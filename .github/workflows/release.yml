@@ -163,7 +163,7 @@ jobs:
         name: Plan dist release
         working-directory: apps/cli
         run: |
-          dist host --steps=create --tag=${{ needs.validate.outputs.tag }} --output-format=json > plan-dist-manifest.json
+          dist host --steps=create --tag=${{ needs.validate.outputs.tag }} --allow-dirty --output-format=json > plan-dist-manifest.json
           echo "dist ran successfully"
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
@@ -226,7 +226,7 @@ jobs:
       - name: Build artifacts
         working-directory: apps/cli
         run: |
-          dist build ${{ needs.plan-cli-release.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          dist build ${{ needs.plan-cli-release.outputs.tag-flag }} --allow-dirty --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
 
       - id: cargo-dist
@@ -287,7 +287,7 @@ jobs:
         shell: bash
         working-directory: apps/cli
         run: |
-          dist build ${{ needs.plan-cli-release.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
+          dist build ${{ needs.plan-cli-release.outputs.tag-flag }} --allow-dirty --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
 
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
@@ -346,7 +346,7 @@ jobs:
         shell: bash
         working-directory: apps/cli
         run: |
-          dist host ${{ needs.plan-cli-release.outputs.tag-flag }} --steps=upload --steps=release --output-format=json > dist-manifest.json
+          dist host ${{ needs.plan-cli-release.outputs.tag-flag }} --allow-dirty --steps=upload --steps=release --output-format=json > dist-manifest.json
           echo "artifacts uploaded and released successfully"
           cat dist-manifest.json
           echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
