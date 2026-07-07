@@ -365,7 +365,9 @@ jobs:
           merge-multiple: true
 
       - name: Cleanup
-        run: rm -f apps/cli/artifacts/*-dist-manifest.json
+        run: |
+          rm -f apps/cli/artifacts/*-dist-manifest.json
+          rm -rf apps/cli/artifacts/target
 
       - name: Create GitHub Release
         env:
