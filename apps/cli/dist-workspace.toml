@@ -17,15 +17,14 @@ install-path = "CARGO_HOME"
 hosting = "github"
 # Whether to install an updater program
 install-updater = false
-# The GitHub repo that hosts your Homebrew tap. The formula is *generated* as a
-# release artifact but is NOT pushed here automatically — publishing is a manual
-# step by default (see tap/README.md).
+# The GitHub repo that hosts your Homebrew tap. dist generates wsmp.rb as a
+# release artifact; the root Release workflow then commits that file into this
+# tap with HOMEBREW_TAP_TOKEN.
 tap = "FlyCockpit/homebrew-tap"
-# Publishing jobs that run on release. Empty by default: the Homebrew formula is
-# built as a release artifact, and you copy it into your tap repo yourself. To
-# auto-publish, add "homebrew" here and set up HOMEBREW_TAP_TOKEN (see
-# tap/README.md → "Automating publish").
-publish-jobs = []
+# Keep this aligned with the root Release workflow's publish-homebrew-formula
+# job. If the workflow is regenerated from cargo-dist, review the generated
+# Homebrew publish job before replacing the hand-rolled monorepo workflow.
+publish-jobs = ["homebrew"]
 # The root manual Release workflow consumes this config from the monorepo root.
 # Pull-request cargo-dist runs are plan-only when generated locally.
 pr-run-mode = "plan"

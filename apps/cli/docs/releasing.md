@@ -3,10 +3,9 @@
 Releases are automated by the root `Release` GitHub Actions workflow and
 [`dist`](https://opensource.axo.dev/cargo-dist/) (cargo-dist). You bump the CLI
 version, merge it to `master`, then manually run the workflow with that version
-tag. CI builds every platform, generates installers + checksums, publishes a
-GitHub Release, and publishes the app container to GHCR. Updating your Homebrew
-tap is a manual copy step by default (and can be automated — see
-`tap/README.md`).
+tag. CI builds every platform, generates installers and checksums, publishes a
+GitHub Release, publishes the app container to GHCR, and commits the generated
+Homebrew formula to `FlyCockpit/homebrew-tap`.
 
 ## What gets built
 
@@ -20,9 +19,18 @@ From `dist-workspace.toml`:
 | macOS Apple Silicon | `aarch64-apple-darwin` |
 | Windows x64 | `x86_64-pc-windows-msvc` |
 
-Installers generated: **shell** (`curl … | sh`), **PowerShell** (`irm … | iex`),
-and a **Homebrew formula** (`wsmp.rb`), attached to the release as an artifact.
-You copy that formula into your tap repo to publish it — see `tap/README.md`.
+Installers generated: **shell** (`curl ... | sh`), **PowerShell** (`irm ... |
+iex`), and a **Homebrew formula** (`wsmp.rb`). The formula is uploaded to the
+GitHub Release and then copied into the tap as `Formula/wsmp.rb`.
+
+The container image is published to GHCR as:
+
+```text
+ghcr.io/flycockpit/ws-model-proxy:vX.Y.Z
+ghcr.io/flycockpit/ws-model-proxy:X.Y.Z
+ghcr.io/flycockpit/ws-model-proxy:sha-<commit-sha>
+ghcr.io/flycockpit/ws-model-proxy:latest   # only when publish_latest is true
+```
 
 ## Cutting a release
 
@@ -36,18 +44,23 @@ git push origin master
 
 The workflow validates that it is running from `master` and that the requested
 `vX.Y.Z` tag matches `apps/cli/Cargo.toml`. It creates the GitHub Release for
-that tag, uploads CLI artifacts, and publishes the app container to GHCR.
+that tag, uploads CLI artifacts, publishes the app container to GHCR, and pushes
+the generated Homebrew formula to the tap.
 
 ## One-time setup
 
-1. **Repo must be public** for `curl | sh` and `brew install` to work without
-   auth tokens.
-2. **GitHub CLI:** install `gh` and run `gh auth login`; the default Homebrew
-   publishing flow uses it to download the generated formula.
-3. **Homebrew tap:** create the tap repo — see `tap/README.md`. No token is
-   needed for the default manual publish flow; one is only required if you opt
-   into automatic publishing.
-4. **Optional local cargo-dist:** CI installs `cargo-dist` for releases, so
+1. **Repos must be public** for `curl | sh`, `brew install`, and unauthenticated
+   container pulls to work without GitHub tokens.
+2. **Homebrew tap:** keep `FlyCockpit/homebrew-tap` public. See
+   `tap/README.md`.
+3. **Release environment and tap token:** create a protected `release`
+   environment in `FlyCockpit/ws-model-proxy`, then add `HOMEBREW_TAP_TOKEN`
+   as an environment secret. Use a fine-grained token with `contents:write`
+   access to `FlyCockpit/homebrew-tap`. The default `GITHUB_TOKEN` cannot push
+   to another repository.
+4. **GHCR package visibility:** after the first release, make the GHCR package
+   public if you want unauthenticated users to pull it.
+5. **Optional local cargo-dist:** CI installs `cargo-dist` for releases, so
    normal release cutting does not require it locally. Install it only when you
    want to validate or regenerate release config from your machine:
 
@@ -56,12 +69,16 @@ that tag, uploads CLI artifacts, and publishes the app container to GHCR.
    dist plan
    ```
 
-### Publishing the Homebrew formula
+## Installation after release
 
-By default the formula is generated as a release artifact and you copy it into
-your tap repo yourself — a few seconds, no extra secrets, and the tap commit is
-plainly yours. The steps (and how to automate it instead) are in
-`tap/README.md`.
+```sh
+brew install flycockpit/tap/wsmp
+
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/FlyCockpit/ws-model-proxy/releases/latest/download/wsmp-installer.sh | sh
+
+docker pull ghcr.io/flycockpit/ws-model-proxy:latest
+```
 
 ## Changing release behavior
 
@@ -77,7 +94,7 @@ dist init      # interactive; or
 dist generate  # re-emit release.yml from the config
 ```
 
-CI has no "release drift" check, so review cargo-dist workflow changes
+CI has no release drift check, so review cargo-dist workflow changes
 deliberately whenever you change `dist-workspace.toml`.
 
 ## Optional: crates.io and cargo-binstall

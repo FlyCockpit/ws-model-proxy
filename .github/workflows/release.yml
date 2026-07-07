@@ -47,8 +47,8 @@ jobs:
           fi
 
           tag="${{ inputs.version }}"
-          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Release version must be a SemVer tag like v0.1.0."
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Release version must be a SemVer tag like v0.1.0 without build metadata."
             exit 1
           fi
 
@@ -377,13 +377,73 @@ jobs:
           echo "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
           gh release create "${{ needs.plan-cli-release.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" apps/cli/artifacts/*
 
+  publish-homebrew-formula:
+    name: Publish Homebrew formula
+    needs:
+      - validate
+      - publish-cli-release
+    runs-on: ubuntu-22.04
+    environment: release
+    steps:
+      - name: Validate tap token
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
+            echo "::error::Set HOMEBREW_TAP_TOKEN to a token with contents:write access to FlyCockpit/homebrew-tap."
+            exit 1
+          fi
+
+      - name: Download generated formula
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v4
+        with:
+          pattern: artifacts-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Check generated formula exists
+        shell: bash
+        run: test -f artifacts/wsmp.rb
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: FlyCockpit/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+          fetch-depth: 0
+
+      - name: Commit formula to tap
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p homebrew-tap/Formula
+          cp artifacts/wsmp.rb homebrew-tap/Formula/wsmp.rb
+
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add Formula/wsmp.rb
+          if git diff --cached --quiet -- Formula/wsmp.rb; then
+            echo "Formula/wsmp.rb already matches ${{ needs.validate.outputs.tag }}."
+            exit 0
+          fi
+
+          git commit -m "wsmp ${{ needs.validate.outputs.tag }}"
+          git push origin HEAD:main
+
   release-summary:
     name: Release summary
     needs:
       - validate
       - publish-container
       - publish-cli-release
-    if: ${{ always() && needs.publish-container.result == 'success' && needs.publish-cli-release.result == 'success' }}
+      - publish-homebrew-formula
+    if: ${{ always() && needs.publish-container.result == 'success' && needs.publish-cli-release.result == 'success' && needs.publish-homebrew-formula.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Write summary
@@ -393,4 +453,5 @@ jobs:
             echo
             echo "- Container: `${{ needs.validate.outputs.image }}:${{ needs.validate.outputs.tag }}`"
             echo "- CLI artifacts: GitHub Release `${{ needs.validate.outputs.tag }}`"
+            echo "- Homebrew: `brew install flycockpit/tap/wsmp`"
           } >> "$GITHUB_STEP_SUMMARY"

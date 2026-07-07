@@ -61,7 +61,45 @@ pnpm test
 
 ## Publishing and Runtime
 
-Releases are created manually from the `master` branch with the root `Release` GitHub Actions workflow. A release publishes the app container to GHCR and attaches cross-platform `wsmp` CLI artifacts to the GitHub Release.
+Releases are created manually from the `master` branch with the root `Release` GitHub Actions workflow. A release publishes:
+
+- The app container to GHCR.
+- Cross-platform `wsmp` CLI artifacts to the GitHub Release.
+- The generated Homebrew formula to `FlyCockpit/homebrew-tap`.
+
+Before the first release, create a protected `release` environment and add `HOMEBREW_TAP_TOKEN` as an environment secret. It must have `contents:write` access to `FlyCockpit/homebrew-tap` so the release workflow can update `Formula/wsmp.rb`.
+
+Install the CLI with Homebrew after the first release:
+
+```sh
+brew install flycockpit/tap/wsmp
+```
+
+Alternative CLI installers are attached to each GitHub Release:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/FlyCockpit/ws-model-proxy/releases/latest/download/wsmp-installer.sh | sh
+```
+
+```powershell
+irm https://github.com/FlyCockpit/ws-model-proxy/releases/latest/download/wsmp-installer.ps1 | iex
+```
+
+The app image is published as:
+
+```text
+ghcr.io/flycockpit/ws-model-proxy:vX.Y.Z
+ghcr.io/flycockpit/ws-model-proxy:X.Y.Z
+ghcr.io/flycockpit/ws-model-proxy:sha-<commit-sha>
+ghcr.io/flycockpit/ws-model-proxy:latest   # when publish_latest is true
+```
+
+For example:
+
+```sh
+docker pull ghcr.io/flycockpit/ws-model-proxy:latest
+```
 
 The runtime is a single web service container plus Postgres. No Redis, S3/R2 object storage, VAPID push service, CMS/MCP service, video pipeline, docs app, or separate queue process is required in v1.
 
@@ -80,9 +118,10 @@ CLI operator flow:
 
 1. Deploy the web service and Postgres.
 2. Create the first admin user, or configure admin emails before inviting operators.
-3. Create a device login or CLI token from the dashboard.
-4. Configure the CLI's local JSON endpoint inventory.
-5. Run `wsmp connect` or the equivalent daemon command from the machine that can reach the local model endpoints.
+3. Install `wsmp` with `brew install flycockpit/tap/wsmp`.
+4. Create a device login or CLI token from the dashboard.
+5. Configure the CLI's local JSON endpoint inventory.
+6. Run `wsmp connect` or the equivalent daemon command from the machine that can reach the local model endpoints.
 
 Model API clients call `/v1/*` with `Authorization: Bearer ...`. Cookie/session auth and permissive browser CORS are intentionally not supported for those bearer routes in v1.
 

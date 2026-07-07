@@ -80,7 +80,7 @@ irm https://github.com/FlyCockpit/ws-model-proxy/releases/latest/download/wsmp-i
 **Homebrew:**
 
 ```sh
-brew install FlyCockpit/tap/wsmp
+brew install flycockpit/tap/wsmp
 ```
 
 **From source:**
