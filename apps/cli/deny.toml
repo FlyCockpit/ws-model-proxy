@@ -25,6 +25,8 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "MPL-2.0",
+    # Used by webpki-roots for Mozilla CA root certificate data.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 
