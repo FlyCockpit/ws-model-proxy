@@ -86,12 +86,16 @@ struct RpcErrorBody {
 
 pub fn start_device_authorization(server_url: &str) -> Result<DeviceCodeStartResponse> {
     let url = join(server_url, "/api/auth/device/code")?;
-    let response = ureq::post(url.as_str())
-        .set("Accept", "application/json")
-        .send_json(serde_json::json!({ "client_id": "ws-model-proxy" }))
+    let body = serde_json::to_vec(&serde_json::json!({ "client_id": "ws-model-proxy" }))
+        .context("serializing device authorization request")?;
+    let mut response = ureq::post(url.as_str())
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
+        .send(body)
         .with_context(|| format!("starting device authorization at `{}`", url.as_str()))?;
     response
-        .into_json()
+        .body_mut()
+        .read_json()
         .context("parsing device authorization response")
 }
 
@@ -109,21 +113,28 @@ pub fn exchange_device_code(
             "cliSlug": cli_slug,
         }
     });
-    let response = match ureq::post(url.as_str())
-        .set("Accept", "application/json")
-        .send_json(request)
+    let body = serde_json::to_vec(&request).context("serializing device credential request")?;
+    let mut response = match ureq::post(url.as_str())
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .send(body)
     {
         Ok(response) => response,
-        Err(ureq::Error::Status(status, response)) => {
-            return Err(rpc_status_error(status, response));
-        }
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("exchanging approved device code at `{}`", url.as_str()));
         }
     };
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        return Err(rpc_status_error(status, response));
+    }
     let parsed = response
-        .into_json::<RpcResponse<DeviceCredentialExchangeResponse>>()
+        .body_mut()
+        .read_json::<RpcResponse<DeviceCredentialExchangeResponse>>()
         .context("parsing device credential response")?;
     let parsed = parsed.into_inner();
     let credential = DeviceCredential {
@@ -134,8 +145,8 @@ pub fn exchange_device_code(
     Ok(credential)
 }
 
-fn rpc_status_error(status: u16, response: ureq::Response) -> anyhow::Error {
-    let body = response.into_string().unwrap_or_default();
+fn rpc_status_error(status: u16, mut response: ureq::http::Response<ureq::Body>) -> anyhow::Error {
+    let body = response.body_mut().read_to_string().unwrap_or_default();
     if let Ok(parsed) = serde_json::from_str::<RpcErrorEnvelope>(&body) {
         if let Some(message) = parsed.json.message {
             return anyhow::anyhow!("{message}");

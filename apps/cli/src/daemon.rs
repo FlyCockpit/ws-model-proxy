@@ -153,7 +153,7 @@ fn run_relay_session(
     };
     let hello = encode_control(&hello).map_err(RelaySessionError::Fatal)?;
     socket
-        .send(Message::Text(hello))
+        .send(Message::Text(hello.into()))
         .map_err(|error| websocket_session_error(error, "sending relay hello", false))?;
 
     let mut next_heartbeat =
@@ -371,14 +371,15 @@ where
     };
     match open_upstream_response(endpoint, &relay_request) {
         Ok(response) => {
-            let status = response.status();
+            let status = response.status().as_u16();
             let headers = response
-                .headers_names()
-                .into_iter()
-                .filter_map(|name| {
-                    response
-                        .header(&name)
-                        .map(|value| (name.to_ascii_lowercase(), value.to_string()))
+                .headers()
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
                 })
                 .collect::<BTreeMap<_, _>>();
             let header_frame = ClientControlMessage::RelayResponseHeaders {
@@ -387,7 +388,7 @@ where
                 headers,
             };
             send_control(socket, &header_frame, "sending relay response headers")?;
-            let mut reader = response.into_reader();
+            let mut reader = response.into_body().into_reader();
             let mut chunk = vec![0_u8; RELAY_BINARY_CHUNK_MAX_BYTES];
             let mut index = 0_usize;
             loop {
@@ -443,14 +444,18 @@ where
 fn open_upstream_response(
     endpoint: &EndpointConfig,
     relay_request: &RelayRequestToForward<'_>,
-) -> Result<ureq::Response> {
+) -> Result<ureq::http::Response<ureq::Body>> {
     let url = endpoint_url(&endpoint.base_url, relay_request.path)?;
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_millis(relay_request.timeout_ms))
-        .build();
-    let mut request = agent.request(relay_request.method, url.as_str());
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_millis(relay_request.timeout_ms)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut request = ureq::http::Request::builder()
+        .method(relay_request.method)
+        .uri(url.as_str());
     for (name, value) in relay_request.headers {
-        request = request.set(name, value);
+        request = request.header(name.as_str(), value.as_str());
     }
     for header in &endpoint.headers {
         let value = std::env::var(&header.env).with_context(|| {
@@ -459,20 +464,22 @@ fn open_upstream_response(
                 header.name, header.env
             )
         })?;
-        request = request.set(&header.name, &value);
+        request = request.header(header.name.as_str(), value.as_str());
     }
-    let response = match if relay_request.body.is_empty() {
-        request.call()
+    let response = if relay_request.body.is_empty() {
+        let request = request
+            .body(())
+            .context("building relay request to upstream endpoint")?;
+        agent.run(request)
     } else {
-        request.send_bytes(relay_request.body)
-    } {
-        Ok(response) => response,
-        Err(ureq::Error::Status(_, response)) => response,
-        Err(error) => return Err(error).context("forwarding relay request to upstream endpoint"),
-    };
+        let request = request
+            .body(relay_request.body)
+            .context("building relay request to upstream endpoint")?;
+        agent.run(request)
+    }
+    .context("forwarding relay request to upstream endpoint")?;
     Ok(response)
 }
-
 fn expects_request_body(method: &str, headers: &BTreeMap<String, String>) -> bool {
     let method = method.to_ascii_uppercase();
     if matches!(method.as_str(), "GET" | "HEAD" | "DELETE") {
@@ -517,7 +524,7 @@ where
 {
     let text = encode_control(message).map_err(RelaySessionError::Fatal)?;
     socket
-        .send(Message::Text(text))
+        .send(Message::Text(text.into()))
         .map_err(|error| websocket_session_error(error, context, true))
 }
 
@@ -530,7 +537,7 @@ where
     S: std::io::Read + std::io::Write,
 {
     socket
-        .send(Message::Binary(bytes))
+        .send(Message::Binary(bytes.into()))
         .map_err(|error| websocket_session_error(error, context, true))
 }
 

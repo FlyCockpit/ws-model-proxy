@@ -1,7 +1,7 @@
 //! Shared forwarder slug policy.
 
 use anyhow::Result;
-use rand::distributions::{Alphanumeric, DistString};
+use rand::distr::{Alphanumeric, SampleString};
 
 const MIN: usize = 3;
 const MAX: usize = 63;
@@ -82,7 +82,7 @@ pub fn slugify_seed(seed: &str, fallback_prefix: &str) -> String {
 
 pub fn generated_slug(prefix: &str) -> String {
     let clean_prefix = slug_prefix(prefix);
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     loop {
         let suffix = Alphanumeric.sample_string(&mut rng, 10).to_lowercase();
         let slug = format!("{clean_prefix}-{suffix}");

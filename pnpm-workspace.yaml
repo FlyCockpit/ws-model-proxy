@@ -6,9 +6,6 @@ minimumReleaseAgeStrict: true
 minimumReleaseAgeIgnoreMissingTime: false
 # Excludes for packages that fail the 7-day minimum-age check on re-resolution.
 minimumReleaseAgeExclude:
-  # GHSA-p6gq-j5cr-w38f: nodemailer 9.0.1 (released 2026-06-17) is the first
-  # fixed version and is <7 days old. Remove once it ages past 2026-06-24.
-  - nodemailer
 # Each selector lifts a transitive out of its vulnerable range. All target
 # versions pass the 7-day minimumReleaseAge gate; selectors are scoped tight so
 # unrelated majors are untouched.
@@ -54,14 +51,14 @@ allowBuilds:
 catalog:
   dotenv: ^17.4.2
   zod: ^4.4.3
-  "@types/node": ^25.9.3
+  "@types/node": ^26.0.1
   "@types/ws": ^8.18.1
-  hono: ^4.12.25
+  hono: ^4.12.27
   "@orpc/server": ^1.14.6
   "@orpc/openapi": ^1.14.6
   "@orpc/zod": ^1.14.6
-  better-auth: ^1.6.19
-  lucide-react: ^1.20.0
+  better-auth: ^1.6.23
+  lucide-react: ^1.22.0
   next-themes: ^0.4.6
   react: ^19.2.7
   react-dom: ^19.2.7
@@ -70,30 +67,30 @@ catalog:
   "@orpc/client": ^1.14.6
   "@types/react": ^19.2.17
   "@types/react-dom": ^19.2.3
-  tailwindcss: ^4.3.1
+  tailwindcss: ^4.3.2
   typescript: ^6.0.3
-  vite: ^8.0.16
-  "@vitejs/plugin-react": ^6.0.2
-  postcss: ^8.5.15
+  vite: ^8.1.1
+  "@vitejs/plugin-react": ^6.0.3
+  postcss: ^8.5.16
   "@tanstack/react-form": ^1.33.0
-  "@tanstack/react-query": ^5.101.0
-  "@tanstack/react-query-devtools": ^5.101.0
-  "@tanstack/react-router": ^1.170.15
+  "@tanstack/react-query": ^5.101.2
+  "@tanstack/react-query-devtools": ^5.101.2
+  "@tanstack/react-router": ^1.170.16
   "@tanstack/react-router-devtools": ^1.167.0
   "@tanstack/react-router-ssr-query": ^1.167.1
-  "@tanstack/react-start": ^1.168.25
+  "@tanstack/react-start": ^1.168.26
   tsx: ^4.22.4
   vitest: ^4.1.9
   vitest-mock-extended: ^4.0.0
   rate-limiter-flexible: ^11.2.0
   ws: ^8.21.0
-  nodemailer: ^9.0.1
+  nodemailer: ^9.0.3
   "@types/nodemailer": ^8.0.1
-  tsdown: ^0.22.2
-  i18next: ^26.3.1
+  tsdown: ^0.22.3
+  i18next: ^26.3.4
   react-i18next: ^17.0.8
   i18next-browser-languagedetector: ^8.2.1
-  openai: ^6.42.0
-  "@anthropic-ai/sdk": ^0.104.2
+  openai: ^6.45.0
+  "@anthropic-ai/sdk": ^0.107.0
   "qrcode.react": ^4.2.0
   "@fontsource-variable/inter": ^5.2.8

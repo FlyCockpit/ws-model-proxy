@@ -91,7 +91,10 @@ fn request_is_complete(bytes: &[u8]) -> bool {
     let headers = String::from_utf8_lossy(&bytes[..header_end]);
     let content_length = headers
         .lines()
-        .find_map(|line| line.strip_prefix("Content-Length: "))
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length").then_some(value)
+        })
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(0);
     bytes.len() >= header_end + 4 + content_length
@@ -449,7 +452,11 @@ fn endpoints_probe_success_applies_model_suggestions_and_uses_secret_env_header(
         2
     );
     let request = server.requests.recv().unwrap();
-    assert!(request.contains("Authorization: Bearer upstream-secret"));
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer upstream-secret")
+    );
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     assert_eq!(cfg["endpoints"][0]["models"].as_array().unwrap().len(), 2);
     assert_eq!(

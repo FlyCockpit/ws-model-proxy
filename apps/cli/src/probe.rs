@@ -59,7 +59,7 @@ pub fn probe_endpoint(endpoint: &EndpointConfig) -> ProbeReport {
 
 fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
     let url = models_url(&endpoint.base_url)?;
-    let mut request = ureq::get(url.as_str()).set("Accept", "application/json");
+    let mut request = ureq::get(url.as_str()).header("Accept", "application/json");
     for header in &endpoint.headers {
         let value = std::env::var(&header.env).with_context(|| {
             format!(
@@ -67,13 +67,14 @@ fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
                 header.name, header.env
             )
         })?;
-        request = request.set(&header.name, &value);
+        request = request.header(&header.name, &value);
     }
-    let response = request
+    let mut response = request
         .call()
         .with_context(|| format!("probing endpoint `{}`", endpoint.slug))?;
     let models = response
-        .into_json::<ModelsResponse>()
+        .body_mut()
+        .read_json::<ModelsResponse>()
         .with_context(|| format!("parsing model list from endpoint `{}`", endpoint.slug))?;
     let discovered_model_ids = models
         .data
