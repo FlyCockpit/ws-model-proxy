@@ -1,0 +1,66 @@
+name: Build container images
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+# A new push to the default branch should cancel any in-progress build for an
+# older commit.
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege token: this workflow only validates the image; publishing is
+# handled by .github/workflows/release.yml.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: server
+            dockerfile: ./Dockerfile
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4
+
+      # Build the image defined by the repo-root Dockerfile but do not push it.
+      # `load: true` puts the built image in the local Docker daemon so the
+      # subsequent Trivy step can scan it by tag. Release publishing happens in
+      # .github/workflows/release.yml.
+      - name: Build ${{ matrix.name }} image
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f  # v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: false
+          load: true
+          tags: |
+            ${{ github.event.repository.name }}-${{ matrix.name }}:${{ github.sha }}
+            ${{ github.event.repository.name }}-${{ matrix.name }}:latest
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          provenance: false
+
+      # Trivy scans the built image for HIGH/CRITICAL CVEs in the base OS
+      # packages and node_modules. `ignore-unfixed: true` skips CVEs that have
+      # no patch available so we don't fail builds on advisories the user
+      # cannot resolve. Drop that flag if you want to fail on those too.
+      - name: Scan ${{ matrix.name }} image with Trivy
+        uses: aquasecurity/trivy-action@314ff8b43182423b84c50b1670b0e10f858f2d98  # v0.36.0
+        with:
+          image-ref: ${{ github.event.repository.name }}-${{ matrix.name }}:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+          format: table
+

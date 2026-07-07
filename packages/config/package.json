@@ -1,0 +1,26 @@
+{
+  "name": "@ws-model-proxy/config",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./tsconfig.base.json": "./tsconfig.base.json",
+    "./biome.json": "./biome.json",
+    "./postcss.config.mjs": "./postcss.config.mjs",
+    "./locales": {
+      "default": "./src/locales.ts"
+    },
+    "./forwarder-identifiers": {
+      "default": "./src/forwarder-identifiers.ts"
+    },
+    "./theme-init": {
+      "default": "./src/theme-init.ts"
+    }
+  },
+  "files": [
+    "tsconfig.base.json",
+    "biome.json",
+    "postcss.config.mjs",
+    "src"
+  ]
+}

@@ -1,0 +1,111 @@
+# Port-parameterized ephemeral local stack used by agent UI testing.
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: ws-model-proxy
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    profiles: [dev, prod]
+
+  mailpit:
+    image: axllent/mailpit:v1.21
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${MAILPIT_PORT:-8025}:8025"
+    profiles: [dev, prod]
+
+  app-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    env_file:
+      - .env.docker.defaults
+      - path: .env
+        required: false
+    environment:
+      HOME: /home/agent
+      PNPM_STORE_DIR: /pnpm/store
+      DATABASE_URL: postgresql://postgres:password@postgres:5432/ws-model-proxy
+      BETTER_AUTH_URL: http://localhost:${WEB_PORT:-3001}
+      VITE_SERVER_URL: ""
+      VITE_DEV_HOST: "true"
+      VITE_DEV_PORT: "3001"
+      VITE_DEV_SERVER_URL: http://localhost:3000
+      SERVER_PORT: "3000"
+      NODE_ENV: development
+      OPENROUTER_API_KEY: "${AGENT_OPENROUTER_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${AGENT_ANTHROPIC_API_KEY:-}"
+      TRANSLATION_PROVIDER: "${TRANSLATION_PROVIDER:-openrouter}"
+      TRANSLATION_MODEL: "${TRANSLATION_MODEL:-}"
+    working_dir: /app
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        pnpm install --frozen-lockfile --ignore-scripts
+        pnpm -F @ws-model-proxy/db exec prisma generate
+        pnpm -F @ws-model-proxy/db exec prisma db push
+        exec pnpm dev:raw
+    volumes:
+      - ./:/app
+      - /app/.docker-volumes
+      - ${AGENT_VOLUME_ROOT:?run via pnpm dev:docker}/nm_root:/app/node_modules
+      - ${AGENT_VOLUME_ROOT}/nm_apps_web:/app/apps/web/node_modules
+      - ${AGENT_VOLUME_ROOT}/nm_apps_server:/app/apps/server/node_modules
+      - ${AGENT_VOLUME_ROOT}/nm_packages_api:/app/packages/api/node_modules
+      - ${AGENT_VOLUME_ROOT}/nm_packages_auth:/app/packages/auth/node_modules
+      - ${AGENT_VOLUME_ROOT}/nm_packages_config:/app/packages/config/node_modules
+      - ${AGENT_VOLUME_ROOT}/nm_packages_db:/app/packages/db/node_modules
+      - ${AGENT_VOLUME_ROOT}/nm_packages_env:/app/packages/env/node_modules
+      - ${AGENT_VOLUME_ROOT}/nm_packages_i18n-translate:/app/packages/i18n-translate/node_modules
+      - ${AGENT_VOLUME_ROOT}/nm_packages_mailer:/app/packages/mailer/node_modules
+      - ${AGENT_VOLUME_ROOT}/nm_packages_test-utils:/app/packages/test-utils/node_modules
+      - ${AGENT_VOLUME_ROOT}/nm_packages_ui:/app/packages/ui/node_modules
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${WEB_PORT:-3001}:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+    profiles: [dev]
+
+  app-prod:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env.docker.defaults
+      - path: .env
+        required: false
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://postgres:password@postgres:5432/ws-model-proxy
+      BETTER_AUTH_URL: http://localhost:${WEB_PORT:-3001}
+      SERVER_PORT: "3000"
+      APPLY_SCHEMA: safe
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${WEB_PORT:-3001}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+    profiles: [prod]
+
+networks:
+  default:
+    name: ${COMPOSE_PROJECT_NAME:-ws-model-proxy-agent}_net
+    driver: bridge

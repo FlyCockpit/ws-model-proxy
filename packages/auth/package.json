@@ -1,0 +1,31 @@
+{
+  "name": "@ws-model-proxy/auth",
+  "type": "module",
+  "exports": {
+    ".": {
+      "default": "./src/index.ts"
+    },
+    "./signup-policy": {
+      "default": "./src/signup-policy.ts"
+    },
+    "./roles": {
+      "default": "./src/roles.ts"
+    }
+  },
+  "scripts": {
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@ws-model-proxy/config": "workspace:*",
+    "@ws-model-proxy/db": "workspace:*",
+    "@ws-model-proxy/env": "workspace:*",
+    "@ws-model-proxy/mailer": "workspace:*",
+    "better-auth": "catalog:",
+    "dotenv": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

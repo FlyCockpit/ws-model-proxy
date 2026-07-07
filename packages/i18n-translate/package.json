@@ -1,0 +1,32 @@
+{
+  "name": "@ws-model-proxy/i18n-translate",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "default": "./src/index.ts"
+    },
+    "./types": {
+      "default": "./src/types.ts"
+    },
+    "./prompt": {
+      "default": "./src/prompt.ts"
+    }
+  },
+  "scripts": {
+    "test": "vitest run --passWithNoTests",
+    "check-types": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "catalog:",
+    "@ws-model-proxy/env": "workspace:*",
+    "openai": "catalog:"
+  },
+  "devDependencies": {
+    "@ws-model-proxy/config": "workspace:*",
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

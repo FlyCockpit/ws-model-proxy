@@ -1,0 +1,25 @@
+{
+  "$schema": "https://ui.shadcn.com/schema.json",
+  "style": "base-lyra",
+  "rsc": false,
+  "tsx": true,
+  "tailwind": {
+    "config": "",
+    "css": "src/styles/globals.css",
+    "baseColor": "neutral",
+    "cssVariables": true,
+    "prefix": ""
+  },
+  "iconLibrary": "lucide",
+  "aliases": {
+    "components": "@ws-model-proxy/ui/components",
+    "utils": "@ws-model-proxy/ui/lib/utils",
+    "hooks": "@ws-model-proxy/ui/hooks",
+    "lib": "@ws-model-proxy/ui/lib",
+    "ui": "@ws-model-proxy/ui/components"
+  },
+  "menuColor": "default-translucent",
+  "menuAccent": "subtle",
+  "registries": {},
+  "rtl": false
+}

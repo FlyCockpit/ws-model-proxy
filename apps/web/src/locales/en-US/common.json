@@ -1,0 +1,28 @@
+{
+  "actions": {
+    "back": "Back",
+    "cancel": "Cancel",
+    "clear": "Clear",
+    "close": "Close",
+    "copy": "Copy",
+    "copied": "Copied",
+    "delete": "Delete",
+    "deleting": "Deleting…",
+    "edit": "Edit",
+    "manage": "Manage",
+    "next": "Next",
+    "previous": "Previous",
+    "reload": "Reload",
+    "refresh": "Refresh",
+    "retry": "Retry",
+    "save": "Save",
+    "saveChanges": "Save changes",
+    "saving": "Saving…",
+    "tryAgain": "Try again",
+    "viewAll": "View all"
+  },
+  "appName": "{{name}}",
+  "loading": "Loading…",
+  "somethingWentWrong": "Something went wrong",
+  "welcome": "Welcome"
+}

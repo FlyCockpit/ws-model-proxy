@@ -1,0 +1,47 @@
+{
+  "name": "@ws-model-proxy/api",
+  "type": "module",
+  "exports": {
+    ".": {
+      "default": "./src/index.ts"
+    },
+    "./context": {
+      "default": "./src/context.ts"
+    },
+    "./lib/cli-credential-access": {
+      "default": "./src/lib/cli-credential-access.ts"
+    },
+    "./lib/model-pool-routing": {
+      "default": "./src/lib/model-pool-routing.ts"
+    },
+    "./lib/model-api-token-access": {
+      "default": "./src/lib/model-api-token-access.ts"
+    },
+    "./routers/index": {
+      "default": "./src/routers/index.ts"
+    }
+  },
+  "scripts": {
+    "check-types": "tsc -p tsconfig.check-types.json --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@orpc/client": "catalog:",
+    "@orpc/openapi": "catalog:",
+    "@orpc/server": "catalog:",
+    "@orpc/zod": "catalog:",
+    "@ws-model-proxy/auth": "workspace:*",
+    "@ws-model-proxy/config": "workspace:*",
+    "@ws-model-proxy/db": "workspace:*",
+    "@ws-model-proxy/env": "workspace:*",
+    "@ws-model-proxy/mailer": "workspace:*",
+    "dotenv": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "hono": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:",
+    "vitest-mock-extended": "catalog:"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "@ws-model-proxy/test-utils",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "default": "./src/index.ts"
+    }
+  },
+  "dependencies": {
+    "@ws-model-proxy/api": "workspace:*",
+    "@ws-model-proxy/auth": "workspace:*",
+    "@ws-model-proxy/db": "workspace:*",
+    "vitest": "catalog:",
+    "vitest-mock-extended": "catalog:"
+  },
+  "devDependencies": {
+    "@ws-model-proxy/config": "workspace:*",
+    "typescript": "catalog:"
+  }
+}

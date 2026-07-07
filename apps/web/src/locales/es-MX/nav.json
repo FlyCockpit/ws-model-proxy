@@ -1,0 +1,26 @@
+{
+  "items": {
+    "about": "Acerca de",
+    "cookiePolicy": "Política de cookies",
+    "dashboard": "Panel de control",
+    "settings": "Configuración",
+    "admin": "Administración"
+  },
+  "languageLabel": "Idioma",
+  "mainNav": {
+    "ariaLabel": "Navegación principal"
+  },
+  "themeToggle": {
+    "label": "Cambiar tema",
+    "light": "Claro",
+    "dark": "Oscuro",
+    "system": "Sistema"
+  },
+  "userMenu": {
+    "myAccount": "Mi cuenta",
+    "open": "Abrir menú de usuario",
+    "signIn": "Iniciar sesión",
+    "signOut": "Cerrar sesión",
+    "signUp": "Registrarse"
+  }
+}

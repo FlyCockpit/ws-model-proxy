@@ -1,0 +1,14 @@
+# typos-cli configuration — catches spelling mistakes in code, comments, and
+# docs. Run locally with: typos   (install: cargo install typos-cli)
+
+[files]
+extend-exclude = [
+    "Cargo.lock",
+    "target/",
+    "*.svg",
+    "*.png",
+]
+
+[default.extend-words]
+# Words/acronyms the checker shouldn't "correct". Map a word to itself.
+wsmp = "wsmp"

@@ -1,0 +1,366 @@
+enum CliConnectionStatus {
+  DISCONNECTED
+  CONNECTED
+  STALE
+  REVOKED
+}
+
+enum EndpointKind {
+  OPENAI_COMPATIBLE
+}
+
+enum EndpointStatus {
+  UNKNOWN
+  ONLINE
+  DEGRADED
+  OFFLINE
+}
+
+enum ModelCapability {
+  TEXT_GENERATION
+  VISION_INPUT
+  EMBEDDING
+  AUDIO_INPUT
+  AUDIO_OUTPUT
+  RESPONSES_API
+}
+
+enum ModelCapabilityOverrideMode {
+  INHERIT_ENDPOINT_DEFAULTS
+  OVERRIDE
+}
+
+enum PoolMemberHealthStatus {
+  UNKNOWN
+  HEALTHY
+  HALF_OPEN
+  DEGRADED
+  UNHEALTHY
+}
+
+enum PoolMemberRoutingStatus {
+  ACTIVE
+  DRAINING
+  DISABLED
+}
+
+enum PoolMemberFailureClass {
+  TRANSPORT
+  RELAY_TIMEOUT
+  WEBSOCKET_DISCONNECTED
+  STALE_SESSION
+  UPSTREAM_5XX
+}
+
+enum ModelApiTokenScopeMode {
+  ALL_VISIBLE
+  ALLOWLIST
+}
+
+enum ModelApiTokenAllowlistTarget {
+  DIRECT_MODEL
+  MODEL_POOL
+}
+
+enum RelayRequestStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  CANCELED
+}
+
+model CliDevice {
+  id                   String                @id @default(cuid(2))
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @default(now()) @updatedAt
+  userId               String
+  slug                 String
+  label                String
+  status               CliConnectionStatus   @default(DISCONNECTED)
+  lastConnectedAt      DateTime?
+  lastDisconnectedAt   DateTime?
+  lastHeartbeatAt      DateTime?
+  connectionCount      Int                   @default(0)
+  User                 User                  @relation("CliDeviceOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  CliTokens            CliToken[]
+  CliDeviceCredentials CliDeviceCredential[]
+  Endpoints            Endpoint[]
+
+  @@unique([userId, slug])
+  @@index([userId, status])
+  @@index([lastHeartbeatAt])
+  @@map("cli_device")
+}
+
+model CliToken {
+  id           String     @id @default(cuid(2))
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @default(now()) @updatedAt
+  userId       String
+  cliDeviceId  String?
+  name         String
+  lookupPrefix String
+  secretDigest String
+  lastUsedAt   DateTime?
+  revokedAt    DateTime?
+  expiresAt    DateTime?
+  User         User       @relation("CliTokenOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  CliDevice    CliDevice? @relation(fields: [cliDeviceId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@unique([lookupPrefix])
+  @@unique([secretDigest])
+  @@index([userId, revokedAt])
+  @@index([cliDeviceId])
+  @@index([expiresAt])
+  @@map("cli_token")
+}
+
+model CliDeviceCredential {
+  id           String     @id @default(cuid(2))
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @default(now()) @updatedAt
+  userId       String
+  cliDeviceId  String?
+  name         String
+  lookupPrefix String
+  secretDigest String
+  lastUsedAt   DateTime?
+  revokedAt    DateTime?
+  User         User       @relation("CliDeviceCredentialOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  CliDevice    CliDevice? @relation(fields: [cliDeviceId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@unique([lookupPrefix])
+  @@unique([secretDigest])
+  @@index([userId, revokedAt])
+  @@index([cliDeviceId])
+  @@map("cli_device_credential")
+}
+
+model Endpoint {
+  id                  String            @id @default(cuid(2))
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @default(now()) @updatedAt
+  userId              String
+  cliDeviceId         String
+  slug                String
+  label               String
+  kind                EndpointKind      @default(OPENAI_COMPATIBLE)
+  status              EndpointStatus    @default(UNKNOWN)
+  defaultCapabilities ModelCapability[] @default([])
+  capabilityMetadata  Json?
+  probeSuggestions    Json?
+  lastSeenAt          DateTime?
+  lastHealthCheckAt   DateTime?
+  statusChangedAt     DateTime?
+  failureReasonCode   String?
+  User                User              @relation("EndpointOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  CliDevice           CliDevice         @relation(fields: [cliDeviceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  DiscoveredModels    DiscoveredModel[]
+
+  @@unique([userId, slug])
+  @@unique([cliDeviceId, slug])
+  @@index([userId, status])
+  @@index([cliDeviceId])
+  @@index([kind, status])
+  @@index([lastSeenAt])
+  @@map("endpoint")
+}
+
+model DiscoveredModel {
+  id                            String                        @id @default(cuid(2))
+  createdAt                     DateTime                      @default(now())
+  updatedAt                     DateTime                      @default(now()) @updatedAt
+  userId                        String
+  endpointId                    String
+  slug                          String?
+  upstreamModelId               String
+  encodedModelId                String
+  capabilityOverrideMode        ModelCapabilityOverrideMode   @default(INHERIT_ENDPOINT_DEFAULTS)
+  capabilityOverrides           ModelCapability[]             @default([])
+  capabilityOverrideMetadata    Json?
+  probeSuggestions              Json?
+  lastSeenAt                    DateTime?
+  User                          User                          @relation("DiscoveredModelOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Endpoint                      Endpoint                      @relation(fields: [endpointId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  PoolMembers                   PoolMember[]
+  ModelApiTokenAllowlistEntries ModelApiTokenAllowlistEntry[]
+  ResponseStickinessTargets     ResponseStickinessRecord[]    @relation("ResponseStickinessTargetModel")
+  ResponseStickinessSelections  ResponseStickinessRecord[]    @relation("ResponseStickinessSelectedModel")
+  RequestedRelayRequests        RelayRequest[]                @relation("RelayRequestRequestedModel")
+  SelectedRelayRequests         RelayRequest[]                @relation("RelayRequestSelectedModel")
+
+  @@unique([endpointId, upstreamModelId])
+  @@unique([endpointId, encodedModelId])
+  @@index([userId])
+  @@index([endpointId, slug])
+  @@index([endpointId, lastSeenAt])
+  @@map("discovered_model")
+}
+
+model ModelPool {
+  id                            String                        @id @default(cuid(2))
+  createdAt                     DateTime                      @default(now())
+  updatedAt                     DateTime                      @default(now()) @updatedAt
+  userId                        String
+  slug                          String
+  name                          String
+  description                   String?
+  User                          User                          @relation("ModelPoolOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  PoolMembers                   PoolMember[]
+  PoolGrants                    PoolGrant[]
+  ModelApiTokenAllowlistEntries ModelApiTokenAllowlistEntry[]
+  ResponseStickinessRecords     ResponseStickinessRecord[]
+  RelayRequests                 RelayRequest[]                @relation("RelayRequestRequestedPool")
+
+  @@unique([userId, slug])
+  @@index([userId])
+  @@map("model_pool")
+}
+
+model PoolMember {
+  id                           String                  @id @default(cuid(2))
+  createdAt                    DateTime                @default(now())
+  updatedAt                    DateTime                @default(now()) @updatedAt
+  poolId                       String
+  discoveredModelId            String
+  weight                       Int                     @default(1)
+  healthStatus                 PoolMemberHealthStatus  @default(UNKNOWN)
+  routingStatus                PoolMemberRoutingStatus @default(ACTIVE)
+  lastFailureClass             PoolMemberFailureClass?
+  consecutiveRetryableFailures Int                     @default(0)
+  lastFailureAt                DateTime?
+  nextRetryAt                  DateTime?
+  halfOpenTrialStartedAt       DateTime?
+  lastRoutedAt                 DateTime?
+  ModelPool                    ModelPool               @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  DiscoveredModel              DiscoveredModel         @relation(fields: [discoveredModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([poolId, discoveredModelId])
+  @@index([discoveredModelId])
+  @@index([poolId, routingStatus, healthStatus])
+  @@index([healthStatus, nextRetryAt])
+  @@map("pool_member")
+}
+
+model PoolGrant {
+  id            String    @id @default(cuid(2))
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @default(now()) @updatedAt
+  poolId        String
+  ownerUserId   String
+  granteeUserId String
+  ModelPool     ModelPool @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Owner         User      @relation("PoolGrantOwner", fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Grantee       User      @relation("PoolGrantGrantee", fields: [granteeUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([poolId, granteeUserId])
+  @@index([ownerUserId])
+  @@index([granteeUserId])
+  @@map("pool_grant")
+}
+
+model ModelApiToken {
+  id                        String                        @id @default(cuid(2))
+  createdAt                 DateTime                      @default(now())
+  updatedAt                 DateTime                      @default(now()) @updatedAt
+  userId                    String
+  name                      String
+  scopeMode                 ModelApiTokenScopeMode        @default(ALL_VISIBLE)
+  lookupPrefix              String
+  secretDigest              String
+  lastUsedAt                DateTime?
+  revokedAt                 DateTime?
+  expiresAt                 DateTime?
+  User                      User                          @relation("ModelApiTokenOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  AllowlistEntries          ModelApiTokenAllowlistEntry[]
+  RelayRequests             RelayRequest[]
+  ResponseStickinessRecords ResponseStickinessRecord[]
+
+  @@unique([lookupPrefix])
+  @@unique([secretDigest])
+  @@index([userId, revokedAt])
+  @@index([scopeMode])
+  @@index([expiresAt])
+  @@map("model_api_token")
+}
+
+model ModelApiTokenAllowlistEntry {
+  id                String                       @id @default(cuid(2))
+  createdAt         DateTime                     @default(now())
+  updatedAt         DateTime                     @default(now()) @updatedAt
+  modelApiTokenId   String
+  target            ModelApiTokenAllowlistTarget
+  discoveredModelId String?
+  modelPoolId       String?
+  ModelApiToken     ModelApiToken                @relation(fields: [modelApiTokenId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  DiscoveredModel   DiscoveredModel?             @relation(fields: [discoveredModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ModelPool         ModelPool?                   @relation(fields: [modelPoolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([modelApiTokenId, discoveredModelId])
+  @@unique([modelApiTokenId, modelPoolId])
+  @@index([discoveredModelId])
+  @@index([modelPoolId])
+  @@index([modelApiTokenId, target])
+  @@map("model_api_token_allowlist_entry")
+}
+
+model ResponseStickinessRecord {
+  id                        String           @id @default(cuid(2))
+  createdAt                 DateTime         @default(now())
+  updatedAt                 DateTime         @default(now()) @updatedAt
+  userId                    String
+  modelApiTokenId           String?
+  routingKeyDigest          String
+  targetDiscoveredModelId   String?
+  targetModelPoolId         String?
+  selectedDiscoveredModelId String?
+  expiresAt                 DateTime?
+  User                      User             @relation("ResponseStickinessOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ModelApiToken             ModelApiToken?   @relation(fields: [modelApiTokenId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  TargetDiscoveredModel     DiscoveredModel? @relation("ResponseStickinessTargetModel", fields: [targetDiscoveredModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  TargetModelPool           ModelPool?       @relation(fields: [targetModelPoolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  SelectedDiscoveredModel   DiscoveredModel? @relation("ResponseStickinessSelectedModel", fields: [selectedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@unique([userId, routingKeyDigest])
+  @@index([modelApiTokenId])
+  @@index([targetDiscoveredModelId])
+  @@index([targetModelPoolId])
+  @@index([selectedDiscoveredModelId])
+  @@index([expiresAt])
+  @@map("response_stickiness_record")
+}
+
+model RelayRequest {
+  id                         String             @id @default(cuid(2))
+  createdAt                  DateTime           @default(now())
+  updatedAt                  DateTime           @default(now()) @updatedAt
+  userId                     String
+  modelApiTokenId            String?
+  modelApiTokenLookupPrefix  String?
+  requestedDiscoveredModelId String?
+  requestedModelPoolId       String?
+  selectedDiscoveredModelId  String?
+  status                     RelayRequestStatus @default(PENDING)
+  startedAt                  DateTime           @default(now())
+  completedAt                DateTime?
+  durationMs                 Int?
+  promptTokens               Int?
+  completionTokens           Int?
+  totalTokens                Int?
+  httpStatusCode             Int?
+  upstreamStatusCode         Int?
+  errorClass                 String?
+  User                       User               @relation("RelayRequestOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ModelApiToken              ModelApiToken?     @relation(fields: [modelApiTokenId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  RequestedDiscoveredModel   DiscoveredModel?   @relation("RelayRequestRequestedModel", fields: [requestedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  RequestedModelPool         ModelPool?         @relation("RelayRequestRequestedPool", fields: [requestedModelPoolId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  SelectedDiscoveredModel    DiscoveredModel?   @relation("RelayRequestSelectedModel", fields: [selectedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([modelApiTokenId, createdAt])
+  @@index([requestedDiscoveredModelId, createdAt])
+  @@index([requestedModelPoolId, createdAt])
+  @@index([selectedDiscoveredModelId])
+  @@index([status, createdAt])
+  @@map("relay_request")
+}

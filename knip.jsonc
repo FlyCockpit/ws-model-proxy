@@ -1,0 +1,59 @@
+{
+  "$schema": "https://unpkg.com/knip@latest/schema-jsonc.json",
+  "ignore": [
+    // Root maintenance scripts are invoked by package.json scripts, not the
+    // production runtime graph.
+    "scripts/*.ts"
+  ],
+  "workspaces": {
+    ".": {
+      "ignoreBinaries": [
+        // Global local-dev CLI. Intentionally not listed in package.json.
+        "portless"
+      ]
+    },
+    "apps/web": {
+      "entry": [
+        // SPA/SSR entry points. `!` suffix = production entry (kept when
+        // running `knip --production`, which excludes dev-only files).
+        "src/client.tsx!",
+        "src/server.ts!",
+        "src/sw.ts!",
+        "src/router.tsx!",
+        "src/routes/**/*.tsx!",
+        "src/hooks/*.ts!",
+        "src/stores/*.ts!",
+        // PWA assets generator config — dev-only tooling, no `!` suffix.
+        "pwa-assets.config.ts"
+      ],
+      "ignoreDependencies": [
+        // Imported only via PostCSS/Tailwind CSS pipeline, not statically.
+        "tailwindcss",
+        "postcss",
+        // Consumed indirectly via `@orpc/client` + `createORPCClient`.
+        "@orpc/server",
+        // Toast primitive re-exported from @ws-model-proxy/ui.
+        "sileo",
+        // Optional peer of h3 2.x (pulled by TanStack Start); pinned here so the
+        // SSR/oRPC stack binds crossws 0.4.x instead of the 0.3.x h3 1.x dedupes
+        // to. No static import in source — it's a build/runtime transitive.
+        "crossws"
+      ]
+    },
+    "apps/server": {
+      "ignoreDependencies": ["better-auth", "dotenv"]
+    },
+    "packages/ui": {
+      "entry": ["src/components/**/*.tsx", "src/styles/**/*.css"]
+    },
+    "packages/api": {
+      "ignoreDependencies": ["@orpc/client", "@orpc/openapi", "@orpc/zod", "dotenv"]
+    },
+    "packages/db": {
+      "ignoreDependencies": ["@prisma/client", "pg", "zod"]
+    },
+    "packages/auth": {
+      "ignoreDependencies": ["dotenv"]
+    }
+  }
+}

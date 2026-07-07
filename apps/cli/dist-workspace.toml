@@ -1,0 +1,38 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "powershell", "homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Where to host releases
+hosting = "github"
+# Whether to install an updater program
+install-updater = false
+# The GitHub repo that hosts your Homebrew tap. The formula is *generated* as a
+# release artifact but is NOT pushed here automatically — publishing is a manual
+# step by default (see tap/README.md).
+tap = "FlyCockpit/homebrew-tap"
+# Publishing jobs that run on release. Empty by default: the Homebrew formula is
+# built as a release artifact, and you copy it into your tap repo yourself. To
+# auto-publish, add "homebrew" here and set up HOMEBREW_TAP_TOKEN (see
+# tap/README.md → "Automating publish").
+publish-jobs = []
+# The root manual Release workflow consumes this config from the monorepo root.
+# Pull-request cargo-dist runs are plan-only when generated locally.
+pr-run-mode = "plan"
+# Release requests must pass the root release-preflight workflow before artifacts build.
+plan-jobs = ["./release-preflight"]
+
+[dist.github-action-commits]
+"actions/checkout" = "df4cb1c069e1874edd31b4311f1884172cec0e10"
+"actions/upload-artifact" = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+"actions/download-artifact" = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"

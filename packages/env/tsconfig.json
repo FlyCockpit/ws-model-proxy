@@ -1,0 +1,3 @@
+{
+  "extends": "@ws-model-proxy/config/tsconfig.base.json"
+}
