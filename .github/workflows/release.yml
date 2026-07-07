@@ -235,7 +235,7 @@ jobs:
         working-directory: apps/cli
         run: |
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-          dist print-upload-files-from-manifest --manifest dist-manifest.json | sed 's#^#apps/cli/#' >> "$GITHUB_OUTPUT"
+          dist print-upload-files-from-manifest --manifest dist-manifest.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
@@ -291,7 +291,7 @@ jobs:
           echo "dist ran successfully"
 
           echo "paths<<EOF" >> "$GITHUB_OUTPUT"
-          jq --raw-output ".upload_files[]" dist-manifest.json | sed 's#^#apps/cli/#' >> "$GITHUB_OUTPUT"
+          jq --raw-output ".upload_files[]" dist-manifest.json >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
           cp dist-manifest.json "$BUILD_MANIFEST_NAME"
@@ -365,19 +365,34 @@ jobs:
           merge-multiple: true
 
       - name: Cleanup
-        run: |
-          rm -f apps/cli/artifacts/*-dist-manifest.json
-          rm -rf apps/cli/artifacts/target
+        run: rm -f apps/cli/artifacts/*-dist-manifest.json
 
-      - name: Create GitHub Release
+      - name: Create or update GitHub Release
         env:
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
+        shell: bash
         run: |
+          set -euo pipefail
+
           echo "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
-          gh release create "${{ needs.plan-cli-release.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" apps/cli/artifacts/*
+          tag="${{ needs.plan-cli-release.outputs.tag }}"
+
+          mapfile -t release_files < <(find apps/cli/artifacts -type f ! -name '*-dist-manifest.json' | sort)
+          if [ "${#release_files[@]}" -eq 0 ]; then
+            echo "::error::No release files found in apps/cli/artifacts."
+            find apps/cli/artifacts -maxdepth 3 -print | sort
+            exit 1
+          fi
+
+          if gh release view "$tag" > /dev/null 2>&1; then
+            gh release edit "$tag" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt"
+            gh release upload "$tag" --clobber "${release_files[@]}"
+          else
+            gh release create "$tag" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" "${release_files[@]}"
+          fi
 
   publish-homebrew-formula:
     name: Publish Homebrew formula
@@ -405,9 +420,20 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Check generated formula exists
+      - id: formula
+        name: Find generated formula
         shell: bash
-        run: test -f artifacts/wsmp.rb
+        run: |
+          set -euo pipefail
+
+          formula_path="$(find artifacts -type f -name wsmp.rb -print -quit)"
+          if [ -z "$formula_path" ]; then
+            echo "::error::Generated wsmp.rb formula was not found in downloaded artifacts."
+            find artifacts -maxdepth 3 -print | sort
+            exit 1
+          fi
+
+          echo "path=$formula_path" >> "$GITHUB_OUTPUT"
 
       - name: Checkout Homebrew tap
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -423,7 +449,7 @@ jobs:
           set -euo pipefail
 
           mkdir -p homebrew-tap/Formula
-          cp artifacts/wsmp.rb homebrew-tap/Formula/wsmp.rb
+          cp "${{ steps.formula.outputs.path }}" homebrew-tap/Formula/wsmp.rb
 
           cd homebrew-tap
           git config user.name "github-actions[bot]"
