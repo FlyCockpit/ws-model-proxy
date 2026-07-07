@@ -94,7 +94,9 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
         with:
           command: check bans licenses sources
-          arguments: --manifest-path apps/cli/Cargo.toml --config apps/cli/deny.toml
+          arguments: ""
+          command-arguments: --config apps/cli/deny.toml
+          manifest-path: apps/cli/Cargo.toml
 
   advisories:
     runs-on: ubuntu-latest
@@ -104,7 +106,9 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
         with:
           command: check advisories
-          arguments: --manifest-path apps/cli/Cargo.toml --config apps/cli/deny.toml
+          arguments: ""
+          command-arguments: --config apps/cli/deny.toml
+          manifest-path: apps/cli/Cargo.toml
 
   docs-drift:
     runs-on: ubuntu-latest
