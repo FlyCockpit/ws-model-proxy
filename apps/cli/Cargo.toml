@@ -54,7 +54,7 @@ rand = "0.8"
 # Temporary files for atomic config writes.
 tempfile = "3"
 # HTTP calls to the self-hosted app and OpenAI-compatible local endpoints.
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3", features = ["json"] }
 # URL parsing and joining for server/local endpoint paths.
 url = "2"
 # Foreground daemon websocket connection to the app relay.
