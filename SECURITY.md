@@ -24,11 +24,23 @@ Only the latest release is supported.
 - `pnpm audit` on every PR with `--audit-level=high`.
 - Non-root `USER node` in the production server image.
 - Tight Content-Security-Policy and `secureHeaders` middleware.
+- Cookie-only Better Auth session resolution that discards bearer
+  `Authorization`; model and CLI credentials remain scoped to their dedicated
+  API and WebSocket surfaces.
 - Tiered rate limiting for signup and auth routes.
 - Production boot guards for weak or missing `BETTER_AUTH_SECRET`.
 
 See `AGENTS.md` for the guardrails an AI coding agent must respect when
 working in this repo.
+
+## SSR and rendered content
+
+The dashboard does not render user-authored or CMS Markdown/HTML. Its only
+`dangerouslySetInnerHTML` usage is the repository-owned theme bootstrap string,
+authorized by a matching CSP hash. TanStack Start hydration scripts receive a
+per-request CSP nonce. If untrusted rich text is introduced later, it must be
+sanitized before rendering and the CSP must not be weakened to accommodate it.
+
 
 ## Features that need a paid GitHub tier
 

@@ -22,8 +22,8 @@
  *       pnpm i18n:translate --ns common,auth # subset of namespaces
  *       pnpm i18n:translate --strict         # drop keys that fail validation
  *
- * The script imports `getTranslationProvider` from @ws-llm-forwarder/i18n-translate so
- * it exercises the same code path as the BullMQ `translate-content` worker.
+ * The script imports `getTranslationProvider` from the workspace translation
+ * package so locale bundles and mailer bundles use the same provider behavior.
  * Never logs the API key. The key must be in `process.env.OPENROUTER_API_KEY`
  * (or `ANTHROPIC_API_KEY` if `TRANSLATION_PROVIDER=anthropic`).
  */
@@ -32,7 +32,7 @@ import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { parseArgs } from "node:util";
 
-import { getTranslationProvider } from "@ws-llm-forwarder/i18n-translate";
+import { getTranslationProvider } from "@ws-model-proxy/i18n-translate";
 
 // ---------------------------------------------------------------------------
 // CLI args

@@ -54,12 +54,19 @@ describe("deviceAdminGate", () => {
     getSession.mockResolvedValue({ user: { id: "u1", role: "user" } });
     const res = await app.request("/api/auth/device/approve", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        Authorization: "Bearer wsmp_cli_secret",
+        Cookie: "better-auth.session_token=signed-session",
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify({ userCode: "ABC123" }),
     });
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
     expect(downstream).toHaveBeenCalledTimes(1);
+    const call = getSession.mock.calls[0]?.[0] as { headers: Headers };
+    expect(call.headers.get("authorization")).toBeNull();
+    expect(call.headers.get("cookie")).toBe("better-auth.session_token=signed-session");
   });
 
   it("admits signed-in unverified users", async () => {

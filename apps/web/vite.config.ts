@@ -1,13 +1,13 @@
 import { execSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 import tailwindcss from "@tailwindcss/vite";
 import { tanstackStart } from "@tanstack/react-start/plugin/vite";
 import react from "@vitejs/plugin-react";
-import { defineConfig, loadEnv } from "vite";
-import { VitePWA } from "vite-plugin-pwa";
+import { defineConfig, loadEnv, type Plugin } from "vite";
+import { type VitePluginPWAAPI, VitePWA } from "vite-plugin-pwa";
 
 function getBuildVersion(): string {
   // process.env is correct here — Vite config runs at build time outside the app runtime.
@@ -77,6 +77,27 @@ function normalizeProxyTarget(value: string | undefined): { http: string; ws: st
   wsUrl.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return { http: url.toString().replace(/\/$/, ""), ws: wsUrl.toString().replace(/\/$/, "") };
 }
+function tanstackPwaBuildPlugin(api: VitePluginPWAAPI): Plugin {
+  const serviceWorkerPath = path.resolve(__dirname, "dist/client/sw.js");
+
+  return {
+    name: "ws-model-proxy:build-pwa",
+    apply: "build",
+    // TanStack Start marks every production environment as SSR. Generate the
+    // service worker when the SSR environment starts: the client assets exist
+    // by then, but the server bundle has not yet been finalized.
+    applyToEnvironment(environment) {
+      return environment.name === "ssr";
+    },
+    async buildStart() {
+      if (existsSync(serviceWorkerPath)) return;
+      await api.generateSW();
+      if (!existsSync(serviceWorkerPath)) {
+        throw new Error("PWA service worker generation did not produce dist/client/sw.js.");
+      }
+    },
+  };
+}
 
 export default defineConfig(({ mode }) => {
   // Keep build-time and runtime branding in lockstep by loading the same
@@ -93,30 +114,38 @@ export default defineConfig(({ mode }) => {
     process.env.VITE_DEV_SERVER_URL ?? env.VITE_DEV_SERVER_URL,
   );
 
+  const pwaPlugins = VitePWA({
+    strategies: "injectManifest",
+    outDir: "dist/client",
+    srcDir: "src",
+    filename: "sw.ts",
+    registerType: "autoUpdate",
+    manifest: {
+      name: appName,
+      short_name: appName,
+      description: `${appName} - PWA Application`,
+      theme_color: "#101113",
+      background_color: "#101113",
+    },
+    devOptions: { enabled: true, type: "module" },
+    injectManifest: {
+      globPatterns: ["**/*.{js,css,html,ico,png,svg,woff2}"],
+      maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
+    },
+  });
+  const pwaApi = pwaPlugins.find((plugin) => plugin.name === "vite-plugin-pwa")?.api as
+    | VitePluginPWAAPI
+    | undefined;
+  if (!pwaApi) throw new Error("vite-plugin-pwa did not expose its build API.");
+
   return {
     envDir,
     plugins: [
       tailwindcss(),
       tanstackStart(),
       react(),
-      VitePWA({
-        strategies: "injectManifest",
-        srcDir: "src",
-        filename: "sw.ts",
-        registerType: "autoUpdate",
-        manifest: {
-          name: appName,
-          short_name: appName,
-          description: `${appName} - PWA Application`,
-          theme_color: "#101113",
-          background_color: "#101113",
-        },
-        devOptions: { enabled: true, type: "module" },
-        injectManifest: {
-          globPatterns: ["**/*.{js,css,html,ico,png,svg,woff2}"],
-          maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
-        },
-      }),
+      ...pwaPlugins,
+      tanstackPwaBuildPlugin(pwaApi),
     ],
     define: {
       __APP_VERSION__: JSON.stringify(buildVersion),

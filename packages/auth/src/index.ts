@@ -124,6 +124,8 @@ export const auth = betterAuth({
   },
   emailAndPassword: {
     enabled: true,
+    // Product policy: keep the creation/reset minimum at eight characters.
+    minPasswordLength: 8,
     requireEmailVerification: false,
   },
   emailVerification: {
@@ -152,6 +154,9 @@ export const auth = betterAuth({
   secret: env.BETTER_AUTH_SECRET,
   baseURL: env.BETTER_AUTH_URL,
   session: {
+    // Deliberately do not enable Better Auth cookieCache. Session revocation,
+    // bans, and role changes must take effect on the next request rather than
+    // after a cached-cookie freshness window.
     // session:30d, refresh every 1d
     expiresIn: 60 * 60 * 24 * 30,
     updateAge: 60 * 60 * 24,

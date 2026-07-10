@@ -1,5 +1,6 @@
 import { createRouterClient, ORPCError } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
+import { invalidateForceTwoFactorPolicyCache } from "@ws-model-proxy/auth/force-two-factor-policy";
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -91,6 +92,7 @@ function buildContext(
 
 beforeEach(() => {
   vi.clearAllMocks();
+  invalidateForceTwoFactorPolicyCache();
   db.appSetting.findUnique.mockResolvedValue(null);
 });
 

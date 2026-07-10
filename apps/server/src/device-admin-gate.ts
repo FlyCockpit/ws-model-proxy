@@ -1,4 +1,5 @@
 import { auth } from "@ws-model-proxy/auth";
+import { cookieSessionHeaders } from "@ws-model-proxy/auth/cookie-session";
 import type { Context, Next } from "hono";
 
 // Signed-in-user gate for the Better-Auth deviceAuthorization plugin's
@@ -21,7 +22,9 @@ import type { Context, Next } from "hono";
 export async function deviceAdminGate(c: Context, next: Next) {
   let session: Awaited<ReturnType<typeof auth.api.getSession>> | null = null;
   try {
-    session = await auth.api.getSession({ headers: c.req.raw.headers });
+    session = await auth.api.getSession({
+      headers: cookieSessionHeaders(c.req.raw.headers),
+    });
   } catch {
     session = null;
   }

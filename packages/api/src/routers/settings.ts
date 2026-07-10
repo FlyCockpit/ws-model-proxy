@@ -1,4 +1,5 @@
 import { ORPCError } from "@orpc/server";
+import { invalidateForceTwoFactorPolicyCache } from "@ws-model-proxy/auth/force-two-factor-policy";
 import { SIGNUP_ENABLED_SETTING_KEY } from "@ws-model-proxy/auth/signup-policy";
 import prisma from "@ws-model-proxy/db";
 import { z } from "zod";
@@ -62,6 +63,9 @@ export const settingsRouter = {
         update: { value: input.value },
         create: { key: input.key, value: input.value },
       });
+      if (input.key === "force2fa") {
+        invalidateForceTwoFactorPolicyCache();
+      }
 
       return { success: true };
     }),

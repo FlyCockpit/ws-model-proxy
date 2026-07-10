@@ -20,6 +20,9 @@ vi.mock("@ws-model-proxy/auth", () => ({
 
 const { default: prisma } = await import("@ws-model-proxy/db");
 const { betterAuthAdminGate } = await import("./better-auth-admin-gate");
+const { invalidateForceTwoFactorPolicyCache } = await import(
+  "@ws-model-proxy/auth/force-two-factor-policy"
+);
 
 const db = prisma as unknown as {
   appSetting: { findUnique: ReturnType<typeof vi.fn> };
@@ -31,6 +34,7 @@ describe("betterAuthAdminGate", () => {
 
   beforeEach(() => {
     getSession.mockReset();
+    invalidateForceTwoFactorPolicyCache();
     db.appSetting.findUnique.mockResolvedValue(null);
     downstream.mockClear();
     app = new Hono();
@@ -88,10 +92,19 @@ describe("betterAuthAdminGate", () => {
     getSession.mockResolvedValue({
       user: { id: "a1", role: "admin", emailVerified: true, twoFactorEnabled: false },
     });
-    const res = await app.request("/api/auth/admin/set-role", { method: "POST" });
+    const res = await app.request("/api/auth/admin/set-role", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer wsmp_model_secret",
+        Cookie: "better-auth.session_token=signed-session",
+      },
+    });
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
     expect(downstream).toHaveBeenCalledTimes(1);
+    const call = getSession.mock.calls[0]?.[0] as { headers: Headers };
+    expect(call.headers.get("authorization")).toBeNull();
+    expect(call.headers.get("cookie")).toBe("better-auth.session_token=signed-session");
   });
 
   it("admits verified admins with 2FA when force2fa is enabled", async () => {

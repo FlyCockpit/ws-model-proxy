@@ -1,6 +1,6 @@
 import { ORPCError, os } from "@orpc/server";
+import { isForceTwoFactorRequired } from "@ws-model-proxy/auth/force-two-factor-policy";
 import { isAdminRole } from "@ws-model-proxy/auth/roles";
-import prisma from "@ws-model-proxy/db";
 
 import type { Context } from "./context";
 
@@ -21,19 +21,11 @@ const requireAuth = o.middleware(async ({ context, next }) => {
 
 export const authenticatedProcedure = publicProcedure.use(requireAuth);
 
-async function isForce2faEnabled(): Promise<boolean> {
-  const setting = await prisma.appSetting.findUnique({
-    where: { key: "force2fa" },
-    select: { value: true },
-  });
-  return setting?.value === "true";
-}
-
 const requireRequiredTwoFactor = o.middleware(async ({ context, next }) => {
   if (!context.session?.user) {
     throw new ORPCError("UNAUTHORIZED");
   }
-  if ((await isForce2faEnabled()) && !context.session.user.twoFactorEnabled) {
+  if ((await isForceTwoFactorRequired()) && !context.session.user.twoFactorEnabled) {
     throw new ORPCError("FORBIDDEN", {
       message: "Two-factor authentication setup is required.",
     });
@@ -64,7 +56,7 @@ const requireAdmin = o.middleware(async ({ context, next }) => {
       message: "Admin access required.",
     });
   }
-  if ((await isForce2faEnabled()) && !context.session.user.twoFactorEnabled) {
+  if ((await isForceTwoFactorRequired()) && !context.session.user.twoFactorEnabled) {
     throw new ORPCError("FORBIDDEN", {
       message: "Two-factor authentication setup is required.",
     });
@@ -94,7 +86,7 @@ const requireAdminOr404 = o.middleware(async ({ context, next }) => {
   if (!isAdminRole(context.session.user.role)) {
     throw notFound();
   }
-  if ((await isForce2faEnabled()) && !context.session.user.twoFactorEnabled) {
+  if ((await isForceTwoFactorRequired()) && !context.session.user.twoFactorEnabled) {
     throw notFound();
   }
   return next({

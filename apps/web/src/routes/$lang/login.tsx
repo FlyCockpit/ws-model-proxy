@@ -324,7 +324,7 @@ function SignInForm({
       // the global map and leak hardcoded English copy into es-MX UIs.
       onSubmit: z.object({
         email: z.email(),
-        password: z.string().min(8),
+        password: z.string().min(1),
       }),
     },
   });

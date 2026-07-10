@@ -24,9 +24,9 @@ export function mountSecurityHeaders<E extends Env>(
         // c.get("secureHeadersNonce"). The SSR handler forwards it to TanStack
         // Start so its inline hydration scripts carry a matching nonce.
         scriptSrc: [NONCE, "'self'", themeInitCspHash],
-        // Intentional product tradeoff: Tailwind/shadcn-driven app UI and AI
-        // generated small-business customizations often rely on inline styles.
-        // Keep script-src strict; remove this only after auditing app-specific UI.
+        // Intentional product tradeoff: Tailwind/shadcn and SSR theme styles
+        // currently rely on inline style attributes. Keep script-src strict;
+        // remove this exception after the rendered app no longer needs it.
         styleSrc: ["'self'", "'unsafe-inline'"],
         imgSrc: ["'self'", "data:", "blob:"],
         connectSrc: cspConnectSrc,

@@ -10,6 +10,12 @@
     },
     "./roles": {
       "default": "./src/roles.ts"
+    },
+    "./cookie-session": {
+      "default": "./src/cookie-session.ts"
+    },
+    "./force-two-factor-policy": {
+      "default": "./src/force-two-factor-policy.ts"
     }
   },
   "scripts": {

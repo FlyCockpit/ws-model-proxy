@@ -3,6 +3,12 @@ import type { Session } from "@ws-model-proxy/auth";
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+const forceTwoFactorPolicy = vi.hoisted(() => ({
+  invalidateForceTwoFactorPolicyCache: vi.fn(),
+  isForceTwoFactorRequired: vi.fn(),
+}));
+vi.mock("@ws-model-proxy/auth/force-two-factor-policy", () => forceTwoFactorPolicy);
+
 import type { Context } from "../context";
 import { settingsRouter } from "./settings";
 
@@ -76,6 +82,7 @@ function buildContext(
 describe("settingsRouter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    forceTwoFactorPolicy.isForceTwoFactorRequired.mockResolvedValue(false);
   });
 
   describe("getAll", () => {
@@ -197,6 +204,7 @@ describe("settingsRouter", () => {
         update: { value: "false" },
         create: { key: "force2fa", value: "false" },
       });
+      expect(forceTwoFactorPolicy.invalidateForceTwoFactorPolicyCache).toHaveBeenCalledOnce();
     });
 
     it("permits admins to update signupEnabled", async () => {
@@ -219,6 +227,7 @@ describe("settingsRouter", () => {
         update: { value: "false" },
         create: { key: "signupEnabled", value: "false" },
       });
+      expect(forceTwoFactorPolicy.invalidateForceTwoFactorPolicyCache).not.toHaveBeenCalled();
     });
 
     it("rejects unknown setting keys", async () => {

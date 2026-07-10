@@ -1,4 +1,5 @@
 import { auth, type Session } from "@ws-model-proxy/auth";
+import { cookieSessionHeaders } from "@ws-model-proxy/auth/cookie-session";
 import type { Context as HonoContext } from "hono";
 
 export type CreateContextOptions = {
@@ -14,7 +15,7 @@ export async function createContext({ context }: CreateContextOptions) {
     preresolved !== undefined
       ? preresolved
       : ((await auth.api.getSession({
-          headers: context.req.raw.headers,
+          headers: cookieSessionHeaders(context.req.raw.headers),
         })) as Session | null);
   return {
     session,
