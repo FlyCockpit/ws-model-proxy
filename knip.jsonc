@@ -5,6 +5,10 @@
     // production runtime graph.
     "scripts/*.ts"
   ],
+  "ignoreExportsUsedInFile": true,
+  "ignoreIssues": {
+    "apps/server/src/ssr-cache.ts": ["exports"]
+  },
   "workspaces": {
     ".": {
       "ignoreBinaries": [

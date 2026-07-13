@@ -17,8 +17,10 @@ import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { useTranslation } from "react-i18next";
 import z from "zod";
-
+import { useAuthSession } from "@/hooks/use-auth-session";
 import { authClient } from "@/lib/auth-client";
+import { requireAnonymousOnlyRoute } from "@/lib/route-session-access";
+import { getRouteSession } from "@/server/auth-session";
 import { friendly } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 import { safeRedirectTo } from "@/utils/safe-redirect";
@@ -28,10 +30,11 @@ export const Route = createFileRoute("/$lang/signup")({
     redirectTo: typeof search.redirectTo === "string" ? search.redirectTo : undefined,
   }),
   beforeLoad: async ({ context, params, search }) => {
-    const session = await authClient.getSession();
-    if (session.data) {
-      throw redirect({ href: safeRedirectTo(search.redirectTo, params.lang) });
-    }
+    requireAnonymousOnlyRoute({
+      session: await getRouteSession(),
+      lang: params.lang,
+      redirectTo: search.redirectTo,
+    });
     const cfg = await context.queryClient.ensureQueryData(orpc.appConfig.queryOptions());
     if (cfg.forceSso || (!cfg.signupEnabled && !cfg.adminBootstrapSignupEnabled)) {
       throw redirect({ to: "/$lang/login", params: { lang: params.lang }, search });
@@ -43,14 +46,14 @@ export const Route = createFileRoute("/$lang/signup")({
 function SignupPage() {
   const { lang } = Route.useParams();
   const { redirectTo } = Route.useSearch();
-  const { isPending } = authClient.useSession();
+  const { state } = useAuthSession();
   const config = useQuery(orpc.appConfig.queryOptions());
   const { t } = useTranslation(["auth", "common"]);
 
   const postAuthRedirect = safeRedirectTo(redirectTo, lang);
   const forceSso = config.data?.forceSso === true;
 
-  if (isPending || config.isPending) {
+  if (state.status === "pending" || config.isPending) {
     return (
       <div className="flex min-h-[80vh] items-center justify-center px-4">
         <div className="w-full max-w-md space-y-6">

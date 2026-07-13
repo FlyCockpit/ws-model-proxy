@@ -10,10 +10,10 @@ import {
 import { Languages } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
+import { useAuthSession } from "@/hooks/use-auth-session";
 import { useHaptics } from "@/hooks/use-haptics";
 import { isSupportedLocale, type Locale, SUPPORTED_LOCALES } from "@/i18n/config";
 import { LOCALE_LABELS } from "@/i18n/labels";
-import { useDeferredSession } from "@/stores/session";
 import { orpc } from "@/utils/orpc";
 
 /**
@@ -29,7 +29,7 @@ export default function LanguageSwitcherSelect() {
   // `strict: false` so the switcher renders under any matched route — the
   // top-level `/` redirect briefly mounts without `lang` in scope.
   const params = useParams({ strict: false });
-  const { data: session } = useDeferredSession();
+  const { state, meta } = useAuthSession();
 
   // Silent server-side sync of the signed-in user's preference. The router's
   // global error toast handles failures — the URL switch already succeeded by
@@ -66,7 +66,11 @@ export default function LanguageSwitcherSelect() {
 
     // Persist server-side so the choice follows the user across devices.
     // Skipped for unauthenticated visitors — there is nothing to persist to.
-    if (session?.user && session.user.locale !== value) {
+    if (
+      state.status === "authenticated" &&
+      !meta.isDegraded &&
+      state.session.user.locale !== value
+    ) {
       updateLocale.mutate({ locale: value });
     }
   };

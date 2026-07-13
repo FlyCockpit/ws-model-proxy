@@ -1,3 +1,4 @@
+import { useQuery } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
@@ -16,6 +17,7 @@ import { useTranslation } from "react-i18next";
 
 import { TwoFactorSetupDetails } from "@/components/two-factor-setup-details";
 import { authClient } from "@/lib/auth-client";
+import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/settings/security")({
   component: SecuritySettings,
@@ -24,6 +26,7 @@ export const Route = createFileRoute("/$lang/_auth/settings/security")({
 function SecuritySettings() {
   const { session } = Route.useRouteContext();
   const has2FA = session.user.twoFactorEnabled === true;
+  const passwordCapabilities = useQuery(orpc.auth.passwordCapabilities.queryOptions());
   const { t } = useTranslation("settings");
 
   return (
@@ -44,7 +47,98 @@ function SecuritySettings() {
         </CardHeader>
         <CardContent>{has2FA ? <Disable2FASection /> : <Enable2FASection />}</CardContent>
       </Card>
+      {passwordCapabilities.data?.canChangePassword && <ChangePasswordCard />}
     </div>
+  );
+}
+
+function ChangePasswordCard() {
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const { t } = useTranslation(["settings", "auth", "common"]);
+
+  const canSubmit =
+    currentPassword.length > 0 && newPassword.length >= 8 && newPassword === confirmPassword;
+
+  const handleChangePassword = async () => {
+    if (!canSubmit) return;
+    setIsLoading(true);
+    try {
+      const result = await authClient.changePassword({
+        currentPassword,
+        newPassword,
+        revokeOtherSessions: true,
+      });
+      if (result.error) {
+        console.error("[settings.security.changePassword]", result.error);
+        toast.error(t("settings:security.changePasswordError"));
+        return;
+      }
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+      toast.success(t("settings:security.changePasswordSuccess"));
+    } catch (err) {
+      console.error("[settings.security.changePassword]", err);
+      toast.error(t("settings:security.changePasswordError"));
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{t("settings:security.changePasswordTitle")}</CardTitle>
+        <CardDescription>{t("settings:security.changePasswordDescription")}</CardDescription>
+      </CardHeader>
+      <CardContent className="max-w-sm space-y-4">
+        <div className="space-y-2">
+          <Label htmlFor="current-password">{t("auth:fields.password")}</Label>
+          <Input
+            id="current-password"
+            type="password"
+            autoComplete="current-password"
+            value={currentPassword}
+            onChange={(event) => setCurrentPassword(event.target.value)}
+          />
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="new-password">{t("settings:security.newPassword")}</Label>
+          <Input
+            id="new-password"
+            type="password"
+            autoComplete="new-password"
+            value={newPassword}
+            onChange={(event) => setNewPassword(event.target.value)}
+          />
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="confirm-new-password">{t("settings:security.confirmNewPassword")}</Label>
+          <Input
+            id="confirm-new-password"
+            type="password"
+            autoComplete="new-password"
+            value={confirmPassword}
+            onChange={(event) => setConfirmPassword(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") handleChangePassword();
+            }}
+          />
+        </div>
+        <Button
+          className="min-h-[44px]"
+          onClick={handleChangePassword}
+          disabled={!canSubmit || isLoading}
+        >
+          {isLoading
+            ? t("settings:security.changingPassword")
+            : t("settings:security.changePassword")}
+        </Button>
+      </CardContent>
+    </Card>
   );
 }
 

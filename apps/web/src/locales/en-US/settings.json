@@ -44,6 +44,14 @@
     "disable": "Disable 2FA",
     "disabling": "Disabling…",
     "couldNotDisable": "Couldn't disable 2FA. Try again.",
-    "disabledSuccess": "Two-factor authentication disabled"
+    "disabledSuccess": "Two-factor authentication disabled",
+    "changePasswordTitle": "Password",
+    "changePasswordDescription": "Change your password and sign out other active sessions.",
+    "newPassword": "New password",
+    "confirmNewPassword": "Confirm new password",
+    "changePassword": "Change password",
+    "changingPassword": "Changing…",
+    "changePasswordSuccess": "Password changed",
+    "changePasswordError": "Couldn't change your password. Check your current password and try again."
   }
 }

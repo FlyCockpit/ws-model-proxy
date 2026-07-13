@@ -1,5 +1,7 @@
 FROM node:24-slim AS base
 
+ARG APT_CACHE_DATE=static
+
 # Runtime base:
 #   - openssl: required by Prisma query engine
 #   - postgresql-client: provides psql, used by docker-entrypoint.sh to hold a
@@ -7,7 +9,7 @@ FROM node:24-slim AS base
 # `apt-get upgrade` pulls the latest Debian 12 security patches for packages
 # already in node:24-slim (glibc, libcap2, systemd libs, etc.) — the base image
 # lags the Debian point release, so Trivy fails on fixable HIGH CVEs without it.
-RUN apt-get update -y && apt-get upgrade -y && apt-get install -y \
+RUN echo "APT cache date: ${APT_CACHE_DATE}" && apt-get update -y && apt-get upgrade -y && apt-get install -y \
   openssl \
   postgresql-client \
   && rm -rf /var/lib/apt/lists/*
@@ -22,6 +24,7 @@ RUN apt-get update -y && apt-get install -y \
 
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
+ENV NODE_OPTIONS="--max-old-space-size=4096"
 RUN corepack enable && corepack prepare pnpm@11.1.2 --activate
 
 # --- Builder stage ---
@@ -134,6 +137,15 @@ COPY packages/db/prisma packages/db/prisma
 # external — so web's runtime deps must be present in the image for SSR to load.
 RUN pnpm install --frozen-lockfile --prod --ignore-scripts --filter=server... --filter=web...
 
+# TypeScript is only needed while building and type-checking. It can appear in
+# prod node_modules as an optional/types peer of runtime packages; remove it
+# from the production dependency layer so the runtime image does not ship tsc
+# or its platform-native TS 7 binary.
+RUN rm -rf node_modules/.pnpm/typescript@* \
+  node_modules/typescript \
+  apps/server/node_modules/typescript \
+  apps/web/node_modules/typescript
+
 # --- Runner stage ---
 # Server image: Hono API + SSR bundle + static web SPA. Ships the Prisma CLI
 # and postgresql-client so `prisma db push` can run on boot when
@@ -143,6 +155,7 @@ RUN pnpm install --frozen-lockfile --prod --ignore-scripts --filter=server... --
 FROM base AS runner
 
 ENV NODE_ENV=production
+ENV NODE_OPTIONS="--max-old-space-size=512"
 WORKDIR /app
 
 # Copy workspace config (needed for pnpm --filter at runtime)

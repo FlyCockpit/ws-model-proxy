@@ -1,9 +1,9 @@
 import { useParams, useRouter } from "@tanstack/react-router";
 import { useEffect } from "react";
 
+import { useAuthSession } from "@/hooks/use-auth-session";
 import i18n from "@/i18n";
 import { isSupportedLocale } from "@/i18n/config";
-import { useDeferredSession } from "@/stores/session";
 
 /**
  * Sync a signed-in user's stored locale (Prisma `User.locale`) into the
@@ -30,13 +30,13 @@ import { useDeferredSession } from "@/stores/session";
  * `useEffect` per CLAUDE.md "React useEffect Policy."
  */
 export function useUserLocaleSync(): void {
-  const { data: session } = useDeferredSession();
+  const { state } = useAuthSession();
   const router = useRouter();
   // `strict: false` so we render under the brief `/` redirect window where
   // `lang` isn't matched yet.
   const params = useParams({ strict: false });
 
-  const userLocale = session?.user?.locale;
+  const userLocale = state.status === "authenticated" ? state.session.user.locale : null;
 
   useEffect(() => {
     if (!userLocale) return;

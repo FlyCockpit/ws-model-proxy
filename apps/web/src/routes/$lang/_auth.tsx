@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { createFileRoute, Outlet, redirect } from "@tanstack/react-router";
+import { createFileRoute, Outlet } from "@tanstack/react-router";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
   Card,
@@ -18,19 +18,18 @@ import { useTranslation } from "react-i18next";
 import { InlineRetry } from "@/components/inline-retry";
 import { TwoFactorSetupDetails } from "@/components/two-factor-setup-details";
 import { authClient } from "@/lib/auth-client";
+import { requireProtectedRoute } from "@/lib/route-session-access";
+import { getRouteSession } from "@/server/auth-session";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth")({
   beforeLoad: async ({ location, params }) => {
-    const session = await authClient.getSession();
-    if (!session.data) {
-      throw redirect({
-        to: "/$lang/login",
-        params: { lang: params.lang },
-        search: { redirectTo: location.href },
-      });
-    }
-    return { session: session.data };
+    const session = requireProtectedRoute({
+      session: await getRouteSession(),
+      lang: params.lang,
+      href: location.href,
+    });
+    return { session };
   },
   component: AuthLayout,
 });

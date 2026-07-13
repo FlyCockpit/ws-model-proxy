@@ -1,6 +1,5 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { createFileRoute, Link, redirect } from "@tanstack/react-router";
-import { hasRole } from "@ws-model-proxy/auth/roles";
+import { createFileRoute, Link } from "@tanstack/react-router";
 import { env } from "@ws-model-proxy/env/web";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
@@ -16,6 +15,8 @@ import { useState } from "react";
 import { Trans, useTranslation } from "react-i18next";
 
 import { authClient } from "@/lib/auth-client";
+import { requireDeviceAdminRoute } from "@/lib/route-session-access";
+import { getRouteSession } from "@/server/auth-session";
 import { friendly } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 
@@ -30,18 +31,12 @@ export const Route = createFileRoute("/$lang/device")({
     return { user_code: userCode };
   },
   beforeLoad: async ({ params }) => {
-    const session = await authClient.getSession();
-    if (!session.data) {
-      throw redirect({
-        to: "/$lang/login",
-        params: { lang: params.lang },
-        search: { redirectTo: `/${params.lang}/device` },
-      });
-    }
-    if (!session.data.user.emailVerified || !hasRole(session.data.user.role, "admin")) {
-      throw redirect({ to: "/$lang/dashboard", params: { lang: params.lang } });
-    }
-    return { session: session.data };
+    const session = requireDeviceAdminRoute({
+      session: await getRouteSession(),
+      lang: params.lang,
+      redirectTo: `/${params.lang}/device`,
+    });
+    return { session };
   },
   component: DevicePage,
 });

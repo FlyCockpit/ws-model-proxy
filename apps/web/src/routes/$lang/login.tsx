@@ -1,6 +1,6 @@
 import { useForm } from "@tanstack/react-form";
 import { useQuery } from "@tanstack/react-query";
-import { createFileRoute, Link, redirect, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { Button, buttonVariants } from "@ws-model-proxy/ui/components/button";
 import {
   Card,
@@ -17,8 +17,10 @@ import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
-
+import { useAuthSession } from "@/hooks/use-auth-session";
 import { authClient } from "@/lib/auth-client";
+import { requireAnonymousOnlyRoute } from "@/lib/route-session-access";
+import { getRouteSession } from "@/server/auth-session";
 import { friendly, isRateLimit } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 import { safeRedirectTo } from "@/utils/safe-redirect";
@@ -28,10 +30,11 @@ export const Route = createFileRoute("/$lang/login")({
     redirectTo: typeof search.redirectTo === "string" ? search.redirectTo : undefined,
   }),
   beforeLoad: async ({ params, search }) => {
-    const session = await authClient.getSession();
-    if (session.data) {
-      throw redirect({ href: safeRedirectTo(search.redirectTo, params.lang) });
-    }
+    requireAnonymousOnlyRoute({
+      session: await getRouteSession(),
+      lang: params.lang,
+      redirectTo: search.redirectTo,
+    });
   },
   component: LoginPage,
 });
@@ -46,7 +49,7 @@ function LoginPage() {
   // verification path from verifyTotp to verifyOtp.
   const [otpSent, setOtpSent] = useState(false);
   const [isSendingOtp, setIsSendingOtp] = useState(false);
-  const { isPending } = authClient.useSession();
+  const { state } = useAuthSession();
   const config = useQuery(orpc.appConfig.queryOptions());
   const { t } = useTranslation(["auth", "common"]);
 
@@ -59,7 +62,7 @@ function LoginPage() {
   const emailEnabled = config.data?.emailEnabled ?? false;
   const postAuthRedirect = safeRedirectTo(redirectTo, lang);
 
-  if (isPending || config.isPending) {
+  if (state.status === "pending" || config.isPending) {
     return (
       <div className="flex min-h-[80vh] items-center justify-center px-4">
         <div className="w-full max-w-md space-y-6">

@@ -35,6 +35,7 @@ import { mountSecurityHeaders } from "./security-headers.js";
 import { registerSeoRoutes } from "./seo.js";
 import { sessionMiddleware } from "./session-middleware.js";
 import { signupAccessGate } from "./signup-access-gate.js";
+import { getOrSetSsrCache } from "./ssr-cache.js";
 
 // ---------------------------------------------------------------------------
 // Startup guards
@@ -365,7 +366,7 @@ if (env.NODE_ENV === "production") {
       headers.set("x-csp-nonce", nonce);
       request = new Request(request, { headers });
     }
-    return startHandler.fetch(request);
+    return getOrSetSsrCache(request, () => startHandler.fetch(request), { nonce });
   });
 } else {
   app.get("/", (c) => {

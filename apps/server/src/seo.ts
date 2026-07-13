@@ -35,7 +35,7 @@ type PublicPath = {
 // Public, indexable content pages only. Authenticated pages, admin routes,
 // utility auth/device routes, demos, and other non-indexable surfaces stay out
 // of sitemap.xml/llms.txt even if they are technically reachable.
-const PUBLIC_PATHS: PublicPath[] = [
+export const PUBLIC_PATHS: PublicPath[] = [
   { path: "", title: "Home", changefreq: "weekly", priority: 1.0 },
 ];
 

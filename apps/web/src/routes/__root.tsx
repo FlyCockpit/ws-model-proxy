@@ -17,7 +17,7 @@ import { TanStackRouterDevtools } from "@tanstack/react-router-devtools";
 import { THEME_INIT_SCRIPT } from "@ws-model-proxy/config/theme-init";
 import { env } from "@ws-model-proxy/env/web";
 import { Toaster } from "@ws-model-proxy/ui/components/sileo";
-import { lazy, type ReactNode, Suspense } from "react";
+import { type ReactNode } from "react";
 import { I18nextProvider } from "react-i18next";
 import BottomNav from "@/components/bottom-nav";
 import ErrorState from "@/components/error-state";
@@ -41,11 +41,6 @@ export interface RouterAppContext {
 }
 
 const APP_NAME = env.VITE_APP_NAME;
-
-// Headless better-auth session bridge. Lazy so the better-auth client chunk and
-// its `get-session` fetch load after first paint instead of during hydration;
-// consumers read the session via `useDeferredSession()` (stores/session.ts).
-const SessionSync = lazy(() => import("@/components/session-sync"));
 
 export const Route = createRootRouteWithContext<RouterAppContext>()({
   // SPA by default. Individual routes can opt into SSR with `ssr: true` or
@@ -170,9 +165,6 @@ function RootComponent() {
             <BottomNav hidden={mobileKeyboardOpen} />
           </div>
           <ThemeColorSync />
-          <Suspense fallback={null}>
-            <SessionSync />
-          </Suspense>
           <Toaster />
           {import.meta.env.DEV && (
             <>

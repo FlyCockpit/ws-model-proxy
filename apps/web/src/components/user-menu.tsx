@@ -6,8 +6,8 @@ import { User } from "lucide-react";
 import { lazy, Suspense, useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { useAuthSession } from "@/hooks/use-auth-session";
 import { DEFAULT_LOCALE, isSupportedLocale } from "@/i18n/config";
-import { useDeferredSession } from "@/stores/session";
 import { orpc } from "@/utils/orpc";
 
 // Lazy so the shared Base UI overlay chunk (Menu/Dialog/focus-guards) leaves the
@@ -27,16 +27,16 @@ export default function UserMenu() {
   // top-level `/` redirect route without throwing.
   const params = useParams({ strict: false });
   const lang = isSupportedLocale(params.lang) ? params.lang : DEFAULT_LOCALE;
-  const { data: session, isPending } = useDeferredSession();
+  const { state } = useAuthSession();
   const config = useQuery(orpc.appConfig.queryOptions());
   const { t } = useTranslation("nav");
   const [mounted, setMounted] = useState(false);
 
-  if (isPending) {
+  if (state.status === "pending") {
     return <Skeleton className="h-11 w-24" />;
   }
 
-  if (!session) {
+  if (state.status !== "authenticated") {
     // Default to NOT showing Sign Up until the flag is known, so it never
     // flashes when signup is disabled.
     const showSignUp =
@@ -78,7 +78,7 @@ export default function UserMenu() {
       }}
     >
       <User className="size-4 md:hidden" aria-hidden="true" />
-      <span className="hidden md:inline">{session.user.name}</span>
+      <span className="hidden md:inline">{state.session.user.name}</span>
     </Button>
   );
 

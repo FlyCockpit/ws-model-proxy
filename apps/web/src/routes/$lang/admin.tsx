@@ -1,25 +1,20 @@
-import { createFileRoute, Link, notFound, Outlet } from "@tanstack/react-router";
-import { hasRole } from "@ws-model-proxy/auth/roles";
+import { createFileRoute, Link, Outlet } from "@tanstack/react-router";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { Activity, Database, LayoutDashboard, Settings, Smartphone, Users } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import { authClient } from "@/lib/auth-client";
+import { requireAdminRoute } from "@/lib/route-session-access";
+import { getRouteSession } from "@/server/auth-session";
 
 export const Route = createFileRoute("/$lang/admin")({
   beforeLoad: async () => {
-    const session = await authClient.getSession();
     // 404-hide the entire admin tree from non-admins. Throwing notFound()
     // (instead of redirect) means an unauthorized visitor can't tell whether
     // /admin exists at all — same response as a route that doesn't exist.
     // Narrow session.data here so children inherit a non-null `session`
     // and can call hooks without an early-return guard.
-    const sessionData = session.data;
-    const user = sessionData?.user;
-    if (!sessionData || !user?.emailVerified || !hasRole(user.role, "admin")) {
-      throw notFound();
-    }
-    return { session: sessionData };
+    const session = requireAdminRoute({ session: await getRouteSession() });
+    return { session };
   },
   component: AdminLayout,
 });
@@ -80,7 +75,7 @@ function AdminNav() {
       className="sticky top-0 z-30 border-b bg-background/80 backdrop-blur"
     >
       <div className="container mx-auto min-w-0 max-w-7xl">
-        <ul className="-mb-px flex gap-1 overflow-x-auto no-scrollbar px-4 py-2">
+        <ul className="-mb-px flex gap-1 overflow-x-auto overscroll-x-contain no-scrollbar px-4 py-2">
           {NAV_ITEMS.map((item) => (
             <li key={item.to} className="shrink-0">
               <Link

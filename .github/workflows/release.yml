@@ -98,6 +98,10 @@ jobs:
         shell: bash
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
+      - name: Compute apt cache-bust date
+        id: apt-cache
+        run: echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+
       - name: Build and push container image
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
@@ -112,6 +116,7 @@ jobs:
             org.opencontainers.image.version=${{ needs.validate.outputs.version }}
           build-args: |
             BUILD_VERSION=${{ github.sha }}
+            APT_CACHE_DATE=${{ steps.apt-cache.outputs.date }}
           cache-from: type=gha,scope=release-app
           cache-to: type=gha,mode=max,scope=release-app
           provenance: false

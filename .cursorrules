@@ -69,10 +69,21 @@ Never run:
 
 - Data fetching goes through oRPC query and mutation options with TanStack Query.
 - Conditional fetching uses `enabled` or `skipToken`; do not conditionally call hooks.
+- Browser session state goes through `apps/web/src/hooks/use-auth-session.ts`.
+  Do not call `.useSession()` anywhere else in production code, and do not
+  mirror Better Auth session data into Zustand.
+- Route auth checks use `apps/web/src/server/auth-session.ts` plus pure
+  decisions from `apps/web/src/lib/route-session-access.ts`. Do not call
+  `authClient.getSession()` from route files.
 - Content loading states use layout-matching `Skeleton` components.
 - Forms use TanStack Form with native Zod validators.
 - Mobile touch targets should be at least 44px.
 - Respect safe-area CSS variables for edge-to-edge mobile layouts.
+- The root shell owns safe areas, bottom-nav clearance, viewport height, and
+  top-level scroll. Do not copy app-shell frame geometry into route files.
+- Prefer axis-specific overscroll: horizontal scrollers use
+  `overflow-x-auto overscroll-x-contain`; bounded vertical panes/dialogs can
+  use `overscroll-contain`.
 - Use the existing `BottomNav`; do not add a second mobile nav.
 - Do not use `transition: all` or Tailwind `transition-all`.
 - Use lucide icons where an existing icon fits.

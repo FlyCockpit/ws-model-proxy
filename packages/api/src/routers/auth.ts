@@ -2,8 +2,8 @@ import { SUPPORTED_LOCALES } from "@ws-model-proxy/config/locales";
 import prisma from "@ws-model-proxy/db";
 import { verifyTransport } from "@ws-model-proxy/mailer";
 import { z } from "zod";
-
 import { protectedProcedure, publicProcedure } from "../index";
+import { canUserChangePassword } from "../lib/password-capabilities";
 
 export const authRouter = {
   /**
@@ -39,4 +39,12 @@ export const authRouter = {
       });
       return { success: true };
     }),
+  passwordCapabilities: protectedProcedure.handler(async ({ context }) => {
+    return {
+      canChangePassword: await canUserChangePassword({
+        userId: context.session.user.id,
+        forceSso: false,
+      }),
+    };
+  }),
 };

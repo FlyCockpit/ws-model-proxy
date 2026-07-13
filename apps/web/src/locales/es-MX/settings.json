@@ -43,7 +43,15 @@
     "disabling": "Deshabilitando…",
     "couldNotDisable": "No se pudo deshabilitar 2FA. Intenta de nuevo.",
     "disabledSuccess": "Autenticación de dos factores deshabilitada",
-    "scanQrPrompt": "Escanea esto con tu aplicación de autenticación"
+    "scanQrPrompt": "Escanea esto con tu aplicación de autenticación",
+    "changePasswordTitle": "Contraseña",
+    "changePasswordDescription": "Cambia tu contraseña y cierra otras sesiones activas.",
+    "newPassword": "Nueva contraseña",
+    "confirmNewPassword": "Confirmar nueva contraseña",
+    "changePassword": "Cambiar contraseña",
+    "changingPassword": "Cambiando…",
+    "changePasswordSuccess": "Contraseña cambiada",
+    "changePasswordError": "No se pudo cambiar tu contraseña. Revisa tu contraseña actual e intenta de nuevo."
   },
   "title": "Configuración"
 }

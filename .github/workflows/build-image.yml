@@ -33,6 +33,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd  # v4
 
+      - name: Compute apt cache-bust date
+        id: apt-cache
+        run: echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+
       # Build the image defined by the repo-root Dockerfile but do not push it.
       # `load: true` puts the built image in the local Docker daemon so the
       # subsequent Trivy step can scan it by tag. Release publishing happens in
@@ -47,6 +51,8 @@ jobs:
           tags: |
             ${{ github.event.repository.name }}-${{ matrix.name }}:${{ github.sha }}
             ${{ github.event.repository.name }}-${{ matrix.name }}:latest
+          build-args: |
+            APT_CACHE_DATE=${{ steps.apt-cache.outputs.date }}
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
           provenance: false
@@ -63,4 +69,3 @@ jobs:
           exit-code: '1'
           ignore-unfixed: true
           format: table
-
