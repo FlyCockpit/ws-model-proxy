@@ -34,6 +34,8 @@ export function mountSecurityHeaders<E extends Env>(
         objectSrc: ["'none'"],
         baseUri: ["'self'"],
         frameAncestors: ["'none'"],
+        // Injected markup cannot POST credentials to an attacker origin.
+        formAction: ["'self'"],
       },
     }),
   );

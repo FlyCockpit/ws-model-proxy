@@ -15,11 +15,13 @@ import { Label } from "@ws-model-proxy/ui/components/label";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import z from "zod";
+import { ResendVerification } from "@/components/auth/resend-verification";
 import { useAuthSession } from "@/hooks/use-auth-session";
 import { authClient } from "@/lib/auth-client";
-import { requireAnonymousOnlyRoute } from "@/lib/route-session-access";
+import { decideAnonymousOnlyRouteAccess } from "@/lib/route-session-access";
 import { getRouteSession } from "@/server/auth-session";
 import { friendly } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
@@ -30,11 +32,11 @@ export const Route = createFileRoute("/$lang/signup")({
     redirectTo: typeof search.redirectTo === "string" ? search.redirectTo : undefined,
   }),
   beforeLoad: async ({ context, params, search }) => {
-    requireAnonymousOnlyRoute({
-      session: await getRouteSession(),
-      lang: params.lang,
-      redirectTo: search.redirectTo,
-    });
+    const decision = decideAnonymousOnlyRouteAccess(await getRouteSession());
+    if (decision.kind === "error") throw new Error("Route session unavailable");
+    if (decision.kind === "redirect-authenticated") {
+      throw redirect({ href: safeRedirectTo(search.redirectTo, params.lang) });
+    }
     const cfg = await context.queryClient.ensureQueryData(orpc.appConfig.queryOptions());
     if (cfg.forceSso || (!cfg.signupEnabled && !cfg.adminBootstrapSignupEnabled)) {
       throw redirect({ to: "/$lang/login", params: { lang: params.lang }, search });
@@ -49,9 +51,48 @@ function SignupPage() {
   const { state } = useAuthSession();
   const config = useQuery(orpc.appConfig.queryOptions());
   const { t } = useTranslation(["auth", "common"]);
+  const [pendingEmail, setPendingEmail] = useState<string | null>(null);
 
   const postAuthRedirect = safeRedirectTo(redirectTo, lang);
   const forceSso = config.data?.forceSso === true;
+  const emailEnabled = config.data?.emailEnabled === true;
+  const canResend = emailEnabled && !forceSso;
+
+  if (pendingEmail) {
+    return (
+      <div className="flex min-h-[80vh] items-center justify-center px-4">
+        <Card className="w-full max-w-md">
+          <CardHeader className="text-center">
+            <CardTitle className="text-2xl">
+              {canResend ? t("auth:verifyEmail.sentTitle") : t("auth:verifyEmail.pendingTitle")}
+            </CardTitle>
+            <CardDescription>
+              {canResend
+                ? t("auth:verifyEmail.sentDescription", { email: pendingEmail })
+                : t("auth:verifyEmail.accountCreatedNoEmail", { email: pendingEmail })}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <Link
+              to="/$lang/login"
+              params={{ lang }}
+              search={{ redirectTo: undefined }}
+              className={cn(buttonVariants(), "min-h-[44px] w-full")}
+            >
+              {t("auth:verifyEmail.signIn")}
+            </Link>
+            {canResend ? (
+              <ResendVerification email={pendingEmail} />
+            ) : (
+              <p className="text-center text-sm text-muted-foreground">
+                {t("auth:verifyEmail.emailUnavailable")}
+              </p>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
 
   if (state.status === "pending" || config.isPending) {
     return (
@@ -120,7 +161,12 @@ function SignupPage() {
           <CardDescription>{t("auth:login.createDescription")}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          <SignUpForm lang={lang} redirectTo={postAuthRedirect} />
+          <SignUpForm
+            lang={lang}
+            redirectTo={postAuthRedirect}
+            emailEnabled={emailEnabled}
+            onAccountCreatedNeedingVerification={setPendingEmail}
+          />
           <div className="text-center">
             <Link
               to="/$lang/login"
@@ -137,7 +183,17 @@ function SignupPage() {
   );
 }
 
-function SignUpForm({ lang, redirectTo }: { lang: string; redirectTo: string }) {
+function SignUpForm({
+  lang,
+  redirectTo,
+  emailEnabled,
+  onAccountCreatedNeedingVerification,
+}: {
+  lang: string;
+  redirectTo: string;
+  emailEnabled: boolean;
+  onAccountCreatedNeedingVerification: (email: string) => void;
+}) {
   const navigate = useNavigate();
   const { t } = useTranslation(["auth"]);
 
@@ -160,6 +216,12 @@ function SignUpForm({ lang, redirectTo }: { lang: string; redirectTo: string }) 
         return;
       }
       toast.success(t("auth:accountCreatedSuccess"));
+      // When email is configured, requireEmailVerification means signUp returns
+      // no session — stay here and show the verify-email pending UI.
+      if (emailEnabled) {
+        onAccountCreatedNeedingVerification(value.email);
+        return;
+      }
       if (redirectTo === `/${lang}/dashboard`) {
         navigate({ to: "/$lang/dashboard", params: { lang } });
       } else {

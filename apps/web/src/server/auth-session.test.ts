@@ -11,7 +11,9 @@ vi.mock("@ws-model-proxy/auth", () => ({
   },
 }));
 
-const { resolveRouteSession } = await import("./auth-session");
+const { resolveRouteSession, resolveRouteSessionFromAuth, toRouteSession } = await import(
+  "./auth-session"
+);
 
 describe("resolveRouteSession", () => {
   beforeEach(() => {
@@ -60,10 +62,50 @@ describe("resolveRouteSession", () => {
     await expect(resolveRouteSession(headers())).resolves.toBeNull();
   });
 
-  it("lets lookup failures bubble as route errors", async () => {
-    const error = new Error("database unavailable");
-    getSession.mockRejectedValue(error);
+  it("turns lookup failures into thrown errors for the legacy helper", async () => {
+    getSession.mockRejectedValue(new Error("database unavailable"));
 
-    await expect(resolveRouteSession(headers())).rejects.toBe(error);
+    await expect(resolveRouteSession(headers())).rejects.toThrow("Route session unavailable");
+  });
+});
+
+describe("resolveRouteSessionFromAuth", () => {
+  it("returns an error resolution instead of throwing", async () => {
+    const resolution = await resolveRouteSessionFromAuth(new Headers(), async () => {
+      throw new Error("database unavailable");
+    });
+    expect(resolution).toEqual({ status: "error" });
+  });
+
+  it("projects a resolved session", async () => {
+    const resolution = await resolveRouteSessionFromAuth(new Headers(), async () => ({
+      user: {
+        id: "u1",
+        name: "User",
+        email: "u@example.com",
+        emailVerified: true,
+        role: "user",
+        twoFactorEnabled: false,
+      },
+    }));
+    expect(resolution).toEqual({
+      status: "resolved",
+      session: {
+        user: {
+          id: "u1",
+          name: "User",
+          email: "u@example.com",
+          emailVerified: true,
+          role: "user",
+          twoFactorEnabled: false,
+        },
+      },
+    });
+  });
+});
+
+describe("toRouteSession", () => {
+  it("returns null for a missing session", () => {
+    expect(toRouteSession(null)).toBeNull();
   });
 });

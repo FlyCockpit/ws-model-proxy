@@ -1,6 +1,6 @@
 import { useForm } from "@tanstack/react-form";
 import { useQuery } from "@tanstack/react-query";
-import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, Link, redirect, useNavigate } from "@tanstack/react-router";
 import { Button, buttonVariants } from "@ws-model-proxy/ui/components/button";
 import {
   Card,
@@ -19,7 +19,7 @@ import { useTranslation } from "react-i18next";
 import z from "zod";
 import { useAuthSession } from "@/hooks/use-auth-session";
 import { authClient } from "@/lib/auth-client";
-import { requireAnonymousOnlyRoute } from "@/lib/route-session-access";
+import { decideAnonymousOnlyRouteAccess } from "@/lib/route-session-access";
 import { getRouteSession } from "@/server/auth-session";
 import { friendly, isRateLimit } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
@@ -30,11 +30,11 @@ export const Route = createFileRoute("/$lang/login")({
     redirectTo: typeof search.redirectTo === "string" ? search.redirectTo : undefined,
   }),
   beforeLoad: async ({ params, search }) => {
-    requireAnonymousOnlyRoute({
-      session: await getRouteSession(),
-      lang: params.lang,
-      redirectTo: search.redirectTo,
-    });
+    const decision = decideAnonymousOnlyRouteAccess(await getRouteSession());
+    if (decision.kind === "error") throw new Error("Route session unavailable");
+    if (decision.kind === "redirect-authenticated") {
+      throw redirect({ href: safeRedirectTo(search.redirectTo, params.lang) });
+    }
   },
   component: LoginPage,
 });

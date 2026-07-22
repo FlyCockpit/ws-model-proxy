@@ -34,6 +34,17 @@ export const env = createEnv({
     RATE_LIMIT_SIGNUP_POINTS: z.coerce.number().int().positive().default(3),
     RATE_LIMIT_SIGNUP_DURATION: z.coerce.number().int().positive().default(3600),
     RATE_LIMIT_SIGNUP_BLOCK_DURATION: z.coerce.number().int().positive().default(3600),
+    // Per-RECIPIENT cap on anonymous endpoints that mail an arbitrary address
+    // (verification resend, password reset). IP-keyed limiters alone do not
+    // bound how much mail one mailbox receives from rotating IPs. POINTS=0
+    // disables. blockDuration defaults to 0 so attacker-supplied addresses
+    // cannot be used as an unauthenticated lockout lever on resets.
+    RATE_LIMIT_EMAIL_RECIPIENT_POINTS: z.coerce.number().int().min(0).default(3),
+    RATE_LIMIT_EMAIL_RECIPIENT_DURATION: z.coerce.number().int().positive().default(3600),
+    RATE_LIMIT_EMAIL_RECIPIENT_BLOCK_DURATION: z.coerce.number().int().min(0).default(0),
+    // Same idea for signup (also mails a caller-supplied address). Higher
+    // budget so shared-NAT offices still work.
+    RATE_LIMIT_SIGNUP_RECIPIENT_POINTS: z.coerce.number().int().min(0).default(6),
     SSR_CACHE_TTL_SECONDS: z.coerce.number().int().min(0).default(60),
     // Number of reverse-proxy hops in front of the app, for deriving the real
     // client IP used as the anonymous rate-limit key.

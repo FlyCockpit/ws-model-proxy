@@ -18,3 +18,14 @@ export const DEFAULT_LOCALE: Locale = "en-US";
 export function isSupportedLocale(value: unknown): value is Locale {
   return typeof value === "string" && (SUPPORTED_LOCALES as readonly string[]).includes(value);
 }
+
+/**
+ * Request header carrying the locale the client is actually rendering.
+ *
+ * The auth client sets this on every request so signup can seed `User.locale`
+ * (and therefore verification / reset email language) from the `/$lang/` the
+ * user is on, not the Prisma default. Shared with the server's CORS
+ * `allowHeaders` list — a custom header the server doesn't allow fails
+ * preflight and blocks every auth request on a split-origin deploy.
+ */
+export const APP_LOCALE_HEADER = "x-app-locale";

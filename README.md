@@ -22,7 +22,9 @@ Self-hosted web app plus CLI for exposing locally hosted OpenAI-compatible model
 - The first signed-up user becomes admin automatically.
 - Later users are regular users unless promoted by an admin.
 - Admins can enable or disable open signup.
-- Auth works with email/password even when SMTP is not configured.
+- Auth works with email/password even when SMTP is not configured. When SMTP
+  is configured, email verification is required and the full verification UX
+  (safe callback URLs, resend, localized mail) is enabled.
 - The `wsmp` CLI authenticates with device auth or an API token, then holds an outbound websocket connection to the server.
 - A single CLI instance can forward to multiple local or network model endpoints.
 - Request images are forwarded through the proxy request and not stored by the app.
@@ -50,6 +52,27 @@ pnpm db:push
 pnpm dev
 ```
 
+### Environment files
+
+Root `.env.example` and `apps/web/.env.example` are **generated** from
+`scripts/lib/env-manifest.ts`. Do not hand-edit them.
+
+```sh
+pnpm env:sync          # rewrite the .env.example files from the manifest
+pnpm env:check         # CI gate: schema keys, manifest, and examples stay in sync
+pnpm generate:secrets  # interactive production env block (WMP vars only)
+pnpm docker:check-copy # CI gate: Dockerfile COPY lists match workspace members
+```
+
+`pnpm generate:secrets` prompts for deploy target, generates
+`BETTER_AUTH_SECRET`, and collects only variables that apply to this repo
+(no Redis, S3, CMS, VAPID, or worker knobs). Use `--all` to include rate-limit
+tuning comments, or `--out <file>` to write a gitignored file.
+
+Email is optional: without SMTP, signup/login work and verification is off.
+With SMTP configured, email verification is required and verification mail,
+password-reset mail (when used), and email 2FA OTP are available.
+
 Useful checks:
 
 ```sh
@@ -57,6 +80,9 @@ pnpm db:validate
 pnpm check-types
 pnpm --filter web check-types
 pnpm test
+pnpm env:check
+pnpm docker:check-copy
+pnpm policy:auth-session
 ```
 
 ## Publishing and Runtime
@@ -110,7 +136,7 @@ Required production values:
 - `BETTER_AUTH_URL`: public HTTPS app URL.
 - `NODE_ENV=production`.
 
-Optional values include SMTP settings for password reset and email-delivered auth flows, `SIGNUP_ENABLED`, rate-limit settings, and display/build values such as `VITE_APP_NAME`, `VITE_SERVER_URL`, and `BUILD_VERSION`.
+Optional values include SMTP settings (enables verification, password reset, and email 2FA delivery), `SIGNUP_ENABLED`, rate-limit settings (including per-recipient email caps), and display/build values such as `VITE_APP_NAME`, `VITE_SERVER_URL`, and `BUILD_VERSION`. Prefer `pnpm generate:secrets` over hand-editing production env.
 
 Schema sync is handled by the server container entrypoint with `APPLY_SCHEMA=off|safe|dangerous`; keep it `off` for normal deploys and use `safe` for additive schema deploys.
 

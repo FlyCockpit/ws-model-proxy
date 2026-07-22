@@ -50,14 +50,6 @@ function record(result: CheckResult) {
   results.push(result);
 }
 
-function parseBooleanEnv(name: string): boolean | null {
-  const value = process.env[name];
-  if (value === undefined) return null;
-  if (value === "true") return true;
-  if (value === "false") return false;
-  throw new Error(`${name} must be exactly "true" or "false" when set.`);
-}
-
 function isLocalDatabaseHost(host: string): boolean {
   return (
     host === "localhost" ||
@@ -186,40 +178,16 @@ function checkSmtp(): Promise<void> {
   return new Promise((done) => {
     const host = process.env.SMTP_HOST;
     const portStr = process.env.SMTP_PORT;
-    let signupEnabled = false;
-    try {
-      signupEnabled = parseBooleanEnv("SIGNUP_ENABLED") ?? false;
-    } catch (err) {
+    if (!host || !portStr) {
+      // Email is optional: without SMTP the app is fully usable and
+      // verification is not required. With SMTP, auth enables require +
+      // send-on-signup. Signup can still be open without mail.
       record({
         name: "smtp",
-        status: "fail",
-        detail: err instanceof Error ? err.message : String(err),
-        hint: "Set boolean env flags to exactly true or false in the root .env.",
-        required: true,
+        status: "skip",
+        detail: "SMTP_HOST/SMTP_PORT not set — email is optional (verification off)",
+        required: false,
       });
-      done();
-      return;
-    }
-    if (!host || !portStr) {
-      if (signupEnabled) {
-        record({
-          name: "smtp",
-          status: "fail",
-          detail: "SMTP_HOST/SMTP_PORT not set but SIGNUP_ENABLED=true",
-          hint:
-            "Email verification is enforced on signup. Set SMTP_HOST/SMTP_PORT/SMTP_FROM " +
-            "(and SMTP_USER/SMTP_PASS if your provider requires auth), or set " +
-            "SIGNUP_ENABLED=false until SMTP is wired up.",
-          required: true,
-        });
-      } else {
-        record({
-          name: "smtp",
-          status: "skip",
-          detail: "SMTP_HOST/SMTP_PORT not set — email is optional",
-          required: false,
-        });
-      }
       done();
       return;
     }

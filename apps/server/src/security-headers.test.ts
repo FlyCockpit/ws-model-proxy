@@ -24,4 +24,10 @@ describe("mountSecurityHeaders", () => {
     const res = await buildApp().request("/some-page");
     expect(res.headers.get("x-content-type-options")).toBe("nosniff");
   });
+
+  it("includes form-action 'self' so injected forms cannot exfiltrate credentials", async () => {
+    const res = await buildApp().request("/some-page");
+    const csp = res.headers.get("content-security-policy") ?? "";
+    expect(csp).toMatch(/form-action[^;]*'self'/);
+  });
 });

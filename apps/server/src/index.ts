@@ -18,7 +18,14 @@ import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { WebSocketServer } from "ws";
 import { betterAuthAdminGate } from "./better-auth-admin-gate.js";
+import { CORS_ALLOW_HEADERS } from "./cors-headers.js";
 import { deviceAdminGate } from "./device-admin-gate.js";
+import {
+  EMAIL_RECIPIENT_PATHS,
+  emailRecipientLimit,
+  SIGNUP_MEDIA_TYPES,
+  SIGNUP_RECIPIENT_PATH,
+} from "./email-recipient-limit.js";
 import { createChatTestRoutes } from "./model-api/chat-test.js";
 import { MODEL_API_MAX_REQUEST_BODY_BYTES } from "./model-api/limits.js";
 import { openAiErrorBody } from "./model-api/openai-errors.js";
@@ -26,8 +33,10 @@ import { createModelApiRoutes } from "./model-api/routes.js";
 import {
   authLimiter,
   createRateLimiterMiddleware,
+  emailRecipientLimiter,
   rpcLimiter,
   signupLimiter,
+  signupRecipientLimiter,
 } from "./rate-limit.js";
 import { RELAY_SUBPROTOCOL } from "./relay/protocol.js";
 import { createRelayWebsocketMiddleware, relayUpgradeHandler } from "./relay/websocket.js";
@@ -165,10 +174,10 @@ if (env.CORS_ORIGIN) {
     cors({
       origin: env.CORS_ORIGIN,
       allowMethods: ["GET", "POST", "OPTIONS"],
-      // NOTE: If you enable CORS, add "x-csrf-token" here — the client's
-      // SimpleCsrfProtectionLinkPlugin sends it on every request and the
-      // browser will block it in preflight without this.
-      allowHeaders: ["Content-Type", "Authorization", "x-csrf-token"],
+      // Adding a header the client sets? It must go in CORS_ALLOW_HEADERS or
+      // the preflight fails and the request never leaves the browser — a
+      // failure mode invisible in local dev. See cors-headers.ts.
+      allowHeaders: [...CORS_ALLOW_HEADERS],
       credentials: true,
     }),
   );
@@ -239,6 +248,14 @@ app.use("/api/auth/*", async (c, next) => {
   if (c.req.path.endsWith("/get-session")) return next();
   return createRateLimiterMiddleware(authLimiter)(c, next);
 });
+
+// Per-recipient caps on anonymous endpoints that mail a caller-supplied
+// address. Mounted AFTER the IP-keyed auth limiter (security control); this
+// layer stops rotating-IP mail cannons. See email-recipient-limit.ts.
+for (const path of EMAIL_RECIPIENT_PATHS) {
+  app.use(path, emailRecipientLimit(emailRecipientLimiter));
+}
+app.use(SIGNUP_RECIPIENT_PATH, emailRecipientLimit(signupRecipientLimiter, SIGNUP_MEDIA_TYPES));
 
 // Verified-admin gate for the deviceAuthorization plugin's approve/deny
 // endpoints. The plugin only checks "is this user signed in" — without this

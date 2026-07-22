@@ -39,6 +39,12 @@ packages/test-utils/ -> Shared test helpers
 - Keep `sitemap.md` updated when adding, removing, or renaming routes.
 - Public SEO paths are defined in `apps/server/src/seo.ts`.
 - Keep all user-facing web strings in the locale bundles under `apps/web/src/locales/`.
+- Root `.env.example` / `apps/web/.env.example` are generated from
+  `scripts/lib/env-manifest.ts` (`pnpm env:sync` / `pnpm env:check`). Production
+  secrets: `pnpm generate:secrets` (WMP vars only). Dockerfile COPY lists:
+  `pnpm docker:check-copy`.
+- Email is optional: without SMTP, verification is off and accounts are usable;
+  with SMTP configured, require verification and the verify-email flow.
 - Do not hardcode secrets, credentials, API keys, passwords, or production URLs.
 - Do not read or print environment variable values unless the task requires it.
 - Do not remove or weaken authentication, authorization, CSRF, CORS, CSP, or rate-limit protections.

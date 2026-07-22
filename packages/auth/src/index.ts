@@ -6,14 +6,23 @@ import {
 } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
-import { renderTwoFactorOtp, renderVerifyEmail, sendEmail } from "@ws-model-proxy/mailer";
+import {
+  isEmailConfigured,
+  renderTwoFactorOtp,
+  renderVerifyEmail,
+  sendEmail,
+} from "@ws-model-proxy/mailer";
 import { betterAuth } from "better-auth";
 import { prismaAdapter } from "better-auth/adapters/prisma";
 import { admin, deviceAuthorization, twoFactor } from "better-auth/plugins";
 import { z } from "zod";
+import { resolveSignupLocale } from "./signup-locale";
 import { getSignupAccessState, SIGNUP_DISABLED_MESSAGE } from "./signup-policy";
+import { withVerificationCallback } from "./verification-callback";
 
 const isCrossOrigin = !!env.CORS_ORIGIN;
+/** Email/SMTP is optional; when configured, verification is required. */
+const emailConfigured = isEmailConfigured();
 
 // Better-Auth emits "user input failed validation" cases (wrong password, unknown
 // email, unverified email, etc.) at level=error. Those are normal end-user mistakes,
@@ -126,7 +135,9 @@ export const auth = betterAuth({
     enabled: true,
     // Product policy: keep the creation/reset minimum at eight characters.
     minPasswordLength: 8,
-    requireEmailVerification: false,
+    // When SMTP is unset the app is fully usable without mail. When SMTP is
+    // configured, require a verified address for email/password sign-in.
+    requireEmailVerification: emailConfigured,
   },
   emailVerification: {
     sendVerificationEmail: async ({ user, url }) => {
@@ -140,7 +151,10 @@ export const auth = betterAuth({
         select: { locale: true },
       });
       const { subject, html } = renderVerifyEmail({
-        url,
+        // Rewrite callbackURL to the locale-prefixed verify-email page with a
+        // safe open-redirect guard. CORS_ORIGIN is the web origin on
+        // split-origin deploys so the absolute callback lands on the app.
+        url: withVerificationCallback(url, row?.locale, env.CORS_ORIGIN),
         locale: row?.locale ?? "en-US",
       });
       await sendEmail({
@@ -149,7 +163,10 @@ export const auth = betterAuth({
         html,
       });
     },
-    sendOnSignUp: Boolean(env.SMTP_HOST),
+    sendOnSignUp: emailConfigured,
+    // Re-send when an unverified user tries to sign in (only meaningful with
+    // requireEmailVerification). Without SMTP this stays off.
+    sendOnSignIn: emailConfigured,
   },
   secret: env.BETTER_AUTH_SECRET,
   baseURL: env.BETTER_AUTH_URL,
@@ -230,7 +247,7 @@ export const auth = betterAuth({
   databaseHooks: {
     user: {
       create: {
-        before: async (user) => {
+        before: async (user, context) => {
           const { signupEnabled, userCount } = await getSignupAccessState();
           const isFirstUser = userCount === 0;
           if (!signupEnabled && !isFirstUser) {
@@ -241,11 +258,17 @@ export const auth = betterAuth({
             name: typeof user.name === "string" ? user.name : undefined,
             email: typeof user.email === "string" ? user.email : undefined,
           });
+          const locale = resolveSignupLocale(context?.headers);
           return {
             data: {
               ...user,
               slug,
-              emailVerified: true,
+              locale,
+              // Without SMTP there is no verification mail path — treat new
+              // accounts as verified so admin gates and sign-in work. With
+              // SMTP configured, leave unverified so requireEmailVerification
+              // and the verify-email flow apply.
+              ...(emailConfigured ? {} : { emailVerified: true }),
               role: isFirstUser ? "admin" : "user",
             },
           };

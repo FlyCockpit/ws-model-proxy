@@ -1,79 +1,89 @@
-import { notFound, redirect } from "@tanstack/react-router";
 import { isAdminRole } from "@ws-model-proxy/auth/roles";
 
-import { safeRedirectTo } from "../utils/safe-redirect";
+type RouteSessionUser = {
+  id: string;
+  name: string;
+  email: string;
+  emailVerified: boolean;
+  role?: string | null;
+  twoFactorEnabled?: boolean | null;
+};
 
 export type RouteSession = {
-  user: {
-    id: string;
-    name: string;
-    email: string;
-    emailVerified: boolean;
-    role: string | null;
-    twoFactorEnabled: boolean;
-  };
+  user: RouteSessionUser;
 };
 
-type ProtectedInput = {
-  session: RouteSession | null;
-  lang: string;
-  href: string;
-};
+export type RouteSessionResolution =
+  | { status: "resolved"; session: RouteSession | null }
+  | { status: "error" };
 
-type AnonymousOnlyInput = {
-  session: RouteSession | null;
-  lang: string;
-  redirectTo?: string;
-};
+export type ProtectedRouteDecision =
+  | { kind: "allow"; session: RouteSession }
+  | { kind: "redirect-to-login" }
+  | { kind: "error" };
 
-type AdminInput = {
-  session: RouteSession | null;
-};
+export type AnonymousOnlyRouteDecision =
+  | { kind: "allow" }
+  | { kind: "redirect-authenticated"; session: RouteSession }
+  | { kind: "error" };
 
-type DeviceAdminInput = {
-  session: RouteSession | null;
-  lang: string;
-  redirectTo: string;
-};
+export type AdminRouteDecision =
+  | { kind: "allow"; session: RouteSession }
+  | { kind: "not-found" }
+  | { kind: "error" };
 
-export function requireProtectedRoute({ session, lang, href }: ProtectedInput): RouteSession {
-  if (!session) {
-    throw redirect({
-      to: "/$lang/login",
-      params: { lang },
-      search: { redirectTo: href },
-    });
-  }
-  return session;
+export type DeviceRouteDecision =
+  | { kind: "allow"; session: RouteSession }
+  | { kind: "redirect-to-login" }
+  | { kind: "redirect-to-dashboard" }
+  | { kind: "error" };
+
+export function resolvedRouteSession(session: RouteSession | null): RouteSessionResolution {
+  return { status: "resolved", session };
 }
 
-export function requireAnonymousOnlyRoute({ session, lang, redirectTo }: AnonymousOnlyInput): void {
-  if (session) {
-    throw redirect({ href: safeRedirectTo(redirectTo, lang) });
-  }
+export function failedRouteSessionResolution(): RouteSessionResolution {
+  return { status: "error" };
 }
 
-export function requireAdminRoute({ session }: AdminInput): RouteSession {
-  if (!session?.user.emailVerified || !isAdminRole(session.user.role)) {
-    throw notFound();
-  }
-  return session;
+/**
+ * Gate for the ordinary authenticated app (`_auth`: dashboard, settings).
+ *
+ * Checks only "is there a session" — NOT `emailVerified`. Verification gates
+ * privilege escalation (admin/device), not basic use — matching the server
+ * (`protectedProcedure` has no verification check; admin gates do).
+ */
+export function decideProtectedRouteAccess(
+  resolution: RouteSessionResolution,
+): ProtectedRouteDecision {
+  if (resolution.status === "error") return { kind: "error" };
+  if (!resolution.session) return { kind: "redirect-to-login" };
+  return { kind: "allow", session: resolution.session };
 }
 
-export function requireDeviceAdminRoute({
-  session,
-  lang,
-  redirectTo,
-}: DeviceAdminInput): RouteSession {
-  if (!session) {
-    throw redirect({
-      to: "/$lang/login",
-      params: { lang },
-      search: { redirectTo },
-    });
+export function decideAnonymousOnlyRouteAccess(
+  resolution: RouteSessionResolution,
+): AnonymousOnlyRouteDecision {
+  if (resolution.status === "error") return { kind: "error" };
+  if (!resolution.session) return { kind: "allow" };
+  return { kind: "redirect-authenticated", session: resolution.session };
+}
+
+export function decideAdminRouteAccess(resolution: RouteSessionResolution): AdminRouteDecision {
+  if (resolution.status === "error") return { kind: "error" };
+  const user = resolution.session?.user;
+  if (!resolution.session || !user?.emailVerified || !isAdminRole(user.role)) {
+    return { kind: "not-found" };
   }
-  if (!session.user.emailVerified || !isAdminRole(session.user.role)) {
-    throw redirect({ to: "/$lang/dashboard", params: { lang } });
+  return { kind: "allow", session: resolution.session };
+}
+
+export function decideDeviceRouteAccess(resolution: RouteSessionResolution): DeviceRouteDecision {
+  if (resolution.status === "error") return { kind: "error" };
+  const user = resolution.session?.user;
+  if (!resolution.session) return { kind: "redirect-to-login" };
+  if (!user?.emailVerified || !isAdminRole(user.role)) {
+    return { kind: "redirect-to-dashboard" };
   }
-  return session;
+  return { kind: "allow", session: resolution.session };
 }

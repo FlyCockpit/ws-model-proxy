@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  decideAdminRouteAccess,
+  decideAnonymousOnlyRouteAccess,
+  decideDeviceRouteAccess,
+  decideProtectedRouteAccess,
+  failedRouteSessionResolution,
   type RouteSession,
-  requireAdminRoute,
-  requireAnonymousOnlyRoute,
-  requireDeviceAdminRoute,
-  requireProtectedRoute,
+  resolvedRouteSession,
 } from "./route-session-access";
 
 const session = {
@@ -26,86 +28,86 @@ const adminSession = {
   },
 } satisfies RouteSession;
 
-function thrownBy(fn: () => unknown): unknown {
-  try {
-    fn();
-  } catch (error) {
-    return error;
-  }
-  throw new Error("Expected function to throw");
-}
-
 describe("route session access decisions", () => {
   it("allows protected routes for authenticated sessions", () => {
-    expect(requireProtectedRoute({ session, lang: "en-US", href: "/en-US/dashboard" })).toBe(
+    expect(decideProtectedRouteAccess(resolvedRouteSession(session))).toEqual({
+      kind: "allow",
       session,
-    );
-  });
-
-  it("redirects anonymous protected routes to login", () => {
-    const error = thrownBy(() =>
-      requireProtectedRoute({ session: null, lang: "en-US", href: "/en-US/dashboard" }),
-    );
-
-    expect(error).toMatchObject({
-      options: {
-        to: "/$lang/login",
-        params: { lang: "en-US" },
-        search: { redirectTo: "/en-US/dashboard" },
-      },
     });
   });
 
-  it("redirects authenticated users away from anonymous-only routes", () => {
-    const error = thrownBy(() =>
-      requireAnonymousOnlyRoute({ session, lang: "en-US", redirectTo: "/en-US/dashboard" }),
-    );
+  it("allows unverified sessions on ordinary protected routes", () => {
+    const unverified = {
+      user: { ...session.user, emailVerified: false },
+    } satisfies RouteSession;
+    expect(decideProtectedRouteAccess(resolvedRouteSession(unverified))).toEqual({
+      kind: "allow",
+      session: unverified,
+    });
+  });
 
-    expect(error).toMatchObject({
-      options: {
-        href: "/en-US/dashboard",
-      },
+  it("redirects anonymous protected routes to login", () => {
+    expect(decideProtectedRouteAccess(resolvedRouteSession(null))).toEqual({
+      kind: "redirect-to-login",
+    });
+  });
+
+  it("surfaces session lookup failures as error decisions", () => {
+    expect(decideProtectedRouteAccess(failedRouteSessionResolution())).toEqual({ kind: "error" });
+    expect(decideAdminRouteAccess(failedRouteSessionResolution())).toEqual({ kind: "error" });
+    expect(decideAnonymousOnlyRouteAccess(failedRouteSessionResolution())).toEqual({
+      kind: "error",
+    });
+    expect(decideDeviceRouteAccess(failedRouteSessionResolution())).toEqual({ kind: "error" });
+  });
+
+  it("redirects authenticated users away from anonymous-only routes", () => {
+    expect(decideAnonymousOnlyRouteAccess(resolvedRouteSession(session))).toEqual({
+      kind: "redirect-authenticated",
+      session,
     });
   });
 
   it("allows anonymous users on anonymous-only routes", () => {
-    expect(
-      requireAnonymousOnlyRoute({ session: null, lang: "en-US", redirectTo: undefined }),
-    ).toBeUndefined();
+    expect(decideAnonymousOnlyRouteAccess(resolvedRouteSession(null))).toEqual({ kind: "allow" });
   });
 
   it("404-hides admin routes from non-admin users", () => {
-    expect(thrownBy(() => requireAdminRoute({ session }))).toEqual({ isNotFound: true });
+    expect(decideAdminRouteAccess(resolvedRouteSession(session))).toEqual({ kind: "not-found" });
   });
 
-  it("allows verified admins through admin routes", () => {
-    expect(requireAdminRoute({ session: adminSession })).toBe(adminSession);
-  });
-
-  it("redirects non-admin device approvers to dashboard", () => {
-    const error = thrownBy(() =>
-      requireDeviceAdminRoute({ session, lang: "en-US", redirectTo: "/en-US/device" }),
-    );
-
-    expect(error).toMatchObject({
-      options: {
-        to: "/$lang/dashboard",
-        params: { lang: "en-US" },
-      },
+  it("404-hides admin routes from unverified admins", () => {
+    const unverifiedAdmin = {
+      user: { ...adminSession.user, emailVerified: false },
+    } satisfies RouteSession;
+    expect(decideAdminRouteAccess(resolvedRouteSession(unverifiedAdmin))).toEqual({
+      kind: "not-found",
     });
   });
 
-  it("redirects anonymous device approvers to login with the device redirect", () => {
-    const error = thrownBy(() =>
-      requireDeviceAdminRoute({ session: null, lang: "en-US", redirectTo: "/en-US/device" }),
-    );
+  it("allows verified admins through admin routes", () => {
+    expect(decideAdminRouteAccess(resolvedRouteSession(adminSession))).toEqual({
+      kind: "allow",
+      session: adminSession,
+    });
+  });
 
-    expect(error).toMatchObject({
-      options: {
-        to: "/$lang/login",
-        params: { lang: "en-US" },
-        search: { redirectTo: "/en-US/device" },
-      },
+  it("redirects non-admin device approvers to dashboard", () => {
+    expect(decideDeviceRouteAccess(resolvedRouteSession(session))).toEqual({
+      kind: "redirect-to-dashboard",
+    });
+  });
+
+  it("redirects anonymous device approvers to login", () => {
+    expect(decideDeviceRouteAccess(resolvedRouteSession(null))).toEqual({
+      kind: "redirect-to-login",
+    });
+  });
+
+  it("allows verified admins on the device route", () => {
+    expect(decideDeviceRouteAccess(resolvedRouteSession(adminSession))).toEqual({
+      kind: "allow",
+      session: adminSession,
     });
   });
 });

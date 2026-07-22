@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { createFileRoute, Outlet } from "@tanstack/react-router";
+import { createFileRoute, Outlet, redirect } from "@tanstack/react-router";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
   Card,
@@ -18,18 +18,22 @@ import { useTranslation } from "react-i18next";
 import { InlineRetry } from "@/components/inline-retry";
 import { TwoFactorSetupDetails } from "@/components/two-factor-setup-details";
 import { authClient } from "@/lib/auth-client";
-import { requireProtectedRoute } from "@/lib/route-session-access";
+import { decideProtectedRouteAccess } from "@/lib/route-session-access";
 import { getRouteSession } from "@/server/auth-session";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth")({
   beforeLoad: async ({ location, params }) => {
-    const session = requireProtectedRoute({
-      session: await getRouteSession(),
-      lang: params.lang,
-      href: location.href,
-    });
-    return { session };
+    const decision = decideProtectedRouteAccess(await getRouteSession());
+    if (decision.kind === "error") throw new Error("Route session unavailable");
+    if (decision.kind === "redirect-to-login") {
+      throw redirect({
+        to: "/$lang/login",
+        params: { lang: params.lang },
+        search: { redirectTo: location.href },
+      });
+    }
+    return { session: decision.session };
   },
   component: AuthLayout,
 });

@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as LangRouteImport } from './routes/$lang'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as LangIndexRouteImport } from './routes/$lang/index'
+import { Route as LangVerifyEmailRouteImport } from './routes/$lang/verify-email'
 import { Route as LangSignupRouteImport } from './routes/$lang/signup'
 import { Route as LangLoginRouteImport } from './routes/$lang/login'
 import { Route as LangDeviceRouteImport } from './routes/$lang/device'
@@ -48,6 +49,11 @@ const IndexRoute = IndexRouteImport.update({
 const LangIndexRoute = LangIndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => LangRoute,
+} as any)
+const LangVerifyEmailRoute = LangVerifyEmailRouteImport.update({
+  id: '/verify-email',
+  path: '/verify-email',
   getParentRoute: () => LangRoute,
 } as any)
 const LangSignupRoute = LangSignupRouteImport.update({
@@ -172,6 +178,7 @@ export interface FileRoutesByFullPath {
   '/$lang/device': typeof LangDeviceRoute
   '/$lang/login': typeof LangLoginRoute
   '/$lang/signup': typeof LangSignupRoute
+  '/$lang/verify-email': typeof LangVerifyEmailRoute
   '/$lang/': typeof LangIndexRoute
   '/$lang/dashboard': typeof LangAuthDashboardRouteWithChildren
   '/$lang/settings': typeof LangAuthSettingsRouteWithChildren
@@ -197,6 +204,7 @@ export interface FileRoutesByTo {
   '/$lang/device': typeof LangDeviceRoute
   '/$lang/login': typeof LangLoginRoute
   '/$lang/signup': typeof LangSignupRoute
+  '/$lang/verify-email': typeof LangVerifyEmailRoute
   '/$lang/admin/devices': typeof LangAdminDevicesRoute
   '/$lang/admin/observability': typeof LangAdminObservabilityRoute
   '/$lang/admin/seed': typeof LangAdminSeedRoute
@@ -222,6 +230,7 @@ export interface FileRoutesById {
   '/$lang/device': typeof LangDeviceRoute
   '/$lang/login': typeof LangLoginRoute
   '/$lang/signup': typeof LangSignupRoute
+  '/$lang/verify-email': typeof LangVerifyEmailRoute
   '/$lang/': typeof LangIndexRoute
   '/$lang/_auth/dashboard': typeof LangAuthDashboardRouteWithChildren
   '/$lang/_auth/settings': typeof LangAuthSettingsRouteWithChildren
@@ -250,6 +259,7 @@ export interface FileRouteTypes {
     | '/$lang/device'
     | '/$lang/login'
     | '/$lang/signup'
+    | '/$lang/verify-email'
     | '/$lang/'
     | '/$lang/dashboard'
     | '/$lang/settings'
@@ -275,6 +285,7 @@ export interface FileRouteTypes {
     | '/$lang/device'
     | '/$lang/login'
     | '/$lang/signup'
+    | '/$lang/verify-email'
     | '/$lang/admin/devices'
     | '/$lang/admin/observability'
     | '/$lang/admin/seed'
@@ -299,6 +310,7 @@ export interface FileRouteTypes {
     | '/$lang/device'
     | '/$lang/login'
     | '/$lang/signup'
+    | '/$lang/verify-email'
     | '/$lang/'
     | '/$lang/_auth/dashboard'
     | '/$lang/_auth/settings'
@@ -345,6 +357,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/$lang/'
       preLoaderRoute: typeof LangIndexRouteImport
+      parentRoute: typeof LangRoute
+    }
+    '/$lang/verify-email': {
+      id: '/$lang/verify-email'
+      path: '/verify-email'
+      fullPath: '/$lang/verify-email'
+      preLoaderRoute: typeof LangVerifyEmailRouteImport
       parentRoute: typeof LangRoute
     }
     '/$lang/signup': {
@@ -582,6 +601,7 @@ interface LangRouteChildren {
   LangDeviceRoute: typeof LangDeviceRoute
   LangLoginRoute: typeof LangLoginRoute
   LangSignupRoute: typeof LangSignupRoute
+  LangVerifyEmailRoute: typeof LangVerifyEmailRoute
   LangIndexRoute: typeof LangIndexRoute
 }
 
@@ -591,6 +611,7 @@ const LangRouteChildren: LangRouteChildren = {
   LangDeviceRoute: LangDeviceRoute,
   LangLoginRoute: LangLoginRoute,
   LangSignupRoute: LangSignupRoute,
+  LangVerifyEmailRoute: LangVerifyEmailRoute,
   LangIndexRoute: LangIndexRoute,
 }
 

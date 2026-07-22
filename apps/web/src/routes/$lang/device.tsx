@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute, Link, redirect } from "@tanstack/react-router";
 import { env } from "@ws-model-proxy/env/web";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
@@ -15,7 +15,7 @@ import { useState } from "react";
 import { Trans, useTranslation } from "react-i18next";
 
 import { authClient } from "@/lib/auth-client";
-import { requireDeviceAdminRoute } from "@/lib/route-session-access";
+import { decideDeviceRouteAccess } from "@/lib/route-session-access";
 import { getRouteSession } from "@/server/auth-session";
 import { friendly } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
@@ -31,12 +31,19 @@ export const Route = createFileRoute("/$lang/device")({
     return { user_code: userCode };
   },
   beforeLoad: async ({ params }) => {
-    const session = requireDeviceAdminRoute({
-      session: await getRouteSession(),
-      lang: params.lang,
-      redirectTo: `/${params.lang}/device`,
-    });
-    return { session };
+    const decision = decideDeviceRouteAccess(await getRouteSession());
+    if (decision.kind === "error") throw new Error("Route session unavailable");
+    if (decision.kind === "redirect-to-login") {
+      throw redirect({
+        to: "/$lang/login",
+        params: { lang: params.lang },
+        search: { redirectTo: `/${params.lang}/device` },
+      });
+    }
+    if (decision.kind === "redirect-to-dashboard") {
+      throw redirect({ to: "/$lang/dashboard", params: { lang: params.lang } });
+    }
+    return { session: decision.session };
   },
   component: DevicePage,
 });

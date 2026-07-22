@@ -57,6 +57,48 @@ export const rpcLimiter = new RateLimiterMemory({
   duration: env.RATE_LIMIT_RPC_DURATION,
 });
 
+/**
+ * Email-recipient limiter — caps how much mail a single ADDRESS can be sent
+ * from anonymous endpoints that accept a recipient in the body
+ * (`/api/auth/send-verification-email`, `/api/auth/request-password-reset`).
+ * Signup mails one too and gets its own bucket — see `signupRecipientLimiter`.
+ *
+ * Other limiters key on client IP (or user id). That bounds one caller, not
+ * one mailbox. Rotating IPs multiply the IP ceiling into a victim's inbox.
+ * Keyed on normalized recipient (lowercased + trimmed). POINTS=0 disables.
+ *
+ * `blockDuration` defaults to 0: keying on an attacker-supplied identifier
+ * must not become an unauthenticated lockout lever on password reset.
+ */
+export const emailRecipientLimiter = new RateLimiterMemory({
+  keyPrefix: "rl:email-to",
+  points: env.RATE_LIMIT_EMAIL_RECIPIENT_POINTS,
+  duration: env.RATE_LIMIT_EMAIL_RECIPIENT_DURATION,
+  blockDuration: env.RATE_LIMIT_EMAIL_RECIPIENT_BLOCK_DURATION,
+});
+
+/**
+ * Same idea as `emailRecipientLimiter`, for `/api/auth/sign-up/email`.
+ * Separate bucket so a signup flood cannot eat a legitimate reset budget.
+ */
+export const signupRecipientLimiter = new RateLimiterMemory({
+  keyPrefix: "rl:signup-to",
+  points: env.RATE_LIMIT_SIGNUP_RECIPIENT_POINTS,
+  duration: env.RATE_LIMIT_EMAIL_RECIPIENT_DURATION,
+  blockDuration: env.RATE_LIMIT_EMAIL_RECIPIENT_BLOCK_DURATION,
+});
+
+/**
+ * Normalize a recipient into a rate-limit key.
+ *
+ * Lowercase + trim only. Deliberately NOT provider-specific canonicalization
+ * (Gmail dots / `+tag`): those rules differ per provider, and collapsing
+ * tags would let one abusive address consume a different user's budget.
+ */
+export function emailRateLimitKey(email: string): string {
+  return email.trim().toLowerCase();
+}
+
 // ---------------------------------------------------------------------------
 // Middleware factory
 // ---------------------------------------------------------------------------
