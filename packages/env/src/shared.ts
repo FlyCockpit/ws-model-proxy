@@ -1,7 +1,4 @@
-import fs from "node:fs";
-import path from "node:path";
 import { createEnv } from "@t3-oss/env-core";
-import { config as loadEnv } from "dotenv";
 import { z } from "zod";
 import { originUrl } from "./url.js";
 
@@ -12,9 +9,9 @@ import { originUrl } from "./url.js";
 // and adds server-only variables. SMTP is included here because both auth and
 // standalone mailer code can use it.
 //
-// dotenv loading and the strict-boolean helper live here (not in ./server.ts)
-// so that exactly one module owns them regardless of which entrypoint loads
-// first: ./server.ts imports this file, so this runs before server validation.
+// This module only validates process.env. Loading a root `.env` file is an
+// entrypoint concern (see ./load-dotenv.ts) so SSR, library imports, and
+// production containers never pull in dotenv or file I/O as a side effect.
 // ---------------------------------------------------------------------------
 
 export const strictBooleanFlag = (defaultValue: boolean = false) =>
@@ -22,22 +19,6 @@ export const strictBooleanFlag = (defaultValue: boolean = false) =>
     .enum(["true", "false"])
     .default(defaultValue ? "true" : "false")
     .transform((value) => value === "true");
-
-// Loaded once at module import. Path is resolved relative to this file, not CWD,
-// so it works from any working directory and any build output location.
-loadEnv({ path: path.resolve(import.meta.dirname, "../../../.env") });
-
-// ---------------------------------------------------------------------------
-// Warn if a stale per-app .env exists — the canonical location is repo root.
-// ---------------------------------------------------------------------------
-const staleEnvPath = path.resolve(import.meta.dirname, "../../../apps/server/.env");
-if (fs.existsSync(staleEnvPath)) {
-  console.warn(
-    "[env] Found apps/server/.env — this file is no longer read. " +
-      "The canonical .env location is the repository root. " +
-      "Move its contents to the root .env and delete apps/server/.env to silence this warning.",
-  );
-}
 
 export const env = createEnv({
   server: {

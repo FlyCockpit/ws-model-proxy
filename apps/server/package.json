@@ -21,7 +21,6 @@
     "@ws-model-proxy/db": "workspace:*",
     "@ws-model-proxy/env": "workspace:*",
     "better-auth": "catalog:",
-    "dotenv": "catalog:",
     "hono": "catalog:",
     "rate-limiter-flexible": "catalog:",
     "ws": "catalog:",

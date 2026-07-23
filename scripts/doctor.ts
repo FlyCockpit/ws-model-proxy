@@ -7,13 +7,13 @@
  * Run: `pnpm doctor`
  */
 
+import "@ws-model-proxy/env/load-dotenv";
+
 import { spawnSync } from "node:child_process";
 import { connect } from "node:net";
 import { resolve } from "node:path";
-import { config as loadEnv } from "dotenv";
 
 const ROOT = resolve(import.meta.dirname!, "..");
-loadEnv({ path: resolve(ROOT, ".env") });
 
 /**
  * Runs a tiny inline Node script inside a workspace package so we can use

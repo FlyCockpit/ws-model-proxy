@@ -1,3 +1,7 @@
+// Load root `.env` before any workspace import validates process.env.
+// Production injects env vars and has no `.env` file — this is a local-dev no-op there.
+import "@ws-model-proxy/env/load-dotenv";
+
 import { createHash } from "node:crypto";
 import { serve } from "@hono/node-server";
 import { OpenAPIHandler } from "@orpc/openapi/fetch";

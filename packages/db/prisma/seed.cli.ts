@@ -3,6 +3,8 @@
 // inline admin path can import `runSeed()` without executing it. This wrapper
 // owns process lifecycle: run, print the summary, disconnect the shared client,
 // exit with the right code.
+import "@ws-model-proxy/env/load-dotenv";
+
 import prisma from "../src/index";
 import { runSeed } from "./seed";
 

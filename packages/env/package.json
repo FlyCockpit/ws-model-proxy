@@ -6,7 +6,9 @@
   "exports": {
     "./shared": "./src/shared.ts",
     "./server": "./src/server.ts",
-    "./web": "./src/web.ts"
+    "./web": "./src/web.ts",
+    "./load-dotenv": "./src/load-dotenv.ts",
+    "./root-dotenv": "./src/root-dotenv.ts"
   },
   "dependencies": {
     "@t3-oss/env-core": "^0.13.11",
@@ -14,11 +16,13 @@
     "zod": "catalog:"
   },
   "scripts": {
-    "check-types": "tsc --noEmit"
+    "check-types": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests"
   },
   "devDependencies": {
     "@ws-model-proxy/config": "workspace:*",
     "@types/node": "catalog:",
-    "typescript": "catalog:"
+    "typescript": "catalog:",
+    "vitest": "catalog:"
   }
 }

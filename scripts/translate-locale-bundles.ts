@@ -28,6 +28,8 @@
  * (or `ANTHROPIC_API_KEY` if `TRANSLATION_PROVIDER=anthropic`).
  */
 
+import "@ws-model-proxy/env/load-dotenv";
+
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { parseArgs } from "node:util";

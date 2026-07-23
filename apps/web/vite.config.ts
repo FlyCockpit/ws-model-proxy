@@ -1,3 +1,8 @@
+// Load root `.env` before any SSR module graph validates process.env.
+// Production SSR runs under apps/server (which already loads dotenv); this is
+// for local `vite dev` / build where Vite is its own process.
+import "@ws-model-proxy/env/load-dotenv";
+
 import { execSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";

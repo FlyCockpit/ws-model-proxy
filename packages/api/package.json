@@ -35,7 +35,6 @@
     "@ws-model-proxy/db": "workspace:*",
     "@ws-model-proxy/env": "workspace:*",
     "@ws-model-proxy/mailer": "workspace:*",
-    "dotenv": "catalog:",
     "zod": "catalog:"
   },
   "devDependencies": {

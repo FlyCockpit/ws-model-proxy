@@ -35,7 +35,6 @@
   },
   "devDependencies": {
     "@ws-model-proxy/config": "workspace:*",
-    "dotenv": "catalog:",
     "prisma": "^7.8.0",
     "tsx": "catalog:",
     "typescript": "catalog:"
