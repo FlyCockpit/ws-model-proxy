@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, stripSearchParams } from "@tanstack/react-router";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Input } from "@ws-model-proxy/ui/components/input";
@@ -14,13 +14,26 @@ import {
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import type { TFunction } from "i18next";
 import { Activity, Cable, DatabaseZap, RadioTower, Search } from "lucide-react";
-import { parseAsInteger, parseAsString, useQueryState } from "nuqs";
 import type { ReactNode } from "react";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
 import { SegmentedControl } from "@/components/segmented-control";
+import {
+  CAPABILITY_FAMILIES,
+  CLI_STATUSES,
+  DEFAULT_OBSERVABILITY_SEARCH,
+  dateInputToDate,
+  dateInputToExclusiveEnd,
+  ENDPOINT_STATUSES,
+  type ObservabilitySearch,
+  type ObservabilityTab,
+  POOL_HEALTH_VALUES,
+  parseFilterSelect,
+  parseObservabilitySearch,
+  RELAY_STATUSES,
+} from "@/lib/observability-search";
 import { orpc } from "@/utils/orpc";
 
 type CliPage = Awaited<ReturnType<AppRouterClient["adminObservability"]["listCliDevices"]>>;
@@ -40,54 +53,15 @@ type QuerySnapshot<T> = {
   refetch: () => void;
 };
 
-type Tab = "clis" | "endpoints" | "models" | "pools" | "relays";
-type CliStatus = "DISCONNECTED" | "CONNECTED" | "STALE" | "REVOKED";
-type EndpointStatus = "UNKNOWN" | "ONLINE" | "DEGRADED" | "OFFLINE";
-type CapabilityFamily = "TEXT" | "VISION" | "EMBEDDING" | "AUDIO" | "RESPONSES";
-type PoolHealth = "UNKNOWN" | "HEALTHY" | "HALF_OPEN" | "DEGRADED" | "UNHEALTHY";
-type RelayStatus = "PENDING" | "SUCCEEDED" | "FAILED" | "CANCELED";
-
-const tabValues: Tab[] = ["clis", "endpoints", "models", "pools", "relays"];
-const cliStatuses: CliStatus[] = ["CONNECTED", "STALE", "DISCONNECTED", "REVOKED"];
-const endpointStatuses: EndpointStatus[] = ["ONLINE", "DEGRADED", "OFFLINE", "UNKNOWN"];
-const capabilityFamilies: CapabilityFamily[] = [
-  "TEXT",
-  "VISION",
-  "EMBEDDING",
-  "AUDIO",
-  "RESPONSES",
-];
-const poolHealthValues: PoolHealth[] = ["HEALTHY", "HALF_OPEN", "DEGRADED", "UNHEALTHY", "UNKNOWN"];
-const relayStatuses: RelayStatus[] = ["SUCCEEDED", "FAILED", "PENDING", "CANCELED"];
 const pageSize = 25;
 
 export const Route = createFileRoute("/$lang/admin/observability")({
+  validateSearch: parseObservabilitySearch,
+  search: {
+    middlewares: [stripSearchParams(DEFAULT_OBSERVABILITY_SEARCH)],
+  },
   component: AdminObservability,
 });
-
-function isTab(value: string): value is Tab {
-  return tabValues.includes(value as Tab);
-}
-
-function isCliStatus(value: string): value is CliStatus {
-  return cliStatuses.includes(value as CliStatus);
-}
-
-function isEndpointStatus(value: string): value is EndpointStatus {
-  return endpointStatuses.includes(value as EndpointStatus);
-}
-
-function isCapabilityFamily(value: string): value is CapabilityFamily {
-  return capabilityFamilies.includes(value as CapabilityFamily);
-}
-
-function isPoolHealth(value: string): value is PoolHealth {
-  return poolHealthValues.includes(value as PoolHealth);
-}
-
-function isRelayStatus(value: string): value is RelayStatus {
-  return relayStatuses.includes(value as RelayStatus);
-}
 
 const dateTimeFormatter = new Intl.DateTimeFormat(undefined, {
   dateStyle: "medium",
@@ -110,19 +84,6 @@ function formatMs(
 ) {
   if (typeof value !== "number") return emptyValue;
   return formatDuration(value.toLocaleString());
-}
-
-function dateInputToDate(value: string) {
-  if (!value) return undefined;
-  const date = new Date(`${value}T00:00:00.000Z`);
-  return Number.isNaN(date.getTime()) ? undefined : date;
-}
-
-function dateInputToExclusiveEnd(value: string) {
-  const date = dateInputToDate(value);
-  if (!date) return undefined;
-  date.setUTCDate(date.getUTCDate() + 1);
-  return date;
 }
 
 function statusLabel(value: string, t: TFunction<["admin", "common"]>) {
@@ -310,33 +271,37 @@ function EmptyRows({ colSpan }: { colSpan: number }) {
 
 function AdminObservability() {
   const { t } = useTranslation(["admin", "common"]);
-  const [tabParam, setTabParam] = useQueryState("tab", parseAsString.withDefault("clis"));
-  const [page, setPage] = useQueryState("page", parseAsInteger.withDefault(1));
-  const [owner, setOwner] = useQueryState("owner", parseAsString.withDefault(""));
-  const [cliStatus, setCliStatus] = useQueryState("cliStatus", parseAsString.withDefault("all"));
-  const [endpointStatus, setEndpointStatus] = useQueryState(
-    "endpointStatus",
-    parseAsString.withDefault("all"),
-  );
-  const [capability, setCapability] = useQueryState("capability", parseAsString.withDefault("all"));
-  const [poolHealth, setPoolHealth] = useQueryState("poolHealth", parseAsString.withDefault("all"));
-  const [relayStatus, setRelayStatus] = useQueryState(
-    "relayStatus",
-    parseAsString.withDefault("all"),
-  );
-  const [errorClass, setErrorClass] = useQueryState("errorClass", parseAsString.withDefault(""));
-  const [createdAfter, setCreatedAfter] = useQueryState(
-    "createdAfter",
-    parseAsString.withDefault(""),
-  );
-  const [createdBefore, setCreatedBefore] = useQueryState(
-    "createdBefore",
-    parseAsString.withDefault(""),
-  );
+  const search = Route.useSearch();
+  const navigate = Route.useNavigate();
 
-  const tab = isTab(tabParam) ? tabParam : "clis";
+  const patchSearch = (patch: Partial<ObservabilitySearch>, options?: { replace?: boolean }) => {
+    void navigate({
+      search: (prev) => ({ ...prev, ...patch }),
+      // Filters/typing use replace to avoid flooding history; pagination pushes
+      // so the browser Back button can step through pages.
+      replace: options?.replace ?? false,
+    });
+  };
+
+  const patchFilters = (patch: Partial<ObservabilitySearch>) => {
+    patchSearch({ ...patch, page: 1 }, { replace: true });
+  };
+
+  const {
+    tab,
+    page,
+    owner,
+    cliStatus,
+    endpointStatus,
+    capability,
+    poolHealth,
+    relayStatus,
+    errorClass,
+    createdAfter,
+    createdBefore,
+  } = search;
+
   const ownerQuery = owner.trim() || undefined;
-  const pageInput = Math.max(page, 1);
   const relayDateInput = useMemo(
     () => ({
       createdAfter: dateInputToDate(createdAfter),
@@ -353,10 +318,10 @@ function AdminObservability() {
   } = useQuery(
     orpc.adminObservability.listCliDevices.queryOptions({
       input: {
-        page: pageInput,
+        page,
         pageSize,
         ownerQuery,
-        status: isCliStatus(cliStatus) ? cliStatus : undefined,
+        status: cliStatus === "all" ? undefined : cliStatus,
       },
     }),
   );
@@ -368,10 +333,10 @@ function AdminObservability() {
   } = useQuery(
     orpc.adminObservability.listEndpoints.queryOptions({
       input: {
-        page: pageInput,
+        page,
         pageSize,
         ownerQuery,
-        status: isEndpointStatus(endpointStatus) ? endpointStatus : undefined,
+        status: endpointStatus === "all" ? undefined : endpointStatus,
       },
     }),
   );
@@ -383,10 +348,10 @@ function AdminObservability() {
   } = useQuery(
     orpc.adminObservability.listModels.queryOptions({
       input: {
-        page: pageInput,
+        page,
         pageSize,
         ownerQuery,
-        capabilityFamily: isCapabilityFamily(capability) ? capability : undefined,
+        capabilityFamily: capability === "all" ? undefined : capability,
       },
     }),
   );
@@ -398,10 +363,10 @@ function AdminObservability() {
   } = useQuery(
     orpc.adminObservability.listPools.queryOptions({
       input: {
-        page: pageInput,
+        page,
         pageSize,
         ownerQuery,
-        memberHealth: isPoolHealth(poolHealth) ? poolHealth : undefined,
+        memberHealth: poolHealth === "all" ? undefined : poolHealth,
       },
     }),
   );
@@ -413,22 +378,18 @@ function AdminObservability() {
   } = useQuery(
     orpc.adminObservability.listRelayMetadataSummaries.queryOptions({
       input: {
-        page: pageInput,
+        page,
         pageSize,
         ownerQuery,
-        status: isRelayStatus(relayStatus) ? relayStatus : undefined,
+        status: relayStatus === "all" ? undefined : relayStatus,
         errorClass: errorClass.trim() || undefined,
         ...relayDateInput,
       },
     }),
   );
 
-  const resetPage = () => {
-    void setPage(1);
-  };
-  const changeTab = (next: Tab) => {
-    void setTabParam(next);
-    resetPage();
+  const changeTab = (next: ObservabilityTab) => {
+    patchFilters({ tab: next });
   };
 
   return (
@@ -469,8 +430,7 @@ function AdminObservability() {
                   autoComplete="off"
                   value={owner}
                   onChange={(event) => {
-                    void setOwner(event.target.value);
-                    resetPage();
+                    patchFilters({ owner: event.target.value });
                   }}
                   placeholder={t("admin:observability.filters.ownerPlaceholder")}
                   className="min-h-[44px] pl-9"
@@ -483,12 +443,11 @@ function AdminObservability() {
                 label={t("admin:observability.filters.cliStatus")}
                 value={cliStatus}
                 onChange={(value) => {
-                  void setCliStatus(value);
-                  resetPage();
+                  patchFilters({ cliStatus: parseFilterSelect(value, CLI_STATUSES) });
                 }}
               >
                 <SelectItem value="all">{t("admin:observability.filters.allStatuses")}</SelectItem>
-                {cliStatuses.map((value) => (
+                {CLI_STATUSES.map((value) => (
                   <SelectItem key={value} value={value}>
                     {statusLabel(value, t)}
                   </SelectItem>
@@ -501,12 +460,13 @@ function AdminObservability() {
                 label={t("admin:observability.filters.endpointHealth")}
                 value={endpointStatus}
                 onChange={(value) => {
-                  void setEndpointStatus(value);
-                  resetPage();
+                  patchFilters({
+                    endpointStatus: parseFilterSelect(value, ENDPOINT_STATUSES),
+                  });
                 }}
               >
                 <SelectItem value="all">{t("admin:observability.filters.allHealth")}</SelectItem>
-                {endpointStatuses.map((value) => (
+                {ENDPOINT_STATUSES.map((value) => (
                   <SelectItem key={value} value={value}>
                     {statusLabel(value, t)}
                   </SelectItem>
@@ -519,14 +479,15 @@ function AdminObservability() {
                 label={t("admin:observability.filters.capability")}
                 value={capability}
                 onChange={(value) => {
-                  void setCapability(value);
-                  resetPage();
+                  patchFilters({
+                    capability: parseFilterSelect(value, CAPABILITY_FAMILIES),
+                  });
                 }}
               >
                 <SelectItem value="all">
                   {t("admin:observability.filters.allCapabilities")}
                 </SelectItem>
-                {capabilityFamilies.map((value) => (
+                {CAPABILITY_FAMILIES.map((value) => (
                   <SelectItem key={value} value={value}>
                     {statusLabel(value, t)}
                   </SelectItem>
@@ -539,12 +500,13 @@ function AdminObservability() {
                 label={t("admin:observability.filters.poolHealth")}
                 value={poolHealth}
                 onChange={(value) => {
-                  void setPoolHealth(value);
-                  resetPage();
+                  patchFilters({
+                    poolHealth: parseFilterSelect(value, POOL_HEALTH_VALUES),
+                  });
                 }}
               >
                 <SelectItem value="all">{t("admin:observability.filters.allHealth")}</SelectItem>
-                {poolHealthValues.map((value) => (
+                {POOL_HEALTH_VALUES.map((value) => (
                   <SelectItem key={value} value={value}>
                     {statusLabel(value, t)}
                   </SelectItem>
@@ -558,14 +520,15 @@ function AdminObservability() {
                   label={t("admin:observability.filters.relayStatus")}
                   value={relayStatus}
                   onChange={(value) => {
-                    void setRelayStatus(value);
-                    resetPage();
+                    patchFilters({
+                      relayStatus: parseFilterSelect(value, RELAY_STATUSES),
+                    });
                   }}
                 >
                   <SelectItem value="all">
                     {t("admin:observability.filters.allStatuses")}
                   </SelectItem>
-                  {relayStatuses.map((value) => (
+                  {RELAY_STATUSES.map((value) => (
                     <SelectItem key={value} value={value}>
                       {statusLabel(value, t)}
                     </SelectItem>
@@ -582,8 +545,7 @@ function AdminObservability() {
                     autoComplete="off"
                     value={errorClass}
                     onChange={(event) => {
-                      void setErrorClass(event.target.value);
-                      resetPage();
+                      patchFilters({ errorClass: event.target.value });
                     }}
                     placeholder={t("admin:observability.filters.errorClassPlaceholder")}
                     className="min-h-[44px]"
@@ -599,8 +561,7 @@ function AdminObservability() {
                       type="date"
                       value={createdAfter}
                       onChange={(event) => {
-                        void setCreatedAfter(event.target.value);
-                        resetPage();
+                        patchFilters({ createdAfter: event.target.value });
                       }}
                       className="min-h-[44px]"
                     />
@@ -614,8 +575,7 @@ function AdminObservability() {
                       type="date"
                       value={createdBefore}
                       onChange={(event) => {
-                        void setCreatedBefore(event.target.value);
-                        resetPage();
+                        patchFilters({ createdBefore: event.target.value });
                       }}
                       className="min-h-[44px]"
                     />
@@ -635,8 +595,8 @@ function AdminObservability() {
             isError: cliIsError,
             refetch: refetchClis,
           }}
-          page={pageInput}
-          onPage={(next) => void setPage(next)}
+          page={page}
+          onPage={(next) => patchSearch({ page: next })}
         />
       ) : null}
       {tab === "endpoints" ? (
@@ -647,8 +607,8 @@ function AdminObservability() {
             isError: endpointIsError,
             refetch: refetchEndpoints,
           }}
-          page={pageInput}
-          onPage={(next) => void setPage(next)}
+          page={page}
+          onPage={(next) => patchSearch({ page: next })}
         />
       ) : null}
       {tab === "models" ? (
@@ -659,8 +619,8 @@ function AdminObservability() {
             isError: modelIsError,
             refetch: refetchModels,
           }}
-          page={pageInput}
-          onPage={(next) => void setPage(next)}
+          page={page}
+          onPage={(next) => patchSearch({ page: next })}
         />
       ) : null}
       {tab === "pools" ? (
@@ -671,8 +631,8 @@ function AdminObservability() {
             isError: poolIsError,
             refetch: refetchPools,
           }}
-          page={pageInput}
-          onPage={(next) => void setPage(next)}
+          page={page}
+          onPage={(next) => patchSearch({ page: next })}
         />
       ) : null}
       {tab === "relays" ? (
@@ -683,8 +643,8 @@ function AdminObservability() {
             isError: relayIsError,
             refetch: refetchRelays,
           }}
-          page={pageInput}
-          onPage={(next) => void setPage(next)}
+          page={page}
+          onPage={(next) => patchSearch({ page: next })}
         />
       ) : null}
     </div>
