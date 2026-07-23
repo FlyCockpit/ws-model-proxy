@@ -4,6 +4,11 @@
     "target": "ESNext",
     "module": "ESNext",
     "moduleResolution": "bundler",
+    // Some workspace sources are imported by Node directly (no bundler) — e.g.
+    // packages/env/src/load-dotenv.ts via apps/web/vite.config.ts — so their
+    // relative specifiers must carry the real `.ts` extension. Type-checking is
+    // always `tsc --noEmit`, so this never affects emitted output.
+    "allowImportingTsExtensions": true,
     "lib": ["ESNext"],
     "verbatimModuleSyntax": true,
     "strict": true,

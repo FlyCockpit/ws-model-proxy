@@ -49,6 +49,9 @@ COPY packages/ui/package.json packages/ui/
 # Prisma schema + config must be present before install (postinstall runs prisma generate)
 COPY packages/db/prisma.config.ts packages/db/
 COPY packages/db/prisma packages/db/prisma
+# prisma.config.ts imports @ws-model-proxy/env/root-dotenv, so env's sources must
+# exist before install too — the config is loaded by `prisma generate`.
+COPY packages/env/src packages/env/src
 
 # Strip the root `postinstall` (which only runs `lefthook install`, a dev-only
 # git hook installer that errors without a real repo). The real package.json is
@@ -131,6 +134,9 @@ COPY packages/ui/package.json packages/ui/
 # Prisma schema + config needed for postinstall
 COPY packages/db/prisma.config.ts packages/db/
 COPY packages/db/prisma packages/db/prisma
+# prisma.config.ts imports @ws-model-proxy/env/root-dotenv (also needed at
+# runtime by `prisma db push`, which loads the same config).
+COPY packages/env/src packages/env/src
 
 # Install prod deps for BOTH the server and the web app. The server bundle
 # imports the built web SSR handler (apps/web/dist/server), which leaves `react`
@@ -162,6 +168,10 @@ WORKDIR /app
 COPY pnpm-workspace.yaml package.json pnpm-lock.yaml ./
 COPY apps/server/package.json apps/server/
 COPY packages/db/package.json packages/db/
+# packages/db/prisma.config.ts imports @ws-model-proxy/env/root-dotenv, and the
+# entrypoint loads that config when running `prisma db push`.
+COPY packages/env/package.json packages/env/
+COPY packages/env/src ./packages/env/src
 
 # Copy production node_modules. The two Prisma-bearing trees are
 # --chown=node:node: `prisma db push` runs at runtime as USER node and
@@ -170,6 +180,8 @@ COPY packages/db/package.json packages/db/
 COPY --chown=node:node --from=prod-deps /app/node_modules ./node_modules
 COPY --from=prod-deps /app/apps/server/node_modules ./apps/server/node_modules
 COPY --chown=node:node --from=prod-deps /app/packages/db/node_modules ./packages/db/node_modules
+# env's own deps (dotenv) — root-dotenv.ts is imported by prisma.config.ts.
+COPY --from=prod-deps /app/packages/env/node_modules ./packages/env/node_modules
 # web's node_modules: the server bundle dynamically imports apps/web/dist/server,
 # whose SSR chunks resolve `react` (left external by the web build) from here.
 COPY --from=prod-deps /app/apps/web/node_modules ./apps/web/node_modules

@@ -14,14 +14,14 @@
 // win (dotenv default).
 // ---------------------------------------------------------------------------
 
-import { loadRootDotenv, warnIfStaleServerEnv } from "./root-dotenv.js";
+import { loadRootDotenv, warnIfStaleServerEnv } from "./root-dotenv.ts";
 
 export {
   findRepoRoot,
   loadRootDotenv,
   resolveRootEnvPath,
   warnIfStaleServerEnv,
-} from "./root-dotenv.js";
+} from "./root-dotenv.ts";
 
 loadRootDotenv();
 warnIfStaleServerEnv();
