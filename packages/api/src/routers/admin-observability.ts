@@ -7,7 +7,14 @@ const CLI_HEARTBEAT_STALE_AFTER_MS = 60_000;
 
 const cliStatusSchema = z.enum(["DISCONNECTED", "CONNECTED", "STALE", "REVOKED"]);
 const endpointStatusSchema = z.enum(["UNKNOWN", "ONLINE", "DEGRADED", "OFFLINE"]);
-const modelCapabilityFamilySchema = z.enum(["TEXT", "VISION", "EMBEDDING", "AUDIO", "RESPONSES"]);
+const modelCapabilityFamilySchema = z.enum([
+  "TEXT",
+  "VISION",
+  "VIDEO",
+  "EMBEDDING",
+  "AUDIO",
+  "RESPONSES",
+]);
 const relayStatusSchema = z.enum(["PENDING", "SUCCEEDED", "FAILED", "CANCELED"]);
 const poolMemberHealthSchema = z.enum(["UNKNOWN", "HEALTHY", "HALF_OPEN", "DEGRADED", "UNHEALTHY"]);
 
@@ -208,6 +215,7 @@ type RelayAggregateRow = {
 type ModelCapabilityValue =
   | "TEXT_GENERATION"
   | "VISION_INPUT"
+  | "VIDEO_INPUT"
   | "EMBEDDING"
   | "AUDIO_INPUT"
   | "AUDIO_OUTPUT"
@@ -219,6 +227,7 @@ function capabilitiesForFamily(
   if (!family) return [];
   if (family === "TEXT") return ["TEXT_GENERATION"];
   if (family === "VISION") return ["VISION_INPUT"];
+  if (family === "VIDEO") return ["VIDEO_INPUT"];
   if (family === "EMBEDDING") return ["EMBEDDING"];
   if (family === "RESPONSES") return ["RESPONSES_API"];
   return ["AUDIO_INPUT", "AUDIO_OUTPUT"];

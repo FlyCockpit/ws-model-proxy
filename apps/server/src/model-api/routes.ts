@@ -33,6 +33,11 @@ import {
   modelApiConcurrencyLimiter,
 } from "./limits.js";
 import {
+  multimodalFlagsFromCapabilities,
+  openAiModelListExtensions,
+  unionMultimodalFlags,
+} from "./model-list-modalities.js";
+import {
   openAiErrorBody,
   openAiFailureJsonResponse,
   relayFailureHttpStatus,
@@ -285,26 +290,49 @@ function parseCapabilities(value: unknown): OpenAiCompatibleCapabilities | null 
   return parsed.success ? parsed.data : null;
 }
 
+/**
+ * Resolve effective OpenAI-compatible capabilities for a discovered model.
+ *
+ * OVERRIDE with parseable model metadata wins; if override mode is set but the
+ * metadata is missing/malformed, fall back to endpoint defaults (same as relay
+ * request-time resolution). INHERIT uses endpoint metadata only.
+ *
+ * Shared by relay routing and `/v1/models` advertisement so list vs execute
+ * never disagree on vision/video/audio flags.
+ */
+function effectiveCapabilitiesFrom({
+  capabilityOverrideMode,
+  capabilityOverrideMetadata,
+  endpointCapabilityMetadata,
+}: {
+  capabilityOverrideMode: string;
+  capabilityOverrideMetadata: unknown | null;
+  endpointCapabilityMetadata: unknown | null;
+}): OpenAiCompatibleCapabilities | null {
+  const modelMetadata =
+    capabilityOverrideMode === "OVERRIDE" ? parseCapabilities(capabilityOverrideMetadata) : null;
+  if (modelMetadata) return modelMetadata;
+  return parseCapabilities(endpointCapabilityMetadata);
+}
+
 function effectiveDirectCapabilities(
   row: DirectModelRelayRow,
 ): OpenAiCompatibleCapabilities | null {
-  const modelMetadata =
-    row.capabilityOverrideMode === "OVERRIDE"
-      ? parseCapabilities(row.capabilityOverrideMetadata)
-      : null;
-  if (modelMetadata) return modelMetadata;
-  return parseCapabilities(row.Endpoint.capabilityMetadata);
+  return effectiveCapabilitiesFrom({
+    capabilityOverrideMode: row.capabilityOverrideMode,
+    capabilityOverrideMetadata: row.capabilityOverrideMetadata,
+    endpointCapabilityMetadata: row.Endpoint.capabilityMetadata,
+  });
 }
 
 function effectivePoolMemberCapabilities(
   row: PoolMemberRelayRow,
 ): OpenAiCompatibleCapabilities | null {
-  const modelMetadata =
-    row.DiscoveredModel.capabilityOverrideMode === "OVERRIDE"
-      ? parseCapabilities(row.DiscoveredModel.capabilityOverrideMetadata)
-      : null;
-  if (modelMetadata) return modelMetadata;
-  return parseCapabilities(row.DiscoveredModel.Endpoint.capabilityMetadata);
+  return effectiveCapabilitiesFrom({
+    capabilityOverrideMode: row.DiscoveredModel.capabilityOverrideMode,
+    capabilityOverrideMetadata: row.DiscoveredModel.capabilityOverrideMetadata,
+    endpointCapabilityMetadata: row.DiscoveredModel.Endpoint.capabilityMetadata,
+  });
 }
 
 function supportsCapability({
@@ -919,25 +947,101 @@ function poolTargetByModelId(targets: VisibleModelPoolTarget[], modelId: string)
   return targets.find((target) => target.modelId === modelId) ?? null;
 }
 
-function modelListResponse(targets: {
+/**
+ * OpenAI-compatible model list with additive multimodal advertisement fields
+ * (supports_vision, capabilities, architecture.input_modalities, …). See
+ * `model-list-modalities.ts`. Official OpenAI only requires id/created/object/owned_by.
+ */
+async function modelListResponse(targets: {
   directModels: VisibleDirectModelTarget[];
   modelPools: VisibleModelPoolTarget[];
 }) {
+  const directIds = targets.directModels.map((model) => model.id);
+  const poolIds = targets.modelPools.map((pool) => pool.id);
+
+  const directRows =
+    directIds.length === 0
+      ? []
+      : await prisma.discoveredModel.findMany({
+          where: { id: { in: directIds } },
+          select: {
+            id: true,
+            capabilityOverrideMode: true,
+            capabilityOverrideMetadata: true,
+            Endpoint: { select: { capabilityMetadata: true } },
+          },
+        });
+
+  const directCapsById = new Map(
+    directRows.map((row) => {
+      const caps = effectiveCapabilitiesFrom({
+        capabilityOverrideMode: row.capabilityOverrideMode,
+        capabilityOverrideMetadata: row.capabilityOverrideMetadata,
+        endpointCapabilityMetadata: row.Endpoint.capabilityMetadata,
+      });
+      return [row.id, multimodalFlagsFromCapabilities(caps)] as const;
+    }),
+  );
+
+  const poolMemberRows =
+    poolIds.length === 0
+      ? []
+      : await prisma.poolMember.findMany({
+          where: { poolId: { in: poolIds } },
+          select: {
+            poolId: true,
+            DiscoveredModel: {
+              select: {
+                capabilityOverrideMode: true,
+                capabilityOverrideMetadata: true,
+                Endpoint: { select: { capabilityMetadata: true } },
+              },
+            },
+          },
+        });
+
+  // Pool advertisement is a union of member flags (optimistic): if any member
+  // supports vision/video/audio, the pool lists it. A single request still
+  // routes to one member that may lack that modality — not a hard guarantee.
+  const poolFlagsById = new Map<string, ReturnType<typeof multimodalFlagsFromCapabilities>>();
+  for (const poolId of poolIds) {
+    const memberFlags = poolMemberRows
+      .filter((row) => row.poolId === poolId)
+      .map((row) => {
+        const dm = row.DiscoveredModel;
+        const caps = effectiveCapabilitiesFrom({
+          capabilityOverrideMode: dm.capabilityOverrideMode,
+          capabilityOverrideMetadata: dm.capabilityOverrideMetadata,
+          endpointCapabilityMetadata: dm.Endpoint.capabilityMetadata,
+        });
+        return multimodalFlagsFromCapabilities(caps);
+      });
+    poolFlagsById.set(poolId, unionMultimodalFlags(memberFlags));
+  }
+
   return {
-    object: "list",
+    object: "list" as const,
     data: [
-      ...targets.directModels.map((model) => ({
-        id: model.modelId,
-        object: "model",
-        created: 0,
-        owned_by: model.ownerUserSlug,
-      })),
-      ...targets.modelPools.map((pool) => ({
-        id: pool.modelId,
-        object: "model",
-        created: 0,
-        owned_by: pool.ownerUserSlug,
-      })),
+      ...targets.directModels.map((model) => {
+        const flags = directCapsById.get(model.id) ?? multimodalFlagsFromCapabilities(null);
+        return {
+          id: model.modelId,
+          object: "model" as const,
+          created: 0,
+          owned_by: model.ownerUserSlug,
+          ...openAiModelListExtensions(flags),
+        };
+      }),
+      ...targets.modelPools.map((pool) => {
+        const flags = poolFlagsById.get(pool.id) ?? multimodalFlagsFromCapabilities(null);
+        return {
+          id: pool.modelId,
+          object: "model" as const,
+          created: 0,
+          owned_by: pool.ownerUserSlug,
+          ...openAiModelListExtensions(flags),
+        };
+      }),
     ],
   };
 }
@@ -1678,7 +1782,7 @@ export function createModelApiRoutes({
       return openAiFailureJsonResponse("access_denied", "Missing or invalid model API token.");
     }
     const targets = await listVisibleModelTargetsForToken(token);
-    return c.json(modelListResponse(targets));
+    return c.json(await modelListResponse(targets));
   });
 
   app.post("/chat/completions", async (c) =>

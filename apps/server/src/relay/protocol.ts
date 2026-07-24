@@ -53,7 +53,18 @@ export const openAiCompatibleCapabilitiesSchema = z
       .object({
         supported: booleanSupportSchema,
         streaming: booleanSupportSchema,
+        /** OpenAI-shaped `image_url` content parts. */
         vision: booleanSupportSchema,
+        /**
+         * OpenAI-shaped `video_url` content parts (e.g. MiMo / omni local models).
+         * Distinct from dedicated media-store video; this is chat multimodal input.
+         */
+        video: booleanSupportSchema,
+        /**
+         * OpenAI-shaped `input_audio` content parts in chat.
+         * Distinct from top-level `audio.transcriptions` / `translations` endpoints.
+         */
+        audio: booleanSupportSchema,
       })
       .strict()
       .optional(),

@@ -93,6 +93,7 @@ function statusLabel(value: string, t: TFunction<["admin", "common"]>) {
 function capabilityLabel(value: string, t: TFunction<["admin", "common"]>) {
   if (value === "TEXT_GENERATION") return statusLabel("TEXT", t);
   if (value === "VISION_INPUT") return statusLabel("VISION", t);
+  if (value === "VIDEO_INPUT") return statusLabel("VIDEO", t);
   if (value === "EMBEDDING") return statusLabel("EMBEDDING", t);
   if (value === "AUDIO_INPUT" || value === "AUDIO_OUTPUT") return statusLabel("AUDIO", t);
   if (value === "RESPONSES_API") return statusLabel("RESPONSES", t);

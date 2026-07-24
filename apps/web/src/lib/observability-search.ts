@@ -14,7 +14,7 @@
 export type ObservabilityTab = "clis" | "endpoints" | "models" | "pools" | "relays";
 export type CliStatus = "DISCONNECTED" | "CONNECTED" | "STALE" | "REVOKED";
 export type EndpointStatus = "UNKNOWN" | "ONLINE" | "DEGRADED" | "OFFLINE";
-export type CapabilityFamily = "TEXT" | "VISION" | "EMBEDDING" | "AUDIO" | "RESPONSES";
+export type CapabilityFamily = "TEXT" | "VISION" | "VIDEO" | "EMBEDDING" | "AUDIO" | "RESPONSES";
 export type PoolHealth = "UNKNOWN" | "HEALTHY" | "HALF_OPEN" | "DEGRADED" | "UNHEALTHY";
 export type RelayStatus = "PENDING" | "SUCCEEDED" | "FAILED" | "CANCELED";
 
@@ -43,6 +43,7 @@ export const ENDPOINT_STATUSES: readonly EndpointStatus[] = [
 export const CAPABILITY_FAMILIES: readonly CapabilityFamily[] = [
   "TEXT",
   "VISION",
+  "VIDEO",
   "EMBEDDING",
   "AUDIO",
   "RESPONSES",

@@ -7,6 +7,7 @@ import type { EndpointInventory, OpenAiCompatibleCapabilities } from "./protocol
 type ModelCapability =
   | "TEXT_GENERATION"
   | "VISION_INPUT"
+  | "VIDEO_INPUT"
   | "EMBEDDING"
   | "AUDIO_INPUT"
   | "AUDIO_OUTPUT"
@@ -52,8 +53,14 @@ function coarseModelCapabilities(
     values.add("TEXT_GENERATION");
   }
   if (capabilities.chatCompletions?.vision) values.add("VISION_INPUT");
+  if (capabilities.chatCompletions?.video) values.add("VIDEO_INPUT");
   if (capabilities.embeddings?.supported) values.add("EMBEDDING");
-  if (capabilities.audio?.transcriptions || capabilities.audio?.translations) {
+  // Dedicated /v1/audio/* endpoints *or* chat `input_audio` content parts.
+  if (
+    capabilities.chatCompletions?.audio ||
+    capabilities.audio?.transcriptions ||
+    capabilities.audio?.translations
+  ) {
     values.add("AUDIO_INPUT");
   }
   if (capabilities.audio?.speech) values.add("AUDIO_OUTPUT");

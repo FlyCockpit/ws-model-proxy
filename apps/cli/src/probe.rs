@@ -177,21 +177,73 @@ fn suggest_default_capabilities(
     if ids.iter().any(|id| id.to_lowercase().contains("response")) {
         suggested = suggested.with_responses();
     }
-    if ids.iter().any(|id| {
-        let id = id.to_lowercase();
-        id.contains("vision") || id.contains("vl") || id.contains("llava")
-    }) {
+    if ids.iter().any(|id| looks_like_vision_model(id)) {
         suggested = suggested.with_vision();
     }
+    if ids.iter().any(|id| looks_like_video_model(id)) {
+        suggested = suggested.with_video();
+    }
+    if ids.iter().any(|id| looks_like_chat_audio_model(id)) {
+        suggested = suggested.with_chat_audio();
+    }
     suggested
+}
+
+/// Heuristic vision/image support from upstream model id (not perfect; operators
+/// can override). Includes common VLM tags and omni stacks used with local relay.
+fn looks_like_vision_model(model_id: &str) -> bool {
+    let id = model_id.to_lowercase();
+    id.contains("vision")
+        || id.contains("vl")
+        || id.contains("llava")
+        || id.contains("omni")
+        || id.contains("mimo")
+        || id.contains("qwen2-vl")
+        || id.contains("qwen2.5-vl")
+        || id.contains("qwen3-vl")
+        || id.contains("internvl")
+        || id.contains("minicpm-v")
+        || id.contains("phi-3.5-vision")
+        || id.contains("pixtral")
+}
+
+/// Chat `video_url` multimodal — omni / dedicated video-language tags.
+fn looks_like_video_model(model_id: &str) -> bool {
+    let id = model_id.to_lowercase();
+    id.contains("omni")
+        || id.contains("mimo")
+        || id.contains("video")
+        || id.contains("qwen2.5-omni")
+        || id.contains("qwen3-omni")
+}
+
+/// Chat `input_audio` multimodal (not STT-only / embed ids).
+fn looks_like_chat_audio_model(model_id: &str) -> bool {
+    let id = model_id.to_lowercase();
+    id.contains("omni")
+        || id.contains("mimo")
+        || (id.contains("audio") && !id.contains("embed") && !id.contains("whisper"))
 }
 
 fn suggest_model(model_id: &str) -> Option<ModelSuggestion> {
     let lower = model_id.to_lowercase();
     let capabilities = if lower.contains("embed") {
         OpenAiCompatibleCapabilities::embedding_defaults()
-    } else if lower.contains("vision") || lower.contains("vl") || lower.contains("llava") {
-        OpenAiCompatibleCapabilities::openai_defaults().with_vision()
+    } else if looks_like_vision_model(model_id)
+        || looks_like_video_model(model_id)
+        || looks_like_chat_audio_model(model_id)
+    {
+        let mut caps = OpenAiCompatibleCapabilities::openai_defaults();
+        if looks_like_vision_model(model_id) {
+            caps = caps.with_vision();
+        }
+        if looks_like_video_model(model_id) {
+            caps = caps.with_video();
+        }
+        if looks_like_chat_audio_model(model_id) {
+            caps = caps.with_chat_audio();
+        }
+        caps
     } else if lower.contains("response") {
         OpenAiCompatibleCapabilities::openai_defaults().with_responses()
     } else {

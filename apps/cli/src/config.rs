@@ -177,6 +177,8 @@ impl OpenAiCompatibleCapabilities {
                 supported: Some(true),
                 streaming: Some(true),
                 vision: None,
+                video: None,
+                audio: None,
             }),
             completions: None,
             embeddings: None,
@@ -216,14 +218,42 @@ impl OpenAiCompatibleCapabilities {
     }
 
     pub fn with_vision(mut self) -> Self {
-        let mut chat = self
-            .chat_completions
-            .unwrap_or(ChatCompletionsCapabilities {
-                supported: Some(true),
-                streaming: Some(true),
-                vision: None,
-            });
+        let mut chat = self.chat_completions.unwrap_or(ChatCompletionsCapabilities {
+            supported: Some(true),
+            streaming: Some(true),
+            vision: None,
+            video: None,
+            audio: None,
+        });
         chat.vision = Some(true);
+        self.chat_completions = Some(chat);
+        self
+    }
+
+    /// Chat multimodal `video_url` parts (omni / VLM local stacks such as MiMo).
+    pub fn with_video(mut self) -> Self {
+        let mut chat = self.chat_completions.unwrap_or(ChatCompletionsCapabilities {
+            supported: Some(true),
+            streaming: Some(true),
+            vision: None,
+            video: None,
+            audio: None,
+        });
+        chat.video = Some(true);
+        self.chat_completions = Some(chat);
+        self
+    }
+
+    /// Chat multimodal `input_audio` parts (not dedicated /v1/audio/* endpoints).
+    pub fn with_chat_audio(mut self) -> Self {
+        let mut chat = self.chat_completions.unwrap_or(ChatCompletionsCapabilities {
+            supported: Some(true),
+            streaming: Some(true),
+            vision: None,
+            video: None,
+            audio: None,
+        });
+        chat.audio = Some(true);
         self.chat_completions = Some(chat);
         self
     }
@@ -249,8 +279,15 @@ pub struct ChatCompletionsCapabilities {
     pub supported: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub streaming: Option<bool>,
+    /// `image_url` content parts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,
+    /// `video_url` content parts (omni / VLM).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video: Option<bool>,
+    /// `input_audio` content parts in chat.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

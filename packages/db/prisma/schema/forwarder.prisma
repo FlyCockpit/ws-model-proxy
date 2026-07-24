@@ -19,6 +19,8 @@ enum EndpointStatus {
 enum ModelCapability {
   TEXT_GENERATION
   VISION_INPUT
+  /// Chat multimodal `video_url` (and similar) input — e.g. omni / VLM stacks.
+  VIDEO_INPUT
   EMBEDDING
   AUDIO_INPUT
   AUDIO_OUTPUT

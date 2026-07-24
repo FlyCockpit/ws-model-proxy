@@ -39,6 +39,7 @@ type CancelRelayRequestArgs = Parameters<RelaySessionManager["cancelRelayRequest
 const db = prisma as unknown as {
   discoveredModel: {
     findUnique: MockInstance;
+    findMany: MockInstance;
   };
   poolMember: {
     findMany: MockInstance;
@@ -332,6 +333,26 @@ describe("model API routes", () => {
   });
 
   it("lists only model targets visible to the bearer token", async () => {
+    db.discoveredModel.findMany.mockResolvedValue([
+      {
+        id: directTarget.id,
+        capabilityOverrideMode: "OVERRIDE",
+        capabilityOverrideMetadata: {
+          version: 1,
+          protocol: "openai-compatible",
+          chatCompletions: {
+            supported: true,
+            streaming: true,
+            vision: true,
+            video: true,
+            audio: true,
+          },
+        },
+        Endpoint: { capabilityMetadata: null },
+      },
+    ]);
+    db.poolMember.findMany.mockResolvedValue([]);
+
     const manager = new FakeRelayManager();
     const response = await appWith(manager).request("/models", {
       headers: { authorization: "Bearer wsmp_model_test" },
@@ -346,18 +367,80 @@ describe("model API routes", () => {
           object: "model",
           created: 0,
           owned_by: "owner",
+          supports_vision: true,
+          supports_video_input: true,
+          supports_audio_input: true,
+          supports_audio_output: false,
+          capabilities: {
+            vision: true,
+            video_input: true,
+            audio_input: true,
+            audio_output: false,
+          },
+          architecture: {
+            input_modalities: ["text", "image", "audio", "video"],
+            output_modalities: ["text"],
+            modality: "text+image+audio+video->text",
+          },
         },
         {
           id: poolTarget.modelId,
           object: "model",
           created: 0,
           owned_by: "owner",
+          // Empty pool → text-only advertisement defaults.
+          supports_vision: false,
+          supports_video_input: false,
+          supports_audio_input: false,
+          supports_audio_output: false,
+          capabilities: {
+            vision: false,
+            video_input: false,
+            audio_input: false,
+            audio_output: false,
+          },
+          architecture: {
+            input_modalities: ["text"],
+            output_modalities: ["text"],
+            modality: "text->text",
+          },
         },
       ],
     });
     expect(mockedTokenAccess.authenticateModelApiTokenSecret).toHaveBeenCalledWith(
       "wsmp_model_test",
     );
+  });
+
+  it("falls back to endpoint capabilities when OVERRIDE metadata is unparseable", async () => {
+    // Mirrors effectiveDirectCapabilities: OVERRIDE + bad override JSON still
+    // advertises endpoint vision so /v1/models matches request-time routing.
+    db.discoveredModel.findMany.mockResolvedValue([
+      {
+        id: directTarget.id,
+        capabilityOverrideMode: "OVERRIDE",
+        capabilityOverrideMetadata: { not: "a valid capabilities object" },
+        Endpoint: {
+          capabilityMetadata: {
+            version: 1,
+            protocol: "openai-compatible",
+            chatCompletions: { supported: true, streaming: true, vision: true },
+          },
+        },
+      },
+    ]);
+    db.poolMember.findMany.mockResolvedValue([]);
+
+    const response = await appWith(new FakeRelayManager()).request("/models", {
+      headers: { authorization: "Bearer wsmp_model_test" },
+    });
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      data: Array<{ id: string; supports_vision: boolean }>;
+    };
+    const direct = body.data.find((entry) => entry.id === directTarget.modelId);
+    expect(direct?.supports_vision).toBe(true);
   });
 
   it("rejects missing or invalid bearer tokens with 401", async () => {
