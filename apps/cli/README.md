@@ -64,8 +64,11 @@ Opt in per endpoint with `expandMedia` (config key) or `--expand-media` on
 `endpoints add`. When enabled, the relay buffers chat-shaped JSON request bodies
 (`Content-Type: application/json`), walks `image_url` / `video_url` /
 `input_audio` content parts, fetches each media URL, and inlines it as a
-`data:{mime};base64,…` URL before forwarding upstream. Non-JSON bodies and
-body-less requests always take the untouched streaming path.
+`data:{mime};base64,…` URL before forwarding upstream. Still-image `image_url`
+parts are normalized to JPEG/PNG when inlined (WebP/GIF and other non-safe
+formats are re-encoded to JPEG) so local vision servers that reject WebP still
+work. Video/audio keep their stored mime. Non-JSON bodies and body-less
+requests always take the untouched streaming path.
 
 Only URLs whose origin matches the connected WMP server (derived from
 `serverUrl`) and whose path is `/media/{id}` are fetched — arbitrary URLs from

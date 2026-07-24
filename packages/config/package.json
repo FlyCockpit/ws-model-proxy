@@ -25,5 +25,11 @@
     "biome.json",
     "postcss.config.mjs",
     "src"
-  ]
+  ],
+  "scripts": {
+    "test": "vitest run --passWithNoTests"
+  },
+  "devDependencies": {
+    "vitest": "catalog:"
+  }
 }

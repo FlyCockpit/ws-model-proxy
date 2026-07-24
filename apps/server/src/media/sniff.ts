@@ -8,6 +8,11 @@
  * what lets the signed GET route send `X-Content-Type-Options: nosniff` with a
  * trustworthy type.
  *
+ * Storage may keep WebP/GIF for efficiency. Consumers that embed base64 for
+ * local OpenAI-compatible servers use the shared model-inline-safe policy
+ * (`@ws-model-proxy/config/media-policy`): JPEG/PNG only, with CLI
+ * `expandMedia` re-encoding other still images when inlining.
+ *
  * Hand-rolled on purpose (no new dependency): the allowlist is small.
  */
 

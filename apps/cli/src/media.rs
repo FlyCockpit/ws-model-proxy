@@ -7,14 +7,26 @@
 //! each media URL that belongs to the connected WMP server, and inlines it as a
 //! `data:` URL before forwarding upstream.
 //!
+//! Still-image parts are normalized to model-inline-safe formats (JPEG/PNG)
+//! when inlined — matching the shared product policy in
+//! `@ws-model-proxy/config/media-policy`. WebP/GIF stored in the media store
+//! therefore still work against local vision servers after expansion.
+//!
 //! This module holds the pure, network-free logic: trusted-origin matching, the
-//! JSON content-part walker, base64 encoding, and the error taxonomy. The daemon
-//! supplies the actual HTTP fetcher so this code stays unit-testable.
+//! JSON content-part walker, base64 encoding, image normalization, and the
+//! error taxonomy. The daemon supplies the actual HTTP fetcher so this code
+//! stays unit-testable.
+
+use std::io::Cursor;
 
 use serde_json::Value;
 use url::{Origin, Url};
 
 use crate::protocol::RelayFailure;
+
+/// JPEG quality used when re-encoding WebP/GIF (or other non-safe images) for
+/// local upstreams. Matches the web composer's `DEFAULT_IMAGE_ENCODE_QUALITY`.
+const INLINE_JPEG_QUALITY: u8 = 85;
 
 /// Hard ceiling on both the buffered request body and the transformed body after
 /// base64 inflation (~4/3 growth). Bodies above this fail fast instead of
@@ -64,6 +76,8 @@ pub enum MediaExpandError {
     InputTooLarge,
     /// The transformed body exceeded the cap after base64 inflation.
     BodyTooLarge,
+    /// A fetched still image could not be normalized to JPEG/PNG for inline use.
+    UnsupportedImage { path: String, reason: String },
 }
 
 impl MediaExpandError {
@@ -76,6 +90,9 @@ impl MediaExpandError {
             Self::AssetTooLarge { .. } | Self::InputTooLarge | Self::BodyTooLarge => {
                 RelayFailure::RequestTooLarge
             }
+            // Treat decode/convert failures like a bad request body from the
+            // client's perspective (unsupported media for this relay path).
+            Self::UnsupportedImage { .. } => RelayFailure::Upstream4xx,
         }
     }
 
@@ -94,6 +111,9 @@ impl MediaExpandError {
             Self::BodyTooLarge => format!(
                 "request body exceeds the {MEDIA_EXPAND_MAX_BODY_BYTES} byte cap after media expansion"
             ),
+            Self::UnsupportedImage { path, reason } => {
+                format!("failed to normalize media image `{path}` for local upstream: {reason}")
+            }
         }
     }
 }
@@ -207,11 +227,17 @@ fn expand_part(
     fetch: &dyn Fn(&Url) -> Result<FetchedMedia, MediaExpandError>,
     changed: &mut bool,
 ) -> Result<(), MediaExpandError> {
-    let Some(kind) = part.get("type").and_then(Value::as_str) else {
+    // Clone the part kind so later mutable borrows of `part` do not conflict
+    // with the temporary borrow from `get("type")`.
+    let kind = part
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let Some(kind) = kind else {
         return Ok(());
     };
     // `input_audio` carries the reference under `data`; image/video under `url`.
-    let (container, field) = match kind {
+    let (container, field) = match kind.as_str() {
         "image_url" => ("image_url", "url"),
         "video_url" => ("video_url", "url"),
         "input_audio" => ("input_audio", "data"),
@@ -233,14 +259,110 @@ fn expand_part(
     }
 
     let fetched = fetch(&url)?;
-    let data_url = format!(
-        "data:{};base64,{}",
-        fetched.mime(),
-        base64_encode(&fetched.bytes)
-    );
+    let path = media_path_for_errors(&url);
+    // Still images are normalized to JPEG/PNG for local-server compatibility.
+    // Video/audio keep their stored mime (no silent re-containerization here).
+    let (mime, bytes) = if kind == "image_url" {
+        prepare_image_for_inline(fetched, &path)?
+    } else {
+        (fetched.mime().to_string(), fetched.bytes)
+    };
+    let data_url = format!("data:{mime};base64,{}", base64_encode(&bytes));
     *field_value = Value::String(data_url);
     *changed = true;
     Ok(())
+}
+
+/// Path fragment used in error messages — never includes query (`sig`).
+fn media_path_for_errors(url: &Url) -> String {
+    url.path().to_string()
+}
+
+/// True when `mime` is safe to embed as a `data:` URL for local vision servers.
+/// Keep aligned with `@ws-model-proxy/config/media-policy` `MODEL_INLINE_SAFE_IMAGE_MIMES`
+/// (+ `image/jpg` alias, which TS normalizes to `image/jpeg`).
+fn is_model_inline_safe_image_mime(mime: &str) -> bool {
+    matches!(
+        mime
+            .split(';')
+            .next()
+            .unwrap_or(mime)
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "image/jpeg" | "image/jpg" | "image/png"
+    )
+}
+
+/// Prepare fetched still-image bytes for a `data:` URL: passthrough JPEG/PNG,
+/// re-encode WebP/GIF/other decodable images to JPEG.
+fn prepare_image_for_inline(
+    fetched: FetchedMedia,
+    path: &str,
+) -> Result<(String, Vec<u8>), MediaExpandError> {
+    let mime = fetched.mime().to_string();
+    if is_model_inline_safe_image_mime(&mime) {
+        return Ok((normalize_safe_image_mime(&mime), fetched.bytes));
+    }
+    let jpeg = reencode_image_bytes_to_jpeg(&fetched.bytes).map_err(|reason| {
+        MediaExpandError::UnsupportedImage {
+            path: path.to_string(),
+            reason,
+        }
+    })?;
+    Ok(("image/jpeg".to_string(), jpeg))
+}
+
+fn normalize_safe_image_mime(mime: &str) -> String {
+    let base = mime
+        .split(';')
+        .next()
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase();
+    if base == "image/jpg" {
+        "image/jpeg".to_string()
+    } else {
+        base
+    }
+}
+
+/// Decode arbitrary still-image bytes and re-encode as JPEG (quality
+/// [`INLINE_JPEG_QUALITY`]). Used when the media store held WebP/GIF/etc.
+///
+/// Alpha is composited onto **white** before encode, matching the web chat-test
+/// path (`image-attachments.ts` fills `#ffffff` before `drawImage`). A bare
+/// `to_rgb8()` would matte transparent pixels to black and diverge from the
+/// browser for screenshots, icons, and diagrams.
+fn reencode_image_bytes_to_jpeg(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let img = image::load_from_memory(bytes).map_err(|err| format!("decode failed: {err}"))?;
+    let rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    // White matte, then alpha-blend source over it (same as canvas white fill).
+    let mut canvas = image::RgbaImage::from_pixel(width, height, image::Rgba([255, 255, 255, 255]));
+    image::imageops::overlay(&mut canvas, &rgba, 0, 0);
+    let rgb = image::DynamicImage::ImageRgba8(canvas).to_rgb8();
+    let mut out = Vec::new();
+    {
+        let mut cursor = Cursor::new(&mut out);
+        let mut encoder =
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, INLINE_JPEG_QUALITY);
+        encoder
+            .encode(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .map_err(|err| format!("jpeg encode failed: {err}"))?;
+    }
+    if out.is_empty() {
+        return Err("jpeg encode produced empty output".to_string());
+    }
+    if out.get(0..3) != Some(&[0xff, 0xd8, 0xff]) {
+        return Err("jpeg encode produced non-jpeg magic".to_string());
+    }
+    Ok(out)
 }
 
 /// Standard base64 (RFC 4648, `+/`, padded). Kept in-crate to avoid a new direct
@@ -310,6 +432,132 @@ mod tests {
         assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
         assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    /// 1×1 PNG (valid magic). Used when the declared mime is WebP so expansion
+    /// must re-encode rather than trust the Content-Type alone.
+    fn tiny_png_bytes() -> Vec<u8> {
+        vec![
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ]
+    }
+
+    #[test]
+    fn prepare_image_passthroughs_png() {
+        let png = tiny_png_bytes();
+        let (mime, bytes) = prepare_image_for_inline(
+            FetchedMedia {
+                content_type: Some("image/png".to_string()),
+                bytes: png.clone(),
+            },
+            "/media/x",
+        )
+        .expect("png");
+        assert_eq!(mime, "image/png");
+        assert_eq!(bytes, png);
+    }
+
+    #[test]
+    fn prepare_image_passthroughs_jpeg_and_aliases_jpg() {
+        // Minimal 1×1 JPEG (valid magic + short payload is enough for passthrough —
+        // we do not re-decode safe mimes).
+        let jpeg = vec![0xff, 0xd8, 0xff, 0xd9];
+        let (mime, bytes) = prepare_image_for_inline(
+            FetchedMedia {
+                content_type: Some("image/jpeg".to_string()),
+                bytes: jpeg.clone(),
+            },
+            "/media/j",
+        )
+        .expect("jpeg");
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(bytes, jpeg);
+
+        let (mime_jpg, _) = prepare_image_for_inline(
+            FetchedMedia {
+                content_type: Some("image/jpg".to_string()),
+                bytes: jpeg,
+            },
+            "/media/jpg",
+        )
+        .expect("jpg alias");
+        assert_eq!(mime_jpg, "image/jpeg");
+    }
+
+    #[test]
+    fn reencode_composites_transparent_pixels_on_white() {
+        // Fully transparent RGBA → after white matte + JPEG, every sample must
+        // be near-white. (Black matte from bare to_rgb8() would be near 0.)
+        // Use a uniform transparent field so JPEG chroma from neighbors cannot
+        // muddy the assertion.
+        let img = image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 0, 0, 0]));
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode png fixture");
+        let jpeg = reencode_image_bytes_to_jpeg(&png).expect("to jpeg");
+        let decoded = image::load_from_memory(&jpeg)
+            .expect("decode jpeg")
+            .to_rgb8();
+        for pixel in decoded.pixels() {
+            let [r, g, b] = pixel.0;
+            assert!(
+                r > 240 && g > 240 && b > 240,
+                "expected white matte for transparent image, got {:?}",
+                pixel.0
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_image_reencodes_webp_declared_bytes_to_jpeg() {
+        // Bytes are a valid PNG; declared mime is WebP so we must normalize.
+        let (mime, bytes) = prepare_image_for_inline(
+            FetchedMedia {
+                content_type: Some("image/webp".to_string()),
+                bytes: tiny_png_bytes(),
+            },
+            "/media/webp",
+        )
+        .expect("normalize");
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(&bytes[0..3], &[0xff, 0xd8, 0xff]);
+    }
+
+    #[test]
+    fn expand_normalizes_image_url_webp_to_jpeg_data_url() {
+        let body = serde_json::json!({
+            "messages": [{
+                "content": [
+                    { "type": "image_url", "image_url": { "url": "https://relay.example.test/media/w?sig=s" } }
+                ]
+            }]
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let out = expand_media_in_body(
+            &bytes,
+            &trusted(),
+            &|_url| {
+                Ok(FetchedMedia {
+                    content_type: Some("image/webp".to_string()),
+                    bytes: tiny_png_bytes(),
+                })
+            },
+            MEDIA_EXPAND_MAX_BODY_BYTES,
+        )
+        .expect("expand");
+        let parsed: Value = serde_json::from_slice(&out).unwrap();
+        let url = parsed["messages"][0]["content"][0]["image_url"]["url"]
+            .as_str()
+            .expect("url");
+        assert!(
+            url.starts_with("data:image/jpeg;base64,"),
+            "expected jpeg data url, got {url}"
+        );
     }
 
     #[test]

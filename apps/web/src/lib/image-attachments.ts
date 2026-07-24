@@ -1,34 +1,41 @@
 // Client-side image attachment helpers for the chat-test composer.
 //
-// Phase 0 of the multimodal asset plan: images are attached by downscaling and
-// re-encoding them in the browser, then embedding them as base64 `data:` URLs
-// inside OpenAI-shaped content parts. No server storage is involved.
+// Multimodal encode policy lives in `@ws-model-proxy/config/media-policy`.
+// This module performs browser I/O (decode, canvas, FileReader) and applies
+// that pure policy so model payloads stay compatible with local vision servers.
 //
 // Size budget rationale (see asset-plan.md "Size limits"):
 //   - The internal chat-test route enforces a global 10 MB Hono body limit.
-//   - The CLI relay now STREAMS request bodies, so the old ~8 MiB buffered-chunk
-//     cap no longer applies — the 10 MB internal route body limit is the real
-//     remaining ceiling for base64-through-relay.
+//   - The CLI relay streams request bodies; the 10 MB internal route body limit
+//     is the remaining ceiling for base64-through-relay.
 //   - Multi-turn history RE-SENDS every prior image as base64 each turn.
 // So we keep a conservative per-image cap and a total-request budget that both
 // sit safely below that 10 MB route limit.
 
-export const ACCEPTED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"] as const;
+import {
+  CLIENT_ACCEPTED_IMAGE_MIMES,
+  DEFAULT_IMAGE_ENCODE_QUALITY,
+  DEFAULT_IMAGE_INLINE_PROFILE,
+  DEFAULT_IMAGE_MAX_EDGE,
+  decideImageEncode,
+  type ImageInlineProfile,
+  isClientAcceptedImageMime,
+  type ModelInlineSafeImageMime,
+  reencodeMimeChain,
+} from "@ws-model-proxy/config/media-policy";
+
+export const ACCEPTED_IMAGE_TYPES = CLIENT_ACCEPTED_IMAGE_MIMES;
 
 export const ACCEPTED_IMAGE_ACCEPT_ATTR = ACCEPTED_IMAGE_TYPES.join(",");
 
-// Longest edge after downscaling; matches the asset plan's client guidance.
-export const MAX_IMAGE_EDGE = 2048;
+/** Longest edge after downscaling; matches the shared media-policy default. */
+export const MAX_IMAGE_EDGE = DEFAULT_IMAGE_MAX_EDGE;
 
-// Re-encode quality for lossy WebP/JPEG output.
-export const IMAGE_ENCODE_QUALITY = 0.85;
+/** Re-encode quality for lossy JPEG output. */
+export const IMAGE_ENCODE_QUALITY = DEFAULT_IMAGE_ENCODE_QUALITY;
 
-// Max number of images that may be attached to a single composer message.
+/** Max number of images that may be attached to a single composer message. */
 export const MAX_ATTACHMENTS_PER_MESSAGE = 8;
-
-// GIFs smaller than this are passed through untouched to preserve animation.
-// Larger GIFs are rasterized to their first frame during downscale/re-encode.
-export const GIF_PASSTHROUGH_MAX_BYTES = 512 * 1024;
 
 // Post-compression per-image cap (decoded binary bytes, i.e. excluding the
 // base64/data-URL overhead). Kept small because history re-sends each image.
@@ -61,22 +68,18 @@ export type ProcessImageResult =
   | { ok: true; image: ProcessedImage }
   | { ok: false; reason: "unsupported" | "oversize" | "decodeFailed"; name: string };
 
-export function isAcceptedImageType(type: string): boolean {
-  return (ACCEPTED_IMAGE_TYPES as readonly string[]).includes(type);
-}
+export type ProcessImageOptions = {
+  /**
+   * Encode profile for the model payload. Defaults to `model-inline-safe`
+   * (JPEG/PNG only) so local OpenAI-compatible servers accept the data URL.
+   * Pass `openai-broad` only when the selected upstream is known to accept
+   * WebP/GIF (e.g. cloud OpenAI-compatible APIs).
+   */
+  profile?: ImageInlineProfile;
+};
 
-let webpSupport: boolean | null = null;
-function supportsWebp(): boolean {
-  if (webpSupport !== null) return webpSupport;
-  try {
-    const canvas = document.createElement("canvas");
-    canvas.width = 1;
-    canvas.height = 1;
-    webpSupport = canvas.toDataURL("image/webp").startsWith("data:image/webp");
-  } catch {
-    webpSupport = false;
-  }
-  return webpSupport;
+export function isAcceptedImageType(type: string): boolean {
+  return isClientAcceptedImageMime(type);
 }
 
 // Convert a processed base64 `data:` URL back into a Blob for multipart upload.
@@ -135,32 +138,77 @@ function decodeImage(objectUrl: string): Promise<HTMLImageElement> {
   });
 }
 
+function reencodeToDataUrl(
+  image: HTMLImageElement,
+  width: number,
+  height: number,
+  mime: ModelInlineSafeImageMime,
+): string | null {
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  // JPEG has no alpha: fill white so transparent PNG/WebP/GIF sources do not
+  // become black (canvas default) in the lossy output. CLI expandMedia uses the
+  // same white matte — keep them aligned.
+  if (mime === "image/jpeg") {
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, width, height);
+  }
+  ctx.drawImage(image, 0, 0, width, height);
+  if (mime === "image/jpeg") {
+    return canvas.toDataURL("image/jpeg", IMAGE_ENCODE_QUALITY);
+  }
+  return canvas.toDataURL("image/png");
+}
+
 /**
- * Downscale + re-encode a single image file into a base64 data URL suitable for
- * embedding in an OpenAI-shaped `image_url` content part.
+ * Try each target mime in order; return the first data URL under the byte budget.
+ * Returns null if every encode failed (canvas), or the last encode's data URL
+ * when all were over budget (caller decides oversize vs ok).
  */
-export async function processImageFile(file: File): Promise<ProcessImageResult> {
+function reencodeUntilFits(
+  image: HTMLImageElement,
+  width: number,
+  height: number,
+  mimes: readonly ModelInlineSafeImageMime[],
+  maxBytes: number,
+): { dataUrl: string; byteSize: number; underBudget: boolean } | null {
+  let last: { dataUrl: string; byteSize: number } | null = null;
+  for (const mime of mimes) {
+    const dataUrl = reencodeToDataUrl(image, width, height, mime);
+    if (!dataUrl) continue;
+    const byteSize = dataUrlByteSize(dataUrl);
+    last = { dataUrl, byteSize };
+    if (byteSize <= maxBytes) {
+      return { dataUrl, byteSize, underBudget: true };
+    }
+  }
+  if (!last) return null;
+  return { ...last, underBudget: false };
+}
+
+/**
+ * Downscale / re-encode a single image file into a base64 data URL suitable for
+ * embedding in an OpenAI-shaped `image_url` content part.
+ *
+ * Policy (default `model-inline-safe`):
+ * - Accept PNG/JPEG/WebP/GIF as input.
+ * - Passthrough JPEG/PNG when already within edge + byte budgets (no quality loss).
+ * - Never emit WebP/GIF on the default profile (local LM Studio / llama.cpp).
+ * - Re-encode with an ordered mime chain: PNG may be tried first for sharpness,
+ *   but JPEG is always the acceptance fallback so large PNGs still fit.
+ */
+export async function processImageFile(
+  file: File,
+  options: ProcessImageOptions = {},
+): Promise<ProcessImageResult> {
   if (!isAcceptedImageType(file.type)) {
     return { ok: false, reason: "unsupported", name: file.name };
   }
 
-  // Small GIFs pass through untouched so animation survives.
-  if (file.type === "image/gif" && file.size <= GIF_PASSTHROUGH_MAX_BYTES) {
-    try {
-      const dataUrl = await readFileAsDataUrl(file);
-      const byteSize = dataUrlByteSize(dataUrl);
-      if (byteSize > PER_IMAGE_MAX_BYTES) {
-        return { ok: false, reason: "oversize", name: file.name };
-      }
-      return {
-        ok: true,
-        image: { id: newAttachmentId(), dataUrl, name: file.name, byteSize },
-      };
-    } catch {
-      return { ok: false, reason: "decodeFailed", name: file.name };
-    }
-  }
-
+  const profile = options.profile ?? DEFAULT_IMAGE_INLINE_PROFILE;
   const objectUrl = URL.createObjectURL(file);
   try {
     const image = await decodeImage(objectUrl);
@@ -170,26 +218,50 @@ export async function processImageFile(file: File): Promise<ProcessImageResult> 
       return { ok: false, reason: "decodeFailed", name: file.name };
     }
 
+    const decision = decideImageEncode({
+      sourceMime: file.type,
+      width: naturalWidth,
+      height: naturalHeight,
+      byteSize: file.size,
+      maxEdge: MAX_IMAGE_EDGE,
+      maxBytes: PER_IMAGE_MAX_BYTES,
+      profile,
+    });
+
+    if (decision.action === "passthrough") {
+      const dataUrl = await readFileAsDataUrl(file);
+      const byteSize = dataUrlByteSize(dataUrl);
+      // File size and decoded payload size can diverge; re-check before shipping.
+      if (byteSize <= PER_IMAGE_MAX_BYTES) {
+        return {
+          ok: true,
+          image: { id: newAttachmentId(), dataUrl, name: file.name, byteSize },
+        };
+      }
+    }
+
     const { width, height } = scaleWithin(naturalWidth, naturalHeight, MAX_IMAGE_EDGE);
-    const canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) {
+    // Policy chain when reencode was selected; if passthrough only failed the
+    // post-read size check, still use a full chain (PNG→JPEG for PNG sources).
+    const mimes =
+      decision.action === "reencode"
+        ? decision.mimes
+        : reencodeMimeChain(file.type, file.size <= PER_IMAGE_MAX_BYTES);
+    const encoded = reencodeUntilFits(image, width, height, mimes, PER_IMAGE_MAX_BYTES);
+    if (!encoded) {
       return { ok: false, reason: "decodeFailed", name: file.name };
     }
-    ctx.drawImage(image, 0, 0, width, height);
-
-    // WebP where supported (smaller), else JPEG. Both re-encode at ~0.85.
-    const mime = supportsWebp() ? "image/webp" : "image/jpeg";
-    const dataUrl = canvas.toDataURL(mime, IMAGE_ENCODE_QUALITY);
-    const byteSize = dataUrlByteSize(dataUrl);
-    if (byteSize > PER_IMAGE_MAX_BYTES) {
+    if (!encoded.underBudget) {
       return { ok: false, reason: "oversize", name: file.name };
     }
     return {
       ok: true,
-      image: { id: newAttachmentId(), dataUrl, name: file.name, byteSize },
+      image: {
+        id: newAttachmentId(),
+        dataUrl: encoded.dataUrl,
+        name: file.name,
+        byteSize: encoded.byteSize,
+      },
     };
   } catch {
     return { ok: false, reason: "decodeFailed", name: file.name };
