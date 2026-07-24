@@ -45,12 +45,37 @@ wsmp config --json show             # print config as JSON
 wsmp config init                    # write a default config
 wsmp config set-slug desk-01        # set this CLI connection's slug
 wsmp endpoints add local http://127.0.0.1:11434
+wsmp endpoints add local http://127.0.0.1:11434 --expand-media  # inline WMP media URLs
 wsmp endpoints probe local
 wsmp connect                        # open the outbound websocket relay
 wsmp completions zsh                # shell completions
 ```
 
 Configuration is stored in a TOML file. `wsmp config path` prints the resolved path for the current platform. Logs go to stderr; pass `-v`/`-vv` for more, `--quiet` for less, or set `WSMP_LOG`.
+
+### Media expansion for local upstreams
+
+The relay normally forwards request bodies untouched, so a signed
+`{server}/media/{id}` URL in a chat request is fetched by the upstream model
+server. Many local OpenAI-compatible servers (llama.cpp, LM Studio, some vLLM
+builds) cannot fetch remote URLs and only accept base64 `data:` URLs.
+
+Opt in per endpoint with `expandMedia` (config key) or `--expand-media` on
+`endpoints add`. When enabled, the relay buffers chat-shaped JSON request bodies
+(`Content-Type: application/json`), walks `image_url` / `video_url` /
+`input_audio` content parts, fetches each media URL, and inlines it as a
+`data:{mime};base64,…` URL before forwarding upstream. Non-JSON bodies and
+body-less requests always take the untouched streaming path.
+
+Only URLs whose origin matches the connected WMP server (derived from
+`serverUrl`) and whose path is `/media/{id}` are fetched — arbitrary URLs from
+request bodies are never followed (SSRF guard). Add extra trusted origins with
+the `mediaTrustedOrigins` config array. The media fetcher follows no redirects,
+so a trusted origin cannot 30x-redirect the relay to an arbitrary internal URL
+after the origin check. Each individual asset fetch is capped at 64 MiB, and the
+buffered body (with its base64-inflated result) is capped at 256 MiB overall;
+over-cap or failed fetches return an OpenAI-shaped relay error naming the media
+path (never the URL signature).
 
 ### Exit Codes
 

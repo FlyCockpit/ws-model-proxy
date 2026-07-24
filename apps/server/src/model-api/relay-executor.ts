@@ -243,12 +243,7 @@ export function startRelayAttempt({
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
-    const failure: RelayFailure =
-      error instanceof Error && error.name === "RelayBackpressureError"
-        ? "rate_limited"
-        : message.includes("disconnected")
-          ? "disconnected"
-          : "transport";
+    const failure: RelayFailure = message.includes("disconnected") ? "disconnected" : "transport";
     finish({
       ok: false,
       failure,

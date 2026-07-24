@@ -37,6 +37,7 @@ model User {
   modelApiTokens            ModelApiToken[]            @relation("ModelApiTokenOwner")
   responseStickinessRecords ResponseStickinessRecord[] @relation("ResponseStickinessOwner")
   relayRequests             RelayRequest[]             @relation("RelayRequestOwner")
+  mediaAssets               MediaAsset[]               @relation("MediaAssetOwner")
 
   @@unique([email])
   @@index([slug])

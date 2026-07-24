@@ -76,7 +76,7 @@ describe("createRelayWebsocketMiddleware", () => {
       method: "GET",
       headers: websocketHeaders({
         Authorization: "Bearer wsmp_cli_secret",
-        "Sec-WebSocket-Protocol": "ws-model-proxy.relay.v2",
+        "Sec-WebSocket-Protocol": "ws-model-proxy.relay.v1",
       }),
     });
 

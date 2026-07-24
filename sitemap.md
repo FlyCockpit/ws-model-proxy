@@ -42,7 +42,7 @@ Gated by the `admin` layout (`apps/web/src/routes/$lang/admin.tsx`). Non-admins 
 | `/{lang}/admin/users` | User management: invite, search/filter, promote/demote, archive/restore, delete. |
 | `/{lang}/admin/devices` | Device-authorization codes for CLI/device sign-in. |
 | `/{lang}/admin/observability` | Admin observability for CLIs, endpoints, models, pools, and relay metadata. |
-| `/{lang}/admin/settings` | Admin-only settings such as signup enable/disable and force-2FA. |
+| `/{lang}/admin/settings` | Admin-only settings such as signup enable/disable, force-2FA, and media policy (asset retention TTL, aggregate storage stats, purge expired, and delete-all — metadata/policy only, no asset content view). |
 | `/{lang}/admin/seed` | Run the database seed (`packages/db/prisma/seed.ts -> runSeed()`) inline on demand. |
 
 ## Navigation

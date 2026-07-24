@@ -10,7 +10,8 @@ import {
   encodeRelayServerControlMessage,
   parseRelayBinaryFrame,
   parseRelayClientControlFrame,
-  RELAY_MAX_QUEUED_OUTBOUND_CHUNKS_PER_REQUEST,
+  RELAY_PROTOCOL_VERSION,
+  RELAY_REQUEST_BODY_WINDOW_CHUNKS,
   RELAY_STALE_AFTER_MS,
   RELAY_UNREGISTERED_STALE_AFTER_MS,
   type RelayBinaryFrameMetadata,
@@ -29,6 +30,17 @@ export type RelaySocket = {
   close(code?: number, reason?: string): void;
 };
 
+// Per-request outbound request-body stream. The server holds the remaining
+// body chunks and only emits them while the CLI has granted credits, so a slow
+// upstream on one request pauses that request's body flow (its credits stop
+// returning) without blocking sibling requests on the same socket.
+type OutboundBodyStream = {
+  chunks: Uint8Array[];
+  nextChunkIndex: number;
+  totalChunks: number;
+  credits: number;
+};
+
 type SessionState = {
   socket: RelaySocket;
   identity: CliWebsocketIdentity;
@@ -38,7 +50,7 @@ type SessionState = {
   cli: { slug: string; label: string } | null;
   registered: boolean;
   unauthenticatedTimer: ReturnType<typeof setTimeout>;
-  queuedOutboundByRequest: Map<string, (string | ArrayBuffer)[]>;
+  bodyStreamsByRequest: Map<string, OutboundBodyStream>;
 };
 
 export type ActiveRelayResponseHandlers = {
@@ -52,13 +64,6 @@ export type ActiveRelayResponseHandlers = {
 type ActiveRelayRequest = ActiveRelayResponseHandlers & {
   cliDeviceId: string;
 };
-
-class RelayBackpressureError extends Error {
-  constructor(public readonly requestId: string) {
-    super("Relay request queue is full.");
-    this.name = "RelayBackpressureError";
-  }
-}
 
 function closeWithProtocolError(socket: RelaySocket, message: string) {
   if (socket.readyState === WS_READY_STATE_OPEN) {
@@ -104,7 +109,7 @@ export class RelaySessionManager {
       cli: null,
       registered: false,
       unauthenticatedTimer,
-      queuedOutboundByRequest: new Map(),
+      bodyStreamsByRequest: new Map(),
     });
   }
 
@@ -137,7 +142,7 @@ export class RelaySessionManager {
           encodeRelayServerControlMessage({
             type: "hello.ok",
             id: message.id,
-            protocolVersion: "1.0",
+            protocolVersion: RELAY_PROTOCOL_VERSION,
           }),
         );
       } catch (error) {
@@ -189,6 +194,11 @@ export class RelaySessionManager {
           receivedAt: now.toISOString(),
         }),
       );
+      return;
+    }
+
+    if (message.type === "relay.request.body.ack") {
+      this.grantBodyCredits(session, message.requestId, message.credits);
       return;
     }
 
@@ -313,6 +323,9 @@ export class RelaySessionManager {
   }) {
     const session = this.sessionsByCliDeviceId.get(cliDeviceId);
     if (!session) throw new Error("CLI session is disconnected.");
+    if (session.socket.readyState !== WS_READY_STATE_OPEN) {
+      throw new Error("CLI session is disconnected.");
+    }
 
     const control: RelayServerControlMessage = {
       type: "relay.request",
@@ -322,18 +335,61 @@ export class RelaySessionManager {
       path,
       headers: sanitizeRelayRequestHeaders(headers),
       timeoutMs,
+      expectBody: bodyChunks.length > 0,
     };
-    this.sendOrQueue(session, requestId, encodeRelayServerControlMessage(control));
+    session.socket.send(encodeRelayServerControlMessage(control));
 
-    bodyChunks.forEach((chunk, index) => {
+    if (bodyChunks.length === 0) return;
+
+    session.bodyStreamsByRequest.set(requestId, {
+      chunks: [...bodyChunks],
+      nextChunkIndex: 0,
+      totalChunks: bodyChunks.length,
+      credits: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+    });
+    this.pumpBodyStream(session, requestId);
+  }
+
+  private grantBodyCredits(session: SessionState, requestId: string, credits: number) {
+    const stream = session.bodyStreamsByRequest.get(requestId);
+    if (!stream) return;
+    // Clamp the credit balance to the flow-control window. A single ack is already
+    // bounded to `RELAY_REQUEST_BODY_WINDOW_CHUNKS`, but a misbehaving CLI could
+    // spam acks to accumulate an unbounded balance and force the server to pump
+    // the entire buffered body into the socket at once. Capping the balance keeps
+    // outstanding (sent-unacked) chunks at or below the window: the balance never
+    // exceeds the window, so `pumpBodyStream` can never emit more than the window
+    // ahead of the CLI's acknowledgements.
+    stream.credits = Math.min(stream.credits + credits, RELAY_REQUEST_BODY_WINDOW_CHUNKS);
+    this.pumpBodyStream(session, requestId);
+  }
+
+  // Emit request-body chunks while the CLI has granted credits and the socket
+  // can accept them. Each in-flight chunk consumes one credit; the CLI returns
+  // credits via `relay.request.body.ack` as its upstream request consumes them.
+  private pumpBodyStream(session: SessionState, requestId: string) {
+    const stream = session.bodyStreamsByRequest.get(requestId);
+    if (!stream) return;
+    while (
+      stream.chunks.length > 0 &&
+      stream.credits > 0 &&
+      session.socket.readyState === WS_READY_STATE_OPEN
+    ) {
+      const chunk = stream.chunks.shift();
+      if (!chunk) break;
       const metadata: RelayBinaryFrameMetadata = {
         type: "relay.request.body",
         requestId,
-        chunkId: `${index}`,
-        final: index === bodyChunks.length - 1,
+        chunkId: `${stream.nextChunkIndex}`,
+        final: stream.nextChunkIndex === stream.totalChunks - 1,
       };
-      this.sendOrQueue(session, requestId, encodeRelayBinaryFrame(metadata, chunk));
-    });
+      session.socket.send(encodeRelayBinaryFrame(metadata, chunk));
+      stream.nextChunkIndex += 1;
+      stream.credits -= 1;
+    }
+    if (stream.chunks.length === 0) {
+      session.bodyStreamsByRequest.delete(requestId);
+    }
   }
 
   registerRelayResponseHandlers({
@@ -353,7 +409,9 @@ export class RelaySessionManager {
 
   completeRelayRequest(requestId: string) {
     this.activeRelayRequests.delete(requestId);
-    this.flushQueuedOutbound(requestId);
+    for (const session of this.sessionsBySocket.values()) {
+      session.bodyStreamsByRequest.delete(requestId);
+    }
   }
 
   cancelRelayRequest({
@@ -368,24 +426,11 @@ export class RelaySessionManager {
     this.activeRelayRequests.delete(requestId);
     const session = this.sessionsByCliDeviceId.get(cliDeviceId);
     if (!session) return;
-    session.queuedOutboundByRequest.delete(requestId);
-    this.sendOrQueue(
-      session,
-      requestId,
+    session.bodyStreamsByRequest.delete(requestId);
+    if (session.socket.readyState !== WS_READY_STATE_OPEN) return;
+    session.socket.send(
       encodeRelayServerControlMessage({ type: "relay.cancel", requestId, reason }),
     );
-  }
-
-  flushQueuedOutbound(requestId: string) {
-    for (const session of this.sessionsBySocket.values()) {
-      const queued = session.queuedOutboundByRequest.get(requestId);
-      if (!queued) continue;
-      while (queued.length > 0 && this.canSendImmediately(session.socket)) {
-        const frame = queued.shift();
-        if (frame) session.socket.send(frame);
-      }
-      if (queued.length === 0) session.queuedOutboundByRequest.delete(requestId);
-    }
   }
 
   getActiveCliDeviceIds(): string[] {
@@ -401,24 +446,6 @@ export class RelaySessionManager {
       clearTimeout(existing.unauthenticatedTimer);
     }
     this.sessionsByCliDeviceId.set(newSession.cliDeviceId, newSession);
-  }
-
-  private sendOrQueue(session: SessionState, requestId: string, frame: string | ArrayBuffer) {
-    if (this.canSendImmediately(session.socket)) {
-      session.socket.send(frame);
-      return;
-    }
-
-    const queued = session.queuedOutboundByRequest.get(requestId) ?? [];
-    if (queued.length >= RELAY_MAX_QUEUED_OUTBOUND_CHUNKS_PER_REQUEST) {
-      throw new RelayBackpressureError(requestId);
-    }
-    queued.push(frame);
-    session.queuedOutboundByRequest.set(requestId, queued);
-  }
-
-  private canSendImmediately(socket: RelaySocket): boolean {
-    return socket.readyState === WS_READY_STATE_OPEN && (socket.bufferedAmount ?? 0) === 0;
   }
 
   private requireSession(socket: RelaySocket): SessionState {

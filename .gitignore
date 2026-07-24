@@ -59,6 +59,9 @@ backups/
 coverage
 .nyc_output
 
+# Firecrawl local tool scratch
+.firecrawl/
+
 # Misc
 *.tgz
 .cache

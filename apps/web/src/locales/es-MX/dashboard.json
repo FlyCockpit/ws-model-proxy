@@ -21,6 +21,20 @@
       "stopped": "Respuesta detenida."
     },
     "assistant": "Asistente",
+    "attachments": {
+      "attachImage": "Adjuntar imagen",
+      "composerLabel": "Imágenes adjuntas",
+      "expired": "Una imagen adjunta expiró. Quítala y adjunta la imagen de nuevo para continuar.",
+      "expiredBadge": "Expirada",
+      "maxReached": "Puedes adjuntar hasta {{count}} imágenes por mensaje.",
+      "quotaExceeded": "Alcanzaste tu cuota de almacenamiento de medios, así que algunas imágenes no se pudieron subir. Deja que las subidas existentes expiren o envía una imagen más pequeña.",
+      "rejected": "No se pudieron adjuntar {{count}} imagen(es). Usa PNG, JPEG, WebP o GIF de menos de 2 MB después de la compresión.",
+      "remove": "Quitar {{name}}",
+      "requestLargeWarning": "Esta solicitud es grande porque las imágenes anteriores se reenvían en cada turno. Puede ser lenta.",
+      "requestTooLarge": "Esta solicitud es demasiado grande para enviarse. Quita algunas imágenes o inicia un hilo nuevo.",
+      "signFailed": "No se pudieron preparar las imágenes subidas para enviarlas. Revisa tu conexión e intenta de nuevo.",
+      "unsupported": "Tipo de archivo no compatible. Usa PNG, JPEG, WebP o GIF."
+    },
     "emptyModels": "No hay modelos visibles disponibles.",
     "emptyTranscript": "Todavía no hay mensajes.",
     "errors": {

@@ -1,7 +1,11 @@
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { RELAY_MAX_QUEUED_OUTBOUND_CHUNKS_PER_REQUEST, RELAY_STALE_AFTER_MS } from "./protocol.js";
+import {
+  parseRelayBinaryFrame,
+  RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+  RELAY_STALE_AFTER_MS,
+} from "./protocol.js";
 
 const WS_READY_STATE_OPEN = 1;
 
@@ -65,15 +69,17 @@ function helloFrame() {
   return JSON.stringify({
     type: "hello",
     id: "hello-id",
-    protocolVersion: "1.0",
+    protocolVersion: "2.0",
     cli: {
       slug: "desktop",
       label: "Desktop",
       capabilities: {
-        protocolVersion: "1.0",
+        protocolVersion: "2.0",
         binaryFrames: true,
         cancellation: true,
         maxBinaryChunkBytes: 1024 * 1024,
+        requestBodyStreaming: true,
+        requestBodyWindowChunks: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
       },
     },
     endpoints: [
@@ -138,7 +144,7 @@ describe("RelaySessionManager", () => {
     expect(JSON.parse(String(socket.sends[0]))).toEqual({
       type: "hello.ok",
       id: "hello-id",
-      protocolVersion: "1.0",
+      protocolVersion: "2.0",
     });
     expect(db.endpoint.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -291,30 +297,121 @@ describe("RelaySessionManager", () => {
     expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
   });
 
-  it("bounds per-request outbound queues under backpressure", async () => {
+  it("streams request-body chunks within the flow-control window and resumes on credits", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
-    socket.bufferedAmount = 1;
     manager.acceptAuthenticatedSocket({ socket, identity, now });
     await manager.handleTextFrame(socket, helloFrame(), now);
+    socket.sends.length = 0;
 
-    const chunks = Array.from(
-      { length: RELAY_MAX_QUEUED_OUTBOUND_CHUNKS_PER_REQUEST + 1 },
-      () => new Uint8Array([1]),
-    );
+    const extraChunks = 2;
+    const chunkCount = RELAY_REQUEST_BODY_WINDOW_CHUNKS + extraChunks;
+    const chunks = Array.from({ length: chunkCount }, (_, index) => new Uint8Array([index]));
 
-    expect(() =>
-      manager.sendRelayRequest({
-        cliDeviceId: "cli-device-id",
+    manager.sendRelayRequest({
+      cliDeviceId: "cli-device-id",
+      requestId: "request-id",
+      family: "chat.completions",
+      method: "POST",
+      path: "/v1/chat/completions",
+      headers: { Authorization: "Bearer secret", Accept: "application/json" },
+      bodyChunks: chunks,
+      timeoutMs: 30_000,
+    });
+
+    // Control frame plus exactly one window of body frames; the remaining
+    // chunks stay parked until the CLI returns credits.
+    expect(socket.sends).toHaveLength(1 + RELAY_REQUEST_BODY_WINDOW_CHUNKS);
+    const control = JSON.parse(String(socket.sends[0]));
+    expect(control.type).toBe("relay.request");
+    expect(control.expectBody).toBe(true);
+    const firstChunk = parseRelayBinaryFrame(socket.sends[1] as ArrayBuffer);
+    expect(firstChunk.metadata).toMatchObject({
+      type: "relay.request.body",
+      requestId: "request-id",
+      chunkId: "0",
+    });
+    expect(firstChunk.metadata.final ?? false).toBe(false);
+
+    // Granting credits flushes the remaining chunks and marks the last final.
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({
+        type: "relay.request.body.ack",
         requestId: "request-id",
-        family: "chat.completions",
-        method: "POST",
-        path: "/v1/chat/completions",
-        headers: { Authorization: "Bearer secret", Accept: "application/json" },
-        bodyChunks: chunks,
-        timeoutMs: 30_000,
+        credits: extraChunks,
       }),
-    ).toThrow("Relay request queue is full.");
-    expect(socket.sends).toHaveLength(1);
+      now,
+    );
+    expect(socket.sends).toHaveLength(1 + chunkCount);
+    const lastChunk = parseRelayBinaryFrame(socket.sends.at(-1) as ArrayBuffer);
+    expect(lastChunk.metadata).toMatchObject({
+      type: "relay.request.body",
+      requestId: "request-id",
+      chunkId: `${chunkCount - 1}`,
+      final: true,
+    });
+  });
+
+  it("clamps accumulated body credits to the window so over-acking cannot burst the whole body", async () => {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity, now });
+    await manager.handleTextFrame(socket, helloFrame(), now);
+    socket.sends.length = 0;
+
+    // Three windows of body chunks so there is always more to burst than one
+    // window ahead.
+    const chunkCount = RELAY_REQUEST_BODY_WINDOW_CHUNKS * 3;
+    const chunks = Array.from({ length: chunkCount }, (_, index) => new Uint8Array([index % 256]));
+
+    manager.sendRelayRequest({
+      cliDeviceId: "cli-device-id",
+      requestId: "request-id",
+      family: "chat.completions",
+      method: "POST",
+      path: "/v1/chat/completions",
+      headers: { Authorization: "Bearer secret", Accept: "application/json" },
+      bodyChunks: chunks,
+      timeoutMs: 30_000,
+    });
+    // Control frame plus exactly one window of body frames.
+    expect(socket.sends).toHaveLength(1 + RELAY_REQUEST_BODY_WINDOW_CHUNKS);
+
+    // A misbehaving CLI floods acks while the socket cannot drain them, trying to
+    // accumulate an unbounded credit balance. Each grant is clamped to the window,
+    // so the balance never accumulates past it.
+    socket.readyState = 0; // not OPEN: pump is a no-op, credits would otherwise pile up
+    for (let i = 0; i < 5; i += 1) {
+      await manager.handleTextFrame(
+        socket,
+        JSON.stringify({
+          type: "relay.request.body.ack",
+          requestId: "request-id",
+          credits: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+        }),
+        now,
+      );
+    }
+    expect(socket.sends).toHaveLength(1 + RELAY_REQUEST_BODY_WINDOW_CHUNKS); // nothing sent while closed
+
+    // Re-open and grant one more credit to trigger a pump. With the clamp the
+    // balance is at most one window, so at most one further window bursts out —
+    // never the whole remaining body.
+    socket.readyState = WS_READY_STATE_OPEN;
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({
+        type: "relay.request.body.ack",
+        requestId: "request-id",
+        credits: 1,
+      }),
+      now,
+    );
+    // Exactly one additional window bursts (not the remaining 2 windows).
+    expect(socket.sends).toHaveLength(1 + RELAY_REQUEST_BODY_WINDOW_CHUNKS * 2);
+    // Outstanding sent-unacked chunks never exceeded the window in any burst.
+    const bodyFrames = socket.sends.slice(1).filter((send) => typeof send !== "string");
+    expect(bodyFrames).toHaveLength(RELAY_REQUEST_BODY_WINDOW_CHUNKS * 2);
   });
 });

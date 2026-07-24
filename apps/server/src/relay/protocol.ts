@@ -1,11 +1,17 @@
 import { z } from "zod";
 
-const RELAY_PROTOCOL_VERSION = "1.0";
-export const RELAY_SUBPROTOCOL = "ws-model-proxy.relay.v1";
+export const RELAY_PROTOCOL_VERSION = "2.0";
+export const RELAY_SUBPROTOCOL = "ws-model-proxy.relay.v2";
 
 const RELAY_JSON_CONTROL_MAX_BYTES = 64 * 1024;
 export const RELAY_BINARY_CHUNK_MAX_BYTES = 1024 * 1024;
-export const RELAY_MAX_QUEUED_OUTBOUND_CHUNKS_PER_REQUEST = 8;
+// Request-body flow control window. The server may have at most this many
+// request-body chunks in flight toward a CLI before it must wait for the CLI to
+// acknowledge consumed chunks (`relay.request.body.ack`). It bounds CLI-side
+// buffering to `RELAY_REQUEST_BODY_WINDOW_CHUNKS * RELAY_BINARY_CHUNK_MAX_BYTES`
+// per request so large request bodies stream without full buffering while one
+// slow upstream cannot stall sibling requests multiplexed on the same socket.
+export const RELAY_REQUEST_BODY_WINDOW_CHUNKS = 16;
 export const RELAY_STALE_AFTER_MS = 60_000;
 export const RELAY_UNREGISTERED_STALE_AFTER_MS = 10_000;
 
@@ -96,6 +102,8 @@ const cliCapabilitiesSchema = z
     binaryFrames: z.literal(true),
     cancellation: z.literal(true),
     maxBinaryChunkBytes: z.literal(RELAY_BINARY_CHUNK_MAX_BYTES),
+    requestBodyStreaming: z.literal(true),
+    requestBodyWindowChunks: z.literal(RELAY_REQUEST_BODY_WINDOW_CHUNKS),
   })
   .strict();
 
@@ -156,6 +164,13 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({
+      type: z.literal("relay.request.body.ack"),
+      requestId: requestIdSchema,
+      credits: z.number().int().min(1).max(RELAY_REQUEST_BODY_WINDOW_CHUNKS),
+    })
+    .strict(),
+  z
+    .object({
       type: z.literal("relay.response.headers"),
       requestId: requestIdSchema,
       status: z.number().int().min(100).max(599),
@@ -212,6 +227,10 @@ export type RelayServerControlMessage =
       path: string;
       headers: Record<string, string>;
       timeoutMs: number;
+      // Whether the CLI should expect streamed `relay.request.body` frames for
+      // this request (true when the request carries a body). When false the CLI
+      // forwards the request to upstream immediately with an empty body.
+      expectBody: boolean;
     }
   | { type: "relay.cancel"; requestId: string; reason: RelayFailure }
   | { type: "protocol.error"; failure: "protocol_error"; message: string; requestId?: string };

@@ -12,3 +12,7 @@ extend-exclude = [
 [default.extend-words]
 # Words/acronyms the checker shouldn't "correct". Map a word to itself.
 wsmp = "wsmp"
+# Canonical RFC 4648 base64 test vectors in `src/media.rs`.
+fo = "fo"
+foob = "foob"
+fooba = "fooba"

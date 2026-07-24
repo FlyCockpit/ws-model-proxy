@@ -21,6 +21,20 @@
       "stopped": "Response stopped."
     },
     "assistant": "Assistant",
+    "attachments": {
+      "attachImage": "Attach image",
+      "composerLabel": "Attached images",
+      "expired": "An attached image has expired. Remove it and attach the image again to continue.",
+      "expiredBadge": "Expired",
+      "maxReached": "You can attach up to {{count}} images per message.",
+      "quotaExceeded": "You've reached your media storage quota, so some images couldn't be uploaded. Let existing uploads expire, or send a smaller image.",
+      "rejected": "{{count}} image(s) could not be attached. Use PNG, JPEG, WebP, or GIF under 2 MB after compression.",
+      "remove": "Remove {{name}}",
+      "requestLargeWarning": "This request is large because prior images are re-sent each turn. It may be slow.",
+      "requestTooLarge": "This request is too large to send. Remove some images or start a new thread.",
+      "signFailed": "Could not prepare uploaded images for sending. Check your connection and try again.",
+      "unsupported": "Unsupported file type. Use PNG, JPEG, WebP, or GIF."
+    },
     "emptyModels": "No visible models are available.",
     "emptyTranscript": "No messages yet.",
     "errors": {

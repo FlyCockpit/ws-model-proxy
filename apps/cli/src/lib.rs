@@ -11,6 +11,7 @@ pub mod config;
 pub mod daemon;
 pub mod exit;
 pub mod logging;
+pub mod media;
 pub mod output;
 pub mod paths;
 pub mod probe;

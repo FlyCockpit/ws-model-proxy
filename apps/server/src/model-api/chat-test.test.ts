@@ -12,6 +12,13 @@ vi.mock("@ws-model-proxy/db", async () => {
   return { default: mockDeep() };
 });
 
+// chat-test.ts imports the shared completions handler from routes.ts, which
+// derives the stickiness digest via @ws-model-proxy/db/forwarder-security
+// (reads env.BETTER_AUTH_SECRET). Mock env so no real validation runs.
+vi.mock("@ws-model-proxy/env/server", () => ({
+  env: { BETTER_AUTH_SECRET: "test-better-auth-secret-value-32chars!" },
+}));
+
 vi.mock("@ws-model-proxy/api/lib/model-api-token-access", () => ({
   authenticateModelApiTokenSecret: vi.fn(),
   listVisibleModelTargetsForUser: vi.fn(),

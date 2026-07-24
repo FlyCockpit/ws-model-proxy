@@ -1,4 +1,3 @@
-import { createHmac } from "node:crypto";
 import {
   authenticateModelApiTokenSecret,
   listVisibleModelTargetsForToken,
@@ -17,6 +16,7 @@ import {
   relayFailureClasses,
 } from "@ws-model-proxy/api/lib/model-pool-routing";
 import prisma from "@ws-model-proxy/db";
+import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
 import { Hono } from "hono";
 import {
   type OpenAiCompatibleCapabilities,
@@ -181,7 +181,6 @@ type RelayRequester = {
 const poolRelayFailureClassSet: ReadonlySet<string> = new Set(relayFailureClasses);
 const RESPONSES_STICKINESS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const RESPONSE_ID_CAPTURE_MAX_CHARS = 1024 * 1024;
-const RESPONSES_STICKINESS_HMAC_CONTEXT = "ws-model-proxy:responses-stickiness:v1";
 
 function isPoolRelayFailureClass(failure: RelayFailure): failure is RelayFailureClass {
   return poolRelayFailureClassSet.has(failure);
@@ -194,7 +193,7 @@ function bearerToken(request: Request): string | null {
   return match?.[1] ?? null;
 }
 
-async function authenticateRequest(request: Request): Promise<ModelApiTokenIdentity | null> {
+export async function authenticateRequest(request: Request): Promise<ModelApiTokenIdentity | null> {
   const token = bearerToken(request);
   if (!token) return null;
   return authenticateModelApiTokenSecret(token);
@@ -635,13 +634,20 @@ function responseStickinessDigest({
   requester: RelayRequester;
   responseId: string;
 }): string {
-  const secret = process.env.BETTER_AUTH_SECRET;
-  if (!secret && process.env.NODE_ENV !== "test") {
-    throw new Error("BETTER_AUTH_SECRET is required for Responses API sticky routing.");
-  }
-  return createHmac("sha256", `${RESPONSES_STICKINESS_HMAC_CONTEXT}:${secret ?? "test"}`)
-    .update(`${requester.userId}:${requester.modelApiTokenId ?? "session"}:${responseId}`)
-    .digest("hex");
+  // Derive the sticky-routing digest through the shared forwarder-security
+  // purpose key (itself derived from BETTER_AUTH_SECRET) instead of hashing the
+  // secret inline. Same rotation semantics; keeps all HMAC purposes in one place.
+  //
+  // MIGRATION NOTE: the digest format changed from an inline hex HMAC to this
+  // purpose-derived base64url form. Sticky rows written by a pre-change build
+  // therefore won't match the digest computed post-deploy — a one-time miss that
+  // simply falls back to normal (non-sticky) routing for that request. This is
+  // intentionally accepted: the stale rows self-heal by expiring naturally via
+  // their TTL (RESPONSES_STICKINESS_TTL_MS); no migration or backfill is needed.
+  return hmacDigestForForwarderPurpose({
+    purpose: "responsesStickiness",
+    value: `${requester.userId}:${requester.modelApiTokenId ?? "session"}:${responseId}`,
+  });
 }
 
 async function writeResponseStickiness({

@@ -5,11 +5,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{CapabilityOverrideMode, EndpointConfig, OpenAiCompatibleCapabilities};
 
-pub const RELAY_PROTOCOL_VERSION: &str = "1.0";
-pub const RELAY_SUBPROTOCOL: &str = "ws-model-proxy.relay.v1";
+pub const RELAY_PROTOCOL_VERSION: &str = "2.0";
+pub const RELAY_SUBPROTOCOL: &str = "ws-model-proxy.relay.v2";
 pub const RELAY_JSON_CONTROL_MAX_BYTES: usize = 64 * 1024;
 pub const RELAY_BINARY_CHUNK_MAX_BYTES: usize = 1024 * 1024;
 pub const RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS: u64 = 20;
+/// Request-body flow-control window shared with the server. The CLI buffers at
+/// most this many streamed request-body chunks per request and returns one
+/// credit (`relay.request.body.ack`) to the server for each chunk its upstream
+/// request consumes. Mirrors `RELAY_REQUEST_BODY_WINDOW_CHUNKS` on the server.
+pub const RELAY_REQUEST_BODY_WINDOW_CHUNKS: usize = 16;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(
@@ -36,6 +41,8 @@ pub enum ClientControlMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         sent_at: Option<String>,
     },
+    #[serde(rename = "relay.request.body.ack")]
+    RelayRequestBodyAck { request_id: String, credits: u32 },
     #[serde(rename = "relay.response.headers")]
     RelayResponseHeaders {
         request_id: String,
@@ -74,6 +81,8 @@ pub struct CliCapabilities {
     pub binary_frames: bool,
     pub cancellation: bool,
     pub max_binary_chunk_bytes: usize,
+    pub request_body_streaming: bool,
+    pub request_body_window_chunks: usize,
 }
 
 impl Default for CliCapabilities {
@@ -83,6 +92,8 @@ impl Default for CliCapabilities {
             binary_frames: true,
             cancellation: true,
             max_binary_chunk_bytes: RELAY_BINARY_CHUNK_MAX_BYTES,
+            request_body_streaming: true,
+            request_body_window_chunks: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
         }
     }
 }
@@ -143,6 +154,7 @@ pub enum ServerControlMessage {
         path: String,
         headers: std::collections::BTreeMap<String, String>,
         timeout_ms: u64,
+        expect_body: bool,
     },
     #[serde(rename = "relay.cancel")]
     RelayCancel {
@@ -327,10 +339,21 @@ mod tests {
 
         let encoded = encode_control(&message).expect("encode");
 
-        assert!(encoded.contains(r#""protocolVersion":"1.0""#));
+        assert!(encoded.contains(r#""protocolVersion":"2.0""#));
         assert!(encoded.contains(r#""maxBinaryChunkBytes":1048576"#));
+        assert!(encoded.contains(r#""requestBodyStreaming":true"#));
+        assert!(encoded.contains(r#""requestBodyWindowChunks":16"#));
         assert!(!encoded.contains("protocol_version"));
         assert!(!encoded.contains(":null"));
+
+        let ack = encode_control(&ClientControlMessage::RelayRequestBodyAck {
+            request_id: "request-1".to_string(),
+            credits: 3,
+        })
+        .expect("encode ack");
+        assert!(ack.contains(r#""type":"relay.request.body.ack""#));
+        assert!(ack.contains(r#""requestId":"request-1""#));
+        assert!(ack.contains(r#""credits":3"#));
 
         let heartbeat = encode_control(&ClientControlMessage::Heartbeat {
             id: "heartbeat-1".to_string(),
@@ -352,17 +375,19 @@ mod tests {
         assert!(!relay_error.contains(":null"));
 
         let parsed = parse_server_control(
-            r#"{"type":"relay.request","requestId":"request-1","family":"generic","method":"POST","path":"/v1/chat/completions","headers":{},"timeoutMs":30000}"#,
+            r#"{"type":"relay.request","requestId":"request-1","family":"generic","method":"POST","path":"/v1/chat/completions","headers":{},"timeoutMs":30000,"expectBody":true}"#,
         )
         .expect("parse server control");
         match parsed {
             ServerControlMessage::RelayRequest {
                 request_id,
                 timeout_ms,
+                expect_body,
                 ..
             } => {
                 assert_eq!(request_id, "request-1");
                 assert_eq!(timeout_ms, 30_000);
+                assert!(expect_body);
             }
             other => panic!("unexpected message: {other:?}"),
         }

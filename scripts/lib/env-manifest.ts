@@ -154,6 +154,21 @@ export const ENV_GROUPS: EnvGroup[] = [
     comment: ["Optional. Used only by `pnpm i18n:translate`. The app boots without these."],
   },
   {
+    id: "media",
+    reuseFromEnv: true,
+    title: "Ephemeral media store",
+    prompt: "Configure the ephemeral media store (image/audio/video uploads)?",
+    default: false,
+    comment: [
+      "OPTIONAL. Upload is a DEPLOY CAPABILITY, not a UI toggle: it turns on only",
+      "when MEDIA_STORAGE=local AND MEDIA_ROOT is a writable absolute path (mount",
+      "a Docker volume there). When off, upload endpoints return a clear",
+      '"media upload is not configured" error and clients fall back to base64 /',
+      "external URLs. Signed GET URLs derive their HMAC key from",
+      "BETTER_AUTH_SECRET — there is no separate media signing secret.",
+    ],
+  },
+  {
     id: "ratelimit",
     title: "Rate limiting",
     tuning: true,
@@ -392,6 +407,63 @@ export const ENV_VARS: EnvVar[] = [
     source: "manual",
     example: "https://ws-model-proxy.example.com",
     comment: ["Optional public origin metadata for some translation providers."],
+  },
+
+  // --- media ---------------------------------------------------------------
+  {
+    key: "MEDIA_STORAGE",
+    group: "media",
+    source: "default",
+    default: "off",
+    choices: [{ value: "off" }, { value: "local" }],
+    example: "local",
+    comment: [
+      "off | local (future: s3). `local` requires MEDIA_ROOT below. Leave `off`",
+      "to disable uploads entirely.",
+    ],
+  },
+  {
+    key: "MEDIA_ROOT",
+    group: "media",
+    source: "prompt",
+    required: true,
+    prompt: "Absolute path for the media object directory",
+    hint: "Must be absolute and writable, e.g. a mounted volume: /var/lib/wmp/media",
+    example: "/var/lib/wmp/media",
+  },
+  {
+    key: "MEDIA_MAX_UPLOAD_BYTES",
+    group: "media",
+    source: "default",
+    default: "26214400",
+    example: "26214400",
+    comment: [
+      "Hard per-upload byte cap (default 25 MiB). The upload route enforces its",
+      "own body limit at this size, independent of the global 10 MB limiter.",
+    ],
+  },
+  {
+    key: "MEDIA_PUBLIC_BASE_URL",
+    format: "origin",
+    group: "media",
+    source: "manual",
+    example: "https://proxy.example.com",
+    comment: [
+      "Public origin used to build signed media URLs. Defaults to BETTER_AUTH_URL",
+      "when unset. Set only if media is served from a different origin.",
+    ],
+  },
+  {
+    key: "MEDIA_MAX_BYTES_PER_USER",
+    group: "media",
+    source: "default",
+    default: "536870912",
+    example: "536870912",
+    comment: [
+      "Per-user storage quota: total bytes one user may hold in unexpired media",
+      "assets (default 512 MiB). A sha256 dedup hit adds no new bytes and is",
+      "exempt. Set 0 to disable the quota.",
+    ],
   },
 
   // --- rate limit tuning ---------------------------------------------------

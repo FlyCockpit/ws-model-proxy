@@ -296,4 +296,75 @@ describe("settingsRouter", () => {
       );
     });
   });
+
+  describe("update (mediaAssetTtlHours)", () => {
+    it("stores a valid in-range TTL as a string and never touches the 2FA cache", async () => {
+      db.appSetting.upsert.mockResolvedValue({ key: "mediaAssetTtlHours", value: "48" });
+      const ctx = buildContext({ user: { role: "admin" } });
+      const client = createRouterClient(settingsRouter, { context: ctx });
+
+      await expect(client.update({ key: "mediaAssetTtlHours", value: 48 })).resolves.toEqual({
+        success: true,
+      });
+      expect(db.appSetting.upsert).toHaveBeenCalledWith({
+        where: { key: "mediaAssetTtlHours" },
+        update: { value: "48" },
+        create: { key: "mediaAssetTtlHours", value: "48" },
+      });
+      expect(forceTwoFactorPolicy.invalidateForceTwoFactorPolicyCache).not.toHaveBeenCalled();
+    });
+
+    it("clamps a value above the max down to 168", async () => {
+      db.appSetting.upsert.mockResolvedValue({});
+      const ctx = buildContext({ user: { role: "admin" } });
+      const client = createRouterClient(settingsRouter, { context: ctx });
+
+      await client.update({ key: "mediaAssetTtlHours", value: 10_000 });
+      expect(db.appSetting.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({ update: { value: "168" } }),
+      );
+    });
+
+    it("clamps a value below the min up to 1", async () => {
+      db.appSetting.upsert.mockResolvedValue({});
+      const ctx = buildContext({ user: { role: "admin" } });
+      const client = createRouterClient(settingsRouter, { context: ctx });
+
+      await client.update({ key: "mediaAssetTtlHours", value: 0 });
+      expect(db.appSetting.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({ update: { value: "1" } }),
+      );
+    });
+
+    it("rejects a non-integer TTL at input validation", async () => {
+      const ctx = buildContext({ user: { role: "admin" } });
+      const client = createRouterClient(settingsRouter, { context: ctx });
+      const update = client.update as (input: { key: string; value: number }) => Promise<unknown>;
+
+      await expect(update({ key: "mediaAssetTtlHours", value: 1.5 })).rejects.toThrow();
+      expect(db.appSetting.upsert).not.toHaveBeenCalled();
+    });
+
+    it("rejects a string value for the numeric TTL key", async () => {
+      const ctx = buildContext({ user: { role: "admin" } });
+      const client = createRouterClient(settingsRouter, { context: ctx });
+      const update = client.update as (input: { key: string; value: unknown }) => Promise<unknown>;
+
+      await expect(update({ key: "mediaAssetTtlHours", value: "48" })).rejects.toThrow();
+      expect(db.appSetting.upsert).not.toHaveBeenCalled();
+    });
+
+    it("throws NOT_FOUND for non-admins updating the TTL", async () => {
+      const ctx = buildContext({ user: { role: "user" } });
+      const client = createRouterClient(settingsRouter, { context: ctx });
+
+      await expect(client.update({ key: "mediaAssetTtlHours", value: 12 })).rejects.toSatisfy(
+        (error: ORPCError) => {
+          expect(error.code).toBe("NOT_FOUND");
+          return true;
+        },
+      );
+      expect(db.appSetting.upsert).not.toHaveBeenCalled();
+    });
+  });
 });

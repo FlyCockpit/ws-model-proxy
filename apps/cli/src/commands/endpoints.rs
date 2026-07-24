@@ -46,6 +46,10 @@ struct AddArgs {
     /// Add the endpoint disabled.
     #[arg(long)]
     disabled: bool,
+    /// Inline trusted WMP media URLs as base64 `data:` URLs before forwarding to
+    /// this endpoint. Use for local upstreams that cannot fetch remote URLs.
+    #[arg(long)]
+    expand_media: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -83,6 +87,7 @@ fn add_endpoint(json: bool, args: &AddArgs) -> Result<()> {
         label: args.label.clone(),
         base_url: args.base_url.clone(),
         enabled: !args.disabled,
+        expand_media: args.expand_media,
         headers,
         default_capabilities: OpenAiCompatibleCapabilities::default(),
         ..EndpointConfig::default()

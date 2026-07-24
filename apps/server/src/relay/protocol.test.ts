@@ -12,16 +12,16 @@ import {
 const RELAY_JSON_CONTROL_MAX_BYTES = 64 * 1024;
 
 describe("relayProtocol", () => {
-  it("accepts the v1 websocket subprotocol and rejects unsupported major versions", () => {
+  it("accepts the v2 websocket subprotocol and rejects unsupported major versions", () => {
     expect(parseRelaySubprotocolHeader(RELAY_SUBPROTOCOL)).toEqual({
       ok: true,
       supported: true,
-      requestedMajorVersions: [1],
+      requestedMajorVersions: [2],
     });
-    expect(parseRelaySubprotocolHeader("ws-model-proxy.relay.v2")).toEqual({
+    expect(parseRelaySubprotocolHeader("ws-model-proxy.relay.v1")).toEqual({
       ok: true,
       supported: false,
-      requestedMajorVersions: [2],
+      requestedMajorVersions: [1],
     });
   });
 

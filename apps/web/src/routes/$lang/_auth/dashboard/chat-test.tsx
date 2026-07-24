@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { env } from "@ws-model-proxy/env/web";
@@ -13,12 +13,42 @@ import {
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { Textarea } from "@ws-model-proxy/ui/components/textarea";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { ArrowDown, FlaskConical, RefreshCw, RotateCcw, Send, Square } from "lucide-react";
-import { type FormEvent, type KeyboardEvent, useCallback, useMemo, useRef, useState } from "react";
+import {
+  ArrowDown,
+  FlaskConical,
+  ImagePlus,
+  Loader2,
+  RefreshCw,
+  RotateCcw,
+  Send,
+  Square,
+  X,
+} from "lucide-react";
+import {
+  type ChangeEvent,
+  type ClipboardEvent,
+  type DragEvent,
+  type FormEvent,
+  type KeyboardEvent,
+  useCallback,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
 import { useChatScrollEngine } from "@/hooks/use-chat-scroll-engine";
+import {
+  ACCEPTED_IMAGE_ACCEPT_ATTR,
+  dataUrlToBlob,
+  isAcceptedImageType,
+  MAX_ATTACHMENTS_PER_MESSAGE,
+  processImageFile,
+  TOTAL_REQUEST_HARD_MAX_BYTES,
+  TOTAL_REQUEST_SOFT_WARN_BYTES,
+  UPLOAD_THRESHOLD_BYTES,
+} from "@/lib/image-attachments";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/dashboard/chat-test")({
@@ -34,6 +64,30 @@ type ModelOption = {
 };
 type ChatRole = "user" | "assistant";
 type ChatMessageStatus = "ready" | "streaming" | "error" | "stopped";
+// Attached images stored on a user message. An attachment is EITHER embedded as
+// a base64 data URL (small / media disabled), OR uploaded to the ephemeral media
+// store and referenced by id — in which case only a client-side preview URL is
+// kept for thumbnails and a fresh signed URL is minted at send time. History
+// keeps mediaIds, never signed URLs (signatures are short-lived).
+type ChatImageBase = {
+  id: string;
+  name: string;
+  // Set when a send-time /sign call reports the media id as expired/unknown, so
+  // the thumbnail can be flagged and the user prompted to re-attach.
+  expired?: boolean;
+};
+type ChatImageData = ChatImageBase & { kind: "data"; dataUrl: string };
+type ChatImageMedia = ChatImageBase & { kind: "media"; mediaId: string; previewUrl: string };
+type ChatImage = ChatImageData | ChatImageMedia;
+
+// Thumbnail source for an attachment: the embedded data URL, or the client-side
+// object/blob preview URL for uploaded media (never the signed URL).
+function imagePreviewSrc(image: ChatImage): string {
+  return image.kind === "data" ? image.dataUrl : image.previewUrl;
+}
+
+type MediaConfigResponse = { enabled: boolean; maxUploadBytes: number };
+type SignedMediaUrl = { id: string; url: string; signatureExpiresAt?: string };
 type ChatMessage = {
   id: string;
   role: ChatRole;
@@ -41,10 +95,15 @@ type ChatMessage = {
   status: ChatMessageStatus;
   sourceUserMessageId?: string;
   errorMessage?: string;
+  images?: ChatImage[];
 };
+// OpenAI-shaped content parts used when a message carries images.
+type RelayContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
 type RelayChatMessage = {
   role: "user" | "assistant";
-  content: string;
+  content: string | RelayContentPart[];
 };
 
 const LONG_THREAD_FIXTURE_COUNT = 200;
@@ -71,16 +130,68 @@ function modelOptions(visibleModels: VisibleModels | undefined): ModelOption[] {
   ];
 }
 
-function relayMessages(messages: ChatMessage[], throughUserMessageId?: string): RelayChatMessage[] {
+// Representative length stand-in for a signed media URL, used only to estimate
+// the outgoing body size BEFORE signing. Uploaded attachments contribute this
+// short URL rather than multi-hundred-KB base64, so the size guards effectively
+// only count embedded (data-URL) attachments.
+const MEDIA_URL_PLACEHOLDER = `https://${"x".repeat(48)}.example.com/media/${"y".repeat(
+  36,
+)}?exp=0000000000&sig=${"z".repeat(64)}`;
+
+function relayMessages(
+  messages: ChatMessage[],
+  throughUserMessageId: string | undefined,
+  // Resolves an uploaded attachment's media id to a URL (a freshly signed URL at
+  // send time, or a fixed placeholder when estimating request size).
+  resolveMediaUrl: (mediaId: string) => string,
+): RelayChatMessage[] {
   const selected = throughUserMessageId
     ? messages.slice(0, messages.findIndex((message) => message.id === throughUserMessageId) + 1)
     : messages;
 
-  return selected.flatMap((message) => {
+  return selected.flatMap<RelayChatMessage>((message) => {
     if (message.role === "assistant" && message.status !== "ready") return [];
-    if (message.content.trim().length === 0) return [];
-    return [{ role: message.role, content: message.content } satisfies RelayChatMessage];
+    const hasImages = (message.images?.length ?? 0) > 0;
+    const hasText = message.content.trim().length > 0;
+    if (!hasText && !hasImages) return [];
+
+    // Text-only messages keep the plain-string shape the route already sends.
+    if (!hasImages) {
+      return [{ role: message.role, content: message.content }];
+    }
+
+    // With images, content becomes an OpenAI-shaped content-parts array.
+    const parts: RelayContentPart[] = [];
+    if (hasText) parts.push({ type: "text", text: message.content });
+    for (const image of message.images ?? []) {
+      const url = image.kind === "data" ? image.dataUrl : resolveMediaUrl(image.mediaId);
+      parts.push({ type: "image_url", image_url: { url } });
+    }
+    return [{ role: message.role, content: parts }];
   });
+}
+
+// Collect the media ids referenced by the outgoing thread (through the given
+// user message), so a single /sign call can mint fresh URLs for all of them.
+function collectMediaIds(messages: ChatMessage[], throughUserMessageId?: string): string[] {
+  const selected = throughUserMessageId
+    ? messages.slice(0, messages.findIndex((message) => message.id === throughUserMessageId) + 1)
+    : messages;
+  const ids = new Set<string>();
+  for (const message of selected) {
+    for (const image of message.images ?? []) {
+      if (image.kind === "media") ids.add(image.mediaId);
+    }
+  }
+  return [...ids];
+}
+
+// Estimate the outgoing request body size so we can guard against the internal
+// chat-test route's 10 MB Hono body limit before sending. (The CLI relay now
+// streams request bodies, so its old ~8 MiB buffered cap no longer applies.)
+function estimateRequestBytes(model: string, messages: RelayChatMessage[]): number {
+  const body = JSON.stringify({ model, messages, stream: true });
+  return new Blob([body]).size;
 }
 
 function contentDelta(value: unknown): string {
@@ -113,6 +224,99 @@ async function readErrorMessage(response: Response, fallback: string) {
     return fallback;
   }
   return fallback;
+}
+
+// --- Ephemeral media store (Phase 1) --------------------------------------
+// These are plain Hono routes (not oRPC), fetched in the same raw-fetch style
+// as the chat-completions stream below.
+
+const MEDIA_CONFIG_QUERY_KEY = ["chat-test", "media-config"] as const;
+
+async function fetchMediaConfig(signal: AbortSignal): Promise<MediaConfigResponse> {
+  const response = await fetch(`${env.VITE_SERVER_URL}/api/internal/media/config`, {
+    credentials: "include",
+    signal,
+  });
+  if (!response.ok) return { enabled: false, maxUploadBytes: 0 };
+  const body: unknown = await response.json();
+  if (typeof body === "object" && body !== null && "enabled" in body) {
+    const enabled = (body as { enabled: unknown }).enabled === true;
+    const maxRaw = (body as { maxUploadBytes?: unknown }).maxUploadBytes;
+    const maxUploadBytes = typeof maxRaw === "number" && maxRaw > 0 ? maxRaw : 0;
+    return { enabled, maxUploadBytes };
+  }
+  return { enabled: false, maxUploadBytes: 0 };
+}
+
+type UploadMediaResult =
+  | { status: "ok"; id: string }
+  | { status: "disabled" } // 501: storage not configured — fall back to base64
+  | { status: "quota" } // 413 media_quota_exceeded: user is over their storage cap
+  | { status: "failed" };
+
+async function uploadMediaFile(blob: Blob, name: string): Promise<UploadMediaResult> {
+  const form = new FormData();
+  form.set("file", blob, name);
+  try {
+    const response = await fetch(`${env.VITE_SERVER_URL}/api/internal/media`, {
+      method: "POST",
+      credentials: "include",
+      body: form,
+    });
+    if (response.status === 501) return { status: "disabled" };
+    if (response.status === 413) {
+      // Distinguish a per-user quota rejection (distinct code) from a plain
+      // oversize body so the composer can show a quota-specific message.
+      const body = (await response.json().catch(() => ({}))) as { code?: unknown };
+      if (body.code === "media_quota_exceeded") return { status: "quota" };
+      return { status: "failed" };
+    }
+    if (!response.ok) return { status: "failed" };
+    const body: unknown = await response.json();
+    if (typeof body === "object" && body !== null && "id" in body) {
+      const id = (body as { id: unknown }).id;
+      if (typeof id === "string" && id.length > 0) return { status: "ok", id };
+    }
+    return { status: "failed" };
+  } catch {
+    return { status: "failed" };
+  }
+}
+
+type SignMediaResult =
+  | { status: "ok"; urls: Map<string, string> }
+  | { status: "expired"; invalidIds: string[] }
+  | { status: "failed" };
+
+async function signMediaUrls(ids: string[]): Promise<SignMediaResult> {
+  try {
+    const response = await fetch(`${env.VITE_SERVER_URL}/api/internal/media/sign`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ids }),
+    });
+    if (response.status === 403) {
+      const body = (await response.json().catch(() => ({}))) as { invalidIds?: unknown };
+      const invalid = Array.isArray(body.invalidIds)
+        ? body.invalidIds.filter((v): v is string => typeof v === "string")
+        : ids;
+      return { status: "expired", invalidIds: invalid.length > 0 ? invalid : ids };
+    }
+    if (!response.ok) return { status: "failed" };
+    const body = (await response.json()) as { urls?: unknown };
+    const map = new Map<string, string>();
+    if (Array.isArray(body.urls)) {
+      for (const entry of body.urls as SignedMediaUrl[]) {
+        if (entry && typeof entry.id === "string" && typeof entry.url === "string") {
+          map.set(entry.id, entry.url);
+        }
+      }
+    }
+    return { status: "ok", urls: map };
+  } catch {
+    return { status: "failed" };
+  }
 }
 
 async function streamChatCompletion({
@@ -189,25 +393,206 @@ function ChatTestPage() {
     isError: visibleModelsIsError,
     refetch: refetchVisibleModels,
   } = useQuery(orpc.forwarderManagement.visibleModels.queryOptions());
+  const queryClient = useQueryClient();
+  const { data: mediaConfig } = useQuery({
+    queryKey: MEDIA_CONFIG_QUERY_KEY,
+    queryFn: ({ signal }) => fetchMediaConfig(signal),
+    staleTime: 5 * 60 * 1000,
+  });
+  const mediaEnabled = mediaConfig?.enabled ?? false;
+  const mediaMaxUploadBytes = mediaConfig?.maxUploadBytes ?? 0;
   const [selectedModelId, setSelectedModelId] = useState("");
   const [draft, setDraft] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [announcement, setAnnouncement] = useState("");
+  const [attachments, setAttachments] = useState<ChatImage[]>([]);
+  const [attachmentNotice, setAttachmentNotice] = useState("");
+  const [isProcessingImages, setIsProcessingImages] = useState(false);
+  const [isPreparingSend, setIsPreparingSend] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const sendingRef = useRef(false);
   const abortControllerRef = useRef<AbortController | null>(null);
   const activeAssistantIdRef = useRef<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const scroll = useChatScrollEngine();
   const options = useMemo(() => modelOptions(visibleModelsData), [visibleModelsData]);
   const effectiveModelId = options.some((option) => option.modelId === selectedModelId)
     ? selectedModelId
     : (options[0]?.modelId ?? "");
   const isStreaming = messages.some((message) => message.status === "streaming");
-  const canSend = draft.trim().length > 0 && effectiveModelId.length > 0 && !isStreaming;
+  const canSend =
+    (draft.trim().length > 0 || attachments.length > 0) &&
+    effectiveModelId.length > 0 &&
+    !isStreaming &&
+    !isProcessingImages &&
+    !isPreparingSend;
 
   const updateAssistant = useCallback((id: string, update: Partial<ChatMessage>) => {
     setMessages((current) =>
       current.map((message) => (message.id === id ? { ...message, ...update } : message)),
     );
   }, []);
+
+  const addImageFiles = useCallback(
+    async (files: File[]) => {
+      const images = files.filter((file) => isAcceptedImageType(file.type));
+      if (images.length === 0) {
+        if (files.length > 0) setAttachmentNotice(t("dashboard:chatTest.attachments.unsupported"));
+        return;
+      }
+      const remaining = MAX_ATTACHMENTS_PER_MESSAGE - attachments.length;
+      if (remaining <= 0) {
+        setAttachmentNotice(
+          t("dashboard:chatTest.attachments.maxReached", { count: MAX_ATTACHMENTS_PER_MESSAGE }),
+        );
+        return;
+      }
+      const toProcess = images.slice(0, remaining);
+      const truncated = images.length > remaining;
+      setIsProcessingImages(true);
+      setAttachmentNotice("");
+      // Media may be disabled mid-batch if an upload reports 501; track locally
+      // and mirror into the query cache so later attachments skip the round trip.
+      let uploadEnabled = mediaEnabled;
+      try {
+        const accepted: ChatImage[] = [];
+        let rejectedCount = 0;
+        let quotaHit = false;
+        for (const file of toProcess) {
+          const result = await processImageFile(file);
+          if (!result.ok) {
+            rejectedCount += 1;
+            continue;
+          }
+          const { id, dataUrl, name, byteSize } = result.image;
+
+          // Large enough to prefer the media store, and small enough to upload:
+          // upload and keep only a media id + client-side preview URL. Otherwise
+          // (or on any upload problem) keep the offline-friendly base64 path.
+          const shouldUpload =
+            uploadEnabled &&
+            byteSize > UPLOAD_THRESHOLD_BYTES &&
+            (mediaMaxUploadBytes === 0 || byteSize <= mediaMaxUploadBytes);
+
+          if (shouldUpload) {
+            const blob = dataUrlToBlob(dataUrl);
+            const upload = await uploadMediaFile(blob, name);
+            if (upload.status === "ok") {
+              accepted.push({
+                id,
+                name,
+                kind: "media",
+                mediaId: upload.id,
+                previewUrl: URL.createObjectURL(blob),
+              });
+              continue;
+            }
+            if (upload.status === "quota") {
+              // Over the per-user storage quota. Don't silently embed multi-
+              // hundred-KB base64 (which history then re-sends every turn) —
+              // skip this attachment and surface a quota-specific notice.
+              quotaHit = true;
+              continue;
+            }
+            if (upload.status === "disabled") {
+              // Storage isn't configured after all — stop trying for this batch
+              // and future ones, then fall through to the base64 path.
+              uploadEnabled = false;
+              queryClient.setQueryData<MediaConfigResponse>(MEDIA_CONFIG_QUERY_KEY, {
+                enabled: false,
+                maxUploadBytes: 0,
+              });
+            }
+            // status "failed" or "disabled": fall back to embedding.
+          }
+
+          accepted.push({ id, name, kind: "data", dataUrl });
+        }
+        if (accepted.length > 0) {
+          setAttachments((current) => [...current, ...accepted]);
+        }
+        const notices: string[] = [];
+        if (quotaHit) {
+          notices.push(t("dashboard:chatTest.attachments.quotaExceeded"));
+        }
+        if (rejectedCount > 0) {
+          notices.push(t("dashboard:chatTest.attachments.rejected", { count: rejectedCount }));
+        }
+        if (truncated) {
+          notices.push(
+            t("dashboard:chatTest.attachments.maxReached", { count: MAX_ATTACHMENTS_PER_MESSAGE }),
+          );
+        }
+        setAttachmentNotice(notices.join(" "));
+      } finally {
+        setIsProcessingImages(false);
+      }
+    },
+    [attachments.length, mediaEnabled, mediaMaxUploadBytes, queryClient, t],
+  );
+
+  const openFilePicker = useCallback(() => {
+    fileInputRef.current?.click();
+  }, []);
+
+  const handleFileInputChange = useCallback(
+    (event: ChangeEvent<HTMLInputElement>) => {
+      const files = event.target.files ? Array.from(event.target.files) : [];
+      // Reset so selecting the same file again re-triggers change.
+      event.target.value = "";
+      if (files.length > 0) void addImageFiles(files);
+    },
+    [addImageFiles],
+  );
+
+  const removeAttachment = useCallback((id: string) => {
+    setAttachments((current) => {
+      const removed = current.find((image) => image.id === id);
+      // Only composer previews are revoked here; once an attachment is sent it
+      // moves into message history, which keeps rendering its preview URL.
+      if (removed?.kind === "media") URL.revokeObjectURL(removed.previewUrl);
+      return current.filter((image) => image.id !== id);
+    });
+  }, []);
+
+  const handlePaste = useCallback(
+    (event: ClipboardEvent<HTMLTextAreaElement>) => {
+      const files = Array.from(event.clipboardData.files ?? []).filter((file) =>
+        isAcceptedImageType(file.type),
+      );
+      if (files.length > 0) {
+        event.preventDefault();
+        void addImageFiles(files);
+      }
+    },
+    [addImageFiles],
+  );
+
+  const handleDragOver = useCallback((event: DragEvent<HTMLFormElement>) => {
+    if (Array.from(event.dataTransfer.types).includes("Files")) {
+      event.preventDefault();
+      setIsDragging(true);
+    }
+  }, []);
+
+  const handleDragLeave = useCallback((event: DragEvent<HTMLFormElement>) => {
+    if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+    setIsDragging(false);
+  }, []);
+
+  const handleDrop = useCallback(
+    (event: DragEvent<HTMLFormElement>) => {
+      const files = Array.from(event.dataTransfer.files ?? []).filter((file) =>
+        isAcceptedImageType(file.type),
+      );
+      if (files.length > 0) {
+        event.preventDefault();
+        void addImageFiles(files);
+      }
+      setIsDragging(false);
+    },
+    [addImageFiles],
+  );
 
   const runRelay = useCallback(
     async ({
@@ -264,17 +649,81 @@ function ChatTestPage() {
     [scroll, t, updateAssistant],
   );
 
+  // Flag attachments whose media id came back invalid/expired from /sign, both
+  // in history and in the composer, so the thumbnails show a re-attach prompt.
+  const markMediaExpired = useCallback((invalidIds: string[]) => {
+    const invalid = new Set(invalidIds);
+    const flag = (image: ChatImage): ChatImage =>
+      image.kind === "media" && invalid.has(image.mediaId) ? { ...image, expired: true } : image;
+    setMessages((current) =>
+      current.map((message) =>
+        message.images ? { ...message, images: message.images.map(flag) } : message,
+      ),
+    );
+    setAttachments((current) => current.map(flag));
+  }, []);
+
+  // Mint fresh signed URLs for every uploaded attachment in the outgoing thread
+  // and substitute them into the OpenAI-shaped parts. Embedded (data-URL)
+  // attachments need no signing. On expiry we block rather than send broken URLs.
+  const buildSignedRelayInput = useCallback(
+    async (
+      threadMessages: ChatMessage[],
+      throughUserMessageId: string,
+    ): Promise<
+      { ok: true; relayInput: RelayChatMessage[] } | { ok: false; reason: "expired" | "failed" }
+    > => {
+      const mediaIds = collectMediaIds(threadMessages, throughUserMessageId);
+      if (mediaIds.length === 0) {
+        return {
+          ok: true,
+          relayInput: relayMessages(threadMessages, throughUserMessageId, () => ""),
+        };
+      }
+      const signed = await signMediaUrls(mediaIds);
+      if (signed.status === "expired") {
+        markMediaExpired(signed.invalidIds);
+        return { ok: false, reason: "expired" };
+      }
+      if (signed.status === "failed") {
+        return { ok: false, reason: "failed" };
+      }
+      // Fail closed: an id the /sign response omitted (present in the request but
+      // missing a URL) is treated exactly like the expired/invalid case rather
+      // than sent as an empty image_url. Block the send and flag the attachment.
+      const missing = mediaIds.filter((id) => !signed.urls.has(id));
+      if (missing.length > 0) {
+        markMediaExpired(missing);
+        return { ok: false, reason: "expired" };
+      }
+      return {
+        ok: true,
+        relayInput: relayMessages(
+          threadMessages,
+          throughUserMessageId,
+          (id) => signed.urls.get(id) ?? "",
+        ),
+      };
+    },
+    [markMediaExpired],
+  );
+
   const handleSend = useCallback(
-    (event?: FormEvent<HTMLFormElement>) => {
+    async (event?: FormEvent<HTMLFormElement>) => {
       event?.preventDefault();
+      if (sendingRef.current) return;
       const content = draft.trim();
-      if (!content || !effectiveModelId || isStreaming) return;
+      const hasImages = attachments.length > 0;
+      if ((!content && !hasImages) || !effectiveModelId || isStreaming || isProcessingImages) {
+        return;
+      }
 
       const userMessage: ChatMessage = {
         id: newId("user"),
         role: "user",
         content,
         status: "ready",
+        images: hasImages ? attachments : undefined,
       };
       const assistantMessage: ChatMessage = {
         id: newId("assistant"),
@@ -284,16 +733,68 @@ function ChatTestPage() {
         sourceUserMessageId: userMessage.id,
       };
       const nextMessages = [...messages, userMessage, assistantMessage];
-      setDraft("");
-      setMessages(nextMessages);
-      scroll.positionTurnNearTop(userMessage.id);
-      void runRelay({
-        assistantId: assistantMessage.id,
-        modelId: effectiveModelId,
-        relayInput: relayMessages(nextMessages, userMessage.id),
-      });
+
+      // Guard against the internal chat-test route's 10 MB body limit. History
+      // re-sends every embedded image, so the whole thread is measured; uploaded
+      // attachments only contribute a short signed URL (placeholder here), so the
+      // guards effectively count just base64 attachments.
+      const estimateInput = relayMessages(
+        nextMessages,
+        userMessage.id,
+        () => MEDIA_URL_PLACEHOLDER,
+      );
+      const estimatedBytes = estimateRequestBytes(effectiveModelId, estimateInput);
+      if (estimatedBytes > TOTAL_REQUEST_HARD_MAX_BYTES) {
+        setAttachmentNotice(t("dashboard:chatTest.attachments.requestTooLarge"));
+        return;
+      }
+
+      sendingRef.current = true;
+      setIsPreparingSend(true);
+      try {
+        // Mint fresh signed URLs for uploaded attachments right before sending.
+        const prepared = await buildSignedRelayInput(nextMessages, userMessage.id);
+        if (!prepared.ok) {
+          setAttachmentNotice(
+            prepared.reason === "expired"
+              ? t("dashboard:chatTest.attachments.expired")
+              : t("dashboard:chatTest.attachments.signFailed"),
+          );
+          return;
+        }
+
+        if (estimatedBytes > TOTAL_REQUEST_SOFT_WARN_BYTES) {
+          setAttachmentNotice(t("dashboard:chatTest.attachments.requestLargeWarning"));
+        } else {
+          setAttachmentNotice("");
+        }
+
+        setDraft("");
+        setAttachments([]);
+        setMessages(nextMessages);
+        scroll.positionTurnNearTop(userMessage.id);
+        void runRelay({
+          assistantId: assistantMessage.id,
+          modelId: effectiveModelId,
+          relayInput: prepared.relayInput,
+        });
+      } finally {
+        sendingRef.current = false;
+        setIsPreparingSend(false);
+      }
     },
-    [draft, effectiveModelId, isStreaming, messages, runRelay, scroll],
+    [
+      attachments,
+      buildSignedRelayInput,
+      draft,
+      effectiveModelId,
+      isProcessingImages,
+      isStreaming,
+      messages,
+      runRelay,
+      scroll,
+      t,
+    ],
   );
 
   const handleStop = useCallback(() => {
@@ -302,23 +803,47 @@ function ChatTestPage() {
   }, [scroll]);
 
   const regenerate = useCallback(
-    (assistant: ChatMessage) => {
-      if (!assistant.sourceUserMessageId || isStreaming) return;
-      scroll.markUserIntent();
-      setMessages((current) =>
-        current.map((message) =>
-          message.id === assistant.id
-            ? { ...message, content: "", status: "streaming", errorMessage: undefined }
-            : message,
-        ),
-      );
-      void runRelay({
-        assistantId: assistant.id,
-        modelId: effectiveModelId,
-        relayInput: relayMessages(messages, assistant.sourceUserMessageId),
-      });
+    async (assistant: ChatMessage) => {
+      const sourceUserMessageId = assistant.sourceUserMessageId;
+      if (!sourceUserMessageId || isStreaming) return;
+      // Share send's in-flight guard so send and regenerate are mutually
+      // exclusive across the whole prep+stream lifecycle: sendingRef covers the
+      // /sign prep window (isStreaming is still false then), isStreaming covers
+      // the relay. Without this a regenerate click during either prep window
+      // could start a second concurrent relay that clobbers the abort refs.
+      if (sendingRef.current) return;
+      sendingRef.current = true;
+      setIsPreparingSend(true);
+      try {
+        scroll.markUserIntent();
+        // Re-sign any uploaded attachments in the replayed thread before relaying.
+        const prepared = await buildSignedRelayInput(messages, sourceUserMessageId);
+        if (!prepared.ok) {
+          setAttachmentNotice(
+            prepared.reason === "expired"
+              ? t("dashboard:chatTest.attachments.expired")
+              : t("dashboard:chatTest.attachments.signFailed"),
+          );
+          return;
+        }
+        setMessages((current) =>
+          current.map((message) =>
+            message.id === assistant.id
+              ? { ...message, content: "", status: "streaming", errorMessage: undefined }
+              : message,
+          ),
+        );
+        void runRelay({
+          assistantId: assistant.id,
+          modelId: effectiveModelId,
+          relayInput: prepared.relayInput,
+        });
+      } finally {
+        sendingRef.current = false;
+        setIsPreparingSend(false);
+      }
     },
-    [effectiveModelId, isStreaming, messages, runRelay, scroll],
+    [buildSignedRelayInput, effectiveModelId, isStreaming, messages, runRelay, scroll, t],
   );
 
   const handleKeyDown = useCallback(
@@ -423,7 +948,7 @@ function ChatTestPage() {
                   key={message.id}
                   message={message}
                   onRegenerate={regenerate}
-                  canRegenerate={!isStreaming && effectiveModelId.length > 0}
+                  canRegenerate={!isStreaming && !isPreparingSend && effectiveModelId.length > 0}
                 />
               ))
             )}
@@ -443,32 +968,105 @@ function ChatTestPage() {
         ) : null}
       </div>
 
-      <form className="border-t p-3" onSubmit={handleSend}>
-        <div className="mx-auto flex max-w-4xl flex-col gap-2 sm:flex-row sm:items-end">
-          <Textarea
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-            onKeyDown={handleKeyDown}
-            onFocus={scroll.markUserIntent}
-            disabled={options.length === 0}
-            placeholder={t("dashboard:chatTest.inputPlaceholder")}
-            aria-label={t("dashboard:chatTest.inputLabel")}
-            inputMode="text"
-            autoComplete="off"
-            className="max-h-40 min-h-[72px] text-base md:text-sm"
-          />
-          <div className="flex gap-2 sm:flex-col">
-            {isStreaming ? (
-              <Button type="button" variant="outline" size="touch" onClick={handleStop}>
-                <Square className="size-4" />
-                {t("dashboard:chatTest.stop")}
+      <form
+        className={cn(
+          "border-t p-3",
+          isDragging && "bg-primary/5 ring-1 ring-inset ring-primary/40",
+        )}
+        onSubmit={handleSend}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+      >
+        <div className="mx-auto flex max-w-4xl flex-col gap-2">
+          {attachments.length > 0 ? (
+            <ul
+              className="flex flex-wrap gap-2"
+              aria-label={t("dashboard:chatTest.attachments.composerLabel")}
+            >
+              {attachments.map((image) => (
+                <li key={image.id} className="relative">
+                  <img
+                    src={imagePreviewSrc(image)}
+                    alt={image.name}
+                    className={cn(
+                      "size-16 rounded-md border object-cover",
+                      image.expired && "opacity-40 ring-1 ring-destructive",
+                    )}
+                  />
+                  {image.expired ? (
+                    <span className="absolute inset-x-0 bottom-0 rounded-b-md bg-destructive/80 px-1 py-0.5 text-center text-[10px] font-medium text-destructive-foreground">
+                      {t("dashboard:chatTest.attachments.expiredBadge")}
+                    </span>
+                  ) : null}
+                  <button
+                    type="button"
+                    onClick={() => removeAttachment(image.id)}
+                    aria-label={t("dashboard:chatTest.attachments.remove", { name: image.name })}
+                    className="absolute -right-2 -top-2 flex size-6 items-center justify-center rounded-full border bg-background text-muted-foreground shadow-sm hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  >
+                    <X className="size-3.5" />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+          {attachmentNotice ? (
+            <p className="text-xs text-muted-foreground" role="status">
+              {attachmentNotice}
+            </p>
+          ) : null}
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+            <Textarea
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              onKeyDown={handleKeyDown}
+              onFocus={scroll.markUserIntent}
+              onPaste={handlePaste}
+              disabled={options.length === 0}
+              placeholder={t("dashboard:chatTest.inputPlaceholder")}
+              aria-label={t("dashboard:chatTest.inputLabel")}
+              inputMode="text"
+              autoComplete="off"
+              className="max-h-40 min-h-[72px] text-base md:text-sm"
+            />
+            <div className="flex gap-2 sm:flex-col">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept={ACCEPTED_IMAGE_ACCEPT_ATTR}
+                multiple
+                className="hidden"
+                onChange={handleFileInputChange}
+                tabIndex={-1}
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="touch"
+                onClick={openFilePicker}
+                disabled={options.length === 0 || isProcessingImages}
+                aria-label={t("dashboard:chatTest.attachments.attachImage")}
+              >
+                {isProcessingImages ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <ImagePlus className="size-4" />
+                )}
+                <span className="sm:hidden">{t("dashboard:chatTest.attachments.attachImage")}</span>
               </Button>
-            ) : (
-              <Button type="submit" size="touch" disabled={!canSend}>
-                <Send className="size-4" />
-                {t("dashboard:chatTest.send")}
-              </Button>
-            )}
+              {isStreaming ? (
+                <Button type="button" variant="outline" size="touch" onClick={handleStop}>
+                  <Square className="size-4" />
+                  {t("dashboard:chatTest.stop")}
+                </Button>
+              ) : (
+                <Button type="submit" size="touch" disabled={!canSend}>
+                  <Send className="size-4" />
+                  {t("dashboard:chatTest.send")}
+                </Button>
+              )}
+            </div>
           </div>
         </div>
         <div className="sr-only" aria-live="polite" aria-atomic="true">
@@ -538,9 +1136,30 @@ function MessageBubble({
           </span>
         ) : null}
       </div>
+      {message.images && message.images.length > 0 ? (
+        <ul className="mb-2 flex flex-wrap gap-2">
+          {message.images.map((image) => (
+            <li key={image.id} className="relative">
+              <img
+                src={imagePreviewSrc(image)}
+                alt={image.name}
+                className={cn(
+                  "max-h-48 max-w-full rounded-md border object-contain",
+                  image.expired && "opacity-40 ring-1 ring-destructive",
+                )}
+              />
+              {image.expired ? (
+                <span className="absolute bottom-1 left-1 rounded bg-destructive/80 px-1.5 py-0.5 text-[10px] font-medium text-destructive-foreground">
+                  {t("dashboard:chatTest.attachments.expiredBadge")}
+                </span>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      ) : null}
       {message.content ? (
         <MessageContent content={message.content} />
-      ) : (
+      ) : message.images && message.images.length > 0 ? null : (
         <p className="text-sm text-muted-foreground">{t("dashboard:chatTest.status.waiting")}</p>
       )}
       {message.status === "error" && message.errorMessage ? (

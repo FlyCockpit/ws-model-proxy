@@ -25,6 +25,11 @@ pub struct Config {
     pub cli_label: Option<String>,
     pub cli_token_env: Option<String>,
     pub endpoints: Vec<EndpointConfig>,
+    /// Extra HTTP(S) origins whose signed `/media/{id}` URLs the relay may fetch
+    /// and inline when an endpoint enables `expandMedia`. The connected server's
+    /// own origin is always trusted; these are additive.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub media_trusted_origins: Vec<String>,
 }
 
 impl Default for Config {
@@ -36,6 +41,7 @@ impl Default for Config {
             cli_label: None,
             cli_token_env: None,
             endpoints: Vec::new(),
+            media_trusted_origins: Vec::new(),
         }
     }
 }
@@ -48,6 +54,11 @@ pub struct EndpointConfig {
     pub kind: EndpointKind,
     pub base_url: String,
     pub enabled: bool,
+    /// When true, buffer chat-shaped JSON request bodies for this endpoint and
+    /// inline trusted WMP media URLs as `data:` URLs before forwarding upstream.
+    /// Off by default; opt in for local upstreams that cannot fetch remote URLs.
+    #[serde(skip_serializing_if = "is_false")]
+    pub expand_media: bool,
     pub default_capabilities: OpenAiCompatibleCapabilities,
     pub headers: Vec<HeaderEnvRef>,
     pub models: Vec<ModelConfig>,
@@ -62,6 +73,7 @@ impl Default for EndpointConfig {
             kind: EndpointKind::OpenAiCompatible,
             base_url: String::new(),
             enabled: true,
+            expand_media: false,
             default_capabilities: OpenAiCompatibleCapabilities::default(),
             headers: Vec::new(),
             models: Vec::new(),
@@ -392,6 +404,10 @@ impl Config {
         }
         Ok(())
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 pub fn validate_env_name(name: &str) -> Result<()> {

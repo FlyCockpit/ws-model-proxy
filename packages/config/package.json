@@ -15,6 +15,9 @@
     },
     "./theme-init": {
       "default": "./src/theme-init.ts"
+    },
+    "./media-policy": {
+      "default": "./src/media-policy.ts"
     }
   },
   "files": [

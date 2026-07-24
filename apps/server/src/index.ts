@@ -30,7 +30,23 @@ import {
   SIGNUP_MEDIA_TYPES,
   SIGNUP_RECIPIENT_PATH,
 } from "./email-recipient-limit.js";
+import { mediaAdminGate } from "./media/admin-gate.js";
+import { startMediaCleanup } from "./media/cleanup.js";
+import { createSameOriginGuard } from "./media/csrf-guard.js";
+import {
+  createMediaAdminDeleteAllHandler,
+  createMediaAdminPurgeExpiredHandler,
+  createMediaAdminStatsHandler,
+  createMediaConfigHandler,
+  createMediaGetHandler,
+  createMediaSignHandler,
+  createMediaUploadHandler,
+} from "./media/routes.js";
 import { createChatTestRoutes } from "./model-api/chat-test.js";
+import {
+  createModelApiFileGetHandler,
+  createModelApiFileUploadHandler,
+} from "./model-api/files.js";
 import { MODEL_API_MAX_REQUEST_BODY_BYTES } from "./model-api/limits.js";
 import { openAiErrorBody } from "./model-api/openai-errors.js";
 import { createModelApiRoutes } from "./model-api/routes.js";
@@ -76,6 +92,14 @@ type AppVariables = {
 
 const app = new Hono<{ Variables: AppVariables }>();
 
+// Signed media fetch (HMAC-only, unauthenticated by design). Registered BEFORE
+// the global secure-headers middleware so this route fully owns its response
+// headers: a raw user blob must be served with `Content-Security-Policy:
+// sandbox` + `Cross-Origin-Resource-Policy: same-origin` + `nosniff`, not the
+// app's script/style CSP. A returning handler short-circuits the middleware
+// chain, so secureHeaders never overwrites these. See media/routes.ts.
+app.get("/media/:id", createMediaGetHandler());
+
 // Secure-headers — sets a battery of security headers (X-Content-Type-Options,
 // X-Frame-Options, Strict-Transport-Security, etc.) on every response, plus the
 // raw-asset `sandbox` CSP override. Ordering between the two is load-bearing and
@@ -90,6 +114,39 @@ const cspConnectSrc = ["'self'", ...(env.CORS_ORIGIN ? [env.CORS_ORIGIN] : [])];
 // this static bootstrap can't carry a per-request nonce, so it uses a hash.
 const themeInitCspHash = `'sha256-${createHash("sha256").update(THEME_INIT_SCRIPT).digest("base64")}'`;
 mountSecurityHeaders(app, { cspConnectSrc, themeInitCspHash });
+
+// Harness-facing media upload (bearer model-token auth — the SAME auth posture
+// as the rest of /v1: no cookies, no CSRF, no browser CORS). Mounted with its
+// OWN body limit of MEDIA_MAX_UPLOAD_BYTES and registered BEFORE the generic
+// /v1/* limiter below so the upload path gets the media cap; the returning
+// handler short-circuits, so the /v1/* 32 MB limiter never runs for these exact
+// paths. Mirrors the /api/internal/media pattern (own limit ahead of the global
+// limiter). GET /v1/files/:id (no body) is the re-sign path and rides along
+// under the same registration so it, too, precedes the catch-all in
+// createModelApiRoutes. Oversize returns the same request_too_large shape as the
+// /v1 body limit below.
+app.use(
+  "/v1/files",
+  bodyLimit({
+    maxSize: env.MEDIA_MAX_UPLOAD_BYTES,
+    onError: () =>
+      new Response(
+        JSON.stringify(
+          openAiErrorBody({
+            message: "Model API request body is too large.",
+            type: "rate_limit_error",
+            code: "request_too_large",
+          }),
+        ),
+        {
+          status: 429,
+          headers: { "content-type": "application/json; charset=utf-8" },
+        },
+      ),
+  }),
+);
+app.post("/v1/files", createModelApiFileUploadHandler());
+app.get("/v1/files/:id", createModelApiFileGetHandler());
 
 // OpenAI-compatible model API routes. These are public server-to-server
 // bearer-token routes: no cookie session auth, no CSRF, and no browser CORS in
@@ -116,6 +173,38 @@ app.use(
   }),
 );
 app.route("/v1", createModelApiRoutes());
+
+// Same-origin guard for the cookie-authenticated media MUTATION routes (upload,
+// sign, admin purge/delete). These plain Hono routes have no oRPC-style custom
+// header / CSRF-token check, so a cross-site multipart form POST could otherwise
+// ride the victim's cookies. The guard only acts on mutating methods, so the
+// GET config + signed GET /media routes are unaffected. Allowed origins are the
+// app's own origin and, on a split-origin deploy, the SPA origin (CORS_ORIGIN).
+const mediaCsrfGuard = createSameOriginGuard({
+  allowedOrigins: [
+    new URL(env.BETTER_AUTH_URL).origin,
+    ...(env.CORS_ORIGIN ? [new URL(env.CORS_ORIGIN).origin] : []),
+  ],
+});
+
+// Ephemeral media upload (session-authenticated). Mounted with its OWN body
+// limit of MEDIA_MAX_UPLOAD_BYTES and registered BEFORE the global 10 MB
+// limiter below, mirroring the /v1 pattern: the POST handler returns, so the
+// global limiter never runs for this exact path. `/api/internal/media` (no
+// trailing `/*`) matches only the upload endpoint — `/api/internal/media/sign`
+// is a JSON route that stays under the global limit.
+app.use("/api/internal/media", sessionMiddleware);
+app.use("/api/internal/media", createRateLimiterMiddleware(rpcLimiter));
+app.use("/api/internal/media", mediaCsrfGuard);
+app.use(
+  "/api/internal/media",
+  bodyLimit({
+    maxSize: env.MEDIA_MAX_UPLOAD_BYTES,
+    onError: (c) =>
+      c.json({ error: "Upload is too large.", maxBytes: env.MEDIA_MAX_UPLOAD_BYTES }, 413),
+  }),
+);
+app.post("/api/internal/media", createMediaUploadHandler());
 
 // Body-limit — reject oversized payloads early (before JSON parsing) to
 // prevent memory exhaustion. 10 MB covers image uploads and large form
@@ -279,8 +368,43 @@ app.use("/api/auth/admin/*", betterAuthAdminGate);
 app.on(["POST", "GET"], "/api/auth/*", (c) => auth.handler(c.req.raw));
 
 app.use("/api/internal/chat-test/*", sessionMiddleware);
+// Same-origin guard as on the media mutators. Chat-test is less exposed (its
+// JSON body can't come from a cross-site HTML form without a preflight), but
+// uniform coverage keeps the cookie-auth mutation surface one policy. Cost:
+// cookie-bearing non-browser callers without an Origin header are rejected.
+app.use("/api/internal/chat-test/*", mediaCsrfGuard);
 app.use("/api/internal/chat-test/*", createRateLimiterMiddleware(rpcLimiter));
 app.route("/api/internal/chat-test", createChatTestRoutes());
+
+// Mint fresh short-lived signed media URLs (session-authenticated, owner-
+// checked). Small JSON body, so it lives under the global 10 MB limit — no
+// dedicated body limit needed. The upload endpoint itself is mounted earlier
+// with its larger limit.
+app.use("/api/internal/media/sign", sessionMiddleware);
+app.use("/api/internal/media/sign", createRateLimiterMiddleware(rpcLimiter));
+app.use("/api/internal/media/sign", mediaCsrfGuard);
+app.post("/api/internal/media/sign", createMediaSignHandler());
+
+// Media capability discovery (session-authenticated). Small GET, no body, so it
+// stays under the global limit. Reports whether upload storage is configured
+// and the hard per-upload byte cap so the client can pick upload vs base64.
+app.use("/api/internal/media/config", sessionMiddleware);
+app.use("/api/internal/media/config", createRateLimiterMiddleware(rpcLimiter));
+app.get("/api/internal/media/config", createMediaConfigHandler());
+
+// Admin media policy surface (verified-admin only). Small JSON bodies, so these
+// stay under the global 10 MB limit. `sessionMiddleware` resolves the session
+// once (used by the rate limiter's uid keying AND the admin gate), then
+// `mediaAdminGate` enforces verified-admin + forced-2FA, returning 404 for
+// non-admins so the surface's existence isn't leaked. Metadata/policy only:
+// stats are aggregate counts, and purge/delete-all are audit-logged by count.
+app.use("/api/internal/media/admin/*", sessionMiddleware);
+app.use("/api/internal/media/admin/*", createRateLimiterMiddleware(rpcLimiter));
+app.use("/api/internal/media/admin/*", mediaCsrfGuard);
+app.use("/api/internal/media/admin/*", mediaAdminGate);
+app.get("/api/internal/media/admin/stats", createMediaAdminStatsHandler());
+app.post("/api/internal/media/admin/purge-expired", createMediaAdminPurgeExpiredHandler());
+app.post("/api/internal/media/admin/delete-all", createMediaAdminDeleteAllHandler());
 
 // Resolve the Better-Auth session once per request on paths that need it.
 // Mounted BEFORE the rate limiters so they can key on the user id without
@@ -450,6 +574,11 @@ const server = serve(
   },
 );
 
+// Ephemeral media cleanup — hourly in-process sweep of expired assets (rows +
+// bytes). No-op when media storage is not configured. Complements the lazy
+// delete-on-GET in media/routes.ts.
+const stopMediaCleanup = startMediaCleanup();
+
 // ---------------------------------------------------------------------------
 // Graceful shutdown — drain in-flight requests, then close dependencies
 // ---------------------------------------------------------------------------
@@ -460,6 +589,9 @@ async function shutdown(signal: string) {
   if (isShuttingDown) return;
   isShuttingDown = true;
   console.log(`[server] Received ${signal} — starting graceful shutdown…`);
+
+  // Stop the media cleanup timer so it can't fire mid-shutdown.
+  stopMediaCleanup?.();
 
   // 1. Stop accepting new connections and drain in-flight requests.
   await new Promise<void>((resolve) => {

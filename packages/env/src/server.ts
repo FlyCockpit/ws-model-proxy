@@ -60,12 +60,70 @@ export const env = createEnv({
     // exact number of proxies between the client and the app. 0 disables
     // X-Forwarded-For entirely and always keys on the socket peer.
     TRUST_PROXY_HOPS: z.coerce.number().int().min(0).optional(),
+    // ---- Ephemeral media store (optional; Phase 1 multimodal asset plan).
+    //
+    // Upload is a DEPLOY CAPABILITY, not a soft UI toggle. It is only available
+    // when MEDIA_STORAGE=local AND MEDIA_ROOT points at a writable absolute
+    // path (see the startup guard below and isMediaConfigured() in
+    // apps/server/src/media/config.ts). When off, upload endpoints return a
+    // clear "media upload is not configured" error and clients fall back to
+    // base64 / external URLs.
+    //
+    // No new signing secret: signed GET URLs derive their HMAC key from
+    // BETTER_AUTH_SECRET via the `mediaSignedUrl` forwarder purpose.
+    MEDIA_STORAGE: z.enum(["off", "local"]).default("off"),
+    // Absolute path to the media object directory (e.g. a mounted Docker
+    // volume like /var/lib/wmp/media). Required when MEDIA_STORAGE=local.
+    MEDIA_ROOT: z.string().min(1).optional(),
+    // Hard cap on a single upload. Independent of the global 10 MB / model-API
+    // 32 MB request-body limits — the upload route mounts its own body limit.
+    // Must stay below 2^31-1: MediaAsset.sizeBytes is a 32-bit Int column.
+    MEDIA_MAX_UPLOAD_BYTES: z.coerce
+      .number()
+      .int()
+      .positive()
+      .max(2 ** 31 - 1)
+      .default(25 * 1024 * 1024),
+    // Public origin used to build signed media URLs. Defaults to
+    // BETTER_AUTH_URL (the app public origin) when unset.
+    MEDIA_PUBLIC_BASE_URL: originUrl("MEDIA_PUBLIC_BASE_URL").optional(),
+    // Per-user storage quota: the total bytes one user may hold in UNEXPIRED
+    // media assets at once. Enforced in uploadMedia so BOTH the session upload
+    // route and /v1/files inherit it; a sha256 dedup hit adds no new bytes and
+    // is exempt. Default 512 MiB. Set 0 to disable the quota entirely.
+    MEDIA_MAX_BYTES_PER_USER: z.coerce
+      .number()
+      .int()
+      .min(0)
+      .default(512 * 1024 * 1024),
   },
   runtimeEnv: process.env,
   emptyStringAsUndefined: true,
 });
 
 export const SIGNUP_ENABLED: boolean = env.SIGNUP_ENABLED;
+
+// ---------------------------------------------------------------------------
+// Media store guard — MEDIA_ROOT is required, and must be absolute, when the
+// local backend is selected. Fail hard at startup so a half-configured volume
+// is caught in staging/CI rather than at the first upload.
+// ---------------------------------------------------------------------------
+if (env.MEDIA_STORAGE === "local") {
+  if (!env.MEDIA_ROOT) {
+    throw new Error(
+      "[env] MEDIA_STORAGE=local requires MEDIA_ROOT to be set to an absolute path (e.g. /var/lib/wmp/media).",
+    );
+  }
+  if (!isAbsolutePosixOrWin(env.MEDIA_ROOT)) {
+    throw new Error(`[env] MEDIA_ROOT must be an absolute path, got "${env.MEDIA_ROOT}".`);
+  }
+}
+
+function isAbsolutePosixOrWin(p: string): boolean {
+  // Avoid a node:path import in this browser-adjacent env module; check both
+  // POSIX ("/…") and Windows ("C:\…" / "\\…") absolute forms.
+  return p.startsWith("/") || /^[A-Za-z]:[\\/]/.test(p) || p.startsWith("\\\\");
+}
 
 // ---------------------------------------------------------------------------
 // BETTER_AUTH_SECRET entropy check — catch weak/placeholder secrets early.
