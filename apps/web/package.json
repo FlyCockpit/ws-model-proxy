@@ -29,7 +29,7 @@
     "@ws-model-proxy/env": "workspace:*",
     "@ws-model-proxy/ui": "workspace:*",
     "better-auth": "catalog:",
-    "crossws": "^0.4.6",
+    "crossws": "^0.4.10",
     "i18next": "catalog:",
     "i18next-browser-languagedetector": "catalog:",
     "lucide-react": "catalog:",
@@ -45,7 +45,7 @@
     "zustand": "^5.0.14"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "^4.3.2",
+    "@tailwindcss/vite": "^4.3.3",
     "@tanstack/react-query-devtools": "catalog:",
     "@tanstack/react-router-devtools": "catalog:",
     "@types/node": "catalog:",
