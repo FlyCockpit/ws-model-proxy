@@ -1131,7 +1131,6 @@ export function CliTokensSection() {
       onSuccess: (result) => {
         queryClient.invalidateQueries({ queryKey: orpc.cliCredentials.key() });
         setSecret(result.secret);
-        setName("");
         toast.success(t("dashboard:tokens.created"));
       },
     }),
@@ -1159,7 +1158,7 @@ export function CliTokensSection() {
         action={
           <Dialog
             open={createOpen}
-            onOpenChange={(open) => {
+            onOpenChange={(open: boolean) => {
               setCreateOpen(open);
               if (!open) {
                 setName("");
@@ -1187,29 +1186,37 @@ export function CliTokensSection() {
                   if (name) create.mutate({ name });
                 }}
               >
-                <div className="space-y-2">
-                  <Label htmlFor="cli-token-name">{t("dashboard:tokens.name")}</Label>
-                  <Input
-                    id="cli-token-name"
-                    value={name}
-                    onChange={(event) => setName(event.target.value)}
-                    inputMode="text"
-                    autoComplete="off"
-                  />
-                </div>
+                {secret ? (
+                  <p className="text-sm">
+                    {t("dashboard:tokens.name")}: <span className="font-medium">{name}</span>
+                  </p>
+                ) : (
+                  <div className="space-y-2">
+                    <Label htmlFor="cli-token-name">{t("dashboard:tokens.name")}</Label>
+                    <Input
+                      id="cli-token-name"
+                      value={name}
+                      onChange={(event) => setName(event.target.value)}
+                      inputMode="text"
+                      autoComplete="off"
+                    />
+                  </div>
+                )}
                 {secret ? (
                   <SecretDisplay secret={secret} label={t("dashboard:tokens.cliSecret")} />
                 ) : null}
                 <DialogFooter>
-                  <Button
-                    type="submit"
-                    size="touch"
-                    disabled={!name || create.isPending || Boolean(secret)}
-                  >
-                    {create.isPending
-                      ? t("dashboard:tokens.creating")
-                      : t("dashboard:tokens.create")}
-                  </Button>
+                  {secret ? (
+                    <Button type="button" size="touch" onClick={() => setCreateOpen(false)}>
+                      {t("common:close")}
+                    </Button>
+                  ) : (
+                    <Button type="submit" size="touch" disabled={!name || create.isPending}>
+                      {create.isPending
+                        ? t("dashboard:tokens.creating")
+                        : t("dashboard:tokens.create")}
+                    </Button>
+                  )}
                 </DialogFooter>
               </form>
             </DialogContent>

@@ -38,6 +38,8 @@
     "react": "catalog:",
     "react-dom": "catalog:",
     "react-i18next": "catalog:",
+    "react-markdown": "catalog:",
+    "remark-gfm": "catalog:",
     "sileo": "catalog:",
     "vite-plugin-pwa": "^1.3.0",
     "web-haptics": "^0.0.6",

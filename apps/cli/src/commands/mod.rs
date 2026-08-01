@@ -11,8 +11,10 @@
 pub mod completions;
 pub mod config;
 pub mod connect;
+pub mod daemon;
 pub mod endpoints;
 pub mod login;
 pub mod logout;
 pub mod reload;
+pub mod service;
 pub mod token;

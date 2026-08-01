@@ -37,6 +37,7 @@ import {
 } from "react";
 import { useTranslation } from "react-i18next";
 
+import { ChatMarkdown } from "@/components/chat-markdown";
 import { InlineRetry } from "@/components/inline-retry";
 import { useChatScrollEngine } from "@/hooks/use-chat-scroll-engine";
 import {
@@ -848,10 +849,13 @@ function ChatTestPage() {
 
   const handleKeyDown = useCallback(
     (event: KeyboardEvent<HTMLTextAreaElement>) => {
-      if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-        event.preventDefault();
-        handleSend();
-      }
+      if (event.key !== "Enter") return;
+      // Don't send while an IME composition session is active (e.g. CJK input).
+      if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+      // Shift+Enter keeps the textarea default: insert a newline.
+      if (event.shiftKey) return;
+      event.preventDefault();
+      void handleSend();
     },
     [handleSend],
   );
@@ -932,7 +936,7 @@ function ChatTestPage() {
         <div
           ref={scroll.scrollRef}
           onScroll={scroll.markUserIntent}
-          className="h-full min-h-0 overflow-y-auto overscroll-y-auto p-3 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/50"
+          className="h-full min-h-0 overflow-y-auto overscroll-y-auto p-3 scrollbar-gutter-stable focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/50"
           aria-label={t("dashboard:chatTest.transcript")}
         >
           <div ref={scroll.contentRef} className="mx-auto max-w-4xl space-y-4">
@@ -1192,57 +1196,5 @@ function MessageBubble({
 }
 
 function MessageContent({ content }: { content: string }) {
-  const parts = useMemo(() => parseContentParts(content), [content]);
-  return (
-    <div className="space-y-3 text-sm leading-relaxed">
-      {parts.map((part) =>
-        part.kind === "code" ? (
-          <pre
-            key={part.id}
-            className="overflow-x-auto rounded-md border bg-background p-3 text-xs leading-relaxed focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/50"
-          >
-            <code>{part.content}</code>
-          </pre>
-        ) : (
-          <p key={part.id} className="whitespace-pre-wrap break-words">
-            {part.content}
-          </p>
-        ),
-      )}
-    </div>
-  );
-}
-
-type ContentPart = {
-  id: string;
-  kind: "text" | "code";
-  content: string;
-};
-
-function parseContentParts(content: string): ContentPart[] {
-  const parts: ContentPart[] = [];
-  const pattern = /```(?:[^\n`]*)?\n?([\s\S]*?)```/g;
-  let lastIndex = 0;
-  let index = 0;
-  for (const match of content.matchAll(pattern)) {
-    if (match.index > lastIndex) {
-      parts.push({
-        id: `text-${index}`,
-        kind: "text",
-        content: content.slice(lastIndex, match.index),
-      });
-      index += 1;
-    }
-    parts.push({
-      id: `code-${index}`,
-      kind: "code",
-      content: match[1] ?? "",
-    });
-    index += 1;
-    lastIndex = match.index + match[0].length;
-  }
-  if (lastIndex < content.length) {
-    parts.push({ id: `text-${index}`, kind: "text", content: content.slice(lastIndex) });
-  }
-  return parts.length > 0 ? parts : [{ id: "text-0", kind: "text", content }];
+  return <ChatMarkdown content={content} />;
 }

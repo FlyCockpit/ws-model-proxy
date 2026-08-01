@@ -1202,11 +1202,20 @@ fn websocket_url(server_url: &str) -> Result<Url> {
 fn endpoint_url(base_url: &str, request_path: &str) -> Result<Url> {
     let mut base =
         Url::parse(base_url).with_context(|| format!("parsing endpoint URL `{base_url}`"))?;
+    let request_path = request_path.trim_start_matches('/');
+    // Upstreams commonly document either their origin or their `/v1` base URL.
+    // Keep the configured URL intact, but avoid duplicating that version prefix
+    // when the relay receives an OpenAI-shaped `/v1/...` request from WMP.
+    let request_path = if base.path().trim_end_matches('/').ends_with("/v1") {
+        request_path.strip_prefix("v1/").unwrap_or(request_path)
+    } else {
+        request_path
+    };
     if !base.path().ends_with('/') {
         let next = format!("{}/", base.path());
         base.set_path(&next);
     }
-    base.join(request_path.trim_start_matches('/'))
+    base.join(request_path)
         .with_context(|| format!("joining endpoint URL `{base_url}` with path `{request_path}`"))
 }
 
@@ -1548,6 +1557,42 @@ mod tests {
         assert_eq!(
             websocket_url("https://example.test").expect("url").as_str(),
             "wss://example.test/api/cli/ws"
+        );
+    }
+
+    #[test]
+    fn endpoint_url_does_not_duplicate_a_configured_v1_prefix() {
+        assert_eq!(
+            endpoint_url("http://localhost:11434/v1", "/v1/chat/completions")
+                .expect("URL should join")
+                .as_str(),
+            "http://localhost:11434/v1/chat/completions"
+        );
+        assert_eq!(
+            endpoint_url("http://localhost:11434/v1/", "/v1/chat/completions")
+                .expect("URL should join")
+                .as_str(),
+            "http://localhost:11434/v1/chat/completions"
+        );
+        assert_eq!(
+            endpoint_url("http://localhost:11434", "/v1/chat/completions")
+                .expect("URL should join")
+                .as_str(),
+            "http://localhost:11434/v1/chat/completions"
+        );
+        // Base paths that merely contain `v1` as a longer segment keep the request path.
+        assert_eq!(
+            endpoint_url("http://localhost:11434/api/v1beta", "/v1/models")
+                .expect("URL should join")
+                .as_str(),
+            "http://localhost:11434/api/v1beta/v1/models"
+        );
+        // Non-versioned request paths still join normally onto a `/v1` base.
+        assert_eq!(
+            endpoint_url("http://localhost:11434/v1", "/models")
+                .expect("URL should join")
+                .as_str(),
+            "http://localhost:11434/v1/models"
         );
     }
 

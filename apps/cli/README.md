@@ -48,10 +48,36 @@ wsmp endpoints add local http://127.0.0.1:11434
 wsmp endpoints add local http://127.0.0.1:11434 --expand-media  # inline WMP media URLs
 wsmp endpoints probe local
 wsmp connect                        # open the outbound websocket relay
+wsmp daemon start --detach          # background relay (new session; owns a PID file)
+wsmp daemon status                  # inspect a detached relay
+wsmp daemon stop                    # stop a detached relay
+wsmp service install                # install, enable, and start a Linux/macOS user service
+wsmp service env-sync               # copy required env vars into the private service env file
 wsmp completions zsh                # shell completions
 ```
 
-Configuration is stored in a TOML file. `wsmp config path` prints the resolved path for the current platform. Logs go to stderr; pass `-v`/`-vv` for more, `--quiet` for less, or set `WSMP_LOG`.
+Configuration is stored in a JSON file. `wsmp config path` prints the resolved path for the current platform. Logs go to stderr; pass `-v`/`-vv` for more, `--quiet` for less, or set `WSMP_LOG`.
+
+### Background daemon and user services
+
+- `wsmp daemon start --detach` starts a session-detached relay that owns
+  `$WSMP_STATE_DIR/relay.pid` (with a pid + ownership token). Only that detached
+  process claims the PID file; foreground `wsmp connect` / `wsmp daemon start`
+  and OS services do not. `stop` refuses to signal a PID that no longer looks
+  like this CLI's daemon (PID-reuse guard).
+- `wsmp service install` installs a **per-user** systemd unit (Linux) or
+  LaunchAgent (macOS). Re-running install rewrites the unit/plist and restarts.
+- **Device credentials** (`wsmp login`) live in the state directory and work
+  under services without extra setup.
+- **CLI tokens and endpoint header secrets** are env-var *names* in config, not
+  values. User services do not inherit your interactive shell, so export those
+  variables and run `wsmp service env-sync` to write them into the private
+  `service.env` file (mode `0600` under the config dir). Installers load that
+  file via systemd `EnvironmentFile=` or a macOS wrapper script — secrets are
+  never embedded in unit/plist files and never printed. `wsmp service env-path`
+  prints the file path.
+- Linux tip: `loginctl enable-linger "$USER"` keeps a user service running after
+  logout.
 
 ### Media expansion for local upstreams
 

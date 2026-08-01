@@ -42,6 +42,8 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         Command::Config(args) => commands::config::run(args),
         Command::Endpoints(args) => commands::endpoints::run(args),
         Command::Connect(args) => commands::connect::run(args),
+        Command::Daemon(args) => commands::daemon::run(args),
+        Command::Service(args) => commands::service::run(args),
         Command::Reload(args) => commands::reload::run(args),
         Command::Logout(args) => commands::logout::run(args),
         Command::Completions(args) => commands::completions::run(args),

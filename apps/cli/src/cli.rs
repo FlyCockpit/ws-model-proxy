@@ -62,6 +62,12 @@ pub enum Command {
     /// Run the foreground websocket relay daemon.
     Connect(crate::commands::connect::Args),
 
+    /// Manage a local background relay daemon.
+    Daemon(crate::commands::daemon::Args),
+
+    /// Install or inspect a per-user operating-system service for the relay.
+    Service(crate::commands::service::Args),
+
     /// Refresh local endpoint inventory for a supervised daemon restart.
     Reload(crate::commands::reload::Args),
 
