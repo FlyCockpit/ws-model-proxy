@@ -526,7 +526,7 @@ fn help_lists_ready_commands() {
 }
 
 #[test]
-fn daemon_status_reports_not_running_without_pid_file() {
+fn daemon_status_explains_that_it_only_checks_detached_relays() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
     let state = tmp.path().join("state");
@@ -534,11 +534,12 @@ fn daemon_status_reports_not_running_without_pid_file() {
         .args(["daemon", "status"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("not running"));
+        .stdout(predicate::str::contains("no detached relay is running"))
+        .stdout(predicate::str::contains("wsmp service status"));
 }
 
 #[test]
-fn daemon_stop_is_idempotent_when_not_running() {
+fn daemon_stop_explains_that_it_only_stops_detached_relays() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
     let state = tmp.path().join("state");
@@ -546,7 +547,8 @@ fn daemon_stop_is_idempotent_when_not_running() {
         .args(["daemon", "stop"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("not running"));
+        .stdout(predicate::str::contains("no detached relay is running"))
+        .stdout(predicate::str::contains("wsmp service status"));
 }
 
 #[test]

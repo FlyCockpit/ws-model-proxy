@@ -52,6 +52,7 @@ wsmp daemon start --detach          # background relay (new session; owns a PID 
 wsmp daemon status                  # inspect a detached relay
 wsmp daemon stop                    # stop a detached relay
 wsmp service install                # install, enable, and start a Linux/macOS user service
+wsmp service status                 # inspect the installed user service
 wsmp service env-sync               # copy required env vars into the private service env file
 wsmp completions zsh                # shell completions
 ```

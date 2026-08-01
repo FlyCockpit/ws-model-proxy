@@ -21,6 +21,7 @@ const PID_FILE_VERSION: u32 = 1;
 const PID_CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
 const STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
+const NO_DETACHED_RELAY_MESSAGE: &str = "no detached relay is running; service-managed relays are not checked (run `wsmp service status`)";
 #[derive(Debug, clap::Args)]
 pub struct Args {
     #[command(subcommand)]
@@ -473,11 +474,11 @@ fn set_private_dir(path: &Path) -> Result<()> {
 fn stop() -> Result<()> {
     let path = pid_file()?;
     let Some(record) = read_pid_record(&path)? else {
-        return output::line("relay daemon is not running");
+        return output::line(NO_DETACHED_RELAY_MESSAGE);
     };
     if !process_running(record.pid) {
         remove_pid_file_if_matches(&path, &record)?;
-        return output::line("relay daemon is not running");
+        return output::line(NO_DETACHED_RELAY_MESSAGE);
     }
     if !process_looks_like_wsmp_daemon(record.pid, &record.token) {
         // PID reuse / foreign process: do not signal. Leave the file for the
@@ -524,14 +525,14 @@ fn status() -> Result<()> {
     let path = pid_file()?;
     match read_pid_record(&path)? {
         Some(record) if live_detached_owner(&record) => {
-            output::line(format!("relay daemon running (pid {})", record.pid))
+            output::line(format!("detached relay running (pid {})", record.pid))
         }
         Some(record) => {
             // Stale file from a dead process — clean up only our record.
             remove_pid_file_if_matches(&path, &record)?;
-            output::line("relay daemon is not running")
+            output::line(NO_DETACHED_RELAY_MESSAGE)
         }
-        None => output::line("relay daemon is not running"),
+        None => output::line(NO_DETACHED_RELAY_MESSAGE),
     }
 }
 
