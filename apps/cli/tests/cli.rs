@@ -526,16 +526,20 @@ fn help_lists_ready_commands() {
 }
 
 #[test]
-fn daemon_status_explains_that_it_only_checks_detached_relays() {
+fn daemon_status_requires_the_live_control_socket() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
     let state = tmp.path().join("state");
     cli(&config, &state)
         .args(["daemon", "status"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("no detached relay is running"))
-        .stdout(predicate::str::contains("wsmp service status"));
+        .failure()
+        .stderr(predicate::str::contains(
+            "live relay control socket is unavailable",
+        ))
+        .stderr(predicate::str::contains(
+            "service-managed relays cannot be inferred",
+        ));
 }
 
 #[test]

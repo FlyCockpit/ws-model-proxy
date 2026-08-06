@@ -1,4 +1,5 @@
 import ReactMarkdown from "react-markdown";
+import rehypeHighlight from "rehype-highlight";
 import remarkGfm from "remark-gfm";
 
 /**
@@ -40,12 +41,17 @@ export function sanitizeMarkdownUrl(url: string): string {
 }
 
 const markdownClassName =
-  "break-words text-sm leading-relaxed [&_a]:text-primary [&_a]:underline [&_blockquote]:border-l-2 [&_blockquote]:pl-3 [&_code]:rounded [&_code]:bg-background [&_code]:px-1 [&_code]:py-0.5 [&_h1]:text-xl [&_h1]:font-semibold [&_h2]:text-lg [&_h2]:font-semibold [&_li]:ml-5 [&_li]:list-disc [&_ol]:ml-5 [&_ol]:list-decimal [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:border [&_pre]:bg-background [&_pre]:p-3 [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_table]:w-full [&_th]:border [&_th]:p-2 [&_td]:border [&_td]:p-2";
+  "break-words text-sm leading-relaxed [&_a]:text-primary [&_a]:underline [&_a]:decoration-primary/70 [&_a]:underline-offset-2 [&_a]:transition-colors [&_a:hover]:decoration-2 [&_a:focus-visible]:rounded-sm [&_a:focus-visible]:outline-none [&_a:focus-visible]:ring-2 [&_a:focus-visible]:ring-ring [&_a:focus-visible]:ring-offset-2 [&_blockquote]:border-l-2 [&_blockquote]:pl-3 [&_code]:rounded [&_code]:bg-background [&_code]:px-1 [&_code]:py-0.5 [&_h1]:text-xl [&_h1]:font-semibold [&_h2]:text-lg [&_h2]:font-semibold [&_li]:ml-5 [&_li]:list-disc [&_ol]:ml-5 [&_ol]:list-decimal [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:border [&_pre]:bg-background [&_pre]:p-3 [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_table]:w-full [&_th]:border [&_th]:p-2 [&_td]:border [&_td]:p-2";
 
 export function ChatMarkdown({ content }: { content: string }) {
   return (
     <div className={markdownClassName}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml urlTransform={sanitizeMarkdownUrl}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[rehypeHighlight]}
+        skipHtml
+        urlTransform={sanitizeMarkdownUrl}
+      >
         {content}
       </ReactMarkdown>
     </div>

@@ -45,6 +45,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         Command::Daemon(args) => commands::daemon::run(args),
         Command::Service(args) => commands::service::run(args),
         Command::Reload(args) => commands::reload::run(args),
+        Command::Status { json } => commands::daemon::run_status(*json),
         Command::Logout(args) => commands::logout::run(args),
         Command::Completions(args) => commands::completions::run(args),
     }

@@ -12,9 +12,59 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
+#[cfg(unix)]
+use nix::fcntl::{Flock, FlockArg};
+
 use crate::slug::validate_slug;
 
 pub const CONFIG_VERSION: u8 = 1;
+
+/// A short-lived advisory lock shared by every local config mutation.  The
+/// daemon still owns the future control-plane mutation API; this is the
+/// transitional guard that prevents a standalone command from overwriting a
+/// concurrent reload/probe write.
+#[cfg(unix)]
+pub struct ConfigLock {
+    // Keeping the RAII guard alive holds the advisory lock for the critical
+    // section; the field is intentionally otherwise unused.
+    _guard: Flock<std::fs::File>,
+}
+
+#[cfg(not(unix))]
+pub struct ConfigLock;
+
+impl ConfigLock {
+    pub fn exclusive() -> Result<Self> {
+        let config = crate::paths::config_file()?;
+        let directory = config
+            .parent()
+            .context("config path has no parent directory")?;
+        std::fs::create_dir_all(directory)
+            .with_context(|| format!("creating config directory `{}`", directory.display()))?;
+        create_private_dir(directory)?;
+        #[cfg(unix)]
+        {
+            let lock_path = config.with_extension("json.lock");
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .with_context(|| format!("opening config lock `{}`", lock_path.display()))?;
+            let lock = Flock::lock(file, FlockArg::LockExclusive)
+                .map_err(|(_, error)| anyhow::anyhow!(error))
+                .with_context(|| format!("locking config `{}`", config.display()))?;
+            Ok(Self { _guard: lock })
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows does not expose the Unix control plane. Atomic writes
+            // still protect file integrity there; daemon-owned mutations are
+            // required before concurrent Windows writers are supported.
+            Ok(Self)
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -218,13 +268,15 @@ impl OpenAiCompatibleCapabilities {
     }
 
     pub fn with_vision(mut self) -> Self {
-        let mut chat = self.chat_completions.unwrap_or(ChatCompletionsCapabilities {
-            supported: Some(true),
-            streaming: Some(true),
-            vision: None,
-            video: None,
-            audio: None,
-        });
+        let mut chat = self
+            .chat_completions
+            .unwrap_or(ChatCompletionsCapabilities {
+                supported: Some(true),
+                streaming: Some(true),
+                vision: None,
+                video: None,
+                audio: None,
+            });
         chat.vision = Some(true);
         self.chat_completions = Some(chat);
         self
@@ -232,13 +284,15 @@ impl OpenAiCompatibleCapabilities {
 
     /// Chat multimodal `video_url` parts (omni / VLM local stacks such as MiMo).
     pub fn with_video(mut self) -> Self {
-        let mut chat = self.chat_completions.unwrap_or(ChatCompletionsCapabilities {
-            supported: Some(true),
-            streaming: Some(true),
-            vision: None,
-            video: None,
-            audio: None,
-        });
+        let mut chat = self
+            .chat_completions
+            .unwrap_or(ChatCompletionsCapabilities {
+                supported: Some(true),
+                streaming: Some(true),
+                vision: None,
+                video: None,
+                audio: None,
+            });
         chat.video = Some(true);
         self.chat_completions = Some(chat);
         self
@@ -246,13 +300,15 @@ impl OpenAiCompatibleCapabilities {
 
     /// Chat multimodal `input_audio` parts (not dedicated /v1/audio/* endpoints).
     pub fn with_chat_audio(mut self) -> Self {
-        let mut chat = self.chat_completions.unwrap_or(ChatCompletionsCapabilities {
-            supported: Some(true),
-            streaming: Some(true),
-            vision: None,
-            video: None,
-            audio: None,
-        });
+        let mut chat = self
+            .chat_completions
+            .unwrap_or(ChatCompletionsCapabilities {
+                supported: Some(true),
+                streaming: Some(true),
+                vision: None,
+                video: None,
+                audio: None,
+            });
         chat.audio = Some(true);
         self.chat_completions = Some(chat);
         self
@@ -341,6 +397,20 @@ pub struct AudioCapabilities {
 }
 
 impl Config {
+    /// Execute a complete local read-modify-write under the transitional
+    /// exclusive lock. Callers must not call `save` from `update`; this method
+    /// persists the returned candidate before releasing the lock.
+    pub fn update<T>(required: bool, mutate: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let _lock = ConfigLock::exclusive()?;
+        let mut config = if required {
+            Self::load_required()?
+        } else {
+            Self::load()?
+        };
+        let output = mutate(&mut config)?;
+        config.save()?;
+        Ok(output)
+    }
     pub fn load() -> Result<Self> {
         Self::load_from_path(&crate::paths::config_file()?)
     }
@@ -404,6 +474,7 @@ impl Config {
     }
 
     pub fn save_new(&self) -> Result<bool> {
+        let _lock = ConfigLock::exclusive()?;
         let path = crate::paths::config_file()?;
         if path
             .try_exists()

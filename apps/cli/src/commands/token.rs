@@ -32,9 +32,10 @@ pub fn run(args: &Args) -> Result<()> {
             if value.trim().is_empty() {
                 anyhow::bail!("CLI token environment variable `{env_var}` is empty");
             }
-            let mut cfg = Config::load()?;
-            cfg.cli_token_env = Some(env_var.clone());
-            cfg.save()?;
+            Config::update(false, |cfg| {
+                cfg.cli_token_env = Some(env_var.clone());
+                Ok(())
+            })?;
             if args.json {
                 output::json(&TokenLogin {
                     cli_token_env: env_var,

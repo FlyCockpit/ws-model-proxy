@@ -128,7 +128,7 @@ function dedupePools(pools: VisibleModelPoolTarget[]): VisibleModelPoolTarget[] 
 export async function listVisibleModelTargetsForUser(userId: string): Promise<VisibleModelTargets> {
   const [directModelRows, ownedPoolRows, grantedPoolRows] = await Promise.all([
     prisma.discoveredModel.findMany({
-      where: { userId },
+      where: { userId, published: true, Endpoint: { published: true } },
       orderBy: { createdAt: "desc" },
       select: {
         id: true,

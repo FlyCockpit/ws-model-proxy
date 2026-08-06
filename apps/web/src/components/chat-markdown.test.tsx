@@ -34,6 +34,12 @@ describe("ChatMarkdown", () => {
     expect(html).not.toContain("<script>");
   });
 
+  it("highlights fenced code blocks by their declared language", () => {
+    const html = renderToStaticMarkup(<ChatMarkdown content={"```ts\nconst answer = 42;\n```"} />);
+    expect(html).toContain("hljs");
+    expect(html).toContain("hljs-keyword");
+  });
+
   it("sanitizes javascript links", () => {
     const html = renderToStaticMarkup(
       <ChatMarkdown content={"[x](javascript:alert(1)) and [ok](https://example.com)"} />,

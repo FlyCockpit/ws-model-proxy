@@ -21,11 +21,7 @@ pub fn run(args: &Args) -> Result<()> {
     let removed_device_credential = remove_device_credential()?;
     let mut removed_token_env = false;
     if args.token {
-        let mut cfg = Config::load()?;
-        removed_token_env = cfg.cli_token_env.take().is_some();
-        if removed_token_env {
-            cfg.save()?;
-        }
+        removed_token_env = Config::update(false, |cfg| Ok(cfg.cli_token_env.take().is_some()))?;
     }
     if args.json {
         output::json(&LogoutOutput {

@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const RELAY_PROTOCOL_VERSION = "2.0";
+export const RELAY_PROTOCOL_VERSION = "2.1";
 export const RELAY_SUBPROTOCOL = "ws-model-proxy.relay.v2";
 
 const RELAY_JSON_CONTROL_MAX_BYTES = 64 * 1024;
@@ -110,6 +110,9 @@ export type OpenAiCompatibleCapabilities = z.infer<typeof openAiCompatibleCapabi
 const cliCapabilitiesSchema = z
   .object({
     protocolVersion: z.literal(RELAY_PROTOCOL_VERSION),
+    inventoryAck: z.literal(true),
+    inventoryReplace: z.literal(true),
+    endpointTargeting: z.literal(true),
     binaryFrames: z.literal(true),
     cancellation: z.literal(true),
     maxBinaryChunkBytes: z.literal(RELAY_BINARY_CHUNK_MAX_BYTES),
@@ -117,6 +120,19 @@ const cliCapabilitiesSchema = z
     requestBodyWindowChunks: z.literal(RELAY_REQUEST_BODY_WINDOW_CHUNKS),
   })
   .strict();
+
+const legacyCliCapabilitiesSchema = z
+  .object({
+    protocolVersion: z.literal("2.0"),
+    binaryFrames: z.literal(true),
+    cancellation: z.literal(true),
+    maxBinaryChunkBytes: z.literal(RELAY_BINARY_CHUNK_MAX_BYTES),
+    requestBodyStreaming: z.literal(true),
+    requestBodyWindowChunks: z.literal(RELAY_REQUEST_BODY_WINDOW_CHUNKS),
+  })
+  .strict();
+
+const acceptedCliCapabilitiesSchema = z.union([cliCapabilitiesSchema, legacyCliCapabilitiesSchema]);
 
 const discoveredModelSchema = z
   .object({
@@ -147,13 +163,13 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
     .object({
       type: z.literal("hello"),
       id: requestIdSchema,
-      protocolVersion: z.literal(RELAY_PROTOCOL_VERSION),
+      protocolVersion: z.union([z.literal(RELAY_PROTOCOL_VERSION), z.literal("2.0")]),
       cli: z
         .object({
           slug: z.string().trim().min(1).max(63),
           label: z.string().trim().min(1).max(160),
           version: z.string().trim().max(80).optional(),
-          capabilities: cliCapabilitiesSchema,
+          capabilities: acceptedCliCapabilitiesSchema,
         })
         .strict(),
       endpoints: z.array(endpointInventorySchema).max(100).default([]),
@@ -220,8 +236,21 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
 ]);
 export type RelayClientControlMessage = z.infer<typeof relayClientControlMessageSchema>;
 
+export type InventoryRevision = {
+  inventorySeq: number;
+  inventoryDigest: string;
+  inventoryAcknowledgedAt: string;
+};
+
 export type RelayServerControlMessage =
-  | { type: "hello.ok"; id: string; protocolVersion: typeof RELAY_PROTOCOL_VERSION }
+  | {
+      type: "hello.ok";
+      id: string;
+      protocolVersion: typeof RELAY_PROTOCOL_VERSION;
+      revision: InventoryRevision;
+    }
+  | { type: "inventory.ok"; id: string; revision: InventoryRevision }
+  | { type: "inventory.error"; id: string; message: string }
   | { type: "heartbeat.pong"; id: string; receivedAt: string }
   | {
       type: "relay.request";
@@ -238,6 +267,7 @@ export type RelayServerControlMessage =
       path: string;
       headers: Record<string, string>;
       timeoutMs: number;
+      endpointSlug: string;
       // Whether the CLI should expect streamed `relay.request.body` frames for
       // this request (true when the request carries a body). When false the CLI
       // forwards the request to upstream immediately with an empty body.

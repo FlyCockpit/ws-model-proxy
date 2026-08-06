@@ -38,6 +38,8 @@ function memberRow({
   healthStatus = "HEALTHY",
   routingStatus = "ACTIVE",
   cliDeviceId = "cli-1",
+  published = true,
+  endpointPublished = true,
   cliStatus = "CONNECTED",
   nextRetryAt = null,
   halfOpenTrialStartedAt = null,
@@ -47,6 +49,8 @@ function memberRow({
   healthStatus?: PoolMemberRouteRow["healthStatus"];
   routingStatus?: PoolMemberRouteRow["routingStatus"];
   cliDeviceId?: string;
+  published?: boolean;
+  endpointPublished?: boolean;
   cliStatus?: string;
   nextRetryAt?: Date | null;
   halfOpenTrialStartedAt?: Date | null;
@@ -64,9 +68,12 @@ function memberRow({
     nextRetryAt,
     halfOpenTrialStartedAt,
     DiscoveredModel: {
+      published,
       upstreamModelId: `${id}-upstream`,
       Endpoint: {
         id: `${id}-endpoint`,
+        slug: `${id}-endpoint`,
+        published: endpointPublished,
         cliDeviceId,
         status: "ONLINE",
         CliDevice: { status: cliStatus },
@@ -199,6 +206,24 @@ describe("modelPoolRouting", () => {
   it("returns a typed no-routable-member result when every candidate is skipped", () => {
     const result = buildPoolRouteSequence({
       members: [memberRow({ id: "absent", cliDeviceId: "cli-absent" })],
+      activeCliDeviceIds: ["cli-1"],
+      now,
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      reason: "NO_ROUTABLE_POOL_MEMBERS",
+      failureClass: "no_routable_member",
+      retryable: true,
+    });
+  });
+
+  it("skips unpublished models and endpoints", () => {
+    const result = buildPoolRouteSequence({
+      members: [
+        memberRow({ id: "unpublished-model", published: false }),
+        memberRow({ id: "unpublished-endpoint", endpointPublished: false }),
+      ],
       activeCliDeviceIds: ["cli-1"],
       now,
     });

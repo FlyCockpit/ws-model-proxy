@@ -8,6 +8,7 @@ pub mod auth;
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod control;
 pub mod daemon;
 pub mod exit;
 pub mod logging;

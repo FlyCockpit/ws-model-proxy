@@ -3,9 +3,11 @@ import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   parseRelayBinaryFrame,
+  parseRelayClientControlFrame,
   RELAY_REQUEST_BODY_WINDOW_CHUNKS,
   RELAY_STALE_AFTER_MS,
 } from "./protocol.js";
+import { inventoryDigestFor, persistRelayRegistration } from "./registration.js";
 
 const WS_READY_STATE_OPEN = 1;
 
@@ -18,6 +20,7 @@ const { RelaySessionManager } = await import("./session-manager.js");
 const { default: prisma } = await import("@ws-model-proxy/db");
 
 const db = prisma as unknown as {
+  $transaction: MockInstance;
   user: {
     findUnique: MockInstance;
   };
@@ -30,9 +33,12 @@ const db = prisma as unknown as {
   };
   endpoint: {
     upsert: MockInstance;
+    findUnique: MockInstance;
+    updateMany: MockInstance;
   };
   discoveredModel: {
     upsert: MockInstance;
+    updateMany: MockInstance;
   };
   poolMember: {
     updateMany: MockInstance;
@@ -69,12 +75,15 @@ function helloFrame() {
   return JSON.stringify({
     type: "hello",
     id: "hello-id",
-    protocolVersion: "2.0",
+    protocolVersion: "2.1",
     cli: {
       slug: "desktop",
       label: "Desktop",
       capabilities: {
-        protocolVersion: "2.0",
+        protocolVersion: "2.1",
+        inventoryAck: true,
+        inventoryReplace: true,
+        endpointTargeting: true,
         binaryFrames: true,
         cancellation: true,
         maxBinaryChunkBytes: 1024 * 1024,
@@ -114,6 +123,7 @@ function helloFrame() {
 }
 
 function seedRegistrationMocks() {
+  db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) => callback(db));
   db.user.findUnique.mockResolvedValue({ id: "user-id", slug: "owner" });
   db.cliDevice.upsert.mockResolvedValue({
     id: "cli-device-id",
@@ -121,8 +131,17 @@ function seedRegistrationMocks() {
     slug: "desktop",
   });
   db.cliToken.update.mockResolvedValue({ id: "token-id" });
+  db.cliDevice.update.mockResolvedValue({
+    inventorySeq: 1,
+    inventoryDigest: "digest",
+    inventoryAcknowledgedAt: now,
+    id: "cli-device-id",
+  });
+  db.endpoint.findUnique.mockResolvedValue(null);
   db.endpoint.upsert.mockResolvedValue({ id: "endpoint-id", slug: "local-openai" });
+  db.endpoint.updateMany.mockResolvedValue({ count: 0 });
   db.discoveredModel.upsert.mockResolvedValue({ id: "model-id" });
+  db.discoveredModel.updateMany.mockResolvedValue({ count: 0 });
   db.poolMember.updateMany.mockResolvedValue({ count: 1 });
 }
 
@@ -131,6 +150,62 @@ describe("RelaySessionManager", () => {
     vi.clearAllMocks();
     vi.useFakeTimers();
     seedRegistrationMocks();
+  });
+
+  it("matches the shared nonempty Rust inventory digest vector", () => {
+    const parsed = parseRelayClientControlFrame(helloFrame());
+    if (parsed.type !== "hello") throw new Error("expected hello frame");
+    const parsedEndpoint = parsed.endpoints[0];
+    if (!parsedEndpoint) throw new Error("expected endpoint");
+    const endpoint: (typeof parsed.endpoints)[number] = {
+      ...parsedEndpoint,
+      slug: "example",
+      label: "Example",
+      defaultCapabilities: {
+        version: 1,
+        protocol: "openai-compatible",
+        models: { list: true },
+        chatCompletions: { supported: true, streaming: true },
+      },
+      models: [
+        {
+          slug: undefined,
+          upstreamModelId: "model-a",
+          capabilityOverrideMode: "inherit",
+        },
+      ],
+    };
+    expect(inventoryDigestFor([endpoint])).toBe(
+      "52e5e23c121ae39dcc319aa506661ec50474c3c8c645cbe09a8121a47d37bc23",
+    );
+  });
+
+  it("retries a serializable inventory conflict so an identical snapshot keeps one revision", async () => {
+    const parsed = parseRelayClientControlFrame(helloFrame());
+    if (parsed.type !== "hello") throw new Error("expected hello frame");
+    const conflict = Object.assign(new Error("serialization failure"), { code: "P2034" });
+    db.$transaction.mockImplementationOnce(async () => {
+      throw conflict;
+    });
+
+    const registration = await persistRelayRegistration({
+      identity,
+      cli: { slug: parsed.cli.slug, label: parsed.cli.label },
+      endpoints: parsed.endpoints,
+      inventoryConfirmed: true,
+      endpointTargeting: true,
+      now,
+    });
+
+    expect(db.$transaction).toHaveBeenCalledTimes(2);
+    expect(db.$transaction).toHaveBeenLastCalledWith(expect.any(Function), {
+      isolationLevel: "Serializable",
+    });
+    expect(registration.revision).toEqual({
+      inventorySeq: 1,
+      inventoryDigest: "digest",
+      inventoryAcknowledgedAt: now.toISOString(),
+    });
   });
 
   it("registers a CLI session and persists endpoint/model capability metadata without endpoint secrets", async () => {
@@ -144,7 +219,12 @@ describe("RelaySessionManager", () => {
     expect(JSON.parse(String(socket.sends[0]))).toEqual({
       type: "hello.ok",
       id: "hello-id",
-      protocolVersion: "2.0",
+      protocolVersion: "2.1",
+      revision: {
+        inventorySeq: 1,
+        inventoryDigest: "digest",
+        inventoryAcknowledgedAt: now.toISOString(),
+      },
     });
     expect(db.endpoint.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -310,6 +390,7 @@ describe("RelaySessionManager", () => {
 
     manager.sendRelayRequest({
       cliDeviceId: "cli-device-id",
+      endpointSlug: "local-openai",
       requestId: "request-id",
       family: "chat.completions",
       method: "POST",
@@ -367,6 +448,7 @@ describe("RelaySessionManager", () => {
 
     manager.sendRelayRequest({
       cliDeviceId: "cli-device-id",
+      endpointSlug: "local-openai",
       requestId: "request-id",
       family: "chat.completions",
       method: "POST",

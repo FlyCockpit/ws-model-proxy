@@ -28,7 +28,7 @@ pub struct Args {
 }
 
 pub fn run(args: &Args) -> Result<()> {
-    let mut cfg = Config::load_required()?;
+    let cfg = Config::load_required()?;
     let server_url = cfg
         .server_url
         .clone()
@@ -62,8 +62,10 @@ pub fn run(args: &Args) -> Result<()> {
         thread::sleep(interval);
         match exchange_device_code(&server_url, &started.device_code, &args.name, &cli_slug) {
             Ok(credential) => {
-                cfg.cli_slug = Some(cli_slug.clone());
-                cfg.save()?;
+                Config::update(true, |candidate| {
+                    candidate.cli_slug = Some(cli_slug.clone());
+                    Ok(())
+                })?;
                 save_device_credential(&credential)?;
                 if !args.json {
                     output::line("device login complete")?;

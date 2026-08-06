@@ -72,21 +72,31 @@ enum RelayRequestStatus {
 }
 
 model CliDevice {
-  id                   String                @id @default(cuid(2))
-  createdAt            DateTime              @default(now())
-  updatedAt            DateTime              @default(now()) @updatedAt
-  userId               String
-  slug                 String
-  label                String
-  status               CliConnectionStatus   @default(DISCONNECTED)
-  lastConnectedAt      DateTime?
-  lastDisconnectedAt   DateTime?
-  lastHeartbeatAt      DateTime?
-  connectionCount      Int                   @default(0)
-  User                 User                  @relation("CliDeviceOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  CliTokens            CliToken[]
-  CliDeviceCredentials CliDeviceCredential[]
-  Endpoints            Endpoint[]
+  id                      String                @id @default(cuid(2))
+  createdAt               DateTime              @default(now())
+  updatedAt               DateTime              @default(now()) @updatedAt
+  userId                  String
+  slug                    String
+  label                   String
+  status                  CliConnectionStatus   @default(DISCONNECTED)
+  lastConnectedAt         DateTime?
+  lastDisconnectedAt      DateTime?
+  lastHeartbeatAt         DateTime?
+  connectionCount         Int                   @default(0)
+  inventorySeq            Int                   @default(0)
+  inventoryDigest         String?
+  inventoryAcknowledgedAt DateTime?
+  /// True only for a relay that negotiated complete-snapshot acknowledgements
+  /// and endpoint targeting. Legacy 2.0 registration is visible but never
+  /// represented as a confirmed published inventory.
+  inventoryConfirmed      Boolean               @default(false)
+  /// Whether this relay negotiated endpoint-targeted request frames. Legacy
+  /// relays must never be allowed to replace their inventory with >1 endpoint.
+  endpointTargeting       Boolean               @default(false)
+  User                    User                  @relation("CliDeviceOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  CliTokens               CliToken[]
+  CliDeviceCredentials    CliDeviceCredential[]
+  Endpoints               Endpoint[]
 
   @@unique([userId, slug])
   @@index([userId, status])
@@ -155,6 +165,8 @@ model Endpoint {
   lastHealthCheckAt   DateTime?
   statusChangedAt     DateTime?
   failureReasonCode   String?
+  published           Boolean           @default(true)
+  unpublishedAt       DateTime?
   User                User              @relation("EndpointOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   CliDevice           CliDevice         @relation(fields: [cliDeviceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   DiscoveredModels    DiscoveredModel[]
@@ -182,6 +194,8 @@ model DiscoveredModel {
   capabilityOverrideMetadata    Json?
   probeSuggestions              Json?
   lastSeenAt                    DateTime?
+  published                     Boolean                       @default(true)
+  unpublishedAt                 DateTime?
   User                          User                          @relation("DiscoveredModelOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   Endpoint                      Endpoint                      @relation(fields: [endpointId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   PoolMembers                   PoolMember[]

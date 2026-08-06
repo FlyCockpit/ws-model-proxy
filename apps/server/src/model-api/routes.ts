@@ -8,6 +8,7 @@ import {
 } from "@ws-model-proxy/api/lib/model-api-token-access";
 import {
   buildPoolRouteSequence,
+  isPublishedEndpointExecutable,
   isRetryablePoolMemberRelayFailure,
   markPoolMemberRelaySuccess,
   type PoolMemberRouteRow,
@@ -95,9 +96,73 @@ type RelayOperation = {
   capability: ModelApiCapability;
   additionalCapabilities?: ModelApiCapability[];
   stream: boolean;
+  // Chat Test is an internal consumer that can accept a final SSE usage event
+  // derived from the relay's authoritative RelayComplete message. Public
+  // OpenAI-compatible routes retain the upstream byte stream unchanged.
+  appendTerminalUsage?: boolean;
   buildRequest: RelayRequestBuilder;
   responseStickiness?: ResponseStickinessCapture;
 };
+
+function responseBodyForOperation({
+  body,
+  headers,
+  terminal,
+  operation,
+}: {
+  body: ReadableStream<Uint8Array>;
+  headers: Headers;
+  terminal: Promise<RelayAttemptTerminal>;
+  operation: RelayOperation;
+}): ReadableStream<Uint8Array> {
+  if (
+    !operation.appendTerminalUsage ||
+    !operation.stream ||
+    !headers.get("content-type")?.toLowerCase().startsWith("text/event-stream")
+  ) {
+    return body;
+  }
+
+  const reader = body.getReader();
+  const encoder = new TextEncoder();
+  let upstreamEnded = false;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        if (!upstreamEnded) {
+          const chunk = await reader.read();
+          if (!chunk.done) {
+            controller.enqueue(chunk.value);
+            return;
+          }
+          upstreamEnded = true;
+        }
+        const result = await terminal;
+        // Only RelayComplete usage is forwarded. If the CLI did not supply
+        // usage, the UI deliberately leaves throughput unavailable.
+        if (result.ok && result.usage) {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({
+                usage: {
+                  prompt_tokens: result.usage.promptTokens,
+                  completion_tokens: result.usage.completionTokens,
+                  total_tokens: result.usage.totalTokens,
+                },
+              })}\n\n`,
+            ),
+          );
+        }
+        controller.close();
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+}
 
 type PreparedModeledRequest = {
   model: string;
@@ -135,12 +200,15 @@ type StickyRoute =
 
 type DirectModelRelayRow = {
   id: string;
+  published: boolean;
   userId: string;
   upstreamModelId: string;
   capabilityOverrideMode: string;
   capabilityOverrideMetadata: unknown | null;
   Endpoint: {
     id: string;
+    slug: string;
+    published: boolean;
     cliDeviceId: string;
     status: string | null;
     capabilityMetadata: unknown | null;
@@ -428,11 +496,14 @@ function supportsOperation({
 }
 
 function isEndpointConnected(row: DirectModelRelayRow, activeCliDeviceIds: Set<string>): boolean {
-  return (
-    row.Endpoint.status !== "OFFLINE" &&
-    row.Endpoint.CliDevice?.status === "CONNECTED" &&
-    activeCliDeviceIds.has(row.Endpoint.cliDeviceId)
-  );
+  return isPublishedEndpointExecutable({
+    modelPublished: row.published,
+    endpointPublished: row.Endpoint.published,
+    endpointStatus: row.Endpoint.status,
+    cliDeviceId: row.Endpoint.cliDeviceId,
+    cliDeviceStatus: row.Endpoint.CliDevice?.status,
+    activeCliDeviceIds,
+  });
 }
 
 async function readModelApiBody(request: Request): Promise<Uint8Array | Response> {
@@ -884,6 +955,7 @@ async function directModelRow(discoveredModelId: string): Promise<DirectModelRel
     where: { id: discoveredModelId },
     select: {
       id: true,
+      published: true,
       userId: true,
       upstreamModelId: true,
       capabilityOverrideMode: true,
@@ -891,6 +963,8 @@ async function directModelRow(discoveredModelId: string): Promise<DirectModelRel
       Endpoint: {
         select: {
           id: true,
+          slug: true,
+          published: true,
           cliDeviceId: true,
           status: true,
           capabilityMetadata: true,
@@ -921,12 +995,15 @@ async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
         select: {
           id: true,
           userId: true,
+          published: true,
           upstreamModelId: true,
           capabilityOverrideMode: true,
           capabilityOverrideMetadata: true,
           Endpoint: {
             select: {
               id: true,
+              slug: true,
+              published: true,
               cliDeviceId: true,
               status: true,
               capabilityMetadata: true,
@@ -1126,6 +1203,7 @@ async function relayDirect({
   const attempt = startRelayAttempt({
     manager,
     cliDeviceId: selected.Endpoint.cliDeviceId,
+    endpointSlug: selected.Endpoint.slug,
     family: operation.family,
     method: operation.method,
     path: operation.path,
@@ -1162,7 +1240,15 @@ async function relayDirect({
       })
       .catch(metadataUpdateError);
     void finalize;
-    return new Response(started.body, { status: started.status, headers: started.headers });
+    return new Response(
+      responseBodyForOperation({
+        body: started.body,
+        headers: started.headers,
+        terminal: attempt.terminal,
+        operation,
+      }),
+      { status: started.status, headers: started.headers },
+    );
   } catch {
     const terminal = await attempt.terminal;
     cliLease.release();
@@ -1268,6 +1354,7 @@ async function relayPool({
     const attempt = startRelayAttempt({
       manager,
       cliDeviceId: candidate.cliDeviceId,
+      endpointSlug: member.DiscoveredModel.Endpoint.slug,
       family: operation.family,
       method: operation.method,
       path: operation.path,
@@ -1319,7 +1406,15 @@ async function relayPool({
         })
         .catch(metadataUpdateError);
       void finalize;
-      return new Response(started.body, { status: started.status, headers: started.headers });
+      return new Response(
+        responseBodyForOperation({
+          body: started.body,
+          headers: started.headers,
+          terminal: attempt.terminal,
+          operation,
+        }),
+        { status: started.status, headers: started.headers },
+      );
     } catch {
       const terminal = await attempt.terminal;
       cliLease.release();
@@ -1435,6 +1530,7 @@ async function relaySelectedModelNoFailover({
   const attempt = startRelayAttempt({
     manager,
     cliDeviceId: selected.Endpoint.cliDeviceId,
+    endpointSlug: selected.Endpoint.slug,
     family: operation.family,
     method: operation.method,
     path: operation.path,
@@ -1470,7 +1566,15 @@ async function relaySelectedModelNoFailover({
       })
       .catch(metadataUpdateError);
     void finalize;
-    return new Response(started.body, { status: started.status, headers: started.headers });
+    return new Response(
+      responseBodyForOperation({
+        body: started.body,
+        headers: started.headers,
+        terminal: attempt.terminal,
+        operation,
+      }),
+      { status: started.status, headers: started.headers },
+    );
   } catch {
     const terminal = await attempt.terminal;
     cliLease.release();
@@ -1619,6 +1723,7 @@ export async function chatTestCompletionsHandler({
       method: "POST",
       path: "/v1/chat/completions",
       capability: "chat.completions",
+      appendTerminalUsage: true,
     },
     manager,
     limiter,

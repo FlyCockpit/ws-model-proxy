@@ -49,6 +49,8 @@ type SessionState = {
   cliDeviceId: string | null;
   cli: { slug: string; label: string } | null;
   registered: boolean;
+  inventoryConfirmed: boolean;
+  endpointTargeting: boolean;
   unauthenticatedTimer: ReturnType<typeof setTimeout>;
   bodyStreamsByRequest: Map<string, OutboundBodyStream>;
 };
@@ -108,6 +110,8 @@ export class RelaySessionManager {
       cliDeviceId: null,
       cli: null,
       registered: false,
+      inventoryConfirmed: false,
+      endpointTargeting: false,
       unauthenticatedTimer,
       bodyStreamsByRequest: new Map(),
     });
@@ -125,16 +129,29 @@ export class RelaySessionManager {
     }
 
     if (message.type === "hello") {
+      if (message.protocolVersion === "2.0" && message.endpoints.length > 1) {
+        closeWithProtocolError(
+          socket,
+          "Legacy relay clients may publish only one endpoint; upgrade wsmp for multi-endpoint routing.",
+        );
+        await this.removeSession(socket, now);
+        return;
+      }
       try {
         const registration = await persistRelayRegistration({
           identity: session.identity,
           cli: message.cli,
           endpoints: message.endpoints,
+          inventoryConfirmed: message.protocolVersion === RELAY_PROTOCOL_VERSION,
+          endpointTargeting: message.protocolVersion === RELAY_PROTOCOL_VERSION,
+          connection: true,
           now,
         });
         session.cliDeviceId = registration.cliDeviceId;
         session.cli = { slug: message.cli.slug, label: message.cli.label };
         session.registered = true;
+        session.inventoryConfirmed = message.protocolVersion === RELAY_PROTOCOL_VERSION;
+        session.endpointTargeting = message.protocolVersion === RELAY_PROTOCOL_VERSION;
         session.lastHeartbeatAt = now;
         clearTimeout(session.unauthenticatedTimer);
         this.replaceDuplicateSession(session);
@@ -143,6 +160,7 @@ export class RelaySessionManager {
             type: "hello.ok",
             id: message.id,
             protocolVersion: RELAY_PROTOCOL_VERSION,
+            revision: registration.revision,
           }),
         );
       } catch (error) {
@@ -171,12 +189,44 @@ export class RelaySessionManager {
     }
 
     if (message.type === "inventory.update" && session.cli) {
-      await persistRelayRegistration({
-        identity: session.identity,
-        cli: session.cli,
-        endpoints: message.endpoints,
-        now,
-      });
+      if (!session.endpointTargeting && message.endpoints.length > 1) {
+        socket.send(
+          encodeRelayServerControlMessage({
+            type: "inventory.error",
+            id: message.id,
+            message:
+              "Legacy relay clients may publish only one endpoint; upgrade wsmp for multi-endpoint routing.",
+          }),
+        );
+        return;
+      }
+      try {
+        const registration = await persistRelayRegistration({
+          identity: session.identity,
+          cli: session.cli,
+          endpoints: message.endpoints,
+          inventoryConfirmed: session.inventoryConfirmed,
+          endpointTargeting: session.endpointTargeting,
+          now,
+        });
+        socket.send(
+          encodeRelayServerControlMessage({
+            type: "inventory.ok",
+            id: message.id,
+            revision: registration.revision,
+          }),
+        );
+      } catch (error) {
+        const messageText =
+          error instanceof RelayRegistrationError ? error.message : "inventory update failed";
+        socket.send(
+          encodeRelayServerControlMessage({
+            type: "inventory.error",
+            id: message.id,
+            message: messageText,
+          }),
+        );
+      }
       return;
     }
 
@@ -297,6 +347,7 @@ export class RelaySessionManager {
 
   sendRelayRequest({
     cliDeviceId,
+    endpointSlug,
     requestId,
     family,
     method,
@@ -306,6 +357,7 @@ export class RelaySessionManager {
     timeoutMs,
   }: {
     cliDeviceId: string;
+    endpointSlug: string;
     requestId: string;
     family:
       | "chat.completions"
@@ -335,6 +387,7 @@ export class RelaySessionManager {
       path,
       headers: sanitizeRelayRequestHeaders(headers),
       timeoutMs,
+      endpointSlug,
       expectBody: bodyChunks.length > 0,
     };
     session.socket.send(encodeRelayServerControlMessage(control));

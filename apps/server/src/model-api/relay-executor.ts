@@ -93,6 +93,7 @@ function failureForHttpStatus(status: number): RelayFailure | null {
 export function startRelayAttempt({
   manager,
   cliDeviceId,
+  endpointSlug,
   family,
   method,
   path,
@@ -104,6 +105,7 @@ export function startRelayAttempt({
 }: {
   manager: RelayManager;
   cliDeviceId: string;
+  endpointSlug: string;
   family: Extract<RelayServerControlMessage, { type: "relay.request" }>["family"];
   method: string;
   path: string;
@@ -233,6 +235,7 @@ export function startRelayAttempt({
   try {
     manager.sendRelayRequest({
       cliDeviceId,
+      endpointSlug,
       requestId,
       family,
       method,

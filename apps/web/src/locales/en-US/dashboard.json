@@ -9,7 +9,19 @@
     "description": "Inspect connected CLI devices, endpoints, and directly discovered models.",
     "empty": "No CLI devices have registered yet.",
     "lastHeartbeat": "Last heartbeat: {{value}}",
+    "inventoryAcknowledged": "Inventory #{{sequence}} acknowledged: {{value}}",
+    "inventoryUnconfirmed": "Inventory has not been acknowledged",
     "loadFailed": "Failed to load CLI metadata.",
+    "searchLabel": "Search endpoints and models",
+    "healthFilterLabel": "Endpoint health filter",
+    "filters": {
+      "all": "All",
+      "online": "Online",
+      "offline": "Offline",
+      "stale": "Stale"
+    },
+    "searchPlaceholder": "Search model ID, upstream ID, endpoint, or label",
+    "noSearchResults": "No endpoints or models match that search.",
     "title": "CLIs, Endpoints, and Models"
   },
   "chatTest": {
@@ -17,6 +29,7 @@
       "completed": "Response complete.",
       "failed": "Response failed.",
       "fixtureLoaded": "{{count}} message test thread loaded.",
+      "fresh": "Started a fresh chat.",
       "started": "Response started.",
       "stopped": "Response stopped."
     },
@@ -43,14 +56,25 @@
     },
     "fixturePrompt": "Fixture prompt {{index}}",
     "fixtureResponse": "Fixture response {{index}}\n\n```text\nblock {{index}}\n```",
+    "freshChat": "Fresh chat",
     "inputLabel": "Message",
     "inputPlaceholder": "Message",
     "jumpToLatest": "Jump to latest",
     "loadFixture": "Load {{count}}",
+    "metrics": {
+      "ttft": "TTFT {{value}} s",
+      "tokensPerSecond": "{{value}} tok/s after first token ({{count}} completion tokens)",
+      "throughputUnavailable": "Throughput unavailable — upstream did not report completion tokens"
+    },
     "modelPicker": "Model",
     "regenerate": "Regenerate",
     "retry": "Retry",
     "send": "Send",
+    "systemPrompt": {
+      "label": "System prompt (session only)",
+      "placeholder": "Optional instructions for this chat",
+      "help": "Sent as the first message for this chat only. It is not saved."
+    },
     "status": {
       "stopped": "Stopped",
       "streaming": "Streaming",
@@ -64,6 +88,7 @@
   "description": "Operate connected CLIs, model pools, credentials, and relay metadata.",
   "endpoints": {
     "empty": "No endpoints have registered for this CLI.",
+    "failureReason": "Last probe failure: {{reason}}",
     "lastSeen": "Last seen: {{value}}"
   },
   "loadFailed": "Failed to load dashboard.",
@@ -179,6 +204,9 @@
   },
   "status": {
     "stale": "Stale"
+  },
+  "publication": {
+    "unpublished": "Unpublished"
   },
   "title": "Dashboard",
   "tokens": {

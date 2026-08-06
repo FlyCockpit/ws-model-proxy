@@ -72,6 +72,11 @@ type CliDeviceRow = {
   lastDisconnectedAt: Date | null;
   lastHeartbeatAt: Date | null;
   connectionCount: number;
+  inventorySeq: number;
+  inventoryDigest: string | null;
+  inventoryAcknowledgedAt: Date | null;
+  inventoryConfirmed: boolean;
+  endpointTargeting: boolean;
   User: { slug: string };
   Endpoints: EndpointRow[];
 };
@@ -91,6 +96,8 @@ type EndpointRow = {
   lastHealthCheckAt: Date | null;
   statusChangedAt: Date | null;
   failureReasonCode: string | null;
+  published: boolean;
+  unpublishedAt: Date | null;
   DiscoveredModels: DiscoveredModelRow[];
 };
 
@@ -106,6 +113,8 @@ type DiscoveredModelRow = {
   capabilityOverrideMetadata: unknown | null;
   probeSuggestions: unknown | null;
   lastSeenAt: Date | null;
+  published: boolean;
+  unpublishedAt: Date | null;
 };
 
 type ModelPoolRow = {
@@ -305,6 +314,11 @@ function serializeCliDevice(row: CliDeviceRow, now: Date) {
     staleAt,
     isStale: Boolean(staleAt && staleAt <= now),
     connectionCount: row.connectionCount,
+    inventorySeq: row.inventorySeq,
+    inventoryDigest: row.inventoryDigest,
+    inventoryAcknowledgedAt: row.inventoryAcknowledgedAt,
+    inventoryConfirmed: row.inventoryConfirmed,
+    endpointTargeting: row.endpointTargeting,
     endpoints: row.Endpoints.map((endpoint) => ({
       id: endpoint.id,
       createdAt: endpoint.createdAt,
@@ -320,6 +334,8 @@ function serializeCliDevice(row: CliDeviceRow, now: Date) {
       lastHealthCheckAt: endpoint.lastHealthCheckAt,
       statusChangedAt: endpoint.statusChangedAt,
       failureReasonCode: endpoint.failureReasonCode,
+      published: endpoint.published,
+      unpublishedAt: endpoint.unpublishedAt,
       models: endpoint.DiscoveredModels.map((model) => ({
         id: model.id,
         createdAt: model.createdAt,
@@ -338,6 +354,8 @@ function serializeCliDevice(row: CliDeviceRow, now: Date) {
         probeSuggestions: model.probeSuggestions,
         effectiveCapabilities: effectiveCapabilities(endpoint, model),
         lastSeenAt: model.lastSeenAt,
+        published: model.published,
+        unpublishedAt: model.unpublishedAt,
       })),
     })),
   };
@@ -575,6 +593,11 @@ export const forwarderManagementRouter = {
           lastDisconnectedAt: true,
           lastHeartbeatAt: true,
           connectionCount: true,
+          inventorySeq: true,
+          inventoryDigest: true,
+          inventoryAcknowledgedAt: true,
+          inventoryConfirmed: true,
+          endpointTargeting: true,
           User: { select: { slug: true } },
           Endpoints: {
             orderBy: { createdAt: "asc" },
@@ -593,6 +616,8 @@ export const forwarderManagementRouter = {
               lastHealthCheckAt: true,
               statusChangedAt: true,
               failureReasonCode: true,
+              published: true,
+              unpublishedAt: true,
               DiscoveredModels: {
                 orderBy: { createdAt: "asc" },
                 select: {
@@ -607,6 +632,8 @@ export const forwarderManagementRouter = {
                   capabilityOverrideMetadata: true,
                   probeSuggestions: true,
                   lastSeenAt: true,
+                  published: true,
+                  unpublishedAt: true,
                 },
               },
             },

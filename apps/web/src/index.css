@@ -1,1 +1,69 @@
 @import "@ws-model-proxy/ui/globals.css";
+@import "highlight.js/styles/github.css";
+
+/* The upstream GitHub stylesheet only covers light surfaces. The application
+   selects dark mode with `.dark`, so mirror its semantic syntax colors there
+   instead of relying on the OS media preference. */
+.dark .hljs {
+  color: #c9d1d9;
+  background: #0d1117;
+}
+.dark
+  :is(
+    .hljs-doctag,
+    .hljs-keyword,
+    .hljs-meta .hljs-keyword,
+    .hljs-template-tag,
+    .hljs-template-variable,
+    .hljs-type,
+    .hljs-variable.language_
+  ) {
+  color: #ff7b72;
+}
+.dark :is(.hljs-title, .hljs-title.class_, .hljs-title.class_.inherited__, .hljs-title.function_) {
+  color: #d2a8ff;
+}
+.dark
+  :is(
+    .hljs-attr,
+    .hljs-attribute,
+    .hljs-literal,
+    .hljs-meta,
+    .hljs-number,
+    .hljs-operator,
+    .hljs-variable,
+    .hljs-selector-attr,
+    .hljs-selector-class,
+    .hljs-selector-id
+  ) {
+  color: #79c0ff;
+}
+.dark :is(.hljs-regexp, .hljs-string, .hljs-meta .hljs-string) {
+  color: #a5d6ff;
+}
+.dark :is(.hljs-built_in, .hljs-symbol) {
+  color: #ffa657;
+}
+.dark :is(.hljs-comment, .hljs-code, .hljs-formula) {
+  color: #8b949e;
+}
+.dark :is(.hljs-name, .hljs-quote, .hljs-selector-tag, .hljs-selector-pseudo) {
+  color: #7ee787;
+}
+.dark :is(.hljs-subst, .hljs-emphasis, .hljs-strong) {
+  color: #c9d1d9;
+}
+.dark .hljs-section {
+  color: #79c0ff;
+}
+.dark .hljs-bullet {
+  color: #f2cc60;
+}
+.dark .hljs-addition {
+  color: #aff5b4;
+  background-color: #033a16;
+}
+.dark .hljs-deletion {
+  color: #ffdcd7;
+  background-color: #67060c;
+}

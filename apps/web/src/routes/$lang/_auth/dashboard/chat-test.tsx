@@ -3,6 +3,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { env } from "@ws-model-proxy/env/web";
 import { Button } from "@ws-model-proxy/ui/components/button";
+import { Label } from "@ws-model-proxy/ui/components/label";
 import {
   Select,
   SelectContent,
@@ -31,6 +32,7 @@ import {
   type FormEvent,
   type KeyboardEvent,
   useCallback,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -89,6 +91,12 @@ function imagePreviewSrc(image: ChatImage): string {
 
 type MediaConfigResponse = { enabled: boolean; maxUploadBytes: number };
 type SignedMediaUrl = { id: string; url: string; signatureExpiresAt?: string };
+type ChatTimingMetrics = {
+  ttftMs?: number;
+  completionTokens?: number;
+  tokensPerSecond?: number;
+};
+
 type ChatMessage = {
   id: string;
   role: ChatRole;
@@ -97,13 +105,14 @@ type ChatMessage = {
   sourceUserMessageId?: string;
   errorMessage?: string;
   images?: ChatImage[];
+  metrics?: ChatTimingMetrics;
 };
 // OpenAI-shaped content parts used when a message carries images.
 type RelayContentPart =
   | { type: "text"; text: string }
   | { type: "image_url"; image_url: { url: string } };
 type RelayChatMessage = {
-  role: "user" | "assistant";
+  role: "system" | "user" | "assistant";
   content: string | RelayContentPart[];
 };
 
@@ -172,6 +181,11 @@ function relayMessages(
   });
 }
 
+function withSystemPrompt(messages: RelayChatMessage[], systemPrompt: string): RelayChatMessage[] {
+  const content = systemPrompt.trim();
+  return content ? [{ role: "system", content }, ...messages] : messages;
+}
+
 // Collect the media ids referenced by the outgoing thread (through the given
 // user message), so a single /sign call can mint fresh URLs for all of them.
 function collectMediaIds(messages: ChatMessage[], throughUserMessageId?: string): string[] {
@@ -210,6 +224,19 @@ function contentDelta(value: unknown): string {
       return "";
     })
     .join("");
+}
+
+function completionTokens(value: unknown): number | undefined {
+  if (typeof value !== "object" || value === null || !("usage" in value)) return undefined;
+  const usage = value.usage;
+  if (typeof usage !== "object" || usage === null) return undefined;
+  const tokens =
+    "completion_tokens" in usage
+      ? usage.completion_tokens
+      : "completionTokens" in usage
+        ? usage.completionTokens
+        : undefined;
+  return typeof tokens === "number" && Number.isFinite(tokens) && tokens >= 0 ? tokens : undefined;
 }
 
 async function readErrorMessage(response: Response, fallback: string) {
@@ -332,7 +359,8 @@ async function streamChatCompletion({
   signal: AbortSignal;
   onDelta: (delta: string) => void;
   fallbackErrorMessage: string;
-}) {
+}): Promise<ChatTimingMetrics> {
+  const startedAt = performance.now();
   const response = await fetch(`${env.VITE_SERVER_URL}/api/internal/chat-test/chat/completions`, {
     method: "POST",
     credentials: "include",
@@ -355,6 +383,8 @@ async function streamChatCompletion({
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let firstVisibleDeltaAt: number | undefined;
+  let reportedCompletionTokens: number | undefined;
 
   const processEvent = (event: string) => {
     const data = event
@@ -365,8 +395,13 @@ async function streamChatCompletion({
       .trim();
     if (!data || data === "[DONE]") return;
     const parsed: unknown = JSON.parse(data);
+    const usage = completionTokens(parsed);
+    if (usage !== undefined) reportedCompletionTokens = usage;
     const delta = contentDelta(parsed);
-    if (delta) onDelta(delta);
+    if (delta) {
+      firstVisibleDeltaAt ??= performance.now();
+      onDelta(delta);
+    }
   };
 
   while (true) {
@@ -380,6 +415,16 @@ async function streamChatCompletion({
 
   buffer += decoder.decode();
   if (buffer.trim()) processEvent(buffer);
+
+  const completedAt = performance.now();
+  const ttftMs = firstVisibleDeltaAt === undefined ? undefined : firstVisibleDeltaAt - startedAt;
+  const tokensPerSecond =
+    reportedCompletionTokens === undefined ||
+    firstVisibleDeltaAt === undefined ||
+    completedAt <= firstVisibleDeltaAt
+      ? undefined
+      : reportedCompletionTokens / ((completedAt - firstVisibleDeltaAt) / 1000);
+  return { ttftMs, completionTokens: reportedCompletionTokens, tokensPerSecond };
 }
 
 function isAbortError(error: unknown) {
@@ -404,6 +449,9 @@ function ChatTestPage() {
   const mediaMaxUploadBytes = mediaConfig?.maxUploadBytes ?? 0;
   const [selectedModelId, setSelectedModelId] = useState("");
   const [draft, setDraft] = useState("");
+  const [systemPrompt, setSystemPrompt] = useState("");
+  const systemPromptId = useId();
+  const systemPromptHelpId = `${systemPromptId}-help`;
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [announcement, setAnnouncement] = useState("");
   const [attachments, setAttachments] = useState<ChatImage[]>([]);
@@ -610,7 +658,7 @@ function ChatTestPage() {
       activeAssistantIdRef.current = assistantId;
       setAnnouncement(t("dashboard:chatTest.announcements.started"));
       try {
-        await streamChatCompletion({
+        const metrics = await streamChatCompletion({
           model: modelId,
           messages: relayInput,
           signal: controller.signal,
@@ -626,11 +674,11 @@ function ChatTestPage() {
             scroll.markContentChanged();
           },
         });
-        updateAssistant(assistantId, { status: "ready" });
+        updateAssistant(assistantId, { status: "ready", metrics });
         setAnnouncement(t("dashboard:chatTest.announcements.completed"));
       } catch (error) {
         if (controller.signal.aborted || isAbortError(error)) {
-          updateAssistant(assistantId, { status: "stopped" });
+          updateAssistant(assistantId, { status: "stopped", metrics: undefined });
           setAnnouncement(t("dashboard:chatTest.announcements.stopped"));
         } else {
           const message =
@@ -678,7 +726,10 @@ function ChatTestPage() {
       if (mediaIds.length === 0) {
         return {
           ok: true,
-          relayInput: relayMessages(threadMessages, throughUserMessageId, () => ""),
+          relayInput: withSystemPrompt(
+            relayMessages(threadMessages, throughUserMessageId, () => ""),
+            systemPrompt,
+          ),
         };
       }
       const signed = await signMediaUrls(mediaIds);
@@ -699,14 +750,13 @@ function ChatTestPage() {
       }
       return {
         ok: true,
-        relayInput: relayMessages(
-          threadMessages,
-          throughUserMessageId,
-          (id) => signed.urls.get(id) ?? "",
+        relayInput: withSystemPrompt(
+          relayMessages(threadMessages, throughUserMessageId, (id) => signed.urls.get(id) ?? ""),
+          systemPrompt,
         ),
       };
     },
-    [markMediaExpired],
+    [markMediaExpired, systemPrompt],
   );
 
   const handleSend = useCallback(
@@ -739,10 +789,9 @@ function ChatTestPage() {
       // re-sends every embedded image, so the whole thread is measured; uploaded
       // attachments only contribute a short signed URL (placeholder here), so the
       // guards effectively count just base64 attachments.
-      const estimateInput = relayMessages(
-        nextMessages,
-        userMessage.id,
-        () => MEDIA_URL_PLACEHOLDER,
+      const estimateInput = withSystemPrompt(
+        relayMessages(nextMessages, userMessage.id, () => MEDIA_URL_PLACEHOLDER),
+        systemPrompt,
       );
       const estimatedBytes = estimateRequestBytes(effectiveModelId, estimateInput);
       if (estimatedBytes > TOTAL_REQUEST_HARD_MAX_BYTES) {
@@ -788,6 +837,7 @@ function ChatTestPage() {
       attachments,
       buildSignedRelayInput,
       draft,
+      systemPrompt,
       effectiveModelId,
       isProcessingImages,
       isStreaming,
@@ -884,6 +934,17 @@ function ChatTestPage() {
     );
   }, [scroll, t]);
 
+  const startFreshChat = useCallback(() => {
+    if (isStreaming || isPreparingSend) return;
+    scroll.markUserIntent();
+    setMessages([]);
+    setDraft("");
+    setSystemPrompt("");
+    setAttachments([]);
+    setAttachmentNotice("");
+    setAnnouncement(t("dashboard:chatTest.announcements.fresh"));
+  }, [isPreparingSend, isStreaming, scroll, t]);
+
   if (visibleModelsIsPending) {
     return <ChatTestSkeleton />;
   }
@@ -923,6 +984,15 @@ function ChatTestPage() {
               ))}
             </SelectContent>
           </Select>
+          <Button
+            type="button"
+            variant="outline"
+            size="touch"
+            disabled={isStreaming || isPreparingSend}
+            onClick={startFreshChat}
+          >
+            {t("dashboard:chatTest.freshChat")}
+          </Button>
           {import.meta.env.DEV ? (
             <Button type="button" variant="outline" size="touch" onClick={loadFixture}>
               <FlaskConical className="size-4" />
@@ -983,6 +1053,23 @@ function ChatTestPage() {
         onDrop={handleDrop}
       >
         <div className="mx-auto flex max-w-4xl flex-col gap-2">
+          <div className="space-y-1.5">
+            <Label htmlFor={systemPromptId} className="text-xs text-muted-foreground">
+              {t("dashboard:chatTest.systemPrompt.label")}
+            </Label>
+            <Textarea
+              id={systemPromptId}
+              value={systemPrompt}
+              onChange={(event) => setSystemPrompt(event.target.value)}
+              disabled={options.length === 0 || isStreaming}
+              placeholder={t("dashboard:chatTest.systemPrompt.placeholder")}
+              aria-describedby={systemPromptHelpId}
+              className="min-h-[44px] resize-y text-sm"
+            />
+            <p id={systemPromptHelpId} className="text-xs text-muted-foreground">
+              {t("dashboard:chatTest.systemPrompt.help")}
+            </p>
+          </div>
           {attachments.length > 0 ? (
             <ul
               className="flex flex-wrap gap-2"
@@ -1166,6 +1253,20 @@ function MessageBubble({
       ) : message.images && message.images.length > 0 ? null : (
         <p className="text-sm text-muted-foreground">{t("dashboard:chatTest.status.waiting")}</p>
       )}
+      {isAssistant && message.metrics?.ttftMs !== undefined ? (
+        <p className="mt-3 text-xs tabular-nums text-muted-foreground">
+          {t("dashboard:chatTest.metrics.ttft", {
+            value: (message.metrics.ttftMs / 1000).toFixed(2),
+          })}
+          <span aria-hidden="true"> · </span>
+          {message.metrics.tokensPerSecond !== undefined
+            ? t("dashboard:chatTest.metrics.tokensPerSecond", {
+                value: message.metrics.tokensPerSecond.toFixed(1),
+                count: message.metrics.completionTokens ?? 0,
+              })
+            : t("dashboard:chatTest.metrics.throughputUnavailable")}
+        </p>
+      ) : null}
       {message.status === "error" && message.errorMessage ? (
         <p className="mt-3 rounded-md border border-destructive/30 bg-destructive/10 p-2 text-sm text-destructive">
           {message.errorMessage}

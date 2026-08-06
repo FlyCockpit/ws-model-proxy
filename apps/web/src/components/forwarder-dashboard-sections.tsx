@@ -52,6 +52,7 @@ type TokenPreview = Awaited<ReturnType<AppRouterClient["modelApiTokens"]["previe
 type RelayRow = Awaited<ReturnType<AppRouterClient["relayMetadata"]["listOwn"]>>[number];
 type ScopeMode = "ALL_VISIBLE" | "ALLOWLIST";
 type RoutingStatus = "ACTIVE" | "DRAINING" | "DISABLED";
+type EndpointHealthFilter = "all" | "online" | "offline" | "stale";
 type DeleteTarget =
   | { kind: "cli"; id: string; label: string }
   | { kind: "endpoint"; id: string; label: string }
@@ -180,7 +181,46 @@ export function CliEndpointsModelsSection() {
     isPending: devicesIsPending,
     isError: devicesIsError,
     refetch: refetchDevices,
-  } = useQuery(orpc.forwarderManagement.listCliDevices.queryOptions());
+  } = useQuery({
+    ...orpc.forwarderManagement.listCliDevices.queryOptions(),
+  });
+  const [search, setSearch] = useState("");
+  const [healthFilter, setHealthFilter] = useState<EndpointHealthFilter>("all");
+  const matchingDevices = useMemo(() => {
+    const needle = search.trim().toLocaleLowerCase();
+    return (devicesData ?? []).flatMap((device) => {
+      const deviceMatches = [device.slug, device.label].some((value) =>
+        value.toLocaleLowerCase().includes(needle),
+      );
+      const endpoints = device.endpoints.flatMap((endpoint) => {
+        const matchesHealth =
+          healthFilter === "all" ||
+          (healthFilter === "online" && endpoint.status === "ONLINE") ||
+          (healthFilter === "offline" && endpoint.status === "OFFLINE") ||
+          (healthFilter === "stale" && device.isStale);
+        if (!matchesHealth) return [];
+        if (!needle) return [{ ...endpoint }];
+        const endpointMatches = [endpoint.slug, endpoint.label].some((value) =>
+          value.toLocaleLowerCase().includes(needle),
+        );
+        const models = endpoint.models.filter((model) =>
+          [model.canonicalModelId, model.upstreamModelId].some((value) =>
+            value.toLocaleLowerCase().includes(needle),
+          ),
+        );
+        if (!endpointMatches && models.length === 0) return [];
+        return [{ ...endpoint, models: endpointMatches ? endpoint.models : models }];
+      });
+      if (!needle) {
+        if (healthFilter === "all") return [{ ...device, endpoints }];
+        return endpoints.length > 0 ? [{ ...device, endpoints }] : [];
+      }
+      if (!deviceMatches && endpoints.length === 0) return [];
+      // A device-name search expands the matching device, but must not undo an
+      // active endpoint-health filter. `endpoints` is already filtered above.
+      return [{ ...device, endpoints }];
+    });
+  }, [devicesData, healthFilter, search]);
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
 
   const removeCli = useMutation(
@@ -223,13 +263,42 @@ export function CliEndpointsModelsSection() {
       <SectionHeader
         title={t("dashboard:clis.title")}
         description={t("dashboard:clis.description")}
+        action={
+          <div className="flex w-full flex-col gap-2 sm:w-auto sm:items-end">
+            <Input
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder={t("dashboard:clis.searchPlaceholder")}
+              aria-label={t("dashboard:clis.searchLabel")}
+              className="min-h-11 w-full sm:w-80"
+            />
+            <div
+              className="flex flex-wrap gap-1"
+              aria-label={t("dashboard:clis.healthFilterLabel")}
+            >
+              {(["all", "online", "offline", "stale"] as const).map((filter) => (
+                <Button
+                  key={filter}
+                  type="button"
+                  size="touch"
+                  variant={healthFilter === filter ? "secondary" : "ghost"}
+                  onClick={() => setHealthFilter(filter)}
+                >
+                  {t(`dashboard:clis.filters.${filter}`)}
+                </Button>
+              ))}
+            </div>
+          </div>
+        }
       />
 
       {devicesData.length === 0 ? (
         <EmptyState>{t("dashboard:clis.empty")}</EmptyState>
+      ) : matchingDevices.length === 0 ? (
+        <EmptyState>{t("dashboard:clis.noSearchResults")}</EmptyState>
       ) : (
         <div className="space-y-4">
-          {devicesData.map((device) => (
+          {matchingDevices.map((device) => (
             <div key={device.id} className="rounded-md border">
               <div className="flex flex-col gap-3 border-b p-4 sm:flex-row sm:items-start sm:justify-between">
                 <div className="min-w-0">
@@ -245,6 +314,14 @@ export function CliEndpointsModelsSection() {
                     {t("dashboard:clis.lastHeartbeat", {
                       value: formatDate(device.lastHeartbeatAt),
                     })}
+                  </p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {device.inventoryConfirmed && device.inventoryAcknowledgedAt
+                      ? t("dashboard:clis.inventoryAcknowledged", {
+                          sequence: device.inventorySeq,
+                          value: formatDate(device.inventoryAcknowledgedAt),
+                        })
+                      : t("dashboard:clis.inventoryUnconfirmed")}
                   </p>
                 </div>
                 <Button
@@ -274,6 +351,11 @@ export function CliEndpointsModelsSection() {
                             <h4 className="text-sm font-medium">{endpoint.label}</h4>
                             <StatusPill>{endpoint.status}</StatusPill>
                             <StatusPill muted>{endpoint.kind}</StatusPill>
+                            {!endpoint.published ? (
+                              <StatusPill muted>
+                                {t("dashboard:publication.unpublished")}
+                              </StatusPill>
+                            ) : null}
                           </div>
                           <p className="mt-1 font-mono text-xs text-muted-foreground">
                             {device.slug}/{endpoint.slug}
@@ -283,6 +365,13 @@ export function CliEndpointsModelsSection() {
                               value: formatDate(endpoint.lastSeenAt),
                             })}
                           </p>
+                          {endpoint.failureReasonCode ? (
+                            <p className="mt-1 text-xs text-destructive">
+                              {t("dashboard:endpoints.failureReason", {
+                                reason: endpoint.failureReasonCode,
+                              })}
+                            </p>
+                          ) : null}
                         </div>
                         <Button
                           type="button"
@@ -329,6 +418,11 @@ export function CliEndpointsModelsSection() {
                                   <code className="font-mono text-xs">
                                     {model.canonicalModelId}
                                   </code>
+                                  {!model.published ? (
+                                    <StatusPill muted>
+                                      {t("dashboard:publication.unpublished")}
+                                    </StatusPill>
+                                  ) : null}
                                   <p className="mt-1 text-muted-foreground">
                                     {t("dashboard:models.immutable")}
                                   </p>

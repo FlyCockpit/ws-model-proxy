@@ -15,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use clap::Subcommand;
 
+use crate::control::{self, ControlCommand};
 use crate::output;
 
 const PID_FILE_VERSION: u32 = 1;
@@ -44,8 +45,12 @@ enum CommandName {
     },
     /// Stop a relay started with `wsmp daemon start --detach`.
     Stop,
-    /// Print whether a detached relay process is running.
-    Status,
+    /// Print live relay connection and published-inventory status.
+    Status {
+        /// Emit a stable JSON status object.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,7 +75,7 @@ pub fn run(args: &Args) -> Result<()> {
         CommandName::Start { detach, .. } if *detach => start_detached(),
         CommandName::Start { detach_token, .. } => run_foreground(detach_token.as_deref()),
         CommandName::Stop => stop(),
-        CommandName::Status => status(),
+        CommandName::Status { json } => run_status(*json),
     }
 }
 
@@ -521,19 +526,138 @@ fn stop() -> Result<()> {
     }
 }
 
-fn status() -> Result<()> {
-    let path = pid_file()?;
-    match read_pid_record(&path)? {
-        Some(record) if live_detached_owner(&record) => {
-            output::line(format!("detached relay running (pid {})", record.pid))
+pub fn run_status(json: bool) -> Result<()> {
+    match control::request(ControlCommand::Status) {
+        Ok(response) => {
+            if json {
+                return output::json(&response);
+            }
+            for line in format_live_status(&response) {
+                output::line(line)?;
+            }
+            return Ok(());
         }
-        Some(record) => {
-            // Stale file from a dead process — clean up only our record.
-            remove_pid_file_if_matches(&path, &record)?;
-            output::line(NO_DETACHED_RELAY_MESSAGE)
-        }
-        None => output::line(NO_DETACHED_RELAY_MESSAGE),
+        Err(control_error) => return report_control_status_failure(json, control_error),
     }
+}
+
+fn report_control_status_failure(json: bool, control_error: anyhow::Error) -> Result<()> {
+    let path = pid_file()?;
+    let detached_pid = match read_pid_record(&path)? {
+        Some(record) if live_detached_owner(&record) => Some(record.pid),
+        Some(record) => {
+            remove_pid_file_if_matches(&path, &record)?;
+            None
+        }
+        None => None,
+    };
+    let (state, message) = control_status_failure_details(&control_error, detached_pid);
+    if json {
+        output::json(&serde_json::json!({
+            "ok": false,
+            "state": state,
+            "message": message,
+        }))?;
+    }
+    anyhow::bail!(message)
+}
+
+fn control_status_failure_details(
+    control_error: &anyhow::Error,
+    detached_pid: Option<u32>,
+) -> (&'static str, String) {
+    match detached_pid {
+        Some(pid) => (
+            "detached_uncontrolled",
+            format!(
+                "detached relay process is running (pid {pid}), but its control socket is unavailable: {control_error:#}"
+            ),
+        ),
+        None => (
+            "control_unavailable",
+            format!(
+                "live relay control socket is unavailable; foreground and service-managed relays cannot be inferred from a detached PID file: {control_error:#}"
+            ),
+        ),
+    }
+}
+
+fn format_live_status(response: &serde_json::Value) -> Vec<String> {
+    let state = response
+        .get("connection")
+        .or_else(|| response.get("state"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let desired_digest = response
+        .get("desiredInventoryDigest")
+        .and_then(serde_json::Value::as_str);
+    let acknowledged_digest = response
+        .get("inventoryDigest")
+        .and_then(serde_json::Value::as_str);
+    let publication =
+        if response.get("state").and_then(serde_json::Value::as_str) == Some("rejected") {
+            "rejected"
+        } else {
+            match (desired_digest, acknowledged_digest) {
+                (Some(desired), Some(acknowledged)) if desired == acknowledged => "current",
+                (_, Some(_)) => "pending",
+                _ => "unconfirmed",
+            }
+        };
+    let mut lines = vec![format!("connection: {state}")];
+    if let Some(digest) = desired_digest {
+        let modified = response
+            .get("configModifiedAtMs")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| format!(" (mtime {value} ms)"))
+            .unwrap_or_default();
+        lines.push(format!("config: desired digest {digest}{modified}"));
+    }
+    match (
+        response.get("inventorySeq").and_then(serde_json::Value::as_u64),
+        acknowledged_digest,
+        response
+            .get("inventoryAcknowledgedAt")
+            .and_then(serde_json::Value::as_str),
+    ) {
+        (Some(sequence), Some(digest), Some(acknowledged_at)) => lines.push(format!(
+            "published: {publication}; inventory sequence {sequence}, digest {digest}, acknowledged at {acknowledged_at}"
+        )),
+        _ => lines.push(format!("published: {publication}")),
+    }
+    if let Some(endpoints) = response
+        .get("desiredEndpoints")
+        .and_then(serde_json::Value::as_array)
+    {
+        lines.push("endpoint  enabled  local probe  models  published".to_string());
+        for endpoint in endpoints {
+            let slug = endpoint
+                .get("slug")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let enabled = endpoint
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let probe = endpoint
+                .get("localProbe")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let models = endpoint
+                .get("modelCount")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let published = endpoint
+                .get("published")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unconfirmed");
+            lines.push(format!(
+                "{slug}  {}  {probe}  {models}  {published}",
+                if enabled { "yes" } else { "no" }
+            ));
+        }
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -577,10 +701,70 @@ mod tests {
     fn detached_command_line_requires_the_record_token() {
         let command = "wsmp daemon start --foreground --detach-token token-123";
         assert!(cmdline_looks_like_detached_daemon(command, "token-123"));
-        assert!(!cmdline_looks_like_detached_daemon(command, "different-token"));
+        assert!(!cmdline_looks_like_detached_daemon(
+            command,
+            "different-token"
+        ));
         assert!(!cmdline_looks_like_detached_daemon(
             "wsmp daemon start --foreground",
             "token-123"
         ));
+    }
+
+    #[test]
+    fn human_status_distinguishes_pending_desired_inventory() {
+        let lines = format_live_status(&serde_json::json!({
+            "connection": "connected",
+            "desiredInventoryDigest": "desired-digest",
+            "configModifiedAtMs": 42,
+            "inventorySeq": 7,
+            "inventoryDigest": "acknowledged-digest",
+            "inventoryAcknowledgedAt": "2026-08-05T00:00:00Z",
+            "desiredEndpoints": [{
+                "slug": "local",
+                "enabled": true,
+                "localProbe": "online",
+                "modelCount": 2,
+                "published": "pending"
+            }]
+        }));
+
+        assert!(lines.iter().any(|line| line == "connection: connected"));
+        assert!(lines.iter().any(|line| line.contains("published: pending")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "local  yes  online  2  pending")
+        );
+    }
+
+    #[test]
+    fn human_status_reports_a_server_rejection_without_calling_it_pending() {
+        let lines = format_live_status(&serde_json::json!({
+            "state": "rejected",
+            "connection": "connected",
+            "desiredInventoryDigest": "rejected-digest",
+            "inventoryDigest": "acknowledged-digest",
+            "desiredEndpoints": [{
+                "slug": "local",
+                "enabled": true,
+                "localProbe": "online",
+                "modelCount": 1,
+                "published": "rejected"
+            }]
+        }));
+
+        assert!(lines.iter().any(|line| line == "published: rejected"));
+        assert!(!lines.iter().any(|line| line.contains("published: pending")));
+    }
+
+    #[test]
+    fn control_socket_failure_is_not_reported_as_a_healthy_detached_daemon() {
+        let error = anyhow::anyhow!("control response timed out");
+        let (state, message) = control_status_failure_details(&error, Some(4242));
+
+        assert_eq!(state, "detached_uncontrolled");
+        assert!(message.contains("pid 4242"));
+        assert!(message.contains("control response timed out"));
     }
 }

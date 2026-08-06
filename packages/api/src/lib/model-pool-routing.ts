@@ -56,9 +56,12 @@ export type PoolMemberRouteRow = {
   nextRetryAt: Date | null;
   halfOpenTrialStartedAt: Date | null;
   DiscoveredModel: {
+    published: boolean;
     upstreamModelId: string;
     Endpoint: {
       id: string;
+      slug: string;
+      published: boolean;
       cliDeviceId: string;
       status?: string | null;
       CliDevice?: {
@@ -231,6 +234,30 @@ function effectiveHealthStatusForRouting(
   return null;
 }
 
+export function isPublishedEndpointExecutable({
+  modelPublished,
+  endpointPublished,
+  endpointStatus,
+  cliDeviceId,
+  cliDeviceStatus,
+  activeCliDeviceIds,
+}: {
+  modelPublished: boolean;
+  endpointPublished: boolean;
+  endpointStatus: string | null | undefined;
+  cliDeviceId: string;
+  cliDeviceStatus: string | null | undefined;
+  activeCliDeviceIds: Set<string>;
+}): boolean {
+  return (
+    modelPublished &&
+    endpointPublished &&
+    endpointStatus !== "OFFLINE" &&
+    cliDeviceStatus === "CONNECTED" &&
+    activeCliDeviceIds.has(cliDeviceId)
+  );
+}
+
 export function routablePoolMembers({
   members,
   activeCliDeviceIds,
@@ -247,10 +274,19 @@ export function routablePoolMembers({
     const endpoint = member.DiscoveredModel.Endpoint;
     const healthStatus = effectiveHealthStatusForRouting(member, now);
     if (healthStatus === null) continue;
+    if (
+      !isPublishedEndpointExecutable({
+        modelPublished: member.DiscoveredModel.published,
+        endpointPublished: endpoint.published,
+        endpointStatus: endpoint.status,
+        cliDeviceId: endpoint.cliDeviceId,
+        cliDeviceStatus: endpoint.CliDevice?.status,
+        activeCliDeviceIds: activeCliDeviceIdSet,
+      })
+    )
+      continue;
     if (member.routingStatus !== "ACTIVE") continue;
     if (member.weight <= 0) continue;
-    if (!activeCliDeviceIdSet.has(endpoint.cliDeviceId)) continue;
-    if (endpoint.CliDevice?.status !== "CONNECTED") continue;
 
     candidates.push({
       poolMemberId: member.id,
@@ -401,10 +437,13 @@ export async function selectPoolRouteSequence({
       halfOpenTrialStartedAt: true,
       DiscoveredModel: {
         select: {
+          published: true,
           upstreamModelId: true,
           Endpoint: {
             select: {
               id: true,
+              slug: true,
+              published: true,
               cliDeviceId: true,
               status: true,
               CliDevice: { select: { status: true } },

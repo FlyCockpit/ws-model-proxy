@@ -78,10 +78,6 @@ fn add_endpoint(json: bool, args: &AddArgs) -> Result<()> {
         .iter()
         .map(|raw| parse_header_env(raw))
         .collect::<Result<Vec<_>>>()?;
-    let mut cfg = Config::load()?;
-    if cfg.endpoint(&args.slug).is_some() {
-        anyhow::bail!("endpoint `{}` already exists", args.slug);
-    }
     let endpoint = EndpointConfig {
         slug: args.slug.clone(),
         label: args.label.clone(),
@@ -92,8 +88,13 @@ fn add_endpoint(json: bool, args: &AddArgs) -> Result<()> {
         default_capabilities: OpenAiCompatibleCapabilities::default(),
         ..EndpointConfig::default()
     };
-    cfg.endpoints.push(endpoint.clone());
-    cfg.save()?;
+    Config::update(false, |cfg| {
+        if cfg.endpoint(&args.slug).is_some() {
+            anyhow::bail!("endpoint `{}` already exists", args.slug);
+        }
+        cfg.endpoints.push(endpoint.clone());
+        Ok(())
+    })?;
     if json {
         output::json(&endpoint)?;
     } else {
@@ -103,14 +104,15 @@ fn add_endpoint(json: bool, args: &AddArgs) -> Result<()> {
 }
 
 fn remove_endpoint(json: bool, slug: &str) -> Result<()> {
-    let mut cfg = Config::load_required()?;
-    let before = cfg.endpoints.len();
-    cfg.endpoints.retain(|endpoint| endpoint.slug != slug);
-    let removed = before != cfg.endpoints.len();
-    if !removed {
-        anyhow::bail!("endpoint `{slug}` not found");
-    }
-    cfg.save()?;
+    let removed = Config::update(true, |cfg| {
+        let before = cfg.endpoints.len();
+        cfg.endpoints.retain(|endpoint| endpoint.slug != slug);
+        let removed = before != cfg.endpoints.len();
+        if !removed {
+            anyhow::bail!("endpoint `{slug}` not found");
+        }
+        Ok(removed)
+    })?;
     if json {
         output::json(&RemoveResult { slug, removed })?;
     } else {
@@ -144,7 +146,9 @@ fn list_endpoints(json: bool) -> Result<()> {
 }
 
 fn probe_endpoints(json: bool, args: &ProbeArgs) -> Result<()> {
-    let mut cfg = Config::load_required()?;
+    // Probe outside the lock so an unavailable upstream cannot starve ordinary
+    // config changes. Applying the reports reacquires and rereads under lock.
+    let cfg = Config::load_required()?;
     let endpoints = cfg
         .endpoints
         .iter()
@@ -159,10 +163,12 @@ fn probe_endpoints(json: bool, args: &ProbeArgs) -> Result<()> {
         .map(probe_endpoint)
         .collect::<Vec<ProbeReport>>();
     if args.apply {
-        for report in &reports {
-            apply_probe_report(&mut cfg, report)?;
-        }
-        cfg.save()?;
+        Config::update(true, |candidate| {
+            for report in &reports {
+                apply_probe_report(candidate, report)?;
+            }
+            Ok(())
+        })?;
     }
     if json {
         output::json(&ProbeOutput {

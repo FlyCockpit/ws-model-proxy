@@ -1,5 +1,7 @@
 //! OpenAI-compatible endpoint probing.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -57,9 +59,15 @@ pub fn probe_endpoint(endpoint: &EndpointConfig) -> ProbeReport {
     }
 }
 
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
     let url = models_url(&endpoint.base_url)?;
-    let mut request = ureq::get(url.as_str()).header("Accept", "application/json");
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(PROBE_TIMEOUT))
+        .build()
+        .into();
+    let mut request = agent.get(url.as_str()).header("Accept", "application/json");
     for header in &endpoint.headers {
         let value = std::env::var(&header.env).with_context(|| {
             format!(

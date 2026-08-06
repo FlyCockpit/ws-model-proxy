@@ -66,10 +66,11 @@ pub fn run(args: &Args) -> Result<()> {
             }
         }
         Sub::SetServer { url } => {
-            let mut cfg = Config::load()?;
             url::Url::parse(url).with_context(|| format!("parsing server URL `{url}`"))?;
-            cfg.server_url = Some(url.clone());
-            cfg.save()?;
+            Config::update(false, |cfg| {
+                cfg.server_url = Some(url.clone());
+                Ok(())
+            })?;
             if args.json {
                 output::json(&SetValue {
                     key: "serverUrl",
@@ -81,9 +82,10 @@ pub fn run(args: &Args) -> Result<()> {
         }
         Sub::SetSlug { slug } => {
             validate_slug(slug)?;
-            let mut cfg = Config::load()?;
-            cfg.cli_slug = Some(slug.clone());
-            cfg.save()?;
+            Config::update(false, |cfg| {
+                cfg.cli_slug = Some(slug.clone());
+                Ok(())
+            })?;
             if args.json {
                 output::json(&SetValue {
                     key: "cliSlug",

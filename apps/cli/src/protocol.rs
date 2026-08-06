@@ -2,10 +2,12 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::config::{CapabilityOverrideMode, EndpointConfig, OpenAiCompatibleCapabilities};
 
-pub const RELAY_PROTOCOL_VERSION: &str = "2.0";
+pub const RELAY_PROTOCOL_VERSION: &str = "2.1";
 pub const RELAY_SUBPROTOCOL: &str = "ws-model-proxy.relay.v2";
 pub const RELAY_JSON_CONTROL_MAX_BYTES: usize = 64 * 1024;
 pub const RELAY_BINARY_CHUNK_MAX_BYTES: usize = 1024 * 1024;
@@ -50,7 +52,11 @@ pub enum ClientControlMessage {
         headers: std::collections::BTreeMap<String, String>,
     },
     #[serde(rename = "relay.complete")]
-    RelayComplete { request_id: String },
+    RelayComplete {
+        request_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage: Option<RelayUsage>,
+    },
     #[serde(rename = "relay.error")]
     RelayError {
         request_id: String,
@@ -62,6 +68,20 @@ pub enum ClientControlMessage {
     },
     #[serde(rename = "relay.cancelled")]
     RelayCancelled { request_id: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayUsage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "prompt_tokens")]
+    pub prompt_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "completion_tokens")]
+    pub completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "total_tokens")]
+    pub total_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -78,6 +98,9 @@ pub struct CliInventory {
 #[serde(rename_all = "camelCase")]
 pub struct CliCapabilities {
     pub protocol_version: String,
+    pub inventory_ack: bool,
+    pub inventory_replace: bool,
+    pub endpoint_targeting: bool,
     pub binary_frames: bool,
     pub cancellation: bool,
     pub max_binary_chunk_bytes: usize,
@@ -89,6 +112,9 @@ impl Default for CliCapabilities {
     fn default() -> Self {
         Self {
             protocol_version: RELAY_PROTOCOL_VERSION.to_string(),
+            inventory_ack: true,
+            inventory_replace: true,
+            endpoint_targeting: true,
             binary_frames: true,
             cancellation: true,
             max_binary_chunk_bytes: RELAY_BINARY_CHUNK_MAX_BYTES,
@@ -133,6 +159,14 @@ pub struct DiscoveredModelInventory {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InventoryRevision {
+    pub inventory_seq: u64,
+    pub inventory_digest: String,
+    pub inventory_acknowledged_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -143,7 +177,15 @@ pub enum ServerControlMessage {
     HelloOk {
         id: String,
         protocol_version: String,
+        revision: InventoryRevision,
     },
+    #[serde(rename = "inventory.ok")]
+    InventoryOk {
+        id: String,
+        revision: InventoryRevision,
+    },
+    #[serde(rename = "inventory.error")]
+    InventoryError { id: String, message: String },
     #[serde(rename = "heartbeat.pong")]
     HeartbeatPong { id: String, received_at: String },
     #[serde(rename = "relay.request")]
@@ -154,6 +196,7 @@ pub enum ServerControlMessage {
         path: String,
         headers: std::collections::BTreeMap<String, String>,
         timeout_ms: u64,
+        endpoint_slug: String,
         expect_body: bool,
     },
     #[serde(rename = "relay.cancel")]
@@ -230,6 +273,74 @@ pub fn endpoint_inventory(endpoint: &EndpointConfig, status: EndpointStatus) -> 
     }
 }
 
+/// SHA-256 identity for the server's complete inventory replacement snapshot.
+///
+/// This deliberately excludes volatile probe health and suggestions. It mirrors
+/// `inventoryDigestFor` in the server registration module: object keys are
+/// sorted recursively, endpoints are ordered by slug, and models by upstream
+/// model id. Keep the test vector below in sync with that implementation.
+pub fn inventory_digest(endpoints: &[EndpointInventory]) -> String {
+    let mut identity = endpoints
+        .iter()
+        .map(|endpoint| {
+            let mut models = endpoint
+                .models
+                .iter()
+                .map(|model| {
+                    json!({
+                        "slug": &model.slug,
+                        "upstreamModelId": &model.upstream_model_id,
+                        "capabilityOverrideMode": &model.capability_override_mode,
+                        "capabilities": &model.capabilities,
+                    })
+                })
+                .collect::<Vec<_>>();
+            models.sort_by(|left, right| {
+                left["upstreamModelId"]
+                    .as_str()
+                    .cmp(&right["upstreamModelId"].as_str())
+            });
+            json!({
+                "slug": &endpoint.slug,
+                "label": &endpoint.label,
+                "kind": &endpoint.kind,
+                "defaultCapabilities": &endpoint.default_capabilities,
+                "models": models,
+            })
+        })
+        .collect::<Vec<_>>();
+    identity.sort_by(|left, right| left["slug"].as_str().cmp(&right["slug"].as_str()));
+    let canonical = stable_json(&Value::Array(identity));
+    format!("{:x}", Sha256::digest(canonical.as_bytes()))
+}
+
+fn stable_json(value: &Value) -> String {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => value.to_string(),
+        Value::Array(values) => format!(
+            "[{}]",
+            values.iter().map(stable_json).collect::<Vec<_>>().join(",")
+        ),
+        Value::Object(values) => stable_object_json(values),
+    }
+}
+
+fn stable_object_json(values: &Map<String, Value>) -> String {
+    let mut keys = values.keys().collect::<Vec<_>>();
+    keys.sort_unstable();
+    format!(
+        "{{{}}}",
+        keys.into_iter()
+            .map(|key| format!(
+                "{}:{}",
+                Value::String(key.clone()).to_string(),
+                stable_json(&values[key])
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
 pub fn encode_control(message: &ClientControlMessage) -> Result<String> {
     let text = serde_json::to_string(message).context("serializing relay control frame")?;
     if text.len() > RELAY_JSON_CONTROL_MAX_BYTES {
@@ -243,6 +354,44 @@ pub fn parse_server_control(text: &str) -> Result<ServerControlMessage> {
         anyhow::bail!("JSON control frame exceeds 64 KiB");
     }
     serde_json::from_str(text).context("parsing relay server control frame")
+}
+
+#[cfg(test)]
+mod inventory_digest_tests {
+    use super::*;
+
+    /// Cross-language canonicalization vector shared with the server's
+    /// `inventoryDigestFor`: SHA-256 of the canonical empty replacement list.
+    #[test]
+    fn inventory_digest_matches_shared_empty_snapshot_vector() {
+        assert_eq!(
+            inventory_digest(&[]),
+            "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        );
+    }
+
+    #[test]
+    fn inventory_digest_matches_shared_nonempty_snapshot_vector() {
+        let endpoints = vec![EndpointInventory {
+            slug: "example".to_string(),
+            label: "Example".to_string(),
+            kind: "openai-compatible".to_string(),
+            status: EndpointStatus::Online,
+            default_capabilities: OpenAiCompatibleCapabilities::default(),
+            probe_suggestions: None,
+            models: vec![DiscoveredModelInventory {
+                slug: None,
+                upstream_model_id: "model-a".to_string(),
+                capabilities: None,
+                capability_override_mode: CapabilityOverrideMode::Inherit,
+                probe_suggestions: None,
+            }],
+        }];
+        assert_eq!(
+            inventory_digest(&endpoints),
+            "52e5e23c121ae39dcc319aa506661ec50474c3c8c645cbe09a8121a47d37bc23"
+        );
+    }
 }
 
 pub fn encode_binary_frame(metadata: &RelayBinaryFrameMetadata, body: &[u8]) -> Result<Vec<u8>> {
@@ -339,7 +488,7 @@ mod tests {
 
         let encoded = encode_control(&message).expect("encode");
 
-        assert!(encoded.contains(r#""protocolVersion":"2.0""#));
+        assert!(encoded.contains(r#""protocolVersion":"2.1""#));
         assert!(encoded.contains(r#""maxBinaryChunkBytes":1048576"#));
         assert!(encoded.contains(r#""requestBodyStreaming":true"#));
         assert!(encoded.contains(r#""requestBodyWindowChunks":16"#));
@@ -375,7 +524,7 @@ mod tests {
         assert!(!relay_error.contains(":null"));
 
         let parsed = parse_server_control(
-            r#"{"type":"relay.request","requestId":"request-1","family":"generic","method":"POST","path":"/v1/chat/completions","headers":{},"timeoutMs":30000,"expectBody":true}"#,
+            r#"{"type":"relay.request","requestId":"request-1","family":"generic","method":"POST","path":"/v1/chat/completions","headers":{},"timeoutMs":30000,"endpointSlug":"local","expectBody":true}"#,
         )
         .expect("parse server control");
         match parsed {

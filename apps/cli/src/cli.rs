@@ -68,8 +68,15 @@ pub enum Command {
     /// Install or inspect a per-user operating-system service for the relay.
     Service(crate::commands::service::Args),
 
-    /// Refresh local endpoint inventory for a supervised daemon restart.
+    /// Publish the current endpoint inventory through the running relay daemon.
     Reload(crate::commands::reload::Args),
+
+    /// Show live relay, local endpoint, and acknowledged inventory status.
+    Status {
+        /// Emit a stable JSON status object.
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Remove stored local authentication state.
     Logout(crate::commands::logout::Args),

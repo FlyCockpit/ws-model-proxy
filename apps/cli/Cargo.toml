@@ -55,6 +55,15 @@ rand = "0.10"
 tempfile = "3"
 # HTTP calls to the self-hosted app and OpenAI-compatible local endpoints.
 ureq = { version = "3", features = ["json"] }
+# SHA-256 inventory identity must match the server's acknowledged revision.
+sha2 = "0.10"
+# Async HTTP transport permits cancellation to interrupt connect, upload, and
+# response reads instead of merely setting a flag beside a blocking request.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "net", "io-util"] }
+# The `Stream` trait lets a request body remain credit-paced while reqwest owns
+# the cancellable connection future.
+futures-core = "0.3"
 # URL parsing and joining for server/local endpoint paths.
 url = "2"
 # Foreground daemon websocket connection to the app relay.
@@ -65,6 +74,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 # Still-image decode/re-encode when `expandMedia` inlines signed media URLs for
 # local upstreams that only accept JPEG/PNG data URLs (not WebP/GIF).
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+
+[target.'cfg(unix)'.dependencies]
+# Maintained Unix API wrapper used only for authenticated local-control peer
+# credentials. `socket` exposes SO_PEERCRED/LOCAL_PEERCRED and `user` exposes
+# the current effective UID without unsafe FFI.
+nix = { version = "0.31", default-features = false, features = ["fs", "socket", "user"] }
 
 [dev-dependencies]
 # Black-box CLI testing: run the built binary and assert on stdout/stderr/exit.

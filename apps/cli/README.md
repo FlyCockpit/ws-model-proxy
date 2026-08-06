@@ -49,7 +49,10 @@ wsmp endpoints add local http://127.0.0.1:11434 --expand-media  # inline WMP med
 wsmp endpoints probe local
 wsmp connect                        # open the outbound websocket relay
 wsmp daemon start --detach          # background relay (new session; owns a PID file)
-wsmp daemon status                  # inspect a detached relay
+wsmp daemon status                  # inspect the live relay (non-zero if absent)
+wsmp status                         # top-level live relay status alias
+wsmp reload                         # probe and publish the complete inventory; waits for server ack
+wsmp reload --offline               # probe and save local state only; never publishes
 wsmp daemon stop                    # stop a detached relay
 wsmp service install                # install, enable, and start a Linux/macOS user service
 wsmp service status                 # inspect the installed user service
@@ -64,8 +67,17 @@ Configuration is stored in a JSON file. `wsmp config path` prints the resolved p
 - `wsmp daemon start --detach` starts a session-detached relay that owns
   `$WSMP_STATE_DIR/relay.pid` (with a pid + ownership token). Only that detached
   process claims the PID file; foreground `wsmp connect` / `wsmp daemon start`
-  and OS services do not. `stop` refuses to signal a PID that no longer looks
+  and OS services do not. `wsmp status` communicates with the live relay control
+  socket, so it also sees foreground and service-managed relays; it exits
+  non-zero when no live acknowledged relay is available. `stop` refuses to signal a PID that no longer looks
   like this CLI's daemon (PID-reuse guard).
+- The live control socket is Unix-only: it is private to the state directory
+  and verifies the connecting process has the daemon's UID using OS peer
+  credentials. Windows does not expose this control plane yet. On Windows,
+  `wsmp reload --offline` is the explicit safe fallback: it probes and saves
+  local state, then reports `published: false`; run the relay on Unix and use
+  its live `wsmp reload` to publish. It requires an
+  authenticated named-pipe equivalent before it can be supported safely.
 - `wsmp service install` installs a **per-user** systemd unit (Linux) or
   LaunchAgent (macOS). Re-running install rewrites the unit/plist and restarts.
 - **Device credentials** (`wsmp login`) live in the state directory and work

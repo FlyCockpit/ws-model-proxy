@@ -184,12 +184,15 @@ function directRow({
 } = {}) {
   return {
     id,
+    published: true,
     userId: "user-id",
     upstreamModelId,
     capabilityOverrideMode: capabilityOverrideMetadata ? "OVERRIDE" : "INHERIT_ENDPOINT_DEFAULTS",
     capabilityOverrideMetadata,
     Endpoint: {
       id: "endpoint-id",
+      slug: "endpoint-default",
+      published: true,
       cliDeviceId,
       status: "ONLINE",
       capabilityMetadata: {
@@ -255,12 +258,15 @@ function poolMemberRow({
     halfOpenTrialStartedAt: null,
     DiscoveredModel: {
       id: discoveredModelId,
+      published: true,
       userId: "user-id",
       upstreamModelId,
       capabilityOverrideMode: capabilityOverrideMetadata ? "OVERRIDE" : "INHERIT_ENDPOINT_DEFAULTS",
       capabilityOverrideMetadata,
       Endpoint: {
         id: `${id}-endpoint-id`,
+        slug: `${id}-endpoint`,
+        published: true,
         cliDeviceId,
         status: "ONLINE",
         capabilityMetadata: directRow().Endpoint.capabilityMetadata,

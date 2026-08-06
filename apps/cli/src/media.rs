@@ -201,6 +201,33 @@ pub fn expand_media_in_body(
     Ok(transformed)
 }
 
+/// Return every trusted media reference in a chat-shaped JSON body. This is
+/// deliberately separate from [`expand_media_in_body`] so the relay can fetch
+/// assets with its cancellable HTTP transport before performing the pure JSON
+/// rewrite. Malformed/non-chat JSON has no references and remains a pass-through
+/// in the normal expansion path.
+pub fn trusted_media_urls_in_body(body: &[u8], trusted: &TrustedOrigins) -> Vec<Url> {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return Vec::new();
+    };
+    let Some(messages) = value.get("messages").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut urls = Vec::new();
+    for message in messages {
+        let Some(parts) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for part in parts {
+            if let Some(url) = trusted_media_url_in_part(part, trusted) {
+                urls.push(url);
+            }
+        }
+    }
+    urls
+}
+
 fn walk_messages(
     value: &mut Value,
     trusted: &TrustedOrigins,
@@ -229,10 +256,7 @@ fn expand_part(
 ) -> Result<(), MediaExpandError> {
     // Clone the part kind so later mutable borrows of `part` do not conflict
     // with the temporary borrow from `get("type")`.
-    let kind = part
-        .get("type")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+    let kind = part.get("type").and_then(Value::as_str).map(str::to_owned);
     let Some(kind) = kind else {
         return Ok(());
     };
@@ -249,14 +273,9 @@ fn expand_part(
     let Some(reference) = field_value.as_str() else {
         return Ok(());
     };
-    // Raw base64 (no scheme) and `data:` URLs never parse into a trusted media
-    // URL, so they fall through as passthrough.
-    let Ok(url) = Url::parse(reference) else {
+    let Some(url) = trusted_media_url(reference, trusted) else {
         return Ok(());
     };
-    if !trusted.is_media_url(&url) {
-        return Ok(());
-    }
 
     let fetched = fetch(&url)?;
     let path = media_path_for_errors(&url);
@@ -273,6 +292,25 @@ fn expand_part(
     Ok(())
 }
 
+fn trusted_media_url_in_part(part: &Value, trusted: &TrustedOrigins) -> Option<Url> {
+    let kind = part.get("type")?.as_str()?;
+    let (container, field) = match kind {
+        "image_url" => ("image_url", "url"),
+        "video_url" => ("video_url", "url"),
+        "input_audio" => ("input_audio", "data"),
+        _ => return None,
+    };
+    let reference = part.get(container)?.get(field)?.as_str()?;
+    trusted_media_url(reference, trusted)
+}
+
+fn trusted_media_url(reference: &str, trusted: &TrustedOrigins) -> Option<Url> {
+    // Raw base64 (no scheme) and `data:` URLs never parse into a trusted media
+    // URL, so they fall through as passthrough.
+    let url = Url::parse(reference).ok()?;
+    trusted.is_media_url(&url).then_some(url)
+}
+
 /// Path fragment used in error messages — never includes query (`sig`).
 fn media_path_for_errors(url: &Url) -> String {
     url.path().to_string()
@@ -283,8 +321,7 @@ fn media_path_for_errors(url: &Url) -> String {
 /// (+ `image/jpg` alias, which TS normalizes to `image/jpeg`).
 fn is_model_inline_safe_image_mime(mime: &str) -> bool {
     matches!(
-        mime
-            .split(';')
+        mime.split(';')
             .next()
             .unwrap_or(mime)
             .trim()
@@ -580,6 +617,24 @@ mod tests {
         assert!(trusted.is_media_url(&Url::parse("http://localhost:8080/media/a").unwrap()));
         assert!(!trusted.is_media_url(&Url::parse("http://localhost:9090/media/a").unwrap()));
         assert!(!trusted.is_media_url(&Url::parse("https://localhost:8080/media/a").unwrap()));
+    }
+
+    #[test]
+    fn trusted_media_url_prepass_matches_expandable_parts_only() {
+        let body = serde_json::json!({
+            "messages": [{
+                "content": [
+                    { "type": "image_url", "image_url": { "url": "https://relay.example.test/media/img?sig=secret" } },
+                    { "type": "video_url", "video_url": { "url": "https://evil.example.test/media/video" } },
+                    { "type": "input_audio", "input_audio": { "data": "https://relay.example.test/media/audio?sig=secret" } }
+                ]
+            }]
+        });
+        let bytes = serde_json::to_vec(&body).expect("body JSON");
+        let urls = trusted_media_urls_in_body(&bytes, &trusted());
+        assert_eq!(urls.len(), 2);
+        assert_eq!(urls[0].path(), "/media/img");
+        assert_eq!(urls[1].path(), "/media/audio");
     }
 
     #[test]

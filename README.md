@@ -151,6 +151,48 @@ CLI operator flow:
 
 Model API clients call `/v1/*` with `Authorization: Bearer ...`. Cookie/session auth and permissive browser CORS are intentionally not supported for those bearer routes in v1.
 
+### OpenAI-compatible client API
+
+Create a Model API token in the dashboard, then use the public server URL as the
+OpenAI-compatible base URL. Browser-dashboard login cookies do not authenticate
+these routes.
+
+```sh
+export WSMP_SERVER_URL="https://models.example.invalid"
+export WSMP_MODEL_API_TOKEN="…"
+curl --fail-with-body \
+  -H "Authorization: Bearer $WSMP_MODEL_API_TOKEN" \
+  "$WSMP_SERVER_URL/v1/models"
+```
+
+For OpenWebUI and other OpenAI-compatible clients, set the API base URL to
+`$WSMP_SERVER_URL/v1` and provide the same bearer token. Use the exact client
+model ID returned by `/v1/models`; dashboard labels and upstream model IDs are
+search aids, not always the client ID.
+
+### Why is my model missing from the dashboard?
+
+1. Confirm the long-running daemon is active: `wsmp status --json`. It must
+   show a connected relay and an acknowledged inventory revision.
+2. Confirm the desired endpoint is enabled and its local probe state is visible
+   in the endpoint configuration. An offline enabled endpoint remains published
+   but is not executable.
+3. After any add, edit, disable, or removal, run `wsmp reload`. It succeeds only
+   after the server acknowledges the complete snapshot.
+   On Windows, use `wsmp reload --offline` only to probe and save local state;
+   it explicitly does not publish. Run the relay on Unix and use its live
+   `wsmp reload` to publish the inventory.
+4. Check the intended account/org and dashboard search. Search accepts client
+   model ID, upstream model ID, endpoint slug, and endpoint label.
+5. For systemd/LaunchAgent services, changed environment-held header secrets
+   require `wsmp service env-sync` and a service restart; reload cannot import a
+   service manager’s newly changed environment.
+
+A local probe being green does not by itself prove dashboard publication.
+`wsmp status` is the authoritative local diagnostic because it reports the
+live relay and its server-acknowledged revision.
+
+
 ## License
 
 MIT. See [LICENSE](./LICENSE).
