@@ -66,6 +66,23 @@ describe("relayProtocol", () => {
     });
     expect([...parsed.body]).toEqual([0, 1, 2, 255]);
   });
+
+  it("accepts separate standardized relay metrics", () => {
+    expect(
+      parseRelayClientControlFrame(
+        JSON.stringify({
+          type: "relay.complete",
+          requestId: "request-id",
+          usage: { completionTokens: 42 },
+          metrics: { completionTokens: 40, tokenizer: "cl100k_base" },
+        }),
+      ),
+    ).toMatchObject({
+      type: "relay.complete",
+      usage: { completionTokens: 42 },
+      metrics: { completionTokens: 40, tokenizer: "cl100k_base" },
+    });
+  });
 });
 
 describe("sanitizeRelayRequestHeaders", () => {

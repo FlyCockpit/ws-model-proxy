@@ -226,17 +226,16 @@ function contentDelta(value: unknown): string {
     .join("");
 }
 
-function completionTokens(value: unknown): number | undefined {
-  if (typeof value !== "object" || value === null || !("usage" in value)) return undefined;
-  const usage = value.usage;
-  if (typeof usage !== "object" || usage === null) return undefined;
-  const tokens =
-    "completion_tokens" in usage
-      ? usage.completion_tokens
-      : "completionTokens" in usage
-        ? usage.completionTokens
-        : undefined;
-  return typeof tokens === "number" && Number.isFinite(tokens) && tokens >= 0 ? tokens : undefined;
+function standardizedCompletionTokens(value: unknown): number | undefined {
+  if (typeof value !== "object" || value === null || !("wsmp_metrics" in value)) {
+    return undefined;
+  }
+  const metrics = value.wsmp_metrics;
+  if (typeof metrics !== "object" || metrics === null) return undefined;
+  const tokens = "completion_tokens" in metrics ? metrics.completion_tokens : undefined;
+  if (typeof tokens !== "number" || !Number.isFinite(tokens) || tokens < 0) return undefined;
+  if (!("tokenizer" in metrics) || metrics.tokenizer !== "cl100k_base") return undefined;
+  return tokens;
 }
 
 async function readErrorMessage(response: Response, fallback: string) {
@@ -384,7 +383,7 @@ async function streamChatCompletion({
   const decoder = new TextDecoder();
   let buffer = "";
   let firstVisibleDeltaAt: number | undefined;
-  let reportedCompletionTokens: number | undefined;
+  let reportedSharedCompletionTokens: number | undefined;
 
   const processEvent = (event: string) => {
     const data = event
@@ -395,8 +394,8 @@ async function streamChatCompletion({
       .trim();
     if (!data || data === "[DONE]") return;
     const parsed: unknown = JSON.parse(data);
-    const usage = completionTokens(parsed);
-    if (usage !== undefined) reportedCompletionTokens = usage;
+    const metrics = standardizedCompletionTokens(parsed);
+    if (metrics !== undefined) reportedSharedCompletionTokens = metrics;
     const delta = contentDelta(parsed);
     if (delta) {
       firstVisibleDeltaAt ??= performance.now();
@@ -419,12 +418,16 @@ async function streamChatCompletion({
   const completedAt = performance.now();
   const ttftMs = firstVisibleDeltaAt === undefined ? undefined : firstVisibleDeltaAt - startedAt;
   const tokensPerSecond =
-    reportedCompletionTokens === undefined ||
+    reportedSharedCompletionTokens === undefined ||
     firstVisibleDeltaAt === undefined ||
     completedAt <= firstVisibleDeltaAt
       ? undefined
-      : reportedCompletionTokens / ((completedAt - firstVisibleDeltaAt) / 1000);
-  return { ttftMs, completionTokens: reportedCompletionTokens, tokensPerSecond };
+      : reportedSharedCompletionTokens / ((completedAt - firstVisibleDeltaAt) / 1000);
+  return {
+    ttftMs,
+    completionTokens: reportedSharedCompletionTokens,
+    tokensPerSecond,
+  };
 }
 
 function isAbortError(error: unknown) {
@@ -1260,7 +1263,7 @@ function MessageBubble({
           })}
           <span aria-hidden="true"> · </span>
           {message.metrics.tokensPerSecond !== undefined
-            ? t("dashboard:chatTest.metrics.tokensPerSecond", {
+            ? t("dashboard:chatTest.metrics.tokensPerSecondShared", {
                 value: message.metrics.tokensPerSecond.toFixed(1),
                 count: message.metrics.completionTokens ?? 0,
               })

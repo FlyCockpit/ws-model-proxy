@@ -96,8 +96,8 @@ type RelayOperation = {
   capability: ModelApiCapability;
   additionalCapabilities?: ModelApiCapability[];
   stream: boolean;
-  // Chat Test is an internal consumer that can accept a final SSE usage event
-  // derived from the relay's authoritative RelayComplete message. Public
+  // Chat Test is an internal consumer that can accept a final SSE metrics event
+  // derived from the relay's standardized RelayComplete metrics. Public
   // OpenAI-compatible routes retain the upstream byte stream unchanged.
   appendTerminalUsage?: boolean;
   buildRequest: RelayRequestBuilder;
@@ -138,16 +138,15 @@ function responseBodyForOperation({
           upstreamEnded = true;
         }
         const result = await terminal;
-        // Only RelayComplete usage is forwarded. If the CLI did not supply
-        // usage, the UI deliberately leaves throughput unavailable.
-        if (result.ok && result.usage) {
+        // Standardized relay metrics are private to Chat Test. Public
+        // OpenAI-compatible routes retain the upstream byte stream unchanged.
+        if (result.ok && result.metrics) {
           controller.enqueue(
             encoder.encode(
               `data: ${JSON.stringify({
-                usage: {
-                  prompt_tokens: result.usage.promptTokens,
-                  completion_tokens: result.usage.completionTokens,
-                  total_tokens: result.usage.totalTokens,
+                wsmp_metrics: {
+                  completion_tokens: result.metrics.completionTokens,
+                  tokenizer: result.metrics.tokenizer,
                 },
               })}\n\n`,
             ),
@@ -717,6 +716,7 @@ async function failRelayMetadata({
       httpStatusCode: relayFailureHttpStatus(failure),
       upstreamStatusCode: null,
       usage: null,
+      metrics: null,
     },
   });
 }

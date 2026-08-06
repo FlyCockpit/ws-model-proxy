@@ -117,6 +117,17 @@ class FakeRelayManager {
     this.handlers.delete(requestId);
     handler?.onComplete({ type: "relay.complete", requestId });
   }
+
+  completeWithStandardizedMetrics(requestId: string) {
+    const handler = this.handlers.get(requestId);
+    this.handlers.delete(requestId);
+    handler?.onComplete({
+      type: "relay.complete",
+      requestId,
+      usage: { completionTokens: 3 },
+      metrics: { completionTokens: 2, tokenizer: "cl100k_base" },
+    });
+  }
 }
 
 const directTarget: VisibleDirectModelTarget = {
@@ -262,9 +273,7 @@ describe("chat test routes", () => {
     manager.complete(sent.requestId);
 
     expect(response.status).toBe(200);
-    await expect(response.text()).resolves.toBe(
-      'data: {}\n\ndata: {"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}\n\n',
-    );
+    await expect(response.text()).resolves.toBe("data: {}\n\n");
     expect(db.relayRequest.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
@@ -318,5 +327,32 @@ describe("chat test routes", () => {
     manager.completeWithoutUsage(sent.requestId);
 
     await expect(response.text()).resolves.toBe("data: {}\n\n");
+  });
+
+  it("forwards standardized metrics separately from upstream usage", async () => {
+    const manager = new FakeRelayManager();
+    const responsePromise = appWith(manager).request("/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: directTarget.modelId, stream: true, messages: [] }),
+    });
+
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    manager.headers(sent.requestId, 200, { "content-type": "text/event-stream" });
+    const response = await responsePromise;
+    manager.body(sent.requestId, "data: {}\n\n");
+    manager.completeWithStandardizedMetrics(sent.requestId);
+
+    await expect(response.text()).resolves.toBe(
+      'data: {}\n\ndata: {"wsmp_metrics":{"completion_tokens":2,"tokenizer":"cl100k_base"}}\n\n',
+    );
+    await vi.waitFor(() =>
+      expect(db.relayRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ completionTokens: 3 }),
+        }),
+      ),
+    );
   });
 });

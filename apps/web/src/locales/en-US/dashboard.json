@@ -64,7 +64,8 @@
     "metrics": {
       "ttft": "TTFT {{value}} s",
       "tokensPerSecond": "{{value}} tok/s after first token ({{count}} completion tokens)",
-      "throughputUnavailable": "Throughput unavailable — upstream did not report completion tokens"
+      "tokensPerSecondShared": "{{value}} shared-tokenizer tok/s after first token ({{count}} completion tokens)",
+      "throughputUnavailable": "Throughput unavailable — shared tokenizer could not count the completion"
     },
     "modelPicker": "Model",
     "regenerate": "Regenerate",

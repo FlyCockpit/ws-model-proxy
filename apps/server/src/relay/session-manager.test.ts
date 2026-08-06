@@ -219,7 +219,7 @@ describe("RelaySessionManager", () => {
     expect(JSON.parse(String(socket.sends[0]))).toEqual({
       type: "hello.ok",
       id: "hello-id",
-      protocolVersion: "2.1",
+      protocolVersion: "2.3",
       revision: {
         inventorySeq: 1,
         inventoryDigest: "digest",

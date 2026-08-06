@@ -11,12 +11,18 @@ type RelayUsage = {
   totalTokens?: number;
 };
 
+type RelayMetrics = {
+  completionTokens: number;
+  tokenizer: "cl100k_base";
+};
+
 export type RelayAttemptTerminal = {
   ok: boolean;
   failure: RelayFailure | null;
   httpStatusCode: number | null;
   upstreamStatusCode: number | null;
   usage: RelayUsage | null;
+  metrics: RelayMetrics | null;
 };
 
 type RelayAttemptStarted = {
@@ -136,6 +142,7 @@ export function startRelayAttempt({
         httpStatusCode: 499,
         upstreamStatusCode,
         usage: null,
+        metrics: null,
       });
       manager.cancelRelayRequest({ cliDeviceId, requestId, reason: "cancelled" });
     },
@@ -149,6 +156,7 @@ export function startRelayAttempt({
       httpStatusCode: 504,
       upstreamStatusCode,
       usage: null,
+      metrics: null,
     });
   }, timeoutMs);
 
@@ -160,6 +168,7 @@ export function startRelayAttempt({
       httpStatusCode: 499,
       upstreamStatusCode,
       usage: null,
+      metrics: null,
     });
   };
   abortSignal?.addEventListener("abort", abort, { once: true });
@@ -208,6 +217,7 @@ export function startRelayAttempt({
         httpStatusCode: upstreamStatusCode,
         upstreamStatusCode,
         usage: message.usage ?? null,
+        metrics: message.metrics ?? null,
       });
     },
     onError(message) {
@@ -218,6 +228,7 @@ export function startRelayAttempt({
         httpStatusCode: null,
         upstreamStatusCode,
         usage: null,
+        metrics: null,
       });
     },
     onCancelled() {
@@ -227,6 +238,7 @@ export function startRelayAttempt({
         httpStatusCode: 499,
         upstreamStatusCode,
         usage: null,
+        metrics: null,
       });
     },
   };
@@ -253,6 +265,7 @@ export function startRelayAttempt({
       httpStatusCode: null,
       upstreamStatusCode,
       usage: null,
+      metrics: null,
     });
   }
 
@@ -268,6 +281,7 @@ export function startRelayAttempt({
         httpStatusCode: null,
         upstreamStatusCode,
         usage: null,
+        metrics: null,
       });
     },
   };

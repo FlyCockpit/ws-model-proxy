@@ -64,7 +64,8 @@
     "metrics": {
       "ttft": "TTFT {{value}} s",
       "tokensPerSecond": "{{value}} tok/s después del primer token ({{count}} tokens de finalización)",
-      "throughputUnavailable": "Rendimiento no disponible: el origen no informó tokens de finalización"
+      "tokensPerSecondShared": "{{value}} tok/s con tokenizador compartido después del primer token ({{count}} tokens de finalización)",
+      "throughputUnavailable": "Rendimiento no disponible: el tokenizador compartido no pudo contar la finalización"
     },
     "modelPicker": "Modelo",
     "regenerate": "Regenerar",

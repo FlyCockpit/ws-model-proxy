@@ -98,6 +98,7 @@ use crate::protocol::{
     parse_binary_frame, parse_server_control,
 };
 use crate::slug::generated_slug;
+use crate::tokens::{CompletionTextCollector, standardized_completion_metrics};
 
 const RELAY_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const RELAY_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(300);
@@ -1883,6 +1884,7 @@ async fn relay_response_back(
 
     let mut response = response;
     let mut usage_tail = Vec::new();
+    let mut completion_text = CompletionTextCollector::default();
     let mut index = 0_usize;
     loop {
         let bytes = tokio::select! {
@@ -1891,6 +1893,7 @@ async fn relay_response_back(
         };
         let Some(bytes) = bytes else { break };
         append_usage_tail(&mut usage_tail, &bytes);
+        completion_text.feed(&bytes);
         relay_response_chunk(tx, &spec.request_id, &bytes, &mut index)?;
     }
     let metadata = RelayBinaryFrameMetadata {
@@ -1900,11 +1903,17 @@ async fn relay_response_back(
         final_chunk: Some(true),
     };
     worker_send_binary(tx, &metadata, &[])?;
+    // Preserve provider usage while attaching separate `cl100k_base` metrics
+    // for comparable cross-model Chat Test TPS. A bounded collector returns
+    // `None` rather than retaining a huge response.
+    let usage = terminal_usage_from_response(&usage_tail);
+    let metrics = standardized_completion_metrics(completion_text.finish().as_deref());
     worker_send_control(
         tx,
         &ClientControlMessage::RelayComplete {
             request_id: spec.request_id.clone(),
-            usage: terminal_usage_from_response(&usage_tail),
+            usage,
+            metrics,
         },
     )?;
     Ok(())
@@ -1927,8 +1936,8 @@ fn append_usage_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
 }
 
 /// Extract upstream-provided terminal usage from either a JSON completion or
-/// the final OpenAI SSE `data:` event. This never estimates tokens: absent or
-/// malformed upstream usage remains absent in `relay.complete`.
+/// the final OpenAI SSE `data:` event. Shared-tokenizer accounting is separate
+/// from usage and happens in [`standardized_completion_metrics`].
 fn terminal_usage_from_response(bytes: &[u8]) -> Option<crate::protocol::RelayUsage> {
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]

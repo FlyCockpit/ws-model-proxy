@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{CapabilityOverrideMode, EndpointConfig, OpenAiCompatibleCapabilities};
 
-pub const RELAY_PROTOCOL_VERSION: &str = "2.1";
+pub const RELAY_PROTOCOL_VERSION: &str = "2.3";
 pub const RELAY_SUBPROTOCOL: &str = "ws-model-proxy.relay.v2";
 pub const RELAY_JSON_CONTROL_MAX_BYTES: usize = 64 * 1024;
 pub const RELAY_BINARY_CHUNK_MAX_BYTES: usize = 1024 * 1024;
@@ -56,6 +56,8 @@ pub enum ClientControlMessage {
         request_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         usage: Option<RelayUsage>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metrics: Option<RelayMetrics>,
     },
     #[serde(rename = "relay.error")]
     RelayError {
@@ -84,6 +86,20 @@ pub struct RelayUsage {
     pub total_tokens: Option<u32>,
 }
 
+/// Internal benchmark metrics, deliberately separate from provider usage.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayMetrics {
+    pub completion_tokens: u32,
+    pub tokenizer: RelayMetricTokenizer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayMetricTokenizer {
+    Cl100kBase,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CliInventory {
@@ -106,6 +122,8 @@ pub struct CliCapabilities {
     pub max_binary_chunk_bytes: usize,
     pub request_body_streaming: bool,
     pub request_body_window_chunks: usize,
+    pub shared_tokenizer_tps: bool,
+    pub standardized_metrics: bool,
 }
 
 impl Default for CliCapabilities {
@@ -120,6 +138,8 @@ impl Default for CliCapabilities {
             max_binary_chunk_bytes: RELAY_BINARY_CHUNK_MAX_BYTES,
             request_body_streaming: true,
             request_body_window_chunks: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+            shared_tokenizer_tps: true,
+            standardized_metrics: true,
         }
     }
 }
@@ -488,7 +508,9 @@ mod tests {
 
         let encoded = encode_control(&message).expect("encode");
 
-        assert!(encoded.contains(r#""protocolVersion":"2.1""#));
+        assert!(encoded.contains(r#""protocolVersion":"2.3""#));
+        assert!(encoded.contains(r#""sharedTokenizerTps":true"#));
+        assert!(encoded.contains(r#""standardizedMetrics":true"#));
         assert!(encoded.contains(r#""maxBinaryChunkBytes":1048576"#));
         assert!(encoded.contains(r#""requestBodyStreaming":true"#));
         assert!(encoded.contains(r#""requestBodyWindowChunks":16"#));

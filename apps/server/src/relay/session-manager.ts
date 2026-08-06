@@ -142,16 +142,16 @@ export class RelaySessionManager {
           identity: session.identity,
           cli: message.cli,
           endpoints: message.endpoints,
-          inventoryConfirmed: message.protocolVersion === RELAY_PROTOCOL_VERSION,
-          endpointTargeting: message.protocolVersion === RELAY_PROTOCOL_VERSION,
+          inventoryConfirmed: message.protocolVersion !== "2.0",
+          endpointTargeting: message.protocolVersion !== "2.0",
           connection: true,
           now,
         });
         session.cliDeviceId = registration.cliDeviceId;
         session.cli = { slug: message.cli.slug, label: message.cli.label };
         session.registered = true;
-        session.inventoryConfirmed = message.protocolVersion === RELAY_PROTOCOL_VERSION;
-        session.endpointTargeting = message.protocolVersion === RELAY_PROTOCOL_VERSION;
+        session.inventoryConfirmed = message.protocolVersion !== "2.0";
+        session.endpointTargeting = message.protocolVersion !== "2.0";
         session.lastHeartbeatAt = now;
         clearTimeout(session.unauthenticatedTimer);
         this.replaceDuplicateSession(session);

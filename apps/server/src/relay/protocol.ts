@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const RELAY_PROTOCOL_VERSION = "2.1";
+export const RELAY_PROTOCOL_VERSION = "2.3";
 export const RELAY_SUBPROTOCOL = "ws-model-proxy.relay.v2";
 
 const RELAY_JSON_CONTROL_MAX_BYTES = 64 * 1024;
@@ -118,6 +118,37 @@ const cliCapabilitiesSchema = z
     maxBinaryChunkBytes: z.literal(RELAY_BINARY_CHUNK_MAX_BYTES),
     requestBodyStreaming: z.literal(true),
     requestBodyWindowChunks: z.literal(RELAY_REQUEST_BODY_WINDOW_CHUNKS),
+    sharedTokenizerTps: z.literal(true),
+    standardizedMetrics: z.literal(true),
+  })
+  .strict();
+
+const v22CliCapabilitiesSchema = z
+  .object({
+    protocolVersion: z.literal("2.2"),
+    inventoryAck: z.literal(true),
+    inventoryReplace: z.literal(true),
+    endpointTargeting: z.literal(true),
+    binaryFrames: z.literal(true),
+    cancellation: z.literal(true),
+    maxBinaryChunkBytes: z.literal(RELAY_BINARY_CHUNK_MAX_BYTES),
+    requestBodyStreaming: z.literal(true),
+    requestBodyWindowChunks: z.literal(RELAY_REQUEST_BODY_WINDOW_CHUNKS),
+    sharedTokenizerTps: z.literal(true),
+  })
+  .strict();
+
+const v21CliCapabilitiesSchema = z
+  .object({
+    protocolVersion: z.literal("2.1"),
+    inventoryAck: z.literal(true),
+    inventoryReplace: z.literal(true),
+    endpointTargeting: z.literal(true),
+    binaryFrames: z.literal(true),
+    cancellation: z.literal(true),
+    maxBinaryChunkBytes: z.literal(RELAY_BINARY_CHUNK_MAX_BYTES),
+    requestBodyStreaming: z.literal(true),
+    requestBodyWindowChunks: z.literal(RELAY_REQUEST_BODY_WINDOW_CHUNKS),
   })
   .strict();
 
@@ -132,7 +163,12 @@ const legacyCliCapabilitiesSchema = z
   })
   .strict();
 
-const acceptedCliCapabilitiesSchema = z.union([cliCapabilitiesSchema, legacyCliCapabilitiesSchema]);
+const acceptedCliCapabilitiesSchema = z.union([
+  cliCapabilitiesSchema,
+  v22CliCapabilitiesSchema,
+  v21CliCapabilitiesSchema,
+  legacyCliCapabilitiesSchema,
+]);
 
 const discoveredModelSchema = z
   .object({
@@ -163,7 +199,12 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
     .object({
       type: z.literal("hello"),
       id: requestIdSchema,
-      protocolVersion: z.union([z.literal(RELAY_PROTOCOL_VERSION), z.literal("2.0")]),
+      protocolVersion: z.union([
+        z.literal(RELAY_PROTOCOL_VERSION),
+        z.literal("2.2"),
+        z.literal("2.1"),
+        z.literal("2.0"),
+      ]),
       cli: z
         .object({
           slug: z.string().trim().min(1).max(63),
@@ -174,7 +215,10 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
         .strict(),
       endpoints: z.array(endpointInventorySchema).max(100).default([]),
     })
-    .strict(),
+    .strict()
+    .refine((message) => message.protocolVersion === message.cli.capabilities.protocolVersion, {
+      message: "Relay protocol version must match CLI capabilities.",
+    }),
   z
     .object({
       type: z.literal("inventory.update"),
@@ -213,6 +257,13 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
           promptTokens: z.number().int().min(0).optional(),
           completionTokens: z.number().int().min(0).optional(),
           totalTokens: z.number().int().min(0).optional(),
+        })
+        .strict()
+        .optional(),
+      metrics: z
+        .object({
+          completionTokens: z.number().int().min(0),
+          tokenizer: z.literal("cl100k_base"),
         })
         .strict()
         .optional(),
