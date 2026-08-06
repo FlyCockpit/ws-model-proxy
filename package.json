@@ -55,7 +55,7 @@
     "postinstall": "lefthook install"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.5.1",
+    "@biomejs/biome": "^2.5.6",
     "@inquirer/prompts": "^8.5.2",
     "@types/node": "catalog:",
     "@ws-model-proxy/config": "workspace:*",
@@ -63,7 +63,7 @@
     "@ws-model-proxy/i18n-translate": "workspace:*",
     "dotenv": "catalog:",
     "knip": "^6.23.0",
-    "lefthook": "^2.1.9",
+    "lefthook": "^2.1.10",
     "react-doctor": "^0.5.8",
     "tsx": "catalog:",
     "turbo": "^2.10.1",
