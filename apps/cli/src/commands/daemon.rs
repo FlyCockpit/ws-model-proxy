@@ -12,9 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::thread;
-use std::time::Duration;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
