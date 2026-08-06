@@ -47,6 +47,9 @@ impl ConfigLock {
             let lock_path = config.with_extension("json.lock");
             let file = std::fs::OpenOptions::new()
                 .create(true)
+                // Lock files are persistent coordination points. Preserve any
+                // existing inode/content rather than truncating on each lock.
+                .truncate(false)
                 .read(true)
                 .write(true)
                 .open(&lock_path)

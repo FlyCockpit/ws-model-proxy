@@ -333,7 +333,7 @@ fn stable_object_json(values: &Map<String, Value>) -> String {
         keys.into_iter()
             .map(|key| format!(
                 "{}:{}",
-                Value::String(key.clone()).to_string(),
+                Value::String(key.clone()),
                 stable_json(&values[key])
             ))
             .collect::<Vec<_>>()

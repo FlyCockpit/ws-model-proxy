@@ -105,6 +105,7 @@ fn service_file() -> Result<PathBuf> {
     anyhow::bail!("service installation is only supported on Linux and macOS")
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn executable() -> Result<String> {
     std::env::current_exe()
         .context("resolving the wsmp executable")?
@@ -487,6 +488,7 @@ fn env_sync() -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn ensure_service_env_placeholder(path: &Path) -> Result<()> {
     if path.exists() {
         return Ok(());
@@ -499,6 +501,7 @@ fn ensure_service_env_placeholder(path: &Path) -> Result<()> {
     write_private_file(path, body.as_bytes())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn print_install_notes(env_file: &Path) -> Result<()> {
     output::line(format!(
         "service environment file: `{}` (mode 0600; never commit secrets)",
@@ -518,6 +521,7 @@ fn print_install_notes(env_file: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn write_service_file(file: &Path, contents: &str) -> Result<()> {
     let parent = file
         .parent()
@@ -598,6 +602,7 @@ fn set_private_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_command(program: &str, args: &[&str]) -> Result<()> {
     let status = Command::new(program)
         .args(args)

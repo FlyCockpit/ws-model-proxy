@@ -8,12 +8,14 @@
 //! loop drains, and the server paces request-body frames with credit-based flow
 //! control (`relay.request.body.ack`).
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+#[cfg(unix)]
+use std::collections::HashMap;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io::{self};
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -115,6 +117,7 @@ const RELAY_MEDIA_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// event without retaining an unbounded generated response in the relay.
 const RELAY_USAGE_TAIL_MAX_BYTES: usize = 256 * 1024;
 
+#[cfg(unix)]
 const INVENTORY_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 /// Avoid serially multiplying the per-endpoint probe timeout during reload
 /// while also preventing a large configuration from opening unbounded local
@@ -125,6 +128,7 @@ const INVENTORY_PROBE_CONCURRENCY: usize = 4;
 /// worker has had a chance to run.
 const UPSTREAM_BODY_HANDOFF_CAPACITY: usize = 1;
 const REQUEST_BODY_INGRESS_CAPACITY: usize = RELAY_REQUEST_BODY_WINDOW_CHUNKS;
+#[cfg(unix)]
 const TIMED_OUT_RELOAD_ID_CAPACITY: usize = 64;
 
 // Request workers are synchronous threads, but their HTTP work is async. Keep
@@ -687,8 +691,8 @@ fn run_relay_session(
     ws_url: &Url,
     auth_value: HeaderValue,
     endpoints: Vec<EndpointInventory>,
-    control: &mut ControlServer,
-    mut last_inventory_revision: &mut Option<crate::protocol::InventoryRevision>,
+    _control: &mut ControlServer,
+    last_inventory_revision: &mut Option<crate::protocol::InventoryRevision>,
 ) -> RelaySessionResult<()> {
     let mut request = ws_url
         .as_str()
@@ -809,10 +813,10 @@ fn run_relay_session(
 
         #[cfg(unix)]
         if let Err(error) = handle_control_requests(
-            control,
+            _control,
             &mut socket,
             config,
-            &mut last_inventory_revision,
+            last_inventory_revision,
             &mut pending_reload,
             &mut timed_out_reload_candidates,
             &mut pending_preparation,
@@ -839,7 +843,7 @@ fn run_relay_session(
             Ok(Message::Text(text)) => handle_text(
                 &mut socket,
                 config,
-                &mut last_inventory_revision,
+                last_inventory_revision,
                 #[cfg(unix)]
                 &mut pending_reload,
                 #[cfg(unix)]
@@ -942,9 +946,10 @@ fn worker_frame_is_current(workers: &BTreeMap<String, WorkerHandle>, request_id:
     workers.contains_key(request_id)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_worker_output<S>(
     socket: &mut tungstenite::WebSocket<S>,
-    config: &mut Config,
+    _config: &mut Config,
     worker_rx: &Receiver<FromWorker>,
     workers: &mut BTreeMap<String, WorkerHandle>,
     recent_finished: &mut RecentlyFinished,
@@ -1029,8 +1034,8 @@ where
                 // server can durably expose this inventory. If the server
                 // rejects it we restore `previous`; before persistence the
                 // candidate cannot receive a server-selected request.
-                let previous = config.clone();
-                *config = pending_reload_routing_map(&previous, &candidate);
+                let previous = _config.clone();
+                *_config = pending_reload_routing_map(&previous, &candidate);
                 *pending_reload = Some((
                     id,
                     candidate,
@@ -1070,6 +1075,7 @@ where
 /// While an inventory replacement is pending, preserve routes for the old
 /// acknowledged slugs and make candidate slugs available for an early server
 /// dispatch. The exact candidate becomes live only at `inventory.ok`.
+#[cfg(unix)]
 fn pending_reload_routing_map(previous: &Config, candidate: &Config) -> Config {
     let mut combined = candidate.clone();
     for endpoint in &previous.endpoints {
@@ -1080,10 +1086,12 @@ fn pending_reload_routing_map(previous: &Config, candidate: &Config) -> Config {
     combined
 }
 
+#[cfg(unix)]
 fn restore_previous_routing_after_timeout(config: &mut Config, previous: &Config) {
     *config = previous.clone();
 }
 
+#[cfg(unix)]
 fn inventory_digest_for_config(config: &Config) -> String {
     let inventory = config
         .endpoints
@@ -1219,6 +1227,7 @@ fn desired_config_snapshot() -> Result<Config> {
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn handle_control_requests<S>(
     control_server: &mut ControlServer,
     _socket: &mut tungstenite::WebSocket<S>,
@@ -1317,6 +1326,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_text<S>(
     socket: &mut tungstenite::WebSocket<S>,
     config: &mut Config,
@@ -1342,6 +1352,8 @@ where
             tracing::debug!(id, "relay heartbeat acknowledged");
         }
         ServerControlMessage::InventoryOk { id, revision } => {
+            #[cfg(not(unix))]
+            let _ = &id;
             #[cfg(unix)]
             if pending_reload
                 .as_ref()
@@ -1937,7 +1949,7 @@ fn terminal_usage_from_response(bytes: &[u8]) -> Option<crate::protocol::RelayUs
                             .and_then(|data| serde_json::from_str::<Completion>(data).ok())
                             .and_then(|completion| completion.usage)
                     })
-                    .last()
+                    .next_back()
             })
         })
 }
@@ -2333,7 +2345,10 @@ fn inventory_from_config(config: &mut Config) -> Vec<EndpointInventory> {
                 .cloned()
                 .map(|endpoint| {
                     let probe_endpoint_config = endpoint.clone();
-                    (endpoint, scope.spawn(move || probe_endpoint(&probe_endpoint_config)))
+                    (
+                        endpoint,
+                        scope.spawn(move || probe_endpoint(&probe_endpoint_config)),
+                    )
                 })
                 .collect::<Vec<_>>();
             handles
@@ -3045,6 +3060,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn pending_reload_routes_both_old_and_candidate_slugs_until_acknowledgement() {
         let mut live = Config::default();
@@ -3072,6 +3088,7 @@ mod tests {
         assert!(candidate.endpoint("new-endpoint").is_some());
     }
 
+    #[cfg(unix)]
     #[test]
     fn acknowledgement_timeout_restores_previous_routes_before_late_acknowledgement() {
         let mut previous = Config::default();

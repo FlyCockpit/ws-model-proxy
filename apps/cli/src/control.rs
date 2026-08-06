@@ -20,14 +20,18 @@ use nix::sys::socket::{getsockopt, sockopt};
 #[cfg(unix)]
 use nix::unistd::Uid;
 
-use anyhow::{Context, Result};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+#[cfg(unix)]
 const CONTROL_MAX_REQUEST_BYTES: usize = 4096;
 /// Status includes one row per locally configured endpoint, so it needs a
 /// materially larger bound than the tiny command request. Keep this finite to
 /// prevent a compromised local daemon from making the CLI allocate without
 /// limit.
+#[cfg(unix)]
 const CONTROL_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 #[cfg(unix)]
 const CONTROL_READ_DEADLINE: Duration = Duration::from_secs(2);

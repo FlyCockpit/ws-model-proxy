@@ -70,7 +70,7 @@ function buildContext(
         id: "session-1",
         userId: sessionOverride?.user?.id ?? "user-1",
         token: "session-token",
-        expiresAt: new Date("2026-07-02T00:00:00.000Z"),
+        expiresAt: new Date(Date.now() + 60_000),
         ipAddress: "127.0.0.1",
         userAgent: "vitest",
         createdAt: new Date("2026-01-01T00:00:00.000Z"),
@@ -172,7 +172,7 @@ describe("cliCredentialsRouter", () => {
   });
 
   it("exchanges an approved device code without a session and creates a CLI device", async () => {
-    const expiresAt = new Date("2026-08-01T00:10:00.000Z");
+    const expiresAt = new Date(Date.now() + 10 * 60_000);
     db.deviceCode.findUnique.mockResolvedValue({
       id: "device-code-row-1",
       userId: "user-1",
@@ -263,7 +263,7 @@ describe("cliCredentialsRouter", () => {
     db.deviceCode.findUnique.mockResolvedValue({
       id: "device-code-row-1",
       userId: "user-1",
-      expiresAt: new Date("2026-08-01T00:10:00.000Z"),
+      expiresAt: new Date(Date.now() + 10 * 60_000),
       status: "approved",
       lastPolledAt: null,
       pollingInterval: 5,
@@ -295,7 +295,7 @@ describe("cliCredentialsRouter", () => {
     db.deviceCode.findUnique.mockResolvedValue({
       id: "device-code-row-1",
       userId: "approved-user",
-      expiresAt: new Date("2026-08-01T00:10:00.000Z"),
+      expiresAt: new Date(Date.now() + 10 * 60_000),
       status: "approved",
       lastPolledAt: null,
       pollingInterval: 5,

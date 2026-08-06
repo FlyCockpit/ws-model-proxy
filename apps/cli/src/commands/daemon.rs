@@ -8,9 +8,13 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::{Command, Stdio};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
@@ -19,7 +23,9 @@ use crate::control::{self, ControlCommand};
 use crate::output;
 
 const PID_FILE_VERSION: u32 = 1;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const PID_CLAIM_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 const NO_DETACHED_RELAY_MESSAGE: &str = "no detached relay is running; service-managed relays are not checked (run `wsmp service status`)";
@@ -247,6 +253,7 @@ pub fn live_detached_owner(record: &PidRecord) -> bool {
     process_running(record.pid) && process_looks_like_wsmp_daemon(record.pid, &record.token)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn new_detach_token() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -535,9 +542,9 @@ pub fn run_status(json: bool) -> Result<()> {
             for line in format_live_status(&response) {
                 output::line(line)?;
             }
-            return Ok(());
+            Ok(())
         }
-        Err(control_error) => return report_control_status_failure(json, control_error),
+        Err(control_error) => report_control_status_failure(json, control_error),
     }
 }
 

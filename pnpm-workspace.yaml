@@ -6,14 +6,26 @@ minimumReleaseAgeStrict: true
 minimumReleaseAgeIgnoreMissingTime: false
 # Excludes for packages that fail the 7-day minimum-age check on re-resolution.
 minimumReleaseAgeExclude:
-# Each selector lifts a transitive out of its vulnerable range. All target
-# versions pass the 7-day minimumReleaseAge gate; selectors are scoped tight so
-# unrelated majors are untouched.
+  # Security releases are allowed through immediately; exact pins keep the
+  # exception from weakening the age gate for future versions.
+  - brace-expansion@2.1.4||5.0.9 # CVE-2026-13149 / CVE-2026-14257 / CVE-2026-69152
+  - fast-uri@4.1.2 # CVE-2026-16221 / CVE-2026-18446
+# Each selector lifts a transitive out of its vulnerable range. Selectors are
+# scoped tightly so unrelated majors are untouched; explicitly listed security
+# releases above are the only exceptions to the 7-day minimum-age gate.
 overrides:
   hono@<4.12.25: ">=4.12.25" # CVE-2026-54290 (CORS credential origin reflection)
   picomatch@>=4 <4.0.4: ">=4.0.4" # CVE-2026-33671 (ReDoS via extglob)
   defu@<6.1.5: ">=6.1.5" # CVE-2026-35209 (prototype pollution)
   fast-uri@<3.1.2: ">=3.1.2" # CVE-2026-6321 / CVE-2026-6322 (path traversal)
+  "brace-expansion@>=2 <2.1.4": 2.1.4 # denial-of-service fixes
+  "brace-expansion@>=5 <5.0.9": 5.0.9 # denial-of-service fixes
+  "fast-uri@>=4 <4.1.2": 4.1.2 # denial-of-service and host-confusion fixes
+  "ajv@8.20.0>fast-uri": 4.1.2 # pnpm 11.1 does not re-resolve the ranged override from the existing lock entry
+  "ip-address@>=10 <10.3.1": 10.3.1 # CVE-2026-69192
+  "postcss@>=8 <8.5.18": 8.5.18 # GHSA-r28c-9q8g-f849 (path traversal)
+  "sharp@>=0.33 <0.35.0": 0.35.0 # GHSA-f88m-g3jw-g9cj (libvips vulnerabilities)
+  "undici@>=7 <7.29.0": 7.29.0 # CVE-2026-13697
   # CVE-2026-44635 (JSON-path injection) is patched in 0.28.17. Pinned EXACT
   # (not just `>=0.28.17`) to dedupe @better-auth/core: better-auth 1.6.11 peers
   # `kysely ^0.28.17` (excludes the otherwise-hoisted 0.29.0), and duplicate
@@ -75,7 +87,7 @@ catalog:
   typescript: ^6.0.3
   vite: ^8.1.1
   "@vitejs/plugin-react": ^6.0.3
-  postcss: ^8.5.16
+  postcss: ^8.5.18
   "@tanstack/react-form": ^1.33.0
   "@tanstack/react-query": ^5.101.2
   "@tanstack/react-query-devtools": ^5.101.2
