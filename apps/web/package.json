@@ -16,7 +16,7 @@
     "@fontsource-variable/inter": "catalog:",
     "@orpc/client": "catalog:",
     "@orpc/server": "catalog:",
-    "@orpc/tanstack-query": "^1.14.6",
+    "@orpc/tanstack-query": "^1.14.13",
     "@prisma/client": "catalog:",
     "@tanstack/react-form": "catalog:",
     "@tanstack/react-query": "catalog:",
@@ -29,7 +29,7 @@
     "@ws-model-proxy/env": "workspace:*",
     "@ws-model-proxy/ui": "workspace:*",
     "better-auth": "catalog:",
-    "crossws": "^0.4.6",
+    "crossws": "^0.4.10",
     "highlight.js": "catalog:",
     "i18next": "catalog:",
     "i18next-browser-languagedetector": "catalog:",
@@ -49,7 +49,7 @@
     "zustand": "^5.0.14"
   },
   "devDependencies": {
-    "@tailwindcss/vite": "^4.3.2",
+    "@tailwindcss/vite": "^4.3.3",
     "@tanstack/react-query-devtools": "catalog:",
     "@tanstack/react-router-devtools": "catalog:",
     "@types/node": "catalog:",
