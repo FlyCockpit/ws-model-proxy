@@ -161,6 +161,7 @@ export class RelaySessionManager {
             id: message.id,
             protocolVersion: RELAY_PROTOCOL_VERSION,
             revision: registration.revision,
+            desiredCapabilities: registration.desiredCapabilities,
           }),
         );
       } catch (error) {
@@ -214,6 +215,7 @@ export class RelaySessionManager {
             type: "inventory.ok",
             id: message.id,
             revision: registration.revision,
+            desiredCapabilities: registration.desiredCapabilities,
           }),
         );
       } catch (error) {

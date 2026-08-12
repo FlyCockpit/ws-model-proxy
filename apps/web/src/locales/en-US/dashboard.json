@@ -54,6 +54,12 @@
       "modelsFailed": "Failed to load visible models.",
       "streamFailed": "Failed to stream the response."
     },
+    "transform": {
+      "title": "What the primary saw (transformer)",
+      "summary": "{{model}} · {{latency}} s · {{cache}} · {{tools}} tools forwarded",
+      "cacheHit": "cache hit",
+      "cacheMiss": "cache miss"
+    },
     "fixturePrompt": "Fixture prompt {{index}}",
     "fixtureResponse": "Fixture response {{index}}\n\n```text\nblock {{index}}\n```",
     "freshChat": "Fresh chat",
@@ -108,10 +114,15 @@
   },
   "models": {
     "capabilities": "Capabilities",
+    "capabilityHint": "Advertised input types. Probe never infers these from the model id.",
+    "capabilitySaved": "Model capabilities saved. This dashboard override is authoritative; the CLI copies it on the next hello or reload.",
     "immutable": "Discovered model IDs are immutable.",
     "lastSeen": "Last seen",
     "modelId": "Model ID",
-    "upstream": "Upstream"
+    "upstream": "Upstream",
+    "vision": "Images",
+    "audio": "Audio",
+    "video": "Video"
   },
   "nav": {
     "ariaLabel": "Dashboard sections",
@@ -197,6 +208,15 @@
     "transformerPromptPlaceholder": "Leave empty for the built-in describe-attachments prompt",
     "transformerTitle": "Media transformer",
     "transformerVideo": "Transform video attachments",
+    "transformerIncludeTools": "Forward primary tool names and descriptions",
+    "transformerIncludeToolsHint": "Off by default. Sends only tool name + description, never schemas or arguments.",
+    "transformerMaxTools": "Max tools",
+    "transformerMaxToolChars": "Max tool text characters",
+    "transformerTimeoutMs": "Transformer timeout (ms)",
+    "transformerMaxAssets": "Max attachments per request",
+    "testMember": "Test chat",
+    "testMemberSuccess": "Chat probe succeeded; health reset to healthy.",
+    "testMemberFailed": "Chat probe failed: {{error}}",
     "typeEmail": "Type the email to confirm",
     "typeModelId": "Type the model ID to confirm",
     "typePoolName": "Type the pool name to confirm",
@@ -236,7 +256,7 @@
     "allVisible": "All visible",
     "allowlist": "Allowlist",
     "allowlistModels": "Allowlisted models",
-    "cliDescription": "Create and revoke product-native CLI tokens. Raw secrets are shown only once.",
+    "cliDescription": "Create and revoke product-native CLI tokens used to register a relay. These are not model API tokens. Raw secrets are shown only once.",
     "cliSecret": "CLI token secret",
     "cliTitle": "CLI Tokens",
     "create": "Create token",
@@ -253,7 +273,7 @@
     "empty": "No active tokens yet.",
     "lastUsed": "Last used",
     "loadFailed": "Failed to load tokens.",
-    "modelApiDescription": "Create OpenAI-compatible API tokens for visible direct models and pools.",
+    "modelApiDescription": "Create OpenAI-compatible API tokens for clients that call /v1. These are not CLI relay tokens.",
     "modelApiSecret": "Model API token secret",
     "modelApiTitle": "Model API Tokens",
     "name": "Name",

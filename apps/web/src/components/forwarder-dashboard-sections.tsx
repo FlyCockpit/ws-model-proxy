@@ -6,6 +6,7 @@ import {
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { validateForwarderPoolSlug } from "@ws-model-proxy/config/forwarder-identifiers";
+import { env } from "@ws-model-proxy/env/web";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
 import {
@@ -236,6 +237,54 @@ function modelTransformerCaps(model: DirectModelOption): {
   };
 }
 
+function ModelCapabilityToggles({
+  modelId,
+  vision,
+  audio,
+  video,
+  disabled,
+  onChange,
+}: {
+  modelId: string;
+  vision: boolean;
+  audio: boolean;
+  video: boolean;
+  disabled: boolean;
+  onChange: (next: { vision: boolean; audio: boolean; video: boolean }) => void;
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  const options = [
+    { key: "vision" as const, label: t("dashboard:models.vision"), checked: vision },
+    { key: "audio" as const, label: t("dashboard:models.audio"), checked: audio },
+    { key: "video" as const, label: t("dashboard:models.video"), checked: video },
+  ];
+  return (
+    <div className="flex flex-wrap gap-3" aria-label={t("dashboard:models.capabilities")}>
+      {options.map((option) => (
+        <label
+          key={`${modelId}-${option.key}`}
+          className="inline-flex min-h-11 items-center gap-2 text-xs"
+        >
+          <input
+            type="checkbox"
+            className="size-4"
+            checked={option.checked}
+            disabled={disabled}
+            onChange={(event) =>
+              onChange({
+                vision: option.key === "vision" ? event.target.checked : vision,
+                audio: option.key === "audio" ? event.target.checked : audio,
+                video: option.key === "video" ? event.target.checked : video,
+              })
+            }
+          />
+          {option.label}
+        </label>
+      ))}
+    </div>
+  );
+}
+
 /** Model is eligible if published (model + endpoint) and supports enabled modalities. */
 function modelSupportsTransformerModalities(
   model: DirectModelOption,
@@ -327,6 +376,14 @@ export function CliEndpointsModelsSection() {
         queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:metadata.deleted"));
         setDeleteTarget(null);
+      },
+    }),
+  );
+  const updateModelCapabilities = useMutation(
+    orpc.forwarderManagement.updateDiscoveredModelCapabilities.mutationOptions({
+      onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
+        toast.success(t("dashboard:models.capabilitySaved"));
       },
     }),
   );
@@ -511,9 +568,43 @@ export function CliEndpointsModelsSection() {
                                   {model.upstreamModelId}
                                 </td>
                                 <td className="py-2 pr-3 align-top">
-                                  {model.effectiveCapabilities.coarse.length > 0
-                                    ? model.effectiveCapabilities.coarse.join(", ")
-                                    : "—"}
+                                  <ModelCapabilityToggles
+                                    modelId={model.id}
+                                    vision={
+                                      modelTransformerCaps({
+                                        ...model,
+                                        endpointPublished: endpoint.published,
+                                        cliSlug: device.slug,
+                                        endpointSlug: endpoint.slug,
+                                        endpointLabel: endpoint.label,
+                                        endpointCapabilityMetadata: endpoint.capabilityMetadata,
+                                      }).images
+                                    }
+                                    audio={
+                                      modelTransformerCaps({
+                                        ...model,
+                                        endpointPublished: endpoint.published,
+                                        cliSlug: device.slug,
+                                        endpointSlug: endpoint.slug,
+                                        endpointLabel: endpoint.label,
+                                        endpointCapabilityMetadata: endpoint.capabilityMetadata,
+                                      }).audio
+                                    }
+                                    video={
+                                      modelTransformerCaps({
+                                        ...model,
+                                        endpointPublished: endpoint.published,
+                                        cliSlug: device.slug,
+                                        endpointSlug: endpoint.slug,
+                                        endpointLabel: endpoint.label,
+                                        endpointCapabilityMetadata: endpoint.capabilityMetadata,
+                                      }).video
+                                    }
+                                    disabled={updateModelCapabilities.isPending}
+                                    onChange={(next) =>
+                                      updateModelCapabilities.mutate({ id: model.id, ...next })
+                                    }
+                                  />
                                 </td>
                                 <td className="py-2 pr-3 align-top tabular-nums">
                                   {formatDate(model.lastSeenAt)}
@@ -596,6 +687,7 @@ export function PoolsSection() {
   const [revokeGrant, setRevokeGrant] = useState<{ pool: ModelPool; grant: PoolGrant } | null>(
     null,
   );
+  const [testingMemberId, setTestingMemberId] = useState<string | null>(null);
   const directModels = useMemo(() => allDirectModels(devicesData ?? []), [devicesData]);
 
   const onChanged = () => {
@@ -780,6 +872,50 @@ export function PoolsSection() {
                               <td className="py-2 pr-3 align-top">{member.healthStatus}</td>
                               <td className="py-2 pl-3 align-top">
                                 <div className="flex justify-end gap-1">
+                                  {member.model.supportsChat ? (
+                                    <Button
+                                      type="button"
+                                      variant="ghost"
+                                      size="touch"
+                                      disabled={testingMemberId === member.id}
+                                      onClick={async () => {
+                                        setTestingMemberId(member.id);
+                                        try {
+                                          const response = await fetch(
+                                            `${env.VITE_SERVER_URL}/api/internal/pools/members/${member.id}/test`,
+                                            {
+                                              method: "POST",
+                                              credentials: "include",
+                                            },
+                                          );
+                                          const payload = (await response.json()) as {
+                                            ok?: boolean;
+                                            error?: string;
+                                          };
+                                          if (!response.ok || !payload.ok) {
+                                            throw new Error(
+                                              payload.error ?? `HTTP ${response.status}`,
+                                            );
+                                          }
+                                          onChanged();
+                                          toast.success(t("dashboard:pools.testMemberSuccess"));
+                                        } catch (error) {
+                                          toast.error(
+                                            t("dashboard:pools.testMemberFailed", {
+                                              error:
+                                                error instanceof Error
+                                                  ? error.message
+                                                  : String(error),
+                                            }),
+                                          );
+                                        } finally {
+                                          setTestingMemberId(null);
+                                        }
+                                      }}
+                                    >
+                                      {t("dashboard:pools.testMember")}
+                                    </Button>
+                                  ) : null}
                                   <Button
                                     type="button"
                                     variant="ghost"
@@ -993,6 +1129,11 @@ function PoolForm({
     transformerVideo: z.boolean(),
     transformerCacheMode: z.enum(["OFF", "MEMORY"]),
     transformerSystemPrompt: z.string().max(16_000),
+    transformerIncludePrimaryTools: z.boolean(),
+    transformerMaxTools: z.number().int().min(1).max(128),
+    transformerMaxToolChars: z.number().int().min(256).max(32_000),
+    transformerTimeoutMs: z.string(),
+    transformerMaxAssets: z.string(),
   });
   const createPool = useMutation(
     orpc.forwarderManagement.createModelPool.mutationOptions({
@@ -1023,6 +1164,13 @@ function PoolForm({
       transformerVideo: pool?.transformer.video ?? false,
       transformerCacheMode: pool?.transformer.cacheMode === "MEMORY" ? "MEMORY" : "OFF",
       transformerSystemPrompt: pool?.transformer.systemPrompt ?? "",
+      transformerIncludePrimaryTools: pool?.transformer.includePrimaryTools ?? false,
+      transformerMaxTools: pool?.transformer.maxTools ?? 32,
+      transformerMaxToolChars: pool?.transformer.maxToolChars ?? 8000,
+      transformerTimeoutMs:
+        pool?.transformer.timeoutMs != null ? String(pool.transformer.timeoutMs) : "",
+      transformerMaxAssets:
+        pool?.transformer.maxAssets != null ? String(pool.transformer.maxAssets) : "",
     },
     validators: { onSubmit: poolSchema },
     onSubmit: async ({ value }) => {
@@ -1047,6 +1195,15 @@ function PoolForm({
           transformerCacheMode: value.transformerCacheMode as "OFF" | "MEMORY",
           transformerSystemPrompt: value.transformerSystemPrompt.trim()
             ? value.transformerSystemPrompt.trim()
+            : null,
+          transformerIncludePrimaryTools: value.transformerIncludePrimaryTools,
+          transformerMaxTools: value.transformerMaxTools,
+          transformerMaxToolChars: value.transformerMaxToolChars,
+          transformerTimeoutMs: value.transformerTimeoutMs.trim()
+            ? Number(value.transformerTimeoutMs)
+            : null,
+          transformerMaxAssets: value.transformerMaxAssets.trim()
+            ? Number(value.transformerMaxAssets)
             : null,
         });
       }
@@ -1247,6 +1404,82 @@ function PoolForm({
               </div>
             )}
           </form.Field>
+          <form.Field name="transformerIncludePrimaryTools">
+            {(field) => (
+              <label className="flex min-h-11 items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  className="size-4"
+                  checked={field.state.value}
+                  onChange={(event) => field.handleChange(event.target.checked)}
+                />
+                {t("dashboard:pools.transformerIncludeTools")}
+              </label>
+            )}
+          </form.Field>
+          <p className="-mt-2 text-xs text-muted-foreground">
+            {t("dashboard:pools.transformerIncludeToolsHint")}
+          </p>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <form.Field name="transformerMaxTools">
+              {(field) => (
+                <div className="space-y-2">
+                  <Label htmlFor={field.name}>{t("dashboard:pools.transformerMaxTools")}</Label>
+                  <Input
+                    id={field.name}
+                    type="number"
+                    min={1}
+                    max={128}
+                    value={field.state.value}
+                    onChange={(event) => field.handleChange(Number(event.target.value))}
+                  />
+                </div>
+              )}
+            </form.Field>
+            <form.Field name="transformerMaxToolChars">
+              {(field) => (
+                <div className="space-y-2">
+                  <Label htmlFor={field.name}>{t("dashboard:pools.transformerMaxToolChars")}</Label>
+                  <Input
+                    id={field.name}
+                    type="number"
+                    min={256}
+                    max={32000}
+                    value={field.state.value}
+                    onChange={(event) => field.handleChange(Number(event.target.value))}
+                  />
+                </div>
+              )}
+            </form.Field>
+            <form.Field name="transformerTimeoutMs">
+              {(field) => (
+                <div className="space-y-2">
+                  <Label htmlFor={field.name}>{t("dashboard:pools.transformerTimeoutMs")}</Label>
+                  <Input
+                    id={field.name}
+                    inputMode="numeric"
+                    value={field.state.value}
+                    onChange={(event) => field.handleChange(event.target.value)}
+                    placeholder="120000"
+                  />
+                </div>
+              )}
+            </form.Field>
+            <form.Field name="transformerMaxAssets">
+              {(field) => (
+                <div className="space-y-2">
+                  <Label htmlFor={field.name}>{t("dashboard:pools.transformerMaxAssets")}</Label>
+                  <Input
+                    id={field.name}
+                    inputMode="numeric"
+                    value={field.state.value}
+                    onChange={(event) => field.handleChange(event.target.value)}
+                    placeholder="16"
+                  />
+                </div>
+              )}
+            </form.Field>
+          </div>
           <form.Field name="transformerSystemPrompt">
             {(field) => (
               <div className="space-y-2">

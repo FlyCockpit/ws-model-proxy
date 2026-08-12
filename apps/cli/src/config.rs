@@ -158,6 +158,9 @@ pub struct ModelConfig {
     pub capability_override_mode: CapabilityOverrideMode,
     pub capabilities: Option<OpenAiCompatibleCapabilities>,
     pub probe_suggestions: Option<OpenAiCompatibleCapabilities>,
+    /// When true, a successful probe keeps this model even if `/v1/models` omits it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pinned: bool,
 }
 
 impl Default for ModelConfig {
@@ -168,6 +171,7 @@ impl Default for ModelConfig {
             capability_override_mode: CapabilityOverrideMode::Inherit,
             capabilities: None,
             probe_suggestions: None,
+            pinned: false,
         }
     }
 }

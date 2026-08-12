@@ -22,6 +22,13 @@ function isSerializationConflict(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "P2034";
 }
 
+export type DesiredModelCapability = {
+  endpointSlug: string;
+  upstreamModelId: string;
+  capabilityOverrideMode: "override";
+  capabilities: OpenAiCompatibleCapabilities;
+};
+
 export class RelayRegistrationError extends Error {
   constructor(
     message: string,
@@ -73,6 +80,44 @@ function coarseModelCapabilities(
   if (capabilities.audio?.speech) values.add("AUDIO_OUTPUT");
   if (capabilities.responses?.supported) values.add("RESPONSES_API");
   return [...values];
+}
+
+export function shouldPreserveDashboardCapabilityOverride(
+  origin: string | null | undefined,
+): boolean {
+  return origin === "DASHBOARD";
+}
+
+async function loadDesiredModelCapabilities(
+  cliDeviceId: string,
+): Promise<DesiredModelCapability[]> {
+  const rows = await prisma.discoveredModel.findMany({
+    where: {
+      Endpoint: { cliDeviceId },
+      published: true,
+      capabilityOverrideMode: "OVERRIDE",
+      capabilityOverrideOrigin: "DASHBOARD",
+    },
+    select: {
+      upstreamModelId: true,
+      capabilityOverrideMetadata: true,
+      Endpoint: { select: { slug: true } },
+    },
+  });
+  const desired: DesiredModelCapability[] = [];
+  if (!Array.isArray(rows)) return desired;
+  for (const row of rows) {
+    if (!row.capabilityOverrideMetadata || typeof row.capabilityOverrideMetadata !== "object") {
+      continue;
+    }
+    desired.push({
+      endpointSlug: row.Endpoint.slug,
+      upstreamModelId: row.upstreamModelId,
+      capabilityOverrideMode: "override",
+      capabilities: row.capabilityOverrideMetadata as OpenAiCompatibleCapabilities,
+    });
+  }
+  return desired;
 }
 
 function jsonOrUndefined(value: OpenAiCompatibleCapabilities | undefined): JsonValue | undefined {
@@ -138,6 +183,7 @@ export async function persistRelayRegistration({
   cliDeviceId: string;
   userId: string;
   revision: { inventorySeq: number; inventoryDigest: string; inventoryAcknowledgedAt: string };
+  desiredCapabilities: DesiredModelCapability[];
 }> {
   const cliSlug = assertSlug(cli.slug, "CLI slug");
   for (const endpoint of endpoints) {
@@ -148,7 +194,7 @@ export async function persistRelayRegistration({
 
   for (let attempt = 1; attempt <= INVENTORY_TRANSACTION_MAX_ATTEMPTS; attempt += 1) {
     try {
-      return await prisma.$transaction(
+      const persisted = await prisma.$transaction(
         async (tx) => {
           const user = await tx.user.findUnique({
             where: { id: identity.userId },
@@ -277,6 +323,19 @@ export async function persistRelayRegistration({
                 model.capabilityOverrideMode === "override"
                   ? coarseModelCapabilities(model.capabilities)
                   : [];
+              const existingModel = await tx.discoveredModel.findUnique({
+                where: {
+                  endpointId_upstreamModelId: {
+                    endpointId: persistedEndpoint.id,
+                    upstreamModelId: model.upstreamModelId,
+                  },
+                },
+                select: { capabilityOverrideMode: true, capabilityOverrideOrigin: true },
+              });
+              const incomingOverride = model.capabilityOverrideMode === "override";
+              const keepDashboardOverride = shouldPreserveDashboardCapabilityOverride(
+                existingModel?.capabilityOverrideOrigin,
+              );
               const discoveredModel = await tx.discoveredModel.upsert({
                 where: {
                   endpointId_upstreamModelId: {
@@ -293,15 +352,18 @@ export async function persistRelayRegistration({
                     endpointSlug: persistedEndpoint.slug,
                     upstreamModelId: model.upstreamModelId,
                   }),
-                  capabilityOverrideMode:
-                    model.capabilityOverrideMode === "override"
-                      ? "OVERRIDE"
-                      : "INHERIT_ENDPOINT_DEFAULTS",
-                  capabilityOverrides: { set: overrideCapabilities },
-                  capabilityOverrideMetadata:
-                    model.capabilityOverrideMode === "override"
-                      ? jsonOrUndefined(model.capabilities)
-                      : undefined,
+                  ...(keepDashboardOverride
+                    ? {}
+                    : {
+                        capabilityOverrideMode: incomingOverride
+                          ? "OVERRIDE"
+                          : "INHERIT_ENDPOINT_DEFAULTS",
+                        capabilityOverrides: { set: overrideCapabilities },
+                        capabilityOverrideMetadata: incomingOverride
+                          ? jsonOrUndefined(model.capabilities)
+                          : undefined,
+                        capabilityOverrideOrigin: incomingOverride ? "CLI" : null,
+                      }),
                   probeSuggestions: jsonOrUndefined(model.probeSuggestions),
                   lastSeenAt: now,
                   published: true,
@@ -327,6 +389,7 @@ export async function persistRelayRegistration({
                     model.capabilityOverrideMode === "override"
                       ? jsonOrUndefined(model.capabilities)
                       : undefined,
+                  capabilityOverrideOrigin: incomingOverride ? "CLI" : null,
                   probeSuggestions: jsonOrUndefined(model.probeSuggestions),
                   lastSeenAt: now,
                   published: true,
@@ -402,6 +465,10 @@ export async function persistRelayRegistration({
         },
         { isolationLevel: "Serializable" },
       );
+      return {
+        ...persisted,
+        desiredCapabilities: await loadDesiredModelCapabilities(persisted.cliDeviceId),
+      };
     } catch (error) {
       if (!isSerializationConflict(error) || attempt === INVENTORY_TRANSACTION_MAX_ATTEMPTS) {
         throw error;

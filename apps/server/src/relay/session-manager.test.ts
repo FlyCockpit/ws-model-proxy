@@ -37,6 +37,8 @@ const db = prisma as unknown as {
     updateMany: MockInstance;
   };
   discoveredModel: {
+    findUnique: MockInstance;
+    findMany: MockInstance;
     upsert: MockInstance;
     updateMany: MockInstance;
   };
@@ -140,6 +142,8 @@ function seedRegistrationMocks() {
   db.endpoint.findUnique.mockResolvedValue(null);
   db.endpoint.upsert.mockResolvedValue({ id: "endpoint-id", slug: "local-openai" });
   db.endpoint.updateMany.mockResolvedValue({ count: 0 });
+  db.discoveredModel.findUnique.mockResolvedValue(null);
+  db.discoveredModel.findMany.mockResolvedValue([]);
   db.discoveredModel.upsert.mockResolvedValue({ id: "model-id" });
   db.discoveredModel.updateMany.mockResolvedValue({ count: 0 });
   db.poolMember.updateMany.mockResolvedValue({ count: 1 });
@@ -225,6 +229,7 @@ describe("RelaySessionManager", () => {
         inventoryDigest: "digest",
         inventoryAcknowledgedAt: now.toISOString(),
       },
+      desiredCapabilities: [],
     });
     expect(db.endpoint.upsert).toHaveBeenCalledWith(
       expect.objectContaining({

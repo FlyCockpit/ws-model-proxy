@@ -32,6 +32,13 @@ enum ModelCapabilityOverrideMode {
   OVERRIDE
 }
 
+/// Who last authored a model capability override. Dashboard-authored overrides
+/// are server-authoritative; CLI-authored ones remain editable via inventory.
+enum ModelCapabilityOverrideOrigin {
+  CLI
+  DASHBOARD
+}
+
 enum PoolMemberHealthStatus {
   UNKNOWN
   HEALTHY
@@ -189,30 +196,31 @@ model Endpoint {
 }
 
 model DiscoveredModel {
-  id                            String                        @id @default(cuid(2))
-  createdAt                     DateTime                      @default(now())
-  updatedAt                     DateTime                      @default(now()) @updatedAt
+  id                            String                         @id @default(cuid(2))
+  createdAt                     DateTime                       @default(now())
+  updatedAt                     DateTime                       @default(now()) @updatedAt
   userId                        String
   endpointId                    String
   slug                          String?
   upstreamModelId               String
   encodedModelId                String
-  capabilityOverrideMode        ModelCapabilityOverrideMode   @default(INHERIT_ENDPOINT_DEFAULTS)
-  capabilityOverrides           ModelCapability[]             @default([])
+  capabilityOverrideMode        ModelCapabilityOverrideMode    @default(INHERIT_ENDPOINT_DEFAULTS)
+  capabilityOverrides           ModelCapability[]              @default([])
   capabilityOverrideMetadata    Json?
+  capabilityOverrideOrigin      ModelCapabilityOverrideOrigin?
   probeSuggestions              Json?
   lastSeenAt                    DateTime?
-  published                     Boolean                       @default(true)
+  published                     Boolean                        @default(true)
   unpublishedAt                 DateTime?
-  User                          User                          @relation("DiscoveredModelOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  Endpoint                      Endpoint                      @relation(fields: [endpointId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  User                          User                           @relation("DiscoveredModelOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Endpoint                      Endpoint                       @relation(fields: [endpointId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   PoolMembers                   PoolMember[]
-  TransformerForPools           ModelPool[]                   @relation("ModelPoolTransformer")
+  TransformerForPools           ModelPool[]                    @relation("ModelPoolTransformer")
   ModelApiTokenAllowlistEntries ModelApiTokenAllowlistEntry[]
-  ResponseStickinessTargets     ResponseStickinessRecord[]    @relation("ResponseStickinessTargetModel")
-  ResponseStickinessSelections  ResponseStickinessRecord[]    @relation("ResponseStickinessSelectedModel")
-  RequestedRelayRequests        RelayRequest[]                @relation("RelayRequestRequestedModel")
-  SelectedRelayRequests         RelayRequest[]                @relation("RelayRequestSelectedModel")
+  ResponseStickinessTargets     ResponseStickinessRecord[]     @relation("ResponseStickinessTargetModel")
+  ResponseStickinessSelections  ResponseStickinessRecord[]     @relation("ResponseStickinessSelectedModel")
+  RequestedRelayRequests        RelayRequest[]                 @relation("RelayRequestRequestedModel")
+  SelectedRelayRequests         RelayRequest[]                 @relation("RelayRequestSelectedModel")
 
   @@unique([endpointId, upstreamModelId])
   @@unique([endpointId, encodedModelId])
@@ -223,33 +231,41 @@ model DiscoveredModel {
 }
 
 model ModelPool {
-  id                            String                        @id @default(cuid(2))
-  createdAt                     DateTime                      @default(now())
-  updatedAt                     DateTime                      @default(now()) @updatedAt
-  userId                        String
-  slug                          String
-  name                          String
-  description                   String?
+  id                             String                        @id @default(cuid(2))
+  createdAt                      DateTime                      @default(now())
+  updatedAt                      DateTime                      @default(now()) @updatedAt
+  userId                         String
+  slug                           String
+  name                           String
+  description                    String?
   /// Optional OpenAI-compatible model used to turn media into text before the
   /// primary pool members run. Null = transformer disabled (default).
-  transformerDiscoveredModelId  String?
+  transformerDiscoveredModelId   String?
   /// Free-text system prompt for the transformer call. Null = built-in default.
-  transformerSystemPrompt       String?
+  transformerSystemPrompt        String?
   /// When true (default if transformer set), image_url parts are transformed.
-  transformerImages             Boolean                       @default(true)
+  transformerImages              Boolean                       @default(true)
   /// When true, input_audio / audio parts are transformed (v1 may no-op if unsupported).
-  transformerAudio              Boolean                       @default(false)
+  transformerAudio               Boolean                       @default(false)
   /// When true, video_url parts are transformed.
-  transformerVideo              Boolean                       @default(false)
+  transformerVideo               Boolean                       @default(false)
   /// Description cache policy. Default OFF so screenshot/PII text is not retained.
-  transformerCacheMode          PoolTransformerCacheMode      @default(OFF)
-  User                          User                          @relation("ModelPoolOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  TransformerDiscoveredModel    DiscoveredModel?              @relation("ModelPoolTransformer", fields: [transformerDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-  PoolMembers                   PoolMember[]
-  PoolGrants                    PoolGrant[]
-  ModelApiTokenAllowlistEntries ModelApiTokenAllowlistEntry[]
-  ResponseStickinessRecords     ResponseStickinessRecord[]
-  RelayRequests                 RelayRequest[]                @relation("RelayRequestRequestedPool")
+  transformerCacheMode           PoolTransformerCacheMode      @default(OFF)
+  /// When true, inject a size-capped name+description list of the primary request's tools.
+  transformerIncludePrimaryTools Boolean                       @default(false)
+  transformerMaxTools            Int                           @default(32)
+  transformerMaxToolChars        Int                           @default(8000)
+  /// Per-hop transformer timeout. Null uses the server default.
+  transformerTimeoutMs           Int?
+  /// Max media parts across all transform jobs in one request. Null uses the server default.
+  transformerMaxAssets           Int?
+  User                           User                          @relation("ModelPoolOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  TransformerDiscoveredModel     DiscoveredModel?              @relation("ModelPoolTransformer", fields: [transformerDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  PoolMembers                    PoolMember[]
+  PoolGrants                     PoolGrant[]
+  ModelApiTokenAllowlistEntries  ModelApiTokenAllowlistEntry[]
+  ResponseStickinessRecords      ResponseStickinessRecord[]
+  RelayRequests                  RelayRequest[]                @relation("RelayRequestRequestedPool")
 
   @@unique([userId, slug])
   @@index([userId])
@@ -390,6 +406,9 @@ model RelayRequest {
   httpStatusCode             Int?
   upstreamStatusCode         Int?
   errorClass                 String?
+  transformerLatencyMs       Int?
+  transformerCacheHit        Boolean?
+  transformerErrorClass      String?
   User                       User               @relation("RelayRequestOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ModelApiToken              ModelApiToken?     @relation(fields: [modelApiTokenId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   RequestedDiscoveredModel   DiscoveredModel?   @relation("RelayRequestRequestedModel", fields: [requestedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)

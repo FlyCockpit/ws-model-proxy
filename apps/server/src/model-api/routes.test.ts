@@ -344,6 +344,11 @@ describe("model API routes", () => {
       transformerAudio: false,
       transformerVideo: false,
       transformerCacheMode: "OFF",
+      transformerIncludePrimaryTools: false,
+      transformerMaxTools: 32,
+      transformerMaxToolChars: 8000,
+      transformerTimeoutMs: null,
+      transformerMaxAssets: null,
     });
     db.relayRequest.create.mockResolvedValue({ id: "relay-request-id" });
     db.relayRequest.update.mockResolvedValue({ id: "relay-request-id" });
@@ -983,6 +988,45 @@ describe("model API routes", () => {
     });
   });
 
+  it("relays a one-member pool whose member is still UNKNOWN (the create default)", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "member-a",
+        discoveredModelId: "model-a",
+        upstreamModelId: "upstream-a",
+        cliDeviceId: "cli-a",
+        healthStatus: "UNKNOWN",
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-a"];
+    const responsePromise = appWith(manager).request("/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "content-type": "application/json",
+      },
+      body: requestBody(poolTarget.modelId),
+    });
+
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    expect(sent.cliDeviceId).toBe("cli-a");
+    expect(firstBodyChunkText(sent)).toContain('"model":"upstream-a"');
+
+    manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+    const response = await responsePromise;
+    manager.body(sent.requestId, JSON.stringify({ id: "chatcmpl", choices: [] }));
+    manager.complete(sent.requestId);
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ id: "chatcmpl", choices: [] });
+  });
+
   it("fails over pool requests across every currently routable member before returning success", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
@@ -1232,6 +1276,11 @@ describe("model API routes", () => {
         transformerAudio: false,
         transformerVideo: false,
         transformerCacheMode: "OFF",
+        transformerIncludePrimaryTools: false,
+        transformerMaxTools: 32,
+        transformerMaxToolChars: 8000,
+        transformerTimeoutMs: null,
+        transformerMaxAssets: null,
         ...overrides,
       });
       db.discoveredModel.findUnique.mockImplementation(async (args: { where: { id: string } }) => {
@@ -1467,7 +1516,7 @@ describe("model API routes", () => {
       expect(response.status).toBeGreaterThanOrEqual(400);
       expect(manager.sent).toHaveLength(1);
       await expect(response.json()).resolves.toMatchObject({
-        error: expect.objectContaining({ message: expect.stringContaining("transformer") }),
+        error: expect.objectContaining({ message: expect.stringMatching(/transformer/i) }),
       });
     });
 

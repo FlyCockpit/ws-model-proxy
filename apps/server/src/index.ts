@@ -49,6 +49,7 @@ import {
 } from "./model-api/files.js";
 import { MODEL_API_MAX_REQUEST_BODY_BYTES } from "./model-api/limits.js";
 import { openAiErrorBody } from "./model-api/openai-errors.js";
+import { createPoolMemberTestRoutes } from "./model-api/pool-member-test.js";
 import { createModelApiRoutes } from "./model-api/routes.js";
 import {
   authLimiter,
@@ -375,6 +376,11 @@ app.use("/api/internal/chat-test/*", sessionMiddleware);
 app.use("/api/internal/chat-test/*", mediaCsrfGuard);
 app.use("/api/internal/chat-test/*", createRateLimiterMiddleware(rpcLimiter));
 app.route("/api/internal/chat-test", createChatTestRoutes());
+
+app.use("/api/internal/pools/*", sessionMiddleware);
+app.use("/api/internal/pools/*", mediaCsrfGuard);
+app.use("/api/internal/pools/*", createRateLimiterMiddleware(rpcLimiter));
+app.route("/api/internal/pools", createPoolMemberTestRoutes());
 
 // Mint fresh short-lived signed media URLs (session-authenticated, owner-
 // checked). Small JSON body, so it lives under the global 10 MB limit — no

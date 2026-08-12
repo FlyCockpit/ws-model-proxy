@@ -102,6 +102,57 @@ export function resolveEffectiveCapabilityMetadata({
   return parseOpenAiCompatibleCapabilities(endpointCapabilityMetadata);
 }
 
+export function openAiCapabilitiesFromCoarse(
+  coarse: readonly string[],
+): OpenAiCompatibleCapabilities {
+  const text = coarse.includes("TEXT_GENERATION");
+  const vision = coarse.includes("VISION_INPUT");
+  const video = coarse.includes("VIDEO_INPUT");
+  const audioInput = coarse.includes("AUDIO_INPUT");
+  const audioOutput = coarse.includes("AUDIO_OUTPUT");
+  const embedding = coarse.includes("EMBEDDING");
+  const responses = coarse.includes("RESPONSES_API");
+  return {
+    version: 1,
+    protocol: "openai-compatible",
+    models: { list: true },
+    ...(text || vision || video || audioInput
+      ? {
+          chatCompletions: {
+            supported: true,
+            streaming: true,
+            vision,
+            video,
+            audio: audioInput,
+          },
+        }
+      : {}),
+    ...(embedding ? { embeddings: { supported: true } } : {}),
+    ...(responses ? { responses: { supported: true, streaming: true } } : {}),
+    ...(audioInput || audioOutput
+      ? {
+          audio: {
+            ...(audioInput ? { transcriptions: true } : {}),
+            ...(audioOutput ? { speech: true } : {}),
+          },
+        }
+      : {}),
+  };
+}
+
+export function supportsChatCompletions({
+  capabilities,
+  coarse,
+}: {
+  capabilities: OpenAiCompatibleCapabilities | null | undefined;
+  coarse?: readonly string[] | null;
+}): boolean {
+  if (capabilities) {
+    return capabilities.chatCompletions?.supported === true;
+  }
+  return Array.isArray(coarse) && coarse.includes("TEXT_GENERATION");
+}
+
 export function transformerSupportedModalities(
   capabilities: OpenAiCompatibleCapabilities | null | undefined,
 ): TransformerModalities {

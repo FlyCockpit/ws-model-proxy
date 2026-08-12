@@ -58,6 +58,9 @@ struct ProbeArgs {
     /// Apply non-secret probe suggestions to local config.
     #[arg(long)]
     apply: bool,
+    /// When applying, drop unpinned models that were absent from this probe.
+    #[arg(long, requires = "apply")]
+    replace: bool,
 }
 
 pub fn run(args: &Args) -> Result<()> {
@@ -165,7 +168,7 @@ fn probe_endpoints(json: bool, args: &ProbeArgs) -> Result<()> {
     if args.apply {
         Config::update(true, |candidate| {
             for report in &reports {
-                apply_probe_report(candidate, report)?;
+                apply_probe_report(candidate, report, args.replace)?;
             }
             Ok(())
         })?;

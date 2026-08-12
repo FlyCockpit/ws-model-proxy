@@ -8,6 +8,7 @@ import {
   escapeTransformEnvelopeBody,
   extractAssistantTextFromChatCompletion,
   extractTransformEnvelopeBody,
+  formatPrimaryToolsBlock,
   getCachedTransformDescription,
   hashTransformMediaParts,
   MEDIA_TRANSFORM_POLICY_MARKER,
@@ -18,6 +19,7 @@ import {
   rewriteMessagesWithPerMessageEnvelopes,
   setCachedTransformDescription,
   shouldCacheTransformDescription,
+  summarizePrimaryTools,
   TransformerResponseTooLargeError,
   transformerModalityMismatchErrors,
   transformerSupportedModalities,
@@ -117,6 +119,38 @@ describe("media-transform", () => {
     });
     expect(payload.model).toBe("vlm-1");
     expect(payload.stream).toBe(false);
+  });
+
+  it("summarizes primary tools to name and description only and caps the list", () => {
+    const summarized = summarizePrimaryTools(
+      [
+        {
+          type: "function",
+          function: {
+            name: "computer_use",
+            description: "Click and type on the desktop",
+            parameters: { type: "object", properties: { action: { type: "string" } } },
+          },
+        },
+        { name: "speakers", description: "List speakers", extra: { schema: true } },
+        { name: "" },
+      ],
+      { maxTools: 8, maxToolChars: 8000 },
+    );
+    expect(summarized).toEqual([
+      { name: "computer_use", description: "Click and type on the desktop" },
+      { name: "speakers", description: "List speakers" },
+    ]);
+    const payload = buildTransformerChatPayload({
+      upstreamModelId: "vlm-1",
+      mediaParts: [{ type: "image_url", image_url: { url: "data:image/png;base64,x" } }],
+      primaryToolsBlock: formatPrimaryToolsBlock(summarized),
+    });
+    const user = payload.messages as Array<{ content: Array<{ text?: string }> }>;
+    const text = user[1]?.content[0]?.text ?? "";
+    expect(text).toContain("<wmp_primary_tools>");
+    expect(text).toContain("computer_use: Click and type on the desktop");
+    expect(text).not.toContain("parameters");
   });
 
   it("extracts assistant text from chat completion JSON", () => {
@@ -221,6 +255,16 @@ describe("media-transform", () => {
       systemPrompt: null,
     });
     expect(keyA).not.toBe(keyB);
+    const keyWithTools = hashTransformMediaParts({
+      ownerUserId: "user-a",
+      discoveredModelId: "dm-shared",
+      endpointId: "ep-shared",
+      upstreamModelId: "same-upstream",
+      mediaParts: media,
+      systemPrompt: null,
+      primaryToolsHash: "tools-a",
+    });
+    expect(keyWithTools).not.toBe(keyA);
     setCachedTransformDescription(keyA, "secret-for-a");
     expect(getCachedTransformDescription(keyB)).toBeNull();
     expect(getCachedTransformDescription(keyA)).toBe("secret-for-a");

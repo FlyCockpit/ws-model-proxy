@@ -37,6 +37,17 @@ export const MODEL_API_TRANSFORMER_MAX_JOBS = 8;
 /** Max media parts across all jobs in one request. */
 export const MODEL_API_TRANSFORMER_MAX_ASSETS = 16;
 
+export const MODEL_API_TRANSFORMER_DEFAULT_MAX_TOOLS = 32;
+export const MODEL_API_TRANSFORMER_DEFAULT_MAX_TOOL_CHARS = 8000;
+export const MODEL_API_TRANSFORMER_MIN_MAX_TOOLS = 1;
+export const MODEL_API_TRANSFORMER_MAX_MAX_TOOLS = 128;
+export const MODEL_API_TRANSFORMER_MIN_MAX_TOOL_CHARS = 256;
+export const MODEL_API_TRANSFORMER_MAX_MAX_TOOL_CHARS = 32_000;
+export const MODEL_API_TRANSFORMER_MIN_TIMEOUT_MS = 1_000;
+export const MODEL_API_TRANSFORMER_MAX_TIMEOUT_MS = 600_000;
+export const MODEL_API_TRANSFORMER_MIN_MAX_ASSETS = 1;
+export const MODEL_API_TRANSFORMER_MAX_MAX_ASSETS_CAP = 64;
+
 /** Max total decoded description characters written into envelopes per request. */
 export const MODEL_API_TRANSFORMER_MAX_TOTAL_DESCRIPTION_CHARS = 100_000;
 
@@ -85,6 +96,22 @@ export const MEDIA_TRANSFORM_POLICY_MARKER = "wmp-media-transform-policy:v1";
 
 const ENVELOPE_TAG = "wmp_media_transform";
 const ENVELOPE_OPEN = `<${ENVELOPE_TAG}`;
+const PRIMARY_TOOLS_TAG = "wmp_primary_tools";
+
+export type TransformerPrimaryTool = {
+  name: string;
+  description: string;
+};
+
+export type TransformDebug = {
+  modelId: string;
+  latencyMs: number;
+  cacheHit: boolean;
+  includePrimaryTools: boolean;
+  toolCount: number;
+  envelope: string | null;
+  error: string | null;
+};
 /** Inserted into spoofed open/close tag sequences inside the body so they cannot delimit. */
 const ENVELOPE_TAG_NEUTRALIZER = "\u200b";
 
@@ -206,16 +233,107 @@ export function collectTransformableParts(
   return collectMessageTransformJobs(messages, modalities).flatMap((job) => job.mediaParts);
 }
 
+export function clampTransformerMaxTools(value: number | null | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return MODEL_API_TRANSFORMER_DEFAULT_MAX_TOOLS;
+  }
+  return Math.min(
+    MODEL_API_TRANSFORMER_MAX_MAX_TOOLS,
+    Math.max(MODEL_API_TRANSFORMER_MIN_MAX_TOOLS, Math.trunc(value)),
+  );
+}
+
+export function clampTransformerMaxToolChars(value: number | null | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return MODEL_API_TRANSFORMER_DEFAULT_MAX_TOOL_CHARS;
+  }
+  return Math.min(
+    MODEL_API_TRANSFORMER_MAX_MAX_TOOL_CHARS,
+    Math.max(MODEL_API_TRANSFORMER_MIN_MAX_TOOL_CHARS, Math.trunc(value)),
+  );
+}
+
+export function clampTransformerTimeoutMs(value: number | null | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return MODEL_API_TRANSFORMER_TIMEOUT_MS;
+  }
+  return Math.min(
+    MODEL_API_TRANSFORMER_MAX_TIMEOUT_MS,
+    Math.max(MODEL_API_TRANSFORMER_MIN_TIMEOUT_MS, Math.trunc(value)),
+  );
+}
+
+export function clampTransformerMaxAssets(value: number | null | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return MODEL_API_TRANSFORMER_MAX_ASSETS;
+  }
+  return Math.min(
+    MODEL_API_TRANSFORMER_MAX_MAX_ASSETS_CAP,
+    Math.max(MODEL_API_TRANSFORMER_MIN_MAX_ASSETS, Math.trunc(value)),
+  );
+}
+
+function toolNameAndDescription(value: unknown): TransformerPrimaryTool | null {
+  if (!isJsonObject(value)) return null;
+  const fn = isJsonObject(value.function) ? value.function : value;
+  const name = typeof fn.name === "string" ? fn.name.trim() : "";
+  if (!name) return null;
+  const description = typeof fn.description === "string" ? fn.description.trim() : "";
+  return { name: name.slice(0, 256), description: description.slice(0, 4_000) };
+}
+
+/** Name + description only. Schemas, types, and extra fields are dropped. */
+export function summarizePrimaryTools(
+  tools: unknown,
+  {
+    maxTools = MODEL_API_TRANSFORMER_DEFAULT_MAX_TOOLS,
+    maxToolChars = MODEL_API_TRANSFORMER_DEFAULT_MAX_TOOL_CHARS,
+  }: { maxTools?: number; maxToolChars?: number } = {},
+): TransformerPrimaryTool[] {
+  if (!Array.isArray(tools)) return [];
+  const cappedTools = clampTransformerMaxTools(maxTools);
+  const cappedChars = clampTransformerMaxToolChars(maxToolChars);
+  const summarized: TransformerPrimaryTool[] = [];
+  let usedChars = 0;
+  for (const tool of tools) {
+    if (summarized.length >= cappedTools) break;
+    const next = toolNameAndDescription(tool);
+    if (!next) continue;
+    const cost = next.name.length + next.description.length + 2;
+    if (usedChars + cost > cappedChars) break;
+    summarized.push(next);
+    usedChars += cost;
+  }
+  return summarized;
+}
+
+export function formatPrimaryToolsBlock(tools: TransformerPrimaryTool[]): string {
+  if (tools.length === 0) return "";
+  const lines = tools.map((tool) =>
+    tool.description ? `- ${tool.name}: ${tool.description}` : `- ${tool.name}`,
+  );
+  return [`<${PRIMARY_TOOLS_TAG}>`, ...lines, `</${PRIMARY_TOOLS_TAG}>`].join("\n");
+}
+
+export function hashPrimaryTools(tools: TransformerPrimaryTool[]): string {
+  return createHash("sha256").update(JSON.stringify(tools)).digest("hex");
+}
+
 export function buildTransformerChatPayload({
   upstreamModelId,
   mediaParts,
   systemPrompt,
+  primaryToolsBlock,
 }: {
   upstreamModelId: string;
   mediaParts: Record<string, unknown>[];
   systemPrompt?: string | null;
+  primaryToolsBlock?: string | null;
 }): Record<string, unknown> {
   const system = systemPrompt?.trim() || DEFAULT_TRANSFORMER_SYSTEM_PROMPT;
+  const intro = "Describe the following attachment(s) for a text-only model.";
+  const toolsBlock = primaryToolsBlock?.trim() ?? "";
+  const text = toolsBlock.length > 0 ? `${intro}\n\n${toolsBlock}` : intro;
   return {
     model: upstreamModelId,
     stream: false,
@@ -227,7 +345,7 @@ export function buildTransformerChatPayload({
         content: [
           {
             type: "text",
-            text: "Describe the following attachment(s) for a text-only model.",
+            text,
           },
           ...mediaParts,
         ],
@@ -345,6 +463,7 @@ export function hashTransformMediaParts({
   upstreamModelId,
   mediaParts,
   systemPrompt,
+  primaryToolsHash,
 }: {
   ownerUserId: string;
   discoveredModelId: string;
@@ -352,6 +471,7 @@ export function hashTransformMediaParts({
   upstreamModelId: string;
   mediaParts: unknown[];
   systemPrompt: string | null | undefined;
+  primaryToolsHash?: string | null;
 }): string {
   return createHash("sha256")
     .update(
@@ -362,6 +482,7 @@ export function hashTransformMediaParts({
         upstreamModelId,
         mediaParts,
         systemPrompt: systemPrompt ?? null,
+        primaryToolsHash: primaryToolsHash ?? null,
       }),
     )
     .digest("hex");

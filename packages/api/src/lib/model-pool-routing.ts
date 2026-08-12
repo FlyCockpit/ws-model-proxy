@@ -220,7 +220,9 @@ function effectiveHealthStatusForRouting(
   member: Pick<PoolMemberRouteRow, "healthStatus" | "nextRetryAt" | "halfOpenTrialStartedAt">,
   now: Date,
 ): "HEALTHY" | "HALF_OPEN" | null {
-  if (member.healthStatus === "HEALTHY") return "HEALTHY";
+  if (member.healthStatus === "HEALTHY" || member.healthStatus === "UNKNOWN") {
+    return "HEALTHY";
+  }
   if (member.healthStatus === "HALF_OPEN") {
     return member.halfOpenTrialStartedAt === null ? "HALF_OPEN" : null;
   }
@@ -514,8 +516,10 @@ export async function markPoolMemberHalfOpenTrial({
   const result = await prisma.poolMember.updateMany({
     where: {
       id: poolMemberId,
-      healthStatus: "UNHEALTHY",
-      nextRetryAt: { lte: now },
+      OR: [
+        { healthStatus: "UNHEALTHY", nextRetryAt: { lte: now } },
+        { healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: null },
+      ],
     },
     data: beginPoolMemberHalfOpenTrial(now),
   });

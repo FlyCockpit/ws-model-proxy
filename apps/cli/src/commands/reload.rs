@@ -78,7 +78,7 @@ fn run_offline(json: bool) -> Result<()> {
         .collect::<Vec<_>>();
     Config::update(true, |candidate| {
         for report in &reports {
-            apply_probe_report(candidate, report)?;
+            apply_probe_report(candidate, report, false)?;
         }
         candidate.validate()
     })?;

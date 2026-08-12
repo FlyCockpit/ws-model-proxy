@@ -582,7 +582,7 @@ fn control_status_failure_details(
         None => (
             "control_unavailable",
             format!(
-                "live relay control socket is unavailable; foreground and service-managed relays cannot be inferred from a detached PID file: {control_error:#}"
+                "relay daemon is not running (control socket unavailable: {control_error:#}). Start it with `wsmp daemon start` or install the user service."
             ),
         ),
     }

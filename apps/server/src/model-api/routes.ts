@@ -10,6 +10,7 @@ import {
   buildPoolRouteSequence,
   isPublishedEndpointExecutable,
   isRetryablePoolMemberRelayFailure,
+  markPoolMemberHalfOpenTrial,
   markPoolMemberRelaySuccess,
   type PoolMemberRouteRow,
   type RelayFailureClass,
@@ -33,24 +34,30 @@ import {
 import {
   anyTransformModalityEnabled,
   buildTransformerChatPayload,
+  clampTransformerMaxAssets,
+  clampTransformerMaxToolChars,
+  clampTransformerMaxTools,
+  clampTransformerTimeoutMs,
   collectMessageTransformJobs,
   countAssetsInJobs,
   effectiveTransformModalities,
   ensureTransformPolicySystemMessage,
   extractAssistantTextFromChatCompletion,
+  formatPrimaryToolsBlock,
   getCachedTransformDescription,
+  hashPrimaryTools,
   hashTransformMediaParts,
-  MODEL_API_TRANSFORMER_MAX_ASSETS,
   MODEL_API_TRANSFORMER_MAX_JOBS,
   MODEL_API_TRANSFORMER_MAX_TOTAL_DESCRIPTION_CHARS,
   MODEL_API_TRANSFORMER_REQUEST_DEADLINE_MS,
-  MODEL_API_TRANSFORMER_TIMEOUT_MS,
   messagesContainTransformEnvelope,
   messagesHaveTransformableMedia,
   readResponseUtf8,
   rewriteMessagesWithPerMessageEnvelopes,
   setCachedTransformDescription,
   shouldCacheTransformDescription,
+  summarizePrimaryTools,
+  type TransformDebug,
   TransformerResponseTooLargeError,
   type TransformModalities,
   transformerModalityMismatchErrors,
@@ -192,6 +199,7 @@ type PreparedModeledRequest = {
   payload: JsonObject | null;
   stream: boolean;
   buildRequest: RelayRequestBuilder;
+  transformDebug?: TransformDebug;
 };
 
 type ResponseStickinessCapture = {
@@ -257,6 +265,9 @@ type RelayMetadataCreate = {
   modelApiTokenLookupPrefix?: string | null;
   requestedDiscoveredModelId?: string;
   requestedModelPoolId?: string;
+  transformerLatencyMs?: number | null;
+  transformerCacheHit?: boolean | null;
+  transformerErrorClass?: string | null;
 };
 
 type RelayMetadataUpdate = {
@@ -265,6 +276,9 @@ type RelayMetadataUpdate = {
   startedAt: Date;
   terminal: RelayAttemptTerminal;
   fallbackFailure?: RelayFailure;
+  transformerLatencyMs?: number | null;
+  transformerCacheHit?: boolean | null;
+  transformerErrorClass?: string | null;
 };
 
 type RelayRequester = {
@@ -272,6 +286,7 @@ type RelayRequester = {
   limitKey: string;
   modelApiTokenId: string | null;
   modelApiTokenLookupPrefix: string | null;
+  exposeTransformDebug?: boolean;
 };
 
 const poolRelayFailureClassSet: ReadonlySet<string> = new Set(relayFailureClasses);
@@ -280,6 +295,13 @@ const RESPONSE_ID_CAPTURE_MAX_CHARS = 1024 * 1024;
 
 function isPoolRelayFailureClass(failure: RelayFailure): failure is RelayFailureClass {
   return poolRelayFailureClassSet.has(failure);
+}
+
+function transformerFailureResponse(failure: RelayFailure, message: string): Response {
+  const prefixed = message.startsWith("Transformer error:")
+    ? message
+    : `Transformer error: ${message}`;
+  return openAiFailureJsonResponse(failure, prefixed);
 }
 
 function bearerToken(request: Request): string | null {
@@ -664,6 +686,9 @@ async function createRelayMetadata(input: RelayMetadataCreate): Promise<string> 
       modelApiTokenLookupPrefix: input.modelApiTokenLookupPrefix ?? null,
       requestedDiscoveredModelId: input.requestedDiscoveredModelId ?? null,
       requestedModelPoolId: input.requestedModelPoolId ?? null,
+      transformerLatencyMs: input.transformerLatencyMs ?? null,
+      transformerCacheHit: input.transformerCacheHit ?? null,
+      transformerErrorClass: input.transformerErrorClass ?? null,
       status: "PENDING",
     },
     select: { id: true },
@@ -686,6 +711,7 @@ function requesterFromChatTestUser(userId: string): RelayRequester {
     limitKey: `chat-test:${userId}`,
     modelApiTokenId: null,
     modelApiTokenLookupPrefix: null,
+    exposeTransformDebug: true,
   };
 }
 
@@ -706,6 +732,15 @@ async function updateRelayMetadata(relayRequestId: string, update: RelayMetadata
         update.terminal.httpStatusCode ?? (failure ? relayFailureHttpStatus(failure) : null),
       upstreamStatusCode: update.terminal.upstreamStatusCode,
       errorClass: failure,
+      ...(update.transformerLatencyMs !== undefined
+        ? { transformerLatencyMs: update.transformerLatencyMs }
+        : {}),
+      ...(update.transformerCacheHit !== undefined
+        ? { transformerCacheHit: update.transformerCacheHit }
+        : {}),
+      ...(update.transformerErrorClass !== undefined
+        ? { transformerErrorClass: update.transformerErrorClass }
+        : {}),
     },
     select: { id: true },
   });
@@ -721,17 +756,23 @@ async function failRelayMetadata({
   startedAt,
   failure,
   selectedDiscoveredModelId,
+  transformerErrorClass,
+  transformerLatencyMs,
 }: {
   relayRequestId: string;
   startedAt: Date;
   failure: RelayFailure;
   selectedDiscoveredModelId?: string;
+  transformerErrorClass?: string | null;
+  transformerLatencyMs?: number | null;
 }) {
   await updateRelayMetadata(relayRequestId, {
     selectedDiscoveredModelId,
     status: failure === "cancelled" ? "CANCELED" : "FAILED",
     startedAt,
     fallbackFailure: failure,
+    transformerErrorClass,
+    transformerLatencyMs,
     terminal: {
       ok: false,
       failure,
@@ -1376,6 +1417,7 @@ async function relayPool({
   operation,
   manager,
   limiter,
+  transformDebug,
 }: {
   request: Request;
   requester: RelayRequester;
@@ -1383,6 +1425,7 @@ async function relayPool({
   operation: RelayOperation;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
+  transformDebug?: TransformDebug;
 }): Promise<Response> {
   const startedAt = new Date();
   const relayRequestId = await createRelayMetadata({
@@ -1390,6 +1433,9 @@ async function relayPool({
     modelApiTokenId: requester.modelApiTokenId,
     modelApiTokenLookupPrefix: requester.modelApiTokenLookupPrefix,
     requestedModelPoolId: target.id,
+    transformerLatencyMs: transformDebug?.latencyMs ?? null,
+    transformerCacheHit: transformDebug?.cacheHit ?? null,
+    transformerErrorClass: transformDebug?.error ?? null,
   });
 
   let globalLease: ModelApiLimitLease;
@@ -1453,6 +1499,15 @@ async function relayPool({
     }
 
     const builtRequest = await operation.buildRequest(candidate.upstreamModelId);
+    if (candidate.healthStatus === "HALF_OPEN") {
+      const claimed = await markPoolMemberHalfOpenTrial({
+        poolMemberId: candidate.poolMemberId,
+      });
+      if (claimed === 0) {
+        cliLease.release();
+        continue;
+      }
+    }
     const responseIdCapture =
       operation.responseStickiness && operation.family === "responses"
         ? createResponseIdCapture()
@@ -1729,6 +1784,11 @@ async function maybeApplyPoolMediaTransformer({
       transformerAudio: true,
       transformerVideo: true,
       transformerCacheMode: true,
+      transformerIncludePrimaryTools: true,
+      transformerMaxTools: true,
+      transformerMaxToolChars: true,
+      transformerTimeoutMs: true,
+      transformerMaxAssets: true,
     },
   })) as {
     transformerDiscoveredModelId: string | null;
@@ -1737,6 +1797,11 @@ async function maybeApplyPoolMediaTransformer({
     transformerAudio: boolean;
     transformerVideo: boolean;
     transformerCacheMode: string;
+    transformerIncludePrimaryTools: boolean;
+    transformerMaxTools: number;
+    transformerMaxToolChars: number;
+    transformerTimeoutMs: number | null;
+    transformerMaxAssets: number | null;
   } | null;
 
   if (!pool?.transformerDiscoveredModelId) return prepared;
@@ -1777,7 +1842,7 @@ async function maybeApplyPoolMediaTransformer({
   // From here the request has raw media — validate transformer and run prepass.
   const transformer = await directModelRow(pool.transformerDiscoveredModelId);
   if (!transformer || !transformer.published || !transformer.Endpoint.published) {
-    return openAiFailureJsonResponse(
+    return transformerFailureResponse(
       "not_found",
       "Pool media transformer model is unavailable or unpublished.",
     );
@@ -1793,7 +1858,7 @@ async function maybeApplyPoolMediaTransformer({
       },
     })
   ) {
-    return openAiFailureJsonResponse(
+    return transformerFailureResponse(
       "unsupported_capability",
       "Pool media transformer does not support chat completions.",
     );
@@ -1805,7 +1870,7 @@ async function maybeApplyPoolMediaTransformer({
     transformerCaps: supported,
   });
   if (mismatch.length > 0) {
-    return openAiFailureJsonResponse("unsupported_capability", mismatch.join(" "));
+    return transformerFailureResponse("unsupported_capability", mismatch.join(" "));
   }
 
   const modalities = effectiveTransformModalities({
@@ -1813,7 +1878,7 @@ async function maybeApplyPoolMediaTransformer({
     transformerCaps: supported,
   });
   if (!anyTransformModalityEnabled(modalities)) {
-    return openAiFailureJsonResponse(
+    return transformerFailureResponse(
       "unsupported_capability",
       "Pool media transformer cannot handle the enabled media modalities.",
     );
@@ -1827,37 +1892,48 @@ async function maybeApplyPoolMediaTransformer({
   const jobs = collectMessageTransformJobs(prepared.payload.messages, modalities);
   if (jobs.length === 0) return prepared;
 
+  const maxAssets = clampTransformerMaxAssets(pool.transformerMaxAssets);
+  const hopTimeoutMs = clampTransformerTimeoutMs(pool.transformerTimeoutMs);
   if (jobs.length > MODEL_API_TRANSFORMER_MAX_JOBS) {
-    return openAiFailureJsonResponse(
+    return transformerFailureResponse(
       "request_too_large",
       `Too many messages with media to transform (max ${MODEL_API_TRANSFORMER_MAX_JOBS}).`,
     );
   }
   const assetCount = countAssetsInJobs(jobs);
-  if (assetCount > MODEL_API_TRANSFORMER_MAX_ASSETS) {
-    return openAiFailureJsonResponse(
+  if (assetCount > maxAssets) {
+    return transformerFailureResponse(
       "request_too_large",
-      `Too many media attachments to transform (max ${MODEL_API_TRANSFORMER_MAX_ASSETS}).`,
+      `Too many media attachments to transform (max ${maxAssets}).`,
     );
   }
 
   if (!isEndpointConnected(transformer, new Set(manager.getActiveCliDeviceIds()))) {
-    return openAiFailureJsonResponse(
+    return transformerFailureResponse(
       "disconnected",
       "Pool media transformer endpoint is disconnected.",
     );
   }
 
   const transformerVisibleId = directModelIdFromRow(transformer);
+  const summarizedTools = pool.transformerIncludePrimaryTools
+    ? summarizePrimaryTools(prepared.payload.tools, {
+        maxTools: clampTransformerMaxTools(pool.transformerMaxTools),
+        maxToolChars: clampTransformerMaxToolChars(pool.transformerMaxToolChars),
+      })
+    : [];
+  const primaryToolsBlock = formatPrimaryToolsBlock(summarizedTools);
+  const primaryToolsHash = summarizedTools.length > 0 ? hashPrimaryTools(summarizedTools) : null;
   const envelopesByMessageIndex = new Map<number, string>();
   const prepassStartedAt = Date.now();
   let totalDescriptionChars = 0;
+  let cacheHits = 0;
 
   for (const job of jobs) {
     const remainingDeadlineMs =
       MODEL_API_TRANSFORMER_REQUEST_DEADLINE_MS - (Date.now() - prepassStartedAt);
     if (remainingDeadlineMs <= 0 || request.signal?.aborted) {
-      return openAiFailureJsonResponse(
+      return transformerFailureResponse(
         "timeout",
         "Pool media transformer prepass exceeded the request deadline.",
       );
@@ -1871,6 +1947,7 @@ async function maybeApplyPoolMediaTransformer({
       upstreamModelId: transformer.upstreamModelId,
       mediaParts: job.mediaParts,
       systemPrompt: pool.transformerSystemPrompt,
+      primaryToolsHash,
     });
     const canCache = shouldCacheTransformDescription({
       mode: pool.transformerCacheMode,
@@ -1878,9 +1955,10 @@ async function maybeApplyPoolMediaTransformer({
     });
     const cached = canCache ? getCachedTransformDescription(cacheKey) : null;
     if (cached !== null) {
+      cacheHits += 1;
       totalDescriptionChars += cached.length;
       if (totalDescriptionChars > MODEL_API_TRANSFORMER_MAX_TOTAL_DESCRIPTION_CHARS) {
-        return openAiFailureJsonResponse(
+        return transformerFailureResponse(
           "request_too_large",
           "Pool media transformer total description size exceeded limit.",
         );
@@ -1924,9 +2002,10 @@ async function maybeApplyPoolMediaTransformer({
       upstreamModelId: transformer.upstreamModelId,
       mediaParts: job.mediaParts,
       systemPrompt: pool.transformerSystemPrompt,
+      primaryToolsBlock,
     });
     const transformerBody = new TextEncoder().encode(JSON.stringify(transformerPayload));
-    const callTimeoutMs = Math.min(MODEL_API_TRANSFORMER_TIMEOUT_MS, remainingDeadlineMs);
+    const callTimeoutMs = Math.min(hopTimeoutMs, remainingDeadlineMs);
     const hopStartedAt = new Date();
     let transformRelayRequestId: string;
     try {
@@ -1974,10 +2053,15 @@ async function maybeApplyPoolMediaTransformer({
           startedAt: hopStartedAt,
           terminal,
           fallbackFailure: terminal.failure ?? "upstream_4xx",
+          transformerErrorClass: terminal.failure ?? "upstream_4xx",
+          transformerLatencyMs: Math.max(0, Date.now() - hopStartedAt.getTime()),
         }).catch(metadataUpdateError);
-        return openAiFailureJsonResponse(
+        return transformerFailureResponse(
           terminal.failure ?? "upstream_4xx",
-          "Pool media transformer request failed.",
+          requester.exposeTransformDebug
+            ? (transformerUpstreamErrorMessage(started.status, rawText) ??
+                "Pool media transformer request failed.")
+            : "Pool media transformer request failed.",
         );
       }
 
@@ -1990,8 +2074,10 @@ async function maybeApplyPoolMediaTransformer({
           startedAt: hopStartedAt,
           failure: "protocol_error",
           selectedDiscoveredModelId: transformer.id,
+          transformerErrorClass: "protocol_error",
+          transformerLatencyMs: Math.max(0, Date.now() - hopStartedAt.getTime()),
         }).catch(metadataUpdateError);
-        return openAiFailureJsonResponse(
+        return transformerFailureResponse(
           "protocol_error",
           "Pool media transformer returned non-JSON.",
         );
@@ -2003,8 +2089,10 @@ async function maybeApplyPoolMediaTransformer({
           startedAt: hopStartedAt,
           failure: "protocol_error",
           selectedDiscoveredModelId: transformer.id,
+          transformerErrorClass: "protocol_error",
+          transformerLatencyMs: Math.max(0, Date.now() - hopStartedAt.getTime()),
         }).catch(metadataUpdateError);
-        return openAiFailureJsonResponse(
+        return transformerFailureResponse(
           "protocol_error",
           "Pool media transformer returned an empty description.",
         );
@@ -2017,8 +2105,10 @@ async function maybeApplyPoolMediaTransformer({
           startedAt: hopStartedAt,
           failure: "request_too_large",
           selectedDiscoveredModelId: transformer.id,
+          transformerErrorClass: "request_too_large",
+          transformerLatencyMs: Math.max(0, Date.now() - hopStartedAt.getTime()),
         }).catch(metadataUpdateError);
-        return openAiFailureJsonResponse(
+        return transformerFailureResponse(
           "request_too_large",
           "Pool media transformer total description size exceeded limit.",
         );
@@ -2029,6 +2119,8 @@ async function maybeApplyPoolMediaTransformer({
         status: "SUCCEEDED",
         startedAt: hopStartedAt,
         terminal: { ...terminal, ok: true, failure: null },
+        transformerLatencyMs: Math.max(0, Date.now() - hopStartedAt.getTime()),
+        transformerCacheHit: false,
       }).catch(metadataUpdateError);
 
       if (canCache) {
@@ -2055,14 +2147,16 @@ async function maybeApplyPoolMediaTransformer({
         startedAt: hopStartedAt,
         failure,
         selectedDiscoveredModelId: transformer.id,
+        transformerErrorClass: failure,
+        transformerLatencyMs: Math.max(0, Date.now() - hopStartedAt.getTime()),
       }).catch(metadataUpdateError);
       if (error instanceof TransformerResponseTooLargeError) {
-        return openAiFailureJsonResponse(
+        return transformerFailureResponse(
           "request_too_large",
           "Pool media transformer response exceeded size limit.",
         );
       }
-      return openAiFailureJsonResponse(
+      return transformerFailureResponse(
         terminal?.failure ?? "unknown",
         "Pool media transformer request failed.",
       );
@@ -2078,15 +2172,95 @@ async function maybeApplyPoolMediaTransformer({
     ...prepared.payload,
     messages: nextMessages,
   };
+  const envelopeText = [...envelopesByMessageIndex.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([, envelope]) => envelope)
+    .join("\n\n");
   return {
     model: prepared.model,
     payload: nextPayload,
     stream: prepared.stream,
+    transformDebug: {
+      modelId: transformerVisibleId,
+      latencyMs: Math.max(0, Date.now() - prepassStartedAt),
+      cacheHit: cacheHits === jobs.length && jobs.length > 0,
+      includePrimaryTools: pool.transformerIncludePrimaryTools,
+      toolCount: summarizedTools.length,
+      envelope: envelopeText,
+      error: null,
+    },
     buildRequest: async (upstreamModelId) => ({
       headers: relayRequestHeaders(request),
       body: upstreamBody(nextPayload, upstreamModelId),
     }),
   };
+}
+
+function transformerUpstreamErrorMessage(status: number, rawText: string): string | null {
+  const snippet = rawText.trim().slice(0, 400);
+  if (!snippet) return `Upstream returned HTTP ${status}.`;
+  try {
+    const parsed: unknown = JSON.parse(snippet);
+    if (
+      isJsonObject(parsed) &&
+      isJsonObject(parsed.error) &&
+      typeof parsed.error.message === "string"
+    ) {
+      return `HTTP ${status}: ${parsed.error.message}`;
+    }
+  } catch {
+    // fall through to raw snippet
+  }
+  return `HTTP ${status}: ${snippet}`;
+}
+
+function attachTransformDebug(response: Response, debug: TransformDebug): Response {
+  const headers = new Headers(response.headers);
+  headers.set(
+    "x-wsmp-transform",
+    JSON.stringify({
+      modelId: debug.modelId,
+      latencyMs: debug.latencyMs,
+      cacheHit: debug.cacheHit,
+      includePrimaryTools: debug.includePrimaryTools,
+      toolCount: debug.toolCount,
+      error: debug.error,
+    }),
+  );
+  const exposed = headers.get("access-control-expose-headers");
+  headers.set(
+    "access-control-expose-headers",
+    exposed ? `${exposed}, x-wsmp-transform` : "x-wsmp-transform",
+  );
+  const contentType = (headers.get("content-type") ?? "").toLowerCase();
+  if (!response.body || !contentType.includes("text/event-stream")) {
+    return new Response(response.body, { status: response.status, headers });
+  }
+  const prefix = `event: wsmp.transform\ndata: ${JSON.stringify(debug)}\n\n`;
+  const prefixBytes = new TextEncoder().encode(prefix);
+  const upstream = response.body;
+  let sentPrefix = false;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (!sentPrefix) {
+        sentPrefix = true;
+        controller.enqueue(prefixBytes);
+        return;
+      }
+      reader ??= upstream.getReader();
+      const { value, done } = await reader.read();
+      if (done) {
+        controller.close();
+        return;
+      }
+      if (value) controller.enqueue(value);
+    },
+    cancel(reason) {
+      return reader ? reader.cancel(reason) : upstream.cancel(reason);
+    },
+  });
+  return new Response(body, { status: response.status, headers });
 }
 
 function directModelIdFromRow(row: DirectModelRelayRow): string {
@@ -2150,14 +2324,19 @@ async function relayPreparedModeledRequest({
       stream: prepared.stream,
       buildRequest: prepared.buildRequest,
     };
-    return relayPool({
+    const response = await relayPool({
       request,
       requester,
       target: poolTarget,
       operation: relayOperation,
       manager,
       limiter,
+      transformDebug: prepared.transformDebug,
     });
+    if (requester.exposeTransformDebug && prepared.transformDebug) {
+      return attachTransformDebug(response, prepared.transformDebug);
+    }
+    return response;
   }
 
   return openAiFailureJsonResponse("not_found");

@@ -461,7 +461,7 @@ fn endpoints_probe_success_applies_model_suggestions_and_uses_secret_env_header(
     assert_eq!(cfg["endpoints"][0]["models"].as_array().unwrap().len(), 2);
     assert_eq!(
         cfg["endpoints"][0]["models"][1]["capabilityOverrideMode"],
-        "override"
+        "inherit"
     );
     assert!(
         !fs::read_to_string(&config)
@@ -535,11 +535,9 @@ fn daemon_status_requires_the_live_control_socket() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "live relay control socket is unavailable",
+            "relay daemon is not running (control socket unavailable",
         ))
-        .stderr(predicate::str::contains(
-            "service-managed relays cannot be inferred",
-        ));
+        .stderr(predicate::str::contains("wsmp daemon start"));
 }
 
 #[test]

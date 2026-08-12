@@ -14,7 +14,9 @@ import {
 } from "../lib/model-api-token-access";
 import { poolMemberRoutingStatuses } from "../lib/model-pool-routing";
 import {
+  openAiCapabilitiesFromCoarse,
   resolveEffectiveCapabilityMetadata,
+  supportsChatCompletions,
   transformerModalityMismatchErrors,
   transformerSupportedModalities,
 } from "../lib/openai-compatible-capabilities";
@@ -135,6 +137,11 @@ type ModelPoolRow = {
   transformerAudio: boolean;
   transformerVideo: boolean;
   transformerCacheMode: string;
+  transformerIncludePrimaryTools: boolean;
+  transformerMaxTools: number;
+  transformerMaxToolChars: number;
+  transformerTimeoutMs: number | null;
+  transformerMaxAssets: number | null;
   User: { slug: string };
   TransformerDiscoveredModel: {
     id: string;
@@ -166,10 +173,15 @@ type PoolMemberRow = {
   DiscoveredModel: {
     id: string;
     upstreamModelId: string;
+    capabilityOverrideMode: string;
+    capabilityOverrides: string[];
+    capabilityOverrideMetadata: unknown | null;
     User: { slug: string };
     Endpoint: {
       id: string;
       slug: string;
+      capabilityMetadata: unknown | null;
+      defaultCapabilities: string[];
       CliDevice: { slug: string };
     };
   };
@@ -413,6 +425,11 @@ function serializePool(row: ModelPoolRow) {
       audio: row.transformerAudio,
       video: row.transformerVideo,
       cacheMode: row.transformerCacheMode,
+      includePrimaryTools: row.transformerIncludePrimaryTools,
+      maxTools: row.transformerMaxTools,
+      maxToolChars: row.transformerMaxToolChars,
+      timeoutMs: row.transformerTimeoutMs,
+      maxAssets: row.transformerMaxAssets,
       model: transformerModel,
     },
     members: row.PoolMembers.map((member) => ({
@@ -440,6 +457,17 @@ function serializePool(row: ModelPoolRow) {
         endpointId: member.DiscoveredModel.Endpoint.id,
         endpointSlug: member.DiscoveredModel.Endpoint.slug,
         cliDeviceSlug: member.DiscoveredModel.Endpoint.CliDevice.slug,
+        supportsChat: supportsChatCompletions({
+          capabilities: resolveEffectiveCapabilityMetadata({
+            capabilityOverrideMode: member.DiscoveredModel.capabilityOverrideMode,
+            capabilityOverrideMetadata: member.DiscoveredModel.capabilityOverrideMetadata,
+            endpointCapabilityMetadata: member.DiscoveredModel.Endpoint.capabilityMetadata,
+          }),
+          coarse:
+            member.DiscoveredModel.capabilityOverrideMode === "OVERRIDE"
+              ? member.DiscoveredModel.capabilityOverrides
+              : member.DiscoveredModel.Endpoint.defaultCapabilities,
+        }),
       },
     })),
     grants: row.PoolGrants.map((grant) => ({
@@ -615,6 +643,11 @@ const poolSelect = {
   transformerAudio: true,
   transformerVideo: true,
   transformerCacheMode: true,
+  transformerIncludePrimaryTools: true,
+  transformerMaxTools: true,
+  transformerMaxToolChars: true,
+  transformerTimeoutMs: true,
+  transformerMaxAssets: true,
   User: { select: { slug: true } },
   TransformerDiscoveredModel: {
     select: {
@@ -649,11 +682,16 @@ const poolSelect = {
         select: {
           id: true,
           upstreamModelId: true,
+          capabilityOverrideMode: true,
+          capabilityOverrides: true,
+          capabilityOverrideMetadata: true,
           User: { select: { slug: true } },
           Endpoint: {
             select: {
               id: true,
               slug: true,
+              capabilityMetadata: true,
+              defaultCapabilities: true,
               CliDevice: { select: { slug: true } },
             },
           },
@@ -846,6 +884,11 @@ export const forwarderManagementRouter = {
         transformerAudio: z.boolean().optional(),
         transformerVideo: z.boolean().optional(),
         transformerCacheMode: z.enum(["OFF", "MEMORY"]).optional(),
+        transformerIncludePrimaryTools: z.boolean().optional(),
+        transformerMaxTools: z.number().int().min(1).max(128).optional(),
+        transformerMaxToolChars: z.number().int().min(256).max(32_000).optional(),
+        transformerTimeoutMs: z.number().int().min(1_000).max(600_000).nullable().optional(),
+        transformerMaxAssets: z.number().int().min(1).max(64).nullable().optional(),
       }),
     )
     .handler(async ({ input, context }) => {
@@ -928,6 +971,21 @@ export const forwarderManagementRouter = {
           ...(input.transformerCacheMode !== undefined
             ? { transformerCacheMode: input.transformerCacheMode }
             : {}),
+          ...(input.transformerIncludePrimaryTools !== undefined
+            ? { transformerIncludePrimaryTools: input.transformerIncludePrimaryTools }
+            : {}),
+          ...(input.transformerMaxTools !== undefined
+            ? { transformerMaxTools: input.transformerMaxTools }
+            : {}),
+          ...(input.transformerMaxToolChars !== undefined
+            ? { transformerMaxToolChars: input.transformerMaxToolChars }
+            : {}),
+          ...(input.transformerTimeoutMs !== undefined
+            ? { transformerTimeoutMs: input.transformerTimeoutMs }
+            : {}),
+          ...(input.transformerMaxAssets !== undefined
+            ? { transformerMaxAssets: input.transformerMaxAssets }
+            : {}),
         },
         select: poolSelect,
       })) as ModelPoolRow;
@@ -1003,6 +1061,127 @@ export const forwarderManagementRouter = {
       }
       await prisma.poolMember.delete({ where: { id: input.id } });
       return { deleted: true };
+    }),
+
+  updateDiscoveredModelCapabilities: protectedProcedure
+    .input(
+      z.object({
+        id: idSchema,
+        vision: z.boolean(),
+        audio: z.boolean(),
+        video: z.boolean(),
+      }),
+    )
+    .handler(async ({ input, context }) => {
+      const model = await prisma.discoveredModel.findUnique({
+        where: { id: input.id },
+        select: {
+          id: true,
+          userId: true,
+          capabilityOverrideMode: true,
+          capabilityOverrideMetadata: true,
+          capabilityOverrides: true,
+          Endpoint: { select: { capabilityMetadata: true, defaultCapabilities: true } },
+        },
+      });
+      if (!model || model.userId !== context.session.user.id) {
+        throw new ORPCError("NOT_FOUND", { message: "Discovered model not found." });
+      }
+      const parsed = resolveEffectiveCapabilityMetadata({
+        capabilityOverrideMode: model.capabilityOverrideMode,
+        capabilityOverrideMetadata: model.capabilityOverrideMetadata,
+        endpointCapabilityMetadata: model.Endpoint.capabilityMetadata,
+      });
+      if (!parsed) {
+        const existingCoarse =
+          model.capabilityOverrideMode === "OVERRIDE"
+            ? model.capabilityOverrides
+            : model.Endpoint.defaultCapabilities;
+        const nextCoarse = existingCoarse.filter(
+          (capability) =>
+            capability !== "VISION_INPUT" &&
+            capability !== "AUDIO_INPUT" &&
+            capability !== "VIDEO_INPUT",
+        ) as typeof existingCoarse;
+        if (input.vision) nextCoarse.push("VISION_INPUT");
+        if (input.audio) nextCoarse.push("AUDIO_INPUT");
+        if (input.video) nextCoarse.push("VIDEO_INPUT");
+        if (
+          (input.vision || input.audio || input.video) &&
+          !nextCoarse.includes("TEXT_GENERATION")
+        ) {
+          nextCoarse.push("TEXT_GENERATION");
+        }
+        return prisma.discoveredModel.update({
+          where: { id: input.id },
+          data: {
+            capabilityOverrideMode: "OVERRIDE",
+            capabilityOverrideOrigin: "DASHBOARD",
+            capabilityOverrides: { set: nextCoarse },
+            capabilityOverrideMetadata: openAiCapabilitiesFromCoarse(nextCoarse),
+          },
+          select: {
+            id: true,
+            capabilityOverrideMode: true,
+            capabilityOverrides: true,
+            capabilityOverrideMetadata: true,
+          },
+        });
+      }
+      const base = parsed;
+      const chatExisted = Boolean(base.chatCompletions);
+      const needsChat = chatExisted || input.vision || input.audio || input.video;
+      const metadata = {
+        ...base,
+        chatCompletions: needsChat
+          ? {
+              ...base.chatCompletions,
+              ...(input.vision || input.audio || input.video ? { supported: true } : {}),
+              vision: input.vision,
+              audio: input.audio,
+              video: input.video,
+            }
+          : base.chatCompletions,
+      };
+      const coarse: Array<
+        | "TEXT_GENERATION"
+        | "VISION_INPUT"
+        | "AUDIO_INPUT"
+        | "AUDIO_OUTPUT"
+        | "VIDEO_INPUT"
+        | "EMBEDDING"
+        | "RESPONSES_API"
+      > = [];
+      if (
+        metadata.chatCompletions?.supported ||
+        metadata.completions?.supported ||
+        metadata.responses?.supported
+      ) {
+        coarse.push("TEXT_GENERATION");
+      }
+      if (input.vision) coarse.push("VISION_INPUT");
+      if (input.video) coarse.push("VIDEO_INPUT");
+      if (input.audio || metadata.audio?.transcriptions || metadata.audio?.translations) {
+        coarse.push("AUDIO_INPUT");
+      }
+      if (metadata.audio?.speech) coarse.push("AUDIO_OUTPUT");
+      if (metadata.embeddings?.supported) coarse.push("EMBEDDING");
+      if (metadata.responses?.supported) coarse.push("RESPONSES_API");
+      return prisma.discoveredModel.update({
+        where: { id: input.id },
+        data: {
+          capabilityOverrideMode: "OVERRIDE",
+          capabilityOverrideOrigin: "DASHBOARD",
+          capabilityOverrides: { set: coarse },
+          capabilityOverrideMetadata: metadata,
+        },
+        select: {
+          id: true,
+          capabilityOverrideMode: true,
+          capabilityOverrides: true,
+          capabilityOverrideMetadata: true,
+        },
+      });
     }),
 
   grantPoolAccessByEmail: protectedProcedure

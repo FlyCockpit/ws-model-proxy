@@ -54,6 +54,12 @@
       "modelsFailed": "No se pudieron cargar los modelos visibles.",
       "streamFailed": "No se pudo transmitir la respuesta."
     },
+    "transform": {
+      "title": "Lo que vio el modelo primario (transformador)",
+      "summary": "{{model}} · {{latency}} s · {{cache}} · {{tools}} herramientas reenviadas",
+      "cacheHit": "acierto de caché",
+      "cacheMiss": "fallo de caché"
+    },
     "fixturePrompt": "Prompt de prueba {{index}}",
     "fixtureResponse": "Respuesta de prueba {{index}}\n\n```text\nbloque {{index}}\n```",
     "freshChat": "Chat nuevo",
@@ -108,10 +114,15 @@
   },
   "models": {
     "capabilities": "Capacidades",
+    "capabilityHint": "Tipos de entrada anunciados. El sondeo no infiere esto del ID del modelo.",
+    "capabilitySaved": "Capacidades guardadas. Esta anulación del panel es autoritativa; el CLI la copia en el próximo hello o reload.",
     "immutable": "Los IDs de modelos descubiertos son inmutables.",
     "lastSeen": "Visto por última vez",
     "modelId": "ID de modelo",
-    "upstream": "Origen"
+    "upstream": "Origen",
+    "vision": "Imágenes",
+    "audio": "Audio",
+    "video": "Video"
   },
   "nav": {
     "ariaLabel": "Secciones del panel",
@@ -197,6 +208,15 @@
     "transformerPromptPlaceholder": "Déjalo vacío para el prompt integrado de descripción",
     "transformerTitle": "Transformador de medios",
     "transformerVideo": "Transformar video adjunto",
+    "transformerIncludeTools": "Reenviar nombres y descripciones de herramientas primarias",
+    "transformerIncludeToolsHint": "Desactivado por defecto. Solo envía nombre y descripción, nunca esquemas ni argumentos.",
+    "transformerMaxTools": "Máximo de herramientas",
+    "transformerMaxToolChars": "Máximo de caracteres de herramientas",
+    "transformerTimeoutMs": "Tiempo de espera del transformador (ms)",
+    "transformerMaxAssets": "Máximo de adjuntos por solicitud",
+    "testMember": "Probar chat",
+    "testMemberSuccess": "La sonda de chat tuvo éxito; la salud volvió a saludable.",
+    "testMemberFailed": "La sonda de chat falló: {{error}}",
     "typeEmail": "Escribe el correo para confirmar",
     "typeModelId": "Escribe el ID de modelo para confirmar",
     "typePoolName": "Escribe el nombre del pool para confirmar",

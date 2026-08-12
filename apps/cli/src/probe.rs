@@ -40,6 +40,32 @@ struct ModelsResponse {
 #[derive(Debug, Deserialize)]
 struct ModelRow {
     id: String,
+    #[serde(default)]
+    supports_vision: Option<bool>,
+    #[serde(default)]
+    supports_video_input: Option<bool>,
+    #[serde(default)]
+    supports_audio_input: Option<bool>,
+    #[serde(default)]
+    capabilities: Option<UpstreamCapabilityFlags>,
+    #[serde(default)]
+    architecture: Option<UpstreamArchitecture>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpstreamCapabilityFlags {
+    #[serde(default)]
+    vision: Option<bool>,
+    #[serde(default)]
+    video_input: Option<bool>,
+    #[serde(default)]
+    audio_input: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpstreamArchitecture {
+    #[serde(default)]
+    input_modalities: Option<Vec<String>>,
 }
 
 pub fn probe_endpoint(endpoint: &EndpointConfig) -> ProbeReport {
@@ -84,46 +110,58 @@ fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
         .body_mut()
         .read_json::<ModelsResponse>()
         .with_context(|| format!("parsing model list from endpoint `{}`", endpoint.slug))?;
-    let discovered_model_ids = models
+    let rows: Vec<ModelRow> = models
         .data
         .into_iter()
-        .map(|model| model.id)
-        .filter(|id| !id.trim().is_empty())
-        .collect::<Vec<_>>();
-    let suggested_default_capabilities =
-        suggest_default_capabilities(&discovered_model_ids, &endpoint.default_capabilities);
-    let model_suggestions = discovered_model_ids
-        .iter()
-        .filter_map(|id| suggest_model(id))
+        .filter(|model| !model.id.trim().is_empty())
         .collect();
+    let discovered_model_ids = rows.iter().map(|model| model.id.clone()).collect::<Vec<_>>();
+    let model_suggestions = rows.iter().filter_map(suggest_model_from_upstream).collect();
     Ok(ProbeReport {
         endpoint_slug: endpoint.slug.clone(),
         status: ProbeStatus::Online,
         discovered_model_ids,
-        suggested_default_capabilities,
+        suggested_default_capabilities: endpoint.default_capabilities.clone(),
         model_suggestions,
         error: None,
     })
 }
 
-pub fn apply_probe_report(config: &mut Config, report: &ProbeReport) -> Result<()> {
+pub fn apply_probe_report(
+    config: &mut Config,
+    report: &ProbeReport,
+    replace: bool,
+) -> Result<()> {
     let Some(endpoint) = config.endpoint_mut(&report.endpoint_slug) else {
         anyhow::bail!("endpoint `{}` no longer exists", report.endpoint_slug);
     };
     if report.status == ProbeStatus::Online {
-        endpoint.default_capabilities = report.suggested_default_capabilities.clone();
         endpoint.last_probe = Some(ProbeSnapshot {
             status: ProbeStatus::Online,
             models: report.discovered_model_ids.clone(),
-            suggested_capabilities: report.suggested_default_capabilities.clone(),
+            suggested_capabilities: endpoint.default_capabilities.clone(),
         });
-        for model_id in &report.discovered_model_ids {
-            if !endpoint
+        let discovered: std::collections::HashSet<&str> = report
+            .discovered_model_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let mut next_models: Vec<ModelConfig> = if replace {
+            endpoint
                 .models
+                .iter()
+                .filter(|model| discovered.contains(model.upstream_model_id.as_str()) || model.pinned)
+                .cloned()
+                .collect()
+        } else {
+            endpoint.models.clone()
+        };
+        for model_id in &report.discovered_model_ids {
+            if !next_models
                 .iter()
                 .any(|model| model.upstream_model_id == *model_id)
             {
-                endpoint.models.push(ModelConfig {
+                next_models.push(ModelConfig {
                     slug: Some(slugify_seed(model_id, "model")),
                     upstream_model_id: model_id.clone(),
                     ..ModelConfig::default()
@@ -131,17 +169,15 @@ pub fn apply_probe_report(config: &mut Config, report: &ProbeReport) -> Result<(
             }
         }
         for suggestion in &report.model_suggestions {
-            if let Some(model) = endpoint
-                .models
+            if let Some(model) = next_models
                 .iter_mut()
                 .find(|model| model.upstream_model_id == suggestion.upstream_model_id)
             {
                 model.slug = model.slug.clone().or_else(|| Some(suggestion.slug.clone()));
-                model.capability_override_mode = suggestion.capability_override_mode.clone();
-                model.capabilities = Some(suggestion.capabilities.clone());
                 model.probe_suggestions = Some(suggestion.capabilities.clone());
             }
         }
+        endpoint.models = next_models;
     } else {
         endpoint.last_probe = Some(ProbeSnapshot {
             status: ProbeStatus::Offline,
@@ -172,95 +208,58 @@ fn models_url(base_url: &str) -> Result<Url> {
         .with_context(|| format!("building model-list URL for `{base_url}`"))
 }
 
-fn suggest_default_capabilities(
-    ids: &[String],
-    configured: &OpenAiCompatibleCapabilities,
-) -> OpenAiCompatibleCapabilities {
-    let mut suggested = configured.clone();
-    if ids.iter().any(|id| id.to_lowercase().contains("embed")) {
-        suggested.embeddings = Some(crate::config::EmbeddingsCapabilities {
-            supported: Some(true),
-        });
-    }
-    if ids.iter().any(|id| id.to_lowercase().contains("response")) {
-        suggested = suggested.with_responses();
-    }
-    if ids.iter().any(|id| looks_like_vision_model(id)) {
-        suggested = suggested.with_vision();
-    }
-    if ids.iter().any(|id| looks_like_video_model(id)) {
-        suggested = suggested.with_video();
-    }
-    if ids.iter().any(|id| looks_like_chat_audio_model(id)) {
-        suggested = suggested.with_chat_audio();
-    }
-    suggested
+fn modality_flag(value: Option<bool>) -> bool {
+    value == Some(true)
 }
 
-/// Heuristic vision/image support from upstream model id (not perfect; operators
-/// can override). Includes common VLM tags and omni stacks used with local relay.
-fn looks_like_vision_model(model_id: &str) -> bool {
-    let id = model_id.to_lowercase();
-    id.contains("vision")
-        || id.contains("vl")
-        || id.contains("llava")
-        || id.contains("omni")
-        || id.contains("mimo")
-        || id.contains("qwen2-vl")
-        || id.contains("qwen2.5-vl")
-        || id.contains("qwen3-vl")
-        || id.contains("internvl")
-        || id.contains("minicpm-v")
-        || id.contains("phi-3.5-vision")
-        || id.contains("pixtral")
+fn architecture_has(architecture: &Option<UpstreamArchitecture>, modality: &str) -> bool {
+    architecture
+        .as_ref()
+        .and_then(|value| value.input_modalities.as_ref())
+        .is_some_and(|modalities| {
+            modalities
+                .iter()
+                .any(|item| item.eq_ignore_ascii_case(modality))
+        })
 }
 
-/// Chat `video_url` multimodal — omni / dedicated video-language tags.
-fn looks_like_video_model(model_id: &str) -> bool {
-    let id = model_id.to_lowercase();
-    id.contains("omni")
-        || id.contains("mimo")
-        || id.contains("video")
-        || id.contains("qwen2.5-omni")
-        || id.contains("qwen3-omni")
-}
-
-/// Chat `input_audio` multimodal (not STT-only / embed ids).
-fn looks_like_chat_audio_model(model_id: &str) -> bool {
-    let id = model_id.to_lowercase();
-    id.contains("omni")
-        || id.contains("mimo")
-        || (id.contains("audio") && !id.contains("embed") && !id.contains("whisper"))
-}
-
-fn suggest_model(model_id: &str) -> Option<ModelSuggestion> {
-    let lower = model_id.to_lowercase();
-    let capabilities = if lower.contains("embed") {
-        OpenAiCompatibleCapabilities::embedding_defaults()
-    } else if looks_like_vision_model(model_id)
-        || looks_like_video_model(model_id)
-        || looks_like_chat_audio_model(model_id)
-    {
-        let mut caps = OpenAiCompatibleCapabilities::openai_defaults();
-        if looks_like_vision_model(model_id) {
-            caps = caps.with_vision();
-        }
-        if looks_like_video_model(model_id) {
-            caps = caps.with_video();
-        }
-        if looks_like_chat_audio_model(model_id) {
-            caps = caps.with_chat_audio();
-        }
-        caps
-    } else if lower.contains("response") {
-        OpenAiCompatibleCapabilities::openai_defaults().with_responses()
-    } else {
+/// Suggestions come only from upstream model-list metadata, never from the model id.
+fn suggest_model_from_upstream(row: &ModelRow) -> Option<ModelSuggestion> {
+    let vision = modality_flag(row.supports_vision)
+        || row
+            .capabilities
+            .as_ref()
+            .is_some_and(|caps| modality_flag(caps.vision))
+        || architecture_has(&row.architecture, "image");
+    let video = modality_flag(row.supports_video_input)
+        || row
+            .capabilities
+            .as_ref()
+            .is_some_and(|caps| modality_flag(caps.video_input))
+        || architecture_has(&row.architecture, "video");
+    let audio = modality_flag(row.supports_audio_input)
+        || row
+            .capabilities
+            .as_ref()
+            .is_some_and(|caps| modality_flag(caps.audio_input))
+        || architecture_has(&row.architecture, "audio");
+    if !vision && !video && !audio {
         return None;
-    };
+    }
+    let mut capabilities = OpenAiCompatibleCapabilities::openai_defaults();
+    if vision {
+        capabilities = capabilities.with_vision();
+    }
+    if video {
+        capabilities = capabilities.with_video();
+    }
+    if audio {
+        capabilities = capabilities.with_chat_audio();
+    }
     Some(ModelSuggestion {
-        upstream_model_id: model_id.to_string(),
-        slug: slugify_seed(model_id, "model"),
-        capability_override_mode: CapabilityOverrideMode::Override,
+        upstream_model_id: row.id.clone(),
+        slug: slugify_seed(&row.id, "model"),
+        capability_override_mode: CapabilityOverrideMode::Inherit,
         capabilities,
     })
 }
@@ -280,14 +279,135 @@ mod tests {
     }
 
     #[test]
-    fn suggests_embedding_override() {
-        let suggestion = suggest_model("text-embedding-3-small").expect("suggestion");
+    fn does_not_infer_modalities_from_model_id() {
+        assert!(suggest_model_from_upstream(&ModelRow {
+            id: "media-describe-omni".to_string(),
+            supports_vision: None,
+            supports_video_input: None,
+            supports_audio_input: None,
+            capabilities: None,
+            architecture: None,
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn suggests_modalities_from_upstream_metadata_only() {
+        let suggestion = suggest_model_from_upstream(&ModelRow {
+            id: "plain-name".to_string(),
+            supports_vision: Some(true),
+            supports_video_input: None,
+            supports_audio_input: None,
+            capabilities: None,
+            architecture: None,
+        })
+        .expect("suggestion");
         assert_eq!(
-            suggestion
-                .capabilities
-                .embeddings
-                .expect("embeddings")
-                .supported,
+            suggestion.capabilities.chat_completions.unwrap().vision,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn successful_probe_accumulates_by_default_and_preserves_desired_caps() {
+        let mut config = Config {
+            endpoints: vec![EndpointConfig {
+                slug: "local".into(),
+                models: vec![ModelConfig {
+                    upstream_model_id: "gone".into(),
+                    capability_override_mode: CapabilityOverrideMode::Override,
+                    capabilities: Some(OpenAiCompatibleCapabilities::openai_defaults()),
+                    ..ModelConfig::default()
+                }],
+                ..EndpointConfig::default()
+            }],
+            ..Config::default()
+        };
+        apply_probe_report(
+            &mut config,
+            &ProbeReport {
+                endpoint_slug: "local".into(),
+                status: ProbeStatus::Online,
+                discovered_model_ids: vec!["new".into()],
+                suggested_default_capabilities: OpenAiCompatibleCapabilities::default(),
+                model_suggestions: vec![],
+                error: None,
+            },
+            false,
+        )
+        .expect("apply");
+        let ids: Vec<&str> = config.endpoints[0]
+            .models
+            .iter()
+            .map(|model| model.upstream_model_id.as_str())
+            .collect();
+        assert_eq!(ids, ["gone", "new"]);
+    }
+
+    #[test]
+    fn successful_probe_replaces_unpinned_models_and_preserves_desired_caps() {
+        let mut config = Config {
+            endpoints: vec![EndpointConfig {
+                slug: "local".into(),
+                models: vec![
+                    ModelConfig {
+                        upstream_model_id: "gone".into(),
+                        capability_override_mode: CapabilityOverrideMode::Override,
+                        capabilities: Some(OpenAiCompatibleCapabilities::openai_defaults()),
+                        ..ModelConfig::default()
+                    },
+                    ModelConfig {
+                        upstream_model_id: "kept".into(),
+                        capability_override_mode: CapabilityOverrideMode::Override,
+                        capabilities: Some(
+                            OpenAiCompatibleCapabilities::openai_defaults().with_vision(),
+                        ),
+                        ..ModelConfig::default()
+                    },
+                    ModelConfig {
+                        upstream_model_id: "pinned-missing".into(),
+                        pinned: true,
+                        ..ModelConfig::default()
+                    },
+                ],
+                ..EndpointConfig::default()
+            }],
+            ..Config::default()
+        };
+        apply_probe_report(
+            &mut config,
+            &ProbeReport {
+                endpoint_slug: "local".into(),
+                status: ProbeStatus::Online,
+                discovered_model_ids: vec!["kept".into(), "new".into()],
+                suggested_default_capabilities: OpenAiCompatibleCapabilities::default(),
+                model_suggestions: vec![ModelSuggestion {
+                    upstream_model_id: "kept".into(),
+                    slug: "kept".into(),
+                    capability_override_mode: CapabilityOverrideMode::Override,
+                    capabilities: OpenAiCompatibleCapabilities::openai_defaults(),
+                }],
+                error: None,
+            },
+            true,
+        )
+        .expect("apply");
+        let models = &config.endpoints[0].models;
+        let ids: Vec<&str> = models.iter().map(|model| model.upstream_model_id.as_str()).collect();
+        assert_eq!(ids, ["kept", "pinned-missing", "new"]);
+        let kept = models
+            .iter()
+            .find(|model| model.upstream_model_id == "kept")
+            .expect("kept");
+        assert_eq!(kept.capability_override_mode, CapabilityOverrideMode::Override);
+        assert_eq!(
+            kept.capabilities
+                .as_ref()
+                .unwrap()
+                .chat_completions
+                .as_ref()
+                .unwrap()
+                .vision,
             Some(true)
         );
     }

@@ -102,6 +102,16 @@ type ChatTimingMetrics = {
   tokensPerSecond?: number;
 };
 
+type TransformDebug = {
+  modelId: string;
+  latencyMs: number;
+  cacheHit: boolean;
+  includePrimaryTools: boolean;
+  toolCount: number;
+  envelope: string | null;
+  error: string | null;
+};
+
 type ChatMessage = {
   id: string;
   role: ChatRole;
@@ -111,6 +121,7 @@ type ChatMessage = {
   errorMessage?: string;
   images?: ChatImage[];
   metrics?: ChatTimingMetrics;
+  transformDebug?: TransformDebug;
 };
 // OpenAI-shaped content parts used when a message carries images.
 type RelayContentPart =
@@ -340,18 +351,21 @@ function standardizedCompletionTokens(value: unknown): number | undefined {
 }
 
 async function readErrorMessage(response: Response, fallback: string) {
+  const statusPrefix = `HTTP ${response.status}`;
   try {
     const payload: unknown = await response.json();
     if (typeof payload === "object" && payload !== null && "error" in payload) {
       const error = payload.error;
       if (typeof error === "object" && error !== null && "message" in error) {
-        return typeof error.message === "string" ? error.message : fallback;
+        return typeof error.message === "string"
+          ? `${statusPrefix}: ${error.message}`
+          : `${statusPrefix}: ${fallback}`;
       }
     }
+    return `${statusPrefix}: ${JSON.stringify(payload).slice(0, 400)}`;
   } catch {
-    return fallback;
+    return `${statusPrefix}: ${fallback}`;
   }
-  return fallback;
 }
 
 // --- Ephemeral media store (Phase 1) --------------------------------------
@@ -452,12 +466,14 @@ async function streamChatCompletion({
   messages,
   signal,
   onDelta,
+  onTransformDebug,
   fallbackErrorMessage,
 }: {
   model: string;
   messages: RelayChatMessage[];
   signal: AbortSignal;
   onDelta: (delta: string) => void;
+  onTransformDebug?: (debug: TransformDebug) => void;
   fallbackErrorMessage: string;
 }): Promise<ChatTimingMetrics> {
   const startedAt = performance.now();
@@ -487,6 +503,11 @@ async function streamChatCompletion({
   let reportedSharedCompletionTokens: number | undefined;
 
   const processEvent = (event: string) => {
+    const eventName = event
+      .split("\n")
+      .find((line) => line.startsWith("event:"))
+      ?.slice(6)
+      .trim();
     const data = event
       .split("\n")
       .filter((line) => line.startsWith("data:"))
@@ -494,7 +515,16 @@ async function streamChatCompletion({
       .join("\n")
       .trim();
     if (!data || data === "[DONE]") return;
-    const parsed: unknown = JSON.parse(data);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      throw new Error(`${fallbackErrorMessage} Invalid stream chunk.`);
+    }
+    if (eventName === "wsmp.transform") {
+      if (parsed && typeof parsed === "object") onTransformDebug?.(parsed as TransformDebug);
+      return;
+    }
     const metrics = standardizedCompletionTokens(parsed);
     if (metrics !== undefined) reportedSharedCompletionTokens = metrics;
     const delta = contentDelta(parsed);
@@ -780,6 +810,13 @@ function ChatTestPage() {
               ),
             );
             scroll.markContentChanged();
+          },
+          onTransformDebug: (debug) => {
+            setMessages((current) =>
+              current.map((message) =>
+                message.id === assistantId ? { ...message, transformDebug: debug } : message,
+              ),
+            );
           },
         });
         updateAssistant(assistantId, { status: "ready", metrics });
@@ -1426,6 +1463,30 @@ function MessageBubble({
               })
             : t("dashboard:chatTest.metrics.throughputUnavailable")}
         </p>
+      ) : null}
+      {isAssistant && message.transformDebug ? (
+        <details className="mt-3 rounded-md border border-border/70 bg-muted/30 p-2 text-xs">
+          <summary className="cursor-pointer font-medium">
+            {t("dashboard:chatTest.transform.title")}
+          </summary>
+          <p className="mt-2 text-muted-foreground">
+            {t("dashboard:chatTest.transform.summary", {
+              model: message.transformDebug.modelId,
+              latency: (message.transformDebug.latencyMs / 1000).toFixed(2),
+              cache: message.transformDebug.cacheHit
+                ? t("dashboard:chatTest.transform.cacheHit")
+                : t("dashboard:chatTest.transform.cacheMiss"),
+              tools: message.transformDebug.includePrimaryTools
+                ? message.transformDebug.toolCount
+                : 0,
+            })}
+          </p>
+          {message.transformDebug.envelope ? (
+            <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px]">
+              {message.transformDebug.envelope}
+            </pre>
+          ) : null}
+        </details>
       ) : null}
       {message.status === "error" && message.errorMessage ? (
         <p className="mt-3 rounded-md border border-destructive/30 bg-destructive/10 p-2 text-sm text-destructive">

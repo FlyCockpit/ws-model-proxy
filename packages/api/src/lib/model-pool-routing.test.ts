@@ -109,6 +109,34 @@ describe("modelPoolRouting", () => {
     });
   });
 
+  it("routes newly added UNKNOWN members as fully eligible", () => {
+    const result = buildPoolRouteSequence({
+      members: [memberRow({ id: "new-member", healthStatus: "UNKNOWN" })],
+      activeCliDeviceIds: ["cli-1"],
+      now,
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      candidates: [{ poolMemberId: "new-member", healthStatus: "HEALTHY" }],
+    });
+  });
+
+  it("does not treat reserved DEGRADED members as routable", () => {
+    const result = buildPoolRouteSequence({
+      members: [memberRow({ id: "degraded-member", healthStatus: "DEGRADED" })],
+      activeCliDeviceIds: ["cli-1"],
+      now,
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      reason: "NO_ROUTABLE_POOL_MEMBERS",
+      failureClass: "no_routable_member",
+      retryable: true,
+    });
+  });
+
   it("uses smooth weighted round-robin with injected deterministic state", () => {
     const members = [memberRow({ id: "member-a", weight: 3 }), memberRow({ id: "member-b" })];
     let state = {};

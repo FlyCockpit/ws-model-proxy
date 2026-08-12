@@ -229,14 +229,27 @@ export type InventoryRevision = {
   inventoryAcknowledgedAt: string;
 };
 
+export type DesiredModelCapability = {
+  endpointSlug: string;
+  upstreamModelId: string;
+  capabilityOverrideMode: "override";
+  capabilities: OpenAiCompatibleCapabilities;
+};
+
 export type RelayServerControlMessage =
   | {
       type: "hello.ok";
       id: string;
       protocolVersion: typeof RELAY_PROTOCOL_VERSION;
       revision: InventoryRevision;
+      desiredCapabilities?: DesiredModelCapability[];
     }
-  | { type: "inventory.ok"; id: string; revision: InventoryRevision }
+  | {
+      type: "inventory.ok";
+      id: string;
+      revision: InventoryRevision;
+      desiredCapabilities?: DesiredModelCapability[];
+    }
   | { type: "inventory.error"; id: string; message: string }
   | { type: "heartbeat.pong"; id: string; receivedAt: string }
   | {

@@ -1345,14 +1345,35 @@ where
 {
     let message = parse_server_control(text).map_err(RelaySessionError::Fatal)?;
     match message {
-        ServerControlMessage::HelloOk { id, revision, .. } => {
+        ServerControlMessage::HelloOk {
+            id,
+            revision,
+            desired_capabilities,
+            ..
+        } => {
             *last_inventory_revision = Some(revision);
+            if let Err(error) =
+                crate::protocol::persist_desired_capabilities(config, &desired_capabilities)
+            {
+                tracing::warn!(error = %error, "failed to persist desired capabilities");
+            }
             tracing::info!(id, "relay registration accepted");
         }
         ServerControlMessage::HeartbeatPong { id, .. } => {
             tracing::debug!(id, "relay heartbeat acknowledged");
         }
-        ServerControlMessage::InventoryOk { id, revision } => {
+        ServerControlMessage::InventoryOk {
+            id,
+            revision,
+            desired_capabilities,
+        } => {
+            let persist_desired = |config: &mut Config| {
+                if let Err(error) =
+                    crate::protocol::persist_desired_capabilities(config, &desired_capabilities)
+                {
+                    tracing::warn!(error = %error, "failed to persist desired capabilities");
+                }
+            };
             #[cfg(not(unix))]
             let _ = &id;
             #[cfg(unix)]
@@ -1370,6 +1391,7 @@ where
                         .filter(|endpoint| endpoint.enabled)
                         .count();
                     *config = candidate;
+                    persist_desired(config);
                     if let Some(pending) = pending {
                         let _ = control::respond(
                             pending,
@@ -1401,6 +1423,7 @@ where
                 config,
                 last_inventory_revision,
             ) {
+                persist_desired(config);
                 tracing::info!(id, inventory_seq = revision.inventory_seq, inventory_digest = %revision.inventory_digest, acknowledged_at = %revision.inventory_acknowledged_at, "late inventory acknowledgement resolved uncertain publish");
                 return Ok(());
             }
@@ -1418,6 +1441,7 @@ where
             {
                 *last_inventory_revision = Some(revision);
             }
+            persist_desired(config);
         }
         ServerControlMessage::InventoryError { id, message } => {
             tracing::warn!(id, message, "relay inventory rejected");
@@ -2381,7 +2405,7 @@ fn inventory_from_config(config: &mut Config) -> Vec<EndpointInventory> {
         reports.extend(batch_reports);
     }
     for report in reports {
-        if let Err(error) = apply_probe_report(config, &report) {
+        if let Err(error) = apply_probe_report(config, &report, false) {
             tracing::warn!(error = %error, endpoint = report.endpoint_slug, "failed to apply probe report");
         }
     }
