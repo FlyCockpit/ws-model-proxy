@@ -18,15 +18,12 @@ describe("isPrivateIp (IPv4)", () => {
     expect(isPrivateIp(ip, 4)).toBe(true);
   });
 
-  it.each([
-    "8.8.8.8",
-    "1.1.1.1",
-    "203.0.113.10",
-    "198.51.100.7",
-    "172.32.0.1",
-  ])("treats %s as public", (ip) => {
-    expect(isPrivateIp(ip, 4)).toBe(false);
-  });
+  it.each(["8.8.8.8", "1.1.1.1", "203.0.113.10", "198.51.100.7", "172.32.0.1"])(
+    "treats %s as public",
+    (ip) => {
+      expect(isPrivateIp(ip, 4)).toBe(false);
+    },
+  );
 
   it("fails closed on malformed input", () => {
     expect(isPrivateIp("not-an-ip", 4)).toBe(true);
@@ -39,15 +36,12 @@ describe("isPrivateIp (IPv6)", () => {
     expect(isPrivateIp(ip, 6)).toBe(true);
   });
 
-  it.each([
-    "fe80::1",
-    "fe90::1",
-    "fea0::1",
-    "feb0::1",
-    "febf::1",
-  ])("treats the full fe80::/10 link-local range (%s) as private", (ip) => {
-    expect(isPrivateIp(ip, 6)).toBe(true);
-  });
+  it.each(["fe80::1", "fe90::1", "fea0::1", "feb0::1", "febf::1"])(
+    "treats the full fe80::/10 link-local range (%s) as private",
+    (ip) => {
+      expect(isPrivateIp(ip, 6)).toBe(true);
+    },
+  );
 
   it("strips a zone id before classifying", () => {
     expect(isPrivateIp("fe80::1%eth0", 6)).toBe(true);
@@ -71,14 +65,12 @@ describe("isPrivateIp (IPv6)", () => {
     expect(isPrivateIp("::ffff:ac10:0001", 6)).toBe(true);
   });
 
-  it.each([
-    "2001:db8::5",
-    "2606:4700::1111",
-    "::ffff:8.8.8.8",
-    "::ffff:0808:0808",
-  ])("treats public address %s as public", (ip) => {
-    expect(isPrivateIp(ip, 6)).toBe(false);
-  });
+  it.each(["2001:db8::5", "2606:4700::1111", "::ffff:8.8.8.8", "::ffff:0808:0808"])(
+    "treats public address %s as public",
+    (ip) => {
+      expect(isPrivateIp(ip, 6)).toBe(false);
+    },
+  );
 });
 
 describe("isPrivateIp (unknown family)", () => {
