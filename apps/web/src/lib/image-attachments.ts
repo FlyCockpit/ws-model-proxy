@@ -28,6 +28,45 @@ export const ACCEPTED_IMAGE_TYPES = CLIENT_ACCEPTED_IMAGE_MIMES;
 
 export const ACCEPTED_IMAGE_ACCEPT_ATTR = ACCEPTED_IMAGE_TYPES.join(",");
 
+// These mirror the server-side magic-byte allowlist. Keeping the picker narrow
+// avoids inviting users to select a file the upload service will reject.
+export const ACCEPTED_AUDIO_TYPES = [
+  "audio/mpeg",
+  "audio/wav",
+  "audio/flac",
+  "audio/ogg",
+  "audio/mp4",
+] as const;
+export const ACCEPTED_VIDEO_TYPES = [
+  "video/mp4",
+  "video/webm",
+  "video/quicktime",
+  "video/x-matroska",
+] as const;
+
+export type AttachmentModality = "image" | "audio" | "video";
+export type AttachmentModalities = Record<AttachmentModality, boolean>;
+
+const attachmentTypesByModality: Record<AttachmentModality, readonly string[]> = {
+  image: ACCEPTED_IMAGE_TYPES,
+  audio: ACCEPTED_AUDIO_TYPES,
+  video: ACCEPTED_VIDEO_TYPES,
+};
+
+export function acceptedAttachmentAcceptAttr(modalities: AttachmentModalities): string {
+  return (Object.keys(attachmentTypesByModality) as AttachmentModality[])
+    .filter((modality) => modalities[modality])
+    .flatMap((modality) => attachmentTypesByModality[modality])
+    .join(",");
+}
+
+export function attachmentModalityForType(type: string): AttachmentModality | null {
+  if (isClientAcceptedImageMime(type)) return "image";
+  if ((ACCEPTED_AUDIO_TYPES as readonly string[]).includes(type)) return "audio";
+  if ((ACCEPTED_VIDEO_TYPES as readonly string[]).includes(type)) return "video";
+  return null;
+}
+
 /** Longest edge after downscaling; matches the shared media-policy default. */
 export const MAX_IMAGE_EDGE = DEFAULT_IMAGE_MAX_EDGE;
 
@@ -120,7 +159,7 @@ function scaleWithin(width: number, height: number, maxEdge: number) {
   };
 }
 
-function readFileAsDataUrl(file: File): Promise<string> {
+export function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : "");

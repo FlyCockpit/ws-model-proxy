@@ -20,6 +20,7 @@ import {
   transformerModalityMismatchErrors,
   transformerSupportedModalities,
 } from "../lib/openai-compatible-capabilities";
+import { visibleModelAttachmentModalities } from "../lib/visible-model-modalities";
 
 const CLI_HEARTBEAT_STALE_AFTER_MS = 60_000;
 
@@ -289,7 +290,8 @@ async function userSlugChangePreview({ userId, nextSlug }: { userId: string; nex
   };
 }
 
-function serializeVisibleTargets(targets: VisibleModelTargets) {
+async function serializeVisibleTargets(targets: VisibleModelTargets) {
+  const modalities = await visibleModelAttachmentModalities(targets);
   return {
     directModels: targets.directModels.map((model) => ({
       target: model.target,
@@ -301,6 +303,11 @@ function serializeVisibleTargets(targets: VisibleModelTargets) {
       endpointId: model.endpointId,
       endpointSlug: model.endpointSlug,
       cliDeviceSlug: model.cliDeviceSlug,
+      attachmentModalities: modalities.directById.get(model.id) ?? {
+        image: false,
+        audio: false,
+        video: false,
+      },
     })),
     modelPools: targets.modelPools.map((pool) => ({
       target: pool.target,
@@ -311,6 +318,11 @@ function serializeVisibleTargets(targets: VisibleModelTargets) {
       ownerUserId: pool.ownerUserId,
       ownerUserSlug: pool.ownerUserSlug,
       poolSlug: pool.poolSlug,
+      attachmentModalities: modalities.poolById.get(pool.id) ?? {
+        image: false,
+        audio: false,
+        video: false,
+      },
     })),
   };
 }

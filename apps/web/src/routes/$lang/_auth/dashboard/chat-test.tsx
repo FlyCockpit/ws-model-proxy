@@ -18,6 +18,7 @@ import { Textarea } from "@ws-model-proxy/ui/components/textarea";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import {
   ArrowDown,
+  AudioLines,
   ChevronDown,
   ChevronsUpDown,
   FlaskConical,
@@ -48,11 +49,15 @@ import { ChatMarkdown } from "@/components/chat-markdown";
 import { InlineRetry } from "@/components/inline-retry";
 import { useChatScrollEngine } from "@/hooks/use-chat-scroll-engine";
 import {
-  ACCEPTED_IMAGE_ACCEPT_ATTR,
+  type AttachmentModalities,
+  type AttachmentModality,
+  acceptedAttachmentAcceptAttr,
+  attachmentModalityForType,
   dataUrlToBlob,
-  isAcceptedImageType,
   MAX_ATTACHMENTS_PER_MESSAGE,
+  PER_IMAGE_MAX_BYTES,
   processImageFile,
+  readFileAsDataUrl,
   TOTAL_REQUEST_HARD_MAX_BYTES,
   TOTAL_REQUEST_SOFT_WARN_BYTES,
   UPLOAD_THRESHOLD_BYTES,
@@ -69,29 +74,88 @@ type ModelOption = {
   modelId: string;
   label: string;
   kind: "DIRECT_MODEL" | "MODEL_POOL";
+  attachmentModalities: AttachmentModalities;
 };
 type ChatRole = "user" | "assistant";
 type ChatMessageStatus = "ready" | "streaming" | "error" | "stopped";
-// Attached images stored on a user message. An attachment is EITHER embedded as
+// Attached media stored on a user message. An attachment is EITHER embedded as
 // a base64 data URL (small / media disabled), OR uploaded to the ephemeral media
 // store and referenced by id — in which case only a client-side preview URL is
 // kept for thumbnails and a fresh signed URL is minted at send time. History
 // keeps mediaIds, never signed URLs (signatures are short-lived).
-type ChatImageBase = {
+type ChatAttachmentBase = {
   id: string;
   name: string;
+  modality: AttachmentModality;
   // Set when a send-time /sign call reports the media id as expired/unknown, so
   // the thumbnail can be flagged and the user prompted to re-attach.
   expired?: boolean;
 };
-type ChatImageData = ChatImageBase & { kind: "data"; dataUrl: string };
-type ChatImageMedia = ChatImageBase & { kind: "media"; mediaId: string; previewUrl: string };
-type ChatImage = ChatImageData | ChatImageMedia;
+type ChatAttachmentData = ChatAttachmentBase & { kind: "data"; dataUrl: string };
+type ChatAttachmentMedia = ChatAttachmentBase & {
+  kind: "media";
+  mediaId: string;
+  previewUrl: string;
+};
+type ChatAttachment = ChatAttachmentData | ChatAttachmentMedia;
 
 // Thumbnail source for an attachment: the embedded data URL, or the client-side
 // object/blob preview URL for uploaded media (never the signed URL).
-function imagePreviewSrc(image: ChatImage): string {
-  return image.kind === "data" ? image.dataUrl : image.previewUrl;
+function attachmentPreviewSrc(attachment: ChatAttachment): string {
+  return attachment.kind === "data" ? attachment.dataUrl : attachment.previewUrl;
+}
+
+function AttachmentPreview({
+  attachment,
+  compact = false,
+}: {
+  attachment: ChatAttachment;
+  compact?: boolean;
+}) {
+  const source = attachmentPreviewSrc(attachment);
+  if (attachment.modality === "image") {
+    return (
+      <img
+        src={source}
+        alt={attachment.name}
+        className={
+          compact
+            ? "size-14 rounded-md border object-cover sm:size-16"
+            : "max-h-48 max-w-full rounded-md border object-contain"
+        }
+      />
+    );
+  }
+  if (attachment.modality === "audio") {
+    return (
+      <div
+        className={cn(
+          "flex min-w-48 items-center gap-2 rounded-md border bg-background p-2",
+          compact && "max-w-56",
+        )}
+      >
+        <AudioLines className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-xs font-medium" title={attachment.name}>
+            {attachment.name}
+          </p>
+          <audio controls src={source} className="mt-1 h-7 w-full" />
+        </div>
+      </div>
+    );
+  }
+  return (
+    <video
+      controls
+      src={source}
+      className={
+        compact
+          ? "h-16 w-28 rounded-md border object-cover"
+          : "max-h-48 max-w-full rounded-md border object-contain"
+      }
+      aria-label={attachment.name}
+    />
+  );
 }
 
 type MediaConfigResponse = { enabled: boolean; maxUploadBytes: number };
@@ -119,14 +183,16 @@ type ChatMessage = {
   status: ChatMessageStatus;
   sourceUserMessageId?: string;
   errorMessage?: string;
-  images?: ChatImage[];
+  attachments?: ChatAttachment[];
   metrics?: ChatTimingMetrics;
   transformDebug?: TransformDebug;
 };
-// OpenAI-shaped content parts used when a message carries images.
+// OpenAI-shaped content parts used when a message carries media.
 type RelayContentPart =
   | { type: "text"; text: string }
-  | { type: "image_url"; image_url: { url: string } };
+  | { type: "image_url"; image_url: { url: string } }
+  | { type: "video_url"; video_url: { url: string } }
+  | { type: "input_audio_url"; input_audio: { url: string } };
 type RelayChatMessage = {
   role: "system" | "user" | "assistant";
   content: string | RelayContentPart[];
@@ -146,12 +212,14 @@ function modelOptions(visibleModels: VisibleModels | undefined): ModelOption[] {
       modelId: model.modelId,
       label: model.upstreamModelId,
       kind: model.target,
+      attachmentModalities: model.attachmentModalities,
     })),
     ...visibleModels.modelPools.map((pool) => ({
       id: pool.id,
       modelId: pool.modelId,
       label: pool.name,
       kind: pool.target,
+      attachmentModalities: pool.attachmentModalities,
     })),
   ];
 }
@@ -273,21 +341,28 @@ function relayMessages(
 
   return selected.flatMap<RelayChatMessage>((message) => {
     if (message.role === "assistant" && message.status !== "ready") return [];
-    const hasImages = (message.images?.length ?? 0) > 0;
+    const hasAttachments = (message.attachments?.length ?? 0) > 0;
     const hasText = message.content.trim().length > 0;
-    if (!hasText && !hasImages) return [];
+    if (!hasText && !hasAttachments) return [];
 
     // Text-only messages keep the plain-string shape the route already sends.
-    if (!hasImages) {
+    if (!hasAttachments) {
       return [{ role: message.role, content: message.content }];
     }
 
-    // With images, content becomes an OpenAI-shaped content-parts array.
+    // With media, content becomes an OpenAI-shaped content-parts array.
     const parts: RelayContentPart[] = [];
     if (hasText) parts.push({ type: "text", text: message.content });
-    for (const image of message.images ?? []) {
-      const url = image.kind === "data" ? image.dataUrl : resolveMediaUrl(image.mediaId);
-      parts.push({ type: "image_url", image_url: { url } });
+    for (const attachment of message.attachments ?? []) {
+      const url =
+        attachment.kind === "data" ? attachment.dataUrl : resolveMediaUrl(attachment.mediaId);
+      if (attachment.modality === "image") {
+        parts.push({ type: "image_url", image_url: { url } });
+      } else if (attachment.modality === "audio") {
+        parts.push({ type: "input_audio_url", input_audio: { url } });
+      } else {
+        parts.push({ type: "video_url", video_url: { url } });
+      }
     }
     return [{ role: message.role, content: parts }];
   });
@@ -306,8 +381,8 @@ function collectMediaIds(messages: ChatMessage[], throughUserMessageId?: string)
     : messages;
   const ids = new Set<string>();
   for (const message of selected) {
-    for (const image of message.images ?? []) {
-      if (image.kind === "media") ids.add(image.mediaId);
+    for (const attachment of message.attachments ?? []) {
+      if (attachment.kind === "media") ids.add(attachment.mediaId);
     }
   }
   return [...ids];
@@ -592,7 +667,7 @@ function ChatTestPage() {
   const systemPromptHelpId = `${systemPromptId}-help`;
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [announcement, setAnnouncement] = useState("");
-  const [attachments, setAttachments] = useState<ChatImage[]>([]);
+  const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [attachmentNotice, setAttachmentNotice] = useState("");
   const [isProcessingImages, setIsProcessingImages] = useState(false);
   const [isPreparingSend, setIsPreparingSend] = useState(false);
@@ -606,6 +681,13 @@ function ChatTestPage() {
   const effectiveModelId = options.some((option) => option.modelId === selectedModelId)
     ? selectedModelId
     : (options[0]?.modelId ?? "");
+  const selectedModel = options.find((option) => option.modelId === effectiveModelId);
+  const attachmentModalities = selectedModel?.attachmentModalities ?? {
+    image: false,
+    audio: false,
+    video: false,
+  };
+  const attachmentAcceptAttr = acceptedAttachmentAcceptAttr(attachmentModalities);
   const isStreaming = messages.some((message) => message.status === "streaming");
   const canSend =
     (draft.trim().length > 0 || attachments.length > 0) &&
@@ -614,16 +696,38 @@ function ChatTestPage() {
     !isProcessingImages &&
     !isPreparingSend;
 
+  const handleModelChange = useCallback(
+    (modelId: string) => {
+      const nextModalities = options.find((option) => option.modelId === modelId)
+        ?.attachmentModalities ?? { image: false, audio: false, video: false };
+      setSelectedModelId(modelId);
+      const retained = attachments.filter((attachment) => nextModalities[attachment.modality]);
+      if (retained.length !== attachments.length) {
+        for (const attachment of attachments) {
+          if (!nextModalities[attachment.modality] && attachment.kind === "media") {
+            URL.revokeObjectURL(attachment.previewUrl);
+          }
+        }
+        setAttachments(retained);
+        setAttachmentNotice(t("dashboard:chatTest.attachments.removedForModel"));
+      }
+    },
+    [attachments, options, t],
+  );
+
   const updateAssistant = useCallback((id: string, update: Partial<ChatMessage>) => {
     setMessages((current) =>
       current.map((message) => (message.id === id ? { ...message, ...update } : message)),
     );
   }, []);
 
-  const addImageFiles = useCallback(
+  const addAttachmentFiles = useCallback(
     async (files: File[]) => {
-      const images = files.filter((file) => isAcceptedImageType(file.type));
-      if (images.length === 0) {
+      const supportedFiles = files.flatMap((file) => {
+        const modality = attachmentModalityForType(file.type);
+        return modality && attachmentModalities[modality] ? [{ file, modality }] : [];
+      });
+      if (supportedFiles.length === 0) {
         if (files.length > 0) setAttachmentNotice(t("dashboard:chatTest.attachments.unsupported"));
         return;
       }
@@ -634,18 +738,62 @@ function ChatTestPage() {
         );
         return;
       }
-      const toProcess = images.slice(0, remaining);
-      const truncated = images.length > remaining;
+      const toProcess = supportedFiles.slice(0, remaining);
+      const truncated = supportedFiles.length > remaining;
       setIsProcessingImages(true);
       setAttachmentNotice("");
       // Media may be disabled mid-batch if an upload reports 501; track locally
       // and mirror into the query cache so later attachments skip the round trip.
       let uploadEnabled = mediaEnabled;
       try {
-        const accepted: ChatImage[] = [];
+        const accepted: ChatAttachment[] = [];
         let rejectedCount = 0;
         let quotaHit = false;
-        for (const file of toProcess) {
+        for (const { file, modality } of toProcess) {
+          if (modality !== "image") {
+            const canUpload =
+              uploadEnabled && (mediaMaxUploadBytes === 0 || file.size <= mediaMaxUploadBytes);
+            if (canUpload) {
+              const upload = await uploadMediaFile(file, file.name);
+              if (upload.status === "ok") {
+                accepted.push({
+                  id: newId("attachment"),
+                  name: file.name,
+                  modality,
+                  kind: "media",
+                  mediaId: upload.id,
+                  previewUrl: URL.createObjectURL(file),
+                });
+                continue;
+              }
+              if (upload.status === "quota") {
+                quotaHit = true;
+                continue;
+              }
+              if (upload.status === "disabled") {
+                uploadEnabled = false;
+                queryClient.setQueryData<MediaConfigResponse>(MEDIA_CONFIG_QUERY_KEY, {
+                  enabled: false,
+                  maxUploadBytes: 0,
+                });
+              }
+            }
+            // Without storage, raw audio/video must stay safely below the
+            // route budget when embedded and re-sent with message history.
+            if (file.size > PER_IMAGE_MAX_BYTES) {
+              rejectedCount += 1;
+              continue;
+            }
+            accepted.push({
+              id: newId("attachment"),
+              name: file.name,
+              modality,
+              kind: "data",
+              dataUrl: await readFileAsDataUrl(file),
+            });
+            continue;
+          }
+
           const result = await processImageFile(file);
           if (!result.ok) {
             rejectedCount += 1;
@@ -668,6 +816,7 @@ function ChatTestPage() {
               accepted.push({
                 id,
                 name,
+                modality,
                 kind: "media",
                 mediaId: upload.id,
                 previewUrl: URL.createObjectURL(blob),
@@ -693,7 +842,7 @@ function ChatTestPage() {
             // status "failed" or "disabled": fall back to embedding.
           }
 
-          accepted.push({ id, name, kind: "data", dataUrl });
+          accepted.push({ id, name, modality, kind: "data", dataUrl });
         }
         if (accepted.length > 0) {
           setAttachments((current) => [...current, ...accepted]);
@@ -715,7 +864,7 @@ function ChatTestPage() {
         setIsProcessingImages(false);
       }
     },
-    [attachments.length, mediaEnabled, mediaMaxUploadBytes, queryClient, t],
+    [attachmentModalities, attachments.length, mediaEnabled, mediaMaxUploadBytes, queryClient, t],
   );
 
   const openFilePicker = useCallback(() => {
@@ -727,32 +876,30 @@ function ChatTestPage() {
       const files = event.target.files ? Array.from(event.target.files) : [];
       // Reset so selecting the same file again re-triggers change.
       event.target.value = "";
-      if (files.length > 0) void addImageFiles(files);
+      if (files.length > 0) void addAttachmentFiles(files);
     },
-    [addImageFiles],
+    [addAttachmentFiles],
   );
 
   const removeAttachment = useCallback((id: string) => {
     setAttachments((current) => {
-      const removed = current.find((image) => image.id === id);
+      const removed = current.find((attachment) => attachment.id === id);
       // Only composer previews are revoked here; once an attachment is sent it
       // moves into message history, which keeps rendering its preview URL.
       if (removed?.kind === "media") URL.revokeObjectURL(removed.previewUrl);
-      return current.filter((image) => image.id !== id);
+      return current.filter((attachment) => attachment.id !== id);
     });
   }, []);
 
   const handlePaste = useCallback(
     (event: ClipboardEvent<HTMLTextAreaElement>) => {
-      const files = Array.from(event.clipboardData.files ?? []).filter((file) =>
-        isAcceptedImageType(file.type),
-      );
+      const files = Array.from(event.clipboardData.files ?? []);
       if (files.length > 0) {
         event.preventDefault();
-        void addImageFiles(files);
+        void addAttachmentFiles(files);
       }
     },
-    [addImageFiles],
+    [addAttachmentFiles],
   );
 
   const handleDragOver = useCallback((event: DragEvent<HTMLFormElement>) => {
@@ -769,16 +916,14 @@ function ChatTestPage() {
 
   const handleDrop = useCallback(
     (event: DragEvent<HTMLFormElement>) => {
-      const files = Array.from(event.dataTransfer.files ?? []).filter((file) =>
-        isAcceptedImageType(file.type),
-      );
+      const files = Array.from(event.dataTransfer.files ?? []);
       if (files.length > 0) {
         event.preventDefault();
-        void addImageFiles(files);
+        void addAttachmentFiles(files);
       }
       setIsDragging(false);
     },
-    [addImageFiles],
+    [addAttachmentFiles],
   );
 
   const runRelay = useCallback(
@@ -847,11 +992,13 @@ function ChatTestPage() {
   // in history and in the composer, so the thumbnails show a re-attach prompt.
   const markMediaExpired = useCallback((invalidIds: string[]) => {
     const invalid = new Set(invalidIds);
-    const flag = (image: ChatImage): ChatImage =>
-      image.kind === "media" && invalid.has(image.mediaId) ? { ...image, expired: true } : image;
+    const flag = (attachment: ChatAttachment): ChatAttachment =>
+      attachment.kind === "media" && invalid.has(attachment.mediaId)
+        ? { ...attachment, expired: true }
+        : attachment;
     setMessages((current) =>
       current.map((message) =>
-        message.images ? { ...message, images: message.images.map(flag) } : message,
+        message.attachments ? { ...message, attachments: message.attachments.map(flag) } : message,
       ),
     );
     setAttachments((current) => current.map(flag));
@@ -909,8 +1056,8 @@ function ChatTestPage() {
       event?.preventDefault();
       if (sendingRef.current) return;
       const content = draft.trim();
-      const hasImages = attachments.length > 0;
-      if ((!content && !hasImages) || !effectiveModelId || isStreaming || isProcessingImages) {
+      const hasAttachments = attachments.length > 0;
+      if ((!content && !hasAttachments) || !effectiveModelId || isStreaming || isProcessingImages) {
         return;
       }
 
@@ -919,7 +1066,7 @@ function ChatTestPage() {
         role: "user",
         content,
         status: "ready",
-        images: hasImages ? attachments : undefined,
+        attachments: hasAttachments ? attachments : undefined,
       };
       const assistantMessage: ChatMessage = {
         id: newId("assistant"),
@@ -1125,7 +1272,7 @@ function ChatTestPage() {
           <ModelPicker
             options={options}
             value={effectiveModelId}
-            onValueChange={setSelectedModelId}
+            onValueChange={handleModelChange}
             disabled={isStreaming || isPreparingSend}
           />
           <Button
@@ -1260,25 +1407,26 @@ function ChatTestPage() {
               className="flex flex-wrap gap-2"
               aria-label={t("dashboard:chatTest.attachments.composerLabel")}
             >
-              {attachments.map((image) => (
-                <li key={image.id} className="relative">
-                  <img
-                    src={imagePreviewSrc(image)}
-                    alt={image.name}
-                    className={cn(
-                      "size-14 rounded-md border object-cover sm:size-16",
-                      image.expired && "opacity-40 ring-1 ring-destructive",
-                    )}
-                  />
-                  {image.expired ? (
+              {attachments.map((attachment) => (
+                <li
+                  key={attachment.id}
+                  className={cn(
+                    "relative",
+                    attachment.expired && "opacity-40 ring-1 ring-destructive",
+                  )}
+                >
+                  <AttachmentPreview attachment={attachment} compact />
+                  {attachment.expired ? (
                     <span className="absolute inset-x-0 bottom-0 rounded-b-md bg-destructive/80 px-1 py-0.5 text-center text-[10px] font-medium text-destructive-foreground">
                       {t("dashboard:chatTest.attachments.expiredBadge")}
                     </span>
                   ) : null}
                   <button
                     type="button"
-                    onClick={() => removeAttachment(image.id)}
-                    aria-label={t("dashboard:chatTest.attachments.remove", { name: image.name })}
+                    onClick={() => removeAttachment(attachment.id)}
+                    aria-label={t("dashboard:chatTest.attachments.remove", {
+                      name: attachment.name,
+                    })}
                     className="absolute -right-2 -top-2 flex size-7 items-center justify-center rounded-full border bg-background text-muted-foreground shadow-sm hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring sm:size-6"
                   >
                     <X className="size-3.5" />
@@ -1296,7 +1444,7 @@ function ChatTestPage() {
             <input
               ref={fileInputRef}
               type="file"
-              accept={ACCEPTED_IMAGE_ACCEPT_ATTR}
+              accept={attachmentAcceptAttr}
               multiple
               className="hidden"
               onChange={handleFileInputChange}
@@ -1307,9 +1455,9 @@ function ChatTestPage() {
               variant="outline"
               size="icon-touch"
               onClick={openFilePicker}
-              disabled={options.length === 0 || isProcessingImages}
-              aria-label={t("dashboard:chatTest.attachments.attachImage")}
-              title={t("dashboard:chatTest.attachments.attachImage")}
+              disabled={options.length === 0 || isProcessingImages || !attachmentAcceptAttr}
+              aria-label={t("dashboard:chatTest.attachments.attach")}
+              title={t("dashboard:chatTest.attachments.attach")}
             >
               {isProcessingImages ? (
                 <Loader2 className="size-4 animate-spin" />
@@ -1424,19 +1572,15 @@ function MessageBubble({
           </span>
         ) : null}
       </div>
-      {message.images && message.images.length > 0 ? (
+      {message.attachments && message.attachments.length > 0 ? (
         <ul className="mb-2 flex flex-wrap gap-2">
-          {message.images.map((image) => (
-            <li key={image.id} className="relative">
-              <img
-                src={imagePreviewSrc(image)}
-                alt={image.name}
-                className={cn(
-                  "max-h-48 max-w-full rounded-md border object-contain",
-                  image.expired && "opacity-40 ring-1 ring-destructive",
-                )}
-              />
-              {image.expired ? (
+          {message.attachments.map((attachment) => (
+            <li
+              key={attachment.id}
+              className={cn("relative", attachment.expired && "opacity-40 ring-1 ring-destructive")}
+            >
+              <AttachmentPreview attachment={attachment} />
+              {attachment.expired ? (
                 <span className="absolute bottom-1 left-1 rounded bg-destructive/80 px-1.5 py-0.5 text-[10px] font-medium text-destructive-foreground">
                   {t("dashboard:chatTest.attachments.expiredBadge")}
                 </span>
@@ -1447,7 +1591,7 @@ function MessageBubble({
       ) : null}
       {message.content ? (
         <MessageContent content={message.content} />
-      ) : message.images && message.images.length > 0 ? null : (
+      ) : message.attachments && message.attachments.length > 0 ? null : (
         <p className="text-sm text-muted-foreground">{t("dashboard:chatTest.status.waiting")}</p>
       )}
       {isAssistant && message.metrics?.ttftMs !== undefined ? (

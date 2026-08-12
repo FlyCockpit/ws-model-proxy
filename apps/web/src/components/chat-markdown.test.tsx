@@ -47,4 +47,12 @@ describe("ChatMarkdown", () => {
     expect(html).not.toContain("javascript:");
     expect(html).toContain('href="https://example.com"');
   });
+
+  it("renders hex colors with contrast-aware swatches", () => {
+    const html = renderToStaticMarkup(<ChatMarkdown content={"Dark #123abc, light #fefefe."} />);
+    expect(html).toContain("background-color:#123abc");
+    expect(html).toContain("color:#ffffff");
+    expect(html).toContain("background-color:#fefefe");
+    expect(html).toContain("color:#000000");
+  });
 });

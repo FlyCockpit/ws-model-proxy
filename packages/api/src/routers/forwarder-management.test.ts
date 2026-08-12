@@ -50,6 +50,7 @@ const db = prisma as unknown as {
   };
   poolMember: {
     create: MockInstance;
+    findMany: MockInstance;
     findUnique: MockInstance;
     update: MockInstance;
     delete: MockInstance;
@@ -135,7 +136,7 @@ describe("forwarderManagementRouter", () => {
     db.user.findUnique
       .mockResolvedValueOnce({ id: "user-id", slug: "old-owner" })
       .mockResolvedValueOnce(null);
-    db.discoveredModel.findMany.mockResolvedValue([
+    db.discoveredModel.findMany.mockResolvedValueOnce([
       {
         id: "model-id",
         upstreamModelId: "org/model 1",
@@ -447,29 +448,64 @@ describe("forwarderManagementRouter", () => {
   });
 
   it("exposes visible model preview with canonical ids and stable internal ids", async () => {
-    db.discoveredModel.findMany.mockResolvedValue([
-      {
-        id: "model-id",
-        userId: "user-id",
-        upstreamModelId: "gpt/local",
-        User: { slug: "owner" },
-        Endpoint: {
-          id: "endpoint-id",
-          slug: "local",
-          CliDevice: { slug: "desk" },
+    db.discoveredModel.findMany
+      .mockResolvedValueOnce([
+        {
+          id: "model-id",
+          userId: "user-id",
+          upstreamModelId: "gpt/local",
+          User: { slug: "owner" },
+          Endpoint: {
+            id: "endpoint-id",
+            slug: "local",
+            CliDevice: { slug: "desk" },
+          },
         },
-      },
-    ]);
-    db.modelPool.findMany.mockResolvedValue([
-      {
-        id: "pool-id",
-        userId: "user-id",
-        slug: "general",
-        name: "General",
-        description: null,
-        User: { slug: "owner" },
-      },
-    ]);
+      ])
+      .mockResolvedValueOnce([
+        {
+          id: "model-id",
+          capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+          capabilityOverrideMetadata: null,
+          Endpoint: {
+            capabilityMetadata: {
+              version: 1,
+              protocol: "openai-compatible",
+              chatCompletions: { supported: true, vision: true, audio: true, video: true },
+            },
+          },
+        },
+      ]);
+    db.modelPool.findMany
+      .mockResolvedValueOnce([
+        {
+          id: "pool-id",
+          userId: "user-id",
+          slug: "general",
+          name: "General",
+          description: null,
+          User: { slug: "owner" },
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          id: "pool-id",
+          transformerDiscoveredModelId: null,
+          transformerImages: true,
+          transformerAudio: false,
+          transformerVideo: false,
+          TransformerDiscoveredModel: null,
+        },
+        {
+          id: "grant-pool-id",
+          transformerDiscoveredModelId: null,
+          transformerImages: true,
+          transformerAudio: false,
+          transformerVideo: false,
+          TransformerDiscoveredModel: null,
+        },
+      ]);
+    db.poolMember.findMany.mockResolvedValue([]);
     db.poolGrant.findMany.mockResolvedValue([
       {
         ModelPool: {
@@ -495,6 +531,7 @@ describe("forwarderManagementRouter", () => {
           endpointId: "endpoint-id",
           endpointSlug: "local",
           cliDeviceSlug: "desk",
+          attachmentModalities: { image: true, audio: true, video: true },
         },
       ],
       modelPools: [
@@ -507,6 +544,7 @@ describe("forwarderManagementRouter", () => {
           ownerUserId: "user-id",
           ownerUserSlug: "owner",
           poolSlug: "general",
+          attachmentModalities: { image: false, audio: false, video: false },
         },
         {
           target: "MODEL_POOL",
@@ -517,6 +555,7 @@ describe("forwarderManagementRouter", () => {
           ownerUserId: "other-user-id",
           ownerUserSlug: "friend",
           poolSlug: "shared",
+          attachmentModalities: { image: false, audio: false, video: false },
         },
       ],
     });
