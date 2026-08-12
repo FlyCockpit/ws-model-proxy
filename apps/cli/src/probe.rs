@@ -115,8 +115,14 @@ fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
         .into_iter()
         .filter(|model| !model.id.trim().is_empty())
         .collect();
-    let discovered_model_ids = rows.iter().map(|model| model.id.clone()).collect::<Vec<_>>();
-    let model_suggestions = rows.iter().filter_map(suggest_model_from_upstream).collect();
+    let discovered_model_ids = rows
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
+    let model_suggestions = rows
+        .iter()
+        .filter_map(suggest_model_from_upstream)
+        .collect();
     Ok(ProbeReport {
         endpoint_slug: endpoint.slug.clone(),
         status: ProbeStatus::Online,
@@ -127,11 +133,7 @@ fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
     })
 }
 
-pub fn apply_probe_report(
-    config: &mut Config,
-    report: &ProbeReport,
-    replace: bool,
-) -> Result<()> {
+pub fn apply_probe_report(config: &mut Config, report: &ProbeReport, replace: bool) -> Result<()> {
     let Some(endpoint) = config.endpoint_mut(&report.endpoint_slug) else {
         anyhow::bail!("endpoint `{}` no longer exists", report.endpoint_slug);
     };
@@ -150,7 +152,9 @@ pub fn apply_probe_report(
             endpoint
                 .models
                 .iter()
-                .filter(|model| discovered.contains(model.upstream_model_id.as_str()) || model.pinned)
+                .filter(|model| {
+                    discovered.contains(model.upstream_model_id.as_str()) || model.pinned
+                })
                 .cloned()
                 .collect()
         } else {
@@ -280,15 +284,17 @@ mod tests {
 
     #[test]
     fn does_not_infer_modalities_from_model_id() {
-        assert!(suggest_model_from_upstream(&ModelRow {
-            id: "media-describe-omni".to_string(),
-            supports_vision: None,
-            supports_video_input: None,
-            supports_audio_input: None,
-            capabilities: None,
-            architecture: None,
-        })
-        .is_none());
+        assert!(
+            suggest_model_from_upstream(&ModelRow {
+                id: "media-describe-omni".to_string(),
+                supports_vision: None,
+                supports_video_input: None,
+                supports_audio_input: None,
+                capabilities: None,
+                architecture: None,
+            })
+            .is_none()
+        );
     }
 
     #[test]
@@ -393,13 +399,19 @@ mod tests {
         )
         .expect("apply");
         let models = &config.endpoints[0].models;
-        let ids: Vec<&str> = models.iter().map(|model| model.upstream_model_id.as_str()).collect();
+        let ids: Vec<&str> = models
+            .iter()
+            .map(|model| model.upstream_model_id.as_str())
+            .collect();
         assert_eq!(ids, ["kept", "pinned-missing", "new"]);
         let kept = models
             .iter()
             .find(|model| model.upstream_model_id == "kept")
             .expect("kept");
-        assert_eq!(kept.capability_override_mode, CapabilityOverrideMode::Override);
+        assert_eq!(
+            kept.capability_override_mode,
+            CapabilityOverrideMode::Override
+        );
         assert_eq!(
             kept.capabilities
                 .as_ref()

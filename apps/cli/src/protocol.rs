@@ -5,9 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::config::{
-    CapabilityOverrideMode, Config, EndpointConfig, OpenAiCompatibleCapabilities,
-};
+use crate::config::{CapabilityOverrideMode, Config, EndpointConfig, OpenAiCompatibleCapabilities};
 
 pub const RELAY_PROTOCOL_VERSION: &str = "2.3";
 pub const RELAY_SUBPROTOCOL: &str = "ws-model-proxy.relay.v2";
