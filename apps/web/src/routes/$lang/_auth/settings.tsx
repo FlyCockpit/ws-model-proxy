@@ -29,7 +29,7 @@ function SettingsLayout() {
           className="w-full min-w-0 md:w-48 flex-shrink-0"
           style={{ viewTransitionName: "settings-subnav" }}
         >
-          <div className="-mx-4 flex flex-row gap-1 overflow-x-auto px-4 no-scrollbar md:mx-0 md:flex-col md:overflow-x-visible md:px-0">
+          <div className="-mx-4 flex flex-row gap-1 overflow-x-auto overflow-y-hidden overscroll-x-contain px-4 no-scrollbar md:mx-0 md:flex-col md:overflow-x-visible md:overflow-y-visible md:overscroll-auto md:px-0">
             {navItems.map((item) => (
               <Link
                 key={item.to}

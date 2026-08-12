@@ -74,7 +74,10 @@
     "systemPrompt": {
       "label": "Prompt del sistema (solo sesión)",
       "placeholder": "Instrucciones opcionales para este chat",
-      "help": "Se envía como el primer mensaje solo para este chat. No se guarda."
+      "help": "Se envía como el primer mensaje solo para este chat. No se guarda.",
+      "toggleShow": "Mostrar prompt del sistema",
+      "toggleHide": "Ocultar prompt del sistema",
+      "activeBadge": "Activo"
     },
     "status": {
       "stopped": "Detenido",

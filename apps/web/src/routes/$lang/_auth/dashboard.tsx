@@ -66,14 +66,17 @@ function DashboardLayout() {
   const { t } = useTranslation(["common", "dashboard"]);
 
   return (
-    <div className="container mx-auto flex h-full min-h-0 max-w-6xl flex-col px-4 py-6 md:py-8">
-      <div className="mb-5 shrink-0">
-        <h1 className="text-2xl font-semibold">{t("dashboard:title")}</h1>
+    <div className="container mx-auto flex h-full min-h-0 max-w-6xl flex-col px-4 py-4 md:py-8">
+      <div className="mb-3 shrink-0 md:mb-5">
+        <h1 className="text-xl font-semibold md:text-2xl">{t("dashboard:title")}</h1>
         <p className="mt-1 text-sm text-muted-foreground">{t("dashboard:description")}</p>
       </div>
 
-      <div className="mb-6 min-w-0 shrink-0 overflow-x-auto no-scrollbar">
-        <nav className="flex w-max gap-1" aria-label={t("dashboard:nav.ariaLabel")}>
+      {/* Horizontal-only: overflow-y-hidden clips accidental vertical overflow;
+          overscroll-x-contain keeps horizontal swipes from chaining. Avoid
+          touch-pan-x so vertical page scrolls can still begin on this strip. */}
+      <div className="mb-4 min-w-0 shrink-0 overflow-x-auto overflow-y-hidden overscroll-x-contain no-scrollbar md:mb-6">
+        <nav className="flex w-max items-center gap-1" aria-label={t("dashboard:nav.ariaLabel")}>
           {dashboardSections.map((item) => (
             <Link
               key={item.to}

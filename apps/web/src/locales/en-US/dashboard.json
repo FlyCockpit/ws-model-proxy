@@ -74,7 +74,10 @@
     "systemPrompt": {
       "label": "System prompt (session only)",
       "placeholder": "Optional instructions for this chat",
-      "help": "Sent as the first message for this chat only. It is not saved."
+      "help": "Sent as the first message for this chat only. It is not saved.",
+      "toggleShow": "Show system prompt",
+      "toggleHide": "Hide system prompt",
+      "activeBadge": "Set"
     },
     "status": {
       "stopped": "Stopped",

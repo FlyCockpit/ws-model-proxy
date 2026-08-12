@@ -75,7 +75,7 @@ function AdminNav() {
       className="sticky top-0 z-30 border-b bg-background/80 backdrop-blur"
     >
       <div className="container mx-auto min-w-0 max-w-7xl">
-        <ul className="-mb-px flex gap-1 overflow-x-auto overscroll-x-contain no-scrollbar px-4 py-2">
+        <ul className="-mb-px flex gap-1 overflow-x-auto overflow-y-hidden overscroll-x-contain no-scrollbar px-4 py-2">
           {NAV_ITEMS.map((item) => (
             <li key={item.to} className="shrink-0">
               <Link

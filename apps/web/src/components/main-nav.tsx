@@ -21,7 +21,7 @@ export function MainNav() {
   return (
     <nav
       aria-label={t("mainNav.ariaLabel")}
-      className="hidden min-w-0 flex-1 overflow-x-auto no-scrollbar md:block"
+      className="hidden min-w-0 flex-1 overflow-x-auto overflow-y-hidden overscroll-x-contain no-scrollbar md:block"
     >
       <div className="flex w-max items-center gap-1">
         {items.map((item) => (

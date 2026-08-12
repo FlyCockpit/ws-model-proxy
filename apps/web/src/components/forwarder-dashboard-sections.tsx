@@ -825,12 +825,12 @@ export function PoolsSection() {
       )}
 
       <Sheet open={Boolean(editingPool)} onOpenChange={(open) => !open && setEditingPool(null)}>
-        <SheetContent className="w-full sm:max-w-md">
-          <SheetHeader>
+        <SheetContent className="w-full overflow-hidden sm:max-w-md">
+          <SheetHeader className="shrink-0">
             <SheetTitle>{t("dashboard:pools.editTitle")}</SheetTitle>
             <SheetDescription>{t("dashboard:pools.editDescription")}</SheetDescription>
           </SheetHeader>
-          <div className="px-4">
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain px-4 pb-[max(1rem,var(--safe-area-bottom))]">
             {editingPool ? (
               <PoolForm
                 key={editingPool.id}
@@ -862,12 +862,12 @@ export function PoolsSection() {
       </Dialog>
 
       <Sheet open={Boolean(editingMember)} onOpenChange={(open) => !open && setEditingMember(null)}>
-        <SheetContent className="w-full sm:max-w-md">
-          <SheetHeader>
+        <SheetContent className="w-full overflow-hidden sm:max-w-md">
+          <SheetHeader className="shrink-0">
             <SheetTitle>{t("dashboard:pools.editMemberTitle")}</SheetTitle>
             <SheetDescription>{t("dashboard:pools.editMemberDescription")}</SheetDescription>
           </SheetHeader>
-          <div className="px-4">
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain px-4 pb-[max(1rem,var(--safe-area-bottom))]">
             {editingMember ? (
               <PoolMemberForm
                 key={editingMember.id}

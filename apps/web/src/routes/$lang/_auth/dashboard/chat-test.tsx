@@ -16,9 +16,11 @@ import { Textarea } from "@ws-model-proxy/ui/components/textarea";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import {
   ArrowDown,
+  ChevronDown,
   FlaskConical,
   ImagePlus,
   Loader2,
+  MessageSquarePlus,
   RefreshCw,
   RotateCcw,
   Send,
@@ -453,7 +455,11 @@ function ChatTestPage() {
   const [selectedModelId, setSelectedModelId] = useState("");
   const [draft, setDraft] = useState("");
   const [systemPrompt, setSystemPrompt] = useState("");
+  // Collapsed by default so the mobile transcript keeps most of the viewport;
+  // users expand only when they need a session system prompt.
+  const [systemPromptOpen, setSystemPromptOpen] = useState(false);
   const systemPromptId = useId();
+  const systemPromptPanelId = `${systemPromptId}-panel`;
   const systemPromptHelpId = `${systemPromptId}-help`;
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [announcement, setAnnouncement] = useState("");
@@ -943,6 +949,7 @@ function ChatTestPage() {
     setMessages([]);
     setDraft("");
     setSystemPrompt("");
+    setSystemPromptOpen(false);
     setAttachments([]);
     setAttachmentNotice("");
     setAnnouncement(t("dashboard:chatTest.announcements.fresh"));
@@ -962,19 +969,21 @@ function ChatTestPage() {
     );
   }
 
+  const systemPromptHasValue = systemPrompt.trim().length > 0;
+
   return (
     <section className="grid h-full min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)_auto] rounded-md border bg-background">
-      <div className="flex flex-col gap-3 border-b p-3 md:flex-row md:items-center md:justify-between">
+      <div className="flex shrink-0 flex-col gap-2 border-b p-2 sm:gap-3 sm:p-3 md:flex-row md:items-center md:justify-between">
         <div className="min-w-0">
-          <h2 className="text-lg font-semibold">{t("dashboard:chatTest.title")}</h2>
+          <h2 className="text-base font-semibold sm:text-lg">{t("dashboard:chatTest.title")}</h2>
         </div>
-        <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center">
+        <div className="flex min-w-0 items-center gap-2">
           <Select
             value={effectiveModelId}
             onValueChange={(value) => setSelectedModelId(value ?? "")}
           >
             <SelectTrigger
-              className="min-h-[44px] w-full min-w-0 sm:w-80"
+              className="min-h-[44px] min-w-0 flex-1 md:w-80 md:flex-none"
               aria-label={t("dashboard:chatTest.modelPicker")}
             >
               <SelectValue />
@@ -990,16 +999,26 @@ function ChatTestPage() {
           <Button
             type="button"
             variant="outline"
-            size="touch"
+            size="icon-touch"
             disabled={isStreaming || isPreparingSend}
             onClick={startFreshChat}
+            aria-label={t("dashboard:chatTest.freshChat")}
+            title={t("dashboard:chatTest.freshChat")}
           >
-            {t("dashboard:chatTest.freshChat")}
+            <MessageSquarePlus className="size-4" />
           </Button>
           {import.meta.env.DEV ? (
-            <Button type="button" variant="outline" size="touch" onClick={loadFixture}>
+            <Button
+              type="button"
+              variant="outline"
+              size="icon-touch"
+              onClick={loadFixture}
+              aria-label={t("dashboard:chatTest.loadFixture", {
+                count: LONG_THREAD_FIXTURE_COUNT,
+              })}
+              title={t("dashboard:chatTest.loadFixture", { count: LONG_THREAD_FIXTURE_COUNT })}
+            >
               <FlaskConical className="size-4" />
-              {t("dashboard:chatTest.loadFixture", { count: LONG_THREAD_FIXTURE_COUNT })}
             </Button>
           ) : null}
         </div>
@@ -1009,12 +1028,12 @@ function ChatTestPage() {
         <div
           ref={scroll.scrollRef}
           onScroll={scroll.markUserIntent}
-          className="h-full min-h-0 overflow-y-auto overscroll-y-auto p-3 scrollbar-gutter-stable focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/50"
+          className="h-full min-h-0 overflow-y-auto overscroll-y-contain p-2 scrollbar-gutter-stable focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/50 sm:p-3"
           aria-label={t("dashboard:chatTest.transcript")}
         >
-          <div ref={scroll.contentRef} className="mx-auto max-w-4xl space-y-4">
+          <div ref={scroll.contentRef} className="mx-auto max-w-4xl space-y-3 sm:space-y-4">
             {messages.length === 0 ? (
-              <div className="rounded-md border border-dashed p-8 text-center text-sm text-muted-foreground">
+              <div className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground sm:p-8">
                 {options.length === 0
                   ? t("dashboard:chatTest.emptyModels")
                   : t("dashboard:chatTest.emptyTranscript")}
@@ -1047,7 +1066,9 @@ function ChatTestPage() {
 
       <form
         className={cn(
-          "border-t p-3",
+          // Cap form height on short viewports so an expanded system prompt /
+          // attachment strip can scroll internally instead of clipping Send.
+          "min-h-0 max-h-[min(50dvh,22rem)] shrink-0 overflow-y-auto overscroll-y-contain border-t p-2 sm:max-h-none sm:overflow-visible sm:p-3",
           isDragging && "bg-primary/5 ring-1 ring-inset ring-primary/40",
         )}
         onSubmit={handleSend}
@@ -1057,21 +1078,50 @@ function ChatTestPage() {
       >
         <div className="mx-auto flex max-w-4xl flex-col gap-2">
           <div className="space-y-1.5">
-            <Label htmlFor={systemPromptId} className="text-xs text-muted-foreground">
-              {t("dashboard:chatTest.systemPrompt.label")}
-            </Label>
-            <Textarea
-              id={systemPromptId}
-              value={systemPrompt}
-              onChange={(event) => setSystemPrompt(event.target.value)}
-              disabled={options.length === 0 || isStreaming}
-              placeholder={t("dashboard:chatTest.systemPrompt.placeholder")}
-              aria-describedby={systemPromptHelpId}
-              className="min-h-[44px] resize-y text-sm"
-            />
-            <p id={systemPromptHelpId} className="text-xs text-muted-foreground">
-              {t("dashboard:chatTest.systemPrompt.help")}
-            </p>
+            <button
+              type="button"
+              className="flex min-h-11 w-full items-center justify-between gap-2 rounded-md px-1 text-left text-xs font-medium text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+              aria-expanded={systemPromptOpen}
+              aria-controls={systemPromptPanelId}
+              onClick={() => setSystemPromptOpen((open) => !open)}
+            >
+              <span className="inline-flex min-w-0 items-center gap-2">
+                <span className="truncate">
+                  {systemPromptOpen
+                    ? t("dashboard:chatTest.systemPrompt.toggleHide")
+                    : t("dashboard:chatTest.systemPrompt.toggleShow")}
+                </span>
+                {systemPromptHasValue && !systemPromptOpen ? (
+                  <span className="rounded-full bg-primary/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-primary">
+                    {t("dashboard:chatTest.systemPrompt.activeBadge")}
+                  </span>
+                ) : null}
+              </span>
+              <ChevronDown
+                aria-hidden="true"
+                className={cn(
+                  "size-4 shrink-0 transition-transform",
+                  systemPromptOpen && "rotate-180",
+                )}
+              />
+            </button>
+            <div id={systemPromptPanelId} hidden={!systemPromptOpen} className="space-y-1.5">
+              <Label htmlFor={systemPromptId} className="sr-only">
+                {t("dashboard:chatTest.systemPrompt.label")}
+              </Label>
+              <Textarea
+                id={systemPromptId}
+                value={systemPrompt}
+                onChange={(event) => setSystemPrompt(event.target.value)}
+                disabled={options.length === 0 || isStreaming}
+                placeholder={t("dashboard:chatTest.systemPrompt.placeholder")}
+                aria-describedby={systemPromptHelpId}
+                className="min-h-[44px] max-h-32 resize-y text-sm"
+              />
+              <p id={systemPromptHelpId} className="text-xs text-muted-foreground">
+                {t("dashboard:chatTest.systemPrompt.help")}
+              </p>
+            </div>
           </div>
           {attachments.length > 0 ? (
             <ul
@@ -1084,7 +1134,7 @@ function ChatTestPage() {
                     src={imagePreviewSrc(image)}
                     alt={image.name}
                     className={cn(
-                      "size-16 rounded-md border object-cover",
+                      "size-14 rounded-md border object-cover sm:size-16",
                       image.expired && "opacity-40 ring-1 ring-destructive",
                     )}
                   />
@@ -1097,7 +1147,7 @@ function ChatTestPage() {
                     type="button"
                     onClick={() => removeAttachment(image.id)}
                     aria-label={t("dashboard:chatTest.attachments.remove", { name: image.name })}
-                    className="absolute -right-2 -top-2 flex size-6 items-center justify-center rounded-full border bg-background text-muted-foreground shadow-sm hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    className="absolute -right-2 -top-2 flex size-7 items-center justify-center rounded-full border bg-background text-muted-foreground shadow-sm hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring sm:size-6"
                   >
                     <X className="size-3.5" />
                   </button>
@@ -1110,7 +1160,31 @@ function ChatTestPage() {
               {attachmentNotice}
             </p>
           ) : null}
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+          <div className="flex items-end gap-2">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept={ACCEPTED_IMAGE_ACCEPT_ATTR}
+              multiple
+              className="hidden"
+              onChange={handleFileInputChange}
+              tabIndex={-1}
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="icon-touch"
+              onClick={openFilePicker}
+              disabled={options.length === 0 || isProcessingImages}
+              aria-label={t("dashboard:chatTest.attachments.attachImage")}
+              title={t("dashboard:chatTest.attachments.attachImage")}
+            >
+              {isProcessingImages ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <ImagePlus className="size-4" />
+              )}
+            </Button>
             <Textarea
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
@@ -1122,45 +1196,31 @@ function ChatTestPage() {
               aria-label={t("dashboard:chatTest.inputLabel")}
               inputMode="text"
               autoComplete="off"
-              className="max-h-40 min-h-[72px] text-base md:text-sm"
+              rows={1}
+              className="max-h-32 min-h-11 flex-1 resize-none text-base sm:max-h-40 sm:min-h-[72px] sm:resize-y md:text-sm"
             />
-            <div className="flex gap-2 sm:flex-col">
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept={ACCEPTED_IMAGE_ACCEPT_ATTR}
-                multiple
-                className="hidden"
-                onChange={handleFileInputChange}
-                tabIndex={-1}
-              />
+            {isStreaming ? (
               <Button
                 type="button"
                 variant="outline"
-                size="touch"
-                onClick={openFilePicker}
-                disabled={options.length === 0 || isProcessingImages}
-                aria-label={t("dashboard:chatTest.attachments.attachImage")}
+                size="icon-touch"
+                onClick={handleStop}
+                aria-label={t("dashboard:chatTest.stop")}
+                title={t("dashboard:chatTest.stop")}
               >
-                {isProcessingImages ? (
-                  <Loader2 className="size-4 animate-spin" />
-                ) : (
-                  <ImagePlus className="size-4" />
-                )}
-                <span className="sm:hidden">{t("dashboard:chatTest.attachments.attachImage")}</span>
+                <Square className="size-4" />
               </Button>
-              {isStreaming ? (
-                <Button type="button" variant="outline" size="touch" onClick={handleStop}>
-                  <Square className="size-4" />
-                  {t("dashboard:chatTest.stop")}
-                </Button>
-              ) : (
-                <Button type="submit" size="touch" disabled={!canSend}>
-                  <Send className="size-4" />
-                  {t("dashboard:chatTest.send")}
-                </Button>
-              )}
-            </div>
+            ) : (
+              <Button
+                type="submit"
+                size="icon-touch"
+                disabled={!canSend}
+                aria-label={t("dashboard:chatTest.send")}
+                title={t("dashboard:chatTest.send")}
+              >
+                <Send className="size-4" />
+              </Button>
+            )}
           </div>
         </div>
         <div className="sr-only" aria-live="polite" aria-atomic="true">
@@ -1173,19 +1233,21 @@ function ChatTestPage() {
 
 function ChatTestSkeleton() {
   return (
-    <div className="grid h-full min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)_auto] rounded-md border p-3">
-      <div className="mb-3 flex items-center justify-between gap-3">
-        <Skeleton className="h-7 w-40" />
-        <Skeleton className="h-11 w-80" />
+    <div className="grid h-full min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)_auto] rounded-md border p-2 sm:p-3">
+      <div className="mb-2 flex items-center gap-2 sm:mb-3">
+        <Skeleton className="h-6 w-28 sm:h-7 sm:w-40" />
+        <Skeleton className="ml-auto h-11 min-w-0 flex-1 md:max-w-80" />
+        <Skeleton className="size-11 shrink-0" />
       </div>
       <div className="min-h-0 space-y-4 overflow-hidden border-y py-4">
         <Skeleton className="h-24 w-3/4" />
         <Skeleton className="ml-auto h-32 w-4/5" />
         <Skeleton className="h-24 w-2/3" />
       </div>
-      <div className="mt-3 flex gap-2">
-        <Skeleton className="h-20 flex-1" />
-        <Skeleton className="h-11 w-24" />
+      <div className="mt-2 flex items-end gap-2 sm:mt-3">
+        <Skeleton className="size-11 shrink-0" />
+        <Skeleton className="h-11 min-w-0 flex-1 sm:h-20" />
+        <Skeleton className="size-11 shrink-0" />
       </div>
     </div>
   );

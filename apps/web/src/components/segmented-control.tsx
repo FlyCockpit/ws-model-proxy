@@ -20,7 +20,12 @@ export function SegmentedControl<T extends string>({
     items.some((item) => item.value === candidate);
 
   return (
-    <div className={cn("min-w-0 max-w-full overflow-x-auto no-scrollbar", className)}>
+    <div
+      className={cn(
+        "min-w-0 max-w-full overflow-x-auto overflow-y-hidden overscroll-x-contain no-scrollbar",
+        className,
+      )}
+    >
       <ToggleGroup
         value={[value]}
         onValueChange={(next) => {
