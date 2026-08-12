@@ -1841,7 +1841,7 @@ async function maybeApplyPoolMediaTransformer({
 
   // From here the request has raw media — validate transformer and run prepass.
   const transformer = await directModelRow(pool.transformerDiscoveredModelId);
-  if (!transformer || !transformer.published || !transformer.Endpoint.published) {
+  if (!transformer?.published || !transformer.Endpoint.published) {
     return transformerFailureResponse(
       "not_found",
       "Pool media transformer model is unavailable or unpublished.",

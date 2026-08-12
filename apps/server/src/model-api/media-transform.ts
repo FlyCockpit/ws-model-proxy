@@ -438,7 +438,7 @@ export function mediaPartsAreCacheable(mediaParts: unknown[]): boolean {
           : isJsonObject(part.input_audio) && typeof part.input_audio.url === "string"
             ? part.input_audio.url
             : null;
-      if (audioUrl && audioUrl.startsWith("data:")) continue;
+      if (audioUrl?.startsWith("data:")) continue;
       return false;
     }
     // Unknown part shapes: do not cache

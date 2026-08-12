@@ -157,7 +157,7 @@ export function transformerSupportedModalities(
   capabilities: OpenAiCompatibleCapabilities | null | undefined,
 ): TransformerModalities {
   const chat = capabilities?.chatCompletions;
-  if (!chat || chat.supported !== true) {
+  if (chat?.supported !== true) {
     return { images: false, audio: false, video: false };
   }
   return {
