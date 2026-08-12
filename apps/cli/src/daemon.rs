@@ -2918,14 +2918,22 @@ mod tests {
             .build()
             .expect("runtime");
         runtime.block_on(async {
+            let (operation_started_tx, operation_started_rx) = tokio::sync::oneshot::channel();
             let cancellation_task = cancellation.clone();
             let cancel = tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                operation_started_rx
+                    .await
+                    .expect("pending transport operation should begin polling");
                 assert!(cancellation_task.cancel());
             });
             let outcome = tokio::time::timeout(
-                Duration::from_millis(100),
-                await_or_cancel(&mut cancellation_rx, std::future::pending::<()>()),
+                Duration::from_secs(1),
+                await_or_cancel(&mut cancellation_rx, async move {
+                    operation_started_tx
+                        .send(())
+                        .expect("signal pending transport operation");
+                    std::future::pending::<()>().await
+                }),
             )
             .await
             .expect("fetch should observe cancellation promptly");
