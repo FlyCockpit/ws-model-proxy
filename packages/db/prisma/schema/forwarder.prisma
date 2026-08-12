@@ -59,6 +59,14 @@ enum ModelApiTokenScopeMode {
   ALLOWLIST
 }
 
+/// Whether pool media-transform descriptions may be cached (privacy-sensitive).
+enum PoolTransformerCacheMode {
+  /// Never store descriptions (privacy-first; more transform cost).
+  OFF
+  /// Process-local in-memory cache for cacheable media (data: URLs only).
+  MEMORY
+}
+
 enum ModelApiTokenAllowlistTarget {
   DIRECT_MODEL
   MODEL_POOL
@@ -199,6 +207,7 @@ model DiscoveredModel {
   User                          User                          @relation("DiscoveredModelOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   Endpoint                      Endpoint                      @relation(fields: [endpointId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   PoolMembers                   PoolMember[]
+  TransformerForPools           ModelPool[]                   @relation("ModelPoolTransformer")
   ModelApiTokenAllowlistEntries ModelApiTokenAllowlistEntry[]
   ResponseStickinessTargets     ResponseStickinessRecord[]    @relation("ResponseStickinessTargetModel")
   ResponseStickinessSelections  ResponseStickinessRecord[]    @relation("ResponseStickinessSelectedModel")
@@ -221,7 +230,21 @@ model ModelPool {
   slug                          String
   name                          String
   description                   String?
+  /// Optional OpenAI-compatible model used to turn media into text before the
+  /// primary pool members run. Null = transformer disabled (default).
+  transformerDiscoveredModelId  String?
+  /// Free-text system prompt for the transformer call. Null = built-in default.
+  transformerSystemPrompt       String?
+  /// When true (default if transformer set), image_url parts are transformed.
+  transformerImages             Boolean                       @default(true)
+  /// When true, input_audio / audio parts are transformed (v1 may no-op if unsupported).
+  transformerAudio              Boolean                       @default(false)
+  /// When true, video_url parts are transformed.
+  transformerVideo              Boolean                       @default(false)
+  /// Description cache policy. Default OFF so screenshot/PII text is not retained.
+  transformerCacheMode          PoolTransformerCacheMode      @default(OFF)
   User                          User                          @relation("ModelPoolOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  TransformerDiscoveredModel    DiscoveredModel?              @relation("ModelPoolTransformer", fields: [transformerDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   PoolMembers                   PoolMember[]
   PoolGrants                    PoolGrant[]
   ModelApiTokenAllowlistEntries ModelApiTokenAllowlistEntry[]
@@ -230,6 +253,7 @@ model ModelPool {
 
   @@unique([userId, slug])
   @@index([userId])
+  @@index([transformerDiscoveredModelId])
   @@map("model_pool")
 }
 

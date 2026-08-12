@@ -1,3 +1,7 @@
+import {
+  type OpenAiCompatibleCapabilities,
+  openAiCompatibleCapabilitiesSchema,
+} from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { z } from "zod";
 
 export const RELAY_PROTOCOL_VERSION = "2.3";
@@ -37,75 +41,7 @@ const headerNameSchema = z.string().trim().min(1).max(128);
 const headerValueSchema = z.string().max(8192);
 const headerSchema = z.record(headerNameSchema, headerValueSchema);
 
-const booleanSupportSchema = z.boolean().optional();
-
-export const openAiCompatibleCapabilitiesSchema = z
-  .object({
-    version: z.literal(1),
-    protocol: z.literal("openai-compatible"),
-    models: z
-      .object({
-        list: booleanSupportSchema,
-      })
-      .strict()
-      .optional(),
-    chatCompletions: z
-      .object({
-        supported: booleanSupportSchema,
-        streaming: booleanSupportSchema,
-        /** OpenAI-shaped `image_url` content parts. */
-        vision: booleanSupportSchema,
-        /**
-         * OpenAI-shaped `video_url` content parts (e.g. MiMo / omni local models).
-         * Distinct from dedicated media-store video; this is chat multimodal input.
-         */
-        video: booleanSupportSchema,
-        /**
-         * OpenAI-shaped `input_audio` content parts in chat.
-         * Distinct from top-level `audio.transcriptions` / `translations` endpoints.
-         */
-        audio: booleanSupportSchema,
-      })
-      .strict()
-      .optional(),
-    completions: z
-      .object({
-        supported: booleanSupportSchema,
-        streaming: booleanSupportSchema,
-      })
-      .strict()
-      .optional(),
-    embeddings: z
-      .object({
-        supported: booleanSupportSchema,
-      })
-      .strict()
-      .optional(),
-    responses: z
-      .object({
-        supported: booleanSupportSchema,
-        streaming: booleanSupportSchema,
-        statefulFollowUps: booleanSupportSchema,
-        retrieve: booleanSupportSchema,
-        delete: booleanSupportSchema,
-        cancel: booleanSupportSchema,
-        listInputItems: booleanSupportSchema,
-        countTokens: booleanSupportSchema,
-        compact: booleanSupportSchema,
-      })
-      .strict()
-      .optional(),
-    audio: z
-      .object({
-        transcriptions: booleanSupportSchema,
-        translations: booleanSupportSchema,
-        speech: booleanSupportSchema,
-      })
-      .strict()
-      .optional(),
-  })
-  .strict();
-export type OpenAiCompatibleCapabilities = z.infer<typeof openAiCompatibleCapabilitiesSchema>;
+export { type OpenAiCompatibleCapabilities, openAiCompatibleCapabilitiesSchema };
 
 const cliCapabilitiesSchema = z
   .object({

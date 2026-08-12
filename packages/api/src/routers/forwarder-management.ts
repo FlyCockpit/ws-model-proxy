@@ -13,6 +13,11 @@ import {
   type VisibleModelTargets,
 } from "../lib/model-api-token-access";
 import { poolMemberRoutingStatuses } from "../lib/model-pool-routing";
+import {
+  resolveEffectiveCapabilityMetadata,
+  transformerModalityMismatchErrors,
+  transformerSupportedModalities,
+} from "../lib/openai-compatible-capabilities";
 
 const CLI_HEARTBEAT_STALE_AFTER_MS = 60_000;
 
@@ -124,7 +129,23 @@ type ModelPoolRow = {
   slug: string;
   name: string;
   description: string | null;
+  transformerDiscoveredModelId: string | null;
+  transformerSystemPrompt: string | null;
+  transformerImages: boolean;
+  transformerAudio: boolean;
+  transformerVideo: boolean;
+  transformerCacheMode: string;
   User: { slug: string };
+  TransformerDiscoveredModel: {
+    id: string;
+    upstreamModelId: string;
+    User: { slug: string };
+    Endpoint: {
+      id: string;
+      slug: string;
+      CliDevice: { slug: string };
+    };
+  } | null;
   PoolMembers: PoolMemberRow[];
   PoolGrants: PoolGrantRow[];
 };
@@ -362,6 +383,21 @@ function serializeCliDevice(row: CliDeviceRow, now: Date) {
 }
 
 function serializePool(row: ModelPoolRow) {
+  const transformerModel = row.TransformerDiscoveredModel
+    ? {
+        id: row.TransformerDiscoveredModel.id,
+        upstreamModelId: row.TransformerDiscoveredModel.upstreamModelId,
+        canonicalModelId: directModelId({
+          userSlug: row.TransformerDiscoveredModel.User.slug,
+          cliSlug: row.TransformerDiscoveredModel.Endpoint.CliDevice.slug,
+          endpointSlug: row.TransformerDiscoveredModel.Endpoint.slug,
+          upstreamModelId: row.TransformerDiscoveredModel.upstreamModelId,
+        }),
+        endpointId: row.TransformerDiscoveredModel.Endpoint.id,
+        endpointSlug: row.TransformerDiscoveredModel.Endpoint.slug,
+        cliDeviceSlug: row.TransformerDiscoveredModel.Endpoint.CliDevice.slug,
+      }
+    : null;
   return {
     id: row.id,
     createdAt: row.createdAt,
@@ -370,6 +406,15 @@ function serializePool(row: ModelPoolRow) {
     name: row.name,
     description: row.description,
     canonicalModelId: poolModelId({ userSlug: row.User.slug, poolSlug: row.slug }),
+    transformer: {
+      discoveredModelId: row.transformerDiscoveredModelId,
+      systemPrompt: row.transformerSystemPrompt,
+      images: row.transformerImages,
+      audio: row.transformerAudio,
+      video: row.transformerVideo,
+      cacheMode: row.transformerCacheMode,
+      model: transformerModel,
+    },
     members: row.PoolMembers.map((member) => ({
       id: member.id,
       createdAt: member.createdAt,
@@ -427,6 +472,64 @@ async function ownedDiscoveredModel(discoveredModelId: string, userId: string) {
     throw new ORPCError("NOT_FOUND", { message: "Discovered model not found." });
   }
   return model;
+}
+
+async function transformerCapabilitiesForOwnedModel(
+  discoveredModelId: string,
+  userId: string,
+): Promise<ReturnType<typeof transformerSupportedModalities>> {
+  const model = (await prisma.discoveredModel.findUnique({
+    where: { id: discoveredModelId },
+    select: {
+      id: true,
+      userId: true,
+      published: true,
+      capabilityOverrideMode: true,
+      capabilityOverrideMetadata: true,
+      Endpoint: { select: { published: true, capabilityMetadata: true } },
+    },
+  })) as {
+    id: string;
+    userId: string;
+    published: boolean;
+    capabilityOverrideMode: string;
+    capabilityOverrideMetadata: unknown | null;
+    Endpoint: { published: boolean; capabilityMetadata: unknown | null };
+  } | null;
+  if (!model || model.userId !== userId) {
+    throw new ORPCError("NOT_FOUND", { message: "Discovered model not found." });
+  }
+  if (!model.published || !model.Endpoint.published) {
+    throw new ORPCError("BAD_REQUEST", {
+      message: "Transformer model must be published (model and endpoint).",
+    });
+  }
+  const caps = resolveEffectiveCapabilityMetadata({
+    capabilityOverrideMode: model.capabilityOverrideMode,
+    capabilityOverrideMetadata: model.capabilityOverrideMetadata,
+    endpointCapabilityMetadata: model.Endpoint.capabilityMetadata,
+  });
+  return transformerSupportedModalities(caps);
+}
+
+function assertTransformerMatchesModalities({
+  caps,
+  images,
+  audio,
+  video,
+}: {
+  caps: ReturnType<typeof transformerSupportedModalities>;
+  images: boolean;
+  audio: boolean;
+  video: boolean;
+}) {
+  const errors = transformerModalityMismatchErrors({
+    pool: { images, audio, video },
+    transformerCaps: caps,
+  });
+  if (errors.length > 0) {
+    throw new ORPCError("BAD_REQUEST", { message: errors.join(" ") });
+  }
 }
 
 async function assertPoolSlugAvailable(slug: string, userId: string, currentPoolId?: string) {
@@ -506,7 +609,27 @@ const poolSelect = {
   slug: true,
   name: true,
   description: true,
+  transformerDiscoveredModelId: true,
+  transformerSystemPrompt: true,
+  transformerImages: true,
+  transformerAudio: true,
+  transformerVideo: true,
+  transformerCacheMode: true,
   User: { select: { slug: true } },
+  TransformerDiscoveredModel: {
+    select: {
+      id: true,
+      upstreamModelId: true,
+      User: { select: { slug: true } },
+      Endpoint: {
+        select: {
+          id: true,
+          slug: true,
+          CliDevice: { select: { slug: true } },
+        },
+      },
+    },
+  },
   PoolMembers: {
     orderBy: { createdAt: "asc" as const },
     select: {
@@ -716,19 +839,95 @@ export const forwarderManagementRouter = {
         slug: poolSlugSchema.optional(),
         name: poolNameSchema.optional(),
         description: poolDescriptionSchema,
+        /** Set to a discovered model id owned by the user, or null to clear. */
+        transformerDiscoveredModelId: z.string().min(1).nullable().optional(),
+        transformerSystemPrompt: z.string().max(16_000).nullable().optional(),
+        transformerImages: z.boolean().optional(),
+        transformerAudio: z.boolean().optional(),
+        transformerVideo: z.boolean().optional(),
+        transformerCacheMode: z.enum(["OFF", "MEMORY"]).optional(),
       }),
     )
     .handler(async ({ input, context }) => {
-      await ownedPool(input.id, context.session.user.id);
+      const existing = (await prisma.modelPool.findUnique({
+        where: { id: input.id },
+        select: {
+          id: true,
+          userId: true,
+          transformerDiscoveredModelId: true,
+          transformerImages: true,
+          transformerAudio: true,
+          transformerVideo: true,
+          transformerCacheMode: true,
+        },
+      })) as {
+        id: string;
+        userId: string;
+        transformerDiscoveredModelId: string | null;
+        transformerImages: boolean;
+        transformerAudio: boolean;
+        transformerVideo: boolean;
+        transformerCacheMode: string;
+      } | null;
+      if (!existing || existing.userId !== context.session.user.id) {
+        throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+      }
       if (input.slug) {
         await assertPoolSlugAvailable(input.slug, context.session.user.id, input.id);
       }
+
+      const nextTransformerId =
+        input.transformerDiscoveredModelId !== undefined
+          ? input.transformerDiscoveredModelId
+          : existing.transformerDiscoveredModelId;
+      const nextImages =
+        input.transformerImages !== undefined
+          ? input.transformerImages
+          : existing.transformerImages;
+      const nextAudio =
+        input.transformerAudio !== undefined ? input.transformerAudio : existing.transformerAudio;
+      const nextVideo =
+        input.transformerVideo !== undefined ? input.transformerVideo : existing.transformerVideo;
+
+      if (nextTransformerId) {
+        const caps = await transformerCapabilitiesForOwnedModel(
+          nextTransformerId,
+          context.session.user.id,
+        );
+        assertTransformerMatchesModalities({
+          caps,
+          images: nextImages,
+          audio: nextAudio,
+          video: nextVideo,
+        });
+      } else if (input.transformerDiscoveredModelId === null) {
+        // clearing transformer — ok
+      }
+
       const row = (await prisma.modelPool.update({
         where: { id: input.id },
         data: {
           ...(input.slug ? { slug: input.slug } : {}),
           ...(input.name ? { name: input.name } : {}),
           ...(input.description !== undefined ? { description: input.description } : {}),
+          ...(input.transformerDiscoveredModelId !== undefined
+            ? { transformerDiscoveredModelId: input.transformerDiscoveredModelId }
+            : {}),
+          ...(input.transformerSystemPrompt !== undefined
+            ? { transformerSystemPrompt: input.transformerSystemPrompt }
+            : {}),
+          ...(input.transformerImages !== undefined
+            ? { transformerImages: input.transformerImages }
+            : {}),
+          ...(input.transformerAudio !== undefined
+            ? { transformerAudio: input.transformerAudio }
+            : {}),
+          ...(input.transformerVideo !== undefined
+            ? { transformerVideo: input.transformerVideo }
+            : {}),
+          ...(input.transformerCacheMode !== undefined
+            ? { transformerCacheMode: input.transformerCacheMode }
+            : {}),
         },
         select: poolSelect,
       })) as ModelPoolRow;

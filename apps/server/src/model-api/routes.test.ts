@@ -46,6 +46,10 @@ const db = prisma as unknown as {
     findUnique: MockInstance;
     update: MockInstance;
   };
+  modelPool: {
+    findUnique: MockInstance;
+    findMany: MockInstance;
+  };
   relayRequest: {
     create: MockInstance;
     update: MockInstance;
@@ -332,6 +336,15 @@ describe("model API routes", () => {
       modelPools: [poolTarget],
     });
     db.discoveredModel.findUnique.mockResolvedValue(directRow());
+    db.modelPool.findMany.mockResolvedValue([]);
+    db.modelPool.findUnique.mockResolvedValue({
+      transformerDiscoveredModelId: null,
+      transformerSystemPrompt: null,
+      transformerImages: true,
+      transformerAudio: false,
+      transformerVideo: false,
+      transformerCacheMode: "OFF",
+    });
     db.relayRequest.create.mockResolvedValue({ id: "relay-request-id" });
     db.relayRequest.update.mockResolvedValue({ id: "relay-request-id" });
     db.responseStickinessRecord.findUnique.mockResolvedValue(null);
@@ -1205,5 +1218,469 @@ describe("model API routes", () => {
     manager.complete(sent.requestId);
 
     expect(response.status).toBe(200);
+  });
+
+  describe("pool media transformer", () => {
+    const transformerId = "transformer-model-id";
+    const transformerUpstream = "vlm-upstream";
+
+    function enablePoolTransformer(overrides: Record<string, unknown> = {}) {
+      db.modelPool.findUnique.mockResolvedValue({
+        transformerDiscoveredModelId: transformerId,
+        transformerSystemPrompt: null,
+        transformerImages: true,
+        transformerAudio: false,
+        transformerVideo: false,
+        transformerCacheMode: "OFF",
+        ...overrides,
+      });
+      db.discoveredModel.findUnique.mockImplementation(async (args: { where: { id: string } }) => {
+        if (args.where.id === transformerId) {
+          const row = directRow();
+          return {
+            ...row,
+            id: transformerId,
+            upstreamModelId: transformerUpstream,
+            Endpoint: {
+              ...row.Endpoint,
+              id: "transformer-endpoint-id",
+              slug: "transformer-endpoint",
+              cliDeviceId: "cli-transformer",
+            },
+          };
+        }
+        return {
+          ...directRow(),
+          id: args.where.id,
+        };
+      });
+    }
+
+    it("transforms media then forwards rewritten chat to the pool primary", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      enablePoolTransformer();
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+        }),
+      ]);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-transformer", "cli-a"];
+
+      const responsePromise = appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: poolTarget.modelId,
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: "what is this?" },
+                { type: "image_url", image_url: { url: "data:image/png;base64,abc" } },
+              ],
+            },
+          ],
+        }),
+      });
+
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const transformReq = requireSent(manager, 0);
+      expect(transformReq.cliDeviceId).toBe("cli-transformer");
+      expect(transformReq.path).toBe("/v1/chat/completions");
+      expect(firstBodyChunkText(transformReq)).toContain("data:image/png;base64,abc");
+      expect(firstBodyChunkText(transformReq)).toContain(`"stream":false`);
+      // Nested transform must not reuse client Idempotency-Key
+      const transformHeaders =
+        transformReq.headers instanceof Headers
+          ? transformReq.headers
+          : new Headers(transformReq.headers as Record<string, string>);
+      expect(transformHeaders.get("idempotency-key")).toBeNull();
+
+      manager.headers(transformReq.requestId, 200, { "content-type": "application/json" });
+      manager.body(
+        transformReq.requestId,
+        JSON.stringify({
+          choices: [{ message: { role: "assistant", content: "A red button labeled Save." } }],
+        }),
+      );
+      manager.complete(transformReq.requestId);
+
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(2));
+      const primaryReq = requireSent(manager, 1);
+      expect(primaryReq.cliDeviceId).toBe("cli-a");
+      const primaryBody = firstBodyChunkText(primaryReq);
+      expect(primaryBody).not.toContain("image_url");
+      expect(primaryBody).toContain("wmp_media_transform");
+      // Plain-text description for the primary model (not base64).
+      expect(primaryBody).toContain("A red button labeled Save.");
+      expect(primaryBody).toContain("untrusted perception");
+      expect(primaryBody).toContain("wmp-media-transform-policy:v1");
+      expect(primaryBody).not.toContain('encoding="base64"');
+
+      manager.headers(primaryReq.requestId, 200, { "content-type": "application/json" });
+      const response = await responsePromise;
+      manager.body(primaryReq.requestId, JSON.stringify({ id: "chatcmpl", choices: [] }));
+      manager.complete(primaryReq.requestId);
+      expect(response.status).toBe(200);
+    });
+
+    it("preserves multi-turn placement: each image stays on its originating message", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      enablePoolTransformer();
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+        }),
+      ]);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-transformer", "cli-a"];
+
+      const responsePromise = appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: poolTarget.modelId,
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: "first" },
+                { type: "image_url", image_url: { url: "data:image/png;base64,aaa" } },
+              ],
+            },
+            { role: "assistant", content: "ok" },
+            {
+              role: "user",
+              content: [
+                { type: "text", text: "second" },
+                { type: "image_url", image_url: { url: "data:image/png;base64,bbb" } },
+              ],
+            },
+          ],
+        }),
+      });
+
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      manager.headers(requireSent(manager, 0).requestId, 200, {
+        "content-type": "application/json",
+      });
+      manager.body(
+        requireSent(manager, 0).requestId,
+        JSON.stringify({
+          choices: [{ message: { role: "assistant", content: "desc-first" } }],
+        }),
+      );
+      manager.complete(requireSent(manager, 0).requestId);
+
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(2));
+      manager.headers(requireSent(manager, 1).requestId, 200, {
+        "content-type": "application/json",
+      });
+      manager.body(
+        requireSent(manager, 1).requestId,
+        JSON.stringify({
+          choices: [{ message: { role: "assistant", content: "desc-second" } }],
+        }),
+      );
+      manager.complete(requireSent(manager, 1).requestId);
+
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(3));
+      const primaryBody = JSON.parse(firstBodyChunkText(requireSent(manager, 2))) as {
+        messages: Array<{ role: string; content: unknown }>;
+      };
+      const userMessages = primaryBody.messages.filter((m) => m.role === "user");
+      expect(JSON.stringify(userMessages[0])).toContain("desc-first");
+      expect(JSON.stringify(userMessages[0])).not.toContain("desc-second");
+      expect(JSON.stringify(userMessages[1])).toContain("desc-second");
+      expect(JSON.stringify(userMessages[1])).not.toContain("desc-first");
+      expect(JSON.stringify(primaryBody)).not.toContain("image_url");
+
+      manager.headers(requireSent(manager, 2).requestId, 200, {
+        "content-type": "application/json",
+      });
+      const response = await responsePromise;
+      manager.body(requireSent(manager, 2).requestId, "{}");
+      manager.complete(requireSent(manager, 2).requestId);
+      expect(response.status).toBe(200);
+    });
+
+    it("fails closed when the transformer errors", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      enablePoolTransformer();
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+        }),
+      ]);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-transformer", "cli-a"];
+
+      const responsePromise = appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: poolTarget.modelId,
+          messages: [
+            {
+              role: "user",
+              content: [{ type: "image_url", image_url: { url: "data:image/png;base64,x" } }],
+            },
+          ],
+        }),
+      });
+
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const transformReq = requireSent(manager, 0);
+      manager.headers(transformReq.requestId, 500, { "content-type": "application/json" });
+      manager.body(transformReq.requestId, JSON.stringify({ error: "boom" }));
+      manager.complete(transformReq.requestId);
+
+      const response = await responsePromise;
+      expect(response.status).toBeGreaterThanOrEqual(400);
+      expect(manager.sent).toHaveLength(1);
+      await expect(response.json()).resolves.toMatchObject({
+        error: expect.objectContaining({ message: expect.stringContaining("transformer") }),
+      });
+    });
+
+    it("advertises vision on pools only when transformer actually supports it", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      db.poolMember.findMany.mockResolvedValue([]);
+      db.modelPool.findMany.mockResolvedValue([
+        {
+          id: poolTarget.id,
+          transformerDiscoveredModelId: transformerId,
+          transformerImages: true,
+          transformerAudio: false,
+          transformerVideo: false,
+        },
+      ]);
+      db.discoveredModel.findMany.mockResolvedValue([
+        {
+          id: transformerId,
+          published: true,
+          capabilityOverrideMode: "OVERRIDE",
+          capabilityOverrideMetadata: {
+            version: 1,
+            protocol: "openai-compatible",
+            chatCompletions: { supported: true, streaming: true, vision: true },
+          },
+          Endpoint: { published: true, capabilityMetadata: null },
+        },
+      ]);
+
+      const response = await appWith(new FakeRelayManager()).request("/models", {
+        headers: { authorization: "Bearer wsmp_model_test" },
+      });
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as {
+        data: Array<{ id: string; supports_vision?: boolean }>;
+      };
+      const pool = body.data.find((row) => row.id === poolTarget.modelId);
+      expect(pool?.supports_vision).toBe(true);
+
+      // Text-only transformer + image toggle should not advertise vision
+      db.discoveredModel.findMany.mockResolvedValue([
+        {
+          id: transformerId,
+          published: true,
+          capabilityOverrideMode: "OVERRIDE",
+          capabilityOverrideMetadata: {
+            version: 1,
+            protocol: "openai-compatible",
+            chatCompletions: { supported: true, streaming: true, vision: false },
+          },
+          Endpoint: { published: true, capabilityMetadata: null },
+        },
+      ]);
+      const response2 = await appWith(new FakeRelayManager()).request("/models", {
+        headers: { authorization: "Bearer wsmp_model_test" },
+      });
+      const body2 = (await response2.json()) as {
+        data: Array<{ id: string; supports_vision?: boolean }>;
+      };
+      const pool2 = body2.data.find((row) => row.id === poolTarget.modelId);
+      expect(pool2?.supports_vision).toBe(false);
+    });
+
+    it("does not advertise transformer modalities when the transformer is unpublished", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      db.poolMember.findMany.mockResolvedValue([]);
+      db.modelPool.findMany.mockResolvedValue([
+        {
+          id: poolTarget.id,
+          transformerDiscoveredModelId: transformerId,
+          transformerImages: true,
+          transformerAudio: false,
+          transformerVideo: false,
+        },
+      ]);
+      db.discoveredModel.findMany.mockResolvedValue([
+        {
+          id: transformerId,
+          published: false,
+          capabilityOverrideMode: "OVERRIDE",
+          capabilityOverrideMetadata: {
+            version: 1,
+            protocol: "openai-compatible",
+            chatCompletions: { supported: true, streaming: true, vision: true },
+          },
+          Endpoint: { published: true, capabilityMetadata: null },
+        },
+      ]);
+
+      const response = await appWith(new FakeRelayManager()).request("/models", {
+        headers: { authorization: "Bearer wsmp_model_test" },
+      });
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as {
+        data: Array<{ id: string; supports_vision?: boolean }>;
+      };
+      const pool = body.data.find((row) => row.id === poolTarget.modelId);
+      expect(pool?.supports_vision).toBe(false);
+    });
+
+    it("does not fail text-only pool requests when the transformer is unpublished", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      enablePoolTransformer();
+      db.discoveredModel.findUnique.mockImplementation(async (args: { where: { id: string } }) => {
+        if (args.where.id === transformerId) {
+          const row = directRow();
+          return {
+            ...row,
+            id: transformerId,
+            published: false,
+            upstreamModelId: transformerUpstream,
+            Endpoint: {
+              ...row.Endpoint,
+              id: "transformer-endpoint-id",
+              slug: "transformer-endpoint",
+              cliDeviceId: "cli-transformer",
+              published: true,
+            },
+          };
+        }
+        return { ...directRow(), id: args.where.id };
+      });
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+        }),
+      ]);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a", "cli-transformer"];
+
+      const responsePromise = appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: poolTarget.modelId,
+          messages: [{ role: "user", content: "plain text only, no media" }],
+        }),
+      });
+
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const primary = requireSent(manager, 0);
+      expect(primary.cliDeviceId).toBe("cli-a");
+      expect(firstBodyChunkText(primary)).toContain("plain text only");
+      manager.headers(primary.requestId, 200, { "content-type": "application/json" });
+      const response = await responsePromise;
+      manager.body(primary.requestId, "{}");
+      manager.complete(primary.requestId);
+      expect(response.status).toBe(200);
+    });
+
+    it("skips retransform when history only has envelopes but still injects policy", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      enablePoolTransformer();
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+        }),
+      ]);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-transformer", "cli-a"];
+
+      const responsePromise = appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: poolTarget.modelId,
+          messages: [
+            {
+              role: "user",
+              content: `<wmp_media_transform model="x" assets="1">\nold desc\n</wmp_media_transform>`,
+            },
+            { role: "user", content: "follow up without new media" },
+          ],
+        }),
+      });
+
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const primary = requireSent(manager, 0);
+      expect(primary.cliDeviceId).toBe("cli-a");
+      const body = firstBodyChunkText(primary);
+      expect(body).toContain("old desc");
+      expect(body).toContain("untrusted perception");
+      expect(body).toContain("wmp-media-transform-policy:v1");
+      expect(manager.sent).toHaveLength(1);
+      manager.headers(primary.requestId, 200, { "content-type": "application/json" });
+      const response = await responsePromise;
+      manager.body(primary.requestId, "{}");
+      manager.complete(primary.requestId);
+      expect(response.status).toBe(200);
+    });
   });
 });

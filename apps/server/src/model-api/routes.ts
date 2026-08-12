@@ -16,14 +16,11 @@ import {
   recordPoolMemberRelayFailure,
   relayFailureClasses,
 } from "@ws-model-proxy/api/lib/model-pool-routing";
+import { resolveEffectiveCapabilityMetadata } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import prisma from "@ws-model-proxy/db";
 import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
 import { Hono } from "hono";
-import {
-  type OpenAiCompatibleCapabilities,
-  openAiCompatibleCapabilitiesSchema,
-  type RelayFailure,
-} from "../relay/protocol.js";
+import { type OpenAiCompatibleCapabilities, type RelayFailure } from "../relay/protocol.js";
 import { type RelaySessionManager, relaySessionManager } from "../relay/session-manager.js";
 import {
   MODEL_API_MAX_REQUEST_BODY_BYTES,
@@ -33,6 +30,33 @@ import {
   type ModelApiLimitLease,
   modelApiConcurrencyLimiter,
 } from "./limits.js";
+import {
+  anyTransformModalityEnabled,
+  buildTransformerChatPayload,
+  collectMessageTransformJobs,
+  countAssetsInJobs,
+  effectiveTransformModalities,
+  ensureTransformPolicySystemMessage,
+  extractAssistantTextFromChatCompletion,
+  getCachedTransformDescription,
+  hashTransformMediaParts,
+  MODEL_API_TRANSFORMER_MAX_ASSETS,
+  MODEL_API_TRANSFORMER_MAX_JOBS,
+  MODEL_API_TRANSFORMER_MAX_TOTAL_DESCRIPTION_CHARS,
+  MODEL_API_TRANSFORMER_REQUEST_DEADLINE_MS,
+  MODEL_API_TRANSFORMER_TIMEOUT_MS,
+  messagesContainTransformEnvelope,
+  messagesHaveTransformableMedia,
+  readResponseUtf8,
+  rewriteMessagesWithPerMessageEnvelopes,
+  setCachedTransformDescription,
+  shouldCacheTransformDescription,
+  TransformerResponseTooLargeError,
+  type TransformModalities,
+  transformerModalityMismatchErrors,
+  transformerSupportedModalities,
+  wrapTransformEnvelope,
+} from "./media-transform.js";
 import {
   multimodalFlagsFromCapabilities,
   openAiModelListExtensions,
@@ -352,20 +376,17 @@ function relayRequestHeaders(request: Request): Headers {
   return headers;
 }
 
-function parseCapabilities(value: unknown): OpenAiCompatibleCapabilities | null {
-  const parsed = openAiCompatibleCapabilitiesSchema.safeParse(value);
-  return parsed.success ? parsed.data : null;
+/** Nested transform prepass must not reuse client Idempotency-Key. */
+function transformerRelayRequestHeaders(request: Request): Headers {
+  const headers = relayRequestHeaders(request);
+  headers.delete("idempotency-key");
+  return headers;
 }
 
 /**
  * Resolve effective OpenAI-compatible capabilities for a discovered model.
- *
- * OVERRIDE with parseable model metadata wins; if override mode is set but the
- * metadata is missing/malformed, fall back to endpoint defaults (same as relay
- * request-time resolution). INHERIT uses endpoint metadata only.
- *
- * Shared by relay routing and `/v1/models` advertisement so list vs execute
- * never disagree on vision/video/audio flags.
+ * Delegates to the shared API helper so management-time validation and
+ * request-time routing use identical OVERRIDE fallback behavior.
  */
 function effectiveCapabilitiesFrom({
   capabilityOverrideMode,
@@ -376,10 +397,11 @@ function effectiveCapabilitiesFrom({
   capabilityOverrideMetadata: unknown | null;
   endpointCapabilityMetadata: unknown | null;
 }): OpenAiCompatibleCapabilities | null {
-  const modelMetadata =
-    capabilityOverrideMode === "OVERRIDE" ? parseCapabilities(capabilityOverrideMetadata) : null;
-  if (modelMetadata) return modelMetadata;
-  return parseCapabilities(endpointCapabilityMetadata);
+  return resolveEffectiveCapabilityMetadata({
+    capabilityOverrideMode,
+    capabilityOverrideMetadata,
+    endpointCapabilityMetadata,
+  });
 }
 
 function effectiveDirectCapabilities(
@@ -1080,6 +1102,63 @@ async function modelListResponse(targets: {
   // Pool advertisement is a union of member flags (optimistic): if any member
   // supports vision/video/audio, the pool lists it. A single request still
   // routes to one member that may lack that modality — not a hard guarantee.
+  // Pools with a media transformer also advertise the modalities they transform.
+  const poolTransformerRows =
+    poolIds.length === 0
+      ? []
+      : await prisma.modelPool.findMany({
+          where: { id: { in: poolIds } },
+          select: {
+            id: true,
+            transformerDiscoveredModelId: true,
+            transformerImages: true,
+            transformerAudio: true,
+            transformerVideo: true,
+          },
+        });
+  const poolTransformerById = new Map(poolTransformerRows.map((row) => [row.id, row] as const));
+
+  const transformerModelIds = [
+    ...new Set(
+      poolTransformerRows
+        .map((row) => row.transformerDiscoveredModelId)
+        .filter((id): id is string => typeof id === "string" && id.length > 0),
+    ),
+  ];
+  const transformerModelRows =
+    transformerModelIds.length === 0
+      ? []
+      : await prisma.discoveredModel.findMany({
+          where: { id: { in: transformerModelIds } },
+          select: {
+            id: true,
+            published: true,
+            capabilityOverrideMode: true,
+            capabilityOverrideMetadata: true,
+            Endpoint: {
+              select: {
+                published: true,
+                capabilityMetadata: true,
+              },
+            },
+          },
+        });
+  const transformerCapsById = new Map(
+    transformerModelRows.map((row) => {
+      // Unpublished transformers must not advertise modalities (request path fails closed).
+      if (!row.published || !row.Endpoint.published) {
+        return [row.id, { images: false, audio: false, video: false }] as const;
+      }
+      // Same resolver as pool management (strict schema parse + malformed override fallback).
+      const caps = effectiveCapabilitiesFrom({
+        capabilityOverrideMode: row.capabilityOverrideMode,
+        capabilityOverrideMetadata: row.capabilityOverrideMetadata,
+        endpointCapabilityMetadata: row.Endpoint.capabilityMetadata,
+      });
+      return [row.id, transformerSupportedModalities(caps)] as const;
+    }),
+  );
+
   const poolFlagsById = new Map<string, ReturnType<typeof multimodalFlagsFromCapabilities>>();
   for (const poolId of poolIds) {
     const memberFlags = poolMemberRows
@@ -1093,7 +1172,34 @@ async function modelListResponse(targets: {
         });
         return multimodalFlagsFromCapabilities(caps);
       });
-    poolFlagsById.set(poolId, unionMultimodalFlags(memberFlags));
+    let flags = unionMultimodalFlags(memberFlags);
+    const transformer = poolTransformerById.get(poolId);
+    if (transformer?.transformerDiscoveredModelId) {
+      const supported = transformerCapsById.get(transformer.transformerDiscoveredModelId) ?? {
+        images: false,
+        audio: false,
+        video: false,
+      };
+      const effective = effectiveTransformModalities({
+        pool: {
+          images: transformer.transformerImages,
+          audio: transformer.transformerAudio,
+          video: transformer.transformerVideo,
+        },
+        transformerCaps: supported,
+      });
+      flags = unionMultimodalFlags([
+        flags,
+        {
+          text: true,
+          vision: effective.images,
+          video: effective.video,
+          audioInput: effective.audio,
+          audioOutput: false,
+        },
+      ]);
+    }
+    poolFlagsById.set(poolId, flags);
   }
 
   return {
@@ -1589,6 +1695,405 @@ async function relaySelectedModelNoFailover({
   }
 }
 
+/**
+ * If the pool has a media transformer and the chat body has raw media, call the
+ * transformer once per originating message (skipping turns that only have prior
+ * envelopes), inject descriptions in place, then return a rewritten primary payload.
+ */
+async function maybeApplyPoolMediaTransformer({
+  request,
+  requester,
+  poolId,
+  prepared,
+  operationFamily,
+  manager,
+  limiter,
+}: {
+  request: Request;
+  requester: RelayRequester;
+  poolId: string;
+  prepared: PreparedModeledRequest;
+  operationFamily: ModelApiEndpointFamily;
+  manager: NonNullable<ModelApiRouteDependencies["manager"]>;
+  limiter: ModelApiConcurrencyLimiter;
+}): Promise<PreparedModeledRequest | Response> {
+  if (operationFamily !== "chat.completions") return prepared;
+  if (!prepared.payload || !Array.isArray(prepared.payload.messages)) return prepared;
+
+  const pool = (await prisma.modelPool.findUnique({
+    where: { id: poolId },
+    select: {
+      transformerDiscoveredModelId: true,
+      transformerSystemPrompt: true,
+      transformerImages: true,
+      transformerAudio: true,
+      transformerVideo: true,
+      transformerCacheMode: true,
+    },
+  })) as {
+    transformerDiscoveredModelId: string | null;
+    transformerSystemPrompt: string | null;
+    transformerImages: boolean;
+    transformerAudio: boolean;
+    transformerVideo: boolean;
+    transformerCacheMode: string;
+  } | null;
+
+  if (!pool?.transformerDiscoveredModelId) return prepared;
+
+  // Pool toggles only — used to detect whether this request needs transform work.
+  // Do not validate the transformer model until we know media is present.
+  const poolModalities: TransformModalities = {
+    images: pool.transformerImages,
+    audio: pool.transformerAudio,
+    video: pool.transformerVideo,
+  };
+  if (!anyTransformModalityEnabled(poolModalities)) {
+    return prepared;
+  }
+
+  const hasRawMedia = messagesHaveTransformableMedia(prepared.payload.messages, poolModalities);
+  const hasEnvelopes = messagesContainTransformEnvelope(prepared.payload.messages);
+
+  // Text-only / no media: never touch the transformer (broken transformers must
+  // not break plain text pool traffic).
+  if (!hasRawMedia) {
+    // Envelope-only history: still inject policy system so prior/spoofed
+    // envelope text is not treated as unguarded instructions.
+    if (!hasEnvelopes) return prepared;
+    const guarded = ensureTransformPolicySystemMessage(prepared.payload.messages as unknown[]);
+    const nextPayload: JsonObject = { ...prepared.payload, messages: guarded };
+    return {
+      model: prepared.model,
+      payload: nextPayload,
+      stream: prepared.stream,
+      buildRequest: async (upstreamModelId) => ({
+        headers: relayRequestHeaders(request),
+        body: upstreamBody(nextPayload, upstreamModelId),
+      }),
+    };
+  }
+
+  // From here the request has raw media — validate transformer and run prepass.
+  const transformer = await directModelRow(pool.transformerDiscoveredModelId);
+  if (!transformer || !transformer.published || !transformer.Endpoint.published) {
+    return openAiFailureJsonResponse(
+      "not_found",
+      "Pool media transformer model is unavailable or unpublished.",
+    );
+  }
+
+  const transformerCaps = effectiveDirectCapabilities(transformer);
+  if (
+    !supportsOperation({
+      capabilities: transformerCaps,
+      operation: {
+        capability: "chat.completions",
+        stream: false,
+      },
+    })
+  ) {
+    return openAiFailureJsonResponse(
+      "unsupported_capability",
+      "Pool media transformer does not support chat completions.",
+    );
+  }
+
+  const supported = transformerSupportedModalities(transformerCaps);
+  const mismatch = transformerModalityMismatchErrors({
+    pool: poolModalities,
+    transformerCaps: supported,
+  });
+  if (mismatch.length > 0) {
+    return openAiFailureJsonResponse("unsupported_capability", mismatch.join(" "));
+  }
+
+  const modalities = effectiveTransformModalities({
+    pool: poolModalities,
+    transformerCaps: supported,
+  });
+  if (!anyTransformModalityEnabled(modalities)) {
+    return openAiFailureJsonResponse(
+      "unsupported_capability",
+      "Pool media transformer cannot handle the enabled media modalities.",
+    );
+  }
+
+  // Re-check with effective modalities (pool ∩ transformer).
+  if (!messagesHaveTransformableMedia(prepared.payload.messages, modalities)) {
+    return prepared;
+  }
+
+  const jobs = collectMessageTransformJobs(prepared.payload.messages, modalities);
+  if (jobs.length === 0) return prepared;
+
+  if (jobs.length > MODEL_API_TRANSFORMER_MAX_JOBS) {
+    return openAiFailureJsonResponse(
+      "request_too_large",
+      `Too many messages with media to transform (max ${MODEL_API_TRANSFORMER_MAX_JOBS}).`,
+    );
+  }
+  const assetCount = countAssetsInJobs(jobs);
+  if (assetCount > MODEL_API_TRANSFORMER_MAX_ASSETS) {
+    return openAiFailureJsonResponse(
+      "request_too_large",
+      `Too many media attachments to transform (max ${MODEL_API_TRANSFORMER_MAX_ASSETS}).`,
+    );
+  }
+
+  if (!isEndpointConnected(transformer, new Set(manager.getActiveCliDeviceIds()))) {
+    return openAiFailureJsonResponse(
+      "disconnected",
+      "Pool media transformer endpoint is disconnected.",
+    );
+  }
+
+  const transformerVisibleId = directModelIdFromRow(transformer);
+  const envelopesByMessageIndex = new Map<number, string>();
+  const prepassStartedAt = Date.now();
+  let totalDescriptionChars = 0;
+
+  for (const job of jobs) {
+    const remainingDeadlineMs =
+      MODEL_API_TRANSFORMER_REQUEST_DEADLINE_MS - (Date.now() - prepassStartedAt);
+    if (remainingDeadlineMs <= 0 || request.signal?.aborted) {
+      return openAiFailureJsonResponse(
+        "timeout",
+        "Pool media transformer prepass exceeded the request deadline.",
+      );
+    }
+
+    const cacheKey = hashTransformMediaParts({
+      // Scope by the *requesting* user so pool grantees do not share cache entries.
+      ownerUserId: requester.userId,
+      discoveredModelId: transformer.id,
+      endpointId: transformer.Endpoint.id,
+      upstreamModelId: transformer.upstreamModelId,
+      mediaParts: job.mediaParts,
+      systemPrompt: pool.transformerSystemPrompt,
+    });
+    const canCache = shouldCacheTransformDescription({
+      mode: pool.transformerCacheMode,
+      mediaParts: job.mediaParts,
+    });
+    const cached = canCache ? getCachedTransformDescription(cacheKey) : null;
+    if (cached !== null) {
+      totalDescriptionChars += cached.length;
+      if (totalDescriptionChars > MODEL_API_TRANSFORMER_MAX_TOTAL_DESCRIPTION_CHARS) {
+        return openAiFailureJsonResponse(
+          "request_too_large",
+          "Pool media transformer total description size exceeded limit.",
+        );
+      }
+      envelopesByMessageIndex.set(
+        job.messageIndex,
+        wrapTransformEnvelope({
+          text: cached,
+          transformerModelId: transformerVisibleId,
+          assetCount: job.mediaParts.length,
+        }),
+      );
+      continue;
+    }
+
+    let globalLease: ModelApiLimitLease | null = null;
+    let cliLease: ModelApiLimitLease | null = null;
+    try {
+      globalLease = limiter.acquireGlobal({
+        tokenId: requester.limitKey,
+        userId: requester.userId,
+      });
+      try {
+        cliLease = limiter.acquireCli(transformer.Endpoint.cliDeviceId);
+      } catch (error) {
+        globalLease.release();
+        globalLease = null;
+        if (error instanceof ModelApiLimitError) {
+          return openAiFailureJsonResponse(error.failure);
+        }
+        throw error;
+      }
+    } catch (error) {
+      if (error instanceof ModelApiLimitError) {
+        return openAiFailureJsonResponse(error.failure);
+      }
+      throw error;
+    }
+
+    const transformerPayload = buildTransformerChatPayload({
+      upstreamModelId: transformer.upstreamModelId,
+      mediaParts: job.mediaParts,
+      systemPrompt: pool.transformerSystemPrompt,
+    });
+    const transformerBody = new TextEncoder().encode(JSON.stringify(transformerPayload));
+    const callTimeoutMs = Math.min(MODEL_API_TRANSFORMER_TIMEOUT_MS, remainingDeadlineMs);
+    const hopStartedAt = new Date();
+    let transformRelayRequestId: string;
+    try {
+      transformRelayRequestId = await createRelayMetadata({
+        userId: requester.userId,
+        modelApiTokenId: requester.modelApiTokenId,
+        modelApiTokenLookupPrefix: requester.modelApiTokenLookupPrefix,
+        requestedDiscoveredModelId: transformer.id,
+        requestedModelPoolId: poolId,
+      });
+    } catch (error) {
+      cliLease.release();
+      globalLease.release();
+      throw error;
+    }
+
+    const attempt = startRelayAttempt({
+      manager,
+      cliDeviceId: transformer.Endpoint.cliDeviceId,
+      endpointSlug: transformer.Endpoint.slug,
+      family: "chat.completions",
+      method: "POST",
+      path: "/v1/chat/completions",
+      headers: transformerRelayRequestHeaders(request),
+      body: transformerBody,
+      timeoutMs: callTimeoutMs,
+      abortSignal: request.signal,
+    });
+
+    try {
+      const started = await attempt.started;
+      const rawText = await readResponseUtf8(started.body, {
+        onOverflow: () => attempt.cancel("request_too_large"),
+      });
+      const terminal = await attempt.terminal;
+      cliLease.release();
+      globalLease.release();
+      cliLease = null;
+      globalLease = null;
+
+      if (!terminal.ok || started.status >= 400) {
+        await updateRelayMetadata(transformRelayRequestId, {
+          selectedDiscoveredModelId: transformer.id,
+          status: terminalStatus(terminal),
+          startedAt: hopStartedAt,
+          terminal,
+          fallbackFailure: terminal.failure ?? "upstream_4xx",
+        }).catch(metadataUpdateError);
+        return openAiFailureJsonResponse(
+          terminal.failure ?? "upstream_4xx",
+          "Pool media transformer request failed.",
+        );
+      }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(rawText) as unknown;
+      } catch {
+        await failRelayMetadata({
+          relayRequestId: transformRelayRequestId,
+          startedAt: hopStartedAt,
+          failure: "protocol_error",
+          selectedDiscoveredModelId: transformer.id,
+        }).catch(metadataUpdateError);
+        return openAiFailureJsonResponse(
+          "protocol_error",
+          "Pool media transformer returned non-JSON.",
+        );
+      }
+      const description = extractAssistantTextFromChatCompletion(parsed);
+      if (!description?.trim()) {
+        await failRelayMetadata({
+          relayRequestId: transformRelayRequestId,
+          startedAt: hopStartedAt,
+          failure: "protocol_error",
+          selectedDiscoveredModelId: transformer.id,
+        }).catch(metadataUpdateError);
+        return openAiFailureJsonResponse(
+          "protocol_error",
+          "Pool media transformer returned an empty description.",
+        );
+      }
+
+      totalDescriptionChars += description.length;
+      if (totalDescriptionChars > MODEL_API_TRANSFORMER_MAX_TOTAL_DESCRIPTION_CHARS) {
+        await failRelayMetadata({
+          relayRequestId: transformRelayRequestId,
+          startedAt: hopStartedAt,
+          failure: "request_too_large",
+          selectedDiscoveredModelId: transformer.id,
+        }).catch(metadataUpdateError);
+        return openAiFailureJsonResponse(
+          "request_too_large",
+          "Pool media transformer total description size exceeded limit.",
+        );
+      }
+
+      await updateRelayMetadata(transformRelayRequestId, {
+        selectedDiscoveredModelId: transformer.id,
+        status: "SUCCEEDED",
+        startedAt: hopStartedAt,
+        terminal: { ...terminal, ok: true, failure: null },
+      }).catch(metadataUpdateError);
+
+      if (canCache) {
+        setCachedTransformDescription(cacheKey, description);
+      }
+      envelopesByMessageIndex.set(
+        job.messageIndex,
+        wrapTransformEnvelope({
+          text: description,
+          transformerModelId: transformerVisibleId,
+          assetCount: job.mediaParts.length,
+        }),
+      );
+    } catch (error) {
+      const terminal = await attempt.terminal.catch(() => null);
+      cliLease?.release();
+      globalLease?.release();
+      const failure: RelayFailure =
+        error instanceof TransformerResponseTooLargeError
+          ? "request_too_large"
+          : (terminal?.failure ?? "unknown");
+      await failRelayMetadata({
+        relayRequestId: transformRelayRequestId,
+        startedAt: hopStartedAt,
+        failure,
+        selectedDiscoveredModelId: transformer.id,
+      }).catch(metadataUpdateError);
+      if (error instanceof TransformerResponseTooLargeError) {
+        return openAiFailureJsonResponse(
+          "request_too_large",
+          "Pool media transformer response exceeded size limit.",
+        );
+      }
+      return openAiFailureJsonResponse(
+        terminal?.failure ?? "unknown",
+        "Pool media transformer request failed.",
+      );
+    }
+  }
+
+  const nextMessages = rewriteMessagesWithPerMessageEnvelopes({
+    messages: prepared.payload.messages as unknown[],
+    modalities,
+    envelopesByMessageIndex,
+  });
+  const nextPayload: JsonObject = {
+    ...prepared.payload,
+    messages: nextMessages,
+  };
+  return {
+    model: prepared.model,
+    payload: nextPayload,
+    stream: prepared.stream,
+    buildRequest: async (upstreamModelId) => ({
+      headers: relayRequestHeaders(request),
+      body: upstreamBody(nextPayload, upstreamModelId),
+    }),
+  };
+}
+
+function directModelIdFromRow(row: DirectModelRelayRow): string {
+  // Best-effort label for the envelope; not used for routing.
+  return `${row.Endpoint.slug}/${row.upstreamModelId}`;
+}
+
 async function relayPreparedModeledRequest({
   request,
   requester,
@@ -1609,13 +2114,13 @@ async function relayPreparedModeledRequest({
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
 }) {
-  const relayOperation: RelayOperation = {
-    ...operation,
-    stream: prepared.stream,
-    buildRequest: prepared.buildRequest,
-  };
   const directTarget = directTargetByModelId(targets.directModels, prepared.model);
   if (directTarget) {
+    const relayOperation: RelayOperation = {
+      ...operation,
+      stream: prepared.stream,
+      buildRequest: prepared.buildRequest,
+    };
     return relayDirect({
       request,
       requester,
@@ -1628,6 +2133,23 @@ async function relayPreparedModeledRequest({
 
   const poolTarget = poolTargetByModelId(targets.modelPools, prepared.model);
   if (poolTarget) {
+    const maybeTransformed = await maybeApplyPoolMediaTransformer({
+      request,
+      requester,
+      poolId: poolTarget.id,
+      prepared,
+      operationFamily: operation.family,
+      manager,
+      limiter,
+    });
+    if (maybeTransformed instanceof Response) return maybeTransformed;
+    prepared = maybeTransformed;
+
+    const relayOperation: RelayOperation = {
+      ...operation,
+      stream: prepared.stream,
+      buildRequest: prepared.buildRequest,
+    };
     return relayPool({
       request,
       requester,

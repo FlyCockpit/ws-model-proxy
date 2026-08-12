@@ -17,6 +17,9 @@
     "./lib/model-api-token-access": {
       "default": "./src/lib/model-api-token-access.ts"
     },
+    "./lib/openai-compatible-capabilities": {
+      "default": "./src/lib/openai-compatible-capabilities.ts"
+    },
     "./routers/index": {
       "default": "./src/routers/index.ts"
     }

@@ -1,5 +1,9 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  resolveEffectiveCapabilityMetadata,
+  transformerSupportedModalities,
+} from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { validateForwarderPoolSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import { Button } from "@ws-model-proxy/ui/components/button";
@@ -168,9 +172,65 @@ function allDirectModels(devices: CliDevice[]) {
         cliSlug: device.slug,
         endpointSlug: endpoint.slug,
         endpointLabel: endpoint.label,
+        endpointPublished: endpoint.published,
+        // Needed for OVERRIDE→endpoint fallback (same as pool management).
+        endpointCapabilityMetadata: endpoint.capabilityMetadata,
       })),
     ),
   );
+}
+
+type DirectModelOption = ReturnType<typeof allDirectModels>[number];
+
+/**
+ * Same capability path as server/pool management: strict parse of OVERRIDE
+ * metadata with fall back to endpoint defaults, then transformer modalities.
+ * Coarse VISION_INPUT enums alone never override a parseable chatCompletions
+ * object that disables vision.
+ */
+function modelTransformerCaps(model: DirectModelOption): {
+  images: boolean;
+  audio: boolean;
+  video: boolean;
+} {
+  const parsed = resolveEffectiveCapabilityMetadata({
+    capabilityOverrideMode: model.capabilityOverrideMode,
+    capabilityOverrideMetadata: model.capabilityOverrideMetadata,
+    endpointCapabilityMetadata: model.endpointCapabilityMetadata,
+  });
+  if (parsed) {
+    return transformerSupportedModalities(parsed);
+  }
+  // No parseable chatCompletions metadata — last resort for enum-only inventory.
+  // Prefer override coarse when mode is OVERRIDE (even if metadata was malformed),
+  // else endpoint/default coarse from effectiveCapabilities.
+  const effective = model.effectiveCapabilities;
+  const coarse =
+    model.capabilityOverrideMode === "OVERRIDE"
+      ? (model.capabilityOverrides ?? [])
+      : (effective?.coarse ?? []);
+  return {
+    images: Array.isArray(coarse) && coarse.includes("VISION_INPUT"),
+    video: Array.isArray(coarse) && coarse.includes("VIDEO_INPUT"),
+    audio: Array.isArray(coarse) && coarse.includes("AUDIO_INPUT"),
+  };
+}
+
+/** Model is eligible if published (model + endpoint) and supports enabled modalities. */
+function modelSupportsTransformerModalities(
+  model: DirectModelOption,
+  needed: { images: boolean; audio: boolean; video: boolean },
+): boolean {
+  if (!model.published || !model.endpointPublished) return false;
+  const caps = modelTransformerCaps(model);
+  if (needed.images && !caps.images) return false;
+  if (needed.audio && !caps.audio) return false;
+  if (needed.video && !caps.video) return false;
+  // At least one modality should be useful when nothing is toggled yet — allow vision models.
+  if (!needed.images && !needed.audio && !needed.video) {
+    return caps.images || caps.audio || caps.video;
+  }
+  return true;
 }
 
 export function CliEndpointsModelsSection() {
@@ -612,6 +672,18 @@ export function PoolsSection() {
                   {pool.description ? (
                     <p className="mt-2 text-sm text-muted-foreground">{pool.description}</p>
                   ) : null}
+                  {pool.transformer.model ? (
+                    <p className="mt-2 text-sm text-muted-foreground">
+                      {t("dashboard:pools.transformerActive")}:{" "}
+                      <code className="font-mono text-xs">
+                        {pool.transformer.model.canonicalModelId}
+                      </code>
+                    </p>
+                  ) : (
+                    <p className="mt-2 text-sm text-muted-foreground">
+                      {t("dashboard:pools.transformerOff")}
+                    </p>
+                  )}
                 </div>
                 <div className="flex flex-wrap gap-2">
                   <Button
@@ -764,6 +836,7 @@ export function PoolsSection() {
                 key={editingPool.id}
                 mode="edit"
                 pool={editingPool}
+                directModels={directModels}
                 onSuccess={() => setEditingPool(null)}
               />
             ) : null}
@@ -867,10 +940,12 @@ function PoolForm({
   mode,
   pool,
   onSuccess,
+  directModels = [],
 }: {
   mode: "create" | "edit";
   pool?: ModelPool;
   onSuccess: () => void;
+  directModels?: ReturnType<typeof allDirectModels>;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
@@ -892,6 +967,12 @@ function PoolForm({
       }),
     name: z.string().trim().min(1).max(120),
     description: z.string().trim().max(1000),
+    transformerDiscoveredModelId: z.string(),
+    transformerImages: z.boolean(),
+    transformerAudio: z.boolean(),
+    transformerVideo: z.boolean(),
+    transformerCacheMode: z.enum(["OFF", "MEMORY"]),
+    transformerSystemPrompt: z.string().max(16_000),
   });
   const createPool = useMutation(
     orpc.forwarderManagement.createModelPool.mutationOptions({
@@ -916,6 +997,12 @@ function PoolForm({
       slug: pool?.slug ?? "",
       name: pool?.name ?? "",
       description: pool?.description ?? "",
+      transformerDiscoveredModelId: pool?.transformer.discoveredModelId ?? "",
+      transformerImages: pool?.transformer.images ?? true,
+      transformerAudio: pool?.transformer.audio ?? false,
+      transformerVideo: pool?.transformer.video ?? false,
+      transformerCacheMode: pool?.transformer.cacheMode === "MEMORY" ? "MEMORY" : "OFF",
+      transformerSystemPrompt: pool?.transformer.systemPrompt ?? "",
     },
     validators: { onSubmit: poolSchema },
     onSubmit: async ({ value }) => {
@@ -931,6 +1018,16 @@ function PoolForm({
           slug: value.slug.trim(),
           name: value.name.trim(),
           description: value.description.trim() || null,
+          transformerDiscoveredModelId: value.transformerDiscoveredModelId.trim()
+            ? value.transformerDiscoveredModelId.trim()
+            : null,
+          transformerImages: value.transformerImages,
+          transformerAudio: value.transformerAudio,
+          transformerVideo: value.transformerVideo,
+          transformerCacheMode: value.transformerCacheMode as "OFF" | "MEMORY",
+          transformerSystemPrompt: value.transformerSystemPrompt.trim()
+            ? value.transformerSystemPrompt.trim()
+            : null,
         });
       }
     },
@@ -1010,6 +1107,145 @@ function PoolForm({
           </div>
         )}
       </form.Field>
+
+      {mode === "edit" ? (
+        <div className="space-y-4 rounded-md border p-3">
+          <div>
+            <h4 className="text-sm font-medium">{t("dashboard:pools.transformerTitle")}</h4>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {t("dashboard:pools.transformerDescription")}
+            </p>
+          </div>
+          <form.Subscribe
+            selector={(state) => ({
+              images: state.values.transformerImages,
+              audio: state.values.transformerAudio,
+              video: state.values.transformerVideo,
+            })}
+          >
+            {({ images, audio, video }) => (
+              <form.Field name="transformerDiscoveredModelId">
+                {(field) => {
+                  const eligible = directModels.filter((model) =>
+                    modelSupportsTransformerModalities(model, { images, audio, video }),
+                  );
+                  return (
+                    <div className="space-y-2">
+                      <Label htmlFor={field.name}>{t("dashboard:pools.transformerModel")}</Label>
+                      <select
+                        id={field.name}
+                        name={field.name}
+                        className="flex h-11 w-full min-h-11 rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                        value={field.state.value}
+                        onBlur={field.handleBlur}
+                        onChange={(event) => field.handleChange(event.target.value)}
+                      >
+                        <option value="">{t("dashboard:pools.transformerNone")}</option>
+                        {eligible.map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.canonicalModelId}
+                          </option>
+                        ))}
+                      </select>
+                      {field.state.value &&
+                      !eligible.some((model) => model.id === field.state.value) ? (
+                        <p className="text-sm text-destructive">
+                          {t("dashboard:pools.transformerIncompatible")}
+                        </p>
+                      ) : null}
+                      {eligible.length === 0 ? (
+                        <p className="text-xs text-muted-foreground">
+                          {t("dashboard:pools.transformerNoEligible")}
+                        </p>
+                      ) : null}
+                    </div>
+                  );
+                }}
+              </form.Field>
+            )}
+          </form.Subscribe>
+          <form.Field name="transformerImages">
+            {(field) => (
+              <label className="flex min-h-11 items-center gap-3 text-sm">
+                <input
+                  type="checkbox"
+                  className="size-4"
+                  checked={field.state.value}
+                  onBlur={field.handleBlur}
+                  onChange={(event) => field.handleChange(event.target.checked)}
+                />
+                {t("dashboard:pools.transformerImages")}
+              </label>
+            )}
+          </form.Field>
+          <form.Field name="transformerAudio">
+            {(field) => (
+              <label className="flex min-h-11 items-center gap-3 text-sm">
+                <input
+                  type="checkbox"
+                  className="size-4"
+                  checked={field.state.value}
+                  onBlur={field.handleBlur}
+                  onChange={(event) => field.handleChange(event.target.checked)}
+                />
+                {t("dashboard:pools.transformerAudio")}
+              </label>
+            )}
+          </form.Field>
+          <form.Field name="transformerVideo">
+            {(field) => (
+              <label className="flex min-h-11 items-center gap-3 text-sm">
+                <input
+                  type="checkbox"
+                  className="size-4"
+                  checked={field.state.value}
+                  onBlur={field.handleBlur}
+                  onChange={(event) => field.handleChange(event.target.checked)}
+                />
+                {t("dashboard:pools.transformerVideo")}
+              </label>
+            )}
+          </form.Field>
+          <form.Field name="transformerCacheMode">
+            {(field) => (
+              <div className="space-y-2">
+                <Label htmlFor={field.name}>{t("dashboard:pools.transformerCacheMode")}</Label>
+                <select
+                  id={field.name}
+                  name={field.name}
+                  className="flex h-11 w-full min-h-11 rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                  value={field.state.value}
+                  onBlur={field.handleBlur}
+                  onChange={(event) => field.handleChange(event.target.value as "OFF" | "MEMORY")}
+                >
+                  <option value="OFF">{t("dashboard:pools.transformerCacheOff")}</option>
+                  <option value="MEMORY">{t("dashboard:pools.transformerCacheMemory")}</option>
+                </select>
+                <p className="text-xs text-muted-foreground">
+                  {t("dashboard:pools.transformerCacheHint")}
+                </p>
+              </div>
+            )}
+          </form.Field>
+          <form.Field name="transformerSystemPrompt">
+            {(field) => (
+              <div className="space-y-2">
+                <Label htmlFor={field.name}>{t("dashboard:pools.transformerPrompt")}</Label>
+                <Textarea
+                  id={field.name}
+                  name={field.name}
+                  value={field.state.value}
+                  onBlur={field.handleBlur}
+                  onChange={(event) => field.handleChange(event.target.value)}
+                  autoComplete="off"
+                  rows={3}
+                  placeholder={t("dashboard:pools.transformerPromptPlaceholder")}
+                />
+              </div>
+            )}
+          </form.Field>
+        </div>
+      ) : null}
 
       <form.Subscribe
         selector={(state) => ({ canSubmit: state.canSubmit, isSubmitting: state.isSubmitting })}
