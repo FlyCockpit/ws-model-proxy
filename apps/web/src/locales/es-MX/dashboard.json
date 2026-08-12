@@ -67,6 +67,8 @@
       "tokensPerSecondShared": "{{value}} tok/s con tokenizador compartido después del primer token ({{count}} tokens de finalización)",
       "throughputUnavailable": "Rendimiento no disponible: el tokenizador compartido no pudo contar la finalización"
     },
+    "modelFilterEmpty": "Ningún modelo coincide",
+    "modelFilterPlaceholder": "Filtrar modelos…",
     "modelPicker": "Modelo",
     "regenerate": "Regenerar",
     "retry": "Reintentar",

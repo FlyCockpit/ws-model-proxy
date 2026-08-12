@@ -67,6 +67,8 @@
       "tokensPerSecondShared": "{{value}} shared-tokenizer tok/s after first token ({{count}} completion tokens)",
       "throughputUnavailable": "Throughput unavailable — shared tokenizer could not count the completion"
     },
+    "modelFilterEmpty": "No models match",
+    "modelFilterPlaceholder": "Filter models…",
     "modelPicker": "Model",
     "regenerate": "Regenerate",
     "retry": "Retry",

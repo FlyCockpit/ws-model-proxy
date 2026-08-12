@@ -3,20 +3,23 @@ import { createFileRoute } from "@tanstack/react-router";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { env } from "@ws-model-proxy/env/web";
 import { Button } from "@ws-model-proxy/ui/components/button";
-import { Label } from "@ws-model-proxy/ui/components/label";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@ws-model-proxy/ui/components/select";
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@ws-model-proxy/ui/components/command";
+import { Label } from "@ws-model-proxy/ui/components/label";
+import { Popover, PopoverContent, PopoverTrigger } from "@ws-model-proxy/ui/components/popover";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { Textarea } from "@ws-model-proxy/ui/components/textarea";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import {
   ArrowDown,
   ChevronDown,
+  ChevronsUpDown,
   FlaskConical,
   ImagePlus,
   Loader2,
@@ -140,6 +143,102 @@ function modelOptions(visibleModels: VisibleModels | undefined): ModelOption[] {
       kind: pool.target,
     })),
   ];
+}
+
+function filterModelOptions(options: ModelOption[], query: string): ModelOption[] {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return options;
+  return options.filter(
+    (option) =>
+      option.modelId.toLowerCase().includes(needle) || option.label.toLowerCase().includes(needle),
+  );
+}
+
+function ModelPicker({
+  options,
+  value,
+  onValueChange,
+  disabled = false,
+}: {
+  options: ModelOption[];
+  value: string;
+  onValueChange: (value: string) => void;
+  disabled?: boolean;
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const selected = options.find((option) => option.modelId === value);
+  const filtered = useMemo(() => filterModelOptions(options, query), [options, query]);
+
+  return (
+    <Popover
+      open={open}
+      onOpenChange={(nextOpen) => {
+        setOpen(nextOpen);
+        if (!nextOpen) setQuery("");
+      }}
+    >
+      <PopoverTrigger
+        render={
+          <Button
+            type="button"
+            variant="outline"
+            role="combobox"
+            aria-expanded={open}
+            aria-label={t("dashboard:chatTest.modelPicker")}
+            disabled={disabled || options.length === 0}
+            className={cn(
+              "h-auto min-h-[44px] min-w-0 flex-1 justify-between gap-2 py-2 font-normal whitespace-normal! md:w-80 md:flex-none",
+              !selected && "text-muted-foreground",
+            )}
+          />
+        }
+      >
+        <span className="min-w-0 flex-1 break-all text-left">
+          {selected?.modelId ?? t("dashboard:chatTest.modelPicker")}
+        </span>
+        <ChevronsUpDown className="size-4 shrink-0 opacity-50" />
+      </PopoverTrigger>
+      <PopoverContent
+        className="w-[var(--anchor-width)] min-w-[min(100vw-2rem,20rem)] max-w-[calc(100vw-1rem)] p-0"
+        align="end"
+      >
+        <Command shouldFilter={false}>
+          <CommandInput
+            placeholder={t("dashboard:chatTest.modelFilterPlaceholder")}
+            value={query}
+            onValueChange={setQuery}
+          />
+          <CommandList>
+            {filtered.length === 0 ? (
+              <CommandEmpty>{t("dashboard:chatTest.modelFilterEmpty")}</CommandEmpty>
+            ) : (
+              <CommandGroup>
+                {filtered.map((option) => {
+                  const isSelected = option.modelId === value;
+                  return (
+                    <CommandItem
+                      key={`${option.kind}:${option.id}`}
+                      value={option.modelId}
+                      data-checked={isSelected}
+                      onSelect={() => {
+                        onValueChange(option.modelId);
+                        setOpen(false);
+                        setQuery("");
+                      }}
+                    >
+                      <span className="min-w-0 flex-1 break-all">{option.modelId}</span>
+                    </CommandItem>
+                  );
+                })}
+              </CommandGroup>
+            )}
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
 }
 
 // Representative length stand-in for a signed media URL, used only to estimate
@@ -973,29 +1072,25 @@ function ChatTestPage() {
 
   return (
     <section className="grid h-full min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)_auto] rounded-md border bg-background">
-      <div className="flex shrink-0 flex-col gap-2 border-b p-2 sm:gap-3 sm:p-3 md:flex-row md:items-center md:justify-between">
+      <div className="flex shrink-0 flex-col gap-2 border-b p-2 sm:gap-3 sm:p-3 md:flex-row md:items-start md:justify-between">
         <div className="min-w-0">
           <h2 className="text-base font-semibold sm:text-lg">{t("dashboard:chatTest.title")}</h2>
-        </div>
-        <div className="flex min-w-0 items-center gap-2">
-          <Select
-            value={effectiveModelId}
-            onValueChange={(value) => setSelectedModelId(value ?? "")}
-          >
-            <SelectTrigger
-              className="min-h-[44px] min-w-0 flex-1 md:w-80 md:flex-none"
-              aria-label={t("dashboard:chatTest.modelPicker")}
+          {effectiveModelId ? (
+            <p
+              className="mt-0.5 break-all font-mono text-xs text-muted-foreground"
+              title={effectiveModelId}
             >
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent align="end">
-              {options.map((option) => (
-                <SelectItem key={`${option.kind}:${option.id}`} value={option.modelId}>
-                  <span className="min-w-0 truncate">{option.modelId}</span>
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+              {effectiveModelId}
+            </p>
+          ) : null}
+        </div>
+        <div className="flex min-w-0 items-start gap-2">
+          <ModelPicker
+            options={options}
+            value={effectiveModelId}
+            onValueChange={setSelectedModelId}
+            disabled={isStreaming || isPreparingSend}
+          />
           <Button
             type="button"
             variant="outline"

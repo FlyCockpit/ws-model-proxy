@@ -118,18 +118,29 @@ function OwnerCell({ owner }: { owner: CliRow["owner"] }) {
   );
 }
 
-function Pill({ children, muted = false }: { children: ReactNode; muted?: boolean }) {
-  return (
-    <span
-      className={
-        muted
-          ? "inline-flex min-h-6 items-center border bg-muted px-2 text-xs font-medium text-muted-foreground"
-          : "inline-flex min-h-6 items-center border border-primary/20 bg-primary/10 px-2 text-xs font-medium text-primary"
-      }
-    >
-      {children}
-    </span>
-  );
+function pillToneClass(status: string | undefined, muted: boolean) {
+  const normalized = (status ?? "").toUpperCase();
+  // Offline / disconnected should read as caution (yellow), not healthy green.
+  if (normalized === "OFFLINE" || normalized === "DISCONNECTED") {
+    return "inline-flex min-h-6 items-center border border-amber-500/30 bg-amber-500/10 px-2 text-xs font-medium text-amber-700 dark:text-amber-300";
+  }
+  if (muted) {
+    return "inline-flex min-h-6 items-center border bg-muted px-2 text-xs font-medium text-muted-foreground";
+  }
+  return "inline-flex min-h-6 items-center border border-primary/20 bg-primary/10 px-2 text-xs font-medium text-primary";
+}
+
+function Pill({
+  children,
+  muted = false,
+  status,
+}: {
+  children: ReactNode;
+  muted?: boolean;
+  /** Raw status value used for tone (labels are translated). */
+  status?: string;
+}) {
+  return <span className={pillToneClass(status, muted)}>{children}</span>;
 }
 
 function SelectFilter({
@@ -706,8 +717,14 @@ function CliTable({
                 </td>
                 <td className="px-4 py-3 align-top">
                   <div className="flex flex-wrap gap-1">
-                    <Pill muted={row.isStale}>{statusLabel(row.status, t)}</Pill>
-                    {row.isStale ? <Pill muted>{statusLabel("STALE", t)}</Pill> : null}
+                    <Pill muted={row.isStale} status={row.status}>
+                      {statusLabel(row.status, t)}
+                    </Pill>
+                    {row.isStale ? (
+                      <Pill muted status="STALE">
+                        {statusLabel("STALE", t)}
+                      </Pill>
+                    ) : null}
                   </div>
                 </td>
                 <td className="px-4 py-3 align-top tabular-nums">
@@ -787,8 +804,14 @@ function EndpointTable({
                 </td>
                 <td className="px-4 py-3 align-top">
                   <div className="flex flex-wrap gap-1">
-                    <Pill muted={row.healthState !== "HEALTHY"}>{statusLabel(row.status, t)}</Pill>
-                    {row.cliDevice.isStale ? <Pill muted>{statusLabel("STALE", t)}</Pill> : null}
+                    <Pill muted={row.healthState !== "HEALTHY"} status={row.status}>
+                      {statusLabel(row.status, t)}
+                    </Pill>
+                    {row.cliDevice.isStale ? (
+                      <Pill muted status="STALE">
+                        {statusLabel("STALE", t)}
+                      </Pill>
+                    ) : null}
                   </div>
                 </td>
                 <td className="px-4 py-3 align-top">
@@ -866,7 +889,7 @@ function ModelTable({
                   </p>
                 </td>
                 <td className="px-4 py-3 align-top">
-                  <Pill muted={row.healthState !== "AVAILABLE"}>
+                  <Pill muted={row.healthState !== "AVAILABLE"} status={row.healthState}>
                     {statusLabel(row.healthState, t)}
                   </Pill>
                 </td>
@@ -958,10 +981,16 @@ function PoolTable({
                 <td className="px-4 py-3 align-top">
                   <div className="flex flex-wrap gap-1">
                     {row.members.length === 0 ? (
-                      <Pill muted>{statusLabel("UNKNOWN", t)}</Pill>
+                      <Pill muted status="UNKNOWN">
+                        {statusLabel("UNKNOWN", t)}
+                      </Pill>
                     ) : null}
                     {row.members.slice(0, 4).map((member) => (
-                      <Pill key={member.id} muted={member.healthStatus !== "HEALTHY"}>
+                      <Pill
+                        key={member.id}
+                        muted={member.healthStatus !== "HEALTHY"}
+                        status={member.healthStatus}
+                      >
                         {statusLabel(member.healthStatus, t)}
                       </Pill>
                     ))}
@@ -1047,7 +1076,9 @@ function RelayTable({
                     {row.selectedModel?.canonicalModelId ?? emptyValue}
                   </td>
                   <td className="px-4 py-3 align-top">
-                    <Pill muted={row.status !== "SUCCEEDED"}>{statusLabel(row.status, t)}</Pill>
+                    <Pill muted={row.status !== "SUCCEEDED"} status={row.status}>
+                      {statusLabel(row.status, t)}
+                    </Pill>
                     {row.errorClass ? (
                       <p className="mt-1 text-muted-foreground">{row.errorClass}</p>
                     ) : null}

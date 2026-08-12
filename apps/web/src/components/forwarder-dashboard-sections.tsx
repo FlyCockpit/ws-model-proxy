@@ -85,14 +85,34 @@ function copyToClipboard(value: string, message: string) {
   void navigator.clipboard.writeText(value).then(() => toast.success(message));
 }
 
-function StatusPill({ children, muted = false }: { children: ReactNode; muted?: boolean }) {
+function statusPillToneClass(status: string | undefined, muted: boolean) {
+  const normalized = (status ?? "").toUpperCase();
+  // Offline / disconnected should read as caution (yellow), not healthy green.
+  if (normalized === "OFFLINE" || normalized === "DISCONNECTED") {
+    return "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300";
+  }
+  if (muted) {
+    return "border-border bg-muted text-muted-foreground";
+  }
+  return "border-primary/20 bg-primary/10 text-primary";
+}
+
+function StatusPill({
+  children,
+  muted = false,
+  status,
+}: {
+  children: ReactNode;
+  muted?: boolean;
+  /** Raw status value used for tone; falls back to string children. */
+  status?: string;
+}) {
+  const toneStatus = status ?? (typeof children === "string" ? children : undefined);
   return (
     <span
       className={cn(
         "inline-flex min-h-6 items-center border px-2 text-xs font-medium tabular-nums",
-        muted
-          ? "border-border bg-muted text-muted-foreground"
-          : "border-primary/20 bg-primary/10 text-primary",
+        statusPillToneClass(toneStatus, muted),
       )}
     >
       {children}
