@@ -7,16 +7,12 @@
     },
     "./forwarder-security": {
       "default": "./src/forwarder-security.ts"
-    },
-    "./seed": {
-      "default": "./prisma/seed.ts"
     }
   },
   "scripts": {
     "check-types": "tsc --noEmit",
     "db:push": "prisma db push",
     "db:push:dangerous": "bash ../../scripts/db-push-dangerous-local.sh",
-    "db:seed": "prisma db seed",
     "db:generate": "prisma generate",
     "db:validate": "prisma validate && prisma format && prisma format --check",
     "postinstall": "prisma generate",
@@ -36,10 +32,6 @@
   "devDependencies": {
     "@ws-model-proxy/config": "workspace:*",
     "prisma": "^7.9.1",
-    "tsx": "catalog:",
     "typescript": "catalog:"
-  },
-  "prisma": {
-    "seed": "tsx prisma/seed.cli.ts"
   }
 }

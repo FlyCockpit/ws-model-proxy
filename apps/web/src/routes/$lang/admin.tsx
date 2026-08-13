@@ -1,6 +1,6 @@
 import { createFileRoute, Link, notFound, Outlet } from "@tanstack/react-router";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { Activity, Database, LayoutDashboard, Settings, Smartphone, Users } from "lucide-react";
+import { Activity, LayoutDashboard, Settings, Smartphone, Users } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { decideAdminRouteAccess } from "@/lib/route-session-access";
@@ -60,12 +60,6 @@ function AdminNav() {
       to: "/$lang/admin/settings" as const,
       label: t("nav.settings"),
       icon: Settings,
-      exact: false,
-    },
-    {
-      to: "/$lang/admin/seed" as const,
-      label: t("nav.seed"),
-      icon: Database,
       exact: false,
     },
   ];

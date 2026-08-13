@@ -9,41 +9,40 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as LangRouteImport } from './routes/$lang'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as LangRouteImport } from './routes/$lang'
 import { Route as LangIndexRouteImport } from './routes/$lang/index'
-import { Route as LangVerifyEmailRouteImport } from './routes/$lang/verify-email'
-import { Route as LangSignupRouteImport } from './routes/$lang/signup'
-import { Route as LangLoginRouteImport } from './routes/$lang/login'
-import { Route as LangDeviceRouteImport } from './routes/$lang/device'
-import { Route as LangAdminRouteImport } from './routes/$lang/admin'
 import { Route as LangAuthRouteImport } from './routes/$lang/_auth'
-import { Route as LangAdminIndexRouteImport } from './routes/$lang/admin/index'
-import { Route as LangAdminUsersRouteImport } from './routes/$lang/admin/users'
-import { Route as LangAdminSettingsRouteImport } from './routes/$lang/admin/settings'
-import { Route as LangAdminSeedRouteImport } from './routes/$lang/admin/seed'
-import { Route as LangAdminObservabilityRouteImport } from './routes/$lang/admin/observability'
-import { Route as LangAdminDevicesRouteImport } from './routes/$lang/admin/devices'
-import { Route as LangAuthSettingsRouteImport } from './routes/$lang/_auth/settings'
+import { Route as LangAdminRouteImport } from './routes/$lang/admin'
+import { Route as LangDeviceRouteImport } from './routes/$lang/device'
+import { Route as LangLoginRouteImport } from './routes/$lang/login'
+import { Route as LangSignupRouteImport } from './routes/$lang/signup'
+import { Route as LangVerifyEmailRouteImport } from './routes/$lang/verify-email'
 import { Route as LangAuthDashboardRouteImport } from './routes/$lang/_auth/dashboard'
-import { Route as LangAuthSettingsIndexRouteImport } from './routes/$lang/_auth/settings/index'
+import { Route as LangAuthSettingsRouteImport } from './routes/$lang/_auth/settings'
+import { Route as LangAdminIndexRouteImport } from './routes/$lang/admin/index'
+import { Route as LangAdminDevicesRouteImport } from './routes/$lang/admin/devices'
+import { Route as LangAdminObservabilityRouteImport } from './routes/$lang/admin/observability'
+import { Route as LangAdminSettingsRouteImport } from './routes/$lang/admin/settings'
+import { Route as LangAdminUsersRouteImport } from './routes/$lang/admin/users'
 import { Route as LangAuthDashboardIndexRouteImport } from './routes/$lang/_auth/dashboard/index'
-import { Route as LangAuthSettingsSecurityRouteImport } from './routes/$lang/_auth/settings/security'
-import { Route as LangAuthDashboardRelayMetadataRouteImport } from './routes/$lang/_auth/dashboard/relay-metadata'
-import { Route as LangAuthDashboardPoolsRouteImport } from './routes/$lang/_auth/dashboard/pools'
-import { Route as LangAuthDashboardModelApiTokensRouteImport } from './routes/$lang/_auth/dashboard/model-api-tokens'
-import { Route as LangAuthDashboardClisRouteImport } from './routes/$lang/_auth/dashboard/clis'
-import { Route as LangAuthDashboardCliTokensRouteImport } from './routes/$lang/_auth/dashboard/cli-tokens'
 import { Route as LangAuthDashboardChatTestRouteImport } from './routes/$lang/_auth/dashboard/chat-test'
+import { Route as LangAuthDashboardCliTokensRouteImport } from './routes/$lang/_auth/dashboard/cli-tokens'
+import { Route as LangAuthDashboardClisRouteImport } from './routes/$lang/_auth/dashboard/clis'
+import { Route as LangAuthDashboardModelApiTokensRouteImport } from './routes/$lang/_auth/dashboard/model-api-tokens'
+import { Route as LangAuthDashboardPoolsRouteImport } from './routes/$lang/_auth/dashboard/pools'
+import { Route as LangAuthDashboardRelayMetadataRouteImport } from './routes/$lang/_auth/dashboard/relay-metadata'
+import { Route as LangAuthSettingsIndexRouteImport } from './routes/$lang/_auth/settings/index'
+import { Route as LangAuthSettingsSecurityRouteImport } from './routes/$lang/_auth/settings/security'
 
-const LangRoute = LangRouteImport.update({
-  id: '/$lang',
-  path: '/$lang',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const LangRoute = LangRouteImport.update({
+  id: '/$lang',
+  path: '/$lang',
   getParentRoute: () => rootRouteImport,
 } as any)
 const LangIndexRoute = LangIndexRouteImport.update({
@@ -51,24 +50,8 @@ const LangIndexRoute = LangIndexRouteImport.update({
   path: '/',
   getParentRoute: () => LangRoute,
 } as any)
-const LangVerifyEmailRoute = LangVerifyEmailRouteImport.update({
-  id: '/verify-email',
-  path: '/verify-email',
-  getParentRoute: () => LangRoute,
-} as any)
-const LangSignupRoute = LangSignupRouteImport.update({
-  id: '/signup',
-  path: '/signup',
-  getParentRoute: () => LangRoute,
-} as any)
-const LangLoginRoute = LangLoginRouteImport.update({
-  id: '/login',
-  path: '/login',
-  getParentRoute: () => LangRoute,
-} as any)
-const LangDeviceRoute = LangDeviceRouteImport.update({
-  id: '/device',
-  path: '/device',
+const LangAuthRoute = LangAuthRouteImport.update({
+  id: '/_auth',
   getParentRoute: () => LangRoute,
 } as any)
 const LangAdminRoute = LangAdminRouteImport.update({
@@ -76,33 +59,39 @@ const LangAdminRoute = LangAdminRouteImport.update({
   path: '/admin',
   getParentRoute: () => LangRoute,
 } as any)
-const LangAuthRoute = LangAuthRouteImport.update({
-  id: '/_auth',
+const LangDeviceRoute = LangDeviceRouteImport.update({
+  id: '/device',
+  path: '/device',
   getParentRoute: () => LangRoute,
+} as any)
+const LangLoginRoute = LangLoginRouteImport.update({
+  id: '/login',
+  path: '/login',
+  getParentRoute: () => LangRoute,
+} as any)
+const LangSignupRoute = LangSignupRouteImport.update({
+  id: '/signup',
+  path: '/signup',
+  getParentRoute: () => LangRoute,
+} as any)
+const LangVerifyEmailRoute = LangVerifyEmailRouteImport.update({
+  id: '/verify-email',
+  path: '/verify-email',
+  getParentRoute: () => LangRoute,
+} as any)
+const LangAuthDashboardRoute = LangAuthDashboardRouteImport.update({
+  id: '/dashboard',
+  path: '/dashboard',
+  getParentRoute: () => LangAuthRoute,
+} as any)
+const LangAuthSettingsRoute = LangAuthSettingsRouteImport.update({
+  id: '/settings',
+  path: '/settings',
+  getParentRoute: () => LangAuthRoute,
 } as any)
 const LangAdminIndexRoute = LangAdminIndexRouteImport.update({
   id: '/',
   path: '/',
-  getParentRoute: () => LangAdminRoute,
-} as any)
-const LangAdminUsersRoute = LangAdminUsersRouteImport.update({
-  id: '/users',
-  path: '/users',
-  getParentRoute: () => LangAdminRoute,
-} as any)
-const LangAdminSettingsRoute = LangAdminSettingsRouteImport.update({
-  id: '/settings',
-  path: '/settings',
-  getParentRoute: () => LangAdminRoute,
-} as any)
-const LangAdminSeedRoute = LangAdminSeedRouteImport.update({
-  id: '/seed',
-  path: '/seed',
-  getParentRoute: () => LangAdminRoute,
-} as any)
-const LangAdminObservabilityRoute = LangAdminObservabilityRouteImport.update({
-  id: '/observability',
-  path: '/observability',
   getParentRoute: () => LangAdminRoute,
 } as any)
 const LangAdminDevicesRoute = LangAdminDevicesRouteImport.update({
@@ -110,41 +99,41 @@ const LangAdminDevicesRoute = LangAdminDevicesRouteImport.update({
   path: '/devices',
   getParentRoute: () => LangAdminRoute,
 } as any)
-const LangAuthSettingsRoute = LangAuthSettingsRouteImport.update({
+const LangAdminObservabilityRoute = LangAdminObservabilityRouteImport.update({
+  id: '/observability',
+  path: '/observability',
+  getParentRoute: () => LangAdminRoute,
+} as any)
+const LangAdminSettingsRoute = LangAdminSettingsRouteImport.update({
   id: '/settings',
   path: '/settings',
-  getParentRoute: () => LangAuthRoute,
+  getParentRoute: () => LangAdminRoute,
 } as any)
-const LangAuthDashboardRoute = LangAuthDashboardRouteImport.update({
-  id: '/dashboard',
-  path: '/dashboard',
-  getParentRoute: () => LangAuthRoute,
-} as any)
-const LangAuthSettingsIndexRoute = LangAuthSettingsIndexRouteImport.update({
-  id: '/',
-  path: '/',
-  getParentRoute: () => LangAuthSettingsRoute,
+const LangAdminUsersRoute = LangAdminUsersRouteImport.update({
+  id: '/users',
+  path: '/users',
+  getParentRoute: () => LangAdminRoute,
 } as any)
 const LangAuthDashboardIndexRoute = LangAuthDashboardIndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => LangAuthDashboardRoute,
 } as any)
-const LangAuthSettingsSecurityRoute =
-  LangAuthSettingsSecurityRouteImport.update({
-    id: '/security',
-    path: '/security',
-    getParentRoute: () => LangAuthSettingsRoute,
-  } as any)
-const LangAuthDashboardRelayMetadataRoute =
-  LangAuthDashboardRelayMetadataRouteImport.update({
-    id: '/relay-metadata',
-    path: '/relay-metadata',
+const LangAuthDashboardChatTestRoute =
+  LangAuthDashboardChatTestRouteImport.update({
+    id: '/chat-test',
+    path: '/chat-test',
     getParentRoute: () => LangAuthDashboardRoute,
   } as any)
-const LangAuthDashboardPoolsRoute = LangAuthDashboardPoolsRouteImport.update({
-  id: '/pools',
-  path: '/pools',
+const LangAuthDashboardCliTokensRoute =
+  LangAuthDashboardCliTokensRouteImport.update({
+    id: '/cli-tokens',
+    path: '/cli-tokens',
+    getParentRoute: () => LangAuthDashboardRoute,
+  } as any)
+const LangAuthDashboardClisRoute = LangAuthDashboardClisRouteImport.update({
+  id: '/clis',
+  path: '/clis',
   getParentRoute: () => LangAuthDashboardRoute,
 } as any)
 const LangAuthDashboardModelApiTokensRoute =
@@ -153,22 +142,27 @@ const LangAuthDashboardModelApiTokensRoute =
     path: '/model-api-tokens',
     getParentRoute: () => LangAuthDashboardRoute,
   } as any)
-const LangAuthDashboardClisRoute = LangAuthDashboardClisRouteImport.update({
-  id: '/clis',
-  path: '/clis',
+const LangAuthDashboardPoolsRoute = LangAuthDashboardPoolsRouteImport.update({
+  id: '/pools',
+  path: '/pools',
   getParentRoute: () => LangAuthDashboardRoute,
 } as any)
-const LangAuthDashboardCliTokensRoute =
-  LangAuthDashboardCliTokensRouteImport.update({
-    id: '/cli-tokens',
-    path: '/cli-tokens',
+const LangAuthDashboardRelayMetadataRoute =
+  LangAuthDashboardRelayMetadataRouteImport.update({
+    id: '/relay-metadata',
+    path: '/relay-metadata',
     getParentRoute: () => LangAuthDashboardRoute,
   } as any)
-const LangAuthDashboardChatTestRoute =
-  LangAuthDashboardChatTestRouteImport.update({
-    id: '/chat-test',
-    path: '/chat-test',
-    getParentRoute: () => LangAuthDashboardRoute,
+const LangAuthSettingsIndexRoute = LangAuthSettingsIndexRouteImport.update({
+  id: '/',
+  path: '/',
+  getParentRoute: () => LangAuthSettingsRoute,
+} as any)
+const LangAuthSettingsSecurityRoute =
+  LangAuthSettingsSecurityRouteImport.update({
+    id: '/security',
+    path: '/security',
+    getParentRoute: () => LangAuthSettingsRoute,
   } as any)
 
 export interface FileRoutesByFullPath {
@@ -184,7 +178,6 @@ export interface FileRoutesByFullPath {
   '/$lang/settings': typeof LangAuthSettingsRouteWithChildren
   '/$lang/admin/devices': typeof LangAdminDevicesRoute
   '/$lang/admin/observability': typeof LangAdminObservabilityRoute
-  '/$lang/admin/seed': typeof LangAdminSeedRoute
   '/$lang/admin/settings': typeof LangAdminSettingsRoute
   '/$lang/admin/users': typeof LangAdminUsersRoute
   '/$lang/admin/': typeof LangAdminIndexRoute
@@ -207,7 +200,6 @@ export interface FileRoutesByTo {
   '/$lang/verify-email': typeof LangVerifyEmailRoute
   '/$lang/admin/devices': typeof LangAdminDevicesRoute
   '/$lang/admin/observability': typeof LangAdminObservabilityRoute
-  '/$lang/admin/seed': typeof LangAdminSeedRoute
   '/$lang/admin/settings': typeof LangAdminSettingsRoute
   '/$lang/admin/users': typeof LangAdminUsersRoute
   '/$lang/admin': typeof LangAdminIndexRoute
@@ -236,7 +228,6 @@ export interface FileRoutesById {
   '/$lang/_auth/settings': typeof LangAuthSettingsRouteWithChildren
   '/$lang/admin/devices': typeof LangAdminDevicesRoute
   '/$lang/admin/observability': typeof LangAdminObservabilityRoute
-  '/$lang/admin/seed': typeof LangAdminSeedRoute
   '/$lang/admin/settings': typeof LangAdminSettingsRoute
   '/$lang/admin/users': typeof LangAdminUsersRoute
   '/$lang/admin/': typeof LangAdminIndexRoute
@@ -265,7 +256,6 @@ export interface FileRouteTypes {
     | '/$lang/settings'
     | '/$lang/admin/devices'
     | '/$lang/admin/observability'
-    | '/$lang/admin/seed'
     | '/$lang/admin/settings'
     | '/$lang/admin/users'
     | '/$lang/admin/'
@@ -288,7 +278,6 @@ export interface FileRouteTypes {
     | '/$lang/verify-email'
     | '/$lang/admin/devices'
     | '/$lang/admin/observability'
-    | '/$lang/admin/seed'
     | '/$lang/admin/settings'
     | '/$lang/admin/users'
     | '/$lang/admin'
@@ -316,7 +305,6 @@ export interface FileRouteTypes {
     | '/$lang/_auth/settings'
     | '/$lang/admin/devices'
     | '/$lang/admin/observability'
-    | '/$lang/admin/seed'
     | '/$lang/admin/settings'
     | '/$lang/admin/users'
     | '/$lang/admin/'
@@ -338,18 +326,18 @@ export interface RootRouteChildren {
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/$lang': {
-      id: '/$lang'
-      path: '/$lang'
-      fullPath: '/$lang'
-      preLoaderRoute: typeof LangRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/': {
       id: '/'
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/$lang': {
+      id: '/$lang'
+      path: '/$lang'
+      fullPath: '/$lang'
+      preLoaderRoute: typeof LangRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/$lang/': {
@@ -359,32 +347,11 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LangIndexRouteImport
       parentRoute: typeof LangRoute
     }
-    '/$lang/verify-email': {
-      id: '/$lang/verify-email'
-      path: '/verify-email'
-      fullPath: '/$lang/verify-email'
-      preLoaderRoute: typeof LangVerifyEmailRouteImport
-      parentRoute: typeof LangRoute
-    }
-    '/$lang/signup': {
-      id: '/$lang/signup'
-      path: '/signup'
-      fullPath: '/$lang/signup'
-      preLoaderRoute: typeof LangSignupRouteImport
-      parentRoute: typeof LangRoute
-    }
-    '/$lang/login': {
-      id: '/$lang/login'
-      path: '/login'
-      fullPath: '/$lang/login'
-      preLoaderRoute: typeof LangLoginRouteImport
-      parentRoute: typeof LangRoute
-    }
-    '/$lang/device': {
-      id: '/$lang/device'
-      path: '/device'
-      fullPath: '/$lang/device'
-      preLoaderRoute: typeof LangDeviceRouteImport
+    '/$lang/_auth': {
+      id: '/$lang/_auth'
+      path: ''
+      fullPath: '/$lang'
+      preLoaderRoute: typeof LangAuthRouteImport
       parentRoute: typeof LangRoute
     }
     '/$lang/admin': {
@@ -394,46 +361,53 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LangAdminRouteImport
       parentRoute: typeof LangRoute
     }
-    '/$lang/_auth': {
-      id: '/$lang/_auth'
-      path: ''
-      fullPath: '/$lang'
-      preLoaderRoute: typeof LangAuthRouteImport
+    '/$lang/device': {
+      id: '/$lang/device'
+      path: '/device'
+      fullPath: '/$lang/device'
+      preLoaderRoute: typeof LangDeviceRouteImport
       parentRoute: typeof LangRoute
+    }
+    '/$lang/login': {
+      id: '/$lang/login'
+      path: '/login'
+      fullPath: '/$lang/login'
+      preLoaderRoute: typeof LangLoginRouteImport
+      parentRoute: typeof LangRoute
+    }
+    '/$lang/signup': {
+      id: '/$lang/signup'
+      path: '/signup'
+      fullPath: '/$lang/signup'
+      preLoaderRoute: typeof LangSignupRouteImport
+      parentRoute: typeof LangRoute
+    }
+    '/$lang/verify-email': {
+      id: '/$lang/verify-email'
+      path: '/verify-email'
+      fullPath: '/$lang/verify-email'
+      preLoaderRoute: typeof LangVerifyEmailRouteImport
+      parentRoute: typeof LangRoute
+    }
+    '/$lang/_auth/dashboard': {
+      id: '/$lang/_auth/dashboard'
+      path: '/dashboard'
+      fullPath: '/$lang/dashboard'
+      preLoaderRoute: typeof LangAuthDashboardRouteImport
+      parentRoute: typeof LangAuthRoute
+    }
+    '/$lang/_auth/settings': {
+      id: '/$lang/_auth/settings'
+      path: '/settings'
+      fullPath: '/$lang/settings'
+      preLoaderRoute: typeof LangAuthSettingsRouteImport
+      parentRoute: typeof LangAuthRoute
     }
     '/$lang/admin/': {
       id: '/$lang/admin/'
       path: '/'
       fullPath: '/$lang/admin/'
       preLoaderRoute: typeof LangAdminIndexRouteImport
-      parentRoute: typeof LangAdminRoute
-    }
-    '/$lang/admin/users': {
-      id: '/$lang/admin/users'
-      path: '/users'
-      fullPath: '/$lang/admin/users'
-      preLoaderRoute: typeof LangAdminUsersRouteImport
-      parentRoute: typeof LangAdminRoute
-    }
-    '/$lang/admin/settings': {
-      id: '/$lang/admin/settings'
-      path: '/settings'
-      fullPath: '/$lang/admin/settings'
-      preLoaderRoute: typeof LangAdminSettingsRouteImport
-      parentRoute: typeof LangAdminRoute
-    }
-    '/$lang/admin/seed': {
-      id: '/$lang/admin/seed'
-      path: '/seed'
-      fullPath: '/$lang/admin/seed'
-      preLoaderRoute: typeof LangAdminSeedRouteImport
-      parentRoute: typeof LangAdminRoute
-    }
-    '/$lang/admin/observability': {
-      id: '/$lang/admin/observability'
-      path: '/observability'
-      fullPath: '/$lang/admin/observability'
-      preLoaderRoute: typeof LangAdminObservabilityRouteImport
       parentRoute: typeof LangAdminRoute
     }
     '/$lang/admin/devices': {
@@ -443,26 +417,26 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LangAdminDevicesRouteImport
       parentRoute: typeof LangAdminRoute
     }
-    '/$lang/_auth/settings': {
-      id: '/$lang/_auth/settings'
+    '/$lang/admin/observability': {
+      id: '/$lang/admin/observability'
+      path: '/observability'
+      fullPath: '/$lang/admin/observability'
+      preLoaderRoute: typeof LangAdminObservabilityRouteImport
+      parentRoute: typeof LangAdminRoute
+    }
+    '/$lang/admin/settings': {
+      id: '/$lang/admin/settings'
       path: '/settings'
-      fullPath: '/$lang/settings'
-      preLoaderRoute: typeof LangAuthSettingsRouteImport
-      parentRoute: typeof LangAuthRoute
+      fullPath: '/$lang/admin/settings'
+      preLoaderRoute: typeof LangAdminSettingsRouteImport
+      parentRoute: typeof LangAdminRoute
     }
-    '/$lang/_auth/dashboard': {
-      id: '/$lang/_auth/dashboard'
-      path: '/dashboard'
-      fullPath: '/$lang/dashboard'
-      preLoaderRoute: typeof LangAuthDashboardRouteImport
-      parentRoute: typeof LangAuthRoute
-    }
-    '/$lang/_auth/settings/': {
-      id: '/$lang/_auth/settings/'
-      path: '/'
-      fullPath: '/$lang/settings/'
-      preLoaderRoute: typeof LangAuthSettingsIndexRouteImport
-      parentRoute: typeof LangAuthSettingsRoute
+    '/$lang/admin/users': {
+      id: '/$lang/admin/users'
+      path: '/users'
+      fullPath: '/$lang/admin/users'
+      preLoaderRoute: typeof LangAdminUsersRouteImport
+      parentRoute: typeof LangAdminRoute
     }
     '/$lang/_auth/dashboard/': {
       id: '/$lang/_auth/dashboard/'
@@ -471,39 +445,11 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LangAuthDashboardIndexRouteImport
       parentRoute: typeof LangAuthDashboardRoute
     }
-    '/$lang/_auth/settings/security': {
-      id: '/$lang/_auth/settings/security'
-      path: '/security'
-      fullPath: '/$lang/settings/security'
-      preLoaderRoute: typeof LangAuthSettingsSecurityRouteImport
-      parentRoute: typeof LangAuthSettingsRoute
-    }
-    '/$lang/_auth/dashboard/relay-metadata': {
-      id: '/$lang/_auth/dashboard/relay-metadata'
-      path: '/relay-metadata'
-      fullPath: '/$lang/dashboard/relay-metadata'
-      preLoaderRoute: typeof LangAuthDashboardRelayMetadataRouteImport
-      parentRoute: typeof LangAuthDashboardRoute
-    }
-    '/$lang/_auth/dashboard/pools': {
-      id: '/$lang/_auth/dashboard/pools'
-      path: '/pools'
-      fullPath: '/$lang/dashboard/pools'
-      preLoaderRoute: typeof LangAuthDashboardPoolsRouteImport
-      parentRoute: typeof LangAuthDashboardRoute
-    }
-    '/$lang/_auth/dashboard/model-api-tokens': {
-      id: '/$lang/_auth/dashboard/model-api-tokens'
-      path: '/model-api-tokens'
-      fullPath: '/$lang/dashboard/model-api-tokens'
-      preLoaderRoute: typeof LangAuthDashboardModelApiTokensRouteImport
-      parentRoute: typeof LangAuthDashboardRoute
-    }
-    '/$lang/_auth/dashboard/clis': {
-      id: '/$lang/_auth/dashboard/clis'
-      path: '/clis'
-      fullPath: '/$lang/dashboard/clis'
-      preLoaderRoute: typeof LangAuthDashboardClisRouteImport
+    '/$lang/_auth/dashboard/chat-test': {
+      id: '/$lang/_auth/dashboard/chat-test'
+      path: '/chat-test'
+      fullPath: '/$lang/dashboard/chat-test'
+      preLoaderRoute: typeof LangAuthDashboardChatTestRouteImport
       parentRoute: typeof LangAuthDashboardRoute
     }
     '/$lang/_auth/dashboard/cli-tokens': {
@@ -513,12 +459,47 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LangAuthDashboardCliTokensRouteImport
       parentRoute: typeof LangAuthDashboardRoute
     }
-    '/$lang/_auth/dashboard/chat-test': {
-      id: '/$lang/_auth/dashboard/chat-test'
-      path: '/chat-test'
-      fullPath: '/$lang/dashboard/chat-test'
-      preLoaderRoute: typeof LangAuthDashboardChatTestRouteImport
+    '/$lang/_auth/dashboard/clis': {
+      id: '/$lang/_auth/dashboard/clis'
+      path: '/clis'
+      fullPath: '/$lang/dashboard/clis'
+      preLoaderRoute: typeof LangAuthDashboardClisRouteImport
       parentRoute: typeof LangAuthDashboardRoute
+    }
+    '/$lang/_auth/dashboard/model-api-tokens': {
+      id: '/$lang/_auth/dashboard/model-api-tokens'
+      path: '/model-api-tokens'
+      fullPath: '/$lang/dashboard/model-api-tokens'
+      preLoaderRoute: typeof LangAuthDashboardModelApiTokensRouteImport
+      parentRoute: typeof LangAuthDashboardRoute
+    }
+    '/$lang/_auth/dashboard/pools': {
+      id: '/$lang/_auth/dashboard/pools'
+      path: '/pools'
+      fullPath: '/$lang/dashboard/pools'
+      preLoaderRoute: typeof LangAuthDashboardPoolsRouteImport
+      parentRoute: typeof LangAuthDashboardRoute
+    }
+    '/$lang/_auth/dashboard/relay-metadata': {
+      id: '/$lang/_auth/dashboard/relay-metadata'
+      path: '/relay-metadata'
+      fullPath: '/$lang/dashboard/relay-metadata'
+      preLoaderRoute: typeof LangAuthDashboardRelayMetadataRouteImport
+      parentRoute: typeof LangAuthDashboardRoute
+    }
+    '/$lang/_auth/settings/': {
+      id: '/$lang/_auth/settings/'
+      path: '/'
+      fullPath: '/$lang/settings/'
+      preLoaderRoute: typeof LangAuthSettingsIndexRouteImport
+      parentRoute: typeof LangAuthSettingsRoute
+    }
+    '/$lang/_auth/settings/security': {
+      id: '/$lang/_auth/settings/security'
+      path: '/security'
+      fullPath: '/$lang/settings/security'
+      preLoaderRoute: typeof LangAuthSettingsSecurityRouteImport
+      parentRoute: typeof LangAuthSettingsRoute
     }
   }
 }
@@ -576,7 +557,6 @@ const LangAuthRouteWithChildren = LangAuthRoute._addFileChildren(
 interface LangAdminRouteChildren {
   LangAdminDevicesRoute: typeof LangAdminDevicesRoute
   LangAdminObservabilityRoute: typeof LangAdminObservabilityRoute
-  LangAdminSeedRoute: typeof LangAdminSeedRoute
   LangAdminSettingsRoute: typeof LangAdminSettingsRoute
   LangAdminUsersRoute: typeof LangAdminUsersRoute
   LangAdminIndexRoute: typeof LangAdminIndexRoute
@@ -585,7 +565,6 @@ interface LangAdminRouteChildren {
 const LangAdminRouteChildren: LangAdminRouteChildren = {
   LangAdminDevicesRoute: LangAdminDevicesRoute,
   LangAdminObservabilityRoute: LangAdminObservabilityRoute,
-  LangAdminSeedRoute: LangAdminSeedRoute,
   LangAdminSettingsRoute: LangAdminSettingsRoute,
   LangAdminUsersRoute: LangAdminUsersRoute,
   LangAdminIndexRoute: LangAdminIndexRoute,

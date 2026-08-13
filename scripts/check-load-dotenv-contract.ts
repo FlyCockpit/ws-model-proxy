@@ -43,12 +43,6 @@ const checks: Check[] = [
   },
   {
     kind: "contains",
-    label: "db seed CLI entry must load root .env",
-    file: "packages/db/prisma/seed.cli.ts",
-    needle: LOAD_DOTENV,
-  },
-  {
-    kind: "contains",
     label: "Prisma config entry must call loadRootDotenv from root-dotenv",
     file: "packages/db/prisma.config.ts",
     needle: ROOT_DOTENV,

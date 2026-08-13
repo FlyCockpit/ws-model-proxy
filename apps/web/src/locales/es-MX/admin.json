@@ -29,8 +29,7 @@
     "users": "Usuarios",
     "devices": "Dispositivos",
     "observability": "Observabilidad",
-    "settings": "Configuracion",
-    "seed": "Seed"
+    "settings": "Configuracion"
   },
   "overview": {
     "title": "Admin",
@@ -138,30 +137,6 @@
       "VIDEO": "Video",
       "VISION": "Vision"
     }
-  },
-  "seedPage": {
-    "back": "Volver a admin",
-    "title": "Ejecutar seed de base de datos",
-    "description": "Ejecuta <0>runSeed()</0> desde <0>packages/db/prisma/seed.ts</0>, la misma funcion que llama <0>prisma db seed</0>. Esto es un mecanismo, no contenido: hace lo que haga tu script de seed.",
-    "emptyStubNote": "El script de seed incluido esta vacio, asi que no hace nada hasta que escribas la logica. Todo lo que agregues debe ser idempotente; este boton puede presionarse repetidamente.",
-    "runTitle": "Ejecutar seed",
-    "runButton": "Ejecutar seed...",
-    "running": "Ejecutando seed...",
-    "prodWarningTitle": "Entorno de produccion",
-    "prodWarningBody": "Este servidor esta ejecutandose en produccion. El seed escribe directamente en la base de datos real y no se puede deshacer. Se requiere una frase de confirmacion mas estricta.",
-    "confirmTitle": "Ejecutar el seed?",
-    "confirmDescription": "Esto ejecuta tu script de seed contra la base de datos actual. Asegurate de que sea idempotente antes de continuar.",
-    "confirmDescriptionProd": "PRODUCCION: esto ejecuta tu script de seed contra la base de datos real y no se puede deshacer. Continua solo si sabes que el seed es idempotente y seguro.",
-    "typePrompt": "Escribe la frase de abajo para confirmar",
-    "copyAria": "Copiar frase de confirmacion",
-    "confirmCta": "Ejecutar seed",
-    "confirmPending": "Iniciando...",
-    "completeToast": "Seed completo",
-    "enqueueFailed": "No se pudo iniciar el seed.",
-    "loadInfoFailed": "No se pudo cargar la configuracion del seed.",
-    "jobCompleteTitle": "Seed completo",
-    "jobDuration": "Termino en {{ms}} ms",
-    "jobEmpty": "El seed no devolvio lineas de resumen."
   },
   "settings": {
     "title": "Configuracion",

@@ -23,7 +23,6 @@
     "dev:server": "turbo -F server dev",
     "db:push": "turbo -F @ws-model-proxy/db db:push",
     "db:push:dangerous": "turbo -F @ws-model-proxy/db db:push:dangerous",
-    "db:seed": "turbo -F @ws-model-proxy/db db:seed",
     "db:studio": "turbo -F @ws-model-proxy/db db:studio",
     "db:generate": "turbo -F @ws-model-proxy/db db:generate",
     "db:validate": "turbo -F @ws-model-proxy/db db:validate",

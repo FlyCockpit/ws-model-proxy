@@ -3,7 +3,7 @@
 //
 // packages/env validation modules (shared, server, web) only read process.env.
 // They never import this file. Call this from process entrypoints BEFORE any
-// import that validates env (server boot, Vite config, seeds, scripts, vitest
+// import that validates env (server boot, Vite config, scripts, vitest
 // setup). See scripts/check-load-dotenv-contract.ts for the enforced list.
 //
 // Pure helpers live in ./root-dotenv.ts — import those when you need

@@ -11,7 +11,6 @@ import { devicesRouter } from "./devices";
 import { forwarderManagementRouter } from "./forwarder-management";
 import { modelApiTokensRouter } from "./model-api-tokens";
 import { relayMetadataRouter } from "./relay-metadata";
-import { seedRouter } from "./seed";
 import { settingsRouter } from "./settings";
 import { usersRouter } from "./users";
 
@@ -49,7 +48,6 @@ export const appRouter = {
   auth: authRouter,
   adminObservability: adminObservabilityRouter,
   settings: settingsRouter,
-  seed: seedRouter,
   devices: devicesRouter,
   forwarderManagement: forwarderManagementRouter,
   cliCredentials: cliCredentialsRouter,

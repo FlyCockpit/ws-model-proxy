@@ -8,7 +8,7 @@ import {
   CardTitle,
 } from "@ws-model-proxy/ui/components/card";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { Activity, Database, Settings, Smartphone, Users } from "lucide-react";
+import { Activity, Settings, Smartphone, Users } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 export const Route = createFileRoute("/$lang/admin/")({
@@ -39,12 +39,6 @@ const ADMIN_LINKS = [
     labelKey: "admin:nav.settings",
     descriptionKey: "admin:settings.description",
     icon: Settings,
-  },
-  {
-    to: "/$lang/admin/seed",
-    labelKey: "admin:nav.seed",
-    descriptionKey: "admin:seedPage.emptyStubNote",
-    icon: Database,
   },
 ] as const;
 

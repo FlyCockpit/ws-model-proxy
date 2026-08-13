@@ -3,7 +3,6 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { I18nextProvider, Trans } from "react-i18next";
 import { beforeAll, describe, expect, it } from "vitest";
 
-import enAdmin from "../locales/en-US/admin.json";
 import enAuth from "../locales/en-US/auth.json";
 
 /**
@@ -24,10 +23,10 @@ describe("<Trans> components-prop rendering", () => {
     await i18n.init({
       lng: "en-US",
       fallbackLng: "en-US",
-      ns: ["admin", "auth"],
-      defaultNS: "admin",
+      ns: ["auth"],
+      defaultNS: "auth",
       resources: {
-        "en-US": { admin: enAdmin, auth: enAuth },
+        "en-US": { auth: enAuth },
       },
       interpolation: { escapeValue: false },
       react: { useSuspense: false },
@@ -37,16 +36,6 @@ describe("<Trans> components-prop rendering", () => {
   function renderTrans(node: React.ReactElement): string {
     return renderToStaticMarkup(<I18nextProvider i18n={i18n}>{node}</I18nextProvider>);
   }
-
-  it("renders seedPage.description with each code placeholder wrapped", () => {
-    const html = renderTrans(
-      <Trans i18nKey="seedPage.description" ns="admin" components={[<code key="0" />]} />,
-    );
-
-    expect(html).toBe(
-      "Runs <code>runSeed()</code> from <code>packages/db/prisma/seed.ts</code> - the same function <code>prisma db seed</code> calls. This is a mechanism, not content: it does whatever your seed script does.",
-    );
-  });
 
   it("renders device.enterCodeDescription with the user_code wrapped in <code>", () => {
     const html = renderTrans(
