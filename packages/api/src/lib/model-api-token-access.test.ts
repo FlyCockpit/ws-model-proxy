@@ -66,6 +66,7 @@ function modelPoolRow({
     slug,
     name,
     description: null,
+    maxAttachmentBytes: null,
     User: { slug: userSlug },
   };
 }
@@ -91,6 +92,7 @@ function directModelRow({
     id,
     userId,
     upstreamModelId,
+    maxAttachmentBytes: null,
     User: { slug: userSlug },
     Endpoint: {
       id: endpointId,
@@ -403,6 +405,7 @@ describe("modelApiTokenAccess", () => {
           endpointId: "endpoint-id",
           endpointSlug: "local",
           cliDeviceSlug: "desktop",
+          maxAttachmentBytes: null,
         },
       ]);
       expect(result.directModels[0]?.modelId).toContain("org%2Fmodel%2520%20with%20spaces%3A");

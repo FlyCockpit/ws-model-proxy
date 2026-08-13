@@ -367,4 +367,48 @@ describe("settingsRouter", () => {
       expect(db.appSetting.upsert).not.toHaveBeenCalled();
     });
   });
+
+  describe("update (mediaAttachmentMaxBytes)", () => {
+    it("stores the admin attachment limit as a clamped byte value", async () => {
+      db.appSetting.upsert.mockResolvedValue({});
+      const client = createRouterClient(settingsRouter, {
+        context: buildContext({ user: { role: "admin" } }),
+      });
+
+      await expect(
+        client.update({ key: "mediaAttachmentMaxBytes", value: 8 * 1024 * 1024 }),
+      ).resolves.toEqual({
+        success: true,
+      });
+      expect(db.appSetting.upsert).toHaveBeenCalledWith({
+        where: { key: "mediaAttachmentMaxBytes" },
+        update: { value: String(8 * 1024 * 1024) },
+        create: { key: "mediaAttachmentMaxBytes", value: String(8 * 1024 * 1024) },
+      });
+    });
+
+    it("clamps a too-small admin attachment limit to 256 KiB", async () => {
+      db.appSetting.upsert.mockResolvedValue({});
+      const client = createRouterClient(settingsRouter, {
+        context: buildContext({ user: { role: "admin" } }),
+      });
+
+      await client.update({ key: "mediaAttachmentMaxBytes", value: 1 });
+      expect(db.appSetting.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({ update: { value: String(256 * 1024) } }),
+      );
+    });
+
+    it("does not expose attachment-limit updates to non-admin users", async () => {
+      const client = createRouterClient(settingsRouter, { context: buildContext() });
+
+      await expect(
+        client.update({ key: "mediaAttachmentMaxBytes", value: 1024 * 1024 }),
+      ).rejects.toSatisfy((error: ORPCError) => {
+        expect(error.code).toBe("NOT_FOUND");
+        return true;
+      });
+      expect(db.appSetting.upsert).not.toHaveBeenCalled();
+    });
+  });
 });

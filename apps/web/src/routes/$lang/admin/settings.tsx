@@ -1,6 +1,10 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
+import {
+  MEDIA_ATTACHMENT_MAX_BYTES_MAX,
+  MEDIA_ATTACHMENT_MAX_BYTES_MIN,
+} from "@ws-model-proxy/config/media-policy";
 import { env } from "@ws-model-proxy/env/web";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
@@ -35,6 +39,11 @@ export const Route = createFileRoute("/$lang/admin/settings")({
 type MediaAdminStats = {
   uploadEnabled: boolean;
   ttl: { hours: number; min: number; max: number; default: number };
+  attachmentLimit: {
+    configuredBytes: number;
+    effectiveBytes: number;
+    deploymentMaxBytes: number | null;
+  };
   stats: { assetCount: number; totalBytes: number; expiredCount: number };
 };
 
@@ -281,8 +290,9 @@ function MediaPolicyCard({ data }: { data: MediaAdminStats }) {
     onError: () => toast.error(t("admin:settings.media.actionFailed")),
   });
 
-  const { ttl, stats } = data;
+  const { attachmentLimit, stats, ttl } = data;
   const ttlFieldId = useId();
+  const attachmentLimitFieldId = useId();
 
   const ttlForm = useForm({
     defaultValues: { hours: String(ttl.hours) },
@@ -310,6 +320,37 @@ function MediaPolicyCard({ data }: { data: MediaAdminStats }) {
     },
   });
 
+  const attachmentLimitForm = useForm({
+    defaultValues: { bytes: String(attachmentLimit.configuredBytes) },
+    validators: {
+      onChange: z.object({
+        bytes: z
+          .string()
+          .refine((v) => /^\d+$/.test(v.trim()), t("admin:settings.media.attachmentLimitInvalid"))
+          .refine(
+            (v) => Number(v) >= MEDIA_ATTACHMENT_MAX_BYTES_MIN,
+            t("admin:settings.media.attachmentLimitMinimum", {
+              min: formatBytes(MEDIA_ATTACHMENT_MAX_BYTES_MIN),
+            }),
+          )
+          .refine(
+            (v) => Number(v) <= MEDIA_ATTACHMENT_MAX_BYTES_MAX,
+            t("admin:settings.media.attachmentLimitMaximum", {
+              max: formatBytes(MEDIA_ATTACHMENT_MAX_BYTES_MAX),
+            }),
+          ),
+      }),
+    },
+    onSubmit: ({ value }) => {
+      updateTtl.mutate(
+        { key: "mediaAttachmentMaxBytes", value: Number(value.bytes) },
+        {
+          onSuccess: () => toast.success(t("admin:settings.media.attachmentLimitSavedToast")),
+        },
+      );
+    },
+  });
+
   const actionsDisabled = !data.uploadEnabled;
 
   return (
@@ -332,6 +373,60 @@ function MediaPolicyCard({ data }: { data: MediaAdminStats }) {
                 : t("admin:settings.media.uploadStatusDisabled")}
             </p>
           </div>
+        </div>
+
+        <div className="space-y-3 rounded-lg border p-4">
+          <div className="space-y-1">
+            <p className="font-medium">{t("admin:settings.media.attachmentLimitTitle")}</p>
+            <p className="text-sm text-muted-foreground">
+              {t("admin:settings.media.attachmentLimitDescription")}
+            </p>
+            <p className="text-sm text-muted-foreground">
+              {attachmentLimit.deploymentMaxBytes === null
+                ? t("admin:settings.media.attachmentLimitNoDeploymentCap")
+                : t("admin:settings.media.attachmentLimitDeploymentCap", {
+                    max: formatBytes(attachmentLimit.deploymentMaxBytes),
+                  })}
+            </p>
+            <p className="text-sm text-muted-foreground">
+              {t("admin:settings.media.attachmentLimitEffective", {
+                max: formatBytes(attachmentLimit.effectiveBytes),
+              })}
+            </p>
+          </div>
+          <form
+            className="flex flex-wrap items-start gap-3"
+            onSubmit={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              void attachmentLimitForm.handleSubmit();
+            }}
+          >
+            <attachmentLimitForm.Field name="bytes">
+              {(field) => (
+                <div className="space-y-1">
+                  <Label htmlFor={attachmentLimitFieldId} className="sr-only">
+                    {t("admin:settings.media.attachmentLimitTitle")}
+                  </Label>
+                  <Input
+                    id={attachmentLimitFieldId}
+                    className="min-h-[44px] w-40"
+                    type="number"
+                    inputMode="numeric"
+                    min={MEDIA_ATTACHMENT_MAX_BYTES_MIN}
+                    max={MEDIA_ATTACHMENT_MAX_BYTES_MAX}
+                    value={field.state.value}
+                    onBlur={field.handleBlur}
+                    onChange={(e) => field.handleChange(e.target.value)}
+                  />
+                  <FieldErrors field={field} />
+                </div>
+              )}
+            </attachmentLimitForm.Field>
+            <Button type="submit" className="min-h-[44px]" disabled={updateTtl.isPending}>
+              {updateTtl.isPending ? t("admin:settings.updating") : t("common:actions.save")}
+            </Button>
+          </form>
         </div>
 
         {/* Editable TTL */}

@@ -31,6 +31,9 @@ const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x11, 0
 
 function fakePrisma() {
   return {
+    appSetting: {
+      findUnique: vi.fn().mockResolvedValue(null),
+    },
     mediaAsset: {
       findFirst: vi.fn(),
       findUnique: vi.fn(),
@@ -172,6 +175,29 @@ describe("POST /v1/files (upload)", () => {
     expect(body.url_expires_at).toBeLessThan(body.expires_at);
     // The bytes actually landed under the asset id.
     expect(await new LocalMediaStore(root).getStream(body.id)).not.toBeNull();
+  });
+
+  it("uses the configured admin cap when it is lower than the deployment ceiling", async () => {
+    const prisma = fakePrisma();
+    const app = new Hono();
+    app.post(
+      "/v1/files",
+      createModelApiFileUploadHandler({
+        authenticate: tokenFor("user-1"),
+        getAttachmentLimit: async () => PNG.length - 1,
+        getConfig: () => config,
+        getTtlHours: async () => 24,
+        prisma: prisma as never,
+      }),
+    );
+    const form = new FormData();
+    form.set("file", new Blob([PNG], { type: "image/png" }), "x.png");
+
+    const res = await app.request("/v1/files", { method: "POST", body: form, headers: bearer() });
+    expect(res.status).toBe(429);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("request_too_large");
+    expect(prisma.mediaAsset.create).not.toHaveBeenCalled();
   });
 
   it("reports the deduped asset's real created_at, not now", async () => {

@@ -24,6 +24,7 @@ export type VisibleDirectModelTarget = {
   endpointId: string;
   endpointSlug: string;
   cliDeviceSlug: string;
+  maxAttachmentBytes: number | null;
 };
 
 export type VisibleModelPoolTarget = {
@@ -35,6 +36,7 @@ export type VisibleModelPoolTarget = {
   ownerUserId: string;
   ownerUserSlug: string;
   poolSlug: string;
+  maxAttachmentBytes: number | null;
 };
 
 export type VisibleModelTargets = {
@@ -55,6 +57,7 @@ type DirectModelRow = {
   id: string;
   userId: string;
   upstreamModelId: string;
+  maxAttachmentBytes: number | null;
   User: { slug: string };
   Endpoint: {
     id: string;
@@ -69,6 +72,7 @@ type ModelPoolRow = {
   slug: string;
   name: string;
   description: string | null;
+  maxAttachmentBytes: number | null;
   User: { slug: string };
 };
 
@@ -98,6 +102,7 @@ function serializeDirectModel(row: DirectModelRow): VisibleDirectModelTarget {
     endpointId: row.Endpoint.id,
     endpointSlug: row.Endpoint.slug,
     cliDeviceSlug: row.Endpoint.CliDevice.slug,
+    maxAttachmentBytes: row.maxAttachmentBytes,
   };
 }
 
@@ -111,6 +116,7 @@ function serializeModelPool(row: ModelPoolRow): VisibleModelPoolTarget {
     ownerUserId: row.userId,
     ownerUserSlug: row.User.slug,
     poolSlug: row.slug,
+    maxAttachmentBytes: row.maxAttachmentBytes,
   };
 }
 
@@ -134,6 +140,7 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
         id: true,
         userId: true,
         upstreamModelId: true,
+        maxAttachmentBytes: true,
         User: { select: { slug: true } },
         Endpoint: {
           select: {
@@ -153,6 +160,7 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
         slug: true,
         name: true,
         description: true,
+        maxAttachmentBytes: true,
         User: { select: { slug: true } },
       },
     }),
@@ -167,6 +175,7 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
             slug: true,
             name: true,
             description: true,
+            maxAttachmentBytes: true,
             User: { select: { slug: true } },
           },
         },

@@ -30,6 +30,9 @@ const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x11, 0
 
 function fakePrisma() {
   return {
+    appSetting: {
+      findUnique: vi.fn().mockResolvedValue(null),
+    },
     mediaAsset: {
       findFirst: vi.fn(),
       findMany: vi.fn(),
@@ -75,27 +78,72 @@ afterEach(async () => {
 describe("GET /api/internal/media/config (capability discovery)", () => {
   it("returns 401 when unauthenticated", async () => {
     const app = withSession(new Hono<{ Variables: { session: unknown } }>(), null);
-    app.get("/api/internal/media/config", createMediaConfigHandler({ getConfig: () => config }));
+    app.get(
+      "/api/internal/media/config",
+      createMediaConfigHandler({
+        getConfig: () => config,
+        getAttachmentLimit: async () => config.maxUploadBytes,
+      }),
+    );
     const res = await app.request("/api/internal/media/config");
     expect(res.status).toBe(401);
   });
 
   it("reports enabled + maxUploadBytes when storage is configured", async () => {
     const app = withSession(new Hono<{ Variables: { session: unknown } }>(), "user-1");
-    app.get("/api/internal/media/config", createMediaConfigHandler({ getConfig: () => config }));
+    app.get(
+      "/api/internal/media/config",
+      createMediaConfigHandler({
+        getConfig: () => config,
+        getAttachmentLimit: async () => config.maxUploadBytes,
+      }),
+    );
     const res = await app.request("/api/internal/media/config");
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { enabled: boolean; maxUploadBytes: number };
-    expect(body).toEqual({ enabled: true, maxUploadBytes: config.maxUploadBytes });
+    const body = (await res.json()) as {
+      enabled: boolean;
+      maxUploadBytes: number;
+      maxAttachmentBytes: number;
+    };
+    expect(body).toEqual({
+      enabled: true,
+      maxUploadBytes: config.maxUploadBytes,
+      maxAttachmentBytes: config.maxUploadBytes,
+    });
+  });
+
+  it("reports the lower admin policy cap when it is below the deployment ceiling", async () => {
+    const app = withSession(new Hono<{ Variables: { session: unknown } }>(), "user-1");
+    app.get(
+      "/api/internal/media/config",
+      createMediaConfigHandler({ getConfig: () => config, getAttachmentLimit: async () => 1024 }),
+    );
+
+    const res = await app.request("/api/internal/media/config");
+    expect(await res.json()).toEqual({
+      enabled: true,
+      maxUploadBytes: 1024,
+      maxAttachmentBytes: 1024,
+    });
   });
 
   it("reports disabled when storage is not configured", async () => {
     const app = withSession(new Hono<{ Variables: { session: unknown } }>(), "user-1");
-    app.get("/api/internal/media/config", createMediaConfigHandler({ getConfig: () => null }));
+    app.get(
+      "/api/internal/media/config",
+      createMediaConfigHandler({
+        getConfig: () => null,
+        getConfiguredAttachmentLimit: async () => 123,
+      }),
+    );
     const res = await app.request("/api/internal/media/config");
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { enabled: boolean; maxUploadBytes: number };
-    expect(body).toEqual({ enabled: false, maxUploadBytes: 0 });
+    const body = (await res.json()) as {
+      enabled: boolean;
+      maxUploadBytes: number;
+      maxAttachmentBytes: number;
+    };
+    expect(body).toEqual({ enabled: false, maxUploadBytes: 0, maxAttachmentBytes: 123 });
   });
 });
 
@@ -151,6 +199,27 @@ describe("POST /api/internal/media (upload)", () => {
     const body = (await res.json()) as { id: string; expiresAt: string };
     expect(body.id).toBe("asset-up");
     expect(new Date(body.expiresAt).getTime()).toBe(NOW + 24 * 60 * 60 * 1000);
+  });
+
+  it("returns 413 when the configured admin cap is lower than the deployment ceiling", async () => {
+    const prisma = fakePrisma();
+    const app = withSession(new Hono<{ Variables: { session: unknown } }>(), "user-1");
+    app.post(
+      "/api/internal/media",
+      createMediaUploadHandler({
+        getConfig: () => config,
+        getAttachmentLimit: async () => PNG.length - 1,
+        getTtlHours: async () => 24,
+        prisma: prisma as never,
+      }),
+    );
+    const form = new FormData();
+    form.set("file", new Blob([PNG], { type: "image/png" }), "x.png");
+
+    const res = await app.request("/api/internal/media", { method: "POST", body: form });
+    expect(res.status).toBe(413);
+    expect(await res.json()).toEqual({ error: "Upload is too large.", maxBytes: PNG.length - 1 });
+    expect(prisma.mediaAsset.create).not.toHaveBeenCalled();
   });
 
   it("returns 413 with code media_quota_exceeded when over the per-user quota", async () => {
@@ -400,6 +469,41 @@ describe("GET /api/internal/media/admin/stats", () => {
     expect(body.stats).toEqual({ assetCount: 5, totalBytes: 2048, expiredCount: 1 });
     // The response must never leak ids/owners/urls.
     expect(JSON.stringify(body)).not.toContain("url");
+  });
+
+  it("reports configured and effective attachment caps separately", async () => {
+    const prisma = fakePrisma();
+    prisma.mediaAsset.aggregate.mockResolvedValue({
+      _count: { _all: 0 },
+      _sum: { sizeBytes: 0 },
+    });
+    prisma.mediaAsset.count.mockResolvedValue(0);
+    const app = new Hono();
+    app.get(
+      "/api/internal/media/admin/stats",
+      createMediaAdminStatsHandler({
+        getAttachmentLimit: async () => 8 * 1024 * 1024,
+        getConfig: () => config,
+        getConfiguredAttachmentLimit: async () => 32 * 1024 * 1024,
+        getTtlHours: async () => 24,
+        now: () => NOW,
+        prisma: prisma as never,
+      }),
+    );
+
+    const response = await app.request("/api/internal/media/admin/stats");
+    const body = (await response.json()) as {
+      attachmentLimit: {
+        configuredBytes: number;
+        effectiveBytes: number;
+        deploymentMaxBytes: number | null;
+      };
+    };
+    expect(body.attachmentLimit).toEqual({
+      configuredBytes: 32 * 1024 * 1024,
+      effectiveBytes: 8 * 1024 * 1024,
+      deploymentMaxBytes: config.maxUploadBytes,
+    });
   });
 
   it("reports uploadEnabled=false when storage is not configured", async () => {

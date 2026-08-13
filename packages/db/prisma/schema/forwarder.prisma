@@ -208,6 +208,8 @@ model DiscoveredModel {
   capabilityOverrides           ModelCapability[]              @default([])
   capabilityOverrideMetadata    Json?
   capabilityOverrideOrigin      ModelCapabilityOverrideOrigin?
+  /// Optional per-model attachment cap. Null inherits the global attachment cap.
+  maxAttachmentBytes            Int?
   probeSuggestions              Json?
   lastSeenAt                    DateTime?
   published                     Boolean                        @default(true)
@@ -259,6 +261,8 @@ model ModelPool {
   transformerTimeoutMs           Int?
   /// Max media parts across all transform jobs in one request. Null uses the server default.
   transformerMaxAssets           Int?
+  /// Optional per-pool attachment cap. Null inherits the global attachment cap.
+  maxAttachmentBytes             Int?
   User                           User                          @relation("ModelPoolOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   TransformerDiscoveredModel     DiscoveredModel?              @relation("ModelPoolTransformer", fields: [transformerDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   PoolMembers                    PoolMember[]

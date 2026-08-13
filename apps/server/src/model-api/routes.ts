@@ -1,4 +1,8 @@
 import {
+  getConfiguredMediaAttachmentMaxBytes,
+  resolveAttachmentLimit,
+} from "@ws-model-proxy/api/lib/media-attachment-limits";
+import {
   authenticateModelApiTokenSecret,
   listVisibleModelTargetsForToken,
   listVisibleModelTargetsForUser,
@@ -21,6 +25,7 @@ import { resolveEffectiveCapabilityMetadata } from "@ws-model-proxy/api/lib/open
 import prisma from "@ws-model-proxy/db";
 import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
 import { Hono } from "hono";
+import { getMediaConfig } from "../media/config.js";
 import { type OpenAiCompatibleCapabilities, type RelayFailure } from "../relay/protocol.js";
 import { type RelaySessionManager, relaySessionManager } from "../relay/session-manager.js";
 import {
@@ -381,6 +386,86 @@ function upstreamBody(payload: JsonObject, upstreamModelId: string): Uint8Array 
 
 function emptyBody(): Uint8Array {
   return new Uint8Array();
+}
+
+function dataUrlByteSize(value: string): number | null {
+  if (!value.startsWith("data:")) return null;
+  const comma = value.indexOf(",");
+  if (comma === -1) return null;
+  const header = value.slice(0, comma).toLowerCase();
+  const payload = value.slice(comma + 1);
+  if (!header.includes(";base64")) return new TextEncoder().encode(payload).byteLength;
+  const padding = payload.endsWith("==") ? 2 : payload.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((payload.length * 3) / 4) - padding);
+}
+
+function referencedMediaIds(value: unknown, ids: Set<string>, inlineSizes: number[]): void {
+  if (typeof value === "string") {
+    const dataSize = dataUrlByteSize(value);
+    if (dataSize !== null) inlineSizes.push(dataSize);
+    try {
+      const url = new URL(value);
+      const segments = url.pathname.split("/").filter(Boolean);
+      const mediaIndex = segments.findIndex(
+        (segment) => segment === "media" || segment === "files",
+      );
+      const id = mediaIndex === -1 ? null : segments[mediaIndex + 1];
+      if (id && /^[a-zA-Z0-9_-]+$/.test(id)) ids.add(id);
+    } catch {
+      // Non-URL strings (including ordinary message text) are not stored media.
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) referencedMediaIds(item, ids, inlineSizes);
+    return;
+  }
+  if (isJsonObject(value)) {
+    for (const child of Object.values(value)) referencedMediaIds(child, ids, inlineSizes);
+  }
+}
+
+async function attachmentLimitResponse({
+  payload,
+  requesterUserId,
+  modelOrPoolMaxBytes,
+}: {
+  payload: JsonObject | null;
+  requesterUserId: string;
+  modelOrPoolMaxBytes: number | null;
+}): Promise<Response | null> {
+  if (!payload) return null;
+  const mediaIds = new Set<string>();
+  const inlineSizes: number[] = [];
+  referencedMediaIds(payload, mediaIds, inlineSizes);
+  if (inlineSizes.length === 0 && mediaIds.size === 0) return null;
+  const maxBytes = resolveAttachmentLimit({
+    configuredBytes: await getConfiguredMediaAttachmentMaxBytes(),
+    deploymentMaxBytes: getMediaConfig()?.maxUploadBytes,
+    modelOrPoolMaxBytes,
+  });
+  if (inlineSizes.some((size) => size > maxBytes)) {
+    return openAiFailureJsonResponse(
+      "request_too_large",
+      `An attachment exceeds this model's ${maxBytes}-byte limit.`,
+    );
+  }
+  if (mediaIds.size === 0) return null;
+  const assets = await prisma.mediaAsset.findMany({
+    where: {
+      id: { in: [...mediaIds] },
+      userId: requesterUserId,
+      expiresAt: { gt: new Date() },
+    },
+    select: { id: true, sizeBytes: true },
+  });
+  if (assets.some((asset) => asset.sizeBytes > maxBytes)) {
+    return openAiFailureJsonResponse(
+      "request_too_large",
+      `An attachment exceeds this model's ${maxBytes}-byte limit.`,
+    );
+  }
+  return null;
 }
 
 function relayRequestHeaders(request: Request): Headers {
@@ -2290,6 +2375,12 @@ async function relayPreparedModeledRequest({
 }) {
   const directTarget = directTargetByModelId(targets.directModels, prepared.model);
   if (directTarget) {
+    const limitError = await attachmentLimitResponse({
+      payload: prepared.payload,
+      requesterUserId: requester.userId,
+      modelOrPoolMaxBytes: directTarget.maxAttachmentBytes,
+    });
+    if (limitError) return limitError;
     const relayOperation: RelayOperation = {
       ...operation,
       stream: prepared.stream,
@@ -2307,6 +2398,12 @@ async function relayPreparedModeledRequest({
 
   const poolTarget = poolTargetByModelId(targets.modelPools, prepared.model);
   if (poolTarget) {
+    const limitError = await attachmentLimitResponse({
+      payload: prepared.payload,
+      requesterUserId: requester.userId,
+      modelOrPoolMaxBytes: poolTarget.maxAttachmentBytes,
+    });
+    if (limitError) return limitError;
     const maybeTransformed = await maybeApplyPoolMediaTransformer({
       request,
       requester,

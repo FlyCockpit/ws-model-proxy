@@ -140,6 +140,7 @@ const directTarget: VisibleDirectModelTarget = {
   endpointId: "endpoint-id",
   endpointSlug: "local",
   cliDeviceSlug: "desk",
+  maxAttachmentBytes: null,
 };
 
 const poolTarget: VisibleModelPoolTarget = {
@@ -151,6 +152,7 @@ const poolTarget: VisibleModelPoolTarget = {
   ownerUserId: "user-id",
   ownerUserSlug: "owner",
   poolSlug: "general",
+  maxAttachmentBytes: null,
 };
 
 const session = {

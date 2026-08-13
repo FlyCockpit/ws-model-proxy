@@ -62,9 +62,9 @@ export const IMAGE_ENCODE_QUALITY = DEFAULT_IMAGE_ENCODE_QUALITY;
 /** Max number of images that may be attached to a single composer message. */
 export const MAX_ATTACHMENTS_PER_MESSAGE = 8;
 
-// Post-compression per-image cap (decoded binary bytes, i.e. excluding the
-// base64/data-URL overhead). Kept small because history re-sends each image.
-export const PER_IMAGE_MAX_BYTES = 2 * 1024 * 1024; // ~2 MB
+// Decoded-byte cap for the inline data-URL fallback. Kept small because every
+// prior inline attachment is re-sent with each chat turn.
+export const INLINE_ATTACHMENT_MAX_BYTES = 2 * 1024 * 1024; // ~2 MB
 
 // Soft warning threshold for the estimated total request body (JSON incl. all
 // base64 images across the whole thread). Warn as we approach the route limit.
@@ -101,6 +101,8 @@ export type ProcessImageOptions = {
    * WebP/GIF (e.g. cloud OpenAI-compatible APIs).
    */
   profile?: ImageInlineProfile;
+  /** Maximum decoded bytes for the inline fallback data URL. */
+  maxBytes?: number;
 };
 
 export function isAcceptedImageType(type: string): boolean {
@@ -246,6 +248,7 @@ export async function processImageFile(
   const sourceMime = fileInfo.mime;
 
   const profile = options.profile ?? DEFAULT_IMAGE_INLINE_PROFILE;
+  const maxBytes = options.maxBytes ?? INLINE_ATTACHMENT_MAX_BYTES;
   const objectUrl = URL.createObjectURL(file);
   try {
     const image = await decodeImage(objectUrl);
@@ -261,7 +264,7 @@ export async function processImageFile(
       height: naturalHeight,
       byteSize: file.size,
       maxEdge: MAX_IMAGE_EDGE,
-      maxBytes: PER_IMAGE_MAX_BYTES,
+      maxBytes,
       profile,
     });
 
@@ -269,7 +272,7 @@ export async function processImageFile(
       const dataUrl = await readFileAsDataUrl(file, sourceMime);
       const byteSize = dataUrlByteSize(dataUrl);
       // File size and decoded payload size can diverge; re-check before shipping.
-      if (byteSize <= PER_IMAGE_MAX_BYTES) {
+      if (byteSize <= maxBytes) {
         return {
           ok: true,
           image: { id: newAttachmentId(), dataUrl, name: file.name, byteSize },
@@ -283,8 +286,8 @@ export async function processImageFile(
     const mimes =
       decision.action === "reencode"
         ? decision.mimes
-        : reencodeMimeChain(sourceMime, file.size <= PER_IMAGE_MAX_BYTES);
-    const encoded = reencodeUntilFits(image, width, height, mimes, PER_IMAGE_MAX_BYTES);
+        : reencodeMimeChain(sourceMime, file.size <= maxBytes);
+    const encoded = reencodeUntilFits(image, width, height, mimes, maxBytes);
     if (!encoded) {
       return { ok: false, reason: "decodeFailed", name: file.name };
     }

@@ -285,6 +285,55 @@ function ModelCapabilityToggles({
   );
 }
 
+const MEBIBYTE = 1024 * 1024;
+
+function AttachmentLimitControl({
+  currentBytes,
+  disabled,
+  onSave,
+}: {
+  currentBytes: number | null;
+  disabled: boolean;
+  onSave: (maxAttachmentBytes: number | null) => void;
+}) {
+  const { t } = useTranslation(["common", "dashboard"]);
+  const [value, setValue] = useState(
+    currentBytes === null ? "" : String(Math.ceil(currentBytes / MEBIBYTE)),
+  );
+  const parsed = Number(value);
+  const valid = value.trim() === "" || (Number.isInteger(parsed) && parsed > 0);
+
+  return (
+    <form
+      className="mt-3 flex flex-wrap items-end gap-2"
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (!valid) return;
+        onSave(value.trim() === "" ? null : parsed * MEBIBYTE);
+      }}
+    >
+      <div className="space-y-1">
+        <Label className="text-xs">{t("dashboard:models.attachmentLimit")}</Label>
+        <Input
+          className="min-h-11 w-28"
+          type="number"
+          min={1}
+          inputMode="numeric"
+          placeholder={t("dashboard:models.attachmentLimitInherit")}
+          value={value}
+          onChange={(event) => setValue(event.target.value)}
+        />
+      </div>
+      <Button type="submit" size="touch" disabled={disabled || !valid}>
+        {t("common:actions.save")}
+      </Button>
+      <p className="basis-full text-xs text-muted-foreground">
+        {t("dashboard:models.attachmentLimitHint")}
+      </p>
+    </form>
+  );
+}
+
 /** Model is eligible if published (model + endpoint) and supports enabled modalities. */
 function modelSupportsTransformerModalities(
   model: DirectModelOption,
@@ -385,6 +434,15 @@ export function CliEndpointsModelsSection() {
         queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:models.capabilitySaved"));
       },
+    }),
+  );
+  const updateModelAttachmentLimit = useMutation(
+    orpc.forwarderManagement.updateDiscoveredModelAttachmentLimit.mutationOptions({
+      onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
+        toast.success(t("dashboard:models.attachmentLimitSaved"));
+      },
+      onError: () => toast.error(t("dashboard:models.attachmentLimitSaveFailed")),
     }),
   );
 
@@ -603,6 +661,17 @@ export function CliEndpointsModelsSection() {
                                     disabled={updateModelCapabilities.isPending}
                                     onChange={(next) =>
                                       updateModelCapabilities.mutate({ id: model.id, ...next })
+                                    }
+                                  />
+                                  <AttachmentLimitControl
+                                    key={`${model.id}-${model.maxAttachmentBytes ?? "inherit"}`}
+                                    currentBytes={model.maxAttachmentBytes}
+                                    disabled={updateModelAttachmentLimit.isPending}
+                                    onSave={(maxAttachmentBytes) =>
+                                      updateModelAttachmentLimit.mutate({
+                                        id: model.id,
+                                        maxAttachmentBytes,
+                                      })
                                     }
                                   />
                                 </td>
@@ -1134,6 +1203,12 @@ function PoolForm({
     transformerMaxToolChars: z.number().int().min(256).max(32_000),
     transformerTimeoutMs: z.string(),
     transformerMaxAssets: z.string(),
+    maxAttachmentMiB: z
+      .string()
+      .refine(
+        (value) => value.trim() === "" || (/^\d+$/.test(value.trim()) && Number(value) > 0),
+        t("dashboard:pools.attachmentLimitInvalid"),
+      ),
   });
   const createPool = useMutation(
     orpc.forwarderManagement.createModelPool.mutationOptions({
@@ -1171,6 +1246,10 @@ function PoolForm({
         pool?.transformer.timeoutMs != null ? String(pool.transformer.timeoutMs) : "",
       transformerMaxAssets:
         pool?.transformer.maxAssets != null ? String(pool.transformer.maxAssets) : "",
+      maxAttachmentMiB:
+        pool?.maxAttachmentBytes != null
+          ? String(Math.ceil(pool.maxAttachmentBytes / MEBIBYTE))
+          : "",
     },
     validators: { onSubmit: poolSchema },
     onSubmit: async ({ value }) => {
@@ -1179,6 +1258,9 @@ function PoolForm({
           slug: value.slug.trim(),
           name: value.name.trim(),
           description: value.description.trim() || null,
+          maxAttachmentBytes: value.maxAttachmentMiB.trim()
+            ? Number(value.maxAttachmentMiB) * MEBIBYTE
+            : null,
         });
       } else if (pool) {
         await updatePool.mutateAsync({
@@ -1204,6 +1286,9 @@ function PoolForm({
             : null,
           transformerMaxAssets: value.transformerMaxAssets.trim()
             ? Number(value.transformerMaxAssets)
+            : null,
+          maxAttachmentBytes: value.maxAttachmentMiB.trim()
+            ? Number(value.maxAttachmentMiB) * MEBIBYTE
             : null,
         });
       }
@@ -1276,6 +1361,34 @@ function PoolForm({
               autoComplete="off"
               rows={4}
             />
+            {field.state.meta.errors.map((error) => (
+              <p key={error?.message} className="text-sm text-destructive">
+                {error?.message}
+              </p>
+            ))}
+          </div>
+        )}
+      </form.Field>
+
+      <form.Field name="maxAttachmentMiB">
+        {(field) => (
+          <div className="space-y-2">
+            <Label htmlFor={field.name}>{t("dashboard:pools.attachmentLimit")}</Label>
+            <Input
+              id={field.name}
+              name={field.name}
+              className="min-h-11 max-w-48"
+              type="number"
+              min={1}
+              inputMode="numeric"
+              placeholder={t("dashboard:pools.attachmentLimitInherit")}
+              value={field.state.value}
+              onBlur={field.handleBlur}
+              onChange={(event) => field.handleChange(event.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">
+              {t("dashboard:pools.attachmentLimitHint")}
+            </p>
             {field.state.meta.errors.map((error) => (
               <p key={error?.message} className="text-sm text-destructive">
                 {error?.message}

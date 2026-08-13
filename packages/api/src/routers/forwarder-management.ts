@@ -5,9 +5,15 @@ import {
   validateForwarderPoolSlug,
   validateForwarderSlug,
 } from "@ws-model-proxy/config/forwarder-identifiers";
+import { MEDIA_ATTACHMENT_MAX_BYTES_MAX } from "@ws-model-proxy/config/media-policy";
 import prisma from "@ws-model-proxy/db";
+import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
+import {
+  getConfiguredMediaAttachmentMaxBytes,
+  resolveAttachmentLimit,
+} from "../lib/media-attachment-limits";
 import {
   listVisibleModelTargetsForUser,
   type VisibleModelTargets,
@@ -48,6 +54,13 @@ const poolNameSchema = z.string().trim().min(1).max(120);
 const poolDescriptionSchema = z.string().trim().max(1000).nullable().optional();
 const idSchema = z.string().min(1);
 const routingStatusSchema = z.enum(poolMemberRoutingStatuses);
+const attachmentLimitSchema = z
+  .number()
+  .int()
+  .positive()
+  .max(MEDIA_ATTACHMENT_MAX_BYTES_MAX)
+  .nullable()
+  .optional();
 
 type UserSlugRow = {
   id: string;
@@ -123,6 +136,7 @@ type DiscoveredModelRow = {
   lastSeenAt: Date | null;
   published: boolean;
   unpublishedAt: Date | null;
+  maxAttachmentBytes: number | null;
 };
 
 type ModelPoolRow = {
@@ -132,6 +146,7 @@ type ModelPoolRow = {
   slug: string;
   name: string;
   description: string | null;
+  maxAttachmentBytes: number | null;
   transformerDiscoveredModelId: string | null;
   transformerSystemPrompt: string | null;
   transformerImages: boolean;
@@ -197,6 +212,19 @@ type PoolGrantRow = {
     name: string;
   };
 };
+
+async function assertAttachmentLimitWithinGlobal(maxAttachmentBytes: number | null | undefined) {
+  if (maxAttachmentBytes === undefined || maxAttachmentBytes === null) return;
+  const globalMax = resolveAttachmentLimit({
+    configuredBytes: await getConfiguredMediaAttachmentMaxBytes(),
+    deploymentMaxBytes: env.MEDIA_MAX_UPLOAD_BYTES,
+  });
+  if (maxAttachmentBytes > globalMax) {
+    throw new ORPCError("BAD_REQUEST", {
+      message: "Attachment limit cannot exceed the global attachment limit.",
+    });
+  }
+}
 
 function slugValidationError(slug: string) {
   const result = validateForwarderSlug(slug);
@@ -303,6 +331,7 @@ async function serializeVisibleTargets(targets: VisibleModelTargets) {
       endpointId: model.endpointId,
       endpointSlug: model.endpointSlug,
       cliDeviceSlug: model.cliDeviceSlug,
+      maxAttachmentBytes: model.maxAttachmentBytes,
       attachmentModalities: modalities.directById.get(model.id) ?? {
         image: false,
         audio: false,
@@ -318,6 +347,7 @@ async function serializeVisibleTargets(targets: VisibleModelTargets) {
       ownerUserId: pool.ownerUserId,
       ownerUserSlug: pool.ownerUserSlug,
       poolSlug: pool.poolSlug,
+      maxAttachmentBytes: pool.maxAttachmentBytes,
       attachmentModalities: modalities.poolById.get(pool.id) ?? {
         image: false,
         audio: false,
@@ -401,6 +431,7 @@ function serializeCliDevice(row: CliDeviceRow, now: Date) {
         lastSeenAt: model.lastSeenAt,
         published: model.published,
         unpublishedAt: model.unpublishedAt,
+        maxAttachmentBytes: model.maxAttachmentBytes,
       })),
     })),
   };
@@ -429,6 +460,7 @@ function serializePool(row: ModelPoolRow) {
     slug: row.slug,
     name: row.name,
     description: row.description,
+    maxAttachmentBytes: row.maxAttachmentBytes,
     canonicalModelId: poolModelId({ userSlug: row.User.slug, poolSlug: row.slug }),
     transformer: {
       discoveredModelId: row.transformerDiscoveredModelId,
@@ -649,6 +681,7 @@ const poolSelect = {
   slug: true,
   name: true,
   description: true,
+  maxAttachmentBytes: true,
   transformerDiscoveredModelId: true,
   transformerSystemPrompt: true,
   transformerImages: true,
@@ -807,6 +840,7 @@ export const forwarderManagementRouter = {
                   lastSeenAt: true,
                   published: true,
                   unpublishedAt: true,
+                  maxAttachmentBytes: true,
                 },
               },
             },
@@ -866,16 +900,21 @@ export const forwarderManagementRouter = {
         slug: poolSlugSchema,
         name: poolNameSchema,
         description: poolDescriptionSchema,
+        maxAttachmentBytes: attachmentLimitSchema,
       }),
     )
     .handler(async ({ input, context }) => {
       await assertPoolSlugAvailable(input.slug, context.session.user.id);
+      await assertAttachmentLimitWithinGlobal(input.maxAttachmentBytes);
       const row = (await prisma.modelPool.create({
         data: {
           userId: context.session.user.id,
           slug: input.slug,
           name: input.name,
           description: input.description ?? null,
+          ...(input.maxAttachmentBytes !== undefined
+            ? { maxAttachmentBytes: input.maxAttachmentBytes }
+            : {}),
         },
         select: poolSelect,
       })) as ModelPoolRow;
@@ -901,6 +940,7 @@ export const forwarderManagementRouter = {
         transformerMaxToolChars: z.number().int().min(256).max(32_000).optional(),
         transformerTimeoutMs: z.number().int().min(1_000).max(600_000).nullable().optional(),
         transformerMaxAssets: z.number().int().min(1).max(64).nullable().optional(),
+        maxAttachmentBytes: attachmentLimitSchema,
       }),
     )
     .handler(async ({ input, context }) => {
@@ -930,6 +970,7 @@ export const forwarderManagementRouter = {
       if (input.slug) {
         await assertPoolSlugAvailable(input.slug, context.session.user.id, input.id);
       }
+      await assertAttachmentLimitWithinGlobal(input.maxAttachmentBytes);
 
       const nextTransformerId =
         input.transformerDiscoveredModelId !== undefined
@@ -997,6 +1038,9 @@ export const forwarderManagementRouter = {
             : {}),
           ...(input.transformerMaxAssets !== undefined
             ? { transformerMaxAssets: input.transformerMaxAssets }
+            : {}),
+          ...(input.maxAttachmentBytes !== undefined
+            ? { maxAttachmentBytes: input.maxAttachmentBytes }
             : {}),
         },
         select: poolSelect,
@@ -1193,6 +1237,24 @@ export const forwarderManagementRouter = {
           capabilityOverrides: true,
           capabilityOverrideMetadata: true,
         },
+      });
+    }),
+
+  updateDiscoveredModelAttachmentLimit: protectedProcedure
+    .input(z.object({ id: idSchema, maxAttachmentBytes: attachmentLimitSchema.unwrap() }))
+    .handler(async ({ input, context }) => {
+      await assertAttachmentLimitWithinGlobal(input.maxAttachmentBytes);
+      const model = await prisma.discoveredModel.findUnique({
+        where: { id: input.id },
+        select: { id: true, userId: true },
+      });
+      if (!model || model.userId !== context.session.user.id) {
+        throw new ORPCError("NOT_FOUND", { message: "Discovered model not found." });
+      }
+      return prisma.discoveredModel.update({
+        where: { id: input.id },
+        data: { maxAttachmentBytes: input.maxAttachmentBytes },
+        select: { id: true, maxAttachmentBytes: true },
       });
     }),
 

@@ -29,6 +29,7 @@ import {
   RotateCcw,
   Send,
   Square,
+  Video,
   X,
 } from "lucide-react";
 import {
@@ -53,14 +54,12 @@ import {
   type AttachmentModality,
   acceptedAttachmentAcceptAttr,
   attachmentFileInfo,
-  dataUrlToBlob,
+  INLINE_ATTACHMENT_MAX_BYTES,
   MAX_ATTACHMENTS_PER_MESSAGE,
-  PER_IMAGE_MAX_BYTES,
   processImageFile,
   readFileAsDataUrl,
   TOTAL_REQUEST_HARD_MAX_BYTES,
   TOTAL_REQUEST_SOFT_WARN_BYTES,
-  UPLOAD_THRESHOLD_BYTES,
 } from "@/lib/image-attachments";
 import { orpc } from "@/utils/orpc";
 
@@ -75,6 +74,7 @@ type ModelOption = {
   label: string;
   kind: "DIRECT_MODEL" | "MODEL_POOL";
   attachmentModalities: AttachmentModalities;
+  maxAttachmentBytes: number | null;
 };
 type ChatRole = "user" | "assistant";
 type ChatMessageStatus = "ready" | "streaming" | "error" | "stopped";
@@ -87,6 +87,7 @@ type ChatAttachmentBase = {
   id: string;
   name: string;
   modality: AttachmentModality;
+  sizeBytes: number;
   // Set when a send-time /sign call reports the media id as expired/unknown, so
   // the thumbnail can be flagged and the user prompted to re-attach.
   expired?: boolean;
@@ -158,7 +159,11 @@ function AttachmentPreview({
   );
 }
 
-type MediaConfigResponse = { enabled: boolean; maxUploadBytes: number };
+type MediaConfigResponse = {
+  enabled: boolean;
+  maxUploadBytes: number;
+  maxAttachmentBytes: number;
+};
 type SignedMediaUrl = { id: string; url: string; signatureExpiresAt?: string };
 type ChatTimingMetrics = {
   ttftMs?: number;
@@ -213,6 +218,7 @@ function modelOptions(visibleModels: VisibleModels | undefined): ModelOption[] {
       label: model.upstreamModelId,
       kind: model.target,
       attachmentModalities: model.attachmentModalities,
+      maxAttachmentBytes: model.maxAttachmentBytes,
     })),
     ...visibleModels.modelPools.map((pool) => ({
       id: pool.id,
@@ -220,6 +226,7 @@ function modelOptions(visibleModels: VisibleModels | undefined): ModelOption[] {
       label: pool.name,
       kind: pool.target,
       attachmentModalities: pool.attachmentModalities,
+      maxAttachmentBytes: pool.maxAttachmentBytes,
     })),
   ];
 }
@@ -454,21 +461,25 @@ async function fetchMediaConfig(signal: AbortSignal): Promise<MediaConfigRespons
     credentials: "include",
     signal,
   });
-  if (!response.ok) return { enabled: false, maxUploadBytes: 0 };
+  if (!response.ok) return { enabled: false, maxUploadBytes: 0, maxAttachmentBytes: 0 };
   const body: unknown = await response.json();
   if (typeof body === "object" && body !== null && "enabled" in body) {
     const enabled = (body as { enabled: unknown }).enabled === true;
     const maxRaw = (body as { maxUploadBytes?: unknown }).maxUploadBytes;
     const maxUploadBytes = typeof maxRaw === "number" && maxRaw > 0 ? maxRaw : 0;
-    return { enabled, maxUploadBytes };
+    const attachmentMaxRaw = (body as { maxAttachmentBytes?: unknown }).maxAttachmentBytes;
+    const maxAttachmentBytes =
+      typeof attachmentMaxRaw === "number" && attachmentMaxRaw > 0 ? attachmentMaxRaw : 0;
+    return { enabled, maxUploadBytes, maxAttachmentBytes };
   }
-  return { enabled: false, maxUploadBytes: 0 };
+  return { enabled: false, maxUploadBytes: 0, maxAttachmentBytes: 0 };
 }
 
 type UploadMediaResult =
   | { status: "ok"; id: string }
   | { status: "disabled" } // 501: storage not configured — fall back to base64
   | { status: "quota" } // 413 media_quota_exceeded: user is over their storage cap
+  | { status: "tooLarge"; maxBytes?: number }
   | { status: "failed" };
 
 async function uploadMediaFile(blob: Blob, name: string): Promise<UploadMediaResult> {
@@ -484,9 +495,16 @@ async function uploadMediaFile(blob: Blob, name: string): Promise<UploadMediaRes
     if (response.status === 413) {
       // Distinguish a per-user quota rejection (distinct code) from a plain
       // oversize body so the composer can show a quota-specific message.
-      const body = (await response.json().catch(() => ({}))) as { code?: unknown };
+      const body = (await response.json().catch(() => ({}))) as {
+        code?: unknown;
+        maxBytes?: unknown;
+      };
       if (body.code === "media_quota_exceeded") return { status: "quota" };
-      return { status: "failed" };
+      return {
+        status: "tooLarge",
+        maxBytes:
+          typeof body.maxBytes === "number" && body.maxBytes > 0 ? body.maxBytes : undefined,
+      };
     }
     if (!response.ok) return { status: "failed" };
     const body: unknown = await response.json();
@@ -640,6 +658,11 @@ function isAbortError(error: unknown) {
   return error instanceof DOMException && error.name === "AbortError";
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(bytes % (1024 * 1024) === 0 ? 0 : 1)} MB`;
+}
+
 function ChatTestPage() {
   const { t } = useTranslation(["common", "dashboard"]);
   const {
@@ -676,18 +699,33 @@ function ChatTestPage() {
   const abortControllerRef = useRef<AbortController | null>(null);
   const activeAssistantIdRef = useRef<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const videoFileInputRef = useRef<HTMLInputElement | null>(null);
   const scroll = useChatScrollEngine();
   const options = useMemo(() => modelOptions(visibleModelsData), [visibleModelsData]);
   const effectiveModelId = options.some((option) => option.modelId === selectedModelId)
     ? selectedModelId
     : (options[0]?.modelId ?? "");
   const selectedModel = options.find((option) => option.modelId === effectiveModelId);
+  const attachmentMaxBytes = Math.min(
+    mediaConfig && mediaConfig.maxAttachmentBytes > 0
+      ? mediaConfig.maxAttachmentBytes
+      : Number.POSITIVE_INFINITY,
+    selectedModel?.maxAttachmentBytes ?? Number.POSITIVE_INFINITY,
+  );
   const attachmentModalities = selectedModel?.attachmentModalities ?? {
     image: false,
     audio: false,
     video: false,
   };
-  const attachmentAcceptAttr = acceptedAttachmentAcceptAttr(attachmentModalities);
+  const attachmentAcceptAttr = acceptedAttachmentAcceptAttr({
+    ...attachmentModalities,
+    video: false,
+  });
+  const videoAttachmentAcceptAttr = acceptedAttachmentAcceptAttr({
+    image: false,
+    audio: false,
+    video: attachmentModalities.video,
+  });
   const isStreaming = messages.some((message) => message.status === "streaming");
   const canSend =
     (draft.trim().length > 0 || attachments.length > 0) &&
@@ -698,21 +736,38 @@ function ChatTestPage() {
 
   const handleModelChange = useCallback(
     (modelId: string) => {
-      const nextModalities = options.find((option) => option.modelId === modelId)
-        ?.attachmentModalities ?? { image: false, audio: false, video: false };
+      const nextModel = options.find((option) => option.modelId === modelId);
+      const nextModalities = nextModel?.attachmentModalities ?? {
+        image: false,
+        audio: false,
+        video: false,
+      };
+      const nextAttachmentMaxBytes = Math.min(
+        mediaConfig && mediaConfig.maxAttachmentBytes > 0
+          ? mediaConfig.maxAttachmentBytes
+          : Number.POSITIVE_INFINITY,
+        nextModel?.maxAttachmentBytes ?? Number.POSITIVE_INFINITY,
+      );
       setSelectedModelId(modelId);
-      const retained = attachments.filter((attachment) => nextModalities[attachment.modality]);
+      const retained = attachments.filter(
+        (attachment) =>
+          nextModalities[attachment.modality] && attachment.sizeBytes <= nextAttachmentMaxBytes,
+      );
       if (retained.length !== attachments.length) {
         for (const attachment of attachments) {
-          if (!nextModalities[attachment.modality] && attachment.kind === "media") {
+          if (
+            (!nextModalities[attachment.modality] ||
+              attachment.sizeBytes > nextAttachmentMaxBytes) &&
+            attachment.kind === "media"
+          ) {
             URL.revokeObjectURL(attachment.previewUrl);
           }
         }
         setAttachments(retained);
-        setAttachmentNotice(t("dashboard:chatTest.attachments.removedForModel"));
+        setAttachmentNotice(t("dashboard:chatTest.attachments.removedForModelLimit"));
       }
     },
-    [attachments, options, t],
+    [attachments, mediaConfig, options, t],
   );
 
   const updateAssistant = useCallback((id: string, update: Partial<ChatMessage>) => {
@@ -749,10 +804,16 @@ function ChatTestPage() {
         const accepted: ChatAttachment[] = [];
         let rejectedCount = 0;
         let quotaHit = false;
+        let mediaStoreRequired = false;
+        let uploadTooLargeMaxBytes: number | undefined;
         for (const { file, modality, mime } of toProcess) {
           if (modality !== "image") {
-            const canUpload =
-              uploadEnabled && (mediaMaxUploadBytes === 0 || file.size <= mediaMaxUploadBytes);
+            if (file.size > attachmentMaxBytes) {
+              uploadTooLargeMaxBytes ??= attachmentMaxBytes;
+              continue;
+            }
+            const exceedsUploadLimit = mediaMaxUploadBytes > 0 && file.size > mediaMaxUploadBytes;
+            const canUpload = uploadEnabled && !exceedsUploadLimit;
             if (canUpload) {
               const upload = await uploadMediaFile(file, file.name);
               if (upload.status === "ok") {
@@ -760,6 +821,7 @@ function ChatTestPage() {
                   id: newId("attachment"),
                   name: file.name,
                   modality,
+                  sizeBytes: file.size,
                   kind: "media",
                   mediaId: upload.id,
                   previewUrl: URL.createObjectURL(file),
@@ -770,79 +832,90 @@ function ChatTestPage() {
                 quotaHit = true;
                 continue;
               }
+              if (upload.status === "tooLarge") {
+                uploadTooLargeMaxBytes ??= upload.maxBytes ?? mediaMaxUploadBytes;
+                continue;
+              }
               if (upload.status === "disabled") {
                 uploadEnabled = false;
                 queryClient.setQueryData<MediaConfigResponse>(MEDIA_CONFIG_QUERY_KEY, {
                   enabled: false,
                   maxUploadBytes: 0,
+                  maxAttachmentBytes: attachmentMaxBytes,
                 });
               }
             }
-            // Without storage, raw audio/video must stay safely below the
-            // route budget when embedded and re-sent with message history.
-            if (file.size > PER_IMAGE_MAX_BYTES) {
-              rejectedCount += 1;
+            if (file.size > Math.min(INLINE_ATTACHMENT_MAX_BYTES, attachmentMaxBytes)) {
+              if (uploadEnabled && exceedsUploadLimit) {
+                uploadTooLargeMaxBytes ??= mediaMaxUploadBytes;
+              } else {
+                mediaStoreRequired = true;
+              }
               continue;
             }
             accepted.push({
               id: newId("attachment"),
               name: file.name,
               modality,
+              sizeBytes: file.size,
               kind: "data",
               dataUrl: await readFileAsDataUrl(file, mime),
             });
             continue;
           }
 
-          const result = await processImageFile(file);
+          if (file.size > attachmentMaxBytes) {
+            uploadTooLargeMaxBytes ??= attachmentMaxBytes;
+            continue;
+          }
+
+          if (uploadEnabled) {
+            const exceedsUploadLimit = mediaMaxUploadBytes > 0 && file.size > mediaMaxUploadBytes;
+            if (exceedsUploadLimit) {
+              uploadTooLargeMaxBytes ??= mediaMaxUploadBytes;
+              continue;
+            }
+            const upload = await uploadMediaFile(file, file.name);
+            if (upload.status === "ok") {
+              accepted.push({
+                id: newId("attachment"),
+                name: file.name,
+                modality,
+                sizeBytes: file.size,
+                kind: "media",
+                mediaId: upload.id,
+                previewUrl: URL.createObjectURL(file),
+              });
+              continue;
+            }
+            if (upload.status === "quota") {
+              quotaHit = true;
+              continue;
+            }
+            if (upload.status === "tooLarge") {
+              uploadTooLargeMaxBytes ??= upload.maxBytes ?? mediaMaxUploadBytes;
+              continue;
+            }
+            if (upload.status === "disabled") {
+              uploadEnabled = false;
+              queryClient.setQueryData<MediaConfigResponse>(MEDIA_CONFIG_QUERY_KEY, {
+                enabled: false,
+                maxUploadBytes: 0,
+                maxAttachmentBytes: attachmentMaxBytes,
+              });
+            }
+          }
+
+          const result = await processImageFile(file, {
+            maxBytes: Math.min(INLINE_ATTACHMENT_MAX_BYTES, attachmentMaxBytes),
+          });
           if (!result.ok) {
             rejectedCount += 1;
             continue;
           }
           const { id, dataUrl, name, byteSize } = result.image;
 
-          // Large enough to prefer the media store, and small enough to upload:
-          // upload and keep only a media id + client-side preview URL. Otherwise
-          // (or on any upload problem) keep the offline-friendly base64 path.
-          const shouldUpload =
-            uploadEnabled &&
-            byteSize > UPLOAD_THRESHOLD_BYTES &&
-            (mediaMaxUploadBytes === 0 || byteSize <= mediaMaxUploadBytes);
-
-          if (shouldUpload) {
-            const blob = dataUrlToBlob(dataUrl);
-            const upload = await uploadMediaFile(blob, name);
-            if (upload.status === "ok") {
-              accepted.push({
-                id,
-                name,
-                modality,
-                kind: "media",
-                mediaId: upload.id,
-                previewUrl: URL.createObjectURL(blob),
-              });
-              continue;
-            }
-            if (upload.status === "quota") {
-              // Over the per-user storage quota. Don't silently embed multi-
-              // hundred-KB base64 (which history then re-sends every turn) —
-              // skip this attachment and surface a quota-specific notice.
-              quotaHit = true;
-              continue;
-            }
-            if (upload.status === "disabled") {
-              // Storage isn't configured after all — stop trying for this batch
-              // and future ones, then fall through to the base64 path.
-              uploadEnabled = false;
-              queryClient.setQueryData<MediaConfigResponse>(MEDIA_CONFIG_QUERY_KEY, {
-                enabled: false,
-                maxUploadBytes: 0,
-              });
-            }
-            // status "failed" or "disabled": fall back to embedding.
-          }
-
-          accepted.push({ id, name, modality, kind: "data", dataUrl });
+          accepted.push({ id, name, modality, sizeBytes: byteSize, kind: "data", dataUrl });
         }
         if (accepted.length > 0) {
           setAttachments((current) => [...current, ...accepted]);
@@ -850,6 +923,20 @@ function ChatTestPage() {
         const notices: string[] = [];
         if (quotaHit) {
           notices.push(t("dashboard:chatTest.attachments.quotaExceeded"));
+        }
+        if (mediaStoreRequired) {
+          notices.push(
+            t("dashboard:chatTest.attachments.mediaStoreRequired", {
+              size: formatBytes(INLINE_ATTACHMENT_MAX_BYTES),
+            }),
+          );
+        }
+        if (uploadTooLargeMaxBytes) {
+          notices.push(
+            t("dashboard:chatTest.attachments.uploadTooLarge", {
+              size: formatBytes(uploadTooLargeMaxBytes),
+            }),
+          );
         }
         if (rejectedCount > 0) {
           notices.push(t("dashboard:chatTest.attachments.rejected", { count: rejectedCount }));
@@ -864,11 +951,23 @@ function ChatTestPage() {
         setIsProcessingImages(false);
       }
     },
-    [attachmentModalities, attachments.length, mediaEnabled, mediaMaxUploadBytes, queryClient, t],
+    [
+      attachmentMaxBytes,
+      attachmentModalities,
+      attachments.length,
+      mediaEnabled,
+      mediaMaxUploadBytes,
+      queryClient,
+      t,
+    ],
   );
 
   const openFilePicker = useCallback(() => {
     fileInputRef.current?.click();
+  }, []);
+
+  const openVideoFilePicker = useCallback(() => {
+    videoFileInputRef.current?.click();
   }, []);
 
   const handleFileInputChange = useCallback(
@@ -1450,21 +1549,49 @@ function ChatTestPage() {
               onChange={handleFileInputChange}
               tabIndex={-1}
             />
-            <Button
-              type="button"
-              variant="outline"
-              size="icon-touch"
-              onClick={openFilePicker}
-              disabled={options.length === 0 || isProcessingImages || !attachmentAcceptAttr}
-              aria-label={t("dashboard:chatTest.attachments.attach")}
-              title={t("dashboard:chatTest.attachments.attach")}
-            >
-              {isProcessingImages ? (
-                <Loader2 className="size-4 animate-spin" />
-              ) : (
-                <ImagePlus className="size-4" />
-              )}
-            </Button>
+            <input
+              ref={videoFileInputRef}
+              type="file"
+              accept={videoAttachmentAcceptAttr}
+              multiple
+              className="hidden"
+              onChange={handleFileInputChange}
+              tabIndex={-1}
+            />
+            {attachmentAcceptAttr ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="icon-touch"
+                onClick={openFilePicker}
+                disabled={options.length === 0 || isProcessingImages}
+                aria-label={t("dashboard:chatTest.attachments.attach")}
+                title={t("dashboard:chatTest.attachments.attach")}
+              >
+                {isProcessingImages ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <ImagePlus className="size-4" />
+                )}
+              </Button>
+            ) : null}
+            {videoAttachmentAcceptAttr ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="icon-touch"
+                onClick={openVideoFilePicker}
+                disabled={options.length === 0 || isProcessingImages}
+                aria-label={t("dashboard:chatTest.attachments.attachVideo")}
+                title={t("dashboard:chatTest.attachments.attachVideo")}
+              >
+                {isProcessingImages ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <Video className="size-4" />
+                )}
+              </Button>
+            ) : null}
             <Textarea
               value={draft}
               onChange={(event) => setDraft(event.target.value)}

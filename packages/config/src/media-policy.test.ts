@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   acceptedMediaInputAcceptAttr,
   CLIENT_ACCEPTED_MEDIA_MIMES,
+  clampMediaAttachmentMaxBytes,
   decideImageEncode,
   imageNeedsInlineNormalization,
   isClientAcceptedImageMime,
@@ -14,6 +15,14 @@ import {
   normalizeImageMime,
   reencodeMimeChain,
 } from "./media-policy";
+
+describe("attachment size policy", () => {
+  it("clamps persisted global limits to the safe database range", () => {
+    expect(clampMediaAttachmentMaxBytes(1)).toBe(256 * 1024);
+    expect(clampMediaAttachmentMaxBytes(8 * 1024 * 1024)).toBe(8 * 1024 * 1024);
+    expect(clampMediaAttachmentMaxBytes(2 ** 32)).toBe(2 ** 31 - 1);
+  });
+});
 
 describe("normalizeImageMime", () => {
   it("strips parameters, lowercases, and aliases image/jpg", () => {

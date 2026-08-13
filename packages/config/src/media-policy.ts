@@ -33,6 +33,20 @@ export const MEDIA_ASSET_TTL_DEFAULT_HOURS = 24;
 export const MEDIA_ASSET_TTL_MIN_HOURS = 1;
 export const MEDIA_ASSET_TTL_MAX_HOURS = 168; // 7 days
 
+/** Admin-set global attachment cap. Deployment upload limits remain a hard ceiling. */
+export const MEDIA_ATTACHMENT_MAX_BYTES_SETTING_KEY = "mediaAttachmentMaxBytes";
+export const MEDIA_ATTACHMENT_MAX_BYTES_DEFAULT = 25 * 1024 * 1024;
+export const MEDIA_ATTACHMENT_MAX_BYTES_MIN = 256 * 1024;
+export const MEDIA_ATTACHMENT_MAX_BYTES_MAX = 2 ** 31 - 1;
+
+export function clampMediaAttachmentMaxBytes(value: number): number {
+  if (!Number.isFinite(value)) return MEDIA_ATTACHMENT_MAX_BYTES_DEFAULT;
+  return Math.min(
+    MEDIA_ATTACHMENT_MAX_BYTES_MAX,
+    Math.max(MEDIA_ATTACHMENT_MAX_BYTES_MIN, Math.trunc(value)),
+  );
+}
+
 /** Clamp an arbitrary hours value into the safe range; NaN/invalid -> default. */
 export function clampMediaAssetTtlHours(value: number): number {
   if (!Number.isFinite(value)) return MEDIA_ASSET_TTL_DEFAULT_HOURS;

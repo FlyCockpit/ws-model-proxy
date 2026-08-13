@@ -3,7 +3,9 @@ import { invalidateForceTwoFactorPolicyCache } from "@ws-model-proxy/auth/force-
 import { SIGNUP_ENABLED_SETTING_KEY } from "@ws-model-proxy/auth/signup-policy";
 import {
   clampMediaAssetTtlHours,
+  clampMediaAttachmentMaxBytes,
   MEDIA_ASSET_TTL_HOURS_SETTING_KEY,
+  MEDIA_ATTACHMENT_MAX_BYTES_SETTING_KEY,
 } from "@ws-model-proxy/config/media-policy";
 import prisma from "@ws-model-proxy/db";
 import { z } from "zod";
@@ -32,7 +34,16 @@ const ttlSettingUpdateSchema = z.object({
   value: z.number().int(),
 });
 
-const settingUpdateSchema = z.union([booleanSettingUpdateSchema, ttlSettingUpdateSchema]);
+const attachmentLimitSettingUpdateSchema = z.object({
+  key: z.literal(MEDIA_ATTACHMENT_MAX_BYTES_SETTING_KEY),
+  value: z.number().int(),
+});
+
+const settingUpdateSchema = z.union([
+  booleanSettingUpdateSchema,
+  ttlSettingUpdateSchema,
+  attachmentLimitSettingUpdateSchema,
+]);
 
 export const settingsRouter = {
   getAll: authenticatedProcedure.handler(async () => {
@@ -72,6 +83,16 @@ export const settingsRouter = {
     // their existing "true"/"false" behavior is untouched.
     if (input.key === MEDIA_ASSET_TTL_HOURS_SETTING_KEY) {
       const value = String(clampMediaAssetTtlHours(input.value));
+      await prisma.appSetting.upsert({
+        where: { key: input.key },
+        update: { value },
+        create: { key: input.key, value },
+      });
+      return { success: true };
+    }
+
+    if (input.key === MEDIA_ATTACHMENT_MAX_BYTES_SETTING_KEY) {
+      const value = String(clampMediaAttachmentMaxBytes(input.value));
       await prisma.appSetting.upsert({
         where: { key: input.key },
         update: { value },

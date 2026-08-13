@@ -30,7 +30,11 @@ const db = prisma as unknown as {
   discoveredModel: {
     findMany: MockInstance;
     findUnique: MockInstance;
+    update: MockInstance;
     delete: MockInstance;
+  };
+  appSetting: {
+    findUnique: MockInstance;
   };
   modelPool: {
     findMany: MockInstance;
@@ -113,6 +117,7 @@ function poolRow(overrides: Record<string, unknown> = {}) {
     slug: "general",
     name: "General",
     description: null,
+    maxAttachmentBytes: null,
     transformerDiscoveredModelId: null,
     transformerSystemPrompt: null,
     transformerImages: true,
@@ -130,6 +135,7 @@ function poolRow(overrides: Record<string, unknown> = {}) {
 describe("forwarderManagementRouter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    db.appSetting.findUnique.mockResolvedValue(null);
   });
 
   it("previews and updates the current user's slug without changing internal ids", async () => {
@@ -313,6 +319,52 @@ describe("forwarderManagementRouter", () => {
       }),
     );
     expect(db.poolGrant.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("persists an in-range pool attachment limit and rejects one above the global policy", async () => {
+    db.modelPool.findUnique.mockResolvedValueOnce(null);
+    db.modelPool.create.mockResolvedValue(poolRow({ maxAttachmentBytes: 2 * 1024 * 1024 }));
+
+    await client().createModelPool({
+      slug: "limited",
+      name: "Limited",
+      maxAttachmentBytes: 2 * 1024 * 1024,
+    });
+    expect(db.modelPool.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ maxAttachmentBytes: 2 * 1024 * 1024 }),
+      }),
+    );
+
+    await expect(
+      client().createModelPool({
+        slug: "too-large",
+        name: "Too large",
+        maxAttachmentBytes: 26 * 1024 * 1024,
+      }),
+    ).rejects.toSatisfy((error: ORPCError) => {
+      expect(error.code).toBe("BAD_REQUEST");
+      return true;
+    });
+  });
+
+  it("allows a direct model attachment limit to inherit and rejects one above global policy", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue({ id: "model-id", userId: "user-id" });
+    db.discoveredModel.update.mockResolvedValue({ id: "model-id", maxAttachmentBytes: null });
+
+    await expect(
+      client().updateDiscoveredModelAttachmentLimit({ id: "model-id", maxAttachmentBytes: null }),
+    ).resolves.toEqual({ id: "model-id", maxAttachmentBytes: null });
+
+    await expect(
+      client().updateDiscoveredModelAttachmentLimit({
+        id: "model-id",
+        maxAttachmentBytes: 26 * 1024 * 1024,
+      }),
+    ).rejects.toSatisfy((error: ORPCError) => {
+      expect(error.code).toBe("BAD_REQUEST");
+      return true;
+    });
   });
 
   it("accepts dotted model pool slugs on create and update", async () => {

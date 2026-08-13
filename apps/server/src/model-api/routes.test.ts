@@ -58,6 +58,12 @@ const db = prisma as unknown as {
     findUnique: MockInstance;
     upsert: MockInstance;
   };
+  appSetting: {
+    findUnique: MockInstance;
+  };
+  mediaAsset: {
+    findMany: MockInstance;
+  };
 };
 
 const mockedTokenAccess = tokenAccess as unknown as {
@@ -148,6 +154,7 @@ const directTarget: VisibleDirectModelTarget = {
   endpointId: "endpoint-id",
   endpointSlug: "local",
   cliDeviceSlug: "desktop",
+  maxAttachmentBytes: null,
 };
 
 const poolTarget: VisibleModelPoolTarget = {
@@ -159,6 +166,7 @@ const poolTarget: VisibleModelPoolTarget = {
   ownerUserId: "user-id",
   ownerUserSlug: "owner",
   poolSlug: "gpt-4.1-mini",
+  maxAttachmentBytes: null,
 };
 
 function directRow({
@@ -351,6 +359,7 @@ describe("model API routes", () => {
       transformerMaxAssets: null,
     });
     db.relayRequest.create.mockResolvedValue({ id: "relay-request-id" });
+    db.appSetting.findUnique.mockResolvedValue(null);
     db.relayRequest.update.mockResolvedValue({ id: "relay-request-id" });
     db.responseStickinessRecord.findUnique.mockResolvedValue(null);
     db.responseStickinessRecord.upsert.mockResolvedValue({ id: "stickiness-id" });
@@ -761,6 +770,35 @@ describe("model API routes", () => {
     ]);
     expect(metadataCalls).not.toContain("secret prompt");
     expect(metadataCalls).not.toContain("SECRET_IMAGE_BYTES");
+  });
+
+  it("rejects an inline attachment above the selected model's limit before relaying", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [{ ...directTarget, maxAttachmentBytes: 3 }],
+      modelPools: [],
+    });
+    const manager = new FakeRelayManager();
+
+    const response = await appWith(manager).request("/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: directTarget.modelId,
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "image_url", image_url: { url: "data:image/png;base64,QUJDRA==" } }],
+          },
+        ],
+      }),
+    });
+
+    expect(response.status).toBe(429);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "request_too_large" } });
+    expect(manager.sent).toHaveLength(0);
   });
 
   it("relays embeddings requests with the selected upstream model", async () => {

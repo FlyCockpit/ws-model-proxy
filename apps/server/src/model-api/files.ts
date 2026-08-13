@@ -1,5 +1,9 @@
 import { Readable } from "node:stream";
 import type { ReadableStream as NodeWebReadableStream } from "node:stream/web";
+import {
+  effectiveMediaAttachmentMaxBytes,
+  getConfiguredMediaAttachmentMaxBytes,
+} from "@ws-model-proxy/api/lib/media-attachment-limits";
 import type { ModelApiTokenIdentity } from "@ws-model-proxy/api/lib/model-api-token-access";
 import defaultPrisma from "@ws-model-proxy/db";
 import type { Context } from "hono";
@@ -28,7 +32,7 @@ import { authenticateRequest } from "./routes.js";
 // can paste the signed URL straight into an image_url/video_url/input_audio part.
 // ===========================================================================
 
-type MediaPrisma = Pick<typeof defaultPrisma, "mediaAsset">;
+type MediaPrisma = Pick<typeof defaultPrisma, "appSetting" | "mediaAsset">;
 
 /** Dependency seam so tests can inject auth, a temp-dir store, mock prisma, and clock. */
 export interface ModelApiFilesDeps {
@@ -36,16 +40,25 @@ export interface ModelApiFilesDeps {
   getConfig?: () => MediaConfig | null;
   makeStore?: (config: MediaConfig) => MediaStore;
   prisma?: MediaPrisma;
+  getAttachmentLimit?: (config: MediaConfig) => Promise<number>;
   getTtlHours?: () => Promise<number>;
   now?: () => number;
 }
 
 function resolveDeps(deps: ModelApiFilesDeps) {
+  const prisma = deps.prisma ?? (defaultPrisma as unknown as MediaPrisma);
   return {
     authenticate: deps.authenticate ?? authenticateRequest,
     getConfig: deps.getConfig ?? getMediaConfig,
     makeStore: deps.makeStore ?? ((config: MediaConfig) => new LocalMediaStore(config.root)),
-    prisma: deps.prisma ?? (defaultPrisma as unknown as MediaPrisma),
+    prisma,
+    getAttachmentLimit:
+      deps.getAttachmentLimit ??
+      (async (config: MediaConfig) =>
+        effectiveMediaAttachmentMaxBytes(
+          config.maxUploadBytes,
+          await getConfiguredMediaAttachmentMaxBytes(prisma),
+        )),
     getTtlHours: deps.getTtlHours ?? getMediaAssetTtlHours,
     now: deps.now ?? (() => Date.now()),
   };
@@ -153,7 +166,8 @@ function fileObject({
 // POST /v1/files — multipart upload (bearer model-token auth)
 // ---------------------------------------------------------------------------
 export function createModelApiFileUploadHandler(deps: ModelApiFilesDeps = {}) {
-  const { authenticate, getConfig, makeStore, prisma, getTtlHours, now } = resolveDeps(deps);
+  const { authenticate, getAttachmentLimit, getConfig, makeStore, prisma, getTtlHours, now } =
+    resolveDeps(deps);
 
   return async (c: Context): Promise<Response> => {
     const token = await authenticate(c.req.raw);
@@ -194,7 +208,7 @@ export function createModelApiFileUploadHandler(deps: ModelApiFilesDeps = {}) {
         userId: token.userId,
         store: makeStore(config),
         ttlHours: await getTtlHours(),
-        maxUploadBytes: config.maxUploadBytes,
+        maxUploadBytes: await getAttachmentLimit(config),
         maxBytesPerUser: config.maxBytesPerUser,
         prisma,
         now: new Date(nowMs),

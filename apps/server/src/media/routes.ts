@@ -1,5 +1,9 @@
 import { Readable } from "node:stream";
 import type { ReadableStream as NodeWebReadableStream } from "node:stream/web";
+import {
+  effectiveMediaAttachmentMaxBytes,
+  getConfiguredMediaAttachmentMaxBytes,
+} from "@ws-model-proxy/api/lib/media-attachment-limits";
 import type { Session } from "@ws-model-proxy/auth";
 import defaultPrisma from "@ws-model-proxy/db";
 import type { Context } from "hono";
@@ -18,22 +22,34 @@ import {
   MEDIA_ASSET_TTL_MIN_HOURS,
 } from "./ttl.js";
 
-type MediaPrisma = Pick<typeof defaultPrisma, "mediaAsset">;
+type MediaPrisma = Pick<typeof defaultPrisma, "appSetting" | "mediaAsset">;
 
 /** Dependency seam so tests can inject a temp-dir store, mock prisma, and clock. */
 export interface MediaHandlerDeps {
   getConfig?: () => MediaConfig | null;
   makeStore?: (config: MediaConfig) => MediaStore;
   prisma?: MediaPrisma;
+  getAttachmentLimit?: (config: MediaConfig) => Promise<number>;
+  getConfiguredAttachmentLimit?: () => Promise<number>;
   getTtlHours?: () => Promise<number>;
   now?: () => number;
 }
 
 function resolveDeps(deps: MediaHandlerDeps) {
+  const prisma = deps.prisma ?? (defaultPrisma as unknown as MediaPrisma);
   return {
     getConfig: deps.getConfig ?? getMediaConfig,
     makeStore: deps.makeStore ?? ((config: MediaConfig) => new LocalMediaStore(config.root)),
-    prisma: deps.prisma ?? (defaultPrisma as unknown as MediaPrisma),
+    prisma,
+    getConfiguredAttachmentLimit:
+      deps.getConfiguredAttachmentLimit ?? (() => getConfiguredMediaAttachmentMaxBytes(prisma)),
+    getAttachmentLimit:
+      deps.getAttachmentLimit ??
+      (async (config: MediaConfig) =>
+        effectiveMediaAttachmentMaxBytes(
+          config.maxUploadBytes,
+          await getConfiguredMediaAttachmentMaxBytes(prisma),
+        )),
     getTtlHours: deps.getTtlHours ?? getMediaAssetTtlHours,
     now: deps.now ?? (() => Date.now()),
   };
@@ -50,7 +66,7 @@ function sessionUser(c: Context): Session["user"] | null {
 // Lets the dashboard/chat-test client decide whether to upload large
 // attachments or fall back to base64 embedding, and how large an upload may be.
 export function createMediaConfigHandler(deps: MediaHandlerDeps = {}) {
-  const { getConfig } = resolveDeps(deps);
+  const { getAttachmentLimit, getConfig, getConfiguredAttachmentLimit } = resolveDeps(deps);
 
   return async (c: Context): Promise<Response> => {
     const user = sessionUser(c);
@@ -58,9 +74,17 @@ export function createMediaConfigHandler(deps: MediaHandlerDeps = {}) {
 
     const config = getConfig();
     if (!config) {
-      return c.json({ enabled: false, maxUploadBytes: 0 }, 200);
+      return c.json(
+        {
+          enabled: false,
+          maxUploadBytes: 0,
+          maxAttachmentBytes: await getConfiguredAttachmentLimit(),
+        },
+        200,
+      );
     }
-    return c.json({ enabled: true, maxUploadBytes: config.maxUploadBytes }, 200);
+    const maxAttachmentBytes = await getAttachmentLimit(config);
+    return c.json({ enabled: true, maxUploadBytes: maxAttachmentBytes, maxAttachmentBytes }, 200);
   };
 }
 
@@ -68,7 +92,7 @@ export function createMediaConfigHandler(deps: MediaHandlerDeps = {}) {
 // POST /api/internal/media — multipart upload (session-authenticated)
 // ---------------------------------------------------------------------------
 export function createMediaUploadHandler(deps: MediaHandlerDeps = {}) {
-  const { getConfig, makeStore, prisma, getTtlHours, now } = resolveDeps(deps);
+  const { getAttachmentLimit, getConfig, makeStore, prisma, getTtlHours, now } = resolveDeps(deps);
 
   return async (c: Context): Promise<Response> => {
     const user = sessionUser(c);
@@ -97,7 +121,7 @@ export function createMediaUploadHandler(deps: MediaHandlerDeps = {}) {
         userId: user.id,
         store: makeStore(config),
         ttlHours: await getTtlHours(),
-        maxUploadBytes: config.maxUploadBytes,
+        maxUploadBytes: await getAttachmentLimit(config),
         maxBytesPerUser: config.maxBytesPerUser,
         prisma,
         now: new Date(now()),
@@ -259,7 +283,8 @@ function auditMediaAction(
 // GET /api/internal/media/admin/stats — capability + aggregate stats
 // ---------------------------------------------------------------------------
 export function createMediaAdminStatsHandler(deps: MediaHandlerDeps = {}) {
-  const { getConfig, prisma, getTtlHours, now } = resolveDeps(deps);
+  const { getAttachmentLimit, getConfig, getConfiguredAttachmentLimit, prisma, getTtlHours, now } =
+    resolveDeps(deps);
 
   return async (c: Context): Promise<Response> => {
     const config = getConfig();
@@ -274,6 +299,13 @@ export function createMediaAdminStatsHandler(deps: MediaHandlerDeps = {}) {
           min: MEDIA_ASSET_TTL_MIN_HOURS,
           max: MEDIA_ASSET_TTL_MAX_HOURS,
           default: MEDIA_ASSET_TTL_DEFAULT_HOURS,
+        },
+        attachmentLimit: {
+          configuredBytes: await getConfiguredAttachmentLimit(),
+          effectiveBytes: config
+            ? await getAttachmentLimit(config)
+            : await getConfiguredAttachmentLimit(),
+          deploymentMaxBytes: config?.maxUploadBytes ?? null,
         },
         stats,
       },
