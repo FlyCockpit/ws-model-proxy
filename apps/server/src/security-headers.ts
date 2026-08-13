@@ -29,6 +29,9 @@ export function mountSecurityHeaders<E extends Env>(
         // remove this exception after the rendered app no longer needs it.
         styleSrc: ["'self'", "'unsafe-inline'"],
         imgSrc: ["'self'", "data:", "blob:"],
+        // MediaBunny uses same-origin blob workers when compressing an oversized
+        // Chat Test video in the browser. Keep workers constrained to this app.
+        workerSrc: ["'self'", "blob:"],
         connectSrc: cspConnectSrc,
         fontSrc: ["'self'", "data:"],
         objectSrc: ["'none'"],

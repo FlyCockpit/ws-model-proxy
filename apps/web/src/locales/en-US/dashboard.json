@@ -37,6 +37,8 @@
     "attachments": {
       "attach": "Attach file",
       "attachVideo": "Attach video",
+      "cancelCompression": "Cancel compression",
+      "compressingVideo": "Compressing video… {{progress}}%",
       "composerLabel": "Attachments",
       "expired": "An attachment has expired. Remove it and attach the file again to continue.",
       "expiredBadge": "Expired",
@@ -51,7 +53,13 @@
       "requestTooLarge": "This request is too large to send. Remove some attachments or start a new thread.",
       "signFailed": "Could not prepare uploaded attachments for sending. Check your connection and try again.",
       "unsupported": "This file type is not supported by the selected model.",
-      "uploadTooLarge": "This file exceeds the attachment limit of {{size}} for the selected model. Choose a smaller file or ask an administrator to raise the limit."
+      "uploadTooLarge": "This file exceeds the attachment limit of {{size}} for the selected model. Choose a smaller file or ask an administrator to raise the limit.",
+      "videoCannotFit": "This video cannot be compressed enough for the attachment limit. Trim it to six minutes or less, or choose a smaller file.",
+      "videoCompressed": "Video compressed to {{size}} and attached.",
+      "videoCompressionCancelled": "Video compression cancelled.",
+      "videoCompressionFailed": "This video could not be compressed. Choose a smaller MP4 video and try again.",
+      "videoCompressionUnsupported": "This browser cannot compress this video. Choose a smaller MP4 video or use a browser with video encoding support.",
+      "videoTooLong": "Videos must be six minutes or shorter before compression. Trim the video and try again."
     },
     "emptyModels": "No visible models are available.",
     "emptyTranscript": "No messages yet.",

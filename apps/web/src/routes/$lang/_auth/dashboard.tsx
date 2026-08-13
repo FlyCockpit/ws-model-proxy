@@ -67,7 +67,7 @@ function DashboardLayout() {
 
   return (
     <div className="container mx-auto flex h-full min-h-0 max-w-6xl flex-col px-4 py-4 md:py-8">
-      <div className="mb-3 shrink-0 md:mb-5">
+      <div className="mb-5 hidden shrink-0 md:block">
         <h1 className="text-xl font-semibold md:text-2xl">{t("dashboard:title")}</h1>
         <p className="mt-1 text-sm text-muted-foreground">{t("dashboard:description")}</p>
       </div>

@@ -30,4 +30,10 @@ describe("mountSecurityHeaders", () => {
     const csp = res.headers.get("content-security-policy") ?? "";
     expect(csp).toMatch(/form-action[^;]*'self'/);
   });
+
+  it("allows same-origin blob workers for browser-side video compression", async () => {
+    const res = await buildApp().request("/some-page");
+    const csp = res.headers.get("content-security-policy") ?? "";
+    expect(csp).toMatch(/worker-src[^;]*'self'[^;]*blob:/);
+  });
 });

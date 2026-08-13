@@ -48,6 +48,7 @@ import { useTranslation } from "react-i18next";
 
 import { ChatMarkdown } from "@/components/chat-markdown";
 import { InlineRetry } from "@/components/inline-retry";
+import { useAbortOnUnmount } from "@/hooks/use-abort-on-unmount";
 import { useChatScrollEngine } from "@/hooks/use-chat-scroll-engine";
 import {
   type AttachmentModalities,
@@ -61,6 +62,7 @@ import {
   TOTAL_REQUEST_HARD_MAX_BYTES,
   TOTAL_REQUEST_SOFT_WARN_BYTES,
 } from "@/lib/image-attachments";
+import { compressVideoToFit } from "@/lib/video-compression";
 import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/$lang/_auth/dashboard/chat-test")({
@@ -693,13 +695,17 @@ function ChatTestPage() {
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [attachmentNotice, setAttachmentNotice] = useState("");
   const [isProcessingImages, setIsProcessingImages] = useState(false);
+  const [videoCompressionProgress, setVideoCompressionProgress] = useState<number | null>(null);
   const [isPreparingSend, setIsPreparingSend] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const sendingRef = useRef(false);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const videoCompressionAbortRef = useRef<AbortController | null>(null);
   const activeAssistantIdRef = useRef<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const videoFileInputRef = useRef<HTMLInputElement | null>(null);
+  const isAddingAttachmentsRef = useRef(false);
+  const isMountedRef = useAbortOnUnmount(videoCompressionAbortRef);
   const scroll = useChatScrollEngine();
   const options = useMemo(() => modelOptions(visibleModelsData), [visibleModelsData]);
   const effectiveModelId = options.some((option) => option.modelId === selectedModelId)
@@ -778,6 +784,7 @@ function ChatTestPage() {
 
   const addAttachmentFiles = useCallback(
     async (files: File[]) => {
+      if (isAddingAttachmentsRef.current) return;
       const supportedFiles = files.flatMap((file) => {
         const info = attachmentFileInfo(file);
         return info && attachmentModalities[info.modality] ? [{ file, ...info }] : [];
@@ -795,6 +802,7 @@ function ChatTestPage() {
       }
       const toProcess = supportedFiles.slice(0, remaining);
       const truncated = supportedFiles.length > remaining;
+      isAddingAttachmentsRef.current = true;
       setIsProcessingImages(true);
       setAttachmentNotice("");
       // Media may be disabled mid-batch if an upload reports 501; track locally
@@ -806,26 +814,73 @@ function ChatTestPage() {
         let quotaHit = false;
         let mediaStoreRequired = false;
         let uploadTooLargeMaxBytes: number | undefined;
+        let compressionNotice = "";
+        let compressedVideoSize: number | null = null;
         for (const { file, modality, mime } of toProcess) {
+          if (!isMountedRef.current) return;
           if (modality !== "image") {
-            if (file.size > attachmentMaxBytes) {
+            let uploadFile = file;
+            let wasCompressed = false;
+            if (modality === "video" && file.size > attachmentMaxBytes && uploadEnabled) {
+              const controller = new AbortController();
+              videoCompressionAbortRef.current = controller;
+              if (isMountedRef.current) setVideoCompressionProgress(0);
+              const compression = await compressVideoToFit({
+                file,
+                maxBytes: attachmentMaxBytes,
+                signal: controller.signal,
+                onProgress: (progress) => {
+                  if (!isMountedRef.current) return;
+                  const percentage = Math.round(progress * 100);
+                  setVideoCompressionProgress((current) =>
+                    current === percentage ? current : percentage,
+                  );
+                },
+              });
+              if (videoCompressionAbortRef.current === controller) {
+                videoCompressionAbortRef.current = null;
+                if (isMountedRef.current) setVideoCompressionProgress(null);
+              }
+              if (compression.status === "compressed") {
+                uploadFile = compression.file;
+                wasCompressed = true;
+              } else {
+                compressionNotice ||= t(
+                  `dashboard:chatTest.attachments.${
+                    compression.status === "tooLong"
+                      ? "videoTooLong"
+                      : compression.status === "cannotFit"
+                        ? "videoCannotFit"
+                        : compression.status === "cancelled"
+                          ? "videoCompressionCancelled"
+                          : compression.status === "unsupported"
+                            ? "videoCompressionUnsupported"
+                            : "videoCompressionFailed"
+                  }`,
+                );
+                continue;
+              }
+            }
+            if (uploadFile.size > attachmentMaxBytes) {
               uploadTooLargeMaxBytes ??= attachmentMaxBytes;
               continue;
             }
-            const exceedsUploadLimit = mediaMaxUploadBytes > 0 && file.size > mediaMaxUploadBytes;
+            const exceedsUploadLimit =
+              mediaMaxUploadBytes > 0 && uploadFile.size > mediaMaxUploadBytes;
             const canUpload = uploadEnabled && !exceedsUploadLimit;
             if (canUpload) {
-              const upload = await uploadMediaFile(file, file.name);
+              const upload = await uploadMediaFile(uploadFile, uploadFile.name);
               if (upload.status === "ok") {
                 accepted.push({
                   id: newId("attachment"),
-                  name: file.name,
+                  name: uploadFile.name,
                   modality,
-                  sizeBytes: file.size,
+                  sizeBytes: uploadFile.size,
                   kind: "media",
                   mediaId: upload.id,
-                  previewUrl: URL.createObjectURL(file),
+                  previewUrl: URL.createObjectURL(uploadFile),
                 });
+                if (wasCompressed) compressedVideoSize ??= uploadFile.size;
                 continue;
               }
               if (upload.status === "quota") {
@@ -845,7 +900,7 @@ function ChatTestPage() {
                 });
               }
             }
-            if (file.size > Math.min(INLINE_ATTACHMENT_MAX_BYTES, attachmentMaxBytes)) {
+            if (uploadFile.size > Math.min(INLINE_ATTACHMENT_MAX_BYTES, attachmentMaxBytes)) {
               if (uploadEnabled && exceedsUploadLimit) {
                 uploadTooLargeMaxBytes ??= mediaMaxUploadBytes;
               } else {
@@ -855,11 +910,11 @@ function ChatTestPage() {
             }
             accepted.push({
               id: newId("attachment"),
-              name: file.name,
+              name: uploadFile.name,
               modality,
-              sizeBytes: file.size,
+              sizeBytes: uploadFile.size,
               kind: "data",
-              dataUrl: await readFileAsDataUrl(file, mime),
+              dataUrl: await readFileAsDataUrl(uploadFile, mime),
             });
             continue;
           }
@@ -917,6 +972,7 @@ function ChatTestPage() {
 
           accepted.push({ id, name, modality, sizeBytes: byteSize, kind: "data", dataUrl });
         }
+        if (!isMountedRef.current) return;
         if (accepted.length > 0) {
           setAttachments((current) => [...current, ...accepted]);
         }
@@ -938,6 +994,14 @@ function ChatTestPage() {
             }),
           );
         }
+        if (compressedVideoSize !== null) {
+          notices.push(
+            t("dashboard:chatTest.attachments.videoCompressed", {
+              size: formatBytes(compressedVideoSize),
+            }),
+          );
+        }
+        if (compressionNotice) notices.push(compressionNotice);
         if (rejectedCount > 0) {
           notices.push(t("dashboard:chatTest.attachments.rejected", { count: rejectedCount }));
         }
@@ -948,7 +1012,8 @@ function ChatTestPage() {
         }
         setAttachmentNotice(notices.join(" "));
       } finally {
-        setIsProcessingImages(false);
+        isAddingAttachmentsRef.current = false;
+        if (isMountedRef.current) setIsProcessingImages(false);
       }
     },
     [
@@ -959,8 +1024,13 @@ function ChatTestPage() {
       mediaMaxUploadBytes,
       queryClient,
       t,
+      isMountedRef,
     ],
   );
+
+  const cancelVideoCompression = useCallback(() => {
+    videoCompressionAbortRef.current?.abort();
+  }, []);
 
   const openFilePicker = useCallback(() => {
     fileInputRef.current?.click();
@@ -1538,6 +1608,22 @@ function ChatTestPage() {
             <p className="text-xs text-muted-foreground" role="status">
               {attachmentNotice}
             </p>
+          ) : null}
+          {videoCompressionProgress !== null ? (
+            <div
+              className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground"
+              role="status"
+            >
+              <Loader2 className="size-3.5 shrink-0 animate-spin" aria-hidden="true" />
+              <span className="min-w-0 flex-1">
+                {t("dashboard:chatTest.attachments.compressingVideo", {
+                  progress: videoCompressionProgress,
+                })}
+              </span>
+              <Button type="button" variant="ghost" size="touch" onClick={cancelVideoCompression}>
+                {t("dashboard:chatTest.attachments.cancelCompression")}
+              </Button>
+            </div>
           ) : null}
           <div className="flex items-end gap-2">
             <input

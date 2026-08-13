@@ -61,6 +61,7 @@ allowBuilds:
 # Catalog: single-version deps shared across workspace packages.
 # Bump shared dependency versions here, not in individual package.json files.
 catalog:
+  mediabunny: ^1.52.3
   dotenv: ^17.4.2
   zod: ^4.4.3
   "@types/node": ^26.1.2

@@ -37,6 +37,8 @@
     "attachments": {
       "attach": "Adjuntar archivo",
       "attachVideo": "Adjuntar video",
+      "cancelCompression": "Cancelar compresión",
+      "compressingVideo": "Comprimiendo video… {{progress}}%",
       "composerLabel": "Archivos adjuntos",
       "expired": "Un archivo adjunto expiró. Quítalo y adjunta el archivo de nuevo para continuar.",
       "expiredBadge": "Expirada",
@@ -51,7 +53,13 @@
       "requestTooLarge": "Esta solicitud es demasiado grande para enviarse. Quita algunos archivos o inicia un hilo nuevo.",
       "signFailed": "No se pudieron preparar los archivos subidos para enviarlos. Revisa tu conexión e intenta de nuevo.",
       "unsupported": "Este tipo de archivo no es compatible con el modelo seleccionado.",
-      "uploadTooLarge": "Este archivo supera el límite de adjuntos de {{size}} para el modelo seleccionado. Elige un archivo más pequeño o pide a un administrador que aumente el límite."
+      "uploadTooLarge": "Este archivo supera el límite de adjuntos de {{size}} para el modelo seleccionado. Elige un archivo más pequeño o pide a un administrador que aumente el límite.",
+      "videoCannotFit": "Este video no se puede comprimir lo suficiente para el límite de adjuntos. Recórtalo a seis minutos o menos, o elige un archivo más pequeño.",
+      "videoCompressed": "Video comprimido a {{size}} y adjuntado.",
+      "videoCompressionCancelled": "Compresión de video cancelada.",
+      "videoCompressionFailed": "No se pudo comprimir este video. Elige un video MP4 más pequeño e inténtalo de nuevo.",
+      "videoCompressionUnsupported": "Este navegador no puede comprimir este video. Elige un video MP4 más pequeño o usa un navegador compatible con codificación de video.",
+      "videoTooLong": "Los videos deben durar seis minutos o menos antes de la compresión. Recorta el video e inténtalo de nuevo."
     },
     "emptyModels": "No hay modelos visibles disponibles.",
     "emptyTranscript": "Todavía no hay mensajes.",
