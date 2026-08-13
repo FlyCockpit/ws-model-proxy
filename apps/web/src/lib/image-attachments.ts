@@ -13,14 +13,20 @@
 // sit safely below that 10 MB route limit.
 
 import {
+  acceptedMediaInputAcceptAttr,
+  CLIENT_ACCEPTED_AUDIO_MIMES,
   CLIENT_ACCEPTED_IMAGE_MIMES,
+  CLIENT_ACCEPTED_VIDEO_MIMES,
   DEFAULT_IMAGE_ENCODE_QUALITY,
   DEFAULT_IMAGE_INLINE_PROFILE,
   DEFAULT_IMAGE_MAX_EDGE,
   decideImageEncode,
   type ImageInlineProfile,
-  isClientAcceptedImageMime,
+  type MediaInputInfo,
+  type MediaInputModality,
   type ModelInlineSafeImageMime,
+  mediaInputInfo,
+  mediaModalityForMime,
   reencodeMimeChain,
 } from "@ws-model-proxy/config/media-policy";
 
@@ -28,43 +34,23 @@ export const ACCEPTED_IMAGE_TYPES = CLIENT_ACCEPTED_IMAGE_MIMES;
 
 export const ACCEPTED_IMAGE_ACCEPT_ATTR = ACCEPTED_IMAGE_TYPES.join(",");
 
-// These mirror the server-side magic-byte allowlist. Keeping the picker narrow
-// avoids inviting users to select a file the upload service will reject.
-export const ACCEPTED_AUDIO_TYPES = [
-  "audio/mpeg",
-  "audio/wav",
-  "audio/flac",
-  "audio/ogg",
-  "audio/mp4",
-] as const;
-export const ACCEPTED_VIDEO_TYPES = [
-  "video/mp4",
-  "video/webm",
-  "video/quicktime",
-  "video/x-matroska",
-] as const;
+export const ACCEPTED_AUDIO_TYPES = CLIENT_ACCEPTED_AUDIO_MIMES;
+export const ACCEPTED_VIDEO_TYPES = CLIENT_ACCEPTED_VIDEO_MIMES;
 
-export type AttachmentModality = "image" | "audio" | "video";
+export type AttachmentModality = MediaInputModality;
 export type AttachmentModalities = Record<AttachmentModality, boolean>;
-
-const attachmentTypesByModality: Record<AttachmentModality, readonly string[]> = {
-  image: ACCEPTED_IMAGE_TYPES,
-  audio: ACCEPTED_AUDIO_TYPES,
-  video: ACCEPTED_VIDEO_TYPES,
-};
+export type AttachmentFileInfo = MediaInputInfo;
 
 export function acceptedAttachmentAcceptAttr(modalities: AttachmentModalities): string {
-  return (Object.keys(attachmentTypesByModality) as AttachmentModality[])
-    .filter((modality) => modalities[modality])
-    .flatMap((modality) => attachmentTypesByModality[modality])
-    .join(",");
+  return acceptedMediaInputAcceptAttr(modalities);
 }
 
 export function attachmentModalityForType(type: string): AttachmentModality | null {
-  if (isClientAcceptedImageMime(type)) return "image";
-  if ((ACCEPTED_AUDIO_TYPES as readonly string[]).includes(type)) return "audio";
-  if ((ACCEPTED_VIDEO_TYPES as readonly string[]).includes(type)) return "video";
-  return null;
+  return mediaModalityForMime(type);
+}
+
+export function attachmentFileInfo(file: Pick<File, "name" | "type">): AttachmentFileInfo | null {
+  return mediaInputInfo(file);
 }
 
 /** Longest edge after downscaling; matches the shared media-policy default. */
@@ -118,7 +104,7 @@ export type ProcessImageOptions = {
 };
 
 export function isAcceptedImageType(type: string): boolean {
-  return isClientAcceptedImageMime(type);
+  return mediaModalityForMime(type) === "image";
 }
 
 // Convert a processed base64 `data:` URL back into a Blob for multipart upload.
@@ -159,13 +145,23 @@ function scaleWithin(width: number, height: number, maxEdge: number) {
   };
 }
 
-export function readFileAsDataUrl(file: File): Promise<string> {
+export function readFileAsDataUrl(file: File, mime?: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : "");
+    reader.onload = () => {
+      const dataUrl = typeof reader.result === "string" ? reader.result : "";
+      resolve(mime ? rewriteDataUrlMime(dataUrl, mime) : dataUrl);
+    };
     reader.onerror = () => reject(new Error("readFailed"));
     reader.readAsDataURL(file);
   });
+}
+
+/** Replace a browser-supplied data URL MIME with the shared canonical MIME. */
+export function rewriteDataUrlMime(dataUrl: string, mime: string): string {
+  if (!dataUrl.startsWith("data:")) return dataUrl;
+  const comma = dataUrl.indexOf(",");
+  return comma === -1 ? dataUrl : `data:${mime};base64,${dataUrl.slice(comma + 1)}`;
 }
 
 function decodeImage(objectUrl: string): Promise<HTMLImageElement> {
@@ -243,9 +239,11 @@ export async function processImageFile(
   file: File,
   options: ProcessImageOptions = {},
 ): Promise<ProcessImageResult> {
-  if (!isAcceptedImageType(file.type)) {
+  const fileInfo = attachmentFileInfo(file);
+  if (fileInfo?.modality !== "image") {
     return { ok: false, reason: "unsupported", name: file.name };
   }
+  const sourceMime = fileInfo.mime;
 
   const profile = options.profile ?? DEFAULT_IMAGE_INLINE_PROFILE;
   const objectUrl = URL.createObjectURL(file);
@@ -258,7 +256,7 @@ export async function processImageFile(
     }
 
     const decision = decideImageEncode({
-      sourceMime: file.type,
+      sourceMime,
       width: naturalWidth,
       height: naturalHeight,
       byteSize: file.size,
@@ -268,7 +266,7 @@ export async function processImageFile(
     });
 
     if (decision.action === "passthrough") {
-      const dataUrl = await readFileAsDataUrl(file);
+      const dataUrl = await readFileAsDataUrl(file, sourceMime);
       const byteSize = dataUrlByteSize(dataUrl);
       // File size and decoded payload size can diverge; re-check before shipping.
       if (byteSize <= PER_IMAGE_MAX_BYTES) {
@@ -285,7 +283,7 @@ export async function processImageFile(
     const mimes =
       decision.action === "reencode"
         ? decision.mimes
-        : reencodeMimeChain(file.type, file.size <= PER_IMAGE_MAX_BYTES);
+        : reencodeMimeChain(sourceMime, file.size <= PER_IMAGE_MAX_BYTES);
     const encoded = reencodeUntilFits(image, width, height, mimes, PER_IMAGE_MAX_BYTES);
     if (!encoded) {
       return { ok: false, reason: "decodeFailed", name: file.name };

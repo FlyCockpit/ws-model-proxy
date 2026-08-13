@@ -52,7 +52,7 @@ import {
   type AttachmentModalities,
   type AttachmentModality,
   acceptedAttachmentAcceptAttr,
-  attachmentModalityForType,
+  attachmentFileInfo,
   dataUrlToBlob,
   MAX_ATTACHMENTS_PER_MESSAGE,
   PER_IMAGE_MAX_BYTES,
@@ -724,8 +724,8 @@ function ChatTestPage() {
   const addAttachmentFiles = useCallback(
     async (files: File[]) => {
       const supportedFiles = files.flatMap((file) => {
-        const modality = attachmentModalityForType(file.type);
-        return modality && attachmentModalities[modality] ? [{ file, modality }] : [];
+        const info = attachmentFileInfo(file);
+        return info && attachmentModalities[info.modality] ? [{ file, ...info }] : [];
       });
       if (supportedFiles.length === 0) {
         if (files.length > 0) setAttachmentNotice(t("dashboard:chatTest.attachments.unsupported"));
@@ -749,7 +749,7 @@ function ChatTestPage() {
         const accepted: ChatAttachment[] = [];
         let rejectedCount = 0;
         let quotaHit = false;
-        for (const { file, modality } of toProcess) {
+        for (const { file, modality, mime } of toProcess) {
           if (modality !== "image") {
             const canUpload =
               uploadEnabled && (mediaMaxUploadBytes === 0 || file.size <= mediaMaxUploadBytes);
@@ -789,7 +789,7 @@ function ChatTestPage() {
               name: file.name,
               modality,
               kind: "data",
-              dataUrl: await readFileAsDataUrl(file),
+              dataUrl: await readFileAsDataUrl(file, mime),
             });
             continue;
           }

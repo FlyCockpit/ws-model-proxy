@@ -1,10 +1,16 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  acceptedMediaInputAcceptAttr,
+  CLIENT_ACCEPTED_MEDIA_MIMES,
   decideImageEncode,
   imageNeedsInlineNormalization,
   isClientAcceptedImageMime,
+  isClientAcceptedMediaMime,
   isModelInlineSafeImageMime,
+  MEDIA_EXTENSION_MIME_MAP,
+  MEDIA_MIME_ALIASES,
+  mediaInputInfo,
   normalizeImageMime,
   reencodeMimeChain,
 } from "./media-policy";
@@ -29,6 +35,52 @@ describe("mime allowlists", () => {
     expect(isClientAcceptedImageMime("image/webp")).toBe(true);
     expect(isClientAcceptedImageMime("image/gif")).toBe(true);
     expect(isClientAcceptedImageMime("image/svg+xml")).toBe(false);
+  });
+});
+
+describe("browser media-input catalog", () => {
+  it("keeps alias and extension targets in the canonical allowlist", () => {
+    for (const mime of [
+      ...Object.values(MEDIA_MIME_ALIASES),
+      ...Object.values(MEDIA_EXTENSION_MIME_MAP),
+    ]) {
+      expect(CLIENT_ACCEPTED_MEDIA_MIMES).toContain(mime);
+      expect(isClientAcceptedMediaMime(mime)).toBe(true);
+    }
+  });
+
+  it("falls back to a supported extension when WebKit returns an empty or generic type", () => {
+    expect(mediaInputInfo({ name: "voice-note.m4a", type: "" })).toEqual({
+      modality: "audio",
+      mime: "audio/mp4",
+    });
+    expect(mediaInputInfo({ name: "voice-note.m4a", type: "application/octet-stream" })).toEqual({
+      modality: "audio",
+      mime: "audio/mp4",
+    });
+  });
+
+  it("uses the M4A/M4B extension for ambiguous generic MP4 declarations", () => {
+    expect(mediaInputInfo({ name: "voice-note.m4a", type: "video/mp4" })).toEqual({
+      modality: "audio",
+      mime: "audio/mp4",
+    });
+  });
+
+  it("otherwise gives a known declared MIME precedence over the filename", () => {
+    expect(mediaInputInfo({ name: "clip.mp4", type: "audio/mpeg" })).toEqual({
+      modality: "audio",
+      mime: "audio/mpeg",
+    });
+  });
+
+  it("derives a modality-specific accept filter from the same catalog", () => {
+    const accept = acceptedMediaInputAcceptAttr({ image: false, audio: true, video: true });
+
+    expect(accept).toContain("audio/x-m4a");
+    expect(accept).toContain(".m4a");
+    expect(accept).toContain(".mov");
+    expect(accept).not.toContain(".jpg");
   });
 });
 

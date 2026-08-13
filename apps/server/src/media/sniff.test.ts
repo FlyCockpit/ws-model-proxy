@@ -1,3 +1,4 @@
+import { isClientAcceptedMediaMime } from "@ws-model-proxy/config/media-policy";
 import { describe, expect, it } from "vitest";
 import { sniffMediaMime } from "./sniff.js";
 
@@ -16,57 +17,64 @@ function ftyp(brand: string): Uint8Array {
   return new Uint8Array([0, 0, 0, 0x18, ...ascii("ftyp"), ...ascii(brand)]);
 }
 
+function expectSniffedMime(input: Uint8Array, expected: string) {
+  const mime = sniffMediaMime(input);
+  expect(mime).toBe(expected);
+  expect(mime).not.toBeNull();
+  expect(isClientAcceptedMediaMime(mime!)).toBe(true);
+}
+
 describe("sniffMediaMime — accepts allowlisted types", () => {
   it("detects JPEG", () => {
-    expect(sniffMediaMime(bytes(0xff, 0xd8, 0xff, 0xe0))).toBe("image/jpeg");
+    expectSniffedMime(bytes(0xff, 0xd8, 0xff, 0xe0), "image/jpeg");
   });
   it("detects PNG", () => {
-    expect(sniffMediaMime(bytes(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a))).toBe("image/png");
+    expectSniffedMime(bytes(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a), "image/png");
   });
   it("detects GIF", () => {
-    expect(sniffMediaMime(ascii("GIF89a"))).toBe("image/gif");
+    expectSniffedMime(ascii("GIF89a"), "image/gif");
   });
   it("detects WebP", () => {
     const buf = new Uint8Array([...ascii("RIFF"), 0, 0, 0, 0, ...ascii("WEBP")]);
-    expect(sniffMediaMime(buf)).toBe("image/webp");
+    expectSniffedMime(buf, "image/webp");
   });
   it("detects WAV", () => {
     const buf = new Uint8Array([...ascii("RIFF"), 0, 0, 0, 0, ...ascii("WAVE")]);
-    expect(sniffMediaMime(buf)).toBe("audio/wav");
+    expectSniffedMime(buf, "audio/wav");
   });
   it("detects FLAC", () => {
-    expect(sniffMediaMime(ascii("fLaC"))).toBe("audio/flac");
+    expectSniffedMime(ascii("fLaC"), "audio/flac");
   });
   it("detects Ogg/Opus", () => {
-    expect(sniffMediaMime(ascii("OggS"))).toBe("audio/ogg");
+    expectSniffedMime(ascii("OggS"), "audio/ogg");
   });
   it("detects MP3 via ID3", () => {
-    expect(sniffMediaMime(ascii("ID3"))).toBe("audio/mpeg");
+    expectSniffedMime(ascii("ID3"), "audio/mpeg");
   });
   it("detects MP3 via frame sync", () => {
-    expect(sniffMediaMime(bytes(0xff, 0xfb, 0x90, 0x00))).toBe("audio/mpeg");
+    expectSniffedMime(bytes(0xff, 0xfb, 0x90, 0x00), "audio/mpeg");
   });
   it("detects a real-ish MPEG1 Layer III frame header (128 kbps, 44.1 kHz)", () => {
     // FF FB: sync + MPEG1 (11) + Layer III (01) + no CRC. 90: bitrate idx 1001,
     // sample rate 00 (44.1 kHz). A valid, non-reserved frame header.
-    expect(sniffMediaMime(bytes(0xff, 0xfb, 0x90, 0x44))).toBe("audio/mpeg");
+    expectSniffedMime(bytes(0xff, 0xfb, 0x90, 0x44), "audio/mpeg");
   });
   it("detects MP4 (isom brand) as video/mp4", () => {
-    expect(sniffMediaMime(ftyp("isom"))).toBe("video/mp4");
+    expectSniffedMime(ftyp("isom"), "video/mp4");
   });
   it("detects M4A brand as audio/mp4", () => {
-    expect(sniffMediaMime(ftyp("M4A "))).toBe("audio/mp4");
+    expectSniffedMime(ftyp("M4A "), "audio/mp4");
   });
   it("detects QuickTime brand as video/quicktime", () => {
-    expect(sniffMediaMime(ftyp("qt  "))).toBe("video/quicktime");
+    expectSniffedMime(ftyp("qt  "), "video/quicktime");
   });
   it("detects WebM via EBML + doctype", () => {
     const buf = new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, ...ascii(" ... webm ... ")]);
-    expect(sniffMediaMime(buf)).toBe("video/webm");
+    expectSniffedMime(buf, "video/webm");
   });
   it("detects Matroska via EBML", () => {
     const buf = new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, ...ascii(" matroska ")]);
-    expect(sniffMediaMime(buf)).toBe("video/x-matroska");
+    expectSniffedMime(buf, "video/x-matroska");
   });
 });
 

@@ -70,6 +70,152 @@ export const CLIENT_ACCEPTED_IMAGE_MIMES = [
 
 export type ClientAcceptedImageMime = (typeof CLIENT_ACCEPTED_IMAGE_MIMES)[number];
 
+// ---------------------------------------------------------------------------
+// Browser media-input catalog
+// ---------------------------------------------------------------------------
+// This catalog describes media containers the browser may offer for chat input.
+// It intentionally does not inspect bytes; server media storage remains the
+// authority that validates uploaded content with magic-byte sniffing.
+
+export type MediaInputModality = "image" | "audio" | "video";
+
+export const CLIENT_ACCEPTED_AUDIO_MIMES = [
+  "audio/mpeg",
+  "audio/wav",
+  "audio/flac",
+  "audio/ogg",
+  "audio/mp4",
+] as const;
+
+export const CLIENT_ACCEPTED_VIDEO_MIMES = [
+  "video/mp4",
+  "video/webm",
+  "video/quicktime",
+  "video/x-matroska",
+] as const;
+
+export const CLIENT_ACCEPTED_MEDIA_MIMES = [
+  ...CLIENT_ACCEPTED_IMAGE_MIMES,
+  ...CLIENT_ACCEPTED_AUDIO_MIMES,
+  ...CLIENT_ACCEPTED_VIDEO_MIMES,
+] as const;
+
+export type ClientAcceptedMediaMime = (typeof CLIENT_ACCEPTED_MEDIA_MIMES)[number];
+
+const modalityByCanonicalMediaMime: Record<ClientAcceptedMediaMime, MediaInputModality> = {
+  "image/png": "image",
+  "image/jpeg": "image",
+  "image/webp": "image",
+  "image/gif": "image",
+  "audio/mpeg": "audio",
+  "audio/wav": "audio",
+  "audio/flac": "audio",
+  "audio/ogg": "audio",
+  "audio/mp4": "audio",
+  "video/mp4": "video",
+  "video/webm": "video",
+  "video/quicktime": "video",
+  "video/x-matroska": "video",
+};
+
+/** Vendor/browser MIME aliases mapped to the canonical media catalog. */
+export const MEDIA_MIME_ALIASES: Record<string, ClientAcceptedMediaMime> = {
+  "image/jpg": "image/jpeg",
+  "audio/mp3": "audio/mpeg",
+  "audio/x-mpeg": "audio/mpeg",
+  "audio/x-wav": "audio/wav",
+  "audio/wave": "audio/wav",
+  "audio/x-flac": "audio/flac",
+  "application/ogg": "audio/ogg",
+  "audio/opus": "audio/ogg",
+  "audio/x-m4a": "audio/mp4",
+  "audio/m4a": "audio/mp4",
+  "video/x-m4v": "video/mp4",
+  "application/x-matroska": "video/x-matroska",
+};
+
+/** Supported filename extensions mapped to the canonical media catalog. */
+export const MEDIA_EXTENSION_MIME_MAP: Record<string, ClientAcceptedMediaMime> = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+  ".mp3": "audio/mpeg",
+  ".wav": "audio/wav",
+  ".flac": "audio/flac",
+  ".ogg": "audio/ogg",
+  ".opus": "audio/ogg",
+  ".m4a": "audio/mp4",
+  ".m4b": "audio/mp4",
+  ".mp4": "video/mp4",
+  ".m4v": "video/mp4",
+  ".webm": "video/webm",
+  ".mov": "video/quicktime",
+  ".mkv": "video/x-matroska",
+};
+
+export type MediaInputModalities = Record<MediaInputModality, boolean>;
+export type MediaInputInfo = { modality: MediaInputModality; mime: ClientAcceptedMediaMime };
+
+/** Normalize parameters/case and browser MIME aliases to a canonical MIME. */
+export function normalizeMediaMime(mime: string): string {
+  const base = mime.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+  return MEDIA_MIME_ALIASES[base] ?? base;
+}
+
+export function mediaModalityForMime(mime: string): MediaInputModality | null {
+  const normalized = normalizeMediaMime(mime);
+  return modalityByCanonicalMediaMime[normalized as ClientAcceptedMediaMime] ?? null;
+}
+
+export function isClientAcceptedMediaMime(mime: string): mime is ClientAcceptedMediaMime {
+  return mediaModalityForMime(mime) !== null;
+}
+
+function extensionForFileName(name: string): string | null {
+  const match = /\.[^.]+$/.exec(name.trim().toLowerCase());
+  return match?.[0] ?? null;
+}
+
+/**
+ * Classify a browser-selected file without relying solely on its declared MIME.
+ * WebKit can return an empty or vendor-specific type; ISO-BMFF M4A/M4B files
+ * also sometimes arrive as generic video/mp4, so their audio extension wins.
+ */
+export function mediaInputInfo({
+  name,
+  type,
+}: {
+  name: string;
+  type: string;
+}): MediaInputInfo | null {
+  const extensionMime = MEDIA_EXTENSION_MIME_MAP[extensionForFileName(name) ?? ""];
+  const declaredMime = normalizeMediaMime(type);
+  if (declaredMime === "video/mp4" && extensionMime === "audio/mp4") {
+    return { modality: "audio", mime: "audio/mp4" };
+  }
+  const declaredModality = mediaModalityForMime(declaredMime);
+  if (declaredModality) {
+    return { modality: declaredModality, mime: declaredMime as ClientAcceptedMediaMime };
+  }
+  if (!extensionMime) return null;
+  return { modality: modalityByCanonicalMediaMime[extensionMime], mime: extensionMime };
+}
+
+/** Explicit media picker filter; extensions are included for iOS WebKit. */
+export function acceptedMediaInputAcceptAttr(modalities: MediaInputModalities): string {
+  const supports = (mime: ClientAcceptedMediaMime) =>
+    modalities[modalityByCanonicalMediaMime[mime]];
+  return [
+    ...CLIENT_ACCEPTED_MEDIA_MIMES.filter(supports),
+    ...Object.keys(MEDIA_MIME_ALIASES).filter((alias) => supports(MEDIA_MIME_ALIASES[alias]!)),
+    ...Object.keys(MEDIA_EXTENSION_MIME_MAP).filter((extension) =>
+      supports(MEDIA_EXTENSION_MIME_MAP[extension]!),
+    ),
+  ].join(",");
+}
+
 /**
  * Formats commonly accepted by cloud OpenAI-compatible vision APIs as data URLs.
  * Not used as the product default — local-first relay targets are narrower.
@@ -114,9 +260,7 @@ export function isClientAcceptedImageMime(mime: string): mime is ClientAcceptedI
  * alias `image/jpg` → `image/jpeg` so TS and CLI safe-list checks stay aligned.
  */
 export function normalizeImageMime(mime: string): string {
-  const base = mime.split(";")[0]?.trim().toLowerCase() ?? "";
-  if (base === "image/jpg") return "image/jpeg";
-  return base;
+  return normalizeMediaMime(mime);
 }
 
 export type ImageEncodeDecision =
