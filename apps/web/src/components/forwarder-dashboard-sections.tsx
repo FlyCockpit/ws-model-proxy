@@ -40,6 +40,7 @@ import { z } from "zod";
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
 import { InlineRetry } from "@/components/inline-retry";
 import { SegmentedControl } from "@/components/segmented-control";
+import { WideContent } from "@/components/wide-content";
 import { orpc } from "@/utils/orpc";
 
 type CliDevice = Awaited<
@@ -167,9 +168,9 @@ function SecretDisplay({ secret, label }: { secret: string; label: string }) {
     <div className="space-y-2 rounded-md border bg-muted/40 p-3">
       <p className="text-sm font-medium">{label}</p>
       <div className="flex items-center gap-2">
-        <code className="min-w-0 flex-1 overflow-x-auto border bg-background px-2 py-2 font-mono text-xs">
-          {secret}
-        </code>
+        <WideContent className="flex-1">
+          <code className="block border bg-background px-2 py-2 font-mono text-xs">{secret}</code>
+        </WideContent>
         <Button
           type="button"
           size="icon-touch"
@@ -454,7 +455,7 @@ export function CliEndpointsModelsSection() {
   const isDeleting = removeCli.isPending || removeEndpoint.isPending || removeModel.isPending;
 
   return (
-    <section>
+    <section className="min-w-0 max-w-full">
       <SectionHeader
         title={t("dashboard:clis.title")}
         description={t("dashboard:clis.description")}
@@ -539,7 +540,7 @@ export function CliEndpointsModelsSection() {
                   </div>
                 ) : (
                   device.endpoints.map((endpoint) => (
-                    <div key={endpoint.id} className="p-4">
+                    <div key={endpoint.id} className="min-w-0 p-4">
                       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                         <div className="min-w-0">
                           <div className="flex flex-wrap items-center gap-2">
@@ -585,7 +586,7 @@ export function CliEndpointsModelsSection() {
                         </Button>
                       </div>
 
-                      <div className="mt-3 overflow-x-auto">
+                      <WideContent className="mt-3">
                         <table className="w-full min-w-[680px] text-left text-xs">
                           <thead className="border-b text-muted-foreground">
                             <tr>
@@ -699,7 +700,7 @@ export function CliEndpointsModelsSection() {
                             ))}
                           </tbody>
                         </table>
-                      </div>
+                      </WideContent>
                     </div>
                   ))
                 )}
@@ -805,7 +806,7 @@ export function PoolsSection() {
   }
 
   return (
-    <section>
+    <section className="min-w-0 max-w-full">
       <SectionHeader
         title={t("dashboard:pools.title")}
         description={t("dashboard:pools.description")}
@@ -905,15 +906,15 @@ export function PoolsSection() {
                 </div>
               </div>
 
-              <div className="grid gap-0 divide-y lg:grid-cols-[1fr_22rem] lg:divide-x lg:divide-y-0">
-                <div className="p-4">
+              <div className="grid min-w-0 gap-0 divide-y lg:grid-cols-[1fr_22rem] lg:divide-x lg:divide-y-0">
+                <div className="min-w-0 p-4">
                   <h4 className="mb-2 text-sm font-medium">{t("dashboard:pools.membersTitle")}</h4>
                   {pool.members.length === 0 ? (
                     <p className="text-sm text-muted-foreground">
                       {t("dashboard:pools.noMembers")}
                     </p>
                   ) : (
-                    <div className="overflow-x-auto">
+                    <WideContent>
                       <table className="w-full min-w-[620px] text-left text-xs">
                         <thead className="border-b text-muted-foreground">
                           <tr>
@@ -1008,11 +1009,11 @@ export function PoolsSection() {
                           ))}
                         </tbody>
                       </table>
-                    </div>
+                    </WideContent>
                   )}
                 </div>
 
-                <div className="p-4">
+                <div className="min-w-0 p-4">
                   <h4 className="mb-2 text-sm font-medium">{t("dashboard:pools.grantsTitle")}</h4>
                   {pool.grants.length === 0 ? (
                     <p className="text-sm text-muted-foreground">{t("dashboard:pools.noGrants")}</p>
@@ -1055,7 +1056,7 @@ export function PoolsSection() {
             <SheetTitle>{t("dashboard:pools.editTitle")}</SheetTitle>
             <SheetDescription>{t("dashboard:pools.editDescription")}</SheetDescription>
           </SheetHeader>
-          <div className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain px-4 pb-[max(1rem,var(--safe-area-bottom))]">
+          <div className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-clip overscroll-y-contain px-4 pb-[max(1rem,var(--safe-area-bottom))]">
             {editingPool ? (
               <PoolForm
                 key={editingPool.id}
@@ -1092,7 +1093,7 @@ export function PoolsSection() {
             <SheetTitle>{t("dashboard:pools.editMemberTitle")}</SheetTitle>
             <SheetDescription>{t("dashboard:pools.editMemberDescription")}</SheetDescription>
           </SheetHeader>
-          <div className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain px-4 pb-[max(1rem,var(--safe-area-bottom))]">
+          <div className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-clip overscroll-y-contain px-4 pb-[max(1rem,var(--safe-area-bottom))]">
             {editingMember ? (
               <PoolMemberForm
                 key={editingMember.id}
@@ -1847,7 +1848,7 @@ export function CliTokensSection() {
   }
 
   return (
-    <section>
+    <section className="min-w-0 max-w-full">
       <SectionHeader
         title={t("dashboard:tokens.cliTitle")}
         description={t("dashboard:tokens.cliDescription")}
@@ -1951,7 +1952,7 @@ function TokenTable<TToken extends CliToken | ModelApiToken>({
   if (tokens.length === 0) return <EmptyState>{t("dashboard:tokens.empty")}</EmptyState>;
 
   return (
-    <div className="overflow-x-auto rounded-md border">
+    <WideContent className="rounded-md border">
       <table className="w-full min-w-[720px] text-left text-xs">
         <thead className="border-b text-muted-foreground">
           <tr>
@@ -2001,7 +2002,7 @@ function TokenTable<TToken extends CliToken | ModelApiToken>({
           ))}
         </tbody>
       </table>
-    </div>
+    </WideContent>
   );
 }
 
@@ -2078,7 +2079,7 @@ export function ModelApiTokensSection() {
   }
 
   return (
-    <section>
+    <section className="min-w-0 max-w-full">
       <SectionHeader
         title={t("dashboard:tokens.modelApiTitle")}
         description={t("dashboard:tokens.modelApiDescription")}
@@ -2237,7 +2238,7 @@ function VisibleModelChecklist({
   return (
     <div className="space-y-2">
       <Label>{t("tokens.allowlistModels")}</Label>
-      <div className="max-h-56 overflow-y-auto rounded-md border">
+      <div className="max-h-56 overflow-y-auto overflow-x-clip rounded-md border">
         {rows.length === 0 ? (
           <p className="p-3 text-sm text-muted-foreground">{t("tokens.noVisibleModels")}</p>
         ) : (
@@ -2277,7 +2278,7 @@ function VisibleModelPreview({ preview }: { preview: TokenPreview }) {
   return (
     <div className="rounded-md border p-3">
       <p className="text-sm font-medium">{t("tokens.visiblePreview", { count })}</p>
-      <div className="mt-2 max-h-40 overflow-y-auto space-y-1">
+      <div className="mt-2 max-h-40 overflow-y-auto overflow-x-clip space-y-1">
         {[...preview.directModels, ...preview.modelPools].map((model) => (
           <code key={model.id} className="block break-all font-mono text-xs text-muted-foreground">
             {model.id}
@@ -2318,7 +2319,7 @@ export function RelayMetadataSection() {
   }
 
   return (
-    <section>
+    <section className="min-w-0 max-w-full">
       <SectionHeader
         title={t("dashboard:relay.title")}
         description={t("dashboard:relay.description")}
@@ -2371,7 +2372,7 @@ export function RelayMetadataSection() {
       {rowsData.length === 0 ? (
         <EmptyState>{t("dashboard:relay.empty")}</EmptyState>
       ) : (
-        <div className="overflow-x-auto rounded-md border">
+        <WideContent className="rounded-md border">
           <table className="w-full min-w-[900px] text-left text-xs">
             <thead className="border-b text-muted-foreground">
               <tr>
@@ -2412,7 +2413,7 @@ export function RelayMetadataSection() {
               ))}
             </tbody>
           </table>
-        </div>
+        </WideContent>
       )}
       <ConfirmDeleteDialog
         open={Boolean(deleteRow)}

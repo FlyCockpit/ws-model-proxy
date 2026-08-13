@@ -16,7 +16,7 @@ export default function BottomNav({ hidden }: { hidden?: boolean }) {
   const { t } = useTranslation("nav");
   const items = getNavItems({
     placement: "mobile",
-    isAuthenticated: state.status === "authenticated",
+    isAuthenticated: Boolean(session),
     role: session?.user.role,
   });
 

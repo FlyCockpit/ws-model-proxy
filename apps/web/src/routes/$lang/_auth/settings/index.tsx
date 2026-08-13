@@ -309,7 +309,7 @@ function SlugChangePanel({ currentSlug }: { currentSlug: string }) {
               </p>
             </div>
           </div>
-          <div className="max-h-48 overflow-y-auto rounded border bg-background">
+          <div className="max-h-48 overflow-y-auto overflow-x-clip rounded border bg-background">
             {slugPreviewData.affectedModels.length === 0 ? (
               <p className="p-3 text-sm text-muted-foreground">
                 {t("settings:profile.noAffectedModels")}

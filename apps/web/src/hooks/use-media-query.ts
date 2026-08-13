@@ -1,5 +1,9 @@
 import { useSyncExternalStore } from "react";
 
+/** Matches Tailwind `md` and `useIsMobile()` (`min-width: 768px`). */
+export const MOBILE_BREAKPOINT_PX = 768;
+export const DESKTOP_MEDIA_QUERY = `(min-width: ${MOBILE_BREAKPOINT_PX}px)`;
+
 export function useMediaQuery(query: string): boolean {
   return useSyncExternalStore(
     (callback) => {
@@ -13,9 +17,9 @@ export function useMediaQuery(query: string): boolean {
 }
 
 export function useIsMobile(): boolean {
-  return !useMediaQuery("(min-width: 768px)");
+  return !useMediaQuery(DESKTOP_MEDIA_QUERY);
 }
 
 export function useIsDesktop(): boolean {
-  return useMediaQuery("(min-width: 768px)");
+  return useMediaQuery(DESKTOP_MEDIA_QUERY);
 }

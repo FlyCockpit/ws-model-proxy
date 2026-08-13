@@ -1476,7 +1476,7 @@ function ChatTestPage() {
         <div
           ref={scroll.scrollRef}
           onScroll={scroll.markUserIntent}
-          className="h-full min-h-0 overflow-y-auto overscroll-y-contain p-2 scrollbar-gutter-stable focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/50 sm:p-3"
+          className="h-full min-h-0 overflow-y-auto overflow-x-clip overscroll-y-contain p-2 scrollbar-gutter-stable focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/50 sm:p-3"
           aria-label={t("dashboard:chatTest.transcript")}
         >
           <div ref={scroll.contentRef} className="mx-auto max-w-4xl space-y-3 sm:space-y-4">
@@ -1516,7 +1516,7 @@ function ChatTestPage() {
         className={cn(
           // Cap form height on short viewports so an expanded system prompt /
           // attachment strip can scroll internally instead of clipping Send.
-          "min-h-0 max-h-[min(50dvh,22rem)] shrink-0 overflow-y-auto overscroll-y-contain border-t p-2 sm:max-h-none sm:overflow-visible sm:p-3",
+          "min-h-0 max-h-[min(50dvh,22rem)] shrink-0 overflow-y-auto overflow-x-clip overscroll-y-contain border-t p-2 sm:max-h-none sm:overflow-visible sm:p-3",
           isDragging && "bg-primary/5 ring-1 ring-inset ring-primary/40",
         )}
         onSubmit={handleSend}

@@ -21,7 +21,7 @@ export const Route = createFileRoute("/$lang/admin")({
 
 function AdminLayout() {
   return (
-    <div className="min-h-screen">
+    <div className="min-h-0 min-w-0 max-w-full">
       <AdminNav />
       <Outlet />
     </div>

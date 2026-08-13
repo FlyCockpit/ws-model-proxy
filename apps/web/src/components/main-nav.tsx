@@ -14,7 +14,7 @@ export function MainNav() {
   const { t } = useTranslation("nav");
   const items = getNavItems({
     placement: "desktop",
-    isAuthenticated: state.status === "authenticated",
+    isAuthenticated: Boolean(session),
     role: session?.user.role,
   });
 

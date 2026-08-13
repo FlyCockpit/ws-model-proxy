@@ -91,7 +91,7 @@ export default function PullToRefresh({ onRefresh, children }: PullToRefreshProp
   return (
     <div
       ref={containerRef}
-      className="relative h-full overflow-y-auto"
+      className="relative h-full min-w-0 overflow-y-auto overflow-x-clip"
       onTouchStart={handleTouchStart}
       onTouchMove={handleTouchMove}
       onTouchEnd={handleTouchEnd}

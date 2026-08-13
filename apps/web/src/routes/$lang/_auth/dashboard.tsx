@@ -66,7 +66,7 @@ function DashboardLayout() {
   const { t } = useTranslation(["common", "dashboard"]);
 
   return (
-    <div className="container mx-auto flex h-full min-h-0 max-w-6xl flex-col px-4 py-4 md:py-8">
+    <div className="container mx-auto flex h-full min-h-0 min-w-0 max-w-6xl flex-col px-4 py-4 md:py-8">
       <div className="mb-5 hidden shrink-0 md:block">
         <h1 className="text-xl font-semibold md:text-2xl">{t("dashboard:title")}</h1>
         <p className="mt-1 text-sm text-muted-foreground">{t("dashboard:description")}</p>
@@ -98,7 +98,7 @@ function DashboardLayout() {
         </nav>
       </div>
 
-      <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col">
         <Outlet />
       </div>
     </div>

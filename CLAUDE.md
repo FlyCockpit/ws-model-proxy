@@ -87,6 +87,16 @@ Never run:
 - Respect safe-area CSS variables for edge-to-edge mobile layouts.
 - The root shell owns safe areas, bottom-nav clearance, viewport height, and
   top-level scroll. Do not copy app-shell frame geometry into route files.
+- Do not hide Header or BottomNav from `visualViewport` height (or similar
+  resize heuristics) alone. Header is stable chrome. BottomNav may hide only
+  when a mobile software keyboard is actually open.
+- Never set `overflow-y: auto` / `overflow-y-auto` without an explicit
+  `overflow-x`. An omitted `overflow-x: visible` computes to `auto` and
+  turns the page into a horizontal scroller.
+- Flex/grid children that wrap wide content need `min-w-0` (and usually
+  `max-w-full`) so min-content width cannot inflate the page.
+- Intentional horizontal scroll belongs in `WideContent` (`apps/web/src/components/wide-content.tsx`),
+  not on the page shell. Pair it with `overscroll-x-contain`.
 - Prefer axis-specific overscroll: horizontal scrollers use
   `overflow-x-auto overscroll-x-contain`; bounded vertical panes/dialogs can
   use `overscroll-contain`.

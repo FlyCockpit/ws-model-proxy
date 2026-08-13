@@ -17,6 +17,7 @@ import { TanStackRouterDevtools } from "@tanstack/react-router-devtools";
 import { THEME_INIT_SCRIPT } from "@ws-model-proxy/config/theme-init";
 import { env } from "@ws-model-proxy/env/web";
 import { Toaster } from "@ws-model-proxy/ui/components/sileo";
+import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { type ReactNode } from "react";
 import { I18nextProvider } from "react-i18next";
 import BottomNav from "@/components/bottom-nav";
@@ -149,17 +150,18 @@ function RootComponent() {
           storageKey="vite-ui-theme"
         >
           <div
-            className="grid h-svh grid-rows-[auto_1fr_auto] md:grid-rows-[auto_1fr] pb-[calc(3.5rem_+_var(--safe-area-bottom))] md:pb-0"
+            className={cn(
+              "grid h-svh min-w-0 grid-rows-[auto_1fr_auto] md:grid-rows-[auto_1fr] md:pb-0",
+              !mobileKeyboardOpen && "pb-[calc(3.5rem_+_var(--safe-area-bottom))]",
+            )}
             style={{
               paddingTop: "var(--safe-area-top)",
               paddingLeft: "var(--safe-area-left)",
               paddingRight: "var(--safe-area-right)",
             }}
           >
-            <div className={mobileKeyboardOpen ? "max-h-0 overflow-hidden" : ""}>
-              <Header />
-            </div>
-            <main className="min-h-0 overflow-y-auto">
+            <Header />
+            <main className="min-h-0 min-w-0 overflow-y-auto overflow-x-clip">
               <Outlet />
             </main>
             <BottomNav hidden={mobileKeyboardOpen} />

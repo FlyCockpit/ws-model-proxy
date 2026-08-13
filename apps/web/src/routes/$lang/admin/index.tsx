@@ -53,7 +53,7 @@ function AdminOverview() {
   const { t } = useTranslation(["admin", "common"]);
 
   return (
-    <div className="container mx-auto max-w-7xl px-4 py-8">
+    <div className="container mx-auto min-w-0 max-w-7xl px-4 py-8">
       <header className="space-y-1">
         <h1 className="text-2xl font-semibold tracking-tight">{t("admin:overview.title")}</h1>
         <p className="text-sm text-muted-foreground">{t("admin:overview.description")}</p>

@@ -164,7 +164,7 @@ function AdminUsers() {
   const deleteTarget = allUsers.find((u) => u.id === deleteId) ?? null;
 
   return (
-    <div className="container mx-auto max-w-7xl px-4 py-8 space-y-6">
+    <div className="container mx-auto min-w-0 max-w-7xl px-4 py-8 space-y-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">{t("admin:users.title")}</h1>

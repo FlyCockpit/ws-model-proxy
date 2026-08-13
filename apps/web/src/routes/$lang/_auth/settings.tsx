@@ -22,7 +22,7 @@ function SettingsLayout() {
   }));
 
   return (
-    <div className="container mx-auto max-w-4xl px-4 py-8">
+    <div className="container mx-auto min-w-0 max-w-4xl px-4 py-8">
       <h1 className="text-2xl font-semibold mb-6">{t("title")}</h1>
       <div className="flex flex-col gap-6 md:flex-row md:gap-8">
         <nav
@@ -48,7 +48,7 @@ function SettingsLayout() {
             ))}
           </div>
         </nav>
-        <div className="flex-1 min-w-0">
+        <div className="min-w-0 max-w-full flex-1">
           <Outlet />
         </div>
       </div>

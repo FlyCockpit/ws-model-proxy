@@ -44,7 +44,7 @@ function AdminDevices() {
   const revokeToken = target?.userCode ?? "";
 
   return (
-    <div className="container mx-auto max-w-3xl px-4 py-8 space-y-6">
+    <div className="container mx-auto min-w-0 max-w-3xl px-4 py-8 space-y-6">
       <header>
         <h1 className="text-2xl font-semibold tracking-tight">{t("admin:devices.title")}</h1>
         <p className="text-sm text-muted-foreground">{t("admin:devices.description")}</p>

@@ -51,7 +51,7 @@ function AdminSeed() {
   });
 
   return (
-    <div className="container mx-auto max-w-3xl px-4 py-8 space-y-6">
+    <div className="container mx-auto min-w-0 max-w-3xl px-4 py-8 space-y-6">
       <header className="space-y-2">
         <Link
           to="/$lang/admin"

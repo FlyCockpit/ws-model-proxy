@@ -20,6 +20,7 @@ import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
 import { SegmentedControl } from "@/components/segmented-control";
+import { WideContent } from "@/components/wide-content";
 import {
   CAPABILITY_FAMILIES,
   CLI_STATUSES,
@@ -217,7 +218,7 @@ function DataShell({
   const lastPage = Math.max(pageCount ?? 1, 1);
 
   return (
-    <section className="rounded-md border">
+    <section className="min-w-0 rounded-md border">
       <div className="flex flex-col gap-2 border-b px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h2 className="text-base font-semibold">{title}</h2>
@@ -405,7 +406,7 @@ function AdminObservability() {
   };
 
   return (
-    <div className="container mx-auto max-w-7xl space-y-6 px-4 py-8">
+    <div className="container mx-auto min-w-0 max-w-7xl space-y-6 px-4 py-8">
       <header className="space-y-1">
         <h1 className="text-2xl font-semibold tracking-tight">{t("admin:observability.title")}</h1>
         <p className="max-w-3xl text-sm text-muted-foreground">
@@ -687,7 +688,7 @@ function CliTable({
       onPage={onPage}
       columns={7}
     >
-      <div className="overflow-x-auto">
+      <WideContent>
         <table className="w-full min-w-[980px] text-left text-xs">
           <thead className="border-b text-muted-foreground">
             <tr>
@@ -743,7 +744,7 @@ function CliTable({
             ))}
           </tbody>
         </table>
-      </div>
+      </WideContent>
     </DataShell>
   );
 }
@@ -772,7 +773,7 @@ function EndpointTable({
       onPage={onPage}
       columns={7}
     >
-      <div className="overflow-x-auto">
+      <WideContent>
         <table className="w-full min-w-[1040px] text-left text-xs">
           <thead className="border-b text-muted-foreground">
             <tr>
@@ -827,7 +828,7 @@ function EndpointTable({
             ))}
           </tbody>
         </table>
-      </div>
+      </WideContent>
     </DataShell>
   );
 }
@@ -856,7 +857,7 @@ function ModelTable({
       onPage={onPage}
       columns={7}
     >
-      <div className="overflow-x-auto">
+      <WideContent>
         <table className="w-full min-w-[1120px] text-left text-xs">
           <thead className="border-b text-muted-foreground">
             <tr>
@@ -909,7 +910,7 @@ function ModelTable({
             ))}
           </tbody>
         </table>
-      </div>
+      </WideContent>
     </DataShell>
   );
 }
@@ -938,7 +939,7 @@ function PoolTable({
       onPage={onPage}
       columns={6}
     >
-      <div className="overflow-x-auto">
+      <WideContent>
         <table className="w-full min-w-[1060px] text-left text-xs">
           <thead className="border-b text-muted-foreground">
             <tr>
@@ -1006,7 +1007,7 @@ function PoolTable({
             ))}
           </tbody>
         </table>
-      </div>
+      </WideContent>
     </DataShell>
   );
 }
@@ -1038,7 +1039,7 @@ function RelayTable({
         onPage={onPage}
         columns={8}
       >
-        <div className="overflow-x-auto">
+        <WideContent>
           <table className="w-full min-w-[1180px] text-left text-xs">
             <thead className="border-b text-muted-foreground">
               <tr>
@@ -1096,7 +1097,7 @@ function RelayTable({
               ))}
             </tbody>
           </table>
-        </div>
+        </WideContent>
       </DataShell>
     </div>
   );
