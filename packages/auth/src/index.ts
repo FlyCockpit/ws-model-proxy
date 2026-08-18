@@ -17,7 +17,8 @@ import { prismaAdapter } from "better-auth/adapters/prisma";
 import { admin, deviceAuthorization, twoFactor } from "better-auth/plugins";
 import { z } from "zod";
 import { resolveSignupLocale } from "./signup-locale";
-import { getSignupAccessState, SIGNUP_DISABLED_MESSAGE } from "./signup-policy";
+import { getSignupAccessState } from "./signup-policy";
+import { resolveUserCreatePolicy, toUserCreatePolicyInput } from "./user-create-policy";
 import { withVerificationCallback } from "./verification-callback";
 
 const isCrossOrigin = !!env.CORS_ORIGIN;
@@ -249,10 +250,15 @@ export const auth = betterAuth({
       create: {
         before: async (user, context) => {
           const { signupEnabled, userCount } = await getSignupAccessState();
-          const isFirstUser = userCount === 0;
-          if (!signupEnabled && !isFirstUser) {
-            throw new Error(SIGNUP_DISABLED_MESSAGE);
-          }
+          const policy = resolveUserCreatePolicy(
+            toUserCreatePolicyInput({
+              signupEnabled,
+              userCount,
+              emailConfigured,
+              user,
+              context,
+            }),
+          );
           const slug = await resolveUniqueUserSlug({
             requestedSlug: typeof user.slug === "string" ? user.slug.trim() : undefined,
             name: typeof user.name === "string" ? user.name : undefined,
@@ -264,12 +270,8 @@ export const auth = betterAuth({
               ...user,
               slug,
               locale,
-              // Without SMTP there is no verification mail path — treat new
-              // accounts as verified so admin gates and sign-in work. With
-              // SMTP configured, leave unverified so requireEmailVerification
-              // and the verify-email flow apply.
-              ...(emailConfigured ? {} : { emailVerified: true }),
-              role: isFirstUser ? "admin" : "user",
+              ...(policy.emailVerified ? { emailVerified: true } : {}),
+              role: policy.role,
             },
           };
         },

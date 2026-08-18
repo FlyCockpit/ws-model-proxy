@@ -21,7 +21,7 @@ Self-hosted web app plus CLI for exposing locally hosted OpenAI-compatible model
 - Deploy one Docker web app on a VPS.
 - The first signed-up user becomes admin automatically.
 - Later users are regular users unless promoted by an admin.
-- Admins can enable or disable open signup.
+- Admins can enable or disable open signup. Admin invites still work when open signup is closed.
 - Auth works with email/password even when SMTP is not configured. When SMTP
   is configured, email verification is required and the full verification UX
   (safe callback URLs, resend, localized mail) is enabled.

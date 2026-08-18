@@ -153,7 +153,7 @@
     "force2faDescription": "Users must set up 2FA before using authenticated pages.",
     "force2faAdminWarning": "Enable 2FA on your own account before requiring it for everyone.",
     "signupTitle": "Allow public sign-up",
-    "signupDescription": "When disabled, new account creation is blocked after the first admin account exists.",
+    "signupDescription": "When disabled, public self-serve sign-up is blocked after the first admin account exists. Admins can still invite users.",
     "signupStatusEnabled": "Public sign-up is open.",
     "signupStatusDisabled": "Public sign-up is closed.",
     "signupSwitchLabel": "Allow public sign-up",

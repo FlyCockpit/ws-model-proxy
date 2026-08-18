@@ -153,7 +153,7 @@
     "force2faDescription": "Los usuarios deben configurar 2FA antes de usar paginas autenticadas.",
     "force2faAdminWarning": "Activa 2FA en tu propia cuenta antes de exigirlo a todos.",
     "signupTitle": "Permitir registro publico",
-    "signupDescription": "Cuando esta desactivado, la creacion de cuentas nuevas se bloquea despues de que exista la primera cuenta admin.",
+    "signupDescription": "Cuando esta desactivado, el registro publico se bloquea despues de que exista la primera cuenta admin. Los admins pueden seguir invitando usuarios.",
     "signupStatusEnabled": "El registro publico esta abierto.",
     "signupStatusDisabled": "El registro publico esta cerrado.",
     "signupSwitchLabel": "Permitir registro publico",
