@@ -26,7 +26,7 @@
     "@prisma/adapter-pg": "^7.9.1",
     "@prisma/client": "catalog:",
     "@ws-model-proxy/env": "workspace:*",
-    "pg": "^8.22.0",
+    "pg": "^8.23.0",
     "zod": "catalog:"
   },
   "devDependencies": {

@@ -16,7 +16,7 @@
     "@fontsource-variable/inter": "catalog:",
     "@orpc/client": "catalog:",
     "@orpc/server": "catalog:",
-    "@orpc/tanstack-query": "^1.14.14",
+    "@orpc/tanstack-query": "^1.15.0",
     "@prisma/client": "catalog:",
     "@tanstack/react-form": "catalog:",
     "@tanstack/react-query": "catalog:",
