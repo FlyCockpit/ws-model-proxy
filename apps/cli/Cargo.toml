@@ -76,7 +76,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 # A single shared tokenizer makes fallback throughput comparable across
 # heterogeneous upstream models. Pin to the MSRV-compatible release.
-tiktoken-rs = "=0.11.0"
+tiktoken-rs = "=0.12.0"
 
 [target.'cfg(unix)'.dependencies]
 # Maintained Unix API wrapper used only for authenticated local-control peer
