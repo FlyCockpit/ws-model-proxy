@@ -754,6 +754,11 @@ integration("PostgreSQL capacity admission primitives", () => {
           ],
         });
         expect(result.state).toBe("ADMITTED");
+        expect(
+          await db.capacityLease.findUnique({
+            where: { attemptId: `reserved-${index}-${suffix}` },
+          }),
+        ).toMatchObject({ borrowed: false, poolMemberId: entry.member.id });
       }
       const secondCapacity = await db.inferenceCapacity.create({
         data: {
@@ -906,6 +911,51 @@ integration("PostgreSQL capacity admission primitives", () => {
       ).resolves.toMatchObject({
         state: "WAITING",
       });
+      const ownerAttempt = (entry: (typeof members)[number], label: string) => ({
+        requestId: `${label}-${suffix}`,
+        attemptId: `${label}-${suffix}`,
+        ownerId: user.id,
+        sourceKind: "POOL" as const,
+        poolId: entry.pool.id,
+        basePriority: 16,
+        connectionOwner: "reservation-proof",
+        deadlineAt,
+        candidates: [
+          {
+            capacityId: capacity.id,
+            executionTargetId: targets[0]!.id,
+            poolMemberId: entry.member.id,
+            candidateOrder: 0,
+          },
+        ],
+      });
+      const occupyingOwner = await manager.acquire(ownerAttempt(members[0]!, "owner-occupies"));
+      expect(occupyingOwner.state).toBe("ADMITTED");
+      await expect(
+        manager.acquire(ownerAttempt(members[1]!, "owner-queued")),
+      ).resolves.toMatchObject({
+        state: "WAITING",
+      });
+      await db.executionTarget.update({
+        where: { id: targets[0]!.id },
+        data: { directConcurrencyLimit: null },
+      });
+      await expect(
+        manager.acquire(directAttempt(`second-outsider-${suffix}`)),
+      ).resolves.toMatchObject({
+        state: "WAITING",
+      });
+      if (occupyingOwner.state !== "ADMITTED") throw new Error("Expected reservation owner lease.");
+      await manager.release(occupyingOwner.lease);
+      expect(
+        await db.capacityLease.findUnique({ where: { attemptId: `owner-queued-${suffix}` } }),
+      ).toMatchObject({ state: "ACTIVE", borrowed: false });
+      expect(
+        await db.admissionRequest.findUnique({ where: { attemptId: `second-outsider-${suffix}` } }),
+      ).toMatchObject({ state: "WAITING" });
+      expect(
+        await db.capacityLease.findUnique({ where: { attemptId: `idle-${suffix}` } }),
+      ).toMatchObject({ state: "ACTIVE" });
     } finally {
       await db.user.delete({ where: { id: user.id } }).catch(() => undefined);
       await db.$disconnect();

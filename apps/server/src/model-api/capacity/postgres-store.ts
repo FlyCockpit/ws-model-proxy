@@ -290,7 +290,11 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
 
   async #admitOne(tx: Prisma.TransactionClient, capacityId: string, now: Date): Promise<boolean> {
     const capacity = await tx.inferenceCapacity.findUniqueOrThrow({ where: { id: capacityId } });
-    const active = await tx.capacityLease.count({ where: { capacityId, state: "ACTIVE" } });
+    const activeLeases = await tx.capacityLease.findMany({
+      where: { capacityId, state: "ACTIVE" },
+      select: { executionTargetId: true, poolMemberId: true },
+    });
+    const active = activeLeases.length;
     if (capacity.hardConcurrencyLimit !== null && active >= capacity.hardConcurrencyLimit)
       return false;
     const waiters = await tx.capacityWaiter.findMany({
@@ -326,6 +330,17 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           capacityReservedSlots: slots,
         });
     }
+    const reservationsByOwner = allocateReservationSlots(
+      configuredReservations,
+      capacity.hardConcurrencyLimit,
+    );
+    const activeByOwner = new Map<string, number>();
+    for (const lease of activeLeases) {
+      const ownerKey = lease.poolMemberId
+        ? `member:${lease.poolMemberId}`
+        : `direct:${lease.executionTargetId}`;
+      activeByOwner.set(ownerKey, (activeByOwner.get(ownerKey) ?? 0) + 1);
+    }
     const eligibility = new Map<string, { borrowed: boolean }>();
     const eligible = [];
     for (const waiter of waiters) {
@@ -343,43 +358,39 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         });
         if (memberActive >= memberLimit) continue;
       }
-      const higherReservationOwners = new Map<string, number>();
-      for (const entry of waiters)
-        if (entry.effectivePriority > waiter.effectivePriority && entry.effectiveReservedSlots > 0)
-          higherReservationOwners.set(
-            entry.poolMemberId
-              ? `member:${entry.poolMemberId}`
-              : `direct:${entry.executionTargetId}`,
-            entry.effectiveReservedSlots,
-          );
-      const reservedForHigherPriority = Math.min(
-        capacity.hardConcurrencyLimit ?? Number.MAX_SAFE_INTEGER,
-        [...higherReservationOwners.values()].reduce((total, slots) => total + slots, 0),
-      );
-      const higherPriorityQueued = higherReservationOwners.size > 0;
-      if (
-        capacity.hardConcurrencyLimit !== null &&
-        reservedForHigherPriority > 0 &&
-        higherPriorityQueued &&
-        active >= capacity.hardConcurrencyLimit - reservedForHigherPriority
-      )
-        continue;
+      const ownerKey = waiter.poolMemberId
+        ? `member:${waiter.poolMemberId}`
+        : `direct:${waiter.executionTargetId}`;
       const reservedForOthers = Math.min(
         capacity.hardConcurrencyLimit ?? Number.MAX_SAFE_INTEGER,
-        configuredReservations
-          .filter(
-            (policy) =>
-              policy.ownerKey !==
-              (waiter.poolMemberId
-                ? `member:${waiter.poolMemberId}`
-                : `direct:${waiter.executionTargetId}`),
-          )
-          .reduce((total, policy) => total + policy.capacityReservedSlots, 0),
+        [...reservationsByOwner.entries()]
+          .filter(([reservationOwner]) => reservationOwner !== ownerKey)
+          .reduce(
+            (total, [reservationOwner, slots]) =>
+              total + Math.max(0, slots - (activeByOwner.get(reservationOwner) ?? 0)),
+            0,
+          ),
+      );
+      const ownReservedRemaining = Math.max(
+        0,
+        (reservationsByOwner.get(ownerKey) ?? 0) - (activeByOwner.get(ownerKey) ?? 0),
       );
       const borrowed =
         capacity.hardConcurrencyLimit !== null &&
+        ownReservedRemaining === 0 &&
         reservedForOthers > 0 &&
-        active >= capacity.hardConcurrencyLimit - reservedForOthers;
+        capacity.hardConcurrencyLimit - active <= reservedForOthers;
+      const queuedReservationOwnerNeedsSlot = waiters.some((entry) => {
+        const queuedOwner = entry.poolMemberId
+          ? `member:${entry.poolMemberId}`
+          : `direct:${entry.executionTargetId}`;
+        return (
+          entry.id !== waiter.id &&
+          queuedOwner !== ownerKey &&
+          (reservationsByOwner.get(queuedOwner) ?? 0) > (activeByOwner.get(queuedOwner) ?? 0)
+        );
+      });
+      if (borrowed && queuedReservationOwnerNeedsSlot) continue;
       if (borrowed && waiter.effectiveBorrowPolicy === "NEVER") continue;
       eligible.push({
         admissionRequestId: waiter.admissionRequestId,
@@ -653,6 +664,32 @@ function schedulerDeficits(value: Prisma.JsonValue): number[] {
   if (Array.isArray(value) && value.length === 32)
     return value.map((entry) => (typeof entry === "number" && entry >= 0 ? entry : 0));
   return Array(32).fill(0);
+}
+
+export function allocateReservationSlots(
+  reservations: readonly { ownerKey: string; capacityReservedSlots: number }[],
+  physicalLimit: number | null,
+): Map<string, number> {
+  const combined = new Map<string, number>();
+  for (const reservation of reservations)
+    combined.set(
+      reservation.ownerKey,
+      (combined.get(reservation.ownerKey) ?? 0) + reservation.capacityReservedSlots,
+    );
+  const total = [...combined.values()].reduce((sum, slots) => sum + slots, 0);
+  if (physicalLimit === null || total <= physicalLimit) return combined;
+  const shares = [...combined.entries()].map(([ownerKey, slots]) => {
+    const exact = (slots * physicalLimit) / total;
+    return { ownerKey, slots: Math.floor(exact), remainder: exact - Math.floor(exact) };
+  });
+  let unassigned = physicalLimit - shares.reduce((sum, share) => sum + share.slots, 0);
+  shares.sort((a, b) => b.remainder - a.remainder || a.ownerKey.localeCompare(b.ownerKey));
+  for (const share of shares) {
+    if (unassigned <= 0) break;
+    share.slots++;
+    unassigned--;
+  }
+  return new Map(shares.map(({ ownerKey, slots }) => [ownerKey, slots]));
 }
 
 function leaseHandle(lease: {

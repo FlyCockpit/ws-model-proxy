@@ -3,10 +3,27 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("@ws-model-proxy/db", () => ({ default: {}, Prisma: {} }));
 
 import {
+  allocateReservationSlots,
   isRetryableCapacityTransactionError,
   runCapacitySerializable,
   waitWithCapacityPolling,
 } from "./postgres-store.js";
+
+describe("capacity reservation allocation", () => {
+  it("caps overcommitted owners proportionally with deterministic remainder order", () => {
+    expect(
+      Object.fromEntries(
+        allocateReservationSlots(
+          [
+            { ownerKey: "member:b", capacityReservedSlots: 9 },
+            { ownerKey: "member:a", capacityReservedSlots: 9 },
+          ],
+          2,
+        ),
+      ),
+    ).toEqual({ "member:a": 1, "member:b": 1 });
+  });
+});
 
 describe("capacity wakeup polling", () => {
   it("recognizes serialization and deadlock errors without depending on one driver class", () => {
