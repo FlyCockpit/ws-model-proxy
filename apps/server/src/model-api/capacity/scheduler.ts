@@ -5,6 +5,8 @@ export const SCHEDULER_VERSION = 1;
 
 export type SchedulerCandidate = {
   admissionRequestId: string;
+  waiterId?: string;
+  candidateOrder?: number;
   priority: number;
   enqueueSequence: bigint;
   eligible: boolean;
@@ -76,7 +78,8 @@ export function scheduleWeightedDeficitRoundRobin({
   for (const queue of queues.values())
     queue.sort((a, b) =>
       a.enqueueSequence === b.enqueueSequence
-        ? a.admissionRequestId.localeCompare(b.admissionRequestId)
+        ? (a.candidateOrder ?? 0) - (b.candidateOrder ?? 0) ||
+          (a.waiterId ?? a.admissionRequestId).localeCompare(b.waiterId ?? b.admissionRequestId)
         : a.enqueueSequence < b.enqueueSequence
           ? -1
           : 1,

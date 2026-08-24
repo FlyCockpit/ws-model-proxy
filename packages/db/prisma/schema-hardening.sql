@@ -24,7 +24,23 @@ UPDATE capacity_waiter waiter
        "enqueueSequence" = request."enqueueSequence"
   FROM admission_request request
  WHERE request.id = waiter."admissionRequestId"
-   AND (waiter."requestId" = '' OR waiter."attemptId" = '');
+   AND (waiter."requestId" IS DISTINCT FROM request."requestId"
+     OR waiter."attemptId" IS DISTINCT FROM request."attemptId"
+     OR waiter."enqueueSequence" IS DISTINCT FROM request."enqueueSequence");
+
+UPDATE capacity_waiter
+   SET "effectiveConcurrencyScope" = 'DIRECT_TARGET',
+       "effectiveConcurrencyScopeId" = "executionTargetId"
+ WHERE "effectiveConcurrencyScope" = '' AND "poolMemberId" IS NULL;
+
+UPDATE capacity_waiter waiter
+   SET "effectiveConcurrencyScope" = CASE
+         WHEN member."capacityConcurrencyLimit" IS NULL THEN 'POOL' ELSE 'MEMBER' END,
+       "effectiveConcurrencyScopeId" = CASE
+         WHEN member."capacityConcurrencyLimit" IS NULL THEN waiter."poolId" ELSE waiter."poolMemberId" END
+  FROM pool_member member
+ WHERE waiter."effectiveConcurrencyScope" = ''
+   AND member.id = waiter."poolMemberId";
 
 ALTER TABLE inference_capacity DROP CONSTRAINT IF EXISTS inference_capacity_limits_check;
 ALTER TABLE inference_capacity ADD CONSTRAINT inference_capacity_limits_check CHECK (
@@ -86,9 +102,13 @@ ALTER TABLE admission_request ADD CONSTRAINT admission_request_shape_check CHECK
 ALTER TABLE capacity_waiter DROP CONSTRAINT IF EXISTS capacity_waiter_shape_check;
 ALTER TABLE capacity_waiter ADD CONSTRAINT capacity_waiter_shape_check CHECK (
   "candidateOrder" >= 0
+  AND "requestId" <> ''
+  AND "attemptId" <> ''
   AND "enqueueSequence" >= 0
   AND "effectivePriority" BETWEEN 0 AND 31
   AND ("effectiveConcurrencyLimit" IS NULL OR "effectiveConcurrencyLimit" > 0)
+  AND "effectiveConcurrencyScope" IN ('DIRECT_TARGET', 'POOL', 'MEMBER')
+  AND "effectiveConcurrencyScopeId" <> ''
   AND "effectiveReservedSlots" >= 0
   AND (("poolId" IS NULL AND "poolMemberId" IS NULL)
     OR ("poolId" IS NOT NULL AND "poolMemberId" IS NOT NULL))
@@ -169,6 +189,8 @@ BEGIN
   IF TG_TABLE_NAME = 'capacity_waiter' AND TG_OP = 'UPDATE'
      AND (NEW."effectivePriority" IS DISTINCT FROM OLD."effectivePriority"
        OR NEW."effectiveConcurrencyLimit" IS DISTINCT FROM OLD."effectiveConcurrencyLimit"
+       OR NEW."effectiveConcurrencyScope" IS DISTINCT FROM OLD."effectiveConcurrencyScope"
+       OR NEW."effectiveConcurrencyScopeId" IS DISTINCT FROM OLD."effectiveConcurrencyScopeId"
        OR NEW."effectiveReservedSlots" IS DISTINCT FROM OLD."effectiveReservedSlots"
        OR NEW."effectiveBorrowPolicy" IS DISTINCT FROM OLD."effectiveBorrowPolicy") THEN
     RAISE EXCEPTION 'capacity waiter policy snapshot is immutable'
@@ -200,6 +222,10 @@ BEGIN
          AND NEW."effectivePriority" = COALESCE(member."capacityPriority", pool."capacityPriority")
          AND NEW."effectiveConcurrencyLimit" IS NOT DISTINCT FROM
            COALESCE(member."capacityConcurrencyLimit", pool."capacityConcurrencyLimit")
+         AND NEW."effectiveConcurrencyScope" = CASE
+           WHEN member."capacityConcurrencyLimit" IS NULL THEN 'POOL' ELSE 'MEMBER' END
+         AND NEW."effectiveConcurrencyScopeId" = CASE
+           WHEN member."capacityConcurrencyLimit" IS NULL THEN pool.id ELSE member.id END
          AND NEW."effectiveReservedSlots" = COALESCE(member."capacityReservedSlots", pool."capacityReservedSlots")
          AND NEW."effectiveBorrowPolicy" = COALESCE(member."capacityBorrowPolicy", pool."capacityBorrowPolicy")
     ) THEN
@@ -217,6 +243,8 @@ BEGIN
      WHERE target.id = NEW."executionTargetId"
        AND NEW."effectivePriority" = target."directPriority"
        AND NEW."effectiveConcurrencyLimit" IS NOT DISTINCT FROM target."directConcurrencyLimit"
+       AND NEW."effectiveConcurrencyScope" = 'DIRECT_TARGET'
+       AND NEW."effectiveConcurrencyScopeId" = target.id
        AND NEW."effectiveReservedSlots" = target."directReservedSlots"
        AND NEW."effectiveBorrowPolicy" = target."directBorrowPolicy"
   ) THEN
@@ -242,7 +270,8 @@ DROP TRIGGER IF EXISTS capacity_waiter_reference_consistency ON capacity_waiter;
 CREATE TRIGGER capacity_waiter_reference_consistency
 BEFORE INSERT OR UPDATE OF "userId", "admissionRequestId", "requestId", "attemptId", "capacityId",
   "executionTargetId", "poolId", "poolMemberId", "effectivePriority", "effectiveConcurrencyLimit",
-  "effectiveReservedSlots", "effectiveBorrowPolicy" ON capacity_waiter
+  "effectiveConcurrencyScope", "effectiveConcurrencyScopeId", "effectiveReservedSlots",
+  "effectiveBorrowPolicy" ON capacity_waiter
 FOR EACH ROW EXECUTE FUNCTION enforce_capacity_reference_consistency();
 
 DROP TRIGGER IF EXISTS capacity_lease_reference_consistency ON capacity_lease;

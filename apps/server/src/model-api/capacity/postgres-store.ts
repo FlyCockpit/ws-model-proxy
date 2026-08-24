@@ -82,20 +82,37 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         where: { attemptId: attempt.attemptId },
         include: { Lease: true, Waiters: true },
       });
-      const observedAt = new Date();
+      const observedRows = await tx.$queryRaw<
+        Array<{ now: Date }>
+      >`SELECT CURRENT_TIMESTAMP AS now`;
+      const observedAt = observedRows[0]?.now;
+      if (!observedAt) throw new Error("Database clock unavailable.");
       if (existing?.Lease?.state === "ACTIVE" && existing.Lease.expiresAt <= observedAt) {
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${existing.Lease.capacityId}, 0))`;
+        const currentLease = await tx.capacityLease.findUniqueOrThrow({
+          where: { id: existing.Lease.id },
+        });
+        const lockedRows = await tx.$queryRaw<
+          Array<{ now: Date }>
+        >`SELECT clock_timestamp() AS now`;
+        const lockedNow = lockedRows[0]?.now;
+        if (!lockedNow) throw new Error("Database clock unavailable.");
+        if (currentLease.state === "ACTIVE" && currentLease.expiresAt > lockedNow)
+          return {
+            result: { state: "ADMITTED", lease: leaseHandle(currentLease) } as const,
+            notify: [],
+          };
         await tx.capacityLease.updateMany({
           where: {
             id: existing.Lease.id,
             fencingToken: existing.Lease.fencingToken,
             state: "ACTIVE",
           },
-          data: { state: "RECLAIMED", releasedAt: observedAt, releaseReason: "expired" },
+          data: { state: "RECLAIMED", releasedAt: lockedNow, releaseReason: "expired" },
         });
         await tx.admissionRequest.update({
           where: { id: existing.id },
-          data: { state: "TERMINAL", terminalAt: observedAt, terminalReason: "lease_expired" },
+          data: { state: "TERMINAL", terminalAt: lockedNow, terminalReason: "lease_expired" },
         });
         return { result: { state: "EXPIRED" } as const, notify: [existing.Lease.capacityId] };
       }
@@ -176,6 +193,8 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
                 candidateOrder: candidate.candidateOrder,
                 effectivePriority: candidate.priority,
                 effectiveConcurrencyLimit: candidate.memberConcurrencyCeiling,
+                effectiveConcurrencyScope: candidate.concurrencyScope,
+                effectiveConcurrencyScopeId: candidate.concurrencyScopeId,
                 effectiveReservedSlots: candidate.reservedSlots,
                 effectiveBorrowPolicy: candidate.allowBorrowReserved ? "WHEN_IDLE" : "NEVER",
               })),
@@ -230,6 +249,8 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
             ...candidate,
             priority: target.directPriority,
             memberConcurrencyCeiling: target.directConcurrencyLimit ?? undefined,
+            concurrencyScope: "DIRECT_TARGET",
+            concurrencyScopeId: target.id,
             reservedSlots: target.directReservedSlots,
             allowBorrowReserved: target.directBorrowPolicy === "WHEN_IDLE",
           };
@@ -256,6 +277,9 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
             member.capacityConcurrencyLimit ??
             member.ModelPool.capacityConcurrencyLimit ??
             undefined,
+          concurrencyScope: member.capacityConcurrencyLimit !== null ? "MEMBER" : "POOL",
+          concurrencyScopeId:
+            member.capacityConcurrencyLimit !== null ? member.id : member.ModelPool.id,
           reservedSlots: member.capacityReservedSlots ?? member.ModelPool.capacityReservedSlots,
           allowBorrowReserved:
             (member.capacityBorrowPolicy ?? member.ModelPool.capacityBorrowPolicy) === "WHEN_IDLE",
@@ -286,8 +310,18 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     });
     const reservationsByTarget = new Map<
       string,
-      { memberIds: Set<string>; capacityReservedSlots: number }
+      { targetId: string; memberIds: Set<string>; capacityReservedSlots: number }
     >();
+    const configuredDirectReservations = await tx.executionTarget.findMany({
+      where: { inferenceCapacityId: capacityId, directReservedSlots: { gt: 0 } },
+      select: { id: true, directReservedSlots: true },
+    });
+    for (const target of configuredDirectReservations)
+      reservationsByTarget.set(target.id, {
+        targetId: target.id,
+        memberIds: new Set(),
+        capacityReservedSlots: target.directReservedSlots,
+      });
     for (const member of configuredReservationMembers) {
       if (!member.executionTargetId) continue;
       const slots = member.capacityReservedSlots ?? member.ModelPool.capacityReservedSlots;
@@ -297,6 +331,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         existing.capacityReservedSlots = Math.max(existing.capacityReservedSlots, slots);
       } else {
         reservationsByTarget.set(member.executionTargetId, {
+          targetId: member.executionTargetId,
           memberIds: new Set([member.id]),
           capacityReservedSlots: slots,
         });
@@ -309,9 +344,16 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     const eligible = [];
     for (const waiter of waiters) {
       const memberLimit = waiter.effectiveConcurrencyLimit;
-      if (memberLimit !== null && memberLimit !== undefined && waiter.poolMemberId) {
+      if (memberLimit !== null && memberLimit !== undefined) {
         const memberActive = await tx.capacityLease.count({
-          where: { poolMemberId: waiter.poolMemberId, state: "ACTIVE" },
+          where: {
+            state: "ACTIVE",
+            ...(waiter.effectiveConcurrencyScope === "POOL"
+              ? { poolId: waiter.effectiveConcurrencyScopeId }
+              : waiter.effectiveConcurrencyScope === "MEMBER"
+                ? { poolMemberId: waiter.effectiveConcurrencyScopeId }
+                : { executionTargetId: waiter.effectiveConcurrencyScopeId }),
+          },
         });
         if (memberActive >= memberLimit) continue;
       }
@@ -337,7 +379,11 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       const reservedForOthers = Math.min(
         capacity.hardConcurrencyLimit ?? Number.MAX_SAFE_INTEGER,
         configuredReservations
-          .filter((policy) => !waiter.poolMemberId || !policy.memberIds.has(waiter.poolMemberId))
+          .filter(
+            (policy) =>
+              policy.targetId !== waiter.executionTargetId &&
+              (!waiter.poolMemberId || !policy.memberIds.has(waiter.poolMemberId)),
+          )
           .reduce((total, policy) => total + policy.capacityReservedSlots, 0),
       );
       const borrowed =
@@ -347,11 +393,13 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       if (borrowed && waiter.effectiveBorrowPolicy === "NEVER") continue;
       eligible.push({
         admissionRequestId: waiter.admissionRequestId,
+        waiterId: waiter.id,
+        candidateOrder: waiter.candidateOrder,
         priority: waiter.effectivePriority,
         enqueueSequence: waiter.AdmissionRequest.enqueueSequence,
         eligible: true,
       });
-      eligibility.set(waiter.admissionRequestId, { borrowed });
+      eligibility.set(waiter.id, { borrowed });
     }
     if (!eligible.length) return false;
     const deficits = schedulerDeficits(capacity.schedulerDeficits);
@@ -360,9 +408,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       state: { cursor: capacity.schedulerCursor, deficits, version: capacity.schedulerVersion },
     });
     if (!decision.winner) return false;
-    const waiter = waiters.find(
-      (entry) => entry.admissionRequestId === decision.winner?.admissionRequestId,
-    );
+    const waiter = waiters.find((entry) => entry.id === decision.winner?.waiterId);
     if (!waiter) return false;
     const updatedCapacity = await tx.inferenceCapacity.update({
       where: { id: capacityId },
@@ -386,7 +432,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         poolMemberId: waiter.poolMemberId,
         priority: waiter.effectivePriority,
         reservationClass: waiter.effectivePriority,
-        borrowed: eligibility.get(waiter.admissionRequestId)?.borrowed ?? false,
+        borrowed: eligibility.get(waiter.id)?.borrowed ?? false,
         fencingToken,
         ownerServerInstance: this.serverInstance,
         heartbeatAt: now,
@@ -416,11 +462,22 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
   }
 
   async heartbeat(lease: CapacityLeaseHandle, expiresAt: Date): Promise<boolean> {
-    const result = await this.db.capacityLease.updateMany({
-      where: { id: lease.leaseId, fencingToken: lease.fencingToken, state: "ACTIVE" },
-      data: { heartbeatAt: new Date(), expiresAt },
+    return this.#serializable(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${lease.capacityId}, 0))`;
+      const clockRows = await tx.$queryRaw<Array<{ now: Date }>>`SELECT CURRENT_TIMESTAMP AS now`;
+      const now = clockRows[0]?.now;
+      if (!now) throw new Error("Database clock unavailable.");
+      const result = await tx.capacityLease.updateMany({
+        where: {
+          id: lease.leaseId,
+          fencingToken: lease.fencingToken,
+          state: "ACTIVE",
+          expiresAt: { gt: now },
+        },
+        data: { heartbeatAt: now, expiresAt },
+      });
+      return result.count === 1;
     });
-    return result.count === 1;
   }
 
   async release(lease: CapacityLeaseHandle): Promise<boolean> {
@@ -470,9 +527,14 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     return result.count === 1;
   }
 
-  async reclaimExpired(now: Date, limit: number): Promise<number> {
+  async reclaimExpired(_now: Date, limit: number): Promise<number> {
+    const clockRows = await this.db.$queryRaw<
+      Array<{ now: Date }>
+    >`SELECT clock_timestamp() AS now`;
+    const databaseNow = clockRows[0]?.now;
+    if (!databaseNow) throw new Error("Database clock unavailable.");
     const expired = await this.db.capacityLease.findMany({
-      where: { state: "ACTIVE", expiresAt: { lte: now } },
+      where: { state: "ACTIVE", expiresAt: { lte: databaseNow } },
       orderBy: [{ expiresAt: "asc" }, { id: "asc" }],
       take: limit,
     });
@@ -480,16 +542,26 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     for (const lease of expired) {
       const result = await this.#serializable(async (tx) => {
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${lease.capacityId}, 0))`;
+        const lockedRows = await tx.$queryRaw<
+          Array<{ now: Date }>
+        >`SELECT clock_timestamp() AS now`;
+        const lockedNow = lockedRows[0]?.now;
+        if (!lockedNow) throw new Error("Database clock unavailable.");
         const update = await tx.capacityLease.updateMany({
-          where: { id: lease.id, fencingToken: lease.fencingToken, state: "ACTIVE" },
-          data: { state: "RECLAIMED", releasedAt: now, releaseReason: "expired" },
+          where: {
+            id: lease.id,
+            fencingToken: lease.fencingToken,
+            state: "ACTIVE",
+            expiresAt: { lte: lockedNow },
+          },
+          data: { state: "RECLAIMED", releasedAt: lockedNow, releaseReason: "expired" },
         });
         if (update.count) {
           await tx.admissionRequest.updateMany({
             where: { id: lease.admissionRequestId, state: "ADMITTED" },
-            data: { state: "TERMINAL", terminalAt: now, terminalReason: "lease_expired" },
+            data: { state: "TERMINAL", terminalAt: lockedNow, terminalReason: "lease_expired" },
           });
-          await this.#fillAvailable(tx, lease.capacityId, now);
+          await this.#fillAvailable(tx, lease.capacityId, lockedNow);
         }
         return update;
       });
@@ -516,28 +588,52 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       orderBy: [{ heartbeatAt: "asc" }, { id: "asc" }],
       take: limit,
     });
+    let sweptRequests = 0;
     for (const request of requests) {
-      const expired = request.deadlineAt !== null && request.deadlineAt <= now;
-      await this.db.$transaction([
-        this.db.admissionRequest.updateMany({
-          where: { id: request.id, state: "WAITING" },
+      const swept = await this.#serializable(async (tx) => {
+        const current = await tx.admissionRequest.findUnique({
+          where: { id: request.id },
+          include: { Waiters: true },
+        });
+        if (
+          current?.state !== "WAITING" ||
+          ((current.deadlineAt === null || current.deadlineAt > now) &&
+            current.heartbeatAt >= heartbeatBefore)
+        )
+          return [] as string[];
+        const capacities = [...new Set(current.Waiters.map((waiter) => waiter.capacityId))].sort();
+        for (const capacityId of capacities)
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacityId}, 0))`;
+        const expired = current.deadlineAt !== null && current.deadlineAt <= now;
+        const updated = await tx.admissionRequest.updateMany({
+          where: {
+            id: current.id,
+            state: "WAITING",
+            ...(expired ? { deadlineAt: { lte: now } } : { heartbeatAt: { lt: heartbeatBefore } }),
+          },
           data: {
             state: expired ? "EXPIRED" : "CANCELLED",
             terminalAt: now,
             terminalReason: expired ? "deadline" : "connection_abandoned",
           },
-        }),
-        this.db.capacityWaiter.updateMany({
-          where: { admissionRequestId: request.id, state: "WAITING" },
+        });
+        if (!updated.count) return [] as string[];
+        await tx.capacityWaiter.updateMany({
+          where: { admissionRequestId: current.id, state: "WAITING" },
           data: {
             state: expired ? "EXPIRED" : "CANCELLED",
             stateChangedAt: now,
             terminalReason: expired ? "deadline" : "connection_abandoned",
           },
-        }),
-      ]);
+        });
+        return capacities;
+      });
+      if (swept.length) {
+        sweptRequests++;
+        await this.notifier?.notify(swept);
+      }
     }
-    return { requests: requests.length, leases: await this.reclaimExpired(now, limit) };
+    return { requests: sweptRequests, leases: await this.reclaimExpired(now, limit) };
   }
 
   async #serializable<T>(work: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
