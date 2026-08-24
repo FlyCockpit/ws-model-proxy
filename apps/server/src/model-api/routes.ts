@@ -113,6 +113,7 @@ import {
   renderProtocolErrorMetadata,
 } from "./protocols/index.js";
 import { type RelayAttemptTerminal, startRelayAttempt } from "./relay-executor.js";
+import { shouldRetryRelayOperation } from "./relay-retry-policy.js";
 import { type RelayBodySource } from "./request-body-source.js";
 import { profileSurfaceRequest } from "./request-feature-profiler.js";
 import {
@@ -2452,7 +2453,7 @@ async function relayPool({
 
     try {
       const started = await attempt.started;
-      if (started.status >= 500 && execution?.retrySafety !== "never") {
+      if (started.status >= 500 && shouldRetryRelayOperation(operation, "precommit_5xx")) {
         attempt.cancel("upstream_5xx");
         const terminal = await attempt.terminal;
         cumulativeRequestBytes += terminal.requestBytes;
@@ -2483,7 +2484,7 @@ async function relayPool({
             poolMemberId: candidate.poolMemberId,
             failure: "protocol_error",
           });
-          if (execution?.retrySafety === "never") break;
+          if (!shouldRetryRelayOperation(operation, "precommit_transport")) break;
           continue;
         }
       }
@@ -2684,7 +2685,7 @@ async function relayPool({
       if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
       const failure = terminal.failure ?? "unknown";
       finalFailure = failure;
-      if (execution?.retrySafety === "never") break;
+      if (!shouldRetryRelayOperation(operation, "precommit_transport")) break;
       if (isPoolRelayFailureClass(failure) && isRetryablePoolMemberRelayFailure(failure)) {
         await recordPoolMemberRelayFailure({
           poolMemberId: candidate.poolMemberId,
