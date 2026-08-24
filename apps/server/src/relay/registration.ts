@@ -254,7 +254,10 @@ export async function persistRelayRegistration({
               update: {
                 cliDeviceId: cliDevice.id,
                 label: endpoint.label,
-                kind: "OPENAI_COMPATIBLE",
+                kind:
+                  endpoint.kind === "anthropic-compatible"
+                    ? "ANTHROPIC_COMPATIBLE"
+                    : "OPENAI_COMPATIBLE",
                 status: endpointStatus(endpoint.status),
                 defaultCapabilities: { set: coarseCapabilities },
                 capabilityMetadata: jsonOrUndefined(endpoint.defaultCapabilities),
@@ -272,7 +275,10 @@ export async function persistRelayRegistration({
                 cliDeviceId: cliDevice.id,
                 slug: endpoint.slug,
                 label: endpoint.label,
-                kind: "OPENAI_COMPATIBLE",
+                kind:
+                  endpoint.kind === "anthropic-compatible"
+                    ? "ANTHROPIC_COMPATIBLE"
+                    : "OPENAI_COMPATIBLE",
                 status: endpointStatus(endpoint.status),
                 defaultCapabilities: coarseCapabilities,
                 capabilityMetadata: jsonOrUndefined(endpoint.defaultCapabilities),

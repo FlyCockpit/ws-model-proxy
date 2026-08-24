@@ -120,13 +120,39 @@ const endpointInventorySchema = z
   .object({
     slug: z.string().trim().min(1).max(63),
     label: z.string().trim().min(1).max(160),
-    kind: z.literal("openai-compatible"),
+    kind: z.enum(["openai-compatible", "anthropic-compatible"]),
     status: z.enum(["unknown", "online", "degraded", "offline"]).default("unknown"),
     defaultCapabilities: openAiCompatibleCapabilitiesSchema,
     probeSuggestions: openAiCompatibleCapabilitiesSchema.optional(),
     models: z.array(discoveredModelSchema).max(1000).default([]),
   })
-  .strict();
+  .strict()
+  .superRefine((endpoint, context) => {
+    const expected = endpoint.kind;
+    const profiles = [
+      endpoint.defaultCapabilities,
+      endpoint.probeSuggestions,
+      ...endpoint.models.flatMap((model) => [model.capabilities, model.probeSuggestions]),
+    ];
+    for (const profile of profiles) {
+      if (profile?.version === 3 && profile.protocol !== expected) {
+        context.addIssue({
+          code: "custom",
+          path: ["defaultCapabilities", "protocol"],
+          message: "Version 3 capability protocol must match endpoint kind.",
+        });
+        return;
+      }
+      if (profile && profile.version < 3 && expected !== "openai-compatible") {
+        context.addIssue({
+          code: "custom",
+          path: ["defaultCapabilities", "version"],
+          message: "Anthropic-compatible endpoints require capability inventory version 3.",
+        });
+        return;
+      }
+    }
+  });
 
 export type EndpointInventory = z.infer<typeof endpointInventorySchema>;
 
@@ -260,6 +286,7 @@ export type RelayServerControlMessage =
         | "completions"
         | "embeddings"
         | "responses"
+        | "messages"
         | "audio"
         | "images"
         | "generic";

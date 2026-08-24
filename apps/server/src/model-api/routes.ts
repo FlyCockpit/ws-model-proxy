@@ -25,6 +25,7 @@ import {
   normalizeTranscriptionCapabilities,
   resolveEffectiveCapabilityMetadata,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import { resolveExecutionPath } from "@ws-model-proxy/api/lib/surface-capabilities";
 import prisma from "@ws-model-proxy/db";
 import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
 import { env } from "@ws-model-proxy/env/server";
@@ -32,6 +33,12 @@ import { Hono } from "hono";
 import { getMediaConfig } from "../media/config.js";
 import { type OpenAiCompatibleCapabilities, type RelayFailure } from "../relay/protocol.js";
 import { type RelaySessionManager, relaySessionManager } from "../relay/session-manager.js";
+import {
+  type AnthropicIngress,
+  anthropicErrorResponse,
+  anthropicRelayHeaders,
+  parseAnthropicIngress,
+} from "./anthropic-protocol.js";
 import {
   MODEL_API_MAX_REQUEST_BODY_BYTES,
   MODEL_API_RELAY_TIMEOUT_MS,
@@ -119,6 +126,7 @@ type ModelApiEndpointFamily =
   | "completions"
   | "embeddings"
   | "responses"
+  | "messages"
   | "audio";
 
 type ModelApiCapability =
@@ -135,7 +143,9 @@ type ModelApiCapability =
   | "responses.cancel"
   | "responses.listInputItems"
   | "responses.countTokens"
-  | "responses.compact";
+  | "responses.compact"
+  | "messages.create"
+  | "messages.countTokens";
 
 type BuiltRelayRequest = {
   headers: Headers;
@@ -162,8 +172,36 @@ type RelayOperation = {
   appendTerminalUsage?: boolean;
   buildRequest: RelayRequestBuilder;
   responseStickiness?: ResponseStickinessCapture;
+  anthropicIngress?: AnthropicIngress;
   dispose?: () => Promise<void>;
 };
+
+function operationFailureResponse(
+  operation: Pick<RelayOperation, "family">,
+  failure: RelayFailure,
+  message?: string,
+) {
+  if (operation.family !== "messages") return openAiFailureJsonResponse(failure, message);
+  const status = relayFailureHttpStatus(failure);
+  return anthropicErrorResponse(
+    status,
+    message ??
+      (failure === "unsupported_capability"
+        ? "The requested Anthropic operation is not supported by this target."
+        : failure === "not_found"
+          ? "The requested model was not found."
+          : failure === "access_denied"
+            ? "Access denied."
+            : "The request could not be completed."),
+    status === 404
+      ? "not_found_error"
+      : status === 401 || status === 403
+        ? "authentication_error"
+        : status >= 500
+          ? "api_error"
+          : "invalid_request_error",
+  );
+}
 
 function responseBodyForOperation({
   body,
@@ -591,11 +629,13 @@ function supportsCapability({
   capability,
   stream,
   transcriptionProfile,
+  anthropicIngress,
 }: {
   capabilities: OpenAiCompatibleCapabilities | null;
   capability: ModelApiCapability;
   stream: boolean;
   transcriptionProfile?: TranscriptionRequestProfile;
+  anthropicIngress?: AnthropicIngress;
 }): boolean {
   if (capability === "chat.completions") {
     if (capabilities?.chatCompletions?.supported !== true) return false;
@@ -637,6 +677,21 @@ function supportsCapability({
     return true;
   }
 
+  if (capability === "messages.create" || capability === "messages.countTokens") {
+    if (capabilities?.version !== 3) return false;
+    const result = resolveExecutionPath({
+      capabilities,
+      requestedSurface: "ANTHROPIC_MESSAGES",
+      request: {
+        stream,
+        countTokens: capability === "messages.countTokens",
+        protocolVersion: anthropicIngress?.version,
+        betaFeatures: anthropicIngress?.betaFeatures,
+      },
+    });
+    return result.mode === "native";
+  }
+
   if (capability === "responses.statefulFollowUps") {
     return capabilities?.responses?.statefulFollowUps === true;
   }
@@ -671,7 +726,7 @@ function supportsOperation({
   capabilities: OpenAiCompatibleCapabilities | null;
   operation: Pick<
     RelayOperation,
-    "capability" | "additionalCapabilities" | "stream" | "transcriptionProfile"
+    "capability" | "additionalCapabilities" | "stream" | "transcriptionProfile" | "anthropicIngress"
   >;
 }): boolean {
   if (
@@ -680,6 +735,7 @@ function supportsOperation({
       capability: operation.capability,
       stream: operation.stream,
       transcriptionProfile: operation.transcriptionProfile,
+      anthropicIngress: operation.anthropicIngress,
     })
   ) {
     return false;
@@ -1563,7 +1619,7 @@ async function relayDirect({
   if (!selected) {
     await operation.dispose?.();
     await failRelayMetadata({ relayRequestId, startedAt, failure: "not_found" });
-    return openAiFailureJsonResponse("not_found");
+    return operationFailureResponse(operation, "not_found");
   }
   const capabilities = effectiveDirectCapabilities(selected);
   const optimisticBasic =
@@ -1587,7 +1643,7 @@ async function relayDirect({
       failure: "unsupported_capability",
       selectedDiscoveredModelId: selected.id,
     });
-    return openAiFailureJsonResponse("unsupported_capability");
+    return operationFailureResponse(operation, "unsupported_capability");
   }
   if (!isEndpointConnected(selected, new Set(manager.getActiveCliDeviceIds()))) {
     await operation.dispose?.();
@@ -1597,7 +1653,7 @@ async function relayDirect({
       failure: "disconnected",
       selectedDiscoveredModelId: selected.id,
     });
-    return openAiFailureJsonResponse("disconnected");
+    return operationFailureResponse(operation, "disconnected");
   }
 
   let globalLease: ModelApiLimitLease | undefined;
@@ -1619,7 +1675,7 @@ async function relayDirect({
         failure: error.failure,
         selectedDiscoveredModelId: selected.id,
       });
-      return openAiFailureJsonResponse(error.failure);
+      return operationFailureResponse(operation, error.failure);
     }
     throw error;
   }
@@ -1637,7 +1693,7 @@ async function relayDirect({
       failure: "unknown",
       selectedDiscoveredModelId: selected.id,
     });
-    return openAiFailureJsonResponse("unknown");
+    return operationFailureResponse(operation, "unknown");
   }
   const responseIdCapture =
     operation.responseStickiness && operation.family === "responses"
@@ -1708,7 +1764,7 @@ async function relayDirect({
       terminal,
       attemptCount: 1,
     });
-    return openAiFailureJsonResponse(terminal.failure ?? "unknown");
+    return operationFailureResponse(operation, terminal.failure ?? "unknown");
   }
 }
 
@@ -1752,7 +1808,7 @@ async function relayPool({
     if (error instanceof ModelApiLimitError) {
       await operation.dispose?.();
       await failRelayMetadata({ relayRequestId, startedAt, failure: error.failure });
-      return openAiFailureJsonResponse(error.failure);
+      return operationFailureResponse(operation, error.failure);
     }
     throw error;
   }
@@ -1788,7 +1844,7 @@ async function relayPool({
       startedAt,
       failure: "unsupported_capability",
     });
-    return openAiFailureJsonResponse("unsupported_capability");
+    return operationFailureResponse(operation, "unsupported_capability");
   }
 
   const activeCliDeviceIds = manager.getActiveCliDeviceIds();
@@ -1811,7 +1867,7 @@ async function relayPool({
     globalLease.release();
     await operation.dispose?.();
     await failRelayMetadata({ relayRequestId, startedAt, failure: "disconnected" });
-    return openAiFailureJsonResponse("disconnected");
+    return operationFailureResponse(operation, "disconnected");
   }
 
   const memberById = new Map(eligibleMembers.map((member) => [member.id, member] as const));
@@ -2795,7 +2851,7 @@ async function relayPreparedModeledRequest({
   }
 
   await prepared.dispose?.();
-  return openAiFailureJsonResponse("not_found");
+  return operationFailureResponse(operation, "not_found");
 }
 
 async function authenticatedModeledHandler({
@@ -3052,6 +3108,81 @@ async function responsesStickyHandler({
   });
 }
 
+async function prepareAnthropicModeledRequest(
+  request: Request,
+  ingress: AnthropicIngress,
+): Promise<PreparedModeledRequest | Response> {
+  const body = await readModelApiBody(request);
+  if (body instanceof Response) {
+    return anthropicErrorResponse(body.status, "Request body is too large.");
+  }
+  let payload: JsonObject;
+  try {
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(body));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("object");
+    payload = parsed as JsonObject;
+  } catch {
+    return anthropicErrorResponse(400, "Request body must be a JSON object.");
+  }
+  if (typeof payload.model !== "string" || payload.model.trim().length === 0) {
+    return anthropicErrorResponse(400, "model is required and must be a non-empty string.");
+  }
+  return {
+    model: payload.model,
+    payload,
+    stream: payload.stream === true,
+    buildRequest: async (upstreamModelId) => ({
+      headers: anthropicRelayHeaders(request, ingress),
+      body: upstreamBody(payload, upstreamModelId),
+    }),
+  };
+}
+
+async function anthropicMessagesHandler({
+  request,
+  countTokens,
+  manager,
+  limiter,
+}: {
+  request: Request;
+  countTokens: boolean;
+  manager: NonNullable<ModelApiRouteDependencies["manager"]>;
+  limiter: ModelApiConcurrencyLimiter;
+}) {
+  const token = await authenticateRequest(request);
+  if (!token) {
+    return anthropicErrorResponse(
+      401,
+      "Missing or invalid WSMP bearer token.",
+      "authentication_error",
+    );
+  }
+  const ingress = parseAnthropicIngress(request.headers);
+  if (ingress instanceof Response) return ingress;
+  const prepared = await prepareAnthropicModeledRequest(request, ingress);
+  if (prepared instanceof Response) return prepared;
+  if (countTokens) prepared.stream = false;
+  const targets = await listVisibleModelTargetsForToken(token);
+  const response = await relayPreparedModeledRequest({
+    request,
+    requester: requesterFromToken(token),
+    targets,
+    prepared,
+    operation: {
+      family: "messages",
+      method: "POST",
+      path: countTokens ? "/v1/messages/count_tokens" : "/v1/messages",
+      capability: countTokens ? "messages.countTokens" : "messages.create",
+      anthropicIngress: ingress,
+    },
+    manager,
+    limiter,
+  });
+  // Native upstream success and error bytes are intentionally opaque here.
+  // Reading or cloning the stream would violate streaming and backpressure.
+  return response;
+}
+
 export function createModelApiRoutes({
   manager = relaySessionManager,
   concurrencyLimiter = modelApiConcurrencyLimiter,
@@ -3148,6 +3279,24 @@ export function createModelApiRoutes({
   app.post("/responses", async (c) =>
     responsesCreateHandler({
       request: c.req.raw,
+      manager,
+      limiter: concurrencyLimiter,
+    }),
+  );
+
+  app.post("/messages", async (c) =>
+    anthropicMessagesHandler({
+      request: c.req.raw,
+      countTokens: false,
+      manager,
+      limiter: concurrencyLimiter,
+    }),
+  );
+
+  app.post("/messages/count_tokens", async (c) =>
+    anthropicMessagesHandler({
+      request: c.req.raw,
+      countTokens: true,
       manager,
       limiter: concurrencyLimiter,
     }),

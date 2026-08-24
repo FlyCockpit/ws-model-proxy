@@ -105,9 +105,59 @@ const v2CapabilitiesSchema = z
   })
   .strict();
 
+const surfaceFeatureSchema = z
+  .object({
+    supported: booleanSupportSchema,
+    streaming: booleanSupportSchema,
+    maxContextTokens: z.number().int().positive().optional(),
+    images: booleanSupportSchema,
+    tools: booleanSupportSchema,
+    parallelTools: booleanSupportSchema,
+    structuredOutput: booleanSupportSchema,
+    reasoning: booleanSupportSchema,
+    hostedTools: booleanSupportSchema,
+    countTokens: booleanSupportSchema,
+    stateful: booleanSupportSchema,
+    protocolVersion: z.string().trim().min(1).max(64).optional(),
+    betaFeatures: z.array(z.string().trim().min(1).max(128)).max(64).optional(),
+  })
+  .strict();
+
+/**
+ * Version 3 is the provider-independent inventory. The legacy operation fields
+ * remain present so v1/v2 readers and non-generation routes can be migrated
+ * independently without losing their existing meaning.
+ */
+const v3CapabilitiesSchema = z
+  .object({
+    version: z.literal(3),
+    ...commonCapabilityShape,
+    protocol: z.enum(["openai-compatible", "anthropic-compatible"]),
+    surfaces: z
+      .object({
+        openaiChatCompletions: surfaceFeatureSchema.optional(),
+        openaiResponses: surfaceFeatureSchema.optional(),
+        anthropicMessages: surfaceFeatureSchema.optional(),
+        openaiCompletions: surfaceFeatureSchema.optional(),
+      })
+      .strict(),
+    source: z.enum(["declared", "probe", "dashboard", "provider"]).optional(),
+    confidence: z.enum(["exact", "high", "estimated", "unknown"]).optional(),
+    audio: z
+      .object({
+        transcriptions: transcriptionCapabilitiesSchema.optional(),
+        translations: transcriptionCapabilitiesSchema.optional(),
+        speech: booleanSupportSchema,
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+
 export const openAiCompatibleCapabilitiesSchema = z.discriminatedUnion("version", [
   v1CapabilitiesSchema,
   v2CapabilitiesSchema,
+  v3CapabilitiesSchema,
 ]);
 
 export type OpenAiCompatibleCapabilities = z.infer<typeof openAiCompatibleCapabilitiesSchema>;

@@ -23,6 +23,9 @@
     "./lib/openai-compatible-capabilities": {
       "default": "./src/lib/openai-compatible-capabilities.ts"
     },
+    "./lib/surface-capabilities": {
+      "default": "./src/lib/surface-capabilities.ts"
+    },
     "./routers/index": {
       "default": "./src/routers/index.ts"
     }

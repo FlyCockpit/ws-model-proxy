@@ -577,6 +577,96 @@ describe("model API routes", () => {
     );
   });
 
+  it("relays native Anthropic Messages with strict WSMP/upstream header isolation", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "anthropic-compatible",
+          surfaces: {
+            anthropicMessages: {
+              supported: true,
+              streaming: true,
+              countTokens: true,
+              protocolVersion: "2023-06-01",
+              betaFeatures: ["prompt-caching-2024-07-31"],
+            },
+          },
+        },
+      }),
+    );
+    const manager = new FakeRelayManager();
+    const responsePromise = appWith(manager).request("/messages", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": " prompt-caching-2024-07-31 ",
+        cookie: "must-not-forward=1",
+      },
+      body: JSON.stringify({
+        model: directTarget.modelId,
+        max_tokens: 32,
+        messages: [{ role: "user", content: "secret prompt" }],
+        unknown_native_field: { preserve: true },
+      }),
+    });
+
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    expect(sent.family).toBe("messages");
+    expect(sent.path).toBe("/v1/messages");
+    expect(sentHeader(sent, "authorization")).toBeUndefined();
+    expect(sentHeader(sent, "x-api-key")).toBeUndefined();
+    expect(sentHeader(sent, "cookie")).toBeUndefined();
+    expect(sentHeader(sent, "anthropic-version")).toBe("2023-06-01");
+    expect(sentHeader(sent, "anthropic-beta")).toBe("prompt-caching-2024-07-31");
+    expect(JSON.parse(firstBodyChunkText(sent))).toMatchObject({
+      model: "gpt-4o-mini",
+      unknown_native_field: { preserve: true },
+    });
+
+    manager.headers(sent.requestId, 200, {
+      "content-type": "application/json",
+      "request-id": "req_anthropic",
+    });
+    const response = await responsePromise;
+    const nativeBody = { id: "msg_123", type: "message", content: [] };
+    manager.body(sent.requestId, JSON.stringify(nativeBody));
+    manager.complete(sent.requestId);
+    expect(response.headers.get("request-id")).toBe("req_anthropic");
+    await expect(response.json()).resolves.toEqual(nativeBody);
+  });
+
+  it("uses Anthropic-shaped errors for authentication, version, and beta rejection", async () => {
+    const app = appWith(new FakeRelayManager());
+    const unauthenticated = await app.request("/messages", { method: "POST" });
+    expect(unauthenticated.status).toBe(401);
+    await expect(unauthenticated.json()).resolves.toMatchObject({
+      type: "error",
+      error: { type: "authentication_error" },
+    });
+
+    const unsupportedVersion = await app.request("/messages", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "anthropic-version": "2099-01-01" },
+    });
+    expect(unsupportedVersion.status).toBe(400);
+    await expect(unsupportedVersion.json()).resolves.toMatchObject({ type: "error" });
+
+    const upstreamCredentialAttempt = await app.request("/messages", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "anthropic-version": "2023-06-01",
+        "x-api-key": "must-not-be-accepted",
+      },
+    });
+    expect(upstreamCredentialAttempt.status).toBe(400);
+    await expect(upstreamCredentialAttempt.json()).resolves.toMatchObject({ type: "error" });
+  });
+
   it("does not fail over direct model requests after an upstream failure", async () => {
     const manager = new FakeRelayManager();
     const responsePromise = appWith(manager).request("/chat/completions", {

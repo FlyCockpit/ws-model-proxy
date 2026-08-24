@@ -1,6 +1,32 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ActiveRelayResponseHandlers } from "../relay/session-manager.js";
-import { RELAY_RESPONSE_QUEUE_MAX_BYTES, startRelayAttempt } from "./relay-executor.js";
+import {
+  RELAY_RESPONSE_QUEUE_MAX_BYTES,
+  sanitizeNativeResponseHeaders,
+  startRelayAttempt,
+} from "./relay-executor.js";
+
+describe("native response header sanitizer", () => {
+  it("preserves protocol metadata while removing framing, cookies, and auth challenges", () => {
+    const headers = sanitizeNativeResponseHeaders({
+      "Content-Type": "text/event-stream",
+      "Request-Id": "req_123",
+      "retry-after": "2",
+      "content-length": "999",
+      "Set-Cookie": "secret=1",
+      "WWW-Authenticate": "Bearer realm=provider",
+      "x-api-key": "provider-secret",
+      Connection: "keep-alive",
+    });
+    expect(headers.get("content-type")).toBe("text/event-stream");
+    expect(headers.get("request-id")).toBe("req_123");
+    expect(headers.get("retry-after")).toBe("2");
+    expect(headers.get("content-length")).toBeNull();
+    expect(headers.get("set-cookie")).toBeNull();
+    expect(headers.get("www-authenticate")).toBeNull();
+    expect(headers.get("x-api-key")).toBeNull();
+  });
+});
 
 function harness() {
   let handlers: ActiveRelayResponseHandlers | undefined;

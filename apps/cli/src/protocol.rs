@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::config::{CapabilityOverrideMode, EndpointConfig, OpenAiCompatibleCapabilities};
+use crate::config::{
+    CapabilityOverrideMode, EndpointConfig, EndpointKind, OpenAiCompatibleCapabilities,
+};
 
 pub const RELAY_PROTOCOL_VERSION: &str = "2.3";
 pub const RELAY_SUBPROTOCOL: &str = "ws-model-proxy.relay.v2";
@@ -285,7 +287,11 @@ pub fn endpoint_inventory(endpoint: &EndpointConfig, status: EndpointStatus) -> 
     EndpointInventory {
         slug: endpoint.slug.clone(),
         label: endpoint.label.clone(),
-        kind: "openai-compatible".to_string(),
+        kind: match endpoint.kind {
+            EndpointKind::OpenAiCompatible => "openai-compatible",
+            EndpointKind::AnthropicCompatible => "anthropic-compatible",
+        }
+        .to_string(),
         status,
         default_capabilities: endpoint.default_capabilities.clone(),
         probe_suggestions: endpoint

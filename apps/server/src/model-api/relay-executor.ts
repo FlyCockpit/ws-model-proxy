@@ -80,7 +80,7 @@ function splitBodyChunks(body: Uint8Array): Uint8Array[] {
   return chunks;
 }
 
-function sanitizeRelayResponseHeaders(headers: Record<string, string>): Headers {
+export function sanitizeNativeResponseHeaders(headers: Record<string, string>): Headers {
   const output = new Headers();
   for (const [name, value] of Object.entries(headers)) {
     const normalized = name.trim().toLowerCase();
@@ -89,6 +89,10 @@ function sanitizeRelayResponseHeaders(headers: Record<string, string>): Headers 
       normalized === "connection" ||
       normalized === "content-length" ||
       normalized === "set-cookie" ||
+      normalized === "www-authenticate" ||
+      normalized === "proxy-authenticate" ||
+      normalized === "authorization" ||
+      normalized === "x-api-key" ||
       normalized === "transfer-encoding" ||
       normalized === "upgrade" ||
       normalized.startsWith("sec-")
@@ -215,7 +219,7 @@ export function startRelayAttempt({
     onHeaders(message) {
       headersResolved = true;
       upstreamStatusCode = message.status;
-      const responseHeaders = sanitizeRelayResponseHeaders(message.headers);
+      const responseHeaders = sanitizeNativeResponseHeaders(message.headers);
       if (!responseHeaders.has("content-type")) {
         responseHeaders.set("content-type", "application/json; charset=utf-8");
       }

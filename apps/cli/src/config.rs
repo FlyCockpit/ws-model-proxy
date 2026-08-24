@@ -24,25 +24,28 @@ where
     D: serde::Deserializer<'de>,
 {
     let version = u8::deserialize(deserializer)?;
-    if matches!(version, 1 | 2) {
+    if matches!(version, 1 | 2 | 3) {
         Ok(version)
     } else {
         Err(serde::de::Error::custom(
-            "capability version must be 1 or 2",
+            "capability version must be 1, 2, or 3",
         ))
     }
 }
 
-fn deserialize_openai_compatible_protocol<'de, D>(deserializer: D) -> Result<String, D::Error>
+fn deserialize_compatible_protocol<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let protocol = String::deserialize(deserializer)?;
-    if protocol == "openai-compatible" {
+    if matches!(
+        protocol.as_str(),
+        "openai-compatible" | "anthropic-compatible"
+    ) {
         Ok(protocol)
     } else {
         Err(serde::de::Error::custom(
-            "capability protocol must be openai-compatible",
+            "capability protocol must be openai-compatible or anthropic-compatible",
         ))
     }
 }
@@ -169,6 +172,8 @@ pub enum EndpointKind {
     #[serde(rename = "openai-compatible")]
     #[default]
     OpenAiCompatible,
+    #[serde(rename = "anthropic-compatible")]
+    AnthropicCompatible,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,8 +237,14 @@ pub enum ProbeStatus {
 pub struct OpenAiCompatibleCapabilities {
     #[serde(deserialize_with = "deserialize_capability_version")]
     pub version: u8,
-    #[serde(deserialize_with = "deserialize_openai_compatible_protocol")]
+    #[serde(deserialize_with = "deserialize_compatible_protocol")]
     pub protocol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub surfaces: Option<SurfaceInventory>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub models: Option<ModelListCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -259,6 +270,9 @@ impl OpenAiCompatibleCapabilities {
         Self {
             version: 1,
             protocol: "openai-compatible".to_string(),
+            surfaces: None,
+            source: None,
+            confidence: None,
             models: Some(ModelListCapabilities { list: Some(true) }),
             chat_completions: Some(ChatCompletionsCapabilities {
                 supported: Some(true),
@@ -278,6 +292,9 @@ impl OpenAiCompatibleCapabilities {
         Self {
             version: 1,
             protocol: "openai-compatible".to_string(),
+            surfaces: None,
+            source: None,
+            confidence: None,
             models: Some(ModelListCapabilities { list: Some(true) }),
             chat_completions: None,
             completions: None,
@@ -350,6 +367,38 @@ impl OpenAiCompatibleCapabilities {
         self.chat_completions = Some(chat);
         self
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SurfaceInventory {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openai_chat_completions: Option<SurfaceCapabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openai_responses: Option<SurfaceCapabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anthropic_messages: Option<SurfaceCapabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openai_completions: Option<SurfaceCapabilities>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SurfaceCapabilities {
+    pub supported: Option<bool>,
+    pub streaming: Option<bool>,
+    pub max_context_tokens: Option<u64>,
+    pub images: Option<bool>,
+    pub tools: Option<bool>,
+    pub parallel_tools: Option<bool>,
+    pub structured_output: Option<bool>,
+    pub reasoning: Option<bool>,
+    pub hosted_tools: Option<bool>,
+    pub count_tokens: Option<bool>,
+    pub stateful: Option<bool>,
+    pub protocol_version: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub beta_features: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -707,8 +756,22 @@ mod tests {
         assert_eq!(profile.supported(), Some(true));
         assert!(matches!(profile, AudioOperationCapabilities::Detailed(_)));
 
+        let anthropic: OpenAiCompatibleCapabilities = serde_json::from_value(serde_json::json!({
+            "version": 3,
+            "protocol": "anthropic-compatible",
+            "surfaces": {
+                "anthropicMessages": {
+                    "supported": true,
+                    "streaming": true,
+                    "protocolVersion": "2023-06-01"
+                }
+            }
+        }))
+        .expect("v3 Anthropic profile");
+        assert_eq!(anthropic.version, 3);
+
         for invalid in [
-            serde_json::json!({ "version": 3, "protocol": "openai-compatible" }),
+            serde_json::json!({ "version": 4, "protocol": "openai-compatible" }),
             serde_json::json!({ "version": 2, "protocol": "other" }),
         ] {
             assert!(serde_json::from_value::<OpenAiCompatibleCapabilities>(invalid).is_err());
