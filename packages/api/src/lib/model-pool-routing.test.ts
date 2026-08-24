@@ -269,6 +269,7 @@ describe("modelPoolRouting", () => {
     expect(poolMemberFailureClassForRelayFailure("timeout")).toBe("RELAY_TIMEOUT");
     expect(poolMemberFailureClassForRelayFailure("disconnected")).toBe("WEBSOCKET_DISCONNECTED");
     expect(poolMemberFailureClassForRelayFailure("upstream_5xx")).toBe("UPSTREAM_5XX");
+    expect(poolMemberFailureClassForRelayFailure("protocol_error")).toBe("TRANSPORT");
     expect(poolMemberFailureClassForRelayFailure("upstream_4xx")).toBeNull();
     expect(poolMemberFailureClassForRelayFailure("access_denied")).toBeNull();
     expect(poolMemberFailureClassForRelayFailure("not_found")).toBeNull();

@@ -131,6 +131,10 @@ export function poolMemberFailureClassForRelayFailure(
   if (failure === "timeout") return "RELAY_TIMEOUT";
   if (failure === "disconnected") return "WEBSOCKET_DISCONNECTED";
   if (failure === "upstream_5xx") return "UPSTREAM_5XX";
+  // A protocol violation is attributable to the selected upstream member in
+  // the same way as a broken relay payload: keep it out of the healthy path
+  // instead of recording the adapted request as an unpenalized failure.
+  if (failure === "protocol_error") return "TRANSPORT";
   return null;
 }
 

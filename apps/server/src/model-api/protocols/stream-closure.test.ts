@@ -137,6 +137,34 @@ describe("cycle 21 streaming closure", () => {
   });
 
   it.each([
+    ["openai-chat", "data: [DONE]"],
+    ["anthropic-messages", "event: message_stop"],
+  ] as const)(
+    "keeps exactly one %s terminal when malformed data follows stop",
+    (surface, marker) => {
+      const renderer = new CanonicalStreamRenderer(surface);
+      const output = [
+        ...renderer.push({
+          type: "message_start",
+          id: "m",
+          model: "model",
+          usage: { inputTokens: 1, outputTokens: 0 },
+        }),
+        ...renderer.push({ type: "stop", reason: "stop" }),
+        ...renderer.push({ type: "complete" }),
+      ].map(decode);
+      expect(output.join("").split(marker)).toHaveLength(2);
+      expect(() =>
+        renderer.push({
+          type: "error",
+          error: { code: "protocol_error", message: "malformed trailing data" },
+        }),
+      ).toThrow("terminal event");
+      expect(output.join("").split(marker)).toHaveLength(2);
+    },
+  );
+
+  it.each([
     ["openai-chat", "content_filter", true],
     ["openai-responses", "content_filter", false],
     ["anthropic-messages", "content_filter", false],
