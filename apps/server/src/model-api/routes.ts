@@ -250,6 +250,23 @@ function operationFailureResponse(
   );
 }
 
+function contextExceededResponse(operation: Pick<RelayOperation, "family">, message: string) {
+  if (operation.family === "messages") {
+    return anthropicErrorResponse(400, message, "invalid_request_error");
+  }
+  return new Response(
+    JSON.stringify({
+      error: {
+        message,
+        type: "invalid_request_error",
+        param: null,
+        code: "context_exceeded",
+      },
+    }),
+    { status: 400, headers: { "content-type": "application/json; charset=utf-8" } },
+  );
+}
+
 function responseBodyForOperation({
   body,
   headers,
@@ -2114,9 +2131,8 @@ async function relayDirect({
     ) {
       await operation.dispose?.();
       await failRelayMetadata({ relayRequestId, startedAt, failure: "request_too_large" });
-      return operationFailureResponse(
+      return contextExceededResponse(
         operation,
-        "request_too_large",
         "Request context exceeds the configured execution capacity ceiling.",
       );
     }
@@ -2318,9 +2334,8 @@ async function relayPool({
   if (members.length > 0 && contextEligibleMembers.length === 0) {
     await operation.dispose?.();
     await failRelayMetadata({ relayRequestId, startedAt, failure: "request_too_large" });
-    return operationFailureResponse(
+    return contextExceededResponse(
       operation,
-      "request_too_large",
       "Request context exceeds every compatible pool member ceiling.",
     );
   }

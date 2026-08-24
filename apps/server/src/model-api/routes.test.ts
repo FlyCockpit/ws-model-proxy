@@ -3066,9 +3066,12 @@ describe("model API routes", () => {
       },
     );
 
-    expect(response.status).toBe(413);
+    expect(response.status).toBe(400);
     await expect(response.json()).resolves.toMatchObject({
-      error: { message: expect.stringContaining("context exceeds") },
+      error: {
+        code: "context_exceeded",
+        message: expect.stringContaining("context exceeds"),
+      },
     });
     expect(capacityRuntime.acquire).not.toHaveBeenCalled();
     expect(manager.sent).toHaveLength(0);
