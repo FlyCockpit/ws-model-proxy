@@ -10,6 +10,8 @@
           "confidence": "exact",
           "supported": true,
           "streaming": true,
+          "inputImages": true,
+          "outputImages": false,
           "inputAudio": false,
           "outputAudio": false,
           "inputVideo": false,
@@ -28,6 +30,8 @@
           "source": "declared",
           "confidence": "exact",
           "supported": true,
+          "inputImages": true,
+          "outputImages": true,
           "responsesLifecycle": {
             "statefulFollowUps": true,
             "retrieve": true,
@@ -56,6 +60,18 @@
           "confidence": "exact",
           "supported": true,
           "stateful": true
+        }
+      }
+    },
+    {
+      "version": 3,
+      "protocol": "openai-compatible",
+      "surfaces": {
+        "openaiChatCompletions": {
+          "source": "declared",
+          "confidence": "exact",
+          "supported": true,
+          "images": true
         }
       }
     },

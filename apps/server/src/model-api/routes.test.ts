@@ -216,6 +216,7 @@ function directRow({
   audioSpeech = true,
   responses = true,
   capabilityOverrideMetadata = null,
+  endpointCapabilityMetadata,
   optimisticBasicTranscription = false,
 }: {
   id?: string;
@@ -229,6 +230,7 @@ function directRow({
   audioSpeech?: boolean;
   responses?: boolean;
   capabilityOverrideMetadata?: Record<string, unknown> | null;
+  endpointCapabilityMetadata?: Record<string, unknown> | null;
   optimisticBasicTranscription?: boolean;
 } = {}) {
   return {
@@ -245,29 +247,32 @@ function directRow({
       published: true,
       cliDeviceId,
       status: "ONLINE",
-      capabilityMetadata: {
-        version: 1,
-        protocol: "openai-compatible",
-        chatCompletions: { supported: true, streaming: true, vision: true },
-        completions: { supported: completions, streaming: true },
-        embeddings: { supported: embeddings },
-        audio: {
-          transcriptions: audioTranscriptions,
-          translations: audioTranslations,
-          speech: audioSpeech,
-        },
-        responses: {
-          supported: responses,
-          streaming: true,
-          statefulFollowUps: true,
-          retrieve: true,
-          delete: true,
-          cancel: true,
-          listInputItems: true,
-          countTokens: true,
-          compact: true,
-        },
-      },
+      capabilityMetadata:
+        endpointCapabilityMetadata === undefined
+          ? {
+              version: 1,
+              protocol: "openai-compatible",
+              chatCompletions: { supported: true, streaming: true, vision: true },
+              completions: { supported: completions, streaming: true },
+              embeddings: { supported: embeddings },
+              audio: {
+                transcriptions: audioTranscriptions,
+                translations: audioTranslations,
+                speech: audioSpeech,
+              },
+              responses: {
+                supported: responses,
+                streaming: true,
+                statefulFollowUps: true,
+                retrieve: true,
+                delete: true,
+                cancel: true,
+                listInputItems: true,
+                countTokens: true,
+                compact: true,
+              },
+            }
+          : endpointCapabilityMetadata,
       CliDevice: { status: connected ? "CONNECTED" : "DISCONNECTED" },
     },
   };
@@ -614,35 +619,34 @@ describe("model API routes", () => {
   });
 
   it("routes v3 OpenAI Chat, Responses, and native-only Completions surfaces", async () => {
-    db.discoveredModel.findUnique.mockResolvedValue(
-      directRow({
-        capabilityOverrideMetadata: {
-          version: 3,
-          protocol: "openai-compatible",
-          surfaces: {
-            openaiChatCompletions: {
-              source: "declared",
-              confidence: "exact",
-              supported: true,
-              streaming: true,
-            },
-            openaiResponses: {
-              source: "declared",
-              confidence: "exact",
-              supported: true,
-              streaming: true,
-              stateful: true,
-            },
-            openaiCompletions: {
-              source: "declared",
-              confidence: "exact",
-              supported: true,
-              streaming: true,
-            },
+    const v3OnlyRow = directRow({
+      endpointCapabilityMetadata: null,
+      capabilityOverrideMetadata: {
+        version: 3,
+        protocol: "openai-compatible",
+        surfaces: {
+          openaiChatCompletions: {
+            source: "declared",
+            confidence: "exact",
+            supported: true,
+            streaming: true,
+          },
+          openaiResponses: {
+            source: "declared",
+            confidence: "exact",
+            supported: true,
+            streaming: true,
+          },
+          openaiCompletions: {
+            source: "declared",
+            confidence: "exact",
+            supported: true,
+            streaming: true,
           },
         },
-      }),
-    );
+      },
+    });
+    db.discoveredModel.findUnique.mockResolvedValue(v3OnlyRow);
     for (const [route, expectedPath, body] of [
       [
         "/chat/completions",
@@ -861,7 +865,7 @@ describe("model API routes", () => {
     });
   });
 
-  it("relays Anthropic count_tokens with the official fixture shape", async () => {
+  it("relays Anthropic count_tokens with the published-spec-derived fixture shape", async () => {
     db.discoveredModel.findUnique.mockResolvedValue(
       directRow({
         capabilityOverrideMetadata: {

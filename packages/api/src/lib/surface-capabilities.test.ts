@@ -172,7 +172,8 @@ describe("surface capability resolution", () => {
           source: "declared",
           confidence: "exact",
           supported: true,
-          images: true,
+          inputImages: true,
+          outputImages: false,
           inputAudio: true,
           outputAudio: false,
           inputVideo: false,
@@ -193,8 +194,30 @@ describe("surface capability resolution", () => {
       resolveExecutionPath({
         capabilities,
         requestedSurface: "OPENAI_RESPONSES",
-        request: { images: true, inputAudio: true, outputVideo: true },
+        request: { inputImages: true, inputAudio: true, outputVideo: true },
       }).mode,
     ).toBe("native");
+  });
+
+  it("maps legacy chat vision to directional image input only", () => {
+    const legacy = parseOpenAiCompatibleCapabilities({
+      version: 2,
+      protocol: "openai-compatible",
+      chatCompletions: { supported: true, vision: true },
+    });
+    expect(
+      resolveExecutionPath({
+        capabilities: legacy,
+        requestedSurface: "OPENAI_CHAT_COMPLETIONS",
+        request: { inputImages: true },
+      }).mode,
+    ).toBe("native");
+    expect(
+      resolveExecutionPath({
+        capabilities: legacy,
+        requestedSurface: "OPENAI_CHAT_COMPLETIONS",
+        request: { outputImages: true },
+      }).mode,
+    ).toBe("unavailable");
   });
 });

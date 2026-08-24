@@ -494,7 +494,9 @@ pub struct SurfaceCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_context_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub images: Option<bool>,
+    pub input_images: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_images: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_audio: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]

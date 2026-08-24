@@ -7,6 +7,17 @@
     "errors": "https://docs.anthropic.com/en/api/errors",
     "betaHeaders": "https://docs.anthropic.com/en/api/beta-headers"
   },
+  "provenance": {
+    "kind": "synthetic-published-spec-derived",
+    "upstreamCapture": false,
+    "assertions": [
+      "required anthropic-version request header",
+      "comma-separated anthropic-beta request header",
+      "Messages response and error envelopes",
+      "count_tokens request and response fields",
+      "documented Messages SSE event ordering"
+    ]
+  },
   "capturedAt": "2026-08-24",
   "requestHeaders": {
     "anthropic-version": "2023-06-01",

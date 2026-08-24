@@ -1,3 +1,5 @@
+import { nativeRequestHeaders } from "./native-request-headers.js";
+
 export const SUPPORTED_ANTHROPIC_VERSIONS = ["2023-06-01"] as const;
 
 export type AnthropicIngress = {
@@ -51,14 +53,7 @@ export function parseAnthropicIngress(headers: Headers): AnthropicIngress | Resp
 }
 
 export function anthropicRelayHeaders(request: Request, ingress: AnthropicIngress): Headers {
-  const headers = new Headers();
-  const contentType = request.headers.get("content-type");
-  if (contentType) headers.set("content-type", contentType);
-  else headers.set("content-type", "application/json");
-  const accept = request.headers.get("accept");
-  if (accept) headers.set("accept", accept);
-  const requestId = request.headers.get("request-id");
-  if (requestId) headers.set("request-id", requestId);
+  const headers = nativeRequestHeaders(request, "anthropic");
   headers.set("anthropic-version", ingress.version);
   if (ingress.betaFeatures.length > 0) {
     headers.set("anthropic-beta", ingress.betaFeatures.join(","));

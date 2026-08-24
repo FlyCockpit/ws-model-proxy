@@ -12,7 +12,8 @@ export type SurfaceMode = "native" | "adapted" | "unavailable";
 export type SurfaceRequestRequirements = {
   stream?: boolean;
   contextTokens?: number;
-  images?: boolean;
+  inputImages?: boolean;
+  outputImages?: boolean;
   inputAudio?: boolean;
   outputAudio?: boolean;
   inputVideo?: boolean;
@@ -56,7 +57,8 @@ type SurfaceFeatures = {
   supported?: boolean;
   streaming?: boolean;
   maxContextTokens?: number;
-  images?: boolean;
+  inputImages?: boolean;
+  outputImages?: boolean;
   inputAudio?: boolean;
   outputAudio?: boolean;
   inputVideo?: boolean;
@@ -85,7 +87,17 @@ function nativeFeatures(
     }[surface] as keyof typeof capabilities.surfaces;
     return capabilities.surfaces[key];
   }
-  if (surface === "OPENAI_CHAT_COMPLETIONS") return capabilities.chatCompletions;
+  if (surface === "OPENAI_CHAT_COMPLETIONS") {
+    const legacy = capabilities.chatCompletions;
+    return legacy
+      ? {
+          ...legacy,
+          inputImages: legacy.vision,
+          inputAudio: legacy.audio,
+          inputVideo: legacy.video,
+        }
+      : undefined;
+  }
   if (surface === "OPENAI_RESPONSES") return capabilities.responses;
   if (surface === "OPENAI_COMPLETIONS") return capabilities.completions;
   return undefined;
@@ -146,6 +158,8 @@ function adaptedSubsetFailures(request: SurfaceRequestRequirements): string[] {
   for (const key of [
     "inputAudio",
     "outputAudio",
+    "inputImages",
+    "outputImages",
     "inputVideo",
     "outputVideo",
     "parallelTools",
@@ -170,7 +184,8 @@ function incompatibilities(features: SurfaceFeatures, request: SurfaceRequestReq
   )
     failures.push("context_limit_unknown_or_exceeded");
   for (const key of [
-    "images",
+    "inputImages",
+    "outputImages",
     "inputAudio",
     "outputAudio",
     "inputVideo",

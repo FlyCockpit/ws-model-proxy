@@ -92,6 +92,7 @@ import {
   parseMultipartToSpool,
   type ReplayableMultipart,
 } from "./multipart-form-data.js";
+import { nativeRequestHeaders } from "./native-request-headers.js";
 import {
   openAiErrorBody,
   openAiFailureJsonResponse,
@@ -570,22 +571,7 @@ async function transcriptionUploadLimitResponse({
 }
 
 function relayRequestHeaders(request: Request): Headers {
-  const headers = new Headers(request.headers);
-  headers.delete("authorization");
-  headers.delete("x-api-key");
-  headers.delete("api-key");
-  headers.delete("openai-api-key");
-  headers.delete("anthropic-api-key");
-  headers.delete("cookie");
-  headers.delete("content-length");
-  headers.delete("host");
-  headers.delete("origin");
-  headers.delete("referer");
-  headers.delete("x-csrf-token");
-  if (!headers.has("content-type")) {
-    headers.set("content-type", "application/json");
-  }
-  return headers;
+  return nativeRequestHeaders(request, "openai");
 }
 
 /** Nested transform prepass must not reuse client Idempotency-Key. */
