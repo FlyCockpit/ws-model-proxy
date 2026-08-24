@@ -5,6 +5,7 @@ import type {
 } from "@ws-model-proxy/api/lib/model-api-token-access";
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import type { ActiveRelayResponseHandlers, RelaySessionManager } from "../relay/session-manager.js";
+import type { CapacityAdmissionRuntime } from "./capacity/runtime.js";
 import officialAnthropicFixture from "./fixtures/anthropic-2023-06-01.json";
 import responsesConformanceFixture from "./protocols/fixtures/generated-conformance/openai-responses-sse.json";
 
@@ -316,6 +317,11 @@ function poolMemberRow({
     lastFailureAt: null,
     nextRetryAt: null,
     halfOpenTrialStartedAt: null,
+    ExecutionTarget: {
+      id: `${id}-target`,
+      inferenceCapacityId: `${id}-capacity`,
+      DiscoveredModel: null,
+    },
     DiscoveredModel: {
       id: discoveredModelId,
       published: true,
@@ -340,12 +346,15 @@ function appWith(
   manager: FakeRelayManager,
   anthropicEnabled = true,
   protocolAdaptationEnabled = false,
+  capacityRuntime?: CapacityAdmissionRuntime,
 ) {
   return createModelApiRoutes({
     manager,
     concurrencyLimiter: new ModelApiConcurrencyLimiter(),
     anthropicEnabled,
     protocolAdaptationEnabled,
+    capacityEnabled: capacityRuntime !== undefined,
+    capacityRuntime,
   });
 }
 
@@ -2842,14 +2851,51 @@ describe("model API routes", () => {
 
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-a", "cli-b"];
-    const responsePromise = appWith(manager).request("/chat/completions", {
-      method: "POST",
-      headers: {
-        authorization: "Bearer wsmp_model_test",
-        "content-type": "application/json",
+    const capacityEvents: string[] = [];
+    const capacityAttempts: Array<{ requestId: string; attemptId: string; candidates: unknown[] }> =
+      [];
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async (attempt) => {
+        capacityEvents.push(`acquire:${attempt.candidates[0]?.poolMemberId ?? "none"}`);
+        capacityAttempts.push({
+          requestId: attempt.requestId,
+          attemptId: attempt.attemptId,
+          candidates: [...attempt.candidates],
+        });
+        const candidate = attempt.candidates[0]!;
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: `lease-${candidate.poolMemberId}`,
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: BigInt(capacityAttempts.length),
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      }),
+      release: vi.fn(async (lease) => {
+        capacityEvents.push(`release:${lease.poolMemberId}`);
+        return true;
+      }),
+      hold: vi.fn((response, lease) => {
+        capacityEvents.push(`hold:${lease.poolMemberId}`);
+        return response;
+      }),
+    };
+    const responsePromise = appWith(manager, true, false, capacityRuntime).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: requestBody(poolTarget.modelId),
       },
-      body: requestBody(poolTarget.modelId),
-    });
+    );
 
     await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
     const failed = requireSent(manager);
@@ -2858,6 +2904,12 @@ describe("model API routes", () => {
     manager.headers(failed.requestId, 500, { "content-type": "application/json" });
 
     await vi.waitFor(() => expect(manager.sent).toHaveLength(2));
+    expect(capacityAttempts).toHaveLength(2);
+    expect(capacityAttempts[0]?.requestId).not.toBe(capacityAttempts[1]?.requestId);
+    expect(capacityAttempts[0]?.attemptId).not.toBe(capacityAttempts[1]?.attemptId);
+    expect(capacityAttempts[0]?.candidates).toHaveLength(2);
+    expect(capacityAttempts[1]?.candidates).toMatchObject([{ poolMemberId: "member-b" }]);
+    expect(capacityEvents).toEqual(["acquire:member-a", "release:member-a", "acquire:member-b"]);
     const retried = requireSent(manager, 1);
     expect(retried.cliDeviceId).toBe("cli-b");
     expect(firstBodyChunkText(retried)).toContain('"model":"upstream-b"');
@@ -2878,6 +2930,8 @@ describe("model API routes", () => {
 
     expect(response.status).toBe(200);
     await response.text();
+    expect(capacityEvents).toContain("hold:member-b");
+    expect(capacityRuntime.release).toHaveBeenCalledTimes(1);
     await vi.waitFor(() =>
       expect(db.relayRequest.update).toHaveBeenCalledWith(
         expect.objectContaining({
