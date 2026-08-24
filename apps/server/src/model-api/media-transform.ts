@@ -225,14 +225,6 @@ export function collectMessageTransformJobs(
   return jobs;
 }
 
-/** @deprecated Prefer collectMessageTransformJobs for multi-turn. */
-export function collectTransformableParts(
-  messages: unknown,
-  modalities: TransformModalities,
-): Record<string, unknown>[] {
-  return collectMessageTransformJobs(messages, modalities).flatMap((job) => job.mediaParts);
-}
-
 export function clampTransformerMaxTools(value: number | null | undefined): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return MODEL_API_TRANSFORMER_DEFAULT_MAX_TOOLS;
@@ -617,31 +609,6 @@ export function rewriteMessagesWithPerMessageEnvelopes({
     });
   });
   return ensureTransformPolicySystemMessage(rewritten);
-}
-
-/** @deprecated Use rewriteMessagesWithPerMessageEnvelopes. */
-export function rewriteMessagesAfterTransform({
-  messages,
-  modalities,
-  envelopeText,
-}: {
-  messages: unknown[];
-  modalities: TransformModalities;
-  envelopeText: string;
-}): unknown[] {
-  const jobs = collectMessageTransformJobs(messages, modalities);
-  const map = new Map<number, string>();
-  for (const job of jobs) {
-    map.set(job.messageIndex, envelopeText);
-  }
-  if (map.size === 0 && messages.length > 0) {
-    map.set(messages.length - 1, envelopeText);
-  }
-  return rewriteMessagesWithPerMessageEnvelopes({
-    messages,
-    modalities,
-    envelopesByMessageIndex: map,
-  });
 }
 
 export function extractAssistantTextFromChatCompletion(body: unknown): string | null {

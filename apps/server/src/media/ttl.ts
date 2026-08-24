@@ -9,9 +9,7 @@ import prisma from "@ws-model-proxy/db";
 // keep working. The single source of truth lives in @ws-model-proxy/config so the
 // oRPC settings router (packages/api) enforces the same bounds. See media-policy.ts.
 export {
-  clampMediaAssetTtlHours,
   MEDIA_ASSET_TTL_DEFAULT_HOURS,
-  MEDIA_ASSET_TTL_HOURS_SETTING_KEY,
   MEDIA_ASSET_TTL_MAX_HOURS,
   MEDIA_ASSET_TTL_MIN_HOURS,
 } from "@ws-model-proxy/config/media-policy";

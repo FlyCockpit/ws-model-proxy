@@ -1,0 +1,5 @@
+# Prisma 7.9.1 pins deepmerge-ts 7.1.5. CVE-2026-40345 requires two
+# attacker-controlled circular JavaScript object graphs, while Prisma uses the
+# package to merge trusted local configuration; plain JSON cannot trigger it.
+# Remove when Prisma supports deepmerge-ts >=8. Review no later than this date.
+CVE-2026-40345 exp:2026-11-30

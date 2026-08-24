@@ -1350,7 +1350,6 @@ where
         ServerControlMessage::HelloOk {
             id,
             revision,
-            desired_capabilities: _,
             ..
         } => {
             *last_inventory_revision = Some(revision);

@@ -305,6 +305,7 @@ jobs:
             Dockerfile Dockerfile.dev package.json docker-compose*.yml scripts/ apps/ packages/ .github/workflows/ \
             | grep -v 'scripts/docker-entrypoint.sh:' \
             | grep -v 'scripts/db-push-dangerous-local.sh:' \
+            | grep -v 'policy: bounded-delete' \
             | grep -v '.github/workflows/pr-checks.yml:' \
             | grep -v '/dist/' \
             | grep -v 'node_modules'; then

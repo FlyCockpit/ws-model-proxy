@@ -148,6 +148,7 @@ RUN pnpm install --frozen-lockfile --prod --ignore-scripts --filter=server... --
 # from the production dependency layer so the runtime image does not ship tsc
 # or its platform-native TS 7 binary.
 RUN rm -rf node_modules/.pnpm/typescript@* \
+  node_modules/.pnpm/@typescript+typescript-* \
   node_modules/typescript \
   apps/server/node_modules/typescript \
   apps/web/node_modules/typescript

@@ -9,7 +9,7 @@ export function transcriptionContentLengthGuard(maxBytes: number) {
   return async (
     c: { req: { header(name: string): string | undefined } },
     next: () => Promise<void>,
-  ): Promise<Response | void> => {
+  ): Promise<Response | undefined> => {
     const raw = c.req.header("content-length");
     if (raw !== undefined) {
       const length = Number(raw);

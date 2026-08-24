@@ -521,7 +521,7 @@ try {
     await new Promise((resolveClose) => upstream.close(resolveClose));
   }
   if (db) {
-    await db.query(`DELETE FROM "user" WHERE id = $1`, [userId]).catch(() => undefined);
+    await db.query(`DELETE FROM "user" WHERE id = $1`, [userId]).catch(() => undefined); // policy: bounded-delete -- generated test user only
     await db.end();
   }
   await rm(scratch, { recursive: true, force: true });

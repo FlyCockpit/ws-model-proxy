@@ -2,18 +2,21 @@ import { spawnSync } from "node:child_process";
 
 type Check = {
   label: string;
-  args: string[];
+  pattern: string;
+  paths: string[];
   allow?: (line: string) => boolean;
 };
 
 const checks: Check[] = [
   {
     label: "route files must not call authClient.getSession(",
-    args: ["authClient\\.getSession\\(", "apps/web/src/routes"],
+    pattern: "authClient\\.getSession\\(",
+    paths: ["apps/web/src/routes"],
   },
   {
     label: "production code must call .useSession( only in apps/web/src/hooks/use-auth-session.ts",
-    args: ["\\.useSession\\(", "apps/web/src"],
+    pattern: "\\.useSession\\(",
+    paths: ["apps/web/src"],
     allow: (line) => line.startsWith("apps/web/src/hooks/use-auth-session.ts:"),
   },
 ];
@@ -21,14 +24,14 @@ const checks: Check[] = [
 let failed = false;
 
 for (const check of checks) {
-  const result = spawnSync("rg", check.args, {
+  const result = spawnSync("git", ["grep", "-n", "-E", check.pattern, "--", ...check.paths], {
     cwd: process.cwd(),
     encoding: "utf8",
   });
 
   if (result.status === 1) continue;
   if (result.status !== 0) {
-    process.stderr.write(result.stderr);
+    process.stderr.write(result.stderr ?? result.error?.message ?? "git grep failed");
     process.exit(result.status ?? 1);
   }
 

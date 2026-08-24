@@ -1,10 +1,5 @@
 import type { RelayFailure } from "../relay/protocol.js";
 export const MODEL_API_MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024;
-/** Absolute safety ceilings; deployment configuration may only lower these. */
-export const MODEL_API_TRANSCRIPTION_HARD_MAX_FILE_BYTES = 1024 * 1024 * 1024;
-/** Includes multipart boundaries, headers, scalar fields, and file payloads. */
-export const MODEL_API_TRANSCRIPTION_HARD_MAX_MULTIPART_BYTES =
-  MODEL_API_TRANSCRIPTION_HARD_MAX_FILE_BYTES + 1024 * 1024;
 export const MODEL_API_RELAY_TIMEOUT_MS = 15 * 60 * 1000;
 
 /** Remaining time in one operation-wide relay budget (shared by pool attempts). */
