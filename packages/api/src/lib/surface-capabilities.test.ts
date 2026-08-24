@@ -220,4 +220,38 @@ describe("surface capability resolution", () => {
       }).mode,
     ).toBe("unavailable");
   });
+
+  it("pre-dispatch excludes adapted Anthropic streaming without initial usage", () => {
+    const chatOnly = parseOpenAiCompatibleCapabilities({
+      version: 3,
+      protocol: "openai-compatible",
+      surfaces: {
+        openaiChatCompletions: {
+          source: "declared",
+          confidence: "exact",
+          supported: true,
+          streaming: true,
+        },
+      },
+    });
+    expect(
+      resolveExecutionPath({
+        capabilities: chatOnly,
+        requestedSurface: "ANTHROPIC_MESSAGES",
+        request: { stream: true },
+        adaptationEnabled: true,
+      }),
+    ).toMatchObject({
+      mode: "unavailable",
+      limitations: expect.arrayContaining(["anthropic_initial_usage_unavailable"]),
+    });
+    expect(
+      resolveExecutionPath({
+        capabilities: chatOnly,
+        requestedSurface: "ANTHROPIC_MESSAGES",
+        request: { stream: false },
+        adaptationEnabled: true,
+      }).mode,
+    ).toBe("adapted");
+  });
 });

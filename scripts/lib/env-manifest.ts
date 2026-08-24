@@ -310,6 +310,13 @@ export const ENV_VARS: EnvVar[] = [
       "Release gate for the incomplete native Anthropic Messages surface. Keep false by default.",
     ],
   },
+  {
+    key: "MODEL_API_PROTOCOL_ADAPTATION_ENABLED",
+    group: "runtime",
+    source: "default",
+    default: "false",
+    comment: ["Release gate for opt-in model-pool cross-protocol adaptation."],
+  },
 
   // --- auth ----------------------------------------------------------------
   {

@@ -159,6 +159,9 @@ const poolTarget: VisibleModelPoolTarget = {
   poolSlug: "general",
   maxAttachmentBytes: null,
   optimisticBasicTranscription: false,
+  protocolAdaptationEnabled: false,
+  allowLossyDeveloperRoleCollapse: false,
+  recommendedSurfaceOverride: null,
 };
 
 const session = {

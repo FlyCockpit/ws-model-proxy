@@ -1,3 +1,4 @@
+export * from "./adaptation.js";
 export * from "./anthropic-messages.js";
 export * from "./canonical.js";
 export * from "./errors.js";

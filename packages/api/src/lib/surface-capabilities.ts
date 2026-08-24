@@ -29,6 +29,7 @@ export type SurfaceRequestRequirements = {
   betaFeatures?: readonly string[];
   responsesOperation?: ResponsesOperation;
   responseId?: string;
+  allowLossyDeveloperRoleCollapse?: boolean;
 };
 
 export type ResponsesOperation =
@@ -310,6 +311,13 @@ export function resolveExecutionPath({
     ...(lifecycleUnsupported ? [`responses_${lifecycleOperation}_unavailable`] : []),
     ...(anthropicCountTokensUnsupported ? ["countTokens_unavailable"] : []),
     ...(selected.mode === "adapted" ? adaptedSubsetFailures(request) : []),
+    ...(selected.mode === "adapted" &&
+    requestedSurface === "ANTHROPIC_MESSAGES" &&
+    request.stream === true &&
+    (selected.nativeSurface === "OPENAI_CHAT_COMPLETIONS" ||
+      selected.nativeSurface === "OPENAI_RESPONSES")
+      ? ["anthropic_initial_usage_unavailable"]
+      : []),
   ];
   const limitations = [...selected.limitations, ...failures];
   return describe(

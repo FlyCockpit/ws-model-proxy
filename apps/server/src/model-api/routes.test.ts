@@ -202,6 +202,9 @@ const poolTarget: VisibleModelPoolTarget = {
   poolSlug: "gpt-4.1-mini",
   maxAttachmentBytes: null,
   optimisticBasicTranscription: false,
+  protocolAdaptationEnabled: false,
+  allowLossyDeveloperRoleCollapse: false,
+  recommendedSurfaceOverride: null,
 };
 
 function directRow({

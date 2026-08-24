@@ -120,6 +120,8 @@ type ModelApiRouteDependencies = {
   concurrencyLimiter?: ModelApiConcurrencyLimiter;
   /** Test/deployment release gate; defaults to the validated env flag. */
   anthropicEnabled?: boolean;
+  /** Independent release gate for opt-in pool protocol adaptation. */
+  protocolAdaptationEnabled?: boolean;
 };
 
 type JsonObject = Record<string, unknown>;
@@ -3253,8 +3255,10 @@ export function createModelApiRoutes({
   manager = relaySessionManager,
   concurrencyLimiter = modelApiConcurrencyLimiter,
   anthropicEnabled = env.MODEL_API_ANTHROPIC_ENABLED,
+  protocolAdaptationEnabled = env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
 }: ModelApiRouteDependencies = {}) {
   const app = new Hono();
+  void protocolAdaptationEnabled;
 
   app.get("/models", async (c) => {
     const token = await authenticateRequest(c.req.raw);
