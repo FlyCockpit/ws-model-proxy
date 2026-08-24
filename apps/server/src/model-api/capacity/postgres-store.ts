@@ -308,38 +308,24 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       where: { ExecutionTarget: { capacityId } },
       include: { ModelPool: true },
     });
-    const reservationsByTarget = new Map<
-      string,
-      { targetId: string; memberIds: Set<string>; capacityReservedSlots: number }
-    >();
+    const configuredReservations: Array<{ ownerKey: string; capacityReservedSlots: number }> = [];
     const configuredDirectReservations = await tx.executionTarget.findMany({
       where: { inferenceCapacityId: capacityId, directReservedSlots: { gt: 0 } },
       select: { id: true, directReservedSlots: true },
     });
     for (const target of configuredDirectReservations)
-      reservationsByTarget.set(target.id, {
-        targetId: target.id,
-        memberIds: new Set(),
+      configuredReservations.push({
+        ownerKey: `direct:${target.id}`,
         capacityReservedSlots: target.directReservedSlots,
       });
     for (const member of configuredReservationMembers) {
-      if (!member.executionTargetId) continue;
       const slots = member.capacityReservedSlots ?? member.ModelPool.capacityReservedSlots;
-      const existing = reservationsByTarget.get(member.executionTargetId);
-      if (existing) {
-        existing.memberIds.add(member.id);
-        existing.capacityReservedSlots = Math.max(existing.capacityReservedSlots, slots);
-      } else {
-        reservationsByTarget.set(member.executionTargetId, {
-          targetId: member.executionTargetId,
-          memberIds: new Set([member.id]),
+      if (slots > 0)
+        configuredReservations.push({
+          ownerKey: `member:${member.id}`,
           capacityReservedSlots: slots,
         });
-      }
     }
-    const configuredReservations = [...reservationsByTarget.values()].filter(
-      (policy) => policy.capacityReservedSlots > 0,
-    );
     const eligibility = new Map<string, { borrowed: boolean }>();
     const eligible = [];
     for (const waiter of waiters) {
@@ -361,7 +347,9 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       for (const entry of waiters)
         if (entry.effectivePriority > waiter.effectivePriority && entry.effectiveReservedSlots > 0)
           higherReservationOwners.set(
-            entry.poolMemberId ?? `direct:${entry.executionTargetId}`,
+            entry.poolMemberId
+              ? `member:${entry.poolMemberId}`
+              : `direct:${entry.executionTargetId}`,
             entry.effectiveReservedSlots,
           );
       const reservedForHigherPriority = Math.min(
@@ -381,8 +369,10 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         configuredReservations
           .filter(
             (policy) =>
-              policy.targetId !== waiter.executionTargetId &&
-              (!waiter.poolMemberId || !policy.memberIds.has(waiter.poolMemberId)),
+              policy.ownerKey !==
+              (waiter.poolMemberId
+                ? `member:${waiter.poolMemberId}`
+                : `direct:${waiter.executionTargetId}`),
           )
           .reduce((total, policy) => total + policy.capacityReservedSlots, 0),
       );

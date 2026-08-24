@@ -102,7 +102,7 @@ integration("PostgreSQL capacity admission primitives", () => {
           {
             admissionRequestId: "earlier-b",
             waiterId: "earlier-b",
-            candidateOrder: 1,
+            candidateOrder: 0,
             priority: 7,
             enqueueSequence: 1n,
             eligible: true,
@@ -110,7 +110,7 @@ integration("PostgreSQL capacity admission primitives", () => {
           {
             admissionRequestId: "earlier-a",
             waiterId: "earlier-a",
-            candidateOrder: 0,
+            candidateOrder: 9,
             priority: 7,
             enqueueSequence: 1n,
             eligible: true,
@@ -861,14 +861,14 @@ integration("PostgreSQL capacity admission primitives", () => {
         connectionOwner: "reservation-proof",
         deadlineAt,
         candidates: [
-          { capacityId: capacity.id, executionTargetId: targets[1]!.id, candidateOrder: 0 },
+          { capacityId: capacity.id, executionTargetId: targets[0]!.id, candidateOrder: 0 },
         ],
       });
       await expect(manager.acquire(directAttempt(`never-${suffix}`))).resolves.toMatchObject({
         state: "WAITING",
       });
       await db.executionTarget.update({
-        where: { id: targets[1]!.id },
+        where: { id: targets[0]!.id },
         data: { directBorrowPolicy: "WHEN_IDLE", directConcurrencyLimit: 1 },
       });
       const active = await db.capacityLease.findMany({

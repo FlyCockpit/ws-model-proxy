@@ -76,6 +76,31 @@ describe("durable capacity scheduler", () => {
     expect(result.winner).toMatchObject({ waiterId: "waiter-0", candidateOrder: 0 });
   });
 
+  it("orders equal-sequence FIFO by request before candidate order", () => {
+    const result = scheduleWeightedDeficitRoundRobin({
+      state: emptyState(),
+      candidates: [
+        {
+          admissionRequestId: "request-b",
+          waiterId: "b-0",
+          candidateOrder: 0,
+          priority: 0,
+          enqueueSequence: 1n,
+          eligible: true,
+        },
+        {
+          admissionRequestId: "request-a",
+          waiterId: "a-9",
+          candidateOrder: 9,
+          priority: 0,
+          enqueueSequence: 1n,
+          eligible: true,
+        },
+      ],
+    });
+    expect(result.winner).toMatchObject({ admissionRequestId: "request-a", waiterId: "a-9" });
+  });
+
   it("resets empty-class credit and advances a durable cursor", () => {
     const state = emptyState();
     state.deficits[5] = 99;

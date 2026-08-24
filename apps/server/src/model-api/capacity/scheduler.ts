@@ -78,7 +78,9 @@ export function scheduleWeightedDeficitRoundRobin({
   for (const queue of queues.values())
     queue.sort((a, b) =>
       a.enqueueSequence === b.enqueueSequence
-        ? a.candidateOrder - b.candidateOrder || a.waiterId.localeCompare(b.waiterId)
+        ? a.admissionRequestId.localeCompare(b.admissionRequestId) ||
+          a.candidateOrder - b.candidateOrder ||
+          a.waiterId.localeCompare(b.waiterId)
         : a.enqueueSequence < b.enqueueSequence
           ? -1
           : 1,
