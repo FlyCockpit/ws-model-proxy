@@ -1,5 +1,6 @@
 import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
 import { describe, expect, it } from "vitest";
+import { PRIORITY_CLASS_COUNT, scheduleWeightedDeficitRoundRobin } from "./scheduler.js";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 const integration = databaseUrl ? describe : describe.skip;
@@ -29,6 +30,94 @@ integration("PostgreSQL capacity admission primitives", () => {
       expect(order).toEqual(["first-lock", "first-release", "second-lock"]);
     } finally {
       await Promise.all([first.$disconnect(), second.$disconnect()]);
+    }
+  });
+
+  it("persists FIFO and weighted WDRR state across independent-client restart", async () => {
+    if (!databaseUrl) return;
+    let client = createPrismaClient(databaseUrl);
+    const cleanup = createPrismaClient(databaseUrl);
+    const suffix = crypto.randomUUID();
+    const user = await cleanup.user.create({
+      data: { name: "Scheduler Proof", email: `scheduler-${suffix}@example.test`, slug: suffix },
+    });
+    const capacity = await cleanup.inferenceCapacity.create({
+      data: {
+        userId: user.id,
+        label: `scheduler-${suffix}`,
+        runtimeIdentityKey: `scheduler-${suffix}`,
+        runtimeModel: "scheduler-proof",
+      },
+    });
+    try {
+      const fifo = scheduleWeightedDeficitRoundRobin({
+        state: {
+          cursor: 7,
+          deficits: Array(PRIORITY_CLASS_COUNT).fill(0),
+          version: 1,
+        },
+        candidates: [
+          { admissionRequestId: "later", priority: 7, enqueueSequence: 2n, eligible: true },
+          { admissionRequestId: "earlier-b", priority: 7, enqueueSequence: 1n, eligible: true },
+          { admissionRequestId: "earlier-a", priority: 7, enqueueSequence: 1n, eligible: true },
+        ],
+      });
+      expect(fifo.winner?.admissionRequestId).toBe("earlier-a");
+
+      const winners: number[] = [];
+      let firstLowRound = -1;
+      const bound = 33;
+      for (let round = 0; round < 96; round++) {
+        const winner = await client.$transaction(async (tx) => {
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacity.id}, 0))`;
+          const row = await tx.inferenceCapacity.findUniqueOrThrow({ where: { id: capacity.id } });
+          const deficits =
+            Array.isArray(row.schedulerDeficits) && row.schedulerDeficits.length === 32
+              ? row.schedulerDeficits.map((value) => (typeof value === "number" ? value : 0))
+              : Array(PRIORITY_CLASS_COUNT).fill(0);
+          const decision = scheduleWeightedDeficitRoundRobin({
+            state: { cursor: row.schedulerCursor, deficits, version: row.schedulerVersion },
+            candidates: [
+              {
+                admissionRequestId: `p31-${round}`,
+                priority: 31,
+                enqueueSequence: 0n,
+                eligible: true,
+              },
+              { admissionRequestId: "p0-head", priority: 0, enqueueSequence: 0n, eligible: true },
+            ],
+          });
+          await tx.inferenceCapacity.update({
+            where: { id: capacity.id },
+            data: {
+              schedulerCursor: decision.state.cursor,
+              schedulerDeficits: decision.state.deficits,
+              schedulerVersion: decision.state.version,
+            },
+          });
+          return decision.winner?.priority;
+        });
+        if (winner !== undefined) winners.push(winner);
+        if (winner === 0 && firstLowRound === -1) firstLowRound = round;
+        if (round === 15) {
+          await client.$disconnect();
+          client = createPrismaClient(databaseUrl);
+        }
+      }
+      expect(firstLowRound).toBeGreaterThanOrEqual(0);
+      expect(firstLowRound).toBeLessThan(bound);
+      expect(winners.filter((priority) => priority === 31).length).toBeGreaterThan(
+        winners.filter((priority) => priority === 0).length,
+      );
+      const persisted = await cleanup.inferenceCapacity.findUniqueOrThrow({
+        where: { id: capacity.id },
+      });
+      expect(persisted.schedulerVersion).toBe(1);
+      expect(persisted.schedulerDeficits).not.toEqual({});
+    } finally {
+      await client.$disconnect();
+      await cleanup.user.delete({ where: { id: user.id } }).catch(() => undefined);
+      await cleanup.$disconnect();
     }
   });
 
@@ -286,6 +375,44 @@ integration("PostgreSQL capacity admission primitives", () => {
             where: { attemptId: abandonedAttempt.attemptId },
           }),
         ).toMatchObject({ state: "CANCELLED", terminalReason: "connection_abandoned" });
+        const raceAttempt = {
+          ...lowAttempt,
+          requestId: `request-race-${suffix}`,
+          attemptId: `attempt-race-${suffix}`,
+        };
+        await expect(firstManager.acquire(raceAttempt)).resolves.toMatchObject({
+          state: "WAITING",
+        });
+        await Promise.all([
+          firstManager.cancelAttempt(raceAttempt.attemptId),
+          secondManager.acquire({ ...raceAttempt, candidates: [] }),
+        ]);
+        expect(
+          await db.admissionRequest.findUnique({ where: { attemptId: raceAttempt.attemptId } }),
+        ).toMatchObject({ state: "CANCELLED" });
+        expect(await db.capacityLease.count({ where: { attemptId: raceAttempt.attemptId } })).toBe(
+          0,
+        );
+
+        const deadlineAttempt = {
+          ...lowAttempt,
+          requestId: `request-deadline-${suffix}`,
+          attemptId: `attempt-deadline-${suffix}`,
+          deadlineAt: new Date(Date.now() + 30),
+        };
+        await expect(firstManager.acquire(deadlineAttempt)).resolves.toMatchObject({
+          state: "WAITING",
+        });
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        if (high.state === "ADMITTED") await secondManager.release(high.lease);
+        await expect(firstManager.acquire({ ...deadlineAttempt, candidates: [] })).resolves.toEqual(
+          {
+            state: "EXPIRED",
+          },
+        );
+        expect(
+          await db.capacityLease.count({ where: { attemptId: deadlineAttempt.attemptId } }),
+        ).toBe(0);
       }
       await secondClient.$disconnect();
     } finally {

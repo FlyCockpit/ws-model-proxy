@@ -18,6 +18,22 @@ export function isRetryableCapacityTransactionError(error: unknown): boolean {
   return code !== undefined && SERIALIZATION_CODES.has(code);
 }
 
+export async function runCapacitySerializable<T>(
+  db: Pick<Db, "$transaction">,
+  work: (tx: Prisma.TransactionClient) => Promise<T>,
+  pause: (milliseconds: number) => Promise<void> = (milliseconds) =>
+    new Promise((resolve) => setTimeout(resolve, milliseconds)),
+): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await db.$transaction(work, { isolationLevel: "Serializable" });
+    } catch (error) {
+      if (attempt >= 4 || !isRetryableCapacityTransactionError(error)) throw error;
+      await pause(5 + Math.floor(Math.random() * 20));
+    }
+  }
+}
+
 export type CapacityNotifier = { notify(capacityIds: readonly string[]): Promise<void> };
 export type CapacityWakeSource = {
   wait(capacityIds: readonly string[], timeoutMs: number, signal?: AbortSignal): Promise<void>;
@@ -76,6 +92,18 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           result: { state: existing.state === "EXPIRED" ? "EXPIRED" : "CANCELLED" } as const,
           notify: [],
         };
+      if (existing?.deadlineAt && existing.deadlineAt <= new Date()) {
+        const expiredAt = new Date();
+        await tx.admissionRequest.update({
+          where: { id: existing.id },
+          data: { state: "EXPIRED", terminalAt: expiredAt, terminalReason: "deadline" },
+        });
+        await tx.capacityWaiter.updateMany({
+          where: { admissionRequestId: existing.id, state: "WAITING" },
+          data: { state: "EXPIRED", stateChangedAt: expiredAt, terminalReason: "deadline" },
+        });
+        return { result: { state: "EXPIRED" } as const, notify: [] };
+      }
 
       const capacityIds = [
         ...new Set(
@@ -357,14 +385,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
   }
 
   async #serializable<T>(work: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
-    for (let attempt = 0; ; attempt++) {
-      try {
-        return await this.db.$transaction(work, { isolationLevel: "Serializable" });
-      } catch (error) {
-        if (attempt >= 4 || !isRetryableCapacityTransactionError(error)) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 5 + Math.floor(Math.random() * 20)));
-      }
-    }
+    return runCapacitySerializable(this.db, work);
   }
 }
 

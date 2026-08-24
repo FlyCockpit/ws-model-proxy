@@ -2,13 +2,40 @@ import { describe, expect, it, vi } from "vitest";
 
 vi.mock("@ws-model-proxy/db", () => ({ default: {}, Prisma: {} }));
 
-import { isRetryableCapacityTransactionError, waitWithCapacityPolling } from "./postgres-store.js";
+import {
+  isRetryableCapacityTransactionError,
+  runCapacitySerializable,
+  waitWithCapacityPolling,
+} from "./postgres-store.js";
 
 describe("capacity wakeup polling", () => {
   it("recognizes serialization and deadlock errors without depending on one driver class", () => {
     expect(isRetryableCapacityTransactionError({ code: "40001" })).toBe(true);
     expect(isRetryableCapacityTransactionError({ code: "40P01" })).toBe(true);
     expect(isRetryableCapacityTransactionError({ code: "23505" })).toBe(false);
+  });
+  it.each(["40001", "40P01"])("retries %s after rollback without leaking work", async (code) => {
+    let attempts = 0;
+    const committed: number[] = [];
+    const transaction = vi.fn(async (work: (tx: object) => Promise<number>) => {
+      attempts++;
+      const pending: number[] = [];
+      const value = await work({ pending });
+      if (attempts < 3) throw Object.assign(new Error("retry"), { code });
+      committed.push(...pending);
+      return value;
+    });
+    const result = await runCapacitySerializable(
+      { $transaction: transaction } as never,
+      async (tx) => {
+        (tx as unknown as { pending: number[] }).pending.push(attempts);
+        return attempts;
+      },
+      async () => undefined,
+    );
+    expect(result).toBe(3);
+    expect(committed).toEqual([3]);
+    expect(transaction).toHaveBeenCalledTimes(3);
   });
   it("treats notifications as hints and re-polls durable state", async () => {
     const admitted = {
