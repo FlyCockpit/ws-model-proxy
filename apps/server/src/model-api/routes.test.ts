@@ -157,6 +157,16 @@ class FakeRelayManager {
       usage: { promptTokens: 3, completionTokens: 5, totalTokens: 8 },
     });
   }
+
+  error(requestId: string, failure: "request_too_large") {
+    const handler = this.handlers.get(requestId);
+    this.handlers.delete(requestId);
+    handler?.onError({
+      type: "relay.error",
+      requestId,
+      failure,
+    });
+  }
 }
 
 const token: ModelApiTokenIdentity = {
@@ -728,6 +738,61 @@ describe("model API routes", () => {
     await expect(response.json()).resolves.toEqual(nativeBody);
   });
 
+  it("passes native Anthropic SSE through byte-for-byte with safe response headers only", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "anthropic-compatible",
+          surfaces: {
+            anthropicMessages: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+              protocolVersion: officialAnthropicFixture.protocolVersion,
+            },
+          },
+        },
+      }),
+    );
+    const manager = new FakeRelayManager();
+    const responsePromise = appWith(manager).request("/messages", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "anthropic-version": officialAnthropicFixture.protocolVersion,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        ...officialAnthropicFixture.request,
+        model: directTarget.modelId,
+        stream: true,
+      }),
+    });
+
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    manager.headers(sent.requestId, 200, {
+      "content-type": "text/event-stream",
+      "request-id": "req_stream_fixture",
+      "cache-control": "no-cache",
+      "set-cookie": "private=secret",
+      "x-upstream-private": "must-not-leak",
+    });
+    const response = await responsePromise;
+    manager.body(sent.requestId, officialAnthropicFixture.stream);
+    manager.complete(sent.requestId);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("text/event-stream");
+    expect(response.headers.get("request-id")).toBe("req_stream_fixture");
+    expect(response.headers.get("cache-control")).toBe("no-cache");
+    expect(response.headers.get("set-cookie")).toBeNull();
+    expect(response.headers.get("x-upstream-private")).toBeNull();
+    await expect(response.text()).resolves.toBe(officialAnthropicFixture.stream);
+  });
+
   it("gates Anthropic routes off explicitly", async () => {
     const response = await appWith(new FakeRelayManager(), false).request("/messages", {
       method: "POST",
@@ -756,6 +821,44 @@ describe("model API routes", () => {
       error: { type: "request_too_large", message: "Request body is too large." },
     });
     expect(db.relayRequest.create).not.toHaveBeenCalled();
+  });
+
+  it("maps relay request-too-large failures to the Anthropic error type", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "anthropic-compatible",
+          surfaces: {
+            anthropicMessages: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              protocolVersion: officialAnthropicFixture.protocolVersion,
+            },
+          },
+        },
+      }),
+    );
+    const manager = new FakeRelayManager();
+    const responsePromise = appWith(manager).request("/messages", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "anthropic-version": officialAnthropicFixture.protocolVersion,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ ...officialAnthropicFixture.request, model: directTarget.modelId }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    manager.error(requireSent(manager).requestId, "request_too_large");
+
+    const response = await responsePromise;
+    expect(response.status).toBe(413);
+    await expect(response.json()).resolves.toEqual({
+      type: "error",
+      error: { type: "request_too_large", message: "Request body is too large." },
+    });
   });
 
   it("relays Anthropic count_tokens with the official fixture shape", async () => {

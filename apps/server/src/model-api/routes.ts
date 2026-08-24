@@ -188,22 +188,26 @@ function operationFailureResponse(
   return anthropicErrorResponse(
     status,
     message ??
-      (failure === "unsupported_capability"
-        ? "The requested Anthropic operation is not supported by this target."
-        : failure === "not_found"
-          ? "The requested model was not found."
-          : failure === "access_denied"
-            ? "Access denied."
-            : "The request could not be completed."),
+      (failure === "request_too_large"
+        ? "Request body is too large."
+        : failure === "unsupported_capability"
+          ? "The requested Anthropic operation is not supported by this target."
+          : failure === "not_found"
+            ? "The requested model was not found."
+            : failure === "access_denied"
+              ? "Access denied."
+              : "The request could not be completed."),
     status === 404
       ? "not_found_error"
       : status === 401 || status === 403
         ? "authentication_error"
         : status === 429
           ? "rate_limit_error"
-          : status >= 500
-            ? "api_error"
-            : "invalid_request_error",
+          : failure === "request_too_large"
+            ? "request_too_large"
+            : status >= 500
+              ? "api_error"
+              : "invalid_request_error",
   );
 }
 

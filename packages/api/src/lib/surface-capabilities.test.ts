@@ -99,39 +99,38 @@ describe("surface capability resolution", () => {
     ).toBe("unavailable");
   });
 
-  it("resolves explicit Responses lifecycle operations and retry safety", () => {
+  it("resolves every Responses operation's selection, method, path, and retry safety", () => {
     const fixture = structuredClone(wireFixtures.valid[1]);
     if (fixture?.version !== 3 || fixture.protocol !== "openai-compatible") {
       throw new Error("expected the OpenAI Responses v3 routing fixture");
     }
-    fixture.surfaces.openaiResponses.responsesLifecycle.cancel = false;
     const capabilities = parseOpenAiCompatibleCapabilities(fixture);
-    expect(
-      resolveExecutionPath({
-        capabilities,
+    const cases = [
+      ["create", "POST", "/v1/responses", "pre_commit_only"],
+      ["statefulFollowUps", "POST", "/v1/responses", "never"],
+      ["retrieve", "GET", "/v1/responses/resp%2Fa", "idempotent"],
+      ["delete", "DELETE", "/v1/responses/resp%2Fa", "idempotent"],
+      ["cancel", "POST", "/v1/responses/resp%2Fa/cancel", "pre_commit_only"],
+      ["listInputItems", "GET", "/v1/responses/resp%2Fa/input_items", "idempotent"],
+      ["compact", "POST", "/v1/responses/resp%2Fa/compact", "pre_commit_only"],
+      ["countTokens", "POST", "/v1/responses/count_tokens", "idempotent"],
+    ] as const;
+    for (const [responsesOperation, method, path, retrySafety] of cases) {
+      expect(
+        resolveExecutionPath({
+          capabilities,
+          requestedSurface: "OPENAI_RESPONSES",
+          request: { responsesOperation, responseId: "resp/a" },
+        }),
+      ).toMatchObject({
+        mode: "native",
+        nativeSurface: "OPENAI_RESPONSES",
         requestedSurface: "OPENAI_RESPONSES",
-        request: { responsesOperation: "retrieve", responseId: "resp/a" },
-      }),
-    ).toMatchObject({
-      mode: "native",
-      method: "GET",
-      path: "/v1/responses/resp%2Fa",
-      retrySafety: "idempotent",
-    });
-    expect(
-      resolveExecutionPath({
-        capabilities,
-        requestedSurface: "OPENAI_RESPONSES",
-        request: { responsesOperation: "cancel", responseId: "resp_1" },
-      }),
-    ).toMatchObject({ mode: "unavailable", method: "POST", path: "/v1/responses/resp_1/cancel" });
-    expect(
-      resolveExecutionPath({
-        capabilities,
-        requestedSurface: "OPENAI_RESPONSES",
-        request: { stateful: true, responsesOperation: "statefulFollowUps" },
-      }).retrySafety,
-    ).toBe("never");
+        method,
+        path,
+        retrySafety,
+      });
+    }
   });
 
   it("categorically rejects adapted Responses lifecycle operations other than create", () => {
