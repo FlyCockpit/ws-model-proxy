@@ -206,7 +206,7 @@ describe("cycle 21 streaming closure", () => {
     const chat = new CanonicalStreamParser("openai-chat");
     chat.push(
       encode(
-        'data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"one","type":"function","function":{"name":"f","arguments":"{"}}]},"finish_reason":null}]}\n\n',
+        'data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"generated-attacker","type":"function","function":{"name":"f","arguments":"{"}}]},"finish_reason":null}]}\n\n',
       ),
     );
     expect(() =>

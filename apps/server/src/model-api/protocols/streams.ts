@@ -191,7 +191,13 @@ export class CanonicalStreamParser {
       );
   }
 
-  #toolDelta(index: number, id: string, name: string | undefined, delta: string): CanonicalEvent[] {
+  #toolDelta(
+    index: number,
+    id: string,
+    name: string | undefined,
+    delta: string,
+    synthesizedId = false,
+  ): CanonicalEvent[] {
     if (this.#items.has(index) && this.#itemTypes.get(index) !== "tool_call")
       throw new AdapterError("item_type_mismatch", `Item ${index} is not a tool call.`);
     if (
@@ -203,8 +209,7 @@ export class CanonicalStreamParser {
     if (name && this.#toolNames.has(index) && name !== this.#toolNames.get(index))
       throw new AdapterError("tool_name_mismatch", `Tool call ${index} changed names.`);
     const stableId = this.#itemIds.get(index) ?? id;
-    if (!this.#itemIds.has(index) && id.startsWith("generated-"))
-      this.#synthesizedItemIds.add(index);
+    if (!this.#itemIds.has(index) && synthesizedId) this.#synthesizedItemIds.add(index);
     if (name) this.#toolNames.set(index, name);
     const bytes = (this.#toolBytes.get(index) ?? 0) + new TextEncoder().encode(delta).byteLength;
     if (bytes > this.#maxToolArgumentsBytes)
@@ -369,6 +374,7 @@ export class CanonicalStreamParser {
             typeof call.id === "string" ? call.id : `generated-call-${index}`,
             typeof fn.name === "string" ? fn.name : undefined,
             typeof fn.arguments === "string" ? fn.arguments : "",
+            typeof call.id !== "string",
           ),
         );
       }
