@@ -2432,9 +2432,10 @@ async function relayPool({
       return operationFailureResponse(operation, "rate_limited");
     }
     const selectedPoolMemberId = capacityLease.lease.poolMemberId;
-    selectedRouteCandidates = routeCandidates.filter(
-      ({ poolMemberId }) => poolMemberId === selectedPoolMemberId,
-    );
+    selectedRouteCandidates = [
+      ...routeCandidates.filter(({ poolMemberId }) => poolMemberId === selectedPoolMemberId),
+      ...routeCandidates.filter(({ poolMemberId }) => poolMemberId !== selectedPoolMemberId),
+    ];
   }
   try {
     globalLease = limiter.acquireGlobal({
@@ -2457,8 +2458,82 @@ async function relayPool({
   const relayDeadlineMs = startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS;
   let cumulativeRequestBytes = 0;
   let cumulativeResponseBytes = 0;
+  const releaseCapacityAttempt = async () => {
+    if (capacityLease?.state !== "ADMITTED") return;
+    const lease = capacityLease.lease;
+    capacityLease = undefined;
+    globalLease?.release();
+    globalLease = undefined;
+    await capacityRuntime?.release(lease);
+  };
 
-  for (const candidate of selectedRouteCandidates) {
+  for (let candidateIndex = 0; candidateIndex < selectedRouteCandidates.length; candidateIndex++) {
+    let candidate = selectedRouteCandidates[candidateIndex]!;
+    if (capacityRuntime && capacityLease?.state !== "ADMITTED") {
+      const remaining = selectedRouteCandidates.slice(candidateIndex);
+      const admissionCandidates = remaining.map((remainingCandidate, candidateOrder) => {
+        const identity = memberById.get(remainingCandidate.poolMemberId)?.ExecutionTarget;
+        if (!identity?.inferenceCapacityId)
+          throw new Error("Capacity-enabled pool member lost execution target identity.");
+        return {
+          capacityId: identity.inferenceCapacityId,
+          executionTargetId: identity.id,
+          poolMemberId: remainingCandidate.poolMemberId,
+          candidateOrder,
+        };
+      });
+      try {
+        capacityLease = await capacityRuntime.acquire(
+          {
+            requestId: crypto.randomUUID(),
+            attemptId: crypto.randomUUID(),
+            ownerId: requester.userId,
+            sourceKind: "POOL",
+            poolId: target.id,
+            basePriority: 16,
+            connectionOwner: "model-api",
+            deadlineAt: new Date(Math.min(relayDeadlineMs, Date.now() + 30_000)),
+            candidates: admissionCandidates,
+          },
+          request.signal,
+        );
+      } catch {
+        finalFailure = "unknown";
+        break;
+      }
+      if (capacityLease.state !== "ADMITTED" || !capacityLease.lease.poolMemberId) {
+        finalFailure = "rate_limited";
+        break;
+      }
+      const admittedPoolMemberId = capacityLease.lease.poolMemberId;
+      const selectedIndex = selectedRouteCandidates.findIndex(
+        ({ poolMemberId }, index) =>
+          index >= candidateIndex && poolMemberId === admittedPoolMemberId,
+      );
+      if (selectedIndex < 0) {
+        await capacityRuntime.release(capacityLease.lease);
+        capacityLease = undefined;
+        finalFailure = "unknown";
+        break;
+      }
+      if (selectedIndex !== candidateIndex) {
+        const [selected] = selectedRouteCandidates.splice(selectedIndex, 1);
+        if (selected) selectedRouteCandidates.splice(candidateIndex, 0, selected);
+      }
+      candidate = selectedRouteCandidates[candidateIndex]!;
+    }
+    if (!globalLease) {
+      try {
+        globalLease = limiter.acquireGlobal({
+          tokenId: requester.limitKey,
+          userId: requester.userId,
+        });
+      } catch (error) {
+        await releaseCapacityAttempt();
+        finalFailure = error instanceof ModelApiLimitError ? error.failure : "unknown";
+        break;
+      }
+    }
     if (remainingRelayBudgetMs(relayDeadlineMs) === 0) {
       finalFailure = "timeout";
       break;
@@ -2472,6 +2547,7 @@ async function relayPool({
     } catch (error) {
       if (error instanceof ModelApiLimitError) {
         finalFailure = error.failure;
+        await releaseCapacityAttempt();
         continue;
       }
       throw error;
@@ -2483,6 +2559,7 @@ async function relayPool({
       });
       if (claimed === 0) {
         cliLease.release();
+        await releaseCapacityAttempt();
         continue;
       }
     }
@@ -2550,6 +2627,7 @@ async function relayPool({
         poolMemberId: candidate.poolMemberId,
         failure: "unknown",
       });
+      await releaseCapacityAttempt();
       continue;
     }
     const responseIdCapture =
@@ -2594,6 +2672,7 @@ async function relayPool({
           poolMemberId: candidate.poolMemberId,
           failure: "upstream_5xx",
         });
+        await releaseCapacityAttempt();
         continue;
       }
 
@@ -2614,6 +2693,7 @@ async function relayPool({
             failure: "protocol_error",
           });
           if (!shouldRetryRelayOperation(operation, "precommit_content_type_mismatch")) break;
+          await releaseCapacityAttempt();
           continue;
         }
       }
@@ -2644,6 +2724,7 @@ async function relayPool({
             poolMemberId: candidate.poolMemberId,
             failure: "protocol_error",
           });
+          await releaseCapacityAttempt();
           continue;
         }
       }
@@ -2681,6 +2762,7 @@ async function relayPool({
             poolMemberId: candidate.poolMemberId,
             failure: "protocol_error",
           });
+          await releaseCapacityAttempt();
           continue;
         }
       }
@@ -2705,7 +2787,7 @@ async function relayPool({
             responseBytes: cumulativeResponseBytes + terminal.responseBytes,
           };
           cliLease.release();
-          globalLease.release();
+          globalLease?.release();
           if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
           await operation.dispose?.();
           if (terminal.ok) {
@@ -2826,6 +2908,7 @@ async function relayPool({
           poolMemberId: candidate.poolMemberId,
           failure,
         });
+        await releaseCapacityAttempt();
         continue;
       }
       globalLease.release();
