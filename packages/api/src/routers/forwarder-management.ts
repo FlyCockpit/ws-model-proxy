@@ -146,6 +146,17 @@ type DiscoveredModelRow = {
   published: boolean;
   unpublishedAt: Date | null;
   maxAttachmentBytes: number | null;
+  ExecutionTargets: Array<{
+    id: string;
+    inferenceCapacityId: string | null;
+    directPriority: number;
+    directConcurrencyLimit: number | null;
+    directReservedSlots: number;
+    directBorrowPolicy: string;
+    directWaitBudgetMs: number | null;
+    directContextCeiling: number | null;
+    directContextMargin: number;
+  }>;
 };
 
 type ModelPoolRow = {
@@ -468,6 +479,7 @@ function serializeCliDevice(row: CliDeviceRow, now: Date) {
         published: model.published,
         unpublishedAt: model.unpublishedAt,
         maxAttachmentBytes: model.maxAttachmentBytes,
+        executionTarget: model.ExecutionTargets[0] ?? null,
       })),
     })),
   };
@@ -1007,6 +1019,20 @@ export const forwarderManagementRouter = {
                   published: true,
                   unpublishedAt: true,
                   maxAttachmentBytes: true,
+                  ExecutionTargets: {
+                    take: 1,
+                    select: {
+                      id: true,
+                      inferenceCapacityId: true,
+                      directPriority: true,
+                      directConcurrencyLimit: true,
+                      directReservedSlots: true,
+                      directBorrowPolicy: true,
+                      directWaitBudgetMs: true,
+                      directContextCeiling: true,
+                      directContextMargin: true,
+                    },
+                  },
                 },
               },
             },
@@ -1269,7 +1295,7 @@ export const forwarderManagementRouter = {
           },
           select: { id: true },
         });
-        return tx.poolMember.create({
+        const member = await tx.poolMember.create({
           data: {
             poolId: input.poolId,
             discoveredModelId: input.discoveredModelId,
@@ -1279,6 +1305,7 @@ export const forwarderManagementRouter = {
           },
           select: { id: true },
         });
+        return { id: member.id, executionTargetId: target.id };
       });
     }),
 

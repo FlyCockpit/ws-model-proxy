@@ -501,6 +501,11 @@ export function CliEndpointsModelsSection() {
   } = useQuery({
     ...orpc.forwarderManagement.listCliDevices.queryOptions(),
   });
+  const { data: capacitiesData } = useQuery({
+    ...orpc.capacityManagement.list.queryOptions(),
+    retry: false,
+  });
+  const [policyModel, setPolicyModel] = useState<DirectModelOption | null>(null);
   const [search, setSearch] = useState("");
   const [healthFilter, setHealthFilter] = useState<EndpointHealthFilter>("all");
   const matchingDevices = useMemo(() => {
@@ -844,6 +849,26 @@ export function CliEndpointsModelsSection() {
                                   {formatDate(model.lastSeenAt)}
                                 </td>
                                 <td className="py-2 pl-3 text-right align-top">
+                                  {model.executionTarget ? (
+                                    <Button
+                                      type="button"
+                                      variant="ghost"
+                                      size="icon-touch"
+                                      onClick={() =>
+                                        setPolicyModel({
+                                          ...model,
+                                          endpointPublished: endpoint.published,
+                                          cliSlug: device.slug,
+                                          endpointSlug: endpoint.slug,
+                                          endpointLabel: endpoint.label,
+                                          endpointCapabilityMetadata: endpoint.capabilityMetadata,
+                                        })
+                                      }
+                                      aria-label={t("dashboard:pools.capacity.directPolicy")}
+                                    >
+                                      <Gauge className="size-4" />
+                                    </Button>
+                                  ) : null}
                                   <Button
                                     type="button"
                                     variant="ghost"
@@ -874,6 +899,24 @@ export function CliEndpointsModelsSection() {
         </div>
       )}
 
+      <Sheet open={Boolean(policyModel)} onOpenChange={(open) => !open && setPolicyModel(null)}>
+        <SheetContent className="w-full overflow-hidden sm:max-w-md">
+          <SheetHeader>
+            <SheetTitle>{t("dashboard:pools.capacity.directPolicy")}</SheetTitle>
+            <SheetDescription>{policyModel?.canonicalModelId}</SheetDescription>
+          </SheetHeader>
+          <div className="min-h-0 overflow-y-auto overflow-x-clip px-4 pb-4">
+            {policyModel?.executionTarget ? (
+              <DirectCapacityPolicyForm
+                target={policyModel.executionTarget}
+                capacities={capacitiesData ?? []}
+                onSuccess={() => setPolicyModel(null)}
+              />
+            ) : null}
+          </div>
+        </SheetContent>
+      </Sheet>
+
       <ConfirmDeleteDialog
         open={Boolean(deleteTarget)}
         onOpenChange={(open) => {
@@ -893,6 +936,128 @@ export function CliEndpointsModelsSection() {
         }}
       />
     </section>
+  );
+}
+
+function DirectCapacityPolicyForm({
+  target,
+  capacities,
+  onSuccess,
+}: {
+  target: NonNullable<DirectModelOption["executionTarget"]>;
+  capacities: CapacityRow[];
+  onSuccess: () => void;
+}) {
+  const { t } = useTranslation(["common", "dashboard"]);
+  const queryClient = useQueryClient();
+  const [capacityId, setCapacityId] = useState(target.inferenceCapacityId ?? "");
+  const [priority, setPriority] = useState(String(target.directPriority));
+  const [concurrency, setConcurrency] = useState(String(target.directConcurrencyLimit ?? 1));
+  const [reserved, setReserved] = useState(String(target.directReservedSlots));
+  const [wait, setWait] = useState(String(target.directWaitBudgetMs ?? 30_000));
+  const [ceiling, setCeiling] = useState(String(target.directContextCeiling ?? 32_768));
+  const [margin, setMargin] = useState(String(target.directContextMargin));
+  const [borrow, setBorrow] = useState<"NEVER" | "WHEN_IDLE">(
+    target.directBorrowPolicy === "NEVER" ? "NEVER" : "WHEN_IDLE",
+  );
+  const mutation = useMutation(
+    orpc.capacityManagement.updateDirectPolicy.mutationOptions({
+      onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
+        queryClient.invalidateQueries({ queryKey: orpc.capacityManagement.key() });
+        toast.success(t("dashboard:pools.capacity.policyUpdated"));
+        onSuccess();
+      },
+    }),
+  );
+  const values = [priority, concurrency, reserved, wait, ceiling, margin].map(Number);
+  const valid =
+    values.every(Number.isInteger) &&
+    values.every((value) => value >= 0) &&
+    values[0] <= 31 &&
+    values[1] > 0 &&
+    values[4] > 0 &&
+    (!capacityId ||
+      reserved === "0" ||
+      Number(reserved) <=
+        (capacities.find((c) => c.id === capacityId)?.hardConcurrencyLimit ??
+          Number.POSITIVE_INFINITY));
+  return (
+    <form
+      className="space-y-4"
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (!valid) return;
+        mutation.mutate({
+          executionTargetId: target.id,
+          inferenceCapacityId: capacityId || null,
+          directPriority: values[0],
+          directConcurrencyLimit: values[1],
+          directReservedSlots: values[2],
+          directWaitBudgetMs: values[3],
+          directContextCeiling: values[4],
+          directContextMargin: values[5],
+          directBorrowPolicy: borrow,
+        });
+      }}
+    >
+      <div className="space-y-2">
+        <Label htmlFor="direct-capacity">{t("dashboard:pools.capacity.attachment")}</Label>
+        <select
+          id="direct-capacity"
+          className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+          value={capacityId}
+          onChange={(event) => setCapacityId(event.target.value)}
+        >
+          <option value="">{t("dashboard:pools.capacity.unattached")}</option>
+          {capacities.map((capacity) => (
+            <option key={capacity.id} value={capacity.id}>
+              {capacity.label}
+            </option>
+          ))}
+        </select>
+      </div>
+      {[
+        ["direct-priority", "capacityPriority", priority, setPriority, 0, 31],
+        ["direct-concurrency", "hardConcurrencyLimit", concurrency, setConcurrency, 1],
+        ["direct-reserved", "capacityReservedSlots", reserved, setReserved, 0],
+        ["direct-wait", "capacityWaitBudgetMs", wait, setWait, 0],
+        ["direct-ceiling", "capacityContextCeiling", ceiling, setCeiling, 1],
+        ["direct-margin", "capacityContextMargin", margin, setMargin, 0],
+      ].map(([id, label, value, setter, min, max]) => (
+        <div key={String(id)} className="space-y-2">
+          <Label htmlFor={String(id)}>{t(`dashboard:pools.capacity.fields.${label}`)}</Label>
+          <Input
+            id={String(id)}
+            className="min-h-11"
+            type="number"
+            min={Number(min)}
+            max={max == null ? undefined : Number(max)}
+            value={String(value)}
+            onChange={(event) =>
+              (setter as React.Dispatch<React.SetStateAction<string>>)(event.target.value)
+            }
+          />
+        </div>
+      ))}
+      <div className="space-y-2">
+        <Label htmlFor="direct-borrow">
+          {t("dashboard:pools.capacity.fields.capacityBorrowPolicy")}
+        </Label>
+        <select
+          id="direct-borrow"
+          className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+          value={borrow}
+          onChange={(event) => setBorrow(event.target.value as "NEVER" | "WHEN_IDLE")}
+        >
+          <option value="WHEN_IDLE">{t("dashboard:pools.capacity.borrowIdle")}</option>
+          <option value="NEVER">{t("dashboard:pools.capacity.borrowNever")}</option>
+        </select>
+      </div>
+      <Button type="submit" size="touch" disabled={!valid || mutation.isPending}>
+        {mutation.isPending ? t("common:actions.saving") : t("common:actions.save")}
+      </Button>
+    </form>
   );
 }
 
@@ -2435,7 +2600,6 @@ function PoolMemberForm({
       onSuccess: () => {
         queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:pools.memberAdded"));
-        onSuccess();
       },
     }),
   );
@@ -2476,12 +2640,25 @@ function PoolMemberForm({
         event.preventDefault();
         if (!canSubmit) return;
         if (mode === "create" && poolId) {
-          createMember.mutate({
+          const created = await createMember.mutateAsync({
             poolId,
             discoveredModelId,
             weight: parsedWeight,
             routingStatus,
           });
+          await updateMemberPolicy.mutateAsync({
+            poolMemberId: created.id,
+            capacityPriority: Number(priority),
+            capacityReservedSlots: Number(reservedSlots),
+            capacityWaitBudgetMs: Number(waitBudget),
+            capacityContextCeiling: Number(contextCeiling),
+          });
+          await attachCapacity.mutateAsync({
+            executionTargetId: created.executionTargetId,
+            inferenceCapacityId: capacityId || null,
+          });
+          queryClient.invalidateQueries({ queryKey: orpc.capacityManagement.key() });
+          onSuccess();
         }
         if (mode === "edit" && member) {
           await updateMember.mutateAsync({ id: member.id, weight: parsedWeight, routingStatus });
@@ -2541,52 +2718,50 @@ function PoolMemberForm({
           autoComplete="off"
         />
       </div>
-      {mode === "edit" ? (
-        <details className="rounded-md border p-3">
-          <summary className="min-h-11 cursor-pointer py-2 text-sm font-medium">
-            {t("dashboard:pools.capacity.memberPolicy")}
-          </summary>
-          <div className="grid gap-4 pt-3 sm:grid-cols-2">
-            <div className="space-y-2 sm:col-span-2">
-              <Label htmlFor="member-capacity">{t("dashboard:pools.capacity.attachment")}</Label>
-              <select
-                id="member-capacity"
-                className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
-                value={capacityId}
-                onChange={(event) => setCapacityId(event.target.value)}
-              >
-                <option value="">{t("dashboard:pools.capacity.unattached")}</option>
-                {capacities.map((capacity) => (
-                  <option key={capacity.id} value={capacity.id}>
-                    {capacity.label}
-                  </option>
-                ))}
-              </select>
-            </div>
-            {[
-              ["member-priority", priority, setPriority, "capacityPriority", 0, 31],
-              ["member-reserved", reservedSlots, setReservedSlots, "capacityReservedSlots", 0],
-              ["member-wait", waitBudget, setWaitBudget, "capacityWaitBudgetMs", 0],
-              ["member-context", contextCeiling, setContextCeiling, "capacityContextCeiling", 1],
-            ].map(([id, value, setter, label, min, max]) => (
-              <div key={String(id)} className="space-y-2">
-                <Label htmlFor={String(id)}>{t(`dashboard:pools.capacity.fields.${label}`)}</Label>
-                <Input
-                  id={String(id)}
-                  className="min-h-11"
-                  type="number"
-                  min={Number(min)}
-                  max={max == null ? undefined : Number(max)}
-                  value={String(value)}
-                  onChange={(event) =>
-                    (setter as React.Dispatch<React.SetStateAction<string>>)(event.target.value)
-                  }
-                />
-              </div>
-            ))}
+      <details className="rounded-md border p-3">
+        <summary className="min-h-11 cursor-pointer py-2 text-sm font-medium">
+          {t("dashboard:pools.capacity.memberPolicy")}
+        </summary>
+        <div className="grid gap-4 pt-3 sm:grid-cols-2">
+          <div className="space-y-2 sm:col-span-2">
+            <Label htmlFor="member-capacity">{t("dashboard:pools.capacity.attachment")}</Label>
+            <select
+              id="member-capacity"
+              className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+              value={capacityId}
+              onChange={(event) => setCapacityId(event.target.value)}
+            >
+              <option value="">{t("dashboard:pools.capacity.unattached")}</option>
+              {capacities.map((capacity) => (
+                <option key={capacity.id} value={capacity.id}>
+                  {capacity.label}
+                </option>
+              ))}
+            </select>
           </div>
-        </details>
-      ) : null}
+          {[
+            ["member-priority", priority, setPriority, "capacityPriority", 0, 31],
+            ["member-reserved", reservedSlots, setReservedSlots, "capacityReservedSlots", 0],
+            ["member-wait", waitBudget, setWaitBudget, "capacityWaitBudgetMs", 0],
+            ["member-context", contextCeiling, setContextCeiling, "capacityContextCeiling", 1],
+          ].map(([id, value, setter, label, min, max]) => (
+            <div key={String(id)} className="space-y-2">
+              <Label htmlFor={String(id)}>{t(`dashboard:pools.capacity.fields.${label}`)}</Label>
+              <Input
+                id={String(id)}
+                className="min-h-11"
+                type="number"
+                min={Number(min)}
+                max={max == null ? undefined : Number(max)}
+                value={String(value)}
+                onChange={(event) =>
+                  (setter as React.Dispatch<React.SetStateAction<string>>)(event.target.value)
+                }
+              />
+            </div>
+          ))}
+        </div>
+      </details>
       <div className="space-y-2">
         <Label>{t("dashboard:pools.routing")}</Label>
         <SegmentedControl
