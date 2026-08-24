@@ -343,6 +343,7 @@ type DirectModelRelayRow = {
   capabilityOverrideMode: string;
   capabilityOverrideMetadata: unknown | null;
   optimisticBasicTranscription: boolean;
+  ExecutionTarget: { id: string; inferenceCapacityId: string | null } | null;
   Endpoint: {
     id: string;
     slug: string;
@@ -355,6 +356,19 @@ type DirectModelRelayRow = {
 };
 
 type PoolMemberRelayRow = PoolMemberRouteRow & {
+  ExecutionTarget: {
+    id: string;
+    inferenceCapacityId: string | null;
+    DiscoveredModel: PoolMemberRouteRow["DiscoveredModel"] & {
+      id: string;
+      userId: string;
+      capabilityOverrideMode: string;
+      capabilityOverrideMetadata: unknown | null;
+      Endpoint: PoolMemberRouteRow["DiscoveredModel"]["Endpoint"] & {
+        capabilityMetadata: unknown | null;
+      };
+    };
+  } | null;
   DiscoveredModel: PoolMemberRouteRow["DiscoveredModel"] & {
     id: string;
     userId: string;
@@ -1687,6 +1701,7 @@ async function directModelRow(discoveredModelId: string): Promise<DirectModelRel
       capabilityOverrideMode: true,
       capabilityOverrideMetadata: true,
       optimisticBasicTranscription: true,
+      ExecutionTarget: { select: { id: true, inferenceCapacityId: true } },
       Endpoint: {
         select: {
           id: true,
@@ -1712,6 +1727,8 @@ async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
       discoveredModelId: true,
       ExecutionTarget: {
         select: {
+          id: true,
+          inferenceCapacityId: true,
           DiscoveredModel: {
             select: {
               id: true,
