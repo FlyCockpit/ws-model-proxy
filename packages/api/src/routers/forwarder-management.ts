@@ -25,10 +25,14 @@ import {
   openAiCapabilitiesFromCoarse,
   openAiCompatibleCapabilitiesSchema,
   resolveEffectiveCapabilityMetadata,
-  supportsChatCompletions,
   transformerModalityMismatchErrors,
   transformerSupportedModalities,
 } from "../lib/openai-compatible-capabilities";
+import {
+  type ModelApiSurface,
+  modelApiSurfaces,
+  surfaceAvailabilityMatrix,
+} from "../lib/surface-capabilities";
 import { visibleModelAttachmentModalities } from "../lib/visible-model-modalities";
 
 const CLI_HEARTBEAT_STALE_AFTER_MS = 60_000;
@@ -152,6 +156,9 @@ type ModelPoolRow = {
   description: string | null;
   maxAttachmentBytes: number | null;
   optimisticBasicTranscription: boolean;
+  protocolAdaptationEnabled: boolean;
+  allowLossyDeveloperRoleCollapse: boolean;
+  recommendedSurfaceOverride: ModelApiSurface | null;
   transformerDiscoveredModelId: string | null;
   transformerSystemPrompt: string | null;
   transformerImages: boolean;
@@ -447,6 +454,60 @@ function serializeCliDevice(row: CliDeviceRow, now: Date) {
 }
 
 function serializePool(row: ModelPoolRow) {
+  const recommendationOrder: readonly ModelApiSurface[] = [
+    "OPENAI_RESPONSES",
+    "OPENAI_CHAT_COMPLETIONS",
+    "ANTHROPIC_MESSAGES",
+    "OPENAI_COMPLETIONS",
+  ];
+  const memberCapabilities = (model: PoolMemberModelRow) =>
+    resolveEffectiveCapabilityMetadata({
+      capabilityOverrideMode: model.capabilityOverrideMode,
+      capabilityOverrideMetadata: model.capabilityOverrideMetadata,
+      endpointCapabilityMetadata: model.Endpoint.capabilityMetadata,
+    }) ??
+    openAiCapabilitiesFromCoarse(
+      model.capabilityOverrideMode === "OVERRIDE"
+        ? model.capabilityOverrides
+        : model.Endpoint.defaultCapabilities,
+    );
+  const memberMatrices = row.PoolMembers.map((member) => {
+    const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
+    const capabilities = model ? memberCapabilities(model) : null;
+    return surfaceAvailabilityMatrix({
+      capabilities,
+      adaptationEnabled: row.protocolAdaptationEnabled,
+    });
+  });
+  const surfaces = Object.fromEntries(
+    modelApiSurfaces.map((surface) => {
+      const entries = memberMatrices.map((matrix) => matrix[surface]);
+      return [
+        surface,
+        {
+          native: entries.filter((entry) => entry.mode === "native").length,
+          adapted: entries.filter((entry) => entry.mode === "adapted").length,
+          unavailable: entries.filter((entry) => entry.mode === "unavailable").length,
+          streaming: entries.some((entry) => entry.mode !== "unavailable" && entry.streaming),
+          limitations: [...new Set(entries.flatMap((entry) => entry.limitations))],
+        },
+      ];
+    }),
+  ) as Record<
+    ModelApiSurface,
+    {
+      native: number;
+      adapted: number;
+      unavailable: number;
+      streaming: boolean;
+      limitations: string[];
+    }
+  >;
+  const recommendedSurface =
+    row.recommendedSurfaceOverride ??
+    recommendationOrder.find((surface) => surfaces[surface].native > 0) ??
+    recommendationOrder.find((surface) => surfaces[surface].adapted > 0) ??
+    null;
   const transformerModel = row.TransformerDiscoveredModel
     ? {
         id: row.TransformerDiscoveredModel.id,
@@ -471,6 +532,21 @@ function serializePool(row: ModelPoolRow) {
     description: row.description,
     maxAttachmentBytes: row.maxAttachmentBytes,
     optimisticBasicTranscription: row.optimisticBasicTranscription,
+    protocolAdaptationEnabled: row.protocolAdaptationEnabled,
+    allowLossyDeveloperRoleCollapse: row.allowLossyDeveloperRoleCollapse,
+    recommendedSurfaceOverride: row.recommendedSurfaceOverride,
+    compatibility: {
+      recommendedSurface,
+      surfaces,
+      warnings: [
+        ...(row.protocolAdaptationEnabled ? ["adaptation_strict_subset"] : []),
+        ...(row.allowLossyDeveloperRoleCollapse ? ["developer_role_collapse_lossy"] : []),
+        ...(row.recommendedSurfaceOverride &&
+        surfaces[row.recommendedSurfaceOverride].unavailable === row.PoolMembers.length
+          ? ["recommended_surface_unavailable"]
+          : []),
+      ],
+    },
     canonicalModelId: poolModelId({ userSlug: row.User.slug, poolSlug: row.slug }),
     transformer: {
       discoveredModelId: row.transformerDiscoveredModelId,
@@ -514,16 +590,9 @@ function serializePool(row: ModelPoolRow) {
               endpointId: model.Endpoint.id,
               endpointSlug: model.Endpoint.slug,
               cliDeviceSlug: model.Endpoint.CliDevice.slug,
-              supportsChat: supportsChatCompletions({
-                capabilities: resolveEffectiveCapabilityMetadata({
-                  capabilityOverrideMode: model.capabilityOverrideMode,
-                  capabilityOverrideMetadata: model.capabilityOverrideMetadata,
-                  endpointCapabilityMetadata: model.Endpoint.capabilityMetadata,
-                }),
-                coarse:
-                  model.capabilityOverrideMode === "OVERRIDE"
-                    ? model.capabilityOverrides
-                    : model.Endpoint.defaultCapabilities,
+              surfaces: surfaceAvailabilityMatrix({
+                capabilities: memberCapabilities(model),
+                adaptationEnabled: row.protocolAdaptationEnabled,
               }),
             }
           : null,
@@ -698,6 +767,9 @@ const poolSelect = {
   description: true,
   maxAttachmentBytes: true,
   optimisticBasicTranscription: true,
+  protocolAdaptationEnabled: true,
+  allowLossyDeveloperRoleCollapse: true,
+  recommendedSurfaceOverride: true,
   transformerDiscoveredModelId: true,
   transformerSystemPrompt: true,
   transformerImages: true,
@@ -943,6 +1015,9 @@ export const forwarderManagementRouter = {
         description: poolDescriptionSchema,
         maxAttachmentBytes: attachmentLimitSchema,
         optimisticBasicTranscription: z.boolean().optional(),
+        protocolAdaptationEnabled: z.boolean().optional(),
+        allowLossyDeveloperRoleCollapse: z.boolean().optional(),
+        recommendedSurfaceOverride: z.enum(modelApiSurfaces).nullable().optional(),
       }),
     )
     .handler(async ({ input, context }) => {
@@ -958,6 +1033,9 @@ export const forwarderManagementRouter = {
             ? { maxAttachmentBytes: input.maxAttachmentBytes }
             : {}),
           optimisticBasicTranscription: input.optimisticBasicTranscription ?? false,
+          protocolAdaptationEnabled: input.protocolAdaptationEnabled ?? false,
+          allowLossyDeveloperRoleCollapse: input.allowLossyDeveloperRoleCollapse ?? false,
+          recommendedSurfaceOverride: input.recommendedSurfaceOverride ?? null,
         },
         select: poolSelect,
       })) as ModelPoolRow;
@@ -985,6 +1063,9 @@ export const forwarderManagementRouter = {
         transformerMaxAssets: z.number().int().min(1).max(64).nullable().optional(),
         maxAttachmentBytes: attachmentLimitSchema,
         optimisticBasicTranscription: z.boolean().optional(),
+        protocolAdaptationEnabled: z.boolean().optional(),
+        allowLossyDeveloperRoleCollapse: z.boolean().optional(),
+        recommendedSurfaceOverride: z.enum(modelApiSurfaces).nullable().optional(),
       }),
     )
     .handler(async ({ input, context }) => {
@@ -1088,6 +1169,15 @@ export const forwarderManagementRouter = {
             : {}),
           ...(input.optimisticBasicTranscription !== undefined
             ? { optimisticBasicTranscription: input.optimisticBasicTranscription }
+            : {}),
+          ...(input.protocolAdaptationEnabled !== undefined
+            ? { protocolAdaptationEnabled: input.protocolAdaptationEnabled }
+            : {}),
+          ...(input.allowLossyDeveloperRoleCollapse !== undefined
+            ? { allowLossyDeveloperRoleCollapse: input.allowLossyDeveloperRoleCollapse }
+            : {}),
+          ...(input.recommendedSurfaceOverride !== undefined
+            ? { recommendedSurfaceOverride: input.recommendedSurfaceOverride }
             : {}),
         },
         select: poolSelect,

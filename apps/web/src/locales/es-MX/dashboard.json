@@ -162,6 +162,28 @@
     "relayMetadata": "Metadatos de relay"
   },
   "pools": {
+    "allowLossyDeveloperRoleCollapse": "Permitir la conversión con pérdida del rol developer",
+    "compatibilityDetails": "Matriz de compatibilidad de protocolos",
+    "enableProtocolAdaptation": "Habilitar adaptación de protocolos del subconjunto estricto",
+    "lossyDeveloperRoleWarning": "Advertencia: las instrucciones developer pueden combinarse con el rol system. Las solicitudes con ambos roles se rechazan salvo que se habilite esta opción.",
+    "limitations": {
+      "native_extensions_unavailable": "extensiones nativas no disponibles",
+      "strict_common_subset": "solo subconjunto común estricto",
+      "surface_unavailable": "superficie no disponible"
+    },
+    "noneAvailable": "Ninguna disponible",
+    "protocolCompatibility": "Compatibilidad de protocolos",
+    "protocolCompatibilityHint": "La adaptación es opcional y rechaza funciones fuera del subconjunto común documentado.",
+    "recommendedAutomatic": "Recomendación automática",
+    "recommendedSurface": "API recomendada",
+    "recommendedSurfaceOverride": "Anulación de API recomendada",
+    "streaming": "streaming",
+    "surfaceCounts": "{{native}} nativos · {{adapted}} adaptados · {{unavailable}} no disponibles",
+    "warnings": {
+      "adaptation_strict_subset": "La adaptación usa un subconjunto estricto",
+      "developer_role_collapse_lossy": "Conversión con pérdida del rol developer habilitada",
+      "recommended_surface_unavailable": "La API recomendada no está disponible"
+    },
     "addMember": "Agregar miembro",
     "addMemberDescription": "Agrega uno de tus modelos descubiertos directamente a este pool.",
     "addMemberTitle": "Agregar miembro al pool",

@@ -1017,6 +1017,44 @@ export function PoolsSection() {
                   {pool.description ? (
                     <p className="mt-2 text-sm text-muted-foreground">{pool.description}</p>
                   ) : null}
+                  <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                    <StatusPill muted>
+                      {t("dashboard:pools.recommendedSurface")}:{" "}
+                      {pool.compatibility.recommendedSurface ?? t("dashboard:pools.noneAvailable")}
+                    </StatusPill>
+                    {pool.compatibility.warnings.map((warning) => (
+                      <StatusPill key={warning} muted>
+                        {t(`dashboard:pools.warnings.${warning}`)}
+                      </StatusPill>
+                    ))}
+                  </div>
+                  <details className="mt-3 text-xs">
+                    <summary className="cursor-pointer text-muted-foreground">
+                      {t("dashboard:pools.compatibilityDetails")}
+                    </summary>
+                    <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                      {Object.entries(pool.compatibility.surfaces).map(
+                        ([surface, availability]) => (
+                          <div key={surface} className="rounded border p-2">
+                            <div className="font-medium">{surface}</div>
+                            <div className="mt-1 text-muted-foreground">
+                              {t("dashboard:pools.surfaceCounts", availability)}
+                              {availability.streaming ? ` · ${t("dashboard:pools.streaming")}` : ""}
+                            </div>
+                            {availability.limitations.length > 0 ? (
+                              <div className="mt-1 break-words text-muted-foreground">
+                                {availability.limitations
+                                  .map((limitation) =>
+                                    t(`dashboard:pools.limitations.${limitation}`),
+                                  )
+                                  .join(", ")}
+                              </div>
+                            ) : null}
+                          </div>
+                        ),
+                      )}
+                    </div>
+                  </details>
                   {pool.transformer.model ? (
                     <p className="mt-2 text-sm text-muted-foreground">
                       {t("dashboard:pools.transformerActive")}:{" "}
@@ -1109,7 +1147,8 @@ export function PoolsSection() {
                               <td className="py-2 pr-3 align-top">{member.healthStatus}</td>
                               <td className="py-2 pl-3 align-top">
                                 <div className="flex justify-end gap-1">
-                                  {member.model?.supportsChat ? (
+                                  {member.model?.surfaces.OPENAI_CHAT_COMPLETIONS.mode !==
+                                  "unavailable" ? (
                                     <Button
                                       type="button"
                                       variant="ghost"
@@ -1380,6 +1419,15 @@ function PoolForm({
         t("dashboard:pools.attachmentLimitInvalid"),
       ),
     optimisticBasicTranscription: z.boolean(),
+    protocolAdaptationEnabled: z.boolean(),
+    allowLossyDeveloperRoleCollapse: z.boolean(),
+    recommendedSurfaceOverride: z.enum([
+      "",
+      "OPENAI_CHAT_COMPLETIONS",
+      "OPENAI_RESPONSES",
+      "ANTHROPIC_MESSAGES",
+      "OPENAI_COMPLETIONS",
+    ]),
   });
   const createPool = useMutation(
     orpc.forwarderManagement.createModelPool.mutationOptions({
@@ -1422,6 +1470,9 @@ function PoolForm({
           ? String(Math.ceil(pool.maxAttachmentBytes / MEBIBYTE))
           : "",
       optimisticBasicTranscription: pool?.optimisticBasicTranscription ?? false,
+      protocolAdaptationEnabled: pool?.protocolAdaptationEnabled ?? false,
+      allowLossyDeveloperRoleCollapse: pool?.allowLossyDeveloperRoleCollapse ?? false,
+      recommendedSurfaceOverride: pool?.recommendedSurfaceOverride ?? "",
     },
     validators: { onSubmit: poolSchema },
     onSubmit: async ({ value }) => {
@@ -1434,6 +1485,16 @@ function PoolForm({
             ? Number(value.maxAttachmentMiB) * MEBIBYTE
             : null,
           optimisticBasicTranscription: value.optimisticBasicTranscription,
+          protocolAdaptationEnabled: value.protocolAdaptationEnabled,
+          allowLossyDeveloperRoleCollapse: value.allowLossyDeveloperRoleCollapse,
+          recommendedSurfaceOverride:
+            value.recommendedSurfaceOverride === ""
+              ? null
+              : (value.recommendedSurfaceOverride as
+                  | "OPENAI_CHAT_COMPLETIONS"
+                  | "OPENAI_RESPONSES"
+                  | "ANTHROPIC_MESSAGES"
+                  | "OPENAI_COMPLETIONS"),
         });
       } else if (pool) {
         await updatePool.mutateAsync({
@@ -1464,6 +1525,16 @@ function PoolForm({
             ? Number(value.maxAttachmentMiB) * MEBIBYTE
             : null,
           optimisticBasicTranscription: value.optimisticBasicTranscription,
+          protocolAdaptationEnabled: value.protocolAdaptationEnabled,
+          allowLossyDeveloperRoleCollapse: value.allowLossyDeveloperRoleCollapse,
+          recommendedSurfaceOverride:
+            value.recommendedSurfaceOverride === ""
+              ? null
+              : (value.recommendedSurfaceOverride as
+                  | "OPENAI_CHAT_COMPLETIONS"
+                  | "OPENAI_RESPONSES"
+                  | "ANTHROPIC_MESSAGES"
+                  | "OPENAI_COMPLETIONS"),
         });
       }
     },
@@ -1518,6 +1589,67 @@ function PoolForm({
           </div>
         )}
       </form.Field>
+
+      <div className="space-y-3 rounded-md border p-3">
+        <div>
+          <h4 className="text-sm font-medium">{t("dashboard:pools.protocolCompatibility")}</h4>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {t("dashboard:pools.protocolCompatibilityHint")}
+          </p>
+        </div>
+        <form.Field name="recommendedSurfaceOverride">
+          {(field) => (
+            <div className="space-y-2">
+              <Label htmlFor={field.name}>{t("dashboard:pools.recommendedSurfaceOverride")}</Label>
+              <select
+                id={field.name}
+                className="flex h-11 w-full rounded-md border border-input bg-transparent px-3 text-sm"
+                value={field.state.value}
+                onChange={(event) =>
+                  field.handleChange(event.target.value as typeof field.state.value)
+                }
+              >
+                <option value="">{t("dashboard:pools.recommendedAutomatic")}</option>
+                <option value="OPENAI_RESPONSES">OpenAI Responses</option>
+                <option value="OPENAI_CHAT_COMPLETIONS">OpenAI Chat Completions</option>
+                <option value="ANTHROPIC_MESSAGES">Anthropic Messages</option>
+                <option value="OPENAI_COMPLETIONS">OpenAI Completions</option>
+              </select>
+            </div>
+          )}
+        </form.Field>
+        <form.Field name="protocolAdaptationEnabled">
+          {(field) => (
+            <label className="flex min-h-11 items-center gap-3 text-sm">
+              <input
+                type="checkbox"
+                className="size-4"
+                checked={field.state.value}
+                onChange={(event) => field.handleChange(event.target.checked)}
+              />
+              {t("dashboard:pools.enableProtocolAdaptation")}
+            </label>
+          )}
+        </form.Field>
+        <form.Field name="allowLossyDeveloperRoleCollapse">
+          {(field) => (
+            <div>
+              <label className="flex min-h-11 items-center gap-3 text-sm">
+                <input
+                  type="checkbox"
+                  className="size-4"
+                  checked={field.state.value}
+                  onChange={(event) => field.handleChange(event.target.checked)}
+                />
+                {t("dashboard:pools.allowLossyDeveloperRoleCollapse")}
+              </label>
+              <p className="text-xs text-destructive">
+                {t("dashboard:pools.lossyDeveloperRoleWarning")}
+              </p>
+            </div>
+          )}
+        </form.Field>
+      </div>
 
       <form.Field name="name">
         {(field) => (

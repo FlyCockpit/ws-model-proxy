@@ -327,45 +327,51 @@ model ExecutionTarget {
 }
 
 model ModelPool {
-  id                             String                        @id @default(cuid(2))
-  createdAt                      DateTime                      @default(now())
-  updatedAt                      DateTime                      @default(now()) @updatedAt
-  userId                         String
-  slug                           String
-  name                           String
-  description                    String?
+  id                              String                        @id @default(cuid(2))
+  createdAt                       DateTime                      @default(now())
+  updatedAt                       DateTime                      @default(now()) @updatedAt
+  userId                          String
+  slug                            String
+  name                            String
+  description                     String?
   /// Optional OpenAI-compatible model used to turn media into text before the
   /// primary pool members run. Null = transformer disabled (default).
-  transformerDiscoveredModelId   String?
+  transformerDiscoveredModelId    String?
   /// Free-text system prompt for the transformer call. Null = built-in default.
-  transformerSystemPrompt        String?
+  transformerSystemPrompt         String?
   /// When true (default if transformer set), image_url parts are transformed.
-  transformerImages              Boolean                       @default(true)
+  transformerImages               Boolean                       @default(true)
   /// When true, input_audio / audio parts are transformed (v1 may no-op if unsupported).
-  transformerAudio               Boolean                       @default(false)
+  transformerAudio                Boolean                       @default(false)
   /// When true, video_url parts are transformed.
-  transformerVideo               Boolean                       @default(false)
+  transformerVideo                Boolean                       @default(false)
   /// Description cache policy. Default OFF so screenshot/PII text is not retained.
-  transformerCacheMode           PoolTransformerCacheMode      @default(OFF)
+  transformerCacheMode            PoolTransformerCacheMode      @default(OFF)
   /// When true, inject a size-capped name+description list of the primary request's tools.
-  transformerIncludePrimaryTools Boolean                       @default(false)
-  transformerMaxTools            Int                           @default(32)
-  transformerMaxToolChars        Int                           @default(8000)
+  transformerIncludePrimaryTools  Boolean                       @default(false)
+  transformerMaxTools             Int                           @default(32)
+  transformerMaxToolChars         Int                           @default(8000)
   /// Per-hop transformer timeout. Null uses the server default.
-  transformerTimeoutMs           Int?
+  transformerTimeoutMs            Int?
   /// Max media parts across all transform jobs in one request. Null uses the server default.
-  transformerMaxAssets           Int?
+  transformerMaxAssets            Int?
   /// Optional per-pool attachment cap. Null inherits the global attachment cap.
-  maxAttachmentBytes             Int?
+  maxAttachmentBytes              Int?
   /// Permit unknown-capability members only as fallback for basic, non-streaming transcription.
-  optimisticBasicTranscription   Boolean                       @default(false)
-  User                           User                          @relation("ModelPoolOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  TransformerDiscoveredModel     DiscoveredModel?              @relation("ModelPoolTransformer", fields: [transformerDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-  PoolMembers                    PoolMember[]
-  PoolGrants                     PoolGrant[]
-  ModelApiTokenAllowlistEntries  ModelApiTokenAllowlistEntry[]
-  ResponseStickinessRecords      ResponseStickinessRecord[]
-  RelayRequests                  RelayRequest[]                @relation("RelayRequestRequestedPool")
+  optimisticBasicTranscription    Boolean                       @default(false)
+  /// Permit the documented strict-subset translation between modern model APIs.
+  protocolAdaptationEnabled       Boolean                       @default(false)
+  /// Permit developer instructions to collapse into the target protocol's system role.
+  allowLossyDeveloperRoleCollapse Boolean                       @default(false)
+  /// Optional validated preferred API surface; null lets WSMP recommend one.
+  recommendedSurfaceOverride      String?
+  User                            User                          @relation("ModelPoolOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  TransformerDiscoveredModel      DiscoveredModel?              @relation("ModelPoolTransformer", fields: [transformerDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  PoolMembers                     PoolMember[]
+  PoolGrants                      PoolGrant[]
+  ModelApiTokenAllowlistEntries   ModelApiTokenAllowlistEntry[]
+  ResponseStickinessRecords       ResponseStickinessRecord[]
+  RelayRequests                   RelayRequest[]                @relation("RelayRequestRequestedPool")
 
   @@unique([userId, slug])
   @@index([userId])

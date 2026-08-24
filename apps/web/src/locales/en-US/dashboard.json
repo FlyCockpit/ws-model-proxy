@@ -162,6 +162,28 @@
     "relayMetadata": "Relay metadata"
   },
   "pools": {
+    "allowLossyDeveloperRoleCollapse": "Allow lossy developer-role collapse",
+    "compatibilityDetails": "Protocol compatibility matrix",
+    "enableProtocolAdaptation": "Enable strict-subset protocol adaptation",
+    "lossyDeveloperRoleWarning": "Warning: developer instructions may be merged into the system role. Requests containing both roles remain rejected unless this is enabled.",
+    "limitations": {
+      "native_extensions_unavailable": "native extensions unavailable",
+      "strict_common_subset": "strict common subset only",
+      "surface_unavailable": "surface unavailable"
+    },
+    "noneAvailable": "None available",
+    "protocolCompatibility": "Protocol compatibility",
+    "protocolCompatibilityHint": "Adaptation is opt-in and rejects features outside the documented strict common subset.",
+    "recommendedAutomatic": "Automatic recommendation",
+    "recommendedSurface": "Recommended API",
+    "recommendedSurfaceOverride": "Recommended API override",
+    "streaming": "streaming",
+    "surfaceCounts": "{{native}} native · {{adapted}} adapted · {{unavailable}} unavailable",
+    "warnings": {
+      "adaptation_strict_subset": "Adaptation uses a strict subset",
+      "developer_role_collapse_lossy": "Lossy developer-role collapse enabled",
+      "recommended_surface_unavailable": "Recommended API is unavailable"
+    },
     "addMember": "Add member",
     "addMemberDescription": "Add one of your direct discovered models to this pool.",
     "addMemberTitle": "Add pool member",

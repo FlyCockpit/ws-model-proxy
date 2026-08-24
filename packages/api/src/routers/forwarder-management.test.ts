@@ -120,6 +120,10 @@ function poolRow(overrides: Record<string, unknown> = {}) {
     name: "General",
     description: null,
     maxAttachmentBytes: null,
+    optimisticBasicTranscription: false,
+    protocolAdaptationEnabled: false,
+    allowLossyDeveloperRoleCollapse: false,
+    recommendedSurfaceOverride: null,
     transformerDiscoveredModelId: null,
     transformerSystemPrompt: null,
     transformerImages: true,
@@ -325,6 +329,84 @@ describe("forwarderManagementRouter", () => {
       }),
     );
     expect(db.poolGrant.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("persists explicit protocol policy and reports the full member compatibility matrix", async () => {
+    db.modelPool.findUnique.mockResolvedValueOnce(null);
+    db.modelPool.create.mockResolvedValue(
+      poolRow({
+        protocolAdaptationEnabled: true,
+        allowLossyDeveloperRoleCollapse: true,
+        recommendedSurfaceOverride: "ANTHROPIC_MESSAGES",
+        PoolMembers: [
+          {
+            id: "member-id",
+            createdAt: new Date("2026-01-01"),
+            updatedAt: new Date("2026-01-01"),
+            discoveredModelId: "model-id",
+            weight: 1,
+            healthStatus: "HEALTHY",
+            routingStatus: "ACTIVE",
+            lastFailureClass: null,
+            consecutiveRetryableFailures: 0,
+            lastFailureAt: null,
+            nextRetryAt: null,
+            halfOpenTrialStartedAt: null,
+            ExecutionTarget: null,
+            DiscoveredModel: {
+              id: "model-id",
+              upstreamModelId: "gpt-local",
+              capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+              capabilityOverrides: [],
+              capabilityOverrideMetadata: null,
+              User: { slug: "owner" },
+              Endpoint: {
+                id: "endpoint-id",
+                slug: "local",
+                capabilityMetadata: {
+                  version: 1,
+                  protocol: "openai-compatible",
+                  chatCompletions: { supported: true, streaming: true },
+                },
+                defaultCapabilities: [],
+                CliDevice: { slug: "desktop" },
+              },
+            },
+          },
+        ],
+      }),
+    );
+
+    const result = await client().createModelPool({
+      slug: "protocols",
+      name: "Protocols",
+      protocolAdaptationEnabled: true,
+      allowLossyDeveloperRoleCollapse: true,
+      recommendedSurfaceOverride: "ANTHROPIC_MESSAGES",
+    });
+
+    expect(db.modelPool.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          protocolAdaptationEnabled: true,
+          allowLossyDeveloperRoleCollapse: true,
+          recommendedSurfaceOverride: "ANTHROPIC_MESSAGES",
+        }),
+      }),
+    );
+    expect(result.members[0]?.model?.surfaces).toMatchObject({
+      OPENAI_CHAT_COMPLETIONS: { mode: "native", streaming: true },
+      OPENAI_RESPONSES: { mode: "adapted" },
+      ANTHROPIC_MESSAGES: { mode: "adapted" },
+      OPENAI_COMPLETIONS: { mode: "unavailable" },
+    });
+    expect(result.compatibility).toMatchObject({
+      recommendedSurface: "ANTHROPIC_MESSAGES",
+      warnings: expect.arrayContaining([
+        "adaptation_strict_subset",
+        "developer_role_collapse_lossy",
+      ]),
+    });
   });
 
   it("persists an in-range pool attachment limit and rejects one above the global policy", async () => {

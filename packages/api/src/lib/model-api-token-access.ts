@@ -38,6 +38,9 @@ export type VisibleModelPoolTarget = {
   poolSlug: string;
   maxAttachmentBytes: number | null;
   optimisticBasicTranscription: boolean;
+  protocolAdaptationEnabled: boolean;
+  allowLossyDeveloperRoleCollapse: boolean;
+  recommendedSurfaceOverride: string | null;
 };
 
 export type VisibleModelTargets = {
@@ -75,6 +78,9 @@ type ModelPoolRow = {
   description: string | null;
   maxAttachmentBytes: number | null;
   optimisticBasicTranscription: boolean;
+  protocolAdaptationEnabled: boolean;
+  allowLossyDeveloperRoleCollapse: boolean;
+  recommendedSurfaceOverride: string | null;
   User: { slug: string };
 };
 
@@ -121,6 +127,9 @@ function serializeModelPool(row: ModelPoolRow): VisibleModelPoolTarget {
     poolSlug: row.slug,
     maxAttachmentBytes: row.maxAttachmentBytes,
     optimisticBasicTranscription: row.optimisticBasicTranscription,
+    protocolAdaptationEnabled: row.protocolAdaptationEnabled,
+    allowLossyDeveloperRoleCollapse: row.allowLossyDeveloperRoleCollapse,
+    recommendedSurfaceOverride: row.recommendedSurfaceOverride,
   };
 }
 
@@ -166,6 +175,10 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
         name: true,
         description: true,
         maxAttachmentBytes: true,
+        optimisticBasicTranscription: true,
+        protocolAdaptationEnabled: true,
+        allowLossyDeveloperRoleCollapse: true,
+        recommendedSurfaceOverride: true,
         User: { select: { slug: true } },
       },
     }),
@@ -182,6 +195,9 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
             description: true,
             maxAttachmentBytes: true,
             optimisticBasicTranscription: true,
+            protocolAdaptationEnabled: true,
+            allowLossyDeveloperRoleCollapse: true,
+            recommendedSurfaceOverride: true,
             User: { select: { slug: true } },
           },
         },
