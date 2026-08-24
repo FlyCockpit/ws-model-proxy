@@ -61,24 +61,64 @@ export function createProtocolAdaptationTransform({
   signal,
   maxEventBytes,
   maxAggregateBytes,
+  recoverProtocolErrors = false,
+  onProtocolError,
 }: {
   source: ProtocolSurface;
   target: ProtocolSurface;
   signal?: AbortSignal;
   maxEventBytes?: number;
   maxAggregateBytes?: number;
+  recoverProtocolErrors?: boolean;
+  onProtocolError?: (error: unknown) => void;
 }): TransformStream<Uint8Array, Uint8Array> {
   const parser = new CanonicalStreamParser(source, { signal, maxEventBytes, maxAggregateBytes });
   const renderer = new CanonicalStreamRenderer(target, { signal, maxAggregateBytes });
+  let failed = false;
+  let hasOutput = false;
+  const recover = (error: unknown, controller: TransformStreamDefaultController<Uint8Array>) => {
+    if (!recoverProtocolErrors || !hasOutput) throw error;
+    failed = true;
+    onProtocolError?.(error);
+    try {
+      for (const output of renderer.push({
+        type: "error",
+        error: {
+          code: "protocol_error",
+          message: "The upstream stream violated the adapted protocol.",
+          upstreamStatus: 502,
+        },
+      }))
+        controller.enqueue(output);
+    } catch {
+      // A target stop barrier is already observable; never append a second terminal.
+    }
+  };
   return new TransformStream({
     transform(chunk, controller) {
-      for (const event of parser.push(chunk))
-        for (const output of renderer.push(event)) controller.enqueue(output);
+      if (failed) return;
+      try {
+        for (const event of parser.push(chunk))
+          for (const output of renderer.push(event)) {
+            hasOutput = true;
+            controller.enqueue(output);
+          }
+      } catch (error) {
+        recover(error, controller);
+      }
     },
     flush(controller) {
-      for (const event of parser.finish())
-        for (const output of renderer.push(event)) controller.enqueue(output);
-      renderer.finish();
+      if (failed) return;
+      try {
+        for (const event of parser.finish())
+          for (const output of renderer.push(event)) {
+            hasOutput = true;
+            controller.enqueue(output);
+          }
+        renderer.finish();
+      } catch (error) {
+        recover(error, controller);
+      }
     },
   });
 }

@@ -880,6 +880,7 @@ function adaptedResponseBody({
   status,
   headers,
   signal,
+  onProtocolError,
 }: {
   body: ReadableStream<Uint8Array>;
   source: ProtocolSurface;
@@ -888,11 +889,19 @@ function adaptedResponseBody({
   status: number;
   headers: Headers;
   signal: AbortSignal;
+  onProtocolError?: (error: unknown) => void;
 }): ReadableStream<Uint8Array> {
   if (stream)
-    return body.pipeThrough(createProtocolAdaptationTransform({ source, target, signal }), {
-      signal,
-    });
+    return body.pipeThrough(
+      createProtocolAdaptationTransform({
+        source,
+        target,
+        signal,
+        recoverProtocolErrors: onProtocolError !== undefined,
+        onProtocolError,
+      }),
+      { signal },
+    );
   const reader = body.getReader();
   return new ReadableStream({
     async start(controller) {
@@ -2510,6 +2519,7 @@ async function relayPool({
       }
       if (adaptedSource && operation.adaptation && operation.stream) {
         try {
+          let protocolFailureObserved = false;
           const primed = await primeReadableStream(
             adaptedResponseBody({
               body: started.body,
@@ -2519,11 +2529,16 @@ async function relayPool({
               status: started.status,
               headers: started.headers,
               signal: request.signal,
+              onProtocolError: () => {
+                protocolFailureObserved = true;
+              },
             }),
             operation.adaptation.requestedSurface,
           );
           primedAdaptedStream = primed.body;
-          adaptationCompletion = primed.completion;
+          adaptationCompletion = primed.completion.then((outcome) =>
+            protocolFailureObserved && outcome === "ok" ? "protocol_error" : outcome,
+          );
         } catch {
           attempt.cancel("protocol_error");
           const terminal = await attempt.terminal;

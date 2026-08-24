@@ -1126,6 +1126,64 @@ describe("model API routes", () => {
     expect(text).not.toContain("event: error");
   });
 
+  it("keeps the live Chat stop barrier when Anthropic fails before message_stop", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "anthropic-member",
+        discoveredModelId: "anthropic-model",
+        upstreamModelId: "claude-upstream",
+        cliDeviceId: "cli-anthropic",
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            anthropicMessages: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+              protocolVersion: "2023-06-01",
+            },
+          },
+        },
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-anthropic"];
+    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        stream: true,
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    manager.headers(sent.requestId, 200, { "content-type": "text/event-stream" });
+    manager.body(
+      sent.requestId,
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg","type":"message","role":"assistant","content":[],"model":"claude-upstream","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+    );
+    const response = await responsePromise;
+    manager.body(
+      sent.requestId,
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":1,"output_tokens":0}}\n\n',
+    );
+    manager.body(sent.requestId, "event: unknown\ndata: {}\n\n");
+    manager.complete(sent.requestId);
+    const text = await response.text();
+    expect(text).toContain('"finish_reason":"stop"');
+    expect(text.split('"finish_reason":"stop"')).toHaveLength(2);
+    expect(text).not.toContain('"code":"protocol_error"');
+    expect(text).not.toContain("data: [DONE]");
+  });
+
   it("propagates adapted downstream cancellation and performs relay cleanup exactly once", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
