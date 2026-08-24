@@ -144,6 +144,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           >`SELECT nextval('admission_enqueue_sequence') AS value`;
       const enqueueSequence = existing?.enqueueSequence ?? sequence[0]?.value;
       if (enqueueSequence === undefined) throw new Error("Admission enqueue sequence unavailable.");
+      const resolvedCandidates = existing ? [] : await this.#resolveCandidates(tx, attempt);
       const request =
         existing ??
         (await tx.admissionRequest.create({
@@ -163,7 +164,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
             connectionOwner: attempt.connectionOwner,
             heartbeatAt: now,
             Waiters: {
-              create: attempt.candidates.map((candidate) => ({
+              create: resolvedCandidates.map((candidate) => ({
                 userId: attempt.ownerId,
                 requestId: attempt.requestId,
                 attemptId: attempt.attemptId,
@@ -199,10 +200,75 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     return result.result;
   }
 
-  async #admitOne(tx: Prisma.TransactionClient, capacityId: string, now: Date) {
+  async #resolveCandidates(tx: Prisma.TransactionClient, attempt: AdmissionAttempt) {
+    if (!attempt.candidates.length) throw new Error("Admission requires at least one candidate.");
+    const orders = new Set<number>();
+    const targets = new Set<string>();
+    return Promise.all(
+      attempt.candidates.map(async (candidate) => {
+        if (!Number.isInteger(candidate.candidateOrder) || candidate.candidateOrder < 0)
+          throw new Error("Admission candidate order must be a nonnegative integer.");
+        if (orders.has(candidate.candidateOrder) || targets.has(candidate.executionTargetId))
+          throw new Error("Admission candidates must have unique order and execution targets.");
+        orders.add(candidate.candidateOrder);
+        targets.add(candidate.executionTargetId);
+        const target = await tx.executionTarget.findFirst({
+          where: {
+            id: candidate.executionTargetId,
+            userId: attempt.ownerId,
+            inferenceCapacityId: candidate.capacityId,
+          },
+        });
+        if (!target)
+          throw new Error(
+            "Admission candidate does not belong to the requested owner and capacity.",
+          );
+        if (attempt.sourceKind === "DIRECT") {
+          if (attempt.poolId || candidate.poolMemberId || attempt.candidates.length !== 1)
+            throw new Error("Direct admission requires exactly one direct execution target.");
+          return {
+            ...candidate,
+            priority: target.directPriority,
+            memberConcurrencyCeiling: target.directConcurrencyLimit ?? undefined,
+            reservedSlots: target.directReservedSlots,
+            allowBorrowReserved: target.directBorrowPolicy === "WHEN_IDLE",
+          };
+        }
+        if (!attempt.poolId || !candidate.poolMemberId)
+          throw new Error("Pool admission requires a pool and member for every candidate.");
+        const member = await tx.poolMember.findFirst({
+          where: {
+            id: candidate.poolMemberId,
+            poolId: attempt.poolId,
+            executionTargetId: candidate.executionTargetId,
+            ModelPool: { userId: attempt.ownerId },
+          },
+          include: { ModelPool: true },
+        });
+        if (!member)
+          throw new Error("Admission pool candidate is not an owned member of the requested pool.");
+        // Member settings are the most-specific policy. Nullable limits inherit
+        // the pool limit; scalar member values intentionally override pool defaults.
+        return {
+          ...candidate,
+          priority: member.capacityPriority ?? member.ModelPool.capacityPriority,
+          memberConcurrencyCeiling:
+            member.capacityConcurrencyLimit ??
+            member.ModelPool.capacityConcurrencyLimit ??
+            undefined,
+          reservedSlots: member.capacityReservedSlots ?? member.ModelPool.capacityReservedSlots,
+          allowBorrowReserved:
+            (member.capacityBorrowPolicy ?? member.ModelPool.capacityBorrowPolicy) === "WHEN_IDLE",
+        };
+      }),
+    );
+  }
+
+  async #admitOne(tx: Prisma.TransactionClient, capacityId: string, now: Date): Promise<boolean> {
     const capacity = await tx.inferenceCapacity.findUniqueOrThrow({ where: { id: capacityId } });
     const active = await tx.capacityLease.count({ where: { capacityId, state: "ACTIVE" } });
-    if (capacity.hardConcurrencyLimit !== null && active >= capacity.hardConcurrencyLimit) return;
+    if (capacity.hardConcurrencyLimit !== null && active >= capacity.hardConcurrencyLimit)
+      return false;
     const waiters = await tx.capacityWaiter.findMany({
       where: {
         capacityId,
@@ -214,10 +280,17 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       },
       include: { AdmissionRequest: true, PoolMember: true },
     });
-    const configuredReservations = await tx.poolMember.findMany({
-      where: { ExecutionTarget: { capacityId }, capacityReservedSlots: { gt: 0 } },
-      select: { id: true, capacityReservedSlots: true },
+    const configuredReservationMembers = await tx.poolMember.findMany({
+      where: { ExecutionTarget: { capacityId } },
+      include: { ModelPool: true },
     });
+    const configuredReservations = configuredReservationMembers
+      .map((member) => ({
+        id: member.id,
+        capacityReservedSlots:
+          member.capacityReservedSlots ?? member.ModelPool.capacityReservedSlots,
+      }))
+      .filter((policy) => policy.capacityReservedSlots > 0);
     const eligibility = new Map<string, { borrowed: boolean }>();
     const eligible = [];
     for (const waiter of waiters) {
@@ -266,17 +339,17 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       });
       eligibility.set(waiter.admissionRequestId, { borrowed });
     }
-    if (!eligible.length) return;
+    if (!eligible.length) return false;
     const deficits = schedulerDeficits(capacity.schedulerDeficits);
     const decision = scheduleWeightedDeficitRoundRobin({
       candidates: eligible,
       state: { cursor: capacity.schedulerCursor, deficits, version: capacity.schedulerVersion },
     });
-    if (!decision.winner) return;
+    if (!decision.winner) return false;
     const waiter = waiters.find(
       (entry) => entry.admissionRequestId === decision.winner?.admissionRequestId,
     );
-    if (!waiter) return;
+    if (!waiter) return false;
     const updatedCapacity = await tx.inferenceCapacity.update({
       where: { id: capacityId },
       data: {
@@ -318,6 +391,14 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       where: { id: waiter.id },
       data: { state: "ADMITTED", stateChangedAt: now, terminalReason: null },
     });
+    return true;
+  }
+
+  async #fillAvailable(tx: Prisma.TransactionClient, capacityId: string, now: Date) {
+    while (await this.#admitOne(tx, capacityId, now)) {
+      // Each iteration consumes one durable waiter and rechecks physical/member
+      // limits, so this terminates without relying on a caller-provided bound.
+    }
   }
 
   async heartbeat(lease: CapacityLeaseHandle, expiresAt: Date): Promise<boolean> {
@@ -341,7 +422,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           where: { attemptId: lease.attemptId, state: "ADMITTED" },
           data: { state: "TERMINAL", terminalAt: now },
         });
-      if (result.count) await this.#admitOne(tx, lease.capacityId, now);
+      if (result.count) await this.#fillAvailable(tx, lease.capacityId, now);
       return result.count === 1;
     });
     if (released) await this.notifier?.notify([lease.capacityId]);
@@ -394,7 +475,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
             where: { id: lease.admissionRequestId, state: "ADMITTED" },
             data: { state: "TERMINAL", terminalAt: now, terminalReason: "lease_expired" },
           });
-          await this.#admitOne(tx, lease.capacityId, now);
+          await this.#fillAvailable(tx, lease.capacityId, now);
         }
         return update;
       });

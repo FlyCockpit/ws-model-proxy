@@ -61,9 +61,9 @@ ALTER TABLE model_pool ADD CONSTRAINT model_pool_capacity_policy_check CHECK (
 
 ALTER TABLE pool_member DROP CONSTRAINT IF EXISTS pool_member_capacity_policy_check;
 ALTER TABLE pool_member ADD CONSTRAINT pool_member_capacity_policy_check CHECK (
-  "capacityPriority" BETWEEN 0 AND 31
+  ("capacityPriority" IS NULL OR "capacityPriority" BETWEEN 0 AND 31)
   AND ("capacityConcurrencyLimit" IS NULL OR "capacityConcurrencyLimit" > 0)
-  AND "capacityReservedSlots" >= 0
+  AND ("capacityReservedSlots" IS NULL OR "capacityReservedSlots" >= 0)
   AND ("capacityWaitBudgetMs" IS NULL OR "capacityWaitBudgetMs" >= 0)
   AND ("capacityContextCeiling" IS NULL OR "capacityContextCeiling" > 0)
   AND "capacityContextMargin" >= 0
@@ -166,6 +166,14 @@ BEGIN
     RAISE EXCEPTION 'capacity admission references must share owner and physical capacity'
       USING ERRCODE = '23514';
   END IF;
+  IF TG_TABLE_NAME = 'capacity_waiter' AND TG_OP = 'UPDATE'
+     AND (NEW."effectivePriority" IS DISTINCT FROM OLD."effectivePriority"
+       OR NEW."effectiveConcurrencyLimit" IS DISTINCT FROM OLD."effectiveConcurrencyLimit"
+       OR NEW."effectiveReservedSlots" IS DISTINCT FROM OLD."effectiveReservedSlots"
+       OR NEW."effectiveBorrowPolicy" IS DISTINCT FROM OLD."effectiveBorrowPolicy") THEN
+    RAISE EXCEPTION 'capacity waiter policy snapshot is immutable'
+      USING ERRCODE = '23514';
+  END IF;
   IF TG_TABLE_NAME IN ('capacity_waiter', 'capacity_lease') AND NOT EXISTS (
     SELECT 1 FROM admission_request request
      WHERE request.id = NEW."admissionRequestId"
@@ -184,11 +192,35 @@ BEGIN
       RAISE EXCEPTION 'capacity admission pool candidate is inconsistent'
         USING ERRCODE = '23514';
     END IF;
+    IF TG_TABLE_NAME = 'capacity_waiter' AND NOT EXISTS (
+      SELECT 1
+        FROM pool_member member
+        JOIN model_pool pool ON pool.id = member."poolId"
+       WHERE member.id = NEW."poolMemberId"
+         AND NEW."effectivePriority" = COALESCE(member."capacityPriority", pool."capacityPriority")
+         AND NEW."effectiveConcurrencyLimit" IS NOT DISTINCT FROM
+           COALESCE(member."capacityConcurrencyLimit", pool."capacityConcurrencyLimit")
+         AND NEW."effectiveReservedSlots" = COALESCE(member."capacityReservedSlots", pool."capacityReservedSlots")
+         AND NEW."effectiveBorrowPolicy" = COALESCE(member."capacityBorrowPolicy", pool."capacityBorrowPolicy")
+    ) THEN
+      RAISE EXCEPTION 'capacity waiter policy snapshot must match its pool member policy'
+        USING ERRCODE = '23514';
+    END IF;
   ELSIF request_pool IS NOT NULL THEN
     RAISE EXCEPTION 'pool admission requires a pool member candidate'
       USING ERRCODE = '23514';
   ELSIF request_direct_target IS DISTINCT FROM NEW."executionTargetId" THEN
     RAISE EXCEPTION 'direct admission candidate must match its source target'
+      USING ERRCODE = '23514';
+  ELSIF TG_TABLE_NAME = 'capacity_waiter' AND NOT EXISTS (
+    SELECT 1 FROM execution_target target
+     WHERE target.id = NEW."executionTargetId"
+       AND NEW."effectivePriority" = target."directPriority"
+       AND NEW."effectiveConcurrencyLimit" IS NOT DISTINCT FROM target."directConcurrencyLimit"
+       AND NEW."effectiveReservedSlots" = target."directReservedSlots"
+       AND NEW."effectiveBorrowPolicy" = target."directBorrowPolicy"
+  ) THEN
+    RAISE EXCEPTION 'capacity waiter policy snapshot must match its direct target policy'
       USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
@@ -209,7 +241,8 @@ FOR EACH ROW EXECUTE FUNCTION enforce_capacity_reference_consistency();
 DROP TRIGGER IF EXISTS capacity_waiter_reference_consistency ON capacity_waiter;
 CREATE TRIGGER capacity_waiter_reference_consistency
 BEFORE INSERT OR UPDATE OF "userId", "admissionRequestId", "requestId", "attemptId", "capacityId",
-  "executionTargetId", "poolId", "poolMemberId" ON capacity_waiter
+  "executionTargetId", "poolId", "poolMemberId", "effectivePriority", "effectiveConcurrencyLimit",
+  "effectiveReservedSlots", "effectiveBorrowPolicy" ON capacity_waiter
 FOR EACH ROW EXECUTE FUNCTION enforce_capacity_reference_consistency();
 
 DROP TRIGGER IF EXISTS capacity_lease_reference_consistency ON capacity_lease;

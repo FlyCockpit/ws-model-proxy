@@ -450,10 +450,11 @@ model PoolMember {
   poolId                       String
   discoveredModelId            String?
   executionTargetId            String?
-  capacityPriority             Int                     @default(16)
+  /// Null inherits the owning pool policy.
+  capacityPriority             Int?
   capacityConcurrencyLimit     Int?
-  capacityReservedSlots        Int                     @default(0)
-  capacityBorrowPolicy         CapacityBorrowPolicy    @default(WHEN_IDLE)
+  capacityReservedSlots        Int?
+  capacityBorrowPolicy         CapacityBorrowPolicy?
   capacityWaitBudgetMs         Int?
   capacityContextCeiling       Int?
   capacityContextMargin        Int                     @default(0)

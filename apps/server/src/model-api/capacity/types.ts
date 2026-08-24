@@ -7,10 +7,6 @@ export type AdmissionCandidate = {
   executionTargetId: string;
   poolMemberId?: string;
   candidateOrder: number;
-  priority: number;
-  memberConcurrencyCeiling?: number;
-  reservedSlots: number;
-  allowBorrowReserved: boolean;
 };
 
 export type AdmissionAttempt = {

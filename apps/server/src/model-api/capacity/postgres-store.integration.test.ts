@@ -252,9 +252,6 @@ integration("PostgreSQL capacity admission primitives", () => {
           executionTargetId: targets[candidateOrder]!.id,
           poolMemberId: member.id,
           candidateOrder,
-          priority: 16,
-          reservedSlots: 0,
-          allowBorrowReserved: true,
         })),
       });
       expect(first.state).toBe("ADMITTED");
@@ -279,9 +276,6 @@ integration("PostgreSQL capacity admission primitives", () => {
             executionTargetId: targets[0]!.id,
             poolMemberId: members[0]!.id,
             candidateOrder: 0,
-            priority: 16,
-            reservedSlots: 0,
-            allowBorrowReserved: true,
           },
         ],
       });
@@ -337,9 +331,6 @@ integration("PostgreSQL capacity admission primitives", () => {
               executionTargetId: targets[0]!.id,
               poolMemberId: members[0]!.id,
               candidateOrder: 0,
-              priority: 0,
-              reservedSlots: 0,
-              allowBorrowReserved: true,
             },
           ],
         };
@@ -370,9 +361,6 @@ integration("PostgreSQL capacity admission primitives", () => {
               executionTargetId: targets[1]!.id,
               poolMemberId: members[1]!.id,
               candidateOrder: 0,
-              priority: 31,
-              reservedSlots: 1,
-              allowBorrowReserved: false,
             },
           ],
         };
