@@ -91,9 +91,30 @@ integration("PostgreSQL capacity admission primitives", () => {
           version: 1,
         },
         candidates: [
-          { admissionRequestId: "later", priority: 7, enqueueSequence: 2n, eligible: true },
-          { admissionRequestId: "earlier-b", priority: 7, enqueueSequence: 1n, eligible: true },
-          { admissionRequestId: "earlier-a", priority: 7, enqueueSequence: 1n, eligible: true },
+          {
+            admissionRequestId: "later",
+            waiterId: "later",
+            candidateOrder: 0,
+            priority: 7,
+            enqueueSequence: 2n,
+            eligible: true,
+          },
+          {
+            admissionRequestId: "earlier-b",
+            waiterId: "earlier-b",
+            candidateOrder: 1,
+            priority: 7,
+            enqueueSequence: 1n,
+            eligible: true,
+          },
+          {
+            admissionRequestId: "earlier-a",
+            waiterId: "earlier-a",
+            candidateOrder: 0,
+            priority: 7,
+            enqueueSequence: 1n,
+            eligible: true,
+          },
         ],
       });
       expect(fifo.winner?.admissionRequestId).toBe("earlier-a");
@@ -114,11 +135,20 @@ integration("PostgreSQL capacity admission primitives", () => {
             candidates: [
               {
                 admissionRequestId: `p31-${round}`,
+                waiterId: `p31-${round}`,
+                candidateOrder: 0,
                 priority: 31,
                 enqueueSequence: 0n,
                 eligible: true,
               },
-              { admissionRequestId: "p0-head", priority: 0, enqueueSequence: 0n, eligible: true },
+              {
+                admissionRequestId: "p0-head",
+                waiterId: "p0-head",
+                candidateOrder: 0,
+                priority: 0,
+                enqueueSequence: 0n,
+                eligible: true,
+              },
             ],
           });
           await tx.inferenceCapacity.update({

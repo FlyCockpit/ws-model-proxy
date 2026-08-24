@@ -29,12 +29,51 @@ describe("durable capacity scheduler", () => {
     const result = scheduleWeightedDeficitRoundRobin({
       state: emptyState(),
       candidates: [
-        { admissionRequestId: "b", priority: 0, enqueueSequence: 1n, eligible: true },
-        { admissionRequestId: "a", priority: 0, enqueueSequence: 1n, eligible: true },
+        {
+          admissionRequestId: "b",
+          waiterId: "b",
+          candidateOrder: 0,
+          priority: 0,
+          enqueueSequence: 1n,
+          eligible: true,
+        },
+        {
+          admissionRequestId: "a",
+          waiterId: "a",
+          candidateOrder: 0,
+          priority: 0,
+          enqueueSequence: 1n,
+          eligible: true,
+        },
       ],
     });
     expect(result.winner?.admissionRequestId).toBe("a");
     expect(result.state.version).toBe(SCHEDULER_VERSION);
+  });
+
+  it("selects an exact waiter when one request has multiple same-capacity candidates", () => {
+    const result = scheduleWeightedDeficitRoundRobin({
+      state: emptyState(),
+      candidates: [
+        {
+          admissionRequestId: "request",
+          waiterId: "waiter-1",
+          candidateOrder: 1,
+          priority: 0,
+          enqueueSequence: 1n,
+          eligible: true,
+        },
+        {
+          admissionRequestId: "request",
+          waiterId: "waiter-0",
+          candidateOrder: 0,
+          priority: 0,
+          enqueueSequence: 1n,
+          eligible: true,
+        },
+      ],
+    });
+    expect(result.winner).toMatchObject({ waiterId: "waiter-0", candidateOrder: 0 });
   });
 
   it("resets empty-class credit and advances a durable cursor", () => {
@@ -42,7 +81,16 @@ describe("durable capacity scheduler", () => {
     state.deficits[5] = 99;
     const result = scheduleWeightedDeficitRoundRobin({
       state,
-      candidates: [{ admissionRequestId: "p7", priority: 7, enqueueSequence: 1n, eligible: true }],
+      candidates: [
+        {
+          admissionRequestId: "p7",
+          waiterId: "p7",
+          candidateOrder: 0,
+          priority: 7,
+          enqueueSequence: 1n,
+          eligible: true,
+        },
+      ],
     });
     expect(result.state.deficits[5]).toBe(0);
     expect(result.state.cursor).toBe(7);
@@ -55,9 +103,18 @@ describe("durable capacity scheduler", () => {
       const result = scheduleWeightedDeficitRoundRobin({
         state,
         candidates: [
-          { admissionRequestId: `low-${round}`, priority: 0, enqueueSequence: 0n, eligible: true },
+          {
+            admissionRequestId: `low-${round}`,
+            waiterId: `low-${round}`,
+            candidateOrder: 0,
+            priority: 0,
+            enqueueSequence: 0n,
+            eligible: true,
+          },
           {
             admissionRequestId: `high-${round}`,
+            waiterId: `high-${round}`,
+            candidateOrder: 0,
             priority: 31,
             enqueueSequence: 0n,
             eligible: true,

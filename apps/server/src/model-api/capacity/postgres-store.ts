@@ -580,10 +580,20 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     heartbeatBefore: Date;
     limit: number;
   }) {
+    const graceMs = Math.max(0, now.getTime() - heartbeatBefore.getTime());
+    const clockRows = await this.db.$queryRaw<
+      Array<{ now: Date }>
+    >`SELECT clock_timestamp() AS now`;
+    const databaseNow = clockRows[0]?.now;
+    if (!databaseNow) throw new Error("Database clock unavailable.");
+    const databaseHeartbeatBefore = new Date(databaseNow.getTime() - graceMs);
     const requests = await this.db.admissionRequest.findMany({
       where: {
         state: "WAITING",
-        OR: [{ deadlineAt: { lte: now } }, { heartbeatAt: { lt: heartbeatBefore } }],
+        OR: [
+          { deadlineAt: { lte: databaseNow } },
+          { heartbeatAt: { lt: databaseHeartbeatBefore } },
+        ],
       },
       orderBy: [{ heartbeatAt: "asc" }, { id: "asc" }],
       take: limit,
@@ -595,25 +605,33 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           where: { id: request.id },
           include: { Waiters: true },
         });
-        if (
-          current?.state !== "WAITING" ||
-          ((current.deadlineAt === null || current.deadlineAt > now) &&
-            current.heartbeatAt >= heartbeatBefore)
-        )
-          return [] as string[];
+        if (current?.state !== "WAITING") return [] as string[];
         const capacities = [...new Set(current.Waiters.map((waiter) => waiter.capacityId))].sort();
         for (const capacityId of capacities)
           await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacityId}, 0))`;
-        const expired = current.deadlineAt !== null && current.deadlineAt <= now;
+        const lockedRows = await tx.$queryRaw<
+          Array<{ now: Date }>
+        >`SELECT clock_timestamp() AS now`;
+        const lockedNow = lockedRows[0]?.now;
+        if (!lockedNow) throw new Error("Database clock unavailable.");
+        const lockedHeartbeatBefore = new Date(lockedNow.getTime() - graceMs);
+        if (
+          (current.deadlineAt === null || current.deadlineAt > lockedNow) &&
+          current.heartbeatAt >= lockedHeartbeatBefore
+        )
+          return [] as string[];
+        const expired = current.deadlineAt !== null && current.deadlineAt <= lockedNow;
         const updated = await tx.admissionRequest.updateMany({
           where: {
             id: current.id,
             state: "WAITING",
-            ...(expired ? { deadlineAt: { lte: now } } : { heartbeatAt: { lt: heartbeatBefore } }),
+            ...(expired
+              ? { deadlineAt: { lte: lockedNow } }
+              : { heartbeatAt: { lt: lockedHeartbeatBefore } }),
           },
           data: {
             state: expired ? "EXPIRED" : "CANCELLED",
-            terminalAt: now,
+            terminalAt: lockedNow,
             terminalReason: expired ? "deadline" : "connection_abandoned",
           },
         });
@@ -622,7 +640,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           where: { admissionRequestId: current.id, state: "WAITING" },
           data: {
             state: expired ? "EXPIRED" : "CANCELLED",
-            stateChangedAt: now,
+            stateChangedAt: lockedNow,
             terminalReason: expired ? "deadline" : "connection_abandoned",
           },
         });
