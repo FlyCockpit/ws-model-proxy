@@ -80,7 +80,7 @@ if [ "$APPLY_SCHEMA" != "off" ]; then
   echo 0 > "$HARDEN_STATUS_FILE"
   SCHEMA_LAUNCH_DIR=$(mktemp -d)
   SCHEMA_LAUNCH_GATE="$SCHEMA_LAUNCH_DIR/start"
-  mkfifo "$SCHEMA_LAUNCH_GATE"
+  : > "$SCHEMA_LAUNCH_GATE"
 
   schema_child_pid=""
   schema_signal_status=""
@@ -166,7 +166,20 @@ if [ "$APPLY_SCHEMA" != "off" ]; then
   setsid sh -c '
     launch_gate=$1
     shift
-    IFS= read -r launch_token < "$launch_gate" || exit 125
+    if [ "${ENTRYPOINT_TEST_SCHEMA_EXIT_BEFORE_GATE:-0}" = 1 ]; then
+      exit 125
+    fi
+    # Polling a regular file keeps the parent write non-blocking even if this
+    # child dies before reaching the gate. Bound the handshake as a second
+    # line of defence against a supervisor failure before gate release.
+    gate_attempt=0
+    launch_token=
+    while [ "$gate_attempt" -lt 100 ]; do
+      IFS= read -r launch_token < "$launch_gate" || true
+      [ "$launch_token" = start ] && break
+      gate_attempt=$((gate_attempt + 1))
+      sleep 0.05
+    done
     [ "$launch_token" = start ] || exit 125
     exec "$@"
   ' schema-launch "$SCHEMA_LAUNCH_GATE" psql -v ON_ERROR_STOP=1 <<EOF &
@@ -192,13 +205,15 @@ EOF
       ;;
   esac
   schema_child_pid=$!
+  if [ -n "${ENTRYPOINT_TEST_SCHEMA_LAUNCH_PID_FILE:-}" ]; then
+    echo "$schema_child_pid" > "$ENTRYPOINT_TEST_SCHEMA_LAUNCH_PID_FILE"
+  fi
   schema_launch_phase="running"
   if [ -n "$schema_pending_signal" ]; then
     kill "-$schema_pending_signal" "-$schema_child_pid" 2>/dev/null || true
   else
-    # Opening the FIFO may itself be interrupted by a signal. Keep `set -e`
-    # from bypassing the signal handoff, then re-check the trap state before
-    # allowing the normal wait path to proceed.
+    # Keep `set -e` from bypassing signal handoff, then re-check trap state
+    # before allowing the normal wait path to proceed.
     set +e
     echo start > "$SCHEMA_LAUNCH_GATE"
     launch_gate_status=$?
@@ -212,7 +227,6 @@ EOF
       exit "$launch_gate_status"
     fi
   fi
-  rm -rf "$SCHEMA_LAUNCH_DIR"
   set +e
   wait "$schema_child_pid"
   psql_status=$?
