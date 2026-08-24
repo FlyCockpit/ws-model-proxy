@@ -888,9 +888,8 @@ integration("PostgreSQL capacity admission primitives", () => {
         fencingToken: active[0]!.fencingToken,
         expiresAt: active[0]!.expiresAt,
       });
-      await expect(manager.acquire(directAttempt(`idle-${suffix}`))).resolves.toMatchObject({
-        state: "ADMITTED",
-      });
+      const idleBorrower = await manager.acquire(directAttempt(`idle-${suffix}`));
+      expect(idleBorrower.state).toBe("ADMITTED");
       expect(
         await db.capacityLease.findUnique({ where: { attemptId: `idle-${suffix}` } }),
       ).toMatchObject({ borrowed: true });
@@ -931,30 +930,99 @@ integration("PostgreSQL capacity admission primitives", () => {
       });
       const occupyingOwner = await manager.acquire(ownerAttempt(members[0]!, "owner-occupies"));
       expect(occupyingOwner.state).toBe("ADMITTED");
+      await manager.cancelAttempt(`direct-ceiling-${suffix}`);
+      await db.poolMember.update({
+        where: { id: members[1]!.member.id },
+        data: { capacityPriority: 0, capacityConcurrencyLimit: 1 },
+      });
       await expect(
-        manager.acquire(ownerAttempt(members[1]!, "owner-queued")),
+        manager.acquire(ownerAttempt(members[1]!, "lower-owner-queued")),
       ).resolves.toMatchObject({
         state: "WAITING",
       });
       await db.executionTarget.update({
         where: { id: targets[0]!.id },
-        data: { directConcurrencyLimit: null },
+        data: { directConcurrencyLimit: null, directPriority: 31 },
       });
       await expect(
-        manager.acquire(directAttempt(`second-outsider-${suffix}`)),
+        manager.acquire(directAttempt(`priority31-borrower-${suffix}`)),
       ).resolves.toMatchObject({
         state: "WAITING",
+      });
+      await db.inferenceCapacity.update({
+        where: { id: capacity.id },
+        data: { schedulerCursor: 31, schedulerDeficits: Array(32).fill(0) },
       });
       if (occupyingOwner.state !== "ADMITTED") throw new Error("Expected reservation owner lease.");
       await manager.release(occupyingOwner.lease);
       expect(
-        await db.capacityLease.findUnique({ where: { attemptId: `owner-queued-${suffix}` } }),
+        await db.capacityLease.findUnique({
+          where: { attemptId: `priority31-borrower-${suffix}` },
+        }),
+      ).toMatchObject({ state: "ACTIVE", borrowed: true });
+      expect(
+        await db.admissionRequest.findUnique({
+          where: { attemptId: `lower-owner-queued-${suffix}` },
+        }),
+      ).toMatchObject({ state: "WAITING" });
+      const priority31Borrower = await manager.acquire({
+        ...directAttempt(`priority31-borrower-${suffix}`),
+        candidates: [],
+      });
+      if (priority31Borrower.state !== "ADMITTED")
+        throw new Error("Expected high-priority borrower.");
+      await manager.release(priority31Borrower.lease);
+
+      const lowerOwner = await manager.acquire({
+        ...ownerAttempt(members[1]!, "lower-owner-queued"),
+        candidates: [],
+      });
+      if (lowerOwner.state !== "ADMITTED") throw new Error("Expected reserved owner lease.");
+      await db.poolMember.update({
+        where: { id: members[1]!.member.id },
+        data: { capacityPriority: 31, capacityConcurrencyLimit: 1 },
+      });
+      await expect(
+        manager.acquire(ownerAttempt(members[1]!, "higher-owner-at-ceiling")),
+      ).resolves.toMatchObject({ state: "WAITING" });
+      await db.executionTarget.update({
+        where: { id: targets[0]!.id },
+        data: { directPriority: 0 },
+      });
+      await expect(
+        manager.acquire(directAttempt(`ceiling-borrower-${suffix}`)),
+      ).resolves.toMatchObject({
+        state: "WAITING",
+      });
+      if (idleBorrower.state !== "ADMITTED") throw new Error("Expected original borrower lease.");
+      await manager.release(idleBorrower.lease);
+      expect(
+        await db.capacityLease.findUnique({ where: { attemptId: `ceiling-borrower-${suffix}` } }),
+      ).toMatchObject({ state: "ACTIVE", borrowed: true });
+      expect(
+        await db.admissionRequest.findUnique({
+          where: { attemptId: `higher-owner-at-ceiling-${suffix}` },
+        }),
+      ).toMatchObject({ state: "WAITING" });
+
+      await expect(
+        manager.acquire(directAttempt(`blocked-outsider-${suffix}`)),
+      ).resolves.toMatchObject({
+        state: "WAITING",
+      });
+      await manager.release(lowerOwner.lease);
+      expect(
+        await db.capacityLease.findUnique({
+          where: { attemptId: `higher-owner-at-ceiling-${suffix}` },
+        }),
       ).toMatchObject({ state: "ACTIVE", borrowed: false });
       expect(
-        await db.admissionRequest.findUnique({ where: { attemptId: `second-outsider-${suffix}` } }),
+        await db.admissionRequest.findUnique({
+          where: { attemptId: `blocked-outsider-${suffix}` },
+        }),
       ).toMatchObject({ state: "WAITING" });
       expect(
-        await db.capacityLease.findUnique({ where: { attemptId: `idle-${suffix}` } }),
+        await db.capacityLease.findUnique({ where: { attemptId: `ceiling-borrower-${suffix}` } }),
       ).toMatchObject({ state: "ACTIVE" });
     } finally {
       await db.user.delete({ where: { id: user.id } }).catch(() => undefined);
