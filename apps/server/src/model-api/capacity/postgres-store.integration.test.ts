@@ -366,6 +366,9 @@ integration("PostgreSQL capacity admission primitives", () => {
       });
       expect(waiters.filter((waiter) => waiter.state === "ADMITTED")).toHaveLength(1);
       expect(waiters.filter((waiter) => waiter.state === "CANCELLED")).toHaveLength(1);
+      expect(
+        await db.capacityLease.findUnique({ where: { attemptId: `attempt-1-${suffix}` } }),
+      ).toMatchObject({ poolMemberId: members[1]!.id });
 
       const second = await secondManager.acquire({
         requestId: `request-2-${suffix}`,
@@ -541,6 +544,7 @@ integration("PostgreSQL capacity admission primitives", () => {
           where: { attemptId: abandonedAttempt.attemptId },
           data: { heartbeatAt: new Date(Date.now() - 120_000) },
         });
+        const notificationsBeforeSweep = notifications.length;
         await expect(
           firstManager.sweepAbandoned({
             now: new Date(),
@@ -548,6 +552,8 @@ integration("PostgreSQL capacity admission primitives", () => {
             limit: 10,
           }),
         ).resolves.toMatchObject({ requests: 1 });
+        expect(notifications.length).toBeGreaterThan(notificationsBeforeSweep);
+        expect(notifications.at(-1)).toContain(capacity.id);
         expect(
           await db.admissionRequest.findUnique({
             where: { attemptId: abandonedAttempt.attemptId },
@@ -707,7 +713,7 @@ integration("PostgreSQL capacity admission primitives", () => {
           }),
         );
       }
-      const members = [];
+      const members: Array<{ pool: { id: string }; member: { id: string } }> = [];
       for (const index of [0, 1]) {
         const pool = await db.modelPool.create({
           data: {
@@ -715,6 +721,7 @@ integration("PostgreSQL capacity admission primitives", () => {
             slug: `reserve-${index}-${suffix}`,
             name: `Reserve ${index}`,
             capacityReservedSlots: 9,
+            capacityConcurrencyLimit: 1,
           },
         });
         members.push({
@@ -748,6 +755,103 @@ integration("PostgreSQL capacity admission primitives", () => {
         });
         expect(result.state).toBe("ADMITTED");
       }
+      const secondCapacity = await db.inferenceCapacity.create({
+        data: {
+          userId: user.id,
+          label: `second-${suffix}`,
+          runtimeIdentityKey: `second-${suffix}`,
+          runtimeModel: "pool-scope-proof",
+          hardConcurrencyLimit: 2,
+        },
+      });
+      const secondModel = await db.providerModel.create({
+        data: {
+          userId: user.id,
+          providerAccountId: account.id,
+          upstreamModelId: `second-${suffix}`,
+        },
+      });
+      const secondTarget = await db.executionTarget.create({
+        data: {
+          userId: user.id,
+          kind: "PROVIDER_MODEL",
+          providerModelId: secondModel.id,
+          inferenceCapacityId: secondCapacity.id,
+        },
+      });
+      const inheritedMember = await db.poolMember.create({
+        data: { poolId: members[0]!.pool.id, executionTargetId: secondTarget.id },
+      });
+      const scopedAttempt = (attemptId: string) => ({
+        requestId: attemptId,
+        attemptId,
+        ownerId: user.id,
+        sourceKind: "POOL" as const,
+        poolId: members[0]!.pool.id,
+        basePriority: 16,
+        connectionOwner: "reservation-proof",
+        deadlineAt,
+        candidates: [
+          {
+            capacityId: secondCapacity.id,
+            executionTargetId: secondTarget.id,
+            poolMemberId: inheritedMember.id,
+            candidateOrder: 0,
+          },
+        ],
+      });
+      await expect(manager.acquire(scopedAttempt(`pool-wide-${suffix}`))).resolves.toMatchObject({
+        state: "WAITING",
+      });
+      await manager.cancelAttempt(`pool-wide-${suffix}`);
+      await db.poolMember.update({
+        where: { id: inheritedMember.id },
+        data: { capacityConcurrencyLimit: 1 },
+      });
+      await expect(manager.acquire(scopedAttempt(`member-scope-${suffix}`))).resolves.toMatchObject(
+        {
+          state: "ADMITTED",
+        },
+      );
+      const raceClient = createPrismaClient(databaseUrl);
+      const raceManager = new PostgresCapacityAdmissionStore(raceClient, "expiry-race-proof");
+      try {
+        for (let index = 0; index < 20; index++) {
+          const raceAttemptId = `expiry-race-${index}-${suffix}`;
+          const admitted = await manager.acquire({
+            requestId: raceAttemptId,
+            attemptId: raceAttemptId,
+            ownerId: user.id,
+            sourceKind: "DIRECT",
+            basePriority: 16,
+            connectionOwner: "reservation-proof",
+            deadlineAt,
+            candidates: [
+              {
+                capacityId: secondCapacity.id,
+                executionTargetId: secondTarget.id,
+                candidateOrder: 0,
+              },
+            ],
+          });
+          if (admitted.state !== "ADMITTED") throw new Error("Expected expiry-race lease.");
+          await db.capacityLease.update({
+            where: { id: admitted.lease.leaseId },
+            data: { expiresAt: new Date(Date.now() - 1) },
+          });
+          const [reclaimed, heartbeated] = await Promise.all([
+            manager.reclaimExpired(new Date(), 1),
+            raceManager.heartbeat(admitted.lease, new Date(Date.now() + 60_000)),
+          ]);
+          expect([reclaimed, heartbeated]).toEqual(reclaimed === 1 ? [1, false] : [0, true]);
+          if (heartbeated) await raceManager.release(admitted.lease);
+          await expect(
+            manager.heartbeat(admitted.lease, new Date(Date.now() + 60_000)),
+          ).resolves.toBe(false);
+        }
+      } finally {
+        await raceClient.$disconnect();
+      }
       const directAttempt = (attemptId: string) => ({
         requestId: attemptId,
         attemptId,
@@ -765,7 +869,7 @@ integration("PostgreSQL capacity admission primitives", () => {
       });
       await db.executionTarget.update({
         where: { id: targets[1]!.id },
-        data: { directBorrowPolicy: "WHEN_IDLE" },
+        data: { directBorrowPolicy: "WHEN_IDLE", directConcurrencyLimit: 1 },
       });
       const active = await db.capacityLease.findMany({
         where: { capacityId: capacity.id, state: "ACTIVE" },
@@ -785,6 +889,23 @@ integration("PostgreSQL capacity admission primitives", () => {
       expect(
         await db.capacityLease.findUnique({ where: { attemptId: `idle-${suffix}` } }),
       ).toMatchObject({ borrowed: true });
+      const onePoolLease = await db.capacityLease.findFirstOrThrow({
+        where: { capacityId: capacity.id, state: "ACTIVE", poolMemberId: { not: null } },
+      });
+      await manager.release({
+        leaseId: onePoolLease.id,
+        attemptId: onePoolLease.attemptId,
+        capacityId: onePoolLease.capacityId,
+        executionTargetId: onePoolLease.executionTargetId,
+        ...(onePoolLease.poolMemberId ? { poolMemberId: onePoolLease.poolMemberId } : {}),
+        fencingToken: onePoolLease.fencingToken,
+        expiresAt: onePoolLease.expiresAt,
+      });
+      await expect(
+        manager.acquire(directAttempt(`direct-ceiling-${suffix}`)),
+      ).resolves.toMatchObject({
+        state: "WAITING",
+      });
     } finally {
       await db.user.delete({ where: { id: user.id } }).catch(() => undefined);
       await db.$disconnect();
