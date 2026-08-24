@@ -296,19 +296,18 @@ struct RawCapabilities {
 
 impl Default for RawCapabilities {
     fn default() -> Self {
-        let value = OpenAiCompatibleCapabilities::openai_defaults();
         Self {
-            version: value.version,
-            protocol: value.protocol,
-            surfaces: value.surfaces,
-            source: value.source,
-            confidence: value.confidence,
-            models: value.models,
-            chat_completions: value.chat_completions,
-            completions: value.completions,
-            embeddings: value.embeddings,
-            responses: value.responses,
-            audio: value.audio,
+            version: 1,
+            protocol: "openai-compatible".to_string(),
+            surfaces: None,
+            source: None,
+            confidence: None,
+            models: None,
+            chat_completions: None,
+            completions: None,
+            embeddings: None,
+            responses: None,
+            audio: None,
         }
     }
 }
@@ -476,9 +475,9 @@ pub struct SurfaceInventory {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub openai_chat_completions: Option<SurfaceCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub openai_responses: Option<SurfaceCapabilities>,
+    pub openai_responses: Option<ResponsesSurfaceCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub anthropic_messages: Option<SurfaceCapabilities>,
+    pub anthropic_messages: Option<AnthropicSurfaceCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub openai_completions: Option<SurfaceCapabilities>,
 }
@@ -488,24 +487,52 @@ pub struct SurfaceInventory {
 pub struct SurfaceCapabilities {
     pub source: CapabilitySource,
     pub confidence: CapabilityConfidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub supported: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub streaming: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_context_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub images: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub input_audio: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_audio: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub input_video: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_video: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_tools: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub structured_output: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hosted_tools: Option<bool>,
-    pub count_tokens: Option<bool>,
-    pub stateful: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub beta_features: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnthropicSurfaceCapabilities {
+    #[serde(flatten)]
+    pub common: SurfaceCapabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count_tokens: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResponsesSurfaceCapabilities {
+    #[serde(flatten)]
+    pub common: SurfaceCapabilities,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub responses_lifecycle: Option<ResponsesLifecycleCapabilities>,
 }
@@ -1156,8 +1183,17 @@ mod tests {
         ))
         .expect("shared capability fixture");
         for valid in fixture["valid"].as_array().expect("valid fixtures") {
-            serde_json::from_value::<OpenAiCompatibleCapabilities>(valid.clone())
+            let parsed = serde_json::from_value::<OpenAiCompatibleCapabilities>(valid.clone())
                 .expect("valid TS/Rust fixture");
+            let serialized = serde_json::to_value(&parsed).expect("serialize valid fixture");
+            assert_eq!(serialized, *valid, "Rust wire output stays sparse");
+            assert!(
+                !serialized.to_string().contains(":null"),
+                "Rust capability profiles must omit absent optional fields"
+            );
+            let round_trip: OpenAiCompatibleCapabilities =
+                serde_json::from_value(serialized).expect("round-trip serialized profile");
+            assert_eq!(round_trip, parsed);
         }
         for invalid in fixture["invalid"].as_array().expect("invalid fixtures") {
             assert!(
