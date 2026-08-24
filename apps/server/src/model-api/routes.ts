@@ -2484,7 +2484,7 @@ async function relayPool({
             poolMemberId: candidate.poolMemberId,
             failure: "protocol_error",
           });
-          if (!shouldRetryRelayOperation(operation, "precommit_transport")) break;
+          if (!shouldRetryRelayOperation(operation, "precommit_content_type_mismatch")) break;
           continue;
         }
       }

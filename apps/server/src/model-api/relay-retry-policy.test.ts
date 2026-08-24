@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { relayOperationRetrySafety, shouldRetryRelayOperation } from "./relay-retry-policy.js";
 
-const failures = ["precommit_5xx", "precommit_transport"] as const;
+const failures = [
+  "precommit_5xx",
+  "precommit_transport",
+  "precommit_content_type_mismatch",
+] as const;
 
 describe("relay retry policy", () => {
   it.each(failures)("never retries previous_response_id follow-ups for %s", (failure) => {
@@ -14,21 +18,19 @@ describe("relay retry policy", () => {
     expect(shouldRetryRelayOperation(operation, failure)).toBe(false);
   });
 
-  it.each([
-    "responses.statefulFollowUps",
-    "responses.retrieve",
-    "responses.delete",
-    "responses.cancel",
-    "responses.listInputItems",
-    "responses.compact",
-  ])("never retries %s", (capability) => {
+  it.each(["responses.statefulFollowUps"])("never retries %s", (capability) => {
     for (const failure of failures)
       expect(shouldRetryRelayOperation({ family: "responses", capability }, failure)).toBe(false);
   });
 
   it.each([
+    ["responses.retrieve", "idempotent"],
+    ["responses.delete", "idempotent"],
+    ["responses.listInputItems", "idempotent"],
     ["responses.countTokens", "idempotent"],
     ["responses.create", "pre_commit_only"],
+    ["responses.cancel", "pre_commit_only"],
+    ["responses.compact", "pre_commit_only"],
     ["chat.create", "pre_commit_only"],
   ] as const)("allows safe precommit retry for %s", (capability, safety) => {
     const operation = {

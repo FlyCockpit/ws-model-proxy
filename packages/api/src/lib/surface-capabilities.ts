@@ -141,7 +141,11 @@ function responsesOperationFor(request: SurfaceRequestRequirements): ResponsesOp
 
 function retrySafetyFor(surface: ModelApiSurface, request: SurfaceRequestRequirements) {
   if (surface !== "OPENAI_RESPONSES") return "pre_commit_only" as const;
-  switch (responsesOperationFor(request)) {
+  return responsesOperationRetrySafety(responsesOperationFor(request));
+}
+
+export function responsesOperationRetrySafety(operation: ResponsesOperation) {
+  switch (operation) {
     case "retrieve":
     case "listInputItems":
     case "countTokens":
