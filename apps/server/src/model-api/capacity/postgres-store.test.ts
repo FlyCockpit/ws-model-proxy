@@ -2,9 +2,14 @@ import { describe, expect, it, vi } from "vitest";
 
 vi.mock("@ws-model-proxy/db", () => ({ default: {}, Prisma: {} }));
 
-import { waitWithCapacityPolling } from "./postgres-store.js";
+import { isRetryableCapacityTransactionError, waitWithCapacityPolling } from "./postgres-store.js";
 
 describe("capacity wakeup polling", () => {
+  it("recognizes serialization and deadlock errors without depending on one driver class", () => {
+    expect(isRetryableCapacityTransactionError({ code: "40001" })).toBe(true);
+    expect(isRetryableCapacityTransactionError({ code: "40P01" })).toBe(true);
+    expect(isRetryableCapacityTransactionError({ code: "23505" })).toBe(false);
+  });
   it("treats notifications as hints and re-polls durable state", async () => {
     const admitted = {
       state: "ADMITTED" as const,

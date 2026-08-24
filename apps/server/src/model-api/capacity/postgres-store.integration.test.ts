@@ -162,6 +162,130 @@ integration("PostgreSQL capacity admission primitives", () => {
         await expect(
           firstManager.heartbeat(first.lease, new Date(Date.now() + 60_000)),
         ).resolves.toBe(false);
+        await db.inferenceCapacity.update({
+          where: { id: capacity.id },
+          data: { hardConcurrencyLimit: 2 },
+        });
+        await db.poolMember.update({
+          where: { id: members[0]!.id },
+          data: {
+            capacityPriority: 0,
+            capacityConcurrencyLimit: 1,
+            capacityBorrowPolicy: "WHEN_IDLE",
+          },
+        });
+        await db.poolMember.update({
+          where: { id: members[1]!.id },
+          data: { capacityPriority: 31, capacityReservedSlots: 1 },
+        });
+        const lowAttempt = {
+          requestId: `request-low-${suffix}`,
+          attemptId: `attempt-low-${suffix}`,
+          ownerId: user.id,
+          sourceKind: "POOL" as const,
+          poolId: pool.id,
+          basePriority: 0,
+          connectionOwner: "proof-server-a",
+          deadlineAt,
+          candidates: [
+            {
+              capacityId: capacity.id,
+              executionTargetId: targets[0]!.id,
+              poolMemberId: members[0]!.id,
+              candidateOrder: 0,
+              priority: 0,
+              reservedSlots: 0,
+              allowBorrowReserved: true,
+            },
+          ],
+        };
+        await expect(firstManager.acquire(lowAttempt)).resolves.toMatchObject({ state: "WAITING" });
+        await db.poolMember.update({
+          where: { id: members[0]!.id },
+          data: { capacityConcurrencyLimit: null },
+        });
+        const borrowed = await firstManager.acquire({ ...lowAttempt, candidates: [] });
+        expect(borrowed).toMatchObject({ state: "ADMITTED", lease: { capacityId: capacity.id } });
+        const borrowedRow = await db.capacityLease.findUniqueOrThrow({
+          where: { attemptId: lowAttempt.attemptId },
+        });
+        expect(borrowedRow.borrowed).toBe(true);
+
+        const highAttempt = {
+          requestId: `request-high-${suffix}`,
+          attemptId: `attempt-high-${suffix}`,
+          ownerId: user.id,
+          sourceKind: "POOL" as const,
+          poolId: pool.id,
+          basePriority: 31,
+          connectionOwner: "proof-server-b",
+          deadlineAt,
+          candidates: [
+            {
+              capacityId: capacity.id,
+              executionTargetId: targets[1]!.id,
+              poolMemberId: members[1]!.id,
+              candidateOrder: 0,
+              priority: 31,
+              reservedSlots: 1,
+              allowBorrowReserved: false,
+            },
+          ],
+        };
+        await expect(secondManager.acquire(highAttempt)).resolves.toMatchObject({
+          state: "WAITING",
+        });
+        expect(
+          await db.capacityLease.count({ where: { capacityId: capacity.id, state: "ACTIVE" } }),
+        ).toBe(2);
+        await secondManager.release(admittedSecond.lease);
+        const high = await secondManager.acquire({ ...highAttempt, candidates: [] });
+        expect(high).toMatchObject({ state: "ADMITTED" });
+        expect(
+          await db.capacityLease.findUnique({ where: { attemptId: lowAttempt.attemptId } }),
+        ).toMatchObject({ state: "ACTIVE" });
+        if (borrowed.state !== "ADMITTED") throw new Error("Expected borrowed lease.");
+        await db.capacityLease.update({
+          where: { id: borrowed.lease.leaseId },
+          data: {
+            expiresAt: new Date(Date.now() - 1_000),
+            heartbeatAt: new Date(Date.now() - 60_000),
+          },
+        });
+        await expect(firstManager.reclaimExpired(new Date(), 10)).resolves.toBe(1);
+        await expect(firstManager.release(borrowed.lease)).resolves.toBe(false);
+        await expect(
+          firstManager.heartbeat(borrowed.lease, new Date(Date.now() + 60_000)),
+        ).resolves.toBe(false);
+
+        await db.inferenceCapacity.update({
+          where: { id: capacity.id },
+          data: { hardConcurrencyLimit: 1 },
+        });
+        const abandonedAttempt = {
+          ...lowAttempt,
+          requestId: `request-abandoned-${suffix}`,
+          attemptId: `attempt-abandoned-${suffix}`,
+        };
+        await expect(firstManager.acquire(abandonedAttempt)).resolves.toMatchObject({
+          state: "WAITING",
+        });
+        await db.admissionRequest.update({
+          where: { attemptId: abandonedAttempt.attemptId },
+          data: { heartbeatAt: new Date(Date.now() - 120_000) },
+        });
+        await expect(
+          firstManager.sweepAbandoned({
+            now: new Date(),
+            heartbeatBefore: new Date(Date.now() - 60_000),
+            limit: 10,
+          }),
+        ).resolves.toMatchObject({ requests: 1 });
+        expect(
+          await db.admissionRequest.findUnique({
+            where: { attemptId: abandonedAttempt.attemptId },
+          }),
+        ).toMatchObject({ state: "CANCELLED", terminalReason: "connection_abandoned" });
       }
       await secondClient.$disconnect();
     } finally {

@@ -10,6 +10,14 @@ import type {
 type Db = typeof prisma;
 const SERIALIZATION_CODES = new Set(["P2034", "40001", "40P01"]);
 
+export function isRetryableCapacityTransactionError(error: unknown): boolean {
+  const code =
+    error && typeof error === "object" && "code" in error && typeof error.code === "string"
+      ? error.code
+      : undefined;
+  return code !== undefined && SERIALIZATION_CODES.has(code);
+}
+
 export type CapacityNotifier = { notify(capacityIds: readonly string[]): Promise<void> };
 export type CapacityWakeSource = {
   wait(capacityIds: readonly string[], timeoutMs: number, signal?: AbortSignal): Promise<void>;
@@ -353,8 +361,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       try {
         return await this.db.$transaction(work, { isolationLevel: "Serializable" });
       } catch (error) {
-        const code = error instanceof Prisma.PrismaClientKnownRequestError ? error.code : undefined;
-        if (attempt >= 4 || !code || !SERIALIZATION_CODES.has(code)) throw error;
+        if (attempt >= 4 || !isRetryableCapacityTransactionError(error)) throw error;
         await new Promise((resolve) => setTimeout(resolve, 5 + Math.floor(Math.random() * 20)));
       }
     }
