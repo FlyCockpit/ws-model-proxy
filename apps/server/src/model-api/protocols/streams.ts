@@ -1028,6 +1028,8 @@ function validateResponseEnvelope(response: Record<string, unknown>) {
     throw new AdapterError("invalid_response_envelope", "Responses created_at is required.");
   if (typeof response.model !== "string" || response.model.length === 0)
     throw new AdapterError("invalid_response_envelope", "Responses model is required.");
+  if (!new Set(["in_progress", "completed", "incomplete", "failed"]).has(String(response.status)))
+    throw new AdapterError("invalid_response_state", "Responses status is unsupported.");
   for (const key of [
     "error",
     "incomplete_details",
@@ -1071,6 +1073,14 @@ function validateResponseEnvelope(response: Record<string, unknown>) {
       "unsupported_response_configuration",
       "Responses envelope contains unsupported mutable configuration.",
     );
+  if (response.user !== undefined && response.user !== null)
+    unsupported("response.user", "is not safely adaptable");
+  if (
+    response.service_tier !== undefined &&
+    response.service_tier !== null &&
+    response.service_tier !== "default"
+  )
+    unsupported("response.service_tier", "is not safely adaptable");
   const reasoning = object(response.reasoning, "response.reasoning");
   rejectUnknown(reasoning, ["effort", "summary"], "response.reasoning");
   if (reasoning.effort !== null || reasoning.summary !== null)
@@ -1095,6 +1105,21 @@ function validateResponseEnvelope(response: Record<string, unknown>) {
       "invalid_response_state",
       "Responses status does not match error, incomplete, or usage state.",
     );
+  if (response.error !== null) {
+    const error = object(response.error, "response.error");
+    rejectUnknown(error, ["code", "message", "type", "param"], "response.error");
+    if (typeof error.code !== "string" || typeof error.message !== "string")
+      throw new AdapterError(
+        "invalid_response_error",
+        "Responses error requires code and message strings.",
+      );
+  }
+  if (response.incomplete_details !== null) {
+    const details = object(response.incomplete_details, "response.incomplete_details");
+    rejectUnknown(details, ["reason"], "response.incomplete_details");
+    if (details.reason !== "max_output_tokens") unsupported("response.incomplete_details.reason");
+  }
+  if (response.usage !== null && response.usage !== undefined) usageEvent(response.usage, true);
 }
 
 function validateCanonicalUsage(usage: { inputTokens?: number; outputTokens?: number }) {
@@ -1328,6 +1353,11 @@ export class CanonicalStreamRenderer {
     if (event.type === "message_start") {
       if (this.#started)
         throw new AdapterError("duplicate_start", "Canonical stream started twice.");
+      if (typeof event.model !== "string" || event.model.length === 0)
+        throw new AdapterError(
+          "missing_model",
+          `${this.#surface} stream rendering requires a non-empty model.`,
+        );
       this.#started = true;
       this.#messageId = event.id;
       this.#model = event.model;
@@ -1784,6 +1814,11 @@ export class CanonicalStreamRenderer {
 
   #anthropic(event: CanonicalEvent): WirePayload[] {
     if (event.type === "message_start") {
+      if (event.usage?.inputTokens === undefined || event.usage.outputTokens === undefined)
+        throw new AdapterError(
+          "unsupported_stream_adaptation",
+          "Anthropic streaming requires initial usage; sources that report usage only at completion are unavailable.",
+        );
       return [
         named("message_start", {
           message: {
@@ -1795,8 +1830,8 @@ export class CanonicalStreamRenderer {
             stop_reason: null,
             stop_sequence: null,
             usage: {
-              input_tokens: event.usage?.inputTokens ?? 0,
-              output_tokens: event.usage?.outputTokens ?? 0,
+              input_tokens: event.usage.inputTokens,
+              output_tokens: event.usage.outputTokens,
             },
           },
         }),

@@ -99,6 +99,7 @@ describe("cycle 21 streaming closure", () => {
       ...renderer.push({
         type: "message_start",
         id: "m",
+        model: "claude",
         usage: { inputTokens: 7, outputTokens: 0 },
       }),
       ...renderer.push({ type: "usage", usage: { inputTokens: 7, outputTokens: 4 } }),
