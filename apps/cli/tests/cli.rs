@@ -382,7 +382,7 @@ fn endpoints_add_list_remove_json() {
             "--base-url",
             "http://127.0.0.1:11434/v1",
             "--header-env",
-            "Authorization=LOCAL_LLM_AUTH",
+            "OpenAI-Organization=LOCAL_LLM_ORG",
         ])
         .assert()
         .success();
@@ -391,7 +391,7 @@ fn endpoints_add_list_remove_json() {
     list.args(["endpoints", "--json", "list"]);
     let value = json_stdout(list);
     assert_eq!(value["endpoints"][0]["slug"], "local");
-    assert_eq!(value["endpoints"][0]["headers"][0]["env"], "LOCAL_LLM_AUTH");
+    assert_eq!(value["endpoints"][0]["headers"][0]["env"], "LOCAL_LLM_ORG");
 
     cli(&config, &state)
         .args(["endpoints", "remove", "local"])
@@ -432,7 +432,8 @@ fn endpoints_probe_success_applies_model_suggestions_and_uses_secret_env_header(
                     "models": { "list": true },
                     "chatCompletions": { "supported": true, "streaming": true }
                 },
-                "headers": [{ "name": "Authorization", "env": "LOCAL_LLM_AUTH" }],
+                "headers": [],
+                "auth": { "mode": "bearer", "env": "LOCAL_LLM_AUTH" },
                 "models": []
             }]
         }),
@@ -441,7 +442,7 @@ fn endpoints_probe_success_applies_model_suggestions_and_uses_secret_env_header(
     let mut probe = cli(&config, &state);
     probe
         .args(["endpoints", "--json", "probe", "local", "--apply"])
-        .env("LOCAL_LLM_AUTH", "Bearer upstream-secret");
+        .env("LOCAL_LLM_AUTH", "upstream-secret");
     let value = json_stdout(probe);
     assert_eq!(value["reports"][0]["status"], "online");
     assert_eq!(
@@ -455,7 +456,8 @@ fn endpoints_probe_success_applies_model_suggestions_and_uses_secret_env_header(
     assert!(
         request
             .to_ascii_lowercase()
-            .contains("authorization: bearer upstream-secret")
+            .contains("authorization: bearer upstream-secret"),
+        "request did not contain typed auth header: {request:?}"
     );
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     assert_eq!(cfg["endpoints"][0]["models"].as_array().unwrap().len(), 2);

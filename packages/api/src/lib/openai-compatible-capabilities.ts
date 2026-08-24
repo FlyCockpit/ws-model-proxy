@@ -126,6 +126,18 @@ const surfaceFeatureSchema = z
     stateful: booleanSupportSchema,
     protocolVersion: z.string().trim().min(1).max(64).optional(),
     betaFeatures: z.array(z.string().trim().min(1).max(128)).max(64).optional(),
+    responsesLifecycle: z
+      .object({
+        statefulFollowUps: booleanSupportSchema,
+        retrieve: booleanSupportSchema,
+        delete: booleanSupportSchema,
+        cancel: booleanSupportSchema,
+        listInputItems: booleanSupportSchema,
+        countTokens: booleanSupportSchema,
+        compact: booleanSupportSchema,
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 

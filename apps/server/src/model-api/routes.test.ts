@@ -579,6 +579,29 @@ describe("model API routes", () => {
     );
   });
 
+  it("strips every inbound provider credential alias before endpoint authentication", async () => {
+    const manager = new FakeRelayManager();
+    const pending = appWith(manager).request("/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "content-type": "application/json",
+        "x-api-key": "client-x-api-key",
+        "api-key": "client-api-key",
+        "openai-api-key": "client-openai-key",
+        "anthropic-api-key": "client-anthropic-key",
+      },
+      body: requestBody(),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    for (const name of ["x-api-key", "api-key", "openai-api-key", "anthropic-api-key"]) {
+      expect(sentHeader(sent, name)).toBeUndefined();
+    }
+    await completeJsonRelay({ manager, requestId: sent.requestId, body: { choices: [] } });
+    expect((await pending).status).toBe(200);
+  });
+
   it("routes v3 OpenAI Chat, Responses, and native-only Completions surfaces", async () => {
     db.discoveredModel.findUnique.mockResolvedValue(
       directRow({

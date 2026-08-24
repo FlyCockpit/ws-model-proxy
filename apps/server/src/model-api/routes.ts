@@ -566,6 +566,10 @@ async function transcriptionUploadLimitResponse({
 function relayRequestHeaders(request: Request): Headers {
   const headers = new Headers(request.headers);
   headers.delete("authorization");
+  headers.delete("x-api-key");
+  headers.delete("api-key");
+  headers.delete("openai-api-key");
+  headers.delete("anthropic-api-key");
   headers.delete("cookie");
   headers.delete("content-length");
   headers.delete("host");
@@ -686,7 +690,7 @@ function supportsCapability({
       resolveExecutionPath({
         capabilities,
         requestedSurface: "OPENAI_RESPONSES",
-        request: { stream },
+        request: { stream, responsesOperation: "create" },
       }).mode === "native"
     );
   }
@@ -712,7 +716,7 @@ function supportsCapability({
         resolveExecutionPath({
           capabilities,
           requestedSurface: "OPENAI_RESPONSES",
-          request: { stateful: true },
+          request: { stateful: true, responsesOperation: "statefulFollowUps" },
         }).mode === "native"
       );
     return capabilities?.responses?.statefulFollowUps === true;
@@ -724,7 +728,7 @@ function supportsCapability({
         resolveExecutionPath({
           capabilities,
           requestedSurface: "OPENAI_RESPONSES",
-          request: { stateful: true },
+          request: { stateful: true, responsesOperation: "retrieve" },
         }).mode === "native"
       );
     return capabilities?.responses?.retrieve === true;
@@ -736,7 +740,7 @@ function supportsCapability({
         resolveExecutionPath({
           capabilities,
           requestedSurface: "OPENAI_RESPONSES",
-          request: { stateful: true },
+          request: { stateful: true, responsesOperation: "delete" },
         }).mode === "native"
       );
     return capabilities?.responses?.delete === true;
@@ -748,7 +752,7 @@ function supportsCapability({
         resolveExecutionPath({
           capabilities,
           requestedSurface: "OPENAI_RESPONSES",
-          request: { stateful: true },
+          request: { stateful: true, responsesOperation: "cancel" },
         }).mode === "native"
       );
     return capabilities?.responses?.cancel === true;
@@ -760,7 +764,7 @@ function supportsCapability({
         resolveExecutionPath({
           capabilities,
           requestedSurface: "OPENAI_RESPONSES",
-          request: { stateful: true },
+          request: { stateful: true, responsesOperation: "listInputItems" },
         }).mode === "native"
       );
     return capabilities?.responses?.listInputItems === true;
@@ -772,7 +776,7 @@ function supportsCapability({
         resolveExecutionPath({
           capabilities,
           requestedSurface: "OPENAI_RESPONSES",
-          request: { countTokens: true },
+          request: { countTokens: true, responsesOperation: "countTokens" },
         }).mode === "native"
       );
     return capabilities?.responses?.countTokens === true;
@@ -780,7 +784,11 @@ function supportsCapability({
 
   if (capabilities?.version === 3)
     return (
-      resolveExecutionPath({ capabilities, requestedSurface: "OPENAI_RESPONSES" }).mode === "native"
+      resolveExecutionPath({
+        capabilities,
+        requestedSurface: "OPENAI_RESPONSES",
+        request: { responsesOperation: "compact" },
+      }).mode === "native"
     );
   return capabilities?.responses?.compact === true;
 }

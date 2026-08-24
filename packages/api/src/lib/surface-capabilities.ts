@@ -13,6 +13,10 @@ export type SurfaceRequestRequirements = {
   stream?: boolean;
   contextTokens?: number;
   images?: boolean;
+  inputAudio?: boolean;
+  outputAudio?: boolean;
+  inputVideo?: boolean;
+  outputVideo?: boolean;
   tools?: boolean;
   parallelTools?: boolean;
   structuredOutput?: boolean;
@@ -22,7 +26,19 @@ export type SurfaceRequestRequirements = {
   countTokens?: boolean;
   protocolVersion?: string;
   betaFeatures?: readonly string[];
+  responsesOperation?: ResponsesOperation;
+  responseId?: string;
 };
+
+export type ResponsesOperation =
+  | "create"
+  | "statefulFollowUps"
+  | "retrieve"
+  | "delete"
+  | "cancel"
+  | "listInputItems"
+  | "countTokens"
+  | "compact";
 
 export type SurfaceAvailability = {
   requestedSurface?: ModelApiSurface;
@@ -54,9 +70,13 @@ type SurfaceFeatures = {
   stateful?: boolean;
   protocolVersion?: string;
   betaFeatures?: string[];
+  responsesLifecycle?: Partial<Record<Exclude<ResponsesOperation, "create">, boolean>>;
 };
 
-function nativeFeatures(capabilities: OpenAiCompatibleCapabilities, surface: ModelApiSurface) {
+function nativeFeatures(
+  capabilities: OpenAiCompatibleCapabilities,
+  surface: ModelApiSurface,
+): SurfaceFeatures | undefined {
   if (capabilities.version === 3) {
     const key = {
       OPENAI_CHAT_COMPLETIONS: "openaiChatCompletions",
@@ -81,15 +101,47 @@ function operationFor(surface: ModelApiSurface, request: SurfaceRequestRequireme
       method: "POST" as const,
       path: request.countTokens ? "/v1/messages/count_tokens" : "/v1/messages",
     };
-  return {
-    method: "POST" as const,
-    path: request.countTokens ? "/v1/responses/count_tokens" : "/v1/responses",
-  };
+  const responseId = request.responseId ? encodeURIComponent(request.responseId) : ":responseId";
+  switch (request.responsesOperation ?? (request.countTokens ? "countTokens" : "create")) {
+    case "retrieve":
+      return { method: "GET" as const, path: `/v1/responses/${responseId}` };
+    case "delete":
+      return { method: "DELETE" as const, path: `/v1/responses/${responseId}` };
+    case "cancel":
+      return { method: "POST" as const, path: `/v1/responses/${responseId}/cancel` };
+    case "listInputItems":
+      return { method: "GET" as const, path: `/v1/responses/${responseId}/input_items` };
+    case "compact":
+      return { method: "POST" as const, path: `/v1/responses/${responseId}/compact` };
+    case "countTokens":
+      return { method: "POST" as const, path: "/v1/responses/count_tokens" };
+    default:
+      return { method: "POST" as const, path: "/v1/responses" };
+  }
+}
+
+function retrySafetyFor(surface: ModelApiSurface, request: SurfaceRequestRequirements) {
+  if (surface !== "OPENAI_RESPONSES") return "pre_commit_only" as const;
+  switch (request.responsesOperation ?? (request.countTokens ? "countTokens" : "create")) {
+    case "retrieve":
+    case "listInputItems":
+    case "countTokens":
+    case "delete":
+      return "idempotent" as const;
+    case "statefulFollowUps":
+      return "never" as const;
+    default:
+      return "pre_commit_only" as const;
+  }
 }
 
 function adaptedSubsetFailures(request: SurfaceRequestRequirements): string[] {
   const failures: string[] = [];
   for (const key of [
+    "inputAudio",
+    "outputAudio",
+    "inputVideo",
+    "outputVideo",
     "parallelTools",
     "structuredOutput",
     "reasoning",
@@ -113,6 +165,10 @@ function incompatibilities(features: SurfaceFeatures, request: SurfaceRequestReq
     failures.push("context_limit_unknown_or_exceeded");
   for (const key of [
     "images",
+    "inputAudio",
+    "outputAudio",
+    "inputVideo",
+    "outputVideo",
     "tools",
     "parallelTools",
     "structuredOutput",
@@ -196,7 +252,7 @@ export function resolveExecutionPath({
     requestedSurface,
     ...operation,
     requirements: { ...request },
-    retrySafety: "pre_commit_only",
+    retrySafety: retrySafetyFor(requestedSurface, request),
   });
   const matrix = surfaceAvailabilityMatrix({ capabilities, adaptationEnabled });
   const selected = matrix[requestedSurface];
@@ -219,8 +275,15 @@ export function resolveExecutionPath({
       streaming: false,
       limitations: ["surface_unavailable"],
     });
+  const lifecycleOperation =
+    requestedSurface === "OPENAI_RESPONSES" ? request.responsesOperation : undefined;
+  const lifecycleUnsupported =
+    lifecycleOperation && lifecycleOperation !== "create"
+      ? features.responsesLifecycle?.[lifecycleOperation] !== true
+      : false;
   const failures = [
     ...incompatibilities(features, request),
+    ...(lifecycleUnsupported ? [`responses_${lifecycleOperation}_unavailable`] : []),
     ...(selected.mode === "adapted" ? adaptedSubsetFailures(request) : []),
   ];
   const limitations = [...selected.limitations, ...failures];

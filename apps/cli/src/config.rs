@@ -317,6 +317,12 @@ impl TryFrom<RawCapabilities> for OpenAiCompatibleCapabilities {
     type Error = String;
 
     fn try_from(value: RawCapabilities) -> std::result::Result<Self, Self::Error> {
+        if value.version < 3 && value.protocol != "openai-compatible" {
+            return Err(
+                "capability inventory versions 1 and 2 require protocol `openai-compatible`"
+                    .to_string(),
+            );
+        }
         if value.version == 3 && value.surfaces.is_none() {
             return Err("version 3 capabilities require `surfaces`".to_string());
         }
@@ -500,6 +506,27 @@ pub struct SurfaceCapabilities {
     pub protocol_version: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub beta_features: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub responses_lifecycle: Option<ResponsesLifecycleCapabilities>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResponsesLifecycleCapabilities {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stateful_follow_ups: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieve: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancel: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_input_items: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count_tokens: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -734,23 +761,64 @@ impl Config {
             if let Some(auth) = &endpoint.auth {
                 validate_env_name(&auth.env)?;
             }
+            let mut endpoint_header_names = std::collections::BTreeSet::new();
             for header in &endpoint.headers {
                 validate_env_name(&header.env)?;
-                let name = header.name.trim().to_ascii_lowercase();
-                if name == "authorization" || name == "x-api-key" {
+                validate_endpoint_header_name(&endpoint.slug, &endpoint.kind, &header.name)?;
+                if !endpoint_header_names.insert(header.name.to_ascii_lowercase()) {
                     anyhow::bail!(
-                        "endpoint `{}` must configure upstream credentials through typed `auth`, not custom header `{}`",
+                        "endpoint `{}` configures duplicate custom header `{}`",
                         endpoint.slug,
                         header.name
                     );
                 }
             }
-            for profile in std::iter::once(&endpoint.default_capabilities).chain(
-                endpoint
-                    .models
-                    .iter()
-                    .filter_map(|model| model.capabilities.as_ref()),
-            ) {
+            let profiles = std::iter::once(&endpoint.default_capabilities)
+                .chain(
+                    endpoint
+                        .last_probe
+                        .iter()
+                        .map(|probe| &probe.suggested_capabilities),
+                )
+                .chain(endpoint.models.iter().flat_map(|model| {
+                    [
+                        model.capabilities.as_ref(),
+                        model.probe_suggestions.as_ref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                }));
+            for profile in profiles {
+                let expected_protocol = match endpoint.kind {
+                    EndpointKind::OpenAiCompatible => "openai-compatible",
+                    EndpointKind::AnthropicCompatible => "anthropic-compatible",
+                };
+                if !(1..=3).contains(&profile.version) {
+                    anyhow::bail!(
+                        "endpoint `{}` has unsupported capability inventory version {}",
+                        endpoint.slug,
+                        profile.version
+                    );
+                }
+                if profile.version < 3 && profile.protocol != "openai-compatible" {
+                    anyhow::bail!(
+                        "endpoint `{}` capability inventory versions 1 and 2 require protocol `openai-compatible`",
+                        endpoint.slug
+                    );
+                }
+                if profile.version < 3 && endpoint.kind != EndpointKind::OpenAiCompatible {
+                    anyhow::bail!(
+                        "endpoint `{}` is anthropic-compatible and requires capability inventory version 3",
+                        endpoint.slug
+                    );
+                }
+                if profile.version == 3 && profile.protocol != expected_protocol {
+                    anyhow::bail!(
+                        "endpoint `{}` kind `{expected_protocol}` does not match capability protocol `{}`",
+                        endpoint.slug,
+                        profile.protocol
+                    );
+                }
                 if profile.version == 3 && profile.surfaces.is_none() {
                     anyhow::bail!("version 3 capabilities require `surfaces`");
                 }
@@ -764,6 +832,72 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// Environment-backed endpoint headers are deliberately much narrower than
+/// relayed request headers. Protocol headers belong to the server and
+/// credentials belong to `EndpointAuthConfig`, so configuration cannot replace
+/// either one after the server has sanitized and validated a request.
+fn validate_endpoint_header_name(slug: &str, kind: &EndpointKind, raw_name: &str) -> Result<()> {
+    reqwest::header::HeaderName::from_bytes(raw_name.as_bytes())
+        .with_context(|| format!("validating custom header `{raw_name}` for endpoint `{slug}`"))?;
+    let name = raw_name.trim().to_ascii_lowercase();
+
+    const FORBIDDEN: &[&str] = &[
+        "authorization",
+        "proxy-authorization",
+        "proxy-authenticate",
+        "www-authenticate",
+        "cookie",
+        "cookie2",
+        "set-cookie",
+        "set-cookie2",
+        "host",
+        "connection",
+        "keep-alive",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "content-length",
+        "x-api-key",
+        "api-key",
+        "openai-api-key",
+        "anthropic-api-key",
+        "openai-version",
+        "openai-beta",
+        "anthropic-version",
+        "anthropic-beta",
+    ];
+    let credential_like = ["token", "secret", "credential", "password"]
+        .iter()
+        .any(|part| name.contains(part));
+    if name.is_empty()
+        || FORBIDDEN.contains(&name.as_str())
+        || name.starts_with("proxy-")
+        || name.starts_with("sec-")
+        || credential_like
+    {
+        anyhow::bail!(
+            "endpoint `{slug}` cannot configure protected custom header `{raw_name}`; use typed `auth` for credentials"
+        );
+    }
+
+    let allowed = match kind {
+        EndpointKind::OpenAiCompatible => {
+            matches!(name.as_str(), "openai-organization" | "openai-project")
+        }
+        // Anthropic version, beta, and authentication headers are owned by the
+        // validated protocol/auth path. There are currently no safe static
+        // Anthropic endpoint headers whose values should come from secrets.
+        EndpointKind::AnthropicCompatible => false,
+    };
+    if !allowed {
+        anyhow::bail!(
+            "endpoint `{slug}` custom header `{raw_name}` is not allowed for this endpoint kind"
+        );
+    }
+    Ok(())
 }
 
 fn is_false(value: &bool) -> bool {
@@ -848,14 +982,10 @@ mod tests {
     }
 
     #[test]
-    fn typed_auth_is_mutually_exclusive_with_legacy_auth_headers() {
+    fn endpoint_headers_use_kind_specific_allowlists_and_protect_transport() {
         let mut config = Config::default();
         config.endpoints.push(EndpointConfig {
-            slug: "anthropic".to_string(),
-            auth: Some(EndpointAuthConfig {
-                mode: EndpointAuthMode::ApiKey,
-                env: "ANTHROPIC_API_KEY".to_string(),
-            }),
+            slug: "openai".to_string(),
             headers: vec![HeaderEnvRef {
                 name: "Authorization".to_string(),
                 env: "OTHER_KEY".to_string(),
@@ -863,10 +993,100 @@ mod tests {
             ..EndpointConfig::default()
         });
         assert!(config.validate().is_err());
-        config.endpoints[0].headers.clear();
-        config.validate().expect("one typed auth mode is valid");
-        let wire = serde_json::to_value(&config.endpoints[0]).expect("serialize endpoint");
-        assert_eq!(wire["auth"]["mode"], "api-key");
+        for protected in [
+            "Content-Length",
+            "Cookie",
+            "Host",
+            "Proxy-Authorization",
+            "OpenAI-Version",
+            "OpenAI-Beta",
+            "Anthropic-Version",
+            "Anthropic-Beta",
+            "X-Custom-Token",
+            " OpenAI-Project",
+        ] {
+            config.endpoints[0].headers[0].name = protected.to_string();
+            assert!(
+                config.validate().is_err(),
+                "accepted protected `{protected}`"
+            );
+        }
+        config.endpoints[0].headers[0].name = "OpenAI-Organization".to_string();
+        config
+            .validate()
+            .expect("OpenAI account-routing header is allowlisted");
+        config.endpoints[0].headers.push(HeaderEnvRef {
+            name: "openai-organization".to_string(),
+            env: "SECOND_ORG".to_string(),
+        });
+        assert!(
+            config.validate().is_err(),
+            "accepted duplicate header names"
+        );
+        config.endpoints[0].headers.pop();
+
+        config.endpoints[0].kind = EndpointKind::AnthropicCompatible;
+        config.endpoints[0].default_capabilities = serde_json::from_value(serde_json::json!({
+            "version": 3,
+            "protocol": "anthropic-compatible",
+            "surfaces": {}
+        }))
+        .expect("Anthropic capabilities");
+        for protocol_owned in ["Anthropic-Version", "Anthropic-Beta", "OpenAI-Organization"] {
+            config.endpoints[0].headers[0].name = protocol_owned.to_string();
+            assert!(
+                config.validate().is_err(),
+                "accepted non-allowlisted `{protocol_owned}`"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_kind_matches_every_capability_profile() {
+        let anthropic: OpenAiCompatibleCapabilities = serde_json::from_value(serde_json::json!({
+            "version": 3,
+            "protocol": "anthropic-compatible",
+            "surfaces": {}
+        }))
+        .expect("Anthropic capabilities");
+        let mut endpoint = EndpointConfig {
+            slug: "anthropic".to_string(),
+            kind: EndpointKind::AnthropicCompatible,
+            default_capabilities: anthropic.clone(),
+            ..EndpointConfig::default()
+        };
+        let mut config = Config {
+            endpoints: vec![endpoint.clone()],
+            ..Config::default()
+        };
+        config.validate().expect("matching endpoint kind");
+
+        endpoint.models.push(ModelConfig {
+            upstream_model_id: "model".to_string(),
+            probe_suggestions: Some(OpenAiCompatibleCapabilities::default()),
+            ..ModelConfig::default()
+        });
+        config.endpoints[0] = endpoint;
+        assert!(config.validate().is_err());
+
+        config.endpoints[0].models.clear();
+        config.endpoints[0].last_probe = Some(ProbeSnapshot {
+            status: ProbeStatus::Online,
+            models: Vec::new(),
+            suggested_capabilities: OpenAiCompatibleCapabilities::default(),
+        });
+        assert!(config.validate().is_err());
+
+        config.endpoints[0].last_probe = None;
+        config.endpoints[0].kind = EndpointKind::OpenAiCompatible;
+        config.endpoints[0].default_capabilities = OpenAiCompatibleCapabilities {
+            protocol: "anthropic-compatible".to_string(),
+            ..OpenAiCompatibleCapabilities::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "accepted a programmatically constructed legacy protocol mismatch"
+        );
     }
 
     #[test]
@@ -922,6 +1142,8 @@ mod tests {
         for invalid in [
             serde_json::json!({ "version": 4, "protocol": "openai-compatible" }),
             serde_json::json!({ "version": 2, "protocol": "other" }),
+            serde_json::json!({ "version": 1, "protocol": "anthropic-compatible" }),
+            serde_json::json!({ "version": 2, "protocol": "anthropic-compatible" }),
         ] {
             assert!(serde_json::from_value::<OpenAiCompatibleCapabilities>(invalid).is_err());
         }

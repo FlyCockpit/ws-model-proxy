@@ -98,4 +98,90 @@ describe("surface capability resolution", () => {
       }).mode,
     ).toBe("unavailable");
   });
+
+  it("resolves explicit Responses lifecycle operations and retry safety", () => {
+    const capabilities = parseOpenAiCompatibleCapabilities({
+      version: 3,
+      protocol: "openai-compatible",
+      surfaces: {
+        openaiResponses: {
+          source: "declared",
+          confidence: "exact",
+          supported: true,
+          stateful: true,
+          countTokens: true,
+          responsesLifecycle: {
+            statefulFollowUps: true,
+            retrieve: true,
+            delete: true,
+            cancel: false,
+            listInputItems: true,
+            countTokens: true,
+            compact: true,
+          },
+        },
+      },
+    });
+    expect(
+      resolveExecutionPath({
+        capabilities,
+        requestedSurface: "OPENAI_RESPONSES",
+        request: { responsesOperation: "retrieve", responseId: "resp/a" },
+      }),
+    ).toMatchObject({
+      mode: "native",
+      method: "GET",
+      path: "/v1/responses/resp%2Fa",
+      retrySafety: "idempotent",
+    });
+    expect(
+      resolveExecutionPath({
+        capabilities,
+        requestedSurface: "OPENAI_RESPONSES",
+        request: { responsesOperation: "cancel", responseId: "resp_1" },
+      }),
+    ).toMatchObject({ mode: "unavailable", method: "POST", path: "/v1/responses/resp_1/cancel" });
+    expect(
+      resolveExecutionPath({
+        capabilities,
+        requestedSurface: "OPENAI_RESPONSES",
+        request: { stateful: true, responsesOperation: "statefulFollowUps" },
+      }).retrySafety,
+    ).toBe("never");
+  });
+
+  it("checks input and output media modalities directionally", () => {
+    const capabilities = parseOpenAiCompatibleCapabilities({
+      version: 3,
+      protocol: "openai-compatible",
+      surfaces: {
+        openaiResponses: {
+          source: "declared",
+          confidence: "exact",
+          supported: true,
+          images: true,
+          inputAudio: true,
+          outputAudio: false,
+          inputVideo: false,
+          outputVideo: true,
+        },
+      },
+    });
+    for (const request of [{ outputAudio: true }, { inputVideo: true }]) {
+      expect(
+        resolveExecutionPath({
+          capabilities,
+          requestedSurface: "OPENAI_RESPONSES",
+          request,
+        }).mode,
+      ).toBe("unavailable");
+    }
+    expect(
+      resolveExecutionPath({
+        capabilities,
+        requestedSurface: "OPENAI_RESPONSES",
+        request: { images: true, inputAudio: true, outputVideo: true },
+      }).mode,
+    ).toBe("native");
+  });
 });
