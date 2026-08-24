@@ -40,6 +40,15 @@ EOF
 cat > "$TEST_ROOT/bin/psql" <<'EOF'
 #!/bin/sh
 echo psql >> "$ENTRYPOINT_TEST_EVENTS"
+if [ "${PSQL_GRANDCHILD_WAIT:-0}" = "1" ]; then
+  /bin/sh "$ENTRYPOINT_GRANDCHILD_SCRIPT" &
+  grandchild_pid=$!
+  echo "$grandchild_pid" > "$ENTRYPOINT_GRANDCHILD_PID_FILE"
+  trap 'echo psql-term >> "$ENTRYPOINT_TEST_EVENTS"; exit 42' TERM
+  echo psql-ready >> "$ENTRYPOINT_TEST_EVENTS"
+  wait "$grandchild_pid"
+  exit $?
+fi
 if [ "${PSQL_SIGNAL_WAIT:-0}" = "1" ]; then
   trap 'echo psql-term >> "$ENTRYPOINT_TEST_EVENTS"; exit 42' TERM
   echo psql-ready >> "$ENTRYPOINT_TEST_EVENTS"
@@ -54,12 +63,22 @@ while IFS= read -r line; do
   esac
 done
 EOF
+cat > "$TEST_ROOT/bin/schema-grandchild" <<'EOF'
+#!/bin/sh
+trap '' HUP INT TERM
+echo grandchild-ready >> "$ENTRYPOINT_TEST_EVENTS"
+while :; do
+  echo mutation >> "$ENTRYPOINT_MUTATIONS"
+  sleep 0.05
+done
+EOF
 cat > "$TEST_ROOT/bin/app-command" <<'EOF'
 #!/bin/sh
 echo exec >> "$ENTRYPOINT_TEST_EVENTS"
 EOF
 
 chmod +x "$TEST_ROOT/bin/node" "$TEST_ROOT/bin/psql" "$TEST_ROOT/bin/app-command" \
+  "$TEST_ROOT/bin/schema-grandchild" \
   "$TEST_ROOT/app/packages/db/node_modules/.bin/prisma" \
   "$TEST_ROOT/usr/local/bin/docker-entrypoint.sh"
 
@@ -157,6 +176,36 @@ if grep -q '^psql$\|^exec$' "$EVENTS"; then
 fi
 unset NODE_TERM_PARENT
 
+# Every supported signal in the exact background-launch/$! assignment window
+# is handed to the newly created group. The recorded group must disappear
+# before the entrypoint exits, without psql or the application ever starting.
+LAUNCH_PID_FILE="$TEST_ROOT/launch-pid"
+export ENTRYPOINT_TEST_SCHEMA_LAUNCH_PID_FILE="$LAUNCH_PID_FILE"
+for launch_case in HUP:129 INT:130 TERM:143; do
+  launch_signal=${launch_case%%:*}
+  expected_status=${launch_case#*:}
+  : > "$EVENTS"
+  rm -f "$LAUNCH_PID_FILE"
+  export ENTRYPOINT_TEST_SCHEMA_LAUNCH_SIGNAL="$launch_signal"
+  set +e
+  "$TEST_ROOT/usr/local/bin/docker-entrypoint.sh" app-command > "$OUTPUT" 2>&1
+  signal_status=$?
+  set -e
+  if [ "$signal_status" -ne "$expected_status" ]; then
+    echo "Expected launch-window $launch_signal to produce exit $expected_status, got $signal_status" >&2
+    cat "$OUTPUT" >&2
+    exit 1
+  fi
+  launch_pid=$(cat "$LAUNCH_PID_FILE")
+  if kill -0 "-$launch_pid" 2>/dev/null; then
+    echo "Launch-window schema group $launch_pid survived $launch_signal handoff" >&2
+    exit 1
+  fi
+  assert_events ''
+  if grep -q '^exec$' "$EVENTS"; then echo "App started after launch-window interruption" >&2; exit 1; fi
+done
+unset ENTRYPOINT_TEST_SCHEMA_LAUNCH_SIGNAL ENTRYPOINT_TEST_SCHEMA_LAUNCH_PID_FILE
+
 # The PID-1 shell forwards termination to the active psql lock session.
 : > "$EVENTS"
 export APPLY_SCHEMA=safe PSQL_SIGNAL_WAIT=1
@@ -185,5 +234,52 @@ while ! grep -q '^psql-term$' "$EVENTS" 2>/dev/null; do
   sleep 0.01
 done
 if grep -q '^exec$' "$EVENTS"; then echo "App started after interruption" >&2; exit 1; fi
+unset PSQL_SIGNAL_WAIT
+
+# psql exits immediately when TERM arrives, while its live grandchild ignores
+# TERM and keeps mutating. The entrypoint must observe the still-live group,
+# force it down with KILL, and wait for disappearance before it exits.
+: > "$EVENTS"
+MUTATIONS="$TEST_ROOT/mutations"
+GRANDCHILD_PID_FILE="$TEST_ROOT/grandchild-pid"
+: > "$MUTATIONS"
+rm -f "$GRANDCHILD_PID_FILE"
+export PSQL_GRANDCHILD_WAIT=1
+export ENTRYPOINT_GRANDCHILD_SCRIPT="$TEST_ROOT/bin/schema-grandchild"
+export ENTRYPOINT_GRANDCHILD_PID_FILE="$GRANDCHILD_PID_FILE"
+export ENTRYPOINT_MUTATIONS="$MUTATIONS"
+"$TEST_ROOT/usr/local/bin/docker-entrypoint.sh" app-command > "$OUTPUT" 2>&1 &
+ENTRYPOINT_PID=$!
+attempt=0
+while ! grep -q '^grandchild-ready$' "$EVENTS" 2>/dev/null; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 100 ]; then echo "Timed out waiting for schema grandchild" >&2; exit 1; fi
+  sleep 0.01
+done
+grandchild_pid=$(cat "$GRANDCHILD_PID_FILE")
+kill -TERM "$ENTRYPOINT_PID"
+set +e
+wait "$ENTRYPOINT_PID"
+signal_status=$?
+set -e
+ENTRYPOINT_PID=""
+if [ "$signal_status" -ne 143 ]; then
+  echo "Expected grandchild TERM to produce exit 143, got $signal_status" >&2
+  exit 1
+fi
+grep -q '^psql-term$' "$EVENTS"
+if kill -0 "$grandchild_pid" 2>/dev/null; then
+  echo "Schema grandchild $grandchild_pid lingered after entrypoint exit" >&2
+  exit 1
+fi
+mutation_count=$(wc -l < "$MUTATIONS")
+sleep 0.2
+if [ "$(wc -l < "$MUTATIONS")" -ne "$mutation_count" ]; then
+  echo "Schema mutation continued after entrypoint exit" >&2
+  exit 1
+fi
+if grep -q '^exec$' "$EVENTS"; then echo "App started after grandchild interruption" >&2; exit 1; fi
+unset PSQL_GRANDCHILD_WAIT ENTRYPOINT_GRANDCHILD_SCRIPT \
+  ENTRYPOINT_GRANDCHILD_PID_FILE ENTRYPOINT_MUTATIONS
 
 echo "Docker entrypoint schema control-flow validation complete."

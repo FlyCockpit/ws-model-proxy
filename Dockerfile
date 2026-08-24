@@ -12,6 +12,7 @@ ARG APT_CACHE_DATE=static
 RUN echo "APT cache date: ${APT_CACHE_DATE}" && apt-get update -y && apt-get upgrade -y && apt-get install -y \
   openssl \
   postgresql-client \
+  util-linux \
   && rm -rf /var/lib/apt/lists/*
 
 # --- Build-time base ---

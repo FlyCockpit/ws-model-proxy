@@ -78,25 +78,44 @@ if [ "$APPLY_SCHEMA" != "off" ]; then
   echo 1 > "$STATUS_FILE"
   HARDEN_STATUS_FILE=$(mktemp)
   echo 0 > "$HARDEN_STATUS_FILE"
+  SCHEMA_LAUNCH_DIR=$(mktemp -d)
+  SCHEMA_LAUNCH_GATE="$SCHEMA_LAUNCH_DIR/start"
+  mkfifo "$SCHEMA_LAUNCH_GATE"
 
   schema_child_pid=""
   schema_signal_status=""
+  schema_launch_phase="preparing"
+  schema_pending_signal=""
   cleanup_schema_files() {
     rm -f "$STATUS_FILE" "$HARDEN_STATUS_FILE"
+    rm -rf "$SCHEMA_LAUNCH_DIR"
   }
   handle_schema_signal() {
     signal_name=$1
     signal_status=$2
     schema_signal_status=$signal_status
-    if [ -n "$schema_child_pid" ]; then
-      kill "-$signal_name" "$schema_child_pid" 2>/dev/null || true
-      return
-    fi
-
-    # A signal may arrive while preparing the psql environment, before there
-    # is a child to forward it to. Do not swallow it and continue into schema
-    # sync (or application startup); exit with the conventional shell status.
-    exit "$signal_status"
+    # Always retain the actual signal. In particular, a trap can run while the
+    # FIFO writer is blocked even though the launch phase is already `running`.
+    # The gate recovery path must not silently turn HUP or INT into TERM.
+    schema_pending_signal=$signal_name
+    case "$schema_launch_phase" in
+      launching)
+        # The background command has been requested but POSIX sh has not yet
+        # executed the following `$!` assignment. Remember the signal so the
+        # newly created process group is terminated as soon as its ID is known.
+        ;;
+      running)
+        # psql is a session/process-group leader. Signal the whole group so a
+        # live `\!` shell, Prisma, and schema-hardening process cannot outlive
+        # the advisory-lock session and keep mutating the database.
+        kill "-$signal_name" "-$schema_child_pid" 2>/dev/null || true
+        ;;
+      *)
+        # Before launch there is no schema process to clean up. Do not swallow
+        # the signal and continue into schema sync or application startup.
+        exit "$signal_status"
+        ;;
+    esac
   }
   trap cleanup_schema_files EXIT
   trap 'handle_schema_signal HUP 129' HUP
@@ -140,13 +159,60 @@ if [ "$APPLY_SCHEMA" != "off" ]; then
   ')" || { echo "FATAL: could not parse DATABASE_URL for psql." >&2; exit 1; }
   eval "$pg_env"
 
-  psql -v ON_ERROR_STOP=1 <<EOF &
+  schema_launch_phase="launching"
+  # `setsid` gives the complete schema-sync subtree a private process group.
+  # The FIFO is a launch barrier: no database operation can start until this
+  # parent has recorded `$!` as the group ID and handled any pending signal.
+  setsid sh -c '
+    launch_gate=$1
+    shift
+    IFS= read -r launch_token < "$launch_gate" || exit 125
+    [ "$launch_token" = start ] || exit 125
+    exec "$@"
+  ' schema-launch "$SCHEMA_LAUNCH_GATE" psql -v ON_ERROR_STOP=1 <<EOF &
 SET lock_timeout = '300s';
 SELECT pg_advisory_lock($LOCK_ID);
 \! cd "$DB_PACKAGE_DIR" && node_modules/.bin/prisma db push $push_flags; push_status=\$?; echo \$push_status > "$STATUS_FILE"; if [ "\$push_status" -eq 0 ]; then node scripts/apply-schema-hardening.mjs; echo \$? > "$HARDEN_STATUS_FILE"; fi
 SELECT pg_advisory_unlock($LOCK_ID);
 EOF
+  # Executable tests use this narrow hook to deliver a signal in the otherwise
+  # instruction-sized gap before `$!` is copied. It is intentionally limited
+  # to signals (not arbitrary commands) and is unset in production.
+  case "${ENTRYPOINT_TEST_SCHEMA_LAUNCH_SIGNAL:-}" in
+    HUP|INT|TERM)
+      if [ -n "${ENTRYPOINT_TEST_SCHEMA_LAUNCH_PID_FILE:-}" ]; then
+        echo "$!" > "$ENTRYPOINT_TEST_SCHEMA_LAUNCH_PID_FILE"
+      fi
+      kill "-${ENTRYPOINT_TEST_SCHEMA_LAUNCH_SIGNAL}" "$$"
+      ;;
+    "") ;;
+    *)
+      echo "FATAL: invalid entrypoint launch test signal." >&2
+      exit 2
+      ;;
+  esac
   schema_child_pid=$!
+  schema_launch_phase="running"
+  if [ -n "$schema_pending_signal" ]; then
+    kill "-$schema_pending_signal" "-$schema_child_pid" 2>/dev/null || true
+  else
+    # Opening the FIFO may itself be interrupted by a signal. Keep `set -e`
+    # from bypassing the signal handoff, then re-check the trap state before
+    # allowing the normal wait path to proceed.
+    set +e
+    echo start > "$SCHEMA_LAUNCH_GATE"
+    launch_gate_status=$?
+    set -e
+    if [ -n "$schema_signal_status" ]; then
+      kill "-$schema_pending_signal" "-$schema_child_pid" 2>/dev/null || true
+    elif [ "$launch_gate_status" -ne 0 ]; then
+      kill -TERM "-$schema_child_pid" 2>/dev/null || true
+      wait "$schema_child_pid" 2>/dev/null || true
+      echo "FATAL: could not release schema-sync launch gate." >&2
+      exit "$launch_gate_status"
+    fi
+  fi
+  rm -rf "$SCHEMA_LAUNCH_DIR"
   set +e
   wait "$schema_child_pid"
   psql_status=$?
@@ -154,8 +220,34 @@ EOF
     # Some shells interrupt wait as soon as the trap runs. Reap the forwarded
     # child before exiting so the lock session cannot outlive PID 1.
     wait "$schema_child_pid" 2>/dev/null
+
+    # psql can exit before a `\!` descendant has handled the forwarded signal.
+    # Wait briefly for the private group to drain, then force any remaining
+    # schema-only descendants down. This never targets the entrypoint or app.
+    drain_attempt=0
+    while kill -0 "-$schema_child_pid" 2>/dev/null; do
+      drain_attempt=$((drain_attempt + 1))
+      if [ "$drain_attempt" -ge 50 ]; then
+        kill -KILL "-$schema_child_pid" 2>/dev/null || true
+        break
+      fi
+      sleep 0.1
+    done
+
+    # KILL is asynchronous. Do not let PID 1 exit (and potentially let the app
+    # supervisor restart it) until the schema process group has actually gone.
+    kill_attempt=0
+    while kill -0 "-$schema_child_pid" 2>/dev/null; do
+      kill_attempt=$((kill_attempt + 1))
+      if [ "$kill_attempt" -ge 50 ]; then
+        echo "FATAL: schema-sync process group $schema_child_pid survived SIGKILL." >&2
+        break
+      fi
+      sleep 0.1
+    done
   fi
   set -e
+  schema_launch_phase="done"
   schema_child_pid=""
   trap - HUP INT TERM
 
