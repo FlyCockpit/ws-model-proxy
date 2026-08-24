@@ -2,6 +2,7 @@
 set -eu
 
 REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+REAL_NODE=$(command -v node)
 TEST_ROOT=$(mktemp -d)
 ENTRYPOINT_PID=""
 WATCHDOG_PID=""
@@ -50,6 +51,9 @@ cp "$REPO_ROOT/scripts/docker-entrypoint.sh" "$TEST_ROOT/usr/local/bin/docker-en
 cat > "$TEST_ROOT/bin/node" <<'EOF'
 #!/bin/sh
 if [ "${1:-}" = "-e" ]; then
+  case "${2:-}" in
+    *ENTRYPOINT_SIGNAL_RESET_LAUNCHER*) exec "$ENTRYPOINT_TEST_REAL_NODE" "$@" ;;
+  esac
   if [ "${NODE_TERM_PARENT:-0}" = "1" ]; then
     echo node-term-parent >> "$ENTRYPOINT_TEST_EVENTS"
     kill -TERM "$PPID"
@@ -112,6 +116,7 @@ chmod +x "$TEST_ROOT/bin/node" "$TEST_ROOT/bin/psql" "$TEST_ROOT/bin/app-command
 EVENTS="$TEST_ROOT/events"
 OUTPUT="$TEST_ROOT/output"
 export ENTRYPOINT_TEST_EVENTS="$EVENTS"
+export ENTRYPOINT_TEST_REAL_NODE="$REAL_NODE"
 export DATABASE_URL='postgresql://test@example.invalid/test'
 export APP_ROOT="$TEST_ROOT/app"
 export PATH="$TEST_ROOT/bin:$PATH"
@@ -120,11 +125,35 @@ export ENTRYPOINT_TEST_SCHEMA_LAUNCH_PID_FILE="$SCHEMA_PID_FILE"
 start_entrypoint() {
   rm -f "$WATCHDOG_DONE" "$WATCHDOG_FIRED" "$SCHEMA_PID_FILE"
   # Reset dispositions that POSIX shells may set to ignored for asynchronous
-  # commands, so the HUP/INT/TERM scenarios exercise the entrypoint traps. A
-  # child shell cannot portably undo an ignored disposition inherited from
-  # this shell, whereas GNU env resets it before executing the entrypoint.
-  env --default-signal=HUP --default-signal=INT --default-signal=TERM \
-    "$TEST_ROOT/usr/local/bin/docker-entrypoint.sh" app-command > "$OUTPUT" 2>&1 &
+  # commands, so the HUP/INT/TERM scenarios exercise the entrypoint traps.
+  # Prefer GNU env when available. Node provides a portable fallback: installing
+  # handlers changes ignored dispositions to caught ones, which exec resets to
+  # their defaults in the spawned entrypoint. The wrapper then forwards signals.
+  if [ "${FORCE_NODE_SIGNAL_RESET:-0}" != "1" ] && \
+    env --default-signal=HUP --default-signal=INT --default-signal=TERM true \
+      >/dev/null 2>&1; then
+    env --default-signal=HUP --default-signal=INT --default-signal=TERM \
+      "$TEST_ROOT/usr/local/bin/docker-entrypoint.sh" app-command > "$OUTPUT" 2>&1 &
+  else
+    node -e '
+      // ENTRYPOINT_SIGNAL_RESET_LAUNCHER
+      const { constants } = require("node:os");
+      const { spawn } = require("node:child_process");
+      const signals = ["SIGHUP", "SIGINT", "SIGTERM"];
+      let child;
+      for (const signal of signals) {
+        process.on(signal, () => child?.kill(signal));
+      }
+      child = spawn(process.argv[1], process.argv.slice(2), { stdio: "inherit" });
+      child.once("error", (error) => {
+        console.error(error.message);
+        process.exit(1);
+      });
+      child.once("exit", (code, signal) => {
+        process.exit(code ?? 128 + constants.signals[signal]);
+      });
+    ' "$TEST_ROOT/usr/local/bin/docker-entrypoint.sh" app-command > "$OUTPUT" 2>&1 &
+  fi
   ENTRYPOINT_PID=$!
   (
     watchdog_attempt=0
@@ -262,7 +291,8 @@ unset ENTRYPOINT_TEST_SCHEMA_EXIT_BEFORE_GATE
 # is handed to the newly created group. The recorded group must disappear
 # before the entrypoint exits, without psql or the application ever starting.
 LAUNCH_PID_FILE="$SCHEMA_PID_FILE"
-export ENTRYPOINT_TEST_SCHEMA_LAUNCH_PID_FILE="$LAUNCH_PID_FILE"
+export ENTRYPOINT_TEST_SCHEMA_LAUNCH_PID_FILE="$LAUNCH_PID_FILE" \
+  FORCE_NODE_SIGNAL_RESET=1
 for launch_case in HUP:129 INT:130 TERM:143; do
   launch_signal=${launch_case%%:*}
   expected_status=${launch_case#*:}
@@ -295,11 +325,11 @@ for launch_case in HUP:129 INT:130 TERM:143; do
   assert_events ''
   if grep -q '^exec$' "$EVENTS"; then echo "App started after launch-window interruption" >&2; exit 1; fi
 done
-unset ENTRYPOINT_TEST_SCHEMA_LAUNCH_SIGNAL
+unset ENTRYPOINT_TEST_SCHEMA_LAUNCH_SIGNAL FORCE_NODE_SIGNAL_RESET
 
 # The PID-1 shell forwards termination to the active psql lock session.
 : > "$EVENTS"
-export APPLY_SCHEMA=safe PSQL_SIGNAL_WAIT=1
+export APPLY_SCHEMA=safe PSQL_SIGNAL_WAIT=1 FORCE_NODE_SIGNAL_RESET=1
 start_entrypoint
 attempt=0
 while ! grep -q '^psql-ready$' "$EVENTS" 2>/dev/null; do
@@ -321,7 +351,7 @@ while ! grep -q '^psql-term$' "$EVENTS" 2>/dev/null; do
   sleep 0.01
 done
 if grep -q '^exec$' "$EVENTS"; then echo "App started after interruption" >&2; exit 1; fi
-unset PSQL_SIGNAL_WAIT
+unset PSQL_SIGNAL_WAIT FORCE_NODE_SIGNAL_RESET
 
 # psql exits immediately when TERM arrives, while its live grandchild ignores
 # TERM and keeps mutating. The entrypoint must observe the still-live group,
