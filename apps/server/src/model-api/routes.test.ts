@@ -3089,6 +3089,64 @@ describe("model API routes", () => {
     );
   });
 
+  it("uses a bounded native Responses count before direct admission", async () => {
+    const manager = new FakeRelayManager();
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async (attempt) => {
+        const candidate = attempt.candidates[0]!;
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: "native-count-lease",
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      }),
+      release: vi.fn().mockResolvedValue(true),
+      hold: vi.fn((response) => response),
+    };
+    const responsePromise = appWith(manager, true, false, capacityRuntime).request("/responses", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: directTarget.modelId, input: "hello" }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const count = requireSent(manager);
+    expect(count.path).toBe("/v1/responses/count_tokens");
+    expect(sentHeader(count, "authorization")).toBeUndefined();
+    expect(capacityRuntime.acquire).not.toHaveBeenCalled();
+    manager.headers(count.requestId, 200, { "content-type": "application/json" });
+    manager.body(count.requestId, JSON.stringify({ input_tokens: 7 }));
+    manager.complete(count.requestId);
+
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(2));
+    expect(capacityRuntime.acquire).toHaveBeenCalledTimes(1);
+    const inference = requireSent(manager, 1);
+    expect(inference.path).toBe("/v1/responses");
+    manager.headers(inference.requestId, 200, { "content-type": "application/json" });
+    const response = await responsePromise;
+    manager.body(inference.requestId, JSON.stringify({ id: "resp", object: "response" }));
+    manager.complete(inference.requestId);
+    await response.text();
+    expect(db.relayRequest.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          contextTokenCount: 7,
+          contextCountMethod: "NATIVE",
+          contextCountConfidence: "EXACT",
+          contextCountExact: true,
+        }),
+      }),
+    );
+  });
+
   it("filters over-context pool members before admission", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
@@ -3153,6 +3211,88 @@ describe("model API routes", () => {
     manager.body(sent.requestId, JSON.stringify({ id: "chatcmpl", choices: [] }));
     manager.complete(sent.requestId);
     await response.text();
+  });
+
+  it("uses per-target native counts to filter pool admission candidates", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "large-count",
+        discoveredModelId: "large-model",
+        upstreamModelId: "large-upstream",
+        cliDeviceId: "cli-large",
+        capacityContextCeiling: 50,
+      }),
+      poolMemberRow({
+        id: "small-count",
+        discoveredModelId: "small-model",
+        upstreamModelId: "small-upstream",
+        cliDeviceId: "cli-small",
+        capacityContextCeiling: 50,
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-large", "cli-small"];
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async (attempt) => {
+        const candidate = attempt.candidates[0]!;
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: "pool-native-count-lease",
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      }),
+      release: vi.fn().mockResolvedValue(true),
+      hold: vi.fn((response) => response),
+    };
+    const responsePromise = appWith(manager, true, false, capacityRuntime).request("/responses", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: JSON.stringify({ model: poolTarget.modelId, input: "hello" }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(2));
+    for (const sent of manager.sent) {
+      expect(sent.path).toBe("/v1/responses/count_tokens");
+      manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+      manager.body(
+        sent.requestId,
+        JSON.stringify({ input_tokens: sent.cliDeviceId === "cli-large" ? 100 : 10 }),
+      );
+      manager.complete(sent.requestId);
+    }
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(3));
+    expect(capacityRuntime.acquire).toHaveBeenCalledWith(
+      expect.objectContaining({
+        candidates: [expect.objectContaining({ poolMemberId: "small-count" })],
+      }),
+      expect.anything(),
+    );
+    const inference = requireSent(manager, 2);
+    expect(inference.cliDeviceId).toBe("cli-small");
+    manager.headers(inference.requestId, 200, { "content-type": "application/json" });
+    const response = await responsePromise;
+    manager.body(inference.requestId, JSON.stringify({ id: "resp", object: "response" }));
+    manager.complete(inference.requestId);
+    await response.text();
+    expect(db.relayRequest.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          contextTokenCount: 10,
+          contextCountMethod: "NATIVE",
+          contextCountExact: true,
+        }),
+      }),
+    );
   });
 
   it("replays a spooled transcription across compatible pool members and accounts both attempts", async () => {

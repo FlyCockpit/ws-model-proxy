@@ -208,6 +208,7 @@ type RelayOperation = {
   anthropicIngress?: AnthropicIngress;
   dispose?: () => Promise<void>;
   contextCount?: ContextCountTelemetry;
+  contextInput?: JsonObject;
   adaptation?: {
     featureEnabled: boolean;
     poolEnabled: boolean;
@@ -324,6 +325,118 @@ function responseBodyForOperation({
       return reader.cancel(reason);
     },
   });
+}
+
+const NATIVE_CONTEXT_COUNT_MAX_BYTES = 64 * 1024;
+
+async function readBoundedJson(
+  stream: ReadableStream<Uint8Array>,
+  maximumBytes: number,
+): Promise<unknown> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    length += chunk.value.byteLength;
+    if (length > maximumBytes) {
+      await reader.cancel("native_count_response_too_large");
+      throw new Error("Native count response exceeds its size limit.");
+    }
+    chunks.push(chunk.value);
+  }
+  const body = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body));
+}
+
+async function nativeContextCount({
+  request,
+  selected,
+  operation,
+  manager,
+}: {
+  request: Request;
+  selected: DirectModelRelayRow;
+  operation: RelayOperation;
+  manager: NonNullable<ModelApiRouteDependencies["manager"]>;
+}): Promise<ContextCountTelemetry | null> {
+  if (!operation.contextInput) return null;
+  if (
+    operation.capability === "responses.countTokens" ||
+    operation.capability === "messages.countTokens"
+  )
+    return null;
+  const countCapability =
+    operation.family === "responses"
+      ? ("responses.countTokens" as const)
+      : operation.family === "messages"
+        ? ("messages.countTokens" as const)
+        : null;
+  if (!countCapability) return null;
+  const countOperation: RelayOperation = {
+    family: operation.family,
+    method: "POST",
+    path:
+      operation.family === "responses" ? "/v1/responses/count_tokens" : "/v1/messages/count_tokens",
+    capability: countCapability,
+    stream: false,
+    buildRequest: operation.buildRequest,
+  };
+  if (
+    !supportsOperation({
+      capabilities: effectiveDirectCapabilities(selected),
+      operation: countOperation,
+    })
+  ) {
+    return null;
+  }
+  let built: BuiltRelayRequest | undefined;
+  let attempt: ReturnType<typeof startRelayAttempt> | undefined;
+  try {
+    built = await operation.buildRequest(selected.upstreamModelId);
+    if (!(built.body instanceof Uint8Array)) return null;
+    attempt = startRelayAttempt({
+      manager,
+      cliDeviceId: selected.Endpoint.cliDeviceId,
+      endpointSlug: selected.Endpoint.slug,
+      family: operation.family,
+      method: "POST",
+      path: countOperation.path,
+      headers: built.headers,
+      body: built.body,
+      timeoutMs: 5_000,
+      abortSignal: request.signal,
+    });
+    const started = await attempt.started;
+    if (started.status < 200 || started.status >= 300) {
+      await started.body.cancel("native_count_status");
+      await attempt.terminal;
+      return null;
+    }
+    const payload = await readBoundedJson(started.body, NATIVE_CONTEXT_COUNT_MAX_BYTES);
+    const terminal = await attempt.terminal;
+    if (!terminal.ok || !isJsonObject(payload)) return null;
+    const tokens = payload.input_tokens;
+    if (!Number.isSafeInteger(tokens) || (tokens as number) < 0) return null;
+    return {
+      tokens: tokens as number,
+      method: "NATIVE",
+      exact: true,
+      confidence: "EXACT",
+      safetyMargin: 1,
+      serializedChars: JSON.stringify(operation.contextInput).length,
+    };
+  } catch {
+    attempt?.cancel(request.signal.aborted ? "cancelled" : "protocol_error");
+    if (request.signal.aborted) throw request.signal.reason;
+    return null;
+  }
 }
 
 type PreparedModeledRequest = {
@@ -1430,6 +1543,23 @@ async function updateRelayMetadata(relayRequestId: string, update: RelayMetadata
   });
 }
 
+async function updateContextCountMetadata(
+  relayRequestId: string,
+  contextCount: ContextCountTelemetry,
+) {
+  await prisma.relayRequest.update({
+    where: { id: relayRequestId },
+    data: {
+      contextTokenCount: contextCount.tokens,
+      contextCountMethod: contextCount.method,
+      contextCountConfidence: contextCount.confidence,
+      contextCountExact: contextCount.exact,
+      contextSafetyMargin: contextCount.safetyMargin,
+      contextSerializedChars: contextCount.serializedChars,
+    },
+  });
+}
+
 function terminalStatus(terminal: RelayAttemptTerminal): "SUCCEEDED" | "FAILED" | "CANCELED" {
   if (terminal.failure === "cancelled") return "CANCELED";
   return terminal.ok ? "SUCCEEDED" : "FAILED";
@@ -2120,6 +2250,20 @@ async function relayDirect({
     return operationFailureResponse(operation, "disconnected");
   }
 
+  if (operation.contextInput) {
+    try {
+      const exactCount = await nativeContextCount({ request, selected, operation, manager });
+      if (exactCount) {
+        operation.contextCount = exactCount;
+        await updateContextCountMetadata(relayRequestId, exactCount);
+      }
+    } catch {
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "cancelled" });
+      return operationFailureResponse(operation, "cancelled");
+    }
+  }
+
   let capacityLease: Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>> | undefined;
   if (capacityRuntime) {
     const identity = selected.ExecutionTarget;
@@ -2330,10 +2474,35 @@ async function relayPool({
   let globalLease: ModelApiLimitLease | undefined;
 
   const members = await poolMemberRows(target.id);
+  const nativeCounts = new Map<string, ContextCountTelemetry>();
+  if (operation.contextInput) {
+    await Promise.all(
+      members.map(async (member) => {
+        const selected = {
+          ...member.DiscoveredModel,
+          optimisticBasicTranscription: false,
+          ExecutionTarget: member.ExecutionTarget,
+          Endpoint: {
+            ...member.DiscoveredModel.Endpoint,
+            status: member.DiscoveredModel.Endpoint.status ?? null,
+            CliDevice: member.DiscoveredModel.Endpoint.CliDevice ?? null,
+          },
+        } satisfies DirectModelRelayRow;
+        if (!isEndpointConnected(selected, new Set(manager.getActiveCliDeviceIds()))) return;
+        try {
+          const count = await nativeContextCount({ request, selected, operation, manager });
+          if (count) nativeCounts.set(member.id, count);
+        } catch {
+          // The request-level abort is handled by admission/relay below; an
+          // individual unavailable counter safely retains the estimate.
+        }
+      }),
+    );
+  }
   const contextEligibleMembers = operation.contextCount
     ? members.filter((member) =>
         contextFitsLimits({
-          count: operation.contextCount!,
+          count: nativeCounts.get(member.id) ?? operation.contextCount!,
           physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
           effectiveContextCeiling: member.capacityContextCeiling,
           contextMargin: member.capacityContextMargin ?? 0,
@@ -2472,6 +2641,12 @@ async function relayPool({
   const memberById = new Map(eligibleMembers.map((member) => [member.id, member] as const));
   let capacityLease: Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>> | undefined;
   let selectedRouteCandidates = routeCandidates;
+  const applyMemberContextCount = async (poolMemberId: string) => {
+    const count = nativeCounts.get(poolMemberId);
+    if (!count) return;
+    operation.contextCount = count;
+    await updateContextCountMetadata(relayRequestId, count);
+  };
   if (capacityRuntime) {
     const admissionCandidates = routeCandidates.map((candidate, candidateOrder) => {
       const member = memberById.get(candidate.poolMemberId);
@@ -2518,6 +2693,7 @@ async function relayPool({
       return operationFailureResponse(operation, "rate_limited");
     }
     const selectedPoolMemberId = capacityLease.lease.poolMemberId;
+    await applyMemberContextCount(selectedPoolMemberId);
     selectedRouteCandidates = [
       ...routeCandidates.filter(({ poolMemberId }) => poolMemberId === selectedPoolMemberId),
       ...routeCandidates.filter(({ poolMemberId }) => poolMemberId !== selectedPoolMemberId),
@@ -2592,6 +2768,7 @@ async function relayPool({
         break;
       }
       const admittedPoolMemberId = capacityLease.lease.poolMemberId;
+      await applyMemberContextCount(admittedPoolMemberId);
       const selectedIndex = selectedRouteCandidates.findIndex(
         ({ poolMemberId }, index) =>
           index >= candidateIndex && poolMemberId === admittedPoolMemberId,
@@ -3833,6 +4010,7 @@ async function relayPreparedModeledRequest({
       transcriptionProfile: prepared.transcriptionProfile,
       dispose: prepared.dispose,
       contextCount,
+      contextInput: capacityRuntime ? (prepared.payload ?? undefined) : undefined,
     };
     return relayDirect({
       request,
@@ -3886,6 +4064,7 @@ async function relayPreparedModeledRequest({
       transcriptionProfile: prepared.transcriptionProfile,
       dispose: prepared.dispose,
       contextCount,
+      contextInput: capacityRuntime ? (prepared.payload ?? undefined) : undefined,
       ...(prepared.payload &&
       (operation.family === "chat.completions" ||
         (operation.family === "responses" && operation.capability === "responses.create") ||
