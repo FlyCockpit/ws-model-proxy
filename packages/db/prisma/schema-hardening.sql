@@ -79,8 +79,8 @@ ALTER TABLE admission_request ADD CONSTRAINT admission_request_shape_check CHECK
     OR ("sourceKind" = 'POOL' AND "poolId" IS NOT NULL
         AND "directExecutionTargetId" IS NULL))
   AND ("deadlineAt" IS NULL OR "deadlineAt" >= "enqueuedAt")
-  AND ((state = 'TERMINAL' AND "terminalAt" IS NOT NULL)
-    OR (state <> 'TERMINAL' AND "terminalAt" IS NULL))
+  AND ((state IN ('CANCELLED', 'EXPIRED', 'TERMINAL') AND "terminalAt" IS NOT NULL)
+    OR (state IN ('WAITING', 'ADMITTED') AND "terminalAt" IS NULL))
 );
 
 ALTER TABLE capacity_waiter DROP CONSTRAINT IF EXISTS capacity_waiter_shape_check;
@@ -166,7 +166,7 @@ BEGIN
     RAISE EXCEPTION 'capacity admission references must share owner and physical capacity'
       USING ERRCODE = '23514';
   END IF;
-  IF TG_TABLE_NAME = 'capacity_lease' AND NOT EXISTS (
+  IF TG_TABLE_NAME IN ('capacity_waiter', 'capacity_lease') AND NOT EXISTS (
     SELECT 1 FROM admission_request request
      WHERE request.id = NEW."admissionRequestId"
        AND request."requestId" = NEW."requestId"
@@ -214,7 +214,7 @@ FOR EACH ROW EXECUTE FUNCTION enforce_capacity_reference_consistency();
 
 DROP TRIGGER IF EXISTS capacity_lease_reference_consistency ON capacity_lease;
 CREATE TRIGGER capacity_lease_reference_consistency
-BEFORE INSERT OR UPDATE OF "userId", "admissionRequestId", "capacityId",
+BEFORE INSERT OR UPDATE OF "userId", "admissionRequestId", "requestId", "attemptId", "capacityId",
   "executionTargetId", "poolId", "poolMemberId" ON capacity_lease
 FOR EACH ROW EXECUTE FUNCTION enforce_capacity_reference_consistency();
 
