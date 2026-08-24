@@ -663,6 +663,67 @@ describe("model API routes", () => {
     expect(text).toContain("data: [DONE]");
   });
 
+  it("renders one requested-protocol error when adapted SSE fails after commitment", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "responses-member",
+        discoveredModelId: "responses-model",
+        upstreamModelId: "upstream-responses",
+        cliDeviceId: "cli-responses",
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiResponses: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+            },
+          },
+        },
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-responses"];
+    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        stream: true,
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    manager.headers(sent.requestId, 200, { "content-type": "text/event-stream" });
+    const first = responsesConformanceFixture.events[0];
+    if (!first) throw new Error("Expected a conformance event.");
+    manager.body(
+      sent.requestId,
+      `${first.event ? `event: ${first.event}\n` : ""}data: ${JSON.stringify(first.data)}\n\n`,
+    );
+    const response = await responsePromise;
+    manager.body(sent.requestId, 'event: response.unknown\ndata: {"type":"response.unknown"}\n\n');
+    manager.complete(sent.requestId);
+    const text = await response.text();
+    expect(text.match(/"code":"protocol_error"/g)).toHaveLength(1);
+    expect(text).not.toContain("data: [DONE]");
+    expect(manager.sent).toHaveLength(1);
+    await vi.waitFor(() =>
+      expect(db.relayRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: "FAILED", errorClass: "protocol_error" }),
+        }),
+      ),
+    );
+  });
+
   it("prefers native members, then falls back to an adaptable member before commitment", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],

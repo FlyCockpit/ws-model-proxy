@@ -104,6 +104,7 @@ import {
 import {
   AdapterError,
   adaptNonstreamResponse,
+  CanonicalStreamRenderer,
   createProtocolAdaptationTransform,
   type ProtocolSurface,
   parseCanonicalRequest,
@@ -968,10 +969,12 @@ async function readAdaptedNonstreamBody({
 
 async function primeReadableStream(
   stream: ReadableStream<Uint8Array>,
+  target: ProtocolSurface,
 ): Promise<{ body: ReadableStream<Uint8Array>; completion: Promise<void> }> {
   const reader = stream.getReader();
   const first = await reader.read();
   let pending = first.done ? null : first.value;
+  let terminalObserved = pending ? targetStreamTerminal(target, pending) : false;
   let resolveCompletion: () => void = () => undefined;
   let rejectCompletion: (error: Error) => void = () => undefined;
   const completion = new Promise<void>((resolve, reject) => {
@@ -991,10 +994,25 @@ async function primeReadableStream(
         if (next.done) {
           resolveCompletion();
           controller.close();
-        } else controller.enqueue(next.value);
+        } else {
+          terminalObserved ||= targetStreamTerminal(target, next.value);
+          controller.enqueue(next.value);
+        }
       } catch (error) {
         rejectCompletion(error instanceof Error ? error : new Error(String(error)));
-        controller.error(error);
+        if (!terminalObserved) {
+          const renderer = new CanonicalStreamRenderer(target);
+          for (const chunk of renderer.push({
+            type: "error",
+            error: {
+              code: "protocol_error",
+              message: "The upstream stream violated the adapted protocol.",
+              upstreamStatus: 502,
+            },
+          }))
+            controller.enqueue(chunk);
+        }
+        controller.close();
       }
     },
     async cancel(reason) {
@@ -1003,6 +1021,14 @@ async function primeReadableStream(
     },
   });
   return { body, completion };
+}
+
+function targetStreamTerminal(target: ProtocolSurface, chunk: Uint8Array): boolean {
+  const text = new TextDecoder().decode(chunk);
+  if (target === "openai-chat") return text.includes("data: [DONE]");
+  if (target === "openai-responses")
+    return /event: (?:response\.(?:completed|incomplete|failed)|error)\r?\n/.test(text);
+  return /event: (?:message_stop|error)\r?\n/.test(text);
 }
 
 function executionPathForPoolMember(
@@ -2447,6 +2473,7 @@ async function relayPool({
               headers: started.headers,
               signal: request.signal,
             }),
+            operation.adaptation.requestedSurface,
           );
           primedAdaptedStream = primed.body;
           adaptationCompletion = primed.completion;
@@ -2505,7 +2532,7 @@ async function relayPool({
         })
         .catch(metadataUpdateError);
       void finalize;
-      const responseHeaders = new Headers(started.headers);
+      let responseHeaders = new Headers(started.headers);
       let responseBody = primedAdaptedStream
         ? primedAdaptedStream
         : validatedAdaptedNonstream
@@ -2522,6 +2549,7 @@ async function relayPool({
               operation,
             });
       if (adaptedSource && operation.adaptation) {
+        const sourceHeaders = responseHeaders;
         const adaptedStreaming =
           operation.stream &&
           responseHeaders.get("content-type")?.toLowerCase().startsWith("text/event-stream") ===
@@ -2536,28 +2564,19 @@ async function relayPool({
             headers: responseHeaders,
             signal: request.signal,
           });
+        responseHeaders = new Headers();
         responseHeaders.set(
           "content-type",
           adaptedStreaming ? "text/event-stream; charset=utf-8" : "application/json; charset=utf-8",
         );
         responseHeaders.set("x-wsmp-adapter-version", "1.0.0");
         responseHeaders.set("x-wsmp-adapter-limitations", "strict_common_subset");
-        for (const name of [
-          "content-encoding",
-          "content-disposition",
-          "content-length",
-          "etag",
-          "last-modified",
-          "content-md5",
-          "digest",
-        ])
-          responseHeaders.delete(name);
+        const retryAfter = sourceHeaders.get("retry-after");
+        if (retryAfter) responseHeaders.set("retry-after", retryAfter);
         const sourceRequestId =
           adaptedSource === "anthropic-messages"
-            ? responseHeaders.get("request-id")
-            : responseHeaders.get("x-request-id");
-        responseHeaders.delete("request-id");
-        responseHeaders.delete("x-request-id");
+            ? sourceHeaders.get("request-id")
+            : sourceHeaders.get("x-request-id");
         if (sourceRequestId)
           responseHeaders.set(
             operation.adaptation.requestedSurface === "anthropic-messages"
@@ -2571,11 +2590,9 @@ async function relayPool({
           ["x-ratelimit-reset-requests", "anthropic-ratelimit-requests-reset"],
         ] as const;
         for (const [openAiName, anthropicName] of rateHeaderPairs) {
-          const value = responseHeaders.get(
+          const value = sourceHeaders.get(
             adaptedSource === "anthropic-messages" ? anthropicName : openAiName,
           );
-          responseHeaders.delete(openAiName);
-          responseHeaders.delete(anthropicName);
           if (value)
             responseHeaders.set(
               operation.adaptation.requestedSurface === "anthropic-messages"

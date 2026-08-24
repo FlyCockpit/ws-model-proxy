@@ -1487,6 +1487,7 @@ export class CanonicalStreamRenderer {
   }
 
   #chat(event: CanonicalEvent): WirePayload[] {
+    if (event.type === "error") return [renderProtocolError("openai-chat", event.error)];
     if (!this.#model)
       throw new AdapterError("missing_model", "Chat stream rendering requires a model.");
     const base = {
@@ -1558,7 +1559,6 @@ export class CanonicalStreamRenderer {
         },
       ];
     if (event.type === "complete") return ["[DONE]"];
-    if (event.type === "error") return [renderProtocolError("openai-chat", event.error)];
     if (event.type === "reasoning_delta")
       throw new AdapterError(
         "unsupported_stream_event",
