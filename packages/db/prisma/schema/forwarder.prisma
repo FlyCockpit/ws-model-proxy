@@ -785,6 +785,24 @@ model RelayRequest {
   @@map("relay_request")
 }
 
+/// Prompt-free, owner-scoped history of capacity and admission-policy changes.
+model CapacityAuditEvent {
+  id           String   @id @default(cuid(2))
+  createdAt    DateTime @default(now())
+  userId       String
+  actorUserId  String
+  action       String
+  resourceType String
+  resourceId   String
+  before       Json?
+  after        Json?
+  User         User     @relation("CapacityAuditEventOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([resourceType, resourceId, createdAt])
+  @@map("capacity_audit_event")
+}
+
 model MediaAsset {
   // Metadata ONLY — bytes live in the MediaStore (local volume / future S3),
   // never in Postgres. Rows are ephemeral: a TTL sweep and lazy-on-GET delete

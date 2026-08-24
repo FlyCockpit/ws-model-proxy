@@ -43,6 +43,7 @@ model User {
   executionTargets          ExecutionTarget[]          @relation("ExecutionTargetOwner")
   inferenceCapacities       InferenceCapacity[]        @relation("InferenceCapacityOwner")
   admissionRequests         AdmissionRequest[]         @relation("AdmissionRequestOwner")
+  capacityAuditEvents       CapacityAuditEvent[]       @relation("CapacityAuditEventOwner")
 
   @@unique([email])
   @@index([slug])

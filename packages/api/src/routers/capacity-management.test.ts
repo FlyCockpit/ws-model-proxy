@@ -15,6 +15,7 @@ vi.mock("@ws-model-proxy/db", async () => {
 const { capacityManagementRouter } = await import("./capacity-management");
 const { default: prisma } = await import("@ws-model-proxy/db");
 const db = prisma as unknown as {
+  $transaction: MockInstance;
   appSetting: { findUnique: MockInstance };
   inferenceCapacity: {
     findMany: MockInstance;
@@ -24,6 +25,7 @@ const db = prisma as unknown as {
     delete: MockInstance;
   };
   executionTarget: { findUnique: MockInstance; update: MockInstance };
+  capacityAuditEvent: { create: MockInstance; findMany: MockInstance };
 };
 
 const context: Context = {
@@ -59,6 +61,10 @@ describe("capacityManagementRouter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     db.appSetting.findUnique.mockResolvedValue(null);
+    db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
+      callback(db),
+    );
+    db.capacityAuditEvent.create.mockResolvedValue({ id: "audit" });
   });
 
   it("lists owner-scoped capacities with aggregate load only", async () => {
@@ -78,6 +84,38 @@ describe("capacityManagementRouter", () => {
           },
         },
       }),
+    );
+  });
+
+  it("writes capacity creation and policy mutation audits in the same transaction", async () => {
+    db.inferenceCapacity.create.mockResolvedValue({ id: "capacity", userId: "owner" });
+    const client = createRouterClient(capacityManagementRouter, { context });
+    await client.create({
+      label: "GPU",
+      runtimeIdentityKey: "host:model",
+      runtimeModel: "model",
+      hardConcurrencyLimit: 2,
+      physicalMaxContext: 4096,
+      countStrategy: "CONSERVATIVE_ESTIMATE",
+    });
+    expect(db.$transaction).toHaveBeenCalledTimes(1);
+    expect(db.capacityAuditEvent.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        userId: "owner",
+        actorUserId: "owner",
+        action: "CREATE",
+        resourceType: "INFERENCE_CAPACITY",
+        resourceId: "capacity",
+      }),
+    });
+  });
+
+  it("lists audit history only for its owner", async () => {
+    db.capacityAuditEvent.findMany.mockResolvedValue([]);
+    const client = createRouterClient(capacityManagementRouter, { context });
+    await expect(client.listAudit({ limit: 10 })).resolves.toEqual([]);
+    expect(db.capacityAuditEvent.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { userId: "owner" }, take: 10 }),
     );
   });
 

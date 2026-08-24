@@ -1,5 +1,5 @@
 import { ORPCError } from "@orpc/server";
-import prisma from "@ws-model-proxy/db";
+import prisma, { Prisma } from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
@@ -24,6 +24,34 @@ function enabled() {
 
 function notFound(): never {
   throw new ORPCError("NOT_FOUND", { message: "Capacity resource not found." });
+}
+
+function auditJson(value: unknown): Prisma.InputJsonValue {
+  return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
+}
+
+async function audit(
+  tx: Prisma.TransactionClient,
+  input: {
+    userId: string;
+    action: string;
+    resourceType: string;
+    resourceId: string;
+    before?: unknown;
+    after?: unknown;
+  },
+) {
+  await tx.capacityAuditEvent.create({
+    data: {
+      userId: input.userId,
+      actorUserId: input.userId,
+      action: input.action,
+      resourceType: input.resourceType,
+      resourceId: input.resourceId,
+      before: input.before === undefined ? undefined : auditJson(input.before),
+      after: input.after === undefined ? undefined : auditJson(input.after),
+    },
+  });
 }
 
 const capacityFields = {
@@ -83,6 +111,17 @@ export const capacityManagementRouter = {
     });
   }),
 
+  listAudit: protectedProcedure
+    .input(z.object({ limit: z.number().int().min(1).max(200).default(50) }).optional())
+    .handler(async ({ input, context }) => {
+      enabled();
+      return prisma.capacityAuditEvent.findMany({
+        where: { userId: context.session.user.id },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: input?.limit ?? 50,
+      });
+    }),
+
   create: protectedProcedure.input(z.object(capacityFields)).handler(async ({ input, context }) => {
     enabled();
     if (
@@ -91,8 +130,17 @@ export const capacityManagementRouter = {
       input.hardConcurrencyLimit < 1
     )
       throw new ORPCError("BAD_REQUEST");
-    return prisma.inferenceCapacity.create({
-      data: { userId: context.session.user.id, ...input },
+    const userId = context.session.user.id;
+    return prisma.$transaction(async (tx) => {
+      const created = await tx.inferenceCapacity.create({ data: { userId, ...input } });
+      await audit(tx, {
+        userId,
+        action: "CREATE",
+        resourceType: "INFERENCE_CAPACITY",
+        resourceId: created.id,
+        after: input,
+      });
+      return created;
     });
   }),
 
@@ -108,52 +156,95 @@ export const capacityManagementRouter = {
     .handler(async ({ input, context }) => {
       enabled();
       const { id: capacityId, ...data } = input;
-      const current = await prisma.inferenceCapacity.findUnique({
-        where: { id: capacityId },
-        select: { userId: true },
+      const userId = context.session.user.id;
+      return prisma.$transaction(async (tx) => {
+        const current = await tx.inferenceCapacity.findUnique({
+          where: { id: capacityId },
+        });
+        if (!current || current.userId !== userId) return notFound();
+        const updated = await tx.inferenceCapacity.update({ where: { id: capacityId }, data });
+        await audit(tx, {
+          userId,
+          action: "UPDATE",
+          resourceType: "INFERENCE_CAPACITY",
+          resourceId: capacityId,
+          before: current,
+          after: updated,
+        });
+        return updated;
       });
-      if (!current || current.userId !== context.session.user.id) return notFound();
-      return prisma.inferenceCapacity.update({ where: { id: capacityId }, data });
     }),
 
   remove: protectedProcedure.input(z.object({ id })).handler(async ({ input, context }) => {
     enabled();
-    const current = await prisma.inferenceCapacity.findUnique({
-      where: { id: input.id },
-      select: { userId: true, _count: { select: { ExecutionTargets: true } } },
+    const userId = context.session.user.id;
+    return prisma.$transaction(async (tx) => {
+      const current = await tx.inferenceCapacity.findUnique({
+        where: { id: input.id },
+        select: { userId: true, _count: { select: { ExecutionTargets: true } } },
+      });
+      if (!current || current.userId !== userId) return notFound();
+      if (current._count.ExecutionTargets > 0) {
+        throw new ORPCError("CONFLICT", { message: "Capacity is still attached." });
+      }
+      await tx.inferenceCapacity.delete({ where: { id: input.id } });
+      await audit(tx, {
+        userId,
+        action: "DELETE",
+        resourceType: "INFERENCE_CAPACITY",
+        resourceId: input.id,
+        before: current,
+      });
+      return { success: true };
     });
-    if (!current || current.userId !== context.session.user.id) return notFound();
-    if (current._count.ExecutionTargets > 0) {
-      throw new ORPCError("CONFLICT", { message: "Capacity is still attached." });
-    }
-    await prisma.inferenceCapacity.delete({ where: { id: input.id } });
-    return { success: true };
   }),
 
   updateDirectPolicy: protectedProcedure.input(directPolicy).handler(async ({ input, context }) => {
     enabled();
     const userId = context.session.user.id;
-    const target = await prisma.executionTarget.findUnique({
-      where: { id: input.executionTargetId },
-      select: { userId: true },
-    });
-    if (!target || target.userId !== userId) return notFound();
-    if (input.inferenceCapacityId) {
-      const capacity = await prisma.inferenceCapacity.findUnique({
-        where: { id: input.inferenceCapacityId },
-        select: { userId: true, hardConcurrencyLimit: true },
+    return prisma.$transaction(async (tx) => {
+      const target = await tx.executionTarget.findUnique({
+        where: { id: input.executionTargetId },
+        select: {
+          id: true,
+          userId: true,
+          inferenceCapacityId: true,
+          directPriority: true,
+          directConcurrencyLimit: true,
+          directReservedSlots: true,
+          directBorrowPolicy: true,
+          directWaitBudgetMs: true,
+          directContextCeiling: true,
+          directContextMargin: true,
+        },
       });
-      if (!capacity || capacity.userId !== userId) return notFound();
-      if (
-        input.directReservedSlots !== undefined &&
-        capacity.hardConcurrencyLimit !== null &&
-        input.directReservedSlots > capacity.hardConcurrencyLimit
-      ) {
-        throw new ORPCError("BAD_REQUEST", { message: "Reserved slots exceed capacity." });
+      if (!target || target.userId !== userId) return notFound();
+      if (input.inferenceCapacityId) {
+        const capacity = await tx.inferenceCapacity.findUnique({
+          where: { id: input.inferenceCapacityId },
+          select: { userId: true, hardConcurrencyLimit: true },
+        });
+        if (!capacity || capacity.userId !== userId) return notFound();
+        if (
+          input.directReservedSlots !== undefined &&
+          capacity.hardConcurrencyLimit !== null &&
+          input.directReservedSlots > capacity.hardConcurrencyLimit
+        ) {
+          throw new ORPCError("BAD_REQUEST", { message: "Reserved slots exceed capacity." });
+        }
       }
-    }
-    const { executionTargetId, ...data } = input;
-    return prisma.executionTarget.update({ where: { id: executionTargetId }, data });
+      const { executionTargetId, ...data } = input;
+      const updated = await tx.executionTarget.update({ where: { id: executionTargetId }, data });
+      await audit(tx, {
+        userId,
+        action: "UPDATE_POLICY",
+        resourceType: "EXECUTION_TARGET",
+        resourceId: executionTargetId,
+        before: target,
+        after: data,
+      });
+      return updated;
+    });
   }),
 
   updatePoolPolicy: protectedProcedure
@@ -167,25 +258,71 @@ export const capacityManagementRouter = {
     )
     .handler(async ({ input, context }) => {
       enabled();
-      const pool = await prisma.modelPool.findUnique({
-        where: { id: input.modelPoolId },
-        select: { userId: true },
+      const userId = context.session.user.id;
+      return prisma.$transaction(async (tx) => {
+        const pool = await tx.modelPool.findUnique({
+          where: { id: input.modelPoolId },
+          select: {
+            id: true,
+            userId: true,
+            capacityPriority: true,
+            capacityConcurrencyLimit: true,
+            capacityReservedSlots: true,
+            capacityBorrowPolicy: true,
+            capacityWaitBudgetMs: true,
+            capacityContextCeiling: true,
+            capacityContextMargin: true,
+            protocolAdaptationEnabled: true,
+            allowLossyDeveloperRoleCollapse: true,
+          },
+        });
+        if (!pool || pool.userId !== userId) return notFound();
+        const { modelPoolId, ...data } = input;
+        const updated = await tx.modelPool.update({ where: { id: modelPoolId }, data });
+        await audit(tx, {
+          userId,
+          action: "UPDATE_POLICY",
+          resourceType: "MODEL_POOL",
+          resourceId: modelPoolId,
+          before: pool,
+          after: data,
+        });
+        return updated;
       });
-      if (!pool || pool.userId !== context.session.user.id) return notFound();
-      const { modelPoolId, ...data } = input;
-      return prisma.modelPool.update({ where: { id: modelPoolId }, data });
     }),
 
   updateMemberPolicy: protectedProcedure
     .input(z.object({ poolMemberId: id, ...sharedPolicyFields }))
     .handler(async ({ input, context }) => {
       enabled();
-      const member = await prisma.poolMember.findUnique({
-        where: { id: input.poolMemberId },
-        select: { ModelPool: { select: { userId: true } } },
+      const userId = context.session.user.id;
+      return prisma.$transaction(async (tx) => {
+        const member = await tx.poolMember.findUnique({
+          where: { id: input.poolMemberId },
+          select: {
+            id: true,
+            capacityPriority: true,
+            capacityConcurrencyLimit: true,
+            capacityReservedSlots: true,
+            capacityBorrowPolicy: true,
+            capacityWaitBudgetMs: true,
+            capacityContextCeiling: true,
+            capacityContextMargin: true,
+            ModelPool: { select: { userId: true } },
+          },
+        });
+        if (!member || member.ModelPool.userId !== userId) return notFound();
+        const { poolMemberId, ...data } = input;
+        const updated = await tx.poolMember.update({ where: { id: poolMemberId }, data });
+        await audit(tx, {
+          userId,
+          action: "UPDATE_POLICY",
+          resourceType: "POOL_MEMBER",
+          resourceId: poolMemberId,
+          before: member,
+          after: data,
+        });
+        return updated;
       });
-      if (!member || member.ModelPool.userId !== context.session.user.id) return notFound();
-      const { poolMemberId, ...data } = input;
-      return prisma.poolMember.update({ where: { id: poolMemberId }, data });
     }),
 };
