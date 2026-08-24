@@ -94,8 +94,8 @@ export const relayMetadataRouter = {
         upstreamStatusCode: row.upstreamStatusCode,
         errorClass: row.errorClass,
         operation: row.operation,
-        requestBytes: row.requestBytes,
-        responseBytes: row.responseBytes,
+        requestBytes: row.requestBytes === null ? null : Number(row.requestBytes),
+        responseBytes: row.responseBytes === null ? null : Number(row.responseBytes),
         attemptCount: row.attemptCount,
       }));
     }),

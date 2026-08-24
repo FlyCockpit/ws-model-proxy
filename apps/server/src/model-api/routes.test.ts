@@ -41,6 +41,10 @@ const { default: prisma } = await import("@ws-model-proxy/db");
 
 const MODEL_API_MAX_ACTIVE_PER_TOKEN = 8;
 
+function stringifyPersistenceCalls(value: unknown) {
+  return JSON.stringify(value, (_key, item) => (typeof item === "bigint" ? item.toString() : item));
+}
+
 type SendRelayRequestArgs = Parameters<RelaySessionManager["sendRelayRequest"]>[0];
 type CancelRelayRequestArgs = Parameters<RelaySessionManager["cancelRelayRequest"]>[0];
 
@@ -710,7 +714,7 @@ describe("model API routes", () => {
           }),
         }),
       );
-      const metadataCalls = JSON.stringify([
+      const metadataCalls = stringifyPersistenceCalls([
         db.relayRequest.create.mock.calls,
         db.relayRequest.update.mock.calls,
       ]);
@@ -805,7 +809,7 @@ describe("model API routes", () => {
 
     expect(firstBodyChunkText(sent)).toContain(imageDataUrl);
     await vi.waitFor(() => expect(db.relayRequest.update).toHaveBeenCalled());
-    const metadataCalls = JSON.stringify([
+    const metadataCalls = stringifyPersistenceCalls([
       db.relayRequest.create.mock.calls,
       db.relayRequest.update.mock.calls,
     ]);
@@ -869,7 +873,7 @@ describe("model API routes", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({ object: "list", data: [] });
-    const metadataCalls = JSON.stringify([
+    const metadataCalls = stringifyPersistenceCalls([
       db.relayRequest.create.mock.calls,
       db.relayRequest.update.mock.calls,
     ]);
@@ -1004,7 +1008,7 @@ describe("model API routes", () => {
     });
     await expect((await responsesResponsePromise).json()).resolves.toEqual({ total_tokens: 9 });
 
-    const metadataCalls = JSON.stringify([
+    const metadataCalls = stringifyPersistenceCalls([
       db.relayRequest.create.mock.calls,
       db.relayRequest.update.mock.calls,
     ]);
@@ -1042,7 +1046,7 @@ describe("model API routes", () => {
 
     expect(response.status).toBe(200);
     await response.text();
-    const metadataCalls = JSON.stringify([
+    const metadataCalls = stringifyPersistenceCalls([
       db.relayRequest.create.mock.calls,
       db.relayRequest.update.mock.calls,
     ]);
@@ -1416,13 +1420,13 @@ describe("model API routes", () => {
     expect(db.relayRequest.update).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
-          requestBytes: firstRequestBytes + secondRequestBytes,
+          requestBytes: BigInt(firstRequestBytes + secondRequestBytes),
         }),
       }),
     );
     expect(db.relayRequest.update).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ attemptCount: 2, responseBytes: expect.any(Number) }),
+        data: expect.objectContaining({ attemptCount: 2, responseBytes: expect.any(BigInt) }),
       }),
     );
     now.mockRestore();
@@ -1490,7 +1494,7 @@ describe("model API routes", () => {
         expect.objectContaining({
           data: expect.objectContaining({
             attemptCount: 2,
-            requestBytes: (first.bodySource?.size ?? 0) + (second.bodySource?.size ?? 0),
+            requestBytes: BigInt((first.bodySource?.size ?? 0) + (second.bodySource?.size ?? 0)),
           }),
         }),
       ),
@@ -1573,7 +1577,7 @@ describe("model API routes", () => {
     expect(response.status).toBe(200);
     await expect(response.text()).resolves.toContain("resp_123");
     await vi.waitFor(() => expect(db.responseStickinessRecord.upsert).toHaveBeenCalled());
-    const persistenceCalls = JSON.stringify([
+    const persistenceCalls = stringifyPersistenceCalls([
       db.relayRequest.create.mock.calls,
       db.relayRequest.update.mock.calls,
       db.responseStickinessRecord.upsert.mock.calls,

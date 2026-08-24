@@ -186,8 +186,8 @@ type RelayRequestRow = {
   upstreamStatusCode: number | null;
   errorClass: string | null;
   operation: string | null;
-  requestBytes: number | null;
-  responseBytes: number | null;
+  requestBytes: bigint | null;
+  responseBytes: bigint | null;
   attemptCount: number;
   User: OwnerRow;
   ModelApiToken: { id: string; name: string; lookupPrefix: string } | null;
@@ -537,8 +537,8 @@ function serializeRelay(row: RelayRequestRow) {
     upstreamStatusCode: row.upstreamStatusCode,
     errorClass: row.errorClass,
     operation: row.operation,
-    requestBytes: row.requestBytes,
-    responseBytes: row.responseBytes,
+    requestBytes: row.requestBytes === null ? null : Number(row.requestBytes),
+    responseBytes: row.responseBytes === null ? null : Number(row.responseBytes),
     attemptCount: row.attemptCount,
   };
 }

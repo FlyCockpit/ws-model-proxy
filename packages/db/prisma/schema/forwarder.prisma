@@ -421,10 +421,10 @@ model RelayRequest {
   operation                  String?
   /// Sum of rebuilt upstream request-body bytes across all relay attempts.
   /// Includes multipart boundaries/headers; it is not the source audio size.
-  requestBytes               Int?
+  requestBytes               BigInt?
   /// Sum of upstream response-body bytes received across all relay attempts,
   /// including retryable failed attempts, counted without retaining content.
-  responseBytes              Int?
+  responseBytes              BigInt?
   /// Number of upstream relay attempts (greater than one indicates pool retry).
   attemptCount               Int                @default(0)
   User                       User               @relation("RelayRequestOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)

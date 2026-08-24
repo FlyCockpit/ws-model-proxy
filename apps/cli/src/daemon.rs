@@ -138,7 +138,6 @@ const TIMED_OUT_RELOAD_ID_CAPACITY: usize = 64;
 static UPSTREAM_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static UPSTREAM_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const UPSTREAM_RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn upstream_runtime() -> Result<&'static tokio::runtime::Runtime> {
     if let Some(runtime) = UPSTREAM_RUNTIME.get() {
@@ -1901,10 +1900,7 @@ async fn relay_response_back(
     loop {
         let bytes = tokio::select! {
             _ = cancellation_rx.changed() => return Ok(()),
-            bytes = tokio::time::timeout(UPSTREAM_RESPONSE_IDLE_TIMEOUT, response.chunk()) => {
-                bytes.context("upstream response idle timeout")?
-                    .context("reading upstream response body")?
-            },
+            bytes = response.chunk() => bytes.context("reading upstream response body")?,
         };
         let Some(bytes) = bytes else { break };
         append_usage_tail(&mut usage_tail, &bytes);

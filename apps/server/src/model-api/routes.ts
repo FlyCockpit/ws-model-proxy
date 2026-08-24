@@ -850,7 +850,7 @@ async function createRelayMetadata(input: RelayMetadataCreate): Promise<string> 
       transformerCacheHit: input.transformerCacheHit ?? null,
       transformerErrorClass: input.transformerErrorClass ?? null,
       operation: input.operation ?? null,
-      requestBytes: input.requestBytes ?? null,
+      requestBytes: input.requestBytes == null ? null : BigInt(input.requestBytes),
       status: "PENDING",
     },
     select: { id: true },
@@ -893,8 +893,8 @@ async function updateRelayMetadata(relayRequestId: string, update: RelayMetadata
       httpStatusCode:
         update.terminal.httpStatusCode ?? (failure ? relayFailureHttpStatus(failure) : null),
       upstreamStatusCode: update.terminal.upstreamStatusCode,
-      requestBytes: update.terminal.requestBytes,
-      responseBytes: update.terminal.responseBytes,
+      requestBytes: BigInt(update.terminal.requestBytes),
+      responseBytes: BigInt(update.terminal.responseBytes),
       ...(update.attemptCount !== undefined ? { attemptCount: update.attemptCount } : {}),
       errorClass: failure,
       ...(update.transformerLatencyMs !== undefined
@@ -940,7 +940,7 @@ async function failRelayMetadata({
   if (requestBytes !== undefined) {
     await prisma.relayRequest.update({
       where: { id: relayRequestId },
-      data: { requestBytes },
+      data: { requestBytes: BigInt(requestBytes) },
       select: { id: true },
     });
   }
