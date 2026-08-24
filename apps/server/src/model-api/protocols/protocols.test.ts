@@ -86,6 +86,7 @@ describe("canonical request adapters", () => {
         model: "requested",
         input: "hello",
         tools: [{ type: "function", name: "lookup", parameters: { type: "object" } }],
+        parallel_tool_calls: false,
       }).tools,
     ).toEqual([{ name: "lookup", inputSchema: { type: "object" } }]);
   });
@@ -95,6 +96,7 @@ describe("canonical request adapters", () => {
     const canonical = parseOpenAiChatRequest({
       model: "m",
       tools: [{ type: "function", function: { name: "f", parameters: {} } }],
+      parallel_tool_calls: false,
       messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: dataUrl } }] }],
     });
     expect(canonical.messages[0]?.content[0]).toMatchObject({
@@ -124,6 +126,7 @@ describe("canonical request adapters", () => {
       temperature: 0.4,
       stop_sequences: ["END"],
       tools: [{ name: "weather", input_schema: { type: "object" } }],
+      tool_choice: { type: "auto", disable_parallel_tool_use: true },
       messages: [
         {
           role: "assistant",
@@ -351,7 +354,8 @@ describe("canonical streaming state machines", () => {
 
   it("tracks partial tool JSON, enforces bounded buffers, and detects truncation", () => {
     const parser = new CanonicalStreamParser("anthropic-messages", { maxToolArgumentsBytes: 4 });
-    const start = 'event: message_start\ndata: {"type":"message_start","message":{"id":"msg"}}\n\n';
+    const start =
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n';
     const tool =
       'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"12345"}}\n\n';
     parser.push(new TextEncoder().encode(start));
@@ -359,7 +363,7 @@ describe("canonical streaming state machines", () => {
     const truncated = new CanonicalStreamParser("openai-responses");
     truncated.push(
       new TextEncoder().encode(
-        'event: response.created\ndata: {"type":"response.created","response":{"id":"r"}}\n\n',
+        'event: response.created\ndata: {"type":"response.created","sequence_number":0,"response":{"id":"r","object":"response","status":"in_progress","output":[]}}\n\n',
       ),
     );
     expect(() => truncated.finish()).toThrow("terminal event");

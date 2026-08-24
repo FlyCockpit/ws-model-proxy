@@ -8,6 +8,26 @@ import {
 } from "./index.js";
 
 describe("strict cross-surface rendering", () => {
+  it("requires an explicit single-call policy whenever OpenAI tools are adapted", () => {
+    const request = {
+      model: "m",
+      messages: [{ role: "user", content: "hello" }],
+      tools: [{ type: "function", function: { name: "lookup", parameters: {} } }],
+    };
+    expect(() => parseOpenAiChatRequest(request)).toThrow("explicitly be false");
+    expect(
+      parseOpenAiChatRequest({ ...request, parallel_tool_calls: false }).parallelToolCalls,
+    ).toBe("single");
+    expect(() =>
+      parseAnthropicMessagesRequest({
+        model: "m",
+        max_tokens: 8,
+        tools: [{ name: "lookup", input_schema: {} }],
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    ).toThrow("explicitly disable parallel");
+  });
+
   it("rejects stop sequences when targeting Responses instead of silently dropping them", () => {
     const canonical = parseOpenAiChatRequest({
       model: "m",
@@ -67,6 +87,7 @@ describe("strict cross-surface rendering", () => {
       model: "m",
       messages: [{ role: "user", content: "hello" }],
       tools: [{ type: "function", function: { name: "lookup", parameters: {} } }],
+      parallel_tool_calls: false,
     });
     expect(renderAnthropicMessagesRequest(canonical, "claude")).toMatchObject({
       tool_choice: { type: "auto", disable_parallel_tool_use: true },

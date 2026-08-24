@@ -1,6 +1,7 @@
 import { ADAPTER_VERSION, type CanonicalMessage, type CanonicalRequest } from "./canonical.js";
 import { invalid, unsupported } from "./errors.js";
 import {
+  boolean,
   object,
   parseAnthropicToolChoice,
   parseTools,
@@ -8,6 +9,8 @@ import {
   sampling,
   string,
   texts,
+  validateBase64,
+  validateToolChoice,
 } from "./parse-utils.js";
 
 const MEDIA_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"] as const);
@@ -32,7 +35,7 @@ function blocks(value: unknown, parameter: string): CanonicalMessage["content"] 
         source: {
           kind: "base64",
           mediaType: source.media_type as "image/jpeg",
-          data: string(source.data, `${parameter}[${index}].source.data`),
+          data: validateBase64(source.data, `${parameter}[${index}].source.data`),
         },
       };
     }
@@ -51,6 +54,8 @@ function blocks(value: unknown, parameter: string): CanonicalMessage["content"] 
         ["type", "tool_use_id", "content", "is_error"],
         `${parameter}[${index}]`,
       );
+      if (block.is_error !== undefined && typeof block.is_error !== "boolean")
+        invalid(`${parameter}[${index}].is_error`, "must be a boolean");
       return {
         type: "tool_result",
         toolCallId: string(block.tool_use_id, `${parameter}[${index}].tool_use_id`),
@@ -82,6 +87,7 @@ export function parseAnthropicMessagesRequest(input: unknown): CanonicalRequest 
   );
   const rawMessages = body.messages;
   if (!Array.isArray(rawMessages)) invalid("messages", "must be an array");
+  if (body.max_tokens === undefined) invalid("max_tokens", "is required for Anthropic Messages");
   const messages = rawMessages.map((entry, sourceIndex): CanonicalMessage => {
     const message = object(entry, `messages[${sourceIndex}]`);
     rejectUnknown(message, ["role", "content"], `messages[${sourceIndex}]`);
@@ -107,6 +113,12 @@ export function parseAnthropicMessagesRequest(input: unknown): CanonicalRequest 
       boundary: { sourceIndex },
     };
   });
+  const tools = parseTools(body.tools, "tools", "anthropic");
+  if (tools.length && body.tool_choice === undefined)
+    invalid("tool_choice", "must explicitly disable parallel tool use when tools are adapted");
+  const toolChoice = parseAnthropicToolChoice(body.tool_choice);
+  validateToolChoice(toolChoice, tools);
+  validateMessageToolIds(messages);
   return {
     adapterVersion: ADAPTER_VERSION,
     source: "anthropic-messages",
@@ -122,13 +134,32 @@ export function parseAnthropicMessagesRequest(input: unknown): CanonicalRequest 
             },
           ],
     messages,
-    tools: parseTools(body.tools, "tools", "anthropic"),
-    toolChoice: parseAnthropicToolChoice(body.tool_choice),
+    tools,
+    toolChoice,
     parallelToolCalls: "single",
-    stream: body.stream === true,
+    stream: boolean(body.stream, "stream"),
     sampling: sampling(body, "max_tokens"),
     limitations: [],
   };
+}
+
+function validateMessageToolIds(messages: readonly CanonicalMessage[]) {
+  const calls = new Set<string>();
+  const results = new Set<string>();
+  for (const message of messages) {
+    for (const part of message.content) {
+      if (part.type === "tool_call") {
+        if (calls.has(part.id)) invalid("messages.tool_use.id", "must be unique");
+        calls.add(part.id);
+      } else if (part.type === "tool_result") {
+        if (results.has(part.toolCallId))
+          invalid("messages.tool_result.tool_use_id", "must be unique");
+        if (!calls.has(part.toolCallId))
+          invalid("messages.tool_result.tool_use_id", "references an unknown tool use");
+        results.add(part.toolCallId);
+      }
+    }
+  }
 }
 
 export function renderAnthropicMessagesRequest(

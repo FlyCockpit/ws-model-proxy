@@ -103,7 +103,15 @@
           "object": "response",
           "status": "completed",
           "model": "gpt-fixture",
-          "output": [],
+          "output": [
+            {
+              "id": "msg_fixture",
+              "type": "message",
+              "status": "completed",
+              "role": "assistant",
+              "content": [{ "type": "output_text", "text": "Hello", "annotations": [] }]
+            }
+          ],
           "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
         }
       }

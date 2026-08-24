@@ -10,6 +10,19 @@ import {
 const bytes = (value: string) => new TextEncoder().encode(value);
 const event = (name: string, data: Record<string, unknown>) =>
   bytes(`event: ${name}\ndata: ${JSON.stringify({ type: name, ...data })}\n\n`);
+const anthropicStart = (id: string) =>
+  event("message_start", {
+    message: {
+      id,
+      type: "message",
+      role: "assistant",
+      content: [],
+      model: "claude",
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: 1, output_tokens: 0 },
+    },
+  });
 
 describe("strict canonical stream parsing", () => {
   it.each([
@@ -35,9 +48,14 @@ describe("strict canonical stream parsing", () => {
   it("commits retry on every emitted event, including message_start", () => {
     const parser = new CanonicalStreamParser("openai-responses");
     expect(parser.retrySafe).toBe(true);
-    expect(parser.push(event("response.created", { response: { id: "r" } }))).toEqual([
-      { type: "message_start", id: "r" },
-    ]);
+    expect(
+      parser.push(
+        event("response.created", {
+          sequence_number: 0,
+          response: { id: "r", object: "response", status: "in_progress", output: [] },
+        }),
+      ),
+    ).toEqual([{ type: "message_start", id: "r" }]);
     expect(parser.retrySafe).toBe(false);
   });
 
@@ -70,7 +88,7 @@ describe("strict canonical stream parsing", () => {
 
   it("enforces indexes, item lifecycle, complete tool JSON, and exactly one terminal", () => {
     const invalidIndex = new CanonicalStreamParser("anthropic-messages");
-    invalidIndex.push(event("message_start", { message: { id: "m" } }));
+    invalidIndex.push(anthropicStart("m"));
     expect(() =>
       invalidIndex.push(
         event("content_block_start", { index: -1, content_block: { type: "text", text: "" } }),
@@ -78,7 +96,7 @@ describe("strict canonical stream parsing", () => {
     ).toThrow("non-negative");
 
     const tool = new CanonicalStreamParser("anthropic-messages");
-    tool.push(event("message_start", { message: { id: "m" } }));
+    tool.push(anthropicStart("m"));
     tool.push(
       event("content_block_start", {
         index: 0,
@@ -105,7 +123,7 @@ describe("strict canonical stream parsing", () => {
 
   it("bounds unfinished items and checks cancellation during push and finish", () => {
     const parser = new CanonicalStreamParser("anthropic-messages", { maxUnfinishedItems: 1 });
-    parser.push(event("message_start", { message: { id: "m" } }));
+    parser.push(anthropicStart("m"));
     parser.push(
       event("content_block_start", { index: 0, content_block: { type: "text", text: "" } }),
     );
@@ -125,7 +143,12 @@ describe("strict canonical stream parsing", () => {
 
 describe("protocol-conformant stateful rendering", () => {
   const canonical: CanonicalEvent[] = [
-    { type: "message_start", id: "m", model: "model" },
+    {
+      type: "message_start",
+      id: "m",
+      model: "model",
+      usage: { inputTokens: 2, outputTokens: 0 },
+    },
     { type: "item_start", index: 0, id: "text", itemType: "text" },
     { type: "text_delta", index: 0, delta: "hello" },
     { type: "item_complete", index: 0 },

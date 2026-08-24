@@ -6,6 +6,7 @@ import {
 } from "./canonical.js";
 import { invalid, unsupported } from "./errors.js";
 import {
+  boolean,
   object,
   parseImageUrl,
   parseOpenAiToolChoice,
@@ -14,6 +15,7 @@ import {
   sampling,
   string,
   texts,
+  validateToolChoice,
 } from "./parse-utils.js";
 
 const ROOT_KEYS = [
@@ -65,7 +67,13 @@ export function parseOpenAiChatRequest(input: unknown): CanonicalRequest {
   if (body.user !== undefined)
     unsupported("user", "provider-side persisted identifiers are not adaptable");
   if (body.stream_options !== undefined) unsupported("stream_options");
-  if (body.parallel_tool_calls === true) unsupported("parallel_tool_calls");
+  const tools = parseTools(body.tools, "tools", "openai-chat");
+  if (tools.length && body.parallel_tool_calls !== false)
+    invalid("parallel_tool_calls", "must explicitly be false when tools are adapted");
+  if (body.parallel_tool_calls === true)
+    unsupported("parallel_tool_calls", "parallel calls are not safely adaptable");
+  if (body.parallel_tool_calls !== undefined && typeof body.parallel_tool_calls !== "boolean")
+    invalid("parallel_tool_calls", "must be a boolean");
   if (body.max_tokens !== undefined && body.max_completion_tokens !== undefined)
     invalid("max_tokens", "conflicts with max_completion_tokens");
   const rawMessages = body.messages;
@@ -152,21 +160,42 @@ export function parseOpenAiChatRequest(input: unknown): CanonicalRequest {
     { ...body, max_tokens: body.max_completion_tokens ?? body.max_tokens },
     "max_tokens",
   );
+  const toolChoice = parseOpenAiToolChoice(body.tool_choice);
+  validateToolChoice(toolChoice, tools);
+  validateMessageToolIds(messages);
   return {
     adapterVersion: ADAPTER_VERSION,
     source: "openai-chat",
     model: string(body.model, "model"),
     instructions,
     messages,
-    tools: parseTools(body.tools, "tools", "openai-chat"),
-    toolChoice: parseOpenAiToolChoice(body.tool_choice),
+    tools,
+    toolChoice,
     parallelToolCalls: "single",
-    stream: body.stream === true,
+    stream: boolean(body.stream, "stream"),
     sampling: chatSampling,
     limitations: instructions.some((item) => item.role === "developer")
       ? ["anthropic_instruction_authority_collapse"]
       : [],
   };
+}
+
+function validateMessageToolIds(messages: readonly CanonicalMessage[]) {
+  const calls = new Set<string>();
+  const results = new Set<string>();
+  for (const message of messages) {
+    for (const part of message.content) {
+      if (part.type === "tool_call") {
+        if (calls.has(part.id)) invalid("messages.tool_calls.id", "must be unique");
+        calls.add(part.id);
+      } else if (part.type === "tool_result") {
+        if (results.has(part.toolCallId)) invalid("messages.tool_call_id", "must be unique");
+        if (!calls.has(part.toolCallId))
+          invalid("messages.tool_call_id", "references an unknown tool call");
+        results.add(part.toolCallId);
+      }
+    }
+  }
 }
 
 export function renderOpenAiChatRequest(

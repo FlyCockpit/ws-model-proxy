@@ -13,7 +13,7 @@
       "version": "OpenAI API reference retrieved 2026-08-24",
       "source": "https://platform.openai.com/docs/api-reference/responses/create",
       "payload": "openai-responses-sse.json",
-      "payloadSha256": "9de3d3b2d3d4dee4c6dd77402292334524ff01fd2ce17c0843bfd9d08b77c1a7"
+      "payloadSha256": "cb5f461fda93433ff2541e66b482a84a661c76438242d9771377d1a72452e1b2"
     },
     {
       "surface": "anthropic-messages",

@@ -86,7 +86,7 @@ export type ParsedProtocolResponse =
 
 export type CanonicalUsage = { inputTokens?: number; outputTokens?: number };
 export type CanonicalEvent =
-  | { type: "message_start"; id: string; model?: string }
+  | { type: "message_start"; id: string; model?: string; usage?: CanonicalUsage }
   | {
       type: "item_start";
       index: number;
@@ -110,4 +110,7 @@ export type CanonicalProtocolError = {
   upstreamStatus?: number;
   requestId?: string;
   retryAfter?: string;
+  retryLimit?: string;
+  retryRemaining?: string;
+  retryReset?: string;
 };

@@ -1,6 +1,7 @@
 import { ADAPTER_VERSION, type CanonicalMessage, type CanonicalRequest } from "./canonical.js";
 import { invalid, unsupported } from "./errors.js";
 import {
+  boolean,
   object,
   parseImageUrl,
   parseOpenAiToolChoice,
@@ -9,6 +10,7 @@ import {
   sampling,
   string,
   texts,
+  validateToolChoice,
 } from "./parse-utils.js";
 
 const ROOT_KEYS = [
@@ -47,9 +49,17 @@ export function parseOpenAiResponsesRequest(input: unknown): CanonicalRequest {
   ] as const) {
     if (body[key] !== undefined) unsupported(key);
   }
+  if (body.store !== undefined && typeof body.store !== "boolean")
+    invalid("store", "must be a boolean");
   if (body.store === true) unsupported("store", "persisted Responses state is native-only");
   if (body.truncation !== undefined && body.truncation !== "disabled") unsupported("truncation");
-  if (body.parallel_tool_calls === true) unsupported("parallel_tool_calls");
+  const tools = parseTools(body.tools, "tools", "openai-responses");
+  if (tools.length && body.parallel_tool_calls !== false)
+    invalid("parallel_tool_calls", "must explicitly be false when tools are adapted");
+  if (body.parallel_tool_calls === true)
+    unsupported("parallel_tool_calls", "parallel calls are not safely adaptable");
+  if (body.parallel_tool_calls !== undefined && typeof body.parallel_tool_calls !== "boolean")
+    invalid("parallel_tool_calls", "must be a boolean");
   const instructions: CanonicalRequest["instructions"] =
     body.instructions === undefined
       ? []
@@ -132,21 +142,42 @@ export function parseOpenAiResponsesRequest(input: unknown): CanonicalRequest {
       unsupported(`input[${sourceIndex}].type`);
     });
   } else invalid("input", "must be text or an item array");
+  const toolChoice = parseOpenAiToolChoice(body.tool_choice);
+  validateToolChoice(toolChoice, tools);
+  validateMessageToolIds(messages);
   return {
     adapterVersion: ADAPTER_VERSION,
     source: "openai-responses",
     model: string(body.model, "model"),
     instructions,
     messages,
-    tools: parseTools(body.tools, "tools", "openai-responses"),
-    toolChoice: parseOpenAiToolChoice(body.tool_choice),
+    tools,
+    toolChoice,
     parallelToolCalls: "single",
-    stream: body.stream === true,
+    stream: boolean(body.stream, "stream"),
     sampling: sampling(body, "max_output_tokens"),
     limitations: instructions.some((item) => item.role === "developer")
       ? ["anthropic_instruction_authority_collapse"]
       : [],
   };
+}
+
+function validateMessageToolIds(messages: readonly CanonicalMessage[]) {
+  const calls = new Set<string>();
+  const results = new Set<string>();
+  for (const message of messages) {
+    for (const part of message.content) {
+      if (part.type === "tool_call") {
+        if (calls.has(part.id)) invalid("input.call_id", "must be unique");
+        calls.add(part.id);
+      } else if (part.type === "tool_result") {
+        if (results.has(part.toolCallId)) invalid("input.call_id", "tool result must be unique");
+        if (!calls.has(part.toolCallId))
+          invalid("input.call_id", "references an unknown tool call");
+        results.add(part.toolCallId);
+      }
+    }
+  }
 }
 
 function responseInstructionText(value: unknown, parameter: string) {
@@ -192,7 +223,13 @@ export function renderOpenAiResponsesRequest(
           part.source.kind === "url"
             ? part.source.url
             : `data:${part.source.mediaType};base64,${part.source.data}`;
-        content.push({ type: "input_image", image_url: imageUrl });
+        content.push({
+          type: "input_image",
+          image_url: imageUrl,
+          ...(part.source.kind === "url" && part.source.detail
+            ? { detail: part.source.detail }
+            : {}),
+        });
       } else if (part.type === "tool_call") {
         flushContent();
         input.push({

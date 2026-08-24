@@ -42,7 +42,7 @@ export function parseTools(
 ): CanonicalTool[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) invalid(parameter, "must be an array");
-  return value.map((entry, index) => {
+  const tools = value.map((entry, index) => {
     let tool = object(entry, `${parameter}[${index}]`);
     if (shape === "openai-chat") {
       rejectUnknown(tool, ["type", "function"], `${parameter}[${index}]`);
@@ -70,6 +70,8 @@ export function parseTools(
       ],
       `${parameter}[${index}]`,
     );
+    if (tool.strict !== undefined && typeof tool.strict !== "boolean")
+      invalid(`${parameter}[${index}].strict`, "must be a boolean");
     if (tool.strict === true)
       unsupported(`${parameter}[${index}].strict`, "structured output is not safely adaptable");
     const schema = object(
@@ -82,6 +84,29 @@ export function parseTools(
       inputSchema: schema,
     };
   });
+  const names = new Set<string>();
+  for (const [index, tool] of tools.entries()) {
+    if (names.has(tool.name)) invalid(`${parameter}[${index}].name`, "must be unique");
+    names.add(tool.name);
+  }
+  return tools;
+}
+
+export function validateToolChoice(
+  choice: CanonicalToolChoice | undefined,
+  tools: readonly CanonicalTool[],
+) {
+  if (!choice) return;
+  if (tools.length === 0 && choice.type !== "none")
+    invalid("tool_choice", "requires at least one declared tool");
+  if (choice.type === "tool" && !tools.some((tool) => tool.name === choice.name))
+    invalid("tool_choice", `references undeclared tool ${choice.name}`);
+}
+
+export function boolean(value: unknown, parameter: string, defaultValue = false): boolean {
+  if (value === undefined) return defaultValue;
+  if (typeof value !== "boolean") invalid(parameter, "must be a boolean");
+  return value;
 }
 
 export function parseOpenAiToolChoice(value: unknown): CanonicalToolChoice | undefined {
@@ -99,8 +124,11 @@ export function parseAnthropicToolChoice(value: unknown): CanonicalToolChoice | 
   if (value === undefined) return undefined;
   const choice = object(value, "tool_choice");
   rejectUnknown(choice, ["type", "name", "disable_parallel_tool_use"], "tool_choice");
-  if (choice.disable_parallel_tool_use === false)
-    unsupported("tool_choice.disable_parallel_tool_use", "parallel calls are not safely adaptable");
+  if (choice.disable_parallel_tool_use !== true)
+    unsupported(
+      "tool_choice.disable_parallel_tool_use",
+      "must be true to opt into safe single-call adaptation",
+    );
   if (choice.type === "auto" || choice.type === "none" || choice.type === "any")
     return { type: choice.type === "any" ? "required" : choice.type };
   if (choice.type === "tool")
@@ -153,10 +181,19 @@ export function parseImageUrl(value: unknown, parameter: string, detail?: unknow
     invalid(`${parameter}.detail`, "is invalid");
   if (url.startsWith("https://"))
     return { kind: "url" as const, url, ...(detail ? { detail: detail as "auto" } : {}) };
+  if (detail !== undefined)
+    unsupported(`${parameter}.detail`, "cannot be preserved for base64 images");
   const match = /^data:([^;,]+);base64,([A-Za-z0-9+/]*={0,2})$/.exec(url);
   if (!match || !SAFE_IMAGE_MIME.has(match[1] ?? ""))
     unsupported(parameter, "must be HTTPS or base64 JPEG, PNG, GIF, or WebP");
   const data = match[2] ?? "";
   if (data.length === 0 || data.length % 4 !== 0) invalid(parameter, "contains invalid base64");
   return { kind: "base64" as const, mediaType: match[1] as "image/jpeg", data };
+}
+
+export function validateBase64(value: unknown, parameter: string): string {
+  const data = string(value, parameter);
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data))
+    invalid(parameter, "must be valid base64");
+  return data;
 }

@@ -5,7 +5,7 @@ import type {
   ProtocolResponseMetadata,
   ProtocolSurface,
 } from "./canonical.js";
-import { invalid, unsupported } from "./errors.js";
+import { AdapterError, invalid, unsupported } from "./errors.js";
 import { object, rejectUnknown, string } from "./parse-utils.js";
 
 export function parseProtocolResponse({
@@ -40,9 +40,10 @@ export function responseMetadata(status: number, headers: Headers): ProtocolResp
     status,
     requestId: safe("request-id") ?? safe("x-request-id"),
     retryAfter: safe("retry-after"),
-    retryLimit: safe("x-ratelimit-limit-requests"),
-    retryRemaining: safe("x-ratelimit-remaining-requests"),
-    retryReset: safe("x-ratelimit-reset-requests"),
+    retryLimit: safe("anthropic-ratelimit-requests-limit") ?? safe("x-ratelimit-limit-requests"),
+    retryRemaining:
+      safe("anthropic-ratelimit-requests-remaining") ?? safe("x-ratelimit-remaining-requests"),
+    retryReset: safe("anthropic-ratelimit-requests-reset") ?? safe("x-ratelimit-reset-requests"),
   };
 }
 
@@ -59,7 +60,8 @@ function parseChatSuccess(value: unknown): CanonicalResponse {
   const choice = object(body.choices[0], "response.choices[0]");
   rejectUnknown(choice, ["index", "message", "finish_reason", "logprobs"], "response.choices[0]");
   if (choice.index !== 0) invalid("response.choices[0].index", "must be zero");
-  if (choice.logprobs != null) unsupported("response.choices[0].logprobs");
+  if (choice.logprobs !== undefined && choice.logprobs !== null)
+    unsupported("response.choices[0].logprobs");
   const message = object(choice.message, "response.choices[0].message");
   rejectUnknown(
     message,
@@ -73,12 +75,22 @@ function parseChatSuccess(value: unknown): CanonicalResponse {
     items.push({ type: "text", text: message.content });
   else if (message.content != null)
     invalid("response.choices[0].message.content", "must be text or null");
-  if (typeof message.refusal === "string" && message.refusal)
-    items.push({ type: "refusal", text: message.refusal });
+  if (message.refusal !== undefined && message.refusal !== null) {
+    const refusal = string(message.refusal, "response.choices[0].message.refusal");
+    if (items.length)
+      unsupported(
+        "response.choices[0].message",
+        "mixed text and refusal order is not representable",
+      );
+    items.push({ type: "refusal", text: refusal });
+  }
   if (message.tool_calls !== undefined) {
     if (!Array.isArray(message.tool_calls))
       invalid("response.choices[0].message.tool_calls", "must be an array");
+    const callIds = new Set<string>();
     for (const [index, raw] of message.tool_calls.entries()) {
+      if (index > 0)
+        unsupported("response.choices[0].message.tool_calls", "must contain at most one call");
       const call = object(raw, `response.choices[0].message.tool_calls[${index}]`);
       rejectUnknown(
         call,
@@ -93,9 +105,13 @@ function parseChatSuccess(value: unknown): CanonicalResponse {
         ["name", "arguments"],
         `response.choices[0].message.tool_calls[${index}].function`,
       );
+      const id = string(call.id, `response.choices[0].message.tool_calls[${index}].id`);
+      if (callIds.has(id))
+        invalid(`response.choices[0].message.tool_calls[${index}].id`, "must be unique");
+      callIds.add(id);
       items.push({
         type: "tool_call",
-        id: string(call.id, "tool_call.id"),
+        id,
         name: string(fn.name, "tool_call.name"),
         arguments: completeArguments(fn.arguments, "tool_call.arguments"),
       });
@@ -140,6 +156,7 @@ function parseResponsesSuccess(value: unknown): CanonicalResponse {
     unsupported("response", "contains incomplete or error state");
   if (!Array.isArray(body.output)) invalid("response.output", "must be an array");
   const items: CanonicalResponse["items"] = [];
+  const callIds = new Set<string>();
   for (const [index, raw] of body.output.entries()) {
     const item = object(raw, `response.output[${index}]`);
     if (item.type === "message") {
@@ -156,10 +173,20 @@ function parseResponsesSuccess(value: unknown): CanonicalResponse {
             ["type", "text", "annotations", "logprobs"],
             `response.output[${index}].content[${contentIndex}]`,
           );
-          if (Array.isArray(content.annotations) && content.annotations.length)
+          if (!Array.isArray(content.annotations))
+            invalid(
+              `response.output[${index}].content[${contentIndex}].annotations`,
+              "must be an array",
+            );
+          if (content.annotations.length)
             unsupported(
               `response.output[${index}].content[${contentIndex}].annotations`,
               "citations are not safely adaptable",
+            );
+          if (content.logprobs !== undefined && !Array.isArray(content.logprobs))
+            invalid(
+              `response.output[${index}].content[${contentIndex}].logprobs`,
+              "must be an array",
             );
           if (Array.isArray(content.logprobs) && content.logprobs.length)
             unsupported(`response.output[${index}].content[${contentIndex}].logprobs`);
@@ -174,6 +201,7 @@ function parseResponsesSuccess(value: unknown): CanonicalResponse {
         } else unsupported(`response.output[${index}].content[${contentIndex}].type`);
       }
     } else if (item.type === "function_call") {
+      if (callIds.size > 0) unsupported("response.output", "must contain at most one tool call");
       rejectUnknown(
         item,
         ["id", "type", "status", "call_id", "name", "arguments"],
@@ -181,9 +209,12 @@ function parseResponsesSuccess(value: unknown): CanonicalResponse {
       );
       if (item.status !== "completed")
         invalid(`response.output[${index}].status`, "must be completed");
+      const id = string(item.call_id, `response.output[${index}].call_id`);
+      if (callIds.has(id)) invalid(`response.output[${index}].call_id`, "must be unique");
+      callIds.add(id);
       items.push({
         type: "tool_call",
-        id: string(item.call_id, "function_call.call_id"),
+        id,
         name: string(item.name, "function_call.name"),
         arguments: completeArguments(item.arguments, "function_call.arguments"),
       });
@@ -208,31 +239,49 @@ function parseAnthropicSuccess(value: unknown): CanonicalResponse {
   if (body.type !== "message" || body.role !== "assistant")
     invalid("response", "must be an Anthropic assistant message");
   if (!Array.isArray(body.content)) invalid("response.content", "must be an array");
+  const callIds = new Set<string>();
   const items: CanonicalResponse["items"] = body.content.map((raw, index) => {
     const block = object(raw, `response.content[${index}]`);
     if (block.type === "text") {
       rejectUnknown(block, ["type", "text", "citations"], `response.content[${index}]`);
-      if (Array.isArray(block.citations) && block.citations.length)
-        unsupported(`response.content[${index}].citations`);
+      if (block.citations !== undefined) {
+        if (!Array.isArray(block.citations))
+          invalid(`response.content[${index}].citations`, "must be an array");
+        if (block.citations.length) unsupported(`response.content[${index}].citations`);
+      }
       return { type: "text", text: string(block.text, `response.content[${index}].text`) };
     }
     if (block.type === "tool_use") {
+      if (callIds.size > 0) unsupported("response.content", "must contain at most one tool use");
       rejectUnknown(block, ["type", "id", "name", "input"], `response.content[${index}]`);
+      const id = string(block.id, `response.content[${index}].id`);
+      if (callIds.has(id)) invalid(`response.content[${index}].id`, "must be unique");
+      callIds.add(id);
       return {
         type: "tool_call",
-        id: string(block.id, "tool_use.id"),
+        id,
         name: string(block.name, "tool_use.name"),
         arguments: JSON.stringify(object(block.input, "tool_use.input")),
       };
     }
     return unsupported(`response.content[${index}].type`);
   });
+  const reason = stopReason(body.stop_reason);
+  const hasCalls = items.some((item) => item.type === "tool_call");
+  if ((reason === "tool") !== hasCalls)
+    invalid("response.stop_reason", "does not match tool-use content");
+  if (body.stop_sequence !== null && body.stop_sequence !== undefined) {
+    if (typeof body.stop_sequence !== "string")
+      invalid("response.stop_sequence", "must be text or null");
+    if (body.stop_reason !== "stop_sequence")
+      invalid("response.stop_sequence", "requires stop_reason stop_sequence");
+  }
   return {
     id: string(body.id, "response.id"),
     ...(typeof body.model === "string" ? { model: body.model } : {}),
     items,
     usage: parseUsage(body.usage),
-    stopReason: stopReason(body.stop_reason),
+    stopReason: reason,
   };
 }
 
@@ -253,9 +302,9 @@ function parseUsage(value: unknown) {
   rejectUnknown(usage, allowed, "usage");
   const input = usage.input_tokens ?? usage.prompt_tokens;
   const output = usage.output_tokens ?? usage.completion_tokens;
-  if (input !== undefined && (typeof input !== "number" || input < 0))
+  if (input !== undefined && (!Number.isInteger(input) || (input as number) < 0))
     invalid("usage.input_tokens", "is invalid");
-  if (output !== undefined && (typeof output !== "number" || output < 0))
+  if (output !== undefined && (!Number.isInteger(output) || (output as number) < 0))
     invalid("usage.output_tokens", "is invalid");
   return {
     ...(typeof input === "number" ? { inputTokens: input } : {}),
@@ -278,7 +327,7 @@ function stopReason(value: unknown): CanonicalResponse["stopReason"] {
   if (value === "length" || value === "max_tokens") return "length";
   if (value === "tool_calls" || value === "tool_use") return "tool";
   if (value === "content_filter") return "content_filter";
-  return "unknown";
+  return unsupported("response.stop_reason", "is not safely adaptable");
 }
 
 function parseError(
@@ -288,11 +337,14 @@ function parseError(
 ): CanonicalProtocolError {
   const body = object(value, "error_response");
   let error: Record<string, unknown>;
+  let bodyRequestId: string | undefined;
   if (surface === "anthropic-messages") {
     rejectUnknown(body, ["type", "error", "request_id"], "error_response");
     if (body.type !== "error") invalid("error_response.type", "must be error");
     error = object(body.error, "error_response.error");
     rejectUnknown(error, ["type", "message"], "error_response.error");
+    if (body.request_id !== undefined)
+      bodyRequestId = string(body.request_id, "error_response.request_id");
   } else {
     rejectUnknown(body, ["error"], "error_response");
     error = object(body.error, "error_response.error");
@@ -308,8 +360,13 @@ function parseError(
     message: string(error.message, "error_response.error.message").slice(0, 1000),
     ...(typeof error.param === "string" ? { parameter: error.param } : {}),
     upstreamStatus: metadata.status,
-    ...(metadata.requestId ? { requestId: metadata.requestId } : {}),
+    ...((bodyRequestId ?? metadata.requestId)
+      ? { requestId: bodyRequestId ?? metadata.requestId }
+      : {}),
     ...(metadata.retryAfter ? { retryAfter: metadata.retryAfter } : {}),
+    ...(metadata.retryLimit ? { retryLimit: metadata.retryLimit } : {}),
+    ...(metadata.retryRemaining ? { retryRemaining: metadata.retryRemaining } : {}),
+    ...(metadata.retryReset ? { retryReset: metadata.retryReset } : {}),
   };
 }
 
@@ -461,23 +518,55 @@ export function renderProtocolError(
       error: { type: error.code, message: error.message },
       ...(error.requestId ? { request_id: error.requestId } : {}),
     };
+  const openAiType = openAiErrorType(error.code, error.upstreamStatus);
   return {
     error: {
       message: error.message,
-      type: error.code,
+      type: openAiType,
       param: error.parameter ?? null,
       code: error.code,
     },
   };
 }
 
-export function renderProtocolErrorMetadata(error: CanonicalProtocolError): {
+function openAiErrorType(code: string, status?: number): string {
+  if (code === "authentication_error" || status === 401) return "authentication_error";
+  if (code === "permission_error" || status === 403) return "permission_error";
+  if (code === "invalid_request_error" || status === 400) return "invalid_request_error";
+  if (code === "rate_limit_error" || status === 429) return "rate_limit_error";
+  if (status !== undefined && status >= 500) return "server_error";
+  return code;
+}
+
+export function renderProtocolErrorMetadata(
+  surfaceOrError: ProtocolSurface | CanonicalProtocolError,
+  maybeError?: CanonicalProtocolError,
+): {
   status: number;
   headers: Headers;
 } {
+  const surface = typeof surfaceOrError === "string" ? surfaceOrError : "openai-responses";
+  const error = typeof surfaceOrError === "string" ? maybeError : surfaceOrError;
+  if (!error) throw new AdapterError("invalid_error", "Canonical error metadata is required.");
   const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
-  if (error.requestId) headers.set("x-request-id", error.requestId);
+  if (error.requestId)
+    headers.set(surface === "anthropic-messages" ? "request-id" : "x-request-id", error.requestId);
   if (error.retryAfter) headers.set("retry-after", error.retryAfter);
+  const retryHeaders =
+    surface === "anthropic-messages"
+      ? {
+          limit: "anthropic-ratelimit-requests-limit",
+          remaining: "anthropic-ratelimit-requests-remaining",
+          reset: "anthropic-ratelimit-requests-reset",
+        }
+      : {
+          limit: "x-ratelimit-limit-requests",
+          remaining: "x-ratelimit-remaining-requests",
+          reset: "x-ratelimit-reset-requests",
+        };
+  if (error.retryLimit) headers.set(retryHeaders.limit, error.retryLimit);
+  if (error.retryRemaining) headers.set(retryHeaders.remaining, error.retryRemaining);
+  if (error.retryReset) headers.set(retryHeaders.reset, error.retryReset);
   return {
     status:
       error.upstreamStatus && error.upstreamStatus >= 400 && error.upstreamStatus <= 599
