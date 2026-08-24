@@ -5,6 +5,9 @@ vi.mock("@ws-model-proxy/db", () => ({ default: {}, Prisma: {} }));
 import { StoreCapacityAdmissionRuntime } from "./runtime.js";
 
 describe("capacity admission runtime", () => {
+  it("rejects polling intervals that cannot safely refresh waiting heartbeats", () => {
+    expect(() => new StoreCapacityAdmissionRuntime({} as never, 10_001)).toThrow(/poll interval/i);
+  });
   it("polls one durable attempt with candidates only on initial enqueue", async () => {
     const acquire = vi
       .fn()

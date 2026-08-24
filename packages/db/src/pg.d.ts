@@ -7,10 +7,12 @@ declare module "pg" {
       event: "notification",
       listener: (message: { channel: string; payload?: string }) => void,
     ): this;
+    on(event: "error", listener: (error: Error) => void): this;
     off(
       event: "notification",
       listener: (message: { channel: string; payload?: string }) => void,
     ): this;
+    off(event: "error", listener: (error: Error) => void): this;
     end(): Promise<void>;
   }
 }

@@ -13,6 +13,10 @@ export interface CapacityAdmissionRuntime {
   hold(response: Response, lease: CapacityLeaseHandle, signal?: AbortSignal): Response;
 }
 
+// Polling re-enters store.acquire, which durably refreshes the WAITING request
+// heartbeat. Keep this safely below the 60-second abandonment threshold.
+export const MAX_CAPACITY_POLL_INTERVAL_MS = 10_000;
+
 export class StoreCapacityAdmissionRuntime implements CapacityAdmissionRuntime {
   private lastMaintenanceAt = 0;
   constructor(
@@ -26,7 +30,17 @@ export class StoreCapacityAdmissionRuntime implements CapacityAdmissionRuntime {
     private readonly pollIntervalMs = 100,
     private readonly maintenanceIntervalMs = 5_000,
     private readonly wakeSource?: CapacityWakeSource,
-  ) {}
+  ) {
+    if (
+      !Number.isFinite(pollIntervalMs) ||
+      pollIntervalMs < 1 ||
+      pollIntervalMs > MAX_CAPACITY_POLL_INTERVAL_MS
+    ) {
+      throw new Error(
+        `Capacity poll interval must be between 1 and ${MAX_CAPACITY_POLL_INTERVAL_MS} ms.`,
+      );
+    }
+  }
 
   async acquire(attempt: AdmissionAttempt, signal?: AbortSignal): Promise<AdmissionResult> {
     await this.maintain();

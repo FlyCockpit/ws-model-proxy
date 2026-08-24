@@ -16,17 +16,25 @@ export class PostgresNotificationListener {
   }
 
   async wait(timeoutMs: number): Promise<string | null> {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const finish = (payload: string | null) => {
         clearTimeout(timer);
         this.#client.off("notification", notification);
+        this.#client.off("error", failed);
         resolve(payload);
+      };
+      const failed = (error: Error) => {
+        clearTimeout(timer);
+        this.#client.off("notification", notification);
+        this.#client.off("error", failed);
+        reject(error);
       };
       const notification = (message: { channel: string; payload?: string }) => {
         if (message.channel === this.#channel) finish(message.payload ?? "");
       };
       const timer = setTimeout(() => finish(null), timeoutMs);
       this.#client.on("notification", notification);
+      this.#client.on("error", failed);
     });
   }
 

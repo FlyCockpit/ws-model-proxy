@@ -42,6 +42,7 @@ import {
   createMediaSignHandler,
   createMediaUploadHandler,
 } from "./media/routes.js";
+import { createProductionCapacityRuntime } from "./model-api/capacity/production-runtime.js";
 import { createChatTestRoutes } from "./model-api/chat-test.js";
 import {
   createModelApiFileGetHandler,
@@ -183,7 +184,15 @@ app.use("/v1/*", (c, next) => {
   }
   return generalModelApiBodyLimit(c, next);
 });
-app.route("/v1", createModelApiRoutes());
+const capacityLifecycle = env.MODEL_API_GLOBAL_CAPACITY_ENABLED
+  ? createProductionCapacityRuntime()
+  : undefined;
+app.route(
+  "/v1",
+  createModelApiRoutes({
+    capacityRuntime: capacityLifecycle?.runtime,
+  }),
+);
 
 // Same-origin guard for the cookie-authenticated media MUTATION routes (upload,
 // sign, admin purge/delete). These plain Hono routes have no oRPC-style custom
@@ -608,6 +617,7 @@ async function shutdown(signal: string) {
 
   // Stop the media cleanup timer so it can't fire mid-shutdown.
   stopMediaCleanup?.();
+  await capacityLifecycle?.close();
 
   // 1. Stop accepting new connections and drain in-flight requests.
   await new Promise<void>((resolve) => {
