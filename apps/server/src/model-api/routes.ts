@@ -42,6 +42,11 @@ import {
   anthropicRelayHeaders,
   parseAnthropicIngress,
 } from "./anthropic-protocol.js";
+import {
+  type ContextCountTelemetry,
+  contextFitsLimits,
+  countSerializedRequestContext,
+} from "./capacity/context.js";
 import { PostgresCapacityAdmissionStore } from "./capacity/postgres-store.js";
 import {
   type CapacityAdmissionRuntime,
@@ -202,6 +207,7 @@ type RelayOperation = {
   responseStickiness?: ResponseStickinessCapture;
   anthropicIngress?: AnthropicIngress;
   dispose?: () => Promise<void>;
+  contextCount?: ContextCountTelemetry;
   adaptation?: {
     featureEnabled: boolean;
     poolEnabled: boolean;
@@ -350,7 +356,13 @@ type DirectModelRelayRow = {
   capabilityOverrideMode: string;
   capabilityOverrideMetadata: unknown | null;
   optimisticBasicTranscription: boolean;
-  ExecutionTarget: { id: string; inferenceCapacityId: string | null } | null;
+  ExecutionTarget: {
+    id: string;
+    inferenceCapacityId: string | null;
+    directContextCeiling?: number | null;
+    directContextMargin?: number;
+    InferenceCapacity?: { physicalMaxContext: number | null } | null;
+  } | null;
   Endpoint: {
     id: string;
     slug: string;
@@ -366,6 +378,7 @@ type PoolMemberRelayRow = PoolMemberRouteRow & {
   ExecutionTarget: {
     id: string;
     inferenceCapacityId: string | null;
+    InferenceCapacity?: { physicalMaxContext: number | null } | null;
     DiscoveredModel: PoolMemberRouteRow["DiscoveredModel"] & {
       id: string;
       userId: string;
@@ -376,6 +389,8 @@ type PoolMemberRelayRow = PoolMemberRouteRow & {
       };
     };
   } | null;
+  capacityContextCeiling?: number | null;
+  capacityContextMargin?: number;
   DiscoveredModel: PoolMemberRouteRow["DiscoveredModel"] & {
     id: string;
     userId: string;
@@ -1708,7 +1723,15 @@ async function directModelRow(discoveredModelId: string): Promise<DirectModelRel
       capabilityOverrideMode: true,
       capabilityOverrideMetadata: true,
       optimisticBasicTranscription: true,
-      ExecutionTarget: { select: { id: true, inferenceCapacityId: true } },
+      ExecutionTarget: {
+        select: {
+          id: true,
+          inferenceCapacityId: true,
+          directContextCeiling: true,
+          directContextMargin: true,
+          InferenceCapacity: { select: { physicalMaxContext: true } },
+        },
+      },
       Endpoint: {
         select: {
           id: true,
@@ -1732,10 +1755,13 @@ async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
       id: true,
       poolId: true,
       discoveredModelId: true,
+      capacityContextCeiling: true,
+      capacityContextMargin: true,
       ExecutionTarget: {
         select: {
           id: true,
           inferenceCapacityId: true,
+          InferenceCapacity: { select: { physicalMaxContext: true } },
           DiscoveredModel: {
             select: {
               id: true,
@@ -2077,6 +2103,23 @@ async function relayDirect({
       await failRelayMetadata({ relayRequestId, startedAt, failure: "unsupported_capability" });
       return operationFailureResponse(operation, "unsupported_capability");
     }
+    if (
+      operation.contextCount &&
+      !contextFitsLimits({
+        count: operation.contextCount,
+        physicalMaxContext: identity.InferenceCapacity?.physicalMaxContext,
+        effectiveContextCeiling: identity.directContextCeiling,
+        contextMargin: identity.directContextMargin ?? 0,
+      })
+    ) {
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "request_too_large" });
+      return operationFailureResponse(
+        operation,
+        "request_too_large",
+        "Request context exceeds the configured execution capacity ceiling.",
+      );
+    }
     try {
       capacityLease = await capacityRuntime.acquire(
         {
@@ -2262,6 +2305,25 @@ async function relayPool({
   let globalLease: ModelApiLimitLease | undefined;
 
   const members = await poolMemberRows(target.id);
+  const contextEligibleMembers = operation.contextCount
+    ? members.filter((member) =>
+        contextFitsLimits({
+          count: operation.contextCount!,
+          physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+          effectiveContextCeiling: member.capacityContextCeiling,
+          contextMargin: member.capacityContextMargin ?? 0,
+        }),
+      )
+    : members;
+  if (members.length > 0 && contextEligibleMembers.length === 0) {
+    await operation.dispose?.();
+    await failRelayMetadata({ relayRequestId, startedAt, failure: "request_too_large" });
+    return operationFailureResponse(
+      operation,
+      "request_too_large",
+      "Request context exceeds every compatible pool member ceiling.",
+    );
+  }
   let canonicalAdaptationRequest: ReturnType<typeof parseCanonicalRequest> | null = null;
   if (operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled) {
     try {
@@ -2274,7 +2336,7 @@ async function relayPool({
     }
   }
   const executionByMember = new Map(
-    members.map((member) => [
+    contextEligibleMembers.map((member) => [
       member.id,
       executionPathForPoolMember(
         effectivePoolMemberCapabilities(member),
@@ -2283,7 +2345,7 @@ async function relayPool({
       ),
     ]),
   );
-  const protocolCandidates = members.filter((member) => {
+  const protocolCandidates = contextEligibleMembers.filter((member) => {
     const execution = executionByMember.get(member.id);
     if (!execution)
       return supportsOperation({
@@ -2327,7 +2389,7 @@ async function relayPool({
     operation.capability === "audio.transcriptions" &&
     operation.transcriptionProfile &&
     isBasicTranscriptionRequest(operation.transcriptionProfile)
-      ? members.filter((member) => {
+      ? contextEligibleMembers.filter((member) => {
           if (knownIds.has(member.id)) return false;
           const capability = normalizeTranscriptionCapabilities(
             effectivePoolMemberCapabilities(member)?.audio?.transcriptions,
@@ -3708,6 +3770,18 @@ async function relayPreparedModeledRequest({
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
 }) {
+  let contextCount: ContextCountTelemetry | undefined;
+  if (capacityRuntime && prepared.payload) {
+    try {
+      contextCount = await countSerializedRequestContext({
+        input: prepared.payload,
+        signal: request.signal,
+      });
+    } catch {
+      await prepared.dispose?.();
+      return operationFailureResponse(operation, request.signal.aborted ? "cancelled" : "unknown");
+    }
+  }
   const directTarget = directTargetByModelId(targets.directModels, prepared.model);
   if (directTarget) {
     const transcriptionLimitError = await transcriptionUploadLimitResponse({
@@ -3733,6 +3807,7 @@ async function relayPreparedModeledRequest({
       buildRequest: prepared.buildRequest,
       transcriptionProfile: prepared.transcriptionProfile,
       dispose: prepared.dispose,
+      contextCount,
     };
     return relayDirect({
       request,
@@ -3785,6 +3860,7 @@ async function relayPreparedModeledRequest({
       buildRequest: prepared.buildRequest,
       transcriptionProfile: prepared.transcriptionProfile,
       dispose: prepared.dispose,
+      contextCount,
       ...(prepared.payload &&
       (operation.family === "chat.completions" ||
         (operation.family === "responses" && operation.capability === "responses.create") ||

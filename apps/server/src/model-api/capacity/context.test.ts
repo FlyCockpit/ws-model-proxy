@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { countContext } from "./context.js";
+import { contextFitsLimits, countContext, countSerializedRequestContext } from "./context.js";
 
 describe("context counting hierarchy", () => {
   it("uses the first available counter", async () => {
@@ -43,5 +43,42 @@ describe("context counting hierarchy", () => {
         signal: controller.signal,
       }),
     ).rejects.toThrow("cancelled");
+  });
+
+  it("serializes the complete request and reports fallback confidence and margin", async () => {
+    const input = {
+      instructions: "system",
+      messages: [{ role: "user", content: "hello" }],
+      tools: [{ name: "lookup", schema: { type: "object" } }],
+      max_output_tokens: 200,
+    };
+    const serializedChars = JSON.stringify(input).length;
+    await expect(countSerializedRequestContext({ input, safetyMargin: 1.25 })).resolves.toEqual({
+      tokens: Math.ceil((serializedChars / 4) * 1.25),
+      method: "CHAR_ESTIMATE",
+      exact: false,
+      confidence: "FALLBACK",
+      safetyMargin: 1.25,
+      serializedChars,
+    });
+  });
+
+  it("applies the strictest physical/member ceiling and reserved margin", () => {
+    expect(
+      contextFitsLimits({
+        count: { tokens: 90, method: "NATIVE", exact: true },
+        physicalMaxContext: 200,
+        effectiveContextCeiling: 100,
+        contextMargin: 10,
+      }),
+    ).toBe(true);
+    expect(
+      contextFitsLimits({
+        count: { tokens: 91, method: "CHAR_ESTIMATE", exact: false },
+        physicalMaxContext: 200,
+        effectiveContextCeiling: 100,
+        contextMargin: 10,
+      }),
+    ).toBe(false);
   });
 });

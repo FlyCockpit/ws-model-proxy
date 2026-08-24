@@ -224,6 +224,9 @@ function directRow({
   capabilityOverrideMetadata = null,
   endpointCapabilityMetadata,
   optimisticBasicTranscription = false,
+  physicalMaxContext,
+  directContextCeiling,
+  directContextMargin = 0,
 }: {
   id?: string;
   upstreamModelId?: string;
@@ -238,6 +241,9 @@ function directRow({
   capabilityOverrideMetadata?: Record<string, unknown> | null;
   endpointCapabilityMetadata?: Record<string, unknown> | null;
   optimisticBasicTranscription?: boolean;
+  physicalMaxContext?: number;
+  directContextCeiling?: number;
+  directContextMargin?: number;
 } = {}) {
   return {
     id,
@@ -247,7 +253,13 @@ function directRow({
     capabilityOverrideMode: capabilityOverrideMetadata ? "OVERRIDE" : "INHERIT_ENDPOINT_DEFAULTS",
     capabilityOverrideMetadata,
     optimisticBasicTranscription,
-    ExecutionTarget: { id: `${id}-target`, inferenceCapacityId: `${id}-capacity` },
+    ExecutionTarget: {
+      id: `${id}-target`,
+      inferenceCapacityId: `${id}-capacity`,
+      directContextCeiling,
+      directContextMargin,
+      InferenceCapacity: physicalMaxContext === undefined ? null : { physicalMaxContext },
+    },
     Endpoint: {
       id: "endpoint-id",
       slug: "endpoint-default",
@@ -295,6 +307,9 @@ function poolMemberRow({
   routingStatus = "ACTIVE",
   connected = true,
   capabilityOverrideMetadata = null,
+  physicalMaxContext,
+  capacityContextCeiling,
+  capacityContextMargin = 0,
 }: {
   id: string;
   discoveredModelId: string;
@@ -305,6 +320,9 @@ function poolMemberRow({
   routingStatus?: "ACTIVE" | "DRAINING" | "DISABLED";
   connected?: boolean;
   capabilityOverrideMetadata?: Record<string, unknown> | null;
+  physicalMaxContext?: number;
+  capacityContextCeiling?: number;
+  capacityContextMargin?: number;
 }) {
   return {
     id,
@@ -318,9 +336,12 @@ function poolMemberRow({
     lastFailureAt: null,
     nextRetryAt: null,
     halfOpenTrialStartedAt: null,
+    capacityContextCeiling,
+    capacityContextMargin,
     ExecutionTarget: {
       id: `${id}-target`,
       inferenceCapacityId: `${id}-capacity`,
+      InferenceCapacity: physicalMaxContext === undefined ? null : { physicalMaxContext },
       DiscoveredModel: null,
     },
     DiscoveredModel: {
@@ -3026,6 +3047,97 @@ describe("model API routes", () => {
       }),
     );
     now.mockRestore();
+  });
+
+  it("rejects direct context ceilings before durable admission", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue(directRow({ directContextCeiling: 1 }));
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(),
+      release: vi.fn(),
+      hold: vi.fn((response) => response),
+    };
+    const manager = new FakeRelayManager();
+    const response = await appWith(manager, true, false, capacityRuntime).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(),
+      },
+    );
+
+    expect(response.status).toBe(413);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { message: expect.stringContaining("context exceeds") },
+    });
+    expect(capacityRuntime.acquire).not.toHaveBeenCalled();
+    expect(manager.sent).toHaveLength(0);
+  });
+
+  it("filters over-context pool members before admission", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "too-small",
+        discoveredModelId: "small-model",
+        upstreamModelId: "small-upstream",
+        cliDeviceId: "cli-small",
+        capacityContextCeiling: 1,
+      }),
+      poolMemberRow({
+        id: "fits",
+        discoveredModelId: "fits-model",
+        upstreamModelId: "fits-upstream",
+        cliDeviceId: "cli-fits",
+        capacityContextCeiling: 10_000,
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-small", "cli-fits"];
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async (attempt) => {
+        const candidate = attempt.candidates[0]!;
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: "context-lease",
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      }),
+      release: vi.fn().mockResolvedValue(true),
+      hold: vi.fn((response) => response),
+    };
+    const responsePromise = appWith(manager, true, false, capacityRuntime).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+      },
+    );
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    expect(requireSent(manager).cliDeviceId).toBe("cli-fits");
+    expect(capacityRuntime.acquire).toHaveBeenCalledWith(
+      expect.objectContaining({
+        candidates: [expect.objectContaining({ poolMemberId: "fits" })],
+      }),
+      expect.anything(),
+    );
+    const sent = requireSent(manager);
+    manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+    const response = await responsePromise;
+    manager.body(sent.requestId, JSON.stringify({ id: "chatcmpl", choices: [] }));
+    manager.complete(sent.requestId);
+    await response.text();
   });
 
   it("replays a spooled transcription across compatible pool members and accounts both attempts", async () => {
