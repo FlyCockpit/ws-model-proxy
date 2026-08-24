@@ -2014,21 +2014,55 @@ async function relayPool({
       executionPathForPoolMember(effectivePoolMemberCapabilities(member), operation),
     ]),
   );
+  let canonicalAdaptationRequest: ReturnType<typeof parseCanonicalRequest> | null = null;
+  if (operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled) {
+    try {
+      canonicalAdaptationRequest = parseCanonicalRequest(
+        operation.adaptation.requestedSurface,
+        operation.adaptation.payload,
+      );
+    } catch {
+      // Native members may still accept extensions outside the strict adapted subset.
+    }
+  }
   const protocolCandidates = members.filter((member) => {
     const execution = executionByMember.get(member.id);
-    return execution
-      ? execution.mode !== "unavailable"
-      : supportsOperation({
-          capabilities: effectivePoolMemberCapabilities(member),
-          operation,
-        });
+    if (!execution)
+      return supportsOperation({
+        capabilities: effectivePoolMemberCapabilities(member),
+        operation,
+      });
+    if (execution.mode === "unavailable") return false;
+    if (execution.mode === "native") return true;
+    const source = execution.nativeSurface ? protocolSurface(execution.nativeSurface) : null;
+    if (!source || !canonicalAdaptationRequest) return false;
+    try {
+      renderCanonicalRequest({
+        request: canonicalAdaptationRequest,
+        target: source,
+        model: member.DiscoveredModel.upstreamModelId,
+        allowLossyDeveloperRoleCollapse: operation.adaptation?.allowLossyDeveloperRoleCollapse,
+      });
+      return true;
+    } catch {
+      return false;
+    }
   });
   const nativeProtocolCandidates = protocolCandidates.filter(
     (member) => executionByMember.get(member.id)?.mode === "native",
   );
   // Native-compatible members are preferred as a class before health/weight scoring.
-  const knownEligibleMembers =
-    nativeProtocolCandidates.length > 0 ? nativeProtocolCandidates : protocolCandidates;
+  const adaptedProtocolCandidates = protocolCandidates.filter(
+    (member) => executionByMember.get(member.id)?.mode === "adapted",
+  );
+  const legacyProtocolCandidates = protocolCandidates.filter(
+    (member) => executionByMember.get(member.id) == null,
+  );
+  const knownEligibleMembers = [
+    ...nativeProtocolCandidates,
+    ...adaptedProtocolCandidates,
+    ...legacyProtocolCandidates,
+  ];
   const knownIds = new Set(knownEligibleMembers.map((member) => member.id));
   const unknownFallbackMembers =
     target.optimisticBasicTranscription &&
@@ -2058,8 +2092,18 @@ async function relayPool({
 
   const activeCliDeviceIds = manager.getActiveCliDeviceIds();
   const now = new Date();
-  const knownSequence = buildPoolRouteSequence({
-    members: knownEligibleMembers,
+  const nativeSequence = buildPoolRouteSequence({
+    members: nativeProtocolCandidates,
+    activeCliDeviceIds,
+    now,
+  });
+  const adaptedSequence = buildPoolRouteSequence({
+    members: adaptedProtocolCandidates,
+    activeCliDeviceIds,
+    now,
+  });
+  const legacySequence = buildPoolRouteSequence({
+    members: legacyProtocolCandidates,
     activeCliDeviceIds,
     now,
   });
@@ -2069,7 +2113,9 @@ async function relayPool({
     now,
   });
   const routeCandidates = [
-    ...(knownSequence.ok ? knownSequence.candidates : []),
+    ...(nativeSequence.ok ? nativeSequence.candidates : []),
+    ...(adaptedSequence.ok ? adaptedSequence.candidates : []),
+    ...(legacySequence.ok ? legacySequence.candidates : []),
     ...(unknownSequence.ok ? unknownSequence.candidates : []),
   ];
   if (routeCandidates.length === 0) {
@@ -2125,12 +2171,13 @@ async function relayPool({
     try {
       builtRequest = await operation.buildRequest(candidate.upstreamModelId);
       if (adaptedSource && operation.adaptation) {
-        const canonical = parseCanonicalRequest(
-          operation.adaptation.requestedSurface,
-          operation.adaptation.payload,
-        );
+        if (!canonicalAdaptationRequest)
+          throw new AdapterError(
+            "unsupported_adaptation",
+            "Request is outside the strict adapted subset.",
+          );
         const rendered = renderCanonicalRequest({
-          request: canonical,
+          request: canonicalAdaptationRequest,
           target: adaptedSource,
           model: candidate.upstreamModelId,
           allowLossyDeveloperRoleCollapse: operation.adaptation.allowLossyDeveloperRoleCollapse,
@@ -2224,6 +2271,43 @@ async function relayPool({
         continue;
       }
 
+      if (adaptedSource && operation.adaptation && started.status >= 200 && started.status < 300) {
+        const upstreamSse =
+          started.headers.get("content-type")?.toLowerCase().startsWith("text/event-stream") ===
+          true;
+        if (upstreamSse !== operation.stream) {
+          attempt.cancel("protocol_error");
+          const terminal = await attempt.terminal;
+          cliLease.release();
+          globalLease.release();
+          if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+          await operation.dispose?.();
+          await updateRelayMetadata(relayRequestId, {
+            selectedDiscoveredModelId: member.discoveredModelId,
+            status: "FAILED",
+            startedAt,
+            terminal,
+            fallbackFailure: "protocol_error",
+            attemptCount,
+          });
+          const error = {
+            code: "protocol_error",
+            message: operation.stream
+              ? "Adapted streaming upstream did not return an SSE stream."
+              : "Adapted non-streaming upstream unexpectedly returned SSE.",
+            upstreamStatus: 502,
+          };
+          const metadata = renderProtocolErrorMetadata(
+            operation.adaptation.requestedSurface,
+            error,
+          );
+          return new Response(
+            JSON.stringify(renderProtocolError(operation.adaptation.requestedSurface, error)),
+            { status: metadata.status, headers: metadata.headers },
+          );
+        }
+      }
+
       const finalize = attempt.terminal
         .then(async (terminal) => {
           const cumulativeTerminal = {
@@ -2284,6 +2368,16 @@ async function relayPool({
         );
         responseHeaders.set("x-wsmp-adapter-version", "1.0.0");
         responseHeaders.set("x-wsmp-adapter-limitations", "strict_common_subset");
+        for (const name of [
+          "content-encoding",
+          "content-disposition",
+          "content-length",
+          "etag",
+          "last-modified",
+          "content-md5",
+          "digest",
+        ])
+          responseHeaders.delete(name);
         const sourceRequestId =
           adaptedSource === "anthropic-messages"
             ? responseHeaders.get("request-id")

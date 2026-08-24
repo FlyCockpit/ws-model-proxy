@@ -602,7 +602,7 @@ describe("model API routes", () => {
     expect(text).toContain("data: [DONE]");
   });
 
-  it("prefers a native pool member over an otherwise adaptable member", async () => {
+  it("prefers native members, then falls back to an adaptable member before commitment", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
       modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
@@ -655,8 +655,36 @@ describe("model API routes", () => {
     const sent = requireSent(manager);
     expect(sent.family).toBe("chat.completions");
     expect(sent.path).toBe("/v1/chat/completions");
-    await completeJsonRelay({ manager, requestId: sent.requestId });
-    await responsePromise;
+    manager.headers(sent.requestId, 500, { "content-type": "application/json" });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(2));
+    const adapted = requireSent(manager, 1);
+    expect(adapted.family).toBe("responses");
+    expect(adapted.path).toBe("/v1/responses");
+    manager.headers(adapted.requestId, 200, { "content-type": "application/json" });
+    manager.body(
+      adapted.requestId,
+      JSON.stringify({
+        id: "resp-fallback",
+        object: "response",
+        created_at: 0,
+        status: "completed",
+        model: "upstream-responses",
+        output: [],
+        usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 },
+        error: null,
+        incomplete_details: null,
+        parallel_tool_calls: false,
+        tool_choice: "none",
+        tools: [],
+        temperature: null,
+        top_p: null,
+        max_output_tokens: null,
+      }),
+    );
+    manager.complete(adapted.requestId);
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ object: "chat.completion" });
   });
 
   it("lists only model targets visible to the bearer token", async () => {
