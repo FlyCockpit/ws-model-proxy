@@ -22,7 +22,13 @@ cp "$REPO_ROOT/scripts/docker-entrypoint.sh" "$TEST_ROOT/usr/local/bin/docker-en
 
 cat > "$TEST_ROOT/bin/node" <<'EOF'
 #!/bin/sh
-if [ "${1:-}" = "-e" ]; then exit 0; fi
+if [ "${1:-}" = "-e" ]; then
+  if [ "${NODE_TERM_PARENT:-0}" = "1" ]; then
+    echo node-term-parent >> "$ENTRYPOINT_TEST_EVENTS"
+    kill -TERM "$PPID"
+  fi
+  exit 0
+fi
 echo harden >> "$ENTRYPOINT_TEST_EVENTS"
 exit "${HARDEN_EXIT_STATUS:-0}"
 EOF
@@ -137,6 +143,19 @@ run_entrypoint
 assert_status 1
 assert_events ''
 grep -q 'APPLY_SCHEMA=typo is invalid' "$OUTPUT"
+
+# TERM received while preparing the connection environment (before a psql
+# child exists) is fatal and cannot be swallowed into schema/app startup. The
+# node fixture signals its parent synchronously, making the race deterministic.
+export APPLY_SCHEMA=safe NODE_TERM_PARENT=1
+run_entrypoint
+assert_status 143
+assert_events 'node-term-parent'
+if grep -q '^psql$\|^exec$' "$EVENTS"; then
+  echo "Schema or app started after pre-child interruption" >&2
+  exit 1
+fi
+unset NODE_TERM_PARENT
 
 # The PID-1 shell forwards termination to the active psql lock session.
 : > "$EVENTS"

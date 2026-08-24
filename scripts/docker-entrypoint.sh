@@ -80,18 +80,28 @@ if [ "$APPLY_SCHEMA" != "off" ]; then
   echo 0 > "$HARDEN_STATUS_FILE"
 
   schema_child_pid=""
+  schema_signal_status=""
   cleanup_schema_files() {
     rm -f "$STATUS_FILE" "$HARDEN_STATUS_FILE"
   }
-  forward_schema_signal() {
+  handle_schema_signal() {
+    signal_name=$1
+    signal_status=$2
+    schema_signal_status=$signal_status
     if [ -n "$schema_child_pid" ]; then
-      kill "-$1" "$schema_child_pid" 2>/dev/null || true
+      kill "-$signal_name" "$schema_child_pid" 2>/dev/null || true
+      return
     fi
+
+    # A signal may arrive while preparing the psql environment, before there
+    # is a child to forward it to. Do not swallow it and continue into schema
+    # sync (or application startup); exit with the conventional shell status.
+    exit "$signal_status"
   }
   trap cleanup_schema_files EXIT
-  trap 'forward_schema_signal HUP' HUP
-  trap 'forward_schema_signal INT' INT
-  trap 'forward_schema_signal TERM' TERM
+  trap 'handle_schema_signal HUP 129' HUP
+  trap 'handle_schema_signal INT 130' INT
+  trap 'handle_schema_signal TERM 143' TERM
 
   echo "Acquiring schema advisory lock ($LOCK_ID)..."
   # psql holds a session-level advisory lock across the `\!` shell call that
@@ -140,9 +150,18 @@ EOF
   set +e
   wait "$schema_child_pid"
   psql_status=$?
+  if [ -n "$schema_signal_status" ]; then
+    # Some shells interrupt wait as soon as the trap runs. Reap the forwarded
+    # child before exiting so the lock session cannot outlive PID 1.
+    wait "$schema_child_pid" 2>/dev/null
+  fi
   set -e
   schema_child_pid=""
   trap - HUP INT TERM
+
+  if [ -n "$schema_signal_status" ]; then
+    exit "$schema_signal_status"
+  fi
 
   if [ "$psql_status" != "0" ]; then
     echo "FATAL: schema sync psql session failed (exit $psql_status)." >&2
