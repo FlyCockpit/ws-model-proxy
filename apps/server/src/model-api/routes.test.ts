@@ -809,6 +809,298 @@ describe("model API routes", () => {
     await expect(response.json()).resolves.toMatchObject({ object: "chat.completion" });
   });
 
+  it("falls back when an adapted non-streaming member returns malformed JSON before commitment", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+    });
+    db.poolMember.findMany.mockResolvedValue(
+      ["first", "second"].map((suffix) =>
+        poolMemberRow({
+          id: `${suffix}-responses-member`,
+          discoveredModelId: `${suffix}-responses-model`,
+          upstreamModelId: `${suffix}-upstream-responses`,
+          cliDeviceId: `cli-${suffix}`,
+          capabilityOverrideMetadata: {
+            version: 3,
+            protocol: "openai-compatible",
+            surfaces: {
+              openaiResponses: {
+                source: "declared",
+                confidence: "exact",
+                supported: true,
+              },
+            },
+          },
+        }),
+      ),
+    );
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-first", "cli-second"];
+    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(poolTarget.modelId),
+    });
+
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const malformed = requireSent(manager);
+    manager.headers(malformed.requestId, 200, { "content-type": "application/json" });
+    manager.body(malformed.requestId, '{"object":"response"');
+    manager.complete(malformed.requestId);
+
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(2));
+    expect(manager.cancelled).toContainEqual({
+      cliDeviceId: "cli-first",
+      requestId: malformed.requestId,
+      reason: "protocol_error",
+    });
+    const fallback = requireSent(manager, 1);
+    await completeJsonRelay({
+      manager,
+      requestId: fallback.requestId,
+      body: {
+        id: "resp-fallback",
+        object: "response",
+        created_at: 0,
+        status: "completed",
+        model: "second-upstream-responses",
+        output: [],
+        usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 },
+        error: null,
+        incomplete_details: null,
+        parallel_tool_calls: false,
+        tool_choice: "none",
+        tools: [],
+        temperature: null,
+        top_p: null,
+        max_output_tokens: null,
+      },
+    });
+
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ object: "chat.completion" });
+    expect(manager.sent).toHaveLength(2);
+  });
+
+  it("falls back when an adapted SSE member fails before its first rendered event", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+    });
+    db.poolMember.findMany.mockResolvedValue(
+      ["first", "second"].map((suffix) =>
+        poolMemberRow({
+          id: `${suffix}-responses-member`,
+          discoveredModelId: `${suffix}-responses-model`,
+          upstreamModelId: `${suffix}-upstream-responses`,
+          cliDeviceId: `cli-${suffix}`,
+          capabilityOverrideMetadata: {
+            version: 3,
+            protocol: "openai-compatible",
+            surfaces: {
+              openaiResponses: {
+                source: "declared",
+                confidence: "exact",
+                supported: true,
+                streaming: true,
+              },
+            },
+          },
+        }),
+      ),
+    );
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-first", "cli-second"];
+    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        stream: true,
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const malformed = requireSent(manager);
+    manager.headers(malformed.requestId, 200, { "content-type": "text/event-stream" });
+    manager.body(malformed.requestId, "event: response.created\ndata: {not-json}\n\n");
+    manager.complete(malformed.requestId);
+
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(2));
+    const fallback = requireSent(manager, 1);
+    manager.headers(fallback.requestId, 200, { "content-type": "text/event-stream" });
+    for (const record of responsesConformanceFixture.events) {
+      manager.body(
+        fallback.requestId,
+        `${record.event ? `event: ${record.event}\n` : ""}data: ${typeof record.data === "string" ? record.data : JSON.stringify(record.data)}\n\n`,
+      );
+    }
+    manager.complete(fallback.requestId);
+
+    const response = await responsePromise;
+    const text = await response.text();
+    expect(text).toContain('"content":"Hello"');
+    expect(text).toContain("data: [DONE]");
+    expect(manager.sent).toHaveLength(2);
+  });
+
+  it("propagates adapted downstream cancellation and performs relay cleanup exactly once", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "responses-member",
+        discoveredModelId: "responses-model",
+        upstreamModelId: "upstream-responses",
+        cliDeviceId: "cli-responses",
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiResponses: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+            },
+          },
+        },
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-responses"];
+    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        stream: true,
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    manager.headers(sent.requestId, 200, { "content-type": "text/event-stream" });
+    const first = responsesConformanceFixture.events[0];
+    if (!first) throw new Error("Expected a conformance event.");
+    manager.body(
+      sent.requestId,
+      `${first.event ? `event: ${first.event}\n` : ""}data: ${JSON.stringify(first.data)}\n\n`,
+    );
+
+    const response = await responsePromise;
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("Expected a response body.");
+    await reader.read();
+    await reader.cancel("caller stopped reading");
+
+    await vi.waitFor(() => expect(manager.cancelled).toHaveLength(1));
+    expect(manager.cancelled).toEqual([
+      { cliDeviceId: "cli-responses", requestId: sent.requestId, reason: "cancelled" },
+    ]);
+    expect(manager.completed.filter((requestId) => requestId === sent.requestId)).toHaveLength(1);
+    await vi.waitFor(() =>
+      expect(db.relayRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: "CANCELED", attemptCount: 1 }),
+        }),
+      ),
+    );
+    expect(
+      db.relayRequest.update.mock.calls.filter(
+        ([call]) => call?.data?.attemptCount === 1 && call?.data?.status === "CANCELED",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("filters adapted pool candidates against both tool and image requirements", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+    });
+    const adaptedMember = (id: string, tools: boolean, inputImages: boolean) =>
+      poolMemberRow({
+        id,
+        discoveredModelId: `${id}-model`,
+        upstreamModelId: `${id}-upstream`,
+        cliDeviceId: `cli-${id}`,
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiResponses: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              tools,
+              inputImages,
+            },
+          },
+        },
+      });
+    db.poolMember.findMany.mockResolvedValue([
+      adaptedMember("no-tools", false, true),
+      adaptedMember("no-images", true, false),
+      adaptedMember("fully-capable", true, true),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-no-tools", "cli-no-images", "cli-fully-capable"];
+    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "describe this" },
+              { type: "image_url", image_url: { url: "data:image/png;base64,QUJDRA==" } },
+            ],
+          },
+        ],
+        tools: [{ type: "function", function: { name: "lookup", parameters: {} } }],
+        parallel_tool_calls: false,
+      }),
+    });
+
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    expect(sent.cliDeviceId).toBe("cli-fully-capable");
+    expect(JSON.parse(await relayBodyText(sent))).toMatchObject({
+      model: "fully-capable-upstream",
+      tools: [{ type: "function", name: "lookup" }],
+    });
+    await completeJsonRelay({
+      manager,
+      requestId: sent.requestId,
+      body: {
+        id: "resp-tools-images",
+        object: "response",
+        created_at: 0,
+        status: "completed",
+        model: "fully-capable-upstream",
+        output: [],
+        usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 },
+        error: null,
+        incomplete_details: null,
+        parallel_tool_calls: false,
+        tool_choice: "none",
+        tools: [],
+        temperature: null,
+        top_p: null,
+        max_output_tokens: null,
+      },
+    });
+    expect((await responsePromise).status).toBe(200);
+    expect(manager.sent).toHaveLength(1);
+  });
+
   it("lists only model targets visible to the bearer token", async () => {
     db.discoveredModel.findMany.mockResolvedValue([
       {
