@@ -5,6 +5,7 @@ REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 TEST_ROOT=$(mktemp -d)
 ENTRYPOINT_PID=""
 WATCHDOG_PID=""
+LAST_SCHEMA_PID=""
 WATCHDOG_DONE="$TEST_ROOT/watchdog-done"
 WATCHDOG_FIRED="$TEST_ROOT/watchdog-fired"
 SCHEMA_PID_FILE="$TEST_ROOT/schema-group-pid"
@@ -119,8 +120,10 @@ export ENTRYPOINT_TEST_SCHEMA_LAUNCH_PID_FILE="$SCHEMA_PID_FILE"
 start_entrypoint() {
   rm -f "$WATCHDOG_DONE" "$WATCHDOG_FIRED" "$SCHEMA_PID_FILE"
   # Reset dispositions that POSIX shells may set to ignored for asynchronous
-  # commands, so the HUP/INT/TERM scenarios exercise the entrypoint traps.
-  sh -c 'trap - HUP INT TERM; exec "$@"' watchdog-launch \
+  # commands, so the HUP/INT/TERM scenarios exercise the entrypoint traps. A
+  # child shell cannot portably undo an ignored disposition inherited from
+  # this shell, whereas GNU env resets it before executing the entrypoint.
+  env --default-signal=HUP --default-signal=INT --default-signal=TERM \
     "$TEST_ROOT/usr/local/bin/docker-entrypoint.sh" app-command > "$OUTPUT" 2>&1 &
   ENTRYPOINT_PID=$!
   (
@@ -153,6 +156,10 @@ wait_entrypoint() {
     cat "$OUTPUT" >&2
     exit 1
   fi
+  LAST_SCHEMA_PID=""
+  if [ -s "$SCHEMA_PID_FILE" ]; then
+    LAST_SCHEMA_PID=$(cat "$SCHEMA_PID_FILE")
+  fi
   rm -f "$SCHEMA_PID_FILE"
 }
 
@@ -162,38 +169,6 @@ run_entrypoint() {
   wait_entrypoint
 }
 
-# Run in the foreground when testing the instruction-sized launch signal hook.
-# In particular, POSIX shells are allowed to start asynchronous commands with
-# SIGINT ignored. The watchdog targets this harness only on timeout; its EXIT
-# trap then performs bounded entrypoint/schema-group cleanup.
-run_entrypoint_foreground() {
-  : > "$EVENTS"
-  rm -f "$WATCHDOG_DONE" "$WATCHDOG_FIRED" "$SCHEMA_PID_FILE"
-  (
-    watchdog_attempt=0
-    while [ ! -e "$WATCHDOG_DONE" ] && [ "$watchdog_attempt" -lt 200 ]; do
-      watchdog_attempt=$((watchdog_attempt + 1))
-      sleep 0.05
-    done
-    if [ ! -e "$WATCHDOG_DONE" ]; then
-      : > "$WATCHDOG_FIRED"
-      kill -TERM "$$" 2>/dev/null || true
-    fi
-  ) &
-  WATCHDOG_PID=$!
-  set +e
-  "$TEST_ROOT/usr/local/bin/docker-entrypoint.sh" app-command > "$OUTPUT" 2>&1
-  RUN_STATUS=$?
-  set -e
-  : > "$WATCHDOG_DONE"
-  wait "$WATCHDOG_PID" 2>/dev/null || true
-  WATCHDOG_PID=""
-  if [ -e "$WATCHDOG_FIRED" ]; then
-    echo "Timed out waiting for foreground docker entrypoint scenario" >&2
-    cat "$OUTPUT" >&2
-    exit 1
-  fi
-}
 assert_status() {
   if [ "$RUN_STATUS" -ne "$1" ]; then
     echo "Expected entrypoint exit $1, got $RUN_STATUS" >&2
@@ -294,14 +269,25 @@ for launch_case in HUP:129 INT:130 TERM:143; do
   : > "$EVENTS"
   rm -f "$LAUNCH_PID_FILE"
   export ENTRYPOINT_TEST_SCHEMA_LAUNCH_SIGNAL="$launch_signal"
-  run_entrypoint_foreground
+  # Use the bounded asynchronous harness here too. Its wrapper resets signal
+  # dispositions before exec (POSIX shells may otherwise ignore SIGINT for an
+  # asynchronous command), while ENTRYPOINT_PID and SCHEMA_PID_FILE let the
+  # watchdog/EXIT trap terminate and reap both the entrypoint and its private
+  # schema process group without ever signalling this test harness itself.
+  run_entrypoint
   signal_status=$RUN_STATUS
   if [ "$signal_status" -ne "$expected_status" ]; then
     echo "Expected launch-window $launch_signal to produce exit $expected_status, got $signal_status" >&2
     cat "$OUTPUT" >&2
     exit 1
   fi
-  launch_pid=$(cat "$LAUNCH_PID_FILE")
+  launch_pid=$LAST_SCHEMA_PID
+  case "$launch_pid" in
+    *[!0-9]*|'')
+      echo "Launch-window schema group PID was not recorded" >&2
+      exit 1
+      ;;
+  esac
   if kill -0 "-$launch_pid" 2>/dev/null; then
     echo "Launch-window schema group $launch_pid survived $launch_signal handoff" >&2
     exit 1
