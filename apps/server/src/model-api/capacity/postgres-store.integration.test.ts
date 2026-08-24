@@ -1,4 +1,5 @@
 import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
+import { PostgresNotificationListener } from "@ws-model-proxy/db/postgres-notifications";
 import { describe, expect, it } from "vitest";
 import { PRIORITY_CLASS_COUNT, scheduleWeightedDeficitRoundRobin } from "./scheduler.js";
 
@@ -118,6 +119,60 @@ integration("PostgreSQL capacity admission primitives", () => {
       await client.$disconnect();
       await cleanup.user.delete({ where: { id: user.id } }).catch(() => undefined);
       await cleanup.$disconnect();
+    }
+  });
+
+  it("recovers from a notification missed while disconnected by bounded polling", async () => {
+    if (!databaseUrl) return;
+    process.env.DATABASE_URL = databaseUrl;
+    const db = createPrismaClient(databaseUrl);
+    const suffix = crypto.randomUUID();
+    const user = await db.user.create({
+      data: {
+        name: "Notify Proof",
+        email: `notify-${suffix}@example.test`,
+        slug: `notify-${suffix}`,
+      },
+    });
+    const capacity = await db.inferenceCapacity.create({
+      data: {
+        userId: user.id,
+        label: `notify-${suffix}`,
+        runtimeIdentityKey: `notify-${suffix}`,
+        runtimeModel: "notify-proof",
+      },
+    });
+    try {
+      await db.$executeRaw`SELECT pg_notify('wsmp_capacity', ${capacity.id})`;
+      await db.inferenceCapacity.update({
+        where: { id: capacity.id },
+        data: { schedulerVersion: 2 },
+      });
+      const listener = new PostgresNotificationListener(databaseUrl);
+      await listener.connect();
+      const { waitWithCapacityPolling } = await import("./postgres-store.js");
+      let polls = 0;
+      const result = await waitWithCapacityPolling({
+        capacityIds: [capacity.id],
+        deadlineAt: new Date(Date.now() + 500),
+        minimumPollMs: 20,
+        maximumPollMs: 20,
+        wakeSource: { wait: async (_ids, timeout) => void (await listener.wait(timeout)) },
+        poll: async () => {
+          polls++;
+          if (polls === 1) return { state: "WAITING" as const, requestId: "notify-proof" };
+          const row = await db.inferenceCapacity.findUniqueOrThrow({ where: { id: capacity.id } });
+          return row.schedulerVersion === 2
+            ? { state: "CANCELLED" as const }
+            : { state: "WAITING" as const, requestId: "notify-proof" };
+        },
+      });
+      expect(result).toEqual({ state: "CANCELLED" });
+      expect(polls).toBeGreaterThan(0);
+      await listener.close();
+    } finally {
+      await db.user.delete({ where: { id: user.id } }).catch(() => undefined);
+      await db.$disconnect();
     }
   });
 
@@ -375,6 +430,29 @@ integration("PostgreSQL capacity admission primitives", () => {
             where: { attemptId: abandonedAttempt.attemptId },
           }),
         ).toMatchObject({ state: "CANCELLED", terminalReason: "connection_abandoned" });
+        const releaseRaceAttempt = {
+          ...lowAttempt,
+          requestId: `request-release-race-${suffix}`,
+          attemptId: `attempt-release-race-${suffix}`,
+        };
+        await expect(firstManager.acquire(releaseRaceAttempt)).resolves.toMatchObject({
+          state: "WAITING",
+        });
+        const { waitWithCapacityPolling } = await import("./postgres-store.js");
+        const [, releaseRaceResult] = await Promise.all([
+          high.state === "ADMITTED" ? secondManager.release(high.lease) : Promise.resolve(false),
+          waitWithCapacityPolling({
+            capacityIds: [capacity.id],
+            deadlineAt: new Date(Date.now() + 1_000),
+            minimumPollMs: 5,
+            maximumPollMs: 10,
+            poll: () => firstManager.acquire({ ...releaseRaceAttempt, candidates: [] }),
+          }),
+        ]);
+        expect(releaseRaceResult).toMatchObject({ state: "ADMITTED" });
+        expect(
+          await db.capacityLease.count({ where: { capacityId: capacity.id, state: "ACTIVE" } }),
+        ).toBe(1);
         const raceAttempt = {
           ...lowAttempt,
           requestId: `request-race-${suffix}`,
@@ -404,7 +482,8 @@ integration("PostgreSQL capacity admission primitives", () => {
           state: "WAITING",
         });
         await new Promise((resolve) => setTimeout(resolve, 40));
-        if (high.state === "ADMITTED") await secondManager.release(high.lease);
+        if (releaseRaceResult.state === "ADMITTED")
+          await firstManager.release(releaseRaceResult.lease);
         await expect(firstManager.acquire({ ...deadlineAttempt, candidates: [] })).resolves.toEqual(
           {
             state: "EXPIRED",

@@ -10,6 +10,9 @@
     },
     "./client-factory": {
       "default": "./src/client-factory.ts"
+    },
+    "./postgres-notifications": {
+      "default": "./src/postgres-notifications.ts"
     }
   },
   "scripts": {
