@@ -1347,11 +1347,7 @@ where
 {
     let message = parse_server_control(text).map_err(RelaySessionError::Fatal)?;
     match message {
-        ServerControlMessage::HelloOk {
-            id,
-            revision,
-            ..
-        } => {
+        ServerControlMessage::HelloOk { id, revision, .. } => {
             *last_inventory_revision = Some(revision);
             tracing::info!(id, "relay registration accepted");
         }
