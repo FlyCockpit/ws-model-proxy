@@ -317,6 +317,13 @@ export const ENV_VARS: EnvVar[] = [
     default: "false",
     comment: ["Release gate for opt-in model-pool cross-protocol adaptation."],
   },
+  {
+    key: "MODEL_API_GLOBAL_CAPACITY_ENABLED",
+    group: "runtime",
+    source: "default",
+    default: "false",
+    comment: ["Release gate for durable global capacity admission. Keep false until proven."],
+  },
 
   // --- auth ----------------------------------------------------------------
   {

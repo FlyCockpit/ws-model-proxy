@@ -130,6 +130,8 @@ export const env = createEnv({
     MODEL_API_ANTHROPIC_ENABLED: strictBooleanFlag(),
     // Cross-protocol pool adaptation is independently release-gated and off by default.
     MODEL_API_PROTOCOL_ADAPTATION_ENABLED: strictBooleanFlag(),
+    // Durable shared-capacity admission remains gated until PostgreSQL concurrency proofs pass.
+    MODEL_API_GLOBAL_CAPACITY_ENABLED: strictBooleanFlag(),
   },
   runtimeEnv: process.env,
   emptyStringAsUndefined: true,
