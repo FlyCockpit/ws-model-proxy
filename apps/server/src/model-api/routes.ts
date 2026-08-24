@@ -2139,7 +2139,7 @@ async function relayDirect({
     builtRequest = await operation.buildRequest(selected.upstreamModelId);
   } catch {
     cliLease.release();
-    globalLease.release();
+    globalLease?.release();
     if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
     await operation.dispose?.();
     await failRelayMetadata({
@@ -2212,7 +2212,7 @@ async function relayDirect({
   } catch {
     const terminal = await attempt.terminal;
     cliLease.release();
-    globalLease.release();
+    globalLease?.release();
     if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
     if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
     await operation.dispose?.();
@@ -2259,20 +2259,7 @@ async function relayPool({
     requestBytes: null,
   });
 
-  let globalLease: ModelApiLimitLease;
-  try {
-    globalLease = limiter.acquireGlobal({
-      tokenId: requester.limitKey,
-      userId: requester.userId,
-    });
-  } catch (error) {
-    if (error instanceof ModelApiLimitError) {
-      await operation.dispose?.();
-      await failRelayMetadata({ relayRequestId, startedAt, failure: error.failure });
-      return operationFailureResponse(operation, error.failure);
-    }
-    throw error;
-  }
+  let globalLease: ModelApiLimitLease | undefined;
 
   const members = await poolMemberRows(target.id);
   let canonicalAdaptationRequest: ReturnType<typeof parseCanonicalRequest> | null = null;
@@ -2351,7 +2338,7 @@ async function relayPool({
   // Known-compatible members always route before optimistic unknown fallbacks.
   const eligibleMembers = [...knownEligibleMembers, ...unknownFallbackMembers];
   if (eligibleMembers.length === 0) {
-    globalLease.release();
+    globalLease?.release();
     await operation.dispose?.();
     await failRelayMetadata({
       relayRequestId,
@@ -2390,7 +2377,7 @@ async function relayPool({
     ...(unknownSequence.ok ? unknownSequence.candidates : []),
   ];
   if (routeCandidates.length === 0) {
-    globalLease.release();
+    globalLease?.release();
     await operation.dispose?.();
     await failRelayMetadata({ relayRequestId, startedAt, failure: "disconnected" });
     return operationFailureResponse(operation, "disconnected");
@@ -2412,7 +2399,7 @@ async function relayPool({
       };
     });
     if (admissionCandidates.some((candidate) => candidate === null)) {
-      globalLease.release();
+      globalLease?.release();
       await operation.dispose?.();
       await failRelayMetadata({ relayRequestId, startedAt, failure: "unsupported_capability" });
       return operationFailureResponse(operation, "unsupported_capability");
@@ -2433,13 +2420,13 @@ async function relayPool({
         request.signal,
       );
     } catch {
-      globalLease.release();
+      globalLease?.release();
       await operation.dispose?.();
       await failRelayMetadata({ relayRequestId, startedAt, failure: "unknown" });
       return operationFailureResponse(operation, "unknown");
     }
     if (capacityLease.state !== "ADMITTED" || !capacityLease.lease.poolMemberId) {
-      globalLease.release();
+      globalLease?.release();
       await operation.dispose?.();
       await failRelayMetadata({ relayRequestId, startedAt, failure: "rate_limited" });
       return operationFailureResponse(operation, "rate_limited");
@@ -2448,6 +2435,20 @@ async function relayPool({
     selectedRouteCandidates = routeCandidates.filter(
       ({ poolMemberId }) => poolMemberId === selectedPoolMemberId,
     );
+  }
+  try {
+    globalLease = limiter.acquireGlobal({
+      tokenId: requester.limitKey,
+      userId: requester.userId,
+    });
+  } catch (error) {
+    if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
+    if (error instanceof ModelApiLimitError) {
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: error.failure });
+      return operationFailureResponse(operation, error.failure);
+    }
+    throw error;
   }
   let finalFailure: RelayFailure = "unknown";
   let attemptCount = 0;

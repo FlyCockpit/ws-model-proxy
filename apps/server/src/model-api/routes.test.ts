@@ -245,6 +245,7 @@ function directRow({
     capabilityOverrideMode: capabilityOverrideMetadata ? "OVERRIDE" : "INHERIT_ENDPOINT_DEFAULTS",
     capabilityOverrideMetadata,
     optimisticBasicTranscription,
+    ExecutionTarget: { id: `${id}-target`, inferenceCapacityId: `${id}-capacity` },
     Endpoint: {
       id: "endpoint-id",
       slug: "endpoint-default",

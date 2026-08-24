@@ -1,4 +1,4 @@
-import { waitWithCapacityPolling } from "./postgres-store.js";
+import { type CapacityWakeSource, waitWithCapacityPolling } from "./postgres-store.js";
 import { holdCapacityLeaseForResponse } from "./response-lease.js";
 import type {
   AdmissionAttempt,
@@ -25,6 +25,7 @@ export class StoreCapacityAdmissionRuntime implements CapacityAdmissionRuntime {
     },
     private readonly pollIntervalMs = 100,
     private readonly maintenanceIntervalMs = 5_000,
+    private readonly wakeSource?: CapacityWakeSource,
   ) {}
 
   async acquire(attempt: AdmissionAttempt, signal?: AbortSignal): Promise<AdmissionResult> {
@@ -37,6 +38,7 @@ export class StoreCapacityAdmissionRuntime implements CapacityAdmissionRuntime {
       signal,
       minimumPollMs: this.pollIntervalMs,
       maximumPollMs: this.pollIntervalMs,
+      wakeSource: this.wakeSource,
       poll: () => this.store.acquire({ ...attempt, candidates: [] }, signal),
     });
   }
