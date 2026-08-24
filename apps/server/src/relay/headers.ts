@@ -29,8 +29,6 @@ const SAFE_HEADER_NAMES = new Set([
   "user-agent",
   "idempotency-key",
   "openai-beta",
-  "openai-organization",
-  "openai-project",
   "openai-version",
   "anthropic-version",
   "anthropic-beta",

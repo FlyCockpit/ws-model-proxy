@@ -96,6 +96,8 @@ describe("sanitizeRelayRequestHeaders", () => {
       Accept: "application/json",
       "Content-Type": "application/json",
       "OpenAI-Beta": "responses=v1",
+      "OpEnAI-OrGaNiZaTiOn": "org_untrusted",
+      "OPENAI-PrOjEcT": "project_untrusted",
       "X-Request-Id": "request-id",
       "Anthropic-Version": "2023-06-01",
       "Anthropic-Beta": "one,two",
@@ -109,5 +111,7 @@ describe("sanitizeRelayRequestHeaders", () => {
       "anthropic-version": "2023-06-01",
       "anthropic-beta": "one,two",
     });
+    expect(headers).not.toHaveProperty("openai-organization");
+    expect(headers).not.toHaveProperty("openai-project");
   });
 });
