@@ -27,7 +27,7 @@ export class NativeContextCounter implements ContextCounter {
       if (tokens === null) return null;
       if (!Number.isSafeInteger(tokens) || tokens < 0) return null;
       return { tokens, method: "NATIVE", exact: true };
-    } catch (error) {
+    } catch {
       if (signal?.aborted) throw signal.reason;
       // Unsupported/malformed/upstream count failures safely fall through to
       // template/token estimates; no inference request has been dispatched.
