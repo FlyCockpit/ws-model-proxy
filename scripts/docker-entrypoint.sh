@@ -18,8 +18,12 @@
 
 set -e
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-DB_PACKAGE_DIR="$SCRIPT_DIR/../packages/db"
+# The production entrypoint is installed in /usr/local/bin while the workspace
+# lives under /app, so its own directory cannot be used to locate packages.
+# APP_ROOT/DB_PACKAGE_DIR remain overridable for derivative images and the
+# executable entrypoint tests.
+APP_ROOT="${APP_ROOT:-/app}"
+DB_PACKAGE_DIR="${DB_PACKAGE_DIR:-$APP_ROOT/packages/db}"
 
 # --- 1. Required env vars ---
 missing=""
@@ -75,6 +79,20 @@ if [ "$APPLY_SCHEMA" != "off" ]; then
   HARDEN_STATUS_FILE=$(mktemp)
   echo 0 > "$HARDEN_STATUS_FILE"
 
+  schema_child_pid=""
+  cleanup_schema_files() {
+    rm -f "$STATUS_FILE" "$HARDEN_STATUS_FILE"
+  }
+  forward_schema_signal() {
+    if [ -n "$schema_child_pid" ]; then
+      kill "-$1" "$schema_child_pid" 2>/dev/null || true
+    fi
+  }
+  trap cleanup_schema_files EXIT
+  trap 'forward_schema_signal HUP' HUP
+  trap 'forward_schema_signal INT' INT
+  trap 'forward_schema_signal TERM' TERM
+
   echo "Acquiring schema advisory lock ($LOCK_ID)..."
   # psql holds a session-level advisory lock across the `\!` shell call that
   # invokes `prisma db push`. When the heredoc closes, the session exits and
@@ -112,17 +130,29 @@ if [ "$APPLY_SCHEMA" != "off" ]; then
   ')" || { echo "FATAL: could not parse DATABASE_URL for psql." >&2; exit 1; }
   eval "$pg_env"
 
-  psql -v ON_ERROR_STOP=1 <<EOF
+  psql -v ON_ERROR_STOP=1 <<EOF &
 SET lock_timeout = '300s';
 SELECT pg_advisory_lock($LOCK_ID);
 \! cd "$DB_PACKAGE_DIR" && node_modules/.bin/prisma db push $push_flags; push_status=\$?; echo \$push_status > "$STATUS_FILE"; if [ "\$push_status" -eq 0 ]; then node scripts/apply-schema-hardening.mjs; echo \$? > "$HARDEN_STATUS_FILE"; fi
 SELECT pg_advisory_unlock($LOCK_ID);
 EOF
+  schema_child_pid=$!
+  set +e
+  wait "$schema_child_pid"
+  psql_status=$?
+  set -e
+  schema_child_pid=""
+  trap - HUP INT TERM
+
+  if [ "$psql_status" != "0" ]; then
+    echo "FATAL: schema sync psql session failed (exit $psql_status)." >&2
+    exit "$psql_status"
+  fi
 
   status=$(cat "$STATUS_FILE")
   harden_status=$(cat "$HARDEN_STATUS_FILE")
-  rm -f "$STATUS_FILE"
-  rm -f "$HARDEN_STATUS_FILE"
+  cleanup_schema_files
+  trap - EXIT
   if [ "$status" != "0" ]; then
     echo "FATAL: prisma db push failed (exit $status)." >&2
     if [ "$APPLY_SCHEMA" = "safe" ]; then

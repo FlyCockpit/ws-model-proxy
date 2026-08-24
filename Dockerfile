@@ -190,6 +190,7 @@ COPY --from=prod-deps /app/apps/web/node_modules ./apps/web/node_modules
 # Copy Prisma schema + config for runtime `prisma db push` (gated on APPLY_SCHEMA)
 COPY --from=builder /app/packages/db/prisma ./packages/db/prisma
 COPY --from=builder /app/packages/db/prisma.config.ts ./packages/db/prisma.config.ts
+COPY --from=builder /app/packages/db/scripts/apply-schema-hardening.mjs ./packages/db/scripts/apply-schema-hardening.mjs
 # Copy generated Prisma client (built during deps stage)
 COPY --from=builder /app/packages/db/prisma/generated ./packages/db/prisma/generated
 # Copy prisma CLI (devDependency, not in prod node_modules) so the entrypoint can run `prisma db push`
