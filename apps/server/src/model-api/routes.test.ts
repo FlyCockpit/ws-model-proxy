@@ -6,6 +6,7 @@ import type {
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import type { ActiveRelayResponseHandlers, RelaySessionManager } from "../relay/session-manager.js";
 import officialAnthropicFixture from "./fixtures/anthropic-2023-06-01.json";
+import responsesConformanceFixture from "./protocols/fixtures/generated-conformance/openai-responses-sse.json";
 
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
@@ -334,11 +335,16 @@ function poolMemberRow({
   };
 }
 
-function appWith(manager: FakeRelayManager, anthropicEnabled = true) {
+function appWith(
+  manager: FakeRelayManager,
+  anthropicEnabled = true,
+  protocolAdaptationEnabled = false,
+) {
   return createModelApiRoutes({
     manager,
     concurrencyLimiter: new ModelApiConcurrencyLimiter(),
     anthropicEnabled,
+    protocolAdaptationEnabled,
   });
 }
 
@@ -423,6 +429,234 @@ describe("model API routes", () => {
     db.relayRequest.update.mockResolvedValue({ id: "relay-request-id" });
     db.responseStickinessRecord.findUnique.mockResolvedValue(null);
     db.responseStickinessRecord.upsert.mockResolvedValue({ id: "stickiness-id" });
+  });
+
+  it("adapts an opted-in Chat pool request through a Responses-only member", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "responses-member",
+        discoveredModelId: "responses-model",
+        upstreamModelId: "upstream-responses",
+        cliDeviceId: "cli-responses",
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiResponses: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+            },
+          },
+        },
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-responses"];
+    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(poolTarget.modelId),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    expect(sent.family).toBe("responses");
+    expect(sent.path).toBe("/v1/responses");
+    expect(JSON.parse(await relayBodyText(sent))).toMatchObject({
+      model: "upstream-responses",
+      input: [{ role: "user" }],
+    });
+    manager.headers(sent.requestId, 200, {
+      "content-type": "application/json",
+      "x-request-id": "req-adapted",
+    });
+    manager.body(
+      sent.requestId,
+      JSON.stringify({
+        id: "resp",
+        object: "response",
+        created_at: 0,
+        status: "completed",
+        model: "upstream-responses",
+        output: [
+          {
+            id: "message",
+            type: "message",
+            status: "completed",
+            role: "assistant",
+            content: [{ type: "output_text", text: "hello", annotations: [], logprobs: [] }],
+          },
+        ],
+        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+        error: null,
+        incomplete_details: null,
+        parallel_tool_calls: false,
+        tool_choice: "none",
+        tools: [],
+        temperature: null,
+        top_p: null,
+        max_output_tokens: null,
+      }),
+    );
+    manager.complete(sent.requestId);
+    const response = await responsePromise;
+    expect(response.headers.get("x-wsmp-adapter-version")).toBe("1.0.0");
+    await expect(response.json()).resolves.toMatchObject({
+      object: "chat.completion",
+      choices: [{ message: { content: "hello" } }],
+    });
+  });
+
+  it("keeps pool adaptation unavailable when the release gate is off", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "responses-member",
+        discoveredModelId: "responses-model",
+        upstreamModelId: "upstream-responses",
+        cliDeviceId: "cli-responses",
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiResponses: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+            },
+          },
+        },
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-responses"];
+    const response = await appWith(manager, true, false).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(poolTarget.modelId),
+    });
+    expect(response.status).toBe(400);
+    expect(manager.sent).toEqual([]);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "unsupported_capability" },
+    });
+  });
+
+  it("incrementally adapts a Responses SSE member back to requested Chat SSE", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "responses-member",
+        discoveredModelId: "responses-model",
+        upstreamModelId: "upstream-responses",
+        cliDeviceId: "cli-responses",
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiResponses: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+            },
+          },
+        },
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-responses"];
+    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        stream: true,
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    manager.headers(sent.requestId, 200, { "content-type": "text/event-stream" });
+    const response = await responsePromise;
+    for (const record of responsesConformanceFixture.events) {
+      manager.body(
+        sent.requestId,
+        `${record.event ? `event: ${record.event}\n` : ""}data: ${typeof record.data === "string" ? record.data : JSON.stringify(record.data)}\n\n`,
+      );
+    }
+    manager.complete(sent.requestId);
+    const text = await response.text();
+    expect(text).toContain('"content":"Hello"');
+    expect(text).toContain("data: [DONE]");
+  });
+
+  it("prefers a native pool member over an otherwise adaptable member", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "responses-member",
+        discoveredModelId: "responses-model",
+        upstreamModelId: "upstream-responses",
+        cliDeviceId: "cli-responses",
+        weight: 100,
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiResponses: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+            },
+          },
+        },
+      }),
+      poolMemberRow({
+        id: "chat-member",
+        discoveredModelId: "chat-model",
+        upstreamModelId: "upstream-chat",
+        cliDeviceId: "cli-chat",
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiChatCompletions: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+            },
+          },
+        },
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-responses", "cli-chat"];
+    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(poolTarget.modelId),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    expect(sent.family).toBe("chat.completions");
+    expect(sent.path).toBe("/v1/chat/completions");
+    await completeJsonRelay({ manager, requestId: sent.requestId });
+    await responsePromise;
   });
 
   it("lists only model targets visible to the bearer token", async () => {

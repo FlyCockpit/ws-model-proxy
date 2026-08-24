@@ -98,6 +98,16 @@ import {
   openAiFailureJsonResponse,
   relayFailureHttpStatus,
 } from "./openai-errors.js";
+import {
+  AdapterError,
+  adaptNonstreamResponse,
+  createProtocolAdaptationTransform,
+  type ProtocolSurface,
+  parseCanonicalRequest,
+  renderCanonicalRequest,
+  renderProtocolError,
+  renderProtocolErrorMetadata,
+} from "./protocols/index.js";
 import { type RelayAttemptTerminal, startRelayAttempt } from "./relay-executor.js";
 import { type RelayBodySource } from "./request-body-source.js";
 import {
@@ -179,6 +189,13 @@ type RelayOperation = {
   responseStickiness?: ResponseStickinessCapture;
   anthropicIngress?: AnthropicIngress;
   dispose?: () => Promise<void>;
+  adaptation?: {
+    featureEnabled: boolean;
+    poolEnabled: boolean;
+    allowLossyDeveloperRoleCollapse: boolean;
+    requestedSurface: ProtocolSurface;
+    payload: JsonObject;
+  };
 };
 
 function operationFailureResponse(
@@ -817,6 +834,115 @@ function supportsOperation({
       transcriptionProfile: operation.transcriptionProfile,
     }),
   );
+}
+
+function requestedSurfaceForOperation(operation: RelayOperation): ProtocolSurface | null {
+  if (operation.family === "chat.completions") return "openai-chat";
+  if (operation.family === "responses" && operation.capability === "responses.create")
+    return "openai-responses";
+  if (operation.family === "messages" && operation.capability === "messages.create")
+    return "anthropic-messages";
+  return null;
+}
+
+function modelApiSurface(surface: ProtocolSurface) {
+  return surface === "openai-chat"
+    ? ("OPENAI_CHAT_COMPLETIONS" as const)
+    : surface === "openai-responses"
+      ? ("OPENAI_RESPONSES" as const)
+      : ("ANTHROPIC_MESSAGES" as const);
+}
+
+function protocolSurface(surface: string): ProtocolSurface | null {
+  if (surface === "OPENAI_CHAT_COMPLETIONS") return "openai-chat";
+  if (surface === "OPENAI_RESPONSES") return "openai-responses";
+  if (surface === "ANTHROPIC_MESSAGES") return "anthropic-messages";
+  return null;
+}
+
+function nativeRouteForSurface(surface: ProtocolSurface) {
+  if (surface === "openai-chat")
+    return { family: "chat.completions" as const, path: "/v1/chat/completions" };
+  if (surface === "openai-responses")
+    return { family: "responses" as const, path: "/v1/responses" };
+  return { family: "messages" as const, path: "/v1/messages" };
+}
+
+function adaptedResponseBody({
+  body,
+  source,
+  target,
+  stream,
+  status,
+  headers,
+  signal,
+}: {
+  body: ReadableStream<Uint8Array>;
+  source: ProtocolSurface;
+  target: ProtocolSurface;
+  stream: boolean;
+  status: number;
+  headers: Headers;
+  signal: AbortSignal;
+}): ReadableStream<Uint8Array> {
+  if (stream)
+    return body.pipeThrough(createProtocolAdaptationTransform({ source, target, signal }), {
+      signal,
+    });
+  const reader = body.getReader();
+  return new ReadableStream({
+    async start(controller) {
+      try {
+        const chunks: Uint8Array[] = [];
+        let bytes = 0;
+        while (true) {
+          const result = await reader.read();
+          if (result.done) break;
+          bytes += result.value.byteLength;
+          if (bytes > MODEL_API_MAX_REQUEST_BODY_BYTES)
+            throw new Error("adapted response exceeded bounded buffer");
+          chunks.push(result.value);
+        }
+        const merged = new Uint8Array(bytes);
+        let offset = 0;
+        for (const chunk of chunks) {
+          merged.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        const parsed = JSON.parse(new TextDecoder().decode(merged)) as unknown;
+        const adapted = adaptNonstreamResponse({ source, target, body: parsed, status, headers });
+        const output = adapted.ok ? adapted.body : renderProtocolError(target, adapted.error);
+        controller.enqueue(new TextEncoder().encode(JSON.stringify(output)));
+        controller.close();
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+}
+
+function executionPathForPoolMember(
+  capabilities: OpenAiCompatibleCapabilities | null,
+  operation: RelayOperation,
+) {
+  const requestedSurface = requestedSurfaceForOperation(operation);
+  if (!requestedSurface) return null;
+  const adaptationEnabled =
+    operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled;
+  return resolveExecutionPath({
+    capabilities,
+    requestedSurface: modelApiSurface(requestedSurface),
+    request: {
+      stream: operation.stream,
+      protocolVersion: operation.anthropicIngress?.version,
+      betaFeatures: operation.anthropicIngress?.betaFeatures,
+      responsesOperation: requestedSurface === "openai-responses" ? "create" : undefined,
+    },
+    adaptationEnabled,
+  });
 }
 
 function isEndpointConnected(row: DirectModelRelayRow, activeCliDeviceIds: Set<string>): boolean {
@@ -1882,12 +2008,27 @@ async function relayPool({
   }
 
   const members = await poolMemberRows(target.id);
-  const knownEligibleMembers = members.filter((member) =>
-    supportsOperation({
-      capabilities: effectivePoolMemberCapabilities(member),
-      operation,
-    }),
+  const executionByMember = new Map(
+    members.map((member) => [
+      member.id,
+      executionPathForPoolMember(effectivePoolMemberCapabilities(member), operation),
+    ]),
   );
+  const protocolCandidates = members.filter((member) => {
+    const execution = executionByMember.get(member.id);
+    return execution
+      ? execution.mode !== "unavailable"
+      : supportsOperation({
+          capabilities: effectivePoolMemberCapabilities(member),
+          operation,
+        });
+  });
+  const nativeProtocolCandidates = protocolCandidates.filter(
+    (member) => executionByMember.get(member.id)?.mode === "native",
+  );
+  // Native-compatible members are preferred as a class before health/weight scoring.
+  const knownEligibleMembers =
+    nativeProtocolCandidates.length > 0 ? nativeProtocolCandidates : protocolCandidates;
   const knownIds = new Set(knownEligibleMembers.map((member) => member.id));
   const unknownFallbackMembers =
     target.optimisticBasicTranscription &&
@@ -1976,10 +2117,61 @@ async function relayPool({
       }
     }
     let builtRequest: BuiltRelayRequest;
+    const execution = executionByMember.get(member.id);
+    const adaptedSource =
+      execution?.mode === "adapted" && execution.nativeSurface
+        ? protocolSurface(execution.nativeSurface)
+        : null;
     try {
       builtRequest = await operation.buildRequest(candidate.upstreamModelId);
-    } catch {
+      if (adaptedSource && operation.adaptation) {
+        const canonical = parseCanonicalRequest(
+          operation.adaptation.requestedSurface,
+          operation.adaptation.payload,
+        );
+        const rendered = renderCanonicalRequest({
+          request: canonical,
+          target: adaptedSource,
+          model: candidate.upstreamModelId,
+          allowLossyDeveloperRoleCollapse: operation.adaptation.allowLossyDeveloperRoleCollapse,
+        });
+        if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+        const adaptedHeaders = new Headers(builtRequest.headers);
+        adaptedHeaders.delete("content-length");
+        if (adaptedSource === "anthropic-messages") {
+          adaptedHeaders.set("anthropic-version", "2023-06-01");
+          adaptedHeaders.delete("anthropic-beta");
+        } else {
+          adaptedHeaders.delete("anthropic-version");
+          adaptedHeaders.delete("anthropic-beta");
+        }
+        builtRequest = {
+          headers: adaptedHeaders,
+          body: new TextEncoder().encode(JSON.stringify(rendered)),
+        };
+      }
+    } catch (error) {
       cliLease.release();
+      if (error instanceof AdapterError && operation.adaptation) {
+        globalLease.release();
+        await operation.dispose?.();
+        const canonicalError = {
+          code: "invalid_request_error",
+          message: error.message,
+          parameter: error.parameter,
+          upstreamStatus: 400,
+        };
+        const metadata = renderProtocolErrorMetadata(
+          operation.adaptation.requestedSurface,
+          canonicalError,
+        );
+        return new Response(
+          JSON.stringify(
+            renderProtocolError(operation.adaptation.requestedSurface, canonicalError),
+          ),
+          { status: metadata.status, headers: metadata.headers },
+        );
+      }
       finalFailure = "unknown";
       await recordPoolMemberRelayFailure({
         poolMemberId: candidate.poolMemberId,
@@ -2002,9 +2194,9 @@ async function relayPool({
       manager,
       cliDeviceId: candidate.cliDeviceId,
       endpointSlug: member.DiscoveredModel.Endpoint.slug,
-      family: operation.family,
+      family: adaptedSource ? nativeRouteForSurface(adaptedSource).family : operation.family,
       method: operation.method,
-      path: operation.path,
+      path: adaptedSource ? nativeRouteForSurface(adaptedSource).path : operation.path,
       headers: builtRequest.headers,
       ...relayAttemptBody(builtRequest.body),
       timeoutMs: attemptTimeoutMs,
@@ -2065,15 +2257,67 @@ async function relayPool({
         })
         .catch(metadataUpdateError);
       void finalize;
-      return new Response(
-        responseBodyForOperation({
-          body: started.body,
-          headers: started.headers,
-          terminal: attempt.terminal,
-          operation,
-        }),
-        { status: started.status, headers: started.headers },
-      );
+      const responseHeaders = new Headers(started.headers);
+      let responseBody = responseBodyForOperation({
+        body: started.body,
+        headers: started.headers,
+        terminal: attempt.terminal,
+        operation,
+      });
+      if (adaptedSource && operation.adaptation) {
+        const adaptedStreaming =
+          operation.stream &&
+          responseHeaders.get("content-type")?.toLowerCase().startsWith("text/event-stream") ===
+            true;
+        responseBody = adaptedResponseBody({
+          body: responseBody,
+          source: adaptedSource,
+          target: operation.adaptation.requestedSurface,
+          stream: adaptedStreaming,
+          status: started.status,
+          headers: responseHeaders,
+          signal: request.signal,
+        });
+        responseHeaders.set(
+          "content-type",
+          adaptedStreaming ? "text/event-stream; charset=utf-8" : "application/json; charset=utf-8",
+        );
+        responseHeaders.set("x-wsmp-adapter-version", "1.0.0");
+        responseHeaders.set("x-wsmp-adapter-limitations", "strict_common_subset");
+        const sourceRequestId =
+          adaptedSource === "anthropic-messages"
+            ? responseHeaders.get("request-id")
+            : responseHeaders.get("x-request-id");
+        responseHeaders.delete("request-id");
+        responseHeaders.delete("x-request-id");
+        if (sourceRequestId)
+          responseHeaders.set(
+            operation.adaptation.requestedSurface === "anthropic-messages"
+              ? "request-id"
+              : "x-request-id",
+            sourceRequestId,
+          );
+        const rateHeaderPairs = [
+          ["x-ratelimit-limit-requests", "anthropic-ratelimit-requests-limit"],
+          ["x-ratelimit-remaining-requests", "anthropic-ratelimit-requests-remaining"],
+          ["x-ratelimit-reset-requests", "anthropic-ratelimit-requests-reset"],
+        ] as const;
+        for (const [openAiName, anthropicName] of rateHeaderPairs) {
+          const value = responseHeaders.get(
+            adaptedSource === "anthropic-messages" ? anthropicName : openAiName,
+          );
+          responseHeaders.delete(openAiName);
+          responseHeaders.delete(anthropicName);
+          if (value)
+            responseHeaders.set(
+              operation.adaptation.requestedSurface === "anthropic-messages"
+                ? anthropicName
+                : openAiName,
+              value,
+            );
+        }
+      }
+      return new Response(responseBody, { status: started.status, headers: responseHeaders });
     } catch {
       const terminal = await attempt.terminal;
       cumulativeRequestBytes += terminal.requestBytes;
@@ -2814,6 +3058,7 @@ async function relayPreparedModeledRequest({
   operation,
   manager,
   limiter,
+  adaptationFeatureEnabled = false,
 }: {
   request: Request;
   requester: RelayRequester;
@@ -2823,6 +3068,7 @@ async function relayPreparedModeledRequest({
   };
   prepared: PreparedModeledRequest;
   operation: Omit<RelayOperation, "stream" | "buildRequest">;
+  adaptationFeatureEnabled?: boolean;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
 }) {
@@ -2902,6 +3148,25 @@ async function relayPreparedModeledRequest({
       buildRequest: prepared.buildRequest,
       transcriptionProfile: prepared.transcriptionProfile,
       dispose: prepared.dispose,
+      ...(prepared.payload &&
+      (operation.family === "chat.completions" ||
+        (operation.family === "responses" && operation.capability === "responses.create") ||
+        (operation.family === "messages" && operation.capability === "messages.create"))
+        ? {
+            adaptation: {
+              featureEnabled: adaptationFeatureEnabled,
+              poolEnabled: poolTarget.protocolAdaptationEnabled,
+              allowLossyDeveloperRoleCollapse: poolTarget.allowLossyDeveloperRoleCollapse,
+              requestedSurface:
+                operation.family === "chat.completions"
+                  ? ("openai-chat" as const)
+                  : operation.family === "responses" && operation.capability === "responses.create"
+                    ? ("openai-responses" as const)
+                    : ("anthropic-messages" as const),
+              payload: prepared.payload,
+            },
+          }
+        : {}),
     };
     const response = await relayPool({
       request,
@@ -2928,12 +3193,14 @@ async function authenticatedModeledHandler({
   prepare,
   manager,
   limiter,
+  adaptationFeatureEnabled,
 }: {
   request: Request;
   operation: Omit<RelayOperation, "stream" | "buildRequest">;
   prepare: (request: Request) => Promise<PreparedModeledRequest | Response>;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
+  adaptationFeatureEnabled?: boolean;
 }) {
   const token = await authenticateRequest(request);
   if (!token)
@@ -2965,6 +3232,7 @@ async function authenticatedModeledHandler({
       operation,
       manager,
       limiter,
+      adaptationFeatureEnabled,
     });
     responseReturned = true;
     return response;
@@ -2978,11 +3246,13 @@ async function completionsHandler({
   family,
   manager,
   limiter,
+  adaptationFeatureEnabled,
 }: {
   request: Request;
   family: "chat.completions" | "completions";
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
+  adaptationFeatureEnabled?: boolean;
 }) {
   return authenticatedModeledHandler({
     request,
@@ -2995,6 +3265,7 @@ async function completionsHandler({
     prepare: prepareJsonModeledRequest,
     manager,
     limiter,
+    adaptationFeatureEnabled,
   });
 }
 
@@ -3056,10 +3327,12 @@ async function responsesCreateHandler({
   request,
   manager,
   limiter,
+  adaptationFeatureEnabled,
 }: {
   request: Request;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
+  adaptationFeatureEnabled?: boolean;
 }) {
   const token = await authenticateRequest(request);
   if (!token)
@@ -3088,6 +3361,7 @@ async function responsesCreateHandler({
       operation,
       manager,
       limiter,
+      adaptationFeatureEnabled,
     });
   }
 
@@ -3211,11 +3485,13 @@ async function anthropicMessagesHandler({
   countTokens,
   manager,
   limiter,
+  adaptationFeatureEnabled,
 }: {
   request: Request;
   countTokens: boolean;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
+  adaptationFeatureEnabled?: boolean;
 }) {
   const token = await authenticateRequest(request);
   if (!token) {
@@ -3245,6 +3521,7 @@ async function anthropicMessagesHandler({
     },
     manager,
     limiter,
+    adaptationFeatureEnabled,
   });
   // Native upstream success and error bytes are intentionally opaque here.
   // Reading or cloning the stream would violate streaming and backpressure.
@@ -3258,7 +3535,6 @@ export function createModelApiRoutes({
   protocolAdaptationEnabled = env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
 }: ModelApiRouteDependencies = {}) {
   const app = new Hono();
-  void protocolAdaptationEnabled;
 
   app.get("/models", async (c) => {
     const token = await authenticateRequest(c.req.raw);
@@ -3275,6 +3551,7 @@ export function createModelApiRoutes({
       family: "chat.completions",
       manager,
       limiter: concurrencyLimiter,
+      adaptationFeatureEnabled: protocolAdaptationEnabled,
     }),
   );
 
@@ -3284,6 +3561,7 @@ export function createModelApiRoutes({
       family: "completions",
       manager,
       limiter: concurrencyLimiter,
+      adaptationFeatureEnabled: protocolAdaptationEnabled,
     }),
   );
 
@@ -3299,6 +3577,7 @@ export function createModelApiRoutes({
       prepare: prepareJsonModeledRequest,
       manager,
       limiter: concurrencyLimiter,
+      adaptationFeatureEnabled: protocolAdaptationEnabled,
     }),
   );
 
@@ -3352,6 +3631,7 @@ export function createModelApiRoutes({
       request: c.req.raw,
       manager,
       limiter: concurrencyLimiter,
+      adaptationFeatureEnabled: protocolAdaptationEnabled,
     }),
   );
 
@@ -3362,6 +3642,7 @@ export function createModelApiRoutes({
         countTokens: false,
         manager,
         limiter: concurrencyLimiter,
+        adaptationFeatureEnabled: protocolAdaptationEnabled,
       }),
     );
 

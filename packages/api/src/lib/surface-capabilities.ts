@@ -307,7 +307,12 @@ export function resolveExecutionPath({
     request.countTokens === true &&
     features.countTokens !== true;
   const failures = [
-    ...incompatibilities(features, request),
+    ...incompatibilities(
+      features,
+      selected.mode === "adapted"
+        ? { ...request, protocolVersion: undefined, betaFeatures: undefined }
+        : request,
+    ),
     ...(lifecycleUnsupported ? [`responses_${lifecycleOperation}_unavailable`] : []),
     ...(anthropicCountTokensUnsupported ? ["countTokens_unavailable"] : []),
     ...(selected.mode === "adapted" ? adaptedSubsetFailures(request) : []),
