@@ -15,8 +15,14 @@ export function createProductionCapacityRuntime() {
     },
   };
   const store = new PostgresCapacityAdmissionStore(prisma, crypto.randomUUID(), notifier);
+  const runtime = new StoreCapacityAdmissionRuntime(store, 100, 5_000, wakeSource);
+  const maintenanceTimer = setInterval(() => void runtime.maintain().catch(() => undefined), 5_000);
+  maintenanceTimer.unref?.();
   return {
-    runtime: new StoreCapacityAdmissionRuntime(store, 100, 5_000, wakeSource),
-    close: () => wakeSource.close(),
+    runtime,
+    async close() {
+      clearInterval(maintenanceTimer);
+      await wakeSource.close();
+    },
   };
 }
