@@ -12,7 +12,7 @@ describe("published-derived request/response/error fixtures", () => {
   it("conforms all three modern protocol surfaces", async () => {
     const fixture = JSON.parse(
       await readFile(
-        new URL("./fixtures/published/modern-nonstream.json", import.meta.url),
+        new URL("./fixtures/generated-conformance/modern-nonstream.json", import.meta.url),
         "utf8",
       ),
     ) as {

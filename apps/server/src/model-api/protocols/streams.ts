@@ -1044,9 +1044,71 @@ function validateResponseEnvelope(response: Record<string, unknown>) {
     "top_p",
     "truncation",
     "metadata",
+    "usage",
   ])
     if (!(key in response))
       throw new AdapterError("invalid_response_envelope", `Responses envelope is missing ${key}.`);
+  const emptyObject = (value: unknown) =>
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.keys(value).length === 0;
+  if (
+    response.instructions !== null ||
+    response.max_output_tokens !== null ||
+    response.parallel_tool_calls !== false ||
+    response.previous_response_id !== null ||
+    response.store !== false ||
+    response.temperature !== null ||
+    response.tool_choice !== "none" ||
+    !Array.isArray(response.tools) ||
+    response.tools.length !== 0 ||
+    response.top_p !== null ||
+    response.truncation !== "disabled" ||
+    !emptyObject(response.metadata)
+  )
+    throw new AdapterError(
+      "unsupported_response_configuration",
+      "Responses envelope contains unsupported mutable configuration.",
+    );
+  const reasoning = object(response.reasoning, "response.reasoning");
+  rejectUnknown(reasoning, ["effort", "summary"], "response.reasoning");
+  if (reasoning.effort !== null || reasoning.summary !== null)
+    unsupported("response.reasoning", "is not safely adaptable");
+  const text = object(response.text, "response.text");
+  rejectUnknown(text, ["format"], "response.text");
+  const format = object(text.format, "response.text.format");
+  rejectUnknown(format, ["type"], "response.text.format");
+  if (format.type !== "text") unsupported("response.text.format.type");
+  if (
+    (response.status === "in_progress" &&
+      (response.error !== null ||
+        response.incomplete_details !== null ||
+        response.usage !== null)) ||
+    (response.status === "completed" &&
+      (response.error !== null || response.incomplete_details !== null)) ||
+    (response.status === "incomplete" &&
+      (response.error !== null || response.incomplete_details == null)) ||
+    (response.status === "failed" && response.error == null)
+  )
+    throw new AdapterError(
+      "invalid_response_state",
+      "Responses status does not match error, incomplete, or usage state.",
+    );
+}
+
+function validateCanonicalUsage(usage: { inputTokens?: number; outputTokens?: number }) {
+  if (
+    !Number.isSafeInteger(usage.inputTokens) ||
+    !Number.isSafeInteger(usage.outputTokens) ||
+    (usage.inputTokens as number) < 0 ||
+    (usage.outputTokens as number) < 0 ||
+    !Number.isSafeInteger((usage.inputTokens as number) + (usage.outputTokens as number))
+  )
+    throw new AdapterError(
+      "invalid_usage",
+      "Canonical usage requires complete non-negative safe integer token counts.",
+    );
 }
 
 function validIndex(index: number) {
@@ -1269,9 +1331,12 @@ export class CanonicalStreamRenderer {
       this.#started = true;
       this.#messageId = event.id;
       this.#model = event.model;
+      if (event.usage) validateCanonicalUsage(event.usage);
       return;
     }
     if (event.type === "error") {
+      if (this.#stopped)
+        throw new AdapterError("event_after_stop", "Canonical error followed the stop barrier.");
       this.#terminal = true;
       return;
     }
@@ -1353,6 +1418,7 @@ export class CanonicalStreamRenderer {
     } else if (event.type === "usage") {
       if (this.#usageEvent)
         throw new AdapterError("duplicate_usage", "Canonical stream emitted usage twice.");
+      validateCanonicalUsage(event.usage);
       this.#usageEvent = event;
     } else if (event.type === "complete") {
       if (!this.#stopped)
@@ -1679,6 +1745,7 @@ export class CanonicalStreamRenderer {
               top_p: null,
               truncation: "disabled",
               metadata: {},
+              usage: null,
               ...(this.#usageEvent
                 ? {
                     usage: {
@@ -1717,11 +1784,6 @@ export class CanonicalStreamRenderer {
 
   #anthropic(event: CanonicalEvent): WirePayload[] {
     if (event.type === "message_start") {
-      if (event.usage?.inputTokens === undefined || event.usage.outputTokens === undefined)
-        throw new AdapterError(
-          "missing_initial_usage",
-          "Anthropic message_start rendering requires complete initial usage.",
-        );
       return [
         named("message_start", {
           message: {
@@ -1733,8 +1795,8 @@ export class CanonicalStreamRenderer {
             stop_reason: null,
             stop_sequence: null,
             usage: {
-              input_tokens: event.usage.inputTokens,
-              output_tokens: event.usage.outputTokens,
+              input_tokens: event.usage?.inputTokens ?? 0,
+              output_tokens: event.usage?.outputTokens ?? 0,
             },
           },
         }),

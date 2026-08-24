@@ -165,7 +165,7 @@ describe("canonical request adapters", () => {
 
 describe("published fixture provenance", () => {
   it("pins every published-derived payload by SHA-256", async () => {
-    const directory = new URL("./fixtures/published/", import.meta.url);
+    const directory = new URL("./fixtures/generated-conformance/", import.meta.url);
     const manifest = JSON.parse(await readFile(new URL("manifest.json", directory), "utf8")) as {
       fixtures: Array<{ payload: string; payloadSha256: string }>;
     };
@@ -365,7 +365,7 @@ describe("canonical streaming state machines", () => {
     const truncated = new CanonicalStreamParser("openai-responses");
     truncated.push(
       new TextEncoder().encode(
-        'event: response.created\ndata: {"type":"response.created","sequence_number":0,"response":{"id":"r","object":"response","created_at":0,"status":"in_progress","error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"gpt","output":[],"parallel_tool_calls":false,"previous_response_id":null,"reasoning":{},"store":false,"temperature":null,"text":{},"tool_choice":"none","tools":[],"top_p":null,"truncation":"disabled","metadata":{}}}\n\n',
+        'event: response.created\ndata: {"type":"response.created","sequence_number":0,"response":{"id":"r","object":"response","created_at":0,"status":"in_progress","error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"gpt","output":[],"parallel_tool_calls":false,"previous_response_id":null,"reasoning":{"effort":null,"summary":null},"store":false,"temperature":null,"text":{"format":{"type":"text"}},"tool_choice":"none","tools":[],"top_p":null,"truncation":"disabled","metadata":{},"usage":null}}\n\n',
       ),
     );
     expect(() => truncated.finish()).toThrow("terminal event");

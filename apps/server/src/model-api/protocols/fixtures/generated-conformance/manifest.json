@@ -1,5 +1,6 @@
 {
-  "capturedOrDerivedOn": "2026-08-24",
+  "generatedOn": "2026-08-24",
+  "provenance": "Synthetic conformance payloads generated from the cited API references; not captured or verbatim provider traffic.",
   "fixtures": [
     {
       "surface": "openai-chat",
@@ -13,7 +14,7 @@
       "version": "OpenAI API reference retrieved 2026-08-24",
       "source": "https://platform.openai.com/docs/api-reference/responses/create",
       "payload": "openai-responses-sse.json",
-      "payloadSha256": "a6184548b42b2bdbc8857d5f4d53a66385d4f8bebced43858304d1113993630f"
+      "payloadSha256": "efa25f920ac203058a949536d5fa04d3edd6bf6295ed29d14eb5c27821e19c10"
     },
     {
       "surface": "anthropic-messages",

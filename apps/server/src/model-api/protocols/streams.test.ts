@@ -32,6 +32,7 @@ const responseStart = (id: string) => ({
   top_p: null,
   truncation: "disabled",
   metadata: {},
+  usage: null,
 });
 const anthropicStart = (id: string) =>
   event("message_start", {
@@ -54,7 +55,7 @@ describe("strict canonical stream parsing", () => {
     ["anthropic-messages", "anthropic-messages-sse.json"],
   ] as const)("conforms to the pinned published-derived %s lifecycle", async (surface, file) => {
     const fixture = JSON.parse(
-      await readFile(new URL(`./fixtures/published/${file}`, import.meta.url), "utf8"),
+      await readFile(new URL(`./fixtures/generated-conformance/${file}`, import.meta.url), "utf8"),
     ) as {
       events: Array<{ event?: string; data: string | Record<string, unknown> }>;
     };

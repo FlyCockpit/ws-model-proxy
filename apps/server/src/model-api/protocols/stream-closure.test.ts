@@ -34,6 +34,7 @@ const responseStart = (id: string) => ({
   top_p: null,
   truncation: "disabled",
   metadata: {},
+  usage: null,
 });
 
 describe("cycle 21 streaming closure", () => {
@@ -56,6 +57,23 @@ describe("cycle 21 streaming closure", () => {
     const parsed = payloads.map((payload) =>
       JSON.parse(payload.match(/data: (.*)\n\n/s)?.[1] ?? "{}"),
     );
+    expect(payloads).toEqual(
+      parsed.map((payload) => `event: ${payload.type}\ndata: ${JSON.stringify(payload)}\n\n`),
+    );
+    expect(parsed.map((payload) => payload.type)).toEqual([
+      "response.created",
+      "response.output_item.added",
+      "response.content_part.added",
+      "response.output_text.delta",
+      "response.output_text.done",
+      "response.content_part.done",
+      "response.output_item.done",
+      "response.output_item.added",
+      "response.function_call_arguments.delta",
+      "response.function_call_arguments.done",
+      "response.output_item.done",
+      "response.completed",
+    ]);
     expect(parsed.map((payload) => payload.sequence_number)).toEqual(
       parsed.map((_, index) => index),
     );

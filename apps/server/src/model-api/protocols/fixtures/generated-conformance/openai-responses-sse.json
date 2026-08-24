@@ -29,7 +29,8 @@
           "tools": [],
           "top_p": null,
           "truncation": "disabled",
-          "metadata": {}
+          "metadata": {},
+          "usage": null
         }
       }
     },
