@@ -15,7 +15,11 @@ export type AdmissionCandidate = {
 
 export type AdmissionAttempt = {
   attemptId: string;
+  requestId: string;
   ownerId: string;
+  sourceKind: "DIRECT" | "POOL";
+  poolId?: string;
+  basePriority: number;
   connectionOwner: string;
   deadlineAt: Date;
   candidates: readonly AdmissionCandidate[];
