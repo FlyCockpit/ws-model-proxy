@@ -42,6 +42,11 @@ import {
   anthropicRelayHeaders,
   parseAnthropicIngress,
 } from "./anthropic-protocol.js";
+import { PostgresCapacityAdmissionStore } from "./capacity/postgres-store.js";
+import {
+  type CapacityAdmissionRuntime,
+  StoreCapacityAdmissionRuntime,
+} from "./capacity/runtime.js";
 import {
   MODEL_API_MAX_REQUEST_BODY_BYTES,
   MODEL_API_RELAY_TIMEOUT_MS,
@@ -138,6 +143,8 @@ type ModelApiRouteDependencies = {
   anthropicEnabled?: boolean;
   /** Independent release gate for opt-in pool protocol adaptation. */
   protocolAdaptationEnabled?: boolean;
+  capacityEnabled?: boolean;
+  capacityRuntime?: CapacityAdmissionRuntime;
 };
 
 type JsonObject = Record<string, unknown>;
@@ -2002,6 +2009,7 @@ async function relayDirect({
   operation,
   manager,
   limiter,
+  capacityRuntime,
 }: {
   request: Request;
   requester: RelayRequester;
@@ -2009,6 +2017,7 @@ async function relayDirect({
   operation: RelayOperation;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
+  capacityRuntime?: CapacityAdmissionRuntime;
 }): Promise<Response> {
   const startedAt = new Date();
   const relayRequestId = await createRelayMetadata({
@@ -2060,6 +2069,40 @@ async function relayDirect({
     return operationFailureResponse(operation, "disconnected");
   }
 
+  let capacityLease: Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>> | undefined;
+  if (capacityRuntime) {
+    const identity = selected.ExecutionTarget;
+    if (!identity?.inferenceCapacityId) {
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "unsupported_capability" });
+      return operationFailureResponse(operation, "unsupported_capability");
+    }
+    capacityLease = await capacityRuntime.acquire(
+      {
+        requestId: crypto.randomUUID(),
+        attemptId: crypto.randomUUID(),
+        ownerId: selected.userId,
+        sourceKind: "DIRECT",
+        basePriority: 16,
+        connectionOwner: "model-api",
+        deadlineAt: new Date(Date.now() + 30_000),
+        candidates: [
+          {
+            capacityId: identity.inferenceCapacityId,
+            executionTargetId: identity.id,
+            candidateOrder: 0,
+          },
+        ],
+      },
+      request.signal,
+    );
+    if (capacityLease.state !== "ADMITTED") {
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "rate_limited" });
+      return operationFailureResponse(operation, "rate_limited");
+    }
+  }
+
   let globalLease: ModelApiLimitLease | undefined;
   let cliLease: ModelApiLimitLease | undefined;
   try {
@@ -2071,6 +2114,7 @@ async function relayDirect({
   } catch (error) {
     cliLease?.release();
     globalLease?.release();
+    if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
     if (error instanceof ModelApiLimitError) {
       await operation.dispose?.();
       await failRelayMetadata({
@@ -2090,6 +2134,7 @@ async function relayDirect({
   } catch {
     cliLease.release();
     globalLease.release();
+    if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
     await operation.dispose?.();
     await failRelayMetadata({
       relayRequestId,
@@ -2146,7 +2191,7 @@ async function relayDirect({
       })
       .catch(metadataUpdateError);
     void finalize;
-    return new Response(
+    const response = new Response(
       responseBodyForOperation({
         body: started.body,
         headers: started.headers,
@@ -2155,10 +2200,14 @@ async function relayDirect({
       }),
       { status: started.status, headers: started.headers },
     );
+    return capacityLease?.state === "ADMITTED"
+      ? (capacityRuntime?.hold(response, capacityLease.lease, request.signal) ?? response)
+      : response;
   } catch {
     const terminal = await attempt.terminal;
     cliLease.release();
     globalLease.release();
+    if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
     if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
     await operation.dispose?.();
     await updateRelayMetadata(relayRequestId, {
@@ -3436,6 +3485,7 @@ async function relayPreparedModeledRequest({
   manager,
   limiter,
   adaptationFeatureEnabled = false,
+  capacityRuntime,
 }: {
   request: Request;
   requester: RelayRequester;
@@ -3446,6 +3496,7 @@ async function relayPreparedModeledRequest({
   prepared: PreparedModeledRequest;
   operation: Omit<RelayOperation, "stream" | "buildRequest">;
   adaptationFeatureEnabled?: boolean;
+  capacityRuntime?: CapacityAdmissionRuntime;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
 }) {
@@ -3482,6 +3533,7 @@ async function relayPreparedModeledRequest({
       operation: relayOperation,
       manager,
       limiter,
+      capacityRuntime,
     });
   }
 
@@ -3571,6 +3623,7 @@ async function authenticatedModeledHandler({
   manager,
   limiter,
   adaptationFeatureEnabled,
+  capacityRuntime,
 }: {
   request: Request;
   operation: Omit<RelayOperation, "stream" | "buildRequest">;
@@ -3578,6 +3631,7 @@ async function authenticatedModeledHandler({
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
   adaptationFeatureEnabled?: boolean;
+  capacityRuntime?: CapacityAdmissionRuntime;
 }) {
   const token = await authenticateRequest(request);
   if (!token)
@@ -3610,6 +3664,7 @@ async function authenticatedModeledHandler({
       manager,
       limiter,
       adaptationFeatureEnabled,
+      capacityRuntime,
     });
     responseReturned = true;
     return response;
@@ -3624,12 +3679,14 @@ async function completionsHandler({
   manager,
   limiter,
   adaptationFeatureEnabled,
+  capacityRuntime,
 }: {
   request: Request;
   family: "chat.completions" | "completions";
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
   adaptationFeatureEnabled?: boolean;
+  capacityRuntime?: CapacityAdmissionRuntime;
 }) {
   return authenticatedModeledHandler({
     request,
@@ -3643,6 +3700,7 @@ async function completionsHandler({
     manager,
     limiter,
     adaptationFeatureEnabled,
+    capacityRuntime,
   });
 }
 
@@ -3705,11 +3763,13 @@ async function responsesCreateHandler({
   manager,
   limiter,
   adaptationFeatureEnabled,
+  capacityRuntime,
 }: {
   request: Request;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
   adaptationFeatureEnabled?: boolean;
+  capacityRuntime?: CapacityAdmissionRuntime;
 }) {
   const token = await authenticateRequest(request);
   if (!token)
@@ -3739,6 +3799,7 @@ async function responsesCreateHandler({
       manager,
       limiter,
       adaptationFeatureEnabled,
+      capacityRuntime,
     });
   }
 
@@ -3863,12 +3924,14 @@ async function anthropicMessagesHandler({
   manager,
   limiter,
   adaptationFeatureEnabled,
+  capacityRuntime,
 }: {
   request: Request;
   countTokens: boolean;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
   adaptationFeatureEnabled?: boolean;
+  capacityRuntime?: CapacityAdmissionRuntime;
 }) {
   const token = await authenticateRequest(request);
   if (!token) {
@@ -3899,6 +3962,7 @@ async function anthropicMessagesHandler({
     manager,
     limiter,
     adaptationFeatureEnabled,
+    capacityRuntime,
   });
   // Native upstream success and error bytes are intentionally opaque here.
   // Reading or cloning the stream would violate streaming and backpressure.
@@ -3910,8 +3974,13 @@ export function createModelApiRoutes({
   concurrencyLimiter = modelApiConcurrencyLimiter,
   anthropicEnabled = env.MODEL_API_ANTHROPIC_ENABLED,
   protocolAdaptationEnabled = env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
+  capacityEnabled = env.MODEL_API_GLOBAL_CAPACITY_ENABLED,
+  capacityRuntime,
 }: ModelApiRouteDependencies = {}) {
   const app = new Hono();
+  const admissionRuntime = capacityEnabled
+    ? (capacityRuntime ?? new StoreCapacityAdmissionRuntime(new PostgresCapacityAdmissionStore()))
+    : undefined;
 
   app.get("/models", async (c) => {
     const token = await authenticateRequest(c.req.raw);
@@ -3929,6 +3998,7 @@ export function createModelApiRoutes({
       manager,
       limiter: concurrencyLimiter,
       adaptationFeatureEnabled: protocolAdaptationEnabled,
+      capacityRuntime: admissionRuntime,
     }),
   );
 
@@ -3939,6 +4009,7 @@ export function createModelApiRoutes({
       manager,
       limiter: concurrencyLimiter,
       adaptationFeatureEnabled: protocolAdaptationEnabled,
+      capacityRuntime: admissionRuntime,
     }),
   );
 
@@ -3954,6 +4025,7 @@ export function createModelApiRoutes({
       prepare: prepareJsonModeledRequest,
       manager,
       limiter: concurrencyLimiter,
+      capacityRuntime: admissionRuntime,
       adaptationFeatureEnabled: protocolAdaptationEnabled,
     }),
   );
@@ -3970,6 +4042,7 @@ export function createModelApiRoutes({
       prepare: prepareMultipartModeledRequest,
       manager,
       limiter: concurrencyLimiter,
+      capacityRuntime: admissionRuntime,
     }),
   );
 
@@ -4009,6 +4082,7 @@ export function createModelApiRoutes({
       manager,
       limiter: concurrencyLimiter,
       adaptationFeatureEnabled: protocolAdaptationEnabled,
+      capacityRuntime: admissionRuntime,
     }),
   );
 
@@ -4020,6 +4094,7 @@ export function createModelApiRoutes({
         manager,
         limiter: concurrencyLimiter,
         adaptationFeatureEnabled: protocolAdaptationEnabled,
+        capacityRuntime: admissionRuntime,
       }),
     );
 
@@ -4029,6 +4104,7 @@ export function createModelApiRoutes({
         countTokens: true,
         manager,
         limiter: concurrencyLimiter,
+        capacityRuntime: admissionRuntime,
       }),
     );
   }
