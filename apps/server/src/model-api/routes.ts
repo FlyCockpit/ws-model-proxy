@@ -199,9 +199,11 @@ function operationFailureResponse(
       ? "not_found_error"
       : status === 401 || status === 403
         ? "authentication_error"
-        : status >= 500
-          ? "api_error"
-          : "invalid_request_error",
+        : status === 429
+          ? "rate_limit_error"
+          : status >= 500
+            ? "api_error"
+            : "invalid_request_error",
   );
 }
 

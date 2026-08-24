@@ -1,10 +1,41 @@
 {
   "protocolVersion": "2023-06-01",
-  "source": "https://docs.anthropic.com/en/api/versioning",
+  "sources": {
+    "versioning": "https://docs.anthropic.com/en/api/versioning",
+    "messages": "https://docs.anthropic.com/en/api/messages",
+    "countTokens": "https://docs.anthropic.com/en/api/messages-count-tokens",
+    "errors": "https://docs.anthropic.com/en/api/errors",
+    "betaHeaders": "https://docs.anthropic.com/en/api/beta-headers"
+  },
   "capturedAt": "2026-08-24",
   "requestHeaders": {
     "anthropic-version": "2023-06-01",
     "anthropic-beta": "prompt-caching-2024-07-31,interleaved-thinking-2025-05-14"
+  },
+  "request": {
+    "model": "claude-sonnet-4-20250514",
+    "max_tokens": 32,
+    "messages": [{ "role": "user", "content": "Hello" }]
+  },
+  "response": {
+    "id": "msg_fixture",
+    "type": "message",
+    "role": "assistant",
+    "content": [{ "type": "text", "text": "Hello!" }],
+    "model": "claude-sonnet-4-20250514",
+    "stop_reason": "end_turn",
+    "stop_sequence": null,
+    "usage": { "input_tokens": 8, "output_tokens": 4 }
+  },
+  "countTokensRequest": {
+    "model": "claude-sonnet-4-20250514",
+    "messages": [{ "role": "user", "content": "Hello" }]
+  },
+  "countTokensResponse": { "input_tokens": 8 },
+  "beta": {
+    "header": "anthropic-beta",
+    "separator": ",",
+    "features": ["prompt-caching-2024-07-31", "interleaved-thinking-2025-05-14"]
   },
   "error": {
     "type": "error",

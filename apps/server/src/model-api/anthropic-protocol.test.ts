@@ -8,7 +8,10 @@ import officialFixture from "./fixtures/anthropic-2023-06-01.json";
 
 describe("Anthropic protocol boundary", () => {
   it("tracks the supported official-version fixture and ordered beta semantics", () => {
-    expect(officialFixture.source).toMatch(/^https:\/\/docs\.anthropic\.com\//);
+    expect(Object.values(officialFixture.sources)).toHaveLength(5);
+    for (const source of Object.values(officialFixture.sources)) {
+      expect(source).toMatch(/^https:\/\/docs\.anthropic\.com\//);
+    }
     const result = parseAnthropicIngress(new Headers(officialFixture.requestHeaders));
     expect(result).toEqual({
       version: officialFixture.protocolVersion,
@@ -20,6 +23,23 @@ describe("Anthropic protocol boundary", () => {
     });
     expect(officialFixture.stream).toContain("event: message_start");
     expect(officialFixture.stream.endsWith("\n\n")).toBe(true);
+    expect(officialFixture.request).toMatchObject({
+      model: expect.any(String),
+      max_tokens: expect.any(Number),
+      messages: [{ role: "user", content: expect.any(String) }],
+    });
+    expect(officialFixture.response).toMatchObject({
+      type: "message",
+      role: "assistant",
+      stop_reason: "end_turn",
+      usage: { input_tokens: expect.any(Number), output_tokens: expect.any(Number) },
+    });
+    expect(officialFixture.countTokensRequest).toMatchObject({ messages: expect.any(Array) });
+    expect(officialFixture.countTokensResponse).toEqual({ input_tokens: expect.any(Number) });
+    expect(officialFixture.beta.header).toBe("anthropic-beta");
+    expect(officialFixture.requestHeaders["anthropic-beta"]).toBe(
+      officialFixture.beta.features.join(officialFixture.beta.separator),
+    );
   });
   it("requires the supported official protocol version", async () => {
     for (const headers of [new Headers(), new Headers({ "anthropic-version": "2099-01-01" })]) {

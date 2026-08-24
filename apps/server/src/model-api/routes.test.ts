@@ -1039,6 +1039,58 @@ describe("model API routes", () => {
     }
   });
 
+  it("returns Anthropic's rate-limit envelope and status for local admission failures", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "anthropic-compatible",
+          surfaces: {
+            anthropicMessages: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+              countTokens: true,
+              protocolVersion: "2023-06-01",
+            },
+          },
+        },
+      }),
+    );
+    const limiter = new ModelApiConcurrencyLimiter();
+    const leases = Array.from({ length: MODEL_API_MAX_ACTIVE_PER_TOKEN }, () =>
+      limiter.acquireGlobal({ tokenId: token.id, userId: token.userId }),
+    );
+
+    try {
+      const response = await createModelApiRoutes({
+        manager: new FakeRelayManager(),
+        concurrencyLimiter: limiter,
+      }).request("/messages", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ model: directTarget.modelId, max_tokens: 8, messages: [] }),
+      });
+
+      expect(response.status).toBe(429);
+      expect(response.headers.get("content-type")).toBe("application/json; charset=utf-8");
+      await expect(response.json()).resolves.toEqual({
+        type: "error",
+        error: {
+          type: "rate_limit_error",
+          message: "The request could not be completed.",
+        },
+      });
+    } finally {
+      for (const lease of leases) lease.release();
+    }
+  });
+
   it("returns retryable 503 when the selected CLI is disconnected", async () => {
     db.discoveredModel.findUnique.mockResolvedValue(directRow({ connected: false }));
 
