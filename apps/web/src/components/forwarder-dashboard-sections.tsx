@@ -42,6 +42,12 @@ import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
 import { InlineRetry } from "@/components/inline-retry";
 import { SegmentedControl } from "@/components/segmented-control";
 import { WideContent } from "@/components/wide-content";
+import {
+  capacityFormSchema,
+  capacityMutationPayload,
+  directPolicyIsValid,
+  newCapacityDefaults,
+} from "@/lib/capacity-forms";
 import { orpc } from "@/utils/orpc";
 
 type CliDevice = Awaited<
@@ -971,17 +977,17 @@ function DirectCapacityPolicyForm({
     }),
   );
   const values = [priority, concurrency, reserved, wait, ceiling, margin].map(Number);
-  const valid =
-    values.every(Number.isInteger) &&
-    values.every((value) => value >= 0) &&
-    values[0] <= 31 &&
-    values[1] > 0 &&
-    values[4] > 0 &&
-    (!capacityId ||
-      reserved === "0" ||
-      Number(reserved) <=
-        (capacities.find((c) => c.id === capacityId)?.hardConcurrencyLimit ??
-          Number.POSITIVE_INFINITY));
+  const valid = directPolicyIsValid({
+    priority,
+    concurrency,
+    reserved,
+    wait,
+    ceiling,
+    margin,
+    hardLimit: capacityId
+      ? (capacities.find((capacity) => capacity.id === capacityId)?.hardConcurrencyLimit ?? null)
+      : null,
+  });
   return (
     <form
       className="space-y-4"
@@ -1702,22 +1708,6 @@ function CapacitySetupForm({
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
-  const schema = z.object({
-    label: z.string().trim().min(1).max(120),
-    runtimeModel: z.string().trim().min(1).max(500),
-    runtimeIdentityKey: z.string().trim().min(1).max(500),
-    hardConcurrencyLimit: z.number().int().min(1).max(10_000),
-    physicalMaxContext: z.number().int().min(1).max(100_000_000),
-    countStrategy: z.enum([
-      "CONSERVATIVE_ESTIMATE",
-      "ENGINE_REPORTED",
-      "TOKENIZER",
-      "TEMPLATE_AWARE",
-    ]),
-    runtimeRevision: z.string().trim().max(500),
-    tokenizer: z.string().trim().max(500),
-    template: z.string().trim().max(500),
-  });
   const createCapacity = useMutation(
     orpc.capacityManagement.create.mutationOptions({
       onSuccess: () => {
@@ -1738,12 +1728,14 @@ function CapacitySetupForm({
   );
   const form = useForm({
     defaultValues: {
-      label: capacity?.label ?? "",
-      runtimeModel: capacity?.runtimeModel ?? "",
-      runtimeIdentityKey: capacity?.runtimeIdentityKey ?? "",
-      hardConcurrencyLimit: capacity?.hardConcurrencyLimit ?? 1,
-      physicalMaxContext: capacity?.physicalMaxContext ?? 32_768,
-      countStrategy: (capacity?.countStrategy ?? "CONSERVATIVE_ESTIMATE") as
+      ...newCapacityDefaults,
+      label: capacity?.label ?? newCapacityDefaults.label,
+      runtimeModel: capacity?.runtimeModel ?? newCapacityDefaults.runtimeModel,
+      runtimeIdentityKey: capacity?.runtimeIdentityKey ?? newCapacityDefaults.runtimeIdentityKey,
+      hardConcurrencyLimit:
+        capacity?.hardConcurrencyLimit ?? newCapacityDefaults.hardConcurrencyLimit,
+      physicalMaxContext: capacity?.physicalMaxContext ?? newCapacityDefaults.physicalMaxContext,
+      countStrategy: (capacity?.countStrategy ?? newCapacityDefaults.countStrategy) as
         | "CONSERVATIVE_ESTIMATE"
         | "ENGINE_REPORTED"
         | "TOKENIZER"
@@ -1752,23 +1744,9 @@ function CapacitySetupForm({
       tokenizer: capacity?.tokenizer ?? "",
       template: capacity?.template ?? "",
     },
-    validators: { onSubmit: schema },
+    validators: { onSubmit: capacityFormSchema },
     onSubmit: async ({ value }) => {
-      const data = {
-        label: value.label.trim(),
-        runtimeModel: value.runtimeModel.trim(),
-        runtimeIdentityKey: value.runtimeIdentityKey.trim(),
-        hardConcurrencyLimit: value.hardConcurrencyLimit,
-        physicalMaxContext: value.physicalMaxContext,
-        countStrategy: value.countStrategy,
-        runtimeRevision: value.runtimeRevision.trim() || null,
-        tokenizer: value.tokenizer.trim() || null,
-        tokenizerVersion: null,
-        template: value.template.trim() || null,
-        templateVersion: null,
-        engine: null,
-        cacheNamespace: null,
-      };
+      const data = capacityMutationPayload(value);
       if (capacity) await updateCapacity.mutateAsync({ id: capacity.id, ...data });
       else await createCapacity.mutateAsync(data);
     },
