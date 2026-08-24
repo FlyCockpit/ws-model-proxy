@@ -63,8 +63,10 @@ ALTER TABLE admission_request DROP CONSTRAINT IF EXISTS admission_request_shape_
 ALTER TABLE admission_request ADD CONSTRAINT admission_request_shape_check CHECK (
   "basePriority" BETWEEN 0 AND 31
   AND "enqueueSequence" >= 0
-  AND (("sourceKind" = 'DIRECT' AND "poolId" IS NULL)
-    OR ("sourceKind" = 'POOL' AND "poolId" IS NOT NULL))
+  AND (("sourceKind" = 'DIRECT' AND "poolId" IS NULL
+        AND "directExecutionTargetId" IS NOT NULL)
+    OR ("sourceKind" = 'POOL' AND "poolId" IS NOT NULL
+        AND "directExecutionTargetId" IS NULL))
   AND ("deadlineAt" IS NULL OR "deadlineAt" >= "enqueuedAt")
   AND ((state = 'TERMINAL' AND "terminalAt" IS NOT NULL)
     OR (state <> 'TERMINAL' AND "terminalAt" IS NULL))
@@ -104,6 +106,7 @@ RETURNS trigger LANGUAGE plpgsql AS $capacity_reference_check$
 DECLARE
   request_owner TEXT;
   request_pool TEXT;
+  request_direct_target TEXT;
   target_owner TEXT;
   target_capacity TEXT;
   member_pool TEXT;
@@ -128,16 +131,33 @@ BEGIN
       RAISE EXCEPTION 'admission request pool must have the same owner'
         USING ERRCODE = '23514';
     END IF;
+    IF NEW."directExecutionTargetId" IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM execution_target target
+       WHERE target.id = NEW."directExecutionTargetId" AND target."userId" = NEW."userId"
+    ) THEN
+      RAISE EXCEPTION 'direct admission target must have the same owner'
+        USING ERRCODE = '23514';
+    END IF;
     RETURN NEW;
   END IF;
 
-  SELECT "userId", "poolId" INTO request_owner, request_pool
+  SELECT "userId", "poolId", "directExecutionTargetId"
+    INTO request_owner, request_pool, request_direct_target
     FROM admission_request WHERE id = NEW."admissionRequestId";
   SELECT "userId", "inferenceCapacityId" INTO target_owner, target_capacity
     FROM execution_target WHERE id = NEW."executionTargetId";
   IF request_owner IS NULL OR request_owner <> NEW."userId"
      OR target_owner <> NEW."userId" OR target_capacity IS DISTINCT FROM NEW."capacityId" THEN
     RAISE EXCEPTION 'capacity admission references must share owner and physical capacity'
+      USING ERRCODE = '23514';
+  END IF;
+  IF TG_TABLE_NAME = 'capacity_lease' AND NOT EXISTS (
+    SELECT 1 FROM admission_request request
+     WHERE request.id = NEW."admissionRequestId"
+       AND request."requestId" = NEW."requestId"
+       AND request."attemptId" = NEW."attemptId"
+  ) THEN
+    RAISE EXCEPTION 'capacity lease request and attempt identity must match admission request'
       USING ERRCODE = '23514';
   END IF;
   IF NEW."poolMemberId" IS NOT NULL THEN
@@ -152,6 +172,9 @@ BEGIN
   ELSIF request_pool IS NOT NULL THEN
     RAISE EXCEPTION 'pool admission requires a pool member candidate'
       USING ERRCODE = '23514';
+  ELSIF request_direct_target IS DISTINCT FROM NEW."executionTargetId" THEN
+    RAISE EXCEPTION 'direct admission candidate must match its source target'
+      USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
 END
@@ -164,12 +187,13 @@ FOR EACH ROW EXECUTE FUNCTION enforce_capacity_reference_consistency();
 
 DROP TRIGGER IF EXISTS admission_request_reference_consistency ON admission_request;
 CREATE TRIGGER admission_request_reference_consistency
-BEFORE INSERT OR UPDATE OF "userId", "sourceKind", "poolId" ON admission_request
+BEFORE INSERT OR UPDATE OF "userId", "sourceKind", "poolId", "directExecutionTargetId"
+ON admission_request
 FOR EACH ROW EXECUTE FUNCTION enforce_capacity_reference_consistency();
 
 DROP TRIGGER IF EXISTS capacity_waiter_reference_consistency ON capacity_waiter;
 CREATE TRIGGER capacity_waiter_reference_consistency
-BEFORE INSERT OR UPDATE OF "userId", "admissionRequestId", "capacityId",
+BEFORE INSERT OR UPDATE OF "userId", "admissionRequestId", "requestId", "attemptId", "capacityId",
   "executionTargetId", "poolId", "poolMemberId" ON capacity_waiter
 FOR EACH ROW EXECUTE FUNCTION enforce_capacity_reference_consistency();
 

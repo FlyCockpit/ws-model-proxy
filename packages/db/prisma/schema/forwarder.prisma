@@ -343,34 +343,35 @@ model ProviderModel {
 /// The named database CHECK installed by prisma/schema-hardening.sql enforces the
 /// kind/FK XOR that Prisma cannot express.
 model ExecutionTarget {
-  id                     String                        @id @default(cuid(2))
-  createdAt              DateTime                      @default(now())
-  updatedAt              DateTime                      @default(now()) @updatedAt
-  userId                 String
-  kind                   ExecutionTargetKind
-  discoveredModelId      String?                       @unique
-  providerModelId        String?                       @unique
-  inferenceCapacityId    String?
+  id                      String                        @id @default(cuid(2))
+  createdAt               DateTime                      @default(now())
+  updatedAt               DateTime                      @default(now()) @updatedAt
+  userId                  String
+  kind                    ExecutionTargetKind
+  discoveredModelId       String?                       @unique
+  providerModelId         String?                       @unique
+  inferenceCapacityId     String?
   /// Direct requests participate in the same 0..31 scheduler as pool traffic.
-  directPriority         Int                           @default(16)
-  directConcurrencyLimit Int?
-  directReservedSlots    Int                           @default(0)
-  directBorrowPolicy     CapacityBorrowPolicy          @default(WHEN_IDLE)
-  directWaitBudgetMs     Int?
-  directContextCeiling   Int?
-  directContextMargin    Int                           @default(0)
-  User                   User                          @relation("ExecutionTargetOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  DiscoveredModel        DiscoveredModel?              @relation(fields: [discoveredModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
-  ProviderModel          ProviderModel?                @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
-  InferenceCapacity      InferenceCapacity?            @relation(fields: [inferenceCapacityId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  PoolMembers            PoolMember[]
-  TokenAllowlistEntries  ModelApiTokenAllowlistEntry[]
-  StickinessTargets      ResponseStickinessRecord[]    @relation("ResponseStickinessTargetExecutionTarget")
-  StickinessSelections   ResponseStickinessRecord[]    @relation("ResponseStickinessSelectedExecutionTarget")
-  RequestedRelayRequests RelayRequest[]                @relation("RelayRequestRequestedExecutionTarget")
-  SelectedRelayRequests  RelayRequest[]                @relation("RelayRequestSelectedExecutionTarget")
-  CapacityWaiters        CapacityWaiter[]
-  CapacityLeases         CapacityLease[]
+  directPriority          Int                           @default(16)
+  directConcurrencyLimit  Int?
+  directReservedSlots     Int                           @default(0)
+  directBorrowPolicy      CapacityBorrowPolicy          @default(WHEN_IDLE)
+  directWaitBudgetMs      Int?
+  directContextCeiling    Int?
+  directContextMargin     Int                           @default(0)
+  User                    User                          @relation("ExecutionTargetOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  DiscoveredModel         DiscoveredModel?              @relation(fields: [discoveredModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  ProviderModel           ProviderModel?                @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  InferenceCapacity       InferenceCapacity?            @relation(fields: [inferenceCapacityId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  PoolMembers             PoolMember[]
+  TokenAllowlistEntries   ModelApiTokenAllowlistEntry[]
+  StickinessTargets       ResponseStickinessRecord[]    @relation("ResponseStickinessTargetExecutionTarget")
+  StickinessSelections    ResponseStickinessRecord[]    @relation("ResponseStickinessSelectedExecutionTarget")
+  RequestedRelayRequests  RelayRequest[]                @relation("RelayRequestRequestedExecutionTarget")
+  SelectedRelayRequests   RelayRequest[]                @relation("RelayRequestSelectedExecutionTarget")
+  DirectAdmissionRequests AdmissionRequest[]            @relation("AdmissionRequestDirectTarget")
+  CapacityWaiters         CapacityWaiter[]
+  CapacityLeases          CapacityLease[]
 
   @@unique([discoveredModelId, userId])
   @@unique([providerModelId, userId])
@@ -519,27 +520,29 @@ model InferenceCapacity {
 }
 
 model AdmissionRequest {
-  id              String                @id @default(cuid(2))
-  createdAt       DateTime              @default(now())
-  updatedAt       DateTime              @default(now()) @updatedAt
-  userId          String
-  requestId       String
-  attemptId       String                @unique
-  sourceKind      AdmissionSourceKind
-  poolId          String?
-  basePriority    Int
-  enqueueSequence BigInt
-  enqueuedAt      DateTime              @default(now())
-  deadlineAt      DateTime?
-  connectionOwner String
-  heartbeatAt     DateTime
-  state           AdmissionRequestState @default(WAITING)
-  terminalAt      DateTime?
-  terminalReason  String?
-  User            User                  @relation("AdmissionRequestOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ModelPool       ModelPool?            @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  Waiters         CapacityWaiter[]
-  Lease           CapacityLease?
+  id                      String                @id @default(cuid(2))
+  createdAt               DateTime              @default(now())
+  updatedAt               DateTime              @default(now()) @updatedAt
+  userId                  String
+  requestId               String
+  attemptId               String                @unique
+  sourceKind              AdmissionSourceKind
+  poolId                  String?
+  directExecutionTargetId String?
+  basePriority            Int
+  enqueueSequence         BigInt
+  enqueuedAt              DateTime              @default(now())
+  deadlineAt              DateTime?
+  connectionOwner         String
+  heartbeatAt             DateTime
+  state                   AdmissionRequestState @default(WAITING)
+  terminalAt              DateTime?
+  terminalReason          String?
+  User                    User                  @relation("AdmissionRequestOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ModelPool               ModelPool?            @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  DirectExecutionTarget   ExecutionTarget?      @relation("AdmissionRequestDirectTarget", fields: [directExecutionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Waiters                 CapacityWaiter[]
+  Lease                   CapacityLease?
 
   @@unique([userId, requestId, attemptId])
   @@index([userId, state, deadlineAt])
@@ -582,6 +585,8 @@ model CapacityLease {
   updatedAt           DateTime           @default(now()) @updatedAt
   userId              String
   admissionRequestId  String             @unique
+  requestId           String
+  attemptId           String             @unique
   capacityId          String
   executionTargetId   String
   poolId              String?
