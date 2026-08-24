@@ -14,12 +14,21 @@ export interface CapacityAdmissionRuntime {
 }
 
 export class StoreCapacityAdmissionRuntime implements CapacityAdmissionRuntime {
+  private lastMaintenanceAt = 0;
   constructor(
-    private readonly store: CapacityAdmissionStore,
+    private readonly store: CapacityAdmissionStore & {
+      sweepAbandoned?: (input: {
+        now: Date;
+        heartbeatBefore: Date;
+        limit: number;
+      }) => Promise<unknown>;
+    },
     private readonly pollIntervalMs = 100,
+    private readonly maintenanceIntervalMs = 5_000,
   ) {}
 
   async acquire(attempt: AdmissionAttempt, signal?: AbortSignal): Promise<AdmissionResult> {
+    await this.maintain();
     const initial = await this.store.acquire(attempt, signal);
     if (initial.state !== "WAITING") return initial;
     return waitWithCapacityPolling({
@@ -29,6 +38,19 @@ export class StoreCapacityAdmissionRuntime implements CapacityAdmissionRuntime {
       minimumPollMs: this.pollIntervalMs,
       maximumPollMs: this.pollIntervalMs,
       poll: () => this.store.acquire({ ...attempt, candidates: [] }, signal),
+    });
+  }
+
+  async maintain(): Promise<void> {
+    if (!this.store.sweepAbandoned) return;
+    const nowMs = Date.now();
+    if (nowMs - this.lastMaintenanceAt < this.maintenanceIntervalMs) return;
+    this.lastMaintenanceAt = nowMs;
+    const now = new Date(nowMs);
+    await this.store.sweepAbandoned({
+      now,
+      heartbeatBefore: new Date(nowMs - 60_000),
+      limit: 100,
     });
   }
 

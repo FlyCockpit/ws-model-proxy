@@ -34,4 +34,30 @@ describe("capacity admission runtime", () => {
     ).resolves.toEqual({ state: "CANCELLED" });
     expect(acquire.mock.calls[1]?.[0].candidates).toEqual([]);
   });
+
+  it("runs bounded request-scoped maintenance once per interval", async () => {
+    const sweepAbandoned = vi.fn().mockResolvedValue({ requests: 0, leases: 0 });
+    const store = {
+      acquire: vi.fn().mockResolvedValue({ state: "CANCELLED" }),
+      release: vi.fn(),
+      heartbeat: vi.fn(),
+      cancelAttempt: vi.fn(),
+      reclaimExpired: vi.fn(),
+      sweepAbandoned,
+    };
+    const runtime = new StoreCapacityAdmissionRuntime(store, 1, 60_000);
+    const attempt = {
+      requestId: "request",
+      attemptId: "attempt",
+      ownerId: "owner",
+      sourceKind: "DIRECT" as const,
+      basePriority: 16,
+      connectionOwner: "server",
+      deadlineAt: new Date(Date.now() + 100),
+      candidates: [{ capacityId: "capacity", executionTargetId: "target", candidateOrder: 0 }],
+    };
+    await runtime.acquire(attempt);
+    await runtime.acquire({ ...attempt, attemptId: "attempt-2" });
+    expect(sweepAbandoned).toHaveBeenCalledTimes(1);
+  });
 });
