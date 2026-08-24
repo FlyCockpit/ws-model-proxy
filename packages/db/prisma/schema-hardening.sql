@@ -13,6 +13,32 @@ LOCK TABLE discovered_model, execution_target, model_pool, model_api_token,
   pool_member, model_api_token_allowlist_entry, response_stickiness_record,
   relay_request IN SHARE ROW EXCLUSIVE MODE;
 
+-- The Prisma field remains text so deployments can add future API surfaces
+-- without a PostgreSQL enum migration. Normalize legacy/out-of-band values and
+-- constrain storage to the surfaces understood by this application version.
+UPDATE model_pool
+   SET "recommendedSurfaceOverride" = NULL
+ WHERE "recommendedSurfaceOverride" IS NOT NULL
+   AND "recommendedSurfaceOverride" NOT IN (
+     'OPENAI_CHAT_COMPLETIONS',
+     'OPENAI_RESPONSES',
+     'ANTHROPIC_MESSAGES',
+     'OPENAI_COMPLETIONS'
+   );
+
+ALTER TABLE model_pool
+  DROP CONSTRAINT IF EXISTS model_pool_recommended_surface_override_check;
+ALTER TABLE model_pool
+  ADD CONSTRAINT model_pool_recommended_surface_override_check CHECK (
+    "recommendedSurfaceOverride" IS NULL
+    OR "recommendedSurfaceOverride" IN (
+      'OPENAI_CHAT_COMPLETIONS',
+      'OPENAI_RESPONSES',
+      'ANTHROPIC_MESSAGES',
+      'OPENAI_COMPLETIONS'
+    )
+  );
+
 -- Build the expected constraint through PostgreSQL itself so comparison is not
 -- coupled to pg_get_constraintdef's whitespace or parenthesis formatting.
 CREATE TEMP TABLE execution_target_expected_constraint (

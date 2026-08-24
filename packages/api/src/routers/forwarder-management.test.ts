@@ -409,6 +409,19 @@ describe("forwarderManagementRouter", () => {
     });
   });
 
+  it("defensively clears an invalid stored recommended surface", async () => {
+    db.modelPool.findMany.mockResolvedValue([
+      poolRow({ recommendedSurfaceOverride: "UNSUPPORTED_FUTURE_SURFACE" }),
+    ]);
+
+    const [result] = await client().listModelPools();
+
+    expect(result).toMatchObject({
+      recommendedSurfaceOverride: null,
+      compatibility: { recommendedSurface: null, warnings: [] },
+    });
+  });
+
   it("persists an in-range pool attachment limit and rejects one above the global policy", async () => {
     db.modelPool.findUnique.mockResolvedValueOnce(null);
     db.modelPool.create.mockResolvedValue(poolRow({ maxAttachmentBytes: 2 * 1024 * 1024 }));

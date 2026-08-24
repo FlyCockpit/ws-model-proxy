@@ -67,6 +67,10 @@ function modelPoolRow({
     name,
     description: null,
     maxAttachmentBytes: null,
+    optimisticBasicTranscription: false,
+    protocolAdaptationEnabled: false,
+    allowLossyDeveloperRoleCollapse: false,
+    recommendedSurfaceOverride: null,
     User: { slug: userSlug },
   };
 }
@@ -202,6 +206,30 @@ describe("modelApiTokenAccess", () => {
   });
 
   describe("listVisibleModelTargetsForToken", () => {
+    it("does not expose an invalid recommended surface read from storage", async () => {
+      const ownedPool = {
+        ...modelPoolRow({
+          id: "owned-pool-id",
+          userId: "user-id",
+          userSlug: "owner",
+          slug: "owned",
+          name: "Owned",
+        }),
+        recommendedSurfaceOverride: "UNSUPPORTED_FUTURE_SURFACE",
+      };
+      db.discoveredModel.findMany.mockResolvedValue([]);
+      db.modelPool.findMany.mockResolvedValue([ownedPool]);
+      db.poolGrant.findMany.mockResolvedValue([]);
+
+      const result = await listVisibleModelTargetsForToken({
+        id: "token-id",
+        userId: "user-id",
+        scopeMode: "ALL_VISIBLE",
+      });
+
+      expect(result.modelPools[0]?.recommendedSurfaceOverride).toBeNull();
+    });
+
     it("resolves ALL_VISIBLE pools from current grants on every call", async () => {
       const ownedPool = modelPoolRow({
         id: "owned-pool-id",

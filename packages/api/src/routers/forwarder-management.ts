@@ -14,6 +14,7 @@ import {
   getConfiguredMediaAttachmentMaxBytes,
   resolveAttachmentLimit,
 } from "../lib/media-attachment-limits";
+import { parseModelApiSurface } from "../lib/model-api-surface";
 import {
   listVisibleModelTargetsForUser,
   type VisibleModelTargets,
@@ -158,7 +159,7 @@ type ModelPoolRow = {
   optimisticBasicTranscription: boolean;
   protocolAdaptationEnabled: boolean;
   allowLossyDeveloperRoleCollapse: boolean;
-  recommendedSurfaceOverride: ModelApiSurface | null;
+  recommendedSurfaceOverride: string | null;
   transformerDiscoveredModelId: string | null;
   transformerSystemPrompt: string | null;
   transformerImages: boolean;
@@ -454,6 +455,7 @@ function serializeCliDevice(row: CliDeviceRow, now: Date) {
 }
 
 function serializePool(row: ModelPoolRow) {
+  const recommendedSurfaceOverride = parseModelApiSurface(row.recommendedSurfaceOverride);
   const recommendationOrder: readonly ModelApiSurface[] = [
     "OPENAI_RESPONSES",
     "OPENAI_CHAT_COMPLETIONS",
@@ -504,7 +506,7 @@ function serializePool(row: ModelPoolRow) {
     }
   >;
   const recommendedSurface =
-    row.recommendedSurfaceOverride ??
+    recommendedSurfaceOverride ??
     recommendationOrder.find((surface) => surfaces[surface].native > 0) ??
     recommendationOrder.find((surface) => surfaces[surface].adapted > 0) ??
     null;
@@ -534,15 +536,15 @@ function serializePool(row: ModelPoolRow) {
     optimisticBasicTranscription: row.optimisticBasicTranscription,
     protocolAdaptationEnabled: row.protocolAdaptationEnabled,
     allowLossyDeveloperRoleCollapse: row.allowLossyDeveloperRoleCollapse,
-    recommendedSurfaceOverride: row.recommendedSurfaceOverride,
+    recommendedSurfaceOverride,
     compatibility: {
       recommendedSurface,
       surfaces,
       warnings: [
         ...(row.protocolAdaptationEnabled ? ["adaptation_strict_subset"] : []),
         ...(row.allowLossyDeveloperRoleCollapse ? ["developer_role_collapse_lossy"] : []),
-        ...(row.recommendedSurfaceOverride &&
-        surfaces[row.recommendedSurfaceOverride].unavailable === row.PoolMembers.length
+        ...(recommendedSurfaceOverride &&
+        surfaces[recommendedSurfaceOverride].unavailable === row.PoolMembers.length
           ? ["recommended_surface_unavailable"]
           : []),
       ],

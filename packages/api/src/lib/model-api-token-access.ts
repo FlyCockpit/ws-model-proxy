@@ -7,6 +7,8 @@ import {
   PRODUCT_CREDENTIAL_PREFIXES,
   verifyForwarderHmacDigest,
 } from "@ws-model-proxy/db/forwarder-security";
+import { parseModelApiSurface } from "./model-api-surface";
+import type { ModelApiSurface } from "./surface-capabilities";
 
 export const modelApiTokenScopeModes = ["ALL_VISIBLE", "ALLOWLIST"] as const;
 export type ModelApiTokenScopeMode = (typeof modelApiTokenScopeModes)[number];
@@ -40,7 +42,7 @@ export type VisibleModelPoolTarget = {
   optimisticBasicTranscription: boolean;
   protocolAdaptationEnabled: boolean;
   allowLossyDeveloperRoleCollapse: boolean;
-  recommendedSurfaceOverride: string | null;
+  recommendedSurfaceOverride: ModelApiSurface | null;
 };
 
 export type VisibleModelTargets = {
@@ -129,7 +131,7 @@ function serializeModelPool(row: ModelPoolRow): VisibleModelPoolTarget {
     optimisticBasicTranscription: row.optimisticBasicTranscription,
     protocolAdaptationEnabled: row.protocolAdaptationEnabled,
     allowLossyDeveloperRoleCollapse: row.allowLossyDeveloperRoleCollapse,
-    recommendedSurfaceOverride: row.recommendedSurfaceOverride,
+    recommendedSurfaceOverride: parseModelApiSurface(row.recommendedSurfaceOverride),
   };
 }
 

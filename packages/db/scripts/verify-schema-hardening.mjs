@@ -15,6 +15,8 @@ const [packageJson, agentCompose, entrypoint, dangerousWrapper, applyScript] = a
   readFile(new URL("./apply-schema-hardening.mjs", import.meta.url), "utf8"),
 ]);
 const requiredFragments = [
+  "model_pool_recommended_surface_override_check",
+  'UPDATE model_pool\n   SET "recommendedSurfaceOverride" = NULL',
   "execution_target_kind_source_xor_check",
   "pg_get_constraintdef",
   'ON CONFLICT ("discoveredModelId") DO NOTHING',
@@ -120,8 +122,11 @@ try {
     INSERT INTO relay_request
       (id, "createdAt", "updatedAt", "userId", "requestedDiscoveredModelId", status, "startedAt")
     VALUES ('old-relay', NOW(), NOW(), 'owner-a', 'model-a', 'PENDING', NOW());
-    INSERT INTO model_pool (id, "createdAt", "updatedAt", "userId", slug, name)
-    VALUES ('conflict-pool', NOW(), NOW(), 'owner-a', 'conflict', 'Conflict');
+    INSERT INTO model_pool (
+      id, "createdAt", "updatedAt", "userId", slug, name, "recommendedSurfaceOverride"
+    ) VALUES (
+      'conflict-pool', NOW(), NOW(), 'owner-a', 'conflict', 'Conflict', 'INVALID_SURFACE'
+    );
     INSERT INTO execution_target
       (id, "createdAt", "updatedAt", "userId", kind, "discoveredModelId")
     VALUES ('preexisting-target-a', NOW(), NOW(), 'owner-a', 'DISCOVERED_MODEL', 'model-a');
@@ -279,6 +284,21 @@ try {
   `);
   if (constraint.rowCount !== 1 || !constraint.rows[0].definition.includes("CHECK")) {
     throw new Error("Named execution-target XOR constraint was not installed");
+  }
+  const surfaceConstraint = await client.query(`
+    SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint
+     WHERE conrelid = 'model_pool'::regclass
+       AND conname = 'model_pool_recommended_surface_override_check'
+  `);
+  const normalizedSurface = await client.query(`
+    SELECT "recommendedSurfaceOverride" FROM model_pool WHERE id = 'conflict-pool'
+  `);
+  if (
+    surfaceConstraint.rowCount !== 1 ||
+    !surfaceConstraint.rows[0].definition.includes("CHECK") ||
+    normalizedSurface.rows[0]?.recommendedSurfaceOverride !== null
+  ) {
+    throw new Error("Recommended surface constraint or compatibility backfill is missing");
   }
   const backfill = await client.query(`
     SELECT (SELECT COUNT(*)::int FROM execution_target
