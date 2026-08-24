@@ -162,6 +162,38 @@
     "relayMetadata": "Metadatos de relay"
   },
   "pools": {
+    "capacity": {
+      "title": "Capacidad local compartida",
+      "description": "Mantén los pools dentro de los límites reales de concurrencia y contexto del runtime que comparten.",
+      "create": "Agregar capacidad",
+      "createTitle": "Configurar capacidad compartida",
+      "createDescription": "Identifica un runtime local y establece límites físicos conservadores. Podrás conectar modelos después de guardar.",
+      "created": "Capacidad creada",
+      "empty": "No hay capacidad compartida configurada. Agrega una antes de habilitar la admisión global.",
+      "active": "{{count}} / {{limit}} activos",
+      "waiting": "{{count}} en espera",
+      "targets": "{{count}} destinos",
+      "safeDefaults": "Comienza con una solicitud simultánea y un límite de contexto que tu runtime pueda atender de forma confiable.",
+      "advanced": "Coincidencia avanzada del runtime",
+      "save": "Guardar capacidad",
+      "fields": {
+        "label": "Nombre de capacidad",
+        "runtimeModel": "Modelo del runtime",
+        "runtimeIdentityKey": "Identidad del runtime",
+        "hardConcurrencyLimit": "Concurrencia física",
+        "physicalMaxContext": "Máximo de tokens de contexto",
+        "countStrategy": "Conteo de contexto",
+        "runtimeRevision": "Revisión del runtime (opcional)",
+        "tokenizer": "Tokenizador (opcional)",
+        "template": "Plantilla de prompt (opcional)"
+      },
+      "strategies": {
+        "estimate": "Estimación conservadora",
+        "engine": "Reportado por el motor",
+        "tokenizer": "Tokenizador coincidente",
+        "template": "Tokenizador y plantilla de prompt"
+      }
+    },
     "allowLossyDeveloperRoleCollapse": "Permitir la conversión con pérdida del rol developer",
     "compatibilityDetails": "Matriz de compatibilidad de protocolos",
     "enableProtocolAdaptation": "Habilitar adaptación de protocolos del subconjunto estricto",

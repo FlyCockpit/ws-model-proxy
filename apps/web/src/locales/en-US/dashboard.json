@@ -162,6 +162,38 @@
     "relayMetadata": "Relay metadata"
   },
   "pools": {
+    "capacity": {
+      "title": "Shared local capacity",
+      "description": "Keep pools within the real concurrency and context limits of the runtime they share.",
+      "create": "Add capacity",
+      "createTitle": "Configure shared capacity",
+      "createDescription": "Identify one local runtime and set conservative physical limits. You can attach models after saving.",
+      "created": "Capacity created",
+      "empty": "No shared capacity is configured. Add one before enabling global admission.",
+      "active": "{{count}} / {{limit}} active",
+      "waiting": "{{count}} waiting",
+      "targets": "{{count}} targets",
+      "safeDefaults": "Start with one concurrent request and a context limit your runtime can reliably serve. Raise limits after observing stable load.",
+      "advanced": "Advanced runtime matching",
+      "save": "Save capacity",
+      "fields": {
+        "label": "Capacity name",
+        "runtimeModel": "Runtime model",
+        "runtimeIdentityKey": "Runtime identity",
+        "hardConcurrencyLimit": "Physical concurrency",
+        "physicalMaxContext": "Maximum context tokens",
+        "countStrategy": "Context counting",
+        "runtimeRevision": "Runtime revision (optional)",
+        "tokenizer": "Tokenizer (optional)",
+        "template": "Prompt template (optional)"
+      },
+      "strategies": {
+        "estimate": "Conservative estimate",
+        "engine": "Engine reported",
+        "tokenizer": "Matching tokenizer",
+        "template": "Tokenizer and prompt template"
+      }
+    },
     "allowLossyDeveloperRoleCollapse": "Allow lossy developer-role collapse",
     "compatibilityDetails": "Protocol compatibility matrix",
     "enableProtocolAdaptation": "Enable strict-subset protocol adaptation",

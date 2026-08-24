@@ -32,7 +32,7 @@ import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { Textarea } from "@ws-model-proxy/ui/components/textarea";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { Copy, Plus, Trash2 } from "lucide-react";
+import { Copy, Gauge, Plus, Trash2 } from "lucide-react";
 import type { ReactNode } from "react";
 import { useId, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -57,6 +57,7 @@ type ModelApiToken = Awaited<ReturnType<AppRouterClient["modelApiTokens"]["list"
 type VisibleModels = Awaited<ReturnType<AppRouterClient["forwarderManagement"]["visibleModels"]>>;
 type TokenPreview = Awaited<ReturnType<AppRouterClient["modelApiTokens"]["preview"]>>;
 type RelayRow = Awaited<ReturnType<AppRouterClient["relayMetadata"]["listOwn"]>>[number];
+type CapacityRow = Awaited<ReturnType<AppRouterClient["capacityManagement"]["list"]>>[number];
 type ScopeMode = "ALL_VISIBLE" | "ALLOWLIST";
 type RoutingStatus = "ACTIVE" | "DRAINING" | "DISABLED";
 type EndpointHealthFilter = "all" | "online" | "offline" | "stale";
@@ -910,7 +911,12 @@ export function PoolsSection() {
     isError: devicesIsError,
     refetch: refetchDevices,
   } = useQuery(orpc.forwarderManagement.listCliDevices.queryOptions());
+  const { data: capacitiesData, isPending: capacitiesPending } = useQuery({
+    ...orpc.capacityManagement.list.queryOptions(),
+    retry: false,
+  });
   const [createOpen, setCreateOpen] = useState(false);
+  const [capacityOpen, setCapacityOpen] = useState(false);
   const [editingPool, setEditingPool] = useState<ModelPool | null>(null);
   const [deletePool, setDeletePool] = useState<ModelPool | null>(null);
   const [memberPool, setMemberPool] = useState<ModelPool | null>(null);
@@ -993,6 +999,85 @@ export function PoolsSection() {
           </Dialog>
         }
       />
+
+      {capacitiesData || capacitiesPending ? (
+        <div className="mb-6 border-y bg-muted/30 py-4">
+          <div className="flex min-w-0 flex-col gap-4 px-4 sm:flex-row sm:items-start sm:justify-between">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <Gauge className="size-4 text-primary" />
+                <h3 className="font-medium">{t("dashboard:pools.capacity.title")}</h3>
+              </div>
+              <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+                {t("dashboard:pools.capacity.description")}
+              </p>
+            </div>
+            <Dialog open={capacityOpen} onOpenChange={setCapacityOpen}>
+              <DialogTrigger
+                render={
+                  <Button type="button" variant="outline" size="touch">
+                    <Plus className="size-4" />
+                    {t("dashboard:pools.capacity.create")}
+                  </Button>
+                }
+              />
+              <DialogContent className="max-h-[min(90vh,52rem)] overflow-x-hidden overflow-y-auto sm:max-w-xl">
+                <DialogHeader>
+                  <DialogTitle>{t("dashboard:pools.capacity.createTitle")}</DialogTitle>
+                  <DialogDescription>
+                    {t("dashboard:pools.capacity.createDescription")}
+                  </DialogDescription>
+                </DialogHeader>
+                <CapacitySetupForm onSuccess={() => setCapacityOpen(false)} />
+              </DialogContent>
+            </Dialog>
+          </div>
+          <div className="mt-4 px-4">
+            {capacitiesPending ? (
+              <div className="grid gap-3 sm:grid-cols-2">
+                <Skeleton className="h-20" />
+                <Skeleton className="h-20" />
+              </div>
+            ) : capacitiesData?.length ? (
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                {capacitiesData.map((capacity: CapacityRow) => (
+                  <div key={capacity.id} className="min-w-0 rounded-md border bg-background p-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-medium">{capacity.label}</div>
+                        <div className="mt-1 truncate text-xs text-muted-foreground">
+                          {capacity.runtimeModel}
+                        </div>
+                      </div>
+                      <StatusPill muted>{capacity.countStrategy}</StatusPill>
+                    </div>
+                    <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                      <span>
+                        {t("dashboard:pools.capacity.active", {
+                          count: capacity._count.CapacityLeases,
+                          limit: capacity.hardConcurrencyLimit ?? "∞",
+                        })}
+                      </span>
+                      <span>
+                        {t("dashboard:pools.capacity.waiting", {
+                          count: capacity._count.CapacityWaiters,
+                        })}
+                      </span>
+                      <span>
+                        {t("dashboard:pools.capacity.targets", {
+                          count: capacity._count.ExecutionTargets,
+                        })}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground">{t("dashboard:pools.capacity.empty")}</p>
+            )}
+          </div>
+        </div>
+      ) : null}
 
       {poolsData.length === 0 ? (
         <EmptyState>{t("dashboard:pools.empty")}</EmptyState>
@@ -1367,6 +1452,189 @@ export function PoolsSection() {
         }}
       />
     </section>
+  );
+}
+
+function CapacitySetupForm({ onSuccess }: { onSuccess: () => void }) {
+  const { t } = useTranslation(["common", "dashboard"]);
+  const queryClient = useQueryClient();
+  const schema = z.object({
+    label: z.string().trim().min(1).max(120),
+    runtimeModel: z.string().trim().min(1).max(500),
+    runtimeIdentityKey: z.string().trim().min(1).max(500),
+    hardConcurrencyLimit: z.number().int().min(1).max(10_000),
+    physicalMaxContext: z.number().int().min(1).max(100_000_000),
+    countStrategy: z.enum([
+      "CONSERVATIVE_ESTIMATE",
+      "ENGINE_REPORTED",
+      "TOKENIZER",
+      "TEMPLATE_AWARE",
+    ]),
+    runtimeRevision: z.string().trim().max(500),
+    tokenizer: z.string().trim().max(500),
+    template: z.string().trim().max(500),
+  });
+  const createCapacity = useMutation(
+    orpc.capacityManagement.create.mutationOptions({
+      onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: orpc.capacityManagement.key() });
+        toast.success(t("dashboard:pools.capacity.created"));
+        onSuccess();
+      },
+    }),
+  );
+  const form = useForm({
+    defaultValues: {
+      label: "",
+      runtimeModel: "",
+      runtimeIdentityKey: "",
+      hardConcurrencyLimit: 1,
+      physicalMaxContext: 32_768,
+      countStrategy: "CONSERVATIVE_ESTIMATE" as
+        | "CONSERVATIVE_ESTIMATE"
+        | "ENGINE_REPORTED"
+        | "TOKENIZER"
+        | "TEMPLATE_AWARE",
+      runtimeRevision: "",
+      tokenizer: "",
+      template: "",
+    },
+    validators: { onSubmit: schema },
+    onSubmit: async ({ value }) => {
+      await createCapacity.mutateAsync({
+        label: value.label.trim(),
+        runtimeModel: value.runtimeModel.trim(),
+        runtimeIdentityKey: value.runtimeIdentityKey.trim(),
+        hardConcurrencyLimit: value.hardConcurrencyLimit,
+        physicalMaxContext: value.physicalMaxContext,
+        countStrategy: value.countStrategy,
+        runtimeRevision: value.runtimeRevision.trim() || null,
+        tokenizer: value.tokenizer.trim() || null,
+        tokenizerVersion: null,
+        template: value.template.trim() || null,
+        templateVersion: null,
+        engine: null,
+        cacheNamespace: null,
+      });
+    },
+  });
+  const textField = (name: "label" | "runtimeModel" | "runtimeIdentityKey") => (
+    <form.Field name={name}>
+      {(field) => (
+        <div className="space-y-2">
+          <Label htmlFor={`capacity-${field.name}`}>
+            {t(`dashboard:pools.capacity.fields.${field.name}`)}
+          </Label>
+          <Input
+            id={`capacity-${field.name}`}
+            className="min-h-11"
+            value={field.state.value}
+            onBlur={field.handleBlur}
+            onChange={(event) => field.handleChange(event.target.value)}
+            autoComplete="off"
+          />
+        </div>
+      )}
+    </form.Field>
+  );
+  return (
+    <form
+      className="min-w-0 space-y-5"
+      onSubmit={(event) => {
+        event.preventDefault();
+        form.handleSubmit();
+      }}
+    >
+      <div className="grid min-w-0 gap-4 sm:grid-cols-2">
+        {textField("label")}
+        {textField("runtimeModel")}
+        <div className="sm:col-span-2">{textField("runtimeIdentityKey")}</div>
+        {(["hardConcurrencyLimit", "physicalMaxContext"] as const).map((name) => (
+          <form.Field key={name} name={name}>
+            {(field) => (
+              <div className="space-y-2">
+                <Label htmlFor={`capacity-${field.name}`}>
+                  {t(`dashboard:pools.capacity.fields.${field.name}`)}
+                </Label>
+                <Input
+                  id={`capacity-${field.name}`}
+                  className="min-h-11"
+                  type="number"
+                  min={1}
+                  inputMode="numeric"
+                  value={field.state.value}
+                  onBlur={field.handleBlur}
+                  onChange={(event) => field.handleChange(Number(event.target.value))}
+                />
+              </div>
+            )}
+          </form.Field>
+        ))}
+      </div>
+      <p className="text-sm text-muted-foreground">{t("dashboard:pools.capacity.safeDefaults")}</p>
+      <details className="rounded-md border p-3">
+        <summary className="min-h-11 cursor-pointer py-2 text-sm font-medium">
+          {t("dashboard:pools.capacity.advanced")}
+        </summary>
+        <div className="grid gap-4 pt-3 sm:grid-cols-2">
+          <form.Field name="countStrategy">
+            {(field) => (
+              <div className="space-y-2 sm:col-span-2">
+                <Label htmlFor="capacity-countStrategy">
+                  {t("dashboard:pools.capacity.fields.countStrategy")}
+                </Label>
+                <select
+                  id="capacity-countStrategy"
+                  className="h-11 w-full rounded-md border border-input bg-transparent px-3 text-sm"
+                  value={field.state.value}
+                  onChange={(event) =>
+                    field.handleChange(event.target.value as typeof field.state.value)
+                  }
+                >
+                  <option value="CONSERVATIVE_ESTIMATE">
+                    {t("dashboard:pools.capacity.strategies.estimate")}
+                  </option>
+                  <option value="ENGINE_REPORTED">
+                    {t("dashboard:pools.capacity.strategies.engine")}
+                  </option>
+                  <option value="TOKENIZER">
+                    {t("dashboard:pools.capacity.strategies.tokenizer")}
+                  </option>
+                  <option value="TEMPLATE_AWARE">
+                    {t("dashboard:pools.capacity.strategies.template")}
+                  </option>
+                </select>
+              </div>
+            )}
+          </form.Field>
+          {(["runtimeRevision", "tokenizer", "template"] as const).map((name) => (
+            <form.Field key={name} name={name}>
+              {(field) => (
+                <div className="space-y-2">
+                  <Label htmlFor={`capacity-${field.name}`}>
+                    {t(`dashboard:pools.capacity.fields.${field.name}`)}
+                  </Label>
+                  <Input
+                    id={`capacity-${field.name}`}
+                    className="min-h-11"
+                    value={field.state.value}
+                    onChange={(event) => field.handleChange(event.target.value)}
+                    autoComplete="off"
+                  />
+                </div>
+              )}
+            </form.Field>
+          ))}
+        </div>
+      </details>
+      <DialogFooter>
+        <Button type="submit" size="touch" disabled={createCapacity.isPending}>
+          {createCapacity.isPending
+            ? t("common:actions.saving")
+            : t("dashboard:pools.capacity.save")}
+        </Button>
+      </DialogFooter>
+    </form>
   );
 }
 
