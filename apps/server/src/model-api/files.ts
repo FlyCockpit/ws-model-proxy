@@ -250,12 +250,12 @@ export function createModelApiFileUploadHandler(deps: ModelApiFilesDeps = {}) {
         });
       }
       if (err instanceof MediaTooLargeError) {
-        // Same request_too_large (429) shape as the /v1/files bodyLimit onError.
+        // Same request_too_large (413) shape as the /v1/files bodyLimit onError.
         return openAiError({
-          status: 429,
+          status: 413,
           message: "Model API request body is too large.",
           code: "request_too_large",
-          type: "rate_limit_error",
+          type: "invalid_request_error",
         });
       }
       throw err;

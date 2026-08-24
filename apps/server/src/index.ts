@@ -136,12 +136,12 @@ app.use(
         JSON.stringify(
           openAiErrorBody({
             message: "Model API request body is too large.",
-            type: "rate_limit_error",
+            type: "invalid_request_error",
             code: "request_too_large",
           }),
         ),
         {
-          status: 429,
+          status: 413,
           headers: { "content-type": "application/json; charset=utf-8" },
         },
       ),
@@ -167,12 +167,12 @@ const generalModelApiBodyLimit = bodyLimit({
       JSON.stringify(
         openAiErrorBody({
           message: "Model API request body is too large.",
-          type: "rate_limit_error",
+          type: "invalid_request_error",
           code: "request_too_large",
         }),
       ),
       {
-        status: 429,
+        status: 413,
         headers: { "content-type": "application/json; charset=utf-8" },
       },
     ),

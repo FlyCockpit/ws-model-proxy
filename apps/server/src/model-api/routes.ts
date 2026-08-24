@@ -3190,7 +3190,7 @@ async function prepareAnthropicModeledRequest(
 ): Promise<PreparedModeledRequest | Response> {
   const body = await readModelApiBody(request);
   if (body instanceof Response) {
-    return anthropicErrorResponse(body.status, "Request body is too large.");
+    return anthropicErrorResponse(413, "Request body is too large.", "request_too_large");
   }
   let payload: JsonObject;
   try {

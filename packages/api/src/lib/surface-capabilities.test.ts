@@ -100,28 +100,12 @@ describe("surface capability resolution", () => {
   });
 
   it("resolves explicit Responses lifecycle operations and retry safety", () => {
-    const capabilities = parseOpenAiCompatibleCapabilities({
-      version: 3,
-      protocol: "openai-compatible",
-      surfaces: {
-        openaiResponses: {
-          source: "declared",
-          confidence: "exact",
-          supported: true,
-          stateful: true,
-          countTokens: true,
-          responsesLifecycle: {
-            statefulFollowUps: true,
-            retrieve: true,
-            delete: true,
-            cancel: false,
-            listInputItems: true,
-            countTokens: true,
-            compact: true,
-          },
-        },
-      },
-    });
+    const fixture = structuredClone(wireFixtures.valid[1]);
+    if (fixture?.version !== 3 || fixture.protocol !== "openai-compatible") {
+      throw new Error("expected the OpenAI Responses v3 routing fixture");
+    }
+    fixture.surfaces.openaiResponses.responsesLifecycle.cancel = false;
+    const capabilities = parseOpenAiCompatibleCapabilities(fixture);
     expect(
       resolveExecutionPath({
         capabilities,
@@ -148,6 +132,36 @@ describe("surface capability resolution", () => {
         request: { stateful: true, responsesOperation: "statefulFollowUps" },
       }).retrySafety,
     ).toBe("never");
+  });
+
+  it("categorically rejects adapted Responses lifecycle operations other than create", () => {
+    const lifecycleOperations = [
+      "statefulFollowUps",
+      "retrieve",
+      "delete",
+      "cancel",
+      "listInputItems",
+      "countTokens",
+      "compact",
+    ] as const;
+    for (const responsesOperation of lifecycleOperations) {
+      expect(
+        resolveExecutionPath({
+          capabilities: anthropic,
+          requestedSurface: "OPENAI_RESPONSES",
+          request: { responsesOperation },
+          adaptationEnabled: true,
+        }),
+      ).toMatchObject({ mode: "unavailable", limitations: ["native_only_operation"] });
+    }
+    expect(
+      resolveExecutionPath({
+        capabilities: anthropic,
+        requestedSurface: "OPENAI_RESPONSES",
+        request: { responsesOperation: "create" },
+        adaptationEnabled: true,
+      }).mode,
+    ).toBe("adapted");
   });
 
   it("checks input and output media modalities directionally", () => {

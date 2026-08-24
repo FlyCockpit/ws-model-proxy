@@ -194,7 +194,7 @@ describe("POST /v1/files (upload)", () => {
     form.set("file", new Blob([PNG], { type: "image/png" }), "x.png");
 
     const res = await app.request("/v1/files", { method: "POST", body: form, headers: bearer() });
-    expect(res.status).toBe(429);
+    expect(res.status).toBe(413);
     const body = (await res.json()) as { error: { code: string } };
     expect(body.error.code).toBe("request_too_large");
     expect(prisma.mediaAsset.create).not.toHaveBeenCalled();

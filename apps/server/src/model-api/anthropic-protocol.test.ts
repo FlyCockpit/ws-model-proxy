@@ -17,25 +17,51 @@ describe("Anthropic protocol boundary", () => {
       version: officialFixture.protocolVersion,
       betaFeatures: ["prompt-caching-2024-07-31", "interleaved-thinking-2025-05-14"],
     });
-    expect(JSON.parse(JSON.stringify(officialFixture.error))).toMatchObject({
+    expect(officialFixture.error).toEqual({
       type: "error",
-      error: { type: "invalid_request_error" },
+      error: { type: "invalid_request_error", message: "Invalid request" },
     });
-    expect(officialFixture.stream).toContain("event: message_start");
     expect(officialFixture.stream.endsWith("\n\n")).toBe(true);
-    expect(officialFixture.request).toMatchObject({
-      model: expect.any(String),
-      max_tokens: expect.any(Number),
-      messages: [{ role: "user", content: expect.any(String) }],
+    const streamRecords = officialFixture.stream
+      .trimEnd()
+      .split("\n\n")
+      .map((record) => {
+        const [eventLine, dataLine] = record.split("\n");
+        return { event: eventLine?.slice(7), data: JSON.parse(dataLine?.slice(6) ?? "null") };
+      });
+    expect(streamRecords).toEqual(officialFixture.streamEvents);
+    expect(streamRecords.map(({ event }) => event)).toEqual([
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop",
+    ]);
+    expect(streamRecords.at(-1)).toEqual({
+      event: "message_stop",
+      data: { type: "message_stop" },
     });
-    expect(officialFixture.response).toMatchObject({
+    expect(officialFixture.request).toEqual({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 32,
+      messages: [{ role: "user", content: "Hello" }],
+    });
+    expect(officialFixture.response).toEqual({
+      id: "msg_fixture",
       type: "message",
       role: "assistant",
+      content: [{ type: "text", text: "Hello!" }],
+      model: "claude-sonnet-4-20250514",
       stop_reason: "end_turn",
-      usage: { input_tokens: expect.any(Number), output_tokens: expect.any(Number) },
+      stop_sequence: null,
+      usage: { input_tokens: 8, output_tokens: 4 },
     });
-    expect(officialFixture.countTokensRequest).toMatchObject({ messages: expect.any(Array) });
-    expect(officialFixture.countTokensResponse).toEqual({ input_tokens: expect.any(Number) });
+    expect(officialFixture.countTokensRequest).toEqual({
+      model: "claude-sonnet-4-20250514",
+      messages: [{ role: "user", content: "Hello" }],
+    });
+    expect(officialFixture.countTokensResponse).toEqual({ input_tokens: 8 });
     expect(officialFixture.beta.header).toBe("anthropic-beta");
     expect(officialFixture.requestHeaders["anthropic-beta"]).toBe(
       officialFixture.beta.features.join(officialFixture.beta.separator),

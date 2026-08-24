@@ -13,6 +13,7 @@ export function anthropicErrorResponse(
     | "authentication_error"
     | "not_found_error"
     | "rate_limit_error"
+    | "request_too_large"
     | "api_error" = "invalid_request_error",
 ) {
   return new Response(JSON.stringify({ type: "error", error: { type, message } }), {

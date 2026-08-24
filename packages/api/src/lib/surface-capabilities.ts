@@ -67,7 +67,6 @@ type SurfaceFeatures = {
   reasoning?: boolean;
   hostedTools?: boolean;
   countTokens?: boolean;
-  stateful?: boolean;
   protocolVersion?: string;
   betaFeatures?: string[];
   responsesLifecycle?: Partial<Record<Exclude<ResponsesOperation, "create">, boolean>>;
@@ -102,7 +101,7 @@ function operationFor(surface: ModelApiSurface, request: SurfaceRequestRequireme
       path: request.countTokens ? "/v1/messages/count_tokens" : "/v1/messages",
     };
   const responseId = request.responseId ? encodeURIComponent(request.responseId) : ":responseId";
-  switch (request.responsesOperation ?? (request.countTokens ? "countTokens" : "create")) {
+  switch (responsesOperationFor(request)) {
     case "retrieve":
       return { method: "GET" as const, path: `/v1/responses/${responseId}` };
     case "delete":
@@ -120,9 +119,16 @@ function operationFor(surface: ModelApiSurface, request: SurfaceRequestRequireme
   }
 }
 
+function responsesOperationFor(request: SurfaceRequestRequirements): ResponsesOperation {
+  return (
+    request.responsesOperation ??
+    (request.countTokens ? "countTokens" : request.stateful ? "statefulFollowUps" : "create")
+  );
+}
+
 function retrySafetyFor(surface: ModelApiSurface, request: SurfaceRequestRequirements) {
   if (surface !== "OPENAI_RESPONSES") return "pre_commit_only" as const;
-  switch (request.responsesOperation ?? (request.countTokens ? "countTokens" : "create")) {
+  switch (responsesOperationFor(request)) {
     case "retrieve":
     case "listInputItems":
     case "countTokens":
@@ -174,8 +180,6 @@ function incompatibilities(features: SurfaceFeatures, request: SurfaceRequestReq
     "structuredOutput",
     "reasoning",
     "hostedTools",
-    "stateful",
-    "countTokens",
   ] as const) {
     if (request[key] && features[key] !== true) failures.push(`${key}_unavailable`);
   }
@@ -260,7 +264,8 @@ export function resolveExecutionPath({
     return describe(selected);
   if (
     selected.mode === "adapted" &&
-    (requestedSurface === "OPENAI_COMPLETIONS" || request.stateful)
+    (requestedSurface === "OPENAI_COMPLETIONS" ||
+      (requestedSurface === "OPENAI_RESPONSES" && responsesOperationFor(request) !== "create"))
   ) {
     return describe({
       mode: "unavailable",
@@ -276,14 +281,19 @@ export function resolveExecutionPath({
       limitations: ["surface_unavailable"],
     });
   const lifecycleOperation =
-    requestedSurface === "OPENAI_RESPONSES" ? request.responsesOperation : undefined;
+    requestedSurface === "OPENAI_RESPONSES" ? responsesOperationFor(request) : undefined;
   const lifecycleUnsupported =
     lifecycleOperation && lifecycleOperation !== "create"
       ? features.responsesLifecycle?.[lifecycleOperation] !== true
       : false;
+  const anthropicCountTokensUnsupported =
+    requestedSurface === "ANTHROPIC_MESSAGES" &&
+    request.countTokens === true &&
+    features.countTokens !== true;
   const failures = [
     ...incompatibilities(features, request),
     ...(lifecycleUnsupported ? [`responses_${lifecycleOperation}_unavailable`] : []),
+    ...(anthropicCountTokensUnsupported ? ["countTokens_unavailable"] : []),
     ...(selected.mode === "adapted" ? adaptedSubsetFailures(request) : []),
   ];
   const limitations = [...selected.limitations, ...failures];

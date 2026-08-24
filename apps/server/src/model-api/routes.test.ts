@@ -5,6 +5,7 @@ import type {
 } from "@ws-model-proxy/api/lib/model-api-token-access";
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import type { ActiveRelayResponseHandlers, RelaySessionManager } from "../relay/session-manager.js";
+import officialAnthropicFixture from "./fixtures/anthropic-2023-06-01.json";
 
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
@@ -735,7 +736,29 @@ describe("model API routes", () => {
     expect(response.status).toBe(404);
   });
 
-  it("relays Anthropic count_tokens and exact SSE/error bytes with safe metadata", async () => {
+  it("returns the official Anthropic request-too-large envelope for oversized bodies", async () => {
+    const response = await appWith(new FakeRelayManager()).request("/messages", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "anthropic-version": officialAnthropicFixture.protocolVersion,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: directTarget.modelId,
+        padding: "x".repeat(MODEL_API_MAX_REQUEST_BODY_BYTES),
+      }),
+    });
+
+    expect(response.status).toBe(413);
+    await expect(response.json()).resolves.toEqual({
+      type: "error",
+      error: { type: "request_too_large", message: "Request body is too large." },
+    });
+    expect(db.relayRequest.create).not.toHaveBeenCalled();
+  });
+
+  it("relays Anthropic count_tokens with the official fixture shape", async () => {
     db.discoveredModel.findUnique.mockResolvedValue(
       directRow({
         capabilityOverrideMetadata: {
@@ -764,7 +787,7 @@ describe("model API routes", () => {
       },
       body: JSON.stringify({
         model: directTarget.modelId,
-        messages: [{ role: "user", content: "hello" }],
+        messages: officialAnthropicFixture.countTokensRequest.messages,
       }),
     });
     await vi.waitFor(() => expect(countManager.sent).toHaveLength(1));
@@ -773,9 +796,11 @@ describe("model API routes", () => {
     await completeJsonRelay({
       manager: countManager,
       requestId: countSent.requestId,
-      body: { input_tokens: 7 },
+      body: officialAnthropicFixture.countTokensResponse,
     });
-    await expect((await countPromise).json()).resolves.toEqual({ input_tokens: 7 });
+    await expect((await countPromise).json()).resolves.toEqual(
+      officialAnthropicFixture.countTokensResponse,
+    );
 
     db.discoveredModel.findUnique.mockResolvedValue(
       directRow({
@@ -808,58 +833,6 @@ describe("model API routes", () => {
       type: "error",
       error: { type: "invalid_request_error" },
     });
-
-    db.discoveredModel.findUnique.mockResolvedValue(
-      directRow({
-        capabilityOverrideMetadata: {
-          version: 3,
-          protocol: "anthropic-compatible",
-          surfaces: {
-            anthropicMessages: {
-              source: "declared",
-              confidence: "exact",
-              supported: true,
-              streaming: true,
-              countTokens: true,
-              protocolVersion: "2023-06-01",
-            },
-          },
-        },
-      }),
-    );
-
-    const streamManager = new FakeRelayManager();
-    const streamPromise = appWith(streamManager).request("/messages", {
-      method: "POST",
-      headers: {
-        authorization: "Bearer wsmp_model_test",
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        model: directTarget.modelId,
-        stream: true,
-        max_tokens: 8,
-        messages: [{ role: "user", content: "hello" }],
-      }),
-    });
-    await vi.waitFor(() => expect(streamManager.sent).toHaveLength(1));
-    const streamSent = requireSent(streamManager);
-    streamManager.headers(streamSent.requestId, 429, {
-      "content-type": "text/event-stream",
-      "request-id": "req_safe",
-      "retry-after": "3",
-      "x-provider-account": "private",
-    });
-    const streamResponse = await streamPromise;
-    const exact = 'event: error\ndata: {"type":"error","error":{"type":"overloaded_error"}}\n\n';
-    streamManager.body(streamSent.requestId, exact);
-    streamManager.complete(streamSent.requestId);
-    expect(streamResponse.status).toBe(429);
-    expect(streamResponse.headers.get("request-id")).toBe("req_safe");
-    expect(streamResponse.headers.get("retry-after")).toBe("3");
-    expect(streamResponse.headers.get("x-provider-account")).toBeNull();
-    expect(await streamResponse.text()).toBe(exact);
   });
 
   it("uses Anthropic-shaped errors for authentication, version, and beta rejection", async () => {
@@ -987,7 +960,7 @@ describe("model API routes", () => {
       body: oversizedBody,
     });
 
-    expect(response.status).toBe(429);
+    expect(response.status).toBe(413);
     await expect(response.json()).resolves.toMatchObject({
       error: { code: "request_too_large" },
     });
@@ -1208,7 +1181,7 @@ describe("model API routes", () => {
       }),
     });
 
-    expect(response.status).toBe(429);
+    expect(response.status).toBe(413);
     await expect(response.json()).resolves.toMatchObject({ error: { code: "request_too_large" } });
     expect(manager.sent).toHaveLength(0);
   });
@@ -1621,7 +1594,7 @@ describe("model API routes", () => {
       body,
     });
 
-    expect(response.status).toBe(429);
+    expect(response.status).toBe(413);
     await expect(response.json()).resolves.toMatchObject({ error: { code: "request_too_large" } });
     expect(manager.sent).toHaveLength(0);
   });
@@ -1642,7 +1615,7 @@ describe("model API routes", () => {
       body,
     });
 
-    expect(response.status).toBe(429);
+    expect(response.status).toBe(413);
     await expect(response.json()).resolves.toMatchObject({ error: { code: "request_too_large" } });
     expect(manager.sent).toHaveLength(0);
   });

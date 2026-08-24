@@ -44,6 +44,33 @@
   "invalid": [
     { "version": 3, "protocol": "anthropic-compatible" },
     { "version": 3, "protocol": "anthropic-compatible", "surfaces": {}, "source": "guess" },
-    { "version": 3, "protocol": "anthropic-compatible", "surfaces": {}, "confidence": "maybe" }
+    { "version": 3, "protocol": "anthropic-compatible", "surfaces": {}, "confidence": "maybe" },
+    { "version": 1, "protocol": "anthropic-compatible" },
+    { "version": 2, "protocol": "anthropic-compatible" },
+    {
+      "version": 3,
+      "protocol": "openai-compatible",
+      "surfaces": {
+        "openaiResponses": {
+          "source": "declared",
+          "confidence": "exact",
+          "supported": true,
+          "stateful": true
+        }
+      }
+    },
+    {
+      "version": 3,
+      "protocol": "openai-compatible",
+      "surfaces": {
+        "openaiResponses": {
+          "source": "declared",
+          "confidence": "exact",
+          "supported": true,
+          "countTokens": true,
+          "responsesLifecycle": { "countTokens": true }
+        }
+      }
+    }
   ]
 }

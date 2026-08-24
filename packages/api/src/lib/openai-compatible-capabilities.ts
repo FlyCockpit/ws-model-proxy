@@ -122,24 +122,29 @@ const surfaceFeatureSchema = z
     structuredOutput: booleanSupportSchema,
     reasoning: booleanSupportSchema,
     hostedTools: booleanSupportSchema,
-    countTokens: booleanSupportSchema,
-    stateful: booleanSupportSchema,
     protocolVersion: z.string().trim().min(1).max(64).optional(),
     betaFeatures: z.array(z.string().trim().min(1).max(128)).max(64).optional(),
-    responsesLifecycle: z
-      .object({
-        statefulFollowUps: booleanSupportSchema,
-        retrieve: booleanSupportSchema,
-        delete: booleanSupportSchema,
-        cancel: booleanSupportSchema,
-        listInputItems: booleanSupportSchema,
-        countTokens: booleanSupportSchema,
-        compact: booleanSupportSchema,
-      })
-      .strict()
-      .optional(),
   })
   .strict();
+
+const anthropicSurfaceFeatureSchema = surfaceFeatureSchema.extend({
+  countTokens: booleanSupportSchema,
+});
+
+const responsesSurfaceFeatureSchema = surfaceFeatureSchema.extend({
+  responsesLifecycle: z
+    .object({
+      statefulFollowUps: booleanSupportSchema,
+      retrieve: booleanSupportSchema,
+      delete: booleanSupportSchema,
+      cancel: booleanSupportSchema,
+      listInputItems: booleanSupportSchema,
+      countTokens: booleanSupportSchema,
+      compact: booleanSupportSchema,
+    })
+    .strict()
+    .optional(),
+});
 
 /**
  * Version 3 is the provider-independent inventory. The legacy operation fields
@@ -154,8 +159,8 @@ const v3CapabilitiesSchema = z
     surfaces: z
       .object({
         openaiChatCompletions: surfaceFeatureSchema.optional(),
-        openaiResponses: surfaceFeatureSchema.optional(),
-        anthropicMessages: surfaceFeatureSchema.optional(),
+        openaiResponses: responsesSurfaceFeatureSchema.optional(),
+        anthropicMessages: anthropicSurfaceFeatureSchema.optional(),
         openaiCompletions: surfaceFeatureSchema.optional(),
       })
       .strict(),
