@@ -2077,25 +2077,31 @@ async function relayDirect({
       await failRelayMetadata({ relayRequestId, startedAt, failure: "unsupported_capability" });
       return operationFailureResponse(operation, "unsupported_capability");
     }
-    capacityLease = await capacityRuntime.acquire(
-      {
-        requestId: crypto.randomUUID(),
-        attemptId: crypto.randomUUID(),
-        ownerId: selected.userId,
-        sourceKind: "DIRECT",
-        basePriority: 16,
-        connectionOwner: "model-api",
-        deadlineAt: new Date(Date.now() + 30_000),
-        candidates: [
-          {
-            capacityId: identity.inferenceCapacityId,
-            executionTargetId: identity.id,
-            candidateOrder: 0,
-          },
-        ],
-      },
-      request.signal,
-    );
+    try {
+      capacityLease = await capacityRuntime.acquire(
+        {
+          requestId: crypto.randomUUID(),
+          attemptId: crypto.randomUUID(),
+          ownerId: selected.userId,
+          sourceKind: "DIRECT",
+          basePriority: 16,
+          connectionOwner: "model-api",
+          deadlineAt: new Date(Date.now() + 30_000),
+          candidates: [
+            {
+              capacityId: identity.inferenceCapacityId,
+              executionTargetId: identity.id,
+              candidateOrder: 0,
+            },
+          ],
+        },
+        request.signal,
+      );
+    } catch {
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "unknown" });
+      return operationFailureResponse(operation, "unknown");
+    }
     if (capacityLease.state !== "ADMITTED") {
       await operation.dispose?.();
       await failRelayMetadata({ relayRequestId, startedAt, failure: "rate_limited" });
@@ -2229,6 +2235,7 @@ async function relayPool({
   manager,
   limiter,
   transformDebug,
+  capacityRuntime,
 }: {
   request: Request;
   requester: RelayRequester;
@@ -2237,6 +2244,7 @@ async function relayPool({
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
   transformDebug?: TransformDebug;
+  capacityRuntime?: CapacityAdmissionRuntime;
 }): Promise<Response> {
   const startedAt = new Date();
   const relayRequestId = await createRelayMetadata({
@@ -2389,6 +2397,58 @@ async function relayPool({
   }
 
   const memberById = new Map(eligibleMembers.map((member) => [member.id, member] as const));
+  let capacityLease: Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>> | undefined;
+  let selectedRouteCandidates = routeCandidates;
+  if (capacityRuntime) {
+    const admissionCandidates = routeCandidates.map((candidate, candidateOrder) => {
+      const member = memberById.get(candidate.poolMemberId);
+      const identity = member?.ExecutionTarget;
+      if (!identity?.inferenceCapacityId) return null;
+      return {
+        capacityId: identity.inferenceCapacityId,
+        executionTargetId: identity.id,
+        poolMemberId: candidate.poolMemberId,
+        candidateOrder,
+      };
+    });
+    if (admissionCandidates.some((candidate) => candidate === null)) {
+      globalLease.release();
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "unsupported_capability" });
+      return operationFailureResponse(operation, "unsupported_capability");
+    }
+    try {
+      capacityLease = await capacityRuntime.acquire(
+        {
+          requestId: crypto.randomUUID(),
+          attemptId: crypto.randomUUID(),
+          ownerId: requester.userId,
+          sourceKind: "POOL",
+          poolId: target.id,
+          basePriority: 16,
+          connectionOwner: "model-api",
+          deadlineAt: new Date(Date.now() + 30_000),
+          candidates: admissionCandidates.filter((candidate) => candidate !== null),
+        },
+        request.signal,
+      );
+    } catch {
+      globalLease.release();
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "unknown" });
+      return operationFailureResponse(operation, "unknown");
+    }
+    if (capacityLease.state !== "ADMITTED" || !capacityLease.lease.poolMemberId) {
+      globalLease.release();
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "rate_limited" });
+      return operationFailureResponse(operation, "rate_limited");
+    }
+    const selectedPoolMemberId = capacityLease.lease.poolMemberId;
+    selectedRouteCandidates = routeCandidates.filter(
+      ({ poolMemberId }) => poolMemberId === selectedPoolMemberId,
+    );
+  }
   let finalFailure: RelayFailure = "unknown";
   let attemptCount = 0;
   // One wall-clock deadline covers body rebuild/reopen, every upstream attempt,
@@ -2397,7 +2457,7 @@ async function relayPool({
   let cumulativeRequestBytes = 0;
   let cumulativeResponseBytes = 0;
 
-  for (const candidate of routeCandidates) {
+  for (const candidate of selectedRouteCandidates) {
     if (remainingRelayBudgetMs(relayDeadlineMs) === 0) {
       finalFailure = "timeout";
       break;
@@ -2464,6 +2524,8 @@ async function relayPool({
       cliLease.release();
       if (error instanceof AdapterError && operation.adaptation) {
         globalLease.release();
+        if (capacityLease?.state === "ADMITTED")
+          await capacityRuntime?.release(capacityLease.lease);
         await operation.dispose?.();
         const canonicalError = {
           code: "invalid_request_error",
@@ -2742,7 +2804,13 @@ async function relayPool({
             );
         }
       }
-      return new Response(responseBody, { status: started.status, headers: responseHeaders });
+      const response = new Response(responseBody, {
+        status: started.status,
+        headers: responseHeaders,
+      });
+      return capacityLease?.state === "ADMITTED"
+        ? (capacityRuntime?.hold(response, capacityLease.lease, request.signal) ?? response)
+        : response;
     } catch {
       const terminal = await attempt.terminal;
       cumulativeRequestBytes += terminal.requestBytes;
@@ -2760,6 +2828,7 @@ async function relayPool({
         continue;
       }
       globalLease.release();
+      if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
       await operation.dispose?.();
       await updateRelayMetadata(relayRequestId, {
         selectedDiscoveredModelId: member.discoveredModelId,
@@ -2777,6 +2846,7 @@ async function relayPool({
   }
 
   globalLease.release();
+  if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
   await operation.dispose?.();
   await failRelayMetadata({
     relayRequestId,
@@ -3605,6 +3675,7 @@ async function relayPreparedModeledRequest({
       manager,
       limiter,
       transformDebug: prepared.transformDebug,
+      capacityRuntime,
     });
     if (requester.exposeTransformDebug && prepared.transformDebug) {
       return attachTransformDebug(response, prepared.transformDebug);
