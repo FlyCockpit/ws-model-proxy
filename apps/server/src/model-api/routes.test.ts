@@ -3075,6 +3075,18 @@ describe("model API routes", () => {
     });
     expect(capacityRuntime.acquire).not.toHaveBeenCalled();
     expect(manager.sent).toHaveLength(0);
+    expect(db.relayRequest.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          contextTokenCount: expect.any(Number),
+          contextCountMethod: "TOKEN_ESTIMATE",
+          contextCountConfidence: "CONSERVATIVE",
+          contextCountExact: false,
+          contextSafetyMargin: 1.2,
+          contextSerializedChars: expect.any(Number),
+        }),
+      }),
+    );
   });
 
   it("filters over-context pool members before admission", async () => {

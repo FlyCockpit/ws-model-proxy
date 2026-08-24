@@ -430,6 +430,7 @@ type RelayMetadataCreate = {
   transformerErrorClass?: string | null;
   operation?: ModelApiCapability;
   requestBytes?: number | null;
+  contextCount?: ContextCountTelemetry;
 };
 
 type RelayMetadataUpdate = {
@@ -1356,6 +1357,12 @@ async function createRelayMetadata(input: RelayMetadataCreate): Promise<string> 
       transformerErrorClass: input.transformerErrorClass ?? null,
       operation: input.operation ?? null,
       requestBytes: input.requestBytes == null ? null : BigInt(input.requestBytes),
+      contextTokenCount: input.contextCount?.tokens ?? null,
+      contextCountMethod: input.contextCount?.method ?? null,
+      contextCountConfidence: input.contextCount?.confidence ?? null,
+      contextCountExact: input.contextCount?.exact ?? null,
+      contextSafetyMargin: input.contextCount?.safetyMargin ?? null,
+      contextSerializedChars: input.contextCount?.serializedChars ?? null,
       status: "PENDING",
     },
     select: { id: true },
@@ -2070,6 +2077,7 @@ async function relayDirect({
     requestedDiscoveredModelId: target.id,
     operation: operation.capability,
     requestBytes: null,
+    contextCount: operation.contextCount,
   });
   const selected = await directModelRow(target.id);
   if (!selected) {
@@ -2316,6 +2324,7 @@ async function relayPool({
     transformerErrorClass: transformDebug?.error ?? null,
     operation: operation.capability,
     requestBytes: null,
+    contextCount: operation.contextCount,
   });
 
   let globalLease: ModelApiLimitLease | undefined;
@@ -3050,6 +3059,7 @@ async function relaySelectedModelNoFailover({
     requestedModelPoolId,
     operation: operation.capability,
     requestBytes: null,
+    contextCount: operation.contextCount,
   });
   const selected = await directModelRow(selectedDiscoveredModelId);
   if (!selected) {

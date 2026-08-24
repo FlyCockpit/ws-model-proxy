@@ -53,13 +53,29 @@ describe("context counting hierarchy", () => {
       max_output_tokens: 200,
     };
     const serializedChars = JSON.stringify(input).length;
-    await expect(countSerializedRequestContext({ input, safetyMargin: 1.25 })).resolves.toEqual({
+    await expect(
+      countSerializedRequestContext({ input, safetyMargin: 1.25, useTokenEstimate: false }),
+    ).resolves.toEqual({
       tokens: Math.ceil((serializedChars / 4) * 1.25),
       method: "CHAR_ESTIMATE",
       exact: false,
       confidence: "FALLBACK",
       safetyMargin: 1.25,
       serializedChars,
+    });
+  });
+
+  it("uses a conservative tokenizer estimate ahead of character fallback", async () => {
+    const input = { messages: [{ content: "hello" }] };
+    const bytes = new TextEncoder().encode(JSON.stringify(input)).byteLength;
+    await expect(
+      countSerializedRequestContext({ input, safetyMargin: 1.2 }),
+    ).resolves.toMatchObject({
+      tokens: Math.ceil((bytes / 3) * 1.2),
+      method: "TOKEN_ESTIMATE",
+      exact: false,
+      confidence: "CONSERVATIVE",
+      safetyMargin: 1.2,
     });
   });
 

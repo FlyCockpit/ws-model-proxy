@@ -749,6 +749,13 @@ model RelayRequest {
   transformerLatencyMs       Int?
   transformerCacheHit        Boolean?
   transformerErrorClass      String?
+  /// Prompt-free context admission telemetry. Never stores request content.
+  contextTokenCount          Int?
+  contextCountMethod         String?
+  contextCountConfidence     String?
+  contextCountExact          Boolean?
+  contextSafetyMargin        Float?
+  contextSerializedChars     Int?
   /// Protocol operation only; never stores prompts, filenames, audio, or transcripts.
   operation                  String?
   /// Sum of rebuilt upstream request-body bytes across all relay attempts.

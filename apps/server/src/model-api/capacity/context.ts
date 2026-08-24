@@ -18,19 +18,34 @@ export async function countSerializedRequestContext({
   input,
   counters = [],
   safetyMargin = 1.2,
+  useTokenEstimate = true,
   signal,
 }: {
   input: unknown;
   counters?: readonly ContextCounter[];
   safetyMargin?: number;
+  useTokenEstimate?: boolean;
   signal?: AbortSignal;
 }): Promise<ContextCountTelemetry> {
   if (signal?.aborted) throw signal.reason;
   const serialized = JSON.stringify(input);
   if (serialized === undefined) throw new TypeError("Context input must be JSON serializable.");
+  const estimateCounter: ContextCounter = {
+    async count() {
+      if (!useTokenEstimate) return null;
+      // Deliberately conservative for mixed text/JSON/tool schemas. This is
+      // never exact and exists below native/template counters in the hierarchy.
+      const utf8Bytes = new TextEncoder().encode(serialized).byteLength;
+      return {
+        tokens: Math.ceil((utf8Bytes / 3) * safetyMargin),
+        method: "TOKEN_ESTIMATE",
+        exact: false,
+      };
+    },
+  };
   const result = await countContext({
     input,
-    counters,
+    counters: [...counters, estimateCounter],
     serializedChars: serialized.length,
     safetyMargin,
     signal,
@@ -44,7 +59,8 @@ export async function countSerializedRequestContext({
         : result.method === "TOKEN_ESTIMATE"
           ? "CONSERVATIVE"
           : "FALLBACK",
-    safetyMargin: result.method === "CHAR_ESTIMATE" ? safetyMargin : 1,
+    safetyMargin:
+      result.method === "CHAR_ESTIMATE" || result.method === "TOKEN_ESTIMATE" ? safetyMargin : 1,
     serializedChars: serialized.length,
   };
 }
