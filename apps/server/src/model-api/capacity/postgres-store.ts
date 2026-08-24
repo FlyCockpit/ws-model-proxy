@@ -284,13 +284,27 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       where: { ExecutionTarget: { capacityId } },
       include: { ModelPool: true },
     });
-    const configuredReservations = configuredReservationMembers
-      .map((member) => ({
-        id: member.id,
-        capacityReservedSlots:
-          member.capacityReservedSlots ?? member.ModelPool.capacityReservedSlots,
-      }))
-      .filter((policy) => policy.capacityReservedSlots > 0);
+    const reservationsByTarget = new Map<
+      string,
+      { memberIds: Set<string>; capacityReservedSlots: number }
+    >();
+    for (const member of configuredReservationMembers) {
+      if (!member.executionTargetId) continue;
+      const slots = member.capacityReservedSlots ?? member.ModelPool.capacityReservedSlots;
+      const existing = reservationsByTarget.get(member.executionTargetId);
+      if (existing) {
+        existing.memberIds.add(member.id);
+        existing.capacityReservedSlots = Math.max(existing.capacityReservedSlots, slots);
+      } else {
+        reservationsByTarget.set(member.executionTargetId, {
+          memberIds: new Set([member.id]),
+          capacityReservedSlots: slots,
+        });
+      }
+    }
+    const configuredReservations = [...reservationsByTarget.values()].filter(
+      (policy) => policy.capacityReservedSlots > 0,
+    );
     const eligibility = new Map<string, { borrowed: boolean }>();
     const eligible = [];
     for (const waiter of waiters) {
@@ -323,7 +337,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       const reservedForOthers = Math.min(
         capacity.hardConcurrencyLimit ?? Number.MAX_SAFE_INTEGER,
         configuredReservations
-          .filter((policy) => policy.id !== waiter.poolMemberId)
+          .filter((policy) => !waiter.poolMemberId || !policy.memberIds.has(waiter.poolMemberId))
           .reduce((total, policy) => total + policy.capacityReservedSlots, 0),
       );
       const borrowed =

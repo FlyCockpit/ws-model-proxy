@@ -286,7 +286,10 @@ integration("PostgreSQL capacity admission primitives", () => {
           }),
         );
       const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
-      const firstManager = new PostgresCapacityAdmissionStore(db, "proof-server-a");
+      const notifications: string[][] = [];
+      const firstManager = new PostgresCapacityAdmissionStore(db, "proof-server-a", {
+        notify: async (capacityIds) => void notifications.push([...capacityIds]),
+      });
       const secondClient = createPrismaClient(databaseUrl);
       const secondManager = new PostgresCapacityAdmissionStore(secondClient, "proof-server-b");
       const deadlineAt = new Date(Date.now() + 60_000);
@@ -457,8 +460,13 @@ integration("PostgreSQL capacity admission primitives", () => {
             heartbeatAt: new Date(Date.now() - 60_000),
           },
         });
-        await expect(firstManager.reclaimExpired(new Date(), 10)).resolves.toBe(1);
-        await expect(firstManager.release(borrowed.lease)).resolves.toBe(false);
+        const [reclaimed, heartbeatWon] = await Promise.all([
+          firstManager.reclaimExpired(new Date(), 10),
+          secondManager.heartbeat(borrowed.lease, new Date(Date.now() + 60_000)),
+        ]);
+        expect([reclaimed, heartbeatWon]).toEqual(reclaimed === 1 ? [1, false] : [0, true]);
+        if (reclaimed === 1) expect(notifications.flat()).toContain(capacity.id);
+        await expect(firstManager.release(borrowed.lease)).resolves.toBe(heartbeatWon);
         await expect(
           firstManager.heartbeat(borrowed.lease, new Date(Date.now() + 60_000)),
         ).resolves.toBe(false);
@@ -616,6 +624,137 @@ integration("PostgreSQL capacity admission primitives", () => {
         ).toBe(3);
       }
       await secondClient.$disconnect();
+    } finally {
+      await db.user.delete({ where: { id: user.id } }).catch(() => undefined);
+      await db.$disconnect();
+    }
+  });
+
+  it("caps overcommitted shared-target reservations and distinguishes NEVER from WHEN_IDLE borrowing", async () => {
+    if (!databaseUrl) return;
+    const db = createPrismaClient(databaseUrl);
+    const suffix = crypto.randomUUID();
+    const user = await db.user.create({
+      data: { name: "Reservation Proof", email: `reserve-${suffix}@example.test`, slug: suffix },
+    });
+    try {
+      const capacity = await db.inferenceCapacity.create({
+        data: {
+          userId: user.id,
+          label: suffix,
+          runtimeIdentityKey: suffix,
+          runtimeModel: "reservation-proof",
+          hardConcurrencyLimit: 2,
+        },
+      });
+      const account = await db.providerAccount.create({
+        data: {
+          userId: user.id,
+          providerType: "proof",
+          label: suffix,
+          baseUrl: "https://example.test",
+          authType: "BEARER",
+        },
+      });
+      const targets: Array<{ id: string }> = [];
+      for (const name of ["shared", "direct"]) {
+        const model = await db.providerModel.create({
+          data: {
+            userId: user.id,
+            providerAccountId: account.id,
+            upstreamModelId: `${name}-${suffix}`,
+          },
+        });
+        targets.push(
+          await db.executionTarget.create({
+            data: {
+              userId: user.id,
+              kind: "PROVIDER_MODEL",
+              providerModelId: model.id,
+              inferenceCapacityId: capacity.id,
+              directBorrowPolicy: "NEVER",
+            },
+          }),
+        );
+      }
+      const members = [];
+      for (const index of [0, 1]) {
+        const pool = await db.modelPool.create({
+          data: {
+            userId: user.id,
+            slug: `reserve-${index}-${suffix}`,
+            name: `Reserve ${index}`,
+            capacityReservedSlots: 9,
+          },
+        });
+        members.push({
+          pool,
+          member: await db.poolMember.create({
+            data: { poolId: pool.id, executionTargetId: targets[0]!.id },
+          }),
+        });
+      }
+      const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+      const manager = new PostgresCapacityAdmissionStore(db, "reservation-proof");
+      const deadlineAt = new Date(Date.now() + 60_000);
+      for (const [index, entry] of members.entries()) {
+        const result = await manager.acquire({
+          requestId: `reserved-${index}-${suffix}`,
+          attemptId: `reserved-${index}-${suffix}`,
+          ownerId: user.id,
+          sourceKind: "POOL",
+          poolId: entry.pool.id,
+          basePriority: 16,
+          connectionOwner: "reservation-proof",
+          deadlineAt,
+          candidates: [
+            {
+              capacityId: capacity.id,
+              executionTargetId: targets[0]!.id,
+              poolMemberId: entry.member.id,
+              candidateOrder: 0,
+            },
+          ],
+        });
+        expect(result.state).toBe("ADMITTED");
+      }
+      const directAttempt = (attemptId: string) => ({
+        requestId: attemptId,
+        attemptId,
+        ownerId: user.id,
+        sourceKind: "DIRECT" as const,
+        basePriority: 16,
+        connectionOwner: "reservation-proof",
+        deadlineAt,
+        candidates: [
+          { capacityId: capacity.id, executionTargetId: targets[1]!.id, candidateOrder: 0 },
+        ],
+      });
+      await expect(manager.acquire(directAttempt(`never-${suffix}`))).resolves.toMatchObject({
+        state: "WAITING",
+      });
+      await db.executionTarget.update({
+        where: { id: targets[1]!.id },
+        data: { directBorrowPolicy: "WHEN_IDLE" },
+      });
+      const active = await db.capacityLease.findMany({
+        where: { capacityId: capacity.id, state: "ACTIVE" },
+      });
+      await manager.release({
+        leaseId: active[0]!.id,
+        attemptId: active[0]!.attemptId,
+        capacityId: active[0]!.capacityId,
+        executionTargetId: active[0]!.executionTargetId,
+        ...(active[0]!.poolMemberId ? { poolMemberId: active[0]!.poolMemberId } : {}),
+        fencingToken: active[0]!.fencingToken,
+        expiresAt: active[0]!.expiresAt,
+      });
+      await expect(manager.acquire(directAttempt(`idle-${suffix}`))).resolves.toMatchObject({
+        state: "ADMITTED",
+      });
+      expect(
+        await db.capacityLease.findUnique({ where: { attemptId: `idle-${suffix}` } }),
+      ).toMatchObject({ borrowed: true });
     } finally {
       await db.user.delete({ where: { id: user.id } }).catch(() => undefined);
       await db.$disconnect();
