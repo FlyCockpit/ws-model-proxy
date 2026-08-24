@@ -3,7 +3,7 @@ import { anthropicRelayHeaders } from "./anthropic-protocol";
 import { nativeRequestHeaders } from "./native-request-headers";
 
 describe("nativeRequestHeaders", () => {
-  it("forwards only explicit OpenAI protocol headers, case-insensitively", () => {
+  it("forwards explicit OpenAI protocol headers but strips client account selectors", () => {
     const request = new Request("https://wsmp.test/v1/responses", {
       method: "POST",
       headers: {
@@ -11,8 +11,8 @@ describe("nativeRequestHeaders", () => {
         "Content-Type": "application/json",
         "Idempotency-Key": "retry-1",
         "OpenAI-Beta": "responses=v1",
-        "OpenAI-Organization": "org_1",
-        "OPENAI-PROJECT": "project_1",
+        "OPENAI-ORGANIZATION": "org_1",
+        "OpenAI-Project": "project_1",
         Authorization: "Bearer wsmp-secret",
         Cookie: "session=private",
         "Proxy-Authorization": "Basic private",
@@ -25,9 +25,9 @@ describe("nativeRequestHeaders", () => {
       "content-type": "application/json",
       "idempotency-key": "retry-1",
       "openai-beta": "responses=v1",
-      "openai-organization": "org_1",
-      "openai-project": "project_1",
     });
+    expect(nativeRequestHeaders(request, "openai").get("openai-organization")).toBeNull();
+    expect(nativeRequestHeaders(request, "openai").get("openai-project")).toBeNull();
   });
 
   it("rejects Connection-nominated fields and preserves required Anthropic fields", () => {

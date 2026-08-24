@@ -12,6 +12,8 @@ describe("Anthropic protocol boundary", () => {
     for (const source of Object.values(officialFixture.sources)) {
       expect(source).toMatch(/^https:\/\/docs\.anthropic\.com\//);
     }
+    expect(officialFixture.derivedAt).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(officialFixture.provenance.upstreamCapture).toBe(false);
     const result = parseAnthropicIngress(new Headers(officialFixture.requestHeaders));
     expect(result).toEqual({
       version: officialFixture.protocolVersion,

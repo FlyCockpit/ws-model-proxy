@@ -18,7 +18,7 @@
       "documented Messages SSE event ordering"
     ]
   },
-  "capturedAt": "2026-08-24",
+  "derivedAt": "2026-08-24",
   "requestHeaders": {
     "anthropic-version": "2023-06-01",
     "anthropic-beta": "prompt-caching-2024-07-31,interleaved-thinking-2025-05-14"
