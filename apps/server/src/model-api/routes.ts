@@ -114,6 +114,7 @@ import {
 } from "./protocols/index.js";
 import { type RelayAttemptTerminal, startRelayAttempt } from "./relay-executor.js";
 import { type RelayBodySource } from "./request-body-source.js";
+import { profileSurfaceRequest } from "./request-feature-profiler.js";
 import {
   isBasicTranscriptionRequest,
   TranscriptionRequestError,
@@ -842,8 +843,7 @@ function supportsOperation({
 
 function requestedSurfaceForOperation(operation: RelayOperation): ProtocolSurface | null {
   if (operation.family === "chat.completions") return "openai-chat";
-  if (operation.family === "responses" && operation.capability === "responses.create")
-    return "openai-responses";
+  if (operation.family === "responses") return "openai-responses";
   if (operation.family === "messages" && operation.capability === "messages.create")
     return "anthropic-messages";
   return null;
@@ -970,18 +970,20 @@ async function readAdaptedNonstreamBody({
 async function primeReadableStream(
   stream: ReadableStream<Uint8Array>,
   target: ProtocolSurface,
-): Promise<{ body: ReadableStream<Uint8Array>; completion: Promise<void> }> {
+): Promise<{
+  body: ReadableStream<Uint8Array>;
+  completion: Promise<"ok" | "protocol_error" | "cancelled">;
+}> {
   const reader = stream.getReader();
   const first = await reader.read();
   let pending = first.done ? null : first.value;
   let terminalObserved = pending ? targetStreamTerminal(target, pending) : false;
-  let resolveCompletion: () => void = () => undefined;
-  let rejectCompletion: (error: Error) => void = () => undefined;
-  const completion = new Promise<void>((resolve, reject) => {
+  let nextResponsesSequence = pending ? responseSequenceAfter(pending) : 0;
+  let resolveCompletion: (result: "ok" | "protocol_error" | "cancelled") => void = () => undefined;
+  const completion = new Promise<"ok" | "protocol_error" | "cancelled">((resolve) => {
     resolveCompletion = resolve;
-    rejectCompletion = reject;
   });
-  if (first.done) resolveCompletion();
+  if (first.done) resolveCompletion("ok");
   const body = new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
@@ -992,35 +994,66 @@ async function primeReadableStream(
         }
         const next = await reader.read();
         if (next.done) {
-          resolveCompletion();
+          resolveCompletion("ok");
           controller.close();
         } else {
           terminalObserved ||= targetStreamTerminal(target, next.value);
+          nextResponsesSequence = Math.max(
+            nextResponsesSequence,
+            responseSequenceAfter(next.value),
+          );
           controller.enqueue(next.value);
         }
-      } catch (error) {
-        rejectCompletion(error instanceof Error ? error : new Error(String(error)));
+      } catch {
+        resolveCompletion("protocol_error");
         if (!terminalObserved) {
-          const renderer = new CanonicalStreamRenderer(target);
-          for (const chunk of renderer.push({
-            type: "error",
-            error: {
-              code: "protocol_error",
-              message: "The upstream stream violated the adapted protocol.",
-              upstreamStatus: 502,
-            },
-          }))
+          for (const chunk of renderCommittedProtocolError(target, nextResponsesSequence))
             controller.enqueue(chunk);
         }
         controller.close();
       }
     },
     async cancel(reason) {
-      rejectCompletion(reason instanceof Error ? reason : new Error("adapted stream canceled"));
+      resolveCompletion("cancelled");
       return reader.cancel(reason);
     },
   });
   return { body, completion };
+}
+
+function responseSequenceAfter(chunk: Uint8Array): number {
+  let next = 0;
+  for (const match of new TextDecoder().decode(chunk).matchAll(/"sequence_number":(\d+)/g))
+    next = Math.max(next, Number(match[1]) + 1);
+  return next;
+}
+
+function renderCommittedProtocolError(
+  target: ProtocolSurface,
+  responsesSequence: number,
+): Uint8Array[] {
+  if (target === "openai-responses") {
+    return [
+      new TextEncoder().encode(
+        `event: error\ndata: ${JSON.stringify({
+          type: "error",
+          sequence_number: responsesSequence,
+          code: "protocol_error",
+          message: "The upstream stream violated the adapted protocol.",
+          param: null,
+        })}\n\n`,
+      ),
+    ];
+  }
+  const renderer = new CanonicalStreamRenderer(target);
+  return renderer.push({
+    type: "error",
+    error: {
+      code: "protocol_error",
+      message: "The upstream stream violated the adapted protocol.",
+      upstreamStatus: 502,
+    },
+  });
 }
 
 function targetStreamTerminal(target: ProtocolSurface, chunk: Uint8Array): boolean {
@@ -1040,6 +1073,10 @@ function executionPathForPoolMember(
   if (!requestedSurface) return null;
   const adaptationEnabled =
     operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled;
+  const responsesOperation = responsesOperationForRelay(operation);
+  const rawRequirements = operation.adaptation
+    ? profileSurfaceRequest(operation.adaptation.payload)
+    : {};
   return resolveExecutionPath({
     capabilities,
     requestedSurface: modelApiSurface(requestedSurface),
@@ -1047,11 +1084,36 @@ function executionPathForPoolMember(
       stream: operation.stream,
       protocolVersion: operation.anthropicIngress?.version,
       betaFeatures: operation.anthropicIngress?.betaFeatures,
-      responsesOperation: requestedSurface === "openai-responses" ? "create" : undefined,
+      responsesOperation,
+      stateful:
+        responsesOperation !== undefined &&
+        responsesOperation !== "create" &&
+        responsesOperation !== "countTokens",
+      ...rawRequirements,
       ...(canonical ? canonicalRequestRequirements(canonical) : {}),
     },
     adaptationEnabled,
   });
+}
+
+function responsesOperationForRelay(
+  operation: RelayOperation,
+): SurfaceRequestRequirements["responsesOperation"] {
+  if (operation.additionalCapabilities?.includes("responses.statefulFollowUps"))
+    return "statefulFollowUps";
+  const mapping: Partial<
+    Record<ModelApiCapability, SurfaceRequestRequirements["responsesOperation"]>
+  > = {
+    "responses.create": "create",
+    "responses.statefulFollowUps": "statefulFollowUps",
+    "responses.retrieve": "retrieve",
+    "responses.delete": "delete",
+    "responses.cancel": "cancel",
+    "responses.listInputItems": "listInputItems",
+    "responses.countTokens": "countTokens",
+    "responses.compact": "compact",
+  };
+  return mapping[operation.capability];
 }
 
 function canonicalRequestRequirements(
@@ -2403,39 +2465,24 @@ async function relayPool({
         if (upstreamSse !== operation.stream) {
           attempt.cancel("protocol_error");
           const terminal = await attempt.terminal;
+          cumulativeRequestBytes += terminal.requestBytes;
+          cumulativeResponseBytes += terminal.responseBytes;
           cliLease.release();
-          globalLease.release();
           if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
-          await operation.dispose?.();
-          await updateRelayMetadata(relayRequestId, {
-            selectedDiscoveredModelId: member.discoveredModelId,
-            status: "FAILED",
-            startedAt,
-            terminal,
-            fallbackFailure: "protocol_error",
-            attemptCount,
+          finalFailure = "protocol_error";
+          await recordPoolMemberRelayFailure({
+            poolMemberId: candidate.poolMemberId,
+            failure: "protocol_error",
           });
-          const error = {
-            code: "protocol_error",
-            message: operation.stream
-              ? "Adapted streaming upstream did not return an SSE stream."
-              : "Adapted non-streaming upstream unexpectedly returned SSE.",
-            upstreamStatus: 502,
-          };
-          const metadata = renderProtocolErrorMetadata(
-            operation.adaptation.requestedSurface,
-            error,
-          );
-          return new Response(
-            JSON.stringify(renderProtocolError(operation.adaptation.requestedSurface, error)),
-            { status: metadata.status, headers: metadata.headers },
-          );
+          if (execution?.retrySafety === "never") break;
+          continue;
         }
       }
 
       let validatedAdaptedNonstream: Uint8Array | null = null;
       let primedAdaptedStream: ReadableStream<Uint8Array> | null = null;
-      let adaptationCompletion = Promise.resolve();
+      let adaptationCompletion: Promise<"ok" | "protocol_error" | "cancelled"> =
+        Promise.resolve("ok");
       if (adaptedSource && operation.adaptation && !operation.stream) {
         try {
           validatedAdaptedNonstream = await readAdaptedNonstreamBody({
@@ -2497,9 +2544,15 @@ async function relayPool({
         .then(async ([terminalResult, adaptationResult]) => {
           if (terminalResult.status === "rejected") throw terminalResult.reason;
           const upstreamTerminal = terminalResult.value;
+          const adaptationOutcome =
+            adaptationResult.status === "fulfilled" ? adaptationResult.value : "protocol_error";
           const terminal: RelayAttemptTerminal =
-            adaptationResult.status === "rejected" && upstreamTerminal.ok
-              ? { ...upstreamTerminal, ok: false, failure: "protocol_error" }
+            adaptationOutcome !== "ok" && upstreamTerminal.ok
+              ? {
+                  ...upstreamTerminal,
+                  ok: false,
+                  failure: adaptationOutcome === "cancelled" ? "cancelled" : "protocol_error",
+                }
               : upstreamTerminal;
           const cumulativeTerminal = {
             ...terminal,
@@ -2512,6 +2565,11 @@ async function relayPool({
           await operation.dispose?.();
           if (terminal.ok) {
             await markPoolMemberRelaySuccess(candidate.poolMemberId);
+          } else if (adaptationOutcome === "protocol_error") {
+            await recordPoolMemberRelayFailure({
+              poolMemberId: candidate.poolMemberId,
+              failure: "protocol_error",
+            });
           }
           await updateRelayMetadata(relayRequestId, {
             selectedDiscoveredModelId: member.discoveredModelId,

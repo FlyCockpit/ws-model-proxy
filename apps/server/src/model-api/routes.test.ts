@@ -1101,6 +1101,81 @@ describe("model API routes", () => {
     expect(manager.sent).toHaveLength(1);
   });
 
+  it("filters native pool candidates using features profiled from the raw request", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    const nativeMember = (id: string, capable: boolean) =>
+      poolMemberRow({
+        id,
+        discoveredModelId: `${id}-model`,
+        upstreamModelId: `${id}-upstream`,
+        cliDeviceId: `cli-${id}`,
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiChatCompletions: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              ...(capable
+                ? {
+                    tools: true,
+                    parallelTools: true,
+                    structuredOutput: true,
+                    reasoning: true,
+                    hostedTools: true,
+                    inputImages: true,
+                    inputAudio: true,
+                    inputVideo: true,
+                    outputImages: true,
+                    outputAudio: true,
+                    outputVideo: true,
+                  }
+                : {}),
+            },
+          },
+        },
+      });
+    db.poolMember.findMany.mockResolvedValue([
+      nativeMember("basic", false),
+      nativeMember("featureful", true),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-basic", "cli-featureful"];
+    const responsePromise = appWith(manager).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "image_url", image_url: { url: "data:image/png;base64,QUJDRA==" } },
+              { type: "input_audio", input_audio: { data: "QUJDRA==", format: "wav" } },
+              { type: "video_url", video_url: { url: "https://example.test/video.mp4" } },
+            ],
+          },
+        ],
+        tools: [{ type: "web_search_preview" }],
+        parallel_tool_calls: true,
+        response_format: { type: "json_schema", json_schema: { name: "answer", schema: {} } },
+        reasoning_effort: "high",
+        modalities: ["text", "audio", "image", "video"],
+      }),
+    });
+
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    expect(sent.cliDeviceId).toBe("cli-featureful");
+    expect(JSON.parse(await relayBodyText(sent))).toMatchObject({ model: "featureful-upstream" });
+    await completeJsonRelay({ manager, requestId: sent.requestId });
+    expect((await responsePromise).status).toBe(200);
+  });
+
   it("lists only model targets visible to the bearer token", async () => {
     db.discoveredModel.findMany.mockResolvedValue([
       {
