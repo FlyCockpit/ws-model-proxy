@@ -89,3 +89,87 @@ export const capacityUiInvariants = {
   boundedHorizontalClass: "overflow-x-clip",
   advancedElement: "details",
 } as const;
+
+export function capacityListViewState(input: {
+  pending: boolean;
+  error: boolean;
+  count: number;
+}): "loading" | "error" | "empty" | "content" {
+  if (input.pending) return "loading";
+  if (input.error) return "error";
+  return input.count === 0 ? "empty" : "content";
+}
+
+export const advancedDisclosureProps = {
+  containerElement: "details",
+  triggerElement: "summary",
+  triggerClassName: "min-h-11 cursor-pointer py-2 text-sm font-medium",
+} as const;
+
+export function directPolicyPayload(input: {
+  executionTargetId: string;
+  capacityId: string;
+  priority: string;
+  concurrency: string;
+  reserved: string;
+  wait: string;
+  ceiling: string;
+  margin: string;
+  borrow: "NEVER" | "WHEN_IDLE";
+}) {
+  return {
+    executionTargetId: input.executionTargetId,
+    inferenceCapacityId: input.capacityId || null,
+    directPriority: Number(input.priority),
+    directConcurrencyLimit: Number(input.concurrency),
+    directReservedSlots: Number(input.reserved),
+    directWaitBudgetMs: Number(input.wait),
+    directContextCeiling: Number(input.ceiling),
+    directContextMargin: Number(input.margin),
+    directBorrowPolicy: input.borrow,
+  };
+}
+
+export function memberPolicyPayload(input: {
+  poolMemberId: string;
+  priority: string;
+  reserved: string;
+  wait: string;
+  ceiling: string;
+}) {
+  return {
+    poolMemberId: input.poolMemberId,
+    capacityPriority: Number(input.priority),
+    capacityReservedSlots: Number(input.reserved),
+    capacityWaitBudgetMs: Number(input.wait),
+    capacityContextCeiling: Number(input.ceiling),
+  };
+}
+
+export function createMemberFollowUps(input: {
+  memberId: string;
+  executionTargetId: string;
+  capacityId: string;
+  priority: string;
+  reserved: string;
+  wait: string;
+  ceiling: string;
+}) {
+  return [
+    {
+      kind: "member-policy" as const,
+      input: memberPolicyPayload({ poolMemberId: input.memberId, ...input }),
+    },
+    {
+      kind: "capacity-attachment" as const,
+      input: {
+        executionTargetId: input.executionTargetId,
+        inferenceCapacityId: input.capacityId || null,
+      },
+    },
+  ] as const;
+}
+
+export function followUpRecoveryState(completed: number, total: number) {
+  return completed === total ? "complete" : completed === 0 ? "member-created" : "policy-saved";
+}

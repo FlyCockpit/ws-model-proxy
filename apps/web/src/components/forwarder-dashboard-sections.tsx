@@ -45,7 +45,9 @@ import { WideContent } from "@/components/wide-content";
 import {
   capacityFormSchema,
   capacityMutationPayload,
+  createMemberFollowUps,
   directPolicyIsValid,
+  directPolicyPayload,
   newCapacityDefaults,
 } from "@/lib/capacity-forms";
 import { orpc } from "@/utils/orpc";
@@ -976,7 +978,6 @@ function DirectCapacityPolicyForm({
       },
     }),
   );
-  const values = [priority, concurrency, reserved, wait, ceiling, margin].map(Number);
   const valid = directPolicyIsValid({
     priority,
     concurrency,
@@ -994,17 +995,19 @@ function DirectCapacityPolicyForm({
       onSubmit={(event) => {
         event.preventDefault();
         if (!valid) return;
-        mutation.mutate({
-          executionTargetId: target.id,
-          inferenceCapacityId: capacityId || null,
-          directPriority: values[0],
-          directConcurrencyLimit: values[1],
-          directReservedSlots: values[2],
-          directWaitBudgetMs: values[3],
-          directContextCeiling: values[4],
-          directContextMargin: values[5],
-          directBorrowPolicy: borrow,
-        });
+        mutation.mutate(
+          directPolicyPayload({
+            executionTargetId: target.id,
+            capacityId,
+            priority,
+            concurrency,
+            reserved,
+            wait,
+            ceiling,
+            margin,
+            borrow,
+          }),
+        );
       }}
     >
       <div className="space-y-2">
@@ -2624,17 +2627,17 @@ function PoolMemberForm({
             weight: parsedWeight,
             routingStatus,
           });
-          await updateMemberPolicy.mutateAsync({
-            poolMemberId: created.id,
-            capacityPriority: Number(priority),
-            capacityReservedSlots: Number(reservedSlots),
-            capacityWaitBudgetMs: Number(waitBudget),
-            capacityContextCeiling: Number(contextCeiling),
-          });
-          await attachCapacity.mutateAsync({
+          const followUps = createMemberFollowUps({
+            memberId: created.id,
             executionTargetId: created.executionTargetId,
-            inferenceCapacityId: capacityId || null,
+            capacityId,
+            priority,
+            reserved: reservedSlots,
+            wait: waitBudget,
+            ceiling: contextCeiling,
           });
+          await updateMemberPolicy.mutateAsync(followUps[0].input);
+          await attachCapacity.mutateAsync(followUps[1].input);
           queryClient.invalidateQueries({ queryKey: orpc.capacityManagement.key() });
           onSuccess();
         }
