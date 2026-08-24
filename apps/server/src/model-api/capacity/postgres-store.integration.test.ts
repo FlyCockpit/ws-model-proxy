@@ -10,6 +10,39 @@ if (!databaseUrl)
   console.warn("[capacity-postgres] skipped: SCHEMA_VALIDATION_DATABASE_URL is not configured");
 
 integration("PostgreSQL capacity admission primitives", () => {
+  it("installs fresh-schema admission hardening and a database-owned enqueue sequence", async () => {
+    if (!databaseUrl) return;
+    const first = createPrismaClient(databaseUrl);
+    const second = createPrismaClient(databaseUrl);
+    try {
+      const triggers = await first.$queryRaw<Array<{ name: string }>>`
+        SELECT tgname AS name FROM pg_trigger
+         WHERE NOT tgisinternal AND tgname IN (
+           'capacity_waiter_reference_consistency',
+           'capacity_lease_reference_consistency',
+           'admission_request_reference_consistency'
+         ) ORDER BY tgname`;
+      expect(triggers.map(({ name }) => name)).toEqual([
+        "admission_request_reference_consistency",
+        "capacity_lease_reference_consistency",
+        "capacity_waiter_reference_consistency",
+      ]);
+      const batches = await Promise.all(
+        Array.from(
+          { length: 32 },
+          (_, index) =>
+            (index % 2 ? first : second).$queryRaw<Array<{ value: bigint }>>`
+            SELECT nextval('admission_enqueue_sequence') AS value`,
+        ),
+      );
+      const values = batches.map(([row]) => row?.value).filter((value) => value !== undefined);
+      expect(new Set(values).size).toBe(32);
+      expect([...values].sort((a, b) => Number(a - b))).toHaveLength(32);
+    } finally {
+      await Promise.all([first.$disconnect(), second.$disconnect()]);
+    }
+  });
+
   it("serializes the same stable capacity lock across independent clients", async () => {
     if (!databaseUrl) return;
     const first = createPrismaClient(databaseUrl);
@@ -224,13 +257,32 @@ integration("PostgreSQL capacity admission primitives", () => {
         );
       }
       const pool = await db.modelPool.create({
-        data: { userId: user.id, slug: `pool-${suffix}`, name: "Proof pool" },
+        data: {
+          userId: user.id,
+          slug: `pool-${suffix}`,
+          name: "Proof pool",
+          capacityPriority: 23,
+          capacityConcurrencyLimit: 3,
+          capacityReservedSlots: 7,
+          capacityBorrowPolicy: "NEVER",
+        },
       });
-      const members = [];
-      for (const target of targets)
+      const members: Array<{ id: string }> = [];
+      for (const [index, target] of targets.entries())
         members.push(
           await db.poolMember.create({
-            data: { poolId: pool.id, executionTargetId: target.id, capacityPriority: 16 },
+            data: {
+              poolId: pool.id,
+              executionTargetId: target.id,
+              ...(index === 0
+                ? {
+                    capacityPriority: 16,
+                    capacityConcurrencyLimit: 2,
+                    capacityReservedSlots: 0,
+                    capacityBorrowPolicy: "WHEN_IDLE" as const,
+                  }
+                : {}),
+            },
           }),
         );
       const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
@@ -238,6 +290,12 @@ integration("PostgreSQL capacity admission primitives", () => {
       const secondClient = createPrismaClient(databaseUrl);
       const secondManager = new PostgresCapacityAdmissionStore(secondClient, "proof-server-b");
       const deadlineAt = new Date(Date.now() + 60_000);
+      const spoofedCallerPolicy = {
+        priority: 31,
+        memberConcurrencyCeiling: 99,
+        reservedSlots: 99,
+        allowBorrowReserved: false,
+      };
       const first = await firstManager.acquire({
         requestId: `request-1-${suffix}`,
         attemptId: `attempt-1-${suffix}`,
@@ -252,11 +310,26 @@ integration("PostgreSQL capacity admission primitives", () => {
           executionTargetId: targets[candidateOrder]!.id,
           poolMemberId: member.id,
           candidateOrder,
+          ...spoofedCallerPolicy,
         })),
       });
       expect(first.state).toBe("ADMITTED");
       const waiters = await db.capacityWaiter.findMany({
         where: { AdmissionRequest: { attemptId: `attempt-1-${suffix}` } },
+        orderBy: { candidateOrder: "asc" },
+      });
+      expect(waiters.map((waiter) => waiter.candidateOrder)).toEqual([0, 1]);
+      expect(waiters[0]).toMatchObject({
+        effectivePriority: 16,
+        effectiveConcurrencyLimit: 2,
+        effectiveReservedSlots: 0,
+        effectiveBorrowPolicy: "WHEN_IDLE",
+      });
+      expect(waiters[1]).toMatchObject({
+        effectivePriority: 23,
+        effectiveConcurrencyLimit: 3,
+        effectiveReservedSlots: 7,
+        effectiveBorrowPolicy: "NEVER",
       });
       expect(waiters.filter((waiter) => waiter.state === "ADMITTED")).toHaveLength(1);
       expect(waiters.filter((waiter) => waiter.state === "CANCELLED")).toHaveLength(1);
@@ -394,6 +467,30 @@ integration("PostgreSQL capacity admission primitives", () => {
           where: { id: capacity.id },
           data: { hardConcurrencyLimit: 1 },
         });
+        const healthyAttempt = {
+          ...lowAttempt,
+          requestId: `request-healthy-${suffix}`,
+          attemptId: `attempt-healthy-${suffix}`,
+        };
+        await expect(firstManager.acquire(healthyAttempt)).resolves.toMatchObject({
+          state: "WAITING",
+        });
+        await expect(
+          firstManager.acquire({ ...healthyAttempt, candidates: [] }),
+        ).resolves.toMatchObject({
+          state: "WAITING",
+        });
+        await expect(
+          firstManager.sweepAbandoned({
+            now: new Date(),
+            heartbeatBefore: new Date(Date.now() - 1_000),
+            limit: 10,
+          }),
+        ).resolves.toMatchObject({ requests: 0 });
+        expect(
+          await db.admissionRequest.findUnique({ where: { attemptId: healthyAttempt.attemptId } }),
+        ).toMatchObject({ state: "WAITING" });
+        await firstManager.cancelAttempt(healthyAttempt.attemptId);
         const abandonedAttempt = {
           ...lowAttempt,
           requestId: `request-abandoned-${suffix}`,
@@ -453,6 +550,7 @@ integration("PostgreSQL capacity admission primitives", () => {
           firstManager.cancelAttempt(raceAttempt.attemptId),
           secondManager.acquire({ ...raceAttempt, candidates: [] }),
         ]);
+        await expect(firstManager.cancelAttempt(raceAttempt.attemptId)).resolves.toBe(false);
         expect(
           await db.admissionRequest.findUnique({ where: { attemptId: raceAttempt.attemptId } }),
         ).toMatchObject({ state: "CANCELLED" });
@@ -480,6 +578,42 @@ integration("PostgreSQL capacity admission primitives", () => {
         expect(
           await db.capacityLease.count({ where: { attemptId: deadlineAttempt.attemptId } }),
         ).toBe(0);
+
+        await db.inferenceCapacity.update({
+          where: { id: capacity.id },
+          data: { hardConcurrencyLimit: 1 },
+        });
+        const fillAttempts = Array.from({ length: 4 }, (_, index) => ({
+          ...lowAttempt,
+          requestId: `request-fill-${index}-${suffix}`,
+          attemptId: `attempt-fill-${index}-${suffix}`,
+          candidates: [
+            {
+              capacityId: capacity.id,
+              executionTargetId: targets[0]!.id,
+              poolMemberId: members[0]!.id,
+              candidateOrder: 0,
+            },
+          ],
+        }));
+        const blocker = await firstManager.acquire(fillAttempts[0]!);
+        expect(blocker.state).toBe("ADMITTED");
+        for (const attempt of fillAttempts.slice(1))
+          await expect(firstManager.acquire(attempt)).resolves.toMatchObject({ state: "WAITING" });
+        await db.inferenceCapacity.update({
+          where: { id: capacity.id },
+          data: { hardConcurrencyLimit: 3 },
+        });
+        if (blocker.state !== "ADMITTED") throw new Error("Expected fill blocker lease.");
+        await expect(firstManager.release(blocker.lease)).resolves.toBe(true);
+        expect(
+          await db.capacityLease.count({
+            where: {
+              attemptId: { in: fillAttempts.slice(1).map(({ attemptId }) => attemptId) },
+              state: "ACTIVE",
+            },
+          }),
+        ).toBe(3);
       }
       await secondClient.$disconnect();
     } finally {
