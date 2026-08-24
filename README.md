@@ -170,6 +170,15 @@ For OpenWebUI and other OpenAI-compatible clients, set the API base URL to
 model ID returned by `/v1/models`; dashboard labels and upstream model IDs are
 search aids, not always the client ID.
 
+Dedicated speech-to-text requests use `POST /v1/audio/transcriptions` (and
+translations use `/v1/audio/translations`) with the standard multipart OpenAI
+shape. This is protocol proxying to the configured upstream transcription
+server; it is separate from `input_audio` inside chat requests. WMP does not run
+ASR, diarization, alignment, language detection, or transcoding. It forwards
+supported timestamps, diarization fields, provider extensions, response
+formats, and SSE bytes unchanged, while configured per-model capabilities
+control direct and pool eligibility.
+
 ### Why is my model missing from the dashboard?
 
 1. Confirm the long-running daemon is active: `wsmp status --json`. It must

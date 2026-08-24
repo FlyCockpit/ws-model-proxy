@@ -96,6 +96,35 @@ export const env = createEnv({
       .int()
       .min(0)
       .default(512 * 1024 * 1024),
+    MODEL_API_TRANSCRIPTION_SPOOL_DIR: z.string().min(1).optional(),
+    MODEL_API_TRANSCRIPTION_MAX_UPLOAD_BYTES: z.coerce
+      .number()
+      .int()
+      .positive()
+      .max(1024 * 1024 * 1024)
+      .default(100 * 1024 * 1024),
+    MODEL_API_TRANSCRIPTION_MAX_MULTIPART_BYTES: z.coerce
+      .number()
+      .int()
+      .positive()
+      .max(1025 * 1024 * 1024)
+      .default(101 * 1024 * 1024),
+    MODEL_API_TRANSCRIPTION_MAX_SPOOL_BYTES: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(1024 * 1024 * 1024),
+    MODEL_API_TRANSCRIPTION_MAX_CONCURRENT_UPLOADS: z.coerce.number().int().positive().default(4),
+    MODEL_API_TRANSCRIPTION_MIN_FREE_BYTES: z.coerce
+      .number()
+      .int()
+      .min(0)
+      .default(256 * 1024 * 1024),
+    MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(15 * 60 * 1000),
   },
   runtimeEnv: process.env,
   emptyStringAsUndefined: true,

@@ -12,6 +12,7 @@
     "dev:raw": "turbo dev",
     "build": "turbo build",
     "test": "turbo run test",
+    "test:e2e:transcription": "pnpm --filter server build && cargo build --quiet --manifest-path apps/cli/Cargo.toml && node scripts/e2e/transcription-relay.mjs",
     "check-types": "turbo check-types",
     "lint": "biome lint .",
     "policy:auth-session": "tsx scripts/check-auth-session-contract.ts",

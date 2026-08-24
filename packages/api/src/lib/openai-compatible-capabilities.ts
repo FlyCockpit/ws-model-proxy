@@ -7,53 +7,78 @@ import { z } from "zod";
 
 const booleanSupportSchema = z.boolean().optional();
 
-export const openAiCompatibleCapabilitiesSchema = z
+export const transcriptionCapabilitiesSchema = z
+  .object({
+    supported: booleanSupportSchema,
+    streaming: booleanSupportSchema,
+    responseFormats: z.array(z.string().trim().min(1).max(64)).max(32).optional(),
+    timestampGranularities: z.array(z.string().trim().min(1).max(64)).max(16).optional(),
+    diarization: booleanSupportSchema,
+    languages: z.array(z.string().trim().min(1).max(64)).max(256).optional(),
+    languageDetection: booleanSupportSchema,
+    multipleLanguageHints: booleanSupportSchema,
+    maxUploadBytes: z
+      .number()
+      .int()
+      .positive()
+      .max(2 ** 31 - 1)
+      .optional(),
+    acceptedMimeTypes: z.array(z.string().trim().min(1).max(255)).max(128).optional(),
+  })
+  .strict();
+
+export type TranscriptionCapabilities = z.infer<typeof transcriptionCapabilitiesSchema>;
+const commonCapabilityShape = {
+  protocol: z.literal("openai-compatible"),
+  models: z
+    .object({
+      list: booleanSupportSchema,
+    })
+    .strict()
+    .optional(),
+  chatCompletions: z
+    .object({
+      supported: booleanSupportSchema,
+      streaming: booleanSupportSchema,
+      vision: booleanSupportSchema,
+      video: booleanSupportSchema,
+      audio: booleanSupportSchema,
+    })
+    .strict()
+    .optional(),
+  completions: z
+    .object({
+      supported: booleanSupportSchema,
+      streaming: booleanSupportSchema,
+    })
+    .strict()
+    .optional(),
+  embeddings: z
+    .object({
+      supported: booleanSupportSchema,
+    })
+    .strict()
+    .optional(),
+  responses: z
+    .object({
+      supported: booleanSupportSchema,
+      streaming: booleanSupportSchema,
+      statefulFollowUps: booleanSupportSchema,
+      retrieve: booleanSupportSchema,
+      delete: booleanSupportSchema,
+      cancel: booleanSupportSchema,
+      listInputItems: booleanSupportSchema,
+      countTokens: booleanSupportSchema,
+      compact: booleanSupportSchema,
+    })
+    .strict()
+    .optional(),
+} as const;
+
+const v1CapabilitiesSchema = z
   .object({
     version: z.literal(1),
-    protocol: z.literal("openai-compatible"),
-    models: z
-      .object({
-        list: booleanSupportSchema,
-      })
-      .strict()
-      .optional(),
-    chatCompletions: z
-      .object({
-        supported: booleanSupportSchema,
-        streaming: booleanSupportSchema,
-        vision: booleanSupportSchema,
-        video: booleanSupportSchema,
-        audio: booleanSupportSchema,
-      })
-      .strict()
-      .optional(),
-    completions: z
-      .object({
-        supported: booleanSupportSchema,
-        streaming: booleanSupportSchema,
-      })
-      .strict()
-      .optional(),
-    embeddings: z
-      .object({
-        supported: booleanSupportSchema,
-      })
-      .strict()
-      .optional(),
-    responses: z
-      .object({
-        supported: booleanSupportSchema,
-        streaming: booleanSupportSchema,
-        statefulFollowUps: booleanSupportSchema,
-        retrieve: booleanSupportSchema,
-        delete: booleanSupportSchema,
-        cancel: booleanSupportSchema,
-        listInputItems: booleanSupportSchema,
-        countTokens: booleanSupportSchema,
-        compact: booleanSupportSchema,
-      })
-      .strict()
-      .optional(),
+    ...commonCapabilityShape,
     audio: z
       .object({
         transcriptions: booleanSupportSchema,
@@ -65,7 +90,40 @@ export const openAiCompatibleCapabilitiesSchema = z
   })
   .strict();
 
+const v2CapabilitiesSchema = z
+  .object({
+    version: z.literal(2),
+    ...commonCapabilityShape,
+    audio: z
+      .object({
+        transcriptions: transcriptionCapabilitiesSchema.optional(),
+        translations: transcriptionCapabilitiesSchema.optional(),
+        speech: booleanSupportSchema,
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+
+export const openAiCompatibleCapabilitiesSchema = z.discriminatedUnion("version", [
+  v1CapabilitiesSchema,
+  v2CapabilitiesSchema,
+]);
+
 export type OpenAiCompatibleCapabilities = z.infer<typeof openAiCompatibleCapabilitiesSchema>;
+
+export function normalizeTranscriptionCapabilities(
+  value: boolean | TranscriptionCapabilities | null | undefined,
+): TranscriptionCapabilities | undefined {
+  if (typeof value === "boolean") return { supported: value };
+  return value ?? undefined;
+}
+
+export function audioOperationSupported(
+  value: boolean | TranscriptionCapabilities | null | undefined,
+): boolean | undefined {
+  return typeof value === "boolean" ? value : value?.supported;
+}
 
 export type TransformerModalities = {
   images: boolean;
@@ -138,6 +196,40 @@ export function openAiCapabilitiesFromCoarse(
         }
       : {}),
   };
+}
+
+/** Derive the legacy routing index without losing the richer v2 metadata. */
+export function coarseCapabilitiesFromOpenAi(
+  capabilities: OpenAiCompatibleCapabilities,
+): Array<
+  | "TEXT_GENERATION"
+  | "VISION_INPUT"
+  | "AUDIO_INPUT"
+  | "AUDIO_OUTPUT"
+  | "VIDEO_INPUT"
+  | "EMBEDDING"
+  | "RESPONSES_API"
+> {
+  const coarse: ReturnType<typeof coarseCapabilitiesFromOpenAi> = [];
+  if (
+    capabilities.chatCompletions?.supported === true ||
+    capabilities.completions?.supported === true ||
+    capabilities.responses?.supported === true
+  )
+    coarse.push("TEXT_GENERATION");
+  if (capabilities.chatCompletions?.vision === true) coarse.push("VISION_INPUT");
+  if (capabilities.chatCompletions?.audio === true) coarse.push("AUDIO_INPUT");
+  if (capabilities.chatCompletions?.video === true) coarse.push("VIDEO_INPUT");
+  if (
+    audioOperationSupported(capabilities.audio?.transcriptions) === true ||
+    audioOperationSupported(capabilities.audio?.translations) === true
+  ) {
+    if (!coarse.includes("AUDIO_INPUT")) coarse.push("AUDIO_INPUT");
+  }
+  if (capabilities.audio?.speech === true) coarse.push("AUDIO_OUTPUT");
+  if (capabilities.embeddings?.supported === true) coarse.push("EMBEDDING");
+  if (capabilities.responses?.supported === true) coarse.push("RESPONSES_API");
+  return coarse;
 }
 
 export function supportsChatCompletions({

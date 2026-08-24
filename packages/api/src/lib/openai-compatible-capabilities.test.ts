@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  normalizeTranscriptionCapabilities,
   openAiCapabilitiesFromCoarse,
+  parseOpenAiCompatibleCapabilities,
   resolveEffectiveCapabilityMetadata,
   supportsChatCompletions,
   transformerSupportedModalities,
@@ -102,5 +104,42 @@ describe("openAiCapabilitiesFromCoarse", () => {
     });
     expect(caps.embeddings).toEqual({ supported: true });
     expect(caps.responses).toMatchObject({ supported: true });
+  });
+});
+
+describe("detailed transcription capabilities", () => {
+  it("enforces versioned audio operation shapes", () => {
+    expect(
+      parseOpenAiCompatibleCapabilities({
+        version: 1,
+        protocol: "openai-compatible",
+        audio: { transcriptions: { supported: true } },
+      }),
+    ).toBeNull();
+    expect(
+      parseOpenAiCompatibleCapabilities({
+        version: 2,
+        protocol: "openai-compatible",
+        audio: { transcriptions: true },
+      }),
+    ).toBeNull();
+  });
+
+  it("reads both legacy booleans and v2 profiles without changing unknown fields to false", () => {
+    expect(normalizeTranscriptionCapabilities(true)).toEqual({ supported: true });
+    expect(normalizeTranscriptionCapabilities(undefined)).toBeUndefined();
+    expect(
+      normalizeTranscriptionCapabilities({
+        supported: true,
+        streaming: true,
+        responseFormats: ["json", "verbose_json"],
+        timestampGranularities: [],
+      }),
+    ).toEqual({
+      supported: true,
+      streaming: true,
+      responseFormats: ["json", "verbose_json"],
+      timestampGranularities: [],
+    });
   });
 });

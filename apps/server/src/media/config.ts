@@ -2,8 +2,8 @@ import { env } from "@ws-model-proxy/env/server";
 
 /**
  * Resolved, validated media-store configuration. Only produced when the local
- * backend is fully configured; otherwise `isMediaConfigured()` is false and the
- * upload/sign routes short-circuit with a "not configured" error.
+ * backend is fully configured; otherwise upload/sign routes short-circuit with
+ * a "not configured" error.
  */
 export interface MediaConfig {
   storage: "local";
@@ -16,17 +16,6 @@ export interface MediaConfig {
   maxBytesPerUser: number;
   /** Public origin used to build signed URLs (no trailing slash). */
   publicBaseUrl: string;
-}
-
-/**
- * Whether the ephemeral media store is fully configured (env-level check, no
- * I/O). Mirrors `isEmailConfigured()` in @ws-model-proxy/mailer. Upload is a
- * deploy capability: it is on only when MEDIA_STORAGE=local and MEDIA_ROOT is
- * set (the env module's startup guard already asserts MEDIA_ROOT is absolute
- * when local).
- */
-export function isMediaConfigured(): boolean {
-  return env.MEDIA_STORAGE === "local" && Boolean(env.MEDIA_ROOT);
 }
 
 /**

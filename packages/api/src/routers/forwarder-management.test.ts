@@ -11,7 +11,7 @@ import { forwarderManagementRouter } from "./forwarder-management";
 
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
-  return { default: mockDeep() };
+  return { default: mockDeep(), Prisma: { DbNull: { kind: "DbNull" } } };
 });
 
 vi.mock("@ws-model-proxy/env/server", () => ({
@@ -518,7 +518,7 @@ describe("forwarderManagementRouter", () => {
         {
           id: "model-id",
           capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
-          capabilityOverrideMetadata: null,
+          capabilityOverrideMetadata: expect.anything(),
           Endpoint: {
             capabilityMetadata: {
               version: 1,
@@ -611,5 +611,66 @@ describe("forwarderManagementRouter", () => {
         },
       ],
     });
+  });
+
+  it("stores a complete v2 model override without collapsing false and unknown fields", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue({ id: "model-id", userId: "user-id" });
+    db.discoveredModel.update.mockImplementation(async ({ data }: { data: unknown }) => data);
+
+    const capabilities = {
+      version: 2 as const,
+      protocol: "openai-compatible" as const,
+      chatCompletions: { supported: true, audio: false },
+      audio: {
+        transcriptions: {
+          supported: true,
+          streaming: false,
+          timestampGranularities: ["word", "segment"],
+          diarization: true,
+          languages: ["en", "es"],
+          acceptedMimeTypes: ["audio/wav"],
+        },
+      },
+    };
+    await client().setDiscoveredModelCapabilityProfile({
+      id: "model-id",
+      mode: "override",
+      capabilities,
+      optimisticBasicTranscription: true,
+    });
+
+    expect(db.discoveredModel.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          capabilityOverrideMode: "OVERRIDE",
+          capabilityOverrideOrigin: "DASHBOARD",
+          capabilityOverrides: { set: ["TEXT_GENERATION", "AUDIO_INPUT"] },
+          capabilityOverrideMetadata: capabilities,
+          optimisticBasicTranscription: true,
+        }),
+      }),
+    );
+  });
+
+  it("switches a model back to endpoint inheritance", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue({ id: "model-id", userId: "user-id" });
+    db.discoveredModel.update.mockResolvedValue({ id: "model-id" });
+
+    await client().setDiscoveredModelCapabilityProfile({
+      id: "model-id",
+      mode: "inherit",
+      optimisticBasicTranscription: false,
+    });
+
+    expect(db.discoveredModel.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+          capabilityOverrideOrigin: "DASHBOARD",
+          capabilityOverrides: { set: [] },
+          capabilityOverrideMetadata: { kind: "DbNull" },
+        }),
+      }),
+    );
   });
 });

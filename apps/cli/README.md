@@ -109,6 +109,18 @@ formats are re-encoded to JPEG) so local vision servers that reject WebP still
 work. Video/audio keep their stored mime. Non-JSON bodies and body-less
 requests always take the untouched streaming path.
 
+Multipart `/v1/audio/transcriptions` and `/v1/audio/translations` requests are
+also relayed to the selected OpenAI-compatible upstream. These dedicated ASR
+operations are independent of chat `input_audio`; capability metadata should
+describe each separately. Advanced transcription behavior (streaming,
+timestamps, diarization, languages, formats, and accepted MIME types) belongs
+to the upstream and is forwarded without transcript normalization.
+
+Each upstream request has three backend-neutral timeout layers: a 10-second
+connection timeout, a 30-second response-body idle timeout (reset after every
+received chunk), and the operation timeout sent by the WMP server. Pool retries
+share one server-side operation deadline; adding members does not multiply it.
+
 Only URLs whose origin matches the connected WMP server (derived from
 `serverUrl`) and whose path is `/media/{id}` are fetched — arbitrary URLs from
 request bodies are never followed (SSRF guard). Add extra trusted origins with

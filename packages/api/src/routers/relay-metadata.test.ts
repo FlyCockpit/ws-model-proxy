@@ -91,6 +91,10 @@ describe("relayMetadataRouter", () => {
         httpStatusCode: 200,
         upstreamStatusCode: 200,
         errorClass: null,
+        operation: "audio.transcriptions",
+        requestBytes: 3_000_000_000n,
+        responseBytes: 42n,
+        attemptCount: 2,
         requestBody: "secret prompt",
         responseBody: "secret answer",
       },
@@ -119,6 +123,10 @@ describe("relayMetadataRouter", () => {
         httpStatusCode: 200,
         upstreamStatusCode: 200,
         errorClass: null,
+        operation: "audio.transcriptions",
+        requestBytes: 3_000_000_000,
+        responseBytes: 42,
+        attemptCount: 2,
       },
     ]);
     expect(JSON.stringify(result)).not.toContain("secret prompt");

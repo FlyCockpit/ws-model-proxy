@@ -35,11 +35,23 @@ export type RelaySocket = {
 // upstream on one request pauses that request's body flow (its credits stop
 // returning) without blocking sibling requests on the same socket.
 type OutboundBodyStream = {
-  chunks: Uint8Array[];
+  chunks?: Uint8Array[];
+  iterator?: AsyncIterator<Uint8Array>;
   nextChunkIndex: number;
-  totalChunks: number;
+  bytesSent: number;
+  totalBytes: number;
   credits: number;
+  pumping: boolean;
 };
+
+async function closeBodyStream(stream: OutboundBodyStream | undefined) {
+  try {
+    await stream?.iterator?.return?.();
+  } catch {
+    // The request is already terminal; cleanup is best-effort here. The body
+    // source remains responsible for disposing its backing resource.
+  }
+}
 
 type SessionState = {
   socket: RelaySocket;
@@ -56,6 +68,8 @@ type SessionState = {
 };
 
 export type ActiveRelayResponseHandlers = {
+  /** Called only after request-body bytes have been accepted by the relay socket. */
+  onRequestBodySent?(byteLength: number): void;
   onHeaders(message: Extract<RelayClientControlMessage, { type: "relay.response.headers" }>): void;
   onBody(chunk: Uint8Array, metadata: RelayBinaryFrameMetadata): void;
   onComplete(message: Extract<RelayClientControlMessage, { type: "relay.complete" }>): void;
@@ -356,6 +370,7 @@ export class RelaySessionManager {
     path,
     headers,
     bodyChunks = [],
+    bodySource,
     timeoutMs,
   }: {
     cliDeviceId: string;
@@ -373,6 +388,7 @@ export class RelaySessionManager {
     path: string;
     headers: Headers | Record<string, string>;
     bodyChunks?: Uint8Array[];
+    bodySource?: { size: number; open(): AsyncIterable<Uint8Array> };
     timeoutMs: number;
   }) {
     const session = this.sessionsByCliDeviceId.get(cliDeviceId);
@@ -390,19 +406,25 @@ export class RelaySessionManager {
       headers: sanitizeRelayRequestHeaders(headers),
       timeoutMs,
       endpointSlug,
-      expectBody: bodyChunks.length > 0,
+      expectBody: (bodySource?.size ?? 0) > 0 || bodyChunks.length > 0,
     };
     session.socket.send(encodeRelayServerControlMessage(control));
 
-    if (bodyChunks.length === 0) return;
+    if (!bodySource && bodyChunks.length === 0) return;
+
+    const totalBytes =
+      bodySource?.size ?? bodyChunks.reduce((total, chunk) => total + chunk.byteLength, 0);
 
     session.bodyStreamsByRequest.set(requestId, {
-      chunks: [...bodyChunks],
+      chunks: bodySource ? undefined : [...bodyChunks],
+      iterator: bodySource?.open()[Symbol.asyncIterator](),
       nextChunkIndex: 0,
-      totalChunks: bodyChunks.length,
+      bytesSent: 0,
+      totalBytes,
       credits: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+      pumping: false,
     });
-    this.pumpBodyStream(session, requestId);
+    void this.pumpBodyStream(session, requestId);
   }
 
   private grantBodyCredits(session: SessionState, requestId: string, credits: number) {
@@ -416,34 +438,77 @@ export class RelaySessionManager {
     // exceeds the window, so `pumpBodyStream` can never emit more than the window
     // ahead of the CLI's acknowledgements.
     stream.credits = Math.min(stream.credits + credits, RELAY_REQUEST_BODY_WINDOW_CHUNKS);
-    this.pumpBodyStream(session, requestId);
+    void this.pumpBodyStream(session, requestId);
   }
 
   // Emit request-body chunks while the CLI has granted credits and the socket
   // can accept them. Each in-flight chunk consumes one credit; the CLI returns
   // credits via `relay.request.body.ack` as its upstream request consumes them.
-  private pumpBodyStream(session: SessionState, requestId: string) {
+  private async pumpBodyStream(session: SessionState, requestId: string) {
     const stream = session.bodyStreamsByRequest.get(requestId);
-    if (!stream) return;
-    while (
-      stream.chunks.length > 0 &&
-      stream.credits > 0 &&
-      session.socket.readyState === WS_READY_STATE_OPEN
-    ) {
-      const chunk = stream.chunks.shift();
-      if (!chunk) break;
-      const metadata: RelayBinaryFrameMetadata = {
-        type: "relay.request.body",
-        requestId,
-        chunkId: `${stream.nextChunkIndex}`,
-        final: stream.nextChunkIndex === stream.totalChunks - 1,
-      };
-      session.socket.send(encodeRelayBinaryFrame(metadata, chunk));
-      stream.nextChunkIndex += 1;
-      stream.credits -= 1;
-    }
-    if (stream.chunks.length === 0) {
+    if (!stream || stream.pumping) return;
+    stream.pumping = true;
+    try {
+      while (stream.credits > 0 && session.socket.readyState === WS_READY_STATE_OPEN) {
+        let chunk = stream.chunks?.shift();
+        if (!chunk) {
+          const next = await stream.iterator?.next();
+          // `next()` may be backed by disk I/O (or another delayed source). The
+          // request can be cancelled/completed, or the session can be replaced,
+          // while it is pending. Never emit the late chunk into either the old
+          // socket or a new stream that reused the same request ID.
+          if (
+            session.bodyStreamsByRequest.get(requestId) !== stream ||
+            this.sessionsByCliDeviceId.get(session.cliDeviceId ?? "") !== session
+          ) {
+            await closeBodyStream(stream);
+            return;
+          }
+          if (!next || next.done) {
+            session.bodyStreamsByRequest.delete(requestId);
+            await closeBodyStream(stream);
+            if (stream.bytesSent !== stream.totalBytes) {
+              const active = this.activeRelayRequests.get(requestId);
+              active?.onError({
+                type: "relay.error",
+                requestId,
+                failure: "protocol_error",
+                message: "Relayed request body ended before its declared size.",
+              });
+            }
+            return;
+          }
+          chunk = next.value;
+        }
+        if (chunk.byteLength === 0) continue;
+        if (session.bodyStreamsByRequest.get(requestId) !== stream) return;
+        if (stream.bytesSent + chunk.byteLength > stream.totalBytes) {
+          throw new Error("Relayed request body exceeded its declared size.");
+        }
+        const metadata: RelayBinaryFrameMetadata = {
+          type: "relay.request.body",
+          requestId,
+          chunkId: `${stream.nextChunkIndex}`,
+          final: stream.bytesSent + chunk.byteLength === stream.totalBytes,
+        };
+        session.socket.send(encodeRelayBinaryFrame(metadata, chunk));
+        stream.bytesSent += chunk.byteLength;
+        this.activeRelayRequests.get(requestId)?.onRequestBodySent?.(chunk.byteLength);
+        stream.nextChunkIndex += 1;
+        stream.credits -= 1;
+      }
+    } catch {
       session.bodyStreamsByRequest.delete(requestId);
+      await closeBodyStream(stream);
+      const active = this.activeRelayRequests.get(requestId);
+      active?.onError({
+        type: "relay.error",
+        requestId,
+        failure: "transport",
+        message: "Failed to read relayed request body.",
+      });
+    } finally {
+      stream.pumping = false;
     }
   }
 
@@ -465,7 +530,9 @@ export class RelaySessionManager {
   completeRelayRequest(requestId: string) {
     this.activeRelayRequests.delete(requestId);
     for (const session of this.sessionsBySocket.values()) {
+      const stream = session.bodyStreamsByRequest.get(requestId);
       session.bodyStreamsByRequest.delete(requestId);
+      void closeBodyStream(stream);
     }
   }
 
@@ -481,7 +548,9 @@ export class RelaySessionManager {
     this.activeRelayRequests.delete(requestId);
     const session = this.sessionsByCliDeviceId.get(cliDeviceId);
     if (!session) return;
+    const stream = session.bodyStreamsByRequest.get(requestId);
     session.bodyStreamsByRequest.delete(requestId);
+    void closeBodyStream(stream);
     if (session.socket.readyState !== WS_READY_STATE_OPEN) return;
     session.socket.send(
       encodeRelayServerControlMessage({ type: "relay.cancel", requestId, reason }),
@@ -510,6 +579,11 @@ export class RelaySessionManager {
   }
 
   private failActiveRequestsForCli(cliDeviceId: string) {
+    const session = this.sessionsByCliDeviceId.get(cliDeviceId);
+    if (session) {
+      for (const stream of session.bodyStreamsByRequest.values()) void closeBodyStream(stream);
+      session.bodyStreamsByRequest.clear();
+    }
     for (const [requestId, activeRequest] of this.activeRelayRequests) {
       if (activeRequest.cliDeviceId !== cliDeviceId) continue;
       this.activeRelayRequests.delete(requestId);

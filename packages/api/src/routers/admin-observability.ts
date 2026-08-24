@@ -185,6 +185,10 @@ type RelayRequestRow = {
   httpStatusCode: number | null;
   upstreamStatusCode: number | null;
   errorClass: string | null;
+  operation: string | null;
+  requestBytes: bigint | null;
+  responseBytes: bigint | null;
+  attemptCount: number;
   User: OwnerRow;
   ModelApiToken: { id: string; name: string; lookupPrefix: string } | null;
   RequestedDiscoveredModel: RelayModelRow | null;
@@ -532,6 +536,10 @@ function serializeRelay(row: RelayRequestRow) {
     httpStatusCode: row.httpStatusCode,
     upstreamStatusCode: row.upstreamStatusCode,
     errorClass: row.errorClass,
+    operation: row.operation,
+    requestBytes: row.requestBytes === null ? null : Number(row.requestBytes),
+    responseBytes: row.responseBytes === null ? null : Number(row.responseBytes),
+    attemptCount: row.attemptCount,
   };
 }
 
@@ -885,6 +893,10 @@ export const adminObservabilityRouter = {
             httpStatusCode: true,
             upstreamStatusCode: true,
             errorClass: true,
+            operation: true,
+            requestBytes: true,
+            responseBytes: true,
+            attemptCount: true,
             User: { select: ownerSelect },
             ModelApiToken: { select: { id: true, name: true, lookupPrefix: true } },
             RequestedDiscoveredModel: { select: relayModelSelect },

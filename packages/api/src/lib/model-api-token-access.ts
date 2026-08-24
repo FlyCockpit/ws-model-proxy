@@ -37,6 +37,7 @@ export type VisibleModelPoolTarget = {
   ownerUserSlug: string;
   poolSlug: string;
   maxAttachmentBytes: number | null;
+  optimisticBasicTranscription: boolean;
 };
 
 export type VisibleModelTargets = {
@@ -73,6 +74,7 @@ type ModelPoolRow = {
   name: string;
   description: string | null;
   maxAttachmentBytes: number | null;
+  optimisticBasicTranscription: boolean;
   User: { slug: string };
 };
 
@@ -117,6 +119,7 @@ function serializeModelPool(row: ModelPoolRow): VisibleModelPoolTarget {
     ownerUserSlug: row.User.slug,
     poolSlug: row.slug,
     maxAttachmentBytes: row.maxAttachmentBytes,
+    optimisticBasicTranscription: row.optimisticBasicTranscription,
   };
 }
 
@@ -141,6 +144,7 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
         userId: true,
         upstreamModelId: true,
         maxAttachmentBytes: true,
+        optimisticBasicTranscription: true,
         User: { select: { slug: true } },
         Endpoint: {
           select: {
@@ -176,6 +180,7 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
             name: true,
             description: true,
             maxAttachmentBytes: true,
+            optimisticBasicTranscription: true,
             User: { select: { slug: true } },
           },
         },

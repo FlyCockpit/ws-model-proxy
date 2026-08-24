@@ -3,7 +3,7 @@ import type {
   VisibleDirectModelTarget,
   VisibleModelPoolTarget,
 } from "@ws-model-proxy/api/lib/model-api-token-access";
-import { beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import type { ActiveRelayResponseHandlers, RelaySessionManager } from "../relay/session-manager.js";
 
 vi.mock("@ws-model-proxy/db", async () => {
@@ -15,7 +15,15 @@ vi.mock("@ws-model-proxy/db", async () => {
 // @ws-model-proxy/db/forwarder-security, which reads env.BETTER_AUTH_SECRET.
 // Mock the env module so the suite never runs real env validation.
 vi.mock("@ws-model-proxy/env/server", () => ({
-  env: { BETTER_AUTH_SECRET: "test-better-auth-secret-value-32chars!" },
+  env: {
+    BETTER_AUTH_SECRET: "test-better-auth-secret-value-32chars!",
+    MODEL_API_TRANSCRIPTION_MAX_UPLOAD_BYTES: 100 * 1024 * 1024,
+    MODEL_API_TRANSCRIPTION_MAX_MULTIPART_BYTES: 101 * 1024 * 1024,
+    MODEL_API_TRANSCRIPTION_MAX_SPOOL_BYTES: 1024 * 1024 * 1024,
+    MODEL_API_TRANSCRIPTION_MAX_CONCURRENT_UPLOADS: 4,
+    MODEL_API_TRANSCRIPTION_MIN_FREE_BYTES: 0,
+    MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS: 30_000,
+  },
 }));
 
 vi.mock("@ws-model-proxy/api/lib/model-api-token-access", () => ({
@@ -32,6 +40,10 @@ const tokenAccess = await import("@ws-model-proxy/api/lib/model-api-token-access
 const { default: prisma } = await import("@ws-model-proxy/db");
 
 const MODEL_API_MAX_ACTIVE_PER_TOKEN = 8;
+
+function stringifyPersistenceCalls(value: unknown) {
+  return JSON.stringify(value, (_key, item) => (typeof item === "bigint" ? item.toString() : item));
+}
 
 type SendRelayRequestArgs = Parameters<RelaySessionManager["sendRelayRequest"]>[0];
 type CancelRelayRequestArgs = Parameters<RelaySessionManager["cancelRelayRequest"]>[0];
@@ -96,6 +108,11 @@ class FakeRelayManager {
 
   sendRelayRequest(args: SendRelayRequestArgs) {
     this.sent.push(args);
+    const byteLength =
+      args.bodySource?.size ??
+      args.bodyChunks?.reduce((total, chunk) => total + chunk.byteLength, 0) ??
+      0;
+    if (byteLength > 0) this.handlers.get(args.requestId)?.onRequestBodySent?.(byteLength);
   }
 
   cancelRelayRequest(args: CancelRelayRequestArgs) {
@@ -117,7 +134,11 @@ class FakeRelayManager {
   }
 
   body(requestId: string, text: string) {
-    this.handlers.get(requestId)?.onBody(new TextEncoder().encode(text), {
+    this.bodyBytes(requestId, new TextEncoder().encode(text));
+  }
+
+  bodyBytes(requestId: string, bytes: Uint8Array) {
+    this.handlers.get(requestId)?.onBody(bytes, {
       type: "relay.response.body",
       requestId,
       chunkId: "0",
@@ -167,6 +188,7 @@ const poolTarget: VisibleModelPoolTarget = {
   ownerUserSlug: "owner",
   poolSlug: "gpt-4.1-mini",
   maxAttachmentBytes: null,
+  optimisticBasicTranscription: false,
 };
 
 function directRow({
@@ -181,6 +203,7 @@ function directRow({
   audioSpeech = true,
   responses = true,
   capabilityOverrideMetadata = null,
+  optimisticBasicTranscription = false,
 }: {
   id?: string;
   upstreamModelId?: string;
@@ -193,6 +216,7 @@ function directRow({
   audioSpeech?: boolean;
   responses?: boolean;
   capabilityOverrideMetadata?: Record<string, unknown> | null;
+  optimisticBasicTranscription?: boolean;
 } = {}) {
   return {
     id,
@@ -201,6 +225,7 @@ function directRow({
     upstreamModelId,
     capabilityOverrideMode: capabilityOverrideMetadata ? "OVERRIDE" : "INHERIT_ENDPOINT_DEFAULTS",
     capabilityOverrideMetadata,
+    optimisticBasicTranscription,
     Endpoint: {
       id: "endpoint-id",
       slug: "endpoint-default",
@@ -321,6 +346,16 @@ function firstBodyChunkText(sent: SendRelayRequestArgs): string {
   return new TextDecoder().decode(chunk);
 }
 
+async function relayBodyText(sent: SendRelayRequestArgs): Promise<string> {
+  if (sent.bodyChunks) {
+    return new TextDecoder().decode(Buffer.concat(sent.bodyChunks));
+  }
+  if (!sent.bodySource) throw new Error("Expected relay body source.");
+  const chunks: Uint8Array[] = [];
+  for await (const chunk of sent.bodySource.open()) chunks.push(chunk);
+  return new TextDecoder().decode(Buffer.concat(chunks));
+}
+
 async function completeJsonRelay({
   manager,
   requestId,
@@ -336,6 +371,8 @@ async function completeJsonRelay({
 }
 
 describe("model API routes", () => {
+  afterEach(() => vi.restoreAllMocks());
+
   beforeEach(() => {
     vi.clearAllMocks();
     mockedTokenAccess.authenticateModelApiTokenSecret.mockResolvedValue(token);
@@ -404,11 +441,15 @@ describe("model API routes", () => {
           supports_video_input: true,
           supports_audio_input: true,
           supports_audio_output: false,
+          supports_audio_transcription: false,
+          supports_audio_translation: false,
           capabilities: {
             vision: true,
             video_input: true,
             audio_input: true,
             audio_output: false,
+            audio_transcription: false,
+            audio_translation: false,
           },
           architecture: {
             input_modalities: ["text", "image", "audio", "video"],
@@ -426,11 +467,15 @@ describe("model API routes", () => {
           supports_video_input: false,
           supports_audio_input: false,
           supports_audio_output: false,
+          supports_audio_transcription: false,
+          supports_audio_translation: false,
           capabilities: {
             vision: false,
             video_input: false,
             audio_input: false,
             audio_output: false,
+            audio_transcription: false,
+            audio_translation: false,
           },
           architecture: {
             input_modalities: ["text"],
@@ -669,7 +714,7 @@ describe("model API routes", () => {
           }),
         }),
       );
-      const metadataCalls = JSON.stringify([
+      const metadataCalls = stringifyPersistenceCalls([
         db.relayRequest.create.mock.calls,
         db.relayRequest.update.mock.calls,
       ]);
@@ -764,7 +809,7 @@ describe("model API routes", () => {
 
     expect(firstBodyChunkText(sent)).toContain(imageDataUrl);
     await vi.waitFor(() => expect(db.relayRequest.update).toHaveBeenCalled());
-    const metadataCalls = JSON.stringify([
+    const metadataCalls = stringifyPersistenceCalls([
       db.relayRequest.create.mock.calls,
       db.relayRequest.update.mock.calls,
     ]);
@@ -828,7 +873,7 @@ describe("model API routes", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({ object: "list", data: [] });
-    const metadataCalls = JSON.stringify([
+    const metadataCalls = stringifyPersistenceCalls([
       db.relayRequest.create.mock.calls,
       db.relayRequest.update.mock.calls,
     ]);
@@ -912,7 +957,7 @@ describe("model API routes", () => {
       headers: { authorization: "Bearer wsmp_model_test" },
       body: translationBody,
     });
-    await vi.waitFor(() => expect(translationManager.sent).toHaveLength(1));
+    await vi.waitFor(() => expect(translationManager.sent).toHaveLength(1), { timeout: 5000 });
     expect(requireSent(translationManager).path).toBe("/v1/audio/translations");
     await completeJsonRelay({
       manager: translationManager,
@@ -963,7 +1008,7 @@ describe("model API routes", () => {
     });
     await expect((await responsesResponsePromise).json()).resolves.toEqual({ total_tokens: 9 });
 
-    const metadataCalls = JSON.stringify([
+    const metadataCalls = stringifyPersistenceCalls([
       db.relayRequest.create.mock.calls,
       db.relayRequest.update.mock.calls,
     ]);
@@ -985,12 +1030,12 @@ describe("model API routes", () => {
       body,
     });
 
-    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1), { timeout: 5000 });
     const sent = requireSent(manager);
     expect(sent.family).toBe("audio");
     expect(sent.path).toBe("/v1/audio/transcriptions");
     expect(sentHeader(sent, "content-type")).toContain("multipart/form-data");
-    const relayedBody = firstBodyChunkText(sent);
+    const relayedBody = await relayBodyText(sent);
     expect(relayedBody).toContain("gpt-4o-mini");
     expect(relayedBody).not.toContain(directTarget.modelId);
 
@@ -1001,11 +1046,238 @@ describe("model API routes", () => {
 
     expect(response.status).toBe(200);
     await response.text();
-    const metadataCalls = JSON.stringify([
+    const metadataCalls = stringifyPersistenceCalls([
       db.relayRequest.create.mock.calls,
       db.relayRequest.update.mock.calls,
     ]);
     expect(metadataCalls).not.toContain("SECRET_AUDIO_BYTES");
+  });
+
+  it.each([
+    ["missing_model", (body: FormData) => body.delete("model")],
+    ["duplicate_model", (body: FormData) => body.append("model", "second/model")],
+    ["missing_file", (body: FormData) => body.delete("file")],
+    ["duplicate_file", (body: FormData) => body.append("file", new Blob(["two"]), "two.wav")],
+  ] as const)("rejects malformed transcription form data with %s", async (code, mutate) => {
+    const body = new FormData();
+    body.set("model", directTarget.modelId);
+    body.set("file", new Blob(["audio"], { type: "audio/wav" }), "input.wav");
+    mutate(body);
+    const manager = new FakeRelayManager();
+
+    const response = await appWith(manager).request("/audio/transcriptions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test" },
+      body,
+    });
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: { code } });
+    expect(manager.sent).toEqual([]);
+  });
+
+  it("preserves transcription fields and passes successful SSE through without retrying", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({
+        capabilityOverrideMetadata: {
+          version: 2,
+          protocol: "openai-compatible",
+          audio: {
+            transcriptions: {
+              supported: true,
+              streaming: true,
+              timestampGranularities: ["word", "segment"],
+              diarization: true,
+              languages: ["fr"],
+              responseFormats: ["verbose_json"],
+            },
+          },
+        },
+      }),
+    );
+    const manager = new FakeRelayManager();
+    const body = new FormData();
+    body.set("model", directTarget.modelId);
+    body.set("file", new Blob(["SSE_AUDIO"], { type: "audio/wav" }), "input.wav");
+    body.set("stream", "true");
+    body.set("language", "fr");
+    body.set("response_format", "verbose_json");
+    body.append("timestamp_granularities[]", "word");
+    body.set("diarization", "true");
+    body.set("vendor_extension", "preserve-me");
+
+    const responsePromise = appWith(manager).request("/audio/transcriptions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test" },
+      body,
+    });
+
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1), { timeout: 5000 });
+    const sent = requireSent(manager);
+    const relayedBody = await relayBodyText(sent);
+    expect(relayedBody).toContain('name="stream"\r\n\r\ntrue');
+    expect(relayedBody).toContain('name="language"\r\n\r\nfr');
+    expect(relayedBody).toContain('name="response_format"\r\n\r\nverbose_json');
+    expect(relayedBody).toContain('name="timestamp_granularities[]"\r\n\r\nword');
+    expect(relayedBody).toContain('name="diarization"\r\n\r\ntrue');
+    expect(relayedBody).toContain('name="vendor_extension"\r\n\r\npreserve-me');
+    expect(relayedBody).toContain('name="model"\r\n\r\ngpt-4o-mini');
+    expect(relayedBody).not.toContain(directTarget.modelId);
+
+    manager.headers(sent.requestId, 200, { "content-type": "text/event-stream" });
+    const response = await responsePromise;
+    manager.body(sent.requestId, 'event: transcript.text.delta\ndata: {"delta":"bon"}\n\n');
+    manager.body(sent.requestId, "data: [DONE]\n\n");
+    manager.complete(sent.requestId);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("text/event-stream");
+    await expect(response.text()).resolves.toBe(
+      'event: transcript.text.delta\ndata: {"delta":"bon"}\n\ndata: [DONE]\n\n',
+    );
+    expect(manager.sent).toHaveLength(1);
+    expect(manager.cancelled).toEqual([]);
+  });
+
+  it.each([
+    [
+      "json",
+      "application/json",
+      new Uint8Array([123, 34, 116, 101, 120, 116, 34, 58, 34, 120, 34, 125]),
+    ],
+    [
+      "verbose_json",
+      "application/json; charset=utf-8",
+      new Uint8Array([123, 34, 119, 111, 114, 100, 115, 34, 58, 91, 93, 125]),
+    ],
+    ["text", "text/plain; charset=utf-8", new Uint8Array([104, 105, 10])],
+    ["srt", "application/x-subrip", new Uint8Array([49, 10, 48, 48, 58, 48, 48])],
+    ["vtt", "text/vtt", new Uint8Array([87, 69, 66, 86, 84, 84, 10])],
+    ["diarized_json", "application/vnd.vendor.diarized+json", new Uint8Array([0, 255, 1, 128])],
+  ] as const)(
+    "passes %s transcription response content type and bytes through unchanged",
+    async (responseFormat, contentType, output) => {
+      db.discoveredModel.findUnique.mockResolvedValue(
+        directRow({
+          capabilityOverrideMetadata: {
+            version: 2,
+            protocol: "openai-compatible",
+            audio: {
+              transcriptions: {
+                supported: true,
+                diarization: responseFormat === "diarized_json",
+                responseFormats: [responseFormat],
+              },
+            },
+          },
+        }),
+      );
+      const manager = new FakeRelayManager();
+      const body = new FormData();
+      body.set("model", directTarget.modelId);
+      body.set("file", new Blob(["audio"], { type: "audio/wav" }), "input.wav");
+      body.set("response_format", responseFormat);
+
+      const responsePromise = appWith(manager).request("/audio/transcriptions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test" },
+        body,
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      manager.headers(sent.requestId, 200, { "content-type": contentType, "x-upstream": "kept" });
+      const response = await responsePromise;
+      manager.bodyBytes(sent.requestId, output);
+      manager.complete(sent.requestId);
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toBe(contentType);
+      expect(response.headers.get("x-upstream")).toBe("kept");
+      expect(new Uint8Array(await response.arrayBuffer())).toEqual(output);
+      expect(manager.sent).toHaveLength(1);
+    },
+  );
+
+  it("uses a persisted opt-in only for direct basic transcription with unknown support", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({
+        optimisticBasicTranscription: true,
+        capabilityOverrideMetadata: {
+          version: 2,
+          protocol: "openai-compatible",
+          chatCompletions: { supported: true, audio: false },
+        },
+      }),
+    );
+    const manager = new FakeRelayManager();
+    const body = new FormData();
+    body.set("model", directTarget.modelId);
+    body.set("file", new Blob(["audio"], { type: "audio/wav" }), "input.wav");
+    const responsePromise = appWith(manager).request("/audio/transcriptions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test" },
+      body,
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    await completeJsonRelay({
+      manager,
+      requestId: requireSent(manager).requestId,
+      body: { text: "ok" },
+    });
+    expect((await responsePromise).status).toBe(200);
+
+    const advanced = new FormData();
+    advanced.set("model", directTarget.modelId);
+    advanced.set("file", new Blob(["audio"], { type: "audio/wav" }), "input.wav");
+    advanced.set("stream", "true");
+    const denied = await appWith(new FakeRelayManager()).request("/audio/transcriptions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test" },
+      body: advanced,
+    });
+    expect(denied.status).toBe(400);
+  });
+
+  it("enforces a direct model's attachment limit for transcription uploads", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [{ ...directTarget, maxAttachmentBytes: 3 }],
+      modelPools: [],
+    });
+    const body = new FormData();
+    body.set("model", directTarget.modelId);
+    body.set("file", new Blob(["audio"], { type: "audio/wav" }), "input.wav");
+    const manager = new FakeRelayManager();
+
+    const response = await appWith(manager).request("/audio/transcriptions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test" },
+      body,
+    });
+
+    expect(response.status).toBe(429);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "request_too_large" } });
+    expect(manager.sent).toHaveLength(0);
+  });
+
+  it("enforces a pool's attachment limit for transcription uploads", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [{ ...poolTarget, maxAttachmentBytes: 3 }],
+    });
+    const body = new FormData();
+    body.set("model", poolTarget.modelId);
+    body.set("file", new Blob(["audio"], { type: "audio/wav" }), "input.wav");
+    const manager = new FakeRelayManager();
+
+    const response = await appWith(manager).request("/audio/transcriptions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test" },
+      body,
+    });
+
+    expect(response.status).toBe(429);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "request_too_large" } });
+    expect(manager.sent).toHaveLength(0);
   });
 
   it("rejects audio endpoints when effective model capabilities do not allow them", async () => {
@@ -1066,6 +1338,8 @@ describe("model API routes", () => {
   });
 
   it("fails over pool requests across every currently routable member before returning success", async () => {
+    let clock = Date.now();
+    const now = vi.spyOn(Date, "now").mockImplementation(() => clock++);
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
       modelPools: [poolTarget],
@@ -1114,6 +1388,7 @@ describe("model API routes", () => {
     const retried = requireSent(manager, 1);
     expect(retried.cliDeviceId).toBe("cli-b");
     expect(firstBodyChunkText(retried)).toContain('"model":"upstream-b"');
+    expect(retried.timeoutMs).toBeLessThan(failed.timeoutMs);
     expect(manager.cancelled).toContainEqual({
       cliDeviceId: "cli-a",
       requestId: failed.requestId,
@@ -1136,6 +1411,90 @@ describe("model API routes", () => {
           data: expect.objectContaining({
             selectedDiscoveredModelId: "model-b",
             status: "SUCCEEDED",
+          }),
+        }),
+      ),
+    );
+    const firstRequestBytes = Buffer.concat(failed.bodyChunks ?? []).byteLength;
+    const secondRequestBytes = Buffer.concat(retried.bodyChunks ?? []).byteLength;
+    expect(db.relayRequest.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          requestBytes: BigInt(firstRequestBytes + secondRequestBytes),
+        }),
+      }),
+    );
+    expect(db.relayRequest.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ attemptCount: 2, responseBytes: expect.any(BigInt) }),
+      }),
+    );
+    now.mockRestore();
+  });
+
+  it("replays a spooled transcription across compatible pool members and accounts both attempts", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "member-a",
+        discoveredModelId: "model-a",
+        upstreamModelId: "asr-a",
+        cliDeviceId: "cli-a",
+      }),
+      poolMemberRow({
+        id: "member-b",
+        discoveredModelId: "model-b",
+        upstreamModelId: "asr-b",
+        cliDeviceId: "cli-b",
+      }),
+    ]);
+    db.poolMember.findUnique.mockResolvedValue({
+      healthStatus: "HEALTHY",
+      lastFailureClass: null,
+      consecutiveRetryableFailures: 0,
+      lastFailureAt: null,
+      nextRetryAt: null,
+      halfOpenTrialStartedAt: null,
+    });
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-a", "cli-b"];
+    const form = new FormData();
+    form.set("model", poolTarget.modelId);
+    form.set("file", new Blob(["REPLAY_AUDIO_SENTINEL"], { type: "audio/wav" }), "voice.wav");
+
+    const responsePromise = appWith(manager).request("/audio/transcriptions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test" },
+      body: form,
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const first = requireSent(manager);
+    const firstBody = await relayBodyText(first);
+    expect(firstBody).toContain("REPLAY_AUDIO_SENTINEL");
+    expect(firstBody).toContain("asr-a");
+    manager.headers(first.requestId, 500, { "content-type": "application/json" });
+
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(2));
+    const second = requireSent(manager, 1);
+    const secondBody = await relayBodyText(second);
+    expect(secondBody).toContain("REPLAY_AUDIO_SENTINEL");
+    expect(secondBody).toContain("asr-b");
+    expect(secondBody).not.toContain("asr-a");
+    manager.headers(second.requestId, 200, { "content-type": "application/json" });
+    const response = await responsePromise;
+    manager.body(second.requestId, JSON.stringify({ text: "done" }));
+    manager.complete(second.requestId);
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ text: "done" });
+    await vi.waitFor(() =>
+      expect(db.relayRequest.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            attemptCount: 2,
+            requestBytes: BigInt((first.bodySource?.size ?? 0) + (second.bodySource?.size ?? 0)),
           }),
         }),
       ),
@@ -1218,7 +1577,7 @@ describe("model API routes", () => {
     expect(response.status).toBe(200);
     await expect(response.text()).resolves.toContain("resp_123");
     await vi.waitFor(() => expect(db.responseStickinessRecord.upsert).toHaveBeenCalled());
-    const persistenceCalls = JSON.stringify([
+    const persistenceCalls = stringifyPersistenceCalls([
       db.relayRequest.create.mock.calls,
       db.relayRequest.update.mock.calls,
       db.responseStickinessRecord.upsert.mock.calls,

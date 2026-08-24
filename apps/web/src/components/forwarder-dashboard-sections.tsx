@@ -1,6 +1,7 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  parseOpenAiCompatibleCapabilities,
   resolveEffectiveCapabilityMetadata,
   transformerSupportedModalities,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
@@ -286,6 +287,142 @@ function ModelCapabilityToggles({
   );
 }
 
+function ModelCapabilityProfileEditor({
+  model,
+  endpointCapabilityMetadata,
+  disabled,
+  onSave,
+}: {
+  model: DirectModelOption;
+  endpointCapabilityMetadata: unknown;
+  disabled: boolean;
+  onSave: (
+    input:
+      | { id: string; mode: "inherit"; optimisticBasicTranscription: boolean }
+      | {
+          id: string;
+          mode: "override";
+          capabilities: NonNullable<ReturnType<typeof parseOpenAiCompatibleCapabilities>>;
+          optimisticBasicTranscription: boolean;
+        },
+  ) => Promise<void>;
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  const [open, setOpen] = useState(false);
+  const effective = resolveEffectiveCapabilityMetadata({
+    capabilityOverrideMode: model.capabilityOverrideMode,
+    capabilityOverrideMetadata: model.capabilityOverrideMetadata,
+    endpointCapabilityMetadata,
+  });
+  const [raw, setRaw] = useState(() =>
+    JSON.stringify(effective ?? { version: 2, protocol: "openai-compatible" }, null, 2),
+  );
+  const [error, setError] = useState<string | null>(null);
+  const [optimisticBasic, setOptimisticBasic] = useState(model.optimisticBasicTranscription);
+  const source = model.capabilityOverrideMode === "OVERRIDE" ? "model" : "endpoint";
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(nextOpen) => {
+        if (nextOpen) {
+          setRaw(
+            JSON.stringify(effective ?? { version: 2, protocol: "openai-compatible" }, null, 2),
+          );
+          setOptimisticBasic(model.optimisticBasicTranscription);
+          setError(null);
+        }
+        setOpen(nextOpen);
+      }}
+    >
+      <DialogTrigger
+        render={
+          <Button type="button" size="touch" variant="outline" className="mt-2">
+            {t("dashboard:models.editCapabilityProfile")}
+          </Button>
+        }
+      />
+      <DialogContent className="max-h-[90dvh] overflow-x-hidden overflow-y-auto sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>{t("dashboard:models.capabilityProfile")}</DialogTitle>
+          <DialogDescription>
+            {t("dashboard:models.capabilityProfileHint", { source })}
+          </DialogDescription>
+        </DialogHeader>
+        <Textarea
+          className="min-h-80 max-w-full font-mono text-xs"
+          value={raw}
+          onChange={(event) => {
+            setRaw(event.target.value);
+            setError(null);
+          }}
+          aria-label={t("dashboard:models.capabilityProfile")}
+        />
+        <p className="text-xs text-muted-foreground">
+          {t("dashboard:models.capabilityUnknownHint")}
+        </p>
+        <label className="flex min-h-11 items-center gap-2 text-sm">
+          <Checkbox
+            checked={optimisticBasic}
+            onCheckedChange={(value) => setOptimisticBasic(value === true)}
+          />
+          {t("dashboard:models.optimisticBasicTranscription")}
+        </label>
+        {error ? <p className="text-sm text-destructive">{error}</p> : null}
+        <DialogFooter className="gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            disabled={disabled}
+            onClick={async () => {
+              setError(null);
+              try {
+                await onSave({
+                  id: model.id,
+                  mode: "inherit",
+                  optimisticBasicTranscription: optimisticBasic,
+                });
+                setOpen(false);
+              } catch {
+                setError(t("dashboard:models.capabilitySaveFailed"));
+              }
+            }}
+          >
+            {t("dashboard:models.inheritCapabilities")}
+          </Button>
+          <Button
+            type="button"
+            disabled={disabled}
+            onClick={async () => {
+              try {
+                const parsed = parseOpenAiCompatibleCapabilities(JSON.parse(raw));
+                if (!parsed) throw new Error(t("dashboard:models.invalidCapabilityProfile"));
+                await onSave({
+                  id: model.id,
+                  mode: "override",
+                  capabilities: parsed,
+                  optimisticBasicTranscription: optimisticBasic,
+                });
+                setOpen(false);
+              } catch (cause) {
+                setError(
+                  cause instanceof SyntaxError
+                    ? t("dashboard:models.invalidCapabilityProfile")
+                    : cause instanceof Error &&
+                        cause.message === t("dashboard:models.invalidCapabilityProfile")
+                      ? cause.message
+                      : t("dashboard:models.capabilitySaveFailed"),
+                );
+              }
+            }}
+          >
+            {t("dashboard:models.saveCapabilityProfile")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 const MEBIBYTE = 1024 * 1024;
 
 function AttachmentLimitControl({
@@ -435,6 +572,15 @@ export function CliEndpointsModelsSection() {
         queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:models.capabilitySaved"));
       },
+    }),
+  );
+  const setModelCapabilityProfile = useMutation(
+    orpc.forwarderManagement.setDiscoveredModelCapabilityProfile.mutationOptions({
+      onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
+        toast.success(t("dashboard:models.capabilitySaved"));
+      },
+      onError: () => toast.error(t("dashboard:models.capabilitySaveFailed")),
     }),
   );
   const updateModelAttachmentLimit = useMutation(
@@ -662,6 +808,23 @@ export function CliEndpointsModelsSection() {
                                     disabled={updateModelCapabilities.isPending}
                                     onChange={(next) =>
                                       updateModelCapabilities.mutate({ id: model.id, ...next })
+                                    }
+                                  />
+                                  <ModelCapabilityProfileEditor
+                                    model={{
+                                      ...model,
+                                      endpointPublished: endpoint.published,
+                                      cliSlug: device.slug,
+                                      endpointSlug: endpoint.slug,
+                                      endpointLabel: endpoint.label,
+                                      endpointCapabilityMetadata: endpoint.capabilityMetadata,
+                                    }}
+                                    endpointCapabilityMetadata={endpoint.capabilityMetadata}
+                                    disabled={setModelCapabilityProfile.isPending}
+                                    onSave={(input) =>
+                                      setModelCapabilityProfile
+                                        .mutateAsync(input)
+                                        .then(() => undefined)
                                     }
                                   />
                                   <AttachmentLimitControl
@@ -1210,6 +1373,7 @@ function PoolForm({
         (value) => value.trim() === "" || (/^\d+$/.test(value.trim()) && Number(value) > 0),
         t("dashboard:pools.attachmentLimitInvalid"),
       ),
+    optimisticBasicTranscription: z.boolean(),
   });
   const createPool = useMutation(
     orpc.forwarderManagement.createModelPool.mutationOptions({
@@ -1251,6 +1415,7 @@ function PoolForm({
         pool?.maxAttachmentBytes != null
           ? String(Math.ceil(pool.maxAttachmentBytes / MEBIBYTE))
           : "",
+      optimisticBasicTranscription: pool?.optimisticBasicTranscription ?? false,
     },
     validators: { onSubmit: poolSchema },
     onSubmit: async ({ value }) => {
@@ -1262,6 +1427,7 @@ function PoolForm({
           maxAttachmentBytes: value.maxAttachmentMiB.trim()
             ? Number(value.maxAttachmentMiB) * MEBIBYTE
             : null,
+          optimisticBasicTranscription: value.optimisticBasicTranscription,
         });
       } else if (pool) {
         await updatePool.mutateAsync({
@@ -1291,6 +1457,7 @@ function PoolForm({
           maxAttachmentBytes: value.maxAttachmentMiB.trim()
             ? Number(value.maxAttachmentMiB) * MEBIBYTE
             : null,
+          optimisticBasicTranscription: value.optimisticBasicTranscription,
         });
       }
     },
@@ -1323,6 +1490,25 @@ function PoolForm({
                 {error?.message}
               </p>
             ))}
+          </div>
+        )}
+      </form.Field>
+      <form.Field name="optimisticBasicTranscription">
+        {(field) => (
+          <div>
+            <label className="flex min-h-11 items-center gap-3 text-sm">
+              <input
+                type="checkbox"
+                className="size-4"
+                checked={field.state.value}
+                onBlur={field.handleBlur}
+                onChange={(event) => field.handleChange(event.target.checked)}
+              />
+              {t("dashboard:pools.optimisticBasicTranscription")}
+            </label>
+            <p className="text-xs text-muted-foreground">
+              {t("dashboard:pools.optimisticBasicTranscriptionHint")}
+            </p>
           </div>
         )}
       </form.Field>
@@ -2378,6 +2564,10 @@ export function RelayMetadataSection() {
               <tr>
                 <th className="p-3 font-medium">{t("dashboard:relay.createdAt")}</th>
                 <th className="p-3 font-medium">{t("dashboard:relay.status")}</th>
+                <th className="p-3 font-medium">{t("dashboard:relay.operation")}</th>
+                <th className="p-3 font-medium">{t("dashboard:relay.requestBytes")}</th>
+                <th className="p-3 font-medium">{t("dashboard:relay.responseBytes")}</th>
+                <th className="p-3 font-medium">{t("dashboard:relay.attempts")}</th>
                 <th className="p-3 font-medium">{t("dashboard:relay.tokenPrefix")}</th>
                 <th className="p-3 font-medium">{t("dashboard:relay.duration")}</th>
                 <th className="p-3 font-medium">{t("dashboard:relay.tokens")}</th>
@@ -2390,6 +2580,10 @@ export function RelayMetadataSection() {
                 <tr key={row.id}>
                   <td className="p-3 align-top tabular-nums">{formatDate(row.createdAt)}</td>
                   <td className="p-3 align-top">{row.status}</td>
+                  <td className="p-3 align-top font-mono">{row.operation ?? "—"}</td>
+                  <td className="p-3 align-top tabular-nums">{numberOrDash(row.requestBytes)}</td>
+                  <td className="p-3 align-top tabular-nums">{numberOrDash(row.responseBytes)}</td>
+                  <td className="p-3 align-top tabular-nums">{numberOrDash(row.attemptCount)}</td>
                   <td className="p-3 align-top font-mono">
                     {row.modelApiTokenLookupPrefix ?? "—"}
                   </td>

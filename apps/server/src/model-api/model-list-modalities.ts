@@ -12,6 +12,7 @@
  * Extra fields are ignored by strict OpenAI SDKs.
  */
 
+import { audioOperationSupported } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import type { OpenAiCompatibleCapabilities } from "../relay/protocol.js";
 
 export type ModelInputModality = "text" | "image" | "audio" | "video" | "file";
@@ -22,6 +23,8 @@ export type ModelListCapabilitiesAdvertisement = {
   video_input: boolean;
   audio_input: boolean;
   audio_output: boolean;
+  audio_transcription: boolean;
+  audio_translation: boolean;
 };
 
 export type ModelListArchitectureAdvertisement = {
@@ -39,9 +42,11 @@ export type MultimodalFlags = {
   text: boolean;
   vision: boolean;
   video: boolean;
-  /** Chat `input_audio` and/or dedicated transcription/translation endpoints. */
+  /** Chat-completions `input_audio`; dedicated audio operations are separate. */
   audioInput: boolean;
   audioOutput: boolean;
+  audioTranscription: boolean;
+  audioTranslation: boolean;
 };
 
 export function multimodalFlagsFromCapabilities(
@@ -54,6 +59,8 @@ export function multimodalFlagsFromCapabilities(
       video: false,
       audioInput: false,
       audioOutput: false,
+      audioTranscription: false,
+      audioTranslation: false,
     };
   }
 
@@ -63,21 +70,29 @@ export function multimodalFlagsFromCapabilities(
   );
   const vision = chat?.vision === true;
   const video = chat?.video === true;
-  const audioInput =
-    chat?.audio === true ||
-    capabilities.audio?.transcriptions === true ||
-    capabilities.audio?.translations === true;
+  const audioInput = chat?.audio === true;
+  const audioTranscription = audioOperationSupported(capabilities.audio?.transcriptions) === true;
+  const audioTranslation = audioOperationSupported(capabilities.audio?.translations) === true;
   const audioOutput = capabilities.audio?.speech === true;
 
   // Embedding-only models still accept text input; keep text true if embeddings.
   const textOrEmbed = text || capabilities.embeddings?.supported === true;
 
   return {
-    text: textOrEmbed || (!vision && !video && !audioInput && !audioOutput),
+    text:
+      textOrEmbed ||
+      (!vision &&
+        !video &&
+        !audioInput &&
+        !audioOutput &&
+        !audioTranscription &&
+        !audioTranslation),
     vision,
     video,
     audioInput,
     audioOutput,
+    audioTranscription,
+    audioTranslation,
   };
 }
 
@@ -92,6 +107,8 @@ export function unionMultimodalFlags(flags: MultimodalFlags[]): MultimodalFlags 
       video: acc.video || next.video,
       audioInput: acc.audioInput || next.audioInput,
       audioOutput: acc.audioOutput || next.audioOutput,
+      audioTranscription: acc.audioTranscription || next.audioTranscription,
+      audioTranslation: acc.audioTranslation || next.audioTranslation,
     }),
     {
       text: false,
@@ -99,6 +116,8 @@ export function unionMultimodalFlags(flags: MultimodalFlags[]): MultimodalFlags 
       video: false,
       audioInput: false,
       audioOutput: false,
+      audioTranscription: false,
+      audioTranslation: false,
     },
   );
 }
@@ -107,7 +126,7 @@ export function inputModalitiesFromFlags(flags: MultimodalFlags): ModelInputModa
   const input: ModelInputModality[] = [];
   if (flags.text) input.push("text");
   if (flags.vision) input.push("image");
-  if (flags.audioInput) input.push("audio");
+  if (flags.audioInput || flags.audioTranscription || flags.audioTranslation) input.push("audio");
   if (flags.video) input.push("video");
   if (input.length === 0) input.push("text");
   return input;
@@ -135,6 +154,8 @@ export function openAiModelListExtensions(flags: MultimodalFlags): {
   supports_video_input: boolean;
   supports_audio_input: boolean;
   supports_audio_output: boolean;
+  supports_audio_transcription: boolean;
+  supports_audio_translation: boolean;
   capabilities: ModelListCapabilitiesAdvertisement;
   architecture: ModelListArchitectureAdvertisement;
 } {
@@ -145,11 +166,15 @@ export function openAiModelListExtensions(flags: MultimodalFlags): {
     supports_video_input: flags.video,
     supports_audio_input: flags.audioInput,
     supports_audio_output: flags.audioOutput,
+    supports_audio_transcription: flags.audioTranscription,
+    supports_audio_translation: flags.audioTranslation,
     capabilities: {
       vision: flags.vision,
       video_input: flags.video,
       audio_input: flags.audioInput,
       audio_output: flags.audioOutput,
+      audio_transcription: flags.audioTranscription,
+      audio_translation: flags.audioTranslation,
     },
     architecture: {
       input_modalities,

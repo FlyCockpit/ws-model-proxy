@@ -21,9 +21,13 @@ import {
   recordPoolMemberRelayFailure,
   relayFailureClasses,
 } from "@ws-model-proxy/api/lib/model-pool-routing";
-import { resolveEffectiveCapabilityMetadata } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import {
+  normalizeTranscriptionCapabilities,
+  resolveEffectiveCapabilityMetadata,
+} from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import prisma from "@ws-model-proxy/db";
 import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
+import { env } from "@ws-model-proxy/env/server";
 import { Hono } from "hono";
 import { getMediaConfig } from "../media/config.js";
 import { type OpenAiCompatibleCapabilities, type RelayFailure } from "../relay/protocol.js";
@@ -35,6 +39,7 @@ import {
   ModelApiLimitError,
   type ModelApiLimitLease,
   modelApiConcurrencyLimiter,
+  remainingRelayBudgetMs,
 } from "./limits.js";
 import {
   anyTransformModalityEnabled,
@@ -75,11 +80,25 @@ import {
   unionMultimodalFlags,
 } from "./model-list-modalities.js";
 import {
+  MultipartIngressError,
+  type MultipartScalarPart,
+  parseMultipartToSpool,
+  type ReplayableMultipart,
+} from "./multipart-form-data.js";
+import {
   openAiErrorBody,
   openAiFailureJsonResponse,
   relayFailureHttpStatus,
 } from "./openai-errors.js";
 import { type RelayAttemptTerminal, startRelayAttempt } from "./relay-executor.js";
+import { type RelayBodySource } from "./request-body-source.js";
+import {
+  isBasicTranscriptionRequest,
+  TranscriptionRequestError,
+  type TranscriptionRequestProfile,
+  transcriptionCapabilityCompatible,
+  transcriptionRequestProfileFromParts,
+} from "./transcription-request.js";
 
 type ModelApiRouteDependencies = {
   manager?: Pick<
@@ -120,8 +139,12 @@ type ModelApiCapability =
 
 type BuiltRelayRequest = {
   headers: Headers;
-  body: Uint8Array;
+  body: Uint8Array | RelayBodySource;
 };
+
+function relayAttemptBody(body: Uint8Array | RelayBodySource) {
+  return body instanceof Uint8Array ? { body } : { bodySource: body };
+}
 
 type RelayRequestBuilder = (upstreamModelId: string) => Promise<BuiltRelayRequest>;
 
@@ -132,12 +155,14 @@ type RelayOperation = {
   capability: ModelApiCapability;
   additionalCapabilities?: ModelApiCapability[];
   stream: boolean;
+  transcriptionProfile?: TranscriptionRequestProfile;
   // Chat Test is an internal consumer that can accept a final SSE metrics event
   // derived from the relay's standardized RelayComplete metrics. Public
   // OpenAI-compatible routes retain the upstream byte stream unchanged.
   appendTerminalUsage?: boolean;
   buildRequest: RelayRequestBuilder;
   responseStickiness?: ResponseStickinessCapture;
+  dispose?: () => Promise<void>;
 };
 
 function responseBodyForOperation({
@@ -203,8 +228,10 @@ type PreparedModeledRequest = {
   model: string;
   payload: JsonObject | null;
   stream: boolean;
+  transcriptionProfile?: TranscriptionRequestProfile;
   buildRequest: RelayRequestBuilder;
   transformDebug?: TransformDebug;
+  dispose?: () => Promise<void>;
 };
 
 type ResponseStickinessCapture = {
@@ -241,6 +268,7 @@ type DirectModelRelayRow = {
   upstreamModelId: string;
   capabilityOverrideMode: string;
   capabilityOverrideMetadata: unknown | null;
+  optimisticBasicTranscription: boolean;
   Endpoint: {
     id: string;
     slug: string;
@@ -273,6 +301,8 @@ type RelayMetadataCreate = {
   transformerLatencyMs?: number | null;
   transformerCacheHit?: boolean | null;
   transformerErrorClass?: string | null;
+  operation?: ModelApiCapability;
+  requestBytes?: number | null;
 };
 
 type RelayMetadataUpdate = {
@@ -284,6 +314,7 @@ type RelayMetadataUpdate = {
   transformerLatencyMs?: number | null;
   transformerCacheHit?: boolean | null;
   transformerErrorClass?: string | null;
+  attemptCount?: number;
 };
 
 type RelayRequester = {
@@ -468,6 +499,28 @@ async function attachmentLimitResponse({
   return null;
 }
 
+async function transcriptionUploadLimitResponse({
+  profile,
+  modelOrPoolMaxBytes,
+}: {
+  profile: TranscriptionRequestProfile | undefined;
+  modelOrPoolMaxBytes: number | null;
+}): Promise<Response | null> {
+  if (profile?.fileSize === undefined) return null;
+  const maxBytes = resolveAttachmentLimit({
+    configuredBytes: await getConfiguredMediaAttachmentMaxBytes(),
+    // Multipart ingress enforces this deployment value before model routing;
+    // include it here as a defense-in-depth absolute ceiling.
+    deploymentMaxBytes: env.MODEL_API_TRANSCRIPTION_MAX_UPLOAD_BYTES,
+    modelOrPoolMaxBytes,
+  });
+  if (profile.fileSize <= maxBytes) return null;
+  return openAiFailureJsonResponse(
+    "request_too_large",
+    `The transcription file exceeds this model's ${maxBytes}-byte limit.`,
+  );
+}
+
 function relayRequestHeaders(request: Request): Headers {
   const headers = new Headers(request.headers);
   headers.delete("authorization");
@@ -535,10 +588,12 @@ function supportsCapability({
   capabilities,
   capability,
   stream,
+  transcriptionProfile,
 }: {
   capabilities: OpenAiCompatibleCapabilities | null;
   capability: ModelApiCapability;
   stream: boolean;
+  transcriptionProfile?: TranscriptionRequestProfile;
 }): boolean {
   if (capability === "chat.completions") {
     if (capabilities?.chatCompletions?.supported !== true) return false;
@@ -557,11 +612,17 @@ function supportsCapability({
   }
 
   if (capability === "audio.transcriptions") {
-    return capabilities?.audio?.transcriptions === true;
+    const profile = normalizeTranscriptionCapabilities(capabilities?.audio?.transcriptions);
+    return transcriptionProfile
+      ? transcriptionCapabilityCompatible({ capability: profile, request: transcriptionProfile })
+      : profile?.supported === true;
   }
 
   if (capability === "audio.translations") {
-    return capabilities?.audio?.translations === true;
+    const profile = normalizeTranscriptionCapabilities(capabilities?.audio?.translations);
+    return transcriptionProfile
+      ? transcriptionCapabilityCompatible({ capability: profile, request: transcriptionProfile })
+      : profile?.supported === true;
   }
 
   if (capability === "audio.speech") {
@@ -606,20 +667,29 @@ function supportsOperation({
   operation,
 }: {
   capabilities: OpenAiCompatibleCapabilities | null;
-  operation: Pick<RelayOperation, "capability" | "additionalCapabilities" | "stream">;
+  operation: Pick<
+    RelayOperation,
+    "capability" | "additionalCapabilities" | "stream" | "transcriptionProfile"
+  >;
 }): boolean {
   if (
     !supportsCapability({
       capabilities,
       capability: operation.capability,
       stream: operation.stream,
+      transcriptionProfile: operation.transcriptionProfile,
     })
   ) {
     return false;
   }
 
   return (operation.additionalCapabilities ?? []).every((capability) =>
-    supportsCapability({ capabilities, capability, stream: operation.stream }),
+    supportsCapability({
+      capabilities,
+      capability,
+      stream: operation.stream,
+      transcriptionProfile: operation.transcriptionProfile,
+    }),
   );
 }
 
@@ -663,41 +733,9 @@ async function prepareJsonModeledRequest(
   };
 }
 
-async function serializeFormDataForRelay({
-  request,
-  formData,
-  upstreamModelId,
-}: {
-  request: Request;
-  formData: FormData;
-  upstreamModelId: string;
-}): Promise<BuiltRelayRequest> {
-  const nextFormData = new FormData();
-  for (const [name, value] of formData.entries()) {
-    if (name === "model") continue;
-    nextFormData.append(name, value);
-  }
-  nextFormData.set("model", upstreamModelId);
-
-  const serialized = new Request("http://model-api.local/body", {
-    method: "POST",
-    body: nextFormData,
-  });
-  const headers = relayRequestHeaders(request);
-  const contentType = serialized.headers.get("content-type");
-  if (contentType) headers.set("content-type", contentType);
-
-  return {
-    headers,
-    body: new Uint8Array(await serialized.arrayBuffer()),
-  };
-}
-
 async function prepareMultipartModeledRequest(
   request: Request,
 ): Promise<PreparedModeledRequest | Response> {
-  const body = await readModelApiBody(request);
-  if (body instanceof Response) return body;
   const contentType = request.headers.get("content-type");
   if (!contentType?.toLowerCase().startsWith("multipart/form-data")) {
     return new Response(
@@ -712,14 +750,16 @@ async function prepareMultipartModeledRequest(
     );
   }
 
-  let formData: FormData;
+  let multipart: ReplayableMultipart;
   try {
-    formData = await new Request("http://model-api.local/body", {
-      method: "POST",
-      headers: { "content-type": contentType },
-      body,
-    }).formData();
-  } catch {
+    multipart = await parseMultipartToSpool(request, contentType);
+  } catch (error) {
+    console.warn("[model-api] multipart ingress rejected", {
+      code: error instanceof MultipartIngressError ? error.code : "invalid_multipart",
+    });
+    if (error instanceof MultipartIngressError && error.code !== "invalid_multipart") {
+      return openAiFailureJsonResponse(error.code);
+    }
     return new Response(
       JSON.stringify(
         openAiErrorBody({
@@ -732,15 +772,44 @@ async function prepareMultipartModeledRequest(
     );
   }
 
-  const model = formData.get("model");
-  if (typeof model !== "string" || model.trim().length === 0) {
+  const modelValues = multipart.parts
+    .filter((part): part is MultipartScalarPart => part.kind === "field" && part.name === "model")
+    .map((part) => part.value);
+  const model = modelValues[0];
+  if (modelValues.length !== 1 || !model?.trim()) {
+    await multipart.dispose();
     return new Response(
       JSON.stringify(
         openAiErrorBody({
-          message: "Missing required string field: model.",
+          message:
+            modelValues.length > 1
+              ? "model must not be provided more than once."
+              : "Missing required string field: model.",
           type: "invalid_request_error",
           param: "model",
-          code: "missing_model",
+          code: modelValues.length > 1 ? "duplicate_model" : "missing_model",
+        }),
+      ),
+      { status: 400, headers: { "content-type": "application/json; charset=utf-8" } },
+    );
+  }
+
+  let transcriptionProfile: TranscriptionRequestProfile;
+  try {
+    transcriptionProfile = transcriptionRequestProfileFromParts(multipart.parts);
+  } catch (error) {
+    if (!(error instanceof TranscriptionRequestError)) {
+      await multipart.dispose();
+      throw error;
+    }
+    await multipart.dispose();
+    return new Response(
+      JSON.stringify(
+        openAiErrorBody({
+          message: error.message,
+          type: "invalid_request_error",
+          param: error.param,
+          code: error.code,
         }),
       ),
       { status: 400, headers: { "content-type": "application/json; charset=utf-8" } },
@@ -750,9 +819,15 @@ async function prepareMultipartModeledRequest(
   return {
     model,
     payload: null,
-    stream: false,
-    buildRequest: (upstreamModelId) =>
-      serializeFormDataForRelay({ request, formData, upstreamModelId }),
+    stream: transcriptionProfile.stream,
+    transcriptionProfile,
+    buildRequest: async (upstreamModelId) => {
+      const built = multipart.build(upstreamModelId);
+      const headers = relayRequestHeaders(request);
+      headers.set("content-type", built.contentType);
+      return { headers, body: built.body };
+    },
+    dispose: multipart.dispose,
   };
 }
 
@@ -774,6 +849,8 @@ async function createRelayMetadata(input: RelayMetadataCreate): Promise<string> 
       transformerLatencyMs: input.transformerLatencyMs ?? null,
       transformerCacheHit: input.transformerCacheHit ?? null,
       transformerErrorClass: input.transformerErrorClass ?? null,
+      operation: input.operation ?? null,
+      requestBytes: input.requestBytes == null ? null : BigInt(input.requestBytes),
       status: "PENDING",
     },
     select: { id: true },
@@ -816,6 +893,9 @@ async function updateRelayMetadata(relayRequestId: string, update: RelayMetadata
       httpStatusCode:
         update.terminal.httpStatusCode ?? (failure ? relayFailureHttpStatus(failure) : null),
       upstreamStatusCode: update.terminal.upstreamStatusCode,
+      requestBytes: BigInt(update.terminal.requestBytes),
+      responseBytes: BigInt(update.terminal.responseBytes),
+      ...(update.attemptCount !== undefined ? { attemptCount: update.attemptCount } : {}),
       errorClass: failure,
       ...(update.transformerLatencyMs !== undefined
         ? { transformerLatencyMs: update.transformerLatencyMs }
@@ -843,6 +923,9 @@ async function failRelayMetadata({
   selectedDiscoveredModelId,
   transformerErrorClass,
   transformerLatencyMs,
+  attemptCount,
+  requestBytes,
+  responseBytes,
 }: {
   relayRequestId: string;
   startedAt: Date;
@@ -850,7 +933,17 @@ async function failRelayMetadata({
   selectedDiscoveredModelId?: string;
   transformerErrorClass?: string | null;
   transformerLatencyMs?: number | null;
+  attemptCount?: number;
+  requestBytes?: number;
+  responseBytes?: number;
 }) {
+  if (requestBytes !== undefined) {
+    await prisma.relayRequest.update({
+      where: { id: relayRequestId },
+      data: { requestBytes: BigInt(requestBytes) },
+      select: { id: true },
+    });
+  }
   await updateRelayMetadata(relayRequestId, {
     selectedDiscoveredModelId,
     status: failure === "cancelled" ? "CANCELED" : "FAILED",
@@ -858,6 +951,7 @@ async function failRelayMetadata({
     fallbackFailure: failure,
     transformerErrorClass,
     transformerLatencyMs,
+    attemptCount,
     terminal: {
       ok: false,
       failure,
@@ -865,6 +959,8 @@ async function failRelayMetadata({
       upstreamStatusCode: null,
       usage: null,
       metrics: null,
+      responseBytes: responseBytes ?? 0,
+      requestBytes: requestBytes ?? 0,
     },
   });
 }
@@ -1108,6 +1204,7 @@ async function directModelRow(discoveredModelId: string): Promise<DirectModelRel
       upstreamModelId: true,
       capabilityOverrideMode: true,
       capabilityOverrideMetadata: true,
+      optimisticBasicTranscription: true,
       Endpoint: {
         select: {
           id: true,
@@ -1322,6 +1419,8 @@ async function modelListResponse(targets: {
           video: effective.video,
           audioInput: effective.audio,
           audioOutput: false,
+          audioTranscription: false,
+          audioTranslation: false,
         },
       ]);
     }
@@ -1376,18 +1475,31 @@ async function relayDirect({
     modelApiTokenId: requester.modelApiTokenId,
     modelApiTokenLookupPrefix: requester.modelApiTokenLookupPrefix,
     requestedDiscoveredModelId: target.id,
+    operation: operation.capability,
+    requestBytes: null,
   });
   const selected = await directModelRow(target.id);
   if (!selected) {
+    await operation.dispose?.();
     await failRelayMetadata({ relayRequestId, startedAt, failure: "not_found" });
     return openAiFailureJsonResponse("not_found");
   }
+  const capabilities = effectiveDirectCapabilities(selected);
+  const optimisticBasic =
+    selected.optimisticBasicTranscription &&
+    operation.capability === "audio.transcriptions" &&
+    operation.transcriptionProfile &&
+    isBasicTranscriptionRequest(operation.transcriptionProfile) &&
+    normalizeTranscriptionCapabilities(capabilities?.audio?.transcriptions)?.supported ===
+      undefined;
   if (
+    !optimisticBasic &&
     !supportsOperation({
-      capabilities: effectiveDirectCapabilities(selected),
+      capabilities,
       operation,
     })
   ) {
+    await operation.dispose?.();
     await failRelayMetadata({
       relayRequestId,
       startedAt,
@@ -1397,6 +1509,7 @@ async function relayDirect({
     return openAiFailureJsonResponse("unsupported_capability");
   }
   if (!isEndpointConnected(selected, new Set(manager.getActiveCliDeviceIds()))) {
+    await operation.dispose?.();
     await failRelayMetadata({
       relayRequestId,
       startedAt,
@@ -1406,8 +1519,8 @@ async function relayDirect({
     return openAiFailureJsonResponse("disconnected");
   }
 
-  let globalLease: ModelApiLimitLease;
-  let cliLease: ModelApiLimitLease;
+  let globalLease: ModelApiLimitLease | undefined;
+  let cliLease: ModelApiLimitLease | undefined;
   try {
     globalLease = limiter.acquireGlobal({
       tokenId: requester.limitKey,
@@ -1415,7 +1528,10 @@ async function relayDirect({
     });
     cliLease = limiter.acquireCli(selected.Endpoint.cliDeviceId);
   } catch (error) {
+    cliLease?.release();
+    globalLease?.release();
     if (error instanceof ModelApiLimitError) {
+      await operation.dispose?.();
       await failRelayMetadata({
         relayRequestId,
         startedAt,
@@ -1427,7 +1543,21 @@ async function relayDirect({
     throw error;
   }
 
-  const builtRequest = await operation.buildRequest(selected.upstreamModelId);
+  let builtRequest: BuiltRelayRequest;
+  try {
+    builtRequest = await operation.buildRequest(selected.upstreamModelId);
+  } catch {
+    cliLease.release();
+    globalLease.release();
+    await operation.dispose?.();
+    await failRelayMetadata({
+      relayRequestId,
+      startedAt,
+      failure: "unknown",
+      selectedDiscoveredModelId: selected.id,
+    });
+    return openAiFailureJsonResponse("unknown");
+  }
   const responseIdCapture =
     operation.responseStickiness && operation.family === "responses"
       ? createResponseIdCapture()
@@ -1440,7 +1570,7 @@ async function relayDirect({
     method: operation.method,
     path: operation.path,
     headers: builtRequest.headers,
-    body: builtRequest.body,
+    ...relayAttemptBody(builtRequest.body),
     timeoutMs: MODEL_API_RELAY_TIMEOUT_MS,
     abortSignal: request.signal,
     onResponseBodyChunk: responseIdCapture
@@ -1454,11 +1584,14 @@ async function relayDirect({
       .then(async (terminal) => {
         cliLease.release();
         globalLease.release();
+        if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+        await operation.dispose?.();
         await updateRelayMetadata(relayRequestId, {
           selectedDiscoveredModelId: selected.id,
           status: terminalStatus(terminal),
           startedAt,
           terminal,
+          attemptCount: 1,
         });
         const responseId = responseIdCapture?.finish(operation.stream) ?? null;
         if (terminal.ok && responseId && operation.responseStickiness) {
@@ -1485,11 +1618,14 @@ async function relayDirect({
     const terminal = await attempt.terminal;
     cliLease.release();
     globalLease.release();
+    if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+    await operation.dispose?.();
     await updateRelayMetadata(relayRequestId, {
       selectedDiscoveredModelId: selected.id,
       status: terminalStatus(terminal),
       startedAt,
       terminal,
+      attemptCount: 1,
     });
     return openAiFailureJsonResponse(terminal.failure ?? "unknown");
   }
@@ -1521,6 +1657,8 @@ async function relayPool({
     transformerLatencyMs: transformDebug?.latencyMs ?? null,
     transformerCacheHit: transformDebug?.cacheHit ?? null,
     transformerErrorClass: transformDebug?.error ?? null,
+    operation: operation.capability,
+    requestBytes: null,
   });
 
   let globalLease: ModelApiLimitLease;
@@ -1531,6 +1669,7 @@ async function relayPool({
     });
   } catch (error) {
     if (error instanceof ModelApiLimitError) {
+      await operation.dispose?.();
       await failRelayMetadata({ relayRequestId, startedAt, failure: error.failure });
       return openAiFailureJsonResponse(error.failure);
     }
@@ -1538,14 +1677,31 @@ async function relayPool({
   }
 
   const members = await poolMemberRows(target.id);
-  const eligibleMembers = members.filter((member) =>
+  const knownEligibleMembers = members.filter((member) =>
     supportsOperation({
       capabilities: effectivePoolMemberCapabilities(member),
       operation,
     }),
   );
+  const knownIds = new Set(knownEligibleMembers.map((member) => member.id));
+  const unknownFallbackMembers =
+    target.optimisticBasicTranscription &&
+    operation.capability === "audio.transcriptions" &&
+    operation.transcriptionProfile &&
+    isBasicTranscriptionRequest(operation.transcriptionProfile)
+      ? members.filter((member) => {
+          if (knownIds.has(member.id)) return false;
+          const capability = normalizeTranscriptionCapabilities(
+            effectivePoolMemberCapabilities(member)?.audio?.transcriptions,
+          );
+          return capability?.supported === undefined;
+        })
+      : [];
+  // Known-compatible members always route before optimistic unknown fallbacks.
+  const eligibleMembers = [...knownEligibleMembers, ...unknownFallbackMembers];
   if (eligibleMembers.length === 0) {
     globalLease.release();
+    await operation.dispose?.();
     await failRelayMetadata({
       relayRequestId,
       startedAt,
@@ -1554,21 +1710,43 @@ async function relayPool({
     return openAiFailureJsonResponse("unsupported_capability");
   }
 
-  const routeSequence = buildPoolRouteSequence({
-    members: eligibleMembers,
-    activeCliDeviceIds: manager.getActiveCliDeviceIds(),
-    now: new Date(),
+  const activeCliDeviceIds = manager.getActiveCliDeviceIds();
+  const now = new Date();
+  const knownSequence = buildPoolRouteSequence({
+    members: knownEligibleMembers,
+    activeCliDeviceIds,
+    now,
   });
-  if (!routeSequence.ok) {
+  const unknownSequence = buildPoolRouteSequence({
+    members: unknownFallbackMembers,
+    activeCliDeviceIds,
+    now,
+  });
+  const routeCandidates = [
+    ...(knownSequence.ok ? knownSequence.candidates : []),
+    ...(unknownSequence.ok ? unknownSequence.candidates : []),
+  ];
+  if (routeCandidates.length === 0) {
     globalLease.release();
+    await operation.dispose?.();
     await failRelayMetadata({ relayRequestId, startedAt, failure: "disconnected" });
     return openAiFailureJsonResponse("disconnected");
   }
 
   const memberById = new Map(eligibleMembers.map((member) => [member.id, member] as const));
   let finalFailure: RelayFailure = "unknown";
+  let attemptCount = 0;
+  // One wall-clock deadline covers body rebuild/reopen, every upstream attempt,
+  // and retry bookkeeping. Pool size never multiplies the public timeout.
+  const relayDeadlineMs = startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS;
+  let cumulativeRequestBytes = 0;
+  let cumulativeResponseBytes = 0;
 
-  for (const candidate of routeSequence.candidates) {
+  for (const candidate of routeCandidates) {
+    if (remainingRelayBudgetMs(relayDeadlineMs) === 0) {
+      finalFailure = "timeout";
+      break;
+    }
     const member = memberById.get(candidate.poolMemberId);
     if (!member) continue;
 
@@ -1583,7 +1761,6 @@ async function relayPool({
       throw error;
     }
 
-    const builtRequest = await operation.buildRequest(candidate.upstreamModelId);
     if (candidate.healthStatus === "HALF_OPEN") {
       const claimed = await markPoolMemberHalfOpenTrial({
         poolMemberId: candidate.poolMemberId,
@@ -1593,10 +1770,29 @@ async function relayPool({
         continue;
       }
     }
+    let builtRequest: BuiltRelayRequest;
+    try {
+      builtRequest = await operation.buildRequest(candidate.upstreamModelId);
+    } catch {
+      cliLease.release();
+      finalFailure = "unknown";
+      await recordPoolMemberRelayFailure({
+        poolMemberId: candidate.poolMemberId,
+        failure: "unknown",
+      });
+      continue;
+    }
     const responseIdCapture =
       operation.responseStickiness && operation.family === "responses"
         ? createResponseIdCapture()
         : null;
+    const attemptTimeoutMs = remainingRelayBudgetMs(relayDeadlineMs);
+    if (attemptTimeoutMs === 0) {
+      cliLease.release();
+      if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+      finalFailure = "timeout";
+      break;
+    }
     const attempt = startRelayAttempt({
       manager,
       cliDeviceId: candidate.cliDeviceId,
@@ -1605,20 +1801,24 @@ async function relayPool({
       method: operation.method,
       path: operation.path,
       headers: builtRequest.headers,
-      body: builtRequest.body,
-      timeoutMs: MODEL_API_RELAY_TIMEOUT_MS,
+      ...relayAttemptBody(builtRequest.body),
+      timeoutMs: attemptTimeoutMs,
       abortSignal: request.signal,
       onResponseBodyChunk: responseIdCapture
         ? (chunk) => responseIdCapture.push(chunk, operation.stream)
         : undefined,
     });
+    attemptCount += 1;
 
     try {
       const started = await attempt.started;
       if (started.status >= 500) {
         attempt.cancel("upstream_5xx");
-        await attempt.terminal;
+        const terminal = await attempt.terminal;
+        cumulativeRequestBytes += terminal.requestBytes;
+        cumulativeResponseBytes += terminal.responseBytes;
         cliLease.release();
+        if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
         finalFailure = "upstream_5xx";
         await recordPoolMemberRelayFailure({
           poolMemberId: candidate.poolMemberId,
@@ -1629,8 +1829,15 @@ async function relayPool({
 
       const finalize = attempt.terminal
         .then(async (terminal) => {
+          const cumulativeTerminal = {
+            ...terminal,
+            requestBytes: cumulativeRequestBytes + terminal.requestBytes,
+            responseBytes: cumulativeResponseBytes + terminal.responseBytes,
+          };
           cliLease.release();
           globalLease.release();
+          if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+          await operation.dispose?.();
           if (terminal.ok) {
             await markPoolMemberRelaySuccess(candidate.poolMemberId);
           }
@@ -1638,7 +1845,8 @@ async function relayPool({
             selectedDiscoveredModelId: member.discoveredModelId,
             status: terminalStatus(terminal),
             startedAt,
-            terminal,
+            terminal: cumulativeTerminal,
+            attemptCount,
           });
           const responseId = responseIdCapture?.finish(operation.stream) ?? null;
           if (terminal.ok && responseId && operation.responseStickiness) {
@@ -1663,7 +1871,10 @@ async function relayPool({
       );
     } catch {
       const terminal = await attempt.terminal;
+      cumulativeRequestBytes += terminal.requestBytes;
+      cumulativeResponseBytes += terminal.responseBytes;
       cliLease.release();
+      if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
       const failure = terminal.failure ?? "unknown";
       finalFailure = failure;
       if (isPoolRelayFailureClass(failure) && isRetryablePoolMemberRelayFailure(failure)) {
@@ -1674,18 +1885,32 @@ async function relayPool({
         continue;
       }
       globalLease.release();
+      await operation.dispose?.();
       await updateRelayMetadata(relayRequestId, {
         selectedDiscoveredModelId: member.discoveredModelId,
         status: terminalStatus(terminal),
         startedAt,
-        terminal,
+        terminal: {
+          ...terminal,
+          requestBytes: cumulativeRequestBytes,
+          responseBytes: cumulativeResponseBytes,
+        },
+        attemptCount,
       });
       return openAiFailureJsonResponse(failure);
     }
   }
 
   globalLease.release();
-  await failRelayMetadata({ relayRequestId, startedAt, failure: finalFailure });
+  await operation.dispose?.();
+  await failRelayMetadata({
+    relayRequestId,
+    startedAt,
+    failure: finalFailure,
+    attemptCount,
+    requestBytes: cumulativeRequestBytes,
+    responseBytes: cumulativeResponseBytes,
+  });
   return openAiFailureJsonResponse(finalFailure);
 }
 
@@ -1715,6 +1940,8 @@ async function relaySelectedModelNoFailover({
     modelApiTokenLookupPrefix: requester.modelApiTokenLookupPrefix,
     requestedDiscoveredModelId,
     requestedModelPoolId,
+    operation: operation.capability,
+    requestBytes: null,
   });
   const selected = await directModelRow(selectedDiscoveredModelId);
   if (!selected) {
@@ -1747,8 +1974,8 @@ async function relaySelectedModelNoFailover({
     return openAiFailureJsonResponse("disconnected");
   }
 
-  let globalLease: ModelApiLimitLease;
-  let cliLease: ModelApiLimitLease;
+  let globalLease: ModelApiLimitLease | undefined;
+  let cliLease: ModelApiLimitLease | undefined;
   try {
     globalLease = limiter.acquireGlobal({
       tokenId: requester.limitKey,
@@ -1756,6 +1983,8 @@ async function relaySelectedModelNoFailover({
     });
     cliLease = limiter.acquireCli(selected.Endpoint.cliDeviceId);
   } catch (error) {
+    cliLease?.release();
+    globalLease?.release();
     if (error instanceof ModelApiLimitError) {
       await failRelayMetadata({
         relayRequestId,
@@ -1768,7 +1997,21 @@ async function relaySelectedModelNoFailover({
     throw error;
   }
 
-  const builtRequest = await operation.buildRequest(selected.upstreamModelId);
+  let builtRequest: BuiltRelayRequest;
+  try {
+    builtRequest = await operation.buildRequest(selected.upstreamModelId);
+  } catch {
+    cliLease.release();
+    globalLease.release();
+    await operation.dispose?.();
+    await failRelayMetadata({
+      relayRequestId,
+      startedAt,
+      failure: "unknown",
+      selectedDiscoveredModelId: selected.id,
+    });
+    return openAiFailureJsonResponse("unknown");
+  }
   const responseIdCapture =
     operation.responseStickiness && operation.family === "responses"
       ? createResponseIdCapture()
@@ -1781,7 +2024,7 @@ async function relaySelectedModelNoFailover({
     method: operation.method,
     path: operation.path,
     headers: builtRequest.headers,
-    body: builtRequest.body,
+    ...relayAttemptBody(builtRequest.body),
     timeoutMs: MODEL_API_RELAY_TIMEOUT_MS,
     abortSignal: request.signal,
     onResponseBodyChunk: responseIdCapture
@@ -1795,11 +2038,13 @@ async function relaySelectedModelNoFailover({
       .then(async (terminal) => {
         cliLease.release();
         globalLease.release();
+        if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
         await updateRelayMetadata(relayRequestId, {
           selectedDiscoveredModelId: selected.id,
           status: terminalStatus(terminal),
           startedAt,
           terminal,
+          attemptCount: 1,
         });
         const responseId = responseIdCapture?.finish(operation.stream) ?? null;
         if (terminal.ok && responseId && operation.responseStickiness) {
@@ -1825,11 +2070,13 @@ async function relaySelectedModelNoFailover({
     const terminal = await attempt.terminal;
     cliLease.release();
     globalLease.release();
+    if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
     await updateRelayMetadata(relayRequestId, {
       selectedDiscoveredModelId: selected.id,
       status: terminalStatus(terminal),
       startedAt,
       terminal,
+      attemptCount: 1,
     });
     return openAiFailureJsonResponse(terminal.failure ?? "unknown");
   }
@@ -2100,6 +2347,7 @@ async function maybeApplyPoolMediaTransformer({
         modelApiTokenLookupPrefix: requester.modelApiTokenLookupPrefix,
         requestedDiscoveredModelId: transformer.id,
         requestedModelPoolId: poolId,
+        operation: "chat.completions",
       });
     } catch (error) {
       cliLease.release();
@@ -2375,16 +2623,29 @@ async function relayPreparedModeledRequest({
 }) {
   const directTarget = directTargetByModelId(targets.directModels, prepared.model);
   if (directTarget) {
+    const transcriptionLimitError = await transcriptionUploadLimitResponse({
+      profile: prepared.transcriptionProfile,
+      modelOrPoolMaxBytes: directTarget.maxAttachmentBytes,
+    });
+    if (transcriptionLimitError) {
+      await prepared.dispose?.();
+      return transcriptionLimitError;
+    }
     const limitError = await attachmentLimitResponse({
       payload: prepared.payload,
       requesterUserId: requester.userId,
       modelOrPoolMaxBytes: directTarget.maxAttachmentBytes,
     });
-    if (limitError) return limitError;
+    if (limitError) {
+      await prepared.dispose?.();
+      return limitError;
+    }
     const relayOperation: RelayOperation = {
       ...operation,
       stream: prepared.stream,
       buildRequest: prepared.buildRequest,
+      transcriptionProfile: prepared.transcriptionProfile,
+      dispose: prepared.dispose,
     };
     return relayDirect({
       request,
@@ -2398,12 +2659,23 @@ async function relayPreparedModeledRequest({
 
   const poolTarget = poolTargetByModelId(targets.modelPools, prepared.model);
   if (poolTarget) {
+    const transcriptionLimitError = await transcriptionUploadLimitResponse({
+      profile: prepared.transcriptionProfile,
+      modelOrPoolMaxBytes: poolTarget.maxAttachmentBytes,
+    });
+    if (transcriptionLimitError) {
+      await prepared.dispose?.();
+      return transcriptionLimitError;
+    }
     const limitError = await attachmentLimitResponse({
       payload: prepared.payload,
       requesterUserId: requester.userId,
       modelOrPoolMaxBytes: poolTarget.maxAttachmentBytes,
     });
-    if (limitError) return limitError;
+    if (limitError) {
+      await prepared.dispose?.();
+      return limitError;
+    }
     const maybeTransformed = await maybeApplyPoolMediaTransformer({
       request,
       requester,
@@ -2413,13 +2685,18 @@ async function relayPreparedModeledRequest({
       manager,
       limiter,
     });
-    if (maybeTransformed instanceof Response) return maybeTransformed;
+    if (maybeTransformed instanceof Response) {
+      await prepared.dispose?.();
+      return maybeTransformed;
+    }
     prepared = maybeTransformed;
 
     const relayOperation: RelayOperation = {
       ...operation,
       stream: prepared.stream,
       buildRequest: prepared.buildRequest,
+      transcriptionProfile: prepared.transcriptionProfile,
+      dispose: prepared.dispose,
     };
     const response = await relayPool({
       request,
@@ -2436,6 +2713,7 @@ async function relayPreparedModeledRequest({
     return response;
   }
 
+  await prepared.dispose?.();
   return openAiFailureJsonResponse("not_found");
 }
 
@@ -2457,17 +2735,37 @@ async function authenticatedModeledHandler({
     return openAiFailureJsonResponse("access_denied", "Missing or invalid model API token.");
   const prepared = await prepare(request);
   if (prepared instanceof Response) return prepared;
-  const requester = requesterFromToken(token);
-  const targets = await listVisibleModelTargetsForToken(token);
-  return relayPreparedModeledRequest({
-    request,
-    requester,
-    targets,
-    prepared,
-    operation,
-    manager,
-    limiter,
-  });
+  // Every downstream path may attempt cleanup (including asynchronous relay
+  // completion). Make it idempotent, and retain handler-level ownership until
+  // routing has been handed off so unexpected DB/limiter/health failures cannot
+  // orphan a prepared spool.
+  const originalDispose = prepared.dispose;
+  let disposed = false;
+  prepared.dispose = originalDispose
+    ? async () => {
+        if (disposed) return;
+        disposed = true;
+        await originalDispose();
+      }
+    : undefined;
+  let responseReturned = false;
+  try {
+    const requester = requesterFromToken(token);
+    const targets = await listVisibleModelTargetsForToken(token);
+    const response = await relayPreparedModeledRequest({
+      request,
+      requester,
+      targets,
+      prepared,
+      operation,
+      manager,
+      limiter,
+    });
+    responseReturned = true;
+    return response;
+  } finally {
+    if (!responseReturned) await prepared.dispose?.();
+  }
 }
 
 async function completionsHandler({

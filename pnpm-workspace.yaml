@@ -10,6 +10,7 @@ minimumReleaseAgeExclude:
   # exception from weakening the age gate for future versions.
   - brace-expansion@2.1.4||5.0.9 # CVE-2026-13149 / CVE-2026-14257 / CVE-2026-69152
   - fast-uri@4.1.2 # CVE-2026-16221 / CVE-2026-18446
+  - "@fastify/busboy@3.2.2" # multipart CR/LF injection security release; exact pin
 # Each selector lifts a transitive out of its vulnerable range. Selectors are
 # scoped tightly so unrelated majors are untouched; explicitly listed security
 # releases above are the only exceptions to the 7-day minimum-age gate.
@@ -50,6 +51,13 @@ savePrefix: ""
 peerDependencyRules:
   allowedVersions:
     vite: "*"
+# Prisma 7.9.1 pins deepmerge-ts 7.1.5 exactly. The advisory requires two
+# attacker-controlled circular JavaScript object graphs; Prisma only uses it to
+# merge trusted local configuration, and plain JSON cannot trigger the issue.
+# Remove this exception when Prisma supports deepmerge-ts >=8.
+auditConfig:
+  ignoreGhsas:
+    - GHSA-ggr8-5vv4-36mx
 allowBuilds:
   '@prisma/engines': true
   esbuild: true
@@ -61,6 +69,7 @@ allowBuilds:
 # Catalog: single-version deps shared across workspace packages.
 # Bump shared dependency versions here, not in individual package.json files.
 catalog:
+  "@fastify/busboy": 3.2.2
   mediabunny: ^1.53.0
   dotenv: ^17.4.2
   zod: ^4.4.3

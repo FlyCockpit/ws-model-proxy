@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
 import { resetPoolMemberHealth } from "@ws-model-proxy/api/lib/model-pool-routing";
+import { audioOperationSupported } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { directModelId, validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma from "@ws-model-proxy/db";
 import type { EndpointInventory, OpenAiCompatibleCapabilities } from "./protocol.js";
@@ -72,8 +73,8 @@ function coarseModelCapabilities(
   // Dedicated /v1/audio/* endpoints *or* chat `input_audio` content parts.
   if (
     capabilities.chatCompletions?.audio ||
-    capabilities.audio?.transcriptions ||
-    capabilities.audio?.translations
+    audioOperationSupported(capabilities.audio?.transcriptions) ||
+    audioOperationSupported(capabilities.audio?.translations)
   ) {
     values.add("AUDIO_INPUT");
   }
@@ -86,38 +87,6 @@ export function shouldPreserveDashboardCapabilityOverride(
   origin: string | null | undefined,
 ): boolean {
   return origin === "DASHBOARD";
-}
-
-async function loadDesiredModelCapabilities(
-  cliDeviceId: string,
-): Promise<DesiredModelCapability[]> {
-  const rows = await prisma.discoveredModel.findMany({
-    where: {
-      Endpoint: { cliDeviceId },
-      published: true,
-      capabilityOverrideMode: "OVERRIDE",
-      capabilityOverrideOrigin: "DASHBOARD",
-    },
-    select: {
-      upstreamModelId: true,
-      capabilityOverrideMetadata: true,
-      Endpoint: { select: { slug: true } },
-    },
-  });
-  const desired: DesiredModelCapability[] = [];
-  if (!Array.isArray(rows)) return desired;
-  for (const row of rows) {
-    if (!row.capabilityOverrideMetadata || typeof row.capabilityOverrideMetadata !== "object") {
-      continue;
-    }
-    desired.push({
-      endpointSlug: row.Endpoint.slug,
-      upstreamModelId: row.upstreamModelId,
-      capabilityOverrideMode: "override",
-      capabilities: row.capabilityOverrideMetadata as OpenAiCompatibleCapabilities,
-    });
-  }
-  return desired;
 }
 
 function jsonOrUndefined(value: OpenAiCompatibleCapabilities | undefined): JsonValue | undefined {
@@ -333,9 +302,13 @@ export async function persistRelayRegistration({
                 select: { capabilityOverrideMode: true, capabilityOverrideOrigin: true },
               });
               const incomingOverride = model.capabilityOverrideMode === "override";
-              const keepDashboardOverride = shouldPreserveDashboardCapabilityOverride(
-                existingModel?.capabilityOverrideOrigin,
-              );
+              // A model override explicitly present in the local CLI config is
+              // authoritative. Dashboard state (including an explicit choice
+              // to inherit) is retained while the CLI inherits endpoint
+              // defaults. Server-owned state is never written to CLI config.
+              const keepDashboardOverride =
+                !incomingOverride &&
+                shouldPreserveDashboardCapabilityOverride(existingModel?.capabilityOverrideOrigin);
               const discoveredModel = await tx.discoveredModel.upsert({
                 where: {
                   endpointId_upstreamModelId: {
@@ -467,7 +440,7 @@ export async function persistRelayRegistration({
       );
       return {
         ...persisted,
-        desiredCapabilities: await loadDesiredModelCapabilities(persisted.cliDeviceId),
+        desiredCapabilities: [],
       };
     } catch (error) {
       if (!isSerializationConflict(error) || attempt === INVENTORY_TRANSACTION_MAX_ATTEMPTS) {

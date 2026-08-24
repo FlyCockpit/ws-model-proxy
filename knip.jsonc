@@ -20,15 +20,9 @@
       "entry": [
         // SPA/SSR entry points. `!` suffix = production entry (kept when
         // running `knip --production`, which excludes dev-only files).
-        "src/client.tsx!",
-        "src/server.ts!",
-        "src/sw.ts!",
-        "src/router.tsx!",
         "src/routes/**/*.tsx!",
         "src/hooks/*.ts!",
-        "src/stores/*.ts!",
-        // PWA assets generator config — dev-only tooling, no `!` suffix.
-        "pwa-assets.config.ts"
+        "src/stores/*.ts!"
       ],
       "ignoreDependencies": [
         // Imported only via PostCSS/Tailwind CSS pipeline, not statically.
@@ -45,19 +39,16 @@
       ]
     },
     "apps/server": {
-      "ignoreDependencies": ["better-auth", "dotenv"]
+      "ignoreDependencies": ["better-auth"]
     },
     "packages/ui": {
       "entry": ["src/components/**/*.tsx", "src/styles/**/*.css"]
     },
     "packages/api": {
-      "ignoreDependencies": ["@orpc/client", "@orpc/openapi", "@orpc/zod", "dotenv"]
+      "ignoreDependencies": ["@orpc/client", "@orpc/openapi", "@orpc/zod"]
     },
     "packages/db": {
       "ignoreDependencies": ["@prisma/client", "pg", "zod"]
-    },
-    "packages/auth": {
-      "ignoreDependencies": ["dotenv"]
     }
   }
 }

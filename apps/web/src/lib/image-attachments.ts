@@ -14,9 +14,6 @@
 
 import {
   acceptedMediaInputAcceptAttr,
-  CLIENT_ACCEPTED_AUDIO_MIMES,
-  CLIENT_ACCEPTED_IMAGE_MIMES,
-  CLIENT_ACCEPTED_VIDEO_MIMES,
   DEFAULT_IMAGE_ENCODE_QUALITY,
   DEFAULT_IMAGE_INLINE_PROFILE,
   DEFAULT_IMAGE_MAX_EDGE,
@@ -29,13 +26,6 @@ import {
   mediaModalityForMime,
   reencodeMimeChain,
 } from "@ws-model-proxy/config/media-policy";
-
-export const ACCEPTED_IMAGE_TYPES = CLIENT_ACCEPTED_IMAGE_MIMES;
-
-export const ACCEPTED_IMAGE_ACCEPT_ATTR = ACCEPTED_IMAGE_TYPES.join(",");
-
-export const ACCEPTED_AUDIO_TYPES = CLIENT_ACCEPTED_AUDIO_MIMES;
-export const ACCEPTED_VIDEO_TYPES = CLIENT_ACCEPTED_VIDEO_MIMES;
 
 export type AttachmentModality = MediaInputModality;
 export type AttachmentModalities = Record<AttachmentModality, boolean>;
@@ -79,8 +69,6 @@ export const TOTAL_REQUEST_HARD_MAX_BYTES = 9.5 * 1024 * 1024; // ~9.5 MB
 // media upload is available. Small images stay embedded (offline-friendly,
 // fewer round trips); anything larger is uploaded so history stops re-sending
 // multi-hundred-KB base64 each turn. (Phase 1 / decision 3B of asset-plan.md.)
-export const UPLOAD_THRESHOLD_BYTES = 256 * 1024; // ~256 KB
-
 export type ProcessedImage = {
   id: string;
   dataUrl: string;
@@ -104,25 +92,6 @@ export type ProcessImageOptions = {
   /** Maximum decoded bytes for the inline fallback data URL. */
   maxBytes?: number;
 };
-
-export function isAcceptedImageType(type: string): boolean {
-  return mediaModalityForMime(type) === "image";
-}
-
-// Convert a processed base64 `data:` URL back into a Blob for multipart upload.
-// Used when an attachment is large enough to prefer the media-store path over
-// base64 embedding; the same bytes then back both the upload and a preview URL.
-export function dataUrlToBlob(dataUrl: string): Blob {
-  const comma = dataUrl.indexOf(",");
-  const header = dataUrl.slice(0, comma);
-  const mimeMatch = /data:([^;,]+)/.exec(header);
-  const mime = mimeMatch?.[1] ?? "application/octet-stream";
-  const base64 = dataUrl.slice(comma + 1);
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-  return new Blob([bytes], { type: mime });
-}
 
 // Decoded byte size of a base64 `data:` URL payload (excludes the header).
 export function dataUrlByteSize(dataUrl: string): number {
