@@ -27,4 +27,21 @@ describe("context counting hierarchy", () => {
       }),
     ).rejects.toThrow("Only native counts");
   });
+
+  it("threads cancellation through the counting hierarchy", async () => {
+    const controller = new AbortController();
+    const count = vi.fn(async (_input, signal?: AbortSignal) => {
+      expect(signal).toBe(controller.signal);
+      controller.abort(new Error("cancelled"));
+      return null;
+    });
+    await expect(
+      countContext({
+        input: {},
+        counters: [{ count }],
+        serializedChars: 10,
+        signal: controller.signal,
+      }),
+    ).rejects.toThrow("cancelled");
+  });
 });

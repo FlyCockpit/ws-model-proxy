@@ -82,6 +82,23 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         where: { attemptId: attempt.attemptId },
         include: { Lease: true, Waiters: true },
       });
+      const observedAt = new Date();
+      if (existing?.Lease?.state === "ACTIVE" && existing.Lease.expiresAt <= observedAt) {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${existing.Lease.capacityId}, 0))`;
+        await tx.capacityLease.updateMany({
+          where: {
+            id: existing.Lease.id,
+            fencingToken: existing.Lease.fencingToken,
+            state: "ACTIVE",
+          },
+          data: { state: "RECLAIMED", releasedAt: observedAt, releaseReason: "expired" },
+        });
+        await tx.admissionRequest.update({
+          where: { id: existing.id },
+          data: { state: "TERMINAL", terminalAt: observedAt, terminalReason: "lease_expired" },
+        });
+        return { result: { state: "EXPIRED" } as const, notify: [existing.Lease.capacityId] };
+      }
       if (existing?.Lease?.state === "ACTIVE")
         return {
           result: { state: "ADMITTED", lease: leaseHandle(existing.Lease) } as const,
@@ -115,6 +132,18 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       for (const capacityId of capacityIds)
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacityId}, 0))`;
       const now = new Date();
+      if (existing)
+        await tx.admissionRequest.update({
+          where: { id: existing.id },
+          data: { heartbeatAt: now, connectionOwner: attempt.connectionOwner },
+        });
+      const sequence = existing
+        ? []
+        : await tx.$queryRaw<
+            Array<{ value: bigint }>
+          >`SELECT nextval('admission_enqueue_sequence') AS value`;
+      const enqueueSequence = existing?.enqueueSequence ?? sequence[0]?.value;
+      if (enqueueSequence === undefined) throw new Error("Admission enqueue sequence unavailable.");
       const request =
         existing ??
         (await tx.admissionRequest.create({
@@ -129,19 +158,25 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
                 ? attempt.candidates[0]?.executionTargetId
                 : undefined,
             basePriority: attempt.basePriority,
-            enqueueSequence:
-              BigInt(Date.now()) * 1_000_000n + BigInt(Math.floor(Math.random() * 1_000_000)),
+            enqueueSequence,
             deadlineAt: attempt.deadlineAt,
             connectionOwner: attempt.connectionOwner,
             heartbeatAt: now,
             Waiters: {
               create: attempt.candidates.map((candidate) => ({
                 userId: attempt.ownerId,
+                requestId: attempt.requestId,
+                attemptId: attempt.attemptId,
+                enqueueSequence,
                 capacityId: candidate.capacityId,
                 executionTargetId: candidate.executionTargetId,
                 poolId: attempt.poolId,
                 poolMemberId: candidate.poolMemberId,
                 candidateOrder: candidate.candidateOrder,
+                effectivePriority: candidate.priority,
+                effectiveConcurrencyLimit: candidate.memberConcurrencyCeiling,
+                effectiveReservedSlots: candidate.reservedSlots,
+                effectiveBorrowPolicy: candidate.allowBorrowReserved ? "WHEN_IDLE" : "NEVER",
               })),
             },
           },
@@ -179,35 +214,32 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       },
       include: { AdmissionRequest: true, PoolMember: true },
     });
-    const memberPolicies = await tx.poolMember.findMany({
-      where: { ExecutionTarget: { capacityId } },
-      select: {
-        id: true,
-        capacityPriority: true,
-        capacityReservedSlots: true,
-        capacityBorrowPolicy: true,
-      },
+    const configuredReservations = await tx.poolMember.findMany({
+      where: { ExecutionTarget: { capacityId }, capacityReservedSlots: { gt: 0 } },
+      select: { id: true, capacityReservedSlots: true },
     });
     const eligibility = new Map<string, { borrowed: boolean }>();
     const eligible = [];
     for (const waiter of waiters) {
-      const memberLimit = waiter.PoolMember?.capacityConcurrencyLimit;
+      const memberLimit = waiter.effectiveConcurrencyLimit;
       if (memberLimit !== null && memberLimit !== undefined && waiter.poolMemberId) {
         const memberActive = await tx.capacityLease.count({
           where: { poolMemberId: waiter.poolMemberId, state: "ACTIVE" },
         });
         if (memberActive >= memberLimit) continue;
       }
-      const higherPolicies = memberPolicies.filter(
-        (policy) => policy.capacityPriority > waiter.AdmissionRequest.basePriority,
+      const higherReservationOwners = new Map<string, number>();
+      for (const entry of waiters)
+        if (entry.effectivePriority > waiter.effectivePriority && entry.effectiveReservedSlots > 0)
+          higherReservationOwners.set(
+            entry.poolMemberId ?? `direct:${entry.executionTargetId}`,
+            entry.effectiveReservedSlots,
+          );
+      const reservedForHigherPriority = Math.min(
+        capacity.hardConcurrencyLimit ?? Number.MAX_SAFE_INTEGER,
+        [...higherReservationOwners.values()].reduce((total, slots) => total + slots, 0),
       );
-      const reservedForHigherPriority = higherPolicies.reduce(
-        (total, policy) => total + policy.capacityReservedSlots,
-        0,
-      );
-      const higherPriorityQueued = waiters.some(
-        (entry) => entry.AdmissionRequest.basePriority > waiter.AdmissionRequest.basePriority,
-      );
+      const higherPriorityQueued = higherReservationOwners.size > 0;
       if (
         capacity.hardConcurrencyLimit !== null &&
         reservedForHigherPriority > 0 &&
@@ -215,17 +247,20 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         active >= capacity.hardConcurrencyLimit - reservedForHigherPriority
       )
         continue;
-      const reservedForOthers = memberPolicies
-        .filter((policy) => policy.id !== waiter.poolMemberId)
-        .reduce((total, policy) => total + policy.capacityReservedSlots, 0);
+      const reservedForOthers = Math.min(
+        capacity.hardConcurrencyLimit ?? Number.MAX_SAFE_INTEGER,
+        configuredReservations
+          .filter((policy) => policy.id !== waiter.poolMemberId)
+          .reduce((total, policy) => total + policy.capacityReservedSlots, 0),
+      );
       const borrowed =
         capacity.hardConcurrencyLimit !== null &&
         reservedForOthers > 0 &&
         active >= capacity.hardConcurrencyLimit - reservedForOthers;
-      if (borrowed && waiter.PoolMember?.capacityBorrowPolicy === "NEVER") continue;
+      if (borrowed && waiter.effectiveBorrowPolicy === "NEVER") continue;
       eligible.push({
         admissionRequestId: waiter.admissionRequestId,
-        priority: waiter.AdmissionRequest.basePriority,
+        priority: waiter.effectivePriority,
         enqueueSequence: waiter.AdmissionRequest.enqueueSequence,
         eligible: true,
       });
@@ -262,8 +297,8 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         executionTargetId: waiter.executionTargetId,
         poolId: waiter.poolId,
         poolMemberId: waiter.poolMemberId,
-        priority: waiter.AdmissionRequest.basePriority,
-        reservationClass: waiter.AdmissionRequest.basePriority,
+        priority: waiter.effectivePriority,
+        reservationClass: waiter.effectivePriority,
         borrowed: eligibility.get(waiter.admissionRequestId)?.borrowed ?? false,
         fencingToken,
         ownerServerInstance: this.serverInstance,
@@ -306,6 +341,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           where: { attemptId: lease.attemptId, state: "ADMITTED" },
           data: { state: "TERMINAL", terminalAt: now },
         });
+      if (result.count) await this.#admitOne(tx, lease.capacityId, now);
       return result.count === 1;
     });
     if (released) await this.notifier?.notify([lease.capacityId]);
@@ -314,15 +350,28 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
 
   async cancelAttempt(attemptId: string): Promise<boolean> {
     const now = new Date();
-    const result = await this.db.admissionRequest.updateMany({
-      where: { attemptId, state: "WAITING" },
-      data: { state: "CANCELLED", terminalAt: now, terminalReason: "cancelled" },
-    });
-    if (result.count)
-      await this.db.capacityWaiter.updateMany({
-        where: { AdmissionRequest: { attemptId }, state: "WAITING" },
-        data: { state: "CANCELLED", stateChangedAt: now, terminalReason: "cancelled" },
+    const cancelled = await this.#serializable(async (tx) => {
+      const request = await tx.admissionRequest.findUnique({
+        where: { attemptId },
+        include: { Waiters: true },
       });
+      if (request?.state !== "WAITING") return { count: 0, capacities: [] as string[] };
+      const capacities = [...new Set(request.Waiters.map((waiter) => waiter.capacityId))].sort();
+      for (const capacityId of capacities)
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacityId}, 0))`;
+      const result = await tx.admissionRequest.updateMany({
+        where: { id: request.id, state: "WAITING" },
+        data: { state: "CANCELLED", terminalAt: now, terminalReason: "cancelled" },
+      });
+      if (result.count)
+        await tx.capacityWaiter.updateMany({
+          where: { admissionRequestId: request.id, state: "WAITING" },
+          data: { state: "CANCELLED", stateChangedAt: now, terminalReason: "cancelled" },
+        });
+      return { count: result.count, capacities };
+    });
+    if (cancelled.count) await this.notifier?.notify(cancelled.capacities);
+    const result = cancelled;
     return result.count === 1;
   }
 
@@ -334,11 +383,23 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     });
     let reclaimed = 0;
     for (const lease of expired) {
-      const result = await this.db.capacityLease.updateMany({
-        where: { id: lease.id, fencingToken: lease.fencingToken, state: "ACTIVE" },
-        data: { state: "RECLAIMED", releasedAt: now, releaseReason: "expired" },
+      const result = await this.#serializable(async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${lease.capacityId}, 0))`;
+        const update = await tx.capacityLease.updateMany({
+          where: { id: lease.id, fencingToken: lease.fencingToken, state: "ACTIVE" },
+          data: { state: "RECLAIMED", releasedAt: now, releaseReason: "expired" },
+        });
+        if (update.count) {
+          await tx.admissionRequest.updateMany({
+            where: { id: lease.admissionRequestId, state: "ADMITTED" },
+            data: { state: "TERMINAL", terminalAt: now, terminalReason: "lease_expired" },
+          });
+          await this.#admitOne(tx, lease.capacityId, now);
+        }
+        return update;
       });
       reclaimed += result.count;
+      if (result.count) await this.notifier?.notify([lease.capacityId]);
     }
     return reclaimed;
   }

@@ -504,7 +504,7 @@ model InferenceCapacity {
   engine               String?
   cacheNamespace       String?
   schedulerCursor      Int                   @default(31)
-  schedulerDeficits    Json                  @default("{}")
+  schedulerDeficits    Json                  @default("[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]")
   schedulerVersion     Int                   @default(1)
   nextFencingToken     BigInt                @default(1)
   User                 User                  @relation("InferenceCapacityOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
@@ -552,26 +552,34 @@ model AdmissionRequest {
 }
 
 model CapacityWaiter {
-  id                 String              @id @default(cuid(2))
-  createdAt          DateTime            @default(now())
-  updatedAt          DateTime            @default(now()) @updatedAt
-  userId             String
-  admissionRequestId String
-  capacityId         String
-  executionTargetId  String
-  poolId             String?
-  poolMemberId       String?
-  candidateOrder     Int
-  state              CapacityWaiterState @default(WAITING)
-  stateChangedAt     DateTime            @default(now())
-  terminalReason     String?
-  AdmissionRequest   AdmissionRequest    @relation(fields: [admissionRequestId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  InferenceCapacity  InferenceCapacity   @relation(fields: [capacityId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
-  ExecutionTarget    ExecutionTarget     @relation(fields: [executionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ModelPool          ModelPool?          @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  PoolMember         PoolMember?         @relation(fields: [poolMemberId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  id                        String               @id @default(cuid(2))
+  createdAt                 DateTime             @default(now())
+  updatedAt                 DateTime             @default(now()) @updatedAt
+  userId                    String
+  admissionRequestId        String
+  requestId                 String               @default("")
+  attemptId                 String               @default("")
+  enqueueSequence           BigInt               @default(0)
+  capacityId                String
+  executionTargetId         String
+  poolId                    String?
+  poolMemberId              String?
+  candidateOrder            Int
+  effectivePriority         Int                  @default(16)
+  effectiveConcurrencyLimit Int?
+  effectiveReservedSlots    Int                  @default(0)
+  effectiveBorrowPolicy     CapacityBorrowPolicy @default(WHEN_IDLE)
+  state                     CapacityWaiterState  @default(WAITING)
+  stateChangedAt            DateTime             @default(now())
+  terminalReason            String?
+  AdmissionRequest          AdmissionRequest     @relation(fields: [admissionRequestId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  InferenceCapacity         InferenceCapacity    @relation(fields: [capacityId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  ExecutionTarget           ExecutionTarget      @relation(fields: [executionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ModelPool                 ModelPool?           @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  PoolMember                PoolMember?          @relation(fields: [poolMemberId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
   @@unique([admissionRequestId, candidateOrder])
+  @@unique([attemptId, candidateOrder])
   @@unique([admissionRequestId, capacityId, executionTargetId, poolMemberId])
   @@index([capacityId, state, candidateOrder])
   @@index([admissionRequestId, state])

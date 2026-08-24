@@ -3,6 +3,8 @@
 
 BEGIN;
 
+CREATE SEQUENCE IF NOT EXISTS admission_enqueue_sequence AS bigint MINVALUE 0 START 1;
+
 -- Serialize the compatibility cutover with old writers. PostgreSQL trigger DDL
 -- also takes strong table locks, but taking every participating table up front
 -- in parent-to-child order avoids observing a half-reconciled graph and gives
@@ -16,6 +18,14 @@ LOCK TABLE discovered_model, execution_target, model_pool, model_api_token,
 
 -- Capacity policy bounds are database invariants because admission correctness
 -- must not depend on every rolling-deploy writer running the same validator.
+UPDATE capacity_waiter waiter
+   SET "requestId" = request."requestId",
+       "attemptId" = request."attemptId",
+       "enqueueSequence" = request."enqueueSequence"
+  FROM admission_request request
+ WHERE request.id = waiter."admissionRequestId"
+   AND (waiter."requestId" = '' OR waiter."attemptId" = '');
+
 ALTER TABLE inference_capacity DROP CONSTRAINT IF EXISTS inference_capacity_limits_check;
 ALTER TABLE inference_capacity ADD CONSTRAINT inference_capacity_limits_check CHECK (
   ("hardConcurrencyLimit" IS NULL OR "hardConcurrencyLimit" > 0)
@@ -23,7 +33,8 @@ ALTER TABLE inference_capacity ADD CONSTRAINT inference_capacity_limits_check CH
   AND "schedulerCursor" BETWEEN 0 AND 31
   AND "schedulerVersion" > 0
   AND "nextFencingToken" > 0
-  AND jsonb_typeof("schedulerDeficits") = 'object'
+  AND ((jsonb_typeof("schedulerDeficits") = 'array' AND jsonb_array_length("schedulerDeficits") = 32)
+    OR "schedulerDeficits" = '{}'::jsonb)
 );
 
 ALTER TABLE execution_target DROP CONSTRAINT IF EXISTS execution_target_capacity_policy_check;
@@ -75,6 +86,10 @@ ALTER TABLE admission_request ADD CONSTRAINT admission_request_shape_check CHECK
 ALTER TABLE capacity_waiter DROP CONSTRAINT IF EXISTS capacity_waiter_shape_check;
 ALTER TABLE capacity_waiter ADD CONSTRAINT capacity_waiter_shape_check CHECK (
   "candidateOrder" >= 0
+  AND "enqueueSequence" >= 0
+  AND "effectivePriority" BETWEEN 0 AND 31
+  AND ("effectiveConcurrencyLimit" IS NULL OR "effectiveConcurrencyLimit" > 0)
+  AND "effectiveReservedSlots" >= 0
   AND (("poolId" IS NULL AND "poolMemberId" IS NULL)
     OR ("poolId" IS NOT NULL AND "poolMemberId" IS NOT NULL))
 );

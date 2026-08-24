@@ -14,14 +14,18 @@ export async function countContext({
   counters,
   serializedChars,
   safetyMargin = 1.2,
+  signal,
 }: {
   input: unknown;
   counters: readonly ContextCounter[];
   serializedChars: number;
   safetyMargin?: number;
+  signal?: AbortSignal;
 }): Promise<ContextCount> {
   for (const counter of counters) {
-    const result = await counter.count(input);
+    if (signal?.aborted) throw signal.reason;
+    const result = await counter.count(input, signal);
+    if (signal?.aborted) throw signal.reason;
     if (result) return validateCount(result);
   }
   if (!Number.isSafeInteger(serializedChars) || serializedChars < 0)
