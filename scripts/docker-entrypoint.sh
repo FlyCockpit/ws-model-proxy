@@ -18,6 +18,9 @@
 
 set -e
 
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+DB_PACKAGE_DIR="$SCRIPT_DIR/../packages/db"
+
 # --- 1. Required env vars ---
 missing=""
 required_vars="DATABASE_URL"
@@ -69,6 +72,8 @@ if [ "$APPLY_SCHEMA" != "off" ]; then
   LOCK_ID=1145389648
   STATUS_FILE=$(mktemp)
   echo 1 > "$STATUS_FILE"
+  HARDEN_STATUS_FILE=$(mktemp)
+  echo 0 > "$HARDEN_STATUS_FILE"
 
   echo "Acquiring schema advisory lock ($LOCK_ID)..."
   # psql holds a session-level advisory lock across the `\!` shell call that
@@ -107,12 +112,10 @@ if [ "$APPLY_SCHEMA" != "off" ]; then
   ')" || { echo "FATAL: could not parse DATABASE_URL for psql." >&2; exit 1; }
   eval "$pg_env"
 
-  HARDEN_STATUS_FILE="$(mktemp)"
   psql -v ON_ERROR_STOP=1 <<EOF
 SET lock_timeout = '300s';
 SELECT pg_advisory_lock($LOCK_ID);
-\! cd /app/packages/db && node_modules/.bin/prisma db push $push_flags; echo \$? > $STATUS_FILE
-\! cd /app/packages/db && node scripts/apply-schema-hardening.mjs; echo \$? > $HARDEN_STATUS_FILE
+\! cd "$DB_PACKAGE_DIR" && node_modules/.bin/prisma db push $push_flags; push_status=\$?; echo \$push_status > "$STATUS_FILE"; if [ "\$push_status" -eq 0 ]; then node scripts/apply-schema-hardening.mjs; echo \$? > "$HARDEN_STATUS_FILE"; fi
 SELECT pg_advisory_unlock($LOCK_ID);
 EOF
 
@@ -128,7 +131,7 @@ EOF
       echo "       If the data loss is intentional, confirm the diff and backup" >&2
       echo "       before using APPLY_SCHEMA=dangerous." >&2
     fi
-    exit 1
+    exit "$status"
   fi
   if [ "$harden_status" != "0" ]; then
     echo "FATAL: schema hardening failed after lock/deadlock retries (exit $harden_status)." >&2

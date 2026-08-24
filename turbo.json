@@ -63,6 +63,8 @@
       "inputs": [
         "prisma/schema/**/*.prisma",
         "prisma/schema-hardening.sql",
+        "../../scripts/docker-entrypoint.sh",
+        "../../scripts/test-docker-entrypoint-schema.sh",
         "scripts/verify-schema-hardening.mjs",
         "prisma.config.ts"
       ]
