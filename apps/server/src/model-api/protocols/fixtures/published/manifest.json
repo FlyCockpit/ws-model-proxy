@@ -21,6 +21,13 @@
       "source": "https://docs.anthropic.com/en/api/messages",
       "payload": "anthropic-messages-sse.json",
       "payloadSha256": "bcd7141647f1d289acd922886913b6023214a4fe4a3edc0cc7cf9cc6a5f81293"
+    },
+    {
+      "surface": "modern-nonstream",
+      "version": "Published API references retrieved 2026-08-24",
+      "source": "OpenAI Chat/Responses and Anthropic Messages references listed in payload",
+      "payload": "modern-nonstream.json",
+      "payloadSha256": "3436355573c9bb5c5f2ba7cce772681e56955c0be5fa0152fa0f5e11c706ea65"
     }
   ]
 }

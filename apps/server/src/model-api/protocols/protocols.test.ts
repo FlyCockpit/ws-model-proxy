@@ -166,7 +166,7 @@ describe("published fixture provenance", () => {
     const manifest = JSON.parse(await readFile(new URL("manifest.json", directory), "utf8")) as {
       fixtures: Array<{ payload: string; payloadSha256: string }>;
     };
-    expect(manifest.fixtures).toHaveLength(3);
+    expect(manifest.fixtures).toHaveLength(4);
     for (const fixture of manifest.fixtures) {
       const bytes = await readFile(new URL(fixture.payload, directory));
       expect(createHash("sha256").update(bytes).digest("hex")).toBe(fixture.payloadSha256);
