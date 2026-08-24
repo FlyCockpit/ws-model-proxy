@@ -137,6 +137,8 @@ const TIMED_OUT_RELOAD_ID_CAPACITY: usize = 64;
 // reactor and reqwest client for every relayed request.
 static UPSTREAM_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static UPSTREAM_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const UPSTREAM_RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn upstream_runtime() -> Result<&'static tokio::runtime::Runtime> {
     if let Some(runtime) = UPSTREAM_RUNTIME.get() {
@@ -157,6 +159,7 @@ fn upstream_http_client() -> Result<&'static reqwest::Client> {
         return Ok(client);
     }
     let client = reqwest::Client::builder()
+        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
         .build()
         .context("building shared cancellable upstream client")?;
     let _ = UPSTREAM_HTTP_CLIENT.set(client);
@@ -1348,15 +1351,10 @@ where
         ServerControlMessage::HelloOk {
             id,
             revision,
-            desired_capabilities,
+            desired_capabilities: _,
             ..
         } => {
             *last_inventory_revision = Some(revision);
-            if let Err(error) =
-                crate::protocol::persist_desired_capabilities(config, &desired_capabilities)
-            {
-                tracing::warn!(error = %error, "failed to persist desired capabilities");
-            }
             tracing::info!(id, "relay registration accepted");
         }
         ServerControlMessage::HeartbeatPong { id, .. } => {
@@ -1365,15 +1363,8 @@ where
         ServerControlMessage::InventoryOk {
             id,
             revision,
-            desired_capabilities,
+            desired_capabilities: _,
         } => {
-            let persist_desired = |config: &mut Config| {
-                if let Err(error) =
-                    crate::protocol::persist_desired_capabilities(config, &desired_capabilities)
-                {
-                    tracing::warn!(error = %error, "failed to persist desired capabilities");
-                }
-            };
             #[cfg(not(unix))]
             let _ = &id;
             #[cfg(unix)]
@@ -1391,7 +1382,6 @@ where
                         .filter(|endpoint| endpoint.enabled)
                         .count();
                     *config = candidate;
-                    persist_desired(config);
                     if let Some(pending) = pending {
                         let _ = control::respond(
                             pending,
@@ -1423,7 +1413,6 @@ where
                 config,
                 last_inventory_revision,
             ) {
-                persist_desired(config);
                 tracing::info!(id, inventory_seq = revision.inventory_seq, inventory_digest = %revision.inventory_digest, acknowledged_at = %revision.inventory_acknowledged_at, "late inventory acknowledgement resolved uncertain publish");
                 return Ok(());
             }
@@ -1441,7 +1430,6 @@ where
             {
                 *last_inventory_revision = Some(revision);
             }
-            persist_desired(config);
         }
         ServerControlMessage::InventoryError { id, message } => {
             tracing::warn!(id, message, "relay inventory rejected");
@@ -1913,7 +1901,10 @@ async fn relay_response_back(
     loop {
         let bytes = tokio::select! {
             _ = cancellation_rx.changed() => return Ok(()),
-            bytes = response.chunk() => bytes.context("reading upstream response body")?,
+            bytes = tokio::time::timeout(UPSTREAM_RESPONSE_IDLE_TIMEOUT, response.chunk()) => {
+                bytes.context("upstream response idle timeout")?
+                    .context("reading upstream response body")?
+            },
         };
         let Some(bytes) = bytes else { break };
         append_usage_tail(&mut usage_tail, &bytes);

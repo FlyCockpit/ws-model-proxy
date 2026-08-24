@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::config::{CapabilityOverrideMode, Config, EndpointConfig, OpenAiCompatibleCapabilities};
+use crate::config::{CapabilityOverrideMode, EndpointConfig, OpenAiCompatibleCapabilities};
 
 pub const RELAY_PROTOCOL_VERSION: &str = "2.3";
 pub const RELAY_SUBPROTOCOL: &str = "ws-model-proxy.relay.v2";
@@ -79,49 +79,6 @@ pub struct DesiredModelCapability {
     pub upstream_model_id: String,
     pub capability_override_mode: CapabilityOverrideMode,
     pub capabilities: OpenAiCompatibleCapabilities,
-}
-
-pub fn persist_desired_capabilities(
-    live: &mut Config,
-    desired: &[DesiredModelCapability],
-) -> Result<()> {
-    apply_desired_capabilities(live, desired);
-    if desired.is_empty() {
-        return Ok(());
-    }
-    Config::update(false, |disk| {
-        apply_desired_capabilities(disk, desired);
-        Ok(())
-    })?;
-    Ok(())
-}
-
-pub fn apply_desired_capabilities(config: &mut Config, desired: &[DesiredModelCapability]) -> bool {
-    let mut changed = false;
-    for item in desired {
-        let Some(endpoint) = config
-            .endpoints
-            .iter_mut()
-            .find(|endpoint| endpoint.slug == item.endpoint_slug)
-        else {
-            continue;
-        };
-        let Some(model) = endpoint
-            .models
-            .iter_mut()
-            .find(|model| model.upstream_model_id == item.upstream_model_id)
-        else {
-            continue;
-        };
-        if model.capability_override_mode != item.capability_override_mode
-            || model.capabilities.as_ref() != Some(&item.capabilities)
-        {
-            model.capability_override_mode = item.capability_override_mode.clone();
-            model.capabilities = Some(item.capabilities.clone());
-            changed = true;
-        }
-    }
-    changed
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

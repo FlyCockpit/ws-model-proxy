@@ -43,7 +43,7 @@ const cliOverride = {
   chatCompletions: { supported: true, vision: false },
 };
 
-function inventoryEndpoints() {
+function inventoryEndpoints({ modelOverride = true }: { modelOverride?: boolean } = {}) {
   return [
     {
       slug: "local-openai",
@@ -59,8 +59,8 @@ function inventoryEndpoints() {
         {
           slug: "llava-local",
           upstreamModelId: "llava/local",
-          capabilityOverrideMode: "override" as const,
-          capabilities: cliOverride,
+          capabilityOverrideMode: modelOverride ? ("override" as const) : ("inherit" as const),
+          ...(modelOverride ? { capabilities: cliOverride } : {}),
         },
       ],
     },
@@ -127,7 +127,7 @@ describe("capability override origin", () => {
     );
   });
 
-  it("does not let inventory overwrite a dashboard-authored override", async () => {
+  it("preserves a dashboard-authored override when the CLI inherits", async () => {
     db.discoveredModel.findUnique.mockResolvedValue({
       capabilityOverrideMode: "OVERRIDE",
       capabilityOverrideOrigin: "DASHBOARD",
@@ -135,7 +135,7 @@ describe("capability override origin", () => {
     await persistRelayRegistration({
       identity,
       cli: { slug: "desktop", label: "Desktop" },
-      endpoints: inventoryEndpoints(),
+      endpoints: inventoryEndpoints({ modelOverride: false }),
       inventoryConfirmed: true,
       endpointTargeting: true,
       now,
@@ -151,7 +151,54 @@ describe("capability override origin", () => {
     );
   });
 
-  it("returns only dashboard-authored overrides as desired capabilities", async () => {
+  it("preserves a dashboard-authored inherit choice when the CLI also inherits", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue({
+      capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+      capabilityOverrideOrigin: "DASHBOARD",
+    });
+    await persistRelayRegistration({
+      identity,
+      cli: { slug: "desktop", label: "Desktop" },
+      endpoints: inventoryEndpoints({ modelOverride: false }),
+      inventoryConfirmed: true,
+      endpointTargeting: true,
+      now,
+    });
+    expect(db.discoveredModel.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        update: expect.not.objectContaining({
+          capabilityOverrideMode: expect.anything(),
+          capabilityOverrideOrigin: expect.anything(),
+        }),
+      }),
+    );
+  });
+
+  it("lets an explicit CLI override replace a dashboard-authored override", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue({
+      capabilityOverrideMode: "OVERRIDE",
+      capabilityOverrideOrigin: "DASHBOARD",
+    });
+    await persistRelayRegistration({
+      identity,
+      cli: { slug: "desktop", label: "Desktop" },
+      endpoints: inventoryEndpoints({ modelOverride: true }),
+      inventoryConfirmed: true,
+      endpointTargeting: true,
+      now,
+    });
+    expect(db.discoveredModel.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        update: expect.objectContaining({
+          capabilityOverrideMode: "OVERRIDE",
+          capabilityOverrideOrigin: "CLI",
+          capabilityOverrideMetadata: expect.anything(),
+        }),
+      }),
+    );
+  });
+
+  it("does not send dashboard-authored state for persistence in CLI config", async () => {
     db.discoveredModel.findMany.mockResolvedValue([
       {
         upstreamModelId: "llava/local",
@@ -171,25 +218,7 @@ describe("capability override origin", () => {
       endpointTargeting: true,
       now,
     });
-    expect(db.discoveredModel.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({
-          capabilityOverrideMode: "OVERRIDE",
-          capabilityOverrideOrigin: "DASHBOARD",
-        }),
-      }),
-    );
-    expect(result.desiredCapabilities).toEqual([
-      {
-        endpointSlug: "local-openai",
-        upstreamModelId: "llava/local",
-        capabilityOverrideMode: "override",
-        capabilities: {
-          version: 1,
-          protocol: "openai-compatible",
-          chatCompletions: { supported: true, vision: true },
-        },
-      },
-    ]);
+    expect(db.discoveredModel.findMany).not.toHaveBeenCalled();
+    expect(result.desiredCapabilities).toEqual([]);
   });
 });

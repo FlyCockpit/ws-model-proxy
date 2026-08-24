@@ -51,6 +51,7 @@ import { MODEL_API_MAX_REQUEST_BODY_BYTES } from "./model-api/limits.js";
 import { openAiErrorBody } from "./model-api/openai-errors.js";
 import { createPoolMemberTestRoutes } from "./model-api/pool-member-test.js";
 import { createModelApiRoutes } from "./model-api/routes.js";
+import { transcriptionContentLengthGuard } from "./model-api/transcription-body-guard.js";
 import {
   authLimiter,
   createRateLimiterMiddleware,
@@ -153,26 +154,35 @@ app.get("/v1/files/:id", createModelApiFileGetHandler());
 // bearer-token routes: no cookie session auth, no CSRF, and no browser CORS in
 // v1. The limit is intentionally larger than the browser/RPC default because
 // OpenAI-compatible image requests can carry base64 JSON payloads.
-app.use(
-  "/v1/*",
-  bodyLimit({
-    maxSize: MODEL_API_MAX_REQUEST_BODY_BYTES,
-    onError: () =>
-      new Response(
-        JSON.stringify(
-          openAiErrorBody({
-            message: "Model API request body is too large.",
-            type: "rate_limit_error",
-            code: "request_too_large",
-          }),
-        ),
-        {
-          status: 429,
-          headers: { "content-type": "application/json; charset=utf-8" },
-        },
+for (const transcriptionPath of ["/v1/audio/transcriptions", "/v1/audio/translations"] as const) {
+  app.use(
+    transcriptionPath,
+    transcriptionContentLengthGuard(env.MODEL_API_TRANSCRIPTION_MAX_MULTIPART_BYTES),
+  );
+}
+const generalModelApiBodyLimit = bodyLimit({
+  maxSize: MODEL_API_MAX_REQUEST_BODY_BYTES,
+  onError: () =>
+    new Response(
+      JSON.stringify(
+        openAiErrorBody({
+          message: "Model API request body is too large.",
+          type: "rate_limit_error",
+          code: "request_too_large",
+        }),
       ),
-  }),
-);
+      {
+        status: 429,
+        headers: { "content-type": "application/json; charset=utf-8" },
+      },
+    ),
+});
+app.use("/v1/*", (c, next) => {
+  if (c.req.path === "/v1/audio/transcriptions" || c.req.path === "/v1/audio/translations") {
+    return next();
+  }
+  return generalModelApiBodyLimit(c, next);
+});
 app.route("/v1", createModelApiRoutes());
 
 // Same-origin guard for the cookie-authenticated media MUTATION routes (upload,

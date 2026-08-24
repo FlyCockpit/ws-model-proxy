@@ -23,5 +23,11 @@ export {
   warnIfStaleServerEnv,
 } from "./root-dotenv.ts";
 
-loadRootDotenv();
-warnIfStaleServerEnv();
+// Hermetic subprocesses (notably protocol E2E tests) can opt out explicitly so
+// a developer's root .env cannot silently alter the child process. This flag
+// is intentionally handled before environment validation and is not an app
+// configuration setting.
+if (process.env.WSMP_DISABLE_DOTENV !== "1") {
+  loadRootDotenv();
+  warnIfStaleServerEnv();
+}

@@ -4,6 +4,7 @@ import {
   type RelayServerControlMessage,
 } from "../relay/protocol.js";
 import type { ActiveRelayResponseHandlers, RelaySessionManager } from "../relay/session-manager.js";
+import type { RelayBodySource } from "./request-body-source.js";
 
 type RelayUsage = {
   promptTokens?: number;
@@ -16,6 +17,12 @@ type RelayMetrics = {
   tokenizer: "cl100k_base";
 };
 
+// The websocket relay protocol currently has request-side credits but no
+// response-side acknowledgement. Bound the Fetch response queue and cancel a
+// relay whose caller is not consuming it instead of retaining arbitrary
+// upstream output in the server heap. This is generic for every relay family.
+export const RELAY_RESPONSE_QUEUE_MAX_BYTES = 8 * 1024 * 1024;
+
 export type RelayAttemptTerminal = {
   ok: boolean;
   failure: RelayFailure | null;
@@ -23,6 +30,9 @@ export type RelayAttemptTerminal = {
   upstreamStatusCode: number | null;
   usage: RelayUsage | null;
   metrics: RelayMetrics | null;
+  responseBytes: number;
+  /** Actual request-body bytes emitted to the CLI websocket for this attempt. */
+  requestBytes: number;
 };
 
 type RelayAttemptStarted = {
@@ -105,6 +115,7 @@ export function startRelayAttempt({
   path,
   headers,
   body,
+  bodySource,
   timeoutMs,
   abortSignal,
   onResponseBodyChunk,
@@ -116,7 +127,8 @@ export function startRelayAttempt({
   method: string;
   path: string;
   headers: Headers;
-  body: Uint8Array;
+  body?: Uint8Array;
+  bodySource?: RelayBodySource;
   timeoutMs: number;
   abortSignal?: AbortSignal;
   onResponseBodyChunk?: (chunk: Uint8Array) => void;
@@ -129,24 +141,32 @@ export function startRelayAttempt({
   let terminalSettled = false;
   let headersResolved = false;
   let responseStreamCancelled = false;
+  let responseBytes = 0;
+  let requestBytes = 0;
 
-  const responseBody = new ReadableStream<Uint8Array>({
-    start(controller) {
-      responseController = controller;
+  const responseBody = new ReadableStream<Uint8Array>(
+    {
+      start(controller) {
+        responseController = controller;
+      },
+      cancel() {
+        responseStreamCancelled = true;
+        finish({
+          ok: false,
+          failure: "cancelled",
+          httpStatusCode: 499,
+          upstreamStatusCode,
+          usage: null,
+          metrics: null,
+        });
+        manager.cancelRelayRequest({ cliDeviceId, requestId, reason: "cancelled" });
+      },
     },
-    cancel() {
-      responseStreamCancelled = true;
-      finish({
-        ok: false,
-        failure: "cancelled",
-        httpStatusCode: 499,
-        upstreamStatusCode,
-        usage: null,
-        metrics: null,
-      });
-      manager.cancelRelayRequest({ cliDeviceId, requestId, reason: "cancelled" });
+    {
+      highWaterMark: RELAY_RESPONSE_QUEUE_MAX_BYTES,
+      size: (chunk) => chunk.byteLength,
     },
-  });
+  );
 
   const timeout = setTimeout(() => {
     manager.cancelRelayRequest({ cliDeviceId, requestId, reason: "timeout" });
@@ -173,7 +193,7 @@ export function startRelayAttempt({
   };
   abortSignal?.addEventListener("abort", abort, { once: true });
 
-  function finish(result: RelayAttemptTerminal) {
+  function finish(result: Omit<RelayAttemptTerminal, "responseBytes" | "requestBytes">) {
     if (terminalSettled) return;
     terminalSettled = true;
     clearTimeout(timeout);
@@ -185,10 +205,13 @@ export function startRelayAttempt({
       started.reject(new Error(result.failure ?? "unknown"));
       responseController?.error(new Error(result.failure ?? "unknown"));
     }
-    terminal.resolve(result);
+    terminal.resolve({ ...result, responseBytes, requestBytes });
   }
 
   const handlers: ActiveRelayResponseHandlers = {
+    onRequestBodySent(byteLength) {
+      if (!terminalSettled) requestBytes += byteLength;
+    },
     onHeaders(message) {
       headersResolved = true;
       upstreamStatusCode = message.status;
@@ -205,6 +228,24 @@ export function startRelayAttempt({
     onBody(chunk) {
       if (terminalSettled) return;
       const bodyChunk = new Uint8Array(chunk);
+      const available = responseController?.desiredSize;
+      if (available !== null && available !== undefined && bodyChunk.byteLength > available) {
+        manager.cancelRelayRequest({ cliDeviceId, requestId, reason: "cancelled" });
+        // Headers may already have committed a 2xx response. Error the body so
+        // a slow caller observes truncation instead of receiving a clean EOF.
+        responseStreamCancelled = true;
+        responseController?.error(new Error("relay response buffer limit exceeded"));
+        finish({
+          ok: false,
+          failure: "cancelled",
+          httpStatusCode: 499,
+          upstreamStatusCode,
+          usage: null,
+          metrics: null,
+        });
+        return;
+      }
+      responseBytes += bodyChunk.byteLength;
       onResponseBodyChunk?.(bodyChunk);
       responseController?.enqueue(bodyChunk);
     },
@@ -243,6 +284,10 @@ export function startRelayAttempt({
     },
   };
 
+  if ((body === undefined) === (bodySource === undefined)) {
+    throw new Error("A relay attempt requires exactly one request body representation.");
+  }
+
   manager.registerRelayResponseHandlers({ cliDeviceId, requestId, handlers });
   try {
     manager.sendRelayRequest({
@@ -253,7 +298,8 @@ export function startRelayAttempt({
       method,
       path,
       headers,
-      bodyChunks: splitBodyChunks(body),
+      bodyChunks: body ? splitBodyChunks(body) : undefined,
+      bodySource,
       timeoutMs,
     });
   } catch (error) {

@@ -19,6 +19,34 @@ use crate::slug::validate_slug;
 
 pub const CONFIG_VERSION: u8 = 1;
 
+fn deserialize_capability_version<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let version = u8::deserialize(deserializer)?;
+    if matches!(version, 1 | 2) {
+        Ok(version)
+    } else {
+        Err(serde::de::Error::custom(
+            "capability version must be 1 or 2",
+        ))
+    }
+}
+
+fn deserialize_openai_compatible_protocol<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let protocol = String::deserialize(deserializer)?;
+    if protocol == "openai-compatible" {
+        Ok(protocol)
+    } else {
+        Err(serde::de::Error::custom(
+            "capability protocol must be openai-compatible",
+        ))
+    }
+}
+
 /// A short-lived advisory lock shared by every local config mutation.  The
 /// daemon still owns the future control-plane mutation API; this is the
 /// transitional guard that prevents a standalone command from overwriting a
@@ -202,7 +230,9 @@ pub enum ProbeStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct OpenAiCompatibleCapabilities {
+    #[serde(deserialize_with = "deserialize_capability_version")]
     pub version: u8,
+    #[serde(deserialize_with = "deserialize_openai_compatible_protocol")]
     pub protocol: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub models: Option<ModelListCapabilities>,
@@ -394,11 +424,52 @@ pub struct ResponsesCapabilities {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
+pub struct TranscriptionCapabilities {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supported: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub streaming: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_formats: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp_granularities: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diarization: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub languages: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language_detection: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multiple_language_hints: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_upload_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted_mime_types: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AudioOperationCapabilities {
+    Boolean(bool),
+    Detailed(TranscriptionCapabilities),
+}
+
+impl AudioOperationCapabilities {
+    pub fn supported(&self) -> Option<bool> {
+        match self {
+            Self::Boolean(value) => Some(*value),
+            Self::Detailed(profile) => profile.supported,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
 pub struct AudioCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub transcriptions: Option<bool>,
+    pub transcriptions: Option<AudioOperationCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub translations: Option<bool>,
+    pub translations: Option<AudioOperationCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speech: Option<bool>,
 }
@@ -600,5 +671,47 @@ mod tests {
         validate_env_name("WSMP_TOKEN").expect("valid");
         assert!(validate_env_name("1TOKEN").is_err());
         assert!(validate_env_name("TOKEN-NAME").is_err());
+    }
+
+    #[test]
+    fn reads_legacy_and_detailed_transcription_capabilities() {
+        let legacy: OpenAiCompatibleCapabilities = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "protocol": "openai-compatible",
+            "audio": { "transcriptions": true }
+        }))
+        .expect("legacy profile");
+        assert_eq!(
+            legacy
+                .audio
+                .as_ref()
+                .and_then(|audio| audio.transcriptions.as_ref())
+                .and_then(AudioOperationCapabilities::supported),
+            Some(true)
+        );
+
+        let detailed: OpenAiCompatibleCapabilities = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "protocol": "openai-compatible",
+            "audio": {
+                "transcriptions": {
+                    "supported": true,
+                    "streaming": true,
+                    "responseFormats": ["json", "verbose_json"],
+                    "timestampGranularities": ["word"]
+                }
+            }
+        }))
+        .expect("detailed profile");
+        let profile = detailed.audio.unwrap().transcriptions.unwrap();
+        assert_eq!(profile.supported(), Some(true));
+        assert!(matches!(profile, AudioOperationCapabilities::Detailed(_)));
+
+        for invalid in [
+            serde_json::json!({ "version": 3, "protocol": "openai-compatible" }),
+            serde_json::json!({ "version": 2, "protocol": "other" }),
+        ] {
+            assert!(serde_json::from_value::<OpenAiCompatibleCapabilities>(invalid).is_err());
+        }
     }
 }

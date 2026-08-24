@@ -1,6 +1,7 @@
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { parseMultipartToSpool } from "../model-api/multipart-form-data.js";
 import {
   parseRelayBinaryFrame,
   parseRelayClientControlFrame,
@@ -15,6 +16,17 @@ vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
   return { default: mockDeep() };
 });
+
+vi.mock("@ws-model-proxy/env/server", () => ({
+  env: {
+    MODEL_API_TRANSCRIPTION_MAX_UPLOAD_BYTES: 1024 * 1024,
+    MODEL_API_TRANSCRIPTION_MAX_SPOOL_BYTES: 4 * 1024 * 1024,
+    MODEL_API_TRANSCRIPTION_MAX_CONCURRENT_UPLOADS: 4,
+    MODEL_API_TRANSCRIPTION_MIN_FREE_BYTES: 0,
+    MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS: 30_000,
+    MODEL_API_TRANSCRIPTION_STALE_SPOOL_MS: 24 * 60 * 60 * 1000,
+  },
+}));
 
 const { RelaySessionManager } = await import("./session-manager.js");
 const { default: prisma } = await import("@ws-model-proxy/db");
@@ -268,6 +280,84 @@ describe("RelaySessionManager", () => {
     });
   });
 
+  it("relays a rebuilt multipart body with an exact declared size and final frame", async () => {
+    vi.useRealTimers();
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity, now });
+    await manager.handleTextFrame(socket, helloFrame(), now);
+    socket.sends.length = 0;
+
+    const incoming = new FormData();
+    incoming.append("prompt", "preserve me");
+    incoming.append("model", "public/model");
+    incoming.append(
+      "file",
+      new File([new Uint8Array([0, 255, 1, 2])], "folder/audio.wav", {
+        type: "audio/wav",
+      }),
+    );
+    const request = new Request("http://localhost/v1/audio/transcriptions", {
+      method: "POST",
+      body: incoming,
+    });
+    const contentType = request.headers.get("content-type");
+    if (!contentType) throw new Error("expected multipart content type");
+    const multipart = await parseMultipartToSpool(request, contentType);
+    const built = multipart.build("upstream/model");
+    const onRequestBodySent = vi.fn();
+    try {
+      manager.registerRelayResponseHandlers({
+        cliDeviceId: "cli-device-id",
+        requestId: "multipart-request",
+        handlers: {
+          onRequestBodySent,
+          onHeaders: vi.fn(),
+          onBody: vi.fn(),
+          onComplete: vi.fn(),
+          onError: vi.fn(),
+          onCancelled: vi.fn(),
+        },
+      });
+      manager.sendRelayRequest({
+        cliDeviceId: "cli-device-id",
+        endpointSlug: "local-openai",
+        requestId: "multipart-request",
+        family: "audio",
+        method: "POST",
+        path: "/v1/audio/transcriptions",
+        headers: { "content-type": built.contentType },
+        bodySource: built.body,
+        timeoutMs: 30_000,
+      });
+      await vi.waitFor(() => {
+        const frames = socket.sends.filter((frame) => typeof frame !== "string");
+        expect(frames.length).toBeGreaterThan(0);
+        expect(parseRelayBinaryFrame(frames.at(-1) as ArrayBuffer).metadata).toMatchObject({
+          requestId: "multipart-request",
+          final: true,
+        });
+      });
+      const parsed = socket.sends
+        .filter((frame) => typeof frame !== "string")
+        .map((frame) => parseRelayBinaryFrame(frame as ArrayBuffer));
+      const sentBytes = parsed.reduce((total, frame) => total + frame.body.byteLength, 0);
+      expect(sentBytes).toBe(built.body.size);
+      expect(onRequestBodySent.mock.calls.flat().reduce((total, value) => total + value, 0)).toBe(
+        sentBytes,
+      );
+      const relayed = Buffer.concat(parsed.map((frame) => Buffer.from(frame.body))).toString(
+        "latin1",
+      );
+      expect(relayed).toContain('name="model"\r\n\r\nupstream/model');
+      expect(relayed.indexOf('name="prompt"')).toBeLessThan(relayed.indexOf('name="model"'));
+      expect(relayed).toContain('filename="folder/audio.wav"');
+    } finally {
+      manager.completeRelayRequest("multipart-request");
+      await multipart.dispose();
+    }
+  });
+
   it("updates heartbeat timestamps and sends pong frames", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
@@ -438,6 +528,189 @@ describe("RelaySessionManager", () => {
       final: true,
     });
   });
+
+  it("announces a lazy request body before its first chunk is available", async () => {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity, now });
+    await manager.handleTextFrame(socket, helloFrame(), now);
+    socket.sends.length = 0;
+    let release: (() => void) | undefined;
+    const ready = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    manager.sendRelayRequest({
+      cliDeviceId: "cli-device-id",
+      endpointSlug: "local-openai",
+      requestId: "lazy-request-id",
+      family: "audio",
+      method: "POST",
+      path: "/v1/audio/transcriptions",
+      headers: { Accept: "text/event-stream" },
+      bodySource: {
+        size: 3,
+        async *open() {
+          await ready;
+          yield new Uint8Array([1, 2, 3]);
+        },
+      },
+      timeoutMs: 30_000,
+    });
+
+    expect(socket.sends).toHaveLength(1);
+    expect(JSON.parse(String(socket.sends[0]))).toMatchObject({
+      type: "relay.request",
+      expectBody: true,
+    });
+    release?.();
+    await vi.waitFor(() => expect(socket.sends).toHaveLength(2));
+    expect(parseRelayBinaryFrame(socket.sends[1] as ArrayBuffer).metadata.final).toBe(true);
+  });
+
+  it("rejects a lazy body that ends before its declared size", async () => {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity, now });
+    await manager.handleTextFrame(socket, helloFrame(), now);
+    const onError = vi.fn();
+    manager.registerRelayResponseHandlers({
+      cliDeviceId: "cli-device-id",
+      requestId: "short-body",
+      handlers: {
+        onHeaders: vi.fn(),
+        onBody: vi.fn(),
+        onComplete: vi.fn(),
+        onError,
+        onCancelled: vi.fn(),
+      },
+    });
+
+    manager.sendRelayRequest({
+      cliDeviceId: "cli-device-id",
+      endpointSlug: "local-openai",
+      requestId: "short-body",
+      family: "audio",
+      method: "POST",
+      path: "/v1/audio/transcriptions",
+      headers: {},
+      bodySource: {
+        size: 4,
+        async *open() {
+          yield new Uint8Array([1, 2, 3]);
+        },
+      },
+      timeoutMs: 30_000,
+    });
+
+    await vi.waitFor(() => expect(onError).toHaveBeenCalledOnce());
+    expect(onError).toHaveBeenCalledWith(
+      expect.objectContaining({ failure: "protocol_error", requestId: "short-body" }),
+    );
+  });
+
+  it("closes a lazy body iterator when the request is cancelled", async () => {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity, now });
+    await manager.handleTextFrame(socket, helloFrame(), now);
+    const closed = vi.fn();
+
+    manager.sendRelayRequest({
+      cliDeviceId: "cli-device-id",
+      endpointSlug: "local-openai",
+      requestId: "cancelled-body",
+      family: "audio",
+      method: "POST",
+      path: "/v1/audio/transcriptions",
+      headers: {},
+      bodySource: {
+        size: 10,
+        open() {
+          const iterator: AsyncIterableIterator<Uint8Array> = {
+            [Symbol.asyncIterator]() {
+              return this;
+            },
+            next: () => new Promise<IteratorResult<Uint8Array>>(() => undefined),
+            return: async () => {
+              closed();
+              return { done: true, value: undefined };
+            },
+          };
+          return iterator;
+        },
+      },
+      timeoutMs: 30_000,
+    });
+    manager.cancelRelayRequest({
+      cliDeviceId: "cli-device-id",
+      requestId: "cancelled-body",
+      reason: "cancelled",
+    });
+
+    await vi.waitFor(() => expect(closed).toHaveBeenCalledOnce());
+  });
+
+  it.each(["cancelled", "completed"] as const)(
+    "does not send a delayed lazy-body chunk after the request is %s",
+    async (terminal) => {
+      const manager = new RelaySessionManager();
+      const socket = new FakeSocket();
+      manager.acceptAuthenticatedSocket({ socket, identity, now });
+      await manager.handleTextFrame(socket, helloFrame(), now);
+      socket.sends.length = 0;
+      let resolveNext: ((result: IteratorResult<Uint8Array>) => void) | undefined;
+      const closed = vi.fn();
+
+      manager.sendRelayRequest({
+        cliDeviceId: "cli-device-id",
+        endpointSlug: "local-openai",
+        requestId: `late-${terminal}`,
+        family: "audio",
+        method: "POST",
+        path: "/v1/audio/transcriptions",
+        headers: {},
+        bodySource: {
+          size: 3,
+          open() {
+            const iterator: AsyncIterableIterator<Uint8Array> = {
+              [Symbol.asyncIterator]() {
+                return this;
+              },
+              next: () =>
+                new Promise<IteratorResult<Uint8Array>>((resolve) => {
+                  resolveNext = resolve;
+                }),
+              return: async () => {
+                closed();
+                return { done: true, value: undefined };
+              },
+            };
+            return iterator;
+          },
+        },
+        timeoutMs: 30_000,
+      });
+
+      expect(socket.sends).toHaveLength(1);
+      if (terminal === "cancelled") {
+        manager.cancelRelayRequest({
+          cliDeviceId: "cli-device-id",
+          requestId: `late-${terminal}`,
+          reason: "cancelled",
+        });
+      } else {
+        manager.completeRelayRequest(`late-${terminal}`);
+      }
+      resolveNext?.({ done: false, value: new Uint8Array([1, 2, 3]) });
+
+      await vi.waitFor(() => expect(closed).toHaveBeenCalled());
+      // Cancellation adds one control frame; completion adds none. Neither may
+      // add a binary body frame after the delayed read settles.
+      const bodyFrames = socket.sends.filter((sent) => typeof sent !== "string");
+      expect(bodyFrames).toEqual([]);
+    },
+  );
 
   it("clamps accumulated body credits to the window so over-acking cannot burst the whole body", async () => {
     const manager = new RelaySessionManager();

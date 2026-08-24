@@ -6,7 +6,7 @@ import {
   validateForwarderSlug,
 } from "@ws-model-proxy/config/forwarder-identifiers";
 import { MEDIA_ATTACHMENT_MAX_BYTES_MAX } from "@ws-model-proxy/config/media-policy";
-import prisma from "@ws-model-proxy/db";
+import prisma, { Prisma } from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
@@ -20,7 +20,10 @@ import {
 } from "../lib/model-api-token-access";
 import { poolMemberRoutingStatuses } from "../lib/model-pool-routing";
 import {
+  audioOperationSupported,
+  coarseCapabilitiesFromOpenAi,
   openAiCapabilitiesFromCoarse,
+  openAiCompatibleCapabilitiesSchema,
   resolveEffectiveCapabilityMetadata,
   supportsChatCompletions,
   transformerModalityMismatchErrors,
@@ -132,6 +135,7 @@ type DiscoveredModelRow = {
   capabilityOverrideMode: string;
   capabilityOverrides: string[];
   capabilityOverrideMetadata: unknown | null;
+  optimisticBasicTranscription: boolean;
   probeSuggestions: unknown | null;
   lastSeenAt: Date | null;
   published: boolean;
@@ -147,6 +151,7 @@ type ModelPoolRow = {
   name: string;
   description: string | null;
   maxAttachmentBytes: number | null;
+  optimisticBasicTranscription: boolean;
   transformerDiscoveredModelId: string | null;
   transformerSystemPrompt: string | null;
   transformerImages: boolean;
@@ -426,6 +431,7 @@ function serializeCliDevice(row: CliDeviceRow, now: Date) {
         capabilityOverrideMode: model.capabilityOverrideMode,
         capabilityOverrides: model.capabilityOverrides,
         capabilityOverrideMetadata: model.capabilityOverrideMetadata,
+        optimisticBasicTranscription: model.optimisticBasicTranscription,
         probeSuggestions: model.probeSuggestions,
         effectiveCapabilities: effectiveCapabilities(endpoint, model),
         lastSeenAt: model.lastSeenAt,
@@ -461,6 +467,7 @@ function serializePool(row: ModelPoolRow) {
     name: row.name,
     description: row.description,
     maxAttachmentBytes: row.maxAttachmentBytes,
+    optimisticBasicTranscription: row.optimisticBasicTranscription,
     canonicalModelId: poolModelId({ userSlug: row.User.slug, poolSlug: row.slug }),
     transformer: {
       discoveredModelId: row.transformerDiscoveredModelId,
@@ -682,6 +689,7 @@ const poolSelect = {
   name: true,
   description: true,
   maxAttachmentBytes: true,
+  optimisticBasicTranscription: true,
   transformerDiscoveredModelId: true,
   transformerSystemPrompt: true,
   transformerImages: true,
@@ -836,6 +844,7 @@ export const forwarderManagementRouter = {
                   capabilityOverrideMode: true,
                   capabilityOverrides: true,
                   capabilityOverrideMetadata: true,
+                  optimisticBasicTranscription: true,
                   probeSuggestions: true,
                   lastSeenAt: true,
                   published: true,
@@ -901,6 +910,7 @@ export const forwarderManagementRouter = {
         name: poolNameSchema,
         description: poolDescriptionSchema,
         maxAttachmentBytes: attachmentLimitSchema,
+        optimisticBasicTranscription: z.boolean().optional(),
       }),
     )
     .handler(async ({ input, context }) => {
@@ -915,6 +925,7 @@ export const forwarderManagementRouter = {
           ...(input.maxAttachmentBytes !== undefined
             ? { maxAttachmentBytes: input.maxAttachmentBytes }
             : {}),
+          optimisticBasicTranscription: input.optimisticBasicTranscription ?? false,
         },
         select: poolSelect,
       })) as ModelPoolRow;
@@ -941,6 +952,7 @@ export const forwarderManagementRouter = {
         transformerTimeoutMs: z.number().int().min(1_000).max(600_000).nullable().optional(),
         transformerMaxAssets: z.number().int().min(1).max(64).nullable().optional(),
         maxAttachmentBytes: attachmentLimitSchema,
+        optimisticBasicTranscription: z.boolean().optional(),
       }),
     )
     .handler(async ({ input, context }) => {
@@ -1041,6 +1053,9 @@ export const forwarderManagementRouter = {
             : {}),
           ...(input.maxAttachmentBytes !== undefined
             ? { maxAttachmentBytes: input.maxAttachmentBytes }
+            : {}),
+          ...(input.optimisticBasicTranscription !== undefined
+            ? { optimisticBasicTranscription: input.optimisticBasicTranscription }
             : {}),
         },
         select: poolSelect,
@@ -1217,7 +1232,11 @@ export const forwarderManagementRouter = {
       }
       if (input.vision) coarse.push("VISION_INPUT");
       if (input.video) coarse.push("VIDEO_INPUT");
-      if (input.audio || metadata.audio?.transcriptions || metadata.audio?.translations) {
+      if (
+        input.audio ||
+        audioOperationSupported(metadata.audio?.transcriptions) ||
+        audioOperationSupported(metadata.audio?.translations)
+      ) {
         coarse.push("AUDIO_INPUT");
       }
       if (metadata.audio?.speech) coarse.push("AUDIO_OUTPUT");
@@ -1234,6 +1253,61 @@ export const forwarderManagementRouter = {
         select: {
           id: true,
           capabilityOverrideMode: true,
+          capabilityOverrides: true,
+          capabilityOverrideMetadata: true,
+        },
+      });
+    }),
+
+  /**
+   * Authoritative, backend-neutral capability editor. `inherit` removes the
+   * manual model profile; `override` stores the complete validated profile.
+   * Optional booleans deliberately retain the distinction between unknown
+   * (omitted) and explicitly unsupported (`false`).
+   */
+  setDiscoveredModelCapabilityProfile: protectedProcedure
+    .input(
+      z.discriminatedUnion("mode", [
+        z.object({
+          id: idSchema,
+          mode: z.literal("inherit"),
+          optimisticBasicTranscription: z.boolean(),
+        }),
+        z.object({
+          id: idSchema,
+          mode: z.literal("override"),
+          capabilities: openAiCompatibleCapabilitiesSchema,
+          optimisticBasicTranscription: z.boolean(),
+        }),
+      ]),
+    )
+    .handler(async ({ input, context }) => {
+      const model = await prisma.discoveredModel.findUnique({
+        where: { id: input.id },
+        select: { id: true, userId: true },
+      });
+      if (!model || model.userId !== context.session.user.id) {
+        throw new ORPCError("NOT_FOUND", { message: "Discovered model not found." });
+      }
+      const override = input.mode === "override";
+      return prisma.discoveredModel.update({
+        where: { id: input.id },
+        data: {
+          capabilityOverrideMode: override ? "OVERRIDE" : "INHERIT_ENDPOINT_DEFAULTS",
+          // Dashboard ownership applies to both choices. This prevents a later
+          // inherited CLI inventory from undoing an explicit dashboard reset.
+          // A CLI model configured with an override remains authoritative.
+          capabilityOverrideOrigin: "DASHBOARD",
+          capabilityOverrides: {
+            set: override ? coarseCapabilitiesFromOpenAi(input.capabilities) : [],
+          },
+          capabilityOverrideMetadata: override ? input.capabilities : Prisma.DbNull,
+          optimisticBasicTranscription: input.optimisticBasicTranscription,
+        },
+        select: {
+          id: true,
+          capabilityOverrideMode: true,
+          capabilityOverrideOrigin: true,
           capabilityOverrides: true,
           capabilityOverrideMetadata: true,
         },

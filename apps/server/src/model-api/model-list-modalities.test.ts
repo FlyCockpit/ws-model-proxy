@@ -8,7 +8,7 @@ import {
 } from "./model-list-modalities.js";
 
 function caps(
-  partial: Partial<OpenAiCompatibleCapabilities> & {
+  partial: Partial<Omit<Extract<OpenAiCompatibleCapabilities, { version: 1 }>, "version">> & {
     chatCompletions?: OpenAiCompatibleCapabilities["chatCompletions"];
     audio?: OpenAiCompatibleCapabilities["audio"];
   },
@@ -28,6 +28,8 @@ describe("multimodalFlagsFromCapabilities", () => {
       video: false,
       audioInput: false,
       audioOutput: false,
+      audioTranscription: false,
+      audioTranslation: false,
     });
   });
 
@@ -51,18 +53,26 @@ describe("multimodalFlagsFromCapabilities", () => {
       video: true,
       audioInput: true,
       audioOutput: true,
+      audioTranscription: false,
+      audioTranslation: false,
     });
   });
 
-  it("treats transcriptions as audio input without requiring chat.audio", () => {
-    expect(
-      multimodalFlagsFromCapabilities(
-        caps({
-          chatCompletions: { supported: true },
-          audio: { transcriptions: true },
-        }),
-      ).audioInput,
-    ).toBe(true);
+  it("advertises dedicated audio operations separately from chat input_audio", () => {
+    const flags = multimodalFlagsFromCapabilities(
+      caps({
+        chatCompletions: { supported: true },
+        audio: { transcriptions: true, translations: true },
+      }),
+    );
+    expect(flags.audioInput).toBe(false);
+    expect(flags.audioTranscription).toBe(true);
+    expect(flags.audioTranslation).toBe(true);
+    const ext = openAiModelListExtensions(flags);
+    expect(ext.supports_audio_input).toBe(false);
+    expect(ext.supports_audio_transcription).toBe(true);
+    expect(ext.supports_audio_translation).toBe(true);
+    expect(ext.architecture.input_modalities).toContain("audio");
   });
 });
 
@@ -74,6 +84,8 @@ describe("openAiModelListExtensions", () => {
       video: true,
       audioInput: true,
       audioOutput: false,
+      audioTranscription: true,
+      audioTranslation: false,
     });
     expect(ext.supports_vision).toBe(true);
     expect(ext.supports_video_input).toBe(true);
@@ -83,6 +95,8 @@ describe("openAiModelListExtensions", () => {
       video_input: true,
       audio_input: true,
       audio_output: false,
+      audio_transcription: true,
+      audio_translation: false,
     });
     expect(ext.architecture.input_modalities).toEqual(["text", "image", "audio", "video"]);
     expect(ext.architecture.output_modalities).toEqual(["text"]);
@@ -103,8 +117,24 @@ describe("unionMultimodalFlags", () => {
   it("ORs pool member capabilities", () => {
     expect(
       unionMultimodalFlags([
-        { text: true, vision: true, video: false, audioInput: false, audioOutput: false },
-        { text: true, vision: false, video: true, audioInput: true, audioOutput: false },
+        {
+          text: true,
+          vision: true,
+          video: false,
+          audioInput: false,
+          audioOutput: false,
+          audioTranscription: true,
+          audioTranslation: false,
+        },
+        {
+          text: true,
+          vision: false,
+          video: true,
+          audioInput: true,
+          audioOutput: false,
+          audioTranscription: false,
+          audioTranslation: true,
+        },
       ]),
     ).toEqual({
       text: true,
@@ -112,6 +142,8 @@ describe("unionMultimodalFlags", () => {
       video: true,
       audioInput: true,
       audioOutput: false,
+      audioTranscription: true,
+      audioTranslation: true,
     });
   });
 });

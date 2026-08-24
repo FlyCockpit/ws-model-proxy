@@ -48,6 +48,11 @@ class FakeRelayManager {
 
   sendRelayRequest(args: SendRelayRequestArgs) {
     this.sent.push(args);
+    const byteLength =
+      args.bodySource?.size ??
+      args.bodyChunks?.reduce((total, chunk) => total + chunk.byteLength, 0) ??
+      0;
+    if (byteLength > 0) this.handlers.get(args.requestId)?.onRequestBodySent?.(byteLength);
   }
 
   cancelRelayRequest(args: CancelRelayRequestArgs) {

@@ -253,6 +253,54 @@ export const ENV_VARS: EnvVar[] = [
       "for the default portless dev flow.",
     ],
   },
+  {
+    key: "MODEL_API_TRANSCRIPTION_SPOOL_DIR",
+    group: "runtime",
+    source: "default",
+    omittable: true,
+    comment: [
+      "Private temporary storage for replayable transcription uploads. Defaults to the OS temp directory.",
+    ],
+  },
+  {
+    key: "MODEL_API_TRANSCRIPTION_MAX_UPLOAD_BYTES",
+    group: "runtime",
+    source: "default",
+    default: "104857600",
+  },
+  {
+    key: "MODEL_API_TRANSCRIPTION_MAX_MULTIPART_BYTES",
+    group: "runtime",
+    source: "default",
+    default: "105906176",
+    comment: [
+      "Raw multipart cap including file data, fields, boundaries, and headers; immutable hard cap 1074790400.",
+    ],
+  },
+  {
+    key: "MODEL_API_TRANSCRIPTION_MAX_SPOOL_BYTES",
+    group: "runtime",
+    source: "default",
+    default: "1073741824",
+  },
+  {
+    key: "MODEL_API_TRANSCRIPTION_MAX_CONCURRENT_UPLOADS",
+    group: "runtime",
+    source: "default",
+    default: "4",
+  },
+  {
+    key: "MODEL_API_TRANSCRIPTION_MIN_FREE_BYTES",
+    group: "runtime",
+    source: "default",
+    default: "268435456",
+  },
+  {
+    key: "MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS",
+    group: "runtime",
+    source: "default",
+    default: "900000",
+  },
 
   // --- auth ----------------------------------------------------------------
   {

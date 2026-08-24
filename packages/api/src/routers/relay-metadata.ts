@@ -68,6 +68,10 @@ export const relayMetadataRouter = {
           httpStatusCode: true,
           upstreamStatusCode: true,
           errorClass: true,
+          operation: true,
+          requestBytes: true,
+          responseBytes: true,
+          attemptCount: true,
         },
       });
       return rows.map((row) => ({
@@ -89,6 +93,10 @@ export const relayMetadataRouter = {
         httpStatusCode: row.httpStatusCode,
         upstreamStatusCode: row.upstreamStatusCode,
         errorClass: row.errorClass,
+        operation: row.operation,
+        requestBytes: row.requestBytes,
+        responseBytes: row.responseBytes,
+        attemptCount: row.attemptCount,
       }));
     }),
 

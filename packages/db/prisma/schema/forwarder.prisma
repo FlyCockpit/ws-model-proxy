@@ -208,6 +208,8 @@ model DiscoveredModel {
   capabilityOverrides           ModelCapability[]              @default([])
   capabilityOverrideMetadata    Json?
   capabilityOverrideOrigin      ModelCapabilityOverrideOrigin?
+  /// Explicit opt-in for basic, non-streaming transcription when support is unknown.
+  optimisticBasicTranscription  Boolean                        @default(false)
   /// Optional per-model attachment cap. Null inherits the global attachment cap.
   maxAttachmentBytes            Int?
   probeSuggestions              Json?
@@ -263,6 +265,8 @@ model ModelPool {
   transformerMaxAssets           Int?
   /// Optional per-pool attachment cap. Null inherits the global attachment cap.
   maxAttachmentBytes             Int?
+  /// Permit unknown-capability members only as fallback for basic, non-streaming transcription.
+  optimisticBasicTranscription   Boolean                       @default(false)
   User                           User                          @relation("ModelPoolOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   TransformerDiscoveredModel     DiscoveredModel?              @relation("ModelPoolTransformer", fields: [transformerDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   PoolMembers                    PoolMember[]
@@ -413,6 +417,16 @@ model RelayRequest {
   transformerLatencyMs       Int?
   transformerCacheHit        Boolean?
   transformerErrorClass      String?
+  /// Protocol operation only; never stores prompts, filenames, audio, or transcripts.
+  operation                  String?
+  /// Sum of rebuilt upstream request-body bytes across all relay attempts.
+  /// Includes multipart boundaries/headers; it is not the source audio size.
+  requestBytes               Int?
+  /// Sum of upstream response-body bytes received across all relay attempts,
+  /// including retryable failed attempts, counted without retaining content.
+  responseBytes              Int?
+  /// Number of upstream relay attempts (greater than one indicates pool retry).
+  attemptCount               Int                @default(0)
   User                       User               @relation("RelayRequestOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ModelApiToken              ModelApiToken?     @relation(fields: [modelApiTokenId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   RequestedDiscoveredModel   DiscoveredModel?   @relation("RelayRequestRequestedModel", fields: [requestedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
