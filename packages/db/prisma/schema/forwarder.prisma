@@ -104,6 +104,46 @@ enum RelayRequestStatus {
   CANCELED
 }
 
+enum CapacityCountStrategy {
+  TOKENIZER
+  TEMPLATE_AWARE
+  ENGINE_REPORTED
+  CONSERVATIVE_ESTIMATE
+}
+
+enum CapacityBorrowPolicy {
+  NEVER
+  WHEN_IDLE
+}
+
+enum AdmissionSourceKind {
+  DIRECT
+  POOL
+}
+
+enum AdmissionRequestState {
+  WAITING
+  ADMITTED
+  CANCELLED
+  EXPIRED
+  TERMINAL
+}
+
+enum CapacityWaiterState {
+  WAITING
+  ADMITTED
+  CANCELLED
+  EXPIRED
+  INCOMPATIBLE
+}
+
+enum CapacityLeaseState {
+  ACTIVE
+  RELEASED
+  EXPIRED
+  RECLAIMED
+}
+
 model CliDevice {
   id                      String                @id @default(cuid(2))
   createdAt               DateTime              @default(now())
@@ -310,19 +350,32 @@ model ExecutionTarget {
   kind                   ExecutionTargetKind
   discoveredModelId      String?                       @unique
   providerModelId        String?                       @unique
+  inferenceCapacityId    String?
+  /// Direct requests participate in the same 0..31 scheduler as pool traffic.
+  directPriority         Int                           @default(16)
+  directConcurrencyLimit Int?
+  directReservedSlots    Int                           @default(0)
+  directBorrowPolicy     CapacityBorrowPolicy          @default(WHEN_IDLE)
+  directWaitBudgetMs     Int?
+  directContextCeiling   Int?
+  directContextMargin    Int                           @default(0)
   User                   User                          @relation("ExecutionTargetOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   DiscoveredModel        DiscoveredModel?              @relation(fields: [discoveredModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
   ProviderModel          ProviderModel?                @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  InferenceCapacity      InferenceCapacity?            @relation(fields: [inferenceCapacityId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
   PoolMembers            PoolMember[]
   TokenAllowlistEntries  ModelApiTokenAllowlistEntry[]
   StickinessTargets      ResponseStickinessRecord[]    @relation("ResponseStickinessTargetExecutionTarget")
   StickinessSelections   ResponseStickinessRecord[]    @relation("ResponseStickinessSelectedExecutionTarget")
   RequestedRelayRequests RelayRequest[]                @relation("RelayRequestRequestedExecutionTarget")
   SelectedRelayRequests  RelayRequest[]                @relation("RelayRequestSelectedExecutionTarget")
+  CapacityWaiters        CapacityWaiter[]
+  CapacityLeases         CapacityLease[]
 
   @@unique([discoveredModelId, userId])
   @@unique([providerModelId, userId])
   @@index([userId, kind])
+  @@index([inferenceCapacityId])
   @@map("execution_target")
 }
 
@@ -365,6 +418,13 @@ model ModelPool {
   allowLossyDeveloperRoleCollapse Boolean                       @default(false)
   /// Optional validated preferred API surface; null lets WSMP recommend one.
   recommendedSurfaceOverride      String?
+  capacityPriority                Int                           @default(16)
+  capacityConcurrencyLimit        Int?
+  capacityReservedSlots           Int                           @default(0)
+  capacityBorrowPolicy            CapacityBorrowPolicy          @default(WHEN_IDLE)
+  capacityWaitBudgetMs            Int?
+  capacityContextCeiling          Int?
+  capacityContextMargin           Int                           @default(0)
   User                            User                          @relation("ModelPoolOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   TransformerDiscoveredModel      DiscoveredModel?              @relation("ModelPoolTransformer", fields: [transformerDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   PoolMembers                     PoolMember[]
@@ -372,6 +432,9 @@ model ModelPool {
   ModelApiTokenAllowlistEntries   ModelApiTokenAllowlistEntry[]
   ResponseStickinessRecords       ResponseStickinessRecord[]
   RelayRequests                   RelayRequest[]                @relation("RelayRequestRequestedPool")
+  AdmissionRequests               AdmissionRequest[]
+  CapacityWaiters                 CapacityWaiter[]
+  CapacityLeases                  CapacityLease[]
 
   @@unique([userId, slug])
   @@index([userId])
@@ -386,6 +449,13 @@ model PoolMember {
   poolId                       String
   discoveredModelId            String?
   executionTargetId            String?
+  capacityPriority             Int                     @default(16)
+  capacityConcurrencyLimit     Int?
+  capacityReservedSlots        Int                     @default(0)
+  capacityBorrowPolicy         CapacityBorrowPolicy    @default(WHEN_IDLE)
+  capacityWaitBudgetMs         Int?
+  capacityContextCeiling       Int?
+  capacityContextMargin        Int                     @default(0)
   weight                       Int                     @default(1)
   healthStatus                 PoolMemberHealthStatus  @default(UNKNOWN)
   routingStatus                PoolMemberRoutingStatus @default(ACTIVE)
@@ -398,6 +468,8 @@ model PoolMember {
   ModelPool                    ModelPool               @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   DiscoveredModel              DiscoveredModel?        @relation(fields: [discoveredModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ExecutionTarget              ExecutionTarget?        @relation(fields: [executionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  CapacityWaiters              CapacityWaiter[]
+  CapacityLeases               CapacityLease[]
 
   @@unique([poolId, discoveredModelId])
   @@unique([poolId, executionTargetId])
@@ -406,6 +478,136 @@ model PoolMember {
   @@index([poolId, routingStatus, healthStatus])
   @@index([healthStatus, nextRetryAt])
   @@map("pool_member")
+}
+
+/// Owner-scoped physical inference capacity shared by every execution target
+/// that points at the same runtime/cache identity. Scheduler state is durable
+/// so a restart cannot reset fairness credit.
+model InferenceCapacity {
+  id                   String                @id @default(cuid(2))
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @default(now()) @updatedAt
+  userId               String
+  label                String
+  hardConcurrencyLimit Int?
+  physicalMaxContext   Int?
+  countStrategy        CapacityCountStrategy @default(CONSERVATIVE_ESTIMATE)
+  /// Stable, application-computed fingerprint for the physical runtime tuple.
+  runtimeIdentityKey   String
+  runtimeModel         String
+  runtimeRevision      String?
+  tokenizer            String?
+  tokenizerVersion     String?
+  template             String?
+  templateVersion      String?
+  engine               String?
+  cacheNamespace       String?
+  schedulerCursor      Int                   @default(31)
+  schedulerDeficits    Json                  @default("{}")
+  schedulerVersion     Int                   @default(1)
+  nextFencingToken     BigInt                @default(1)
+  User                 User                  @relation("InferenceCapacityOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ExecutionTargets     ExecutionTarget[]
+  CapacityWaiters      CapacityWaiter[]
+  CapacityLeases       CapacityLease[]
+
+  @@unique([userId, label])
+  @@unique([userId, runtimeIdentityKey])
+  @@unique([id, userId])
+  @@index([userId])
+  @@map("inference_capacity")
+}
+
+model AdmissionRequest {
+  id              String                @id @default(cuid(2))
+  createdAt       DateTime              @default(now())
+  updatedAt       DateTime              @default(now()) @updatedAt
+  userId          String
+  requestId       String
+  attemptId       String                @unique
+  sourceKind      AdmissionSourceKind
+  poolId          String?
+  basePriority    Int
+  enqueueSequence BigInt
+  enqueuedAt      DateTime              @default(now())
+  deadlineAt      DateTime?
+  connectionOwner String
+  heartbeatAt     DateTime
+  state           AdmissionRequestState @default(WAITING)
+  terminalAt      DateTime?
+  terminalReason  String?
+  User            User                  @relation("AdmissionRequestOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ModelPool       ModelPool?            @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Waiters         CapacityWaiter[]
+  Lease           CapacityLease?
+
+  @@unique([userId, requestId, attemptId])
+  @@index([userId, state, deadlineAt])
+  @@index([state, heartbeatAt])
+  @@index([basePriority, enqueueSequence, id])
+  @@map("admission_request")
+}
+
+model CapacityWaiter {
+  id                 String              @id @default(cuid(2))
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @default(now()) @updatedAt
+  userId             String
+  admissionRequestId String
+  capacityId         String
+  executionTargetId  String
+  poolId             String?
+  poolMemberId       String?
+  candidateOrder     Int
+  state              CapacityWaiterState @default(WAITING)
+  stateChangedAt     DateTime            @default(now())
+  terminalReason     String?
+  AdmissionRequest   AdmissionRequest    @relation(fields: [admissionRequestId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  InferenceCapacity  InferenceCapacity   @relation(fields: [capacityId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  ExecutionTarget    ExecutionTarget     @relation(fields: [executionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ModelPool          ModelPool?          @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  PoolMember         PoolMember?         @relation(fields: [poolMemberId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([admissionRequestId, candidateOrder])
+  @@unique([admissionRequestId, capacityId, executionTargetId, poolMemberId])
+  @@index([capacityId, state, candidateOrder])
+  @@index([admissionRequestId, state])
+  @@index([poolMemberId, state])
+  @@map("capacity_waiter")
+}
+
+model CapacityLease {
+  id                  String             @id @default(cuid(2))
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @default(now()) @updatedAt
+  userId              String
+  admissionRequestId  String             @unique
+  capacityId          String
+  executionTargetId   String
+  poolId              String?
+  poolMemberId        String?
+  priority            Int
+  reservationClass    Int
+  borrowed            Boolean            @default(false)
+  fencingToken        BigInt
+  state               CapacityLeaseState @default(ACTIVE)
+  ownerServerInstance String
+  acquiredAt          DateTime           @default(now())
+  heartbeatAt         DateTime
+  expiresAt           DateTime
+  releasedAt          DateTime?
+  releaseReason       String?
+  AdmissionRequest    AdmissionRequest   @relation(fields: [admissionRequestId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  InferenceCapacity   InferenceCapacity  @relation(fields: [capacityId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  ExecutionTarget     ExecutionTarget    @relation(fields: [executionTargetId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  ModelPool           ModelPool?         @relation(fields: [poolId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  PoolMember          PoolMember?        @relation(fields: [poolMemberId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([capacityId, fencingToken])
+  @@index([capacityId, state, expiresAt])
+  @@index([ownerServerInstance, state, heartbeatAt])
+  @@index([poolMemberId, state])
+  @@map("capacity_lease")
 }
 
 model PoolGrant {

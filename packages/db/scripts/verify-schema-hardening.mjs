@@ -6,7 +6,10 @@ import pg from "pg";
 
 const sqlPath = fileURLToPath(new URL("../prisma/schema-hardening.sql", import.meta.url));
 const packageRoot = fileURLToPath(new URL("..", import.meta.url));
-const sql = await readFile(sqlPath, "utf8");
+const [sql, forwarderSchema] = await Promise.all([
+  readFile(sqlPath, "utf8"),
+  readFile(new URL("../prisma/schema/forwarder.prisma", import.meta.url), "utf8"),
+]);
 const [packageJson, agentCompose, entrypoint, dangerousWrapper, applyScript] = await Promise.all([
   readFile(new URL("../package.json", import.meta.url), "utf8"),
   readFile(new URL("../../../docker-compose.agent.yml", import.meta.url), "utf8"),
@@ -18,6 +21,19 @@ const requiredFragments = [
   "model_pool_recommended_surface_override_check",
   'UPDATE model_pool\n   SET "recommendedSurfaceOverride" = NULL',
   "execution_target_kind_source_xor_check",
+  "inference_capacity_limits_check",
+  "execution_target_capacity_policy_check",
+  "model_pool_capacity_policy_check",
+  "pool_member_capacity_policy_check",
+  "admission_request_shape_check",
+  "capacity_waiter_shape_check",
+  "capacity_lease_shape_check",
+  "capacity_waiter_one_admitted_winner",
+  "capacity_waiter_unique_direct_candidate",
+  "capacity_lease_one_live_attempt",
+  "enforce_capacity_reference_consistency",
+  "create_execution_target_capacity",
+  "execution-target:' || target.id",
   "pg_get_constraintdef",
   'ON CONFLICT ("discoveredModelId") DO NOTHING',
   "enforce_execution_target_consumer_consistency",
@@ -32,6 +48,20 @@ const requiredFragments = [
 ];
 for (const fragment of requiredFragments) {
   if (!sql.includes(fragment)) throw new Error(`Missing schema-hardening fragment: ${fragment}`);
+}
+for (const fragment of [
+  "model InferenceCapacity",
+  "runtimeIdentityKey",
+  "schedulerDeficits",
+  "nextFencingToken",
+  "model AdmissionRequest",
+  "model CapacityWaiter",
+  "model CapacityLease",
+  "directPriority",
+  "capacityPriority",
+]) {
+  if (!forwarderSchema.includes(fragment))
+    throw new Error(`Missing capacity schema fragment: ${fragment}`);
 }
 for (const fragment of ['error?.code === "40P01"', 'error?.code === "55P03"', "maxAttempts"]) {
   if (!applyScript.includes(fragment))

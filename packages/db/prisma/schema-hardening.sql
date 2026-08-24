@@ -11,7 +11,173 @@ BEGIN;
 -- the locks is released sees the installed trigger.
 LOCK TABLE discovered_model, execution_target, model_pool, model_api_token,
   pool_member, model_api_token_allowlist_entry, response_stickiness_record,
-  relay_request IN SHARE ROW EXCLUSIVE MODE;
+  relay_request, inference_capacity, admission_request, capacity_waiter,
+  capacity_lease IN SHARE ROW EXCLUSIVE MODE;
+
+-- Capacity policy bounds are database invariants because admission correctness
+-- must not depend on every rolling-deploy writer running the same validator.
+ALTER TABLE inference_capacity DROP CONSTRAINT IF EXISTS inference_capacity_limits_check;
+ALTER TABLE inference_capacity ADD CONSTRAINT inference_capacity_limits_check CHECK (
+  ("hardConcurrencyLimit" IS NULL OR "hardConcurrencyLimit" > 0)
+  AND ("physicalMaxContext" IS NULL OR "physicalMaxContext" > 0)
+  AND "schedulerCursor" BETWEEN 0 AND 31
+  AND "schedulerVersion" > 0
+  AND "nextFencingToken" > 0
+  AND jsonb_typeof("schedulerDeficits") = 'object'
+);
+
+ALTER TABLE execution_target DROP CONSTRAINT IF EXISTS execution_target_capacity_policy_check;
+ALTER TABLE execution_target ADD CONSTRAINT execution_target_capacity_policy_check CHECK (
+  "directPriority" BETWEEN 0 AND 31
+  AND ("directConcurrencyLimit" IS NULL OR "directConcurrencyLimit" > 0)
+  AND "directReservedSlots" >= 0
+  AND ("directWaitBudgetMs" IS NULL OR "directWaitBudgetMs" >= 0)
+  AND ("directContextCeiling" IS NULL OR "directContextCeiling" > 0)
+  AND "directContextMargin" >= 0
+  AND ("directContextCeiling" IS NULL OR "directContextMargin" < "directContextCeiling")
+);
+
+ALTER TABLE model_pool DROP CONSTRAINT IF EXISTS model_pool_capacity_policy_check;
+ALTER TABLE model_pool ADD CONSTRAINT model_pool_capacity_policy_check CHECK (
+  "capacityPriority" BETWEEN 0 AND 31
+  AND ("capacityConcurrencyLimit" IS NULL OR "capacityConcurrencyLimit" > 0)
+  AND "capacityReservedSlots" >= 0
+  AND ("capacityWaitBudgetMs" IS NULL OR "capacityWaitBudgetMs" >= 0)
+  AND ("capacityContextCeiling" IS NULL OR "capacityContextCeiling" > 0)
+  AND "capacityContextMargin" >= 0
+  AND ("capacityContextCeiling" IS NULL OR "capacityContextMargin" < "capacityContextCeiling")
+);
+
+ALTER TABLE pool_member DROP CONSTRAINT IF EXISTS pool_member_capacity_policy_check;
+ALTER TABLE pool_member ADD CONSTRAINT pool_member_capacity_policy_check CHECK (
+  "capacityPriority" BETWEEN 0 AND 31
+  AND ("capacityConcurrencyLimit" IS NULL OR "capacityConcurrencyLimit" > 0)
+  AND "capacityReservedSlots" >= 0
+  AND ("capacityWaitBudgetMs" IS NULL OR "capacityWaitBudgetMs" >= 0)
+  AND ("capacityContextCeiling" IS NULL OR "capacityContextCeiling" > 0)
+  AND "capacityContextMargin" >= 0
+  AND ("capacityContextCeiling" IS NULL OR "capacityContextMargin" < "capacityContextCeiling")
+);
+
+ALTER TABLE admission_request DROP CONSTRAINT IF EXISTS admission_request_shape_check;
+ALTER TABLE admission_request ADD CONSTRAINT admission_request_shape_check CHECK (
+  "basePriority" BETWEEN 0 AND 31
+  AND "enqueueSequence" >= 0
+  AND (("sourceKind" = 'DIRECT' AND "poolId" IS NULL)
+    OR ("sourceKind" = 'POOL' AND "poolId" IS NOT NULL))
+  AND ("deadlineAt" IS NULL OR "deadlineAt" >= "enqueuedAt")
+  AND ((state = 'TERMINAL' AND "terminalAt" IS NOT NULL)
+    OR (state <> 'TERMINAL' AND "terminalAt" IS NULL))
+);
+
+ALTER TABLE capacity_waiter DROP CONSTRAINT IF EXISTS capacity_waiter_shape_check;
+ALTER TABLE capacity_waiter ADD CONSTRAINT capacity_waiter_shape_check CHECK (
+  "candidateOrder" >= 0
+  AND (("poolId" IS NULL AND "poolMemberId" IS NULL)
+    OR ("poolId" IS NOT NULL AND "poolMemberId" IS NOT NULL))
+);
+
+ALTER TABLE capacity_lease DROP CONSTRAINT IF EXISTS capacity_lease_shape_check;
+ALTER TABLE capacity_lease ADD CONSTRAINT capacity_lease_shape_check CHECK (
+  priority BETWEEN 0 AND 31
+  AND "reservationClass" BETWEEN 0 AND 31
+  AND "fencingToken" > 0
+  AND "expiresAt" > "acquiredAt"
+  AND (("poolId" IS NULL AND "poolMemberId" IS NULL)
+    OR ("poolId" IS NOT NULL AND "poolMemberId" IS NOT NULL))
+  AND ((state = 'ACTIVE' AND "releasedAt" IS NULL)
+    OR (state <> 'ACTIVE' AND "releasedAt" IS NOT NULL))
+);
+
+-- Partial indexes document and enforce the live-winner invariant even if a
+-- future archival change relaxes the stronger one-lease-per-attempt FK.
+CREATE UNIQUE INDEX IF NOT EXISTS capacity_waiter_one_admitted_winner
+  ON capacity_waiter ("admissionRequestId") WHERE state = 'ADMITTED';
+CREATE UNIQUE INDEX IF NOT EXISTS capacity_waiter_unique_direct_candidate
+  ON capacity_waiter ("admissionRequestId", "capacityId", "executionTargetId")
+  WHERE "poolMemberId" IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS capacity_lease_one_live_attempt
+  ON capacity_lease ("admissionRequestId") WHERE state = 'ACTIVE';
+
+CREATE OR REPLACE FUNCTION enforce_capacity_reference_consistency()
+RETURNS trigger LANGUAGE plpgsql AS $capacity_reference_check$
+DECLARE
+  request_owner TEXT;
+  request_pool TEXT;
+  target_owner TEXT;
+  target_capacity TEXT;
+  member_pool TEXT;
+  member_target TEXT;
+BEGIN
+  IF TG_TABLE_NAME = 'execution_target' THEN
+    IF NEW."inferenceCapacityId" IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM inference_capacity capacity
+       WHERE capacity.id = NEW."inferenceCapacityId" AND capacity."userId" = NEW."userId"
+    ) THEN
+      RAISE EXCEPTION 'execution target capacity must have the same owner'
+        USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF TG_TABLE_NAME = 'admission_request' THEN
+    IF NEW."poolId" IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM model_pool pool
+       WHERE pool.id = NEW."poolId" AND pool."userId" = NEW."userId"
+    ) THEN
+      RAISE EXCEPTION 'admission request pool must have the same owner'
+        USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  SELECT "userId", "poolId" INTO request_owner, request_pool
+    FROM admission_request WHERE id = NEW."admissionRequestId";
+  SELECT "userId", "inferenceCapacityId" INTO target_owner, target_capacity
+    FROM execution_target WHERE id = NEW."executionTargetId";
+  IF request_owner IS NULL OR request_owner <> NEW."userId"
+     OR target_owner <> NEW."userId" OR target_capacity IS DISTINCT FROM NEW."capacityId" THEN
+    RAISE EXCEPTION 'capacity admission references must share owner and physical capacity'
+      USING ERRCODE = '23514';
+  END IF;
+  IF NEW."poolMemberId" IS NOT NULL THEN
+    SELECT "poolId", "executionTargetId" INTO member_pool, member_target
+      FROM pool_member WHERE id = NEW."poolMemberId";
+    IF member_pool IS DISTINCT FROM NEW."poolId"
+       OR member_target IS DISTINCT FROM NEW."executionTargetId"
+       OR request_pool IS DISTINCT FROM NEW."poolId" THEN
+      RAISE EXCEPTION 'capacity admission pool candidate is inconsistent'
+        USING ERRCODE = '23514';
+    END IF;
+  ELSIF request_pool IS NOT NULL THEN
+    RAISE EXCEPTION 'pool admission requires a pool member candidate'
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END
+$capacity_reference_check$;
+
+DROP TRIGGER IF EXISTS execution_target_capacity_consistency ON execution_target;
+CREATE TRIGGER execution_target_capacity_consistency
+BEFORE INSERT OR UPDATE OF "userId", "inferenceCapacityId" ON execution_target
+FOR EACH ROW EXECUTE FUNCTION enforce_capacity_reference_consistency();
+
+DROP TRIGGER IF EXISTS admission_request_reference_consistency ON admission_request;
+CREATE TRIGGER admission_request_reference_consistency
+BEFORE INSERT OR UPDATE OF "userId", "sourceKind", "poolId" ON admission_request
+FOR EACH ROW EXECUTE FUNCTION enforce_capacity_reference_consistency();
+
+DROP TRIGGER IF EXISTS capacity_waiter_reference_consistency ON capacity_waiter;
+CREATE TRIGGER capacity_waiter_reference_consistency
+BEFORE INSERT OR UPDATE OF "userId", "admissionRequestId", "capacityId",
+  "executionTargetId", "poolId", "poolMemberId" ON capacity_waiter
+FOR EACH ROW EXECUTE FUNCTION enforce_capacity_reference_consistency();
+
+DROP TRIGGER IF EXISTS capacity_lease_reference_consistency ON capacity_lease;
+CREATE TRIGGER capacity_lease_reference_consistency
+BEFORE INSERT OR UPDATE OF "userId", "admissionRequestId", "capacityId",
+  "executionTargetId", "poolId", "poolMemberId" ON capacity_lease
+FOR EACH ROW EXECUTE FUNCTION enforce_capacity_reference_consistency();
 
 -- The Prisma field remains text so deployments can add future API surfaces
 -- without a PostgreSQL enum migration. Normalize legacy/out-of-band values and
@@ -147,6 +313,69 @@ SELECT
   discovered_model.id
 FROM discovered_model
 ON CONFLICT ("discoveredModelId") DO NOTHING;
+
+-- Give every pre-capacity execution target a conservative private identity.
+-- We cannot safely infer that two independently published targets share a
+-- physical engine, so the backfill intentionally creates one capacity per
+-- target. Owners can explicitly consolidate them later.
+INSERT INTO inference_capacity (
+  id, "createdAt", "updatedAt", "userId", label, "runtimeIdentityKey", "runtimeModel"
+)
+SELECT
+  'cap_' || md5(target.id), target."createdAt", NOW(), target."userId",
+  COALESCE(model."upstreamModelId", provider_model."upstreamModelId", target.id)
+    || ' (' || target.id || ')',
+  'execution-target:' || target.id,
+  COALESCE(model."upstreamModelId", provider_model."upstreamModelId", target.id)
+FROM execution_target target
+LEFT JOIN discovered_model model ON model.id = target."discoveredModelId"
+LEFT JOIN provider_model ON provider_model.id = target."providerModelId"
+WHERE target."inferenceCapacityId" IS NULL
+ON CONFLICT ("userId", "runtimeIdentityKey") DO NOTHING;
+
+UPDATE execution_target target
+   SET "inferenceCapacityId" = capacity.id
+  FROM inference_capacity capacity
+ WHERE target."inferenceCapacityId" IS NULL
+   AND capacity."userId" = target."userId"
+   AND capacity."runtimeIdentityKey" = 'execution-target:' || target.id;
+
+CREATE OR REPLACE FUNCTION create_execution_target_capacity()
+RETURNS trigger LANGUAGE plpgsql AS $create_target_capacity$
+DECLARE
+  model_name TEXT;
+  capacity_id TEXT;
+BEGIN
+  IF NEW."inferenceCapacityId" IS NOT NULL THEN
+    RETURN NEW;
+  END IF;
+  IF NEW."discoveredModelId" IS NOT NULL THEN
+    SELECT "upstreamModelId" INTO model_name FROM discovered_model
+     WHERE id = NEW."discoveredModelId";
+  ELSE
+    SELECT "upstreamModelId" INTO model_name FROM provider_model
+     WHERE id = NEW."providerModelId";
+  END IF;
+  model_name := COALESCE(model_name, NEW.id);
+  capacity_id := 'cap_' || md5(NEW.id);
+  INSERT INTO inference_capacity (
+    id, "createdAt", "updatedAt", "userId", label, "runtimeIdentityKey", "runtimeModel"
+  ) VALUES (
+    capacity_id, NEW."createdAt", NOW(), NEW."userId",
+    model_name || ' (' || NEW.id || ')',
+    'execution-target:' || NEW.id, model_name
+  ) ON CONFLICT ("userId", "runtimeIdentityKey") DO UPDATE
+    SET "updatedAt" = EXCLUDED."updatedAt"
+  RETURNING id INTO capacity_id;
+  NEW."inferenceCapacityId" := capacity_id;
+  RETURN NEW;
+END
+$create_target_capacity$;
+
+DROP TRIGGER IF EXISTS execution_target_capacity_backfill ON execution_target;
+CREATE TRIGGER execution_target_capacity_backfill
+BEFORE INSERT ON execution_target
+FOR EACH ROW EXECUTE FUNCTION create_execution_target_capacity();
 
 -- Never guess how to merge independently configured duplicate rows. Updating
 -- the legacy representation would violate the new uniqueness constraint, so
