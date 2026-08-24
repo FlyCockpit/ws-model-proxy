@@ -22,6 +22,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
 const { default: prisma } = await import("@ws-model-proxy/db");
 
 const db = prisma as unknown as {
+  $transaction: MockInstance;
   user: {
     findUnique: MockInstance;
     findFirst: MockInstance;
@@ -59,6 +60,7 @@ const db = prisma as unknown as {
     update: MockInstance;
     delete: MockInstance;
   };
+  executionTarget: { upsert: MockInstance };
   poolGrant: {
     upsert: MockInstance;
     deleteMany: MockInstance;
@@ -135,6 +137,10 @@ function poolRow(overrides: Record<string, unknown> = {}) {
 describe("forwarderManagementRouter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
+      callback(db),
+    );
+    db.executionTarget.upsert.mockResolvedValue({ id: "target-id" });
     db.appSetting.findUnique.mockResolvedValue(null);
   });
 
@@ -450,6 +456,14 @@ describe("forwarderManagementRouter", () => {
         weight: 5,
       }),
     ).resolves.toEqual({ id: "member-id" });
+    expect(db.poolMember.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        poolId: "pool-id",
+        discoveredModelId: "model-id",
+        executionTargetId: "target-id",
+      }),
+      select: { id: true },
+    });
     await expect(
       client().updatePoolMember({
         id: "member-id",

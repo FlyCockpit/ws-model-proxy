@@ -266,7 +266,11 @@ describe("modelApiTokensRouter", () => {
       ).toBe(true);
       expect(createCall.data.AllowlistEntries.create).toEqual(
         expect.arrayContaining([
-          { target: "DIRECT_MODEL", discoveredModelId: "direct-model-id" },
+          expect.objectContaining({
+            target: "DIRECT_MODEL",
+            discoveredModelId: "direct-model-id",
+            ExecutionTarget: { connect: { discoveredModelId: "direct-model-id" } },
+          }),
           { target: "MODEL_POOL", modelPoolId: "owned-pool-id" },
           { target: "MODEL_POOL", modelPoolId: "granted-pool-id" },
         ]),

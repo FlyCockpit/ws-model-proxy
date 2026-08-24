@@ -1083,14 +1083,27 @@ export const forwarderManagementRouter = {
     .handler(async ({ input, context }) => {
       await ownedPool(input.poolId, context.session.user.id);
       await ownedDiscoveredModel(input.discoveredModelId, context.session.user.id);
-      return prisma.poolMember.create({
-        data: {
-          poolId: input.poolId,
-          discoveredModelId: input.discoveredModelId,
-          weight: input.weight,
-          routingStatus: input.routingStatus,
-        },
-        select: { id: true },
+      return prisma.$transaction(async (tx) => {
+        const target = await tx.executionTarget.upsert({
+          where: { discoveredModelId: input.discoveredModelId },
+          update: {},
+          create: {
+            userId: context.session.user.id,
+            kind: "DISCOVERED_MODEL",
+            discoveredModelId: input.discoveredModelId,
+          },
+          select: { id: true },
+        });
+        return tx.poolMember.create({
+          data: {
+            poolId: input.poolId,
+            discoveredModelId: input.discoveredModelId,
+            executionTargetId: target.id,
+            weight: input.weight,
+            routingStatus: input.routingStatus,
+          },
+          select: { id: true },
+        });
       });
     }),
 

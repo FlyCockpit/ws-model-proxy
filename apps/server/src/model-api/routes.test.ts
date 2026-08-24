@@ -49,6 +49,7 @@ type SendRelayRequestArgs = Parameters<RelaySessionManager["sendRelayRequest"]>[
 type CancelRelayRequestArgs = Parameters<RelaySessionManager["cancelRelayRequest"]>[0];
 
 const db = prisma as unknown as {
+  executionTarget: { findUnique: MockInstance };
   discoveredModel: {
     findUnique: MockInstance;
     findMany: MockInstance;
@@ -381,6 +382,7 @@ describe("model API routes", () => {
       modelPools: [poolTarget],
     });
     db.discoveredModel.findUnique.mockResolvedValue(directRow());
+    db.executionTarget.findUnique.mockResolvedValue({ id: "execution-target-id" });
     db.modelPool.findMany.mockResolvedValue([]);
     db.modelPool.findUnique.mockResolvedValue({
       transformerDiscoveredModelId: null,
@@ -1589,7 +1591,9 @@ describe("model API routes", () => {
         userId: "user-id",
         modelApiTokenId: "token-id",
         targetDiscoveredModelId: "model-id",
+        targetExecutionTargetId: "execution-target-id",
         selectedDiscoveredModelId: "model-id",
+        selectedExecutionTargetId: "execution-target-id",
       },
     });
   });

@@ -59,6 +59,7 @@
       "cache": false
     },
     "db:validate": {
+      "passThroughEnv": ["SCHEMA_VALIDATION_DATABASE_URL"],
       "inputs": [
         "prisma/schema/**/*.prisma",
         "prisma/schema-hardening.sql",

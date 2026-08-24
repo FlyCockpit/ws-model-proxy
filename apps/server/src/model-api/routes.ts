@@ -839,12 +839,19 @@ function prepareEmptyRelayRequest(request: Request): RelayRequestBuilder {
 }
 
 async function createRelayMetadata(input: RelayMetadataCreate): Promise<string> {
+  const requestedExecutionTarget = input.requestedDiscoveredModelId
+    ? await prisma.executionTarget.findUnique({
+        where: { discoveredModelId: input.requestedDiscoveredModelId },
+        select: { id: true },
+      })
+    : null;
   const row = await prisma.relayRequest.create({
     data: {
       userId: input.userId,
       modelApiTokenId: input.modelApiTokenId ?? null,
       modelApiTokenLookupPrefix: input.modelApiTokenLookupPrefix ?? null,
       requestedDiscoveredModelId: input.requestedDiscoveredModelId ?? null,
+      requestedExecutionTargetId: requestedExecutionTarget?.id ?? null,
       requestedModelPoolId: input.requestedModelPoolId ?? null,
       transformerLatencyMs: input.transformerLatencyMs ?? null,
       transformerCacheHit: input.transformerCacheHit ?? null,
@@ -880,10 +887,17 @@ function requesterFromChatTestUser(userId: string): RelayRequester {
 async function updateRelayMetadata(relayRequestId: string, update: RelayMetadataUpdate) {
   const completedAt = new Date();
   const failure = update.terminal.failure ?? update.fallbackFailure ?? null;
+  const selectedExecutionTarget = update.selectedDiscoveredModelId
+    ? await prisma.executionTarget.findUnique({
+        where: { discoveredModelId: update.selectedDiscoveredModelId },
+        select: { id: true },
+      })
+    : null;
   await prisma.relayRequest.update({
     where: { id: relayRequestId },
     data: {
       selectedDiscoveredModelId: update.selectedDiscoveredModelId ?? null,
+      selectedExecutionTargetId: selectedExecutionTarget?.id ?? null,
       status: update.status,
       completedAt,
       durationMs: Math.max(0, completedAt.getTime() - update.startedAt.getTime()),
@@ -1005,6 +1019,18 @@ async function writeResponseStickiness({
 }) {
   const routingKeyDigest = responseStickinessDigest({ requester, responseId });
   const expiresAt = new Date(Date.now() + RESPONSES_STICKINESS_TTL_MS);
+  const [targetExecutionTarget, selectedExecutionTarget] = await Promise.all([
+    targetDiscoveredModelId
+      ? prisma.executionTarget.findUnique({
+          where: { discoveredModelId: targetDiscoveredModelId },
+          select: { id: true },
+        })
+      : null,
+    prisma.executionTarget.findUnique({
+      where: { discoveredModelId: selectedDiscoveredModelId },
+      select: { id: true },
+    }),
+  ]);
   await prisma.responseStickinessRecord.upsert({
     where: {
       userId_routingKeyDigest: {
@@ -1017,15 +1043,19 @@ async function writeResponseStickiness({
       modelApiTokenId: requester.modelApiTokenId,
       routingKeyDigest,
       targetDiscoveredModelId: targetDiscoveredModelId ?? null,
+      targetExecutionTargetId: targetExecutionTarget?.id ?? null,
       targetModelPoolId: targetModelPoolId ?? null,
       selectedDiscoveredModelId,
+      selectedExecutionTargetId: selectedExecutionTarget?.id ?? null,
       expiresAt,
     },
     update: {
       modelApiTokenId: requester.modelApiTokenId,
       targetDiscoveredModelId: targetDiscoveredModelId ?? null,
+      targetExecutionTargetId: targetExecutionTarget?.id ?? null,
       targetModelPoolId: targetModelPoolId ?? null,
       selectedDiscoveredModelId,
+      selectedExecutionTargetId: selectedExecutionTarget?.id ?? null,
       expiresAt,
     },
     select: { id: true },

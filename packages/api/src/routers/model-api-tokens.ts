@@ -196,6 +196,7 @@ export const modelApiTokensRouter = {
               ...allowlistTargets.directModels.map((model) => ({
                 target: "DIRECT_MODEL" as const,
                 discoveredModelId: model.id,
+                ExecutionTarget: { connect: { discoveredModelId: model.id } },
               })),
               ...allowlistTargets.modelPools.map((pool) => ({
                 target: "MODEL_POOL" as const,

@@ -370,6 +370,16 @@ export async function persistRelayRegistration({
                 },
                 select: { id: true },
               });
+              await tx.executionTarget.upsert({
+                where: { discoveredModelId: discoveredModel.id },
+                update: { userId: identity.userId, kind: "DISCOVERED_MODEL" },
+                create: {
+                  userId: identity.userId,
+                  kind: "DISCOVERED_MODEL",
+                  discoveredModelId: discoveredModel.id,
+                },
+                select: { id: true },
+              });
               refreshedDiscoveredModelIds.push(discoveredModel.id);
             }
 

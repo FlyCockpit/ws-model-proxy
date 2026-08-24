@@ -105,4 +105,104 @@ UPDATE relay_request AS consumer
  WHERE consumer."selectedExecutionTargetId" IS NULL
    AND target."discoveredModelId" = consumer."selectedDiscoveredModelId";
 
+-- Compatibility consumers retain their legacy discovered-model columns for a
+-- rollback window. Reject cross-owner and mismatched dual writes at the DB
+-- boundary while continuing to permit nullable historical telemetry.
+CREATE OR REPLACE FUNCTION enforce_execution_target_consumer_consistency()
+RETURNS trigger LANGUAGE plpgsql AS $consumer_check$
+DECLARE
+  target_owner TEXT;
+  target_model TEXT;
+  consumer_owner TEXT;
+BEGIN
+  IF TG_TABLE_NAME = 'pool_member' THEN
+    IF NEW."executionTargetId" IS NULL THEN RETURN NEW; END IF;
+    SELECT et."userId", et."discoveredModelId", pool."userId"
+      INTO target_owner, target_model, consumer_owner
+      FROM execution_target et, model_pool pool
+     WHERE et.id = NEW."executionTargetId" AND pool.id = NEW."poolId";
+    IF target_owner IS NULL OR target_owner <> consumer_owner
+       OR target_model IS DISTINCT FROM NEW."discoveredModelId" THEN
+      RAISE EXCEPTION 'pool_member execution target must match its owner and discovered model'
+        USING ERRCODE = '23514';
+    END IF;
+  ELSIF TG_TABLE_NAME = 'model_api_token_allowlist_entry' THEN
+    IF NEW."executionTargetId" IS NULL THEN RETURN NEW; END IF;
+    SELECT et."userId", et."discoveredModelId", token."userId"
+      INTO target_owner, target_model, consumer_owner
+      FROM execution_target et, model_api_token token
+     WHERE et.id = NEW."executionTargetId" AND token.id = NEW."modelApiTokenId";
+    IF NEW.target <> 'DIRECT_MODEL'::"ModelApiTokenAllowlistTarget"
+       OR NEW."discoveredModelId" IS NULL OR target_owner IS NULL
+       OR target_owner <> consumer_owner
+       OR target_model IS DISTINCT FROM NEW."discoveredModelId" THEN
+      RAISE EXCEPTION 'allowlist execution target must match its owner and direct model'
+        USING ERRCODE = '23514';
+    END IF;
+  ELSIF TG_TABLE_NAME = 'response_stickiness_record' THEN
+    IF NEW."targetExecutionTargetId" IS NOT NULL THEN
+      SELECT "userId", "discoveredModelId" INTO target_owner, target_model
+        FROM execution_target WHERE id = NEW."targetExecutionTargetId";
+      IF target_owner IS NULL OR target_owner <> NEW."userId"
+         OR target_model IS DISTINCT FROM NEW."targetDiscoveredModelId" THEN
+        RAISE EXCEPTION 'stickiness target must match its owner and discovered model'
+          USING ERRCODE = '23514';
+      END IF;
+    END IF;
+    IF NEW."selectedExecutionTargetId" IS NOT NULL THEN
+      SELECT "userId", "discoveredModelId" INTO target_owner, target_model
+        FROM execution_target WHERE id = NEW."selectedExecutionTargetId";
+      IF target_owner IS NULL OR target_owner <> NEW."userId"
+         OR target_model IS DISTINCT FROM NEW."selectedDiscoveredModelId" THEN
+        RAISE EXCEPTION 'stickiness selection must match its owner and discovered model'
+          USING ERRCODE = '23514';
+      END IF;
+    END IF;
+  ELSIF TG_TABLE_NAME = 'relay_request' THEN
+    IF NEW."requestedExecutionTargetId" IS NOT NULL THEN
+      SELECT "userId", "discoveredModelId" INTO target_owner, target_model
+        FROM execution_target WHERE id = NEW."requestedExecutionTargetId";
+      IF target_owner IS NULL OR target_owner <> NEW."userId"
+         OR target_model IS DISTINCT FROM NEW."requestedDiscoveredModelId" THEN
+        RAISE EXCEPTION 'relay request target must match its owner and discovered model'
+          USING ERRCODE = '23514';
+      END IF;
+    END IF;
+    IF NEW."selectedExecutionTargetId" IS NOT NULL THEN
+      SELECT "userId", "discoveredModelId" INTO target_owner, target_model
+        FROM execution_target WHERE id = NEW."selectedExecutionTargetId";
+      IF target_owner IS NULL OR target_owner <> NEW."userId"
+         OR target_model IS DISTINCT FROM NEW."selectedDiscoveredModelId" THEN
+        RAISE EXCEPTION 'relay request selection must match its owner and discovered model'
+          USING ERRCODE = '23514';
+      END IF;
+    END IF;
+  END IF;
+  RETURN NEW;
+END
+$consumer_check$;
+
+DROP TRIGGER IF EXISTS pool_member_execution_target_consistency ON pool_member;
+CREATE TRIGGER pool_member_execution_target_consistency
+BEFORE INSERT OR UPDATE OF "poolId", "discoveredModelId", "executionTargetId" ON pool_member
+FOR EACH ROW EXECUTE FUNCTION enforce_execution_target_consumer_consistency();
+
+DROP TRIGGER IF EXISTS allowlist_execution_target_consistency ON model_api_token_allowlist_entry;
+CREATE TRIGGER allowlist_execution_target_consistency
+BEFORE INSERT OR UPDATE OF "modelApiTokenId", target, "discoveredModelId", "executionTargetId"
+ON model_api_token_allowlist_entry
+FOR EACH ROW EXECUTE FUNCTION enforce_execution_target_consumer_consistency();
+
+DROP TRIGGER IF EXISTS stickiness_execution_target_consistency ON response_stickiness_record;
+CREATE TRIGGER stickiness_execution_target_consistency
+BEFORE INSERT OR UPDATE OF "userId", "targetDiscoveredModelId", "targetExecutionTargetId",
+  "selectedDiscoveredModelId", "selectedExecutionTargetId" ON response_stickiness_record
+FOR EACH ROW EXECUTE FUNCTION enforce_execution_target_consumer_consistency();
+
+DROP TRIGGER IF EXISTS relay_request_execution_target_consistency ON relay_request;
+CREATE TRIGGER relay_request_execution_target_consistency
+BEFORE INSERT OR UPDATE OF "userId", "requestedDiscoveredModelId", "requestedExecutionTargetId",
+  "selectedDiscoveredModelId", "selectedExecutionTargetId" ON relay_request
+FOR EACH ROW EXECUTE FUNCTION enforce_execution_target_consumer_consistency();
+
 COMMIT;
