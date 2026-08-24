@@ -371,10 +371,12 @@ export class CanonicalStreamParser {
         events.push(
           ...this.#toolDelta(
             index,
-            typeof call.id === "string" ? call.id : `generated-call-${index}`,
+            typeof call.id === "string"
+              ? call.id
+              : (this.#itemIds.get(index) ?? `generated-call-${index}`),
             typeof fn.name === "string" ? fn.name : undefined,
             typeof fn.arguments === "string" ? fn.arguments : "",
-            typeof call.id !== "string",
+            typeof call.id !== "string" && !this.#itemIds.has(index),
           ),
         );
       }
@@ -1113,6 +1115,13 @@ function validateResponseEnvelope(response: Record<string, unknown>) {
         "invalid_response_error",
         "Responses error requires code and message strings.",
       );
+    if (error.type !== undefined && typeof error.type !== "string")
+      throw new AdapterError("invalid_response_error", "Responses error.type must be text.");
+    if (error.param !== undefined && error.param !== null && typeof error.param !== "string")
+      throw new AdapterError(
+        "invalid_response_error",
+        "Responses error.param must be text or null.",
+      );
   }
   if (response.incomplete_details !== null) {
     const details = object(response.incomplete_details, "response.incomplete_details");
@@ -1120,6 +1129,17 @@ function validateResponseEnvelope(response: Record<string, unknown>) {
     if (details.reason !== "max_output_tokens") unsupported("response.incomplete_details.reason");
   }
   if (response.usage !== null && response.usage !== undefined) usageEvent(response.usage, true);
+  if (
+    response.status === "failed" &&
+    (!Array.isArray(response.output) ||
+      response.output.length !== 0 ||
+      response.incomplete_details !== null ||
+      response.usage !== null)
+  )
+    throw new AdapterError(
+      "invalid_failed_response",
+      "Failed Responses envelopes require empty output and null incomplete/usage fields.",
+    );
 }
 
 function validateCanonicalUsage(usage: { inputTokens?: number; outputTokens?: number }) {

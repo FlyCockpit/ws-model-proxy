@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import type { CanonicalEvent } from "./canonical.js";
 import {
@@ -38,7 +39,7 @@ const responseStart = (id: string) => ({
 });
 
 describe("cycle 21 streaming closure", () => {
-  it("renders exact contiguous Responses sequence/index/output/tool/usage wire state", () => {
+  it("renders exact contiguous Responses sequence/index/output/tool/usage wire state", async () => {
     const events: CanonicalEvent[] = [
       { type: "message_start", id: "r", model: "gpt" },
       { type: "item_start", index: 4, id: "text", itemType: "text" },
@@ -53,6 +54,13 @@ describe("cycle 21 streaming closure", () => {
     ];
     const renderer = new CanonicalStreamRenderer("openai-responses");
     const payloads = events.flatMap((event) => renderer.push(event)).map(decode);
+    const fullGolden = JSON.parse(
+      await readFile(
+        new URL("./fixtures/adapter-golden/responses-full-stream-v1.json", import.meta.url),
+        "utf8",
+      ),
+    ) as string[];
+    expect(payloads).toEqual(fullGolden);
     renderer.finish();
     const parsed = payloads.map((payload) =>
       JSON.parse(payload.match(/data: (.*)\n\n/s)?.[1] ?? "{}"),

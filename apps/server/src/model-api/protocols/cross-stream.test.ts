@@ -21,6 +21,87 @@ async function chatFixtureEvents(): Promise<CanonicalEvent[]> {
 }
 
 describe("cross-protocol streaming conformance", () => {
+  it("pipes a bounded large Chat wire stream incrementally into Responses", () => {
+    const source = new CanonicalStreamParser("openai-chat", {
+      maxEventBytes: 512,
+      maxAggregateBytes: 2048,
+    });
+    const renderer = new CanonicalStreamRenderer("openai-responses", {
+      maxAggregateBytes: 2048,
+    });
+    const target = new CanonicalStreamParser("openai-responses", {
+      maxEventBytes: 2048,
+      maxAggregateBytes: 2048,
+    });
+    const targetEvents: CanonicalEvent[] = [];
+    let sourceDone = false;
+    const pipe = (wire: string) => {
+      for (const canonical of source.push(encode(wire)))
+        for (const rendered of renderer.push(canonical))
+          targetEvents.push(...target.push(rendered));
+    };
+    pipe(
+      'data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"gpt","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n',
+    );
+    for (let index = 0; index < 20; index++) {
+      pipe(
+        `data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"gpt","choices":[{"index":0,"delta":{"content":"${"x".repeat(50)}"},"finish_reason":null}]}\n\n`,
+      );
+      if (index === 0) {
+        expect(sourceDone).toBe(false);
+        expect(targetEvents.some((event) => event.type === "text_delta")).toBe(true);
+      }
+    }
+    pipe(
+      'data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"gpt","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+    );
+    pipe("data: [DONE]\n\n");
+    sourceDone = true;
+    for (const canonical of source.finish())
+      for (const rendered of renderer.push(canonical)) targetEvents.push(...target.push(rendered));
+    renderer.finish();
+    targetEvents.push(...target.finish());
+    expect(sourceDone).toBe(true);
+    expect(targetEvents.at(-1)).toEqual({ type: "complete" });
+  });
+
+  it("closes actual partial Chat tool wire through Responses with stable identity", () => {
+    const source = new CanonicalStreamParser("openai-chat");
+    const renderer = new CanonicalStreamRenderer("openai-responses");
+    const target = new CanonicalStreamParser("openai-responses");
+    const targetEvents: CanonicalEvent[] = [];
+    for (const wire of [
+      'data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"gpt","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call","type":"function","function":{"name":"lookup","arguments":"{\\"city\\":"}}]},"finish_reason":null}]}\n\n',
+      'data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"gpt","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"Paris\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n',
+      "data: [DONE]\n\n",
+    ])
+      for (const canonical of source.push(encode(wire)))
+        for (const rendered of renderer.push(canonical))
+          targetEvents.push(...target.push(rendered));
+    source.finish();
+    renderer.finish();
+    targetEvents.push(...target.finish());
+    expect(targetEvents).toContainEqual(
+      expect.objectContaining({
+        type: "tool_arguments_delta",
+        id: "call",
+        name: "lookup",
+      }),
+    );
+    expect(targetEvents).toContainEqual({ type: "item_complete", index: 0 });
+  });
+
+  it("explicitly rejects actual Chat refusal wire targeting Anthropic", () => {
+    const source = new CanonicalStreamParser("openai-chat");
+    const canonical = source.push(
+      encode(
+        'data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"gpt","choices":[{"index":0,"delta":{"refusal":"no"},"finish_reason":null}]}\n\n',
+      ),
+    );
+    const renderer = new CanonicalStreamRenderer("anthropic-messages");
+    expect(() => canonical.flatMap((event) => renderer.push(event))).toThrow("initial usage");
+  });
+
   it("pins an independent literal golden for the complete empty Responses wire", () => {
     const renderer = new CanonicalStreamRenderer("openai-responses");
     const actual = [
