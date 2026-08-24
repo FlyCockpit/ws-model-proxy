@@ -185,6 +185,13 @@
       "targets": "{{count}} targets",
       "safeDefaults": "Start with one concurrent request and a context limit your runtime can reliably serve. Raise limits after observing stable load.",
       "advanced": "Advanced runtime matching",
+      "poolPolicy": "Capacity and wait policy",
+      "poolPolicyHint": "Set conservative admission behavior across this pool. {{count}} shared capacities are available for member attachment.",
+      "memberPolicy": "Capacity attachment and overrides",
+      "attachment": "Shared capacity",
+      "unattached": "Not attached",
+      "borrowIdle": "Borrow only while reserved capacity is idle",
+      "borrowNever": "Never borrow reserved capacity",
       "save": "Save capacity",
       "fields": {
         "label": "Capacity name",
@@ -195,7 +202,13 @@
         "countStrategy": "Context counting",
         "runtimeRevision": "Runtime revision (optional)",
         "tokenizer": "Tokenizer (optional)",
-        "template": "Prompt template (optional)"
+        "template": "Prompt template (optional)",
+        "capacityPriority": "Priority (0–31)",
+        "capacityReservedSlots": "Private reserved slots",
+        "capacityWaitBudgetMs": "Local wait budget (ms)",
+        "capacityContextCeiling": "Context ceiling",
+        "capacityContextMargin": "Context safety margin",
+        "capacityBorrowPolicy": "Reserved capacity borrowing"
       },
       "strategies": {
         "estimate": "Conservative estimate",

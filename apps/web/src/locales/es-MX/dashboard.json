@@ -185,6 +185,13 @@
       "targets": "{{count}} destinos",
       "safeDefaults": "Comienza con una solicitud simultánea y un límite de contexto que tu runtime pueda atender de forma confiable.",
       "advanced": "Coincidencia avanzada del runtime",
+      "poolPolicy": "Política de capacidad y espera",
+      "poolPolicyHint": "Configura una admisión conservadora para este grupo. Hay {{count}} capacidades compartidas disponibles para vincular miembros.",
+      "memberPolicy": "Capacidad vinculada y ajustes",
+      "attachment": "Capacidad compartida",
+      "unattached": "Sin vincular",
+      "borrowIdle": "Tomar prestado solo cuando la capacidad reservada esté inactiva",
+      "borrowNever": "Nunca tomar prestada capacidad reservada",
       "save": "Guardar capacidad",
       "fields": {
         "label": "Nombre de capacidad",
@@ -195,7 +202,13 @@
         "countStrategy": "Conteo de contexto",
         "runtimeRevision": "Revisión del runtime (opcional)",
         "tokenizer": "Tokenizador (opcional)",
-        "template": "Plantilla de prompt (opcional)"
+        "template": "Plantilla de prompt (opcional)",
+        "capacityPriority": "Prioridad (0–31)",
+        "capacityReservedSlots": "Espacios privados reservados",
+        "capacityWaitBudgetMs": "Espera local (ms)",
+        "capacityContextCeiling": "Límite de contexto",
+        "capacityContextMargin": "Margen de seguridad de contexto",
+        "capacityBorrowPolicy": "Préstamo de capacidad reservada"
       },
       "strategies": {
         "estimate": "Estimación conservadora",

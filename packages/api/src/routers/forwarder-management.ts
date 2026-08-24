@@ -160,6 +160,13 @@ type ModelPoolRow = {
   protocolAdaptationEnabled: boolean;
   allowLossyDeveloperRoleCollapse: boolean;
   recommendedSurfaceOverride: string | null;
+  capacityPriority: number;
+  capacityConcurrencyLimit: number | null;
+  capacityReservedSlots: number;
+  capacityBorrowPolicy: string;
+  capacityWaitBudgetMs: number | null;
+  capacityContextCeiling: number | null;
+  capacityContextMargin: number;
   transformerDiscoveredModelId: string | null;
   transformerSystemPrompt: string | null;
   transformerImages: boolean;
@@ -199,8 +206,20 @@ type PoolMemberRow = {
   lastFailureAt: Date | null;
   nextRetryAt: Date | null;
   halfOpenTrialStartedAt: Date | null;
+  capacityPriority: number | null;
+  capacityConcurrencyLimit: number | null;
+  capacityReservedSlots: number | null;
+  capacityBorrowPolicy: string | null;
+  capacityWaitBudgetMs: number | null;
+  capacityContextCeiling: number | null;
+  capacityContextMargin: number | null;
   DiscoveredModel: PoolMemberModelRow | null;
-  ExecutionTarget: { kind: string; DiscoveredModel: PoolMemberModelRow | null } | null;
+  ExecutionTarget: {
+    id: string;
+    kind: string;
+    inferenceCapacityId: string | null;
+    DiscoveredModel: PoolMemberModelRow | null;
+  } | null;
 };
 
 type PoolMemberModelRow = {
@@ -537,6 +556,13 @@ function serializePool(row: ModelPoolRow) {
     protocolAdaptationEnabled: row.protocolAdaptationEnabled,
     allowLossyDeveloperRoleCollapse: row.allowLossyDeveloperRoleCollapse,
     recommendedSurfaceOverride,
+    capacityPriority: row.capacityPriority,
+    capacityConcurrencyLimit: row.capacityConcurrencyLimit,
+    capacityReservedSlots: row.capacityReservedSlots,
+    capacityBorrowPolicy: row.capacityBorrowPolicy,
+    capacityWaitBudgetMs: row.capacityWaitBudgetMs,
+    capacityContextCeiling: row.capacityContextCeiling,
+    capacityContextMargin: row.capacityContextMargin,
     compatibility: {
       recommendedSurface,
       surfaces,
@@ -571,6 +597,15 @@ function serializePool(row: ModelPoolRow) {
         createdAt: member.createdAt,
         updatedAt: member.updatedAt,
         discoveredModelId: model?.id ?? member.discoveredModelId,
+        executionTargetId: member.ExecutionTarget?.id ?? null,
+        inferenceCapacityId: member.ExecutionTarget?.inferenceCapacityId ?? null,
+        capacityPriority: member.capacityPriority,
+        capacityConcurrencyLimit: member.capacityConcurrencyLimit,
+        capacityReservedSlots: member.capacityReservedSlots,
+        capacityBorrowPolicy: member.capacityBorrowPolicy,
+        capacityWaitBudgetMs: member.capacityWaitBudgetMs,
+        capacityContextCeiling: member.capacityContextCeiling,
+        capacityContextMargin: member.capacityContextMargin,
         weight: member.weight,
         healthStatus: member.healthStatus,
         routingStatus: member.routingStatus,
@@ -772,6 +807,13 @@ const poolSelect = {
   protocolAdaptationEnabled: true,
   allowLossyDeveloperRoleCollapse: true,
   recommendedSurfaceOverride: true,
+  capacityPriority: true,
+  capacityConcurrencyLimit: true,
+  capacityReservedSlots: true,
+  capacityBorrowPolicy: true,
+  capacityWaitBudgetMs: true,
+  capacityContextCeiling: true,
+  capacityContextMargin: true,
   transformerDiscoveredModelId: true,
   transformerSystemPrompt: true,
   transformerImages: true,
@@ -807,7 +849,9 @@ const poolSelect = {
       discoveredModelId: true,
       ExecutionTarget: {
         select: {
+          id: true,
           kind: true,
+          inferenceCapacityId: true,
           DiscoveredModel: {
             select: {
               id: true,
@@ -830,6 +874,13 @@ const poolSelect = {
         },
       },
       weight: true,
+      capacityPriority: true,
+      capacityConcurrencyLimit: true,
+      capacityReservedSlots: true,
+      capacityBorrowPolicy: true,
+      capacityWaitBudgetMs: true,
+      capacityContextCeiling: true,
+      capacityContextMargin: true,
       healthStatus: true,
       routingStatus: true,
       lastFailureClass: true,

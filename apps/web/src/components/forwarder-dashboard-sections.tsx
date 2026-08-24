@@ -1006,7 +1006,11 @@ export function PoolsSection() {
                 <DialogTitle>{t("dashboard:pools.createTitle")}</DialogTitle>
                 <DialogDescription>{t("dashboard:pools.createDescription")}</DialogDescription>
               </DialogHeader>
-              <PoolForm mode="create" onSuccess={() => setCreateOpen(false)} />
+              <PoolForm
+                mode="create"
+                capacities={capacitiesData ?? []}
+                onSuccess={() => setCreateOpen(false)}
+              />
             </DialogContent>
           </Dialog>
         }
@@ -1385,6 +1389,7 @@ export function PoolsSection() {
                 mode="edit"
                 pool={editingPool}
                 directModels={directModels}
+                capacities={capacitiesData ?? []}
                 onSuccess={() => setEditingPool(null)}
               />
             ) : null}
@@ -1438,6 +1443,7 @@ export function PoolsSection() {
               mode="create"
               poolId={memberPool.id}
               directModels={directModels}
+              capacities={capacitiesData ?? []}
               onSuccess={() => setMemberPool(null)}
             />
           ) : null}
@@ -1457,6 +1463,7 @@ export function PoolsSection() {
                 mode="edit"
                 member={editingMember}
                 directModels={directModels}
+                capacities={capacitiesData ?? []}
                 onSuccess={() => setEditingMember(null)}
               />
             ) : null}
@@ -1730,11 +1737,13 @@ function PoolForm({
   pool,
   onSuccess,
   directModels = [],
+  capacities = [],
 }: {
   mode: "create" | "edit";
   pool?: ModelPool;
   onSuccess: () => void;
   directModels?: ReturnType<typeof allDirectModels>;
+  capacities?: CapacityRow[];
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
@@ -1783,6 +1792,12 @@ function PoolForm({
       "ANTHROPIC_MESSAGES",
       "OPENAI_COMPLETIONS",
     ]),
+    capacityPriority: z.number().int().min(0).max(31),
+    capacityReservedSlots: z.number().int().min(0).max(10_000),
+    capacityWaitBudgetMs: z.number().int().min(0).max(600_000),
+    capacityContextCeiling: z.number().int().min(1).max(100_000_000),
+    capacityContextMargin: z.number().int().min(0).max(100_000_000),
+    capacityBorrowPolicy: z.enum(["NEVER", "WHEN_IDLE"]),
   });
   const createPool = useMutation(
     orpc.forwarderManagement.createModelPool.mutationOptions({
@@ -1802,6 +1817,7 @@ function PoolForm({
       },
     }),
   );
+  const updatePoolPolicy = useMutation(orpc.capacityManagement.updatePoolPolicy.mutationOptions());
   const form = useForm({
     defaultValues: {
       slug: pool?.slug ?? "",
@@ -1828,6 +1844,14 @@ function PoolForm({
       protocolAdaptationEnabled: pool?.protocolAdaptationEnabled ?? false,
       allowLossyDeveloperRoleCollapse: pool?.allowLossyDeveloperRoleCollapse ?? false,
       recommendedSurfaceOverride: pool?.recommendedSurfaceOverride ?? "",
+      capacityPriority: pool?.capacityPriority ?? 16,
+      capacityReservedSlots: pool?.capacityReservedSlots ?? 0,
+      capacityWaitBudgetMs: pool?.capacityWaitBudgetMs ?? 30_000,
+      capacityContextCeiling: pool?.capacityContextCeiling ?? 32_768,
+      capacityContextMargin: pool?.capacityContextMargin ?? 1_024,
+      capacityBorrowPolicy: (pool?.capacityBorrowPolicy === "NEVER" ? "NEVER" : "WHEN_IDLE") as
+        | "NEVER"
+        | "WHEN_IDLE",
     },
     validators: { onSubmit: poolSchema },
     onSubmit: async ({ value }) => {
@@ -1890,6 +1914,17 @@ function PoolForm({
                   | "OPENAI_RESPONSES"
                   | "ANTHROPIC_MESSAGES"
                   | "OPENAI_COMPLETIONS"),
+        });
+        await updatePoolPolicy.mutateAsync({
+          modelPoolId: pool.id,
+          capacityPriority: value.capacityPriority,
+          capacityReservedSlots: value.capacityReservedSlots,
+          capacityWaitBudgetMs: value.capacityWaitBudgetMs,
+          capacityContextCeiling: value.capacityContextCeiling,
+          capacityContextMargin: value.capacityContextMargin,
+          capacityBorrowPolicy: value.capacityBorrowPolicy,
+          protocolAdaptationEnabled: value.protocolAdaptationEnabled,
+          allowLossyDeveloperRoleCollapse: value.allowLossyDeveloperRoleCollapse,
         });
       }
     },
@@ -2005,6 +2040,65 @@ function PoolForm({
           )}
         </form.Field>
       </div>
+
+      {mode === "edit" ? (
+        <details className="rounded-md border p-3">
+          <summary className="min-h-11 cursor-pointer py-2 text-sm font-medium">
+            {t("dashboard:pools.capacity.poolPolicy")}
+          </summary>
+          <p className="mb-3 text-xs text-muted-foreground">
+            {t("dashboard:pools.capacity.poolPolicyHint", { count: capacities.length })}
+          </p>
+          <div className="grid gap-4 sm:grid-cols-2">
+            {(
+              [
+                "capacityPriority",
+                "capacityReservedSlots",
+                "capacityWaitBudgetMs",
+                "capacityContextCeiling",
+                "capacityContextMargin",
+              ] as const
+            ).map((name) => (
+              <form.Field key={name} name={name}>
+                {(field) => (
+                  <div className="space-y-2">
+                    <Label htmlFor={name}>{t(`dashboard:pools.capacity.fields.${name}`)}</Label>
+                    <Input
+                      id={name}
+                      className="min-h-11"
+                      type="number"
+                      value={field.state.value}
+                      min={name === "capacityContextCeiling" ? 1 : 0}
+                      max={name === "capacityPriority" ? 31 : undefined}
+                      onChange={(event) => field.handleChange(Number(event.target.value))}
+                    />
+                  </div>
+                )}
+              </form.Field>
+            ))}
+            <form.Field name="capacityBorrowPolicy">
+              {(field) => (
+                <div className="space-y-2">
+                  <Label htmlFor="capacityBorrowPolicy">
+                    {t("dashboard:pools.capacity.fields.capacityBorrowPolicy")}
+                  </Label>
+                  <select
+                    id="capacityBorrowPolicy"
+                    className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+                    value={field.state.value}
+                    onChange={(event) =>
+                      field.handleChange(event.target.value as "NEVER" | "WHEN_IDLE")
+                    }
+                  >
+                    <option value="WHEN_IDLE">{t("dashboard:pools.capacity.borrowIdle")}</option>
+                    <option value="NEVER">{t("dashboard:pools.capacity.borrowNever")}</option>
+                  </select>
+                </div>
+              )}
+            </form.Field>
+          </div>
+        </details>
+      ) : null}
 
       <form.Field name="name">
         {(field) => (
@@ -2311,12 +2405,14 @@ function PoolMemberForm({
   poolId,
   member,
   directModels,
+  capacities,
   onSuccess,
 }: {
   mode: "create" | "edit";
   poolId?: string;
   member?: PoolMember;
   directModels: ReturnType<typeof allDirectModels>;
+  capacities: CapacityRow[];
   onSuccess: () => void;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
@@ -2325,6 +2421,13 @@ function PoolMemberForm({
   const [weight, setWeight] = useState(String(member?.weight ?? 1));
   const [routingStatus, setRoutingStatus] = useState<RoutingStatus>(() =>
     routingStatusValue(member?.routingStatus),
+  );
+  const [capacityId, setCapacityId] = useState(member?.inferenceCapacityId ?? "");
+  const [priority, setPriority] = useState(String(member?.capacityPriority ?? 16));
+  const [reservedSlots, setReservedSlots] = useState(String(member?.capacityReservedSlots ?? 0));
+  const [waitBudget, setWaitBudget] = useState(String(member?.capacityWaitBudgetMs ?? 30_000));
+  const [contextCeiling, setContextCeiling] = useState(
+    String(member?.capacityContextCeiling ?? 32_768),
   );
   const selectId = useId();
   const createMember = useMutation(
@@ -2341,22 +2444,35 @@ function PoolMemberForm({
       onSuccess: () => {
         queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:pools.memberUpdated"));
-        onSuccess();
       },
     }),
   );
+  const updateMemberPolicy = useMutation(
+    orpc.capacityManagement.updateMemberPolicy.mutationOptions(),
+  );
+  const attachCapacity = useMutation(orpc.capacityManagement.updateDirectPolicy.mutationOptions());
   const isPending = createMember.isPending || updateMember.isPending;
   const parsedWeight = Number.parseInt(weight, 10);
   const canSubmit =
     Number.isInteger(parsedWeight) &&
     parsedWeight >= 0 &&
     parsedWeight <= 10_000 &&
-    (mode === "edit" || discoveredModelId.length > 0);
+    (mode === "edit" || discoveredModelId.length > 0) &&
+    (mode !== "edit" ||
+      (Number.isInteger(Number(priority)) &&
+        Number(priority) >= 0 &&
+        Number(priority) <= 31 &&
+        Number.isInteger(Number(reservedSlots)) &&
+        Number(reservedSlots) >= 0 &&
+        Number.isInteger(Number(waitBudget)) &&
+        Number(waitBudget) >= 0 &&
+        Number.isInteger(Number(contextCeiling)) &&
+        Number(contextCeiling) > 0));
 
   return (
     <form
       className="space-y-4"
-      onSubmit={(event) => {
+      onSubmit={async (event) => {
         event.preventDefault();
         if (!canSubmit) return;
         if (mode === "create" && poolId) {
@@ -2368,7 +2484,22 @@ function PoolMemberForm({
           });
         }
         if (mode === "edit" && member) {
-          updateMember.mutate({ id: member.id, weight: parsedWeight, routingStatus });
+          await updateMember.mutateAsync({ id: member.id, weight: parsedWeight, routingStatus });
+          await updateMemberPolicy.mutateAsync({
+            poolMemberId: member.id,
+            capacityPriority: Number(priority),
+            capacityReservedSlots: Number(reservedSlots),
+            capacityWaitBudgetMs: Number(waitBudget),
+            capacityContextCeiling: Number(contextCeiling),
+          });
+          if (member.executionTargetId) {
+            await attachCapacity.mutateAsync({
+              executionTargetId: member.executionTargetId,
+              inferenceCapacityId: capacityId || null,
+            });
+          }
+          queryClient.invalidateQueries({ queryKey: orpc.capacityManagement.key() });
+          onSuccess();
         }
       }}
     >
@@ -2410,6 +2541,52 @@ function PoolMemberForm({
           autoComplete="off"
         />
       </div>
+      {mode === "edit" ? (
+        <details className="rounded-md border p-3">
+          <summary className="min-h-11 cursor-pointer py-2 text-sm font-medium">
+            {t("dashboard:pools.capacity.memberPolicy")}
+          </summary>
+          <div className="grid gap-4 pt-3 sm:grid-cols-2">
+            <div className="space-y-2 sm:col-span-2">
+              <Label htmlFor="member-capacity">{t("dashboard:pools.capacity.attachment")}</Label>
+              <select
+                id="member-capacity"
+                className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+                value={capacityId}
+                onChange={(event) => setCapacityId(event.target.value)}
+              >
+                <option value="">{t("dashboard:pools.capacity.unattached")}</option>
+                {capacities.map((capacity) => (
+                  <option key={capacity.id} value={capacity.id}>
+                    {capacity.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            {[
+              ["member-priority", priority, setPriority, "capacityPriority", 0, 31],
+              ["member-reserved", reservedSlots, setReservedSlots, "capacityReservedSlots", 0],
+              ["member-wait", waitBudget, setWaitBudget, "capacityWaitBudgetMs", 0],
+              ["member-context", contextCeiling, setContextCeiling, "capacityContextCeiling", 1],
+            ].map(([id, value, setter, label, min, max]) => (
+              <div key={String(id)} className="space-y-2">
+                <Label htmlFor={String(id)}>{t(`dashboard:pools.capacity.fields.${label}`)}</Label>
+                <Input
+                  id={String(id)}
+                  className="min-h-11"
+                  type="number"
+                  min={Number(min)}
+                  max={max == null ? undefined : Number(max)}
+                  value={String(value)}
+                  onChange={(event) =>
+                    (setter as React.Dispatch<React.SetStateAction<string>>)(event.target.value)
+                  }
+                />
+              </div>
+            ))}
+          </div>
+        </details>
+      ) : null}
       <div className="space-y-2">
         <Label>{t("dashboard:pools.routing")}</Label>
         <SegmentedControl
