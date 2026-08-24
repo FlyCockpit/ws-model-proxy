@@ -589,8 +589,14 @@ describe("model API routes", () => {
     await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
     const sent = requireSent(manager);
     manager.headers(sent.requestId, 200, { "content-type": "text/event-stream" });
+    const [firstEvent, ...remainingEvents] = responsesConformanceFixture.events;
+    if (!firstEvent) throw new Error("Expected a conformance event.");
+    manager.body(
+      sent.requestId,
+      `${firstEvent.event ? `event: ${firstEvent.event}\n` : ""}data: ${typeof firstEvent.data === "string" ? firstEvent.data : JSON.stringify(firstEvent.data)}\n\n`,
+    );
     const response = await responsePromise;
-    for (const record of responsesConformanceFixture.events) {
+    for (const record of remainingEvents) {
       manager.body(
         sent.requestId,
         `${record.event ? `event: ${record.event}\n` : ""}data: ${typeof record.data === "string" ? record.data : JSON.stringify(record.data)}\n\n`,

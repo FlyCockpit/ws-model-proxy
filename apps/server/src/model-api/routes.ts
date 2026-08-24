@@ -25,7 +25,10 @@ import {
   normalizeTranscriptionCapabilities,
   resolveEffectiveCapabilityMetadata,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
-import { resolveExecutionPath } from "@ws-model-proxy/api/lib/surface-capabilities";
+import {
+  resolveExecutionPath,
+  type SurfaceRequestRequirements,
+} from "@ws-model-proxy/api/lib/surface-capabilities";
 import prisma from "@ws-model-proxy/db";
 import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
 import { env } from "@ws-model-proxy/env/server";
@@ -924,9 +927,88 @@ function adaptedResponseBody({
   });
 }
 
+async function readAdaptedNonstreamBody({
+  body,
+  source,
+  target,
+  status,
+  headers,
+  signal,
+}: Omit<Parameters<typeof adaptedResponseBody>[0], "stream">): Promise<Uint8Array> {
+  const reader = body.getReader();
+  const abort = () => void reader.cancel(signal.reason);
+  signal.addEventListener("abort", abort, { once: true });
+  try {
+    const chunks: Uint8Array[] = [];
+    let bytes = 0;
+    while (true) {
+      if (signal.aborted) throw signal.reason;
+      const result = await reader.read();
+      if (result.done) break;
+      bytes += result.value.byteLength;
+      if (bytes > MODEL_API_MAX_REQUEST_BODY_BYTES)
+        throw new Error("adapted response exceeded bounded buffer");
+      chunks.push(result.value);
+    }
+    const merged = new Uint8Array(bytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    const parsed = JSON.parse(new TextDecoder().decode(merged)) as unknown;
+    const adapted = adaptNonstreamResponse({ source, target, body: parsed, status, headers });
+    const output = adapted.ok ? adapted.body : renderProtocolError(target, adapted.error);
+    return new TextEncoder().encode(JSON.stringify(output));
+  } finally {
+    signal.removeEventListener("abort", abort);
+    reader.releaseLock();
+  }
+}
+
+async function primeReadableStream(
+  stream: ReadableStream<Uint8Array>,
+): Promise<{ body: ReadableStream<Uint8Array>; completion: Promise<void> }> {
+  const reader = stream.getReader();
+  const first = await reader.read();
+  let pending = first.done ? null : first.value;
+  let resolveCompletion: () => void = () => undefined;
+  let rejectCompletion: (error: Error) => void = () => undefined;
+  const completion = new Promise<void>((resolve, reject) => {
+    resolveCompletion = resolve;
+    rejectCompletion = reject;
+  });
+  if (first.done) resolveCompletion();
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        if (pending) {
+          controller.enqueue(pending);
+          pending = null;
+          return;
+        }
+        const next = await reader.read();
+        if (next.done) {
+          resolveCompletion();
+          controller.close();
+        } else controller.enqueue(next.value);
+      } catch (error) {
+        rejectCompletion(error instanceof Error ? error : new Error(String(error)));
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      rejectCompletion(reason instanceof Error ? reason : new Error("adapted stream canceled"));
+      return reader.cancel(reason);
+    },
+  });
+  return { body, completion };
+}
+
 function executionPathForPoolMember(
   capabilities: OpenAiCompatibleCapabilities | null,
   operation: RelayOperation,
+  canonical?: ReturnType<typeof parseCanonicalRequest> | null,
 ) {
   const requestedSurface = requestedSurfaceForOperation(operation);
   if (!requestedSurface) return null;
@@ -940,9 +1022,22 @@ function executionPathForPoolMember(
       protocolVersion: operation.anthropicIngress?.version,
       betaFeatures: operation.anthropicIngress?.betaFeatures,
       responsesOperation: requestedSurface === "openai-responses" ? "create" : undefined,
+      ...(canonical ? canonicalRequestRequirements(canonical) : {}),
     },
     adaptationEnabled,
   });
+}
+
+function canonicalRequestRequirements(
+  request: ReturnType<typeof parseCanonicalRequest>,
+): SurfaceRequestRequirements {
+  return {
+    stream: request.stream,
+    tools: request.tools.length > 0,
+    inputImages: request.messages.some((message) =>
+      message.content.some((content) => content.type === "image"),
+    ),
+  };
 }
 
 function isEndpointConnected(row: DirectModelRelayRow, activeCliDeviceIds: Set<string>): boolean {
@@ -2008,12 +2103,6 @@ async function relayPool({
   }
 
   const members = await poolMemberRows(target.id);
-  const executionByMember = new Map(
-    members.map((member) => [
-      member.id,
-      executionPathForPoolMember(effectivePoolMemberCapabilities(member), operation),
-    ]),
-  );
   let canonicalAdaptationRequest: ReturnType<typeof parseCanonicalRequest> | null = null;
   if (operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled) {
     try {
@@ -2025,6 +2114,16 @@ async function relayPool({
       // Native members may still accept extensions outside the strict adapted subset.
     }
   }
+  const executionByMember = new Map(
+    members.map((member) => [
+      member.id,
+      executionPathForPoolMember(
+        effectivePoolMemberCapabilities(member),
+        operation,
+        canonicalAdaptationRequest,
+      ),
+    ]),
+  );
   const protocolCandidates = members.filter((member) => {
     const execution = executionByMember.get(member.id);
     if (!execution)
@@ -2256,7 +2355,7 @@ async function relayPool({
 
     try {
       const started = await attempt.started;
-      if (started.status >= 500) {
+      if (started.status >= 500 && execution?.retrySafety !== "never") {
         attempt.cancel("upstream_5xx");
         const terminal = await attempt.terminal;
         cumulativeRequestBytes += terminal.requestBytes;
@@ -2308,8 +2407,73 @@ async function relayPool({
         }
       }
 
-      const finalize = attempt.terminal
-        .then(async (terminal) => {
+      let validatedAdaptedNonstream: Uint8Array | null = null;
+      let primedAdaptedStream: ReadableStream<Uint8Array> | null = null;
+      let adaptationCompletion = Promise.resolve();
+      if (adaptedSource && operation.adaptation && !operation.stream) {
+        try {
+          validatedAdaptedNonstream = await readAdaptedNonstreamBody({
+            body: started.body,
+            source: adaptedSource,
+            target: operation.adaptation.requestedSurface,
+            status: started.status,
+            headers: started.headers,
+            signal: request.signal,
+          });
+        } catch {
+          attempt.cancel("protocol_error");
+          const terminal = await attempt.terminal;
+          cumulativeRequestBytes += terminal.requestBytes;
+          cumulativeResponseBytes += terminal.responseBytes;
+          cliLease.release();
+          if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+          finalFailure = "protocol_error";
+          await recordPoolMemberRelayFailure({
+            poolMemberId: candidate.poolMemberId,
+            failure: "protocol_error",
+          });
+          continue;
+        }
+      }
+      if (adaptedSource && operation.adaptation && operation.stream) {
+        try {
+          const primed = await primeReadableStream(
+            adaptedResponseBody({
+              body: started.body,
+              source: adaptedSource,
+              target: operation.adaptation.requestedSurface,
+              stream: true,
+              status: started.status,
+              headers: started.headers,
+              signal: request.signal,
+            }),
+          );
+          primedAdaptedStream = primed.body;
+          adaptationCompletion = primed.completion;
+        } catch {
+          attempt.cancel("protocol_error");
+          const terminal = await attempt.terminal;
+          cumulativeRequestBytes += terminal.requestBytes;
+          cumulativeResponseBytes += terminal.responseBytes;
+          cliLease.release();
+          if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+          finalFailure = "protocol_error";
+          await recordPoolMemberRelayFailure({
+            poolMemberId: candidate.poolMemberId,
+            failure: "protocol_error",
+          });
+          continue;
+        }
+      }
+
+      const finalize = Promise.allSettled([attempt.terminal, adaptationCompletion])
+        .then(async ([terminalResult, adaptationResult]) => {
+          if (terminalResult.status === "rejected") throw terminalResult.reason;
+          const upstreamTerminal = terminalResult.value;
+          const terminal: RelayAttemptTerminal =
+            adaptationResult.status === "rejected" && upstreamTerminal.ok
+              ? { ...upstreamTerminal, ok: false, failure: "protocol_error" }
+              : upstreamTerminal;
           const cumulativeTerminal = {
             ...terminal,
             requestBytes: cumulativeRequestBytes + terminal.requestBytes,
@@ -2342,26 +2506,36 @@ async function relayPool({
         .catch(metadataUpdateError);
       void finalize;
       const responseHeaders = new Headers(started.headers);
-      let responseBody = responseBodyForOperation({
-        body: started.body,
-        headers: started.headers,
-        terminal: attempt.terminal,
-        operation,
-      });
+      let responseBody = primedAdaptedStream
+        ? primedAdaptedStream
+        : validatedAdaptedNonstream
+          ? new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(validatedAdaptedNonstream as Uint8Array);
+                controller.close();
+              },
+            })
+          : responseBodyForOperation({
+              body: started.body,
+              headers: started.headers,
+              terminal: attempt.terminal,
+              operation,
+            });
       if (adaptedSource && operation.adaptation) {
         const adaptedStreaming =
           operation.stream &&
           responseHeaders.get("content-type")?.toLowerCase().startsWith("text/event-stream") ===
             true;
-        responseBody = adaptedResponseBody({
-          body: responseBody,
-          source: adaptedSource,
-          target: operation.adaptation.requestedSurface,
-          stream: adaptedStreaming,
-          status: started.status,
-          headers: responseHeaders,
-          signal: request.signal,
-        });
+        if (adaptedStreaming && !primedAdaptedStream)
+          responseBody = adaptedResponseBody({
+            body: responseBody,
+            source: adaptedSource,
+            target: operation.adaptation.requestedSurface,
+            stream: true,
+            status: started.status,
+            headers: responseHeaders,
+            signal: request.signal,
+          });
         responseHeaders.set(
           "content-type",
           adaptedStreaming ? "text/event-stream; charset=utf-8" : "application/json; charset=utf-8",
@@ -2420,6 +2594,7 @@ async function relayPool({
       if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
       const failure = terminal.failure ?? "unknown";
       finalFailure = failure;
+      if (execution?.retrySafety === "never") break;
       if (isPoolRelayFailureClass(failure) && isRetryablePoolMemberRelayFailure(failure)) {
         await recordPoolMemberRelayFailure({
           poolMemberId: candidate.poolMemberId,
