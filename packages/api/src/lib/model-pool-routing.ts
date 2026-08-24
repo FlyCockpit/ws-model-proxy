@@ -559,7 +559,13 @@ export async function resetPoolMemberHealthForDiscoveredModels(
   if (discoveredModelIds.length === 0) return;
   await prisma.poolMember.updateMany({
     where: {
-      discoveredModelId: { in: discoveredModelIds },
+      OR: [
+        {
+          executionTargetId: { not: null },
+          ExecutionTarget: { discoveredModelId: { in: discoveredModelIds } },
+        },
+        { executionTargetId: null, discoveredModelId: { in: discoveredModelIds } },
+      ],
       routingStatus: { not: "DISABLED" },
     },
     data: resetPoolMemberHealth(),
@@ -577,9 +583,16 @@ export async function markPoolMembersForCliUnavailable({
 }): Promise<void> {
   await prisma.poolMember.updateMany({
     where: {
-      DiscoveredModel: {
-        Endpoint: { cliDeviceId },
-      },
+      OR: [
+        {
+          executionTargetId: { not: null },
+          ExecutionTarget: { DiscoveredModel: { Endpoint: { cliDeviceId } } },
+        },
+        {
+          executionTargetId: null,
+          DiscoveredModel: { Endpoint: { cliDeviceId } },
+        },
+      ],
     },
     data: transitionPoolMemberHealthForCliUnavailable({ failureClass, now }),
   });

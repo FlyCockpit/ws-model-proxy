@@ -182,7 +182,7 @@ type PoolMemberRow = {
   id: string;
   createdAt: Date;
   updatedAt: Date;
-  discoveredModelId: string;
+  discoveredModelId: string | null;
   weight: number;
   healthStatus: string;
   routingStatus: string;
@@ -191,20 +191,23 @@ type PoolMemberRow = {
   lastFailureAt: Date | null;
   nextRetryAt: Date | null;
   halfOpenTrialStartedAt: Date | null;
-  DiscoveredModel: {
+  DiscoveredModel: PoolMemberModelRow | null;
+  ExecutionTarget: { kind: string; DiscoveredModel: PoolMemberModelRow | null } | null;
+};
+
+type PoolMemberModelRow = {
+  id: string;
+  upstreamModelId: string;
+  capabilityOverrideMode: string;
+  capabilityOverrides: string[];
+  capabilityOverrideMetadata: unknown | null;
+  User: { slug: string };
+  Endpoint: {
     id: string;
-    upstreamModelId: string;
-    capabilityOverrideMode: string;
-    capabilityOverrides: string[];
-    capabilityOverrideMetadata: unknown | null;
-    User: { slug: string };
-    Endpoint: {
-      id: string;
-      slug: string;
-      capabilityMetadata: unknown | null;
-      defaultCapabilities: string[];
-      CliDevice: { slug: string };
-    };
+    slug: string;
+    capabilityMetadata: unknown | null;
+    defaultCapabilities: string[];
+    CliDevice: { slug: string };
   };
 };
 
@@ -483,44 +486,49 @@ function serializePool(row: ModelPoolRow) {
       maxAssets: row.transformerMaxAssets,
       model: transformerModel,
     },
-    members: row.PoolMembers.map((member) => ({
-      id: member.id,
-      createdAt: member.createdAt,
-      updatedAt: member.updatedAt,
-      discoveredModelId: member.discoveredModelId,
-      weight: member.weight,
-      healthStatus: member.healthStatus,
-      routingStatus: member.routingStatus,
-      lastFailureClass: member.lastFailureClass,
-      consecutiveRetryableFailures: member.consecutiveRetryableFailures,
-      lastFailureAt: member.lastFailureAt,
-      nextRetryAt: member.nextRetryAt,
-      halfOpenTrialStartedAt: member.halfOpenTrialStartedAt,
-      model: {
-        id: member.DiscoveredModel.id,
-        upstreamModelId: member.DiscoveredModel.upstreamModelId,
-        canonicalModelId: directModelId({
-          userSlug: member.DiscoveredModel.User.slug,
-          cliSlug: member.DiscoveredModel.Endpoint.CliDevice.slug,
-          endpointSlug: member.DiscoveredModel.Endpoint.slug,
-          upstreamModelId: member.DiscoveredModel.upstreamModelId,
-        }),
-        endpointId: member.DiscoveredModel.Endpoint.id,
-        endpointSlug: member.DiscoveredModel.Endpoint.slug,
-        cliDeviceSlug: member.DiscoveredModel.Endpoint.CliDevice.slug,
-        supportsChat: supportsChatCompletions({
-          capabilities: resolveEffectiveCapabilityMetadata({
-            capabilityOverrideMode: member.DiscoveredModel.capabilityOverrideMode,
-            capabilityOverrideMetadata: member.DiscoveredModel.capabilityOverrideMetadata,
-            endpointCapabilityMetadata: member.DiscoveredModel.Endpoint.capabilityMetadata,
-          }),
-          coarse:
-            member.DiscoveredModel.capabilityOverrideMode === "OVERRIDE"
-              ? member.DiscoveredModel.capabilityOverrides
-              : member.DiscoveredModel.Endpoint.defaultCapabilities,
-        }),
-      },
-    })),
+    members: row.PoolMembers.map((member) => {
+      const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
+      return {
+        id: member.id,
+        createdAt: member.createdAt,
+        updatedAt: member.updatedAt,
+        discoveredModelId: model?.id ?? member.discoveredModelId,
+        weight: member.weight,
+        healthStatus: member.healthStatus,
+        routingStatus: member.routingStatus,
+        lastFailureClass: member.lastFailureClass,
+        consecutiveRetryableFailures: member.consecutiveRetryableFailures,
+        lastFailureAt: member.lastFailureAt,
+        nextRetryAt: member.nextRetryAt,
+        halfOpenTrialStartedAt: member.halfOpenTrialStartedAt,
+        model: model
+          ? {
+              id: model.id,
+              upstreamModelId: model.upstreamModelId,
+              canonicalModelId: directModelId({
+                userSlug: model.User.slug,
+                cliSlug: model.Endpoint.CliDevice.slug,
+                endpointSlug: model.Endpoint.slug,
+                upstreamModelId: model.upstreamModelId,
+              }),
+              endpointId: model.Endpoint.id,
+              endpointSlug: model.Endpoint.slug,
+              cliDeviceSlug: model.Endpoint.CliDevice.slug,
+              supportsChat: supportsChatCompletions({
+                capabilities: resolveEffectiveCapabilityMetadata({
+                  capabilityOverrideMode: model.capabilityOverrideMode,
+                  capabilityOverrideMetadata: model.capabilityOverrideMetadata,
+                  endpointCapabilityMetadata: model.Endpoint.capabilityMetadata,
+                }),
+                coarse:
+                  model.capabilityOverrideMode === "OVERRIDE"
+                    ? model.capabilityOverrides
+                    : model.Endpoint.defaultCapabilities,
+              }),
+            }
+          : null,
+      };
+    }),
     grants: row.PoolGrants.map((grant) => ({
       id: grant.id,
       createdAt: grant.createdAt,
@@ -723,6 +731,30 @@ const poolSelect = {
       createdAt: true,
       updatedAt: true,
       discoveredModelId: true,
+      ExecutionTarget: {
+        select: {
+          kind: true,
+          DiscoveredModel: {
+            select: {
+              id: true,
+              upstreamModelId: true,
+              capabilityOverrideMode: true,
+              capabilityOverrides: true,
+              capabilityOverrideMetadata: true,
+              User: { select: { slug: true } },
+              Endpoint: {
+                select: {
+                  id: true,
+                  slug: true,
+                  capabilityMetadata: true,
+                  defaultCapabilities: true,
+                  CliDevice: { select: { slug: true } },
+                },
+              },
+            },
+          },
+        },
+      },
       weight: true,
       healthStatus: true,
       routingStatus: true,

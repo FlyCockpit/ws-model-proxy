@@ -266,7 +266,13 @@ describe("RelaySessionManager", () => {
     );
     expect(db.poolMember.updateMany).toHaveBeenCalledWith({
       where: {
-        discoveredModelId: { in: ["model-id"] },
+        OR: [
+          {
+            executionTargetId: { not: null },
+            ExecutionTarget: { discoveredModelId: { in: ["model-id"] } },
+          },
+          { executionTargetId: null, discoveredModelId: { in: ["model-id"] } },
+        ],
         routingStatus: { not: "DISABLED" },
       },
       data: {
@@ -399,9 +405,16 @@ describe("RelaySessionManager", () => {
     });
     expect(db.poolMember.updateMany).toHaveBeenLastCalledWith({
       where: {
-        DiscoveredModel: {
-          Endpoint: { cliDeviceId: "cli-device-id" },
-        },
+        OR: [
+          {
+            executionTargetId: { not: null },
+            ExecutionTarget: { DiscoveredModel: { Endpoint: { cliDeviceId: "cli-device-id" } } },
+          },
+          {
+            executionTargetId: null,
+            DiscoveredModel: { Endpoint: { cliDeviceId: "cli-device-id" } },
+          },
+        ],
       },
       data: {
         healthStatus: "UNHEALTHY",
@@ -432,9 +445,16 @@ describe("RelaySessionManager", () => {
     });
     expect(db.poolMember.updateMany).toHaveBeenLastCalledWith({
       where: {
-        DiscoveredModel: {
-          Endpoint: { cliDeviceId: "cli-device-id" },
-        },
+        OR: [
+          {
+            executionTargetId: { not: null },
+            ExecutionTarget: { DiscoveredModel: { Endpoint: { cliDeviceId: "cli-device-id" } } },
+          },
+          {
+            executionTargetId: null,
+            DiscoveredModel: { Endpoint: { cliDeviceId: "cli-device-id" } },
+          },
+        ],
       },
       data: {
         healthStatus: "UNHEALTHY",

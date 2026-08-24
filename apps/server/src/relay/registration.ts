@@ -404,7 +404,18 @@ export async function persistRelayRegistration({
           if (inventoryChanged && refreshedDiscoveredModelIds.length > 0) {
             await tx.poolMember.updateMany({
               where: {
-                discoveredModelId: { in: refreshedDiscoveredModelIds },
+                OR: [
+                  {
+                    executionTargetId: { not: null },
+                    ExecutionTarget: {
+                      discoveredModelId: { in: refreshedDiscoveredModelIds },
+                    },
+                  },
+                  {
+                    executionTargetId: null,
+                    discoveredModelId: { in: refreshedDiscoveredModelIds },
+                  },
+                ],
                 routingStatus: { not: "DISABLED" },
               },
               data: resetPoolMemberHealth(),

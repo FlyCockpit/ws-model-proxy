@@ -90,6 +90,22 @@ SELECT
 FROM discovered_model
 ON CONFLICT ("discoveredModelId") DO NOTHING;
 
+-- Collapse pre-existing mixed-representation duplicates before canonicalizing
+-- legacy rows. The target-backed row is authoritative in the new model.
+DELETE FROM pool_member AS legacy
+USING execution_target AS target, pool_member AS canonical
+WHERE legacy."executionTargetId" IS NULL
+  AND legacy."discoveredModelId" = target."discoveredModelId"
+  AND canonical."poolId" = legacy."poolId"
+  AND canonical."executionTargetId" = target.id;
+
+DELETE FROM model_api_token_allowlist_entry AS legacy
+USING execution_target AS target, model_api_token_allowlist_entry AS canonical
+WHERE legacy."executionTargetId" IS NULL
+  AND legacy."discoveredModelId" = target."discoveredModelId"
+  AND canonical."modelApiTokenId" = legacy."modelApiTokenId"
+  AND canonical."executionTargetId" = target.id;
+
 UPDATE pool_member AS consumer
    SET "executionTargetId" = target.id
   FROM execution_target AS target
@@ -126,6 +142,33 @@ UPDATE relay_request AS consumer
  WHERE consumer."selectedExecutionTargetId" IS NULL
    AND target."discoveredModelId" = consumer."selectedDiscoveredModelId";
 
+-- Canonicalize compatibility writes before uniqueness and consistency checks.
+-- This closes the mixed-representation hole where one row used only the
+-- legacy model FK and another used the execution-target FK for the same model.
+CREATE OR REPLACE FUNCTION canonicalize_execution_target_consumer()
+RETURNS trigger LANGUAGE plpgsql AS $canonicalize_consumer$
+BEGIN
+  IF NEW."executionTargetId" IS NULL AND NEW."discoveredModelId" IS NOT NULL THEN
+    SELECT id INTO NEW."executionTargetId"
+      FROM execution_target
+     WHERE "discoveredModelId" = NEW."discoveredModelId";
+  END IF;
+  RETURN NEW;
+END
+$canonicalize_consumer$;
+
+DROP TRIGGER IF EXISTS a_pool_member_canonicalize_execution_target ON pool_member;
+CREATE TRIGGER a_pool_member_canonicalize_execution_target
+BEFORE INSERT OR UPDATE OF "discoveredModelId", "executionTargetId" ON pool_member
+FOR EACH ROW EXECUTE FUNCTION canonicalize_execution_target_consumer();
+
+DROP TRIGGER IF EXISTS a_allowlist_canonicalize_execution_target
+ON model_api_token_allowlist_entry;
+CREATE TRIGGER a_allowlist_canonicalize_execution_target
+BEFORE INSERT OR UPDATE OF "discoveredModelId", "executionTargetId"
+ON model_api_token_allowlist_entry
+FOR EACH ROW EXECUTE FUNCTION canonicalize_execution_target_consumer();
+
 -- Compatibility consumers retain their legacy discovered-model columns for a
 -- rollback window. Reject cross-owner and mismatched dual writes at the DB
 -- boundary while continuing to permit nullable historical telemetry.
@@ -148,7 +191,7 @@ BEGIN
       INTO target_owner, target_model, consumer_owner
       FROM execution_target et, model_pool pool
      WHERE et.id = NEW."executionTargetId" AND pool.id = NEW."poolId";
-    IF target_owner IS NULL OR target_owner <> consumer_owner OR target_model IS NULL
+    IF target_owner IS NULL OR target_owner <> consumer_owner
        OR (NEW."discoveredModelId" IS NOT NULL
            AND target_model IS DISTINCT FROM NEW."discoveredModelId") THEN
       RAISE EXCEPTION 'pool_member execution target must match its owner and discovered model'
@@ -168,7 +211,7 @@ BEGIN
       FROM execution_target et, model_api_token token
      WHERE et.id = NEW."executionTargetId" AND token.id = NEW."modelApiTokenId";
     IF NEW.target <> 'DIRECT_MODEL'::"ModelApiTokenAllowlistTarget"
-       OR target_owner IS NULL OR target_model IS NULL
+       OR target_owner IS NULL
        OR target_owner <> consumer_owner
        OR (NEW."discoveredModelId" IS NOT NULL
            AND target_model IS DISTINCT FROM NEW."discoveredModelId") THEN

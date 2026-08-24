@@ -342,7 +342,13 @@ describe("modelPoolRouting", () => {
     });
     expect(db.poolMember.updateMany).toHaveBeenCalledWith({
       where: {
-        discoveredModelId: { in: ["model-a", "model-b"] },
+        OR: [
+          {
+            executionTargetId: { not: null },
+            ExecutionTarget: { discoveredModelId: { in: ["model-a", "model-b"] } },
+          },
+          { executionTargetId: null, discoveredModelId: { in: ["model-a", "model-b"] } },
+        ],
         routingStatus: { not: "DISABLED" },
       },
       data: resetPoolMemberHealth(),
@@ -390,9 +396,13 @@ describe("modelPoolRouting", () => {
     });
     expect(db.poolMember.updateMany).toHaveBeenCalledWith({
       where: {
-        DiscoveredModel: {
-          Endpoint: { cliDeviceId: "cli-1" },
-        },
+        OR: [
+          {
+            executionTargetId: { not: null },
+            ExecutionTarget: { DiscoveredModel: { Endpoint: { cliDeviceId: "cli-1" } } },
+          },
+          { executionTargetId: null, DiscoveredModel: { Endpoint: { cliDeviceId: "cli-1" } } },
+        ],
       },
       data: expect.objectContaining({
         healthStatus: "UNHEALTHY",

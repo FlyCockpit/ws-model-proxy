@@ -967,7 +967,7 @@ function PoolTable({
                     {row.members.length === 0 ? emptyValue : null}
                     {row.members.slice(0, 4).map((member) => (
                       <p key={member.id} className="font-mono">
-                        {member.model.canonicalModelId}
+                        {member.model?.canonicalModelId ?? member.discoveredModelId ?? member.id}
                       </p>
                     ))}
                     {row.members.length > 4 ? (

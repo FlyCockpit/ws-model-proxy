@@ -19,6 +19,7 @@ const requiredFragments = [
   'ON CONFLICT ("discoveredModelId") DO NOTHING',
   "enforce_execution_target_consumer_consistency",
   "enforce_execution_target_identity_immutable",
+  "canonicalize_execution_target_consumer",
   "UPDATE pool_member",
   "UPDATE model_api_token_allowlist_entry",
   "UPDATE response_stickiness_record",
@@ -153,6 +154,31 @@ try {
       (id, "createdAt", "updatedAt", "poolId", "executionTargetId")
     SELECT 'duplicate-new-only-member', NOW(), NOW(), 'pool-a', id
       FROM execution_target WHERE "discoveredModelId" = 'model-a'
+  `,
+    "23505",
+  );
+  await expectConstraintFailure(
+    `
+    INSERT INTO pool_member
+      (id, "createdAt", "updatedAt", "poolId", "discoveredModelId")
+    VALUES ('duplicate-legacy-member', NOW(), NOW(), 'pool-a', 'model-a')
+  `,
+    "23505",
+  );
+  await client.query(`
+    INSERT INTO model_api_token
+      (id, "createdAt", "updatedAt", "userId", name, "lookupPrefix", "secretDigest")
+    VALUES ('token-a', NOW(), NOW(), 'owner-a', 'Token', 'prefix-a', 'digest-a');
+    INSERT INTO model_api_token_allowlist_entry
+      (id, "createdAt", "updatedAt", "modelApiTokenId", target, "executionTargetId")
+    SELECT 'target-only-access', NOW(), NOW(), 'token-a', 'DIRECT_MODEL', id
+      FROM execution_target WHERE "discoveredModelId" = 'model-a';
+  `);
+  await expectConstraintFailure(
+    `
+    INSERT INTO model_api_token_allowlist_entry
+      (id, "createdAt", "updatedAt", "modelApiTokenId", target, "discoveredModelId")
+    VALUES ('duplicate-legacy-access', NOW(), NOW(), 'token-a', 'DIRECT_MODEL', 'model-a')
   `,
     "23505",
   );

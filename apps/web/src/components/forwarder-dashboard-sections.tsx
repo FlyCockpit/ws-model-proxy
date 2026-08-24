@@ -1098,14 +1098,18 @@ export function PoolsSection() {
                           {pool.members.map((member) => (
                             <tr key={member.id}>
                               <td className="py-2 pr-3 align-top">
-                                <code className="font-mono">{member.model.canonicalModelId}</code>
+                                <code className="font-mono">
+                                  {member.model?.canonicalModelId ??
+                                    member.discoveredModelId ??
+                                    member.id}
+                                </code>
                               </td>
                               <td className="py-2 pr-3 align-top tabular-nums">{member.weight}</td>
                               <td className="py-2 pr-3 align-top">{member.routingStatus}</td>
                               <td className="py-2 pr-3 align-top">{member.healthStatus}</td>
                               <td className="py-2 pl-3 align-top">
                                 <div className="flex justify-end gap-1">
-                                  {member.model.supportsChat ? (
+                                  {member.model?.supportsChat ? (
                                     <Button
                                       type="button"
                                       variant="ghost"
@@ -1291,7 +1295,9 @@ export function PoolsSection() {
         onOpenChange={(open) => !open && setDeleteMember(null)}
         title={t("dashboard:pools.removeMemberTitle")}
         description={t("dashboard:pools.removeMemberDescription")}
-        confirmToken={deleteMember?.model.canonicalModelId ?? ""}
+        confirmToken={
+          deleteMember?.model?.canonicalModelId ?? deleteMember?.discoveredModelId ?? ""
+        }
         typePrompt={t("dashboard:pools.typeModelId")}
         copyAriaLabel={t("dashboard:actions.copyConfirm")}
         isPending={removeMember.isPending}
@@ -1902,7 +1908,7 @@ function PoolMemberForm({
         <div className="space-y-2">
           <Label>{t("dashboard:pools.directModel")}</Label>
           <code className="block break-all border bg-muted px-2 py-2 font-mono text-xs">
-            {member?.model.canonicalModelId}
+            {member?.model?.canonicalModelId ?? member?.discoveredModelId ?? member?.id}
           </code>
         </div>
       )}

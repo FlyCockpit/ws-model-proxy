@@ -139,7 +139,7 @@ type PoolMemberRow = {
   id: string;
   createdAt: Date;
   updatedAt: Date;
-  discoveredModelId: string;
+  discoveredModelId: string | null;
   weight: number;
   healthStatus: string;
   routingStatus: string;
@@ -149,22 +149,25 @@ type PoolMemberRow = {
   nextRetryAt: Date | null;
   halfOpenTrialStartedAt: Date | null;
   lastRoutedAt: Date | null;
-  DiscoveredModel: {
+  DiscoveredModel: PoolMemberModelRow | null;
+  ExecutionTarget: { kind: string; DiscoveredModel: PoolMemberModelRow | null } | null;
+};
+
+type PoolMemberModelRow = {
+  id: string;
+  upstreamModelId: string;
+  User: { slug: string };
+  Endpoint: {
     id: string;
-    upstreamModelId: string;
-    User: { slug: string };
-    Endpoint: {
+    slug: string;
+    label: string;
+    status: string;
+    CliDevice: {
       id: string;
       slug: string;
       label: string;
       status: string;
-      CliDevice: {
-        id: string;
-        slug: string;
-        label: string;
-        status: string;
-        lastHeartbeatAt: Date | null;
-      };
+      lastHeartbeatAt: Date | null;
     };
   };
 };
@@ -457,40 +460,45 @@ function serializePool(row: ModelPoolRow, now: Date) {
     canonicalModelId: poolModelId({ userSlug: row.User.slug, poolSlug: row.slug }),
     grantCount: row._count.PoolGrants,
     allowlistEntryCount: row._count.ModelApiTokenAllowlistEntries,
-    members: row.PoolMembers.map((member) => ({
-      id: member.id,
-      createdAt: member.createdAt,
-      updatedAt: member.updatedAt,
-      discoveredModelId: member.discoveredModelId,
-      weight: member.weight,
-      healthStatus: String(member.healthStatus),
-      routingStatus: String(member.routingStatus),
-      lastFailureClass: member.lastFailureClass,
-      consecutiveRetryableFailures: member.consecutiveRetryableFailures,
-      lastFailureAt: member.lastFailureAt,
-      nextRetryAt: member.nextRetryAt,
-      halfOpenTrialStartedAt: member.halfOpenTrialStartedAt,
-      lastRoutedAt: member.lastRoutedAt,
-      model: {
-        id: member.DiscoveredModel.id,
-        upstreamModelId: member.DiscoveredModel.upstreamModelId,
-        canonicalModelId: directModelId({
-          userSlug: member.DiscoveredModel.User.slug,
-          cliSlug: member.DiscoveredModel.Endpoint.CliDevice.slug,
-          endpointSlug: member.DiscoveredModel.Endpoint.slug,
-          upstreamModelId: member.DiscoveredModel.upstreamModelId,
-        }),
-        endpointId: member.DiscoveredModel.Endpoint.id,
-        endpointSlug: member.DiscoveredModel.Endpoint.slug,
-        endpointLabel: member.DiscoveredModel.Endpoint.label,
-        endpointStatus: String(member.DiscoveredModel.Endpoint.status),
-        cliDeviceId: member.DiscoveredModel.Endpoint.CliDevice.id,
-        cliDeviceSlug: member.DiscoveredModel.Endpoint.CliDevice.slug,
-        cliDeviceLabel: member.DiscoveredModel.Endpoint.CliDevice.label,
-        cliDeviceStatus: String(member.DiscoveredModel.Endpoint.CliDevice.status),
-        cliDeviceIsStale: isStale(member.DiscoveredModel.Endpoint.CliDevice.lastHeartbeatAt, now),
-      },
-    })),
+    members: row.PoolMembers.map((member) => {
+      const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
+      return {
+        id: member.id,
+        createdAt: member.createdAt,
+        updatedAt: member.updatedAt,
+        discoveredModelId: model?.id ?? member.discoveredModelId,
+        weight: member.weight,
+        healthStatus: String(member.healthStatus),
+        routingStatus: String(member.routingStatus),
+        lastFailureClass: member.lastFailureClass,
+        consecutiveRetryableFailures: member.consecutiveRetryableFailures,
+        lastFailureAt: member.lastFailureAt,
+        nextRetryAt: member.nextRetryAt,
+        halfOpenTrialStartedAt: member.halfOpenTrialStartedAt,
+        lastRoutedAt: member.lastRoutedAt,
+        model: model
+          ? {
+              id: model.id,
+              upstreamModelId: model.upstreamModelId,
+              canonicalModelId: directModelId({
+                userSlug: model.User.slug,
+                cliSlug: model.Endpoint.CliDevice.slug,
+                endpointSlug: model.Endpoint.slug,
+                upstreamModelId: model.upstreamModelId,
+              }),
+              endpointId: model.Endpoint.id,
+              endpointSlug: model.Endpoint.slug,
+              endpointLabel: model.Endpoint.label,
+              endpointStatus: String(model.Endpoint.status),
+              cliDeviceId: model.Endpoint.CliDevice.id,
+              cliDeviceSlug: model.Endpoint.CliDevice.slug,
+              cliDeviceLabel: model.Endpoint.CliDevice.label,
+              cliDeviceStatus: String(model.Endpoint.CliDevice.status),
+              cliDeviceIsStale: isStale(model.Endpoint.CliDevice.lastHeartbeatAt, now),
+            }
+          : null,
+      };
+    }),
   };
 }
 
@@ -555,6 +563,29 @@ const poolMemberSelect = {
   createdAt: true,
   updatedAt: true,
   discoveredModelId: true,
+  ExecutionTarget: {
+    select: {
+      kind: true,
+      DiscoveredModel: {
+        select: {
+          id: true,
+          upstreamModelId: true,
+          User: { select: { slug: true } },
+          Endpoint: {
+            select: {
+              id: true,
+              slug: true,
+              label: true,
+              status: true,
+              CliDevice: {
+                select: { id: true, slug: true, label: true, status: true, lastHeartbeatAt: true },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
   weight: true,
   healthStatus: true,
   routingStatus: true,
