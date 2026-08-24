@@ -32,7 +32,7 @@ import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { Textarea } from "@ws-model-proxy/ui/components/textarea";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { Copy, Gauge, Plus, Trash2 } from "lucide-react";
+import { Copy, Gauge, Pencil, Plus, Trash2 } from "lucide-react";
 import type { ReactNode } from "react";
 import { useId, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -917,6 +917,8 @@ export function PoolsSection() {
   });
   const [createOpen, setCreateOpen] = useState(false);
   const [capacityOpen, setCapacityOpen] = useState(false);
+  const [editingCapacity, setEditingCapacity] = useState<CapacityRow | null>(null);
+  const [deleteCapacity, setDeleteCapacity] = useState<CapacityRow | null>(null);
   const [editingPool, setEditingPool] = useState<ModelPool | null>(null);
   const [deletePool, setDeletePool] = useState<ModelPool | null>(null);
   const [memberPool, setMemberPool] = useState<ModelPool | null>(null);
@@ -958,6 +960,16 @@ export function PoolsSection() {
         toast.success(t("dashboard:pools.grantRevoked"));
         setRevokeGrant(null);
       },
+    }),
+  );
+  const deleteCapacityMutation = useMutation(
+    orpc.capacityManagement.remove.mutationOptions({
+      onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: orpc.capacityManagement.key() });
+        toast.success(t("dashboard:pools.capacity.deleted"));
+        setDeleteCapacity(null);
+      },
+      onError: () => toast.error(t("dashboard:pools.capacity.deleteConflict")),
     }),
   );
 
@@ -1049,7 +1061,26 @@ export function PoolsSection() {
                           {capacity.runtimeModel}
                         </div>
                       </div>
-                      <StatusPill muted>{capacity.countStrategy}</StatusPill>
+                      <div className="flex shrink-0 items-center gap-1">
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-touch"
+                          aria-label={t("dashboard:pools.capacity.edit")}
+                          onClick={() => setEditingCapacity(capacity)}
+                        >
+                          <Pencil className="size-4" />
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-touch"
+                          aria-label={t("dashboard:pools.capacity.delete")}
+                          onClick={() => setDeleteCapacity(capacity)}
+                        >
+                          <Trash2 className="size-4" />
+                        </Button>
+                      </div>
                     </div>
                     <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
                       <span>
@@ -1361,6 +1392,41 @@ export function PoolsSection() {
         </SheetContent>
       </Sheet>
 
+      <Sheet
+        open={Boolean(editingCapacity)}
+        onOpenChange={(open) => !open && setEditingCapacity(null)}
+      >
+        <SheetContent className="w-full overflow-hidden sm:max-w-xl">
+          <SheetHeader className="shrink-0">
+            <SheetTitle>{t("dashboard:pools.capacity.editTitle")}</SheetTitle>
+            <SheetDescription>{t("dashboard:pools.capacity.editDescription")}</SheetDescription>
+          </SheetHeader>
+          <div className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-clip overscroll-y-contain px-4 pb-[max(1rem,var(--safe-area-bottom))]">
+            {editingCapacity ? (
+              <CapacitySetupForm
+                key={editingCapacity.id}
+                capacity={editingCapacity}
+                onSuccess={() => setEditingCapacity(null)}
+              />
+            ) : null}
+          </div>
+        </SheetContent>
+      </Sheet>
+
+      <ConfirmDeleteDialog
+        open={Boolean(deleteCapacity)}
+        onOpenChange={(open) => !open && setDeleteCapacity(null)}
+        title={t("dashboard:pools.capacity.deleteTitle")}
+        description={t("dashboard:pools.capacity.deleteDescription")}
+        confirmToken={deleteCapacity?.label ?? ""}
+        typePrompt={t("dashboard:pools.capacity.typeName")}
+        copyAriaLabel={t("dashboard:actions.copyConfirm")}
+        isPending={deleteCapacityMutation.isPending}
+        onConfirm={() => {
+          if (deleteCapacity) deleteCapacityMutation.mutate({ id: deleteCapacity.id });
+        }}
+      />
+
       <Dialog open={Boolean(memberPool)} onOpenChange={(open) => !open && setMemberPool(null)}>
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
@@ -1455,7 +1521,13 @@ export function PoolsSection() {
   );
 }
 
-function CapacitySetupForm({ onSuccess }: { onSuccess: () => void }) {
+function CapacitySetupForm({
+  onSuccess,
+  capacity,
+}: {
+  onSuccess: () => void;
+  capacity?: CapacityRow;
+}) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
   const schema = z.object({
@@ -1483,25 +1555,34 @@ function CapacitySetupForm({ onSuccess }: { onSuccess: () => void }) {
       },
     }),
   );
+  const updateCapacity = useMutation(
+    orpc.capacityManagement.update.mutationOptions({
+      onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: orpc.capacityManagement.key() });
+        toast.success(t("dashboard:pools.capacity.updated"));
+        onSuccess();
+      },
+    }),
+  );
   const form = useForm({
     defaultValues: {
-      label: "",
-      runtimeModel: "",
-      runtimeIdentityKey: "",
-      hardConcurrencyLimit: 1,
-      physicalMaxContext: 32_768,
-      countStrategy: "CONSERVATIVE_ESTIMATE" as
+      label: capacity?.label ?? "",
+      runtimeModel: capacity?.runtimeModel ?? "",
+      runtimeIdentityKey: capacity?.runtimeIdentityKey ?? "",
+      hardConcurrencyLimit: capacity?.hardConcurrencyLimit ?? 1,
+      physicalMaxContext: capacity?.physicalMaxContext ?? 32_768,
+      countStrategy: (capacity?.countStrategy ?? "CONSERVATIVE_ESTIMATE") as
         | "CONSERVATIVE_ESTIMATE"
         | "ENGINE_REPORTED"
         | "TOKENIZER"
         | "TEMPLATE_AWARE",
-      runtimeRevision: "",
-      tokenizer: "",
-      template: "",
+      runtimeRevision: capacity?.runtimeRevision ?? "",
+      tokenizer: capacity?.tokenizer ?? "",
+      template: capacity?.template ?? "",
     },
     validators: { onSubmit: schema },
     onSubmit: async ({ value }) => {
-      await createCapacity.mutateAsync({
+      const data = {
         label: value.label.trim(),
         runtimeModel: value.runtimeModel.trim(),
         runtimeIdentityKey: value.runtimeIdentityKey.trim(),
@@ -1515,7 +1596,9 @@ function CapacitySetupForm({ onSuccess }: { onSuccess: () => void }) {
         templateVersion: null,
         engine: null,
         cacheNamespace: null,
-      });
+      };
+      if (capacity) await updateCapacity.mutateAsync({ id: capacity.id, ...data });
+      else await createCapacity.mutateAsync(data);
     },
   });
   const textField = (name: "label" | "runtimeModel" | "runtimeIdentityKey") => (
@@ -1628,8 +1711,12 @@ function CapacitySetupForm({ onSuccess }: { onSuccess: () => void }) {
         </div>
       </details>
       <DialogFooter>
-        <Button type="submit" size="touch" disabled={createCapacity.isPending}>
-          {createCapacity.isPending
+        <Button
+          type="submit"
+          size="touch"
+          disabled={createCapacity.isPending || updateCapacity.isPending}
+        >
+          {createCapacity.isPending || updateCapacity.isPending
             ? t("common:actions.saving")
             : t("dashboard:pools.capacity.save")}
         </Button>
