@@ -107,16 +107,19 @@ if [ "$APPLY_SCHEMA" != "off" ]; then
   ')" || { echo "FATAL: could not parse DATABASE_URL for psql." >&2; exit 1; }
   eval "$pg_env"
 
+  HARDEN_STATUS_FILE="$(mktemp)"
   psql -v ON_ERROR_STOP=1 <<EOF
 SET lock_timeout = '300s';
 SELECT pg_advisory_lock($LOCK_ID);
 \! cd /app/packages/db && node_modules/.bin/prisma db push $push_flags; echo \$? > $STATUS_FILE
-\i /app/packages/db/prisma/schema-hardening.sql
+\! cd /app/packages/db && node scripts/apply-schema-hardening.mjs; echo \$? > $HARDEN_STATUS_FILE
 SELECT pg_advisory_unlock($LOCK_ID);
 EOF
 
   status=$(cat "$STATUS_FILE")
+  harden_status=$(cat "$HARDEN_STATUS_FILE")
   rm -f "$STATUS_FILE"
+  rm -f "$HARDEN_STATUS_FILE"
   if [ "$status" != "0" ]; then
     echo "FATAL: prisma db push failed (exit $status)." >&2
     if [ "$APPLY_SCHEMA" = "safe" ]; then
@@ -126,6 +129,10 @@ EOF
       echo "       before using APPLY_SCHEMA=dangerous." >&2
     fi
     exit 1
+  fi
+  if [ "$harden_status" != "0" ]; then
+    echo "FATAL: schema hardening failed after lock/deadlock retries (exit $harden_status)." >&2
+    exit "$harden_status"
   fi
   echo "Schema sync complete."
 fi
