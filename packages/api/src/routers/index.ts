@@ -6,6 +6,7 @@ import { env } from "@ws-model-proxy/env/server";
 import { protectedProcedure, publicProcedure } from "../index";
 import { adminObservabilityRouter } from "./admin-observability";
 import { authRouter } from "./auth";
+import { capacityManagementRouter } from "./capacity-management";
 import { cliCredentialsRouter } from "./cli-credentials";
 import { devicesRouter } from "./devices";
 import { forwarderManagementRouter } from "./forwarder-management";
@@ -51,6 +52,7 @@ export const appRouter = {
   devices: devicesRouter,
   forwarderManagement: forwarderManagementRouter,
   cliCredentials: cliCredentialsRouter,
+  capacityManagement: capacityManagementRouter,
   modelApiTokens: modelApiTokensRouter,
   relayMetadata: relayMetadataRouter,
   users: usersRouter,
