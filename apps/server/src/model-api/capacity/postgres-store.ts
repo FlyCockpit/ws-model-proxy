@@ -47,7 +47,7 @@ export async function waitWithCapacityPolling({
 export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
   constructor(
     private readonly db: Db = prisma,
-    private readonly serverInstance = crypto.randomUUID(),
+    private readonly serverInstance: string = crypto.randomUUID(),
     private readonly notifier?: CapacityNotifier,
   ) {}
 
@@ -56,7 +56,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     const result = await this.#serializable(async (tx) => {
       const existing = await tx.admissionRequest.findUnique({
         where: { attemptId: attempt.attemptId },
-        include: { Lease: true },
+        include: { Lease: true, Waiters: true },
       });
       if (existing?.Lease?.state === "ACTIVE")
         return {
@@ -70,7 +70,11 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         };
 
       const capacityIds = [
-        ...new Set(attempt.candidates.map((candidate) => candidate.capacityId)),
+        ...new Set(
+          existing
+            ? existing.Waiters.map((waiter) => waiter.capacityId)
+            : attempt.candidates.map((candidate) => candidate.capacityId),
+        ),
       ].sort();
       for (const capacityId of capacityIds)
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacityId}, 0))`;
