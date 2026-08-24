@@ -178,7 +178,17 @@ describe("published fixture provenance", () => {
 
   it("keeps adapter goldens explicitly pinned to the canonical adapter version", async () => {
     const directory = new URL("./fixtures/adapter-golden/", import.meta.url);
-    for (const file of ["instruction-collapse-v1.json", "tool-roundtrip-v1.json"]) {
+    const manifest = JSON.parse(await readFile(new URL("manifest.json", directory), "utf8")) as {
+      adapterVersion: string;
+      goldens: string[];
+    };
+    expect(manifest.adapterVersion).toBe("1.0.0");
+    expect(manifest.goldens).toEqual([
+      "instruction-collapse-v1.json",
+      "tool-roundtrip-v1.json",
+      "responses-full-stream-v1.json",
+    ]);
+    for (const file of manifest.goldens) {
       const fixture = JSON.parse(await readFile(new URL(file, directory), "utf8")) as {
         adapterVersion: string;
       };

@@ -4,6 +4,30 @@ import type { CanonicalEvent } from "./canonical.js";
 import { CanonicalStreamParser, CanonicalStreamRenderer } from "./streams.js";
 
 const encode = (value: string) => new TextEncoder().encode(value);
+const responseEnvelope = (status: "in_progress" | "failed") => ({
+  id: "r",
+  object: "response",
+  created_at: 0,
+  status,
+  error: status === "failed" ? { code: "server_error", message: "failed" } : null,
+  incomplete_details: null,
+  instructions: null,
+  max_output_tokens: null,
+  model: "gpt",
+  output: [],
+  parallel_tool_calls: false,
+  previous_response_id: null,
+  reasoning: { effort: null, summary: null },
+  store: false,
+  temperature: null,
+  text: { format: { type: "text" } },
+  tool_choice: "none",
+  tools: [],
+  top_p: null,
+  truncation: "disabled",
+  metadata: {},
+  usage: null,
+});
 
 async function chatFixtureEvents(): Promise<CanonicalEvent[]> {
   const fixture = JSON.parse(
@@ -21,6 +45,37 @@ async function chatFixtureEvents(): Promise<CanonicalEvent[]> {
 }
 
 describe("cross-protocol streaming conformance", () => {
+  it.each([
+    ["nonempty output", { output: [{}] }],
+    ["nonarray output", { output: "bad" }],
+    ["nonnull usage", { usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } }],
+    ["nonnull incomplete details", { incomplete_details: { reason: "max_output_tokens" } }],
+    ["nonstring error type", { error: { code: "bad", message: "bad", type: 1 } }],
+    ["invalid error param", { error: { code: "bad", message: "bad", param: 1 } }],
+  ] as const)("rejects failed Responses with %s", (_name, mutation) => {
+    const parser = new CanonicalStreamParser("openai-responses");
+    parser.push(
+      encode(
+        `event: response.created\ndata: ${JSON.stringify({
+          type: "response.created",
+          sequence_number: 0,
+          response: responseEnvelope("in_progress"),
+        })}\n\n`,
+      ),
+    );
+    expect(() =>
+      parser.push(
+        encode(
+          `event: response.failed\ndata: ${JSON.stringify({
+            type: "response.failed",
+            sequence_number: 1,
+            response: { ...responseEnvelope("failed"), ...mutation },
+          })}\n\n`,
+        ),
+      ),
+    ).toThrow();
+  });
+
   it("pipes a bounded large Chat wire stream incrementally into Responses", () => {
     const source = new CanonicalStreamParser("openai-chat", {
       maxEventBytes: 512,

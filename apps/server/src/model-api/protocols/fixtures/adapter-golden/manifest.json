@@ -1,0 +1,8 @@
+{
+  "adapterVersion": "1.0.0",
+  "goldens": [
+    "instruction-collapse-v1.json",
+    "tool-roundtrip-v1.json",
+    "responses-full-stream-v1.json"
+  ]
+}

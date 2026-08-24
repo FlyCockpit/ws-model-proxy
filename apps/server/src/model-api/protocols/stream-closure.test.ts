@@ -59,8 +59,9 @@ describe("cycle 21 streaming closure", () => {
         new URL("./fixtures/adapter-golden/responses-full-stream-v1.json", import.meta.url),
         "utf8",
       ),
-    ) as string[];
-    expect(payloads).toEqual(fullGolden);
+    ) as { adapterVersion: string; events: string[] };
+    expect(fullGolden.adapterVersion).toBe("1.0.0");
+    expect(payloads).toEqual(fullGolden.events);
     renderer.finish();
     const parsed = payloads.map((payload) =>
       JSON.parse(payload.match(/data: (.*)\n\n/s)?.[1] ?? "{}"),
