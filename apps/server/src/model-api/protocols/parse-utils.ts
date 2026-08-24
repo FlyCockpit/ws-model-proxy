@@ -74,6 +74,8 @@ export function parseTools(
       invalid(`${parameter}[${index}].strict`, "must be a boolean");
     if (tool.strict === true)
       unsupported(`${parameter}[${index}].strict`, "structured output is not safely adaptable");
+    if (tool.description !== undefined && typeof tool.description !== "string")
+      invalid(`${parameter}[${index}].description`, "must be text");
     const schema = object(
       tool.parameters ?? tool.input_schema,
       `${parameter}[${index}].input_schema`,
@@ -129,6 +131,8 @@ export function parseAnthropicToolChoice(value: unknown): CanonicalToolChoice | 
       "tool_choice.disable_parallel_tool_use",
       "must be true to opt into safe single-call adaptation",
     );
+  if (choice.type !== "tool" && choice.name !== undefined)
+    invalid("tool_choice.name", "is only valid for a named tool choice");
   if (choice.type === "auto" || choice.type === "none" || choice.type === "any")
     return { type: choice.type === "any" ? "required" : choice.type };
   if (choice.type === "tool")

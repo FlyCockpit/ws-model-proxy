@@ -10,6 +10,29 @@ import {
 const bytes = (value: string) => new TextEncoder().encode(value);
 const event = (name: string, data: Record<string, unknown>) =>
   bytes(`event: ${name}\ndata: ${JSON.stringify({ type: name, ...data })}\n\n`);
+const responseStart = (id: string) => ({
+  id,
+  object: "response",
+  created_at: 0,
+  status: "in_progress",
+  error: null,
+  incomplete_details: null,
+  instructions: null,
+  max_output_tokens: null,
+  model: "gpt",
+  output: [],
+  parallel_tool_calls: false,
+  previous_response_id: null,
+  reasoning: { effort: null, summary: null },
+  store: false,
+  temperature: null,
+  text: { format: { type: "text" } },
+  tool_choice: "none",
+  tools: [],
+  top_p: null,
+  truncation: "disabled",
+  metadata: {},
+});
 const anthropicStart = (id: string) =>
   event("message_start", {
     message: {
@@ -52,10 +75,10 @@ describe("strict canonical stream parsing", () => {
       parser.push(
         event("response.created", {
           sequence_number: 0,
-          response: { id: "r", object: "response", status: "in_progress", output: [] },
+          response: responseStart("r"),
         }),
       ),
-    ).toEqual([{ type: "message_start", id: "r" }]);
+    ).toEqual([{ type: "message_start", id: "r", model: "gpt" }]);
     expect(parser.retrySafe).toBe(false);
   });
 
@@ -75,8 +98,9 @@ describe("strict canonical stream parsing", () => {
   });
 
   it("bounds each unfinished event rather than the aggregate drained chunk", () => {
-    const parser = new CanonicalStreamParser("openai-chat", { maxEventBytes: 128 });
-    const small = 'data: {"id":"x","choices":[]}\n\n';
+    const parser = new CanonicalStreamParser("openai-chat", { maxEventBytes: 256 });
+    const small =
+      'data: {"id":"x","object":"chat.completion.chunk","created":0,"model":"m","choices":[]}\n\n';
     expect(parser.push(bytes(small.repeat(20)))).toHaveLength(1);
     expect(parser.retrySafe).toBe(false);
   });
@@ -115,7 +139,9 @@ describe("strict canonical stream parsing", () => {
 
     const duplicate = new CanonicalStreamParser("openai-chat");
     duplicate.push(
-      bytes('data: {"id":"c","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'),
+      bytes(
+        'data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+      ),
     );
     duplicate.push(bytes("data: [DONE]\n\n"));
     expect(() => duplicate.push(bytes("data: [DONE]\n\n"))).toThrow("terminal");
@@ -228,7 +254,7 @@ describe("protocol-conformant stateful rendering", () => {
     const reader = transform.readable.getReader();
     const writer = transform.writable.getWriter();
     const read = reader.read();
-    await writer.write({ type: "message_start", id: "m" });
+    await writer.write({ type: "message_start", id: "m", model: "model" });
     expect((await read).value?.byteLength).toBeGreaterThan(0);
     await writer.write({ type: "stop", reason: "stop" });
     await reader.read();
@@ -239,7 +265,7 @@ describe("protocol-conformant stateful rendering", () => {
 
     const bounded = createCanonicalSseTransform("openai-chat", { maxChunkBytes: 8 });
     await expect(
-      bounded.writable.getWriter().write({ type: "message_start", id: "too-large" }),
+      bounded.writable.getWriter().write({ type: "message_start", id: "too-large", model: "m" }),
     ).rejects.toThrow("bounded buffer");
   });
 });

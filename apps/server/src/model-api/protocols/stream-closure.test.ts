@@ -12,6 +12,29 @@ const wire = (event: string, sequence: number, fields: Record<string, unknown>) 
   encode(
     `event: ${event}\ndata: ${JSON.stringify({ type: event, sequence_number: sequence, ...fields })}\n\n`,
   );
+const responseStart = (id: string) => ({
+  id,
+  object: "response",
+  created_at: 0,
+  status: "in_progress",
+  error: null,
+  incomplete_details: null,
+  instructions: null,
+  max_output_tokens: null,
+  model: "gpt",
+  output: [],
+  parallel_tool_calls: false,
+  previous_response_id: null,
+  reasoning: { effort: null, summary: null },
+  store: false,
+  temperature: null,
+  text: { format: { type: "text" } },
+  tool_choice: "none",
+  tools: [],
+  top_p: null,
+  truncation: "disabled",
+  metadata: {},
+});
 
 describe("cycle 21 streaming closure", () => {
   it("renders exact contiguous Responses sequence/index/output/tool/usage wire state", () => {
@@ -97,6 +120,7 @@ describe("cycle 21 streaming closure", () => {
     renderer.push({
       type: "message_start",
       id: "m",
+      model: "model",
       usage: { inputTokens: 0, outputTokens: 0 },
     });
     const render = () => renderer.push({ type: "stop", reason });
@@ -116,12 +140,12 @@ describe("cycle 21 streaming closure", () => {
     const parser = new CanonicalStreamParser("openai-responses");
     parser.push(
       wire("response.created", 0, {
-        response: { id: "r", object: "response", status: "in_progress", output: [] },
+        response: responseStart("r"),
       }),
     );
     parser.push(
       wire("response.output_item.added", 1, {
-        output_index: 8,
+        output_index: 0,
         item: {
           id: "item",
           type: "function_call",
@@ -134,14 +158,14 @@ describe("cycle 21 streaming closure", () => {
     );
     parser.push(
       wire("response.function_call_arguments.delta", 2, {
-        output_index: 8,
+        output_index: 0,
         item_id: "item",
         delta: "{}",
       }),
     );
     parser.push(
       wire("response.function_call_arguments.done", 3, {
-        output_index: 8,
+        output_index: 0,
         item_id: "item",
         arguments: "{}",
       }),
@@ -149,7 +173,7 @@ describe("cycle 21 streaming closure", () => {
     expect(() =>
       parser.push(
         wire("response.output_item.done", 4, {
-          output_index: 8,
+          output_index: 0,
           item: {
             id: "item",
             type: "function_call",
@@ -182,13 +206,13 @@ describe("cycle 21 streaming closure", () => {
     const chat = new CanonicalStreamParser("openai-chat");
     chat.push(
       encode(
-        'data: {"id":"c","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"one","type":"function","function":{"name":"f","arguments":"{"}}]},"finish_reason":null}]}\n\n',
+        'data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"one","type":"function","function":{"name":"f","arguments":"{"}}]},"finish_reason":null}]}\n\n',
       ),
     );
     expect(() =>
       chat.push(
         encode(
-          'data: {"id":"c","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"two","function":{"name":"f","arguments":"}"}}]},"finish_reason":null}]}\n\n',
+          'data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"two","function":{"name":"f","arguments":"}"}}]},"finish_reason":null}]}\n\n',
         ),
       ),
     ).toThrow("changed IDs");
@@ -199,14 +223,14 @@ describe("cycle 21 streaming closure", () => {
     expect(() =>
       boundedParser.push(
         encode(
-          'data: {"id":"c","choices":[{"index":0,"delta":{"content":"four"},"finish_reason":null}]}\n\n',
+          'data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"content":"four"},"finish_reason":null}]}\n\n',
         ),
       ),
     ).toThrow("Accumulated");
     const boundedRenderer = new CanonicalStreamRenderer("openai-chat", {
       maxAggregateBytes: 3,
     });
-    boundedRenderer.push({ type: "message_start", id: "c" });
+    boundedRenderer.push({ type: "message_start", id: "c", model: "m" });
     boundedRenderer.push({ type: "item_start", index: 0, id: "t", itemType: "text" });
     expect(() => boundedRenderer.push({ type: "text_delta", index: 0, delta: "four" })).toThrow(
       "Accumulated",

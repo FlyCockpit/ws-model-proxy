@@ -19,7 +19,7 @@ export function parseProtocolResponse({
   status: number;
   headers?: Headers;
 }): ParsedProtocolResponse {
-  const metadata = responseMetadata(status, headers);
+  const metadata = responseMetadata(status, headers, surface);
   if (status < 200 || status >= 300)
     return { ok: false, metadata, error: parseError(surface, body, metadata) };
   return {
@@ -34,16 +34,26 @@ export function parseProtocolResponse({
   };
 }
 
-export function responseMetadata(status: number, headers: Headers): ProtocolResponseMetadata {
+export function responseMetadata(
+  status: number,
+  headers: Headers,
+  surface?: ProtocolSurface,
+): ProtocolResponseMetadata {
   const safe = (name: string) => headers.get(name)?.slice(0, 512) || undefined;
+  const anthropic = surface === "anthropic-messages";
   return {
     status,
-    requestId: safe("request-id") ?? safe("x-request-id"),
+    requestId: anthropic ? safe("request-id") : safe("x-request-id"),
     retryAfter: safe("retry-after"),
-    retryLimit: safe("anthropic-ratelimit-requests-limit") ?? safe("x-ratelimit-limit-requests"),
-    retryRemaining:
-      safe("anthropic-ratelimit-requests-remaining") ?? safe("x-ratelimit-remaining-requests"),
-    retryReset: safe("anthropic-ratelimit-requests-reset") ?? safe("x-ratelimit-reset-requests"),
+    retryLimit: anthropic
+      ? safe("anthropic-ratelimit-requests-limit")
+      : safe("x-ratelimit-limit-requests"),
+    retryRemaining: anthropic
+      ? safe("anthropic-ratelimit-requests-remaining")
+      : safe("x-ratelimit-remaining-requests"),
+    retryReset: anthropic
+      ? safe("anthropic-ratelimit-requests-reset")
+      : safe("x-ratelimit-reset-requests"),
   };
 }
 
@@ -267,6 +277,8 @@ function parseAnthropicSuccess(value: unknown): CanonicalResponse {
     return unsupported(`response.content[${index}].type`);
   });
   const reason = stopReason(body.stop_reason);
+  if (reason === "content_filter")
+    unsupported("response.stop_reason", "is not safely representable across protocols");
   const hasCalls = items.some((item) => item.type === "tool_call");
   if ((reason === "tool") !== hasCalls)
     invalid("response.stop_reason", "does not match tool-use content");
@@ -302,10 +314,32 @@ function parseUsage(value: unknown) {
   rejectUnknown(usage, allowed, "usage");
   const input = usage.input_tokens ?? usage.prompt_tokens;
   const output = usage.output_tokens ?? usage.completion_tokens;
-  if (input !== undefined && (!Number.isInteger(input) || (input as number) < 0))
+  if (input !== undefined && (typeof input !== "number" || !Number.isInteger(input) || input < 0))
     invalid("usage.input_tokens", "is invalid");
-  if (output !== undefined && (!Number.isInteger(output) || (output as number) < 0))
+  if (
+    output !== undefined &&
+    (typeof output !== "number" || !Number.isInteger(output) || output < 0)
+  )
     invalid("usage.output_tokens", "is invalid");
+  if (typeof input !== "number" || typeof output !== "number")
+    invalid("usage", "must include both input and output token counts");
+  if (
+    usage.total_tokens !== undefined &&
+    (!Number.isInteger(usage.total_tokens) || usage.total_tokens !== input + output)
+  )
+    invalid("usage.total_tokens", "must equal input plus output tokens");
+  for (const key of ["input_tokens_details", "output_tokens_details"] as const) {
+    if (usage[key] === undefined) continue;
+    const details = object(usage[key], `usage.${key}`);
+    rejectUnknown(
+      details,
+      key === "input_tokens_details" ? ["cached_tokens"] : ["reasoning_tokens"],
+      `usage.${key}`,
+    );
+    for (const [name, count] of Object.entries(details))
+      if (!Number.isInteger(count) || (count as number) < 0)
+        invalid(`usage.${key}.${name}`, "must be a non-negative integer");
+  }
   return {
     ...(typeof input === "number" ? { inputTokens: input } : {}),
     ...(typeof output === "number" ? { outputTokens: output } : {}),
@@ -515,7 +549,7 @@ export function renderProtocolError(
   if (surface === "anthropic-messages")
     return {
       type: "error",
-      error: { type: error.code, message: error.message },
+      error: { type: anthropicErrorType(error.code, error.upstreamStatus), message: error.message },
       ...(error.requestId ? { request_id: error.requestId } : {}),
     };
   const openAiType = openAiErrorType(error.code, error.upstreamStatus);
@@ -527,6 +561,17 @@ export function renderProtocolError(
       code: error.code,
     },
   };
+}
+
+function anthropicErrorType(code: string, status?: number): string {
+  if (code === "authentication_error" || status === 401) return "authentication_error";
+  if (code === "permission_error" || status === 403) return "permission_error";
+  if (code === "not_found_error" || status === 404) return "not_found_error";
+  if (code === "request_too_large" || status === 413) return "request_too_large";
+  if (code === "rate_limit_error" || status === 429) return "rate_limit_error";
+  if (code === "overloaded_error" || status === 529) return "overloaded_error";
+  if (status !== undefined && status >= 500) return "api_error";
+  return "invalid_request_error";
 }
 
 function openAiErrorType(code: string, status?: number): string {

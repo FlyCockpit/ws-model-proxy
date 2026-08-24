@@ -21,6 +21,7 @@ export class CanonicalStreamParser {
   readonly #items = new Set<number>();
   readonly #toolBytes = new Map<number, number>();
   readonly #itemIds = new Map<number, string>();
+  readonly #synthesizedItemIds = new Set<number>();
   readonly #itemTypes = new Map<number, "text" | "tool_call" | "refusal" | "reasoning">();
   readonly #toolNames = new Map<number, string>();
   readonly #toolArguments = new Map<number, string>();
@@ -41,8 +42,10 @@ export class CanonicalStreamParser {
   #stopped = false;
   #observable = false;
   #lastSequence = -1;
+  #nextResponseOutputIndex = 0;
   #aggregateBytes = 0;
   #pendingChatStop?: ReturnType<typeof stopReason>;
+  #chatUsageSeen = false;
   #messageId?: string;
   #messageModel?: string;
 
@@ -115,7 +118,10 @@ export class CanonicalStreamParser {
         throw new AdapterError("unexpected_done", "[DONE] is only valid for Chat Completions.");
       if (!this.#pendingChatStop)
         throw new AdapterError("terminal_before_stop", "Chat [DONE] arrived before finish_reason.");
-      return [...this.#stop(this.#pendingChatStop), ...this.#complete()];
+      const completed: CanonicalEvent[] = [];
+      for (const index of this.#items)
+        if (!this.#completedItems.has(index)) completed.push(...this.#completeItem(index));
+      return [...completed, ...this.#stop(this.#pendingChatStop), ...this.#complete()];
     }
     let value: Record<string, unknown>;
     try {
@@ -188,11 +194,17 @@ export class CanonicalStreamParser {
   #toolDelta(index: number, id: string, name: string | undefined, delta: string): CanonicalEvent[] {
     if (this.#items.has(index) && this.#itemTypes.get(index) !== "tool_call")
       throw new AdapterError("item_type_mismatch", `Item ${index} is not a tool call.`);
-    if (this.#itemIds.has(index) && id !== this.#itemIds.get(index) && !id.startsWith("generated-"))
+    if (
+      this.#itemIds.has(index) &&
+      id !== this.#itemIds.get(index) &&
+      !this.#synthesizedItemIds.has(index)
+    )
       throw new AdapterError("tool_id_mismatch", `Tool call ${index} changed IDs.`);
     if (name && this.#toolNames.has(index) && name !== this.#toolNames.get(index))
       throw new AdapterError("tool_name_mismatch", `Tool call ${index} changed names.`);
     const stableId = this.#itemIds.get(index) ?? id;
+    if (!this.#itemIds.has(index) && id.startsWith("generated-"))
+      this.#synthesizedItemIds.add(index);
     if (name) this.#toolNames.set(index, name);
     const bytes = (this.#toolBytes.get(index) ?? 0) + new TextEncoder().encode(delta).byteLength;
     if (bytes > this.#maxToolArgumentsBytes)
@@ -268,6 +280,12 @@ export class CanonicalStreamParser {
   }
 
   #chat(value: Record<string, unknown>): CanonicalEvent[] {
+    if (value.error !== undefined) {
+      if (this.#stopped || this.#pendingChatStop)
+        throw new AdapterError("event_after_stop", "Chat error followed finish_reason.");
+      this.#terminal = true;
+      return [{ type: "error", error: this.#streamError(value.error) }];
+    }
     if (this.#pendingChatStop && Array.isArray(value.choices) && value.choices.length > 0)
       throw new AdapterError("event_after_stop", "Chat candidate event followed finish_reason.");
     rejectUnknown(
@@ -275,6 +293,10 @@ export class CanonicalStreamParser {
       ["id", "object", "created", "model", "system_fingerprint", "choices", "usage"],
       "stream.data",
     );
+    if (!Number.isSafeInteger(value.created) || (value.created as number) < 0)
+      throw new AdapterError("invalid_stream_event", "Chat created must be a timestamp integer.");
+    if (typeof value.model !== "string" || value.model.length === 0)
+      throw new AdapterError("invalid_stream_event", "Chat model is required.");
     const events = this.#started ? [] : this.#start(value.id, value.model);
     if (value.id !== this.#messageId)
       throw new AdapterError("chunk_id_mismatch", "Chat stream changed response IDs.");
@@ -355,8 +377,13 @@ export class CanonicalStreamParser {
         throw new AdapterError("duplicate_stop", "Chat emitted more than one finish_reason.");
       this.#pendingChatStop = stopReason(choice.finish_reason);
     }
-    const usage = usageEvent(value.usage);
-    if (usage) events.push(usage);
+    const usage = usageEvent(value.usage, true);
+    if (usage) {
+      if (this.#chatUsageSeen)
+        throw new AdapterError("duplicate_usage", "Chat stream emitted usage twice.");
+      this.#chatUsageSeen = true;
+      events.push(usage);
+    }
     return events;
   }
 
@@ -428,6 +455,14 @@ export class CanonicalStreamParser {
         ],
         "stream.data.response",
       );
+    if (
+      type === "response.created" ||
+      type === "response.in_progress" ||
+      type === "response.completed" ||
+      type === "response.incomplete" ||
+      type === "response.failed"
+    )
+      validateResponseEnvelope(response);
     const events = type === "response.created" ? this.#start(response.id, response.model) : [];
     if (
       (type === "response.in_progress" ||
@@ -437,6 +472,13 @@ export class CanonicalStreamParser {
       response.id !== this.#messageId
     )
       throw new AdapterError("chunk_id_mismatch", "Responses stream changed response IDs.");
+    if (
+      type !== "error" &&
+      this.#messageModel &&
+      response.model !== undefined &&
+      response.model !== this.#messageModel
+    )
+      throw new AdapterError("chunk_model_mismatch", "Responses stream changed models.");
     if (type === "response.created") {
       if (
         response.object !== "response" ||
@@ -447,6 +489,15 @@ export class CanonicalStreamParser {
         throw new AdapterError(
           "invalid_response_start",
           "Responses response.created envelope is invalid.",
+        );
+    }
+    if (type === "response.in_progress") {
+      if (response.object !== "response" || response.status !== "in_progress")
+        throw new AdapterError("invalid_response_state", "Responses in_progress state is invalid.");
+      if (!Array.isArray(response.output) || response.output.length !== 0)
+        throw new AdapterError(
+          "invalid_response_state",
+          "Responses in_progress output must be empty.",
         );
     }
     if (!this.#started && type !== "error")
@@ -466,6 +517,12 @@ export class CanonicalStreamParser {
     const index = needsIndex ? this.#indexFor(`responses:${sourceIndex}`) : 0;
     const item = value.item && typeof value.item === "object" ? object(value.item) : {};
     if (type === "response.output_item.added") {
+      if (sourceIndex !== this.#nextResponseOutputIndex)
+        throw new AdapterError(
+          "invalid_stream_index",
+          "Responses output_index must be contiguous from zero.",
+        );
+      this.#nextResponseOutputIndex++;
       rejectUnknown(
         item,
         ["id", "type", "status", "role", "content", "call_id", "name", "arguments"],
@@ -714,13 +771,20 @@ export class CanonicalStreamParser {
           "terminal_output_mismatch",
           "Responses terminal output did not match completed items.",
         );
-      const usage = usageEvent(response.usage);
+      const usage = usageEvent(response.usage, true);
       if (usage) events.push(usage);
       events.push(
         ...this.#stop(stopReason(type === "response.incomplete" ? "length" : "stop")),
         ...this.#complete(),
       );
     } else if (type === "response.failed" || type === "error") {
+      if (this.#stopped)
+        throw new AdapterError("event_after_stop", "Responses error followed the stop barrier.");
+      if (
+        type === "response.failed" &&
+        (response.object !== "response" || response.status !== "failed" || !response.error)
+      )
+        throw new AdapterError("invalid_failed_response", "Responses failed state requires error.");
       this.#terminal = true;
       events.push({
         type: "error",
@@ -902,12 +966,25 @@ export class CanonicalStreamParser {
   }
 }
 
-function usageEvent(value: unknown): Extract<CanonicalEvent, { type: "usage" }> | undefined {
+function usageEvent(
+  value: unknown,
+  requireBoth = false,
+): Extract<CanonicalEvent, { type: "usage" }> | undefined {
   if (!value || typeof value !== "object") return undefined;
   const usage = object(value);
   rejectUnknown(
     usage,
-    ["input_tokens", "output_tokens", "prompt_tokens", "completion_tokens", "total_tokens"],
+    [
+      "input_tokens",
+      "output_tokens",
+      "prompt_tokens",
+      "completion_tokens",
+      "total_tokens",
+      "input_tokens_details",
+      "output_tokens_details",
+      "prompt_tokens_details",
+      "completion_tokens_details",
+    ],
     "stream.usage",
   );
   const input = usage.input_tokens ?? usage.prompt_tokens;
@@ -917,8 +994,20 @@ function usageEvent(value: unknown): Extract<CanonicalEvent, { type: "usage" }> 
     (output !== undefined && (!Number.isSafeInteger(output) || (output as number) < 0))
   )
     throw new AdapterError("invalid_usage", "Stream usage tokens must be non-negative integers.");
-  if (input === undefined && output === undefined)
-    throw new AdapterError("invalid_usage", "Stream usage must include token counts.");
+  if (
+    (requireBoth && (input === undefined || output === undefined)) ||
+    (!requireBoth && input === undefined && output === undefined)
+  )
+    throw new AdapterError("invalid_usage", "Stream usage is missing required token counts.");
+  const total = usage.total_tokens;
+  if (
+    total !== undefined &&
+    (!Number.isSafeInteger(total) ||
+      input === undefined ||
+      output === undefined ||
+      total !== (input as number) + (output as number))
+  )
+    throw new AdapterError("invalid_usage", "Stream total_tokens must equal input plus output.");
   return {
     type: "usage",
     usage: {
@@ -926,6 +1015,32 @@ function usageEvent(value: unknown): Extract<CanonicalEvent, { type: "usage" }> 
       ...(typeof output === "number" ? { outputTokens: output } : {}),
     },
   };
+}
+
+function validateResponseEnvelope(response: Record<string, unknown>) {
+  if (!Number.isSafeInteger(response.created_at) || (response.created_at as number) < 0)
+    throw new AdapterError("invalid_response_envelope", "Responses created_at is required.");
+  if (typeof response.model !== "string" || response.model.length === 0)
+    throw new AdapterError("invalid_response_envelope", "Responses model is required.");
+  for (const key of [
+    "error",
+    "incomplete_details",
+    "instructions",
+    "max_output_tokens",
+    "parallel_tool_calls",
+    "previous_response_id",
+    "reasoning",
+    "store",
+    "temperature",
+    "text",
+    "tool_choice",
+    "tools",
+    "top_p",
+    "truncation",
+    "metadata",
+  ])
+    if (!(key in response))
+      throw new AdapterError("invalid_response_envelope", `Responses envelope is missing ${key}.`);
 }
 
 function validIndex(index: number) {
@@ -1230,6 +1345,8 @@ export class CanonicalStreamRenderer {
       this.#stopped = true;
       this.#stopEvent = event;
     } else if (event.type === "usage") {
+      if (this.#usageEvent)
+        throw new AdapterError("duplicate_usage", "Canonical stream emitted usage twice.");
       this.#usageEvent = event;
     } else if (event.type === "complete") {
       if (!this.#stopped)
@@ -1248,7 +1365,14 @@ export class CanonicalStreamRenderer {
   }
 
   #chat(event: CanonicalEvent): WirePayload[] {
-    const base = { id: this.#messageId, object: "chat.completion.chunk", model: this.#model };
+    if (!this.#model)
+      throw new AdapterError("missing_model", "Chat stream rendering requires a model.");
+    const base = {
+      id: this.#messageId,
+      object: "chat.completion.chunk",
+      created: 0,
+      model: this.#model,
+    };
     if (event.type === "message_start")
       return [
         { ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] },
@@ -1294,6 +1418,7 @@ export class CanonicalStreamRenderer {
           usage: {
             prompt_tokens: event.usage.inputTokens,
             completion_tokens: event.usage.outputTokens,
+            total_tokens: (event.usage.inputTokens ?? 0) + (event.usage.outputTokens ?? 0),
           },
         },
       ];
@@ -1327,9 +1452,26 @@ export class CanonicalStreamRenderer {
           response: {
             id: event.id,
             object: "response",
+            created_at: 0,
             status: "in_progress",
+            error: null,
+            incomplete_details: null,
+            instructions: null,
+            max_output_tokens: null,
             model: event.model,
             output: [],
+            parallel_tool_calls: false,
+            previous_response_id: null,
+            reasoning: { effort: null, summary: null },
+            store: false,
+            temperature: null,
+            text: { format: { type: "text" } },
+            tool_choice: "none",
+            tools: [],
+            top_p: null,
+            truncation: "disabled",
+            usage: null,
+            metadata: {},
           },
         }),
       ];
@@ -1424,6 +1566,20 @@ export class CanonicalStreamRenderer {
             arguments: this.#toolArguments.get(event.index) ?? "",
           }),
         );
+      if (item?.itemType !== "tool_call" && !this.#parts.has(event.index)) {
+        this.#parts.add(event.index);
+        output.push(
+          this.#responseEvent("response.content_part.added", {
+            output_index: outputIndex,
+            content_index: 0,
+            item_id: item?.id,
+            part:
+              item?.itemType === "refusal"
+                ? { type: "refusal", refusal: "" }
+                : { type: "output_text", text: "", annotations: [], logprobs: [] },
+          }),
+        );
+      }
       if (this.#parts.has(event.index)) {
         output.push(
           this.#responseEvent(
@@ -1494,14 +1650,29 @@ export class CanonicalStreamRenderer {
             response: {
               id: this.#messageId,
               object: "response",
+              created_at: 0,
               status: this.#stopEvent?.reason === "length" ? "incomplete" : "completed",
+              error: null,
               model: this.#model,
               output: [...this.#responseOutput.entries()]
                 .sort(([left], [right]) => left - right)
                 .map(([, item]) => item),
               ...(this.#stopEvent?.reason === "length"
                 ? { incomplete_details: { reason: "max_output_tokens" } }
-                : {}),
+                : { incomplete_details: null }),
+              instructions: null,
+              max_output_tokens: null,
+              parallel_tool_calls: false,
+              previous_response_id: null,
+              reasoning: { effort: null, summary: null },
+              store: false,
+              temperature: null,
+              text: { format: { type: "text" } },
+              tool_choice: "none",
+              tools: [],
+              top_p: null,
+              truncation: "disabled",
+              metadata: {},
               ...(this.#usageEvent
                 ? {
                     usage: {
@@ -1644,26 +1815,40 @@ export function createCanonicalSseTransform(
   const maxChunkBytes = options.maxChunkBytes ?? 1024 * 1024;
   if (!Number.isSafeInteger(maxChunkBytes) || maxChunkBytes <= 0)
     throw new AdapterError("invalid_buffer_limit", "maxChunkBytes must be a positive integer.");
+  let abortListener: (() => void) | undefined;
+  const removeAbortListener = () => {
+    if (abortListener) options.signal?.removeEventListener("abort", abortListener);
+    abortListener = undefined;
+  };
   return new TransformStream<CanonicalEvent, Uint8Array>(
     {
       start(controller) {
-        const abort = () =>
+        abortListener = () =>
           controller.error(new AdapterError("cancelled", "Stream rendering was cancelled."));
-        if (options.signal?.aborted) abort();
-        else options.signal?.addEventListener("abort", abort, { once: true });
+        if (options.signal?.aborted) abortListener();
+        else options.signal?.addEventListener("abort", abortListener, { once: true });
       },
       transform(event, controller) {
-        for (const chunk of renderer.push(event)) {
-          if (chunk.byteLength > maxChunkBytes)
-            throw new AdapterError(
-              "stream_chunk_exceeded",
-              "Rendered SSE event exceeded the bounded buffer.",
-            );
-          controller.enqueue(chunk);
+        try {
+          for (const chunk of renderer.push(event)) {
+            if (chunk.byteLength > maxChunkBytes)
+              throw new AdapterError(
+                "stream_chunk_exceeded",
+                "Rendered SSE event exceeded the bounded buffer.",
+              );
+            controller.enqueue(chunk);
+          }
+        } catch (error) {
+          removeAbortListener();
+          throw error;
         }
       },
       flush() {
-        renderer.finish();
+        try {
+          renderer.finish();
+        } finally {
+          removeAbortListener();
+        }
       },
     },
     undefined,

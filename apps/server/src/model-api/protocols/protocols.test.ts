@@ -318,7 +318,7 @@ describe("canonical streaming state machines", () => {
   it("decodes arbitrary UTF-8 splits, CRLF, comments, and multiline SSE data", () => {
     const parser = new CanonicalStreamParser("openai-chat");
     const bytes = new TextEncoder().encode(
-      ': keepalive\r\ndata: {"id":"chat_1","model":"gpt","choices":[{"index":0,"delta":{"content":"hé"},\r\ndata: "finish_reason":"stop"}]}\r\n\r\ndata: [DONE]\r\n\r\n',
+      ': keepalive\r\ndata: {"id":"chat_1","object":"chat.completion.chunk","created":0,"model":"gpt","choices":[{"index":0,"delta":{"content":"hé"},\r\ndata: "finish_reason":"stop"}]}\r\n\r\ndata: [DONE]\r\n\r\n',
     );
     const events = [
       ...parser.push(bytes.slice(0, 77)),
@@ -330,6 +330,7 @@ describe("canonical streaming state machines", () => {
       { type: "message_start", id: "chat_1", model: "gpt" },
       { type: "item_start", index: 0, id: "text-0", itemType: "text" },
       { type: "text_delta", index: 0, delta: "hé" },
+      { type: "item_complete", index: 0 },
       { type: "stop", reason: "stop" },
       { type: "complete" },
     ]);
@@ -339,13 +340,14 @@ describe("canonical streaming state machines", () => {
   it("does not invent an event boundary when CRLF is split across byte chunks", () => {
     const parser = new CanonicalStreamParser("openai-chat");
     const first = new TextEncoder().encode(
-      'data: {"id":"chat_1","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\r',
+      'data: {"id":"chat_1","object":"chat.completion.chunk","created":0,"model":"gpt","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\r',
     );
     expect(parser.push(first)).toEqual([]);
     expect(parser.push(new TextEncoder().encode("\n\r\ndata: [DONE]\r\n\r\n"))).toMatchObject([
       { type: "message_start", id: "chat_1" },
       { type: "item_start" },
       { type: "text_delta", delta: "ok" },
+      { type: "item_complete" },
       { type: "stop", reason: "stop" },
       { type: "complete" },
     ]);
@@ -363,7 +365,7 @@ describe("canonical streaming state machines", () => {
     const truncated = new CanonicalStreamParser("openai-responses");
     truncated.push(
       new TextEncoder().encode(
-        'event: response.created\ndata: {"type":"response.created","sequence_number":0,"response":{"id":"r","object":"response","status":"in_progress","output":[]}}\n\n',
+        'event: response.created\ndata: {"type":"response.created","sequence_number":0,"response":{"id":"r","object":"response","created_at":0,"status":"in_progress","error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"model":"gpt","output":[],"parallel_tool_calls":false,"previous_response_id":null,"reasoning":{},"store":false,"temperature":null,"text":{},"tool_choice":"none","tools":[],"top_p":null,"truncation":"disabled","metadata":{}}}\n\n',
       ),
     );
     expect(() => truncated.finish()).toThrow("terminal event");

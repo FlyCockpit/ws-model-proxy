@@ -11,9 +11,25 @@
         "response": {
           "id": "resp_fixture",
           "object": "response",
+          "created_at": 0,
           "status": "in_progress",
+          "error": null,
+          "incomplete_details": null,
+          "instructions": null,
+          "max_output_tokens": null,
           "model": "gpt-fixture",
-          "output": []
+          "output": [],
+          "parallel_tool_calls": false,
+          "previous_response_id": null,
+          "reasoning": { "effort": null, "summary": null },
+          "store": false,
+          "temperature": null,
+          "text": { "format": { "type": "text" } },
+          "tool_choice": "none",
+          "tools": [],
+          "top_p": null,
+          "truncation": "disabled",
+          "metadata": {}
         }
       }
     },
@@ -101,7 +117,12 @@
         "response": {
           "id": "resp_fixture",
           "object": "response",
+          "created_at": 0,
           "status": "completed",
+          "error": null,
+          "incomplete_details": null,
+          "instructions": null,
+          "max_output_tokens": null,
           "model": "gpt-fixture",
           "output": [
             {
@@ -112,6 +133,17 @@
               "content": [{ "type": "output_text", "text": "Hello", "annotations": [] }]
             }
           ],
+          "parallel_tool_calls": false,
+          "previous_response_id": null,
+          "reasoning": { "effort": null, "summary": null },
+          "store": false,
+          "temperature": null,
+          "text": { "format": { "type": "text" } },
+          "tool_choice": "none",
+          "tools": [],
+          "top_p": null,
+          "truncation": "disabled",
+          "metadata": {},
           "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
         }
       }

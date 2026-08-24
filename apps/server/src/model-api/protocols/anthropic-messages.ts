@@ -56,6 +56,11 @@ function blocks(value: unknown, parameter: string): CanonicalMessage["content"] 
       );
       if (block.is_error !== undefined && typeof block.is_error !== "boolean")
         invalid(`${parameter}[${index}].is_error`, "must be a boolean");
+      if (Array.isArray(block.content) && block.content.length > 1)
+        unsupported(
+          `${parameter}[${index}].content`,
+          "multiple tool-result blocks cannot be losslessly adapted",
+        );
       return {
         type: "tool_result",
         toolCallId: string(block.tool_use_id, `${parameter}[${index}].tool_use_id`),
