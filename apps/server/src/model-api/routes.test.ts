@@ -5,6 +5,7 @@ import type {
 } from "@ws-model-proxy/api/lib/model-api-token-access";
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import type { ActiveRelayResponseHandlers, RelaySessionManager } from "../relay/session-manager.js";
+import { holdCapacityLeaseForResponse } from "./capacity/response-lease.js";
 import type { CapacityAdmissionRuntime } from "./capacity/runtime.js";
 import officialAnthropicFixture from "./fixtures/anthropic-2023-06-01.json";
 import responsesConformanceFixture from "./protocols/fixtures/generated-conformance/openai-responses-sse.json";
@@ -347,10 +348,11 @@ function appWith(
   anthropicEnabled = true,
   protocolAdaptationEnabled = false,
   capacityRuntime?: CapacityAdmissionRuntime,
+  concurrencyLimiter = new ModelApiConcurrencyLimiter(),
 ) {
   return createModelApiRoutes({
     manager,
-    concurrencyLimiter: new ModelApiConcurrencyLimiter(),
+    concurrencyLimiter,
     anthropicEnabled,
     protocolAdaptationEnabled,
     capacityEnabled: capacityRuntime !== undefined,
@@ -708,15 +710,45 @@ describe("model API routes", () => {
     });
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-responses"];
-    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
-      method: "POST",
-      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
-      body: JSON.stringify({
-        model: poolTarget.modelId,
-        stream: true,
-        messages: [{ role: "user", content: "hello" }],
+    const release = vi.fn().mockResolvedValue(true);
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async (attempt) => {
+        const candidate = attempt.candidates[0]!;
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: "lease-responses-member",
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
       }),
-    });
+      release,
+      hold: (response, lease, signal) =>
+        holdCapacityLeaseForResponse({
+          response,
+          lease,
+          signal,
+          heartbeatIntervalMs: 0,
+          store: { heartbeat: vi.fn().mockResolvedValue(true), release },
+        }),
+    };
+    const responsePromise = appWith(manager, true, true, capacityRuntime).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: poolTarget.modelId,
+          stream: true,
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      },
+    );
     await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
     const sent = requireSent(manager);
     manager.headers(sent.requestId, 200, { "content-type": "text/event-stream" });
@@ -727,12 +759,16 @@ describe("model API routes", () => {
       `${first.event ? `event: ${first.event}\n` : ""}data: ${JSON.stringify(first.data)}\n\n`,
     );
     const response = await responsePromise;
+    expect(capacityRuntime.acquire).toHaveBeenCalledTimes(1);
+    expect(release).not.toHaveBeenCalled();
     manager.body(sent.requestId, 'event: response.unknown\ndata: {"type":"response.unknown"}\n\n');
     manager.complete(sent.requestId);
     const text = await response.text();
     expect(text.match(/"code":"protocol_error"/g)).toHaveLength(1);
     expect(text).not.toContain("data: [DONE]");
     expect(manager.sent).toHaveLength(1);
+    expect(capacityRuntime.acquire).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledTimes(1);
     await vi.waitFor(() =>
       expect(db.relayRequest.update).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -2852,6 +2888,29 @@ describe("model API routes", () => {
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-a", "cli-b"];
     const capacityEvents: string[] = [];
+    const limiter = new ModelApiConcurrencyLimiter();
+    const acquireGlobal = limiter.acquireGlobal.bind(limiter);
+    vi.spyOn(limiter, "acquireGlobal").mockImplementation((identity) => {
+      capacityEvents.push("local:global:acquire");
+      const lease = acquireGlobal(identity);
+      return {
+        release: () => {
+          capacityEvents.push("local:global:release");
+          lease.release();
+        },
+      };
+    });
+    const acquireCli = limiter.acquireCli.bind(limiter);
+    vi.spyOn(limiter, "acquireCli").mockImplementation((cliDeviceId) => {
+      capacityEvents.push(`local:cli:acquire:${cliDeviceId}`);
+      const lease = acquireCli(cliDeviceId);
+      return {
+        release: () => {
+          capacityEvents.push(`local:cli:release:${cliDeviceId}`);
+          lease.release();
+        },
+      };
+    });
     const capacityAttempts: Array<{ requestId: string; attemptId: string; candidates: unknown[] }> =
       [];
     const capacityRuntime: CapacityAdmissionRuntime = {
@@ -2885,7 +2944,7 @@ describe("model API routes", () => {
         return response;
       }),
     };
-    const responsePromise = appWith(manager, true, false, capacityRuntime).request(
+    const responsePromise = appWith(manager, true, false, capacityRuntime, limiter).request(
       "/chat/completions",
       {
         method: "POST",
@@ -2909,7 +2968,17 @@ describe("model API routes", () => {
     expect(capacityAttempts[0]?.attemptId).not.toBe(capacityAttempts[1]?.attemptId);
     expect(capacityAttempts[0]?.candidates).toHaveLength(2);
     expect(capacityAttempts[1]?.candidates).toMatchObject([{ poolMemberId: "member-b" }]);
-    expect(capacityEvents).toEqual(["acquire:member-a", "release:member-a", "acquire:member-b"]);
+    expect(capacityEvents).toEqual([
+      "acquire:member-a",
+      "local:global:acquire",
+      "local:cli:acquire:cli-a",
+      "local:cli:release:cli-a",
+      "local:global:release",
+      "release:member-a",
+      "acquire:member-b",
+      "local:global:acquire",
+      "local:cli:acquire:cli-b",
+    ]);
     const retried = requireSent(manager, 1);
     expect(retried.cliDeviceId).toBe("cli-b");
     expect(firstBodyChunkText(retried)).toContain('"model":"upstream-b"');
