@@ -139,6 +139,16 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       },
       include: { AdmissionRequest: true, PoolMember: true },
     });
+    const memberPolicies = await tx.poolMember.findMany({
+      where: { ExecutionTarget: { capacityId } },
+      select: {
+        id: true,
+        capacityPriority: true,
+        capacityReservedSlots: true,
+        capacityBorrowPolicy: true,
+      },
+    });
+    const eligibility = new Map<string, { borrowed: boolean }>();
     const eligible = [];
     for (const waiter of waiters) {
       const memberLimit = waiter.PoolMember?.capacityConcurrencyLimit;
@@ -148,25 +158,38 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         });
         if (memberActive >= memberLimit) continue;
       }
-      const reservedForHigherPriority = waiters
-        .filter(
-          (entry) =>
-            entry.AdmissionRequest.basePriority > waiter.AdmissionRequest.basePriority &&
-            (entry.PoolMember?.capacityReservedSlots ?? 0) > 0,
-        )
-        .reduce((total, entry) => total + (entry.PoolMember?.capacityReservedSlots ?? 0), 0);
+      const higherPolicies = memberPolicies.filter(
+        (policy) => policy.capacityPriority > waiter.AdmissionRequest.basePriority,
+      );
+      const reservedForHigherPriority = higherPolicies.reduce(
+        (total, policy) => total + policy.capacityReservedSlots,
+        0,
+      );
+      const higherPriorityQueued = waiters.some(
+        (entry) => entry.AdmissionRequest.basePriority > waiter.AdmissionRequest.basePriority,
+      );
       if (
         capacity.hardConcurrencyLimit !== null &&
         reservedForHigherPriority > 0 &&
+        higherPriorityQueued &&
         active >= capacity.hardConcurrencyLimit - reservedForHigherPriority
       )
         continue;
+      const reservedForOthers = memberPolicies
+        .filter((policy) => policy.id !== waiter.poolMemberId)
+        .reduce((total, policy) => total + policy.capacityReservedSlots, 0);
+      const borrowed =
+        capacity.hardConcurrencyLimit !== null &&
+        reservedForOthers > 0 &&
+        active >= capacity.hardConcurrencyLimit - reservedForOthers;
+      if (borrowed && waiter.PoolMember?.capacityBorrowPolicy === "NEVER") continue;
       eligible.push({
         admissionRequestId: waiter.admissionRequestId,
         priority: waiter.AdmissionRequest.basePriority,
         enqueueSequence: waiter.AdmissionRequest.enqueueSequence,
         eligible: true,
       });
+      eligibility.set(waiter.admissionRequestId, { borrowed });
     }
     if (!eligible.length) return;
     const deficits = schedulerDeficits(capacity.schedulerDeficits);
@@ -201,6 +224,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         poolMemberId: waiter.poolMemberId,
         priority: waiter.AdmissionRequest.basePriority,
         reservationClass: waiter.AdmissionRequest.basePriority,
+        borrowed: eligibility.get(waiter.admissionRequestId)?.borrowed ?? false,
         fencingToken,
         ownerServerInstance: this.serverInstance,
         heartbeatAt: now,

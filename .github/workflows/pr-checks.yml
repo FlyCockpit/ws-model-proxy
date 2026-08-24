@@ -361,6 +361,14 @@ jobs:
       - name: Validate schema and hardening against PostgreSQL
         run: pnpm db:validate
 
+      - name: Apply validation schema
+        env:
+          DATABASE_URL: ${{ env.SCHEMA_VALIDATION_DATABASE_URL }}
+        run: pnpm --filter @ws-model-proxy/db db:push
+
+      - name: Prove capacity admission PostgreSQL primitives
+        run: pnpm --filter server exec vitest run src/model-api/capacity/postgres-store.integration.test.ts
+
   # ── React Doctor (React health scan: hooks, a11y, perf, security) ─
 
   react-doctor:

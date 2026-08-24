@@ -7,6 +7,9 @@
     },
     "./forwarder-security": {
       "default": "./src/forwarder-security.ts"
+    },
+    "./client-factory": {
+      "default": "./src/client-factory.ts"
     }
   },
   "scripts": {
