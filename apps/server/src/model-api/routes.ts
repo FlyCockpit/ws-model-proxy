@@ -246,6 +246,8 @@ type ResponseStickinessRecordRow = {
   targetDiscoveredModelId: string | null;
   targetModelPoolId: string | null;
   selectedDiscoveredModelId: string | null;
+  TargetExecutionTarget: { discoveredModelId: string | null } | null;
+  SelectedExecutionTarget: { discoveredModelId: string | null } | null;
   expiresAt: Date | null;
 };
 
@@ -1172,15 +1174,22 @@ async function resolveStickyRoute({
       targetDiscoveredModelId: true,
       targetModelPoolId: true,
       selectedDiscoveredModelId: true,
+      TargetExecutionTarget: { select: { discoveredModelId: true } },
+      SelectedExecutionTarget: { select: { discoveredModelId: true } },
       expiresAt: true,
     },
   })) as ResponseStickinessRecordRow | null;
+
+  const targetDiscoveredModelId =
+    record?.TargetExecutionTarget?.discoveredModelId ?? record?.targetDiscoveredModelId ?? null;
+  const selectedDiscoveredModelId =
+    record?.SelectedExecutionTarget?.discoveredModelId ?? record?.selectedDiscoveredModelId ?? null;
 
   if (
     !record ||
     record.userId !== requester.userId ||
     record.modelApiTokenId !== requester.modelApiTokenId ||
-    !record.selectedDiscoveredModelId ||
+    !selectedDiscoveredModelId ||
     (record.expiresAt !== null && record.expiresAt <= new Date())
   ) {
     return openAiFailureJsonResponse(
@@ -1189,9 +1198,9 @@ async function resolveStickyRoute({
     );
   }
 
-  if (record.targetDiscoveredModelId) {
+  if (targetDiscoveredModelId) {
     const visibleTarget =
-      targets.directModels.find((target) => target.id === record.targetDiscoveredModelId) ?? null;
+      targets.directModels.find((target) => target.id === targetDiscoveredModelId) ?? null;
     if (!visibleTarget) {
       return openAiFailureJsonResponse(
         "access_denied",
@@ -1201,7 +1210,7 @@ async function resolveStickyRoute({
     return {
       target: "DIRECT_MODEL",
       visibleTarget,
-      selectedDiscoveredModelId: record.selectedDiscoveredModelId,
+      selectedDiscoveredModelId,
     };
   }
 
@@ -1217,7 +1226,7 @@ async function resolveStickyRoute({
     return {
       target: "MODEL_POOL",
       visibleTarget,
-      selectedDiscoveredModelId: record.selectedDiscoveredModelId,
+      selectedDiscoveredModelId,
     };
   }
 
@@ -1251,13 +1260,38 @@ async function directModelRow(discoveredModelId: string): Promise<DirectModelRel
 }
 
 async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
-  return (await prisma.poolMember.findMany({
+  const rows = await prisma.poolMember.findMany({
     where: { poolId },
     orderBy: { id: "asc" },
     select: {
       id: true,
       poolId: true,
       discoveredModelId: true,
+      ExecutionTarget: {
+        select: {
+          DiscoveredModel: {
+            select: {
+              id: true,
+              userId: true,
+              published: true,
+              upstreamModelId: true,
+              capabilityOverrideMode: true,
+              capabilityOverrideMetadata: true,
+              Endpoint: {
+                select: {
+                  id: true,
+                  slug: true,
+                  published: true,
+                  cliDeviceId: true,
+                  status: true,
+                  capabilityMetadata: true,
+                  CliDevice: { select: { status: true } },
+                },
+              },
+            },
+          },
+        },
+      },
       weight: true,
       healthStatus: true,
       routingStatus: true,
@@ -1288,7 +1322,12 @@ async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
         },
       },
     },
-  })) as PoolMemberRelayRow[];
+  });
+  return rows.flatMap((row) => {
+    const discoveredModel = row.ExecutionTarget?.DiscoveredModel ?? row.DiscoveredModel;
+    if (!discoveredModel) return [];
+    return [{ ...row, discoveredModelId: discoveredModel.id, DiscoveredModel: discoveredModel }];
+  }) as PoolMemberRelayRow[];
 }
 
 function directTargetByModelId(targets: VisibleDirectModelTarget[], modelId: string) {
@@ -1342,6 +1381,17 @@ async function modelListResponse(targets: {
           where: { poolId: { in: poolIds } },
           select: {
             poolId: true,
+            ExecutionTarget: {
+              select: {
+                DiscoveredModel: {
+                  select: {
+                    capabilityOverrideMode: true,
+                    capabilityOverrideMetadata: true,
+                    Endpoint: { select: { capabilityMetadata: true } },
+                  },
+                },
+              },
+            },
             DiscoveredModel: {
               select: {
                 capabilityOverrideMode: true,
@@ -1417,7 +1467,8 @@ async function modelListResponse(targets: {
     const memberFlags = poolMemberRows
       .filter((row) => row.poolId === poolId)
       .map((row) => {
-        const dm = row.DiscoveredModel;
+        const dm = row.ExecutionTarget?.DiscoveredModel ?? row.DiscoveredModel;
+        if (!dm) return multimodalFlagsFromCapabilities(null);
         const caps = effectiveCapabilitiesFrom({
           capabilityOverrideMode: dm.capabilityOverrideMode,
           capabilityOverrideMetadata: dm.capabilityOverrideMetadata,

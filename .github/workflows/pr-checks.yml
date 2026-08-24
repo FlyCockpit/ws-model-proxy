@@ -316,10 +316,26 @@ jobs:
   # ── Prisma schema validation ──────────────────────────────────────
 
   prisma-validate:
-    name: Prisma validate
+    name: PostgreSQL schema validation
     needs: setup
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: schema_validation
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d schema_validation"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      SCHEMA_VALIDATION_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/schema_validation
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
@@ -342,11 +358,8 @@ jobs:
             packages/db/prisma/generated
           key: workspace-${{ github.sha }}
 
-      - name: Validate schema
-        run: pnpm -F @ws-model-proxy/db exec prisma validate
-
-      - name: Check schema formatting
-        run: pnpm -F @ws-model-proxy/db exec prisma format --check
+      - name: Validate schema and hardening against PostgreSQL
+        run: pnpm db:validate
 
   # ── React Doctor (React health scan: hooks, a11y, perf, security) ─
 

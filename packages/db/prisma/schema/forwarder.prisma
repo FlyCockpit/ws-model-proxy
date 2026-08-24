@@ -378,7 +378,7 @@ model PoolMember {
   createdAt                    DateTime                @default(now())
   updatedAt                    DateTime                @default(now()) @updatedAt
   poolId                       String
-  discoveredModelId            String
+  discoveredModelId            String?
   executionTargetId            String?
   weight                       Int                     @default(1)
   healthStatus                 PoolMemberHealthStatus  @default(UNKNOWN)
@@ -390,10 +390,11 @@ model PoolMember {
   halfOpenTrialStartedAt       DateTime?
   lastRoutedAt                 DateTime?
   ModelPool                    ModelPool               @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  DiscoveredModel              DiscoveredModel         @relation(fields: [discoveredModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  DiscoveredModel              DiscoveredModel?        @relation(fields: [discoveredModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ExecutionTarget              ExecutionTarget?        @relation(fields: [executionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
   @@unique([poolId, discoveredModelId])
+  @@unique([poolId, executionTargetId])
   @@index([discoveredModelId])
   @@index([executionTargetId])
   @@index([poolId, routingStatus, healthStatus])
@@ -458,6 +459,7 @@ model ModelApiTokenAllowlistEntry {
   ModelPool         ModelPool?                   @relation(fields: [modelPoolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
   @@unique([modelApiTokenId, discoveredModelId])
+  @@unique([modelApiTokenId, executionTargetId])
   @@unique([modelApiTokenId, modelPoolId])
   @@index([discoveredModelId])
   @@index([executionTargetId])

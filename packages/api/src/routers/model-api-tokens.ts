@@ -33,6 +33,7 @@ const tokenSelection = {
     select: {
       target: true,
       discoveredModelId: true,
+      ExecutionTarget: { select: { discoveredModelId: true } },
       modelPoolId: true,
     },
   },
@@ -52,6 +53,7 @@ type TokenListRow = {
   AllowlistEntries: {
     target: string;
     discoveredModelId: string | null;
+    ExecutionTarget?: { discoveredModelId: string | null } | null;
     modelPoolId: string | null;
   }[];
 };
@@ -69,7 +71,9 @@ function serializeToken(row: TokenListRow) {
     expiresAt: row.expiresAt,
     allowlist: {
       directModelCount: row.AllowlistEntries.filter(
-        (entry) => entry.target === "DIRECT_MODEL" && entry.discoveredModelId,
+        (entry) =>
+          entry.target === "DIRECT_MODEL" &&
+          Boolean(entry.ExecutionTarget?.discoveredModelId ?? entry.discoveredModelId),
       ).length,
       modelPoolCount: row.AllowlistEntries.filter(
         (entry) => entry.target === "MODEL_POOL" && entry.modelPoolId,

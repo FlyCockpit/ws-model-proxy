@@ -49,6 +49,27 @@ BEGIN
 END
 $hardening$;
 
+-- Execution-target identity is immutable. Consumers may safely treat an ID as
+-- a stable owner/kind/source tuple; source rows remain deletable through FKs.
+CREATE OR REPLACE FUNCTION enforce_execution_target_identity_immutable()
+RETURNS trigger LANGUAGE plpgsql AS $target_identity$
+BEGIN
+  IF NEW."userId" IS DISTINCT FROM OLD."userId"
+     OR NEW.kind IS DISTINCT FROM OLD.kind
+     OR NEW."discoveredModelId" IS DISTINCT FROM OLD."discoveredModelId"
+     OR NEW."providerModelId" IS DISTINCT FROM OLD."providerModelId" THEN
+    RAISE EXCEPTION 'execution target identity and source are immutable'
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END
+$target_identity$;
+
+DROP TRIGGER IF EXISTS execution_target_identity_immutable ON execution_target;
+CREATE TRIGGER execution_target_identity_immutable
+BEFORE UPDATE OF "userId", kind, "discoveredModelId", "providerModelId" ON execution_target
+FOR EACH ROW EXECUTE FUNCTION enforce_execution_target_identity_immutable();
+
 -- Deterministic IDs make this safe to rerun and allow an interrupted rollout
 -- to resume without producing duplicate execution targets.
 INSERT INTO execution_target (
@@ -116,26 +137,41 @@ DECLARE
   consumer_owner TEXT;
 BEGIN
   IF TG_TABLE_NAME = 'pool_member' THEN
-    IF NEW."executionTargetId" IS NULL THEN RETURN NEW; END IF;
+    IF NEW."executionTargetId" IS NULL THEN
+      IF NEW."discoveredModelId" IS NULL THEN
+        RAISE EXCEPTION 'pool_member requires an execution target or legacy discovered model'
+          USING ERRCODE = '23514';
+      END IF;
+      RETURN NEW;
+    END IF;
     SELECT et."userId", et."discoveredModelId", pool."userId"
       INTO target_owner, target_model, consumer_owner
       FROM execution_target et, model_pool pool
      WHERE et.id = NEW."executionTargetId" AND pool.id = NEW."poolId";
-    IF target_owner IS NULL OR target_owner <> consumer_owner
-       OR target_model IS DISTINCT FROM NEW."discoveredModelId" THEN
+    IF target_owner IS NULL OR target_owner <> consumer_owner OR target_model IS NULL
+       OR (NEW."discoveredModelId" IS NOT NULL
+           AND target_model IS DISTINCT FROM NEW."discoveredModelId") THEN
       RAISE EXCEPTION 'pool_member execution target must match its owner and discovered model'
         USING ERRCODE = '23514';
     END IF;
   ELSIF TG_TABLE_NAME = 'model_api_token_allowlist_entry' THEN
-    IF NEW."executionTargetId" IS NULL THEN RETURN NEW; END IF;
+    IF NEW."executionTargetId" IS NULL THEN
+      IF NEW.target = 'DIRECT_MODEL'::"ModelApiTokenAllowlistTarget"
+         AND NEW."discoveredModelId" IS NULL THEN
+        RAISE EXCEPTION 'direct-model allowlist entry requires an execution target or legacy model'
+          USING ERRCODE = '23514';
+      END IF;
+      RETURN NEW;
+    END IF;
     SELECT et."userId", et."discoveredModelId", token."userId"
       INTO target_owner, target_model, consumer_owner
       FROM execution_target et, model_api_token token
      WHERE et.id = NEW."executionTargetId" AND token.id = NEW."modelApiTokenId";
     IF NEW.target <> 'DIRECT_MODEL'::"ModelApiTokenAllowlistTarget"
-       OR NEW."discoveredModelId" IS NULL OR target_owner IS NULL
+       OR target_owner IS NULL OR target_model IS NULL
        OR target_owner <> consumer_owner
-       OR target_model IS DISTINCT FROM NEW."discoveredModelId" THEN
+       OR (NEW."discoveredModelId" IS NOT NULL
+           AND target_model IS DISTINCT FROM NEW."discoveredModelId") THEN
       RAISE EXCEPTION 'allowlist execution target must match its owner and direct model'
         USING ERRCODE = '23514';
     END IF;
@@ -144,7 +180,9 @@ BEGIN
       SELECT "userId", "discoveredModelId" INTO target_owner, target_model
         FROM execution_target WHERE id = NEW."targetExecutionTargetId";
       IF target_owner IS NULL OR target_owner <> NEW."userId"
-         OR target_model IS DISTINCT FROM NEW."targetDiscoveredModelId" THEN
+         OR target_model IS NULL
+         OR (NEW."targetDiscoveredModelId" IS NOT NULL
+             AND target_model IS DISTINCT FROM NEW."targetDiscoveredModelId") THEN
         RAISE EXCEPTION 'stickiness target must match its owner and discovered model'
           USING ERRCODE = '23514';
       END IF;
@@ -153,7 +191,9 @@ BEGIN
       SELECT "userId", "discoveredModelId" INTO target_owner, target_model
         FROM execution_target WHERE id = NEW."selectedExecutionTargetId";
       IF target_owner IS NULL OR target_owner <> NEW."userId"
-         OR target_model IS DISTINCT FROM NEW."selectedDiscoveredModelId" THEN
+         OR target_model IS NULL
+         OR (NEW."selectedDiscoveredModelId" IS NOT NULL
+             AND target_model IS DISTINCT FROM NEW."selectedDiscoveredModelId") THEN
         RAISE EXCEPTION 'stickiness selection must match its owner and discovered model'
           USING ERRCODE = '23514';
       END IF;
@@ -163,7 +203,9 @@ BEGIN
       SELECT "userId", "discoveredModelId" INTO target_owner, target_model
         FROM execution_target WHERE id = NEW."requestedExecutionTargetId";
       IF target_owner IS NULL OR target_owner <> NEW."userId"
-         OR target_model IS DISTINCT FROM NEW."requestedDiscoveredModelId" THEN
+         OR target_model IS NULL
+         OR (NEW."requestedDiscoveredModelId" IS NOT NULL
+             AND target_model IS DISTINCT FROM NEW."requestedDiscoveredModelId") THEN
         RAISE EXCEPTION 'relay request target must match its owner and discovered model'
           USING ERRCODE = '23514';
       END IF;
@@ -172,7 +214,9 @@ BEGIN
       SELECT "userId", "discoveredModelId" INTO target_owner, target_model
         FROM execution_target WHERE id = NEW."selectedExecutionTargetId";
       IF target_owner IS NULL OR target_owner <> NEW."userId"
-         OR target_model IS DISTINCT FROM NEW."selectedDiscoveredModelId" THEN
+         OR target_model IS NULL
+         OR (NEW."selectedDiscoveredModelId" IS NOT NULL
+             AND target_model IS DISTINCT FROM NEW."selectedDiscoveredModelId") THEN
         RAISE EXCEPTION 'relay request selection must match its owner and discovered model'
           USING ERRCODE = '23514';
       END IF;

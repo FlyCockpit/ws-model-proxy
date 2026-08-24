@@ -61,6 +61,30 @@ export function createPoolMemberTestRoutes({
       select: {
         id: true,
         ModelPool: { select: { userId: true } },
+        ExecutionTarget: {
+          select: {
+            DiscoveredModel: {
+              select: {
+                id: true,
+                published: true,
+                upstreamModelId: true,
+                capabilityOverrideMode: true,
+                capabilityOverrides: true,
+                capabilityOverrideMetadata: true,
+                Endpoint: {
+                  select: {
+                    published: true,
+                    slug: true,
+                    cliDeviceId: true,
+                    capabilityMetadata: true,
+                    defaultCapabilities: true,
+                    CliDevice: { select: { status: true } },
+                  },
+                },
+              },
+            },
+          },
+        },
         DiscoveredModel: {
           select: {
             id: true,
@@ -86,7 +110,10 @@ export function createPoolMemberTestRoutes({
     if (!member || member.ModelPool.userId !== session.user.id) {
       return c.json({ ok: false, error: "Pool member not found." }, 404);
     }
-    const model = member.DiscoveredModel;
+    const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
+    if (!model) {
+      return c.json({ ok: false, error: "Member execution target is not relay-capable." }, 409);
+    }
     if (!model.published || !model.Endpoint.published) {
       return c.json({ ok: false, error: "Member model is unpublished." }, 409);
     }

@@ -422,13 +422,34 @@ export async function selectPoolRouteSequence({
   now?: Date;
   state?: SmoothWeightedRoundRobinState;
 }): Promise<PoolRouteSequenceResult> {
-  const members = (await prisma.poolMember.findMany({
+  const rows = await prisma.poolMember.findMany({
     where: { poolId },
     orderBy: { id: "asc" },
     select: {
       id: true,
       poolId: true,
       discoveredModelId: true,
+      ExecutionTarget: {
+        select: {
+          DiscoveredModel: {
+            select: {
+              id: true,
+              published: true,
+              upstreamModelId: true,
+              Endpoint: {
+                select: {
+                  id: true,
+                  slug: true,
+                  published: true,
+                  cliDeviceId: true,
+                  status: true,
+                  CliDevice: { select: { status: true } },
+                },
+              },
+            },
+          },
+        },
+      },
       weight: true,
       healthStatus: true,
       routingStatus: true,
@@ -439,6 +460,7 @@ export async function selectPoolRouteSequence({
       halfOpenTrialStartedAt: true,
       DiscoveredModel: {
         select: {
+          id: true,
           published: true,
           upstreamModelId: true,
           Endpoint: {
@@ -454,7 +476,12 @@ export async function selectPoolRouteSequence({
         },
       },
     },
-  })) as PoolMemberRouteRow[];
+  });
+  const members = rows.flatMap((row) => {
+    const discoveredModel = row.ExecutionTarget?.DiscoveredModel ?? row.DiscoveredModel;
+    if (!discoveredModel) return [];
+    return [{ ...row, discoveredModelId: discoveredModel.id, DiscoveredModel: discoveredModel }];
+  }) as PoolMemberRouteRow[];
 
   return buildPoolRouteSequence({ members, activeCliDeviceIds, now, state });
 }

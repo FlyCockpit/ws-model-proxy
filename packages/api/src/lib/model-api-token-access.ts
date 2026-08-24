@@ -85,6 +85,7 @@ type PoolGrantRow = {
 type AllowlistEntryRow = {
   target: ModelApiTokenAllowlistTarget;
   discoveredModelId: string | null;
+  ExecutionTarget?: { discoveredModelId: string | null } | null;
   modelPoolId: string | null;
 };
 
@@ -255,14 +256,16 @@ export async function listVisibleModelTargetsForToken(
     select: {
       target: true,
       discoveredModelId: true,
+      ExecutionTarget: { select: { discoveredModelId: true } },
       modelPoolId: true,
     },
   })) as AllowlistEntryRow[];
 
   const allowedDirectIds = new Set(
     entries
-      .filter((entry) => entry.target === "DIRECT_MODEL" && entry.discoveredModelId)
-      .map((entry) => entry.discoveredModelId),
+      .filter((entry) => entry.target === "DIRECT_MODEL")
+      .map((entry) => entry.ExecutionTarget?.discoveredModelId ?? entry.discoveredModelId)
+      .filter((id): id is string => Boolean(id)),
   );
   const allowedPoolIds = new Set(
     entries

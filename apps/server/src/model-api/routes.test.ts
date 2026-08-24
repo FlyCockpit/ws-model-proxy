@@ -1602,9 +1602,11 @@ describe("model API routes", () => {
     db.responseStickinessRecord.findUnique.mockResolvedValue({
       userId: "user-id",
       modelApiTokenId: "token-id",
-      targetDiscoveredModelId: "model-id",
+      targetDiscoveredModelId: null,
       targetModelPoolId: null,
-      selectedDiscoveredModelId: "model-id",
+      selectedDiscoveredModelId: null,
+      TargetExecutionTarget: { discoveredModelId: "model-id" },
+      SelectedExecutionTarget: { discoveredModelId: "model-id" },
       expiresAt: new Date(Date.now() + 60_000),
     });
     const manager = new FakeRelayManager();

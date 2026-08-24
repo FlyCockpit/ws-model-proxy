@@ -18,6 +18,7 @@ const requiredFragments = [
   "pg_get_constraintdef",
   'ON CONFLICT ("discoveredModelId") DO NOTHING',
   "enforce_execution_target_consumer_consistency",
+  "enforce_execution_target_identity_immutable",
   "UPDATE pool_member",
   "UPDATE model_api_token_allowlist_entry",
   "UPDATE response_stickiness_record",
@@ -49,11 +50,11 @@ prismaUrl.searchParams.set("schema", schema);
 const admin = new pg.Client({ connectionString: baseUrl });
 const client = new pg.Client({ connectionString: baseUrl });
 
-async function expectConstraintFailure(statement) {
+async function expectConstraintFailure(statement, expectedCode = "23514") {
   try {
     await client.query(statement);
   } catch (error) {
-    if (error?.code === "23514") return;
+    if (error?.code === expectedCode) return;
     throw error;
   }
   throw new Error("Expected PostgreSQL constraint failure");
@@ -122,6 +123,14 @@ try {
   await expectConstraintFailure(`
     UPDATE relay_request SET "requestedDiscoveredModelId" = 'model-b' WHERE id = 'old-relay'
   `);
+  await expectConstraintFailure(`
+    UPDATE execution_target SET "discoveredModelId" = 'model-b'
+     WHERE "discoveredModelId" = 'model-a'
+  `);
+  await expectConstraintFailure(`
+    UPDATE execution_target SET "userId" = 'owner-b'
+     WHERE "discoveredModelId" = 'model-a'
+  `);
   await client.query(`
     INSERT INTO model_pool (id, "createdAt", "updatedAt", "userId", slug, name)
     VALUES ('pool-a', NOW(), NOW(), 'owner-a', 'pool', 'Pool')
@@ -131,6 +140,41 @@ try {
       (id, "createdAt", "updatedAt", "poolId", "discoveredModelId", "executionTargetId")
     SELECT 'cross-owner-member', NOW(), NOW(), 'pool-a', 'model-b', id
       FROM execution_target WHERE "discoveredModelId" = 'model-b'
+  `);
+  await client.query(`
+    INSERT INTO pool_member
+      (id, "createdAt", "updatedAt", "poolId", "executionTargetId")
+    SELECT 'new-only-member', NOW(), NOW(), 'pool-a', id
+      FROM execution_target WHERE "discoveredModelId" = 'model-a';
+  `);
+  await expectConstraintFailure(
+    `
+    INSERT INTO pool_member
+      (id, "createdAt", "updatedAt", "poolId", "executionTargetId")
+    SELECT 'duplicate-new-only-member', NOW(), NOW(), 'pool-a', id
+      FROM execution_target WHERE "discoveredModelId" = 'model-a'
+  `,
+    "23505",
+  );
+  await expectConstraintFailure(`
+    INSERT INTO pool_member (id, "createdAt", "updatedAt", "poolId")
+    VALUES ('empty-member', NOW(), NOW(), 'pool-a')
+  `);
+  await client.query(`
+    INSERT INTO response_stickiness_record
+      (id, "createdAt", "updatedAt", "userId", "routingKeyDigest",
+       "selectedExecutionTargetId")
+    SELECT 'new-only-stickiness', NOW(), NOW(), 'owner-a', 'new-only', id
+      FROM execution_target WHERE "discoveredModelId" = 'model-a';
+    INSERT INTO response_stickiness_record
+      (id, "createdAt", "updatedAt", "userId", "routingKeyDigest",
+       "selectedDiscoveredModelId")
+    VALUES ('legacy-only-stickiness', NOW(), NOW(), 'owner-a', 'legacy-only', 'model-a');
+    INSERT INTO response_stickiness_record
+      (id, "createdAt", "updatedAt", "userId", "routingKeyDigest",
+       "selectedDiscoveredModelId", "selectedExecutionTargetId")
+    SELECT 'dual-stickiness', NOW(), NOW(), 'owner-a', 'dual', 'model-a', id
+      FROM execution_target WHERE "discoveredModelId" = 'model-a';
   `);
   process.stdout.write("Schema-hardening PostgreSQL integration validation complete.\n");
 } finally {
