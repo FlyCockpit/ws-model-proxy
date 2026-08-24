@@ -121,6 +121,8 @@ export function sampling(
     if (body[input] !== undefined) {
       if (typeof body[input] !== "number" || !Number.isFinite(body[input]))
         invalid(input, "must be finite");
+      if ((body[input] as number) < 0 || (body[input] as number) > 1)
+        invalid(input, "must be within the cross-protocol range 0 through 1");
       result[output] = body[input];
     }
   }
@@ -134,7 +136,27 @@ export function sampling(
     const values = typeof rawStop === "string" ? [rawStop] : rawStop;
     if (!Array.isArray(values) || values.some((item) => typeof item !== "string"))
       invalid("stop", "must contain strings");
+    if (values.length === 0 || values.length > 4)
+      invalid("stop", "must contain between 1 and 4 strings");
+    if (values.some((item) => item.length === 0 || new TextEncoder().encode(item).byteLength > 256))
+      invalid("stop", "must contain non-empty strings no larger than 256 bytes");
     result.stop = values as string[];
   }
   return result;
+}
+
+const SAFE_IMAGE_MIME = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+
+export function parseImageUrl(value: unknown, parameter: string, detail?: unknown) {
+  const url = string(value, parameter);
+  if (detail !== undefined && detail !== "auto" && detail !== "low" && detail !== "high")
+    invalid(`${parameter}.detail`, "is invalid");
+  if (url.startsWith("https://"))
+    return { kind: "url" as const, url, ...(detail ? { detail: detail as "auto" } : {}) };
+  const match = /^data:([^;,]+);base64,([A-Za-z0-9+/]*={0,2})$/.exec(url);
+  if (!match || !SAFE_IMAGE_MIME.has(match[1] ?? ""))
+    unsupported(parameter, "must be HTTPS or base64 JPEG, PNG, GIF, or WebP");
+  const data = match[2] ?? "";
+  if (data.length === 0 || data.length % 4 !== 0) invalid(parameter, "contains invalid base64");
+  return { kind: "base64" as const, mediaType: match[1] as "image/jpeg", data };
 }

@@ -1,0 +1,488 @@
+import type {
+  CanonicalProtocolError,
+  CanonicalResponse,
+  ParsedProtocolResponse,
+  ProtocolResponseMetadata,
+  ProtocolSurface,
+} from "./canonical.js";
+import { invalid, unsupported } from "./errors.js";
+import { object, rejectUnknown, string } from "./parse-utils.js";
+
+export function parseProtocolResponse({
+  surface,
+  body,
+  status,
+  headers = new Headers(),
+}: {
+  surface: ProtocolSurface;
+  body: unknown;
+  status: number;
+  headers?: Headers;
+}): ParsedProtocolResponse {
+  const metadata = responseMetadata(status, headers);
+  if (status < 200 || status >= 300)
+    return { ok: false, metadata, error: parseError(surface, body, metadata) };
+  return {
+    ok: true,
+    metadata,
+    response:
+      surface === "openai-chat"
+        ? parseChatSuccess(body)
+        : surface === "openai-responses"
+          ? parseResponsesSuccess(body)
+          : parseAnthropicSuccess(body),
+  };
+}
+
+export function responseMetadata(status: number, headers: Headers): ProtocolResponseMetadata {
+  const safe = (name: string) => headers.get(name)?.slice(0, 512) || undefined;
+  return {
+    status,
+    requestId: safe("request-id") ?? safe("x-request-id"),
+    retryAfter: safe("retry-after"),
+    retryLimit: safe("x-ratelimit-limit-requests"),
+    retryRemaining: safe("x-ratelimit-remaining-requests"),
+    retryReset: safe("x-ratelimit-reset-requests"),
+  };
+}
+
+function parseChatSuccess(value: unknown): CanonicalResponse {
+  const body = object(value);
+  rejectUnknown(
+    body,
+    ["id", "object", "created", "model", "choices", "usage", "system_fingerprint", "service_tier"],
+    "response",
+  );
+  if (body.object !== "chat.completion") invalid("response.object", "must be chat.completion");
+  if (!Array.isArray(body.choices) || body.choices.length !== 1)
+    unsupported("response.choices", "must contain exactly one candidate");
+  const choice = object(body.choices[0], "response.choices[0]");
+  rejectUnknown(choice, ["index", "message", "finish_reason", "logprobs"], "response.choices[0]");
+  if (choice.index !== 0) invalid("response.choices[0].index", "must be zero");
+  if (choice.logprobs != null) unsupported("response.choices[0].logprobs");
+  const message = object(choice.message, "response.choices[0].message");
+  rejectUnknown(
+    message,
+    ["role", "content", "refusal", "tool_calls"],
+    "response.choices[0].message",
+  );
+  if (message.role !== "assistant")
+    invalid("response.choices[0].message.role", "must be assistant");
+  const items: CanonicalResponse["items"] = [];
+  if (typeof message.content === "string" && message.content)
+    items.push({ type: "text", text: message.content });
+  else if (message.content != null)
+    invalid("response.choices[0].message.content", "must be text or null");
+  if (typeof message.refusal === "string" && message.refusal)
+    items.push({ type: "refusal", text: message.refusal });
+  if (message.tool_calls !== undefined) {
+    if (!Array.isArray(message.tool_calls))
+      invalid("response.choices[0].message.tool_calls", "must be an array");
+    for (const [index, raw] of message.tool_calls.entries()) {
+      const call = object(raw, `response.choices[0].message.tool_calls[${index}]`);
+      rejectUnknown(
+        call,
+        ["id", "type", "function"],
+        `response.choices[0].message.tool_calls[${index}]`,
+      );
+      if (call.type !== "function")
+        unsupported(`response.choices[0].message.tool_calls[${index}].type`);
+      const fn = object(call.function, `response.choices[0].message.tool_calls[${index}].function`);
+      rejectUnknown(
+        fn,
+        ["name", "arguments"],
+        `response.choices[0].message.tool_calls[${index}].function`,
+      );
+      items.push({
+        type: "tool_call",
+        id: string(call.id, "tool_call.id"),
+        name: string(fn.name, "tool_call.name"),
+        arguments: completeArguments(fn.arguments, "tool_call.arguments"),
+      });
+    }
+  }
+  return {
+    id: string(body.id, "response.id"),
+    ...(typeof body.model === "string" ? { model: body.model } : {}),
+    items,
+    usage: parseUsage(body.usage),
+    stopReason: stopReason(choice.finish_reason),
+  };
+}
+
+function parseResponsesSuccess(value: unknown): CanonicalResponse {
+  const body = object(value);
+  rejectUnknown(
+    body,
+    [
+      "id",
+      "object",
+      "created_at",
+      "status",
+      "model",
+      "output",
+      "usage",
+      "error",
+      "incomplete_details",
+      "parallel_tool_calls",
+      "tool_choice",
+      "tools",
+      "temperature",
+      "top_p",
+      "max_output_tokens",
+    ],
+    "response",
+  );
+  if (body.object !== "response") invalid("response.object", "must be response");
+  if (body.status !== "completed")
+    unsupported("response.status", "must be completed for non-stream adaptation");
+  if (body.error != null || body.incomplete_details != null)
+    unsupported("response", "contains incomplete or error state");
+  if (!Array.isArray(body.output)) invalid("response.output", "must be an array");
+  const items: CanonicalResponse["items"] = [];
+  for (const [index, raw] of body.output.entries()) {
+    const item = object(raw, `response.output[${index}]`);
+    if (item.type === "message") {
+      rejectUnknown(item, ["id", "type", "status", "role", "content"], `response.output[${index}]`);
+      if (item.role !== "assistant" || item.status !== "completed")
+        invalid(`response.output[${index}]`, "must be a completed assistant message");
+      if (!Array.isArray(item.content))
+        invalid(`response.output[${index}].content`, "must be an array");
+      for (const [contentIndex, rawContent] of item.content.entries()) {
+        const content = object(rawContent, `response.output[${index}].content[${contentIndex}]`);
+        if (content.type === "output_text") {
+          rejectUnknown(
+            content,
+            ["type", "text", "annotations", "logprobs"],
+            `response.output[${index}].content[${contentIndex}]`,
+          );
+          if (Array.isArray(content.annotations) && content.annotations.length)
+            unsupported(
+              `response.output[${index}].content[${contentIndex}].annotations`,
+              "citations are not safely adaptable",
+            );
+          if (Array.isArray(content.logprobs) && content.logprobs.length)
+            unsupported(`response.output[${index}].content[${contentIndex}].logprobs`);
+          items.push({ type: "text", text: string(content.text, "output_text.text") });
+        } else if (content.type === "refusal") {
+          rejectUnknown(
+            content,
+            ["type", "refusal"],
+            `response.output[${index}].content[${contentIndex}]`,
+          );
+          items.push({ type: "refusal", text: string(content.refusal, "refusal.refusal") });
+        } else unsupported(`response.output[${index}].content[${contentIndex}].type`);
+      }
+    } else if (item.type === "function_call") {
+      rejectUnknown(
+        item,
+        ["id", "type", "status", "call_id", "name", "arguments"],
+        `response.output[${index}]`,
+      );
+      if (item.status !== "completed")
+        invalid(`response.output[${index}].status`, "must be completed");
+      items.push({
+        type: "tool_call",
+        id: string(item.call_id, "function_call.call_id"),
+        name: string(item.name, "function_call.name"),
+        arguments: completeArguments(item.arguments, "function_call.arguments"),
+      });
+    } else unsupported(`response.output[${index}].type`);
+  }
+  return {
+    id: string(body.id, "response.id"),
+    ...(typeof body.model === "string" ? { model: body.model } : {}),
+    items,
+    usage: parseUsage(body.usage),
+    stopReason: items.some((item) => item.type === "tool_call") ? "tool" : "stop",
+  };
+}
+
+function parseAnthropicSuccess(value: unknown): CanonicalResponse {
+  const body = object(value);
+  rejectUnknown(
+    body,
+    ["id", "type", "role", "content", "model", "stop_reason", "stop_sequence", "usage"],
+    "response",
+  );
+  if (body.type !== "message" || body.role !== "assistant")
+    invalid("response", "must be an Anthropic assistant message");
+  if (!Array.isArray(body.content)) invalid("response.content", "must be an array");
+  const items: CanonicalResponse["items"] = body.content.map((raw, index) => {
+    const block = object(raw, `response.content[${index}]`);
+    if (block.type === "text") {
+      rejectUnknown(block, ["type", "text", "citations"], `response.content[${index}]`);
+      if (Array.isArray(block.citations) && block.citations.length)
+        unsupported(`response.content[${index}].citations`);
+      return { type: "text", text: string(block.text, `response.content[${index}].text`) };
+    }
+    if (block.type === "tool_use") {
+      rejectUnknown(block, ["type", "id", "name", "input"], `response.content[${index}]`);
+      return {
+        type: "tool_call",
+        id: string(block.id, "tool_use.id"),
+        name: string(block.name, "tool_use.name"),
+        arguments: JSON.stringify(object(block.input, "tool_use.input")),
+      };
+    }
+    return unsupported(`response.content[${index}].type`);
+  });
+  return {
+    id: string(body.id, "response.id"),
+    ...(typeof body.model === "string" ? { model: body.model } : {}),
+    items,
+    usage: parseUsage(body.usage),
+    stopReason: stopReason(body.stop_reason),
+  };
+}
+
+function parseUsage(value: unknown) {
+  if (value == null) return undefined;
+  const usage = object(value, "usage");
+  const allowed = [
+    "input_tokens",
+    "output_tokens",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "input_tokens_details",
+    "output_tokens_details",
+  ];
+  rejectUnknown(usage, allowed, "usage");
+  const input = usage.input_tokens ?? usage.prompt_tokens;
+  const output = usage.output_tokens ?? usage.completion_tokens;
+  if (input !== undefined && (typeof input !== "number" || input < 0))
+    invalid("usage.input_tokens", "is invalid");
+  if (output !== undefined && (typeof output !== "number" || output < 0))
+    invalid("usage.output_tokens", "is invalid");
+  return {
+    ...(typeof input === "number" ? { inputTokens: input } : {}),
+    ...(typeof output === "number" ? { outputTokens: output } : {}),
+  };
+}
+
+function completeArguments(value: unknown, parameter: string): string {
+  const raw = string(value, parameter);
+  try {
+    object(JSON.parse(raw), parameter);
+  } catch {
+    invalid(parameter, "must be a complete JSON object");
+  }
+  return raw;
+}
+
+function stopReason(value: unknown): CanonicalResponse["stopReason"] {
+  if (value === "stop" || value === "stop_sequence" || value === "end_turn") return "stop";
+  if (value === "length" || value === "max_tokens") return "length";
+  if (value === "tool_calls" || value === "tool_use") return "tool";
+  if (value === "content_filter") return "content_filter";
+  return "unknown";
+}
+
+function parseError(
+  surface: ProtocolSurface,
+  value: unknown,
+  metadata: ProtocolResponseMetadata,
+): CanonicalProtocolError {
+  const body = object(value, "error_response");
+  let error: Record<string, unknown>;
+  if (surface === "anthropic-messages") {
+    rejectUnknown(body, ["type", "error", "request_id"], "error_response");
+    if (body.type !== "error") invalid("error_response.type", "must be error");
+    error = object(body.error, "error_response.error");
+    rejectUnknown(error, ["type", "message"], "error_response.error");
+  } else {
+    rejectUnknown(body, ["error"], "error_response");
+    error = object(body.error, "error_response.error");
+    rejectUnknown(error, ["message", "type", "param", "code"], "error_response.error");
+  }
+  return {
+    code:
+      typeof error.code === "string"
+        ? error.code
+        : typeof error.type === "string"
+          ? error.type
+          : "upstream_error",
+    message: string(error.message, "error_response.error.message").slice(0, 1000),
+    ...(typeof error.param === "string" ? { parameter: error.param } : {}),
+    upstreamStatus: metadata.status,
+    ...(metadata.requestId ? { requestId: metadata.requestId } : {}),
+    ...(metadata.retryAfter ? { retryAfter: metadata.retryAfter } : {}),
+  };
+}
+
+export function renderProtocolResponse(
+  surface: ProtocolSurface,
+  response: CanonicalResponse,
+): Record<string, unknown> {
+  if (surface === "openai-chat") return renderChat(response);
+  if (surface === "openai-responses") return renderResponses(response);
+  return renderAnthropic(response);
+}
+
+function renderChat(response: CanonicalResponse) {
+  const hasCalls = response.items.some((item) => item.type === "tool_call");
+  const hasContent = response.items.some((item) => item.type !== "tool_call");
+  if (hasCalls && hasContent)
+    unsupported("response.items", "mixed content and tool calls have no lossless ordering in Chat");
+  const text = response.items
+    .filter((item) => item.type === "text")
+    .map((item) => item.text)
+    .join("");
+  const refusal = response.items
+    .filter((item) => item.type === "refusal")
+    .map((item) => item.text)
+    .join("");
+  const calls = response.items.filter((item) => item.type === "tool_call");
+  return {
+    id: response.id,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: response.model ?? "adapted",
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: "assistant",
+          content: text || null,
+          ...(refusal ? { refusal } : {}),
+          ...(calls.length
+            ? {
+                tool_calls: calls.map((call) => ({
+                  id: call.id,
+                  type: "function",
+                  function: { name: call.name, arguments: call.arguments },
+                })),
+              }
+            : {}),
+        },
+        finish_reason: response.stopReason === "tool" ? "tool_calls" : response.stopReason,
+      },
+    ],
+    ...(response.usage
+      ? {
+          usage: {
+            prompt_tokens: response.usage.inputTokens ?? 0,
+            completion_tokens: response.usage.outputTokens ?? 0,
+            total_tokens: (response.usage.inputTokens ?? 0) + (response.usage.outputTokens ?? 0),
+          },
+        }
+      : {}),
+  };
+}
+
+function renderResponses(response: CanonicalResponse) {
+  const output: Record<string, unknown>[] = [];
+  let messageIndex = 0;
+  let content: Record<string, unknown>[] = [];
+  const flush = () => {
+    if (!content.length) return;
+    output.push({
+      id: `${response.id}-message-${messageIndex++}`,
+      type: "message",
+      status: "completed",
+      role: "assistant",
+      content,
+    });
+    content = [];
+  };
+  for (const item of response.items) {
+    if (item.type === "text")
+      content.push({ type: "output_text", text: item.text, annotations: [] });
+    else if (item.type === "refusal") content.push({ type: "refusal", refusal: item.text });
+    else {
+      flush();
+      output.push({
+        id: `${response.id}-${item.id}`,
+        type: "function_call",
+        status: "completed",
+        call_id: item.id,
+        name: item.name,
+        arguments: item.arguments,
+      });
+    }
+  }
+  flush();
+  return {
+    id: response.id,
+    object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    status: "completed",
+    model: response.model ?? "adapted",
+    output,
+    ...(response.usage
+      ? {
+          usage: {
+            input_tokens: response.usage.inputTokens ?? 0,
+            output_tokens: response.usage.outputTokens ?? 0,
+            total_tokens: (response.usage.inputTokens ?? 0) + (response.usage.outputTokens ?? 0),
+          },
+        }
+      : {}),
+  };
+}
+
+function renderAnthropic(response: CanonicalResponse) {
+  return {
+    id: response.id,
+    type: "message",
+    role: "assistant",
+    model: response.model ?? "adapted",
+    content: response.items.map((item) =>
+      item.type === "text"
+        ? item
+        : item.type === "tool_call"
+          ? { type: "tool_use", id: item.id, name: item.name, input: JSON.parse(item.arguments) }
+          : unsupported("response.refusal", "Anthropic has no lossless refusal block"),
+    ),
+    stop_reason:
+      response.stopReason === "tool"
+        ? "tool_use"
+        : response.stopReason === "length"
+          ? "max_tokens"
+          : "end_turn",
+    stop_sequence: null,
+    usage: {
+      input_tokens: response.usage?.inputTokens ?? 0,
+      output_tokens: response.usage?.outputTokens ?? 0,
+    },
+  };
+}
+
+export function renderProtocolError(
+  surface: ProtocolSurface,
+  error: CanonicalProtocolError,
+): Record<string, unknown> {
+  if (surface === "anthropic-messages")
+    return {
+      type: "error",
+      error: { type: error.code, message: error.message },
+      ...(error.requestId ? { request_id: error.requestId } : {}),
+    };
+  return {
+    error: {
+      message: error.message,
+      type: error.code,
+      param: error.parameter ?? null,
+      code: error.code,
+    },
+  };
+}
+
+export function renderProtocolErrorMetadata(error: CanonicalProtocolError): {
+  status: number;
+  headers: Headers;
+} {
+  const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
+  if (error.requestId) headers.set("x-request-id", error.requestId);
+  if (error.retryAfter) headers.set("retry-after", error.retryAfter);
+  return {
+    status:
+      error.upstreamStatus && error.upstreamStatus >= 400 && error.upstreamStatus <= 599
+        ? error.upstreamStatus
+        : 502,
+    headers,
+  };
+}

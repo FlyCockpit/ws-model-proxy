@@ -87,9 +87,23 @@ export function parseAnthropicMessagesRequest(input: unknown): CanonicalRequest 
     rejectUnknown(message, ["role", "content"], `messages[${sourceIndex}]`);
     if (message.role !== "user" && message.role !== "assistant")
       invalid(`messages[${sourceIndex}].role`, "is unsupported");
+    const parsedContent = blocks(message.content, `messages[${sourceIndex}].content`);
+    if (message.role === "user" && parsedContent.some((part) => part.type === "tool_call"))
+      unsupported(
+        `messages[${sourceIndex}].content`,
+        "tool_use blocks must have the assistant role",
+      );
+    if (
+      message.role === "assistant" &&
+      parsedContent.some((part) => part.type === "tool_result" || part.type === "image")
+    )
+      unsupported(
+        `messages[${sourceIndex}].content`,
+        "tool results and input images must have the user role",
+      );
     return {
       role: message.role,
-      content: blocks(message.content, `messages[${sourceIndex}].content`),
+      content: parsedContent,
       boundary: { sourceIndex },
     };
   });
@@ -110,6 +124,7 @@ export function parseAnthropicMessagesRequest(input: unknown): CanonicalRequest 
     messages,
     tools: parseTools(body.tools, "tools", "anthropic"),
     toolChoice: parseAnthropicToolChoice(body.tool_choice),
+    parallelToolCalls: "single",
     stream: body.stream === true,
     sampling: sampling(body, "max_tokens"),
     limitations: [],
@@ -122,16 +137,12 @@ export function renderAnthropicMessagesRequest(
   options: { allowLossyInstructionRoleCollapse?: boolean } = {},
 ): Record<string, unknown> {
   const roles = new Set(request.instructions.map((item) => item.role));
-  if (roles.size > 1 && !options.allowLossyInstructionRoleCollapse) {
+  if (roles.has("developer") && !options.allowLossyInstructionRoleCollapse) {
     unsupported(
       "instructions",
       "mix system and developer roles; enable lossy instruction-role collapse explicitly",
     );
   }
-  const limitations = request.instructions.some((item) => item.role === "developer")
-    ? ["anthropic_instruction_authority_collapse"]
-    : [];
-  request.limitations.push(...limitations.filter((item) => !request.limitations.includes(item)));
   const system = request.instructions.flatMap((instruction) =>
     instruction.content.map((part) => ({ type: "text", text: part.text })),
   );
@@ -175,12 +186,18 @@ export function renderAnthropicMessagesRequest(
           })),
         }
       : {}),
-    ...(request.toolChoice
+    ...(request.tools.length || request.toolChoice
       ? {
           tool_choice:
-            request.toolChoice.type === "tool"
-              ? { type: "tool", name: request.toolChoice.name }
-              : { type: request.toolChoice.type === "required" ? "any" : request.toolChoice.type },
+            request.toolChoice?.type === "tool"
+              ? { type: "tool", name: request.toolChoice.name, disable_parallel_tool_use: true }
+              : {
+                  type:
+                    request.toolChoice?.type === "required"
+                      ? "any"
+                      : (request.toolChoice?.type ?? "auto"),
+                  disable_parallel_tool_use: true,
+                },
         }
       : {}),
     stream: request.stream,

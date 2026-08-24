@@ -54,10 +54,35 @@ export type CanonicalRequest = {
   messages: CanonicalMessage[];
   tools: CanonicalTool[];
   toolChoice?: CanonicalToolChoice;
+  /** Adapted paths deliberately force one tool call at a time. */
+  parallelToolCalls: "single";
   stream: boolean;
   sampling: { temperature?: number; topP?: number; stop?: string[]; maxOutputTokens?: number };
   limitations: string[];
 };
+
+export type CanonicalResponse = {
+  id: string;
+  model?: string;
+  items: Array<
+    { type: "text"; text: string } | { type: "refusal"; text: string } | CanonicalToolCall
+  >;
+  usage?: CanonicalUsage;
+  stopReason: "stop" | "length" | "tool" | "content_filter" | "unknown";
+};
+
+export type ProtocolResponseMetadata = {
+  status: number;
+  requestId?: string;
+  retryAfter?: string;
+  retryLimit?: string;
+  retryRemaining?: string;
+  retryReset?: string;
+};
+
+export type ParsedProtocolResponse =
+  | { ok: true; metadata: ProtocolResponseMetadata; response: CanonicalResponse }
+  | { ok: false; metadata: ProtocolResponseMetadata; error: CanonicalProtocolError };
 
 export type CanonicalUsage = { inputTokens?: number; outputTokens?: number };
 export type CanonicalEvent =

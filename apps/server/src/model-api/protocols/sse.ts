@@ -4,7 +4,7 @@ export type SseRecord = { event?: string; data: string; id?: string };
 
 /** Incremental SSE decoder: arbitrary byte boundaries, LF/CRLF, comments and multiline data. */
 export class SseDecoder {
-  readonly #decoder = new TextDecoder();
+  readonly #decoder = new TextDecoder("utf-8", { fatal: true });
   readonly #maxBufferBytes: number;
   #buffer = "";
   #finished = false;
@@ -15,17 +15,27 @@ export class SseDecoder {
 
   push(chunk: Uint8Array): SseRecord[] {
     if (this.#finished) throw new AdapterError("stream_closed", "SSE decoder is already closed.");
-    this.#buffer += this.#decoder.decode(chunk, { stream: true });
+    try {
+      this.#buffer += this.#decoder.decode(chunk, { stream: true });
+    } catch {
+      throw new AdapterError("invalid_utf8", "SSE stream was not valid UTF-8.");
+    }
+    const records = this.#drain(false);
     this.#guard();
-    return this.#drain(false);
+    return records;
   }
 
   finish(): SseRecord[] {
     if (this.#finished) return [];
     this.#finished = true;
-    this.#buffer += this.#decoder.decode();
+    try {
+      this.#buffer += this.#decoder.decode();
+    } catch {
+      throw new AdapterError("invalid_utf8", "SSE stream was not valid UTF-8.");
+    }
+    const records = this.#drain(true);
     this.#guard();
-    return this.#drain(true);
+    return records;
   }
 
   #guard() {
@@ -43,6 +53,8 @@ export class SseDecoder {
         .slice(0, match.index)
         .replaceAll("\r\n", "\n")
         .replaceAll("\r", "\n");
+      if (new TextEncoder().encode(raw).byteLength > this.#maxBufferBytes)
+        throw new AdapterError("stream_buffer_exceeded", "SSE event exceeded the bounded buffer.");
       this.#buffer = this.#buffer.slice(match.index + match[0].length);
       const record = parseRecord(raw);
       if (record) records.push(record);
@@ -67,6 +79,8 @@ function parseRecord(raw: string): SseRecord | null {
     if (field === "event") event = value;
     else if (field === "data") data.push(value);
     else if (field === "id" && !value.includes("\0")) id = value;
+    else if (field !== "id")
+      throw new AdapterError("unsupported_sse_field", `Unsupported SSE field: ${field}.`);
   }
   return data.length === 0 ? null : { event, data: data.join("\n"), id };
 }

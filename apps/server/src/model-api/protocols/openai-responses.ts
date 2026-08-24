@@ -2,6 +2,7 @@ import { ADAPTER_VERSION, type CanonicalMessage, type CanonicalRequest } from ".
 import { invalid, unsupported } from "./errors.js";
 import {
   object,
+  parseImageUrl,
   parseOpenAiToolChoice,
   parseTools,
   rejectUnknown,
@@ -70,23 +71,29 @@ export function parseOpenAiResponsesRequest(input: unknown): CanonicalRequest {
   else if (Array.isArray(rawInput)) {
     rawInput.forEach((entry, sourceIndex) => {
       const item = object(entry, `input[${sourceIndex}]`);
-      if (item.type === "message" || item.role !== undefined) {
+      if ((item.type === undefined || item.type === "message") && item.role !== undefined) {
         rejectUnknown(item, ["type", "id", "role", "content", "status"], `input[${sourceIndex}]`);
         if (item.id !== undefined || item.status !== undefined)
           unsupported(`input[${sourceIndex}]`, "persisted item references are native-only");
         if (item.role === "system" || item.role === "developer") {
           instructions.push({
             role: item.role,
-            content: responseText(item.content, `input[${sourceIndex}].content`),
+            content: responseInstructionText(item.content, `input[${sourceIndex}].content`),
             boundary: { sourceIndex },
           });
           return;
         }
         if (item.role !== "user" && item.role !== "assistant")
           invalid(`input[${sourceIndex}].role`, "is unsupported");
+        const parsedContent = responseText(item.content, `input[${sourceIndex}].content`);
+        if (item.role === "assistant" && parsedContent.some((part) => part.type === "image"))
+          unsupported(
+            `input[${sourceIndex}].content`,
+            "assistant images are not in the common subset",
+          );
         messages.push({
           role: item.role,
-          content: responseText(item.content, `input[${sourceIndex}].content`),
+          content: parsedContent,
           boundary: { sourceIndex },
         });
         return;
@@ -133,18 +140,36 @@ export function parseOpenAiResponsesRequest(input: unknown): CanonicalRequest {
     messages,
     tools: parseTools(body.tools, "tools", "openai-responses"),
     toolChoice: parseOpenAiToolChoice(body.tool_choice),
+    parallelToolCalls: "single",
     stream: body.stream === true,
     sampling: sampling(body, "max_output_tokens"),
     limitations: instructions.some((item) => item.role === "developer")
-      ? ["developer_instruction_semantics_require_target_review"]
+      ? ["anthropic_instruction_authority_collapse"]
       : [],
   };
+}
+
+function responseInstructionText(value: unknown, parameter: string) {
+  if (typeof value === "string") return [{ type: "text" as const, text: value }];
+  if (!Array.isArray(value)) invalid(parameter, "must be text or an array");
+  return value.map((entry, index) => {
+    const block = object(entry, `${parameter}[${index}]`);
+    rejectUnknown(block, ["type", "text"], `${parameter}[${index}]`);
+    if (block.type !== "input_text" && block.type !== "output_text")
+      unsupported(`${parameter}[${index}].type`);
+    return {
+      type: "text" as const,
+      text: string(block.text, `${parameter}[${index}].text`),
+    };
+  });
 }
 
 export function renderOpenAiResponsesRequest(
   request: CanonicalRequest,
   model: string,
 ): Record<string, unknown> {
+  if (request.sampling.stop?.length)
+    unsupported("stop", "OpenAI Responses has no lossless stop-sequence control");
   const input: Record<string, unknown>[] = request.instructions.map((instruction) => ({
     type: "message",
     role: instruction.role,
@@ -152,6 +177,10 @@ export function renderOpenAiResponsesRequest(
   }));
   for (const message of request.messages) {
     const content: Record<string, unknown>[] = [];
+    const flushContent = () => {
+      if (content.length)
+        input.push({ type: "message", role: message.role, content: content.splice(0) });
+    };
     for (const part of message.content) {
       if (part.type === "text")
         content.push({
@@ -164,21 +193,24 @@ export function renderOpenAiResponsesRequest(
             ? part.source.url
             : `data:${part.source.mediaType};base64,${part.source.data}`;
         content.push({ type: "input_image", image_url: imageUrl });
-      } else if (part.type === "tool_call")
+      } else if (part.type === "tool_call") {
+        flushContent();
         input.push({
           type: "function_call",
           call_id: part.id,
           name: part.name,
           arguments: part.arguments,
         });
-      else
+      } else {
+        flushContent();
         input.push({
           type: "function_call_output",
           call_id: part.toolCallId,
           output: part.content.map((item) => item.text).join("\n"),
         });
+      }
     }
-    if (content.length) input.push({ type: "message", role: message.role, content });
+    flushContent();
   }
   return {
     model,
@@ -193,6 +225,7 @@ export function renderOpenAiResponsesRequest(
           })),
         }
       : {}),
+    ...(request.tools.length ? { parallel_tool_calls: false } : {}),
     ...(request.toolChoice
       ? {
           tool_choice:
@@ -218,9 +251,20 @@ function responseText(value: unknown, parameter: string) {
   if (!Array.isArray(value)) invalid(parameter, "must be text or an array");
   return value.map((entry, index) => {
     const block = object(entry, `${parameter}[${index}]`);
-    rejectUnknown(block, ["type", "text"], `${parameter}[${index}]`);
-    if (block.type !== "input_text" && block.type !== "output_text")
-      unsupported(`${parameter}[${index}].type`);
-    return { type: "text" as const, text: string(block.text, `${parameter}[${index}].text`) };
+    if (block.type === "input_text" || block.type === "output_text") {
+      rejectUnknown(block, ["type", "text"], `${parameter}[${index}]`);
+      return {
+        type: "text" as const,
+        text: string(block.text, `${parameter}[${index}].text`),
+      };
+    }
+    if (block.type === "input_image") {
+      rejectUnknown(block, ["type", "image_url", "detail"], `${parameter}[${index}]`);
+      return {
+        type: "image" as const,
+        source: parseImageUrl(block.image_url, `${parameter}[${index}].image_url`, block.detail),
+      };
+    }
+    return unsupported(`${parameter}[${index}].type`);
   });
 }

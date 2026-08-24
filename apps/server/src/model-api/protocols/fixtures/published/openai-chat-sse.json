@@ -1,0 +1,34 @@
+{
+  "surface": "openai-chat",
+  "source": "https://platform.openai.com/docs/api-reference/chat/streaming",
+  "derivedOn": "2026-08-24",
+  "events": [
+    {
+      "data": {
+        "id": "chatcmpl-fixture",
+        "object": "chat.completion.chunk",
+        "model": "gpt-fixture",
+        "choices": [
+          { "index": 0, "delta": { "role": "assistant", "content": "" }, "finish_reason": null }
+        ]
+      }
+    },
+    {
+      "data": {
+        "id": "chatcmpl-fixture",
+        "object": "chat.completion.chunk",
+        "model": "gpt-fixture",
+        "choices": [{ "index": 0, "delta": { "content": "Hello" }, "finish_reason": null }]
+      }
+    },
+    {
+      "data": {
+        "id": "chatcmpl-fixture",
+        "object": "chat.completion.chunk",
+        "model": "gpt-fixture",
+        "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+      }
+    },
+    { "data": "[DONE]" }
+  ]
+}

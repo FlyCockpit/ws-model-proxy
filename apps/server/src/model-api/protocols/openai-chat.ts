@@ -7,6 +7,7 @@ import {
 import { invalid, unsupported } from "./errors.js";
 import {
   object,
+  parseImageUrl,
   parseOpenAiToolChoice,
   parseTools,
   rejectUnknown,
@@ -30,6 +31,7 @@ const ROOT_KEYS = [
   "user",
   "seed",
   "stream_options",
+  "parallel_tool_calls",
 ] as const;
 
 function content(value: unknown, parameter: string): CanonicalContent[] {
@@ -45,18 +47,10 @@ function content(value: unknown, parameter: string): CanonicalContent[] {
       rejectUnknown(block, ["type", "image_url"], `${parameter}[${index}]`);
       const image = object(block.image_url, `${parameter}[${index}].image_url`);
       rejectUnknown(image, ["url", "detail"], `${parameter}[${index}].image_url`);
-      const url = string(image.url, `${parameter}[${index}].image_url.url`);
-      if (!url.startsWith("https://") && !url.startsWith("data:image/"))
-        unsupported(`${parameter}[${index}].image_url.url`);
-      if (url.startsWith("data:"))
-        unsupported(
-          `${parameter}[${index}].image_url.url`,
-          "inline OpenAI image URLs require a lossless media decoder",
-        );
-      const detail = image.detail;
-      if (detail !== undefined && detail !== "auto" && detail !== "low" && detail !== "high")
-        invalid(`${parameter}[${index}].image_url.detail`, "is invalid");
-      return { type: "image", source: { kind: "url", url, ...(detail ? { detail } : {}) } };
+      return {
+        type: "image",
+        source: parseImageUrl(image.url, `${parameter}[${index}].image_url.url`, image.detail),
+      };
     }
     return unsupported(`${parameter}[${index}].type`);
   });
@@ -71,6 +65,7 @@ export function parseOpenAiChatRequest(input: unknown): CanonicalRequest {
   if (body.user !== undefined)
     unsupported("user", "provider-side persisted identifiers are not adaptable");
   if (body.stream_options !== undefined) unsupported("stream_options");
+  if (body.parallel_tool_calls === true) unsupported("parallel_tool_calls");
   if (body.max_tokens !== undefined && body.max_completion_tokens !== undefined)
     invalid("max_tokens", "conflicts with max_completion_tokens");
   const rawMessages = body.messages;
@@ -116,6 +111,11 @@ export function parseOpenAiChatRequest(input: unknown): CanonicalRequest {
       invalid(`messages[${sourceIndex}].role`, "is unsupported");
     const parts: CanonicalMessage["content"] =
       message.content == null ? [] : content(message.content, `messages[${sourceIndex}].content`);
+    if (message.role === "assistant" && parts.some((part) => part.type === "image"))
+      unsupported(
+        `messages[${sourceIndex}].content`,
+        "assistant images are not in the common subset",
+      );
     if (message.tool_call_id !== undefined) unsupported(`messages[${sourceIndex}].tool_call_id`);
     if (message.tool_calls !== undefined) {
       if (message.role !== "assistant" || !Array.isArray(message.tool_calls))
@@ -160,9 +160,12 @@ export function parseOpenAiChatRequest(input: unknown): CanonicalRequest {
     messages,
     tools: parseTools(body.tools, "tools", "openai-chat"),
     toolChoice: parseOpenAiToolChoice(body.tool_choice),
+    parallelToolCalls: "single",
     stream: body.stream === true,
     sampling: chatSampling,
-    limitations: [],
+    limitations: instructions.some((item) => item.role === "developer")
+      ? ["anthropic_instruction_authority_collapse"]
+      : [],
   };
 }
 
@@ -175,6 +178,12 @@ export function renderOpenAiChatRequest(
     content: instruction.content.length === 1 ? instruction.content[0]?.text : instruction.content,
   }));
   for (const message of request.messages) {
+    const hasToolResult = message.content.some((part) => part.type === "tool_result");
+    if (hasToolResult && message.content.some((part) => part.type !== "tool_result"))
+      unsupported(
+        "messages.content",
+        "mixed tool results and other content cannot preserve ordering in Chat",
+      );
     const contentParts: Record<string, unknown>[] = [];
     const toolCalls: Record<string, unknown>[] = [];
     for (const part of message.content) {
@@ -236,6 +245,7 @@ export function renderOpenAiChatRequest(
               : request.toolChoice.type,
         }
       : {}),
+    ...(request.tools.length ? { parallel_tool_calls: false } : {}),
     stream: request.stream,
     ...(request.sampling.temperature !== undefined
       ? { temperature: request.sampling.temperature }

@@ -4,17 +4,23 @@
     {
       "surface": "openai-chat",
       "version": "OpenAI API reference retrieved 2026-08-24",
-      "source": "https://platform.openai.com/docs/api-reference/chat/create"
+      "source": "https://platform.openai.com/docs/api-reference/chat/create",
+      "payload": "openai-chat-sse.json",
+      "payloadSha256": "1cd29751259b44f3a48e5156582f3960a5550061b12b29bd6ccb2cf35109b907"
     },
     {
       "surface": "openai-responses",
       "version": "OpenAI API reference retrieved 2026-08-24",
-      "source": "https://platform.openai.com/docs/api-reference/responses/create"
+      "source": "https://platform.openai.com/docs/api-reference/responses/create",
+      "payload": "openai-responses-sse.json",
+      "payloadSha256": "9de3d3b2d3d4dee4c6dd77402292334524ff01fd2ce17c0843bfd9d08b77c1a7"
     },
     {
       "surface": "anthropic-messages",
       "version": "2023-06-01",
-      "source": "https://docs.anthropic.com/en/api/messages"
+      "source": "https://docs.anthropic.com/en/api/messages",
+      "payload": "anthropic-messages-sse.json",
+      "payloadSha256": "bcd7141647f1d289acd922886913b6023214a4fe4a3edc0cc7cf9cc6a5f81293"
     }
   ]
 }

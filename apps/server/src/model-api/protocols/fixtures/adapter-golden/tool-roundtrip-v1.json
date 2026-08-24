@@ -1,0 +1,18 @@
+{
+  "adapterVersion": "1.0.0",
+  "canonical": {
+    "toolName": "weather",
+    "callId": "call_stable",
+    "arguments": "{\"city\":\"Paris\"}",
+    "result": "sunny"
+  },
+  "openaiChat": {
+    "toolType": "function",
+    "parallelToolCalls": false
+  },
+  "anthropic": {
+    "toolType": "tool_use",
+    "resultType": "tool_result",
+    "disableParallelToolUse": true
+  }
+}

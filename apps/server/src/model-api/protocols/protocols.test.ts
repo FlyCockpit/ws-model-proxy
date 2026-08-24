@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import {
   AdapterError,
@@ -5,8 +7,12 @@ import {
   parseAnthropicMessagesRequest,
   parseOpenAiChatRequest,
   parseOpenAiResponsesRequest,
+  parseProtocolResponse,
   renderAnthropicMessagesRequest,
   renderOpenAiChatRequest,
+  renderProtocolError,
+  renderProtocolErrorMetadata,
+  renderProtocolResponse,
 } from "./index.js";
 
 describe("canonical request adapters", () => {
@@ -58,11 +64,20 @@ describe("canonical request adapters", () => {
       instructions: "policy",
       input: "hello",
     });
-    expect(renderAnthropicMessagesRequest(canonical, "upstream")).toMatchObject({
+    const before = structuredClone(canonical);
+    expect(() => renderAnthropicMessagesRequest(canonical, "upstream")).toThrow(
+      "lossy instruction-role collapse",
+    );
+    expect(canonical).toEqual(before);
+    expect(
+      renderAnthropicMessagesRequest(canonical, "upstream", {
+        allowLossyInstructionRoleCollapse: true,
+      }),
+    ).toMatchObject({
       system: [{ type: "text", text: "policy" }],
       messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
     });
-    expect(canonical.limitations).toContain("anthropic_instruction_authority_collapse");
+    expect(canonical).toEqual(before);
   });
 
   it("accepts only client-defined Responses function tools", () => {
@@ -73,6 +88,33 @@ describe("canonical request adapters", () => {
         tools: [{ type: "function", name: "lookup", parameters: { type: "object" } }],
       }).tools,
     ).toEqual([{ name: "lookup", inputSchema: { type: "object" } }]);
+  });
+
+  it("preserves lossless data images and forces single-call tool behavior", () => {
+    const dataUrl = "data:image/png;base64,iVBORw==";
+    const canonical = parseOpenAiChatRequest({
+      model: "m",
+      tools: [{ type: "function", function: { name: "f", parameters: {} } }],
+      messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: dataUrl } }] }],
+    });
+    expect(canonical.messages[0]?.content[0]).toMatchObject({
+      type: "image",
+      source: { kind: "base64", mediaType: "image/png", data: "iVBORw==" },
+    });
+    expect(renderOpenAiChatRequest(canonical, "upstream")).toMatchObject({
+      parallel_tool_calls: false,
+      messages: [{ content: [{ image_url: { url: dataUrl } }] }],
+    });
+  });
+
+  it.each([
+    [{ temperature: 1.01 }, "temperature"],
+    [{ top_p: -0.1 }, "top_p"],
+    [{ stop: [] }, "stop"],
+    [{ stop: ["a", "b", "c", "d", "e"] }, "stop"],
+    [{ stop: [""] }, "stop"],
+  ])("rejects sampling controls outside the strict intersection", (extra, field) => {
+    expect(() => parseOpenAiChatRequest({ model: "m", messages: [], ...extra })).toThrow(field);
   });
 
   it("round-trips ordinary tools with stable call IDs and safely equivalent controls", () => {
@@ -118,11 +160,162 @@ describe("canonical request adapters", () => {
   });
 });
 
+describe("published fixture provenance", () => {
+  it("pins every published-derived payload by SHA-256", async () => {
+    const directory = new URL("./fixtures/published/", import.meta.url);
+    const manifest = JSON.parse(await readFile(new URL("manifest.json", directory), "utf8")) as {
+      fixtures: Array<{ payload: string; payloadSha256: string }>;
+    };
+    expect(manifest.fixtures).toHaveLength(3);
+    for (const fixture of manifest.fixtures) {
+      const bytes = await readFile(new URL(fixture.payload, directory));
+      expect(createHash("sha256").update(bytes).digest("hex")).toBe(fixture.payloadSha256);
+    }
+  });
+
+  it("keeps adapter goldens explicitly pinned to the canonical adapter version", async () => {
+    const directory = new URL("./fixtures/adapter-golden/", import.meta.url);
+    for (const file of ["instruction-collapse-v1.json", "tool-roundtrip-v1.json"]) {
+      const fixture = JSON.parse(await readFile(new URL(file, directory), "utf8")) as {
+        adapterVersion: string;
+      };
+      expect(fixture.adapterVersion).toBe("1.0.0");
+    }
+  });
+});
+
+describe("non-stream protocol responses", () => {
+  it("parses and renders one-candidate Chat with safe response metadata", () => {
+    const parsed = parseProtocolResponse({
+      surface: "openai-chat",
+      status: 200,
+      headers: new Headers({ "x-request-id": "req_1", "retry-after": "2" }),
+      body: {
+        id: "chat_1",
+        object: "chat.completion",
+        model: "gpt",
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: "hello",
+              tool_calls: [
+                {
+                  id: "call_1",
+                  type: "function",
+                  function: { name: "lookup", arguments: '{"q":"x"}' },
+                },
+              ],
+            },
+            finish_reason: "tool_calls",
+            logprobs: null,
+          },
+        ],
+        usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 },
+      },
+    });
+    expect(parsed).toMatchObject({
+      ok: true,
+      metadata: { requestId: "req_1", retryAfter: "2" },
+      response: { id: "chat_1", stopReason: "tool", items: [{ text: "hello" }, { id: "call_1" }] },
+    });
+    if (!parsed.ok) throw new Error("expected success");
+    expect(renderProtocolResponse("anthropic-messages", parsed.response)).toMatchObject({
+      id: "chat_1",
+      content: [
+        { type: "text", text: "hello" },
+        { type: "tool_use", id: "call_1" },
+      ],
+      stop_reason: "tool_use",
+    });
+  });
+
+  it("parses structured upstream errors and renders the requested envelope", () => {
+    const parsed = parseProtocolResponse({
+      surface: "anthropic-messages",
+      status: 429,
+      headers: new Headers({ "request-id": "req_limit", "retry-after": "3" }),
+      body: { type: "error", error: { type: "rate_limit_error", message: "slow down" } },
+    });
+    expect(parsed).toMatchObject({
+      ok: false,
+      error: {
+        code: "rate_limit_error",
+        upstreamStatus: 429,
+        requestId: "req_limit",
+        retryAfter: "3",
+      },
+    });
+    if (parsed.ok) throw new Error("expected error");
+    expect(renderProtocolError("openai-responses", parsed.error)).toEqual({
+      error: {
+        message: "slow down",
+        type: "rate_limit_error",
+        param: null,
+        code: "rate_limit_error",
+      },
+    });
+    const metadata = renderProtocolErrorMetadata(parsed.error);
+    expect(metadata.status).toBe(429);
+    expect(Object.fromEntries(metadata.headers)).toMatchObject({
+      "retry-after": "3",
+      "x-request-id": "req_limit",
+    });
+  });
+
+  it("rejects citations, unknown nested output, incomplete tool JSON, and multiple candidates", () => {
+    expect(() =>
+      parseProtocolResponse({
+        surface: "openai-chat",
+        status: 200,
+        body: {
+          id: "x",
+          object: "chat.completion",
+          choices: [
+            {
+              index: 0,
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  { id: "c", type: "function", function: { name: "f", arguments: "{" } },
+                ],
+              },
+              finish_reason: "tool_calls",
+            },
+          ],
+        },
+      }),
+    ).toThrow("complete JSON");
+    expect(() =>
+      parseProtocolResponse({
+        surface: "openai-chat",
+        status: 200,
+        body: { id: "x", object: "chat.completion", choices: [{}, {}] },
+      }),
+    ).toThrow("exactly one");
+    expect(() =>
+      parseProtocolResponse({
+        surface: "anthropic-messages",
+        status: 200,
+        body: {
+          id: "m",
+          type: "message",
+          role: "assistant",
+          content: [{ type: "text", text: "x", citations: [{ url: "private" }] }],
+          stop_reason: "end_turn",
+        },
+      }),
+    ).toThrow("citations");
+  });
+});
+
 describe("canonical streaming state machines", () => {
   it("decodes arbitrary UTF-8 splits, CRLF, comments, and multiline SSE data", () => {
     const parser = new CanonicalStreamParser("openai-chat");
     const bytes = new TextEncoder().encode(
-      ': keepalive\r\ndata: {"id":"chat_1","model":"gpt","choices":[{"index":0,"delta":{"content":"hé"},\r\ndata: "finish_reason":null}]}\r\n\r\ndata: [DONE]\r\n\r\n',
+      ': keepalive\r\ndata: {"id":"chat_1","model":"gpt","choices":[{"index":0,"delta":{"content":"hé"},\r\ndata: "finish_reason":"stop"}]}\r\n\r\ndata: [DONE]\r\n\r\n',
     );
     const events = [
       ...parser.push(bytes.slice(0, 77)),
@@ -134,6 +327,7 @@ describe("canonical streaming state machines", () => {
       { type: "message_start", id: "chat_1", model: "gpt" },
       { type: "item_start", index: 0, id: "text-0", itemType: "text" },
       { type: "text_delta", index: 0, delta: "hé" },
+      { type: "stop", reason: "stop" },
       { type: "complete" },
     ]);
     expect(parser.retrySafe).toBe(false);
@@ -142,13 +336,14 @@ describe("canonical streaming state machines", () => {
   it("does not invent an event boundary when CRLF is split across byte chunks", () => {
     const parser = new CanonicalStreamParser("openai-chat");
     const first = new TextEncoder().encode(
-      'data: {"id":"chat_1","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}\r',
+      'data: {"id":"chat_1","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\r',
     );
     expect(parser.push(first)).toEqual([]);
     expect(parser.push(new TextEncoder().encode("\n\r\ndata: [DONE]\r\n\r\n"))).toMatchObject([
       { type: "message_start", id: "chat_1" },
       { type: "item_start" },
       { type: "text_delta", delta: "ok" },
+      { type: "stop", reason: "stop" },
       { type: "complete" },
     ]);
     expect(parser.finish()).toEqual([]);
