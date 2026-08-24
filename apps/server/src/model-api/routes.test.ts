@@ -474,6 +474,10 @@ describe("model API routes", () => {
     manager.headers(sent.requestId, 200, {
       "content-type": "application/json",
       "x-request-id": "req-adapted",
+      "content-encoding": "gzip",
+      "content-length": "999",
+      etag: '"upstream-representation"',
+      digest: "sha-256=upstream-representation",
     });
     manager.body(
       sent.requestId,
@@ -506,9 +510,60 @@ describe("model API routes", () => {
     manager.complete(sent.requestId);
     const response = await responsePromise;
     expect(response.headers.get("x-wsmp-adapter-version")).toBe("1.0.0");
+    expect(response.headers.get("content-encoding")).toBeNull();
+    expect(response.headers.get("content-length")).toBeNull();
+    expect(response.headers.get("etag")).toBeNull();
+    expect(response.headers.get("digest")).toBeNull();
     await expect(response.json()).resolves.toMatchObject({
       object: "chat.completion",
       choices: [{ message: { content: "hello" } }],
+    });
+  });
+
+  it("rejects strict fields that cannot be adapted before relay dispatch", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "responses-member",
+        discoveredModelId: "responses-model",
+        upstreamModelId: "upstream-responses",
+        cliDeviceId: "cli-responses",
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiResponses: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+              tools: true,
+              parallelTools: true,
+            },
+          },
+        },
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-responses"];
+    const response = await appWith(manager, true, true).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        messages: [{ role: "user", content: "hello" }],
+        tools: [{ type: "function", function: { name: "lookup", parameters: {} } }],
+        parallel_tool_calls: true,
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(manager.sent).toEqual([]);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "unsupported_capability" },
     });
   });
 
