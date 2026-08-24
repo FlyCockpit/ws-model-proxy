@@ -3204,7 +3204,34 @@ describe("model API routes", () => {
       expiresAt: new Date(Date.now() + 60_000),
     });
     const manager = new FakeRelayManager();
-    const responsePromise = appWith(manager).request("/responses", {
+    const release = vi.fn().mockResolvedValue(true);
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async (attempt) => {
+        const candidate = attempt.candidates[0]!;
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: "sticky-lease",
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      }),
+      release,
+      hold: (response, lease, signal) =>
+        holdCapacityLeaseForResponse({
+          response,
+          lease,
+          signal,
+          heartbeatIntervalMs: 0,
+          store: { heartbeat: vi.fn().mockResolvedValue(true), release },
+        }),
+    };
+    const responsePromise = appWith(manager, true, false, capacityRuntime).request("/responses", {
       method: "POST",
       headers: {
         authorization: "Bearer wsmp_model_test",
@@ -3223,11 +3250,26 @@ describe("model API routes", () => {
     expect(sent.path).toBe("/v1/responses");
     manager.headers(sent.requestId, 200, { "content-type": "application/json" });
     const response = await responsePromise;
+    expect(capacityRuntime.acquire).toHaveBeenCalledTimes(1);
+    expect(capacityRuntime.acquire).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sourceKind: "DIRECT",
+        candidates: [
+          expect.objectContaining({
+            capacityId: "model-id-capacity",
+            executionTargetId: "model-id-target",
+          }),
+        ],
+      }),
+      expect.anything(),
+    );
+    expect(release).not.toHaveBeenCalled();
     manager.body(sent.requestId, JSON.stringify({ id: "resp_456", object: "response" }));
     manager.complete(sent.requestId);
 
     expect(response.status).toBe(200);
     await response.text();
+    expect(release).toHaveBeenCalledTimes(1);
     const findCall = JSON.stringify(db.responseStickinessRecord.findUnique.mock.calls);
     expect(findCall).not.toContain("resp_123");
     expect(manager.sent).toHaveLength(1);
@@ -3375,6 +3417,80 @@ describe("model API routes", () => {
     manager.complete(sent.requestId);
 
     expect(response.status).toBe(200);
+  });
+
+  it("admits a sticky pool lifecycle request through its exact bound member", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.responseStickinessRecord.findUnique.mockResolvedValue({
+      userId: "user-id",
+      modelApiTokenId: "token-id",
+      targetDiscoveredModelId: null,
+      targetModelPoolId: "pool-id",
+      selectedDiscoveredModelId: "model-a",
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({ id: "model-a", upstreamModelId: "upstream-a", cliDeviceId: "cli-a" }),
+    );
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "member-a",
+        discoveredModelId: "model-a",
+        upstreamModelId: "upstream-a",
+        cliDeviceId: "cli-a",
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-a"];
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async (attempt) => {
+        const candidate = attempt.candidates[0]!;
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: "pool-sticky-lease",
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      }),
+      release: vi.fn().mockResolvedValue(true),
+      hold: vi.fn((response) => response),
+    };
+    const responsePromise = appWith(manager, true, false, capacityRuntime).request(
+      "/responses/resp_123",
+      { headers: { authorization: "Bearer wsmp_model_test" } },
+    );
+
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    expect(capacityRuntime.acquire).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sourceKind: "POOL",
+        candidates: [
+          expect.objectContaining({
+            capacityId: "member-a-capacity",
+            executionTargetId: "member-a-target",
+            poolMemberId: "member-a",
+          }),
+        ],
+      }),
+      expect.anything(),
+    );
+    const sent = requireSent(manager);
+    manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+    const response = await responsePromise;
+    manager.body(sent.requestId, JSON.stringify({ id: "resp_123", object: "response" }));
+    manager.complete(sent.requestId);
+    await response.text();
+    expect(capacityRuntime.acquire).toHaveBeenCalledTimes(1);
+    expect(capacityRuntime.hold).toHaveBeenCalledTimes(1);
   });
 
   describe("pool media transformer", () => {

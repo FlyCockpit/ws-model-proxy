@@ -2952,6 +2952,7 @@ async function relaySelectedModelNoFailover({
   operation,
   manager,
   limiter,
+  capacityRuntime,
 }: {
   request: Request;
   requester: RelayRequester;
@@ -2961,6 +2962,7 @@ async function relaySelectedModelNoFailover({
   operation: RelayOperation;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
+  capacityRuntime?: CapacityAdmissionRuntime;
 }): Promise<Response> {
   const startedAt = new Date();
   const relayRequestId = await createRelayMetadata({
@@ -3003,6 +3005,52 @@ async function relaySelectedModelNoFailover({
     return operationFailureResponse(operation, "disconnected");
   }
 
+  let capacityLease: Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>> | undefined;
+  if (capacityRuntime) {
+    const poolMember = requestedModelPoolId
+      ? (await poolMemberRows(requestedModelPoolId)).find(
+          (member) => member.discoveredModelId === selectedDiscoveredModelId,
+        )
+      : undefined;
+    const identity = poolMember?.ExecutionTarget ?? selected.ExecutionTarget;
+    if (!identity?.inferenceCapacityId || (requestedModelPoolId && !poolMember)) {
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "unsupported_capability" });
+      return operationFailureResponse(operation, "unsupported_capability");
+    }
+    try {
+      capacityLease = await capacityRuntime.acquire(
+        {
+          requestId: crypto.randomUUID(),
+          attemptId: crypto.randomUUID(),
+          ownerId: selected.userId,
+          sourceKind: requestedModelPoolId ? "POOL" : "DIRECT",
+          basePriority: 16,
+          connectionOwner: "model-api",
+          deadlineAt: new Date(Date.now() + 30_000),
+          candidates: [
+            {
+              capacityId: identity.inferenceCapacityId,
+              executionTargetId: identity.id,
+              poolMemberId: poolMember?.id,
+              candidateOrder: 0,
+            },
+          ],
+        },
+        request.signal,
+      );
+    } catch {
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "unknown" });
+      return operationFailureResponse(operation, "unknown");
+    }
+    if (capacityLease.state !== "ADMITTED") {
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "rate_limited" });
+      return operationFailureResponse(operation, "rate_limited");
+    }
+  }
+
   let globalLease: ModelApiLimitLease | undefined;
   let cliLease: ModelApiLimitLease | undefined;
   try {
@@ -3014,6 +3062,7 @@ async function relaySelectedModelNoFailover({
   } catch (error) {
     cliLease?.release();
     globalLease?.release();
+    if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
     if (error instanceof ModelApiLimitError) {
       await failRelayMetadata({
         relayRequestId,
@@ -3032,6 +3081,7 @@ async function relaySelectedModelNoFailover({
   } catch {
     cliLease.release();
     globalLease.release();
+    if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
     await operation.dispose?.();
     await failRelayMetadata({
       relayRequestId,
@@ -3086,7 +3136,7 @@ async function relaySelectedModelNoFailover({
       })
       .catch(metadataUpdateError);
     void finalize;
-    return new Response(
+    const response = new Response(
       responseBodyForOperation({
         body: started.body,
         headers: started.headers,
@@ -3095,10 +3145,14 @@ async function relaySelectedModelNoFailover({
       }),
       { status: started.status, headers: started.headers },
     );
+    return capacityLease?.state === "ADMITTED"
+      ? (capacityRuntime?.hold(response, capacityLease.lease, request.signal) ?? response)
+      : response;
   } catch {
     const terminal = await attempt.terminal;
     cliLease.release();
     globalLease.release();
+    if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
     if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
     await updateRelayMetadata(relayRequestId, {
       selectedDiscoveredModelId: selected.id,
@@ -3917,8 +3971,8 @@ async function responsesCreateHandler({
   request,
   manager,
   limiter,
-  adaptationFeatureEnabled,
   capacityRuntime,
+  adaptationFeatureEnabled,
 }: {
   request: Request;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
@@ -3993,6 +4047,7 @@ async function responsesCreateHandler({
     },
     manager,
     limiter,
+    capacityRuntime,
   });
 }
 
@@ -4004,6 +4059,7 @@ async function responsesStickyHandler({
   capability,
   manager,
   limiter,
+  capacityRuntime,
 }: {
   request: Request;
   responseId: string;
@@ -4012,6 +4068,7 @@ async function responsesStickyHandler({
   capability: ModelApiCapability;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
+  capacityRuntime?: CapacityAdmissionRuntime;
 }) {
   const token = await authenticateRequest(request);
   if (!token)
@@ -4040,6 +4097,7 @@ async function responsesStickyHandler({
     },
     manager,
     limiter,
+    capacityRuntime,
   });
 }
 
@@ -4290,6 +4348,7 @@ export function createModelApiRoutes({
       capability: "responses.retrieve",
       manager,
       limiter: concurrencyLimiter,
+      capacityRuntime: admissionRuntime,
     });
   });
 
@@ -4304,6 +4363,7 @@ export function createModelApiRoutes({
       capability: "responses.delete",
       manager,
       limiter: concurrencyLimiter,
+      capacityRuntime: admissionRuntime,
     });
   });
 
@@ -4318,6 +4378,7 @@ export function createModelApiRoutes({
       capability: "responses.cancel",
       manager,
       limiter: concurrencyLimiter,
+      capacityRuntime: admissionRuntime,
     });
   });
 
@@ -4332,6 +4393,7 @@ export function createModelApiRoutes({
       capability: "responses.listInputItems",
       manager,
       limiter: concurrencyLimiter,
+      capacityRuntime: admissionRuntime,
     });
   });
 
@@ -4346,6 +4408,7 @@ export function createModelApiRoutes({
       capability: "responses.compact",
       manager,
       limiter: concurrencyLimiter,
+      capacityRuntime: admissionRuntime,
     });
   });
 
