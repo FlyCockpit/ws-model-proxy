@@ -32,6 +32,8 @@ const SAFE_HEADER_NAMES = new Set([
   "openai-organization",
   "openai-project",
   "openai-version",
+  "anthropic-version",
+  "anthropic-beta",
   "x-request-id",
   "x-stainless-lang",
   "x-stainless-package-version",

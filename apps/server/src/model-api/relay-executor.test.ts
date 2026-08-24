@@ -14,8 +14,14 @@ describe("native response header sanitizer", () => {
       "retry-after": "2",
       "content-length": "999",
       "Set-Cookie": "secret=1",
+      "Set-Cookie2": "legacy-secret=1",
       "WWW-Authenticate": "Bearer realm=provider",
+      "Proxy-Authenticate": "Basic realm=provider",
       "x-api-key": "provider-secret",
+      "x-provider-account-id": "acct_private",
+      "x-internal-endpoint": "http://10.0.0.1",
+      location: "https://credential.example/",
+      "x-unknown-provider-secret": "secret",
       Connection: "keep-alive",
     });
     expect(headers.get("content-type")).toBe("text/event-stream");
@@ -23,8 +29,26 @@ describe("native response header sanitizer", () => {
     expect(headers.get("retry-after")).toBe("2");
     expect(headers.get("content-length")).toBeNull();
     expect(headers.get("set-cookie")).toBeNull();
+    expect(headers.get("set-cookie2")).toBeNull();
     expect(headers.get("www-authenticate")).toBeNull();
     expect(headers.get("x-api-key")).toBeNull();
+    expect(headers.get("proxy-authenticate")).toBeNull();
+    expect(headers.get("location")).toBeNull();
+    expect(headers.get("x-provider-account-id")).toBeNull();
+    expect(headers.get("x-unknown-provider-secret")).toBeNull();
+  });
+
+  it("preserves ordered duplicate safe headers without trusting stale lengths", () => {
+    const headers = sanitizeNativeResponseHeaders([
+      ["warning", "private warning"],
+      ["x-request-id", "first"],
+      ["x-request-id", "second"],
+      ["content-length", "1"],
+      ["content-type", "application/json"],
+    ]);
+    expect(headers.get("warning")).toBeNull();
+    expect(headers.get("x-request-id")).toBe("first, second");
+    expect(headers.get("content-length")).toBeNull();
   });
 });
 

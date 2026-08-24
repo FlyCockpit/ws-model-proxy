@@ -107,10 +107,16 @@ const v2CapabilitiesSchema = z
 
 const surfaceFeatureSchema = z
   .object({
+    source: z.enum(["declared", "probe", "dashboard", "provider"]),
+    confidence: z.enum(["exact", "high", "estimated", "unknown"]),
     supported: booleanSupportSchema,
     streaming: booleanSupportSchema,
     maxContextTokens: z.number().int().positive().optional(),
     images: booleanSupportSchema,
+    inputAudio: booleanSupportSchema,
+    outputAudio: booleanSupportSchema,
+    inputVideo: booleanSupportSchema,
+    outputVideo: booleanSupportSchema,
     tools: booleanSupportSchema,
     parallelTools: booleanSupportSchema,
     structuredOutput: booleanSupportSchema,

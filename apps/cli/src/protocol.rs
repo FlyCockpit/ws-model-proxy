@@ -51,7 +51,9 @@ pub enum ClientControlMessage {
     RelayResponseHeaders {
         request_id: String,
         status: u16,
-        headers: std::collections::BTreeMap<String, String>,
+        /// Ordered pairs preserve repeated fields such as `warning` and
+        /// `x-ratelimit-*`; servers also accept the legacy object form.
+        headers: Vec<(String, String)>,
     },
     #[serde(rename = "relay.complete")]
     RelayComplete {

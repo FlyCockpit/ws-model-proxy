@@ -40,6 +40,7 @@ const requestIdSchema = z.string().trim().min(1).max(128);
 const headerNameSchema = z.string().trim().min(1).max(128);
 const headerValueSchema = z.string().max(8192);
 const headerSchema = z.record(headerNameSchema, headerValueSchema);
+const orderedHeadersSchema = z.array(z.tuple([headerNameSchema, headerValueSchema])).max(256);
 
 export { type OpenAiCompatibleCapabilities, openAiCompatibleCapabilitiesSchema };
 
@@ -207,7 +208,7 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
       type: z.literal("relay.response.headers"),
       requestId: requestIdSchema,
       status: z.number().int().min(100).max(599),
-      headers: headerSchema.default({}),
+      headers: z.union([headerSchema, orderedHeadersSchema]).default({}),
     })
     .strict(),
   z

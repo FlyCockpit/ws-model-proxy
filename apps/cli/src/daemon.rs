@@ -28,7 +28,7 @@ use tungstenite::{Message, connect};
 use url::Url;
 
 use crate::auth::{join, resolve_credential};
-use crate::config::{Config, ConfigLock};
+use crate::config::{Config, ConfigLock, EndpointAuthMode};
 use crate::control::ControlServer;
 #[cfg(unix)]
 use crate::control::{
@@ -159,6 +159,10 @@ fn upstream_http_client() -> Result<&'static reqwest::Client> {
     }
     let client = reqwest::Client::builder()
         .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+        // Redirects are an execution boundary: replaying configured credentials
+        // to a Location target (even same-origin) is not safe without validating
+        // every hop. Native relay therefore exposes 3xx to the caller unchanged.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("building shared cancellable upstream client")?;
     let _ = UPSTREAM_HTTP_CLIENT.set(client);
@@ -285,6 +289,7 @@ struct UpstreamRequestSpec {
     path: String,
     request_headers: BTreeMap<String, String>,
     endpoint_headers: Vec<(String, String)>,
+    endpoint_auth: Option<(EndpointAuthMode, String)>,
     timeout_ms: u64,
     has_body: bool,
     /// When set, buffer a chat-shaped JSON body and inline trusted media URLs as
@@ -1582,6 +1587,10 @@ where
             .iter()
             .map(|header| (header.name.clone(), header.env.clone()))
             .collect(),
+        endpoint_auth: endpoint
+            .auth
+            .as_ref()
+            .map(|auth| (auth.mode.clone(), auth.env.clone())),
         timeout_ms,
         has_body: expect_body,
         expand_media: endpoint.expand_media,
@@ -1770,6 +1779,13 @@ async fn execute_upstream(
             .with_context(|| format!("reading endpoint header `{name}` from `{env}`"))?;
         builder = builder.header(name, value);
     }
+    if let Some((mode, env)) = &spec.endpoint_auth {
+        let value = std::env::var(env).context("reading typed endpoint credential")?;
+        builder = match mode {
+            EndpointAuthMode::ApiKey => builder.header("x-api-key", value),
+            EndpointAuthMode::Bearer => builder.header("authorization", format!("Bearer {value}")),
+        };
+    }
 
     // Media expansion only applies to chat-shaped JSON bodies on an opted-in
     // endpoint. Every other shape (non-JSON, body-less) stays on the streaming
@@ -1878,7 +1894,7 @@ async fn relay_response_back(
                 .ok()
                 .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
         })
-        .collect::<BTreeMap<_, _>>();
+        .collect::<Vec<_>>();
     worker_send_control(
         tx,
         &ClientControlMessage::RelayResponseHeaders {
@@ -3300,6 +3316,7 @@ mod tests {
             path: "/v1/chat/completions".to_string(),
             request_headers: BTreeMap::new(),
             endpoint_headers: Vec::new(),
+            endpoint_auth: None,
             timeout_ms: 2_000,
             has_body: false,
             expand_media: false,
@@ -3358,6 +3375,92 @@ mod tests {
                     && text.contains(r#""completionTokens":5"#)
                     && text.contains(r#""totalTokens":8"#)
         )));
+    }
+
+    #[test]
+    fn reqwest_relay_does_not_follow_cross_origin_redirects_or_replay_credentials() {
+        let first = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("bind redirect source: {error}"),
+        };
+        let second = std::net::TcpListener::bind("127.0.0.1:0").expect("bind redirect target");
+        second
+            .set_nonblocking(true)
+            .expect("nonblocking redirect target");
+        let first_address = first.local_addr().expect("source address");
+        let second_address = second.local_addr().expect("target address");
+        let source = thread::spawn(move || {
+            let (mut stream, _) = first.accept().expect("accept source request");
+            let mut request = [0_u8; 4096];
+            let size = std::io::Read::read(&mut stream, &mut request).expect("read source request");
+            let text = String::from_utf8_lossy(&request[..size]).to_ascii_lowercase();
+            assert!(text.contains("x-api-key: redirect-test-secret"));
+            stream.write_all(format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://{second_address}/credential-sink\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            ).as_bytes()).expect("write redirect");
+        });
+        let mut spec = local_upstream_spec(format!("http://{first_address}"));
+        spec.request_headers
+            .insert("x-api-key".to_string(), "redirect-test-secret".to_string());
+        let (tx, rx) = mpsc::sync_channel(RELAY_WORKER_OUTBOUND_CAPACITY);
+        let (_cancellation, cancellation_rx) = CancellationHandle::new();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(execute_upstream(spec, None, &tx, cancellation_rx))
+            .expect("relay redirect");
+        source.join().expect("source thread");
+        thread::sleep(Duration::from_millis(25));
+        assert!(matches!(second.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+        let frames = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(frames.iter().any(|frame| matches!(frame,
+            FromWorker::Send { frame: WsFrame::Text(text), .. }
+                if text.contains(r#""type":"relay.response.headers""#)
+        )));
+    }
+
+    #[test]
+    fn reqwest_relay_does_not_follow_same_origin_redirects() {
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("bind redirect source: {error}"),
+        };
+        let address = listener.local_addr().expect("source address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept initial request");
+            let mut request = [0_u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut request).expect("read initial request");
+            stream
+                .write_all(
+                    format!("HTTP/1.1 308 Permanent Redirect\r\nlocation: http://{address}/same-origin\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").as_bytes(),
+                )
+                .expect("write redirect");
+            drop(stream);
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            thread::sleep(Duration::from_millis(25));
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+            );
+        });
+        let (tx, _rx) = mpsc::sync_channel(RELAY_WORKER_OUTBOUND_CAPACITY);
+        let (_cancellation, cancellation_rx) = CancellationHandle::new();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(execute_upstream(
+                local_upstream_spec(format!("http://{address}")),
+                None,
+                &tx,
+                cancellation_rx,
+            ))
+            .expect("relay same-origin redirect");
+        server.join().expect("redirect server");
     }
 
     #[test]

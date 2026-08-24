@@ -125,6 +125,9 @@ export const env = createEnv({
       .int()
       .positive()
       .default(15 * 60 * 1000),
+    // Native Anthropic relay is an incomplete, release-gated surface. Keep it
+    // explicitly disabled until the complete protocol gate is satisfied.
+    MODEL_API_ANTHROPIC_ENABLED: strictBooleanFlag(),
   },
   runtimeEnv: process.env,
   emptyStringAsUndefined: true,

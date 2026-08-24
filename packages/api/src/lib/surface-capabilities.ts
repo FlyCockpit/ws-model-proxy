@@ -25,8 +25,13 @@ export type SurfaceRequestRequirements = {
 };
 
 export type SurfaceAvailability = {
+  requestedSurface?: ModelApiSurface;
   mode: SurfaceMode;
   nativeSurface?: ModelApiSurface;
+  method?: "GET" | "POST" | "DELETE";
+  path?: string;
+  requirements?: Readonly<SurfaceRequestRequirements>;
+  retrySafety?: "pre_commit_only" | "idempotent" | "never";
   streaming: boolean;
   limitations: string[];
 };
@@ -36,6 +41,10 @@ type SurfaceFeatures = {
   streaming?: boolean;
   maxContextTokens?: number;
   images?: boolean;
+  inputAudio?: boolean;
+  outputAudio?: boolean;
+  inputVideo?: boolean;
+  outputVideo?: boolean;
   tools?: boolean;
   parallelTools?: boolean;
   structuredOutput?: boolean;
@@ -61,6 +70,37 @@ function nativeFeatures(capabilities: OpenAiCompatibleCapabilities, surface: Mod
   if (surface === "OPENAI_RESPONSES") return capabilities.responses;
   if (surface === "OPENAI_COMPLETIONS") return capabilities.completions;
   return undefined;
+}
+
+function operationFor(surface: ModelApiSurface, request: SurfaceRequestRequirements) {
+  if (surface === "OPENAI_CHAT_COMPLETIONS")
+    return { method: "POST" as const, path: "/v1/chat/completions" };
+  if (surface === "OPENAI_COMPLETIONS") return { method: "POST" as const, path: "/v1/completions" };
+  if (surface === "ANTHROPIC_MESSAGES")
+    return {
+      method: "POST" as const,
+      path: request.countTokens ? "/v1/messages/count_tokens" : "/v1/messages",
+    };
+  return {
+    method: "POST" as const,
+    path: request.countTokens ? "/v1/responses/count_tokens" : "/v1/responses",
+  };
+}
+
+function adaptedSubsetFailures(request: SurfaceRequestRequirements): string[] {
+  const failures: string[] = [];
+  for (const key of [
+    "parallelTools",
+    "structuredOutput",
+    "reasoning",
+    "hostedTools",
+    "stateful",
+    "countTokens",
+  ] as const) {
+    if (request[key]) failures.push(`${key}_not_adaptable`);
+  }
+  if (request.betaFeatures?.length) failures.push("beta_feature_not_adaptable");
+  return failures;
 }
 
 function incompatibilities(features: SurfaceFeatures, request: SurfaceRequestRequirements) {
@@ -150,21 +190,48 @@ export function resolveExecutionPath({
   request?: SurfaceRequestRequirements;
   adaptationEnabled?: boolean;
 }): SurfaceAvailability {
+  const operation = operationFor(requestedSurface, request);
+  const describe = (availability: SurfaceAvailability): SurfaceAvailability => ({
+    ...availability,
+    requestedSurface,
+    ...operation,
+    requirements: { ...request },
+    retrySafety: "pre_commit_only",
+  });
   const matrix = surfaceAvailabilityMatrix({ capabilities, adaptationEnabled });
   const selected = matrix[requestedSurface];
-  if (selected.mode === "unavailable" || !capabilities || !selected.nativeSurface) return selected;
+  if (selected.mode === "unavailable" || !capabilities || !selected.nativeSurface)
+    return describe(selected);
   if (
     selected.mode === "adapted" &&
     (requestedSurface === "OPENAI_COMPLETIONS" || request.stateful)
   ) {
-    return { mode: "unavailable", streaming: false, limitations: ["native_only_operation"] };
+    return describe({
+      mode: "unavailable",
+      streaming: false,
+      limitations: ["native_only_operation"],
+    });
   }
   const features = nativeFeatures(capabilities, selected.nativeSurface);
   if (!features)
-    return { mode: "unavailable", streaming: false, limitations: ["surface_unavailable"] };
-  const failures = incompatibilities(features, request);
+    return describe({
+      mode: "unavailable",
+      streaming: false,
+      limitations: ["surface_unavailable"],
+    });
+  const failures = [
+    ...incompatibilities(features, request),
+    ...(selected.mode === "adapted" ? adaptedSubsetFailures(request) : []),
+  ];
   const limitations = [...selected.limitations, ...failures];
-  return failures.length > 0
-    ? { mode: "unavailable", nativeSurface: selected.nativeSurface, streaming: false, limitations }
-    : { ...selected, limitations };
+  return describe(
+    failures.length > 0
+      ? {
+          mode: "unavailable",
+          nativeSurface: selected.nativeSurface,
+          streaming: false,
+          limitations,
+        }
+      : { ...selected, limitations },
+  );
 }

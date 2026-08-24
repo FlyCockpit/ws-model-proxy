@@ -80,26 +80,45 @@ function splitBodyChunks(body: Uint8Array): Uint8Array[] {
   return chunks;
 }
 
-export function sanitizeNativeResponseHeaders(headers: Record<string, string>): Headers {
+const SAFE_NATIVE_RESPONSE_HEADERS = new Set([
+  "cache-control",
+  "content-disposition",
+  "content-encoding",
+  "content-language",
+  "content-type",
+  "etag",
+  "expires",
+  "last-modified",
+  "openai-processing-ms",
+  "request-id",
+  "retry-after",
+  "vary",
+  "x-request-id",
+]);
+
+function isSafeNativeResponseHeader(name: string): boolean {
+  if (SAFE_NATIVE_RESPONSE_HEADERS.has(name)) return true;
+  return (
+    name.startsWith("x-ratelimit-") ||
+    name.startsWith("ratelimit-") ||
+    name.startsWith("anthropic-ratelimit-")
+  );
+}
+
+export function sanitizeNativeResponseHeaders(
+  headers: Record<string, string> | readonly (readonly [string, string])[],
+): Headers {
   const output = new Headers();
-  for (const [name, value] of Object.entries(headers)) {
+  const entries = Array.isArray(headers) ? headers : Object.entries(headers);
+  for (const [name, value] of entries) {
     const normalized = name.trim().toLowerCase();
     if (!normalized) continue;
-    if (
-      normalized === "connection" ||
-      normalized === "content-length" ||
-      normalized === "set-cookie" ||
-      normalized === "www-authenticate" ||
-      normalized === "proxy-authenticate" ||
-      normalized === "authorization" ||
-      normalized === "x-api-key" ||
-      normalized === "transfer-encoding" ||
-      normalized === "upgrade" ||
-      normalized.startsWith("sec-")
-    ) {
-      continue;
-    }
-    output.set(normalized, value);
+    // Explicit allowlisting keeps credentials, cookies, redirect locations,
+    // provider account metadata and private/internal routing headers out even
+    // when a provider invents a new spelling. Content-Length is intentionally
+    // excluded because relay framing/decompression can change body length.
+    if (!isSafeNativeResponseHeader(normalized)) continue;
+    output.append(normalized, value);
   }
   return output;
 }

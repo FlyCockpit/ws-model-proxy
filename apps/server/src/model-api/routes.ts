@@ -117,6 +117,8 @@ type ModelApiRouteDependencies = {
     | "completeRelayRequest"
   >;
   concurrencyLimiter?: ModelApiConcurrencyLimiter;
+  /** Test/deployment release gate; defaults to the validated env flag. */
+  anthropicEnabled?: boolean;
 };
 
 type JsonObject = Record<string, unknown>;
@@ -638,15 +640,23 @@ function supportsCapability({
   anthropicIngress?: AnthropicIngress;
 }): boolean {
   if (capability === "chat.completions") {
-    if (capabilities?.chatCompletions?.supported !== true) return false;
-    if (stream && capabilities.chatCompletions.streaming === false) return false;
-    return true;
+    return (
+      resolveExecutionPath({
+        capabilities,
+        requestedSurface: "OPENAI_CHAT_COMPLETIONS",
+        request: { stream },
+      }).mode === "native"
+    );
   }
 
   if (capability === "completions") {
-    if (capabilities?.completions?.supported !== true) return false;
-    if (stream && capabilities.completions.streaming === false) return false;
-    return true;
+    return (
+      resolveExecutionPath({
+        capabilities,
+        requestedSurface: "OPENAI_COMPLETIONS",
+        request: { stream },
+      }).mode === "native"
+    );
   }
 
   if (capability === "embeddings") {
@@ -672,9 +682,13 @@ function supportsCapability({
   }
 
   if (capability === "responses.create") {
-    if (capabilities?.responses?.supported !== true) return false;
-    if (stream && capabilities.responses.streaming === false) return false;
-    return true;
+    return (
+      resolveExecutionPath({
+        capabilities,
+        requestedSurface: "OPENAI_RESPONSES",
+        request: { stream },
+      }).mode === "native"
+    );
   }
 
   if (capability === "messages.create" || capability === "messages.countTokens") {
@@ -693,29 +707,81 @@ function supportsCapability({
   }
 
   if (capability === "responses.statefulFollowUps") {
+    if (capabilities?.version === 3)
+      return (
+        resolveExecutionPath({
+          capabilities,
+          requestedSurface: "OPENAI_RESPONSES",
+          request: { stateful: true },
+        }).mode === "native"
+      );
     return capabilities?.responses?.statefulFollowUps === true;
   }
 
   if (capability === "responses.retrieve") {
+    if (capabilities?.version === 3)
+      return (
+        resolveExecutionPath({
+          capabilities,
+          requestedSurface: "OPENAI_RESPONSES",
+          request: { stateful: true },
+        }).mode === "native"
+      );
     return capabilities?.responses?.retrieve === true;
   }
 
   if (capability === "responses.delete") {
+    if (capabilities?.version === 3)
+      return (
+        resolveExecutionPath({
+          capabilities,
+          requestedSurface: "OPENAI_RESPONSES",
+          request: { stateful: true },
+        }).mode === "native"
+      );
     return capabilities?.responses?.delete === true;
   }
 
   if (capability === "responses.cancel") {
+    if (capabilities?.version === 3)
+      return (
+        resolveExecutionPath({
+          capabilities,
+          requestedSurface: "OPENAI_RESPONSES",
+          request: { stateful: true },
+        }).mode === "native"
+      );
     return capabilities?.responses?.cancel === true;
   }
 
   if (capability === "responses.listInputItems") {
+    if (capabilities?.version === 3)
+      return (
+        resolveExecutionPath({
+          capabilities,
+          requestedSurface: "OPENAI_RESPONSES",
+          request: { stateful: true },
+        }).mode === "native"
+      );
     return capabilities?.responses?.listInputItems === true;
   }
 
   if (capability === "responses.countTokens") {
+    if (capabilities?.version === 3)
+      return (
+        resolveExecutionPath({
+          capabilities,
+          requestedSurface: "OPENAI_RESPONSES",
+          request: { countTokens: true },
+        }).mode === "native"
+      );
     return capabilities?.responses?.countTokens === true;
   }
 
+  if (capabilities?.version === 3)
+    return (
+      resolveExecutionPath({ capabilities, requestedSurface: "OPENAI_RESPONSES" }).mode === "native"
+    );
   return capabilities?.responses?.compact === true;
 }
 
@@ -2034,7 +2100,7 @@ async function relayPool({
         },
         attemptCount,
       });
-      return openAiFailureJsonResponse(failure);
+      return operationFailureResponse(operation, failure);
     }
   }
 
@@ -2048,7 +2114,7 @@ async function relayPool({
     requestBytes: cumulativeRequestBytes,
     responseBytes: cumulativeResponseBytes,
   });
-  return openAiFailureJsonResponse(finalFailure);
+  return operationFailureResponse(operation, finalFailure);
 }
 
 async function relaySelectedModelNoFailover({
@@ -2083,7 +2149,7 @@ async function relaySelectedModelNoFailover({
   const selected = await directModelRow(selectedDiscoveredModelId);
   if (!selected) {
     await failRelayMetadata({ relayRequestId, startedAt, failure: "not_found" });
-    return openAiFailureJsonResponse("not_found");
+    return operationFailureResponse(operation, "not_found");
   }
 
   if (
@@ -2098,7 +2164,7 @@ async function relaySelectedModelNoFailover({
       failure: "unsupported_capability",
       selectedDiscoveredModelId: selected.id,
     });
-    return openAiFailureJsonResponse("unsupported_capability");
+    return operationFailureResponse(operation, "unsupported_capability");
   }
 
   if (!isEndpointConnected(selected, new Set(manager.getActiveCliDeviceIds()))) {
@@ -2108,7 +2174,7 @@ async function relaySelectedModelNoFailover({
       failure: "disconnected",
       selectedDiscoveredModelId: selected.id,
     });
-    return openAiFailureJsonResponse("disconnected");
+    return operationFailureResponse(operation, "disconnected");
   }
 
   let globalLease: ModelApiLimitLease | undefined;
@@ -2129,7 +2195,7 @@ async function relaySelectedModelNoFailover({
         failure: error.failure,
         selectedDiscoveredModelId: selected.id,
       });
-      return openAiFailureJsonResponse(error.failure);
+      return operationFailureResponse(operation, error.failure);
     }
     throw error;
   }
@@ -2147,7 +2213,7 @@ async function relaySelectedModelNoFailover({
       failure: "unknown",
       selectedDiscoveredModelId: selected.id,
     });
-    return openAiFailureJsonResponse("unknown");
+    return operationFailureResponse(operation, "unknown");
   }
   const responseIdCapture =
     operation.responseStickiness && operation.family === "responses"
@@ -2215,7 +2281,7 @@ async function relaySelectedModelNoFailover({
       terminal,
       attemptCount: 1,
     });
-    return openAiFailureJsonResponse(terminal.failure ?? "unknown");
+    return operationFailureResponse(operation, terminal.failure ?? "unknown");
   }
 }
 
@@ -3186,6 +3252,7 @@ async function anthropicMessagesHandler({
 export function createModelApiRoutes({
   manager = relaySessionManager,
   concurrencyLimiter = modelApiConcurrencyLimiter,
+  anthropicEnabled = env.MODEL_API_ANTHROPIC_ENABLED,
 }: ModelApiRouteDependencies = {}) {
   const app = new Hono();
 
@@ -3284,23 +3351,25 @@ export function createModelApiRoutes({
     }),
   );
 
-  app.post("/messages", async (c) =>
-    anthropicMessagesHandler({
-      request: c.req.raw,
-      countTokens: false,
-      manager,
-      limiter: concurrencyLimiter,
-    }),
-  );
+  if (anthropicEnabled) {
+    app.post("/messages", async (c) =>
+      anthropicMessagesHandler({
+        request: c.req.raw,
+        countTokens: false,
+        manager,
+        limiter: concurrencyLimiter,
+      }),
+    );
 
-  app.post("/messages/count_tokens", async (c) =>
-    anthropicMessagesHandler({
-      request: c.req.raw,
-      countTokens: true,
-      manager,
-      limiter: concurrencyLimiter,
-    }),
-  );
+    app.post("/messages/count_tokens", async (c) =>
+      anthropicMessagesHandler({
+        request: c.req.raw,
+        countTokens: true,
+        manager,
+        limiter: concurrencyLimiter,
+      }),
+    );
+  }
 
   app.post("/responses/count_tokens", async (c) =>
     authenticatedModeledHandler({

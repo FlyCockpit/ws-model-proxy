@@ -23,6 +23,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     MODEL_API_TRANSCRIPTION_MAX_CONCURRENT_UPLOADS: 4,
     MODEL_API_TRANSCRIPTION_MIN_FREE_BYTES: 0,
     MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS: 30_000,
+    MODEL_API_ANTHROPIC_ENABLED: true,
   },
 }));
 
@@ -314,10 +315,11 @@ function poolMemberRow({
   };
 }
 
-function appWith(manager: FakeRelayManager) {
+function appWith(manager: FakeRelayManager, anthropicEnabled = true) {
   return createModelApiRoutes({
     manager,
     concurrencyLimiter: new ModelApiConcurrencyLimiter(),
+    anthropicEnabled,
   });
 }
 
@@ -577,6 +579,59 @@ describe("model API routes", () => {
     );
   });
 
+  it("routes v3 OpenAI Chat, Responses, and native-only Completions surfaces", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiChatCompletions: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+            },
+            openaiResponses: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+              stateful: true,
+            },
+            openaiCompletions: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+            },
+          },
+        },
+      }),
+    );
+    for (const [route, expectedPath, body] of [
+      [
+        "/chat/completions",
+        "/v1/chat/completions",
+        { messages: [{ role: "user", content: "hi" }] },
+      ],
+      ["/responses", "/v1/responses", { input: "hi" }],
+      ["/completions", "/v1/completions", { prompt: "hi" }],
+    ] as const) {
+      const manager = new FakeRelayManager();
+      const pending = appWith(manager).request(route, {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: JSON.stringify({ model: directTarget.modelId, ...body }),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      expect(sent.path).toBe(expectedPath);
+      await completeJsonRelay({ manager, requestId: sent.requestId, body: { id: "native" } });
+      expect((await pending).status).toBe(200);
+    }
+  });
+
   it("relays native Anthropic Messages with strict WSMP/upstream header isolation", async () => {
     db.discoveredModel.findUnique.mockResolvedValue(
       directRow({
@@ -585,6 +640,8 @@ describe("model API routes", () => {
           protocol: "anthropic-compatible",
           surfaces: {
             anthropicMessages: {
+              source: "declared",
+              confidence: "exact",
               supported: true,
               streaming: true,
               countTokens: true,
@@ -610,6 +667,13 @@ describe("model API routes", () => {
         max_tokens: 32,
         messages: [{ role: "user", content: "secret prompt" }],
         unknown_native_field: { preserve: true },
+        tools: [
+          {
+            name: "lookup",
+            description: "native",
+            input_schema: { type: "object", additionalProperties: true },
+          },
+        ],
       }),
     });
 
@@ -625,6 +689,7 @@ describe("model API routes", () => {
     expect(JSON.parse(firstBodyChunkText(sent))).toMatchObject({
       model: "gpt-4o-mini",
       unknown_native_field: { preserve: true },
+      tools: [{ name: "lookup", input_schema: { additionalProperties: true } }],
     });
 
     manager.headers(sent.requestId, 200, {
@@ -637,6 +702,141 @@ describe("model API routes", () => {
     manager.complete(sent.requestId);
     expect(response.headers.get("request-id")).toBe("req_anthropic");
     await expect(response.json()).resolves.toEqual(nativeBody);
+  });
+
+  it("gates Anthropic routes off explicitly", async () => {
+    const response = await appWith(new FakeRelayManager(), false).request("/messages", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "anthropic-version": "2023-06-01" },
+    });
+    expect(response.status).toBe(404);
+  });
+
+  it("relays Anthropic count_tokens and exact SSE/error bytes with safe metadata", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "anthropic-compatible",
+          surfaces: {
+            anthropicMessages: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+              countTokens: true,
+              protocolVersion: "2023-06-01",
+            },
+          },
+        },
+      }),
+    );
+    const countManager = new FakeRelayManager();
+    const countPromise = appWith(countManager).request("/messages/count_tokens", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: directTarget.modelId,
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+    await vi.waitFor(() => expect(countManager.sent).toHaveLength(1));
+    const countSent = requireSent(countManager);
+    expect(countSent.path).toBe("/v1/messages/count_tokens");
+    await completeJsonRelay({
+      manager: countManager,
+      requestId: countSent.requestId,
+      body: { input_tokens: 7 },
+    });
+    await expect((await countPromise).json()).resolves.toEqual({ input_tokens: 7 });
+
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "anthropic-compatible",
+          surfaces: {
+            anthropicMessages: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              countTokens: false,
+              protocolVersion: "2023-06-01",
+            },
+          },
+        },
+      }),
+    );
+    const rejectedCount = await appWith(new FakeRelayManager()).request("/messages/count_tokens", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: directTarget.modelId, messages: [] }),
+    });
+    expect(rejectedCount.status).toBe(400);
+    await expect(rejectedCount.json()).resolves.toMatchObject({
+      type: "error",
+      error: { type: "invalid_request_error" },
+    });
+
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "anthropic-compatible",
+          surfaces: {
+            anthropicMessages: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+              countTokens: true,
+              protocolVersion: "2023-06-01",
+            },
+          },
+        },
+      }),
+    );
+
+    const streamManager = new FakeRelayManager();
+    const streamPromise = appWith(streamManager).request("/messages", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: directTarget.modelId,
+        stream: true,
+        max_tokens: 8,
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+    await vi.waitFor(() => expect(streamManager.sent).toHaveLength(1));
+    const streamSent = requireSent(streamManager);
+    streamManager.headers(streamSent.requestId, 429, {
+      "content-type": "text/event-stream",
+      "request-id": "req_safe",
+      "retry-after": "3",
+      "x-provider-account": "private",
+    });
+    const streamResponse = await streamPromise;
+    const exact = 'event: error\ndata: {"type":"error","error":{"type":"overloaded_error"}}\n\n';
+    streamManager.body(streamSent.requestId, exact);
+    streamManager.complete(streamSent.requestId);
+    expect(streamResponse.status).toBe(429);
+    expect(streamResponse.headers.get("request-id")).toBe("req_safe");
+    expect(streamResponse.headers.get("retry-after")).toBe("3");
+    expect(streamResponse.headers.get("x-provider-account")).toBeNull();
+    expect(await streamResponse.text()).toBe(exact);
   });
 
   it("uses Anthropic-shaped errors for authentication, version, and beta rejection", async () => {
@@ -1284,7 +1484,7 @@ describe("model API routes", () => {
 
       expect(response.status).toBe(200);
       expect(response.headers.get("content-type")).toBe(contentType);
-      expect(response.headers.get("x-upstream")).toBe("kept");
+      expect(response.headers.get("x-upstream")).toBeNull();
       expect(new Uint8Array(await response.arrayBuffer())).toEqual(output);
       expect(manager.sent).toHaveLength(1);
     },
@@ -1427,6 +1627,38 @@ describe("model API routes", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({ id: "chatcmpl", choices: [] });
+  });
+
+  it("returns Anthropic-shaped pool compatibility failures", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "member-openai",
+        discoveredModelId: "model-openai",
+        upstreamModelId: "upstream-openai",
+        cliDeviceId: "cli-openai",
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-openai"];
+    const response = await appWith(manager).request("/messages", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: poolTarget.modelId, max_tokens: 8, messages: [] }),
+    });
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      type: "error",
+      error: { type: "invalid_request_error" },
+    });
+    expect(manager.sent).toHaveLength(0);
   });
 
   it("fails over pool requests across every currently routable member before returning success", async () => {

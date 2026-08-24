@@ -301,6 +301,15 @@ export const ENV_VARS: EnvVar[] = [
     source: "default",
     default: "900000",
   },
+  {
+    key: "MODEL_API_ANTHROPIC_ENABLED",
+    group: "runtime",
+    source: "default",
+    default: "false",
+    comment: [
+      "Release gate for the incomplete native Anthropic Messages surface. Keep false by default.",
+    ],
+  },
 
   // --- auth ----------------------------------------------------------------
   {

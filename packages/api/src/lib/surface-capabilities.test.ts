@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import wireFixtures from "./fixtures/capabilities-v3-wire.json";
 import { parseOpenAiCompatibleCapabilities } from "./openai-compatible-capabilities";
 import { resolveExecutionPath, surfaceAvailabilityMatrix } from "./surface-capabilities";
 
@@ -7,6 +8,8 @@ const anthropic = parseOpenAiCompatibleCapabilities({
   protocol: "anthropic-compatible",
   surfaces: {
     anthropicMessages: {
+      source: "declared",
+      confidence: "exact",
       supported: true,
       streaming: true,
       tools: true,
@@ -21,6 +24,12 @@ const anthropic = parseOpenAiCompatibleCapabilities({
 });
 
 describe("surface capability resolution", () => {
+  it("accepts and rejects the shared v3 wire fixtures", () => {
+    for (const fixture of wireFixtures.valid)
+      expect(parseOpenAiCompatibleCapabilities(fixture)).not.toBeNull();
+    for (const fixture of wireFixtures.invalid)
+      expect(parseOpenAiCompatibleCapabilities(fixture)).toBeNull();
+  });
   it("retains v1/v2 readers and accepts the provider-independent v3 inventory", () => {
     expect(
       parseOpenAiCompatibleCapabilities({ version: 1, protocol: "openai-compatible" }),

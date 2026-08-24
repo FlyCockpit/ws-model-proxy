@@ -91,6 +91,7 @@ fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
     let url = models_url(&endpoint.base_url)?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(PROBE_TIMEOUT))
+        .max_redirects(0)
         .build()
         .into();
     let mut request = agent.get(url.as_str()).header("Accept", "application/json");
@@ -102,6 +103,16 @@ fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
             )
         })?;
         request = request.header(&header.name, &value);
+    }
+    if let Some(auth) = &endpoint.auth {
+        let value = std::env::var(&auth.env)
+            .with_context(|| format!("reading typed endpoint credential from `{}`", auth.env))?;
+        request = match auth.mode {
+            crate::config::EndpointAuthMode::ApiKey => request.header("x-api-key", &value),
+            crate::config::EndpointAuthMode::Bearer => {
+                request.header("authorization", &format!("Bearer {value}"))
+            }
+        };
     }
     let mut response = request
         .call()

@@ -4,8 +4,23 @@ import {
   parseAnthropicIngress,
   SUPPORTED_ANTHROPIC_VERSIONS,
 } from "./anthropic-protocol";
+import officialFixture from "./fixtures/anthropic-2023-06-01.json";
 
 describe("Anthropic protocol boundary", () => {
+  it("tracks the supported official-version fixture and ordered beta semantics", () => {
+    expect(officialFixture.source).toMatch(/^https:\/\/docs\.anthropic\.com\//);
+    const result = parseAnthropicIngress(new Headers(officialFixture.requestHeaders));
+    expect(result).toEqual({
+      version: officialFixture.protocolVersion,
+      betaFeatures: ["prompt-caching-2024-07-31", "interleaved-thinking-2025-05-14"],
+    });
+    expect(JSON.parse(JSON.stringify(officialFixture.error))).toMatchObject({
+      type: "error",
+      error: { type: "invalid_request_error" },
+    });
+    expect(officialFixture.stream).toContain("event: message_start");
+    expect(officialFixture.stream.endsWith("\n\n")).toBe(true);
+  });
   it("requires the supported official protocol version", async () => {
     for (const headers of [new Headers(), new Headers({ "anthropic-version": "2099-01-01" })]) {
       const result = parseAnthropicIngress(headers);

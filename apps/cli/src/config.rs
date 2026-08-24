@@ -24,7 +24,7 @@ where
     D: serde::Deserializer<'de>,
 {
     let version = u8::deserialize(deserializer)?;
-    if matches!(version, 1 | 2 | 3) {
+    if matches!(version, 1..=3) {
         Ok(version)
     } else {
         Err(serde::de::Error::custom(
@@ -145,6 +145,8 @@ pub struct EndpointConfig {
     pub expand_media: bool,
     pub default_capabilities: OpenAiCompatibleCapabilities,
     pub headers: Vec<HeaderEnvRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth: Option<EndpointAuthConfig>,
     pub models: Vec<ModelConfig>,
     pub last_probe: Option<ProbeSnapshot>,
 }
@@ -160,10 +162,25 @@ impl Default for EndpointConfig {
             expand_media: false,
             default_capabilities: OpenAiCompatibleCapabilities::default(),
             headers: Vec::new(),
+            auth: None,
             models: Vec::new(),
             last_probe: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointAuthConfig {
+    pub mode: EndpointAuthMode,
+    pub env: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EndpointAuthMode {
+    ApiKey,
+    Bearer,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,7 +250,7 @@ pub enum ProbeStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase", try_from = "RawCapabilities")]
 pub struct OpenAiCompatibleCapabilities {
     #[serde(deserialize_with = "deserialize_capability_version")]
     pub version: u8,
@@ -242,9 +259,9 @@ pub struct OpenAiCompatibleCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub surfaces: Option<SurfaceInventory>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
+    pub source: Option<CapabilitySource>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub confidence: Option<String>,
+    pub confidence: Option<CapabilityConfidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub models: Option<ModelListCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -257,6 +274,84 @@ pub struct OpenAiCompatibleCapabilities {
     pub responses: Option<ResponsesCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio: Option<AudioCapabilities>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+struct RawCapabilities {
+    #[serde(deserialize_with = "deserialize_capability_version")]
+    version: u8,
+    #[serde(deserialize_with = "deserialize_compatible_protocol")]
+    protocol: String,
+    surfaces: Option<SurfaceInventory>,
+    source: Option<CapabilitySource>,
+    confidence: Option<CapabilityConfidence>,
+    models: Option<ModelListCapabilities>,
+    chat_completions: Option<ChatCompletionsCapabilities>,
+    completions: Option<CompletionsCapabilities>,
+    embeddings: Option<EmbeddingsCapabilities>,
+    responses: Option<ResponsesCapabilities>,
+    audio: Option<AudioCapabilities>,
+}
+
+impl Default for RawCapabilities {
+    fn default() -> Self {
+        let value = OpenAiCompatibleCapabilities::openai_defaults();
+        Self {
+            version: value.version,
+            protocol: value.protocol,
+            surfaces: value.surfaces,
+            source: value.source,
+            confidence: value.confidence,
+            models: value.models,
+            chat_completions: value.chat_completions,
+            completions: value.completions,
+            embeddings: value.embeddings,
+            responses: value.responses,
+            audio: value.audio,
+        }
+    }
+}
+
+impl TryFrom<RawCapabilities> for OpenAiCompatibleCapabilities {
+    type Error = String;
+
+    fn try_from(value: RawCapabilities) -> std::result::Result<Self, Self::Error> {
+        if value.version == 3 && value.surfaces.is_none() {
+            return Err("version 3 capabilities require `surfaces`".to_string());
+        }
+        Ok(Self {
+            version: value.version,
+            protocol: value.protocol,
+            surfaces: value.surfaces,
+            source: value.source,
+            confidence: value.confidence,
+            models: value.models,
+            chat_completions: value.chat_completions,
+            completions: value.completions,
+            embeddings: value.embeddings,
+            responses: value.responses,
+            audio: value.audio,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CapabilitySource {
+    Declared,
+    Probe,
+    Dashboard,
+    Provider,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CapabilityConfidence {
+    Exact,
+    High,
+    Estimated,
+    Unknown,
 }
 
 impl Default for OpenAiCompatibleCapabilities {
@@ -370,7 +465,7 @@ impl OpenAiCompatibleCapabilities {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct SurfaceInventory {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub openai_chat_completions: Option<SurfaceCapabilities>,
@@ -382,13 +477,19 @@ pub struct SurfaceInventory {
     pub openai_completions: Option<SurfaceCapabilities>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SurfaceCapabilities {
+    pub source: CapabilitySource,
+    pub confidence: CapabilityConfidence,
     pub supported: Option<bool>,
     pub streaming: Option<bool>,
     pub max_context_tokens: Option<u64>,
     pub images: Option<bool>,
+    pub input_audio: Option<bool>,
+    pub output_audio: Option<bool>,
+    pub input_video: Option<bool>,
+    pub output_video: Option<bool>,
     pub tools: Option<bool>,
     pub parallel_tools: Option<bool>,
     pub structured_output: Option<bool>,
@@ -397,7 +498,7 @@ pub struct SurfaceCapabilities {
     pub count_tokens: Option<bool>,
     pub stateful: Option<bool>,
     pub protocol_version: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub beta_features: Vec<String>,
 }
 
@@ -630,6 +731,30 @@ impl Config {
         for endpoint in &self.endpoints {
             validate_slug(&endpoint.slug)
                 .with_context(|| format!("validating endpoint slug `{}`", endpoint.slug))?;
+            if let Some(auth) = &endpoint.auth {
+                validate_env_name(&auth.env)?;
+            }
+            for header in &endpoint.headers {
+                validate_env_name(&header.env)?;
+                let name = header.name.trim().to_ascii_lowercase();
+                if name == "authorization" || name == "x-api-key" {
+                    anyhow::bail!(
+                        "endpoint `{}` must configure upstream credentials through typed `auth`, not custom header `{}`",
+                        endpoint.slug,
+                        header.name
+                    );
+                }
+            }
+            for profile in std::iter::once(&endpoint.default_capabilities).chain(
+                endpoint
+                    .models
+                    .iter()
+                    .filter_map(|model| model.capabilities.as_ref()),
+            ) {
+                if profile.version == 3 && profile.surfaces.is_none() {
+                    anyhow::bail!("version 3 capabilities require `surfaces`");
+                }
+            }
             for model in &endpoint.models {
                 if let Some(slug) = &model.slug {
                     validate_slug(slug)
@@ -723,6 +848,28 @@ mod tests {
     }
 
     #[test]
+    fn typed_auth_is_mutually_exclusive_with_legacy_auth_headers() {
+        let mut config = Config::default();
+        config.endpoints.push(EndpointConfig {
+            slug: "anthropic".to_string(),
+            auth: Some(EndpointAuthConfig {
+                mode: EndpointAuthMode::ApiKey,
+                env: "ANTHROPIC_API_KEY".to_string(),
+            }),
+            headers: vec![HeaderEnvRef {
+                name: "Authorization".to_string(),
+                env: "OTHER_KEY".to_string(),
+            }],
+            ..EndpointConfig::default()
+        });
+        assert!(config.validate().is_err());
+        config.endpoints[0].headers.clear();
+        config.validate().expect("one typed auth mode is valid");
+        let wire = serde_json::to_value(&config.endpoints[0]).expect("serialize endpoint");
+        assert_eq!(wire["auth"]["mode"], "api-key");
+    }
+
+    #[test]
     fn reads_legacy_and_detailed_transcription_capabilities() {
         let legacy: OpenAiCompatibleCapabilities = serde_json::from_value(serde_json::json!({
             "version": 1,
@@ -761,6 +908,8 @@ mod tests {
             "protocol": "anthropic-compatible",
             "surfaces": {
                 "anthropicMessages": {
+                    "source": "declared",
+                    "confidence": "exact",
                     "supported": true,
                     "streaming": true,
                     "protocolVersion": "2023-06-01"
@@ -775,6 +924,23 @@ mod tests {
             serde_json::json!({ "version": 2, "protocol": "other" }),
         ] {
             assert!(serde_json::from_value::<OpenAiCompatibleCapabilities>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn matches_shared_v3_wire_fixtures() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../packages/api/src/lib/fixtures/capabilities-v3-wire.json"
+        ))
+        .expect("shared capability fixture");
+        for valid in fixture["valid"].as_array().expect("valid fixtures") {
+            serde_json::from_value::<OpenAiCompatibleCapabilities>(valid.clone())
+                .expect("valid TS/Rust fixture");
+        }
+        for invalid in fixture["invalid"].as_array().expect("invalid fixtures") {
+            assert!(
+                serde_json::from_value::<OpenAiCompatibleCapabilities>(invalid.clone()).is_err()
+            );
         }
     }
 }

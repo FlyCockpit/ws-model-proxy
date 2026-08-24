@@ -1,0 +1,17 @@
+{
+  "protocolVersion": "2023-06-01",
+  "source": "https://docs.anthropic.com/en/api/versioning",
+  "capturedAt": "2026-08-24",
+  "requestHeaders": {
+    "anthropic-version": "2023-06-01",
+    "anthropic-beta": "prompt-caching-2024-07-31,interleaved-thinking-2025-05-14"
+  },
+  "error": {
+    "type": "error",
+    "error": {
+      "type": "invalid_request_error",
+      "message": "Invalid request"
+    }
+  },
+  "stream": "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fixture\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-fixture\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+}

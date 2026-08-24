@@ -1,0 +1,29 @@
+{
+  "source": "WSMP provider-independent capability inventory v3, 2026-08-24",
+  "valid": [
+    {
+      "version": 3,
+      "protocol": "anthropic-compatible",
+      "surfaces": {
+        "anthropicMessages": {
+          "source": "declared",
+          "confidence": "exact",
+          "supported": true,
+          "streaming": true,
+          "inputAudio": false,
+          "outputAudio": false,
+          "inputVideo": false,
+          "outputVideo": false,
+          "protocolVersion": "2023-06-01"
+        }
+      },
+      "source": "declared",
+      "confidence": "exact"
+    }
+  ],
+  "invalid": [
+    { "version": 3, "protocol": "anthropic-compatible" },
+    { "version": 3, "protocol": "anthropic-compatible", "surfaces": {}, "source": "guess" },
+    { "version": 3, "protocol": "anthropic-compatible", "surfaces": {}, "confidence": "maybe" }
+  ]
+}
