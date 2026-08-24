@@ -341,21 +341,32 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         : `direct:${lease.executionTargetId}`;
       activeByOwner.set(ownerKey, (activeByOwner.get(ownerKey) ?? 0) + 1);
     }
+    const concurrencyActiveByScope = new Map<string, number>();
+    for (const waiter of waiters) {
+      if (waiter.effectiveConcurrencyLimit === null) continue;
+      const scopeKey = `${waiter.effectiveConcurrencyScope}:${waiter.effectiveConcurrencyScopeId}`;
+      if (concurrencyActiveByScope.has(scopeKey)) continue;
+      const scopedActive = await tx.capacityLease.count({
+        where: {
+          state: "ACTIVE",
+          ...(waiter.effectiveConcurrencyScope === "POOL"
+            ? { poolId: waiter.effectiveConcurrencyScopeId }
+            : waiter.effectiveConcurrencyScope === "MEMBER"
+              ? { poolMemberId: waiter.effectiveConcurrencyScopeId }
+              : { executionTargetId: waiter.effectiveConcurrencyScopeId }),
+        },
+      });
+      concurrencyActiveByScope.set(scopeKey, scopedActive);
+    }
     const eligibility = new Map<string, { borrowed: boolean }>();
     const eligible = [];
     for (const waiter of waiters) {
       const memberLimit = waiter.effectiveConcurrencyLimit;
       if (memberLimit !== null && memberLimit !== undefined) {
-        const memberActive = await tx.capacityLease.count({
-          where: {
-            state: "ACTIVE",
-            ...(waiter.effectiveConcurrencyScope === "POOL"
-              ? { poolId: waiter.effectiveConcurrencyScopeId }
-              : waiter.effectiveConcurrencyScope === "MEMBER"
-                ? { poolMemberId: waiter.effectiveConcurrencyScopeId }
-                : { executionTargetId: waiter.effectiveConcurrencyScopeId }),
-          },
-        });
+        const memberActive =
+          concurrencyActiveByScope.get(
+            `${waiter.effectiveConcurrencyScope}:${waiter.effectiveConcurrencyScopeId}`,
+          ) ?? 0;
         if (memberActive >= memberLimit) continue;
       }
       const ownerKey = waiter.poolMemberId
@@ -386,8 +397,13 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           : `direct:${entry.executionTargetId}`;
         return (
           entry.id !== waiter.id &&
+          entry.effectivePriority > waiter.effectivePriority &&
           queuedOwner !== ownerKey &&
-          (reservationsByOwner.get(queuedOwner) ?? 0) > (activeByOwner.get(queuedOwner) ?? 0)
+          (reservationsByOwner.get(queuedOwner) ?? 0) > (activeByOwner.get(queuedOwner) ?? 0) &&
+          (entry.effectiveConcurrencyLimit === null ||
+            (concurrencyActiveByScope.get(
+              `${entry.effectiveConcurrencyScope}:${entry.effectiveConcurrencyScopeId}`,
+            ) ?? 0) < entry.effectiveConcurrencyLimit)
         );
       });
       if (borrowed && queuedReservationOwnerNeedsSlot) continue;
