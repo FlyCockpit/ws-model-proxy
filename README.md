@@ -52,6 +52,11 @@ pnpm db:push
 pnpm dev
 ```
 
+Use the repository `pnpm db:push` wrapper for every schema application. It
+runs Prisma and then installs the database constraints/backfills in
+`packages/db/prisma/schema-hardening.sql`; invoking raw `prisma db push` alone
+is unsupported for deployments.
+
 ### Environment files
 
 Root `.env.example` and `apps/web/.env.example` are **generated** from

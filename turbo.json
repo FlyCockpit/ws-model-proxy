@@ -59,7 +59,12 @@
       "cache": false
     },
     "db:validate": {
-      "inputs": ["prisma/schema/**/*.prisma", "prisma.config.ts"]
+      "inputs": [
+        "prisma/schema/**/*.prisma",
+        "prisma/schema-hardening.sql",
+        "scripts/verify-schema-hardening.mjs",
+        "prisma.config.ts"
+      ]
     },
     "db:studio": {
       "cache": false,

@@ -11,10 +11,10 @@
   },
   "scripts": {
     "check-types": "tsc --noEmit",
-    "db:push": "prisma db push",
+    "db:push": "prisma db push && node scripts/apply-schema-hardening.mjs",
     "db:push:dangerous": "bash ../../scripts/db-push-dangerous-local.sh",
     "db:generate": "prisma generate",
-    "db:validate": "prisma validate && prisma format && prisma format --check",
+    "db:validate": "prisma validate && prisma format && prisma format --check && node scripts/verify-schema-hardening.mjs",
     "postinstall": "prisma generate",
     "db:studio": "prisma studio",
     "db:start": "bash ../../scripts/compose.sh up -d",

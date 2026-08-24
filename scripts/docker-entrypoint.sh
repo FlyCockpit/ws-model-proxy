@@ -4,8 +4,9 @@
 # Responsibilities:
 #   1. Validate required environment variables.
 #   2. Gate schema sync on APPLY_SCHEMA. When sync is requested, run
-#      `prisma db push` under a Postgres advisory lock so concurrent replicas
-#      (and any accidental cross-image pushes) serialize.
+#      `prisma db push` plus repository schema hardening under a Postgres
+#      advisory lock so concurrent replicas (and any accidental cross-image
+#      pushes) serialize.
 #   3. exec the container CMD.
 #
 # APPLY_SCHEMA values:
@@ -110,6 +111,7 @@ if [ "$APPLY_SCHEMA" != "off" ]; then
 SET lock_timeout = '300s';
 SELECT pg_advisory_lock($LOCK_ID);
 \! cd /app/packages/db && node_modules/.bin/prisma db push $push_flags; echo \$? > $STATUS_FILE
+\i /app/packages/db/prisma/schema-hardening.sql
 SELECT pg_advisory_unlock($LOCK_ID);
 EOF
 

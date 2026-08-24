@@ -38,6 +38,9 @@ model User {
   responseStickinessRecords ResponseStickinessRecord[] @relation("ResponseStickinessOwner")
   relayRequests             RelayRequest[]             @relation("RelayRequestOwner")
   mediaAssets               MediaAsset[]               @relation("MediaAssetOwner")
+  providerAccounts          ProviderAccount[]          @relation("ProviderAccountOwner")
+  providerModels            ProviderModel[]            @relation("ProviderModelOwner")
+  executionTargets          ExecutionTarget[]          @relation("ExecutionTargetOwner")
 
   @@unique([email])
   @@index([slug])
