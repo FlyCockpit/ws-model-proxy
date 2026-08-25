@@ -1107,6 +1107,13 @@ export const forwarderManagementRouter = {
         protocolAdaptationEnabled: z.boolean().optional(),
         allowLossyDeveloperRoleCollapse: z.boolean().optional(),
         recommendedSurfaceOverride: z.enum(modelApiSurfaces).nullable().optional(),
+        capacityPriority: z.number().int().min(0).max(31).optional(),
+        capacityConcurrencyLimit: z.number().int().positive().max(10_000).nullable().optional(),
+        capacityReservedSlots: z.number().int().min(0).max(10_000).optional(),
+        capacityWaitBudgetMs: z.number().int().min(0).max(600_000).nullable().optional(),
+        capacityContextCeiling: z.number().int().positive().max(100_000_000).nullable().optional(),
+        capacityContextMargin: z.number().int().min(0).max(100_000_000).optional(),
+        capacityBorrowPolicy: z.enum(["NEVER", "WHEN_IDLE"]).optional(),
       }),
     )
     .handler(async ({ input, context }) => {
@@ -1125,6 +1132,13 @@ export const forwarderManagementRouter = {
           protocolAdaptationEnabled: input.protocolAdaptationEnabled ?? false,
           allowLossyDeveloperRoleCollapse: input.allowLossyDeveloperRoleCollapse ?? false,
           recommendedSurfaceOverride: input.recommendedSurfaceOverride ?? null,
+          capacityPriority: input.capacityPriority ?? 16,
+          capacityConcurrencyLimit: input.capacityConcurrencyLimit ?? null,
+          capacityReservedSlots: input.capacityReservedSlots ?? 0,
+          capacityWaitBudgetMs: input.capacityWaitBudgetMs ?? null,
+          capacityContextCeiling: input.capacityContextCeiling ?? null,
+          capacityContextMargin: input.capacityContextMargin ?? 0,
+          capacityBorrowPolicy: input.capacityBorrowPolicy ?? "WHEN_IDLE",
         },
         select: poolSelect,
       })) as ModelPoolRow;

@@ -39,12 +39,19 @@ export type AdmissionResult =
   | { state: "WAITING"; requestId: string }
   | { state: "CANCELLED" | "EXPIRED" };
 
+export type AdmissionTerminalizationResult =
+  | { state: "ADMITTED"; lease: CapacityLeaseHandle }
+  | { state: "CANCELLED" | "EXPIRED" | "TERMINAL" }
+  | { state: "MISSING" };
+
 export interface CapacityAdmissionStore {
   acquire(attempt: AdmissionAttempt, signal?: AbortSignal): Promise<AdmissionResult>;
   heartbeat(lease: CapacityLeaseHandle, expiresAt: Date): Promise<boolean>;
   release(lease: CapacityLeaseHandle): Promise<boolean>;
-  cancelAttempt(attemptId: string): Promise<boolean>;
-  expireAttempt(attemptId: string): Promise<boolean>;
+  terminalizeAttempt(
+    attemptId: string,
+    state: "CANCELLED" | "EXPIRED",
+  ): Promise<AdmissionTerminalizationResult>;
   reclaimExpired(now: Date, limit: number): Promise<number>;
 }
 

@@ -3,6 +3,7 @@ import { SCHEDULER_VERSION, scheduleWeightedDeficitRoundRobin } from "./schedule
 import type {
   AdmissionAttempt,
   AdmissionResult,
+  AdmissionTerminalizationResult,
   CapacityAdmissionStore,
   CapacityLeaseHandle,
 } from "./types.js";
@@ -553,29 +554,42 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     return released;
   }
 
-  async cancelAttempt(attemptId: string): Promise<boolean> {
-    return this.#terminalizeWaitingAttempt(attemptId, "CANCELLED", "cancelled");
-  }
-
-  async expireAttempt(attemptId: string): Promise<boolean> {
-    return this.#terminalizeWaitingAttempt(attemptId, "EXPIRED", "deadline");
-  }
-
-  async #terminalizeWaitingAttempt(
+  async terminalizeAttempt(
     attemptId: string,
     state: "CANCELLED" | "EXPIRED",
-    reason: "cancelled" | "deadline",
-  ): Promise<boolean> {
+  ): Promise<AdmissionTerminalizationResult> {
+    const reason = state === "CANCELLED" ? "cancelled" : "deadline";
     const now = new Date();
     const cancelled = await this.#serializable(async (tx) => {
       const request = await tx.admissionRequest.findUnique({
         where: { attemptId },
-        include: { Waiters: true },
+        include: { Waiters: true, Lease: true },
       });
-      if (request?.state !== "WAITING") return { count: 0, capacities: [] as string[] };
+      if (!request) return { result: { state: "MISSING" } as const, capacities: [] as string[] };
       const capacities = [...new Set(request.Waiters.map((waiter) => waiter.capacityId))].sort();
-      for (const capacityId of capacities)
+      if (request.Lease?.capacityId) capacities.push(request.Lease.capacityId);
+      const lockedCapacities = [...new Set(capacities)].sort();
+      for (const capacityId of lockedCapacities)
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacityId}, 0))`;
+      const current = await tx.admissionRequest.findUniqueOrThrow({
+        where: { id: request.id },
+        include: { Lease: true },
+      });
+      if (current.state === "ADMITTED" && current.Lease?.state === "ACTIVE")
+        return {
+          result: { state: "ADMITTED", lease: leaseHandle(current.Lease) } as const,
+          capacities: lockedCapacities,
+        };
+      if (current.state !== "WAITING")
+        return {
+          result: {
+            state:
+              current.state === "CANCELLED" || current.state === "EXPIRED"
+                ? current.state
+                : "TERMINAL",
+          } as AdmissionTerminalizationResult,
+          capacities: lockedCapacities,
+        };
       const result = await tx.admissionRequest.updateMany({
         where: { id: request.id, state: "WAITING" },
         data: { state, terminalAt: now, terminalReason: reason },
@@ -590,11 +604,23 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           where: { id: request.relayRequestId, admissionAttemptId: attemptId },
           data: { admissionTerminalState: state },
         });
-      return { count: result.count, capacities };
+      return {
+        result: { state: result.count ? state : "MISSING" } as AdmissionTerminalizationResult,
+        capacities: lockedCapacities,
+      };
     });
-    if (cancelled.count) await this.notifier?.notify(cancelled.capacities);
-    const result = cancelled;
-    return result.count === 1;
+    if (cancelled.result.state === state) await this.notifier?.notify(cancelled.capacities);
+    return cancelled.result;
+  }
+
+  /** @deprecated Prefer terminalizeAttempt so an admission race cannot be hidden. */
+  async cancelAttempt(attemptId: string): Promise<boolean> {
+    return (await this.terminalizeAttempt(attemptId, "CANCELLED")).state === "CANCELLED";
+  }
+
+  /** @deprecated Prefer terminalizeAttempt so an admission race cannot be hidden. */
+  async expireAttempt(attemptId: string): Promise<boolean> {
+    return (await this.terminalizeAttempt(attemptId, "EXPIRED")).state === "EXPIRED";
   }
 
   async reclaimExpired(_now: Date, limit: number): Promise<number> {

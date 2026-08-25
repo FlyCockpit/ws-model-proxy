@@ -18,8 +18,7 @@ describe("capacity admission runtime", () => {
         acquire,
         release: vi.fn(),
         heartbeat: vi.fn(),
-        cancelAttempt: vi.fn(),
-        expireAttempt: vi.fn(),
+        terminalizeAttempt: vi.fn().mockResolvedValue({ state: "CANCELLED" }),
         reclaimExpired: vi.fn(),
       },
       1,
@@ -45,8 +44,7 @@ describe("capacity admission runtime", () => {
       acquire: vi.fn().mockResolvedValue({ state: "CANCELLED" }),
       release: vi.fn(),
       heartbeat: vi.fn(),
-      cancelAttempt: vi.fn(),
-      expireAttempt: vi.fn(),
+      terminalizeAttempt: vi.fn().mockResolvedValue({ state: "CANCELLED" }),
       reclaimExpired: vi.fn(),
       sweepAbandoned,
     };
@@ -68,7 +66,7 @@ describe("capacity admission runtime", () => {
 
   it("durably cancels an aborted waiter before returning", async () => {
     const controller = new AbortController();
-    const cancelAttempt = vi.fn().mockResolvedValue(true);
+    const terminalizeAttempt = vi.fn().mockResolvedValue({ state: "CANCELLED" });
     const acquire = vi.fn().mockImplementation(async () => {
       controller.abort();
       return { state: "WAITING", requestId: "request" };
@@ -78,8 +76,7 @@ describe("capacity admission runtime", () => {
         acquire,
         release: vi.fn(),
         heartbeat: vi.fn(),
-        cancelAttempt,
-        expireAttempt: vi.fn(),
+        terminalizeAttempt,
         reclaimExpired: vi.fn(),
       },
       1,
@@ -99,7 +96,7 @@ describe("capacity admission runtime", () => {
         controller.signal,
       ),
     ).resolves.toEqual({ state: "CANCELLED" });
-    expect(cancelAttempt).toHaveBeenCalledWith("attempt");
+    expect(terminalizeAttempt).toHaveBeenCalledWith("attempt", "CANCELLED");
   });
 
   it("releases admission when abort wins immediately after acquire", async () => {
@@ -121,8 +118,49 @@ describe("capacity admission runtime", () => {
         }),
         release,
         heartbeat: vi.fn(),
-        cancelAttempt: vi.fn(),
-        expireAttempt: vi.fn(),
+        terminalizeAttempt: vi.fn().mockResolvedValue({ state: "ADMITTED", lease }),
+        reclaimExpired: vi.fn(),
+      },
+      1,
+    );
+    await expect(
+      runtime.acquire(
+        {
+          requestId: "request",
+          attemptId: "attempt",
+          ownerId: "owner",
+          sourceKind: "DIRECT",
+          basePriority: 16,
+          connectionOwner: "server",
+          deadlineAt: new Date(Date.now() + 100),
+          candidates: [{ capacityId: "capacity", executionTargetId: "target", candidateOrder: 0 }],
+        },
+        controller.signal,
+      ),
+    ).resolves.toEqual({ state: "CANCELLED" });
+    expect(release).toHaveBeenCalledWith(lease);
+  });
+
+  it("releases a lease that atomically wins against waiter cancellation", async () => {
+    const controller = new AbortController();
+    const lease = {
+      leaseId: "race-lease",
+      attemptId: "attempt",
+      capacityId: "capacity",
+      executionTargetId: "target",
+      fencingToken: 2n,
+      expiresAt: new Date(Date.now() + 30_000),
+    };
+    const release = vi.fn().mockResolvedValue(true);
+    const runtime = new StoreCapacityAdmissionRuntime(
+      {
+        acquire: vi.fn().mockImplementation(async () => {
+          controller.abort();
+          return { state: "WAITING", requestId: "request" };
+        }),
+        release,
+        heartbeat: vi.fn(),
+        terminalizeAttempt: vi.fn().mockResolvedValue({ state: "ADMITTED", lease }),
         reclaimExpired: vi.fn(),
       },
       1,
@@ -146,14 +184,13 @@ describe("capacity admission runtime", () => {
   });
 
   it("durably expires a waiter at its deadline", async () => {
-    const expireAttempt = vi.fn().mockResolvedValue(true);
+    const terminalizeAttempt = vi.fn().mockResolvedValue({ state: "EXPIRED" });
     const runtime = new StoreCapacityAdmissionRuntime(
       {
         acquire: vi.fn().mockResolvedValue({ state: "WAITING", requestId: "request" }),
         release: vi.fn(),
         heartbeat: vi.fn(),
-        cancelAttempt: vi.fn(),
-        expireAttempt,
+        terminalizeAttempt,
         reclaimExpired: vi.fn(),
       },
       1,
@@ -170,6 +207,6 @@ describe("capacity admission runtime", () => {
         candidates: [{ capacityId: "capacity", executionTargetId: "target", candidateOrder: 0 }],
       }),
     ).resolves.toEqual({ state: "EXPIRED" });
-    expect(expireAttempt).toHaveBeenCalledWith("attempt");
+    expect(terminalizeAttempt).toHaveBeenCalledWith("attempt", "EXPIRED");
   });
 });

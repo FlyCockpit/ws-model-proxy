@@ -522,6 +522,7 @@ type DirectModelRelayRow = {
     inferenceCapacityId: string | null;
     directContextCeiling?: number | null;
     directContextMargin?: number;
+    directWaitBudgetMs?: number | null;
     InferenceCapacity?: {
       physicalMaxContext: number | null;
       countStrategy: "TOKENIZER" | "TEMPLATE_AWARE" | "ENGINE_REPORTED" | "CONSERVATIVE_ESTIMATE";
@@ -575,9 +576,12 @@ type PoolMemberRelayRow = PoolMemberRouteRow & {
   capacityContextCeiling?: number | null;
   capacityContextCeilingMode?: "INHERIT" | "LIMITED" | "UNLIMITED";
   capacityContextMargin?: number | null;
+  capacityWaitBudgetMs?: number | null;
+  capacityWaitBudgetMode?: "INHERIT" | "LIMITED" | "UNLIMITED";
   ModelPool?: {
     capacityContextCeiling: number | null;
     capacityContextMargin: number;
+    capacityWaitBudgetMs: number | null;
   };
   DiscoveredModel: PoolMemberRouteRow["DiscoveredModel"] & {
     id: string;
@@ -623,6 +627,33 @@ type RelayRequester = {
   modelApiTokenLookupPrefix: string | null;
   exposeTransformDebug?: boolean;
 };
+
+function boundedAdmissionDeadline(
+  nowMs: number,
+  requestDeadlineMs: number,
+  waitBudgetMs: number | null,
+) {
+  return new Date(
+    Math.min(requestDeadlineMs, waitBudgetMs === null ? requestDeadlineMs : nowMs + waitBudgetMs),
+  );
+}
+
+function effectiveMemberWaitBudget(member: PoolMemberRelayRow): number | null {
+  if (member.capacityWaitBudgetMode === "UNLIMITED") return null;
+  if (
+    member.capacityWaitBudgetMode === "LIMITED" ||
+    (member.capacityWaitBudgetMode === undefined && member.capacityWaitBudgetMs != null)
+  )
+    return member.capacityWaitBudgetMs ?? 0;
+  return member.ModelPool?.capacityWaitBudgetMs ?? null;
+}
+
+function effectivePoolCandidateWaitBudget(members: readonly PoolMemberRelayRow[]): number | null {
+  const limited = members
+    .map(effectiveMemberWaitBudget)
+    .filter((budget): budget is number => budget !== null);
+  return limited.length ? Math.min(...limited) : null;
+}
 
 const poolRelayFailureClassSet: ReadonlySet<string> = new Set(relayFailureClasses);
 const RESPONSES_STICKINESS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1739,8 +1770,8 @@ async function failRelayMetadata({
 }
 
 function metadataUpdateError(error: unknown) {
-  const message = error instanceof Error ? error.message : "unknown error";
-  console.warn(`[model-api] relay metadata update failed: ${message}`);
+  void error;
+  console.warn("[model-api] relay metadata update failed");
 }
 
 function responseStickinessDigest({
@@ -1824,8 +1855,26 @@ async function writeResponseStickiness({
 }
 
 function stickinessWriteError(error: unknown) {
-  const message = error instanceof Error ? error.message : "unknown error";
-  console.warn(`[model-api] responses stickiness write failed: ${message}`);
+  void error;
+  console.warn("[model-api] responses stickiness write failed");
+}
+
+function reportCleanupFailures(results: readonly PromiseSettledResult<unknown>[]) {
+  const failures = results.filter(({ status }) => status === "rejected").length;
+  if (failures) console.warn(`[model-api] ${failures} relay cleanup operation(s) failed`);
+}
+
+function rejectedRelayTerminal(): RelayAttemptTerminal {
+  return {
+    ok: false,
+    failure: "unknown",
+    httpStatusCode: 500,
+    upstreamStatusCode: null,
+    usage: null,
+    metrics: null,
+    responseBytes: 0,
+    requestBytes: 0,
+  };
 }
 
 function extractResponseIdFromJson(value: unknown): string | null {
@@ -2023,6 +2072,7 @@ async function directModelRow(discoveredModelId: string): Promise<DirectModelRel
           inferenceCapacityId: true,
           directContextCeiling: true,
           directContextMargin: true,
+          directWaitBudgetMs: true,
           InferenceCapacity: {
             select: {
               physicalMaxContext: true,
@@ -2065,8 +2115,14 @@ async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
       capacityContextCeiling: true,
       capacityContextCeilingMode: true,
       capacityContextMargin: true,
+      capacityWaitBudgetMs: true,
+      capacityWaitBudgetMode: true,
       ModelPool: {
-        select: { capacityContextCeiling: true, capacityContextMargin: true },
+        select: {
+          capacityContextCeiling: true,
+          capacityContextMargin: true,
+          capacityWaitBudgetMs: true,
+        },
       },
       ExecutionTarget: {
         select: {
@@ -2474,7 +2530,11 @@ async function relayDirect({
           sourceKind: "DIRECT",
           basePriority: 16,
           connectionOwner: "model-api",
-          deadlineAt: new Date(Date.now() + 30_000),
+          deadlineAt: boundedAdmissionDeadline(
+            Date.now(),
+            startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS,
+            identity.directWaitBudgetMs ?? null,
+          ),
           candidates: [
             {
               capacityId: identity.inferenceCapacityId,
@@ -2561,27 +2621,33 @@ async function relayDirect({
   try {
     const started = await attempt.started;
     const finalize = attempt.terminal
+      .catch(() => rejectedRelayTerminal())
       .then(async (terminal) => {
-        cliLease.release();
-        globalLease.release();
-        if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
-        await operation.dispose?.();
-        await updateRelayMetadata(relayRequestId, {
-          selectedDiscoveredModelId: selected.id,
-          status: terminalStatus(terminal),
-          startedAt,
-          terminal,
-          attemptCount: 1,
-        });
+        const cleanup = await Promise.allSettled([
+          Promise.resolve().then(() => cliLease.release()),
+          Promise.resolve().then(() => globalLease.release()),
+          builtRequest.body instanceof Uint8Array ? Promise.resolve() : builtRequest.body.dispose(),
+          operation.dispose?.() ?? Promise.resolve(),
+        ]);
+        reportCleanupFailures(cleanup);
         const responseId = responseIdCapture?.finish(operation.stream) ?? null;
-        if (terminal.ok && responseId && operation.responseStickiness) {
-          await writeResponseStickiness({
-            ...operation.responseStickiness,
-            responseId,
-            targetDiscoveredModelId: target.id,
+        await Promise.allSettled([
+          updateRelayMetadata(relayRequestId, {
             selectedDiscoveredModelId: selected.id,
-          }).catch(stickinessWriteError);
-        }
+            status: terminalStatus(terminal),
+            startedAt,
+            terminal,
+            attemptCount: 1,
+          }).catch(metadataUpdateError),
+          terminal.ok && responseId && operation.responseStickiness
+            ? writeResponseStickiness({
+                ...operation.responseStickiness,
+                responseId,
+                targetDiscoveredModelId: target.id,
+                selectedDiscoveredModelId: selected.id,
+              }).catch(stickinessWriteError)
+            : Promise.resolve(),
+        ]);
       })
       .catch(metadataUpdateError);
     void finalize;
@@ -2598,12 +2664,17 @@ async function relayDirect({
       ? (capacityRuntime?.hold(response, capacityLease.lease, request.signal) ?? response)
       : response;
   } catch {
-    const terminal = await attempt.terminal;
-    cliLease.release();
-    globalLease?.release();
-    if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
-    if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
-    await operation.dispose?.();
+    const terminal = await attempt.terminal.catch(() => rejectedRelayTerminal());
+    const cleanup = await Promise.allSettled([
+      Promise.resolve().then(() => cliLease.release()),
+      Promise.resolve().then(() => globalLease?.release()),
+      capacityLease?.state === "ADMITTED"
+        ? (capacityRuntime?.release(capacityLease.lease) ?? Promise.resolve(false))
+        : Promise.resolve(),
+      builtRequest.body instanceof Uint8Array ? Promise.resolve() : builtRequest.body.dispose(),
+      operation.dispose?.() ?? Promise.resolve(),
+    ]);
+    reportCleanupFailures(cleanup);
     await updateRelayMetadata(relayRequestId, {
       selectedDiscoveredModelId: selected.id,
       status: terminalStatus(terminal),
@@ -2635,6 +2706,7 @@ async function relayPool({
   capacityRuntime?: CapacityAdmissionRuntime;
 }): Promise<Response> {
   const startedAt = new Date();
+  const relayDeadlineMs = startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS;
   const relayRequestId = await createRelayMetadata({
     userId: requester.userId,
     modelApiTokenId: requester.modelApiTokenId,
@@ -2863,7 +2935,15 @@ async function relayPool({
           poolId: target.id,
           basePriority: 16,
           connectionOwner: "model-api",
-          deadlineAt: new Date(Date.now() + 30_000),
+          deadlineAt: boundedAdmissionDeadline(
+            Date.now(),
+            relayDeadlineMs,
+            effectivePoolCandidateWaitBudget(
+              routeCandidates
+                .map(({ poolMemberId }) => memberById.get(poolMemberId))
+                .filter((member): member is PoolMemberRelayRow => member !== undefined),
+            ),
+          ),
           candidates: admissionCandidates.filter((candidate) => candidate !== null),
         },
         signal: request.signal,
@@ -2905,7 +2985,6 @@ async function relayPool({
   let attemptCount = 0;
   // One wall-clock deadline covers body rebuild/reopen, every upstream attempt,
   // and retry bookkeeping. Pool size never multiplies the public timeout.
-  const relayDeadlineMs = startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS;
   let cumulativeRequestBytes = 0;
   let cumulativeResponseBytes = 0;
   const releaseCapacityAttempt = async () => {
@@ -2945,7 +3024,15 @@ async function relayPool({
             poolId: target.id,
             basePriority: 16,
             connectionOwner: "model-api",
-            deadlineAt: new Date(Math.min(relayDeadlineMs, Date.now() + 30_000)),
+            deadlineAt: boundedAdmissionDeadline(
+              Date.now(),
+              relayDeadlineMs,
+              effectivePoolCandidateWaitBudget(
+                remaining
+                  .map(({ poolMemberId }) => memberById.get(poolMemberId))
+                  .filter((member): member is PoolMemberRelayRow => member !== undefined),
+              ),
+            ),
             candidates: admissionCandidates,
           },
           signal: request.signal,
@@ -3223,8 +3310,8 @@ async function relayPool({
 
       const finalize = Promise.allSettled([attempt.terminal, adaptationCompletion])
         .then(async ([terminalResult, adaptationResult]) => {
-          if (terminalResult.status === "rejected") throw terminalResult.reason;
-          const upstreamTerminal = terminalResult.value;
+          const upstreamTerminal =
+            terminalResult.status === "fulfilled" ? terminalResult.value : rejectedRelayTerminal();
           const adaptationOutcome =
             adaptationResult.status === "fulfilled" ? adaptationResult.value : "protocol_error";
           const terminal: RelayAttemptTerminal =
@@ -3240,34 +3327,42 @@ async function relayPool({
             requestBytes: cumulativeRequestBytes + terminal.requestBytes,
             responseBytes: cumulativeResponseBytes + terminal.responseBytes,
           };
-          cliLease.release();
-          globalLease?.release();
-          if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
-          await operation.dispose?.();
-          if (terminal.ok) {
-            await markPoolMemberRelaySuccess(candidate.poolMemberId);
-          } else if (adaptationOutcome === "protocol_error") {
-            await recordPoolMemberRelayFailure({
-              poolMemberId: candidate.poolMemberId,
-              failure: "protocol_error",
-            });
-          }
-          await updateRelayMetadata(relayRequestId, {
-            selectedDiscoveredModelId: member.discoveredModelId,
-            status: terminalStatus(terminal),
-            startedAt,
-            terminal: cumulativeTerminal,
-            attemptCount,
-          });
+          const cleanup = await Promise.allSettled([
+            Promise.resolve().then(() => cliLease.release()),
+            Promise.resolve().then(() => globalLease?.release()),
+            builtRequest.body instanceof Uint8Array
+              ? Promise.resolve()
+              : builtRequest.body.dispose(),
+            operation.dispose?.() ?? Promise.resolve(),
+          ]);
+          reportCleanupFailures(cleanup);
           const responseId = responseIdCapture?.finish(operation.stream) ?? null;
-          if (terminal.ok && responseId && operation.responseStickiness) {
-            await writeResponseStickiness({
-              ...operation.responseStickiness,
-              responseId,
-              targetModelPoolId: target.id,
+          const terminalWrites = await Promise.allSettled([
+            terminal.ok
+              ? markPoolMemberRelaySuccess(candidate.poolMemberId)
+              : adaptationOutcome === "protocol_error"
+                ? recordPoolMemberRelayFailure({
+                    poolMemberId: candidate.poolMemberId,
+                    failure: "protocol_error",
+                  })
+                : Promise.resolve(),
+            updateRelayMetadata(relayRequestId, {
               selectedDiscoveredModelId: member.discoveredModelId,
-            }).catch(stickinessWriteError);
-          }
+              status: terminalStatus(terminal),
+              startedAt,
+              terminal: cumulativeTerminal,
+              attemptCount,
+            }).catch(metadataUpdateError),
+            terminal.ok && responseId && operation.responseStickiness
+              ? writeResponseStickiness({
+                  ...operation.responseStickiness,
+                  responseId,
+                  targetModelPoolId: target.id,
+                  selectedDiscoveredModelId: member.discoveredModelId,
+                }).catch(stickinessWriteError)
+              : Promise.resolve(),
+          ]);
+          reportCleanupFailures(terminalWrites);
         })
         .catch(metadataUpdateError);
       void finalize;
@@ -3485,7 +3580,13 @@ async function relaySelectedModelNoFailover({
           sourceKind: requestedModelPoolId ? "POOL" : "DIRECT",
           basePriority: 16,
           connectionOwner: "model-api",
-          deadlineAt: new Date(Date.now() + 30_000),
+          deadlineAt: boundedAdmissionDeadline(
+            Date.now(),
+            startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS,
+            poolMember
+              ? effectiveMemberWaitBudget(poolMember)
+              : (selected.ExecutionTarget?.directWaitBudgetMs ?? null),
+          ),
           candidates: [
             {
               capacityId: identity.inferenceCapacityId,
@@ -3572,25 +3673,32 @@ async function relaySelectedModelNoFailover({
   try {
     const started = await attempt.started;
     const finalize = attempt.terminal
+      .catch(() => rejectedRelayTerminal())
       .then(async (terminal) => {
-        cliLease.release();
-        globalLease.release();
-        if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
-        await updateRelayMetadata(relayRequestId, {
-          selectedDiscoveredModelId: selected.id,
-          status: terminalStatus(terminal),
-          startedAt,
-          terminal,
-          attemptCount: 1,
-        });
+        const cleanup = await Promise.allSettled([
+          Promise.resolve().then(() => cliLease.release()),
+          Promise.resolve().then(() => globalLease.release()),
+          builtRequest.body instanceof Uint8Array ? Promise.resolve() : builtRequest.body.dispose(),
+          operation.dispose?.() ?? Promise.resolve(),
+        ]);
+        reportCleanupFailures(cleanup);
         const responseId = responseIdCapture?.finish(operation.stream) ?? null;
-        if (terminal.ok && responseId && operation.responseStickiness) {
-          await writeResponseStickiness({
-            ...operation.responseStickiness,
-            responseId,
+        await Promise.allSettled([
+          updateRelayMetadata(relayRequestId, {
             selectedDiscoveredModelId: selected.id,
-          }).catch(stickinessWriteError);
-        }
+            status: terminalStatus(terminal),
+            startedAt,
+            terminal,
+            attemptCount: 1,
+          }).catch(metadataUpdateError),
+          terminal.ok && responseId && operation.responseStickiness
+            ? writeResponseStickiness({
+                ...operation.responseStickiness,
+                responseId,
+                selectedDiscoveredModelId: selected.id,
+              }).catch(stickinessWriteError)
+            : Promise.resolve(),
+        ]);
       })
       .catch(metadataUpdateError);
     void finalize;
@@ -3607,11 +3715,17 @@ async function relaySelectedModelNoFailover({
       ? (capacityRuntime?.hold(response, capacityLease.lease, request.signal) ?? response)
       : response;
   } catch {
-    const terminal = await attempt.terminal;
-    cliLease.release();
-    globalLease.release();
-    if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
-    if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+    const terminal = await attempt.terminal.catch(() => rejectedRelayTerminal());
+    const cleanup = await Promise.allSettled([
+      Promise.resolve().then(() => cliLease.release()),
+      Promise.resolve().then(() => globalLease.release()),
+      capacityLease?.state === "ADMITTED"
+        ? (capacityRuntime?.release(capacityLease.lease) ?? Promise.resolve(false))
+        : Promise.resolve(),
+      builtRequest.body instanceof Uint8Array ? Promise.resolve() : builtRequest.body.dispose(),
+      operation.dispose?.() ?? Promise.resolve(),
+    ]);
+    reportCleanupFailures(cleanup);
     await updateRelayMetadata(relayRequestId, {
       selectedDiscoveredModelId: selected.id,
       status: terminalStatus(terminal),

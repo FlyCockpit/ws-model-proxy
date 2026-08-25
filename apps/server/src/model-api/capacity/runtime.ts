@@ -68,13 +68,20 @@ export class StoreCapacityAdmissionRuntime implements CapacityAdmissionRuntime {
         ? "EXPIRED"
         : null;
     if (terminal) {
-      if (result.state === "ADMITTED") await this.store.release(result.lease);
-      else if (terminal === "CANCELLED") await this.store.cancelAttempt(attempt.attemptId);
-      else await this.store.expireAttempt(attempt.attemptId);
+      const finalized = await this.store.terminalizeAttempt(attempt.attemptId, terminal);
+      // The terminalization transaction serializes with admission under the
+      // same capacity locks. Its answer is authoritative even when our last
+      // poll observed WAITING; release a lease that won that race.
+      if (finalized.state === "ADMITTED") await this.store.release(finalized.lease);
       return { state: terminal };
     }
-    if (result.state === "CANCELLED") await this.store.cancelAttempt(attempt.attemptId);
-    if (result.state === "EXPIRED") await this.store.expireAttempt(attempt.attemptId);
+    if (result.state === "CANCELLED" || result.state === "EXPIRED") {
+      const finalized = await this.store.terminalizeAttempt(attempt.attemptId, result.state);
+      if (finalized.state === "ADMITTED") {
+        await this.store.release(finalized.lease);
+        return { state: result.state };
+      }
+    }
     return result;
   }
 

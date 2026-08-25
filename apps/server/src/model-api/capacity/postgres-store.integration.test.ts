@@ -590,17 +590,26 @@ integration("PostgreSQL capacity admission primitives", () => {
         await expect(firstManager.acquire(raceAttempt)).resolves.toMatchObject({
           state: "WAITING",
         });
-        await Promise.all([
-          firstManager.cancelAttempt(raceAttempt.attemptId),
+        const [terminalized] = await Promise.all([
+          firstManager.terminalizeAttempt(raceAttempt.attemptId, "CANCELLED"),
           secondManager.acquire({ ...raceAttempt, candidates: [] }),
+          releaseRaceResult.state === "ADMITTED"
+            ? firstManager.release(releaseRaceResult.lease)
+            : Promise.resolve(false),
         ]);
-        await expect(firstManager.cancelAttempt(raceAttempt.attemptId)).resolves.toBe(false);
+        // Whichever operation obtained the capacity lock first, terminalize
+        // must return the authoritative result so callers can release a lease
+        // that won the cancellation race.
+        if (terminalized.state === "ADMITTED") await firstManager.release(terminalized.lease);
+        const raceRequest = await db.admissionRequest.findUnique({
+          where: { attemptId: raceAttempt.attemptId },
+        });
+        expect(["CANCELLED", "TERMINAL"]).toContain(raceRequest?.state);
         expect(
-          await db.admissionRequest.findUnique({ where: { attemptId: raceAttempt.attemptId } }),
-        ).toMatchObject({ state: "CANCELLED" });
-        expect(await db.capacityLease.count({ where: { attemptId: raceAttempt.attemptId } })).toBe(
-          0,
-        );
+          await db.capacityLease.count({
+            where: { attemptId: raceAttempt.attemptId, state: "ACTIVE" },
+          }),
+        ).toBe(0);
 
         const deadlineAttempt = {
           ...lowAttempt,
@@ -612,8 +621,6 @@ integration("PostgreSQL capacity admission primitives", () => {
           state: "WAITING",
         });
         await new Promise((resolve) => setTimeout(resolve, 40));
-        if (releaseRaceResult.state === "ADMITTED")
-          await firstManager.release(releaseRaceResult.lease);
         await expect(firstManager.acquire({ ...deadlineAttempt, candidates: [] })).resolves.toEqual(
           {
             state: "EXPIRED",

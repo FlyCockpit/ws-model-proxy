@@ -9,7 +9,7 @@ const priority = z.number().int().min(0).max(31);
 const optionalLimit = z.number().int().positive().nullable();
 const reservedSlots = z.number().int().min(0);
 const waitBudget = z.number().int().min(0).max(600_000).nullable();
-const memberWaitBudget = z.number().int().positive().max(600_000).nullable();
+const memberWaitBudget = z.number().int().min(0).max(600_000).nullable();
 const contextMargin = z.number().int().min(0).max(10_000_000);
 const borrowPolicy = z.enum(["NEVER", "WHEN_IDLE"]);
 const capacityLimitMode = z.enum(["INHERIT", "LIMITED", "UNLIMITED"]);
@@ -26,6 +26,31 @@ function enabled() {
 
 function notFound(): never {
   throw new ORPCError("NOT_FOUND", { message: "Capacity resource not found." });
+}
+
+const RETRYABLE_CAPACITY_TRANSACTION_CODES = new Set(["P2034", "40001", "40P01"]);
+
+async function capacityTransaction<T>(
+  work: (tx: Prisma.TransactionClient) => Promise<T>,
+  _options?: { isolationLevel: "Serializable" },
+): Promise<T> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      return await prisma.$transaction(work, { isolationLevel: "Serializable" });
+    } catch (error) {
+      const code =
+        error && typeof error === "object" && "code" in error && typeof error.code === "string"
+          ? error.code
+          : undefined;
+      if (!code || !RETRYABLE_CAPACITY_TRANSACTION_CODES.has(code)) throw error;
+      if (attempt === 4)
+        throw new ORPCError("CONFLICT", {
+          message: "Capacity configuration changed concurrently. Retry the request.",
+        });
+      await new Promise((resolve) => setTimeout(resolve, 5 * (attempt + 1)));
+    }
+  }
+  throw new ORPCError("CONFLICT", { message: "Capacity configuration retry exhausted." });
 }
 
 function auditJson(value: unknown): Prisma.InputJsonValue {
@@ -195,7 +220,7 @@ export const capacityManagementRouter = {
     )
       throw new ORPCError("BAD_REQUEST");
     const userId = context.session.user.id;
-    return prisma.$transaction(
+    return capacityTransaction(
       async (tx) => {
         const created = await tx.inferenceCapacity.create({ data: { userId, ...input } });
         await audit(tx, {
@@ -224,7 +249,7 @@ export const capacityManagementRouter = {
       enabled();
       const { id: capacityId, ...data } = input;
       const userId = context.session.user.id;
-      return prisma.$transaction(
+      return capacityTransaction(
         async (tx) => {
           const current = await tx.inferenceCapacity.findUnique({
             where: { id: capacityId },
@@ -293,7 +318,7 @@ export const capacityManagementRouter = {
   remove: protectedProcedure.input(z.object({ id })).handler(async ({ input, context }) => {
     enabled();
     const userId = context.session.user.id;
-    return prisma.$transaction(
+    return capacityTransaction(
       async (tx) => {
         const current = await tx.inferenceCapacity.findUnique({
           where: { id: input.id },
@@ -320,7 +345,7 @@ export const capacityManagementRouter = {
   updateDirectPolicy: protectedProcedure.input(directPolicy).handler(async ({ input, context }) => {
     enabled();
     const userId = context.session.user.id;
-    return prisma.$transaction(
+    return capacityTransaction(
       async (tx) => {
         const target = await tx.executionTarget.findUnique({
           where: { id: input.executionTargetId },
@@ -411,7 +436,7 @@ export const capacityManagementRouter = {
     .handler(async ({ input, context }) => {
       enabled();
       const userId = context.session.user.id;
-      return prisma.$transaction(
+      return capacityTransaction(
         async (tx) => {
           const pool = await tx.modelPool.findUnique({
             where: { id: input.modelPoolId },
@@ -511,7 +536,7 @@ export const capacityManagementRouter = {
           ? null
           : input.capacityContextCeiling,
     };
-    return prisma.$transaction(
+    return capacityTransaction(
       async (tx) => {
         const member = await tx.poolMember.findUnique({
           where: { id: input.poolMemberId },

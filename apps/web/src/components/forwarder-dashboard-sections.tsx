@@ -2146,6 +2146,16 @@ function PoolForm({
                   | "OPENAI_RESPONSES"
                   | "ANTHROPIC_MESSAGES"
                   | "OPENAI_COMPLETIONS"),
+          capacityPriority: value.capacityPriority,
+          capacityConcurrencyLimit:
+            value.capacityConcurrencyMode === "UNLIMITED" ? null : value.capacityConcurrencyLimit,
+          capacityReservedSlots: value.capacityReservedSlots,
+          capacityWaitBudgetMs:
+            value.capacityWaitBudgetMode === "UNLIMITED" ? null : value.capacityWaitBudgetMs,
+          capacityContextCeiling:
+            value.capacityContextCeilingMode === "UNLIMITED" ? null : value.capacityContextCeiling,
+          capacityContextMargin: value.capacityContextMargin,
+          capacityBorrowPolicy: value.capacityBorrowPolicy,
         });
       } else if (pool) {
         await updatePool.mutateAsync({
