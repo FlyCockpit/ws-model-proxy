@@ -105,23 +105,12 @@ export async function heartbeatProviderAttempt(input: {
   });
 }
 
-export async function expireProviderAttempts(now = new Date()): Promise<number> {
-  return prisma.$executeRaw`
-    UPDATE provider_attempt attempt
-       SET state = 'EXPIRED', "terminalReason" = 'CRASH_RECOVERY', "terminalAt" = ${now}
-     WHERE attempt.state = 'ACTIVE'
-       AND (attempt."expiresAt" <= ${now} OR attempt."heartbeatAt" < ${new Date(now.getTime() - 60_000)})
-       AND NOT EXISTS (
-         SELECT 1 FROM provider_budget_reservation reservation
-          WHERE reservation."attemptId" = attempt."attemptId"
-            AND reservation."fencingToken" = attempt."fencingToken"
-            AND reservation.state = 'RESERVED'
-       )
-       AND NOT EXISTS (
-         SELECT 1 FROM provider_usage_ledger ledger
-          WHERE ledger."attemptId" = attempt."attemptId"
-            AND ledger."fencingToken" = attempt."fencingToken"
-       )`;
+export async function expireProviderAttempts(_now = new Date()): Promise<number> {
+  // Provider-attempt state, its immutable ledger, and every reservation must
+  // transition in one transaction. repairExpiredProviderBudgets is the sole
+  // crash-recovery owner; a state-only expiry sweep can strand both finite
+  // reservations and the durable anchor created for unlimited policies.
+  return 0;
 }
 
 /** Atomically excludes cooldown targets and grants at most one half-open probe. */

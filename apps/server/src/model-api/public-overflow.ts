@@ -963,6 +963,27 @@ export function providerStreamHasTerminalUsageEvent(
   return /(?:^|\n)data:\s*\[DONE\]\s*(?:\r?\n|$)/u.test(text);
 }
 
+function providerStreamHasTerminalEvent(
+  chunks: readonly Uint8Array[],
+  surface: ProtocolSurface,
+): boolean {
+  const text = new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))));
+  if (/(?:^|\n)event:\s*error\s*(?:\r?\n|$)/u.test(text)) return true;
+  return providerStreamHasTerminalUsageEvent(chunks, surface);
+}
+
+function providerStreamTerminalFailed(
+  chunks: readonly Uint8Array[],
+  surface: ProtocolSurface,
+): boolean {
+  const text = new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))));
+  if (/(?:^|\n)event:\s*error\s*(?:\r?\n|$)/u.test(text)) return true;
+  return (
+    surface === "openai-responses" &&
+    /"type"\s*:\s*"response\.(?:failed|cancelled|incomplete)"/u.test(text)
+  );
+}
+
 export function extractTailUsageObject(text: string): Record<string, unknown> | undefined {
   const marker = text.lastIndexOf('"usage"');
   if (marker < 0) return undefined;
@@ -1714,25 +1735,32 @@ export async function dispatchPublicOverflow(
       let firstClientByteAt: Date | undefined;
       let firstClientBytePersistence: Promise<void> | undefined;
       const usageChunks: Uint8Array[] = [];
+      const initialUsageChunks: Uint8Array[] = [];
+      let initialUsageBytes = 0;
       let usageBytes = 0;
       let resolveTerminal!: (value: { ok: boolean; responseBytes: number }) => void;
       const terminal = new Promise<{ ok: boolean; responseBytes: number }>((resolve) => {
         resolveTerminal = resolve;
       });
       const httpOk = status >= 200 && status < 400;
+      let clientCancelled = false;
       const reconcile = (streamComplete: boolean): Promise<void> => {
         if (reconciliation) return reconciliation;
         reconciliation = (async () => {
           stopHeartbeat();
           const transportComplete = streamComplete && response.complete;
-          const ok = transportComplete && httpOk;
+          const streamFailed = request.stream
+            ? providerStreamTerminalFailed(usageChunks, nativeSurface ?? request.requestedSurface)
+            : false;
+          const ok = transportComplete && httpOk && !streamFailed && !clientCancelled;
           const healthOutcome = providerHealthOutcome(status);
-          const attemptAborted = request.signal.aborted || attemptController.signal.aborted;
+          const attemptAborted =
+            request.signal.aborted || attemptController.signal.aborted || clientCancelled;
           if (!attemptAborted && healthOutcome !== "NEUTRAL") {
             await recordProviderHealth(
               target,
               request.userId,
-              transportComplete && healthOutcome === "SUCCESS",
+              ok && healthOutcome === "SUCCESS",
               { status, retryAfter: response.headers["retry-after"] },
               { attemptId, fencingToken },
             ).catch(() => undefined);
@@ -1746,7 +1774,10 @@ export async function dispatchPublicOverflow(
               fencingToken,
             }).catch(() => false);
           }
-          const observedUsage = parseProviderUsage(usageChunks, pricing);
+          const observedUsage = parseProviderUsage(
+            [...initialUsageChunks, ...usageChunks],
+            pricing,
+          );
           const observationComplete =
             transportComplete &&
             (!request.stream ||
@@ -1772,14 +1803,15 @@ export async function dispatchPublicOverflow(
             requestId: request.requestId,
             attemptId,
             fencingToken,
-            reason: terminalReason(request.signal, ok),
+            reason: clientCancelled ? "CANCELLED" : terminalReason(request.signal, ok),
             revisionSequence: 1n,
             revisionKind: "SNAPSHOT",
             observationComplete,
             usageSource: usage ? `${upstream.protocol}-response` : "missing-provider-usage",
             usage,
           });
-          const state = request.signal.aborted ? "CANCELLED" : ok ? "COMPLETED" : "FAILED";
+          const state =
+            request.signal.aborted || clientCancelled ? "CANCELLED" : ok ? "COMPLETED" : "FAILED";
           // If client commitment already began, retain event creation order
           // without ever making client delivery wait for telemetry persistence.
           await firstClientBytePersistence;
@@ -1853,6 +1885,13 @@ export async function dispatchPublicOverflow(
                 return;
               }
               responseBytes += chunk.value.byteLength;
+              if (initialUsageBytes < 64 * 1024) {
+                const prefix = chunk.value.subarray(0, 64 * 1024 - initialUsageBytes);
+                if (prefix.byteLength > 0) {
+                  initialUsageChunks.push(prefix);
+                  initialUsageBytes += prefix.byteLength;
+                }
+              }
               // Retain the bounded tail, not merely the prefix. Streaming APIs
               // report authoritative usage in terminal events, which may occur
               // after arbitrarily large content deltas.
@@ -1863,7 +1902,7 @@ export async function dispatchPublicOverflow(
               }
               if (
                 request.stream &&
-                providerStreamHasTerminalUsageEvent(
+                providerStreamHasTerminalEvent(
                   usageChunks,
                   nativeSurface ?? request.requestedSurface,
                 )
@@ -1875,7 +1914,6 @@ export async function dispatchPublicOverflow(
               return;
             }
           } catch (error) {
-            controller.error(error);
             if (reachedEof) {
               // A failed durable success terminal remains ACTIVE for retry or
               // crash repair; never rewrite it as a transport failure.
@@ -1884,11 +1922,19 @@ export async function dispatchPublicOverflow(
               // A provider-side truncation is itself the terminal observation.
               // Persist its conservative failure settlement before resolving
               // the terminal promise, while preserving the stream error.
-              await reconcile(false).catch(() => resolveTerminal({ ok: false, responseBytes }));
+              try {
+                await reconcile(false);
+              } catch (reconcileError) {
+                resolveTerminal({ ok: false, responseBytes });
+                controller.error(reconcileError);
+                return;
+              }
             }
+            controller.error(error);
           }
         },
         async cancel(reason) {
+          clientCancelled = true;
           await reader.cancel(reason).catch(() => undefined);
           response.destroy(reason instanceof Error ? reason : undefined);
           await reconcile(false).catch(() => resolveTerminal({ ok: false, responseBytes }));
