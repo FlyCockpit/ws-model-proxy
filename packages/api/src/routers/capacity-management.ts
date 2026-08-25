@@ -9,6 +9,7 @@ import {
   assertEffectiveContextPolicy,
   lockExecutionTargetPolicies,
 } from "../lib/capacity-policy-safety";
+import { runSerializableTransaction } from "../lib/serializable-transaction";
 
 const id = z.string().min(1);
 const priority = z.number().int().min(0).max(31);
@@ -34,29 +35,11 @@ function notFound(): never {
   throw new ORPCError("NOT_FOUND", { message: "Capacity resource not found." });
 }
 
-const RETRYABLE_CAPACITY_TRANSACTION_CODES = new Set(["P2034", "40001", "40P01"]);
-
 async function capacityTransaction<T>(
   work: (tx: Prisma.TransactionClient) => Promise<T>,
   _options?: { isolationLevel: "Serializable" },
 ): Promise<T> {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    try {
-      return await prisma.$transaction(work, { isolationLevel: "Serializable" });
-    } catch (error) {
-      const code =
-        error && typeof error === "object" && "code" in error && typeof error.code === "string"
-          ? error.code
-          : undefined;
-      if (!code || !RETRYABLE_CAPACITY_TRANSACTION_CODES.has(code)) throw error;
-      if (attempt === 4)
-        throw new ORPCError("CONFLICT", {
-          message: "Capacity configuration changed concurrently. Retry the request.",
-        });
-      await new Promise((resolve) => setTimeout(resolve, 5 * (attempt + 1)));
-    }
-  }
-  throw new ORPCError("CONFLICT", { message: "Capacity configuration retry exhausted." });
+  return runSerializableTransaction(work);
 }
 
 function auditJson(value: unknown): Prisma.InputJsonValue {

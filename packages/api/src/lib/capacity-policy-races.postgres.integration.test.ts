@@ -1,29 +1,54 @@
-import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createRouterClient } from "@orpc/server";
+import type { Session } from "@ws-model-proxy/auth";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import type { Context } from "../context";
 import {
   assertDirectCapacityPolicy,
   assertEffectiveConcurrencyPolicy,
   assertEffectiveContextPolicy,
-  lockExecutionTargetIdentities,
-  lockExecutionTargetPolicies,
 } from "./capacity-policy-safety";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 const integration = databaseUrl ? describe : describe.skip;
 
-integration("capacity policy two-connection races", () => {
-  const first = databaseUrl ? createPrismaClient(databaseUrl) : undefined;
-  const second = databaseUrl ? createPrismaClient(databaseUrl) : undefined;
+integration("capacity policy production-router races", () => {
+  let modules:
+    | {
+        prisma: typeof import("@ws-model-proxy/db").default;
+        capacity: typeof import("../routers/capacity-management");
+        forwarder: typeof import("../routers/forwarder-management");
+        provider: typeof import("../routers/provider-management");
+      }
+    | undefined;
+  let blocker: ReturnType<typeof import("@ws-model-proxy/db/client-factory").createPrismaClient>;
+  let context: Context;
   let userId = "";
   let capacityId = "";
-  let targetIds: string[] = [];
+  let providerCapacityId = "";
+  let providerTargetId = "";
+  let targetIds: [string, string];
+  let providerModelId = "";
+  let guardedProviderModelIds: [string, string];
   let poolId = "";
   let memberId = "";
 
   beforeAll(async () => {
-    if (!first) return;
+    if (!databaseUrl) return;
+    process.env.DATABASE_URL = databaseUrl;
+    process.env.NODE_ENV = "test";
+    process.env.MODEL_API_GLOBAL_CAPACITY_ENABLED = "true";
+    process.env.MODEL_API_PUBLIC_PROVIDERS_ENABLED = "true";
+    const [db, dbFactory, capacity, forwarder, provider] = await Promise.all([
+      import("@ws-model-proxy/db"),
+      import("@ws-model-proxy/db/client-factory"),
+      import("../routers/capacity-management"),
+      import("../routers/forwarder-management"),
+      import("../routers/provider-management"),
+    ]);
+    blocker = dbFactory.createPrismaClient(databaseUrl);
+    modules = { prisma: db.default, capacity, forwarder, provider };
     const suffix = crypto.randomUUID();
-    const user = await first.user.create({
+    const user = await modules.prisma.user.create({
       data: {
         name: "Capacity race",
         email: `capacity-race-${suffix}@example.test`,
@@ -31,7 +56,22 @@ integration("capacity policy two-connection races", () => {
       },
     });
     userId = user.id;
-    const capacity = await first.inferenceCapacity.create({
+    context = {
+      session: {
+        user,
+        session: {
+          id: `session-${suffix}`,
+          userId,
+          token: `token-${suffix}`,
+          expiresAt: new Date(Date.now() + 60_000),
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          ipAddress: "127.0.0.1",
+          userAgent: "capacity-race-test",
+        },
+      } as Session,
+    };
+    const physical = await modules.prisma.inferenceCapacity.create({
       data: {
         userId,
         label: `race-${suffix}`,
@@ -39,44 +79,99 @@ integration("capacity policy two-connection races", () => {
         runtimeModel: "race-model",
         hardConcurrencyLimit: 8,
         physicalMaxContext: 16_384,
+        countStrategy: "CONSERVATIVE_ESTIMATE",
       },
     });
-    capacityId = capacity.id;
-    const targets = await Promise.all(
-      ["a", "b"].map(async (name) => {
-        const account = await first.providerAccount.create({
-          data: {
-            userId,
-            providerType: "openai",
-            label: `race-${name}-${suffix}`,
-            baseUrl: `https://${name}.example.test/v1`,
-            endpointIdentity: `https://${name}.example.test/v1`,
-            authType: "BEARER",
-          },
-        });
-        const provider = await first.providerModel.create({
+    capacityId = physical.id;
+    const account = await modules.prisma.providerAccount.create({
+      data: {
+        userId,
+        providerType: "openai",
+        label: `race-${suffix}`,
+        baseUrl: "https://provider.example.test/v1",
+        endpointIdentity: "https://provider.example.test/v1",
+        authType: "BEARER",
+      },
+    });
+    const credential = await modules.prisma.providerCredential.create({
+      data: {
+        userId,
+        providerAccountId: account.id,
+        credentialType: "BEARER",
+        keyVersion: "race-test-v1",
+        ciphertext: new Uint8Array([1]),
+        nonce: crypto.getRandomValues(new Uint8Array(12)),
+        authTag: new Uint8Array(16),
+        displaySuffix: "test",
+      },
+    });
+    await modules.prisma.providerAccount.update({
+      where: { id: account.id },
+      data: { currentCredentialId: credential.id, enabled: true },
+    });
+    const providerModels = await Promise.all(
+      ["attach", "a", "b"].map((name) =>
+        modules!.prisma.providerModel.create({
           data: {
             userId,
             providerAccountId: account.id,
             upstreamModelId: `race-${name}`,
+            enabled: true,
+            concurrencyLimit: 8,
+            contextWindow: 16_384,
+            nativeCapabilities: {
+              version: 1,
+              protocol: "openai-compatible",
+              chatCompletions: { supported: true, streaming: true },
+            },
           },
-        });
-        return first.executionTarget.create({
+        }),
+      ),
+    );
+    providerModelId = providerModels[0]!.id;
+    guardedProviderModelIds = [providerModels[1]!.id, providerModels[2]!.id];
+    await Promise.all(
+      providerModels.map((model) =>
+        modules!.prisma.providerPricingVersion.create({
+          data: {
+            userId,
+            providerAccountId: account.id,
+            providerModelId: model.id,
+            version: "race-v1",
+            currency: "USD",
+            pricing: { ratesPerMillion: { input: "1", output: "1" } },
+            effectiveAt: new Date(Date.now() - 60_000),
+          },
+        }),
+      ),
+    );
+    const providerCapacity = await modules.prisma.inferenceCapacity.create({
+      data: {
+        userId,
+        label: `provider-${suffix}`,
+        runtimeIdentityKey: `provider-model:${providerModelId}`,
+        runtimeModel: providerModels[0]!.upstreamModelId,
+        hardConcurrencyLimit: 8,
+        physicalMaxContext: 16_384,
+        countStrategy: "CONSERVATIVE_ESTIMATE",
+      },
+    });
+    providerCapacityId = providerCapacity.id;
+    const targets = await Promise.all(
+      providerModels.map((model, index) =>
+        modules!.prisma.executionTarget.create({
           data: {
             userId,
             kind: "PROVIDER_MODEL",
-            providerModelId: provider.id,
-            inferenceCapacityId: capacity.id,
-            directConcurrencyLimit: 4,
-            directReservedSlots: 1,
-            directContextCeiling: 8_192,
-            directContextMargin: 512,
+            providerModelId: model.id,
+            inferenceCapacityId: index === 0 ? providerCapacity.id : physical.id,
           },
-        });
-      }),
+        }),
+      ),
     );
-    targetIds = targets.map((target) => target.id);
-    const pool = await first.modelPool.create({
+    providerTargetId = targets[0]!.id;
+    targetIds = [targets[1]!.id, targets[2]!.id];
+    const pool = await modules.prisma.modelPool.create({
       data: {
         userId,
         slug: `race-${suffix}`,
@@ -88,78 +183,261 @@ integration("capacity policy two-connection races", () => {
       },
     });
     poolId = pool.id;
-    const member = await first.poolMember.create({
-      data: { poolId, executionTargetId: targetIds[0], tier: "PRIMARY", weight: 1 },
+    const policy = await modules.prisma.providerBudgetPolicy.create({
+      data: {
+        userId,
+        providerAccountId: account.id,
+        providerModelId,
+        poolId,
+        scopeType: "POOL_PROVIDER_MODEL",
+        active: true,
+        activatedAt: new Date(),
+        Rules: {
+          create: {
+            metric: "CONCURRENCY",
+            period: "PER_ATTEMPT",
+            mode: "LIMITED",
+            limitValue: 8,
+          },
+        },
+      },
+    });
+    await modules.prisma.providerAuditEvent.create({
+      data: {
+        userId,
+        providerAccountId: account.id,
+        action: "BUDGET_ACTIVATED",
+        subjectId: policy.id,
+      },
+    });
+    const member = await modules.prisma.poolMember.create({
+      data: { poolId, executionTargetId: targetIds[1], tier: "PRIMARY", weight: 1 },
     });
     memberId = member.id;
   });
 
+  beforeEach(async () => {
+    if (!modules) return;
+    await modules.prisma.poolMember.deleteMany({
+      where: { poolId, executionTargetId: providerTargetId },
+    });
+    await modules.prisma.providerModel.update({
+      where: { id: providerModelId },
+      data: { concurrencyLimit: 8, contextWindow: 16_384 },
+    });
+    await modules.prisma.inferenceCapacity.update({
+      where: { id: capacityId },
+      data: { hardConcurrencyLimit: 8, physicalMaxContext: 16_384 },
+    });
+    await modules.prisma.inferenceCapacity.update({
+      where: { id: providerCapacityId },
+      data: { hardConcurrencyLimit: 8, physicalMaxContext: 16_384 },
+    });
+    await modules.prisma.executionTarget.updateMany({
+      where: { id: { in: targetIds } },
+      data: {
+        directConcurrencyLimit: null,
+        directReservedSlots: 0,
+        directContextCeiling: null,
+        directContextMargin: 0,
+      },
+    });
+    await modules.prisma.modelPool.update({
+      where: { id: poolId },
+      data: {
+        capacityConcurrencyLimit: 4,
+        capacityReservedSlots: 1,
+        capacityContextCeiling: 8_192,
+        capacityContextMargin: 512,
+      },
+    });
+    await modules.prisma.poolMember.update({
+      where: { id: memberId },
+      data: {
+        capacityConcurrencyMode: "INHERIT",
+        capacityConcurrencyLimit: null,
+        capacityReservedSlots: 0,
+        capacityContextCeilingMode: "INHERIT",
+        capacityContextCeiling: null,
+        capacityContextMargin: 0,
+      },
+    });
+  });
+
   afterAll(async () => {
-    if (first && userId) await first.user.delete({ where: { id: userId } });
-    await Promise.all([first?.$disconnect(), second?.$disconnect()]);
+    if (modules && userId) await modules.prisma.user.delete({ where: { id: userId } });
+    await blocker?.$disconnect();
   });
 
-  it("serializes provider physical updates with standard attachment", async () => {
-    if (!first || !second) return;
-    const identity = "provider-model:race-a";
-    const outcomes = await Promise.allSettled([
-      first.$transaction(async (tx) => {
-        await lockExecutionTargetIdentities(tx, [identity]);
-        await lockExecutionTargetPolicies(tx, [targetIds[0]!]);
-        await tx.inferenceCapacity.update({
-          where: { id: capacityId },
-          data: { hardConcurrencyLimit: 6 },
-        });
-      }),
-      second.$transaction(async (tx) => {
-        await lockExecutionTargetIdentities(tx, [identity]);
-        await lockExecutionTargetPolicies(tx, [targetIds[0]!]);
-        const capacity = await tx.inferenceCapacity.findUniqueOrThrow({
-          where: { id: capacityId },
-        });
-        assertEffectiveConcurrencyPolicy({
-          hardLimit: capacity.hardConcurrencyLimit,
-          poolLimit: 4,
-          poolReserved: 1,
-        });
+  async function raceBehindIdentityFence(
+    identity: string,
+    operations: readonly (() => Promise<unknown>)[],
+  ) {
+    let releaseFence: (() => void) | undefined;
+    let reportLocked: (() => void) | undefined;
+    const release = new Promise<void>((resolve) => {
+      releaseFence = resolve;
+    });
+    const locked = new Promise<void>((resolve) => {
+      reportLocked = resolve;
+    });
+    const blockerTransaction = blocker.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`execution-target:${identity}`}, 0))`;
+      reportLocked?.();
+      await release;
+    });
+    await locked;
+    const outcomesPromise = Promise.allSettled(operations.map((operation) => operation()));
+    let waiterCount = 0;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const rows = await blocker.$queryRaw<Array<{ count: bigint }>>`
+        SELECT COUNT(*)::bigint AS count
+        FROM pg_stat_activity
+        WHERE wait_event_type = 'Lock'
+          AND wait_event = 'advisory'
+          AND query LIKE '%pg_advisory_xact_lock%'
+      `;
+      waiterCount = Number(rows[0]?.count ?? 0n);
+      if (waiterCount >= operations.length) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    releaseFence?.();
+    await blockerTransaction;
+    if (waiterCount < operations.length)
+      throw new Error(`Expected ${operations.length} advisory waiters, observed ${waiterCount}.`);
+    return outcomesPromise;
+  }
+
+  it("serializes provider limit updates against standard provider attachment", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const providerClient = createRouterClient(modules.provider.providerManagementRouter, {
+      context,
+    });
+    const forwarderClient = createRouterClient(modules.forwarder.forwarderManagementRouter, {
+      context,
+    });
+    const outcomes = await raceBehindIdentityFence(`provider-model:${providerModelId}`, [
+      () => providerClient.updateModel({ id: providerModelId, concurrencyLimit: 2 }),
+      () =>
+        forwarderClient.addProviderPoolMember({
+          poolId,
+          providerModelId,
+          tier: "PRIMARY",
+          weight: 1,
+        }),
+    ]);
+    expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
+    const [model, physical, attachment] = await Promise.all([
+      modules.prisma.providerModel.findUniqueOrThrow({ where: { id: providerModelId } }),
+      modules.prisma.inferenceCapacity.findUniqueOrThrow({ where: { id: providerCapacityId } }),
+      modules.prisma.poolMember.findFirst({
+        where: { poolId, executionTargetId: providerTargetId },
       }),
     ]);
-    expect(outcomes.every((outcome) => outcome.status === "fulfilled")).toBe(true);
+    expect(physical.hardConcurrencyLimit).toBe(model.concurrencyLimit);
+    expect(attachment === null || (model.concurrencyLimit ?? 0) >= 4).toBe(true);
   });
 
-  it("sorts guarded multi-attachment target locks across connections", async () => {
-    if (!first || !second) return;
+  it("orders the real multi-target capacity update against direct mutations", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const firstClient = createRouterClient(modules.capacity.capacityManagementRouter, { context });
+    const secondClient = createRouterClient(modules.capacity.capacityManagementRouter, { context });
     const outcomes = await Promise.allSettled([
-      first.$transaction((tx) => lockExecutionTargetPolicies(tx, targetIds)),
-      second.$transaction((tx) => lockExecutionTargetPolicies(tx, [...targetIds].reverse())),
+      firstClient.update({ id: capacityId, hardConcurrencyLimit: 6 }),
+      Promise.all([
+        secondClient.updateDirectPolicy({
+          executionTargetId: targetIds[1],
+          directConcurrencyLimit: 3,
+        }),
+        secondClient.updateDirectPolicy({
+          executionTargetId: targetIds[0],
+          directConcurrencyLimit: 3,
+        }),
+      ]),
     ]);
     expect(outcomes.every((outcome) => outcome.status === "fulfilled")).toBe(true);
+    const targets = await modules.prisma.executionTarget.findMany({
+      where: { id: { in: targetIds } },
+      include: { InferenceCapacity: true },
+    });
+    expect(targets).toHaveLength(2);
+    for (const target of targets)
+      assertDirectCapacityPolicy({
+        hardLimit: target.InferenceCapacity?.hardConcurrencyLimit,
+        concurrencyLimit: target.directConcurrencyLimit,
+        reservedSlots: target.directReservedSlots,
+        physicalMaxContext: target.InferenceCapacity?.physicalMaxContext,
+        contextCeiling: target.directContextCeiling,
+        contextMargin: target.directContextMargin,
+      });
   });
 
-  it("preserves pool, member, and direct-policy invariants under concurrent writes", async () => {
-    if (!first || !second) return;
+  it("serializes guarded multi-provider attachment in canonical identity order", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const firstClient = createRouterClient(modules.forwarder.forwarderManagementRouter, {
+      context,
+    });
+    const secondClient = createRouterClient(modules.forwarder.forwarderManagementRouter, {
+      context,
+    });
+    const suffix = crypto.randomUUID();
+    const providerInput = (ids: readonly [string, string]) =>
+      ids.map((id) => ({
+        providerModelId: id,
+        tier: "PRIMARY" as const,
+        concurrencyLimit: 4,
+        dailySpendLimit: "5",
+      }));
+    const guardedInput = (slug: string, ids: readonly [string, string]) => ({
+      slug,
+      name: `Guarded ${slug}`,
+      localModelIds: [],
+      recommendedSurface: "OPENAI_CHAT_COMPLETIONS" as const,
+      memberConcurrencyLimit: 4,
+      memberContextCeiling: 8_192,
+      reservedSlots: 1,
+      localWaitBudgetMs: 30_000,
+      publicEgressAcknowledged: false,
+      providerModels: providerInput(ids),
+    });
+    const ordered = [...guardedProviderModelIds].sort() as [string, string];
+    const outcomes = await raceBehindIdentityFence(`provider-model:${ordered[0]}`, [
+      () => firstClient.createGuardedModelPool(guardedInput(`guarded-a-${suffix}`, ordered)),
+      () =>
+        secondClient.createGuardedModelPool(
+          guardedInput(`guarded-b-${suffix}`, [ordered[1], ordered[0]]),
+        ),
+    ]);
+    expect(outcomes.every((outcome) => outcome.status === "fulfilled")).toBe(true);
+    const pools = await modules.prisma.modelPool.findMany({
+      where: { userId, slug: { in: [`guarded-a-${suffix}`, `guarded-b-${suffix}`] } },
+      include: { PoolMembers: true },
+    });
+    expect(pools).toHaveLength(2);
+    expect(pools.every((pool) => pool.PoolMembers.length === 2)).toBe(true);
+    expect(
+      pools.flatMap((pool) => pool.PoolMembers).every((member) => member.tier === "PRIMARY"),
+    ).toBe(true);
+  });
+
+  it("preserves cross-row invariants across real pool, member, and direct mutations", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const firstClient = createRouterClient(modules.capacity.capacityManagementRouter, { context });
+    const secondClient = createRouterClient(modules.capacity.capacityManagementRouter, { context });
+    const thirdClient = createRouterClient(modules.capacity.capacityManagementRouter, { context });
     const outcomes = await Promise.allSettled([
-      first.$transaction(async (tx) => {
-        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${poolId} FOR UPDATE`;
-        await lockExecutionTargetPolicies(tx, [targetIds[0]!]);
-        await tx.poolMember.update({
-          where: { id: memberId },
-          data: { capacityReservedSlots: 2 },
-        });
-      }),
-      second.$transaction(async (tx) => {
-        await lockExecutionTargetPolicies(tx, [targetIds[0]!]);
-        await tx.executionTarget.update({
-          where: { id: targetIds[0]! },
-          data: { directReservedSlots: 2 },
-        });
+      firstClient.updatePoolPolicy({ modelPoolId: poolId, capacityReservedSlots: 2 }),
+      secondClient.updateMemberPolicy({ poolMemberId: memberId, capacityReservedSlots: 1 }),
+      thirdClient.updateDirectPolicy({
+        executionTargetId: targetIds[1],
+        directReservedSlots: 2,
       }),
     ]);
     expect(outcomes.every((outcome) => outcome.status === "fulfilled")).toBe(true);
     const [capacity, target, member] = await Promise.all([
-      first.inferenceCapacity.findUniqueOrThrow({ where: { id: capacityId } }),
-      first.executionTarget.findUniqueOrThrow({ where: { id: targetIds[0]! } }),
-      first.poolMember.findUniqueOrThrow({
+      modules.prisma.inferenceCapacity.findUniqueOrThrow({ where: { id: capacityId } }),
+      modules.prisma.executionTarget.findUniqueOrThrow({ where: { id: targetIds[1] } }),
+      modules.prisma.poolMember.findUniqueOrThrow({
         where: { id: memberId },
         include: { ModelPool: true },
       }),
