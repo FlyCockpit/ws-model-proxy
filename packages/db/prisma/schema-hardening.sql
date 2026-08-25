@@ -1066,6 +1066,18 @@ FOR EACH ROW EXECUTE FUNCTION enforce_execution_target_consumer_consistency();
 
 UPDATE provider_account SET "endpointIdentity" = "baseUrl" WHERE "endpointIdentity" = '';
 
+-- Pre-ownership half-open timestamps cannot safely identify a live worker.
+-- Clear them during the compatibility cutover; an expired cooldown can then
+-- be reclaimed immediately by a fenced writer.
+UPDATE provider_account
+   SET "healthHalfOpenAt" = NULL
+ WHERE "healthHalfOpenAt" IS NOT NULL
+   AND "healthHalfOpenAttemptId" IS NULL;
+UPDATE provider_model
+   SET "healthHalfOpenAt" = NULL
+ WHERE "healthHalfOpenAt" IS NOT NULL
+   AND "healthHalfOpenAttemptId" IS NULL;
+
 ALTER TABLE provider_account DROP CONSTRAINT IF EXISTS provider_account_shape_check;
 ALTER TABLE provider_account ADD CONSTRAINT provider_account_shape_check CHECK (
   "providerType" = lower("providerType")
@@ -1076,6 +1088,8 @@ ALTER TABLE provider_account ADD CONSTRAINT provider_account_shape_check CHECK (
   AND "endpointVersion" > 0
   AND (enabled = FALSE OR status = 'ACTIVE')
   AND (enabled = FALSE OR "currentCredentialId" IS NOT NULL)
+  AND (("healthHalfOpenAt" IS NULL AND "healthHalfOpenAttemptId" IS NULL AND "healthHalfOpenFencingToken" IS NULL)
+    OR ("healthHalfOpenAt" IS NOT NULL AND btrim("healthHalfOpenAttemptId") <> '' AND "healthHalfOpenFencingToken" > 0))
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS provider_credential_one_active_per_account
@@ -1088,6 +1102,8 @@ ALTER TABLE provider_model ADD CONSTRAINT provider_model_shape_check CHECK (
   AND ("maxOutputTokens" IS NULL OR "maxOutputTokens" > 0)
   AND ("concurrencyLimit" IS NULL OR "concurrencyLimit" > 0)
   AND ("pricingVersion" IS NULL OR btrim("pricingVersion") <> '')
+  AND (("healthHalfOpenAt" IS NULL AND "healthHalfOpenAttemptId" IS NULL AND "healthHalfOpenFencingToken" IS NULL)
+    OR ("healthHalfOpenAt" IS NOT NULL AND btrim("healthHalfOpenAttemptId") <> '' AND "healthHalfOpenFencingToken" > 0))
 );
 
 ALTER TABLE provider_credential DROP CONSTRAINT IF EXISTS provider_credential_shape_check;

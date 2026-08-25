@@ -527,6 +527,7 @@ async function recordProviderHealth(
   userId: string,
   success: boolean,
   response?: { status: number; retryAfter?: string | string[] },
+  owner?: { attemptId: string; fencingToken: bigint },
 ): Promise<void> {
   await recordProviderOutcome({
     userId,
@@ -535,6 +536,7 @@ async function recordProviderHealth(
     success,
     failureClass: success ? undefined : classifyProviderFailure(response?.status),
     retryAfterMs: success ? undefined : parseRetryAfter(response?.retryAfter),
+    ...owner,
   }).catch(() => undefined);
 }
 
@@ -734,6 +736,8 @@ export async function dispatchPublicOverflow(
       userId: request.userId,
       providerAccountId: target.providerAccountId,
       providerModelId: target.providerModelId,
+      attemptId,
+      fencingToken,
     }).catch(() => "COOLDOWN" as const);
     if (healthClaim === "COOLDOWN") {
       await reconcileProviderBudget({
@@ -774,6 +778,20 @@ export async function dispatchPublicOverflow(
       }).catch(() => undefined);
       continue;
     }
+
+    // Start before credential lookup and provider connection establishment:
+    // either can consume most of the 14-minute end-to-end timeout. Renewal is
+    // fenced to this exact account+model claim, so an orphan cannot revive a
+    // successor's half-open lease.
+    let destroyAttempt: ((error: Error) => void) | undefined;
+    const heartbeatTimer = setInterval(() => {
+      void heartbeatProviderAttempt({ attemptId, fencingToken, extensionMs: 15 * 60_000 })
+        .then((alive) => {
+          if (!alive) destroyAttempt?.(new Error("provider attempt lease expired"));
+        })
+        .catch(() => destroyAttempt?.(new Error("provider attempt heartbeat failed")));
+    }, 10_000);
+    heartbeatTimer.unref();
 
     await recordProviderAttemptEvent({
       userId: request.userId,
@@ -820,6 +838,7 @@ export async function dispatchPublicOverflow(
         upstream.protocol,
         providerAuth(target, secret),
       );
+      destroyAttempt = (error) => response.destroy(error);
       const status = response.statusCode ?? 502;
       // Retry only before exposing headers/body to the caller.
       if (
@@ -841,7 +860,10 @@ export async function dispatchPublicOverflow(
           success: false,
           failureClass: classifyProviderFailure(status),
           retryAfterMs: parseRetryAfter(response.headers["retry-after"]),
+          attemptId,
+          fencingToken,
         }).catch(() => undefined);
+        clearInterval(heartbeatTimer);
         await reconcileProviderBudget({
           userId: request.userId,
           providerAccountId: target.providerAccountId,
@@ -883,14 +905,6 @@ export async function dispatchPublicOverflow(
       const body = Readable.toWeb(response) as ReadableStream<Uint8Array>;
       const reader = body.getReader();
       let reconciled = false;
-      const heartbeatTimer = setInterval(() => {
-        void heartbeatProviderAttempt({ attemptId, fencingToken, extensionMs: 15 * 60_000 })
-          .then((alive) => {
-            if (!alive) response.destroy(new Error("provider attempt lease expired"));
-          })
-          .catch(() => response.destroy(new Error("provider attempt heartbeat failed")));
-      }, 10_000);
-      heartbeatTimer.unref();
       let responseBytes = 0;
       let firstClientByteAt: Date | undefined;
       let firstClientBytePersistence: Promise<void> | undefined;
@@ -913,6 +927,7 @@ export async function dispatchPublicOverflow(
             request.userId,
             streamComplete && healthOutcome === "SUCCESS",
             { status, retryAfter: response.headers["retry-after"] },
+            { attemptId, fencingToken },
           );
         }
         const usage = streamComplete ? parseProviderUsage(usageChunks) : undefined;
@@ -1051,6 +1066,7 @@ export async function dispatchPublicOverflow(
         }),
       };
     } catch {
+      clearInterval(heartbeatTimer);
       // A caller disappearing before provider response is not evidence that
       // the provider transport is unhealthy. Keep the existing health state;
       // cancellation still terminalizes and reconciles the durable attempt.
@@ -1061,6 +1077,8 @@ export async function dispatchPublicOverflow(
           providerModelId: target.providerModelId,
           success: false,
           failureClass: "TRANSPORT",
+          attemptId,
+          fencingToken,
         }).catch(() => undefined);
       }
       await reconcileProviderBudget({

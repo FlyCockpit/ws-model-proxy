@@ -389,39 +389,42 @@ model DiscoveredModel {
 /// remain feature-gated until credential, SSRF, admission, and budget controls
 /// are implemented.
 model ProviderAccount {
-  id                  String                       @id @default(cuid(2))
-  createdAt           DateTime                     @default(now())
-  updatedAt           DateTime                     @default(now()) @updatedAt
-  deletedAt           DateTime?
-  userId              String
-  providerType        String
-  providerVersion     String?
-  label               String
-  baseUrl             String
+  id                         String                       @id @default(cuid(2))
+  createdAt                  DateTime                     @default(now())
+  updatedAt                  DateTime                     @default(now()) @updatedAt
+  deletedAt                  DateTime?
+  userId                     String
+  providerType               String
+  providerVersion            String?
+  label                      String
+  baseUrl                    String
   /// Canonical endpoint identity used by affinity keys; changes only with baseUrl.
-  endpointIdentity    String                       @default("")
-  endpointVersion     Int                          @default(1)
-  authType            ProviderAuthType
-  status              ProviderAccountStatus        @default(DISABLED)
-  enabled             Boolean                      @default(false)
-  safeConfiguration   Json?
-  currentCredentialId String?                      @unique
-  healthStatus        ProviderHealthStatus         @default(UNKNOWN)
-  healthCheckedAt     DateTime?
-  healthFailureCount  Int                          @default(0)
-  healthNextRetryAt   DateTime?
-  healthHalfOpenAt    DateTime?
-  nextFencingToken    BigInt                       @default(0)
-  User                User                         @relation("ProviderAccountOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ProviderModels      ProviderModel[]
-  Credentials         ProviderCredential[]         @relation("ProviderAccountCredentials")
-  CurrentCredential   ProviderCredential?          @relation("ProviderAccountCurrentCredential", fields: [currentCredentialId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-  BudgetPolicies      ProviderBudgetPolicy[]
-  UsageLedger         ProviderUsageLedger[]
-  Attempts            ProviderAttempt[]
-  PricingVersions     ProviderPricingVersion[]
-  AuditEvents         ProviderAuditEvent[]
-  AttemptEvents       PublicProviderAttemptEvent[]
+  endpointIdentity           String                       @default("")
+  endpointVersion            Int                          @default(1)
+  authType                   ProviderAuthType
+  status                     ProviderAccountStatus        @default(DISABLED)
+  enabled                    Boolean                      @default(false)
+  safeConfiguration          Json?
+  currentCredentialId        String?                      @unique
+  healthStatus               ProviderHealthStatus         @default(UNKNOWN)
+  healthCheckedAt            DateTime?
+  healthFailureCount         Int                          @default(0)
+  healthNextRetryAt          DateTime?
+  healthHalfOpenAt           DateTime?
+  /// Fenced owner of the live half-open probe. Both fields are null together.
+  healthHalfOpenAttemptId    String?
+  healthHalfOpenFencingToken BigInt?
+  nextFencingToken           BigInt                       @default(0)
+  User                       User                         @relation("ProviderAccountOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ProviderModels             ProviderModel[]
+  Credentials                ProviderCredential[]         @relation("ProviderAccountCredentials")
+  CurrentCredential          ProviderCredential?          @relation("ProviderAccountCurrentCredential", fields: [currentCredentialId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  BudgetPolicies             ProviderBudgetPolicy[]
+  UsageLedger                ProviderUsageLedger[]
+  Attempts                   ProviderAttempt[]
+  PricingVersions            ProviderPricingVersion[]
+  AuditEvents                ProviderAuditEvent[]
+  AttemptEvents              PublicProviderAttemptEvent[]
 
   @@unique([userId, label])
   @@unique([id, userId])
@@ -431,35 +434,38 @@ model ProviderAccount {
 }
 
 model ProviderModel {
-  id                 String                       @id @default(cuid(2))
-  createdAt          DateTime                     @default(now())
-  updatedAt          DateTime                     @default(now()) @updatedAt
-  deletedAt          DateTime?
-  userId             String
-  providerAccountId  String
-  upstreamModelId    String
-  displayName        String?
-  capabilityMetadata Json?
-  nativeCapabilities Json?
-  contextWindow      Int?
-  maxOutputTokens    Int?
-  concurrencyLimit   Int?
-  pricingMetadata    Json?
-  pricingVersion     String?
-  healthStatus       ProviderHealthStatus         @default(UNKNOWN)
-  healthCheckedAt    DateTime?
-  healthFailureCount Int                          @default(0)
-  healthNextRetryAt  DateTime?
-  healthHalfOpenAt   DateTime?
-  enabled            Boolean                      @default(false)
-  User               User                         @relation("ProviderModelOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ProviderAccount    ProviderAccount              @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
-  ExecutionTarget    ExecutionTarget?
-  BudgetPolicies     ProviderBudgetPolicy[]
-  UsageLedger        ProviderUsageLedger[]
-  Attempts           ProviderAttempt[]
-  PricingVersions    ProviderPricingVersion[]
-  AttemptEvents      PublicProviderAttemptEvent[]
+  id                         String                       @id @default(cuid(2))
+  createdAt                  DateTime                     @default(now())
+  updatedAt                  DateTime                     @default(now()) @updatedAt
+  deletedAt                  DateTime?
+  userId                     String
+  providerAccountId          String
+  upstreamModelId            String
+  displayName                String?
+  capabilityMetadata         Json?
+  nativeCapabilities         Json?
+  contextWindow              Int?
+  maxOutputTokens            Int?
+  concurrencyLimit           Int?
+  pricingMetadata            Json?
+  pricingVersion             String?
+  healthStatus               ProviderHealthStatus         @default(UNKNOWN)
+  healthCheckedAt            DateTime?
+  healthFailureCount         Int                          @default(0)
+  healthNextRetryAt          DateTime?
+  healthHalfOpenAt           DateTime?
+  /// Fenced owner of the live half-open probe. Both fields are null together.
+  healthHalfOpenAttemptId    String?
+  healthHalfOpenFencingToken BigInt?
+  enabled                    Boolean                      @default(false)
+  User                       User                         @relation("ProviderModelOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ProviderAccount            ProviderAccount              @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  ExecutionTarget            ExecutionTarget?
+  BudgetPolicies             ProviderBudgetPolicy[]
+  UsageLedger                ProviderUsageLedger[]
+  Attempts                   ProviderAttempt[]
+  PricingVersions            ProviderPricingVersion[]
+  AttemptEvents              PublicProviderAttemptEvent[]
 
   @@unique([providerAccountId, upstreamModelId])
   @@unique([id, userId])

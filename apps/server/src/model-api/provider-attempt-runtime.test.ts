@@ -9,12 +9,104 @@ vi.mock("@ws-model-proxy/db", () => ({ default: db }));
 import {
   claimProviderHealthTrial,
   classifyProviderFailure,
+  heartbeatProviderAttempt,
   parseRetryAfter,
   recordProviderAttemptEvent,
   recordProviderOutcome,
 } from "./provider-attempt-runtime.js";
 
 describe("provider attempt failure policy", () => {
+  it("renews only the fenced account and model half-open owner", async () => {
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
+      providerAttempt: {
+        findUnique: vi.fn().mockResolvedValue({
+          userId: "owner",
+          providerAccountId: "account",
+          providerModelId: "model",
+        }),
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      },
+      providerAccount: {
+        findUniqueOrThrow: vi.fn().mockResolvedValue({
+          healthHalfOpenAttemptId: "attempt",
+          healthHalfOpenFencingToken: 7n,
+        }),
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      },
+      providerModel: {
+        findUniqueOrThrow: vi.fn().mockResolvedValue({
+          healthHalfOpenAttemptId: "attempt",
+          healthHalfOpenFencingToken: 7n,
+        }),
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      },
+    };
+    db.$transaction.mockImplementationOnce(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+
+    await expect(
+      heartbeatProviderAttempt({ attemptId: "attempt", fencingToken: 7n, extensionMs: 900_000 }),
+    ).resolves.toBe(true);
+    expect(tx.providerAccount.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: "account",
+        userId: "owner",
+        healthHalfOpenAttemptId: "attempt",
+        healthHalfOpenFencingToken: 7n,
+      },
+      data: { healthHalfOpenAt: expect.any(Date) },
+    });
+    expect(tx.providerModel.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: "model",
+        userId: "owner",
+        healthHalfOpenAttemptId: "attempt",
+        healthHalfOpenFencingToken: 7n,
+      },
+      data: { healthHalfOpenAt: expect.any(Date) },
+    });
+  });
+
+  it("rejects an orphan heartbeat after a successor fence is installed", async () => {
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
+      providerAttempt: {
+        findUnique: vi.fn().mockResolvedValue({
+          userId: "owner",
+          providerAccountId: "account",
+          providerModelId: "model",
+        }),
+        updateMany: vi.fn(),
+      },
+      providerAccount: {
+        findUniqueOrThrow: vi.fn().mockResolvedValue({
+          healthHalfOpenAttemptId: "successor",
+          healthHalfOpenFencingToken: 8n,
+        }),
+        updateMany: vi.fn(),
+      },
+      providerModel: {
+        findUniqueOrThrow: vi.fn().mockResolvedValue({
+          healthHalfOpenAttemptId: "successor",
+          healthHalfOpenFencingToken: 8n,
+        }),
+        updateMany: vi.fn(),
+      },
+    };
+    db.$transaction.mockImplementationOnce(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+
+    await expect(
+      heartbeatProviderAttempt({ attemptId: "orphan", fencingToken: 7n, extensionMs: 900_000 }),
+    ).resolves.toBe(false);
+    expect(tx.providerAttempt.updateMany).not.toHaveBeenCalled();
+    expect(tx.providerAccount.updateMany).not.toHaveBeenCalled();
+    expect(tx.providerModel.updateMany).not.toHaveBeenCalled();
+  });
+
   it.each([
     [408, "TIMEOUT"],
     [409, "CONFLICT"],
@@ -110,6 +202,8 @@ describe("provider attempt failure policy", () => {
         userId: "owner",
         providerAccountId: "account",
         providerModelId: "model-b",
+        attemptId: "attempt-b",
+        fencingToken: 2n,
         now: new Date("2026-08-25T00:00:00.000Z"),
       }),
     ).resolves.toBe("COOLDOWN");
@@ -147,16 +241,26 @@ describe("provider attempt failure policy", () => {
         userId: "owner",
         providerAccountId: "account",
         providerModelId: "model",
+        attemptId: "attempt-new",
+        fencingToken: 3n,
         now,
       }),
     ).resolves.toBe("HALF_OPEN");
     expect(tx.providerAccount.update).toHaveBeenCalledWith({
       where: { id: "account", userId: "owner" },
-      data: { healthHalfOpenAt: now },
+      data: {
+        healthHalfOpenAt: now,
+        healthHalfOpenAttemptId: "attempt-new",
+        healthHalfOpenFencingToken: 3n,
+      },
     });
     expect(tx.providerModel.update).toHaveBeenCalledWith({
       where: { id: "model", userId: "owner" },
-      data: { healthHalfOpenAt: now },
+      data: {
+        healthHalfOpenAt: now,
+        healthHalfOpenAttemptId: "attempt-new",
+        healthHalfOpenFencingToken: 3n,
+      },
     });
   });
 
@@ -187,6 +291,8 @@ describe("provider attempt failure policy", () => {
         userId: "owner",
         providerAccountId: "account",
         providerModelId: "model",
+        attemptId: "attempt-new",
+        fencingToken: 3n,
         now: new Date("2026-08-25T00:02:00.000Z"),
       }),
     ).resolves.toBe("COOLDOWN");

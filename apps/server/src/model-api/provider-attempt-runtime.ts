@@ -40,19 +40,69 @@ export async function heartbeatProviderAttempt(input: {
   extensionMs: number;
 }): Promise<boolean> {
   const now = new Date();
-  const updated = await prisma.providerAttempt.updateMany({
-    where: {
-      attemptId: input.attemptId,
-      fencingToken: input.fencingToken,
-      state: "ACTIVE",
-      expiresAt: { gt: now },
-    },
-    data: {
-      heartbeatAt: now,
-      expiresAt: new Date(now.getTime() + Math.max(1_000, input.extensionMs)),
-    },
+  return prisma.$transaction(async (tx) => {
+    const attempt = await tx.providerAttempt.findUnique({
+      where: {
+        attemptId_fencingToken: {
+          attemptId: input.attemptId,
+          fencingToken: input.fencingToken,
+        },
+      },
+      select: { userId: true, providerAccountId: true, providerModelId: true },
+    });
+    if (!attempt) return false;
+    await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${attempt.providerAccountId} AND "userId" = ${attempt.userId} FOR UPDATE`;
+    await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${attempt.providerModelId} AND "userId" = ${attempt.userId} FOR UPDATE`;
+    const [accountHealth, modelHealth] = await Promise.all([
+      tx.providerAccount.findUniqueOrThrow({
+        where: { id: attempt.providerAccountId, userId: attempt.userId },
+        select: { healthHalfOpenAttemptId: true, healthHalfOpenFencingToken: true },
+      }),
+      tx.providerModel.findUniqueOrThrow({
+        where: {
+          id: attempt.providerModelId,
+          userId: attempt.userId,
+          providerAccountId: attempt.providerAccountId,
+        },
+        select: { healthHalfOpenAttemptId: true, healthHalfOpenFencingToken: true },
+      }),
+    ]);
+    const owns = (health: typeof accountHealth) =>
+      health.healthHalfOpenAttemptId === input.attemptId &&
+      health.healthHalfOpenFencingToken === input.fencingToken;
+    const unclaimed = (health: typeof accountHealth) => health.healthHalfOpenAttemptId === null;
+    const ownsHalfOpen = owns(accountHealth) && owns(modelHealth);
+    if (!ownsHalfOpen && !(unclaimed(accountHealth) && unclaimed(modelHealth))) return false;
+    const updated = await tx.providerAttempt.updateMany({
+      where: {
+        attemptId: input.attemptId,
+        fencingToken: input.fencingToken,
+        state: "ACTIVE",
+        expiresAt: { gt: now },
+      },
+      data: {
+        heartbeatAt: now,
+        expiresAt: new Date(now.getTime() + Math.max(1_000, input.extensionMs)),
+      },
+    });
+    if (updated.count !== 1) return false;
+    const owner = {
+      healthHalfOpenAttemptId: input.attemptId,
+      healthHalfOpenFencingToken: input.fencingToken,
+    };
+    if (!ownsHalfOpen) return true;
+    const [account, model] = await Promise.all([
+      tx.providerAccount.updateMany({
+        where: { id: attempt.providerAccountId, userId: attempt.userId, ...owner },
+        data: { healthHalfOpenAt: now },
+      }),
+      tx.providerModel.updateMany({
+        where: { id: attempt.providerModelId, userId: attempt.userId, ...owner },
+        data: { healthHalfOpenAt: now },
+      }),
+    ]);
+    return account.count === 1 && model.count === 1;
   });
-  return updated.count === 1;
 }
 
 export async function finishProviderAttempt(input: {
@@ -85,6 +135,8 @@ export async function claimProviderHealthTrial(input: {
   userId: string;
   providerAccountId: string;
   providerModelId: string;
+  attemptId: string;
+  fencingToken: bigint;
   now?: Date;
 }): Promise<"READY" | "HALF_OPEN" | "COOLDOWN"> {
   const now = input.now ?? new Date();
@@ -119,11 +171,19 @@ export async function claimProviderHealthTrial(input: {
     await Promise.all([
       tx.providerAccount.update({
         where: { id: input.providerAccountId, userId: input.userId },
-        data: { healthHalfOpenAt: now },
+        data: {
+          healthHalfOpenAt: now,
+          healthHalfOpenAttemptId: input.attemptId,
+          healthHalfOpenFencingToken: input.fencingToken,
+        },
       }),
       tx.providerModel.update({
         where: { id: input.providerModelId, userId: input.userId },
-        data: { healthHalfOpenAt: now },
+        data: {
+          healthHalfOpenAt: now,
+          healthHalfOpenAttemptId: input.attemptId,
+          healthHalfOpenFencingToken: input.fencingToken,
+        },
       }),
     ]);
     return "HALF_OPEN";
@@ -145,6 +205,8 @@ export async function recordProviderOutcome(input: {
   success: boolean;
   failureClass?: ProviderFailureClass;
   retryAfterMs?: number;
+  attemptId?: string;
+  fencingToken?: bigint;
   now?: Date;
 }): Promise<void> {
   const now = input.now ?? new Date();
@@ -154,7 +216,12 @@ export async function recordProviderOutcome(input: {
     const [accountCurrent, current] = await Promise.all([
       tx.providerAccount.findUniqueOrThrow({
         where: { id: input.providerAccountId, userId: input.userId },
-        select: { healthFailureCount: true, healthNextRetryAt: true },
+        select: {
+          healthFailureCount: true,
+          healthNextRetryAt: true,
+          healthHalfOpenAttemptId: true,
+          healthHalfOpenFencingToken: true,
+        },
       }),
       tx.providerModel.findUniqueOrThrow({
         where: {
@@ -162,9 +229,20 @@ export async function recordProviderOutcome(input: {
           userId: input.userId,
           providerAccountId: input.providerAccountId,
         },
-        select: { healthFailureCount: true },
+        select: {
+          healthFailureCount: true,
+          healthHalfOpenAttemptId: true,
+          healthHalfOpenFencingToken: true,
+        },
       }),
     ]);
+    const ownedByAnother = [accountCurrent, current].some(
+      (health) =>
+        health.healthHalfOpenAttemptId != null &&
+        (health.healthHalfOpenAttemptId !== input.attemptId ||
+          health.healthHalfOpenFencingToken !== input.fencingToken),
+    );
+    if (ownedByAnother) return;
     const failures = input.success ? 0 : current.healthFailureCount + 1;
     const modelHealth = input.success
       ? ("HEALTHY" as const)
@@ -178,6 +256,8 @@ export async function recordProviderOutcome(input: {
           healthFailureCount: 0,
           healthNextRetryAt: null,
           healthHalfOpenAt: null,
+          healthHalfOpenAttemptId: null,
+          healthHalfOpenFencingToken: null,
         }
       : {
           healthStatus: modelHealth,
@@ -185,6 +265,8 @@ export async function recordProviderOutcome(input: {
           healthFailureCount: failures,
           healthNextRetryAt: new Date(now.getTime() + backoffMs(failures, input.retryAfterMs)),
           healthHalfOpenAt: null,
+          healthHalfOpenAttemptId: null,
+          healthHalfOpenFencingToken: null,
         };
     await tx.providerModel.update({
       where: { id: input.providerModelId, userId: input.userId },
@@ -196,7 +278,13 @@ export async function recordProviderOutcome(input: {
         healthStatus: input.success ? "HEALTHY" : "DEGRADED",
         healthCheckedAt: now,
         ...(input.success
-          ? { healthFailureCount: 0, healthNextRetryAt: null, healthHalfOpenAt: null }
+          ? {
+              healthFailureCount: 0,
+              healthNextRetryAt: null,
+              healthHalfOpenAt: null,
+              healthHalfOpenAttemptId: null,
+              healthHalfOpenFencingToken: null,
+            }
           : {
               healthFailureCount: { increment: 1 },
               healthNextRetryAt: new Date(
@@ -207,6 +295,8 @@ export async function recordProviderOutcome(input: {
                 ),
               ),
               healthHalfOpenAt: null,
+              healthHalfOpenAttemptId: null,
+              healthHalfOpenFencingToken: null,
             }),
       },
     });
