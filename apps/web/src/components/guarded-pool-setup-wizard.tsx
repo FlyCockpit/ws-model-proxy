@@ -18,7 +18,7 @@ import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ShieldCheck } from "lucide-r
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
-
+import { useCapacityDerivedDefaults } from "@/hooks/use-capacity-derived-defaults";
 import {
   type GuardedWizardLocalModel,
   minimumSelectedPhysicalContext,
@@ -125,6 +125,8 @@ export function GuardedPoolSetupWizard({
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
   const formRef = useRef<HTMLFormElement>(null);
+  const contextCeilingCustomized = useRef(false);
+  const contextMarginCustomized = useRef(false);
   const [step, setStep] = useState<number>(initialStep);
   const [stepErrors, setStepErrors] = useState<Record<string, string>>({});
   const [memberOverrides, setMemberOverrides] = useState<Record<string, MemberOverride>>({});
@@ -353,6 +355,19 @@ export function GuardedPoolSetupWizard({
         })),
       }),
   });
+  useCapacityDerivedDefaults({
+    selectedIds: form.state.values.localModelIds,
+    models: directModels,
+    capacities: capacities.data ?? [],
+    contextCeilingCustomized: contextCeilingCustomized.current,
+    contextMarginCustomized: contextMarginCustomized.current,
+    apply: (defaults) => {
+      if (defaults.contextCeiling != null)
+        form.setFieldValue("memberContextCeiling", defaults.contextCeiling);
+      if (defaults.contextMargin != null)
+        form.setFieldValue("contextMargin", defaults.contextMargin);
+    },
+  });
   const stepFields = [
     ["slug", "name", "localModelIds"],
     [
@@ -521,8 +536,10 @@ export function GuardedPoolSetupWizard({
                                 );
                                 if (physicalMaximum != null) {
                                   const safe = safeContextControls(physicalMaximum);
-                                  form.setFieldValue("memberContextCeiling", safe.contextCeiling);
-                                  form.setFieldValue("contextMargin", safe.contextMargin);
+                                  if (!contextCeilingCustomized.current)
+                                    form.setFieldValue("memberContextCeiling", safe.contextCeiling);
+                                  if (!contextMarginCustomized.current)
+                                    form.setFieldValue("contextMargin", safe.contextMargin);
                                 }
                               })()
                             }
@@ -585,7 +602,11 @@ export function GuardedPoolSetupWizard({
                           type="number"
                           min={name === "reservedSlots" || name === "localWaitBudgetMs" ? 0 : 1}
                           value={field.state.value}
-                          onChange={(event) => field.handleChange(Number(event.target.value))}
+                          onChange={(event) => {
+                            if (name === "memberContextCeiling")
+                              contextCeilingCustomized.current = true;
+                            field.handleChange(Number(event.target.value));
+                          }}
                           {...errorProps(name)}
                         />
                         {stepErrors[name] ? (
@@ -679,7 +700,10 @@ export function GuardedPoolSetupWizard({
                             type="number"
                             min={name === "affinityTtlSeconds" ? 60 : 0}
                             value={field.state.value}
-                            onChange={(event) => field.handleChange(Number(event.target.value))}
+                            onChange={(event) => {
+                              if (name === "contextMargin") contextMarginCustomized.current = true;
+                              field.handleChange(Number(event.target.value));
+                            }}
                             {...errorProps(name)}
                           />
                           {stepErrors[name] ? (

@@ -44,6 +44,7 @@ vi.mock("@ws-model-proxy/ui/components/dialog", () => ({
   DialogTitle: ({ children }: { children: React.ReactNode }) => <h1>{children}</h1>,
 }));
 
+import { capacityDerivedDefaults } from "../hooks/use-capacity-derived-defaults";
 import {
   minimumSelectedPhysicalContext,
   primarySurfaceIsSelectable,
@@ -355,6 +356,27 @@ describe("GuardedPoolSetupWizard", () => {
         ],
       ),
     ).toBe(32_768);
+  });
+
+  it("applies delayed capacity defaults without replacing explicit stricter edits", () => {
+    expect(
+      capacityDerivedDefaults({
+        selectedIds: ["local"],
+        models: [localModel],
+        capacities: [],
+        contextCeilingCustomized: false,
+        contextMarginCustomized: false,
+      }),
+    ).toBeNull();
+    expect(
+      capacityDerivedDefaults({
+        selectedIds: ["local"],
+        models: [localModel],
+        capacities: [{ id: "capacity", physicalMaxContext: 8_192 }],
+        contextCeilingCustomized: true,
+        contextMarginCustomized: false,
+      }),
+    ).toEqual({ contextCeiling: undefined, contextMargin: 1_024 });
   });
 
   it("derives a positive global ceiling and heterogeneous per-member defaults", () => {
