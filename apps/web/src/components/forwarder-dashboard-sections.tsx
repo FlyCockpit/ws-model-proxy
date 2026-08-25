@@ -40,6 +40,7 @@ import { z } from "zod";
 
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
 import { InlineRetry } from "@/components/inline-retry";
+import { ProviderOperationsSection } from "@/components/provider-operations-section";
 import { SegmentedControl } from "@/components/segmented-control";
 import { WideContent } from "@/components/wide-content";
 import {
@@ -1765,6 +1766,7 @@ export function PoolsSection() {
           }
         }}
       />
+      <ProviderOperationsSection />
     </section>
   );
 }
