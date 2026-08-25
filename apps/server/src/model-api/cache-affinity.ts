@@ -56,21 +56,15 @@ function asJson(value: unknown): JsonValue | undefined {
   return result;
 }
 
-const RELEVANT_PARAMETER_KEYS = [
-  "temperature",
-  "top_p",
-  "top_k",
-  "seed",
-  "stop",
-  "max_tokens",
-  "max_completion_tokens",
-  "max_output_tokens",
-  "tool_choice",
-  "parallel_tool_calls",
-  "response_format",
-  "reasoning",
-  "thinking",
-] as const;
+const CONTENT_BINDING_KEYS = new Set([
+  "input",
+  "messages",
+  "prompt",
+  "instructions",
+  "system",
+  "tools",
+]);
+const ROUTING_ONLY_KEYS = new Set(["model", "stream"]);
 
 /**
  * Produces cumulative canonical prefixes without retaining source material.
@@ -96,9 +90,13 @@ export function affinityPrefixDigests({
       : [orderedSource];
   const instructions = asJson(payload.instructions ?? payload.system);
   const tools = asJson(payload.tools);
+  // Bind every other JSON field, including unknown native extensions. False
+  // negatives are safe; matching requests whose unknown semantics differ is
+  // not. Only the visible pool alias and transport framing are routing-only.
   const parameters = Object.fromEntries(
-    RELEVANT_PARAMETER_KEYS.flatMap((key) => {
-      const value = asJson(payload[key]);
+    Object.entries(payload).flatMap(([key, raw]) => {
+      if (CONTENT_BINDING_KEYS.has(key) || ROUTING_ONLY_KEYS.has(key)) return [];
+      const value = asJson(raw);
       return value === undefined ? [] : [[key, value] as const];
     }),
   );

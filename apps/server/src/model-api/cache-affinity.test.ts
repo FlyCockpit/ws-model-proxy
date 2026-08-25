@@ -74,6 +74,9 @@ describe("cache affinity", () => {
     );
     expect(digest({ payload: { ...payload, tools: [] } })).not.toBe(baseline);
     expect(digest({ payload: { ...payload, temperature: 0.3 } })).not.toBe(baseline);
+    expect(digest({ payload: { ...payload, vendor_extension: { mode: "different" } } })).not.toBe(
+      baseline,
+    );
   });
 
   it("supports scalar Responses input without storing or truncating it", () => {
