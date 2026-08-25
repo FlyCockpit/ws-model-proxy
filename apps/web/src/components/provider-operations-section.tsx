@@ -330,7 +330,11 @@ export function ProviderOperationsSection() {
     ...orpc.modelApiTokens.list.queryOptions({ input: { includeRevoked: false, limit: 100 } }),
     retry: false,
   });
-  const [attachmentDraft, setAttachmentDraft] = useState({ poolId: "", publicOrder: "0" });
+  const [attachmentDraft, setAttachmentDraft] = useState({
+    poolId: "",
+    tier: "PRIMARY" as "PRIMARY" | "PUBLIC_OVERFLOW",
+    publicOrder: "0",
+  });
   const budgetDefaults = {
     concurrencyMode: "LIMITED" as "LIMITED" | "UNLIMITED",
     concurrency: "1",
@@ -1379,7 +1383,7 @@ export function ProviderOperationsSection() {
                   ) : pools.isPending ? (
                     <Skeleton className="h-24" />
                   ) : (
-                    <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_10rem_auto]">
+                    <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_10rem_10rem]">
                       <Field label={t("dashboard:providers.fields.pool")}>
                         <select
                           className="h-11 w-full rounded-md border bg-background px-3 text-base sm:text-sm"
@@ -1396,45 +1400,71 @@ export function ProviderOperationsSection() {
                           ))}
                         </select>
                       </Field>
-                      <Field label={t("dashboard:providers.fields.publicOrder")}>
-                        <Input
-                          type="number"
-                          min="0"
-                          max="10000"
-                          value={attachmentDraft.publicOrder}
+                      <Field label={t("dashboard:providers.fields.memberTier")}>
+                        <select
+                          className="h-11 w-full rounded-md border bg-background px-3 text-base sm:text-sm"
+                          value={attachmentDraft.tier}
                           onChange={(event) =>
                             setAttachmentDraft({
                               ...attachmentDraft,
-                              publicOrder: event.target.value,
+                              tier: event.target.value as "PRIMARY" | "PUBLIC_OVERFLOW",
                             })
                           }
-                        />
-                      </Field>
-                      <div className="flex flex-wrap items-end gap-2 md:col-span-3">
-                        <Button
-                          type="button"
-                          size="touch"
-                          variant="outline"
-                          disabled={
-                            !attachmentDraft.poolId ||
-                            createBudget.isPending ||
-                            !budgetForm.state.canSubmit ||
-                            !activePricing
-                          }
-                          onClick={() => {
-                            const currency = activePricing?.currency ?? null;
-                            createBudget.mutate({
-                              scopeType: "POOL_PROVIDER_MODEL",
-                              providerAccountId: selected.id,
-                              poolId: attachmentDraft.poolId,
-                              providerModelId: activeModelId,
-                              active: true,
-                              rules: providerBudgetRules(budgetForm.state.values, currency),
-                            });
-                          }}
                         >
-                          {t("dashboard:providers.actions.createAttachmentProtection")}
-                        </Button>
+                          <option value="PRIMARY">
+                            {t("dashboard:pools.memberTiers.PRIMARY")}
+                          </option>
+                          <option value="PUBLIC_OVERFLOW">
+                            {t("dashboard:pools.memberTiers.PUBLIC_OVERFLOW")}
+                          </option>
+                        </select>
+                      </Field>
+                      {attachmentDraft.tier === "PUBLIC_OVERFLOW" ? (
+                        <Field label={t("dashboard:providers.fields.publicOrder")}>
+                          <Input
+                            type="number"
+                            min="0"
+                            max="10000"
+                            value={attachmentDraft.publicOrder}
+                            onChange={(event) =>
+                              setAttachmentDraft({
+                                ...attachmentDraft,
+                                publicOrder: event.target.value,
+                              })
+                            }
+                          />
+                        </Field>
+                      ) : null}
+                      <p className="text-sm text-muted-foreground md:col-span-3">
+                        {t("dashboard:providers.primaryEgressDisclosure")}
+                      </p>
+                      <div className="flex flex-wrap items-end gap-2 md:col-span-3">
+                        {attachmentDraft.tier === "PUBLIC_OVERFLOW" ? (
+                          <Button
+                            type="button"
+                            size="touch"
+                            variant="outline"
+                            disabled={
+                              !attachmentDraft.poolId ||
+                              createBudget.isPending ||
+                              !budgetForm.state.canSubmit ||
+                              !activePricing
+                            }
+                            onClick={() => {
+                              const currency = activePricing?.currency ?? null;
+                              createBudget.mutate({
+                                scopeType: "POOL_PROVIDER_MODEL",
+                                providerAccountId: selected.id,
+                                poolId: attachmentDraft.poolId,
+                                providerModelId: activeModelId,
+                                active: true,
+                                rules: providerBudgetRules(budgetForm.state.values, currency),
+                              });
+                            }}
+                          >
+                            {t("dashboard:providers.actions.createAttachmentProtection")}
+                          </Button>
+                        ) : null}
                         <Button
                           type="button"
                           size="touch"
@@ -1455,14 +1485,20 @@ export function ProviderOperationsSection() {
                           size="touch"
                           disabled={
                             !attachmentDraft.poolId ||
-                            !Number.isInteger(Number(attachmentDraft.publicOrder)) ||
+                            (attachmentDraft.tier === "PUBLIC_OVERFLOW" &&
+                              !Number.isInteger(Number(attachmentDraft.publicOrder))) ||
                             addPoolMember.isPending
                           }
                           onClick={() =>
                             addPoolMember.mutate({
                               poolId: attachmentDraft.poolId,
                               providerModelId: activeModelId,
-                              publicOrder: Number(attachmentDraft.publicOrder),
+                              tier: attachmentDraft.tier,
+                              publicOrder:
+                                attachmentDraft.tier === "PUBLIC_OVERFLOW"
+                                  ? Number(attachmentDraft.publicOrder)
+                                  : undefined,
+                              weight: 1,
                             })
                           }
                         >
@@ -1489,9 +1525,12 @@ export function ProviderOperationsSection() {
                                   member.providerModel?.upstreamModelId}
                               </p>
                               <p className="text-xs text-muted-foreground">
-                                {t("dashboard:providers.publicOrder", {
-                                  order: member.publicOrder ?? 0,
-                                })}{" "}
+                                {t(`dashboard:pools.memberTiers.${member.tier}`)}
+                                {member.tier === "PUBLIC_OVERFLOW"
+                                  ? ` · ${t("dashboard:providers.publicOrder", {
+                                      order: member.publicOrder ?? 0,
+                                    })}`
+                                  : ""}{" "}
                                 · {t(`dashboard:providers.enums.${member.routingStatus}`)}
                               </p>
                               <p className="mt-1 break-words text-xs text-muted-foreground">

@@ -72,6 +72,9 @@ export interface PublicOverflowRequest {
   poolId: string;
   requestId: string;
   reason: PublicOverflowReason;
+  /** Provider-backed PRIMARY reuses the guarded provider execution pipeline but
+   * is not public fallback and therefore does not require the public opt-in. */
+  memberTier?: "PRIMARY" | "PUBLIC_OVERFLOW";
   requestedProtocol: ProviderProtocol;
   requestedSurface: ProtocolSurface;
   stream: boolean;
@@ -252,7 +255,7 @@ function providerEventRouting(input: {
     poolId: input.request.poolId,
     poolMemberId: input.target.poolMemberId,
     executionTargetId: input.target.executionTargetId,
-    memberTier: "PUBLIC_OVERFLOW",
+    memberTier: input.request.memberTier ?? "PUBLIC_OVERFLOW",
     triggerReason: input.request.reason,
     affinityOutcome: input.target.affinity?.outcome ?? "NONE",
     contextCountMethod: input.request.contextCountMethod,
@@ -500,6 +503,7 @@ function supportedFeatures(value: unknown): string[] {
 export async function listPublicOverflowTargets(
   userId: string,
   poolId: string,
+  memberTier: "PRIMARY" | "PUBLIC_OVERFLOW" = "PUBLIC_OVERFLOW",
 ): Promise<ListedPublicOverflowTargets> {
   const pool = await prisma.modelPool.findFirst({
     where: { id: poolId, userId },
@@ -514,11 +518,19 @@ export async function listPublicOverflowTargets(
       affinityConfirmedCacheWeight: true,
       affinityLoadPenaltyWeight: true,
       PoolMembers: {
-        where: { tier: "PUBLIC_OVERFLOW", routingStatus: "ACTIVE" },
-        orderBy: [{ publicOrder: "asc" }, { id: "asc" }],
+        where: {
+          tier: memberTier,
+          routingStatus: "ACTIVE",
+          ExecutionTarget: { ProviderModel: { isNot: null } },
+        },
+        orderBy:
+          memberTier === "PUBLIC_OVERFLOW"
+            ? [{ publicOrder: "asc" }, { id: "asc" }]
+            : [{ weight: "desc" }, { id: "asc" }],
         select: {
           id: true,
           publicOrder: true,
+          weight: true,
           ExecutionTarget: {
             select: {
               id: true,
@@ -598,7 +610,7 @@ export async function listPublicOverflowTargets(
       !account ||
       !credential ||
       !protocol ||
-      member.publicOrder == null ||
+      (memberTier === "PUBLIC_OVERFLOW" && member.publicOrder == null) ||
       model.userId !== userId ||
       account.userId !== userId ||
       !model.enabled ||
@@ -614,7 +626,7 @@ export async function listPublicOverflowTargets(
       {
         poolMemberId: member.id,
         executionTargetId: member.ExecutionTarget!.id,
-        publicOrder: member.publicOrder,
+        publicOrder: member.publicOrder ?? 0,
         providerModelId: model.id,
         upstreamModelId: model.upstreamModelId,
         contextWindow: model.contextWindow,
@@ -1373,11 +1385,14 @@ export async function rankPublicOverflowTargets(input: {
 export async function dispatchPublicOverflow(
   request: PublicOverflowRequest,
 ): Promise<PublicOverflowResult> {
-  if (!env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED)
+  const memberTier = request.memberTier ?? "PUBLIC_OVERFLOW";
+  if (memberTier === "PUBLIC_OVERFLOW" && !env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED)
     return { dispatched: false, reason: "DEPLOYMENT_GATE_DISABLED" };
-  const listed = await listPublicOverflowTargets(request.userId, request.poolId);
-  if (!listed.enabled) return { dispatched: false, reason: "POOL_PRIVATE" };
-  if (!listed.acknowledged) return { dispatched: false, reason: "POOL_ACKNOWLEDGEMENT_MISSING" };
+  const listed = await listPublicOverflowTargets(request.userId, request.poolId, memberTier);
+  if (memberTier === "PUBLIC_OVERFLOW" && !listed.enabled)
+    return { dispatched: false, reason: "POOL_PRIVATE" };
+  if (memberTier === "PUBLIC_OVERFLOW" && !listed.acknowledged)
+    return { dispatched: false, reason: "POOL_ACKNOWLEDGEMENT_MISSING" };
   // Payload size may change during cross-protocol rendering. Do the initial
   // pass with zero input solely to reject protocol/feature/output mismatches;
   // each target is checked again with its actual rendered wire size below.

@@ -2295,7 +2295,9 @@ export const forwarderManagementRouter = {
       z.object({
         poolId: idSchema,
         providerModelId: idSchema,
-        publicOrder: z.number().int().min(0).max(10_000),
+        tier: z.enum(["PRIMARY", "PUBLIC_OVERFLOW"]).default("PUBLIC_OVERFLOW"),
+        publicOrder: z.number().int().min(0).max(10_000).optional(),
+        weight: z.number().int().min(0).max(10_000).default(1),
       }),
     )
     .handler(async ({ input, context }) => {
@@ -2312,9 +2314,17 @@ export const forwarderManagementRouter = {
           select: { id: true, publicEgressEnabled: true, publicEgressAcknowledged: true },
         });
         if (!pool) throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
-        if (!pool.publicEgressEnabled || !pool.publicEgressAcknowledged) {
+        if (
+          input.tier === "PUBLIC_OVERFLOW" &&
+          (!pool.publicEgressEnabled || !pool.publicEgressAcknowledged)
+        ) {
           throw new ORPCError("BAD_REQUEST", {
             message: "Acknowledge and enable public egress before adding an overflow target.",
+          });
+        }
+        if (input.tier === "PUBLIC_OVERFLOW" && input.publicOrder === undefined) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: "Public overflow targets require an explicit order.",
           });
         }
         const providerModel = await tx.providerModel.findFirst({
@@ -2384,23 +2394,25 @@ export const forwarderManagementRouter = {
           data: {
             poolId: input.poolId,
             executionTargetId: target.id,
-            tier: "PUBLIC_OVERFLOW",
-            publicOrder: input.publicOrder,
-            weight: 0,
+            tier: input.tier,
+            publicOrder: input.tier === "PUBLIC_OVERFLOW" ? input.publicOrder : null,
+            weight: input.tier === "PRIMARY" ? input.weight : 0,
           },
           select: { id: true },
         });
-        const ordered = await tx.poolMember.findMany({
-          where: { poolId: input.poolId, tier: "PUBLIC_OVERFLOW", id: { not: member.id } },
-          orderBy: [{ publicOrder: "asc" }, { id: "asc" }],
-          select: { id: true },
-        });
-        ordered.splice(Math.min(input.publicOrder, ordered.length), 0, member);
-        for (const [publicOrder, orderedMember] of ordered.entries()) {
-          await tx.poolMember.update({
-            where: { id: orderedMember.id },
-            data: { publicOrder },
+        if (input.tier === "PUBLIC_OVERFLOW") {
+          const ordered = await tx.poolMember.findMany({
+            where: { poolId: input.poolId, tier: "PUBLIC_OVERFLOW", id: { not: member.id } },
+            orderBy: [{ publicOrder: "asc" }, { id: "asc" }],
+            select: { id: true },
           });
+          ordered.splice(Math.min(input.publicOrder ?? 0, ordered.length), 0, member);
+          for (const [publicOrder, orderedMember] of ordered.entries()) {
+            await tx.poolMember.update({
+              where: { id: orderedMember.id },
+              data: { publicOrder },
+            });
+          }
         }
         return { id: member.id, executionTargetId: target.id };
       });
@@ -2412,23 +2424,60 @@ export const forwarderManagementRouter = {
         id: idSchema,
         weight: z.number().int().min(0).max(10_000).optional(),
         routingStatus: routingStatusSchema.optional(),
+        tier: z.enum(["PRIMARY", "PUBLIC_OVERFLOW"]).optional(),
         publicOrder: z.number().int().min(0).max(10_000).optional(),
       }),
     )
     .handler(async ({ input, context }) => {
       const member = await prisma.poolMember.findUnique({
         where: { id: input.id },
-        select: { id: true, ModelPool: { select: { userId: true } } },
+        select: {
+          id: true,
+          tier: true,
+          publicOrder: true,
+          ExecutionTarget: { select: { ProviderModel: { select: { id: true } } } },
+          ModelPool: {
+            select: {
+              userId: true,
+              publicEgressEnabled: true,
+              publicEgressAcknowledged: true,
+            },
+          },
+        },
       });
       if (!member || member.ModelPool.userId !== context.session.user.id) {
         throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
+      }
+      const nextTier = input.tier ?? member.tier;
+      if (input.tier && !member.ExecutionTarget?.ProviderModel) {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Only provider-backed members can change tier.",
+        });
+      }
+      if (
+        nextTier === "PUBLIC_OVERFLOW" &&
+        (!member.ModelPool.publicEgressEnabled || !member.ModelPool.publicEgressAcknowledged)
+      ) {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Acknowledge and enable public egress before moving a target to overflow.",
+        });
+      }
+      const nextPublicOrder =
+        nextTier === "PUBLIC_OVERFLOW" ? (input.publicOrder ?? member.publicOrder) : null;
+      if (nextTier === "PUBLIC_OVERFLOW" && nextPublicOrder === null) {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Public overflow targets require an explicit order.",
+        });
       }
       return prisma.poolMember.update({
         where: { id: input.id },
         data: {
           ...(input.weight !== undefined ? { weight: input.weight } : {}),
           ...(input.routingStatus ? { routingStatus: input.routingStatus } : {}),
-          ...(input.publicOrder !== undefined ? { publicOrder: input.publicOrder } : {}),
+          ...(input.tier ? { tier: input.tier } : {}),
+          ...(input.tier || input.publicOrder !== undefined
+            ? { publicOrder: nextPublicOrder }
+            : {}),
         },
         select: { id: true, weight: true, routingStatus: true, tier: true, publicOrder: true },
       });

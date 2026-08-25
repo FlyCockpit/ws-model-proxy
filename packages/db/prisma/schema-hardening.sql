@@ -190,8 +190,8 @@ BEGIN
     RAISE EXCEPTION 'pool member target must have the same owner as its pool'
       USING ERRCODE = '23514';
   END IF;
-  IF NEW.tier = 'PRIMARY' AND target_kind IS DISTINCT FROM 'DISCOVERED_MODEL' THEN
-    RAISE EXCEPTION 'primary pool members must be discovered models'
+  IF NEW.tier = 'PRIMARY' AND target_kind NOT IN ('DISCOVERED_MODEL', 'PROVIDER_MODEL') THEN
+    RAISE EXCEPTION 'primary pool members must be discovered or provider models'
       USING ERRCODE = '23514';
   END IF;
   IF NEW.tier = 'PUBLIC_OVERFLOW' AND

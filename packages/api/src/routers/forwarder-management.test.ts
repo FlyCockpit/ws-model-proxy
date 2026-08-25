@@ -1375,6 +1375,50 @@ describe("forwarderManagementRouter", () => {
     });
   });
 
+  it("attaches a provider PRIMARY without enabling public overflow", async () => {
+    db.modelPool.findFirst.mockResolvedValue({
+      id: "private-pool",
+      publicEgressEnabled: false,
+      publicEgressAcknowledged: false,
+    });
+    db.providerModel.findFirst.mockResolvedValue({
+      id: "provider-model",
+      providerAccountId: "provider-account",
+      enabled: true,
+    });
+    db.providerBudgetPolicy.findFirst.mockResolvedValue({
+      id: "policy",
+      activatedAt: new Date(),
+      Rules: [{ id: "rule", mode: "LIMITED", limitValue: 2 }],
+    });
+    db.providerAuditEvent.findFirst.mockResolvedValue({ id: "audit" });
+    db.executionTarget.upsert.mockResolvedValue({ id: "provider-target" });
+    db.poolMember.create.mockResolvedValue({ id: "primary-provider-member" });
+
+    await expect(
+      client().addProviderPoolMember({
+        poolId: "private-pool",
+        providerModelId: "provider-model",
+        tier: "PRIMARY",
+        weight: 7,
+      }),
+    ).resolves.toEqual({
+      id: "primary-provider-member",
+      executionTargetId: "provider-target",
+    });
+    expect(db.poolMember.create).toHaveBeenCalledWith({
+      data: {
+        poolId: "private-pool",
+        executionTargetId: "provider-target",
+        tier: "PRIMARY",
+        publicOrder: null,
+        weight: 7,
+      },
+      select: { id: true },
+    });
+    expect(db.poolMember.findMany).not.toHaveBeenCalled();
+  });
+
   it("makes missing and cross-owner nested pool-member ids indistinguishable", async () => {
     const expectedPoolError = { code: "NOT_FOUND", message: "Model pool not found." };
     db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce({

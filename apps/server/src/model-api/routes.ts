@@ -145,6 +145,7 @@ import {
   conservativeSerializedInputTokens,
   dispatchPublicOverflow,
   type PublicOverflowReason,
+  type PublicOverflowRequest,
 } from "./public-overflow.js";
 import { type RelayAttemptTerminal, startRelayAttempt } from "./relay-executor.js";
 import { shouldRetryRelayOperation } from "./relay-retry-policy.js";
@@ -3281,7 +3282,13 @@ async function relayPool({
           }
         })()
       : null;
-    const result = await dispatchPublicOverflow({
+    let localCapacityReleased = false;
+    const releaseProviderCapacity = async () => {
+      if (localCapacityReleased) return;
+      localCapacityReleased = true;
+      await releaseLocalCapacity();
+    };
+    const providerRequest = {
       // Provider configuration and budgets belong to the pool owner. The
       // requester may be an explicitly granted tenant; relay metadata and the
       // stickiness visibility tuple remain requester/token scoped.
@@ -3297,7 +3304,7 @@ async function relayPool({
       headers: built.headers,
       body: built.body,
       signal: request.signal,
-      releaseLocalCapacity,
+      releaseLocalCapacity: releaseProviderCapacity,
       adaptationEnabled:
         operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled,
       chatTestRoutingMode: testRoutingMode,
@@ -3343,16 +3350,24 @@ async function relayPool({
             };
           }
         : undefined,
-    });
+    } satisfies PublicOverflowRequest;
+    let selectedTier: "PRIMARY" | "PUBLIC_OVERFLOW" = "PRIMARY";
+    let result = await dispatchPublicOverflow({ ...providerRequest, memberTier: "PRIMARY" });
+    if (!result.dispatched) {
+      selectedTier = "PUBLIC_OVERFLOW";
+      result = await dispatchPublicOverflow({ ...providerRequest, memberTier: "PUBLIC_OVERFLOW" });
+    }
     if (!result.dispatched) return null;
     await prisma.relayRequest
       .update({
         where: { id: relayRequestId },
         data: {
           selectedExecutionTargetId: result.target.executionTargetId,
+          // Provider-backed PRIMARY is still external egress even though it is
+          // not public fallback. The tier and overflow reason distinguish it.
           publicEgress: true,
-          publicOverflowReason: reason,
-          selectedPoolMemberTier: "PUBLIC_OVERFLOW",
+          publicOverflowReason: selectedTier === "PUBLIC_OVERFLOW" ? reason : null,
+          selectedPoolMemberTier: selectedTier,
           providerAccountId: result.target.providerAccountId,
           providerModelId: result.target.providerModelId,
           providerAttemptId: result.attemptId,
@@ -5630,7 +5645,7 @@ async function relayBoundProviderResponse(input: {
       ? conservativeSerializedInputTokens(input.body.byteLength)
       : BigInt(input.contextCount.tokens)
     : 0n;
-  const result = await dispatchPublicOverflow({
+  const boundRequest = {
     userId: input.stickyRoute.visibleTarget.ownerUserId,
     poolId: input.stickyRoute.visibleTarget.id,
     requestId: relayRequestId,
@@ -5653,7 +5668,13 @@ async function relayBoundProviderResponse(input: {
     retrySafe: false,
     exactResponsesBinding: input.stickyRoute.binding,
     skipContextValidation: input.contextInput === undefined,
-  });
+  } satisfies PublicOverflowRequest;
+  let selectedTier: "PRIMARY" | "PUBLIC_OVERFLOW" = "PRIMARY";
+  let result = await dispatchPublicOverflow({ ...boundRequest, memberTier: "PRIMARY" });
+  if (!result.dispatched) {
+    selectedTier = "PUBLIC_OVERFLOW";
+    result = await dispatchPublicOverflow({ ...boundRequest, memberTier: "PUBLIC_OVERFLOW" });
+  }
   if (!result.dispatched) {
     await prisma.relayRequest
       .update({
@@ -5673,7 +5694,7 @@ async function relayBoundProviderResponse(input: {
       data: {
         selectedExecutionTargetId: result.target.executionTargetId,
         publicEgress: true,
-        selectedPoolMemberTier: "PUBLIC_OVERFLOW",
+        selectedPoolMemberTier: selectedTier,
         providerAccountId: result.target.providerAccountId,
         providerModelId: result.target.providerModelId,
         providerAttemptId: result.attemptId,

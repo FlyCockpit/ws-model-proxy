@@ -347,6 +347,8 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     grantee?: boolean;
     cookieAuth?: boolean;
     forceProviderMember?: boolean;
+    memberTier?: "PRIMARY" | "PUBLIC_OVERFLOW";
+    privatePool?: boolean;
     routingMode?: "PREFER_NATIVE" | "REQUIRE_NATIVE" | "REQUIRE_ADAPTED";
   }) {
     if (!modules) throw new Error("modules unavailable");
@@ -374,8 +376,8 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         slug: `pool-${suffix}`,
         name: "Provider route pool",
         protocolAdaptationEnabled: true,
-        publicEgressEnabled: true,
-        publicEgressAcknowledged: true,
+        publicEgressEnabled: !input.privatePool,
+        publicEgressAcknowledged: !input.privatePool,
       },
     });
     const grant = input.grantee
@@ -452,8 +454,9 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       data: {
         poolId: pool.id,
         executionTargetId: target.id,
-        tier: "PUBLIC_OVERFLOW",
-        publicOrder: 0,
+        tier: input.memberTier ?? "PUBLIC_OVERFLOW",
+        publicOrder: (input.memberTier ?? "PUBLIC_OVERFLOW") === "PUBLIC_OVERFLOW" ? 0 : null,
+        weight: (input.memberTier ?? "PUBLIC_OVERFLOW") === "PRIMARY" ? 1 : 0,
       },
     });
     await modules.prisma.providerPricingVersion.create({
@@ -1146,6 +1149,25 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       expectAdapterTelemetry(result, "native", requested, requested);
     });
   }
+
+  it("routes a provider PRIMARY in a private pool with durable settlement", async () => {
+    const result = await runCase({
+      requested: "openai-chat",
+      native: "openai-chat",
+      behavior: "json",
+      memberTier: "PRIMARY",
+      privatePool: true,
+    });
+    expect(result.response.status).toBe(200);
+    expect(result.pool).toMatchObject({
+      publicEgressEnabled: false,
+      publicEgressAcknowledged: false,
+    });
+    expect(result.attemptEvents).not.toHaveLength(0);
+    expect(result.attemptEvents.every((event) => event.memberTier === "PRIMARY")).toBe(true);
+    expect(result.settlements).toHaveLength(result.reservations.length);
+    expectExactSuccessAccounting(result);
+  });
 
   it.each(crossPairs)(
     "$requested executes the full non-stream matrix from $native",

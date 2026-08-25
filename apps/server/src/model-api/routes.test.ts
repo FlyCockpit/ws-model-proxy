@@ -3041,6 +3041,117 @@ describe("model API routes", () => {
     expect((await responsePromise).status).toBe(200);
   });
 
+  it("routes provider PRIMARY before public overflow without silently changing tiers", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([]);
+    publicOverflow.dispatch.mockResolvedValueOnce({
+      dispatched: false,
+      reason: "NO_COMPATIBLE_PROVIDER",
+    });
+    publicOverflow.dispatch.mockResolvedValueOnce({
+      dispatched: true,
+      response: new Response(JSON.stringify({ id: "overflow" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+      target: {
+        poolMemberId: "overflow-member",
+        executionTargetId: "overflow-target",
+        providerAccountId: "provider-account",
+        providerModelId: "provider-model",
+        endpointIdentity: "https://provider.example/v1",
+        endpointVersion: 1,
+        upstreamModelId: "provider-upstream",
+      },
+      attemptId: "overflow-attempt",
+      fencingToken: 1n,
+      nativeSurface: "openai-chat",
+      attemptCount: 1,
+      terminal: Promise.resolve({ ok: true, responseBytes: 17 }),
+      markFirstClientByte: vi.fn().mockResolvedValue(undefined),
+      affinity: undefined,
+    });
+
+    const response = await appWith(new FakeRelayManager()).request("/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "content-type": "application/json",
+      },
+      body: requestBody(poolTarget.modelId),
+    });
+
+    expect(response.status).toBe(200);
+    expect(publicOverflow.dispatch.mock.calls.map(([input]) => input.memberTier)).toEqual([
+      "PRIMARY",
+      "PUBLIC_OVERFLOW",
+    ]);
+    expect(db.relayRequest.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          publicEgress: true,
+          selectedPoolMemberTier: "PUBLIC_OVERFLOW",
+        }),
+      }),
+    );
+  });
+
+  it("records provider PRIMARY as external egress without an overflow reason", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([]);
+    publicOverflow.dispatch.mockResolvedValueOnce({
+      dispatched: true,
+      response: new Response(JSON.stringify({ id: "primary" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+      target: {
+        poolMemberId: "primary-provider-member",
+        executionTargetId: "primary-provider-target",
+        providerAccountId: "provider-account",
+        providerModelId: "provider-model",
+        endpointIdentity: "https://provider.example/v1",
+        endpointVersion: 1,
+        upstreamModelId: "provider-upstream",
+      },
+      attemptId: "primary-attempt",
+      fencingToken: 1n,
+      nativeSurface: "openai-chat",
+      attemptCount: 1,
+      terminal: Promise.resolve({ ok: true, responseBytes: 16 }),
+      markFirstClientByte: vi.fn().mockResolvedValue(undefined),
+      affinity: undefined,
+    });
+
+    const response = await appWith(new FakeRelayManager()).request("/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "content-type": "application/json",
+      },
+      body: requestBody(poolTarget.modelId),
+    });
+
+    expect(response.status).toBe(200);
+    expect(publicOverflow.dispatch).toHaveBeenCalledTimes(1);
+    expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({ memberTier: "PRIMARY" });
+    expect(db.relayRequest.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          publicEgress: true,
+          publicOverflowReason: null,
+          selectedPoolMemberTier: "PRIMARY",
+        }),
+      }),
+    );
+  });
+
   it("returns Anthropic-shaped pool compatibility failures", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
