@@ -308,6 +308,39 @@ describe("GuardedPoolSetupWizard", () => {
     expect(primarySurfaceIsSelectable("OPENAI_RESPONSES", ["local"], multiNative)).toBe(false);
   });
 
+  it("requires explicit adaptation for heterogeneous primary APIs", () => {
+    const surfaceModel = (id: string, surface: "openaiChatCompletions" | "openaiResponses") => ({
+      ...localModel,
+      id,
+      effectiveCapabilities: {
+        metadata: {
+          version: 3 as const,
+          protocol: "openai-compatible" as const,
+          surfaces: {
+            [surface]: {
+              source: "declared" as const,
+              confidence: "exact" as const,
+              supported: true,
+              streaming: true,
+            },
+          },
+        },
+      },
+    });
+    const heterogeneous = [
+      surfaceModel("chat", "openaiChatCompletions"),
+      surfaceModel("responses", "openaiResponses"),
+    ];
+    const selected = ["chat", "responses"];
+
+    expect(recommendedPrimarySurface(selected, heterogeneous)).toBeNull();
+    expect(primarySurfaceIsSelectable("OPENAI_RESPONSES", selected, heterogeneous)).toBe(false);
+    expect(recommendedPrimarySurface(selected, heterogeneous, true)).toBe("OPENAI_RESPONSES");
+    expect(primarySurfaceIsSelectable("OPENAI_RESPONSES", selected, heterogeneous, true)).toBe(
+      true,
+    );
+  });
+
   it("uses the smallest selected physical context for inline validation", () => {
     expect(
       minimumSelectedPhysicalContext(

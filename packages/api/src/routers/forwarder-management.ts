@@ -1344,22 +1344,45 @@ export const forwarderManagementRouter = {
                     ? model.capabilityOverrides
                     : model.Endpoint.defaultCapabilities,
                 ),
-              adaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? true,
+              adaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
             }),
           );
-          const recommendedEntries = primaryMatrices.map(
-            (matrix) => matrix[input.recommendedSurface],
-          );
-          const anyPrimaryNative = modelApiSurfaces.some((surface) =>
-            primaryMatrices.some((matrix) => matrix[surface].mode === "native"),
-          );
-          if (
-            recommendedEntries.every((entry) => entry.mode === "unavailable") ||
-            (anyPrimaryNative && recommendedEntries.every((entry) => entry.mode !== "native"))
-          ) {
+          const recommendedSurface = [
+            "OPENAI_RESPONSES",
+            "OPENAI_CHAT_COMPLETIONS",
+            "ANTHROPIC_MESSAGES",
+          ]
+            .map((surface, orderIndex) => {
+              const typedSurface = surface as Exclude<
+                (typeof modelApiSurfaces)[number],
+                "OPENAI_COMPLETIONS"
+              >;
+              return {
+                surface: typedSurface,
+                orderIndex,
+                nativeCount: primaryMatrices.filter(
+                  (matrix) => matrix[typedSurface].mode === "native",
+                ).length,
+                limitations: primaryMatrices.reduce(
+                  (count, matrix) => count + matrix[typedSurface].limitations.length,
+                  0,
+                ),
+                available: primaryMatrices.every(
+                  (matrix) => matrix[typedSurface].mode !== "unavailable",
+                ),
+              };
+            })
+            .filter((candidate) => candidate.available)
+            .sort(
+              (left, right) =>
+                right.nativeCount - left.nativeCount ||
+                left.limitations - right.limitations ||
+                left.orderIndex - right.orderIndex,
+            )[0]?.surface;
+          if (!recommendedSurface || input.recommendedSurface !== recommendedSurface) {
             throw new ORPCError("BAD_REQUEST", {
               message:
-                "Recommended API must be supported by a selected primary model and prefer a native primary API when available.",
+                "Recommended API must be the best API supported by every selected primary model.",
             });
           }
           const localTargets = await tx.executionTarget.findMany({
@@ -1472,7 +1495,7 @@ export const forwarderManagementRouter = {
               userId,
               slug: input.slug,
               name: input.name,
-              protocolAdaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? true,
+              protocolAdaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
               allowLossyDeveloperRoleCollapse:
                 input.advanced?.allowLossyDeveloperRoleCollapse ?? false,
               publicEgressEnabled: providerIds.length > 0,

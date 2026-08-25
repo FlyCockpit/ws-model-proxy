@@ -260,7 +260,7 @@ export function GuardedPoolSetupWizard({
         | "CONSERVATIVE_ESTIMATE",
       contextMargin: 1_024,
       borrowPolicy: "WHEN_IDLE" as "NEVER" | "WHEN_IDLE",
-      protocolAdaptationEnabled: true,
+      protocolAdaptationEnabled: false,
       allowLossyDeveloperRoleCollapse: false,
       affinityEnabled: false,
       affinityTtlSeconds: 3_600,

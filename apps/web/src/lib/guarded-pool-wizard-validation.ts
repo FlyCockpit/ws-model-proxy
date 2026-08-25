@@ -22,7 +22,7 @@ export type GuardedWizardCapacity = {
 export function recommendedPrimarySurface(
   selectedIds: readonly string[],
   models: readonly GuardedWizardLocalModel[],
-  protocolAdaptationEnabled = true,
+  protocolAdaptationEnabled = false,
 ): Exclude<ModelApiSurface, "OPENAI_COMPLETIONS"> | null {
   const matrices = models
     .filter((model) => selectedIds.includes(model.id))
@@ -39,10 +39,25 @@ export function recommendedPrimarySurface(
     "OPENAI_CHAT_COMPLETIONS",
     "ANTHROPIC_MESSAGES",
   ];
+  if (matrices.length === 0) return null;
   return (
-    order.find((surface) => matrices.some((matrix) => matrix[surface].mode === "native")) ??
-    order.find((surface) => matrices.some((matrix) => matrix[surface].mode === "adapted")) ??
-    null
+    order
+      .filter((surface) => matrices.every((matrix) => matrix[surface].mode !== "unavailable"))
+      .map((surface, orderIndex) => ({
+        surface,
+        nativeCount: matrices.filter((matrix) => matrix[surface].mode === "native").length,
+        limitations: matrices.reduce(
+          (count, matrix) => count + matrix[surface].limitations.length,
+          0,
+        ),
+        orderIndex,
+      }))
+      .sort(
+        (left, right) =>
+          right.nativeCount - left.nativeCount ||
+          left.limitations - right.limitations ||
+          left.orderIndex - right.orderIndex,
+      )[0]?.surface ?? null
   );
 }
 
@@ -50,7 +65,7 @@ export function primarySurfaceIsSelectable(
   surface: ModelApiSurface,
   selectedIds: readonly string[],
   models: readonly GuardedWizardLocalModel[],
-  protocolAdaptationEnabled = true,
+  protocolAdaptationEnabled = false,
 ) {
   const matrices = models
     .filter((model) => selectedIds.includes(model.id))
@@ -62,12 +77,7 @@ export function primarySurfaceIsSelectable(
         adaptationEnabled: protocolAdaptationEnabled,
       }),
     );
-  const selectedModes = matrices.map((matrix) => matrix[surface].mode);
-  if (selectedModes.some((mode) => mode === "native")) return true;
-  const anyNative = modelApiSurfaces.some((candidate) =>
-    matrices.some((matrix) => matrix[candidate].mode === "native"),
-  );
-  return !anyNative && selectedModes.some((mode) => mode === "adapted");
+  return matrices.length > 0 && matrices.every((matrix) => matrix[surface].mode !== "unavailable");
 }
 
 export function safeContextControls(physicalMaxContext: number | null | undefined) {
