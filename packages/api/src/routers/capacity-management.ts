@@ -4,6 +4,7 @@ import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
 import {
+  assertDirectCapacityPolicy,
   assertEffectiveConcurrencyPolicy,
   assertEffectiveContextPolicy,
   lockExecutionTargetPolicies,
@@ -60,28 +61,6 @@ async function capacityTransaction<T>(
 
 function auditJson(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
-}
-
-function assertPolicyWithinHardLimit(input: {
-  hardLimit: number | null | undefined;
-  concurrencyLimit: number | null | undefined;
-  reservedSlots: number | null | undefined;
-}) {
-  if (input.hardLimit === null || input.hardLimit === undefined) return;
-  if (
-    input.concurrencyLimit !== null &&
-    input.concurrencyLimit !== undefined &&
-    input.concurrencyLimit > input.hardLimit
-  ) {
-    throw new ORPCError("BAD_REQUEST", { message: "Concurrency limit exceeds capacity." });
-  }
-  if (
-    input.reservedSlots !== null &&
-    input.reservedSlots !== undefined &&
-    input.reservedSlots > input.hardLimit
-  ) {
-    throw new ORPCError("BAD_REQUEST", { message: "Reserved slots exceed capacity." });
-  }
 }
 
 async function audit(
@@ -305,10 +284,16 @@ export const capacityManagementRouter = {
             .physicalMaxContext;
           if (requestedHardLimit !== undefined) {
             for (const target of current.ExecutionTargets ?? []) {
-              assertPolicyWithinHardLimit({
+              assertDirectCapacityPolicy({
                 hardLimit: requestedHardLimit,
                 concurrencyLimit: target.directConcurrencyLimit,
                 reservedSlots: target.directReservedSlots,
+                physicalMaxContext:
+                  requestedPhysicalMaxContext !== undefined
+                    ? requestedPhysicalMaxContext
+                    : current.physicalMaxContext,
+                contextCeiling: target.directContextCeiling,
+                contextMargin: target.directContextMargin,
               });
               for (const member of target.PoolMembers) {
                 assertEffectiveConcurrencyPolicy({
@@ -324,15 +309,17 @@ export const capacityManagementRouter = {
           }
           if (requestedPhysicalMaxContext !== undefined) {
             for (const target of current.ExecutionTargets ?? []) {
-              if (
-                requestedPhysicalMaxContext != null &&
-                target.directContextCeiling != null &&
-                target.directContextCeiling + target.directContextMargin >
-                  requestedPhysicalMaxContext
-              )
-                throw new ORPCError("BAD_REQUEST", {
-                  message: "Direct context policy exceeds physical capacity.",
-                });
+              assertDirectCapacityPolicy({
+                hardLimit:
+                  requestedHardLimit !== undefined
+                    ? requestedHardLimit
+                    : current.hardConcurrencyLimit,
+                concurrencyLimit: target.directConcurrencyLimit,
+                reservedSlots: target.directReservedSlots,
+                physicalMaxContext: requestedPhysicalMaxContext,
+                contextCeiling: target.directContextCeiling,
+                contextMargin: target.directContextMargin,
+              });
               for (const member of target.PoolMembers)
                 assertEffectiveContextPolicy({
                   physicalMaxContext: requestedPhysicalMaxContext,
@@ -448,13 +435,23 @@ export const capacityManagementRouter = {
           hardConcurrencyLimit = null;
           physicalMaxContext = null;
         }
-        assertPolicyWithinHardLimit({
+        const nextDirectConcurrency =
+          input.directConcurrencyLimit !== undefined
+            ? input.directConcurrencyLimit
+            : target.directConcurrencyLimit;
+        const nextDirectReserved = input.directReservedSlots ?? target.directReservedSlots;
+        const nextDirectContextCeiling =
+          input.directContextCeiling !== undefined
+            ? input.directContextCeiling
+            : target.directContextCeiling;
+        const nextDirectContextMargin = input.directContextMargin ?? target.directContextMargin;
+        assertDirectCapacityPolicy({
           hardLimit: hardConcurrencyLimit,
-          concurrencyLimit:
-            input.directConcurrencyLimit !== undefined
-              ? input.directConcurrencyLimit
-              : target.directConcurrencyLimit,
-          reservedSlots: input.directReservedSlots ?? target.directReservedSlots,
+          concurrencyLimit: nextDirectConcurrency,
+          reservedSlots: nextDirectReserved,
+          physicalMaxContext,
+          contextCeiling: nextDirectContextCeiling,
+          contextMargin: nextDirectContextMargin,
         });
         // Attaching a target changes the physical ceiling for every pool that
         // already references it. Validate both explicit member overrides and
@@ -477,20 +474,6 @@ export const capacityManagementRouter = {
             memberMargin: member.capacityContextMargin,
           });
         }
-        if (
-          physicalMaxContext != null &&
-          (input.directContextCeiling !== undefined
-            ? input.directContextCeiling
-            : target.directContextCeiling) != null &&
-          (input.directContextCeiling !== undefined
-            ? input.directContextCeiling
-            : target.directContextCeiling)! +
-            (input.directContextMargin ?? target.directContextMargin) >
-            physicalMaxContext
-        )
-          throw new ORPCError("BAD_REQUEST", {
-            message: "Direct context policy exceeds physical capacity.",
-          });
         const { executionTargetId, ...data } = input;
         const updated = await tx.executionTarget.update({ where: { id: executionTargetId }, data });
         await audit(tx, {

@@ -13,6 +13,7 @@ import { protectedProcedure } from "../index";
 import {
   assertEffectiveConcurrencyPolicy,
   assertEffectiveContextPolicy,
+  lockExecutionTargetIdentities,
   lockExecutionTargetPolicies,
 } from "../lib/capacity-policy-safety";
 import {
@@ -35,6 +36,7 @@ import {
   transformerModalityMismatchErrors,
   transformerSupportedModalities,
 } from "../lib/openai-compatible-capabilities";
+import { runSerializableTransaction } from "../lib/serializable-transaction";
 import {
   type ModelApiSurface,
   modelApiSurfaces,
@@ -1345,457 +1347,474 @@ export const forwarderManagementRouter = {
       const userId = context.session.user.id;
       await assertPoolSlugAvailable(input.slug, userId);
       const now = new Date();
-      return prisma.$transaction(
-        async (tx) => {
-          const localModels = await tx.discoveredModel.findMany({
-            where: {
-              id: { in: input.localModelIds },
-              userId,
-              published: true,
-              Endpoint: { published: true },
+      return runSerializableTransaction(async (tx) => {
+        const localModels = await tx.discoveredModel.findMany({
+          where: {
+            id: { in: input.localModelIds },
+            userId,
+            published: true,
+            Endpoint: { published: true },
+          },
+          select: {
+            id: true,
+            upstreamModelId: true,
+            capabilityOverrideMode: true,
+            capabilityOverrides: true,
+            capabilityOverrideMetadata: true,
+            Endpoint: {
+              select: { capabilityMetadata: true, defaultCapabilities: true },
             },
-            select: {
-              id: true,
-              upstreamModelId: true,
-              capabilityOverrideMode: true,
-              capabilityOverrides: true,
-              capabilityOverrideMetadata: true,
-              Endpoint: {
-                select: { capabilityMetadata: true, defaultCapabilities: true },
-              },
-            },
-          });
-          if (localModels.length !== input.localModelIds.length) {
-            throw new ORPCError("NOT_FOUND", { message: "A selected local model is unavailable" });
-          }
-          const providerIds = input.providerModels.map((item) => item.providerModelId);
-          const hasPublicOverflow = input.providerModels.some(
-            (item) => item.tier === "PUBLIC_OVERFLOW",
-          );
-          const providers = providerIds.length
-            ? await tx.providerModel.findMany({
-                where: {
-                  id: { in: providerIds },
-                  userId,
+          },
+        });
+        if (localModels.length !== input.localModelIds.length) {
+          throw new ORPCError("NOT_FOUND", { message: "A selected local model is unavailable" });
+        }
+        const providerIds = input.providerModels.map((item) => item.providerModelId);
+        const hasPublicOverflow = input.providerModels.some(
+          (item) => item.tier === "PUBLIC_OVERFLOW",
+        );
+        const providers = providerIds.length
+          ? await tx.providerModel.findMany({
+              where: {
+                id: { in: providerIds },
+                userId,
+                enabled: true,
+                deletedAt: null,
+                ProviderAccount: {
                   enabled: true,
                   deletedAt: null,
-                  ProviderAccount: {
-                    enabled: true,
-                    deletedAt: null,
-                    CurrentCredential: { status: "ACTIVE" },
-                  },
+                  CurrentCredential: { status: "ACTIVE" },
                 },
-                select: {
-                  id: true,
-                  providerAccountId: true,
-                  upstreamModelId: true,
-                  contextWindow: true,
-                  concurrencyLimit: true,
-                  nativeCapabilities: true,
-                  PricingVersions: {
-                    where: { status: "ACTIVE", retiredAt: null, effectiveAt: { lte: now } },
-                    orderBy: [{ effectiveAt: "desc" }, { id: "desc" }],
-                    take: 1,
-                    select: { id: true, currency: true },
-                  },
+              },
+              select: {
+                id: true,
+                providerAccountId: true,
+                upstreamModelId: true,
+                contextWindow: true,
+                concurrencyLimit: true,
+                nativeCapabilities: true,
+                PricingVersions: {
+                  where: { status: "ACTIVE", retiredAt: null, effectiveAt: { lte: now } },
+                  orderBy: [{ effectiveAt: "desc" }, { id: "desc" }],
+                  take: 1,
+                  select: { id: true, currency: true },
                 },
-              })
-            : [];
-          if (
-            providers.length !== providerIds.length ||
-            providers.some((row) => !row.PricingVersions[0])
-          ) {
-            throw new ORPCError("PRECONDITION_FAILED", {
-              message: "A selected provider is not ready for guarded routing",
-            });
-          }
-          const primaryProviderIds = new Set(
-            input.providerModels
-              .filter((item) => item.tier === "PRIMARY")
-              .map((item) => item.providerModelId),
-          );
-          const primaryMatrices = [
-            ...localModels.map((model) =>
+              },
+            })
+          : [];
+        if (
+          providers.length !== providerIds.length ||
+          providers.some((row) => !row.PricingVersions[0])
+        ) {
+          throw new ORPCError("PRECONDITION_FAILED", {
+            message: "A selected provider is not ready for guarded routing",
+          });
+        }
+        const primaryProviderIds = new Set(
+          input.providerModels
+            .filter((item) => item.tier === "PRIMARY")
+            .map((item) => item.providerModelId),
+        );
+        const primaryMatrices = [
+          ...localModels.map((model) =>
+            surfaceAvailabilityMatrix({
+              capabilities:
+                resolveEffectiveCapabilityMetadata({
+                  capabilityOverrideMode: model.capabilityOverrideMode,
+                  capabilityOverrideMetadata: model.capabilityOverrideMetadata,
+                  endpointCapabilityMetadata: model.Endpoint.capabilityMetadata,
+                }) ??
+                openAiCapabilitiesFromCoarse(
+                  model.capabilityOverrideMode === "OVERRIDE"
+                    ? model.capabilityOverrides
+                    : model.Endpoint.defaultCapabilities,
+                ),
+              adaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
+            }),
+          ),
+          ...providers
+            .filter((provider) => primaryProviderIds.has(provider.id))
+            .map((provider) =>
               surfaceAvailabilityMatrix({
-                capabilities:
-                  resolveEffectiveCapabilityMetadata({
-                    capabilityOverrideMode: model.capabilityOverrideMode,
-                    capabilityOverrideMetadata: model.capabilityOverrideMetadata,
-                    endpointCapabilityMetadata: model.Endpoint.capabilityMetadata,
-                  }) ??
-                  openAiCapabilitiesFromCoarse(
-                    model.capabilityOverrideMode === "OVERRIDE"
-                      ? model.capabilityOverrides
-                      : model.Endpoint.defaultCapabilities,
-                  ),
+                capabilities: parseOpenAiCompatibleCapabilities(provider.nativeCapabilities),
                 adaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
               }),
             ),
-            ...providers
-              .filter((provider) => primaryProviderIds.has(provider.id))
-              .map((provider) =>
-                surfaceAvailabilityMatrix({
-                  capabilities: parseOpenAiCompatibleCapabilities(provider.nativeCapabilities),
-                  adaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
-                }),
+        ];
+        const recommendedSurface = [
+          "OPENAI_RESPONSES",
+          "OPENAI_CHAT_COMPLETIONS",
+          "ANTHROPIC_MESSAGES",
+        ]
+          .map((surface, orderIndex) => {
+            const typedSurface = surface as Exclude<
+              (typeof modelApiSurfaces)[number],
+              "OPENAI_COMPLETIONS"
+            >;
+            return {
+              surface: typedSurface,
+              orderIndex,
+              nativeCount: primaryMatrices.filter(
+                (matrix) => matrix[typedSurface].mode === "native",
+              ).length,
+              limitations: primaryMatrices.reduce(
+                (count, matrix) => count + matrix[typedSurface].limitations.length,
+                0,
               ),
-          ];
-          const recommendedSurface = [
-            "OPENAI_RESPONSES",
-            "OPENAI_CHAT_COMPLETIONS",
-            "ANTHROPIC_MESSAGES",
-          ]
-            .map((surface, orderIndex) => {
-              const typedSurface = surface as Exclude<
-                (typeof modelApiSurfaces)[number],
-                "OPENAI_COMPLETIONS"
-              >;
-              return {
-                surface: typedSurface,
-                orderIndex,
-                nativeCount: primaryMatrices.filter(
-                  (matrix) => matrix[typedSurface].mode === "native",
-                ).length,
-                limitations: primaryMatrices.reduce(
-                  (count, matrix) => count + matrix[typedSurface].limitations.length,
-                  0,
-                ),
-                available: primaryMatrices.every(
-                  (matrix) => matrix[typedSurface].mode !== "unavailable",
-                ),
-              };
-            })
-            .filter((candidate) => candidate.available)
-            .sort(
-              (left, right) =>
-                right.nativeCount - left.nativeCount ||
-                left.limitations - right.limitations ||
-                left.orderIndex - right.orderIndex,
-            )[0]?.surface;
-          if (!recommendedSurface || input.recommendedSurface !== recommendedSurface) {
-            throw new ORPCError("BAD_REQUEST", {
-              message:
-                "Recommended API must be the best API supported by every selected primary model.",
-            });
-          }
-          const localTargets = await tx.executionTarget.findMany({
-            where: { userId, discoveredModelId: { in: input.localModelIds } },
-            select: {
-              id: true,
-              discoveredModelId: true,
-              inferenceCapacityId: true,
-              InferenceCapacity: {
-                select: { physicalMaxContext: true, hardConcurrencyLimit: true },
-              },
-            },
+              available: primaryMatrices.every(
+                (matrix) => matrix[typedSurface].mode !== "unavailable",
+              ),
+            };
+          })
+          .filter((candidate) => candidate.available)
+          .sort(
+            (left, right) =>
+              right.nativeCount - left.nativeCount ||
+              left.limitations - right.limitations ||
+              left.orderIndex - right.orderIndex,
+          )[0]?.surface;
+        if (!recommendedSurface || input.recommendedSurface !== recommendedSurface) {
+          throw new ORPCError("BAD_REQUEST", {
+            message:
+              "Recommended API must be the best API supported by every selected primary model.",
           });
-          if (
-            localTargets.length !== localModels.length ||
-            localTargets.some((target) => !target.inferenceCapacityId)
-          ) {
-            throw new ORPCError("PRECONDITION_FAILED", {
-              message:
-                "Every selected local model must already have an explicitly assigned physical capacity.",
-            });
-          }
-          const memberOverrideByModelId = new Map(
-            input.advanced?.memberOverrides.map((override) => [
-              override.discoveredModelId,
-              override,
-            ]) ?? [],
-          );
-          if (
-            memberOverrideByModelId.size > 0 &&
-            [...memberOverrideByModelId.keys()].some(
-              (modelId) => !input.localModelIds.includes(modelId),
-            )
-          ) {
-            throw new ORPCError("BAD_REQUEST", {
-              message: "A member override does not belong to a selected local model.",
-            });
-          }
-          for (const target of localTargets) {
-            const override = target.discoveredModelId
-              ? memberOverrideByModelId.get(target.discoveredModelId)
-              : undefined;
-            assertConcurrencyPolicyWithinHardLimit({
-              hardLimit: target.InferenceCapacity?.hardConcurrencyLimit,
-              poolLimit: input.memberConcurrencyLimit,
-              poolReserved: input.reservedSlots,
-              memberMode: override?.concurrency.mode,
-              memberLimit:
-                override?.concurrency.mode === "LIMITED" ? override.concurrency.limitValue : null,
-              memberReserved: override?.reservedSlots,
-            });
-            if (!override) continue;
-            if (
-              override.concurrency.mode === "LIMITED" &&
-              override.reservedSlots > override.concurrency.limitValue
-            ) {
-              throw new ORPCError("BAD_REQUEST", {
-                message: "Reserved slots exceed a member concurrency override.",
-              });
-            }
-            const physicalMaximum = target.InferenceCapacity?.physicalMaxContext;
-            if (
-              override.contextCeiling.mode === "LIMITED" &&
-              physicalMaximum != null &&
-              override.contextCeiling.limitValue + override.contextMargin > physicalMaximum
-            ) {
-              throw new ORPCError("BAD_REQUEST", {
-                message: "A member context override exceeds physical capacity after margin.",
-              });
-            }
-          }
-          if (
-            localTargets.some((target) => {
-              const maximum = target.InferenceCapacity?.physicalMaxContext;
-              return (
-                maximum != null &&
-                input.memberContextCeiling + (input.advanced?.contextMargin ?? 0) > maximum
-              );
-            })
-          ) {
-            throw new ORPCError("BAD_REQUEST", {
-              message: "Member context exceeds a selected model's physical capacity.",
-            });
-          }
-          if (
-            providers.some(
-              (provider) =>
-                primaryProviderIds.has(provider.id) &&
-                provider.contextWindow != null &&
-                input.memberContextCeiling + (input.advanced?.contextMargin ?? 0) >
-                  provider.contextWindow,
-            )
-          ) {
-            throw new ORPCError("BAD_REQUEST", {
-              message: "Member context exceeds a selected provider's context window.",
-            });
-          }
-          for (const provider of providers) {
-            assertConcurrencyPolicyWithinHardLimit({
-              hardLimit: provider.concurrencyLimit,
-              poolLimit: input.memberConcurrencyLimit,
-              poolReserved: input.reservedSlots,
-            });
-          }
-          const pool = await tx.modelPool.create({
-            data: {
-              userId,
-              slug: input.slug,
-              name: input.name,
-              protocolAdaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
-              allowLossyDeveloperRoleCollapse:
-                input.advanced?.allowLossyDeveloperRoleCollapse ?? false,
-              publicEgressEnabled: hasPublicOverflow,
-              publicEgressAcknowledged: hasPublicOverflow,
-              recommendedSurfaceOverride: input.recommendedSurface,
-              capacityPriority: 16,
-              capacityConcurrencyLimit: input.memberConcurrencyLimit,
-              capacityReservedSlots: input.reservedSlots,
-              capacityWaitBudgetMs: input.localWaitBudgetMs,
-              capacityContextCeiling: input.memberContextCeiling,
-              capacityContextMargin:
-                input.advanced?.contextMargin ??
-                Math.min(1024, Math.max(0, input.memberContextCeiling - 1)),
-              capacityBorrowPolicy: input.advanced?.borrowPolicy ?? "WHEN_IDLE",
-              affinityEnabled: input.advanced?.affinity.enabled ?? false,
-              affinityTtlSeconds: input.advanced?.affinity.ttlSeconds ?? 3600,
-              affinityMaxRecords: input.advanced?.affinity.maxRecords ?? 10_000,
-              affinityPrefixWeight: input.advanced?.affinity.prefixWeight ?? 100,
-              affinityConversationWeight: input.advanced?.affinity.conversationWeight ?? 150,
-              affinityConfirmedCacheWeight: input.advanced?.affinity.confirmedCacheWeight ?? 250,
-              affinityLoadPenaltyWeight: input.advanced?.affinity.loadPenaltyWeight ?? 100,
+        }
+        const localTargets = await tx.executionTarget.findMany({
+          where: { userId, discoveredModelId: { in: input.localModelIds } },
+          select: {
+            id: true,
+            discoveredModelId: true,
+            inferenceCapacityId: true,
+            InferenceCapacity: {
+              select: { physicalMaxContext: true, hardConcurrencyLimit: true },
             },
-            select: { id: true },
+          },
+        });
+        if (
+          localTargets.length !== localModels.length ||
+          localTargets.some((target) => !target.inferenceCapacityId)
+        ) {
+          throw new ORPCError("PRECONDITION_FAILED", {
+            message:
+              "Every selected local model must already have an explicitly assigned physical capacity.",
           });
-          if (input.advanced) {
-            await tx.inferenceCapacity.updateMany({
-              where: {
-                userId,
-                id: {
-                  in: [
-                    ...new Set(localTargets.flatMap((target) => target.inferenceCapacityId ?? [])),
-                  ],
-                },
-              },
-              data: { countStrategy: input.advanced.physicalCountStrategy },
+        }
+        const memberOverrideByModelId = new Map(
+          input.advanced?.memberOverrides.map((override) => [
+            override.discoveredModelId,
+            override,
+          ]) ?? [],
+        );
+        if (
+          memberOverrideByModelId.size > 0 &&
+          [...memberOverrideByModelId.keys()].some(
+            (modelId) => !input.localModelIds.includes(modelId),
+          )
+        ) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: "A member override does not belong to a selected local model.",
+          });
+        }
+        for (const target of localTargets) {
+          const override = target.discoveredModelId
+            ? memberOverrideByModelId.get(target.discoveredModelId)
+            : undefined;
+          assertConcurrencyPolicyWithinHardLimit({
+            hardLimit: target.InferenceCapacity?.hardConcurrencyLimit,
+            poolLimit: input.memberConcurrencyLimit,
+            poolReserved: input.reservedSlots,
+            memberMode: override?.concurrency.mode,
+            memberLimit:
+              override?.concurrency.mode === "LIMITED" ? override.concurrency.limitValue : null,
+            memberReserved: override?.reservedSlots,
+          });
+          if (!override) continue;
+          if (
+            override.concurrency.mode === "LIMITED" &&
+            override.reservedSlots > override.concurrency.limitValue
+          ) {
+            throw new ORPCError("BAD_REQUEST", {
+              message: "Reserved slots exceed a member concurrency override.",
             });
           }
-          const localTargetByModelId = new Map(
-            localTargets.map((target) => [target.discoveredModelId, target]),
-          );
-          for (const model of localModels) {
-            const target = localTargetByModelId.get(model.id)!;
-            const override = memberOverrideByModelId.get(model.id);
-            await tx.poolMember.create({
-              data: {
-                poolId: pool.id,
-                discoveredModelId: model.id,
-                executionTargetId: target.id,
-                tier: "PRIMARY",
-                weight: 1,
-                ...(override
-                  ? {
-                      capacityConcurrencyMode: override.concurrency.mode,
-                      capacityConcurrencyLimit:
-                        override.concurrency.mode === "LIMITED"
-                          ? override.concurrency.limitValue
-                          : null,
-                      capacityReservedSlots: override.reservedSlots,
-                      capacityBorrowPolicy: override.borrowPolicy,
-                      capacityWaitBudgetMode: override.waitBudget.mode,
-                      capacityWaitBudgetMs:
-                        override.waitBudget.mode === "LIMITED"
-                          ? override.waitBudget.limitValue
-                          : null,
-                      capacityContextCeilingMode: override.contextCeiling.mode,
-                      capacityContextCeiling:
-                        override.contextCeiling.mode === "LIMITED"
-                          ? override.contextCeiling.limitValue
-                          : null,
-                      capacityContextMargin: override.contextMargin,
-                    }
-                  : {}),
-              },
+          const physicalMaximum = target.InferenceCapacity?.physicalMaxContext;
+          if (
+            override.contextCeiling.mode === "LIMITED" &&
+            physicalMaximum != null &&
+            override.contextCeiling.limitValue + override.contextMargin > physicalMaximum
+          ) {
+            throw new ORPCError("BAD_REQUEST", {
+              message: "A member context override exceeds physical capacity after margin.",
             });
           }
-          const providerById = new Map(providers.map((provider) => [provider.id, provider]));
-          let publicOrder = 0;
-          for (const protection of input.providerModels) {
-            const provider = providerById.get(protection.providerModelId);
-            if (!provider) throw new ORPCError("PRECONDITION_FAILED");
-            const capacity = await tx.inferenceCapacity.upsert({
-              where: {
-                userId_runtimeIdentityKey: {
-                  userId,
-                  runtimeIdentityKey: `provider-model:${provider.id}`,
-                },
-              },
+        }
+        if (
+          localTargets.some((target) => {
+            const maximum = target.InferenceCapacity?.physicalMaxContext;
+            return (
+              maximum != null &&
+              input.memberContextCeiling + (input.advanced?.contextMargin ?? 0) > maximum
+            );
+          })
+        ) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: "Member context exceeds a selected model's physical capacity.",
+          });
+        }
+        if (
+          providers.some(
+            (provider) =>
+              primaryProviderIds.has(provider.id) &&
+              provider.contextWindow != null &&
+              input.memberContextCeiling + (input.advanced?.contextMargin ?? 0) >
+                provider.contextWindow,
+          )
+        ) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: "Member context exceeds a selected provider's context window.",
+          });
+        }
+        for (const provider of providers) {
+          assertConcurrencyPolicyWithinHardLimit({
+            hardLimit: provider.concurrencyLimit,
+            poolLimit: input.memberConcurrencyLimit,
+            poolReserved: input.reservedSlots,
+          });
+        }
+        // Stable mutation order for mixed local/provider setup:
+        // identity fences -> target rows (sorted policy locks) -> capacities.
+        await lockExecutionTargetIdentities(
+          tx,
+          providers.map((provider) => `provider-model:${provider.id}`),
+        );
+        const orderedProviders = [...providers].sort((left, right) =>
+          left.id.localeCompare(right.id),
+        );
+        const providerTargets = await Promise.all(
+          orderedProviders.map((provider) =>
+            tx.executionTarget.upsert({
+              where: { providerModelId: provider.id },
               update: {},
-              create: {
-                userId,
-                label: `Provider model ${provider.id}`,
-                runtimeIdentityKey: `provider-model:${provider.id}`,
-                runtimeModel: provider.upstreamModelId,
-                hardConcurrencyLimit: provider.concurrencyLimit,
-                physicalMaxContext: provider.contextWindow,
-                countStrategy: "CONSERVATIVE_ESTIMATE",
-              },
-              select: { id: true },
-            });
-            const existingTarget = await tx.executionTarget.findUnique({
-              where: { providerModelId: provider.id },
-              select: { inferenceCapacityId: true },
-            });
-            const target = await tx.executionTarget.upsert({
-              where: { providerModelId: provider.id },
-              update: existingTarget?.inferenceCapacityId
-                ? {}
-                : { inferenceCapacityId: capacity.id },
               create: {
                 userId,
                 kind: "PROVIDER_MODEL",
                 providerModelId: provider.id,
-                inferenceCapacityId: capacity.id,
               },
-              select: { id: true },
-            });
-            await tx.poolMember.create({
-              data: {
-                poolId: pool.id,
-                executionTargetId: target.id,
-                tier: protection.tier,
-                publicOrder: protection.tier === "PUBLIC_OVERFLOW" ? publicOrder++ : null,
-                weight: protection.tier === "PRIMARY" ? 1 : 0,
-              },
-            });
-            const budget = await tx.providerBudgetPolicy.create({
-              data: {
-                userId,
-                scopeType: "POOL_PROVIDER_MODEL",
-                providerAccountId: provider.providerAccountId,
-                poolId: pool.id,
-                providerModelId: provider.id,
-                active: true,
-                activatedAt: now,
-                Rules: {
-                  create: (() => {
-                    const rules = protection.budgetRules;
-                    if (!rules)
-                      return [
-                        {
-                          metric: "CONCURRENCY" as const,
-                          period: "PER_ATTEMPT" as const,
-                          mode: "LIMITED" as const,
-                          limitValue: new Prisma.Decimal(protection.concurrencyLimit),
-                        },
-                        {
-                          metric: "SPEND" as const,
-                          period: "UTC_DAY" as const,
-                          mode: "LIMITED" as const,
-                          limitValue: new Prisma.Decimal(protection.dailySpendLimit),
-                          currency: provider.PricingVersions[0]!.currency,
-                        },
-                      ];
-                    const rule = (
-                      metric: "CONCURRENCY" | "TOKENS" | "SPEND",
-                      period: "PER_ATTEMPT" | "UTC_DAY" | "UTC_MONTH" | "LIFETIME",
-                      value:
-                        | { mode: "UNLIMITED"; limitValue: null }
-                        | { mode: "LIMITED"; limitValue: string | number },
-                    ) => ({
-                      metric,
-                      period,
-                      mode: value.mode,
-                      limitValue:
-                        value.mode === "LIMITED" ? new Prisma.Decimal(value.limitValue) : null,
-                      currency: metric === "SPEND" ? provider.PricingVersions[0]!.currency : null,
-                    });
-                    return [
-                      rule("CONCURRENCY", "PER_ATTEMPT", rules.concurrency),
-                      rule("TOKENS", "PER_ATTEMPT", rules.tokensPerAttempt),
-                      rule("TOKENS", "UTC_DAY", rules.tokensPerDay),
-                      rule("TOKENS", "UTC_MONTH", rules.tokensPerMonth),
-                      rule("TOKENS", "LIFETIME", rules.tokensLifetime),
-                      rule("SPEND", "UTC_DAY", rules.spendPerDay),
-                      rule("SPEND", "UTC_MONTH", rules.spendPerMonth),
-                    ];
-                  })(),
-                },
-              },
-              select: { id: true },
-            });
-            await tx.providerAuditEvent.create({
-              data: {
-                userId,
-                providerAccountId: provider.providerAccountId,
-                action: "BUDGET_CREATED",
-                subjectId: budget.id,
-                metadata: { source: "guarded_pool_wizard" },
-              },
-            });
-          }
-          await tx.capacityAuditEvent.create({
-            data: {
+              select: { id: true, providerModelId: true, inferenceCapacityId: true },
+            }),
+          ),
+        );
+        await lockExecutionTargetPolicies(tx, [
+          ...localTargets.map((target) => target.id),
+          ...providerTargets.map((target) => target.id),
+        ]);
+        const pool = await tx.modelPool.create({
+          data: {
+            userId,
+            slug: input.slug,
+            name: input.name,
+            protocolAdaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
+            allowLossyDeveloperRoleCollapse:
+              input.advanced?.allowLossyDeveloperRoleCollapse ?? false,
+            publicEgressEnabled: hasPublicOverflow,
+            publicEgressAcknowledged: hasPublicOverflow,
+            recommendedSurfaceOverride: input.recommendedSurface,
+            capacityPriority: 16,
+            capacityConcurrencyLimit: input.memberConcurrencyLimit,
+            capacityReservedSlots: input.reservedSlots,
+            capacityWaitBudgetMs: input.localWaitBudgetMs,
+            capacityContextCeiling: input.memberContextCeiling,
+            capacityContextMargin:
+              input.advanced?.contextMargin ??
+              Math.min(1024, Math.max(0, input.memberContextCeiling - 1)),
+            capacityBorrowPolicy: input.advanced?.borrowPolicy ?? "WHEN_IDLE",
+            affinityEnabled: input.advanced?.affinity.enabled ?? false,
+            affinityTtlSeconds: input.advanced?.affinity.ttlSeconds ?? 3600,
+            affinityMaxRecords: input.advanced?.affinity.maxRecords ?? 10_000,
+            affinityPrefixWeight: input.advanced?.affinity.prefixWeight ?? 100,
+            affinityConversationWeight: input.advanced?.affinity.conversationWeight ?? 150,
+            affinityConfirmedCacheWeight: input.advanced?.affinity.confirmedCacheWeight ?? 250,
+            affinityLoadPenaltyWeight: input.advanced?.affinity.loadPenaltyWeight ?? 100,
+          },
+          select: { id: true },
+        });
+        if (input.advanced) {
+          await tx.inferenceCapacity.updateMany({
+            where: {
               userId,
-              actorUserId: userId,
-              action: "CREATE",
-              resourceType: "MODEL_POOL",
-              resourceId: pool.id,
+              id: {
+                in: [
+                  ...new Set(localTargets.flatMap((target) => target.inferenceCapacityId ?? [])),
+                ],
+              },
+            },
+            data: { countStrategy: input.advanced.physicalCountStrategy },
+          });
+        }
+        const localTargetByModelId = new Map(
+          localTargets.map((target) => [target.discoveredModelId, target]),
+        );
+        for (const model of localModels) {
+          const target = localTargetByModelId.get(model.id)!;
+          const override = memberOverrideByModelId.get(model.id);
+          await tx.poolMember.create({
+            data: {
+              poolId: pool.id,
+              discoveredModelId: model.id,
+              executionTargetId: target.id,
+              tier: "PRIMARY",
+              weight: 1,
+              ...(override
+                ? {
+                    capacityConcurrencyMode: override.concurrency.mode,
+                    capacityConcurrencyLimit:
+                      override.concurrency.mode === "LIMITED"
+                        ? override.concurrency.limitValue
+                        : null,
+                    capacityReservedSlots: override.reservedSlots,
+                    capacityBorrowPolicy: override.borrowPolicy,
+                    capacityWaitBudgetMode: override.waitBudget.mode,
+                    capacityWaitBudgetMs:
+                      override.waitBudget.mode === "LIMITED"
+                        ? override.waitBudget.limitValue
+                        : null,
+                    capacityContextCeilingMode: override.contextCeiling.mode,
+                    capacityContextCeiling:
+                      override.contextCeiling.mode === "LIMITED"
+                        ? override.contextCeiling.limitValue
+                        : null,
+                    capacityContextMargin: override.contextMargin,
+                  }
+                : {}),
             },
           });
-          guardedSetupTestFailure?.();
-          const created = (await tx.modelPool.findUnique({
-            where: { id: pool.id },
-            select: poolSelect,
-          })) as ModelPoolRow | null;
-          if (!created) throw new ORPCError("INTERNAL_SERVER_ERROR");
-          return serializePool(created);
-        },
-        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
-      );
+        }
+        const providerById = new Map(providers.map((provider) => [provider.id, provider]));
+        const providerTargetByModelId = new Map(
+          providerTargets.map((target, index) => [orderedProviders[index]?.id, target]),
+        );
+        let publicOrder = 0;
+        for (const protection of input.providerModels) {
+          const provider = providerById.get(protection.providerModelId);
+          if (!provider) throw new ORPCError("PRECONDITION_FAILED");
+          const capacity = await tx.inferenceCapacity.upsert({
+            where: {
+              userId_runtimeIdentityKey: {
+                userId,
+                runtimeIdentityKey: `provider-model:${provider.id}`,
+              },
+            },
+            update: {},
+            create: {
+              userId,
+              label: `Provider model ${provider.id}`,
+              runtimeIdentityKey: `provider-model:${provider.id}`,
+              runtimeModel: provider.upstreamModelId,
+              hardConcurrencyLimit: provider.concurrencyLimit,
+              physicalMaxContext: provider.contextWindow,
+              countStrategy: "CONSERVATIVE_ESTIMATE",
+            },
+            select: { id: true },
+          });
+          const target = providerTargetByModelId.get(provider.id);
+          if (!target) throw new ORPCError("PRECONDITION_FAILED");
+          if (!target.inferenceCapacityId)
+            await tx.executionTarget.update({
+              where: { id: target.id },
+              data: { inferenceCapacityId: capacity.id },
+            });
+          await tx.poolMember.create({
+            data: {
+              poolId: pool.id,
+              executionTargetId: target.id,
+              tier: protection.tier,
+              publicOrder: protection.tier === "PUBLIC_OVERFLOW" ? publicOrder++ : null,
+              weight: protection.tier === "PRIMARY" ? 1 : 0,
+            },
+          });
+          const budget = await tx.providerBudgetPolicy.create({
+            data: {
+              userId,
+              scopeType: "POOL_PROVIDER_MODEL",
+              providerAccountId: provider.providerAccountId,
+              poolId: pool.id,
+              providerModelId: provider.id,
+              active: true,
+              activatedAt: now,
+              Rules: {
+                create: (() => {
+                  const rules = protection.budgetRules;
+                  if (!rules)
+                    return [
+                      {
+                        metric: "CONCURRENCY" as const,
+                        period: "PER_ATTEMPT" as const,
+                        mode: "LIMITED" as const,
+                        limitValue: new Prisma.Decimal(protection.concurrencyLimit),
+                      },
+                      {
+                        metric: "SPEND" as const,
+                        period: "UTC_DAY" as const,
+                        mode: "LIMITED" as const,
+                        limitValue: new Prisma.Decimal(protection.dailySpendLimit),
+                        currency: provider.PricingVersions[0]!.currency,
+                      },
+                    ];
+                  const rule = (
+                    metric: "CONCURRENCY" | "TOKENS" | "SPEND",
+                    period: "PER_ATTEMPT" | "UTC_DAY" | "UTC_MONTH" | "LIFETIME",
+                    value:
+                      | { mode: "UNLIMITED"; limitValue: null }
+                      | { mode: "LIMITED"; limitValue: string | number },
+                  ) => ({
+                    metric,
+                    period,
+                    mode: value.mode,
+                    limitValue:
+                      value.mode === "LIMITED" ? new Prisma.Decimal(value.limitValue) : null,
+                    currency: metric === "SPEND" ? provider.PricingVersions[0]!.currency : null,
+                  });
+                  return [
+                    rule("CONCURRENCY", "PER_ATTEMPT", rules.concurrency),
+                    rule("TOKENS", "PER_ATTEMPT", rules.tokensPerAttempt),
+                    rule("TOKENS", "UTC_DAY", rules.tokensPerDay),
+                    rule("TOKENS", "UTC_MONTH", rules.tokensPerMonth),
+                    rule("TOKENS", "LIFETIME", rules.tokensLifetime),
+                    rule("SPEND", "UTC_DAY", rules.spendPerDay),
+                    rule("SPEND", "UTC_MONTH", rules.spendPerMonth),
+                  ];
+                })(),
+              },
+            },
+            select: { id: true },
+          });
+          await tx.providerAuditEvent.create({
+            data: {
+              userId,
+              providerAccountId: provider.providerAccountId,
+              action: "BUDGET_CREATED",
+              subjectId: budget.id,
+              metadata: { source: "guarded_pool_wizard" },
+            },
+          });
+        }
+        await tx.capacityAuditEvent.create({
+          data: {
+            userId,
+            actorUserId: userId,
+            action: "CREATE",
+            resourceType: "MODEL_POOL",
+            resourceId: pool.id,
+          },
+        });
+        guardedSetupTestFailure?.();
+        const created = (await tx.modelPool.findUnique({
+          where: { id: pool.id },
+          select: poolSelect,
+        })) as ModelPoolRow | null;
+        if (!created) throw new ORPCError("INTERNAL_SERVER_ERROR");
+        return serializePool(created);
+      });
     }),
   getProfileSlug: protectedProcedure.handler(async ({ context }) => {
     const user = await currentUserSlug(context.session.user.id);
@@ -2393,7 +2412,7 @@ export const forwarderManagementRouter = {
     .handler(async ({ input, context }) => {
       await ownedPool(input.poolId, context.session.user.id);
       await ownedDiscoveredModel(input.discoveredModelId, context.session.user.id);
-      return prisma.$transaction(async (tx) => {
+      return runSerializableTransaction(async (tx) => {
         const userId = context.session.user.id;
         await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${input.poolId} AND "userId" = ${userId} FOR UPDATE`;
         const target = await tx.executionTarget.upsert({
@@ -2468,7 +2487,7 @@ export const forwarderManagementRouter = {
     )
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
-      return prisma.$transaction(async (tx) => {
+      return runSerializableTransaction(async (tx) => {
         const candidatePool = await tx.modelPool.findFirst({
           where: { id: input.poolId, userId },
           select: { id: true },
@@ -2518,6 +2537,7 @@ export const forwarderManagementRouter = {
         if (!providerModel.enabled) {
           throw new ORPCError("BAD_REQUEST", { message: "Enable the provider model first." });
         }
+        await lockExecutionTargetIdentities(tx, [`provider-model:${providerModel.id}`]);
         // Fast rejection; the same invariant is checked again after the target
         // policy fence below, which is the authoritative race-safe check.
         assertConcurrencyPolicyWithinHardLimit({
@@ -2577,6 +2597,21 @@ export const forwarderManagementRouter = {
             message: "The attachment protection policy must have an activation audit trail.",
           });
         }
+        const existingTarget = await tx.executionTarget.findUnique({
+          where: { providerModelId: input.providerModelId },
+          select: { id: true, inferenceCapacityId: true },
+        });
+        const target = await tx.executionTarget.upsert({
+          where: { providerModelId: input.providerModelId },
+          update: {},
+          create: {
+            userId,
+            kind: "PROVIDER_MODEL",
+            providerModelId: input.providerModelId,
+          },
+          select: { id: true },
+        });
+        await lockExecutionTargetPolicies(tx, [target.id]);
         const capacity = await tx.inferenceCapacity.upsert({
           where: {
             userId_runtimeIdentityKey: {
@@ -2596,22 +2631,11 @@ export const forwarderManagementRouter = {
           },
           select: { id: true },
         });
-        const existingTarget = await tx.executionTarget.findUnique({
-          where: { providerModelId: input.providerModelId },
-          select: { inferenceCapacityId: true },
-        });
-        const target = await tx.executionTarget.upsert({
-          where: { providerModelId: input.providerModelId },
-          update: existingTarget?.inferenceCapacityId ? {} : { inferenceCapacityId: capacity.id },
-          create: {
-            userId,
-            kind: "PROVIDER_MODEL",
-            providerModelId: input.providerModelId,
-            inferenceCapacityId: capacity.id,
-          },
-          select: { id: true },
-        });
-        await lockExecutionTargetPolicies(tx, [target.id]);
+        if (!existingTarget?.inferenceCapacityId)
+          await tx.executionTarget.update({
+            where: { id: target.id },
+            data: { inferenceCapacityId: capacity.id },
+          });
         await tx.$queryRaw`SELECT id FROM inference_capacity WHERE id = ${capacity.id} AND "userId" = ${userId} FOR UPDATE`;
         const [reloadedProviderModel, reloadedPool, reloadedCapacity] = await Promise.all([
           tx.providerModel.findFirst({

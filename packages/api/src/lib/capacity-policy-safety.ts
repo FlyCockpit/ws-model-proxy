@@ -18,6 +18,58 @@ export async function lockExecutionTargetPolicies(
   }
 }
 
+/**
+ * Fences target discovery/creation before a row exists. Call this before
+ * touching the execution target, then lock the target row, and only then lock
+ * or create its physical capacity. Provider-model identities use the same key
+ * in every management path.
+ */
+export async function lockExecutionTargetIdentities(
+  tx: Prisma.TransactionClient,
+  identities: readonly string[],
+): Promise<void> {
+  for (const identity of [...new Set(identities)].sort())
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${"execution-target:" + identity}, 0))`;
+}
+
+export function assertDirectCapacityPolicy(input: {
+  hardLimit: number | null | undefined;
+  concurrencyLimit: number | null | undefined;
+  reservedSlots: number | null | undefined;
+  physicalMaxContext: number | null | undefined;
+  contextCeiling: number | null | undefined;
+  contextMargin: number | null | undefined;
+}): void {
+  const reserved = input.reservedSlots ?? 0;
+  const margin = input.contextMargin ?? 0;
+  if (input.concurrencyLimit != null && reserved > input.concurrencyLimit)
+    throw new ORPCError("BAD_REQUEST", {
+      message: "Reserved slots exceed the direct concurrency limit.",
+    });
+  if (input.hardLimit != null) {
+    if (input.concurrencyLimit != null && input.concurrencyLimit > input.hardLimit)
+      throw new ORPCError("BAD_REQUEST", {
+        message: "Direct concurrency limit exceeds physical capacity.",
+      });
+    if (reserved > input.hardLimit)
+      throw new ORPCError("BAD_REQUEST", {
+        message: "Direct reserved slots exceed physical concurrency capacity.",
+      });
+  }
+  if (input.contextCeiling != null && margin >= input.contextCeiling)
+    throw new ORPCError("BAD_REQUEST", {
+      message: "Direct context margin must be smaller than the context ceiling.",
+    });
+  if (
+    input.physicalMaxContext != null &&
+    input.contextCeiling != null &&
+    input.contextCeiling + margin > input.physicalMaxContext
+  )
+    throw new ORPCError("BAD_REQUEST", {
+      message: "Direct context policy exceeds physical capacity.",
+    });
+}
+
 export function assertEffectiveConcurrencyPolicy(input: {
   hardLimit: number | null | undefined;
   poolLimit: number | null;

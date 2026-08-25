@@ -1,11 +1,35 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  assertDirectCapacityPolicy,
   assertEffectiveConcurrencyPolicy,
   assertEffectiveContextPolicy,
   lockExecutionTargetPolicies,
 } from "./capacity-policy-safety";
 
 describe("capacity policy safety", () => {
+  it("enforces direct relational invariants without physical caps", () => {
+    expect(() =>
+      assertDirectCapacityPolicy({
+        hardLimit: null,
+        concurrencyLimit: 2,
+        reservedSlots: 3,
+        physicalMaxContext: null,
+        contextCeiling: null,
+        contextMargin: 0,
+      }),
+    ).toThrow(/direct concurrency/i);
+    expect(() =>
+      assertDirectCapacityPolicy({
+        hardLimit: null,
+        concurrencyLimit: null,
+        reservedSlots: 3,
+        physicalMaxContext: null,
+        contextCeiling: 100,
+        contextMargin: 100,
+      }),
+    ).toThrow(/context margin/i);
+  });
+
   it.each([
     ["INHERIT", null, null, 4, 3, 2],
     ["LIMITED", 2, 2, 8, 1, 1],

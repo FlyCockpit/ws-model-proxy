@@ -484,11 +484,10 @@ describe("forwarderManagementRouter", () => {
     expect(db.providerAuditEvent.create).toHaveBeenCalledTimes(2);
     expect(db.capacityAuditEvent.create).toHaveBeenCalledTimes(1);
     expect(db.inferenceCapacity.upsert).toHaveBeenCalledTimes(2);
-    expect(db.executionTarget.upsert.mock.calls).toContainEqual([
-      expect.objectContaining({
-        update: expect.objectContaining({ inferenceCapacityId: "provider-capacity-id" }),
-      }),
-    ]);
+    expect(db.executionTarget.update).toHaveBeenCalledWith({
+      where: { id: expect.stringMatching(/^provider-target-/) },
+      data: { inferenceCapacityId: "provider-capacity-id" },
+    });
   });
 
   it("creates a provider-only PRIMARY pool and derives its recommended surface", async () => {

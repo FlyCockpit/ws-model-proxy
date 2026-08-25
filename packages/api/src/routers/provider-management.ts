@@ -4,7 +4,13 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
-import { lockExecutionTargetPolicies } from "../lib/capacity-policy-safety";
+import {
+  assertDirectCapacityPolicy,
+  assertEffectiveConcurrencyPolicy,
+  assertEffectiveContextPolicy,
+  lockExecutionTargetIdentities,
+  lockExecutionTargetPolicies,
+} from "../lib/capacity-policy-safety";
 import { openAiCompatibleCapabilitiesSchema } from "../lib/openai-compatible-capabilities";
 import {
   decryptProviderCredential,
@@ -16,6 +22,7 @@ import {
   redactProviderError,
   validateProviderBaseUrl,
 } from "../lib/provider-egress";
+import { runSerializableTransaction } from "../lib/serializable-transaction";
 
 const id = z.string().min(1);
 const missing = () => new ORPCError("NOT_FOUND", { message: "Not found" });
@@ -73,25 +80,26 @@ function assertProviderCapacityReductionIsSafe(
   physicalMaxContext: number | null,
   activeLeases: number,
 ): void {
+  try {
+    assertDirectCapacityPolicy({
+      hardLimit: hardConcurrencyLimit,
+      concurrencyLimit: target.directConcurrencyLimit,
+      reservedSlots: target.directReservedSlots,
+      physicalMaxContext,
+      contextCeiling: target.directContextCeiling,
+      contextMargin: target.directContextMargin,
+    });
+  } catch {
+    throw new ORPCError("PRECONDITION_FAILED", {
+      message: "Provider capacity conflicts with the direct target policy.",
+    });
+  }
   if (hardConcurrencyLimit != null) {
-    if (
-      activeLeases > hardConcurrencyLimit ||
-      target.directReservedSlots > hardConcurrencyLimit ||
-      (target.directConcurrencyLimit != null &&
-        target.directConcurrencyLimit > hardConcurrencyLimit)
-    )
+    if (activeLeases > hardConcurrencyLimit || target.directReservedSlots > hardConcurrencyLimit)
       throw new ORPCError("PRECONDITION_FAILED", {
         message: "Provider concurrency cannot be reduced below active or configured capacity.",
       });
   }
-  if (
-    physicalMaxContext != null &&
-    target.directContextCeiling != null &&
-    target.directContextCeiling + target.directContextMargin > physicalMaxContext
-  )
-    throw new ORPCError("PRECONDITION_FAILED", {
-      message: "Provider context cannot be reduced below direct target policy.",
-    });
   for (const member of target.PoolMembers) {
     const concurrencyLimit =
       member.capacityConcurrencyMode === "LIMITED"
@@ -100,14 +108,20 @@ function assertProviderCapacityReductionIsSafe(
           ? null
           : member.ModelPool.capacityConcurrencyLimit;
     const reservedSlots = member.capacityReservedSlots ?? member.ModelPool.capacityReservedSlots;
-    if (
-      hardConcurrencyLimit != null &&
-      ((concurrencyLimit != null && concurrencyLimit > hardConcurrencyLimit) ||
-        reservedSlots > hardConcurrencyLimit)
-    )
-      throw new ORPCError("PRECONDITION_FAILED", {
-        message: "Provider concurrency cannot be reduced below an attached pool policy.",
+    try {
+      assertEffectiveConcurrencyPolicy({
+        hardLimit: hardConcurrencyLimit,
+        poolLimit: member.ModelPool.capacityConcurrencyLimit,
+        poolReserved: member.ModelPool.capacityReservedSlots,
+        memberMode: member.capacityConcurrencyMode,
+        memberLimit: concurrencyLimit,
+        memberReserved: reservedSlots,
       });
+    } catch {
+      throw new ORPCError("PRECONDITION_FAILED", {
+        message: "Provider concurrency conflicts with an attached pool policy.",
+      });
+    }
     const contextCeiling =
       member.capacityContextCeilingMode === "LIMITED"
         ? member.capacityContextCeiling
@@ -115,14 +129,20 @@ function assertProviderCapacityReductionIsSafe(
           ? null
           : member.ModelPool.capacityContextCeiling;
     const contextMargin = member.capacityContextMargin ?? member.ModelPool.capacityContextMargin;
-    if (
-      physicalMaxContext != null &&
-      contextCeiling != null &&
-      contextCeiling + contextMargin > physicalMaxContext
-    )
-      throw new ORPCError("PRECONDITION_FAILED", {
-        message: "Provider context cannot be reduced below an attached pool policy.",
+    try {
+      assertEffectiveContextPolicy({
+        physicalMaxContext,
+        poolCeiling: member.ModelPool.capacityContextCeiling,
+        poolMargin: member.ModelPool.capacityContextMargin,
+        memberMode: member.capacityContextCeilingMode,
+        memberCeiling: contextCeiling,
+        memberMargin: contextMargin,
       });
+    } catch {
+      throw new ORPCError("PRECONDITION_FAILED", {
+        message: "Provider context conflicts with an attached pool policy.",
+      });
+    }
   }
 }
 const ring = () => {
@@ -620,7 +640,11 @@ export const providerManagementRouter = {
       enabled();
       const userId = context.session.user.id;
       const { id: modelId, ...data } = input;
-      return prisma.$transaction(async (tx) => {
+      return runSerializableTransaction(async (tx) => {
+        // This pre-row identity fence is always first, matching provider
+        // attachment/setup paths even when the execution target does not yet
+        // exist.
+        await lockExecutionTargetIdentities(tx, [`provider-model:${modelId}`]);
         await tx.$queryRaw`SELECT a.id FROM provider_account a WHERE a.id = (SELECT m."providerAccountId" FROM provider_model m WHERE m.id = ${modelId} AND m."userId" = ${userId}) AND a."userId" = ${userId} FOR UPDATE`;
         await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${modelId} AND "userId" = ${userId} FOR UPDATE`;
         const current = await tx.providerModel.findFirst({
@@ -734,7 +758,7 @@ export const providerManagementRouter = {
           },
         });
         return row;
-      }, providerWriteTransaction);
+      });
     }),
   deleteModel: protectedProcedure.input(z.object({ id })).handler(async ({ input, context }) => {
     enabled();

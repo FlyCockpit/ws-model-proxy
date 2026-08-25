@@ -366,7 +366,7 @@ describe("providerManagementRouter security boundary", () => {
     await expect(client.updateModel({ id: "model", enabled: true })).rejects.toMatchObject({
       code: "NOT_FOUND",
     });
-    expect(db.$queryRaw).toHaveBeenCalledTimes(2);
+    expect(db.$queryRaw).toHaveBeenCalledTimes(3);
     expect(db.providerModel.update).not.toHaveBeenCalled();
     expect(db.providerAccount.findFirst).not.toHaveBeenCalled();
   });
@@ -526,6 +526,7 @@ describe("providerManagementRouter security boundary", () => {
   it("rejects reducing provider concurrency below active database leases", async () => {
     envMock.enabled = true;
     db.$queryRaw
+      .mockResolvedValueOnce([])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([])
