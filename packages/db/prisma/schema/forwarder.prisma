@@ -71,6 +71,11 @@ enum UsageCostConfidence {
   ESTIMATED
 }
 
+enum ProviderAccountingRevisionKind {
+  SNAPSHOT
+  DELTA
+}
+
 enum ProviderAuditAction {
   ACCOUNT_CREATED
   ACCOUNT_UPDATED
@@ -596,45 +601,54 @@ model ProviderAttempt {
 /// Append-only accounting row. Application APIs expose creation only; database
 /// hardening prevents UPDATE/DELETE outside the schema maintenance role.
 model ProviderUsageLedger {
-  id                          String                     @id @default(cuid(2))
-  createdAt                   DateTime                   @default(now())
-  userId                      String
-  providerAccountId           String
-  providerModelId             String
-  credentialId                String?
-  reservationId               String?
-  poolId                      String?
-  requestId                   String
-  attemptId                   String
-  fencingToken                BigInt
-  inputTokens                 BigInt?
-  outputTokens                BigInt?
-  cacheReadTokens             BigInt?
-  cacheWriteTokens            BigInt?
-  reasoningTokens             BigInt?
-  toolTokens                  BigInt?
-  additionalBillableTokens    BigInt?
-  authoritativeBillableTokens BigInt?
-  billableTotal               BigInt?
-  categoriesComplete          Boolean?
-  rawUsage                    Json?
-  reportedCost                Decimal?                   @db.Decimal(30, 9)
-  calculatedCost              Decimal?                   @db.Decimal(30, 9)
-  settledCost                 Decimal?                   @db.Decimal(30, 9)
-  currency                    String?
-  pricingVersion              String?
-  accountingVersion           String
-  sourceVersion               String                     @default("terminal-v1")
-  usageSource                 String                     @default("terminal")
-  usageKnown                  Boolean
-  costKnown                   Boolean
-  terminalReason              String
-  confidence                  UsageCostConfidence
-  User                        User                       @relation("ProviderUsageLedgerOwner", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  ProviderAccount             ProviderAccount            @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  ProviderModel               ProviderModel              @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  Credential                  ProviderCredential?        @relation(fields: [credentialId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  Reservation                 ProviderBudgetReservation? @relation(fields: [reservationId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  id                           String                         @id @default(cuid(2))
+  createdAt                    DateTime                       @default(now())
+  userId                       String
+  providerAccountId            String
+  providerModelId              String
+  credentialId                 String?
+  reservationId                String?
+  poolId                       String?
+  requestId                    String
+  attemptId                    String
+  fencingToken                 BigInt
+  inputTokens                  BigInt?
+  outputTokens                 BigInt?
+  cacheReadTokens              BigInt?
+  cacheWriteTokens             BigInt?
+  reasoningTokens              BigInt?
+  toolTokens                   BigInt?
+  additionalBillableTokens     BigInt?
+  authoritativeBillableTokens  BigInt?
+  billableTotal                BigInt?
+  categoriesComplete           Boolean?
+  rawUsage                     Json?
+  reportedCost                 Decimal?                       @db.Decimal(30, 9)
+  reportedCostCurrency         String?
+  reportedCostPricingVersion   String?
+  reportedCostSource           String?
+  calculatedCost               Decimal?                       @db.Decimal(30, 9)
+  calculatedCostCurrency       String?
+  calculatedCostPricingVersion String?
+  calculatedCostSource         String?
+  settledCost                  Decimal?                       @db.Decimal(30, 9)
+  currency                     String?
+  pricingVersion               String?
+  accountingVersion            String
+  sourceVersion                String                         @default("terminal-v1")
+  revisionSequence             BigInt                         @default(1)
+  revisionKind                 ProviderAccountingRevisionKind @default(SNAPSHOT)
+  payloadHash                  String                         @default("legacy-pending")
+  usageSource                  String                         @default("terminal")
+  usageKnown                   Boolean
+  costKnown                    Boolean
+  terminalReason               String
+  confidence                   UsageCostConfidence
+  User                         User                           @relation("ProviderUsageLedgerOwner", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  ProviderAccount              ProviderAccount                @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  ProviderModel                ProviderModel                  @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  Credential                   ProviderCredential?            @relation(fields: [credentialId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  Reservation                  ProviderBudgetReservation?     @relation(fields: [reservationId], references: [id], onDelete: Restrict, onUpdate: Cascade)
 
   @@unique([attemptId, fencingToken, sourceVersion])
   @@index([userId, createdAt])
@@ -665,18 +679,28 @@ model ProviderPricingVersion {
 /// Append-only reconciliation entry. The unique fencing identity makes
 /// retries idempotent without rewriting historical reservations.
 model ProviderBudgetSettlement {
-  id            String                    @id @default(cuid(2))
-  createdAt     DateTime                  @default(now())
-  userId        String
-  reservationId String
-  attemptId     String
-  fencingToken  BigInt
-  sourceVersion String                    @default("terminal-v1")
-  settledValue  Decimal                   @db.Decimal(30, 9)
-  currency      String?
-  confidence    UsageCostConfidence
-  reason        String
-  Reservation   ProviderBudgetReservation @relation(fields: [reservationId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  id                String                         @id @default(cuid(2))
+  createdAt         DateTime                       @default(now())
+  userId            String
+  providerAccountId String                         @default("")
+  providerModelId   String                         @default("")
+  credentialId      String?
+  poolId            String?
+  requestId         String                         @default("")
+  reservationId     String
+  attemptId         String
+  fencingToken      BigInt
+  sourceVersion     String                         @default("terminal-v1")
+  revisionSequence  BigInt                         @default(1)
+  revisionKind      ProviderAccountingRevisionKind @default(SNAPSHOT)
+  payloadHash       String                         @default("legacy-pending")
+  accountingVersion String                         @default("")
+  pricingVersion    String?
+  settledValue      Decimal                        @db.Decimal(30, 9)
+  currency          String?
+  confidence        UsageCostConfidence
+  reason            String
+  Reservation       ProviderBudgetReservation      @relation(fields: [reservationId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
 
   @@unique([reservationId, attemptId, fencingToken, sourceVersion])
   @@index([userId, createdAt])

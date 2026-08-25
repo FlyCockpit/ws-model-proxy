@@ -735,6 +735,9 @@ try {
   // Simulate a reservation written by the immediately previous application
   // version before provider_attempt anchors existed. The next idempotent
   // hardening pass must preserve it and synthesize its durable attempt anchor.
+  await client.query(
+    `DROP TRIGGER provider_budget_reservation_graph_consistency ON provider_budget_reservation`,
+  );
   await client.query(`
     INSERT INTO provider_budget_reservation
       (id, "createdAt", "userId", "providerAccountId", "providerModelId", "policyId", "ruleId",
@@ -784,6 +787,25 @@ try {
   if (legacyAttempt.rowCount !== 1 || legacyAttempt.rows[0].requestId !== "legacy-request") {
     throw new Error("Provider attempt compatibility backfill did not preserve the legacy row");
   }
+  await expectConstraintFailure(`
+    INSERT INTO provider_usage_ledger
+      (id, "createdAt", "userId", "providerAccountId", "providerModelId", "requestId",
+       "attemptId", "fencingToken", "accountingVersion", "sourceVersion", "usageSource",
+       "revisionSequence", "revisionKind", "payloadHash", "usageKnown", "costKnown",
+       "terminalReason", confidence)
+    VALUES ('bad-ledger-anchor', NOW(), 'owner-a', 'provider-account-a', 'provider-model-a',
+      'wrong-request', 'legacy-attempt', 7, 'usage-v1', 'bad-ledger-v1', 'test', 1,
+      'SNAPSHOT', 'bad-ledger-hash', false, false, 'FAILED', 'ESTIMATED')
+  `);
+  await expectConstraintFailure(`
+    INSERT INTO provider_budget_settlement
+      (id, "createdAt", "userId", "providerAccountId", "providerModelId", "requestId",
+       "reservationId", "attemptId", "fencingToken", "sourceVersion", "revisionSequence",
+       "revisionKind", "payloadHash", "accountingVersion", "settledValue", confidence, reason)
+    VALUES ('bad-settlement-anchor', NOW(), 'owner-a', 'provider-account-c', 'provider-model-a',
+      'legacy-request', 'legacy-reservation', 'legacy-attempt', 7, 'bad-settlement-v1', 1,
+      'SNAPSHOT', 'bad-settlement-hash', 'usage-v1', 1, 'ESTIMATED', 'FAILED')
+  `);
   const racedTarget = await client.query(`
     SELECT id FROM execution_target WHERE "discoveredModelId" = 'model-during-rollout'
   `);

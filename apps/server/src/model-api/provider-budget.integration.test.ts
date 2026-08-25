@@ -37,6 +37,7 @@ integration("provider budget admission and reconciliation", () => {
         providerType: "proof",
         label: `budget-${suffix}`,
         baseUrl: "https://example.test",
+        endpointIdentity: "https://example.test",
         authType: "BEARER",
       },
     });
@@ -142,6 +143,13 @@ integration("provider budget admission and reconciliation", () => {
     await expect(
       service.admitProviderBudget({ ...original, requestId: "different" }),
     ).rejects.toThrow("conflict");
+    await service.reconcileProviderBudget({
+      ...original,
+      reason: "COMPLETED",
+      revisionSequence: 1n,
+      revisionKind: "SNAPSHOT",
+    });
+    await expect(service.admitProviderBudget(original)).rejects.toThrow("no longer replayable");
   });
 
   it("fails closed for partial token usage and appends one terminal ledger row", async () => {
@@ -155,6 +163,8 @@ integration("provider budget admission and reconciliation", () => {
     const terminal = {
       ...original,
       reason: "FAILED" as const,
+      revisionSequence: 1n,
+      revisionKind: "SNAPSHOT" as const,
       usage: {
         accountingVersion: "usage-v1",
         inputTokens: 2n,
@@ -214,6 +224,8 @@ integration("provider budget admission and reconciliation", () => {
     await service.reconcileProviderBudget({
       ...original,
       reason: "COMPLETED",
+      revisionSequence: 1n,
+      revisionKind: "SNAPSHOT",
       usage: {
         accountingVersion: "usage-v1",
         authoritativeBillableTokens: 3n,
@@ -236,11 +248,18 @@ integration("provider budget admission and reconciliation", () => {
       accountingVersion: "usage-v1",
     });
     await service.admitProviderBudget(original);
-    await service.reconcileProviderBudget({ ...original, reason: "TIMEOUT" });
+    await service.reconcileProviderBudget({
+      ...original,
+      reason: "TIMEOUT",
+      revisionSequence: 1n,
+      revisionKind: "SNAPSHOT",
+    });
     const delayed = {
       ...original,
       reason: "COMPLETED" as const,
       sourceVersion: "provider-final-v2",
+      revisionSequence: 2n,
+      revisionKind: "SNAPSHOT" as const,
       usageSource: "provider-poll",
       usage: {
         accountingVersion: "usage-v1",
@@ -276,5 +295,125 @@ integration("provider budget admission and reconciliation", () => {
       billableTotal: 3n,
       usageKnown: true,
     });
+  });
+
+  it("rejects reverse and mutated revisions while allowing ordered corrections both ways", async () => {
+    if (!db) return;
+    const row = await fixture({ metric: "TOKENS" });
+    const original = attempt(row, `ordered-${crypto.randomUUID()}`, {
+      tokens: 8n,
+      accountingVersion: "usage-v1",
+    });
+    await service.admitProviderBudget(original);
+    const revision = (sequence: bigint, total: bigint, sourceVersion: string) => ({
+      ...original,
+      reason: "COMPLETED" as const,
+      sourceVersion,
+      revisionSequence: sequence,
+      revisionKind: "SNAPSHOT" as const,
+      usage: {
+        accountingVersion: "usage-v1",
+        authoritativeBillableTokens: total,
+        confidence: "REPORTED" as const,
+      },
+    });
+    await service.reconcileProviderBudget(revision(1n, 8n, "provider-1"));
+    await service.reconcileProviderBudget(revision(3n, 3n, "provider-3"));
+    await expect(service.reconcileProviderBudget(revision(2n, 7n, "provider-2"))).rejects.toThrow(
+      "Stale",
+    );
+    await expect(service.reconcileProviderBudget(revision(3n, 4n, "provider-3"))).rejects.toThrow(
+      "conflict",
+    );
+    await service.reconcileProviderBudget(revision(4n, 6n, "provider-4"));
+    const reservation = await db.providerBudgetReservation.findFirstOrThrow({
+      where: { attemptId: original.attemptId },
+    });
+    const settlements = await db.providerBudgetSettlement.findMany({
+      where: { reservationId: reservation.id },
+      orderBy: { revisionSequence: "asc" },
+    });
+    expect(settlements.map((entry) => entry.settledValue.toString())).toEqual(["8", "-5", "3"]);
+  });
+
+  it("crash-repairs an expired no-policy attempt anchor exactly once", async () => {
+    if (!db) return;
+    const row = await fixture({ noPolicy: true });
+    const original = attempt(row, `no-policy-crash-${crypto.randomUUID()}`);
+    original.expiresAt = new Date(Date.now() + 100);
+    await service.admitProviderBudget(original);
+    await service.repairExpiredProviderBudgets(new Date(Date.now() + 1_000));
+    await service.repairExpiredProviderBudgets(new Date(Date.now() + 2_000));
+    const ledgers = await db.providerUsageLedger.findMany({
+      where: { attemptId: original.attemptId },
+    });
+    expect(ledgers).toHaveLength(1);
+    expect(ledgers[0]).toMatchObject({
+      terminalReason: "CRASH_RECOVERY",
+      revisionSequence: 0n,
+      revisionKind: "SNAPSHOT",
+      reservationId: null,
+    });
+  });
+
+  it("retains independent raw cost provenance while settling only anchor-matched pricing", async () => {
+    if (!db) return;
+    const row = await fixture({ noPolicy: true });
+    await db.providerPricingVersion.create({
+      data: {
+        userId: row.user.id,
+        providerAccountId: row.account.id,
+        providerModelId: row.model.id,
+        version: "price-v1",
+        currency: "USD",
+        pricing: { input: "1" },
+        effectiveAt: new Date(Date.now() - 1_000),
+      },
+    });
+    const original = {
+      ...attempt(row, `cost-evidence-${crypto.randomUUID()}`),
+      liability: {
+        spend: "9",
+        currency: "USD",
+        pricingVersion: "price-v1",
+        accountingVersion: "usage-v1",
+      },
+    };
+    await service.admitProviderBudget(original);
+    await service.reconcileProviderBudget({
+      ...original,
+      reason: "COMPLETED",
+      revisionSequence: 1n,
+      revisionKind: "SNAPSHOT",
+      usage: {
+        accountingVersion: "usage-v1",
+        confidence: "REPORTED",
+        reportedCost: "7",
+        reportedCostCurrency: "EUR",
+        reportedCostPricingVersion: "provider-price-v9",
+        reportedCostSource: "provider-header",
+        calculatedCost: "5",
+        calculatedCostCurrency: "USD",
+        calculatedCostPricingVersion: "price-v1",
+        calculatedCostSource: "local-price-table",
+      },
+    });
+    const ledger = await db.providerUsageLedger.findFirstOrThrow({
+      where: { attemptId: original.attemptId },
+    });
+    expect(ledger).toMatchObject({
+      reportedCostCurrency: "EUR",
+      reportedCostPricingVersion: "provider-price-v9",
+      reportedCostSource: "provider-header",
+      calculatedCostCurrency: "USD",
+      calculatedCostPricingVersion: "price-v1",
+      calculatedCostSource: "local-price-table",
+      costKnown: true,
+      currency: "USD",
+      pricingVersion: "price-v1",
+    });
+    expect(ledger.reportedCost?.toString()).toBe("7");
+    expect(ledger.calculatedCost?.toString()).toBe("5");
+    expect(ledger.settledCost?.toString()).toBe("5");
   });
 });

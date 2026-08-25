@@ -1113,6 +1113,52 @@ ALTER TABLE provider_attempt ADD CONSTRAINT provider_attempt_shape_check CHECK (
     OR ("liabilitySpend" IS NOT NULL AND "liabilityCurrency" IS NOT NULL AND "pricingVersion" IS NOT NULL))
 );
 
+-- Backfill ordered immutable revisions introduced after the first terminal-only
+-- ledger release. Arrival order is used only for legacy rows; all new writers
+-- must provide an explicit provider sequence.
+WITH ordered AS (
+  SELECT id, row_number() OVER (
+    PARTITION BY "attemptId", "fencingToken" ORDER BY "createdAt", id
+  )::bigint AS sequence
+  FROM provider_usage_ledger
+)
+UPDATE provider_usage_ledger ledger
+   SET "revisionSequence" = ordered.sequence,
+       "payloadHash" = CASE WHEN ledger."payloadHash" = 'legacy-pending'
+         THEN md5(to_jsonb(ledger)::text) ELSE ledger."payloadHash" END
+  FROM ordered
+ WHERE ordered.id = ledger.id
+   AND ledger."payloadHash" = 'legacy-pending';
+
+UPDATE provider_budget_settlement settlement
+   SET "providerAccountId" = attempt."providerAccountId",
+       "providerModelId" = attempt."providerModelId",
+       "credentialId" = attempt."credentialId",
+       "poolId" = attempt."poolId",
+       "requestId" = attempt."requestId",
+       "accountingVersion" = attempt."accountingVersion",
+       "pricingVersion" = attempt."pricingVersion",
+       "revisionSequence" = ledger."revisionSequence",
+       "revisionKind" = ledger."revisionKind",
+       "payloadHash" = CASE WHEN settlement."payloadHash" = 'legacy-pending'
+         THEN ledger."payloadHash" ELSE settlement."payloadHash" END
+  FROM provider_attempt attempt, provider_usage_ledger ledger
+ WHERE settlement."attemptId" = attempt."attemptId"
+   AND settlement."fencingToken" = attempt."fencingToken"
+   AND ledger."attemptId" = attempt."attemptId"
+   AND ledger."fencingToken" = attempt."fencingToken"
+   AND ledger."sourceVersion" = settlement."sourceVersion"
+   AND (settlement."providerAccountId" = '' OR settlement."providerModelId" = ''
+     OR settlement."requestId" = '' OR settlement."accountingVersion" = ''
+     OR settlement."payloadHash" = 'legacy-pending'
+     OR settlement."revisionSequence" IS DISTINCT FROM ledger."revisionSequence"
+     OR settlement."revisionKind" IS DISTINCT FROM ledger."revisionKind");
+
+CREATE UNIQUE INDEX IF NOT EXISTS provider_usage_ledger_attempt_revision_unique
+  ON provider_usage_ledger ("attemptId", "fencingToken", "revisionSequence");
+CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_settlement_reservation_revision_unique
+  ON provider_budget_settlement ("reservationId", "attemptId", "fencingToken", "revisionSequence");
+
 ALTER TABLE provider_usage_ledger DROP CONSTRAINT IF EXISTS provider_usage_ledger_shape_check;
 ALTER TABLE provider_usage_ledger ADD CONSTRAINT provider_usage_ledger_shape_check CHECK (
   "fencingToken" > 0 AND ("settledCost" IS NULL OR "settledCost" >= 0)
@@ -1121,7 +1167,13 @@ ALTER TABLE provider_usage_ledger ADD CONSTRAINT provider_usage_ledger_shape_che
   AND btrim("accountingVersion") <> '' AND btrim("terminalReason") <> ''
   AND (NOT "costKnown" OR ("settledCost" IS NOT NULL AND currency IS NOT NULL AND "pricingVersion" IS NOT NULL))
   AND ("reportedCost" IS NULL OR "reportedCost" >= 0)
+  AND ("reportedCostCurrency" IS NULL OR "reportedCostCurrency" ~ '^[A-Z]{3}$')
+  AND ("reportedCostPricingVersion" IS NULL OR btrim("reportedCostPricingVersion") <> '')
+  AND ("reportedCostSource" IS NULL OR btrim("reportedCostSource") <> '')
   AND ("calculatedCost" IS NULL OR "calculatedCost" >= 0)
+  AND ("calculatedCostCurrency" IS NULL OR "calculatedCostCurrency" ~ '^[A-Z]{3}$')
+  AND ("calculatedCostPricingVersion" IS NULL OR btrim("calculatedCostPricingVersion") <> '')
+  AND ("calculatedCostSource" IS NULL OR btrim("calculatedCostSource") <> '')
   AND ("inputTokens" IS NULL OR "inputTokens" >= 0)
   AND ("outputTokens" IS NULL OR "outputTokens" >= 0)
   AND ("cacheReadTokens" IS NULL OR "cacheReadTokens" >= 0)
@@ -1132,6 +1184,7 @@ ALTER TABLE provider_usage_ledger ADD CONSTRAINT provider_usage_ledger_shape_che
   AND ("authoritativeBillableTokens" IS NULL OR "authoritativeBillableTokens" >= 0)
   AND ("billableTotal" IS NULL OR "billableTotal" >= 0)
   AND btrim("sourceVersion") <> '' AND btrim("usageSource") <> ''
+  AND "revisionSequence" >= 0 AND btrim("payloadHash") <> ''
 );
 
 ALTER TABLE provider_pricing_version DROP CONSTRAINT IF EXISTS provider_pricing_version_shape_check;
@@ -1143,6 +1196,9 @@ ALTER TABLE provider_pricing_version ADD CONSTRAINT provider_pricing_version_sha
 ALTER TABLE provider_budget_settlement DROP CONSTRAINT IF EXISTS provider_budget_settlement_shape_check;
 ALTER TABLE provider_budget_settlement ADD CONSTRAINT provider_budget_settlement_shape_check CHECK (
   "fencingToken" > 0 AND btrim(reason) <> '' AND btrim("sourceVersion") <> ''
+  AND "revisionSequence" >= 0 AND btrim("payloadHash") <> ''
+  AND btrim("providerAccountId") <> '' AND btrim("providerModelId") <> ''
+  AND btrim("requestId") <> '' AND btrim("accountingVersion") <> ''
   AND (currency IS NULL OR currency ~ '^[A-Z]{3}$')
 );
 
@@ -1331,10 +1387,14 @@ BEGIN
       AND m."userId" = NEW."userId" AND m."providerAccountId" = NEW."providerAccountId") THEN
       RAISE EXCEPTION 'provider attempt model must match provider account' USING ERRCODE = '23514';
     END IF;
-    IF NEW."credentialId" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM provider_credential c
-      WHERE c.id = NEW."credentialId" AND c."userId" = NEW."userId"
-        AND c."providerAccountId" = NEW."providerAccountId") THEN
+    IF NEW."credentialId" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM provider_credential credential
+      WHERE credential.id = NEW."credentialId" AND credential."userId" = NEW."userId"
+        AND credential."providerAccountId" = NEW."providerAccountId") THEN
       RAISE EXCEPTION 'provider attempt credential is inconsistent' USING ERRCODE = '23514';
+    END IF;
+    IF NEW."poolId" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM model_pool mp
+      WHERE mp.id = NEW."poolId" AND mp."userId" = NEW."userId") THEN
+      RAISE EXCEPTION 'provider attempt pool owner is inconsistent' USING ERRCODE = '23514';
     END IF;
     IF NEW."pricingVersion" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM provider_pricing_version pv
       WHERE pv."providerModelId" = NEW."providerModelId" AND pv.version = NEW."pricingVersion"
@@ -1351,8 +1411,9 @@ BEGIN
        OR r.currency IS DISTINCT FROM NEW.currency
        OR p."providerAccountId" <> NEW."providerAccountId"
        OR NEW."providerModelId" = ''
-       OR p."poolId" IS DISTINCT FROM NEW."poolId"
-       OR (p."providerModelId" IS NOT NULL AND p."providerModelId" <> NEW."providerModelId") THEN
+       OR (p."scopeType" = 'POOL_PROVIDER_MODEL'
+         AND (p."poolId" IS DISTINCT FROM NEW."poolId"
+           OR p."providerModelId" IS DISTINCT FROM NEW."providerModelId")) THEN
       RAISE EXCEPTION 'budget reservation must match its policy version and rule' USING ERRCODE = '23514';
     END IF;
     IF NEW."credentialId" IS NOT NULL THEN
@@ -1364,6 +1425,17 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM provider_model m WHERE m.id = NEW."providerModelId"
       AND m."userId" = NEW."userId" AND m."providerAccountId" = NEW."providerAccountId") THEN
       RAISE EXCEPTION 'budget reservation model must match provider account' USING ERRCODE = '23514';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM provider_attempt a
+      WHERE a."attemptId" = NEW."attemptId" AND a."fencingToken" = NEW."fencingToken"
+        AND (a."userId", a."providerAccountId", a."providerModelId", a."credentialId",
+             a."poolId", a."requestId", a."accountingVersion", a."pricingVersion",
+             a."liabilityTokens", a."liabilitySpend", a."liabilityCurrency")
+          IS NOT DISTINCT FROM
+            (NEW."userId", NEW."providerAccountId", NEW."providerModelId", NEW."credentialId",
+             NEW."poolId", NEW."requestId", NEW."accountingVersion", NEW."pricingVersion",
+             NEW."liabilityTokens", NEW."liabilitySpend", NEW."liabilityCurrency")) THEN
+      RAISE EXCEPTION 'budget reservation must match its provider attempt anchor' USING ERRCODE = '23514';
     END IF;
     IF EXISTS (SELECT 1 FROM provider_budget_reservation existing
       WHERE existing."attemptId" = NEW."attemptId" AND existing.id <> NEW.id
@@ -1384,6 +1456,15 @@ BEGIN
       RAISE EXCEPTION 'pricing model must match provider account' USING ERRCODE = '23514';
     END IF;
   ELSIF TG_TABLE_NAME = 'provider_usage_ledger' THEN
+    IF NOT EXISTS (SELECT 1 FROM provider_attempt a
+      WHERE a."attemptId" = NEW."attemptId" AND a."fencingToken" = NEW."fencingToken"
+        AND (a."userId", a."providerAccountId", a."providerModelId", a."credentialId",
+             a."poolId", a."requestId", a."accountingVersion", a."pricingVersion")
+          IS NOT DISTINCT FROM
+            (NEW."userId", NEW."providerAccountId", NEW."providerModelId", NEW."credentialId",
+             NEW."poolId", NEW."requestId", NEW."accountingVersion", NEW."pricingVersion")) THEN
+      RAISE EXCEPTION 'usage ledger must match its provider attempt anchor' USING ERRCODE = '23514';
+    END IF;
     IF NOT EXISTS (SELECT 1 FROM provider_model m WHERE m.id = NEW."providerModelId"
       AND m."userId" = NEW."userId" AND m."providerAccountId" = NEW."providerAccountId")
       OR (NEW."pricingVersion" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM provider_pricing_version pv
@@ -1392,9 +1473,9 @@ BEGIN
           AND pv."providerAccountId" = NEW."providerAccountId" AND pv."userId" = NEW."userId")) THEN
       RAISE EXCEPTION 'usage ledger provider and pricing graph is inconsistent' USING ERRCODE = '23514';
     END IF;
-    IF NEW."credentialId" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM provider_credential c
-      WHERE c.id = NEW."credentialId" AND c."userId" = NEW."userId"
-        AND c."providerAccountId" = NEW."providerAccountId") THEN
+    IF NEW."credentialId" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM provider_credential credential
+      WHERE credential.id = NEW."credentialId" AND credential."userId" = NEW."userId"
+        AND credential."providerAccountId" = NEW."providerAccountId") THEN
       RAISE EXCEPTION 'usage ledger credential is inconsistent' USING ERRCODE = '23514';
     END IF;
     IF NEW."reservationId" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM provider_budget_reservation br
@@ -1414,6 +1495,15 @@ BEGIN
       AND br."userId" = NEW."userId" AND br."attemptId" = NEW."attemptId"
       AND br."fencingToken" = NEW."fencingToken" AND br.currency IS NOT DISTINCT FROM NEW.currency) THEN
       RAISE EXCEPTION 'budget settlement must match its reservation identity' USING ERRCODE = '23514';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM provider_attempt a
+      WHERE a."attemptId" = NEW."attemptId" AND a."fencingToken" = NEW."fencingToken"
+        AND (a."userId", a."providerAccountId", a."providerModelId", a."credentialId",
+             a."poolId", a."requestId", a."accountingVersion", a."pricingVersion")
+          IS NOT DISTINCT FROM
+            (NEW."userId", NEW."providerAccountId", NEW."providerModelId", NEW."credentialId",
+             NEW."poolId", NEW."requestId", NEW."accountingVersion", NEW."pricingVersion")) THEN
+      RAISE EXCEPTION 'budget settlement must match its provider attempt anchor' USING ERRCODE = '23514';
     END IF;
   ELSIF TG_TABLE_NAME = 'provider_audit_event' AND NEW."providerAccountId" IS NOT NULL THEN
     IF NOT EXISTS (SELECT 1 FROM provider_account a WHERE a.id = NEW."providerAccountId" AND a."userId" = NEW."userId") THEN

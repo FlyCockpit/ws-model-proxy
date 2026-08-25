@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import {
   budgetWindow,
@@ -61,7 +62,13 @@ export interface RawProviderUsage extends ProviderTokenUsage {
   rawUsage?: Prisma.InputJsonValue;
   /** A provider total may be supplied only when it does not include the categories above. */
   reportedCost?: string | number | Prisma.Decimal;
+  reportedCostCurrency?: string;
+  reportedCostPricingVersion?: string;
+  reportedCostSource?: string;
   calculatedCost?: string | number | Prisma.Decimal;
+  calculatedCostCurrency?: string;
+  calculatedCostPricingVersion?: string;
+  calculatedCostSource?: string;
   currency?: string;
   pricingVersion?: string;
   accountingVersion: string;
@@ -80,6 +87,10 @@ export interface ProviderBudgetTerminal {
   reason: "COMPLETED" | "FAILED" | "CANCELLED" | "TIMEOUT" | "CRASH_RECOVERY";
   /** Stable upstream usage revision identity. Duplicate delivery is idempotent. */
   sourceVersion?: string;
+  /** Provider-scoped, strictly increasing sequence for this attempt. */
+  revisionSequence: bigint;
+  /** SNAPSHOT replaces the known total; DELTA adds newly reported usage. */
+  revisionKind: "SNAPSHOT" | "DELTA";
   usageSource?: string;
   usage?: RawProviderUsage;
 }
@@ -132,6 +143,36 @@ function assertUsage(usage: RawProviderUsage | undefined): void {
   normalizedVersion(usage.accountingVersion, "accountingVersion");
   if (usage.pricingVersion !== undefined) normalizedVersion(usage.pricingVersion, "pricingVersion");
   normalizedCurrency(usage.currency);
+  normalizedCurrency(usage.reportedCostCurrency);
+  normalizedCurrency(usage.calculatedCostCurrency);
+  if (usage.reportedCostPricingVersion !== undefined)
+    normalizedVersion(usage.reportedCostPricingVersion, "reportedCostPricingVersion");
+  if (usage.calculatedCostPricingVersion !== undefined)
+    normalizedVersion(usage.calculatedCostPricingVersion, "calculatedCostPricingVersion");
+  if (usage.reportedCostSource !== undefined)
+    normalizedVersion(usage.reportedCostSource, "reportedCostSource");
+  if (usage.calculatedCostSource !== undefined)
+    normalizedVersion(usage.calculatedCostSource, "calculatedCostSource");
+}
+
+function canonicalPayloadHash(value: unknown): string {
+  function normalize(input: unknown): unknown {
+    if (typeof input === "bigint") return input.toString();
+    if (input instanceof Prisma.Decimal) return input.toString();
+    if (input instanceof Date) return input.toISOString();
+    if (Array.isArray(input)) return input.map(normalize);
+    if (input && typeof input === "object")
+      return Object.fromEntries(
+        Object.entries(input as Record<string, unknown>)
+          .filter(([, item]) => item !== undefined)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([key, item]) => [key, normalize(item)]),
+      );
+    return input;
+  }
+  return createHash("sha256")
+    .update(JSON.stringify(normalize(value)))
+    .digest("hex");
 }
 
 function reservationValue(
@@ -259,8 +300,31 @@ export async function admitProviderBudget(
       const replay = await tx.providerBudgetReservation.findMany({
         where: { attemptId: attempt.attemptId, fencingToken: attempt.fencingToken },
         orderBy: { id: "asc" },
-        select: { id: true },
+        select: { id: true, policyId: true, ruleId: true, state: true, expiresAt: true },
       });
+      const expectedRules = new Set(
+        policies.flatMap((policy) =>
+          policy.Rules.filter((rule) => rule.mode === "LIMITED").map(
+            (rule) => `${policy.id}:${rule.id}`,
+          ),
+        ),
+      );
+      const hasTerminal = await tx.providerUsageLedger.count({
+        where: { attemptId: attempt.attemptId, fencingToken: attempt.fencingToken },
+      });
+      const completeLiveReservedSet =
+        attemptAnchor.expiresAt.getTime() > now.getTime() &&
+        hasTerminal === 0 &&
+        replay.length === expectedRules.size &&
+        replay.every(
+          (row) =>
+            row.state === "RESERVED" &&
+            row.expiresAt !== null &&
+            row.expiresAt.getTime() > now.getTime() &&
+            expectedRules.has(`${row.policyId}:${row.ruleId}`),
+        );
+      if (!completeLiveReservedSet)
+        throw new ProviderBudgetConfigurationError("Provider attempt is no longer replayable");
       return { admitted: true, reservationIds: replay.map(({ id }) => id) };
     }
     if (attempt.expiresAt.getTime() <= now.getTime())
@@ -501,7 +565,7 @@ export async function admitProviderBudget(
       });
       ids.push(row.id);
     }
-    return { admitted: true, reservationIds: ids };
+    return { admitted: true, reservationIds: ids.sort() };
   });
 }
 
@@ -518,7 +582,12 @@ function terminalValue(metric: BudgetMetric, usage: RawProviderUsage | undefined
 
 /** Append one immutable accounting revision. Duplicate source revisions are safe. */
 export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal): Promise<void> {
-  if (terminal.fencingToken <= 0n || terminal.fencingToken > MAX_SIGNED_BIGINT)
+  if (
+    terminal.fencingToken <= 0n ||
+    terminal.fencingToken > MAX_SIGNED_BIGINT ||
+    terminal.revisionSequence < 0n ||
+    terminal.revisionSequence > MAX_SIGNED_BIGINT
+  )
     throw new ProviderBudgetConfigurationError("Invalid fencing token");
   assertUsage(terminal.usage);
   const sourceVersion = normalizedVersion(
@@ -530,6 +599,11 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
     terminal.usageSource ?? (terminal.reason === "CRASH_RECOVERY" ? "crash-repair" : "terminal"),
     "usageSource",
   );
+  const payloadHash = canonicalPayloadHash({
+    ...terminal,
+    sourceVersion,
+    usageSource,
+  });
   await serializable(async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-attempt:${terminal.attemptId}`}, 0))`;
     const anchor = await tx.providerAttempt.findUnique({
@@ -559,17 +633,27 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
           sourceVersion,
         },
       },
-      select: { id: true },
+      select: { payloadHash: true, revisionSequence: true, revisionKind: true },
     });
-    if (priorRevision) return;
+    if (priorRevision) {
+      if (
+        priorRevision.payloadHash !== payloadHash ||
+        priorRevision.revisionSequence !== terminal.revisionSequence ||
+        priorRevision.revisionKind !== terminal.revisionKind
+      )
+        throw new ProviderBudgetConfigurationError("Accounting source revision conflict");
+      return;
+    }
     const previousLedgers = await tx.providerUsageLedger.findMany({
       where: { attemptId: terminal.attemptId, fencingToken: terminal.fencingToken },
-      orderBy: { createdAt: "desc" },
-      select: { id: true },
+      orderBy: { revisionSequence: "desc" },
+      select: { revisionSequence: true },
     });
     // A completed terminal observation always wins a crash sweep that selected
     // the row just before the terminal transaction committed.
     if (terminal.reason === "CRASH_RECOVERY" && previousLedgers.length > 0) return;
+    if (previousLedgers[0] && terminal.revisionSequence <= previousLedgers[0].revisionSequence)
+      throw new ProviderBudgetConfigurationError("Stale accounting revision");
 
     const reservations = await tx.providerBudgetReservation.findMany({
       where: {
@@ -585,14 +669,32 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
     const usage = terminal.usage;
     const billableTotal = usage && providerBillableTokens(usage);
     const accountingMatches = usage?.accountingVersion.trim() === anchor.accountingVersion;
-    const pricingMatches = Boolean(
-      anchor.pricingVersion &&
+    const reportedCurrency = normalizedCurrency(usage?.reportedCostCurrency ?? usage?.currency);
+    const reportedPricingVersion =
+      usage?.reportedCostPricingVersion?.trim() ?? usage?.pricingVersion?.trim();
+    const calculatedCurrency = normalizedCurrency(usage?.calculatedCostCurrency ?? usage?.currency);
+    const calculatedPricingVersion =
+      usage?.calculatedCostPricingVersion?.trim() ?? usage?.pricingVersion?.trim();
+    const reportedMatches = Boolean(
+      usage?.reportedCost !== undefined &&
+        anchor.pricingVersion &&
         anchor.liabilityCurrency &&
-        usage?.pricingVersion?.trim() === anchor.pricingVersion &&
-        normalizedCurrency(usage?.currency) === anchor.liabilityCurrency,
+        reportedPricingVersion === anchor.pricingVersion &&
+        reportedCurrency === anchor.liabilityCurrency,
     );
-    const suppliedCost = usage?.reportedCost ?? usage?.calculatedCost;
-    const costKnown = suppliedCost !== undefined && pricingMatches;
+    const calculatedMatches = Boolean(
+      usage?.calculatedCost !== undefined &&
+        anchor.pricingVersion &&
+        anchor.liabilityCurrency &&
+        calculatedPricingVersion === anchor.pricingVersion &&
+        calculatedCurrency === anchor.liabilityCurrency,
+    );
+    const suppliedCost = reportedMatches
+      ? usage?.reportedCost
+      : calculatedMatches
+        ? usage?.calculatedCost
+        : undefined;
+    const costKnown = suppliedCost !== undefined;
     const settledCost = costKnown ? decimal(suppliedCost) : null;
 
     for (const reservation of reservations) {
@@ -600,21 +702,44 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
         reservation.metric === "CONCURRENCY" ||
         (reservation.metric === "TOKENS" && accountingMatches && billableTotal !== undefined) ||
         (reservation.metric === "SPEND" && costKnown);
-      const desiredTotal = trustworthy
-        ? terminalValue(reservation.metric, usage)
-        : reservation.reservedValue;
       const prior = await tx.providerBudgetSettlement.aggregate({
         where: { reservationId: reservation.id },
         _sum: { settledValue: true },
       });
-      const delta = desiredTotal.minus(prior._sum.settledValue ?? 0);
+      const priorTotal = prior._sum.settledValue ?? new Prisma.Decimal(0);
+      const observation = trustworthy
+        ? reservation.metric === "SPEND" && settledCost
+          ? settledCost
+          : terminalValue(reservation.metric, usage)
+        : reservation.reservedValue;
+      const delta =
+        terminal.revisionKind === "SNAPSHOT"
+          ? observation.minus(priorTotal)
+          : trustworthy
+            ? observation
+            : priorTotal.lessThan(reservation.reservedValue)
+              ? reservation.reservedValue.minus(priorTotal)
+              : new Prisma.Decimal(0);
+      const desiredTotal = priorTotal.plus(delta);
+      if (desiredTotal.isNegative())
+        throw new ProviderBudgetConfigurationError("Accounting correction underflows zero");
       await tx.providerBudgetSettlement.create({
         data: {
           userId: terminal.userId,
+          providerAccountId: anchor.providerAccountId,
+          providerModelId: anchor.providerModelId,
+          credentialId: anchor.credentialId,
+          poolId: anchor.poolId,
+          requestId: anchor.requestId,
           reservationId: reservation.id,
           attemptId: terminal.attemptId,
           fencingToken: terminal.fencingToken,
           sourceVersion,
+          revisionSequence: terminal.revisionSequence,
+          revisionKind: terminal.revisionKind,
+          payloadHash,
+          accountingVersion: anchor.accountingVersion,
+          pricingVersion: anchor.pricingVersion,
           settledValue: delta,
           currency: reservation.metric === "SPEND" ? reservation.currency : null,
           confidence: trustworthy ? (usage?.confidence ?? "ESTIMATED") : "ESTIMATED",
@@ -650,19 +775,32 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
         billableTotal: accountingMatches ? billableTotal : undefined,
         categoriesComplete: usage?.categoriesComplete,
         rawUsage: usage?.rawUsage,
-        reportedCost: pricingMatches ? usage?.reportedCost : undefined,
-        calculatedCost: pricingMatches ? usage?.calculatedCost : undefined,
+        reportedCost: usage?.reportedCost,
+        reportedCostCurrency: reportedCurrency,
+        reportedCostPricingVersion: reportedPricingVersion,
+        reportedCostSource:
+          usage?.reportedCost === undefined ? undefined : (usage.reportedCostSource ?? usageSource),
+        calculatedCost: usage?.calculatedCost,
+        calculatedCostCurrency: calculatedCurrency,
+        calculatedCostPricingVersion: calculatedPricingVersion,
+        calculatedCostSource:
+          usage?.calculatedCost === undefined
+            ? undefined
+            : (usage.calculatedCostSource ?? usageSource),
         settledCost,
         currency: anchor.liabilityCurrency,
         pricingVersion: anchor.pricingVersion,
         accountingVersion: anchor.accountingVersion,
         sourceVersion,
+        revisionSequence: terminal.revisionSequence,
+        revisionKind: terminal.revisionKind,
+        payloadHash,
         usageSource,
         usageKnown: Boolean(accountingMatches && billableTotal !== undefined),
         costKnown,
         terminalReason: terminal.reason,
         confidence:
-          accountingMatches && (suppliedCost === undefined || pricingMatches)
+          accountingMatches && (suppliedCost === undefined || costKnown)
             ? (usage?.confidence ?? "ESTIMATED")
             : "ESTIMATED",
       },
@@ -674,20 +812,26 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
 export async function repairExpiredProviderBudgets(now = new Date()): Promise<number> {
   if (!Number.isFinite(now.getTime()))
     throw new ProviderBudgetConfigurationError("Invalid repair date");
-  const expired = await prisma.providerBudgetReservation.findMany({
-    where: { state: "RESERVED", expiresAt: { lte: now } },
-    select: {
-      userId: true,
-      providerAccountId: true,
-      providerModelId: true,
-      credentialId: true,
-      poolId: true,
-      requestId: true,
-      attemptId: true,
-      fencingToken: true,
-    },
-    distinct: ["attemptId", "fencingToken"],
-  });
+  const expired = await prisma.$queryRaw<
+    Array<{
+      userId: string;
+      providerAccountId: string;
+      providerModelId: string;
+      credentialId: string | null;
+      poolId: string | null;
+      requestId: string;
+      attemptId: string;
+      fencingToken: bigint;
+    }>
+  >`SELECT a."userId", a."providerAccountId", a."providerModelId", a."credentialId",
+           a."poolId", a."requestId", a."attemptId", a."fencingToken"
+      FROM provider_attempt a
+     WHERE a."expiresAt" <= ${now}
+       AND NOT EXISTS (
+         SELECT 1 FROM provider_usage_ledger l
+          WHERE l."attemptId" = a."attemptId" AND l."fencingToken" = a."fencingToken"
+       )
+     ORDER BY a."attemptId"`;
   for (const row of expired) {
     await reconcileProviderBudget({
       userId: row.userId,
@@ -699,6 +843,8 @@ export async function repairExpiredProviderBudgets(now = new Date()): Promise<nu
       attemptId: row.attemptId,
       fencingToken: row.fencingToken,
       reason: "CRASH_RECOVERY",
+      revisionSequence: 0n,
+      revisionKind: "SNAPSHOT",
     });
   }
   return expired.length;
