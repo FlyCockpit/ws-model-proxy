@@ -4,6 +4,10 @@ import { describe, expect, it, vi } from "vitest";
 import { PRIORITY_CLASS_COUNT, scheduleWeightedDeficitRoundRobin } from "./scheduler.js";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
+if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
+  throw new Error(
+    "PostgreSQL integration was required but SCHEMA_VALIDATION_DATABASE_URL is unset.",
+  );
 const integration = databaseUrl ? describe : describe.skip;
 
 if (!databaseUrl)
