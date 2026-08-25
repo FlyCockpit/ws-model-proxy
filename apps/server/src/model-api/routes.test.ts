@@ -56,6 +56,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     MODEL_API_TRANSCRIPTION_MIN_FREE_BYTES: 0,
     MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS: 30_000,
     MODEL_API_ANTHROPIC_ENABLED: true,
+    WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
   },
 }));
 
@@ -466,6 +467,29 @@ function appWith(
   });
 }
 
+function admittingCapacityRuntime(): CapacityAdmissionRuntime {
+  return {
+    acquire: vi.fn(async (attempt) => {
+      const selected = attempt.candidates[0];
+      if (!selected) return { state: "CANCELLED" as const };
+      return {
+        state: "ADMITTED" as const,
+        lease: {
+          leaseId: `lease-${selected.poolMemberId ?? selected.executionTargetId}`,
+          attemptId: attempt.attemptId,
+          capacityId: selected.capacityId,
+          executionTargetId: selected.executionTargetId,
+          poolMemberId: selected.poolMemberId,
+          fencingToken: 1n,
+          expiresAt: new Date(Date.now() + 30_000),
+        },
+      };
+    }),
+    release: vi.fn(async () => true),
+    hold: vi.fn((response) => response),
+  };
+}
+
 function requestBody(model = directTarget.modelId) {
   return JSON.stringify({
     model,
@@ -713,7 +737,7 @@ describe("model API routes", () => {
     );
     // Provider-backed and local primaries are discovered before scoring, but
     // successful PRIMARY execution never inspects PUBLIC_OVERFLOW members.
-    expect(publicOverflow.list).toHaveBeenCalledWith("user-id", poolTarget.id, "PRIMARY");
+    expect(publicOverflow.list).not.toHaveBeenCalled();
     expect(publicOverflow.dispatch).not.toHaveBeenCalled();
   });
 
@@ -3342,9 +3366,9 @@ describe("model API routes", () => {
       modelPools: [poolTarget],
     });
     db.poolMember.findMany.mockResolvedValue([]);
-    publicOverflow.list.mockResolvedValueOnce({
-      enabled: false,
-      acknowledged: false,
+    publicOverflow.list.mockResolvedValue({
+      enabled: true,
+      acknowledged: true,
       affinityPolicy: {
         enabled: false,
         ttlSeconds: 3600,
@@ -3384,7 +3408,12 @@ describe("model API routes", () => {
       affinity: undefined,
     });
 
-    const response = await appWith(new FakeRelayManager()).request("/chat/completions", {
+    const response = await appWith(
+      new FakeRelayManager(),
+      true,
+      false,
+      admittingCapacityRuntime(),
+    ).request("/chat/completions", {
       method: "POST",
       headers: {
         authorization: "Bearer wsmp_model_test",
@@ -3414,9 +3443,9 @@ describe("model API routes", () => {
       modelPools: [poolTarget],
     });
     db.poolMember.findMany.mockResolvedValue([]);
-    publicOverflow.list.mockResolvedValueOnce({
+    publicOverflow.list.mockResolvedValue({
       enabled: false,
-      acknowledged: false,
+      acknowledged: true,
       affinityPolicy: {
         enabled: true,
         ttlSeconds: 3600,
@@ -3452,7 +3481,12 @@ describe("model API routes", () => {
       affinity: undefined,
     });
 
-    const response = await appWith(new FakeRelayManager()).request("/chat/completions", {
+    const response = await appWith(
+      new FakeRelayManager(),
+      true,
+      false,
+      admittingCapacityRuntime(),
+    ).request("/chat/completions", {
       method: "POST",
       headers: {
         authorization: "Bearer wsmp_model_test",
@@ -3482,6 +3516,38 @@ describe("model API routes", () => {
     );
   });
 
+  it("fails provider-backed routing closed when durable global capacity is unavailable", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([]);
+    publicOverflow.list.mockResolvedValue({
+      enabled: false,
+      acknowledged: true,
+      affinityPolicy: {
+        enabled: false,
+        ttlSeconds: 3600,
+        maxRecords: 10_000,
+        prefixWeight: 100,
+        conversationWeight: 150,
+        confirmedCacheWeight: 250,
+        loadPenaltyWeight: 100,
+      },
+      targets: [providerPrimaryTarget()],
+    });
+
+    const response = await appWith(new FakeRelayManager()).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(poolTarget.modelId),
+    });
+
+    expect(response.status).toBe(400);
+    expect(publicOverflow.list).not.toHaveBeenCalled();
+    expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+  });
+
   it("re-admits remaining provider overflow members after a retry-safe precommit failure", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
@@ -3493,7 +3559,7 @@ describe("model API routes", () => {
     publicOverflow.list.mockImplementation(
       async (_userId: string, _poolId: string, tier: "PRIMARY" | "PUBLIC_OVERFLOW") => ({
         enabled: tier === "PUBLIC_OVERFLOW",
-        acknowledged: tier === "PUBLIC_OVERFLOW",
+        acknowledged: true,
         affinityPolicy: {
           enabled: false,
           ttlSeconds: 3600,
@@ -3580,7 +3646,7 @@ describe("model API routes", () => {
     publicOverflow.list.mockImplementation(
       async (_userId: string, _poolId: string, tier: "PRIMARY" | "PUBLIC_OVERFLOW") => ({
         enabled: tier === "PUBLIC_OVERFLOW",
-        acknowledged: tier === "PUBLIC_OVERFLOW",
+        acknowledged: true,
         affinityPolicy: {
           enabled: false,
           ttlSeconds: 3600,
@@ -3664,7 +3730,7 @@ describe("model API routes", () => {
     const provider = { ...providerPrimaryTarget(), weight: 5 };
     publicOverflow.list.mockResolvedValue({
       enabled: false,
-      acknowledged: false,
+      acknowledged: true,
       affinityPolicy: {
         enabled: true,
         ttlSeconds: 3600,
@@ -3766,7 +3832,7 @@ describe("model API routes", () => {
     const provider = providerPrimaryTarget();
     publicOverflow.list.mockResolvedValue({
       enabled: false,
-      acknowledged: false,
+      acknowledged: true,
       affinityPolicy: {
         enabled: false,
         ttlSeconds: 3600,
@@ -3875,7 +3941,7 @@ describe("model API routes", () => {
       };
       publicOverflow.list.mockResolvedValue({
         enabled: false,
-        acknowledged: false,
+        acknowledged: true,
         affinityPolicy: {
           enabled: true,
           ttlSeconds: 3600,
@@ -4695,14 +4761,42 @@ describe("model API routes", () => {
     });
     db.poolMember.findMany.mockResolvedValue([]);
     const providerTarget = {
-      poolMemberId: "provider-member",
+      ...providerPrimaryTarget("provider-member"),
       executionTargetId: "provider-target",
       providerAccountId: "provider-account",
       providerModelId: "provider-model",
       endpointIdentity: "https://provider.example/v1",
       endpointVersion: 4,
       upstreamModelId: "gpt-response",
+      nativeSurfaces: ["openai-responses" as const],
+      capabilityInventory: {
+        version: 3 as const,
+        protocol: "openai-compatible" as const,
+        surfaces: {
+          openaiResponses: {
+            source: "provider" as const,
+            confidence: "exact" as const,
+            supported: true,
+            streaming: true,
+          },
+        },
+      },
     };
+    publicOverflow.list.mockResolvedValue({
+      enabled: false,
+      acknowledged: true,
+      affinityPolicy: {
+        enabled: false,
+        ttlSeconds: 3600,
+        maxRecords: 10_000,
+        prefixWeight: 100,
+        conversationWeight: 150,
+        confirmedCacheWeight: 250,
+        loadPenaltyWeight: 100,
+      },
+      targets: [providerTarget],
+    });
+    const capacityRuntime = admittingCapacityRuntime();
     publicOverflow.dispatch.mockResolvedValueOnce({
       dispatched: true,
       response: new Response(JSON.stringify({ id: "resp_provider", object: "response" }), {
@@ -4718,14 +4812,17 @@ describe("model API routes", () => {
       markFirstClientByte: vi.fn().mockResolvedValue(undefined),
       affinity: undefined,
     });
-    const create = await appWith(new FakeRelayManager()).request("/responses", {
-      method: "POST",
-      headers: {
-        authorization: "Bearer wsmp_model_test",
-        "content-type": "application/json",
+    const create = await appWith(new FakeRelayManager(), true, false, capacityRuntime).request(
+      "/responses",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ model: poolTarget.modelId, input: "hello", store: true }),
       },
-      body: JSON.stringify({ model: poolTarget.modelId, input: "hello", store: true }),
-    });
+    );
     expect(create.status).toBe(200);
     await expect(create.json()).resolves.toMatchObject({ id: "resp_provider" });
     await vi.waitFor(() => expect(db.responseStickinessRecord.upsert).toHaveBeenCalled());
@@ -4771,7 +4868,7 @@ describe("model API routes", () => {
       markFirstClientByte: vi.fn().mockResolvedValue(undefined),
       affinity: undefined,
     });
-    const retrieve = await appWith(new FakeRelayManager()).request(
+    const retrieve = await appWith(new FakeRelayManager(), true, false, capacityRuntime).request(
       "/responses/resp_provider?include[]=output",
       { headers: { authorization: "Bearer wsmp_model_test" } },
     );
@@ -5114,9 +5211,12 @@ describe("model API routes", () => {
       expiresAt: new Date(Date.now() + 60_000),
     });
     const manager = new FakeRelayManager();
-    const response = await appWith(manager).request("/responses/resp_provider", {
-      headers: { authorization: "Bearer wsmp_model_test" },
-    });
+    const response = await appWith(manager, true, false, admittingCapacityRuntime()).request(
+      "/responses/resp_provider",
+      {
+        headers: { authorization: "Bearer wsmp_model_test" },
+      },
+    );
     expect(response.status).toBe(404);
     expect(manager.sent).toEqual([]);
     expect(affinity.rank).not.toHaveBeenCalled();

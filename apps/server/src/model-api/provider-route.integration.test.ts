@@ -111,7 +111,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     process.env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS = `route-v1:${Buffer.alloc(32, 19).toString("base64")}`;
     process.env.MODEL_API_ANTHROPIC_ENABLED = "true";
     process.env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = "true";
-    process.env.MODEL_API_GLOBAL_CAPACITY_ENABLED = "false";
+    process.env.MODEL_API_GLOBAL_CAPACITY_ENABLED = "true";
     const [prismaModule, security, routes, chatTest, identifiers, credentials, protocols] =
       await Promise.all([
         import("@ws-model-proxy/db"),
@@ -379,12 +379,14 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         name: "Provider route pool",
         protocolAdaptationEnabled: true,
         publicEgressEnabled: !input.privatePool,
-        publicEgressAcknowledged: !input.privatePool,
+        // Provider PRIMARY is still external egress even when overflow is
+        // disabled, so a private pool retains explicit owner consent.
+        publicEgressAcknowledged: true,
       },
     });
     expect(pool).toMatchObject({
       publicEgressEnabled: !input.privatePool,
-      publicEgressAcknowledged: !input.privatePool,
+      publicEgressAcknowledged: true,
     });
     const grant = input.grantee
       ? await modules.prisma.poolGrant.create({
@@ -472,8 +474,24 @@ integration("provider dispatch routes with real PostgreSQL", () => {
             },
       },
     });
+    const capacity = await modules.prisma.inferenceCapacity.create({
+      data: {
+        userId: user.id,
+        label: `Provider route ${suffix}`,
+        runtimeIdentityKey: `provider-route:${model.id}`,
+        runtimeModel: model.upstreamModelId,
+        hardConcurrencyLimit: model.concurrencyLimit,
+        physicalMaxContext: model.contextWindow,
+        countStrategy: "CONSERVATIVE_ESTIMATE",
+      },
+    });
     const target = await modules.prisma.executionTarget.create({
-      data: { userId: user.id, kind: "PROVIDER_MODEL", providerModelId: model.id },
+      data: {
+        userId: user.id,
+        kind: "PROVIDER_MODEL",
+        providerModelId: model.id,
+        inferenceCapacityId: capacity.id,
+      },
     });
     const primaryMember = await modules.prisma.poolMember.create({
       data: {
@@ -601,8 +619,24 @@ integration("provider dispatch routes with real PostgreSQL", () => {
           },
         },
       });
+      const secondCapacity = await modules.prisma.inferenceCapacity.create({
+        data: {
+          userId: user.id,
+          label: `Provider route second ${suffix}`,
+          runtimeIdentityKey: `provider-route:${secondModel.id}`,
+          runtimeModel: secondModel.upstreamModelId,
+          hardConcurrencyLimit: secondModel.concurrencyLimit,
+          physicalMaxContext: secondModel.contextWindow,
+          countStrategy: "CONSERVATIVE_ESTIMATE",
+        },
+      });
       const secondTarget = await modules.prisma.executionTarget.create({
-        data: { userId: user.id, kind: "PROVIDER_MODEL", providerModelId: secondModel.id },
+        data: {
+          userId: user.id,
+          kind: "PROVIDER_MODEL",
+          providerModelId: secondModel.id,
+          inferenceCapacityId: secondCapacity.id,
+        },
       });
       const secondTier = input.memberTier ?? "PUBLIC_OVERFLOW";
       await modules.prisma.poolMember.create({
@@ -719,7 +753,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
           manager,
           anthropicEnabled: true,
           protocolAdaptationEnabled: true,
-          capacityEnabled: false,
+          capacityEnabled: true,
         });
     const modelId = modules.identifiers.poolModelId({
       userSlug: user.slug,
@@ -823,6 +857,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       pool,
       account,
       target,
+      primaryMember,
       grant,
       credentialId,
       rawToken,
@@ -1115,13 +1150,20 @@ integration("provider dispatch routes with real PostgreSQL", () => {
           endpointVersion: { increment: 1 },
         },
       });
-    else if (invalidation === "member")
+    else if (invalidation === "member") {
+      if (!result.primaryMember) throw new Error("primary provider member unavailable");
+      await modules.prisma.capacityLease.deleteMany({
+        where: { poolMemberId: result.primaryMember.id },
+      });
       await modules.prisma.poolMember.deleteMany({
         where: { poolId: result.pool.id, executionTargetId: result.target.id },
       });
-    else if (invalidation === "target")
+    } else if (invalidation === "target") {
+      await modules.prisma.capacityLease.deleteMany({
+        where: { executionTargetId: result.target.id },
+      });
       await modules.prisma.executionTarget.delete({ where: { id: result.target.id } });
-    else if (invalidation === "model")
+    } else if (invalidation === "model")
       await modules.prisma.providerModel.update({
         where: { id: result.model.id },
         data: { deletedAt: new Date(), enabled: false },
@@ -1213,7 +1255,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       expect(result.response.status).toBe(200);
       expect(result.pool).toMatchObject({
         publicEgressEnabled: false,
-        publicEgressAcknowledged: false,
+        publicEgressAcknowledged: true,
       });
       expect(result.attemptEvents).not.toHaveLength(0);
       expect(result.attemptEvents.every((event) => event.memberTier === "PRIMARY")).toBe(true);
@@ -1469,7 +1511,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         adapterMode: "native",
         adapterVersion: null,
       });
-  });
+  }, 15_000);
 
   it("never tries a second target after the first target commits a byte and crashes", async () => {
     if (!modules) throw new Error("modules unavailable");
@@ -1654,7 +1696,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       status: "completed",
     });
     expect(result.observation?.authorization).toBe("Bearer route-provider-secret");
-  });
+  }, 15_000);
 
   it("proves PostgreSQL removes guarded setup writes after an injected mid-transaction failure", async () => {
     if (!modules) throw new Error("modules unavailable");

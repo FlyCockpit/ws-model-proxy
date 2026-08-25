@@ -17,6 +17,7 @@ import {
   claimPublicProviderCredentialForSend,
   conservativeProviderLiability,
   conservativeSerializedInputTokens,
+  dispatchPublicOverflow,
   exactResponsesNativeSurface,
   matchesExactResponsesBinding,
   parseProviderUsage,
@@ -25,6 +26,31 @@ import {
   publicTargetCompatibility,
   resolvePublicProviderExecution,
 } from "./public-overflow.js";
+
+it("applies the deployment egress gate to provider PRIMARY dispatch", async () => {
+  await expect(
+    dispatchPublicOverflow({
+      userId: "owner",
+      poolId: "pool",
+      requestId: "request",
+      reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      memberTier: "PRIMARY",
+      requestedProtocol: "openai",
+      requestedSurface: "openai-chat",
+      stream: false,
+      requiredFeatures: [],
+      path: "/v1/chat/completions",
+      headers: new Headers({ "content-type": "application/json" }),
+      body: new TextEncoder().encode("{}"),
+      signal: new AbortController().signal,
+      liability: { tokens: 1n, accountingVersion: "provider-billable-v1" },
+      releaseLocalCapacity: async () => undefined,
+      adaptationEnabled: false,
+      retrySafe: false,
+    }),
+  ).resolves.toEqual({ dispatched: false, reason: "DEPLOYMENT_GATE_DISABLED" });
+  expect(db.$transaction).not.toHaveBeenCalled();
+});
 
 describe("provider health cooldown", () => {
   const now = new Date("2026-08-25T12:00:00.000Z");

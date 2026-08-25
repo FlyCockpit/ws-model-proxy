@@ -9,6 +9,8 @@ import {
 } from "./capacity-policy-safety";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
+if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
+  throw new Error("SCHEMA_VALIDATION_DATABASE_URL is required for PostgreSQL integration tests");
 const integration = databaseUrl ? describe : describe.skip;
 
 integration("capacity policy production-router races", () => {
@@ -184,6 +186,7 @@ integration("capacity policy production-router races", () => {
         capacityReservedSlots: 1,
         capacityContextCeiling: 8_192,
         capacityContextMargin: 512,
+        publicEgressAcknowledged: true,
       },
     });
     poolId = pool.id;
@@ -427,7 +430,7 @@ integration("capacity policy production-router races", () => {
       memberContextCeiling: 8_192,
       reservedSlots: 1,
       localWaitBudgetMs: 30_000,
-      publicEgressAcknowledged: false,
+      publicEgressAcknowledged: true,
       providerModels: providerInput(ids),
     });
     const ordered = [...guardedProviderModelIds].sort() as [string, string];

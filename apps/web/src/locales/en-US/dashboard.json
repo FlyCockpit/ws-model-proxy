@@ -319,8 +319,8 @@
       "create": "Create protected pool",
       "description": "Choose local capacity first, then explicitly decide whether requests may leave your infrastructure.",
       "disabled": "Disabled",
-      "egressRequired": "Acknowledge public egress before enabling it.",
-      "egressWarning": "When local targets cannot serve a request, its prompts, attachments, tool definitions, and generated output may be sent to the configured public provider.",
+      "egressRequired": "Acknowledge provider egress before attaching any provider target.",
+      "egressWarning": "Provider PRIMARY requests, and overflow requests when enabled, send prompts, attachments, tool definitions, and generated output outside this deployment. The deployment release gate and durable global capacity admission must also be enabled.",
       "enabled": "Enabled",
       "fields": {
         "concurrency": "Physical concurrency ceiling",

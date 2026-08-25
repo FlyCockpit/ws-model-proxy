@@ -371,13 +371,10 @@ jobs:
         run: pnpm --filter @ws-model-proxy/db db:push
 
       - name: Prove capacity admission PostgreSQL primitives
-        run: pnpm --filter server exec vitest run src/model-api/capacity/postgres-store.integration.test.ts src/model-api/capacity/postgres-process.integration.test.ts
+        run: pnpm --filter server test:postgres
 
-      - name: Prove provider route pricing and accounting
-        run: pnpm --filter server exec vitest run src/model-api/provider-route.integration.test.ts
-
-      - name: Prove provider budget concurrency and settlement
-        run: pnpm --filter server exec vitest run src/model-api/provider-budget.integration.test.ts
+      - name: Prove provider management and capacity policy races
+        run: pnpm --filter @ws-model-proxy/api test:postgres
 
       - name: Prove provider attempt lifecycle recovery
         run: pnpm --filter server exec vitest run src/model-api/provider-attempt-runtime.integration.test.ts

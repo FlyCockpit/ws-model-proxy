@@ -7,6 +7,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Context } from "../context";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
+if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
+  throw new Error("SCHEMA_VALIDATION_DATABASE_URL is required for PostgreSQL integration tests");
 const integration = databaseUrl ? describe : describe.skip;
 
 integration("guarded pool setup with real PostgreSQL", () => {
@@ -21,6 +23,7 @@ integration("guarded pool setup with real PostgreSQL", () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
     process.env.NODE_ENV = "test";
+    process.env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = "true";
     const [db, router] = await Promise.all([
       import("@ws-model-proxy/db"),
       import("./forwarder-management"),

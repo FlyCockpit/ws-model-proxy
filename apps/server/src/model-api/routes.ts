@@ -3432,7 +3432,10 @@ async function relayPool({
         providerCapacityLease = options.preAdmittedProviderLease;
         return result;
       }
-      if (!capacityRuntime) return dispatchPublicOverflow({ ...providerRequest, memberTier });
+      // Provider egress never has a direct-dispatch fallback. Durable global
+      // admission supplies the cross-process concurrency fence; without it a
+      // provider request must fail closed even if legacy configuration exists.
+      if (!capacityRuntime) return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" } as const;
       const listed = await listPublicOverflowTargets(target.ownerUserId, target.id, memberTier);
       const compatible = orderChatTestProviderTargets(
         listed.targets.flatMap((providerTarget) => {
@@ -3508,6 +3511,7 @@ async function relayPool({
             ...providerRequest,
             memberTier,
             forcedPoolMemberId: selectedPoolMemberId,
+            retrySingleTargetPrecommit: remaining.length > 1,
           });
         } catch (error) {
           // Admission owns the lease until dispatch commits successfully. A
@@ -3872,7 +3876,12 @@ async function relayPool({
     PublicOverflowRequest,
     "userId" | "requestedSurface" | "estimatedInputTokens" | "requestedOutputTokens" | "liability"
   > | null = null;
-  if (operation.contextInput && requestedSurface) {
+  if (
+    capacityRuntime &&
+    env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED &&
+    operation.contextInput &&
+    requestedSurface
+  ) {
     const listed = await listPublicOverflowTargets(target.ownerUserId, target.id, "PRIMARY");
     providerAffinityPolicy = listed.affinityPolicy;
     const maxOutput = operation.contextInput.max_output_tokens ?? operation.contextInput.max_tokens;
@@ -3926,19 +3935,21 @@ async function relayPool({
       headers: request.headers,
       method: request.method,
     } as const;
-    providerPrimaryTargets = listed.targets.flatMap((providerTarget) => {
-      if (forcedPoolMemberId && providerTarget.poolMemberId !== forcedPoolMemberId) return [];
-      const resolvedExecution = resolvePublicProviderExecution(
-        providerTarget,
-        providerCompatibilityRequest,
-      );
-      const resolvedTarget = { ...providerTarget, resolvedExecution };
-      return publicTargetCompatibility(providerTarget, providerCompatibilityRequest) ===
-        "COMPATIBLE" &&
-        matchesChatTestProviderMode(resolvedTarget, requestedSurface, testRoutingMode)
-        ? [resolvedTarget]
-        : [];
-    });
+    providerPrimaryTargets = (listed.acknowledged ? listed.targets : []).flatMap(
+      (providerTarget) => {
+        if (forcedPoolMemberId && providerTarget.poolMemberId !== forcedPoolMemberId) return [];
+        const resolvedExecution = resolvePublicProviderExecution(
+          providerTarget,
+          providerCompatibilityRequest,
+        );
+        const resolvedTarget = { ...providerTarget, resolvedExecution };
+        return publicTargetCompatibility(providerTarget, providerCompatibilityRequest) ===
+          "COMPATIBLE" &&
+          matchesChatTestProviderMode(resolvedTarget, requestedSurface, testRoutingMode)
+          ? [resolvedTarget]
+          : [];
+      },
+    );
   }
   if (
     members.length > 0 &&
@@ -5975,11 +5986,13 @@ export async function chatTestCompletionsHandler({
   userId,
   manager,
   limiter,
+  capacityRuntime,
 }: {
   request: Request;
   userId: string;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
+  capacityRuntime?: CapacityAdmissionRuntime;
 }) {
   const prepared = await prepareJsonModeledRequest(request);
   if (prepared instanceof Response) return prepared;
@@ -6000,6 +6013,7 @@ export async function chatTestCompletionsHandler({
     },
     manager,
     limiter,
+    capacityRuntime,
   });
 }
 
@@ -6082,7 +6096,8 @@ async function relayBoundProviderResponse(input: {
       >["lease"]
     | undefined;
   const dispatchBoundTier = async (memberTier: "PRIMARY" | "PUBLIC_OVERFLOW") => {
-    if (!input.capacityRuntime) return dispatchPublicOverflow({ ...boundRequest, memberTier });
+    if (!input.capacityRuntime)
+      return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" } as const;
     const listed = await listPublicOverflowTargets(
       input.stickyRoute.visibleTarget.ownerUserId,
       input.stickyRoute.visibleTarget.id,
@@ -6103,7 +6118,7 @@ async function relayBoundProviderResponse(input: {
         requestId: crypto.randomUUID(),
         relayRequestId,
         attemptId: crypto.randomUUID(),
-        ownerId: input.requester.userId,
+        ownerId: input.stickyRoute.visibleTarget.ownerUserId,
         sourceKind: "POOL",
         poolId: input.stickyRoute.visibleTarget.id,
         basePriority: 16,

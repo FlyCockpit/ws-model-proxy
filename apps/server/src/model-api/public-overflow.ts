@@ -81,8 +81,9 @@ export interface PublicOverflowRequest {
   poolId: string;
   requestId: string;
   reason: PublicOverflowReason;
-  /** Provider-backed PRIMARY reuses the guarded provider execution pipeline but
-   * is not public fallback and therefore does not require the public opt-in. */
+  /** Provider-backed PRIMARY reuses the guarded provider execution pipeline.
+   * It requires deployment approval and pool acknowledgement, but not the
+   * separate public-overflow enablement switch. */
   memberTier?: "PRIMARY" | "PUBLIC_OVERFLOW";
   requestedProtocol: ProviderProtocol;
   requestedSurface: ProtocolSurface;
@@ -110,6 +111,10 @@ export interface PublicOverflowRequest {
   forcedPoolMemberId?: string;
   /** True only when the operation resolver proves a second attempt is safe. */
   retrySafe: boolean;
+  /** The caller admitted one target at a time and has another capacity-fenced
+   * candidate available. Consume and settle a retryable response, then return
+   * uncommitted so the caller can admit the next target. */
+  retrySingleTargetPrecommit?: boolean;
   requireNativeSurface?: ProtocolSurface;
   /** Correctness-required Responses binding. It disables ranking, adaptation,
    * and all post-binding failover and validates the immutable endpoint tuple. */
@@ -818,7 +823,28 @@ function joinProviderPath(baseUrl: string, path: string): string {
   return `${cleanBase}${cleanPath}${requested.search}`;
 }
 
-function responseHeaders(headers: import("node:http").IncomingHttpHeaders): Headers {
+const SAFE_CONTENT_ENCODINGS = new Set(["br", "deflate", "gzip", "identity", "zstd"]);
+
+function validatedContentEncoding(value: string | string[] | undefined): string | null {
+  if (value === undefined) return null;
+  const joined = Array.isArray(value) ? value.join(",") : value;
+  const encodings = joined
+    .split(",")
+    .map((encoding) => encoding.trim().toLowerCase())
+    .filter(Boolean);
+  if (
+    encodings.length === 0 ||
+    encodings.length > 4 ||
+    encodings.some((encoding) => !SAFE_CONTENT_ENCODINGS.has(encoding))
+  )
+    return null;
+  return encodings.join(", ");
+}
+
+export function providerResponseHeaders(
+  headers: import("node:http").IncomingHttpHeaders,
+  preserveOpaqueRepresentation: boolean,
+): Headers {
   const result = new Headers();
   const allowed = new Set([
     "content-type",
@@ -844,6 +870,14 @@ function responseHeaders(headers: import("node:http").IncomingHttpHeaders): Head
   for (const [name, value] of Object.entries(headers)) {
     if (!allowed.has(name.toLowerCase()) || value === undefined) continue;
     result.set(name, Array.isArray(value) ? value.join(", ") : value);
+  }
+  // node:http exposes the provider's wire bytes without transparent
+  // decompression. Preserve a validated encoding only when those exact bytes
+  // are passed through natively. Adapted responses are decoded and rendered,
+  // so their representation validators and encoding must be stripped.
+  if (preserveOpaqueRepresentation) {
+    const encoding = validatedContentEncoding(headers["content-encoding"]);
+    if (encoding) result.set("content-encoding", encoding);
   }
   return result;
 }
@@ -1555,13 +1589,18 @@ export async function dispatchPublicOverflow(
   request: PublicOverflowRequest,
 ): Promise<PublicOverflowResult> {
   const memberTier = request.memberTier ?? "PUBLIC_OVERFLOW";
-  if (memberTier === "PUBLIC_OVERFLOW" && !env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED)
+  // The deployment release gate covers every request that can leave WSMP,
+  // including provider-backed PRIMARY members. Existing database state must
+  // not silently bypass an operator's disabled/missing deployment setting.
+  if (!env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED)
     return { dispatched: false, reason: "DEPLOYMENT_GATE_DISABLED" };
   const listed = await listPublicOverflowTargets(request.userId, request.poolId, memberTier);
   if (memberTier === "PUBLIC_OVERFLOW" && !listed.enabled)
     return { dispatched: false, reason: "POOL_PRIVATE" };
-  if (memberTier === "PUBLIC_OVERFLOW" && !listed.acknowledged)
-    return { dispatched: false, reason: "POOL_ACKNOWLEDGEMENT_MISSING" };
+  // Acknowledgement is the pool owner's consent for all provider egress.
+  // publicEgressEnabled remains the separate switch that makes a pool
+  // non-private by permitting fallback to PUBLIC_OVERFLOW members.
+  if (!listed.acknowledged) return { dispatched: false, reason: "POOL_ACKNOWLEDGEMENT_MISSING" };
   // Payload size may change during cross-protocol rendering. Do the initial
   // pass with zero input solely to reject protocol/feature/output mismatches;
   // each target is checked again with its actual rendered wire size below.
@@ -1934,7 +1973,7 @@ export async function dispatchPublicOverflow(
       // Retry only before exposing headers/body to the caller.
       if (
         request.retrySafe &&
-        rankedIndex < ranked.targets.length - 1 &&
+        (rankedIndex < ranked.targets.length - 1 || request.retrySingleTargetPrecommit === true) &&
         (status === 408 || status === 409 || status === 429 || status >= 500)
       ) {
         // Failed/rate-limited calls may still be billed. Consume only a strict
@@ -2377,7 +2416,11 @@ export async function dispatchPublicOverflow(
         affinity: target.affinity,
         response: new Response(bodyForbidden ? null : heldBody, {
           status,
-          headers: responseHeaders(response.headers),
+          headers: providerResponseHeaders(
+            response.headers,
+            nativeSurface === request.requestedSurface &&
+              target.resolvedExecution?.mode !== "adapted",
+          ),
         }),
       };
     } catch {

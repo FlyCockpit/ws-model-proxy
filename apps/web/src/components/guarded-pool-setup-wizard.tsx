@@ -203,11 +203,7 @@ export function GuardedPoolSetupWizard({
         ctx.addIssue({ code: "custom", path: ["providerModelIds"] });
       if (value.reservedSlots > value.memberConcurrencyLimit)
         ctx.addIssue({ code: "custom", path: ["reservedSlots"] });
-      if (
-        value.providerModelIds.length > 0 &&
-        value.providerTier === "PUBLIC_OVERFLOW" &&
-        !value.publicEgressAcknowledged
-      )
+      if (value.providerModelIds.length > 0 && !value.publicEgressAcknowledged)
         ctx.addIssue({ code: "custom", path: ["publicEgressAcknowledged"] });
       if (
         value.localModelIds.length +

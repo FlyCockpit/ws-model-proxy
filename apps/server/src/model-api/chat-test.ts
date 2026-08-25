@@ -1,6 +1,12 @@
 import type { Session } from "@ws-model-proxy/auth";
+import { env } from "@ws-model-proxy/env/server";
 import { Hono } from "hono";
 import { type RelaySessionManager, relaySessionManager } from "../relay/session-manager.js";
+import { PostgresCapacityAdmissionStore } from "./capacity/postgres-store.js";
+import {
+  type CapacityAdmissionRuntime,
+  StoreCapacityAdmissionRuntime,
+} from "./capacity/runtime.js";
 import { type ModelApiConcurrencyLimiter, modelApiConcurrencyLimiter } from "./limits.js";
 import { openAiFailureJsonResponse } from "./openai-errors.js";
 import {
@@ -19,6 +25,8 @@ type ChatTestRouteDependencies = {
     | "completeRelayRequest"
   >;
   concurrencyLimiter?: ModelApiConcurrencyLimiter;
+  capacityEnabled?: boolean;
+  capacityRuntime?: CapacityAdmissionRuntime;
 };
 
 type ChatTestVariables = {
@@ -28,8 +36,13 @@ type ChatTestVariables = {
 export function createChatTestRoutes({
   manager = relaySessionManager,
   concurrencyLimiter = modelApiConcurrencyLimiter,
+  capacityEnabled = env.MODEL_API_GLOBAL_CAPACITY_ENABLED,
+  capacityRuntime,
 }: ChatTestRouteDependencies = {}) {
   const app = new Hono<{ Variables: ChatTestVariables }>();
+  const admissionRuntime = capacityEnabled
+    ? (capacityRuntime ?? new StoreCapacityAdmissionRuntime(new PostgresCapacityAdmissionStore()))
+    : undefined;
 
   app.post("/chat/completions", async (c) => {
     const session = c.get("session");
@@ -42,6 +55,7 @@ export function createChatTestRoutes({
       userId: session.user.id,
       manager,
       limiter: concurrencyLimiter,
+      capacityRuntime: admissionRuntime,
     });
   });
 
@@ -55,6 +69,7 @@ export function createChatTestRoutes({
       manager,
       limiter: concurrencyLimiter,
       adaptationFeatureEnabled: true,
+      capacityRuntime: admissionRuntime,
     });
   });
 
@@ -69,6 +84,7 @@ export function createChatTestRoutes({
       manager,
       limiter: concurrencyLimiter,
       adaptationFeatureEnabled: true,
+      capacityRuntime: admissionRuntime,
     });
   });
 

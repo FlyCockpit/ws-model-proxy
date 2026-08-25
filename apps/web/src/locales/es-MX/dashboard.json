@@ -319,8 +319,8 @@
       "create": "Crear pool protegido",
       "description": "Elige primero la capacidad local y luego decide explícitamente si las solicitudes pueden salir de tu infraestructura.",
       "disabled": "Desactivado",
-      "egressRequired": "Reconoce la salida pública antes de activarla.",
-      "egressWarning": "Cuando los destinos locales no puedan atender una solicitud, sus prompts, adjuntos, definiciones de herramientas y salida generada podrán enviarse al proveedor público configurado.",
+      "egressRequired": "Reconoce la salida al proveedor antes de adjuntar cualquier destino de proveedor.",
+      "egressWarning": "Las solicitudes al proveedor PRIMARY, y las solicitudes de desbordamiento cuando estén habilitadas, envían prompts, adjuntos, definiciones de herramientas y resultados generados fuera de esta implementación. La puerta de lanzamiento y la admisión de capacidad global duradera también deben estar habilitadas.",
       "enabled": "Activado",
       "fields": {
         "concurrency": "Límite de concurrencia física",

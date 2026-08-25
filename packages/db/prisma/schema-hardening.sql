@@ -209,6 +209,10 @@ BEGIN
     RAISE EXCEPTION 'primary pool members must be discovered or provider models'
       USING ERRCODE = '23514';
   END IF;
+  IF target_kind = 'PROVIDER_MODEL' AND NOT public_ack THEN
+    RAISE EXCEPTION 'provider pool members require explicit pool egress acknowledgement'
+      USING ERRCODE = '23514';
+  END IF;
   IF NEW.tier = 'PUBLIC_OVERFLOW' AND
      (target_kind IS DISTINCT FROM 'PROVIDER_MODEL' OR NOT public_enabled OR NOT public_ack) THEN
     RAISE EXCEPTION 'public overflow requires an acknowledged public pool and provider target'
@@ -226,7 +230,15 @@ FOR EACH ROW EXECUTE FUNCTION enforce_pool_member_tier_source();
 CREATE OR REPLACE FUNCTION enforce_pool_public_disable()
 RETURNS trigger LANGUAGE plpgsql AS $pool_public_disable$
 BEGIN
-  IF (NOT NEW."publicEgressEnabled" OR NOT NEW."publicEgressAcknowledged") AND EXISTS (
+  IF NOT NEW."publicEgressAcknowledged" AND EXISTS (
+    SELECT 1 FROM pool_member member
+    JOIN execution_target target ON target.id = member."executionTargetId"
+    WHERE member."poolId" = NEW.id AND target.kind = 'PROVIDER_MODEL'
+  ) THEN
+    RAISE EXCEPTION 'remove provider members before revoking provider egress acknowledgement'
+      USING ERRCODE = '23514';
+  END IF;
+  IF NOT NEW."publicEgressEnabled" AND EXISTS (
     SELECT 1 FROM pool_member
      WHERE "poolId" = NEW.id AND tier = 'PUBLIC_OVERFLOW'
   ) THEN

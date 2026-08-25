@@ -83,9 +83,42 @@ import {
   listPublicOverflowTargets,
   matchesChatTestProviderMode,
   orderChatTestProviderTargets,
+  providerResponseHeaders,
   rankPublicOverflowTargets,
   targetsForForcedPoolMember,
 } from "./public-overflow.js";
+
+describe("opaque native provider response headers", () => {
+  it.each(["application/json", "text/event-stream"])(
+    "preserves validated compression for native %s wire bytes",
+    (contentType) => {
+      const headers = providerResponseHeaders(
+        {
+          "content-type": contentType,
+          "content-encoding": "gzip",
+          "content-length": "123",
+          authorization: "secret",
+        },
+        true,
+      );
+      expect(headers.get("content-type")).toBe(contentType);
+      expect(headers.get("content-encoding")).toBe("gzip");
+      expect(headers.get("content-length")).toBeNull();
+      expect(headers.get("authorization")).toBeNull();
+    },
+  );
+
+  it("strips encoding from adapted bodies and rejects unrecognized encodings", () => {
+    expect(
+      providerResponseHeaders({ "content-encoding": "gzip" }, false).get("content-encoding"),
+    ).toBeNull();
+    expect(
+      providerResponseHeaders({ "content-encoding": "unsafe-extension" }, true).get(
+        "content-encoding",
+      ),
+    ).toBeNull();
+  });
+});
 
 it("applies explicit native and adapted Chat Test modes to provider targets", () => {
   const target = { nativeSurfaces: ["openai-chat"] as const };

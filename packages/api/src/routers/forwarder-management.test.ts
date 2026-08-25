@@ -12,6 +12,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Context } from "../context";
 import { forwarderManagementRouter } from "./forwarder-management";
 
+const testEnv = vi.hoisted(() => ({ WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true }));
+
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
   class TestDecimal {
@@ -36,7 +38,7 @@ vi.mock("@ws-model-proxy/db", async () => {
 });
 
 vi.mock("@ws-model-proxy/env/server", () => ({
-  env: {},
+  env: testEnv,
   ADMIN_EMAILS: new Set<string>(),
 }));
 
@@ -219,6 +221,7 @@ function guardedLocalModel(
 describe("forwarderManagementRouter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    testEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
     db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
       callback(db),
     );
@@ -227,6 +230,18 @@ describe("forwarderManagementRouter", () => {
     db.inferenceCapacity.upsert.mockResolvedValue({ id: "provider-capacity-id" });
     db.capacityAuditEvent.create.mockResolvedValue({ id: "audit-id" });
     db.appSetting.findUnique.mockResolvedValue(null);
+  });
+
+  it("fails provider attachment closed when the deployment egress gate is disabled", async () => {
+    testEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = false;
+    await expect(
+      client().addProviderPoolMember({
+        poolId: "pool-id",
+        providerModelId: "provider-model",
+        tier: "PRIMARY",
+      }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(db.$transaction).not.toHaveBeenCalled();
   });
 
   it("denies guessed provider attachments and public-egress mutations over HTTP", async () => {
@@ -530,7 +545,7 @@ describe("forwarderManagementRouter", () => {
         memberContextCeiling: 32_768,
         reservedSlots: 0,
         localWaitBudgetMs: 30_000,
-        publicEgressAcknowledged: false,
+        publicEgressAcknowledged: true,
         providerModels: [
           {
             providerModelId: "provider-primary",
@@ -546,7 +561,7 @@ describe("forwarderManagementRouter", () => {
       expect.objectContaining({
         data: expect.objectContaining({
           publicEgressEnabled: false,
-          publicEgressAcknowledged: false,
+          publicEgressAcknowledged: true,
           recommendedSurfaceOverride: "OPENAI_RESPONSES",
         }),
       }),
@@ -1485,7 +1500,7 @@ describe("forwarderManagementRouter", () => {
         ModelPool: {
           userId: "user-id",
           publicEgressEnabled: false,
-          publicEgressAcknowledged: false,
+          publicEgressAcknowledged: true,
           capacityConcurrencyLimit: 6,
           capacityReservedSlots: 1,
         },
@@ -1557,7 +1572,7 @@ describe("forwarderManagementRouter", () => {
       ModelPool: {
         userId: "user-id",
         publicEgressEnabled: false,
-        publicEgressAcknowledged: false,
+        publicEgressAcknowledged: true,
         capacityConcurrencyLimit: 6,
         capacityReservedSlots: 1,
       },
@@ -1611,7 +1626,7 @@ describe("forwarderManagementRouter", () => {
       ModelPool: {
         userId: "user-id",
         publicEgressEnabled: false,
-        publicEgressAcknowledged: false,
+        publicEgressAcknowledged: true,
         capacityConcurrencyLimit: 8,
         capacityReservedSlots: 0,
       },
@@ -1687,7 +1702,7 @@ describe("forwarderManagementRouter", () => {
     db.modelPool.findFirst.mockResolvedValue({
       id: "pool-id",
       publicEgressEnabled: false,
-      publicEgressAcknowledged: false,
+      publicEgressAcknowledged: true,
       capacityConcurrencyLimit: 5,
       capacityReservedSlots: 1,
     });
@@ -1713,7 +1728,7 @@ describe("forwarderManagementRouter", () => {
     db.modelPool.findFirst.mockResolvedValue({
       id: "private-pool",
       publicEgressEnabled: false,
-      publicEgressAcknowledged: false,
+      publicEgressAcknowledged: true,
     });
     db.providerModel.findFirst.mockResolvedValue({
       id: "provider-model",

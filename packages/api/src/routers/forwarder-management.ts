@@ -85,6 +85,13 @@ const attachmentLimitSchema = z
   .nullable()
   .optional();
 
+function assertProviderEgressReleaseGate(): void {
+  if (!env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED)
+    throw new ORPCError("NOT_FOUND", {
+      message: "Provider egress is not enabled for this deployment.",
+    });
+}
+
 function assertConcurrencyPolicyWithinHardLimit(input: {
   hardLimit: number | null | undefined;
   poolLimit: number | null;
@@ -1291,14 +1298,11 @@ export const forwarderManagementRouter = {
                 message: "Reserved slots exceed member concurrency",
               });
             }
-            if (
-              input.providerModels.some((provider) => provider.tier === "PUBLIC_OVERFLOW") &&
-              !input.publicEgressAcknowledged
-            ) {
+            if (input.providerModels.length > 0 && !input.publicEgressAcknowledged) {
               ctx.addIssue({
                 code: "custom",
                 path: ["publicEgressAcknowledged"],
-                message: "Public egress acknowledgement is required",
+                message: "Provider egress acknowledgement is required",
               });
             }
             if (new Set(input.localModelIds).size !== input.localModelIds.length) {
@@ -1344,6 +1348,7 @@ export const forwarderManagementRouter = {
       })(),
     )
     .handler(async ({ input, context }) => {
+      if (input.providerModels.length > 0) assertProviderEgressReleaseGate();
       const userId = context.session.user.id;
       await assertPoolSlugAvailable(input.slug, userId);
       const now = new Date();
@@ -1617,7 +1622,7 @@ export const forwarderManagementRouter = {
             allowLossyDeveloperRoleCollapse:
               input.advanced?.allowLossyDeveloperRoleCollapse ?? false,
             publicEgressEnabled: hasPublicOverflow,
-            publicEgressAcknowledged: hasPublicOverflow,
+            publicEgressAcknowledged: input.publicEgressAcknowledged,
             recommendedSurfaceOverride: input.recommendedSurface,
             capacityPriority: 16,
             capacityConcurrencyLimit: input.memberConcurrencyLimit,
@@ -2045,6 +2050,8 @@ export const forwarderManagementRouter = {
       }),
     )
     .handler(async ({ input, context }) => {
+      if (input.publicEgressEnabled === true || input.publicEgressAcknowledged === true)
+        assertProviderEgressReleaseGate();
       if (
         input.capacityConcurrencyLimit != null &&
         (input.capacityReservedSlots ?? 0) > input.capacityConcurrencyLimit
@@ -2184,6 +2191,8 @@ export const forwarderManagementRouter = {
       const nextPublicEgressEnabled = input.publicEgressEnabled ?? existing.publicEgressEnabled;
       const nextPublicEgressAcknowledged =
         input.publicEgressAcknowledged ?? existing.publicEgressAcknowledged;
+      if (input.publicEgressEnabled === true || input.publicEgressAcknowledged === true)
+        assertProviderEgressReleaseGate();
       if (nextPublicEgressEnabled && !nextPublicEgressAcknowledged) {
         throw new ORPCError("BAD_REQUEST", {
           message: "Acknowledge public egress before enabling it.",
@@ -2486,6 +2495,7 @@ export const forwarderManagementRouter = {
       }),
     )
     .handler(async ({ input, context }) => {
+      assertProviderEgressReleaseGate();
       const userId = context.session.user.id;
       return runSerializableTransaction(async (tx) => {
         const candidatePool = await tx.modelPool.findFirst({
@@ -2507,10 +2517,12 @@ export const forwarderManagementRouter = {
           },
         });
         if (!pool) throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
-        if (
-          input.tier === "PUBLIC_OVERFLOW" &&
-          (!pool.publicEgressEnabled || !pool.publicEgressAcknowledged)
-        ) {
+        if (!pool.publicEgressAcknowledged) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: "Acknowledge provider egress before adding a provider target.",
+          });
+        }
+        if (input.tier === "PUBLIC_OVERFLOW" && !pool.publicEgressEnabled) {
           throw new ORPCError("BAD_REQUEST", {
             message: "Acknowledge and enable public egress before adding an overflow target.",
           });
@@ -2826,6 +2838,7 @@ export const forwarderManagementRouter = {
           if (!member || member.ModelPool.userId !== userId)
             throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
           const providerModel = member.ExecutionTarget?.ProviderModel;
+          if (providerModel) assertProviderEgressReleaseGate();
           const nextTier = input.tier ?? member.tier;
           const nextWeight = input.weight ?? member.weight;
           const nextRoutingStatus = input.routingStatus ?? member.routingStatus;
@@ -2837,10 +2850,11 @@ export const forwarderManagementRouter = {
             throw new ORPCError("BAD_REQUEST", {
               message: "Only provider-backed members can change tier.",
             });
-          if (
-            nextTier === "PUBLIC_OVERFLOW" &&
-            (!member.ModelPool.publicEgressEnabled || !member.ModelPool.publicEgressAcknowledged)
-          )
+          if (providerModel && !member.ModelPool.publicEgressAcknowledged)
+            throw new ORPCError("BAD_REQUEST", {
+              message: "Acknowledge provider egress before updating a provider target.",
+            });
+          if (nextTier === "PUBLIC_OVERFLOW" && !member.ModelPool.publicEgressEnabled)
             throw new ORPCError("BAD_REQUEST", {
               message: "Acknowledge and enable public egress before moving a target to overflow.",
             });

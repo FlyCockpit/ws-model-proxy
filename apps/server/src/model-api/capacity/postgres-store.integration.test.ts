@@ -259,6 +259,7 @@ integration("PostgreSQL capacity admission primitives", () => {
           slug: `pool-policy-race-${suffix}`,
           name: "Pool policy race",
           capacityConcurrencyLimit: null,
+          publicEgressAcknowledged: true,
         },
       });
       const account = await writer.providerAccount.create({
