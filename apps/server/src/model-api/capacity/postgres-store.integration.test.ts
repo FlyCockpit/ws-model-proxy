@@ -146,6 +146,7 @@ integration("PostgreSQL capacity admission primitives", () => {
           providerType: "proof",
           label: `database-clock-${suffix}`,
           baseUrl: "https://example.test",
+          endpointIdentity: "https://example.test",
           authType: "BEARER",
         },
       });
@@ -196,12 +197,12 @@ integration("PostgreSQL capacity admission primitives", () => {
       const skewAttempt = attempt("clock-skew", skewDeadline);
       await expect(secondManager.acquire(skewAttempt)).resolves.toMatchObject({ state: "WAITING" });
       await first.$executeRaw`
-        UPDATE "AdmissionRequest" SET "deadlineAt" = NULL
+        UPDATE admission_request SET "deadlineAt" = NULL
          WHERE "attemptId" = ${skewAttempt.attemptId}`;
       await first.$executeRaw`
-        UPDATE "CapacityWaiter" SET "deadlineAt" = NULL
+        UPDATE capacity_waiter SET "deadlineAt" = NULL
          WHERE "admissionRequestId" = (
-           SELECT id FROM "AdmissionRequest" WHERE "attemptId" = ${skewAttempt.attemptId}
+           SELECT id FROM admission_request WHERE "attemptId" = ${skewAttempt.attemptId}
          )`;
       await expect(
         secondManager.terminalizeAttempt(skewAttempt.attemptId, "EXPIRED"),
@@ -213,7 +214,7 @@ integration("PostgreSQL capacity admission primitives", () => {
         first.admissionRequest.findUniqueOrThrow({ where: { attemptId: skewAttempt.attemptId } }),
       ).resolves.toMatchObject({ state: "WAITING", deadlineAt: skewDeadline });
       await first.$executeRaw`
-        UPDATE "AdmissionRequest"
+        UPDATE admission_request
            SET "deadlineAt" = clock_timestamp() + interval '250 milliseconds'
          WHERE "attemptId" = ${skewAttempt.attemptId}`;
       const skewRuntime = new StoreCapacityAdmissionRuntime(
@@ -242,10 +243,10 @@ integration("PostgreSQL capacity admission primitives", () => {
         // completed. The competing manager must re-read it after obtaining the
         // advisory lock instead of trusting its pre-lock view or process clock.
         await tx.$executeRaw`
-          UPDATE "CapacityWaiter"
+          UPDATE capacity_waiter
              SET "deadlineAt" = clock_timestamp() + interval '150 milliseconds'
            WHERE "admissionRequestId" = (
-             SELECT id FROM "AdmissionRequest" WHERE "attemptId" = ${deadlineAttempt.attemptId}
+             SELECT id FROM admission_request WHERE "attemptId" = ${deadlineAttempt.attemptId}
            )`;
         locked();
         await releaseLock;
@@ -286,7 +287,7 @@ integration("PostgreSQL capacity admission primitives", () => {
       ).toMatchObject({ state: "ACTIVE" });
 
       await first.$executeRaw`
-        UPDATE "CapacityLease"
+        UPDATE capacity_lease
            SET "expiresAt" = clock_timestamp() - interval '1 millisecond'
          WHERE id = ${live.lease.leaseId}`;
       await expect(secondManager.heartbeat(live.lease, 60_000)).resolves.toBe(false);
@@ -498,28 +499,35 @@ integration("PostgreSQL capacity admission primitives", () => {
           hardConcurrencyLimit: 1,
         },
       });
-      const account = await db.providerAccount.create({
+      const device = await db.cliDevice.create({
         data: {
           userId: user.id,
-          providerType: "proof",
-          label: `provider-${suffix}`,
-          baseUrl: "https://example.test",
-          authType: "BEARER",
+          slug: `device-${suffix}`,
+          label: "Capacity device",
+        },
+      });
+      const endpoint = await db.endpoint.create({
+        data: {
+          userId: user.id,
+          cliDeviceId: device.id,
+          slug: `endpoint-${suffix}`,
+          label: "Capacity endpoint",
         },
       });
       const targets: Array<{ id: string }> = [];
       for (const upstreamModelId of ["proof-a", "proof-b"]) {
-        const model = await db.providerModel.create({
-          data: { userId: user.id, providerAccountId: account.id, upstreamModelId },
+        const model = await db.discoveredModel.create({
+          data: {
+            userId: user.id,
+            endpointId: endpoint.id,
+            upstreamModelId,
+            encodedModelId: `${upstreamModelId}-${suffix}`,
+          },
         });
         targets.push(
-          await db.executionTarget.create({
-            data: {
-              userId: user.id,
-              kind: "PROVIDER_MODEL",
-              providerModelId: model.id,
-              inferenceCapacityId: capacity.id,
-            },
+          await db.executionTarget.update({
+            where: { discoveredModelId: model.id },
+            data: { inferenceCapacityId: capacity.id },
           }),
         );
       }
@@ -620,9 +628,11 @@ integration("PostgreSQL capacity admission primitives", () => {
       });
       expect(waiters.filter((waiter) => waiter.state === "ADMITTED")).toHaveLength(1);
       expect(waiters.filter((waiter) => waiter.state === "CANCELLED")).toHaveLength(1);
+      const admittedWaiter = waiters.find((waiter) => waiter.state === "ADMITTED");
+      expect(admittedWaiter).toBeDefined();
       expect(
         await db.capacityLease.findUnique({ where: { attemptId: `attempt-1-${suffix}` } }),
-      ).toMatchObject({ poolMemberId: members[1]!.id });
+      ).toMatchObject({ poolMemberId: admittedWaiter!.poolMemberId });
 
       const second = await secondManager.acquire({
         requestId: `request-2-${suffix}`,
@@ -976,30 +986,35 @@ integration("PostgreSQL capacity admission primitives", () => {
           hardConcurrencyLimit: 2,
         },
       });
-      const account = await db.providerAccount.create({
+      const device = await db.cliDevice.create({
         data: {
           userId: user.id,
-          providerType: "proof",
-          label: suffix,
-          baseUrl: "https://example.test",
-          authType: "BEARER",
+          slug: `device-${suffix}`,
+          label: "Reservation device",
+        },
+      });
+      const endpoint = await db.endpoint.create({
+        data: {
+          userId: user.id,
+          cliDeviceId: device.id,
+          slug: `endpoint-${suffix}`,
+          label: "Reservation endpoint",
         },
       });
       const targets: Array<{ id: string }> = [];
       for (const name of ["shared", "direct"]) {
-        const model = await db.providerModel.create({
+        const model = await db.discoveredModel.create({
           data: {
             userId: user.id,
-            providerAccountId: account.id,
+            endpointId: endpoint.id,
             upstreamModelId: `${name}-${suffix}`,
+            encodedModelId: `${name}-${suffix}`,
           },
         });
         targets.push(
-          await db.executionTarget.create({
+          await db.executionTarget.update({
+            where: { discoveredModelId: model.id },
             data: {
-              userId: user.id,
-              kind: "PROVIDER_MODEL",
-              providerModelId: model.id,
               inferenceCapacityId: capacity.id,
               directBorrowPolicy: "NEVER",
             },
@@ -1020,7 +1035,10 @@ integration("PostgreSQL capacity admission primitives", () => {
         members.push({
           pool,
           member: await db.poolMember.create({
-            data: { poolId: pool.id, executionTargetId: targets[0]!.id },
+            data: {
+              poolId: pool.id,
+              executionTargetId: targets[0]!.id,
+            },
           }),
         });
       }
@@ -1062,23 +1080,23 @@ integration("PostgreSQL capacity admission primitives", () => {
           hardConcurrencyLimit: 2,
         },
       });
-      const secondModel = await db.providerModel.create({
+      const secondModel = await db.discoveredModel.create({
         data: {
           userId: user.id,
-          providerAccountId: account.id,
+          endpointId: endpoint.id,
           upstreamModelId: `second-${suffix}`,
+          encodedModelId: `second-${suffix}`,
         },
       });
-      const secondTarget = await db.executionTarget.create({
-        data: {
-          userId: user.id,
-          kind: "PROVIDER_MODEL",
-          providerModelId: secondModel.id,
-          inferenceCapacityId: secondCapacity.id,
-        },
+      const secondTarget = await db.executionTarget.update({
+        where: { discoveredModelId: secondModel.id },
+        data: { inferenceCapacityId: secondCapacity.id },
       });
       const inheritedMember = await db.poolMember.create({
-        data: { poolId: members[0]!.pool.id, executionTargetId: secondTarget.id },
+        data: {
+          poolId: members[0]!.pool.id,
+          executionTargetId: secondTarget.id,
+        },
       });
       const scopedAttempt = (attemptId: string) => ({
         requestId: attemptId,

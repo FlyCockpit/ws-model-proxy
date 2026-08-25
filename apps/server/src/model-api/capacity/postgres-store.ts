@@ -12,11 +12,20 @@ type Db = typeof prisma;
 const SERIALIZATION_CODES = new Set(["P2034", "40001", "40P01"]);
 
 export function isRetryableCapacityTransactionError(error: unknown): boolean {
-  const code =
-    error && typeof error === "object" && "code" in error && typeof error.code === "string"
-      ? error.code
-      : undefined;
-  return code !== undefined && SERIALIZATION_CODES.has(code);
+  const pending: unknown[] = [error];
+  const seen = new Set<object>();
+  while (pending.length > 0) {
+    const candidate = pending.pop();
+    if (!candidate || typeof candidate !== "object" || seen.has(candidate)) continue;
+    seen.add(candidate);
+    const record = candidate as Record<string, unknown>;
+    for (const key of ["code", "originalCode"]) {
+      const code = record[key];
+      if (typeof code === "string" && SERIALIZATION_CODES.has(code)) return true;
+    }
+    for (const key of ["meta", "driverAdapterError", "cause"]) pending.push(record[key]);
+  }
+  return false;
 }
 
 export async function runCapacitySerializable<T>(
@@ -111,6 +120,16 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       capacityIds.sort();
       for (const capacityId of capacityIds)
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacityId}, 0))`;
+      // The initial graph read is needed to discover which capacity locks to
+      // take. Under SERIALIZABLE it can otherwise retain a snapshot from
+      // before a concurrent deadline update that committed while those locks
+      // were held. Row-lock the durable request and its waiters after taking
+      // the advisory locks so PostgreSQL raises 40001 and our retry starts
+      // from a fresh snapshot instead of admitting from stale deadlines.
+      if (existing) {
+        await tx.$queryRaw`SELECT id FROM admission_request WHERE id = ${existing.id} FOR UPDATE`;
+        await tx.$queryRaw`SELECT id FROM capacity_waiter WHERE "admissionRequestId" = ${existing.id} FOR UPDATE`;
+      }
       const observedRows = await tx.$queryRaw<
         Array<{ now: Date }>
       >`SELECT clock_timestamp() AS now`;

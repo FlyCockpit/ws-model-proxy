@@ -7,10 +7,6 @@ import {
 } from "@ws-model-proxy/api/lib/provider-credential-crypto";
 import { poolModelId } from "@ws-model-proxy/config/forwarder-identifiers";
 import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
-import {
-  credentialLookupPrefix,
-  hmacDigestForForwarderPurpose,
-} from "@ws-model-proxy/db/forwarder-security";
 import { afterAll, describe, expect, it } from "vitest";
 import type { AdmissionAttempt, CapacityLeaseHandle } from "./types.js";
 
@@ -188,12 +184,12 @@ integration("capacity admission across operating-system processes", () => {
       ];
       for (const sweeper of sweepers) children.add(sweeper.child);
       const sweepResults = await Promise.all(sweepers.map((sweeper) => sweeper.result));
+      // Reclaim is deliberately global. Another concurrently running
+      // integration sweeper may win this lease, so the durable row below—not
+      // this worker-local count—is the authoritative ownership proof.
       expect(
-        sweepResults.reduce(
-          (total, result) => total + ("reclaimed" in result ? result.reclaimed : 0),
-          0,
-        ),
-      ).toBeGreaterThanOrEqual(1);
+        sweepResults.every((result) => "reclaimed" in result && Number.isInteger(result.reclaimed)),
+      ).toBe(true);
       await expect(
         db.capacityLease.findUniqueOrThrow({ where: { id: holderResult.lease.leaseId } }),
       ).resolves.toMatchObject({ state: "RECLAIMED" });
@@ -411,7 +407,12 @@ integration("capacity admission across operating-system processes", () => {
            WHERE id = ${oldLease.id}`;
         const reclaim = startWorker({ operation: "reclaim", limit: 10 });
         children.add(reclaim.child);
-        await expect(reclaim.result).resolves.toEqual({ reclaimed: 1 });
+        // Other integration files can have expired work in the same forced-PG
+        // run. The global sweeper count is therefore not scoped to this lease;
+        // successful recovery below proves this exact lease was reclaimed.
+        await expect(reclaim.result).resolves.toMatchObject({
+          reclaimed: expect.any(Number),
+        });
         const recovery = await fetch(`http://127.0.0.1:${ports[1]}/admit`, {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -610,6 +611,9 @@ integration("capacity admission across operating-system processes", () => {
     process.env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS = `process-v1:${Buffer.alloc(32, 37).toString("base64")}`;
     process.env.MODEL_API_GLOBAL_CAPACITY_ENABLED = "true";
     process.env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = "true";
+    const { credentialLookupPrefix, hmacDigestForForwarderPurpose } = await import(
+      "@ws-model-proxy/db/forwarder-security"
+    );
     const upstreamResponses: Array<{ path: string; response: ServerResponse }> = [];
     const observations: string[] = [];
     const upstream = createServer((request, response) => {

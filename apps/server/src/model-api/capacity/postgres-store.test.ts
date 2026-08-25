@@ -30,6 +30,12 @@ describe("capacity wakeup polling", () => {
     expect(isRetryableCapacityTransactionError({ code: "40001" })).toBe(true);
     expect(isRetryableCapacityTransactionError({ code: "40P01" })).toBe(true);
     expect(isRetryableCapacityTransactionError({ code: "P2034" })).toBe(true);
+    expect(
+      isRetryableCapacityTransactionError({
+        code: "P2010",
+        meta: { driverAdapterError: { cause: { originalCode: "40001" } } },
+      }),
+    ).toBe(true);
     expect(isRetryableCapacityTransactionError({ code: "23505" })).toBe(false);
   });
   it.each(["P2034", "40001", "40P01"])(

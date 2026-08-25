@@ -214,8 +214,11 @@ try {
               'pre-provider-model'),
            ('pre-other-provider-target', NOW(), NOW(), 'owner-a', 'PROVIDER_MODEL',
               'pre-other-provider-model');
-    INSERT INTO model_pool (id, "createdAt", "updatedAt", "userId", slug, name)
-    VALUES ('pre-provider-pool', NOW(), NOW(), 'owner-a', 'pre-provider', 'Pre provider');
+    INSERT INTO model_pool
+      (id, "createdAt", "updatedAt", "userId", slug, name,
+       "publicEgressEnabled", "publicEgressAcknowledged")
+    VALUES ('pre-provider-pool', NOW(), NOW(), 'owner-a', 'pre-provider', 'Pre provider',
+      TRUE, TRUE);
     INSERT INTO pool_member
       (id, "createdAt", "updatedAt", "poolId", "executionTargetId", tier, "publicOrder")
     VALUES ('pre-provider-member', NOW(), NOW(), 'pre-provider-pool',
@@ -449,9 +452,11 @@ try {
       (id, "createdAt", "updatedAt", "userId", kind, "providerModelId")
     VALUES ('other-provider-target', NOW(), NOW(), 'owner-a', 'PROVIDER_MODEL',
       'other-provider-model');
-    INSERT INTO model_pool (id, "createdAt", "updatedAt", "userId", slug, name)
+    INSERT INTO model_pool
+      (id, "createdAt", "updatedAt", "userId", slug, name,
+       "publicEgressEnabled", "publicEgressAcknowledged")
     VALUES ('sticky-provider-pool', NOW(), NOW(), 'owner-a', 'sticky-provider',
-      'Sticky provider');
+      'Sticky provider', TRUE, TRUE);
     INSERT INTO pool_member
       (id, "createdAt", "updatedAt", "poolId", "executionTargetId", tier, "publicOrder")
     VALUES ('sticky-provider-member', NOW(), NOW(), 'sticky-provider-pool',

@@ -140,7 +140,7 @@ BEGIN
       USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
-END
+END;
 $cache_affinity_identity_immutable$;
 
 DROP TRIGGER IF EXISTS cache_affinity_identity_immutable ON cache_affinity_record;
@@ -200,7 +200,7 @@ BEGIN
       USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
-END
+END;
 $pool_member_tier_source$;
 
 DROP TRIGGER IF EXISTS pool_member_tier_source ON pool_member;
@@ -219,7 +219,7 @@ BEGIN
       USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
-END
+END;
 $pool_public_disable$;
 
 DROP TRIGGER IF EXISTS model_pool_public_disable ON model_pool;
@@ -234,7 +234,7 @@ BEGIN
     RAISE EXCEPTION 'model pool owner is immutable' USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
-END
+END;
 $model_pool_owner_immutable$;
 
 DROP TRIGGER IF EXISTS model_pool_owner_immutable ON model_pool;
@@ -336,14 +336,8 @@ BEGIN
     RAISE EXCEPTION 'provider Responses binding is immutable' USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
-END
+END;
 $response_stickiness_provider_binding_immutable$;
-
-DROP TRIGGER IF EXISTS response_stickiness_provider_binding_immutable
-  ON response_stickiness_record;
-CREATE TRIGGER response_stickiness_provider_binding_immutable
-BEFORE UPDATE ON response_stickiness_record
-FOR EACH ROW EXECUTE FUNCTION enforce_response_stickiness_provider_binding_immutable();
 
 ALTER TABLE relay_request DROP CONSTRAINT IF EXISTS relay_request_admission_telemetry_check;
 ALTER TABLE relay_request ADD CONSTRAINT relay_request_admission_telemetry_check CHECK (
@@ -489,7 +483,7 @@ BEGIN
     END IF;
   END IF;
   RETURN NEW;
-END
+END;
 $capacity_reference_check$;
 
 DROP TRIGGER IF EXISTS execution_target_capacity_consistency ON execution_target;
@@ -586,7 +580,7 @@ BEGIN
         (kind = 'PROVIDER_MODEL' AND "providerModelId" IS NOT NULL AND "discoveredModelId" IS NULL)
       );
   END IF;
-END
+END;
 $hardening$;
 
 -- Execution-target identity is immutable. Consumers may safely treat an ID as
@@ -602,7 +596,7 @@ BEGIN
       USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
-END
+END;
 $target_identity$;
 
 DROP TRIGGER IF EXISTS execution_target_identity_immutable ON execution_target;
@@ -624,7 +618,7 @@ BEGIN
   )
   ON CONFLICT ("discoveredModelId") DO NOTHING;
   RETURN NEW;
-END
+END;
 $create_discovered_target$;
 
 DROP TRIGGER IF EXISTS discovered_model_create_execution_target ON discovered_model;
@@ -707,7 +701,7 @@ BEGIN
   RETURNING id INTO capacity_id;
   NEW."inferenceCapacityId" := capacity_id;
   RETURN NEW;
-END
+END;
 $create_target_capacity$;
 
 DROP TRIGGER IF EXISTS execution_target_capacity_backfill ON execution_target;
@@ -762,7 +756,7 @@ BEGIN
       USING ERRCODE = '23505', DETAIL = conflict_detail,
             HINT = 'Keep the intended access rule in one row and remove the other explicitly before retrying.';
   END IF;
-END
+END;
 $consumer_conflicts$;
 
 -- Complete either half of compatibility rows that were committed by a newer
@@ -848,6 +842,15 @@ UPDATE response_stickiness_record AS record
    AND grant_row."ownerUserId" = pool."userId"
    AND grant_row."granteeUserId" = record."userId";
 
+-- Install immutability only after the one-time compatibility backfill above.
+-- Existing v3 grantee bindings may legitimately need their exact grant ID
+-- filled in; all subsequent application writes remain immutable.
+DROP TRIGGER IF EXISTS response_stickiness_provider_binding_immutable
+  ON response_stickiness_record;
+CREATE TRIGGER response_stickiness_provider_binding_immutable
+BEFORE UPDATE ON response_stickiness_record
+FOR EACH ROW EXECUTE FUNCTION enforce_response_stickiness_provider_binding_immutable();
+
 UPDATE relay_request AS consumer
    SET "requestedExecutionTargetId" = target.id
   FROM execution_target AS target
@@ -921,6 +924,8 @@ BEGIN
          OR target."userId" IS DISTINCT FROM model."userId"
          OR model."userId" IS DISTINCT FROM account."userId"
          OR pool."userId" IS DISTINCT FROM target."userId"
+         OR NOT pool."publicEgressEnabled"
+         OR NOT pool."publicEgressAcknowledged"
          OR NOT EXISTS (
            SELECT 1 FROM pool_member member
             WHERE member."poolId" = record."targetModelPoolId"
@@ -939,7 +944,7 @@ BEGIN
                 AND grant_row."ownerUserId" = pool."userId"
                 AND grant_row."granteeUserId" = record."userId"
            )
-         ))
+         )))
     UNION ALL
     SELECT format('relay request target row=%s', request.id)
       FROM relay_request request
@@ -961,7 +966,7 @@ BEGIN
       USING ERRCODE = '23514', DETAIL = invalid_detail,
             HINT = 'Correct the owner/target/type mismatch explicitly; hardening left the original rows unchanged.';
   END IF;
-END
+END;
 $invalid_consumers$;
 
 -- Canonicalize compatibility writes before uniqueness and consistency checks.
@@ -1083,7 +1088,7 @@ BEGIN
     END IF;
   END IF;
   RETURN NEW;
-END
+END;
 $canonicalize_consumer$;
 
 DROP TRIGGER IF EXISTS a_pool_member_canonicalize_execution_target ON pool_member;
@@ -1257,7 +1262,7 @@ BEGIN
     END IF;
   END IF;
   RETURN NEW;
-END
+END;
 $consumer_check$;
 
 DROP TRIGGER IF EXISTS pool_member_execution_target_consistency ON pool_member;
@@ -1590,7 +1595,7 @@ CREATE OR REPLACE FUNCTION reject_immutable_provider_history_mutation()
 RETURNS trigger LANGUAGE plpgsql AS $immutable_provider_history$
 BEGIN
   RAISE EXCEPTION '% is append-only', TG_TABLE_NAME USING ERRCODE = '55000';
-END
+END;
 $immutable_provider_history$;
 
 DROP TRIGGER IF EXISTS provider_usage_ledger_immutable ON provider_usage_ledger;
@@ -1634,7 +1639,7 @@ BEGIN
     RAISE EXCEPTION 'pricing retirement preserves activation and sets retirement' USING ERRCODE = '55000';
   END IF;
   RETURN NEW;
-END
+END;
 $provider_pricing_immutable$;
 DROP TRIGGER IF EXISTS provider_pricing_version_immutable ON provider_pricing_version;
 CREATE TRIGGER provider_pricing_version_immutable BEFORE UPDATE OR DELETE ON provider_pricing_version
@@ -1676,7 +1681,7 @@ BEGIN
     RAISE EXCEPTION 'invalid provider_attempt terminal fields' USING ERRCODE = '55000';
   END IF;
   RETURN NEW;
-END
+END;
 $provider_attempt_transition$;
 CREATE TRIGGER provider_attempt_transition BEFORE UPDATE OR DELETE ON provider_attempt
 FOR EACH ROW EXECUTE FUNCTION enforce_provider_attempt_transition();
@@ -1698,7 +1703,7 @@ BEGIN
     RAISE EXCEPTION 'provider budget reservation identity is immutable' USING ERRCODE = '55000';
   END IF;
   RETURN NEW;
-END
+END;
 $provider_budget_reservation_transition$;
 DROP TRIGGER IF EXISTS provider_budget_reservation_transition ON provider_budget_reservation;
 CREATE TRIGGER provider_budget_reservation_transition BEFORE UPDATE OR DELETE ON provider_budget_reservation
@@ -1717,7 +1722,7 @@ BEGIN
     RAISE EXCEPTION 'provider credential authenticated identity is immutable' USING ERRCODE = '55000';
   END IF;
   RETURN NEW;
-END
+END;
 $provider_credential_identity$;
 
 DROP TRIGGER IF EXISTS provider_credential_identity_immutable ON provider_credential;
@@ -1746,7 +1751,7 @@ BEGIN
     RAISE EXCEPTION 'provider authentication type cannot change after credentials exist' USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
-END
+END;
 $provider_account_endpoint_auth$;
 
 DROP TRIGGER IF EXISTS provider_account_endpoint_and_auth ON provider_account;
@@ -1766,7 +1771,7 @@ BEGIN
     RAISE EXCEPTION 'provider model identity is immutable' USING ERRCODE = '55000';
   END IF;
   RETURN NEW;
-END
+END;
 $provider_graph_identity$;
 
 DROP TRIGGER IF EXISTS provider_account_identity_immutable ON provider_account;
@@ -1800,7 +1805,7 @@ BEGIN
     END IF;
   END IF;
   RETURN NEW;
-END
+END;
 $provider_credential_account$;
 
 DROP TRIGGER IF EXISTS provider_credential_account_consistency ON provider_credential;
@@ -1827,7 +1832,7 @@ BEGIN
     RAISE EXCEPTION 'provider account without a current credential cannot retain an active credential' USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
-END
+END;
 $provider_current_credential$;
 
 DROP TRIGGER IF EXISTS provider_account_current_credential_consistency ON provider_account;
@@ -1974,7 +1979,7 @@ BEGIN
     END IF;
   END IF;
   RETURN NEW;
-END
+END;
 $provider_budget_graph$;
 
 DROP TRIGGER IF EXISTS provider_budget_policy_graph_consistency ON provider_budget_policy;
@@ -2031,7 +2036,7 @@ BEGIN
     END IF;
   END IF;
   RETURN NEW;
-END
+END;
 $provider_budget_history$;
 
 DROP TRIGGER IF EXISTS provider_budget_rule_immutable ON provider_budget_rule;
