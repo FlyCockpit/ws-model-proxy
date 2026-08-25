@@ -198,6 +198,53 @@ try {
       (id, "createdAt", "updatedAt", "modelApiTokenId", target, "executionTargetId")
     VALUES ('conflict-target-access', NOW(), NOW(), 'conflict-token', 'DIRECT_MODEL',
       'preexisting-target-a');
+    INSERT INTO provider_account
+      (id, "createdAt", "updatedAt", "userId", "providerType", label, "baseUrl",
+       "endpointIdentity", "endpointVersion", "authType")
+    VALUES ('pre-provider-account', NOW(), NOW(), 'owner-a', 'openai', 'Pre provider',
+      'https://pre.example.test/v1', 'https://pre.example.test/v1', 1, 'BEARER');
+    INSERT INTO provider_model
+      (id, "createdAt", "updatedAt", "userId", "providerAccountId", "upstreamModelId")
+    VALUES ('pre-provider-model', NOW(), NOW(), 'owner-a', 'pre-provider-account', 'pre-model'),
+           ('pre-other-provider-model', NOW(), NOW(), 'owner-a', 'pre-provider-account',
+             'pre-other-model');
+    INSERT INTO execution_target
+      (id, "createdAt", "updatedAt", "userId", kind, "providerModelId")
+    VALUES ('pre-provider-target', NOW(), NOW(), 'owner-a', 'PROVIDER_MODEL',
+              'pre-provider-model'),
+           ('pre-other-provider-target', NOW(), NOW(), 'owner-a', 'PROVIDER_MODEL',
+              'pre-other-provider-model');
+    INSERT INTO model_pool (id, "createdAt", "updatedAt", "userId", slug, name)
+    VALUES ('pre-provider-pool', NOW(), NOW(), 'owner-a', 'pre-provider', 'Pre provider');
+    INSERT INTO pool_member
+      (id, "createdAt", "updatedAt", "poolId", "executionTargetId", tier, "publicOrder")
+    VALUES ('pre-provider-member', NOW(), NOW(), 'pre-provider-pool',
+      'pre-provider-target', 'PUBLIC_OVERFLOW', 0);
+    INSERT INTO pool_grant
+      (id, "createdAt", "updatedAt", "poolId", "ownerUserId", "granteeUserId")
+    VALUES ('pre-provider-grant', NOW(), NOW(), 'pre-provider-pool', 'owner-a', 'owner-b');
+    INSERT INTO model_api_token
+      (id, "createdAt", "updatedAt", "userId", name, "lookupPrefix", "secretDigest")
+    VALUES ('pre-provider-token', NOW(), NOW(), 'owner-b', 'Pre provider token',
+      'pre-provider-prefix', 'pre-provider-digest');
+    INSERT INTO response_stickiness_record
+      (id, "createdAt", "updatedAt", "userId", "modelApiTokenId", "routingKeyDigest",
+       "routingVersion", "targetModelPoolId", "selectedExecutionTargetId",
+       "providerAccountId", "providerModelId", "providerEndpointIdentity",
+       "providerEndpointVersion", "providerUpstreamModelId", "nativeSurface",
+       "upstreamResponseIdDigest", "expiresAt")
+    VALUES ('pre-valid-grantee-binding', NOW(), NOW(), 'owner-b', 'pre-provider-token',
+      'pre-valid-grantee-digest', 3, 'pre-provider-pool', 'pre-provider-target',
+      'pre-provider-account', 'pre-provider-model', 'https://pre.example.test/v1', 1,
+      'pre-model', 'OPENAI_RESPONSES',
+      'fghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-abcde',
+      NOW() + INTERVAL '1 hour'),
+    ('pre-invalid-cross-wire', NOW(), NOW(), 'owner-b', 'pre-provider-token',
+      'pre-invalid-cross-wire-digest', 3, 'pre-provider-pool', 'pre-other-provider-target',
+      'pre-provider-account', 'pre-other-provider-model', 'https://pre.example.test/v1', 1,
+      'pre-other-model', 'OPENAI_RESPONSES',
+      'ghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-abcdef',
+      NOW() + INTERVAL '1 hour');
   `);
 
   try {
@@ -294,6 +341,7 @@ try {
         "invalid-preexisting-access",
         "invalid-preexisting-stickiness",
         "invalid-preexisting-relay",
+        "pre-invalid-cross-wire",
       ].every((id) => error?.detail?.includes(id))
     ) {
       throw error;
@@ -323,6 +371,7 @@ try {
     DELETE FROM pool_member WHERE id = 'invalid-preexisting-member';
     DELETE FROM model_api_token_allowlist_entry WHERE id = 'invalid-preexisting-access';
     DELETE FROM response_stickiness_record WHERE id = 'invalid-preexisting-stickiness';
+    DELETE FROM response_stickiness_record WHERE id = 'pre-invalid-cross-wire';
     DELETE FROM relay_request WHERE id = 'invalid-preexisting-relay';
   `);
 
@@ -359,6 +408,14 @@ try {
   `);
   if (backfill.rows[0].targets !== 2 || backfill.rows[0].relays !== 1) {
     throw new Error("Backfill was not idempotent or did not preserve old rows");
+  }
+  const preservedGranteeBinding = await client.query(`
+    SELECT COUNT(*)::int AS count FROM response_stickiness_record
+     WHERE id = 'pre-valid-grantee-binding' AND "userId" = 'owner-b'
+       AND "selectedExecutionTargetId" = 'pre-provider-target'
+  `);
+  if (preservedGranteeBinding.rows[0]?.count !== 1) {
+    throw new Error("Hardening rejected or rewrote a valid pre-existing grantee binding");
   }
 
   // Exercise the provider Responses v3 binding on real PostgreSQL. Endpoint

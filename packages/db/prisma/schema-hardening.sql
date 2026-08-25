@@ -875,16 +875,51 @@ BEGIN
     SELECT format('stickiness target row=%s', record.id)
       FROM response_stickiness_record record
       JOIN execution_target target ON target.id = record."targetExecutionTargetId"
-     WHERE target."userId" <> record."userId"
+     WHERE record."routingVersion" < 3
+       AND (target."userId" <> record."userId"
         OR (record."targetDiscoveredModelId" IS NOT NULL
-            AND target."discoveredModelId" IS DISTINCT FROM record."targetDiscoveredModelId")
+            AND target."discoveredModelId" IS DISTINCT FROM record."targetDiscoveredModelId"))
     UNION ALL
     SELECT format('stickiness selection row=%s', record.id)
       FROM response_stickiness_record record
       JOIN execution_target target ON target.id = record."selectedExecutionTargetId"
-     WHERE target."userId" <> record."userId"
+     WHERE record."routingVersion" < 3
+       AND (target."userId" <> record."userId"
         OR (record."selectedDiscoveredModelId" IS NOT NULL
-            AND target."discoveredModelId" IS DISTINCT FROM record."selectedDiscoveredModelId")
+            AND target."discoveredModelId" IS DISTINCT FROM record."selectedDiscoveredModelId"))
+    UNION ALL
+    SELECT format('provider stickiness graph row=%s', record.id)
+      FROM response_stickiness_record record
+      LEFT JOIN execution_target target ON target.id = record."selectedExecutionTargetId"
+      LEFT JOIN provider_model model ON model.id = target."providerModelId"
+      LEFT JOIN provider_account account ON account.id = model."providerAccountId"
+      LEFT JOIN model_pool pool ON pool.id = record."targetModelPoolId"
+      LEFT JOIN model_api_token token ON token.id = record."modelApiTokenId"
+     WHERE record."routingVersion" >= 3
+       AND (target.id IS NULL
+         OR model.id IS NULL
+         OR account.id IS NULL
+         OR pool.id IS NULL
+         OR target."providerModelId" IS DISTINCT FROM record."providerModelId"
+         OR model."providerAccountId" IS DISTINCT FROM record."providerAccountId"
+         OR model."upstreamModelId" IS DISTINCT FROM record."providerUpstreamModelId"
+         OR target."userId" IS DISTINCT FROM model."userId"
+         OR model."userId" IS DISTINCT FROM account."userId"
+         OR pool."userId" IS DISTINCT FROM target."userId"
+         OR NOT EXISTS (
+           SELECT 1 FROM pool_member member
+            WHERE member."poolId" = record."targetModelPoolId"
+              AND member."executionTargetId" = record."selectedExecutionTargetId"
+              AND member.tier = 'PUBLIC_OVERFLOW'::"PoolMemberTier"
+         )
+         OR (record."modelApiTokenId" IS NOT NULL
+           AND (token.id IS NULL OR token."userId" IS DISTINCT FROM record."userId"))
+         OR (record."userId" IS DISTINCT FROM pool."userId" AND NOT EXISTS (
+           SELECT 1 FROM pool_grant grant_row
+            WHERE grant_row."poolId" = record."targetModelPoolId"
+              AND grant_row."ownerUserId" = pool."userId"
+              AND grant_row."granteeUserId" = record."userId"
+         )))
     UNION ALL
     SELECT format('relay request target row=%s', request.id)
       FROM relay_request request
