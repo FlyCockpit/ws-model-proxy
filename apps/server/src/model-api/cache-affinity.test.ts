@@ -76,6 +76,24 @@ describe("cache affinity", () => {
     expect(digest({ payload: { ...payload, temperature: 0.3 } })).not.toBe(baseline);
   });
 
+  it("supports scalar Responses input without storing or truncating it", () => {
+    const first = affinityPrefixDigests({
+      ownerId: "owner",
+      surface: "OPENAI_RESPONSES",
+      payload: { input: "first private input" },
+      runtimeIdentity: "runtime",
+    });
+    const second = affinityPrefixDigests({
+      ownerId: "owner",
+      surface: "OPENAI_RESPONSES",
+      payload: { input: "different private input" },
+      runtimeIdentity: "runtime",
+    });
+    expect(first.digests).toHaveLength(1);
+    expect(first.digests[0]).not.toBe(second.digests[0]);
+    expect(first.digests[0]).not.toContain("private input");
+  });
+
   it("selects the longest compatible prefix but lets load override a weak match", async () => {
     const targetA = {
       poolMemberId: "member-a",

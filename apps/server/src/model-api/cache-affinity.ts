@@ -88,11 +88,12 @@ export function affinityPrefixDigests({
   payload: Record<string, unknown>;
   runtimeIdentity: string;
 }): { digests: string[]; conversationDigest: string | null } {
-  const ordered =
-    (Array.isArray(payload.input) && payload.input) ||
-    (Array.isArray(payload.messages) && payload.messages) ||
-    (Array.isArray(payload.prompt) && payload.prompt) ||
-    [];
+  const orderedSource = payload.input ?? payload.messages ?? payload.prompt;
+  const ordered = Array.isArray(orderedSource)
+    ? orderedSource
+    : orderedSource === undefined
+      ? []
+      : [orderedSource];
   const instructions = asJson(payload.instructions ?? payload.system);
   const tools = asJson(payload.tools);
   const parameters = Object.fromEntries(
@@ -110,6 +111,10 @@ export function affinityPrefixDigests({
     tools: tools ?? null,
     parameters,
   });
+  const bindingDigest = hmacDigestForForwarderPurpose({
+    purpose: "cacheAffinity",
+    value: `binding:${binding}`,
+  });
   const units = ordered
     .slice(0, MAX_PREFIXES_PER_REQUEST)
     .map(asJson)
@@ -122,7 +127,7 @@ export function affinityPrefixDigests({
     digests.push(
       hmacDigestForForwarderPurpose({
         purpose: "cacheAffinity",
-        value: `${binding}\nprefix:${index + 1}\n${cumulative}`,
+        value: `binding:${bindingDigest}\nprefix:${index + 1}\n${cumulative}`,
       }),
     );
   }
@@ -134,7 +139,7 @@ export function affinityPrefixDigests({
         ? null
         : hmacDigestForForwarderPurpose({
             purpose: "cacheAffinity",
-            value: `${binding}\nconversation:${stableJson(conversationSource)}`,
+            value: `binding:${bindingDigest}\nconversation:${stableJson(conversationSource)}`,
           }),
   };
 }
