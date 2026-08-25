@@ -231,18 +231,18 @@ try {
       (id, "createdAt", "updatedAt", "userId", "modelApiTokenId", "routingKeyDigest",
        "routingVersion", "targetModelPoolId", "selectedExecutionTargetId",
        "providerAccountId", "providerModelId", "providerEndpointIdentity",
-       "providerEndpointVersion", "providerUpstreamModelId", "nativeSurface",
+       "providerEndpointVersion", "providerUpstreamModelId", "poolGrantId", "nativeSurface",
        "upstreamResponseIdDigest", "expiresAt")
     VALUES ('pre-valid-grantee-binding', NOW(), NOW(), 'owner-b', 'pre-provider-token',
       'pre-valid-grantee-digest', 3, 'pre-provider-pool', 'pre-provider-target',
       'pre-provider-account', 'pre-provider-model', 'https://pre.example.test/v1', 1,
-      'pre-model', 'OPENAI_RESPONSES',
+      'pre-model', NULL, 'OPENAI_RESPONSES',
       'fghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-abcde',
       NOW() + INTERVAL '1 hour'),
     ('pre-invalid-cross-wire', NOW(), NOW(), 'owner-b', 'pre-provider-token',
       'pre-invalid-cross-wire-digest', 3, 'pre-provider-pool', 'pre-other-provider-target',
       'pre-provider-account', 'pre-other-provider-model', 'https://pre.example.test/v1', 1,
-      'pre-other-model', 'OPENAI_RESPONSES',
+      'pre-other-model', NULL, 'OPENAI_RESPONSES',
       'ghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-abcdef',
       NOW() + INTERVAL '1 hour');
   `);
@@ -413,6 +413,7 @@ try {
     SELECT COUNT(*)::int AS count FROM response_stickiness_record
      WHERE id = 'pre-valid-grantee-binding' AND "userId" = 'owner-b'
        AND "selectedExecutionTargetId" = 'pre-provider-target'
+       AND "poolGrantId" = 'pre-provider-grant'
   `);
   if (preservedGranteeBinding.rows[0]?.count !== 1) {
     throw new Error("Hardening rejected or rewrote a valid pre-existing grantee binding");
@@ -470,23 +471,23 @@ try {
       (id, "createdAt", "updatedAt", "userId", "modelApiTokenId", "routingKeyDigest",
        "routingVersion", "targetModelPoolId", "selectedExecutionTargetId",
        "providerAccountId", "providerModelId", "providerEndpointIdentity",
-       "providerEndpointVersion", "providerUpstreamModelId", "nativeSurface",
+       "providerEndpointVersion", "providerUpstreamModelId", "poolGrantId", "nativeSurface",
        "upstreamResponseIdDigest", "expiresAt")
     VALUES ('sticky-provider-binding', NOW(), NOW(), 'owner-a', 'sticky-provider-token',
       'sticky-routing-digest', 3, 'sticky-provider-pool', 'sticky-provider-target',
       'sticky-provider-account', 'sticky-provider-model', 'https://api.example.test/v1', 1,
-      'gpt-responses', 'OPENAI_RESPONSES',
+      'gpt-responses', NULL, 'OPENAI_RESPONSES',
       'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-', NOW() + INTERVAL '1 hour');
     INSERT INTO response_stickiness_record
       (id, "createdAt", "updatedAt", "userId", "modelApiTokenId", "routingKeyDigest",
        "routingVersion", "targetModelPoolId", "selectedExecutionTargetId",
        "providerAccountId", "providerModelId", "providerEndpointIdentity",
-       "providerEndpointVersion", "providerUpstreamModelId", "nativeSurface",
+       "providerEndpointVersion", "providerUpstreamModelId", "poolGrantId", "nativeSurface",
        "upstreamResponseIdDigest", "expiresAt")
     VALUES ('grantee-provider-binding', NOW(), NOW(), 'owner-b', 'grantee-provider-token',
       'grantee-sticky-routing-digest', 3, 'sticky-provider-pool', 'sticky-provider-target',
       'sticky-provider-account', 'sticky-provider-model', 'https://api.example.test/v1', 1,
-      'gpt-responses', 'OPENAI_RESPONSES',
+      'gpt-responses', 'sticky-provider-grant', 'OPENAI_RESPONSES',
       'efghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-abcd',
       NOW() + INTERVAL '1 hour');
     INSERT INTO response_stickiness_record
@@ -586,6 +587,27 @@ try {
   `);
   if (deletedTokenBinding.rows[0]?.count !== 0) {
     throw new Error("Deleted model API token retained a provider Responses binding");
+  }
+  await client.query(`DELETE FROM pool_grant WHERE id = 'sticky-provider-grant'`);
+  const revokedGrantBinding = await client.query(`
+    SELECT COUNT(*)::int AS count FROM response_stickiness_record
+     WHERE id = 'grantee-provider-binding'
+  `);
+  if (revokedGrantBinding.rows[0]?.count !== 0) {
+    throw new Error("Revoked pool grant retained a provider Responses binding");
+  }
+  await client.query(`
+    INSERT INTO pool_grant
+      (id, "createdAt", "updatedAt", "poolId", "ownerUserId", "granteeUserId")
+    VALUES ('replacement-sticky-provider-grant', NOW(), NOW(), 'sticky-provider-pool',
+      'owner-a', 'owner-b')
+  `);
+  const resurrectedGrantBinding = await client.query(`
+    SELECT COUNT(*)::int AS count FROM response_stickiness_record
+     WHERE id = 'grantee-provider-binding'
+  `);
+  if (resurrectedGrantBinding.rows[0]?.count !== 0) {
+    throw new Error("Replacement pool grant resurrected an old provider Responses binding");
   }
   await client.query(`DELETE FROM model_api_token WHERE id = 'grantee-provider-token'`);
   const deletedGranteeBinding = await client.query(`

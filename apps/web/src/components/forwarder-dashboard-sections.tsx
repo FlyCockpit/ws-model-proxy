@@ -48,6 +48,7 @@ import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
+import { GuardedPoolSetupWizard } from "@/components/guarded-pool-setup-wizard";
 import { InlineRetry } from "@/components/inline-retry";
 import { ProviderOperationsSection } from "@/components/provider-operations-section";
 import { SegmentedControl } from "@/components/segmented-control";
@@ -80,6 +81,8 @@ type RelayRow = Awaited<ReturnType<AppRouterClient["relayMetadata"]["listOwn"]>>
 type CapacityRow = Awaited<ReturnType<AppRouterClient["capacityManagement"]["list"]>>[number];
 type ScopeMode = "ALL_VISIBLE" | "ALLOWLIST";
 type RoutingStatus = "ACTIVE" | "DRAINING" | "DISABLED";
+type MemberTestSurface = "OPENAI_CHAT_COMPLETIONS" | "OPENAI_RESPONSES" | "ANTHROPIC_MESSAGES";
+type MemberTestMode = "PREFER_NATIVE" | "REQUIRE_NATIVE" | "REQUIRE_ADAPTED";
 type EndpointHealthFilter = "all" | "online" | "offline" | "stale";
 type DeleteTarget =
   | { kind: "cli"; id: string; label: string }
@@ -110,6 +113,61 @@ const poolSurfaceValues = [
   "OPENAI_RESPONSES",
   "ANTHROPIC_MESSAGES",
 ] as const;
+
+async function testPoolMemberThroughResolver({
+  poolModel,
+  memberId,
+  surface,
+  mode,
+}: {
+  poolModel: string;
+  memberId: string;
+  surface: MemberTestSurface;
+  mode: MemberTestMode;
+}) {
+  const endpoint =
+    surface === "OPENAI_RESPONSES"
+      ? "responses"
+      : surface === "ANTHROPIC_MESSAGES"
+        ? "messages"
+        : "chat/completions";
+  const body =
+    surface === "OPENAI_RESPONSES"
+      ? { model: poolModel, input: "Reply with the single word pong.", stream: false }
+      : surface === "ANTHROPIC_MESSAGES"
+        ? {
+            model: poolModel,
+            messages: [{ role: "user", content: "Reply with the single word pong." }],
+            max_tokens: 8,
+            stream: false,
+          }
+        : {
+            model: poolModel,
+            messages: [{ role: "user", content: "Reply with the single word pong." }],
+            max_tokens: 8,
+            stream: false,
+          };
+  const response = await fetch(`${env.VITE_SERVER_URL}/api/internal/chat-test/${endpoint}`, {
+    method: "POST",
+    credentials: "include",
+    headers: {
+      "content-type": "application/json",
+      "x-wsmp-chat-test-routing-mode": mode,
+      "x-wsmp-chat-test-member-id": memberId,
+      ...(surface === "ANTHROPIC_MESSAGES" ? { "anthropic-version": "2023-06-01" } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => null)) as {
+      error?: { message?: string } | string;
+    } | null;
+    const error = payload?.error;
+    throw new Error(
+      (typeof error === "string" ? error : error?.message) ?? `HTTP ${response.status}`,
+    );
+  }
+}
 
 function copyToClipboard(value: string, message: string) {
   void navigator.clipboard.writeText(value).then(() => toast.success(message));
@@ -1154,7 +1212,7 @@ function DirectCapacityPolicyForm({
   );
 }
 
-function PoolSetupWizard({
+function _PoolSetupWizard({
   open,
   onOpenChange,
   directModels,
@@ -1585,6 +1643,8 @@ export function PoolsSection() {
     null,
   );
   const [testingMemberId, setTestingMemberId] = useState<string | null>(null);
+  const [memberTestSurface, setMemberTestSurface] = useState<MemberTestSurface>("OPENAI_RESPONSES");
+  const [memberTestMode, setMemberTestMode] = useState<MemberTestMode>("PREFER_NATIVE");
   const directModels = useMemo(() => allDirectModels(devicesData ?? []), [devicesData]);
 
   const onChanged = () => {
@@ -1677,7 +1737,11 @@ export function PoolsSection() {
           </div>
         }
       />
-      <PoolSetupWizard open={wizardOpen} onOpenChange={setWizardOpen} directModels={directModels} />
+      <GuardedPoolSetupWizard
+        open={wizardOpen}
+        onOpenChange={setWizardOpen}
+        directModels={directModels}
+      />
 
       {capacitiesData || capacitiesPending ? (
         <div className="mb-6 border-y bg-muted/30 py-4">
@@ -1824,6 +1888,18 @@ export function PoolsSection() {
                               {t("dashboard:pools.surfaceCounts", availability)}
                               {availability.streaming ? ` · ${t("dashboard:pools.streaming")}` : ""}
                             </div>
+                            <div className="mt-1 text-muted-foreground">
+                              {t("dashboard:pools.surfaceTierCounts", {
+                                tier: t("dashboard:pools.memberTiers.PRIMARY"),
+                                ...availability.primary,
+                              })}
+                            </div>
+                            <div className="text-muted-foreground">
+                              {t("dashboard:pools.surfaceTierCounts", {
+                                tier: t("dashboard:pools.memberTiers.PUBLIC_OVERFLOW"),
+                                ...availability.publicOverflow,
+                              })}
+                            </div>
                             {availability.limitations.length > 0 ? (
                               <div className="mt-1 break-words text-muted-foreground">
                                 {availability.limitations
@@ -1892,7 +1968,47 @@ export function PoolsSection() {
 
               <div className="grid min-w-0 gap-0 divide-y lg:grid-cols-[1fr_22rem] lg:divide-x lg:divide-y-0">
                 <div className="min-w-0 p-4">
-                  <h4 className="mb-2 text-sm font-medium">{t("dashboard:pools.membersTitle")}</h4>
+                  <div className="mb-3 flex flex-wrap items-end justify-between gap-2">
+                    <h4 className="text-sm font-medium">{t("dashboard:pools.membersTitle")}</h4>
+                    <div className="flex flex-wrap gap-2">
+                      <Label className="sr-only" htmlFor={`member-test-surface-${pool.id}`}>
+                        {t("dashboard:pools.memberTestSurface")}
+                      </Label>
+                      <select
+                        id={`member-test-surface-${pool.id}`}
+                        className="h-11 rounded-md border bg-background px-3 text-xs"
+                        value={memberTestSurface}
+                        onChange={(event) =>
+                          setMemberTestSurface(event.target.value as MemberTestSurface)
+                        }
+                      >
+                        <option value="OPENAI_CHAT_COMPLETIONS">OpenAI Chat</option>
+                        <option value="OPENAI_RESPONSES">OpenAI Responses</option>
+                        <option value="ANTHROPIC_MESSAGES">Anthropic Messages</option>
+                      </select>
+                      <Label className="sr-only" htmlFor={`member-test-mode-${pool.id}`}>
+                        {t("dashboard:pools.memberTestMode")}
+                      </Label>
+                      <select
+                        id={`member-test-mode-${pool.id}`}
+                        className="h-11 rounded-md border bg-background px-3 text-xs"
+                        value={memberTestMode}
+                        onChange={(event) =>
+                          setMemberTestMode(event.target.value as MemberTestMode)
+                        }
+                      >
+                        <option value="PREFER_NATIVE">
+                          {t("dashboard:pools.memberTestPreferred")}
+                        </option>
+                        <option value="REQUIRE_NATIVE">
+                          {t("dashboard:pools.memberTestNative")}
+                        </option>
+                        <option value="REQUIRE_ADAPTED">
+                          {t("dashboard:pools.memberTestAdapted")}
+                        </option>
+                      </select>
+                    </div>
+                  </div>
                   {pool.members.length === 0 ? (
                     <p className="text-sm text-muted-foreground">
                       {t("dashboard:pools.noMembers")}
@@ -2024,6 +2140,27 @@ export function PoolsSection() {
                                     </div>
                                     <div>
                                       <dt className="inline">
+                                        {t("dashboard:pools.capacity.fields.capacityWaitBudgetMs")}:{" "}
+                                      </dt>
+                                      <dd className="inline">
+                                        {member.capacityWaitBudgetMode}
+                                        {member.capacityWaitBudgetMs != null
+                                          ? ` ${member.capacityWaitBudgetMs} ms`
+                                          : ""}
+                                      </dd>
+                                    </div>
+                                    <div>
+                                      <dt className="inline">
+                                        {t("dashboard:pools.capacity.fields.capacityContextMargin")}
+                                        :{" "}
+                                      </dt>
+                                      <dd className="inline">
+                                        {member.capacityContextMargin ??
+                                          t("dashboard:pools.inherited")}
+                                      </dd>
+                                    </div>
+                                    <div>
+                                      <dt className="inline">
                                         {t("dashboard:pools.memberPhysicalCapacity")}:{" "}
                                       </dt>
                                       <dd className="inline">
@@ -2048,6 +2185,29 @@ export function PoolsSection() {
                                           : t("dashboard:pools.capacity.unattached")}
                                       </dd>
                                     </div>
+                                    {member.inferenceCapacityId ? (
+                                      <div>
+                                        <dt className="inline">
+                                          {t("dashboard:pools.memberPhysicalContext")}:{" "}
+                                        </dt>
+                                        <dd className="inline">
+                                          {t("dashboard:pools.memberPhysicalContextValue", {
+                                            context: String(
+                                              capacitiesData?.find(
+                                                (capacity) =>
+                                                  capacity.id === member.inferenceCapacityId,
+                                              )?.physicalMaxContext ?? "∞",
+                                            ),
+                                            strategy: String(
+                                              capacitiesData?.find(
+                                                (capacity) =>
+                                                  capacity.id === member.inferenceCapacityId,
+                                              )?.countStrategy ?? "—",
+                                            ),
+                                          })}
+                                        </dd>
+                                      </div>
+                                    ) : null}
                                   </dl>
                                 </details>
                               </td>
@@ -2075,51 +2235,38 @@ export function PoolsSection() {
                               </td>
                               <td className="py-2 pl-3 align-top">
                                 <div className="flex justify-end gap-1">
-                                  {member.model?.surfaces.OPENAI_CHAT_COMPLETIONS.mode !==
-                                  "unavailable" ? (
-                                    <Button
-                                      type="button"
-                                      variant="ghost"
-                                      size="touch"
-                                      disabled={testingMemberId === member.id}
-                                      onClick={async () => {
-                                        setTestingMemberId(member.id);
-                                        try {
-                                          const response = await fetch(
-                                            `${env.VITE_SERVER_URL}/api/internal/pools/members/${member.id}/test`,
-                                            {
-                                              method: "POST",
-                                              credentials: "include",
-                                            },
-                                          );
-                                          const payload = (await response.json()) as {
-                                            ok?: boolean;
-                                            error?: string;
-                                          };
-                                          if (!response.ok || !payload.ok) {
-                                            throw new Error(
-                                              payload.error ?? `HTTP ${response.status}`,
-                                            );
-                                          }
-                                          onChanged();
-                                          toast.success(t("dashboard:pools.testMemberSuccess"));
-                                        } catch (error) {
-                                          toast.error(
-                                            t("dashboard:pools.testMemberFailed", {
-                                              error:
-                                                error instanceof Error
-                                                  ? error.message
-                                                  : String(error),
-                                            }),
-                                          );
-                                        } finally {
-                                          setTestingMemberId(null);
-                                        }
-                                      }}
-                                    >
-                                      {t("dashboard:pools.testMember")}
-                                    </Button>
-                                  ) : null}
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="touch"
+                                    disabled={testingMemberId === member.id}
+                                    onClick={async () => {
+                                      setTestingMemberId(member.id);
+                                      try {
+                                        await testPoolMemberThroughResolver({
+                                          poolModel: pool.canonicalModelId,
+                                          memberId: member.id,
+                                          surface: memberTestSurface,
+                                          mode: memberTestMode,
+                                        });
+                                        onChanged();
+                                        toast.success(t("dashboard:pools.testMemberSuccess"));
+                                      } catch (error) {
+                                        toast.error(
+                                          t("dashboard:pools.testMemberFailed", {
+                                            error:
+                                              error instanceof Error
+                                                ? error.message
+                                                : String(error),
+                                          }),
+                                        );
+                                      } finally {
+                                        setTestingMemberId(null);
+                                      }
+                                    }}
+                                  >
+                                    {t("dashboard:pools.testMember")}
+                                  </Button>
                                   <Button
                                     type="button"
                                     variant="ghost"
@@ -3860,17 +4007,38 @@ function GrantPoolDialog({
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
-  const [email, setEmail] = useState("");
   const grant = useMutation(
     orpc.forwarderManagement.grantPoolAccessByEmail.mutationOptions({
       onSuccess: () => {
         queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:pools.grantAdded"));
-        setEmail("");
+        form.reset();
         onOpenChange(false);
       },
     }),
   );
+  const schema = z
+    .object({
+      email: z.string().trim().email(),
+      publicEgressAcknowledged: z.boolean(),
+    })
+    .superRefine((value, ctx) => {
+      if (pool?.publicEgressEnabled && !value.publicEgressAcknowledged) {
+        ctx.addIssue({ code: "custom", path: ["publicEgressAcknowledged"] });
+      }
+    });
+  const form = useForm({
+    defaultValues: { email: "", publicEgressAcknowledged: false },
+    validators: { onSubmit: schema },
+    onSubmit: ({ value }) =>
+      pool
+        ? grant.mutateAsync({
+            poolId: pool.id,
+            email: value.email,
+            publicEgressAcknowledged: value.publicEgressAcknowledged,
+          })
+        : Promise.resolve(),
+  });
 
   return (
     <Dialog open={Boolean(pool)} onOpenChange={onOpenChange}>
@@ -3883,26 +4051,60 @@ function GrantPoolDialog({
           className="space-y-4"
           onSubmit={(event) => {
             event.preventDefault();
-            if (pool && email) grant.mutate({ poolId: pool.id, email });
+            form.handleSubmit();
           }}
         >
-          <div className="space-y-2">
-            <Label htmlFor="grant-email">{t("dashboard:pools.email")}</Label>
-            <Input
-              id="grant-email"
-              type="email"
-              inputMode="email"
-              autoComplete="email"
-              value={email}
-              onChange={(event) => setEmail(event.target.value)}
-              placeholder="user@example.com"
-            />
-            <p className="text-xs text-muted-foreground">{t("dashboard:pools.exactEmailOnly")}</p>
-          </div>
+          <form.Field name="email">
+            {(field) => (
+              <div className="space-y-2">
+                <Label htmlFor="grant-email">{t("dashboard:pools.email")}</Label>
+                <Input
+                  id="grant-email"
+                  type="email"
+                  inputMode="email"
+                  autoComplete="email"
+                  value={field.state.value}
+                  onBlur={field.handleBlur}
+                  onChange={(event) => field.handleChange(event.target.value)}
+                  placeholder="user@example.com"
+                  aria-invalid={field.state.meta.errors.length > 0}
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t("dashboard:pools.exactEmailOnly")}
+                </p>
+              </div>
+            )}
+          </form.Field>
+          {pool?.publicEgressEnabled ? (
+            <form.Field name="publicEgressAcknowledged">
+              {(field) => (
+                <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3">
+                  <p className="text-sm font-medium">
+                    {t("dashboard:pools.grantEgressWarningTitle")}
+                  </p>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    {t("dashboard:pools.grantEgressWarning", { pool: pool.name })}
+                  </p>
+                  <label className="mt-3 flex min-h-11 cursor-pointer items-center gap-3 text-sm">
+                    <Checkbox
+                      checked={field.state.value}
+                      onCheckedChange={(checked) => field.handleChange(checked === true)}
+                      aria-invalid={field.state.meta.errors.length > 0}
+                    />
+                    <span>{t("dashboard:pools.grantEgressAcknowledge")}</span>
+                  </label>
+                </div>
+              )}
+            </form.Field>
+          ) : null}
           <DialogFooter>
-            <Button type="submit" size="touch" disabled={!email || grant.isPending}>
-              {grant.isPending ? t("dashboard:pools.granting") : t("dashboard:pools.grant")}
-            </Button>
+            <form.Subscribe selector={(state) => [state.canSubmit, state.isSubmitting]}>
+              {([canSubmit, isSubmitting]) => (
+                <Button type="submit" size="touch" disabled={!canSubmit || isSubmitting}>
+                  {isSubmitting ? t("dashboard:pools.granting") : t("dashboard:pools.grant")}
+                </Button>
+              )}
+            </form.Subscribe>
           </DialogFooter>
         </form>
       </DialogContent>

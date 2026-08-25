@@ -156,6 +156,7 @@ const poolTarget: VisibleModelPoolTarget = {
   description: null,
   ownerUserId: "user-id",
   ownerUserSlug: "owner",
+  accessGrantId: null,
   poolSlug: "general",
   maxAttachmentBytes: null,
   optimisticBasicTranscription: false,

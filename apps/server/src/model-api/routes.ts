@@ -525,6 +525,13 @@ type ResponseStickinessRecordRow = {
   providerUpstreamModelId?: string | null;
   nativeSurface?: string | null;
   upstreamResponseIdDigest?: string | null;
+  poolGrantId?: string | null;
+  PoolGrant?: {
+    id: string;
+    poolId: string;
+    ownerUserId: string;
+    granteeUserId: string;
+  } | null;
   expiresAt: Date | null;
 };
 
@@ -2038,6 +2045,7 @@ async function writeProviderResponseStickiness(input: {
   endpointIdentity: string;
   endpointVersion: number;
   upstreamModelId: string;
+  poolGrantId: string | null;
 }) {
   const routingKeyDigest = responseStickinessDigest(input);
   await prisma.responseStickinessRecord.upsert({
@@ -2056,6 +2064,7 @@ async function writeProviderResponseStickiness(input: {
       providerEndpointIdentity: input.endpointIdentity,
       providerEndpointVersion: input.endpointVersion,
       providerUpstreamModelId: input.upstreamModelId,
+      poolGrantId: input.poolGrantId,
       nativeSurface: "OPENAI_RESPONSES",
       upstreamResponseIdDigest: upstreamResponseIdDigest(input.responseId),
       expiresAt: new Date(Date.now() + RESPONSES_STICKINESS_TTL_MS),
@@ -2076,6 +2085,7 @@ async function writeProviderResponseStickiness(input: {
       providerEndpointIdentity: input.endpointIdentity,
       providerEndpointVersion: input.endpointVersion,
       providerUpstreamModelId: input.upstreamModelId,
+      poolGrantId: input.poolGrantId,
       nativeSurface: "OPENAI_RESPONSES",
       upstreamResponseIdDigest: upstreamResponseIdDigest(input.responseId),
       expiresAt: new Date(Date.now() + RESPONSES_STICKINESS_TTL_MS),
@@ -2253,6 +2263,7 @@ export function captureProviderResponseBinding(input: {
   streaming: boolean;
   requester: RelayRequester;
   targetModelPoolId: string;
+  poolGrantId: string | null;
   target: {
     executionTargetId: string;
     providerAccountId: string;
@@ -2280,6 +2291,7 @@ export function captureProviderResponseBinding(input: {
         requester: input.requester,
         responseId,
         targetModelPoolId: input.targetModelPoolId,
+        poolGrantId: input.poolGrantId,
         ...input.target,
       });
     } catch (error) {
@@ -2351,6 +2363,10 @@ async function resolveStickyRoute({
       providerUpstreamModelId: true,
       nativeSurface: true,
       upstreamResponseIdDigest: true,
+      poolGrantId: true,
+      PoolGrant: {
+        select: { id: true, poolId: true, ownerUserId: true, granteeUserId: true },
+      },
       TargetExecutionTarget: { select: { discoveredModelId: true } },
       SelectedExecutionTarget: { select: { discoveredModelId: true } },
       expiresAt: true,
@@ -2367,7 +2383,16 @@ async function resolveStickyRoute({
     const visibleTarget = record?.targetModelPoolId
       ? (targets.modelPools.find((target) => target.id === record.targetModelPoolId) ?? null)
       : null;
-    if (!validRequester || !visibleTarget)
+    const exactGrantVisible = visibleTarget
+      ? record?.poolGrantId === null
+        ? visibleTarget.accessGrantId === null && visibleTarget.ownerUserId === requester.userId
+        : visibleTarget.accessGrantId === record?.poolGrantId &&
+          record.PoolGrant?.id === record.poolGrantId &&
+          record.PoolGrant.poolId === visibleTarget.id &&
+          record.PoolGrant.ownerUserId === visibleTarget.ownerUserId &&
+          record.PoolGrant.granteeUserId === requester.userId
+      : false;
+    if (!validRequester || !visibleTarget || !exactGrantVisible)
       return openAiFailureJsonResponse(
         "not_found",
         "Response routing metadata was not found or has expired.",
@@ -3184,6 +3209,10 @@ async function relayPool({
     request.headers.get("x-wsmp-chat-test-routing-mode"),
     requester.exposeTransformDebug === true,
   );
+  const forcedPoolMemberId =
+    requester.exposeTransformDebug === true
+      ? request.headers.get("x-wsmp-chat-test-member-id")?.trim() || undefined
+      : undefined;
   const relayDeadlineMs = startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS;
   const relayRequestId = await createRelayMetadata({
     userId: requester.userId,
@@ -3202,7 +3231,6 @@ async function relayPool({
     reason: PublicOverflowReason,
     releaseLocalCapacity: () => Promise<void>,
   ): Promise<Response | null> => {
-    if (testRoutingMode !== "PREFER_NATIVE") return null;
     // Public provider dispatch is intentionally limited to replayable modern
     // JSON operations. Stateful Responses and multipart/audio paths must retain
     // their exact target or fail safely.
@@ -3272,6 +3300,8 @@ async function relayPool({
       releaseLocalCapacity,
       adaptationEnabled:
         operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled,
+      chatTestRoutingMode: testRoutingMode,
+      forcedPoolMemberId,
       retrySafe:
         shouldRetryRelayOperation(operation, "precommit_5xx") &&
         shouldRetryRelayOperation(operation, "precommit_transport"),
@@ -3400,6 +3430,7 @@ async function relayPool({
               streaming: operation.stream,
               requester,
               targetModelPoolId: target.id,
+              poolGrantId: target.accessGrantId,
               target: result.target,
               terminal: result.terminal,
             })
@@ -3484,7 +3515,19 @@ async function relayPool({
 
   let globalLease: ModelApiLimitLease | undefined;
 
-  const members = await poolMemberRows(target.id);
+  const listedMembers = await poolMemberRows(target.id);
+  const members = forcedPoolMemberId
+    ? listedMembers.filter((member) => member.id === forcedPoolMemberId)
+    : listedMembers;
+  if (forcedPoolMemberId && members.length === 0) {
+    await operation.dispose?.();
+    await failRelayMetadata({ relayRequestId, startedAt, failure: "not_found" });
+    return operationFailureResponse(
+      operation,
+      "not_found",
+      "The selected pool member is unavailable in this pool.",
+    );
+  }
   const nativeCounts = new Map<string, ContextCountTelemetry>();
   if (capacityRuntime && operation.contextInput) {
     await Promise.all(
@@ -5691,6 +5734,7 @@ async function relayBoundProviderResponse(input: {
       streaming: input.stream,
       requester: input.requester,
       targetModelPoolId: input.stickyRoute.visibleTarget.id,
+      poolGrantId: input.stickyRoute.visibleTarget.accessGrantId,
       target: result.target,
       terminal: result.terminal,
     });
@@ -5705,27 +5749,33 @@ function responseIdParam(responseId: string | undefined): string | Response {
   return responseId;
 }
 
-async function responsesCreateHandler({
+export async function responsesCreateHandler({
   request,
   manager,
   limiter,
   capacityRuntime,
   adaptationFeatureEnabled,
+  chatTestUserId,
 }: {
   request: Request;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
   adaptationFeatureEnabled?: boolean;
   capacityRuntime?: CapacityAdmissionRuntime;
+  chatTestUserId?: string;
 }) {
-  const token = await authenticateRequest(request);
-  if (!token)
+  const token = chatTestUserId ? null : await authenticateRequest(request);
+  if (!token && !chatTestUserId)
     return openAiFailureJsonResponse("access_denied", "Missing or invalid model API token.");
 
   const prepared = await prepareJsonModeledRequest(request);
   if (prepared instanceof Response) return prepared;
-  const requester = requesterFromToken(token);
-  const targets = await listVisibleModelTargetsForToken(token);
+  const requester = chatTestUserId
+    ? requesterFromChatTestUser(chatTestUserId)
+    : requesterFromToken(token!);
+  const targets = chatTestUserId
+    ? await listVisibleModelTargetsForUser(chatTestUserId)
+    : await listVisibleModelTargetsForToken(token!);
   const previousId = previousResponseId(prepared.payload);
   const operation: Omit<RelayOperation, "stream" | "buildRequest"> = {
     family: "responses",
@@ -5918,13 +5968,14 @@ async function prepareAnthropicModeledRequest(
   };
 }
 
-async function anthropicMessagesHandler({
+export async function anthropicMessagesHandler({
   request,
   countTokens,
   manager,
   limiter,
   adaptationFeatureEnabled,
   capacityRuntime,
+  chatTestUserId,
 }: {
   request: Request;
   countTokens: boolean;
@@ -5932,9 +5983,10 @@ async function anthropicMessagesHandler({
   limiter: ModelApiConcurrencyLimiter;
   adaptationFeatureEnabled?: boolean;
   capacityRuntime?: CapacityAdmissionRuntime;
+  chatTestUserId?: string;
 }) {
-  const token = await authenticateRequest(request);
-  if (!token) {
+  const token = chatTestUserId ? null : await authenticateRequest(request);
+  if (!token && !chatTestUserId) {
     return anthropicErrorResponse(
       401,
       "Missing or invalid WSMP bearer token.",
@@ -5946,10 +5998,14 @@ async function anthropicMessagesHandler({
   const prepared = await prepareAnthropicModeledRequest(request, ingress);
   if (prepared instanceof Response) return prepared;
   if (countTokens) prepared.stream = false;
-  const targets = await listVisibleModelTargetsForToken(token);
+  const targets = chatTestUserId
+    ? await listVisibleModelTargetsForUser(chatTestUserId)
+    : await listVisibleModelTargetsForToken(token!);
   const response = await relayPreparedModeledRequest({
     request,
-    requester: requesterFromToken(token),
+    requester: chatTestUserId
+      ? requesterFromChatTestUser(chatTestUserId)
+      : requesterFromToken(token!),
     targets,
     prepared,
     operation: {

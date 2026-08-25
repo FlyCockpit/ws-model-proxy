@@ -88,6 +88,10 @@ export interface PublicOverflowRequest {
   /** Must be called before credential decryption or any network attempt. */
   releaseLocalCapacity: () => Promise<void>;
   adaptationEnabled: boolean;
+  /** Cookie-authenticated Chat Test may constrain provider execution mode. */
+  chatTestRoutingMode?: "PREFER_NATIVE" | "REQUIRE_NATIVE" | "REQUIRE_ADAPTED";
+  /** Cookie-authenticated member probe can constrain dispatch to one pool member. */
+  forcedPoolMemberId?: string;
   /** True only when the operation resolver proves a second attempt is safe. */
   retrySafe: boolean;
   requireNativeSurface?: ProtocolSurface;
@@ -147,6 +151,16 @@ export interface PublicProviderTarget {
   };
   affinity?: { outcome: string; score?: number; prefixDepth?: number; reason?: string };
   affinityTarget?: AffinityTarget;
+}
+
+export function matchesChatTestProviderMode(
+  target: Pick<PublicProviderTarget, "nativeSurfaces">,
+  requestedSurface: ProtocolSurface,
+  mode: PublicOverflowRequest["chatTestRoutingMode"],
+) {
+  if (mode === "REQUIRE_NATIVE") return target.nativeSurfaces.includes(requestedSurface);
+  if (mode === "REQUIRE_ADAPTED") return !target.nativeSurfaces.includes(requestedSurface);
+  return true;
 }
 
 export function matchesExactResponsesBinding(
@@ -1214,23 +1228,27 @@ export async function dispatchPublicOverflow(
   // pass with zero input solely to reject protocol/feature/output mismatches;
   // each target is checked again with its actual rendered wire size below.
   const binding = request.exactResponsesBinding;
+  const memberEligible = request.forcedPoolMemberId
+    ? listed.targets.filter((target) => target.poolMemberId === request.forcedPoolMemberId)
+    : listed.targets;
   const eligible = binding
-    ? listed.targets.filter((target) => matchesExactResponsesBinding(target, binding))
+    ? memberEligible.filter((target) => matchesExactResponsesBinding(target, binding))
     : request.requireNativeSurface
-      ? listed.targets.filter(
+      ? memberEligible.filter(
           (target) =>
             target.nativeSurfaces.includes(request.requireNativeSurface!) &&
             (request.requireNativeSurface !== "anthropic-messages" ||
               target.protocol === "anthropic"),
         )
-      : listed.targets;
+      : memberEligible;
   const compatible = eligible.filter(
     (target) =>
       publicTargetCompatibility(target, {
         ...request,
         liability: request.liability,
         contextTokens: 0n,
-      }) === "COMPATIBLE",
+      }) === "COMPATIBLE" &&
+      matchesChatTestProviderMode(target, request.requestedSurface, request.chatTestRoutingMode),
   );
   if (compatible.length === 0) {
     await Promise.allSettled(

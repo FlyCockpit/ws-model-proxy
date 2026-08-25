@@ -124,7 +124,7 @@ function client() {
   return createRouterClient(forwarderManagementRouter, { context: buildContext() });
 }
 
-function httpClient() {
+function httpClient(captures?: Array<{ status: number; body: string }>) {
   const handler = new RPCHandler(forwarderManagementRouter);
   const link = new RPCLink({
     url: "https://example.test/rpc",
@@ -133,7 +133,13 @@ function httpClient() {
         prefix: "/rpc",
         context: buildContext(),
       });
-      return result.matched ? result.response : new Response(null, { status: 404 });
+      if (!result.matched) return new Response(null, { status: 404 });
+      if (captures)
+        captures.push({
+          status: result.response.status,
+          body: await result.response.clone().text(),
+        });
+      return result.response;
     },
   });
   return createORPCClient(link) as ReturnType<
@@ -184,7 +190,8 @@ describe("forwarderManagementRouter", () => {
     db.modelPool.findFirst.mockResolvedValue(null);
     db.poolMember.findUnique.mockResolvedValue(null);
     db.providerModel.findFirst.mockResolvedValue(null);
-    const rpc = httpClient();
+    const captures: Array<{ status: number; body: string }> = [];
+    const rpc = httpClient(captures);
     const attempts = [
       rpc.updateModelPool({
         id: "foreign-pool",
@@ -196,27 +203,95 @@ describe("forwarderManagementRouter", () => {
         providerModelId: "foreign-provider-model",
         publicOrder: 0,
       }),
+      rpc.addPoolMember({
+        poolId: "foreign-pool",
+        discoveredModelId: "foreign-discovered-model",
+        weight: 1,
+        routingStatus: "ACTIVE",
+      }),
       rpc.updatePoolMember({ id: "foreign-member", publicOrder: 1 }),
       rpc.reorderProviderPoolMember({ id: "foreign-member", direction: "EARLIER" }),
       rpc.removePoolMember({ id: "foreign-member" }),
       rpc.deleteModelPool({ id: "foreign-pool" }),
       rpc.grantPoolAccessByEmail({ poolId: "foreign-pool", email: "victim@example.test" }),
       rpc.revokePoolAccessByEmail({ poolId: "foreign-pool", email: "victim@example.test" }),
+      rpc.cacheAffinityStats({ poolId: "foreign-pool" }),
+      rpc.clearCacheAffinity({ poolId: "foreign-pool" }),
+      rpc.removeCliDeviceMetadata({ id: "foreign-cli" }),
+      rpc.removeEndpointMetadata({ id: "foreign-endpoint" }),
+      rpc.removeDiscoveredModelMetadata({ id: "foreign-discovered-model" }),
+      rpc.updateDiscoveredModelCapabilities({
+        id: "foreign-discovered-model",
+        vision: true,
+        audio: false,
+        video: false,
+      }),
+      rpc.setDiscoveredModelCapabilityProfile({
+        id: "foreign-discovered-model",
+        mode: "inherit",
+        optimisticBasicTranscription: false,
+      }),
+      rpc.updateDiscoveredModelAttachmentLimit({
+        id: "foreign-discovered-model",
+        maxAttachmentBytes: null,
+      }),
     ];
     const results = await Promise.allSettled(attempts);
     for (const result of results) {
       expect(result.status).toBe("rejected");
       if (result.status === "rejected") expect(result.reason).toMatchObject({ code: "NOT_FOUND" });
     }
-    const serialized = JSON.stringify(results);
-    for (const identifier of ["foreign-pool", "foreign-provider-model", "foreign-member"])
-      expect(serialized).not.toContain(identifier);
+    expect(captures).toHaveLength(attempts.length);
+    for (const capture of captures) {
+      expect(capture.status).toBe(404);
+      expect(capture.body).toContain("NOT_FOUND");
+      for (const identifier of [
+        "foreign-pool",
+        "foreign-provider-model",
+        "foreign-member",
+        "foreign-discovered-model",
+        "foreign-cli",
+        "foreign-endpoint",
+      ])
+        expect(capture.body).not.toContain(identifier);
+    }
     expect(db.executionTarget.upsert).not.toHaveBeenCalled();
     expect(db.poolMember.create).not.toHaveBeenCalled();
     expect(db.poolMember.update).not.toHaveBeenCalled();
     expect(db.poolMember.delete).not.toHaveBeenCalled();
     expect(db.poolGrant.upsert).not.toHaveBeenCalled();
     expect(db.poolGrant.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("rejects guarded overflow without acknowledgement or a positive finite spend cap", async () => {
+    const base = {
+      slug: "guarded",
+      name: "Guarded",
+      localModelIds: ["local-id"],
+      recommendedSurface: "OPENAI_RESPONSES" as const,
+      physicalConcurrencyLimit: 1,
+      physicalMaxContext: 32_768,
+      memberConcurrencyLimit: 1,
+      memberContextCeiling: 31_744,
+      reservedSlots: 0,
+      localWaitBudgetMs: 30_000,
+      providerModels: [
+        { providerModelId: "provider-id", concurrencyLimit: 1, dailySpendLimit: "10.00" },
+      ],
+    };
+    await expect(
+      client().createGuardedModelPool({ ...base, publicEgressAcknowledged: false }),
+    ).rejects.toBeDefined();
+    await expect(
+      client().createGuardedModelPool({
+        ...base,
+        publicEgressAcknowledged: true,
+        providerModels: [
+          { providerModelId: "provider-id", concurrencyLimit: 1, dailySpendLimit: "0" },
+        ],
+      }),
+    ).rejects.toBeDefined();
+    expect(db.$transaction).not.toHaveBeenCalled();
   });
 
   it("previews and updates the current user's slug without changing internal ids", async () => {
@@ -975,7 +1050,11 @@ describe("forwarderManagementRouter", () => {
   });
 
   it("grants and revokes pool access by exact case-insensitive email without search", async () => {
-    db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+    db.modelPool.findUnique.mockResolvedValue({
+      id: "pool-id",
+      userId: "user-id",
+      publicEgressEnabled: false,
+    });
     db.user.findFirst.mockResolvedValue({ id: "grantee-id" });
     db.poolGrant.upsert.mockResolvedValue({
       id: "grant-id",
@@ -994,6 +1073,24 @@ describe("forwarderManagementRouter", () => {
       select: { id: true },
     });
     expect(JSON.stringify(db.user.findFirst.mock.calls)).not.toContain("contains");
+  });
+
+  it("requires an exact public-egress acknowledgement before creating a pool grant", async () => {
+    db.modelPool.findUnique.mockResolvedValue({
+      id: "pool-id",
+      userId: "user-id",
+      publicEgressEnabled: true,
+    });
+
+    await expect(
+      client().grantPoolAccessByEmail({
+        poolId: "pool-id",
+        email: "friend@example.com",
+        publicEgressAcknowledged: false,
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.user.findFirst).not.toHaveBeenCalled();
+    expect(db.poolGrant.upsert).not.toHaveBeenCalled();
   });
 
   it("returns a generic not-found result for unmatched grant emails", async () => {
@@ -1082,7 +1179,7 @@ describe("forwarderManagementRouter", () => {
       },
     ]);
 
-    await expect(client().visibleModels()).resolves.toEqual({
+    await expect(client().visibleModels()).resolves.toMatchObject({
       directModels: [
         {
           target: "DIRECT_MODEL",

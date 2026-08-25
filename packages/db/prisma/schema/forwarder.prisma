@@ -1179,15 +1179,16 @@ model CapacityLease {
 }
 
 model PoolGrant {
-  id            String    @id @default(cuid(2))
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @default(now()) @updatedAt
-  poolId        String
-  ownerUserId   String
-  granteeUserId String
-  ModelPool     ModelPool @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  Owner         User      @relation("PoolGrantOwner", fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  Grantee       User      @relation("PoolGrantGrantee", fields: [granteeUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  id                        String                     @id @default(cuid(2))
+  createdAt                 DateTime                   @default(now())
+  updatedAt                 DateTime                   @default(now()) @updatedAt
+  poolId                    String
+  ownerUserId               String
+  granteeUserId             String
+  ModelPool                 ModelPool                  @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Owner                     User                       @relation("PoolGrantOwner", fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Grantee                   User                       @relation("PoolGrantGrantee", fields: [granteeUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ResponseStickinessRecords ResponseStickinessRecord[]
 
   @@unique([poolId, granteeUserId])
   @@index([ownerUserId])
@@ -1266,6 +1267,7 @@ model ResponseStickinessRecord {
   providerEndpointIdentity  String?
   providerEndpointVersion   Int?
   providerUpstreamModelId   String?
+  poolGrantId               String?
   nativeSurface             String?
   upstreamResponseIdDigest  String?
   expiresAt                 DateTime?
@@ -1278,6 +1280,7 @@ model ResponseStickinessRecord {
   SelectedExecutionTarget   ExecutionTarget? @relation("ResponseStickinessSelectedExecutionTarget", fields: [selectedExecutionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ProviderAccount           ProviderAccount? @relation("ResponseStickinessProviderAccount", fields: [providerAccountId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ProviderModel             ProviderModel?   @relation("ResponseStickinessProviderModel", fields: [providerModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  PoolGrant                 PoolGrant?       @relation(fields: [poolGrantId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
   @@unique([userId, routingKeyDigest])
   @@index([modelApiTokenId])
@@ -1288,6 +1291,7 @@ model ResponseStickinessRecord {
   @@index([selectedExecutionTargetId])
   @@index([providerAccountId, providerEndpointVersion])
   @@index([providerModelId])
+  @@index([poolGrantId])
   @@index([expiresAt])
   @@map("response_stickiness_record")
 }

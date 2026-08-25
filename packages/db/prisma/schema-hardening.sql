@@ -12,7 +12,7 @@ CREATE SEQUENCE IF NOT EXISTS admission_enqueue_sequence AS bigint MINVALUE 0 ST
 -- before these locks is included by the backfill below; one that starts after
 -- the locks is released sees the installed trigger.
 LOCK TABLE discovered_model, execution_target, model_pool, model_api_token,
-  pool_member, model_api_token_allowlist_entry, response_stickiness_record,
+  pool_member, pool_grant, model_api_token_allowlist_entry, response_stickiness_record,
   relay_request, inference_capacity, admission_request, capacity_waiter,
   capacity_lease, provider_account, provider_model, provider_credential,
   provider_budget_policy, provider_budget_rule, provider_attempt, provider_budget_reservation,
@@ -296,7 +296,7 @@ ALTER TABLE response_stickiness_record
     ("routingVersion" < 3 AND "providerAccountId" IS NULL AND "providerModelId" IS NULL
       AND "providerEndpointIdentity" IS NULL AND "providerEndpointVersion" IS NULL
       AND "providerUpstreamModelId" IS NULL AND "nativeSurface" IS NULL
-      AND "upstreamResponseIdDigest" IS NULL)
+      AND "upstreamResponseIdDigest" IS NULL AND "poolGrantId" IS NULL)
     OR
     ("routingVersion" >= 3 AND "providerAccountId" IS NOT NULL AND "providerModelId" IS NOT NULL
       AND "selectedExecutionTargetId" IS NOT NULL AND "targetModelPoolId" IS NOT NULL
@@ -324,6 +324,7 @@ BEGIN
     OR NEW."targetModelPoolId" IS DISTINCT FROM OLD."targetModelPoolId"
     OR NEW."selectedDiscoveredModelId" IS DISTINCT FROM OLD."selectedDiscoveredModelId"
     OR NEW."selectedExecutionTargetId" IS DISTINCT FROM OLD."selectedExecutionTargetId"
+    OR NEW."poolGrantId" IS DISTINCT FROM OLD."poolGrantId"
     OR NEW."providerAccountId" IS DISTINCT FROM OLD."providerAccountId"
     OR NEW."providerModelId" IS DISTINCT FROM OLD."providerModelId"
     OR NEW."providerEndpointIdentity" IS DISTINCT FROM OLD."providerEndpointIdentity"
@@ -833,6 +834,20 @@ UPDATE response_stickiness_record AS consumer
  WHERE consumer."selectedExecutionTargetId" IS NULL
    AND target."discoveredModelId" = consumer."selectedDiscoveredModelId";
 
+-- Version-3 grantee bindings written before exact grant identity was added are
+-- backfilled only from the unique grant that currently establishes visibility.
+-- Missing grants remain null and are rejected by the pre-trigger audit below.
+UPDATE response_stickiness_record AS record
+   SET "poolGrantId" = grant_row.id
+  FROM model_pool pool, pool_grant grant_row
+ WHERE record."routingVersion" >= 3
+   AND record."poolGrantId" IS NULL
+   AND pool.id = record."targetModelPoolId"
+   AND record."userId" <> pool."userId"
+   AND grant_row."poolId" = pool.id
+   AND grant_row."ownerUserId" = pool."userId"
+   AND grant_row."granteeUserId" = record."userId";
+
 UPDATE relay_request AS consumer
    SET "requestedExecutionTargetId" = target.id
   FROM execution_target AS target
@@ -914,12 +929,17 @@ BEGIN
          )
          OR (record."modelApiTokenId" IS NOT NULL
            AND (token.id IS NULL OR token."userId" IS DISTINCT FROM record."userId"))
-         OR (record."userId" IS DISTINCT FROM pool."userId" AND NOT EXISTS (
-           SELECT 1 FROM pool_grant grant_row
-            WHERE grant_row."poolId" = record."targetModelPoolId"
-              AND grant_row."ownerUserId" = pool."userId"
-              AND grant_row."granteeUserId" = record."userId"
-         )))
+         OR (record."userId" IS NOT DISTINCT FROM pool."userId"
+           AND record."poolGrantId" IS NOT NULL)
+         OR (record."userId" IS DISTINCT FROM pool."userId" AND (
+           record."poolGrantId" IS NULL OR NOT EXISTS (
+             SELECT 1 FROM pool_grant grant_row
+              WHERE grant_row.id = record."poolGrantId"
+                AND grant_row."poolId" = record."targetModelPoolId"
+                AND grant_row."ownerUserId" = pool."userId"
+                AND grant_row."granteeUserId" = record."userId"
+           )
+         ))
     UNION ALL
     SELECT format('relay request target row=%s', request.id)
       FROM relay_request request
@@ -1171,11 +1191,15 @@ BEGIN
               AND member."executionTargetId" = NEW."selectedExecutionTargetId"
               AND member.tier = 'PUBLIC_OVERFLOW'::"PoolMemberTier"
          )
-         OR (NEW."userId" IS DISTINCT FROM pool_owner AND NOT EXISTS (
-           SELECT 1 FROM pool_grant grant_row
-            WHERE grant_row."poolId" = NEW."targetModelPoolId"
-              AND grant_row."ownerUserId" = pool_owner
-              AND grant_row."granteeUserId" = NEW."userId"
+         OR (NEW."userId" IS NOT DISTINCT FROM pool_owner AND NEW."poolGrantId" IS NOT NULL)
+         OR (NEW."userId" IS DISTINCT FROM pool_owner AND (
+           NEW."poolGrantId" IS NULL OR NOT EXISTS (
+             SELECT 1 FROM pool_grant grant_row
+              WHERE grant_row.id = NEW."poolGrantId"
+                AND grant_row."poolId" = NEW."targetModelPoolId"
+                AND grant_row."ownerUserId" = pool_owner
+                AND grant_row."granteeUserId" = NEW."userId"
+           )
          )) THEN
         RAISE EXCEPTION 'provider stickiness binding must match its exact account, model, target, pool, endpoint, and visibility graph'
           USING ERRCODE = '23514';

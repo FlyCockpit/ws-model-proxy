@@ -248,6 +248,9 @@ type PoolMemberRow = {
       id: string;
       upstreamModelId: string;
       displayName: string | null;
+      nativeCapabilities: unknown | null;
+      contextWindow: number | null;
+      concurrencyLimit: number | null;
       healthStatus: string;
       enabled: boolean;
       PricingVersions: Array<{ version: string; currency: string }>;
@@ -388,7 +391,21 @@ async function userSlugChangePreview({ userId, nextSlug }: { userId: string; nex
 }
 
 async function serializeVisibleTargets(targets: VisibleModelTargets) {
-  const modalities = await visibleModelAttachmentModalities(targets);
+  const [modalities, poolRows] = await Promise.all([
+    visibleModelAttachmentModalities(targets),
+    targets.modelPools.length
+      ? prisma.modelPool.findMany({
+          where: { id: { in: targets.modelPools.map((pool) => pool.id) } },
+          select: poolSelect,
+        })
+      : [],
+  ]);
+  const poolCompatibility = new Map(
+    (poolRows as ModelPoolRow[]).map((row) => {
+      const serialized = serializePool(row);
+      return [row.id, serialized.compatibility] as const;
+    }),
+  );
   return {
     directModels: targets.directModels.map((model) => ({
       target: model.target,
@@ -419,6 +436,7 @@ async function serializeVisibleTargets(targets: VisibleModelTargets) {
       maxAttachmentBytes: pool.maxAttachmentBytes,
       publicEgressEnabled: pool.publicEgressEnabled,
       publicEgressAcknowledged: pool.publicEgressAcknowledged,
+      compatibility: poolCompatibility.get(pool.id) ?? null,
       attachmentModalities: modalities.poolById.get(pool.id) ?? {
         image: false,
         audio: false,
@@ -532,15 +550,68 @@ function serializePool(row: ModelPoolRow) {
     );
   const memberMatrices = row.PoolMembers.map((member) => {
     const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
-    const capabilities = model ? memberCapabilities(model) : null;
-    return surfaceAvailabilityMatrix({
-      capabilities,
-      adaptationEnabled: row.protocolAdaptationEnabled,
-    });
+    if (model)
+      return {
+        tier: member.tier,
+        matrix: surfaceAvailabilityMatrix({
+          capabilities: memberCapabilities(model),
+          adaptationEnabled: row.protocolAdaptationEnabled,
+        }),
+      };
+    const provider = member.ExecutionTarget?.ProviderModel;
+    const native =
+      provider?.nativeCapabilities && typeof provider.nativeCapabilities === "object"
+        ? (provider.nativeCapabilities as { surfaces?: unknown; streaming?: unknown })
+        : null;
+    const nativeSurfaces = new Set(
+      Array.isArray(native?.surfaces)
+        ? native.surfaces.filter((value): value is string => typeof value === "string")
+        : [],
+    );
+    const surfaceNames: Record<ModelApiSurface, string> = {
+      OPENAI_CHAT_COMPLETIONS: "openai-chat",
+      OPENAI_RESPONSES: "openai-responses",
+      ANTHROPIC_MESSAGES: "anthropic-messages",
+      OPENAI_COMPLETIONS: "openai-completions",
+    };
+    const adaptable = [...nativeSurfaces].some((surface) =>
+      ["openai-chat", "openai-responses", "anthropic-messages"].includes(surface),
+    );
+    return {
+      tier: member.tier,
+      matrix: Object.fromEntries(
+        modelApiSurfaces.map((surface) => {
+          const nativeSurface = nativeSurfaces.has(surfaceNames[surface]);
+          const adapted =
+            !nativeSurface &&
+            row.protocolAdaptationEnabled &&
+            surface !== "OPENAI_COMPLETIONS" &&
+            adaptable;
+          return [
+            surface,
+            {
+              mode: nativeSurface ? "native" : adapted ? "adapted" : "unavailable",
+              streaming: Boolean(native?.streaming) && (nativeSurface || adapted),
+              limitations: adapted ? ["strict_common_subset"] : [],
+            },
+          ];
+        }),
+      ) as ReturnType<typeof surfaceAvailabilityMatrix>,
+    };
   });
   const surfaces = Object.fromEntries(
     modelApiSurfaces.map((surface) => {
-      const entries = memberMatrices.map((matrix) => matrix[surface]);
+      const entries = memberMatrices.map(({ matrix }) => matrix[surface]);
+      const tierCounts = (tier: "PRIMARY" | "PUBLIC_OVERFLOW") => {
+        const tierEntries = memberMatrices
+          .filter((entry) => entry.tier === tier)
+          .map(({ matrix }) => matrix[surface]);
+        return {
+          native: tierEntries.filter((entry) => entry.mode === "native").length,
+          adapted: tierEntries.filter((entry) => entry.mode === "adapted").length,
+          unavailable: tierEntries.filter((entry) => entry.mode === "unavailable").length,
+        };
+      };
       return [
         surface,
         {
@@ -549,6 +620,8 @@ function serializePool(row: ModelPoolRow) {
           unavailable: entries.filter((entry) => entry.mode === "unavailable").length,
           streaming: entries.some((entry) => entry.mode !== "unavailable" && entry.streaming),
           limitations: [...new Set(entries.flatMap((entry) => entry.limitations))],
+          primary: tierCounts("PRIMARY"),
+          publicOverflow: tierCounts("PUBLIC_OVERFLOW"),
         },
       ];
     }),
@@ -560,6 +633,8 @@ function serializePool(row: ModelPoolRow) {
       unavailable: number;
       streaming: boolean;
       limitations: string[];
+      primary: { native: number; adapted: number; unavailable: number };
+      publicOverflow: { native: number; adapted: number; unavailable: number };
     }
   >;
   const recommendedSurface =
@@ -716,7 +791,7 @@ function serializePool(row: ModelPoolRow) {
 async function ownedPool(poolId: string, userId: string) {
   const pool = await prisma.modelPool.findUnique({
     where: { id: poolId },
-    select: { id: true, userId: true },
+    select: { id: true, userId: true, publicEgressEnabled: true },
   });
   if (!pool || pool.userId !== userId) {
     throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
@@ -955,6 +1030,9 @@ const poolSelect = {
               id: true,
               upstreamModelId: true,
               displayName: true,
+              nativeCapabilities: true,
+              contextWindow: true,
+              concurrencyLimit: true,
               healthStatus: true,
               enabled: true,
               PricingVersions: {
@@ -1021,6 +1099,317 @@ const poolSelect = {
 } as const;
 
 export const forwarderManagementRouter = {
+  listGuardedOverflowCandidates: protectedProcedure.handler(async ({ context }) => {
+    const now = new Date();
+    const rows = await prisma.providerModel.findMany({
+      where: {
+        userId: context.session.user.id,
+        enabled: true,
+        deletedAt: null,
+        ProviderAccount: {
+          enabled: true,
+          deletedAt: null,
+          CurrentCredential: { status: "ACTIVE" },
+        },
+        PricingVersions: {
+          some: { status: "ACTIVE", retiredAt: null, effectiveAt: { lte: now } },
+        },
+      },
+      select: {
+        id: true,
+        upstreamModelId: true,
+        displayName: true,
+        nativeCapabilities: true,
+        capabilityMetadata: true,
+        contextWindow: true,
+        concurrencyLimit: true,
+        ProviderAccount: { select: { id: true, label: true, providerType: true } },
+        PricingVersions: {
+          where: { status: "ACTIVE", retiredAt: null, effectiveAt: { lte: now } },
+          orderBy: [{ effectiveAt: "desc" }, { id: "desc" }],
+          take: 1,
+          select: { id: true, version: true, currency: true },
+        },
+      },
+      orderBy: [{ ProviderAccount: { label: "asc" } }, { upstreamModelId: "asc" }],
+    });
+    return rows.flatMap((row) => {
+      const pricing = row.PricingVersions[0];
+      return pricing
+        ? [
+            {
+              id: row.id,
+              upstreamModelId: row.upstreamModelId,
+              displayName: row.displayName,
+              nativeCapabilities: row.nativeCapabilities,
+              capabilityMetadata: row.capabilityMetadata,
+              contextWindow: row.contextWindow,
+              concurrencyLimit: row.concurrencyLimit,
+              providerAccount: row.ProviderAccount,
+              pricing,
+            },
+          ]
+        : [];
+    });
+  }),
+  createGuardedModelPool: protectedProcedure
+    .input(
+      z
+        .object({
+          slug: poolSlugSchema,
+          name: poolNameSchema,
+          localModelIds: z.array(idSchema).min(1).max(64),
+          recommendedSurface: z.enum(modelApiSurfaces),
+          physicalConcurrencyLimit: z.number().int().min(1).max(10_000),
+          physicalMaxContext: z.number().int().min(1).max(100_000_000),
+          memberConcurrencyLimit: z.number().int().min(1).max(10_000),
+          memberContextCeiling: z.number().int().min(1).max(100_000_000),
+          reservedSlots: z.number().int().min(0).max(10_000),
+          localWaitBudgetMs: z.number().int().min(0).max(600_000),
+          publicEgressAcknowledged: z.boolean(),
+          providerModels: z
+            .array(
+              z.object({
+                providerModelId: idSchema,
+                concurrencyLimit: z.number().int().min(1).max(10_000),
+                dailySpendLimit: z
+                  .string()
+                  .regex(/^\d+(?:\.\d{1,9})?$/)
+                  .refine((value) => new Prisma.Decimal(value).greaterThan(0)),
+              }),
+            )
+            .max(32),
+        })
+        .superRefine((input, ctx) => {
+          if (input.reservedSlots > input.memberConcurrencyLimit) {
+            ctx.addIssue({
+              code: "custom",
+              path: ["reservedSlots"],
+              message: "Reserved slots exceed member concurrency",
+            });
+          }
+          if (input.memberContextCeiling > input.physicalMaxContext) {
+            ctx.addIssue({
+              code: "custom",
+              path: ["memberContextCeiling"],
+              message: "Member context exceeds physical context",
+            });
+          }
+          if (input.providerModels.length > 0 && !input.publicEgressAcknowledged) {
+            ctx.addIssue({
+              code: "custom",
+              path: ["publicEgressAcknowledged"],
+              message: "Public egress acknowledgement is required",
+            });
+          }
+          if (new Set(input.localModelIds).size !== input.localModelIds.length) {
+            ctx.addIssue({
+              code: "custom",
+              path: ["localModelIds"],
+              message: "Duplicate local model",
+            });
+          }
+          if (
+            new Set(input.providerModels.map((item) => item.providerModelId)).size !==
+            input.providerModels.length
+          ) {
+            ctx.addIssue({
+              code: "custom",
+              path: ["providerModels"],
+              message: "Duplicate provider model",
+            });
+          }
+        }),
+    )
+    .handler(async ({ input, context }) => {
+      const userId = context.session.user.id;
+      await assertPoolSlugAvailable(input.slug, userId);
+      const now = new Date();
+      return prisma.$transaction(
+        async (tx) => {
+          const localModels = await tx.discoveredModel.findMany({
+            where: {
+              id: { in: input.localModelIds },
+              userId,
+              published: true,
+              Endpoint: { published: true },
+            },
+            select: { id: true, upstreamModelId: true },
+          });
+          if (localModels.length !== input.localModelIds.length) {
+            throw new ORPCError("NOT_FOUND", { message: "A selected local model is unavailable" });
+          }
+          const providerIds = input.providerModels.map((item) => item.providerModelId);
+          const providers = providerIds.length
+            ? await tx.providerModel.findMany({
+                where: {
+                  id: { in: providerIds },
+                  userId,
+                  enabled: true,
+                  deletedAt: null,
+                  ProviderAccount: {
+                    enabled: true,
+                    deletedAt: null,
+                    CurrentCredential: { status: "ACTIVE" },
+                  },
+                },
+                select: {
+                  id: true,
+                  providerAccountId: true,
+                  PricingVersions: {
+                    where: { status: "ACTIVE", retiredAt: null, effectiveAt: { lte: now } },
+                    orderBy: [{ effectiveAt: "desc" }, { id: "desc" }],
+                    take: 1,
+                    select: { id: true, currency: true },
+                  },
+                },
+              })
+            : [];
+          if (
+            providers.length !== providerIds.length ||
+            providers.some((row) => !row.PricingVersions[0])
+          ) {
+            throw new ORPCError("PRECONDITION_FAILED", {
+              message: "A selected provider is not ready for guarded overflow",
+            });
+          }
+          const pool = await tx.modelPool.create({
+            data: {
+              userId,
+              slug: input.slug,
+              name: input.name,
+              protocolAdaptationEnabled: true,
+              publicEgressEnabled: providerIds.length > 0,
+              publicEgressAcknowledged: providerIds.length > 0,
+              recommendedSurfaceOverride: input.recommendedSurface,
+              capacityPriority: 16,
+              capacityConcurrencyLimit: input.memberConcurrencyLimit,
+              capacityReservedSlots: input.reservedSlots,
+              capacityWaitBudgetMs: input.localWaitBudgetMs,
+              capacityContextCeiling: input.memberContextCeiling,
+              capacityContextMargin: Math.min(1024, Math.max(0, input.memberContextCeiling - 1)),
+              capacityBorrowPolicy: "WHEN_IDLE",
+            },
+            select: { id: true },
+          });
+          for (const model of localModels) {
+            const capacity = await tx.inferenceCapacity.upsert({
+              where: {
+                userId_runtimeIdentityKey: { userId, runtimeIdentityKey: `model:${model.id}` },
+              },
+              update: {
+                hardConcurrencyLimit: input.physicalConcurrencyLimit,
+                physicalMaxContext: input.physicalMaxContext,
+              },
+              create: {
+                userId,
+                label: `Model ${model.id}`,
+                runtimeIdentityKey: `model:${model.id}`,
+                runtimeModel: model.upstreamModelId,
+                hardConcurrencyLimit: input.physicalConcurrencyLimit,
+                physicalMaxContext: input.physicalMaxContext,
+                countStrategy: "CONSERVATIVE_ESTIMATE",
+              },
+              select: { id: true },
+            });
+            const target = await tx.executionTarget.upsert({
+              where: { discoveredModelId: model.id },
+              update: { inferenceCapacityId: capacity.id },
+              create: {
+                userId,
+                kind: "DISCOVERED_MODEL",
+                discoveredModelId: model.id,
+                inferenceCapacityId: capacity.id,
+              },
+              select: { id: true },
+            });
+            await tx.poolMember.create({
+              data: {
+                poolId: pool.id,
+                discoveredModelId: model.id,
+                executionTargetId: target.id,
+                tier: "PRIMARY",
+                weight: 1,
+              },
+            });
+          }
+          const providerById = new Map(providers.map((provider) => [provider.id, provider]));
+          for (const [publicOrder, protection] of input.providerModels.entries()) {
+            const provider = providerById.get(protection.providerModelId);
+            if (!provider) throw new ORPCError("PRECONDITION_FAILED");
+            const target = await tx.executionTarget.upsert({
+              where: { providerModelId: provider.id },
+              update: {},
+              create: { userId, kind: "PROVIDER_MODEL", providerModelId: provider.id },
+              select: { id: true },
+            });
+            await tx.poolMember.create({
+              data: {
+                poolId: pool.id,
+                executionTargetId: target.id,
+                tier: "PUBLIC_OVERFLOW",
+                publicOrder,
+                weight: 0,
+              },
+            });
+            const budget = await tx.providerBudgetPolicy.create({
+              data: {
+                userId,
+                scopeType: "POOL_PROVIDER_MODEL",
+                providerAccountId: provider.providerAccountId,
+                poolId: pool.id,
+                providerModelId: provider.id,
+                active: true,
+                activatedAt: now,
+                Rules: {
+                  create: [
+                    {
+                      metric: "CONCURRENCY",
+                      period: "PER_ATTEMPT",
+                      mode: "LIMITED",
+                      limitValue: new Prisma.Decimal(protection.concurrencyLimit),
+                    },
+                    {
+                      metric: "SPEND",
+                      period: "UTC_DAY",
+                      mode: "LIMITED",
+                      limitValue: new Prisma.Decimal(protection.dailySpendLimit),
+                      currency: provider.PricingVersions[0]!.currency,
+                    },
+                  ],
+                },
+              },
+              select: { id: true },
+            });
+            await tx.providerAuditEvent.create({
+              data: {
+                userId,
+                providerAccountId: provider.providerAccountId,
+                action: "BUDGET_CREATED",
+                subjectId: budget.id,
+                metadata: { source: "guarded_pool_wizard" },
+              },
+            });
+          }
+          await tx.capacityAuditEvent.create({
+            data: {
+              userId,
+              actorUserId: userId,
+              action: "CREATE",
+              resourceType: "MODEL_POOL",
+              resourceId: pool.id,
+            },
+          });
+          const created = (await tx.modelPool.findUnique({
+            where: { id: pool.id },
+            select: poolSelect,
+          })) as ModelPoolRow | null;
+          if (!created) throw new ORPCError("INTERNAL_SERVER_ERROR");
+          return serializePool(created);
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
+    }),
   getProfileSlug: protectedProcedure.handler(async ({ context }) => {
     const user = await currentUserSlug(context.session.user.id);
     return { slug: user.slug };
@@ -2025,9 +2414,20 @@ export const forwarderManagementRouter = {
     }),
 
   grantPoolAccessByEmail: protectedProcedure
-    .input(z.object({ poolId: idSchema, email: z.string().trim().email().max(320) }))
+    .input(
+      z.object({
+        poolId: idSchema,
+        email: z.string().trim().email().max(320),
+        publicEgressAcknowledged: z.boolean().default(false),
+      }),
+    )
     .handler(async ({ input, context }) => {
-      await ownedPool(input.poolId, context.session.user.id);
+      const pool = await ownedPool(input.poolId, context.session.user.id);
+      if (pool.publicEgressEnabled && !input.publicEgressAcknowledged) {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Public-provider egress acknowledgement is required for this grant.",
+        });
+      }
       const grantee = await prisma.user.findFirst({
         where: { email: { equals: input.email, mode: "insensitive" } },
         select: { id: true },

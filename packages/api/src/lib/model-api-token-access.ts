@@ -37,6 +37,8 @@ export type VisibleModelPoolTarget = {
   description: string | null;
   ownerUserId: string;
   ownerUserSlug: string;
+  /** Exact grant row establishing visibility; null for the pool owner. */
+  accessGrantId: string | null;
   poolSlug: string;
   maxAttachmentBytes: number | null;
   optimisticBasicTranscription: boolean;
@@ -91,6 +93,7 @@ type ModelPoolRow = {
 };
 
 type PoolGrantRow = {
+  id: string;
   ModelPool: ModelPoolRow;
 };
 
@@ -121,7 +124,10 @@ function serializeDirectModel(row: DirectModelRow): VisibleDirectModelTarget {
   };
 }
 
-function serializeModelPool(row: ModelPoolRow): VisibleModelPoolTarget {
+function serializeModelPool(
+  row: ModelPoolRow,
+  accessGrantId: string | null = null,
+): VisibleModelPoolTarget {
   return {
     target: "MODEL_POOL",
     id: row.id,
@@ -130,6 +136,7 @@ function serializeModelPool(row: ModelPoolRow): VisibleModelPoolTarget {
     description: row.description,
     ownerUserId: row.userId,
     ownerUserSlug: row.User.slug,
+    accessGrantId,
     poolSlug: row.slug,
     maxAttachmentBytes: row.maxAttachmentBytes,
     optimisticBasicTranscription: row.optimisticBasicTranscription,
@@ -196,6 +203,7 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
       where: { granteeUserId: userId },
       orderBy: { createdAt: "desc" },
       select: {
+        id: true,
         ModelPool: {
           select: {
             id: true,
@@ -218,9 +226,9 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
   ]);
 
   const directModels = (directModelRows as DirectModelRow[]).map(serializeDirectModel);
-  const ownedPools = (ownedPoolRows as ModelPoolRow[]).map(serializeModelPool);
+  const ownedPools = (ownedPoolRows as ModelPoolRow[]).map((row) => serializeModelPool(row));
   const grantedPools = (grantedPoolRows as PoolGrantRow[]).map((grant) =>
-    serializeModelPool(grant.ModelPool),
+    serializeModelPool(grant.ModelPool, grant.id),
   );
 
   return {

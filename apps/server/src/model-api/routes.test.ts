@@ -222,6 +222,7 @@ const poolTarget: VisibleModelPoolTarget = {
   description: null,
   ownerUserId: "user-id",
   ownerUserSlug: "owner",
+  accessGrantId: null,
   poolSlug: "gpt-4.1-mini",
   maxAttachmentBytes: null,
   optimisticBasicTranscription: false,
@@ -3731,6 +3732,7 @@ describe("model API routes", () => {
         limitKey: "token-id",
       },
       targetModelPoolId: "pool-id",
+      poolGrantId: null,
       target: {
         executionTargetId: "provider-target",
         providerAccountId: "provider-account",
@@ -3764,6 +3766,7 @@ describe("model API routes", () => {
           providerEndpointIdentity: "https://provider.example/v1",
           providerEndpointVersion: 4,
           providerUpstreamModelId: "gpt-response",
+          poolGrantId: null,
           nativeSurface: "OPENAI_RESPONSES",
         }),
       }),
@@ -3823,6 +3826,7 @@ describe("model API routes", () => {
       providerEndpointIdentity: "https://provider.example/v1",
       providerEndpointVersion: 4,
       providerUpstreamModelId: "gpt-response",
+      poolGrantId: null,
       nativeSurface: "OPENAI_RESPONSES",
     });
     expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({
@@ -3835,6 +3839,7 @@ describe("model API routes", () => {
       ...binding,
       userId: "user-id",
       modelApiTokenId: "token-id",
+      PoolGrant: null,
       TargetExecutionTarget: null,
       SelectedExecutionTarget: { discoveredModelId: null },
     });
@@ -4184,6 +4189,8 @@ describe("model API routes", () => {
       providerEndpointIdentity: "https://provider.example/v1",
       providerEndpointVersion: 1,
       providerUpstreamModelId: "gpt-response",
+      poolGrantId: null,
+      PoolGrant: null,
       nativeSurface: "OPENAI_RESPONSES",
       upstreamResponseIdDigest: hmacDigestForForwarderPurpose({
         purpose: "responsesStickinessUpstreamId",
@@ -4200,6 +4207,51 @@ describe("model API routes", () => {
     expect(response.status).toBe(404);
     expect(manager.sent).toEqual([]);
     expect(affinity.rank).not.toHaveBeenCalled();
+  });
+
+  it("does not resurrect a grantee binding after its exact grant is replaced", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [
+        {
+          ...poolTarget,
+          ownerUserId: "pool-owner-id",
+          accessGrantId: "replacement-grant",
+        },
+      ],
+    });
+    db.responseStickinessRecord.findUnique.mockResolvedValue({
+      routingVersion: 3,
+      userId: "user-id",
+      modelApiTokenId: "token-id",
+      targetDiscoveredModelId: null,
+      targetModelPoolId: "pool-id",
+      selectedDiscoveredModelId: null,
+      selectedExecutionTargetId: "provider-target",
+      providerAccountId: "provider-account",
+      providerModelId: "provider-model",
+      providerEndpointIdentity: "https://provider.example/v1",
+      providerEndpointVersion: 1,
+      providerUpstreamModelId: "gpt-response",
+      nativeSurface: "OPENAI_RESPONSES",
+      poolGrantId: "original-grant",
+      PoolGrant: {
+        id: "original-grant",
+        poolId: "pool-id",
+        ownerUserId: "pool-owner-id",
+        granteeUserId: "user-id",
+      },
+      upstreamResponseIdDigest: hmacDigestForForwarderPurpose({
+        purpose: "responsesStickinessUpstreamId",
+        value: "resp_grantee",
+      }),
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+    const response = await appWith(new FakeRelayManager()).request("/responses/resp_grantee", {
+      headers: { authorization: "Bearer wsmp_model_test" },
+    });
+    expect(response.status).toBe(404);
+    expect(publicOverflow.dispatch).not.toHaveBeenCalled();
   });
 
   it.each([

@@ -3,7 +3,11 @@ import { Hono } from "hono";
 import { type RelaySessionManager, relaySessionManager } from "../relay/session-manager.js";
 import { type ModelApiConcurrencyLimiter, modelApiConcurrencyLimiter } from "./limits.js";
 import { openAiFailureJsonResponse } from "./openai-errors.js";
-import { chatTestCompletionsHandler } from "./routes.js";
+import {
+  anthropicMessagesHandler,
+  chatTestCompletionsHandler,
+  responsesCreateHandler,
+} from "./routes.js";
 
 type ChatTestRouteDependencies = {
   manager?: Pick<
@@ -38,6 +42,33 @@ export function createChatTestRoutes({
       userId: session.user.id,
       manager,
       limiter: concurrencyLimiter,
+    });
+  });
+
+  app.post("/responses", async (c) => {
+    const session = c.get("session");
+    if (!session?.user)
+      return openAiFailureJsonResponse("access_denied", "Authentication is required.");
+    return responsesCreateHandler({
+      request: c.req.raw,
+      chatTestUserId: session.user.id,
+      manager,
+      limiter: concurrencyLimiter,
+      adaptationFeatureEnabled: true,
+    });
+  });
+
+  app.post("/messages", async (c) => {
+    const session = c.get("session");
+    if (!session?.user)
+      return openAiFailureJsonResponse("access_denied", "Authentication is required.");
+    return anthropicMessagesHandler({
+      request: c.req.raw,
+      chatTestUserId: session.user.id,
+      countTokens: false,
+      manager,
+      limiter: concurrencyLimiter,
+      adaptationFeatureEnabled: true,
     });
   });
 

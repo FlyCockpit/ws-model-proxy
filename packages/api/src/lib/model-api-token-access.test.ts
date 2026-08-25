@@ -264,8 +264,8 @@ describe("modelApiTokenAccess", () => {
       db.discoveredModel.findMany.mockResolvedValue([]);
       db.modelPool.findMany.mockResolvedValue([ownedPool]);
       db.poolGrant.findMany
-        .mockResolvedValueOnce([{ ModelPool: firstGrantedPool }])
-        .mockResolvedValueOnce([{ ModelPool: secondGrantedPool }]);
+        .mockResolvedValueOnce([{ id: "grant-a", ModelPool: firstGrantedPool }])
+        .mockResolvedValueOnce([{ id: "grant-b", ModelPool: secondGrantedPool }]);
 
       const token = {
         id: "token-id",
@@ -284,6 +284,8 @@ describe("modelApiTokenAccess", () => {
         poolModelId({ userSlug: "owner", poolSlug: "owned" }),
         poolModelId({ userSlug: "team-b", poolSlug: "shared-b" }),
       ]);
+      expect(first.modelPools.map((pool) => pool.accessGrantId)).toEqual([null, "grant-a"]);
+      expect(second.modelPools.map((pool) => pool.accessGrantId)).toEqual([null, "grant-b"]);
     });
 
     it("intersects ALLOWLIST entries with current visibility", async () => {
@@ -298,7 +300,7 @@ describe("modelApiTokenAccess", () => {
       db.discoveredModel.findMany.mockResolvedValue([]);
       db.modelPool.findMany.mockResolvedValue([]);
       db.poolGrant.findMany
-        .mockResolvedValueOnce([{ ModelPool: grantedPool }])
+        .mockResolvedValueOnce([{ id: "grant-before-removal", ModelPool: grantedPool }])
         .mockResolvedValueOnce([]);
       db.modelApiTokenAllowlistEntry.findMany.mockResolvedValue([
         {
@@ -332,7 +334,9 @@ describe("modelApiTokenAccess", () => {
 
       db.discoveredModel.findMany.mockResolvedValue([]);
       db.modelPool.findMany.mockResolvedValue([]);
-      db.poolGrant.findMany.mockResolvedValue([{ ModelPool: renamedGrantedPool }]);
+      db.poolGrant.findMany.mockResolvedValue([
+        { id: "renamed-grant", ModelPool: renamedGrantedPool },
+      ]);
       db.modelApiTokenAllowlistEntry.findMany.mockResolvedValue([
         {
           target: "MODEL_POOL",
@@ -352,6 +356,7 @@ describe("modelApiTokenAccess", () => {
           id: "granted-pool-id",
           poolSlug: "renamed-shared",
           modelId: poolModelId({ userSlug: "team-a", poolSlug: "renamed-shared" }),
+          accessGrantId: "renamed-grant",
         }),
       ]);
     });

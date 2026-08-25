@@ -84,6 +84,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
   let origin = "";
   const upstreamObservations: Array<{
     path: string;
+    method?: string;
     authorization?: string;
     body: string;
   }> = [];
@@ -153,6 +154,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       const body = await readBody(request);
       upstreamObservations.push({
         path: request.url ?? "",
+        method: request.method,
         authorization: request.headers.authorization,
         body,
       });
@@ -338,6 +340,8 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     behavior: Behavior;
     expectRejected?: boolean;
     secondBehavior?: Behavior;
+    statefulResponses?: boolean;
+    grantee?: boolean;
   }) {
     if (!modules) throw new Error("modules unavailable");
     const suffix = crypto.randomUUID();
@@ -349,6 +353,15 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         slug: `provider-route-${suffix}`,
       },
     });
+    const requester = input.grantee
+      ? await modules.prisma.user.create({
+          data: {
+            name: "Provider route grantee",
+            email: `provider-route-grantee-${suffix}@example.test`,
+            slug: `provider-route-grantee-${suffix}`,
+          },
+        })
+      : user;
     const pool = await modules.prisma.modelPool.create({
       data: {
         userId: user.id,
@@ -359,6 +372,11 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         publicEgressAcknowledged: true,
       },
     });
+    const grant = input.grantee
+      ? await modules.prisma.poolGrant.create({
+          data: { poolId: pool.id, ownerUserId: user.id, granteeUserId: requester.id },
+        })
+      : undefined;
     const accountId = crypto.randomUUID();
     const credentialId = crypto.randomUUID();
     const keyring = modules.credentials.parseProviderCredentialKeyring(
@@ -609,7 +627,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     }
     await modules.prisma.modelApiToken.create({
       data: {
-        userId: user.id,
+        userId: requester.id,
         name: "Provider route token",
         lookupPrefix: modules.security.credentialLookupPrefix(rawToken),
         secretDigest: modules.security.hmacDigestForForwarderPurpose({
@@ -640,7 +658,13 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       input.requested === "openai-chat"
         ? { model: modelId, stream, max_tokens: 16, messages: [{ role: "user", content: "hi" }] }
         : input.requested === "openai-responses"
-          ? { model: modelId, stream, store: false, max_output_tokens: 16, input: "hi" }
+          ? {
+              model: modelId,
+              stream,
+              store: input.statefulResponses === true,
+              max_output_tokens: 16,
+              input: "hi",
+            }
           : {
               model: modelId,
               stream,
@@ -675,6 +699,16 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         attemptEvents: [] as never[],
         model,
         secondModel,
+        user,
+        requester,
+        pool,
+        account,
+        target,
+        grant,
+        credentialId,
+        rawToken,
+        app,
+        modelId,
       };
     }
     const ledger = await waitForLedger(model.id);
@@ -703,6 +737,16 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       responseText,
       attemptEvents,
       observation: upstreamObservations[observationIndex],
+      user,
+      requester,
+      pool,
+      account,
+      target,
+      grant,
+      credentialId,
+      rawToken,
+      app,
+      modelId,
     };
   }
 
@@ -802,6 +846,224 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       expect(settlement?.settledValue.equals(reservation.reservedValue)).toBe(true);
     }
   }
+
+  const bearerHeaders = (token: string, json = false) => ({
+    authorization: `Bearer ${token}`,
+    ...(json ? { "content-type": "application/json" } : {}),
+  });
+
+  it("persists an exact grantee binding and pins every Responses lifecycle operation", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const result = await runCase({
+      requested: "openai-responses",
+      native: "openai-responses",
+      behavior: "json",
+      statefulResponses: true,
+      grantee: true,
+      secondBehavior: "json",
+    });
+    if (!result.grant) throw new Error("expected exact pool grant");
+    expect(result.response.status).toBe(200);
+    const binding = await modules.prisma.responseStickinessRecord.findFirstOrThrow({
+      where: { userId: result.requester.id, providerModelId: result.model.id },
+    });
+    expect(binding).toMatchObject({
+      routingVersion: 3,
+      modelApiTokenId: expect.any(String),
+      targetModelPoolId: result.pool.id,
+      selectedExecutionTargetId: result.target.id,
+      providerAccountId: result.account.id,
+      providerModelId: result.model.id,
+      providerEndpointIdentity: result.account.endpointIdentity,
+      providerEndpointVersion: result.account.endpointVersion,
+      providerUpstreamModelId: result.model.upstreamModelId,
+      nativeSurface: "OPENAI_RESPONSES",
+      poolGrantId: result.grant.id,
+    });
+    const observationStart = upstreamObservations.length;
+    const followUp = await result.app.request("/responses", {
+      method: "POST",
+      headers: bearerHeaders(result.rawToken, true),
+      body: JSON.stringify({
+        model: result.modelId,
+        previous_response_id: "resp_route",
+        input: "follow-up",
+        store: true,
+        max_output_tokens: 16,
+      }),
+    });
+    expect(followUp.status).toBe(200);
+    await followUp.text();
+    const retrieve = await result.app.request("/responses/resp_route?include[]=output", {
+      headers: bearerHeaders(result.rawToken),
+    });
+    expect(retrieve.status).toBe(200);
+    await retrieve.text();
+
+    const keyring = modules.credentials.parseProviderCredentialKeyring(
+      process.env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS!,
+    );
+    const rotated = modules.credentials.encryptProviderCredential(
+      "route-provider-secret-rotated",
+      {
+        userId: result.user.id,
+        providerAccountId: result.account.id,
+        credentialId: result.credentialId,
+        credentialType: "BEARER",
+        aadVersion: 1,
+      },
+      keyring,
+    );
+    await modules.prisma.providerCredential.update({
+      where: { id: result.credentialId },
+      data: rotated,
+    });
+    const lifecycle = [
+      ["POST", "/responses/resp_route/cancel"],
+      ["GET", "/responses/resp_route/input_items"],
+      ["POST", "/responses/resp_route/compact"],
+      ["DELETE", "/responses/resp_route"],
+    ] as const;
+    for (const [method, path] of lifecycle) {
+      const response = await result.app.request(path, {
+        method,
+        headers: bearerHeaders(result.rawToken),
+      });
+      expect(response.status).toBe(200);
+      await response.text();
+    }
+    const pinned = upstreamObservations.slice(observationStart);
+    expect(pinned.map(({ method, path }) => [method, path])).toEqual([
+      ["POST", "/json/v1/responses"],
+      ["GET", "/json/v1/responses/resp_route?include[]=output"],
+      ["POST", "/json/v1/responses/resp_route/cancel"],
+      ["GET", "/json/v1/responses/resp_route/input_items"],
+      ["POST", "/json/v1/responses/resp_route/compact"],
+      ["DELETE", "/json/v1/responses/resp_route"],
+    ]);
+    expect(
+      pinned
+        .slice(2)
+        .every(({ authorization }) => authorization === "Bearer route-provider-secret-rotated"),
+    ).toBe(true);
+    expect(
+      pinned.every(({ authorization }) => authorization !== "Bearer route-provider-secret-second"),
+    ).toBe(true);
+
+    const strangerSecret = `wsmp_model_${crypto.randomUUID().replaceAll("-", "")}`;
+    const stranger = await modules.prisma.user.create({
+      data: {
+        name: "Provider route stranger",
+        email: `provider-route-stranger-${crypto.randomUUID()}@example.test`,
+        slug: `provider-route-stranger-${crypto.randomUUID()}`,
+      },
+    });
+    await modules.prisma.modelApiToken.create({
+      data: {
+        userId: stranger.id,
+        name: "Stranger token",
+        lookupPrefix: modules.security.credentialLookupPrefix(strangerSecret),
+        secretDigest: modules.security.hmacDigestForForwarderPurpose({
+          purpose: "modelApiToken",
+          value: strangerSecret,
+        }),
+      },
+    });
+    const guessed = await result.app.request("/responses/resp_route", {
+      headers: bearerHeaders(strangerSecret),
+    });
+    expect(guessed.status).toBe(404);
+
+    await modules.prisma.poolGrant.delete({ where: { id: result.grant.id } });
+    expect(await modules.prisma.responseStickinessRecord.count({ where: { id: binding.id } })).toBe(
+      0,
+    );
+    await modules.prisma.poolGrant.create({
+      data: {
+        poolId: result.pool.id,
+        ownerUserId: result.user.id,
+        granteeUserId: result.requester.id,
+      },
+    });
+    const afterReplacement = await result.app.request("/responses/resp_route", {
+      headers: bearerHeaders(result.rawToken),
+    });
+    expect(afterReplacement.status).toBe(404);
+  });
+
+  it.each([
+    "expiry",
+    "endpoint",
+    "member",
+    "target",
+    "model",
+    "account",
+    "credential",
+    "token",
+  ] as const)("fails closed after bound provider %s invalidation", async (invalidation) => {
+    if (!modules) throw new Error("modules unavailable");
+    const result = await runCase({
+      requested: "openai-responses",
+      native: "openai-responses",
+      behavior: "json",
+      statefulResponses: true,
+    });
+    const binding = await modules.prisma.responseStickinessRecord.findFirstOrThrow({
+      where: { userId: result.user.id, providerModelId: result.model.id },
+    });
+    if (invalidation === "expiry")
+      await modules.prisma.responseStickinessRecord.update({
+        where: { id: binding.id },
+        data: { expiresAt: new Date(Date.now() - 1) },
+      });
+    else if (invalidation === "endpoint")
+      await modules.prisma.providerAccount.update({
+        where: { id: result.account.id },
+        data: {
+          baseUrl: `${origin}/replacement`,
+          endpointIdentity: `${origin}/replacement`,
+          endpointVersion: { increment: 1 },
+        },
+      });
+    else if (invalidation === "member")
+      await modules.prisma.poolMember.deleteMany({
+        where: { poolId: result.pool.id, executionTargetId: result.target.id },
+      });
+    else if (invalidation === "target")
+      await modules.prisma.executionTarget.delete({ where: { id: result.target.id } });
+    else if (invalidation === "model")
+      await modules.prisma.providerModel.update({
+        where: { id: result.model.id },
+        data: { deletedAt: new Date(), enabled: false },
+      });
+    else if (invalidation === "account")
+      await modules.prisma.providerAccount.update({
+        where: { id: result.account.id },
+        data: { deletedAt: new Date(), enabled: false },
+      });
+    else if (invalidation === "credential")
+      await modules.prisma.$transaction(async (tx) => {
+        await tx.providerAccount.update({
+          where: { id: result.account.id },
+          data: { currentCredentialId: null, enabled: false },
+        });
+        await tx.providerCredential.update({
+          where: { id: result.credentialId },
+          data: { status: "REVOKED", revokedAt: new Date() },
+        });
+      });
+    else
+      await modules.prisma.modelApiToken.updateMany({
+        where: { userId: result.user.id, name: "Provider route token" },
+        data: { revokedAt: new Date() },
+      });
+    const observationCount = upstreamObservations.length;
+    const response = await result.app.request("/responses/resp_route", {
+      headers: bearerHeaders(result.rawToken),
+    });
+    expect(response.status).toBe(invalidation === "token" ? 401 : 404);
+    expect(upstreamObservations).toHaveLength(observationCount);
+  });
 
   const requestedSurfaces: Surface[] = ["openai-chat", "openai-responses", "anthropic-messages"];
   const crossPairs = requestedSurfaces.flatMap((requested) =>

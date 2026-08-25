@@ -82,8 +82,17 @@ vi.mock("./provider-attempt-runtime.js", () => ({
 import {
   dispatchPublicOverflow,
   listPublicOverflowTargets,
+  matchesChatTestProviderMode,
   rankPublicOverflowTargets,
 } from "./public-overflow.js";
+
+it("applies explicit native and adapted Chat Test modes to provider targets", () => {
+  const target = { nativeSurfaces: ["openai-chat"] as const };
+  expect(matchesChatTestProviderMode(target, "openai-chat", "REQUIRE_NATIVE")).toBe(true);
+  expect(matchesChatTestProviderMode(target, "openai-responses", "REQUIRE_NATIVE")).toBe(false);
+  expect(matchesChatTestProviderMode(target, "openai-responses", "REQUIRE_ADAPTED")).toBe(true);
+  expect(matchesChatTestProviderMode(target, "openai-chat", "REQUIRE_ADAPTED")).toBe(false);
+});
 
 function dispatchPoolFixture(
   protocol = "openai",
