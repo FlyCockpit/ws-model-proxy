@@ -8,6 +8,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Context } from "../context";
 
 const envMock = { enabled: false };
+const egressMock = vi.hoisted(() => ({ request: vi.fn() }));
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
     get WMP_PUBLIC_PROVIDER_EGRESS_ENABLED() {
@@ -24,6 +25,10 @@ vi.mock("@ws-model-proxy/db", async () => {
     Prisma: { TransactionIsolationLevel: { Serializable: "Serializable" } },
   };
 });
+vi.mock("../lib/provider-egress", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/provider-egress")>()),
+  providerHttpsRequest: egressMock.request,
+}));
 
 const { providerManagementRouter } = await import("./provider-management");
 const { default: prisma } = await import("@ws-model-proxy/db");
@@ -43,6 +48,11 @@ const db = prisma as unknown as {
     updateMany: MockInstance;
   };
   providerAuditEvent: { create: MockInstance; findMany: MockInstance };
+  providerBudgetPolicy: {
+    findMany: MockInstance;
+    findFirst: MockInstance;
+    updateMany: MockInstance;
+  };
 };
 
 const session = {
@@ -77,6 +87,7 @@ describe("providerManagementRouter security boundary", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     envMock.enabled = false;
+    egressMock.request.mockReset();
     db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
       callback(db),
     );
@@ -175,7 +186,7 @@ describe("providerManagementRouter security boundary", () => {
     expect(db.$transaction).not.toHaveBeenCalled();
   });
 
-  it("makes credential revocation idempotent without duplicate audit events", async () => {
+  it("serializes credential revocation against replacement and remains idempotent", async () => {
     envMock.enabled = true;
     db.providerCredential.findFirst.mockResolvedValue({
       id: "credential",
@@ -187,7 +198,101 @@ describe("providerManagementRouter security boundary", () => {
     db.providerCredential.updateMany.mockResolvedValue({ count: 0 });
     const client = createRouterClient(providerManagementRouter, { context });
     await expect(client.revokeCredential({ id: "credential" })).resolves.toEqual({ success: true });
+    expect(db.$queryRaw).toHaveBeenCalledTimes(2);
+    expect(db.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+      isolationLevel: "Serializable",
+    });
     expect(db.providerAuditEvent.create).not.toHaveBeenCalled();
     expect(db.providerAccount.updateMany).not.toHaveBeenCalled();
+  });
+
+  it.each(["REVOKED", "REPLACED"])(
+    "refuses rotation when a concurrent operation has made the credential %s",
+    async () => {
+      envMock.enabled = true;
+      db.providerCredential.findFirst
+        .mockResolvedValueOnce({ id: "credential", providerAccountId: "account" })
+        .mockResolvedValueOnce(null);
+      db.$queryRaw.mockResolvedValue([{ id: "locked" }]);
+      const client = createRouterClient(providerManagementRouter, { context });
+      await expect(client.rotateCredential({ id: "credential" })).rejects.toMatchObject({
+        code: "NOT_FOUND",
+      });
+      expect(db.$queryRaw).toHaveBeenCalledTimes(2);
+      expect(db.providerCredential.updateMany).not.toHaveBeenCalled();
+      expect(db.providerAuditEvent.create).not.toHaveBeenCalled();
+    },
+  );
+
+  it("hides budget policies owned by soft-deleted provider accounts", async () => {
+    envMock.enabled = true;
+    db.providerBudgetPolicy.findMany.mockResolvedValue([]);
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(client.listBudgetPolicies()).resolves.toEqual([]);
+    expect(db.providerBudgetPolicy.findMany).toHaveBeenCalledWith({
+      where: { userId: "owner", ProviderAccount: { deletedAt: null } },
+      include: { Rules: true },
+    });
+  });
+
+  it("audits successful and failed credential tests without secrets or endpoint data", async () => {
+    envMock.enabled = true;
+    const { encryptProviderCredential, parseProviderCredentialKeyring } = await import(
+      "../lib/provider-credential-crypto"
+    );
+    const identity = {
+      userId: "owner",
+      providerAccountId: "account",
+      credentialId: "credential",
+      credentialType: "BEARER" as const,
+      aadVersion: 1,
+    };
+    const encrypted = encryptProviderCredential(
+      "super-secret-value",
+      identity,
+      parseProviderCredentialKeyring("v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+    );
+    db.providerAccount.findFirst.mockResolvedValue({
+      id: "account",
+      userId: "owner",
+      deletedAt: null,
+      currentCredentialId: "credential",
+      providerType: "openai",
+      baseUrl: "https://provider.example/v1",
+    });
+    db.providerCredential.findFirst.mockResolvedValue({
+      id: "credential",
+      providerAccountId: "account",
+      credentialType: "BEARER",
+      aadVersion: 1,
+      status: "ACTIVE",
+      ...encrypted,
+    });
+    db.providerCredential.updateMany.mockResolvedValue({ count: 1 });
+    db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
+    egressMock.request.mockResolvedValue({ statusCode: 204, resume: vi.fn() });
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(client.testCredential({ providerAccountId: "account" })).resolves.toEqual({
+      ok: true,
+      statusCode: 204,
+    });
+    const audit = db.providerAuditEvent.create.mock.calls.at(-1)?.[0];
+    expect(audit.data).toMatchObject({
+      action: "CREDENTIAL_TESTED",
+      subjectId: "credential",
+      metadata: { outcome: "SUCCESS", statusCode: 204 },
+    });
+    expect(JSON.stringify(audit)).not.toContain("super-secret-value");
+    expect(JSON.stringify(audit)).not.toContain("provider.example");
+
+    egressMock.request.mockRejectedValueOnce(new Error("provider.example super-secret-value"));
+    await expect(client.testCredential({ providerAccountId: "account" })).rejects.toMatchObject({
+      code: "BAD_GATEWAY",
+      message: "Provider request failed",
+    });
+    const failedAudit = db.providerAuditEvent.create.mock.calls.at(-1)?.[0];
+    expect(failedAudit.data.metadata).toEqual({ outcome: "FAILURE", statusCode: null });
+    expect(JSON.stringify(failedAudit)).not.toContain("super-secret-value");
+    expect(JSON.stringify(failedAudit)).not.toContain("provider.example");
   });
 });

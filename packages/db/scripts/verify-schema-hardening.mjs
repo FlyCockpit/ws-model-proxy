@@ -582,6 +582,10 @@ try {
      WHERE id = 'provider-account-a';
   `);
   await client.query("COMMIT");
+  await expectConstraintFailure(`
+    UPDATE provider_account SET "currentCredentialId" = NULL
+     WHERE id = 'provider-account-a'
+  `);
   await expectConstraintFailure(
     `
     INSERT INTO provider_credential
@@ -602,9 +606,31 @@ try {
        "endpointIdentity", "authType")
     VALUES ('provider-account-b', NOW(), NOW(), 'owner-b', 'test', 'Test B',
       'https://provider-b.invalid', 'https://provider-b.invalid', 'API_KEY');
+    INSERT INTO provider_account
+      (id, "createdAt", "updatedAt", "userId", "providerType", label, "baseUrl",
+       "endpointIdentity", "authType")
+    VALUES ('provider-account-c', NOW(), NOW(), 'owner-a', 'test', 'Test C',
+      'https://provider-c.invalid', 'https://provider-c.invalid', 'BEARER');
     INSERT INTO provider_model
       (id, "createdAt", "updatedAt", "userId", "providerAccountId", "upstreamModelId")
     VALUES ('provider-model-b', NOW(), NOW(), 'owner-b', 'provider-account-b', 'provider-model-b');
+    INSERT INTO provider_credential
+      (id, "createdAt", "userId", "providerAccountId", "credentialType", "keyVersion",
+       ciphertext, nonce, "authTag", "displaySuffix", status, "revokedAt")
+    VALUES ('credential-b-revoked', NOW(), 'owner-b', 'provider-account-b', 'API_KEY', 'v1',
+      decode('04', 'hex'), decode('030000000000000000000000', 'hex'),
+      decode('00000000000000000000000000000000', 'hex'), 'tail', 'REVOKED', NOW());
+    INSERT INTO provider_credential
+      (id, "createdAt", "userId", "providerAccountId", "credentialType", "keyVersion",
+       ciphertext, nonce, "authTag", "displaySuffix", status, "revokedAt")
+    VALUES ('credential-c-revoked', NOW(), 'owner-a', 'provider-account-c', 'BEARER', 'v1',
+      decode('05', 'hex'), decode('040000000000000000000000', 'hex'),
+      decode('00000000000000000000000000000000', 'hex'), 'tail', 'REVOKED', NOW());
+  `);
+  await expectConstraintFailure(`
+    UPDATE provider_credential
+       SET status = 'REPLACED', "replacedAt" = NOW(), "replacedById" = 'credential-c-revoked'
+     WHERE id = 'credential-a'
   `);
   await expectConstraintFailure(`
     INSERT INTO provider_budget_policy

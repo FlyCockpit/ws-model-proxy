@@ -24,6 +24,26 @@ describe("provider egress policy", () => {
     "recognizes private address %s",
     (address) => expect(isPrivateOrSpecialAddress(address)).toBe(true),
   );
+  it.each([
+    "[::1]",
+    "::ffff:127.0.0.1",
+    "::ffff:7f00:1",
+    "::127.0.0.1",
+    "::a9fe:a9fe",
+    "fe80::1",
+    "fc00::1",
+    "ff02::1",
+    "2001:db8::1",
+    "3fff::1",
+    "100::1",
+    "64:ff9b:1::1",
+  ])("recognizes special IPv6 spelling %s", (address) => {
+    expect(isPrivateOrSpecialAddress(address)).toBe(true);
+  });
+  it.each(["8.8.8.8", "93.184.216.34", "2001:4860:4860::8888", "2606:4700:4700::1111"])(
+    "allows globally routable address %s",
+    (address) => expect(isPrivateOrSpecialAddress(address)).toBe(false),
+  );
   it("requires HTTPS, forbids URL credentials, and rejects literal private targets", () => {
     const policy = { allowPrivateNetworks: false };
     expect(() => validateProviderBaseUrl("http://example.com", policy)).toThrow(/HTTPS/u);
@@ -31,6 +51,7 @@ describe("provider egress policy", () => {
       /credentials/u,
     );
     expect(() => validateProviderBaseUrl("https://127.0.0.1", policy)).toThrow(/private/u);
+    expect(() => validateProviderBaseUrl("https://[::ffff:7f00:1]", policy)).toThrow(/private/u);
     expect(validateProviderBaseUrl("https://api.example.com/v1", policy).href).toBe(
       "https://api.example.com/v1",
     );
@@ -85,6 +106,11 @@ describe("provider egress policy", () => {
     expect(() => assertResolvedAddressesSafe([], { allowPrivateNetworks: false })).toThrow(
       "Provider request failed",
     );
+    expect(() =>
+      assertResolvedAddressesSafe([{ address: "::ffff:a9fe:a9fe" }], {
+        allowPrivateNetworks: false,
+      }),
+    ).toThrow("Provider request failed");
   });
   it("rejects redirects and exposes only a stable error", async () => {
     const server = createServer((_request, response) => {

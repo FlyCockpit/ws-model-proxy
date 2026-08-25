@@ -1185,7 +1185,7 @@ FOR EACH ROW EXECUTE FUNCTION enforce_provider_graph_identity_immutable();
 
 CREATE OR REPLACE FUNCTION enforce_provider_credential_account_consistency()
 RETURNS trigger LANGUAGE plpgsql AS $provider_credential_account$
-DECLARE account_owner TEXT; account_auth TEXT; current_id TEXT;
+DECLARE account_owner TEXT; account_auth TEXT; current_id TEXT; replacement RECORD;
 BEGIN
   SELECT "userId", "authType"::text, "currentCredentialId"
     INTO account_owner, account_auth, current_id
@@ -1196,26 +1196,41 @@ BEGIN
   IF NEW.status = 'ACTIVE' AND current_id IS DISTINCT FROM NEW.id THEN
     RAISE EXCEPTION 'active provider credential must be current for its account' USING ERRCODE = '23514';
   END IF;
+  IF NEW."replacedById" IS NOT NULL THEN
+    SELECT "userId", "providerAccountId", "credentialType"::text INTO replacement
+      FROM provider_credential WHERE id = NEW."replacedById";
+    IF replacement."userId" IS DISTINCT FROM NEW."userId"
+       OR replacement."providerAccountId" IS DISTINCT FROM NEW."providerAccountId"
+       OR replacement."credentialType" IS DISTINCT FROM NEW."credentialType"::text THEN
+      RAISE EXCEPTION 'provider credential replacement must stay within its account and authentication type' USING ERRCODE = '23514';
+    END IF;
+  END IF;
   RETURN NEW;
 END
 $provider_credential_account$;
 
 DROP TRIGGER IF EXISTS provider_credential_account_consistency ON provider_credential;
 CREATE CONSTRAINT TRIGGER provider_credential_account_consistency
-AFTER INSERT OR UPDATE OF "userId", "providerAccountId", "credentialType", status ON provider_credential
+AFTER INSERT OR UPDATE OF "userId", "providerAccountId", "credentialType", status, "replacedById" ON provider_credential
 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION enforce_provider_credential_account_consistency();
 
 CREATE OR REPLACE FUNCTION enforce_provider_current_credential_consistency()
 RETURNS trigger LANGUAGE plpgsql AS $provider_current_credential$
-DECLARE credential_owner TEXT; credential_account TEXT; credential_state TEXT;
+DECLARE credential_owner TEXT; credential_account TEXT; credential_state TEXT; credential_auth TEXT;
 BEGIN
   IF NEW."currentCredentialId" IS NOT NULL THEN
-    SELECT "userId", "providerAccountId", status::text INTO credential_owner, credential_account, credential_state
+    SELECT "userId", "providerAccountId", status::text, "credentialType"::text
+      INTO credential_owner, credential_account, credential_state, credential_auth
       FROM provider_credential WHERE id = NEW."currentCredentialId";
     IF credential_owner IS DISTINCT FROM NEW."userId" OR credential_account IS DISTINCT FROM NEW.id
-       OR credential_state IS DISTINCT FROM 'ACTIVE' THEN
+       OR credential_state IS DISTINCT FROM 'ACTIVE' OR credential_auth IS DISTINCT FROM NEW."authType"::text THEN
       RAISE EXCEPTION 'current provider credential must be active and belong to the account owner' USING ERRCODE = '23514';
     END IF;
+  ELSIF EXISTS (
+    SELECT 1 FROM provider_credential
+     WHERE "providerAccountId" = NEW.id AND "userId" = NEW."userId" AND status = 'ACTIVE'
+  ) THEN
+    RAISE EXCEPTION 'provider account without a current credential cannot retain an active credential' USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
 END

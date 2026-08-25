@@ -30,10 +30,57 @@ function ipv4Number(address: string): number {
   return address.split(".").reduce((value, octet) => (value << 8) + Number(octet), 0) >>> 0;
 }
 
+function stripIpBrackets(address: string): string {
+  const withoutZone = address.split("%")[0] ?? "";
+  return withoutZone.startsWith("[") && withoutZone.endsWith("]")
+    ? withoutZone.slice(1, -1)
+    : withoutZone;
+}
+
+function ipv6Bytes(address: string): Uint8Array | null {
+  const literal = stripIpBrackets(address).toLowerCase();
+  if (isIP(literal) !== 6) return null;
+  const dottedIndex = literal.lastIndexOf(":");
+  let hexadecimal = literal;
+  if (literal.includes(".")) {
+    const dotted = literal.slice(dottedIndex + 1);
+    if (isIP(dotted) !== 4) return null;
+    const octets = dotted.split(".").map(Number);
+    hexadecimal = `${literal.slice(0, dottedIndex)}:${(((octets[0] ?? 0) << 8) | (octets[1] ?? 0)).toString(16)}:${(((octets[2] ?? 0) << 8) | (octets[3] ?? 0)).toString(16)}`;
+  }
+  const halves = hexadecimal.split("::");
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(":") : [];
+  const right = halves[1] ? halves[1].split(":") : [];
+  const missing = 8 - left.length - right.length;
+  if ((halves.length === 1 && missing !== 0) || missing < 0) return null;
+  const words = [...left, ...Array.from({ length: missing }, () => "0"), ...right];
+  if (words.length !== 8) return null;
+  const bytes = new Uint8Array(16);
+  for (const [index, word] of words.entries()) {
+    const value = Number.parseInt(word, 16);
+    bytes[index * 2] = value >>> 8;
+    bytes[index * 2 + 1] = value & 0xff;
+  }
+  return bytes;
+}
+
+function bytesInPrefix(bytes: Uint8Array, prefix: readonly number[], bits: number): boolean {
+  const wholeBytes = Math.floor(bits / 8);
+  for (let index = 0; index < wholeBytes; index += 1) {
+    if (bytes[index] !== (prefix[index] ?? 0)) return false;
+  }
+  const remaining = bits % 8;
+  if (remaining === 0) return true;
+  const mask = (0xff << (8 - remaining)) & 0xff;
+  return ((bytes[wholeBytes] ?? 0) & mask) === ((prefix[wholeBytes] ?? 0) & mask);
+}
+
 export function isPrivateOrSpecialAddress(address: string): boolean {
-  const family = isIP(address);
+  const literal = stripIpBrackets(address);
+  const family = isIP(literal);
   if (family === 4) {
-    const value = ipv4Number(address);
+    const value = ipv4Number(literal);
     const inRange = (base: string, bits: number) => {
       const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
       return (value & mask) === (ipv4Number(base) & mask);
@@ -56,13 +103,30 @@ export function isPrivateOrSpecialAddress(address: string): boolean {
     );
   }
   if (family === 6) {
-    const normalized = address.toLowerCase().split("%")[0] ?? "";
-    if (normalized === "::" || normalized === "::1") return true;
-    if (normalized.startsWith("fc") || normalized.startsWith("fd") || /^fe[89ab]/u.test(normalized))
-      return true;
-    if (normalized.startsWith("ff") || normalized.startsWith("2001:db8:")) return true;
-    const mapped = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/u)?.[1];
-    return mapped ? isPrivateOrSpecialAddress(mapped) : false;
+    const bytes = ipv6Bytes(literal);
+    if (!bytes) return true;
+    const prefix = (...values: number[]) => values;
+    // IPv4-compatible and IPv4-mapped forms must be classified by the embedded
+    // address, including compressed and all-hex spellings.
+    const firstTenZero = bytes.slice(0, 10).every((value) => value === 0);
+    const compatible = bytes.slice(0, 12).every((value) => value === 0);
+    if (compatible || (firstTenZero && bytes[10] === 0xff && bytes[11] === 0xff)) {
+      const embedded = `${bytes[12]}.${bytes[13]}.${bytes[14]}.${bytes[15]}`;
+      return isPrivateOrSpecialAddress(embedded);
+    }
+    return (
+      bytesInPrefix(bytes, prefix(0x00), 8) || // reserved low addresses
+      bytesInPrefix(bytes, prefix(0x01, 0x00), 64) || // discard-only
+      bytesInPrefix(bytes, prefix(0x20, 0x01, 0x00), 23) || // IETF assignments
+      bytesInPrefix(bytes, prefix(0x20, 0x01, 0x0d, 0xb8), 32) || // documentation
+      bytesInPrefix(bytes, prefix(0x20, 0x02), 16) || // deprecated 6to4
+      bytesInPrefix(bytes, prefix(0x3f, 0xff), 20) || // documentation
+      bytesInPrefix(bytes, prefix(0x5f, 0x00), 16) || // segment-routing local
+      bytesInPrefix(bytes, prefix(0x00, 0x64, 0xff, 0x9b, 0x00, 0x01), 48) || // local translation
+      bytesInPrefix(bytes, prefix(0xfc), 7) || // unique-local
+      bytesInPrefix(bytes, prefix(0xfe, 0x80), 10) || // link-local
+      bytesInPrefix(bytes, prefix(0xff), 8) // multicast
+    );
   }
   return true;
 }
@@ -95,7 +159,7 @@ export function validateProviderBaseUrl(rawUrl: string, policy: ProviderEgressPo
   if (url.hash || url.search)
     throw new Error("Provider base URL must not contain query or fragment components");
   if (
-    isIP(url.hostname) &&
+    isIP(stripIpBrackets(url.hostname)) &&
     !policy.allowPrivateNetworks &&
     isPrivateOrSpecialAddress(url.hostname)
   ) {

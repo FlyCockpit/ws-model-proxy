@@ -486,30 +486,39 @@ export const providerManagementRouter = {
     .handler(async ({ input, context }) => {
       enabled();
       const userId = context.session.user.id;
-      const row = await prisma.providerCredential.findFirst({
+      const candidate = await prisma.providerCredential.findFirst({
         where: { id: input.id, userId },
-        include: { ProviderAccount: true },
+        select: { id: true, providerAccountId: true },
       });
-      if (!row || row.ProviderAccount.deletedAt) throw missing();
-      await prisma.$transaction(async (tx) => {
-        const changed = await tx.providerCredential.updateMany({
-          where: { id: row.id, userId, status: { not: "REVOKED" } },
-          data: { status: "REVOKED", revokedAt: new Date() },
-        });
-        if (changed.count === 0) return;
-        await tx.providerAccount.updateMany({
-          where: { id: row.providerAccountId, userId, currentCredentialId: row.id },
-          data: { currentCredentialId: null, enabled: false, status: "DISABLED" },
-        });
-        await tx.providerAuditEvent.create({
-          data: {
-            userId,
-            providerAccountId: row.providerAccountId,
-            action: "CREDENTIAL_REVOKED",
-            subjectId: row.id,
-          },
-        });
-      });
+      if (!candidate) throw missing();
+      await prisma.$transaction(
+        async (tx) => {
+          await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${candidate.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
+          await tx.$queryRaw`SELECT id FROM provider_credential WHERE id = ${candidate.id} AND "userId" = ${userId} FOR UPDATE`;
+          const row = await tx.providerCredential.findFirst({
+            where: { id: candidate.id, userId, ProviderAccount: { deletedAt: null } },
+          });
+          if (!row) throw missing();
+          const changed = await tx.providerCredential.updateMany({
+            where: { id: row.id, userId, status: { not: "REVOKED" } },
+            data: { status: "REVOKED", revokedAt: new Date() },
+          });
+          if (changed.count === 0) return;
+          await tx.providerAccount.updateMany({
+            where: { id: row.providerAccountId, userId, currentCredentialId: row.id },
+            data: { currentCredentialId: null, enabled: false, status: "DISABLED" },
+          });
+          await tx.providerAuditEvent.create({
+            data: {
+              userId,
+              providerAccountId: row.providerAccountId,
+              action: "CREDENTIAL_REVOKED",
+              subjectId: row.id,
+            },
+          });
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
       return { success: true };
     }),
   listAuditEvents: protectedProcedure
@@ -545,46 +554,65 @@ export const providerManagementRouter = {
     .handler(async ({ input, context }) => {
       enabled();
       const userId = context.session.user.id;
-      const row = await prisma.providerCredential.findFirst({
-        where: { id: input.id, userId, status: "ACTIVE" },
+      const candidate = await prisma.providerCredential.findFirst({
+        where: { id: input.id, userId },
+        select: { id: true, providerAccountId: true },
       });
-      if (!row) throw missing();
-      const keyring = ring();
-      const identity = {
-        userId,
-        providerAccountId: row.providerAccountId,
-        credentialId: row.id,
-        credentialType: row.credentialType,
-        aadVersion: row.aadVersion,
-      };
-      const plaintext = decryptProviderCredential(
-        {
-          algorithm: row.algorithm as "AES-256-GCM",
-          keyVersion: row.keyVersion,
-          ciphertext: Buffer.from(row.ciphertext),
-          nonce: Buffer.from(row.nonce),
-          authTag: Buffer.from(row.authTag),
-        },
-        identity,
-        keyring,
-      );
-      const encrypted = encryptProviderCredential(plaintext, identity, keyring);
-      await prisma.$transaction(async (tx) => {
-        await tx.providerCredential.update({ where: { id: row.id }, data: encrypted });
-        await tx.providerAuditEvent.create({
-          data: {
+      if (!candidate) throw missing();
+      return prisma.$transaction(
+        async (tx) => {
+          await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${candidate.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
+          await tx.$queryRaw`SELECT id FROM provider_credential WHERE id = ${candidate.id} AND "userId" = ${userId} FOR UPDATE`;
+          const row = await tx.providerCredential.findFirst({
+            where: {
+              id: candidate.id,
+              userId,
+              status: "ACTIVE",
+              ProviderAccount: { deletedAt: null, currentCredentialId: candidate.id },
+            },
+          });
+          if (!row) throw missing();
+          const keyring = ring();
+          const identity = {
             userId,
             providerAccountId: row.providerAccountId,
-            action: "CREDENTIAL_ROTATED",
-            subjectId: row.id,
-          },
-        });
-      });
-      return {
-        id: row.id,
-        keyVersion: encrypted.keyVersion,
-        displaySuffix: encrypted.displaySuffix,
-      };
+            credentialId: row.id,
+            credentialType: row.credentialType,
+            aadVersion: row.aadVersion,
+          };
+          const plaintext = decryptProviderCredential(
+            {
+              algorithm: row.algorithm as "AES-256-GCM",
+              keyVersion: row.keyVersion,
+              ciphertext: Buffer.from(row.ciphertext),
+              nonce: Buffer.from(row.nonce),
+              authTag: Buffer.from(row.authTag),
+            },
+            identity,
+            keyring,
+          );
+          const encrypted = encryptProviderCredential(plaintext, identity, keyring);
+          const changed = await tx.providerCredential.updateMany({
+            where: { id: row.id, userId, status: "ACTIVE", keyVersion: row.keyVersion },
+            data: encrypted,
+          });
+          if (changed.count !== 1) throw new ORPCError("CONFLICT");
+          await tx.providerAuditEvent.create({
+            data: {
+              userId,
+              providerAccountId: row.providerAccountId,
+              action: "CREDENTIAL_ROTATED",
+              subjectId: row.id,
+            },
+          });
+          return {
+            id: row.id,
+            keyVersion: encrypted.keyVersion,
+            displaySuffix: encrypted.displaySuffix,
+          };
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
     }),
   testCredential: protectedProcedure
     .input(z.object({ providerAccountId: id }))
@@ -628,19 +656,46 @@ export const providerManagementRouter = {
           headers,
         );
         response.resume();
-        await prisma.providerCredential.update({
-          where: { id: row.id },
-          data: { lastUsedAt: new Date() },
-        });
-        return { ok: (response.statusCode ?? 500) < 400, statusCode: response.statusCode ?? null };
+        const statusCode = response.statusCode ?? null;
+        const ok = (statusCode ?? 500) < 400;
+        await prisma.$transaction(
+          async (tx) => {
+            const used = await tx.providerCredential.updateMany({
+              where: { id: row.id, userId, status: "ACTIVE" },
+              data: { lastUsedAt: new Date() },
+            });
+            if (used.count !== 1) throw new ORPCError("CONFLICT");
+            await tx.providerAuditEvent.create({
+              data: {
+                userId,
+                providerAccountId: account.id,
+                action: "CREDENTIAL_TESTED",
+                subjectId: row.id,
+                metadata: { outcome: ok ? "SUCCESS" : "FAILURE", statusCode },
+              },
+            });
+          },
+          { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+        );
+        return { ok, statusCode };
       } catch (error) {
+        if (error instanceof ORPCError) throw error;
+        await prisma.providerAuditEvent.create({
+          data: {
+            userId,
+            providerAccountId: account.id,
+            action: "CREDENTIAL_TESTED",
+            subjectId: row.id,
+            metadata: { outcome: "FAILURE", statusCode: null },
+          },
+        });
         throw new ORPCError("BAD_GATEWAY", { message: redactProviderError(error) });
       }
     }),
   listBudgetPolicies: protectedProcedure.handler(({ context }) => {
     enabled();
     return prisma.providerBudgetPolicy.findMany({
-      where: { userId: context.session.user.id },
+      where: { userId: context.session.user.id, ProviderAccount: { deletedAt: null } },
       include: { Rules: true },
     });
   }),
@@ -717,7 +772,7 @@ export const providerManagementRouter = {
           await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${current.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
           await tx.$queryRaw`SELECT id FROM provider_budget_policy WHERE id = ${current.id} AND "userId" = ${userId} FOR UPDATE`;
           const locked = await tx.providerBudgetPolicy.findFirst({
-            where: { id: current.id, userId },
+            where: { id: current.id, userId, ProviderAccount: { deletedAt: null } },
           });
           if (!locked) throw missing();
           const latest = await tx.providerBudgetPolicy.findFirst({
@@ -779,23 +834,34 @@ export const providerManagementRouter = {
       const userId = context.session.user.id;
       const current = await prisma.providerBudgetPolicy.findFirst({
         where: { id: input.id, userId },
+        select: { id: true, providerAccountId: true },
       });
       if (!current) throw missing();
-      if (!current.active) return { success: true };
-      await prisma.$transaction(async (tx) => {
-        await tx.providerBudgetPolicy.update({
-          where: { id: current.id },
-          data: { active: false, deactivatedAt: new Date() },
-        });
-        await tx.providerAuditEvent.create({
-          data: {
-            userId,
-            providerAccountId: current.providerAccountId,
-            action: "BUDGET_DEACTIVATED",
-            subjectId: current.id,
-          },
-        });
-      });
+      await prisma.$transaction(
+        async (tx) => {
+          await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${current.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
+          await tx.$queryRaw`SELECT id FROM provider_budget_policy WHERE id = ${current.id} AND "userId" = ${userId} FOR UPDATE`;
+          const locked = await tx.providerBudgetPolicy.findFirst({
+            where: { id: current.id, userId, ProviderAccount: { deletedAt: null } },
+          });
+          if (!locked) throw missing();
+          if (!locked.active) return;
+          const changed = await tx.providerBudgetPolicy.updateMany({
+            where: { id: locked.id, userId, active: true },
+            data: { active: false, deactivatedAt: new Date() },
+          });
+          if (changed.count !== 1) throw new ORPCError("CONFLICT");
+          await tx.providerAuditEvent.create({
+            data: {
+              userId,
+              providerAccountId: locked.providerAccountId,
+              action: "BUDGET_DEACTIVATED",
+              subjectId: current.id,
+            },
+          });
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
       return { success: true };
     }),
 };
