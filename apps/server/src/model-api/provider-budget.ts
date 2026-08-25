@@ -278,10 +278,17 @@ function retryable(error: unknown): boolean {
   );
 }
 
-async function serializable<T>(work: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
+async function serializedByAdvisoryLocks<T>(
+  work: (tx: Prisma.TransactionClient) => Promise<T>,
+): Promise<T> {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      return await prisma.$transaction(work, { isolationLevel: "Serializable" });
+      // The first statement acquires an account/attempt advisory lock. Under
+      // PostgreSQL SERIALIZABLE that statement also fixes a snapshot before a
+      // contending policy replacement commits, leaving subsequent reads stale
+      // after the lock is granted. READ COMMITTED refreshes the snapshot after
+      // each waited lock; the advisory locks provide the serialization here.
+      return await prisma.$transaction(work, { isolationLevel: "ReadCommitted" });
     } catch (error) {
       if (attempt + 1 >= MAX_TRANSACTION_ATTEMPTS || !retryable(error)) throw error;
       await new Promise((resolve) => setTimeout(resolve, 5 + Math.floor(Math.random() * 20)));
@@ -315,7 +322,7 @@ export async function admitProviderBudget(
   const currency = normalizedCurrency(attempt.liability.currency);
   const liabilitySpend =
     attempt.liability.spend === undefined ? undefined : decimal(attempt.liability.spend);
-  return serializable(async (tx) => {
+  return serializedByAdvisoryLocks(async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-attempt:${attempt.attemptId}`}, 0))`;
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-account:${attempt.userId}:${attempt.providerAccountId}`}, 0))`;
     const nowRows = await tx.$queryRaw<Array<{ now: Date }>>`SELECT transaction_timestamp() AS now`;
@@ -690,7 +697,7 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
     terminal.usageSource ?? (terminal.reason === "CRASH_RECOVERY" ? "crash-repair" : "terminal"),
     "usageSource",
   );
-  await serializable(async (tx) => {
+  await serializedByAdvisoryLocks(async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-attempt:${terminal.attemptId}`}, 0))`;
     const anchor = await tx.providerAttempt.findUnique({
       where: {
@@ -806,7 +813,11 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
         : undefined;
     // Cost and token observations from an incomplete stream remain useful
     // evidence, but cannot safely reduce the admitted liability.
-    const costKnown = suppliedCost !== undefined && usage?.categoriesComplete === true;
+    // Cost provenance is independent when completeness is unspecified: some
+    // non-streaming providers report an authoritative charge without a full
+    // token-category breakdown. An explicit false, however, marks a truncated
+    // observation and must retain the conservative admitted liability.
+    const costKnown = suppliedCost !== undefined && usage?.categoriesComplete !== false;
     const suppliedCostConfidence: UsageConfidence = reportedMatches
       ? "REPORTED"
       : calculatedMatches

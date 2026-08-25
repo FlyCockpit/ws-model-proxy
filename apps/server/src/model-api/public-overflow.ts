@@ -587,12 +587,14 @@ export async function listPublicOverflowTargets(
   };
 }
 
-function joinProviderUrl(baseUrl: string, path: string): string {
+function joinProviderPath(baseUrl: string, path: string): string {
   const base = new URL(baseUrl);
+  const requested = new URL(path, "http://provider-path.invalid");
   const cleanBase = base.pathname.replace(/\/$/u, "");
-  const cleanPath = path.startsWith("/") ? path : `/${path}`;
-  base.pathname = `${cleanBase}${cleanPath}`;
-  return base.toString();
+  const cleanPath = requested.pathname.startsWith("/")
+    ? requested.pathname
+    : `/${requested.pathname}`;
+  return `${cleanBase}${cleanPath}${requested.search}`;
 }
 
 function responseHeaders(headers: import("node:http").IncomingHttpHeaders): Headers {
@@ -1614,9 +1616,10 @@ export async function dispatchPublicOverflow(
         keyring,
       });
       const response = await providerHttpsRequest(
-        joinProviderUrl(target.baseUrl, upstream.path),
+        target.baseUrl,
         {
           method: request.method ?? "POST",
+          path: joinProviderPath(target.baseUrl, upstream.path),
           headers: Object.fromEntries(upstream.headers.entries()),
           body: upstream.body,
           signal: AbortSignal.any([
@@ -1831,8 +1834,12 @@ export async function dispatchPublicOverflow(
           try {
             const chunk = await reader.read();
             if (chunk.done) {
-              controller.close();
+              // Do not expose EOF until correctness-required settlement and
+              // health release are durable. Sequential Responses lifecycle
+              // calls issued immediately after body consumption must not race
+              // the preceding attempt's half-open claim.
               await reconcile(true);
+              controller.close();
             } else {
               responseBytes += chunk.value.byteLength;
               // Retain the bounded tail, not merely the prefix. Streaming APIs
