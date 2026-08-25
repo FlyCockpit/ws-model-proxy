@@ -530,6 +530,7 @@ describe("providerManagementRouter security boundary", () => {
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
       .mockResolvedValueOnce([{ count: 3n }]);
     db.providerModel.findFirst.mockResolvedValue({
       id: "model",

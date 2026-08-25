@@ -4,6 +4,7 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
+import { lockExecutionTargetPolicies } from "../lib/capacity-policy-safety";
 import { openAiCompatibleCapabilitiesSchema } from "../lib/openai-compatible-capabilities";
 import {
   decryptProviderCredential,
@@ -633,8 +634,16 @@ export const providerManagementRouter = {
         if (!account) throw missing();
         assertInventoryMatchesProviderType(account.providerType, data.nativeCapabilities);
         if (data.concurrencyLimit !== undefined || data.contextWindow !== undefined) {
-          await tx.$queryRaw`SELECT id FROM execution_target WHERE "providerModelId" = ${modelId} AND "userId" = ${userId} FOR UPDATE`;
-          const target = await tx.executionTarget.findUnique({
+          const targetIdentity = await tx.executionTarget.findUnique({
+            where: { providerModelId: modelId },
+            select: { id: true, inferenceCapacityId: true },
+          });
+          if (targetIdentity) await lockExecutionTargetPolicies(tx, [targetIdentity.id]);
+          if (targetIdentity?.inferenceCapacityId)
+            await tx.$queryRaw`SELECT id FROM inference_capacity WHERE id = ${targetIdentity.inferenceCapacityId} AND "userId" = ${userId} FOR UPDATE`;
+          // All mutable policy inputs are deliberately read only after both the
+          // target policy fence and the physical-capacity row lock are held.
+          const reloadedTarget = await tx.executionTarget.findUnique({
             where: { providerModelId: modelId },
             select: {
               id: true,
@@ -663,8 +672,8 @@ export const providerManagementRouter = {
               },
             },
           });
+          const target = reloadedTarget ?? (targetIdentity as typeof reloadedTarget);
           if (target?.inferenceCapacityId) {
-            await tx.$queryRaw`SELECT id FROM inference_capacity WHERE id = ${target.inferenceCapacityId} AND "userId" = ${userId} FOR UPDATE`;
             const nextConcurrency =
               data.concurrencyLimit !== undefined
                 ? data.concurrencyLimit

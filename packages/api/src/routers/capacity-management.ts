@@ -3,6 +3,11 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
+import {
+  assertEffectiveConcurrencyPolicy,
+  assertEffectiveContextPolicy,
+  lockExecutionTargetPolicies,
+} from "../lib/capacity-policy-safety";
 
 const id = z.string().min(1);
 const priority = z.number().int().min(0).max(31);
@@ -251,22 +256,40 @@ export const capacityManagementRouter = {
       const userId = context.session.user.id;
       return capacityTransaction(
         async (tx) => {
+          const candidate = await tx.inferenceCapacity.findUnique({
+            where: { id: capacityId },
+            select: { userId: true, ExecutionTargets: { select: { id: true } } },
+          });
+          if (!candidate || candidate.userId !== userId) return notFound();
+          await lockExecutionTargetPolicies(
+            tx,
+            candidate.ExecutionTargets.map((target) => target.id),
+          );
+          await tx.$queryRaw`SELECT id FROM inference_capacity WHERE id = ${capacityId} AND "userId" = ${userId} FOR UPDATE`;
           const current = await tx.inferenceCapacity.findUnique({
             where: { id: capacityId },
             include: {
               ExecutionTargets: {
                 select: {
+                  id: true,
                   directConcurrencyLimit: true,
                   directReservedSlots: true,
+                  directContextCeiling: true,
+                  directContextMargin: true,
                   PoolMembers: {
                     select: {
                       capacityConcurrencyMode: true,
                       capacityConcurrencyLimit: true,
                       capacityReservedSlots: true,
+                      capacityContextCeilingMode: true,
+                      capacityContextCeiling: true,
+                      capacityContextMargin: true,
                       ModelPool: {
                         select: {
                           capacityConcurrencyLimit: true,
                           capacityReservedSlots: true,
+                          capacityContextCeiling: true,
+                          capacityContextMargin: true,
                         },
                       },
                     },
@@ -278,6 +301,8 @@ export const capacityManagementRouter = {
           if (!current || current.userId !== userId) return notFound();
           const requestedHardLimit = (data as { hardConcurrencyLimit?: number | null })
             .hardConcurrencyLimit;
+          const requestedPhysicalMaxContext = (data as { physicalMaxContext?: number | null })
+            .physicalMaxContext;
           if (requestedHardLimit !== undefined) {
             for (const target of current.ExecutionTargets ?? []) {
               assertPolicyWithinHardLimit({
@@ -286,18 +311,37 @@ export const capacityManagementRouter = {
                 reservedSlots: target.directReservedSlots,
               });
               for (const member of target.PoolMembers) {
-                assertPolicyWithinHardLimit({
+                assertEffectiveConcurrencyPolicy({
                   hardLimit: requestedHardLimit,
-                  concurrencyLimit:
-                    member.capacityConcurrencyMode === "UNLIMITED"
-                      ? null
-                      : member.capacityConcurrencyMode === "LIMITED"
-                        ? member.capacityConcurrencyLimit
-                        : member.ModelPool.capacityConcurrencyLimit,
-                  reservedSlots:
-                    member.capacityReservedSlots ?? member.ModelPool.capacityReservedSlots,
+                  poolLimit: member.ModelPool.capacityConcurrencyLimit,
+                  poolReserved: member.ModelPool.capacityReservedSlots,
+                  memberMode: member.capacityConcurrencyMode,
+                  memberLimit: member.capacityConcurrencyLimit,
+                  memberReserved: member.capacityReservedSlots,
                 });
               }
+            }
+          }
+          if (requestedPhysicalMaxContext !== undefined) {
+            for (const target of current.ExecutionTargets ?? []) {
+              if (
+                requestedPhysicalMaxContext != null &&
+                target.directContextCeiling != null &&
+                target.directContextCeiling + target.directContextMargin >
+                  requestedPhysicalMaxContext
+              )
+                throw new ORPCError("BAD_REQUEST", {
+                  message: "Direct context policy exceeds physical capacity.",
+                });
+              for (const member of target.PoolMembers)
+                assertEffectiveContextPolicy({
+                  physicalMaxContext: requestedPhysicalMaxContext,
+                  poolCeiling: member.ModelPool.capacityContextCeiling,
+                  poolMargin: member.ModelPool.capacityContextMargin,
+                  memberMode: member.capacityContextCeilingMode,
+                  memberCeiling: member.capacityContextCeiling,
+                  memberMargin: member.capacityContextMargin,
+                });
             }
           }
           const updated = await tx.inferenceCapacity.update({ where: { id: capacityId }, data });
@@ -347,6 +391,12 @@ export const capacityManagementRouter = {
     const userId = context.session.user.id;
     return capacityTransaction(
       async (tx) => {
+        const candidate = await tx.executionTarget.findUnique({
+          where: { id: input.executionTargetId },
+          select: { id: true, userId: true },
+        });
+        if (!candidate || candidate.userId !== userId) return notFound();
+        await lockExecutionTargetPolicies(tx, [candidate.id]);
         const target = await tx.executionTarget.findUnique({
           where: { id: input.executionTargetId },
           select: {
@@ -360,16 +410,23 @@ export const capacityManagementRouter = {
             directWaitBudgetMs: true,
             directContextCeiling: true,
             directContextMargin: true,
-            InferenceCapacity: { select: { hardConcurrencyLimit: true } },
+            InferenceCapacity: {
+              select: { hardConcurrencyLimit: true, physicalMaxContext: true },
+            },
             PoolMembers: {
               select: {
                 capacityConcurrencyMode: true,
                 capacityConcurrencyLimit: true,
                 capacityReservedSlots: true,
+                capacityContextCeilingMode: true,
+                capacityContextCeiling: true,
+                capacityContextMargin: true,
                 ModelPool: {
                   select: {
                     capacityConcurrencyLimit: true,
                     capacityReservedSlots: true,
+                    capacityContextCeiling: true,
+                    capacityContextMargin: true,
                   },
                 },
               },
@@ -378,36 +435,62 @@ export const capacityManagementRouter = {
         });
         if (!target || target.userId !== userId) return notFound();
         let hardConcurrencyLimit = target.InferenceCapacity?.hardConcurrencyLimit;
+        let physicalMaxContext = target.InferenceCapacity?.physicalMaxContext;
         if (input.inferenceCapacityId) {
           const capacity = await tx.inferenceCapacity.findUnique({
             where: { id: input.inferenceCapacityId },
-            select: { userId: true, hardConcurrencyLimit: true },
+            select: { userId: true, hardConcurrencyLimit: true, physicalMaxContext: true },
           });
           if (!capacity || capacity.userId !== userId) return notFound();
           hardConcurrencyLimit = capacity.hardConcurrencyLimit;
+          physicalMaxContext = capacity.physicalMaxContext;
         } else if (input.inferenceCapacityId === null) {
           hardConcurrencyLimit = null;
+          physicalMaxContext = null;
         }
         assertPolicyWithinHardLimit({
           hardLimit: hardConcurrencyLimit,
-          concurrencyLimit: input.directConcurrencyLimit ?? target.directConcurrencyLimit,
+          concurrencyLimit:
+            input.directConcurrencyLimit !== undefined
+              ? input.directConcurrencyLimit
+              : target.directConcurrencyLimit,
           reservedSlots: input.directReservedSlots ?? target.directReservedSlots,
         });
         // Attaching a target changes the physical ceiling for every pool that
         // already references it. Validate both explicit member overrides and
         // inherited pool policies before committing the attachment.
         for (const member of target.PoolMembers ?? []) {
-          assertPolicyWithinHardLimit({
+          assertEffectiveConcurrencyPolicy({
             hardLimit: hardConcurrencyLimit,
-            concurrencyLimit:
-              member.capacityConcurrencyMode === "UNLIMITED"
-                ? null
-                : member.capacityConcurrencyMode === "LIMITED"
-                  ? member.capacityConcurrencyLimit
-                  : member.ModelPool.capacityConcurrencyLimit,
-            reservedSlots: member.capacityReservedSlots ?? member.ModelPool.capacityReservedSlots,
+            poolLimit: member.ModelPool.capacityConcurrencyLimit,
+            poolReserved: member.ModelPool.capacityReservedSlots,
+            memberMode: member.capacityConcurrencyMode,
+            memberLimit: member.capacityConcurrencyLimit,
+            memberReserved: member.capacityReservedSlots,
+          });
+          assertEffectiveContextPolicy({
+            physicalMaxContext,
+            poolCeiling: member.ModelPool.capacityContextCeiling,
+            poolMargin: member.ModelPool.capacityContextMargin,
+            memberMode: member.capacityContextCeilingMode,
+            memberCeiling: member.capacityContextCeiling,
+            memberMargin: member.capacityContextMargin,
           });
         }
+        if (
+          physicalMaxContext != null &&
+          (input.directContextCeiling !== undefined
+            ? input.directContextCeiling
+            : target.directContextCeiling) != null &&
+          (input.directContextCeiling !== undefined
+            ? input.directContextCeiling
+            : target.directContextCeiling)! +
+            (input.directContextMargin ?? target.directContextMargin) >
+            physicalMaxContext
+        )
+          throw new ORPCError("BAD_REQUEST", {
+            message: "Direct context policy exceeds physical capacity.",
+          });
         const { executionTargetId, ...data } = input;
         const updated = await tx.executionTarget.update({ where: { id: executionTargetId }, data });
         await audit(tx, {
@@ -438,6 +521,21 @@ export const capacityManagementRouter = {
       const userId = context.session.user.id;
       return capacityTransaction(
         async (tx) => {
+          const candidate = await tx.modelPool.findUnique({
+            where: { id: input.modelPoolId },
+            select: {
+              userId: true,
+              PoolMembers: { select: { executionTargetId: true } },
+            },
+          });
+          if (!candidate || candidate.userId !== userId) return notFound();
+          await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${input.modelPoolId} AND "userId" = ${userId} FOR UPDATE`;
+          await lockExecutionTargetPolicies(
+            tx,
+            candidate.PoolMembers.flatMap((member) =>
+              member.executionTargetId ? [member.executionTargetId] : [],
+            ),
+          );
           const pool = await tx.modelPool.findUnique({
             where: { id: input.modelPoolId },
             select: {
@@ -457,8 +555,15 @@ export const capacityManagementRouter = {
                   capacityConcurrencyMode: true,
                   capacityConcurrencyLimit: true,
                   capacityReservedSlots: true,
+                  capacityContextCeilingMode: true,
+                  capacityContextCeiling: true,
+                  capacityContextMargin: true,
                   ExecutionTarget: {
-                    select: { InferenceCapacity: { select: { hardConcurrencyLimit: true } } },
+                    select: {
+                      InferenceCapacity: {
+                        select: { hardConcurrencyLimit: true, physicalMaxContext: true },
+                      },
+                    },
                   },
                 },
               },
@@ -466,18 +571,27 @@ export const capacityManagementRouter = {
           });
           if (!pool || pool.userId !== userId) return notFound();
           for (const member of pool.PoolMembers ?? []) {
-            assertPolicyWithinHardLimit({
+            assertEffectiveConcurrencyPolicy({
               hardLimit: member.ExecutionTarget?.InferenceCapacity?.hardConcurrencyLimit,
-              concurrencyLimit:
-                member.capacityConcurrencyMode === "UNLIMITED"
-                  ? null
-                  : member.capacityConcurrencyMode === "LIMITED"
-                    ? member.capacityConcurrencyLimit
-                    : (input.capacityConcurrencyLimit ?? pool.capacityConcurrencyLimit),
-              reservedSlots:
-                member.capacityReservedSlots ??
-                input.capacityReservedSlots ??
-                pool.capacityReservedSlots,
+              poolLimit:
+                input.capacityConcurrencyLimit !== undefined
+                  ? input.capacityConcurrencyLimit
+                  : pool.capacityConcurrencyLimit,
+              poolReserved: input.capacityReservedSlots ?? pool.capacityReservedSlots,
+              memberMode: member.capacityConcurrencyMode,
+              memberLimit: member.capacityConcurrencyLimit,
+              memberReserved: member.capacityReservedSlots,
+            });
+            assertEffectiveContextPolicy({
+              physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+              poolCeiling:
+                input.capacityContextCeiling !== undefined
+                  ? input.capacityContextCeiling
+                  : pool.capacityContextCeiling,
+              poolMargin: input.capacityContextMargin ?? pool.capacityContextMargin,
+              memberMode: member.capacityContextCeilingMode,
+              memberCeiling: member.capacityContextCeiling,
+              memberMargin: member.capacityContextMargin,
             });
           }
           const { modelPoolId, ...data } = input;
@@ -538,6 +652,18 @@ export const capacityManagementRouter = {
     };
     return capacityTransaction(
       async (tx) => {
+        const candidate = await tx.poolMember.findUnique({
+          where: { id: input.poolMemberId },
+          select: {
+            poolId: true,
+            executionTargetId: true,
+            ModelPool: { select: { userId: true } },
+          },
+        });
+        if (!candidate || candidate.ModelPool.userId !== userId) return notFound();
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidate.poolId} AND "userId" = ${userId} FOR UPDATE`;
+        if (candidate.executionTargetId)
+          await lockExecutionTargetPolicies(tx, [candidate.executionTargetId]);
         const member = await tx.poolMember.findUnique({
           where: { id: input.poolMemberId },
           select: {
@@ -557,10 +683,16 @@ export const capacityManagementRouter = {
                 userId: true,
                 capacityConcurrencyLimit: true,
                 capacityReservedSlots: true,
+                capacityContextCeiling: true,
+                capacityContextMargin: true,
               },
             },
             ExecutionTarget: {
-              select: { InferenceCapacity: { select: { hardConcurrencyLimit: true } } },
+              select: {
+                InferenceCapacity: {
+                  select: { hardConcurrencyLimit: true, physicalMaxContext: true },
+                },
+              },
             },
           },
         });
@@ -575,15 +707,31 @@ export const capacityManagementRouter = {
           input.capacityReservedSlots !== undefined
             ? input.capacityReservedSlots
             : member.capacityReservedSlots;
-        assertPolicyWithinHardLimit({
+        assertEffectiveConcurrencyPolicy({
           hardLimit: member.ExecutionTarget?.InferenceCapacity?.hardConcurrencyLimit,
-          concurrencyLimit:
-            nextConcurrencyMode === "UNLIMITED"
-              ? null
-              : nextConcurrencyMode === "LIMITED"
-                ? nextConcurrency
-                : member.ModelPool.capacityConcurrencyLimit,
-          reservedSlots: nextReserved ?? member.ModelPool.capacityReservedSlots,
+          poolLimit: member.ModelPool.capacityConcurrencyLimit,
+          poolReserved: member.ModelPool.capacityReservedSlots,
+          memberMode: nextConcurrencyMode,
+          memberLimit: nextConcurrency,
+          memberReserved: nextReserved,
+        });
+        const nextContextMode =
+          normalizedInput.capacityContextCeilingMode ?? member.capacityContextCeilingMode;
+        const nextContextCeiling =
+          normalizedInput.capacityContextCeiling !== undefined
+            ? normalizedInput.capacityContextCeiling
+            : member.capacityContextCeiling;
+        const nextContextMargin =
+          input.capacityContextMargin !== undefined
+            ? input.capacityContextMargin
+            : member.capacityContextMargin;
+        assertEffectiveContextPolicy({
+          physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+          poolCeiling: member.ModelPool.capacityContextCeiling,
+          poolMargin: member.ModelPool.capacityContextMargin,
+          memberMode: nextContextMode,
+          memberCeiling: nextContextCeiling,
+          memberMargin: nextContextMargin,
         });
         const { poolMemberId, ...data } = normalizedInput;
         const updated = await tx.poolMember.update({ where: { id: poolMemberId }, data });

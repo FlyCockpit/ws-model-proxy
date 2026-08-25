@@ -11,6 +11,11 @@ import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
 import {
+  assertEffectiveConcurrencyPolicy,
+  assertEffectiveContextPolicy,
+  lockExecutionTargetPolicies,
+} from "../lib/capacity-policy-safety";
+import {
   getConfiguredMediaAttachmentMaxBytes,
   resolveAttachmentLimit,
 } from "../lib/media-attachment-limits";
@@ -86,22 +91,7 @@ function assertConcurrencyPolicyWithinHardLimit(input: {
   memberLimit?: number | null;
   memberReserved?: number | null;
 }): void {
-  if (input.hardLimit == null) return;
-  const effectiveLimit =
-    input.memberMode === "LIMITED"
-      ? input.memberLimit
-      : input.memberMode === "UNLIMITED"
-        ? null
-        : input.poolLimit;
-  const effectiveReserved = input.memberReserved ?? input.poolReserved;
-  if (effectiveLimit != null && effectiveLimit > input.hardLimit)
-    throw new ORPCError("BAD_REQUEST", {
-      message: "Effective concurrency limit exceeds physical capacity.",
-    });
-  if (effectiveReserved > input.hardLimit)
-    throw new ORPCError("BAD_REQUEST", {
-      message: "Reserved slots exceed physical concurrency capacity.",
-    });
+  assertEffectiveConcurrencyPolicy(input);
 }
 
 type UserSlugRow = {
@@ -2036,6 +2026,13 @@ export const forwarderManagementRouter = {
       }),
     )
     .handler(async ({ input, context }) => {
+      if (
+        input.capacityConcurrencyLimit != null &&
+        (input.capacityReservedSlots ?? 0) > input.capacityConcurrencyLimit
+      )
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Reserved slots exceed the pool concurrency limit.",
+        });
       await assertPoolSlugAvailable(input.slug, context.session.user.id);
       await assertAttachmentLimitWithinGlobal(input.maxAttachmentBytes);
       const userId = context.session.user.id;
@@ -2397,6 +2394,8 @@ export const forwarderManagementRouter = {
       await ownedPool(input.poolId, context.session.user.id);
       await ownedDiscoveredModel(input.discoveredModelId, context.session.user.id);
       return prisma.$transaction(async (tx) => {
+        const userId = context.session.user.id;
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${input.poolId} AND "userId" = ${userId} FOR UPDATE`;
         const target = await tx.executionTarget.upsert({
           where: { discoveredModelId: input.discoveredModelId },
           update: {},
@@ -2407,18 +2406,41 @@ export const forwarderManagementRouter = {
           },
           select: {
             id: true,
-            InferenceCapacity: { select: { hardConcurrencyLimit: true } },
+            InferenceCapacity: {
+              select: { hardConcurrencyLimit: true, physicalMaxContext: true },
+            },
           },
         });
+        await lockExecutionTargetPolicies(tx, [target.id]);
+        const reloadedTarget = await tx.executionTarget.findUnique({
+          where: { id: target.id },
+          select: {
+            id: true,
+            InferenceCapacity: {
+              select: { hardConcurrencyLimit: true, physicalMaxContext: true },
+            },
+          },
+        });
+        const lockedTarget = reloadedTarget ?? target;
         const pool = await tx.modelPool.findFirst({
-          where: { id: input.poolId, userId: context.session.user.id },
-          select: { capacityConcurrencyLimit: true, capacityReservedSlots: true },
+          where: { id: input.poolId, userId },
+          select: {
+            capacityConcurrencyLimit: true,
+            capacityReservedSlots: true,
+            capacityContextCeiling: true,
+            capacityContextMargin: true,
+          },
         });
         if (!pool) throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
         assertConcurrencyPolicyWithinHardLimit({
-          hardLimit: target.InferenceCapacity?.hardConcurrencyLimit,
+          hardLimit: lockedTarget.InferenceCapacity?.hardConcurrencyLimit,
           poolLimit: pool.capacityConcurrencyLimit,
           poolReserved: pool.capacityReservedSlots,
+        });
+        assertEffectiveContextPolicy({
+          physicalMaxContext: lockedTarget.InferenceCapacity?.physicalMaxContext,
+          poolCeiling: pool.capacityContextCeiling,
+          poolMargin: pool.capacityContextMargin,
         });
         const member = await tx.poolMember.create({
           data: {
@@ -2430,7 +2452,7 @@ export const forwarderManagementRouter = {
           },
           select: { id: true },
         });
-        return { id: member.id, executionTargetId: target.id };
+        return { id: member.id, executionTargetId: lockedTarget.id };
       });
     }),
 
@@ -2461,6 +2483,8 @@ export const forwarderManagementRouter = {
             publicEgressAcknowledged: true,
             capacityConcurrencyLimit: true,
             capacityReservedSlots: true,
+            capacityContextCeiling: true,
+            capacityContextMargin: true,
           },
         });
         if (!pool) throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
@@ -2494,10 +2518,17 @@ export const forwarderManagementRouter = {
         if (!providerModel.enabled) {
           throw new ORPCError("BAD_REQUEST", { message: "Enable the provider model first." });
         }
+        // Fast rejection; the same invariant is checked again after the target
+        // policy fence below, which is the authoritative race-safe check.
         assertConcurrencyPolicyWithinHardLimit({
           hardLimit: providerModel.concurrencyLimit,
           poolLimit: pool.capacityConcurrencyLimit,
           poolReserved: pool.capacityReservedSlots,
+        });
+        assertEffectiveContextPolicy({
+          physicalMaxContext: providerModel.contextWindow,
+          poolCeiling: pool.capacityContextCeiling,
+          poolMargin: pool.capacityContextMargin,
         });
         const protectionPolicy = await tx.providerBudgetPolicy.findFirst({
           where: {
@@ -2579,6 +2610,47 @@ export const forwarderManagementRouter = {
             inferenceCapacityId: capacity.id,
           },
           select: { id: true },
+        });
+        await lockExecutionTargetPolicies(tx, [target.id]);
+        await tx.$queryRaw`SELECT id FROM inference_capacity WHERE id = ${capacity.id} AND "userId" = ${userId} FOR UPDATE`;
+        const [reloadedProviderModel, reloadedPool, reloadedCapacity] = await Promise.all([
+          tx.providerModel.findFirst({
+            where: { id: input.providerModelId, userId, deletedAt: null },
+            select: { concurrencyLimit: true, contextWindow: true, enabled: true },
+          }),
+          tx.modelPool.findFirst({
+            where: { id: input.poolId, userId },
+            select: {
+              capacityConcurrencyLimit: true,
+              capacityReservedSlots: true,
+              capacityContextCeiling: true,
+              capacityContextMargin: true,
+            },
+          }),
+          tx.inferenceCapacity.findUnique({
+            where: { id: capacity.id },
+            select: { hardConcurrencyLimit: true, physicalMaxContext: true },
+          }),
+        ]);
+        const lockedProviderModel = reloadedProviderModel ?? providerModel;
+        const lockedPool = reloadedPool ?? pool;
+        const lockedCapacity = reloadedCapacity ?? {
+          hardConcurrencyLimit: lockedProviderModel.concurrencyLimit,
+          physicalMaxContext: lockedProviderModel.contextWindow,
+        };
+        if (!lockedProviderModel.enabled)
+          throw new ORPCError("CONFLICT", {
+            message: "Provider attachment changed concurrently.",
+          });
+        assertConcurrencyPolicyWithinHardLimit({
+          hardLimit: lockedCapacity.hardConcurrencyLimit,
+          poolLimit: lockedPool.capacityConcurrencyLimit,
+          poolReserved: lockedPool.capacityReservedSlots,
+        });
+        assertEffectiveContextPolicy({
+          physicalMaxContext: lockedCapacity.physicalMaxContext,
+          poolCeiling: lockedPool.capacityContextCeiling,
+          poolMargin: lockedPool.capacityContextMargin,
         });
         const member = await tx.poolMember.create({
           data: {
@@ -2676,7 +2748,11 @@ export const forwarderManagementRouter = {
         async (tx) => {
           const candidate = await tx.poolMember.findUnique({
             where: { id: input.id },
-            select: { poolId: true, ModelPool: { select: { userId: true } } },
+            select: {
+              poolId: true,
+              executionTargetId: true,
+              ModelPool: { select: { userId: true } },
+            },
           });
           if (!candidate || candidate.ModelPool.userId !== userId)
             throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
@@ -2685,6 +2761,8 @@ export const forwarderManagementRouter = {
           // reorder operations. Re-read all policy inputs after taking the lock
           // so acknowledgement and protection cannot be revoked concurrently.
           await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidate.poolId} AND "userId" = ${userId} FOR UPDATE`;
+          if (candidate.executionTargetId)
+            await lockExecutionTargetPolicies(tx, [candidate.executionTargetId]);
           const member = await tx.poolMember.findUnique({
             where: { id: input.id },
             select: {
@@ -2715,6 +2793,8 @@ export const forwarderManagementRouter = {
                   publicEgressAcknowledged: true,
                   capacityConcurrencyLimit: true,
                   capacityReservedSlots: true,
+                  capacityContextCeiling: true,
+                  capacityContextMargin: true,
                 },
               },
             },
@@ -2778,16 +2858,14 @@ export const forwarderManagementRouter = {
               ? input.capacityContextMargin
               : member.capacityContextMargin;
           const physicalMaxContext = member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext;
-          if (
-            nextContextMode === "LIMITED" &&
-            nextContextCeiling != null &&
-            ((nextContextMargin != null && nextContextMargin >= nextContextCeiling) ||
-              (physicalMaxContext != null &&
-                nextContextCeiling + (nextContextMargin ?? 0) > physicalMaxContext))
-          )
-            throw new ORPCError("BAD_REQUEST", {
-              message: "Member context policy exceeds its physical capacity.",
-            });
+          assertEffectiveContextPolicy({
+            physicalMaxContext,
+            poolCeiling: member.ModelPool.capacityContextCeiling,
+            poolMargin: member.ModelPool.capacityContextMargin,
+            memberMode: nextContextMode,
+            memberCeiling: nextContextCeiling,
+            memberMargin: nextContextMargin,
+          });
 
           if (nextTier === "PUBLIC_OVERFLOW" && member.tier !== "PUBLIC_OVERFLOW") {
             if (!providerModel) throw new ORPCError("BAD_REQUEST");
