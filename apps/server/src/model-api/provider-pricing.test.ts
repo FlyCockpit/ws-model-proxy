@@ -81,6 +81,87 @@ describe("provider pricing and usage accounting", () => {
     });
   });
 
+  it("normalizes Chat audio and prediction detail categories without double counting", () => {
+    const usage = usageFromObject({
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 50,
+        total_tokens: 150,
+        prompt_tokens_details: { cached_tokens: 20, audio_tokens: 5 },
+        completion_tokens_details: {
+          reasoning_tokens: 10,
+          audio_tokens: 3,
+          accepted_prediction_tokens: 4,
+          rejected_prediction_tokens: 2,
+        },
+      },
+    });
+    expect(usage).toMatchObject({
+      inputTokens: 75n,
+      cacheReadTokens: 20n,
+      outputTokens: 31n,
+      reasoningTokens: 10n,
+      additionalBillableTokens: 14n,
+      reportedTotalTokens: 150n,
+      categoriesComplete: true,
+    });
+    expect(usage?.rawUsage).toMatchObject({
+      prompt_tokens_details: { audio_tokens: 5 },
+      completion_tokens_details: {
+        audio_tokens: 3,
+        accepted_prediction_tokens: 4,
+        rejected_prediction_tokens: 2,
+      },
+    });
+  });
+
+  it("normalizes Responses audio and prediction detail categories", () => {
+    expect(
+      usageFromObject({
+        type: "response.completed",
+        response: {
+          usage: {
+            input_tokens: 20,
+            output_tokens: 12,
+            total_tokens: 32,
+            input_tokens_details: { cached_tokens: 3, audio_tokens: 2 },
+            output_tokens_details: {
+              reasoning_tokens: 4,
+              audio_tokens: 1,
+              accepted_prediction_tokens: 2,
+              rejected_prediction_tokens: 1,
+            },
+          },
+        },
+      }),
+    ).toMatchObject({
+      inputTokens: 15n,
+      outputTokens: 4n,
+      cacheReadTokens: 3n,
+      reasoningTokens: 4n,
+      additionalBillableTokens: 6n,
+      categoriesComplete: true,
+    });
+  });
+
+  it("recognizes Responses output details even when input details are omitted", () => {
+    expect(
+      usageFromObject({
+        usage: {
+          input_tokens: 7,
+          output_tokens: 10,
+          output_tokens_details: { reasoning_tokens: 4, audio_tokens: 1 },
+        },
+      }),
+    ).toMatchObject({
+      inputTokens: 7n,
+      outputTokens: 5n,
+      reasoningTokens: 4n,
+      additionalBillableTokens: 1n,
+      categoriesComplete: true,
+    });
+  });
+
   it("corroborates consistent totals and fails incomplete on mismatched aggregates", () => {
     expect(
       usageFromObject({
@@ -155,13 +236,31 @@ describe("provider pricing and usage accounting", () => {
         usage: {
           input_tokens: 10,
           output_tokens: 2,
-          input_tokens_details: { cached_tokens: 1, audio_tokens: 3 },
+          input_tokens_details: { cached_tokens: 1, future_tokens: 3 },
         },
       })?.categoriesComplete,
     ).toBe(false);
     expect(
       usageFromObject({ usage: { input_tokens: 10, output_tokens: 2, mystery_tokens: 1 } })
         ?.categoriesComplete,
+    ).toBe(false);
+    expect(
+      usageFromObject({
+        usage: {
+          input_tokens: 2,
+          output_tokens: 1,
+          input_tokens_details: { audio_tokens: "invalid" },
+        },
+      })?.categoriesComplete,
+    ).toBe(false);
+    expect(
+      usageFromObject({
+        usage: {
+          input_tokens: 2,
+          output_tokens: 1,
+          input_tokens_details: { audio_tokens: 3 },
+        },
+      })?.categoriesComplete,
     ).toBe(false);
   });
 

@@ -47,7 +47,11 @@ vi.mock("./provider-attempt-runtime.js", () => ({
 
 import { dispatchPublicOverflow, listPublicOverflowTargets } from "./public-overflow.js";
 
-function dispatchPoolFixture() {
+function dispatchPoolFixture(
+  protocol = "openai",
+  surface = "openai-chat",
+  providerType = "openai",
+) {
   return {
     publicEgressEnabled: true,
     publicEgressAcknowledged: true,
@@ -64,8 +68,8 @@ function dispatchPoolFixture() {
             contextWindow: 10_000,
             maxOutputTokens: 1_000,
             nativeCapabilities: {
-              protocols: ["openai"],
-              surfaces: ["openai-chat"],
+              protocols: [protocol],
+              surfaces: [surface],
               streaming: true,
               features: [],
             },
@@ -76,7 +80,7 @@ function dispatchPoolFixture() {
             ProviderAccount: {
               id: "account-heartbeat",
               userId: "owner",
-              providerType: "openai",
+              providerType,
               providerVersion: null,
               baseUrl: "https://provider.example",
               authType: "BEARER",
@@ -104,6 +108,92 @@ function dispatchPoolFixture() {
 }
 
 describe("public overflow terminal response dispatch", () => {
+  it.each([
+    {
+      label: "OpenAI partial usage",
+      protocol: "openai",
+      surface: "openai-chat",
+      path: "/v1/chat/completions",
+      chunk:
+        'data: {"choices":[{"delta":{"content":"x"}}],"usage":{"prompt_tokens":9,"completion_tokens":1}}\n\n',
+      expected: { inputTokens: 9n, outputTokens: 1n },
+    },
+    {
+      label: "Anthropic message_start usage",
+      protocol: "anthropic",
+      surface: "anthropic-messages",
+      path: "/v1/messages",
+      chunk:
+        'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":0}}}\n\n',
+      expected: { inputTokens: 12n, outputTokens: 0n },
+    },
+  ])("retains $label when the upstream ends before its terminal event", async (fixture) => {
+    reconcileProviderBudget.mockClear();
+    db.modelPool.findFirst.mockResolvedValue(
+      dispatchPoolFixture(fixture.protocol, fixture.surface, fixture.protocol),
+    );
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
+      providerCredential: {
+        findFirst: vi.fn().mockResolvedValue({
+          id: "credential-heartbeat",
+          credentialType: "BEARER",
+          aadVersion: 1,
+          algorithm: "AES-256-GCM",
+          keyVersion: "v1",
+          ciphertext: new Uint8Array(),
+          nonce: new Uint8Array(),
+          authTag: new Uint8Array(),
+        }),
+        update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+      },
+    };
+    db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+    const upstream = Readable.from([Buffer.from(fixture.chunk)]);
+    Object.assign(upstream, {
+      statusCode: 200,
+      headers: { "content-type": "text/event-stream" },
+      complete: false,
+    });
+    providerHttpsRequest.mockResolvedValueOnce(upstream);
+
+    const result = await dispatchPublicOverflow({
+      userId: "owner",
+      poolId: "pool",
+      requestId: `request-${fixture.protocol}`,
+      reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      requestedProtocol: fixture.protocol as "openai" | "anthropic",
+      requestedSurface: fixture.surface as "openai-chat" | "anthropic-messages",
+      stream: true,
+      requiredFeatures: [],
+      path: fixture.path,
+      headers: new Headers({ "content-type": "application/json" }),
+      body: new TextEncoder().encode('{"model":"pool","stream":true}'),
+      signal: new AbortController().signal,
+      liability: { tokens: 100n, accountingVersion: "provider-billable-v1" },
+      requestedOutputTokens: 10n,
+      releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+      adaptationEnabled: false,
+      retrySafe: false,
+    });
+    expect(result.dispatched).toBe(true);
+    if (!result.dispatched) throw new Error("expected dispatch");
+    await result.response.text();
+    await result.terminal;
+
+    expect(reconcileProviderBudget).toHaveBeenCalledWith(
+      expect.objectContaining({
+        usage: expect.objectContaining({
+          ...fixture.expected,
+          categoriesComplete: false,
+          rawUsage: expect.anything(),
+        }),
+      }),
+    );
+  });
+
   it("keeps unavailable targets with cooldown metadata eligible for half-open recovery", async () => {
     db.modelPool.findFirst.mockResolvedValue({
       publicEgressEnabled: true,

@@ -64,4 +64,13 @@ describe("provider budget accounting", () => {
       12n,
     );
   });
+
+  it("does not trust even an authoritative aggregate from an incomplete stream", () => {
+    expect(
+      providerBillableTokens({
+        authoritativeBillableTokens: 12n,
+        categoriesComplete: false,
+      }),
+    ).toBeUndefined();
+  });
 });

@@ -804,7 +804,9 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
       : calculatedMatches
         ? usage?.calculatedCost
         : undefined;
-    const costKnown = suppliedCost !== undefined;
+    // Cost and token observations from an incomplete stream remain useful
+    // evidence, but cannot safely reduce the admitted liability.
+    const costKnown = suppliedCost !== undefined && usage?.categoriesComplete === true;
     const suppliedCostConfidence: UsageConfidence = reportedMatches
       ? "REPORTED"
       : calculatedMatches

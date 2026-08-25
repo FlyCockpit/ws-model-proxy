@@ -38,7 +38,8 @@ export function budgetWindow(
 }
 
 export function providerBillableTokens(usage: ProviderTokenUsage): bigint | undefined {
-  if (usage.authoritativeBillableTokens !== undefined) return usage.authoritativeBillableTokens;
+  if (usage.authoritativeBillableTokens !== undefined && usage.categoriesComplete !== false)
+    return usage.authoritativeBillableTokens;
   if (usage.categoriesComplete !== true) return undefined;
   const categories = [
     usage.inputTokens,

@@ -511,10 +511,13 @@ function usageRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function exclusive(total: bigint | undefined, subset: bigint | undefined): bigint | undefined {
+function exclusiveMany(
+  total: bigint | undefined,
+  subsets: readonly (bigint | undefined)[],
+): bigint | undefined {
   if (total === undefined) return undefined;
-  if (subset === undefined) return total;
-  return subset <= total ? total - subset : undefined;
+  const represented = subsets.reduce<bigint>((sum, item) => sum + (item ?? 0n), 0n);
+  return represented <= total ? total - represented : undefined;
 }
 
 export function usageFromObject(value: unknown): RawProviderUsage | undefined {
@@ -535,14 +538,41 @@ export function usageFromObject(value: unknown): RawProviderUsage | undefined {
   );
   const cacheWriteTokens = usageInteger(usage.cache_creation_input_tokens);
   const reasoningTokens = usageInteger(completionDetails?.reasoning_tokens);
+  const inputAudioTokens = usageInteger(promptDetails?.audio_tokens);
+  const outputAudioTokens = usageInteger(completionDetails?.audio_tokens);
+  const acceptedPredictionTokens = usageInteger(completionDetails?.accepted_prediction_tokens);
+  const rejectedPredictionTokens = usageInteger(completionDetails?.rejected_prediction_tokens);
   const promptTotal = usageInteger(usage.input_tokens ?? usage.prompt_tokens);
   const completionTotal = usageInteger(usage.output_tokens ?? usage.completion_tokens);
   const openAiShape =
     usage.prompt_tokens !== undefined ||
     usage.completion_tokens !== undefined ||
-    usage.input_tokens_details !== undefined;
-  const inputTokens = openAiShape ? exclusive(promptTotal, cacheReadTokens) : promptTotal;
-  const outputTokens = openAiShape ? exclusive(completionTotal, reasoningTokens) : completionTotal;
+    usage.input_tokens_details !== undefined ||
+    usage.output_tokens_details !== undefined ||
+    usage.prompt_tokens_details !== undefined ||
+    usage.completion_tokens_details !== undefined;
+  const inputTokens = openAiShape
+    ? exclusiveMany(promptTotal, [cacheReadTokens, inputAudioTokens])
+    : promptTotal;
+  const outputTokens = openAiShape
+    ? exclusiveMany(completionTotal, [
+        reasoningTokens,
+        outputAudioTokens,
+        acceptedPredictionTokens,
+        rejectedPredictionTokens,
+      ])
+    : completionTotal;
+  const explicitAdditional = usageInteger(usage.additional_billable_tokens);
+  const additionalParts = [
+    explicitAdditional,
+    inputAudioTokens,
+    outputAudioTokens,
+    acceptedPredictionTokens,
+    rejectedPredictionTokens,
+  ];
+  const additionalBillableTokens = additionalParts.some((item) => item !== undefined)
+    ? additionalParts.reduce<bigint>((sum, item) => sum + (item ?? 0n), 0n)
+    : undefined;
   const authoritativeBillableTokens = usageInteger(usage.billable_tokens);
   const reportedTotalTokens = usageInteger(usage.total_tokens);
   if (
@@ -550,7 +580,10 @@ export function usageFromObject(value: unknown): RawProviderUsage | undefined {
     outputTokens === undefined &&
     cacheReadTokens === undefined &&
     cacheWriteTokens === undefined &&
-    authoritativeBillableTokens === undefined
+    authoritativeBillableTokens === undefined &&
+    reasoningTokens === undefined &&
+    usageInteger(usage.tool_tokens) === undefined &&
+    additionalBillableTokens === undefined
   )
     return undefined;
   const reportedCost = usageCost(usage.cost ?? usage.total_cost);
@@ -574,8 +607,13 @@ export function usageFromObject(value: unknown): RawProviderUsage | undefined {
     "currency",
     "pricing_version",
   ]);
-  const knownPromptDetailKeys = new Set(["cached_tokens"]);
-  const knownCompletionDetailKeys = new Set(["reasoning_tokens"]);
+  const knownPromptDetailKeys = new Set(["cached_tokens", "audio_tokens"]);
+  const knownCompletionDetailKeys = new Set([
+    "reasoning_tokens",
+    "audio_tokens",
+    "accepted_prediction_tokens",
+    "rejected_prediction_tokens",
+  ]);
   const hasUnknownUsageCategory = Object.keys(usage).some((key) => !knownUsageKeys.has(key));
   const hasUnknownPromptDetail =
     promptDetails !== undefined &&
@@ -583,8 +621,51 @@ export function usageFromObject(value: unknown): RawProviderUsage | undefined {
   const hasUnknownCompletionDetail =
     completionDetails !== undefined &&
     Object.keys(completionDetails).some((key) => !knownCompletionDetailKeys.has(key));
+  const hasInvalidKnownDetail = [
+    [promptDetails, "cached_tokens"],
+    [promptDetails, "audio_tokens"],
+    [completionDetails, "reasoning_tokens"],
+    [completionDetails, "audio_tokens"],
+    [completionDetails, "accepted_prediction_tokens"],
+    [completionDetails, "rejected_prediction_tokens"],
+  ].some(
+    ([details, key]) =>
+      details !== undefined &&
+      Object.hasOwn(details as Record<string, unknown>, key as string) &&
+      usageInteger((details as Record<string, unknown>)[key as string]) === undefined,
+  );
+  const knownIntegerFields = [
+    "input_tokens",
+    "prompt_tokens",
+    "output_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "billable_tokens",
+    "tool_tokens",
+    "additional_billable_tokens",
+  ];
+  const hasInvalidKnownInteger = knownIntegerFields.some(
+    (key) => Object.hasOwn(usage, key) && usageInteger(usage[key]) === undefined,
+  );
+  const impossibleBreakdown =
+    (promptTotal !== undefined &&
+      exclusiveMany(promptTotal, [cacheReadTokens, inputAudioTokens]) === undefined) ||
+    (completionTotal !== undefined &&
+      exclusiveMany(completionTotal, [
+        reasoningTokens,
+        outputAudioTokens,
+        acceptedPredictionTokens,
+        rejectedPredictionTokens,
+      ]) === undefined);
   const hasUnknownCategories =
-    hasUnknownUsageCategory || hasUnknownPromptDetail || hasUnknownCompletionDetail;
+    hasUnknownUsageCategory ||
+    hasUnknownPromptDetail ||
+    hasUnknownCompletionDetail ||
+    hasInvalidKnownDetail ||
+    hasInvalidKnownInteger ||
+    impossibleBreakdown;
   const normalizedCategoryTotal =
     inputTokens !== undefined && outputTokens !== undefined
       ? [
@@ -594,7 +675,7 @@ export function usageFromObject(value: unknown): RawProviderUsage | undefined {
           cacheWriteTokens,
           reasoningTokens,
           usageInteger(usage.tool_tokens),
-          usageInteger(usage.additional_billable_tokens),
+          additionalBillableTokens,
         ].reduce<bigint>((sum, item) => sum + (item ?? 0n), 0n)
       : undefined;
   const categoriesComplete = hasUnknownCategories
@@ -611,7 +692,7 @@ export function usageFromObject(value: unknown): RawProviderUsage | undefined {
     cacheWriteTokens,
     reasoningTokens,
     toolTokens: usageInteger(usage.tool_tokens),
-    additionalBillableTokens: usageInteger(usage.additional_billable_tokens),
+    additionalBillableTokens,
     authoritativeBillableTokens,
     reportedTotalTokens,
     categoriesComplete,
@@ -699,6 +780,21 @@ export function parseProviderUsage(
         accountingVersion: pricing!.accountingVersion,
       }
     : normalized;
+}
+
+export function providerStreamHasTerminalUsageEvent(
+  chunks: readonly Uint8Array[],
+  surface: ProtocolSurface,
+): boolean {
+  const text = new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))));
+  if (surface === "anthropic-messages")
+    return (
+      /(?:^|\n)event:\s*message_stop\s*(?:\r?\n|$)/u.test(text) ||
+      /"type"\s*:\s*"message_stop"/u.test(text)
+    );
+  if (surface === "openai-responses")
+    return /"type"\s*:\s*"response\.(?:completed|failed|cancelled|incomplete)"/u.test(text);
+  return /(?:^|\n)data:\s*\[DONE\]\s*(?:\r?\n|$)/u.test(text);
 }
 
 export function extractTailUsageObject(text: string): Record<string, unknown> | undefined {
@@ -1284,7 +1380,23 @@ export async function dispatchPublicOverflow(
             fencingToken,
           }).catch(() => false);
         }
-        const usage = streamComplete ? parseProviderUsage(usageChunks, pricing) : undefined;
+        const observedUsage = parseProviderUsage(usageChunks, pricing);
+        const observationComplete =
+          streamComplete &&
+          (!request.stream ||
+            providerStreamHasTerminalUsageEvent(
+              usageChunks,
+              nativeSurface ?? request.requestedSurface,
+            ));
+        const usage = observedUsage
+          ? {
+              ...observedUsage,
+              // A terminal usage event may not have arrived. Retain the partial
+              // provider observation for audit, but never release conservative
+              // liability based on it.
+              categoriesComplete: observationComplete ? observedUsage.categoriesComplete : false,
+            }
+          : undefined;
         await reconcileProviderBudget({
           userId: request.userId,
           providerAccountId: target.providerAccountId,
