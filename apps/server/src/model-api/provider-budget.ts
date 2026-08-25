@@ -325,7 +325,10 @@ export async function admitProviderBudget(
   return serializedByAdvisoryLocks(async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-attempt:${attempt.attemptId}`}, 0))`;
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-account:${attempt.userId}:${attempt.providerAccountId}`}, 0))`;
-    const nowRows = await tx.$queryRaw<Array<{ now: Date }>>`SELECT transaction_timestamp() AS now`;
+    // This statement runs after possibly waiting for the account lock. Use the
+    // actual post-wait database clock, not this transaction's start time, when
+    // evaluating newly committed activation/effective/expiry boundaries.
+    const nowRows = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
     const now = nowRows[0]?.now;
     if (!now) throw new ProviderBudgetConfigurationError("Database clock unavailable");
     const hasCostIdentity =
