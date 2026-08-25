@@ -32,7 +32,16 @@ import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { Textarea } from "@ws-model-proxy/ui/components/textarea";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { Copy, Gauge, Pencil, Plus, Trash2 } from "lucide-react";
+import {
+  ArrowLeft,
+  ArrowRight,
+  Copy,
+  Gauge,
+  Pencil,
+  Plus,
+  ShieldCheck,
+  Trash2,
+} from "lucide-react";
 import type { ReactNode } from "react";
 import { useId, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -52,6 +61,7 @@ import {
   memberPolicyPayload,
   newCapacityDefaults,
 } from "@/lib/capacity-forms";
+import { publicEgressResourceNames } from "@/lib/public-egress-disclosure";
 import { orpc } from "@/utils/orpc";
 
 type CliDevice = Awaited<
@@ -94,6 +104,12 @@ function routingStatusValue(value: string | undefined): RoutingStatus {
   if (value === "DRAINING" || value === "DISABLED") return value;
   return "ACTIVE";
 }
+
+const poolSurfaceValues = [
+  "OPENAI_CHAT_COMPLETIONS",
+  "OPENAI_RESPONSES",
+  "ANTHROPIC_MESSAGES",
+] as const;
 
 function copyToClipboard(value: string, message: string) {
   void navigator.clipboard.writeText(value).then(() => toast.success(message));
@@ -1138,6 +1154,403 @@ function DirectCapacityPolicyForm({
   );
 }
 
+function PoolSetupWizard({
+  open,
+  onOpenChange,
+  directModels,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  directModels: ReturnType<typeof allDirectModels>;
+}) {
+  const { t } = useTranslation(["common", "dashboard"]);
+  const queryClient = useQueryClient();
+  const [step, setStep] = useState(0);
+  const createPool = useMutation(orpc.forwarderManagement.createModelPool.mutationOptions());
+  const addMember = useMutation(orpc.forwarderManagement.addPoolMember.mutationOptions());
+  const schema = z
+    .object({
+      slug: z
+        .string()
+        .trim()
+        .superRefine((value, ctx) => {
+          const result = validateForwarderPoolSlug(value);
+          if (!result.ok)
+            ctx.addIssue({ code: "custom", message: t("dashboard:pools.invalidSlug") });
+        }),
+      name: z.string().trim().min(1).max(120),
+      localModelIds: z.array(z.string()).min(1, t("dashboard:pools.wizard.localRequired")),
+      publicEgress: z.boolean(),
+      publicEgressAcknowledged: z.boolean(),
+      finiteSpendProtection: z.boolean(),
+      concurrency: z.number().int().min(1).max(10_000),
+      contextCeiling: z.number().int().min(1).max(100_000_000),
+      reservedSlots: z.number().int().min(0).max(10_000),
+      waitMs: z.number().int().min(0).max(600_000),
+      recommendedSurface: z.enum(poolSurfaceValues),
+    })
+    .superRefine((value, ctx) => {
+      if (value.reservedSlots > value.concurrency) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["reservedSlots"],
+          message: t("dashboard:pools.wizard.reservationInvalid"),
+        });
+      }
+      if (value.publicEgress && !value.publicEgressAcknowledged) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["publicEgressAcknowledged"],
+          message: t("dashboard:pools.wizard.egressRequired"),
+        });
+      }
+      if (value.publicEgress && !value.finiteSpendProtection) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["finiteSpendProtection"],
+          message: t("dashboard:pools.wizard.spendRequired"),
+        });
+      }
+    });
+  const form = useForm({
+    defaultValues: {
+      slug: "",
+      name: "",
+      localModelIds: [] as string[],
+      publicEgress: false,
+      publicEgressAcknowledged: false,
+      finiteSpendProtection: true,
+      concurrency: 1,
+      contextCeiling: 32_768,
+      reservedSlots: 0,
+      waitMs: 30_000,
+      recommendedSurface: "OPENAI_RESPONSES" as (typeof poolSurfaceValues)[number],
+    },
+    validators: { onSubmit: schema },
+    onSubmit: async ({ value }) => {
+      const created = await createPool.mutateAsync({
+        slug: value.slug.trim(),
+        name: value.name.trim(),
+        description: null,
+        maxAttachmentBytes: null,
+        protocolAdaptationEnabled: true,
+        publicEgressEnabled: value.publicEgress,
+        ...(value.publicEgress ? { publicEgressAcknowledged: true as const } : {}),
+        recommendedSurfaceOverride: value.recommendedSurface,
+        capacityPriority: 16,
+        capacityConcurrencyLimit: value.concurrency,
+        capacityReservedSlots: value.reservedSlots,
+        capacityWaitBudgetMs: value.waitMs,
+        capacityContextCeiling: value.contextCeiling,
+        capacityContextMargin: Math.min(1024, Math.max(0, value.contextCeiling - 1)),
+        capacityBorrowPolicy: "WHEN_IDLE",
+      });
+      for (const discoveredModelId of value.localModelIds) {
+        await addMember.mutateAsync({
+          poolId: created.id,
+          discoveredModelId,
+          weight: 1,
+          routingStatus: "ACTIVE",
+        });
+      }
+      await queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
+      toast.success(t("dashboard:pools.created"));
+      setStep(0);
+      onOpenChange(false);
+    },
+  });
+  const steps = ["models", "capacity", "egress", "review"] as const;
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-h-[min(92vh,54rem)] overflow-x-hidden overflow-y-auto sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>{t("dashboard:pools.wizard.title")}</DialogTitle>
+          <DialogDescription>{t("dashboard:pools.wizard.description")}</DialogDescription>
+        </DialogHeader>
+        <div className="flex gap-1" aria-label={t("dashboard:pools.wizard.progress")}>
+          {steps.map((item, index) => (
+            <div
+              key={item}
+              className={cn("h-1.5 flex-1 rounded-full", index <= step ? "bg-primary" : "bg-muted")}
+              aria-current={index === step ? "step" : undefined}
+            />
+          ))}
+        </div>
+        <p className="text-sm font-medium">
+          {t("dashboard:pools.wizard.step", { current: step + 1, total: steps.length })}:{" "}
+          {t(`dashboard:pools.wizard.steps.${steps[step]}`)}
+        </p>
+        <form
+          className="space-y-5"
+          onSubmit={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (step < steps.length - 1) setStep((current) => current + 1);
+            else form.handleSubmit();
+          }}
+        >
+          {step === 0 ? (
+            <div className="space-y-4">
+              <div className="grid gap-4 sm:grid-cols-2">
+                {(["slug", "name"] as const).map((name) => (
+                  <form.Field key={name} name={name}>
+                    {(field) => (
+                      <div className="space-y-2">
+                        <Label htmlFor={`wizard-${name}`}>{t(`dashboard:pools.${name}`)}</Label>
+                        <Input
+                          id={`wizard-${name}`}
+                          className="min-h-11"
+                          value={field.state.value}
+                          onBlur={field.handleBlur}
+                          onChange={(event) => field.handleChange(event.target.value)}
+                        />
+                        {field.state.meta.errors.map((error) => (
+                          <p key={error?.message} className="text-sm text-destructive">
+                            {error?.message}
+                          </p>
+                        ))}
+                      </div>
+                    )}
+                  </form.Field>
+                ))}
+              </div>
+              <form.Field name="localModelIds">
+                {(field) => (
+                  <fieldset className="space-y-2">
+                    <legend className="text-sm font-medium">
+                      {t("dashboard:pools.wizard.localModels")}
+                    </legend>
+                    <p className="text-sm text-muted-foreground">
+                      {t("dashboard:pools.wizard.localModelsHint")}
+                    </p>
+                    <div className="max-h-56 divide-y overflow-x-clip overflow-y-auto overscroll-contain rounded-md border">
+                      {directModels.length ? (
+                        directModels.map((model) => {
+                          const checked = field.state.value.includes(model.id);
+                          return (
+                            <label key={model.id} className="flex min-h-11 items-center gap-3 p-3">
+                              <Checkbox
+                                checked={checked}
+                                onCheckedChange={(next) =>
+                                  field.handleChange(
+                                    next === true
+                                      ? [...field.state.value, model.id]
+                                      : field.state.value.filter((id) => id !== model.id),
+                                  )
+                                }
+                              />
+                              <code className="min-w-0 break-all font-mono text-xs">
+                                {model.canonicalModelId}
+                              </code>
+                            </label>
+                          );
+                        })
+                      ) : (
+                        <p className="p-4 text-sm text-muted-foreground">
+                          {t("dashboard:pools.noDirectModels")}
+                        </p>
+                      )}
+                    </div>
+                  </fieldset>
+                )}
+              </form.Field>
+            </div>
+          ) : null}
+          {step === 1 ? (
+            <div className="space-y-4">
+              <div className="rounded-md bg-muted p-4 text-sm text-muted-foreground">
+                {t("dashboard:pools.wizard.capacityHint")}
+              </div>
+              <div className="grid gap-4 sm:grid-cols-2">
+                {(["concurrency", "contextCeiling", "reservedSlots", "waitMs"] as const).map(
+                  (name) => (
+                    <form.Field key={name} name={name}>
+                      {(field) => (
+                        <div className="space-y-2">
+                          <Label htmlFor={`wizard-${name}`}>
+                            {t(`dashboard:pools.wizard.fields.${name}`)}
+                          </Label>
+                          <Input
+                            id={`wizard-${name}`}
+                            className="min-h-11"
+                            type="number"
+                            min={name === "reservedSlots" || name === "waitMs" ? 0 : 1}
+                            value={field.state.value}
+                            onChange={(event) => field.handleChange(Number(event.target.value))}
+                          />
+                          {field.state.meta.errors.map((error) => (
+                            <p key={error?.message} className="text-sm text-destructive">
+                              {error?.message}
+                            </p>
+                          ))}
+                        </div>
+                      )}
+                    </form.Field>
+                  ),
+                )}
+              </div>
+            </div>
+          ) : null}
+          {step === 2 ? (
+            <div className="space-y-4">
+              <form.Field name="recommendedSurface">
+                {(field) => (
+                  <div className="space-y-2">
+                    <Label htmlFor="wizard-surface">
+                      {t("dashboard:pools.wizard.fields.recommendedSurface")}
+                    </Label>
+                    <select
+                      id="wizard-surface"
+                      className="h-11 w-full rounded-md border bg-background px-3 text-sm"
+                      value={field.state.value}
+                      onChange={(event) =>
+                        field.handleChange(event.target.value as typeof field.state.value)
+                      }
+                    >
+                      {poolSurfaceValues.map((surface) => (
+                        <option key={surface} value={surface}>
+                          {t(`dashboard:pools.wizard.surfaces.${surface}`)}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+              </form.Field>
+              <form.Field name="publicEgress">
+                {(field) => (
+                  <label className="flex min-h-11 items-start gap-3 rounded-md border p-3">
+                    <Checkbox
+                      checked={field.state.value}
+                      onCheckedChange={(next) => field.handleChange(next === true)}
+                    />
+                    <span>
+                      <span className="block text-sm font-medium">
+                        {t("dashboard:pools.wizard.publicEgress")}
+                      </span>
+                      <span className="block text-sm text-muted-foreground">
+                        {t("dashboard:pools.wizard.publicEgressHint")}
+                      </span>
+                    </span>
+                  </label>
+                )}
+              </form.Field>
+              <form.Subscribe selector={(state) => state.values.publicEgress}>
+                {(publicEgress) =>
+                  publicEgress ? (
+                    <div className="space-y-3 rounded-md bg-amber-500/10 p-4 text-amber-900 dark:text-amber-100">
+                      <p className="text-sm font-medium">
+                        {t("dashboard:pools.wizard.egressWarning")}
+                      </p>
+                      {(["publicEgressAcknowledged", "finiteSpendProtection"] as const).map(
+                        (name) => (
+                          <form.Field key={name} name={name}>
+                            {(field) => (
+                              <label className="flex min-h-11 items-start gap-3 text-sm">
+                                <Checkbox
+                                  checked={field.state.value}
+                                  onCheckedChange={(next) => field.handleChange(next === true)}
+                                />
+                                <span>{t(`dashboard:pools.wizard.fields.${name}`)}</span>
+                              </label>
+                            )}
+                          </form.Field>
+                        ),
+                      )}
+                      <p className="text-xs">{t("dashboard:pools.wizard.providerOrderHint")}</p>
+                    </div>
+                  ) : null
+                }
+              </form.Subscribe>
+            </div>
+          ) : null}
+          {step === 3 ? (
+            <form.Subscribe selector={(state) => state.values}>
+              {(values) => (
+                <div className="space-y-4">
+                  <div className="flex items-start gap-3 rounded-md bg-primary/10 p-4 text-sm">
+                    <ShieldCheck className="mt-0.5 size-5 shrink-0 text-primary" />
+                    <p>{t("dashboard:pools.wizard.reviewSafe")}</p>
+                  </div>
+                  <dl className="grid gap-3 text-sm sm:grid-cols-2">
+                    <div>
+                      <dt className="text-muted-foreground">
+                        {t("dashboard:pools.wizard.localModels")}
+                      </dt>
+                      <dd className="font-medium tabular-nums">{values.localModelIds.length}</dd>
+                    </div>
+                    <div>
+                      <dt className="text-muted-foreground">
+                        {t("dashboard:pools.wizard.fields.concurrency")}
+                      </dt>
+                      <dd className="font-medium tabular-nums">{values.concurrency}</dd>
+                    </div>
+                    <div>
+                      <dt className="text-muted-foreground">
+                        {t("dashboard:pools.wizard.fields.contextCeiling")}
+                      </dt>
+                      <dd className="font-medium tabular-nums">
+                        {values.contextCeiling.toLocaleString()}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt className="text-muted-foreground">
+                        {t("dashboard:pools.wizard.publicEgress")}
+                      </dt>
+                      <dd className="font-medium">
+                        {values.publicEgress
+                          ? t("dashboard:pools.wizard.enabled")
+                          : t("dashboard:pools.wizard.disabled")}
+                      </dd>
+                    </div>
+                  </dl>
+                  <p className="text-sm text-muted-foreground">
+                    {t("dashboard:pools.wizard.advancedHint")}
+                  </p>
+                </div>
+              )}
+            </form.Subscribe>
+          ) : null}
+          <DialogFooter className="gap-2 sm:justify-between">
+            <Button
+              type="button"
+              variant="ghost"
+              size="touch"
+              disabled={step === 0}
+              onClick={() => setStep((current) => Math.max(0, current - 1))}
+            >
+              <ArrowLeft className="size-4" />
+              {t("dashboard:pools.wizard.back")}
+            </Button>
+            <Button
+              type="submit"
+              size="touch"
+              disabled={
+                createPool.isPending ||
+                addMember.isPending ||
+                (step === 0 && directModels.length === 0)
+              }
+            >
+              {step === steps.length - 1 ? (
+                createPool.isPending || addMember.isPending ? (
+                  t("common:actions.saving")
+                ) : (
+                  t("dashboard:pools.wizard.create")
+                )
+              ) : (
+                <>
+                  {t("dashboard:pools.wizard.next")}
+                  <ArrowRight className="size-4" />
+                </>
+              )}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 export function PoolsSection() {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
@@ -1158,6 +1571,7 @@ export function PoolsSection() {
     retry: false,
   });
   const [createOpen, setCreateOpen] = useState(false);
+  const [wizardOpen, setWizardOpen] = useState(false);
   const [capacityOpen, setCapacityOpen] = useState(false);
   const [editingCapacity, setEditingCapacity] = useState<CapacityRow | null>(null);
   const [deleteCapacity, setDeleteCapacity] = useState<CapacityRow | null>(null);
@@ -1234,29 +1648,36 @@ export function PoolsSection() {
         title={t("dashboard:pools.title")}
         description={t("dashboard:pools.description")}
         action={
-          <Dialog open={createOpen} onOpenChange={setCreateOpen}>
-            <DialogTrigger
-              render={
-                <Button size="touch">
-                  <Plus className="size-4" />
-                  {t("dashboard:pools.create")}
-                </Button>
-              }
-            />
-            <DialogContent className="sm:max-w-lg">
-              <DialogHeader>
-                <DialogTitle>{t("dashboard:pools.createTitle")}</DialogTitle>
-                <DialogDescription>{t("dashboard:pools.createDescription")}</DialogDescription>
-              </DialogHeader>
-              <PoolForm
-                mode="create"
-                capacities={capacitiesData ?? []}
-                onSuccess={() => setCreateOpen(false)}
+          <div className="flex flex-wrap gap-2">
+            <Button size="touch" onClick={() => setWizardOpen(true)}>
+              <Plus className="size-4" />
+              {t("dashboard:pools.wizard.open")}
+            </Button>
+            <Dialog open={createOpen} onOpenChange={setCreateOpen}>
+              <DialogTrigger
+                render={
+                  <Button size="touch">
+                    <Plus className="size-4" />
+                    {t("dashboard:pools.advancedCreate")}
+                  </Button>
+                }
               />
-            </DialogContent>
-          </Dialog>
+              <DialogContent className="sm:max-w-lg">
+                <DialogHeader>
+                  <DialogTitle>{t("dashboard:pools.createTitle")}</DialogTitle>
+                  <DialogDescription>{t("dashboard:pools.createDescription")}</DialogDescription>
+                </DialogHeader>
+                <PoolForm
+                  mode="create"
+                  capacities={capacitiesData ?? []}
+                  onSuccess={() => setCreateOpen(false)}
+                />
+              </DialogContent>
+            </Dialog>
+          </div>
         }
       />
+      <PoolSetupWizard open={wizardOpen} onOpenChange={setWizardOpen} directModels={directModels} />
 
       {capacitiesData || capacitiesPending ? (
         <div className="mb-6 border-y bg-muted/30 py-4">
@@ -1500,13 +1921,158 @@ export function PoolsSection() {
                               <td className="py-2 pr-3 align-top">
                                 <code className="font-mono">
                                   {member.model?.canonicalModelId ??
+                                    member.providerModel?.displayName ??
+                                    member.providerModel?.upstreamModelId ??
                                     member.discoveredModelId ??
                                     member.id}
                                 </code>
+                                <div className="mt-1 flex flex-wrap gap-1">
+                                  <StatusPill muted>
+                                    {t(`dashboard:pools.memberTiers.${member.tier}`)}
+                                  </StatusPill>
+                                  {member.publicOrder != null ? (
+                                    <StatusPill muted>
+                                      {t("dashboard:pools.publicOrder", {
+                                        order: member.publicOrder + 1,
+                                      })}
+                                    </StatusPill>
+                                  ) : null}
+                                </div>
+                                {member.model ? (
+                                  <details className="mt-2">
+                                    <summary className="min-h-11 cursor-pointer py-2 text-muted-foreground">
+                                      {t("dashboard:pools.memberCapabilities")}
+                                    </summary>
+                                    <div className="space-y-1">
+                                      {Object.entries(member.model.surfaces).map(
+                                        ([surface, availability]) => (
+                                          <p key={surface} className="break-words">
+                                            <span className="font-medium">{surface}</span>:{" "}
+                                            {availability.mode}
+                                            {availability.limitations.length
+                                              ? ` · ${availability.limitations.map((item) => t(`dashboard:pools.limitations.${item}`)).join(", ")}`
+                                              : ""}
+                                          </p>
+                                        ),
+                                      )}
+                                    </div>
+                                  </details>
+                                ) : null}
                               </td>
                               <td className="py-2 pr-3 align-top tabular-nums">{member.weight}</td>
-                              <td className="py-2 pr-3 align-top">{member.routingStatus}</td>
-                              <td className="py-2 pr-3 align-top">{member.healthStatus}</td>
+                              <td className="py-2 pr-3 align-top">
+                                <div>{member.routingStatus}</div>
+                                <details className="mt-1">
+                                  <summary className="min-h-11 cursor-pointer py-2 text-muted-foreground">
+                                    {t("dashboard:pools.memberPolicyDetails")}
+                                  </summary>
+                                  <dl className="space-y-1 text-muted-foreground">
+                                    <div>
+                                      <dt className="inline">
+                                        {t(
+                                          "dashboard:pools.capacity.fields.capacityConcurrencyLimit",
+                                        )}
+                                        :{" "}
+                                      </dt>
+                                      <dd className="inline">
+                                        {member.capacityConcurrencyMode}
+                                        {member.capacityConcurrencyLimit != null
+                                          ? ` ${member.capacityConcurrencyLimit}`
+                                          : ""}
+                                      </dd>
+                                    </div>
+                                    <div>
+                                      <dt className="inline">
+                                        {t(
+                                          "dashboard:pools.capacity.fields.capacityContextCeiling",
+                                        )}
+                                        :{" "}
+                                      </dt>
+                                      <dd className="inline">
+                                        {member.capacityContextCeilingMode}
+                                        {member.capacityContextCeiling != null
+                                          ? ` ${member.capacityContextCeiling.toLocaleString()}`
+                                          : ""}
+                                      </dd>
+                                    </div>
+                                    <div>
+                                      <dt className="inline">
+                                        {t("dashboard:pools.capacity.fields.capacityPriority")}:{" "}
+                                      </dt>
+                                      <dd className="inline">
+                                        {member.capacityPriority ?? t("dashboard:pools.inherited")}
+                                      </dd>
+                                    </div>
+                                    <div>
+                                      <dt className="inline">
+                                        {t("dashboard:pools.capacity.fields.capacityReservedSlots")}
+                                        :{" "}
+                                      </dt>
+                                      <dd className="inline">
+                                        {member.capacityReservedSlots ??
+                                          t("dashboard:pools.inherited")}
+                                      </dd>
+                                    </div>
+                                    <div>
+                                      <dt className="inline">
+                                        {t("dashboard:pools.capacity.fields.capacityBorrowPolicy")}:{" "}
+                                      </dt>
+                                      <dd className="inline">
+                                        {member.capacityBorrowPolicy ??
+                                          t("dashboard:pools.inherited")}
+                                      </dd>
+                                    </div>
+                                    <div>
+                                      <dt className="inline">
+                                        {t("dashboard:pools.memberPhysicalCapacity")}:{" "}
+                                      </dt>
+                                      <dd className="inline">
+                                        {member.inferenceCapacityId
+                                          ? t("dashboard:pools.memberLoad", {
+                                              active:
+                                                capacitiesData?.find(
+                                                  (capacity) =>
+                                                    capacity.id === member.inferenceCapacityId,
+                                                )?._count.CapacityLeases ?? 0,
+                                              waiting:
+                                                capacitiesData?.find(
+                                                  (capacity) =>
+                                                    capacity.id === member.inferenceCapacityId,
+                                                )?._count.CapacityWaiters ?? 0,
+                                              limit:
+                                                capacitiesData?.find(
+                                                  (capacity) =>
+                                                    capacity.id === member.inferenceCapacityId,
+                                                )?.hardConcurrencyLimit ?? "∞",
+                                            })
+                                          : t("dashboard:pools.capacity.unattached")}
+                                      </dd>
+                                    </div>
+                                  </dl>
+                                </details>
+                              </td>
+                              <td className="py-2 pr-3 align-top">
+                                <StatusPill status={member.healthStatus}>
+                                  {member.healthStatus}
+                                </StatusPill>
+                                {member.lastFailureClass ? (
+                                  <p className="mt-2 text-muted-foreground">
+                                    {member.lastFailureClass} ·{" "}
+                                    {member.consecutiveRetryableFailures}
+                                  </p>
+                                ) : null}
+                                {member.providerModel ? (
+                                  <p className="mt-2 text-muted-foreground">
+                                    {member.providerModel.ProviderAccount.label} ·{" "}
+                                    {member.providerModel.pricingVersion
+                                      ? t("dashboard:pools.memberCost", {
+                                          version: member.providerModel.pricingVersion,
+                                          currency: member.providerModel.pricingCurrency,
+                                        })
+                                      : t("dashboard:pools.costUnavailable")}
+                                  </p>
+                                ) : null}
+                              </td>
                               <td className="py-2 pl-3 align-top">
                                 <div className="flex justify-end gap-1">
                                   {member.model?.surfaces.OPENAI_CHAT_COMPLETIONS.mode !==
@@ -1597,6 +2163,11 @@ export function PoolsSection() {
                             <p className="truncate text-xs text-muted-foreground">
                               {grant.granteeEmail}
                             </p>
+                            {pool.publicEgressEnabled ? (
+                              <p className="mt-1 text-xs text-amber-700 dark:text-amber-300">
+                                {t("dashboard:pools.grantEgressWarning")}
+                              </p>
+                            ) : null}
                           </div>
                           <Button
                             type="button"
@@ -2543,6 +3114,24 @@ function PoolForm({
               )}
             </form.Field>
           </div>
+          <form.Subscribe
+            selector={(state) =>
+              state.values.capacityConcurrencyMode === "UNLIMITED" ||
+              state.values.capacityWaitBudgetMode === "UNLIMITED" ||
+              state.values.capacityContextCeilingMode === "UNLIMITED"
+            }
+          >
+            {(hasUnlimited) =>
+              hasUnlimited ? (
+                <p
+                  className="mt-3 rounded-md bg-amber-500/10 p-3 text-sm text-amber-900 dark:text-amber-100"
+                  role="alert"
+                >
+                  {t("dashboard:pools.capacity.unlimitedWarning")}
+                </p>
+              ) : null
+            }
+          </form.Subscribe>
         </details>
       ) : null}
 
@@ -3703,6 +4292,7 @@ export function ModelApiTokensSection() {
           {t("dashboard:tokens.noVisibleModels")}
         </div>
       ) : null}
+      <TokenEgressWarnings pools={visibleModelsData.modelPools} />
       <TokenTable tokens={tokensData} onRevoke={setRevokeToken} />
       <ConfirmDeleteDialog
         open={Boolean(revokeToken)}
@@ -3789,6 +4379,7 @@ function VisibleModelPreview({ preview }: { preview: TokenPreview }) {
   return (
     <div className="rounded-md border p-3">
       <p className="text-sm font-medium">{t("tokens.visiblePreview", { count })}</p>
+      <TokenEgressWarnings pools={preview.modelPools} compact />
       <div className="mt-2 max-h-40 overflow-y-auto overflow-x-clip space-y-1">
         {[...preview.directModels, ...preview.modelPools].map((model) => (
           <code key={model.id} className="block break-all font-mono text-xs text-muted-foreground">
@@ -3796,6 +4387,37 @@ function VisibleModelPreview({ preview }: { preview: TokenPreview }) {
           </code>
         ))}
       </div>
+    </div>
+  );
+}
+
+function TokenEgressWarnings({
+  pools,
+  compact = false,
+}: {
+  pools: Array<{
+    id: string;
+    name: string;
+    publicEgressEnabled: boolean;
+    publicEgressAcknowledged: boolean;
+  }>;
+  compact?: boolean;
+}) {
+  const { t } = useTranslation("dashboard");
+  const egressPoolNames = publicEgressResourceNames(pools);
+  if (egressPoolNames.length === 0) return null;
+  return (
+    <div
+      className={cn(
+        "rounded-md bg-amber-500/10 text-sm text-amber-900 dark:text-amber-100",
+        compact ? "mt-3 p-3" : "mb-4 p-4",
+      )}
+      role="note"
+    >
+      <p className="font-medium">{t("tokens.publicEgressWarningTitle")}</p>
+      <p className="mt-1">
+        {t("tokens.publicEgressWarning", { pools: egressPoolNames.join(", ") })}
+      </p>
     </div>
   );
 }

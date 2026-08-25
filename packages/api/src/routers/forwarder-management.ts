@@ -250,6 +250,7 @@ type PoolMemberRow = {
       displayName: string | null;
       healthStatus: string;
       enabled: boolean;
+      PricingVersions: Array<{ version: string; currency: string }>;
       ProviderAccount: { id: string; label: string; providerType: string; enabled: boolean };
     } | null;
   } | null;
@@ -416,6 +417,8 @@ async function serializeVisibleTargets(targets: VisibleModelTargets) {
       ownerUserSlug: pool.ownerUserSlug,
       poolSlug: pool.poolSlug,
       maxAttachmentBytes: pool.maxAttachmentBytes,
+      publicEgressEnabled: pool.publicEgressEnabled,
+      publicEgressAcknowledged: pool.publicEgressAcknowledged,
       attachmentModalities: modalities.poolById.get(pool.id) ?? {
         image: false,
         audio: false,
@@ -684,7 +687,20 @@ function serializePool(row: ModelPoolRow) {
               }),
             }
           : null,
-        providerModel: member.ExecutionTarget?.ProviderModel ?? null,
+        providerModel: member.ExecutionTarget?.ProviderModel
+          ? {
+              id: member.ExecutionTarget.ProviderModel.id,
+              upstreamModelId: member.ExecutionTarget.ProviderModel.upstreamModelId,
+              displayName: member.ExecutionTarget.ProviderModel.displayName,
+              healthStatus: member.ExecutionTarget.ProviderModel.healthStatus,
+              enabled: member.ExecutionTarget.ProviderModel.enabled,
+              ProviderAccount: member.ExecutionTarget.ProviderModel.ProviderAccount,
+              pricingVersion:
+                member.ExecutionTarget.ProviderModel.PricingVersions[0]?.version ?? null,
+              pricingCurrency:
+                member.ExecutionTarget.ProviderModel.PricingVersions[0]?.currency ?? null,
+            }
+          : null,
       };
     }),
     grants: row.PoolGrants.map((grant) => ({
@@ -941,6 +957,12 @@ const poolSelect = {
               displayName: true,
               healthStatus: true,
               enabled: true,
+              PricingVersions: {
+                where: { status: "ACTIVE" as const, retiredAt: null },
+                orderBy: { effectiveAt: "desc" as const },
+                take: 1,
+                select: { version: true, currency: true },
+              },
               ProviderAccount: {
                 select: { id: true, label: true, providerType: true, enabled: true },
               },

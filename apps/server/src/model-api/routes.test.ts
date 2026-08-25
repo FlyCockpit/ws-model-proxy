@@ -51,7 +51,7 @@ vi.mock("@ws-model-proxy/api/lib/model-api-token-access", () => ({
   listVisibleModelTargetsForToken: vi.fn(),
 }));
 
-const { createModelApiRoutes } = await import("./routes.js");
+const { captureProviderResponseBinding, createModelApiRoutes } = await import("./routes.js");
 const { MODEL_API_MAX_REQUEST_BODY_BYTES, ModelApiConcurrencyLimiter } = await import(
   "./limits.js"
 );
@@ -3699,6 +3699,68 @@ describe("model API routes", () => {
         selectedExecutionTargetId: "execution-target-id",
       },
     });
+  });
+
+  it("does not expose provider Responses EOF until the v3 binding is durable", async () => {
+    let resolveUpsert!: (value: { id: string }) => void;
+    db.responseStickinessRecord.upsert.mockImplementationOnce(
+      () =>
+        new Promise<{ id: string }>((resolve) => {
+          resolveUpsert = resolve;
+        }),
+    );
+    const wrapped = captureProviderResponseBinding({
+      response: new Response(JSON.stringify({ id: "resp_provider", object: "response" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+      streaming: false,
+      requester: {
+        userId: "user-id",
+        modelApiTokenId: "token-id",
+        modelApiTokenLookupPrefix: "wsmp_model_lookup",
+        limitKey: "token-id",
+      },
+      targetModelPoolId: "pool-id",
+      target: {
+        executionTargetId: "provider-target",
+        providerAccountId: "provider-account",
+        providerModelId: "provider-model",
+        endpointIdentity: "https://provider.example/v1",
+        endpointVersion: 4,
+        upstreamModelId: "gpt-response",
+      },
+      terminal: Promise.resolve({ ok: true }),
+    });
+    const reader = wrapped.body!.getReader();
+    const first = await reader.read();
+    expect(first.done).toBe(false);
+    const eof = reader.read();
+    let eofObserved = false;
+    void eof.then(() => {
+      eofObserved = true;
+    });
+    await vi.waitFor(() => expect(db.responseStickinessRecord.upsert).toHaveBeenCalled());
+    expect(eofObserved).toBe(false);
+    expect(db.responseStickinessRecord.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({
+          routingVersion: 3,
+          userId: "user-id",
+          modelApiTokenId: "token-id",
+          targetModelPoolId: "pool-id",
+          selectedExecutionTargetId: "provider-target",
+          providerAccountId: "provider-account",
+          providerModelId: "provider-model",
+          providerEndpointIdentity: "https://provider.example/v1",
+          providerEndpointVersion: 4,
+          providerUpstreamModelId: "gpt-response",
+          nativeSurface: "OPENAI_RESPONSES",
+        }),
+      }),
+    );
+    resolveUpsert({ id: "binding-id" });
+    await expect(eof).resolves.toEqual({ done: true, value: undefined });
   });
 
   it("uses metadata-only sticky routing for Responses API follow-up requests", async () => {

@@ -60,6 +60,10 @@ import {
   type CapacityAdmissionRuntime,
   StoreCapacityAdmissionRuntime,
 } from "./capacity/runtime.js";
+import {
+  allowsChatTestExecutionMode,
+  resolveChatTestRoutingMode,
+} from "./chat-test-routing-mode.js";
 import { responseWithFirstClientByte } from "./client-byte-commit.js";
 import {
   MODEL_API_MAX_REQUEST_BODY_BYTES,
@@ -2227,7 +2231,7 @@ function createResponseIdCapture() {
   };
 }
 
-function captureProviderResponseBinding(input: {
+export function captureProviderResponseBinding(input: {
   response: Response;
   streaming: boolean;
   requester: RelayRequester;
@@ -2252,21 +2256,30 @@ function captureProviderResponseBinding(input: {
     finished = true;
     const responseId = capture.finish(input.streaming);
     const terminal = await input.terminal;
-    if (!terminal.ok || !responseId) return;
-    await writeProviderResponseStickiness({
-      requester: input.requester,
-      responseId,
-      targetModelPoolId: input.targetModelPoolId,
-      ...input.target,
-    }).catch(stickinessWriteError);
+    if (!terminal.ok) throw new Error("Provider response did not complete successfully");
+    if (!responseId) throw new Error("Provider response did not include a response id");
+    try {
+      await writeProviderResponseStickiness({
+        requester: input.requester,
+        responseId,
+        targetModelPoolId: input.targetModelPoolId,
+        ...input.target,
+      });
+    } catch (error) {
+      stickinessWriteError(error);
+      throw new Error("Response routing metadata could not be persisted");
+    }
   };
   const body = new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
         const next = await reader.read();
         if (next.done) {
-          controller.close();
           await persist();
+          // The successful upstream response is not observably complete until
+          // its correctness-required binding is durable. A follow-up issued as
+          // soon as EOF is observed can therefore never race the database row.
+          controller.close();
           return;
         }
         capture.push(next.value, input.streaming);
@@ -3150,6 +3163,10 @@ async function relayPool({
 }): Promise<Response> {
   const startedAt = new Date();
   const requestedSurface = requestedSurfaceForOperation(operation);
+  const testRoutingMode = resolveChatTestRoutingMode(
+    request.headers.get("x-wsmp-chat-test-routing-mode"),
+    requester.exposeTransformDebug === true,
+  );
   const relayDeadlineMs = startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS;
   const relayRequestId = await createRelayMetadata({
     userId: requester.userId,
@@ -3168,6 +3185,7 @@ async function relayPool({
     reason: PublicOverflowReason,
     releaseLocalCapacity: () => Promise<void>,
   ): Promise<Response | null> => {
+    if (testRoutingMode !== "PREFER_NATIVE") return null;
     // Public provider dispatch is intentionally limited to replayable modern
     // JSON operations. Stateful Responses and multipart/audio paths must retain
     // their exact target or fail safely.
@@ -3557,10 +3575,19 @@ async function relayPool({
   const legacyProtocolCandidates = protocolCandidates.filter(
     (member) => executionByMember.get(member.id) == null,
   );
+  const selectedNativeProtocolCandidates = allowsChatTestExecutionMode(testRoutingMode, "native")
+    ? nativeProtocolCandidates
+    : [];
+  const selectedAdaptedProtocolCandidates = allowsChatTestExecutionMode(testRoutingMode, "adapted")
+    ? adaptedProtocolCandidates
+    : [];
+  const selectedLegacyProtocolCandidates = allowsChatTestExecutionMode(testRoutingMode, "legacy")
+    ? legacyProtocolCandidates
+    : [];
   const knownEligibleMembers = [
-    ...nativeProtocolCandidates,
-    ...adaptedProtocolCandidates,
-    ...legacyProtocolCandidates,
+    ...selectedNativeProtocolCandidates,
+    ...selectedAdaptedProtocolCandidates,
+    ...selectedLegacyProtocolCandidates,
   ];
   const knownIds = new Set(knownEligibleMembers.map((member) => member.id));
   const unknownFallbackMembers =
@@ -3597,17 +3624,17 @@ async function relayPool({
   const activeCliDeviceIds = manager.getActiveCliDeviceIds();
   const now = new Date();
   const nativeSequence = buildPoolRouteSequence({
-    members: nativeProtocolCandidates,
+    members: selectedNativeProtocolCandidates,
     activeCliDeviceIds,
     now,
   });
   const adaptedSequence = buildPoolRouteSequence({
-    members: adaptedProtocolCandidates,
+    members: selectedAdaptedProtocolCandidates,
     activeCliDeviceIds,
     now,
   });
   const legacySequence = buildPoolRouteSequence({
-    members: legacyProtocolCandidates,
+    members: selectedLegacyProtocolCandidates,
     activeCliDeviceIds,
     now,
   });
@@ -5525,6 +5552,7 @@ async function relayBoundProviderResponse(input: {
   stickyRoute: Extract<StickyRoute, { target: "PROVIDER" }>;
   method: string;
   path: string;
+  capability: ModelApiCapability;
   body: Uint8Array;
   headers: Headers;
   stream: boolean;
@@ -5537,7 +5565,7 @@ async function relayBoundProviderResponse(input: {
     modelApiTokenId: input.requester.modelApiTokenId,
     modelApiTokenLookupPrefix: input.requester.modelApiTokenLookupPrefix,
     requestedModelPoolId: input.stickyRoute.visibleTarget.id,
-    operation: "responses.create",
+    operation: input.capability,
     requestBytes: input.body.byteLength,
     contextCount: input.contextCount,
   });
@@ -5727,6 +5755,7 @@ async function responsesCreateHandler({
       stickyRoute,
       method: "POST",
       path: "/v1/responses",
+      capability: "responses.create",
       body: built.body,
       headers: built.headers,
       stream: prepared.stream,
@@ -5812,6 +5841,7 @@ async function responsesStickyHandler({
       stickyRoute,
       method,
       path,
+      capability,
       body: prepared.body,
       headers: prepared.headers,
       stream: false,

@@ -90,6 +90,14 @@
     "modelFilterPlaceholder": "Filter models…",
     "modelPicker": "Model",
     "regenerate": "Regenerate",
+    "routingMode": {
+      "label": "Pool route mode",
+      "PREFER_NATIVE": "Preferred API (native first)",
+      "REQUIRE_NATIVE": "Require native Chat API",
+      "REQUIRE_ADAPTED": "Require adapted Chat API",
+      "help": "Native mode rejects adapted members; adapted mode rejects native members. Unsupported modes fail without silently changing the route.",
+      "directHelp": "Direct models always use their native Chat API."
+    },
     "retry": "Retry",
     "send": "Send",
     "systemPrompt": {
@@ -209,6 +217,7 @@
       "attachmentGlobalEffect": "Changing the shared capacity attachment changes admission for this execution target everywhere it is used.",
       "attachment": "Shared capacity",
       "unattached": "Not attached",
+      "unlimitedWarning": "Unlimited removes a physical safety boundary. Confirm the runtime and provider have an independently enforced ceiling before saving.",
       "borrowIdle": "Borrow only while reserved capacity is idle",
       "borrowNever": "Never borrow reserved capacity",
       "save": "Save capacity",
@@ -278,6 +287,52 @@
     "attachmentLimitInvalid": "Enter a whole number of MiB, or leave it blank.",
     "created": "Pool created",
     "create": "Create pool",
+    "advancedCreate": "Advanced setup",
+    "wizard": {
+      "advancedHint": "After creation, Advanced setup exposes borrowing, context margins, count strategy, affinity, adaptation, and target ordering.",
+      "back": "Back",
+      "capacityHint": "These finite defaults protect the physical runtime. Reserved slots stay private to this pool; other idle slots may be borrowed.",
+      "create": "Create protected pool",
+      "description": "Choose local capacity first, then explicitly decide whether requests may leave your infrastructure.",
+      "disabled": "Disabled",
+      "egressRequired": "Acknowledge public egress before enabling it.",
+      "egressWarning": "When local targets cannot serve a request, its prompts, attachments, tool definitions, and generated output may be sent to the configured public provider.",
+      "enabled": "Enabled",
+      "fields": {
+        "concurrency": "Physical concurrency ceiling",
+        "contextCeiling": "Maximum context tokens",
+        "finiteSpendProtection": "I will configure a finite provider spending limit before attaching a public target.",
+        "publicEgressAcknowledged": "I understand which request data can leave this deployment.",
+        "recommendedSurface": "Recommended API",
+        "reservedSlots": "Private reserved slots",
+        "waitMs": "Local wait before overflow (ms)"
+      },
+      "localModels": "Local models",
+      "localModelsHint": "Select at least one connected model. These remain the primary tier.",
+      "localRequired": "Select at least one local model.",
+      "next": "Continue",
+      "open": "Guided setup",
+      "progress": "Pool setup progress",
+      "providerOrderHint": "Public providers are tried only after the local wait, in the explicit order you set in Provider operations. Each attachment also requires a concurrency policy and finite spend protection.",
+      "publicEgress": "Allow guarded public overflow",
+      "publicEgressHint": "Keep local targets preferred and use configured providers only after local capacity cannot serve the request.",
+      "reservationInvalid": "Reserved slots cannot exceed the concurrency ceiling.",
+      "reviewSafe": "This setup keeps concurrency, context, waiting, and spending protections finite. Public targets are not usable until their provider policy and order are configured.",
+      "spendRequired": "Confirm finite spending protection before enabling public overflow.",
+      "step": "Step {{current}} of {{total}}",
+      "steps": {
+        "capacity": "Protect local capacity",
+        "egress": "Choose API and egress",
+        "models": "Choose local models",
+        "review": "Review safeguards"
+      },
+      "surfaces": {
+        "ANTHROPIC_MESSAGES": "Anthropic Messages",
+        "OPENAI_CHAT_COMPLETIONS": "OpenAI Chat Completions",
+        "OPENAI_RESPONSES": "OpenAI Responses"
+      },
+      "title": "Set up a model pool"
+    },
     "createDescription": "Create an OpenAI-compatible pooled model ID.",
     "createTitle": "Create pool",
     "deleted": "Pool deleted",
@@ -302,6 +357,7 @@
     "grantsTitle": "Grants",
     "grantRevoked": "Pool access revoked",
     "grantTitle": "Grant pool access",
+    "grantEgressWarning": "This grant includes this pool's effective public-egress behavior.",
     "health": "Health",
     "invalidSlug": "Use lowercase letters, numbers, hyphens, or dots. Slugs cannot start or end with a separator and cannot contain slashes.",
     "loadFailed": "Failed to load pools.",
@@ -310,6 +366,18 @@
     "membersLabel": "members",
     "membersTitle": "Members",
     "memberUpdated": "Pool member updated",
+    "memberCapabilities": "Native and adapted APIs",
+    "memberPolicyDetails": "Capacity and routing details",
+    "memberTiers": {
+      "PRIMARY": "Local primary",
+      "PUBLIC_OVERFLOW": "Public overflow"
+    },
+    "publicOrder": "Provider order {{order}}",
+    "costUnavailable": "No active pricing version",
+    "memberCost": "Pricing {{version}} · {{currency}}",
+    "memberLoad": "{{active}} active / {{waiting}} waiting / {{limit}} physical limit",
+    "memberPhysicalCapacity": "Current physical load",
+    "inherited": "Inherited",
     "name": "Name",
     "noDirectModels": "No direct models are available to add.",
     "noGrants": "No grants yet.",
@@ -436,7 +504,9 @@
     "scope": "Scope",
     "scopeMode": "Scope mode",
     "typeTokenName": "Type the token name to confirm",
-    "visiblePreview": "{{count}} models visible to this token"
+    "visiblePreview": "{{count}} models visible to this token",
+    "publicEgressWarningTitle": "Some resources can use public providers",
+    "publicEgressWarning": "This token can access {{pools}}. Requests to these pools may send prompts, attachments, tools, and output to configured public providers after local fallback rules are met."
   },
   "providers": {
     "title": "Public provider operations",

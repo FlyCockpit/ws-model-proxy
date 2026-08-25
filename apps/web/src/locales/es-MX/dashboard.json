@@ -90,6 +90,14 @@
     "modelFilterPlaceholder": "Filtrar modelos…",
     "modelPicker": "Modelo",
     "regenerate": "Regenerar",
+    "routingMode": {
+      "label": "Modo de ruta del pool",
+      "PREFER_NATIVE": "API preferida (nativa primero)",
+      "REQUIRE_NATIVE": "Requerir API de Chat nativa",
+      "REQUIRE_ADAPTED": "Requerir API de Chat adaptada",
+      "help": "El modo nativo rechaza miembros adaptados; el modo adaptado rechaza miembros nativos. Los modos no compatibles fallan sin cambiar la ruta silenciosamente.",
+      "directHelp": "Los modelos directos siempre usan su API de Chat nativa."
+    },
     "retry": "Reintentar",
     "send": "Enviar",
     "systemPrompt": {
@@ -209,6 +217,7 @@
       "attachmentGlobalEffect": "Cambiar la capacidad compartida vinculada modifica la admisión de este destino de ejecución dondequiera que se use.",
       "attachment": "Capacidad compartida",
       "unattached": "Sin vincular",
+      "unlimitedWarning": "Ilimitado elimina un límite de seguridad físico. Confirma que el runtime y el proveedor tengan un límite aplicado de forma independiente antes de guardar.",
       "borrowIdle": "Tomar prestado solo cuando la capacidad reservada esté inactiva",
       "borrowNever": "Nunca tomar prestada capacidad reservada",
       "save": "Guardar capacidad",
@@ -278,6 +287,52 @@
     "attachmentLimitInvalid": "Ingresa un número entero de MiB o déjalo vacío.",
     "created": "Pool creado",
     "create": "Crear pool",
+    "advancedCreate": "Configuración avanzada",
+    "wizard": {
+      "advancedHint": "Después de crearlo, Configuración avanzada expone préstamos, márgenes de contexto, estrategia de conteo, afinidad, adaptación y orden de destinos.",
+      "back": "Atrás",
+      "capacityHint": "Estos valores finitos protegen el runtime físico. Los espacios reservados son privados para este pool; otros espacios inactivos se pueden prestar.",
+      "create": "Crear pool protegido",
+      "description": "Elige primero la capacidad local y luego decide explícitamente si las solicitudes pueden salir de tu infraestructura.",
+      "disabled": "Desactivado",
+      "egressRequired": "Reconoce la salida pública antes de activarla.",
+      "egressWarning": "Cuando los destinos locales no puedan atender una solicitud, sus prompts, adjuntos, definiciones de herramientas y salida generada podrán enviarse al proveedor público configurado.",
+      "enabled": "Activado",
+      "fields": {
+        "concurrency": "Límite de concurrencia física",
+        "contextCeiling": "Máximo de tokens de contexto",
+        "finiteSpendProtection": "Configuraré un límite finito de gasto del proveedor antes de adjuntar un destino público.",
+        "publicEgressAcknowledged": "Entiendo qué datos de la solicitud pueden salir de esta implementación.",
+        "recommendedSurface": "API recomendada",
+        "reservedSlots": "Espacios privados reservados",
+        "waitMs": "Espera local antes del desbordamiento (ms)"
+      },
+      "localModels": "Modelos locales",
+      "localModelsHint": "Selecciona al menos un modelo conectado. Estos permanecen en el nivel principal.",
+      "localRequired": "Selecciona al menos un modelo local.",
+      "next": "Continuar",
+      "open": "Configuración guiada",
+      "progress": "Progreso de configuración del pool",
+      "providerOrderHint": "Los proveedores públicos solo se prueban después de la espera local, en el orden explícito que defines en Operaciones de proveedor. Cada adjunto también requiere una política de concurrencia y protección de gasto finita.",
+      "publicEgress": "Permitir desbordamiento público protegido",
+      "publicEgressHint": "Mantén preferidos los destinos locales y usa proveedores configurados solo cuando la capacidad local no pueda atender la solicitud.",
+      "reservationInvalid": "Los espacios reservados no pueden superar el límite de concurrencia.",
+      "reviewSafe": "Esta configuración mantiene finitas las protecciones de concurrencia, contexto, espera y gasto. Los destinos públicos no se pueden usar hasta configurar su política y orden.",
+      "spendRequired": "Confirma la protección de gasto finita antes de activar el desbordamiento público.",
+      "step": "Paso {{current}} de {{total}}",
+      "steps": {
+        "capacity": "Proteger capacidad local",
+        "egress": "Elegir API y salida",
+        "models": "Elegir modelos locales",
+        "review": "Revisar protecciones"
+      },
+      "surfaces": {
+        "ANTHROPIC_MESSAGES": "Anthropic Messages",
+        "OPENAI_CHAT_COMPLETIONS": "OpenAI Chat Completions",
+        "OPENAI_RESPONSES": "OpenAI Responses"
+      },
+      "title": "Configurar un pool de modelos"
+    },
     "createDescription": "Crea un ID de modelo agrupado compatible con OpenAI.",
     "createTitle": "Crear pool",
     "deleted": "Pool eliminado",
@@ -302,6 +357,7 @@
     "grantsTitle": "Permisos",
     "grantRevoked": "Acceso al pool revocado",
     "grantTitle": "Dar acceso al pool",
+    "grantEgressWarning": "Este permiso incluye el comportamiento efectivo de salida pública de este pool.",
     "health": "Salud",
     "invalidSlug": "Usa letras minúsculas, números, guiones o puntos. Los slugs no pueden empezar ni terminar con un separador ni contener barras.",
     "loadFailed": "No se pudieron cargar los pools.",
@@ -310,6 +366,18 @@
     "membersLabel": "miembros",
     "membersTitle": "Miembros",
     "memberUpdated": "Miembro del pool actualizado",
+    "memberCapabilities": "APIs nativas y adaptadas",
+    "memberPolicyDetails": "Detalles de capacidad y enrutamiento",
+    "memberTiers": {
+      "PRIMARY": "Principal local",
+      "PUBLIC_OVERFLOW": "Desbordamiento público"
+    },
+    "publicOrder": "Orden de proveedor {{order}}",
+    "costUnavailable": "Sin versión activa de precios",
+    "memberCost": "Precios {{version}} · {{currency}}",
+    "memberLoad": "{{active}} activas / {{waiting}} en espera / límite físico {{limit}}",
+    "memberPhysicalCapacity": "Carga física actual",
+    "inherited": "Heredado",
     "name": "Nombre",
     "noDirectModels": "No hay modelos directos disponibles para agregar.",
     "noGrants": "Todavía no hay permisos.",
@@ -436,7 +504,9 @@
     "scope": "Alcance",
     "scopeMode": "Modo de alcance",
     "typeTokenName": "Escribe el nombre del token para confirmar",
-    "visiblePreview": "{{count}} modelos visibles para este token"
+    "visiblePreview": "{{count}} modelos visibles para este token",
+    "publicEgressWarningTitle": "Algunos recursos pueden usar proveedores públicos",
+    "publicEgressWarning": "Este token puede acceder a {{pools}}. Las solicitudes a estos pools pueden enviar prompts, adjuntos, herramientas y salida a proveedores públicos configurados después de cumplir las reglas de fallback local."
   },
   "providers": {
     "title": "Operaciones de proveedores públicos",

@@ -154,6 +154,8 @@ function poolRow({
     slug,
     name,
     description: null,
+    publicEgressEnabled: false,
+    publicEgressAcknowledged: false,
     User: { slug: userSlug },
   };
 }

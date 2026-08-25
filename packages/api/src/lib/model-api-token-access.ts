@@ -41,6 +41,8 @@ export type VisibleModelPoolTarget = {
   maxAttachmentBytes: number | null;
   optimisticBasicTranscription: boolean;
   protocolAdaptationEnabled: boolean;
+  publicEgressEnabled: boolean;
+  publicEgressAcknowledged: boolean;
   allowLossyDeveloperRoleCollapse: boolean;
   recommendedSurfaceOverride: ModelApiSurface | null;
 };
@@ -81,6 +83,8 @@ type ModelPoolRow = {
   maxAttachmentBytes: number | null;
   optimisticBasicTranscription: boolean;
   protocolAdaptationEnabled: boolean;
+  publicEgressEnabled: boolean;
+  publicEgressAcknowledged: boolean;
   allowLossyDeveloperRoleCollapse: boolean;
   recommendedSurfaceOverride: string | null;
   User: { slug: string };
@@ -130,6 +134,8 @@ function serializeModelPool(row: ModelPoolRow): VisibleModelPoolTarget {
     maxAttachmentBytes: row.maxAttachmentBytes,
     optimisticBasicTranscription: row.optimisticBasicTranscription,
     protocolAdaptationEnabled: row.protocolAdaptationEnabled,
+    publicEgressEnabled: row.publicEgressEnabled,
+    publicEgressAcknowledged: row.publicEgressAcknowledged,
     allowLossyDeveloperRoleCollapse: row.allowLossyDeveloperRoleCollapse,
     recommendedSurfaceOverride: parseModelApiSurface(row.recommendedSurfaceOverride),
   };
@@ -179,6 +185,8 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
         maxAttachmentBytes: true,
         optimisticBasicTranscription: true,
         protocolAdaptationEnabled: true,
+        publicEgressEnabled: true,
+        publicEgressAcknowledged: true,
         allowLossyDeveloperRoleCollapse: true,
         recommendedSurfaceOverride: true,
         User: { select: { slug: true } },
@@ -198,6 +206,8 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
             maxAttachmentBytes: true,
             optimisticBasicTranscription: true,
             protocolAdaptationEnabled: true,
+            publicEgressEnabled: true,
+            publicEgressAcknowledged: true,
             allowLossyDeveloperRoleCollapse: true,
             recommendedSurfaceOverride: true,
             User: { select: { slug: true } },

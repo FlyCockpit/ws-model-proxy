@@ -78,6 +78,7 @@ type ModelOption = {
   attachmentModalities: AttachmentModalities;
   maxAttachmentBytes: number | null;
 };
+type ChatTestRoutingMode = "PREFER_NATIVE" | "REQUIRE_NATIVE" | "REQUIRE_ADAPTED";
 type ChatRole = "user" | "assistant";
 type ChatMessageStatus = "ready" | "streaming" | "error" | "stopped";
 // Attached media stored on a user message. An attachment is EITHER embedded as
@@ -559,6 +560,7 @@ async function signMediaUrls(ids: string[]): Promise<SignMediaResult> {
 async function streamChatCompletion({
   model,
   messages,
+  routingMode,
   signal,
   onDelta,
   onTransformDebug,
@@ -566,6 +568,7 @@ async function streamChatCompletion({
 }: {
   model: string;
   messages: RelayChatMessage[];
+  routingMode: ChatTestRoutingMode;
   signal: AbortSignal;
   onDelta: (delta: string) => void;
   onTransformDebug?: (debug: TransformDebug) => void;
@@ -575,7 +578,10 @@ async function streamChatCompletion({
   const response = await fetch(`${env.VITE_SERVER_URL}/api/internal/chat-test/chat/completions`, {
     method: "POST",
     credentials: "include",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      "x-wsmp-chat-test-routing-mode": routingMode,
+    },
     body: JSON.stringify({
       model,
       messages,
@@ -682,6 +688,7 @@ function ChatTestPage() {
   const mediaEnabled = mediaConfig?.enabled ?? false;
   const mediaMaxUploadBytes = mediaConfig?.maxUploadBytes ?? 0;
   const [selectedModelId, setSelectedModelId] = useState("");
+  const [routingMode, setRoutingMode] = useState<ChatTestRoutingMode>("PREFER_NATIVE");
   const [draft, setDraft] = useState("");
   const [systemPrompt, setSystemPrompt] = useState("");
   // Collapsed by default so the mobile transcript keeps most of the viewport;
@@ -1113,6 +1120,7 @@ function ChatTestPage() {
         const metrics = await streamChatCompletion({
           model: modelId,
           messages: relayInput,
+          routingMode,
           signal: controller.signal,
           fallbackErrorMessage: t("dashboard:chatTest.errors.streamFailed"),
           onDelta: (delta) => {
@@ -1154,7 +1162,7 @@ function ChatTestPage() {
         scroll.markContentChanged();
       }
     },
-    [scroll, t, updateAssistant],
+    [routingMode, scroll, t, updateAssistant],
   );
 
   // Flag attachments whose media id came back invalid/expired from /sign, both
@@ -1437,13 +1445,40 @@ function ChatTestPage() {
             </p>
           ) : null}
         </div>
-        <div className="flex min-w-0 items-start gap-2">
+        <div className="flex min-w-0 flex-wrap items-start justify-end gap-2">
           <ModelPicker
             options={options}
             value={effectiveModelId}
             onValueChange={handleModelChange}
             disabled={isStreaming || isPreparingSend}
           />
+          <div className="min-w-[13rem] max-w-full space-y-1">
+            <Label htmlFor="chat-test-routing-mode" className="sr-only">
+              {t("dashboard:chatTest.routingMode.label")}
+            </Label>
+            <select
+              id="chat-test-routing-mode"
+              className="h-11 w-full rounded-md border bg-background px-3 text-sm"
+              value={routingMode}
+              disabled={isStreaming || isPreparingSend || selectedModel?.kind !== "MODEL_POOL"}
+              onChange={(event) => setRoutingMode(event.target.value as ChatTestRoutingMode)}
+            >
+              <option value="PREFER_NATIVE">
+                {t("dashboard:chatTest.routingMode.PREFER_NATIVE")}
+              </option>
+              <option value="REQUIRE_NATIVE">
+                {t("dashboard:chatTest.routingMode.REQUIRE_NATIVE")}
+              </option>
+              <option value="REQUIRE_ADAPTED">
+                {t("dashboard:chatTest.routingMode.REQUIRE_ADAPTED")}
+              </option>
+            </select>
+            <p className="text-xs text-muted-foreground">
+              {selectedModel?.kind === "MODEL_POOL"
+                ? t("dashboard:chatTest.routingMode.help")
+                : t("dashboard:chatTest.routingMode.directHelp")}
+            </p>
+          </div>
           <Button
             type="button"
             variant="outline"

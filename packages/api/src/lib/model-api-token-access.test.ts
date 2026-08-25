@@ -69,6 +69,8 @@ function modelPoolRow({
     maxAttachmentBytes: null,
     optimisticBasicTranscription: false,
     protocolAdaptationEnabled: false,
+    publicEgressEnabled: false,
+    publicEgressAcknowledged: false,
     allowLossyDeveloperRoleCollapse: false,
     recommendedSurfaceOverride: null,
     User: { slug: userSlug },
@@ -216,6 +218,8 @@ describe("modelApiTokenAccess", () => {
           name: "Owned",
         }),
         recommendedSurfaceOverride: "UNSUPPORTED_FUTURE_SURFACE",
+        publicEgressEnabled: true,
+        publicEgressAcknowledged: true,
       };
       db.discoveredModel.findMany.mockResolvedValue([]);
       db.modelPool.findMany.mockResolvedValue([ownedPool]);
@@ -228,6 +232,10 @@ describe("modelApiTokenAccess", () => {
       });
 
       expect(result.modelPools[0]?.recommendedSurfaceOverride).toBeNull();
+      expect(result.modelPools[0]).toMatchObject({
+        publicEgressEnabled: true,
+        publicEgressAcknowledged: true,
+      });
     });
 
     it("resolves ALL_VISIBLE pools from current grants on every call", async () => {
