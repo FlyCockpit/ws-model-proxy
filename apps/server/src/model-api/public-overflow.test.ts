@@ -18,6 +18,7 @@ import {
   conservativeProviderLiability,
   conservativeSerializedInputTokens,
   parseProviderUsage,
+  providerHealthOutcome,
   publicTargetCompatibility,
 } from "./public-overflow.js";
 
@@ -33,6 +34,13 @@ const request = {
 };
 
 describe("public overflow compatibility", () => {
+  it("treats ordinary client errors as health-neutral and 429 as failure", () => {
+    expect(providerHealthOutcome(200)).toBe("SUCCESS");
+    expect(providerHealthOutcome(400)).toBe("NEUTRAL");
+    expect(providerHealthOutcome(401)).toBe("NEUTRAL");
+    expect(providerHealthOutcome(429)).toBe("FAILURE");
+    expect(providerHealthOutcome(503)).toBe("FAILURE");
+  });
   it("commits the credential send-start claim before provider I/O can begin", async () => {
     const keyring = parseProviderCredentialKeyring(`v1:${Buffer.alloc(32, 7).toString("base64")}`);
     const identity = {

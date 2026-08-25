@@ -51,6 +51,10 @@ import {
 import { MODEL_API_MAX_REQUEST_BODY_BYTES } from "./model-api/limits.js";
 import { openAiErrorBody } from "./model-api/openai-errors.js";
 import { createPoolMemberTestRoutes } from "./model-api/pool-member-test.js";
+import {
+  providerAttemptExpiryEnabled,
+  startProviderAttemptExpiry,
+} from "./model-api/provider-attempt-lifecycle.js";
 import { startProviderBudgetRepair } from "./model-api/provider-budget-runtime.js";
 import { createModelApiRoutes } from "./model-api/routes.js";
 import { transcriptionContentLengthGuard } from "./model-api/transcription-body-guard.js";
@@ -605,6 +609,11 @@ const server = serve(
 // delete-on-GET in media/routes.ts.
 const stopMediaCleanup = startMediaCleanup();
 const stopProviderBudgetRepair = startProviderBudgetRepair();
+const stopProviderAttemptExpiry = providerAttemptExpiryEnabled(
+  env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
+)
+  ? startProviderAttemptExpiry()
+  : undefined;
 
 // ---------------------------------------------------------------------------
 // Graceful shutdown — drain in-flight requests, then close dependencies
@@ -620,6 +629,7 @@ async function shutdown(signal: string) {
   // Stop the media cleanup timer so it can't fire mid-shutdown.
   stopMediaCleanup?.();
   stopProviderBudgetRepair();
+  stopProviderAttemptExpiry?.();
   await capacityLifecycle?.close();
 
   // 1. Stop accepting new connections and drain in-flight requests.

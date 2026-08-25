@@ -1,5 +1,9 @@
 import prisma from "@ws-model-proxy/db";
 
+// The product spec requires bounded cooldown/half-open recovery but does not
+// prescribe a duration. Cap both local backoff and untrusted Retry-After at
+// five minutes so a provider response cannot disable a configured target
+// indefinitely; repeated failures re-enter the same bounded cooldown.
 const MAX_COOLDOWN_MS = 5 * 60_000;
 const BASE_COOLDOWN_MS = 1_000;
 
@@ -75,22 +79,46 @@ export async function expireProviderAttempts(now = new Date()): Promise<number> 
 /** Atomically excludes cooldown targets and grants at most one half-open probe. */
 export async function claimProviderHealthTrial(input: {
   userId: string;
+  providerAccountId: string;
   providerModelId: string;
   now?: Date;
 }): Promise<"READY" | "HALF_OPEN" | "COOLDOWN"> {
   const now = input.now ?? new Date();
   return prisma.$transaction(async (tx) => {
+    // Every health mutation takes the shared account lock before its model
+    // lock. This serializes sibling models and avoids account/model deadlocks.
+    await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.providerAccountId} AND "userId" = ${input.userId} FOR UPDATE`;
     await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${input.providerModelId} AND "userId" = ${input.userId} FOR UPDATE`;
-    const model = await tx.providerModel.findUniqueOrThrow({
-      where: { id: input.providerModelId, userId: input.userId },
+    const account = await tx.providerAccount.findUniqueOrThrow({
+      where: { id: input.providerAccountId, userId: input.userId },
       select: { healthNextRetryAt: true, healthHalfOpenAt: true },
     });
-    if (!model.healthNextRetryAt) return "READY";
-    if (model.healthNextRetryAt > now || model.healthHalfOpenAt) return "COOLDOWN";
-    await tx.providerModel.update({
-      where: { id: input.providerModelId, userId: input.userId },
-      data: { healthHalfOpenAt: now },
+    const model = await tx.providerModel.findUniqueOrThrow({
+      where: {
+        id: input.providerModelId,
+        userId: input.userId,
+        providerAccountId: input.providerAccountId,
+      },
+      select: { healthNextRetryAt: true, healthHalfOpenAt: true },
     });
+    const cooldowns = [account, model].filter((health) => health.healthNextRetryAt !== null);
+    if (cooldowns.length === 0) return "READY";
+    if (
+      cooldowns.some(
+        (health) => health.healthNextRetryAt! > now || health.healthHalfOpenAt !== null,
+      )
+    )
+      return "COOLDOWN";
+    await Promise.all([
+      tx.providerAccount.update({
+        where: { id: input.providerAccountId, userId: input.userId },
+        data: { healthHalfOpenAt: now },
+      }),
+      tx.providerModel.update({
+        where: { id: input.providerModelId, userId: input.userId },
+        data: { healthHalfOpenAt: now },
+      }),
+    ]);
     return "HALF_OPEN";
   });
 }
@@ -111,11 +139,22 @@ export async function recordProviderOutcome(input: {
 }): Promise<void> {
   const now = input.now ?? new Date();
   await prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.providerAccountId} AND "userId" = ${input.userId} FOR UPDATE`;
     await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${input.providerModelId} AND "userId" = ${input.userId} FOR UPDATE`;
-    const current = await tx.providerModel.findUniqueOrThrow({
-      where: { id: input.providerModelId, userId: input.userId },
-      select: { healthFailureCount: true },
-    });
+    const [accountCurrent, current] = await Promise.all([
+      tx.providerAccount.findUniqueOrThrow({
+        where: { id: input.providerAccountId, userId: input.userId },
+        select: { healthFailureCount: true, healthNextRetryAt: true },
+      }),
+      tx.providerModel.findUniqueOrThrow({
+        where: {
+          id: input.providerModelId,
+          userId: input.userId,
+          providerAccountId: input.providerAccountId,
+        },
+        select: { healthFailureCount: true },
+      }),
+    ]);
     const failures = input.success ? 0 : current.healthFailureCount + 1;
     const modelHealth = input.success
       ? ("HEALTHY" as const)
@@ -148,7 +187,17 @@ export async function recordProviderOutcome(input: {
         healthCheckedAt: now,
         ...(input.success
           ? { healthFailureCount: 0, healthNextRetryAt: null, healthHalfOpenAt: null }
-          : { healthFailureCount: { increment: 1 }, healthNextRetryAt: data.healthNextRetryAt }),
+          : {
+              healthFailureCount: { increment: 1 },
+              healthNextRetryAt: new Date(
+                Math.max(
+                  accountCurrent.healthNextRetryAt?.getTime() ?? 0,
+                  now.getTime() +
+                    backoffMs(accountCurrent.healthFailureCount + 1, input.retryAfterMs),
+                ),
+              ),
+              healthHalfOpenAt: null,
+            }),
       },
     });
   });

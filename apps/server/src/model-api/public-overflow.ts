@@ -536,6 +536,14 @@ async function recordProviderHealth(
   }).catch(() => undefined);
 }
 
+export function providerHealthOutcome(status: number): "SUCCESS" | "FAILURE" | "NEUTRAL" {
+  if (status >= 200 && status < 400) return "SUCCESS";
+  if (status === 408 || status === 409 || status === 429 || status >= 500) return "FAILURE";
+  // Ordinary client errors demonstrate neither provider recovery nor provider
+  // failure. In particular they must not clear an existing cooldown.
+  return "NEUTRAL";
+}
+
 function selectedNativeSurface(target: PublicProviderTarget, requested: ProtocolSurface) {
   if (target.nativeSurfaces.includes(requested)) return requested;
   return target.nativeSurfaces.find((surface) =>
@@ -722,6 +730,7 @@ export async function dispatchPublicOverflow(
 
     const healthClaim = await claimProviderHealthTrial({
       userId: request.userId,
+      providerAccountId: target.providerAccountId,
       providerModelId: target.providerModelId,
     }).catch(() => "COOLDOWN" as const);
     if (healthClaim === "COOLDOWN") {
@@ -895,11 +904,12 @@ export async function dispatchPublicOverflow(
         reconciled = true;
         clearInterval(heartbeatTimer);
         const ok = streamComplete && httpOk;
-        if (!request.signal.aborted) {
+        const healthOutcome = providerHealthOutcome(status);
+        if (!request.signal.aborted && healthOutcome !== "NEUTRAL") {
           await recordProviderHealth(
             target,
             request.userId,
-            streamComplete && ![408, 409, 429].includes(status) && status < 500,
+            streamComplete && healthOutcome === "SUCCESS",
             { status, retryAfter: response.headers["retry-after"] },
           );
         }

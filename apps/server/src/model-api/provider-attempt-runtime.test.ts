@@ -7,6 +7,7 @@ const db = vi.hoisted(() => ({
 vi.mock("@ws-model-proxy/db", () => ({ default: db }));
 
 import {
+  claimProviderHealthTrial,
   classifyProviderFailure,
   parseRetryAfter,
   recordProviderAttemptEvent,
@@ -41,7 +42,12 @@ describe("provider attempt failure policy", () => {
         findUniqueOrThrow: vi.fn().mockResolvedValue({ healthFailureCount: 0 }),
         update: vi.fn().mockResolvedValue({}),
       },
-      providerAccount: { update: vi.fn().mockResolvedValue({}) },
+      providerAccount: {
+        findUniqueOrThrow: vi
+          .fn()
+          .mockResolvedValue({ healthFailureCount: 0, healthNextRetryAt: null }),
+        update: vi.fn().mockResolvedValue({}),
+      },
     };
     db.$transaction.mockImplementationOnce(async (callback: (client: typeof tx) => unknown) =>
       callback(tx),
@@ -71,6 +77,45 @@ describe("provider attempt failure policy", () => {
         healthNextRetryAt: new Date("2026-08-25T00:00:45.000Z"),
       }),
     });
+  });
+
+  it("locks the account before the model and enforces an account cooldown", async () => {
+    const locks: string[] = [];
+    const tx = {
+      $queryRaw: vi.fn(async (parts: TemplateStringsArray) => {
+        locks.push(parts.join("?"));
+        return [];
+      }),
+      providerAccount: {
+        findUniqueOrThrow: vi.fn().mockResolvedValue({
+          healthNextRetryAt: new Date("2026-08-25T00:01:00.000Z"),
+          healthHalfOpenAt: null,
+        }),
+        update: vi.fn(),
+      },
+      providerModel: {
+        findUniqueOrThrow: vi.fn().mockResolvedValue({
+          healthNextRetryAt: null,
+          healthHalfOpenAt: null,
+        }),
+        update: vi.fn(),
+      },
+    };
+    db.$transaction.mockImplementationOnce(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+
+    await expect(
+      claimProviderHealthTrial({
+        userId: "owner",
+        providerAccountId: "account",
+        providerModelId: "model-b",
+        now: new Date("2026-08-25T00:00:00.000Z"),
+      }),
+    ).resolves.toBe("COOLDOWN");
+    expect(locks[0]).toContain("provider_account");
+    expect(locks[1]).toContain("provider_model");
+    expect(tx.providerModel.update).not.toHaveBeenCalled();
   });
 
   it("persists a prompt-free, fully correlated append-only attempt event", async () => {

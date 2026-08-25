@@ -1,0 +1,160 @@
+import { Readable } from "node:stream";
+import { describe, expect, it, vi } from "vitest";
+
+const providerHttpsRequest = vi.hoisted(() => vi.fn());
+const recordProviderOutcome = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const db = vi.hoisted(() => ({
+  modelPool: { findFirst: vi.fn() },
+  relayRequest: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+  $transaction: vi.fn(),
+}));
+
+vi.mock("@ws-model-proxy/db", () => ({ default: db }));
+vi.mock("@ws-model-proxy/env/server", () => ({
+  env: {
+    WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
+    WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: false,
+    WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS: `v1:${Buffer.alloc(32, 7).toString("base64")}`,
+  },
+}));
+vi.mock("@ws-model-proxy/api/lib/provider-credential-crypto", () => ({
+  parseProviderCredentialKeyring: vi.fn(() => ({ active: {}, keys: new Map() })),
+  decryptProviderCredential: vi.fn(() => "secret"),
+}));
+vi.mock("@ws-model-proxy/api/lib/provider-egress", () => ({ providerHttpsRequest }));
+vi.mock("./provider-budget.js", () => ({
+  admitProviderBudget: vi.fn().mockResolvedValue({
+    admitted: true,
+    providerAttemptId: "anchor",
+    reservationIds: ["reservation"],
+  }),
+  reconcileProviderBudget: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("./provider-attempt-runtime.js", () => ({
+  allocateProviderFence: vi.fn().mockResolvedValue(1n),
+  claimProviderHealthTrial: vi.fn().mockResolvedValue("READY"),
+  classifyProviderFailure: vi.fn((status?: number) => (status === 429 ? "RATE_LIMIT" : "SERVER")),
+  finishProviderAttempt: vi.fn().mockResolvedValue(true),
+  heartbeatProviderAttempt: vi.fn().mockResolvedValue(true),
+  parseRetryAfter: vi.fn((value?: string) => (value === "37" ? 37_000 : undefined)),
+  recordProviderAttemptEvent: vi.fn().mockResolvedValue(undefined),
+  recordProviderOutcome,
+}));
+
+import { dispatchPublicOverflow } from "./public-overflow.js";
+
+describe("public overflow terminal response dispatch", () => {
+  it("returns a non-retry-safe 429 with Retry-After and records its cooldown", async () => {
+    db.modelPool.findFirst.mockResolvedValue({
+      publicEgressEnabled: true,
+      publicEgressAcknowledged: true,
+      PoolMembers: [
+        {
+          id: "member",
+          publicOrder: 0,
+          ExecutionTarget: {
+            id: "target",
+            ProviderModel: {
+              id: "model",
+              userId: "owner",
+              upstreamModelId: "upstream-model",
+              contextWindow: 10_000,
+              maxOutputTokens: 1_000,
+              nativeCapabilities: {
+                protocols: ["openai"],
+                surfaces: ["openai-chat"],
+                streaming: true,
+                features: [],
+              },
+              healthStatus: "HEALTHY",
+              enabled: true,
+              deletedAt: null,
+              ProviderAccount: {
+                id: "account",
+                userId: "owner",
+                providerType: "openai",
+                providerVersion: null,
+                baseUrl: "https://provider.example",
+                authType: "BEARER",
+                healthStatus: "HEALTHY",
+                enabled: true,
+                deletedAt: null,
+                CurrentCredential: {
+                  id: "credential",
+                  credentialType: "BEARER",
+                  aadVersion: 1,
+                  algorithm: "AES-256-GCM",
+                  keyVersion: "v1",
+                  ciphertext: new Uint8Array(),
+                  nonce: new Uint8Array(),
+                  authTag: new Uint8Array(),
+                  status: "ACTIVE",
+                },
+              },
+            },
+          },
+        },
+      ],
+    });
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
+      providerCredential: {
+        findFirst: vi.fn().mockResolvedValue({
+          id: "credential",
+          credentialType: "BEARER",
+          aadVersion: 1,
+          algorithm: "AES-256-GCM",
+          keyVersion: "v1",
+          ciphertext: new Uint8Array(),
+          nonce: new Uint8Array(),
+          authTag: new Uint8Array(),
+        }),
+        update: vi.fn().mockResolvedValue({ id: "credential" }),
+      },
+    };
+    db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+    const upstream = Readable.from([Buffer.from('{"error":"limited"}')]);
+    Object.assign(upstream, {
+      statusCode: 429,
+      headers: { "content-type": "application/json", "retry-after": "37" },
+      complete: false,
+    });
+    providerHttpsRequest.mockResolvedValue(upstream);
+
+    const result = await dispatchPublicOverflow({
+      userId: "owner",
+      poolId: "pool",
+      requestId: "request",
+      reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      requestedProtocol: "openai",
+      requestedSurface: "openai-chat",
+      stream: false,
+      requiredFeatures: [],
+      path: "/v1/chat/completions",
+      headers: new Headers({ "content-type": "application/json" }),
+      body: new TextEncoder().encode('{"model":"pool"}'),
+      signal: new AbortController().signal,
+      liability: { tokens: 10n, accountingVersion: "provider-billable-v1" },
+      requestedOutputTokens: 1n,
+      releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+      adaptationEnabled: false,
+      retrySafe: false,
+    });
+
+    expect(result.dispatched).toBe(true);
+    if (!result.dispatched) throw new Error("expected dispatch");
+    expect(result.response.status).toBe(429);
+    expect(result.response.headers.get("retry-after")).toBe("37");
+    expect(await result.response.text()).toBe('{"error":"limited"}');
+    await result.terminal;
+    expect(recordProviderOutcome).toHaveBeenCalledWith(
+      expect.objectContaining({
+        success: false,
+        failureClass: "RATE_LIMIT",
+        retryAfterMs: 37_000,
+      }),
+    );
+  });
+});
