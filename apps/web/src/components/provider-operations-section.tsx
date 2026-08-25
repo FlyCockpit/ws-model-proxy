@@ -470,7 +470,10 @@ export function ProviderOperationsSection() {
       baseUrl: "https://api.openai.com/v1",
       authType: "BEARER" as "API_KEY" | "BEARER",
     },
-    validators: { onSubmit: providerAccountFormSchema },
+    validators: {
+      onChange: providerAccountFormSchema,
+      onSubmit: providerAccountFormSchema,
+    },
     onSubmit: async ({ value }) => {
       await createAccount.mutateAsync({ ...value, safeConfiguration: null });
     },
@@ -532,7 +535,10 @@ export function ProviderOperationsSection() {
   });
   const budgetForm = useForm({
     defaultValues: budgetDefaults,
-    validators: { onSubmit: providerBudgetFormSchema },
+    validators: {
+      onChange: providerBudgetFormSchema,
+      onSubmit: providerBudgetFormSchema,
+    },
     onSubmit: async ({ value }) => {
       await createBudget.mutateAsync({
         scopeType: "PROVIDER_ACCOUNT",
@@ -610,7 +616,7 @@ export function ProviderOperationsSection() {
           )}
         </accountForm.Field>
         <div className="flex items-end md:col-span-2 xl:col-span-1">
-          <Button className="w-full" size="touch" disabled={createAccount.isPending}>
+          <Button type="submit" className="w-full" size="touch" disabled={createAccount.isPending}>
             <Plus className="size-4" /> {t("dashboard:providers.actions.addAccount")}
           </Button>
         </div>
@@ -755,6 +761,7 @@ export function ProviderOperationsSection() {
                     {t("dashboard:providers.secretNeverShown")}
                   </p>
                   <Button
+                    type="submit"
                     size="touch"
                     disabled={saveCredential.isPending || replaceCredential.isPending}
                   >
@@ -811,7 +818,7 @@ export function ProviderOperationsSection() {
                       </Field>
                     )}
                   </createModelForm.Field>
-                  <Button size="touch" disabled={createModel.isPending}>
+                  <Button type="submit" size="touch" disabled={createModel.isPending}>
                     <Plus className="size-4" />
                     {t("dashboard:providers.actions.addModel")}
                   </Button>
@@ -957,7 +964,7 @@ export function ProviderOperationsSection() {
                         </pricingForm.Field>
                       ))}
                     </div>
-                    <Button size="touch" disabled={createPricing.isPending}>
+                    <Button type="submit" size="touch" disabled={createPricing.isPending}>
                       {t("dashboard:providers.actions.savePricingDraft")}
                     </Button>
                     <div className="divide-y rounded-xl border">
@@ -1120,11 +1127,12 @@ export function ProviderOperationsSection() {
                         </div>
                       )}
                     </budgetForm.Subscribe>
-                    <budgetForm.Subscribe selector={(state) => state.canSubmit}>
-                      {(canSubmit) => (
+                    <budgetForm.Subscribe selector={(state) => state.isSubmitting}>
+                      {() => (
                         <Button
+                          type="submit"
                           size="touch"
-                          disabled={createBudget.isPending || !canSubmit || !activePricing}
+                          disabled={createBudget.isPending || !activePricing}
                         >
                           {t("dashboard:providers.actions.activateBudget")}
                         </Button>
@@ -1757,6 +1765,7 @@ function UpdateAccountForm({
         </p>
       ) : null}
       <Button
+        type="submit"
         className="md:col-span-2 xl:col-span-4 xl:justify-self-start"
         size="touch"
         disabled={updateAccount.isPending}
@@ -1837,7 +1846,7 @@ function UpdateModelForm({
         ),
       )}
       <div className="flex items-end">
-        <Button size="touch" disabled={updateModel.isPending}>
+        <Button type="submit" size="touch" disabled={updateModel.isPending}>
           {t("dashboard:providers.actions.saveModel")}
         </Button>
       </div>
