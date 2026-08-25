@@ -1161,8 +1161,6 @@ export const forwarderManagementRouter = {
           name: poolNameSchema,
           localModelIds: z.array(idSchema).min(1).max(64),
           recommendedSurface: z.enum(modelApiSurfaces),
-          physicalConcurrencyLimit: z.number().int().min(1).max(10_000),
-          physicalMaxContext: z.number().int().min(1).max(100_000_000),
           memberConcurrencyLimit: z.number().int().min(1).max(10_000),
           memberContextCeiling: z.number().int().min(1).max(100_000_000),
           reservedSlots: z.number().int().min(0).max(10_000),

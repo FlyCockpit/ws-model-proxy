@@ -45,6 +45,10 @@ export function GuardedPoolSetupWizard({
   const candidates = useQuery(
     orpc.forwarderManagement.listGuardedOverflowCandidates.queryOptions(),
   );
+  const capacities = useQuery({
+    ...orpc.capacityManagement.list.queryOptions(),
+    retry: false,
+  });
   const create = useMutation(
     orpc.forwarderManagement.createGuardedModelPool.mutationOptions({
       onSuccess: async () => {
@@ -64,8 +68,6 @@ export function GuardedPoolSetupWizard({
         .refine((value) => validateForwarderPoolSlug(value).ok),
       name: z.string().trim().min(1).max(120),
       localModelIds: z.array(z.string()).min(1),
-      physicalConcurrencyLimit: z.number().int().min(1).max(10_000),
-      physicalMaxContext: z.number().int().min(1).max(100_000_000),
       memberConcurrencyLimit: z.number().int().min(1).max(10_000),
       memberContextCeiling: z.number().int().min(1).max(100_000_000),
       reservedSlots: z.number().int().min(0).max(10_000),
@@ -90,8 +92,6 @@ export function GuardedPoolSetupWizard({
       slug: "",
       name: "",
       localModelIds: [] as string[],
-      physicalConcurrencyLimit: 1,
-      physicalMaxContext: 32_768,
       memberConcurrencyLimit: 1,
       memberContextCeiling: 31_744,
       reservedSlots: 0,
@@ -109,8 +109,6 @@ export function GuardedPoolSetupWizard({
         name: value.name.trim(),
         localModelIds: value.localModelIds,
         recommendedSurface: value.recommendedSurface,
-        physicalConcurrencyLimit: value.physicalConcurrencyLimit,
-        physicalMaxContext: value.physicalMaxContext,
         memberConcurrencyLimit: value.memberConcurrencyLimit,
         memberContextCeiling: value.memberContextCeiling,
         reservedSlots: value.reservedSlots,
@@ -217,7 +215,7 @@ export function GuardedPoolSetupWizard({
                     </legend>
                     <div className="max-h-56 divide-y overflow-x-clip overflow-y-auto rounded-md border">
                       {directModels.map((model) => (
-                        <label key={model.id} className="flex min-h-11 items-center gap-3 p-3">
+                        <label key={model.id} className="flex min-h-11 items-start gap-3 p-3">
                           <Checkbox
                             disabled={!model.executionTarget?.inferenceCapacityId}
                             checked={field.state.value.includes(model.id)}
@@ -229,13 +227,24 @@ export function GuardedPoolSetupWizard({
                               )
                             }
                           />
-                          <code className="break-all font-mono text-xs">
-                            {model.canonicalModelId}
-                          </code>
-                          <span className="ml-auto text-xs text-muted-foreground">
-                            {model.executionTarget?.inferenceCapacityId
-                              ? t("dashboard:pools.wizard.capacityAssigned")
-                              : t("dashboard:pools.wizard.capacityRequired")}
+                          <span className="min-w-0 flex-1">
+                            <code className="block break-all font-mono text-xs">
+                              {model.canonicalModelId}
+                            </code>
+                            <span className="mt-1 block text-xs text-muted-foreground">
+                              {(() => {
+                                const capacity = capacities.data?.find(
+                                  (item) => item.id === model.executionTarget?.inferenceCapacityId,
+                                );
+                                return capacity
+                                  ? t("dashboard:pools.wizard.capacityAssignedDetail", {
+                                      concurrency: String(capacity.hardConcurrencyLimit ?? "∞"),
+                                      context: String(capacity.physicalMaxContext ?? "∞"),
+                                      strategy: String(capacity.countStrategy),
+                                    })
+                                  : t("dashboard:pools.wizard.capacityRequired");
+                              })()}
+                            </span>
                           </span>
                         </label>
                       ))}
