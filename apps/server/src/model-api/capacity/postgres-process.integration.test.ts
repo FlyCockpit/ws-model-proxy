@@ -402,10 +402,17 @@ integration("capacity admission across operating-system processes", () => {
           extensionMs: 30_000,
         });
         const staleRelease = startWorker({ operation: "release", lease: staleLease });
+        const duplicateKilledAttempt = startWorker({
+          operation: "acquire",
+          attempt: { ...holderAttempt, candidates: [] },
+          hold: false,
+        });
         children.add(staleHeartbeat.child);
         children.add(staleRelease.child);
+        children.add(duplicateKilledAttempt.child);
         await expect(staleHeartbeat.result).resolves.toEqual({ heartbeat: false });
         await expect(staleRelease.result).resolves.toEqual({ released: false });
+        await expect(duplicateKilledAttempt.result).resolves.toEqual({ state: "CANCELLED" });
         expect(
           await db.capacityLease.count({ where: { capacityId: capacity.id, state: "ACTIVE" } }),
         ).toBe(1);
