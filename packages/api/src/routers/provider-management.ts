@@ -656,7 +656,12 @@ export const providerManagementRouter = {
       const { id: pricingId, ratesPerMillion, chargeRules: rules, ...data } = input;
       return prisma.$transaction(async (tx) => {
         const current = await tx.providerPricingVersion.findFirst({
-          where: { id: pricingId, userId, status: "DRAFT", ProviderModel: { deletedAt: null } },
+          where: {
+            id: pricingId,
+            userId,
+            status: "DRAFT",
+            ProviderModel: { deletedAt: null, ProviderAccount: { deletedAt: null } },
+          },
         });
         if (!current) throw missing();
         const row = await tx.providerPricingVersion.update({
@@ -687,7 +692,12 @@ export const providerManagementRouter = {
       return prisma.$transaction(async (tx) => {
         const now = new Date();
         const candidate = await tx.providerPricingVersion.findFirst({
-          where: { id: input.id, userId, status: "DRAFT", ProviderModel: { deletedAt: null } },
+          where: {
+            id: input.id,
+            userId,
+            status: "DRAFT",
+            ProviderModel: { deletedAt: null, ProviderAccount: { deletedAt: null } },
+          },
         });
         if (!candidate) throw missing();
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-pricing:${userId}:${candidate.providerModelId}`}, 0))`;
@@ -696,7 +706,7 @@ export const providerManagementRouter = {
             id: candidate.id,
             userId,
             status: "DRAFT",
-            ProviderModel: { deletedAt: null },
+            ProviderModel: { deletedAt: null, ProviderAccount: { deletedAt: null } },
           },
         });
         if (!current) throw new ORPCError("CONFLICT", { message: "Pricing version changed" });
@@ -744,7 +754,12 @@ export const providerManagementRouter = {
       const userId = context.session.user.id;
       await prisma.$transaction(async (tx) => {
         const current = await tx.providerPricingVersion.findFirst({
-          where: { id: input.id, userId, status: "ACTIVE" },
+          where: {
+            id: input.id,
+            userId,
+            status: "ACTIVE",
+            ProviderModel: { deletedAt: null, ProviderAccount: { deletedAt: null } },
+          },
         });
         if (!current) throw missing();
         const now = new Date();
@@ -776,7 +791,12 @@ export const providerManagementRouter = {
       const userId = context.session.user.id;
       await prisma.$transaction(async (tx) => {
         const current = await tx.providerPricingVersion.findFirst({
-          where: { id: input.id, userId, status: "DRAFT" },
+          where: {
+            id: input.id,
+            userId,
+            status: "DRAFT",
+            ProviderModel: { deletedAt: null, ProviderAccount: { deletedAt: null } },
+          },
         });
         if (!current) throw missing();
         await tx.providerPricingVersion.delete({ where: { id: current.id } });

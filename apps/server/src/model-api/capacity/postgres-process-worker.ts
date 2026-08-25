@@ -1,5 +1,6 @@
 import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
 import { PostgresCapacityAdmissionStore } from "./postgres-store.js";
+import { PRIORITY_CLASS_COUNT, scheduleWeightedDeficitRoundRobin } from "./scheduler.js";
 import type { AdmissionAttempt, CapacityLeaseHandle } from "./types.js";
 
 type WorkerCommand =
@@ -15,7 +16,19 @@ type WorkerCommand =
         expiresAt: string;
       };
     }
-  | { operation: "reclaim"; limit: number };
+  | { operation: "reclaim"; limit: number }
+  | {
+      operation: "schedule";
+      capacityId: string;
+      candidates: Array<{
+        admissionRequestId: string;
+        waiterId: string;
+        candidateOrder: number;
+        priority: number;
+        enqueueSequence: string;
+        eligible: boolean;
+      }>;
+    };
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (!databaseUrl)
@@ -41,7 +54,7 @@ try {
     if (command.hold && result.state === "ADMITTED") {
       // The parent deliberately SIGKILLs this process to model a server dying
       // after admission (including while a response stream owns the lease).
-      await new Promise<never>(() => undefined);
+      await new Promise<never>(() => setInterval(() => undefined, 60_000));
     }
   } else if (command.operation === "release") {
     write({
@@ -51,8 +64,41 @@ try {
         expiresAt: new Date(command.lease.expiresAt),
       }),
     });
-  } else {
+  } else if (command.operation === "reclaim") {
     write({ reclaimed: await store.reclaimExpired(new Date(), command.limit) });
+  } else {
+    const winner = await db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${command.capacityId}, 0))`;
+      const capacity = await tx.inferenceCapacity.findUniqueOrThrow({
+        where: { id: command.capacityId },
+      });
+      const deficits =
+        Array.isArray(capacity.schedulerDeficits) &&
+        capacity.schedulerDeficits.length === PRIORITY_CLASS_COUNT
+          ? capacity.schedulerDeficits.map((value) => (typeof value === "number" ? value : 0))
+          : Array(PRIORITY_CLASS_COUNT).fill(0);
+      const decision = scheduleWeightedDeficitRoundRobin({
+        state: {
+          cursor: capacity.schedulerCursor,
+          deficits,
+          version: capacity.schedulerVersion,
+        },
+        candidates: command.candidates.map((candidate) => ({
+          ...candidate,
+          enqueueSequence: BigInt(candidate.enqueueSequence),
+        })),
+      });
+      await tx.inferenceCapacity.update({
+        where: { id: command.capacityId },
+        data: {
+          schedulerCursor: decision.state.cursor,
+          schedulerDeficits: decision.state.deficits,
+          schedulerVersion: decision.state.version,
+        },
+      });
+      return decision.winner;
+    });
+    write({ winner });
   }
 } finally {
   await db.$disconnect();

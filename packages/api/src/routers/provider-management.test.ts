@@ -108,6 +108,24 @@ const session = {
 } as Session;
 const context: Context = { session };
 
+function createHttpClient(rpcContext: Context = context) {
+  const handler = new RPCHandler(providerManagementRouter);
+  const link = new RPCLink({
+    url: "https://example.test/rpc",
+    fetch: async (request, init) => {
+      const result = await handler.handle(new Request(request, init), {
+        prefix: "/rpc",
+        context: rpcContext,
+      });
+      if (!result.matched) return new Response(null, { status: 404 });
+      return result.response;
+    },
+  });
+  return createORPCClient(link) as ReturnType<
+    typeof createRouterClient<typeof providerManagementRouter>
+  >;
+}
+
 describe("providerManagementRouter security boundary", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -195,6 +213,99 @@ describe("providerManagementRouter security boundary", () => {
     });
     expect(db.providerUsageLedger.findMany).not.toHaveBeenCalled();
     expect(db.providerAttempt.findMany).not.toHaveBeenCalled();
+  });
+
+  it("returns non-enumerating HTTP errors for guessed provider graph resources", async () => {
+    envMock.enabled = true;
+    db.providerAccount.findFirst.mockResolvedValue(null);
+    db.providerModel.findFirst.mockResolvedValue(null);
+    db.providerPricingVersion.findFirst.mockResolvedValue(null);
+    db.providerCredential.findFirst.mockResolvedValue(null);
+    db.providerBudgetPolicy.findFirst.mockResolvedValue(null);
+    db.modelPool.findFirst.mockResolvedValue(null);
+    const client = createHttpClient();
+    const credential = "must-not-appear-in-an-error-body";
+    const limitedRule = {
+      metric: "CONCURRENCY" as const,
+      period: "PER_ATTEMPT" as const,
+      mode: "LIMITED" as const,
+      limitValue: "1",
+      currency: null,
+    };
+    const attempts = [
+      client.updateAccount({ id: "foreign-account", label: "guess" }),
+      client.setAccountEnabled({ id: "foreign-account", enabled: true }),
+      client.deleteAccount({ id: "foreign-account" }),
+      client.createModel({
+        providerAccountId: "foreign-account",
+        upstreamModelId: "foreign-model",
+        enabled: false,
+      }),
+      client.updateModel({ id: "foreign-model", displayName: "guess" }),
+      client.deleteModel({ id: "foreign-model" }),
+      client.listPricingVersions({ providerModelId: "foreign-model" }),
+      client.createPricingVersion({
+        providerModelId: "foreign-model",
+        version: "v1",
+        currency: "USD",
+        accountingVersion: "v1",
+        confidence: "CALCULATED",
+        ratesPerMillion: { input: "1", output: "1" },
+        chargeRules: {
+          inputIncludesCacheRead: false,
+          inputIncludesCacheWrite: false,
+          outputIncludesReasoning: false,
+          outputIncludesTool: false,
+          reasoningAllowanceTokens: 0,
+          toolAllowanceTokens: 0,
+          cacheReadAllowanceTokens: 0,
+          cacheWriteAllowanceTokens: 0,
+          additionalAllowanceTokens: 0,
+          unknownCategories: "FAIL_CLOSED",
+        },
+        effectiveAt: new Date("2026-01-01T00:00:00.000Z"),
+      }),
+      client.updatePricingVersion({ id: "foreign-pricing", currency: "EUR" }),
+      client.activatePricingVersion({ id: "foreign-pricing" }),
+      client.retirePricingVersion({ id: "foreign-pricing" }),
+      client.deletePricingVersion({ id: "foreign-pricing" }),
+      client.listCredentials({ providerAccountId: "foreign-account" }),
+      client.createCredential({ providerAccountId: "foreign-account", credential }),
+      client.replaceCredential({ providerAccountId: "foreign-account", credential }),
+      client.revokeCredential({ id: "foreign-credential" }),
+      client.createBudgetPolicy({
+        scopeType: "POOL_PROVIDER_MODEL",
+        providerAccountId: "foreign-account",
+        providerModelId: "foreign-model",
+        poolId: "foreign-pool",
+        active: false,
+        rules: [limitedRule],
+      }),
+      client.replaceBudgetPolicy({
+        id: "foreign-budget",
+        active: false,
+        rules: [limitedRule],
+      }),
+      client.deactivateBudgetPolicy({ id: "foreign-budget" }),
+    ];
+    const results = await Promise.allSettled(attempts);
+    expect(results).toHaveLength(attempts.length);
+    for (const [index, result] of results.entries()) {
+      expect(result.status).toBe("rejected");
+      if (result.status === "rejected")
+        expect(result.reason, `request ${index}`).toMatchObject({
+          code: "NOT_FOUND",
+          message: "Not found",
+        });
+    }
+    const serialized = JSON.stringify(results);
+    expect(serialized).not.toContain(credential);
+    expect(serialized).not.toContain("foreign-account");
+    expect(serialized).not.toContain("foreign-model");
+    expect(serialized).not.toContain("foreign-pricing");
+    expect(serialized).not.toContain("foreign-credential");
+    expect(serialized).not.toContain("foreign-budget");
+    expect(db.executionTarget.create).not.toHaveBeenCalled();
   });
 
   it("rechecks the locked account inside createModel and loses a race with account deletion", async () => {
@@ -298,10 +409,42 @@ describe("providerManagementRouter security boundary", () => {
         id: "active-price",
         userId: "owner",
         status: "DRAFT",
-        ProviderModel: { deletedAt: null },
+        ProviderModel: { deletedAt: null, ProviderAccount: { deletedAt: null } },
       },
     });
     expect(db.providerPricingVersion.update).not.toHaveBeenCalled();
+  });
+
+  it("denies retiring or deleting pricing below a deleted provider graph", async () => {
+    envMock.enabled = true;
+    db.providerPricingVersion.findFirst.mockResolvedValue(null);
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(client.retirePricingVersion({ id: "orphaned-active" })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      message: "Not found",
+    });
+    await expect(client.deletePricingVersion({ id: "orphaned-draft" })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      message: "Not found",
+    });
+    expect(db.providerPricingVersion.findFirst).toHaveBeenNthCalledWith(1, {
+      where: {
+        id: "orphaned-active",
+        userId: "owner",
+        status: "ACTIVE",
+        ProviderModel: { deletedAt: null, ProviderAccount: { deletedAt: null } },
+      },
+    });
+    expect(db.providerPricingVersion.findFirst).toHaveBeenNthCalledWith(2, {
+      where: {
+        id: "orphaned-draft",
+        userId: "owner",
+        status: "DRAFT",
+        ProviderModel: { deletedAt: null, ProviderAccount: { deletedAt: null } },
+      },
+    });
+    expect(db.providerPricingVersion.update).not.toHaveBeenCalled();
+    expect(db.providerPricingVersion.delete).not.toHaveBeenCalled();
   });
 
   it("denies a budget policy whose model is deleted or belongs to another account", async () => {

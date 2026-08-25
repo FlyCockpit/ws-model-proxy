@@ -20,7 +20,8 @@ type WorkerResult =
   | { state: "WAITING" | "CANCELLED" | "EXPIRED"; requestId?: string }
   | { state: "ADMITTED"; lease: SerializableLease }
   | { reclaimed: number }
-  | { released: boolean };
+  | { released: boolean }
+  | { winner?: { admissionRequestId: string; priority: number } };
 
 function startWorker(command: unknown) {
   const child = spawn(
@@ -119,17 +120,18 @@ integration("capacity admission across operating-system processes", () => {
         hold: true,
       });
       children.add(holder.child);
+      const holderResult = await holder.result;
+      expect(holderResult).toMatchObject({ state: "ADMITTED" });
+      if (!("state" in holderResult) || holderResult.state !== "ADMITTED")
+        throw new Error("Holder was not admitted.");
       const contender = startWorker({
         operation: "acquire",
         attempt: attempt(`${phase}-contender`),
         hold: false,
       });
       children.add(contender.child);
-      const [holderResult, contenderResult] = await Promise.all([holder.result, contender.result]);
-      expect(holderResult).toMatchObject({ state: "ADMITTED" });
+      const contenderResult = await contender.result;
       expect(contenderResult).toMatchObject({ state: "WAITING" });
-      if (!("state" in holderResult) || holderResult.state !== "ADMITTED")
-        throw new Error("Holder was not admitted.");
       expect(
         await db.capacityLease.count({ where: { capacityId: capacity.id, state: "ACTIVE" } }),
       ).toBe(1);
@@ -172,6 +174,79 @@ integration("capacity admission across operating-system processes", () => {
       children.add(releaser.child);
       await expect(releaser.result).resolves.toEqual({ released: true });
     }
+
+    // Persist scheduler state in PostgreSQL, then let different OS processes
+    // advance it. The high-weight class receives its remaining turn, the
+    // cursor advances to the low class (bounded anti-starvation), and FIFO is
+    // stable within that class.
+    const deficits = Array(32).fill(0) as number[];
+    deficits[31] = 1;
+    await db.inferenceCapacity.update({
+      where: { id: capacity.id },
+      data: { schedulerCursor: 31, schedulerDeficits: deficits },
+    });
+    const weightedCandidates = [
+      {
+        admissionRequestId: `high-${suffix}`,
+        waiterId: `high-${suffix}`,
+        candidateOrder: 0,
+        priority: 31,
+        enqueueSequence: "2",
+        eligible: true,
+      },
+      {
+        admissionRequestId: `low-${suffix}`,
+        waiterId: `low-${suffix}`,
+        candidateOrder: 0,
+        priority: 0,
+        enqueueSequence: "1",
+        eligible: true,
+      },
+    ];
+    const highRound = startWorker({
+      operation: "schedule",
+      capacityId: capacity.id,
+      candidates: weightedCandidates,
+    });
+    children.add(highRound.child);
+    await expect(highRound.result).resolves.toMatchObject({
+      winner: { admissionRequestId: `high-${suffix}`, priority: 31 },
+    });
+    const lowRound = startWorker({
+      operation: "schedule",
+      capacityId: capacity.id,
+      candidates: weightedCandidates,
+    });
+    children.add(lowRound.child);
+    await expect(lowRound.result).resolves.toMatchObject({
+      winner: { admissionRequestId: `low-${suffix}`, priority: 0 },
+    });
+    const fifoRound = startWorker({
+      operation: "schedule",
+      capacityId: capacity.id,
+      candidates: [
+        {
+          admissionRequestId: `later-${suffix}`,
+          waiterId: `later-${suffix}`,
+          candidateOrder: 0,
+          priority: 0,
+          enqueueSequence: "4",
+          eligible: true,
+        },
+        {
+          admissionRequestId: `earlier-${suffix}`,
+          waiterId: `earlier-${suffix}`,
+          candidateOrder: 0,
+          priority: 0,
+          enqueueSequence: "3",
+          eligible: true,
+        },
+      ],
+    });
+    children.add(fifoRound.child);
+    await expect(fifoRound.result).resolves.toMatchObject({
+      winner: { admissionRequestId: `earlier-${suffix}` },
+    });
 
     await db.user.delete({ where: { id: owner.id } });
   }, 30_000);
