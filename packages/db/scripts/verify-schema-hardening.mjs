@@ -695,7 +695,8 @@ try {
     UPDATE cache_affinity_record SET "prefixDigest" = repeat('x', 43)
      WHERE id = 'affinity-a'
   `);
-  await expectConstraintFailure(`
+  await expectConstraintFailure(
+    `
     INSERT INTO cache_affinity_record
       (id, "createdAt", "lastUsedAt", "expiresAt", "userId", "tenantUserId", "poolId",
        "executionTargetId", "targetIdentity", "digestVersion", "prefixDigest",
@@ -703,7 +704,9 @@ try {
     SELECT 'affinity-cross-owner', NOW(), NOW(), NOW() + interval '1 hour', 'owner-b',
       'owner-b', 'pool-a', id, repeat('t', 32), 2, repeat('q', 43), repeat('c', 43), 1
       FROM execution_target WHERE "discoveredModelId" = 'model-a'
-  `, "23503");
+  `,
+    "23503",
+  );
   await expectConstraintFailure(`
     INSERT INTO cache_affinity_record
       (id, "createdAt", "lastUsedAt", "expiresAt", "userId", "tenantUserId", "poolId",
