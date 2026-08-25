@@ -17,11 +17,13 @@ import {
 } from "lucide-react";
 import {
   cloneElement,
+  type FormEvent,
   isValidElement,
   type ReactElement,
   type ReactNode,
   useId,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { useTranslation } from "react-i18next";
@@ -33,40 +35,49 @@ import { orpc } from "@/utils/orpc";
 
 const showValue = (value: unknown) => (value === null || value === undefined ? "—" : String(value));
 
-const accountFormSchema = z.object({
+export const providerAccountFormSchema = z.object({
   providerType: z
     .string()
     .trim()
     .toLowerCase()
-    .regex(/^[a-z][a-z0-9_-]{0,63}$/u),
-  label: z.string().trim().min(1).max(120),
-  baseUrl: z.string().url().max(2048),
+    .regex(/^[a-z][a-z0-9_-]{0,63}$/u, "providerType"),
+  label: z.string().trim().min(1, "required").max(120, "tooLong"),
+  baseUrl: z
+    .string()
+    .url("url")
+    .max(2048, "tooLong")
+    .refine((value) => value.startsWith("https://"), "httpsUrl"),
   authType: z.enum(["API_KEY", "BEARER"]),
 });
-const credentialFormSchema = z.object({ credential: z.string().min(1).max(16_384) });
-const createModelFormSchema = z.object({
-  upstreamModelId: z.string().trim().min(1).max(255),
-  displayName: z.string().trim().max(255),
+const credentialFormSchema = z.object({
+  credential: z.string().min(1, "required").max(16_384, "tooLong"),
 });
-const optionalPositiveInteger = z.union([z.literal(""), z.string().regex(/^[1-9]\d*$/u)]);
+const createModelFormSchema = z.object({
+  upstreamModelId: z.string().trim().min(1, "required").max(255, "tooLong"),
+  displayName: z.string().trim().max(255, "tooLong"),
+});
+const optionalPositiveInteger = z.union([
+  z.literal(""),
+  z.string().regex(/^[1-9]\d*$/u, "positiveInteger"),
+]);
 const updateModelFormSchema = z.object({
-  displayName: z.string().trim().max(255),
+  displayName: z.string().trim().max(255, "tooLong"),
   contextWindow: optionalPositiveInteger,
   maxOutputTokens: optionalPositiveInteger,
   concurrencyLimit: optionalPositiveInteger,
 });
-const moneyRateSchema = z.string().regex(/^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/u);
+const moneyRateSchema = z.string().regex(/^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/u, "money");
 const pricingFormSchema = z.object({
-  version: z.string().trim().min(1).max(128),
+  version: z.string().trim().min(1, "required").max(128, "tooLong"),
   currency: z
     .string()
     .trim()
     .toUpperCase()
-    .regex(/^[A-Z]{3}$/u),
+    .regex(/^[A-Z]{3}$/u, "currency"),
   input: moneyRateSchema,
   output: moneyRateSchema,
 });
-const budgetFormSchema = z
+export const providerBudgetFormSchema = z
   .object({
     concurrencyMode: z.enum(["LIMITED", "UNLIMITED"]),
     concurrency: optionalPositiveInteger,
@@ -84,21 +95,32 @@ const budgetFormSchema = z
     spendMonth: z.union([z.literal(""), moneyRateSchema]),
   })
   .superRefine((value, context) => {
-    const pairs = [
-      [value.concurrencyMode, value.concurrency],
-      [value.tokenAttemptMode, value.tokenAttempt],
-      [value.tokenDayMode, value.tokenDay],
-      [value.tokenMonthMode, value.tokenMonth],
-      [value.tokenLifetimeMode, value.tokenLifetime],
-      [value.spendDayMode, value.spendDay],
-      [value.spendMonthMode, value.spendMonth],
-    ] as const;
-    if (pairs.some(([mode, limit]) => mode === "LIMITED" && (!limit || Number(limit) <= 0)))
-      context.addIssue({
-        code: "custom",
-        message: "Limited budget rules require a positive value",
-      });
+    for (const [mode, limit, path] of [
+      [value.concurrencyMode, value.concurrency, "concurrency"],
+      [value.tokenAttemptMode, value.tokenAttempt, "tokenAttempt"],
+      [value.tokenDayMode, value.tokenDay, "tokenDay"],
+      [value.tokenMonthMode, value.tokenMonth, "tokenMonth"],
+      [value.tokenLifetimeMode, value.tokenLifetime, "tokenLifetime"],
+      [value.spendDayMode, value.spendDay, "spendDay"],
+      [value.spendMonthMode, value.spendMonth, "spendMonth"],
+    ] as const) {
+      if (mode === "LIMITED" && (!limit || Number(limit) <= 0))
+        context.addIssue({ code: "custom", message: "positiveRequired", path: [path] });
+    }
   });
+
+export function focusFirstInvalidProviderField(form: HTMLFormElement | null) {
+  const invalid = form?.querySelector<HTMLElement>('[aria-invalid="true"]');
+  invalid?.focus();
+}
+
+function submitProviderForm(event: FormEvent<HTMLFormElement>, submit: () => void | Promise<void>) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  void Promise.resolve(submit()).finally(() => {
+    requestAnimationFrame(() => focusFirstInvalidProviderField(form));
+  });
+}
 
 export function ProviderOperationsSection() {
   const { t, i18n } = useTranslation(["common", "dashboard"]);
@@ -109,6 +131,11 @@ export function ProviderOperationsSection() {
   const showDate = (value: Date | string | null | undefined) =>
     value ? dateTime.format(new Date(value)) : "—";
   const queryClient = useQueryClient();
+  const accountFormRef = useRef<HTMLFormElement>(null);
+  const credentialFormRef = useRef<HTMLFormElement>(null);
+  const createModelFormRef = useRef<HTMLFormElement>(null);
+  const pricingFormRef = useRef<HTMLFormElement>(null);
+  const budgetFormRef = useRef<HTMLFormElement>(null);
   const accounts = useQuery({
     ...orpc.providerManagement.listAccounts.queryOptions(),
     retry: false,
@@ -425,7 +452,7 @@ export function ProviderOperationsSection() {
       baseUrl: "https://api.openai.com/v1",
       authType: "BEARER" as "API_KEY" | "BEARER",
     },
-    validators: { onSubmit: accountFormSchema },
+    validators: { onSubmit: providerAccountFormSchema },
     onSubmit: async ({ value }) => {
       await createAccount.mutateAsync({ ...value, safeConfiguration: null });
     },
@@ -487,7 +514,7 @@ export function ProviderOperationsSection() {
   });
   const budgetForm = useForm({
     defaultValues: budgetDefaults,
-    validators: { onSubmit: budgetFormSchema },
+    validators: { onSubmit: providerBudgetFormSchema },
     onSubmit: async ({ value }) => {
       await createBudget.mutateAsync({
         scopeType: "PROVIDER_ACCOUNT",
@@ -522,16 +549,17 @@ export function ProviderOperationsSection() {
       </div>
 
       <form
+        ref={accountFormRef}
+        noValidate
         className="mt-6 grid gap-3 rounded-xl border bg-muted/20 p-4 md:grid-cols-2 xl:grid-cols-5"
-        onSubmit={(event) => {
-          event.preventDefault();
-          accountForm.handleSubmit();
-        }}
+        onSubmit={(event) => submitProviderForm(event, accountForm.handleSubmit)}
       >
         {(["label", "providerType", "baseUrl"] as const).map((name) => (
           <accountForm.Field key={name} name={name}>
             {(field) => (
               <Field
+                id={`provider-account-${name}`}
+                errors={field.state.meta.errors}
                 label={t(`dashboard:providers.fields.${name === "providerType" ? "type" : name}`)}
                 className={name === "baseUrl" ? "md:col-span-2" : undefined}
               >
@@ -547,7 +575,11 @@ export function ProviderOperationsSection() {
         ))}
         <accountForm.Field name="authType">
           {(field) => (
-            <Field label={t("dashboard:providers.fields.authType")}>
+            <Field
+              id="provider-account-authType"
+              errors={field.state.meta.errors}
+              label={t("dashboard:providers.fields.authType")}
+            >
               <select
                 className="h-11 w-full rounded-md border bg-background px-3 text-base sm:text-sm"
                 value={field.state.value}
@@ -658,11 +690,10 @@ export function ProviderOperationsSection() {
 
               <div className="grid gap-6 lg:grid-cols-2">
                 <form
+                  ref={credentialFormRef}
+                  noValidate
                   className="min-w-0 space-y-3"
-                  onSubmit={(event) => {
-                    event.preventDefault();
-                    credentialForm.handleSubmit();
-                  }}
+                  onSubmit={(event) => submitProviderForm(event, credentialForm.handleSubmit)}
                 >
                   <h3 className="flex items-center gap-2 font-medium">
                     <KeyRound className="size-4" />
@@ -681,21 +712,25 @@ export function ProviderOperationsSection() {
                         })
                       : t("dashboard:providers.noCredential")}
                   </p>
-                  <Label htmlFor="provider-secret">
-                    {credentialActive
-                      ? t("dashboard:providers.fields.replacementSecret")
-                      : t("dashboard:providers.fields.secret")}
-                  </Label>
                   <credentialForm.Field name="credential">
                     {(field) => (
-                      <Input
+                      <Field
                         id="provider-secret"
-                        type="password"
-                        autoComplete="new-password"
-                        value={field.state.value}
-                        onBlur={field.handleBlur}
-                        onChange={(event) => field.handleChange(event.target.value)}
-                      />
+                        errors={field.state.meta.errors}
+                        label={
+                          credentialActive
+                            ? t("dashboard:providers.fields.replacementSecret")
+                            : t("dashboard:providers.fields.secret")
+                        }
+                      >
+                        <Input
+                          type="password"
+                          autoComplete="new-password"
+                          value={field.state.value}
+                          onBlur={field.handleBlur}
+                          onChange={(event) => field.handleChange(event.target.value)}
+                        />
+                      </Field>
                     )}
                   </credentialForm.Field>
                   <p className="text-xs text-muted-foreground">
@@ -722,16 +757,19 @@ export function ProviderOperationsSection() {
                   ) : null}
                 </form>
                 <form
+                  ref={createModelFormRef}
+                  noValidate
                   className="min-w-0 space-y-3"
-                  onSubmit={(event) => {
-                    event.preventDefault();
-                    createModelForm.handleSubmit();
-                  }}
+                  onSubmit={(event) => submitProviderForm(event, createModelForm.handleSubmit)}
                 >
                   <h3 className="font-medium">{t("dashboard:providers.models")}</h3>
                   <createModelForm.Field name="upstreamModelId">
                     {(field) => (
-                      <Field label={t("dashboard:providers.fields.upstreamModel")}>
+                      <Field
+                        id="provider-new-model-upstreamModelId"
+                        errors={field.state.meta.errors}
+                        label={t("dashboard:providers.fields.upstreamModel")}
+                      >
                         <Input
                           value={field.state.value}
                           onBlur={field.handleBlur}
@@ -742,7 +780,11 @@ export function ProviderOperationsSection() {
                   </createModelForm.Field>
                   <createModelForm.Field name="displayName">
                     {(field) => (
-                      <Field label={t("dashboard:providers.fields.displayName")}>
+                      <Field
+                        id="provider-new-model-displayName"
+                        errors={field.state.meta.errors}
+                        label={t("dashboard:providers.fields.displayName")}
+                      >
                         <Input
                           value={field.state.value}
                           onBlur={field.handleBlur}
@@ -842,11 +884,10 @@ export function ProviderOperationsSection() {
               {models.data?.length ? (
                 <div className="grid min-w-0 gap-6 lg:grid-cols-2">
                   <form
+                    ref={pricingFormRef}
+                    noValidate
                     className="min-w-0 space-y-3"
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      pricingForm.handleSubmit();
-                    }}
+                    onSubmit={(event) => submitProviderForm(event, pricingForm.handleSubmit)}
                   >
                     <h3 className="font-medium">{t("dashboard:providers.pricing")}</h3>
                     {pricing.isError ? (
@@ -872,6 +913,8 @@ export function ProviderOperationsSection() {
                         <pricingForm.Field key={name} name={name}>
                           {(field) => (
                             <Field
+                              id={`provider-pricing-${name}`}
+                              errors={field.state.meta.errors}
                               label={t(
                                 `dashboard:providers.fields.${name === "version" ? "pricingVersion" : name === "input" ? "inputRate" : name === "output" ? "outputRate" : name}`,
                               )}
@@ -976,11 +1019,10 @@ export function ProviderOperationsSection() {
                     </div>
                   </form>
                   <form
+                    ref={budgetFormRef}
+                    noValidate
                     className="min-w-0 space-y-3"
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      budgetForm.handleSubmit();
-                    }}
+                    onSubmit={(event) => submitProviderForm(event, budgetForm.handleSubmit)}
                   >
                     <h3 className="font-medium">{t("dashboard:providers.budgets")}</h3>
                     {policies.isError ? (
@@ -991,6 +1033,8 @@ export function ProviderOperationsSection() {
                     ) : null}
                     <div className="grid gap-3 sm:grid-cols-2">
                       <BudgetRuleField
+                        id="provider-budget-concurrency"
+                        errors={budgetForm.getFieldMeta("concurrency")?.errors}
                         label={t("dashboard:providers.fields.concurrencyAttempt")}
                         mode={budgetForm.state.values.concurrencyMode}
                         value={budgetForm.state.values.concurrency}
@@ -998,6 +1042,8 @@ export function ProviderOperationsSection() {
                         onValue={(value) => budgetForm.setFieldValue("concurrency", value)}
                       />
                       <BudgetRuleField
+                        id="provider-budget-token-attempt"
+                        errors={budgetForm.getFieldMeta("tokenAttempt")?.errors}
                         label={t("dashboard:providers.fields.tokensAttempt")}
                         mode={budgetForm.state.values.tokenAttemptMode}
                         value={budgetForm.state.values.tokenAttempt}
@@ -1005,6 +1051,8 @@ export function ProviderOperationsSection() {
                         onValue={(value) => budgetForm.setFieldValue("tokenAttempt", value)}
                       />
                       <BudgetRuleField
+                        id="provider-budget-token-day"
+                        errors={budgetForm.getFieldMeta("tokenDay")?.errors}
                         label={t("dashboard:providers.fields.tokensDay")}
                         mode={budgetForm.state.values.tokenDayMode}
                         value={budgetForm.state.values.tokenDay}
@@ -1012,6 +1060,8 @@ export function ProviderOperationsSection() {
                         onValue={(value) => budgetForm.setFieldValue("tokenDay", value)}
                       />
                       <BudgetRuleField
+                        id="provider-budget-token-month"
+                        errors={budgetForm.getFieldMeta("tokenMonth")?.errors}
                         label={t("dashboard:providers.fields.tokensMonth")}
                         mode={budgetForm.state.values.tokenMonthMode}
                         value={budgetForm.state.values.tokenMonth}
@@ -1019,6 +1069,8 @@ export function ProviderOperationsSection() {
                         onValue={(value) => budgetForm.setFieldValue("tokenMonth", value)}
                       />
                       <BudgetRuleField
+                        id="provider-budget-token-lifetime"
+                        errors={budgetForm.getFieldMeta("tokenLifetime")?.errors}
                         label={t("dashboard:providers.fields.tokensLifetime")}
                         mode={budgetForm.state.values.tokenLifetimeMode}
                         value={budgetForm.state.values.tokenLifetime}
@@ -1026,6 +1078,8 @@ export function ProviderOperationsSection() {
                         onValue={(value) => budgetForm.setFieldValue("tokenLifetime", value)}
                       />
                       <BudgetRuleField
+                        id="provider-budget-spend-day"
+                        errors={budgetForm.getFieldMeta("spendDay")?.errors}
                         label={t("dashboard:providers.fields.spendDay")}
                         mode={budgetForm.state.values.spendDayMode}
                         value={budgetForm.state.values.spendDay}
@@ -1034,6 +1088,8 @@ export function ProviderOperationsSection() {
                         decimal
                       />
                       <BudgetRuleField
+                        id="provider-budget-spend-month"
+                        errors={budgetForm.getFieldMeta("spendMonth")?.errors}
                         label={t("dashboard:providers.fields.spendMonth")}
                         mode={budgetForm.state.values.spendMonthMode}
                         value={budgetForm.state.values.spendMonth}
@@ -1464,9 +1520,23 @@ export function ProviderOperationsSection() {
                     {t("dashboard:providers.actions.firstPage")}
                   </Button>
                 ) : null}
-                <p className="mt-3 text-xs text-muted-foreground">
-                  {t("dashboard:providers.invoiceCaveat")}
-                </p>
+                {budgets.data?.caveats.length ? (
+                  <aside
+                    className="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/5 p-4"
+                    aria-labelledby="provider-billing-caveats-title"
+                  >
+                    <h4 id="provider-billing-caveats-title" className="text-sm font-medium">
+                      {t("dashboard:providers.billingCaveatsTitle")}
+                    </h4>
+                    <ul className="mt-2 list-disc space-y-1 ps-5 text-xs text-muted-foreground">
+                      {budgets.data.caveats.map((caveat) => (
+                        <li key={caveat} className="break-words">
+                          {t(`dashboard:providers.billingCaveats.${caveat}`)}
+                        </li>
+                      ))}
+                    </ul>
+                  </aside>
+                ) : null}
                 {budgets.isError ? (
                   <InlineRetry
                     message={t("dashboard:providers.budgetActivityFailed")}
@@ -1594,6 +1664,7 @@ function UpdateAccountForm({
   authTypeLocked: boolean;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
+  const formRef = useRef<HTMLFormElement>(null);
   const queryClient = useQueryClient();
   const updateAccount = useMutation(
     orpc.providerManagement.updateAccount.mutationOptions({
@@ -1608,21 +1679,22 @@ function UpdateAccountForm({
       providerType: account.providerType,
       authType: account.authType,
     },
-    validators: { onSubmit: accountFormSchema },
+    validators: { onSubmit: providerAccountFormSchema },
     onSubmit: async ({ value }) => updateAccount.mutateAsync({ id: account.id, ...value }),
   });
   return (
     <form
+      ref={formRef}
+      noValidate
       className="grid gap-3 md:grid-cols-2 xl:grid-cols-4"
-      onSubmit={(event) => {
-        event.preventDefault();
-        form.handleSubmit();
-      }}
+      onSubmit={(event) => submitProviderForm(event, form.handleSubmit)}
     >
       {(["label", "baseUrl", "providerType"] as const).map((name) => (
         <form.Field key={name} name={name}>
           {(field) => (
             <Field
+              id={`provider-update-account-${account.id}-${name}`}
+              errors={field.state.meta.errors}
               label={t(`dashboard:providers.fields.${name === "providerType" ? "type" : name}`)}
               className={name === "baseUrl" ? "xl:col-span-2" : undefined}
             >
@@ -1638,7 +1710,11 @@ function UpdateAccountForm({
       ))}
       <form.Field name="authType">
         {(field) => (
-          <Field label={t("dashboard:providers.fields.authType")}>
+          <Field
+            id={`provider-update-account-${account.id}-authType`}
+            errors={field.state.meta.errors}
+            label={t("dashboard:providers.fields.authType")}
+          >
             <select
               disabled={authTypeLocked}
               className="h-11 w-full rounded-md border bg-background px-3 text-base sm:text-sm"
@@ -1679,6 +1755,7 @@ function UpdateModelForm({
   };
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
+  const formRef = useRef<HTMLFormElement>(null);
   const queryClient = useQueryClient();
   const updateModel = useMutation(
     orpc.providerManagement.updateModel.mutationOptions({
@@ -1707,17 +1784,18 @@ function UpdateModelForm({
   });
   return (
     <form
+      ref={formRef}
+      noValidate
       className="grid gap-3 pt-2 sm:grid-cols-2 lg:grid-cols-3"
-      onSubmit={(event) => {
-        event.preventDefault();
-        form.handleSubmit();
-      }}
+      onSubmit={(event) => submitProviderForm(event, form.handleSubmit)}
     >
       {(["displayName", "contextWindow", "maxOutputTokens", "concurrencyLimit"] as const).map(
         (name) => (
           <form.Field key={name} name={name}>
             {(field) => (
               <Field
+                id={`provider-update-model-${model.id}-${name}`}
+                errors={field.state.meta.errors}
                 label={t(
                   `dashboard:providers.fields.${name === "concurrencyLimit" ? "concurrency" : name}`,
                 )}
@@ -1747,33 +1825,66 @@ function Field({
   label,
   children,
   className = "",
+  errors = [],
+  id,
 }: {
   label: string;
   children: ReactNode;
   className?: string;
+  errors?: unknown[];
+  id?: string;
 }) {
+  const { t } = useTranslation("dashboard");
   const generatedId = useId();
+  const fieldId = id ?? generatedId;
+  const errorId = `${fieldId}-error`;
+  const firstError = errors[0];
+  const errorCode =
+    typeof firstError === "string"
+      ? firstError
+      : typeof firstError === "object" && firstError && "message" in firstError
+        ? String(firstError.message)
+        : "invalid";
+  const hasError = errors.length > 0;
   const child = isValidElement(children)
-    ? cloneElement(children as ReactElement<{ id?: string }>, {
-        id: (children.props as { id?: string }).id ?? generatedId,
-      })
+    ? cloneElement(
+        children as ReactElement<{
+          id?: string;
+          "aria-invalid"?: boolean;
+          "aria-describedby"?: string;
+        }>,
+        {
+          id: (children.props as { id?: string }).id ?? fieldId,
+          "aria-invalid": hasError,
+          "aria-describedby": hasError ? errorId : undefined,
+        },
+      )
     : children;
-  const childId = isValidElement(child) ? (child.props as { id?: string }).id : generatedId;
+  const childId = isValidElement(child) ? (child.props as { id?: string }).id : fieldId;
   return (
     <div className={`min-w-0 space-y-2 ${className}`}>
       <Label htmlFor={childId}>{label}</Label>
       {child}
+      {hasError ? (
+        <p id={errorId} className="text-sm text-destructive" role="alert">
+          {t(`providers.validation.${errorCode}`, {
+            defaultValue: t("providers.validation.invalid"),
+          })}
+        </p>
+      ) : null}
     </div>
   );
 }
 
-function BudgetRuleField({
+export function BudgetRuleField({
   label,
   mode,
   value,
   onMode,
   onValue,
   decimal = false,
+  errors = [],
+  id,
 }: {
   label: string;
   mode: "LIMITED" | "UNLIMITED";
@@ -1781,10 +1892,21 @@ function BudgetRuleField({
   onMode: (mode: "LIMITED" | "UNLIMITED") => void;
   onValue: (value: string) => void;
   decimal?: boolean;
+  errors?: unknown[];
+  id: string;
 }) {
   const { t } = useTranslation("dashboard");
-  const modeId = useId();
-  const valueId = useId();
+  const modeId = `${id}-mode`;
+  const valueId = `${id}-value`;
+  const errorId = `${valueId}-error`;
+  const hasError = errors.length > 0;
+  const firstError = errors[0];
+  const errorCode =
+    typeof firstError === "string"
+      ? firstError
+      : typeof firstError === "object" && firstError && "message" in firstError
+        ? String(firstError.message)
+        : "invalid";
   return (
     <div className="min-w-0 space-y-2 rounded-xl border p-3">
       <p className="text-sm font-medium">{label}</p>
@@ -1809,7 +1931,16 @@ function BudgetRuleField({
             min={decimal ? undefined : "1"}
             value={value}
             onChange={(event) => onValue(event.target.value)}
+            aria-invalid={hasError}
+            aria-describedby={hasError ? errorId : undefined}
           />
+          {hasError ? (
+            <p id={errorId} className="text-sm text-destructive" role="alert">
+              {t(`providers.validation.${errorCode}`, {
+                defaultValue: t("providers.validation.invalid"),
+              })}
+            </p>
+          ) : null}
         </>
       ) : (
         <p className="text-xs text-amber-700 dark:text-amber-300">

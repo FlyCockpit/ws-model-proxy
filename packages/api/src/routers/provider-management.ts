@@ -1137,8 +1137,15 @@ export const providerManagementRouter = {
     return {
       reservations,
       settlements,
-      caveat:
-        "Provider invoices are authoritative; budgets are protective admission controls, not guaranteed billing caps.",
+      caveats: [
+        "FAILED_OR_CANCELLED_MAY_BILL",
+        "USAGE_CATEGORIES_MAY_BE_OMITTED",
+        "STREAM_FINAL_USAGE_MAY_BE_MISSING",
+        "PRICING_MAY_CHANGE",
+        "FX_IS_INEXACT_AND_NOT_CONVERTED",
+        "INVOICES_ARE_AUTHORITATIVE",
+        "BUDGETS_ARE_NOT_GUARANTEED_CAPS",
+      ] as const,
     };
   }),
   listProviderAttemptEvents: protectedProcedure
