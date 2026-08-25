@@ -360,6 +360,76 @@ try {
   if (backfill.rows[0].targets !== 2 || backfill.rows[0].relays !== 1) {
     throw new Error("Backfill was not idempotent or did not preserve old rows");
   }
+
+  // Exercise the provider Responses v3 binding on real PostgreSQL. Endpoint
+  // versions are snapshots (base-URL changes invalidate at runtime), while
+  // target identity cannot be rewritten and deleting its token removes it.
+  await client.query(`
+    INSERT INTO provider_account
+      (id, "createdAt", "updatedAt", "userId", "providerType", label, "baseUrl",
+       "endpointIdentity", "endpointVersion", "authType")
+    VALUES ('sticky-provider-account', NOW(), NOW(), 'owner-a', 'openai', 'Sticky provider',
+      'https://api.example.test/v1', 'https://api.example.test/v1', 1, 'BEARER');
+    INSERT INTO provider_model
+      (id, "createdAt", "updatedAt", "userId", "providerAccountId", "upstreamModelId")
+    VALUES ('sticky-provider-model', NOW(), NOW(), 'owner-a', 'sticky-provider-account',
+      'gpt-responses');
+    INSERT INTO execution_target
+      (id, "createdAt", "updatedAt", "userId", kind, "providerModelId")
+    VALUES ('sticky-provider-target', NOW(), NOW(), 'owner-a', 'PROVIDER_MODEL',
+      'sticky-provider-model');
+    INSERT INTO model_pool (id, "createdAt", "updatedAt", "userId", slug, name)
+    VALUES ('sticky-provider-pool', NOW(), NOW(), 'owner-a', 'sticky-provider',
+      'Sticky provider');
+    INSERT INTO model_api_token
+      (id, "createdAt", "updatedAt", "userId", name, "lookupPrefix", "secretDigest")
+    VALUES ('sticky-provider-token', NOW(), NOW(), 'owner-a', 'Sticky token',
+      'sticky-provider-prefix', 'sticky-provider-secret-digest');
+    INSERT INTO response_stickiness_record
+      (id, "createdAt", "updatedAt", "userId", "modelApiTokenId", "routingKeyDigest",
+       "routingVersion", "targetModelPoolId", "selectedExecutionTargetId",
+       "providerAccountId", "providerModelId", "providerEndpointIdentity",
+       "providerEndpointVersion", "providerUpstreamModelId", "nativeSurface",
+       "upstreamResponseIdDigest", "expiresAt")
+    VALUES ('sticky-provider-binding', NOW(), NOW(), 'owner-a', 'sticky-provider-token',
+      'sticky-routing-digest', 3, 'sticky-provider-pool', 'sticky-provider-target',
+      'sticky-provider-account', 'sticky-provider-model', 'https://api.example.test/v1', 1,
+      'gpt-responses', 'OPENAI_RESPONSES',
+      'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-', NOW() + INTERVAL '1 hour');
+  `);
+  await expectConstraintFailure(`
+    UPDATE response_stickiness_record
+       SET "providerEndpointVersion" = 2
+     WHERE id = 'sticky-provider-binding'
+  `);
+  await client.query(`
+    UPDATE provider_account
+       SET "baseUrl" = 'https://replacement.example.test/v1',
+           "endpointIdentity" = 'https://replacement.example.test/v1',
+           "endpointVersion" = 2
+     WHERE id = 'sticky-provider-account'
+  `);
+  const invalidatedBinding = await client.query(`
+    SELECT record."providerEndpointVersion" AS bound_version,
+           account."endpointVersion" AS current_version
+      FROM response_stickiness_record record
+      JOIN provider_account account ON account.id = record."providerAccountId"
+     WHERE record.id = 'sticky-provider-binding'
+  `);
+  if (
+    invalidatedBinding.rows[0]?.bound_version !== 1 ||
+    invalidatedBinding.rows[0]?.current_version !== 2
+  ) {
+    throw new Error("Provider endpoint change did not preserve an invalidated binding snapshot");
+  }
+  await client.query(`DELETE FROM model_api_token WHERE id = 'sticky-provider-token'`);
+  const deletedTokenBinding = await client.query(`
+    SELECT COUNT(*)::int AS count FROM response_stickiness_record
+     WHERE id = 'sticky-provider-binding'
+  `);
+  if (deletedTokenBinding.rows[0]?.count !== 0) {
+    throw new Error("Deleted model API token retained a provider Responses binding");
+  }
   const reverseBackfill = await client.query(`
     SELECT "discoveredModelId" FROM pool_member WHERE id = 'conflict-target-row'
   `);
