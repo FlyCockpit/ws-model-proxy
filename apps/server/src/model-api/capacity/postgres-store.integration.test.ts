@@ -118,6 +118,151 @@ integration("PostgreSQL capacity admission primitives", () => {
     }
   });
 
+  it("uses the database clock across managers for deadlines, heartbeats, and lease expiry", async () => {
+    if (!databaseUrl) return;
+    const first = createPrismaClient(databaseUrl);
+    const second = createPrismaClient(databaseUrl);
+    const suffix = crypto.randomUUID();
+    const user = await first.user.create({
+      data: { name: "Database clock proof", email: `database-clock-${suffix}@example.test` },
+    });
+    try {
+      const capacity = await first.inferenceCapacity.create({
+        data: {
+          userId: user.id,
+          label: `database-clock-${suffix}`,
+          runtimeIdentityKey: `database-clock-${suffix}`,
+          runtimeModel: "database-clock-proof",
+          hardConcurrencyLimit: 1,
+        },
+      });
+      const account = await first.providerAccount.create({
+        data: {
+          userId: user.id,
+          providerType: "proof",
+          label: `database-clock-${suffix}`,
+          baseUrl: "https://example.test",
+          authType: "BEARER",
+        },
+      });
+      const model = await first.providerModel.create({
+        data: { userId: user.id, providerAccountId: account.id, upstreamModelId: suffix },
+      });
+      const target = await first.executionTarget.create({
+        data: {
+          userId: user.id,
+          kind: "PROVIDER_MODEL",
+          providerModelId: model.id,
+          inferenceCapacityId: capacity.id,
+        },
+      });
+      const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+      const firstManager = new PostgresCapacityAdmissionStore(first, "database-clock-a");
+      const secondManager = new PostgresCapacityAdmissionStore(second, "database-clock-b");
+      const databaseNow = async () => {
+        const [row] = await first.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
+        if (!row) throw new Error("Database clock unavailable in integration test.");
+        return row.now;
+      };
+      const attempt = (name: string, deadlineAt: Date) => ({
+        requestId: `${name}-${suffix}`,
+        attemptId: `${name}-${suffix}`,
+        ownerId: user.id,
+        sourceKind: "DIRECT" as const,
+        basePriority: 16,
+        connectionOwner: name,
+        deadlineAt,
+        candidates: [{ capacityId: capacity.id, executionTargetId: target.id, candidateOrder: 0 }],
+      });
+
+      const blocker = await firstManager.acquire(
+        attempt("clock-blocker", new Date((await databaseNow()).getTime() + 60_000)),
+      );
+      if (blocker.state !== "ADMITTED") throw new Error("Expected database-clock blocker.");
+      const deadlineAttempt = attempt(
+        "clock-deadline",
+        new Date((await databaseNow()).getTime() + 60_000),
+      );
+      await expect(secondManager.acquire(deadlineAttempt)).resolves.toMatchObject({
+        state: "WAITING",
+      });
+
+      let locked!: () => void;
+      let unlock!: () => void;
+      const hasLock = new Promise<void>((resolve) => {
+        locked = resolve;
+      });
+      const releaseLock = new Promise<void>((resolve) => {
+        unlock = resolve;
+      });
+      const lockHolder = first.$transaction(async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacity.id}, 0))`;
+        // Shorten only the persisted candidate deadline after setup has
+        // completed. The competing manager must re-read it after obtaining the
+        // advisory lock instead of trusting its pre-lock view or process clock.
+        await tx.$executeRaw`
+          UPDATE "CapacityWaiter"
+             SET "deadlineAt" = clock_timestamp() + interval '150 milliseconds'
+           WHERE "admissionRequestId" = (
+             SELECT id FROM "AdmissionRequest" WHERE "attemptId" = ${deadlineAttempt.attemptId}
+           )`;
+        locked();
+        await releaseLock;
+      });
+      await hasLock;
+      const delayedPoll = secondManager.acquire({ ...deadlineAttempt, candidates: [] });
+      await new Promise((resolve) => setTimeout(resolve, 225));
+      unlock();
+      await lockHolder;
+      await expect(delayedPoll).resolves.toEqual({ state: "EXPIRED" });
+      expect(
+        await first.capacityLease.count({ where: { attemptId: deadlineAttempt.attemptId } }),
+      ).toBe(0);
+
+      await firstManager.release(blocker.lease);
+      const live = await firstManager.acquire(
+        attempt("clock-live", new Date((await databaseNow()).getTime() + 60_000)),
+      );
+      if (live.state !== "ADMITTED") throw new Error("Expected live database-clock lease.");
+      const beforeHeartbeat = await databaseNow();
+      await expect(secondManager.heartbeat(live.lease, 2_000)).resolves.toBe(true);
+      const [heartbeated, afterHeartbeat] = await Promise.all([
+        first.capacityLease.findUniqueOrThrow({ where: { id: live.lease.leaseId } }),
+        databaseNow(),
+      ]);
+      expect(heartbeated.expiresAt.getTime() - heartbeated.heartbeatAt.getTime()).toBe(2_000);
+      expect(heartbeated.heartbeatAt.getTime()).toBeGreaterThanOrEqual(beforeHeartbeat.getTime());
+      expect(heartbeated.heartbeatAt.getTime()).toBeLessThanOrEqual(afterHeartbeat.getTime());
+      expect(heartbeated.expiresAt.getTime()).toBeGreaterThan(afterHeartbeat.getTime());
+
+      // A wildly future application clock cannot reclaim a lease whose database
+      // expiry is still live; reclaimExpired deliberately ignores its legacy input.
+      await expect(
+        firstManager.reclaimExpired(new Date("9999-12-31T23:59:59.999Z"), 10),
+      ).resolves.toBe(0);
+      expect(
+        await first.capacityLease.findUniqueOrThrow({ where: { id: live.lease.leaseId } }),
+      ).toMatchObject({ state: "ACTIVE" });
+
+      await first.$executeRaw`
+        UPDATE "CapacityLease"
+           SET "expiresAt" = clock_timestamp() - interval '1 millisecond'
+         WHERE id = ${live.lease.leaseId}`;
+      await expect(secondManager.heartbeat(live.lease, 60_000)).resolves.toBe(false);
+      // A wildly past application clock cannot suppress database-expired cleanup.
+      await expect(
+        firstManager.reclaimExpired(new Date("1900-01-01T00:00:00.000Z"), 10),
+      ).resolves.toBe(1);
+      await expect(secondManager.heartbeat(live.lease, 60_000)).resolves.toBe(false);
+      expect(
+        await first.capacityLease.findUniqueOrThrow({ where: { id: live.lease.leaseId } }),
+      ).toMatchObject({ state: "RECLAIMED", releaseReason: "expired" });
+    } finally {
+      await first.user.delete({ where: { id: user.id } }).catch(() => undefined);
+      await Promise.all([first.$disconnect(), second.$disconnect()]);
+    }
+  });
+
   it("persists FIFO and weighted WDRR state across independent-client restart", async () => {
     if (!databaseUrl) return;
     let client = createPrismaClient(databaseUrl);
