@@ -48,7 +48,8 @@ export type AdmissionTerminalizationResult =
 
 export interface CapacityAdmissionStore {
   acquire(attempt: AdmissionAttempt, signal?: AbortSignal): Promise<AdmissionResult>;
-  heartbeat(lease: CapacityLeaseHandle, expiresAt: Date): Promise<boolean>;
+  /** Extend an active lease relative to the authoritative database clock. */
+  heartbeat(lease: CapacityLeaseHandle, extensionMs: number): Promise<boolean>;
   release(lease: CapacityLeaseHandle): Promise<boolean>;
   terminalizeAttempt(
     attemptId: string,

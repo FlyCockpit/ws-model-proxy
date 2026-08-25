@@ -44,7 +44,7 @@ export function holdCapacityLeaseForResponse({
     if (finished || heartbeatRunning) return;
     heartbeatRunning = true;
     try {
-      const retained = await store.heartbeat(lease, new Date(Date.now() + leaseExtensionMs));
+      const retained = await store.heartbeat(lease, leaseExtensionMs);
       if (!retained) await loseLease(new Error("Capacity lease was lost while streaming."));
     } catch (error) {
       await loseLease(error);

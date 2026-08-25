@@ -76,6 +76,20 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     private readonly notifier?: CapacityNotifier,
   ) {}
 
+  async #notifyBestEffort(capacityIds: readonly string[]): Promise<void> {
+    if (!this.notifier || capacityIds.length === 0) return;
+    try {
+      await this.notifier.notify(capacityIds);
+    } catch (error) {
+      // Notifications are only latency hints. The durable transaction has
+      // already committed, so notifier failure must never change its outcome.
+      console.warn("[capacity] wake notification failed", {
+        errorClass: error instanceof Error ? error.name : "UnknownError",
+        capacityCount: capacityIds.length,
+      });
+    }
+  }
+
   async acquire(attempt: AdmissionAttempt, signal?: AbortSignal): Promise<AdmissionResult> {
     if (signal?.aborted) return { state: "CANCELLED" };
     const result = await this.#serializable(async (tx) => {
@@ -83,13 +97,26 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         where: { attemptId: attempt.attemptId },
         include: { Lease: true, Waiters: true },
       });
+      const capacityIds = [
+        ...new Set(
+          existing
+            ? existing.Waiters.filter((waiter) => waiter.state === "WAITING").map(
+                (waiter) => waiter.capacityId,
+              )
+            : attempt.candidates.map((candidate) => candidate.capacityId),
+        ),
+      ].sort();
+      if (existing?.Lease?.state === "ACTIVE" && !capacityIds.includes(existing.Lease.capacityId))
+        capacityIds.push(existing.Lease.capacityId);
+      capacityIds.sort();
+      for (const capacityId of capacityIds)
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacityId}, 0))`;
       const observedRows = await tx.$queryRaw<
         Array<{ now: Date }>
-      >`SELECT CURRENT_TIMESTAMP AS now`;
+      >`SELECT clock_timestamp() AS now`;
       const observedAt = observedRows[0]?.now;
       if (!observedAt) throw new Error("Database clock unavailable.");
       if (existing?.Lease?.state === "ACTIVE" && existing.Lease.expiresAt <= observedAt) {
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${existing.Lease.capacityId}, 0))`;
         const currentLease = await tx.capacityLease.findUniqueOrThrow({
           where: { id: existing.Lease.id },
         });
@@ -188,20 +215,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         }
       }
 
-      const capacityIds = [
-        ...new Set(
-          existing
-            ? existing.Waiters.filter(
-                (waiter) =>
-                  waiter.state === "WAITING" &&
-                  (waiter.deadlineAt === null || waiter.deadlineAt > observedAt),
-              ).map((waiter) => waiter.capacityId)
-            : attempt.candidates.map((candidate) => candidate.capacityId),
-        ),
-      ].sort();
-      for (const capacityId of capacityIds)
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacityId}, 0))`;
-      const now = new Date();
+      const now = observedAt;
       if (existing)
         await tx.admissionRequest.update({
           where: { id: existing.id },
@@ -270,7 +284,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         notify: capacityIds,
       };
     });
-    if (result.notify.length) await this.notifier?.notify(result.notify);
+    await this.#notifyBestEffort(result.notify);
     return result.result;
   }
 
@@ -556,10 +570,13 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     }
   }
 
-  async heartbeat(lease: CapacityLeaseHandle, expiresAt: Date): Promise<boolean> {
+  async heartbeat(lease: CapacityLeaseHandle, extensionMs: number): Promise<boolean> {
+    if (!Number.isFinite(extensionMs) || extensionMs <= 0)
+      throw new RangeError("Capacity lease extension must be a positive duration.");
+    const boundedExtensionMs = Math.min(extensionMs, 5 * 60_000);
     return this.#serializable(async (tx) => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${lease.capacityId}, 0))`;
-      const clockRows = await tx.$queryRaw<Array<{ now: Date }>>`SELECT CURRENT_TIMESTAMP AS now`;
+      const clockRows = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
       const now = clockRows[0]?.now;
       if (!now) throw new Error("Database clock unavailable.");
       const result = await tx.capacityLease.updateMany({
@@ -569,16 +586,18 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           state: "ACTIVE",
           expiresAt: { gt: now },
         },
-        data: { heartbeatAt: now, expiresAt },
+        data: { heartbeatAt: now, expiresAt: new Date(now.getTime() + boundedExtensionMs) },
       });
       return result.count === 1;
     });
   }
 
   async release(lease: CapacityLeaseHandle): Promise<boolean> {
-    const now = new Date();
     const released = await this.db.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${lease.capacityId}, 0))`;
+      const clockRows = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
+      const now = clockRows[0]?.now;
+      if (!now) throw new Error("Database clock unavailable.");
       const result = await tx.capacityLease.updateMany({
         where: { id: lease.leaseId, fencingToken: lease.fencingToken, state: "ACTIVE" },
         data: { state: "RELEASED", releasedAt: now, releaseReason: "released" },
@@ -602,7 +621,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       if (result.count) await this.#fillAvailable(tx, lease.capacityId, now);
       return result.count === 1;
     });
-    if (released) await this.notifier?.notify([lease.capacityId]);
+    if (released) await this.#notifyBestEffort([lease.capacityId]);
     return released;
   }
 
@@ -611,7 +630,6 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     state: "CANCELLED" | "EXPIRED",
   ): Promise<AdmissionTerminalizationResult> {
     const reason = state === "CANCELLED" ? "cancelled" : "deadline";
-    const now = new Date();
     const cancelled = await this.#serializable(async (tx) => {
       const request = await tx.admissionRequest.findUnique({
         where: { attemptId },
@@ -623,6 +641,9 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       const lockedCapacities = [...new Set(capacities)].sort();
       for (const capacityId of lockedCapacities)
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacityId}, 0))`;
+      const clockRows = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
+      const now = clockRows[0]?.now;
+      if (!now) throw new Error("Database clock unavailable.");
       const current = await tx.admissionRequest.findUniqueOrThrow({
         where: { id: request.id },
         include: { Lease: true },
@@ -661,7 +682,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         capacities: lockedCapacities,
       };
     });
-    if (cancelled.result.state === state) await this.notifier?.notify(cancelled.capacities);
+    if (cancelled.result.state === state) await this.#notifyBestEffort(cancelled.capacities);
     return cancelled.result;
   }
 
@@ -723,7 +744,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         return update;
       });
       reclaimed += result.count;
-      if (result.count) await this.notifier?.notify([lease.capacityId]);
+      if (result.count) await this.#notifyBestEffort([lease.capacityId]);
     }
     return reclaimed;
   }
@@ -810,7 +831,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       });
       if (swept.length) {
         sweptRequests++;
-        await this.notifier?.notify(swept);
+        await this.#notifyBestEffort(swept);
       }
     }
     return { requests: sweptRequests, leases: await this.reclaimExpired(now, limit) };

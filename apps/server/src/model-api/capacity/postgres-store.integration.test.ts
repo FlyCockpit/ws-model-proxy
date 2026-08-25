@@ -1,6 +1,6 @@
 import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
 import { PostgresNotificationListener } from "@ws-model-proxy/db/postgres-notifications";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { PRIORITY_CLASS_COUNT, scheduleWeightedDeficitRoundRobin } from "./scheduler.js";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
@@ -369,8 +369,13 @@ integration("PostgreSQL capacity admission primitives", () => {
         );
       const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
       const notifications: string[][] = [];
+      let rejectNotification = true;
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
       const firstManager = new PostgresCapacityAdmissionStore(db, "proof-server-a", {
-        notify: async (capacityIds) => void notifications.push([...capacityIds]),
+        notify: async (capacityIds) => {
+          if (rejectNotification) throw new Error("secret notifier detail");
+          notifications.push([...capacityIds]);
+        },
       });
       const secondClient = createPrismaClient(databaseUrl);
       const secondManager = new PostgresCapacityAdmissionStore(secondClient, "proof-server-b");
@@ -400,6 +405,12 @@ integration("PostgreSQL capacity admission primitives", () => {
         })),
       });
       expect(first.state).toBe("ADMITTED");
+      expect(warning).toHaveBeenCalledWith("[capacity] wake notification failed", {
+        errorClass: "Error",
+        capacityCount: 1,
+      });
+      expect(JSON.stringify(warning.mock.calls)).not.toContain("secret notifier detail");
+      rejectNotification = false;
       const waiters = await db.capacityWaiter.findMany({
         where: { AdmissionRequest: { attemptId: `attempt-1-${suffix}` } },
         orderBy: { candidateOrder: "asc" },
@@ -447,7 +458,12 @@ integration("PostgreSQL capacity admission primitives", () => {
       });
       expect(second.state).toBe("WAITING");
       if (first.state !== "ADMITTED") throw new Error("Expected first lease.");
+      rejectNotification = true;
       await expect(firstManager.release(first.lease)).resolves.toBe(true);
+      expect(
+        await db.capacityLease.findUniqueOrThrow({ where: { id: first.lease.leaseId } }),
+      ).toMatchObject({ state: "RELEASED", releaseReason: "released" });
+      rejectNotification = false;
       await expect(firstManager.release(first.lease)).resolves.toBe(false);
       const admittedSecond = await secondManager.acquire({
         requestId: `request-2-${suffix}`,
@@ -463,9 +479,7 @@ integration("PostgreSQL capacity admission primitives", () => {
       expect(admittedSecond.state).toBe("ADMITTED");
       if (admittedSecond.state === "ADMITTED") {
         expect(admittedSecond.lease.fencingToken).toBeGreaterThan(first.lease.fencingToken);
-        await expect(
-          firstManager.heartbeat(first.lease, new Date(Date.now() + 60_000)),
-        ).resolves.toBe(false);
+        await expect(firstManager.heartbeat(first.lease, 60_000)).resolves.toBe(false);
         await db.inferenceCapacity.update({
           where: { id: capacity.id },
           data: { hardConcurrencyLimit: 2 },
@@ -507,7 +521,14 @@ integration("PostgreSQL capacity admission primitives", () => {
         });
         // Waiter policy is an immutable enqueue-time snapshot. A policy edit
         // must not mutate an already queued attempt; retry with a new attempt.
-        await firstManager.cancelAttempt(lowAttempt.attemptId);
+        rejectNotification = true;
+        await expect(firstManager.cancelAttempt(lowAttempt.attemptId)).resolves.toBe(true);
+        expect(
+          await db.admissionRequest.findUniqueOrThrow({
+            where: { attemptId: lowAttempt.attemptId },
+          }),
+        ).toMatchObject({ state: "CANCELLED", terminalReason: "cancelled" });
+        rejectNotification = false;
         const retryLowAttempt = {
           ...lowAttempt,
           requestId: `request-low-retry-${suffix}`,
@@ -563,15 +584,13 @@ integration("PostgreSQL capacity admission primitives", () => {
         });
         const [reclaimed, heartbeatWon] = await Promise.all([
           firstManager.reclaimExpired(new Date(), 10),
-          secondManager.heartbeat(borrowed.lease, new Date(Date.now() + 60_000)),
+          secondManager.heartbeat(borrowed.lease, 60_000),
         ]);
         expect(heartbeatWon).toBe(reclaimed === 0);
         if (reclaimed > 0) expect(notifications.flat()).toContain(capacity.id);
         const releasedAfterRace = await firstManager.release(borrowed.lease);
         if (heartbeatWon) expect(releasedAfterRace).toBe(true);
-        await expect(
-          firstManager.heartbeat(borrowed.lease, new Date(Date.now() + 60_000)),
-        ).resolves.toBe(false);
+        await expect(firstManager.heartbeat(borrowed.lease, 60_000)).resolves.toBe(false);
 
         await db.inferenceCapacity.update({
           where: { id: capacity.id },
@@ -746,6 +765,7 @@ integration("PostgreSQL capacity admission primitives", () => {
           }),
         ).toBe(3);
       }
+      warning.mockRestore();
       await secondClient.$disconnect();
     } finally {
       await db.user.delete({ where: { id: user.id } }).catch(() => undefined);
@@ -936,13 +956,11 @@ integration("PostgreSQL capacity admission primitives", () => {
           });
           const [reclaimed, heartbeated] = await Promise.all([
             manager.reclaimExpired(new Date(), 1),
-            raceManager.heartbeat(admitted.lease, new Date(Date.now() + 60_000)),
+            raceManager.heartbeat(admitted.lease, 60_000),
           ]);
           expect([reclaimed, heartbeated]).toEqual(reclaimed === 1 ? [1, false] : [0, true]);
           if (heartbeated) await raceManager.release(admitted.lease);
-          await expect(
-            manager.heartbeat(admitted.lease, new Date(Date.now() + 60_000)),
-          ).resolves.toBe(false);
+          await expect(manager.heartbeat(admitted.lease, 60_000)).resolves.toBe(false);
         }
       } finally {
         await raceClient.$disconnect();
