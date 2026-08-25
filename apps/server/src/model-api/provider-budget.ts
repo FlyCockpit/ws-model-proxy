@@ -182,7 +182,9 @@ function canonicalPayloadHash(value: unknown): string {
       return Object.fromEntries(
         Object.entries(input as Record<string, unknown>)
           .filter(([, item]) => item !== undefined)
-          .sort(([left], [right]) => left.localeCompare(right))
+          // JSON object keys are UTF-16 strings. Compare code units directly so
+          // revision identity cannot vary with a replica's ICU locale.
+          .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
           .map(([key, item]) => [key, normalize(item)]),
       );
     return input;

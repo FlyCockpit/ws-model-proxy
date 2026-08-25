@@ -112,6 +112,12 @@ export async function expireProviderAttempts(now = new Date()): Promise<number> 
      WHERE attempt.state = 'ACTIVE'
        AND (attempt."expiresAt" <= ${now} OR attempt."heartbeatAt" < ${new Date(now.getTime() - 60_000)})
        AND NOT EXISTS (
+         SELECT 1 FROM provider_budget_reservation reservation
+          WHERE reservation."attemptId" = attempt."attemptId"
+            AND reservation."fencingToken" = attempt."fencingToken"
+            AND reservation.state = 'RESERVED'
+       )
+       AND NOT EXISTS (
          SELECT 1 FROM provider_usage_ledger ledger
           WHERE ledger."attemptId" = attempt."attemptId"
             AND ledger."fencingToken" = attempt."fencingToken"

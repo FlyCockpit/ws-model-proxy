@@ -1819,28 +1819,60 @@ export async function dispatchPublicOverflow(
         })();
         return reconciliation;
       };
+      let heldTerminalChunks: Uint8Array[] | undefined;
       const heldBody = new ReadableStream<Uint8Array>({
         async pull(controller) {
           let reachedEof = false;
           try {
-            const chunk = await reader.read();
-            if (chunk.done) {
-              reachedEof = true;
-              // Do not expose EOF until correctness-required settlement and
-              // health release are durable. Sequential Responses lifecycle
-              // calls issued immediately after body consumption must not race
-              // the preceding attempt's half-open claim.
-              await reconcile(response.complete);
-              if (response.complete || !httpOk) controller.close();
-              else
-                controller.error(new Error("Provider response ended before transport completion"));
-            } else {
+            while (true) {
+              const chunk = await reader.read();
+              if (chunk.done) {
+                reachedEof = true;
+                // Do not expose either a streaming terminal event or EOF until
+                // correctness-required settlement and health release are durable.
+                await reconcile(response.complete);
+                if (response.complete || !httpOk) {
+                  if (heldTerminalChunks) {
+                    const length = heldTerminalChunks.reduce(
+                      (total, item) => total + item.byteLength,
+                      0,
+                    );
+                    const terminal = new Uint8Array(length);
+                    let offset = 0;
+                    for (const item of heldTerminalChunks) {
+                      terminal.set(item, offset);
+                      offset += item.byteLength;
+                    }
+                    heldTerminalChunks = undefined;
+                    controller.enqueue(terminal);
+                  } else controller.close();
+                } else
+                  controller.error(
+                    new Error("Provider response ended before transport completion"),
+                  );
+                return;
+              }
               responseBytes += chunk.value.byteLength;
               // Retain the bounded tail, not merely the prefix. Streaming APIs
               // report authoritative usage in terminal events, which may occur
               // after arbitrarily large content deltas.
               usageBytes = retainProviderUsageTail(usageChunks, usageBytes, chunk.value);
+              if (heldTerminalChunks) {
+                heldTerminalChunks.push(chunk.value);
+                continue;
+              }
+              if (
+                request.stream &&
+                providerStreamHasTerminalUsageEvent(
+                  usageChunks,
+                  nativeSurface ?? request.requestedSurface,
+                )
+              ) {
+                heldTerminalChunks = [chunk.value];
+                continue;
+              }
               controller.enqueue(chunk.value);
+              return;
             }
           } catch (error) {
             controller.error(error);
