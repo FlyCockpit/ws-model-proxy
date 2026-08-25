@@ -398,21 +398,6 @@ export async function admitProviderBudget(
       throw new ProviderBudgetConfigurationError(
         "Provider reservation expiry is not in the future",
       );
-    if (hasCostIdentity) {
-      const pricing = await tx.providerPricingVersion.findFirst({
-        where: {
-          userId: attempt.userId,
-          providerAccountId: attempt.providerAccountId,
-          providerModelId: attempt.providerModelId,
-          version: pricingVersion,
-          currency,
-          effectiveAt: { lte: now },
-          OR: [{ retiredAt: null }, { retiredAt: { gt: now } }],
-        },
-        select: { id: true },
-      });
-      if (!pricing) throw new ProviderBudgetConfigurationError("Pricing identity is unavailable");
-    }
     const existing = await tx.providerBudgetReservation.findMany({
       where: { attemptId: attempt.attemptId },
       orderBy: { id: "asc" },

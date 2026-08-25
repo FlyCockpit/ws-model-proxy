@@ -756,6 +756,7 @@ export const providerManagementRouter = {
       )
         throw new ORPCError("BAD_REQUEST");
       return prisma.$transaction(async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-account:${userId}:${input.providerAccountId}`}, 0))`;
         await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
         const account = await tx.providerAccount.findFirst({
           where: { id: input.providerAccountId, userId, deletedAt: null },
@@ -824,6 +825,7 @@ export const providerManagementRouter = {
       if (!current) throw missing();
       return prisma.$transaction(
         async (tx) => {
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-account:${userId}:${current.providerAccountId}`}, 0))`;
           await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${current.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
           await tx.$queryRaw`SELECT id FROM provider_budget_policy WHERE id = ${current.id} AND "userId" = ${userId} FOR UPDATE`;
           const locked = await tx.providerBudgetPolicy.findFirst({
@@ -894,6 +896,7 @@ export const providerManagementRouter = {
       if (!current) throw missing();
       await prisma.$transaction(
         async (tx) => {
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-account:${userId}:${current.providerAccountId}`}, 0))`;
           await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${current.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
           await tx.$queryRaw`SELECT id FROM provider_budget_policy WHERE id = ${current.id} AND "userId" = ${userId} FOR UPDATE`;
           const locked = await tx.providerBudgetPolicy.findFirst({
