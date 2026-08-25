@@ -30,6 +30,20 @@ const providerWriteTransaction = {
   maxWait: 5_000,
   timeout: 10_000,
 } as const;
+function inventoryProtocolForProviderType(providerType: string) {
+  return ["anthropic", "anthropic-compatible"].includes(providerType.trim().toLowerCase())
+    ? ("anthropic-compatible" as const)
+    : ("openai-compatible" as const);
+}
+function assertInventoryMatchesProviderType(
+  providerType: string,
+  inventory: z.infer<typeof openAiCompatibleCapabilitiesSchema> | null | undefined,
+) {
+  if (inventory && inventory.protocol !== inventoryProtocolForProviderType(providerType))
+    throw new ORPCError("BAD_REQUEST", {
+      message: "Capability inventory protocol does not match provider type.",
+    });
+}
 const ring = () => {
   if (!env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS)
     throw new ORPCError("PRECONDITION_FAILED", {
@@ -486,9 +500,10 @@ export const providerManagementRouter = {
       await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
       const account = await tx.providerAccount.findFirst({
         where: { id: input.providerAccountId, userId, deletedAt: null },
-        select: { id: true },
+        select: { id: true, providerType: true },
       });
       if (!account) throw missing();
+      assertInventoryMatchesProviderType(account.providerType, input.nativeCapabilities);
       const row = await tx.providerModel.create({
         data: {
           ...input,
@@ -532,9 +547,10 @@ export const providerManagementRouter = {
         if (!current) throw missing();
         const account = await tx.providerAccount.findFirst({
           where: { id: current.providerAccountId, userId, deletedAt: null },
-          select: { id: true },
+          select: { id: true, providerType: true },
         });
         if (!account) throw missing();
+        assertInventoryMatchesProviderType(account.providerType, data.nativeCapabilities);
         const row = await tx.providerModel.update({
           where: { id: modelId },
           data: data as Prisma.ProviderModelUpdateInput,

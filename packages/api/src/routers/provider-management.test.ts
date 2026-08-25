@@ -45,6 +45,7 @@ const db = prisma as unknown as {
   providerModel: {
     count: MockInstance;
     create: MockInstance;
+    findMany: MockInstance;
     findFirst: MockInstance;
     update: MockInstance;
     updateMany: MockInstance;
@@ -373,7 +374,7 @@ describe("providerManagementRouter security boundary", () => {
     envMock.enabled = true;
     db.$queryRaw.mockResolvedValue([]);
     db.providerModel.findFirst.mockResolvedValue({ id: "model", providerAccountId: "account" });
-    db.providerAccount.findFirst.mockResolvedValue({ id: "account" });
+    db.providerAccount.findFirst.mockResolvedValue({ id: "account", providerType: "openai" });
     db.providerModel.update.mockResolvedValue({ id: "model" });
     db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
     const nativeCapabilities = {
@@ -405,6 +406,78 @@ describe("providerManagementRouter security boundary", () => {
       data: { nativeCapabilities },
       select: expect.any(Object),
     });
+  });
+
+  it("rejects create and update inventories whose protocol disagrees with provider type", async () => {
+    envMock.enabled = true;
+    db.$queryRaw.mockResolvedValue([]);
+    db.providerAccount.findFirst.mockResolvedValue({ id: "account", providerType: "anthropic" });
+    db.providerModel.findFirst.mockResolvedValue({ id: "model", providerAccountId: "account" });
+    const nativeCapabilities = {
+      version: 4 as const,
+      protocol: "openai-compatible" as const,
+      surfaces: {
+        openaiResponses: {
+          source: "dashboard" as const,
+          confidence: "exact" as const,
+          operations: ["create" as const],
+        },
+      },
+    };
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(
+      client.createModel({
+        providerAccountId: "account",
+        upstreamModelId: "model",
+        nativeCapabilities,
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    await expect(client.updateModel({ id: "model", nativeCapabilities })).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+    });
+    expect(db.providerModel.create).not.toHaveBeenCalled();
+    expect(db.providerModel.update).not.toHaveBeenCalled();
+  });
+
+  it("creates, reads, updates, and clears an owner capability inventory", async () => {
+    envMock.enabled = true;
+    db.$queryRaw.mockResolvedValue([]);
+    db.providerAccount.findFirst.mockResolvedValue({ id: "account", providerType: "openai" });
+    const nativeCapabilities = {
+      version: 4 as const,
+      protocol: "openai-compatible" as const,
+      surfaces: {
+        openaiResponses: {
+          source: "dashboard" as const,
+          confidence: "exact" as const,
+          operations: ["create" as const, "retrieve" as const],
+        },
+      },
+    };
+    db.providerModel.create.mockResolvedValue({ id: "model", nativeCapabilities });
+    db.executionTarget.create.mockResolvedValue({ id: "target" });
+    db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
+    const client = createRouterClient(providerManagementRouter, { context });
+    await client.createModel({
+      providerAccountId: "account",
+      upstreamModelId: "model",
+      nativeCapabilities,
+    });
+    expect(db.providerModel.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ nativeCapabilities }) }),
+    );
+
+    db.providerModel.findMany.mockResolvedValue([{ id: "model", nativeCapabilities }]);
+    await expect(client.listModels({ providerAccountId: "account" })).resolves.toEqual([
+      { id: "model", nativeCapabilities },
+    ]);
+
+    db.providerModel.findFirst.mockResolvedValue({ id: "model", providerAccountId: "account" });
+    db.providerModel.update.mockResolvedValue({ id: "model", nativeCapabilities: null });
+    await client.updateModel({ id: "model", nativeCapabilities: null });
+    expect(db.providerModel.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { nativeCapabilities: null } }),
+    );
   });
 
   it("creates owner-scoped draft pricing with explicit accounting rules and audit", async () => {

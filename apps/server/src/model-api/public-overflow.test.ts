@@ -17,6 +17,7 @@ import {
   claimPublicProviderCredentialForSend,
   conservativeProviderLiability,
   conservativeSerializedInputTokens,
+  exactResponsesNativeSurface,
   matchesExactResponsesBinding,
   parseProviderUsage,
   providerHealthOutcome,
@@ -35,6 +36,41 @@ const request = {
 };
 
 describe("public overflow compatibility", () => {
+  it("fails closed when a v1-v4 inventory protocol disagrees with the provider account", () => {
+    const target = {
+      contextWindow: 1_000,
+      maxOutputTokens: 100,
+      protocol: "anthropic" as const,
+      nativeProtocols: ["openai" as const],
+      nativeSurfaces: ["openai-chat" as const],
+      supportsStreaming: false,
+      supportedFeatures: [],
+    };
+    for (const capabilityInventory of [
+      { version: 1 as const, protocol: "openai-compatible" as const },
+      { version: 2 as const, protocol: "openai-compatible" as const },
+      {
+        version: 3 as const,
+        protocol: "openai-compatible" as const,
+        surfaces: {},
+      },
+      {
+        version: 4 as const,
+        protocol: "openai-compatible" as const,
+        surfaces: {
+          openaiChatCompletions: {
+            source: "provider" as const,
+            confidence: "exact" as const,
+            operations: ["create" as const],
+          },
+        },
+      },
+    ])
+      expect(publicTargetCompatibility({ ...target, capabilityInventory }, request)).toBe(
+        "PROTOCOL_UNAVAILABLE",
+      );
+  });
+
   it("decodes v1-v3 inventories through the shared resolver and fails closed per surface", () => {
     const inventories = [
       {
@@ -249,6 +285,80 @@ describe("public overflow compatibility", () => {
     ]) {
       expect(matchesExactResponsesBinding({ ...target, ...changed }, binding)).toBe(false);
     }
+  });
+
+  it("routes lifecycle-only Responses operations only through their exact native binding", () => {
+    const capabilityInventory = {
+      version: 4 as const,
+      protocol: "openai-compatible" as const,
+      surfaces: {
+        openaiResponses: {
+          source: "provider" as const,
+          confidence: "exact" as const,
+          operations: [
+            "retrieve" as const,
+            "delete" as const,
+            "cancel" as const,
+            "listInputItems" as const,
+            "countTokens" as const,
+            "compact" as const,
+          ],
+        },
+      },
+    };
+    const target = {
+      executionTargetId: "execution-target",
+      providerAccountId: "account",
+      providerModelId: "provider-model",
+      endpointIdentity: "https://api.example/v1",
+      endpointVersion: 7,
+      upstreamModelId: "gpt-response",
+      nativeSurfaces: [],
+      protocol: "openai" as const,
+      capabilityInventory,
+      contextWindow: 1_000,
+      maxOutputTokens: 100,
+      nativeProtocols: ["openai" as const],
+      supportsStreaming: false,
+      supportedFeatures: [],
+    };
+    const binding = {
+      executionTargetId: "execution-target",
+      providerAccountId: "account",
+      providerModelId: "provider-model",
+      endpointIdentity: "https://api.example/v1",
+      endpointVersion: 7,
+      upstreamModelId: "gpt-response",
+    };
+    expect(matchesExactResponsesBinding(target, binding)).toBe(true);
+    expect(exactResponsesNativeSurface(target)).toBe("openai-responses");
+    for (const [method, path] of [
+      ["GET", "/v1/responses/response"],
+      ["DELETE", "/v1/responses/response"],
+      ["POST", "/v1/responses/response/cancel"],
+      ["GET", "/v1/responses/response/input_items"],
+      ["POST", "/v1/responses/count_tokens"],
+      ["POST", "/v1/responses/response/compact"],
+    ] as const)
+      expect(
+        publicTargetCompatibility(target, {
+          ...request,
+          requestedSurface: "openai-responses",
+          method,
+          path,
+        }),
+      ).toBe("COMPATIBLE");
+    expect(
+      publicTargetCompatibility(target, {
+        ...request,
+        requestedSurface: "openai-responses",
+        method: "POST",
+        path: "/v1/responses",
+      }),
+    ).toBe("PROTOCOL_UNAVAILABLE");
+    expect(matchesExactResponsesBinding({ ...target, providerModelId: "other" }, binding)).toBe(
+      false,
+    );
   });
   it("treats ordinary client errors as health-neutral and 429 as failure", () => {
     expect(providerHealthOutcome(200)).toBe("SUCCESS");

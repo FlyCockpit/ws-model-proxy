@@ -98,9 +98,9 @@ describe("surface capability resolution", () => {
         },
       },
     });
-    expect(surfaceAvailabilityMatrix({ capabilities: lifecycleOnly }).OPENAI_RESPONSES.mode).toBe(
-      "unavailable",
-    );
+    expect(
+      surfaceAvailabilityMatrix({ capabilities: lifecycleOnly }).OPENAI_RESPONSES,
+    ).toMatchObject({ mode: "unavailable", lifecycleOperations: ["retrieve"] });
     expect(
       resolveExecutionPath({
         capabilities: lifecycleOnly,

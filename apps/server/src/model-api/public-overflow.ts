@@ -206,6 +206,17 @@ export function orderChatTestProviderTargets<
   ];
 }
 
+export function exactResponsesNativeSurface(
+  target: Pick<PublicProviderTarget, "nativeSurfaces" | "capabilityInventory" | "protocol">,
+): "openai-responses" | undefined {
+  if (target.protocol !== "openai") return undefined;
+  if (target.nativeSurfaces.includes("openai-responses")) return "openai-responses";
+  return target.capabilityInventory?.version === 4 &&
+    target.capabilityInventory.surfaces.openaiResponses !== undefined
+    ? "openai-responses"
+    : undefined;
+}
+
 export function matchesExactResponsesBinding(
   target: Pick<
     PublicProviderTarget,
@@ -228,8 +239,7 @@ export function matchesExactResponsesBinding(
     target.endpointIdentity === binding.endpointIdentity &&
     target.endpointVersion === binding.endpointVersion &&
     target.upstreamModelId === binding.upstreamModelId &&
-    target.nativeSurfaces.includes("openai-responses") &&
-    target.protocol === "openai"
+    exactResponsesNativeSurface(target) === "openai-responses"
   );
 }
 
@@ -352,6 +362,8 @@ export function publicTargetCompatibility(
   > &
     Partial<Pick<PublicOverflowRequest, "path" | "headers" | "method">>,
 ): "COMPATIBLE" | "CONTEXT_UNKNOWN" | "CONTEXT_EXCEEDED" | "PROTOCOL_UNAVAILABLE" {
+  if (!inventoryMatchesProtocol(target.capabilityInventory, target.protocol))
+    return "PROTOCOL_UNAVAILABLE";
   const requestedOutputTokens =
     request.requestedOutputTokens ??
     (target.maxOutputTokens === null ? undefined : BigInt(target.maxOutputTokens));
@@ -457,9 +469,18 @@ export type PublicOverflowResult =
 
 function targetProtocol(providerType: string): ProviderProtocol | null {
   const normalized = providerType.trim().toLowerCase();
-  if (normalized === "anthropic") return "anthropic";
-  if (normalized === "openai" || normalized === "openai-compatible") return "openai";
-  return null;
+  if (normalized === "anthropic" || normalized === "anthropic-compatible") return "anthropic";
+  return "openai";
+}
+
+function inventoryMatchesProtocol(
+  inventory: OpenAiCompatibleCapabilities | null | undefined,
+  protocol: ProviderProtocol,
+) {
+  if (!inventory) return true;
+  return (
+    inventory.protocol === (protocol === "anthropic" ? "anthropic-compatible" : "openai-compatible")
+  );
 }
 
 function nativeProtocols(value: unknown): ProviderProtocol[] {
@@ -621,11 +642,13 @@ export async function listPublicOverflowTargets(
     const account = model?.ProviderAccount;
     const credential = account?.CurrentCredential;
     const protocol = account ? targetProtocol(account.providerType) : null;
+    const capabilityInventory = parseOpenAiCompatibleCapabilities(model?.nativeCapabilities);
     if (
       !model ||
       !account ||
       !credential ||
       !protocol ||
+      !inventoryMatchesProtocol(capabilityInventory, protocol) ||
       (memberTier === "PUBLIC_OVERFLOW" && member.publicOrder == null) ||
       model.userId !== userId ||
       account.userId !== userId ||
@@ -667,7 +690,7 @@ export async function listPublicOverflowTargets(
         nativeSurfaces: nativeSurfaces(model.nativeCapabilities),
         supportsStreaming: supportsStreaming(model.nativeCapabilities),
         supportedFeatures: supportedFeatures(model.nativeCapabilities),
-        capabilityInventory: parseOpenAiCompatibleCapabilities(model.nativeCapabilities),
+        capabilityInventory,
         credential,
       } satisfies PublicProviderTarget,
     ];
@@ -1491,9 +1514,7 @@ export async function dispatchPublicOverflow(
   );
   for (const [rankedIndex, target] of rankedTargets.entries()) {
     const nativeSurface = binding
-      ? target.nativeSurfaces.includes("openai-responses")
-        ? "openai-responses"
-        : undefined
+      ? exactResponsesNativeSurface(target)
       : selectedProviderSurface(target, request.requestedSurface, request.chatTestRoutingMode);
     if (!nativeSurface) continue;
     attemptCount += 1;

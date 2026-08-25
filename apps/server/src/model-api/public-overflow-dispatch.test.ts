@@ -189,6 +189,29 @@ function dispatchPoolFixture(
   };
 }
 
+it("excludes protocol-mismatched legacy inventories from PRIMARY before egress", async () => {
+  const fixture = dispatchPoolFixture();
+  const model = fixture.PoolMembers[0]!.ExecutionTarget.ProviderModel;
+  model.ProviderAccount.providerType = "anthropic";
+  Object.assign(model, {
+    nativeCapabilities: {
+      version: 3,
+      protocol: "openai-compatible",
+      surfaces: {
+        openaiChatCompletions: {
+          source: "provider",
+          confidence: "exact",
+          supported: true,
+        },
+      },
+    },
+  });
+  db.modelPool.findFirst.mockResolvedValue(fixture);
+  const listed = await listPublicOverflowTargets("owner", "pool", "PRIMARY");
+  expect(listed.targets).toEqual([]);
+  expect(providerHttpsRequest).not.toHaveBeenCalled();
+});
+
 describe("public overflow terminal response dispatch", () => {
   it("ranks only overflow-eligible providers and uses immutable pricing, health, and load penalties", async () => {
     const fixture = dispatchPoolFixture();

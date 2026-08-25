@@ -270,21 +270,21 @@ export function surfaceAvailabilityMatrix({
   const result = {} as Record<ModelApiSurface, SurfaceAvailability>;
   for (const requested of modelApiSurfaces) {
     const native = capabilities ? nativeFeatures(capabilities, requested) : undefined;
+    const lifecycleOperations =
+      requested === "OPENAI_RESPONSES"
+        ? (
+            [
+              "statefulFollowUps",
+              "retrieve",
+              "delete",
+              "cancel",
+              "listInputItems",
+              "countTokens",
+              "compact",
+            ] as const
+          ).filter((operation) => native?.responsesLifecycle?.[operation] === true)
+        : undefined;
     if (native?.supported === true) {
-      const lifecycleOperations =
-        requested === "OPENAI_RESPONSES"
-          ? (
-              [
-                "statefulFollowUps",
-                "retrieve",
-                "delete",
-                "cancel",
-                "listInputItems",
-                "countTokens",
-                "compact",
-              ] as const
-            ).filter((operation) => native.responsesLifecycle?.[operation] === true)
-          : undefined;
       result[requested] = {
         mode: "native",
         nativeSurface: requested,
@@ -322,8 +322,14 @@ export function surfaceAvailabilityMatrix({
             "native_extensions_unavailable",
             ...(lacksAnthropicInitialUsage ? ["anthropic_initial_usage_unavailable"] : []),
           ],
+          ...(lifecycleOperations?.length ? { lifecycleOperations } : {}),
         }
-      : { mode: "unavailable", streaming: false, limitations: ["surface_unavailable"] };
+      : {
+          mode: "unavailable",
+          streaming: false,
+          limitations: ["surface_unavailable"],
+          ...(lifecycleOperations?.length ? { lifecycleOperations } : {}),
+        };
   }
   return result;
 }
