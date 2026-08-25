@@ -46,6 +46,7 @@ const requiredFragments = [
   "UPDATE response_stickiness_record",
   "UPDATE relay_request",
   "provider_credential_one_active_per_account",
+  "enforce_provider_credential_immutable_identity",
   "enforce_provider_account_endpoint_and_auth",
   "enforce_provider_credential_account_consistency",
   "enforce_provider_budget_graph_consistency",
@@ -582,6 +583,28 @@ try {
      WHERE id = 'provider-account-a';
   `);
   await client.query("COMMIT");
+  for (const mutation of [
+    `id = 'credential-a-renamed'`,
+    `"userId" = 'owner-b'`,
+    `"providerAccountId" = 'missing-account'`,
+    `"credentialType" = 'API_KEY'`,
+    `"aadVersion" = 2`,
+  ]) {
+    await expectConstraintFailure(
+      `UPDATE provider_credential SET ${mutation} WHERE id = 'credential-a'`,
+      "55000",
+    );
+  }
+  // Cipher material and operational timestamps are deliberately mutable so
+  // key rotation and usage tracking remain possible without changing the AAD.
+  await client.query(`
+    UPDATE provider_credential
+       SET "keyVersion" = 'v2', ciphertext = decode('0a', 'hex'),
+           nonce = decode('0a0000000000000000000000', 'hex'),
+           "authTag" = decode('01000000000000000000000000000000', 'hex'),
+           "displaySuffix" = 'next', "lastUsedAt" = NOW()
+     WHERE id = 'credential-a'
+  `);
   await expectConstraintFailure(`
     UPDATE provider_account SET "currentCredentialId" = NULL
      WHERE id = 'provider-account-a'
@@ -632,6 +655,26 @@ try {
        SET status = 'REPLACED', "replacedAt" = NOW(), "replacedById" = 'credential-c-revoked'
      WHERE id = 'credential-a'
   `);
+  // A valid same-account replacement lifecycle remains allowed by both the
+  // immutable-AAD trigger and the deferred graph constraints.
+  await client.query("BEGIN");
+  await client.query(`
+    UPDATE provider_credential SET status = 'REVOKED', "revokedAt" = NOW()
+     WHERE id = 'credential-a';
+    INSERT INTO provider_credential
+      (id, "createdAt", "userId", "providerAccountId", "credentialType", "keyVersion",
+       ciphertext, nonce, "authTag", "displaySuffix")
+    VALUES ('credential-a-next', NOW(), 'owner-a', 'provider-account-a', 'BEARER', 'v2',
+      decode('06', 'hex'), decode('050000000000000000000000', 'hex'),
+      decode('00000000000000000000000000000000', 'hex'), 'next');
+    UPDATE provider_credential
+       SET status = 'REPLACED', "replacedAt" = NOW(), "replacedById" = 'credential-a-next',
+           "revokedAt" = NULL
+     WHERE id = 'credential-a';
+    UPDATE provider_account SET "currentCredentialId" = 'credential-a-next'
+     WHERE id = 'provider-account-a';
+  `);
+  await client.query("COMMIT");
   await expectConstraintFailure(`
     INSERT INTO provider_budget_policy
       (id, "createdAt", "updatedAt", "userId", "scopeType", "providerAccountId", "poolId", "providerModelId")

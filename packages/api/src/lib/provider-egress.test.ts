@@ -34,15 +34,23 @@ describe("provider egress policy", () => {
     "fc00::1",
     "ff02::1",
     "2001:db8::1",
+    "2001:2::1",
     "3fff::1",
     "100::1",
     "64:ff9b:1::1",
+    "64:ff9b::7f00:1",
+    "64:ff9b::a9fe:a9fe",
   ])("recognizes special IPv6 spelling %s", (address) => {
     expect(isPrivateOrSpecialAddress(address)).toBe(true);
   });
-  it.each(["8.8.8.8", "93.184.216.34", "2001:4860:4860::8888", "2606:4700:4700::1111"])(
-    "allows globally routable address %s",
-    (address) => expect(isPrivateOrSpecialAddress(address)).toBe(false),
+  it.each([
+    "8.8.8.8",
+    "93.184.216.34",
+    "2001:4860:4860::8888",
+    "2606:4700:4700::1111",
+    "64:ff9b::808:808",
+  ])("allows globally routable address %s", (address) =>
+    expect(isPrivateOrSpecialAddress(address)).toBe(false),
   );
   it("requires HTTPS, forbids URL credentials, and rejects literal private targets", () => {
     const policy = { allowPrivateNetworks: false };

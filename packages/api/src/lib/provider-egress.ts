@@ -114,10 +114,18 @@ export function isPrivateOrSpecialAddress(address: string): boolean {
       const embedded = `${bytes[12]}.${bytes[13]}.${bytes[14]}.${bytes[15]}`;
       return isPrivateOrSpecialAddress(embedded);
     }
+    // The well-known NAT64 prefix is globally routable, but the last 32 bits
+    // still identify the effective IPv4 destination. Permit public synthesis
+    // while preventing translation from bypassing the IPv4 deny ranges.
+    if (bytesInPrefix(bytes, prefix(0x00, 0x64, 0xff, 0x9b), 96)) {
+      const embedded = `${bytes[12]}.${bytes[13]}.${bytes[14]}.${bytes[15]}`;
+      return isPrivateOrSpecialAddress(embedded);
+    }
     return (
       bytesInPrefix(bytes, prefix(0x00), 8) || // reserved low addresses
       bytesInPrefix(bytes, prefix(0x01, 0x00), 64) || // discard-only
-      bytesInPrefix(bytes, prefix(0x20, 0x01, 0x00), 23) || // IETF assignments
+      bytesInPrefix(bytes, prefix(0x20, 0x01, 0x00, 0x02), 48) || // benchmarking
+      bytesInPrefix(bytes, prefix(0x20, 0x01, 0x00), 23) || // other IETF assignments
       bytesInPrefix(bytes, prefix(0x20, 0x01, 0x0d, 0xb8), 32) || // documentation
       bytesInPrefix(bytes, prefix(0x20, 0x02), 16) || // deprecated 6to4
       bytesInPrefix(bytes, prefix(0x3f, 0xff), 20) || // documentation
