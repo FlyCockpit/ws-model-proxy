@@ -36,11 +36,20 @@ const db = prisma as unknown as {
   $transaction: MockInstance;
   $queryRaw: MockInstance;
   providerAccount: {
+    create: MockInstance;
     findMany: MockInstance;
     findFirst: MockInstance;
     update: MockInstance;
     updateMany: MockInstance;
   };
+  providerModel: {
+    create: MockInstance;
+    findFirst: MockInstance;
+    update: MockInstance;
+    updateMany: MockInstance;
+  };
+  executionTarget: { create: MockInstance };
+  modelPool: { findFirst: MockInstance };
   providerCredential: {
     count: MockInstance;
     create: MockInstance;
@@ -49,6 +58,7 @@ const db = prisma as unknown as {
   };
   providerAuditEvent: { create: MockInstance; findMany: MockInstance };
   providerBudgetPolicy: {
+    create: MockInstance;
     findMany: MockInstance;
     findFirst: MockInstance;
     updateMany: MockInstance;
@@ -119,6 +129,77 @@ describe("providerManagementRouter security boundary", () => {
     >;
     await expect(client.listAccounts()).rejects.toMatchObject({ code: "NOT_FOUND" });
     expect(db.providerAccount.findMany).not.toHaveBeenCalled();
+  });
+
+  it("rechecks the locked account inside createModel and loses a race with account deletion", async () => {
+    envMock.enabled = true;
+    db.$queryRaw.mockResolvedValue([]);
+    db.providerAccount.findFirst.mockResolvedValue(null);
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(
+      client.createModel({
+        providerAccountId: "deleted-account",
+        upstreamModelId: "model",
+        enabled: false,
+      }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(db.$queryRaw).toHaveBeenCalledOnce();
+    expect(db.providerModel.create).not.toHaveBeenCalled();
+    expect(db.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+      isolationLevel: "Serializable",
+      maxWait: 5_000,
+      timeout: 10_000,
+    });
+  });
+
+  it("locks the owning account first and denies updateModel after account deletion", async () => {
+    envMock.enabled = true;
+    db.$queryRaw.mockResolvedValue([]);
+    db.providerModel.findFirst.mockResolvedValue(null);
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(client.updateModel({ id: "model", enabled: true })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
+    expect(db.$queryRaw).toHaveBeenCalledOnce();
+    expect(db.providerModel.update).not.toHaveBeenCalled();
+    expect(db.providerAccount.findFirst).not.toHaveBeenCalled();
+  });
+
+  it("denies a budget policy whose model is deleted or belongs to another account", async () => {
+    envMock.enabled = true;
+    db.$queryRaw.mockResolvedValue([{ id: "account" }]);
+    db.providerAccount.findFirst.mockResolvedValue({ id: "account" });
+    db.providerModel.findFirst.mockResolvedValue(null);
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(
+      client.createBudgetPolicy({
+        scopeType: "POOL_PROVIDER_MODEL",
+        providerAccountId: "account",
+        providerModelId: "foreign-or-deleted-model",
+        poolId: "pool",
+        active: false,
+        rules: [
+          {
+            metric: "CONCURRENCY",
+            period: "PER_ATTEMPT",
+            mode: "LIMITED",
+            limitValue: "1",
+            currency: null,
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(db.providerModel.findFirst).toHaveBeenCalledWith({
+      where: expect.objectContaining({
+        id: "foreign-or-deleted-model",
+        userId: "owner",
+        providerAccountId: "account",
+        deletedAt: null,
+      }),
+      select: { id: true },
+    });
+    expect(db.modelPool.findFirst).not.toHaveBeenCalled();
+    expect(db.providerBudgetPolicy.create).not.toHaveBeenCalled();
   });
 
   it("owner-scopes audit history and never returns credential envelopes", async () => {
@@ -284,6 +365,13 @@ describe("providerManagementRouter security boundary", () => {
     });
     expect(JSON.stringify(audit)).not.toContain("super-secret-value");
     expect(JSON.stringify(audit)).not.toContain("provider.example");
+    expect(egressMock.request).toHaveBeenLastCalledWith(
+      "https://provider.example/v1",
+      { method: "GET", headers: { accept: "application/json" } },
+      expect.objectContaining({ egressEnabled: true }),
+      "openai",
+      { type: "BEARER", token: "super-secret-value" },
+    );
 
     egressMock.request.mockRejectedValueOnce(new Error("provider.example super-secret-value"));
     await expect(client.testCredential({ providerAccountId: "account" })).rejects.toMatchObject({

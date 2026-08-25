@@ -20,6 +20,60 @@ afterEach(async () => {
 });
 
 describe("provider egress policy", () => {
+  it.each([
+    [{ type: "API_KEY", apiKey: "key", token: "also-present" }],
+    [{ type: "BEARER", token: "token", apiKey: "also-present" }],
+    [{ type: "NONE" }],
+  ])("rejects malformed or ambiguous provider auth at runtime", async (auth) => {
+    await expect(
+      providerHttpsRequest(
+        "http://127.0.0.1:1",
+        { method: "GET" },
+        { allowPrivateNetworks: true, egressEnabled: true },
+        "openai",
+        auth as never,
+      ),
+    ).rejects.toThrow("Provider request failed");
+  });
+
+  it.each([
+    [
+      { type: "API_KEY", apiKey: "api-secret" } as const,
+      { accept: "application/json", "x-api-key": "api-secret" },
+    ],
+    [
+      { type: "BEARER", token: "bearer-secret" } as const,
+      { accept: "application/json", authorization: "Bearer bearer-secret" },
+    ],
+  ])("emits exactly the selected provider authentication headers", async (auth, expected) => {
+    let observed: Record<string, string | string[] | undefined> = {};
+    const server = createServer((request, response) => {
+      observed = request.headers;
+      response.writeHead(204);
+      response.end();
+    });
+    servers.push(server);
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server did not bind");
+    const response = await providerHttpsRequest(
+      `http://127.0.0.1:${address.port}`,
+      {
+        method: "GET",
+        headers: { accept: "application/json", authorization: "inbound", "x-api-key": "inbound" },
+      },
+      { allowPrivateNetworks: true, egressEnabled: true },
+      "openai",
+      auth,
+    );
+    response.resume();
+    expect(observed.accept).toBe(expected.accept);
+    expect(observed.authorization).toBe(expected.authorization);
+    expect(observed["x-api-key"]).toBe(expected["x-api-key"]);
+    expect(observed.cookie).toBeUndefined();
+  });
+
   it.each(["127.0.0.1", "10.1.2.3", "169.254.169.254", "192.168.1.1", "::1", "fd00::1"])(
     "recognizes private address %s",
     (address) => expect(isPrivateOrSpecialAddress(address)).toBe(true),
@@ -144,6 +198,7 @@ describe("provider egress policy", () => {
         { method: "GET" },
         { allowPrivateNetworks: true, egressEnabled: true, timeoutMs: 500 },
         "openai",
+        { type: "NONE", purpose: "UNAUTHENTICATED_PROBE" },
       ),
     ).rejects.toThrow("Provider request failed");
   });
@@ -160,6 +215,7 @@ describe("provider egress policy", () => {
         { method: "GET" },
         { allowPrivateNetworks: true, egressEnabled: true, timeoutMs: 20 },
         "anthropic",
+        { type: "NONE", purpose: "UNAUTHENTICATED_PROBE" },
       ),
     ).rejects.toThrow("Provider request failed");
   });
@@ -170,6 +226,7 @@ describe("provider egress policy", () => {
         { method: "GET" },
         { allowPrivateNetworks: false },
         "openai",
+        { type: "NONE", purpose: "UNAUTHENTICATED_PROBE" },
       ),
     ).rejects.toThrow("Provider request failed");
   });

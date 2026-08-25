@@ -24,6 +24,11 @@ const policy = () => ({
   allowPrivateNetworks: env.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS,
   egressEnabled: env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
 });
+const providerWriteTransaction = {
+  isolationLevel: "Serializable" as const,
+  maxWait: 5_000,
+  timeout: 10_000,
+} as const;
 const ring = () => {
   if (!env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS)
     throw new ORPCError("PRECONDITION_FAILED", {
@@ -215,13 +220,19 @@ export const providerManagementRouter = {
   deleteAccount: protectedProcedure.input(z.object({ id })).handler(async ({ input, context }) => {
     enabled();
     const userId = context.session.user.id;
-    await accountFor(userId, input.id);
     const now = new Date();
     await prisma.$transaction(async (tx) => {
-      await tx.providerAccount.update({
+      await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.id} AND "userId" = ${userId} FOR UPDATE`;
+      const account = await tx.providerAccount.findFirst({
+        where: { id: input.id, userId, deletedAt: null },
+        select: { id: true },
+      });
+      if (!account) throw missing();
+      const deleted = await tx.providerAccount.updateMany({
         where: { id: input.id },
         data: { deletedAt: now, enabled: false, status: "DISABLED", currentCredentialId: null },
       });
+      if (deleted.count !== 1) throw new ORPCError("CONFLICT");
       await tx.providerModel.updateMany({
         where: { userId, providerAccountId: input.id },
         data: { deletedAt: now, enabled: false },
@@ -238,7 +249,7 @@ export const providerManagementRouter = {
           subjectId: input.id,
         },
       });
-    });
+    }, providerWriteTransaction);
     return { success: true };
   }),
   listModels: protectedProcedure
@@ -258,8 +269,13 @@ export const providerManagementRouter = {
   createModel: protectedProcedure.input(modelInput).handler(async ({ input, context }) => {
     enabled();
     const userId = context.session.user.id;
-    await accountFor(userId, input.providerAccountId);
     return prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
+      const account = await tx.providerAccount.findFirst({
+        where: { id: input.providerAccountId, userId, deletedAt: null },
+        select: { id: true },
+      });
+      if (!account) throw missing();
       const row = await tx.providerModel.create({
         data: {
           ...input,
@@ -282,7 +298,7 @@ export const providerManagementRouter = {
         },
       });
       return row;
-    });
+    }, providerWriteTransaction);
   }),
   updateModel: protectedProcedure
     .input(
@@ -291,9 +307,18 @@ export const providerManagementRouter = {
     .handler(async ({ input, context }) => {
       enabled();
       const userId = context.session.user.id;
-      const current = await modelFor(userId, input.id);
       const { id: modelId, ...data } = input;
       return prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT a.id FROM provider_account a WHERE a.id = (SELECT m."providerAccountId" FROM provider_model m WHERE m.id = ${modelId} AND m."userId" = ${userId}) AND a."userId" = ${userId} FOR UPDATE`;
+        const current = await tx.providerModel.findFirst({
+          where: { id: modelId, userId, deletedAt: null, ProviderAccount: { deletedAt: null } },
+        });
+        if (!current) throw missing();
+        const account = await tx.providerAccount.findFirst({
+          where: { id: current.providerAccountId, userId, deletedAt: null },
+          select: { id: true },
+        });
+        if (!account) throw missing();
         const row = await tx.providerModel.update({
           where: { id: modelId },
           data: data as Prisma.ProviderModelUpdateInput,
@@ -308,7 +333,7 @@ export const providerManagementRouter = {
           },
         });
         return row;
-      });
+      }, providerWriteTransaction);
     }),
   deleteModel: protectedProcedure.input(z.object({ id })).handler(async ({ input, context }) => {
     enabled();
@@ -644,16 +669,16 @@ export const providerManagementRouter = {
         ring(),
       );
       try {
-        const headers =
+        const providerAuth =
           row.credentialType === "BEARER"
-            ? { authorization: `Bearer ${secret}` }
-            : { "x-api-key": secret };
+            ? ({ type: "BEARER", token: secret } as const)
+            : ({ type: "API_KEY", apiKey: secret } as const);
         const response = await providerHttpsRequest(
           account.baseUrl,
           { method: "GET", headers: { accept: "application/json" } },
           policy(),
           account.providerType === "anthropic" ? "anthropic" : "openai",
-          headers,
+          providerAuth,
         );
         response.resume();
         const statusCode = response.statusCode ?? null;
@@ -713,22 +738,40 @@ export const providerManagementRouter = {
     .handler(async ({ input, context }) => {
       enabled();
       const userId = context.session.user.id;
-      await accountFor(userId, input.providerAccountId);
       if (
         (input.scopeType === "POOL_PROVIDER_MODEL") !==
         Boolean(input.poolId && input.providerModelId)
       )
         throw new ORPCError("BAD_REQUEST");
-      if (input.providerModelId) {
-        const model = await modelFor(userId, input.providerModelId);
-        if (model.providerAccountId !== input.providerAccountId) throw missing();
-      }
-      if (
-        input.poolId &&
-        !(await prisma.modelPool.findFirst({ where: { id: input.poolId, userId } }))
-      )
-        throw missing();
       return prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
+        const account = await tx.providerAccount.findFirst({
+          where: { id: input.providerAccountId, userId, deletedAt: null },
+          select: { id: true },
+        });
+        if (!account) throw missing();
+        if (input.providerModelId) {
+          const model = await tx.providerModel.findFirst({
+            where: {
+              id: input.providerModelId,
+              userId,
+              providerAccountId: account.id,
+              deletedAt: null,
+              ProviderAccount: { deletedAt: null },
+            },
+            select: { id: true },
+          });
+          if (!model) throw missing();
+        }
+        if (input.poolId) {
+          const pool = await tx.modelPool.findFirst({
+            // Model pools are hard-deleted, so an owner-scoped re-read is the
+            // liveness check after the provider-account lock is acquired.
+            where: { id: input.poolId, userId },
+            select: { id: true },
+          });
+          if (!pool) throw missing();
+        }
         const row = await tx.providerBudgetPolicy.create({
           data: {
             userId,
@@ -756,7 +799,7 @@ export const providerManagementRouter = {
           },
         });
         return row;
-      });
+      }, providerWriteTransaction);
     }),
   replaceBudgetPolicy: protectedProcedure
     .input(z.object({ id, active: z.boolean(), rules: z.array(rule).min(1) }))

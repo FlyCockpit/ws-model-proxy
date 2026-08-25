@@ -19,6 +19,37 @@ export interface ProviderEgressPolicy {
   timeoutMs?: number;
 }
 
+export type ProviderEgressAuth =
+  | { type: "API_KEY"; apiKey: string }
+  | { type: "BEARER"; token: string }
+  | { type: "NONE"; purpose: "UNAUTHENTICATED_PROBE" };
+
+function providerAuthHeaders(auth: ProviderEgressAuth): Record<string, string> {
+  if (!auth || typeof auth !== "object") throw new ProviderEgressError();
+  const keys = Object.keys(auth).sort();
+  if (
+    auth.type === "API_KEY" &&
+    keys.join(",") === "apiKey,type" &&
+    typeof auth.apiKey === "string" &&
+    auth.apiKey.length > 0
+  )
+    return { "x-api-key": auth.apiKey };
+  if (
+    auth.type === "BEARER" &&
+    keys.join(",") === "token,type" &&
+    typeof auth.token === "string" &&
+    auth.token.length > 0
+  )
+    return { authorization: `Bearer ${auth.token}` };
+  if (
+    auth.type === "NONE" &&
+    keys.join(",") === "purpose,type" &&
+    auth.purpose === "UNAUTHENTICATED_PROBE"
+  )
+    return {};
+  throw new ProviderEgressError();
+}
+
 export class ProviderEgressError extends Error {
   constructor() {
     super("Provider request failed");
@@ -229,13 +260,13 @@ export async function providerHttpsRequest(
   options: Omit<RequestOptions, "hostname" | "host" | "port" | "protocol" | "lookup">,
   policy: ProviderEgressPolicy,
   protocol: ProviderProtocol,
-  providerAuthHeaders: { authorization?: string; "x-api-key"?: string } = {},
+  auth: ProviderEgressAuth,
 ) {
   if (policy.egressEnabled !== true) throw new ProviderEgressError();
   const url = validateProviderBaseUrl(rawUrl, policy);
   const headers = {
     ...sanitizeProviderHeaders((options.headers ?? {}) as Record<string, string>, protocol),
-    ...providerAuthHeaders,
+    ...providerAuthHeaders(auth),
   };
   return new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
     const requestFunction = url.protocol === "https:" ? httpsRequest : httpRequest;
