@@ -524,12 +524,15 @@ async function recordProviderHealth(
   target: PublicProviderTarget,
   userId: string,
   success: boolean,
+  response?: { status: number; retryAfter?: string | string[] },
 ): Promise<void> {
   await recordProviderOutcome({
     userId,
     providerAccountId: target.providerAccountId,
     providerModelId: target.providerModelId,
     success,
+    failureClass: success ? undefined : classifyProviderFailure(response?.status),
+    retryAfterMs: success ? undefined : parseRetryAfter(response?.retryAfter),
   }).catch(() => undefined);
 }
 
@@ -897,6 +900,7 @@ export async function dispatchPublicOverflow(
             target,
             request.userId,
             streamComplete && ![408, 409, 429].includes(status) && status < 500,
+            { status, retryAfter: response.headers["retry-after"] },
           );
         }
         const usage = streamComplete ? parseProviderUsage(usageChunks) : undefined;

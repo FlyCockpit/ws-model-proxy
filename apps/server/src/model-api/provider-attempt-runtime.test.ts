@@ -1,12 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 
-const db = vi.hoisted(() => ({ publicProviderAttemptEvent: { create: vi.fn() } }));
+const db = vi.hoisted(() => ({
+  $transaction: vi.fn(),
+  publicProviderAttemptEvent: { create: vi.fn() },
+}));
 vi.mock("@ws-model-proxy/db", () => ({ default: db }));
 
 import {
   classifyProviderFailure,
   parseRetryAfter,
   recordProviderAttemptEvent,
+  recordProviderOutcome,
 } from "./provider-attempt-runtime.js";
 
 describe("provider attempt failure policy", () => {
@@ -27,6 +31,46 @@ describe("provider attempt failure policy", () => {
     expect(parseRetryAfter("Wed, 01 Jan 2025 00:01:00 GMT", Date.UTC(2025, 0, 1))).toBe(60_000);
     expect(parseRetryAfter("999999", 0)).toBe(300_000);
     expect(parseRetryAfter("invalid", 0)).toBeUndefined();
+  });
+
+  it("persists provider-directed cooldowns for a terminal rate-limit response", async () => {
+    const now = new Date("2026-08-25T00:00:00.000Z");
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
+      providerModel: {
+        findUniqueOrThrow: vi.fn().mockResolvedValue({ healthFailureCount: 0 }),
+        update: vi.fn().mockResolvedValue({}),
+      },
+      providerAccount: { update: vi.fn().mockResolvedValue({}) },
+    };
+    db.$transaction.mockImplementationOnce(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+
+    await recordProviderOutcome({
+      userId: "owner",
+      providerAccountId: "account",
+      providerModelId: "model",
+      success: false,
+      failureClass: "RATE_LIMIT",
+      retryAfterMs: 45_000,
+      now,
+    });
+
+    expect(tx.providerModel.update).toHaveBeenCalledWith({
+      where: { id: "model", userId: "owner" },
+      data: expect.objectContaining({
+        healthStatus: "DEGRADED",
+        healthNextRetryAt: new Date("2026-08-25T00:00:45.000Z"),
+      }),
+    });
+    expect(tx.providerAccount.update).toHaveBeenCalledWith({
+      where: { id: "account", userId: "owner" },
+      data: expect.objectContaining({
+        healthStatus: "DEGRADED",
+        healthNextRetryAt: new Date("2026-08-25T00:00:45.000Z"),
+      }),
+    });
   });
 
   it("persists a prompt-free, fully correlated append-only attempt event", async () => {
