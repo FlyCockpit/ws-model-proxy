@@ -3519,15 +3519,6 @@ async function relayPool({
   const members = forcedPoolMemberId
     ? listedMembers.filter((member) => member.id === forcedPoolMemberId)
     : listedMembers;
-  if (forcedPoolMemberId && members.length === 0) {
-    await operation.dispose?.();
-    await failRelayMetadata({ relayRequestId, startedAt, failure: "not_found" });
-    return operationFailureResponse(
-      operation,
-      "not_found",
-      "The selected pool member is unavailable in this pool.",
-    );
-  }
   const nativeCounts = new Map<string, ContextCountTelemetry>();
   if (capacityRuntime && operation.contextInput) {
     await Promise.all(

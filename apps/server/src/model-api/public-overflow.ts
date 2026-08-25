@@ -163,6 +163,15 @@ export function matchesChatTestProviderMode(
   return true;
 }
 
+export function targetsForForcedPoolMember<T extends Pick<PublicProviderTarget, "poolMemberId">>(
+  targets: readonly T[],
+  forcedPoolMemberId: string | undefined,
+) {
+  return forcedPoolMemberId
+    ? targets.filter((target) => target.poolMemberId === forcedPoolMemberId)
+    : [...targets];
+}
+
 export function matchesExactResponsesBinding(
   target: Pick<
     PublicProviderTarget,
@@ -1228,9 +1237,7 @@ export async function dispatchPublicOverflow(
   // pass with zero input solely to reject protocol/feature/output mismatches;
   // each target is checked again with its actual rendered wire size below.
   const binding = request.exactResponsesBinding;
-  const memberEligible = request.forcedPoolMemberId
-    ? listed.targets.filter((target) => target.poolMemberId === request.forcedPoolMemberId)
-    : listed.targets;
+  const memberEligible = targetsForForcedPoolMember(listed.targets, request.forcedPoolMemberId);
   const eligible = binding
     ? memberEligible.filter((target) => matchesExactResponsesBinding(target, binding))
     : request.requireNativeSurface

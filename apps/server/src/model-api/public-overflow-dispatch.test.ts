@@ -84,6 +84,7 @@ import {
   listPublicOverflowTargets,
   matchesChatTestProviderMode,
   rankPublicOverflowTargets,
+  targetsForForcedPoolMember,
 } from "./public-overflow.js";
 
 it("applies explicit native and adapted Chat Test modes to provider targets", () => {
@@ -92,6 +93,14 @@ it("applies explicit native and adapted Chat Test modes to provider targets", ()
   expect(matchesChatTestProviderMode(target, "openai-responses", "REQUIRE_NATIVE")).toBe(false);
   expect(matchesChatTestProviderMode(target, "openai-responses", "REQUIRE_ADAPTED")).toBe(true);
   expect(matchesChatTestProviderMode(target, "openai-chat", "REQUIRE_ADAPTED")).toBe(false);
+});
+
+it("constrains a member probe to the selected public-overflow member", () => {
+  const targets = [{ poolMemberId: "provider-a" }, { poolMemberId: "provider-b" }];
+  expect(targetsForForcedPoolMember(targets, "provider-b")).toEqual([
+    { poolMemberId: "provider-b" },
+  ]);
+  expect(targetsForForcedPoolMember(targets, undefined)).toEqual(targets);
 });
 
 function dispatchPoolFixture(
