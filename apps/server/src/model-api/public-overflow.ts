@@ -1092,6 +1092,14 @@ async function readRetryableProviderUsage(
     return undefined;
   }
   if (!response.complete) return undefined;
+  try {
+    const parsed = JSON.parse(
+      new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)))),
+    );
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  } catch {
+    return undefined;
+  }
   const usage = parseProviderUsage(chunks, pricing);
   return usage ? { ...usage, observationComplete: true } : undefined;
 }
@@ -1783,10 +1791,12 @@ export async function dispatchPublicOverflow(
           const providerFailed =
             protocolFailed ||
             (!request.stream &&
-              surface === "openai-responses" &&
-              ["failed", "cancelled", "incomplete"].includes(
-                typeof nonstreamEnvelope?.status === "string" ? nonstreamEnvelope.status : "",
-              ));
+              (nonstreamEnvelope?.error !== undefined ||
+                (surface === "anthropic-messages" && nonstreamEnvelope?.type === "error") ||
+                (surface === "openai-responses" &&
+                  ["failed", "cancelled", "incomplete"].includes(
+                    typeof nonstreamEnvelope?.status === "string" ? nonstreamEnvelope.status : "",
+                  ))));
           const ok =
             transportComplete &&
             httpOk &&
@@ -1833,11 +1843,14 @@ export async function dispatchPublicOverflow(
                   inputTokens: tailUsage.inputTokens ?? initialUsage.inputTokens,
                   outputTokens: tailUsage.outputTokens ?? initialUsage.outputTokens,
                   categoriesComplete:
-                    surface === "anthropic-messages" &&
-                    (tailUsage.inputTokens ?? initialUsage.inputTokens) !== undefined &&
-                    (tailUsage.outputTokens ?? initialUsage.outputTokens) !== undefined
-                      ? true
-                      : (tailUsage.categoriesComplete ?? initialUsage.categoriesComplete),
+                    initialUsage.categoriesComplete === false ||
+                    tailUsage.categoriesComplete === false
+                      ? false
+                      : surface === "anthropic-messages" &&
+                          (tailUsage.inputTokens ?? initialUsage.inputTokens) !== undefined &&
+                          (tailUsage.outputTokens ?? initialUsage.outputTokens) !== undefined
+                        ? true
+                        : (tailUsage.categoriesComplete ?? initialUsage.categoriesComplete),
                   rawUsage: [initialUsage.rawUsage, tailUsage.rawUsage],
                 } as RawProviderUsage)
               : (tailUsage ?? initialUsage);
