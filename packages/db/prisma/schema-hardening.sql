@@ -1137,6 +1137,19 @@ UPDATE provider_usage_ledger ledger
  WHERE ordered.id = ledger.id
    AND ledger."payloadHash" = 'legacy-pending';
 
+-- Older revisions retained only the admitted accounting contract. Preserve a
+-- deterministic source identity for observations that demonstrably contained
+-- usage; crash/empty observations continue to have no source usage contract.
+UPDATE provider_usage_ledger
+   SET "sourceUsageAccountingVersion" = "accountingVersion"
+ WHERE "sourceUsageAccountingVersion" IS NULL
+   AND ("inputTokens" IS NOT NULL OR "outputTokens" IS NOT NULL
+     OR "cacheReadTokens" IS NOT NULL OR "cacheWriteTokens" IS NOT NULL
+     OR "reasoningTokens" IS NOT NULL OR "toolTokens" IS NOT NULL
+     OR "additionalBillableTokens" IS NOT NULL OR "authoritativeBillableTokens" IS NOT NULL
+     OR "billableTotal" IS NOT NULL OR "rawUsage" IS NOT NULL
+     OR "reportedCost" IS NOT NULL OR "calculatedCost" IS NOT NULL);
+
 UPDATE provider_budget_settlement settlement
    SET "providerAccountId" = attempt."providerAccountId",
        "providerModelId" = attempt."providerModelId",
@@ -1144,6 +1157,7 @@ UPDATE provider_budget_settlement settlement
        "poolId" = attempt."poolId",
        "requestId" = attempt."requestId",
        "accountingVersion" = attempt."accountingVersion",
+       "sourceUsageAccountingVersion" = ledger."sourceUsageAccountingVersion",
        "pricingVersion" = attempt."pricingVersion",
        "revisionSequence" = ledger."revisionSequence",
        "revisionKind" = ledger."revisionKind",
@@ -1157,6 +1171,7 @@ UPDATE provider_budget_settlement settlement
    AND ledger."sourceVersion" = settlement."sourceVersion"
    AND (settlement."providerAccountId" = '' OR settlement."providerModelId" = ''
      OR settlement."requestId" = '' OR settlement."accountingVersion" = ''
+     OR settlement."sourceUsageAccountingVersion" IS DISTINCT FROM ledger."sourceUsageAccountingVersion"
      OR settlement."payloadHash" = 'legacy-pending'
      OR settlement."revisionSequence" IS DISTINCT FROM ledger."revisionSequence"
      OR settlement."revisionKind" IS DISTINCT FROM ledger."revisionKind");
@@ -1172,6 +1187,7 @@ ALTER TABLE provider_usage_ledger ADD CONSTRAINT provider_usage_ledger_shape_che
   AND (currency IS NULL OR currency ~ '^[A-Z]{3}$')
   AND ("pricingVersion" IS NULL OR btrim("pricingVersion") <> '')
   AND btrim("accountingVersion") <> '' AND btrim("terminalReason") <> ''
+  AND ("sourceUsageAccountingVersion" IS NULL OR btrim("sourceUsageAccountingVersion") <> '')
   AND (NOT "costKnown" OR ("settledCost" IS NOT NULL AND currency IS NOT NULL AND "pricingVersion" IS NOT NULL))
   AND ("reportedCost" IS NULL OR "reportedCost" >= 0)
   AND ("reportedCostCurrency" IS NULL OR "reportedCostCurrency" ~ '^[A-Z]{3}$')
@@ -1206,6 +1222,7 @@ ALTER TABLE provider_budget_settlement ADD CONSTRAINT provider_budget_settlement
   AND "revisionSequence" >= 0 AND btrim("payloadHash") <> ''
   AND btrim("providerAccountId") <> '' AND btrim("providerModelId") <> ''
   AND btrim("requestId") <> '' AND btrim("accountingVersion") <> ''
+  AND ("sourceUsageAccountingVersion" IS NULL OR btrim("sourceUsageAccountingVersion") <> '')
   AND (currency IS NULL OR currency ~ '^[A-Z]{3}$')
 );
 

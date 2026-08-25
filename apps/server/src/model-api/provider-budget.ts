@@ -184,10 +184,12 @@ function terminalPayloadHash(
   terminal: ProviderBudgetTerminal,
   sourceVersion: string,
   usageSource: string,
-  accountingVersion: string,
   accountingMatches: boolean,
 ): string {
   const usage = terminal.usage;
+  const sourceUsageAccountingVersion = usage
+    ? normalizedVersion(usage.accountingVersion, "accountingVersion")
+    : undefined;
   const normalizedUsage = usage
     ? {
         inputTokens: usage.inputTokens,
@@ -228,7 +230,7 @@ function terminalPayloadHash(
             ? undefined
             : normalizedVersion(usage.calculatedCostSource ?? usageSource, "calculatedCostSource"),
         billableTotal: accountingMatches ? providerBillableTokens(usage) : undefined,
-        accountingVersion,
+        sourceUsageAccountingVersion,
         confidence: usage.confidence,
       }
     : undefined;
@@ -686,13 +688,15 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
       throw new ProviderBudgetConfigurationError("Terminal attempt identity conflict");
 
     const usage = terminal.usage;
+    const sourceUsageAccountingVersion = usage
+      ? normalizedVersion(usage.accountingVersion, "accountingVersion")
+      : undefined;
     const billableTotal = usage && providerBillableTokens(usage);
     const accountingMatches = usage?.accountingVersion.trim() === anchor.accountingVersion;
     const payloadHash = terminalPayloadHash(
       terminal,
       sourceVersion,
       usageSource,
-      anchor.accountingVersion,
       accountingMatches,
     );
     const priorRevision = await tx.providerUsageLedger.findUnique({
@@ -805,6 +809,7 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
           revisionSequence: terminal.revisionSequence,
           revisionKind: terminal.revisionKind,
           payloadHash,
+          sourceUsageAccountingVersion,
           accountingVersion: anchor.accountingVersion,
           pricingVersion: anchor.pricingVersion,
           settledValue: delta,
@@ -859,6 +864,7 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
         settledCost,
         currency: anchor.liabilityCurrency,
         pricingVersion: anchor.pricingVersion,
+        sourceUsageAccountingVersion,
         accountingVersion: anchor.accountingVersion,
         sourceVersion,
         revisionSequence: terminal.revisionSequence,

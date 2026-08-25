@@ -417,7 +417,7 @@ integration("provider budget admission and reconciliation", () => {
     ).rejects.toThrow("conflict");
   });
 
-  it("treats differing unrecognized accounting versions as the same persisted semantics", async () => {
+  it("persists source accounting identity and rejects a changed identity for the same revision", async () => {
     if (!db) return;
     const row = await fixture({ metric: "TOKENS" });
     const original = attempt(row, `mismatched-accounting-${crypto.randomUUID()}`, {
@@ -438,12 +438,27 @@ integration("provider budget admission and reconciliation", () => {
       },
     };
     await service.reconcileProviderBudget(revision);
+    const persisted = await db.providerUsageLedger.findFirstOrThrow({
+      where: { attemptId: original.attemptId, sourceVersion: "provider-v1" },
+    });
+    expect(persisted).toMatchObject({
+      accountingVersion: "usage-v1",
+      sourceUsageAccountingVersion: "provider-usage-v2",
+      usageKnown: false,
+    });
+    const settlement = await db.providerBudgetSettlement.findFirstOrThrow({
+      where: { attemptId: original.attemptId, sourceVersion: "provider-v1" },
+    });
+    expect(settlement).toMatchObject({
+      accountingVersion: "usage-v1",
+      sourceUsageAccountingVersion: "provider-usage-v2",
+    });
     await expect(
       service.reconcileProviderBudget({
         ...revision,
         usage: { ...revision.usage, accountingVersion: "provider-usage-v3" },
       }),
-    ).resolves.toBeUndefined();
+    ).rejects.toThrow("conflict");
     await expect(
       service.reconcileProviderBudget({
         ...revision,
