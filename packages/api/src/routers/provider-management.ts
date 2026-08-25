@@ -79,6 +79,67 @@ async function accountFor(userId: string, accountId: string) {
   if (!row) throw missing();
   return row;
 }
+async function historicalAccountFor(userId: string, accountId: string) {
+  const row = await prisma.providerAccount.findFirst({
+    where: { id: accountId, userId },
+    select: { id: true },
+  });
+  if (!row) throw missing();
+  return row;
+}
+async function reportScopeFor(
+  userId: string,
+  input: { providerAccountId?: string; providerModelId?: string; poolId?: string },
+) {
+  if (input.providerAccountId) await historicalAccountFor(userId, input.providerAccountId);
+  if (input.providerModelId) {
+    const model = await prisma.providerModel.findFirst({
+      where: {
+        id: input.providerModelId,
+        userId,
+        ...(input.providerAccountId ? { providerAccountId: input.providerAccountId } : {}),
+      },
+      select: { id: true },
+    });
+    if (!model) throw missing();
+  }
+  if (input.poolId) {
+    const pool = await prisma.modelPool.findFirst({
+      where: { id: input.poolId, userId },
+      select: { id: true },
+    });
+    if (!pool) throw missing();
+  }
+}
+const reportInput = z
+  .object({
+    providerAccountId: id.optional(),
+    providerModelId: id.optional(),
+    poolId: id.optional(),
+    from: z.coerce.date().optional(),
+    to: z.coerce.date().optional(),
+    limit: z.number().int().min(1).max(200).default(50),
+  })
+  .superRefine((value, ctx) => {
+    if (value.from && value.to && value.from >= value.to)
+      ctx.addIssue({ code: "custom", message: "from must be before to" });
+  });
+function reportWhere(userId: string, input: z.infer<typeof reportInput>) {
+  return {
+    userId,
+    ...(input.providerAccountId ? { providerAccountId: input.providerAccountId } : {}),
+    ...(input.providerModelId ? { providerModelId: input.providerModelId } : {}),
+    ...(input.poolId ? { poolId: input.poolId } : {}),
+    ...(input.from || input.to
+      ? {
+          createdAt: {
+            ...(input.from ? { gte: input.from } : {}),
+            ...(input.to ? { lt: input.to } : {}),
+          },
+        }
+      : {}),
+  };
+}
 const json = z.record(z.string(), z.unknown()).nullable().optional();
 const accountInput = z.object({
   providerType: z
@@ -852,7 +913,7 @@ export const providerManagementRouter = {
     .handler(async ({ input, context }) => {
       enabled();
       if (input.providerAccountId)
-        await accountFor(context.session.user.id, input.providerAccountId);
+        await historicalAccountFor(context.session.user.id, input.providerAccountId);
       return prisma.providerAuditEvent.findMany({
         where: {
           userId: context.session.user.id,
@@ -865,6 +926,156 @@ export const providerManagementRouter = {
           action: true,
           subjectId: true,
           metadata: true,
+        },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: input.limit,
+      });
+    }),
+  listUsageReport: protectedProcedure.input(reportInput).handler(async ({ input, context }) => {
+    enabled();
+    const userId = context.session.user.id;
+    await reportScopeFor(userId, input);
+    return prisma.providerUsageLedger.findMany({
+      where: reportWhere(userId, input),
+      select: {
+        id: true,
+        createdAt: true,
+        providerAccountId: true,
+        providerModelId: true,
+        poolId: true,
+        requestId: true,
+        attemptId: true,
+        inputTokens: true,
+        outputTokens: true,
+        cacheReadTokens: true,
+        cacheWriteTokens: true,
+        reasoningTokens: true,
+        toolTokens: true,
+        additionalBillableTokens: true,
+        authoritativeBillableTokens: true,
+        reportedTotalTokens: true,
+        billableTotal: true,
+        categoriesComplete: true,
+        reportedCost: true,
+        reportedCostCurrency: true,
+        calculatedCost: true,
+        calculatedCostCurrency: true,
+        settledCost: true,
+        currency: true,
+        pricingVersion: true,
+        accountingVersion: true,
+        usageKnown: true,
+        costKnown: true,
+        terminalReason: true,
+        confidence: true,
+      },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      take: input.limit,
+    });
+  }),
+  listBudgetActivity: protectedProcedure.input(reportInput).handler(async ({ input, context }) => {
+    enabled();
+    const userId = context.session.user.id;
+    await reportScopeFor(userId, input);
+    const where = reportWhere(userId, input);
+    const [reservations, settlements] = await Promise.all([
+      prisma.providerBudgetReservation.findMany({
+        where,
+        select: {
+          id: true,
+          createdAt: true,
+          settledAt: true,
+          expiresAt: true,
+          providerAccountId: true,
+          providerModelId: true,
+          poolId: true,
+          policyId: true,
+          ruleId: true,
+          requestId: true,
+          attemptId: true,
+          metric: true,
+          period: true,
+          policyVersion: true,
+          utcBasis: true,
+          windowStart: true,
+          windowEnd: true,
+          reservedValue: true,
+          liabilityTokens: true,
+          liabilitySpend: true,
+          liabilityCurrency: true,
+          settledValue: true,
+          currency: true,
+          pricingVersion: true,
+          accountingVersion: true,
+          state: true,
+        },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: input.limit,
+      }),
+      prisma.providerBudgetSettlement.findMany({
+        where,
+        select: {
+          id: true,
+          createdAt: true,
+          providerAccountId: true,
+          providerModelId: true,
+          poolId: true,
+          requestId: true,
+          reservationId: true,
+          attemptId: true,
+          pricingVersion: true,
+          accountingVersion: true,
+          settledValue: true,
+          currency: true,
+          confidence: true,
+          reason: true,
+        },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: input.limit,
+      }),
+    ]);
+    return {
+      reservations,
+      settlements,
+      caveat:
+        "Provider invoices are authoritative; budgets are protective admission controls, not guaranteed billing caps.",
+    };
+  }),
+  listProviderAttemptEvents: protectedProcedure
+    .input(reportInput)
+    .handler(async ({ input, context }) => {
+      enabled();
+      const userId = context.session.user.id;
+      await reportScopeFor(userId, input);
+      return prisma.publicProviderAttemptEvent.findMany({
+        where: reportWhere(userId, input),
+        select: {
+          id: true,
+          createdAt: true,
+          providerAccountId: true,
+          providerModelId: true,
+          requestId: true,
+          attemptId: true,
+          eventType: true,
+          reason: true,
+          requestedSurface: true,
+          nativeSurface: true,
+          adapterMode: true,
+          adapterVersion: true,
+          poolId: true,
+          poolMemberId: true,
+          executionTargetId: true,
+          memberTier: true,
+          triggerReason: true,
+          affinityOutcome: true,
+          contextCountMethod: true,
+          contextCountConfidence: true,
+          waitDurationMs: true,
+          reservationId: true,
+          contextTokens: true,
+          firstClientByteAt: true,
+          streamCommitted: true,
+          terminalState: true,
         },
         orderBy: [{ createdAt: "desc" }, { id: "desc" }],
         take: input.limit,

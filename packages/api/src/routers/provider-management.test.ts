@@ -62,6 +62,7 @@ const db = prisma as unknown as {
     count: MockInstance;
     create: MockInstance;
     findFirst: MockInstance;
+    findMany: MockInstance;
     updateMany: MockInstance;
   };
   providerAuditEvent: { create: MockInstance; findMany: MockInstance };
@@ -71,6 +72,10 @@ const db = prisma as unknown as {
     findFirst: MockInstance;
     updateMany: MockInstance;
   };
+  providerUsageLedger: { findMany: MockInstance };
+  providerBudgetReservation: { findMany: MockInstance };
+  providerBudgetSettlement: { findMany: MockInstance };
+  publicProviderAttemptEvent: { findMany: MockInstance };
 };
 
 const session = {
@@ -336,6 +341,127 @@ describe("providerManagementRouter security boundary", () => {
     );
   });
 
+  it("owner-scopes usage reports, validates nested filters, and excludes provider payloads", async () => {
+    envMock.enabled = true;
+    db.providerAccount.findFirst.mockResolvedValue({ id: "account" });
+    db.providerModel.findFirst.mockResolvedValue({ id: "model" });
+    db.modelPool.findFirst.mockResolvedValue({ id: "pool" });
+    db.providerUsageLedger.findMany.mockResolvedValue([{ id: "usage" }]);
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(
+      client.listUsageReport({
+        providerAccountId: "account",
+        providerModelId: "model",
+        poolId: "pool",
+        from: new Date("2026-08-01T00:00:00Z"),
+        to: new Date("2026-09-01T00:00:00Z"),
+        limit: 25,
+      }),
+    ).resolves.toEqual([{ id: "usage" }]);
+    expect(db.providerModel.findFirst).toHaveBeenCalledWith({
+      where: {
+        id: "model",
+        userId: "owner",
+        providerAccountId: "account",
+      },
+      select: { id: true },
+    });
+    expect(db.modelPool.findFirst).toHaveBeenCalledWith({
+      where: { id: "pool", userId: "owner" },
+      select: { id: true },
+    });
+    expect(db.providerUsageLedger.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          userId: "owner",
+          providerAccountId: "account",
+          providerModelId: "model",
+          poolId: "pool",
+        }),
+        select: expect.not.objectContaining({
+          rawUsage: true,
+          credentialId: true,
+          payloadHash: true,
+        }),
+        take: 25,
+      }),
+    );
+  });
+
+  it("fails closed before reporting when a nested model belongs to another account", async () => {
+    envMock.enabled = true;
+    db.providerAccount.findFirst.mockResolvedValue({ id: "account" });
+    db.providerModel.findFirst.mockResolvedValue(null);
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(
+      client.listUsageReport({
+        providerAccountId: "account",
+        providerModelId: "foreign-model",
+      }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND", message: "Not found" });
+    expect(db.providerUsageLedger.findMany).not.toHaveBeenCalled();
+  });
+
+  it("keeps deleted-account audit and accounting history owner-accessible", async () => {
+    envMock.enabled = true;
+    db.providerAccount.findFirst.mockResolvedValue({ id: "deleted-account" });
+    db.providerAuditEvent.findMany.mockResolvedValue([]);
+    db.providerUsageLedger.findMany.mockResolvedValue([]);
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(
+      client.listAuditEvents({ providerAccountId: "deleted-account", limit: 10 }),
+    ).resolves.toEqual([]);
+    await expect(
+      client.listUsageReport({ providerAccountId: "deleted-account", limit: 10 }),
+    ).resolves.toEqual([]);
+    expect(db.providerAccount.findFirst).toHaveBeenCalledWith({
+      where: { id: "deleted-account", userId: "owner" },
+      select: { id: true },
+    });
+  });
+
+  it("returns owner-scoped budget reporting with the invoice caveat and no credential IDs", async () => {
+    envMock.enabled = true;
+    db.providerBudgetReservation.findMany.mockResolvedValue([{ id: "reservation" }]);
+    db.providerBudgetSettlement.findMany.mockResolvedValue([{ id: "settlement" }]);
+    const client = createRouterClient(providerManagementRouter, { context });
+    const result = await client.listBudgetActivity({ limit: 10 });
+    expect(result).toEqual({
+      reservations: [{ id: "reservation" }],
+      settlements: [{ id: "settlement" }],
+      caveat:
+        "Provider invoices are authoritative; budgets are protective admission controls, not guaranteed billing caps.",
+    });
+    for (const call of [
+      db.providerBudgetReservation.findMany.mock.calls[0]?.[0],
+      db.providerBudgetSettlement.findMany.mock.calls[0]?.[0],
+    ]) {
+      expect(call.where).toEqual({ userId: "owner" });
+      expect(call.select).not.toEqual(expect.objectContaining({ credentialId: true }));
+      expect(call.take).toBe(10);
+    }
+  });
+
+  it("reports only safe owner-scoped attempt telemetry", async () => {
+    envMock.enabled = true;
+    db.publicProviderAttemptEvent.findMany.mockResolvedValue([{ id: "event" }]);
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(client.listProviderAttemptEvents({ limit: 5 })).resolves.toEqual([
+      { id: "event" },
+    ]);
+    expect(db.publicProviderAttemptEvent.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { userId: "owner" },
+        select: expect.not.objectContaining({
+          usage: true,
+          metadata: true,
+          reservationIds: true,
+        }),
+        take: 5,
+      }),
+    );
+  });
+
   it("serializes credential creation on the account and never reflects plaintext", async () => {
     envMock.enabled = true;
     db.$queryRaw.mockResolvedValue([{ id: "account" }]);
@@ -366,6 +492,24 @@ describe("providerManagementRouter security boundary", () => {
     const write = db.providerCredential.create.mock.calls[0]?.[0];
     expect(JSON.stringify(write)).not.toContain("super-secret-value");
     expect(write.data.ciphertext).toBeInstanceOf(Uint8Array);
+  });
+
+  it("lists only credential lifecycle metadata for a live owned account", async () => {
+    envMock.enabled = true;
+    db.providerAccount.findFirst.mockResolvedValue({ id: "account" });
+    db.providerCredential.findMany.mockResolvedValue([{ id: "credential" }]);
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(client.listCredentials({ providerAccountId: "account" })).resolves.toEqual([
+      { id: "credential" },
+    ]);
+    expect(db.providerCredential.findMany).toHaveBeenCalledWith({
+      where: { userId: "owner", providerAccountId: "account" },
+      select: expect.not.objectContaining({
+        ciphertext: true,
+        nonce: true,
+        authTag: true,
+      }),
+    });
   });
 
   it("requires credential cleanup before an authentication-type change", async () => {
