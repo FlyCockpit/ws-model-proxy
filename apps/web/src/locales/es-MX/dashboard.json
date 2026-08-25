@@ -388,6 +388,8 @@
       "providerOrderHint": "Los proveedores públicos solo se prueban después de la espera local, en el orden explícito que defines en Operaciones de proveedor. Cada adjunto también requiere una política de concurrencia y protección de gasto finita.",
       "providerOrder": "Orden de proveedores protegido",
       "providerOrderExact": "Selecciona proveedores en orden de fallback. Las flechas cambian el orden duradero.",
+      "selectLocalModel": "Seleccionar modelo local {{name}}",
+      "selectProvider": "Seleccionar modelo de proveedor {{name}}",
       "moveProviderUp": "Mover proveedor antes",
       "moveProviderDown": "Mover proveedor después",
       "errors": {

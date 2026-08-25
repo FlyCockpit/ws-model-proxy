@@ -388,6 +388,8 @@
       "providerOrderHint": "Public providers are tried only after the local wait, in the explicit order you set in Provider operations. Each attachment also requires a concurrency policy and finite spend protection.",
       "providerOrder": "Guarded provider order",
       "providerOrderExact": "Select providers in fallback order. Arrow controls change the durable order.",
+      "selectLocalModel": "Select local model {{name}}",
+      "selectProvider": "Select provider model {{name}}",
       "moveProviderUp": "Move provider earlier",
       "moveProviderDown": "Move provider later",
       "errors": {

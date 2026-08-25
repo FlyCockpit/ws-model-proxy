@@ -1,3 +1,4 @@
+import { FormApi } from "@tanstack/react-form";
 import { isValidElement, type ReactElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
@@ -122,6 +123,39 @@ describe("ProviderOperationsSection form workflows", () => {
       limitValue: null,
       currency: "USD",
     });
+  });
+
+  it("submits a real TanStack form after interactive mode and value changes", async () => {
+    let submitted: ReturnType<typeof providerBudgetRules> | undefined;
+    const defaults: Parameters<typeof providerBudgetRules>[0] = { ...unlimitedBudget };
+    const form = new FormApi({
+      defaultValues: defaults,
+      validators: { onSubmit: providerBudgetFormSchema },
+      onSubmit: ({ value }) => {
+        submitted = providerBudgetRules(value, "USD");
+      },
+    });
+    const unmount = form.mount();
+    form.setFieldValue("tokenDayMode", "LIMITED");
+    form.setFieldValue("tokenDay", "2500");
+    form.setFieldValue("spendMonthMode", "LIMITED");
+    form.setFieldValue("spendMonth", "25.75");
+    await form.handleSubmit();
+    expect(submitted).toContainEqual({
+      metric: "TOKENS",
+      period: "UTC_DAY",
+      mode: "LIMITED",
+      limitValue: "2500",
+      currency: null,
+    });
+    expect(submitted).toContainEqual({
+      metric: "SPEND",
+      period: "UTC_MONTH",
+      mode: "LIMITED",
+      limitValue: "25.75",
+      currency: "USD",
+    });
+    unmount();
   });
 
   it("renders a keyboard-native mode control and a strong warning for UNLIMITED", () => {

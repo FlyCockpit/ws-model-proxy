@@ -26,6 +26,7 @@ import {
   providerOrderAfterMove,
   providerOrderAfterToggle,
   recommendedPrimarySurface,
+  safeContextControls,
 } from "@/lib/guarded-pool-wizard-validation";
 import { orpc } from "@/utils/orpc";
 
@@ -57,14 +58,26 @@ const defaultMemberOverride = (): MemberOverride => ({
   contextCeiling: 31_744,
   contextMargin: 1_024,
 });
-export function deriveMemberOverride(values: {
-  memberConcurrencyLimit: number;
-  reservedSlots: number;
-  borrowPolicy: "NEVER" | "WHEN_IDLE";
-  localWaitBudgetMs: number;
-  memberContextCeiling: number;
-  contextMargin: number;
-}): MemberOverride {
+export function deriveMemberOverride(
+  values: {
+    memberConcurrencyLimit: number;
+    reservedSlots: number;
+    borrowPolicy: "NEVER" | "WHEN_IDLE";
+    localWaitBudgetMs: number;
+    memberContextCeiling: number;
+    contextMargin: number;
+  },
+  physicalMaxContext?: number | null,
+): MemberOverride {
+  const safeContext = safeContextControls(physicalMaxContext);
+  const contextMargin =
+    physicalMaxContext == null
+      ? values.contextMargin
+      : Math.min(values.contextMargin, safeContext.contextMargin);
+  const contextCeiling =
+    physicalMaxContext == null
+      ? values.memberContextCeiling
+      : Math.max(1, Math.min(values.memberContextCeiling, physicalMaxContext - contextMargin));
   return {
     concurrencyMode: "LIMITED",
     concurrencyLimit: values.memberConcurrencyLimit,
@@ -73,8 +86,8 @@ export function deriveMemberOverride(values: {
     waitBudgetMode: "LIMITED",
     waitBudgetMs: values.localWaitBudgetMs,
     contextCeilingMode: "LIMITED",
-    contextCeiling: values.memberContextCeiling,
-    contextMargin: values.contextMargin,
+    contextCeiling,
+    contextMargin,
   };
 }
 export function memberContextFitsPhysical(
@@ -188,7 +201,12 @@ export function GuardedPoolSetupWizard({
         ctx.addIssue({ code: "custom", path: ["publicEgressAcknowledged"] });
       if (
         value.localModelIds.length > 0 &&
-        !primarySurfaceIsSelectable(value.recommendedSurface, value.localModelIds, directModels)
+        !primarySurfaceIsSelectable(
+          value.recommendedSurface,
+          value.localModelIds,
+          directModels,
+          value.protocolAdaptationEnabled,
+        )
       )
         ctx.addIssue({ code: "custom", path: ["recommendedSurface"] });
       const physicalMaximum = minimumSelectedPhysicalContext(
@@ -293,7 +311,12 @@ export function GuardedPoolSetupWizard({
           },
           memberOverrides: value.localModelIds.flatMap((discoveredModelId) => {
             if (!enabledMemberOverrides[discoveredModelId]) return [];
-            const override = memberOverrides[discoveredModelId] ?? deriveMemberOverride(value);
+            const model = directModels.find((candidate) => candidate.id === discoveredModelId);
+            const physicalMaxContext = capacities.data?.find(
+              (capacity) => capacity.id === model?.executionTarget?.inferenceCapacityId,
+            )?.physicalMaxContext;
+            const override =
+              memberOverrides[discoveredModelId] ?? deriveMemberOverride(value, physicalMaxContext);
             const rule = (mode: LimitMode, limitValue: number) =>
               mode === "LIMITED"
                 ? ({ mode, limitValue } as const)
@@ -471,6 +494,10 @@ export function GuardedPoolSetupWizard({
                       {directModels.map((model) => (
                         <label key={model.id} className="flex min-h-11 items-start gap-3 p-3">
                           <Checkbox
+                            id={`guarded-local-${model.id}`}
+                            aria-label={t("dashboard:pools.wizard.selectLocalModel", {
+                              name: model.canonicalModelId,
+                            })}
                             disabled={!model.executionTarget?.inferenceCapacityId}
                             checked={field.state.value.includes(model.id)}
                             onCheckedChange={(checked) =>
@@ -480,9 +507,23 @@ export function GuardedPoolSetupWizard({
                                     ? [...field.state.value, model.id]
                                     : field.state.value.filter((id) => id !== model.id);
                                 field.handleChange(next);
-                                const recommended = recommendedPrimarySurface(next, directModels);
+                                const recommended = recommendedPrimarySurface(
+                                  next,
+                                  directModels,
+                                  form.state.values.protocolAdaptationEnabled,
+                                );
                                 if (recommended)
                                   form.setFieldValue("recommendedSurface", recommended);
+                                const physicalMaximum = minimumSelectedPhysicalContext(
+                                  next,
+                                  directModels,
+                                  capacities.data ?? [],
+                                );
+                                if (physicalMaximum != null) {
+                                  const safe = safeContextControls(physicalMaximum);
+                                  form.setFieldValue("memberContextCeiling", safe.contextCeiling);
+                                  form.setFieldValue("contextMargin", safe.contextMargin);
+                                }
                               })()
                             }
                           />
@@ -663,10 +704,32 @@ export function GuardedPoolSetupWizard({
                       {(field) => (
                         <label className="flex min-h-11 items-start gap-3 py-2">
                           <Checkbox
+                            id={`guarded-${name}`}
                             checked={field.state.value}
-                            onCheckedChange={(checked) => field.handleChange(checked === true)}
+                            onCheckedChange={(checked) => {
+                              const enabled = checked === true;
+                              field.handleChange(enabled);
+                              if (name === "protocolAdaptationEnabled") {
+                                const recommended = recommendedPrimarySurface(
+                                  form.state.values.localModelIds,
+                                  directModels,
+                                  enabled,
+                                );
+                                if (recommended)
+                                  form.setFieldValue("recommendedSurface", recommended);
+                                setStepErrors((current) => {
+                                  const next = { ...current };
+                                  if (recommended) delete next.recommendedSurface;
+                                  else
+                                    next.recommendedSurface = t(
+                                      "dashboard:pools.wizard.errors.recommendedSurface",
+                                    );
+                                  return next;
+                                });
+                              }
+                            }}
                           />
-                          <span className="text-sm">
+                          <span className="text-sm" id={`guarded-${name}-label`}>
                             {t(`dashboard:pools.wizard.fields.${name}`)}
                           </span>
                         </label>
@@ -688,7 +751,13 @@ export function GuardedPoolSetupWizard({
                   {form.state.values.localModelIds.map((modelId) => {
                     const model = directModels.find((candidate) => candidate.id === modelId);
                     const override =
-                      memberOverrides[modelId] ?? deriveMemberOverride(form.state.values);
+                      memberOverrides[modelId] ??
+                      deriveMemberOverride(
+                        form.state.values,
+                        capacities.data?.find(
+                          (capacity) => capacity.id === model?.executionTarget?.inferenceCapacityId,
+                        )?.physicalMaxContext,
+                      );
                     return (
                       <MemberOverrideEditor
                         key={modelId}
@@ -773,6 +842,10 @@ export function GuardedPoolSetupWizard({
                         return (
                           <div key={candidate.id} className="flex min-h-11 items-center gap-3 p-3">
                             <Checkbox
+                              id={`guarded-provider-${candidate.id}`}
+                              aria-label={t("dashboard:pools.wizard.selectProvider", {
+                                name: candidate.displayName ?? candidate.upstreamModelId,
+                              })}
                               checked={order >= 0}
                               onCheckedChange={(checked) =>
                                 field.handleChange(

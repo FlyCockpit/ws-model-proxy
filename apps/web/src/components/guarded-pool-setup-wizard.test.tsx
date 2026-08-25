@@ -3,6 +3,8 @@ import { isValidElement, type ReactElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
+const queryData = vi.hoisted(() => ({ providers: [] as Array<Record<string, unknown>> }));
+
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
     t: (key: string, values?: { current?: number }) =>
@@ -14,7 +16,11 @@ vi.mock("@/utils/orpc", () => ({
     forwarderManagement: {
       key: () => ["forwarderManagement"],
       listGuardedOverflowCandidates: {
-        queryOptions: () => ({ queryKey: ["providers"], queryFn: async () => [] }),
+        queryOptions: () => ({
+          queryKey: ["providers"],
+          queryFn: async () => queryData.providers,
+          initialData: queryData.providers,
+        }),
       },
       createGuardedModelPool: {
         mutationOptions: (options: unknown) => ({
@@ -44,6 +50,7 @@ import {
   providerOrderAfterMove,
   providerOrderAfterToggle,
   recommendedPrimarySurface,
+  safeContextControls,
 } from "../lib/guarded-pool-wizard-validation";
 import {
   budgetIntegerRule,
@@ -134,6 +141,22 @@ describe("GuardedPoolSetupWizard", () => {
     const withProvider = renderStep(2, ["provider"]);
     expect(withProvider).toContain("dashboard:pools.wizard.egressWarning");
     expect(withProvider).toContain("dashboard:pools.wizard.fields.publicEgressAcknowledged");
+  });
+
+  it("gives provider selection controls stable accessible names", () => {
+    queryData.providers = [
+      {
+        id: "provider-a",
+        upstreamModelId: "gpt-example",
+        displayName: "Primary provider",
+        providerAccount: { label: "OpenAI" },
+        pricing: { currency: "USD" },
+      },
+    ];
+    const markup = renderStep(2);
+    expect(markup).toContain('id="guarded-provider-provider-a"');
+    expect(markup).toContain('aria-label="dashboard:pools.wizard.selectProvider"');
+    queryData.providers = [];
   });
 
   it("focuses the first rendered invalid control", () => {
@@ -299,5 +322,26 @@ describe("GuardedPoolSetupWizard", () => {
         ],
       ),
     ).toBe(32_768);
+  });
+
+  it("derives a positive global ceiling and heterogeneous per-member defaults", () => {
+    expect(safeContextControls(8_192)).toEqual({
+      contextCeiling: 7_168,
+      contextMargin: 1_024,
+    });
+    expect(safeContextControls(512)).toEqual({ contextCeiling: 1, contextMargin: 511 });
+    expect(
+      deriveMemberOverride(
+        {
+          memberConcurrencyLimit: 1,
+          reservedSlots: 0,
+          borrowPolicy: "WHEN_IDLE",
+          localWaitBudgetMs: 30_000,
+          memberContextCeiling: 31_744,
+          contextMargin: 1_024,
+        },
+        8_192,
+      ),
+    ).toMatchObject({ contextCeiling: 7_168, contextMargin: 1_024 });
   });
 });

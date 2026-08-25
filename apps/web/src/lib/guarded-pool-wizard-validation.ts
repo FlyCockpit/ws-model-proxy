@@ -22,6 +22,7 @@ export type GuardedWizardCapacity = {
 export function recommendedPrimarySurface(
   selectedIds: readonly string[],
   models: readonly GuardedWizardLocalModel[],
+  protocolAdaptationEnabled = true,
 ): Exclude<ModelApiSurface, "OPENAI_COMPLETIONS"> | null {
   const matrices = models
     .filter((model) => selectedIds.includes(model.id))
@@ -30,7 +31,7 @@ export function recommendedPrimarySurface(
         capabilities:
           parseOpenAiCompatibleCapabilities(model.effectiveCapabilities?.metadata) ??
           openAiCapabilitiesFromCoarse(model.effectiveCapabilities?.coarse ?? []),
-        adaptationEnabled: true,
+        adaptationEnabled: protocolAdaptationEnabled,
       }),
     );
   const order: readonly Exclude<ModelApiSurface, "OPENAI_COMPLETIONS">[] = [
@@ -49,6 +50,7 @@ export function primarySurfaceIsSelectable(
   surface: ModelApiSurface,
   selectedIds: readonly string[],
   models: readonly GuardedWizardLocalModel[],
+  protocolAdaptationEnabled = true,
 ) {
   const matrices = models
     .filter((model) => selectedIds.includes(model.id))
@@ -57,7 +59,7 @@ export function primarySurfaceIsSelectable(
         capabilities:
           parseOpenAiCompatibleCapabilities(model.effectiveCapabilities?.metadata) ??
           openAiCapabilitiesFromCoarse(model.effectiveCapabilities?.coarse ?? []),
-        adaptationEnabled: true,
+        adaptationEnabled: protocolAdaptationEnabled,
       }),
     );
   const selectedModes = matrices.map((matrix) => matrix[surface].mode);
@@ -66,6 +68,15 @@ export function primarySurfaceIsSelectable(
     matrices.some((matrix) => matrix[candidate].mode === "native"),
   );
   return !anyNative && selectedModes.some((mode) => mode === "adapted");
+}
+
+export function safeContextControls(physicalMaxContext: number | null | undefined) {
+  if (physicalMaxContext == null) return { contextCeiling: 31_744, contextMargin: 1_024 } as const;
+  const contextMargin = Math.min(1_024, Math.max(0, physicalMaxContext - 1));
+  return {
+    contextCeiling: Math.max(1, physicalMaxContext - contextMargin),
+    contextMargin,
+  };
 }
 
 export function minimumSelectedPhysicalContext(
