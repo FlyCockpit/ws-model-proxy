@@ -125,12 +125,18 @@ describe("capacity policy safety", () => {
 
   it("locks unique execution targets in stable lexical order", async () => {
     const query = vi.fn().mockResolvedValue([]);
-    await lockExecutionTargetPolicies({ $queryRaw: query } as never, ["z", "a", "z"]);
-    expect(query).toHaveBeenCalledTimes(4);
-    expect(String(query.mock.calls[1]?.[0]?.[0])).toContain("pg_advisory_xact_lock");
+    const execute = vi.fn().mockResolvedValue(1);
+    await lockExecutionTargetPolicies({ $queryRaw: query, $executeRaw: execute } as never, [
+      "z",
+      "a",
+      "z",
+    ]);
+    expect(query).toHaveBeenCalledTimes(2);
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(String(execute.mock.calls[0]?.[0]?.[0])).toContain("pg_advisory_xact_lock");
     expect(query.mock.calls[0]?.slice(1)).toEqual(["a"]);
-    expect(query.mock.calls[1]?.slice(1)).toEqual(["capacity-policy:a"]);
-    expect(query.mock.calls[2]?.slice(1)).toEqual(["z"]);
-    expect(query.mock.calls[3]?.slice(1)).toEqual(["capacity-policy:z"]);
+    expect(execute.mock.calls[0]?.slice(1)).toEqual(["capacity-policy:a"]);
+    expect(query.mock.calls[1]?.slice(1)).toEqual(["z"]);
+    expect(execute.mock.calls[1]?.slice(1)).toEqual(["capacity-policy:z"]);
   });
 });

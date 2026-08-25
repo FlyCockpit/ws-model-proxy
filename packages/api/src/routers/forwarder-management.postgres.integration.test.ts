@@ -16,7 +16,6 @@ integration("guarded pool setup with real PostgreSQL", () => {
         router: typeof import("./forwarder-management");
       }
     | undefined;
-  const userIds: string[] = [];
 
   beforeAll(async () => {
     if (!databaseUrl) return;
@@ -32,7 +31,8 @@ integration("guarded pool setup with real PostgreSQL", () => {
   afterAll(async () => {
     if (!modules) return;
     modules.router.setGuardedSetupTestFailureInjector(undefined);
-    await modules.prisma.user.deleteMany({ where: { id: { in: userIds } } });
+    // Successful guarded setup writes append-only provider audit history.
+    // Unique fixture identities keep retained rows isolated in shared CI.
   });
 
   it("rolls back every durable guarded-setup row after a deterministic late failure", async () => {
@@ -45,7 +45,6 @@ integration("guarded pool setup with real PostgreSQL", () => {
         slug: `guarded-router-${suffix}`,
       },
     });
-    userIds.push(user.id);
     const cli = await modules.prisma.cliDevice.create({
       data: { userId: user.id, slug: `cli-${suffix}`, label: "CLI" },
     });
@@ -80,13 +79,12 @@ integration("guarded pool setup with real PostgreSQL", () => {
         physicalMaxContext: 65_536,
       },
     });
-    await modules.prisma.executionTarget.create({
-      data: {
-        userId: user.id,
-        kind: "DISCOVERED_MODEL",
-        discoveredModelId: local.id,
-        inferenceCapacityId: capacity.id,
-      },
+    const localTarget = await modules.prisma.executionTarget.findUniqueOrThrow({
+      where: { discoveredModelId: local.id },
+    });
+    await modules.prisma.executionTarget.update({
+      where: { id: localTarget.id },
+      data: { inferenceCapacityId: capacity.id },
     });
     const account = await modules.prisma.providerAccount.create({
       data: {
@@ -100,21 +98,23 @@ integration("guarded pool setup with real PostgreSQL", () => {
         enabled: false,
       },
     });
-    const credential = await modules.prisma.providerCredential.create({
-      data: {
-        userId: user.id,
-        providerAccountId: account.id,
-        credentialType: "BEARER",
-        keyVersion: "test-v1",
-        ciphertext: new Uint8Array([1]),
-        nonce: crypto.getRandomValues(new Uint8Array(12)),
-        authTag: new Uint8Array(16),
-        displaySuffix: "test",
-      },
-    });
-    await modules.prisma.providerAccount.update({
-      where: { id: account.id },
-      data: { currentCredentialId: credential.id, enabled: true },
+    await modules.prisma.$transaction(async (transaction) => {
+      const credential = await transaction.providerCredential.create({
+        data: {
+          userId: user.id,
+          providerAccountId: account.id,
+          credentialType: "BEARER",
+          keyVersion: "test-v1",
+          ciphertext: new Uint8Array([1]),
+          nonce: crypto.getRandomValues(new Uint8Array(12)),
+          authTag: new Uint8Array(16),
+          displaySuffix: "test",
+        },
+      });
+      await transaction.providerAccount.update({
+        where: { id: account.id },
+        data: { currentCredentialId: credential.id, enabled: true },
+      });
     });
     const provider = await modules.prisma.providerModel.create({
       data: {

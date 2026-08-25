@@ -14,7 +14,9 @@ export async function lockExecutionTargetPolicies(
 ): Promise<void> {
   for (const targetId of [...new Set(executionTargetIds)].sort()) {
     await tx.$queryRaw`SELECT id FROM execution_target WHERE id = ${targetId} FOR UPDATE`;
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${"capacity-policy:" + targetId}, 0))`;
+    // pg_advisory_xact_lock returns PostgreSQL void, which Prisma's pg adapter
+    // cannot deserialize through $queryRaw. Execute it for its side effect.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${"capacity-policy:" + targetId}, 0))`;
   }
 }
 
@@ -29,7 +31,7 @@ export async function lockExecutionTargetIdentities(
   identities: readonly string[],
 ): Promise<void> {
   for (const identity of [...new Set(identities)].sort())
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${"execution-target:" + identity}, 0))`;
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${"execution-target:" + identity}, 0))`;
 }
 
 export function assertDirectCapacityPolicy(input: {

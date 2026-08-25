@@ -18,7 +18,16 @@ export function retryableSerializableTransactionCode(error: unknown): string | u
   const code = stringProperty(error, "code");
   if (code === "P2010") {
     if (!error || typeof error !== "object" || !("meta" in error)) return undefined;
-    const sqlState = stringProperty(Reflect.get(error, "meta"), "code");
+    const meta = Reflect.get(error, "meta");
+    const driverAdapterError =
+      meta && typeof meta === "object" && "driverAdapterError" in meta
+        ? Reflect.get(meta, "driverAdapterError")
+        : undefined;
+    const cause =
+      driverAdapterError && typeof driverAdapterError === "object" && "cause" in driverAdapterError
+        ? Reflect.get(driverAdapterError, "cause")
+        : undefined;
+    const sqlState = stringProperty(meta, "code") ?? stringProperty(cause, "originalCode");
     return sqlState && RETRYABLE_CODES.has(sqlState) ? sqlState : undefined;
   }
   return code && RETRYABLE_CODES.has(code) ? code : undefined;

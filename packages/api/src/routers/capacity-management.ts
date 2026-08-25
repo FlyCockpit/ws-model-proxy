@@ -43,7 +43,9 @@ async function capacityTransaction<T>(
 }
 
 function auditJson(value: unknown): Prisma.InputJsonValue {
-  return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
+  return JSON.parse(
+    JSON.stringify(value, (_key, item) => (typeof item === "bigint" ? item.toString() : item)),
+  ) as Prisma.InputJsonValue;
 }
 
 async function audit(

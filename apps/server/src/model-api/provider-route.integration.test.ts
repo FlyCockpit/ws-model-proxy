@@ -380,6 +380,10 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         publicEgressAcknowledged: !input.privatePool,
       },
     });
+    expect(pool).toMatchObject({
+      publicEgressEnabled: !input.privatePool,
+      publicEgressAcknowledged: !input.privatePool,
+    });
     const grant = input.grantee
       ? await modules.prisma.poolGrant.create({
           data: { poolId: pool.id, ownerUserId: user.id, granteeUserId: requester.id },
@@ -574,12 +578,16 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       const secondTarget = await modules.prisma.executionTarget.create({
         data: { userId: user.id, kind: "PROVIDER_MODEL", providerModelId: secondModel.id },
       });
+      const secondTier = input.memberTier ?? "PUBLIC_OVERFLOW";
       await modules.prisma.poolMember.create({
         data: {
           poolId: pool.id,
           executionTargetId: secondTarget.id,
-          tier: "PUBLIC_OVERFLOW",
-          publicOrder: 1,
+          tier: secondTier,
+          publicOrder: secondTier === "PUBLIC_OVERFLOW" ? 1 : null,
+          // Keep the first model deterministic while retaining this lower
+          // priority primary as the private-pool failover candidate.
+          weight: 0,
         },
       });
       await modules.prisma.providerPricingVersion.create({

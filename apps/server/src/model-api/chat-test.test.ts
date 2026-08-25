@@ -471,7 +471,16 @@ describe("chat test routes", () => {
     const sent = requireSent(manager);
     expect(sent.family).toBe("chat.completions");
     expect(sent.cliDeviceId).toBe("cli-device-id");
-    expect(db.modelPool.findFirst).not.toHaveBeenCalled();
+    expect(db.modelPool.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: poolTarget.id, userId: "user-id" },
+        select: expect.objectContaining({
+          PoolMembers: expect.objectContaining({
+            where: expect.objectContaining({ tier: "PRIMARY", routingStatus: "ACTIVE" }),
+          }),
+        }),
+      }),
+    );
     manager.headers(sent.requestId, 200, { "content-type": "application/json" });
     manager.body(sent.requestId, '{"choices":[{"message":{"role":"assistant","content":"pong"}}]}');
     manager.complete(sent.requestId);

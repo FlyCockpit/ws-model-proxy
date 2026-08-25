@@ -27,7 +27,10 @@ describe("serializable transaction retry", () => {
   it("retries SQLSTATE errors wrapped by Prisma P2010", async () => {
     transaction
       .mockRejectedValueOnce({ code: "P2010", meta: { code: "40001", message: "write conflict" } })
-      .mockRejectedValueOnce({ code: "P2010", meta: { code: "40P01" } })
+      .mockRejectedValueOnce({
+        code: "P2010",
+        meta: { driverAdapterError: { cause: { originalCode: "40P01" } } },
+      })
       .mockResolvedValueOnce("ok");
     await expect(runSerializableTransaction(async () => "unused")).resolves.toBe("ok");
     expect(transaction).toHaveBeenCalledTimes(3);
@@ -40,6 +43,10 @@ describe("serializable transaction retry", () => {
     { code: "P2010" },
     { code: "P2010", meta: null },
     { code: "P2010", meta: { code: "23505" } },
+    {
+      code: "P2010",
+      meta: { driverAdapterError: { cause: { originalCode: "23505" } } },
+    },
     { code: "P2002", meta: { code: "40001" } },
     { code: 40001 },
   ])("does not classify a non-retryable error %#", async (error) => {

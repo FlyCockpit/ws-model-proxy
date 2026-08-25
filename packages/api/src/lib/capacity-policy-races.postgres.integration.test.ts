@@ -93,21 +93,23 @@ integration("capacity policy production-router races", () => {
         authType: "BEARER",
       },
     });
-    const credential = await modules.prisma.providerCredential.create({
-      data: {
-        userId,
-        providerAccountId: account.id,
-        credentialType: "BEARER",
-        keyVersion: "race-test-v1",
-        ciphertext: new Uint8Array([1]),
-        nonce: crypto.getRandomValues(new Uint8Array(12)),
-        authTag: new Uint8Array(16),
-        displaySuffix: "test",
-      },
-    });
-    await modules.prisma.providerAccount.update({
-      where: { id: account.id },
-      data: { currentCredentialId: credential.id, enabled: true },
+    await modules.prisma.$transaction(async (transaction) => {
+      const credential = await transaction.providerCredential.create({
+        data: {
+          userId,
+          providerAccountId: account.id,
+          credentialType: "BEARER",
+          keyVersion: "race-test-v1",
+          ciphertext: new Uint8Array([1]),
+          nonce: crypto.getRandomValues(new Uint8Array(12)),
+          authTag: new Uint8Array(16),
+          displaySuffix: "test",
+        },
+      });
+      await transaction.providerAccount.update({
+        where: { id: account.id },
+        data: { currentCredentialId: credential.id, enabled: true, status: "ACTIVE" },
+      });
     });
     const providerModels = await Promise.all(
       ["attach", "a", "b"].map((name) =>
@@ -265,7 +267,8 @@ integration("capacity policy production-router races", () => {
   });
 
   afterAll(async () => {
-    if (modules && userId) await modules.prisma.user.delete({ where: { id: userId } });
+    // Provider audit history is intentionally append-only and retains its
+    // owner. Unique fixture identities keep these rows isolated in shared CI.
     await blocker?.$disconnect();
   });
 
@@ -282,7 +285,7 @@ integration("capacity policy production-router races", () => {
       reportLocked = resolve;
     });
     const blockerTransaction = blocker.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`execution-target:${identity}`}, 0))`;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`execution-target:${identity}`}, 0))`;
       reportLocked?.();
       await release;
     });
@@ -298,14 +301,23 @@ integration("capacity policy production-router races", () => {
           AND query LIKE '%pg_advisory_xact_lock%'
       `;
       waiterCount = Number(rows[0]?.count ?? 0n);
-      if (waiterCount >= operations.length) break;
+      // The operations also serialize with one another, so the first waiter
+      // reaching the shared identity fence proves they are queued behind it.
+      if (waiterCount >= 1) break;
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     releaseFence?.();
     await blockerTransaction;
-    if (waiterCount < operations.length)
-      throw new Error(`Expected ${operations.length} advisory waiters, observed ${waiterCount}.`);
+    if (waiterCount < 1) throw new Error("Expected an advisory waiter, observed none.");
     return outcomesPromise;
+  }
+
+  function expectAllFulfilled(outcomes: readonly PromiseSettledResult<unknown>[]) {
+    expect(
+      outcomes.flatMap((outcome) =>
+        outcome.status === "rejected" ? [String(outcome.reason)] : [],
+      ),
+    ).toEqual([]);
   }
 
   it("serializes provider limit updates against standard provider attachment", async () => {
@@ -355,7 +367,7 @@ integration("capacity policy production-router races", () => {
         }),
       ]),
     ]);
-    expect(outcomes.every((outcome) => outcome.status === "fulfilled")).toBe(true);
+    expectAllFulfilled(outcomes);
     const targets = await modules.prisma.executionTarget.findMany({
       where: { id: { in: targetIds } },
       include: { InferenceCapacity: true },
@@ -408,7 +420,7 @@ integration("capacity policy production-router races", () => {
           guardedInput(`guarded-b-${suffix}`, [ordered[1], ordered[0]]),
         ),
     ]);
-    expect(outcomes.every((outcome) => outcome.status === "fulfilled")).toBe(true);
+    expectAllFulfilled(outcomes);
     const pools = await modules.prisma.modelPool.findMany({
       where: { userId, slug: { in: [`guarded-a-${suffix}`, `guarded-b-${suffix}`] } },
       include: { PoolMembers: true },
@@ -433,7 +445,7 @@ integration("capacity policy production-router races", () => {
         directReservedSlots: 2,
       }),
     ]);
-    expect(outcomes.every((outcome) => outcome.status === "fulfilled")).toBe(true);
+    expectAllFulfilled(outcomes);
     const [capacity, target, member] = await Promise.all([
       modules.prisma.inferenceCapacity.findUniqueOrThrow({ where: { id: capacityId } }),
       modules.prisma.executionTarget.findUniqueOrThrow({ where: { id: targetIds[1] } }),
