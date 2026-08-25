@@ -1,10 +1,14 @@
 export type PublicEgressResource = {
   name: string;
   publicEgressEnabled: boolean;
+  members?: ReadonlyArray<{ providerModel?: unknown | null }>;
 };
 
 export function publicEgressResourceNames(resources: PublicEgressResource[]): string[] {
   return resources
-    .filter((resource) => resource.publicEgressEnabled)
+    .filter(
+      (resource) =>
+        resource.publicEgressEnabled || resource.members?.some((member) => member.providerModel),
+    )
     .map((resource) => resource.name);
 }

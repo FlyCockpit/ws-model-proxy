@@ -46,10 +46,12 @@ vi.mock("@ws-model-proxy/ui/components/dialog", () => ({
 
 import { capacityDerivedDefaults } from "../hooks/use-capacity-derived-defaults";
 import {
+  combinedPrimarySurfaceIsSelectable,
   minimumSelectedPhysicalContext,
   primarySurfaceIsSelectable,
   providerOrderAfterMove,
   providerOrderAfterToggle,
+  recommendedCombinedPrimarySurface,
   recommendedPrimarySurface,
   safeContextControls,
 } from "../lib/guarded-pool-wizard-validation";
@@ -105,6 +107,49 @@ function renderStep(initialStep: 0 | 1 | 2 | 3, initialProviderModelIds: string[
 }
 
 describe("GuardedPoolSetupWizard", () => {
+  it("derives compatibility across provider-only and mixed PRIMARY selections", () => {
+    const provider = {
+      id: "provider",
+      nativeCapabilities: {
+        version: 3,
+        protocol: "openai-compatible",
+        surfaces: {
+          openaiResponses: {
+            source: "provider",
+            confidence: "exact",
+            supported: true,
+            streaming: true,
+          },
+        },
+      },
+    };
+    expect(recommendedCombinedPrimarySurface([], [], [provider.id], [provider], "PRIMARY")).toBe(
+      "OPENAI_RESPONSES",
+    );
+    expect(
+      combinedPrimarySurfaceIsSelectable(
+        "OPENAI_RESPONSES",
+        [localModel.id],
+        [localModel],
+        [provider.id],
+        [provider],
+        "PRIMARY",
+        false,
+      ),
+    ).toBe(false);
+    expect(
+      combinedPrimarySurfaceIsSelectable(
+        "OPENAI_CHAT_COMPLETIONS",
+        [localModel.id],
+        [localModel],
+        [provider.id],
+        [provider],
+        "PUBLIC_OVERFLOW",
+        false,
+      ),
+    ).toBe(true);
+  });
+
   it("renders each of the four navigable steps", () => {
     for (const step of [0, 1, 2, 3] as const)
       expect(renderStep(step)).toContain(`dashboard:pools.wizard.step:${step + 1}`);

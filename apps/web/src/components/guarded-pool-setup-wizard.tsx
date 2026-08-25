@@ -20,11 +20,12 @@ import { useTranslation } from "react-i18next";
 import { z } from "zod";
 import { useCapacityDerivedDefaults } from "@/hooks/use-capacity-derived-defaults";
 import {
+  combinedPrimarySurfaceIsSelectable,
   type GuardedWizardLocalModel,
   minimumSelectedPhysicalContext,
-  primarySurfaceIsSelectable,
   providerOrderAfterMove,
   providerOrderAfterToggle,
+  recommendedCombinedPrimarySurface,
   recommendedPrimarySurface,
   safeContextControls,
 } from "@/lib/guarded-pool-wizard-validation";
@@ -156,7 +157,7 @@ export function GuardedPoolSetupWizard({
         .trim()
         .refine((value) => validateForwarderPoolSlug(value).ok),
       name: z.string().trim().min(1).max(120),
-      localModelIds: z.array(z.string()).min(1),
+      localModelIds: z.array(z.string()),
       memberConcurrencyLimit: z.number().int().min(1).max(10_000),
       memberContextCeiling: z.number().int().min(1).max(100_000_000),
       reservedSlots: z.number().int().min(0).max(10_000),
@@ -198,6 +199,8 @@ export function GuardedPoolSetupWizard({
       spendMonthLimit: z.string(),
     })
     .superRefine((value, ctx) => {
+      if (value.localModelIds.length + value.providerModelIds.length === 0)
+        ctx.addIssue({ code: "custom", path: ["providerModelIds"] });
       if (value.reservedSlots > value.memberConcurrencyLimit)
         ctx.addIssue({ code: "custom", path: ["reservedSlots"] });
       if (
@@ -207,11 +210,16 @@ export function GuardedPoolSetupWizard({
       )
         ctx.addIssue({ code: "custom", path: ["publicEgressAcknowledged"] });
       if (
-        value.localModelIds.length > 0 &&
-        !primarySurfaceIsSelectable(
+        value.localModelIds.length +
+          (value.providerTier === "PRIMARY" ? value.providerModelIds.length : 0) >
+          0 &&
+        !combinedPrimarySurfaceIsSelectable(
           value.recommendedSurface,
           value.localModelIds,
           directModels,
+          value.providerModelIds,
+          candidates.data ?? [],
+          value.providerTier,
           value.protocolAdaptationEnabled,
         )
       )
@@ -879,15 +887,24 @@ export function GuardedPoolSetupWizard({
                                 name: candidate.displayName ?? candidate.upstreamModelId,
                               })}
                               checked={order >= 0}
-                              onCheckedChange={(checked) =>
-                                field.handleChange(
-                                  providerOrderAfterToggle(
-                                    field.state.value,
-                                    candidate.id,
-                                    checked === true,
-                                  ),
-                                )
-                              }
+                              onCheckedChange={(checked) => {
+                                const next = providerOrderAfterToggle(
+                                  field.state.value,
+                                  candidate.id,
+                                  checked === true,
+                                );
+                                field.handleChange(next);
+                                const recommended = recommendedCombinedPrimarySurface(
+                                  form.state.values.localModelIds,
+                                  directModels,
+                                  next,
+                                  candidates.data ?? [],
+                                  form.state.values.providerTier,
+                                  form.state.values.protocolAdaptationEnabled,
+                                );
+                                if (recommended)
+                                  form.setFieldValue("recommendedSurface", recommended);
+                              }}
                             />
                             <span className="min-w-0 flex-1">
                               <span className="block text-sm font-medium">
@@ -898,36 +915,42 @@ export function GuardedPoolSetupWizard({
                               </span>
                             </span>
                             {order >= 0 ? (
-                              <span className="flex gap-1">
-                                <Button
-                                  type="button"
-                                  size="icon-touch"
-                                  variant="ghost"
-                                  disabled={order === 0}
-                                  aria-label={t("dashboard:pools.wizard.moveProviderUp")}
-                                  onClick={() => {
-                                    field.handleChange(
-                                      providerOrderAfterMove(field.state.value, order, -1),
-                                    );
-                                  }}
-                                >
-                                  <ArrowUp className="size-4" />
-                                </Button>
-                                <Button
-                                  type="button"
-                                  size="icon-touch"
-                                  variant="ghost"
-                                  disabled={order === field.state.value.length - 1}
-                                  aria-label={t("dashboard:pools.wizard.moveProviderDown")}
-                                  onClick={() => {
-                                    field.handleChange(
-                                      providerOrderAfterMove(field.state.value, order, 1),
-                                    );
-                                  }}
-                                >
-                                  <ArrowDown className="size-4" />
-                                </Button>
-                              </span>
+                              <form.Subscribe selector={(state) => state.values.providerTier}>
+                                {(providerTier) =>
+                                  providerTier === "PUBLIC_OVERFLOW" ? (
+                                    <span className="flex gap-1">
+                                      <Button
+                                        type="button"
+                                        size="icon-touch"
+                                        variant="ghost"
+                                        disabled={order === 0}
+                                        aria-label={t("dashboard:pools.wizard.moveProviderUp")}
+                                        onClick={() => {
+                                          field.handleChange(
+                                            providerOrderAfterMove(field.state.value, order, -1),
+                                          );
+                                        }}
+                                      >
+                                        <ArrowUp className="size-4" />
+                                      </Button>
+                                      <Button
+                                        type="button"
+                                        size="icon-touch"
+                                        variant="ghost"
+                                        disabled={order === field.state.value.length - 1}
+                                        aria-label={t("dashboard:pools.wizard.moveProviderDown")}
+                                        onClick={() => {
+                                          field.handleChange(
+                                            providerOrderAfterMove(field.state.value, order, 1),
+                                          );
+                                        }}
+                                      >
+                                        <ArrowDown className="size-4" />
+                                      </Button>
+                                    </span>
+                                  ) : null
+                                }
+                              </form.Subscribe>
                             ) : null}
                           </div>
                         );
@@ -956,9 +979,19 @@ export function GuardedPoolSetupWizard({
                       id="guarded-provider-tier"
                       className="h-11 w-full rounded-md border bg-background px-3 text-sm"
                       value={field.state.value}
-                      onChange={(event) =>
-                        field.handleChange(event.target.value as typeof field.state.value)
-                      }
+                      onChange={(event) => {
+                        const tier = event.target.value as typeof field.state.value;
+                        field.handleChange(tier);
+                        const recommended = recommendedCombinedPrimarySurface(
+                          form.state.values.localModelIds,
+                          directModels,
+                          form.state.values.providerModelIds,
+                          candidates.data ?? [],
+                          tier,
+                          form.state.values.protocolAdaptationEnabled,
+                        );
+                        if (recommended) form.setFieldValue("recommendedSurface", recommended);
+                      }}
                     >
                       <option value="PRIMARY">{t("dashboard:pools.memberTiers.PRIMARY")}</option>
                       <option value="PUBLIC_OVERFLOW">

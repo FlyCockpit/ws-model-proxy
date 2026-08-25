@@ -19,6 +19,73 @@ export type GuardedWizardCapacity = {
   physicalMaxContext: number | null;
 };
 
+export type GuardedWizardProviderModel = {
+  id: string;
+  nativeCapabilities?: unknown;
+};
+
+function combinedPrimarySelection(
+  localIds: readonly string[],
+  localModels: readonly GuardedWizardLocalModel[],
+  providerIds: readonly string[],
+  providerModels: readonly GuardedWizardProviderModel[],
+  providerTier: "PRIMARY" | "PUBLIC_OVERFLOW",
+) {
+  if (providerTier !== "PRIMARY") return { ids: [...localIds], models: [...localModels] };
+  return {
+    ids: [...localIds, ...providerIds],
+    models: [
+      ...localModels,
+      ...providerModels.map((provider) => ({
+        id: provider.id,
+        effectiveCapabilities: { metadata: provider.nativeCapabilities },
+      })),
+    ],
+  };
+}
+
+export function recommendedCombinedPrimarySurface(
+  localIds: readonly string[],
+  localModels: readonly GuardedWizardLocalModel[],
+  providerIds: readonly string[],
+  providerModels: readonly GuardedWizardProviderModel[],
+  providerTier: "PRIMARY" | "PUBLIC_OVERFLOW",
+  protocolAdaptationEnabled = false,
+) {
+  const combined = combinedPrimarySelection(
+    localIds,
+    localModels,
+    providerIds,
+    providerModels,
+    providerTier,
+  );
+  return recommendedPrimarySurface(combined.ids, combined.models, protocolAdaptationEnabled);
+}
+
+export function combinedPrimarySurfaceIsSelectable(
+  surface: ModelApiSurface,
+  localIds: readonly string[],
+  localModels: readonly GuardedWizardLocalModel[],
+  providerIds: readonly string[],
+  providerModels: readonly GuardedWizardProviderModel[],
+  providerTier: "PRIMARY" | "PUBLIC_OVERFLOW",
+  protocolAdaptationEnabled = false,
+) {
+  const combined = combinedPrimarySelection(
+    localIds,
+    localModels,
+    providerIds,
+    providerModels,
+    providerTier,
+  );
+  return primarySurfaceIsSelectable(
+    surface,
+    combined.ids,
+    combined.models,
+    protocolAdaptationEnabled,
+  );
+}
+
 export function recommendedPrimarySurface(
   selectedIds: readonly string[],
   models: readonly GuardedWizardLocalModel[],

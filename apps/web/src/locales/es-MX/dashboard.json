@@ -467,8 +467,8 @@
     "grantsTitle": "Permisos",
     "grantRevoked": "Acceso al pool revocado",
     "grantTitle": "Dar acceso al pool",
-    "grantEgressWarning": "Dar acceso a {{pool}} permite que esta persona envíe instrucciones y adjuntos a sus proveedores públicos configurados cuando la capacidad local no pueda atender la solicitud. Pueden aplicarse cargos.",
-    "grantEgressWarningTitle": "Este permiso puede usar salida a proveedores públicos",
+    "grantEgressWarning": "Dar acceso a {{pool}} permite que esta persona envíe instrucciones, adjuntos, herramientas y resultados a proveedores configurados usados como destinos principales o desbordamiento público. Pueden aplicarse cargos.",
+    "grantEgressWarningTitle": "Este permiso puede usar salida a proveedores externos",
     "grantEgressAcknowledge": "Entiendo que las solicitudes de esta persona pueden salir del despliegue local mediante los proveedores de este pool.",
     "memberTestSurface": "Superficie de API para probar el miembro",
     "memberTestMode": "Modo de ejecución para probar el miembro",
@@ -490,8 +490,14 @@
     "memberUpdated": "Miembro del pool actualizado",
     "memberCapabilities": "APIs nativas y adaptadas",
     "memberPolicyDetails": "Detalles de capacidad y enrutamiento",
+    "memberTarget": "Destino de ejecución",
+    "memberTier": "Nivel de enrutamiento",
+    "memberTierDisclosure": "Los proveedores principales participan en el enrutamiento normal y envían datos fuera de esta implementación. El desbordamiento público se intenta solo después de agotar todos los destinos principales.",
+    "moveOverflowEarlier": "Mover el proveedor de desbordamiento antes",
+    "moveOverflowLater": "Mover el proveedor de desbordamiento después",
+    "reorderFailed": "No se pudo reordenar los proveedores de desbordamiento",
     "memberTiers": {
-      "PRIMARY": "Principal local",
+      "PRIMARY": "Principal",
       "PUBLIC_OVERFLOW": "Desbordamiento público"
     },
     "publicOrder": "Orden de proveedor {{order}}",
@@ -629,8 +635,8 @@
     "scopeMode": "Modo de alcance",
     "typeTokenName": "Escribe el nombre del token para confirmar",
     "visiblePreview": "{{count}} modelos visibles para este token",
-    "publicEgressWarningTitle": "Algunos recursos pueden usar proveedores públicos",
-    "publicEgressWarning": "Este token puede acceder a {{pools}}. Las solicitudes a estos pools pueden enviar prompts, adjuntos, herramientas y salida a proveedores públicos configurados después de cumplir las reglas de fallback local."
+    "publicEgressWarningTitle": "Algunos recursos pueden usar proveedores externos",
+    "publicEgressWarning": "Este token puede acceder a {{pools}}. Las solicitudes a estos pools pueden enviar instrucciones, adjuntos, herramientas y resultados a proveedores configurados usados como destinos principales o desbordamiento público."
   },
   "providers": {
     "title": "Operaciones de proveedores públicos",

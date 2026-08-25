@@ -3148,9 +3148,21 @@ export const forwarderManagementRouter = {
     )
     .handler(async ({ input, context }) => {
       const pool = await ownedPool(input.poolId, context.session.user.id);
-      if (pool.publicEgressEnabled && !input.publicEgressAcknowledged) {
+      const hasProviderPrimary = pool.publicEgressEnabled
+        ? false
+        : Boolean(
+            await prisma.poolMember.findFirst({
+              where: {
+                poolId: pool.id,
+                tier: "PRIMARY",
+                ExecutionTarget: { ProviderModel: { isNot: null } },
+              },
+              select: { id: true },
+            }),
+          );
+      if ((pool.publicEgressEnabled || hasProviderPrimary) && !input.publicEgressAcknowledged) {
         throw new ORPCError("BAD_REQUEST", {
-          message: "Public-provider egress acknowledgement is required for this grant.",
+          message: "Provider egress acknowledgement is required for this grant.",
         });
       }
       const grantee = await prisma.user.findFirst({

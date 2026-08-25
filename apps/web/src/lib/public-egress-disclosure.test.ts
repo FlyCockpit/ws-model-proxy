@@ -7,8 +7,13 @@ describe("publicEgressResourceNames", () => {
     expect(
       publicEgressResourceNames([
         { name: "Local only", publicEgressEnabled: false },
+        {
+          name: "Provider primary",
+          publicEgressEnabled: false,
+          members: [{ providerModel: { id: "provider" } }],
+        },
         { name: "Guarded overflow", publicEgressEnabled: true },
       ]),
-    ).toEqual(["Guarded overflow"]);
+    ).toEqual(["Provider primary", "Guarded overflow"]);
   });
 });

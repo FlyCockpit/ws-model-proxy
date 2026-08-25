@@ -37,6 +37,8 @@ import {
   ArrowRight,
   Copy,
   Gauge,
+  MoveDown,
+  MoveUp,
   Pencil,
   Plus,
   ShieldCheck,
@@ -1669,6 +1671,12 @@ export function PoolsSection() {
       },
     }),
   );
+  const reorderOverflowMember = useMutation(
+    orpc.forwarderManagement.reorderProviderPoolMember.mutationOptions({
+      onSuccess: () => onChanged(),
+      onError: () => toast.error(t("dashboard:pools.reorderFailed")),
+    }),
+  );
   const revokeGrantMutation = useMutation(
     orpc.forwarderManagement.revokePoolAccessByEmail.mutationOptions({
       onSuccess: () => {
@@ -2241,6 +2249,40 @@ export function PoolsSection() {
                               </td>
                               <td className="py-2 pl-3 align-top">
                                 <div className="flex justify-end gap-1">
+                                  {member.tier === "PUBLIC_OVERFLOW" ? (
+                                    <>
+                                      <Button
+                                        type="button"
+                                        variant="ghost"
+                                        size="icon-touch"
+                                        disabled={reorderOverflowMember.isPending}
+                                        onClick={() =>
+                                          reorderOverflowMember.mutate({
+                                            id: member.id,
+                                            direction: "EARLIER",
+                                          })
+                                        }
+                                        aria-label={t("dashboard:pools.moveOverflowEarlier")}
+                                      >
+                                        <MoveUp className="size-4" />
+                                      </Button>
+                                      <Button
+                                        type="button"
+                                        variant="ghost"
+                                        size="icon-touch"
+                                        disabled={reorderOverflowMember.isPending}
+                                        onClick={() =>
+                                          reorderOverflowMember.mutate({
+                                            id: member.id,
+                                            direction: "LATER",
+                                          })
+                                        }
+                                        aria-label={t("dashboard:pools.moveOverflowLater")}
+                                      >
+                                        <MoveDown className="size-4" />
+                                      </Button>
+                                    </>
+                                  ) : null}
                                   <Button
                                     type="button"
                                     variant="ghost"
@@ -2316,7 +2358,7 @@ export function PoolsSection() {
                             <p className="truncate text-xs text-muted-foreground">
                               {grant.granteeEmail}
                             </p>
-                            {pool.publicEgressEnabled ? (
+                            {pool.members.some((member) => member.providerModel) ? (
                               <p className="mt-1 text-xs text-amber-700 dark:text-amber-300">
                                 {t("dashboard:pools.grantEgressWarning")}
                               </p>
@@ -3663,6 +3705,9 @@ function PoolMemberForm({
   const [routingStatus, setRoutingStatus] = useState<RoutingStatus>(() =>
     routingStatusValue(member?.routingStatus),
   );
+  const [memberTier, setMemberTier] = useState<"PRIMARY" | "PUBLIC_OVERFLOW">(
+    member?.tier ?? "PRIMARY",
+  );
   const [capacityId, setCapacityId] = useState(member?.inferenceCapacityId ?? "");
   const [priorityMode, setPriorityMode] = useState<"INHERIT" | "OVERRIDE">(
     member?.capacityPriority == null ? "INHERIT" : "OVERRIDE",
@@ -3742,6 +3787,7 @@ function PoolMemberForm({
     Number.isInteger(parsedWeight) &&
     parsedWeight >= 0 &&
     parsedWeight <= 10_000 &&
+    !(memberTier === "PRIMARY" && routingStatus === "ACTIVE" && parsedWeight === 0) &&
     (mode === "edit" || discoveredModelId.length > 0) &&
     memberPolicyValid;
 
@@ -3785,27 +3831,46 @@ function PoolMemberForm({
           onSuccess();
         }
         if (mode === "edit" && member) {
-          await updateMember.mutateAsync({ id: member.id, weight: parsedWeight, routingStatus });
-          await updateMemberPolicy.mutateAsync(
-            memberPolicyPayload({
-              poolMemberId: member.id,
-              priority,
-              concurrency,
-              reserved: reservedSlots,
-              wait: waitBudget,
-              ceiling: contextCeiling,
-              margin: contextMargin,
-              borrow,
-              priorityMode,
-              concurrencyMode,
-              reservedMode,
-              waitMode,
-              ceilingMode,
-              marginMode,
-              borrowMode,
-            }),
-          );
-          if (member.executionTargetId) {
+          if (member.providerModel) {
+            await updateMember.mutateAsync({
+              id: member.id,
+              tier: memberTier,
+              weight: parsedWeight,
+              routingStatus,
+              capacityPriority: priorityMode === "INHERIT" ? null : Number(priority),
+              capacityConcurrencyMode: concurrencyMode,
+              capacityConcurrencyLimit: concurrencyMode === "LIMITED" ? Number(concurrency) : null,
+              capacityReservedSlots: reservedMode === "INHERIT" ? null : Number(reservedSlots),
+              capacityBorrowPolicy: borrowMode === "INHERIT" ? null : borrow,
+              capacityWaitBudgetMode: waitMode,
+              capacityWaitBudgetMs: waitMode === "LIMITED" ? Number(waitBudget) : null,
+              capacityContextCeilingMode: ceilingMode,
+              capacityContextCeiling: ceilingMode === "LIMITED" ? Number(contextCeiling) : null,
+              capacityContextMargin: marginMode === "INHERIT" ? null : Number(contextMargin),
+            });
+          } else {
+            await updateMember.mutateAsync({ id: member.id, weight: parsedWeight, routingStatus });
+            await updateMemberPolicy.mutateAsync(
+              memberPolicyPayload({
+                poolMemberId: member.id,
+                priority,
+                concurrency,
+                reserved: reservedSlots,
+                wait: waitBudget,
+                ceiling: contextCeiling,
+                margin: contextMargin,
+                borrow,
+                priorityMode,
+                concurrencyMode,
+                reservedMode,
+                waitMode,
+                ceilingMode,
+                marginMode,
+                borrowMode,
+              }),
+            );
+          }
+          if (member.executionTargetId && !member.providerModel) {
             await attachCapacity.mutateAsync({
               executionTargetId: member.executionTargetId,
               inferenceCapacityId: capacityId || null,
@@ -3837,12 +3902,32 @@ function PoolMemberForm({
         </div>
       ) : (
         <div className="space-y-2">
-          <Label>{t("dashboard:pools.directModel")}</Label>
+          <Label>{t("dashboard:pools.memberTarget")}</Label>
           <code className="block break-all border bg-muted px-2 py-2 font-mono text-xs">
             {member?.model?.canonicalModelId ?? member?.discoveredModelId ?? member?.id}
           </code>
         </div>
       )}
+
+      {mode === "edit" && member?.providerModel ? (
+        <div className="space-y-2">
+          <Label htmlFor="member-tier">{t("dashboard:pools.memberTier")}</Label>
+          <select
+            id="member-tier"
+            className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+            value={memberTier}
+            onChange={(event) => setMemberTier(event.target.value as "PRIMARY" | "PUBLIC_OVERFLOW")}
+          >
+            <option value="PRIMARY">{t("dashboard:pools.memberTiers.PRIMARY")}</option>
+            <option value="PUBLIC_OVERFLOW">
+              {t("dashboard:pools.memberTiers.PUBLIC_OVERFLOW")}
+            </option>
+          </select>
+          <p className="text-xs text-muted-foreground">
+            {t("dashboard:pools.memberTierDisclosure")}
+          </p>
+        </div>
+      ) : null}
 
       <div className="space-y-2">
         <Label htmlFor="member-weight">{t("dashboard:pools.weight")}</Label>
@@ -4013,6 +4098,7 @@ function GrantPoolDialog({
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
+  const providerEgress = pool?.members.some((member) => member.providerModel) ?? false;
   const grant = useMutation(
     orpc.forwarderManagement.grantPoolAccessByEmail.mutationOptions({
       onSuccess: () => {
@@ -4029,7 +4115,7 @@ function GrantPoolDialog({
       publicEgressAcknowledged: z.boolean(),
     })
     .superRefine((value, ctx) => {
-      if (pool?.publicEgressEnabled && !value.publicEgressAcknowledged) {
+      if (providerEgress && !value.publicEgressAcknowledged) {
         ctx.addIssue({ code: "custom", path: ["publicEgressAcknowledged"] });
       }
     });
@@ -4081,7 +4167,7 @@ function GrantPoolDialog({
               </div>
             )}
           </form.Field>
-          {pool?.publicEgressEnabled ? (
+          {providerEgress ? (
             <form.Field name="publicEgressAcknowledged">
               {(field) => (
                 <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3">
@@ -4089,7 +4175,7 @@ function GrantPoolDialog({
                     {t("dashboard:pools.grantEgressWarningTitle")}
                   </p>
                   <p className="mt-1 text-sm text-muted-foreground">
-                    {t("dashboard:pools.grantEgressWarning", { pool: pool.name })}
+                    {t("dashboard:pools.grantEgressWarning", { pool: pool?.name ?? "" })}
                   </p>
                   <label className="mt-3 flex min-h-11 cursor-pointer items-center gap-3 text-sm">
                     <Checkbox

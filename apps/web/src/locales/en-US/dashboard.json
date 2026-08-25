@@ -467,8 +467,8 @@
     "grantsTitle": "Grants",
     "grantRevoked": "Pool access revoked",
     "grantTitle": "Grant pool access",
-    "grantEgressWarning": "Granting {{pool}} lets this user send prompts and attachments to its configured public providers when local capacity cannot serve the request. Provider charges may apply.",
-    "grantEgressWarningTitle": "This grant can use public-provider egress",
+    "grantEgressWarning": "Granting {{pool}} lets this user send prompts, attachments, tools, and output to configured providers used as primary targets or public overflow. Provider charges may apply.",
+    "grantEgressWarningTitle": "This grant can use external-provider egress",
     "grantEgressAcknowledge": "I understand this user's requests can leave the local deployment through this pool's providers.",
     "memberTestSurface": "Member test API surface",
     "memberTestMode": "Member test execution mode",
@@ -490,8 +490,14 @@
     "memberUpdated": "Pool member updated",
     "memberCapabilities": "Native and adapted APIs",
     "memberPolicyDetails": "Capacity and routing details",
+    "memberTarget": "Execution target",
+    "memberTier": "Routing tier",
+    "memberTierDisclosure": "Provider primary targets participate in normal routing and send request data outside this deployment. Public overflow is tried only after every primary target is exhausted.",
+    "moveOverflowEarlier": "Move overflow provider earlier",
+    "moveOverflowLater": "Move overflow provider later",
+    "reorderFailed": "Could not reorder overflow providers",
     "memberTiers": {
-      "PRIMARY": "Local primary",
+      "PRIMARY": "Primary",
       "PUBLIC_OVERFLOW": "Public overflow"
     },
     "publicOrder": "Provider order {{order}}",
@@ -629,8 +635,8 @@
     "scopeMode": "Scope mode",
     "typeTokenName": "Type the token name to confirm",
     "visiblePreview": "{{count}} models visible to this token",
-    "publicEgressWarningTitle": "Some resources can use public providers",
-    "publicEgressWarning": "This token can access {{pools}}. Requests to these pools may send prompts, attachments, tools, and output to configured public providers after local fallback rules are met."
+    "publicEgressWarningTitle": "Some resources can use external providers",
+    "publicEgressWarning": "This token can access {{pools}}. Requests to these pools may send prompts, attachments, tools, and output to configured providers used as primary targets or public overflow."
   },
   "providers": {
     "title": "Public provider operations",

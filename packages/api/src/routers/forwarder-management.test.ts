@@ -1677,6 +1677,32 @@ describe("forwarderManagementRouter", () => {
     expect(db.poolGrant.upsert).not.toHaveBeenCalled();
   });
 
+  it("requires provider-egress acknowledgement for provider PRIMARY grants", async () => {
+    db.modelPool.findUnique.mockResolvedValue({
+      id: "pool-id",
+      userId: "user-id",
+      publicEgressEnabled: false,
+    });
+    db.poolMember.findFirst.mockResolvedValue({ id: "provider-primary-member" });
+
+    await expect(
+      client().grantPoolAccessByEmail({
+        poolId: "pool-id",
+        email: "friend@example.com",
+        publicEgressAcknowledged: false,
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.poolMember.findFirst).toHaveBeenCalledWith({
+      where: {
+        poolId: "pool-id",
+        tier: "PRIMARY",
+        ExecutionTarget: { ProviderModel: { isNot: null } },
+      },
+      select: { id: true },
+    });
+    expect(db.poolGrant.upsert).not.toHaveBeenCalled();
+  });
+
   it("returns a generic not-found result for unmatched grant emails", async () => {
     db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
     db.user.findFirst.mockResolvedValue(null);
