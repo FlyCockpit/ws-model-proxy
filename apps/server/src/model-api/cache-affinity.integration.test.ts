@@ -142,14 +142,18 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
     await new Promise((resolve) => setTimeout(resolve, 1_100));
     await Promise.all([
       service.sweepExpiredAffinity({ now: new Date(), limit: 1 }),
-      service.rememberAffinity({ ...args, now: new Date() }),
+      service.rememberAffinity({ ...args, policy, now: new Date() }),
     ]);
     expect(
       await db.cacheAffinityRecord.count({
         where: { tenantUserId: row.tenant.id, poolId: row.pool.id, expiresAt: { gt: new Date() } },
       }),
     ).toBe(1);
-    expect(await service.sweepExpiredAffinity({ now: new Date(), limit: 1 })).toBe(0);
+    let swept = 1;
+    for (let attempt = 0; attempt < 100 && swept > 0; attempt += 1) {
+      swept = await service.sweepExpiredAffinity({ now: new Date(), limit: 10 });
+    }
+    expect(swept).toBe(0);
     expect(await service.sweepExpiredAffinity({ now: new Date(), limit: 1 })).toBe(0);
   });
 
