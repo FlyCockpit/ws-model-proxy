@@ -81,6 +81,7 @@ export type ProtocolResponseMetadata = {
   tokenLimit?: string;
   tokenRemaining?: string;
   tokenReset?: string;
+  resetFormat?: "duration" | "timestamp";
 };
 
 export type ParsedProtocolResponse =
@@ -119,4 +120,5 @@ export type CanonicalProtocolError = {
   tokenLimit?: string;
   tokenRemaining?: string;
   tokenReset?: string;
+  resetFormat?: "duration" | "timestamp";
 };

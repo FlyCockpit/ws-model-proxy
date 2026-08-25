@@ -9,7 +9,14 @@ if (!databaseUrl)
   console.warn("[provider-route] skipped: SCHEMA_VALIDATION_DATABASE_URL is not configured");
 
 type Surface = "openai-chat" | "openai-responses" | "anthropic-messages";
-type Behavior = "json" | "stream" | "error" | "client-error" | "crash";
+type Behavior =
+  | "json"
+  | "stream"
+  | "error"
+  | "client-error"
+  | "empty-error"
+  | "overload-error"
+  | "crash";
 
 const protocolFor = (surface: Surface) =>
   surface === "anthropic-messages" ? "anthropic" : "openai";
@@ -152,6 +159,36 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         : request.url?.includes("/messages")
           ? "anthropic-messages"
           : "openai-chat";
+      if (behavior === "empty-error") {
+        response.writeHead(429, {
+          "retry-after": "1s",
+          "x-request-id": "secret https://10.0.0.8/private",
+          "x-ratelimit-limit-requests": "1.5",
+          "x-internal-secret": "must-not-pass",
+        });
+        response.end();
+        return;
+      }
+      if (behavior === "overload-error") {
+        response.writeHead(529, {
+          "content-type": "application/json",
+          "retry-after": "Tue, 25 Aug 2026 12:00:00 GMT",
+          ...(surface === "anthropic-messages"
+            ? { "request-id": "overload-request-529" }
+            : { "x-request-id": "overload-request-529" }),
+          "x-internal-secret": "must-not-pass",
+        });
+        response.end(
+          JSON.stringify({
+            error: {
+              message: "route-provider-secret at http://10.0.0.8/private",
+              nested: { tenant: "tenant-other" },
+            },
+            provider_debug: { credential: "route-provider-secret" },
+          }),
+        );
+        return;
+      }
       if (behavior === "error") {
         response.writeHead(503, {
           "content-type": "application/json",
@@ -318,19 +355,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         publicEgressAcknowledged: true,
       },
     });
-    const account = await modules.prisma.providerAccount.create({
-      data: {
-        userId: user.id,
-        providerType: protocolFor(input.native),
-        label: `account-${suffix}`,
-        baseUrl: `${origin}/${input.behavior}`,
-        endpointIdentity: `${origin}/${input.behavior}`,
-        authType: "BEARER",
-        status: "ACTIVE",
-        enabled: true,
-        healthStatus: "HEALTHY",
-      },
-    });
+    const accountId = crypto.randomUUID();
     const credentialId = crypto.randomUUID();
     const keyring = modules.credentials.parseProviderCredentialKeyring(
       process.env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS!,
@@ -339,25 +364,41 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       "route-provider-secret",
       {
         userId: user.id,
-        providerAccountId: account.id,
+        providerAccountId: accountId,
         credentialId,
         credentialType: "BEARER",
         aadVersion: 1,
       },
       keyring,
     );
-    await modules.prisma.providerCredential.create({
+    const account = await modules.prisma.providerAccount.create({
       data: {
-        id: credentialId,
+        id: accountId,
         userId: user.id,
-        providerAccountId: account.id,
-        credentialType: "BEARER",
-        ...encrypted,
+        providerType: protocolFor(input.native),
+        label: `account-${suffix}`,
+        baseUrl: `${origin}/${input.behavior}`,
+        endpointIdentity: `${origin}/${input.behavior}`,
+        authType: "BEARER",
+        status: "ACTIVE",
+        enabled: false,
+        healthStatus: "HEALTHY",
       },
     });
-    await modules.prisma.providerAccount.update({
-      where: { id: account.id },
-      data: { currentCredentialId: credentialId },
+    await modules.prisma.$transaction(async (transaction) => {
+      await transaction.providerCredential.create({
+        data: {
+          id: credentialId,
+          userId: user.id,
+          providerAccountId: accountId,
+          credentialType: "BEARER",
+          ...encrypted,
+        },
+      });
+      await transaction.providerAccount.update({
+        where: { id: accountId },
+        data: { currentCredentialId: credentialId, enabled: true },
+      });
     });
     const model = await modules.prisma.providerModel.create({
       data: {
@@ -440,8 +481,10 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     });
     let secondModel: typeof model | undefined;
     if (input.secondBehavior) {
+      const secondAccountId = crypto.randomUUID();
       const secondAccount = await modules.prisma.providerAccount.create({
         data: {
+          id: secondAccountId,
           userId: user.id,
           providerType: protocolFor(input.native),
           label: `account-second-${suffix}`,
@@ -449,7 +492,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
           endpointIdentity: `${origin}/${input.secondBehavior}`,
           authType: "BEARER",
           status: "ACTIVE",
-          enabled: true,
+          enabled: false,
           healthStatus: "HEALTHY",
         },
       });
@@ -465,18 +508,20 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         },
         keyring,
       );
-      await modules.prisma.providerCredential.create({
-        data: {
-          id: secondCredentialId,
-          userId: user.id,
-          providerAccountId: secondAccount.id,
-          credentialType: "BEARER",
-          ...secondEncrypted,
-        },
-      });
-      await modules.prisma.providerAccount.update({
-        where: { id: secondAccount.id },
-        data: { currentCredentialId: secondCredentialId },
+      await modules.prisma.$transaction(async (transaction) => {
+        await transaction.providerCredential.create({
+          data: {
+            id: secondCredentialId,
+            userId: user.id,
+            providerAccountId: secondAccount.id,
+            credentialType: "BEARER",
+            ...secondEncrypted,
+          },
+        });
+        await transaction.providerAccount.update({
+          where: { id: secondAccount.id },
+          data: { currentCredentialId: secondCredentialId, enabled: true },
+        });
       });
       secondModel = await modules.prisma.providerModel.create({
         data: {
@@ -1038,10 +1083,18 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       expect(requestedRateHeaders.map((name) => result.response.headers.get(name))).toEqual([
         "100",
         "99",
-        native === "anthropic-messages" ? "2026-08-25T12:00:00Z" : "1s",
+        native !== requested
+          ? null
+          : native === "anthropic-messages"
+            ? "2026-08-25T12:00:00Z"
+            : "1s",
         "1000",
         "900",
-        native === "anthropic-messages" ? "2026-08-25T12:01:00Z" : "2s",
+        native !== requested
+          ? null
+          : native === "anthropic-messages"
+            ? "2026-08-25T12:01:00Z"
+            : "2s",
       ]);
       const oppositeRateHeaders =
         requested === "anthropic-messages"
@@ -1065,6 +1118,52 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       expect(result.attempt.state).toBe("FAILED");
       expectConservativeAccounting(result);
       expectAdapterTelemetry(result, mode, requested, native);
+    },
+  );
+
+  it.each(
+    [
+      {
+        behavior: "empty-error" as const,
+        status: 429,
+        code: "rate_limit_error",
+        type: "rate_limit_error",
+      },
+      {
+        behavior: "overload-error" as const,
+        status: 529,
+        code: "overloaded_error",
+        type: "server_error",
+      },
+    ].flatMap((scenario) => [
+      { ...scenario, native: "openai-chat" as const, mode: "native" as const },
+      { ...scenario, native: "anthropic-messages" as const, mode: "adapted" as const },
+    ]),
+  )(
+    "canonicalizes $behavior from a $mode actual provider route",
+    async ({ behavior, status, code, type, native, mode }) => {
+      const result = await runCase({ requested: "openai-chat", native, behavior });
+      expect(result.response.status, result.responseText).toBe(status);
+      expect(JSON.parse(result.responseText)).toMatchObject({
+        error: { type, code, param: null },
+      });
+      expect(result.response.headers.get("x-internal-secret")).toBeNull();
+      expect(result.response.headers.get("x-wsmp-adapter-version")).toBe(
+        mode === "adapted" ? "1.0.0" : null,
+      );
+      expect(result.responseText).not.toContain("route-provider-secret");
+      expect(result.responseText).not.toContain("10.0.0.8");
+      expect(result.responseText).not.toContain("tenant-other");
+      if (behavior === "empty-error") {
+        expect(result.response.headers.get("retry-after")).toBeNull();
+        expect(result.response.headers.get("x-request-id")).toBeNull();
+        expect(result.response.headers.get("x-ratelimit-limit-requests")).toBeNull();
+      } else {
+        expect(result.response.headers.get("retry-after")).toBe("Tue, 25 Aug 2026 12:00:00 GMT");
+        expect(result.response.headers.get("x-request-id")).toBe("overload-request-529");
+      }
+      expectConservativeAccounting(result);
+      expectAdapterTelemetry(result, mode, "openai-chat", native);
     },
   );
 });

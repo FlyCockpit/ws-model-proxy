@@ -39,41 +39,98 @@ export function responseMetadata(
   headers: Headers,
   surface?: ProtocolSurface,
 ): ProtocolResponseMetadata {
-  const safe = (name: string) => headers.get(name)?.slice(0, 512) || undefined;
-  const requestId = (name: string) => {
-    const value = safe(name);
-    return value && /^[A-Za-z0-9._:-]{1,128}$/u.test(value) ? value : undefined;
-  };
-  const rateValue = (name: string) => {
-    const value = safe(name);
-    return value && /^(?:\d+(?:\.\d+)?(?:ms|s|m|h)?|[0-9TZ:+.-]+)$/u.test(value)
-      ? value
-      : undefined;
-  };
+  const value = (name: string) => headers.get(name);
   const anthropic = surface === "anthropic-messages";
+  const retryLimit = safeProviderRateCount(
+    value(anthropic ? "anthropic-ratelimit-requests-limit" : "x-ratelimit-limit-requests"),
+  );
+  const rawRetryRemaining = safeProviderRateCount(
+    value(anthropic ? "anthropic-ratelimit-requests-remaining" : "x-ratelimit-remaining-requests"),
+  );
+  const tokenLimit = safeProviderRateCount(
+    value(anthropic ? "anthropic-ratelimit-tokens-limit" : "x-ratelimit-limit-tokens"),
+  );
+  const rawTokenRemaining = safeProviderRateCount(
+    value(anthropic ? "anthropic-ratelimit-tokens-remaining" : "x-ratelimit-remaining-tokens"),
+  );
   return {
     status,
-    requestId: anthropic ? requestId("request-id") : requestId("x-request-id"),
-    retryAfter: rateValue("retry-after"),
-    retryLimit: anthropic
-      ? rateValue("anthropic-ratelimit-requests-limit")
-      : rateValue("x-ratelimit-limit-requests"),
-    retryRemaining: anthropic
-      ? rateValue("anthropic-ratelimit-requests-remaining")
-      : rateValue("x-ratelimit-remaining-requests"),
+    requestId: safeProviderRequestId(value(anthropic ? "request-id" : "x-request-id")),
+    retryAfter: safeProviderRetryAfter(value("retry-after")),
+    retryLimit,
+    retryRemaining:
+      rawRetryRemaining && (!retryLimit || BigInt(rawRetryRemaining) <= BigInt(retryLimit))
+        ? rawRetryRemaining
+        : undefined,
     retryReset: anthropic
-      ? rateValue("anthropic-ratelimit-requests-reset")
-      : rateValue("x-ratelimit-reset-requests"),
-    tokenLimit: anthropic
-      ? rateValue("anthropic-ratelimit-tokens-limit")
-      : rateValue("x-ratelimit-limit-tokens"),
-    tokenRemaining: anthropic
-      ? rateValue("anthropic-ratelimit-tokens-remaining")
-      : rateValue("x-ratelimit-remaining-tokens"),
+      ? safeProviderRateReset(value("anthropic-ratelimit-requests-reset"), true)
+      : safeProviderRateReset(value("x-ratelimit-reset-requests"), false),
+    tokenLimit,
+    tokenRemaining:
+      rawTokenRemaining && (!tokenLimit || BigInt(rawTokenRemaining) <= BigInt(tokenLimit))
+        ? rawTokenRemaining
+        : undefined,
     tokenReset: anthropic
-      ? rateValue("anthropic-ratelimit-tokens-reset")
-      : rateValue("x-ratelimit-reset-tokens"),
+      ? safeProviderRateReset(value("anthropic-ratelimit-tokens-reset"), true)
+      : safeProviderRateReset(value("x-ratelimit-reset-tokens"), false),
+    resetFormat: anthropic ? "timestamp" : "duration",
   };
+}
+
+export function safeProviderRequestId(value: string | null): string | undefined {
+  return value && /^[A-Za-z0-9._:-]{1,128}$/u.test(value) ? value : undefined;
+}
+
+export function safeProviderRateCount(value: string | null): string | undefined {
+  return value && /^(?:0|[1-9]\d{0,14})$/u.test(value) ? value : undefined;
+}
+
+export function safeProviderRetryAfter(value: string | null): string | undefined {
+  if (!value || value.length > 64) return undefined;
+  if (/^(?:0|[1-9]\d{0,9})$/u.test(value))
+    return Number(value) <= 2_147_483_647 ? value : undefined;
+  if (
+    !/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/u.test(
+      value,
+    )
+  )
+    return undefined;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && new Date(timestamp).toUTCString() === value
+    ? value
+    : undefined;
+}
+
+export function safeProviderRateReset(
+  value: string | null,
+  anthropic: boolean,
+): string | undefined {
+  if (!value || value.length > 64) return undefined;
+  if (anthropic) {
+    const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?Z$/u.exec(value);
+    if (!match) return undefined;
+    const [, year, month, day, hour, minute, second] = match;
+    const timestamp = Date.UTC(
+      Number(year),
+      Number(month) - 1,
+      Number(day),
+      Number(hour),
+      Number(minute),
+      Number(second),
+    );
+    return Number(year) >= 1970 &&
+      Number.isFinite(timestamp) &&
+      new Date(timestamp).toISOString().slice(0, 19) === value.slice(0, 19)
+      ? value
+      : undefined;
+  }
+  if (!/^(?:\d+(?:\.\d+)?(?:ms|s|m|h))+$/u.test(value)) return undefined;
+  const units = [...value.matchAll(/(\d+(?:\.\d+)?)(ms|s|m|h)/gu)];
+  const seconds = units.reduce((total, [, amount, unit]) => {
+    const multiplier = unit === "h" ? 3600 : unit === "m" ? 60 : unit === "ms" ? 0.001 : 1;
+    return total + Number(amount) * multiplier;
+  }, 0);
+  return Number.isFinite(seconds) && seconds <= 2_147_483_647 ? value : undefined;
 }
 
 function parseChatSuccess(value: unknown): CanonicalResponse {
@@ -384,27 +441,12 @@ function stopReason(value: unknown): CanonicalResponse["stopReason"] {
 }
 
 function parseError(
-  surface: ProtocolSurface,
-  value: unknown,
+  _surface: ProtocolSurface,
+  _value: unknown,
   metadata: ProtocolResponseMetadata,
 ): CanonicalProtocolError {
-  const body = object(value, "error_response");
-  let error: Record<string, unknown>;
-  if (surface === "anthropic-messages") {
-    rejectUnknown(body, ["type", "error", "request_id"], "error_response");
-    if (body.type !== "error") invalid("error_response.type", "must be error");
-    error = object(body.error, "error_response.error");
-    rejectUnknown(error, ["type", "message"], "error_response.error");
-    if (body.request_id !== undefined) string(body.request_id, "error_response.request_id");
-  } else {
-    rejectUnknown(body, ["error"], "error_response");
-    error = object(body.error, "error_response.error");
-    rejectUnknown(error, ["message", "type", "param", "code"], "error_response.error");
-  }
-  // Validate the provider shape, but never reflect provider-controlled error
-  // text, codes, or parameter names. They routinely contain credentials,
-  // private endpoints, tenant identifiers, and implementation details.
-  string(error.message, "error_response.error.message");
+  // Error bodies are untrusted and frequently empty, malformed, or not JSON.
+  // Status and allowlisted headers are the complete canonical error boundary.
   const sanitized =
     metadata.status === 401
       ? { code: "authentication_error", message: "The provider rejected authentication." }
@@ -435,6 +477,7 @@ function parseError(
     ...(metadata.tokenLimit ? { tokenLimit: metadata.tokenLimit } : {}),
     ...(metadata.tokenRemaining ? { tokenRemaining: metadata.tokenRemaining } : {}),
     ...(metadata.tokenReset ? { tokenReset: metadata.tokenReset } : {}),
+    ...(metadata.resetFormat ? { resetFormat: metadata.resetFormat } : {}),
   };
 }
 
@@ -645,7 +688,9 @@ export function renderProtocolErrorMetadata(
         };
   if (error.retryLimit) headers.set(retryHeaders.limit, error.retryLimit);
   if (error.retryRemaining) headers.set(retryHeaders.remaining, error.retryRemaining);
-  if (error.retryReset) headers.set(retryHeaders.reset, error.retryReset);
+  const targetResetFormat = surface === "anthropic-messages" ? "timestamp" : "duration";
+  if (error.retryReset && error.resetFormat === targetResetFormat)
+    headers.set(retryHeaders.reset, error.retryReset);
   const tokenHeaders =
     surface === "anthropic-messages"
       ? {
@@ -660,7 +705,8 @@ export function renderProtocolErrorMetadata(
         };
   if (error.tokenLimit) headers.set(tokenHeaders.limit, error.tokenLimit);
   if (error.tokenRemaining) headers.set(tokenHeaders.remaining, error.tokenRemaining);
-  if (error.tokenReset) headers.set(tokenHeaders.reset, error.tokenReset);
+  if (error.tokenReset && error.resetFormat === targetResetFormat)
+    headers.set(tokenHeaders.reset, error.tokenReset);
   return {
     status:
       error.upstreamStatus && error.upstreamStatus >= 400 && error.upstreamStatus <= 599

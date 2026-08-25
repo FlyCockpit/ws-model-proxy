@@ -123,6 +123,10 @@ import {
   renderCanonicalRequest,
   renderProtocolError,
   renderProtocolErrorMetadata,
+  safeProviderRateCount,
+  safeProviderRateReset,
+  safeProviderRequestId,
+  safeProviderRetryAfter,
 } from "./protocols/index.js";
 import {
   conservativeProviderLiability,
@@ -1222,29 +1226,57 @@ async function readAdaptedNonstreamBody({
   status,
   headers,
   signal,
-}: Omit<Parameters<typeof adaptedResponseBody>[0], "stream">): Promise<Uint8Array> {
+}: {
+  body: ReadableStream<Uint8Array> | null;
+  source: ProtocolSurface;
+  target: ProtocolSurface;
+  status: number;
+  headers: Headers;
+  signal: AbortSignal;
+}): Promise<Uint8Array> {
+  if (!body) {
+    const adapted = adaptNonstreamResponse({ source, target, body: null, status, headers });
+    const output = adapted.ok ? adapted.body : renderProtocolError(target, adapted.error);
+    return new TextEncoder().encode(JSON.stringify(output));
+  }
   const reader = body.getReader();
   const abort = () => void reader.cancel(signal.reason);
   signal.addEventListener("abort", abort, { once: true });
   try {
     const chunks: Uint8Array[] = [];
     let bytes = 0;
+    let discardedOversizedError = false;
     while (true) {
       if (signal.aborted) throw signal.reason;
       const result = await reader.read();
       if (result.done) break;
       bytes += result.value.byteLength;
-      if (bytes > MODEL_API_MAX_REQUEST_BODY_BYTES)
-        throw new Error("adapted response exceeded bounded buffer");
+      if (bytes > MODEL_API_MAX_REQUEST_BODY_BYTES) {
+        if (status >= 200 && status < 300)
+          throw new Error("adapted response exceeded bounded buffer");
+        discardedOversizedError = true;
+        chunks.length = 0;
+        await reader.cancel("oversized provider error discarded");
+        break;
+      }
       chunks.push(result.value);
     }
-    const merged = new Uint8Array(bytes);
+    const merged = new Uint8Array(discardedOversizedError ? 0 : bytes);
     let offset = 0;
     for (const chunk of chunks) {
       merged.set(chunk, offset);
       offset += chunk.byteLength;
     }
-    const parsed = JSON.parse(new TextDecoder().decode(merged)) as unknown;
+    const text = new TextDecoder().decode(merged).trim();
+    let parsed: unknown = null;
+    if (text) {
+      try {
+        parsed = JSON.parse(text) as unknown;
+      } catch {
+        // Non-success provider bodies are never reflected. Malformed JSON is
+        // equivalent to an absent body at this trust boundary.
+      }
+    }
     const adapted = adaptNonstreamResponse({ source, target, body: parsed, status, headers });
     const output = adapted.ok ? adapted.body : renderProtocolError(target, adapted.error);
     return new TextEncoder().encode(JSON.stringify(output));
@@ -1262,14 +1294,9 @@ function adaptedProviderResponseHeaders(
 ): Headers {
   const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
   if (adapted) headers.set("x-wsmp-adapter-version", "1.0.0");
-  const retryAfter = sourceHeaders.get("retry-after");
-  const safeRate = (value: string | null) =>
-    value && /^(?:\d+(?:\.\d+)?(?:ms|s|m|h)?|[0-9TZ:+.-]+)$/u.test(value) ? value : null;
-  const safeRequestId = (value: string | null) =>
-    value && /^[A-Za-z0-9._:-]{1,128}$/u.test(value) ? value : null;
-  const validatedRetryAfter = safeRate(retryAfter);
+  const validatedRetryAfter = safeProviderRetryAfter(sourceHeaders.get("retry-after"));
   if (validatedRetryAfter) headers.set("retry-after", validatedRetryAfter);
-  const requestId = safeRequestId(
+  const requestId = safeProviderRequestId(
     source === "anthropic-messages"
       ? sourceHeaders.get("request-id")
       : sourceHeaders.get("x-request-id"),
@@ -1277,20 +1304,41 @@ function adaptedProviderResponseHeaders(
   if (requestId)
     headers.set(target === "anthropic-messages" ? "request-id" : "x-request-id", requestId);
   const rateHeaderPairs = [
-    ["x-ratelimit-limit-requests", "anthropic-ratelimit-requests-limit"],
-    ["x-ratelimit-remaining-requests", "anthropic-ratelimit-requests-remaining"],
-    ["x-ratelimit-reset-requests", "anthropic-ratelimit-requests-reset"],
-    ["x-ratelimit-limit-tokens", "anthropic-ratelimit-tokens-limit"],
-    ["x-ratelimit-remaining-tokens", "anthropic-ratelimit-tokens-remaining"],
-    ["x-ratelimit-reset-tokens", "anthropic-ratelimit-tokens-reset"],
+    ["x-ratelimit-limit-requests", "anthropic-ratelimit-requests-limit", "count"],
+    ["x-ratelimit-remaining-requests", "anthropic-ratelimit-requests-remaining", "count"],
+    ["x-ratelimit-reset-requests", "anthropic-ratelimit-requests-reset", "reset"],
+    ["x-ratelimit-limit-tokens", "anthropic-ratelimit-tokens-limit", "count"],
+    ["x-ratelimit-remaining-tokens", "anthropic-ratelimit-tokens-remaining", "count"],
+    ["x-ratelimit-reset-tokens", "anthropic-ratelimit-tokens-reset", "reset"],
   ] as const;
-  for (const [openAiName, anthropicName] of rateHeaderPairs) {
-    const value = safeRate(
-      sourceHeaders.get(source === "anthropic-messages" ? anthropicName : openAiName),
-    );
+  for (const [openAiName, anthropicName, kind] of rateHeaderPairs) {
+    const sourceName = source === "anthropic-messages" ? anthropicName : openAiName;
+    const raw = sourceHeaders.get(sourceName);
+    const limitName = sourceName.replace("remaining", "limit");
+    const value =
+      kind === "count"
+        ? safeProviderBoundedRemaining(
+            raw,
+            sourceName.includes("remaining"),
+            sourceHeaders.get(limitName),
+          )
+        : source === target
+          ? safeProviderRateReset(raw, source === "anthropic-messages")
+          : undefined;
     if (value) headers.set(target === "anthropic-messages" ? anthropicName : openAiName, value);
   }
   return headers;
+}
+
+function safeProviderBoundedRemaining(
+  raw: string | null,
+  isRemaining: boolean,
+  rawLimit: string | null,
+): string | undefined {
+  const value = safeProviderRateCount(raw);
+  if (!value || !isRemaining) return value;
+  const limit = safeProviderRateCount(rawLimit);
+  return !limit || BigInt(value) <= BigInt(limit) ? value : undefined;
 }
 
 async function primeReadableStream(
@@ -2824,6 +2872,7 @@ async function relayPool({
   capacityRuntime?: CapacityAdmissionRuntime;
 }): Promise<Response> {
   const startedAt = new Date();
+  const requestedSurface = requestedSurfaceForOperation(operation);
   const relayDeadlineMs = startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS;
   const relayRequestId = await createRelayMetadata({
     userId: requester.userId,
@@ -2996,8 +3045,7 @@ async function relayPool({
       responseWithFirstClientByte(response, result.markFirstClientByte);
     if (
       result.nativeSurface === requestedSurface &&
-      (result.response.status < 200 || result.response.status >= 300) &&
-      result.response.body
+      (result.response.status < 200 || result.response.status >= 300)
     ) {
       const sanitized = await readAdaptedNonstreamBody({
         body: result.response.body,
@@ -3009,7 +3057,10 @@ async function relayPool({
       });
       return commitAwareResponse(
         new Response(sanitized, {
-          status: result.response.status,
+          status:
+            result.response.status >= 400 && result.response.status <= 599
+              ? result.response.status
+              : 502,
           headers: adaptedProviderResponseHeaders(
             requestedSurface,
             requestedSurface,
@@ -3026,7 +3077,6 @@ async function relayPool({
     // operation would have streamed. Adapt that envelope as JSON; never feed
     // it into an SSE state machine or advertise it as an event stream.
     if (result.response.status < 200 || result.response.status >= 300) {
-      if (!result.response.body) return result.response;
       const adapted = await readAdaptedNonstreamBody({
         body: result.response.body,
         source,
@@ -3042,7 +3092,10 @@ async function relayPool({
       );
       return commitAwareResponse(
         new Response(adapted, {
-          status: result.response.status,
+          status:
+            result.response.status >= 400 && result.response.status <= 599
+              ? result.response.status
+              : 502,
           headers: adaptedHeaders,
         }),
       );
@@ -3683,12 +3736,15 @@ async function relayPool({
       let primedAdaptedStream: ReadableStream<Uint8Array> | null = null;
       let adaptationCompletion: Promise<"ok" | "protocol_error" | "cancelled"> =
         Promise.resolve("ok");
-      if (adaptedSource && operation.adaptation && !operation.stream) {
+      const nonSuccess = started.status < 200 || started.status >= 300;
+      const canonicalNonSuccess = nonSuccess && requestedSurface !== null;
+      if (canonicalNonSuccess || (adaptedSource && operation.adaptation && !operation.stream)) {
         try {
           validatedAdaptedNonstream = await readAdaptedNonstreamBody({
             body: started.body,
-            source: adaptedSource,
-            target: operation.adaptation.requestedSurface,
+            source: adaptedSource ?? requestedSurface ?? "openai-responses",
+            target:
+              operation.adaptation?.requestedSurface ?? requestedSurface ?? "openai-responses",
             status: started.status,
             headers: started.headers,
             signal: request.signal,
@@ -3712,7 +3768,7 @@ async function relayPool({
           continue;
         }
       }
-      if (adaptedSource && operation.adaptation && operation.stream) {
+      if (adaptedSource && operation.adaptation && operation.stream && !canonicalNonSuccess) {
         try {
           let protocolFailureObserved = false;
           const primed = await primeReadableStream(
@@ -3828,7 +3884,16 @@ async function relayPool({
               terminal: attempt.terminal,
               operation,
             });
-      if (adaptedSource && operation.adaptation) {
+      if (canonicalNonSuccess) {
+        responseHeaders = adaptedProviderResponseHeaders(
+          adaptedSource ?? requestedSurface ?? "openai-responses",
+          operation.adaptation?.requestedSurface ?? requestedSurface ?? "openai-responses",
+          started.headers,
+          Boolean(adaptedSource && operation.adaptation),
+        );
+        if (adaptedSource && operation.adaptation)
+          responseHeaders.set("x-wsmp-adapter-limitations", "strict_common_subset");
+      } else if (adaptedSource && operation.adaptation) {
         const sourceHeaders = responseHeaders;
         const adaptedStreaming =
           operation.stream &&
@@ -3851,12 +3916,13 @@ async function relayPool({
         );
         responseHeaders.set("x-wsmp-adapter-version", "1.0.0");
         responseHeaders.set("x-wsmp-adapter-limitations", "strict_common_subset");
-        const retryAfter = sourceHeaders.get("retry-after");
+        const retryAfter = safeProviderRetryAfter(sourceHeaders.get("retry-after"));
         if (retryAfter) responseHeaders.set("retry-after", retryAfter);
-        const sourceRequestId =
+        const sourceRequestId = safeProviderRequestId(
           adaptedSource === "anthropic-messages"
             ? sourceHeaders.get("request-id")
-            : sourceHeaders.get("x-request-id");
+            : sourceHeaders.get("x-request-id"),
+        );
         if (sourceRequestId)
           responseHeaders.set(
             operation.adaptation.requestedSurface === "anthropic-messages"
@@ -3865,17 +3931,26 @@ async function relayPool({
             sourceRequestId,
           );
         const rateHeaderPairs = [
-          ["x-ratelimit-limit-requests", "anthropic-ratelimit-requests-limit"],
-          ["x-ratelimit-remaining-requests", "anthropic-ratelimit-requests-remaining"],
-          ["x-ratelimit-reset-requests", "anthropic-ratelimit-requests-reset"],
-          ["x-ratelimit-limit-tokens", "anthropic-ratelimit-tokens-limit"],
-          ["x-ratelimit-remaining-tokens", "anthropic-ratelimit-tokens-remaining"],
-          ["x-ratelimit-reset-tokens", "anthropic-ratelimit-tokens-reset"],
+          ["x-ratelimit-limit-requests", "anthropic-ratelimit-requests-limit", "count"],
+          ["x-ratelimit-remaining-requests", "anthropic-ratelimit-requests-remaining", "count"],
+          ["x-ratelimit-reset-requests", "anthropic-ratelimit-requests-reset", "reset"],
+          ["x-ratelimit-limit-tokens", "anthropic-ratelimit-tokens-limit", "count"],
+          ["x-ratelimit-remaining-tokens", "anthropic-ratelimit-tokens-remaining", "count"],
+          ["x-ratelimit-reset-tokens", "anthropic-ratelimit-tokens-reset", "reset"],
         ] as const;
-        for (const [openAiName, anthropicName] of rateHeaderPairs) {
-          const value = sourceHeaders.get(
-            adaptedSource === "anthropic-messages" ? anthropicName : openAiName,
-          );
+        for (const [openAiName, anthropicName, kind] of rateHeaderPairs) {
+          const sourceName = adaptedSource === "anthropic-messages" ? anthropicName : openAiName;
+          const rawValue = sourceHeaders.get(sourceName);
+          const value =
+            kind === "count"
+              ? safeProviderBoundedRemaining(
+                  rawValue,
+                  sourceName.includes("remaining"),
+                  sourceHeaders.get(sourceName.replace("remaining", "limit")),
+                )
+              : adaptedSource === operation.adaptation.requestedSurface
+                ? safeProviderRateReset(rawValue, adaptedSource === "anthropic-messages")
+                : undefined;
           if (value)
             responseHeaders.set(
               operation.adaptation.requestedSurface === "anthropic-messages"
@@ -3886,7 +3961,7 @@ async function relayPool({
         }
       }
       const response = new Response(responseBody, {
-        status: started.status,
+        status: nonSuccess && (started.status < 400 || started.status > 599) ? 502 : started.status,
         headers: responseHeaders,
       });
       return capacityLease?.state === "ADMITTED"

@@ -604,15 +604,16 @@ describe("public overflow terminal response dispatch", () => {
       Object.assign(upstream, { statusCode: 503, headers: {}, complete: true });
       resolveProvider(upstream);
 
-      await expect(dispatched).resolves.toEqual({
-        dispatched: false,
-        reason: "PROVIDER_UNAVAILABLE",
-      });
+      const result = await dispatched;
+      expect(result).toMatchObject({ dispatched: true, attemptCount: 1 });
+      if (!result.dispatched) throw new Error("expected terminal provider response");
+      await result.response.text();
+      await result.terminal;
       expect(recordProviderOutcome).not.toHaveBeenCalled();
       expect(reconcileProviderBudget).toHaveBeenCalledWith(
         expect.objectContaining({
           reason: "FAILED",
-          usageSource: "openai-retryable-response",
+          usageSource: "openai-response",
           usage: expect.objectContaining({
             inputTokens: 9n,
             outputTokens: 2n,

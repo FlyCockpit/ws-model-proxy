@@ -1287,6 +1287,7 @@ export async function dispatchPublicOverflow(
       // Retry only before exposing headers/body to the caller.
       if (
         request.retrySafe &&
+        target !== compatible.at(-1) &&
         (status === 408 || status === 409 || status === 429 || status >= 500)
       ) {
         // Failed/rate-limited calls may still be billed. Consume only a strict

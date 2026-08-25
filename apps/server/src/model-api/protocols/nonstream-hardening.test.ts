@@ -154,10 +154,10 @@ describe("strict non-stream response parsing", () => {
         "retry-after": "2",
         "anthropic-ratelimit-requests-limit": "10",
         "anthropic-ratelimit-requests-remaining": "3",
-        "anthropic-ratelimit-requests-reset": "2s",
+        "anthropic-ratelimit-requests-reset": "2026-08-25T12:00:00Z",
         "anthropic-ratelimit-tokens-limit": "100",
         "anthropic-ratelimit-tokens-remaining": "80",
-        "anthropic-ratelimit-tokens-reset": "3s",
+        "anthropic-ratelimit-tokens-reset": "2026-08-25T12:01:00Z",
       }),
       body: {
         type: "error",
@@ -176,10 +176,10 @@ describe("strict non-stream response parsing", () => {
       "retry-after": "2",
       "anthropic-ratelimit-requests-limit": "10",
       "anthropic-ratelimit-requests-remaining": "3",
-      "anthropic-ratelimit-requests-reset": "2s",
+      "anthropic-ratelimit-requests-reset": "2026-08-25T12:00:00Z",
       "anthropic-ratelimit-tokens-limit": "100",
       "anthropic-ratelimit-tokens-remaining": "80",
-      "anthropic-ratelimit-tokens-reset": "3s",
+      "anthropic-ratelimit-tokens-reset": "2026-08-25T12:01:00Z",
     });
     expect(metadata.headers.has("x-request-id")).toBe(false);
     const openAiMetadata = renderProtocolErrorMetadata("openai-chat", parsed.error);
@@ -188,11 +188,11 @@ describe("strict non-stream response parsing", () => {
       "retry-after": "2",
       "x-ratelimit-limit-requests": "10",
       "x-ratelimit-remaining-requests": "3",
-      "x-ratelimit-reset-requests": "2s",
       "x-ratelimit-limit-tokens": "100",
       "x-ratelimit-remaining-tokens": "80",
-      "x-ratelimit-reset-tokens": "3s",
     });
+    expect(openAiMetadata.headers.has("x-ratelimit-reset-requests")).toBe(false);
+    expect(openAiMetadata.headers.has("x-ratelimit-reset-tokens")).toBe(false);
     expect(openAiMetadata.headers.has("request-id")).toBe(false);
   });
 
@@ -233,6 +233,60 @@ describe("strict non-stream response parsing", () => {
     expect(renderProtocolError("anthropic-messages", parsed.error)).toMatchObject({
       error: { type: "overloaded_error", message: "The provider is overloaded." },
     });
+  });
+
+  it("canonicalizes empty and malformed non-success bodies", () => {
+    for (const body of [null, undefined, "not-json", {}, { unexpected: "private" }]) {
+      const parsed = parseProtocolResponse({
+        surface: "openai-responses",
+        status: 429,
+        body,
+      });
+      if (parsed.ok) throw new Error("expected error");
+      expect(parsed.error).toMatchObject({
+        upstreamStatus: 429,
+        code: "rate_limit_error",
+        message: "The provider rate limit was exceeded.",
+      });
+    }
+  });
+
+  it("drops syntactically plausible but semantically invalid provider metadata", () => {
+    const parsed = parseProtocolResponse({
+      surface: "anthropic-messages",
+      status: 529,
+      headers: new Headers({
+        "request-id": "safe-id",
+        "retry-after": "1s",
+        "anthropic-ratelimit-requests-limit": "1.5",
+        "anthropic-ratelimit-requests-remaining": "-1",
+        "anthropic-ratelimit-requests-reset": "9999",
+        "anthropic-ratelimit-tokens-limit": "1e9",
+        "anthropic-ratelimit-tokens-remaining": "01",
+        "anthropic-ratelimit-tokens-reset": "https://10.0.0.1/private",
+      }),
+      body: null,
+    });
+    if (parsed.ok) throw new Error("expected error");
+    const metadata = renderProtocolErrorMetadata("anthropic-messages", parsed.error);
+    expect(Object.fromEntries(metadata.headers)).toEqual({
+      "content-type": "application/json; charset=utf-8",
+      "request-id": "safe-id",
+    });
+
+    const malformedDates = parseProtocolResponse({
+      surface: "openai-chat",
+      status: 429,
+      headers: new Headers({
+        "retry-after": "Mon, 99 Jan 2026 99:99:99 GMT",
+        "x-ratelimit-reset-requests": "999999999999999999h",
+      }),
+      body: { error: { message: "ignored", nested: { secret: true } } },
+    });
+    if (malformedDates.ok) throw new Error("expected error");
+    expect(
+      Object.fromEntries(renderProtocolErrorMetadata("openai-chat", malformedDates.error).headers),
+    ).toEqual({ "content-type": "application/json; charset=utf-8" });
   });
 });
 
