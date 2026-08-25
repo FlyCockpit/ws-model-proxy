@@ -22,6 +22,7 @@ integration("provider budget admission and reconciliation", () => {
   });
 
   afterAll(async () => {
+    service?.setTerminalPersistenceTestFailureInjector(undefined);
     await db?.$disconnect();
   });
 
@@ -278,6 +279,103 @@ integration("provider budget admission and reconciliation", () => {
     expect(ledgers[0]?.usageKnown).toBe(false);
     expect(ledgers[0]?.costKnown).toBe(false);
     expect(ledgers[0]?.terminalReason).toBe("FAILED");
+  });
+
+  it("atomically rolls back a failed terminal write and permits an idempotent retry", async () => {
+    if (!db) return;
+    const row = await fixture({ metric: "TOKENS" });
+    const original = attempt(row, `terminal-retry-${crypto.randomUUID()}`, {
+      tokens: 8n,
+      accountingVersion: "usage-v1",
+    });
+    await service.admitProviderBudget(original);
+    let fail = true;
+    service.setTerminalPersistenceTestFailureInjector(() => {
+      if (fail) {
+        fail = false;
+        throw new Error("injected terminal persistence failure");
+      }
+    });
+    const terminal = {
+      ...original,
+      reason: "COMPLETED" as const,
+      revisionSequence: 1n,
+      revisionKind: "SNAPSHOT" as const,
+      usage: {
+        accountingVersion: "usage-v1",
+        authoritativeBillableTokens: 3n,
+        observationComplete: true,
+        confidence: "REPORTED" as const,
+      },
+    };
+    await expect(service.reconcileProviderBudget(terminal)).rejects.toThrow("injected");
+    expect(await db.providerUsageLedger.count({ where: { attemptId: original.attemptId } })).toBe(
+      0,
+    );
+    await expect(
+      db.providerAttempt.findUniqueOrThrow({
+        where: {
+          attemptId_fencingToken: {
+            attemptId: original.attemptId,
+            fencingToken: original.fencingToken,
+          },
+        },
+      }),
+    ).resolves.toMatchObject({ state: "ACTIVE", terminalAt: null });
+
+    await service.reconcileProviderBudget(terminal);
+    service.setTerminalPersistenceTestFailureInjector(undefined);
+    expect(await db.providerUsageLedger.count({ where: { attemptId: original.attemptId } })).toBe(
+      1,
+    );
+    await expect(
+      db.providerAttempt.findUniqueOrThrow({
+        where: {
+          attemptId_fencingToken: {
+            attemptId: original.attemptId,
+            fencingToken: original.fencingToken,
+          },
+        },
+      }),
+    ).resolves.toMatchObject({ state: "COMPLETED", terminalReason: "COMPLETED" });
+  });
+
+  it("leaves a failed terminal transaction recoverable by the crash sweeper", async () => {
+    if (!db) return;
+    const row = await fixture({ metric: "TOKENS" });
+    const original = attempt(row, `terminal-crash-${crypto.randomUUID()}`, {
+      tokens: 6n,
+      accountingVersion: "usage-v1",
+    });
+    original.expiresAt = new Date(Date.now() + 100);
+    await service.admitProviderBudget(original);
+    service.setTerminalPersistenceTestFailureInjector(() => {
+      throw new Error("injected terminal persistence failure");
+    });
+    await expect(
+      service.reconcileProviderBudget({
+        ...original,
+        reason: "COMPLETED",
+        revisionSequence: 1n,
+        revisionKind: "SNAPSHOT",
+      }),
+    ).rejects.toThrow("injected");
+    service.setTerminalPersistenceTestFailureInjector(undefined);
+    await service.repairExpiredProviderBudgets(new Date(Date.now() + 1_000));
+    const ledger = await db.providerUsageLedger.findFirstOrThrow({
+      where: { attemptId: original.attemptId },
+    });
+    expect(ledger).toMatchObject({ terminalReason: "CRASH_RECOVERY", usageKnown: false });
+    await expect(
+      db.providerAttempt.findUniqueOrThrow({
+        where: {
+          attemptId_fencingToken: {
+            attemptId: original.attemptId,
+            fencingToken: original.fencingToken,
+          },
+        },
+      }),
+    ).resolves.toMatchObject({ state: "EXPIRED", terminalReason: "CRASH_RECOVERY" });
   });
 
   it("crash sweep retains expired liability and preserves the reservation identity", async () => {
@@ -839,6 +937,8 @@ integration("provider budget admission and reconciliation", () => {
       usage: {
         accountingVersion: "usage-v1",
         confidence: "REPORTED",
+        categoriesComplete: false,
+        observationComplete: true,
         reportedCost: "2.5",
         reportedCostCurrency: "USD",
         reportedCostPricingVersion: "price-v1",
@@ -848,6 +948,36 @@ integration("provider budget admission and reconciliation", () => {
       where: { attemptId: valid.attemptId },
     });
     expect(reservations.map((item) => item.settledValue?.toString())).toEqual(["2.5", "2.5"]);
+
+    const truncated = {
+      ...valid,
+      requestId: `request-spend-truncated-${crypto.randomUUID()}`,
+      attemptId: `spend-truncated-${crypto.randomUUID()}`,
+    };
+    await expect(service.admitProviderBudget(truncated)).resolves.toMatchObject({ admitted: true });
+    await service.reconcileProviderBudget({
+      ...truncated,
+      reason: "FAILED",
+      revisionSequence: 1n,
+      revisionKind: "SNAPSHOT",
+      usage: {
+        accountingVersion: "usage-v1",
+        confidence: "REPORTED",
+        categoriesComplete: true,
+        observationComplete: false,
+        reportedCost: "1",
+        reportedCostCurrency: "USD",
+        reportedCostPricingVersion: "price-v1",
+      },
+    });
+    const truncatedReservations = await db.providerBudgetReservation.findMany({
+      where: { attemptId: truncated.attemptId },
+    });
+    expect(truncatedReservations.map((item) => item.settledValue?.toString())).toEqual(["4", "4"]);
+    const truncatedLedger = await db.providerUsageLedger.findFirstOrThrow({
+      where: { attemptId: truncated.attemptId },
+    });
+    expect(truncatedLedger).toMatchObject({ costKnown: false, settledCost: null });
   });
 
   it.each(["UTC_DAY", "UTC_MONTH"] as const)(

@@ -740,6 +740,7 @@ export function usageFromObject(value: unknown): RawProviderUsage | undefined {
     : undefined;
   const authoritativeBillableTokens = usageInteger(usage.billable_tokens);
   const reportedTotalTokens = usageInteger(usage.total_tokens);
+  const reportedCost = usageCost(usage.cost ?? usage.total_cost);
   if (
     inputTokens === undefined &&
     outputTokens === undefined &&
@@ -748,10 +749,10 @@ export function usageFromObject(value: unknown): RawProviderUsage | undefined {
     authoritativeBillableTokens === undefined &&
     reasoningTokens === undefined &&
     usageInteger(usage.tool_tokens) === undefined &&
-    additionalBillableTokens === undefined
+    additionalBillableTokens === undefined &&
+    reportedCost === undefined
   )
     return undefined;
-  const reportedCost = usageCost(usage.cost ?? usage.total_cost);
   const knownUsageKeys = new Set([
     "input_tokens",
     "prompt_tokens",
@@ -927,8 +928,9 @@ export function parseProviderUsage(
     categoriesComplete:
       found.authoritativeBillableTokens === undefined &&
       found.inputTokens !== undefined &&
-      found.outputTokens !== undefined &&
-      categoriesComplete,
+      found.outputTokens !== undefined
+        ? categoriesComplete
+        : found.categoriesComplete,
   };
   const calculated = pricing ? calculatedCostForUsage(normalized, pricing) : undefined;
   return calculated
@@ -1061,7 +1063,9 @@ async function readRetryableProviderUsage(
   } catch {
     return undefined;
   }
-  return response.complete ? parseProviderUsage(chunks, pricing) : undefined;
+  if (!response.complete) return undefined;
+  const usage = parseProviderUsage(chunks, pricing);
+  return usage ? { ...usage, observationComplete: true } : undefined;
 }
 
 async function recordProviderHealth(
@@ -1687,6 +1691,7 @@ export async function dispatchPublicOverflow(
           reason: "FAILED",
           revisionSequence: 1n,
           revisionKind: "SNAPSHOT",
+          observationComplete: response.complete,
           usageSource: retryUsage ? `${upstream.protocol}-retryable-response` : undefined,
           usage: retryUsage,
         });
@@ -1717,7 +1722,7 @@ export async function dispatchPublicOverflow(
       }
       const body = Readable.toWeb(response) as ReadableStream<Uint8Array>;
       const reader = body.getReader();
-      let reconciled = false;
+      let reconciliation: Promise<void> | undefined;
       let responseBytes = 0;
       let firstClientByteAt: Date | undefined;
       let firstClientBytePersistence: Promise<void> | undefined;
@@ -1728,112 +1733,111 @@ export async function dispatchPublicOverflow(
         resolveTerminal = resolve;
       });
       const httpOk = status >= 200 && status < 400;
-      const reconcile = async (streamComplete: boolean) => {
-        if (reconciled) return;
-        reconciled = true;
-        stopHeartbeat();
-        const ok = streamComplete && httpOk;
-        const healthOutcome = providerHealthOutcome(status);
-        const attemptAborted = request.signal.aborted || attemptController.signal.aborted;
-        if (!attemptAborted && healthOutcome !== "NEUTRAL") {
-          await recordProviderHealth(
-            target,
-            request.userId,
-            streamComplete && healthOutcome === "SUCCESS",
-            { status, retryAfter: response.headers["retry-after"] },
-            { attemptId, fencingToken },
-          );
-        }
-        if (attemptAborted || healthOutcome === "NEUTRAL") {
-          await releaseProviderHealthTrial({
+      const reconcile = (streamComplete: boolean): Promise<void> => {
+        if (reconciliation) return reconciliation;
+        reconciliation = (async () => {
+          stopHeartbeat();
+          const ok = streamComplete && httpOk;
+          const healthOutcome = providerHealthOutcome(status);
+          const attemptAborted = request.signal.aborted || attemptController.signal.aborted;
+          if (!attemptAborted && healthOutcome !== "NEUTRAL") {
+            await recordProviderHealth(
+              target,
+              request.userId,
+              streamComplete && healthOutcome === "SUCCESS",
+              { status, retryAfter: response.headers["retry-after"] },
+              { attemptId, fencingToken },
+            ).catch(() => undefined);
+          }
+          if (attemptAborted || healthOutcome === "NEUTRAL") {
+            await releaseProviderHealthTrial({
+              userId: request.userId,
+              providerAccountId: target.providerAccountId,
+              providerModelId: target.providerModelId,
+              attemptId,
+              fencingToken,
+            }).catch(() => false);
+          }
+          const observedUsage = parseProviderUsage(usageChunks, pricing);
+          const observationComplete =
+            streamComplete &&
+            (!request.stream ||
+              providerStreamHasTerminalUsageEvent(
+                usageChunks,
+                nativeSurface ?? request.requestedSurface,
+              ));
+          const usage = observedUsage
+            ? {
+                ...observedUsage,
+                // Transport completion is independent from whether the provider
+                // exposes every token category. A complete cost-only observation
+                // may settle spend, while truncated observations remain audit-only.
+                observationComplete,
+              }
+            : undefined;
+          await reconcileProviderBudget({
             userId: request.userId,
             providerAccountId: target.providerAccountId,
             providerModelId: target.providerModelId,
+            credentialId: target.credential.id,
+            poolId: request.poolId,
+            requestId: request.requestId,
             attemptId,
             fencingToken,
-          }).catch(() => false);
-        }
-        const observedUsage = parseProviderUsage(usageChunks, pricing);
-        const observationComplete =
-          streamComplete &&
-          (!request.stream ||
-            providerStreamHasTerminalUsageEvent(
-              usageChunks,
-              nativeSurface ?? request.requestedSurface,
-            ));
-        const usage = observedUsage
-          ? {
-              ...observedUsage,
-              // A terminal usage event may not have arrived. Retain the partial
-              // provider observation for audit, but never release conservative
-              // liability based on it.
-              categoriesComplete: observationComplete ? observedUsage.categoriesComplete : false,
-            }
-          : undefined;
-        await reconcileProviderBudget({
-          userId: request.userId,
-          providerAccountId: target.providerAccountId,
-          providerModelId: target.providerModelId,
-          credentialId: target.credential.id,
-          poolId: request.poolId,
-          requestId: request.requestId,
-          attemptId,
-          fencingToken,
-          reason: terminalReason(request.signal, ok),
-          revisionSequence: 1n,
-          revisionKind: "SNAPSHOT",
-          usageSource: usage ? `${upstream.protocol}-response` : "missing-provider-usage",
-          usage,
-        }).catch(() => undefined);
-        const state = request.signal.aborted ? "CANCELLED" : ok ? "COMPLETED" : "FAILED";
-        await finishProviderAttempt({
-          attemptId,
-          fencingToken,
-          state,
-          reason: terminalReason(request.signal, ok),
-        }).catch(() => false);
-        // If client commitment already began, retain event creation order
-        // without ever making client delivery wait for telemetry persistence.
-        await firstClientBytePersistence;
-        await recordProviderAttemptEvent({
-          userId: request.userId,
-          providerAccountId: target.providerAccountId,
-          providerModelId: target.providerModelId,
-          providerAttemptId,
-          requestId: request.requestId,
-          attemptId,
-          fencingToken,
-          eventType: "TERMINAL",
-          reason: terminalReason(request.signal, ok),
-          ...providerEventRouting({ request, target, nativeSurface }),
-          reservationId: admission.reservationIds[0],
-          reservationIds: admission.reservationIds,
-          waitDurationMs: providerWaitDurationMs,
-          terminalState: state,
-          firstClientByteAt,
-          streamCommitted: firstClientByteAt !== undefined,
-          usage: usage
-            ? {
-                inputTokens: usage.inputTokens?.toString() ?? null,
-                outputTokens: usage.outputTokens?.toString() ?? null,
-                cacheReadTokens: usage.cacheReadTokens?.toString() ?? null,
-                cacheWriteTokens: usage.cacheWriteTokens?.toString() ?? null,
-                reasoningTokens: usage.reasoningTokens?.toString() ?? null,
-                toolTokens: usage.toolTokens?.toString() ?? null,
-                categoriesComplete: usage.categoriesComplete ?? null,
-                accountingVersion: usage.accountingVersion,
-                confidence: usage.confidence,
-              }
-            : undefined,
-          metadata: { status, responseBytes, streamComplete },
-        }).catch(() => undefined);
-        resolveTerminal({ ok, responseBytes });
+            reason: terminalReason(request.signal, ok),
+            revisionSequence: 1n,
+            revisionKind: "SNAPSHOT",
+            observationComplete,
+            usageSource: usage ? `${upstream.protocol}-response` : "missing-provider-usage",
+            usage,
+          });
+          const state = request.signal.aborted ? "CANCELLED" : ok ? "COMPLETED" : "FAILED";
+          // If client commitment already began, retain event creation order
+          // without ever making client delivery wait for telemetry persistence.
+          await firstClientBytePersistence;
+          await recordProviderAttemptEvent({
+            userId: request.userId,
+            providerAccountId: target.providerAccountId,
+            providerModelId: target.providerModelId,
+            providerAttemptId,
+            requestId: request.requestId,
+            attemptId,
+            fencingToken,
+            eventType: "TERMINAL",
+            reason: terminalReason(request.signal, ok),
+            ...providerEventRouting({ request, target, nativeSurface }),
+            reservationId: admission.reservationIds[0],
+            reservationIds: admission.reservationIds,
+            waitDurationMs: providerWaitDurationMs,
+            terminalState: state,
+            firstClientByteAt,
+            streamCommitted: firstClientByteAt !== undefined,
+            usage: usage
+              ? {
+                  inputTokens: usage.inputTokens?.toString() ?? null,
+                  outputTokens: usage.outputTokens?.toString() ?? null,
+                  cacheReadTokens: usage.cacheReadTokens?.toString() ?? null,
+                  cacheWriteTokens: usage.cacheWriteTokens?.toString() ?? null,
+                  reasoningTokens: usage.reasoningTokens?.toString() ?? null,
+                  toolTokens: usage.toolTokens?.toString() ?? null,
+                  categoriesComplete: usage.categoriesComplete ?? null,
+                  accountingVersion: usage.accountingVersion,
+                  confidence: usage.confidence,
+                }
+              : undefined,
+            metadata: { status, responseBytes, streamComplete },
+          }).catch(() => undefined);
+          resolveTerminal({ ok, responseBytes });
+        })();
+        return reconciliation;
       };
       const heldBody = new ReadableStream<Uint8Array>({
         async pull(controller) {
+          let reachedEof = false;
           try {
             const chunk = await reader.read();
             if (chunk.done) {
+              reachedEof = true;
               // Do not expose EOF until correctness-required settlement and
               // health release are durable. Sequential Responses lifecycle
               // calls issued immediately after body consumption must not race
@@ -1850,13 +1854,22 @@ export async function dispatchPublicOverflow(
             }
           } catch (error) {
             controller.error(error);
-            await reconcile(false);
+            if (reachedEof) {
+              // A failed durable success terminal remains ACTIVE for retry or
+              // crash repair; never rewrite it as a transport failure.
+              resolveTerminal({ ok: false, responseBytes });
+            } else {
+              // A provider-side truncation is itself the terminal observation.
+              // Persist its conservative failure settlement before resolving
+              // the terminal promise, while preserving the stream error.
+              await reconcile(false).catch(() => resolveTerminal({ ok: false, responseBytes }));
+            }
           }
         },
         async cancel(reason) {
           await reader.cancel(reason).catch(() => undefined);
           response.destroy(reason instanceof Error ? reason : undefined);
-          await reconcile(false);
+          await reconcile(false).catch(() => resolveTerminal({ ok: false, responseBytes }));
         },
       });
       const bodyForbidden = status === 204 || status === 205 || status === 304;

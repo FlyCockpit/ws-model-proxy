@@ -388,4 +388,21 @@ describe("public overflow compatibility", () => {
       confidence: "REPORTED",
     });
   });
+
+  it("preserves authoritative cost-only usage independently of token categories", () => {
+    const usage = parseProviderUsage([
+      new TextEncoder().encode(
+        '{"usage":{"cost":1.25,"currency":"usd","pricing_version":"price-v2"}}',
+      ),
+    ]);
+    expect(usage).toMatchObject({
+      reportedCost: 1.25,
+      reportedCostCurrency: "USD",
+      reportedCostPricingVersion: "price-v2",
+      categoriesComplete: undefined,
+      confidence: "REPORTED",
+    });
+    expect(usage?.inputTokens).toBeUndefined();
+    expect(usage?.outputTokens).toBeUndefined();
+  });
 });

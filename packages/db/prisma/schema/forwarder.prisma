@@ -720,6 +720,8 @@ model ProviderUsageLedger {
   reportedTotalTokens          BigInt?
   billableTotal                BigInt?
   categoriesComplete           Boolean?
+  /// Whether the provider transport reached its terminal usage boundary.
+  observationComplete          Boolean?
   rawUsage                     Json?
   reportedCost                 Decimal?                       @db.Decimal(30, 9)
   reportedCostCurrency         String?

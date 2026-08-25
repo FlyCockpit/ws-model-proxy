@@ -11,6 +11,14 @@ export { budgetWindow, providerBillableTokens } from "./provider-budget-accounti
 const RETRYABLE_TRANSACTION_CODES = new Set(["P2034", "40001", "40P01"]);
 const MAX_TRANSACTION_ATTEMPTS = 5;
 
+let terminalPersistenceTestFailure: (() => void) | undefined;
+
+export function setTerminalPersistenceTestFailureInjector(injector: (() => void) | undefined) {
+  if (process.env.NODE_ENV !== "test")
+    throw new Error("Terminal persistence failure injection is test-only");
+  terminalPersistenceTestFailure = injector;
+}
+
 export type BudgetMetric = "CONCURRENCY" | "TOKENS" | "SPEND";
 export type { BudgetPeriod } from "./provider-budget-accounting.js";
 export type UsageConfidence = "REPORTED" | "CALCULATED" | "ESTIMATED";
@@ -62,6 +70,8 @@ export interface RawProviderUsage extends ProviderTokenUsage {
   reasoningTokens?: bigint;
   toolTokens?: bigint;
   rawUsage?: Prisma.InputJsonValue;
+  /** Whether the transport reached its provider-defined terminal boundary. */
+  observationComplete?: boolean;
   /** A provider total may be supplied only when it does not include the categories above. */
   reportedCost?: string | number | Prisma.Decimal;
   reportedCostCurrency?: string;
@@ -96,6 +106,8 @@ export interface ProviderBudgetTerminal {
   /** SNAPSHOT replaces the known total; DELTA adds newly reported usage. */
   revisionKind: "SNAPSHOT" | "DELTA";
   usageSource?: string;
+  /** Whether the provider transport reached its terminal response boundary. */
+  observationComplete?: boolean;
   usage?: RawProviderUsage;
 }
 
@@ -208,6 +220,7 @@ function terminalPayloadHash(
         reportedTotalTokens: usage.reportedTotalTokens,
         categoriesComplete: usage.categoriesComplete,
         rawUsage: usage.rawUsage,
+        observationComplete: usage.observationComplete,
         reportedCost: usage.reportedCost === undefined ? undefined : decimal(usage.reportedCost),
         reportedCostCurrency: normalizedCurrency(usage.reportedCostCurrency ?? usage.currency),
         reportedCostPricingVersion:
@@ -253,6 +266,7 @@ function terminalPayloadHash(
     sourceVersion,
     revisionSequence: terminal.revisionSequence,
     revisionKind: terminal.revisionKind,
+    observationComplete: terminal.observationComplete,
     usageSource,
     usage: normalizedUsage,
   });
@@ -736,6 +750,7 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
     };
 
     const usage = terminal.usage;
+    const observationComplete = terminal.observationComplete ?? usage?.observationComplete;
     const sourceUsageAccountingVersion = usage
       ? normalizedVersion(usage.accountingVersion, "accountingVersion")
       : undefined;
@@ -820,7 +835,7 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
     // non-streaming providers report an authoritative charge without a full
     // token-category breakdown. An explicit false, however, marks a truncated
     // observation and must retain the conservative admitted liability.
-    const costKnown = suppliedCost !== undefined && usage?.categoriesComplete !== false;
+    const costKnown = suppliedCost !== undefined && observationComplete !== false;
     const suppliedCostConfidence: UsageConfidence = reportedMatches
       ? "REPORTED"
       : calculatedMatches
@@ -831,7 +846,10 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
     for (const reservation of reservations) {
       const trustworthy =
         reservation.metric === "CONCURRENCY" ||
-        (reservation.metric === "TOKENS" && accountingMatches && billableTotal !== undefined) ||
+        (reservation.metric === "TOKENS" &&
+          accountingMatches &&
+          observationComplete !== false &&
+          billableTotal !== undefined) ||
         (reservation.metric === "SPEND" && costKnown);
       const prior = await tx.providerBudgetSettlement.aggregate({
         where: { reservationId: reservation.id },
@@ -912,6 +930,7 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
         reportedTotalTokens: usage?.reportedTotalTokens,
         billableTotal: accountingMatches ? billableTotal : undefined,
         categoriesComplete: usage?.categoriesComplete,
+        observationComplete,
         rawUsage: usage?.rawUsage,
         reportedCost: usage?.reportedCost,
         reportedCostCurrency: reportedCurrency,
@@ -937,7 +956,9 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
         revisionKind: terminal.revisionKind,
         payloadHash,
         usageSource,
-        usageKnown: Boolean(accountingMatches && billableTotal !== undefined),
+        usageKnown: Boolean(
+          accountingMatches && observationComplete !== false && billableTotal !== undefined,
+        ),
         costKnown,
         terminalReason: terminal.reason,
         confidence: costKnown
@@ -947,6 +968,28 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
             : "ESTIMATED",
       },
     });
+    terminalPersistenceTestFailure?.();
+    if (terminal.reason !== "CRASH_RECOVERY") {
+      const terminalAt = new Date();
+      const finalized = await tx.providerAttempt.updateMany({
+        where: { id: anchor.id, state: "ACTIVE" },
+        data: {
+          state:
+            terminal.reason === "COMPLETED"
+              ? "COMPLETED"
+              : terminal.reason === "CANCELLED"
+                ? "CANCELLED"
+                : "FAILED",
+          terminalReason: terminal.reason,
+          terminalAt,
+          heartbeatAt: terminalAt,
+        },
+      });
+      if (previousLedgers.length === 0 && finalized.count !== 1)
+        throw new ProviderBudgetConfigurationError(
+          "Provider attempt was not active at initial terminal settlement",
+        );
+    }
     await expireCrashAnchor();
   });
 }

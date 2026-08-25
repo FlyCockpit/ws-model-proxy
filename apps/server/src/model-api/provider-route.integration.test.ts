@@ -1167,7 +1167,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     "%s retains conservative liability for a truncated native provider stream",
     async (requested) => {
       const result = await runCase({ requested, native: requested, behavior: "crash" });
-      expect(result.ledger.categoriesComplete).not.toBe(true);
+      expect(result.ledger.observationComplete).toBe(false);
       expect(result.ledger.usageKnown).toBe(false);
       expect(result.attempt.state).toBe("FAILED");
       expect(result.reservations.every((row) => row.state === "SETTLED")).toBe(true);
