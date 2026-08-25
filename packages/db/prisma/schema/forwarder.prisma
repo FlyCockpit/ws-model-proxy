@@ -79,6 +79,12 @@ enum UsageCostConfidence {
   ESTIMATED
 }
 
+enum ProviderPricingStatus {
+  DRAFT
+  ACTIVE
+  RETIRED
+}
+
 enum ProviderAccountingRevisionKind {
   SNAPSHOT
   DELTA
@@ -100,6 +106,11 @@ enum ProviderAuditAction {
   BUDGET_UPDATED
   BUDGET_ACTIVATED
   BUDGET_DEACTIVATED
+  PRICING_CREATED
+  PRICING_UPDATED
+  PRICING_ACTIVATED
+  PRICING_RETIRED
+  PRICING_DELETED
 }
 
 enum ExecutionTargetKind {
@@ -703,6 +714,7 @@ model ProviderUsageLedger {
   toolTokens                   BigInt?
   additionalBillableTokens     BigInt?
   authoritativeBillableTokens  BigInt?
+  reportedTotalTokens          BigInt?
   billableTotal                BigInt?
   categoriesComplete           Boolean?
   rawUsage                     Json?
@@ -744,20 +756,26 @@ model ProviderUsageLedger {
 
 /// Immutable provider price schedule referenced by usage rows via version.
 model ProviderPricingVersion {
-  id                String          @id @default(cuid(2))
-  createdAt         DateTime        @default(now())
+  id                String                @id @default(cuid(2))
+  createdAt         DateTime              @default(now())
   userId            String
   providerAccountId String
   providerModelId   String
   version           String
   currency          String
+  status            ProviderPricingStatus @default(ACTIVE)
+  accountingVersion String                @default("provider-billable-v1")
+  confidence        UsageCostConfidence   @default(ESTIMATED)
   pricing           Json
+  chargeRules       Json                  @default("{}")
   effectiveAt       DateTime
+  activatedAt       DateTime?             @default(now())
   retiredAt         DateTime?
-  ProviderAccount   ProviderAccount @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  ProviderModel     ProviderModel   @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  ProviderAccount   ProviderAccount       @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  ProviderModel     ProviderModel         @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
 
   @@unique([providerModelId, version])
+  @@index([providerModelId, status, effectiveAt, retiredAt])
   @@index([userId, effectiveAt])
   @@map("provider_pricing_version")
 }

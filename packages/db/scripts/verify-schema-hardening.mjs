@@ -52,6 +52,11 @@ const requiredFragments = [
   "enforce_provider_budget_graph_consistency",
   "enforce_provider_budget_history_transitions",
   "enforce_provider_budget_reservation_transition",
+  "provider_pricing_version_shape_check",
+  "enforce_provider_pricing_version_immutability",
+  "activated provider pricing billing fields are immutable",
+  "provider pricing lifecycle timestamps are immutable",
+  "pricing retirement preserves activation and sets retirement",
   'btrim("accountingVersion")',
   'AND br."pricingVersion" IS NOT DISTINCT FROM NEW."pricingVersion"',
 ];
@@ -490,9 +495,12 @@ try {
     INSERT INTO execution_target
       (id, "createdAt", "updatedAt", "userId", kind, "providerModelId")
     VALUES ('provider-target-a', NOW(), NOW(), 'owner-a', 'PROVIDER_MODEL', 'provider-model-a');
+    UPDATE model_pool
+       SET "publicEgressEnabled" = TRUE, "publicEgressAcknowledged" = TRUE
+     WHERE id = 'pool-a';
     INSERT INTO pool_member
-      (id, "createdAt", "updatedAt", "poolId", "executionTargetId")
-    VALUES ('provider-member', NOW(), NOW(), 'pool-a', 'provider-target-a');
+      (id, "createdAt", "updatedAt", "poolId", "executionTargetId", tier, "publicOrder")
+    VALUES ('provider-member', NOW(), NOW(), 'pool-a', 'provider-target-a', 'PUBLIC_OVERFLOW', 0);
     INSERT INTO response_stickiness_record
       (id, "createdAt", "updatedAt", "userId", "routingKeyDigest",
        "targetExecutionTargetId", "selectedExecutionTargetId")
@@ -689,6 +697,53 @@ try {
       (id, "createdAt", "userId", "providerAccountId", action, "subjectId")
     VALUES ('bad-audit', NOW(), 'owner-b', 'provider-account-a', 'ACCOUNT_UPDATED', 'provider-account-a')
   `);
+  await client.query(`
+    INSERT INTO provider_pricing_version
+      (id, "createdAt", "userId", "providerAccountId", "providerModelId", version,
+       currency, status, "accountingVersion", pricing, "chargeRules", "effectiveAt", "activatedAt")
+    VALUES ('pricing-lifecycle-a', NOW(), 'owner-a', 'provider-account-a', 'provider-model-a',
+      'lifecycle-v1', 'USD', 'DRAFT', 'usage-v1', '{"ratesPerMillion":{"input":"1","output":"2"}}',
+      '{"unknownCategories":"FAIL_CLOSED"}', NOW() + interval '1 hour', NULL)
+  `);
+  await expectConstraintFailure(
+    `
+    UPDATE provider_pricing_version SET "activatedAt" = NOW()
+     WHERE id = 'pricing-lifecycle-a'
+  `,
+    "55000",
+  );
+  await client.query(`
+    UPDATE provider_pricing_version SET status = 'ACTIVE', "activatedAt" = NOW()
+     WHERE id = 'pricing-lifecycle-a'
+  `);
+  await expectConstraintFailure(
+    `
+    UPDATE provider_pricing_version SET "activatedAt" = "activatedAt" + interval '1 second'
+     WHERE id = 'pricing-lifecycle-a'
+  `,
+    "55000",
+  );
+  await expectConstraintFailure(
+    `
+    UPDATE provider_pricing_version SET status = 'RETIRED',
+      "activatedAt" = "activatedAt" + interval '1 second',
+      "retiredAt" = "effectiveAt" + interval '1 hour'
+     WHERE id = 'pricing-lifecycle-a'
+  `,
+    "55000",
+  );
+  await client.query(`
+    UPDATE provider_pricing_version SET status = 'RETIRED',
+      "retiredAt" = "effectiveAt" + interval '1 hour'
+     WHERE id = 'pricing-lifecycle-a'
+  `);
+  await expectConstraintFailure(
+    `
+    UPDATE provider_pricing_version SET "retiredAt" = "retiredAt" + interval '1 second'
+     WHERE id = 'pricing-lifecycle-a'
+  `,
+    "55000",
+  );
   await client.query("BEGIN");
   await client.query(`
     INSERT INTO provider_credential

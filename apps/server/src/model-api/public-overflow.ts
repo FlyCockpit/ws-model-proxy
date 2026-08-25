@@ -8,9 +8,10 @@ import {
   type ProviderProtocol,
   providerHttpsRequest,
 } from "@ws-model-proxy/api/lib/provider-egress";
-import prisma from "@ws-model-proxy/db";
+import prisma, { Prisma } from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
 import type { ProtocolSurface } from "./protocols/index.js";
+import { SseDecoder } from "./protocols/sse.js";
 import {
   allocateProviderFence,
   claimProviderHealthTrial,
@@ -29,6 +30,12 @@ import {
   type RawProviderUsage,
   reconcileProviderBudget,
 } from "./provider-budget.js";
+import {
+  calculatedCostForUsage,
+  liabilityFromPricing,
+  type ProviderPricingSchedule,
+  resolveActiveProviderPricing,
+} from "./provider-pricing.js";
 
 export type PublicOverflowReason =
   | "NO_COMPATIBLE_HEALTHY_PRIMARY"
@@ -61,7 +68,12 @@ export interface PublicOverflowRequest {
   body: Uint8Array;
   signal: AbortSignal;
   liability: ProviderLiability;
-  requestedOutputTokens: bigint;
+  /** Conservative rendered input bound before any provider output. */
+  estimatedInputTokens?: bigint;
+  /** Conservative rendered input plus requested output, used only for context fit. */
+  contextTokens?: bigint;
+  /** Undefined means reserve the selected provider model's maximum output. */
+  requestedOutputTokens?: bigint;
   contextCountMethod?: string;
   contextCountConfidence?: string;
   /** Must be called before credential decryption or any network attempt. */
@@ -215,16 +227,22 @@ export function publicTargetCompatibility(
     | "adaptationEnabled"
     | "renderForTarget"
     | "liability"
+    | "estimatedInputTokens"
+    | "contextTokens"
   >,
 ): "COMPATIBLE" | "CONTEXT_UNKNOWN" | "CONTEXT_EXCEEDED" | "PROTOCOL_UNAVAILABLE" {
-  if (target.contextWindow === null || request.liability.tokens === undefined)
+  const requestedOutputTokens =
+    request.requestedOutputTokens ??
+    (target.maxOutputTokens === null ? undefined : BigInt(target.maxOutputTokens));
+  const contextTokens =
+    request.estimatedInputTokens !== undefined && requestedOutputTokens !== undefined
+      ? checkedContextTokens(request.estimatedInputTokens, requestedOutputTokens)
+      : (request.contextTokens ?? request.liability.tokens);
+  if (target.contextWindow === null || contextTokens === undefined) return "CONTEXT_UNKNOWN";
+  if (contextTokens > BigInt(target.contextWindow)) return "CONTEXT_EXCEEDED";
+  if (target.maxOutputTokens === null || requestedOutputTokens === undefined)
     return "CONTEXT_UNKNOWN";
-  if (request.liability.tokens > BigInt(target.contextWindow)) return "CONTEXT_EXCEEDED";
-  if (
-    target.maxOutputTokens === null ||
-    request.requestedOutputTokens > BigInt(target.maxOutputTokens)
-  )
-    return "CONTEXT_EXCEEDED";
+  if (requestedOutputTokens > BigInt(target.maxOutputTokens)) return "CONTEXT_EXCEEDED";
   if (request.stream && !target.supportsStreaming) return "PROTOCOL_UNAVAILABLE";
   if (request.requiredFeatures.some((feature) => !target.supportedFeatures.includes(feature)))
     return "PROTOCOL_UNAVAILABLE";
@@ -471,40 +489,181 @@ function usageInteger(value: unknown): bigint | undefined {
     : undefined;
 }
 
-function usageFromObject(value: unknown): RawProviderUsage | undefined {
+function usageString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function usageCost(value: unknown): string | number | undefined {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+  const candidate = usageString(value);
+  if (!candidate) return undefined;
+  try {
+    const parsed = new Prisma.Decimal(candidate);
+    return parsed.isFinite() && !parsed.isNegative() ? candidate : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function usageRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function exclusive(total: bigint | undefined, subset: bigint | undefined): bigint | undefined {
+  if (total === undefined) return undefined;
+  if (subset === undefined) return total;
+  return subset <= total ? total - subset : undefined;
+}
+
+export function usageFromObject(value: unknown): RawProviderUsage | undefined {
   if (!value || typeof value !== "object") return undefined;
   const root = value as Record<string, unknown>;
-  const raw = (root.usage ?? root.message) as Record<string, unknown> | undefined;
+  // Responses terminal stream events nest the authoritative usage object in
+  // `response.usage`; Chat and Anthropic expose it at the other two shapes.
+  const raw = (root.usage ?? root.response ?? root.message) as Record<string, unknown> | undefined;
   const usage =
     raw?.usage && typeof raw.usage === "object" ? (raw.usage as Record<string, unknown>) : raw;
   if (!usage || typeof usage !== "object") return undefined;
-  const inputTokens = usageInteger(usage.input_tokens ?? usage.prompt_tokens);
-  const outputTokens = usageInteger(usage.output_tokens ?? usage.completion_tokens);
-  if (inputTokens === undefined && outputTokens === undefined) return undefined;
+  const promptDetails = usageRecord(usage.prompt_tokens_details ?? usage.input_tokens_details);
+  const completionDetails = usageRecord(
+    usage.completion_tokens_details ?? usage.output_tokens_details,
+  );
+  const cacheReadTokens = usageInteger(
+    usage.cache_read_input_tokens ?? promptDetails?.cached_tokens,
+  );
+  const cacheWriteTokens = usageInteger(usage.cache_creation_input_tokens);
+  const reasoningTokens = usageInteger(completionDetails?.reasoning_tokens);
+  const promptTotal = usageInteger(usage.input_tokens ?? usage.prompt_tokens);
+  const completionTotal = usageInteger(usage.output_tokens ?? usage.completion_tokens);
+  const openAiShape =
+    usage.prompt_tokens !== undefined ||
+    usage.completion_tokens !== undefined ||
+    usage.input_tokens_details !== undefined;
+  const inputTokens = openAiShape ? exclusive(promptTotal, cacheReadTokens) : promptTotal;
+  const outputTokens = openAiShape ? exclusive(completionTotal, reasoningTokens) : completionTotal;
+  const authoritativeBillableTokens = usageInteger(usage.billable_tokens);
+  const reportedTotalTokens = usageInteger(usage.total_tokens);
+  if (
+    inputTokens === undefined &&
+    outputTokens === undefined &&
+    cacheReadTokens === undefined &&
+    cacheWriteTokens === undefined &&
+    authoritativeBillableTokens === undefined
+  )
+    return undefined;
+  const reportedCost = usageCost(usage.cost ?? usage.total_cost);
+  const knownUsageKeys = new Set([
+    "input_tokens",
+    "prompt_tokens",
+    "output_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "input_tokens_details",
+    "prompt_tokens_details",
+    "output_tokens_details",
+    "completion_tokens_details",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "billable_tokens",
+    "tool_tokens",
+    "additional_billable_tokens",
+    "cost",
+    "total_cost",
+    "currency",
+    "pricing_version",
+  ]);
+  const knownPromptDetailKeys = new Set(["cached_tokens"]);
+  const knownCompletionDetailKeys = new Set(["reasoning_tokens"]);
+  const hasUnknownUsageCategory = Object.keys(usage).some((key) => !knownUsageKeys.has(key));
+  const hasUnknownPromptDetail =
+    promptDetails !== undefined &&
+    Object.keys(promptDetails).some((key) => !knownPromptDetailKeys.has(key));
+  const hasUnknownCompletionDetail =
+    completionDetails !== undefined &&
+    Object.keys(completionDetails).some((key) => !knownCompletionDetailKeys.has(key));
+  const hasUnknownCategories =
+    hasUnknownUsageCategory || hasUnknownPromptDetail || hasUnknownCompletionDetail;
+  const normalizedCategoryTotal =
+    inputTokens !== undefined && outputTokens !== undefined
+      ? [
+          inputTokens,
+          outputTokens,
+          cacheReadTokens,
+          cacheWriteTokens,
+          reasoningTokens,
+          usageInteger(usage.tool_tokens),
+          usageInteger(usage.additional_billable_tokens),
+        ].reduce<bigint>((sum, item) => sum + (item ?? 0n), 0n)
+      : undefined;
+  const categoriesComplete = hasUnknownCategories
+    ? false
+    : authoritativeBillableTokens !== undefined ||
+        inputTokens === undefined ||
+        outputTokens === undefined
+      ? undefined
+      : !(reportedTotalTokens !== undefined && reportedTotalTokens !== normalizedCategoryTotal);
   return {
     inputTokens,
     outputTokens,
-    cacheReadTokens: usageInteger(usage.cache_read_input_tokens),
-    cacheWriteTokens: usageInteger(usage.cache_creation_input_tokens),
-    categoriesComplete: false,
+    cacheReadTokens,
+    cacheWriteTokens,
+    reasoningTokens,
+    toolTokens: usageInteger(usage.tool_tokens),
+    additionalBillableTokens: usageInteger(usage.additional_billable_tokens),
+    authoritativeBillableTokens,
+    reportedTotalTokens,
+    categoriesComplete,
+    rawUsage: JSON.parse(JSON.stringify(usage)),
+    reportedCost,
+    reportedCostCurrency: usageString(usage.currency)?.toUpperCase(),
+    reportedCostPricingVersion: usageString(usage.pricing_version),
+    reportedCostSource: reportedCost === undefined ? undefined : "provider-runtime",
     accountingVersion: "provider-billable-v1",
     confidence: "REPORTED",
   };
 }
 
-export function parseProviderUsage(chunks: readonly Uint8Array[]) {
+export function parseProviderUsage(
+  chunks: readonly Uint8Array[],
+  pricing?: ProviderPricingSchedule,
+) {
   if (chunks.length === 0) return undefined;
   const text = new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))));
   const candidates = [text];
-  for (const line of text.split(/\r?\n/u)) {
-    if (line.startsWith("data:")) candidates.push(line.slice(5).trim());
+  // SSE observations are decoded in wire order below. Tail extraction is for
+  // a bounded/truncated JSON response only; adding it for SSE would reorder
+  // and duplicate the terminal observation ahead of earlier events.
+  const tailUsage = /(?:^|\r?\n)data:/u.test(text) ? undefined : extractTailUsageObject(text);
+  if (tailUsage) candidates.push(JSON.stringify({ usage: tailUsage }));
+  const decoder = new SseDecoder();
+  try {
+    for (const chunk of chunks) {
+      for (const event of decoder.push(chunk)) candidates.push(event.data);
+    }
+    for (const event of decoder.finish()) candidates.push(event.data);
+  } catch {
+    // A non-SSE JSON response or a truncated error body is still considered
+    // through the whole-body candidate above.
   }
   let found: RawProviderUsage | undefined;
+  let categoriesComplete = true;
+  const rawObservations: Prisma.InputJsonValue[] = [];
+  const rawObservationKeys = new Set<string>();
   for (const candidate of candidates) {
     if (!candidate || candidate === "[DONE]") continue;
     try {
       const observed = usageFromObject(JSON.parse(candidate));
       if (observed) {
+        if (observed.categoriesComplete === false) categoriesComplete = false;
+        if (observed.rawUsage !== undefined) {
+          const observationKey = JSON.stringify(observed.rawUsage);
+          if (!rawObservationKeys.has(observationKey)) {
+            rawObservationKeys.add(observationKey);
+            rawObservations.push(observed.rawUsage);
+          }
+        }
         const definedObserved = Object.fromEntries(
           Object.entries(observed).filter(([, item]) => item !== undefined),
         );
@@ -515,12 +674,133 @@ export function parseProviderUsage(chunks: readonly Uint8Array[]) {
       // trustworthy usage settles at the conservative admission liability.
     }
   }
-  return found
+  if (!found) return undefined;
+  const normalized: RawProviderUsage = {
+    ...found,
+    rawUsage: rawObservations.length === 1 ? found.rawUsage : rawObservations,
+    categoriesComplete:
+      found.authoritativeBillableTokens === undefined &&
+      found.inputTokens !== undefined &&
+      found.outputTokens !== undefined &&
+      categoriesComplete,
+  };
+  const calculated = pricing ? calculatedCostForUsage(normalized, pricing) : undefined;
+  return calculated
     ? {
-        ...found,
-        categoriesComplete: found.inputTokens !== undefined && found.outputTokens !== undefined,
+        ...normalized,
+        calculatedCost: calculated,
+        calculatedCostCurrency: pricing!.currency,
+        calculatedCostPricingVersion: pricing!.version,
+        calculatedCostSource: "wsmp-pricing",
+        calculatedCostConfidence:
+          pricing!.confidence === "REPORTED" ? "CALCULATED" : pricing!.confidence,
+        pricingVersion: pricing!.version,
+        currency: pricing!.currency,
+        accountingVersion: pricing!.accountingVersion,
       }
-    : undefined;
+    : normalized;
+}
+
+export function extractTailUsageObject(text: string): Record<string, unknown> | undefined {
+  const marker = text.lastIndexOf('"usage"');
+  if (marker < 0) return undefined;
+  const colon = text.indexOf(":", marker + 7);
+  const start = colon < 0 ? -1 : text.indexOf("{", colon + 1);
+  if (start < 0) return undefined;
+  let depth = 0;
+  let quoted = false;
+  let escaped = false;
+  for (let index = start; index < text.length; index += 1) {
+    const character = text[index];
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') quoted = false;
+      continue;
+    }
+    if (character === '"') quoted = true;
+    else if (character === "{") depth += 1;
+    else if (character === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        try {
+          return usageRecord(JSON.parse(text.slice(start, index + 1)));
+        } catch {
+          return undefined;
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
+export function retainProviderUsageTail(
+  chunks: Uint8Array[],
+  currentBytes: number,
+  chunk: Uint8Array,
+  maxBytes = 1024 * 1024,
+): number {
+  const overflowed = currentBytes + chunk.byteLength > maxBytes;
+  const chunkView = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  const prior = Buffer.concat(chunks.map((item) => Buffer.from(item)));
+  let retained =
+    chunk.byteLength >= maxBytes
+      ? chunkView.subarray(-maxBytes)
+      : Buffer.concat([prior, chunkView]).subarray(-maxBytes);
+  // If truncation cut through an SSE event, begin at the next complete event.
+  // This prevents a partial multi-megabyte content delta from poisoning the
+  // decoder before it reaches terminal usage.
+  if (overflowed) {
+    const boundaries = [
+      retained.indexOf("\n\n"),
+      retained.indexOf("\r\n\r\n"),
+      retained.indexOf("\r\r"),
+    ]
+      .filter((index) => index >= 0)
+      .sort((left, right) => left - right);
+    const boundary = boundaries[0];
+    if (boundary !== undefined) {
+      const width = retained
+        .subarray(boundary, boundary + 4)
+        .toString()
+        .startsWith("\r\n\r\n")
+        ? 4
+        : 2;
+      retained = retained.subarray(boundary + width);
+    }
+  }
+  chunks.splice(0, chunks.length, new Uint8Array(retained));
+  return retained.byteLength;
+}
+
+const MAX_RETRYABLE_PROVIDER_BODY_BYTES = 1024 * 1024;
+
+async function readRetryableProviderUsage(
+  response: AsyncIterable<Uint8Array> & { complete: boolean; destroy(error?: Error): void },
+  pricing?: ProviderPricingSchedule,
+): Promise<RawProviderUsage | undefined> {
+  const chunks: Uint8Array[] = [];
+  let retainedBytes = 0;
+  let receivedBytes = 0;
+  try {
+    for await (const rawChunk of response) {
+      const chunk = Uint8Array.from(rawChunk);
+      receivedBytes += chunk.byteLength;
+      if (receivedBytes > MAX_RETRYABLE_PROVIDER_BODY_BYTES) {
+        response.destroy(new Error("Retryable provider response exceeded accounting limit"));
+        return undefined;
+      }
+      retainedBytes = retainProviderUsageTail(
+        chunks,
+        retainedBytes,
+        chunk,
+        MAX_RETRYABLE_PROVIDER_BODY_BYTES,
+      );
+    }
+  } catch {
+    return undefined;
+  }
+  return response.complete ? parseProviderUsage(chunks, pricing) : undefined;
 }
 
 async function recordProviderHealth(
@@ -578,7 +858,8 @@ export async function dispatchPublicOverflow(
     (target) =>
       publicTargetCompatibility(target, {
         ...request,
-        liability: { ...request.liability, tokens: 0n },
+        liability: request.liability,
+        contextTokens: 0n,
       }) === "COMPATIBLE",
   );
   if (compatible.length === 0) {
@@ -657,13 +938,45 @@ export async function dispatchPublicOverflow(
       }).catch(() => undefined);
       continue;
     }
-    const renderedLiability = conservativeProviderLiability({
-      estimatedInputTokens: conservativeSerializedInputTokens(upstream.body.byteLength),
-      requestedOutputTokens: request.requestedOutputTokens,
+    // Resolve by immutable account/model identity and admission time. This is
+    // intentionally per attempt so fallback cannot inherit another target's
+    // price, currency, or accounting contract.
+    const pricing = await resolveActiveProviderPricing({
+      userId: request.userId,
+      providerAccountId: target.providerAccountId,
+      providerModelId: target.providerModelId,
+    }).catch(() => undefined);
+    const requestedOutputTokens =
+      request.requestedOutputTokens ??
+      (target.maxOutputTokens === null ? undefined : BigInt(target.maxOutputTokens));
+    if (requestedOutputTokens === undefined) {
+      await recordProviderAttemptEvent({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        eventType: "TERMINAL",
+        reason: "OUTPUT_BOUND_UNAVAILABLE",
+        ...providerEventRouting({ request, target, nativeSurface }),
+        terminalState: "SKIPPED",
+      }).catch(() => undefined);
+      continue;
+    }
+    const renderedInputTokens = conservativeSerializedInputTokens(upstream.body.byteLength);
+    const renderedLiability = liabilityFromPricing({
+      estimatedInputTokens: renderedInputTokens,
+      requestedOutputTokens,
+      pricing,
     });
+    const renderedContextTokens = checkedContextTokens(renderedInputTokens, requestedOutputTokens);
     const renderedCompatibility = publicTargetCompatibility(target, {
       ...request,
       liability: renderedLiability,
+      estimatedInputTokens: renderedInputTokens,
+      contextTokens: renderedContextTokens,
+      requestedOutputTokens,
     });
     if (renderedCompatibility !== "COMPATIBLE") {
       await recordProviderAttemptEvent({
@@ -676,7 +989,7 @@ export async function dispatchPublicOverflow(
         eventType: "TERMINAL",
         reason: renderedCompatibility,
         ...providerEventRouting({ request, target, nativeSurface }),
-        contextTokens: renderedLiability.tokens,
+        contextTokens: renderedContextTokens,
         terminalState: "SKIPPED",
       }).catch(() => undefined);
       continue;
@@ -707,7 +1020,7 @@ export async function dispatchPublicOverflow(
         eventType: "TERMINAL",
         reason: "BUDGET_ADMISSION_FAILED",
         ...providerEventRouting({ request, target, nativeSurface }),
-        contextTokens: renderedLiability.tokens,
+        contextTokens: renderedContextTokens,
         terminalState: "FAILED",
       }).catch(() => undefined);
       continue;
@@ -862,14 +1175,11 @@ export async function dispatchPublicOverflow(
         request.retrySafe &&
         (status === 408 || status === 409 || status === 429 || status >= 500)
       ) {
-        const closed = response.complete
-          ? Promise.resolve()
-          : new Promise<void>((resolve) => {
-              response.once("close", resolve);
-              response.once("end", resolve);
-            });
-        response.destroy();
-        await closed;
+        // Failed/rate-limited calls may still be billed. Consume only a strict
+        // bounded body before retry, retaining raw usage/cost when present;
+        // ambiguous, truncated, or oversized bodies keep conservative liability.
+        const retryUsage = await readRetryableProviderUsage(response, pricing);
+        if (!response.complete) response.destroy();
         // Heartbeat loss means a successor may already own health state. Do
         // not let this orphan's retryable response mutate that state. The
         // fenced release is deliberately attempted in either case: it clears
@@ -908,6 +1218,8 @@ export async function dispatchPublicOverflow(
           reason: "FAILED",
           revisionSequence: 1n,
           revisionKind: "SNAPSHOT",
+          usageSource: retryUsage ? `${upstream.protocol}-retryable-response` : undefined,
+          usage: retryUsage,
         });
         await finishProviderAttempt({
           attemptId,
@@ -972,7 +1284,7 @@ export async function dispatchPublicOverflow(
             fencingToken,
           }).catch(() => false);
         }
-        const usage = streamComplete ? parseProviderUsage(usageChunks) : undefined;
+        const usage = streamComplete ? parseProviderUsage(usageChunks, pricing) : undefined;
         await reconcileProviderBudget({
           userId: request.userId,
           providerAccountId: target.providerAccountId,
@@ -1041,10 +1353,10 @@ export async function dispatchPublicOverflow(
               await reconcile(true);
             } else {
               responseBytes += chunk.value.byteLength;
-              if (usageBytes + chunk.value.byteLength <= 4 * 1024 * 1024) {
-                usageChunks.push(chunk.value.slice());
-                usageBytes += chunk.value.byteLength;
-              }
+              // Retain the bounded tail, not merely the prefix. Streaming APIs
+              // report authoritative usage in terminal events, which may occur
+              // after arbitrarily large content deltas.
+              usageBytes = retainProviderUsageTail(usageChunks, usageBytes, chunk.value);
               controller.enqueue(chunk.value);
             }
           } catch (error) {
@@ -1197,6 +1509,11 @@ export function conservativeProviderLiability(input: {
     pricingVersion: input.pricingVersion,
     accountingVersion: "provider-billable-v1",
   };
+}
+
+function checkedContextTokens(inputTokens: bigint, outputTokens: bigint): bigint {
+  const total = inputTokens + outputTokens;
+  return total <= 9_223_372_036_854_775_807n ? total : 9_223_372_036_854_775_807n;
 }
 
 /**

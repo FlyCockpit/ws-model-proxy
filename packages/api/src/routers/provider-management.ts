@@ -105,6 +105,62 @@ const modelInput = z.object({
   pricingVersion: z.string().trim().min(1).max(128).nullable().optional(),
   enabled: z.boolean().default(false),
 });
+const moneyRate = z.string().regex(/^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/u);
+const pricingRates = z
+  .object({
+    input: moneyRate,
+    output: moneyRate,
+    cacheRead: moneyRate.optional(),
+    cacheWrite: moneyRate.optional(),
+    reasoning: moneyRate.optional(),
+    tool: moneyRate.optional(),
+    additional: moneyRate.optional(),
+  })
+  .strict();
+const chargeRules = z
+  .object({
+    inputIncludesCacheRead: z.boolean().default(false),
+    inputIncludesCacheWrite: z.boolean().default(false),
+    outputIncludesReasoning: z.boolean().default(false),
+    outputIncludesTool: z.boolean().default(false),
+    reasoningAllowanceTokens: z.number().int().nonnegative(),
+    toolAllowanceTokens: z.number().int().nonnegative(),
+    cacheReadAllowanceTokens: z.number().int().nonnegative(),
+    cacheWriteAllowanceTokens: z.number().int().nonnegative(),
+    additionalAllowanceTokens: z.number().int().nonnegative(),
+    unknownCategories: z.literal("FAIL_CLOSED"),
+  })
+  .strict();
+const pricingInput = z.object({
+  providerModelId: id,
+  version: z.string().trim().min(1).max(128),
+  currency: z
+    .string()
+    .trim()
+    .toUpperCase()
+    .regex(/^[A-Z]{3}$/u),
+  accountingVersion: z.string().trim().min(1).max(128),
+  confidence: z.enum(["CALCULATED", "ESTIMATED"]),
+  ratesPerMillion: pricingRates,
+  chargeRules,
+  effectiveAt: z.coerce.date(),
+});
+const pricingSelect = {
+  id: true,
+  createdAt: true,
+  providerAccountId: true,
+  providerModelId: true,
+  version: true,
+  currency: true,
+  status: true,
+  accountingVersion: true,
+  confidence: true,
+  pricing: true,
+  chargeRules: true,
+  effectiveAt: true,
+  activatedAt: true,
+  retiredAt: true,
+} as const;
 const rule = z
   .object({
     metric: z.enum(["CONCURRENCY", "TOKENS", "SPEND"]),
@@ -387,6 +443,214 @@ export const providerManagementRouter = {
     }, providerWriteTransaction);
     return { success: true };
   }),
+  listPricingVersions: protectedProcedure
+    .input(z.object({ providerModelId: id }))
+    .handler(async ({ input, context }) => {
+      enabled();
+      const model = await prisma.providerModel.findFirst({
+        where: {
+          id: input.providerModelId,
+          userId: context.session.user.id,
+          deletedAt: null,
+          ProviderAccount: { deletedAt: null },
+        },
+        select: { id: true },
+      });
+      if (!model) throw missing();
+      return prisma.providerPricingVersion.findMany({
+        where: { userId: context.session.user.id, providerModelId: model.id },
+        orderBy: [{ effectiveAt: "desc" }, { createdAt: "desc" }],
+        select: pricingSelect,
+      });
+    }),
+  createPricingVersion: protectedProcedure
+    .input(pricingInput)
+    .handler(async ({ input, context }) => {
+      enabled();
+      const userId = context.session.user.id;
+      return prisma.$transaction(async (tx) => {
+        const model = await tx.providerModel.findFirst({
+          where: {
+            id: input.providerModelId,
+            userId,
+            deletedAt: null,
+            ProviderAccount: { deletedAt: null },
+          },
+          select: { id: true, providerAccountId: true },
+        });
+        if (!model) throw missing();
+        const row = await tx.providerPricingVersion.create({
+          data: {
+            userId,
+            providerAccountId: model.providerAccountId,
+            providerModelId: model.id,
+            version: input.version,
+            currency: input.currency,
+            status: "DRAFT",
+            activatedAt: null,
+            accountingVersion: input.accountingVersion,
+            confidence: input.confidence,
+            pricing: { ratesPerMillion: input.ratesPerMillion },
+            chargeRules: input.chargeRules,
+            effectiveAt: input.effectiveAt,
+          },
+          select: pricingSelect,
+        });
+        await tx.providerAuditEvent.create({
+          data: {
+            userId,
+            providerAccountId: model.providerAccountId,
+            action: "PRICING_CREATED",
+            subjectId: row.id,
+            metadata: { version: row.version, status: row.status },
+          },
+        });
+        return row;
+      }, providerWriteTransaction);
+    }),
+  updatePricingVersion: protectedProcedure
+    .input(pricingInput.omit({ providerModelId: true, version: true }).partial().extend({ id }))
+    .handler(async ({ input, context }) => {
+      enabled();
+      const userId = context.session.user.id;
+      const { id: pricingId, ratesPerMillion, chargeRules: rules, ...data } = input;
+      return prisma.$transaction(async (tx) => {
+        const current = await tx.providerPricingVersion.findFirst({
+          where: { id: pricingId, userId, status: "DRAFT", ProviderModel: { deletedAt: null } },
+        });
+        if (!current) throw missing();
+        const row = await tx.providerPricingVersion.update({
+          where: { id: current.id },
+          data: {
+            ...data,
+            ...(ratesPerMillion ? { pricing: { ratesPerMillion } } : {}),
+            ...(rules ? { chargeRules: rules } : {}),
+          },
+          select: pricingSelect,
+        });
+        await tx.providerAuditEvent.create({
+          data: {
+            userId,
+            providerAccountId: current.providerAccountId,
+            action: "PRICING_UPDATED",
+            subjectId: row.id,
+          },
+        });
+        return row;
+      }, providerWriteTransaction);
+    }),
+  activatePricingVersion: protectedProcedure
+    .input(z.object({ id }))
+    .handler(async ({ input, context }) => {
+      enabled();
+      const userId = context.session.user.id;
+      return prisma.$transaction(async (tx) => {
+        const now = new Date();
+        const candidate = await tx.providerPricingVersion.findFirst({
+          where: { id: input.id, userId, status: "DRAFT", ProviderModel: { deletedAt: null } },
+        });
+        if (!candidate) throw missing();
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-pricing:${userId}:${candidate.providerModelId}`}, 0))`;
+        const current = await tx.providerPricingVersion.findFirst({
+          where: {
+            id: candidate.id,
+            userId,
+            status: "DRAFT",
+            ProviderModel: { deletedAt: null },
+          },
+        });
+        if (!current) throw new ORPCError("CONFLICT", { message: "Pricing version changed" });
+        const prior = await tx.providerPricingVersion.findMany({
+          where: { userId, providerModelId: current.providerModelId, status: "ACTIVE" },
+          select: { id: true, effectiveAt: true },
+        });
+        if (prior.some((row) => row.effectiveAt >= current.effectiveAt))
+          throw new ORPCError("CONFLICT", {
+            message: "Pricing activation must advance the effective time",
+          });
+        await tx.providerPricingVersion.updateMany({
+          where: { userId, providerModelId: current.providerModelId, status: "ACTIVE" },
+          data: { status: "RETIRED", retiredAt: current.effectiveAt },
+        });
+        const row = await tx.providerPricingVersion.update({
+          where: { id: current.id },
+          data: { status: "ACTIVE", activatedAt: now, retiredAt: null },
+          select: pricingSelect,
+        });
+        if (current.effectiveAt <= now)
+          await tx.providerModel.update({
+            where: { id: current.providerModelId },
+            data: {
+              pricingVersion: current.version,
+              pricingMetadata: current.pricing as Prisma.InputJsonValue,
+            },
+          });
+        await tx.providerAuditEvent.create({
+          data: {
+            userId,
+            providerAccountId: current.providerAccountId,
+            action: "PRICING_ACTIVATED",
+            subjectId: row.id,
+            metadata: { version: row.version },
+          },
+        });
+        return row;
+      }, providerWriteTransaction);
+    }),
+  retirePricingVersion: protectedProcedure
+    .input(z.object({ id }))
+    .handler(async ({ input, context }) => {
+      enabled();
+      const userId = context.session.user.id;
+      await prisma.$transaction(async (tx) => {
+        const current = await tx.providerPricingVersion.findFirst({
+          where: { id: input.id, userId, status: "ACTIVE" },
+        });
+        if (!current) throw missing();
+        const now = new Date();
+        const retiredAt =
+          now > current.effectiveAt ? now : new Date(current.effectiveAt.getTime() + 1);
+        await tx.providerPricingVersion.update({
+          where: { id: current.id },
+          data: { status: "RETIRED", retiredAt },
+        });
+        await tx.providerModel.updateMany({
+          where: { id: current.providerModelId, userId, pricingVersion: current.version },
+          data: { pricingVersion: null, pricingMetadata: Prisma.JsonNull },
+        });
+        await tx.providerAuditEvent.create({
+          data: {
+            userId,
+            providerAccountId: current.providerAccountId,
+            action: "PRICING_RETIRED",
+            subjectId: current.id,
+          },
+        });
+      }, providerWriteTransaction);
+      return { success: true };
+    }),
+  deletePricingVersion: protectedProcedure
+    .input(z.object({ id }))
+    .handler(async ({ input, context }) => {
+      enabled();
+      const userId = context.session.user.id;
+      await prisma.$transaction(async (tx) => {
+        const current = await tx.providerPricingVersion.findFirst({
+          where: { id: input.id, userId, status: "DRAFT" },
+        });
+        if (!current) throw missing();
+        await tx.providerPricingVersion.delete({ where: { id: current.id } });
+        await tx.providerAuditEvent.create({
+          data: {
+            userId,
+            providerAccountId: current.providerAccountId,
+            action: "PRICING_DELETED",
+            subjectId: current.id,
+          },
+        });
+      }, providerWriteTransaction);
+      return { success: true };
+    }),
   listCredentials: protectedProcedure
     .input(z.object({ providerAccountId: id }))
     .handler(async ({ input, context }) => {

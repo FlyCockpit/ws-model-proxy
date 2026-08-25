@@ -2834,7 +2834,11 @@ async function relayPool({
     const requestedOutputTokens =
       typeof maxOutput === "number" && Number.isSafeInteger(maxOutput) && maxOutput >= 0
         ? BigInt(maxOutput)
-        : 4096n;
+        : undefined;
+    const estimatedInputTokens =
+      operation.contextCount?.tokens !== undefined
+        ? BigInt(operation.contextCount.tokens)
+        : conservativeSerializedInputTokens(publicRequestBytes);
     const canonical = operation.adaptation
       ? (() => {
           try {
@@ -2866,13 +2870,15 @@ async function relayPool({
       retrySafe:
         shouldRetryRelayOperation(operation, "precommit_5xx") &&
         shouldRetryRelayOperation(operation, "precommit_transport"),
-      liability: conservativeProviderLiability({
-        estimatedInputTokens:
-          operation.contextCount?.tokens !== undefined
-            ? BigInt(operation.contextCount.tokens)
-            : conservativeSerializedInputTokens(publicRequestBytes),
-        requestedOutputTokens,
-      }),
+      liability:
+        requestedOutputTokens === undefined
+          ? { accountingVersion: "provider-billable-v1" }
+          : conservativeProviderLiability({ estimatedInputTokens, requestedOutputTokens }),
+      estimatedInputTokens,
+      contextTokens:
+        requestedOutputTokens === undefined
+          ? undefined
+          : estimatedInputTokens + requestedOutputTokens,
       requestedOutputTokens,
       contextCountMethod: operation.contextCount?.method,
       contextCountConfidence: operation.contextCount?.confidence,

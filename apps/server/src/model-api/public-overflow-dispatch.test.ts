@@ -5,6 +5,7 @@ const providerHttpsRequest = vi.hoisted(() => vi.fn());
 const recordProviderOutcome = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const heartbeatProviderAttempt = vi.hoisted(() => vi.fn().mockResolvedValue(true));
 const releaseProviderHealthTrial = vi.hoisted(() => vi.fn().mockResolvedValue(true));
+const reconcileProviderBudget = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const db = vi.hoisted(() => ({
   modelPool: { findFirst: vi.fn() },
   relayRequest: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
@@ -30,7 +31,7 @@ vi.mock("./provider-budget.js", () => ({
     providerAttemptId: "anchor",
     reservationIds: ["reservation"],
   }),
-  reconcileProviderBudget: vi.fn().mockResolvedValue(undefined),
+  reconcileProviderBudget,
 }));
 vi.mock("./provider-attempt-runtime.js", () => ({
   allocateProviderFence: vi.fn().mockResolvedValue(1n),
@@ -454,6 +455,7 @@ describe("public overflow terminal response dispatch", () => {
     vi.useFakeTimers();
     try {
       recordProviderOutcome.mockClear();
+      reconcileProviderBudget.mockClear();
       releaseProviderHealthTrial.mockClear();
       heartbeatProviderAttempt.mockResolvedValueOnce(false);
       db.modelPool.findFirst.mockResolvedValue(dispatchPoolFixture());
@@ -504,7 +506,11 @@ describe("public overflow terminal response dispatch", () => {
         retrySafe: true,
       });
       await vi.advanceTimersByTimeAsync(10_000);
-      const upstream = Readable.from([]);
+      const upstream = Readable.from([
+        Buffer.from(
+          '{"usage":{"input_tokens":9,"output_tokens":2,"cost":0.003,"currency":"USD","pricing_version":"price-v1"}}',
+        ),
+      ]);
       Object.assign(upstream, { statusCode: 503, headers: {}, complete: true });
       resolveProvider(upstream);
 
@@ -513,6 +519,18 @@ describe("public overflow terminal response dispatch", () => {
         reason: "PROVIDER_UNAVAILABLE",
       });
       expect(recordProviderOutcome).not.toHaveBeenCalled();
+      expect(reconcileProviderBudget).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: "FAILED",
+          usageSource: "openai-retryable-response",
+          usage: expect.objectContaining({
+            inputTokens: 9n,
+            outputTokens: 2n,
+            reportedCost: 0.003,
+            rawUsage: expect.objectContaining({ input_tokens: 9, output_tokens: 2 }),
+          }),
+        }),
+      );
       expect(releaseProviderHealthTrial).toHaveBeenCalledWith({
         userId: "owner",
         providerAccountId: "account-heartbeat",

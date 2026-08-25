@@ -48,6 +48,14 @@ const db = prisma as unknown as {
     update: MockInstance;
     updateMany: MockInstance;
   };
+  providerPricingVersion: {
+    create: MockInstance;
+    delete: MockInstance;
+    findFirst: MockInstance;
+    findMany: MockInstance;
+    update: MockInstance;
+    updateMany: MockInstance;
+  };
   executionTarget: { create: MockInstance };
   modelPool: { findFirst: MockInstance };
   providerCredential: {
@@ -163,6 +171,79 @@ describe("providerManagementRouter security boundary", () => {
     expect(db.$queryRaw).toHaveBeenCalledOnce();
     expect(db.providerModel.update).not.toHaveBeenCalled();
     expect(db.providerAccount.findFirst).not.toHaveBeenCalled();
+  });
+
+  it("creates owner-scoped draft pricing with explicit accounting rules and audit", async () => {
+    envMock.enabled = true;
+    db.providerModel.findFirst.mockResolvedValue({ id: "model", providerAccountId: "account" });
+    db.providerPricingVersion.create.mockResolvedValue({
+      id: "price",
+      version: "price-v1",
+      status: "DRAFT",
+    });
+    db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
+    const client = createRouterClient(providerManagementRouter, { context });
+    await client.createPricingVersion({
+      providerModelId: "model",
+      version: "price-v1",
+      currency: "USD",
+      accountingVersion: "provider-billable-v2",
+      confidence: "CALCULATED",
+      ratesPerMillion: { input: "1", output: "4", cacheRead: "0.25" },
+      chargeRules: {
+        inputIncludesCacheRead: false,
+        inputIncludesCacheWrite: false,
+        outputIncludesReasoning: false,
+        outputIncludesTool: false,
+        cacheReadAllowanceTokens: 1000,
+        cacheWriteAllowanceTokens: 0,
+        additionalAllowanceTokens: 0,
+        reasoningAllowanceTokens: 0,
+        toolAllowanceTokens: 0,
+        unknownCategories: "FAIL_CLOSED",
+      },
+      effectiveAt: new Date("2026-08-25T00:00:00Z"),
+    });
+    expect(db.providerModel.findFirst).toHaveBeenCalledWith({
+      where: {
+        id: "model",
+        userId: "owner",
+        deletedAt: null,
+        ProviderAccount: { deletedAt: null },
+      },
+      select: { id: true, providerAccountId: true },
+    });
+    expect(db.providerPricingVersion.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        userId: "owner",
+        providerAccountId: "account",
+        providerModelId: "model",
+        accountingVersion: "provider-billable-v2",
+        chargeRules: expect.objectContaining({ unknownCategories: "FAIL_CLOSED" }),
+      }),
+      select: expect.any(Object),
+    });
+    expect(db.providerAuditEvent.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ action: "PRICING_CREATED", subjectId: "price" }),
+    });
+  });
+
+  it("does not allow activated pricing billing fields through the draft update API", async () => {
+    envMock.enabled = true;
+    db.providerPricingVersion.findFirst.mockResolvedValue(null);
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(
+      client.updatePricingVersion({ id: "active-price", currency: "EUR" }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(db.providerPricingVersion.findFirst).toHaveBeenCalledWith({
+      where: {
+        id: "active-price",
+        userId: "owner",
+        status: "DRAFT",
+        ProviderModel: { deletedAt: null },
+      },
+    });
+    expect(db.providerPricingVersion.update).not.toHaveBeenCalled();
   });
 
   it("denies a budget policy whose model is deleted or belongs to another account", async () => {

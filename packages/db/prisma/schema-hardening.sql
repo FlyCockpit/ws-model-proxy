@@ -1333,14 +1333,27 @@ ALTER TABLE provider_usage_ledger ADD CONSTRAINT provider_usage_ledger_shape_che
   AND ("toolTokens" IS NULL OR "toolTokens" >= 0)
   AND ("additionalBillableTokens" IS NULL OR "additionalBillableTokens" >= 0)
   AND ("authoritativeBillableTokens" IS NULL OR "authoritativeBillableTokens" >= 0)
+  AND ("reportedTotalTokens" IS NULL OR "reportedTotalTokens" >= 0)
   AND ("billableTotal" IS NULL OR "billableTotal" >= 0)
   AND btrim("sourceVersion") <> '' AND btrim("usageSource") <> ''
   AND "revisionSequence" >= 0 AND btrim("payloadHash") <> ''
 );
 
+-- Rows created before pricing lifecycle fields existed were effective schedules,
+-- not drafts. Prisma's ACTIVE/activatedAt defaults preserve that meaning; this
+-- idempotent correction maps legacy rows that already had an end boundary.
+UPDATE provider_pricing_version
+SET status = 'RETIRED'
+WHERE status = 'ACTIVE' AND "retiredAt" IS NOT NULL;
+
 ALTER TABLE provider_pricing_version DROP CONSTRAINT IF EXISTS provider_pricing_version_shape_check;
 ALTER TABLE provider_pricing_version ADD CONSTRAINT provider_pricing_version_shape_check CHECK (
   btrim(version) <> '' AND currency ~ '^[A-Z]{3}$'
+  AND btrim("accountingVersion") <> ''
+  AND jsonb_typeof(pricing) = 'object' AND jsonb_typeof("chargeRules") = 'object'
+  AND ((status = 'DRAFT' AND "activatedAt" IS NULL AND "retiredAt" IS NULL)
+    OR (status = 'ACTIVE' AND "activatedAt" IS NOT NULL AND "retiredAt" IS NULL)
+    OR (status = 'RETIRED' AND "activatedAt" IS NOT NULL AND "retiredAt" IS NOT NULL))
   AND ("retiredAt" IS NULL OR "retiredAt" > "effectiveAt")
 );
 
@@ -1364,9 +1377,49 @@ $immutable_provider_history$;
 DROP TRIGGER IF EXISTS provider_usage_ledger_immutable ON provider_usage_ledger;
 CREATE TRIGGER provider_usage_ledger_immutable BEFORE UPDATE OR DELETE ON provider_usage_ledger
 FOR EACH ROW EXECUTE FUNCTION reject_immutable_provider_history_mutation();
+CREATE OR REPLACE FUNCTION enforce_provider_pricing_version_immutability()
+RETURNS trigger LANGUAGE plpgsql AS $provider_pricing_immutable$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    IF OLD.status <> 'DRAFT' THEN
+      RAISE EXCEPTION 'activated provider pricing is immutable' USING ERRCODE = '55000';
+    END IF;
+    RETURN OLD;
+  END IF;
+  IF (OLD.status <> 'DRAFT' OR NEW.status <> 'DRAFT') AND
+    (OLD."userId", OLD."providerAccountId", OLD."providerModelId", OLD.version,
+     OLD.currency, OLD."accountingVersion", OLD.confidence, OLD.pricing,
+     OLD."chargeRules", OLD."effectiveAt", OLD."createdAt")
+      IS DISTINCT FROM
+    (NEW."userId", NEW."providerAccountId", NEW."providerModelId", NEW.version,
+     NEW.currency, NEW."accountingVersion", NEW.confidence, NEW.pricing,
+     NEW."chargeRules", NEW."effectiveAt", NEW."createdAt") THEN
+    RAISE EXCEPTION 'activated provider pricing billing fields are immutable' USING ERRCODE = '55000';
+  END IF;
+  IF NOT ((OLD.status = NEW.status)
+    OR (OLD.status = 'DRAFT' AND NEW.status = 'ACTIVE')
+    OR (OLD.status = 'ACTIVE' AND NEW.status = 'RETIRED')) THEN
+    RAISE EXCEPTION 'invalid provider pricing lifecycle transition' USING ERRCODE = '55000';
+  END IF;
+  IF OLD.status = NEW.status AND
+    (OLD."activatedAt", OLD."retiredAt") IS DISTINCT FROM
+    (NEW."activatedAt", NEW."retiredAt") THEN
+    RAISE EXCEPTION 'provider pricing lifecycle timestamps are immutable' USING ERRCODE = '55000';
+  END IF;
+  IF OLD.status = 'DRAFT' AND NEW.status = 'ACTIVE' AND
+    (NEW."activatedAt" IS NULL OR NEW."retiredAt" IS NOT NULL) THEN
+    RAISE EXCEPTION 'pricing activation requires exactly one activation timestamp' USING ERRCODE = '55000';
+  END IF;
+  IF OLD.status = 'ACTIVE' AND NEW.status = 'RETIRED' AND
+    (NEW."activatedAt" IS DISTINCT FROM OLD."activatedAt" OR NEW."retiredAt" IS NULL) THEN
+    RAISE EXCEPTION 'pricing retirement preserves activation and sets retirement' USING ERRCODE = '55000';
+  END IF;
+  RETURN NEW;
+END
+$provider_pricing_immutable$;
 DROP TRIGGER IF EXISTS provider_pricing_version_immutable ON provider_pricing_version;
 CREATE TRIGGER provider_pricing_version_immutable BEFORE UPDATE OR DELETE ON provider_pricing_version
-FOR EACH ROW EXECUTE FUNCTION reject_immutable_provider_history_mutation();
+FOR EACH ROW EXECUTE FUNCTION enforce_provider_pricing_version_immutability();
 DROP TRIGGER IF EXISTS provider_budget_settlement_immutable ON provider_budget_settlement;
 CREATE TRIGGER provider_budget_settlement_immutable BEFORE UPDATE OR DELETE ON provider_budget_settlement
 FOR EACH ROW EXECUTE FUNCTION reject_immutable_provider_history_mutation();

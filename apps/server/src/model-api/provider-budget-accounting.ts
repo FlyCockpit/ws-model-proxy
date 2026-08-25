@@ -13,6 +13,8 @@ export interface ProviderTokenUsage {
   categoriesComplete?: boolean;
   /** Provider-authoritative total. It is used instead of, never added to, categories. */
   authoritativeBillableTokens?: bigint;
+  /** Provider aggregate retained as corroboration; never added to categories. */
+  reportedTotalTokens?: bigint;
 }
 
 export function budgetWindow(

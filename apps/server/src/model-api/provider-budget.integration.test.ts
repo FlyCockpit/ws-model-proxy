@@ -42,7 +42,12 @@ integration("provider budget admission and reconciliation", () => {
       },
     });
     const model = await db.providerModel.create({
-      data: { userId: user.id, providerAccountId: account.id, upstreamModelId: suffix },
+      data: {
+        userId: user.id,
+        providerAccountId: account.id,
+        upstreamModelId: suffix,
+        enabled: true,
+      },
     });
     let poolId: string | undefined;
     if (options?.attachment) {
@@ -293,6 +298,16 @@ integration("provider budget admission and reconciliation", () => {
     });
     expect(ledger.requestId).toBe(original.requestId);
     expect(ledger.terminalReason).toBe("CRASH_RECOVERY");
+    await expect(
+      db.providerAttempt.findUniqueOrThrow({
+        where: {
+          attemptId_fencingToken: {
+            attemptId: original.attemptId,
+            fencingToken: original.fencingToken,
+          },
+        },
+      }),
+    ).resolves.toMatchObject({ state: "EXPIRED", terminalReason: "CRASH_RECOVERY" });
   });
 
   it("anchors and reconciles an attempt even when no finite policy creates a reservation", async () => {
@@ -548,6 +563,16 @@ integration("provider budget admission and reconciliation", () => {
       revisionKind: "SNAPSHOT",
       reservationId: null,
     });
+    await expect(
+      db.providerAttempt.findUniqueOrThrow({
+        where: {
+          attemptId_fencingToken: {
+            attemptId: original.attemptId,
+            fencingToken: original.fencingToken,
+          },
+        },
+      }),
+    ).resolves.toMatchObject({ state: "EXPIRED", terminalReason: "CRASH_RECOVERY" });
   });
 
   it("retains independent raw cost provenance while settling only anchor-matched pricing", async () => {
@@ -560,6 +585,8 @@ integration("provider budget admission and reconciliation", () => {
         providerModelId: row.model.id,
         version: "price-v1",
         currency: "USD",
+        status: "ACTIVE",
+        activatedAt: new Date(Date.now() - 1_000),
         pricing: { input: "1" },
         effectiveAt: new Date(Date.now() - 1_000),
       },
@@ -609,6 +636,7 @@ integration("provider budget admission and reconciliation", () => {
     expect(ledger.reportedCost?.toString()).toBe("7");
     expect(ledger.calculatedCost?.toString()).toBe("5");
     expect(ledger.settledCost?.toString()).toBe("5");
+    expect(ledger.confidence).toBe("CALCULATED");
   });
 
   it.each(["UTC_DAY", "UTC_MONTH"] as const)(
@@ -783,6 +811,8 @@ integration("provider budget admission and reconciliation", () => {
         providerModelId: row.model.id,
         version: "price-v1",
         currency: "USD",
+        status: "ACTIVE",
+        activatedAt: new Date(Date.now() - 1_000),
         pricing: { input: "1" },
         effectiveAt: new Date(Date.now() - 1_000),
       },
@@ -830,6 +860,8 @@ integration("provider budget admission and reconciliation", () => {
             providerModelId: row.model.id,
             version: "price-v1",
             currency: "USD",
+            status: "ACTIVE",
+            activatedAt: new Date(Date.now() - 1_000),
             pricing: { input: "1" },
             effectiveAt: new Date(Date.now() - 1_000),
           },
@@ -885,6 +917,33 @@ integration("provider budget admission and reconciliation", () => {
       providerAttemptId: expect.any(String),
       reservationIds: [],
     });
+
+    const unlimitedWithoutLiability = await fixture({ noPolicy: true });
+    await policy(unlimitedWithoutLiability, [
+      { metric: "TOKENS", period: "UTC_DAY", mode: "UNLIMITED" },
+      { metric: "SPEND", period: "UTC_MONTH", mode: "UNLIMITED", currency: "USD" },
+      { metric: "CONCURRENCY", period: "PER_ATTEMPT", mode: "UNLIMITED" },
+    ]);
+    await expect(
+      service.admitProviderBudget(
+        attempt(unlimitedWithoutLiability, `unbounded-${crypto.randomUUID()}`, {
+          accountingVersion: "provider-billable-v1",
+        }),
+      ),
+    ).resolves.toMatchObject({ admitted: true, reservationIds: [] });
+
+    const finiteWithoutLiability = await fixture({ noPolicy: true });
+    await policy(finiteWithoutLiability, [
+      { metric: "TOKENS", period: "UTC_DAY", limitValue: 100 },
+      { metric: "CONCURRENCY", period: "PER_ATTEMPT", mode: "UNLIMITED" },
+    ]);
+    await expect(
+      service.admitProviderBudget(
+        attempt(finiteWithoutLiability, `finite-unbounded-${crypto.randomUUID()}`, {
+          accountingVersion: "provider-billable-v1",
+        }),
+      ),
+    ).resolves.toMatchObject({ admitted: false, reason: "TOKEN_BOUND_UNAVAILABLE" });
 
     const mixed = await fixture({ noPolicy: true });
     await policy(mixed, [
@@ -967,12 +1026,12 @@ integration("provider budget admission and reconciliation", () => {
         slug: `second-${crypto.randomUUID()}`,
       },
     });
-    await policy(row, [{ metric: "TOKENS", period: "UTC_DAY", limitValue: 8 }], {
-      poolId: row.poolId,
-    });
-    await policy(row, [{ metric: "TOKENS", period: "UTC_DAY", limitValue: 8 }], {
-      poolId: secondPool.id,
-    });
+    const attachmentRules: Rule[] = [
+      { metric: "TOKENS", period: "UTC_DAY", limitValue: 8 },
+      { metric: "CONCURRENCY", period: "PER_ATTEMPT", mode: "UNLIMITED" },
+    ];
+    await policy(row, attachmentRules, { poolId: row.poolId });
+    await policy(row, attachmentRules, { poolId: secondPool.id });
     const forPool = (poolId: string, id: string) => ({
       ...attempt(row, id, { tokens: 4n, accountingVersion: "usage-v1" }),
       poolId,

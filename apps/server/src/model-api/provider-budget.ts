@@ -71,6 +71,8 @@ export interface RawProviderUsage extends ProviderTokenUsage {
   calculatedCostCurrency?: string;
   calculatedCostPricingVersion?: string;
   calculatedCostSource?: string;
+  /** Confidence of the local pricing calculation, independent of token provenance. */
+  calculatedCostConfidence?: UsageConfidence;
   currency?: string;
   pricingVersion?: string;
   accountingVersion: string;
@@ -136,6 +138,7 @@ function assertUsage(usage: RawProviderUsage | undefined): void {
     usage.toolTokens,
     usage.additionalBillableTokens,
     usage.authoritativeBillableTokens,
+    usage.reportedTotalTokens,
   ];
   if (!tokens.every(validToken)) throw new ProviderBudgetConfigurationError("Invalid token usage");
   if (usage.authoritativeBillableTokens !== undefined && usage.categoriesComplete === true)
@@ -202,6 +205,7 @@ function terminalPayloadHash(
         toolTokens: usage.toolTokens,
         additionalBillableTokens: usage.additionalBillableTokens,
         authoritativeBillableTokens: usage.authoritativeBillableTokens,
+        reportedTotalTokens: usage.reportedTotalTokens,
         categoriesComplete: usage.categoriesComplete,
         rawUsage: usage.rawUsage,
         reportedCost: usage.reportedCost === undefined ? undefined : decimal(usage.reportedCost),
@@ -326,16 +330,16 @@ export async function admitProviderBudget(
       throw new ProviderBudgetConfigurationError(
         "Spend liability, currency, and pricingVersion must be supplied together",
       );
-    const attemptAnchor = await tx.providerAttempt.findUnique({
-      where: {
-        attemptId_fencingToken: {
-          attemptId: attempt.attemptId,
-          fencingToken: attempt.fencingToken,
-        },
-      },
+    // A dispatch attempt ID is globally stable across delivery retries. A new
+    // fencing token must use a new attempt ID; otherwise reservations from the
+    // first fence could be orphaned or charged to the second execution.
+    const attemptAnchor = await tx.providerAttempt.findFirst({
+      where: { attemptId: attempt.attemptId },
+      orderBy: { createdAt: "asc" },
     });
     if (attemptAnchor) {
       const exact =
+        attemptAnchor.fencingToken === attempt.fencingToken &&
         attemptAnchor.userId === attempt.userId &&
         attemptAnchor.providerAccountId === attempt.providerAccountId &&
         attemptAnchor.providerModelId === attempt.providerModelId &&
@@ -508,6 +512,8 @@ export async function admitProviderBudget(
               providerModelId: attempt.providerModelId,
               version: pricingVersion,
               currency,
+              status: { in: ["ACTIVE", "RETIRED"] },
+              activatedAt: { not: null },
               effectiveAt: { lte: now },
               OR: [{ retiredAt: null }, { retiredAt: { gt: now } }],
             },
@@ -705,6 +711,20 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
     )
       throw new ProviderBudgetConfigurationError("Terminal attempt identity conflict");
 
+    const expireCrashAnchor = async () => {
+      if (terminal.reason !== "CRASH_RECOVERY") return;
+      const terminalAt = new Date();
+      await tx.providerAttempt.updateMany({
+        where: { id: anchor.id, state: "ACTIVE" },
+        data: {
+          state: "EXPIRED",
+          terminalAt,
+          terminalReason: "CRASH_RECOVERY",
+          heartbeatAt: terminalAt,
+        },
+      });
+    };
+
     const usage = terminal.usage;
     const sourceUsageAccountingVersion = usage
       ? normalizedVersion(usage.accountingVersion, "accountingVersion")
@@ -734,6 +754,7 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
         priorRevision.revisionKind !== terminal.revisionKind
       )
         throw new ProviderBudgetConfigurationError("Accounting source revision conflict");
+      await expireCrashAnchor();
       return;
     }
     const previousLedgers = await tx.providerUsageLedger.findMany({
@@ -784,6 +805,11 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
         ? usage?.calculatedCost
         : undefined;
     const costKnown = suppliedCost !== undefined;
+    const suppliedCostConfidence: UsageConfidence = reportedMatches
+      ? "REPORTED"
+      : calculatedMatches
+        ? (usage?.calculatedCostConfidence ?? "CALCULATED")
+        : "ESTIMATED";
     const settledCost = costKnown ? decimal(suppliedCost) : null;
 
     for (const reservation of reservations) {
@@ -832,7 +858,12 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
           pricingVersion: anchor.pricingVersion,
           settledValue: delta,
           currency: reservation.metric === "SPEND" ? reservation.currency : null,
-          confidence: trustworthy ? (usage?.confidence ?? "ESTIMATED") : "ESTIMATED",
+          confidence:
+            trustworthy && reservation.metric === "SPEND"
+              ? suppliedCostConfidence
+              : trustworthy
+                ? (usage?.confidence ?? "ESTIMATED")
+                : "ESTIMATED",
           reason: terminal.reason,
         },
       });
@@ -862,6 +893,7 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
         toolTokens: usage?.toolTokens,
         additionalBillableTokens: usage?.additionalBillableTokens,
         authoritativeBillableTokens: usage?.authoritativeBillableTokens,
+        reportedTotalTokens: usage?.reportedTotalTokens,
         billableTotal: accountingMatches ? billableTotal : undefined,
         categoriesComplete: usage?.categoriesComplete,
         rawUsage: usage?.rawUsage,
@@ -892,12 +924,14 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
         usageKnown: Boolean(accountingMatches && billableTotal !== undefined),
         costKnown,
         terminalReason: terminal.reason,
-        confidence:
-          accountingMatches && (suppliedCost === undefined || costKnown)
+        confidence: costKnown
+          ? suppliedCostConfidence
+          : accountingMatches
             ? (usage?.confidence ?? "ESTIMATED")
             : "ESTIMATED",
       },
     });
+    await expireCrashAnchor();
   });
 }
 

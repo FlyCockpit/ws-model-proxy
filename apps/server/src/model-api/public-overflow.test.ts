@@ -219,6 +219,49 @@ describe("public overflow compatibility", () => {
     ).toBe("CONTEXT_EXCEEDED");
   });
 
+  it("uses a context-only estimate when billable liability is unavailable", () => {
+    expect(
+      publicTargetCompatibility(
+        {
+          contextWindow: 1_000,
+          maxOutputTokens: 100,
+          protocol: "openai",
+          nativeProtocols: ["openai"],
+          nativeSurfaces: ["openai-chat"],
+          supportsStreaming: true,
+          supportedFeatures: [],
+        },
+        {
+          ...request,
+          liability: { accountingVersion: "provider-billable-v1" },
+          contextTokens: 200n,
+        },
+      ),
+    ).toBe("COMPATIBLE");
+  });
+
+  it("uses the selected model maximum when the client omits an output limit", () => {
+    expect(
+      publicTargetCompatibility(
+        {
+          contextWindow: 1_001,
+          maxOutputTokens: 1_000,
+          protocol: "openai",
+          nativeProtocols: ["openai"],
+          nativeSurfaces: ["openai-chat"],
+          supportsStreaming: true,
+          supportedFeatures: [],
+        },
+        {
+          ...request,
+          requestedOutputTokens: undefined,
+          estimatedInputTokens: 1n,
+          liability: { accountingVersion: "provider-billable-v1" },
+        },
+      ),
+    ).toBe("COMPATIBLE");
+  });
+
   it("requires both adaptation gates and a known native target protocol", () => {
     const target = {
       contextWindow: 1000,
