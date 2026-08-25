@@ -179,8 +179,48 @@ integration("guarded pool setup with real PostgreSQL", () => {
         reservedSlots: 0,
         localWaitBudgetMs: 30_000,
         publicEgressAcknowledged: true,
+        advanced: {
+          physicalCountStrategy: "ENGINE_REPORTED",
+          contextMargin: 1_024,
+          borrowPolicy: "NEVER",
+          protocolAdaptationEnabled: false,
+          allowLossyDeveloperRoleCollapse: true,
+          affinity: {
+            enabled: true,
+            ttlSeconds: 7_200,
+            maxRecords: 20_000,
+            prefixWeight: 110,
+            conversationWeight: 160,
+            confirmedCacheWeight: 260,
+            loadPenaltyWeight: 120,
+          },
+          memberOverrides: [
+            {
+              discoveredModelId: local.id,
+              concurrency: { mode: "LIMITED", limitValue: 1 },
+              reservedSlots: 0,
+              borrowPolicy: "NEVER",
+              waitBudget: { mode: "LIMITED", limitValue: 15_000 },
+              contextCeiling: { mode: "LIMITED", limitValue: 31_744 },
+              contextMargin: 1_024,
+            },
+          ],
+        },
         providerModels: [
-          { providerModelId: provider.id, concurrencyLimit: 1, dailySpendLimit: "5" },
+          {
+            providerModelId: provider.id,
+            concurrencyLimit: 1,
+            dailySpendLimit: "5",
+            budgetRules: {
+              concurrency: { mode: "LIMITED", limitValue: 1 },
+              tokensPerAttempt: { mode: "LIMITED", limitValue: 100_000 },
+              tokensPerDay: { mode: "LIMITED", limitValue: 1_000_000 },
+              tokensPerMonth: { mode: "LIMITED", limitValue: 10_000_000 },
+              tokensLifetime: { mode: "UNLIMITED", limitValue: null },
+              spendPerDay: { mode: "LIMITED", limitValue: "5" },
+              spendPerMonth: { mode: "LIMITED", limitValue: "100" },
+            },
+          },
         ],
       }),
     ).rejects.toThrow();
@@ -202,5 +242,11 @@ integration("guarded pool setup with real PostgreSQL", () => {
     expect(await modules.prisma.providerAuditEvent.count({ where: { userId: user.id } })).toBe(0);
     expect(await modules.prisma.capacityAuditEvent.count({ where: { userId: user.id } })).toBe(0);
     expect(await modules.prisma.executionTarget.count({ where: { userId: user.id } })).toBe(1);
+    expect(
+      await modules.prisma.inferenceCapacity.findUnique({
+        where: { id: capacity.id },
+        select: { countStrategy: true },
+      }),
+    ).toEqual({ countStrategy: "CONSERVATIVE_ESTIMATE" });
   });
 });
