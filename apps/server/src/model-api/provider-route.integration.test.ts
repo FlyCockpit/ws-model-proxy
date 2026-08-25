@@ -9,7 +9,7 @@ if (!databaseUrl)
   console.warn("[provider-route] skipped: SCHEMA_VALIDATION_DATABASE_URL is not configured");
 
 type Surface = "openai-chat" | "openai-responses" | "anthropic-messages";
-type Behavior = "json" | "stream" | "error" | "crash";
+type Behavior = "json" | "stream" | "error" | "client-error" | "crash";
 
 const protocolFor = (surface: Surface) =>
   surface === "anthropic-messages" ? "anthropic" : "openai";
@@ -153,8 +153,41 @@ integration("provider dispatch routes with real PostgreSQL", () => {
           ? "anthropic-messages"
           : "openai-chat";
       if (behavior === "error") {
-        response.writeHead(503, { "content-type": "application/json", "retry-after": "1" });
+        response.writeHead(503, {
+          "content-type": "application/json",
+          "retry-after": "1",
+          "request-id": "upstream-request-123",
+          "x-internal-secret": "must-not-pass",
+        });
         response.end(JSON.stringify({ error: { message: "temporary", type: "server_error" } }));
+        return;
+      }
+      if (behavior === "client-error") {
+        const requestIdHeader =
+          surface === "anthropic-messages"
+            ? { "request-id": "upstream-request-400" }
+            : { "x-request-id": "upstream-request-400" };
+        response.writeHead(400, {
+          "content-type": "application/json",
+          "retry-after": "2",
+          ...requestIdHeader,
+          "x-internal-secret": "must-not-pass",
+        });
+        response.end(
+          JSON.stringify(
+            surface === "anthropic-messages"
+              ? {
+                  type: "error",
+                  error: { type: "invalid_request_error", message: "safe provider error" },
+                }
+              : {
+                  error: {
+                    type: "invalid_request_error",
+                    message: "safe provider error",
+                  },
+                },
+          ),
+        );
         return;
       }
       if (behavior === "crash") {
@@ -231,6 +264,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     native: Surface;
     behavior: Behavior;
     expectRejected?: boolean;
+    secondBehavior?: Behavior;
   }) {
     if (!modules) throw new Error("modules unavailable");
     const suffix = crypto.randomUUID();
@@ -372,6 +406,126 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         },
       },
     });
+    let secondModel: typeof model | undefined;
+    if (input.secondBehavior) {
+      const secondAccount = await modules.prisma.providerAccount.create({
+        data: {
+          userId: user.id,
+          providerType: protocolFor(input.native),
+          label: `account-second-${suffix}`,
+          baseUrl: `${origin}/${input.secondBehavior}`,
+          endpointIdentity: `${origin}/${input.secondBehavior}`,
+          authType: "BEARER",
+          status: "ACTIVE",
+          enabled: true,
+          healthStatus: "HEALTHY",
+        },
+      });
+      const secondCredentialId = crypto.randomUUID();
+      const secondEncrypted = modules.credentials.encryptProviderCredential(
+        "route-provider-secret-second",
+        {
+          userId: user.id,
+          providerAccountId: secondAccount.id,
+          credentialId: secondCredentialId,
+          credentialType: "BEARER",
+          aadVersion: 1,
+        },
+        keyring,
+      );
+      await modules.prisma.providerCredential.create({
+        data: {
+          id: secondCredentialId,
+          userId: user.id,
+          providerAccountId: secondAccount.id,
+          credentialType: "BEARER",
+          ...secondEncrypted,
+        },
+      });
+      await modules.prisma.providerAccount.update({
+        where: { id: secondAccount.id },
+        data: { currentCredentialId: secondCredentialId },
+      });
+      secondModel = await modules.prisma.providerModel.create({
+        data: {
+          userId: user.id,
+          providerAccountId: secondAccount.id,
+          upstreamModelId: "upstream-model-second",
+          enabled: true,
+          healthStatus: "HEALTHY",
+          contextWindow: 8_192,
+          maxOutputTokens: 256,
+          nativeCapabilities: {
+            protocols: [protocolFor(input.native)],
+            surfaces: [input.native],
+            streaming: true,
+            features: [],
+          },
+        },
+      });
+      const secondTarget = await modules.prisma.executionTarget.create({
+        data: { userId: user.id, kind: "PROVIDER_MODEL", providerModelId: secondModel.id },
+      });
+      await modules.prisma.poolMember.create({
+        data: {
+          poolId: pool.id,
+          executionTargetId: secondTarget.id,
+          tier: "PUBLIC_OVERFLOW",
+          publicOrder: 1,
+        },
+      });
+      await modules.prisma.providerPricingVersion.create({
+        data: {
+          userId: user.id,
+          providerAccountId: secondAccount.id,
+          providerModelId: secondModel.id,
+          version: "route-v1",
+          currency: "USD",
+          status: "ACTIVE",
+          accountingVersion: "provider-billable-v1",
+          confidence: "CALCULATED",
+          effectiveAt: new Date(Date.now() - 60_000),
+          activatedAt: new Date(Date.now() - 60_000),
+          pricing: { ratesPerMillion: { input: "1", output: "2", additional: "2" } },
+          chargeRules: {
+            inputIncludesCacheRead: false,
+            inputIncludesCacheWrite: false,
+            outputIncludesReasoning: false,
+            outputIncludesTool: false,
+            cacheReadAllowanceTokens: 0,
+            cacheWriteAllowanceTokens: 0,
+            reasoningAllowanceTokens: 0,
+            toolAllowanceTokens: 0,
+            additionalAllowanceTokens: 0,
+            unknownCategories: "FAIL_CLOSED",
+          },
+        },
+      });
+      await modules.prisma.providerBudgetPolicy.create({
+        data: {
+          userId: user.id,
+          providerAccountId: secondAccount.id,
+          providerModelId: secondModel.id,
+          poolId: pool.id,
+          scopeType: "POOL_PROVIDER_MODEL",
+          active: true,
+          activatedAt: new Date(Date.now() - 60_000),
+          Rules: {
+            create: [
+              { metric: "CONCURRENCY", period: "PER_ATTEMPT", mode: "UNLIMITED" },
+              { metric: "TOKENS", period: "UTC_DAY", mode: "LIMITED", limitValue: 100_000 },
+              {
+                metric: "SPEND",
+                period: "UTC_DAY",
+                mode: "LIMITED",
+                limitValue: "10",
+                currency: "USD",
+              },
+            ],
+          },
+        },
+      });
+    }
     await modules.prisma.modelApiToken.create({
       data: {
         userId: user.id,
@@ -439,6 +593,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         settlements: [] as never[],
         attemptEvents: [] as never[],
         model,
+        secondModel,
       };
     }
     const ledger = await waitForLedger(model.id);
@@ -463,6 +618,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       reservations,
       settlements,
       model,
+      secondModel,
       responseText,
       attemptEvents,
       observation: upstreamObservations[observationIndex],
@@ -493,18 +649,22 @@ integration("provider dispatch routes with real PostgreSQL", () => {
   function expectAdapterTelemetry(
     result: Awaited<ReturnType<typeof runCase>>,
     mode: "native" | "adapted",
+    requested: Surface,
+    native: Surface,
   ) {
     const terminals = result.attemptEvents.filter((event) => event.eventType === "TERMINAL");
     expect(terminals).toHaveLength(1);
     const terminal = terminals[0];
     expect(terminal).toMatchObject({
+      requestedSurface: requested,
+      nativeSurface: native,
       adapterMode: mode,
       adapterVersion: mode === "adapted" ? "1.0.0" : null,
     });
     for (const event of result.attemptEvents) {
       expect(event).toMatchObject({
-        requestedSurface: terminal?.requestedSurface,
-        nativeSurface: terminal?.nativeSurface,
+        requestedSurface: requested,
+        nativeSurface: native,
         adapterMode: mode,
         adapterVersion: mode === "adapted" ? "1.0.0" : null,
       });
@@ -592,7 +752,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       expectEgressContract(result, requested);
       expectExactSuccessAccounting(result);
       expectJsonEnvelope(result, requested);
-      expectAdapterTelemetry(result, "native");
+      expectAdapterTelemetry(result, "native", requested, requested);
     });
 
     it(`${requested} executes native streaming through terminal reconciliation`, async () => {
@@ -604,7 +764,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       expectEgressContract(result, requested);
       expectExactSuccessAccounting(result);
       expectStreamEnvelope(result, requested);
-      expectAdapterTelemetry(result, "native");
+      expectAdapterTelemetry(result, "native", requested, requested);
     });
   }
 
@@ -620,7 +780,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       expectEgressContract(result, native);
       expectExactSuccessAccounting(result);
       expectJsonEnvelope(result, requested);
-      expectAdapterTelemetry(result, "adapted");
+      expectAdapterTelemetry(result, "adapted", requested, native);
     },
   );
 
@@ -676,7 +836,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     expectEgressContract(result, native);
     expectExactSuccessAccounting(result);
     expectStreamEnvelope(result, requested);
-    expectAdapterTelemetry(result, "adapted");
+    expectAdapterTelemetry(result, "adapted", requested, native);
   });
 
   it.each([
@@ -700,6 +860,123 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       });
       expect(result.attemptCount).toBe(0);
       expect(result.observation).toBeUndefined();
+    },
+  );
+
+  it("fails over in publicOrder from a retryable first target to a settled second target", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const observationStart = upstreamObservations.length;
+    const first = await runCase({
+      requested: "openai-chat",
+      native: "openai-chat",
+      behavior: "error",
+      secondBehavior: "json",
+    });
+    if (!first.secondModel) throw new Error("second provider model was not created");
+    const secondLedger = await waitForLedger(first.secondModel.id);
+    await waitForTerminalAttempt(first.secondModel.id);
+    await waitForTerminalEvent(first.secondModel.id);
+    const [attempts, secondReservations, secondSettlements, secondEvents] = await Promise.all([
+      modules.prisma.providerAttempt.findMany({
+        where: { providerModelId: { in: [first.model.id, first.secondModel.id] } },
+        orderBy: { createdAt: "asc" },
+      }),
+      modules.prisma.providerBudgetReservation.findMany({
+        where: { providerModelId: first.secondModel.id },
+      }),
+      modules.prisma.providerBudgetSettlement.findMany({
+        where: { providerModelId: first.secondModel.id },
+      }),
+      modules.prisma.publicProviderAttemptEvent.findMany({
+        where: { providerModelId: first.secondModel.id },
+        orderBy: { createdAt: "asc" },
+      }),
+    ]);
+    expect(first.response.status).toBe(200);
+    expect(attempts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ providerModelId: first.model.id, state: "FAILED" }),
+        expect.objectContaining({ providerModelId: first.secondModel.id, state: "COMPLETED" }),
+      ]),
+    );
+    expect(
+      upstreamObservations.slice(observationStart).map(({ path }) => path.split("/")[1]),
+    ).toEqual(["error", "json"]);
+    expect(first.reservations).toHaveLength(2);
+    expect(first.settlements).toHaveLength(2);
+    expectConservativeAccounting(first);
+    expect(secondLedger).toMatchObject({ billableTotal: 7n, usageKnown: true, costKnown: true });
+    expect(secondReservations).toHaveLength(2);
+    expect(secondSettlements).toHaveLength(2);
+    expect(secondSettlements.map((row) => row.settledValue.toString()).sort()).toEqual([
+      "0.000009",
+      "7",
+    ]);
+    expect(secondEvents.filter((event) => event.eventType === "TERMINAL")).toHaveLength(1);
+    for (const event of secondEvents)
+      expect(event).toMatchObject({
+        requestedSurface: "openai-chat",
+        nativeSurface: "openai-chat",
+        adapterMode: "native",
+        adapterVersion: null,
+      });
+  });
+
+  it("never tries a second target after the first target commits a byte and crashes", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const observationStart = upstreamObservations.length;
+    const first = await runCase({
+      requested: "openai-chat",
+      native: "openai-chat",
+      behavior: "crash",
+      secondBehavior: "json",
+    });
+    if (!first.secondModel) throw new Error("second provider model was not created");
+    expect(upstreamObservations.slice(observationStart)).toHaveLength(1);
+    expect(
+      await modules.prisma.providerAttempt.count({
+        where: { providerModelId: first.secondModel.id },
+      }),
+    ).toBe(0);
+    expect(first.attempt).toMatchObject({ state: "FAILED" });
+    expect(first.ledger.usageKnown).toBe(false);
+    expectConservativeAccounting(first);
+    expect(first.attemptEvents.some((event) => event.eventType === "FIRST_CLIENT_BYTE")).toBe(true);
+  });
+
+  it.each(requestedSurfaces)(
+    "%s renders and redacts an adapted provider error in the requested protocol",
+    async (requested) => {
+      const native = adaptedNative[requested];
+      const result = await runCase({ requested, native, behavior: "client-error" });
+      expect(result.response.status).toBe(400);
+      expect(result.response.headers.get("retry-after")).toBe("2");
+      const requestedRequestIdHeader =
+        requested === "anthropic-messages" ? "request-id" : "x-request-id";
+      const sourceRequestIdHeader = native === "anthropic-messages" ? "request-id" : "x-request-id";
+      expect(result.response.headers.get(requestedRequestIdHeader)).toBe("upstream-request-400");
+      if (sourceRequestIdHeader !== requestedRequestIdHeader)
+        expect(result.response.headers.get(sourceRequestIdHeader)).toBeNull();
+      expect(result.response.headers.get("x-internal-secret")).toBeNull();
+      expect(result.responseText).not.toContain("route-provider-secret");
+      expect(result.responseText).not.toContain("internal_secret");
+      const error = JSON.parse(result.responseText);
+      if (requested === "anthropic-messages")
+        expect(error).toMatchObject({
+          type: "error",
+          error: { type: "invalid_request_error", message: "safe provider error" },
+        });
+      else
+        expect(error).toMatchObject({
+          error: {
+            type: "invalid_request_error",
+            code: "invalid_request_error",
+            message: "safe provider error",
+          },
+        });
+      expect(result.attempt.state).toBe("FAILED");
+      expectConservativeAccounting(result);
+      expectAdapterTelemetry(result, "adapted", requested, native);
     },
   );
 });

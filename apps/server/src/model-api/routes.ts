@@ -1254,6 +1254,26 @@ async function readAdaptedNonstreamBody({
   }
 }
 
+function adaptedProviderResponseHeaders(
+  source: ProtocolSurface,
+  target: ProtocolSurface,
+  sourceHeaders: Headers,
+): Headers {
+  const headers = new Headers({
+    "content-type": "application/json; charset=utf-8",
+    "x-wsmp-adapter-version": "1.0.0",
+  });
+  const retryAfter = sourceHeaders.get("retry-after");
+  if (retryAfter) headers.set("retry-after", retryAfter);
+  const requestId =
+    source === "anthropic-messages"
+      ? sourceHeaders.get("request-id")
+      : sourceHeaders.get("x-request-id");
+  if (requestId)
+    headers.set(target === "anthropic-messages" ? "request-id" : "x-request-id", requestId);
+  return headers;
+}
+
 async function primeReadableStream(
   stream: ReadableStream<Uint8Array>,
   target: ProtocolSurface,
@@ -2971,13 +2991,15 @@ async function relayPool({
         headers: result.response.headers,
         signal: request.signal,
       });
+      const adaptedHeaders = adaptedProviderResponseHeaders(
+        source,
+        operation.adaptation.requestedSurface,
+        result.response.headers,
+      );
       return commitAwareResponse(
         new Response(adapted, {
           status: result.response.status,
-          headers: {
-            "content-type": "application/json; charset=utf-8",
-            "x-wsmp-adapter-version": "1.0.0",
-          },
+          headers: adaptedHeaders,
         }),
       );
     }
