@@ -106,18 +106,26 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         where: { attemptId: attempt.attemptId },
         include: { Lease: true, Waiters: true },
       });
-      const capacityIds = [
+      const orderedCapacityIds = [
         ...new Set(
-          existing
-            ? existing.Waiters.filter((waiter) => waiter.state === "WAITING").map(
-                (waiter) => waiter.capacityId,
+          (existing
+            ? existing.Waiters.filter((waiter) => waiter.state === "WAITING").sort(
+                (left, right) => left.candidateOrder - right.candidateOrder,
               )
-            : attempt.candidates.map((candidate) => candidate.capacityId),
+            : [...attempt.candidates].sort(
+                (left, right) => left.candidateOrder - right.candidateOrder,
+              )
+          ).map((candidate) => candidate.capacityId),
         ),
-      ].sort();
-      if (existing?.Lease?.state === "ACTIVE" && !capacityIds.includes(existing.Lease.capacityId))
-        capacityIds.push(existing.Lease.capacityId);
-      capacityIds.sort();
+      ];
+      if (
+        existing?.Lease?.state === "ACTIVE" &&
+        !orderedCapacityIds.includes(existing.Lease.capacityId)
+      )
+        orderedCapacityIds.push(existing.Lease.capacityId);
+      // Locks remain globally sorted to avoid cross-request deadlocks. Once
+      // held, admission visits capacities in caller-scored candidate order.
+      const capacityIds = [...orderedCapacityIds].sort();
       for (const capacityId of capacityIds)
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacityId}, 0))`;
       // The initial graph read is needed to discover which capacity locks to
@@ -303,7 +311,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           },
         }));
 
-      for (const capacityId of capacityIds) await this.#admitOne(tx, capacityId, now);
+      for (const capacityId of orderedCapacityIds) await this.#admitOne(tx, capacityId, now);
       const refreshed = await tx.admissionRequest.findUniqueOrThrow({
         where: { id: request.id },
         include: { Lease: true },
