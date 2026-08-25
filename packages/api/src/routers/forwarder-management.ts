@@ -2437,58 +2437,162 @@ export const forwarderManagementRouter = {
       }),
     )
     .handler(async ({ input, context }) => {
-      const member = await prisma.poolMember.findUnique({
-        where: { id: input.id },
-        select: {
-          id: true,
-          tier: true,
-          publicOrder: true,
-          ExecutionTarget: { select: { ProviderModel: { select: { id: true } } } },
-          ModelPool: {
+      const userId = context.session.user.id;
+      return prisma.$transaction(
+        async (tx) => {
+          const candidate = await tx.poolMember.findUnique({
+            where: { id: input.id },
+            select: { poolId: true, ModelPool: { select: { userId: true } } },
+          });
+          if (!candidate || candidate.ModelPool.userId !== userId)
+            throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
+
+          // Serialize every tier/order transition with pool attachment and
+          // reorder operations. Re-read all policy inputs after taking the lock
+          // so acknowledgement and protection cannot be revoked concurrently.
+          await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidate.poolId} AND "userId" = ${userId} FOR UPDATE`;
+          const member = await tx.poolMember.findUnique({
+            where: { id: input.id },
             select: {
-              userId: true,
-              publicEgressEnabled: true,
-              publicEgressAcknowledged: true,
+              id: true,
+              poolId: true,
+              tier: true,
+              publicOrder: true,
+              ExecutionTarget: {
+                select: {
+                  ProviderModel: { select: { id: true, providerAccountId: true } },
+                },
+              },
+              ModelPool: {
+                select: {
+                  userId: true,
+                  publicEgressEnabled: true,
+                  publicEgressAcknowledged: true,
+                },
+              },
             },
-          },
+          });
+          if (!member || member.ModelPool.userId !== userId)
+            throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
+          const providerModel = member.ExecutionTarget?.ProviderModel;
+          const nextTier = input.tier ?? member.tier;
+          if (input.tier && !providerModel)
+            throw new ORPCError("BAD_REQUEST", {
+              message: "Only provider-backed members can change tier.",
+            });
+          if (
+            nextTier === "PUBLIC_OVERFLOW" &&
+            (!member.ModelPool.publicEgressEnabled || !member.ModelPool.publicEgressAcknowledged)
+          )
+            throw new ORPCError("BAD_REQUEST", {
+              message: "Acknowledge and enable public egress before moving a target to overflow.",
+            });
+
+          if (nextTier === "PUBLIC_OVERFLOW" && member.tier !== "PUBLIC_OVERFLOW") {
+            if (!providerModel) throw new ORPCError("BAD_REQUEST");
+            const protection = await tx.providerBudgetPolicy.findFirst({
+              where: {
+                userId,
+                active: true,
+                scopeType: "POOL_PROVIDER_MODEL",
+                poolId: member.poolId,
+                providerModelId: providerModel.id,
+                providerAccountId: providerModel.providerAccountId,
+                activatedAt: { not: null },
+                Rules: {
+                  some: { metric: "CONCURRENCY", period: "PER_ATTEMPT" },
+                },
+              },
+              select: {
+                id: true,
+                Rules: {
+                  where: { metric: "CONCURRENCY", period: "PER_ATTEMPT" },
+                  select: { mode: true, limitValue: true },
+                },
+              },
+            });
+            const concurrency = protection?.Rules[0];
+            const validProtection =
+              protection &&
+              protection.Rules.length === 1 &&
+              concurrency &&
+              ((concurrency.mode === "LIMITED" &&
+                concurrency.limitValue !== null &&
+                Number(concurrency.limitValue.toString()) > 0) ||
+                (concurrency.mode === "UNLIMITED" && concurrency.limitValue === null));
+            const protectionAudit = protection
+              ? await tx.providerAuditEvent.findFirst({
+                  where: {
+                    userId,
+                    providerAccountId: providerModel.providerAccountId,
+                    subjectId: protection.id,
+                    action: { in: ["BUDGET_CREATED", "BUDGET_UPDATED", "BUDGET_ACTIVATED"] },
+                  },
+                  select: { id: true },
+                })
+              : null;
+            if (!validProtection || !protectionAudit)
+              throw new ORPCError("BAD_REQUEST", {
+                message:
+                  "Create and activate an audited attachment protection policy before moving this target to overflow.",
+              });
+          }
+
+          const overflow = await tx.poolMember.findMany({
+            where: { poolId: member.poolId, tier: "PUBLIC_OVERFLOW", id: { not: member.id } },
+            orderBy: [{ publicOrder: "asc" }, { id: "asc" }],
+            select: { id: true },
+          });
+          const desiredOrder = Math.min(
+            input.publicOrder ?? member.publicOrder ?? overflow.length,
+            overflow.length,
+          );
+          if (nextTier === "PUBLIC_OVERFLOW") overflow.splice(desiredOrder, 0, { id: member.id });
+
+          // Move existing rows out of the unique public-order range before
+          // assigning the normalized contiguous order.
+          if (overflow.length > 0)
+            await tx.poolMember.updateMany({
+              where: { poolId: member.poolId, tier: "PUBLIC_OVERFLOW" },
+              data: { publicOrder: { increment: 20_000 } },
+            });
+          const updated = await tx.poolMember.update({
+            where: { id: member.id },
+            data: {
+              ...(input.weight !== undefined ? { weight: input.weight } : {}),
+              ...(input.routingStatus ? { routingStatus: input.routingStatus } : {}),
+              ...(input.tier ? { tier: input.tier } : {}),
+              publicOrder: nextTier === "PUBLIC_OVERFLOW" ? desiredOrder + 40_000 : null,
+            },
+            select: { id: true, weight: true, routingStatus: true, tier: true, publicOrder: true },
+          });
+          for (const [publicOrder, orderedMember] of overflow.entries())
+            await tx.poolMember.update({
+              where: { id: orderedMember.id },
+              data: { publicOrder },
+            });
+          if (providerModel && member.tier !== nextTier)
+            await tx.providerAuditEvent.create({
+              data: {
+                userId,
+                providerAccountId: providerModel.providerAccountId,
+                action: "MODEL_UPDATED",
+                subjectId: providerModel.id,
+                metadata: {
+                  source: "pool_member_tier_transition",
+                  poolId: member.poolId,
+                  poolMemberId: member.id,
+                  fromTier: member.tier,
+                  toTier: nextTier,
+                },
+              },
+            });
+          return Object.hasOwn(updated, "tier")
+            ? { ...updated, publicOrder: nextTier === "PUBLIC_OVERFLOW" ? desiredOrder : null }
+            : updated;
         },
-      });
-      if (!member || member.ModelPool.userId !== context.session.user.id) {
-        throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
-      }
-      const nextTier = input.tier ?? member.tier;
-      if (input.tier && !member.ExecutionTarget?.ProviderModel) {
-        throw new ORPCError("BAD_REQUEST", {
-          message: "Only provider-backed members can change tier.",
-        });
-      }
-      if (
-        nextTier === "PUBLIC_OVERFLOW" &&
-        (!member.ModelPool.publicEgressEnabled || !member.ModelPool.publicEgressAcknowledged)
-      ) {
-        throw new ORPCError("BAD_REQUEST", {
-          message: "Acknowledge and enable public egress before moving a target to overflow.",
-        });
-      }
-      const nextPublicOrder =
-        nextTier === "PUBLIC_OVERFLOW" ? (input.publicOrder ?? member.publicOrder) : null;
-      if (nextTier === "PUBLIC_OVERFLOW" && nextPublicOrder === null) {
-        throw new ORPCError("BAD_REQUEST", {
-          message: "Public overflow targets require an explicit order.",
-        });
-      }
-      return prisma.poolMember.update({
-        where: { id: input.id },
-        data: {
-          ...(input.weight !== undefined ? { weight: input.weight } : {}),
-          ...(input.routingStatus ? { routingStatus: input.routingStatus } : {}),
-          ...(input.tier ? { tier: input.tier } : {}),
-          ...(input.tier || input.publicOrder !== undefined
-            ? { publicOrder: nextPublicOrder }
-            : {}),
-        },
-        select: { id: true, weight: true, routingStatus: true, tier: true, publicOrder: true },
-      });
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
     }),
 
   reorderProviderPoolMember: protectedProcedure
@@ -2517,6 +2621,10 @@ export const forwarderManagementRouter = {
         if (currentIndex < 0 || nextIndex < 0 || nextIndex >= members.length)
           return { moved: false };
         [members[currentIndex], members[nextIndex]] = [members[nextIndex]!, members[currentIndex]!];
+        await tx.poolMember.updateMany({
+          where: { poolId: candidate.poolId, tier: "PUBLIC_OVERFLOW" },
+          data: { publicOrder: { increment: 20_000 } },
+        });
         for (const [publicOrder, member] of members.entries()) {
           await tx.poolMember.update({ where: { id: member.id }, data: { publicOrder } });
         }

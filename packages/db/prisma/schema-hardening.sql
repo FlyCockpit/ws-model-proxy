@@ -931,14 +931,22 @@ BEGIN
          OR target."userId" IS DISTINCT FROM model."userId"
          OR model."userId" IS DISTINCT FROM account."userId"
          OR pool."userId" IS DISTINCT FROM target."userId"
-         OR NOT pool."publicEgressEnabled"
-         OR NOT pool."publicEgressAcknowledged"
          OR NOT EXISTS (
            SELECT 1 FROM pool_member member
             WHERE member."poolId" = record."targetModelPoolId"
               AND member."executionTargetId" = record."selectedExecutionTargetId"
-              AND member.tier = 'PUBLIC_OVERFLOW'::"PoolMemberTier"
+              AND member.tier IN (
+                'PRIMARY'::"PoolMemberTier",
+                'PUBLIC_OVERFLOW'::"PoolMemberTier"
+              )
          )
+         OR ((NOT pool."publicEgressEnabled" OR NOT pool."publicEgressAcknowledged")
+           AND EXISTS (
+             SELECT 1 FROM pool_member member
+              WHERE member."poolId" = record."targetModelPoolId"
+                AND member."executionTargetId" = record."selectedExecutionTargetId"
+                AND member.tier = 'PUBLIC_OVERFLOW'::"PoolMemberTier"
+           ))
          OR (record."modelApiTokenId" IS NOT NULL
            AND (token.id IS NULL OR token."userId" IS DISTINCT FROM record."userId"))
          OR (record."userId" IS NOT DISTINCT FROM pool."userId"
@@ -1201,7 +1209,10 @@ BEGIN
            SELECT 1 FROM pool_member member
             WHERE member."poolId" = NEW."targetModelPoolId"
               AND member."executionTargetId" = NEW."selectedExecutionTargetId"
-              AND member.tier = 'PUBLIC_OVERFLOW'::"PoolMemberTier"
+              AND member.tier IN (
+                'PRIMARY'::"PoolMemberTier",
+                'PUBLIC_OVERFLOW'::"PoolMemberTier"
+              )
          )
          OR (NEW."userId" IS NOT DISTINCT FROM pool_owner AND NEW."poolGrantId" IS NOT NULL)
          OR (NEW."userId" IS DISTINCT FROM pool_owner AND (
@@ -1214,6 +1225,19 @@ BEGIN
            )
          )) THEN
         RAISE EXCEPTION 'provider stickiness binding must match its exact account, model, target, pool, endpoint, and visibility graph'
+          USING ERRCODE = '23514';
+      END IF;
+      IF EXISTS (
+        SELECT 1
+          FROM pool_member member
+          JOIN model_pool provider_pool ON provider_pool.id = member."poolId"
+         WHERE member."poolId" = NEW."targetModelPoolId"
+           AND member."executionTargetId" = NEW."selectedExecutionTargetId"
+           AND member.tier = 'PUBLIC_OVERFLOW'::"PoolMemberTier"
+           AND (NOT provider_pool."publicEgressEnabled"
+             OR NOT provider_pool."publicEgressAcknowledged")
+      ) THEN
+        RAISE EXCEPTION 'provider overflow stickiness requires acknowledged public egress'
           USING ERRCODE = '23514';
       END IF;
       IF NEW."modelApiTokenId" IS NOT NULL THEN
