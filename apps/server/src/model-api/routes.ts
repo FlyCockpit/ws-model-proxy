@@ -5746,7 +5746,7 @@ function responseIdParam(responseId: string | undefined): string | Response {
   // Hono can preserve the raw query suffix in a route parameter when this app
   // is mounted below another Hono router. Never let that suffix become part of
   // the encoded upstream response ID; responsePathWithQuery forwards it once.
-  const normalized = responseId?.split("?", 1)[0]?.trim();
+  const normalized = responseId?.split(/\?|%3f/i, 1)[0]?.trim();
   if (!normalized) {
     return openAiFailureJsonResponse("not_found", "Response ID is required.");
   }
