@@ -351,6 +351,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     privatePool?: boolean;
     routingMode?: "PREFER_NATIVE" | "REQUIRE_NATIVE" | "REQUIRE_ADAPTED";
     multiSurfaceStreamingFallback?: boolean;
+    developerPrefix?: boolean;
   }) {
     if (!modules) throw new Error("modules unavailable");
     const suffix = crypto.randomUUID();
@@ -727,7 +728,15 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     const stream = input.behavior === "stream" || input.behavior === "crash";
     const body =
       input.requested === "openai-chat"
-        ? { model: modelId, stream, max_tokens: 16, messages: [{ role: "user", content: "hi" }] }
+        ? {
+            model: modelId,
+            stream,
+            max_tokens: 16,
+            messages: [
+              ...(input.developerPrefix ? [{ role: "developer", content: "policy" }] : []),
+              { role: "user", content: "hi" },
+            ],
+          }
         : input.requested === "openai-responses"
           ? {
               model: modelId,
@@ -1357,6 +1366,26 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     expect(result.observation?.path).toBe("/stream/v1/responses");
     expectAdapterTelemetry(result, "adapted", "openai-chat", "openai-responses");
     expectStreamEnvelope(result, "openai-chat");
+  });
+
+  it("reports developer authority loss on provider-backed Anthropic adaptation", async () => {
+    const result = await runCase({
+      requested: "openai-chat",
+      native: "anthropic-messages",
+      behavior: "json",
+      developerPrefix: true,
+    });
+    expect(result.response.status).toBe(200);
+    expect(result.response.headers.get("x-wsmp-adapter-limitations")).toBe(
+      "strict_common_subset,anthropic_instruction_authority_collapse",
+    );
+    const observedBody: unknown = JSON.parse(result.observation?.body ?? "{}");
+    const parsedBody =
+      typeof observedBody === "string" ? (JSON.parse(observedBody) as unknown) : observedBody;
+    expect(parsedBody).toMatchObject({
+      system: [{ type: "text", text: "policy" }],
+      messages: [{ role: "user" }],
+    });
   });
 
   it.each([

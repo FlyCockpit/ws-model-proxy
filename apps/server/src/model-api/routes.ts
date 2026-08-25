@@ -148,6 +148,7 @@ import {
   dispatchPublicOverflow,
   listPublicOverflowTargets,
   matchesChatTestProviderMode,
+  orderChatTestProviderTargets,
   type PublicOverflowReason,
   type PublicOverflowRequest,
   type PublicProviderTarget,
@@ -3433,12 +3434,22 @@ async function relayPool({
       }
       if (!capacityRuntime) return dispatchPublicOverflow({ ...providerRequest, memberTier });
       const listed = await listPublicOverflowTargets(target.ownerUserId, target.id, memberTier);
-      const compatible = listed.targets.filter(
-        (providerTarget) =>
-          (!providerRequest.forcedPoolMemberId ||
-            providerTarget.poolMemberId === providerRequest.forcedPoolMemberId) &&
-          publicTargetCompatibility(providerTarget, providerRequest) === "COMPATIBLE" &&
-          matchesChatTestProviderMode(providerTarget, requestedSurface, testRoutingMode),
+      const compatible = orderChatTestProviderTargets(
+        listed.targets.flatMap((providerTarget) => {
+          if (
+            providerRequest.forcedPoolMemberId &&
+            providerTarget.poolMemberId !== providerRequest.forcedPoolMemberId
+          )
+            return [];
+          const resolvedExecution = resolvePublicProviderExecution(providerTarget, providerRequest);
+          const resolvedTarget = { ...providerTarget, resolvedExecution };
+          return publicTargetCompatibility(providerTarget, providerRequest) === "COMPATIBLE" &&
+            matchesChatTestProviderMode(resolvedTarget, requestedSurface, testRoutingMode)
+            ? [resolvedTarget]
+            : [];
+        }),
+        requestedSurface,
+        testRoutingMode,
       );
       // A provider-backed primary is a physical execution target too. Missing
       // capacity identity is a configuration error, never permission to bypass
@@ -3625,6 +3636,20 @@ async function relayPool({
       return commitAwareResponse(response);
     }
     const source: ProtocolSurface = result.nativeSurface;
+    const adaptedRequestLimitations = (() => {
+      try {
+        return parseCanonicalRequest(
+          operation.adaptation.requestedSurface,
+          operation.adaptation.payload,
+        ).limitations;
+      } catch {
+        return [];
+      }
+    })();
+    const adapterLimitations = [
+      "strict_common_subset",
+      ...(source === "anthropic-messages" ? adaptedRequestLimitations : []),
+    ].join(",");
     // Providers return ordinary JSON error envelopes even when the successful
     // operation would have streamed. Adapt that envelope as JSON; never feed
     // it into an SSE state machine or advertise it as an event stream.
@@ -3642,6 +3667,7 @@ async function relayPool({
         operation.adaptation.requestedSurface,
         result.response.headers,
       );
+      adaptedHeaders.set("x-wsmp-adapter-limitations", adapterLimitations);
       return commitAwareResponse(
         new Response(adapted, {
           status:
@@ -3653,7 +3679,12 @@ async function relayPool({
       );
     }
     if (operation.stream) {
-      if (!result.response.body) return commitAwareResponse(result.response);
+      if (!result.response.body) {
+        const headers = new Headers(result.response.headers);
+        headers.set("x-wsmp-adapter-version", "1.0.0");
+        headers.set("x-wsmp-adapter-limitations", adapterLimitations);
+        return commitAwareResponse(new Response(null, { status: result.response.status, headers }));
+      }
       return commitAwareResponse(
         new Response(
           adaptedResponseBody({
@@ -3670,6 +3701,7 @@ async function relayPool({
             headers: {
               "content-type": "text/event-stream; charset=utf-8",
               "x-wsmp-adapter-version": "1.0.0",
+              "x-wsmp-adapter-limitations": adapterLimitations,
             },
           },
         ),
@@ -3695,6 +3727,7 @@ async function relayPool({
         headers: {
           "content-type": "application/json; charset=utf-8",
           "x-wsmp-adapter-version": "1.0.0",
+          "x-wsmp-adapter-limitations": adapterLimitations,
         },
       }),
     );
