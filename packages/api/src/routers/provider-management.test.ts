@@ -35,6 +35,7 @@ const { default: prisma } = await import("@ws-model-proxy/db");
 const db = prisma as unknown as {
   $transaction: MockInstance;
   $queryRaw: MockInstance;
+  $executeRaw: MockInstance;
   providerAccount: {
     create: MockInstance;
     findMany: MockInstance;
@@ -366,7 +367,8 @@ describe("providerManagementRouter security boundary", () => {
     await expect(client.updateModel({ id: "model", enabled: true })).rejects.toMatchObject({
       code: "NOT_FOUND",
     });
-    expect(db.$queryRaw).toHaveBeenCalledTimes(3);
+    expect(db.$executeRaw).toHaveBeenCalledOnce();
+    expect(db.$queryRaw).toHaveBeenCalledTimes(2);
     expect(db.providerModel.update).not.toHaveBeenCalled();
     expect(db.providerAccount.findFirst).not.toHaveBeenCalled();
   });
@@ -526,8 +528,6 @@ describe("providerManagementRouter security boundary", () => {
   it("rejects reducing provider concurrency below active database leases", async () => {
     envMock.enabled = true;
     db.$queryRaw
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce([])

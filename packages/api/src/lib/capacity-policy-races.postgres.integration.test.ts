@@ -21,6 +21,7 @@ integration("capacity policy production-router races", () => {
       }
     | undefined;
   let blocker: ReturnType<typeof import("@ws-model-proxy/db/client-factory").createPrismaClient>;
+  let observer: ReturnType<typeof import("@ws-model-proxy/db/client-factory").createPrismaClient>;
   let context: Context;
   let userId = "";
   let capacityId = "";
@@ -37,7 +38,7 @@ integration("capacity policy production-router races", () => {
     process.env.DATABASE_URL = databaseUrl;
     process.env.NODE_ENV = "test";
     process.env.MODEL_API_GLOBAL_CAPACITY_ENABLED = "true";
-    process.env.MODEL_API_PUBLIC_PROVIDERS_ENABLED = "true";
+    process.env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = "true";
     const [db, dbFactory, capacity, forwarder, provider] = await Promise.all([
       import("@ws-model-proxy/db"),
       import("@ws-model-proxy/db/client-factory"),
@@ -46,6 +47,7 @@ integration("capacity policy production-router races", () => {
       import("../routers/provider-management"),
     ]);
     blocker = dbFactory.createPrismaClient(databaseUrl);
+    observer = dbFactory.createPrismaClient(databaseUrl);
     modules = { prisma: db.default, capacity, forwarder, provider };
     const suffix = crypto.randomUUID();
     const user = await modules.prisma.user.create({
@@ -269,13 +271,11 @@ integration("capacity policy production-router races", () => {
   afterAll(async () => {
     // Provider audit history is intentionally append-only and retains its
     // owner. Unique fixture identities keep these rows isolated in shared CI.
-    await blocker?.$disconnect();
+    await Promise.all([blocker?.$disconnect(), observer?.$disconnect()]);
   });
 
-  async function raceBehindIdentityFence(
-    identity: string,
-    operations: readonly (() => Promise<unknown>)[],
-  ) {
+  async function operationBehindIdentityFence(identity: string, operation: () => Promise<unknown>) {
+    const lockKey = `execution-target:${identity}`;
     let releaseFence: (() => void) | undefined;
     let reportLocked: (() => void) | undefined;
     const release = new Promise<void>((resolve) => {
@@ -290,26 +290,31 @@ integration("capacity policy production-router races", () => {
       await release;
     });
     await locked;
-    const outcomesPromise = Promise.allSettled(operations.map((operation) => operation()));
+    const outcomePromise = operation();
     let waiterCount = 0;
-    for (let attempt = 0; attempt < 100; attempt++) {
-      const rows = await blocker.$queryRaw<Array<{ count: bigint }>>`
+    for (let attempt = 0; attempt < 500; attempt++) {
+      // Observe from a dedicated client: querying through the client that owns
+      // the blocker transaction can reuse its pinned connection under Prisma's
+      // adapter and make the barrier observation ambiguous.
+      const rows = await observer.$queryRaw<Array<{ count: bigint }>>`
+        WITH expected_lock AS (
+          SELECT hashtextextended(${lockKey}, 0) AS lock_key
+        )
         SELECT COUNT(*)::bigint AS count
-        FROM pg_stat_activity
-        WHERE wait_event_type = 'Lock'
-          AND wait_event = 'advisory'
-          AND query LIKE '%pg_advisory_xact_lock%'
+        FROM pg_locks, expected_lock
+        WHERE locktype = 'advisory'
+          AND granted = false
+          AND classid = (((lock_key >> 32) & 4294967295)::oid)
+          AND objid = ((lock_key & 4294967295)::oid)
+          AND objsubid = 1
       `;
       waiterCount = Number(rows[0]?.count ?? 0n);
-      // The operations also serialize with one another, so the first waiter
-      // reaching the shared identity fence proves they are queued behind it.
       if (waiterCount >= 1) break;
-      await new Promise((resolve) => setTimeout(resolve, 10));
     }
     releaseFence?.();
     await blockerTransaction;
-    if (waiterCount < 1) throw new Error("Expected an advisory waiter, observed none.");
-    return outcomesPromise;
+    if (waiterCount < 1) throw new Error(`Expected a waiter on ${lockKey}, observed none.`);
+    return outcomePromise;
   }
 
   function expectAllFulfilled(outcomes: readonly PromiseSettledResult<unknown>[]) {
@@ -328,15 +333,28 @@ integration("capacity policy production-router races", () => {
     const forwarderClient = createRouterClient(modules.forwarder.forwarderManagementRouter, {
       context,
     });
-    const outcomes = await raceBehindIdentityFence(`provider-model:${providerModelId}`, [
-      () => providerClient.updateModel({ id: providerModelId, concurrencyLimit: 2 }),
-      () =>
-        forwarderClient.addProviderPoolMember({
-          poolId,
-          providerModelId,
-          tier: "PRIMARY",
-          weight: 1,
-        }),
+    await operationBehindIdentityFence(`provider-model:${providerModelId}`, () =>
+      providerClient.updateModel({ id: providerModelId, concurrencyLimit: 8 }),
+    );
+    await operationBehindIdentityFence(`provider-model:${providerModelId}`, () =>
+      forwarderClient.addProviderPoolMember({
+        poolId,
+        providerModelId,
+        tier: "PRIMARY",
+        weight: 1,
+      }),
+    );
+    await modules.prisma.poolMember.deleteMany({
+      where: { poolId, executionTargetId: providerTargetId },
+    });
+    const outcomes = await Promise.allSettled([
+      providerClient.updateModel({ id: providerModelId, concurrencyLimit: 2 }),
+      forwarderClient.addProviderPoolMember({
+        poolId,
+        providerModelId,
+        tier: "PRIMARY",
+        weight: 1,
+      }),
     ]);
     expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
     const [model, physical, attachment] = await Promise.all([
@@ -413,12 +431,19 @@ integration("capacity policy production-router races", () => {
       providerModels: providerInput(ids),
     });
     const ordered = [...guardedProviderModelIds].sort() as [string, string];
-    const outcomes = await raceBehindIdentityFence(`provider-model:${ordered[0]}`, [
-      () => firstClient.createGuardedModelPool(guardedInput(`guarded-a-${suffix}`, ordered)),
-      () =>
-        secondClient.createGuardedModelPool(
-          guardedInput(`guarded-b-${suffix}`, [ordered[1], ordered[0]]),
-        ),
+    await operationBehindIdentityFence(`provider-model:${ordered[0]}`, () =>
+      firstClient.createGuardedModelPool(guardedInput(`guarded-probe-a-${suffix}`, ordered)),
+    );
+    await operationBehindIdentityFence(`provider-model:${ordered[0]}`, () =>
+      secondClient.createGuardedModelPool(
+        guardedInput(`guarded-probe-b-${suffix}`, [ordered[1], ordered[0]]),
+      ),
+    );
+    const outcomes = await Promise.allSettled([
+      firstClient.createGuardedModelPool(guardedInput(`guarded-a-${suffix}`, ordered)),
+      secondClient.createGuardedModelPool(
+        guardedInput(`guarded-b-${suffix}`, [ordered[1], ordered[0]]),
+      ),
     ]);
     expectAllFulfilled(outcomes);
     const pools = await modules.prisma.modelPool.findMany({

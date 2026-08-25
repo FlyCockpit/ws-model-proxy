@@ -2,6 +2,7 @@ import { ORPCError } from "@orpc/server";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 
 const RETRYABLE_CODES = new Set(["P2034", "40001", "40P01"]);
+const TRANSACTION_WRITE_CONFLICT = "TransactionWriteConflict";
 
 function stringProperty(value: unknown, property: string): string | undefined {
   if (!value || typeof value !== "object" || !(property in value)) return undefined;
@@ -16,6 +17,11 @@ function stringProperty(value: unknown, property: string): string | undefined {
  */
 export function retryableSerializableTransactionCode(error: unknown): string | undefined {
   const code = stringProperty(error, "code");
+  const directCause =
+    error && typeof error === "object" && "cause" in error
+      ? Reflect.get(error, "cause")
+      : undefined;
+  if (stringProperty(directCause, "kind") === TRANSACTION_WRITE_CONFLICT) return "40001";
   if (code === "P2010") {
     if (!error || typeof error !== "object" || !("meta" in error)) return undefined;
     const meta = Reflect.get(error, "meta");
@@ -27,6 +33,7 @@ export function retryableSerializableTransactionCode(error: unknown): string | u
       driverAdapterError && typeof driverAdapterError === "object" && "cause" in driverAdapterError
         ? Reflect.get(driverAdapterError, "cause")
         : undefined;
+    if (stringProperty(cause, "kind") === TRANSACTION_WRITE_CONFLICT) return "40001";
     const sqlState = stringProperty(meta, "code") ?? stringProperty(cause, "originalCode");
     return sqlState && RETRYABLE_CODES.has(sqlState) ? sqlState : undefined;
   }

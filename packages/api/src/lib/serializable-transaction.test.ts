@@ -36,6 +36,21 @@ describe("serializable transaction retry", () => {
     expect(transaction).toHaveBeenCalledTimes(3);
   });
 
+  it("retries Prisma adapter transaction-write-conflict errors", async () => {
+    transaction
+      .mockRejectedValueOnce({
+        name: "DriverAdapterError",
+        cause: { kind: "TransactionWriteConflict" },
+      })
+      .mockRejectedValueOnce({
+        code: "P2010",
+        meta: { driverAdapterError: { cause: { kind: "TransactionWriteConflict" } } },
+      })
+      .mockResolvedValueOnce("ok");
+    await expect(runSerializableTransaction(async () => "unused")).resolves.toBe("ok");
+    expect(transaction).toHaveBeenCalledTimes(3);
+  });
+
   it.each([
     null,
     "40001",
