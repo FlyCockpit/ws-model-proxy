@@ -944,6 +944,65 @@ describe("model API routes", () => {
     expect(text).toContain("data: [DONE]");
   });
 
+  it("uses an alternate adapted surface when the requested native surface lacks streaming", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "multi-surface-member",
+        discoveredModelId: "multi-surface-model",
+        upstreamModelId: "upstream-multi",
+        cliDeviceId: "cli-multi",
+        capabilityOverrideMetadata: {
+          version: 4,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiChatCompletions: {
+              source: "provider",
+              confidence: "exact",
+              operations: ["create"],
+              streaming: false,
+            },
+            openaiResponses: {
+              source: "provider",
+              confidence: "exact",
+              operations: ["create"],
+              streaming: true,
+            },
+          },
+        },
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-multi"];
+    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        stream: true,
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    expect(sent.family).toBe("responses");
+    expect(sent.path).toBe("/v1/responses");
+    manager.headers(sent.requestId, 200, { "content-type": "text/event-stream" });
+    for (const record of responsesConformanceFixture.events) {
+      manager.body(
+        sent.requestId,
+        `${record.event ? `event: ${record.event}\n` : ""}data: ${typeof record.data === "string" ? record.data : JSON.stringify(record.data)}\n\n`,
+      );
+    }
+    manager.complete(sent.requestId);
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("data: [DONE]");
+  });
+
   it("renders one requested-protocol error when adapted SSE fails after commitment", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],

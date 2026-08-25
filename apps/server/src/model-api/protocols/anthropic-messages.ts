@@ -173,7 +173,11 @@ export function renderAnthropicMessagesRequest(
   options: { allowLossyInstructionRoleCollapse?: boolean } = {},
 ): Record<string, unknown> {
   const roles = new Set(request.instructions.map((item) => item.role));
-  if (roles.has("developer") && !options.allowLossyInstructionRoleCollapse) {
+  // Anthropic has one top-level instruction channel. A developer-only sequence
+  // can therefore stay in its original order and authority tier (there is no
+  // competing system tier to collapse into). Mixed system/developer input is
+  // the lossy case and remains explicit opt-in.
+  if (roles.has("system") && roles.has("developer") && !options.allowLossyInstructionRoleCollapse) {
     unsupported(
       "instructions",
       "mix system and developer roles; enable lossy instruction-role collapse explicitly",

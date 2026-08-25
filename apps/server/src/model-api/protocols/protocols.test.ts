@@ -58,26 +58,38 @@ describe("canonical request adapters", () => {
     expect(canonical.limitations).toContain("anthropic_instruction_authority_collapse");
   });
 
-  it("allows developer-only adaptation while surfacing the Anthropic limitation", () => {
-    const canonical = parseOpenAiResponsesRequest({
+  it.each([false, true])(
+    "adapts developer-only instructions at Anthropic authority for stream=%s",
+    (stream) => {
+      const canonical = parseOpenAiResponsesRequest({
+        model: "requested",
+        instructions: "policy",
+        input: "hello",
+        stream,
+      });
+      const before = structuredClone(canonical);
+      expect(renderAnthropicMessagesRequest(canonical, "upstream")).toMatchObject({
+        system: [{ type: "text", text: "policy" }],
+        messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+        stream,
+      });
+      expect(canonical).toEqual(before);
+      expect(canonical.limitations).toContain("anthropic_instruction_authority_collapse");
+    },
+  );
+
+  it("adapts system-only instructions without a lossy opt-in", () => {
+    const canonical = parseOpenAiChatRequest({
       model: "requested",
-      instructions: "policy",
-      input: "hello",
+      messages: [
+        { role: "system", content: "policy" },
+        { role: "user", content: "hello" },
+      ],
     });
-    const before = structuredClone(canonical);
-    expect(() => renderAnthropicMessagesRequest(canonical, "upstream")).toThrow(
-      "lossy instruction-role collapse",
-    );
-    expect(canonical).toEqual(before);
-    expect(
-      renderAnthropicMessagesRequest(canonical, "upstream", {
-        allowLossyInstructionRoleCollapse: true,
-      }),
-    ).toMatchObject({
-      system: [{ type: "text", text: "policy" }],
-      messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
-    });
-    expect(canonical).toEqual(before);
+    expect(renderAnthropicMessagesRequest(canonical, "upstream").system).toEqual([
+      { type: "text", text: "policy" },
+    ]);
+    expect(canonical.limitations).toEqual([]);
   });
 
   it("accepts only client-defined Responses function tools", () => {

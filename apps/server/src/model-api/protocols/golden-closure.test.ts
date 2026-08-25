@@ -94,6 +94,8 @@ describe("adapter golden behavior", () => {
     ) as {
       sourceInstructions: Array<{ role: "system" | "developer"; text: string }>;
       strictResult: string;
+      developerOnlyInstructions: Array<{ role: "developer"; text: string; sourceIndex: number }>;
+      developerOnlyAnthropicSystem: Array<{ type: "text"; text: string }>;
       lossyOptInAnthropicSystem: Array<{ type: "text"; text: string }>;
       limitation: string;
     };
@@ -117,5 +119,15 @@ describe("adapter golden behavior", () => {
       }).system,
     ).toEqual(golden.lossyOptInAnthropicSystem);
     expect(canonical.limitations).toContain(golden.limitation);
+    const developerOnly = parseOpenAiChatRequest({
+      model: "m",
+      messages: golden.developerOnlyInstructions.map((item) => ({
+        role: item.role,
+        content: item.text,
+      })),
+    });
+    expect(renderAnthropicMessagesRequest(developerOnly, "claude").system).toEqual(
+      golden.developerOnlyAnthropicSystem,
+    );
   });
 });

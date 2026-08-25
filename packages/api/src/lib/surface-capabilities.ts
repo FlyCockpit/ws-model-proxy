@@ -353,82 +353,101 @@ export function resolveExecutionPath({
     requirements: { ...request },
     retrySafety: retrySafetyFor(requestedSurface, request),
   });
-  const matrix = surfaceAvailabilityMatrix({ capabilities, adaptationEnabled });
-  let selected = matrix[requestedSurface];
-  // v4 can truthfully advertise a lifecycle operation without advertising
-  // create. Let the exact resolver evaluate that operation directly.
-  if (capabilities?.version === 4 && selected.mode === "unavailable") {
-    const exact = nativeFeatures(capabilities, requestedSurface);
-    if (exact?.operations?.includes(requestedOperation(requestedSurface, request)))
-      selected = {
-        mode: "native",
-        nativeSurface: requestedSurface,
-        streaming: exact.streaming === true,
-        limitations: [],
-      };
-  }
-  if (selected.mode === "unavailable" || !capabilities || !selected.nativeSurface)
-    return describe(selected);
-  if (
-    selected.mode === "adapted" &&
-    (requestedSurface === "OPENAI_COMPLETIONS" ||
-      (requestedSurface === "OPENAI_RESPONSES" && responsesOperationFor(request) !== "create"))
-  ) {
-    return describe({
-      mode: "unavailable",
-      streaming: false,
-      limitations: ["native_only_operation"],
-    });
-  }
-  const features = nativeFeatures(capabilities, selected.nativeSurface);
-  if (!features)
+  if (!capabilities)
     return describe({
       mode: "unavailable",
       streaming: false,
       limitations: ["surface_unavailable"],
     });
-  const lifecycleOperation =
-    requestedSurface === "OPENAI_RESPONSES" ? responsesOperationFor(request) : undefined;
-  const lifecycleUnsupported =
-    lifecycleOperation && lifecycleOperation !== "create"
-      ? features.responsesLifecycle?.[lifecycleOperation] !== true
-      : false;
-  const anthropicCountTokensUnsupported =
-    requestedSurface === "ANTHROPIC_MESSAGES" &&
-    request.countTokens === true &&
-    features.countTokens !== true;
-  const failures = [
-    ...incompatibilities(
-      features,
-      selected.mode === "adapted"
+
+  const nativeOnly =
+    requestedSurface === "OPENAI_COMPLETIONS" ||
+    (requestedSurface === "OPENAI_RESPONSES" && responsesOperationFor(request) !== "create") ||
+    (requestedSurface === "ANTHROPIC_MESSAGES" && request.countTokens === true);
+  const evaluate = (nativeSurface: ModelApiSurface, mode: "native" | "adapted") => {
+    const features = nativeFeatures(capabilities, nativeSurface);
+    if (!features) return undefined;
+    const operationName =
+      mode === "native" ? requestedOperation(requestedSurface, request) : "create";
+    const operationSupported =
+      capabilities.version === 4
+        ? features.operations?.includes(operationName) === true
+        : mode === "native" && requestedSurface === "OPENAI_RESPONSES" && operationName !== "create"
+          ? features.responsesLifecycle?.[
+              operationName as Exclude<ResponsesOperation, "create">
+            ] === true
+          : mode === "native" &&
+              requestedSurface === "ANTHROPIC_MESSAGES" &&
+              operationName === "countTokens"
+            ? features.countTokens === true
+            : features.supported === true;
+    if (!operationSupported) return undefined;
+    const normalizedRequest =
+      mode === "adapted"
         ? { ...request, protocolVersion: undefined, betaFeatures: undefined }
-        : request,
-    ),
-    ...(lifecycleUnsupported ? [`responses_${lifecycleOperation}_unavailable`] : []),
-    ...(anthropicCountTokensUnsupported ? ["countTokens_unavailable"] : []),
-    ...(capabilities.version === 4 &&
-    selected.mode === "native" &&
-    !features.operations?.includes(requestedOperation(requestedSurface, request))
-      ? ["operation_unavailable"]
-      : []),
-    ...(selected.mode === "adapted" ? adaptedSubsetFailures(request) : []),
-    ...(selected.mode === "adapted" &&
-    requestedSurface === "ANTHROPIC_MESSAGES" &&
-    request.stream === true &&
-    (selected.nativeSurface === "OPENAI_CHAT_COMPLETIONS" ||
-      selected.nativeSurface === "OPENAI_RESPONSES")
-      ? ["anthropic_initial_usage_unavailable"]
-      : []),
-  ];
-  const limitations = [...selected.limitations, ...failures];
-  return describe(
-    failures.length > 0
-      ? {
-          mode: "unavailable",
-          nativeSurface: selected.nativeSurface,
-          streaming: false,
-          limitations,
-        }
-      : { ...selected, limitations },
-  );
+        : request;
+    const failures = [
+      ...incompatibilities(features, normalizedRequest),
+      ...(mode === "adapted" ? adaptedSubsetFailures(request) : []),
+      ...(mode === "adapted" &&
+      requestedSurface === "ANTHROPIC_MESSAGES" &&
+      request.stream === true &&
+      (nativeSurface === "OPENAI_CHAT_COMPLETIONS" || nativeSurface === "OPENAI_RESPONSES")
+        ? ["anthropic_initial_usage_unavailable"]
+        : []),
+    ];
+    if (failures.length) return { failures, features };
+    return { failures: [], features };
+  };
+
+  // Exact requested protocol always wins when it satisfies the complete
+  // operation/stream/feature contract.
+  const exact = evaluate(requestedSurface, "native");
+  if (exact?.failures.length === 0)
+    return describe({
+      mode: "native",
+      nativeSurface: requestedSurface,
+      streaming: exact.features.streaming === true,
+      limitations: [],
+    });
+
+  if (nativeOnly) {
+    return describe({
+      mode: "unavailable",
+      streaming: false,
+      limitations: ["native_only_operation", ...(exact?.failures ?? [])],
+    });
+  }
+
+  if (adaptationEnabled) {
+    // Stable order is intentional and makes equal candidates deterministic.
+    let firstCandidateFailure: { nativeSurface: ModelApiSurface; failures: string[] } | undefined;
+    for (const source of modelApiSurfaces) {
+      if (source === requestedSurface || source === "OPENAI_COMPLETIONS") continue;
+      const candidate = evaluate(source, "adapted");
+      if (candidate && !firstCandidateFailure)
+        firstCandidateFailure = { nativeSurface: source, failures: candidate.failures };
+      if (candidate?.failures.length === 0)
+        return describe({
+          mode: "adapted",
+          nativeSurface: source,
+          streaming: candidate.features.streaming === true,
+          limitations: ["strict_common_subset", "native_extensions_unavailable"],
+        });
+    }
+    if (firstCandidateFailure)
+      return describe({
+        mode: "unavailable",
+        nativeSurface: firstCandidateFailure.nativeSurface,
+        streaming: false,
+        limitations: firstCandidateFailure.failures,
+      });
+  }
+
+  return describe({
+    mode: "unavailable",
+    nativeSurface: exact ? requestedSurface : undefined,
+    streaming: false,
+    limitations: exact?.failures ?? ["surface_unavailable"],
+  });
 }

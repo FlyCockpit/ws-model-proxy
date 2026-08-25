@@ -4694,6 +4694,24 @@ async function relayPool({
         .catch(metadataUpdateError);
       void finalize;
       let responseHeaders = new Headers(started.headers);
+      const adaptedRequestLimitations = operation.adaptation
+        ? (() => {
+            try {
+              return parseCanonicalRequest(
+                operation.adaptation.requestedSurface,
+                operation.adaptation.payload,
+              ).limitations;
+            } catch {
+              return [];
+            }
+          })()
+        : [];
+      const adapterLimitations = [
+        "strict_common_subset",
+        ...(operation.adaptation?.requestedSurface === "anthropic-messages"
+          ? adaptedRequestLimitations
+          : []),
+      ].join(",");
       let responseBody = primedAdaptedStream
         ? primedAdaptedStream
         : validatedAdaptedNonstream
@@ -4717,7 +4735,7 @@ async function relayPool({
           Boolean(adaptedSource && operation.adaptation),
         );
         if (adaptedSource && operation.adaptation)
-          responseHeaders.set("x-wsmp-adapter-limitations", "strict_common_subset");
+          responseHeaders.set("x-wsmp-adapter-limitations", adapterLimitations);
       } else if (adaptedSource && operation.adaptation) {
         const sourceHeaders = responseHeaders;
         const adaptedStreaming =
@@ -4740,7 +4758,7 @@ async function relayPool({
           adaptedStreaming ? "text/event-stream; charset=utf-8" : "application/json; charset=utf-8",
         );
         responseHeaders.set("x-wsmp-adapter-version", "1.0.0");
-        responseHeaders.set("x-wsmp-adapter-limitations", "strict_common_subset");
+        responseHeaders.set("x-wsmp-adapter-limitations", adapterLimitations);
         const retryAfter = safeProviderRetryAfter(sourceHeaders.get("retry-after"));
         if (retryAfter) responseHeaders.set("retry-after", retryAfter);
         const sourceRequestId = safeProviderRequestId(

@@ -175,6 +175,82 @@ describe("surface capability resolution", () => {
     }
   });
 
+  it("falls through an incompatible requested native surface to an exact adapted source", () => {
+    const multiSurface = parseOpenAiCompatibleCapabilities({
+      version: 4,
+      protocol: "openai-compatible",
+      surfaces: {
+        openaiChatCompletions: {
+          source: "provider",
+          confidence: "exact",
+          operations: ["create"],
+          streaming: false,
+          inputImages: false,
+        },
+        openaiResponses: {
+          source: "provider",
+          confidence: "exact",
+          operations: ["create"],
+          streaming: true,
+          inputImages: true,
+        },
+      },
+    });
+    expect(
+      resolveExecutionPath({
+        capabilities: multiSurface,
+        requestedSurface: "OPENAI_CHAT_COMPLETIONS",
+        request: { stream: true, inputImages: true },
+        adaptationEnabled: true,
+      }),
+    ).toMatchObject({
+      mode: "adapted",
+      nativeSurface: "OPENAI_RESPONSES",
+    });
+    expect(
+      resolveExecutionPath({
+        capabilities: multiSurface,
+        requestedSurface: "OPENAI_CHAT_COMPLETIONS",
+        request: { stream: false },
+        adaptationEnabled: true,
+      }),
+    ).toMatchObject({
+      mode: "native",
+      nativeSurface: "OPENAI_CHAT_COMPLETIONS",
+    });
+  });
+
+  it("chooses the first fully compatible adapted source in stable surface order", () => {
+    const multiSurface = parseOpenAiCompatibleCapabilities({
+      version: 4,
+      protocol: "openai-compatible",
+      surfaces: {
+        openaiChatCompletions: {
+          source: "provider",
+          confidence: "exact",
+          operations: ["create"],
+          streaming: true,
+          tools: true,
+        },
+        openaiResponses: {
+          source: "provider",
+          confidence: "exact",
+          operations: ["create"],
+          streaming: true,
+          tools: true,
+        },
+      },
+    });
+    expect(
+      resolveExecutionPath({
+        capabilities: multiSurface,
+        requestedSurface: "ANTHROPIC_MESSAGES",
+        request: { tools: true },
+        adaptationEnabled: true,
+      }).nativeSurface,
+    ).toBe("OPENAI_CHAT_COMPLETIONS");
+  });
+
   it("keeps stateful Responses and legacy Completions native-only", () => {
     expect(
       resolveExecutionPath({

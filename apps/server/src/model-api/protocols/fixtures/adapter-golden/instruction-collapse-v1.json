@@ -6,6 +6,10 @@
     { "role": "system", "text": "system two", "sourceIndex": 3 }
   ],
   "strictResult": "unsupported_feature",
+  "developerOnlyInstructions": [
+    { "role": "developer", "text": "developer only", "sourceIndex": 0 }
+  ],
+  "developerOnlyAnthropicSystem": [{ "type": "text", "text": "developer only" }],
   "lossyOptInAnthropicSystem": [
     { "type": "text", "text": "system one" },
     { "type": "text", "text": "developer one" },
