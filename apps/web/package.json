@@ -47,7 +47,7 @@
     "vite-plugin-pwa": "^1.3.0",
     "web-haptics": "^0.0.6",
     "zod": "catalog:",
-    "zustand": "^5.0.14"
+    "zustand": "^5.0.15"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",
