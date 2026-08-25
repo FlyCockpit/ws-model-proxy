@@ -969,6 +969,7 @@ function providerStreamHasTerminalEvent(
 ): boolean {
   const text = new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))));
   if (/(?:^|\n)event:\s*error\s*(?:\r?\n|$)/u.test(text)) return true;
+  if (surface === "openai-chat" && /(?:^|\n)data:\s*\{[^\n]*"error"\s*:/u.test(text)) return true;
   return providerStreamHasTerminalUsageEvent(chunks, surface);
 }
 
@@ -978,9 +979,11 @@ function providerStreamTerminalFailed(
 ): boolean {
   const text = new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))));
   if (/(?:^|\n)event:\s*error\s*(?:\r?\n|$)/u.test(text)) return true;
+  if (surface === "openai-chat" && /(?:^|\n)data:\s*\{[^\n]*"error"\s*:/u.test(text)) return true;
   return (
     surface === "openai-responses" &&
-    /"type"\s*:\s*"response\.(?:failed|cancelled|incomplete)"/u.test(text)
+    (/"type"\s*:\s*"response\.(?:failed|cancelled|incomplete)"/u.test(text) ||
+      /"status"\s*:\s*"(?:failed|cancelled|incomplete)"/u.test(text))
   );
 }
 
@@ -1749,10 +1752,12 @@ export async function dispatchPublicOverflow(
         reconciliation = (async () => {
           stopHeartbeat();
           const transportComplete = streamComplete && response.complete;
-          const streamFailed = request.stream
-            ? providerStreamTerminalFailed(usageChunks, nativeSurface ?? request.requestedSurface)
-            : false;
-          const ok = transportComplete && httpOk && !streamFailed && !clientCancelled;
+          const surface = nativeSurface ?? request.requestedSurface;
+          const streamTerminal =
+            !request.stream || providerStreamHasTerminalEvent(usageChunks, surface);
+          const providerFailed = providerStreamTerminalFailed(usageChunks, surface);
+          const ok =
+            transportComplete && httpOk && streamTerminal && !providerFailed && !clientCancelled;
           const healthOutcome = providerHealthOutcome(status);
           const attemptAborted =
             request.signal.aborted || attemptController.signal.aborted || clientCancelled;
@@ -1774,10 +1779,36 @@ export async function dispatchPublicOverflow(
               fencingToken,
             }).catch(() => false);
           }
-          const observedUsage = parseProviderUsage(
-            [...initialUsageChunks, ...usageChunks],
-            pricing,
-          );
+          const tailUsage = parseProviderUsage(usageChunks, pricing);
+          const initialUsage =
+            responseBytes > 1024 * 1024
+              ? parseProviderUsage(initialUsageChunks, pricing)
+              : undefined;
+          const combinedUsage =
+            initialUsage && tailUsage
+              ? ({
+                  ...initialUsage,
+                  ...Object.fromEntries(
+                    Object.entries(tailUsage).filter(([, value]) => value !== undefined),
+                  ),
+                  inputTokens: tailUsage.inputTokens ?? initialUsage.inputTokens,
+                  outputTokens: tailUsage.outputTokens ?? initialUsage.outputTokens,
+                  rawUsage: [initialUsage.rawUsage, tailUsage.rawUsage],
+                } as RawProviderUsage)
+              : (tailUsage ?? initialUsage);
+          const combinedCost =
+            combinedUsage && pricing ? calculatedCostForUsage(combinedUsage, pricing) : undefined;
+          const observedUsage: RawProviderUsage | undefined = combinedCost
+            ? ({
+                ...combinedUsage,
+                calculatedCost: combinedCost,
+                calculatedCostCurrency: pricing!.currency,
+                calculatedCostPricingVersion: pricing!.version,
+                calculatedCostSource: "wsmp-pricing",
+                calculatedCostConfidence:
+                  pricing!.confidence === "REPORTED" ? "CALCULATED" : pricing!.confidence,
+              } as RawProviderUsage)
+            : combinedUsage;
           const observationComplete =
             transportComplete &&
             (!request.stream ||
