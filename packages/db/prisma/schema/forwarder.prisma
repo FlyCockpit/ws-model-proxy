@@ -396,6 +396,7 @@ model ProviderAccount {
   CurrentCredential   ProviderCredential?      @relation("ProviderAccountCurrentCredential", fields: [currentCredentialId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   BudgetPolicies      ProviderBudgetPolicy[]
   UsageLedger         ProviderUsageLedger[]
+  Attempts            ProviderAttempt[]
   PricingVersions     ProviderPricingVersion[]
   AuditEvents         ProviderAuditEvent[]
 
@@ -430,6 +431,7 @@ model ProviderModel {
   ExecutionTarget    ExecutionTarget?
   BudgetPolicies     ProviderBudgetPolicy[]
   UsageLedger        ProviderUsageLedger[]
+  Attempts           ProviderAttempt[]
   PricingVersions    ProviderPricingVersion[]
 
   @@unique([providerAccountId, upstreamModelId])
@@ -466,6 +468,7 @@ model ProviderCredential {
   Replaces           ProviderCredential?         @relation("ProviderCredentialReplacement")
   BudgetReservations ProviderBudgetReservation[]
   UsageLedger        ProviderUsageLedger[]
+  Attempts           ProviderAttempt[]
 
   @@unique([id, userId])
   @@unique([replacedById, userId])
@@ -560,44 +563,80 @@ model ProviderBudgetReservation {
   @@map("provider_budget_reservation")
 }
 
-/// Append-only accounting row. Application APIs expose creation only; database
-/// hardening prevents UPDATE/DELETE outside the schema maintenance role.
-model ProviderUsageLedger {
-  id                String                     @id @default(cuid(2))
-  createdAt         DateTime                   @default(now())
+/// Durable identity and liability snapshot for every admitted provider attempt,
+/// including attempts for which every applicable rule is unlimited (or no
+/// policy is attached). This makes terminal and delayed reconciliation total.
+model ProviderAttempt {
+  id                String              @id @default(cuid(2))
+  createdAt         DateTime            @default(now())
   userId            String
   providerAccountId String
   providerModelId   String
   credentialId      String?
-  reservationId     String?
   poolId            String?
   requestId         String
   attemptId         String
   fencingToken      BigInt
-  inputTokens       BigInt?
-  outputTokens      BigInt?
-  cacheReadTokens   BigInt?
-  cacheWriteTokens  BigInt?
-  reasoningTokens   BigInt?
-  toolTokens        BigInt?
-  rawUsage          Json?
-  reportedCost      Decimal?                   @db.Decimal(30, 9)
-  calculatedCost    Decimal?                   @db.Decimal(30, 9)
-  settledCost       Decimal?                   @db.Decimal(30, 9)
-  currency          String?
+  expiresAt         DateTime
+  liabilityTokens   BigInt?
+  liabilitySpend    Decimal?            @db.Decimal(30, 9)
+  liabilityCurrency String?
   pricingVersion    String?
   accountingVersion String
-  usageKnown        Boolean
-  costKnown         Boolean
-  terminalReason    String
-  confidence        UsageCostConfidence
-  User              User                       @relation("ProviderUsageLedgerOwner", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  ProviderAccount   ProviderAccount            @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  ProviderModel     ProviderModel              @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  Credential        ProviderCredential?        @relation(fields: [credentialId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  Reservation       ProviderBudgetReservation? @relation(fields: [reservationId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  User              User                @relation("ProviderAttemptOwner", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  ProviderAccount   ProviderAccount     @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  ProviderModel     ProviderModel       @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  Credential        ProviderCredential? @relation(fields: [credentialId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
 
   @@unique([attemptId, fencingToken])
+  @@index([userId, expiresAt])
+  @@map("provider_attempt")
+}
+
+/// Append-only accounting row. Application APIs expose creation only; database
+/// hardening prevents UPDATE/DELETE outside the schema maintenance role.
+model ProviderUsageLedger {
+  id                          String                     @id @default(cuid(2))
+  createdAt                   DateTime                   @default(now())
+  userId                      String
+  providerAccountId           String
+  providerModelId             String
+  credentialId                String?
+  reservationId               String?
+  poolId                      String?
+  requestId                   String
+  attemptId                   String
+  fencingToken                BigInt
+  inputTokens                 BigInt?
+  outputTokens                BigInt?
+  cacheReadTokens             BigInt?
+  cacheWriteTokens            BigInt?
+  reasoningTokens             BigInt?
+  toolTokens                  BigInt?
+  additionalBillableTokens    BigInt?
+  authoritativeBillableTokens BigInt?
+  billableTotal               BigInt?
+  categoriesComplete          Boolean?
+  rawUsage                    Json?
+  reportedCost                Decimal?                   @db.Decimal(30, 9)
+  calculatedCost              Decimal?                   @db.Decimal(30, 9)
+  settledCost                 Decimal?                   @db.Decimal(30, 9)
+  currency                    String?
+  pricingVersion              String?
+  accountingVersion           String
+  sourceVersion               String                     @default("terminal-v1")
+  usageSource                 String                     @default("terminal")
+  usageKnown                  Boolean
+  costKnown                   Boolean
+  terminalReason              String
+  confidence                  UsageCostConfidence
+  User                        User                       @relation("ProviderUsageLedgerOwner", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  ProviderAccount             ProviderAccount            @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  ProviderModel               ProviderModel              @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  Credential                  ProviderCredential?        @relation(fields: [credentialId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  Reservation                 ProviderBudgetReservation? @relation(fields: [reservationId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([attemptId, fencingToken, sourceVersion])
   @@index([userId, createdAt])
   @@index([providerAccountId, createdAt])
   @@map("provider_usage_ledger")
@@ -632,13 +671,14 @@ model ProviderBudgetSettlement {
   reservationId String
   attemptId     String
   fencingToken  BigInt
+  sourceVersion String                    @default("terminal-v1")
   settledValue  Decimal                   @db.Decimal(30, 9)
   currency      String?
   confidence    UsageCostConfidence
   reason        String
   Reservation   ProviderBudgetReservation @relation(fields: [reservationId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
 
-  @@unique([reservationId, attemptId, fencingToken])
+  @@unique([reservationId, attemptId, fencingToken, sourceVersion])
   @@index([userId, createdAt])
   @@map("provider_budget_settlement")
 }

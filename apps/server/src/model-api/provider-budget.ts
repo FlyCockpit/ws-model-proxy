@@ -78,6 +78,9 @@ export interface ProviderBudgetTerminal {
   attemptId: string;
   fencingToken: bigint;
   reason: "COMPLETED" | "FAILED" | "CANCELLED" | "TIMEOUT" | "CRASH_RECOVERY";
+  /** Stable upstream usage revision identity. Duplicate delivery is idempotent. */
+  sourceVersion?: string;
+  usageSource?: string;
   usage?: RawProviderUsage;
 }
 
@@ -219,10 +222,66 @@ export async function admitProviderBudget(
     const nowRows = await tx.$queryRaw<Array<{ now: Date }>>`SELECT transaction_timestamp() AS now`;
     const now = nowRows[0]?.now;
     if (!now) throw new ProviderBudgetConfigurationError("Database clock unavailable");
+    const hasCostIdentity =
+      liabilitySpend !== undefined || currency !== undefined || pricingVersion !== undefined;
+    if (
+      hasCostIdentity &&
+      (liabilitySpend === undefined || currency === undefined || pricingVersion === undefined)
+    )
+      throw new ProviderBudgetConfigurationError(
+        "Spend liability, currency, and pricingVersion must be supplied together",
+      );
+    const attemptAnchor = await tx.providerAttempt.findUnique({
+      where: {
+        attemptId_fencingToken: {
+          attemptId: attempt.attemptId,
+          fencingToken: attempt.fencingToken,
+        },
+      },
+    });
+    if (attemptAnchor) {
+      const exact =
+        attemptAnchor.userId === attempt.userId &&
+        attemptAnchor.providerAccountId === attempt.providerAccountId &&
+        attemptAnchor.providerModelId === attempt.providerModelId &&
+        attemptAnchor.credentialId === (attempt.credentialId ?? null) &&
+        attemptAnchor.poolId === (attempt.poolId ?? null) &&
+        attemptAnchor.requestId === attempt.requestId &&
+        attemptAnchor.expiresAt.getTime() === attempt.expiresAt.getTime() &&
+        attemptAnchor.liabilityTokens === (attempt.liability.tokens ?? null) &&
+        (attemptAnchor.liabilitySpend?.equals(liabilitySpend ?? 0) ??
+          liabilitySpend === undefined) &&
+        attemptAnchor.liabilityCurrency === (currency ?? null) &&
+        attemptAnchor.pricingVersion === (pricingVersion ?? null) &&
+        attemptAnchor.accountingVersion === accountingVersion;
+      if (!exact)
+        throw new ProviderBudgetConfigurationError("Attempt identity or liability conflict");
+      const replay = await tx.providerBudgetReservation.findMany({
+        where: { attemptId: attempt.attemptId, fencingToken: attempt.fencingToken },
+        orderBy: { id: "asc" },
+        select: { id: true },
+      });
+      return { admitted: true, reservationIds: replay.map(({ id }) => id) };
+    }
     if (attempt.expiresAt.getTime() <= now.getTime())
       throw new ProviderBudgetConfigurationError(
         "Provider reservation expiry is not in the future",
       );
+    if (hasCostIdentity) {
+      const pricing = await tx.providerPricingVersion.findFirst({
+        where: {
+          userId: attempt.userId,
+          providerAccountId: attempt.providerAccountId,
+          providerModelId: attempt.providerModelId,
+          version: pricingVersion,
+          currency,
+          effectiveAt: { lte: now },
+          OR: [{ retiredAt: null }, { retiredAt: { gt: now } }],
+        },
+        select: { id: true },
+      });
+      if (!pricing) throw new ProviderBudgetConfigurationError("Pricing identity is unavailable");
+    }
     const existing = await tx.providerBudgetReservation.findMany({
       where: { attemptId: attempt.attemptId },
       orderBy: { id: "asc" },
@@ -305,15 +364,9 @@ export async function admitProviderBudget(
                   ? { windowStart: window.windowStart, windowEnd: null }
                   : { windowStart: window.windowStart, windowEnd: window.windowEnd }),
           },
-          _sum: { reservedValue: true, settledValue: true },
+          _sum: { reservedValue: true },
         });
-        // Settled rows contribute actual value, live rows contribute reserved value.
-        const settled =
-          rule.metric === "CONCURRENCY"
-            ? new Prisma.Decimal(0)
-            : (aggregate._sum.settledValue ?? new Prisma.Decimal(0));
         const reserved = aggregate._sum.reservedValue ?? new Prisma.Decimal(0);
-        // reservedValue includes settled rows, so subtract their reservation before adding actual.
         const settledReserved =
           rule.metric === "CONCURRENCY"
             ? null
@@ -330,7 +383,26 @@ export async function admitProviderBudget(
                 },
                 _sum: { reservedValue: true },
               });
-        const consumed = reserved.minus(settledReserved?._sum.reservedValue ?? 0).plus(settled);
+        const settlementAggregate =
+          rule.metric === "CONCURRENCY"
+            ? null
+            : await tx.providerBudgetSettlement.aggregate({
+                where: {
+                  Reservation: {
+                    policyId: policy.id,
+                    ruleId: rule.id,
+                    ...(rule.period === "PER_ATTEMPT"
+                      ? { attemptId: attempt.attemptId }
+                      : rule.period === "LIFETIME"
+                        ? { windowStart: window.windowStart, windowEnd: null }
+                        : { windowStart: window.windowStart, windowEnd: window.windowEnd }),
+                  },
+                },
+                _sum: { settledValue: true },
+              });
+        const consumed = reserved
+          .minus(settledReserved?._sum.reservedValue ?? 0)
+          .plus(settlementAggregate?._sum.settledValue ?? 0);
         if (
           existing.length === 0 &&
           (!rule.limitValue || consumed.plus(value).greaterThan(rule.limitValue))
@@ -354,7 +426,6 @@ export async function admitProviderBudget(
           const item = expected.get(`${row.policyId}:${row.ruleId}`);
           return Boolean(
             item &&
-              row.state === "RESERVED" &&
               row.userId === attempt.userId &&
               row.providerAccountId === attempt.providerAccountId &&
               row.providerModelId === attempt.providerModelId &&
@@ -380,6 +451,24 @@ export async function admitProviderBudget(
       return { admitted: true, reservationIds: existing.map(({ id }) => id) };
     }
 
+    await tx.providerAttempt.create({
+      data: {
+        userId: attempt.userId,
+        providerAccountId: attempt.providerAccountId,
+        providerModelId: attempt.providerModelId,
+        credentialId: attempt.credentialId,
+        poolId: attempt.poolId,
+        requestId: attempt.requestId,
+        attemptId: attempt.attemptId,
+        fencingToken: attempt.fencingToken,
+        expiresAt: attempt.expiresAt,
+        liabilityTokens: attempt.liability.tokens,
+        liabilitySpend,
+        liabilityCurrency: currency,
+        pricingVersion,
+        accountingVersion,
+      },
+    });
     const ids: string[] = [];
     for (const item of pending) {
       const row = await tx.providerBudgetReservation.create({
@@ -427,22 +516,61 @@ function terminalValue(metric: BudgetMetric, usage: RawProviderUsage | undefined
   return value === undefined ? new Prisma.Decimal(0) : decimal(value);
 }
 
-function hasTrustworthyTerminalValue(
-  metric: BudgetMetric,
-  usage: RawProviderUsage | undefined,
-): boolean {
-  if (metric === "CONCURRENCY") return true;
-  if (!usage) return false;
-  if (metric === "TOKENS") return providerBillableTokens(usage) !== undefined;
-  return usage.reportedCost !== undefined || usage.calculatedCost !== undefined;
-}
-
-/** Reconcile/release every applicable scope once. Duplicate terminal calls are safe. */
+/** Append one immutable accounting revision. Duplicate source revisions are safe. */
 export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal): Promise<void> {
   if (terminal.fencingToken <= 0n || terminal.fencingToken > MAX_SIGNED_BIGINT)
     throw new ProviderBudgetConfigurationError("Invalid fencing token");
   assertUsage(terminal.usage);
+  const sourceVersion = normalizedVersion(
+    terminal.sourceVersion ??
+      (terminal.reason === "CRASH_RECOVERY" ? "crash-recovery-v1" : "terminal-v1"),
+    "sourceVersion",
+  );
+  const usageSource = normalizedVersion(
+    terminal.usageSource ?? (terminal.reason === "CRASH_RECOVERY" ? "crash-repair" : "terminal"),
+    "usageSource",
+  );
   await serializable(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-attempt:${terminal.attemptId}`}, 0))`;
+    const anchor = await tx.providerAttempt.findUnique({
+      where: {
+        attemptId_fencingToken: {
+          attemptId: terminal.attemptId,
+          fencingToken: terminal.fencingToken,
+        },
+      },
+    });
+    if (!anchor) throw new ProviderBudgetConfigurationError("No admitted provider attempt exists");
+    if (
+      anchor.userId !== terminal.userId ||
+      anchor.providerAccountId !== terminal.providerAccountId ||
+      anchor.providerModelId !== terminal.providerModelId ||
+      anchor.poolId !== (terminal.poolId ?? null) ||
+      anchor.credentialId !== (terminal.credentialId ?? null) ||
+      anchor.requestId !== terminal.requestId
+    )
+      throw new ProviderBudgetConfigurationError("Terminal attempt identity conflict");
+
+    const priorRevision = await tx.providerUsageLedger.findUnique({
+      where: {
+        attemptId_fencingToken_sourceVersion: {
+          attemptId: terminal.attemptId,
+          fencingToken: terminal.fencingToken,
+          sourceVersion,
+        },
+      },
+      select: { id: true },
+    });
+    if (priorRevision) return;
+    const previousLedgers = await tx.providerUsageLedger.findMany({
+      where: { attemptId: terminal.attemptId, fencingToken: terminal.fencingToken },
+      orderBy: { createdAt: "desc" },
+      select: { id: true },
+    });
+    // A completed terminal observation always wins a crash sweep that selected
+    // the row just before the terminal transaction committed.
+    if (terminal.reason === "CRASH_RECOVERY" && previousLedgers.length > 0) return;
+
     const reservations = await tx.providerBudgetReservation.findMany({
       where: {
         userId: terminal.userId,
@@ -451,115 +579,94 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
       },
       orderBy: { id: "asc" },
     });
-    if (reservations.length === 0)
-      throw new ProviderBudgetConfigurationError("No reservation exists for terminal attempt");
-    const identityMatches = reservations.every(
-      (row) =>
-        row.providerAccountId === terminal.providerAccountId &&
-        row.providerModelId === terminal.providerModelId &&
-        row.poolId === (terminal.poolId ?? null) &&
-        row.credentialId === (terminal.credentialId ?? null) &&
-        row.requestId === terminal.requestId,
-    );
-    if (!identityMatches)
-      throw new ProviderBudgetConfigurationError("Terminal attempt identity conflict");
-    for (const reservation of reservations) {
+    for (const reservation of reservations)
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget:${reservation.policyId}`}, 0))`;
-    }
+
+    const usage = terminal.usage;
+    const billableTotal = usage && providerBillableTokens(usage);
+    const accountingMatches = usage?.accountingVersion.trim() === anchor.accountingVersion;
+    const pricingMatches = Boolean(
+      anchor.pricingVersion &&
+        anchor.liabilityCurrency &&
+        usage?.pricingVersion?.trim() === anchor.pricingVersion &&
+        normalizedCurrency(usage?.currency) === anchor.liabilityCurrency,
+    );
+    const suppliedCost = usage?.reportedCost ?? usage?.calculatedCost;
+    const costKnown = suppliedCost !== undefined && pricingMatches;
+    const settledCost = costKnown ? decimal(suppliedCost) : null;
+
     for (const reservation of reservations) {
-      if (reservation.state !== "RESERVED") continue;
-      const accountingMatches =
-        terminal.usage?.accountingVersion.trim() === reservation.accountingVersion;
-      const pricingMatches =
-        reservation.metric !== "SPEND" ||
-        (terminal.usage?.pricingVersion?.trim() === reservation.pricingVersion &&
-          normalizedCurrency(terminal.usage?.currency) === reservation.currency);
-      let settled = terminalValue(reservation.metric, terminal.usage);
-      // Missing/untrusted usage and possibly billable failures retain the reserved
-      // liability. A later repair can settle it when trustworthy usage arrives.
-      if (
-        !hasTrustworthyTerminalValue(reservation.metric, terminal.usage) ||
-        (reservation.metric === "TOKENS" && !accountingMatches) ||
-        !pricingMatches
-      ) {
-        settled = reservation.reservedValue;
-      }
-      const currency = reservation.metric === "SPEND" ? reservation.currency : null;
+      const trustworthy =
+        reservation.metric === "CONCURRENCY" ||
+        (reservation.metric === "TOKENS" && accountingMatches && billableTotal !== undefined) ||
+        (reservation.metric === "SPEND" && costKnown);
+      const desiredTotal = trustworthy
+        ? terminalValue(reservation.metric, usage)
+        : reservation.reservedValue;
+      const prior = await tx.providerBudgetSettlement.aggregate({
+        where: { reservationId: reservation.id },
+        _sum: { settledValue: true },
+      });
+      const delta = desiredTotal.minus(prior._sum.settledValue ?? 0);
       await tx.providerBudgetSettlement.create({
         data: {
           userId: terminal.userId,
           reservationId: reservation.id,
           attemptId: terminal.attemptId,
           fencingToken: terminal.fencingToken,
-          settledValue: settled,
-          currency,
-          confidence:
-            accountingMatches && pricingMatches
-              ? (terminal.usage?.confidence ?? "ESTIMATED")
-              : "ESTIMATED",
+          sourceVersion,
+          settledValue: delta,
+          currency: reservation.metric === "SPEND" ? reservation.currency : null,
+          confidence: trustworthy ? (usage?.confidence ?? "ESTIMATED") : "ESTIMATED",
           reason: terminal.reason,
         },
       });
-      await tx.providerBudgetReservation.update({
-        where: { id: reservation.id },
-        data: { state: "SETTLED", settledValue: settled, settledAt: new Date() },
-      });
+      if (reservation.state === "RESERVED")
+        await tx.providerBudgetReservation.update({
+          where: { id: reservation.id },
+          data: { state: "SETTLED", settledValue: desiredTotal, settledAt: new Date() },
+        });
     }
 
-    const anchor = reservations.find((row) => row.metric === "SPEND") ?? reservations[0];
-    if (!anchor) throw new ProviderBudgetConfigurationError("Reservation identity unavailable");
-    const usage = terminal.usage;
-    const accountingMatches = usage?.accountingVersion.trim() === anchor.accountingVersion;
-    const pricingMatches =
-      usage?.pricingVersion?.trim() === anchor.pricingVersion &&
-      normalizedCurrency(usage?.currency) === anchor.currency;
-    const suppliedCost = usage?.reportedCost ?? usage?.calculatedCost;
-    const costKnown = Boolean(suppliedCost !== undefined && pricingMatches);
-    const settledCost = costKnown ? decimal(suppliedCost!) : null;
-    const ledgerExists = await tx.providerUsageLedger.findUnique({
-      where: {
-        attemptId_fencingToken: {
-          attemptId: terminal.attemptId,
-          fencingToken: terminal.fencingToken,
-        },
+    await tx.providerUsageLedger.create({
+      data: {
+        userId: terminal.userId,
+        providerAccountId: anchor.providerAccountId,
+        providerModelId: anchor.providerModelId,
+        credentialId: anchor.credentialId,
+        reservationId: reservations[0]?.id,
+        poolId: anchor.poolId,
+        requestId: anchor.requestId,
+        attemptId: terminal.attemptId,
+        fencingToken: terminal.fencingToken,
+        inputTokens: usage?.inputTokens,
+        outputTokens: usage?.outputTokens,
+        cacheReadTokens: usage?.cacheReadTokens,
+        cacheWriteTokens: usage?.cacheWriteTokens,
+        reasoningTokens: usage?.reasoningTokens,
+        toolTokens: usage?.toolTokens,
+        additionalBillableTokens: usage?.additionalBillableTokens,
+        authoritativeBillableTokens: usage?.authoritativeBillableTokens,
+        billableTotal: accountingMatches ? billableTotal : undefined,
+        categoriesComplete: usage?.categoriesComplete,
+        rawUsage: usage?.rawUsage,
+        reportedCost: pricingMatches ? usage?.reportedCost : undefined,
+        calculatedCost: pricingMatches ? usage?.calculatedCost : undefined,
+        settledCost,
+        currency: anchor.liabilityCurrency,
+        pricingVersion: anchor.pricingVersion,
+        accountingVersion: anchor.accountingVersion,
+        sourceVersion,
+        usageSource,
+        usageKnown: Boolean(accountingMatches && billableTotal !== undefined),
+        costKnown,
+        terminalReason: terminal.reason,
+        confidence:
+          accountingMatches && (suppliedCost === undefined || pricingMatches)
+            ? (usage?.confidence ?? "ESTIMATED")
+            : "ESTIMATED",
       },
-      select: { id: true },
     });
-    if (!ledgerExists) {
-      await tx.providerUsageLedger.create({
-        data: {
-          userId: terminal.userId,
-          providerAccountId: anchor.providerAccountId,
-          providerModelId: anchor.providerModelId,
-          credentialId: anchor.credentialId,
-          reservationId: anchor.id,
-          poolId: anchor.poolId,
-          requestId: anchor.requestId,
-          attemptId: terminal.attemptId,
-          fencingToken: terminal.fencingToken,
-          inputTokens: usage?.inputTokens,
-          outputTokens: usage?.outputTokens,
-          cacheReadTokens: usage?.cacheReadTokens,
-          cacheWriteTokens: usage?.cacheWriteTokens,
-          reasoningTokens: usage?.reasoningTokens,
-          toolTokens: usage?.toolTokens,
-          rawUsage: usage?.rawUsage,
-          reportedCost: pricingMatches ? usage?.reportedCost : undefined,
-          calculatedCost: pricingMatches ? usage?.calculatedCost : undefined,
-          settledCost,
-          currency: anchor.currency,
-          pricingVersion: anchor.pricingVersion,
-          accountingVersion: anchor.accountingVersion,
-          usageKnown: Boolean(
-            usage && accountingMatches && providerBillableTokens(usage) !== undefined,
-          ),
-          costKnown,
-          terminalReason: terminal.reason,
-          confidence:
-            accountingMatches && pricingMatches ? (usage?.confidence ?? "ESTIMATED") : "ESTIMATED",
-        },
-      });
-    }
   });
 }
 

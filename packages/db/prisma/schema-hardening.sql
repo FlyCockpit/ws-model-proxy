@@ -15,7 +15,7 @@ LOCK TABLE discovered_model, execution_target, model_pool, model_api_token,
   pool_member, model_api_token_allowlist_entry, response_stickiness_record,
   relay_request, inference_capacity, admission_request, capacity_waiter,
   capacity_lease, provider_account, provider_model, provider_credential,
-  provider_budget_policy, provider_budget_rule, provider_budget_reservation,
+  provider_budget_policy, provider_budget_rule, provider_attempt, provider_budget_reservation,
   provider_usage_ledger, provider_pricing_version, provider_budget_settlement,
   provider_audit_event IN SHARE ROW EXCLUSIVE MODE;
 
@@ -1074,6 +1074,45 @@ ALTER TABLE provider_budget_reservation ADD CONSTRAINT provider_budget_reservati
   AND ("settledValue" IS NULL OR "settledValue" >= 0)
 );
 
+-- Prisma creates provider_attempt before this script runs. Populate anchors for
+-- reservations written by the previous release before enforcing the new graph.
+-- Cost identity is retained only when the complete pricing triple existed;
+-- partial legacy metadata remains intact on the reservation itself.
+INSERT INTO provider_attempt (
+  id, "createdAt", "userId", "providerAccountId", "providerModelId", "credentialId",
+  "poolId", "requestId", "attemptId", "fencingToken", "expiresAt", "liabilityTokens",
+  "liabilitySpend", "liabilityCurrency", "pricingVersion", "accountingVersion"
+)
+SELECT DISTINCT ON (r."attemptId", r."fencingToken")
+  'legacy-' || md5(r."attemptId" || ':' || r."fencingToken"::text), r."createdAt", r."userId",
+  r."providerAccountId", r."providerModelId", r."credentialId", r."poolId", r."requestId",
+  r."attemptId", r."fencingToken",
+  GREATEST(COALESCE(r."expiresAt", r."createdAt" + interval '24 hours'),
+           r."createdAt" + interval '1 millisecond'),
+  r."liabilityTokens",
+  CASE WHEN r."liabilitySpend" IS NOT NULL AND r."liabilityCurrency" IS NOT NULL
+         AND r."pricingVersion" IS NOT NULL THEN r."liabilitySpend" END,
+  CASE WHEN r."liabilitySpend" IS NOT NULL AND r."liabilityCurrency" IS NOT NULL
+         AND r."pricingVersion" IS NOT NULL THEN r."liabilityCurrency" END,
+  CASE WHEN r."liabilitySpend" IS NOT NULL AND r."liabilityCurrency" IS NOT NULL
+         AND r."pricingVersion" IS NOT NULL THEN r."pricingVersion" END,
+  r."accountingVersion"
+FROM provider_budget_reservation r
+ON CONFLICT ("attemptId", "fencingToken") DO NOTHING;
+
+ALTER TABLE provider_attempt DROP CONSTRAINT IF EXISTS provider_attempt_shape_check;
+ALTER TABLE provider_attempt ADD CONSTRAINT provider_attempt_shape_check CHECK (
+  "fencingToken" > 0 AND "expiresAt" > "createdAt"
+  AND btrim("requestId") <> '' AND btrim("attemptId") <> ''
+  AND btrim("accountingVersion") <> ''
+  AND ("liabilityTokens" IS NULL OR "liabilityTokens" >= 0)
+  AND ("liabilitySpend" IS NULL OR "liabilitySpend" >= 0)
+  AND ("liabilityCurrency" IS NULL OR "liabilityCurrency" ~ '^[A-Z]{3}$')
+  AND ("pricingVersion" IS NULL OR btrim("pricingVersion") <> '')
+  AND (("liabilitySpend" IS NULL AND "liabilityCurrency" IS NULL AND "pricingVersion" IS NULL)
+    OR ("liabilitySpend" IS NOT NULL AND "liabilityCurrency" IS NOT NULL AND "pricingVersion" IS NOT NULL))
+);
+
 ALTER TABLE provider_usage_ledger DROP CONSTRAINT IF EXISTS provider_usage_ledger_shape_check;
 ALTER TABLE provider_usage_ledger ADD CONSTRAINT provider_usage_ledger_shape_check CHECK (
   "fencingToken" > 0 AND ("settledCost" IS NULL OR "settledCost" >= 0)
@@ -1089,6 +1128,10 @@ ALTER TABLE provider_usage_ledger ADD CONSTRAINT provider_usage_ledger_shape_che
   AND ("cacheWriteTokens" IS NULL OR "cacheWriteTokens" >= 0)
   AND ("reasoningTokens" IS NULL OR "reasoningTokens" >= 0)
   AND ("toolTokens" IS NULL OR "toolTokens" >= 0)
+  AND ("additionalBillableTokens" IS NULL OR "additionalBillableTokens" >= 0)
+  AND ("authoritativeBillableTokens" IS NULL OR "authoritativeBillableTokens" >= 0)
+  AND ("billableTotal" IS NULL OR "billableTotal" >= 0)
+  AND btrim("sourceVersion") <> '' AND btrim("usageSource") <> ''
 );
 
 ALTER TABLE provider_pricing_version DROP CONSTRAINT IF EXISTS provider_pricing_version_shape_check;
@@ -1099,7 +1142,7 @@ ALTER TABLE provider_pricing_version ADD CONSTRAINT provider_pricing_version_sha
 
 ALTER TABLE provider_budget_settlement DROP CONSTRAINT IF EXISTS provider_budget_settlement_shape_check;
 ALTER TABLE provider_budget_settlement ADD CONSTRAINT provider_budget_settlement_shape_check CHECK (
-  "fencingToken" > 0 AND "settledValue" >= 0 AND btrim(reason) <> ''
+  "fencingToken" > 0 AND btrim(reason) <> '' AND btrim("sourceVersion") <> ''
   AND (currency IS NULL OR currency ~ '^[A-Z]{3}$')
 );
 
@@ -1118,6 +1161,9 @@ CREATE TRIGGER provider_pricing_version_immutable BEFORE UPDATE OR DELETE ON pro
 FOR EACH ROW EXECUTE FUNCTION reject_immutable_provider_history_mutation();
 DROP TRIGGER IF EXISTS provider_budget_settlement_immutable ON provider_budget_settlement;
 CREATE TRIGGER provider_budget_settlement_immutable BEFORE UPDATE OR DELETE ON provider_budget_settlement
+FOR EACH ROW EXECUTE FUNCTION reject_immutable_provider_history_mutation();
+DROP TRIGGER IF EXISTS provider_attempt_immutable ON provider_attempt;
+CREATE TRIGGER provider_attempt_immutable BEFORE UPDATE OR DELETE ON provider_attempt
 FOR EACH ROW EXECUTE FUNCTION reject_immutable_provider_history_mutation();
 CREATE OR REPLACE FUNCTION enforce_provider_budget_reservation_transition()
 RETURNS trigger LANGUAGE plpgsql AS $provider_budget_reservation_transition$
@@ -1280,6 +1326,22 @@ BEGIN
         AND m."userId" = NEW."userId" AND m."providerAccountId" = NEW."providerAccountId") THEN
       RAISE EXCEPTION 'budget policy model must belong to its provider account' USING ERRCODE = '23514';
     END IF;
+  ELSIF TG_TABLE_NAME = 'provider_attempt' THEN
+    IF NOT EXISTS (SELECT 1 FROM provider_model m WHERE m.id = NEW."providerModelId"
+      AND m."userId" = NEW."userId" AND m."providerAccountId" = NEW."providerAccountId") THEN
+      RAISE EXCEPTION 'provider attempt model must match provider account' USING ERRCODE = '23514';
+    END IF;
+    IF NEW."credentialId" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM provider_credential c
+      WHERE c.id = NEW."credentialId" AND c."userId" = NEW."userId"
+        AND c."providerAccountId" = NEW."providerAccountId") THEN
+      RAISE EXCEPTION 'provider attempt credential is inconsistent' USING ERRCODE = '23514';
+    END IF;
+    IF NEW."pricingVersion" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM provider_pricing_version pv
+      WHERE pv."providerModelId" = NEW."providerModelId" AND pv.version = NEW."pricingVersion"
+        AND pv.currency = NEW."liabilityCurrency" AND pv."providerAccountId" = NEW."providerAccountId"
+        AND pv."userId" = NEW."userId") THEN
+      RAISE EXCEPTION 'provider attempt pricing identity is inconsistent' USING ERRCODE = '23514';
+    END IF;
   ELSIF TG_TABLE_NAME = 'provider_budget_reservation' THEN
     SELECT * INTO p FROM provider_budget_policy WHERE id = NEW."policyId";
     SELECT * INTO r FROM provider_budget_rule WHERE id = NEW."ruleId";
@@ -1367,6 +1429,9 @@ CREATE TRIGGER provider_budget_policy_graph_consistency BEFORE INSERT OR UPDATE 
 FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_graph_consistency();
 DROP TRIGGER IF EXISTS provider_budget_reservation_graph_consistency ON provider_budget_reservation;
 CREATE TRIGGER provider_budget_reservation_graph_consistency BEFORE INSERT OR UPDATE ON provider_budget_reservation
+FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_graph_consistency();
+DROP TRIGGER IF EXISTS provider_attempt_graph_consistency ON provider_attempt;
+CREATE TRIGGER provider_attempt_graph_consistency BEFORE INSERT OR UPDATE ON provider_attempt
 FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_graph_consistency();
 DROP TRIGGER IF EXISTS provider_pricing_version_graph_consistency ON provider_pricing_version;
 CREATE TRIGGER provider_pricing_version_graph_consistency BEFORE INSERT OR UPDATE ON provider_pricing_version

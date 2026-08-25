@@ -732,6 +732,19 @@ try {
       'budget-policy-a', 'token-rule', 'r', 'a', 1, 'SPEND', 'UTC_DAY', 1,
       date_trunc('day', NOW()), date_trunc('day', NOW()) + interval '1 day', 1, 'usage-v1')
   `);
+  // Simulate a reservation written by the immediately previous application
+  // version before provider_attempt anchors existed. The next idempotent
+  // hardening pass must preserve it and synthesize its durable attempt anchor.
+  await client.query(`
+    INSERT INTO provider_budget_reservation
+      (id, "createdAt", "userId", "providerAccountId", "providerModelId", "policyId", "ruleId",
+       "requestId", "attemptId", "fencingToken", metric, period, "policyVersion", "windowStart",
+       "windowEnd", "reservedValue", "liabilityTokens", "accountingVersion", "expiresAt")
+    VALUES ('legacy-reservation', NOW(), 'owner-a', 'provider-account-a', 'provider-model-a',
+      'budget-policy-a', 'token-rule', 'legacy-request', 'legacy-attempt', 7, 'TOKENS', 'UTC_DAY', 1,
+      date_trunc('day', NOW()), date_trunc('day', NOW()) + interval '1 day', 4, 4, 'usage-v1',
+      NOW() + interval '1 hour')
+  `);
 
   // Recreate the deployment boundary and prove a transaction from an old
   // instance cannot slip a discovered model between trigger install/backfill.
@@ -764,6 +777,13 @@ try {
   if (!observedLockWait) throw new Error("Hardening did not lock out the concurrent old writer");
   await oldWriter.query("COMMIT");
   await concurrentHardening;
+  const legacyAttempt = await client.query(`
+    SELECT "requestId", "liabilityTokens", "accountingVersion"
+      FROM provider_attempt WHERE "attemptId" = 'legacy-attempt' AND "fencingToken" = 7
+  `);
+  if (legacyAttempt.rowCount !== 1 || legacyAttempt.rows[0].requestId !== "legacy-request") {
+    throw new Error("Provider attempt compatibility backfill did not preserve the legacy row");
+  }
   const racedTarget = await client.query(`
     SELECT id FROM execution_target WHERE "discoveredModelId" = 'model-during-rollout'
   `);

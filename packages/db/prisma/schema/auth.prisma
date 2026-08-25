@@ -43,6 +43,7 @@ model User {
   providerCredentials       ProviderCredential[]       @relation("ProviderCredentialOwner")
   providerBudgetPolicies    ProviderBudgetPolicy[]     @relation("ProviderBudgetPolicyOwner")
   providerUsageLedger       ProviderUsageLedger[]      @relation("ProviderUsageLedgerOwner")
+  providerAttempts          ProviderAttempt[]          @relation("ProviderAttemptOwner")
   providerAuditEvents       ProviderAuditEvent[]       @relation("ProviderAuditEventOwner")
   executionTargets          ExecutionTarget[]          @relation("ExecutionTargetOwner")
   inferenceCapacities       InferenceCapacity[]        @relation("InferenceCapacityOwner")

@@ -21,7 +21,11 @@ integration("provider budget admission and reconciliation", () => {
     await db?.$disconnect();
   });
 
-  async function fixture(options?: { attachment?: boolean; metric?: "CONCURRENCY" | "TOKENS" }) {
+  async function fixture(options?: {
+    attachment?: boolean;
+    metric?: "CONCURRENCY" | "TOKENS";
+    noPolicy?: boolean;
+  }) {
     if (!db) throw new Error("database unavailable");
     const suffix = crypto.randomUUID();
     const user = await db.user.create({
@@ -46,48 +50,50 @@ integration("provider budget admission and reconciliation", () => {
       });
       poolId = pool.id;
     }
-    const policies = await Promise.all([
-      db.providerBudgetPolicy.create({
-        data: {
-          userId: user.id,
-          providerAccountId: account.id,
-          scopeType: "PROVIDER_ACCOUNT",
-          active: true,
-          activatedAt: new Date(),
-          Rules: {
-            create: {
-              metric: options?.metric ?? "CONCURRENCY",
-              period: options?.metric === "TOKENS" ? "UTC_DAY" : "PER_ATTEMPT",
-              mode: "LIMITED",
-              limitValue: options?.metric === "TOKENS" ? 10 : 1,
-            },
-          },
-        },
-      }),
-      ...(poolId
-        ? [
-            db.providerBudgetPolicy.create({
-              data: {
-                userId: user.id,
-                providerAccountId: account.id,
-                providerModelId: model.id,
-                poolId,
-                scopeType: "POOL_PROVIDER_MODEL",
-                active: true,
-                activatedAt: new Date(),
-                Rules: {
-                  create: {
-                    metric: options?.metric ?? "CONCURRENCY",
-                    period: options?.metric === "TOKENS" ? "UTC_DAY" : "PER_ATTEMPT",
-                    mode: "LIMITED",
-                    limitValue: options?.metric === "TOKENS" ? 10 : 1,
-                  },
+    const policies = options?.noPolicy
+      ? []
+      : await Promise.all([
+          db.providerBudgetPolicy.create({
+            data: {
+              userId: user.id,
+              providerAccountId: account.id,
+              scopeType: "PROVIDER_ACCOUNT",
+              active: true,
+              activatedAt: new Date(),
+              Rules: {
+                create: {
+                  metric: options?.metric ?? "CONCURRENCY",
+                  period: options?.metric === "TOKENS" ? "UTC_DAY" : "PER_ATTEMPT",
+                  mode: "LIMITED",
+                  limitValue: options?.metric === "TOKENS" ? 10 : 1,
                 },
               },
-            }),
-          ]
-        : []),
-    ]);
+            },
+          }),
+          ...(poolId
+            ? [
+                db.providerBudgetPolicy.create({
+                  data: {
+                    userId: user.id,
+                    providerAccountId: account.id,
+                    providerModelId: model.id,
+                    poolId,
+                    scopeType: "POOL_PROVIDER_MODEL",
+                    active: true,
+                    activatedAt: new Date(),
+                    Rules: {
+                      create: {
+                        metric: options?.metric ?? "CONCURRENCY",
+                        period: options?.metric === "TOKENS" ? "UTC_DAY" : "PER_ATTEMPT",
+                        mode: "LIMITED",
+                        limitValue: options?.metric === "TOKENS" ? 10 : 1,
+                      },
+                    },
+                  },
+                }),
+              ]
+            : []),
+        ]);
     return { user, account, model, poolId, policies };
   }
 
@@ -183,10 +189,92 @@ integration("provider budget admission and reconciliation", () => {
     expect(repaired).toBeGreaterThanOrEqual(1);
     const ledger = await db.providerUsageLedger.findUniqueOrThrow({
       where: {
-        attemptId_fencingToken: { attemptId: original.attemptId, fencingToken: 1n },
+        attemptId_fencingToken_sourceVersion: {
+          attemptId: original.attemptId,
+          fencingToken: 1n,
+          sourceVersion: "crash-recovery-v1",
+        },
       },
     });
     expect(ledger.requestId).toBe(original.requestId);
     expect(ledger.terminalReason).toBe("CRASH_RECOVERY");
+  });
+
+  it("anchors and reconciles an attempt even when no finite policy creates a reservation", async () => {
+    if (!db) return;
+    const row = await fixture({ noPolicy: true });
+    const original = attempt(row, `unlimited-${crypto.randomUUID()}`, {
+      tokens: 5n,
+      accountingVersion: "usage-v1",
+    });
+    await expect(service.admitProviderBudget(original)).resolves.toEqual({
+      admitted: true,
+      reservationIds: [],
+    });
+    await service.reconcileProviderBudget({
+      ...original,
+      reason: "COMPLETED",
+      usage: {
+        accountingVersion: "usage-v1",
+        authoritativeBillableTokens: 3n,
+        confidence: "REPORTED",
+      },
+    });
+    expect(await db.providerAttempt.count({ where: { attemptId: original.attemptId } })).toBe(1);
+    const ledger = await db.providerUsageLedger.findFirstOrThrow({
+      where: { attemptId: original.attemptId },
+    });
+    expect(ledger.reservationId).toBeNull();
+    expect(ledger.billableTotal).toBe(3n);
+  });
+
+  it("appends one idempotent delayed usage adjustment without rewriting history", async () => {
+    if (!db) return;
+    const row = await fixture({ metric: "TOKENS" });
+    const original = attempt(row, `delayed-${crypto.randomUUID()}`, {
+      tokens: 8n,
+      accountingVersion: "usage-v1",
+    });
+    await service.admitProviderBudget(original);
+    await service.reconcileProviderBudget({ ...original, reason: "TIMEOUT" });
+    const delayed = {
+      ...original,
+      reason: "COMPLETED" as const,
+      sourceVersion: "provider-final-v2",
+      usageSource: "provider-poll",
+      usage: {
+        accountingVersion: "usage-v1",
+        inputTokens: 2n,
+        additionalBillableTokens: 1n,
+        categoriesComplete: true,
+        confidence: "REPORTED" as const,
+        rawUsage: { input_tokens: 2, special_tokens: 1 },
+      },
+    };
+    await service.reconcileProviderBudget(delayed);
+    await service.reconcileProviderBudget(delayed);
+
+    const reservation = await db.providerBudgetReservation.findFirstOrThrow({
+      where: { attemptId: original.attemptId },
+    });
+    expect(reservation.settledValue?.toString()).toBe("8");
+    const settlements = await db.providerBudgetSettlement.findMany({
+      where: { reservationId: reservation.id },
+      orderBy: { createdAt: "asc" },
+    });
+    expect(settlements.map((entry) => entry.settledValue.toString())).toEqual(["8", "-5"]);
+    const ledgers = await db.providerUsageLedger.findMany({
+      where: { attemptId: original.attemptId },
+      orderBy: { createdAt: "asc" },
+    });
+    expect(ledgers).toHaveLength(2);
+    expect(ledgers[1]).toMatchObject({
+      sourceVersion: "provider-final-v2",
+      usageSource: "provider-poll",
+      categoriesComplete: true,
+      additionalBillableTokens: 1n,
+      billableTotal: 3n,
+      usageKnown: true,
+    });
   });
 });
