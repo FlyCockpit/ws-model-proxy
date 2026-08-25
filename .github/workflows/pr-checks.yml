@@ -371,7 +371,7 @@ jobs:
         run: pnpm --filter @ws-model-proxy/db db:push
 
       - name: Prove capacity admission PostgreSQL primitives
-        run: pnpm --filter server exec vitest run src/model-api/capacity/postgres-store.integration.test.ts
+        run: pnpm --filter server exec vitest run src/model-api/capacity/postgres-store.integration.test.ts src/model-api/capacity/postgres-process.integration.test.ts
 
       - name: Prove provider route pricing and accounting
         run: pnpm --filter server exec vitest run src/model-api/provider-route.integration.test.ts
