@@ -187,5 +187,25 @@ integration("provider half-open recovery", () => {
     const reclaimed = await db.providerAccount.findUniqueOrThrow({ where: { id: account.id } });
     expect(reclaimed.healthHalfOpenAttemptId).toBe(successor.attemptId);
     expect(reclaimed.healthHalfOpenFencingToken).toBe(successor.fencingToken);
+
+    // B completes and clears the nullable owner tuple. The durable watermark
+    // must still reject A's delayed failure instead of re-opening cooldown.
+    await service.recordProviderOutcome({
+      ...target,
+      ...successor,
+      success: true,
+    });
+    await service.recordProviderOutcome({
+      ...target,
+      ...owner,
+      success: false,
+      failureClass: "TRANSPORT",
+    });
+    const afterLateOwner = await db.providerModel.findUniqueOrThrow({ where: { id: model.id } });
+    expect(afterLateOwner.healthStatus).toBe("HEALTHY");
+    expect(afterLateOwner.healthFailureCount).toBe(0);
+    expect(afterLateOwner.healthNextRetryAt).toBeNull();
+    expect(afterLateOwner.healthHalfOpenAttemptId).toBeNull();
+    expect(afterLateOwner.healthFencingWatermark).toBe(successor.fencingToken);
   });
 });

@@ -1066,6 +1066,33 @@ FOR EACH ROW EXECUTE FUNCTION enforce_execution_target_consumer_consistency();
 
 UPDATE provider_account SET "endpointIdentity" = "baseUrl" WHERE "endpointIdentity" = '';
 
+-- Fencing counters are monotonic non-negative watermarks. Repair legacy or
+-- partially-applied rows before installing the checks, and retain any live
+-- half-open owner's token in the durable health watermark.
+UPDATE provider_account
+   SET "nextFencingToken" = GREATEST(
+         "nextFencingToken",
+         "healthFencingWatermark",
+         COALESCE("healthHalfOpenFencingToken", 0),
+         0
+       ),
+       "healthFencingWatermark" = GREATEST(
+         "healthFencingWatermark",
+         COALESCE("healthHalfOpenFencingToken", 0)
+       )
+ WHERE "nextFencingToken" < GREATEST(
+         "healthFencingWatermark",
+         COALESCE("healthHalfOpenFencingToken", 0),
+         0
+       )
+    OR "healthFencingWatermark" < COALESCE("healthHalfOpenFencingToken", 0);
+UPDATE provider_model
+   SET "healthFencingWatermark" = GREATEST(
+         "healthFencingWatermark",
+         COALESCE("healthHalfOpenFencingToken", 0)
+       )
+ WHERE "healthFencingWatermark" < COALESCE("healthHalfOpenFencingToken", 0);
+
 -- Pre-ownership half-open timestamps cannot safely identify a live worker.
 -- Clear them during the compatibility cutover; an expired cooldown can then
 -- be reclaimed immediately by a fenced writer.
@@ -1086,6 +1113,10 @@ ALTER TABLE provider_account ADD CONSTRAINT provider_account_shape_check CHECK (
   AND btrim("baseUrl") <> ''
   AND btrim("endpointIdentity") <> ''
   AND "endpointVersion" > 0
+  AND "nextFencingToken" >= 0
+  AND "healthFencingWatermark" >= 0
+  AND "nextFencingToken" >= "healthFencingWatermark"
+  AND "healthFencingWatermark" >= COALESCE("healthHalfOpenFencingToken", 0)
   AND (enabled = FALSE OR status = 'ACTIVE')
   AND (enabled = FALSE OR "currentCredentialId" IS NOT NULL)
   AND (("healthHalfOpenAt" IS NULL AND "healthHalfOpenAttemptId" IS NULL AND "healthHalfOpenFencingToken" IS NULL)
@@ -1102,6 +1133,8 @@ ALTER TABLE provider_model ADD CONSTRAINT provider_model_shape_check CHECK (
   AND ("maxOutputTokens" IS NULL OR "maxOutputTokens" > 0)
   AND ("concurrencyLimit" IS NULL OR "concurrencyLimit" > 0)
   AND ("pricingVersion" IS NULL OR btrim("pricingVersion") <> '')
+  AND "healthFencingWatermark" >= 0
+  AND "healthFencingWatermark" >= COALESCE("healthHalfOpenFencingToken", 0)
   AND (("healthHalfOpenAt" IS NULL AND "healthHalfOpenAttemptId" IS NULL AND "healthHalfOpenFencingToken" IS NULL)
     OR ("healthHalfOpenAt" IS NOT NULL AND btrim("healthHalfOpenAttemptId") <> '' AND "healthHalfOpenFencingToken" > 0))
 );

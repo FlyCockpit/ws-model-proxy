@@ -20,6 +20,7 @@ import {
   parseRetryAfter,
   recordProviderAttemptEvent,
   recordProviderOutcome,
+  releaseProviderHealthTrial,
 } from "./provider-attempt-runtime.js";
 import {
   admitProviderBudget,
@@ -784,12 +785,24 @@ export async function dispatchPublicOverflow(
     // fenced to this exact account+model claim, so an orphan cannot revive a
     // successor's half-open lease.
     let destroyAttempt: ((error: Error) => void) | undefined;
+    const attemptController = new AbortController();
+    let heartbeatActive = true;
+    const stopHeartbeat = () => {
+      heartbeatActive = false;
+      clearInterval(heartbeatTimer);
+    };
+    const loseOwnership = (error: Error) => {
+      if (!heartbeatActive) return;
+      heartbeatActive = false;
+      attemptController.abort(error);
+      destroyAttempt?.(error);
+    };
     const heartbeatTimer = setInterval(() => {
       void heartbeatProviderAttempt({ attemptId, fencingToken, extensionMs: 15 * 60_000 })
         .then((alive) => {
-          if (!alive) destroyAttempt?.(new Error("provider attempt lease expired"));
+          if (!alive) loseOwnership(new Error("provider attempt lease expired"));
         })
-        .catch(() => destroyAttempt?.(new Error("provider attempt heartbeat failed")));
+        .catch(() => loseOwnership(new Error("provider attempt heartbeat failed")));
     }, 10_000);
     heartbeatTimer.unref();
 
@@ -828,7 +841,11 @@ export async function dispatchPublicOverflow(
           method: "POST",
           headers: Object.fromEntries(upstream.headers.entries()),
           body: upstream.body,
-          signal: AbortSignal.any([request.signal, AbortSignal.timeout(14 * 60_000)]),
+          signal: AbortSignal.any([
+            request.signal,
+            attemptController.signal,
+            AbortSignal.timeout(14 * 60_000),
+          ]),
         },
         {
           egressEnabled: true,
@@ -863,7 +880,7 @@ export async function dispatchPublicOverflow(
           attemptId,
           fencingToken,
         }).catch(() => undefined);
-        clearInterval(heartbeatTimer);
+        stopHeartbeat();
         await reconcileProviderBudget({
           userId: request.userId,
           providerAccountId: target.providerAccountId,
@@ -918,10 +935,11 @@ export async function dispatchPublicOverflow(
       const reconcile = async (streamComplete: boolean) => {
         if (reconciled) return;
         reconciled = true;
-        clearInterval(heartbeatTimer);
+        stopHeartbeat();
         const ok = streamComplete && httpOk;
         const healthOutcome = providerHealthOutcome(status);
-        if (!request.signal.aborted && healthOutcome !== "NEUTRAL") {
+        const attemptAborted = request.signal.aborted || attemptController.signal.aborted;
+        if (!attemptAborted && healthOutcome !== "NEUTRAL") {
           await recordProviderHealth(
             target,
             request.userId,
@@ -929,6 +947,15 @@ export async function dispatchPublicOverflow(
             { status, retryAfter: response.headers["retry-after"] },
             { attemptId, fencingToken },
           );
+        }
+        if (attemptAborted || healthOutcome === "NEUTRAL") {
+          await releaseProviderHealthTrial({
+            userId: request.userId,
+            providerAccountId: target.providerAccountId,
+            providerModelId: target.providerModelId,
+            attemptId,
+            fencingToken,
+          }).catch(() => false);
         }
         const usage = streamComplete ? parseProviderUsage(usageChunks) : undefined;
         await reconcileProviderBudget({
@@ -1066,11 +1093,11 @@ export async function dispatchPublicOverflow(
         }),
       };
     } catch {
-      clearInterval(heartbeatTimer);
+      stopHeartbeat();
       // A caller disappearing before provider response is not evidence that
       // the provider transport is unhealthy. Keep the existing health state;
       // cancellation still terminalizes and reconciles the durable attempt.
-      if (!request.signal.aborted) {
+      if (!request.signal.aborted && !attemptController.signal.aborted) {
         await recordProviderOutcome({
           userId: request.userId,
           providerAccountId: target.providerAccountId,
@@ -1080,6 +1107,15 @@ export async function dispatchPublicOverflow(
           attemptId,
           fencingToken,
         }).catch(() => undefined);
+      }
+      if (request.signal.aborted || attemptController.signal.aborted) {
+        await releaseProviderHealthTrial({
+          userId: request.userId,
+          providerAccountId: target.providerAccountId,
+          providerModelId: target.providerModelId,
+          attemptId,
+          fencingToken,
+        }).catch(() => false);
       }
       await reconcileProviderBudget({
         userId: request.userId,

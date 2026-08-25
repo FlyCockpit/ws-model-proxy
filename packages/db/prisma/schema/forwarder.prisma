@@ -414,6 +414,8 @@ model ProviderAccount {
   /// Fenced owner of the live half-open probe. Both fields are null together.
   healthHalfOpenAttemptId    String?
   healthHalfOpenFencingToken BigInt?
+  /// Durable high-water mark; owner cleanup must never make an older probe authoritative again.
+  healthFencingWatermark     BigInt                       @default(0)
   nextFencingToken           BigInt                       @default(0)
   User                       User                         @relation("ProviderAccountOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ProviderModels             ProviderModel[]
@@ -457,6 +459,8 @@ model ProviderModel {
   /// Fenced owner of the live half-open probe. Both fields are null together.
   healthHalfOpenAttemptId    String?
   healthHalfOpenFencingToken BigInt?
+  /// Durable high-water mark; owner cleanup must never make an older probe authoritative again.
+  healthFencingWatermark     BigInt                       @default(0)
   enabled                    Boolean                      @default(false)
   User                       User                         @relation("ProviderModelOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ProviderAccount            ProviderAccount              @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)

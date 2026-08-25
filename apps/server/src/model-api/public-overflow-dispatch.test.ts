@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from "vitest";
 
 const providerHttpsRequest = vi.hoisted(() => vi.fn());
 const recordProviderOutcome = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+const heartbeatProviderAttempt = vi.hoisted(() => vi.fn().mockResolvedValue(true));
+const releaseProviderHealthTrial = vi.hoisted(() => vi.fn().mockResolvedValue(true));
 const db = vi.hoisted(() => ({
   modelPool: { findFirst: vi.fn() },
   relayRequest: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
@@ -35,13 +37,70 @@ vi.mock("./provider-attempt-runtime.js", () => ({
   claimProviderHealthTrial: vi.fn().mockResolvedValue("READY"),
   classifyProviderFailure: vi.fn((status?: number) => (status === 429 ? "RATE_LIMIT" : "SERVER")),
   finishProviderAttempt: vi.fn().mockResolvedValue(true),
-  heartbeatProviderAttempt: vi.fn().mockResolvedValue(true),
+  heartbeatProviderAttempt,
   parseRetryAfter: vi.fn((value?: string) => (value === "37" ? 37_000 : undefined)),
   recordProviderAttemptEvent: vi.fn().mockResolvedValue(undefined),
   recordProviderOutcome,
+  releaseProviderHealthTrial,
 }));
 
 import { dispatchPublicOverflow, listPublicOverflowTargets } from "./public-overflow.js";
+
+function dispatchPoolFixture() {
+  return {
+    publicEgressEnabled: true,
+    publicEgressAcknowledged: true,
+    PoolMembers: [
+      {
+        id: "member-heartbeat",
+        publicOrder: 0,
+        ExecutionTarget: {
+          id: "target-heartbeat",
+          ProviderModel: {
+            id: "model-heartbeat",
+            userId: "owner",
+            upstreamModelId: "upstream-model",
+            contextWindow: 10_000,
+            maxOutputTokens: 1_000,
+            nativeCapabilities: {
+              protocols: ["openai"],
+              surfaces: ["openai-chat"],
+              streaming: true,
+              features: [],
+            },
+            healthStatus: "UNAVAILABLE",
+            healthNextRetryAt: new Date(0),
+            enabled: true,
+            deletedAt: null,
+            ProviderAccount: {
+              id: "account-heartbeat",
+              userId: "owner",
+              providerType: "openai",
+              providerVersion: null,
+              baseUrl: "https://provider.example",
+              authType: "BEARER",
+              healthStatus: "UNAVAILABLE",
+              healthNextRetryAt: new Date(0),
+              enabled: true,
+              deletedAt: null,
+              CurrentCredential: {
+                id: "credential-heartbeat",
+                credentialType: "BEARER",
+                aadVersion: 1,
+                algorithm: "AES-256-GCM",
+                keyVersion: "v1",
+                ciphertext: new Uint8Array(),
+                nonce: new Uint8Array(),
+                authTag: new Uint8Array(),
+                status: "ACTIVE",
+              },
+            },
+          },
+        },
+      },
+    ],
+  };
+}
 
 describe("public overflow terminal response dispatch", () => {
   it("keeps unavailable targets with cooldown metadata eligible for half-open recovery", async () => {
@@ -319,5 +378,75 @@ describe("public overflow terminal response dispatch", () => {
 
     expect(result).toEqual({ dispatched: false, reason: "PROVIDER_UNAVAILABLE" });
     expect(recordProviderOutcome).not.toHaveBeenCalled();
+  });
+
+  it("aborts a pending provider request when heartbeat ownership is lost", async () => {
+    vi.useFakeTimers();
+    try {
+      recordProviderOutcome.mockClear();
+      releaseProviderHealthTrial.mockClear();
+      heartbeatProviderAttempt.mockResolvedValueOnce(false);
+      db.modelPool.findFirst.mockResolvedValue(dispatchPoolFixture());
+      const tx = {
+        $queryRaw: vi.fn().mockResolvedValue([]),
+        providerCredential: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: "credential-heartbeat",
+            credentialType: "BEARER",
+            aadVersion: 1,
+            algorithm: "AES-256-GCM",
+            keyVersion: "v1",
+            ciphertext: new Uint8Array(),
+            nonce: new Uint8Array(),
+            authTag: new Uint8Array(),
+          }),
+          update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+        },
+      };
+      db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+        callback(tx),
+      );
+      let providerSignal: AbortSignal | undefined;
+      providerHttpsRequest.mockImplementationOnce(
+        (_url: string, init: { signal: AbortSignal }) =>
+          new Promise((_resolve, reject) => {
+            providerSignal = init.signal;
+            init.signal.addEventListener("abort", () => reject(init.signal.reason), { once: true });
+          }),
+      );
+
+      const dispatched = dispatchPublicOverflow({
+        userId: "owner",
+        poolId: "pool",
+        requestId: "request-heartbeat",
+        reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+        requestedProtocol: "openai",
+        requestedSurface: "openai-chat",
+        stream: false,
+        requiredFeatures: [],
+        path: "/v1/chat/completions",
+        headers: new Headers({ "content-type": "application/json" }),
+        body: new TextEncoder().encode('{"model":"pool"}'),
+        signal: new AbortController().signal,
+        liability: { tokens: 10n, accountingVersion: "provider-billable-v1" },
+        requestedOutputTokens: 1n,
+        releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+        adaptationEnabled: false,
+        retrySafe: false,
+      });
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      await expect(dispatched).resolves.toEqual({
+        dispatched: false,
+        reason: "PROVIDER_UNAVAILABLE",
+      });
+      expect(providerSignal?.aborted).toBe(true);
+      expect(recordProviderOutcome).not.toHaveBeenCalled();
+      expect(releaseProviderHealthTrial).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(heartbeatProviderAttempt).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

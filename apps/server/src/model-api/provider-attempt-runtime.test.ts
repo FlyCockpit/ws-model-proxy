@@ -13,6 +13,7 @@ import {
   parseRetryAfter,
   recordProviderAttemptEvent,
   recordProviderOutcome,
+  releaseProviderHealthTrial,
 } from "./provider-attempt-runtime.js";
 
 describe("provider attempt failure policy", () => {
@@ -171,6 +172,42 @@ describe("provider attempt failure policy", () => {
     });
   });
 
+  it("rejects a delayed older outcome after a successor clears its owner fields", async () => {
+    const completedSuccessor = {
+      healthFailureCount: 0,
+      healthNextRetryAt: null,
+      healthHalfOpenAttemptId: null,
+      healthHalfOpenFencingToken: null,
+      healthFencingWatermark: 8n,
+    };
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
+      providerAccount: {
+        findUniqueOrThrow: vi.fn().mockResolvedValue(completedSuccessor),
+        update: vi.fn(),
+      },
+      providerModel: {
+        findUniqueOrThrow: vi.fn().mockResolvedValue(completedSuccessor),
+        update: vi.fn(),
+      },
+    };
+    db.$transaction.mockImplementationOnce(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+
+    await recordProviderOutcome({
+      userId: "owner",
+      providerAccountId: "account",
+      providerModelId: "model",
+      attemptId: "late-a",
+      fencingToken: 7n,
+      success: false,
+    });
+
+    expect(tx.providerAccount.update).not.toHaveBeenCalled();
+    expect(tx.providerModel.update).not.toHaveBeenCalled();
+  });
+
   it("locks the account before the model and enforces an account cooldown", async () => {
     const locks: string[] = [];
     const tx = {
@@ -252,6 +289,7 @@ describe("provider attempt failure policy", () => {
         healthHalfOpenAt: now,
         healthHalfOpenAttemptId: "attempt-new",
         healthHalfOpenFencingToken: 3n,
+        healthFencingWatermark: 3n,
       },
     });
     expect(tx.providerModel.update).toHaveBeenCalledWith({
@@ -260,6 +298,53 @@ describe("provider attempt failure policy", () => {
         healthHalfOpenAt: now,
         healthHalfOpenAttemptId: "attempt-new",
         healthHalfOpenFencingToken: 3n,
+        healthFencingWatermark: 3n,
+      },
+    });
+  });
+
+  it("releases only the exact owner without clearing cooldown or the durable fence", async () => {
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
+      providerAccount: {
+        findUniqueOrThrow: vi.fn().mockResolvedValue({
+          healthHalfOpenAttemptId: "attempt",
+          healthHalfOpenFencingToken: 7n,
+        }),
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      },
+      providerModel: {
+        findUniqueOrThrow: vi.fn().mockResolvedValue({
+          healthHalfOpenAttemptId: "attempt",
+          healthHalfOpenFencingToken: 7n,
+        }),
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+      },
+    };
+    db.$transaction.mockImplementationOnce(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+
+    await expect(
+      releaseProviderHealthTrial({
+        userId: "owner",
+        providerAccountId: "account",
+        providerModelId: "model",
+        attemptId: "attempt",
+        fencingToken: 7n,
+      }),
+    ).resolves.toBe(true);
+    expect(tx.providerAccount.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: "account",
+        userId: "owner",
+        healthHalfOpenAttemptId: "attempt",
+        healthHalfOpenFencingToken: 7n,
+      },
+      data: {
+        healthHalfOpenAt: null,
+        healthHalfOpenAttemptId: null,
+        healthHalfOpenFencingToken: null,
       },
     });
   });

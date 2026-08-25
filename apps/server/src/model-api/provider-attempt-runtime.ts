@@ -147,7 +147,11 @@ export async function claimProviderHealthTrial(input: {
     await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${input.providerModelId} AND "userId" = ${input.userId} FOR UPDATE`;
     const account = await tx.providerAccount.findUniqueOrThrow({
       where: { id: input.providerAccountId, userId: input.userId },
-      select: { healthNextRetryAt: true, healthHalfOpenAt: true },
+      select: {
+        healthNextRetryAt: true,
+        healthHalfOpenAt: true,
+        healthFencingWatermark: true,
+      },
     });
     const model = await tx.providerModel.findUniqueOrThrow({
       where: {
@@ -155,8 +159,20 @@ export async function claimProviderHealthTrial(input: {
         userId: input.userId,
         providerAccountId: input.providerAccountId,
       },
-      select: { healthNextRetryAt: true, healthHalfOpenAt: true },
+      select: {
+        healthNextRetryAt: true,
+        healthHalfOpenAt: true,
+        healthFencingWatermark: true,
+      },
     });
+    // The owner fields are intentionally nullable, but authority is not. A
+    // completed successor leaves this watermark behind so a delayed outcome
+    // from an older probe cannot become authoritative after owner cleanup.
+    if (
+      input.fencingToken <= account.healthFencingWatermark ||
+      input.fencingToken <= model.healthFencingWatermark
+    )
+      return "COOLDOWN";
     const cooldowns = [account, model].filter((health) => health.healthNextRetryAt !== null);
     if (cooldowns.length === 0) return "READY";
     const liveLeaseCutoff = new Date(now.getTime() - PROVIDER_HALF_OPEN_LEASE_MS);
@@ -175,6 +191,7 @@ export async function claimProviderHealthTrial(input: {
           healthHalfOpenAt: now,
           healthHalfOpenAttemptId: input.attemptId,
           healthHalfOpenFencingToken: input.fencingToken,
+          healthFencingWatermark: input.fencingToken,
         },
       }),
       tx.providerModel.update({
@@ -183,6 +200,7 @@ export async function claimProviderHealthTrial(input: {
           healthHalfOpenAt: now,
           healthHalfOpenAttemptId: input.attemptId,
           healthHalfOpenFencingToken: input.fencingToken,
+          healthFencingWatermark: input.fencingToken,
         },
       }),
     ]);
@@ -221,6 +239,7 @@ export async function recordProviderOutcome(input: {
           healthNextRetryAt: true,
           healthHalfOpenAttemptId: true,
           healthHalfOpenFencingToken: true,
+          healthFencingWatermark: true,
         },
       }),
       tx.providerModel.findUniqueOrThrow({
@@ -233,6 +252,7 @@ export async function recordProviderOutcome(input: {
           healthFailureCount: true,
           healthHalfOpenAttemptId: true,
           healthHalfOpenFencingToken: true,
+          healthFencingWatermark: true,
         },
       }),
     ]);
@@ -242,7 +262,12 @@ export async function recordProviderOutcome(input: {
         (health.healthHalfOpenAttemptId !== input.attemptId ||
           health.healthHalfOpenFencingToken !== input.fencingToken),
     );
-    if (ownedByAnother) return;
+    const superseded =
+      input.fencingToken !== undefined &&
+      [accountCurrent, current].some(
+        (health) => input.fencingToken! < health.healthFencingWatermark,
+      );
+    if (ownedByAnother || superseded) return;
     const failures = input.success ? 0 : current.healthFailureCount + 1;
     const modelHealth = input.success
       ? ("HEALTHY" as const)
@@ -300,6 +325,61 @@ export async function recordProviderOutcome(input: {
             }),
       },
     });
+  });
+}
+
+/** Releases only this exact half-open owner while retaining cooldown and watermark state. */
+export async function releaseProviderHealthTrial(input: {
+  userId: string;
+  providerAccountId: string;
+  providerModelId: string;
+  attemptId: string;
+  fencingToken: bigint;
+}): Promise<boolean> {
+  return prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.providerAccountId} AND "userId" = ${input.userId} FOR UPDATE`;
+    await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${input.providerModelId} AND "userId" = ${input.userId} FOR UPDATE`;
+    const owner = {
+      healthHalfOpenAttemptId: input.attemptId,
+      healthHalfOpenFencingToken: input.fencingToken,
+    };
+    const [accountOwner, modelOwner] = await Promise.all([
+      tx.providerAccount.findUniqueOrThrow({
+        where: { id: input.providerAccountId, userId: input.userId },
+        select: { healthHalfOpenAttemptId: true, healthHalfOpenFencingToken: true },
+      }),
+      tx.providerModel.findUniqueOrThrow({
+        where: {
+          id: input.providerModelId,
+          userId: input.userId,
+          providerAccountId: input.providerAccountId,
+        },
+        select: { healthHalfOpenAttemptId: true, healthHalfOpenFencingToken: true },
+      }),
+    ]);
+    const owns = (health: typeof accountOwner) =>
+      health.healthHalfOpenAttemptId === input.attemptId &&
+      health.healthHalfOpenFencingToken === input.fencingToken;
+    if (!owns(accountOwner) || !owns(modelOwner)) return false;
+    const cleared = {
+      healthHalfOpenAt: null,
+      healthHalfOpenAttemptId: null,
+      healthHalfOpenFencingToken: null,
+    };
+    const account = await tx.providerAccount.updateMany({
+      where: { id: input.providerAccountId, userId: input.userId, ...owner },
+      data: cleared,
+    });
+    const model = await tx.providerModel.updateMany({
+      where: {
+        id: input.providerModelId,
+        userId: input.userId,
+        providerAccountId: input.providerAccountId,
+        ...owner,
+      },
+      data: cleared,
+    });
+    return account.count === 1 && model.count === 1;
   });
 }
 
