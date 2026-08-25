@@ -43,6 +43,7 @@ const db = prisma as unknown as {
     updateMany: MockInstance;
   };
   providerModel: {
+    count: MockInstance;
     create: MockInstance;
     findFirst: MockInstance;
     update: MockInstance;
@@ -72,10 +73,11 @@ const db = prisma as unknown as {
     findFirst: MockInstance;
     updateMany: MockInstance;
   };
-  providerUsageLedger: { findMany: MockInstance };
+  providerUsageLedger: { findMany: MockInstance; groupBy: MockInstance };
   providerBudgetReservation: { findMany: MockInstance };
   providerBudgetSettlement: { findMany: MockInstance };
   publicProviderAttemptEvent: { findMany: MockInstance };
+  providerAttempt: { findMany: MockInstance };
 };
 
 const session = {
@@ -142,6 +144,36 @@ describe("providerManagementRouter security boundary", () => {
     >;
     await expect(client.listAccounts()).rejects.toMatchObject({ code: "NOT_FOUND" });
     expect(db.providerAccount.findMany).not.toHaveBeenCalled();
+  });
+
+  it("returns a generic HTTP NOT_FOUND for guessed owner and pool report filters", async () => {
+    envMock.enabled = true;
+    db.providerAccount.findFirst.mockResolvedValue(null);
+    db.modelPool.findFirst.mockResolvedValue(null);
+    const handler = new RPCHandler(providerManagementRouter);
+    const link = new RPCLink({
+      url: "https://example.test/rpc",
+      fetch: async (request, init) => {
+        const result = await handler.handle(new Request(request, init), {
+          prefix: "/rpc",
+          context,
+        });
+        if (!result.matched) return new Response(null, { status: 404 });
+        return result.response;
+      },
+    });
+    const client = createORPCClient(link) as ReturnType<
+      typeof createRouterClient<typeof providerManagementRouter>
+    >;
+    await expect(
+      client.listUsageReportPage({ providerAccountId: "foreign-account" }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND", message: "Not found" });
+    await expect(client.listProviderAttempts({ poolId: "foreign-pool" })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      message: "Not found",
+    });
+    expect(db.providerUsageLedger.findMany).not.toHaveBeenCalled();
+    expect(db.providerAttempt.findMany).not.toHaveBeenCalled();
   });
 
   it("rechecks the locked account inside createModel and loses a race with account deletion", async () => {
@@ -570,6 +602,87 @@ describe("providerManagementRouter security boundary", () => {
       expect.objectContaining({ where: { id: "account", userId: "owner", deletedAt: null } }),
     );
     expect(db.providerAuditEvent.create).toHaveBeenCalledOnce();
+  });
+
+  it("enables an owned account only with active credentials and enabled models", async () => {
+    envMock.enabled = true;
+    db.providerAccount.findFirst
+      .mockResolvedValueOnce({
+        id: "account",
+        currentCredentialId: "credential",
+        enabled: false,
+      })
+      .mockResolvedValueOnce({ id: "account", enabled: true, status: "ACTIVE" });
+    db.providerCredential.findFirst.mockResolvedValue({ id: "credential" });
+    db.providerModel.count.mockResolvedValue(1);
+    db.providerAccount.updateMany.mockResolvedValue({ count: 1 });
+    db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(client.setAccountEnabled({ id: "account", enabled: true })).resolves.toEqual({
+      id: "account",
+      enabled: true,
+      status: "ACTIVE",
+    });
+    expect(db.providerCredential.findFirst).toHaveBeenCalledWith({
+      where: {
+        id: "credential",
+        userId: "owner",
+        providerAccountId: "account",
+        status: "ACTIVE",
+      },
+      select: { id: true },
+    });
+    expect(db.providerAuditEvent.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ metadata: { enabled: true } }),
+    });
+  });
+
+  it("returns exact per-currency totals and stable report cursors", async () => {
+    envMock.enabled = true;
+    const createdAt = new Date("2026-08-25T00:00:00Z");
+    db.providerUsageLedger.findMany.mockResolvedValue([
+      { id: "b", createdAt },
+      { id: "a", createdAt },
+    ]);
+    db.providerUsageLedger.groupBy.mockResolvedValue([
+      { currency: "EUR", _sum: { settledCost: "1.25" }, _count: { _all: 2 } },
+      { currency: "USD", _sum: { settledCost: "3.5" }, _count: { _all: 4 } },
+    ]);
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(client.listUsageReportPage({ limit: 1 })).resolves.toEqual({
+      items: [{ id: "b", createdAt }],
+      nextCursor: { id: "b", createdAt },
+    });
+    await expect(client.getUsageTotals({ limit: 50 })).resolves.toEqual([
+      { currency: "EUR", settledCost: "1.25", rowCount: 2, from: null, to: null },
+      { currency: "USD", settledCost: "3.5", rowCount: 4, from: null, to: null },
+    ]);
+    expect(db.providerUsageLedger.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { userId: "owner" }, take: 2 }),
+    );
+  });
+
+  it("reports stale and unreconciled attempts without credential material", async () => {
+    envMock.enabled = true;
+    db.providerAttempt.findMany.mockResolvedValue([
+      {
+        id: "attempt-row",
+        createdAt: new Date("2026-08-24T00:00:00Z"),
+        attemptId: "attempt",
+        state: "ACTIVE",
+        expiresAt: new Date("2026-08-24T00:01:00Z"),
+      },
+    ]);
+    db.providerUsageLedger.groupBy.mockResolvedValue([]);
+    const client = createRouterClient(providerManagementRouter, { context });
+    const result = await client.listProviderAttempts({ limit: 10 });
+    expect(result.items[0]).toMatchObject({ stale: true, reconciliationStatus: "PENDING" });
+    expect(db.providerAttempt.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { userId: "owner" },
+        select: expect.not.objectContaining({ credentialId: true }),
+      }),
+    );
   });
 
   it("locks account then model and audits deleteModel exactly once", async () => {

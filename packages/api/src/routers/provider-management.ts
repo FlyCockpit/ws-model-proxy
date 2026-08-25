@@ -124,6 +124,8 @@ const reportInput = z
     if (value.from && value.to && value.from >= value.to)
       ctx.addIssue({ code: "custom", message: "from must be before to" });
   });
+const reportCursor = z.object({ createdAt: z.coerce.date(), id });
+const pagedReportInput = reportInput.extend({ cursor: reportCursor.optional() });
 function reportWhere(userId: string, input: z.infer<typeof reportInput>) {
   return {
     userId,
@@ -138,6 +140,25 @@ function reportWhere(userId: string, input: z.infer<typeof reportInput>) {
           },
         }
       : {}),
+  };
+}
+function cursorWhere(cursor: z.infer<typeof reportCursor> | undefined) {
+  return cursor
+    ? {
+        OR: [
+          { createdAt: { lt: cursor.createdAt } },
+          { createdAt: cursor.createdAt, id: { lt: cursor.id } },
+        ],
+      }
+    : {};
+}
+function page<T extends { id: string; createdAt: Date }>(rows: T[], limit: number) {
+  const hasMore = rows.length > limit;
+  const items = hasMore ? rows.slice(0, limit) : rows;
+  const last = items.at(-1);
+  return {
+    items,
+    nextCursor: hasMore && last ? { createdAt: last.createdAt, id: last.id } : null,
   };
 }
 const json = z.record(z.string(), z.unknown()).nullable().optional();
@@ -347,6 +368,64 @@ export const providerManagementRouter = {
             subjectId: accountId,
           },
         });
+        return row;
+      }, providerWriteTransaction);
+    }),
+  setAccountEnabled: protectedProcedure
+    .input(z.object({ id, enabled: z.boolean() }))
+    .handler(async ({ input, context }) => {
+      enabled();
+      const userId = context.session.user.id;
+      return prisma.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.id} AND "userId" = ${userId} FOR UPDATE`;
+        const account = await tx.providerAccount.findFirst({
+          where: { id: input.id, userId, deletedAt: null },
+          select: { id: true, currentCredentialId: true, enabled: true },
+        });
+        if (!account) throw missing();
+        if (input.enabled) {
+          if (!account.currentCredentialId)
+            throw new ORPCError("PRECONDITION_FAILED", {
+              message: "An active credential is required",
+            });
+          const credential = await tx.providerCredential.findFirst({
+            where: {
+              id: account.currentCredentialId,
+              userId,
+              providerAccountId: account.id,
+              status: "ACTIVE",
+            },
+            select: { id: true },
+          });
+          if (!credential) throw new ORPCError("PRECONDITION_FAILED");
+          const enabledModels = await tx.providerModel.count({
+            where: { userId, providerAccountId: account.id, deletedAt: null, enabled: true },
+          });
+          if (enabledModels === 0)
+            throw new ORPCError("PRECONDITION_FAILED", {
+              message: "At least one enabled provider model is required",
+            });
+        }
+        if (account.enabled !== input.enabled) {
+          await tx.providerAccount.updateMany({
+            where: { id: account.id, userId, deletedAt: null },
+            data: { enabled: input.enabled, status: input.enabled ? "ACTIVE" : "DISABLED" },
+          });
+          await tx.providerAuditEvent.create({
+            data: {
+              userId,
+              providerAccountId: account.id,
+              action: "ACCOUNT_UPDATED",
+              subjectId: account.id,
+              metadata: { enabled: input.enabled },
+            },
+          });
+        }
+        const row = await tx.providerAccount.findFirst({
+          where: { id: account.id, userId, deletedAt: null },
+          select: accountSelect,
+        });
+        if (!row) throw missing();
         return row;
       }, providerWriteTransaction);
     }),
@@ -1080,6 +1159,111 @@ export const providerManagementRouter = {
         orderBy: [{ createdAt: "desc" }, { id: "desc" }],
         take: input.limit,
       });
+    }),
+  listUsageReportPage: protectedProcedure
+    .input(pagedReportInput)
+    .handler(async ({ input, context }) => {
+      enabled();
+      const userId = context.session.user.id;
+      await reportScopeFor(userId, input);
+      const rows = await prisma.providerUsageLedger.findMany({
+        where: { ...reportWhere(userId, input), ...cursorWhere(input.cursor) },
+        select: {
+          id: true,
+          createdAt: true,
+          providerAccountId: true,
+          providerModelId: true,
+          poolId: true,
+          inputTokens: true,
+          outputTokens: true,
+          billableTotal: true,
+          settledCost: true,
+          currency: true,
+          pricingVersion: true,
+          accountingVersion: true,
+          usageKnown: true,
+          costKnown: true,
+          terminalReason: true,
+          confidence: true,
+        },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: input.limit + 1,
+      });
+      return page(rows, input.limit);
+    }),
+  getUsageTotals: protectedProcedure.input(reportInput).handler(async ({ input, context }) => {
+    enabled();
+    const userId = context.session.user.id;
+    await reportScopeFor(userId, input);
+    const groups = await prisma.providerUsageLedger.groupBy({
+      by: ["currency"],
+      where: { ...reportWhere(userId, input), costKnown: true, currency: { not: null } },
+      _sum: { settledCost: true },
+      _count: { _all: true },
+      orderBy: { currency: "asc" },
+    });
+    return groups.map((group) => ({
+      currency: group.currency,
+      settledCost: group._sum.settledCost,
+      rowCount: group._count._all,
+      from: input.from ?? null,
+      to: input.to ?? null,
+    }));
+  }),
+  listProviderAttempts: protectedProcedure
+    .input(pagedReportInput)
+    .handler(async ({ input, context }) => {
+      enabled();
+      const userId = context.session.user.id;
+      await reportScopeFor(userId, input);
+      const now = new Date();
+      const rows = await prisma.providerAttempt.findMany({
+        where: { ...reportWhere(userId, input), ...cursorWhere(input.cursor) },
+        select: {
+          id: true,
+          createdAt: true,
+          providerAccountId: true,
+          providerModelId: true,
+          poolId: true,
+          requestId: true,
+          attemptId: true,
+          state: true,
+          heartbeatAt: true,
+          terminalAt: true,
+          terminalReason: true,
+          expiresAt: true,
+          liabilityTokens: true,
+          liabilitySpend: true,
+          liabilityCurrency: true,
+          pricingVersion: true,
+          accountingVersion: true,
+        },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: input.limit + 1,
+      });
+      const result = page(rows, input.limit);
+      const attemptIds = result.items.map((row) => row.attemptId);
+      const ledgerCounts = attemptIds.length
+        ? await prisma.providerUsageLedger.groupBy({
+            by: ["attemptId"],
+            where: { userId, attemptId: { in: attemptIds } },
+            _count: { _all: true },
+          })
+        : [];
+      const counts = new Map(ledgerCounts.map((row) => [row.attemptId, row._count._all]));
+      return {
+        ...result,
+        items: result.items.map((row) => ({
+          ...row,
+          stale: row.state === "ACTIVE" && row.expiresAt <= now,
+          reconciliationStatus:
+            (counts.get(row.attemptId) ?? 0) > 0
+              ? "RECORDED"
+              : row.state === "ACTIVE"
+                ? "PENDING"
+                : "MISSING",
+        })),
+      };
     }),
   rotateCredential: protectedProcedure
     .input(z.object({ id }))
