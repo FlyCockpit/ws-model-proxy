@@ -433,14 +433,13 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       include: { AdmissionRequest: true, PoolMember: true },
     });
     const configuredReservationMembers = await tx.poolMember.findMany({
-      // Only concrete local primary targets participate in local capacity
-      // reservation accounting. Public provider overflow has independent
-      // provider concurrency and budget admission.
+      // Every PRIMARY execution target sharing this physical capacity takes
+      // part in the same reservation accounting, including provider-backed
+      // primaries. PUBLIC_OVERFLOW remains outside the primary scheduler.
       where: {
         tier: "PRIMARY",
         ExecutionTarget: {
           inferenceCapacityId: capacityId,
-          DiscoveredModel: { isNot: null },
         },
       },
       include: { ModelPool: true },
