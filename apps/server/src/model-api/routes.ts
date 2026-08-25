@@ -1258,19 +1258,38 @@ function adaptedProviderResponseHeaders(
   source: ProtocolSurface,
   target: ProtocolSurface,
   sourceHeaders: Headers,
+  adapted = true,
 ): Headers {
-  const headers = new Headers({
-    "content-type": "application/json; charset=utf-8",
-    "x-wsmp-adapter-version": "1.0.0",
-  });
+  const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
+  if (adapted) headers.set("x-wsmp-adapter-version", "1.0.0");
   const retryAfter = sourceHeaders.get("retry-after");
-  if (retryAfter) headers.set("retry-after", retryAfter);
-  const requestId =
+  const safeRate = (value: string | null) =>
+    value && /^(?:\d+(?:\.\d+)?(?:ms|s|m|h)?|[0-9TZ:+.-]+)$/u.test(value) ? value : null;
+  const safeRequestId = (value: string | null) =>
+    value && /^[A-Za-z0-9._:-]{1,128}$/u.test(value) ? value : null;
+  const validatedRetryAfter = safeRate(retryAfter);
+  if (validatedRetryAfter) headers.set("retry-after", validatedRetryAfter);
+  const requestId = safeRequestId(
     source === "anthropic-messages"
       ? sourceHeaders.get("request-id")
-      : sourceHeaders.get("x-request-id");
+      : sourceHeaders.get("x-request-id"),
+  );
   if (requestId)
     headers.set(target === "anthropic-messages" ? "request-id" : "x-request-id", requestId);
+  const rateHeaderPairs = [
+    ["x-ratelimit-limit-requests", "anthropic-ratelimit-requests-limit"],
+    ["x-ratelimit-remaining-requests", "anthropic-ratelimit-requests-remaining"],
+    ["x-ratelimit-reset-requests", "anthropic-ratelimit-requests-reset"],
+    ["x-ratelimit-limit-tokens", "anthropic-ratelimit-tokens-limit"],
+    ["x-ratelimit-remaining-tokens", "anthropic-ratelimit-tokens-remaining"],
+    ["x-ratelimit-reset-tokens", "anthropic-ratelimit-tokens-reset"],
+  ] as const;
+  for (const [openAiName, anthropicName] of rateHeaderPairs) {
+    const value = safeRate(
+      sourceHeaders.get(source === "anthropic-messages" ? anthropicName : openAiName),
+    );
+    if (value) headers.set(target === "anthropic-messages" ? anthropicName : openAiName, value);
+  }
   return headers;
 }
 
@@ -2975,6 +2994,31 @@ async function relayPool({
     // machines as local targets.
     const commitAwareResponse = (response: Response) =>
       responseWithFirstClientByte(response, result.markFirstClientByte);
+    if (
+      result.nativeSurface === requestedSurface &&
+      (result.response.status < 200 || result.response.status >= 300) &&
+      result.response.body
+    ) {
+      const sanitized = await readAdaptedNonstreamBody({
+        body: result.response.body,
+        source: requestedSurface,
+        target: requestedSurface,
+        status: result.response.status,
+        headers: result.response.headers,
+        signal: request.signal,
+      });
+      return commitAwareResponse(
+        new Response(sanitized, {
+          status: result.response.status,
+          headers: adaptedProviderResponseHeaders(
+            requestedSurface,
+            requestedSurface,
+            result.response.headers,
+            false,
+          ),
+        }),
+      );
+    }
     if (result.nativeSurface === requestedSurface || !operation.adaptation)
       return commitAwareResponse(result.response);
     const source: ProtocolSurface = result.nativeSurface;
@@ -3824,6 +3868,9 @@ async function relayPool({
           ["x-ratelimit-limit-requests", "anthropic-ratelimit-requests-limit"],
           ["x-ratelimit-remaining-requests", "anthropic-ratelimit-requests-remaining"],
           ["x-ratelimit-reset-requests", "anthropic-ratelimit-requests-reset"],
+          ["x-ratelimit-limit-tokens", "anthropic-ratelimit-tokens-limit"],
+          ["x-ratelimit-remaining-tokens", "anthropic-ratelimit-tokens-remaining"],
+          ["x-ratelimit-reset-tokens", "anthropic-ratelimit-tokens-reset"],
         ] as const;
         for (const [openAiName, anthropicName] of rateHeaderPairs) {
           const value = sourceHeaders.get(

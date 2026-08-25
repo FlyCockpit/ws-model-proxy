@@ -78,6 +78,9 @@ export type ProtocolResponseMetadata = {
   retryLimit?: string;
   retryRemaining?: string;
   retryReset?: string;
+  tokenLimit?: string;
+  tokenRemaining?: string;
+  tokenReset?: string;
 };
 
 export type ParsedProtocolResponse =
@@ -113,4 +116,7 @@ export type CanonicalProtocolError = {
   retryLimit?: string;
   retryRemaining?: string;
   retryReset?: string;
+  tokenLimit?: string;
+  tokenRemaining?: string;
+  tokenReset?: string;
 };

@@ -40,20 +40,39 @@ export function responseMetadata(
   surface?: ProtocolSurface,
 ): ProtocolResponseMetadata {
   const safe = (name: string) => headers.get(name)?.slice(0, 512) || undefined;
+  const requestId = (name: string) => {
+    const value = safe(name);
+    return value && /^[A-Za-z0-9._:-]{1,128}$/u.test(value) ? value : undefined;
+  };
+  const rateValue = (name: string) => {
+    const value = safe(name);
+    return value && /^(?:\d+(?:\.\d+)?(?:ms|s|m|h)?|[0-9TZ:+.-]+)$/u.test(value)
+      ? value
+      : undefined;
+  };
   const anthropic = surface === "anthropic-messages";
   return {
     status,
-    requestId: anthropic ? safe("request-id") : safe("x-request-id"),
-    retryAfter: safe("retry-after"),
+    requestId: anthropic ? requestId("request-id") : requestId("x-request-id"),
+    retryAfter: rateValue("retry-after"),
     retryLimit: anthropic
-      ? safe("anthropic-ratelimit-requests-limit")
-      : safe("x-ratelimit-limit-requests"),
+      ? rateValue("anthropic-ratelimit-requests-limit")
+      : rateValue("x-ratelimit-limit-requests"),
     retryRemaining: anthropic
-      ? safe("anthropic-ratelimit-requests-remaining")
-      : safe("x-ratelimit-remaining-requests"),
+      ? rateValue("anthropic-ratelimit-requests-remaining")
+      : rateValue("x-ratelimit-remaining-requests"),
     retryReset: anthropic
-      ? safe("anthropic-ratelimit-requests-reset")
-      : safe("x-ratelimit-reset-requests"),
+      ? rateValue("anthropic-ratelimit-requests-reset")
+      : rateValue("x-ratelimit-reset-requests"),
+    tokenLimit: anthropic
+      ? rateValue("anthropic-ratelimit-tokens-limit")
+      : rateValue("x-ratelimit-limit-tokens"),
+    tokenRemaining: anthropic
+      ? rateValue("anthropic-ratelimit-tokens-remaining")
+      : rateValue("x-ratelimit-remaining-tokens"),
+    tokenReset: anthropic
+      ? rateValue("anthropic-ratelimit-tokens-reset")
+      : rateValue("x-ratelimit-reset-tokens"),
   };
 }
 
@@ -371,36 +390,51 @@ function parseError(
 ): CanonicalProtocolError {
   const body = object(value, "error_response");
   let error: Record<string, unknown>;
-  let bodyRequestId: string | undefined;
   if (surface === "anthropic-messages") {
     rejectUnknown(body, ["type", "error", "request_id"], "error_response");
     if (body.type !== "error") invalid("error_response.type", "must be error");
     error = object(body.error, "error_response.error");
     rejectUnknown(error, ["type", "message"], "error_response.error");
-    if (body.request_id !== undefined)
-      bodyRequestId = string(body.request_id, "error_response.request_id");
+    if (body.request_id !== undefined) string(body.request_id, "error_response.request_id");
   } else {
     rejectUnknown(body, ["error"], "error_response");
     error = object(body.error, "error_response.error");
     rejectUnknown(error, ["message", "type", "param", "code"], "error_response.error");
   }
+  // Validate the provider shape, but never reflect provider-controlled error
+  // text, codes, or parameter names. They routinely contain credentials,
+  // private endpoints, tenant identifiers, and implementation details.
+  string(error.message, "error_response.error.message");
+  const sanitized =
+    metadata.status === 401
+      ? { code: "authentication_error", message: "The provider rejected authentication." }
+      : metadata.status === 403
+        ? { code: "permission_error", message: "The provider denied this request." }
+        : metadata.status === 404
+          ? { code: "not_found_error", message: "The provider resource was not found." }
+          : metadata.status === 413
+            ? { code: "request_too_large", message: "The provider rejected the request size." }
+            : metadata.status === 429
+              ? { code: "rate_limit_error", message: "The provider rate limit was exceeded." }
+              : metadata.status === 529
+                ? { code: "overloaded_error", message: "The provider is overloaded." }
+                : metadata.status >= 500
+                  ? { code: "upstream_error", message: "The provider request failed." }
+                  : {
+                      code: "invalid_request_error",
+                      message: "The provider rejected the request.",
+                    };
   return {
-    code:
-      typeof error.code === "string"
-        ? error.code
-        : typeof error.type === "string"
-          ? error.type
-          : "upstream_error",
-    message: string(error.message, "error_response.error.message").slice(0, 1000),
-    ...(typeof error.param === "string" ? { parameter: error.param } : {}),
+    ...sanitized,
     upstreamStatus: metadata.status,
-    ...((bodyRequestId ?? metadata.requestId)
-      ? { requestId: bodyRequestId ?? metadata.requestId }
-      : {}),
+    ...(metadata.requestId ? { requestId: metadata.requestId } : {}),
     ...(metadata.retryAfter ? { retryAfter: metadata.retryAfter } : {}),
     ...(metadata.retryLimit ? { retryLimit: metadata.retryLimit } : {}),
     ...(metadata.retryRemaining ? { retryRemaining: metadata.retryRemaining } : {}),
     ...(metadata.retryReset ? { retryReset: metadata.retryReset } : {}),
+    ...(metadata.tokenLimit ? { tokenLimit: metadata.tokenLimit } : {}),
+    ...(metadata.tokenRemaining ? { tokenRemaining: metadata.tokenRemaining } : {}),
+    ...(metadata.tokenReset ? { tokenReset: metadata.tokenReset } : {}),
   };
 }
 
@@ -612,6 +646,21 @@ export function renderProtocolErrorMetadata(
   if (error.retryLimit) headers.set(retryHeaders.limit, error.retryLimit);
   if (error.retryRemaining) headers.set(retryHeaders.remaining, error.retryRemaining);
   if (error.retryReset) headers.set(retryHeaders.reset, error.retryReset);
+  const tokenHeaders =
+    surface === "anthropic-messages"
+      ? {
+          limit: "anthropic-ratelimit-tokens-limit",
+          remaining: "anthropic-ratelimit-tokens-remaining",
+          reset: "anthropic-ratelimit-tokens-reset",
+        }
+      : {
+          limit: "x-ratelimit-limit-tokens",
+          remaining: "x-ratelimit-remaining-tokens",
+          reset: "x-ratelimit-reset-tokens",
+        };
+  if (error.tokenLimit) headers.set(tokenHeaders.limit, error.tokenLimit);
+  if (error.tokenRemaining) headers.set(tokenHeaders.remaining, error.tokenRemaining);
+  if (error.tokenReset) headers.set(tokenHeaders.reset, error.tokenReset);
   return {
     status:
       error.upstreamStatus && error.upstreamStatus >= 400 && error.upstreamStatus <= 599

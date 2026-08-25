@@ -463,6 +463,15 @@ function responseHeaders(headers: import("node:http").IncomingHttpHeaders): Head
     "x-ratelimit-limit-requests",
     "x-ratelimit-remaining-requests",
     "x-ratelimit-reset-requests",
+    "x-ratelimit-limit-tokens",
+    "x-ratelimit-remaining-tokens",
+    "x-ratelimit-reset-tokens",
+    "anthropic-ratelimit-requests-limit",
+    "anthropic-ratelimit-requests-remaining",
+    "anthropic-ratelimit-requests-reset",
+    "anthropic-ratelimit-tokens-limit",
+    "anthropic-ratelimit-tokens-remaining",
+    "anthropic-ratelimit-tokens-reset",
   ]);
   for (const [name, value] of Object.entries(headers)) {
     if (!allowed.has(name.toLowerCase()) || value === undefined) continue;

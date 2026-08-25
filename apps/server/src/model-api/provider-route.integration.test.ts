@@ -165,12 +165,37 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       if (behavior === "client-error") {
         const requestIdHeader =
           surface === "anthropic-messages"
-            ? { "request-id": "upstream-request-400" }
-            : { "x-request-id": "upstream-request-400" };
+            ? {
+                "request-id": "upstream-request-400",
+                "x-request-id": "route-provider-secret http://10.0.0.8/private",
+              }
+            : {
+                "x-request-id": "upstream-request-400",
+                "request-id": "route-provider-secret http://10.0.0.8/private",
+              };
+        const rateHeaders =
+          surface === "anthropic-messages"
+            ? {
+                "anthropic-ratelimit-requests-limit": "100",
+                "anthropic-ratelimit-requests-remaining": "99",
+                "anthropic-ratelimit-requests-reset": "2026-08-25T12:00:00Z",
+                "anthropic-ratelimit-tokens-limit": "1000",
+                "anthropic-ratelimit-tokens-remaining": "900",
+                "anthropic-ratelimit-tokens-reset": "2026-08-25T12:01:00Z",
+              }
+            : {
+                "x-ratelimit-limit-requests": "100",
+                "x-ratelimit-remaining-requests": "99",
+                "x-ratelimit-reset-requests": "1s",
+                "x-ratelimit-limit-tokens": "1000",
+                "x-ratelimit-remaining-tokens": "900",
+                "x-ratelimit-reset-tokens": "2s",
+              };
         response.writeHead(400, {
           "content-type": "application/json",
           "retry-after": "2",
           ...requestIdHeader,
+          ...rateHeaders,
           "x-internal-secret": "must-not-pass",
         });
         response.end(
@@ -178,12 +203,19 @@ integration("provider dispatch routes with real PostgreSQL", () => {
             surface === "anthropic-messages"
               ? {
                   type: "error",
-                  error: { type: "invalid_request_error", message: "safe provider error" },
+                  error: {
+                    type: "tenant-internal-secret-code",
+                    message:
+                      "credential route-provider-secret at http://10.0.0.8/private tenant tenant-other",
+                  },
                 }
               : {
                   error: {
-                    type: "invalid_request_error",
-                    message: "safe provider error",
+                    type: "provider_internal_type",
+                    code: "tenant-internal-secret-code",
+                    param: "tenant-other.private_field",
+                    message:
+                      "credential route-provider-secret at http://10.0.0.8/private tenant tenant-other",
                   },
                 },
           ),
@@ -944,10 +976,14 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     expect(first.attemptEvents.some((event) => event.eventType === "FIRST_CLIENT_BYTE")).toBe(true);
   });
 
-  it.each(requestedSurfaces)(
-    "%s renders and redacts an adapted provider error in the requested protocol",
-    async (requested) => {
-      const native = adaptedNative[requested];
+  it.each(
+    requestedSurfaces.flatMap((requested) => [
+      { requested, native: requested, mode: "native" as const },
+      { requested, native: adaptedNative[requested], mode: "adapted" as const },
+    ]),
+  )(
+    "$requested renders and redacts a $mode provider error from $native",
+    async ({ requested, native, mode }) => {
       const result = await runCase({ requested, native, behavior: "client-error" });
       expect(result.response.status).toBe(400);
       expect(result.response.headers.get("retry-after")).toBe("2");
@@ -959,24 +995,76 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         expect(result.response.headers.get(sourceRequestIdHeader)).toBeNull();
       expect(result.response.headers.get("x-internal-secret")).toBeNull();
       expect(result.responseText).not.toContain("route-provider-secret");
-      expect(result.responseText).not.toContain("internal_secret");
+      expect(result.responseText).not.toContain("10.0.0.8");
+      expect(result.responseText).not.toContain("tenant-other");
+      expect(result.responseText).not.toContain("provider_internal_type");
+      expect(result.responseText).not.toContain("tenant-internal-secret-code");
       const error = JSON.parse(result.responseText);
       if (requested === "anthropic-messages")
         expect(error).toMatchObject({
           type: "error",
-          error: { type: "invalid_request_error", message: "safe provider error" },
+          error: {
+            type: "invalid_request_error",
+            message: "The provider rejected the request.",
+          },
         });
       else
         expect(error).toMatchObject({
           error: {
             type: "invalid_request_error",
             code: "invalid_request_error",
-            message: "safe provider error",
+            param: null,
+            message: "The provider rejected the request.",
           },
         });
+      const requestedRateHeaders =
+        requested === "anthropic-messages"
+          ? [
+              "anthropic-ratelimit-requests-limit",
+              "anthropic-ratelimit-requests-remaining",
+              "anthropic-ratelimit-requests-reset",
+              "anthropic-ratelimit-tokens-limit",
+              "anthropic-ratelimit-tokens-remaining",
+              "anthropic-ratelimit-tokens-reset",
+            ]
+          : [
+              "x-ratelimit-limit-requests",
+              "x-ratelimit-remaining-requests",
+              "x-ratelimit-reset-requests",
+              "x-ratelimit-limit-tokens",
+              "x-ratelimit-remaining-tokens",
+              "x-ratelimit-reset-tokens",
+            ];
+      expect(requestedRateHeaders.map((name) => result.response.headers.get(name))).toEqual([
+        "100",
+        "99",
+        native === "anthropic-messages" ? "2026-08-25T12:00:00Z" : "1s",
+        "1000",
+        "900",
+        native === "anthropic-messages" ? "2026-08-25T12:01:00Z" : "2s",
+      ]);
+      const oppositeRateHeaders =
+        requested === "anthropic-messages"
+          ? [
+              "x-ratelimit-limit-requests",
+              "x-ratelimit-remaining-requests",
+              "x-ratelimit-reset-requests",
+              "x-ratelimit-limit-tokens",
+              "x-ratelimit-remaining-tokens",
+              "x-ratelimit-reset-tokens",
+            ]
+          : [
+              "anthropic-ratelimit-requests-limit",
+              "anthropic-ratelimit-requests-remaining",
+              "anthropic-ratelimit-requests-reset",
+              "anthropic-ratelimit-tokens-limit",
+              "anthropic-ratelimit-tokens-remaining",
+              "anthropic-ratelimit-tokens-reset",
+            ];
+      expect(oppositeRateHeaders.every((name) => !result.response.headers.has(name))).toBe(true);
       expect(result.attempt.state).toBe("FAILED");
       expectConservativeAccounting(result);
-      expectAdapterTelemetry(result, "adapted", requested, native);
+      expectAdapterTelemetry(result, mode, requested, native);
     },
   );
 });

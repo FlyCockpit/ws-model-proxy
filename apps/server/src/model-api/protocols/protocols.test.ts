@@ -263,7 +263,7 @@ describe("non-stream protocol responses", () => {
     if (parsed.ok) throw new Error("expected error");
     expect(renderProtocolError("openai-responses", parsed.error)).toEqual({
       error: {
-        message: "slow down",
+        message: "The provider rate limit was exceeded.",
         type: "rate_limit_error",
         param: null,
         code: "rate_limit_error",

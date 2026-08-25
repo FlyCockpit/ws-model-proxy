@@ -154,7 +154,10 @@ describe("strict non-stream response parsing", () => {
         "retry-after": "2",
         "anthropic-ratelimit-requests-limit": "10",
         "anthropic-ratelimit-requests-remaining": "3",
-        "anthropic-ratelimit-requests-reset": "soon",
+        "anthropic-ratelimit-requests-reset": "2s",
+        "anthropic-ratelimit-tokens-limit": "100",
+        "anthropic-ratelimit-tokens-remaining": "80",
+        "anthropic-ratelimit-tokens-reset": "3s",
       }),
       body: {
         type: "error",
@@ -163,19 +166,73 @@ describe("strict non-stream response parsing", () => {
       },
     });
     if (parsed.ok) throw new Error("expected error");
-    expect(parsed.error.requestId).toBe("body");
+    expect(parsed.error.requestId).toBe("header");
     expect(renderProtocolError("openai-responses", parsed.error)).toMatchObject({
-      error: { type: "server_error", code: "overloaded_error" },
+      error: { type: "server_error", code: "upstream_error" },
     });
     const metadata = renderProtocolErrorMetadata("anthropic-messages", parsed.error);
     expect(Object.fromEntries(metadata.headers)).toMatchObject({
-      "request-id": "body",
+      "request-id": "header",
       "retry-after": "2",
       "anthropic-ratelimit-requests-limit": "10",
       "anthropic-ratelimit-requests-remaining": "3",
-      "anthropic-ratelimit-requests-reset": "soon",
+      "anthropic-ratelimit-requests-reset": "2s",
+      "anthropic-ratelimit-tokens-limit": "100",
+      "anthropic-ratelimit-tokens-remaining": "80",
+      "anthropic-ratelimit-tokens-reset": "3s",
     });
     expect(metadata.headers.has("x-request-id")).toBe(false);
+    const openAiMetadata = renderProtocolErrorMetadata("openai-chat", parsed.error);
+    expect(Object.fromEntries(openAiMetadata.headers)).toMatchObject({
+      "x-request-id": "header",
+      "retry-after": "2",
+      "x-ratelimit-limit-requests": "10",
+      "x-ratelimit-remaining-requests": "3",
+      "x-ratelimit-reset-requests": "2s",
+      "x-ratelimit-limit-tokens": "100",
+      "x-ratelimit-remaining-tokens": "80",
+      "x-ratelimit-reset-tokens": "3s",
+    });
+    expect(openAiMetadata.headers.has("request-id")).toBe(false);
+  });
+
+  it("never reflects provider-controlled error text, code, or parameter", () => {
+    const parsed = parseProtocolResponse({
+      surface: "openai-chat",
+      status: 400,
+      body: {
+        error: {
+          type: "private_type",
+          code: "tenant-secret-code",
+          param: "tenant-other.internal_id",
+          message: "api-key-secret at http://10.0.0.7/private",
+        },
+      },
+    });
+    if (parsed.ok) throw new Error("expected error");
+    expect(renderProtocolError("openai-responses", parsed.error)).toEqual({
+      error: {
+        message: "The provider rejected the request.",
+        type: "invalid_request_error",
+        param: null,
+        code: "invalid_request_error",
+      },
+    });
+  });
+
+  it("preserves 529 overload status semantics without reflecting provider text", () => {
+    const parsed = parseProtocolResponse({
+      surface: "anthropic-messages",
+      status: 529,
+      body: {
+        type: "error",
+        error: { type: "private-overload-code", message: "internal overload host 10.0.0.9" },
+      },
+    });
+    if (parsed.ok) throw new Error("expected error");
+    expect(renderProtocolError("anthropic-messages", parsed.error)).toMatchObject({
+      error: { type: "overloaded_error", message: "The provider is overloaded." },
+    });
   });
 });
 
