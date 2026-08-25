@@ -1,31 +1,88 @@
+import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
-import { AlertTriangle, KeyRound, Plus, RefreshCw, ShieldCheck } from "lucide-react";
-import type { ReactNode } from "react";
-import { useMemo, useState } from "react";
+import {
+  AlertTriangle,
+  KeyRound,
+  Plus,
+  Power,
+  RefreshCw,
+  ShieldCheck,
+  Trash2,
+  Wrench,
+} from "lucide-react";
+import {
+  cloneElement,
+  isValidElement,
+  type ReactElement,
+  type ReactNode,
+  useId,
+  useMemo,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
+import { z } from "zod";
 
 import { InlineRetry } from "@/components/inline-retry";
 import { WideContent } from "@/components/wide-content";
 import { orpc } from "@/utils/orpc";
 
-const dateTime = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
-const showDate = (value: Date | string | null | undefined) =>
-  value ? dateTime.format(new Date(value)) : "—";
 const showValue = (value: unknown) => (value === null || value === undefined ? "—" : String(value));
 
+const accountFormSchema = z.object({
+  providerType: z
+    .string()
+    .trim()
+    .toLowerCase()
+    .regex(/^[a-z][a-z0-9_-]{0,63}$/u),
+  label: z.string().trim().min(1).max(120),
+  baseUrl: z.string().url().max(2048),
+  authType: z.enum(["API_KEY", "BEARER"]),
+});
+const credentialFormSchema = z.object({ credential: z.string().min(1).max(16_384) });
+const createModelFormSchema = z.object({
+  upstreamModelId: z.string().trim().min(1).max(255),
+  displayName: z.string().trim().max(255),
+});
+const optionalPositiveInteger = z.union([z.literal(""), z.string().regex(/^[1-9]\d*$/u)]);
+const updateModelFormSchema = z.object({
+  displayName: z.string().trim().max(255),
+  contextWindow: optionalPositiveInteger,
+  maxOutputTokens: optionalPositiveInteger,
+  concurrencyLimit: optionalPositiveInteger,
+});
+const moneyRateSchema = z.string().regex(/^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/u);
+const pricingFormSchema = z.object({
+  version: z.string().trim().min(1).max(128),
+  currency: z
+    .string()
+    .trim()
+    .toUpperCase()
+    .regex(/^[A-Z]{3}$/u),
+  input: moneyRateSchema,
+  output: moneyRateSchema,
+});
+
 export function ProviderOperationsSection() {
-  const { t } = useTranslation(["common", "dashboard"]);
+  const { t, i18n } = useTranslation(["common", "dashboard"]);
+  const dateTime = useMemo(
+    () => new Intl.DateTimeFormat(i18n.language, { dateStyle: "medium", timeStyle: "short" }),
+    [i18n.language],
+  );
+  const showDate = (value: Date | string | null | undefined) =>
+    value ? dateTime.format(new Date(value)) : "—";
   const queryClient = useQueryClient();
   const accounts = useQuery({
     ...orpc.providerManagement.listAccounts.queryOptions(),
     retry: false,
   });
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [deleteAccountArmed, setDeleteAccountArmed] = useState(false);
+  const [deleteModelArmed, setDeleteModelArmed] = useState<string | null>(null);
   const selected =
     accounts.data?.find((account) => account.id === selectedId) ?? accounts.data?.[0];
   const accountId = selected?.id ?? "";
@@ -48,8 +105,16 @@ export function ProviderOperationsSection() {
     enabled: Boolean(accountId),
     retry: false,
   });
+  const [usageCursor, setUsageCursor] = useState<{ createdAt: Date; id: string } | undefined>();
   const usage = useQuery({
-    ...orpc.providerManagement.listUsageReport.queryOptions({
+    ...orpc.providerManagement.listUsageReportPage.queryOptions({
+      input: { providerAccountId: accountId, limit: 50, cursor: usageCursor },
+    }),
+    enabled: Boolean(accountId),
+    retry: false,
+  });
+  const usageTotals = useQuery({
+    ...orpc.providerManagement.getUsageTotals.queryOptions({
       input: { providerAccountId: accountId, limit: 50 },
     }),
     enabled: Boolean(accountId),
@@ -69,14 +134,14 @@ export function ProviderOperationsSection() {
     enabled: Boolean(accountId),
     retry: false,
   });
-  const [accountDraft, setAccountDraft] = useState({
-    label: "",
-    providerType: "openai",
-    baseUrl: "https://api.openai.com/v1",
-    authType: "BEARER" as "API_KEY" | "BEARER",
+  const [attemptCursor, setAttemptCursor] = useState<{ createdAt: Date; id: string } | undefined>();
+  const attemptStates = useQuery({
+    ...orpc.providerManagement.listProviderAttempts.queryOptions({
+      input: { providerAccountId: accountId, limit: 50, cursor: attemptCursor },
+    }),
+    enabled: Boolean(accountId),
+    retry: false,
   });
-  const [secret, setSecret] = useState("");
-  const [modelDraft, setModelDraft] = useState({ upstreamModelId: "", displayName: "" });
   const [selectedModelId, setSelectedModelId] = useState("");
   const activeModelId = models.data?.some((model) => model.id === selectedModelId)
     ? selectedModelId
@@ -88,10 +153,20 @@ export function ProviderOperationsSection() {
     enabled: Boolean(activeModelId),
     retry: false,
   });
+  const activePricing = pricing.data?.find((row) => row.status === "ACTIVE");
   const policies = useQuery({
     ...orpc.providerManagement.listBudgetPolicies.queryOptions(),
     retry: false,
   });
+  const pools = useQuery({
+    ...orpc.forwarderManagement.listModelPools.queryOptions(),
+    retry: false,
+  });
+  const modelApiTokens = useQuery({
+    ...orpc.modelApiTokens.list.queryOptions({ input: { includeRevoked: false, limit: 100 } }),
+    retry: false,
+  });
+  const [attachmentDraft, setAttachmentDraft] = useState({ poolId: "", publicOrder: "0" });
   const [pricingDraft, setPricingDraft] = useState({
     version: "",
     currency: "USD",
@@ -99,18 +174,66 @@ export function ProviderOperationsSection() {
     output: "",
   });
   const [limits, setLimits] = useState({
+    concurrencyMode: "LIMITED" as "LIMITED" | "UNLIMITED",
     concurrency: "1",
-    tokens: "100000",
-    spend: "10",
-    unlimited: false,
+    tokenAttemptMode: "LIMITED" as "LIMITED" | "UNLIMITED",
+    tokenAttempt: "100000",
+    tokenDayMode: "LIMITED" as "LIMITED" | "UNLIMITED",
+    tokenDay: "1000000",
+    tokenMonthMode: "LIMITED" as "LIMITED" | "UNLIMITED",
+    tokenMonth: "10000000",
+    tokenLifetimeMode: "UNLIMITED" as "LIMITED" | "UNLIMITED",
+    tokenLifetime: "100000000",
+    spendDayMode: "LIMITED" as "LIMITED" | "UNLIMITED",
+    spendDay: "10",
+    spendMonthMode: "LIMITED" as "LIMITED" | "UNLIMITED",
+    spendMonth: "100",
   });
-  const invalidate = () =>
-    queryClient.invalidateQueries({ queryKey: orpc.providerManagement.key() });
+  const positiveInteger = /^[1-9]\d*$/u;
+  const moneyRate = /^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/u;
+  const limitsValid =
+    [
+      [limits.concurrencyMode, limits.concurrency],
+      [limits.tokenAttemptMode, limits.tokenAttempt],
+      [limits.tokenDayMode, limits.tokenDay],
+      [limits.tokenMonthMode, limits.tokenMonth],
+      [limits.tokenLifetimeMode, limits.tokenLifetime],
+    ].every(([mode, value]) => mode === "UNLIMITED" || positiveInteger.test(value)) &&
+    [
+      [limits.spendDayMode, limits.spendDay],
+      [limits.spendMonthMode, limits.spendMonth],
+    ].every(
+      ([mode, value]) => mode === "UNLIMITED" || (moneyRate.test(value) && Number(value) > 0),
+    );
+  const budgetRules = (currency: string | null) =>
+    [
+      ["CONCURRENCY", "PER_ATTEMPT", limits.concurrencyMode, limits.concurrency, null],
+      ["TOKENS", "PER_ATTEMPT", limits.tokenAttemptMode, limits.tokenAttempt, null],
+      ["TOKENS", "UTC_DAY", limits.tokenDayMode, limits.tokenDay, null],
+      ["TOKENS", "UTC_MONTH", limits.tokenMonthMode, limits.tokenMonth, null],
+      ["TOKENS", "LIFETIME", limits.tokenLifetimeMode, limits.tokenLifetime, null],
+      ["SPEND", "UTC_DAY", limits.spendDayMode, limits.spendDay, currency],
+      ["SPEND", "UTC_MONTH", limits.spendMonthMode, limits.spendMonth, currency],
+    ].map(([metric, period, mode, value, ruleCurrency]) => ({
+      metric: metric as "CONCURRENCY" | "TOKENS" | "SPEND",
+      period: period as "PER_ATTEMPT" | "UTC_DAY" | "UTC_MONTH" | "LIFETIME",
+      mode: mode as "LIMITED" | "UNLIMITED",
+      limitValue: mode === "UNLIMITED" ? null : value,
+      currency: metric === "SPEND" ? ruleCurrency : null,
+    }));
+  const invalidate = async () => {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: orpc.providerManagement.key() }),
+      queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() }),
+    ]);
+  };
   const createAccount = useMutation(
     orpc.providerManagement.createAccount.mutationOptions({
       onSuccess: (account) => {
         setSelectedId(account.id);
-        setAccountDraft((value) => ({ ...value, label: "" }));
+        setUsageCursor(undefined);
+        setAttemptCursor(undefined);
+        accountForm.reset({ ...accountForm.state.values, label: "" });
         invalidate();
         toast.success(t("dashboard:providers.feedback.accountCreated"));
       },
@@ -120,7 +243,7 @@ export function ProviderOperationsSection() {
   const saveCredential = useMutation(
     orpc.providerManagement.createCredential.mutationOptions({
       onSuccess: () => {
-        setSecret("");
+        credentialForm.reset();
         invalidate();
         toast.success(t("dashboard:providers.feedback.credentialSaved"));
       },
@@ -130,7 +253,7 @@ export function ProviderOperationsSection() {
   const replaceCredential = useMutation(
     orpc.providerManagement.replaceCredential.mutationOptions({
       onSuccess: () => {
-        setSecret("");
+        credentialForm.reset();
         invalidate();
         toast.success(t("dashboard:providers.feedback.credentialReplaced"));
       },
@@ -140,7 +263,7 @@ export function ProviderOperationsSection() {
   const createModel = useMutation(
     orpc.providerManagement.createModel.mutationOptions({
       onSuccess: () => {
-        setModelDraft({ upstreamModelId: "", displayName: "" });
+        createModelForm.reset();
         invalidate();
         toast.success(t("dashboard:providers.feedback.modelCreated"));
       },
@@ -175,6 +298,12 @@ export function ProviderOperationsSection() {
       onError: () => toast.error(t("dashboard:providers.feedback.failed")),
     }),
   );
+  const updatePricing = useMutation(
+    orpc.providerManagement.updatePricingVersion.mutationOptions({
+      onSuccess: () => invalidate(),
+      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+    }),
+  );
   const createBudget = useMutation(
     orpc.providerManagement.createBudgetPolicy.mutationOptions({
       onSuccess: () => {
@@ -184,12 +313,139 @@ export function ProviderOperationsSection() {
       onError: () => toast.error(t("dashboard:providers.feedback.failed")),
     }),
   );
-  const reportPending = usage.isPending || budgets.isPending || attempts.isPending;
-  const credentialActive = credentials.data?.find((item) => item.status === "ACTIVE");
-  const spend = useMemo(
-    () => usage.data?.reduce((sum, row) => sum + Number(row.settledCost ?? 0), 0) ?? 0,
-    [usage.data],
+  const setAccountEnabled = useMutation(
+    orpc.providerManagement.setAccountEnabled.mutationOptions({
+      onSuccess: () => invalidate(),
+      onError: () => toast.error(t("dashboard:providers.feedback.enableFailed")),
+    }),
   );
+  const updateModel = useMutation(
+    orpc.providerManagement.updateModel.mutationOptions({
+      onSuccess: () => invalidate(),
+      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+    }),
+  );
+  const deleteAccount = useMutation(
+    orpc.providerManagement.deleteAccount.mutationOptions({
+      onSuccess: () => {
+        setSelectedId(null);
+        credentialForm.reset();
+        setUsageCursor(undefined);
+        setAttemptCursor(undefined);
+        invalidate();
+      },
+      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+    }),
+  );
+  const deleteModel = useMutation(
+    orpc.providerManagement.deleteModel.mutationOptions({
+      onSuccess: () => invalidate(),
+      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+    }),
+  );
+  const revokeCredential = useMutation(
+    orpc.providerManagement.revokeCredential.mutationOptions({
+      onSuccess: () => invalidate(),
+      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+    }),
+  );
+  const retirePricing = useMutation(
+    orpc.providerManagement.retirePricingVersion.mutationOptions({
+      onSuccess: () => invalidate(),
+      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+    }),
+  );
+  const deletePricing = useMutation(
+    orpc.providerManagement.deletePricingVersion.mutationOptions({
+      onSuccess: () => invalidate(),
+      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+    }),
+  );
+  const deactivateBudget = useMutation(
+    orpc.providerManagement.deactivateBudgetPolicy.mutationOptions({
+      onSuccess: () => invalidate(),
+      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+    }),
+  );
+  const replaceBudget = useMutation(
+    orpc.providerManagement.replaceBudgetPolicy.mutationOptions({
+      onSuccess: () => invalidate(),
+      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+    }),
+  );
+  const repairAttempts = useMutation(
+    orpc.providerManagement.repairExpiredAttempts.mutationOptions({
+      onSuccess: ({ repaired }) => {
+        invalidate();
+        toast.success(t("dashboard:providers.feedback.repaired", { count: repaired }));
+      },
+      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+    }),
+  );
+  const updatePool = useMutation(
+    orpc.forwarderManagement.updateModelPool.mutationOptions({
+      onSuccess: () => invalidate(),
+      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+    }),
+  );
+  const addPoolMember = useMutation(
+    orpc.forwarderManagement.addProviderPoolMember.mutationOptions({
+      onSuccess: () => invalidate(),
+      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+    }),
+  );
+  const reorderPoolMember = useMutation(
+    orpc.forwarderManagement.reorderProviderPoolMember.mutationOptions({
+      onSuccess: () => invalidate(),
+      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+    }),
+  );
+  const removePoolMember = useMutation(
+    orpc.forwarderManagement.removePoolMember.mutationOptions({
+      onSuccess: () => invalidate(),
+      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+    }),
+  );
+  const credentialActive = credentials.data?.find((item) => item.status === "ACTIVE");
+  const accountForm = useForm({
+    defaultValues: {
+      label: "",
+      providerType: "openai",
+      baseUrl: "https://api.openai.com/v1",
+      authType: "BEARER" as "API_KEY" | "BEARER",
+    },
+    validators: { onSubmit: accountFormSchema },
+    onSubmit: async ({ value }) => {
+      await createAccount.mutateAsync({ ...value, safeConfiguration: null });
+    },
+  });
+  const credentialForm = useForm({
+    defaultValues: { credential: "" },
+    validators: { onSubmit: credentialFormSchema },
+    onSubmit: async ({ value }) => {
+      const action = credentialActive ? replaceCredential : saveCredential;
+      await action.mutateAsync({ providerAccountId: accountId, credential: value.credential });
+    },
+  });
+  const createModelForm = useForm({
+    defaultValues: { upstreamModelId: "", displayName: "" },
+    validators: { onSubmit: createModelFormSchema },
+    onSubmit: async ({ value }) => {
+      await createModel.mutateAsync({
+        providerAccountId: accountId,
+        upstreamModelId: value.upstreamModelId,
+        displayName: value.displayName || null,
+        capabilityMetadata: null,
+        nativeCapabilities: null,
+        contextWindow: null,
+        maxOutputTokens: null,
+        concurrencyLimit: null,
+        pricingMetadata: null,
+        pricingVersion: null,
+        enabled: false,
+      });
+    },
+  });
 
   if (accounts.isPending) return <Skeleton className="mt-8 h-80 w-full" />;
   if (accounts.isError)
@@ -216,39 +472,42 @@ export function ProviderOperationsSection() {
         className="mt-6 grid gap-3 rounded-xl border bg-muted/20 p-4 md:grid-cols-2 xl:grid-cols-5"
         onSubmit={(event) => {
           event.preventDefault();
-          createAccount.mutate({ ...accountDraft, safeConfiguration: null });
+          accountForm.handleSubmit();
         }}
       >
-        <Field label={t("dashboard:providers.fields.label")}>
-          <Input
-            required
-            value={accountDraft.label}
-            onChange={(e) => setAccountDraft({ ...accountDraft, label: e.target.value })}
-          />
-        </Field>
-        <Field label={t("dashboard:providers.fields.type")}>
-          <Input
-            required
-            value={accountDraft.providerType}
-            onChange={(e) =>
-              setAccountDraft({ ...accountDraft, providerType: e.target.value.toLowerCase() })
-            }
-          />
-        </Field>
-        <Field label={t("dashboard:providers.fields.baseUrl")} className="md:col-span-2">
-          <Input
-            required
-            type="url"
-            value={accountDraft.baseUrl}
-            onChange={(e) => setAccountDraft({ ...accountDraft, baseUrl: e.target.value })}
-          />
-        </Field>
-        <div className="flex items-end">
-          <Button
-            className="w-full"
-            size="touch"
-            disabled={!accountDraft.label.trim() || createAccount.isPending}
-          >
+        {(["label", "providerType", "baseUrl"] as const).map((name) => (
+          <accountForm.Field key={name} name={name}>
+            {(field) => (
+              <Field
+                label={t(`dashboard:providers.fields.${name === "providerType" ? "type" : name}`)}
+                className={name === "baseUrl" ? "md:col-span-2" : undefined}
+              >
+                <Input
+                  type={name === "baseUrl" ? "url" : "text"}
+                  value={field.state.value}
+                  onBlur={field.handleBlur}
+                  onChange={(event) => field.handleChange(event.target.value)}
+                />
+              </Field>
+            )}
+          </accountForm.Field>
+        ))}
+        <accountForm.Field name="authType">
+          {(field) => (
+            <Field label={t("dashboard:providers.fields.authType")}>
+              <select
+                className="h-11 w-full rounded-md border bg-background px-3 text-base sm:text-sm"
+                value={field.state.value}
+                onChange={(event) => field.handleChange(event.target.value as "API_KEY" | "BEARER")}
+              >
+                <option value="BEARER">{t("dashboard:providers.enums.BEARER")}</option>
+                <option value="API_KEY">{t("dashboard:providers.enums.API_KEY")}</option>
+              </select>
+            </Field>
+          )}
+        </accountForm.Field>
+        <div className="flex items-end md:col-span-2 xl:col-span-1">
+          <Button className="w-full" size="touch" disabled={createAccount.isPending}>
             <Plus className="size-4" /> {t("dashboard:providers.actions.addAccount")}
           </Button>
         </div>
@@ -265,12 +524,21 @@ export function ProviderOperationsSection() {
               <button
                 type="button"
                 key={account.id}
-                onClick={() => setSelectedId(account.id)}
+                onClick={() => {
+                  setSelectedId(account.id);
+                  credentialForm.reset();
+                  createModelForm.reset();
+                  setSelectedModelId("");
+                  setUsageCursor(undefined);
+                  setAttemptCursor(undefined);
+                  setDeleteAccountArmed(false);
+                  setDeleteModelArmed(null);
+                }}
                 className={`min-h-11 w-full rounded-xl border px-3 py-2 text-start focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${selected?.id === account.id ? "border-primary bg-primary/5" : "hover:bg-muted/50"}`}
               >
                 <span className="block truncate text-sm font-medium">{account.label}</span>
                 <span className="mt-1 block truncate text-xs text-muted-foreground">
-                  {account.providerType} · {account.healthStatus}
+                  {account.providerType} · {t(`dashboard:providers.enums.${account.healthStatus}`)}
                 </span>
               </button>
             ))}
@@ -287,29 +555,72 @@ export function ProviderOperationsSection() {
                     })}
                   </p>
                 </div>
-                <Button
-                  variant="outline"
-                  size="touch"
-                  disabled={!credentialActive || testCredential.isPending}
-                  onClick={() => testCredential.mutate({ providerAccountId: selected.id })}
-                >
-                  <RefreshCw className="size-4" /> {t("dashboard:providers.actions.test")}
-                </Button>
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    variant="outline"
+                    size="touch"
+                    disabled={!credentialActive || testCredential.isPending}
+                    onClick={() => testCredential.mutate({ providerAccountId: selected.id })}
+                  >
+                    <RefreshCw className="size-4" /> {t("dashboard:providers.actions.test")}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="touch"
+                    disabled={setAccountEnabled.isPending}
+                    onClick={() =>
+                      setAccountEnabled.mutate({ id: selected.id, enabled: !selected.enabled })
+                    }
+                  >
+                    <Power className="size-4" />
+                    {selected.enabled
+                      ? t("dashboard:providers.actions.disable")
+                      : t("dashboard:providers.actions.enable")}
+                  </Button>
+                  <Button
+                    variant="destructive"
+                    size="touch"
+                    disabled={deleteAccount.isPending}
+                    onClick={() => {
+                      if (deleteAccountArmed) deleteAccount.mutate({ id: selected.id });
+                      else setDeleteAccountArmed(true);
+                    }}
+                    aria-label={t("dashboard:providers.actions.deleteAccount", {
+                      label: selected.label,
+                    })}
+                  >
+                    <Trash2 className="size-4" />
+                    {deleteAccountArmed
+                      ? t("dashboard:providers.actions.confirmDelete")
+                      : t("dashboard:providers.actions.delete")}
+                  </Button>
+                </div>
               </div>
+
+              <UpdateAccountForm
+                key={`account-${selected.id}-${selected.updatedAt.toString()}`}
+                account={selected}
+                authTypeLocked={Boolean(credentials.data?.length)}
+              />
 
               <div className="grid gap-6 lg:grid-cols-2">
                 <form
                   className="min-w-0 space-y-3"
                   onSubmit={(event) => {
                     event.preventDefault();
-                    const action = credentialActive ? replaceCredential : saveCredential;
-                    action.mutate({ providerAccountId: selected.id, credential: secret });
+                    credentialForm.handleSubmit();
                   }}
                 >
                   <h3 className="flex items-center gap-2 font-medium">
                     <KeyRound className="size-4" />
                     {t("dashboard:providers.credentials")}
                   </h3>
+                  {credentials.isError ? (
+                    <InlineRetry
+                      message={t("dashboard:providers.credentialsFailed")}
+                      onRetry={credentials.refetch}
+                    />
+                  ) : null}
                   <p className="text-sm text-muted-foreground">
                     {credentialActive
                       ? t("dashboard:providers.activeSuffix", {
@@ -322,67 +633,72 @@ export function ProviderOperationsSection() {
                       ? t("dashboard:providers.fields.replacementSecret")
                       : t("dashboard:providers.fields.secret")}
                   </Label>
-                  <Input
-                    id="provider-secret"
-                    type="password"
-                    autoComplete="new-password"
-                    required
-                    value={secret}
-                    onChange={(event) => setSecret(event.target.value)}
-                  />
+                  <credentialForm.Field name="credential">
+                    {(field) => (
+                      <Input
+                        id="provider-secret"
+                        type="password"
+                        autoComplete="new-password"
+                        value={field.state.value}
+                        onBlur={field.handleBlur}
+                        onChange={(event) => field.handleChange(event.target.value)}
+                      />
+                    )}
+                  </credentialForm.Field>
                   <p className="text-xs text-muted-foreground">
                     {t("dashboard:providers.secretNeverShown")}
                   </p>
                   <Button
                     size="touch"
-                    disabled={!secret || saveCredential.isPending || replaceCredential.isPending}
+                    disabled={saveCredential.isPending || replaceCredential.isPending}
                   >
                     {credentialActive
                       ? t("dashboard:providers.actions.replaceCredential")
                       : t("dashboard:providers.actions.saveCredential")}
                   </Button>
+                  {credentialActive ? (
+                    <Button
+                      type="button"
+                      size="touch"
+                      variant="outline"
+                      disabled={revokeCredential.isPending}
+                      onClick={() => revokeCredential.mutate({ id: credentialActive.id })}
+                    >
+                      {t("dashboard:providers.actions.revokeCredential")}
+                    </Button>
+                  ) : null}
                 </form>
                 <form
                   className="min-w-0 space-y-3"
                   onSubmit={(event) => {
                     event.preventDefault();
-                    createModel.mutate({
-                      providerAccountId: selected.id,
-                      upstreamModelId: modelDraft.upstreamModelId,
-                      displayName: modelDraft.displayName || null,
-                      capabilityMetadata: null,
-                      nativeCapabilities: null,
-                      contextWindow: null,
-                      maxOutputTokens: null,
-                      concurrencyLimit: null,
-                      pricingMetadata: null,
-                      pricingVersion: null,
-                      enabled: false,
-                    });
+                    createModelForm.handleSubmit();
                   }}
                 >
                   <h3 className="font-medium">{t("dashboard:providers.models")}</h3>
-                  <Field label={t("dashboard:providers.fields.upstreamModel")}>
-                    <Input
-                      required
-                      value={modelDraft.upstreamModelId}
-                      onChange={(event) =>
-                        setModelDraft({ ...modelDraft, upstreamModelId: event.target.value })
-                      }
-                    />
-                  </Field>
-                  <Field label={t("dashboard:providers.fields.displayName")}>
-                    <Input
-                      value={modelDraft.displayName}
-                      onChange={(event) =>
-                        setModelDraft({ ...modelDraft, displayName: event.target.value })
-                      }
-                    />
-                  </Field>
-                  <Button
-                    size="touch"
-                    disabled={!modelDraft.upstreamModelId.trim() || createModel.isPending}
-                  >
+                  <createModelForm.Field name="upstreamModelId">
+                    {(field) => (
+                      <Field label={t("dashboard:providers.fields.upstreamModel")}>
+                        <Input
+                          value={field.state.value}
+                          onBlur={field.handleBlur}
+                          onChange={(event) => field.handleChange(event.target.value)}
+                        />
+                      </Field>
+                    )}
+                  </createModelForm.Field>
+                  <createModelForm.Field name="displayName">
+                    {(field) => (
+                      <Field label={t("dashboard:providers.fields.displayName")}>
+                        <Input
+                          value={field.state.value}
+                          onBlur={field.handleBlur}
+                          onChange={(event) => field.handleChange(event.target.value)}
+                        />
+                      </Field>
+                    )}
+                  </createModelForm.Field>
+                  <Button size="touch" disabled={createModel.isPending}>
                     <Plus className="size-4" />
                     {t("dashboard:providers.actions.addModel")}
                   </Button>
@@ -391,26 +707,75 @@ export function ProviderOperationsSection() {
 
               <div className="min-w-0">
                 <h3 className="font-medium">{t("dashboard:providers.configuredModels")}</h3>
+                {models.isError ? (
+                  <InlineRetry
+                    message={t("dashboard:providers.modelsFailed")}
+                    onRetry={models.refetch}
+                  />
+                ) : null}
                 <div className="mt-3 divide-y rounded-xl border">
                   {models.data?.map((model) => (
-                    <div
-                      key={model.id}
-                      className="flex min-w-0 items-center justify-between gap-3 p-3"
-                    >
-                      <div className="min-w-0">
-                        <p className="truncate text-sm font-medium">
-                          {model.displayName || model.upstreamModelId}
-                        </p>
-                        <p className="truncate text-xs text-muted-foreground">
-                          {model.pricingVersion || t("dashboard:providers.noActivePricing")} ·{" "}
-                          {model.healthStatus}
-                        </p>
+                    <div key={model.id} className="min-w-0 p-3">
+                      <div className="flex min-w-0 items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-medium">
+                            {model.displayName || model.upstreamModelId}
+                          </p>
+                          <p className="truncate text-xs text-muted-foreground">
+                            {model.pricingVersion || t("dashboard:providers.noActivePricing")} ·{" "}
+                            {t(`dashboard:providers.enums.${model.healthStatus}`)}
+                          </p>
+                        </div>
+                        <div className="flex shrink-0 flex-wrap gap-2">
+                          <Button
+                            type="button"
+                            size="touch"
+                            variant="outline"
+                            disabled={updateModel.isPending}
+                            onClick={() =>
+                              updateModel.mutate({ id: model.id, enabled: !model.enabled })
+                            }
+                          >
+                            {model.enabled
+                              ? t("dashboard:providers.actions.disable")
+                              : t("dashboard:providers.actions.enable")}
+                          </Button>
+                          <Button
+                            type="button"
+                            size="touch"
+                            variant={deleteModelArmed === model.id ? "destructive" : "ghost"}
+                            disabled={deleteModel.isPending}
+                            onClick={() => {
+                              if (deleteModelArmed === model.id)
+                                deleteModel.mutate({ id: model.id });
+                              else setDeleteModelArmed(model.id);
+                            }}
+                            aria-label={
+                              deleteModelArmed === model.id
+                                ? t("dashboard:providers.actions.confirmDeleteModel", {
+                                    label: model.displayName || model.upstreamModelId,
+                                  })
+                                : t("dashboard:providers.actions.deleteModel", {
+                                    label: model.displayName || model.upstreamModelId,
+                                  })
+                            }
+                          >
+                            <Trash2 className="size-4" />
+                            {deleteModelArmed === model.id ? (
+                              <span>{t("dashboard:providers.actions.confirmDelete")}</span>
+                            ) : null}
+                          </Button>
+                        </div>
                       </div>
-                      <span className="text-xs text-muted-foreground">
-                        {model.enabled
-                          ? t("dashboard:providers.enabled")
-                          : t("dashboard:providers.disabled")}
-                      </span>
+                      <details className="mt-3">
+                        <summary className="min-h-11 cursor-pointer py-3 text-sm font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                          {t("dashboard:providers.actions.editModel")}
+                        </summary>
+                        <UpdateModelForm
+                          key={`model-${model.id}-${model.updatedAt.toString()}`}
+                          model={model}
+                        />
+                      </details>
                     </div>
                   ))}
                   {!models.data?.length ? (
@@ -452,6 +817,12 @@ export function ProviderOperationsSection() {
                     }}
                   >
                     <h3 className="font-medium">{t("dashboard:providers.pricing")}</h3>
+                    {pricing.isError ? (
+                      <InlineRetry
+                        message={t("dashboard:providers.pricingFailed")}
+                        onRetry={pricing.refetch}
+                      />
+                    ) : null}
                     <select
                       className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
                       value={activeModelId}
@@ -530,18 +901,65 @@ export function ProviderOperationsSection() {
                               {row.version} · {row.currency}
                             </p>
                             <p className="text-xs text-muted-foreground">
-                              {row.status} · {row.accountingVersion}
+                              {t(`dashboard:providers.enums.${row.status}`)} ·{" "}
+                              {row.accountingVersion}
                             </p>
                           </div>
                           {row.status === "DRAFT" ? (
+                            <div className="flex flex-wrap gap-2">
+                              <Button
+                                type="button"
+                                size="touch"
+                                variant="outline"
+                                disabled={
+                                  updatePricing.isPending ||
+                                  !pricingDraft.input ||
+                                  !pricingDraft.output
+                                }
+                                onClick={() =>
+                                  updatePricing.mutate({
+                                    id: row.id,
+                                    currency: pricingDraft.currency,
+                                    ratesPerMillion: {
+                                      input: pricingDraft.input,
+                                      output: pricingDraft.output,
+                                    },
+                                  })
+                                }
+                              >
+                                {t("dashboard:providers.actions.updateDraft")}
+                              </Button>
+                              <Button
+                                type="button"
+                                size="touch"
+                                variant="outline"
+                                disabled={activatePricing.isPending}
+                                onClick={() => activatePricing.mutate({ id: row.id })}
+                              >
+                                {t("dashboard:providers.actions.activate")}
+                              </Button>
+                              <Button
+                                type="button"
+                                size="touch"
+                                variant="ghost"
+                                disabled={deletePricing.isPending}
+                                onClick={() => deletePricing.mutate({ id: row.id })}
+                                aria-label={t("dashboard:providers.actions.deletePricing", {
+                                  version: row.version,
+                                })}
+                              >
+                                <Trash2 className="size-4" />
+                              </Button>
+                            </div>
+                          ) : row.status === "ACTIVE" ? (
                             <Button
                               type="button"
-                              size="sm"
+                              size="touch"
                               variant="outline"
-                              disabled={activatePricing.isPending}
-                              onClick={() => activatePricing.mutate({ id: row.id })}
+                              disabled={retirePricing.isPending}
+                              onClick={() => retirePricing.mutate({ id: row.id })}
                             >
-                              {t("dashboard:providers.actions.activate")}
+                              {t("dashboard:providers.actions.retire")}
                             </Button>
                           ) : null}
                         </div>
@@ -552,99 +970,79 @@ export function ProviderOperationsSection() {
                     className="min-w-0 space-y-3"
                     onSubmit={(event) => {
                       event.preventDefault();
-                      const unlimited = limits.unlimited;
                       createBudget.mutate({
                         scopeType: "PROVIDER_ACCOUNT",
                         providerAccountId: selected.id,
                         poolId: null,
                         providerModelId: null,
                         active: true,
-                        rules: [
-                          {
-                            metric: "CONCURRENCY",
-                            period: "PER_ATTEMPT",
-                            mode: unlimited ? "UNLIMITED" : "LIMITED",
-                            limitValue: unlimited ? null : limits.concurrency,
-                            currency: null,
-                          },
-                          {
-                            metric: "TOKENS",
-                            period: "UTC_DAY",
-                            mode: unlimited ? "UNLIMITED" : "LIMITED",
-                            limitValue: unlimited ? null : limits.tokens,
-                            currency: null,
-                          },
-                          {
-                            metric: "SPEND",
-                            period: "UTC_MONTH",
-                            mode: unlimited ? "UNLIMITED" : "LIMITED",
-                            limitValue: unlimited ? null : limits.spend,
-                            currency: "USD",
-                          },
-                        ],
+                        rules: budgetRules(activePricing?.currency ?? null),
                       });
                     }}
                   >
                     <h3 className="font-medium">{t("dashboard:providers.budgets")}</h3>
-                    <label className="flex min-h-11 items-center gap-3 rounded-md border px-3">
-                      <input
-                        type="checkbox"
-                        checked={limits.unlimited}
-                        onChange={(event) =>
-                          setLimits({ ...limits, unlimited: event.target.checked })
-                        }
+                    {policies.isError ? (
+                      <InlineRetry
+                        message={t("dashboard:providers.policiesFailed")}
+                        onRetry={policies.refetch}
                       />
-                      <span className="text-sm">{t("dashboard:providers.fields.unlimited")}</span>
-                    </label>
-                    {!limits.unlimited ? (
-                      <div className="grid gap-3 sm:grid-cols-3">
-                        <Field label={t("dashboard:providers.fields.concurrency")}>
-                          <Input
-                            required
-                            type="number"
-                            min="1"
-                            value={limits.concurrency}
-                            onChange={(event) =>
-                              setLimits({ ...limits, concurrency: event.target.value })
-                            }
-                          />
-                        </Field>
-                        <Field label={t("dashboard:providers.fields.tokensDay")}>
-                          <Input
-                            required
-                            type="number"
-                            min="1"
-                            value={limits.tokens}
-                            onChange={(event) =>
-                              setLimits({ ...limits, tokens: event.target.value })
-                            }
-                          />
-                        </Field>
-                        <Field label={t("dashboard:providers.fields.spendMonth")}>
-                          <Input
-                            required
-                            inputMode="decimal"
-                            value={limits.spend}
-                            onChange={(event) =>
-                              setLimits({ ...limits, spend: event.target.value })
-                            }
-                          />
-                        </Field>
-                      </div>
-                    ) : (
-                      <p className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-sm">
-                        {t("dashboard:providers.unlimitedWarning")}
-                      </p>
-                    )}
+                    ) : null}
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <BudgetRuleField
+                        label={t("dashboard:providers.fields.concurrencyAttempt")}
+                        mode={limits.concurrencyMode}
+                        value={limits.concurrency}
+                        onMode={(concurrencyMode) => setLimits({ ...limits, concurrencyMode })}
+                        onValue={(concurrency) => setLimits({ ...limits, concurrency })}
+                      />
+                      <BudgetRuleField
+                        label={t("dashboard:providers.fields.tokensAttempt")}
+                        mode={limits.tokenAttemptMode}
+                        value={limits.tokenAttempt}
+                        onMode={(tokenAttemptMode) => setLimits({ ...limits, tokenAttemptMode })}
+                        onValue={(tokenAttempt) => setLimits({ ...limits, tokenAttempt })}
+                      />
+                      <BudgetRuleField
+                        label={t("dashboard:providers.fields.tokensDay")}
+                        mode={limits.tokenDayMode}
+                        value={limits.tokenDay}
+                        onMode={(tokenDayMode) => setLimits({ ...limits, tokenDayMode })}
+                        onValue={(tokenDay) => setLimits({ ...limits, tokenDay })}
+                      />
+                      <BudgetRuleField
+                        label={t("dashboard:providers.fields.tokensMonth")}
+                        mode={limits.tokenMonthMode}
+                        value={limits.tokenMonth}
+                        onMode={(tokenMonthMode) => setLimits({ ...limits, tokenMonthMode })}
+                        onValue={(tokenMonth) => setLimits({ ...limits, tokenMonth })}
+                      />
+                      <BudgetRuleField
+                        label={t("dashboard:providers.fields.tokensLifetime")}
+                        mode={limits.tokenLifetimeMode}
+                        value={limits.tokenLifetime}
+                        onMode={(tokenLifetimeMode) => setLimits({ ...limits, tokenLifetimeMode })}
+                        onValue={(tokenLifetime) => setLimits({ ...limits, tokenLifetime })}
+                      />
+                      <BudgetRuleField
+                        label={t("dashboard:providers.fields.spendDay")}
+                        mode={limits.spendDayMode}
+                        value={limits.spendDay}
+                        onMode={(spendDayMode) => setLimits({ ...limits, spendDayMode })}
+                        onValue={(spendDay) => setLimits({ ...limits, spendDay })}
+                        decimal
+                      />
+                      <BudgetRuleField
+                        label={t("dashboard:providers.fields.spendMonth")}
+                        mode={limits.spendMonthMode}
+                        value={limits.spendMonth}
+                        onMode={(spendMonthMode) => setLimits({ ...limits, spendMonthMode })}
+                        onValue={(spendMonth) => setLimits({ ...limits, spendMonth })}
+                        decimal
+                      />
+                    </div>
                     <Button
                       size="touch"
-                      disabled={
-                        createBudget.isPending ||
-                        (!limits.unlimited &&
-                          (!Number(limits.concurrency) ||
-                            !Number(limits.tokens) ||
-                            !Number(limits.spend)))
-                      }
+                      disabled={createBudget.isPending || !limitsValid || !activePricing}
                     >
                       {t("dashboard:providers.actions.activateBudget")}
                     </Button>
@@ -659,7 +1057,261 @@ export function ProviderOperationsSection() {
                           ).length ?? 0,
                       })}
                     </p>
+                    {!activePricing ? (
+                      <p className="text-sm text-destructive">
+                        {t("dashboard:providers.activePricingRequired")}
+                      </p>
+                    ) : null}
+                    <div className="divide-y rounded-xl border">
+                      {policies.data
+                        ?.filter((policy) => policy.providerAccountId === selected.id)
+                        .map((policy) => (
+                          <div
+                            key={policy.id}
+                            className="flex min-w-0 items-center justify-between gap-3 p-3"
+                          >
+                            <div className="min-w-0 text-sm">
+                              <p className="font-medium">
+                                {t(`dashboard:providers.enums.${policy.scopeType}`)} · v
+                                {policy.version}
+                              </p>
+                              <p className="text-xs text-muted-foreground">
+                                {policy.Rules.map(
+                                  (rule) =>
+                                    `${t(`dashboard:providers.enums.${rule.metric}`)} / ${t(`dashboard:providers.enums.${rule.period}`)}: ${t(`dashboard:providers.enums.${rule.mode}`)}${rule.limitValue ? ` ${rule.limitValue.toString()}${rule.currency ? ` ${rule.currency}` : ""}` : ""}`,
+                                ).join(" · ")}
+                              </p>
+                            </div>
+                            {policy.active ? (
+                              <div className="flex flex-wrap gap-2">
+                                <Button
+                                  type="button"
+                                  size="touch"
+                                  variant="outline"
+                                  disabled={replaceBudget.isPending}
+                                  onClick={() =>
+                                    replaceBudget.mutate({
+                                      id: policy.id,
+                                      active: true,
+                                      rules: budgetRules(activePricing?.currency ?? null),
+                                    })
+                                  }
+                                >
+                                  {t("dashboard:providers.actions.newBudgetVersion")}
+                                </Button>
+                                <Button
+                                  type="button"
+                                  size="touch"
+                                  variant="outline"
+                                  disabled={deactivateBudget.isPending}
+                                  onClick={() => deactivateBudget.mutate({ id: policy.id })}
+                                >
+                                  {t("dashboard:providers.actions.deactivate")}
+                                </Button>
+                              </div>
+                            ) : null}
+                          </div>
+                        ))}
+                    </div>
                   </form>
+                </div>
+              ) : null}
+
+              {activeModelId ? (
+                <div className="min-w-0 space-y-4 border-t pt-8">
+                  <div>
+                    <h3 className="font-medium">{t("dashboard:providers.poolAttachments")}</h3>
+                    <p className="mt-1 text-sm text-muted-foreground">
+                      {t("dashboard:providers.poolAttachmentsDescription")}
+                    </p>
+                  </div>
+                  {pools.isError ? (
+                    <InlineRetry
+                      message={t("dashboard:providers.poolLoadFailed")}
+                      onRetry={pools.refetch}
+                    />
+                  ) : pools.isPending ? (
+                    <Skeleton className="h-24" />
+                  ) : (
+                    <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_10rem_auto]">
+                      <Field label={t("dashboard:providers.fields.pool")}>
+                        <select
+                          className="h-11 w-full rounded-md border bg-background px-3 text-base sm:text-sm"
+                          value={attachmentDraft.poolId}
+                          onChange={(event) =>
+                            setAttachmentDraft({ ...attachmentDraft, poolId: event.target.value })
+                          }
+                        >
+                          <option value="">{t("dashboard:providers.fields.choosePool")}</option>
+                          {pools.data?.map((pool) => (
+                            <option key={pool.id} value={pool.id}>
+                              {pool.name}
+                            </option>
+                          ))}
+                        </select>
+                      </Field>
+                      <Field label={t("dashboard:providers.fields.publicOrder")}>
+                        <Input
+                          type="number"
+                          min="0"
+                          max="10000"
+                          value={attachmentDraft.publicOrder}
+                          onChange={(event) =>
+                            setAttachmentDraft({
+                              ...attachmentDraft,
+                              publicOrder: event.target.value,
+                            })
+                          }
+                        />
+                      </Field>
+                      <div className="flex flex-wrap items-end gap-2 md:col-span-3">
+                        <Button
+                          type="button"
+                          size="touch"
+                          variant="outline"
+                          disabled={
+                            !attachmentDraft.poolId ||
+                            createBudget.isPending ||
+                            !limitsValid ||
+                            !activePricing
+                          }
+                          onClick={() => {
+                            const currency = activePricing?.currency ?? null;
+                            createBudget.mutate({
+                              scopeType: "POOL_PROVIDER_MODEL",
+                              providerAccountId: selected.id,
+                              poolId: attachmentDraft.poolId,
+                              providerModelId: activeModelId,
+                              active: true,
+                              rules: budgetRules(currency),
+                            });
+                          }}
+                        >
+                          {t("dashboard:providers.actions.createAttachmentProtection")}
+                        </Button>
+                        <Button
+                          type="button"
+                          size="touch"
+                          variant="outline"
+                          disabled={!attachmentDraft.poolId || updatePool.isPending}
+                          onClick={() =>
+                            updatePool.mutate({
+                              id: attachmentDraft.poolId,
+                              publicEgressAcknowledged: true,
+                              publicEgressEnabled: true,
+                            })
+                          }
+                        >
+                          {t("dashboard:providers.actions.acknowledgeEgress")}
+                        </Button>
+                        <Button
+                          type="button"
+                          size="touch"
+                          disabled={
+                            !attachmentDraft.poolId ||
+                            !Number.isInteger(Number(attachmentDraft.publicOrder)) ||
+                            addPoolMember.isPending
+                          }
+                          onClick={() =>
+                            addPoolMember.mutate({
+                              poolId: attachmentDraft.poolId,
+                              providerModelId: activeModelId,
+                              publicOrder: Number(attachmentDraft.publicOrder),
+                            })
+                          }
+                        >
+                          {t("dashboard:providers.actions.attachProvider")}
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+                  <div className="divide-y rounded-xl border">
+                    {pools.data?.flatMap((pool) =>
+                      pool.members
+                        .filter(
+                          (member) => member.providerModel?.ProviderAccount.id === selected.id,
+                        )
+                        .map((member) => (
+                          <div
+                            key={member.id}
+                            className="flex min-w-0 flex-col gap-3 p-3 sm:flex-row sm:items-center sm:justify-between"
+                          >
+                            <div className="min-w-0">
+                              <p className="truncate text-sm font-medium">
+                                {pool.name} ·{" "}
+                                {member.providerModel?.displayName ??
+                                  member.providerModel?.upstreamModelId}
+                              </p>
+                              <p className="text-xs text-muted-foreground">
+                                {t("dashboard:providers.publicOrder", {
+                                  order: member.publicOrder ?? 0,
+                                })}{" "}
+                                · {t(`dashboard:providers.enums.${member.routingStatus}`)}
+                              </p>
+                              <p className="mt-1 break-words text-xs text-muted-foreground">
+                                {t("dashboard:providers.grantEgressDisclosure", {
+                                  grants:
+                                    pool.grants.map((grant) => grant.granteeEmail).join(", ") ||
+                                    t("dashboard:providers.none"),
+                                  tokens:
+                                    modelApiTokens.data
+                                      ?.filter(
+                                        (token) =>
+                                          token.scopeMode === "ALL_VISIBLE" ||
+                                          token.allowlist.modelPoolIds.includes(pool.id),
+                                      )
+                                      .map((token) => token.name)
+                                      .join(", ") || t("dashboard:providers.none"),
+                                })}
+                              </p>
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              <Button
+                                type="button"
+                                size="touch"
+                                variant="outline"
+                                disabled={reorderPoolMember.isPending}
+                                onClick={() =>
+                                  reorderPoolMember.mutate({ id: member.id, direction: "EARLIER" })
+                                }
+                              >
+                                {t("dashboard:providers.actions.moveEarlier")}
+                              </Button>
+                              <Button
+                                type="button"
+                                size="touch"
+                                variant="outline"
+                                disabled={reorderPoolMember.isPending}
+                                onClick={() =>
+                                  reorderPoolMember.mutate({ id: member.id, direction: "LATER" })
+                                }
+                              >
+                                {t("dashboard:providers.actions.moveLater")}
+                              </Button>
+                              <Button
+                                type="button"
+                                size="touch"
+                                variant="ghost"
+                                disabled={removePoolMember.isPending}
+                                onClick={() => removePoolMember.mutate({ id: member.id })}
+                                aria-label={t("dashboard:providers.actions.detachProvider")}
+                              >
+                                <Trash2 className="size-4" />
+                              </Button>
+                            </div>
+                          </div>
+                        )),
+                    )}
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {t("dashboard:providers.egressAcknowledgement")}
+                  </p>
+                  {modelApiTokens.isError ? (
+                    <InlineRetry
+                      message={t("dashboard:providers.tokensFailed")}
+                      onRetry={modelApiTokens.refetch}
+                    />
+                  ) : null}
                 </div>
               ) : null}
 
@@ -683,11 +1335,41 @@ export function ProviderOperationsSection() {
                       {t("dashboard:providers.reportingDescription")}
                     </p>
                   </div>
-                  <p className="text-sm font-medium">
-                    {t("dashboard:providers.settledSpend", { value: spend.toFixed(6) })}
-                  </p>
+                  {!usageTotals.isError ? (
+                    <div className="text-end text-sm font-medium">
+                      {usageTotals.data?.totals.map((total) => (
+                        <p key={total.currency ?? "unknown"}>
+                          {t("dashboard:providers.settledSpendCurrency", {
+                            value: total.settledCost?.toString() ?? "0",
+                            currency: total.currency ?? t("dashboard:providers.unknownCurrency"),
+                          })}
+                        </p>
+                      ))}
+                      {(usageTotals.data?.excludedRowCount ?? 0) > 0 ? (
+                        <p className="text-xs font-normal text-muted-foreground">
+                          {t("dashboard:providers.unknownCostRows", {
+                            count: usageTotals.data?.excludedRowCount,
+                          })}
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="touch"
+                      onClick={() => usageTotals.refetch()}
+                    >
+                      {t("common:retry")}
+                    </Button>
+                  )}
                 </div>
-                {reportPending ? (
+                {usage.isError ? (
+                  <InlineRetry
+                    message={t("dashboard:providers.reportFailed")}
+                    onRetry={usage.refetch}
+                  />
+                ) : usage.isPending ? (
                   <Skeleton className="mt-3 h-40" />
                 ) : (
                   <WideContent className="mt-3">
@@ -706,7 +1388,7 @@ export function ProviderOperationsSection() {
                         </tr>
                       </thead>
                       <tbody className="divide-y">
-                        {usage.data?.map((row) => (
+                        {usage.data?.items.map((row) => (
                           <tr key={row.id}>
                             <td className="p-3">{showDate(row.createdAt)}</td>
                             <td className="p-3">
@@ -714,8 +1396,29 @@ export function ProviderOperationsSection() {
                               {showValue(row.billableTotal)}
                             </td>
                             <td className="p-3">
-                              {showValue(row.reportedCost)} / {showValue(row.calculatedCost)}{" "}
-                              {row.currency ?? row.reportedCostCurrency ?? ""}
+                              <span className="block">
+                                {t("dashboard:providers.reportedCost", {
+                                  value: showValue(row.reportedCost),
+                                  currency:
+                                    row.reportedCostCurrency ??
+                                    t("dashboard:providers.unknownCurrency"),
+                                })}
+                              </span>
+                              <span className="block">
+                                {t("dashboard:providers.calculatedCost", {
+                                  value: showValue(row.calculatedCost),
+                                  currency:
+                                    row.calculatedCostCurrency ??
+                                    t("dashboard:providers.unknownCurrency"),
+                                })}
+                              </span>
+                              <span className="block">
+                                {t("dashboard:providers.settledCost", {
+                                  value: showValue(row.settledCost),
+                                  currency:
+                                    row.currency ?? t("dashboard:providers.unknownCurrency"),
+                                })}
+                              </span>
                             </td>
                             <td className="p-3">
                               {row.pricingVersion} · {row.accountingVersion}
@@ -732,34 +1435,132 @@ export function ProviderOperationsSection() {
                     </table>
                   </WideContent>
                 )}
+                {usage.data?.nextCursor ? (
+                  <Button
+                    type="button"
+                    className="mt-3"
+                    size="touch"
+                    variant="outline"
+                    onClick={() => setUsageCursor(usage.data.nextCursor ?? undefined)}
+                  >
+                    {t("dashboard:providers.actions.nextPage")}
+                  </Button>
+                ) : null}
+                {usageCursor ? (
+                  <Button
+                    type="button"
+                    className="mt-3 ms-2"
+                    size="touch"
+                    variant="ghost"
+                    onClick={() => setUsageCursor(undefined)}
+                  >
+                    {t("dashboard:providers.actions.firstPage")}
+                  </Button>
+                ) : null}
                 <p className="mt-3 text-xs text-muted-foreground">
-                  {budgets.data?.caveat ?? t("dashboard:providers.invoiceCaveat")}
+                  {t("dashboard:providers.invoiceCaveat")}
                 </p>
+                {budgets.isError ? (
+                  <InlineRetry
+                    message={t("dashboard:providers.budgetActivityFailed")}
+                    onRetry={budgets.refetch}
+                  />
+                ) : null}
               </div>
 
               <div className="grid min-w-0 gap-6 lg:grid-cols-2">
-                <Timeline
-                  title={t("dashboard:providers.attempts")}
-                  empty={t("dashboard:providers.noAttempts")}
-                  rows={
-                    attempts.data?.map((row) => ({
-                      id: row.id,
-                      title: `${row.eventType} · ${row.terminalState ?? row.reason ?? "—"}`,
-                      detail: `${showDate(row.createdAt)} · ${row.requestedSurface ?? "—"} → ${row.nativeSurface ?? "—"}`,
-                    })) ?? []
-                  }
-                />
-                <Timeline
-                  title={t("dashboard:providers.audit")}
-                  empty={t("dashboard:providers.noAudit")}
-                  rows={
-                    audits.data?.map((row) => ({
-                      id: row.id,
-                      title: row.action,
-                      detail: `${showDate(row.createdAt)} · ${row.subjectId}`,
-                    })) ?? []
-                  }
-                />
+                {attempts.isError ? (
+                  <InlineRetry
+                    message={t("dashboard:providers.attemptsFailed")}
+                    onRetry={attempts.refetch}
+                  />
+                ) : (
+                  <Timeline
+                    title={t("dashboard:providers.attempts")}
+                    empty={t("dashboard:providers.noAttempts")}
+                    rows={
+                      attempts.data?.map((row) => ({
+                        id: row.id,
+                        title: `${t(`dashboard:providers.enums.${row.eventType}`)} · ${t(`dashboard:providers.enums.${row.terminalState ?? row.reason ?? "UNKNOWN"}`)}`,
+                        detail: `${showDate(row.createdAt)} · ${row.requestedSurface ?? "—"} → ${row.nativeSurface ?? "—"}`,
+                      })) ?? []
+                    }
+                  />
+                )}
+                {audits.isError ? (
+                  <InlineRetry
+                    message={t("dashboard:providers.auditFailed")}
+                    onRetry={audits.refetch}
+                  />
+                ) : (
+                  <Timeline
+                    title={t("dashboard:providers.audit")}
+                    empty={t("dashboard:providers.noAudit")}
+                    rows={
+                      audits.data?.map((row) => ({
+                        id: row.id,
+                        title: t(`dashboard:providers.enums.${row.action}`),
+                        detail: `${showDate(row.createdAt)} · ${row.subjectId}`,
+                      })) ?? []
+                    }
+                  />
+                )}
+              </div>
+              <div className="min-w-0 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <h3 className="font-medium">{t("dashboard:providers.repairStatus")}</h3>
+                  <Button
+                    type="button"
+                    size="touch"
+                    variant="outline"
+                    disabled={repairAttempts.isPending}
+                    onClick={() => repairAttempts.mutate({ providerAccountId: selected.id })}
+                  >
+                    <Wrench className="size-4" /> {t("dashboard:providers.actions.repair")}
+                  </Button>
+                </div>
+                {attemptStates.isError ? (
+                  <InlineRetry
+                    message={t("dashboard:providers.repairLoadFailed")}
+                    onRetry={attemptStates.refetch}
+                  />
+                ) : attemptStates.isPending ? (
+                  <Skeleton className="h-24" />
+                ) : (
+                  <Timeline
+                    title={t("dashboard:providers.repairStatus")}
+                    empty={t("dashboard:providers.noRepairItems")}
+                    rows={
+                      attemptStates.data?.items.map((row) => ({
+                        id: row.id,
+                        title: `${t(`dashboard:providers.enums.${row.state}`)} · ${t(`dashboard:providers.enums.${row.reconciliationStatus}`)}`,
+                        detail: `${showDate(row.createdAt)} · ${row.stale ? t("dashboard:providers.stale") : t("dashboard:providers.current")}`,
+                      })) ?? []
+                    }
+                  />
+                )}
+                <div className="flex gap-2">
+                  {attemptStates.data?.nextCursor ? (
+                    <Button
+                      type="button"
+                      size="touch"
+                      variant="outline"
+                      onClick={() => setAttemptCursor(attemptStates.data.nextCursor ?? undefined)}
+                    >
+                      {t("dashboard:providers.actions.nextPage")}
+                    </Button>
+                  ) : null}
+                  {attemptCursor ? (
+                    <Button
+                      type="button"
+                      size="touch"
+                      variant="ghost"
+                      onClick={() => setAttemptCursor(undefined)}
+                    >
+                      {t("dashboard:providers.actions.firstPage")}
+                    </Button>
+                  ) : null}
+                </div>
               </div>
               <p className="text-xs text-muted-foreground">
                 {t("dashboard:providers.visibilityDisclosure")}
@@ -772,6 +1573,169 @@ export function ProviderOperationsSection() {
   );
 }
 
+function UpdateAccountForm({
+  account,
+  authTypeLocked,
+}: {
+  account: {
+    id: string;
+    label: string;
+    baseUrl: string;
+    providerType: string;
+    authType: "API_KEY" | "BEARER";
+  };
+  authTypeLocked: boolean;
+}) {
+  const { t } = useTranslation(["common", "dashboard"]);
+  const queryClient = useQueryClient();
+  const updateAccount = useMutation(
+    orpc.providerManagement.updateAccount.mutationOptions({
+      onSuccess: () => queryClient.invalidateQueries({ queryKey: orpc.providerManagement.key() }),
+      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+    }),
+  );
+  const form = useForm({
+    defaultValues: {
+      label: account.label,
+      baseUrl: account.baseUrl,
+      providerType: account.providerType,
+      authType: account.authType,
+    },
+    validators: { onSubmit: accountFormSchema },
+    onSubmit: async ({ value }) => updateAccount.mutateAsync({ id: account.id, ...value }),
+  });
+  return (
+    <form
+      className="grid gap-3 md:grid-cols-2 xl:grid-cols-4"
+      onSubmit={(event) => {
+        event.preventDefault();
+        form.handleSubmit();
+      }}
+    >
+      {(["label", "baseUrl", "providerType"] as const).map((name) => (
+        <form.Field key={name} name={name}>
+          {(field) => (
+            <Field
+              label={t(`dashboard:providers.fields.${name === "providerType" ? "type" : name}`)}
+              className={name === "baseUrl" ? "xl:col-span-2" : undefined}
+            >
+              <Input
+                type={name === "baseUrl" ? "url" : "text"}
+                value={field.state.value}
+                onBlur={field.handleBlur}
+                onChange={(event) => field.handleChange(event.target.value)}
+              />
+            </Field>
+          )}
+        </form.Field>
+      ))}
+      <form.Field name="authType">
+        {(field) => (
+          <Field label={t("dashboard:providers.fields.authType")}>
+            <select
+              disabled={authTypeLocked}
+              className="h-11 w-full rounded-md border bg-background px-3 text-base sm:text-sm"
+              value={field.state.value}
+              onChange={(event) => field.handleChange(event.target.value as "API_KEY" | "BEARER")}
+            >
+              <option value="BEARER">{t("dashboard:providers.enums.BEARER")}</option>
+              <option value="API_KEY">{t("dashboard:providers.enums.API_KEY")}</option>
+            </select>
+          </Field>
+        )}
+      </form.Field>
+      {authTypeLocked ? (
+        <p className="self-end text-xs text-muted-foreground">
+          {t("dashboard:providers.authTypeImmutable")}
+        </p>
+      ) : null}
+      <Button
+        className="md:col-span-2 xl:col-span-4 xl:justify-self-start"
+        size="touch"
+        disabled={updateAccount.isPending}
+      >
+        {t("dashboard:providers.actions.saveAccount")}
+      </Button>
+    </form>
+  );
+}
+
+function UpdateModelForm({
+  model,
+}: {
+  model: {
+    id: string;
+    displayName: string | null;
+    contextWindow: number | null;
+    maxOutputTokens: number | null;
+    concurrencyLimit: number | null;
+  };
+}) {
+  const { t } = useTranslation(["common", "dashboard"]);
+  const queryClient = useQueryClient();
+  const updateModel = useMutation(
+    orpc.providerManagement.updateModel.mutationOptions({
+      onSuccess: () => queryClient.invalidateQueries({ queryKey: orpc.providerManagement.key() }),
+      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+    }),
+  );
+  const form = useForm({
+    defaultValues: {
+      displayName: model.displayName ?? "",
+      contextWindow: model.contextWindow?.toString() ?? "",
+      maxOutputTokens: model.maxOutputTokens?.toString() ?? "",
+      concurrencyLimit: model.concurrencyLimit?.toString() ?? "",
+    },
+    validators: { onSubmit: updateModelFormSchema },
+    onSubmit: async ({ value }) => {
+      const numberOrNull = (raw: string) => (raw ? Number(raw) : null);
+      await updateModel.mutateAsync({
+        id: model.id,
+        displayName: value.displayName || null,
+        contextWindow: numberOrNull(value.contextWindow),
+        maxOutputTokens: numberOrNull(value.maxOutputTokens),
+        concurrencyLimit: numberOrNull(value.concurrencyLimit),
+      });
+    },
+  });
+  return (
+    <form
+      className="grid gap-3 pt-2 sm:grid-cols-2 lg:grid-cols-3"
+      onSubmit={(event) => {
+        event.preventDefault();
+        form.handleSubmit();
+      }}
+    >
+      {(["displayName", "contextWindow", "maxOutputTokens", "concurrencyLimit"] as const).map(
+        (name) => (
+          <form.Field key={name} name={name}>
+            {(field) => (
+              <Field
+                label={t(
+                  `dashboard:providers.fields.${name === "concurrencyLimit" ? "concurrency" : name}`,
+                )}
+              >
+                <Input
+                  type={name === "displayName" ? "text" : "number"}
+                  min={name === "displayName" ? undefined : "1"}
+                  value={field.state.value}
+                  onBlur={field.handleBlur}
+                  onChange={(event) => field.handleChange(event.target.value)}
+                />
+              </Field>
+            )}
+          </form.Field>
+        ),
+      )}
+      <div className="flex items-end">
+        <Button size="touch" disabled={updateModel.isPending}>
+          {t("dashboard:providers.actions.saveModel")}
+        </Button>
+      </div>
+    </form>
+  );
+}
+
 function Field({
   label,
   children,
@@ -781,10 +1745,70 @@ function Field({
   children: ReactNode;
   className?: string;
 }) {
+  const generatedId = useId();
+  const child = isValidElement(children)
+    ? cloneElement(children as ReactElement<{ id?: string }>, {
+        id: (children.props as { id?: string }).id ?? generatedId,
+      })
+    : children;
+  const childId = isValidElement(child) ? (child.props as { id?: string }).id : generatedId;
   return (
     <div className={`min-w-0 space-y-2 ${className}`}>
-      <Label>{label}</Label>
-      {children}
+      <Label htmlFor={childId}>{label}</Label>
+      {child}
+    </div>
+  );
+}
+
+function BudgetRuleField({
+  label,
+  mode,
+  value,
+  onMode,
+  onValue,
+  decimal = false,
+}: {
+  label: string;
+  mode: "LIMITED" | "UNLIMITED";
+  value: string;
+  onMode: (mode: "LIMITED" | "UNLIMITED") => void;
+  onValue: (value: string) => void;
+  decimal?: boolean;
+}) {
+  const { t } = useTranslation("dashboard");
+  const modeId = useId();
+  const valueId = useId();
+  return (
+    <div className="min-w-0 space-y-2 rounded-xl border p-3">
+      <p className="text-sm font-medium">{label}</p>
+      <Label htmlFor={modeId}>{t("providers.fields.limitMode")}</Label>
+      <select
+        id={modeId}
+        className="h-11 w-full rounded-md border bg-background px-3 text-base sm:text-sm"
+        value={mode}
+        onChange={(event) => onMode(event.target.value as "LIMITED" | "UNLIMITED")}
+      >
+        <option value="LIMITED">{t("providers.enums.LIMITED")}</option>
+        <option value="UNLIMITED">{t("providers.enums.UNLIMITED")}</option>
+      </select>
+      {mode === "LIMITED" ? (
+        <>
+          <Label htmlFor={valueId}>{t("providers.fields.limitValue")}</Label>
+          <Input
+            id={valueId}
+            required
+            type={decimal ? "text" : "number"}
+            inputMode={decimal ? "decimal" : "numeric"}
+            min={decimal ? undefined : "1"}
+            value={value}
+            onChange={(event) => onValue(event.target.value)}
+          />
+        </>
+      ) : (
+        <p className="text-xs text-amber-700 dark:text-amber-300">
+          {t("providers.unlimitedRuleWarning")}
+        </p>
+      )}
     </div>
   );
 }
