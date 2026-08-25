@@ -62,7 +62,7 @@ const context: Context = {
   } as Session,
 };
 
-function httpClient() {
+function httpClient(captures?: Array<{ status: number; body: string }>) {
   const handler = new RPCHandler(capacityManagementRouter);
   const link = new RPCLink({
     url: "https://example.test/rpc",
@@ -71,7 +71,13 @@ function httpClient() {
         prefix: "/rpc",
         context,
       });
-      return result.matched ? result.response : new Response(null, { status: 404 });
+      if (!result.matched) return new Response(null, { status: 404 });
+      if (captures)
+        captures.push({
+          status: result.response.status,
+          body: await result.response.clone().text(),
+        });
+      return result.response;
     },
   });
   return createORPCClient(link) as ReturnType<
@@ -159,8 +165,9 @@ describe("capacityManagementRouter", () => {
     db.executionTarget.findUnique.mockResolvedValue(null);
     db.modelPool.findUnique.mockResolvedValue(null);
     db.poolMember.findUnique.mockResolvedValue(null);
-    const client = httpClient();
-    const results = await Promise.allSettled([
+    const captures: Array<{ status: number; body: string }> = [];
+    const client = httpClient(captures);
+    const attempts = [
       client.update({ id: "foreign-capacity", label: "guess" }),
       client.remove({ id: "foreign-capacity" }),
       client.updateDirectPolicy({
@@ -175,19 +182,24 @@ describe("capacityManagementRouter", () => {
         poolMemberId: "foreign-member",
         capacityPriority: 10,
       }),
-    ]);
+    ];
+    const results = await Promise.allSettled(attempts);
     for (const result of results) {
       expect(result.status).toBe("rejected");
       if (result.status === "rejected") expect(result.reason).toMatchObject({ code: "NOT_FOUND" });
     }
-    const serialized = JSON.stringify(results);
-    for (const identifier of [
-      "foreign-capacity",
-      "foreign-target",
-      "foreign-pool",
-      "foreign-member",
-    ])
-      expect(serialized).not.toContain(identifier);
+    expect(captures).toHaveLength(attempts.length);
+    for (const capture of captures) {
+      expect(capture.status).toBe(404);
+      expect(capture.body).toContain("NOT_FOUND");
+      for (const identifier of [
+        "foreign-capacity",
+        "foreign-target",
+        "foreign-pool",
+        "foreign-member",
+      ])
+        expect(capture.body).not.toContain(identifier);
+    }
     expect(db.executionTarget.update).not.toHaveBeenCalled();
     expect(db.modelPool.update).not.toHaveBeenCalled();
     expect(db.poolMember.update).not.toHaveBeenCalled();

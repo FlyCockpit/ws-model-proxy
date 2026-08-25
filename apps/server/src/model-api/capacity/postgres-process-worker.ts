@@ -42,6 +42,15 @@ type WorkerCommand =
   | {
       operation: "server";
       upstreamUrl: string;
+    }
+  | {
+      operation: "production-server";
+    }
+  | {
+      operation: "repair-provider";
+      now: string;
+      userId: string;
+      providerAccountId: string;
     };
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
@@ -56,6 +65,11 @@ const store = new PostgresCapacityAdmissionStore(db, `process-worker-${process.p
 const write = (value: unknown) =>
   process.stdout.write(
     `${JSON.stringify(value, (_key, item) => (typeof item === "bigint" ? item.toString() : item))}\n`,
+  );
+const jsonResponse = (value: unknown, status: number) =>
+  new Response(
+    JSON.stringify(value, (_key, item) => (typeof item === "bigint" ? item.toString() : item)),
+    { status, headers: { "content-type": "application/json" } },
   );
 
 try {
@@ -124,7 +138,7 @@ try {
       return decision.winner;
     });
     write({ winner });
-  } else {
+  } else if (command.operation === "server") {
     const app = new Hono();
     const leases = new Map<string, CapacityLeaseHandle>();
     app.post("/admit", async (context) => {
@@ -133,7 +147,7 @@ try {
       };
       const result = await store.acquire({ ...input, deadlineAt: new Date(input.deadlineAt) });
       if (result.state === "ADMITTED") leases.set(input.attemptId, result.lease);
-      return context.json(result, result.state === "ADMITTED" ? 200 : 202);
+      return jsonResponse(result, result.state === "ADMITTED" ? 200 : 202);
     });
     app.post("/release/:attemptId", async (context) => {
       const lease = leases.get(context.req.param("attemptId"));
@@ -210,6 +224,43 @@ try {
       process.once("SIGTERM", shutdown);
       process.once("SIGINT", shutdown);
     });
+  } else if (command.operation === "production-server") {
+    const { createModelApiRoutes } = await import("../routes.js");
+    const manager = {
+      getActiveCliDeviceIds: () => [] as string[],
+      registerRelayResponseHandlers: () => undefined,
+      sendRelayRequest: () => undefined,
+      cancelRelayRequest: () => undefined,
+      completeRelayRequest: () => undefined,
+    };
+    const app = new Hono();
+    app.route(
+      "/v1",
+      createModelApiRoutes({
+        manager,
+        anthropicEnabled: true,
+        protocolAdaptationEnabled: true,
+        capacityEnabled: true,
+      }),
+    );
+    const server = serve({ fetch: app.fetch, port: 0 }, (info) => write({ port: info.port }));
+    await new Promise<void>((resolve) => {
+      const shutdown = () => server.close(() => resolve());
+      process.once("SIGTERM", shutdown);
+      process.once("SIGINT", shutdown);
+    });
+  } else {
+    const now = new Date(command.now);
+    const [{ repairExpiredProviderBudgets }, { expireProviderAttempts }] = await Promise.all([
+      import("../provider-budget.js"),
+      import("../provider-attempt-runtime.js"),
+    ]);
+    const budgets = await repairExpiredProviderBudgets(now, {
+      userId: command.userId,
+      providerAccountId: command.providerAccountId,
+    });
+    const attempts = await expireProviderAttempts(now);
+    write({ budgets, attempts });
   }
 } finally {
   await db.$disconnect();

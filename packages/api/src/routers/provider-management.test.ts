@@ -108,7 +108,10 @@ const session = {
 } as Session;
 const context: Context = { session };
 
-function createHttpClient(rpcContext: Context = context) {
+function createHttpClient(
+  rpcContext: Context = context,
+  captures?: Array<{ status: number; body: string }>,
+) {
   const handler = new RPCHandler(providerManagementRouter);
   const link = new RPCLink({
     url: "https://example.test/rpc",
@@ -118,6 +121,11 @@ function createHttpClient(rpcContext: Context = context) {
         context: rpcContext,
       });
       if (!result.matched) return new Response(null, { status: 404 });
+      if (captures)
+        captures.push({
+          status: result.response.status,
+          body: await result.response.clone().text(),
+        });
       return result.response;
     },
   });
@@ -223,7 +231,8 @@ describe("providerManagementRouter security boundary", () => {
     db.providerCredential.findFirst.mockResolvedValue(null);
     db.providerBudgetPolicy.findFirst.mockResolvedValue(null);
     db.modelPool.findFirst.mockResolvedValue(null);
-    const client = createHttpClient();
+    const captures: Array<{ status: number; body: string }> = [];
+    const client = createHttpClient(context, captures);
     const credential = "must-not-appear-in-an-error-body";
     const limitedRule = {
       metric: "CONCURRENCY" as const,
@@ -309,13 +318,20 @@ describe("providerManagementRouter security boundary", () => {
           message: "Not found",
         });
     }
-    const serialized = JSON.stringify(results);
-    expect(serialized).not.toContain(credential);
-    expect(serialized).not.toContain("foreign-account");
-    expect(serialized).not.toContain("foreign-model");
-    expect(serialized).not.toContain("foreign-pricing");
-    expect(serialized).not.toContain("foreign-credential");
-    expect(serialized).not.toContain("foreign-budget");
+    expect(captures).toHaveLength(attempts.length);
+    for (const capture of captures) {
+      expect(capture.status).toBe(404);
+      expect(capture.body).toContain("NOT_FOUND");
+      for (const forbidden of [
+        credential,
+        "foreign-account",
+        "foreign-model",
+        "foreign-pricing",
+        "foreign-credential",
+        "foreign-budget",
+      ])
+        expect(capture.body).not.toContain(forbidden);
+    }
     expect(db.executionTarget.create).not.toHaveBeenCalled();
   });
 

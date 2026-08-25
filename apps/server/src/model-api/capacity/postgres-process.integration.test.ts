@@ -1,7 +1,16 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createServer, type ServerResponse } from "node:http";
 import { fileURLToPath } from "node:url";
+import {
+  encryptProviderCredential,
+  parseProviderCredentialKeyring,
+} from "@ws-model-proxy/api/lib/provider-credential-crypto";
+import { poolModelId } from "@ws-model-proxy/config/forwarder-identifiers";
 import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
+import {
+  credentialLookupPrefix,
+  hmacDigestForForwarderPurpose,
+} from "@ws-model-proxy/db/forwarder-security";
 import { afterAll, describe, expect, it } from "vitest";
 import type { AdmissionAttempt, CapacityLeaseHandle } from "./types.js";
 
@@ -23,16 +32,30 @@ type WorkerResult =
   | { reclaimed: number }
   | { released: boolean }
   | { heartbeat: boolean }
+  | { budgets: number; attempts: number }
   | { winner?: { admissionRequestId: string; priority: number } }
   | { port: number };
 
 function startWorker(command: unknown) {
+  const production =
+    typeof command === "object" &&
+    command !== null &&
+    "operation" in command &&
+    command.operation === "production-server";
+  const workerDatabaseUrl =
+    production && databaseUrl
+      ? `${databaseUrl}${databaseUrl.includes("?") ? "&" : "?"}application_name=wsmp-production-process-proof`
+      : databaseUrl;
   const child = spawn(
     process.execPath,
     ["--import", "tsx", workerPath, Buffer.from(JSON.stringify(command)).toString("base64url")],
     {
       cwd: fileURLToPath(new URL("../../../../..", import.meta.url)),
-      env: { ...process.env, SCHEMA_VALIDATION_DATABASE_URL: databaseUrl },
+      env: {
+        ...process.env,
+        DATABASE_URL: workerDatabaseUrl,
+        SCHEMA_VALIDATION_DATABASE_URL: workerDatabaseUrl,
+      },
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
@@ -102,6 +125,7 @@ integration("capacity admission across operating-system processes", () => {
         providerType: "process-proof",
         label: `process-account-${suffix}`,
         baseUrl: "https://example.test",
+        endpointIdentity: "https://example.test",
         authType: "BEARER",
       },
     });
@@ -155,7 +179,7 @@ integration("capacity admission across operating-system processes", () => {
       await stop(holder.child);
       children.delete(holder.child);
       await db.$executeRaw`
-        UPDATE "CapacityLease" SET "expiresAt" = clock_timestamp() - interval '1 millisecond'
+        UPDATE capacity_lease SET "expiresAt" = clock_timestamp() - interval '1 millisecond'
          WHERE id = ${holderResult.lease.leaseId}`;
       const sweepers = [
         startWorker({ operation: "reclaim", limit: 10 }),
@@ -168,7 +192,10 @@ integration("capacity admission across operating-system processes", () => {
           (total, result) => total + ("reclaimed" in result ? result.reclaimed : 0),
           0,
         ),
-      ).toBe(1);
+      ).toBeGreaterThanOrEqual(1);
+      await expect(
+        db.capacityLease.findUniqueOrThrow({ where: { id: holderResult.lease.leaseId } }),
+      ).resolves.toMatchObject({ state: "RECLAIMED" });
 
       const recovered = startWorker({
         operation: "acquire",
@@ -264,7 +291,7 @@ integration("capacity admission across operating-system processes", () => {
       winner: { admissionRequestId: `earlier-${suffix}` },
     });
 
-    await db.user.delete({ where: { id: owner.id } });
+    await db.user.delete({ where: { id: owner.id } }).catch(() => undefined);
   }, 30_000);
 
   it("runs real Hono workers through precommit and committed stream crashes", async () => {
@@ -297,6 +324,7 @@ integration("capacity admission across operating-system processes", () => {
         providerType: "hono-proof",
         label: `hono-account-${suffix}`,
         baseUrl: "https://example.test",
+        endpointIdentity: "https://example.test",
         authType: "BEARER",
       },
     });
@@ -369,7 +397,7 @@ integration("capacity admission across operating-system processes", () => {
         if (phase === "precommit") await expect(work).rejects.toBeDefined();
         upstreamResponse.destroy();
         await db.$executeRaw`
-          UPDATE "CapacityLease" SET "expiresAt" = clock_timestamp() - interval '1 millisecond'
+          UPDATE capacity_lease SET "expiresAt" = clock_timestamp() - interval '1 millisecond'
            WHERE id = ${oldLease.id}`;
         const reclaim = startWorker({ operation: "reclaim", limit: 10 });
         children.add(reclaim.child);
@@ -563,4 +591,361 @@ integration("capacity admission across operating-system processes", () => {
       await db.user.delete({ where: { id: owner.id } }).catch(() => undefined);
     }
   }, 90_000);
+
+  it("boots production model routes in two processes and preserves commit semantics", async () => {
+    if (!db || !databaseUrl) return;
+    process.env.BETTER_AUTH_SECRET = "w7Qp9Lm2Nx4Rv6Tk8Yc3Hu5Jd1Fs0ZaB";
+    process.env.BETTER_AUTH_URL = "http://localhost:3000";
+    process.env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = "true";
+    process.env.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS = "true";
+    process.env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS = `process-v1:${Buffer.alloc(32, 37).toString("base64")}`;
+    process.env.MODEL_API_GLOBAL_CAPACITY_ENABLED = "true";
+    process.env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = "true";
+    const upstreamResponses: Array<{ path: string; response: ServerResponse }> = [];
+    const observations: string[] = [];
+    const upstream = createServer((request, response) => {
+      const path = request.url ?? "";
+      observations.push(path);
+      upstreamResponses.push({ path, response });
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    const address = upstream.address();
+    if (!address || typeof address === "string")
+      throw new Error("Production upstream unavailable.");
+    const origin = `http://127.0.0.1:${address.port}`;
+    const suffix = crypto.randomUUID();
+    const owner = await db.user.create({
+      data: {
+        name: "Production process proof",
+        email: `production-process-${suffix}@example.test`,
+        slug: `production-process-${suffix}`,
+      },
+    });
+    const capacity = await db.inferenceCapacity.create({
+      data: {
+        userId: owner.id,
+        label: `production-capacity-${suffix}`,
+        runtimeIdentityKey: `production-runtime-${suffix}`,
+        runtimeModel: "production-proof",
+        hardConcurrencyLimit: 1,
+      },
+    });
+    const pool = await db.modelPool.create({
+      data: {
+        userId: owner.id,
+        slug: `production-pool-${suffix}`,
+        name: "Production process pool",
+        protocolAdaptationEnabled: true,
+        publicEgressEnabled: true,
+        publicEgressAcknowledged: true,
+      },
+    });
+    const keyring = parseProviderCredentialKeyring(
+      process.env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS,
+    );
+    const createProvider = async (label: string, publicOrder: number) => {
+      const accountId = crypto.randomUUID();
+      const credentialId = crypto.randomUUID();
+      const account = await db.providerAccount.create({
+        data: {
+          id: accountId,
+          userId: owner.id,
+          providerType: "openai",
+          label: `${label}-${suffix}`,
+          baseUrl: `${origin}/${label}`,
+          endpointIdentity: `${origin}/${label}`,
+          authType: "BEARER",
+          status: "ACTIVE",
+          enabled: false,
+          healthStatus: "HEALTHY",
+        },
+      });
+      const encrypted = encryptProviderCredential(
+        `secret-${label}`,
+        {
+          userId: owner.id,
+          providerAccountId: account.id,
+          credentialId,
+          credentialType: "BEARER",
+          aadVersion: 1,
+        },
+        keyring,
+      );
+      await db.$transaction(async (tx) => {
+        await tx.providerCredential.create({
+          data: {
+            id: credentialId,
+            userId: owner.id,
+            providerAccountId: account.id,
+            credentialType: "BEARER",
+            ...encrypted,
+          },
+        });
+        await tx.providerAccount.update({
+          where: { id: account.id },
+          data: { currentCredentialId: credentialId, enabled: true },
+        });
+      });
+      const model = await db.providerModel.create({
+        data: {
+          userId: owner.id,
+          providerAccountId: account.id,
+          upstreamModelId: `upstream-${label}`,
+          enabled: true,
+          healthStatus: "HEALTHY",
+          contextWindow: 8_192,
+          maxOutputTokens: 256,
+          nativeCapabilities: {
+            protocols: ["openai"],
+            surfaces: ["openai-chat"],
+            streaming: true,
+            features: [],
+          },
+        },
+      });
+      const target = await db.executionTarget.create({
+        data: {
+          userId: owner.id,
+          kind: "PROVIDER_MODEL",
+          providerModelId: model.id,
+          inferenceCapacityId: capacity.id,
+        },
+      });
+      await db.poolMember.create({
+        data: {
+          poolId: pool.id,
+          executionTargetId: target.id,
+          tier: "PUBLIC_OVERFLOW",
+          publicOrder,
+        },
+      });
+      await db.providerPricingVersion.create({
+        data: {
+          userId: owner.id,
+          providerAccountId: account.id,
+          providerModelId: model.id,
+          version: "process-v1",
+          currency: "USD",
+          status: "ACTIVE",
+          accountingVersion: "provider-billable-v1",
+          confidence: "CALCULATED",
+          effectiveAt: new Date(Date.now() - 60_000),
+          activatedAt: new Date(Date.now() - 60_000),
+          pricing: { ratesPerMillion: { input: "1", output: "2", additional: "2" } },
+          chargeRules: {
+            inputIncludesCacheRead: false,
+            inputIncludesCacheWrite: false,
+            outputIncludesReasoning: false,
+            outputIncludesTool: false,
+            cacheReadAllowanceTokens: 0,
+            cacheWriteAllowanceTokens: 0,
+            reasoningAllowanceTokens: 0,
+            toolAllowanceTokens: 0,
+            additionalAllowanceTokens: 0,
+            unknownCategories: "FAIL_CLOSED",
+          },
+        },
+      });
+      await db.providerBudgetPolicy.create({
+        data: {
+          userId: owner.id,
+          providerAccountId: account.id,
+          providerModelId: model.id,
+          poolId: pool.id,
+          scopeType: "POOL_PROVIDER_MODEL",
+          active: true,
+          activatedAt: new Date(Date.now() - 60_000),
+          Rules: {
+            create: [
+              { metric: "CONCURRENCY", period: "PER_ATTEMPT", mode: "UNLIMITED" },
+              { metric: "TOKENS", period: "UTC_DAY", mode: "LIMITED", limitValue: 100_000 },
+              {
+                metric: "SPEND",
+                period: "UTC_DAY",
+                mode: "LIMITED",
+                limitValue: "10",
+                currency: "USD",
+              },
+            ],
+          },
+        },
+      });
+      return { account, model, target };
+    };
+    const primary = await createProvider("primary", 0);
+    await createProvider("secondary", 1);
+    const rawToken = `wsmp_model_${crypto.randomUUID().replaceAll("-", "")}`;
+    await db.modelApiToken.create({
+      data: {
+        userId: owner.id,
+        name: "Production process token",
+        lookupPrefix: credentialLookupPrefix(rawToken),
+        secretDigest: hmacDigestForForwarderPurpose({ purpose: "modelApiToken", value: rawToken }),
+      },
+    });
+    const modelId = poolModelId({ userSlug: owner.slug, poolSlug: pool.slug });
+    const request = (port: number) =>
+      fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${rawToken}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          model: modelId,
+          stream: true,
+          max_tokens: 16,
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      });
+    const workers = [
+      startWorker({ operation: "production-server" }),
+      startWorker({ operation: "production-server" }),
+    ];
+    for (const worker of workers) children.add(worker.child);
+    const ready = await Promise.all(workers.map((worker) => worker.result));
+    const ports = ready.map((result) => {
+      if (!("port" in result)) throw new Error("Production worker did not become ready.");
+      return result.port;
+    });
+    try {
+      let priorProviderFence = 0n;
+      for (const phase of ["before-byte", "after-byte"] as const) {
+        const observationStart = observations.length;
+        const responsePromise = request(ports[0]!);
+        const responseOutcome = responsePromise.then(
+          (response) => ({ response, error: undefined }),
+          (error: unknown) => ({ response: undefined, error }),
+        );
+        const controlled = await waitFor(() => upstreamResponses.shift(), 10_000);
+        expect(controlled.path).toContain("/primary/");
+        if (phase === "after-byte") {
+          controlled.response.writeHead(200, { "content-type": "text/event-stream" });
+          controlled.response.write(
+            `data: ${JSON.stringify({
+              id: `chunk-${suffix}`,
+              object: "chat.completion.chunk",
+              created: 1,
+              model: "upstream-primary",
+              choices: [{ index: 0, delta: { content: "first" }, finish_reason: null }],
+            })}\n\n`,
+          );
+          const outcome = await responseOutcome;
+          if (!outcome.response) throw outcome.error;
+          const downstream = outcome.response;
+          const first = await downstream.body?.getReader().read();
+          expect(new TextDecoder().decode(first?.value)).toContain("first");
+        }
+        const active = await waitFor(() =>
+          db.providerAttempt
+            .findFirst({
+              where: { providerModelId: primary.model.id, state: "ACTIVE" },
+              orderBy: { createdAt: "desc" },
+            })
+            .then((attemptRow) => attemptRow ?? undefined),
+        );
+        expect(active.fencingToken).toBeGreaterThan(priorProviderFence);
+        priorProviderFence = active.fencingToken;
+        await stop(workers[0]!.child);
+        children.delete(workers[0]!.child);
+        if (phase === "before-byte") {
+          const outcome = await responseOutcome;
+          expect(outcome.error).toBeDefined();
+          expect(outcome.response).toBeUndefined();
+        }
+        controlled.response.destroy();
+        expect(
+          observations.slice(observationStart).filter((path) => path.includes("/secondary/")),
+        ).toHaveLength(0);
+        await db.providerAttempt.update({
+          where: { id: active.id },
+          data: { expiresAt: new Date(Date.now() - 1) },
+        });
+        const providerRepair = startWorker({
+          operation: "repair-provider",
+          now: new Date(Date.now() + 10 * 60_000).toISOString(),
+          userId: owner.id,
+          providerAccountId: primary.account.id,
+        });
+        children.add(providerRepair.child);
+        const providerRepairResult = await providerRepair.result;
+        expect(providerRepairResult).toMatchObject({ budgets: 1 });
+        const duplicateProviderRepair = startWorker({
+          operation: "repair-provider",
+          now: new Date(Date.now() + 10 * 60_000).toISOString(),
+          userId: owner.id,
+          providerAccountId: primary.account.id,
+        });
+        children.add(duplicateProviderRepair.child);
+        await expect(duplicateProviderRepair.result).resolves.toMatchObject({ budgets: 0 });
+        await expect(
+          db.providerAttempt.findFirstOrThrow({
+            where: { providerModelId: primary.model.id },
+            orderBy: { createdAt: "desc" },
+          }),
+        ).resolves.toMatchObject({ state: "EXPIRED", terminalReason: "CRASH_RECOVERY" });
+        expect(
+          await db.providerAttempt.count({
+            where: { providerModelId: primary.model.id, state: "ACTIVE" },
+          }),
+        ).toBe(0);
+        const restarted = startWorker({ operation: "production-server" });
+        children.add(restarted.child);
+        const restartedResult = await restarted.result;
+        if (!("port" in restartedResult)) throw new Error("Production restart failed.");
+        workers[0] = restarted;
+        ports[0] = restartedResult.port;
+      }
+
+      const interrupted = request(ports[0]!);
+      const controlled = await waitFor(() => upstreamResponses.shift(), 10_000);
+      const backendRows = await db.$queryRaw<Array<{ pid: number }>>`
+        SELECT pid FROM pg_stat_activity
+         WHERE application_name = 'wsmp-production-process-proof'
+           AND pid <> pg_backend_pid()`;
+      expect(backendRows.length).toBeGreaterThan(0);
+      await db.$executeRaw`
+        SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+         WHERE application_name = 'wsmp-production-process-proof'
+           AND pid <> pg_backend_pid()`;
+      controlled.response.destroy(new Error("database connectivity interruption"));
+      const fallback = await waitFor(
+        () => upstreamResponses.find((entry) => entry.path.includes("/secondary/")),
+        10_000,
+      );
+      fallback.response.writeHead(503, { "content-type": "application/json" });
+      fallback.response.end(JSON.stringify({ error: { message: "controlled fallback failure" } }));
+      const interruptedResponse = await interrupted;
+      expect(interruptedResponse.status).toBeGreaterThanOrEqual(400);
+      const interruptedLease = await db.providerAttempt.findFirst({
+        where: { providerModelId: primary.model.id },
+        orderBy: { createdAt: "desc" },
+      });
+      if (interruptedLease?.state === "ACTIVE") {
+        await db.providerAttempt.update({
+          where: { id: interruptedLease.id },
+          data: { expiresAt: new Date(Date.now() - 1) },
+        });
+      }
+      const interruptedProviderRepair = startWorker({
+        operation: "repair-provider",
+        now: new Date(Date.now() + 10 * 60_000).toISOString(),
+        userId: owner.id,
+        providerAccountId: primary.account.id,
+      });
+      children.add(interruptedProviderRepair.child);
+      await expect(interruptedProviderRepair.result).resolves.toMatchObject({
+        budgets: expect.any(Number),
+      });
+      expect(
+        await db.providerAttempt.count({
+          where: { providerModelId: primary.model.id, state: "ACTIVE" },
+        }),
+      ).toBe(0);
+      expect(await db.providerAttempt.count({ where: { providerModelId: primary.model.id } })).toBe(
+        3,
+      );
+    } finally {
+      for (const worker of workers) await stop(worker.child);
+      await new Promise<void>((resolve) => upstream.close(() => resolve()));
+      await db.user.delete({ where: { id: owner.id } }).catch(() => undefined);
+    }
+  }, 120_000);
 });

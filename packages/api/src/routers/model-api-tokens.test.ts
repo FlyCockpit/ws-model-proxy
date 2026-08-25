@@ -110,7 +110,7 @@ function buildContext(
   };
 }
 
-function httpClient() {
+function httpClient(captures?: Array<{ status: number; body: string }>) {
   const handler = new RPCHandler(modelApiTokensRouter);
   const link = new RPCLink({
     url: "https://example.test/rpc",
@@ -119,7 +119,13 @@ function httpClient() {
         prefix: "/rpc",
         context: buildContext(),
       });
-      return result.matched ? result.response : new Response(null, { status: 404 });
+      if (!result.matched) return new Response(null, { status: 404 });
+      if (captures)
+        captures.push({
+          status: result.response.status,
+          body: await result.response.clone().text(),
+        });
+      return result.response;
     },
   });
   return createORPCClient(link) as ReturnType<
@@ -495,11 +501,17 @@ describe("modelApiTokensRouter", () => {
         userId: "other-user-id",
         revokedAt: null,
       });
-      const result = await Promise.allSettled([httpClient().revoke({ id: "foreign-token-id" })]);
+      const captures: Array<{ status: number; body: string }> = [];
+      const result = await Promise.allSettled([
+        httpClient(captures).revoke({ id: "foreign-token-id" }),
+      ]);
       expect(result[0]?.status).toBe("rejected");
       if (result[0]?.status === "rejected")
         expect(result[0].reason).toMatchObject({ code: "NOT_FOUND" });
-      expect(JSON.stringify(result)).not.toContain("foreign-token-id");
+      expect(captures).toHaveLength(1);
+      expect(captures[0]?.status).toBe(404);
+      expect(captures[0]?.body).toContain("NOT_FOUND");
+      expect(captures[0]?.body).not.toContain("foreign-token-id");
       expect(db.modelApiToken.update).not.toHaveBeenCalled();
     });
   });
