@@ -992,20 +992,6 @@ function classifyTerminalRecord(
   return undefined;
 }
 
-function providerStreamTerminalFailed(
-  chunks: readonly Uint8Array[],
-  surface: ProtocolSurface,
-): boolean {
-  const text = new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))));
-  if (/(?:^|\n)event:\s*error\s*(?:\r?\n|$)/u.test(text)) return true;
-  if (surface === "openai-chat" && /(?:^|\n)data:\s*\{[^\n]*"error"\s*:/u.test(text)) return true;
-  return (
-    surface === "openai-responses" &&
-    (/"type"\s*:\s*"response\.(?:failed|cancelled|incomplete)"/u.test(text) ||
-      /"status"\s*:\s*"(?:failed|cancelled|incomplete)"/u.test(text))
-  );
-}
-
 export function extractTailUsageObject(text: string): Record<string, unknown> | undefined {
   const marker = text.lastIndexOf('"usage"');
   if (marker < 0) return undefined;
@@ -1759,6 +1745,9 @@ export async function dispatchPublicOverflow(
       const usageChunks: Uint8Array[] = [];
       const initialUsageChunks: Uint8Array[] = [];
       let initialUsageBytes = 0;
+      const nonstreamChunks: Uint8Array[] = [];
+      let nonstreamBytes = 0;
+      let nonstreamOverflow = false;
       let usageBytes = 0;
       let resolveTerminal!: (value: { ok: boolean; responseBytes: number }) => void;
       const terminal = new Promise<{ ok: boolean; responseBytes: number }>((resolve) => {
@@ -1776,12 +1765,35 @@ export async function dispatchPublicOverflow(
           stopHeartbeat();
           const transportComplete = streamComplete && (response.complete || protocolTerminal);
           const surface = nativeSurface ?? request.requestedSurface;
+          let nonstreamEnvelope: Record<string, unknown> | undefined;
+          if (!request.stream && !nonstreamOverflow) {
+            try {
+              const parsed = JSON.parse(
+                new TextDecoder().decode(
+                  Buffer.concat(nonstreamChunks.map((chunk) => Buffer.from(chunk))),
+                ),
+              );
+              if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+                nonstreamEnvelope = parsed as Record<string, unknown>;
+            } catch {
+              nonstreamEnvelope = undefined;
+            }
+          }
           const streamTerminal = !request.stream || protocolTerminal;
           const providerFailed =
             protocolFailed ||
-            (!request.stream && providerStreamTerminalFailed(usageChunks, surface));
+            (!request.stream &&
+              surface === "openai-responses" &&
+              ["failed", "cancelled", "incomplete"].includes(
+                typeof nonstreamEnvelope?.status === "string" ? nonstreamEnvelope.status : "",
+              ));
           const ok =
-            transportComplete && httpOk && streamTerminal && !providerFailed && !clientCancelled;
+            transportComplete &&
+            httpOk &&
+            streamTerminal &&
+            (request.stream || nonstreamEnvelope !== undefined) &&
+            !providerFailed &&
+            !clientCancelled;
           const healthOutcome = providerHealthOutcome(status);
           const attemptAborted =
             request.signal.aborted || attemptController.signal.aborted || clientCancelled;
@@ -1803,7 +1815,10 @@ export async function dispatchPublicOverflow(
               fencingToken,
             }).catch(() => false);
           }
-          const tailUsage = parseProviderUsage(usageChunks, pricing);
+          const tailUsage = parseProviderUsage(
+            !request.stream && !nonstreamOverflow ? nonstreamChunks : usageChunks,
+            pricing,
+          );
           const initialUsage =
             responseBytes > 1024 * 1024
               ? parseProviderUsage(initialUsageChunks, pricing)
@@ -1817,6 +1832,12 @@ export async function dispatchPublicOverflow(
                   ),
                   inputTokens: tailUsage.inputTokens ?? initialUsage.inputTokens,
                   outputTokens: tailUsage.outputTokens ?? initialUsage.outputTokens,
+                  categoriesComplete:
+                    surface === "anthropic-messages" &&
+                    (tailUsage.inputTokens ?? initialUsage.inputTokens) !== undefined &&
+                    (tailUsage.outputTokens ?? initialUsage.outputTokens) !== undefined
+                      ? true
+                      : (tailUsage.categoriesComplete ?? initialUsage.categoriesComplete),
                   rawUsage: [initialUsage.rawUsage, tailUsage.rawUsage],
                 } as RawProviderUsage)
               : (tailUsage ?? initialUsage);
@@ -1834,7 +1855,10 @@ export async function dispatchPublicOverflow(
               } as RawProviderUsage)
             : combinedUsage;
           const observationComplete =
-            transportComplete && (!request.stream || (protocolTerminal && !protocolFailed));
+            transportComplete &&
+            (request.stream
+              ? protocolTerminal && !protocolFailed
+              : nonstreamEnvelope !== undefined && !nonstreamOverflow);
           const usage = observedUsage
             ? {
                 ...observedUsage,
@@ -1936,6 +1960,15 @@ export async function dispatchPublicOverflow(
                 return;
               }
               responseBytes += chunk.value.byteLength;
+              if (!request.stream && !nonstreamOverflow) {
+                if (nonstreamBytes + chunk.value.byteLength <= 8 * 1024 * 1024) {
+                  nonstreamChunks.push(chunk.value);
+                  nonstreamBytes += chunk.value.byteLength;
+                } else {
+                  nonstreamOverflow = true;
+                  nonstreamChunks.length = 0;
+                }
+              }
               if (initialUsageBytes < 64 * 1024) {
                 const prefix = chunk.value.subarray(0, 64 * 1024 - initialUsageBytes);
                 if (prefix.byteLength > 0) {
@@ -1970,7 +2003,7 @@ export async function dispatchPublicOverflow(
               return;
             }
           } catch (error) {
-            if (reachedEof) {
+            if (reachedEof && reconciliation) {
               // A failed durable success terminal remains ACTIVE for retry or
               // crash repair; never rewrite it as a transport failure.
               resolveTerminal({ ok: false, responseBytes });
