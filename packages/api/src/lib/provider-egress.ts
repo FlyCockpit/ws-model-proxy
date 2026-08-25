@@ -257,21 +257,24 @@ export function assertSafeProviderHeaders(headers: Record<string, string>): void
  */
 export async function providerHttpsRequest(
   rawUrl: string,
-  options: Omit<RequestOptions, "hostname" | "host" | "port" | "protocol" | "lookup">,
+  options: Omit<RequestOptions, "hostname" | "host" | "port" | "protocol" | "lookup"> & {
+    body?: Uint8Array;
+  },
   policy: ProviderEgressPolicy,
   protocol: ProviderProtocol,
   auth: ProviderEgressAuth,
 ) {
   if (policy.egressEnabled !== true) throw new ProviderEgressError();
   const url = validateProviderBaseUrl(rawUrl, policy);
+  const { body, ...requestOptions } = options;
   const headers = {
-    ...sanitizeProviderHeaders((options.headers ?? {}) as Record<string, string>, protocol),
+    ...sanitizeProviderHeaders((requestOptions.headers ?? {}) as Record<string, string>, protocol),
     ...providerAuthHeaders(auth),
   };
   return new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
     const requestFunction = url.protocol === "https:" ? httpsRequest : httpRequest;
     const request = requestFunction(url, {
-      ...options,
+      ...requestOptions,
       headers,
       lookup(hostname, lookupOptions, callback) {
         dnsLookup(hostname, { ...lookupOptions, all: true }, (error, addresses) => {
@@ -291,9 +294,12 @@ export async function providerHttpsRequest(
     const timeoutMs = policy.timeoutMs ?? 10_000;
     request.setTimeout(timeoutMs, () => request.destroy(new ProviderEgressError()));
     const abort = () => request.destroy(new ProviderEgressError());
-    options.signal?.addEventListener("abort", abort, { once: true });
+    requestOptions.signal?.addEventListener("abort", abort, { once: true });
     request.once("response", (response) => {
-      options.signal?.removeEventListener("abort", abort);
+      const detachAbort = () => requestOptions.signal?.removeEventListener("abort", abort);
+      response.once("end", detachAbort);
+      response.once("close", detachAbort);
+      response.once("error", detachAbort);
       if ((response.statusCode ?? 0) >= 300 && (response.statusCode ?? 0) < 400) {
         response.resume();
         reject(new ProviderEgressError());
@@ -302,9 +308,9 @@ export async function providerHttpsRequest(
       resolve(response);
     });
     request.once("error", () => {
-      options.signal?.removeEventListener("abort", abort);
+      requestOptions.signal?.removeEventListener("abort", abort);
       reject(new ProviderEgressError());
     });
-    request.end();
+    request.end(body);
   });
 }

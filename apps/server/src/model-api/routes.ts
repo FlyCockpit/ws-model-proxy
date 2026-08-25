@@ -123,6 +123,11 @@ import {
   renderProtocolError,
   renderProtocolErrorMetadata,
 } from "./protocols/index.js";
+import {
+  conservativeProviderLiability,
+  dispatchPublicOverflow,
+  type PublicOverflowReason,
+} from "./public-overflow.js";
 import { type RelayAttemptTerminal, startRelayAttempt } from "./relay-executor.js";
 import { shouldRetryRelayOperation } from "./relay-retry-policy.js";
 import { type RelayBodySource } from "./request-body-source.js";
@@ -2495,7 +2500,7 @@ async function relayDirect({
     return operationFailureResponse(operation, "disconnected");
   }
 
-  if (operation.contextInput) {
+  if (capacityRuntime && operation.contextInput) {
     try {
       const exactCount = await nativeContextCount({ request, selected, operation, manager });
       if (exactCount) {
@@ -2777,11 +2782,213 @@ async function relayPool({
     contextCount: operation.contextCount,
   });
 
+  const tryPublicOverflow = async (
+    reason: PublicOverflowReason,
+    releaseLocalCapacity: () => Promise<void>,
+  ): Promise<Response | null> => {
+    // Public provider dispatch is intentionally limited to replayable modern
+    // JSON operations. Stateful Responses and multipart/audio paths must retain
+    // their exact target or fail safely.
+    if (!operation.contextInput || operation.responseStickiness) return null;
+    let built: BuiltRelayRequest;
+    try {
+      built = await operation.buildRequest("__public_provider_model__");
+    } catch {
+      return null;
+    }
+    if (!(built.body instanceof Uint8Array)) {
+      await built.body.dispose();
+      return null;
+    }
+    const publicRequestBytes = built.body.byteLength;
+    const requestedProtocol: "openai" | "anthropic" =
+      operation.family === "messages" ? "anthropic" : "openai";
+    const requestedSurface: ProtocolSurface =
+      operation.family === "messages"
+        ? "anthropic-messages"
+        : operation.family === "responses"
+          ? "openai-responses"
+          : "openai-chat";
+    const maxOutput = operation.contextInput.max_output_tokens ?? operation.contextInput.max_tokens;
+    const requestedFeatures = profileSurfaceRequest(operation.contextInput);
+    const requiredFeatures = Object.entries(requestedFeatures)
+      .filter(([, enabled]) => enabled === true)
+      .map(([feature]) => feature);
+    const requestedOutputTokens =
+      typeof maxOutput === "number" && Number.isSafeInteger(maxOutput) && maxOutput >= 0
+        ? BigInt(maxOutput)
+        : 4096n;
+    const canonical = operation.adaptation
+      ? (() => {
+          try {
+            return parseCanonicalRequest(
+              operation.adaptation!.requestedSurface,
+              operation.adaptation!.payload,
+            );
+          } catch {
+            return null;
+          }
+        })()
+      : null;
+    const result = await dispatchPublicOverflow({
+      userId: requester.userId,
+      poolId: target.id,
+      requestId: relayRequestId,
+      reason,
+      requestedProtocol,
+      requestedSurface,
+      stream: operation.stream,
+      requiredFeatures,
+      path: operation.path,
+      headers: built.headers,
+      body: built.body,
+      signal: request.signal,
+      releaseLocalCapacity,
+      adaptationEnabled:
+        operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled,
+      retrySafe:
+        shouldRetryRelayOperation(operation, "precommit_5xx") &&
+        shouldRetryRelayOperation(operation, "precommit_transport"),
+      liability: conservativeProviderLiability({
+        estimatedInputTokens: BigInt(operation.contextCount?.tokens ?? 0),
+        requestedOutputTokens,
+      }),
+      requestedOutputTokens,
+      renderForTarget: canonical
+        ? async (providerTarget) => {
+            const targetSurface: ProtocolSurface =
+              providerTarget.protocol === "anthropic"
+                ? "anthropic-messages"
+                : operation.adaptation?.requestedSurface === "openai-responses"
+                  ? "openai-responses"
+                  : "openai-chat";
+            const payload = renderCanonicalRequest({
+              request: canonical,
+              target: targetSurface,
+              model: providerTarget.upstreamModelId,
+              allowLossyDeveloperRoleCollapse:
+                operation.adaptation?.allowLossyDeveloperRoleCollapse,
+            });
+            const headers = new Headers({ "content-type": "application/json" });
+            if (providerTarget.protocol === "anthropic")
+              headers.set("anthropic-version", providerTarget.providerVersion ?? "2023-06-01");
+            return {
+              protocol: providerTarget.protocol,
+              path:
+                targetSurface === "anthropic-messages"
+                  ? "/v1/messages"
+                  : targetSurface === "openai-responses"
+                    ? "/v1/responses"
+                    : "/v1/chat/completions",
+              headers,
+              body: new TextEncoder().encode(JSON.stringify(payload)),
+            };
+          }
+        : undefined,
+    });
+    if (!result.dispatched) return null;
+    await prisma.relayRequest
+      .update({
+        where: { id: relayRequestId },
+        data: {
+          selectedExecutionTargetId: result.target.executionTargetId,
+          publicEgress: true,
+          publicOverflowReason: reason,
+          selectedPoolMemberTier: "PUBLIC_OVERFLOW",
+          providerAccountId: result.target.providerAccountId,
+          providerModelId: result.target.providerModelId,
+          providerAttemptId: result.attemptId,
+          providerFencingToken: result.fencingToken,
+          streamCommitted: true,
+          attemptCount: result.attemptCount,
+        },
+        select: { id: true },
+      })
+      .catch(metadataUpdateError);
+    void result.terminal
+      .then(async (terminal) => {
+        const completedAt = new Date();
+        await Promise.allSettled([
+          prisma.relayRequest.update({
+            where: { id: relayRequestId },
+            data: {
+              selectedExecutionTargetId: result.target.executionTargetId,
+              status: terminal.ok ? "SUCCEEDED" : request.signal.aborted ? "CANCELED" : "FAILED",
+              completedAt,
+              durationMs: Math.max(0, completedAt.getTime() - startedAt.getTime()),
+              httpStatusCode: result.response.status,
+              upstreamStatusCode: result.response.status,
+              requestBytes: BigInt(publicRequestBytes),
+              responseBytes: BigInt(terminal.responseBytes),
+              attemptCount: result.attemptCount,
+              errorClass: terminal.ok ? null : request.signal.aborted ? "cancelled" : "unknown",
+            },
+            select: { id: true },
+          }),
+          operation.dispose?.() ?? Promise.resolve(),
+        ]);
+      })
+      .catch(metadataUpdateError);
+    // Native response bytes remain opaque. Cross-protocol provider response
+    // adaptation is handled by the same strict streaming/non-streaming state
+    // machines as local targets.
+    if (result.target.protocol === requestedProtocol || !operation.adaptation)
+      return result.response;
+    const source: ProtocolSurface =
+      result.target.protocol === "anthropic"
+        ? "anthropic-messages"
+        : operation.adaptation.requestedSurface === "openai-responses"
+          ? "openai-responses"
+          : "openai-chat";
+    if (operation.stream) {
+      if (!result.response.body) return result.response;
+      return new Response(
+        adaptedResponseBody({
+          body: result.response.body,
+          source,
+          target: operation.adaptation.requestedSurface,
+          stream: true,
+          status: result.response.status,
+          headers: result.response.headers,
+          signal: request.signal,
+        }),
+        {
+          status: result.response.status,
+          headers: {
+            "content-type": "text/event-stream; charset=utf-8",
+            "x-wsmp-adapter-version": "1.0.0",
+          },
+        },
+      );
+    }
+    const bytes = new Uint8Array(await result.response.arrayBuffer());
+    const adapted = await readAdaptedNonstreamBody({
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(bytes);
+          controller.close();
+        },
+      }),
+      source,
+      target: operation.adaptation.requestedSurface,
+      status: result.response.status,
+      headers: result.response.headers,
+      signal: request.signal,
+    });
+    return new Response(adapted, {
+      status: result.response.status,
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "x-wsmp-adapter-version": "1.0.0",
+      },
+    });
+  };
+
   let globalLease: ModelApiLimitLease | undefined;
 
   const members = await poolMemberRows(target.id);
   const nativeCounts = new Map<string, ContextCountTelemetry>();
-  if (operation.contextInput) {
+  if (capacityRuntime && operation.contextInput) {
     await Promise.all(
       members.map(async (member) => {
         const selected = {
@@ -2824,6 +3031,8 @@ async function relayPool({
       )
     : members;
   if (members.length > 0 && contextEligibleMembers.length === 0) {
+    const overflow = await tryPublicOverflow("LOCAL_CONTEXT_CEILING", async () => undefined);
+    if (overflow) return overflow;
     await operation.dispose?.();
     await failRelayMetadata({ relayRequestId, startedAt, failure: "request_too_large" });
     return contextExceededResponse(
@@ -2907,6 +3116,11 @@ async function relayPool({
   // Known-compatible members always route before optimistic unknown fallbacks.
   const eligibleMembers = [...knownEligibleMembers, ...unknownFallbackMembers];
   if (eligibleMembers.length === 0) {
+    const overflow = await tryPublicOverflow(
+      "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      async () => undefined,
+    );
+    if (overflow) return overflow;
     globalLease?.release();
     await operation.dispose?.();
     await failRelayMetadata({
@@ -2946,6 +3160,11 @@ async function relayPool({
     ...(unknownSequence.ok ? unknownSequence.candidates : []),
   ];
   if (routeCandidates.length === 0) {
+    const overflow = await tryPublicOverflow(
+      "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      async () => undefined,
+    );
+    if (overflow) return overflow;
     globalLease?.release();
     await operation.dispose?.();
     await failRelayMetadata({ relayRequestId, startedAt, failure: "disconnected" });
@@ -3000,6 +3219,8 @@ async function relayPool({
       return operationFailureResponse(operation, "unknown");
     }
     if (capacityLease.state !== "ADMITTED" || !capacityLease.lease.poolMemberId) {
+      const overflow = await tryPublicOverflow("LOCAL_WAIT_EXPIRED", async () => undefined);
+      if (overflow) return overflow;
       globalLease?.release();
       await operation.dispose?.();
       await failRelayMetadata({ relayRequestId, startedAt, failure: "rate_limited" });
@@ -3598,6 +3819,22 @@ async function relayPool({
       return operationFailureResponse(operation, failure);
     }
   }
+
+  const overflowReason: PublicOverflowReason =
+    finalFailure === "rate_limited" || finalFailure === "timeout"
+      ? "LOCAL_WAIT_EXPIRED"
+      : "RETRYABLE_PRECOMMIT_PRIMARY_FAILURE";
+  const overflow = await tryPublicOverflow(overflowReason, async () => {
+    const lease = capacityLease?.state === "ADMITTED" ? capacityLease.lease : undefined;
+    capacityLease = undefined;
+    const acquiredGlobalLease = globalLease;
+    globalLease = undefined;
+    await settleRelayCleanup([
+      () => acquiredGlobalLease?.release(),
+      () => (lease ? capacityRuntime?.release(lease) : undefined),
+    ]);
+  });
+  if (overflow) return overflow;
 
   await settleRelayCleanup([
     () => globalLease?.release(),
@@ -4407,7 +4644,7 @@ async function relayPreparedModeledRequest({
   limiter: ModelApiConcurrencyLimiter;
 }) {
   let contextCount: ContextCountTelemetry | undefined;
-  if (capacityRuntime && prepared.payload) {
+  if (prepared.payload) {
     try {
       contextCount = await countSerializedRequestContext({
         input: prepared.payload,
@@ -4490,7 +4727,7 @@ async function relayPreparedModeledRequest({
       return maybeTransformed;
     }
     prepared = maybeTransformed;
-    if (capacityRuntime && prepared.payload) {
+    if (prepared.payload) {
       try {
         // Media descriptions can grow or shrink the serialized request. Pool
         // eligibility must use the payload that will actually reach members.
@@ -4514,7 +4751,7 @@ async function relayPreparedModeledRequest({
       transcriptionProfile: prepared.transcriptionProfile,
       dispose: prepared.dispose,
       contextCount,
-      contextInput: capacityRuntime ? (prepared.payload ?? undefined) : undefined,
+      contextInput: prepared.payload ?? undefined,
       ...(prepared.payload &&
       (operation.family === "chat.completions" ||
         (operation.family === "responses" && operation.capability === "responses.create") ||

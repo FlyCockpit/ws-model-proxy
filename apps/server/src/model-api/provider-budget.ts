@@ -45,11 +45,12 @@ export type ProviderBudgetAdmission =
       admitted: false;
       reason:
         | "BUDGET_EXCEEDED"
+        | "PROVIDER_CONCURRENCY_EXCEEDED"
         | "CURRENCY_UNAVAILABLE"
         | "PRICING_UNAVAILABLE"
         | "TOKEN_BOUND_UNAVAILABLE";
-      policyId: string;
-      ruleId: string;
+      policyId?: string;
+      ruleId?: string;
     };
 
 export interface RawProviderUsage extends ProviderTokenUsage {
@@ -369,6 +370,37 @@ export async function admitProviderBudget(
       if (!completeLiveReservedSet)
         throw new ProviderBudgetConfigurationError("Provider attempt is no longer replayable");
       return { admitted: true, reservationIds: replay.map(({ id }) => id) };
+    }
+    // The provider model's physical concurrency ceiling is admitted under the
+    // same account lock and transaction as financial/token budgets. Live
+    // attempt anchors remain liabilities until terminal reconciliation or
+    // expiry, including attempts with no explicit budget policies.
+    const providerModel = await tx.providerModel.findFirst({
+      where: {
+        id: attempt.providerModelId,
+        userId: attempt.userId,
+        providerAccountId: attempt.providerAccountId,
+        enabled: true,
+        deletedAt: null,
+      },
+      select: { concurrencyLimit: true },
+    });
+    if (!providerModel) throw new ProviderBudgetConfigurationError("Provider model is unavailable");
+    if (providerModel.concurrencyLimit !== null) {
+      const live = await tx.$queryRaw<Array<{ count: bigint }>>`
+        SELECT COUNT(*)::bigint AS count
+          FROM provider_attempt attempt
+         WHERE attempt."userId" = ${attempt.userId}
+           AND attempt."providerModelId" = ${attempt.providerModelId}
+           AND attempt."expiresAt" > ${now}
+           AND NOT EXISTS (
+             SELECT 1 FROM provider_usage_ledger ledger
+              WHERE ledger."attemptId" = attempt."attemptId"
+                AND ledger."fencingToken" = attempt."fencingToken"
+           )`;
+      if ((live[0]?.count ?? 0n) >= BigInt(providerModel.concurrencyLimit)) {
+        return { admitted: false, reason: "PROVIDER_CONCURRENCY_EXCEEDED" };
+      }
     }
     const policies = await tx.providerBudgetPolicy.findMany({
       where: {

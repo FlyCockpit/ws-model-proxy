@@ -74,6 +74,43 @@ describe("provider egress policy", () => {
     expect(observed.cookie).toBeUndefined();
   });
 
+  it("streams the exact request bytes without reflecting inbound credentials", async () => {
+    let observedBody = Buffer.alloc(0);
+    const server = createServer((request, response) => {
+      const chunks: Buffer[] = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        observedBody = Buffer.concat(chunks);
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end("{}");
+      });
+    });
+    servers.push(server);
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server did not bind");
+    const body = new TextEncoder().encode('{"model":"rewritten","stream":true}');
+    const response = await providerHttpsRequest(
+      `http://127.0.0.1:${address.port}/v1/messages`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer inbound-must-not-leak",
+          "anthropic-version": "2023-06-01",
+        },
+        body,
+      },
+      { allowPrivateNetworks: true, egressEnabled: true },
+      "anthropic",
+      { type: "API_KEY", apiKey: "provider-secret" },
+    );
+    response.resume();
+    await once(response, "end");
+    expect(observedBody).toEqual(Buffer.from(body));
+  });
+
   it.each(["127.0.0.1", "10.1.2.3", "169.254.169.254", "192.168.1.1", "::1", "fd00::1"])(
     "recognizes private address %s",
     (address) => expect(isPrivateOrSpecialAddress(address)).toBe(true),

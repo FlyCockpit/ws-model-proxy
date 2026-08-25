@@ -26,6 +26,12 @@
     "./lib/surface-capabilities": {
       "default": "./src/lib/surface-capabilities.ts"
     },
+    "./lib/provider-credential-crypto": {
+      "default": "./src/lib/provider-credential-crypto.ts"
+    },
+    "./lib/provider-egress": {
+      "default": "./src/lib/provider-egress.ts"
+    },
     "./routers/index": {
       "default": "./src/routers/index.ts"
     }

@@ -110,6 +110,85 @@ ALTER TABLE pool_member ADD CONSTRAINT pool_member_capacity_policy_check CHECK (
     OR "capacityContextMargin" < "capacityContextCeiling")
 );
 
+ALTER TABLE pool_member DROP CONSTRAINT IF EXISTS pool_member_tier_shape_check;
+ALTER TABLE pool_member ADD CONSTRAINT pool_member_tier_shape_check CHECK (
+  (tier = 'PRIMARY' AND "publicOrder" IS NULL)
+  OR (tier = 'PUBLIC_OVERFLOW' AND "publicOrder" IS NOT NULL AND "publicOrder" >= 0)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS pool_member_public_order_unique
+  ON pool_member ("poolId", "publicOrder") WHERE tier = 'PUBLIC_OVERFLOW';
+
+CREATE OR REPLACE FUNCTION enforce_pool_member_tier_source()
+RETURNS trigger LANGUAGE plpgsql AS $pool_member_tier_source$
+DECLARE
+  target_kind "ExecutionTargetKind";
+  target_owner TEXT;
+  pool_owner TEXT;
+  public_enabled BOOLEAN;
+  public_ack BOOLEAN;
+BEGIN
+  SELECT kind, "userId" INTO target_kind, target_owner
+    FROM execution_target WHERE id = NEW."executionTargetId";
+  SELECT "userId", "publicEgressEnabled", "publicEgressAcknowledged"
+    INTO pool_owner, public_enabled, public_ack
+    FROM model_pool WHERE id = NEW."poolId";
+  IF target_owner IS DISTINCT FROM pool_owner THEN
+    RAISE EXCEPTION 'pool member target must have the same owner as its pool'
+      USING ERRCODE = '23514';
+  END IF;
+  IF NEW.tier = 'PRIMARY' AND target_kind IS DISTINCT FROM 'DISCOVERED_MODEL' THEN
+    RAISE EXCEPTION 'primary pool members must be discovered models'
+      USING ERRCODE = '23514';
+  END IF;
+  IF NEW.tier = 'PUBLIC_OVERFLOW' AND
+     (target_kind IS DISTINCT FROM 'PROVIDER_MODEL' OR NOT public_enabled OR NOT public_ack) THEN
+    RAISE EXCEPTION 'public overflow requires an acknowledged public pool and provider target'
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END
+$pool_member_tier_source$;
+
+DROP TRIGGER IF EXISTS pool_member_tier_source ON pool_member;
+CREATE TRIGGER pool_member_tier_source
+BEFORE INSERT OR UPDATE OF "poolId", "executionTargetId", tier, "publicOrder" ON pool_member
+FOR EACH ROW EXECUTE FUNCTION enforce_pool_member_tier_source();
+
+CREATE OR REPLACE FUNCTION enforce_pool_public_disable()
+RETURNS trigger LANGUAGE plpgsql AS $pool_public_disable$
+BEGIN
+  IF (NOT NEW."publicEgressEnabled" OR NOT NEW."publicEgressAcknowledged") AND EXISTS (
+    SELECT 1 FROM pool_member
+     WHERE "poolId" = NEW.id AND tier = 'PUBLIC_OVERFLOW'
+  ) THEN
+    RAISE EXCEPTION 'remove public overflow members before disabling public egress'
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END
+$pool_public_disable$;
+
+DROP TRIGGER IF EXISTS model_pool_public_disable ON model_pool;
+CREATE TRIGGER model_pool_public_disable
+BEFORE UPDATE OF "publicEgressEnabled", "publicEgressAcknowledged" ON model_pool
+FOR EACH ROW EXECUTE FUNCTION enforce_pool_public_disable();
+
+CREATE OR REPLACE FUNCTION enforce_model_pool_owner_immutable()
+RETURNS trigger LANGUAGE plpgsql AS $model_pool_owner_immutable$
+BEGIN
+  IF NEW."userId" IS DISTINCT FROM OLD."userId" THEN
+    RAISE EXCEPTION 'model pool owner is immutable' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END
+$model_pool_owner_immutable$;
+
+DROP TRIGGER IF EXISTS model_pool_owner_immutable ON model_pool;
+CREATE TRIGGER model_pool_owner_immutable
+BEFORE UPDATE OF "userId" ON model_pool
+FOR EACH ROW EXECUTE FUNCTION enforce_model_pool_owner_immutable();
+
 ALTER TABLE admission_request DROP CONSTRAINT IF EXISTS admission_request_shape_check;
 ALTER TABLE admission_request ADD CONSTRAINT admission_request_shape_check CHECK (
   "basePriority" BETWEEN 0 AND 31

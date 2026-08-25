@@ -143,6 +143,11 @@ enum PoolMemberRoutingStatus {
   DISABLED
 }
 
+enum PoolMemberTier {
+  PRIMARY
+  PUBLIC_OVERFLOW
+}
+
 enum PoolMemberFailureClass {
   TRANSPORT
   RELAY_TIMEOUT
@@ -802,6 +807,10 @@ model ModelPool {
   optimisticBasicTranscription    Boolean                       @default(false)
   /// Permit the documented strict-subset translation between modern model APIs.
   protocolAdaptationEnabled       Boolean                       @default(false)
+  /// Explicit owner opt-in. Provider members are inert unless both this and
+  /// publicEgressAcknowledged are true and the deployment gate is enabled.
+  publicEgressEnabled             Boolean                       @default(false)
+  publicEgressAcknowledged        Boolean                       @default(false)
   /// Permit developer instructions to collapse into the target protocol's system role.
   allowLossyDeveloperRoleCollapse Boolean                       @default(false)
   /// Optional validated preferred API surface; null lets WSMP recommend one.
@@ -839,6 +848,9 @@ model PoolMember {
   poolId                       String
   discoveredModelId            String?
   executionTargetId            String?
+  tier                         PoolMemberTier          @default(PRIMARY)
+  /// Stable owner-defined order for PUBLIC_OVERFLOW targets. Null for primaries.
+  publicOrder                  Int?
   /// Null inherits the owning pool policy.
   capacityPriority             Int?
   capacityConcurrencyMode      CapacityLimitMode       @default(INHERIT)
@@ -1164,6 +1176,15 @@ model RelayRequest {
   admissionReservationClass  Int?
   admissionBorrowed          Boolean?
   admissionTerminalState     String?
+  /// Prompt-free public overflow correlation and commitment telemetry.
+  publicEgress               Boolean            @default(false)
+  publicOverflowReason       String?
+  selectedPoolMemberTier     String?
+  providerAccountId          String?
+  providerModelId            String?
+  providerAttemptId          String?
+  providerFencingToken       BigInt?
+  streamCommitted            Boolean            @default(false)
   /// Protocol operation only; never stores prompts, filenames, audio, or transcripts.
   operation                  String?
   /// Sum of rebuilt upstream request-body bytes across all relay attempts.

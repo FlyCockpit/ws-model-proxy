@@ -169,6 +169,8 @@ type ModelPoolRow = {
   maxAttachmentBytes: number | null;
   optimisticBasicTranscription: boolean;
   protocolAdaptationEnabled: boolean;
+  publicEgressEnabled: boolean;
+  publicEgressAcknowledged: boolean;
   allowLossyDeveloperRoleCollapse: boolean;
   recommendedSurfaceOverride: string | null;
   capacityPriority: number;
@@ -209,6 +211,8 @@ type PoolMemberRow = {
   createdAt: Date;
   updatedAt: Date;
   discoveredModelId: string | null;
+  tier: "PRIMARY" | "PUBLIC_OVERFLOW";
+  publicOrder: number | null;
   weight: number;
   healthStatus: string;
   routingStatus: string;
@@ -233,6 +237,14 @@ type PoolMemberRow = {
     kind: string;
     inferenceCapacityId: string | null;
     DiscoveredModel: PoolMemberModelRow | null;
+    ProviderModel: {
+      id: string;
+      upstreamModelId: string;
+      displayName: string | null;
+      healthStatus: string;
+      enabled: boolean;
+      ProviderAccount: { id: string; label: string; providerType: string; enabled: boolean };
+    } | null;
   } | null;
 };
 
@@ -570,6 +582,8 @@ function serializePool(row: ModelPoolRow) {
     maxAttachmentBytes: row.maxAttachmentBytes,
     optimisticBasicTranscription: row.optimisticBasicTranscription,
     protocolAdaptationEnabled: row.protocolAdaptationEnabled,
+    publicEgressEnabled: row.publicEgressEnabled,
+    publicEgressAcknowledged: row.publicEgressAcknowledged,
     allowLossyDeveloperRoleCollapse: row.allowLossyDeveloperRoleCollapse,
     recommendedSurfaceOverride,
     capacityPriority: row.capacityPriority,
@@ -613,6 +627,8 @@ function serializePool(row: ModelPoolRow) {
         createdAt: member.createdAt,
         updatedAt: member.updatedAt,
         discoveredModelId: model?.id ?? member.discoveredModelId,
+        tier: member.tier,
+        publicOrder: member.publicOrder,
         executionTargetId: member.ExecutionTarget?.id ?? null,
         inferenceCapacityId: member.ExecutionTarget?.inferenceCapacityId ?? null,
         capacityPriority: member.capacityPriority,
@@ -652,6 +668,7 @@ function serializePool(row: ModelPoolRow) {
               }),
             }
           : null,
+        providerModel: member.ExecutionTarget?.ProviderModel ?? null,
       };
     }),
     grants: row.PoolGrants.map((grant) => ({
@@ -824,6 +841,8 @@ const poolSelect = {
   maxAttachmentBytes: true,
   optimisticBasicTranscription: true,
   protocolAdaptationEnabled: true,
+  publicEgressEnabled: true,
+  publicEgressAcknowledged: true,
   allowLossyDeveloperRoleCollapse: true,
   recommendedSurfaceOverride: true,
   capacityPriority: true,
@@ -866,6 +885,8 @@ const poolSelect = {
       createdAt: true,
       updatedAt: true,
       discoveredModelId: true,
+      tier: true,
+      publicOrder: true,
       ExecutionTarget: {
         select: {
           id: true,
@@ -887,6 +908,18 @@ const poolSelect = {
                   defaultCapabilities: true,
                   CliDevice: { select: { slug: true } },
                 },
+              },
+            },
+          },
+          ProviderModel: {
+            select: {
+              id: true,
+              upstreamModelId: true,
+              displayName: true,
+              healthStatus: true,
+              enabled: true,
+              ProviderAccount: {
+                select: { id: true, label: true, providerType: true, enabled: true },
               },
             },
           },
@@ -1105,6 +1138,8 @@ export const forwarderManagementRouter = {
         maxAttachmentBytes: attachmentLimitSchema,
         optimisticBasicTranscription: z.boolean().optional(),
         protocolAdaptationEnabled: z.boolean().optional(),
+        publicEgressEnabled: z.boolean().optional(),
+        publicEgressAcknowledged: z.literal(true).optional(),
         allowLossyDeveloperRoleCollapse: z.boolean().optional(),
         recommendedSurfaceOverride: z.enum(modelApiSurfaces).nullable().optional(),
         capacityPriority: z.number().int().min(0).max(31).optional(),
@@ -1130,6 +1165,8 @@ export const forwarderManagementRouter = {
           : {}),
         optimisticBasicTranscription: input.optimisticBasicTranscription ?? false,
         protocolAdaptationEnabled: input.protocolAdaptationEnabled ?? false,
+        publicEgressEnabled: input.publicEgressEnabled ?? false,
+        publicEgressAcknowledged: input.publicEgressAcknowledged ?? false,
         allowLossyDeveloperRoleCollapse: input.allowLossyDeveloperRoleCollapse ?? false,
         recommendedSurfaceOverride: input.recommendedSurfaceOverride ?? null,
         capacityPriority: input.capacityPriority ?? 16,
@@ -1191,6 +1228,8 @@ export const forwarderManagementRouter = {
         maxAttachmentBytes: attachmentLimitSchema,
         optimisticBasicTranscription: z.boolean().optional(),
         protocolAdaptationEnabled: z.boolean().optional(),
+        publicEgressEnabled: z.boolean().optional(),
+        publicEgressAcknowledged: z.literal(true).optional(),
         allowLossyDeveloperRoleCollapse: z.boolean().optional(),
         recommendedSurfaceOverride: z.enum(modelApiSurfaces).nullable().optional(),
       }),
@@ -1300,6 +1339,12 @@ export const forwarderManagementRouter = {
           ...(input.protocolAdaptationEnabled !== undefined
             ? { protocolAdaptationEnabled: input.protocolAdaptationEnabled }
             : {}),
+          ...(input.publicEgressEnabled !== undefined
+            ? { publicEgressEnabled: input.publicEgressEnabled }
+            : {}),
+          ...(input.publicEgressAcknowledged !== undefined
+            ? { publicEgressAcknowledged: input.publicEgressAcknowledged }
+            : {}),
           ...(input.allowLossyDeveloperRoleCollapse !== undefined
             ? { allowLossyDeveloperRoleCollapse: input.allowLossyDeveloperRoleCollapse }
             : {}),
@@ -1357,12 +1402,61 @@ export const forwarderManagementRouter = {
       });
     }),
 
+  addProviderPoolMember: protectedProcedure
+    .input(
+      z.object({
+        poolId: idSchema,
+        providerModelId: idSchema,
+        publicOrder: z.number().int().min(0).max(10_000),
+      }),
+    )
+    .handler(async ({ input, context }) => {
+      const userId = context.session.user.id;
+      return prisma.$transaction(async (tx) => {
+        const pool = await tx.modelPool.findFirst({
+          where: { id: input.poolId, userId },
+          select: { id: true, publicEgressEnabled: true, publicEgressAcknowledged: true },
+        });
+        if (!pool) throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+        if (!pool.publicEgressEnabled || !pool.publicEgressAcknowledged) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: "Acknowledge and enable public egress before adding an overflow target.",
+          });
+        }
+        const providerModel = await tx.providerModel.findFirst({
+          where: { id: input.providerModelId, userId, deletedAt: null },
+          select: { id: true },
+        });
+        if (!providerModel) {
+          throw new ORPCError("NOT_FOUND", { message: "Provider model not found." });
+        }
+        const target = await tx.executionTarget.upsert({
+          where: { providerModelId: input.providerModelId },
+          update: {},
+          create: { userId, kind: "PROVIDER_MODEL", providerModelId: input.providerModelId },
+          select: { id: true },
+        });
+        const member = await tx.poolMember.create({
+          data: {
+            poolId: input.poolId,
+            executionTargetId: target.id,
+            tier: "PUBLIC_OVERFLOW",
+            publicOrder: input.publicOrder,
+            weight: 0,
+          },
+          select: { id: true },
+        });
+        return { id: member.id, executionTargetId: target.id };
+      });
+    }),
+
   updatePoolMember: protectedProcedure
     .input(
       z.object({
         id: idSchema,
         weight: z.number().int().min(0).max(10_000).optional(),
         routingStatus: routingStatusSchema.optional(),
+        publicOrder: z.number().int().min(0).max(10_000).optional(),
       }),
     )
     .handler(async ({ input, context }) => {
@@ -1378,8 +1472,9 @@ export const forwarderManagementRouter = {
         data: {
           ...(input.weight !== undefined ? { weight: input.weight } : {}),
           ...(input.routingStatus ? { routingStatus: input.routingStatus } : {}),
+          ...(input.publicOrder !== undefined ? { publicOrder: input.publicOrder } : {}),
         },
-        select: { id: true, weight: true, routingStatus: true },
+        select: { id: true, weight: true, routingStatus: true, tier: true, publicOrder: true },
       });
     }),
 
