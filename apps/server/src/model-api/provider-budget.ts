@@ -175,6 +175,81 @@ function canonicalPayloadHash(value: unknown): string {
     .digest("hex");
 }
 
+/**
+ * Hash only the normalized semantics that this service persists. In particular,
+ * callers may attach transport metadata without changing revision identity, and
+ * equivalent currency/version/source spelling must remain idempotent.
+ */
+function terminalPayloadHash(
+  terminal: ProviderBudgetTerminal,
+  sourceVersion: string,
+  usageSource: string,
+  accountingVersion: string,
+  accountingMatches: boolean,
+): string {
+  const usage = terminal.usage;
+  const normalizedUsage = usage
+    ? {
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        cacheReadTokens: usage.cacheReadTokens,
+        cacheWriteTokens: usage.cacheWriteTokens,
+        reasoningTokens: usage.reasoningTokens,
+        toolTokens: usage.toolTokens,
+        additionalBillableTokens: usage.additionalBillableTokens,
+        authoritativeBillableTokens: usage.authoritativeBillableTokens,
+        categoriesComplete: usage.categoriesComplete,
+        rawUsage: usage.rawUsage,
+        reportedCost: usage.reportedCost === undefined ? undefined : decimal(usage.reportedCost),
+        reportedCostCurrency: normalizedCurrency(usage.reportedCostCurrency ?? usage.currency),
+        reportedCostPricingVersion:
+          usage.reportedCostPricingVersion === undefined && usage.pricingVersion === undefined
+            ? undefined
+            : normalizedVersion(
+                usage.reportedCostPricingVersion ?? usage.pricingVersion,
+                "reportedCostPricingVersion",
+              ),
+        reportedCostSource:
+          usage.reportedCost === undefined
+            ? undefined
+            : normalizedVersion(usage.reportedCostSource ?? usageSource, "reportedCostSource"),
+        calculatedCost:
+          usage.calculatedCost === undefined ? undefined : decimal(usage.calculatedCost),
+        calculatedCostCurrency: normalizedCurrency(usage.calculatedCostCurrency ?? usage.currency),
+        calculatedCostPricingVersion:
+          usage.calculatedCostPricingVersion === undefined && usage.pricingVersion === undefined
+            ? undefined
+            : normalizedVersion(
+                usage.calculatedCostPricingVersion ?? usage.pricingVersion,
+                "calculatedCostPricingVersion",
+              ),
+        calculatedCostSource:
+          usage.calculatedCost === undefined
+            ? undefined
+            : normalizedVersion(usage.calculatedCostSource ?? usageSource, "calculatedCostSource"),
+        billableTotal: accountingMatches ? providerBillableTokens(usage) : undefined,
+        accountingVersion,
+        confidence: usage.confidence,
+      }
+    : undefined;
+  return canonicalPayloadHash({
+    userId: terminal.userId,
+    providerAccountId: terminal.providerAccountId,
+    providerModelId: terminal.providerModelId,
+    credentialId: terminal.credentialId,
+    poolId: terminal.poolId,
+    requestId: terminal.requestId,
+    attemptId: terminal.attemptId,
+    fencingToken: terminal.fencingToken,
+    reason: terminal.reason,
+    sourceVersion,
+    revisionSequence: terminal.revisionSequence,
+    revisionKind: terminal.revisionKind,
+    usageSource,
+    usage: normalizedUsage,
+  });
+}
+
 function reservationValue(
   metric: BudgetMetric,
   liability: ProviderLiability,
@@ -235,31 +310,6 @@ export async function admitProviderBudget(
   return serializable(async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-attempt:${attempt.attemptId}`}, 0))`;
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-account:${attempt.userId}:${attempt.providerAccountId}`}, 0))`;
-    const policies = await tx.providerBudgetPolicy.findMany({
-      where: {
-        userId: attempt.userId,
-        providerAccountId: attempt.providerAccountId,
-        active: true,
-        OR: [
-          { scopeType: "PROVIDER_ACCOUNT", poolId: null, providerModelId: null },
-          ...(attempt.poolId
-            ? [
-                {
-                  scopeType: "POOL_PROVIDER_MODEL" as const,
-                  poolId: attempt.poolId,
-                  providerModelId: attempt.providerModelId,
-                },
-              ]
-            : []),
-        ],
-      },
-      include: { Rules: true },
-      orderBy: { id: "asc" },
-    });
-    for (const policy of policies) {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget:${policy.id}`}, 0))`;
-    }
-
     const nowRows = await tx.$queryRaw<Array<{ now: Date }>>`SELECT transaction_timestamp() AS now`;
     const now = nowRows[0]?.now;
     if (!now) throw new ProviderBudgetConfigurationError("Database clock unavailable");
@@ -302,30 +352,45 @@ export async function admitProviderBudget(
         orderBy: { id: "asc" },
         select: { id: true, policyId: true, ruleId: true, state: true, expiresAt: true },
       });
-      const expectedRules = new Set(
-        policies.flatMap((policy) =>
-          policy.Rules.filter((rule) => rule.mode === "LIMITED").map(
-            (rule) => `${policy.id}:${rule.id}`,
-          ),
-        ),
-      );
       const hasTerminal = await tx.providerUsageLedger.count({
         where: { attemptId: attempt.attemptId, fencingToken: attempt.fencingToken },
       });
       const completeLiveReservedSet =
         attemptAnchor.expiresAt.getTime() > now.getTime() &&
         hasTerminal === 0 &&
-        replay.length === expectedRules.size &&
         replay.every(
           (row) =>
             row.state === "RESERVED" &&
             row.expiresAt !== null &&
-            row.expiresAt.getTime() > now.getTime() &&
-            expectedRules.has(`${row.policyId}:${row.ruleId}`),
+            row.expiresAt.getTime() > now.getTime(),
         );
       if (!completeLiveReservedSet)
         throw new ProviderBudgetConfigurationError("Provider attempt is no longer replayable");
       return { admitted: true, reservationIds: replay.map(({ id }) => id) };
+    }
+    const policies = await tx.providerBudgetPolicy.findMany({
+      where: {
+        userId: attempt.userId,
+        providerAccountId: attempt.providerAccountId,
+        active: true,
+        OR: [
+          { scopeType: "PROVIDER_ACCOUNT", poolId: null, providerModelId: null },
+          ...(attempt.poolId
+            ? [
+                {
+                  scopeType: "POOL_PROVIDER_MODEL" as const,
+                  poolId: attempt.poolId,
+                  providerModelId: attempt.providerModelId,
+                },
+              ]
+            : []),
+        ],
+      },
+      include: { Rules: true },
+      orderBy: { id: "asc" },
+    });
+    for (const policy of policies) {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget:${policy.id}`}, 0))`;
     }
     if (attempt.expiresAt.getTime() <= now.getTime())
       throw new ProviderBudgetConfigurationError(
@@ -599,11 +664,6 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
     terminal.usageSource ?? (terminal.reason === "CRASH_RECOVERY" ? "crash-repair" : "terminal"),
     "usageSource",
   );
-  const payloadHash = canonicalPayloadHash({
-    ...terminal,
-    sourceVersion,
-    usageSource,
-  });
   await serializable(async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-attempt:${terminal.attemptId}`}, 0))`;
     const anchor = await tx.providerAttempt.findUnique({
@@ -625,6 +685,16 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
     )
       throw new ProviderBudgetConfigurationError("Terminal attempt identity conflict");
 
+    const usage = terminal.usage;
+    const billableTotal = usage && providerBillableTokens(usage);
+    const accountingMatches = usage?.accountingVersion.trim() === anchor.accountingVersion;
+    const payloadHash = terminalPayloadHash(
+      terminal,
+      sourceVersion,
+      usageSource,
+      anchor.accountingVersion,
+      accountingMatches,
+    );
     const priorRevision = await tx.providerUsageLedger.findUnique({
       where: {
         attemptId_fencingToken_sourceVersion: {
@@ -666,9 +736,6 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
     for (const reservation of reservations)
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget:${reservation.policyId}`}, 0))`;
 
-    const usage = terminal.usage;
-    const billableTotal = usage && providerBillableTokens(usage);
-    const accountingMatches = usage?.accountingVersion.trim() === anchor.accountingVersion;
     const reportedCurrency = normalizedCurrency(usage?.reportedCostCurrency ?? usage?.currency);
     const reportedPricingVersion =
       usage?.reportedCostPricingVersion?.trim() ?? usage?.pricingVersion?.trim();
@@ -779,14 +846,16 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
         reportedCostCurrency: reportedCurrency,
         reportedCostPricingVersion: reportedPricingVersion,
         reportedCostSource:
-          usage?.reportedCost === undefined ? undefined : (usage.reportedCostSource ?? usageSource),
+          usage?.reportedCost === undefined
+            ? undefined
+            : normalizedVersion(usage.reportedCostSource ?? usageSource, "reportedCostSource"),
         calculatedCost: usage?.calculatedCost,
         calculatedCostCurrency: calculatedCurrency,
         calculatedCostPricingVersion: calculatedPricingVersion,
         calculatedCostSource:
           usage?.calculatedCost === undefined
             ? undefined
-            : (usage.calculatedCostSource ?? usageSource),
+            : normalizedVersion(usage.calculatedCostSource ?? usageSource, "calculatedCostSource"),
         settledCost,
         currency: anchor.liabilityCurrency,
         pricingVersion: anchor.pricingVersion,

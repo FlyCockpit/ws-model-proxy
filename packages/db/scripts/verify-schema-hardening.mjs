@@ -748,6 +748,47 @@ try {
       date_trunc('day', NOW()), date_trunc('day', NOW()) + interval '1 day', 4, 4, 'usage-v1',
       NOW() + interval '1 hour')
   `);
+  // A real previous-schema upgrade also arrives with legacy accounting rows
+  // and the old append-only triggers already installed. The compatibility
+  // transaction must temporarily remove only the triggers guarding rows it
+  // rewrites, then restore them before commit.
+  await client.query(
+    `ALTER TABLE provider_budget_settlement DROP CONSTRAINT provider_budget_settlement_shape_check`,
+  );
+  await client.query(
+    `DROP TRIGGER provider_budget_settlement_graph_consistency ON provider_budget_settlement`,
+  );
+  await client.query(`
+    INSERT INTO provider_attempt
+      (id, "createdAt", "userId", "providerAccountId", "providerModelId", "requestId",
+       "attemptId", "fencingToken", "expiresAt", "liabilityTokens", "accountingVersion")
+    VALUES ('legacy-history-attempt', NOW(), 'owner-a', 'provider-account-a', 'provider-model-a',
+      'legacy-history-request', 'legacy-history', 8, NOW() + interval '1 hour', 4, 'usage-v1');
+    INSERT INTO provider_budget_reservation
+      (id, "createdAt", "userId", "providerAccountId", "providerModelId", "policyId", "ruleId",
+       "requestId", "attemptId", "fencingToken", metric, period, "policyVersion", "windowStart",
+       "windowEnd", "reservedValue", "liabilityTokens", "accountingVersion", "expiresAt")
+    VALUES ('legacy-history-reservation', NOW(), 'owner-a', 'provider-account-a',
+      'provider-model-a', 'budget-policy-a', 'token-rule', 'legacy-history-request',
+      'legacy-history', 8, 'TOKENS', 'UTC_DAY', 1, date_trunc('day', NOW()),
+      date_trunc('day', NOW()) + interval '1 day', 4, 4, 'usage-v1', NOW() + interval '1 hour');
+    INSERT INTO provider_usage_ledger
+      (id, "createdAt", "userId", "providerAccountId", "providerModelId", "reservationId",
+       "requestId", "attemptId", "fencingToken", "accountingVersion", "sourceVersion",
+       "usageSource", "revisionSequence", "revisionKind", "payloadHash", "usageKnown",
+       "costKnown", "terminalReason", confidence)
+    VALUES ('legacy-history-ledger', NOW(), 'owner-a', 'provider-account-a', 'provider-model-a',
+      'legacy-history-reservation', 'legacy-history-request', 'legacy-history', 8, 'usage-v1',
+      'legacy-history-v1', 'legacy', 1, 'SNAPSHOT', 'legacy-pending', false, false,
+      'FAILED', 'ESTIMATED');
+    INSERT INTO provider_budget_settlement
+      (id, "createdAt", "userId", "providerAccountId", "providerModelId", "requestId",
+       "reservationId", "attemptId", "fencingToken", "sourceVersion", "revisionSequence",
+       "revisionKind", "payloadHash", "accountingVersion", "settledValue", confidence, reason)
+    VALUES ('legacy-history-settlement', NOW(), 'owner-a', '', '', '',
+      'legacy-history-reservation', 'legacy-history', 8, 'legacy-history-v1', 1,
+      'SNAPSHOT', 'legacy-pending', '', 4, 'ESTIMATED', 'FAILED')
+  `);
 
   // Recreate the deployment boundary and prove a transaction from an old
   // instance cannot slip a discovered model between trigger install/backfill.
@@ -780,6 +821,31 @@ try {
   if (!observedLockWait) throw new Error("Hardening did not lock out the concurrent old writer");
   await oldWriter.query("COMMIT");
   await concurrentHardening;
+  const upgradedHistory = await client.query(`
+    SELECT ledger."payloadHash" AS ledger_hash, settlement."payloadHash" AS settlement_hash,
+           settlement."providerAccountId" AS account_id, settlement."requestId" AS request_id
+      FROM provider_usage_ledger ledger
+      JOIN provider_budget_settlement settlement
+        ON settlement."attemptId" = ledger."attemptId"
+     WHERE ledger.id = 'legacy-history-ledger'
+  `);
+  if (
+    upgradedHistory.rows[0]?.ledger_hash === "legacy-pending" ||
+    upgradedHistory.rows[0]?.settlement_hash !== upgradedHistory.rows[0]?.ledger_hash ||
+    upgradedHistory.rows[0]?.account_id !== "provider-account-a" ||
+    upgradedHistory.rows[0]?.request_id !== "legacy-history-request"
+  ) {
+    throw new Error("Previous-schema accounting history was not upgraded atomically");
+  }
+  const restoredHistoryTriggers = await client.query(`
+    SELECT tgname FROM pg_trigger
+     WHERE tgrelid IN ('provider_usage_ledger'::regclass, 'provider_budget_settlement'::regclass)
+       AND tgname IN ('provider_usage_ledger_immutable', 'provider_budget_settlement_immutable')
+       AND tgenabled <> 'D'
+  `);
+  if (restoredHistoryTriggers.rowCount !== 2) {
+    throw new Error("Accounting immutability triggers were not restored before commit");
+  }
   const legacyAttempt = await client.query(`
     SELECT "requestId", "liabilityTokens", "accountingVersion"
       FROM provider_attempt WHERE "attemptId" = 'legacy-attempt' AND "fencingToken" = 7
@@ -824,6 +890,36 @@ try {
   if (postRolloutTarget.rowCount !== 1) {
     throw new Error("Old-writer insert after rollout did not create an execution target");
   }
+
+  // Prove a failed compatibility validation rolls back both row rewrites and
+  // trigger DDL, leaving the previously installed protection active.
+  await client.query(
+    `ALTER TABLE provider_usage_ledger DROP CONSTRAINT provider_usage_ledger_shape_check`,
+  );
+  await client.query(`
+    INSERT INTO provider_usage_ledger
+      (id, "createdAt", "userId", "providerAccountId", "providerModelId", "requestId",
+       "attemptId", "fencingToken", "accountingVersion", "sourceVersion", "usageSource",
+       "revisionSequence", "revisionKind", "payloadHash", "usageKnown", "costKnown",
+       "terminalReason", confidence)
+    VALUES ('invalid-upgrade-ledger', NOW(), 'owner-a', 'provider-account-a', 'provider-model-a',
+      'legacy-history-request', 'legacy-history', 8, 'usage-v1', 'invalid-v1', 'legacy', -1,
+      'SNAPSHOT', 'invalid-hash', false, false, 'FAILED', 'ESTIMATED')
+  `);
+  try {
+    await client.query(sql);
+    throw new Error("Expected compatibility validation failure");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    if (error?.code !== "23514") throw error;
+  }
+  await expectConstraintFailure(
+    `UPDATE provider_usage_ledger SET "payloadHash" = 'mutated' WHERE id = 'legacy-history-ledger'`,
+    "55000",
+  );
+  await client.query(`DROP TRIGGER provider_usage_ledger_immutable ON provider_usage_ledger`);
+  await client.query(`DELETE FROM provider_usage_ledger WHERE id = 'invalid-upgrade-ledger'`);
+  await client.query(sql);
 
   // A child-first application transaction can conflict with hardening's
   // parent-first lock order. Force a lock timeout and prove the production

@@ -1116,6 +1116,13 @@ ALTER TABLE provider_attempt ADD CONSTRAINT provider_attempt_shape_check CHECK (
 -- Backfill ordered immutable revisions introduced after the first terminal-only
 -- ledger release. Arrival order is used only for legacy rows; all new writers
 -- must provide an explicit provider sequence.
+-- A previous release may already have installed the append-only triggers. Drop
+-- exactly the two triggers protecting rows this compatibility block rewrites;
+-- the surrounding transaction restores the old definitions automatically on
+-- failure, and recreates them below before commit.
+DROP TRIGGER IF EXISTS provider_usage_ledger_immutable ON provider_usage_ledger;
+DROP TRIGGER IF EXISTS provider_budget_settlement_immutable ON provider_budget_settlement;
+
 WITH ordered AS (
   SELECT id, row_number() OVER (
     PARTITION BY "attemptId", "fencingToken" ORDER BY "createdAt", id

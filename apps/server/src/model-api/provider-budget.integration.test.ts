@@ -152,6 +152,29 @@ integration("provider budget admission and reconciliation", () => {
     await expect(service.admitProviderBudget(original)).rejects.toThrow("no longer replayable");
   });
 
+  it("replays the immutable admitted graph after its policies change", async () => {
+    if (!db) return;
+    const row = await fixture({ attachment: true, metric: "TOKENS" });
+    const original = attempt(row, `policy-replay-${crypto.randomUUID()}`, {
+      tokens: 3n,
+      accountingVersion: "usage-v1",
+    });
+    const admitted = await service.admitProviderBudget(original);
+    await db.providerBudgetPolicy.updateMany({
+      where: { id: { in: row.policies.map(({ id }) => id) } },
+      data: { active: false, deactivatedAt: new Date() },
+    });
+    await expect(service.admitProviderBudget(original)).resolves.toEqual(admitted);
+
+    const firstReservation = admitted.admitted ? admitted.reservationIds[0] : undefined;
+    if (!firstReservation) throw new Error("reservation unavailable");
+    await db.providerBudgetReservation.update({
+      where: { id: firstReservation },
+      data: { state: "SETTLED", settledValue: 3, settledAt: new Date() },
+    });
+    await expect(service.admitProviderBudget(original)).rejects.toThrow("no longer replayable");
+  });
+
   it("fails closed for partial token usage and appends one terminal ledger row", async () => {
     if (!db) return;
     const row = await fixture({ metric: "TOKENS" });
@@ -334,6 +357,99 @@ integration("provider budget admission and reconciliation", () => {
       orderBy: { revisionSequence: "asc" },
     });
     expect(settlements.map((entry) => entry.settledValue.toString())).toEqual(["8", "-5", "3"]);
+  });
+
+  it("hashes only normalized persisted revision semantics", async () => {
+    if (!db) return;
+    const row = await fixture({ metric: "TOKENS" });
+    const original = attempt(row, `canonical-${crypto.randomUUID()}`, {
+      tokens: 8n,
+      accountingVersion: "usage-v1",
+    });
+    await service.admitProviderBudget(original);
+    const revision = {
+      ...original,
+      reason: "COMPLETED" as const,
+      sourceVersion: " provider-v1 ",
+      usageSource: " provider-poll ",
+      revisionSequence: 1n,
+      revisionKind: "SNAPSHOT" as const,
+      usage: {
+        accountingVersion: " usage-v1 ",
+        authoritativeBillableTokens: 3n,
+        reportedCost: "1.00",
+        reportedCostCurrency: " usd ",
+        reportedCostPricingVersion: " price-v1 ",
+        reportedCostSource: " header ",
+        confidence: "REPORTED" as const,
+      },
+      transportTrace: "first delivery",
+    };
+    await service.reconcileProviderBudget(revision);
+    const persisted = await db.providerUsageLedger.findFirstOrThrow({
+      where: { attemptId: original.attemptId, sourceVersion: "provider-v1" },
+    });
+    expect(persisted).toMatchObject({
+      usageSource: "provider-poll",
+      reportedCostSource: "header",
+    });
+    const equivalentRetry = {
+      ...revision,
+      sourceVersion: "provider-v1",
+      usageSource: "provider-poll",
+      transportTrace: "retry delivery",
+      usage: {
+        ...revision.usage,
+        accountingVersion: "usage-v1",
+        reportedCost: new (await import("@ws-model-proxy/db")).Prisma.Decimal("1"),
+        reportedCostCurrency: "USD",
+        reportedCostPricingVersion: "price-v1",
+        reportedCostSource: "header",
+      },
+    };
+    await expect(service.reconcileProviderBudget(equivalentRetry)).resolves.toBeUndefined();
+    await expect(
+      service.reconcileProviderBudget({
+        ...revision,
+        sourceVersion: "provider-v1",
+        usage: { ...revision.usage, authoritativeBillableTokens: 4n },
+      }),
+    ).rejects.toThrow("conflict");
+  });
+
+  it("treats differing unrecognized accounting versions as the same persisted semantics", async () => {
+    if (!db) return;
+    const row = await fixture({ metric: "TOKENS" });
+    const original = attempt(row, `mismatched-accounting-${crypto.randomUUID()}`, {
+      tokens: 8n,
+      accountingVersion: "usage-v1",
+    });
+    await service.admitProviderBudget(original);
+    const revision = {
+      ...original,
+      reason: "COMPLETED" as const,
+      sourceVersion: "provider-v1",
+      revisionSequence: 1n,
+      revisionKind: "SNAPSHOT" as const,
+      usage: {
+        accountingVersion: "provider-usage-v2",
+        authoritativeBillableTokens: 3n,
+        confidence: "REPORTED" as const,
+      },
+    };
+    await service.reconcileProviderBudget(revision);
+    await expect(
+      service.reconcileProviderBudget({
+        ...revision,
+        usage: { ...revision.usage, accountingVersion: "provider-usage-v3" },
+      }),
+    ).resolves.toBeUndefined();
+    await expect(
+      service.reconcileProviderBudget({
+        ...revision,
+        usage: { ...revision.usage, authoritativeBillableTokens: 4n },
+      }),
+    ).rejects.toThrow("conflict");
   });
 
   it("crash-repairs an expired no-policy attempt anchor exactly once", async () => {
