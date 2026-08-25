@@ -35,8 +35,8 @@ export function recommendedPrimarySurface(
     );
   const order: readonly Exclude<ModelApiSurface, "OPENAI_COMPLETIONS">[] = [
     "OPENAI_RESPONSES",
-    "ANTHROPIC_MESSAGES",
     "OPENAI_CHAT_COMPLETIONS",
+    "ANTHROPIC_MESSAGES",
   ];
   return (
     order.find((surface) => matrices.some((matrix) => matrix[surface].mode === "native")) ??
@@ -50,7 +50,22 @@ export function primarySurfaceIsSelectable(
   selectedIds: readonly string[],
   models: readonly GuardedWizardLocalModel[],
 ) {
-  return recommendedPrimarySurface(selectedIds, models) === surface;
+  const matrices = models
+    .filter((model) => selectedIds.includes(model.id))
+    .map((model) =>
+      surfaceAvailabilityMatrix({
+        capabilities:
+          parseOpenAiCompatibleCapabilities(model.effectiveCapabilities?.metadata) ??
+          openAiCapabilitiesFromCoarse(model.effectiveCapabilities?.coarse ?? []),
+        adaptationEnabled: true,
+      }),
+    );
+  const selectedModes = matrices.map((matrix) => matrix[surface].mode);
+  if (selectedModes.some((mode) => mode === "native")) return true;
+  const anyNative = modelApiSurfaces.some((candidate) =>
+    matrices.some((matrix) => matrix[candidate].mode === "native"),
+  );
+  return !anyNative && selectedModes.some((mode) => mode === "adapted");
 }
 
 export function minimumSelectedPhysicalContext(

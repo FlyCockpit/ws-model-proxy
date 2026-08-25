@@ -44,6 +44,9 @@ const db = prisma as unknown as {
   poolMember: {
     findMany: MockInstance;
   };
+  modelPool: {
+    findFirst: MockInstance;
+  };
   relayRequest: {
     create: MockInstance;
     update: MockInstance;
@@ -264,6 +267,62 @@ function poolMemberRow(native: "chat" | "responses" = "responses") {
   };
 }
 
+function publicOverflowPoolRow() {
+  return {
+    publicEgressEnabled: true,
+    publicEgressAcknowledged: true,
+    PoolMembers: [
+      {
+        id: "provider-member-id",
+        publicOrder: 0,
+        ExecutionTarget: {
+          id: "provider-target-id",
+          ProviderModel: {
+            id: "provider-model-id",
+            userId: "user-id",
+            upstreamModelId: "provider-chat",
+            contextWindow: 128_000,
+            maxOutputTokens: 4_096,
+            nativeCapabilities: {
+              protocols: ["openai"],
+              surfaces: ["openai-chat"],
+              streaming: true,
+              features: [],
+            },
+            healthStatus: "HEALTHY",
+            healthNextRetryAt: null,
+            enabled: true,
+            deletedAt: null,
+            ProviderAccount: {
+              id: "provider-account-id",
+              userId: "user-id",
+              providerType: "openai",
+              providerVersion: null,
+              baseUrl: "https://provider.invalid",
+              authType: "BEARER",
+              healthStatus: "HEALTHY",
+              healthNextRetryAt: null,
+              enabled: true,
+              deletedAt: null,
+              CurrentCredential: {
+                id: "credential-id",
+                credentialType: "BEARER",
+                aadVersion: 1,
+                algorithm: "AES-256-GCM",
+                keyVersion: "v1",
+                ciphertext: new Uint8Array(),
+                nonce: new Uint8Array(),
+                authTag: new Uint8Array(),
+                status: "ACTIVE",
+              },
+            },
+          },
+        },
+      },
+    ],
+  };
+}
+
 function appWith(manager: FakeRelayManager, authSession: Session | null = session) {
   const app = new Hono<{ Variables: { session: Session | null } }>();
   app.use("*", async (c, next) => {
@@ -393,6 +452,7 @@ describe("chat test routes", () => {
       ],
     });
     db.poolMember.findMany.mockResolvedValue([poolMemberRow("chat")]);
+    db.modelPool.findFirst.mockResolvedValue(publicOverflowPoolRow());
     const responsePromise = appWith(manager).request("/chat/completions", {
       method: "POST",
       headers: {
@@ -409,6 +469,7 @@ describe("chat test routes", () => {
     const sent = requireSent(manager);
     expect(sent.family).toBe("chat.completions");
     expect(sent.cliDeviceId).toBe("cli-device-id");
+    expect(db.modelPool.findFirst).not.toHaveBeenCalled();
     manager.headers(sent.requestId, 200, { "content-type": "application/json" });
     manager.body(sent.requestId, '{"choices":[{"message":{"role":"assistant","content":"pong"}}]}');
     manager.complete(sent.requestId);

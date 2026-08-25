@@ -38,15 +38,19 @@ export function GuardedPoolSetupWizard({
   open,
   onOpenChange,
   directModels,
+  initialStep = 0,
+  initialProviderModelIds = [],
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   directModels: LocalModel[];
+  initialStep?: 0 | 1 | 2 | 3;
+  initialProviderModelIds?: string[];
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
   const formRef = useRef<HTMLFormElement>(null);
-  const [step, setStep] = useState(0);
+  const [step, setStep] = useState<number>(initialStep);
   const [stepErrors, setStepErrors] = useState<Record<string, string>>({});
   const candidates = useQuery(
     orpc.forwarderManagement.listGuardedOverflowCandidates.queryOptions(),
@@ -115,7 +119,7 @@ export function GuardedPoolSetupWizard({
       reservedSlots: 0,
       localWaitBudgetMs: 30_000,
       recommendedSurface: "OPENAI_RESPONSES" as (typeof surfaces)[number],
-      providerModelIds: [] as string[],
+      providerModelIds: initialProviderModelIds,
       providerConcurrencyLimit: 1,
       dailySpendLimit: "10.00",
       publicEgressAcknowledged: false,
@@ -163,9 +167,7 @@ export function GuardedPoolSetupWizard({
     }
     setStepErrors(errors);
     if (Object.keys(errors).length > 0) {
-      requestAnimationFrame(() =>
-        formRef.current?.querySelector<HTMLElement>("[aria-invalid='true']")?.focus(),
-      );
+      requestAnimationFrame(() => focusFirstInvalidWizardField(formRef.current));
       return false;
     }
     return true;
@@ -573,4 +575,8 @@ export function GuardedPoolSetupWizard({
       </DialogContent>
     </Dialog>
   );
+}
+
+export function focusFirstInvalidWizardField(form: Pick<HTMLFormElement, "querySelector"> | null) {
+  form?.querySelector<HTMLElement>("[aria-invalid='true']")?.focus();
 }
