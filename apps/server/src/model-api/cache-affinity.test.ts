@@ -151,6 +151,36 @@ describe("cache affinity", () => {
     })) {
       expect(buildAffinityTargetIdentity({ ...base, [key]: value })).not.toBe(baseline);
     }
+    expect(baseline).toHaveLength(43);
+    expect(
+      buildAffinityTargetIdentity({ ...base, runtimeIdentityKey: "a\u001fb", runtimeModel: "c" }),
+    ).not.toBe(
+      buildAffinityTargetIdentity({ ...base, runtimeIdentityKey: "a", runtimeModel: "b\u001fc" }),
+    );
+    expect(
+      buildAffinityTargetIdentity({
+        ...base,
+        runtimeIdentityKey: "x".repeat(500),
+        runtimeModel: "y".repeat(500),
+        tokenizer: "z".repeat(500),
+        template: "t".repeat(500),
+      }),
+    ).toHaveLength(43);
+  });
+
+  it("never treats the missing-conversation sentinel as conversation affinity", async () => {
+    const affinityTarget = target("target-a", "runtime-a");
+    await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      policy,
+      surface: "OPENAI_CHAT_COMPLETIONS",
+      payload: { messages: [{ role: "user", content: "unrelated" }] },
+      targets: [affinityTarget, target("target-b", "runtime-b")],
+    });
+    const query = db.cacheAffinityRecord.findMany.mock.calls.at(-1)?.[0];
+    expect(JSON.stringify(query?.where.OR)).not.toContain("conversationDigest");
   });
 
   it("selects the longest compatible prefix but lets load override a weak match", async () => {

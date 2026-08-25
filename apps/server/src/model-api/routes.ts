@@ -719,6 +719,7 @@ function affinityTargetForMember(
   member: PoolMemberRelayRow,
   requestedSurface: ProtocolSurface,
   execution: { mode: string; nativeSurface?: string } | null | undefined,
+  effectiveHealthStatus = member.healthStatus,
 ) {
   const target = member.ExecutionTarget;
   const capacity = target?.InferenceCapacity;
@@ -744,11 +745,11 @@ function affinityTargetForMember(
     adapterVersion: execution?.mode === "adapted" ? ADAPTER_VERSION : "native",
   });
   const healthPenalty =
-    member.healthStatus === "HALF_OPEN"
+    effectiveHealthStatus === "HALF_OPEN"
       ? 200
-      : member.healthStatus === "DEGRADED"
+      : effectiveHealthStatus === "DEGRADED"
         ? 100
-        : member.healthStatus === "UNKNOWN"
+        : effectiveHealthStatus === "UNKNOWN"
           ? 25
           : 0;
   return {
@@ -3447,7 +3448,12 @@ async function relayPool({
     const affinityTargets = routeCandidates.flatMap((candidate) => {
       const member = memberById.get(candidate.poolMemberId);
       const affinityTarget = member
-        ? affinityTargetForMember(member, requestedSurface, executionByMember.get(member.id))
+        ? affinityTargetForMember(
+            member,
+            requestedSurface,
+            executionByMember.get(member.id),
+            candidate.healthStatus,
+          )
         : null;
       return affinityTarget ? [affinityTarget] : [];
     });
@@ -4000,7 +4006,12 @@ async function relayPool({
           reportCleanupFailures(cleanup);
           const responseId = responseIdCapture?.finish(operation.stream) ?? null;
           const affinityTarget = requestedSurface
-            ? affinityTargetForMember(member, requestedSurface, executionByMember.get(member.id))
+            ? affinityTargetForMember(
+                member,
+                requestedSurface,
+                executionByMember.get(member.id),
+                candidate.healthStatus,
+              )
             : null;
           const selectedAffinityScore = affinityTarget
             ? (affinityDecision?.scores[affinityTarget.executionTargetId] ?? 0)

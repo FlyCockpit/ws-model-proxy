@@ -55,25 +55,10 @@ export function buildAffinityTargetIdentity(parts: {
   mode: string;
   adapterVersion: string;
 }) {
-  return [
-    "affinity-target:v2",
-    parts.executionTargetId,
-    parts.endpointIdentity,
-    parts.upstreamModelId,
-    parts.runtimeIdentityKey,
-    parts.runtimeModel,
-    parts.runtimeRevision ?? "",
-    parts.tokenizer ?? "",
-    parts.tokenizerVersion ?? "",
-    parts.template ?? "",
-    parts.templateVersion ?? "",
-    parts.engine ?? "",
-    parts.cacheNamespace ?? "",
-    parts.requestedSurface,
-    parts.nativeSurface,
-    parts.mode,
-    parts.adapterVersion,
-  ].join("\u001f");
+  return hmacDigestForForwarderPurpose({
+    purpose: "cacheAffinity",
+    value: stableJson({ version: 2, ...parts }),
+  });
 }
 
 function stableJson(value: JsonValue): string {
@@ -126,7 +111,7 @@ export function affinityPrefixDigests({
   surface: string;
   payload: Record<string, unknown>;
   runtimeIdentity: string;
-}): { digests: string[]; conversationDigest: string } {
+}): { digests: string[]; conversationDigest: string; hasExplicitConversation: boolean } {
   const orderedSource = payload.input ?? payload.messages ?? payload.prompt;
   const ordered = Array.isArray(orderedSource)
     ? orderedSource
@@ -177,6 +162,7 @@ export function affinityPrefixDigests({
   const conversationSource = asJson(payload.conversation ?? payload.conversation_id);
   return {
     digests,
+    hasExplicitConversation: conversationSource !== undefined,
     conversationDigest: hmacDigestForForwarderPurpose({
       purpose: "cacheAffinity",
       value: `binding:${bindingDigest}\nconversation:${
@@ -226,7 +212,9 @@ export async function rankAffinityTargets({
   ];
   const conversationDigests = [
     ...new Set(
-      [...materialByIdentity.values()].map(({ conversationDigest }) => conversationDigest),
+      [...materialByIdentity.values()]
+        .filter(({ hasExplicitConversation }) => hasExplicitConversation)
+        .map(({ conversationDigest }) => conversationDigest),
     ),
   ];
   if (allDigests.length === 0 && conversationDigests.length === 0) return unchanged;
@@ -241,7 +229,9 @@ export async function rankAffinityTargets({
         executionTargetId: { in: targets.map(({ executionTargetId }) => executionTargetId) },
         OR: [
           ...(allDigests.length ? [{ prefixDigest: { in: allDigests } }] : []),
-          { conversationDigest: { in: conversationDigests } },
+          ...(conversationDigests.length
+            ? [{ conversationDigest: { in: conversationDigests } }]
+            : []),
         ],
       },
       select: {
@@ -286,9 +276,9 @@ export async function rankAffinityTargets({
       (best, record) => Math.max(best, digestDepth.get(record.prefixDigest) ?? 0),
       0,
     );
-    const conversation = compatible.some(
-      (record) => record.conversationDigest === material.conversationDigest,
-    );
+    const conversation =
+      material.hasExplicitConversation &&
+      compatible.some((record) => record.conversationDigest === material.conversationDigest);
     const confirmed = compatible.some(
       (record) =>
         (digestDepth.get(record.prefixDigest) ?? 0) === prefixDepth && record.engineCacheConfirmed,
