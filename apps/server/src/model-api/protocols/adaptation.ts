@@ -2,7 +2,7 @@ import {
   parseAnthropicMessagesRequest,
   renderAnthropicMessagesRequest,
 } from "./anthropic-messages.js";
-import type { CanonicalRequest, ProtocolSurface } from "./canonical.js";
+import type { CanonicalEvent, CanonicalRequest, ProtocolSurface } from "./canonical.js";
 import { parseProtocolResponse, renderProtocolResponse } from "./nonstream.js";
 import { parseOpenAiChatRequest, renderOpenAiChatRequest } from "./openai-chat.js";
 import { parseOpenAiResponsesRequest, renderOpenAiResponsesRequest } from "./openai-responses.js";
@@ -76,6 +76,22 @@ export function createProtocolAdaptationTransform({
   const renderer = new CanonicalStreamRenderer(target, { signal, maxAggregateBytes });
   let failed = false;
   let hasOutput = false;
+  let observedUsage: { inputTokens?: number; outputTokens?: number } = {};
+  const mergeUsage = (usage: { inputTokens?: number; outputTokens?: number }) => {
+    if (usage.inputTokens !== undefined) observedUsage.inputTokens = usage.inputTokens;
+    if (usage.outputTokens !== undefined) observedUsage.outputTokens = usage.outputTokens;
+  };
+  const withCumulativeUsage = (event: CanonicalEvent): CanonicalEvent => {
+    if (event.type === "usage") {
+      mergeUsage(event.usage);
+      return { ...event, usage: observedUsage };
+    }
+    if (event.type === "message_start" && event.usage) {
+      mergeUsage(event.usage);
+      return { ...event, usage: observedUsage };
+    }
+    return event;
+  };
   const recover = (error: unknown, controller: TransformStreamDefaultController<Uint8Array>) => {
     if (!recoverProtocolErrors || !hasOutput) throw error;
     failed = true;
@@ -99,7 +115,7 @@ export function createProtocolAdaptationTransform({
       if (failed) return;
       try {
         for (const event of parser.push(chunk))
-          for (const output of renderer.push(event)) {
+          for (const output of renderer.push(withCumulativeUsage(event))) {
             hasOutput = true;
             controller.enqueue(output);
           }
@@ -111,7 +127,7 @@ export function createProtocolAdaptationTransform({
       if (failed) return;
       try {
         for (const event of parser.finish())
-          for (const output of renderer.push(event)) {
+          for (const output of renderer.push(withCumulativeUsage(event))) {
             hasOutput = true;
             controller.enqueue(output);
           }

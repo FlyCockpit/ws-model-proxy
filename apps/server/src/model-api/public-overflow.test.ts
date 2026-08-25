@@ -284,6 +284,32 @@ describe("public overflow compatibility", () => {
     ).toBe("COMPATIBLE");
   });
 
+  it("rejects Anthropic streaming adaptation from OpenAI before commitment", () => {
+    expect(
+      publicTargetCompatibility(
+        {
+          contextWindow: 1_000,
+          maxOutputTokens: 100,
+          protocol: "openai",
+          nativeProtocols: ["openai"],
+          nativeSurfaces: ["openai-chat"],
+          supportsStreaming: true,
+          supportedFeatures: [],
+        },
+        {
+          ...request,
+          requestedProtocol: "anthropic",
+          requestedSurface: "anthropic-messages",
+          stream: true,
+          adaptationEnabled: true,
+          renderForTarget: async () => {
+            throw new Error("not invoked by prefilter");
+          },
+        },
+      ),
+    ).toBe("PROTOCOL_UNAVAILABLE");
+  });
+
   it("reserves conservative input plus requested output tokens", () => {
     expect(
       conservativeProviderLiability({

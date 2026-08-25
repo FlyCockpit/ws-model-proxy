@@ -315,6 +315,8 @@ export class CanonicalStreamParser {
         "multiple_candidates",
         "Multiple stream candidates are not adaptable.",
       );
+    const observedUsage = usageEvent(value.usage, true);
+    if (observedUsage) events.push(observedUsage);
     const choice = choices[0] ? object(choices[0], "choices[0]") : undefined;
     if (!choice) return events;
     if (choice.index !== undefined && choice.index !== 0)

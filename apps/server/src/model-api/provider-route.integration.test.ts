@@ -61,25 +61,6 @@ function jsonResponse(surface: Surface) {
   };
 }
 
-function streamResponse(surface: Surface) {
-  if (surface === "anthropic-messages")
-    return [
-      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_route","type":"message","role":"assistant","content":[],"model":"upstream-model","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":0}}}\n\n',
-      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}}\n\n',
-      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
-    ];
-  if (surface === "openai-responses")
-    return [
-      'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_route","object":"response","created_at":1,"status":"in_progress","model":"upstream-model","output":[]}}\n\n',
-      'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_route","object":"response","created_at":1,"status":"completed","model":"upstream-model","output":[],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}}\n\n',
-    ];
-  return [
-    'data: {"id":"chat_route","object":"chat.completion.chunk","created":1,"model":"upstream-model","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"},"finish_reason":null}]}\n\n',
-    'data: {"id":"chat_route","object":"chat.completion.chunk","created":1,"model":"upstream-model","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}\n\n',
-    "data: [DONE]\n\n",
-  ];
-}
-
 async function readBody(request: IncomingMessage) {
   const chunks: Buffer[] = [];
   for await (const chunk of request) chunks.push(Buffer.from(chunk));
@@ -102,6 +83,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         routes: typeof import("./routes.js");
         identifiers: typeof import("@ws-model-proxy/config/forwarder-identifiers");
         credentials: typeof import("@ws-model-proxy/api/lib/provider-credential-crypto");
+        protocols: typeof import("./protocols/index.js");
       }
     | undefined;
 
@@ -116,14 +98,46 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     process.env.MODEL_API_ANTHROPIC_ENABLED = "true";
     process.env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = "true";
     process.env.MODEL_API_GLOBAL_CAPACITY_ENABLED = "false";
-    const [prismaModule, security, routes, identifiers, credentials] = await Promise.all([
-      import("@ws-model-proxy/db"),
-      import("@ws-model-proxy/db/forwarder-security"),
-      import("./routes.js"),
-      import("@ws-model-proxy/config/forwarder-identifiers"),
-      import("@ws-model-proxy/api/lib/provider-credential-crypto"),
-    ]);
-    modules = { prisma: prismaModule.default, security, routes, identifiers, credentials };
+    const [prismaModule, security, routes, identifiers, credentials, protocols] = await Promise.all(
+      [
+        import("@ws-model-proxy/db"),
+        import("@ws-model-proxy/db/forwarder-security"),
+        import("./routes.js"),
+        import("@ws-model-proxy/config/forwarder-identifiers"),
+        import("@ws-model-proxy/api/lib/provider-credential-crypto"),
+        import("./protocols/index.js"),
+      ],
+    );
+    modules = {
+      prisma: prismaModule.default,
+      security,
+      routes,
+      identifiers,
+      credentials,
+      protocols,
+    };
+    const streamResponse = (surface: Surface) => {
+      const renderer = new protocols.CanonicalStreamRenderer(surface);
+      const events: import("./protocols/index.js").CanonicalEvent[] = [
+        {
+          type: "message_start",
+          id: "route-message",
+          model: "upstream-model",
+          ...(surface === "anthropic-messages"
+            ? { usage: { inputTokens: 5, outputTokens: 0 } }
+            : {}),
+        },
+        { type: "item_start", index: 0, id: "route-text", itemType: "text" },
+        { type: "text_delta", index: 0, delta: "ok" },
+        { type: "item_complete", index: 0 },
+        { type: "usage", usage: { inputTokens: 5, outputTokens: 2 } },
+        { type: "stop", reason: "stop" },
+        { type: "complete" },
+      ];
+      const chunks = events.flatMap((event) => renderer.push(event));
+      renderer.finish();
+      return chunks;
+    };
     upstream = createServer(async (request: IncomingMessage, response: ServerResponse) => {
       const body = await readBody(request);
       upstreamObservations.push({
@@ -199,7 +213,25 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     throw new Error("timed out waiting for terminal provider attempt");
   }
 
-  async function runCase(input: { requested: Surface; native: Surface; behavior: Behavior }) {
+  async function waitForTerminalEvent(providerModelId: string) {
+    if (!modules) throw new Error("modules unavailable");
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      const event = await modules.prisma.publicProviderAttemptEvent.findFirst({
+        where: { providerModelId, eventType: "TERMINAL" },
+      });
+      if (event) return event;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error("timed out waiting for provider terminal event");
+  }
+
+  async function runCase(input: {
+    requested: Surface;
+    native: Surface;
+    behavior: Behavior;
+    expectRejected?: boolean;
+  }) {
     if (!modules) throw new Error("modules unavailable");
     const suffix = crypto.randomUUID();
     const rawToken = `wsmp_model_${crypto.randomUUID().replaceAll("-", "")}`;
@@ -391,23 +423,48 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       headers,
       body: JSON.stringify(body),
     });
-    await response.text().catch(() => undefined);
+    const responseText = await response.text().catch(() => "");
+    if (input.expectRejected) {
+      return {
+        rejected: true as const,
+        response,
+        responseText,
+        attemptCount: await modules.prisma.providerAttempt.count({
+          where: { providerModelId: model.id },
+        }),
+        observation: upstreamObservations[observationIndex],
+        ledger: undefined as never,
+        attempt: undefined as never,
+        reservations: [] as never[],
+        settlements: [] as never[],
+        attemptEvents: [] as never[],
+        model,
+      };
+    }
     const ledger = await waitForLedger(model.id);
     const attempt = await waitForTerminalAttempt(model.id);
-    const [reservations, settlements] = await Promise.all([
+    await waitForTerminalEvent(model.id);
+    const [reservations, settlements, attemptEvents] = await Promise.all([
       modules.prisma.providerBudgetReservation.findMany({
         where: { providerModelId: model.id },
         include: { Rule: true },
       }),
       modules.prisma.providerBudgetSettlement.findMany({ where: { providerModelId: model.id } }),
+      modules.prisma.publicProviderAttemptEvent.findMany({
+        where: { providerModelId: model.id },
+        orderBy: { createdAt: "asc" },
+      }),
     ]);
     return {
+      rejected: false as const,
       response,
       ledger,
       attempt,
       reservations,
       settlements,
       model,
+      responseText,
+      attemptEvents,
       observation: upstreamObservations[observationIndex],
     };
   }
@@ -433,6 +490,71 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     }
   }
 
+  function expectAdapterTelemetry(
+    result: Awaited<ReturnType<typeof runCase>>,
+    mode: "native" | "adapted",
+  ) {
+    const terminals = result.attemptEvents.filter((event) => event.eventType === "TERMINAL");
+    expect(terminals).toHaveLength(1);
+    const terminal = terminals[0];
+    expect(terminal).toMatchObject({
+      adapterMode: mode,
+      adapterVersion: mode === "adapted" ? "1.0.0" : null,
+    });
+    for (const event of result.attemptEvents) {
+      expect(event).toMatchObject({
+        requestedSurface: terminal?.requestedSurface,
+        nativeSurface: terminal?.nativeSurface,
+        adapterMode: mode,
+        adapterVersion: mode === "adapted" ? "1.0.0" : null,
+      });
+    }
+  }
+
+  function expectJsonEnvelope(result: Awaited<ReturnType<typeof runCase>>, requested: Surface) {
+    const payload = JSON.parse(result.responseText);
+    if (requested === "openai-chat") {
+      expect(payload).toMatchObject({
+        object: "chat.completion",
+        choices: [{ message: { role: "assistant", content: "ok" } }],
+      });
+    } else if (requested === "openai-responses") {
+      expect(payload).toMatchObject({
+        object: "response",
+        output: [{ type: "message", content: [{ type: "output_text", text: "ok" }] }],
+      });
+    } else {
+      expect(payload).toMatchObject({
+        type: "message",
+        role: "assistant",
+        content: [{ type: "text", text: "ok" }],
+      });
+    }
+  }
+
+  function expectStreamEnvelope(result: Awaited<ReturnType<typeof runCase>>, requested: Surface) {
+    if (requested === "openai-chat") {
+      expect(result.responseText).toContain('"object":"chat.completion.chunk"');
+      expect(result.responseText).toContain('"content":"ok"');
+      expect(result.responseText).toContain("data: [DONE]");
+      expect(result.responseText).toContain(
+        '"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}',
+      );
+    } else if (requested === "openai-responses") {
+      expect(result.responseText).toContain("event: response.created");
+      expect(result.responseText).toContain('"type":"response.output_text.delta"');
+      expect(result.responseText).toContain('"delta":"ok"');
+      expect(result.responseText).toContain("event: response.completed");
+      expect(result.responseText).toContain(
+        '"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}',
+      );
+    } else {
+      expect(result.responseText).toContain("event: message_start");
+      expect(result.responseText).toContain('"type":"text_delta","text":"ok"');
+      expect(result.responseText).toContain("event: message_stop");
+    }
+  }
+
   function expectConservativeAccounting(result: Awaited<ReturnType<typeof runCase>>) {
     for (const reservation of result.reservations) {
       const settlement = result.settlements.find((row) => row.reservationId === reservation.id);
@@ -441,6 +563,11 @@ integration("provider dispatch routes with real PostgreSQL", () => {
   }
 
   const requestedSurfaces: Surface[] = ["openai-chat", "openai-responses", "anthropic-messages"];
+  const crossPairs = requestedSurfaces.flatMap((requested) =>
+    requestedSurfaces
+      .filter((native) => native !== requested)
+      .map((native) => ({ requested, native })),
+  );
   const adaptedNative: Record<Surface, Surface> = {
     "openai-chat": "openai-responses",
     "openai-responses": "anthropic-messages",
@@ -464,21 +591,8 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       expect(result.settlements).toHaveLength(2);
       expectEgressContract(result, requested);
       expectExactSuccessAccounting(result);
-    });
-
-    it(`${requested} executes an adapted non-stream route with pinned accounting`, async () => {
-      const result = await runCase({
-        requested,
-        native: adaptedNative[requested],
-        behavior: "json",
-      });
-      expect(result.response.status).toBe(200);
-      expect(result.ledger.pricingVersion).toBe("route-v1");
-      expect(result.ledger.accountingVersion).toBe("provider-billable-v1");
-      expect(result.attempt.state).toBe("COMPLETED");
-      expect(result.settlements).toHaveLength(result.reservations.length);
-      expectEgressContract(result, adaptedNative[requested]);
-      expectExactSuccessAccounting(result);
+      expectJsonEnvelope(result, requested);
+      expectAdapterTelemetry(result, "native");
     });
 
     it(`${requested} executes native streaming through terminal reconciliation`, async () => {
@@ -489,8 +603,26 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       expect(result.settlements).toHaveLength(result.reservations.length);
       expectEgressContract(result, requested);
       expectExactSuccessAccounting(result);
+      expectStreamEnvelope(result, requested);
+      expectAdapterTelemetry(result, "native");
     });
   }
+
+  it.each(crossPairs)(
+    "$requested executes the full non-stream matrix from $native",
+    async ({ requested, native }) => {
+      const result = await runCase({ requested, native, behavior: "json" });
+      expect(result.response.status).toBe(200);
+      expect(result.ledger.pricingVersion).toBe("route-v1");
+      expect(result.ledger.accountingVersion).toBe("provider-billable-v1");
+      expect(result.attempt.state).toBe("COMPLETED");
+      expect(result.settlements).toHaveLength(result.reservations.length);
+      expectEgressContract(result, native);
+      expectExactSuccessAccounting(result);
+      expectJsonEnvelope(result, requested);
+      expectAdapterTelemetry(result, "adapted");
+    },
+  );
 
   it.each(requestedSurfaces)(
     "%s retains conservative liability for a truncated native provider stream",
@@ -533,16 +665,41 @@ integration("provider dispatch routes with real PostgreSQL", () => {
 
   it.each([
     ["openai-chat", "openai-responses"],
+    ["openai-chat", "anthropic-messages"],
+    ["openai-responses", "openai-chat"],
     ["openai-responses", "anthropic-messages"],
+  ] as const)("%s successfully adapts a committed %s SSE stream", async (requested, native) => {
+    const result = await runCase({ requested, native, behavior: "stream" });
+    expect(result.response.status).toBe(200);
+    expect(result.attempt.state).toBe("COMPLETED");
+    expect(result.ledger.usageKnown).toBe(true);
+    expectEgressContract(result, native);
+    expectExactSuccessAccounting(result);
+    expectStreamEnvelope(result, requested);
+    expectAdapterTelemetry(result, "adapted");
+  });
+
+  it.each([
+    ["anthropic-messages", "openai-chat"],
+    ["anthropic-messages", "openai-responses"],
   ] as const)(
-    "%s fences a malformed committed %s adapted SSE stream",
+    "%s rejects unsupported streaming adaptation from %s before egress commitment",
     async (requested, native) => {
-      const result = await runCase({ requested, native, behavior: "stream" });
-      expect(result.response.status).toBe(200);
-      expect(result.attempt.state).toBe("FAILED");
-      expect(result.ledger.usageKnown).toBe(false);
-      expectEgressContract(result, native);
-      expectConservativeAccounting(result);
+      const result = await runCase({
+        requested,
+        native,
+        behavior: "stream",
+        expectRejected: true,
+      });
+      expect(result.rejected).toBe(true);
+      if (!result.rejected) throw new Error("expected pre-dispatch rejection");
+      expect(result.response.status).toBe(400);
+      expect(JSON.parse(result.responseText)).toMatchObject({
+        type: "error",
+        error: { type: "invalid_request_error" },
+      });
+      expect(result.attemptCount).toBe(0);
+      expect(result.observation).toBeUndefined();
     },
   );
 });

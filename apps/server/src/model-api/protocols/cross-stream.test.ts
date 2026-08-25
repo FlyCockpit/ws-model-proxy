@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
+import { createProtocolAdaptationTransform } from "./adaptation.js";
 import type { CanonicalEvent } from "./canonical.js";
 import { CanonicalStreamParser, CanonicalStreamRenderer } from "./streams.js";
 
@@ -45,6 +46,32 @@ async function chatFixtureEvents(): Promise<CanonicalEvent[]> {
 }
 
 describe("cross-protocol streaming conformance", () => {
+  it.each(["openai-chat", "openai-responses"] as const)(
+    "carries Anthropic initial input usage into later partial usage for %s",
+    async (target) => {
+      const chunks = [
+        encode(
+          'event: message_start\ndata: {"type":"message_start","message":{"id":"usage-merge","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":0}}}\n\n',
+        ),
+        encode(
+          'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}}\n\n',
+        ),
+        encode('event: message_stop\ndata: {"type":"message_stop"}\n\n'),
+      ];
+      const readable = new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const chunk of chunks) controller.enqueue(chunk);
+          controller.close();
+        },
+      }).pipeThrough(createProtocolAdaptationTransform({ source: "anthropic-messages", target }));
+      const output = await new Response(readable).text();
+      expect(output).toContain(target === "openai-chat" ? 'prompt_tokens":5' : 'input_tokens":5');
+      expect(output).toContain(
+        target === "openai-chat" ? 'completion_tokens":2' : 'output_tokens":2',
+      );
+    },
+  );
+
   it.each([
     ["nonempty output", { output: [{}] }],
     ["nonarray output", { output: "bad" }],
