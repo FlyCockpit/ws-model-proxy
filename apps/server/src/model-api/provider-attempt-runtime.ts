@@ -237,7 +237,7 @@ export async function recordProviderOutcome(input: {
     await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.providerAccountId} AND "userId" = ${input.userId} FOR UPDATE`;
     await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${input.providerModelId} AND "userId" = ${input.userId} FOR UPDATE`;
     if (input.attemptId !== undefined && input.fencingToken !== undefined) {
-      const authoritative = await tx.$queryRaw<Array<{ id: string }>>`
+      const lockedAttempt = await tx.$queryRaw<Array<{ id: string }>>`
         SELECT id
         FROM provider_attempt
         WHERE "attemptId" = ${input.attemptId}
@@ -245,11 +245,27 @@ export async function recordProviderOutcome(input: {
           AND "userId" = ${input.userId}
           AND "providerAccountId" = ${input.providerAccountId}
           AND "providerModelId" = ${input.providerModelId}
-          AND state = 'ACTIVE'::"ProviderAttemptState"
-          AND "expiresAt" > ${now}
         FOR UPDATE
       `;
-      if (authoritative.length !== 1) return false;
+      if (lockedAttempt.length !== 1) return false;
+
+      // This must be a separate statement after FOR UPDATE. A transaction can
+      // wait for the row lock long enough for the attempt to expire, so an app
+      // timestamp captured before the wait is not authoritative.
+      const authoritative = await tx.$queryRaw<Array<{ eligible: boolean }>>`
+        SELECT EXISTS (
+          SELECT 1
+          FROM provider_attempt
+          WHERE "attemptId" = ${input.attemptId}
+            AND "fencingToken" = ${input.fencingToken}
+            AND "userId" = ${input.userId}
+            AND "providerAccountId" = ${input.providerAccountId}
+            AND "providerModelId" = ${input.providerModelId}
+            AND state = 'ACTIVE'::"ProviderAttemptState"
+            AND "expiresAt" > clock_timestamp()
+        ) AS eligible
+      `;
+      if (authoritative.length !== 1 || !authoritative[0]?.eligible) return false;
     }
     const [accountCurrent, current] = await Promise.all([
       tx.providerAccount.findUniqueOrThrow({

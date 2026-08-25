@@ -217,9 +217,11 @@ describe("provider attempt failure policy", () => {
       healthFencingWatermark: 4n,
     };
     const tx = {
-      $queryRaw: vi.fn(async (parts: TemplateStringsArray) =>
-        parts.join("").includes("FROM provider_attempt") ? [{ id: "durable-attempt" }] : [],
-      ),
+      $queryRaw: vi.fn(async (parts: TemplateStringsArray) => {
+        const sql = parts.join("");
+        if (sql.includes("SELECT EXISTS")) return [{ eligible: true }];
+        return sql.includes("FROM provider_attempt") ? [{ id: "durable-attempt" }] : [];
+      }),
       providerAccount: {
         findUniqueOrThrow: vi.fn().mockResolvedValue(healthy),
         update: vi.fn().mockResolvedValue({}),
@@ -250,6 +252,13 @@ describe("provider attempt failure policy", () => {
       where: { id: "account", userId: "owner" },
       data: expect.objectContaining({ healthFencingWatermark: 9n }),
     });
+    expect(
+      tx.$queryRaw.mock.calls.some(([parts]) =>
+        (parts as unknown as TemplateStringsArray)
+          .join("")
+          .includes('"expiresAt" > clock_timestamp()'),
+      ),
+    ).toBe(true);
   });
 
   it("rejects a fenced outcome when its durable attempt is no longer active", async () => {

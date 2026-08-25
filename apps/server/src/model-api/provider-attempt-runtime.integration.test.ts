@@ -428,6 +428,80 @@ integration("provider half-open recovery", () => {
     expect(storedModel.healthFailureCount).toBe(0);
   });
 
+  it("rejects an outcome whose attempt expires while waiting for its row lock", async () => {
+    if (!db) return;
+    const suffix = crypto.randomUUID();
+    const user = await db.user.create({
+      data: { name: "Outcome expiry proof", email: `outcome-expiry-${suffix}@example.test` },
+    });
+    const account = await db.providerAccount.create({
+      data: {
+        userId: user.id,
+        providerType: "proof",
+        label: `outcome-expiry-${suffix}`,
+        baseUrl: "https://example.test",
+        endpointIdentity: "https://example.test",
+        authType: "BEARER",
+      },
+    });
+    const model = await db.providerModel.create({
+      data: { userId: user.id, providerAccountId: account.id, upstreamModelId: suffix },
+    });
+    const attemptId = `outcome-expiry-${suffix}`;
+    const fencingToken = await service.allocateProviderFence({
+      userId: user.id,
+      providerAccountId: account.id,
+    });
+    await db.providerAttempt.create({
+      data: {
+        userId: user.id,
+        providerAccountId: account.id,
+        providerModelId: model.id,
+        requestId: `outcome-expiry-request-${suffix}`,
+        attemptId,
+        fencingToken,
+        expiresAt: new Date(Date.now() + 15 * 60_000),
+        accountingVersion: "test-v1",
+      },
+    });
+
+    let releaseLock!: () => void;
+    const lockMayCommit = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    let attemptLocked!: () => void;
+    const attemptHasLock = new Promise<void>((resolve) => {
+      attemptLocked = resolve;
+    });
+    const lockHolder = db.$transaction(async (tx) => {
+      await tx.$queryRaw`
+        UPDATE provider_attempt
+        SET "expiresAt" = clock_timestamp() + interval '250 milliseconds'
+        WHERE "attemptId" = ${attemptId} AND "fencingToken" = ${fencingToken}
+      `;
+      attemptLocked();
+      await lockMayCommit;
+    });
+    await attemptHasLock;
+    const outcome = service.recordProviderOutcome({
+      userId: user.id,
+      providerAccountId: account.id,
+      providerModelId: model.id,
+      attemptId,
+      fencingToken,
+      success: false,
+      failureClass: "TRANSPORT",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    releaseLock();
+    await lockHolder;
+
+    await expect(outcome).resolves.toBe(false);
+    const storedModel = await db.providerModel.findUniqueOrThrow({ where: { id: model.id } });
+    expect(storedModel.healthStatus).toBe("UNKNOWN");
+    expect(storedModel.healthFailureCount).toBe(0);
+  });
+
   it("installs durable watermark defaults and database ordering constraints", async () => {
     if (!db) return;
     const constraints = await db.$queryRaw<Array<{ table_name: string; definition: string }>>`
