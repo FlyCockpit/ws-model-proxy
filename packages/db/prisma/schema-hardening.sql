@@ -310,6 +310,13 @@ ALTER TABLE response_stickiness_record
       AND length("upstreamResponseIdDigest") BETWEEN 32 AND 128)
   );
 
+-- A prior release may already have this trigger installed. Remove it before
+-- replacing its function or performing the one-time grant-identity backfill.
+-- The enclosing transaction holds a table lock and restores the old trigger
+-- on rollback, so no writer can observe an unenforced compatibility window.
+DROP TRIGGER IF EXISTS response_stickiness_provider_binding_immutable
+  ON response_stickiness_record;
+
 CREATE OR REPLACE FUNCTION enforce_response_stickiness_provider_binding_immutable()
 RETURNS trigger LANGUAGE plpgsql AS $response_stickiness_provider_binding_immutable$
 BEGIN

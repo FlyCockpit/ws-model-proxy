@@ -248,6 +248,31 @@ try {
       'pre-other-model', NULL, 'OPENAI_RESPONSES',
       'ghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-abcdef',
       NOW() + INTERVAL '1 hour');
+
+    -- Reproduce an upgrade from the previous release: the historical v3
+    -- immutability trigger exists, but exact pool-grant identity has not yet
+    -- been backfilled. Hardening must temporarily remove this trigger inside
+    -- its locked transaction, populate the grant, and recreate enforcement.
+    CREATE OR REPLACE FUNCTION enforce_response_stickiness_provider_binding_immutable()
+    RETURNS trigger LANGUAGE plpgsql AS $historical_provider_binding$
+    BEGIN
+      IF NEW."routingVersion" >= 3 AND
+         NEW."poolGrantId" IS DISTINCT FROM OLD."poolGrantId" THEN
+        RAISE EXCEPTION 'historical provider Responses binding is immutable'
+          USING ERRCODE = '23514';
+      END IF;
+      RETURN NEW;
+    END;
+    $historical_provider_binding$;
+    CREATE TRIGGER response_stickiness_provider_binding_immutable
+    BEFORE UPDATE ON response_stickiness_record
+    FOR EACH ROW EXECUTE FUNCTION enforce_response_stickiness_provider_binding_immutable();
+  `);
+
+  await expectConstraintFailure(`
+    UPDATE response_stickiness_record
+       SET "poolGrantId" = 'pre-provider-grant'
+     WHERE id = 'pre-valid-grantee-binding'
   `);
 
   try {
@@ -421,6 +446,11 @@ try {
   if (preservedGranteeBinding.rows[0]?.count !== 1) {
     throw new Error("Hardening rejected or rewrote a valid pre-existing grantee binding");
   }
+  await expectConstraintFailure(`
+    UPDATE response_stickiness_record
+       SET "poolGrantId" = NULL
+     WHERE id = 'pre-valid-grantee-binding'
+  `);
 
   // Exercise the provider Responses v3 binding on real PostgreSQL. Endpoint
   // versions are snapshots (base-URL changes invalidate at runtime), while
