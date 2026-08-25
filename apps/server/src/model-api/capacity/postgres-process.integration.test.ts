@@ -366,11 +366,14 @@ integration("capacity admission across operating-system processes", () => {
       for (const phase of ["precommit", "committed-stream"] as const) {
         const holderAttempt = attempt(`${phase}-holder`);
         const contenderAttempt = attempt(`${phase}-contender`);
-        const work = fetch(`http://127.0.0.1:${ports[0]}/work`, {
+        const workOutcome = fetch(`http://127.0.0.1:${ports[0]}/work`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(holderAttempt),
-        });
+        }).then(
+          (response) => ({ response, error: undefined }),
+          (error: unknown) => ({ response: undefined, error }),
+        );
         const upstreamResponse = await waitFor(() => pendingUpstreams.shift());
         const waiting = await fetch(`http://127.0.0.1:${ports[1]}/admit`, {
           method: "POST",
@@ -384,7 +387,9 @@ integration("capacity admission across operating-system processes", () => {
         if (phase === "committed-stream") {
           upstreamResponse.writeHead(200, { "content-type": "text/event-stream" });
           upstreamResponse.write("data: first\n\n");
-          const response = await work;
+          const outcome = await workOutcome;
+          if (!outcome.response) throw outcome.error;
+          const response = outcome.response;
           expect(response.status).toBe(200);
           committedFence = response.headers.get("x-capacity-fence");
           const first = await response.body?.getReader().read();
@@ -395,7 +400,11 @@ integration("capacity admission across operating-system processes", () => {
         });
         await stop(servers[0]!.child);
         children.delete(servers[0]!.child);
-        if (phase === "precommit") await expect(work).rejects.toBeDefined();
+        if (phase === "precommit") {
+          const outcome = await workOutcome;
+          expect(outcome.response).toBeUndefined();
+          expect(outcome.error).toBeDefined();
+        }
         upstreamResponse.destroy();
         await db.$executeRaw`
           UPDATE capacity_lease SET "expiresAt" = clock_timestamp() - interval '1 millisecond'
@@ -595,7 +604,6 @@ integration("capacity admission across operating-system processes", () => {
 
   it("boots production model routes in two processes and preserves commit semantics", async () => {
     if (!db || !databaseUrl) return;
-    process.env.BETTER_AUTH_SECRET = "w7Qp9Lm2Nx4Rv6Tk8Yc3Hu5Jd1Fs0ZaB";
     process.env.BETTER_AUTH_URL = "http://localhost:3000";
     process.env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = "true";
     process.env.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS = "true";
@@ -815,7 +823,22 @@ integration("capacity admission across operating-system processes", () => {
           (response) => ({ response, error: undefined }),
           (error: unknown) => ({ response: undefined, error }),
         );
-        const controlled = await waitFor(() => upstreamResponses.shift(), 10_000);
+        let upstreamObserved = false;
+        const controlled = await Promise.race([
+          waitFor(() => upstreamResponses.shift(), 10_000).then((upstreamResponse) => {
+            upstreamObserved = true;
+            return upstreamResponse;
+          }),
+          responseOutcome.then(async (outcome) => {
+            if (upstreamObserved) return new Promise<never>(() => undefined);
+            if (!outcome.response)
+              throw outcome.error ?? new Error("Production route failed without an error.");
+            const body = await outcome.response.text();
+            throw new Error(
+              `Production route returned before upstream dispatch: ${outcome.response.status} ${body}`,
+            );
+          }),
+        ]);
         expect(controlled.path).toContain("/primary/");
         if (phase === "after-byte") {
           controlled.response.writeHead(200, { "content-type": "text/event-stream" });
