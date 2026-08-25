@@ -861,9 +861,11 @@ model ExecutionTarget {
   DirectAdmissionRequests AdmissionRequest[]            @relation("AdmissionRequestDirectTarget")
   CapacityWaiters         CapacityWaiter[]
   CapacityLeases          CapacityLease[]
+  CacheAffinityRecords    CacheAffinityRecord[]
 
   @@unique([discoveredModelId, userId])
   @@unique([providerModelId, userId])
+  @@unique([id, userId])
   @@index([userId, kind])
   @@index([inferenceCapacityId])
   @@map("execution_target")
@@ -919,6 +921,15 @@ model ModelPool {
   capacityWaitBudgetMs            Int?
   capacityContextCeiling          Int?
   capacityContextMargin           Int                           @default(0)
+  /// Cache affinity is a routing hint only and never overrides compatibility,
+  /// capacity, health, privacy, or provider-budget constraints.
+  affinityEnabled                 Boolean                       @default(false)
+  affinityTtlSeconds              Int                           @default(3600)
+  affinityMaxRecords              Int                           @default(10000)
+  affinityPrefixWeight            Int                           @default(100)
+  affinityConversationWeight      Int                           @default(150)
+  affinityConfirmedCacheWeight    Int                           @default(250)
+  affinityLoadPenaltyWeight       Int                           @default(100)
   User                            User                          @relation("ModelPoolOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   TransformerDiscoveredModel      DiscoveredModel?              @relation("ModelPoolTransformer", fields: [transformerDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   PoolMembers                     PoolMember[]
@@ -930,12 +941,43 @@ model ModelPool {
   AdmissionRequests               AdmissionRequest[]
   CapacityWaiters                 CapacityWaiter[]
   CapacityLeases                  CapacityLease[]
+  CacheAffinityRecords            CacheAffinityRecord[]
 
   @@unique([userId, slug])
   @@unique([id, userId])
   @@index([userId])
   @@index([transformerDiscoveredModelId])
   @@map("model_pool")
+}
+
+/// Prompt-free, optional cache-routing predictions. `prefixDigest` and
+/// `conversationDigest` are tenant-scoped, purpose-separated HMACs over
+/// canonical material. The source material is never persisted.
+model CacheAffinityRecord {
+  id                   String          @id @default(cuid(2))
+  createdAt            DateTime        @default(now())
+  lastUsedAt           DateTime        @default(now())
+  expiresAt            DateTime
+  userId               String
+  poolId               String
+  executionTargetId    String
+  targetIdentity       String
+  digestVersion        Int             @default(1)
+  prefixDigest         String
+  conversationDigest   String?
+  prefixDepth          Int
+  estimatedTokens      Int?
+  engineCacheConfirmed Boolean         @default(false)
+  User                 User            @relation("CacheAffinityRecordOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ModelPool            ModelPool       @relation(fields: [poolId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  ExecutionTarget      ExecutionTarget @relation(fields: [executionTargetId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([userId, poolId, executionTargetId, targetIdentity, prefixDigest])
+  @@index([userId, poolId, prefixDigest, expiresAt])
+  @@index([userId, poolId, conversationDigest, expiresAt])
+  @@index([userId, poolId, expiresAt])
+  @@index([executionTargetId, expiresAt])
+  @@map("cache_affinity_record")
 }
 
 model PoolMember {
@@ -1282,6 +1324,10 @@ model RelayRequest {
   providerAttemptId          String?
   providerFencingToken       BigInt?
   streamCommitted            Boolean            @default(false)
+  affinityOutcome            String?
+  affinityScore              Int?
+  affinityPrefixDepth        Int?
+  affinityReason             String?
   /// Protocol operation only; never stores prompts, filenames, audio, or transcripts.
   operation                  String?
   /// Sum of rebuilt upstream request-body bytes across all relay attempts.

@@ -162,6 +162,22 @@
     "relayMetadata": "Relay metadata"
   },
   "pools": {
+    "affinity": {
+      "title": "Cache-aware routing",
+      "description": "Prefer a runtime that may still hold a matching prompt prefix, while letting current load override weak matches.",
+      "enabled": "Enable optional cache affinity",
+      "stats": "{{records}} active records across {{targets}} targets; {{confirmed}} engine-confirmed",
+      "clear": "Clear affinity records",
+      "privacy": "Only tenant-scoped HMAC digests and prompt-free routing metadata are stored. A match predicts cache residency; it does not prove it.",
+      "fields": {
+        "affinityTtlSeconds": "Prediction TTL (seconds)",
+        "affinityMaxRecords": "Maximum records per target",
+        "affinityPrefixWeight": "Prefix-depth weight",
+        "affinityConversationWeight": "Conversation weight",
+        "affinityConfirmedCacheWeight": "Confirmed-cache weight",
+        "affinityLoadPenaltyWeight": "Active-load penalty"
+      }
+    },
     "capacity": {
       "title": "Shared local capacity",
       "description": "Keep pools within the real concurrency and context limits of the runtime they share.",

@@ -2062,6 +2062,13 @@ function PoolForm({
     capacityContextCeiling: z.number().int().min(1).max(100_000_000),
     capacityContextMargin: z.number().int().min(0).max(100_000_000),
     capacityBorrowPolicy: z.enum(["NEVER", "WHEN_IDLE"]),
+    affinityEnabled: z.boolean(),
+    affinityTtlSeconds: z.number().int().min(60).max(604_800),
+    affinityMaxRecords: z.number().int().min(100).max(100_000),
+    affinityPrefixWeight: z.number().int().min(0).max(10_000),
+    affinityConversationWeight: z.number().int().min(0).max(10_000),
+    affinityConfirmedCacheWeight: z.number().int().min(0).max(10_000),
+    affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000),
   });
   const createPool = useMutation(
     orpc.forwarderManagement.createModelPool.mutationOptions({
@@ -2082,6 +2089,21 @@ function PoolForm({
     }),
   );
   const updatePoolPolicy = useMutation(orpc.capacityManagement.updatePoolPolicy.mutationOptions());
+  const affinityStats = useQuery({
+    ...orpc.forwarderManagement.cacheAffinityStats.queryOptions({
+      input: { poolId: pool?.id ?? "disabled" },
+    }),
+    enabled: Boolean(pool?.id),
+  });
+  const clearAffinity = useMutation(
+    orpc.forwarderManagement.clearCacheAffinity.mutationOptions({
+      onSuccess: () => {
+        queryClient.invalidateQueries({
+          queryKey: orpc.forwarderManagement.cacheAffinityStats.key(),
+        });
+      },
+    }),
+  );
   const form = useForm({
     defaultValues: {
       slug: pool?.slug ?? "",
@@ -2126,6 +2148,13 @@ function PoolForm({
       capacityBorrowPolicy: (pool?.capacityBorrowPolicy === "NEVER" ? "NEVER" : "WHEN_IDLE") as
         | "NEVER"
         | "WHEN_IDLE",
+      affinityEnabled: pool?.affinity.enabled ?? false,
+      affinityTtlSeconds: pool?.affinity.ttlSeconds ?? 3600,
+      affinityMaxRecords: pool?.affinity.maxRecords ?? 10_000,
+      affinityPrefixWeight: pool?.affinity.prefixWeight ?? 100,
+      affinityConversationWeight: pool?.affinity.conversationWeight ?? 150,
+      affinityConfirmedCacheWeight: pool?.affinity.confirmedCacheWeight ?? 250,
+      affinityLoadPenaltyWeight: pool?.affinity.loadPenaltyWeight ?? 100,
     },
     validators: { onSubmit: poolSchema },
     onSubmit: async ({ value }) => {
@@ -2158,6 +2187,13 @@ function PoolForm({
             value.capacityContextCeilingMode === "UNLIMITED" ? null : value.capacityContextCeiling,
           capacityContextMargin: value.capacityContextMargin,
           capacityBorrowPolicy: value.capacityBorrowPolicy,
+          affinityEnabled: value.affinityEnabled,
+          affinityTtlSeconds: value.affinityTtlSeconds,
+          affinityMaxRecords: value.affinityMaxRecords,
+          affinityPrefixWeight: value.affinityPrefixWeight,
+          affinityConversationWeight: value.affinityConversationWeight,
+          affinityConfirmedCacheWeight: value.affinityConfirmedCacheWeight,
+          affinityLoadPenaltyWeight: value.affinityLoadPenaltyWeight,
         });
       } else if (pool) {
         await updatePool.mutateAsync({
@@ -2198,6 +2234,13 @@ function PoolForm({
                   | "OPENAI_RESPONSES"
                   | "ANTHROPIC_MESSAGES"
                   | "OPENAI_COMPLETIONS"),
+          affinityEnabled: value.affinityEnabled,
+          affinityTtlSeconds: value.affinityTtlSeconds,
+          affinityMaxRecords: value.affinityMaxRecords,
+          affinityPrefixWeight: value.affinityPrefixWeight,
+          affinityConversationWeight: value.affinityConversationWeight,
+          affinityConfirmedCacheWeight: value.affinityConfirmedCacheWeight,
+          affinityLoadPenaltyWeight: value.affinityLoadPenaltyWeight,
         });
         await updatePoolPolicy.mutateAsync({
           modelPoolId: pool.id,
@@ -2328,6 +2371,89 @@ function PoolForm({
           )}
         </form.Field>
       </div>
+
+      <details className="rounded-md border p-3">
+        <summary className="min-h-11 cursor-pointer py-2 text-sm font-medium">
+          {t("dashboard:pools.affinity.title")}
+        </summary>
+        <p className="mb-3 text-xs text-muted-foreground">
+          {t("dashboard:pools.affinity.description")}
+        </p>
+        <form.Field name="affinityEnabled">
+          {(field) => (
+            <label className="flex min-h-11 items-center gap-3 text-sm">
+              <input
+                type="checkbox"
+                className="size-4"
+                checked={field.state.value}
+                onChange={(event) => field.handleChange(event.target.checked)}
+              />
+              {t("dashboard:pools.affinity.enabled")}
+            </label>
+          )}
+        </form.Field>
+        <div className="mt-3 grid gap-4 sm:grid-cols-2">
+          {(
+            [
+              "affinityTtlSeconds",
+              "affinityMaxRecords",
+              "affinityPrefixWeight",
+              "affinityConversationWeight",
+              "affinityConfirmedCacheWeight",
+              "affinityLoadPenaltyWeight",
+            ] as const
+          ).map((name) => (
+            <form.Field key={name} name={name}>
+              {(field) => (
+                <div className="min-w-0 space-y-2">
+                  <Label htmlFor={name}>{t(`dashboard:pools.affinity.fields.${name}`)}</Label>
+                  <Input
+                    id={name}
+                    className="min-h-11"
+                    type="number"
+                    value={field.state.value}
+                    min={
+                      name === "affinityTtlSeconds" ? 60 : name === "affinityMaxRecords" ? 100 : 0
+                    }
+                    max={
+                      name === "affinityTtlSeconds"
+                        ? 604800
+                        : name === "affinityMaxRecords"
+                          ? 100000
+                          : 10000
+                    }
+                    onChange={(event) => field.handleChange(Number(event.target.value))}
+                  />
+                </div>
+              )}
+            </form.Field>
+          ))}
+        </div>
+        <p className="mt-3 text-xs text-muted-foreground">
+          {t("dashboard:pools.affinity.privacy")}
+        </p>
+        {pool ? (
+          <div className="mt-3 flex min-w-0 flex-wrap items-center justify-between gap-3 border-t pt-3 text-xs text-muted-foreground">
+            <span>
+              {t("dashboard:pools.affinity.stats", {
+                records: affinityStats.data?.activeRecords ?? 0,
+                targets: affinityStats.data?.targets.length ?? 0,
+                confirmed: affinityStats.data?.confirmedRecords ?? 0,
+              })}
+            </span>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="min-h-11"
+              disabled={clearAffinity.isPending || !affinityStats.data?.activeRecords}
+              onClick={() => clearAffinity.mutate({ poolId: pool.id })}
+            >
+              {t("dashboard:pools.affinity.clear")}
+            </Button>
+          </div>
+        ) : null}
+      </details>
 
       {mode === "edit" ? (
         <details className="rounded-md border p-3">

@@ -70,6 +70,11 @@ const db = prisma as unknown as {
     findMany: MockInstance;
   };
   capacityAuditEvent: { create: MockInstance };
+  cacheAffinityRecord: {
+    count: MockInstance;
+    groupBy: MockInstance;
+    deleteMany: MockInstance;
+  };
 };
 
 function buildContext(
@@ -1117,5 +1122,40 @@ describe("forwarderManagementRouter", () => {
         }),
       }),
     );
+  });
+
+  it("reports and clears cache affinity only after verifying pool ownership", async () => {
+    db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+    db.cacheAffinityRecord.count.mockResolvedValueOnce(7).mockResolvedValueOnce(2);
+    db.cacheAffinityRecord.groupBy.mockResolvedValue([
+      {
+        executionTargetId: "target-id",
+        _count: { _all: 7 },
+        _max: { lastUsedAt: new Date("2026-08-25"), expiresAt: new Date("2026-08-26") },
+      },
+    ]);
+    db.cacheAffinityRecord.deleteMany.mockResolvedValue({ count: 7 });
+
+    const stats = await client().cacheAffinityStats({ poolId: "pool-id" });
+    const cleared = await client().clearCacheAffinity({ poolId: "pool-id" });
+
+    expect(stats.activeRecords).toBe(7);
+    expect(stats.confirmedRecords).toBe(2);
+    expect(cleared).toEqual({ deleted: 7 });
+    expect(db.cacheAffinityRecord.deleteMany).toHaveBeenCalledWith({
+      where: { userId: "user-id", poolId: "pool-id" },
+    });
+  });
+
+  it("does not reveal or mutate another owner's affinity records", async () => {
+    db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "other-user" });
+    await expect(client().cacheAffinityStats({ poolId: "pool-id" })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
+    await expect(client().clearCacheAffinity({ poolId: "pool-id" })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
+    expect(db.cacheAffinityRecord.count).not.toHaveBeenCalled();
+    expect(db.cacheAffinityRecord.deleteMany).not.toHaveBeenCalled();
   });
 });

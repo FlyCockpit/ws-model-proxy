@@ -43,6 +43,12 @@ import {
   parseAnthropicIngress,
 } from "./anthropic-protocol.js";
 import {
+  type AffinityDecision,
+  type AffinityPolicy,
+  rankAffinityTargets,
+  rememberAffinity,
+} from "./cache-affinity.js";
+import {
   type ContextCountTelemetry,
   contextFitsLimits,
   countSerializedRequestContext,
@@ -545,6 +551,7 @@ type DirectModelRelayRow = {
       template: string | null;
       templateVersion: string | null;
       engine: string | null;
+      cacheNamespace: string | null;
     } | null;
   } | null;
   Endpoint: {
@@ -573,6 +580,7 @@ type PoolMemberRelayRow = PoolMemberRouteRow & {
       template: string | null;
       templateVersion: string | null;
       engine: string | null;
+      cacheNamespace: string | null;
     } | null;
     DiscoveredModel: PoolMemberRouteRow["DiscoveredModel"] & {
       id: string;
@@ -593,6 +601,13 @@ type PoolMemberRelayRow = PoolMemberRouteRow & {
     capacityContextCeiling: number | null;
     capacityContextMargin: number;
     capacityWaitBudgetMs: number | null;
+    affinityEnabled: boolean;
+    affinityTtlSeconds: number;
+    affinityMaxRecords: number;
+    affinityPrefixWeight: number;
+    affinityConversationWeight: number;
+    affinityConfirmedCacheWeight: number;
+    affinityLoadPenaltyWeight: number;
   };
   DiscoveredModel: PoolMemberRouteRow["DiscoveredModel"] & {
     id: string;
@@ -629,6 +644,7 @@ type RelayMetadataUpdate = {
   transformerCacheHit?: boolean | null;
   transformerErrorClass?: string | null;
   attemptCount?: number;
+  affinity?: { outcome: string; score: number; prefixDepth: number; reason: string };
 };
 
 type RelayRequester = {
@@ -677,6 +693,40 @@ function poolAdmissionCandidate(
       requestDeadlineMs,
       effectiveMemberWaitBudget(member),
     ),
+  };
+}
+
+function affinityPolicyForMember(member: PoolMemberRelayRow): AffinityPolicy {
+  const pool = member.ModelPool;
+  return {
+    enabled: pool?.affinityEnabled ?? false,
+    ttlSeconds: pool?.affinityTtlSeconds ?? 3600,
+    maxRecords: pool?.affinityMaxRecords ?? 10_000,
+    prefixWeight: pool?.affinityPrefixWeight ?? 100,
+    conversationWeight: pool?.affinityConversationWeight ?? 150,
+    confirmedCacheWeight: pool?.affinityConfirmedCacheWeight ?? 250,
+    loadPenaltyWeight: pool?.affinityLoadPenaltyWeight ?? 100,
+  };
+}
+
+function affinityTargetForMember(member: PoolMemberRelayRow) {
+  const target = member.ExecutionTarget;
+  const capacity = target?.InferenceCapacity;
+  if (!target || !capacity) return null;
+  // Target and endpoint IDs are immutable. The runtime identity includes the
+  // model/revision/tokenizer/template/engine/cache namespace tuple.
+  const targetIdentity = [
+    "affinity-target:v1",
+    target.id,
+    member.DiscoveredModel.Endpoint.id,
+    member.DiscoveredModel.upstreamModelId,
+    capacity.runtimeIdentityKey,
+    capacity.cacheNamespace ?? "",
+  ].join("\u001f");
+  return {
+    poolMemberId: member.id,
+    executionTargetId: target.id,
+    targetIdentity,
   };
 }
 
@@ -1725,6 +1775,14 @@ async function updateRelayMetadata(relayRequestId: string, update: RelayMetadata
       requestBytes: BigInt(update.terminal.requestBytes),
       responseBytes: BigInt(update.terminal.responseBytes),
       ...(update.attemptCount !== undefined ? { attemptCount: update.attemptCount } : {}),
+      ...(update.affinity
+        ? {
+            affinityOutcome: update.affinity.outcome,
+            affinityScore: update.affinity.score,
+            affinityPrefixDepth: update.affinity.prefixDepth,
+            affinityReason: update.affinity.reason,
+          }
+        : {}),
       errorClass: failure,
       ...(update.transformerLatencyMs !== undefined
         ? { transformerLatencyMs: update.transformerLatencyMs }
@@ -2198,6 +2256,7 @@ async function directModelRow(discoveredModelId: string): Promise<DirectModelRel
               template: true,
               templateVersion: true,
               engine: true,
+              cacheNamespace: true,
             },
           },
         },
@@ -2244,6 +2303,13 @@ async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
           capacityContextCeiling: true,
           capacityContextMargin: true,
           capacityWaitBudgetMs: true,
+          affinityEnabled: true,
+          affinityTtlSeconds: true,
+          affinityMaxRecords: true,
+          affinityPrefixWeight: true,
+          affinityConversationWeight: true,
+          affinityConfirmedCacheWeight: true,
+          affinityLoadPenaltyWeight: true,
         },
       },
       ExecutionTarget: {
@@ -2262,6 +2328,7 @@ async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
               template: true,
               templateVersion: true,
               engine: true,
+              cacheNamespace: true,
             },
           },
           DiscoveredModel: {
@@ -3317,7 +3384,7 @@ async function relayPool({
     activeCliDeviceIds,
     now,
   });
-  const routeCandidates = [
+  let routeCandidates = [
     ...(nativeSequence.ok ? nativeSequence.candidates : []),
     ...(adaptedSequence.ok ? adaptedSequence.candidates : []),
     ...(legacySequence.ok ? legacySequence.candidates : []),
@@ -3336,6 +3403,59 @@ async function relayPool({
   }
 
   const memberById = new Map(eligibleMembers.map((member) => [member.id, member] as const));
+  let affinityDecision: AffinityDecision | null = null;
+  const affinityPayload = operation.contextInput ?? operation.adaptation?.payload ?? null;
+  const affinityPolicy = affinityPolicyForMember(eligibleMembers[0]!);
+  if (requestedSurface && affinityPayload && affinityPolicy.enabled) {
+    const affinityTargets = routeCandidates.flatMap((candidate) => {
+      const member = memberById.get(candidate.poolMemberId);
+      const affinityTarget = member ? affinityTargetForMember(member) : null;
+      return affinityTarget ? [affinityTarget] : [];
+    });
+    if (affinityTargets.length === routeCandidates.length) {
+      try {
+        affinityDecision = await rankAffinityTargets({
+          ownerId: requester.userId,
+          poolId: target.id,
+          policy: affinityPolicy,
+          surface: requestedSurface,
+          payload: affinityPayload,
+          targets: affinityTargets,
+        });
+        const affinityOrder = new Map(
+          affinityDecision.orderedTargetIds.map((executionTargetId, index) => [
+            executionTargetId,
+            index,
+          ]),
+        );
+        routeCandidates = routeCandidates
+          .map((candidate, originalIndex) => ({ candidate, originalIndex }))
+          .sort((left, right) => {
+            const modeRank = (poolMemberId: string) => {
+              const mode = executionByMember.get(poolMemberId)?.mode;
+              return mode === "native" ? 0 : mode === "adapted" ? 1 : 2;
+            };
+            const classDifference =
+              modeRank(left.candidate.poolMemberId) - modeRank(right.candidate.poolMemberId);
+            if (classDifference !== 0) return classDifference;
+            const leftTarget = memberById.get(left.candidate.poolMemberId)?.ExecutionTarget?.id;
+            const rightTarget = memberById.get(right.candidate.poolMemberId)?.ExecutionTarget?.id;
+            return (
+              (leftTarget
+                ? (affinityOrder.get(leftTarget) ?? left.originalIndex)
+                : left.originalIndex) -
+                (rightTarget
+                  ? (affinityOrder.get(rightTarget) ?? right.originalIndex)
+                  : right.originalIndex) || left.originalIndex - right.originalIndex
+            );
+          })
+          .map(({ candidate }) => candidate);
+      } catch {
+        // Affinity is optional and never makes an otherwise valid route unavailable.
+        affinityDecision = null;
+      }
+    }
+  }
   let capacityLease: Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>> | undefined;
   let selectedRouteCandidates = routeCandidates;
   const applyMemberContextCount = async (poolMemberId: string) => {
@@ -3839,6 +3959,16 @@ async function relayPool({
           ]);
           reportCleanupFailures(cleanup);
           const responseId = responseIdCapture?.finish(operation.stream) ?? null;
+          const affinityTarget = affinityTargetForMember(member);
+          const selectedAffinityScore = affinityTarget
+            ? (affinityDecision?.scores[affinityTarget.executionTargetId] ?? 0)
+            : 0;
+          const selectedAffinityPrefixDepth = affinityTarget
+            ? (affinityDecision?.prefixDepths[affinityTarget.executionTargetId] ?? 0)
+            : 0;
+          const selectedAffinityReason = affinityTarget
+            ? (affinityDecision?.reasons[affinityTarget.executionTargetId] ?? "no_match")
+            : "identity_unavailable";
           const terminalWrites = await Promise.allSettled([
             terminal.ok
               ? markPoolMemberRelaySuccess(candidate.poolMemberId)
@@ -3854,6 +3984,17 @@ async function relayPool({
               startedAt,
               terminal: cumulativeTerminal,
               attemptCount,
+              affinity: {
+                outcome:
+                  affinityDecision && selectedAffinityPrefixDepth > 0
+                    ? "PREDICTED_MATCH"
+                    : affinityPolicy.enabled
+                      ? "NO_MATCH"
+                      : "DISABLED",
+                score: selectedAffinityScore,
+                prefixDepth: selectedAffinityPrefixDepth,
+                reason: selectedAffinityReason,
+              },
             }).catch(metadataUpdateError),
             terminal.ok && responseId && operation.responseStickiness
               ? writeResponseStickiness({
@@ -3862,6 +4003,17 @@ async function relayPool({
                   targetModelPoolId: target.id,
                   selectedDiscoveredModelId: member.discoveredModelId,
                 }).catch(stickinessWriteError)
+              : Promise.resolve(),
+            terminal.ok && requestedSurface && affinityPayload && affinityTarget
+              ? rememberAffinity({
+                  ownerId: requester.userId,
+                  poolId: target.id,
+                  policy: affinityPolicy,
+                  surface: requestedSurface,
+                  payload: affinityPayload,
+                  target: affinityTarget,
+                  estimatedTokens: operation.contextCount?.tokens,
+                })
               : Promise.resolve(),
           ]);
           reportCleanupFailures(terminalWrites);

@@ -50,6 +50,7 @@ model User {
   inferenceCapacities       InferenceCapacity[]          @relation("InferenceCapacityOwner")
   admissionRequests         AdmissionRequest[]           @relation("AdmissionRequestOwner")
   capacityAuditEvents       CapacityAuditEvent[]         @relation("CapacityAuditEventOwner")
+  cacheAffinityRecords      CacheAffinityRecord[]        @relation("CacheAffinityRecordOwner")
 
   @@unique([email])
   @@index([slug])

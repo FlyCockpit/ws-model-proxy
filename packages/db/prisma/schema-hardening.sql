@@ -17,7 +17,7 @@ LOCK TABLE discovered_model, execution_target, model_pool, model_api_token,
   capacity_lease, provider_account, provider_model, provider_credential,
   provider_budget_policy, provider_budget_rule, provider_attempt, provider_budget_reservation,
   provider_usage_ledger, provider_pricing_version, provider_budget_settlement,
-  provider_audit_event, public_provider_attempt_event IN SHARE ROW EXCLUSIVE MODE;
+  provider_audit_event, public_provider_attempt_event, cache_affinity_record IN SHARE ROW EXCLUSIVE MODE;
 
 -- Capacity policy bounds are database invariants because admission correctness
 -- must not depend on every rolling-deploy writer running the same validator.
@@ -94,6 +94,50 @@ ALTER TABLE model_pool ADD CONSTRAINT model_pool_capacity_policy_check CHECK (
   AND "capacityContextMargin" >= 0
   AND ("capacityContextCeiling" IS NULL OR "capacityContextMargin" < "capacityContextCeiling")
 );
+
+ALTER TABLE model_pool DROP CONSTRAINT IF EXISTS model_pool_affinity_policy_check;
+ALTER TABLE model_pool ADD CONSTRAINT model_pool_affinity_policy_check CHECK (
+  "affinityTtlSeconds" BETWEEN 60 AND 604800
+  AND "affinityMaxRecords" BETWEEN 100 AND 100000
+  AND "affinityPrefixWeight" BETWEEN 0 AND 10000
+  AND "affinityConversationWeight" BETWEEN 0 AND 10000
+  AND "affinityConfirmedCacheWeight" BETWEEN 0 AND 10000
+  AND "affinityLoadPenaltyWeight" BETWEEN 0 AND 10000
+);
+
+ALTER TABLE cache_affinity_record DROP CONSTRAINT IF EXISTS cache_affinity_record_shape_check;
+ALTER TABLE cache_affinity_record ADD CONSTRAINT cache_affinity_record_shape_check CHECK (
+  "digestVersion" >= 1
+  AND "prefixDepth" > 0 AND "prefixDepth" <= 64
+  AND ("estimatedTokens" IS NULL OR "estimatedTokens" >= 0)
+  AND "expiresAt" > "createdAt"
+  AND length("prefixDigest") BETWEEN 32 AND 128
+  AND ("conversationDigest" IS NULL OR length("conversationDigest") BETWEEN 32 AND 128)
+  AND length("targetIdentity") BETWEEN 1 AND 2048
+);
+
+CREATE OR REPLACE FUNCTION enforce_cache_affinity_identity_immutable()
+RETURNS trigger LANGUAGE plpgsql AS $cache_affinity_identity_immutable$
+BEGIN
+  IF NEW."userId" IS DISTINCT FROM OLD."userId"
+    OR NEW."poolId" IS DISTINCT FROM OLD."poolId"
+    OR NEW."executionTargetId" IS DISTINCT FROM OLD."executionTargetId"
+    OR NEW."targetIdentity" IS DISTINCT FROM OLD."targetIdentity"
+    OR NEW."digestVersion" IS DISTINCT FROM OLD."digestVersion"
+    OR NEW."prefixDigest" IS DISTINCT FROM OLD."prefixDigest"
+    OR NEW."conversationDigest" IS DISTINCT FROM OLD."conversationDigest"
+    OR NEW."prefixDepth" IS DISTINCT FROM OLD."prefixDepth" THEN
+    RAISE EXCEPTION 'cache affinity identity and HMAC digests are immutable'
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END
+$cache_affinity_identity_immutable$;
+
+DROP TRIGGER IF EXISTS cache_affinity_identity_immutable ON cache_affinity_record;
+CREATE TRIGGER cache_affinity_identity_immutable
+BEFORE UPDATE ON cache_affinity_record
+FOR EACH ROW EXECUTE FUNCTION enforce_cache_affinity_identity_immutable();
 
 ALTER TABLE pool_member DROP CONSTRAINT IF EXISTS pool_member_capacity_policy_check;
 ALTER TABLE pool_member ADD CONSTRAINT pool_member_capacity_policy_check CHECK (

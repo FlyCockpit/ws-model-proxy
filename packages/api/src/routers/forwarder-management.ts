@@ -180,6 +180,13 @@ type ModelPoolRow = {
   capacityWaitBudgetMs: number | null;
   capacityContextCeiling: number | null;
   capacityContextMargin: number;
+  affinityEnabled: boolean;
+  affinityTtlSeconds: number;
+  affinityMaxRecords: number;
+  affinityPrefixWeight: number;
+  affinityConversationWeight: number;
+  affinityConfirmedCacheWeight: number;
+  affinityLoadPenaltyWeight: number;
   transformerDiscoveredModelId: string | null;
   transformerSystemPrompt: string | null;
   transformerImages: boolean;
@@ -593,6 +600,15 @@ function serializePool(row: ModelPoolRow) {
     capacityWaitBudgetMs: row.capacityWaitBudgetMs,
     capacityContextCeiling: row.capacityContextCeiling,
     capacityContextMargin: row.capacityContextMargin,
+    affinity: {
+      enabled: row.affinityEnabled,
+      ttlSeconds: row.affinityTtlSeconds,
+      maxRecords: row.affinityMaxRecords,
+      prefixWeight: row.affinityPrefixWeight,
+      conversationWeight: row.affinityConversationWeight,
+      confirmedCacheWeight: row.affinityConfirmedCacheWeight,
+      loadPenaltyWeight: row.affinityLoadPenaltyWeight,
+    },
     compatibility: {
       recommendedSurface,
       surfaces,
@@ -852,6 +868,13 @@ const poolSelect = {
   capacityWaitBudgetMs: true,
   capacityContextCeiling: true,
   capacityContextMargin: true,
+  affinityEnabled: true,
+  affinityTtlSeconds: true,
+  affinityMaxRecords: true,
+  affinityPrefixWeight: true,
+  affinityConversationWeight: true,
+  affinityConfirmedCacheWeight: true,
+  affinityLoadPenaltyWeight: true,
   transformerDiscoveredModelId: true,
   transformerSystemPrompt: true,
   transformerImages: true,
@@ -1129,6 +1152,52 @@ export const forwarderManagementRouter = {
     return rows.map(serializePool);
   }),
 
+  cacheAffinityStats: protectedProcedure
+    .input(z.object({ poolId: idSchema }))
+    .handler(async ({ input, context }) => {
+      await ownedPool(input.poolId, context.session.user.id);
+      const now = new Date();
+      const [activeRecords, confirmedRecords, targetGroups] = await Promise.all([
+        prisma.cacheAffinityRecord.count({
+          where: { userId: context.session.user.id, poolId: input.poolId, expiresAt: { gt: now } },
+        }),
+        prisma.cacheAffinityRecord.count({
+          where: {
+            userId: context.session.user.id,
+            poolId: input.poolId,
+            expiresAt: { gt: now },
+            engineCacheConfirmed: true,
+          },
+        }),
+        prisma.cacheAffinityRecord.groupBy({
+          by: ["executionTargetId"],
+          where: { userId: context.session.user.id, poolId: input.poolId, expiresAt: { gt: now } },
+          _count: { _all: true },
+          _max: { lastUsedAt: true, expiresAt: true },
+        }),
+      ]);
+      return {
+        activeRecords,
+        confirmedRecords,
+        targets: targetGroups.map((group) => ({
+          executionTargetId: group.executionTargetId,
+          records: group._count._all,
+          lastUsedAt: group._max.lastUsedAt,
+          expiresAt: group._max.expiresAt,
+        })),
+      };
+    }),
+
+  clearCacheAffinity: protectedProcedure
+    .input(z.object({ poolId: idSchema }))
+    .handler(async ({ input, context }) => {
+      await ownedPool(input.poolId, context.session.user.id);
+      const result = await prisma.cacheAffinityRecord.deleteMany({
+        where: { userId: context.session.user.id, poolId: input.poolId },
+      });
+      return { deleted: result.count };
+    }),
+
   createModelPool: protectedProcedure
     .input(
       z.object({
@@ -1149,6 +1218,13 @@ export const forwarderManagementRouter = {
         capacityContextCeiling: z.number().int().positive().max(100_000_000).nullable().optional(),
         capacityContextMargin: z.number().int().min(0).max(100_000_000).optional(),
         capacityBorrowPolicy: z.enum(["NEVER", "WHEN_IDLE"]).optional(),
+        affinityEnabled: z.boolean().optional(),
+        affinityTtlSeconds: z.number().int().min(60).max(604_800).optional(),
+        affinityMaxRecords: z.number().int().min(100).max(100_000).optional(),
+        affinityPrefixWeight: z.number().int().min(0).max(10_000).optional(),
+        affinityConversationWeight: z.number().int().min(0).max(10_000).optional(),
+        affinityConfirmedCacheWeight: z.number().int().min(0).max(10_000).optional(),
+        affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000).optional(),
       }),
     )
     .handler(async ({ input, context }) => {
@@ -1176,6 +1252,13 @@ export const forwarderManagementRouter = {
         capacityContextCeiling: input.capacityContextCeiling ?? null,
         capacityContextMargin: input.capacityContextMargin ?? 0,
         capacityBorrowPolicy: input.capacityBorrowPolicy ?? "WHEN_IDLE",
+        affinityEnabled: input.affinityEnabled ?? false,
+        affinityTtlSeconds: input.affinityTtlSeconds ?? 3600,
+        affinityMaxRecords: input.affinityMaxRecords ?? 10_000,
+        affinityPrefixWeight: input.affinityPrefixWeight ?? 100,
+        affinityConversationWeight: input.affinityConversationWeight ?? 150,
+        affinityConfirmedCacheWeight: input.affinityConfirmedCacheWeight ?? 250,
+        affinityLoadPenaltyWeight: input.affinityLoadPenaltyWeight ?? 100,
       } as const;
       const capacityPolicy = {
         capacityPriority: data.capacityPriority,
@@ -1232,6 +1315,13 @@ export const forwarderManagementRouter = {
         publicEgressAcknowledged: z.literal(true).optional(),
         allowLossyDeveloperRoleCollapse: z.boolean().optional(),
         recommendedSurfaceOverride: z.enum(modelApiSurfaces).nullable().optional(),
+        affinityEnabled: z.boolean().optional(),
+        affinityTtlSeconds: z.number().int().min(60).max(604_800).optional(),
+        affinityMaxRecords: z.number().int().min(100).max(100_000).optional(),
+        affinityPrefixWeight: z.number().int().min(0).max(10_000).optional(),
+        affinityConversationWeight: z.number().int().min(0).max(10_000).optional(),
+        affinityConfirmedCacheWeight: z.number().int().min(0).max(10_000).optional(),
+        affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000).optional(),
       }),
     )
     .handler(async ({ input, context }) => {
@@ -1450,6 +1540,27 @@ export const forwarderManagementRouter = {
             : {}),
           ...(input.recommendedSurfaceOverride !== undefined
             ? { recommendedSurfaceOverride: input.recommendedSurfaceOverride }
+            : {}),
+          ...(input.affinityEnabled !== undefined
+            ? { affinityEnabled: input.affinityEnabled }
+            : {}),
+          ...(input.affinityTtlSeconds !== undefined
+            ? { affinityTtlSeconds: input.affinityTtlSeconds }
+            : {}),
+          ...(input.affinityMaxRecords !== undefined
+            ? { affinityMaxRecords: input.affinityMaxRecords }
+            : {}),
+          ...(input.affinityPrefixWeight !== undefined
+            ? { affinityPrefixWeight: input.affinityPrefixWeight }
+            : {}),
+          ...(input.affinityConversationWeight !== undefined
+            ? { affinityConversationWeight: input.affinityConversationWeight }
+            : {}),
+          ...(input.affinityConfirmedCacheWeight !== undefined
+            ? { affinityConfirmedCacheWeight: input.affinityConfirmedCacheWeight }
+            : {}),
+          ...(input.affinityLoadPenaltyWeight !== undefined
+            ? { affinityLoadPenaltyWeight: input.affinityLoadPenaltyWeight }
             : {}),
         },
         select: poolSelect,

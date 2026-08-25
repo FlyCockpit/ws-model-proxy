@@ -162,6 +162,22 @@
     "relayMetadata": "Metadatos de relay"
   },
   "pools": {
+    "affinity": {
+      "title": "Enrutamiento según caché",
+      "description": "Prefiere un entorno que quizá conserve un prefijo de solicitud coincidente y permite que la carga actual supere coincidencias débiles.",
+      "enabled": "Activar afinidad de caché opcional",
+      "stats": "{{records}} registros activos en {{targets}} destinos; {{confirmed}} confirmados por el motor",
+      "clear": "Borrar registros de afinidad",
+      "privacy": "Solo se guardan resúmenes HMAC por inquilino y metadatos de enrutamiento sin solicitudes. Una coincidencia predice la residencia en caché; no la confirma.",
+      "fields": {
+        "affinityTtlSeconds": "TTL de predicción (segundos)",
+        "affinityMaxRecords": "Máximo de registros por destino",
+        "affinityPrefixWeight": "Peso por profundidad del prefijo",
+        "affinityConversationWeight": "Peso de conversación",
+        "affinityConfirmedCacheWeight": "Peso de caché confirmada",
+        "affinityLoadPenaltyWeight": "Penalización por carga activa"
+      }
+    },
     "capacity": {
       "title": "Capacidad local compartida",
       "description": "Mantén los pools dentro de los límites reales de concurrencia y contexto del runtime que comparten.",
