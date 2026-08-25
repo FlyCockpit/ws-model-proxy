@@ -191,13 +191,13 @@ export function liabilityFromPricing(input: {
     .plus(
       (input.pricing.rules.inputIncludesCacheRead
         ? input.pricing.rates.input
-        : input.pricing.rates.cacheRead!
+        : (input.pricing.rates.cacheRead ?? input.pricing.rates.input)
       ).mul(cacheRead.toString()),
     )
     .plus(
       (input.pricing.rules.inputIncludesCacheWrite
         ? input.pricing.rates.input
-        : input.pricing.rates.cacheWrite!
+        : (input.pricing.rates.cacheWrite ?? input.pricing.rates.input)
       ).mul(cacheWrite.toString()),
     )
     .plus((input.pricing.rates.additional ?? input.pricing.rates.output).mul(additional.toString()))

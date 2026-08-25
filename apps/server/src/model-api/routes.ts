@@ -5007,7 +5007,10 @@ async function responsesCreateHandler({
     path: "/v1/responses",
     capability: "responses.create",
     additionalCapabilities: previousId ? ["responses.statefulFollowUps"] : undefined,
-    responseStickiness: { requester },
+    // Explicitly stateless Responses requests do not create a follow-up route
+    // and may therefore use a public provider target. Stored/default Responses
+    // remain pinned to relay targets until provider stickiness is implemented.
+    responseStickiness: prepared.payload?.store === false ? undefined : { requester },
   };
 
   if (!previousId) {

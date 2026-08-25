@@ -230,6 +230,37 @@ describe("provider pricing and usage accounting", () => {
     expect(locallyPriced?.confidence).toBe("CALCULATED");
   });
 
+  it("prices explicit zero cache allowances without requiring unused cache rates", () => {
+    const zeroCache = parsePricingSchedule({
+      id: "zero-cache",
+      version: "v1",
+      currency: "USD",
+      accountingVersion: "v1",
+      confidence: "CALCULATED",
+      effectiveAt: new Date(),
+      pricing: { ratesPerMillion: { input: "1", output: "2" } },
+      chargeRules: {
+        inputIncludesCacheRead: false,
+        inputIncludesCacheWrite: false,
+        outputIncludesReasoning: false,
+        outputIncludesTool: false,
+        cacheReadAllowanceTokens: 0,
+        cacheWriteAllowanceTokens: 0,
+        reasoningAllowanceTokens: 0,
+        toolAllowanceTokens: 0,
+        additionalAllowanceTokens: 0,
+        unknownCategories: "FAIL_CLOSED",
+      },
+    });
+    expect(
+      liabilityFromPricing({
+        estimatedInputTokens: 10n,
+        requestedOutputTokens: 5n,
+        pricing: zeroCache,
+      }).spend?.toString(),
+    ).toBe("0.00002");
+  });
+
   it("keeps unknown usage and detail categories incomplete", () => {
     expect(
       usageFromObject({
