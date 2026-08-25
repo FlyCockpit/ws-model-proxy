@@ -11,7 +11,10 @@ import {
   lockExecutionTargetIdentities,
   lockExecutionTargetPolicies,
 } from "../lib/capacity-policy-safety";
-import { openAiCompatibleCapabilitiesSchema } from "../lib/openai-compatible-capabilities";
+import {
+  openAiCompatibleCapabilitiesSchema,
+  parseOpenAiCompatibleCapabilities,
+} from "../lib/openai-compatible-capabilities";
 import {
   decryptProviderCredential,
   encryptProviderCredential,
@@ -22,6 +25,10 @@ import {
   redactProviderError,
   validateProviderBaseUrl,
 } from "../lib/provider-egress";
+import {
+  inventoryProtocolForProviderType,
+  providerProtocolForType,
+} from "../lib/provider-protocol";
 import { runSerializableTransaction } from "../lib/serializable-transaction";
 
 const id = z.string().min(1);
@@ -38,18 +45,14 @@ const providerWriteTransaction = {
   maxWait: 5_000,
   timeout: 10_000,
 } as const;
-function inventoryProtocolForProviderType(providerType: string) {
-  return ["anthropic", "anthropic-compatible"].includes(providerType.trim().toLowerCase())
-    ? ("anthropic-compatible" as const)
-    : ("openai-compatible" as const);
-}
 function assertInventoryMatchesProviderType(
   providerType: string,
   inventory: z.infer<typeof openAiCompatibleCapabilitiesSchema> | null | undefined,
 ) {
-  if (inventory && inventory.protocol !== inventoryProtocolForProviderType(providerType))
+  const expected = inventoryProtocolForProviderType(providerType);
+  if (expected === null || (inventory && inventory.protocol !== expected))
     throw new ORPCError("BAD_REQUEST", {
-      message: "Capability inventory protocol does not match provider type.",
+      message: "Invalid provider protocol configuration.",
     });
 }
 
@@ -415,6 +418,7 @@ export const providerManagementRouter = {
   }),
   createAccount: protectedProcedure.input(accountInput).handler(async ({ input, context }) => {
     enabled();
+    assertInventoryMatchesProviderType(input.providerType, null);
     const userId = context.session.user.id;
     const baseUrl = validateProviderBaseUrl(input.baseUrl, policy()).href.replace(/\/$/u, "");
     return prisma.$transaction(async (tx) => {
@@ -451,6 +455,20 @@ export const providerManagementRouter = {
           where: { id: accountId, userId, deletedAt: null },
         });
         if (!current) throw missing();
+        const nextProviderType = data.providerType ?? current.providerType;
+        assertInventoryMatchesProviderType(nextProviderType, null);
+        if (data.providerType !== undefined && data.providerType !== current.providerType) {
+          const models = await tx.providerModel.findMany({
+            where: { userId, providerAccountId: accountId, deletedAt: null },
+            select: { id: true, nativeCapabilities: true },
+          });
+          for (const model of models) {
+            if (model.nativeCapabilities === null) continue;
+            const inventory = parseOpenAiCompatibleCapabilities(model.nativeCapabilities);
+            if (!inventory) throw new ORPCError("BAD_REQUEST");
+            assertInventoryMatchesProviderType(nextProviderType, inventory);
+          }
+        }
         if (data.authType && data.authType !== current.authType) {
           const credentialCount = await tx.providerCredential.count({
             where: { userId, providerAccountId: accountId },
@@ -1646,6 +1664,8 @@ export const providerManagementRouter = {
       enabled();
       const userId = context.session.user.id;
       const account = await accountFor(userId, input.providerAccountId);
+      const protocol = providerProtocolForType(account.providerType);
+      if (!protocol) throw new ORPCError("BAD_REQUEST");
       const row = account.currentCredentialId
         ? await prisma.providerCredential.findFirst({
             where: { id: account.currentCredentialId, userId, status: "ACTIVE" },
@@ -1680,7 +1700,7 @@ export const providerManagementRouter = {
           account.baseUrl,
           { method: "GET", headers: { accept: "application/json" } },
           policy(),
-          account.providerType === "anthropic" ? "anthropic" : "openai",
+          protocol,
           providerAuth,
         );
         response.resume();

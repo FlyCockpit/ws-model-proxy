@@ -2,8 +2,9 @@ import { lookup as dnsLookup, type LookupAddress } from "node:dns";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest, type RequestOptions } from "node:https";
 import { isIP } from "node:net";
+import type { ProviderProtocol } from "./provider-protocol";
 
-export type ProviderProtocol = "openai" | "anthropic";
+export type { ProviderProtocol } from "./provider-protocol";
 
 const COMMON_REQUEST_HEADERS = new Set(["accept", "content-type"]);
 const PROTOCOL_REQUEST_HEADERS: Record<ProviderProtocol, ReadonlySet<string>> = {

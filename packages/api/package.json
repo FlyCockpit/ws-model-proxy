@@ -32,6 +32,9 @@
     "./lib/provider-egress": {
       "default": "./src/lib/provider-egress.ts"
     },
+    "./lib/provider-protocol": {
+      "default": "./src/lib/provider-protocol.ts"
+    },
     "./routers/index": {
       "default": "./src/routers/index.ts"
     }

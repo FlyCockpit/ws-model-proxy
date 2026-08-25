@@ -12,6 +12,7 @@ import {
   type ProviderProtocol,
   providerHttpsRequest,
 } from "@ws-model-proxy/api/lib/provider-egress";
+import { providerProtocolForType } from "@ws-model-proxy/api/lib/provider-protocol";
 import {
   resolveExecutionPath,
   surfaceAvailabilityMatrix,
@@ -489,9 +490,7 @@ export type PublicOverflowResult =
   | { dispatched: false; reason: PublicOverflowSkipReason; detail?: string };
 
 function targetProtocol(providerType: string): ProviderProtocol | null {
-  const normalized = providerType.trim().toLowerCase();
-  if (normalized === "anthropic" || normalized === "anthropic-compatible") return "anthropic";
-  return "openai";
+  return providerProtocolForType(providerType);
 }
 
 function inventoryMatchesProtocol(

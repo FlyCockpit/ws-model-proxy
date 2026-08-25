@@ -209,6 +209,11 @@ it("excludes protocol-mismatched legacy inventories from PRIMARY before egress",
   db.modelPool.findFirst.mockResolvedValue(fixture);
   const listed = await listPublicOverflowTargets("owner", "pool", "PRIMARY");
   expect(listed.targets).toEqual([]);
+  model.ProviderAccount.providerType = "unknown-provider";
+  const unknownPrimary = await listPublicOverflowTargets("owner", "pool", "PRIMARY");
+  const unknownOverflow = await listPublicOverflowTargets("owner", "pool", "PUBLIC_OVERFLOW");
+  expect(unknownPrimary.targets).toEqual([]);
+  expect(unknownOverflow.targets).toEqual([]);
   expect(providerHttpsRequest).not.toHaveBeenCalled();
 });
 

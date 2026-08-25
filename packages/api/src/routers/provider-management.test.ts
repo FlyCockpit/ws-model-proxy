@@ -587,6 +587,17 @@ describe("providerManagementRouter security boundary", () => {
     });
     expect(db.providerModel.create).not.toHaveBeenCalled();
     expect(db.providerModel.update).not.toHaveBeenCalled();
+
+    db.providerAccount.findFirst.mockResolvedValue({
+      id: "account",
+      providerType: "unknown-provider",
+    });
+    await expect(
+      client.createModel({ providerAccountId: "account", upstreamModelId: "model" }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    await expect(
+      client.updateModel({ id: "model", nativeCapabilities: null }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
   });
 
   it("creates, reads, updates, and clears an owner capability inventory", async () => {
@@ -1010,6 +1021,7 @@ describe("providerManagementRouter security boundary", () => {
       userId: "owner",
       deletedAt: null,
       authType: "BEARER",
+      providerType: "openai",
     });
     db.providerCredential.count.mockResolvedValue(1);
     const client = createRouterClient(providerManagementRouter, { context });
@@ -1048,6 +1060,7 @@ describe("providerManagementRouter security boundary", () => {
         userId: "owner",
         authType: "BEARER",
         baseUrl: "https://old.example",
+        providerType: "openai",
       })
       .mockResolvedValueOnce({ id: "account", label: "changed" });
     db.providerAccount.updateMany.mockResolvedValue({ count: 1 });
@@ -1061,6 +1074,101 @@ describe("providerManagementRouter security boundary", () => {
       expect.objectContaining({ where: { id: "account", userId: "owner", deletedAt: null } }),
     );
     expect(db.providerAuditEvent.create).toHaveBeenCalledOnce();
+  });
+
+  it("fails closed for unknown provider types on account create and update", async () => {
+    envMock.enabled = true;
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(
+      client.createAccount({
+        providerType: "unknown-provider",
+        label: "Unknown",
+        baseUrl: "https://provider.example",
+        authType: "BEARER",
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.providerAccount.create).not.toHaveBeenCalled();
+
+    db.providerAccount.findFirst.mockResolvedValue({
+      id: "account",
+      userId: "owner",
+      providerType: "openai",
+      authType: "BEARER",
+      baseUrl: "https://provider.example",
+    });
+    await expect(
+      client.updateAccount({ id: "account", providerType: "unknown-provider" }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.providerAccount.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("locks the account and rejects a provider-type change conflicting with any model", async () => {
+    envMock.enabled = true;
+    db.providerAccount.findFirst.mockResolvedValue({
+      id: "account",
+      userId: "owner",
+      providerType: "openai",
+      authType: "BEARER",
+      baseUrl: "https://provider.example",
+    });
+    db.providerModel.findMany.mockResolvedValue([
+      { id: "without-inventory", nativeCapabilities: null },
+      {
+        id: "openai-model",
+        nativeCapabilities: {
+          version: 4,
+          protocol: "openai-compatible",
+          surfaces: {},
+        },
+      },
+    ]);
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(
+      client.updateAccount({ id: "account", providerType: "anthropic-compatible" }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.$queryRaw).toHaveBeenCalledOnce();
+    expect(db.providerModel.findMany).toHaveBeenCalledWith({
+      where: { userId: "owner", providerAccountId: "account", deletedAt: null },
+      select: { id: true, nativeCapabilities: true },
+    });
+    expect(db.providerAccount.updateMany).not.toHaveBeenCalled();
+    expect(db.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+      isolationLevel: "Serializable",
+      maxWait: 5_000,
+      timeout: 10_000,
+    });
+  });
+
+  it("allows an alias-only provider-type change after validating every model", async () => {
+    envMock.enabled = true;
+    db.providerAccount.findFirst
+      .mockResolvedValueOnce({
+        id: "account",
+        userId: "owner",
+        providerType: "openai",
+        authType: "BEARER",
+        baseUrl: "https://provider.example",
+      })
+      .mockResolvedValueOnce({ id: "account", providerType: "openai-compatible" });
+    db.providerModel.findMany.mockResolvedValue([
+      { id: "without-inventory", nativeCapabilities: null },
+      {
+        id: "openai-model",
+        nativeCapabilities: {
+          version: 4,
+          protocol: "openai-compatible",
+          surfaces: {},
+        },
+      },
+    ]);
+    db.providerAccount.updateMany.mockResolvedValue({ count: 1 });
+    db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(
+      client.updateAccount({ id: "account", providerType: "openai-compatible" }),
+    ).resolves.toMatchObject({ providerType: "openai-compatible" });
+    expect(db.providerModel.findMany).toHaveBeenCalledOnce();
+    expect(db.providerAccount.updateMany).toHaveBeenCalledOnce();
   });
 
   it("enables an owned account only with active credentials and enabled models", async () => {
@@ -1358,6 +1466,53 @@ describe("providerManagementRouter security boundary", () => {
       { type: "BEARER", token: "super-secret-value" },
     );
 
+    for (const [providerType, protocol] of [
+      ["openai-compatible", "openai"],
+      ["anthropic", "anthropic"],
+      ["anthropic-compatible", "anthropic"],
+    ] as const) {
+      db.providerAccount.findFirst.mockResolvedValue({
+        id: "account",
+        userId: "owner",
+        deletedAt: null,
+        currentCredentialId: "credential",
+        providerType,
+        baseUrl: "https://provider.example/v1",
+      });
+      await expect(client.testCredential({ providerAccountId: "account" })).resolves.toMatchObject({
+        ok: true,
+      });
+      expect(egressMock.request).toHaveBeenLastCalledWith(
+        "https://provider.example/v1",
+        { method: "GET", headers: { accept: "application/json" } },
+        expect.objectContaining({ egressEnabled: true }),
+        protocol,
+        { type: "BEARER", token: "super-secret-value" },
+      );
+    }
+
+    db.providerAccount.findFirst.mockResolvedValue({
+      id: "account",
+      userId: "owner",
+      deletedAt: null,
+      currentCredentialId: "credential",
+      providerType: "unknown-provider",
+      baseUrl: "https://provider.example/v1",
+    });
+    egressMock.request.mockClear();
+    await expect(client.testCredential({ providerAccountId: "account" })).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+    });
+    expect(egressMock.request).not.toHaveBeenCalled();
+
+    db.providerAccount.findFirst.mockResolvedValue({
+      id: "account",
+      userId: "owner",
+      deletedAt: null,
+      currentCredentialId: "credential",
+      providerType: "openai",
+      baseUrl: "https://provider.example/v1",
+    });
     egressMock.request.mockRejectedValueOnce(new Error("provider.example super-secret-value"));
     await expect(client.testCredential({ providerAccountId: "account" })).rejects.toMatchObject({
       code: "BAD_GATEWAY",
