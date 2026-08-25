@@ -1,4 +1,7 @@
+import { createORPCClient } from "@orpc/client";
+import { RPCLink } from "@orpc/client/fetch";
 import { createRouterClient, ORPCError } from "@orpc/server";
+import { RPCHandler } from "@orpc/server/fetch";
 import type { Session } from "@ws-model-proxy/auth";
 import { directModelId, poolModelId } from "@ws-model-proxy/config/forwarder-identifiers";
 import {
@@ -105,6 +108,23 @@ function buildContext(
       },
     } as Session,
   };
+}
+
+function httpClient() {
+  const handler = new RPCHandler(modelApiTokensRouter);
+  const link = new RPCLink({
+    url: "https://example.test/rpc",
+    fetch: async (request, init) => {
+      const result = await handler.handle(new Request(request, init), {
+        prefix: "/rpc",
+        context: buildContext(),
+      });
+      return result.matched ? result.response : new Response(null, { status: 404 });
+    },
+  });
+  return createORPCClient(link) as ReturnType<
+    typeof createRouterClient<typeof modelApiTokensRouter>
+  >;
 }
 
 function directModelRow({
@@ -466,6 +486,20 @@ describe("modelApiTokensRouter", () => {
         expect(error.code).toBe("NOT_FOUND");
         return true;
       });
+      expect(db.modelApiToken.update).not.toHaveBeenCalled();
+    });
+
+    it("does not reflect a guessed foreign token through the HTTP transport", async () => {
+      db.modelApiToken.findUnique.mockResolvedValue({
+        id: "foreign-token-id",
+        userId: "other-user-id",
+        revokedAt: null,
+      });
+      const result = await Promise.allSettled([httpClient().revoke({ id: "foreign-token-id" })]);
+      expect(result[0]?.status).toBe("rejected");
+      if (result[0]?.status === "rejected")
+        expect(result[0].reason).toMatchObject({ code: "NOT_FOUND" });
+      expect(JSON.stringify(result)).not.toContain("foreign-token-id");
       expect(db.modelApiToken.update).not.toHaveBeenCalled();
     });
   });

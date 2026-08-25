@@ -1,4 +1,7 @@
+import { createORPCClient } from "@orpc/client";
+import { RPCLink } from "@orpc/client/fetch";
 import { createRouterClient } from "@orpc/server";
+import { RPCHandler } from "@orpc/server/fetch";
 import type { Session } from "@ws-model-proxy/auth";
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -58,6 +61,23 @@ const context: Context = {
     },
   } as Session,
 };
+
+function httpClient() {
+  const handler = new RPCHandler(capacityManagementRouter);
+  const link = new RPCLink({
+    url: "https://example.test/rpc",
+    fetch: async (request, init) => {
+      const result = await handler.handle(new Request(request, init), {
+        prefix: "/rpc",
+        context,
+      });
+      return result.matched ? result.response : new Response(null, { status: 404 });
+    },
+  });
+  return createORPCClient(link) as ReturnType<
+    typeof createRouterClient<typeof capacityManagementRouter>
+  >;
+}
 
 describe("capacityManagementRouter", () => {
   beforeEach(() => {
@@ -132,6 +152,45 @@ describe("capacityManagementRouter", () => {
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
     expect(db.inferenceCapacity.findUnique).not.toHaveBeenCalled();
     expect(db.executionTarget.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects guessed capacity graph substitutions at the HTTP boundary", async () => {
+    db.inferenceCapacity.findUnique.mockResolvedValue(null);
+    db.executionTarget.findUnique.mockResolvedValue(null);
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.poolMember.findUnique.mockResolvedValue(null);
+    const client = httpClient();
+    const results = await Promise.allSettled([
+      client.update({ id: "foreign-capacity", label: "guess" }),
+      client.remove({ id: "foreign-capacity" }),
+      client.updateDirectPolicy({
+        executionTargetId: "foreign-target",
+        inferenceCapacityId: "foreign-capacity",
+      }),
+      client.updatePoolPolicy({
+        modelPoolId: "foreign-pool",
+        capacityPriority: 10,
+      }),
+      client.updateMemberPolicy({
+        poolMemberId: "foreign-member",
+        capacityPriority: 10,
+      }),
+    ]);
+    for (const result of results) {
+      expect(result.status).toBe("rejected");
+      if (result.status === "rejected") expect(result.reason).toMatchObject({ code: "NOT_FOUND" });
+    }
+    const serialized = JSON.stringify(results);
+    for (const identifier of [
+      "foreign-capacity",
+      "foreign-target",
+      "foreign-pool",
+      "foreign-member",
+    ])
+      expect(serialized).not.toContain(identifier);
+    expect(db.executionTarget.update).not.toHaveBeenCalled();
+    expect(db.modelPool.update).not.toHaveBeenCalled();
+    expect(db.poolMember.update).not.toHaveBeenCalled();
   });
 
   it("rejects deleting attached capacity and invalid policy bounds", async () => {

@@ -1,4 +1,7 @@
+import { createORPCClient } from "@orpc/client";
+import { RPCLink } from "@orpc/client/fetch";
 import { createRouterClient, ORPCError } from "@orpc/server";
+import { RPCHandler } from "@orpc/server/fetch";
 import type { Session } from "@ws-model-proxy/auth";
 import {
   parseDirectModelId,
@@ -40,6 +43,7 @@ const db = prisma as unknown as {
   modelPool: {
     findMany: MockInstance;
     findUnique: MockInstance;
+    findFirst: MockInstance;
     create: MockInstance;
     update: MockInstance;
     delete: MockInstance;
@@ -120,6 +124,23 @@ function client() {
   return createRouterClient(forwarderManagementRouter, { context: buildContext() });
 }
 
+function httpClient() {
+  const handler = new RPCHandler(forwarderManagementRouter);
+  const link = new RPCLink({
+    url: "https://example.test/rpc",
+    fetch: async (request, init) => {
+      const result = await handler.handle(new Request(request, init), {
+        prefix: "/rpc",
+        context: buildContext(),
+      });
+      return result.matched ? result.response : new Response(null, { status: 404 });
+    },
+  });
+  return createORPCClient(link) as ReturnType<
+    typeof createRouterClient<typeof forwarderManagementRouter>
+  >;
+}
+
 function poolRow(overrides: Record<string, unknown> = {}) {
   return {
     id: "pool-id",
@@ -156,6 +177,46 @@ describe("forwarderManagementRouter", () => {
     db.executionTarget.upsert.mockResolvedValue({ id: "target-id" });
     db.capacityAuditEvent.create.mockResolvedValue({ id: "audit-id" });
     db.appSetting.findUnique.mockResolvedValue(null);
+  });
+
+  it("denies guessed provider attachments and public-egress mutations over HTTP", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.modelPool.findFirst.mockResolvedValue(null);
+    db.poolMember.findUnique.mockResolvedValue(null);
+    db.providerModel.findFirst.mockResolvedValue(null);
+    const rpc = httpClient();
+    const attempts = [
+      rpc.updateModelPool({
+        id: "foreign-pool",
+        publicEgressEnabled: true,
+        publicEgressAcknowledged: true,
+      }),
+      rpc.addProviderPoolMember({
+        poolId: "foreign-pool",
+        providerModelId: "foreign-provider-model",
+        publicOrder: 0,
+      }),
+      rpc.updatePoolMember({ id: "foreign-member", publicOrder: 1 }),
+      rpc.reorderProviderPoolMember({ id: "foreign-member", direction: "EARLIER" }),
+      rpc.removePoolMember({ id: "foreign-member" }),
+      rpc.deleteModelPool({ id: "foreign-pool" }),
+      rpc.grantPoolAccessByEmail({ poolId: "foreign-pool", email: "victim@example.test" }),
+      rpc.revokePoolAccessByEmail({ poolId: "foreign-pool", email: "victim@example.test" }),
+    ];
+    const results = await Promise.allSettled(attempts);
+    for (const result of results) {
+      expect(result.status).toBe("rejected");
+      if (result.status === "rejected") expect(result.reason).toMatchObject({ code: "NOT_FOUND" });
+    }
+    const serialized = JSON.stringify(results);
+    for (const identifier of ["foreign-pool", "foreign-provider-model", "foreign-member"])
+      expect(serialized).not.toContain(identifier);
+    expect(db.executionTarget.upsert).not.toHaveBeenCalled();
+    expect(db.poolMember.create).not.toHaveBeenCalled();
+    expect(db.poolMember.update).not.toHaveBeenCalled();
+    expect(db.poolMember.delete).not.toHaveBeenCalled();
+    expect(db.poolGrant.upsert).not.toHaveBeenCalled();
+    expect(db.poolGrant.deleteMany).not.toHaveBeenCalled();
   });
 
   it("previews and updates the current user's slug without changing internal ids", async () => {
