@@ -78,6 +78,32 @@ const attachmentLimitSchema = z
   .nullable()
   .optional();
 
+function assertConcurrencyPolicyWithinHardLimit(input: {
+  hardLimit: number | null | undefined;
+  poolLimit: number | null;
+  poolReserved: number;
+  memberMode?: "INHERIT" | "LIMITED" | "UNLIMITED";
+  memberLimit?: number | null;
+  memberReserved?: number | null;
+}): void {
+  if (input.hardLimit == null) return;
+  const effectiveLimit =
+    input.memberMode === "LIMITED"
+      ? input.memberLimit
+      : input.memberMode === "UNLIMITED"
+        ? null
+        : input.poolLimit;
+  const effectiveReserved = input.memberReserved ?? input.poolReserved;
+  if (effectiveLimit != null && effectiveLimit > input.hardLimit)
+    throw new ORPCError("BAD_REQUEST", {
+      message: "Effective concurrency limit exceeds physical capacity.",
+    });
+  if (effectiveReserved > input.hardLimit)
+    throw new ORPCError("BAD_REQUEST", {
+      message: "Reserved slots exceed physical concurrency capacity.",
+    });
+}
+
 type UserSlugRow = {
   id: string;
   slug: string;
@@ -1468,7 +1494,9 @@ export const forwarderManagementRouter = {
               id: true,
               discoveredModelId: true,
               inferenceCapacityId: true,
-              InferenceCapacity: { select: { physicalMaxContext: true } },
+              InferenceCapacity: {
+                select: { physicalMaxContext: true, hardConcurrencyLimit: true },
+              },
             },
           });
           if (
@@ -1500,6 +1528,15 @@ export const forwarderManagementRouter = {
             const override = target.discoveredModelId
               ? memberOverrideByModelId.get(target.discoveredModelId)
               : undefined;
+            assertConcurrencyPolicyWithinHardLimit({
+              hardLimit: target.InferenceCapacity?.hardConcurrencyLimit,
+              poolLimit: input.memberConcurrencyLimit,
+              poolReserved: input.reservedSlots,
+              memberMode: override?.concurrency.mode,
+              memberLimit:
+                override?.concurrency.mode === "LIMITED" ? override.concurrency.limitValue : null,
+              memberReserved: override?.reservedSlots,
+            });
             if (!override) continue;
             if (
               override.concurrency.mode === "LIMITED" &&
@@ -1544,6 +1581,13 @@ export const forwarderManagementRouter = {
           ) {
             throw new ORPCError("BAD_REQUEST", {
               message: "Member context exceeds a selected provider's context window.",
+            });
+          }
+          for (const provider of providers) {
+            assertConcurrencyPolicyWithinHardLimit({
+              hardLimit: provider.concurrencyLimit,
+              poolLimit: input.memberConcurrencyLimit,
+              poolReserved: input.reservedSlots,
             });
           }
           const pool = await tx.modelPool.create({
@@ -2361,7 +2405,20 @@ export const forwarderManagementRouter = {
             kind: "DISCOVERED_MODEL",
             discoveredModelId: input.discoveredModelId,
           },
-          select: { id: true },
+          select: {
+            id: true,
+            InferenceCapacity: { select: { hardConcurrencyLimit: true } },
+          },
+        });
+        const pool = await tx.modelPool.findFirst({
+          where: { id: input.poolId, userId: context.session.user.id },
+          select: { capacityConcurrencyLimit: true, capacityReservedSlots: true },
+        });
+        if (!pool) throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+        assertConcurrencyPolicyWithinHardLimit({
+          hardLimit: target.InferenceCapacity?.hardConcurrencyLimit,
+          poolLimit: pool.capacityConcurrencyLimit,
+          poolReserved: pool.capacityReservedSlots,
         });
         const member = await tx.poolMember.create({
           data: {
@@ -2398,7 +2455,13 @@ export const forwarderManagementRouter = {
         await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidatePool.id} AND "userId" = ${userId} FOR UPDATE`;
         const pool = await tx.modelPool.findFirst({
           where: { id: candidatePool.id, userId },
-          select: { id: true, publicEgressEnabled: true, publicEgressAcknowledged: true },
+          select: {
+            id: true,
+            publicEgressEnabled: true,
+            publicEgressAcknowledged: true,
+            capacityConcurrencyLimit: true,
+            capacityReservedSlots: true,
+          },
         });
         if (!pool) throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
         if (
@@ -2431,6 +2494,11 @@ export const forwarderManagementRouter = {
         if (!providerModel.enabled) {
           throw new ORPCError("BAD_REQUEST", { message: "Enable the provider model first." });
         }
+        assertConcurrencyPolicyWithinHardLimit({
+          hardLimit: providerModel.concurrencyLimit,
+          poolLimit: pool.capacityConcurrencyLimit,
+          poolReserved: pool.capacityReservedSlots,
+        });
         const protectionPolicy = await tx.providerBudgetPolicy.findFirst({
           where: {
             userId,
@@ -2635,7 +2703,9 @@ export const forwarderManagementRouter = {
               ExecutionTarget: {
                 select: {
                   ProviderModel: { select: { id: true, providerAccountId: true } },
-                  InferenceCapacity: { select: { physicalMaxContext: true } },
+                  InferenceCapacity: {
+                    select: { physicalMaxContext: true, hardConcurrencyLimit: true },
+                  },
                 },
               },
               ModelPool: {
@@ -2643,6 +2713,8 @@ export const forwarderManagementRouter = {
                   userId: true,
                   publicEgressEnabled: true,
                   publicEgressAcknowledged: true,
+                  capacityConcurrencyLimit: true,
+                  capacityReservedSlots: true,
                 },
               },
             },
@@ -2687,6 +2759,14 @@ export const forwarderManagementRouter = {
             throw new ORPCError("BAD_REQUEST", {
               message: "Reserved slots exceed the member concurrency limit.",
             });
+          assertConcurrencyPolicyWithinHardLimit({
+            hardLimit: member.ExecutionTarget?.InferenceCapacity?.hardConcurrencyLimit,
+            poolLimit: member.ModelPool.capacityConcurrencyLimit,
+            poolReserved: member.ModelPool.capacityReservedSlots,
+            memberMode: nextConcurrencyMode,
+            memberLimit: nextConcurrencyLimit,
+            memberReserved: nextReservedSlots,
+          });
           const nextContextMode =
             input.capacityContextCeilingMode ?? member.capacityContextCeilingMode;
           const nextContextCeiling =

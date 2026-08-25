@@ -594,6 +594,35 @@ describe("forwarderManagementRouter", () => {
     expect(db.executionTarget.upsert).not.toHaveBeenCalled();
   });
 
+  it("rejects guarded setup when inherited local concurrency exceeds physical capacity", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel()]);
+    db.executionTarget.findMany.mockResolvedValue([
+      {
+        id: "existing-target",
+        discoveredModelId: "local-id",
+        inferenceCapacityId: "capacity-id",
+        InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: 2 },
+      },
+    ]);
+
+    await expect(
+      client().createGuardedModelPool({
+        slug: "guarded-capacity",
+        name: "Guarded capacity",
+        localModelIds: ["local-id"],
+        recommendedSurface: "OPENAI_RESPONSES",
+        memberConcurrencyLimit: 3,
+        memberContextCeiling: 32_768,
+        reservedSlots: 1,
+        localWaitBudgetMs: 30_000,
+        publicEgressAcknowledged: false,
+        providerModels: [],
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["OPENAI_RESPONSES", "adapted recommendation when a native primary API exists"],
     ["OPENAI_COMPLETIONS", "unavailable primary recommendation"],
@@ -1344,6 +1373,10 @@ describe("forwarderManagementRouter", () => {
 
   it("manages pool members within the owner boundary", async () => {
     db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+    db.modelPool.findFirst.mockResolvedValue({
+      capacityConcurrencyLimit: null,
+      capacityReservedSlots: 0,
+    });
     db.discoveredModel.findUnique.mockResolvedValue({ id: "model-id", userId: "user-id" });
     db.poolMember.create.mockResolvedValue({ id: "member-id" });
     db.poolMember.findUnique.mockResolvedValue({
@@ -1382,6 +1415,24 @@ describe("forwarderManagementRouter", () => {
       weight: 0,
       routingStatus: "DISABLED",
     });
+  });
+
+  it("rejects attaching a local target when inherited pool capacity exceeds its hard limit", async () => {
+    db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+    db.discoveredModel.findUnique.mockResolvedValue({ id: "model-id", userId: "user-id" });
+    db.executionTarget.upsert.mockResolvedValue({
+      id: "target-id",
+      InferenceCapacity: { hardConcurrencyLimit: 2 },
+    });
+    db.modelPool.findFirst.mockResolvedValue({
+      capacityConcurrencyLimit: 3,
+      capacityReservedSlots: 0,
+    });
+
+    await expect(
+      client().addPoolMember({ poolId: "pool-id", discoveredModelId: "model-id" }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.poolMember.create).not.toHaveBeenCalled();
   });
 
   it("transactionally reindexes public overflow order without duplicate positions", async () => {
@@ -1430,12 +1481,14 @@ describe("forwarderManagementRouter", () => {
         capacityContextMargin: null,
         ExecutionTarget: {
           ProviderModel: { id: "provider-model", providerAccountId: "provider-account" },
-          InferenceCapacity: { physicalMaxContext: 65_536 },
+          InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: 8 },
         },
         ModelPool: {
           userId: "user-id",
           publicEgressEnabled: false,
           publicEgressAcknowledged: false,
+          capacityConcurrencyLimit: 6,
+          capacityReservedSlots: 1,
         },
       });
     db.poolMember.findMany.mockResolvedValue([]);
@@ -1484,6 +1537,110 @@ describe("forwarderManagementRouter", () => {
     );
   });
 
+  it("rejects finite and inherited member policies above physical concurrency", async () => {
+    const member = (mode: "INHERIT" | "LIMITED" | "UNLIMITED") => ({
+      id: "member-id",
+      poolId: "pool-id",
+      tier: "PRIMARY",
+      publicOrder: null,
+      weight: 1,
+      routingStatus: "ACTIVE",
+      capacityConcurrencyMode: mode,
+      capacityConcurrencyLimit: mode === "LIMITED" ? 2 : null,
+      capacityReservedSlots: null,
+      capacityContextCeilingMode: "INHERIT",
+      capacityContextCeiling: null,
+      capacityContextMargin: null,
+      ExecutionTarget: {
+        ProviderModel: { id: "provider-model", providerAccountId: "provider-account" },
+        InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: 4 },
+      },
+      ModelPool: {
+        userId: "user-id",
+        publicEgressEnabled: false,
+        publicEgressAcknowledged: false,
+        capacityConcurrencyLimit: 6,
+        capacityReservedSlots: 1,
+      },
+    });
+    db.poolMember.findUnique
+      .mockResolvedValueOnce({
+        id: "member-id",
+        poolId: "pool-id",
+        ModelPool: { userId: "user-id" },
+      })
+      .mockResolvedValueOnce(member("INHERIT"));
+    await expect(client().updatePoolMember({ id: "member-id", weight: 2 })).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+    });
+
+    db.poolMember.findUnique
+      .mockResolvedValueOnce({
+        id: "member-id",
+        poolId: "pool-id",
+        ModelPool: { userId: "user-id" },
+      })
+      .mockResolvedValueOnce(member("LIMITED"));
+    await expect(
+      client().updatePoolMember({
+        id: "member-id",
+        capacityConcurrencyMode: "LIMITED",
+        capacityConcurrencyLimit: 5,
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.poolMember.update).not.toHaveBeenCalled();
+  });
+
+  it("allows unlimited member policy while enforcing its reservation against physical capacity", async () => {
+    const base = {
+      id: "member-id",
+      poolId: "pool-id",
+      tier: "PRIMARY",
+      publicOrder: null,
+      weight: 1,
+      routingStatus: "ACTIVE",
+      capacityConcurrencyMode: "INHERIT",
+      capacityConcurrencyLimit: null,
+      capacityReservedSlots: null,
+      capacityContextCeilingMode: "INHERIT",
+      capacityContextCeiling: null,
+      capacityContextMargin: null,
+      ExecutionTarget: {
+        ProviderModel: { id: "provider-model", providerAccountId: "provider-account" },
+        InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: 4 },
+      },
+      ModelPool: {
+        userId: "user-id",
+        publicEgressEnabled: false,
+        publicEgressAcknowledged: false,
+        capacityConcurrencyLimit: 8,
+        capacityReservedSlots: 0,
+      },
+    };
+    db.poolMember.findUnique
+      .mockResolvedValueOnce({
+        id: "member-id",
+        poolId: "pool-id",
+        ModelPool: { userId: "user-id" },
+      })
+      .mockResolvedValueOnce(base);
+    db.poolMember.findMany.mockResolvedValue([]);
+    db.poolMember.update.mockResolvedValue({
+      id: "member-id",
+      weight: 1,
+      routingStatus: "ACTIVE",
+      tier: "PRIMARY",
+      publicOrder: null,
+    });
+    await expect(
+      client().updatePoolMember({
+        id: "member-id",
+        capacityConcurrencyMode: "UNLIMITED",
+        capacityReservedSlots: 4,
+      }),
+    ).resolves.toMatchObject({ id: "member-id" });
+  });
+
   it("requires an active explicit concurrency policy before attaching public overflow", async () => {
     db.modelPool.findFirst.mockResolvedValue({
       id: "pool-id",
@@ -1525,6 +1682,32 @@ describe("forwarderManagementRouter", () => {
       where: { id: "provider-member" },
       data: { publicOrder: 0 },
     });
+  });
+
+  it("rejects attaching a provider primary when inherited pool capacity exceeds its hard limit", async () => {
+    db.modelPool.findFirst.mockResolvedValue({
+      id: "pool-id",
+      publicEgressEnabled: false,
+      publicEgressAcknowledged: false,
+      capacityConcurrencyLimit: 5,
+      capacityReservedSlots: 1,
+    });
+    db.providerModel.findFirst.mockResolvedValue({
+      id: "provider-model",
+      providerAccountId: "provider-account",
+      concurrencyLimit: 4,
+      enabled: true,
+    });
+
+    await expect(
+      client().addProviderPoolMember({
+        poolId: "pool-id",
+        providerModelId: "provider-model",
+        tier: "PRIMARY",
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.providerBudgetPolicy.findFirst).not.toHaveBeenCalled();
+    expect(db.poolMember.create).not.toHaveBeenCalled();
   });
 
   it("attaches a provider PRIMARY without enabling public overflow", async () => {

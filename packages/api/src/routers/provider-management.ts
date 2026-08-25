@@ -44,6 +44,86 @@ function assertInventoryMatchesProviderType(
       message: "Capability inventory protocol does not match provider type.",
     });
 }
+
+type AttachedCapacityPolicy = {
+  directConcurrencyLimit: number | null;
+  directReservedSlots: number;
+  directContextCeiling: number | null;
+  directContextMargin: number;
+  PoolMembers: Array<{
+    capacityConcurrencyMode: "INHERIT" | "LIMITED" | "UNLIMITED";
+    capacityConcurrencyLimit: number | null;
+    capacityReservedSlots: number | null;
+    capacityContextCeilingMode: "INHERIT" | "LIMITED" | "UNLIMITED";
+    capacityContextCeiling: number | null;
+    capacityContextMargin: number | null;
+    ModelPool: {
+      capacityConcurrencyLimit: number | null;
+      capacityReservedSlots: number;
+      capacityContextCeiling: number | null;
+      capacityContextMargin: number;
+    };
+  }>;
+};
+
+function assertProviderCapacityReductionIsSafe(
+  target: AttachedCapacityPolicy,
+  hardConcurrencyLimit: number | null,
+  physicalMaxContext: number | null,
+  activeLeases: number,
+): void {
+  if (hardConcurrencyLimit != null) {
+    if (
+      activeLeases > hardConcurrencyLimit ||
+      target.directReservedSlots > hardConcurrencyLimit ||
+      (target.directConcurrencyLimit != null &&
+        target.directConcurrencyLimit > hardConcurrencyLimit)
+    )
+      throw new ORPCError("PRECONDITION_FAILED", {
+        message: "Provider concurrency cannot be reduced below active or configured capacity.",
+      });
+  }
+  if (
+    physicalMaxContext != null &&
+    target.directContextCeiling != null &&
+    target.directContextCeiling + target.directContextMargin > physicalMaxContext
+  )
+    throw new ORPCError("PRECONDITION_FAILED", {
+      message: "Provider context cannot be reduced below direct target policy.",
+    });
+  for (const member of target.PoolMembers) {
+    const concurrencyLimit =
+      member.capacityConcurrencyMode === "LIMITED"
+        ? member.capacityConcurrencyLimit
+        : member.capacityConcurrencyMode === "UNLIMITED"
+          ? null
+          : member.ModelPool.capacityConcurrencyLimit;
+    const reservedSlots = member.capacityReservedSlots ?? member.ModelPool.capacityReservedSlots;
+    if (
+      hardConcurrencyLimit != null &&
+      ((concurrencyLimit != null && concurrencyLimit > hardConcurrencyLimit) ||
+        reservedSlots > hardConcurrencyLimit)
+    )
+      throw new ORPCError("PRECONDITION_FAILED", {
+        message: "Provider concurrency cannot be reduced below an attached pool policy.",
+      });
+    const contextCeiling =
+      member.capacityContextCeilingMode === "LIMITED"
+        ? member.capacityContextCeiling
+        : member.capacityContextCeilingMode === "UNLIMITED"
+          ? null
+          : member.ModelPool.capacityContextCeiling;
+    const contextMargin = member.capacityContextMargin ?? member.ModelPool.capacityContextMargin;
+    if (
+      physicalMaxContext != null &&
+      contextCeiling != null &&
+      contextCeiling + contextMargin > physicalMaxContext
+    )
+      throw new ORPCError("PRECONDITION_FAILED", {
+        message: "Provider context cannot be reduced below an attached pool policy.",
+      });
+  }
+}
 const ring = () => {
   if (!env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS)
     throw new ORPCError("PRECONDITION_FAILED", {
@@ -541,6 +621,7 @@ export const providerManagementRouter = {
       const { id: modelId, ...data } = input;
       return prisma.$transaction(async (tx) => {
         await tx.$queryRaw`SELECT a.id FROM provider_account a WHERE a.id = (SELECT m."providerAccountId" FROM provider_model m WHERE m.id = ${modelId} AND m."userId" = ${userId}) AND a."userId" = ${userId} FOR UPDATE`;
+        await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${modelId} AND "userId" = ${userId} FOR UPDATE`;
         const current = await tx.providerModel.findFirst({
           where: { id: modelId, userId, deletedAt: null, ProviderAccount: { deletedAt: null } },
         });
@@ -551,6 +632,72 @@ export const providerManagementRouter = {
         });
         if (!account) throw missing();
         assertInventoryMatchesProviderType(account.providerType, data.nativeCapabilities);
+        if (data.concurrencyLimit !== undefined || data.contextWindow !== undefined) {
+          await tx.$queryRaw`SELECT id FROM execution_target WHERE "providerModelId" = ${modelId} AND "userId" = ${userId} FOR UPDATE`;
+          const target = await tx.executionTarget.findUnique({
+            where: { providerModelId: modelId },
+            select: {
+              id: true,
+              inferenceCapacityId: true,
+              directConcurrencyLimit: true,
+              directReservedSlots: true,
+              directContextCeiling: true,
+              directContextMargin: true,
+              PoolMembers: {
+                select: {
+                  capacityConcurrencyMode: true,
+                  capacityConcurrencyLimit: true,
+                  capacityReservedSlots: true,
+                  capacityContextCeilingMode: true,
+                  capacityContextCeiling: true,
+                  capacityContextMargin: true,
+                  ModelPool: {
+                    select: {
+                      capacityConcurrencyLimit: true,
+                      capacityReservedSlots: true,
+                      capacityContextCeiling: true,
+                      capacityContextMargin: true,
+                    },
+                  },
+                },
+              },
+            },
+          });
+          if (target?.inferenceCapacityId) {
+            await tx.$queryRaw`SELECT id FROM inference_capacity WHERE id = ${target.inferenceCapacityId} AND "userId" = ${userId} FOR UPDATE`;
+            const nextConcurrency =
+              data.concurrencyLimit !== undefined
+                ? data.concurrencyLimit
+                : current.concurrencyLimit;
+            const nextContext =
+              data.contextWindow !== undefined ? data.contextWindow : current.contextWindow;
+            const activeRows = await tx.$queryRaw<Array<{ count: bigint }>>`
+              SELECT COUNT(*)::bigint AS count
+              FROM capacity_lease
+              WHERE "capacityId" = ${target.inferenceCapacityId}
+                AND "userId" = ${userId}
+                AND state = 'ACTIVE'
+                AND "expiresAt" > CURRENT_TIMESTAMP
+            `;
+            assertProviderCapacityReductionIsSafe(
+              target,
+              nextConcurrency,
+              nextContext,
+              Number(activeRows[0]?.count ?? 0n),
+            );
+            const synchronized = await tx.inferenceCapacity.updateMany({
+              where: { id: target.inferenceCapacityId, userId },
+              data: {
+                hardConcurrencyLimit: nextConcurrency,
+                physicalMaxContext: nextContext,
+              },
+            });
+            if (synchronized.count !== 1)
+              throw new ORPCError("CONFLICT", {
+                message: "Provider capacity attachment changed concurrently.",
+              });
+          }
+        }
         const row = await tx.providerModel.update({
           where: { id: modelId },
           data: data as Prisma.ProviderModelUpdateInput,
@@ -562,6 +709,19 @@ export const providerManagementRouter = {
             providerAccountId: current.providerAccountId,
             action: "MODEL_UPDATED",
             subjectId: modelId,
+            metadata:
+              data.concurrencyLimit !== undefined || data.contextWindow !== undefined
+                ? ({
+                    previousConcurrencyLimit: current.concurrencyLimit,
+                    nextConcurrencyLimit:
+                      data.concurrencyLimit !== undefined
+                        ? data.concurrencyLimit
+                        : current.concurrencyLimit,
+                    previousContextWindow: current.contextWindow,
+                    nextContextWindow:
+                      data.contextWindow !== undefined ? data.contextWindow : current.contextWindow,
+                  } as Prisma.InputJsonValue)
+                : undefined,
           },
         });
         return row;

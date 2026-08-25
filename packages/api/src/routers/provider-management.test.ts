@@ -58,7 +58,8 @@ const db = prisma as unknown as {
     update: MockInstance;
     updateMany: MockInstance;
   };
-  executionTarget: { create: MockInstance };
+  executionTarget: { create: MockInstance; findUnique: MockInstance };
+  inferenceCapacity: { updateMany: MockInstance };
   modelPool: { findFirst: MockInstance };
   providerCredential: {
     count: MockInstance;
@@ -365,7 +366,7 @@ describe("providerManagementRouter security boundary", () => {
     await expect(client.updateModel({ id: "model", enabled: true })).rejects.toMatchObject({
       code: "NOT_FOUND",
     });
-    expect(db.$queryRaw).toHaveBeenCalledOnce();
+    expect(db.$queryRaw).toHaveBeenCalledTimes(2);
     expect(db.providerModel.update).not.toHaveBeenCalled();
     expect(db.providerAccount.findFirst).not.toHaveBeenCalled();
   });
@@ -406,6 +407,153 @@ describe("providerManagementRouter security boundary", () => {
       data: { nativeCapabilities },
       select: expect.any(Object),
     });
+  });
+
+  it("atomically synchronizes attached provider concurrency and context capacity", async () => {
+    envMock.enabled = true;
+    db.$queryRaw.mockResolvedValue([]);
+    db.providerModel.findFirst.mockResolvedValue({
+      id: "model",
+      providerAccountId: "account",
+      concurrencyLimit: 4,
+      contextWindow: 32_768,
+    });
+    db.providerAccount.findFirst.mockResolvedValue({ id: "account", providerType: "openai" });
+    db.executionTarget.findUnique.mockResolvedValue({
+      id: "target",
+      inferenceCapacityId: "capacity",
+      directConcurrencyLimit: 2,
+      directReservedSlots: 1,
+      directContextCeiling: 16_000,
+      directContextMargin: 384,
+      PoolMembers: [],
+    });
+    db.providerModel.update.mockResolvedValue({ id: "model" });
+    db.inferenceCapacity.updateMany.mockResolvedValue({ count: 1 });
+    db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
+    const client = createRouterClient(providerManagementRouter, { context });
+
+    await client.updateModel({ id: "model", concurrencyLimit: 8, contextWindow: 65_536 });
+
+    expect(db.inferenceCapacity.updateMany).toHaveBeenCalledWith({
+      where: { id: "capacity", userId: "owner" },
+      data: { hardConcurrencyLimit: 8, physicalMaxContext: 65_536 },
+    });
+    expect(db.providerAuditEvent.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          action: "MODEL_UPDATED",
+          metadata: expect.objectContaining({
+            previousConcurrencyLimit: 4,
+            nextConcurrencyLimit: 8,
+            previousContextWindow: 32_768,
+            nextContextWindow: 65_536,
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("rejects provider reductions below inherited pool concurrency or context policy", async () => {
+    envMock.enabled = true;
+    db.$queryRaw.mockResolvedValue([]);
+    db.providerModel.findFirst.mockResolvedValue({
+      id: "model",
+      providerAccountId: "account",
+      concurrencyLimit: 8,
+      contextWindow: 65_536,
+    });
+    db.providerAccount.findFirst.mockResolvedValue({ id: "account", providerType: "openai" });
+    db.executionTarget.findUnique.mockResolvedValue({
+      id: "target",
+      inferenceCapacityId: "capacity",
+      directConcurrencyLimit: null,
+      directReservedSlots: 0,
+      directContextCeiling: null,
+      directContextMargin: 0,
+      PoolMembers: [
+        {
+          capacityConcurrencyMode: "INHERIT",
+          capacityConcurrencyLimit: null,
+          capacityReservedSlots: null,
+          capacityContextCeilingMode: "INHERIT",
+          capacityContextCeiling: null,
+          capacityContextMargin: null,
+          ModelPool: {
+            capacityConcurrencyLimit: 6,
+            capacityReservedSlots: 2,
+            capacityContextCeiling: 48_000,
+            capacityContextMargin: 1_000,
+          },
+        },
+      ],
+    });
+    const client = createRouterClient(providerManagementRouter, { context });
+
+    await expect(client.updateModel({ id: "model", concurrencyLimit: 5 })).rejects.toMatchObject({
+      code: "PRECONDITION_FAILED",
+    });
+    await expect(client.updateModel({ id: "model", contextWindow: 48_000 })).rejects.toMatchObject({
+      code: "PRECONDITION_FAILED",
+    });
+    expect(db.providerModel.update).not.toHaveBeenCalled();
+    expect(db.inferenceCapacity.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("allows unattached provider capacity edits without creating a capacity snapshot", async () => {
+    envMock.enabled = true;
+    db.$queryRaw.mockResolvedValue([]);
+    db.providerModel.findFirst.mockResolvedValue({
+      id: "model",
+      providerAccountId: "account",
+      concurrencyLimit: null,
+      contextWindow: null,
+    });
+    db.providerAccount.findFirst.mockResolvedValue({ id: "account", providerType: "openai" });
+    db.executionTarget.findUnique.mockResolvedValue({
+      id: "target",
+      inferenceCapacityId: null,
+      PoolMembers: [],
+    });
+    db.providerModel.update.mockResolvedValue({ id: "model" });
+    db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
+    const client = createRouterClient(providerManagementRouter, { context });
+
+    await client.updateModel({ id: "model", concurrencyLimit: 3, contextWindow: 8_192 });
+    expect(db.inferenceCapacity.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("rejects reducing provider concurrency below active database leases", async () => {
+    envMock.enabled = true;
+    db.$queryRaw
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ count: 3n }]);
+    db.providerModel.findFirst.mockResolvedValue({
+      id: "model",
+      providerAccountId: "account",
+      concurrencyLimit: 4,
+      contextWindow: 32_768,
+    });
+    db.providerAccount.findFirst.mockResolvedValue({ id: "account", providerType: "openai" });
+    db.executionTarget.findUnique.mockResolvedValue({
+      id: "target",
+      inferenceCapacityId: "capacity",
+      directConcurrencyLimit: null,
+      directReservedSlots: 0,
+      directContextCeiling: null,
+      directContextMargin: 0,
+      PoolMembers: [],
+    });
+    const client = createRouterClient(providerManagementRouter, { context });
+
+    await expect(client.updateModel({ id: "model", concurrencyLimit: 2 })).rejects.toMatchObject({
+      code: "PRECONDITION_FAILED",
+    });
+    expect(db.inferenceCapacity.updateMany).not.toHaveBeenCalled();
+    expect(db.providerModel.update).not.toHaveBeenCalled();
   });
 
   it("rejects create and update inventories whose protocol disagrees with provider type", async () => {
