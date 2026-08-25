@@ -1,0 +1,801 @@
+import { randomUUID } from "node:crypto";
+import { ORPCError } from "@orpc/server";
+import prisma, { Prisma } from "@ws-model-proxy/db";
+import { env } from "@ws-model-proxy/env/server";
+import { z } from "zod";
+import { protectedProcedure } from "../index";
+import {
+  decryptProviderCredential,
+  encryptProviderCredential,
+  parseProviderCredentialKeyring,
+} from "../lib/provider-credential-crypto";
+import {
+  providerHttpsRequest,
+  redactProviderError,
+  validateProviderBaseUrl,
+} from "../lib/provider-egress";
+
+const id = z.string().min(1);
+const missing = () => new ORPCError("NOT_FOUND", { message: "Not found" });
+function enabled(): void {
+  if (!env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED) throw new ORPCError("NOT_FOUND");
+}
+const policy = () => ({
+  allowPrivateNetworks: env.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS,
+  egressEnabled: env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
+});
+const ring = () => {
+  if (!env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS)
+    throw new ORPCError("PRECONDITION_FAILED", {
+      message: "Provider credential encryption is not configured",
+    });
+  return parseProviderCredentialKeyring(env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS);
+};
+const accountSelect = {
+  id: true,
+  createdAt: true,
+  updatedAt: true,
+  providerType: true,
+  providerVersion: true,
+  label: true,
+  baseUrl: true,
+  endpointIdentity: true,
+  endpointVersion: true,
+  authType: true,
+  status: true,
+  enabled: true,
+  safeConfiguration: true,
+  healthStatus: true,
+  healthCheckedAt: true,
+  currentCredentialId: true,
+} as const;
+const modelSelect = {
+  id: true,
+  createdAt: true,
+  updatedAt: true,
+  providerAccountId: true,
+  upstreamModelId: true,
+  displayName: true,
+  capabilityMetadata: true,
+  nativeCapabilities: true,
+  contextWindow: true,
+  maxOutputTokens: true,
+  concurrencyLimit: true,
+  pricingMetadata: true,
+  pricingVersion: true,
+  healthStatus: true,
+  healthCheckedAt: true,
+  enabled: true,
+} as const;
+async function accountFor(userId: string, accountId: string) {
+  const row = await prisma.providerAccount.findFirst({
+    where: { id: accountId, userId, deletedAt: null },
+  });
+  if (!row) throw missing();
+  return row;
+}
+async function modelFor(userId: string, modelId: string) {
+  const row = await prisma.providerModel.findFirst({
+    where: { id: modelId, userId, deletedAt: null, ProviderAccount: { deletedAt: null } },
+  });
+  if (!row) throw missing();
+  return row;
+}
+const json = z.record(z.string(), z.unknown()).nullable().optional();
+const accountInput = z.object({
+  providerType: z
+    .string()
+    .trim()
+    .toLowerCase()
+    .regex(/^[a-z][a-z0-9_-]{0,63}$/u),
+  providerVersion: z.string().trim().min(1).max(64).nullable().optional(),
+  label: z.string().trim().min(1).max(120),
+  baseUrl: z.string().url().max(2048),
+  authType: z.enum(["API_KEY", "BEARER"]),
+  safeConfiguration: json,
+});
+const modelInput = z.object({
+  providerAccountId: id,
+  upstreamModelId: z.string().trim().min(1).max(255),
+  displayName: z.string().trim().min(1).max(255).nullable().optional(),
+  capabilityMetadata: json,
+  nativeCapabilities: json,
+  contextWindow: z.number().int().positive().nullable().optional(),
+  maxOutputTokens: z.number().int().positive().nullable().optional(),
+  concurrencyLimit: z.number().int().positive().nullable().optional(),
+  pricingMetadata: json,
+  pricingVersion: z.string().trim().min(1).max(128).nullable().optional(),
+  enabled: z.boolean().default(false),
+});
+const rule = z
+  .object({
+    metric: z.enum(["CONCURRENCY", "TOKENS", "SPEND"]),
+    period: z.enum(["PER_ATTEMPT", "UTC_DAY", "UTC_MONTH", "LIFETIME"]),
+    mode: z.enum(["LIMITED", "UNLIMITED"]),
+    limitValue: z
+      .string()
+      .regex(/^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/u)
+      .nullable(),
+    currency: z
+      .string()
+      .regex(/^[A-Z]{3}$/u)
+      .nullable(),
+  })
+  .superRefine((v, ctx) => {
+    if ((v.mode === "LIMITED") !== (v.limitValue !== null) || v.limitValue === "0")
+      ctx.addIssue({
+        code: "custom",
+        message: "LIMITED requires a positive value; UNLIMITED requires null",
+      });
+    if ((v.metric === "SPEND") !== (v.currency !== null))
+      ctx.addIssue({ code: "custom", message: "Currency is required only for spend" });
+    if (v.metric === "SPEND" && !["UTC_DAY", "UTC_MONTH"].includes(v.period))
+      ctx.addIssue({ code: "custom", message: "Invalid spend period" });
+    if (v.metric === "CONCURRENCY" && v.period !== "PER_ATTEMPT")
+      ctx.addIssue({ code: "custom", message: "Concurrency uses PER_ATTEMPT" });
+    if (v.metric !== "SPEND" && v.limitValue !== null && !/^\d+$/u.test(v.limitValue))
+      ctx.addIssue({ code: "custom", message: "Token and concurrency limits must be integers" });
+  });
+
+export const providerManagementRouter = {
+  listAccounts: protectedProcedure.handler(({ context }) => {
+    enabled();
+    return prisma.providerAccount.findMany({
+      where: { userId: context.session.user.id, deletedAt: null },
+      orderBy: [{ label: "asc" }, { id: "asc" }],
+      select: accountSelect,
+    });
+  }),
+  createAccount: protectedProcedure.input(accountInput).handler(async ({ input, context }) => {
+    enabled();
+    const userId = context.session.user.id;
+    const baseUrl = validateProviderBaseUrl(input.baseUrl, policy()).href.replace(/\/$/u, "");
+    return prisma.$transaction(async (tx) => {
+      const row = await tx.providerAccount.create({
+        data: {
+          ...input,
+          baseUrl,
+          endpointIdentity: baseUrl,
+          userId,
+          safeConfiguration: input.safeConfiguration as Prisma.InputJsonValue | undefined,
+          enabled: false,
+          status: "DISABLED",
+        },
+        select: accountSelect,
+      });
+      await tx.providerAuditEvent.create({
+        data: { userId, providerAccountId: row.id, action: "ACCOUNT_CREATED", subjectId: row.id },
+      });
+      return row;
+    });
+  }),
+  updateAccount: protectedProcedure
+    .input(accountInput.partial().extend({ id }))
+    .handler(async ({ input, context }) => {
+      enabled();
+      const userId = context.session.user.id;
+      const current = await accountFor(userId, input.id);
+      const { id: accountId, ...data } = input;
+      if (data.authType && data.authType !== current.authType) {
+        const credentialCount = await prisma.providerCredential.count({
+          where: { userId, providerAccountId: accountId },
+        });
+        if (credentialCount > 0)
+          throw new ORPCError("CONFLICT", {
+            message: "Replace or revoke provider credentials before changing authentication type",
+          });
+      }
+      let endpointChanged = false;
+      if (data.baseUrl) {
+        data.baseUrl = validateProviderBaseUrl(data.baseUrl, policy()).href.replace(/\/$/u, "");
+        endpointChanged = data.baseUrl !== current.baseUrl;
+      }
+      return prisma.$transaction(async (tx) => {
+        const row = await tx.providerAccount.update({
+          where: { id: accountId },
+          data: {
+            ...(data as Prisma.ProviderAccountUpdateInput),
+            ...(endpointChanged
+              ? { endpointIdentity: data.baseUrl, endpointVersion: { increment: 1 } }
+              : {}),
+          },
+          select: accountSelect,
+        });
+        await tx.providerAuditEvent.create({
+          data: {
+            userId,
+            providerAccountId: accountId,
+            action: "ACCOUNT_UPDATED",
+            subjectId: accountId,
+          },
+        });
+        return row;
+      });
+    }),
+  deleteAccount: protectedProcedure.input(z.object({ id })).handler(async ({ input, context }) => {
+    enabled();
+    const userId = context.session.user.id;
+    await accountFor(userId, input.id);
+    const now = new Date();
+    await prisma.$transaction(async (tx) => {
+      await tx.providerAccount.update({
+        where: { id: input.id },
+        data: { deletedAt: now, enabled: false, status: "DISABLED", currentCredentialId: null },
+      });
+      await tx.providerModel.updateMany({
+        where: { userId, providerAccountId: input.id },
+        data: { deletedAt: now, enabled: false },
+      });
+      await tx.providerCredential.updateMany({
+        where: { userId, providerAccountId: input.id, status: "ACTIVE" },
+        data: { status: "REVOKED", revokedAt: now },
+      });
+      await tx.providerAuditEvent.create({
+        data: {
+          userId,
+          providerAccountId: input.id,
+          action: "ACCOUNT_DELETED",
+          subjectId: input.id,
+        },
+      });
+    });
+    return { success: true };
+  }),
+  listModels: protectedProcedure
+    .input(z.object({ providerAccountId: id }))
+    .handler(async ({ input, context }) => {
+      enabled();
+      await accountFor(context.session.user.id, input.providerAccountId);
+      return prisma.providerModel.findMany({
+        where: {
+          userId: context.session.user.id,
+          providerAccountId: input.providerAccountId,
+          deletedAt: null,
+        },
+        select: modelSelect,
+      });
+    }),
+  createModel: protectedProcedure.input(modelInput).handler(async ({ input, context }) => {
+    enabled();
+    const userId = context.session.user.id;
+    await accountFor(userId, input.providerAccountId);
+    return prisma.$transaction(async (tx) => {
+      const row = await tx.providerModel.create({
+        data: {
+          ...input,
+          userId,
+          capabilityMetadata: input.capabilityMetadata as Prisma.InputJsonValue | undefined,
+          nativeCapabilities: input.nativeCapabilities as Prisma.InputJsonValue | undefined,
+          pricingMetadata: input.pricingMetadata as Prisma.InputJsonValue | undefined,
+        },
+        select: modelSelect,
+      });
+      await tx.executionTarget.create({
+        data: { userId, kind: "PROVIDER_MODEL", providerModelId: row.id },
+      });
+      await tx.providerAuditEvent.create({
+        data: {
+          userId,
+          providerAccountId: input.providerAccountId,
+          action: "MODEL_CREATED",
+          subjectId: row.id,
+        },
+      });
+      return row;
+    });
+  }),
+  updateModel: protectedProcedure
+    .input(
+      modelInput.omit({ providerAccountId: true, upstreamModelId: true }).partial().extend({ id }),
+    )
+    .handler(async ({ input, context }) => {
+      enabled();
+      const userId = context.session.user.id;
+      const current = await modelFor(userId, input.id);
+      const { id: modelId, ...data } = input;
+      return prisma.$transaction(async (tx) => {
+        const row = await tx.providerModel.update({
+          where: { id: modelId },
+          data: data as Prisma.ProviderModelUpdateInput,
+          select: modelSelect,
+        });
+        await tx.providerAuditEvent.create({
+          data: {
+            userId,
+            providerAccountId: current.providerAccountId,
+            action: "MODEL_UPDATED",
+            subjectId: modelId,
+          },
+        });
+        return row;
+      });
+    }),
+  deleteModel: protectedProcedure.input(z.object({ id })).handler(async ({ input, context }) => {
+    enabled();
+    const userId = context.session.user.id;
+    const current = await modelFor(userId, input.id);
+    await prisma.$transaction(async (tx) => {
+      await tx.providerModel.update({
+        where: { id: input.id },
+        data: { deletedAt: new Date(), enabled: false },
+      });
+      await tx.providerAuditEvent.create({
+        data: {
+          userId,
+          providerAccountId: current.providerAccountId,
+          action: "MODEL_DELETED",
+          subjectId: input.id,
+        },
+      });
+    });
+    return { success: true };
+  }),
+  listCredentials: protectedProcedure
+    .input(z.object({ providerAccountId: id }))
+    .handler(async ({ input, context }) => {
+      enabled();
+      await accountFor(context.session.user.id, input.providerAccountId);
+      return prisma.providerCredential.findMany({
+        where: { userId: context.session.user.id, providerAccountId: input.providerAccountId },
+        select: {
+          id: true,
+          createdAt: true,
+          credentialType: true,
+          keyVersion: true,
+          displaySuffix: true,
+          status: true,
+          replacedAt: true,
+          lastUsedAt: true,
+          revokedAt: true,
+        },
+      });
+    }),
+  createCredential: protectedProcedure
+    .input(z.object({ providerAccountId: id, credential: z.string().min(1).max(16_384) }))
+    .handler(async ({ input, context }) => {
+      enabled();
+      const userId = context.session.user.id;
+      const credentialId = randomUUID();
+      return prisma.$transaction(
+        async (tx) => {
+          await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.providerAccountId} AND "userId" = ${userId} AND "deletedAt" IS NULL FOR UPDATE`;
+          const account = await tx.providerAccount.findFirst({
+            where: { id: input.providerAccountId, userId, deletedAt: null },
+          });
+          if (!account) throw missing();
+          if (account.currentCredentialId) throw new ORPCError("CONFLICT");
+          const encrypted = encryptProviderCredential(
+            input.credential,
+            {
+              userId,
+              providerAccountId: account.id,
+              credentialId,
+              credentialType: account.authType,
+              aadVersion: 1,
+            },
+            ring(),
+          );
+          const row = await tx.providerCredential.create({
+            data: {
+              id: credentialId,
+              userId,
+              providerAccountId: account.id,
+              credentialType: account.authType,
+              ...encrypted,
+            },
+            select: {
+              id: true,
+              createdAt: true,
+              credentialType: true,
+              keyVersion: true,
+              displaySuffix: true,
+              status: true,
+            },
+          });
+          await tx.providerAccount.update({
+            where: { id: account.id },
+            data: { currentCredentialId: row.id },
+          });
+          await tx.providerAuditEvent.create({
+            data: {
+              userId,
+              providerAccountId: account.id,
+              action: "CREDENTIAL_CREATED",
+              subjectId: row.id,
+            },
+          });
+          return row;
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
+    }),
+  replaceCredential: protectedProcedure
+    .input(z.object({ providerAccountId: id, credential: z.string().min(1).max(16_384) }))
+    .handler(async ({ input, context }) => {
+      enabled();
+      const userId = context.session.user.id;
+      const credentialId = randomUUID();
+      return prisma.$transaction(
+        async (tx) => {
+          await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.providerAccountId} AND "userId" = ${userId} AND "deletedAt" IS NULL FOR UPDATE`;
+          const account = await tx.providerAccount.findFirst({
+            where: { id: input.providerAccountId, userId, deletedAt: null },
+          });
+          if (!account?.currentCredentialId) throw missing();
+          const encrypted = encryptProviderCredential(
+            input.credential,
+            {
+              userId,
+              providerAccountId: account.id,
+              credentialId,
+              credentialType: account.authType,
+              aadVersion: 1,
+            },
+            ring(),
+          );
+          const deactivated = await tx.providerCredential.updateMany({
+            where: { id: account.currentCredentialId, userId, status: "ACTIVE" },
+            data: { status: "REVOKED", revokedAt: new Date() },
+          });
+          if (deactivated.count !== 1) throw new ORPCError("CONFLICT");
+          const row = await tx.providerCredential.create({
+            data: {
+              id: credentialId,
+              userId,
+              providerAccountId: account.id,
+              credentialType: account.authType,
+              ...encrypted,
+            },
+            select: {
+              id: true,
+              createdAt: true,
+              credentialType: true,
+              keyVersion: true,
+              displaySuffix: true,
+              status: true,
+            },
+          });
+          await tx.providerCredential.update({
+            where: { id: account.currentCredentialId },
+            data: {
+              status: "REPLACED",
+              replacedAt: new Date(),
+              replacedById: row.id,
+              revokedAt: null,
+            },
+          });
+          await tx.providerAccount.update({
+            where: { id: account.id },
+            data: { currentCredentialId: row.id },
+          });
+          await tx.providerAuditEvent.create({
+            data: {
+              userId,
+              providerAccountId: account.id,
+              action: "CREDENTIAL_REPLACED",
+              subjectId: row.id,
+            },
+          });
+          return row;
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
+    }),
+  revokeCredential: protectedProcedure
+    .input(z.object({ id }))
+    .handler(async ({ input, context }) => {
+      enabled();
+      const userId = context.session.user.id;
+      const row = await prisma.providerCredential.findFirst({
+        where: { id: input.id, userId },
+        include: { ProviderAccount: true },
+      });
+      if (!row || row.ProviderAccount.deletedAt) throw missing();
+      await prisma.$transaction(async (tx) => {
+        const changed = await tx.providerCredential.updateMany({
+          where: { id: row.id, userId, status: { not: "REVOKED" } },
+          data: { status: "REVOKED", revokedAt: new Date() },
+        });
+        if (changed.count === 0) return;
+        await tx.providerAccount.updateMany({
+          where: { id: row.providerAccountId, userId, currentCredentialId: row.id },
+          data: { currentCredentialId: null, enabled: false, status: "DISABLED" },
+        });
+        await tx.providerAuditEvent.create({
+          data: {
+            userId,
+            providerAccountId: row.providerAccountId,
+            action: "CREDENTIAL_REVOKED",
+            subjectId: row.id,
+          },
+        });
+      });
+      return { success: true };
+    }),
+  listAuditEvents: protectedProcedure
+    .input(
+      z.object({
+        providerAccountId: id.optional(),
+        limit: z.number().int().min(1).max(200).default(50),
+      }),
+    )
+    .handler(async ({ input, context }) => {
+      enabled();
+      if (input.providerAccountId)
+        await accountFor(context.session.user.id, input.providerAccountId);
+      return prisma.providerAuditEvent.findMany({
+        where: {
+          userId: context.session.user.id,
+          ...(input.providerAccountId ? { providerAccountId: input.providerAccountId } : {}),
+        },
+        select: {
+          id: true,
+          createdAt: true,
+          providerAccountId: true,
+          action: true,
+          subjectId: true,
+          metadata: true,
+        },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: input.limit,
+      });
+    }),
+  rotateCredential: protectedProcedure
+    .input(z.object({ id }))
+    .handler(async ({ input, context }) => {
+      enabled();
+      const userId = context.session.user.id;
+      const row = await prisma.providerCredential.findFirst({
+        where: { id: input.id, userId, status: "ACTIVE" },
+      });
+      if (!row) throw missing();
+      const keyring = ring();
+      const identity = {
+        userId,
+        providerAccountId: row.providerAccountId,
+        credentialId: row.id,
+        credentialType: row.credentialType,
+        aadVersion: row.aadVersion,
+      };
+      const plaintext = decryptProviderCredential(
+        {
+          algorithm: row.algorithm as "AES-256-GCM",
+          keyVersion: row.keyVersion,
+          ciphertext: Buffer.from(row.ciphertext),
+          nonce: Buffer.from(row.nonce),
+          authTag: Buffer.from(row.authTag),
+        },
+        identity,
+        keyring,
+      );
+      const encrypted = encryptProviderCredential(plaintext, identity, keyring);
+      await prisma.$transaction(async (tx) => {
+        await tx.providerCredential.update({ where: { id: row.id }, data: encrypted });
+        await tx.providerAuditEvent.create({
+          data: {
+            userId,
+            providerAccountId: row.providerAccountId,
+            action: "CREDENTIAL_ROTATED",
+            subjectId: row.id,
+          },
+        });
+      });
+      return {
+        id: row.id,
+        keyVersion: encrypted.keyVersion,
+        displaySuffix: encrypted.displaySuffix,
+      };
+    }),
+  testCredential: protectedProcedure
+    .input(z.object({ providerAccountId: id }))
+    .handler(async ({ input, context }) => {
+      enabled();
+      const userId = context.session.user.id;
+      const account = await accountFor(userId, input.providerAccountId);
+      const row = account.currentCredentialId
+        ? await prisma.providerCredential.findFirst({
+            where: { id: account.currentCredentialId, userId, status: "ACTIVE" },
+          })
+        : null;
+      if (!row) throw missing();
+      const secret = decryptProviderCredential(
+        {
+          algorithm: row.algorithm as "AES-256-GCM",
+          keyVersion: row.keyVersion,
+          ciphertext: Buffer.from(row.ciphertext),
+          nonce: Buffer.from(row.nonce),
+          authTag: Buffer.from(row.authTag),
+        },
+        {
+          userId,
+          providerAccountId: account.id,
+          credentialId: row.id,
+          credentialType: row.credentialType,
+          aadVersion: row.aadVersion,
+        },
+        ring(),
+      );
+      try {
+        const headers =
+          row.credentialType === "BEARER"
+            ? { authorization: `Bearer ${secret}` }
+            : { "x-api-key": secret };
+        const response = await providerHttpsRequest(
+          account.baseUrl,
+          { method: "GET", headers: { accept: "application/json" } },
+          policy(),
+          account.providerType === "anthropic" ? "anthropic" : "openai",
+          headers,
+        );
+        response.resume();
+        await prisma.providerCredential.update({
+          where: { id: row.id },
+          data: { lastUsedAt: new Date() },
+        });
+        return { ok: (response.statusCode ?? 500) < 400, statusCode: response.statusCode ?? null };
+      } catch (error) {
+        throw new ORPCError("BAD_GATEWAY", { message: redactProviderError(error) });
+      }
+    }),
+  listBudgetPolicies: protectedProcedure.handler(({ context }) => {
+    enabled();
+    return prisma.providerBudgetPolicy.findMany({
+      where: { userId: context.session.user.id },
+      include: { Rules: true },
+    });
+  }),
+  createBudgetPolicy: protectedProcedure
+    .input(
+      z.object({
+        scopeType: z.enum(["PROVIDER_ACCOUNT", "POOL_PROVIDER_MODEL"]),
+        providerAccountId: id,
+        poolId: id.nullable(),
+        providerModelId: id.nullable(),
+        active: z.boolean().default(false),
+        rules: z.array(rule).min(1),
+      }),
+    )
+    .handler(async ({ input, context }) => {
+      enabled();
+      const userId = context.session.user.id;
+      await accountFor(userId, input.providerAccountId);
+      if (
+        (input.scopeType === "POOL_PROVIDER_MODEL") !==
+        Boolean(input.poolId && input.providerModelId)
+      )
+        throw new ORPCError("BAD_REQUEST");
+      if (input.providerModelId) {
+        const model = await modelFor(userId, input.providerModelId);
+        if (model.providerAccountId !== input.providerAccountId) throw missing();
+      }
+      if (
+        input.poolId &&
+        !(await prisma.modelPool.findFirst({ where: { id: input.poolId, userId } }))
+      )
+        throw missing();
+      return prisma.$transaction(async (tx) => {
+        const row = await tx.providerBudgetPolicy.create({
+          data: {
+            userId,
+            scopeType: input.scopeType,
+            providerAccountId: input.providerAccountId,
+            poolId: input.poolId,
+            providerModelId: input.providerModelId,
+            active: input.active,
+            activatedAt: input.active ? new Date() : null,
+            Rules: {
+              create: input.rules.map((r) => ({
+                ...r,
+                limitValue: r.limitValue ? new Prisma.Decimal(r.limitValue) : null,
+              })),
+            },
+          },
+          include: { Rules: true },
+        });
+        await tx.providerAuditEvent.create({
+          data: {
+            userId,
+            providerAccountId: input.providerAccountId,
+            action: "BUDGET_CREATED",
+            subjectId: row.id,
+          },
+        });
+        return row;
+      });
+    }),
+  replaceBudgetPolicy: protectedProcedure
+    .input(z.object({ id, active: z.boolean(), rules: z.array(rule).min(1) }))
+    .handler(async ({ input, context }) => {
+      enabled();
+      const userId = context.session.user.id;
+      const current = await prisma.providerBudgetPolicy.findFirst({
+        where: { id: input.id, userId },
+      });
+      if (!current) throw missing();
+      return prisma.$transaction(
+        async (tx) => {
+          await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${current.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
+          await tx.$queryRaw`SELECT id FROM provider_budget_policy WHERE id = ${current.id} AND "userId" = ${userId} FOR UPDATE`;
+          const locked = await tx.providerBudgetPolicy.findFirst({
+            where: { id: current.id, userId },
+          });
+          if (!locked) throw missing();
+          const latest = await tx.providerBudgetPolicy.findFirst({
+            where: {
+              userId,
+              scopeType: locked.scopeType,
+              providerAccountId: locked.providerAccountId,
+              poolId: locked.poolId,
+              providerModelId: locked.providerModelId,
+            },
+            orderBy: { version: "desc" },
+            select: { id: true },
+          });
+          if (latest?.id !== locked.id)
+            throw new ORPCError("CONFLICT", { message: "Budget policy version is stale" });
+          if (locked.active) {
+            await tx.providerBudgetPolicy.update({
+              where: { id: locked.id },
+              data: { active: false, deactivatedAt: new Date() },
+            });
+          }
+          const row = await tx.providerBudgetPolicy.create({
+            data: {
+              userId,
+              scopeType: locked.scopeType,
+              providerAccountId: locked.providerAccountId,
+              poolId: locked.poolId,
+              providerModelId: locked.providerModelId,
+              version: locked.version + 1,
+              active: input.active,
+              activatedAt: input.active ? new Date() : null,
+              Rules: {
+                create: input.rules.map((r) => ({
+                  ...r,
+                  limitValue: r.limitValue ? new Prisma.Decimal(r.limitValue) : null,
+                })),
+              },
+            },
+            include: { Rules: true },
+          });
+          await tx.providerAuditEvent.create({
+            data: {
+              userId,
+              providerAccountId: locked.providerAccountId,
+              action: "BUDGET_UPDATED",
+              subjectId: row.id,
+              metadata: { replacesPolicyId: locked.id },
+            },
+          });
+          return row;
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
+    }),
+  deactivateBudgetPolicy: protectedProcedure
+    .input(z.object({ id }))
+    .handler(async ({ input, context }) => {
+      enabled();
+      const userId = context.session.user.id;
+      const current = await prisma.providerBudgetPolicy.findFirst({
+        where: { id: input.id, userId },
+      });
+      if (!current) throw missing();
+      if (!current.active) return { success: true };
+      await prisma.$transaction(async (tx) => {
+        await tx.providerBudgetPolicy.update({
+          where: { id: current.id },
+          data: { active: false, deactivatedAt: new Date() },
+        });
+        await tx.providerAuditEvent.create({
+          data: {
+            userId,
+            providerAccountId: current.providerAccountId,
+            action: "BUDGET_DEACTIVATED",
+            subjectId: current.id,
+          },
+        });
+      });
+      return { success: true };
+    }),
+};

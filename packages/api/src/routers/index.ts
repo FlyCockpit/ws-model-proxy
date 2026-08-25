@@ -11,6 +11,7 @@ import { cliCredentialsRouter } from "./cli-credentials";
 import { devicesRouter } from "./devices";
 import { forwarderManagementRouter } from "./forwarder-management";
 import { modelApiTokensRouter } from "./model-api-tokens";
+import { providerManagementRouter } from "./provider-management";
 import { relayMetadataRouter } from "./relay-metadata";
 import { settingsRouter } from "./settings";
 import { usersRouter } from "./users";
@@ -54,6 +55,7 @@ export const appRouter = {
   cliCredentials: cliCredentialsRouter,
   capacityManagement: capacityManagementRouter,
   modelApiTokens: modelApiTokensRouter,
+  providerManagement: providerManagementRouter,
   relayMetadata: relayMetadataRouter,
   users: usersRouter,
 };

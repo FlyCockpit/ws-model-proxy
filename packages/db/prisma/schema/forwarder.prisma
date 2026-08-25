@@ -22,6 +22,73 @@ enum ProviderAuthType {
   BEARER
 }
 
+enum ProviderCredentialStatus {
+  ACTIVE
+  REPLACED
+  REVOKED
+}
+
+enum ProviderHealthStatus {
+  UNKNOWN
+  HEALTHY
+  DEGRADED
+  UNAVAILABLE
+}
+
+enum BudgetLimitMode {
+  LIMITED
+  UNLIMITED
+}
+
+enum BudgetScopeType {
+  PROVIDER_ACCOUNT
+  POOL_PROVIDER_MODEL
+}
+
+enum BudgetMetric {
+  CONCURRENCY
+  TOKENS
+  SPEND
+}
+
+enum BudgetPeriod {
+  PER_ATTEMPT
+  UTC_DAY
+  UTC_MONTH
+  LIFETIME
+}
+
+enum BudgetReservationState {
+  RESERVED
+  RELEASED
+  SETTLED
+  EXPIRED
+}
+
+enum UsageCostConfidence {
+  REPORTED
+  CALCULATED
+  ESTIMATED
+}
+
+enum ProviderAuditAction {
+  ACCOUNT_CREATED
+  ACCOUNT_UPDATED
+  ACCOUNT_DELETED
+  MODEL_CREATED
+  MODEL_UPDATED
+  MODEL_DELETED
+  CREDENTIAL_CREATED
+  CREDENTIAL_REPLACED
+  CREDENTIAL_REVOKED
+  CREDENTIAL_ROTATED
+  CREDENTIAL_TESTED
+  BUDGET_CREATED
+  BUDGET_UPDATED
+  BUDGET_ACTIVATED
+  BUDGET_DEACTIVATED
+}
+
 enum ExecutionTargetKind {
   DISCOVERED_MODEL
   PROVIDER_MODEL
@@ -304,45 +371,279 @@ model DiscoveredModel {
 /// remain feature-gated until credential, SSRF, admission, and budget controls
 /// are implemented.
 model ProviderAccount {
-  id                String                @id @default(cuid(2))
-  createdAt         DateTime              @default(now())
-  updatedAt         DateTime              @default(now()) @updatedAt
-  userId            String
-  providerType      String
-  label             String
-  baseUrl           String
-  authType          ProviderAuthType
-  status            ProviderAccountStatus @default(DISABLED)
-  enabled           Boolean               @default(false)
-  safeConfiguration Json?
-  User              User                  @relation("ProviderAccountOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ProviderModels    ProviderModel[]
+  id                  String                   @id @default(cuid(2))
+  createdAt           DateTime                 @default(now())
+  updatedAt           DateTime                 @default(now()) @updatedAt
+  deletedAt           DateTime?
+  userId              String
+  providerType        String
+  providerVersion     String?
+  label               String
+  baseUrl             String
+  /// Canonical endpoint identity used by affinity keys; changes only with baseUrl.
+  endpointIdentity    String                   @default("")
+  endpointVersion     Int                      @default(1)
+  authType            ProviderAuthType
+  status              ProviderAccountStatus    @default(DISABLED)
+  enabled             Boolean                  @default(false)
+  safeConfiguration   Json?
+  currentCredentialId String?                  @unique
+  healthStatus        ProviderHealthStatus     @default(UNKNOWN)
+  healthCheckedAt     DateTime?
+  User                User                     @relation("ProviderAccountOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ProviderModels      ProviderModel[]
+  Credentials         ProviderCredential[]     @relation("ProviderAccountCredentials")
+  CurrentCredential   ProviderCredential?      @relation("ProviderAccountCurrentCredential", fields: [currentCredentialId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  BudgetPolicies      ProviderBudgetPolicy[]
+  UsageLedger         ProviderUsageLedger[]
+  PricingVersions     ProviderPricingVersion[]
+  AuditEvents         ProviderAuditEvent[]
 
   @@unique([userId, label])
   @@unique([id, userId])
+  @@unique([id, userId, endpointVersion])
   @@index([userId, status])
   @@map("provider_account")
 }
 
 model ProviderModel {
-  id                 String           @id @default(cuid(2))
-  createdAt          DateTime         @default(now())
-  updatedAt          DateTime         @default(now()) @updatedAt
+  id                 String                   @id @default(cuid(2))
+  createdAt          DateTime                 @default(now())
+  updatedAt          DateTime                 @default(now()) @updatedAt
+  deletedAt          DateTime?
   userId             String
   providerAccountId  String
   upstreamModelId    String
   displayName        String?
   capabilityMetadata Json?
-  enabled            Boolean          @default(false)
-  User               User             @relation("ProviderModelOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ProviderAccount    ProviderAccount  @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  nativeCapabilities Json?
+  contextWindow      Int?
+  maxOutputTokens    Int?
+  concurrencyLimit   Int?
+  pricingMetadata    Json?
+  pricingVersion     String?
+  healthStatus       ProviderHealthStatus     @default(UNKNOWN)
+  healthCheckedAt    DateTime?
+  enabled            Boolean                  @default(false)
+  User               User                     @relation("ProviderModelOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ProviderAccount    ProviderAccount          @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
   ExecutionTarget    ExecutionTarget?
+  BudgetPolicies     ProviderBudgetPolicy[]
+  UsageLedger        ProviderUsageLedger[]
+  PricingVersions    ProviderPricingVersion[]
 
   @@unique([providerAccountId, upstreamModelId])
   @@unique([id, userId])
   @@index([userId])
   @@index([providerAccountId, enabled])
   @@map("provider_model")
+}
+
+/// Recoverable provider secret encrypted with application-layer AES-256-GCM.
+/// Identity fields are immutable because they form the authenticated AAD.
+model ProviderCredential {
+  id                 String                      @id @default(cuid(2))
+  createdAt          DateTime                    @default(now())
+  userId             String
+  providerAccountId  String
+  credentialType     ProviderAuthType
+  aadVersion         Int                         @default(1)
+  algorithm          String                      @default("AES-256-GCM")
+  keyVersion         String
+  ciphertext         Bytes
+  nonce              Bytes
+  authTag            Bytes
+  displaySuffix      String
+  status             ProviderCredentialStatus    @default(ACTIVE)
+  replacedAt         DateTime?
+  replacedById       String?                     @unique
+  lastUsedAt         DateTime?
+  revokedAt          DateTime?
+  User               User                        @relation("ProviderCredentialOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ProviderAccount    ProviderAccount             @relation("ProviderAccountCredentials", fields: [providerAccountId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  CurrentForAccount  ProviderAccount?            @relation("ProviderAccountCurrentCredential")
+  ReplacedBy         ProviderCredential?         @relation("ProviderCredentialReplacement", fields: [replacedById, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  Replaces           ProviderCredential?         @relation("ProviderCredentialReplacement")
+  BudgetReservations ProviderBudgetReservation[]
+  UsageLedger        ProviderUsageLedger[]
+
+  @@unique([id, userId])
+  @@unique([replacedById, userId])
+  @@unique([nonce, keyVersion])
+  @@index([providerAccountId, status])
+  @@index([userId])
+  @@map("provider_credential")
+}
+
+model ProviderBudgetPolicy {
+  id                String                      @id @default(cuid(2))
+  createdAt         DateTime                    @default(now())
+  updatedAt         DateTime                    @default(now()) @updatedAt
+  userId            String
+  scopeType         BudgetScopeType
+  providerAccountId String
+  poolId            String?
+  providerModelId   String?
+  version           Int                         @default(1)
+  active            Boolean                     @default(false)
+  activatedAt       DateTime?
+  deactivatedAt     DateTime?
+  User              User                        @relation("ProviderBudgetPolicyOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ProviderAccount   ProviderAccount             @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  Pool              ModelPool?                  @relation(fields: [poolId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  ProviderModel     ProviderModel?              @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  Rules             ProviderBudgetRule[]
+  Reservations      ProviderBudgetReservation[]
+
+  @@unique([id, userId])
+  @@unique([userId, scopeType, providerAccountId, poolId, providerModelId, version])
+  @@index([userId, active])
+  @@map("provider_budget_policy")
+}
+
+model ProviderBudgetRule {
+  id           String                      @id @default(cuid(2))
+  createdAt    DateTime                    @default(now())
+  policyId     String
+  metric       BudgetMetric
+  period       BudgetPeriod
+  mode         BudgetLimitMode
+  limitValue   Decimal?                    @db.Decimal(30, 9)
+  currency     String?
+  Policy       ProviderBudgetPolicy        @relation(fields: [policyId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Reservations ProviderBudgetReservation[]
+
+  @@unique([policyId, metric, period])
+  @@map("provider_budget_rule")
+}
+
+model ProviderBudgetReservation {
+  id            String                     @id @default(cuid(2))
+  createdAt     DateTime                   @default(now())
+  settledAt     DateTime?
+  expiresAt     DateTime?
+  userId        String
+  policyId      String
+  ruleId        String
+  credentialId  String?
+  requestId     String
+  attemptId     String
+  fencingToken  BigInt
+  metric        BudgetMetric
+  period        BudgetPeriod
+  policyVersion Int
+  utcBasis      String                     @default("UTC")
+  windowStart   DateTime?
+  windowEnd     DateTime?
+  reservedValue Decimal                    @db.Decimal(30, 9)
+  settledValue  Decimal?                   @db.Decimal(30, 9)
+  currency      String?
+  state         BudgetReservationState     @default(RESERVED)
+  Policy        ProviderBudgetPolicy       @relation(fields: [policyId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  Rule          ProviderBudgetRule         @relation(fields: [ruleId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  Credential    ProviderCredential?        @relation(fields: [credentialId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  UsageLedger   ProviderUsageLedger[]
+  Settlements   ProviderBudgetSettlement[]
+
+  @@unique([policyId, ruleId, attemptId])
+  @@unique([id, userId])
+  @@index([userId, state, expiresAt])
+  @@index([policyId, ruleId, windowStart, windowEnd])
+  @@map("provider_budget_reservation")
+}
+
+/// Append-only accounting row. Application APIs expose creation only; database
+/// hardening prevents UPDATE/DELETE outside the schema maintenance role.
+model ProviderUsageLedger {
+  id                String                     @id @default(cuid(2))
+  createdAt         DateTime                   @default(now())
+  userId            String
+  providerAccountId String
+  providerModelId   String
+  credentialId      String?
+  reservationId     String?
+  poolId            String?
+  requestId         String
+  attemptId         String
+  fencingToken      BigInt
+  inputTokens       BigInt?
+  outputTokens      BigInt?
+  cacheReadTokens   BigInt?
+  cacheWriteTokens  BigInt?
+  reasoningTokens   BigInt?
+  toolTokens        BigInt?
+  rawUsage          Json?
+  reportedCost      Decimal?                   @db.Decimal(30, 9)
+  calculatedCost    Decimal?                   @db.Decimal(30, 9)
+  settledCost       Decimal                    @db.Decimal(30, 9)
+  currency          String
+  pricingVersion    String
+  confidence        UsageCostConfidence
+  User              User                       @relation("ProviderUsageLedgerOwner", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  ProviderAccount   ProviderAccount            @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  ProviderModel     ProviderModel              @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  Credential        ProviderCredential?        @relation(fields: [credentialId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  Reservation       ProviderBudgetReservation? @relation(fields: [reservationId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([attemptId, fencingToken])
+  @@index([userId, createdAt])
+  @@index([providerAccountId, createdAt])
+  @@map("provider_usage_ledger")
+}
+
+/// Immutable provider price schedule referenced by usage rows via version.
+model ProviderPricingVersion {
+  id                String          @id @default(cuid(2))
+  createdAt         DateTime        @default(now())
+  userId            String
+  providerAccountId String
+  providerModelId   String
+  version           String
+  currency          String
+  pricing           Json
+  effectiveAt       DateTime
+  retiredAt         DateTime?
+  ProviderAccount   ProviderAccount @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  ProviderModel     ProviderModel   @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([providerModelId, version])
+  @@index([userId, effectiveAt])
+  @@map("provider_pricing_version")
+}
+
+/// Append-only reconciliation entry. The unique fencing identity makes
+/// retries idempotent without rewriting historical reservations.
+model ProviderBudgetSettlement {
+  id            String                    @id @default(cuid(2))
+  createdAt     DateTime                  @default(now())
+  userId        String
+  reservationId String
+  attemptId     String
+  fencingToken  BigInt
+  settledValue  Decimal                   @db.Decimal(30, 9)
+  currency      String?
+  confidence    UsageCostConfidence
+  reason        String
+  Reservation   ProviderBudgetReservation @relation(fields: [reservationId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([reservationId, attemptId, fencingToken])
+  @@index([userId, createdAt])
+  @@map("provider_budget_settlement")
+}
+
+model ProviderAuditEvent {
+  id                String              @id @default(cuid(2))
+  createdAt         DateTime            @default(now())
+  userId            String
+  providerAccountId String?
+  action            ProviderAuditAction
+  subjectId         String
+  metadata          Json?
+  User              User                @relation("ProviderAuditEventOwner", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  ProviderAccount   ProviderAccount?    @relation(fields: [providerAccountId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("provider_audit_event")
 }
 
 /// Stable, owner-scoped identity for anything capable of executing inference.
@@ -435,6 +736,7 @@ model ModelPool {
   User                            User                          @relation("ModelPoolOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   TransformerDiscoveredModel      DiscoveredModel?              @relation("ModelPoolTransformer", fields: [transformerDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   PoolMembers                     PoolMember[]
+  ProviderBudgetPolicies          ProviderBudgetPolicy[]
   PoolGrants                      PoolGrant[]
   ModelApiTokenAllowlistEntries   ModelApiTokenAllowlistEntry[]
   ResponseStickinessRecords       ResponseStickinessRecord[]
@@ -444,6 +746,7 @@ model ModelPool {
   CapacityLeases                  CapacityLease[]
 
   @@unique([userId, slug])
+  @@unique([id, userId])
   @@index([userId])
   @@index([transformerDiscoveredModelId])
   @@map("model_pool")

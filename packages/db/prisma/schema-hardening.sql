@@ -14,7 +14,10 @@ CREATE SEQUENCE IF NOT EXISTS admission_enqueue_sequence AS bigint MINVALUE 0 ST
 LOCK TABLE discovered_model, execution_target, model_pool, model_api_token,
   pool_member, model_api_token_allowlist_entry, response_stickiness_record,
   relay_request, inference_capacity, admission_request, capacity_waiter,
-  capacity_lease IN SHARE ROW EXCLUSIVE MODE;
+  capacity_lease, provider_account, provider_model, provider_credential,
+  provider_budget_policy, provider_budget_rule, provider_budget_reservation,
+  provider_usage_ledger, provider_pricing_version, provider_budget_settlement,
+  provider_audit_event IN SHARE ROW EXCLUSIVE MODE;
 
 -- Capacity policy bounds are database invariants because admission correctness
 -- must not depend on every rolling-deploy writer running the same validator.
@@ -981,5 +984,372 @@ CREATE TRIGGER relay_request_execution_target_consistency
 BEFORE INSERT OR UPDATE OF "userId", "requestedDiscoveredModelId", "requestedExecutionTargetId",
   "selectedDiscoveredModelId", "selectedExecutionTargetId" ON relay_request
 FOR EACH ROW EXECUTE FUNCTION enforce_execution_target_consumer_consistency();
+
+UPDATE provider_account SET "endpointIdentity" = "baseUrl" WHERE "endpointIdentity" = '';
+
+ALTER TABLE provider_account DROP CONSTRAINT IF EXISTS provider_account_shape_check;
+ALTER TABLE provider_account ADD CONSTRAINT provider_account_shape_check CHECK (
+  "providerType" = lower("providerType")
+  AND "providerType" ~ '^[a-z][a-z0-9_-]{0,63}$'
+  AND btrim(label) <> ''
+  AND btrim("baseUrl") <> ''
+  AND btrim("endpointIdentity") <> ''
+  AND "endpointVersion" > 0
+  AND (enabled = FALSE OR status = 'ACTIVE')
+  AND (enabled = FALSE OR "currentCredentialId" IS NOT NULL)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS provider_credential_one_active_per_account
+  ON provider_credential ("providerAccountId") WHERE status = 'ACTIVE';
+
+ALTER TABLE provider_model DROP CONSTRAINT IF EXISTS provider_model_shape_check;
+ALTER TABLE provider_model ADD CONSTRAINT provider_model_shape_check CHECK (
+  btrim("upstreamModelId") <> ''
+  AND ("contextWindow" IS NULL OR "contextWindow" > 0)
+  AND ("maxOutputTokens" IS NULL OR "maxOutputTokens" > 0)
+  AND ("concurrencyLimit" IS NULL OR "concurrencyLimit" > 0)
+  AND ("pricingVersion" IS NULL OR btrim("pricingVersion") <> '')
+);
+
+ALTER TABLE provider_credential DROP CONSTRAINT IF EXISTS provider_credential_shape_check;
+ALTER TABLE provider_credential ADD CONSTRAINT provider_credential_shape_check CHECK (
+  "aadVersion" > 0
+  AND algorithm = 'AES-256-GCM'
+  AND octet_length(nonce) = 12
+  AND octet_length("authTag") = 16
+  AND octet_length(ciphertext) > 0
+  AND btrim("keyVersion") <> ''
+  AND char_length("displaySuffix") BETWEEN 1 AND 4
+  AND ((status = 'ACTIVE' AND "replacedAt" IS NULL AND "revokedAt" IS NULL)
+    OR (status = 'REPLACED' AND "replacedAt" IS NOT NULL AND "replacedById" IS NOT NULL AND "revokedAt" IS NULL)
+    OR (status = 'REVOKED' AND "revokedAt" IS NOT NULL))
+);
+
+ALTER TABLE provider_budget_policy DROP CONSTRAINT IF EXISTS provider_budget_policy_scope_check;
+ALTER TABLE provider_budget_policy ADD CONSTRAINT provider_budget_policy_scope_check CHECK (
+  version > 0
+  AND (("scopeType" = 'PROVIDER_ACCOUNT' AND "poolId" IS NULL AND "providerModelId" IS NULL)
+    OR ("scopeType" = 'POOL_PROVIDER_MODEL' AND "poolId" IS NOT NULL AND "providerModelId" IS NOT NULL))
+  AND ((active AND "activatedAt" IS NOT NULL AND "deactivatedAt" IS NULL)
+    OR (NOT active AND ("activatedAt" IS NULL OR "deactivatedAt" IS NOT NULL)))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_account_version_unique
+  ON provider_budget_policy ("userId", "providerAccountId", version)
+  WHERE "scopeType" = 'PROVIDER_ACCOUNT';
+CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_attachment_version_unique
+  ON provider_budget_policy ("userId", "providerAccountId", "poolId", "providerModelId", version)
+  WHERE "scopeType" = 'POOL_PROVIDER_MODEL';
+CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_one_active_account
+  ON provider_budget_policy ("userId", "providerAccountId")
+  WHERE active AND "scopeType" = 'PROVIDER_ACCOUNT';
+CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_one_active_attachment
+  ON provider_budget_policy ("userId", "providerAccountId", "poolId", "providerModelId")
+  WHERE active AND "scopeType" = 'POOL_PROVIDER_MODEL';
+
+ALTER TABLE provider_budget_rule DROP CONSTRAINT IF EXISTS provider_budget_rule_shape_check;
+ALTER TABLE provider_budget_rule ADD CONSTRAINT provider_budget_rule_shape_check CHECK (
+  ((mode = 'LIMITED' AND "limitValue" > 0) OR (mode = 'UNLIMITED' AND "limitValue" IS NULL))
+  AND ((metric = 'SPEND' AND currency ~ '^[A-Z]{3}$') OR (metric <> 'SPEND' AND currency IS NULL))
+  AND (metric <> 'CONCURRENCY' OR period = 'PER_ATTEMPT')
+  AND (metric <> 'SPEND' OR period IN ('UTC_DAY', 'UTC_MONTH'))
+  AND (metric = 'SPEND' OR "limitValue" IS NULL OR trunc("limitValue") = "limitValue")
+);
+
+ALTER TABLE provider_budget_reservation DROP CONSTRAINT IF EXISTS provider_budget_reservation_shape_check;
+ALTER TABLE provider_budget_reservation ADD CONSTRAINT provider_budget_reservation_shape_check CHECK (
+  "fencingToken" > 0 AND "policyVersion" > 0 AND "reservedValue" > 0
+  AND "utcBasis" = 'UTC'
+  AND ((period = 'LIFETIME' AND "windowStart" IS NOT NULL AND "windowEnd" IS NULL)
+    OR (period = 'PER_ATTEMPT' AND "windowStart" IS NULL AND "windowEnd" IS NULL)
+    OR (period IN ('UTC_DAY', 'UTC_MONTH') AND "windowStart" IS NOT NULL AND "windowEnd" > "windowStart"))
+  AND ((metric = 'SPEND' AND currency ~ '^[A-Z]{3}$') OR (metric <> 'SPEND' AND currency IS NULL))
+  AND ("settledValue" IS NULL OR "settledValue" >= 0)
+);
+
+ALTER TABLE provider_usage_ledger DROP CONSTRAINT IF EXISTS provider_usage_ledger_shape_check;
+ALTER TABLE provider_usage_ledger ADD CONSTRAINT provider_usage_ledger_shape_check CHECK (
+  "fencingToken" > 0 AND "settledCost" >= 0 AND currency ~ '^[A-Z]{3}$'
+  AND btrim("pricingVersion") <> ''
+  AND ("reportedCost" IS NULL OR "reportedCost" >= 0)
+  AND ("calculatedCost" IS NULL OR "calculatedCost" >= 0)
+  AND ("inputTokens" IS NULL OR "inputTokens" >= 0)
+  AND ("outputTokens" IS NULL OR "outputTokens" >= 0)
+  AND ("cacheReadTokens" IS NULL OR "cacheReadTokens" >= 0)
+  AND ("cacheWriteTokens" IS NULL OR "cacheWriteTokens" >= 0)
+  AND ("reasoningTokens" IS NULL OR "reasoningTokens" >= 0)
+  AND ("toolTokens" IS NULL OR "toolTokens" >= 0)
+);
+
+ALTER TABLE provider_pricing_version DROP CONSTRAINT IF EXISTS provider_pricing_version_shape_check;
+ALTER TABLE provider_pricing_version ADD CONSTRAINT provider_pricing_version_shape_check CHECK (
+  btrim(version) <> '' AND currency ~ '^[A-Z]{3}$'
+  AND ("retiredAt" IS NULL OR "retiredAt" > "effectiveAt")
+);
+
+ALTER TABLE provider_budget_settlement DROP CONSTRAINT IF EXISTS provider_budget_settlement_shape_check;
+ALTER TABLE provider_budget_settlement ADD CONSTRAINT provider_budget_settlement_shape_check CHECK (
+  "fencingToken" > 0 AND "settledValue" >= 0 AND btrim(reason) <> ''
+  AND (currency IS NULL OR currency ~ '^[A-Z]{3}$')
+);
+
+CREATE OR REPLACE FUNCTION reject_immutable_provider_history_mutation()
+RETURNS trigger LANGUAGE plpgsql AS $immutable_provider_history$
+BEGIN
+  RAISE EXCEPTION '% is append-only', TG_TABLE_NAME USING ERRCODE = '55000';
+END
+$immutable_provider_history$;
+
+DROP TRIGGER IF EXISTS provider_usage_ledger_immutable ON provider_usage_ledger;
+CREATE TRIGGER provider_usage_ledger_immutable BEFORE UPDATE OR DELETE ON provider_usage_ledger
+FOR EACH ROW EXECUTE FUNCTION reject_immutable_provider_history_mutation();
+DROP TRIGGER IF EXISTS provider_pricing_version_immutable ON provider_pricing_version;
+CREATE TRIGGER provider_pricing_version_immutable BEFORE UPDATE OR DELETE ON provider_pricing_version
+FOR EACH ROW EXECUTE FUNCTION reject_immutable_provider_history_mutation();
+DROP TRIGGER IF EXISTS provider_budget_settlement_immutable ON provider_budget_settlement;
+CREATE TRIGGER provider_budget_settlement_immutable BEFORE UPDATE OR DELETE ON provider_budget_settlement
+FOR EACH ROW EXECUTE FUNCTION reject_immutable_provider_history_mutation();
+DROP TRIGGER IF EXISTS provider_audit_event_immutable ON provider_audit_event;
+CREATE TRIGGER provider_audit_event_immutable BEFORE UPDATE OR DELETE ON provider_audit_event
+FOR EACH ROW EXECUTE FUNCTION reject_immutable_provider_history_mutation();
+
+CREATE OR REPLACE FUNCTION enforce_provider_credential_immutable_identity()
+RETURNS trigger LANGUAGE plpgsql AS $provider_credential_identity$
+BEGIN
+  IF NEW.id IS DISTINCT FROM OLD.id OR NEW."userId" IS DISTINCT FROM OLD."userId"
+     OR NEW."providerAccountId" IS DISTINCT FROM OLD."providerAccountId"
+     OR NEW."credentialType" IS DISTINCT FROM OLD."credentialType"
+     OR NEW."aadVersion" IS DISTINCT FROM OLD."aadVersion" THEN
+    RAISE EXCEPTION 'provider credential authenticated identity is immutable' USING ERRCODE = '55000';
+  END IF;
+  RETURN NEW;
+END
+$provider_credential_identity$;
+
+DROP TRIGGER IF EXISTS provider_credential_identity_immutable ON provider_credential;
+CREATE TRIGGER provider_credential_identity_immutable
+BEFORE UPDATE OF id, "userId", "providerAccountId", "credentialType", "aadVersion" ON provider_credential
+FOR EACH ROW EXECUTE FUNCTION enforce_provider_credential_immutable_identity();
+
+CREATE OR REPLACE FUNCTION enforce_provider_account_endpoint_and_auth()
+RETURNS trigger LANGUAGE plpgsql AS $provider_account_endpoint_auth$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW."endpointIdentity" IS DISTINCT FROM NEW."baseUrl" OR NEW."endpointVersion" <> 1 THEN
+      RAISE EXCEPTION 'provider endpoint identity must start at normalized base URL version 1' USING ERRCODE = '23514';
+    END IF;
+  ELSIF NEW."baseUrl" IS DISTINCT FROM OLD."baseUrl" THEN
+    IF NEW."endpointIdentity" IS DISTINCT FROM NEW."baseUrl"
+       OR NEW."endpointVersion" <> OLD."endpointVersion" + 1 THEN
+      RAISE EXCEPTION 'provider endpoint change must atomically bump its identity version' USING ERRCODE = '23514';
+    END IF;
+  ELSIF NEW."endpointIdentity" IS DISTINCT FROM OLD."endpointIdentity"
+     OR NEW."endpointVersion" IS DISTINCT FROM OLD."endpointVersion" THEN
+    RAISE EXCEPTION 'provider endpoint identity is immutable without a base URL change' USING ERRCODE = '55000';
+  END IF;
+  IF TG_OP = 'UPDATE' AND NEW."authType" IS DISTINCT FROM OLD."authType"
+     AND EXISTS (SELECT 1 FROM provider_credential WHERE "providerAccountId" = OLD.id) THEN
+    RAISE EXCEPTION 'provider authentication type cannot change after credentials exist' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END
+$provider_account_endpoint_auth$;
+
+DROP TRIGGER IF EXISTS provider_account_endpoint_and_auth ON provider_account;
+CREATE TRIGGER provider_account_endpoint_and_auth
+BEFORE INSERT OR UPDATE OF "baseUrl", "endpointIdentity", "endpointVersion", "authType" ON provider_account
+FOR EACH ROW EXECUTE FUNCTION enforce_provider_account_endpoint_and_auth();
+
+CREATE OR REPLACE FUNCTION enforce_provider_graph_identity_immutable()
+RETURNS trigger LANGUAGE plpgsql AS $provider_graph_identity$
+BEGIN
+  IF TG_TABLE_NAME = 'provider_account' AND
+     (NEW.id IS DISTINCT FROM OLD.id OR NEW."userId" IS DISTINCT FROM OLD."userId") THEN
+    RAISE EXCEPTION 'provider account identity is immutable' USING ERRCODE = '55000';
+  ELSIF TG_TABLE_NAME = 'provider_model' AND
+     (NEW.id IS DISTINCT FROM OLD.id OR NEW."userId" IS DISTINCT FROM OLD."userId"
+       OR NEW."providerAccountId" IS DISTINCT FROM OLD."providerAccountId") THEN
+    RAISE EXCEPTION 'provider model identity is immutable' USING ERRCODE = '55000';
+  END IF;
+  RETURN NEW;
+END
+$provider_graph_identity$;
+
+DROP TRIGGER IF EXISTS provider_account_identity_immutable ON provider_account;
+CREATE TRIGGER provider_account_identity_immutable BEFORE UPDATE OF id, "userId" ON provider_account
+FOR EACH ROW EXECUTE FUNCTION enforce_provider_graph_identity_immutable();
+DROP TRIGGER IF EXISTS provider_model_identity_immutable ON provider_model;
+CREATE TRIGGER provider_model_identity_immutable
+BEFORE UPDATE OF id, "userId", "providerAccountId" ON provider_model
+FOR EACH ROW EXECUTE FUNCTION enforce_provider_graph_identity_immutable();
+
+CREATE OR REPLACE FUNCTION enforce_provider_credential_account_consistency()
+RETURNS trigger LANGUAGE plpgsql AS $provider_credential_account$
+DECLARE account_owner TEXT; account_auth TEXT; current_id TEXT;
+BEGIN
+  SELECT "userId", "authType"::text, "currentCredentialId"
+    INTO account_owner, account_auth, current_id
+    FROM provider_account WHERE id = NEW."providerAccountId";
+  IF account_owner IS DISTINCT FROM NEW."userId" OR account_auth IS DISTINCT FROM NEW."credentialType"::text THEN
+    RAISE EXCEPTION 'provider credential must match its account owner and authentication type' USING ERRCODE = '23514';
+  END IF;
+  IF NEW.status = 'ACTIVE' AND current_id IS DISTINCT FROM NEW.id THEN
+    RAISE EXCEPTION 'active provider credential must be current for its account' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END
+$provider_credential_account$;
+
+DROP TRIGGER IF EXISTS provider_credential_account_consistency ON provider_credential;
+CREATE CONSTRAINT TRIGGER provider_credential_account_consistency
+AFTER INSERT OR UPDATE OF "userId", "providerAccountId", "credentialType", status ON provider_credential
+DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION enforce_provider_credential_account_consistency();
+
+CREATE OR REPLACE FUNCTION enforce_provider_current_credential_consistency()
+RETURNS trigger LANGUAGE plpgsql AS $provider_current_credential$
+DECLARE credential_owner TEXT; credential_account TEXT; credential_state TEXT;
+BEGIN
+  IF NEW."currentCredentialId" IS NOT NULL THEN
+    SELECT "userId", "providerAccountId", status::text INTO credential_owner, credential_account, credential_state
+      FROM provider_credential WHERE id = NEW."currentCredentialId";
+    IF credential_owner IS DISTINCT FROM NEW."userId" OR credential_account IS DISTINCT FROM NEW.id
+       OR credential_state IS DISTINCT FROM 'ACTIVE' THEN
+      RAISE EXCEPTION 'current provider credential must be active and belong to the account owner' USING ERRCODE = '23514';
+    END IF;
+  END IF;
+  RETURN NEW;
+END
+$provider_current_credential$;
+
+DROP TRIGGER IF EXISTS provider_account_current_credential_consistency ON provider_account;
+CREATE CONSTRAINT TRIGGER provider_account_current_credential_consistency
+AFTER INSERT OR UPDATE OF "currentCredentialId", "userId" ON provider_account
+DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION enforce_provider_current_credential_consistency();
+
+CREATE OR REPLACE FUNCTION enforce_provider_budget_graph_consistency()
+RETURNS trigger LANGUAGE plpgsql AS $provider_budget_graph$
+DECLARE p RECORD; r RECORD; c RECORD;
+BEGIN
+  IF TG_TABLE_NAME = 'provider_budget_policy' THEN
+    IF NEW."providerModelId" IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM provider_model m WHERE m.id = NEW."providerModelId"
+        AND m."userId" = NEW."userId" AND m."providerAccountId" = NEW."providerAccountId") THEN
+      RAISE EXCEPTION 'budget policy model must belong to its provider account' USING ERRCODE = '23514';
+    END IF;
+  ELSIF TG_TABLE_NAME = 'provider_budget_reservation' THEN
+    SELECT * INTO p FROM provider_budget_policy WHERE id = NEW."policyId";
+    SELECT * INTO r FROM provider_budget_rule WHERE id = NEW."ruleId";
+    IF p.id IS NULL OR r.id IS NULL OR r."policyId" <> p.id
+       OR p."userId" <> NEW."userId" OR p.version <> NEW."policyVersion"
+       OR r.metric::text <> NEW.metric::text OR r.period::text <> NEW.period::text
+       OR r.currency IS DISTINCT FROM NEW.currency THEN
+      RAISE EXCEPTION 'budget reservation must match its policy version and rule' USING ERRCODE = '23514';
+    END IF;
+    IF NEW."credentialId" IS NOT NULL THEN
+      SELECT * INTO c FROM provider_credential WHERE id = NEW."credentialId";
+      IF c."userId" IS DISTINCT FROM NEW."userId" OR c."providerAccountId" IS DISTINCT FROM p."providerAccountId" THEN
+        RAISE EXCEPTION 'budget reservation credential must match policy account' USING ERRCODE = '23514';
+      END IF;
+    END IF;
+  ELSIF TG_TABLE_NAME = 'provider_pricing_version' THEN
+    IF NOT EXISTS (SELECT 1 FROM provider_model m WHERE m.id = NEW."providerModelId"
+      AND m."userId" = NEW."userId" AND m."providerAccountId" = NEW."providerAccountId") THEN
+      RAISE EXCEPTION 'pricing model must match provider account' USING ERRCODE = '23514';
+    END IF;
+  ELSIF TG_TABLE_NAME = 'provider_usage_ledger' THEN
+    IF NOT EXISTS (SELECT 1 FROM provider_model m WHERE m.id = NEW."providerModelId"
+      AND m."userId" = NEW."userId" AND m."providerAccountId" = NEW."providerAccountId")
+      OR NOT EXISTS (SELECT 1 FROM provider_pricing_version pv WHERE pv."providerModelId" = NEW."providerModelId"
+        AND pv.version = NEW."pricingVersion" AND pv.currency = NEW.currency
+        AND pv."providerAccountId" = NEW."providerAccountId" AND pv."userId" = NEW."userId") THEN
+      RAISE EXCEPTION 'usage ledger provider and pricing graph is inconsistent' USING ERRCODE = '23514';
+    END IF;
+    IF NEW."credentialId" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM provider_credential c
+      WHERE c.id = NEW."credentialId" AND c."userId" = NEW."userId"
+        AND c."providerAccountId" = NEW."providerAccountId") THEN
+      RAISE EXCEPTION 'usage ledger credential is inconsistent' USING ERRCODE = '23514';
+    END IF;
+    IF NEW."reservationId" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM provider_budget_reservation br
+      JOIN provider_budget_policy bp ON bp.id = br."policyId" WHERE br.id = NEW."reservationId"
+        AND br."userId" = NEW."userId" AND bp."providerAccountId" = NEW."providerAccountId"
+        AND br."requestId" = NEW."requestId" AND br."attemptId" = NEW."attemptId"
+        AND br."fencingToken" = NEW."fencingToken") THEN
+      RAISE EXCEPTION 'usage ledger reservation is inconsistent' USING ERRCODE = '23514';
+    END IF;
+  ELSIF TG_TABLE_NAME = 'provider_budget_settlement' THEN
+    IF NOT EXISTS (SELECT 1 FROM provider_budget_reservation br WHERE br.id = NEW."reservationId"
+      AND br."userId" = NEW."userId" AND br."attemptId" = NEW."attemptId"
+      AND br."fencingToken" = NEW."fencingToken" AND br.currency IS NOT DISTINCT FROM NEW.currency) THEN
+      RAISE EXCEPTION 'budget settlement must match its reservation identity' USING ERRCODE = '23514';
+    END IF;
+  ELSIF TG_TABLE_NAME = 'provider_audit_event' AND NEW."providerAccountId" IS NOT NULL THEN
+    IF NOT EXISTS (SELECT 1 FROM provider_account a WHERE a.id = NEW."providerAccountId" AND a."userId" = NEW."userId") THEN
+      RAISE EXCEPTION 'provider audit account must belong to actor owner' USING ERRCODE = '23514';
+    END IF;
+  END IF;
+  RETURN NEW;
+END
+$provider_budget_graph$;
+
+DROP TRIGGER IF EXISTS provider_budget_policy_graph_consistency ON provider_budget_policy;
+CREATE TRIGGER provider_budget_policy_graph_consistency BEFORE INSERT OR UPDATE ON provider_budget_policy
+FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_graph_consistency();
+DROP TRIGGER IF EXISTS provider_budget_reservation_graph_consistency ON provider_budget_reservation;
+CREATE TRIGGER provider_budget_reservation_graph_consistency BEFORE INSERT OR UPDATE ON provider_budget_reservation
+FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_graph_consistency();
+DROP TRIGGER IF EXISTS provider_pricing_version_graph_consistency ON provider_pricing_version;
+CREATE TRIGGER provider_pricing_version_graph_consistency BEFORE INSERT OR UPDATE ON provider_pricing_version
+FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_graph_consistency();
+DROP TRIGGER IF EXISTS provider_usage_ledger_graph_consistency ON provider_usage_ledger;
+CREATE TRIGGER provider_usage_ledger_graph_consistency BEFORE INSERT OR UPDATE ON provider_usage_ledger
+FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_graph_consistency();
+DROP TRIGGER IF EXISTS provider_budget_settlement_graph_consistency ON provider_budget_settlement;
+CREATE TRIGGER provider_budget_settlement_graph_consistency BEFORE INSERT OR UPDATE ON provider_budget_settlement
+FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_graph_consistency();
+DROP TRIGGER IF EXISTS provider_audit_event_graph_consistency ON provider_audit_event;
+CREATE TRIGGER provider_audit_event_graph_consistency BEFORE INSERT OR UPDATE ON provider_audit_event
+FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_graph_consistency();
+
+CREATE OR REPLACE FUNCTION enforce_provider_budget_history_transitions()
+RETURNS trigger LANGUAGE plpgsql AS $provider_budget_history$
+BEGIN
+  IF TG_TABLE_NAME = 'provider_budget_rule' THEN
+    RAISE EXCEPTION 'provider budget rules are immutable' USING ERRCODE = '55000';
+  END IF;
+  IF OLD.active THEN
+    IF NEW.id IS DISTINCT FROM OLD.id OR NEW."userId" IS DISTINCT FROM OLD."userId"
+       OR NEW."scopeType" IS DISTINCT FROM OLD."scopeType"
+       OR NEW."providerAccountId" IS DISTINCT FROM OLD."providerAccountId"
+       OR NEW."poolId" IS DISTINCT FROM OLD."poolId"
+       OR NEW."providerModelId" IS DISTINCT FROM OLD."providerModelId"
+       OR NEW.version IS DISTINCT FROM OLD.version OR NEW."activatedAt" IS DISTINCT FROM OLD."activatedAt"
+       OR NEW.active OR NEW."deactivatedAt" IS NULL THEN
+      RAISE EXCEPTION 'activated provider budget policy is immutable except deactivation' USING ERRCODE = '55000';
+    END IF;
+  END IF;
+  IF NOT OLD.active AND OLD."activatedAt" IS NOT NULL THEN
+    RAISE EXCEPTION 'deactivated provider budget policy cannot be reactivated' USING ERRCODE = '55000';
+  END IF;
+  IF NOT OLD.active AND OLD."activatedAt" IS NULL THEN
+    IF NEW.id IS DISTINCT FROM OLD.id OR NEW."userId" IS DISTINCT FROM OLD."userId"
+       OR NEW."scopeType" IS DISTINCT FROM OLD."scopeType"
+       OR NEW."providerAccountId" IS DISTINCT FROM OLD."providerAccountId"
+       OR NEW."poolId" IS DISTINCT FROM OLD."poolId"
+       OR NEW."providerModelId" IS DISTINCT FROM OLD."providerModelId"
+       OR NEW.version IS DISTINCT FROM OLD.version
+       OR NOT NEW.active OR NEW."activatedAt" IS NULL OR NEW."deactivatedAt" IS NOT NULL THEN
+      RAISE EXCEPTION 'provider budget policy permits only controlled activation' USING ERRCODE = '55000';
+    END IF;
+  END IF;
+  RETURN NEW;
+END
+$provider_budget_history$;
+
+DROP TRIGGER IF EXISTS provider_budget_rule_immutable ON provider_budget_rule;
+CREATE TRIGGER provider_budget_rule_immutable BEFORE UPDATE OR DELETE ON provider_budget_rule
+FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_history_transitions();
+DROP TRIGGER IF EXISTS provider_budget_policy_transition ON provider_budget_policy;
+CREATE TRIGGER provider_budget_policy_transition BEFORE UPDATE ON provider_budget_policy
+FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_history_transitions();
 
 COMMIT;

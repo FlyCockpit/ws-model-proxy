@@ -324,6 +324,35 @@ export const ENV_VARS: EnvVar[] = [
     default: "false",
     comment: ["Release gate for durable global capacity admission. Keep false until proven."],
   },
+  {
+    key: "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED",
+    group: "runtime",
+    source: "default",
+    default: "false",
+    comment: [
+      "Release gate for direct public-provider egress. Keep false until admission, budgets, redaction, and SSRF gates pass.",
+    ],
+  },
+  {
+    key: "WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS",
+    group: "runtime",
+    source: "default",
+    default: "false",
+    comment: [
+      "Explicit deployment policy allowing private/loopback provider URLs. HTTPS public endpoints remain the default.",
+    ],
+  },
+  {
+    key: "WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS",
+    group: "runtime",
+    source: "manual",
+    secret: true,
+    example: "v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    comment: [
+      "Provider credential AES-256-GCM keyring: active-version:base64-32-byte-key,old-version:base64-32-byte-key.",
+      "The first key encrypts new/rotated records; remaining keys are decrypt-only. Never log this value.",
+    ],
+  },
 
   // --- auth ----------------------------------------------------------------
   {

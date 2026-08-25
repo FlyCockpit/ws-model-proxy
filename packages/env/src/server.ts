@@ -132,6 +132,25 @@ export const env = createEnv({
     MODEL_API_PROTOCOL_ADAPTATION_ENABLED: strictBooleanFlag(),
     // Durable shared-capacity admission remains gated until PostgreSQL concurrency proofs pass.
     MODEL_API_GLOBAL_CAPACITY_ENABLED: strictBooleanFlag(),
+    // Provider egress remains disabled until the full overflow admission and
+    // settlement path is enabled. The keyring is optional while that gate is off.
+    WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: strictBooleanFlag(),
+    WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: strictBooleanFlag(),
+    WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS: z
+      .string()
+      .min(1)
+      .refine(
+        (value) =>
+          value.split(",").every((entry) => {
+            const separator = entry.indexOf(":");
+            if (separator <= 0) return false;
+            const version = entry.slice(0, separator);
+            const encoded = entry.slice(separator + 1);
+            return /^[A-Za-z0-9._-]{1,64}$/u.test(version) && /^[A-Za-z0-9+/]{43}=$/u.test(encoded);
+          }),
+        "must be a comma-separated version:base64-32-byte-key keyring",
+      )
+      .optional(),
   },
   runtimeEnv: process.env,
   emptyStringAsUndefined: true,

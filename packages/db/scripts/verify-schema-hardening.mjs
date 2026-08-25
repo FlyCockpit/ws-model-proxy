@@ -45,6 +45,11 @@ const requiredFragments = [
   "UPDATE model_api_token_allowlist_entry",
   "UPDATE response_stickiness_record",
   "UPDATE relay_request",
+  "provider_credential_one_active_per_account",
+  "enforce_provider_account_endpoint_and_auth",
+  "enforce_provider_credential_account_consistency",
+  "enforce_provider_budget_graph_consistency",
+  "enforce_provider_budget_history_transitions",
 ];
 for (const fragment of requiredFragments) {
   if (!sql.includes(fragment)) throw new Error(`Missing schema-hardening fragment: ${fragment}`);
@@ -471,9 +476,10 @@ try {
 
   await client.query(`
     INSERT INTO provider_account
-      (id, "createdAt", "updatedAt", "userId", "providerType", label, "baseUrl", "authType")
+      (id, "createdAt", "updatedAt", "userId", "providerType", label, "baseUrl",
+       "endpointIdentity", "authType")
     VALUES ('provider-account-a', NOW(), NOW(), 'owner-a', 'test', 'Test',
-      'https://provider.invalid', 'BEARER');
+      'https://provider.invalid', 'https://provider.invalid', 'BEARER');
     INSERT INTO provider_model
       (id, "createdAt", "updatedAt", "userId", "providerAccountId", "upstreamModelId")
     VALUES ('provider-model-a', NOW(), NOW(), 'owner-a', 'provider-account-a', 'provider-model');
@@ -548,6 +554,110 @@ try {
   if (legacyUpdateCompatibility.rows[0].discoveredModelId !== "model-a") {
     throw new Error("Legacy-only update did not replace its execution target");
   }
+
+  // Provider configuration is a security/accounting graph, not a collection
+  // of independently valid foreign keys. Prove PostgreSQL rejects mismatched
+  // ownership, endpoint generations, auth envelopes, budget rules, and links.
+  await expectConstraintFailure(`
+    UPDATE provider_account SET "baseUrl" = 'https://changed.invalid'
+     WHERE id = 'provider-account-a'
+  `);
+  await expectConstraintFailure(
+    `
+    INSERT INTO provider_model
+      (id, "createdAt", "updatedAt", "userId", "providerAccountId", "upstreamModelId")
+    VALUES ('provider-model-wrong-owner', NOW(), NOW(), 'owner-b', 'provider-account-a', 'bad')
+  `,
+    "23503",
+  );
+  await client.query("BEGIN");
+  await client.query(`
+    INSERT INTO provider_credential
+      (id, "createdAt", "userId", "providerAccountId", "credentialType", "keyVersion",
+       ciphertext, nonce, "authTag", "displaySuffix")
+    VALUES ('credential-a', NOW(), 'owner-a', 'provider-account-a', 'BEARER', 'v1',
+      decode('01', 'hex'), decode('000000000000000000000000', 'hex'),
+      decode('00000000000000000000000000000000', 'hex'), 'tail');
+    UPDATE provider_account SET "currentCredentialId" = 'credential-a'
+     WHERE id = 'provider-account-a';
+  `);
+  await client.query("COMMIT");
+  await expectConstraintFailure(
+    `
+    INSERT INTO provider_credential
+      (id, "createdAt", "userId", "providerAccountId", "credentialType", "keyVersion",
+       ciphertext, nonce, "authTag", "displaySuffix")
+    VALUES ('credential-a-duplicate', NOW(), 'owner-a', 'provider-account-a', 'BEARER', 'v1',
+      decode('02', 'hex'), decode('010000000000000000000000', 'hex'),
+      decode('00000000000000000000000000000000', 'hex'), 'tail')
+  `,
+    "23505",
+  );
+  await expectConstraintFailure(`
+    UPDATE provider_account SET "authType" = 'API_KEY' WHERE id = 'provider-account-a'
+  `);
+  await client.query(`
+    INSERT INTO provider_account
+      (id, "createdAt", "updatedAt", "userId", "providerType", label, "baseUrl",
+       "endpointIdentity", "authType")
+    VALUES ('provider-account-b', NOW(), NOW(), 'owner-b', 'test', 'Test B',
+      'https://provider-b.invalid', 'https://provider-b.invalid', 'API_KEY');
+    INSERT INTO provider_model
+      (id, "createdAt", "updatedAt", "userId", "providerAccountId", "upstreamModelId")
+    VALUES ('provider-model-b', NOW(), NOW(), 'owner-b', 'provider-account-b', 'provider-model-b');
+  `);
+  await expectConstraintFailure(`
+    INSERT INTO provider_budget_policy
+      (id, "createdAt", "updatedAt", "userId", "scopeType", "providerAccountId", "poolId", "providerModelId")
+    VALUES ('bad-attached-policy', NOW(), NOW(), 'owner-a', 'POOL_PROVIDER_MODEL',
+      'provider-account-a', 'pool-a', 'provider-model-b')
+  `);
+  await expectConstraintFailure(`
+    INSERT INTO provider_audit_event
+      (id, "createdAt", "userId", "providerAccountId", action, "subjectId")
+    VALUES ('bad-audit', NOW(), 'owner-b', 'provider-account-a', 'ACCOUNT_UPDATED', 'provider-account-a')
+  `);
+  await client.query("BEGIN");
+  await client.query(`
+    INSERT INTO provider_credential
+      (id, "createdAt", "userId", "providerAccountId", "credentialType", "keyVersion",
+       ciphertext, nonce, "authTag", "displaySuffix")
+    VALUES ('credential-wrong-auth', NOW(), 'owner-b', 'provider-account-b', 'BEARER', 'v1',
+      decode('03', 'hex'), decode('020000000000000000000000', 'hex'),
+      decode('00000000000000000000000000000000', 'hex'), 'tail');
+    UPDATE provider_account SET "currentCredentialId" = 'credential-wrong-auth'
+     WHERE id = 'provider-account-b';
+  `);
+  try {
+    await client.query("COMMIT");
+    throw new Error("Expected provider credential auth mismatch failure");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    if (error?.code !== "23514") throw error;
+  }
+  await client.query(`
+    INSERT INTO provider_budget_policy
+      (id, "createdAt", "updatedAt", "userId", "scopeType", "providerAccountId")
+    VALUES ('budget-policy-a', NOW(), NOW(), 'owner-a', 'PROVIDER_ACCOUNT', 'provider-account-a')
+  `);
+  await expectConstraintFailure(`
+    INSERT INTO provider_budget_rule
+      (id, "createdAt", "policyId", metric, period, mode, "limitValue")
+    VALUES ('fractional-token-rule', NOW(), 'budget-policy-a', 'TOKENS', 'UTC_DAY',
+      'LIMITED', 1.5)
+  `);
+  await client.query(`
+    INSERT INTO provider_budget_rule
+      (id, "createdAt", "policyId", metric, period, mode, "limitValue")
+    VALUES ('token-rule', NOW(), 'budget-policy-a', 'TOKENS', 'UTC_DAY', 'LIMITED', 10)
+  `);
+  await expectConstraintFailure(`
+    INSERT INTO provider_budget_reservation
+      (id, "createdAt", "userId", "policyId", "ruleId", "requestId", "attemptId",
+       "fencingToken", metric, period, "policyVersion", "windowStart", "windowEnd", "reservedValue")
+    VALUES ('bad-reservation', NOW(), 'owner-a', 'budget-policy-a', 'token-rule', 'r', 'a',
+      1, 'SPEND', 'UTC_DAY', 1, date_trunc('day', NOW()), date_trunc('day', NOW()) + interval '1 day', 1)
+  `);
 
   // Recreate the deployment boundary and prove a transaction from an old
   // instance cannot slip a discovered model between trigger install/backfill.
