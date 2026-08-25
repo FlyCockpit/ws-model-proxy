@@ -329,6 +329,8 @@
         "waitMs": "Espera local antes del desbordamiento (ms)"
       },
       "localModels": "Modelos locales",
+      "capacityAssigned": "Capacidad física asignada",
+      "capacityRequired": "Asigna primero una capacidad física",
       "localModelsHint": "Selecciona al menos un modelo conectado. Estos permanecen en el nivel principal.",
       "localRequired": "Selecciona al menos un modelo local.",
       "next": "Continuar",
@@ -341,11 +343,16 @@
       "moveProviderUp": "Mover proveedor antes",
       "moveProviderDown": "Mover proveedor después",
       "errors": {
-        "dailySpendLimit": "Ingresa una cantidad finita no negativa con hasta nueve decimales.",
+        "dailySpendLimit": "Ingresa una cantidad finita positiva con hasta nueve decimales.",
         "localModelIds": "Selecciona al menos un modelo local.",
+        "localWaitBudgetMs": "Ingresa una espera local finita de 0 a 600000 ms.",
+        "memberConcurrencyLimit": "Ingresa un límite de concurrencia del miembro de 1 a 10000.",
         "memberContextCeiling": "El contexto del miembro debe ser positivo y no superar el contexto físico.",
         "name": "Ingresa un nombre para el pool.",
         "providerConcurrencyLimit": "Ingresa un límite finito de concurrencia del proveedor.",
+        "providerModelIds": "Selecciona como máximo 32 modelos de proveedor.",
+        "physicalConcurrencyLimit": "Ingresa un límite de concurrencia física de 1 a 10000.",
+        "physicalMaxContext": "Ingresa un límite de contexto físico de 1 a 100000000.",
         "publicEgressAcknowledged": "Reconoce la divulgación exacta de salida pública.",
         "reservedSlots": "Los espacios reservados no pueden superar la concurrencia del miembro.",
         "slug": "Ingresa un slug de pool válido."

@@ -2054,23 +2054,23 @@ export function PoolsSection() {
                                     </StatusPill>
                                   ) : null}
                                 </div>
-                                {member.model ? (
+                                {member.model || member.providerModel ? (
                                   <details className="mt-2">
                                     <summary className="min-h-11 cursor-pointer py-2 text-muted-foreground">
                                       {t("dashboard:pools.memberCapabilities")}
                                     </summary>
                                     <div className="space-y-1">
-                                      {Object.entries(member.model.surfaces).map(
-                                        ([surface, availability]) => (
-                                          <p key={surface} className="break-words">
-                                            <span className="font-medium">{surface}</span>:{" "}
-                                            {availability.mode}
-                                            {availability.limitations.length
-                                              ? ` · ${availability.limitations.map((item) => t(`dashboard:pools.limitations.${item}`)).join(", ")}`
-                                              : ""}
-                                          </p>
-                                        ),
-                                      )}
+                                      {Object.entries(
+                                        member.model?.surfaces ?? member.providerModel!.surfaces,
+                                      ).map(([surface, availability]) => (
+                                        <p key={surface} className="break-words">
+                                          <span className="font-medium">{surface}</span>:{" "}
+                                          {availability.mode}
+                                          {availability.limitations.length
+                                            ? ` · ${availability.limitations.map((item) => t(`dashboard:pools.limitations.${item}`)).join(", ")}`
+                                            : ""}
+                                        </p>
+                                      ))}
                                     </div>
                                   </details>
                                 ) : null}

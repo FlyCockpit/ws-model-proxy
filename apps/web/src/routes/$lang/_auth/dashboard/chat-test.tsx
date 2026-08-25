@@ -778,15 +778,15 @@ function ChatTestPage() {
   const selectedModel = options.find((option) => option.modelId === effectiveModelId);
   const recommendedSurface = selectedModel?.compatibility?.recommendedSurface;
   const effectiveSurface: ChatTestSurface | null =
-    surfaceSelection === "PREFERRED"
-      ? recommendedSurface === "OPENAI_CHAT_COMPLETIONS" ||
-        recommendedSurface === "OPENAI_RESPONSES" ||
-        recommendedSurface === "ANTHROPIC_MESSAGES"
-        ? recommendedSurface
-        : selectedModel?.kind === "DIRECT_MODEL"
-          ? "OPENAI_CHAT_COMPLETIONS"
+    selectedModel?.kind === "DIRECT_MODEL"
+      ? "OPENAI_CHAT_COMPLETIONS"
+      : surfaceSelection === "PREFERRED"
+        ? recommendedSurface === "OPENAI_CHAT_COMPLETIONS" ||
+          recommendedSurface === "OPENAI_RESPONSES" ||
+          recommendedSurface === "ANTHROPIC_MESSAGES"
+          ? recommendedSurface
           : null
-      : surfaceSelection;
+        : surfaceSelection;
   const attachmentMaxBytes = Math.min(
     mediaConfig && mediaConfig.maxAttachmentBytes > 0
       ? mediaConfig.maxAttachmentBytes
@@ -831,6 +831,10 @@ function ChatTestPage() {
         nextModel?.maxAttachmentBytes ?? Number.POSITIVE_INFINITY,
       );
       setSelectedModelId(modelId);
+      if (nextModel?.kind === "DIRECT_MODEL") {
+        setSurfaceSelection("PREFERRED");
+        setRoutingMode("PREFER_NATIVE");
+      }
       const retained = attachments.filter(
         (attachment) =>
           nextModalities[attachment.modality] && attachment.sizeBytes <= nextAttachmentMaxBytes,

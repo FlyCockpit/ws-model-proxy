@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
+import { Hono } from "hono";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
@@ -93,6 +94,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         prisma: typeof import("@ws-model-proxy/db").default;
         security: typeof import("@ws-model-proxy/db/forwarder-security");
         routes: typeof import("./routes.js");
+        chatTest: typeof import("./chat-test.js");
         identifiers: typeof import("@ws-model-proxy/config/forwarder-identifiers");
         credentials: typeof import("@ws-model-proxy/api/lib/provider-credential-crypto");
         protocols: typeof import("./protocols/index.js");
@@ -110,20 +112,21 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     process.env.MODEL_API_ANTHROPIC_ENABLED = "true";
     process.env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = "true";
     process.env.MODEL_API_GLOBAL_CAPACITY_ENABLED = "false";
-    const [prismaModule, security, routes, identifiers, credentials, protocols] = await Promise.all(
-      [
+    const [prismaModule, security, routes, chatTest, identifiers, credentials, protocols] =
+      await Promise.all([
         import("@ws-model-proxy/db"),
         import("@ws-model-proxy/db/forwarder-security"),
         import("./routes.js"),
+        import("./chat-test.js"),
         import("@ws-model-proxy/config/forwarder-identifiers"),
         import("@ws-model-proxy/api/lib/provider-credential-crypto"),
         import("./protocols/index.js"),
-      ],
-    );
+      ]);
     modules = {
       prisma: prismaModule.default,
       security,
       routes,
+      chatTest,
       identifiers,
       credentials,
       protocols,
@@ -342,6 +345,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     secondBehavior?: Behavior;
     statefulResponses?: boolean;
     grantee?: boolean;
+    cookieAuth?: boolean;
   }) {
     if (!modules) throw new Error("modules unavailable");
     const suffix = crypto.randomUUID();
@@ -643,12 +647,41 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       cancelRelayRequest: () => undefined,
       completeRelayRequest: () => undefined,
     };
-    const app = modules.routes.createModelApiRoutes({
-      manager,
-      anthropicEnabled: true,
-      protocolAdaptationEnabled: true,
-      capacityEnabled: false,
-    });
+    const app = input.cookieAuth
+      ? (() => {
+          const cookieApp = new Hono<{
+            Variables: { session: import("@ws-model-proxy/auth").Session | null };
+          }>();
+          cookieApp.use("*", async (context, next) => {
+            context.set("session", {
+              user: requester,
+              session: {
+                id: `session-${suffix}`,
+                userId: requester.id,
+                token: `cookie-${suffix}`,
+                expiresAt: new Date(Date.now() + 60_000),
+                ipAddress: "127.0.0.1",
+                userAgent: "provider-route-integration",
+                createdAt: new Date(),
+                updatedAt: new Date(),
+              },
+            } as import("@ws-model-proxy/auth").Session);
+            await next();
+          });
+          cookieApp.route(
+            "/",
+            modules.chatTest.createChatTestRoutes({
+              manager,
+            }),
+          );
+          return cookieApp;
+        })()
+      : modules.routes.createModelApiRoutes({
+          manager,
+          anthropicEnabled: true,
+          protocolAdaptationEnabled: true,
+          capacityEnabled: false,
+        });
     const modelId = modules.identifiers.poolModelId({
       userSlug: user.slug,
       poolSlug: pool.slug,
@@ -671,10 +704,9 @@ integration("provider dispatch routes with real PostgreSQL", () => {
               max_tokens: 16,
               messages: [{ role: "user", content: "hi" }],
             };
-    const headers: Record<string, string> = {
-      authorization: `Bearer ${rawToken}`,
-      "content-type": "application/json",
-    };
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (input.cookieAuth) headers.cookie = `better-auth.session_token=cookie-${suffix}`;
+    else headers.authorization = `Bearer ${rawToken}`;
     if (input.requested === "anthropic-messages") headers["anthropic-version"] = "2023-06-01";
     const observationIndex = upstreamObservations.length;
     const response = await app.request(pathFor(input.requested), {
@@ -1432,4 +1464,19 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       expectAdapterTelemetry(result, mode, "openai-chat", native);
     },
   );
+
+  it("dispatches a provider-backed Responses request through the cookie-authenticated Chat Test route", async () => {
+    const result = await runCase({
+      requested: "openai-responses",
+      native: "openai-responses",
+      behavior: "json",
+      cookieAuth: true,
+    });
+    expect(result.response.status, result.responseText).toBe(200);
+    expect(JSON.parse(result.responseText)).toMatchObject({
+      id: "resp_route",
+      status: "completed",
+    });
+    expect(result.observation?.authorization).toBe("Bearer route-provider-secret");
+  });
 });

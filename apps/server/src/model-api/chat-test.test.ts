@@ -218,6 +218,52 @@ function directRow() {
   };
 }
 
+function poolMemberRow() {
+  return {
+    id: "member-id",
+    poolId: "pool-id",
+    discoveredModelId: "model-id",
+    weight: 1,
+    healthStatus: "HEALTHY",
+    routingStatus: "ACTIVE",
+    lastFailureClass: null,
+    consecutiveRetryableFailures: 0,
+    lastFailureAt: null,
+    nextRetryAt: null,
+    halfOpenTrialStartedAt: null,
+    capacityContextCeiling: null,
+    capacityContextMargin: 0,
+    capacityWaitBudgetMode: "INHERIT",
+    capacityWaitBudgetMs: null,
+    ModelPool: {
+      capacityWaitBudgetMs: 30_000,
+      affinityEnabled: false,
+      affinityTtlSeconds: 3600,
+      affinityMaxRecords: 10_000,
+      affinityPrefixWeight: 100,
+      affinityConversationWeight: 150,
+      affinityConfirmedCacheWeight: 250,
+      affinityLoadPenaltyWeight: 100,
+    },
+    ExecutionTarget: {
+      id: "member-target",
+      inferenceCapacityId: null,
+      InferenceCapacity: null,
+      DiscoveredModel: null,
+    },
+    DiscoveredModel: {
+      ...directRow(),
+      capabilityOverrideMode: "OVERRIDE",
+      capabilityOverrideMetadata: {
+        version: 1,
+        protocol: "openai-compatible",
+        chatCompletions: { supported: true, streaming: true },
+        responses: { supported: true, streaming: true },
+      },
+    },
+  };
+}
+
 function appWith(manager: FakeRelayManager, authSession: Session | null = session) {
   const app = new Hono<{ Variables: { session: Session | null } }>();
   app.use("*", async (c, next) => {
@@ -298,6 +344,38 @@ describe("chat test routes", () => {
         }),
       }),
     );
+  });
+
+  it("applies the selected Responses surface, native mode, and forced local member", async () => {
+    const manager = new FakeRelayManager();
+    mockedTokenAccess.listVisibleModelTargetsForUser.mockResolvedValue({
+      directModels: [directTarget],
+      modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+    });
+    db.poolMember.findMany.mockResolvedValue([poolMemberRow()]);
+    const responsePromise = appWith(manager).request("/responses", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-wsmp-chat-test-member-id": "member-id",
+        "x-wsmp-chat-test-routing-mode": "REQUIRE_NATIVE",
+      },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        input: "Reply with pong.",
+        stream: false,
+      }),
+    });
+
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    expect(sent.family).toBe("responses");
+    expect(sent.path).toBe("/v1/responses");
+    expect(sent.endpointSlug).toBe("local");
+    manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+    manager.body(sent.requestId, '{"id":"resp_1","output":[]}');
+    manager.complete(sent.requestId);
+    await expect(responsePromise).resolves.toMatchObject({ status: 200 });
   });
 
   it("cancels the websocket relay request when the browser stops reading", async () => {

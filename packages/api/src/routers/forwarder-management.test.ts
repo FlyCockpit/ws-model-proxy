@@ -14,7 +14,25 @@ import { forwarderManagementRouter } from "./forwarder-management";
 
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
-  return { default: mockDeep(), Prisma: { DbNull: { kind: "DbNull" } } };
+  class TestDecimal {
+    readonly value: string;
+
+    constructor(value: string | number) {
+      this.value = String(value);
+    }
+
+    greaterThan(other: string | number) {
+      return Number(this.value) > Number(other);
+    }
+  }
+  return {
+    default: mockDeep(),
+    Prisma: {
+      DbNull: { kind: "DbNull" },
+      Decimal: TestDecimal,
+      TransactionIsolationLevel: { Serializable: "Serializable" },
+    },
+  };
 });
 
 vi.mock("@ws-model-proxy/env/server", () => ({
@@ -64,10 +82,10 @@ const db = prisma as unknown as {
     update: MockInstance;
     delete: MockInstance;
   };
-  executionTarget: { upsert: MockInstance };
-  providerModel: { findFirst: MockInstance };
-  providerBudgetPolicy: { findFirst: MockInstance; findMany: MockInstance };
-  providerAuditEvent: { findFirst: MockInstance };
+  executionTarget: { findMany: MockInstance; upsert: MockInstance };
+  providerModel: { findFirst: MockInstance; findMany: MockInstance };
+  providerBudgetPolicy: { create: MockInstance; findFirst: MockInstance; findMany: MockInstance };
+  providerAuditEvent: { create: MockInstance; findFirst: MockInstance };
   poolGrant: {
     upsert: MockInstance;
     deleteMany: MockInstance;
@@ -292,6 +310,264 @@ describe("forwarderManagementRouter", () => {
       }),
     ).rejects.toBeDefined();
     expect(db.$transaction).not.toHaveBeenCalled();
+  });
+
+  it("atomically persists guarded local capacity reuse, ordered providers, budgets, and audits", async () => {
+    db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(
+      poolRow({
+        protocolAdaptationEnabled: true,
+        publicEgressEnabled: true,
+        publicEgressAcknowledged: true,
+      }),
+    );
+    db.discoveredModel.findMany.mockResolvedValue([
+      {
+        id: "local-id",
+        upstreamModelId: "local-model",
+      },
+    ]);
+    db.executionTarget.findMany.mockResolvedValue([
+      {
+        id: "existing-target",
+        discoveredModelId: "local-id",
+        inferenceCapacityId: "shared-capacity",
+        InferenceCapacity: { physicalMaxContext: 65_536 },
+      },
+    ]);
+    db.providerModel.findMany.mockResolvedValue([
+      {
+        id: "provider-b",
+        providerAccountId: "account-b",
+        PricingVersions: [{ id: "price-b", currency: "USD" }],
+      },
+      {
+        id: "provider-a",
+        providerAccountId: "account-a",
+        PricingVersions: [{ id: "price-a", currency: "USD" }],
+      },
+    ]);
+    db.modelPool.create.mockResolvedValue({ id: "pool-id" });
+    db.executionTarget.upsert
+      .mockResolvedValueOnce({ id: "provider-target-b" })
+      .mockResolvedValueOnce({ id: "provider-target-a" });
+    db.providerBudgetPolicy.create
+      .mockResolvedValueOnce({ id: "budget-b" })
+      .mockResolvedValueOnce({ id: "budget-a" });
+
+    await client().createGuardedModelPool({
+      slug: "guarded",
+      name: "Guarded",
+      localModelIds: ["local-id"],
+      recommendedSurface: "OPENAI_RESPONSES",
+      physicalConcurrencyLimit: 1,
+      physicalMaxContext: 65_536,
+      memberConcurrencyLimit: 2,
+      memberContextCeiling: 32_768,
+      reservedSlots: 1,
+      localWaitBudgetMs: 30_000,
+      publicEgressAcknowledged: true,
+      providerModels: [
+        { providerModelId: "provider-b", concurrencyLimit: 2, dailySpendLimit: "8.50" },
+        { providerModelId: "provider-a", concurrencyLimit: 1, dailySpendLimit: "4.25" },
+      ],
+    });
+
+    expect(db.poolMember.create).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        data: expect.objectContaining({
+          executionTargetId: "existing-target",
+          tier: "PRIMARY",
+        }),
+      }),
+    );
+    expect(db.poolMember.create).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ data: expect.objectContaining({ publicOrder: 0 }) }),
+    );
+    expect(db.poolMember.create).toHaveBeenNthCalledWith(
+      3,
+      expect.objectContaining({ data: expect.objectContaining({ publicOrder: 1 }) }),
+    );
+    expect(db.providerBudgetPolicy.create).toHaveBeenCalledTimes(2);
+    expect(db.providerBudgetPolicy.create.mock.calls[0]?.[0].data.Rules.create).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ metric: "CONCURRENCY", mode: "LIMITED" }),
+        expect.objectContaining({ metric: "SPEND", mode: "LIMITED", currency: "USD" }),
+      ]),
+    );
+    expect(db.providerAuditEvent.create).toHaveBeenCalledTimes(2);
+    expect(db.capacityAuditEvent.create).toHaveBeenCalledTimes(1);
+    expect(db.executionTarget.upsert.mock.calls).not.toContainEqual([
+      expect.objectContaining({
+        update: expect.objectContaining({ inferenceCapacityId: expect.anything() }),
+      }),
+    ]);
+  });
+
+  it("refuses guarded setup instead of inventing or overwriting physical capacity mapping", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([
+      { id: "local-id", upstreamModelId: "local-model" },
+    ]);
+    db.executionTarget.findMany.mockResolvedValue([
+      {
+        id: "existing-target",
+        discoveredModelId: "local-id",
+        inferenceCapacityId: null,
+        InferenceCapacity: null,
+      },
+    ]);
+
+    await expect(
+      client().createGuardedModelPool({
+        slug: "guarded",
+        name: "Guarded",
+        localModelIds: ["local-id"],
+        recommendedSurface: "OPENAI_RESPONSES",
+        physicalConcurrencyLimit: 1,
+        physicalMaxContext: 65_536,
+        memberConcurrencyLimit: 1,
+        memberContextCeiling: 32_768,
+        reservedSlots: 0,
+        localWaitBudgetMs: 30_000,
+        publicEgressAcknowledged: false,
+        providerModels: [],
+      }),
+    ).rejects.toMatchObject({ code: "PRECONDITION_FAILED" });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+    expect(db.executionTarget.upsert).not.toHaveBeenCalled();
+  });
+
+  it("rolls back guarded setup when a mid-transaction provider budget write fails", async () => {
+    let rolledBack = false;
+    db.$transaction.mockImplementationOnce(async (callback: (tx: typeof db) => unknown) => {
+      try {
+        return await callback(db);
+      } catch (error) {
+        rolledBack = true;
+        throw error;
+      }
+    });
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([
+      {
+        id: "local-id",
+        upstreamModelId: "local-model",
+      },
+    ]);
+    db.executionTarget.findMany.mockResolvedValue([
+      {
+        id: "existing-target",
+        discoveredModelId: "local-id",
+        inferenceCapacityId: "shared-capacity",
+        InferenceCapacity: { physicalMaxContext: 65_536 },
+      },
+    ]);
+    db.providerModel.findMany.mockResolvedValue([
+      {
+        id: "provider-id",
+        providerAccountId: "account-id",
+        PricingVersions: [{ id: "price-id", currency: "USD" }],
+      },
+    ]);
+    db.modelPool.create.mockResolvedValue({ id: "pool-id" });
+    db.executionTarget.upsert.mockResolvedValue({ id: "provider-target" });
+    db.providerBudgetPolicy.create.mockRejectedValue(new Error("injected budget failure"));
+
+    await expect(
+      client().createGuardedModelPool({
+        slug: "guarded",
+        name: "Guarded",
+        localModelIds: ["local-id"],
+        recommendedSurface: "OPENAI_RESPONSES",
+        physicalConcurrencyLimit: 1,
+        physicalMaxContext: 65_536,
+        memberConcurrencyLimit: 1,
+        memberContextCeiling: 32_768,
+        reservedSlots: 0,
+        localWaitBudgetMs: 30_000,
+        publicEgressAcknowledged: true,
+        providerModels: [
+          { providerModelId: "provider-id", concurrencyLimit: 1, dailySpendLimit: "5" },
+        ],
+      }),
+    ).rejects.toThrow("injected budget failure");
+    expect(rolledBack).toBe(true);
+    expect(db.capacityAuditEvent.create).not.toHaveBeenCalled();
+  });
+
+  it("does not reflect foreign guarded-pool model ids through HTTP response envelopes", async () => {
+    db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
+      callback(db),
+    );
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce([
+      {
+        id: "owned-local-model",
+        upstreamModelId: "owned-model",
+        ExecutionTargets: [
+          {
+            id: "owned-local-target",
+            inferenceCapacityId: "owned-capacity",
+            InferenceCapacity: { physicalMaxContext: 32_768 },
+          },
+        ],
+      },
+    ]);
+    db.providerModel.findMany.mockResolvedValueOnce([]);
+    const captures: Array<{ status: number; body: string }> = [];
+    const rpc = httpClient(captures);
+    const base = {
+      slug: "guarded-auth-proof",
+      name: "Guarded auth proof",
+      recommendedSurface: "OPENAI_RESPONSES" as const,
+      physicalConcurrencyLimit: 1,
+      physicalMaxContext: 32_768,
+      memberConcurrencyLimit: 1,
+      memberContextCeiling: 31_744,
+      reservedSlots: 0,
+      localWaitBudgetMs: 30_000,
+      publicEgressAcknowledged: true,
+    };
+
+    const localResult = await Promise.allSettled([
+      rpc.createGuardedModelPool({
+        ...base,
+        localModelIds: ["foreign-local-model"],
+        providerModels: [],
+      }),
+    ]);
+    const providerResult = await Promise.allSettled([
+      rpc.createGuardedModelPool({
+        ...base,
+        slug: "guarded-provider-auth-proof",
+        localModelIds: ["owned-local-model"],
+        providerModels: [
+          {
+            providerModelId: "foreign-provider-model",
+            concurrencyLimit: 1,
+            dailySpendLimit: "10.00",
+          },
+        ],
+      }),
+    ]);
+
+    expect(localResult[0]).toMatchObject({ status: "rejected", reason: { code: "NOT_FOUND" } });
+    expect(providerResult[0]).toMatchObject({
+      status: "rejected",
+      reason: { code: "PRECONDITION_FAILED" },
+    });
+    expect(captures).toHaveLength(2);
+    expect(captures.map((capture) => capture.status)).toEqual([404, 412]);
+    expect(captures[0]?.body).toContain("NOT_FOUND");
+    expect(captures[1]?.body).toContain("PRECONDITION_FAILED");
+    for (const capture of captures) {
+      expect(capture.body).not.toContain("foreign-local-model");
+      expect(capture.body).not.toContain("foreign-provider-model");
+    }
+    expect(db.executionTarget.upsert).not.toHaveBeenCalled();
+    expect(db.modelPool.create).not.toHaveBeenCalled();
   });
 
   it("previews and updates the current user's slug without changing internal ids", async () => {

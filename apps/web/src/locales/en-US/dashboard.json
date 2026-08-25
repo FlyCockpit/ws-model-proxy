@@ -329,6 +329,8 @@
         "waitMs": "Local wait before overflow (ms)"
       },
       "localModels": "Local models",
+      "capacityAssigned": "Physical capacity assigned",
+      "capacityRequired": "Assign physical capacity first",
       "localModelsHint": "Select at least one connected model. These remain the primary tier.",
       "localRequired": "Select at least one local model.",
       "next": "Continue",
@@ -341,11 +343,16 @@
       "moveProviderUp": "Move provider earlier",
       "moveProviderDown": "Move provider later",
       "errors": {
-        "dailySpendLimit": "Enter a finite non-negative amount with up to nine decimal places.",
+        "dailySpendLimit": "Enter a finite positive amount with up to nine decimal places.",
         "localModelIds": "Select at least one local model.",
+        "localWaitBudgetMs": "Enter a finite local wait from 0 to 600000 ms.",
+        "memberConcurrencyLimit": "Enter a member concurrency limit from 1 to 10000.",
         "memberContextCeiling": "Member context must be positive and no larger than physical context.",
         "name": "Enter a pool name.",
         "providerConcurrencyLimit": "Enter a finite provider concurrency ceiling.",
+        "providerModelIds": "Select no more than 32 provider models.",
+        "physicalConcurrencyLimit": "Enter a physical concurrency limit from 1 to 10000.",
+        "physicalMaxContext": "Enter a physical context limit from 1 to 100000000.",
         "publicEgressAcknowledged": "Acknowledge the exact public-egress disclosure.",
         "reservedSlots": "Reserved slots cannot exceed member concurrency.",
         "slug": "Enter a valid, available-style pool slug."

@@ -21,7 +21,11 @@ import { z } from "zod";
 
 import { orpc } from "@/utils/orpc";
 
-type LocalModel = { id: string; canonicalModelId: string };
+type LocalModel = {
+  id: string;
+  canonicalModelId: string;
+  executionTarget?: { inferenceCapacityId: string | null } | null;
+};
 const surfaces = ["OPENAI_CHAT_COMPLETIONS", "OPENAI_RESPONSES", "ANTHROPIC_MESSAGES"] as const;
 
 export function GuardedPoolSetupWizard({
@@ -78,8 +82,6 @@ export function GuardedPoolSetupWizard({
     .superRefine((value, ctx) => {
       if (value.reservedSlots > value.memberConcurrencyLimit)
         ctx.addIssue({ code: "custom", path: ["reservedSlots"] });
-      if (value.memberContextCeiling > value.physicalMaxContext)
-        ctx.addIssue({ code: "custom", path: ["memberContextCeiling"] });
       if (value.providerModelIds.length > 0 && !value.publicEgressAcknowledged)
         ctx.addIssue({ code: "custom", path: ["publicEgressAcknowledged"] });
     });
@@ -123,14 +125,7 @@ export function GuardedPoolSetupWizard({
   });
   const stepFields = [
     ["slug", "name", "localModelIds"],
-    [
-      "physicalConcurrencyLimit",
-      "physicalMaxContext",
-      "memberConcurrencyLimit",
-      "memberContextCeiling",
-      "reservedSlots",
-      "localWaitBudgetMs",
-    ],
+    ["memberConcurrencyLimit", "memberContextCeiling", "reservedSlots", "localWaitBudgetMs"],
     [
       "recommendedSurface",
       "providerModelIds",
@@ -224,6 +219,7 @@ export function GuardedPoolSetupWizard({
                       {directModels.map((model) => (
                         <label key={model.id} className="flex min-h-11 items-center gap-3 p-3">
                           <Checkbox
+                            disabled={!model.executionTarget?.inferenceCapacityId}
                             checked={field.state.value.includes(model.id)}
                             onCheckedChange={(checked) =>
                               field.handleChange(
@@ -236,6 +232,11 @@ export function GuardedPoolSetupWizard({
                           <code className="break-all font-mono text-xs">
                             {model.canonicalModelId}
                           </code>
+                          <span className="ml-auto text-xs text-muted-foreground">
+                            {model.executionTarget?.inferenceCapacityId
+                              ? t("dashboard:pools.wizard.capacityAssigned")
+                              : t("dashboard:pools.wizard.capacityRequired")}
+                          </span>
                         </label>
                       ))}
                     </div>
@@ -257,8 +258,6 @@ export function GuardedPoolSetupWizard({
               <div className="grid gap-4 sm:grid-cols-2">
                 {(
                   [
-                    "physicalConcurrencyLimit",
-                    "physicalMaxContext",
                     "memberConcurrencyLimit",
                     "memberContextCeiling",
                     "reservedSlots",
@@ -319,7 +318,11 @@ export function GuardedPoolSetupWizard({
               </form.Field>
               <form.Field name="providerModelIds">
                 {(field) => (
-                  <fieldset className="space-y-2">
+                  <fieldset
+                    className="space-y-2"
+                    {...errorProps("providerModelIds")}
+                    tabIndex={stepErrors.providerModelIds ? -1 : undefined}
+                  >
                     <legend className="text-sm font-medium">
                       {t("dashboard:pools.wizard.providerOrder")}
                     </legend>
@@ -396,6 +399,11 @@ export function GuardedPoolSetupWizard({
                         </p>
                       ) : null}
                     </div>
+                    {stepErrors.providerModelIds ? (
+                      <p id="wizard-providerModelIds-error" className="text-sm text-destructive">
+                        {stepErrors.providerModelIds}
+                      </p>
+                    ) : null}
                   </fieldset>
                 )}
               </form.Field>

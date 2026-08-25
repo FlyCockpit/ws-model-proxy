@@ -714,7 +714,7 @@ function serializePool(row: ModelPoolRow) {
       maxAssets: row.transformerMaxAssets,
       model: transformerModel,
     },
-    members: row.PoolMembers.map((member) => {
+    members: row.PoolMembers.map((member, memberIndex) => {
       const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
       return {
         id: member.id,
@@ -774,6 +774,7 @@ function serializePool(row: ModelPoolRow) {
                 member.ExecutionTarget.ProviderModel.PricingVersions[0]?.version ?? null,
               pricingCurrency:
                 member.ExecutionTarget.ProviderModel.PricingVersions[0]?.currency ?? null,
+              surfaces: memberMatrices[memberIndex]!.matrix,
             }
           : null,
       };
@@ -1188,13 +1189,6 @@ export const forwarderManagementRouter = {
               message: "Reserved slots exceed member concurrency",
             });
           }
-          if (input.memberContextCeiling > input.physicalMaxContext) {
-            ctx.addIssue({
-              code: "custom",
-              path: ["memberContextCeiling"],
-              message: "Member context exceeds physical context",
-            });
-          }
           if (input.providerModels.length > 0 && !input.publicEgressAcknowledged) {
             ctx.addIssue({
               code: "custom",
@@ -1238,6 +1232,34 @@ export const forwarderManagementRouter = {
           });
           if (localModels.length !== input.localModelIds.length) {
             throw new ORPCError("NOT_FOUND", { message: "A selected local model is unavailable" });
+          }
+          const localTargets = await tx.executionTarget.findMany({
+            where: { userId, discoveredModelId: { in: input.localModelIds } },
+            select: {
+              id: true,
+              discoveredModelId: true,
+              inferenceCapacityId: true,
+              InferenceCapacity: { select: { physicalMaxContext: true } },
+            },
+          });
+          if (
+            localTargets.length !== localModels.length ||
+            localTargets.some((target) => !target.inferenceCapacityId)
+          ) {
+            throw new ORPCError("PRECONDITION_FAILED", {
+              message:
+                "Every selected local model must already have an explicitly assigned physical capacity.",
+            });
+          }
+          if (
+            localTargets.some((target) => {
+              const maximum = target.InferenceCapacity?.physicalMaxContext;
+              return maximum != null && input.memberContextCeiling > maximum;
+            })
+          ) {
+            throw new ORPCError("BAD_REQUEST", {
+              message: "Member context exceeds a selected model's physical capacity.",
+            });
           }
           const providerIds = input.providerModels.map((item) => item.providerModelId);
           const providers = providerIds.length
@@ -1292,37 +1314,11 @@ export const forwarderManagementRouter = {
             },
             select: { id: true },
           });
+          const localTargetByModelId = new Map(
+            localTargets.map((target) => [target.discoveredModelId, target]),
+          );
           for (const model of localModels) {
-            const capacity = await tx.inferenceCapacity.upsert({
-              where: {
-                userId_runtimeIdentityKey: { userId, runtimeIdentityKey: `model:${model.id}` },
-              },
-              update: {
-                hardConcurrencyLimit: input.physicalConcurrencyLimit,
-                physicalMaxContext: input.physicalMaxContext,
-              },
-              create: {
-                userId,
-                label: `Model ${model.id}`,
-                runtimeIdentityKey: `model:${model.id}`,
-                runtimeModel: model.upstreamModelId,
-                hardConcurrencyLimit: input.physicalConcurrencyLimit,
-                physicalMaxContext: input.physicalMaxContext,
-                countStrategy: "CONSERVATIVE_ESTIMATE",
-              },
-              select: { id: true },
-            });
-            const target = await tx.executionTarget.upsert({
-              where: { discoveredModelId: model.id },
-              update: { inferenceCapacityId: capacity.id },
-              create: {
-                userId,
-                kind: "DISCOVERED_MODEL",
-                discoveredModelId: model.id,
-                inferenceCapacityId: capacity.id,
-              },
-              select: { id: true },
-            });
+            const target = localTargetByModelId.get(model.id)!;
             await tx.poolMember.create({
               data: {
                 poolId: pool.id,
