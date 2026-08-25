@@ -449,4 +449,79 @@ describe("public overflow terminal response dispatch", () => {
       vi.useRealTimers();
     }
   });
+
+  it("does not record a retryable failure after heartbeat ownership is lost", async () => {
+    vi.useFakeTimers();
+    try {
+      recordProviderOutcome.mockClear();
+      releaseProviderHealthTrial.mockClear();
+      heartbeatProviderAttempt.mockResolvedValueOnce(false);
+      db.modelPool.findFirst.mockResolvedValue(dispatchPoolFixture());
+      const tx = {
+        $queryRaw: vi.fn().mockResolvedValue([]),
+        providerCredential: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: "credential-heartbeat",
+            credentialType: "BEARER",
+            aadVersion: 1,
+            algorithm: "AES-256-GCM",
+            keyVersion: "v1",
+            ciphertext: new Uint8Array(),
+            nonce: new Uint8Array(),
+            authTag: new Uint8Array(),
+          }),
+          update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+        },
+      };
+      db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+        callback(tx),
+      );
+      let resolveProvider!: (response: Readable) => void;
+      providerHttpsRequest.mockImplementationOnce(
+        () =>
+          new Promise<Readable>((resolve) => {
+            resolveProvider = resolve;
+          }),
+      );
+
+      const dispatched = dispatchPublicOverflow({
+        userId: "owner",
+        poolId: "pool",
+        requestId: "request-retry-heartbeat",
+        reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+        requestedProtocol: "openai",
+        requestedSurface: "openai-chat",
+        stream: false,
+        requiredFeatures: [],
+        path: "/v1/chat/completions",
+        headers: new Headers({ "content-type": "application/json" }),
+        body: new TextEncoder().encode('{"model":"pool"}'),
+        signal: new AbortController().signal,
+        liability: { tokens: 10n, accountingVersion: "provider-billable-v1" },
+        requestedOutputTokens: 1n,
+        releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+        adaptationEnabled: false,
+        retrySafe: true,
+      });
+      await vi.advanceTimersByTimeAsync(10_000);
+      const upstream = Readable.from([]);
+      Object.assign(upstream, { statusCode: 503, headers: {}, complete: true });
+      resolveProvider(upstream);
+
+      await expect(dispatched).resolves.toEqual({
+        dispatched: false,
+        reason: "PROVIDER_UNAVAILABLE",
+      });
+      expect(recordProviderOutcome).not.toHaveBeenCalled();
+      expect(releaseProviderHealthTrial).toHaveBeenCalledWith({
+        userId: "owner",
+        providerAccountId: "account-heartbeat",
+        providerModelId: "model-heartbeat",
+        attemptId: expect.any(String),
+        fencingToken: 1n,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

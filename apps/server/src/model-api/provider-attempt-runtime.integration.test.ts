@@ -56,10 +56,22 @@ integration("provider half-open recovery", () => {
       providerAccountId: account.id,
       providerModelId: model.id,
     };
+    const [probeAFence, probeBFence] = await Promise.all([
+      service.allocateProviderFence({ userId: user.id, providerAccountId: account.id }),
+      service.allocateProviderFence({ userId: user.id, providerAccountId: account.id }),
+    ]);
 
     const claims = await Promise.all([
-      service.claimProviderHealthTrial({ ...input, attemptId: "probe-a", fencingToken: 1n }),
-      service.claimProviderHealthTrial({ ...input, attemptId: "probe-b", fencingToken: 2n }),
+      service.claimProviderHealthTrial({
+        ...input,
+        attemptId: "probe-a",
+        fencingToken: probeAFence,
+      }),
+      service.claimProviderHealthTrial({
+        ...input,
+        attemptId: "probe-b",
+        fencingToken: probeBFence,
+      }),
     ]);
 
     expect(claims.sort()).toEqual(["COOLDOWN", "HALF_OPEN"]);
@@ -81,8 +93,16 @@ integration("provider half-open recovery", () => {
       }),
     ]);
 
+    const probeCFence = await service.allocateProviderFence({
+      userId: user.id,
+      providerAccountId: account.id,
+    });
     await expect(
-      service.claimProviderHealthTrial({ ...input, attemptId: "probe-c", fencingToken: 3n }),
+      service.claimProviderHealthTrial({
+        ...input,
+        attemptId: "probe-c",
+        fencingToken: probeCFence,
+      }),
     ).resolves.toBe("HALF_OPEN");
     const recovered = await db.providerModel.findUniqueOrThrow({
       where: { id: model.id },
@@ -119,7 +139,13 @@ integration("provider half-open recovery", () => {
         healthNextRetryAt: expiredCooldown,
       },
     });
-    const owner = { attemptId: `owner-${suffix}`, fencingToken: 11n };
+    const owner = {
+      attemptId: `owner-${suffix}`,
+      fencingToken: await service.allocateProviderFence({
+        userId: user.id,
+        providerAccountId: account.id,
+      }),
+    };
     await db.providerAttempt.create({
       data: {
         userId: user.id,
@@ -153,12 +179,16 @@ integration("provider half-open recovery", () => {
         data: { healthHalfOpenAt: almostStale },
       }),
     ]);
+    const competitorFence = await service.allocateProviderFence({
+      userId: user.id,
+      providerAccountId: account.id,
+    });
     const [alive, competitor] = await Promise.all([
       service.heartbeatProviderAttempt({ ...owner, extensionMs: 15 * 60_000 }),
       service.claimProviderHealthTrial({
         ...target,
         attemptId: `competitor-${suffix}`,
-        fencingToken: 12n,
+        fencingToken: competitorFence,
       }),
     ]);
     expect(alive).toBe(true);
@@ -177,7 +207,13 @@ integration("provider half-open recovery", () => {
       }),
       db.providerModel.update({ where: { id: model.id }, data: { healthHalfOpenAt: orphaned } }),
     ]);
-    const successor = { attemptId: `successor-${suffix}`, fencingToken: 13n };
+    const successor = {
+      attemptId: `successor-${suffix}`,
+      fencingToken: await service.allocateProviderFence({
+        userId: user.id,
+        providerAccountId: account.id,
+      }),
+    };
     await expect(service.claimProviderHealthTrial({ ...target, ...successor })).resolves.toBe(
       "HALF_OPEN",
     );
@@ -207,5 +243,138 @@ integration("provider half-open recovery", () => {
     expect(afterLateOwner.healthNextRetryAt).toBeNull();
     expect(afterLateOwner.healthHalfOpenAttemptId).toBeNull();
     expect(afterLateOwner.healthFencingWatermark).toBe(successor.fencingToken);
+  });
+
+  it("orders concurrent READY outcomes without blocking either dispatch", async () => {
+    if (!db) return;
+    const suffix = crypto.randomUUID();
+    const user = await db.user.create({
+      data: { name: "READY ordering proof", email: `ready-order-${suffix}@example.test` },
+    });
+    const account = await db.providerAccount.create({
+      data: {
+        userId: user.id,
+        providerType: "proof",
+        label: `ready-order-${suffix}`,
+        baseUrl: "https://example.test",
+        endpointIdentity: "https://example.test",
+        authType: "BEARER",
+      },
+    });
+    const model = await db.providerModel.create({
+      data: {
+        userId: user.id,
+        providerAccountId: account.id,
+        upstreamModelId: suffix,
+      },
+    });
+    const target = {
+      userId: user.id,
+      providerAccountId: account.id,
+      providerModelId: model.id,
+    };
+    const olderFence = await service.allocateProviderFence({
+      userId: user.id,
+      providerAccountId: account.id,
+    });
+    const newerFence = await service.allocateProviderFence({
+      userId: user.id,
+      providerAccountId: account.id,
+    });
+
+    await expect(
+      Promise.all([
+        service.claimProviderHealthTrial({
+          ...target,
+          attemptId: `ready-old-${suffix}`,
+          fencingToken: olderFence,
+        }),
+        service.claimProviderHealthTrial({
+          ...target,
+          attemptId: `ready-new-${suffix}`,
+          fencingToken: newerFence,
+        }),
+      ]),
+    ).resolves.toEqual(["READY", "READY"]);
+
+    await service.recordProviderOutcome({
+      ...target,
+      attemptId: `ready-new-${suffix}`,
+      fencingToken: newerFence,
+      success: true,
+    });
+    await service.recordProviderOutcome({
+      ...target,
+      attemptId: `ready-old-${suffix}`,
+      fencingToken: olderFence,
+      success: false,
+      failureClass: "TRANSPORT",
+    });
+
+    const [storedAccount, storedModel] = await Promise.all([
+      db.providerAccount.findUniqueOrThrow({ where: { id: account.id } }),
+      db.providerModel.findUniqueOrThrow({ where: { id: model.id } }),
+    ]);
+    expect(storedAccount.healthStatus).toBe("HEALTHY");
+    expect(storedModel.healthStatus).toBe("HEALTHY");
+    expect(storedAccount.healthFencingWatermark).toBe(newerFence);
+    expect(storedModel.healthFencingWatermark).toBe(newerFence);
+  });
+
+  it("installs durable watermark defaults and database ordering constraints", async () => {
+    if (!db) return;
+    const constraints = await db.$queryRaw<Array<{ table_name: string; definition: string }>>`
+      SELECT rel.relname AS table_name, pg_get_constraintdef(con.oid) AS definition
+      FROM pg_constraint con
+      JOIN pg_class rel ON rel.oid = con.conrelid
+      WHERE con.conname IN ('provider_account_shape_check', 'provider_model_shape_check')
+      ORDER BY rel.relname
+    `;
+    expect(constraints).toHaveLength(2);
+    expect(constraints.find((row) => row.table_name === "provider_account")?.definition).toContain(
+      '"nextFencingToken" >= "healthFencingWatermark"',
+    );
+    for (const constraint of constraints) {
+      expect(constraint.definition).toMatch(
+        /"healthFencingWatermark"\s*>=\s*COALESCE\("healthHalfOpenFencingToken"/,
+      );
+    }
+    const [invalidAccountRows, invalidModelRows] = await Promise.all([
+      db.$queryRaw<Array<{ count: bigint }>>`
+        SELECT COUNT(*) AS count
+        FROM provider_account
+        WHERE "nextFencingToken" < "healthFencingWatermark"
+           OR "healthFencingWatermark" < COALESCE("healthHalfOpenFencingToken", 0)
+      `,
+      db.$queryRaw<Array<{ count: bigint }>>`
+        SELECT COUNT(*) AS count
+        FROM provider_model
+        WHERE "healthFencingWatermark" < COALESCE("healthHalfOpenFencingToken", 0)
+      `,
+    ]);
+    expect(invalidAccountRows[0]?.count).toBe(0n);
+    expect(invalidModelRows[0]?.count).toBe(0n);
+
+    const suffix = crypto.randomUUID();
+    const user = await db.user.create({
+      data: { name: "Watermark constraint proof", email: `watermark-${suffix}@example.test` },
+    });
+    const account = await db.providerAccount.create({
+      data: {
+        userId: user.id,
+        providerType: "proof",
+        label: `watermark-${suffix}`,
+        baseUrl: "https://example.test",
+        endpointIdentity: "https://example.test",
+        authType: "BEARER",
+      },
+    });
+    expect(account.healthFencingWatermark).toBe(0n);
+    await expect(
+      db.providerAccount.update({
+        where: { id: account.id },
+        data: { nextFencingToken: 1n, healthFencingWatermark: 2n },
+      }),
+    ).rejects.toThrow();
   });
 });

@@ -870,16 +870,31 @@ export async function dispatchPublicOverflow(
             });
         response.destroy();
         await closed;
-        await recordProviderOutcome({
-          userId: request.userId,
-          providerAccountId: target.providerAccountId,
-          providerModelId: target.providerModelId,
-          success: false,
-          failureClass: classifyProviderFailure(status),
-          retryAfterMs: parseRetryAfter(response.headers["retry-after"]),
-          attemptId,
-          fencingToken,
-        }).catch(() => undefined);
+        // Heartbeat loss means a successor may already own health state. Do
+        // not let this orphan's retryable response mutate that state. The
+        // fenced release is deliberately attempted in either case: it clears
+        // only this exact half-open owner and is a no-op for READY attempts or
+        // a successor-owned probe.
+        if (!attemptController.signal.aborted) {
+          await recordProviderOutcome({
+            userId: request.userId,
+            providerAccountId: target.providerAccountId,
+            providerModelId: target.providerModelId,
+            success: false,
+            failureClass: classifyProviderFailure(status),
+            retryAfterMs: parseRetryAfter(response.headers["retry-after"]),
+            attemptId,
+            fencingToken,
+          }).catch(() => undefined);
+        } else {
+          await releaseProviderHealthTrial({
+            userId: request.userId,
+            providerAccountId: target.providerAccountId,
+            providerModelId: target.providerModelId,
+            attemptId,
+            fencingToken,
+          }).catch(() => false);
+        }
         stopHeartbeat();
         await reconcileProviderBudget({
           userId: request.userId,

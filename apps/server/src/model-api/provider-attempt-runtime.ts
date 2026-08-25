@@ -283,6 +283,9 @@ export async function recordProviderOutcome(input: {
           healthHalfOpenAt: null,
           healthHalfOpenAttemptId: null,
           healthHalfOpenFencingToken: null,
+          ...(input.fencingToken !== undefined
+            ? { healthFencingWatermark: input.fencingToken }
+            : {}),
         }
       : {
           healthStatus: modelHealth,
@@ -292,6 +295,9 @@ export async function recordProviderOutcome(input: {
           healthHalfOpenAt: null,
           healthHalfOpenAttemptId: null,
           healthHalfOpenFencingToken: null,
+          ...(input.fencingToken !== undefined
+            ? { healthFencingWatermark: input.fencingToken }
+            : {}),
         };
     await tx.providerModel.update({
       where: { id: input.providerModelId, userId: input.userId },
@@ -309,6 +315,9 @@ export async function recordProviderOutcome(input: {
               healthHalfOpenAt: null,
               healthHalfOpenAttemptId: null,
               healthHalfOpenFencingToken: null,
+              ...(input.fencingToken !== undefined
+                ? { healthFencingWatermark: input.fencingToken }
+                : {}),
             }
           : {
               healthFailureCount: { increment: 1 },
@@ -322,6 +331,9 @@ export async function recordProviderOutcome(input: {
               healthHalfOpenAt: null,
               healthHalfOpenAttemptId: null,
               healthHalfOpenFencingToken: null,
+              ...(input.fencingToken !== undefined
+                ? { healthFencingWatermark: input.fencingToken }
+                : {}),
             }),
       },
     });

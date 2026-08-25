@@ -208,6 +208,48 @@ describe("provider attempt failure policy", () => {
     expect(tx.providerModel.update).not.toHaveBeenCalled();
   });
 
+  it("advances the durable watermark when a concurrent READY attempt records an outcome", async () => {
+    const healthy = {
+      healthFailureCount: 0,
+      healthNextRetryAt: null,
+      healthHalfOpenAttemptId: null,
+      healthHalfOpenFencingToken: null,
+      healthFencingWatermark: 4n,
+    };
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
+      providerAccount: {
+        findUniqueOrThrow: vi.fn().mockResolvedValue(healthy),
+        update: vi.fn().mockResolvedValue({}),
+      },
+      providerModel: {
+        findUniqueOrThrow: vi.fn().mockResolvedValue(healthy),
+        update: vi.fn().mockResolvedValue({}),
+      },
+    };
+    db.$transaction.mockImplementationOnce(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+
+    await recordProviderOutcome({
+      userId: "owner",
+      providerAccountId: "account",
+      providerModelId: "model",
+      attemptId: "ready-newer",
+      fencingToken: 9n,
+      success: true,
+    });
+
+    expect(tx.providerModel.update).toHaveBeenCalledWith({
+      where: { id: "model", userId: "owner" },
+      data: expect.objectContaining({ healthFencingWatermark: 9n }),
+    });
+    expect(tx.providerAccount.update).toHaveBeenCalledWith({
+      where: { id: "account", userId: "owner" },
+      data: expect.objectContaining({ healthFencingWatermark: 9n }),
+    });
+  });
+
   it("locks the account before the model and enforces an account cooldown", async () => {
     const locks: string[] = [];
     const tx = {
