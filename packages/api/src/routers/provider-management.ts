@@ -685,6 +685,8 @@ export const providerManagementRouter = {
         },
         ring(),
       );
+      let statusCode: number | null = null;
+      let requestError: unknown;
       try {
         const providerAuth =
           row.credentialType === "BEARER"
@@ -698,41 +700,34 @@ export const providerManagementRouter = {
           providerAuth,
         );
         response.resume();
-        const statusCode = response.statusCode ?? null;
-        const ok = (statusCode ?? 500) < 400;
-        await prisma.$transaction(
-          async (tx) => {
-            const used = await tx.providerCredential.updateMany({
-              where: { id: row.id, userId, status: "ACTIVE" },
-              data: { lastUsedAt: new Date() },
-            });
-            if (used.count !== 1) throw new ORPCError("CONFLICT");
-            await tx.providerAuditEvent.create({
-              data: {
-                userId,
-                providerAccountId: account.id,
-                action: "CREDENTIAL_TESTED",
-                subjectId: row.id,
-                metadata: { outcome: ok ? "SUCCESS" : "FAILURE", statusCode },
-              },
-            });
-          },
-          { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
-        );
-        return { ok, statusCode };
+        statusCode = response.statusCode ?? null;
       } catch (error) {
-        if (error instanceof ORPCError) throw error;
-        await prisma.providerAuditEvent.create({
+        requestError = error;
+      }
+      const ok = requestError === undefined && (statusCode ?? 500) < 400;
+      await prisma.$transaction(async (tx) => {
+        // Match every credential lifecycle mutation's account-then-credential
+        // lock order. The credential may have been revoked (or removed) while
+        // the network request was in flight; that must not erase the attempt.
+        await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${account.id} AND "userId" = ${userId} FOR UPDATE`;
+        await tx.$queryRaw`SELECT id FROM provider_credential WHERE id = ${row.id} AND "userId" = ${userId} FOR UPDATE`;
+        await tx.providerCredential.updateMany({
+          where: { id: row.id, userId, status: "ACTIVE" },
+          data: { lastUsedAt: new Date() },
+        });
+        await tx.providerAuditEvent.create({
           data: {
             userId,
             providerAccountId: account.id,
             action: "CREDENTIAL_TESTED",
             subjectId: row.id,
-            metadata: { outcome: "FAILURE", statusCode: null },
+            metadata: { outcome: ok ? "SUCCESS" : "FAILURE", statusCode },
           },
         });
-        throw new ORPCError("BAD_GATEWAY", { message: redactProviderError(error) });
-      }
+      }, providerWriteTransaction);
+      if (requestError !== undefined)
+        throw new ORPCError("BAD_GATEWAY", { message: redactProviderError(requestError) });
+      return { ok, statusCode };
     }),
   listBudgetPolicies: protectedProcedure.handler(({ context }) => {
     enabled();

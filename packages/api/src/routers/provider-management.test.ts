@@ -461,4 +461,70 @@ describe("providerManagementRouter security boundary", () => {
     expect(JSON.stringify(failedAudit)).not.toContain("super-secret-value");
     expect(JSON.stringify(failedAudit)).not.toContain("provider.example");
   });
+
+  it("records a successful test exactly once when revocation wins during egress", async () => {
+    envMock.enabled = true;
+    const { encryptProviderCredential, parseProviderCredentialKeyring } = await import(
+      "../lib/provider-credential-crypto"
+    );
+    const encrypted = encryptProviderCredential(
+      "concurrent-secret",
+      {
+        userId: "owner",
+        providerAccountId: "account",
+        credentialId: "credential",
+        credentialType: "BEARER",
+        aadVersion: 1,
+      },
+      parseProviderCredentialKeyring("v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+    );
+    db.providerAccount.findFirst.mockResolvedValue({
+      id: "account",
+      userId: "owner",
+      deletedAt: null,
+      currentCredentialId: "credential",
+      providerType: "openai",
+      baseUrl: "https://provider.example/v1",
+    });
+    db.providerCredential.findFirst.mockResolvedValue({
+      id: "credential",
+      providerAccountId: "account",
+      credentialType: "BEARER",
+      aadVersion: 1,
+      status: "ACTIVE",
+      ...encrypted,
+    });
+    // The request selected an active credential, but revokeCredential committed
+    // before the post-egress transaction acquired its lifecycle locks.
+    db.providerCredential.updateMany.mockResolvedValue({ count: 0 });
+    db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
+    egressMock.request.mockResolvedValue({ statusCode: 204, resume: vi.fn() });
+
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(client.testCredential({ providerAccountId: "account" })).resolves.toEqual({
+      ok: true,
+      statusCode: 204,
+    });
+
+    expect(db.$queryRaw).toHaveBeenCalledTimes(2);
+    expect(db.providerCredential.updateMany).toHaveBeenCalledWith({
+      where: { id: "credential", userId: "owner", status: "ACTIVE" },
+      data: { lastUsedAt: expect.any(Date) },
+    });
+    expect(db.providerAuditEvent.create).toHaveBeenCalledOnce();
+    expect(db.providerAuditEvent.create).toHaveBeenCalledWith({
+      data: {
+        userId: "owner",
+        providerAccountId: "account",
+        action: "CREDENTIAL_TESTED",
+        subjectId: "credential",
+        metadata: { outcome: "SUCCESS", statusCode: 204 },
+      },
+    });
+    expect(db.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+      isolationLevel: "Serializable",
+      maxWait: 5_000,
+      timeout: 10_000,
+    });
+  });
 });
