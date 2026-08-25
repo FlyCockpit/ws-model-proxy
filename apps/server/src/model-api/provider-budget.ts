@@ -109,6 +109,8 @@ export interface ProviderBudgetTerminal {
   /** Whether the provider transport reached its terminal response boundary. */
   observationComplete?: boolean;
   usage?: RawProviderUsage;
+  /** Internal crash-sweeper cutoff, rechecked under the attempt advisory lock. */
+  crashExpiredAt?: Date;
 }
 
 export class ProviderBudgetConfigurationError extends Error {}
@@ -726,6 +728,7 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
   );
   await serializedByAdvisoryLocks(async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-attempt:${terminal.attemptId}`}, 0))`;
+    await tx.$queryRaw`SELECT id FROM provider_attempt WHERE "attemptId" = ${terminal.attemptId} AND "fencingToken" = ${terminal.fencingToken} FOR UPDATE`;
     const anchor = await tx.providerAttempt.findUnique({
       where: {
         attemptId_fencingToken: {
@@ -735,6 +738,12 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
       },
     });
     if (!anchor) throw new ProviderBudgetConfigurationError("No admitted provider attempt exists");
+    if (
+      terminal.reason === "CRASH_RECOVERY" &&
+      terminal.crashExpiredAt &&
+      anchor.expiresAt > terminal.crashExpiredAt
+    )
+      return;
     if (
       anchor.userId !== terminal.userId ||
       anchor.providerAccountId !== terminal.providerAccountId ||
@@ -1077,6 +1086,7 @@ export async function repairExpiredProviderBudgets(
       attemptId: row.attemptId,
       fencingToken: row.fencingToken,
       reason: "CRASH_RECOVERY",
+      crashExpiredAt: now,
       revisionSequence: 0n,
       revisionKind: "SNAPSHOT",
     });

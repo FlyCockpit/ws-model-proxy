@@ -20,7 +20,7 @@ import {
 } from "./cache-affinity.js";
 import { ADAPTER_VERSION } from "./protocols/canonical.js";
 import type { ProtocolSurface } from "./protocols/index.js";
-import { SseDecoder } from "./protocols/sse.js";
+import { SseDecoder, type SseRecord } from "./protocols/sse.js";
 import {
   allocateProviderFence,
   claimProviderHealthTrial,
@@ -963,14 +963,33 @@ export function providerStreamHasTerminalUsageEvent(
   return /(?:^|\n)data:\s*\[DONE\]\s*(?:\r?\n|$)/u.test(text);
 }
 
-function providerStreamHasTerminalEvent(
-  chunks: readonly Uint8Array[],
+function classifyTerminalRecord(
+  record: SseRecord,
   surface: ProtocolSurface,
-): boolean {
-  const text = new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))));
-  if (/(?:^|\n)event:\s*error\s*(?:\r?\n|$)/u.test(text)) return true;
-  if (surface === "openai-chat" && /(?:^|\n)data:\s*\{[^\n]*"error"\s*:/u.test(text)) return true;
-  return providerStreamHasTerminalUsageEvent(chunks, surface);
+): "SUCCESS" | "FAILED" | undefined {
+  if (surface === "openai-chat") {
+    if (record.data === "[DONE]") return "SUCCESS";
+    try {
+      const value = JSON.parse(record.data) as Record<string, unknown>;
+      return value.error === undefined ? undefined : "FAILED";
+    } catch {
+      return undefined;
+    }
+  }
+  try {
+    const value = JSON.parse(record.data) as Record<string, unknown>;
+    const dataType = typeof value.type === "string" ? value.type : undefined;
+    if (!record.event || record.event !== dataType) return undefined;
+    if (record.event === "error") return "FAILED";
+    if (surface === "anthropic-messages")
+      return record.event === "message_stop" ? "SUCCESS" : undefined;
+    if (record.event === "response.completed") return "SUCCESS";
+    if (["response.failed", "response.cancelled", "response.incomplete"].includes(record.event))
+      return "FAILED";
+  } catch {
+    return undefined;
+  }
+  return undefined;
 }
 
 function providerStreamTerminalFailed(
@@ -1747,15 +1766,20 @@ export async function dispatchPublicOverflow(
       });
       const httpOk = status >= 200 && status < 400;
       let clientCancelled = false;
+      let protocolTerminal = false;
+      let protocolFailed = false;
+      let deliveredProtocolTerminal = false;
+      const terminalDecoder = request.stream ? new SseDecoder() : undefined;
       const reconcile = (streamComplete: boolean): Promise<void> => {
         if (reconciliation) return reconciliation;
         reconciliation = (async () => {
           stopHeartbeat();
-          const transportComplete = streamComplete && response.complete;
+          const transportComplete = streamComplete && (response.complete || protocolTerminal);
           const surface = nativeSurface ?? request.requestedSurface;
-          const streamTerminal =
-            !request.stream || providerStreamHasTerminalEvent(usageChunks, surface);
-          const providerFailed = providerStreamTerminalFailed(usageChunks, surface);
+          const streamTerminal = !request.stream || protocolTerminal;
+          const providerFailed =
+            protocolFailed ||
+            (!request.stream && providerStreamTerminalFailed(usageChunks, surface));
           const ok =
             transportComplete && httpOk && streamTerminal && !providerFailed && !clientCancelled;
           const healthOutcome = providerHealthOutcome(status);
@@ -1810,12 +1834,7 @@ export async function dispatchPublicOverflow(
               } as RawProviderUsage)
             : combinedUsage;
           const observationComplete =
-            transportComplete &&
-            (!request.stream ||
-              providerStreamHasTerminalUsageEvent(
-                usageChunks,
-                nativeSurface ?? request.requestedSurface,
-              ));
+            transportComplete && (!request.stream || (protocolTerminal && !protocolFailed));
           const usage = observedUsage
             ? {
                 ...observedUsage,
@@ -1882,33 +1901,34 @@ export async function dispatchPublicOverflow(
         })();
         return reconciliation;
       };
-      let heldTerminalChunks: Uint8Array[] | undefined;
       const heldBody = new ReadableStream<Uint8Array>({
         async pull(controller) {
+          if (deliveredProtocolTerminal) {
+            controller.close();
+            return;
+          }
           let reachedEof = false;
           try {
             while (true) {
               const chunk = await reader.read();
               if (chunk.done) {
                 reachedEof = true;
+                if (terminalDecoder && !protocolTerminal) {
+                  const records = terminalDecoder.finish();
+                  for (const record of records) {
+                    const outcome = classifyTerminalRecord(
+                      record,
+                      nativeSurface ?? request.requestedSurface,
+                    );
+                    protocolTerminal ||= outcome !== undefined;
+                    protocolFailed ||= outcome === "FAILED";
+                  }
+                }
                 // Do not expose either a streaming terminal event or EOF until
                 // correctness-required settlement and health release are durable.
                 await reconcile(response.complete);
                 if (response.complete || !httpOk) {
-                  if (heldTerminalChunks) {
-                    const length = heldTerminalChunks.reduce(
-                      (total, item) => total + item.byteLength,
-                      0,
-                    );
-                    const terminal = new Uint8Array(length);
-                    let offset = 0;
-                    for (const item of heldTerminalChunks) {
-                      terminal.set(item, offset);
-                      offset += item.byteLength;
-                    }
-                    heldTerminalChunks = undefined;
-                    controller.enqueue(terminal);
-                  } else controller.close();
+                  controller.close();
                 } else
                   controller.error(
                     new Error("Provider response ended before transport completion"),
@@ -1927,19 +1947,24 @@ export async function dispatchPublicOverflow(
               // report authoritative usage in terminal events, which may occur
               // after arbitrarily large content deltas.
               usageBytes = retainProviderUsageTail(usageChunks, usageBytes, chunk.value);
-              if (heldTerminalChunks) {
-                heldTerminalChunks.push(chunk.value);
-                continue;
+              if (terminalDecoder) {
+                const records = terminalDecoder.push(chunk.value);
+                for (const record of records) {
+                  const outcome = classifyTerminalRecord(
+                    record,
+                    nativeSurface ?? request.requestedSurface,
+                  );
+                  protocolTerminal ||= outcome !== undefined;
+                  protocolFailed ||= outcome === "FAILED";
+                }
               }
-              if (
-                request.stream &&
-                providerStreamHasTerminalEvent(
-                  usageChunks,
-                  nativeSurface ?? request.requestedSurface,
-                )
-              ) {
-                heldTerminalChunks = [chunk.value];
-                continue;
+              if (protocolTerminal) {
+                await reconcile(true);
+                deliveredProtocolTerminal = true;
+                controller.enqueue(chunk.value);
+                await reader.cancel().catch(() => undefined);
+                response.destroy();
+                return;
               }
               controller.enqueue(chunk.value);
               return;

@@ -39,7 +39,6 @@ export async function heartbeatProviderAttempt(input: {
   fencingToken: bigint;
   extensionMs: number;
 }): Promise<boolean> {
-  const now = new Date();
   return prisma.$transaction(async (tx) => {
     const attempt = await tx.providerAttempt.findUnique({
       where: {
@@ -73,6 +72,9 @@ export async function heartbeatProviderAttempt(input: {
     const unclaimed = (health: typeof accountHealth) => health.healthHalfOpenAttemptId === null;
     const ownsHalfOpen = owns(accountHealth) && owns(modelHealth);
     if (!ownsHalfOpen && !(unclaimed(accountHealth) && unclaimed(modelHealth))) return false;
+    // Evaluate expiry only after every contended ownership lock is held. A
+    // timestamp captured before the wait could renew an already-expired lease.
+    const now = new Date();
     const updated = await tx.providerAttempt.updateMany({
       where: {
         attemptId: input.attemptId,
