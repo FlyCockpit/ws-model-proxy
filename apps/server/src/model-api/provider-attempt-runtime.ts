@@ -226,11 +226,31 @@ export async function recordProviderOutcome(input: {
   attemptId?: string;
   fencingToken?: bigint;
   now?: Date;
-}): Promise<void> {
+}): Promise<boolean> {
+  if ((input.attemptId === undefined) !== (input.fencingToken === undefined)) return false;
   const now = input.now ?? new Date();
-  await prisma.$transaction(async (tx) => {
+  return prisma.$transaction(async (tx) => {
+    // Health mutations use one global lock order: account, model, attempt.
+    // In particular, lock the attempt in this transaction rather than relying
+    // on a heartbeat checked before entry: expiry or terminalization could win
+    // that gap and allow an orphan to overwrite a successor's health state.
     await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.providerAccountId} AND "userId" = ${input.userId} FOR UPDATE`;
     await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${input.providerModelId} AND "userId" = ${input.userId} FOR UPDATE`;
+    if (input.attemptId !== undefined && input.fencingToken !== undefined) {
+      const authoritative = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT id
+        FROM provider_attempt
+        WHERE "attemptId" = ${input.attemptId}
+          AND "fencingToken" = ${input.fencingToken}
+          AND "userId" = ${input.userId}
+          AND "providerAccountId" = ${input.providerAccountId}
+          AND "providerModelId" = ${input.providerModelId}
+          AND state = 'ACTIVE'::"ProviderAttemptState"
+          AND "expiresAt" > ${now}
+        FOR UPDATE
+      `;
+      if (authoritative.length !== 1) return false;
+    }
     const [accountCurrent, current] = await Promise.all([
       tx.providerAccount.findUniqueOrThrow({
         where: { id: input.providerAccountId, userId: input.userId },
@@ -267,7 +287,7 @@ export async function recordProviderOutcome(input: {
       [accountCurrent, current].some(
         (health) => input.fencingToken! < health.healthFencingWatermark,
       );
-    if (ownedByAnother || superseded) return;
+    if (ownedByAnother || superseded) return false;
     const failures = input.success ? 0 : current.healthFailureCount + 1;
     const modelHealth = input.success
       ? ("HEALTHY" as const)
@@ -337,6 +357,7 @@ export async function recordProviderOutcome(input: {
             }),
       },
     });
+    return true;
   });
 }
 

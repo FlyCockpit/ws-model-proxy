@@ -214,6 +214,17 @@ integration("provider half-open recovery", () => {
         providerAccountId: account.id,
       }),
     };
+    await db.providerAttempt.create({
+      data: {
+        userId: user.id,
+        providerAccountId: account.id,
+        providerModelId: model.id,
+        requestId: `successor-request-${suffix}`,
+        ...successor,
+        expiresAt: new Date(Date.now() + 15 * 60_000),
+        accountingVersion: "test-v1",
+      },
+    });
     await expect(service.claimProviderHealthTrial({ ...target, ...successor })).resolves.toBe(
       "HALF_OPEN",
     );
@@ -281,6 +292,30 @@ integration("provider half-open recovery", () => {
       userId: user.id,
       providerAccountId: account.id,
     });
+    await db.providerAttempt.createMany({
+      data: [
+        {
+          userId: user.id,
+          providerAccountId: account.id,
+          providerModelId: model.id,
+          requestId: `ready-old-request-${suffix}`,
+          attemptId: `ready-old-${suffix}`,
+          fencingToken: olderFence,
+          expiresAt: new Date(Date.now() + 15 * 60_000),
+          accountingVersion: "test-v1",
+        },
+        {
+          userId: user.id,
+          providerAccountId: account.id,
+          providerModelId: model.id,
+          requestId: `ready-new-request-${suffix}`,
+          attemptId: `ready-new-${suffix}`,
+          fencingToken: newerFence,
+          expiresAt: new Date(Date.now() + 15 * 60_000),
+          accountingVersion: "test-v1",
+        },
+      ],
+    });
 
     await expect(
       Promise.all([
@@ -319,6 +354,78 @@ integration("provider half-open recovery", () => {
     expect(storedModel.healthStatus).toBe("HEALTHY");
     expect(storedAccount.healthFencingWatermark).toBe(newerFence);
     expect(storedModel.healthFencingWatermark).toBe(newerFence);
+  });
+
+  it("rejects an outcome whose attempt terminalizes while outcome processing is deferred", async () => {
+    if (!db) return;
+    const suffix = crypto.randomUUID();
+    const user = await db.user.create({
+      data: { name: "Outcome race proof", email: `outcome-race-${suffix}@example.test` },
+    });
+    const account = await db.providerAccount.create({
+      data: {
+        userId: user.id,
+        providerType: "proof",
+        label: `outcome-race-${suffix}`,
+        baseUrl: "https://example.test",
+        endpointIdentity: "https://example.test",
+        authType: "BEARER",
+      },
+    });
+    const model = await db.providerModel.create({
+      data: { userId: user.id, providerAccountId: account.id, upstreamModelId: suffix },
+    });
+    const attemptId = `outcome-race-${suffix}`;
+    const fencingToken = await service.allocateProviderFence({
+      userId: user.id,
+      providerAccountId: account.id,
+    });
+    await db.providerAttempt.create({
+      data: {
+        userId: user.id,
+        providerAccountId: account.id,
+        providerModelId: model.id,
+        requestId: `outcome-race-request-${suffix}`,
+        attemptId,
+        fencingToken,
+        expiresAt: new Date(Date.now() + 15 * 60_000),
+        accountingVersion: "test-v1",
+      },
+    });
+
+    let releaseTerminal!: () => void;
+    const terminalMayCommit = new Promise<void>((resolve) => {
+      releaseTerminal = resolve;
+    });
+    let terminalLocked!: () => void;
+    const terminalHasLock = new Promise<void>((resolve) => {
+      terminalLocked = resolve;
+    });
+    const terminal = db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM provider_attempt WHERE "attemptId" = ${attemptId} AND "fencingToken" = ${fencingToken} FOR UPDATE`;
+      await tx.providerAttempt.update({
+        where: { attemptId_fencingToken: { attemptId, fencingToken } },
+        data: { state: "FAILED", terminalAt: new Date(), terminalReason: "RACE_WINNER" },
+      });
+      terminalLocked();
+      await terminalMayCommit;
+    });
+    await terminalHasLock;
+    const outcome = service.recordProviderOutcome({
+      userId: user.id,
+      providerAccountId: account.id,
+      providerModelId: model.id,
+      attemptId,
+      fencingToken,
+      success: false,
+      failureClass: "TRANSPORT",
+    });
+    releaseTerminal();
+    await terminal;
+    await expect(outcome).resolves.toBe(false);
+    const storedModel = await db.providerModel.findUniqueOrThrow({ where: { id: model.id } });
+    expect(storedModel.healthStatus).toBe("UNKNOWN");
+    expect(storedModel.healthFailureCount).toBe(0);
   });
 
   it("installs durable watermark defaults and database ordering constraints", async () => {

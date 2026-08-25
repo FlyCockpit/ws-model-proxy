@@ -217,7 +217,9 @@ describe("provider attempt failure policy", () => {
       healthFencingWatermark: 4n,
     };
     const tx = {
-      $queryRaw: vi.fn().mockResolvedValue([]),
+      $queryRaw: vi.fn(async (parts: TemplateStringsArray) =>
+        parts.join("").includes("FROM provider_attempt") ? [{ id: "durable-attempt" }] : [],
+      ),
       providerAccount: {
         findUniqueOrThrow: vi.fn().mockResolvedValue(healthy),
         update: vi.fn().mockResolvedValue({}),
@@ -248,6 +250,30 @@ describe("provider attempt failure policy", () => {
       where: { id: "account", userId: "owner" },
       data: expect.objectContaining({ healthFencingWatermark: 9n }),
     });
+  });
+
+  it("rejects a fenced outcome when its durable attempt is no longer active", async () => {
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
+      providerAccount: { findUniqueOrThrow: vi.fn(), update: vi.fn() },
+      providerModel: { findUniqueOrThrow: vi.fn(), update: vi.fn() },
+    };
+    db.$transaction.mockImplementationOnce(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+
+    await expect(
+      recordProviderOutcome({
+        userId: "owner",
+        providerAccountId: "account",
+        providerModelId: "model",
+        attemptId: "expired",
+        fencingToken: 11n,
+        success: false,
+      }),
+    ).resolves.toBe(false);
+    expect(tx.providerAccount.findUniqueOrThrow).not.toHaveBeenCalled();
+    expect(tx.providerModel.findUniqueOrThrow).not.toHaveBeenCalled();
   });
 
   it("locks the account before the model and enforces an account cooldown", async () => {
