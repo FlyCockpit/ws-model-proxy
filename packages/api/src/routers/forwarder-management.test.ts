@@ -66,6 +66,7 @@ const db = prisma as unknown as {
     deleteMany: MockInstance;
     findMany: MockInstance;
   };
+  capacityAuditEvent: { create: MockInstance };
 };
 
 function buildContext(
@@ -145,6 +146,7 @@ describe("forwarderManagementRouter", () => {
       callback(db),
     );
     db.executionTarget.upsert.mockResolvedValue({ id: "target-id" });
+    db.capacityAuditEvent.create.mockResolvedValue({ id: "audit-id" });
     db.appSetting.findUnique.mockResolvedValue(null);
   });
 
@@ -329,6 +331,76 @@ describe("forwarderManagementRouter", () => {
       }),
     );
     expect(db.poolGrant.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("atomically creates a pool and its capacity-policy audit record", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.modelPool.create.mockResolvedValue(poolRow());
+
+    await client().createModelPool({
+      slug: "general",
+      name: "General",
+      capacityPriority: 23,
+      capacityConcurrencyLimit: 4,
+      capacityReservedSlots: 2,
+      capacityWaitBudgetMs: 1_500,
+      capacityContextCeiling: 32_768,
+      capacityContextMargin: 1_024,
+      capacityBorrowPolicy: "NEVER",
+    });
+
+    expect(db.$transaction).toHaveBeenCalledTimes(1);
+    expect(db.modelPool.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        userId: "user-id",
+        slug: "general",
+        capacityPriority: 23,
+        capacityConcurrencyLimit: 4,
+        capacityReservedSlots: 2,
+        capacityWaitBudgetMs: 1_500,
+        capacityContextCeiling: 32_768,
+        capacityContextMargin: 1_024,
+        capacityBorrowPolicy: "NEVER",
+      }),
+      select: expect.any(Object),
+    });
+    expect(db.capacityAuditEvent.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        userId: "user-id",
+        actorUserId: "user-id",
+        action: "CREATE",
+        resourceType: "MODEL_POOL",
+        resourceId: "pool-id",
+        after: expect.objectContaining({
+          capacityPriority: 23,
+          capacityConcurrencyLimit: 4,
+          capacityReservedSlots: 2,
+        }),
+      }),
+    });
+    expect(db.capacityAuditEvent.create.mock.calls[0]?.[0].data.after).not.toHaveProperty(
+      "description",
+    );
+    expect(db.modelPool.create.mock.invocationCallOrder[0]).toBeLessThan(
+      db.capacityAuditEvent.create.mock.invocationCallOrder[0] ?? 0,
+    );
+  });
+
+  it("fails pool creation when the atomic capacity-policy audit cannot be persisted", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.modelPool.create.mockResolvedValue(poolRow());
+    db.capacityAuditEvent.create.mockRejectedValue(new Error("policy audit failed"));
+
+    await expect(
+      client().createModelPool({
+        slug: "general",
+        name: "General",
+        capacityConcurrencyLimit: 2,
+      }),
+    ).rejects.toThrow("policy audit failed");
+    expect(db.$transaction).toHaveBeenCalledTimes(1);
+    expect(db.modelPool.create).toHaveBeenCalledTimes(1);
+    expect(db.capacityAuditEvent.create).toHaveBeenCalledTimes(1);
   });
 
   it("persists explicit protocol policy and reports the full member compatibility matrix", async () => {
@@ -570,6 +642,68 @@ describe("forwarderManagementRouter", () => {
       weight: 0,
       routingStatus: "DISABLED",
     });
+  });
+
+  it("makes missing and cross-owner nested pool-member ids indistinguishable", async () => {
+    const expectedPoolError = { code: "NOT_FOUND", message: "Model pool not found." };
+    db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce({
+      id: "other-pool-id",
+      userId: "other-user-id",
+    });
+    await expect(
+      client().addPoolMember({ poolId: "missing-pool", discoveredModelId: "model-id" }),
+    ).rejects.toMatchObject(expectedPoolError);
+    await expect(
+      client().addPoolMember({ poolId: "other-pool-id", discoveredModelId: "model-id" }),
+    ).rejects.toMatchObject(expectedPoolError);
+
+    const expectedModelError = { code: "NOT_FOUND", message: "Discovered model not found." };
+    db.modelPool.findUnique
+      .mockResolvedValueOnce({ id: "pool-id", userId: "user-id" })
+      .mockResolvedValueOnce({ id: "pool-id", userId: "user-id" });
+    db.discoveredModel.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce({
+      id: "other-model-id",
+      userId: "other-user-id",
+    });
+    await expect(
+      client().addPoolMember({ poolId: "pool-id", discoveredModelId: "missing-model" }),
+    ).rejects.toMatchObject(expectedModelError);
+    await expect(
+      client().addPoolMember({ poolId: "pool-id", discoveredModelId: "other-model-id" }),
+    ).rejects.toMatchObject(expectedModelError);
+
+    expect(db.executionTarget.upsert).not.toHaveBeenCalled();
+    expect(db.poolMember.create).not.toHaveBeenCalled();
+  });
+
+  it("makes missing and cross-owner transformer ids indistinguishable", async () => {
+    const existingPool = {
+      id: "pool-id",
+      userId: "user-id",
+      transformerDiscoveredModelId: null,
+      transformerImages: true,
+      transformerAudio: false,
+      transformerVideo: false,
+      transformerCacheMode: "OFF",
+    };
+    db.modelPool.findUnique.mockResolvedValueOnce(existingPool).mockResolvedValueOnce(existingPool);
+    db.discoveredModel.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce({
+      id: "other-model-id",
+      userId: "other-user-id",
+      published: true,
+      capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+      capabilityOverrideMetadata: null,
+      Endpoint: { published: true, capabilityMetadata: null },
+    });
+
+    const expected = { code: "NOT_FOUND", message: "Discovered model not found." };
+    await expect(
+      client().updateModelPool({ id: "pool-id", transformerDiscoveredModelId: "missing-model" }),
+    ).rejects.toMatchObject(expected);
+    await expect(
+      client().updateModelPool({ id: "pool-id", transformerDiscoveredModelId: "other-model-id" }),
+    ).rejects.toMatchObject(expected);
+    expect(db.modelPool.update).not.toHaveBeenCalled();
   });
 
   it("grants and revokes pool access by exact case-insensitive email without search", async () => {

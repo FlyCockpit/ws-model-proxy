@@ -94,7 +94,10 @@ export function scheduleWeightedDeficitRoundRobin({
     const priority = (state.cursor + visited) % PRIORITY_CLASS_COUNT;
     const queue = queues.get(priority);
     if (!queue?.length) continue;
-    deficits[priority] = Math.min(deficits[priority]! + quanta[priority]!, quanta[priority]! * 2);
+    // Refill only after a class has spent its prior quantum. Refilling on every
+    // visit makes any quantum greater than one self-sustaining and pins the
+    // cursor to that class forever, starving every lower-weight class.
+    if (deficits[priority]! < 1) deficits[priority] = quanta[priority]!;
     if (deficits[priority]! < 1) continue;
     deficits[priority]!--;
     return {

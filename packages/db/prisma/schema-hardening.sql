@@ -219,15 +219,20 @@ BEGIN
     RAISE EXCEPTION 'capacity admission references must share owner and physical capacity'
       USING ERRCODE = '23514';
   END IF;
-  IF TG_TABLE_NAME = 'capacity_waiter' AND TG_OP = 'UPDATE'
-     AND (NEW."effectivePriority" IS DISTINCT FROM OLD."effectivePriority"
-       OR NEW."effectiveConcurrencyLimit" IS DISTINCT FROM OLD."effectiveConcurrencyLimit"
-       OR NEW."effectiveConcurrencyScope" IS DISTINCT FROM OLD."effectiveConcurrencyScope"
-       OR NEW."effectiveConcurrencyScopeId" IS DISTINCT FROM OLD."effectiveConcurrencyScopeId"
-       OR NEW."effectiveReservedSlots" IS DISTINCT FROM OLD."effectiveReservedSlots"
-       OR NEW."effectiveBorrowPolicy" IS DISTINCT FROM OLD."effectiveBorrowPolicy") THEN
-    RAISE EXCEPTION 'capacity waiter policy snapshot is immutable'
-      USING ERRCODE = '23514';
+  -- Do not combine the table guard and waiter-only record fields in one SQL
+  -- boolean expression. PostgreSQL may resolve every NEW/OLD field before
+  -- applying boolean short-circuiting, and capacity_lease has no policy fields.
+  IF TG_TABLE_NAME = 'capacity_waiter' THEN
+    IF TG_OP = 'UPDATE'
+       AND (NEW."effectivePriority" IS DISTINCT FROM OLD."effectivePriority"
+         OR NEW."effectiveConcurrencyLimit" IS DISTINCT FROM OLD."effectiveConcurrencyLimit"
+         OR NEW."effectiveConcurrencyScope" IS DISTINCT FROM OLD."effectiveConcurrencyScope"
+         OR NEW."effectiveConcurrencyScopeId" IS DISTINCT FROM OLD."effectiveConcurrencyScopeId"
+         OR NEW."effectiveReservedSlots" IS DISTINCT FROM OLD."effectiveReservedSlots"
+         OR NEW."effectiveBorrowPolicy" IS DISTINCT FROM OLD."effectiveBorrowPolicy") THEN
+      RAISE EXCEPTION 'capacity waiter policy snapshot is immutable'
+        USING ERRCODE = '23514';
+    END IF;
   END IF;
   IF TG_TABLE_NAME IN ('capacity_waiter', 'capacity_lease') AND NOT EXISTS (
     SELECT 1 FROM admission_request request
@@ -247,7 +252,16 @@ BEGIN
       RAISE EXCEPTION 'capacity admission pool candidate is inconsistent'
         USING ERRCODE = '23514';
     END IF;
-    IF TG_TABLE_NAME = 'capacity_waiter' AND NOT EXISTS (
+  ELSIF request_pool IS NOT NULL THEN
+    RAISE EXCEPTION 'pool admission requires a pool member candidate'
+      USING ERRCODE = '23514';
+  ELSIF request_direct_target IS DISTINCT FROM NEW."executionTargetId" THEN
+    RAISE EXCEPTION 'direct admission candidate must match its source target'
+      USING ERRCODE = '23514';
+  END IF;
+
+  IF TG_TABLE_NAME = 'capacity_waiter' THEN
+    IF NEW."poolMemberId" IS NOT NULL AND NOT EXISTS (
       SELECT 1
         FROM pool_member member
         JOIN model_pool pool ON pool.id = member."poolId"
@@ -267,25 +281,19 @@ BEGIN
     ) THEN
       RAISE EXCEPTION 'capacity waiter policy snapshot must match its pool member policy'
         USING ERRCODE = '23514';
+    ELSIF NEW."poolMemberId" IS NULL AND NOT EXISTS (
+      SELECT 1 FROM execution_target target
+       WHERE target.id = NEW."executionTargetId"
+         AND NEW."effectivePriority" = target."directPriority"
+         AND NEW."effectiveConcurrencyLimit" IS NOT DISTINCT FROM target."directConcurrencyLimit"
+         AND NEW."effectiveConcurrencyScope" = 'DIRECT_TARGET'
+         AND NEW."effectiveConcurrencyScopeId" = target.id
+         AND NEW."effectiveReservedSlots" = target."directReservedSlots"
+         AND NEW."effectiveBorrowPolicy" = target."directBorrowPolicy"
+    ) THEN
+      RAISE EXCEPTION 'capacity waiter policy snapshot must match its direct target policy'
+        USING ERRCODE = '23514';
     END IF;
-  ELSIF request_pool IS NOT NULL THEN
-    RAISE EXCEPTION 'pool admission requires a pool member candidate'
-      USING ERRCODE = '23514';
-  ELSIF request_direct_target IS DISTINCT FROM NEW."executionTargetId" THEN
-    RAISE EXCEPTION 'direct admission candidate must match its source target'
-      USING ERRCODE = '23514';
-  ELSIF TG_TABLE_NAME = 'capacity_waiter' AND NOT EXISTS (
-    SELECT 1 FROM execution_target target
-     WHERE target.id = NEW."executionTargetId"
-       AND NEW."effectivePriority" = target."directPriority"
-       AND NEW."effectiveConcurrencyLimit" IS NOT DISTINCT FROM target."directConcurrencyLimit"
-       AND NEW."effectiveConcurrencyScope" = 'DIRECT_TARGET'
-       AND NEW."effectiveConcurrencyScopeId" = target.id
-       AND NEW."effectiveReservedSlots" = target."directReservedSlots"
-       AND NEW."effectiveBorrowPolicy" = target."directBorrowPolicy"
-  ) THEN
-    RAISE EXCEPTION 'capacity waiter policy snapshot must match its direct target policy'
-      USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
 END

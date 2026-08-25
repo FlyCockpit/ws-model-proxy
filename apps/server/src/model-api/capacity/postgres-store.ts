@@ -387,7 +387,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       include: { AdmissionRequest: true, PoolMember: true },
     });
     const configuredReservationMembers = await tx.poolMember.findMany({
-      where: { ExecutionTarget: { capacityId } },
+      where: { ExecutionTarget: { inferenceCapacityId: capacityId } },
       include: { ModelPool: true },
     });
     const configuredReservations: Array<{ ownerKey: string; capacityReservedSlots: number }> = [];

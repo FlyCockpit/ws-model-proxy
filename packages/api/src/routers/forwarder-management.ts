@@ -1119,29 +1119,53 @@ export const forwarderManagementRouter = {
     .handler(async ({ input, context }) => {
       await assertPoolSlugAvailable(input.slug, context.session.user.id);
       await assertAttachmentLimitWithinGlobal(input.maxAttachmentBytes);
-      const row = (await prisma.modelPool.create({
-        data: {
-          userId: context.session.user.id,
-          slug: input.slug,
-          name: input.name,
-          description: input.description ?? null,
-          ...(input.maxAttachmentBytes !== undefined
-            ? { maxAttachmentBytes: input.maxAttachmentBytes }
-            : {}),
-          optimisticBasicTranscription: input.optimisticBasicTranscription ?? false,
-          protocolAdaptationEnabled: input.protocolAdaptationEnabled ?? false,
-          allowLossyDeveloperRoleCollapse: input.allowLossyDeveloperRoleCollapse ?? false,
-          recommendedSurfaceOverride: input.recommendedSurfaceOverride ?? null,
-          capacityPriority: input.capacityPriority ?? 16,
-          capacityConcurrencyLimit: input.capacityConcurrencyLimit ?? null,
-          capacityReservedSlots: input.capacityReservedSlots ?? 0,
-          capacityWaitBudgetMs: input.capacityWaitBudgetMs ?? null,
-          capacityContextCeiling: input.capacityContextCeiling ?? null,
-          capacityContextMargin: input.capacityContextMargin ?? 0,
-          capacityBorrowPolicy: input.capacityBorrowPolicy ?? "WHEN_IDLE",
-        },
-        select: poolSelect,
-      })) as ModelPoolRow;
+      const userId = context.session.user.id;
+      const data = {
+        userId,
+        slug: input.slug,
+        name: input.name,
+        description: input.description ?? null,
+        ...(input.maxAttachmentBytes !== undefined
+          ? { maxAttachmentBytes: input.maxAttachmentBytes }
+          : {}),
+        optimisticBasicTranscription: input.optimisticBasicTranscription ?? false,
+        protocolAdaptationEnabled: input.protocolAdaptationEnabled ?? false,
+        allowLossyDeveloperRoleCollapse: input.allowLossyDeveloperRoleCollapse ?? false,
+        recommendedSurfaceOverride: input.recommendedSurfaceOverride ?? null,
+        capacityPriority: input.capacityPriority ?? 16,
+        capacityConcurrencyLimit: input.capacityConcurrencyLimit ?? null,
+        capacityReservedSlots: input.capacityReservedSlots ?? 0,
+        capacityWaitBudgetMs: input.capacityWaitBudgetMs ?? null,
+        capacityContextCeiling: input.capacityContextCeiling ?? null,
+        capacityContextMargin: input.capacityContextMargin ?? 0,
+        capacityBorrowPolicy: input.capacityBorrowPolicy ?? "WHEN_IDLE",
+      } as const;
+      const capacityPolicy = {
+        capacityPriority: data.capacityPriority,
+        capacityConcurrencyLimit: data.capacityConcurrencyLimit,
+        capacityReservedSlots: data.capacityReservedSlots,
+        capacityWaitBudgetMs: data.capacityWaitBudgetMs,
+        capacityContextCeiling: data.capacityContextCeiling,
+        capacityContextMargin: data.capacityContextMargin,
+        capacityBorrowPolicy: data.capacityBorrowPolicy,
+      } as const;
+      const row = await prisma.$transaction(async (tx) => {
+        const created = (await tx.modelPool.create({
+          data,
+          select: poolSelect,
+        })) as ModelPoolRow;
+        await tx.capacityAuditEvent.create({
+          data: {
+            userId,
+            actorUserId: userId,
+            action: "CREATE",
+            resourceType: "MODEL_POOL",
+            resourceId: created.id,
+            after: JSON.parse(JSON.stringify(capacityPolicy)) as Prisma.InputJsonValue,
+          },
+        });
+        return created;
+      });
       return serializePool(row);
     }),
 

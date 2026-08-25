@@ -336,6 +336,9 @@ jobs:
           --health-retries 5
     env:
       SCHEMA_VALIDATION_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/schema_validation
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/schema_validation
+      BETTER_AUTH_SECRET: w7Qp9Lm2Nx4Rv6Tk8Yc3Hu5Jd1Fs0ZaB
+      BETTER_AUTH_URL: http://localhost:3000
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6

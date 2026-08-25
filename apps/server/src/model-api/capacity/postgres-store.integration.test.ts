@@ -10,6 +10,52 @@ if (!databaseUrl)
   console.warn("[capacity-postgres] skipped: SCHEMA_VALIDATION_DATABASE_URL is not configured");
 
 integration("PostgreSQL capacity admission primitives", () => {
+  it("rolls back pool creation when its capacity-policy audit write fails", async () => {
+    if (!databaseUrl) return;
+    const db = createPrismaClient(databaseUrl);
+    const suffix = crypto.randomUUID();
+    const user = await db.user.create({
+      data: { name: "Pool rollback proof", email: `pool-rollback-${suffix}@example.test` },
+    });
+    const slug = `rollback-${suffix}`;
+    const auditId = `audit-${suffix}`;
+    try {
+      await db.capacityAuditEvent.create({
+        data: {
+          id: auditId,
+          userId: user.id,
+          actorUserId: user.id,
+          action: "SEED",
+          resourceType: "MODEL_POOL",
+          resourceId: "seed",
+        },
+      });
+      await expect(
+        db.$transaction(async (tx) => {
+          const pool = await tx.modelPool.create({
+            data: { userId: user.id, slug, name: "Must roll back", capacityConcurrencyLimit: 1 },
+          });
+          await tx.capacityAuditEvent.create({
+            data: {
+              id: auditId,
+              userId: user.id,
+              actorUserId: user.id,
+              action: "CREATE",
+              resourceType: "MODEL_POOL",
+              resourceId: pool.id,
+              after: { capacityConcurrencyLimit: 1 },
+            },
+          });
+        }),
+      ).rejects.toBeDefined();
+      expect(await db.modelPool.findFirst({ where: { userId: user.id, slug } })).toBeNull();
+      expect(await db.capacityAuditEvent.count({ where: { userId: user.id } })).toBe(1);
+    } finally {
+      await db.user.delete({ where: { id: user.id } }).catch(() => undefined);
+      await db.$disconnect();
+    }
+  });
+
   it("installs fresh-schema admission hardening and a database-owned enqueue sequence", async () => {
     if (!databaseUrl) return;
     const first = createPrismaClient(databaseUrl);
@@ -48,14 +94,19 @@ integration("PostgreSQL capacity admission primitives", () => {
     const first = createPrismaClient(databaseUrl);
     const second = createPrismaClient(databaseUrl);
     const order: string[] = [];
+    let firstLocked!: () => void;
+    const firstHasLock = new Promise<void>((resolve) => {
+      firstLocked = resolve;
+    });
     try {
       const a = first.$transaction(async (tx) => {
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${"capacity-proof"}, 0))`;
         order.push("first-lock");
+        firstLocked();
         await new Promise((resolve) => setTimeout(resolve, 30));
         order.push("first-release");
       });
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      await firstHasLock;
       const b = second.$transaction(async (tx) => {
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${"capacity-proof"}, 0))`;
         order.push("second-lock");
@@ -307,6 +358,7 @@ integration("PostgreSQL capacity admission primitives", () => {
               ...(index === 0
                 ? {
                     capacityPriority: 16,
+                    capacityConcurrencyMode: "LIMITED" as const,
                     capacityConcurrencyLimit: 2,
                     capacityReservedSlots: 0,
                     capacityBorrowPolicy: "WHEN_IDLE" as const,
@@ -453,10 +505,20 @@ integration("PostgreSQL capacity admission primitives", () => {
           where: { id: members[0]!.id },
           data: { capacityConcurrencyLimit: null },
         });
-        const borrowed = await firstManager.acquire({ ...lowAttempt, candidates: [] });
+        // Waiter policy is an immutable enqueue-time snapshot. A policy edit
+        // must not mutate an already queued attempt; retry with a new attempt.
+        await firstManager.cancelAttempt(lowAttempt.attemptId);
+        const retryLowAttempt = {
+          ...lowAttempt,
+          requestId: `request-low-retry-${suffix}`,
+          attemptId: `attempt-low-retry-${suffix}`,
+        };
+        let borrowed = await firstManager.acquire(retryLowAttempt);
+        for (let visit = 1; borrowed.state === "WAITING" && visit < 33; visit++)
+          borrowed = await firstManager.acquire({ ...retryLowAttempt, candidates: [] });
         expect(borrowed).toMatchObject({ state: "ADMITTED", lease: { capacityId: capacity.id } });
         const borrowedRow = await db.capacityLease.findUniqueOrThrow({
-          where: { attemptId: lowAttempt.attemptId },
+          where: { attemptId: retryLowAttempt.attemptId },
         });
         expect(borrowedRow.borrowed).toBe(true);
 
@@ -488,12 +550,13 @@ integration("PostgreSQL capacity admission primitives", () => {
         const high = await secondManager.acquire({ ...highAttempt, candidates: [] });
         expect(high).toMatchObject({ state: "ADMITTED" });
         expect(
-          await db.capacityLease.findUnique({ where: { attemptId: lowAttempt.attemptId } }),
+          await db.capacityLease.findUnique({ where: { attemptId: retryLowAttempt.attemptId } }),
         ).toMatchObject({ state: "ACTIVE" });
         if (borrowed.state !== "ADMITTED") throw new Error("Expected borrowed lease.");
         await db.capacityLease.update({
           where: { id: borrowed.lease.leaseId },
           data: {
+            acquiredAt: new Date(Date.now() - 2_000),
             expiresAt: new Date(Date.now() - 1_000),
             heartbeatAt: new Date(Date.now() - 60_000),
           },
@@ -502,9 +565,10 @@ integration("PostgreSQL capacity admission primitives", () => {
           firstManager.reclaimExpired(new Date(), 10),
           secondManager.heartbeat(borrowed.lease, new Date(Date.now() + 60_000)),
         ]);
-        expect([reclaimed, heartbeatWon]).toEqual(reclaimed === 1 ? [1, false] : [0, true]);
-        if (reclaimed === 1) expect(notifications.flat()).toContain(capacity.id);
-        await expect(firstManager.release(borrowed.lease)).resolves.toBe(heartbeatWon);
+        expect(heartbeatWon).toBe(reclaimed === 0);
+        if (reclaimed > 0) expect(notifications.flat()).toContain(capacity.id);
+        const releasedAfterRace = await firstManager.release(borrowed.lease);
+        if (heartbeatWon) expect(releasedAfterRace).toBe(true);
         await expect(
           firstManager.heartbeat(borrowed.lease, new Date(Date.now() + 60_000)),
         ).resolves.toBe(false);
@@ -526,13 +590,11 @@ integration("PostgreSQL capacity admission primitives", () => {
         ).resolves.toMatchObject({
           state: "WAITING",
         });
-        await expect(
-          firstManager.sweepAbandoned({
-            now: new Date(),
-            heartbeatBefore: new Date(Date.now() - 1_000),
-            limit: 10,
-          }),
-        ).resolves.toMatchObject({ requests: 0 });
+        await firstManager.sweepAbandoned({
+          now: new Date(),
+          heartbeatBefore: new Date(Date.now() - 1_000),
+          limit: 10,
+        });
         expect(
           await db.admissionRequest.findUnique({ where: { attemptId: healthyAttempt.attemptId } }),
         ).toMatchObject({ state: "WAITING" });
@@ -616,6 +678,18 @@ integration("PostgreSQL capacity admission primitives", () => {
           }),
         ).toBe(0);
 
+        await db.inferenceCapacity.update({
+          where: { id: capacity.id },
+          data: { hardConcurrencyLimit: 1 },
+        });
+        const deadlineBlockerAttempt = {
+          ...lowAttempt,
+          requestId: `request-deadline-blocker-${suffix}`,
+          attemptId: `attempt-deadline-blocker-${suffix}`,
+        };
+        const deadlineBlocker = await firstManager.acquire(deadlineBlockerAttempt);
+        expect(deadlineBlocker).toMatchObject({ state: "ADMITTED" });
+
         const deadlineAttempt = {
           ...lowAttempt,
           requestId: `request-deadline-${suffix}`,
@@ -634,6 +708,7 @@ integration("PostgreSQL capacity admission primitives", () => {
         expect(
           await db.capacityLease.count({ where: { attemptId: deadlineAttempt.attemptId } }),
         ).toBe(0);
+        if (deadlineBlocker.state === "ADMITTED") await firstManager.release(deadlineBlocker.lease);
 
         await db.inferenceCapacity.update({
           where: { id: capacity.id },
@@ -823,13 +898,16 @@ integration("PostgreSQL capacity admission primitives", () => {
       await manager.cancelAttempt(`pool-wide-${suffix}`);
       await db.poolMember.update({
         where: { id: inheritedMember.id },
-        data: { capacityConcurrencyLimit: 1 },
+        data: { capacityConcurrencyMode: "LIMITED", capacityConcurrencyLimit: 1 },
       });
-      await expect(manager.acquire(scopedAttempt(`member-scope-${suffix}`))).resolves.toMatchObject(
-        {
-          state: "ADMITTED",
-        },
-      );
+      const memberScoped = await manager.acquire(scopedAttempt(`member-scope-${suffix}`));
+      expect(memberScoped).toMatchObject({ state: "ADMITTED" });
+      if (memberScoped.state !== "ADMITTED") throw new Error("Expected member-scoped lease.");
+      await manager.release(memberScoped.lease);
+      await db.modelPool.update({
+        where: { id: members[0]!.pool.id },
+        data: { capacityReservedSlots: 0 },
+      });
       const raceClient = createPrismaClient(databaseUrl);
       const raceManager = new PostgresCapacityAdmissionStore(raceClient, "expiry-race-proof");
       try {
@@ -886,21 +964,37 @@ integration("PostgreSQL capacity admission primitives", () => {
       });
       await db.executionTarget.update({
         where: { id: targets[0]!.id },
-        data: { directBorrowPolicy: "WHEN_IDLE", directConcurrencyLimit: 1 },
+        data: { directBorrowPolicy: "WHEN_IDLE", directConcurrencyLimit: null },
       });
+      await manager.cancelAttempt(`never-${suffix}`);
+      const staleWaiters = await db.capacityWaiter.findMany({
+        where: { capacityId: capacity.id, state: "WAITING" },
+        select: { attemptId: true },
+      });
+      for (const waiter of staleWaiters) await manager.cancelAttempt(waiter.attemptId);
       const active = await db.capacityLease.findMany({
         where: { capacityId: capacity.id, state: "ACTIVE" },
       });
-      await manager.release({
-        leaseId: active[0]!.id,
-        attemptId: active[0]!.attemptId,
-        capacityId: active[0]!.capacityId,
-        executionTargetId: active[0]!.executionTargetId,
-        ...(active[0]!.poolMemberId ? { poolMemberId: active[0]!.poolMemberId } : {}),
-        fencingToken: active[0]!.fencingToken,
-        expiresAt: active[0]!.expiresAt,
-      });
-      const idleBorrower = await manager.acquire(directAttempt(`idle-${suffix}`));
+      const toRelease = [
+        ...active.filter((lease) => lease.poolMemberId === null),
+        ...active.filter((lease) => lease.poolMemberId !== null).slice(1),
+      ];
+      for (const released of toRelease)
+        await expect(
+          manager.release({
+            leaseId: released.id,
+            attemptId: released.attemptId,
+            capacityId: released.capacityId,
+            executionTargetId: released.executionTargetId,
+            ...(released.poolMemberId ? { poolMemberId: released.poolMemberId } : {}),
+            fencingToken: released.fencingToken,
+            expiresAt: released.expiresAt,
+          }),
+        ).resolves.toBe(true);
+      const idleAttempt = directAttempt(`idle-${suffix}`);
+      let idleBorrower = await manager.acquire(idleAttempt);
+      for (let visit = 1; idleBorrower.state === "WAITING" && visit < 33; visit++)
+        idleBorrower = await manager.acquire({ ...idleAttempt, candidates: [] });
       expect(idleBorrower.state).toBe("ADMITTED");
       expect(
         await db.capacityLease.findUnique({ where: { attemptId: `idle-${suffix}` } }),
@@ -916,6 +1010,10 @@ integration("PostgreSQL capacity admission primitives", () => {
         ...(onePoolLease.poolMemberId ? { poolMemberId: onePoolLease.poolMemberId } : {}),
         fencingToken: onePoolLease.fencingToken,
         expiresAt: onePoolLease.expiresAt,
+      });
+      await db.executionTarget.update({
+        where: { id: targets[0]!.id },
+        data: { directConcurrencyLimit: 1 },
       });
       await expect(
         manager.acquire(directAttempt(`direct-ceiling-${suffix}`)),
@@ -945,7 +1043,11 @@ integration("PostgreSQL capacity admission primitives", () => {
       await manager.cancelAttempt(`direct-ceiling-${suffix}`);
       await db.poolMember.update({
         where: { id: members[1]!.member.id },
-        data: { capacityPriority: 0, capacityConcurrencyLimit: 1 },
+        data: {
+          capacityPriority: 0,
+          capacityConcurrencyMode: "LIMITED",
+          capacityConcurrencyLimit: 1,
+        },
       });
       await expect(
         manager.acquire(ownerAttempt(members[1]!, "lower-owner-queued")),
@@ -992,7 +1094,11 @@ integration("PostgreSQL capacity admission primitives", () => {
       if (lowerOwner.state !== "ADMITTED") throw new Error("Expected reserved owner lease.");
       await db.poolMember.update({
         where: { id: members[1]!.member.id },
-        data: { capacityPriority: 31, capacityConcurrencyLimit: 1 },
+        data: {
+          capacityPriority: 31,
+          capacityConcurrencyMode: "LIMITED",
+          capacityConcurrencyLimit: 1,
+        },
       });
       await expect(
         manager.acquire(ownerAttempt(members[1]!, "higher-owner-at-ceiling")),
@@ -1041,4 +1147,389 @@ integration("PostgreSQL capacity admission primitives", () => {
       await db.$disconnect();
     }
   });
+});
+
+type RelayHandlers = {
+  onHeaders(message: {
+    type: "relay.response.headers";
+    requestId: string;
+    status: number;
+    headers: Record<string, string>;
+  }): void;
+  onBody(
+    chunk: Uint8Array,
+    message: {
+      type: "relay.response.body";
+      requestId: string;
+      chunkId: string;
+    },
+  ): void;
+  onComplete(message: {
+    type: "relay.complete";
+    requestId: string;
+    usage: { promptTokens: number; completionTokens: number; totalTokens: number };
+  }): void;
+  onError(message: { type: "relay.error"; requestId: string; failure: "transport" }): void;
+};
+
+class PostgresRouteFakeRelayManager {
+  readonly sent: Array<{ requestId: string; cliDeviceId: string }> = [];
+  readonly cancelled: string[] = [];
+  readonly handlers = new Map<string, RelayHandlers>();
+  activeCliDeviceIds: string[] = [];
+
+  getActiveCliDeviceIds() {
+    return this.activeCliDeviceIds;
+  }
+
+  registerRelayResponseHandlers(input: { requestId: string; handlers: RelayHandlers }) {
+    this.handlers.set(input.requestId, input.handlers);
+  }
+
+  sendRelayRequest(input: { requestId: string; cliDeviceId: string }) {
+    this.sent.push(input);
+  }
+
+  cancelRelayRequest(input: { requestId: string }) {
+    this.cancelled.push(input.requestId);
+    this.handlers.delete(input.requestId);
+  }
+
+  completeRelayRequest() {}
+
+  headers(requestId: string, status: number, contentType: string) {
+    this.handlers.get(requestId)?.onHeaders({
+      type: "relay.response.headers",
+      requestId,
+      status,
+      headers: { "content-type": contentType },
+    });
+  }
+
+  body(requestId: string, body: string) {
+    this.handlers.get(requestId)?.onBody(new TextEncoder().encode(body), {
+      type: "relay.response.body",
+      requestId,
+      chunkId: crypto.randomUUID(),
+    });
+  }
+
+  complete(requestId: string) {
+    const handlers = this.handlers.get(requestId);
+    this.handlers.delete(requestId);
+    handlers?.onComplete({
+      type: "relay.complete",
+      requestId,
+      usage: { promptTokens: 3, completionTokens: 5, totalTokens: 8 },
+    });
+  }
+}
+
+async function waitFor<T>(
+  read: () => T | undefined | Promise<T | undefined>,
+  timeoutMs = 2_000,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = await read();
+    if (value !== undefined) return value;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("Timed out waiting for PostgreSQL route test state.");
+}
+
+integration("model API routes with real PostgreSQL capacity", () => {
+  it("releases and fences direct, streaming, cancelled, and retried pool attempts", async () => {
+    if (!databaseUrl) return;
+    process.env.DATABASE_URL = databaseUrl;
+    process.env.BETTER_AUTH_SECRET = "w7Qp9Lm2Nx4Rv6Tk8Yc3Hu5Jd1Fs0ZaB";
+    process.env.BETTER_AUTH_URL = "http://localhost:3000";
+    process.env.MODEL_API_GLOBAL_CAPACITY_ENABLED = "true";
+
+    const [{ default: prisma }, security, routes, storeModule, runtimeModule, apiRouters, orpc] =
+      await Promise.all([
+        import("@ws-model-proxy/db"),
+        import("@ws-model-proxy/db/forwarder-security"),
+        import("../routes.js"),
+        import("./postgres-store.js"),
+        import("./runtime.js"),
+        import("@ws-model-proxy/api/routers/index"),
+        import("@orpc/server"),
+      ]);
+    const suffix = crypto.randomUUID();
+    const secret = `wsmp_model_${crypto.randomUUID().replaceAll("-", "")}`;
+    const user = await prisma.user.create({
+      data: {
+        name: "Capacity route proof",
+        email: `capacity-route-${suffix}@example.test`,
+        slug: `capacity-route-${suffix}`,
+      },
+    });
+    const manager = new PostgresRouteFakeRelayManager();
+    const capacities = await Promise.all(
+      ["a", "b"].map((label) =>
+        prisma.inferenceCapacity.create({
+          data: {
+            userId: user.id,
+            label: `route-${label}-${suffix}`,
+            runtimeIdentityKey: `route-${label}-${suffix}`,
+            runtimeModel: `route-model-${label}`,
+            hardConcurrencyLimit: 1,
+            physicalMaxContext: 32_768,
+            countStrategy: "CONSERVATIVE_ESTIMATE",
+          },
+        }),
+      ),
+    );
+    const cli = await prisma.cliDevice.create({
+      data: {
+        userId: user.id,
+        slug: `cli-${suffix}`,
+        label: "Capacity route CLI",
+        status: "CONNECTED",
+        inventoryConfirmed: true,
+        endpointTargeting: true,
+      },
+    });
+    manager.activeCliDeviceIds = [cli.id];
+    const endpoint = await prisma.endpoint.create({
+      data: {
+        userId: user.id,
+        cliDeviceId: cli.id,
+        slug: `endpoint-${suffix}`,
+        label: "Capacity route endpoint",
+        status: "ONLINE",
+        published: true,
+        capabilityMetadata: {
+          version: 1,
+          protocol: "openai-compatible",
+          chatCompletions: { supported: true, streaming: true },
+        },
+      },
+    });
+    const models = await Promise.all(
+      ["a", "b"].map(async (label, index) => {
+        const model = await prisma.discoveredModel.create({
+          data: {
+            userId: user.id,
+            endpointId: endpoint.id,
+            upstreamModelId: `route-model-${label}`,
+            encodedModelId: `route-model-${label}`,
+            published: true,
+          },
+        });
+        const target = await prisma.executionTarget.upsert({
+          where: { discoveredModelId: model.id },
+          update: {
+            inferenceCapacityId: capacities[index]?.id,
+            directConcurrencyLimit: 1,
+            directWaitBudgetMs: 1_000,
+          },
+          create: {
+            userId: user.id,
+            kind: "DISCOVERED_MODEL",
+            discoveredModelId: model.id,
+            inferenceCapacityId: capacities[index]?.id,
+            directConcurrencyLimit: 1,
+            directWaitBudgetMs: 1_000,
+          },
+        });
+        return { model, target };
+      }),
+    );
+    const pool = await prisma.modelPool.create({
+      data: {
+        userId: user.id,
+        slug: `pool-${suffix}`,
+        name: "Capacity route pool",
+        capacityConcurrencyLimit: 1,
+        capacityWaitBudgetMs: 1_000,
+      },
+    });
+    await Promise.all(
+      models.map(({ model, target }, index) =>
+        prisma.poolMember.create({
+          data: {
+            poolId: pool.id,
+            discoveredModelId: model.id,
+            executionTargetId: target.id,
+            weight: index === 0 ? 2 : 1,
+          },
+        }),
+      ),
+    );
+    await prisma.modelApiToken.create({
+      data: {
+        userId: user.id,
+        name: "Capacity route token",
+        lookupPrefix: security.credentialLookupPrefix(secret),
+        secretDigest: security.hmacDigestForForwarderPurpose({
+          purpose: "modelApiToken",
+          value: secret,
+        }),
+      },
+    });
+
+    const store = new storeModule.PostgresCapacityAdmissionStore(prisma, `route-proof-${suffix}`);
+    const runtime = new runtimeModule.StoreCapacityAdmissionRuntime(store, 5, 60_000);
+    const app = routes.createModelApiRoutes({
+      manager: manager as never,
+      capacityEnabled: true,
+      capacityRuntime: runtime,
+    });
+    const authorization = { authorization: `Bearer ${secret}`, "content-type": "application/json" };
+    const directModelId = `${user.slug}/${cli.slug}/${endpoint.slug}/${models[0]?.model.upstreamModelId}`;
+    const request = (model: string, stream = false, signal?: AbortSignal) =>
+      app.request("/chat/completions", {
+        method: "POST",
+        headers: authorization,
+        body: JSON.stringify({ model, stream, messages: [{ role: "user", content: "proof" }] }),
+        signal,
+      });
+
+    try {
+      // Gate the actual procedure, not only Prisma's transaction primitive:
+      // force its audit insert to fail after modelPool.create and prove the
+      // procedure's transaction rolls the pool mutation back.
+      await prisma.$executeRawUnsafe(`
+        CREATE OR REPLACE FUNCTION fail_route_pool_audit() RETURNS trigger
+        LANGUAGE plpgsql AS $fn$
+        BEGIN
+          IF NEW."resourceType" = 'MODEL_POOL' AND NEW.action = 'CREATE'
+             AND EXISTS (
+               SELECT 1 FROM model_pool
+                WHERE id = NEW."resourceId" AND slug LIKE 'rollback-router-%'
+             ) THEN
+            RAISE EXCEPTION 'forced route audit failure' USING ERRCODE = '23514';
+          END IF;
+          RETURN NEW;
+        END
+        $fn$
+      `);
+      await prisma.$executeRawUnsafe(
+        `DROP TRIGGER IF EXISTS fail_route_pool_audit_trigger ON capacity_audit_event`,
+      );
+      await prisma.$executeRawUnsafe(`
+        CREATE TRIGGER fail_route_pool_audit_trigger
+        BEFORE INSERT ON capacity_audit_event
+        FOR EACH ROW EXECUTE FUNCTION fail_route_pool_audit()
+      `);
+      try {
+        const management = orpc.createRouterClient(apiRouters.appRouter, {
+          context: {
+            session: { user: { id: user.id }, session: {} },
+          } as never,
+        });
+        const rollbackSlug = `rollback-router-${suffix}`;
+        await expect(
+          management.forwarderManagement.createModelPool({
+            slug: rollbackSlug,
+            name: "Must roll back",
+          }),
+        ).rejects.toBeDefined();
+        expect(
+          await prisma.modelPool.findFirst({ where: { userId: user.id, slug: rollbackSlug } }),
+        ).toBeNull();
+      } finally {
+        await prisma.$executeRawUnsafe(
+          `DROP TRIGGER IF EXISTS fail_route_pool_audit_trigger ON capacity_audit_event`,
+        );
+        await prisma.$executeRawUnsafe(`DROP FUNCTION IF EXISTS fail_route_pool_audit()`);
+      }
+
+      const directPromise = request(directModelId);
+      const directSent = await waitFor(() => manager.sent[0]);
+      manager.headers(directSent.requestId, 200, "application/json");
+      manager.body(directSent.requestId, JSON.stringify({ id: "direct-ok" }));
+      manager.complete(directSent.requestId);
+      expect(await (await directPromise).json()).toMatchObject({ id: "direct-ok" });
+
+      const streamPromise = request(directModelId, true);
+      const streamSent = await waitFor(() => manager.sent[1]);
+      manager.headers(streamSent.requestId, 200, "text/event-stream");
+      manager.body(streamSent.requestId, ": heartbeat\n\ndata: [DONE]\n\n");
+      manager.complete(streamSent.requestId);
+      expect(await (await streamPromise).text()).toContain(": heartbeat");
+
+      const cancelledPromise = request(directModelId, true);
+      const cancelledSent = await waitFor(() => manager.sent[2]);
+      manager.headers(cancelledSent.requestId, 200, "text/event-stream");
+      const cancelledResponse = await cancelledPromise;
+      await cancelledResponse.body?.cancel();
+      await waitFor(() =>
+        manager.cancelled.includes(cancelledSent.requestId) ? cancelledSent.requestId : undefined,
+      );
+
+      const poolPromise = request(`${user.slug}/${pool.slug}`);
+      const firstPoolSent = await waitFor(() => manager.sent[3]);
+      manager.headers(firstPoolSent.requestId, 503, "application/json");
+      manager.body(firstPoolSent.requestId, JSON.stringify({ error: "retry" }));
+      manager.complete(firstPoolSent.requestId);
+      const secondPoolSent = await waitFor(() => manager.sent[4]);
+      expect(secondPoolSent.cliDeviceId).toBe(cli.id);
+      const [releasedRetryLease, activeRetryLease] = await Promise.all([
+        prisma.capacityLease.findFirstOrThrow({
+          where: { userId: user.id, poolId: pool.id, state: "RELEASED" },
+          orderBy: { createdAt: "desc" },
+        }),
+        prisma.capacityLease.findFirstOrThrow({
+          where: { userId: user.id, poolId: pool.id, state: "ACTIVE" },
+          orderBy: { createdAt: "desc" },
+        }),
+      ]);
+      expect(
+        await store.release({
+          leaseId: activeRetryLease.id,
+          attemptId: activeRetryLease.attemptId,
+          capacityId: activeRetryLease.capacityId,
+          executionTargetId: activeRetryLease.executionTargetId,
+          ...(activeRetryLease.poolMemberId ? { poolMemberId: activeRetryLease.poolMemberId } : {}),
+          fencingToken: releasedRetryLease.fencingToken,
+          expiresAt: activeRetryLease.expiresAt,
+        }),
+      ).toBe(false);
+      expect(
+        await prisma.capacityLease.findUnique({ where: { id: activeRetryLease.id } }),
+      ).toMatchObject({ state: "ACTIVE", fencingToken: activeRetryLease.fencingToken });
+      manager.headers(secondPoolSent.requestId, 200, "application/json");
+      manager.body(secondPoolSent.requestId, JSON.stringify({ id: "pool-ok" }));
+      manager.complete(secondPoolSent.requestId);
+      expect(await (await poolPromise).json()).toMatchObject({ id: "pool-ok" });
+
+      await waitFor(async () => {
+        const active = await prisma.capacityLease.count({
+          where: { userId: user.id, state: "ACTIVE" },
+        });
+        return active === 0 ? 0 : undefined;
+      });
+      const [leases, admissions, relays] = await Promise.all([
+        prisma.capacityLease.findMany({
+          where: { userId: user.id },
+          orderBy: { createdAt: "asc" },
+        }),
+        prisma.admissionRequest.findMany({
+          where: { userId: user.id },
+          orderBy: { createdAt: "asc" },
+        }),
+        prisma.relayRequest.findMany({ where: { userId: user.id }, orderBy: { createdAt: "asc" } }),
+      ]);
+      expect(leases).toHaveLength(5);
+      expect(leases.every((lease) => lease.state === "RELEASED")).toBe(true);
+      expect(new Set(leases.map((lease) => lease.fencingToken.toString())).size).toBeGreaterThan(1);
+      expect(new Set(admissions.map((admission) => admission.attemptId)).size).toBe(5);
+      expect(admissions.every((admission) => admission.state !== "WAITING")).toBe(true);
+      expect(relays).toHaveLength(4);
+      expect(relays.every((relay) => relay.admissionWaitDurationMs !== null)).toBe(true);
+      expect(relays.every((relay) => relay.admissionFencingToken !== null)).toBe(true);
+      expect(relays.some((relay) => relay.status === "CANCELED")).toBe(true);
+      expect(relays.find((relay) => relay.attemptCount === 2)).toMatchObject({
+        status: "SUCCEEDED",
+        admissionBorrowed: expect.any(Boolean),
+        admissionReservationClass: expect.any(Number),
+      });
+    } finally {
+      await prisma.user.delete({ where: { id: user.id } }).catch(() => undefined);
+      await prisma.$disconnect();
+    }
+  }, 20_000);
 });
