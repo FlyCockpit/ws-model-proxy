@@ -443,6 +443,44 @@ describe("modelApiTokensRouter", () => {
       expect(result.directModels.map((model) => model.id)).toEqual([modelIds.directModelId]);
       expect(result.modelPools.map((pool) => pool.id)).toEqual([modelIds.grantedPoolId]);
     });
+
+    it("does not reflect a guessed foreign model id through preview or create HTTP envelopes", async () => {
+      seedVisibleModels();
+      mockTokenCreate();
+      const foreignModelId = directModelId({
+        userSlug: "foreign-owner",
+        cliSlug: "foreign-cli",
+        endpointSlug: "foreign-endpoint",
+        upstreamModelId: "foreign-model",
+      });
+      const captures: Array<{ status: number; body: string }> = [];
+      const rpc = httpClient(captures);
+
+      const results = await Promise.allSettled([
+        rpc.preview({ scopeMode: "ALLOWLIST", modelIds: [foreignModelId] }),
+        rpc.create({ name: "Foreign target", scopeMode: "ALLOWLIST", modelIds: [foreignModelId] }),
+      ]);
+
+      for (const result of results) {
+        expect(result.status).toBe("rejected");
+        if (result.status === "rejected")
+          expect(result.reason).toMatchObject({ code: "FORBIDDEN" });
+      }
+      expect(captures).toHaveLength(2);
+      for (const capture of captures) {
+        expect(capture.status).toBe(403);
+        expect(capture.body).toContain("FORBIDDEN");
+        expect(capture.body).not.toContain(foreignModelId);
+        for (const fragment of [
+          "foreign-owner",
+          "foreign-cli",
+          "foreign-endpoint",
+          "foreign-model",
+        ])
+          expect(capture.body).not.toContain(fragment);
+      }
+      expect(db.modelApiToken.create).not.toHaveBeenCalled();
+    });
   });
 
   describe("revoke", () => {

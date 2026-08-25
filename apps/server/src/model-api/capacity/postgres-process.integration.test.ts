@@ -42,9 +42,10 @@ function startWorker(command: unknown) {
     command !== null &&
     "operation" in command &&
     command.operation === "production-server";
+  const applicationName = production ? `wsmp-prod-${crypto.randomUUID()}` : undefined;
   const workerDatabaseUrl =
-    production && databaseUrl
-      ? `${databaseUrl}${databaseUrl.includes("?") ? "&" : "?"}application_name=wsmp-production-process-proof`
+    applicationName && databaseUrl
+      ? `${databaseUrl}${databaseUrl.includes("?") ? "&" : "?"}application_name=${encodeURIComponent(applicationName)}`
       : databaseUrl;
   const child = spawn(
     process.execPath,
@@ -74,7 +75,7 @@ function startWorker(command: unknown) {
       reject(new Error(`capacity worker exited ${code ?? signal}: ${stderr}`));
     });
   });
-  return { child, result };
+  return { child, result, applicationName };
 }
 
 async function stop(child: ChildProcess) {
@@ -896,15 +897,34 @@ integration("capacity admission across operating-system processes", () => {
 
       const interrupted = request(ports[0]!);
       const controlled = await waitFor(() => upstreamResponses.shift(), 10_000);
-      const backendRows = await db.$queryRaw<Array<{ pid: number }>>`
+      const selectedApplicationName = workers[0]!.applicationName;
+      if (!selectedApplicationName) throw new Error("Production worker application name missing.");
+      const backendRows = await waitFor(() =>
+        db.$queryRaw<Array<{ pid: number }>>`
         SELECT pid FROM pg_stat_activity
-         WHERE application_name = 'wsmp-production-process-proof'
-           AND pid <> pg_backend_pid()`;
-      expect(backendRows.length).toBeGreaterThan(0);
-      await db.$executeRaw`
-        SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-         WHERE application_name = 'wsmp-production-process-proof'
-           AND pid <> pg_backend_pid()`;
+         WHERE application_name = ${selectedApplicationName}
+           AND pid <> pg_backend_pid()`.then((rows) => (rows.length > 0 ? rows : undefined)),
+      );
+      const selectedBackendPids = backendRows.map((row) => row.pid);
+      expect(selectedBackendPids.length).toBeGreaterThan(0);
+      const terminated = await Promise.all(
+        selectedBackendPids.map(
+          (pid) =>
+            db.$queryRaw<Array<{ terminated: boolean }>>`
+            SELECT pg_terminate_backend(${pid}) AS terminated`,
+        ),
+      );
+      expect(terminated).toEqual(selectedBackendPids.map(() => [{ terminated: true }]));
+      await waitFor(async () => {
+        const presence = await Promise.all(
+          selectedBackendPids.map(
+            (pid) =>
+              db.$queryRaw<Array<{ present: boolean }>>`
+              SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid = ${pid}) AS present`,
+          ),
+        );
+        return presence.every((rows) => rows[0]?.present === false) ? true : undefined;
+      });
       controlled.response.destroy(new Error("database connectivity interruption"));
       const fallback = await waitFor(
         () => upstreamResponses.find((entry) => entry.path.includes("/secondary/")),
