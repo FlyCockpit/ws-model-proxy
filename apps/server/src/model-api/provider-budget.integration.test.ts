@@ -302,8 +302,9 @@ integration("provider budget admission and reconciliation", () => {
       tokens: 5n,
       accountingVersion: "usage-v1",
     });
-    await expect(service.admitProviderBudget(original)).resolves.toEqual({
+    await expect(service.admitProviderBudget(original)).resolves.toMatchObject({
       admitted: true,
+      providerAttemptId: expect.any(String),
       reservationIds: [],
     });
     await service.reconcileProviderBudget({
@@ -879,7 +880,11 @@ integration("provider budget admission and reconciliation", () => {
     ]);
     await expect(
       service.admitProviderBudget(attempt(allUnlimited, `all-unlimited-${crypto.randomUUID()}`)),
-    ).resolves.toEqual({ admitted: true, reservationIds: [] });
+    ).resolves.toMatchObject({
+      admitted: true,
+      providerAttemptId: expect.any(String),
+      reservationIds: [],
+    });
 
     const mixed = await fixture({ noPolicy: true });
     await policy(mixed, [

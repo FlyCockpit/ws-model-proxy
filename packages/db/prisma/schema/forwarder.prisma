@@ -629,30 +629,42 @@ model ProviderAttempt {
 /// Immutable, prompt-free execution telemetry. Database hardening makes this
 /// append-only just like the usage ledger.
 model PublicProviderAttemptEvent {
-  id                String           @id @default(cuid(2))
-  createdAt         DateTime         @default(now())
-  userId            String
-  providerAccountId String
-  providerModelId   String
-  providerAttemptId String?
-  requestId         String
-  attemptId         String
-  fencingToken      BigInt?
-  eventType         String
-  reason            String?
-  requestedSurface  String?
-  nativeSurface     String?
-  adapterMode       String?
-  adapterVersion    String?
-  waitDurationMs    Int?
-  reservationId     String?
-  contextTokens     BigInt?
-  usage             Json?
-  metadata          Json?
-  User              User             @relation("PublicProviderAttemptEventOwner", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  ProviderAccount   ProviderAccount  @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  ProviderModel     ProviderModel    @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  ProviderAttempt   ProviderAttempt? @relation(fields: [providerAttemptId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  id                     String           @id @default(cuid(2))
+  createdAt              DateTime         @default(now())
+  userId                 String
+  providerAccountId      String
+  providerModelId        String
+  providerAttemptId      String?
+  requestId              String
+  attemptId              String
+  fencingToken           BigInt?
+  eventType              String
+  reason                 String?
+  requestedSurface       String?
+  nativeSurface          String?
+  adapterMode            String?
+  adapterVersion         String?
+  poolId                 String?
+  poolMemberId           String?
+  executionTargetId      String?
+  memberTier             String?
+  triggerReason          String?
+  affinityOutcome        String?
+  contextCountMethod     String?
+  contextCountConfidence String?
+  waitDurationMs         Int?
+  reservationId          String?
+  reservationIds         Json?
+  contextTokens          BigInt?
+  firstClientByteAt      DateTime?
+  streamCommitted        Boolean?
+  terminalState          String?
+  usage                  Json?
+  metadata               Json?
+  User                   User             @relation("PublicProviderAttemptEventOwner", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  ProviderAccount        ProviderAccount  @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  ProviderModel          ProviderModel    @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  ProviderAttempt        ProviderAttempt? @relation(fields: [providerAttemptId], references: [id], onDelete: Restrict, onUpdate: Cascade)
 
   @@index([userId, createdAt])
   @@index([attemptId, fencingToken, createdAt])

@@ -53,6 +53,7 @@ import {
   type CapacityAdmissionRuntime,
   StoreCapacityAdmissionRuntime,
 } from "./capacity/runtime.js";
+import { responseWithFirstClientByte } from "./client-byte-commit.js";
 import {
   MODEL_API_MAX_REQUEST_BODY_BYTES,
   MODEL_API_RELAY_TIMEOUT_MS,
@@ -2873,6 +2874,8 @@ async function relayPool({
         requestedOutputTokens,
       }),
       requestedOutputTokens,
+      contextCountMethod: operation.contextCount?.method,
+      contextCountConfidence: operation.contextCount?.confidence,
       renderForTarget: canonical
         ? async (providerTarget, targetSurface) => {
             const payload = renderCanonicalRequest({
@@ -2944,7 +2947,10 @@ async function relayPool({
     // Native response bytes remain opaque. Cross-protocol provider response
     // adaptation is handled by the same strict streaming/non-streaming state
     // machines as local targets.
-    if (result.nativeSurface === requestedSurface || !operation.adaptation) return result.response;
+    const commitAwareResponse = (response: Response) =>
+      responseWithFirstClientByte(response, result.markFirstClientByte);
+    if (result.nativeSurface === requestedSurface || !operation.adaptation)
+      return commitAwareResponse(result.response);
     const source: ProtocolSurface = result.nativeSurface;
     // Providers return ordinary JSON error envelopes even when the successful
     // operation would have streamed. Adapt that envelope as JSON; never feed
@@ -2959,33 +2965,37 @@ async function relayPool({
         headers: result.response.headers,
         signal: request.signal,
       });
-      return new Response(adapted, {
-        status: result.response.status,
-        headers: {
-          "content-type": "application/json; charset=utf-8",
-          "x-wsmp-adapter-version": "1.0.0",
-        },
-      });
+      return commitAwareResponse(
+        new Response(adapted, {
+          status: result.response.status,
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+            "x-wsmp-adapter-version": "1.0.0",
+          },
+        }),
+      );
     }
     if (operation.stream) {
       if (!result.response.body) return result.response;
-      return new Response(
-        adaptedResponseBody({
-          body: result.response.body,
-          source,
-          target: operation.adaptation.requestedSurface,
-          stream: true,
-          status: result.response.status,
-          headers: result.response.headers,
-          signal: request.signal,
-        }),
-        {
-          status: result.response.status,
-          headers: {
-            "content-type": "text/event-stream; charset=utf-8",
-            "x-wsmp-adapter-version": "1.0.0",
+      return commitAwareResponse(
+        new Response(
+          adaptedResponseBody({
+            body: result.response.body,
+            source,
+            target: operation.adaptation.requestedSurface,
+            stream: true,
+            status: result.response.status,
+            headers: result.response.headers,
+            signal: request.signal,
+          }),
+          {
+            status: result.response.status,
+            headers: {
+              "content-type": "text/event-stream; charset=utf-8",
+              "x-wsmp-adapter-version": "1.0.0",
+            },
           },
-        },
+        ),
       );
     }
     const bytes = new Uint8Array(await result.response.arrayBuffer());
@@ -3002,13 +3012,15 @@ async function relayPool({
       headers: result.response.headers,
       signal: request.signal,
     });
-    return new Response(adapted, {
-      status: result.response.status,
-      headers: {
-        "content-type": "application/json; charset=utf-8",
-        "x-wsmp-adapter-version": "1.0.0",
-      },
-    });
+    return commitAwareResponse(
+      new Response(adapted, {
+        status: result.response.status,
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "x-wsmp-adapter-version": "1.0.0",
+        },
+      }),
+    );
   };
 
   let globalLease: ModelApiLimitLease | undefined;

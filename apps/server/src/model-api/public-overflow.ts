@@ -61,6 +61,8 @@ export interface PublicOverflowRequest {
   signal: AbortSignal;
   liability: ProviderLiability;
   requestedOutputTokens: bigint;
+  contextCountMethod?: string;
+  contextCountConfidence?: string;
   /** Must be called before credential decryption or any network attempt. */
   releaseLocalCapacity: () => Promise<void>;
   adaptationEnabled: boolean;
@@ -104,6 +106,34 @@ export interface PublicProviderTarget {
     ciphertext: Uint8Array<ArrayBuffer>;
     nonce: Uint8Array<ArrayBuffer>;
     authTag: Uint8Array<ArrayBuffer>;
+  };
+}
+
+function providerEventRouting(input: {
+  request: PublicOverflowRequest;
+  target: PublicProviderTarget;
+  nativeSurface?: ProtocolSurface;
+}) {
+  return {
+    requestedSurface: input.request.requestedSurface,
+    nativeSurface: input.nativeSurface,
+    adapterMode: input.nativeSurface
+      ? input.nativeSurface === input.request.requestedSurface
+        ? "native"
+        : "adapted"
+      : undefined,
+    adapterVersion:
+      input.nativeSurface && input.nativeSurface !== input.request.requestedSurface
+        ? "1.0.0"
+        : undefined,
+    poolId: input.request.poolId,
+    poolMemberId: input.target.poolMemberId,
+    executionTargetId: input.target.executionTargetId,
+    memberTier: "PUBLIC_OVERFLOW",
+    triggerReason: input.request.reason,
+    affinityOutcome: "NONE",
+    contextCountMethod: input.request.contextCountMethod,
+    contextCountConfidence: input.request.contextCountConfidence,
   };
 }
 
@@ -220,6 +250,8 @@ export type PublicOverflowResult =
       nativeSurface: ProtocolSurface;
       attemptCount: number;
       terminal: Promise<{ ok: boolean; responseBytes: number }>;
+      /** Record commitment only when the final rendered response emits a byte. */
+      markFirstClientByte: () => Promise<void>;
     }
   | { dispatched: false; reason: PublicOverflowSkipReason; detail?: string };
 
@@ -544,7 +576,7 @@ export async function dispatchPublicOverflow(
           attemptId: `${request.requestId}:compatibility-skip:${target.providerModelId}`,
           eventType: "SKIP",
           reason: publicTargetCompatibility(target, request),
-          requestedSurface: request.requestedSurface,
+          ...providerEventRouting({ request, target }),
         }),
       ),
     );
@@ -559,14 +591,30 @@ export async function dispatchPublicOverflow(
   let attemptCount = 0;
 
   for (const target of compatible) {
-    attemptCount += 1;
     const nativeSurface = selectedNativeSurface(target, request.requestedSurface);
     if (!nativeSurface) continue;
+    attemptCount += 1;
     const attemptId = crypto.randomUUID();
-    const fencingToken = await allocateProviderFence({
-      userId: request.userId,
-      providerAccountId: target.providerAccountId,
-    });
+    let fencingToken: bigint;
+    try {
+      fencingToken = await allocateProviderFence({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+      });
+    } catch {
+      await recordProviderAttemptEvent({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        requestId: request.requestId,
+        attemptId,
+        eventType: "TERMINAL",
+        reason: "FENCE_ALLOCATION_FAILED",
+        ...providerEventRouting({ request, target, nativeSurface }),
+        terminalState: "FAILED",
+      }).catch(() => undefined);
+      continue;
+    }
     let upstream: { protocol: ProviderProtocol; path: string; headers: Headers; body: Uint8Array };
     try {
       upstream =
@@ -579,29 +627,76 @@ export async function dispatchPublicOverflow(
             }
           : await request.renderForTarget!(target, nativeSurface);
     } catch {
+      await recordProviderAttemptEvent({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        eventType: "TERMINAL",
+        reason: "REQUEST_RENDER_FAILED",
+        ...providerEventRouting({ request, target, nativeSurface }),
+        terminalState: "SKIPPED",
+      }).catch(() => undefined);
       continue;
     }
     const renderedLiability = conservativeProviderLiability({
       estimatedInputTokens: conservativeSerializedInputTokens(upstream.body.byteLength),
       requestedOutputTokens: request.requestedOutputTokens,
     });
-    if (
-      publicTargetCompatibility(target, { ...request, liability: renderedLiability }) !==
-      "COMPATIBLE"
-    )
-      continue;
-    const admission = await admitProviderBudget({
-      userId: request.userId,
-      providerAccountId: target.providerAccountId,
-      providerModelId: target.providerModelId,
-      credentialId: target.credential.id,
-      poolId: request.poolId,
-      requestId: request.requestId,
-      attemptId,
-      fencingToken,
+    const renderedCompatibility = publicTargetCompatibility(target, {
+      ...request,
       liability: renderedLiability,
-      expiresAt: new Date(Date.now() + 15 * 60_000),
     });
+    if (renderedCompatibility !== "COMPATIBLE") {
+      await recordProviderAttemptEvent({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        eventType: "TERMINAL",
+        reason: renderedCompatibility,
+        ...providerEventRouting({ request, target, nativeSurface }),
+        contextTokens: renderedLiability.tokens,
+        terminalState: "SKIPPED",
+      }).catch(() => undefined);
+      continue;
+    }
+    const admissionStartedAt = Date.now();
+    let admission: ProviderBudgetAdmission;
+    try {
+      admission = await admitProviderBudget({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        credentialId: target.credential.id,
+        poolId: request.poolId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        liability: renderedLiability,
+        expiresAt: new Date(Date.now() + 15 * 60_000),
+      });
+    } catch {
+      await recordProviderAttemptEvent({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        eventType: "TERMINAL",
+        reason: "BUDGET_ADMISSION_FAILED",
+        ...providerEventRouting({ request, target, nativeSurface }),
+        contextTokens: renderedLiability.tokens,
+        terminalState: "FAILED",
+      }).catch(() => undefined);
+      continue;
+    }
+    const providerWaitDurationMs = Math.max(0, Date.now() - admissionStartedAt);
     lastAdmission = admission;
     if (!admission.admitted) {
       await recordProviderAttemptEvent({
@@ -611,13 +706,16 @@ export async function dispatchPublicOverflow(
         requestId: request.requestId,
         attemptId,
         fencingToken,
-        eventType: "SKIP",
+        eventType: "TERMINAL",
         reason: admission.reason,
-        requestedSurface: request.requestedSurface,
-        nativeSurface,
+        ...providerEventRouting({ request, target, nativeSurface }),
+        waitDurationMs: providerWaitDurationMs,
+        contextTokens: renderedLiability.tokens,
+        terminalState: "SKIPPED",
       }).catch(() => undefined);
       continue;
     }
+    const providerAttemptId = admission.providerAttemptId;
 
     const healthClaim = await claimProviderHealthTrial({
       userId: request.userId,
@@ -647,13 +745,18 @@ export async function dispatchPublicOverflow(
         userId: request.userId,
         providerAccountId: target.providerAccountId,
         providerModelId: target.providerModelId,
+        providerAttemptId,
         requestId: request.requestId,
         attemptId,
         fencingToken,
-        eventType: "SKIP",
+        eventType: "TERMINAL",
         reason: "PROVIDER_HEALTH_COOLDOWN",
-        requestedSurface: request.requestedSurface,
-        nativeSurface,
+        ...providerEventRouting({ request, target, nativeSurface }),
+        reservationId: admission.reservationIds[0],
+        reservationIds: admission.reservationIds,
+        waitDurationMs: providerWaitDurationMs,
+        contextTokens: renderedLiability.tokens,
+        terminalState: "FAILED",
       }).catch(() => undefined);
       continue;
     }
@@ -662,15 +765,16 @@ export async function dispatchPublicOverflow(
       userId: request.userId,
       providerAccountId: target.providerAccountId,
       providerModelId: target.providerModelId,
+      providerAttemptId,
       requestId: request.requestId,
       attemptId,
       fencingToken,
       eventType: "DISPATCH",
       reason: request.reason,
-      requestedSurface: request.requestedSurface,
-      nativeSurface,
-      adapterMode: nativeSurface === request.requestedSurface ? "native" : "adapted",
-      adapterVersion: nativeSurface === request.requestedSurface ? undefined : "1.0.0",
+      ...providerEventRouting({ request, target, nativeSurface }),
+      reservationId: admission.reservationIds[0],
+      reservationIds: admission.reservationIds,
+      waitDurationMs: providerWaitDurationMs,
       contextTokens: renderedLiability.tokens,
       metadata: { healthClaim },
     }).catch(() => undefined);
@@ -747,13 +851,18 @@ export async function dispatchPublicOverflow(
           userId: request.userId,
           providerAccountId: target.providerAccountId,
           providerModelId: target.providerModelId,
+          providerAttemptId,
           requestId: request.requestId,
           attemptId,
           fencingToken,
-          eventType: "RETRY",
+          eventType: "TERMINAL",
           reason: classifyProviderFailure(status),
-          requestedSurface: request.requestedSurface,
-          nativeSurface,
+          ...providerEventRouting({ request, target, nativeSurface }),
+          reservationId: admission.reservationIds[0],
+          reservationIds: admission.reservationIds,
+          waitDurationMs: providerWaitDurationMs,
+          terminalState: "FAILED",
+          contextTokens: renderedLiability.tokens,
         }).catch(() => undefined);
         continue;
       }
@@ -769,6 +878,8 @@ export async function dispatchPublicOverflow(
       }, 10_000);
       heartbeatTimer.unref();
       let responseBytes = 0;
+      let firstClientByteAt: Date | undefined;
+      let firstClientBytePersistence: Promise<void> | undefined;
       const usageChunks: Uint8Array[] = [];
       let usageBytes = 0;
       let resolveTerminal!: (value: { ok: boolean; responseBytes: number }) => void;
@@ -811,22 +922,36 @@ export async function dispatchPublicOverflow(
           state,
           reason: terminalReason(request.signal, ok),
         }).catch(() => false);
+        // If client commitment already began, retain event creation order
+        // without ever making client delivery wait for telemetry persistence.
+        await firstClientBytePersistence;
         await recordProviderAttemptEvent({
           userId: request.userId,
           providerAccountId: target.providerAccountId,
           providerModelId: target.providerModelId,
+          providerAttemptId,
           requestId: request.requestId,
           attemptId,
           fencingToken,
           eventType: "TERMINAL",
           reason: terminalReason(request.signal, ok),
-          requestedSurface: request.requestedSurface,
-          nativeSurface,
-          adapterMode: nativeSurface === request.requestedSurface ? "native" : "adapted",
+          ...providerEventRouting({ request, target, nativeSurface }),
+          reservationId: admission.reservationIds[0],
+          reservationIds: admission.reservationIds,
+          waitDurationMs: providerWaitDurationMs,
+          terminalState: state,
+          firstClientByteAt,
+          streamCommitted: firstClientByteAt !== undefined,
           usage: usage
             ? {
                 inputTokens: usage.inputTokens?.toString() ?? null,
                 outputTokens: usage.outputTokens?.toString() ?? null,
+                cacheReadTokens: usage.cacheReadTokens?.toString() ?? null,
+                cacheWriteTokens: usage.cacheWriteTokens?.toString() ?? null,
+                reasoningTokens: usage.reasoningTokens?.toString() ?? null,
+                toolTokens: usage.toolTokens?.toString() ?? null,
+                categoriesComplete: usage.categoriesComplete ?? null,
+                accountingVersion: usage.accountingVersion,
                 confidence: usage.confidence,
               }
             : undefined,
@@ -866,6 +991,35 @@ export async function dispatchPublicOverflow(
         response.destroy();
         await reconcile(true);
       }
+      const markFirstClientByte = async () => {
+        if (firstClientByteAt) return;
+        firstClientByteAt = new Date();
+        firstClientBytePersistence = Promise.allSettled([
+          prisma.relayRequest.updateMany({
+            where: { id: request.requestId, providerAttemptId: attemptId },
+            data: { streamCommitted: true },
+          }),
+          recordProviderAttemptEvent({
+            userId: request.userId,
+            providerAccountId: target.providerAccountId,
+            providerModelId: target.providerModelId,
+            providerAttemptId,
+            requestId: request.requestId,
+            attemptId,
+            fencingToken,
+            eventType: "FIRST_CLIENT_BYTE",
+            reason: "RESPONSE_COMMITTED",
+            ...providerEventRouting({ request, target, nativeSurface }),
+            reservationId: admission.reservationIds[0],
+            reservationIds: admission.reservationIds,
+            waitDurationMs: providerWaitDurationMs,
+            contextTokens: renderedLiability.tokens,
+            firstClientByteAt,
+            streamCommitted: true,
+          }),
+        ]).then(() => undefined);
+        await firstClientBytePersistence;
+      };
       return {
         dispatched: true,
         target,
@@ -874,6 +1028,7 @@ export async function dispatchPublicOverflow(
         nativeSurface,
         attemptCount,
         terminal,
+        markFirstClientByte,
         response: new Response(bodyForbidden ? null : heldBody, {
           status,
           headers: responseHeaders(response.headers),
@@ -906,6 +1061,24 @@ export async function dispatchPublicOverflow(
         state: request.signal.aborted ? "CANCELLED" : "FAILED",
         reason: request.signal.aborted ? "CANCELLED" : "TRANSPORT",
       }).catch(() => false);
+      await recordProviderAttemptEvent({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        providerAttemptId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        eventType: "TERMINAL",
+        reason: request.signal.aborted ? "CANCELLED" : "TRANSPORT",
+        ...providerEventRouting({ request, target, nativeSurface }),
+        reservationId: admission.reservationIds[0],
+        reservationIds: admission.reservationIds,
+        waitDurationMs: providerWaitDurationMs,
+        terminalState: request.signal.aborted ? "CANCELLED" : "FAILED",
+        contextTokens: renderedLiability.tokens,
+        streamCommitted: false,
+      }).catch(() => undefined);
       if (!request.retrySafe) break;
     }
   }

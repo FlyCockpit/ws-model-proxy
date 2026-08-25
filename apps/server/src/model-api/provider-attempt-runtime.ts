@@ -168,13 +168,30 @@ export async function recordProviderAttemptEvent(input: {
   nativeSurface?: string;
   adapterMode?: string;
   adapterVersion?: string;
+  poolId?: string;
+  poolMemberId?: string;
+  executionTargetId?: string;
+  memberTier?: string;
+  triggerReason?: string;
+  affinityOutcome?: string;
+  contextCountMethod?: string;
+  contextCountConfidence?: string;
   waitDurationMs?: number;
   reservationId?: string;
+  reservationIds?: readonly string[];
   contextTokens?: bigint;
+  firstClientByteAt?: Date;
+  streamCommitted?: boolean;
+  terminalState?: string;
   usage?: Record<string, string | number | boolean | null>;
   metadata?: Record<string, string | number | boolean | null>;
 }): Promise<void> {
-  await prisma.publicProviderAttemptEvent.create({ data: input });
+  await prisma.publicProviderAttemptEvent.create({
+    data: {
+      ...input,
+      reservationIds: input.reservationIds ? [...input.reservationIds] : undefined,
+    },
+  });
 }
 
 export function classifyProviderFailure(status?: number): ProviderFailureClass {

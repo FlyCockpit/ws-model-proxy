@@ -40,7 +40,7 @@ export interface ProviderBudgetAttempt {
 }
 
 export type ProviderBudgetAdmission =
-  | { admitted: true; reservationIds: readonly string[] }
+  | { admitted: true; providerAttemptId: string; reservationIds: readonly string[] }
   | {
       admitted: false;
       reason:
@@ -370,7 +370,11 @@ export async function admitProviderBudget(
         );
       if (!completeLiveReservedSet)
         throw new ProviderBudgetConfigurationError("Provider attempt is no longer replayable");
-      return { admitted: true, reservationIds: replay.map(({ id }) => id) };
+      return {
+        admitted: true,
+        providerAttemptId: attemptAnchor.id,
+        reservationIds: replay.map(({ id }) => id),
+      };
     }
     // The provider model's physical concurrency ceiling is admitted under the
     // same account lock and transaction as financial/token budgets. Live
@@ -591,39 +595,12 @@ export async function admitProviderBudget(
     }
 
     if (existing.length > 0) {
-      const expected = new Map(pending.map((item) => [`${item.policy.id}:${item.rule.id}`, item]));
-      const exact =
-        existing.length === pending.length &&
-        existing.every((row) => {
-          const item = expected.get(`${row.policyId}:${row.ruleId}`);
-          return Boolean(
-            item &&
-              row.userId === attempt.userId &&
-              row.providerAccountId === attempt.providerAccountId &&
-              row.providerModelId === attempt.providerModelId &&
-              row.poolId === (attempt.poolId ?? null) &&
-              row.credentialId === (attempt.credentialId ?? null) &&
-              row.requestId === attempt.requestId &&
-              row.fencingToken === attempt.fencingToken &&
-              row.policyVersion === item.policy.version &&
-              row.reservedValue.equals(item.value) &&
-              row.liabilityTokens === (attempt.liability.tokens ?? null) &&
-              (row.liabilitySpend?.equals(liabilitySpend ?? 0) ?? liabilitySpend === undefined) &&
-              row.liabilityCurrency === (currency ?? null) &&
-              row.currency === item.rule.currency &&
-              row.pricingVersion === (pricingVersion ?? null) &&
-              row.accountingVersion === accountingVersion &&
-              row.expiresAt?.getTime() === attempt.expiresAt.getTime(),
-          );
-        });
-      if (!exact)
-        throw new ProviderBudgetConfigurationError(
-          "Attempt identity or active policy set conflict",
-        );
-      return { admitted: true, reservationIds: existing.map(({ id }) => id) };
+      throw new ProviderBudgetConfigurationError(
+        "Budget reservations exist without their provider attempt anchor",
+      );
     }
 
-    await tx.providerAttempt.create({
+    const providerAttempt = await tx.providerAttempt.create({
       data: {
         userId: attempt.userId,
         providerAccountId: attempt.providerAccountId,
@@ -673,7 +650,7 @@ export async function admitProviderBudget(
       });
       ids.push(row.id);
     }
-    return { admitted: true, reservationIds: ids.sort() };
+    return { admitted: true, providerAttemptId: providerAttempt.id, reservationIds: ids.sort() };
   });
 }
 
