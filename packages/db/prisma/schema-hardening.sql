@@ -1548,8 +1548,8 @@ ALTER TABLE provider_usage_ledger ADD CONSTRAINT provider_usage_ledger_shape_che
   AND btrim("accountingVersion") <> '' AND btrim("terminalReason") <> ''
   AND ("sourceUsageAccountingVersion" IS NULL OR btrim("sourceUsageAccountingVersion") <> '')
   AND (NOT "costKnown" OR ("settledCost" IS NOT NULL AND currency IS NOT NULL AND "pricingVersion" IS NOT NULL))
-  AND (NOT "costKnown" OR "observationComplete" IS DISTINCT FROM FALSE)
-  AND (NOT "usageKnown" OR "observationComplete" IS DISTINCT FROM FALSE)
+  AND (NOT "costKnown" OR "observationComplete" IS TRUE)
+  AND (NOT "usageKnown" OR "observationComplete" IS TRUE)
   AND ("reportedCost" IS NULL OR "reportedCost" >= 0)
   AND ("reportedCostCurrency" IS NULL OR "reportedCostCurrency" ~ '^[A-Z]{3}$')
   AND ("reportedCostPricingVersion" IS NULL OR btrim("reportedCostPricingVersion") <> '')

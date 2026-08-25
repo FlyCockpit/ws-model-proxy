@@ -835,7 +835,7 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
     // non-streaming providers report an authoritative charge without a full
     // token-category breakdown. An explicit false, however, marks a truncated
     // observation and must retain the conservative admitted liability.
-    const costKnown = suppliedCost !== undefined && observationComplete !== false;
+    const costKnown = suppliedCost !== undefined && observationComplete === true;
     const suppliedCostConfidence: UsageConfidence = reportedMatches
       ? "REPORTED"
       : calculatedMatches
@@ -848,7 +848,7 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
         reservation.metric === "CONCURRENCY" ||
         (reservation.metric === "TOKENS" &&
           accountingMatches &&
-          observationComplete !== false &&
+          observationComplete === true &&
           billableTotal !== undefined) ||
         (reservation.metric === "SPEND" && costKnown);
       const prior = await tx.providerBudgetSettlement.aggregate({
@@ -957,7 +957,7 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
         payloadHash,
         usageSource,
         usageKnown: Boolean(
-          accountingMatches && observationComplete !== false && billableTotal !== undefined,
+          accountingMatches && observationComplete === true && billableTotal !== undefined,
         ),
         costKnown,
         terminalReason: terminal.reason,

@@ -378,6 +378,88 @@ integration("provider budget admission and reconciliation", () => {
     ).resolves.toMatchObject({ state: "EXPIRED", terminalReason: "CRASH_RECOVERY" });
   });
 
+  it("retains conservative token and spend liability when terminal completeness is omitted", async () => {
+    if (!db) return;
+    const tokenRow = await fixture({ metric: "TOKENS" });
+    const tokenAttempt = attempt(tokenRow, `unknown-token-terminal-${crypto.randomUUID()}`, {
+      tokens: 8n,
+      accountingVersion: "usage-v1",
+    });
+    await service.admitProviderBudget(tokenAttempt);
+    await service.reconcileProviderBudget({
+      ...tokenAttempt,
+      reason: "COMPLETED",
+      revisionSequence: 1n,
+      revisionKind: "SNAPSHOT",
+      usage: {
+        accountingVersion: "usage-v1",
+        authoritativeBillableTokens: 3n,
+        confidence: "REPORTED",
+      },
+    });
+    const tokenReservation = await db.providerBudgetReservation.findFirstOrThrow({
+      where: { attemptId: tokenAttempt.attemptId },
+    });
+    expect(tokenReservation.settledValue?.toString()).toBe("8");
+    const tokenLedger = await db.providerUsageLedger.findFirstOrThrow({
+      where: { attemptId: tokenAttempt.attemptId },
+    });
+    expect(tokenLedger).toMatchObject({ observationComplete: null, usageKnown: false });
+
+    const spendRow = await fixture({ noPolicy: true });
+    await policy(spendRow, [
+      { metric: "SPEND", period: "UTC_DAY", limitValue: "10", currency: "USD" },
+    ]);
+    await db.providerPricingVersion.create({
+      data: {
+        userId: spendRow.user.id,
+        providerAccountId: spendRow.account.id,
+        providerModelId: spendRow.model.id,
+        version: "price-v1",
+        currency: "USD",
+        status: "ACTIVE",
+        activatedAt: new Date(Date.now() - 1_000),
+        pricing: { input: "1" },
+        effectiveAt: new Date(Date.now() - 1_000),
+      },
+    });
+    const spendAttempt = {
+      ...attempt(spendRow, `unknown-spend-terminal-${crypto.randomUUID()}`),
+      liability: {
+        spend: "4",
+        currency: "USD",
+        pricingVersion: "price-v1",
+        accountingVersion: "usage-v1",
+      },
+    };
+    await service.admitProviderBudget(spendAttempt);
+    await service.reconcileProviderBudget({
+      ...spendAttempt,
+      reason: "COMPLETED",
+      revisionSequence: 1n,
+      revisionKind: "SNAPSHOT",
+      usage: {
+        accountingVersion: "usage-v1",
+        confidence: "REPORTED",
+        reportedCost: "1",
+        reportedCostCurrency: "USD",
+        reportedCostPricingVersion: "price-v1",
+      },
+    });
+    const spendReservation = await db.providerBudgetReservation.findFirstOrThrow({
+      where: { attemptId: spendAttempt.attemptId },
+    });
+    expect(spendReservation.settledValue?.toString()).toBe("4");
+    const spendLedger = await db.providerUsageLedger.findFirstOrThrow({
+      where: { attemptId: spendAttempt.attemptId },
+    });
+    expect(spendLedger).toMatchObject({
+      observationComplete: null,
+      costKnown: false,
+      settledCost: null,
+    });
+  });
+
   it("crash sweep retains expired liability and preserves the reservation identity", async () => {
     if (!db) return;
     const row = await fixture({ metric: "TOKENS" });
@@ -464,6 +546,7 @@ integration("provider budget admission and reconciliation", () => {
       revisionSequence: 2n,
       revisionKind: "SNAPSHOT" as const,
       usageSource: "provider-poll",
+      observationComplete: true,
       usage: {
         accountingVersion: "usage-v1",
         inputTokens: 2n,
@@ -514,6 +597,7 @@ integration("provider budget admission and reconciliation", () => {
       sourceVersion,
       revisionSequence: sequence,
       revisionKind: "SNAPSHOT" as const,
+      observationComplete: true,
       usage: {
         accountingVersion: "usage-v1",
         authoritativeBillableTokens: total,
@@ -708,6 +792,7 @@ integration("provider budget admission and reconciliation", () => {
       reason: "COMPLETED",
       revisionSequence: 1n,
       revisionKind: "SNAPSHOT",
+      observationComplete: true,
       usage: {
         accountingVersion: "usage-v1",
         confidence: "REPORTED",
@@ -1202,6 +1287,7 @@ integration("provider budget admission and reconciliation", () => {
         reason,
         revisionSequence: 1n,
         revisionKind: "SNAPSHOT",
+        observationComplete: true,
         usage: {
           accountingVersion: "usage-v1",
           authoritativeBillableTokens: 3n,
