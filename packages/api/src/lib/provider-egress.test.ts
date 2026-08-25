@@ -31,6 +31,8 @@ describe("provider egress policy", () => {
     "::127.0.0.1",
     "::a9fe:a9fe",
     "fe80::1",
+    "fec0::1",
+    "feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
     "fc00::1",
     "ff02::1",
     "2001:db8::1",
@@ -60,6 +62,7 @@ describe("provider egress policy", () => {
     );
     expect(() => validateProviderBaseUrl("https://127.0.0.1", policy)).toThrow(/private/u);
     expect(() => validateProviderBaseUrl("https://[::ffff:7f00:1]", policy)).toThrow(/private/u);
+    expect(() => validateProviderBaseUrl("https://[fec0::1]", policy)).toThrow(/private/u);
     expect(validateProviderBaseUrl("https://api.example.com/v1", policy).href).toBe(
       "https://api.example.com/v1",
     );
@@ -116,6 +119,11 @@ describe("provider egress policy", () => {
     );
     expect(() =>
       assertResolvedAddressesSafe([{ address: "::ffff:a9fe:a9fe" }], {
+        allowPrivateNetworks: false,
+      }),
+    ).toThrow("Provider request failed");
+    expect(() =>
+      assertResolvedAddressesSafe([{ address: "fec0::1" }], {
         allowPrivateNetworks: false,
       }),
     ).toThrow("Provider request failed");

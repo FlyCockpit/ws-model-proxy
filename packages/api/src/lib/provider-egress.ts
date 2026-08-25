@@ -133,6 +133,7 @@ export function isPrivateOrSpecialAddress(address: string): boolean {
       bytesInPrefix(bytes, prefix(0x00, 0x64, 0xff, 0x9b, 0x00, 0x01), 48) || // local translation
       bytesInPrefix(bytes, prefix(0xfc), 7) || // unique-local
       bytesInPrefix(bytes, prefix(0xfe, 0x80), 10) || // link-local
+      bytesInPrefix(bytes, prefix(0xfe, 0xc0), 10) || // deprecated site-local
       bytesInPrefix(bytes, prefix(0xff), 8) // multicast
     );
   }
