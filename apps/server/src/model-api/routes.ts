@@ -3254,6 +3254,22 @@ async function relayPool({
     contextCount: operation.contextCount,
   });
 
+  // A provider lease admitted by the pool-routing loop remains owned by this
+  // request until dispatch commits it to the response. Keep cleanup idempotent
+  // across the nested dispatcher and its caller so every precommit exit,
+  // including a rejected dispatch promise, releases the lease exactly once.
+  const releasedPreAdmittedProviderLeaseIds = new Set<string>();
+  const releasePreAdmittedProviderLease = async (
+    lease: Extract<
+      Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>>,
+      { state: "ADMITTED" }
+    >["lease"],
+  ) => {
+    if (releasedPreAdmittedProviderLeaseIds.has(lease.leaseId)) return;
+    releasedPreAdmittedProviderLeaseIds.add(lease.leaseId);
+    await capacityRuntime?.release(lease);
+  };
+
   const tryPublicOverflow = async (
     reason: PublicOverflowReason,
     releaseLocalCapacity: () => Promise<void>,
@@ -3393,13 +3409,19 @@ async function relayPool({
       | undefined;
     const dispatchProviderTier = async (memberTier: "PRIMARY" | "PUBLIC_OVERFLOW") => {
       if (options?.preAdmittedProviderLease && memberTier === "PRIMARY") {
-        const result = await dispatchPublicOverflow({
-          ...providerRequest,
-          memberTier,
-          forcedPoolMemberId: options.forcedProviderMemberId,
-        });
+        let result: Awaited<ReturnType<typeof dispatchPublicOverflow>>;
+        try {
+          result = await dispatchPublicOverflow({
+            ...providerRequest,
+            memberTier,
+            forcedPoolMemberId: options.forcedProviderMemberId,
+          });
+        } catch (error) {
+          await releasePreAdmittedProviderLease(options.preAdmittedProviderLease);
+          throw error;
+        }
         if (!result.dispatched) {
-          await capacityRuntime?.release(options.preAdmittedProviderLease);
+          await releasePreAdmittedProviderLease(options.preAdmittedProviderLease);
           return result;
         }
         providerCapacityLease = options.preAdmittedProviderLease;
@@ -3420,47 +3442,78 @@ async function relayPool({
       if (compatible.length === 0 || compatible.some((item) => !item.inferenceCapacityId))
         return { dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" } as const;
       await releaseProviderCapacity();
-      const admissionStartedAt = Date.now();
-      const admission = await acquireCapacityWithTelemetry({
-        runtime: capacityRuntime,
-        relayRequestId,
-        attempt: {
-          requestId: crypto.randomUUID(),
+      let remaining = compatible;
+      let lastResult: Awaited<ReturnType<typeof dispatchPublicOverflow>> = {
+        dispatched: false,
+        reason: "PROVIDER_UNAVAILABLE",
+      };
+      while (
+        remaining.length > 0 &&
+        !request.signal.aborted &&
+        remainingRelayBudgetMs(relayDeadlineMs) > 0
+      ) {
+        const admissionStartedAt = Date.now();
+        const admission = await acquireCapacityWithTelemetry({
+          runtime: capacityRuntime,
           relayRequestId,
-          attemptId: crypto.randomUUID(),
-          ownerId: target.ownerUserId,
-          sourceKind: "POOL",
-          poolId: target.id,
-          basePriority: 16,
-          connectionOwner: "model-api-provider",
-          deadlineAt: new Date(relayDeadlineMs),
-          candidates: compatible.map((providerTarget, candidateOrder) => ({
-            capacityId: providerTarget.inferenceCapacityId!,
-            executionTargetId: providerTarget.executionTargetId,
-            poolMemberId: providerTarget.poolMemberId,
-            candidateOrder,
-            deadlineAt: boundedAdmissionDeadline(
-              admissionStartedAt,
-              relayDeadlineMs,
-              providerTarget.capacityWaitBudgetMs ?? null,
-            ),
-          })),
-        },
-        signal: request.signal,
-      });
-      if (admission.state !== "ADMITTED" || !admission.lease.poolMemberId)
-        return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" } as const;
-      const result = await dispatchPublicOverflow({
-        ...providerRequest,
-        memberTier,
-        forcedPoolMemberId: admission.lease.poolMemberId,
-      });
-      if (!result.dispatched) {
+          attempt: {
+            requestId: crypto.randomUUID(),
+            relayRequestId,
+            attemptId: crypto.randomUUID(),
+            ownerId: target.ownerUserId,
+            sourceKind: "POOL",
+            poolId: target.id,
+            basePriority: 16,
+            connectionOwner: "model-api-provider",
+            deadlineAt: new Date(relayDeadlineMs),
+            candidates: remaining.map((providerTarget, candidateOrder) => ({
+              capacityId: providerTarget.inferenceCapacityId!,
+              executionTargetId: providerTarget.executionTargetId,
+              poolMemberId: providerTarget.poolMemberId,
+              candidateOrder,
+              deadlineAt: boundedAdmissionDeadline(
+                admissionStartedAt,
+                relayDeadlineMs,
+                providerTarget.capacityWaitBudgetMs ?? null,
+              ),
+            })),
+          },
+          signal: request.signal,
+        });
+        if (admission.state !== "ADMITTED" || !admission.lease.poolMemberId)
+          return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" } as const;
+        const selectedPoolMemberId = admission.lease.poolMemberId;
+        if (!remaining.some((item) => item.poolMemberId === selectedPoolMemberId)) {
+          await capacityRuntime.release(admission.lease);
+          return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" } as const;
+        }
+        let result: Awaited<ReturnType<typeof dispatchPublicOverflow>>;
+        try {
+          result = await dispatchPublicOverflow({
+            ...providerRequest,
+            memberTier,
+            forcedPoolMemberId: selectedPoolMemberId,
+          });
+        } catch (error) {
+          // Admission owns the lease until dispatch commits successfully. A
+          // rejected dispatch must not strand an ACTIVE lease or continue to
+          // another member as though this were a classified precommit result.
+          await capacityRuntime.release(admission.lease);
+          throw error;
+        }
+        if (result.dispatched) {
+          providerCapacityLease = admission.lease;
+          return result;
+        }
         await capacityRuntime.release(admission.lease);
-        return result;
+        lastResult = result;
+        // A provider attempt that did not commit is retryable only under the
+        // operation's existing exact retry policy. Never re-admit the same
+        // physical member during this tier traversal.
+        if (!providerRequest.retrySafe) return result;
+        remaining = remaining.filter((item) => item.poolMemberId !== selectedPoolMemberId);
       }
-      providerCapacityLease = admission.lease;
-      return result;
+      return lastResult;
     };
     let selectedTier: "PRIMARY" | "PUBLIC_OVERFLOW" = options?.onlyTier ?? "PRIMARY";
     let result = await dispatchProviderTier(selectedTier);
@@ -4260,7 +4313,7 @@ async function relayPool({
         },
       );
       if (providerResponse) return providerResponse;
-      if (providerLease) await capacityRuntime?.release(providerLease);
+      if (providerLease) await releasePreAdmittedProviderLease(providerLease);
       finalFailure = "upstream_5xx";
       continue;
     }

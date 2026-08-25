@@ -3350,6 +3350,165 @@ describe("model API routes", () => {
     );
   });
 
+  it("re-admits remaining provider overflow members after a retry-safe precommit failure", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([]);
+    const first = providerPrimaryTarget("overflow-a");
+    const second = providerPrimaryTarget("overflow-b");
+    publicOverflow.list.mockImplementation(
+      async (_userId: string, _poolId: string, tier: "PRIMARY" | "PUBLIC_OVERFLOW") => ({
+        enabled: tier === "PUBLIC_OVERFLOW",
+        acknowledged: tier === "PUBLIC_OVERFLOW",
+        affinityPolicy: {
+          enabled: false,
+          ttlSeconds: 3600,
+          maxRecords: 10_000,
+          prefixWeight: 100,
+          conversationWeight: 150,
+          confirmedCacheWeight: 250,
+          loadPenaltyWeight: 100,
+        },
+        targets: tier === "PUBLIC_OVERFLOW" ? [first, second] : [],
+      }),
+    );
+    publicOverflow.dispatch
+      .mockResolvedValueOnce({ dispatched: false, reason: "PROVIDER_UNAVAILABLE" })
+      .mockResolvedValueOnce({
+        dispatched: true,
+        response: new Response(JSON.stringify({ id: "secondary" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+        target: second,
+        attemptId: "secondary-attempt",
+        fencingToken: 2n,
+        nativeSurface: "openai-chat",
+        attemptCount: 1,
+        terminal: Promise.resolve({ ok: true, responseBytes: 18 }),
+        markFirstClientByte: vi.fn().mockResolvedValue(undefined),
+        affinity: undefined,
+      });
+    const admittedMembers: string[][] = [];
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async (attempt) => {
+        admittedMembers.push(
+          attempt.candidates.map((candidate: { poolMemberId?: string }) => candidate.poolMemberId!),
+        );
+        const candidate = attempt.candidates[0]!;
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: `lease-${candidate.poolMemberId}`,
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: BigInt(admittedMembers.length),
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      }),
+      release: vi.fn(async () => true),
+      hold: vi.fn((response) => response),
+    };
+
+    const response = await appWith(new FakeRelayManager(), true, false, capacityRuntime).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: requestBody(poolTarget.modelId),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(admittedMembers).toEqual([["overflow-a", "overflow-b"], ["overflow-b"]]);
+    expect(publicOverflow.dispatch.mock.calls.map(([input]) => input.forcedPoolMemberId)).toEqual([
+      "overflow-a",
+      "overflow-b",
+    ]);
+    expect(capacityRuntime.release).toHaveBeenCalledTimes(1);
+    expect(capacityRuntime.hold).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases an admitted provider lease when dispatch rejects without re-admitting", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([]);
+    const first = providerPrimaryTarget("overflow-a");
+    const second = providerPrimaryTarget("overflow-b");
+    publicOverflow.list.mockImplementation(
+      async (_userId: string, _poolId: string, tier: "PRIMARY" | "PUBLIC_OVERFLOW") => ({
+        enabled: tier === "PUBLIC_OVERFLOW",
+        acknowledged: tier === "PUBLIC_OVERFLOW",
+        affinityPolicy: {
+          enabled: false,
+          ttlSeconds: 3600,
+          maxRecords: 10_000,
+          prefixWeight: 100,
+          conversationWeight: 150,
+          confirmedCacheWeight: 250,
+          loadPenaltyWeight: 100,
+        },
+        targets: tier === "PUBLIC_OVERFLOW" ? [first, second] : [],
+      }),
+    );
+    const dispatchError = new Error("provider dispatch rejected");
+    publicOverflow.dispatch.mockRejectedValueOnce(dispatchError);
+    const release = vi.fn(async () => true);
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async (attempt) => {
+        const candidate = attempt.candidates[0]!;
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: `lease-${candidate.poolMemberId}`,
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      }),
+      release,
+      hold: vi.fn((response) => response),
+    };
+
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const response = await appWith(new FakeRelayManager(), true, false, capacityRuntime).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: requestBody(poolTarget.modelId),
+      },
+    );
+
+    expect(response.status).toBe(500);
+    expect(consoleError).toHaveBeenCalledWith(dispatchError);
+
+    expect(capacityRuntime.acquire).toHaveBeenCalledTimes(1);
+    expect(publicOverflow.dispatch).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledWith(
+      expect.objectContaining({ leaseId: "lease-overflow-a", poolMemberId: "overflow-a" }),
+    );
+    expect(capacityRuntime.hold).not.toHaveBeenCalled();
+  });
+
   it("admits local and provider PRIMARY members through one scored capacity candidate set", async () => {
     const grantedPoolTarget = {
       ...poolTarget,
@@ -3460,6 +3619,81 @@ describe("model API routes", () => {
         ]),
       }),
     );
+  });
+
+  it("releases a pre-admitted provider PRIMARY lease once when dispatch rejects", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([]);
+    const provider = providerPrimaryTarget();
+    publicOverflow.list.mockResolvedValue({
+      enabled: false,
+      acknowledged: false,
+      affinityPolicy: {
+        enabled: false,
+        ttlSeconds: 3600,
+        maxRecords: 10_000,
+        prefixWeight: 100,
+        conversationWeight: 150,
+        confirmedCacheWeight: 250,
+        loadPenaltyWeight: 100,
+      },
+      targets: [provider],
+    });
+    const dispatchError = new Error("pre-admitted provider dispatch rejected");
+    publicOverflow.dispatch.mockRejectedValueOnce(dispatchError);
+    const release = vi.fn(async () => true);
+    const hold = vi.fn((response) => response);
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async (attempt) => {
+        const selected = attempt.candidates[0]!;
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: "pre-admitted-provider-lease",
+            attemptId: attempt.attemptId,
+            capacityId: selected.capacityId,
+            executionTargetId: selected.executionTargetId,
+            poolMemberId: selected.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      }),
+      release,
+      hold,
+    };
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const response = await appWith(new FakeRelayManager(), true, false, capacityRuntime).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: requestBody(poolTarget.modelId),
+      },
+    );
+
+    expect(response.status).toBe(500);
+    expect(consoleError).toHaveBeenCalledWith(dispatchError);
+    expect(capacityRuntime.acquire).toHaveBeenCalledTimes(1);
+    expect(publicOverflow.dispatch).toHaveBeenCalledTimes(1);
+    expect(publicOverflow.dispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        memberTier: "PRIMARY",
+        forcedPoolMemberId: provider.poolMemberId,
+      }),
+    );
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledWith(
+      expect.objectContaining({ leaseId: "pre-admitted-provider-lease" }),
+    );
+    expect(hold).not.toHaveBeenCalled();
   });
 
   it.each([

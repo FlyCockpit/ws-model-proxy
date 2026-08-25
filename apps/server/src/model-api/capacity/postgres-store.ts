@@ -34,12 +34,32 @@ export async function runCapacitySerializable<T>(
   pause: (milliseconds: number) => Promise<void> = (milliseconds) =>
     new Promise((resolve) => setTimeout(resolve, milliseconds)),
 ): Promise<T> {
+  const retryDeadline = Date.now() + 15_000;
   for (let attempt = 0; ; attempt++) {
     try {
-      return await db.$transaction(work, { isolationLevel: "Serializable" });
+      // Capacity mutations are serialized by transaction-scoped advisory
+      // locks. READ COMMITTED is intentional: a SERIALIZABLE transaction
+      // fixes its snapshot before a contended advisory-lock call returns, so
+      // every predecessor in a lock queue can force another 40001 retry. With
+      // READ COMMITTED, the statement after the lock observes the predecessor's
+      // commit while the advisory lock still prevents oversubscription.
+      return await db.$transaction(work, {
+        isolationLevel: "ReadCommitted",
+        timeout: Math.max(1, retryDeadline - Date.now()),
+      });
     } catch (error) {
-      if (attempt >= 4 || !isRetryableCapacityTransactionError(error)) throw error;
-      await pause(5 + Math.floor(Math.random() * 20));
+      if (
+        attempt >= 4 ||
+        Date.now() >= retryDeadline ||
+        !isRetryableCapacityTransactionError(error)
+      )
+        throw error;
+      // Full jitter with an exponential cap keeps the total retry sleep below
+      // 80 ms (7 + 15 + 23 + 31) instead of allowing an unbounded retry storm.
+      const capMs = Math.min(31, 7 + attempt * 8);
+      await pause(
+        Math.max(0, Math.min(retryDeadline - Date.now(), Math.floor(Math.random() * (capMs + 1)))),
+      );
     }
   }
 }
@@ -102,10 +122,32 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
   async acquire(attempt: AdmissionAttempt, signal?: AbortSignal): Promise<AdmissionResult> {
     if (signal?.aborted) return { state: "CANCELLED" };
     const result = await this.#serializable(async (tx) => {
-      const existing = await tx.admissionRequest.findUnique({
+      // Identical attempts must share one creation boundary even if a buggy
+      // caller supplies a different candidate list on retry. This lock is
+      // always acquired before capacity locks, giving every acquire operation
+      // one deterministic global order.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`admission-attempt:${attempt.attemptId}`}, 0))`;
+      let existing = await tx.admissionRequest.findUnique({
         where: { attemptId: attempt.attemptId },
         include: { Lease: true, Waiters: true },
       });
+      // Policy writers take the execution-target row and its capacity-policy
+      // advisory fence before changing pool/member/direct limits. Admission
+      // must join that same lock domain before it resolves and persists the
+      // effective policy; otherwise an unlimited admission on capacity A can
+      // race a pool-wide unlimited -> limited update while another admission
+      // enters through capacity B.
+      const policyTargetIds = existing
+        ? existing.Waiters.map((waiter) => waiter.executionTargetId)
+        : attempt.candidates.map((candidate) => candidate.executionTargetId);
+      await this.#lockExecutionTargetPolicies(tx, policyTargetIds);
+      // READ COMMITTED gives this statement the committed policy snapshot of
+      // the predecessor that released a contended fence.
+      existing = await tx.admissionRequest.findUnique({
+        where: { attemptId: attempt.attemptId },
+        include: { Lease: true, Waiters: true },
+      });
+      const resolvedCandidates = existing ? [] : await this.#resolveCandidates(tx, attempt);
       const orderedCapacityIds = [
         ...new Set(
           (existing
@@ -123,17 +165,33 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         !orderedCapacityIds.includes(existing.Lease.capacityId)
       )
         orderedCapacityIds.push(existing.Lease.capacityId);
-      // Locks remain globally sorted to avoid cross-request deadlocks. Once
-      // held, admission visits capacities in caller-scored candidate order.
+      const candidateScopeKeys = existing
+        ? existing.Waiters.flatMap((candidate) =>
+            candidate.effectiveConcurrencyLimit === null
+              ? []
+              : [
+                  concurrencyLockKey(
+                    candidate.effectiveConcurrencyScope,
+                    candidate.effectiveConcurrencyScopeId,
+                  ),
+                ],
+          )
+        : resolvedCandidates.flatMap((candidate) =>
+            candidate.memberConcurrencyCeiling === undefined
+              ? []
+              : [concurrencyLockKey(candidate.concurrencyScope, candidate.concurrencyScopeId)],
+          );
+      // Every shared scope lock sorts before every physical-capacity lock.
+      // Release/reclaim use the same order, preventing both cross-capacity
+      // write skew and advisory-lock inversion.
       const capacityIds = [...orderedCapacityIds].sort();
-      for (const capacityId of capacityIds)
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacityId}, 0))`;
-      // The initial graph read is needed to discover which capacity locks to
-      // take. Under SERIALIZABLE it can otherwise retain a snapshot from
-      // before a concurrent deadline update that committed while those locks
-      // were held. Row-lock the durable request and its waiters after taking
-      // the advisory locks so PostgreSQL raises 40001 and our retry starts
-      // from a fresh snapshot instead of admitting from stale deadlines.
+      await this.#lockAdmissionResources(tx, capacityIds, candidateScopeKeys);
+      // The initial graph read only discovers locks for an idempotent retry.
+      // Re-read after all locks so every decision uses a fresh committed view.
+      existing = await tx.admissionRequest.findUnique({
+        where: { attemptId: attempt.attemptId },
+        include: { Lease: true, Waiters: true },
+      });
       if (existing) {
         await tx.$queryRaw`SELECT id FROM admission_request WHERE id = ${existing.id} FOR UPDATE`;
         await tx.$queryRaw`SELECT id FROM capacity_waiter WHERE "admissionRequestId" = ${existing.id} FOR UPDATE`;
@@ -268,7 +326,6 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           >`SELECT nextval('admission_enqueue_sequence') AS value`;
       const enqueueSequence = existing?.enqueueSequence ?? sequence[0]?.value;
       if (enqueueSequence === undefined) throw new Error("Admission enqueue sequence unavailable.");
-      const resolvedCandidates = existing ? [] : await this.#resolveCandidates(tx, attempt);
       const request =
         existing ??
         (await tx.admissionRequest.create({
@@ -567,6 +624,16 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     if (!decision.winner) return false;
     const waiter = waiters.find((entry) => entry.id === decision.winner?.waiterId);
     if (!waiter) return false;
+    // A request may have sibling waiters on distinct physical capacities.
+    // Serialize the winner at the durable request row, then re-read after the
+    // lock. This makes the unique attemptId lease constraint a final invariant
+    // rather than the normal arbitration mechanism (and avoids leaking P2002).
+    await tx.$queryRaw`SELECT id FROM admission_request WHERE id = ${waiter.admissionRequestId} FOR UPDATE`;
+    const winningRequest = await tx.admissionRequest.findUnique({
+      where: { id: waiter.admissionRequestId },
+      include: { Lease: true },
+    });
+    if (winningRequest?.state !== "WAITING" || winningRequest.Lease) return true;
     const updatedCapacity = await tx.inferenceCapacity.update({
       where: { id: capacityId },
       data: {
@@ -618,12 +685,69 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     }
   }
 
+  async #lockAdmissionResources(
+    tx: Prisma.TransactionClient,
+    capacityIds: readonly string[],
+    additionalScopeKeys: readonly string[] = [],
+  ): Promise<void> {
+    const durableScopes = capacityIds.length
+      ? await tx.capacityWaiter.findMany({
+          where: {
+            capacityId: { in: [...capacityIds] },
+            effectiveConcurrencyLimit: { not: null },
+          },
+          select: {
+            effectiveConcurrencyScope: true,
+            effectiveConcurrencyScopeId: true,
+          },
+          distinct: ["effectiveConcurrencyScope", "effectiveConcurrencyScopeId"],
+        })
+      : [];
+    const scopeKeys = durableScopes.map((waiter) =>
+      concurrencyLockKey(waiter.effectiveConcurrencyScope, waiter.effectiveConcurrencyScopeId),
+    );
+    // All capacity operations use this two-phase order. Capacity IDs remain
+    // the historical lock key shared with API policy mutations and process
+    // workers; changing that key would silently split the lock domain.
+    const orderedScopeKeys = [...new Set([...scopeKeys, ...additionalScopeKeys])].sort();
+    for (const lockKey of orderedScopeKeys)
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`;
+    const orderedCapacityIds = [...new Set(capacityIds)].sort();
+    for (const capacityId of orderedCapacityIds)
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacityId}, 0))`;
+    // Policy writers and admission both lock execution targets before reaching
+    // this phase. Writers never acquire capacity admission locks afterwards;
+    // taking capacity rows only after all sorted advisory locks therefore
+    // preserves both orders. Crucially, the first capacity snapshot runs as a
+    // new READ COMMITTED statement after a contended writer commits instead of
+    // admitting against its stale pre-update limit.
+    if (orderedCapacityIds.length > 0)
+      await tx.$queryRaw`SELECT id FROM inference_capacity WHERE id IN (${Prisma.join(
+        orderedCapacityIds,
+      )}) ORDER BY id FOR UPDATE`;
+  }
+
+  async #lockExecutionTargetPolicies(
+    tx: Prisma.TransactionClient,
+    executionTargetIds: readonly string[],
+  ): Promise<void> {
+    // Keep this byte-for-byte lock-key compatible with
+    // packages/api/src/lib/capacity-policy-safety.ts. Policy mutations that
+    // affect multiple targets and admissions both use sorted target IDs.
+    for (const targetId of [...new Set(executionTargetIds)].sort()) {
+      await tx.$queryRaw`SELECT id FROM execution_target WHERE id = ${targetId} FOR UPDATE`;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${
+        "capacity-policy:" + targetId
+      }, 0))`;
+    }
+  }
+
   async heartbeat(lease: CapacityLeaseHandle, extensionMs: number): Promise<boolean> {
     if (!Number.isFinite(extensionMs) || extensionMs <= 0)
       throw new RangeError("Capacity lease extension must be a positive duration.");
     const boundedExtensionMs = Math.min(extensionMs, 5 * 60_000);
     return this.#serializable(async (tx) => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${lease.capacityId}, 0))`;
+      await this.#lockAdmissionResources(tx, [lease.capacityId]);
       const clockRows = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
       const now = clockRows[0]?.now;
       if (!now) throw new Error("Database clock unavailable.");
@@ -642,7 +766,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
 
   async release(lease: CapacityLeaseHandle): Promise<boolean> {
     const released = await this.db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${lease.capacityId}, 0))`;
+      await this.#lockAdmissionResources(tx, [lease.capacityId]);
       const clockRows = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
       const now = clockRows[0]?.now;
       if (!now) throw new Error("Database clock unavailable.");
@@ -687,8 +811,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       const capacities = [...new Set(request.Waiters.map((waiter) => waiter.capacityId))].sort();
       if (request.Lease?.capacityId) capacities.push(request.Lease.capacityId);
       const lockedCapacities = [...new Set(capacities)].sort();
-      for (const capacityId of lockedCapacities)
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacityId}, 0))`;
+      await this.#lockAdmissionResources(tx, lockedCapacities);
       const clockRows = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
       const now = clockRows[0]?.now;
       if (!now) throw new Error("Database clock unavailable.");
@@ -770,7 +893,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     let reclaimed = 0;
     for (const lease of expired) {
       const result = await this.#serializable(async (tx) => {
-        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${lease.capacityId}, 0))`;
+        await this.#lockAdmissionResources(tx, [lease.capacityId]);
         const lockedRows = await tx.$queryRaw<
           Array<{ now: Date }>
         >`SELECT clock_timestamp() AS now`;
@@ -845,8 +968,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         });
         if (current?.state !== "WAITING") return [] as string[];
         const capacities = [...new Set(current.Waiters.map((waiter) => waiter.capacityId))].sort();
-        for (const capacityId of capacities)
-          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacityId}, 0))`;
+        await this.#lockAdmissionResources(tx, capacities);
         const lockedRows = await tx.$queryRaw<
           Array<{ now: Date }>
         >`SELECT clock_timestamp() AS now`;
@@ -906,6 +1028,10 @@ function schedulerDeficits(value: Prisma.JsonValue): number[] {
   if (Array.isArray(value) && value.length === 32)
     return value.map((entry) => (typeof entry === "number" && entry >= 0 ? entry : 0));
   return Array(32).fill(0);
+}
+
+function concurrencyLockKey(scope: string, scopeId: string): string {
+  return `0:concurrency:${scope}:${scopeId}`;
 }
 
 export function allocateReservationSlots(

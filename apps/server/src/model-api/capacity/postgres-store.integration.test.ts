@@ -122,6 +122,279 @@ integration("PostgreSQL capacity admission primitives", () => {
     }
   });
 
+  it("observes a concurrent physical-limit reduction before admitting", async () => {
+    if (!databaseUrl) return;
+    const writer = createPrismaClient(databaseUrl);
+    const admission = createPrismaClient(databaseUrl);
+    const inspector = createPrismaClient(databaseUrl);
+    const suffix = crypto.randomUUID();
+    const user = await writer.user.create({
+      data: { name: "Capacity limit race", email: `capacity-limit-race-${suffix}@example.test` },
+    });
+    let releaseWriter!: () => void;
+    const writerMayCommit = new Promise<void>((resolve) => {
+      releaseWriter = resolve;
+    });
+    let policyWrite: Promise<void> | undefined;
+    try {
+      const capacity = await writer.inferenceCapacity.create({
+        data: {
+          userId: user.id,
+          label: `capacity-limit-race-${suffix}`,
+          runtimeIdentityKey: `capacity-limit-race-${suffix}`,
+          runtimeModel: "capacity-limit-race",
+          hardConcurrencyLimit: 2,
+        },
+      });
+      const account = await writer.providerAccount.create({
+        data: {
+          userId: user.id,
+          providerType: "proof",
+          label: `capacity-limit-race-${suffix}`,
+          baseUrl: "https://example.test",
+          endpointIdentity: "https://example.test",
+          authType: "BEARER",
+        },
+      });
+      const model = await writer.providerModel.create({
+        data: { userId: user.id, providerAccountId: account.id, upstreamModelId: suffix },
+      });
+      const target = await writer.executionTarget.create({
+        data: {
+          userId: user.id,
+          kind: "PROVIDER_MODEL",
+          providerModelId: model.id,
+          inferenceCapacityId: capacity.id,
+        },
+      });
+      const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+      const store = new PostgresCapacityAdmissionStore(admission, "limit-race-admission");
+      const attempt = (name: string) => ({
+        requestId: `${name}-${suffix}`,
+        attemptId: `${name}-${suffix}`,
+        ownerId: user.id,
+        sourceKind: "DIRECT" as const,
+        basePriority: 16,
+        connectionOwner: name,
+        deadlineAt: new Date(Date.now() + 60_000),
+        candidates: [{ capacityId: capacity.id, executionTargetId: target.id, candidateOrder: 0 }],
+      });
+      const blocker = await store.acquire(attempt("blocker"));
+      if (blocker.state !== "ADMITTED") throw new Error("Expected the first capacity lease.");
+
+      let writerLocked!: () => void;
+      const writerHasLock = new Promise<void>((resolve) => {
+        writerLocked = resolve;
+      });
+      policyWrite = writer.$transaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM inference_capacity WHERE id = ${capacity.id} FOR UPDATE`;
+        await tx.inferenceCapacity.update({
+          where: { id: capacity.id },
+          data: { hardConcurrencyLimit: 1 },
+        });
+        writerLocked();
+        await writerMayCommit;
+      });
+      await writerHasLock;
+
+      const contender = store.acquire(attempt("contender"));
+      let blocked = false;
+      for (let poll = 0; poll < 100 && !blocked; poll++) {
+        const rows = await inspector.$queryRaw<Array<{ blocked: boolean }>>`
+          SELECT EXISTS (
+            SELECT 1
+              FROM pg_stat_activity
+             WHERE cardinality(pg_blocking_pids(pid)) > 0
+               AND query LIKE '%inference_capacity%FOR UPDATE%'
+          ) AS blocked`;
+        blocked = rows[0]?.blocked ?? false;
+        if (!blocked) await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(blocked).toBe(true);
+      releaseWriter();
+      await policyWrite;
+
+      await expect(contender).resolves.toMatchObject({ state: "WAITING" });
+      expect(
+        await admission.capacityLease.count({
+          where: { capacityId: capacity.id, state: "ACTIVE" },
+        }),
+      ).toBe(1);
+      await store.release(blocker.lease);
+    } finally {
+      releaseWriter();
+      await policyWrite?.catch(() => undefined);
+      await writer.user.delete({ where: { id: user.id } }).catch(() => undefined);
+      await Promise.all([writer.$disconnect(), admission.$disconnect(), inspector.$disconnect()]);
+    }
+  });
+
+  it("observes a pool unlimited-to-limited update across distinct capacities before admission", async () => {
+    if (!databaseUrl) return;
+    const suffix = crypto.randomUUID();
+    const namedUrl = (name: string) =>
+      `${databaseUrl}${databaseUrl.includes("?") ? "&" : "?"}application_name=${encodeURIComponent(name)}`;
+    const writerName = `capacity-policy-writer-${suffix}`;
+    const admissionNames = [
+      `capacity-policy-admission-a-${suffix}`,
+      `capacity-policy-admission-b-${suffix}`,
+    ];
+    const writer = createPrismaClient(namedUrl(writerName));
+    const admissions = admissionNames.map((name) => createPrismaClient(namedUrl(name)));
+    const inspector = createPrismaClient(databaseUrl);
+    const user = await writer.user.create({
+      data: { name: "Pool policy race", email: `pool-policy-race-${suffix}@example.test` },
+    });
+    let allowWriterCommit!: () => void;
+    const writerMayCommit = new Promise<void>((resolve) => {
+      allowWriterCommit = resolve;
+    });
+    let policyWrite: Promise<void> | undefined;
+    let admissionAttempts: Promise<unknown>[] = [];
+    let writerPid: number | undefined;
+    try {
+      const pool = await writer.modelPool.create({
+        data: {
+          userId: user.id,
+          slug: `pool-policy-race-${suffix}`,
+          name: "Pool policy race",
+          capacityConcurrencyLimit: null,
+        },
+      });
+      const account = await writer.providerAccount.create({
+        data: {
+          userId: user.id,
+          providerType: "proof",
+          label: `pool-policy-race-${suffix}`,
+          baseUrl: "https://example.test",
+          endpointIdentity: "https://example.test",
+          authType: "BEARER",
+        },
+      });
+      const candidates: Array<{
+        capacityId: string;
+        executionTargetId: string;
+        poolMemberId: string;
+      }> = [];
+      for (const index of [0, 1]) {
+        const capacity = await writer.inferenceCapacity.create({
+          data: {
+            userId: user.id,
+            label: `pool-policy-race-${index}-${suffix}`,
+            runtimeIdentityKey: `pool-policy-race-${index}-${suffix}`,
+            runtimeModel: "pool-policy-race",
+            hardConcurrencyLimit: 1,
+          },
+        });
+        const model = await writer.providerModel.create({
+          data: {
+            userId: user.id,
+            providerAccountId: account.id,
+            upstreamModelId: `${index}-${suffix}`,
+          },
+        });
+        const target = await writer.executionTarget.create({
+          data: {
+            userId: user.id,
+            kind: "PROVIDER_MODEL",
+            providerModelId: model.id,
+            inferenceCapacityId: capacity.id,
+          },
+        });
+        const member = await writer.poolMember.create({
+          data: {
+            poolId: pool.id,
+            executionTargetId: target.id,
+            tier: "PRIMARY",
+            capacityConcurrencyMode: "INHERIT",
+          },
+        });
+        candidates.push({
+          capacityId: capacity.id,
+          executionTargetId: target.id,
+          poolMemberId: member.id,
+        });
+      }
+
+      let writerLocked!: () => void;
+      const writerHasLocks = new Promise<void>((resolve) => {
+        writerLocked = resolve;
+      });
+      policyWrite = writer.$transaction(async (tx) => {
+        const backend = await tx.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid() AS pid`;
+        writerPid = backend[0]?.pid;
+        if (writerPid === undefined) throw new Error("Policy writer backend unavailable.");
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${pool.id} FOR UPDATE`;
+        for (const targetId of candidates
+          .map(({ executionTargetId }) => executionTargetId)
+          .sort()) {
+          await tx.$queryRaw`SELECT id FROM execution_target WHERE id = ${targetId} FOR UPDATE`;
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${
+            "capacity-policy:" + targetId
+          }, 0))`;
+        }
+        await tx.modelPool.update({
+          where: { id: pool.id },
+          data: { capacityConcurrencyLimit: 1 },
+        });
+        writerLocked();
+        await writerMayCommit;
+      });
+      await writerHasLocks;
+
+      const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+      const attempts = candidates.map((candidate, index) =>
+        new PostgresCapacityAdmissionStore(admissions[index]!, `pool-policy-${index}`).acquire({
+          requestId: `pool-policy-${index}-${suffix}`,
+          attemptId: `pool-policy-${index}-${suffix}`,
+          ownerId: user.id,
+          sourceKind: "POOL",
+          poolId: pool.id,
+          basePriority: 16,
+          connectionOwner: `pool-policy-${index}`,
+          deadlineAt: new Date(Date.now() + 60_000),
+          candidates: [{ ...candidate, candidateOrder: 0 }],
+        }),
+      );
+      admissionAttempts = attempts;
+      let blockedAdmissions = 0;
+      for (let poll = 0; poll < 200 && blockedAdmissions !== 2; poll++) {
+        const rows = await inspector.$queryRaw<Array<{ count: bigint }>>`
+          SELECT COUNT(*)::bigint AS count
+            FROM pg_stat_activity
+           WHERE ${writerPid} = ANY(pg_blocking_pids(pid))
+             AND wait_event_type = 'Lock'`;
+        blockedAdmissions = Number(rows[0]?.count ?? 0n);
+        if (blockedAdmissions !== 2) await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(blockedAdmissions).toBe(2);
+      allowWriterCommit();
+      await policyWrite;
+
+      const results = await Promise.all(attempts);
+      expect(results.filter(({ state }) => state === "ADMITTED")).toHaveLength(1);
+      expect(results.filter(({ state }) => state === "WAITING")).toHaveLength(1);
+      expect(
+        await inspector.capacityLease.count({ where: { poolId: pool.id, state: "ACTIVE" } }),
+      ).toBe(1);
+      const admitted = results.find((result) => result.state === "ADMITTED");
+      if (admitted?.state === "ADMITTED")
+        await new PostgresCapacityAdmissionStore(admissions[0]!, "pool-policy-release").release(
+          admitted.lease,
+        );
+    } finally {
+      allowWriterCommit();
+      await policyWrite?.catch(() => undefined);
+      await Promise.allSettled(admissionAttempts);
+      await writer.user.delete({ where: { id: user.id } }).catch(() => undefined);
+      await Promise.all([
+        writer.$disconnect(),
+        inspector.$disconnect(),
+        ...admissions.map((client) => client.$disconnect()),
+      ]);
+    }
+  }, 15_000);
+
   it("uses the database clock across managers for deadlines, heartbeats, and lease expiry", async () => {
     if (!databaseUrl) return;
     const first = createPrismaClient(databaseUrl);

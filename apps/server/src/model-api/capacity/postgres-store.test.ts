@@ -62,8 +62,33 @@ describe("capacity wakeup polling", () => {
       expect(result).toBe(3);
       expect(committed).toEqual([3]);
       expect(transaction).toHaveBeenCalledTimes(3);
+      expect(transaction).toHaveBeenCalledWith(expect.any(Function), {
+        isolationLevel: "ReadCommitted",
+        timeout: expect.any(Number),
+      });
     },
   );
+  it("bounds jitter and surfaces a terminal nested Prisma conflict", async () => {
+    const nestedConflict = {
+      code: "P2010",
+      meta: { driverAdapterError: { cause: { originalCode: "40001" } } },
+    };
+    const transaction = vi.fn().mockRejectedValue(nestedConflict);
+    const pauses: number[] = [];
+    await expect(
+      runCapacitySerializable(
+        { $transaction: transaction } as never,
+        async () => undefined,
+        async (milliseconds) => {
+          pauses.push(milliseconds);
+        },
+      ),
+    ).rejects.toBe(nestedConflict);
+    expect(transaction).toHaveBeenCalledTimes(5);
+    expect(pauses).toHaveLength(4);
+    expect(pauses.every((pause, index) => pause >= 0 && pause <= 7 + index * 8)).toBe(true);
+    expect(pauses.reduce((total, pause) => total + pause, 0)).toBeLessThanOrEqual(76);
+  });
   it("treats notifications as hints and re-polls durable state", async () => {
     const admitted = {
       state: "ADMITTED" as const,

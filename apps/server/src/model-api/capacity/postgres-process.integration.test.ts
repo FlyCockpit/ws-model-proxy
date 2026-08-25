@@ -32,17 +32,18 @@ type WorkerResult =
   | { winner?: { admissionRequestId: string; priority: number } }
   | { port: number };
 
-function startWorker(command: unknown) {
+function startWorker(command: unknown, requestedApplicationName?: string) {
   const production =
     typeof command === "object" &&
     command !== null &&
     "operation" in command &&
     command.operation === "production-server";
-  const applicationName = production ? `wsmp-prod-${crypto.randomUUID()}` : undefined;
-  const workerDatabaseUrl =
-    applicationName && databaseUrl
-      ? `${databaseUrl}${databaseUrl.includes("?") ? "&" : "?"}application_name=${encodeURIComponent(applicationName)}`
-      : databaseUrl;
+  const applicationName =
+    requestedApplicationName ??
+    (production ? `wsmp-prod-${crypto.randomUUID()}` : `wsmp-capacity-${crypto.randomUUID()}`);
+  const workerDatabaseUrl = databaseUrl
+    ? `${databaseUrl}${databaseUrl.includes("?") ? "&" : "?"}application_name=${encodeURIComponent(applicationName)}`
+    : databaseUrl;
   const child = spawn(
     process.execPath,
     ["--import", "tsx", workerPath, Buffer.from(JSON.stringify(command)).toString("base64url")],
@@ -290,6 +291,291 @@ integration("capacity admission across operating-system processes", () => {
 
     await db.user.delete({ where: { id: owner.id } }).catch(() => undefined);
   }, 30_000);
+
+  it("drains a deterministic high-contention process queue without retry exhaustion", async () => {
+    if (!db) return;
+    const suffix = crypto.randomUUID();
+    const applicationPrefix = `wsmp-capacity-contention-${suffix}`;
+    const owner = await db.user.create({
+      data: {
+        name: "Capacity contention proof",
+        email: `capacity-contention-${suffix}@example.test`,
+      },
+    });
+    const capacity = await db.inferenceCapacity.create({
+      data: {
+        userId: owner.id,
+        label: `capacity-contention-${suffix}`,
+        runtimeIdentityKey: `capacity-contention-runtime-${suffix}`,
+        runtimeModel: "capacity-contention-proof",
+        hardConcurrencyLimit: 3,
+      },
+    });
+    const account = await db.providerAccount.create({
+      data: {
+        userId: owner.id,
+        providerType: "capacity-contention-proof",
+        label: `capacity-contention-account-${suffix}`,
+        baseUrl: "https://example.test",
+        endpointIdentity: "https://example.test",
+        authType: "BEARER",
+      },
+    });
+    const model = await db.providerModel.create({
+      data: { userId: owner.id, providerAccountId: account.id, upstreamModelId: suffix },
+    });
+    const target = await db.executionTarget.create({
+      data: {
+        userId: owner.id,
+        kind: "PROVIDER_MODEL",
+        providerModelId: model.id,
+        inferenceCapacityId: capacity.id,
+      },
+    });
+    let releaseFence: (() => void) | undefined;
+    let reportLocked: (() => void) | undefined;
+    const release = new Promise<void>((resolve) => {
+      releaseFence = resolve;
+    });
+    const locked = new Promise<void>((resolve) => {
+      reportLocked = resolve;
+    });
+    const barrier = db.$transaction(
+      async (tx) => {
+        await tx.$queryRaw`SELECT id FROM execution_target WHERE id = ${target.id} FOR UPDATE`;
+        reportLocked?.();
+        await release;
+      },
+      { timeout: 30_000 },
+    );
+    await locked;
+    const attempts = Array.from({ length: 12 }, (_value, index) => ({
+      attemptId: `contention-${index}-${suffix}`,
+      requestId: `contention-${index}-${suffix}`,
+      ownerId: owner.id,
+      sourceKind: "DIRECT" as const,
+      basePriority: index % 32,
+      connectionOwner: `contention-process-${index}`,
+      deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+      candidates: [{ capacityId: capacity.id, executionTargetId: target.id, candidateOrder: 0 }],
+    }));
+    const workers = attempts.map((attempt, index) =>
+      startWorker({ operation: "acquire", attempt, hold: false }, `${applicationPrefix}-${index}`),
+    );
+    for (const worker of workers) children.add(worker.child);
+    const outcomesPromise = Promise.all(workers.map((worker) => worker.result));
+    const waiterCount = await waitFor(async () => {
+      const rows = await db.$queryRaw<Array<{ count: bigint }>>`
+        SELECT COUNT(*)::bigint AS count
+        FROM pg_stat_activity
+        WHERE application_name LIKE ${`${applicationPrefix}-%`}
+          AND wait_event_type = 'Lock'
+      `;
+      const count = Number(rows[0]?.count ?? 0n);
+      return count === attempts.length ? count : undefined;
+    }, 15_000);
+    expect(waiterCount).toBe(attempts.length);
+    releaseFence?.();
+    await barrier;
+    const outcomes = await outcomesPromise;
+    expect(
+      outcomes.filter((outcome) => "state" in outcome && outcome.state === "ADMITTED"),
+    ).toHaveLength(3);
+    expect(
+      outcomes.filter((outcome) => "state" in outcome && outcome.state === "WAITING"),
+    ).toHaveLength(9);
+    expect(
+      await db.capacityLease.count({ where: { capacityId: capacity.id, state: "ACTIVE" } }),
+    ).toBe(3);
+
+    const admittedAttempts = new Set<string>();
+    while (admittedAttempts.size < attempts.length) {
+      const active = await db.capacityLease.findMany({
+        where: { capacityId: capacity.id, state: "ACTIVE" },
+        orderBy: { fencingToken: "asc" },
+      });
+      expect(active.length).toBeGreaterThan(0);
+      expect(active.length).toBeLessThanOrEqual(3);
+      for (const lease of active) admittedAttempts.add(lease.attemptId);
+      const releasers = active.map((lease, index) =>
+        startWorker(
+          {
+            operation: "release",
+            lease: {
+              leaseId: lease.id,
+              attemptId: lease.attemptId,
+              capacityId: lease.capacityId,
+              executionTargetId: lease.executionTargetId,
+              poolMemberId: lease.poolMemberId ?? undefined,
+              fencingToken: lease.fencingToken.toString(),
+              expiresAt: lease.expiresAt.toISOString(),
+              reservationClass: lease.reservationClass,
+              borrowed: lease.borrowed,
+            },
+          },
+          `${applicationPrefix}-release-${admittedAttempts.size}-${index}`,
+        ),
+      );
+      for (const releaser of releasers) children.add(releaser.child);
+      await expect(Promise.all(releasers.map((releaser) => releaser.result))).resolves.toEqual(
+        active.map(() => ({ released: true })),
+      );
+    }
+    expect(admittedAttempts).toEqual(new Set(attempts.map((attempt) => attempt.attemptId)));
+    expect(
+      await db.capacityLease.count({ where: { capacityId: capacity.id, state: "ACTIVE" } }),
+    ).toBe(0);
+    expect(
+      await db.admissionRequest.count({
+        where: {
+          attemptId: { in: attempts.map((attempt) => attempt.attemptId) },
+          state: "TERMINAL",
+        },
+      }),
+    ).toBe(attempts.length);
+    // Capacity leases intentionally retain immutable execution-target history,
+    // so this disposable PostgreSQL proof is cleaned up with its container.
+    await db.user.delete({ where: { id: owner.id } }).catch(() => undefined);
+  }, 60_000);
+
+  it("enforces one pool scope across capacities and admits one sibling on simultaneous release", async () => {
+    if (!db) return;
+    const suffix = crypto.randomUUID();
+    const owner = await db.user.create({
+      data: { name: "Cross-capacity proof", email: `cross-capacity-${suffix}@example.test` },
+    });
+    const pool = await db.modelPool.create({
+      data: {
+        userId: owner.id,
+        slug: `cross-capacity-${suffix}`,
+        name: "Cross-capacity proof",
+        capacityConcurrencyLimit: 1,
+      },
+    });
+    const account = await db.providerAccount.create({
+      data: {
+        userId: owner.id,
+        providerType: "cross-capacity-proof",
+        label: `cross-capacity-account-${suffix}`,
+        baseUrl: "https://example.test",
+        endpointIdentity: "https://example.test",
+        authType: "BEARER",
+      },
+    });
+    const capacities = await Promise.all(
+      [0, 1].map((index) =>
+        db.inferenceCapacity.create({
+          data: {
+            userId: owner.id,
+            label: `cross-capacity-${index}-${suffix}`,
+            runtimeIdentityKey: `cross-runtime-${index}-${suffix}`,
+            runtimeModel: "cross-capacity-proof",
+            hardConcurrencyLimit: 1,
+          },
+        }),
+      ),
+    );
+    const targets: Array<{ id: string }> = [];
+    const members: Array<{ id: string }> = [];
+    for (const [index, capacity] of capacities.entries()) {
+      const model = await db.providerModel.create({
+        data: {
+          userId: owner.id,
+          providerAccountId: account.id,
+          upstreamModelId: `cross-${index}-${suffix}`,
+        },
+      });
+      const target = await db.executionTarget.create({
+        data: {
+          userId: owner.id,
+          kind: "PROVIDER_MODEL",
+          providerModelId: model.id,
+          inferenceCapacityId: capacity.id,
+        },
+      });
+      const member = await db.poolMember.create({
+        data: { poolId: pool.id, executionTargetId: target.id, tier: "PRIMARY" },
+      });
+      targets.push(target);
+      members.push(member);
+    }
+    const deadlineAt = new Date(Date.now() + 60_000).toISOString();
+    const directAttempt = (index: number) => ({
+      attemptId: `cross-holder-${index}-${suffix}`,
+      requestId: `cross-holder-${index}-${suffix}`,
+      ownerId: owner.id,
+      sourceKind: "DIRECT" as const,
+      basePriority: 16,
+      connectionOwner: `cross-holder-${index}`,
+      deadlineAt,
+      candidates: [
+        {
+          capacityId: capacities[index]!.id,
+          executionTargetId: targets[index]!.id,
+          candidateOrder: 0,
+        },
+      ],
+    });
+    const holders = [0, 1].map((index) =>
+      startWorker({ operation: "acquire", attempt: directAttempt(index), hold: false }),
+    );
+    for (const holder of holders) children.add(holder.child);
+    const holderResults = await Promise.all(holders.map((holder) => holder.result));
+    expect(holderResults.every((result) => "state" in result && result.state === "ADMITTED")).toBe(
+      true,
+    );
+    const siblingAttempt = {
+      attemptId: `cross-sibling-${suffix}`,
+      requestId: `cross-sibling-${suffix}`,
+      ownerId: owner.id,
+      sourceKind: "POOL" as const,
+      poolId: pool.id,
+      basePriority: 16,
+      connectionOwner: "cross-sibling",
+      deadlineAt,
+      candidates: capacities.map((capacity, index) => ({
+        capacityId: capacity.id,
+        executionTargetId: targets[index]!.id,
+        poolMemberId: members[index]!.id,
+        candidateOrder: index,
+      })),
+    };
+    const sibling = startWorker({ operation: "acquire", attempt: siblingAttempt, hold: false });
+    children.add(sibling.child);
+    await expect(sibling.result).resolves.toMatchObject({ state: "WAITING" });
+    const releases = holderResults.map((result) => {
+      if (!("state" in result) || result.state !== "ADMITTED")
+        throw new Error("Cross-capacity holder was not admitted.");
+      return startWorker({ operation: "release", lease: result.lease });
+    });
+    for (const release of releases) children.add(release.child);
+    await expect(Promise.all(releases.map((release) => release.result))).resolves.toEqual([
+      { released: true },
+      { released: true },
+    ]);
+    const siblingLeases = await db.capacityLease.findMany({
+      where: { attemptId: siblingAttempt.attemptId, state: "ACTIVE" },
+    });
+    expect(siblingLeases).toHaveLength(1);
+    expect(await db.capacityLease.count({ where: { poolId: pool.id, state: "ACTIVE" } })).toBe(1);
+    const releaser = startWorker({
+      operation: "release",
+      lease: {
+        leaseId: siblingLeases[0]!.id,
+        attemptId: siblingLeases[0]!.attemptId,
+        capacityId: siblingLeases[0]!.capacityId,
+        executionTargetId: siblingLeases[0]!.executionTargetId,
+        fencingToken: siblingLeases[0]!.fencingToken.toString(),
+        expiresAt: siblingLeases[0]!.expiresAt.toISOString(),
+        poolMemberId: siblingLeases[0]!.poolMemberId ?? undefined,
+        reservationClass: siblingLeases[0]!.reservationClass,
+        borrowed: siblingLeases[0]!.borrowed,
+      },
+    });
+    children.add(releaser.child);
+    await expect(releaser.result).resolves.toEqual({ released: true });
+    await db.user.delete({ where: { id: owner.id } }).catch(() => undefined);
+  }, 60_000);
 
   it("runs real Hono workers through precommit and committed stream crashes", async () => {
     if (!db) return;
@@ -914,6 +1200,27 @@ integration("capacity admission across operating-system processes", () => {
             where: { providerModelId: primary.model.id, state: "ACTIVE" },
           }),
         ).toBe(0);
+        // The provider-attempt repair and the global capacity sweeper are
+        // deliberately independent crash-recovery loops. Model a database
+        // lease timeout as well before asking the restarted process to admit
+        // the next request; otherwise the killed process correctly retains
+        // its physical slot until the original 30-second lease expires.
+        const crashedCapacityLease = await db.capacityLease.findFirstOrThrow({
+          where: { capacityId: capacity.id, state: "ACTIVE" },
+          orderBy: { createdAt: "desc" },
+        });
+        await db.capacityLease.update({
+          where: { id: crashedCapacityLease.id },
+          data: { expiresAt: new Date(Date.now() - 1) },
+        });
+        const capacityRepair = startWorker({ operation: "reclaim", limit: 10 });
+        children.add(capacityRepair.child);
+        await expect(capacityRepair.result).resolves.toMatchObject({
+          reclaimed: expect.any(Number),
+        });
+        await expect(
+          db.capacityLease.findUniqueOrThrow({ where: { id: crashedCapacityLease.id } }),
+        ).resolves.toMatchObject({ state: "RECLAIMED" });
         const restarted = startWorker({ operation: "production-server" });
         children.add(restarted.child);
         const restartedResult = await restarted.result;
