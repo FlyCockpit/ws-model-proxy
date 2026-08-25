@@ -1540,6 +1540,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS provider_usage_ledger_attempt_revision_unique
 CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_settlement_reservation_revision_unique
   ON provider_budget_settlement ("reservationId", "attemptId", "fencingToken", "revisionSequence");
 
+-- Rows created before observationComplete was persisted already passed the
+-- then-current known-usage/cost invariants. Preserve that immutable accounting
+-- decision explicitly; unknown/conservative legacy rows remain NULL.
+UPDATE provider_usage_ledger
+   SET "observationComplete" = TRUE
+ WHERE "observationComplete" IS NULL
+   AND ("usageKnown" OR "costKnown");
+
 ALTER TABLE provider_usage_ledger DROP CONSTRAINT IF EXISTS provider_usage_ledger_shape_check;
 ALTER TABLE provider_usage_ledger ADD CONSTRAINT provider_usage_ledger_shape_check CHECK (
   "fencingToken" > 0 AND ("settledCost" IS NULL OR "settledCost" >= 0)

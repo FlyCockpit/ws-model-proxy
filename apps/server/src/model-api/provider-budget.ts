@@ -11,9 +11,9 @@ export { budgetWindow, providerBillableTokens } from "./provider-budget-accounti
 const RETRYABLE_TRANSACTION_CODES = new Set(["P2034", "40001", "40P01"]);
 const MAX_TRANSACTION_ATTEMPTS = 5;
 
-let terminalPersistenceTestFailure: (() => void) | undefined;
+let terminalPersistenceTestFailure: (() => unknown) | undefined;
 
-export function setTerminalPersistenceTestFailureInjector(injector: (() => void) | undefined) {
+export function setTerminalPersistenceTestFailureInjector(injector: (() => unknown) | undefined) {
   if (process.env.NODE_ENV !== "test")
     throw new Error("Terminal persistence failure injection is test-only");
   terminalPersistenceTestFailure = injector;
@@ -748,6 +748,28 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
         },
       });
     };
+    const finalizeNonCrashAnchor = async () => {
+      if (terminal.reason === "CRASH_RECOVERY" || anchor.state !== "ACTIVE") return;
+      const terminalAt = new Date();
+      const finalized = await tx.providerAttempt.updateMany({
+        where: { id: anchor.id, state: "ACTIVE" },
+        data: {
+          state:
+            terminal.reason === "COMPLETED"
+              ? "COMPLETED"
+              : terminal.reason === "CANCELLED"
+                ? "CANCELLED"
+                : "FAILED",
+          terminalReason: terminal.reason,
+          terminalAt,
+          heartbeatAt: terminalAt,
+        },
+      });
+      if (finalized.count !== 1)
+        throw new ProviderBudgetConfigurationError(
+          "Provider attempt was not active at terminal settlement",
+        );
+    };
 
     const usage = terminal.usage;
     const observationComplete = terminal.observationComplete ?? usage?.observationComplete;
@@ -779,6 +801,7 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
         priorRevision.revisionKind !== terminal.revisionKind
       )
         throw new ProviderBudgetConfigurationError("Accounting source revision conflict");
+      await finalizeNonCrashAnchor();
       await expireCrashAnchor();
       return;
     }
@@ -968,28 +991,8 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
             : "ESTIMATED",
       },
     });
-    terminalPersistenceTestFailure?.();
-    if (terminal.reason !== "CRASH_RECOVERY") {
-      const terminalAt = new Date();
-      const finalized = await tx.providerAttempt.updateMany({
-        where: { id: anchor.id, state: "ACTIVE" },
-        data: {
-          state:
-            terminal.reason === "COMPLETED"
-              ? "COMPLETED"
-              : terminal.reason === "CANCELLED"
-                ? "CANCELLED"
-                : "FAILED",
-          terminalReason: terminal.reason,
-          terminalAt,
-          heartbeatAt: terminalAt,
-        },
-      });
-      if (previousLedgers.length === 0 && finalized.count !== 1)
-        throw new ProviderBudgetConfigurationError(
-          "Provider attempt was not active at initial terminal settlement",
-        );
-    }
+    if (terminalPersistenceTestFailure?.() === "SIMULATE_LEGACY_SPLIT") return;
+    await finalizeNonCrashAnchor();
     await expireCrashAnchor();
   });
 }

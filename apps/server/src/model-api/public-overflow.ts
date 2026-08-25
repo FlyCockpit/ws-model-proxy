@@ -1737,14 +1737,15 @@ export async function dispatchPublicOverflow(
         if (reconciliation) return reconciliation;
         reconciliation = (async () => {
           stopHeartbeat();
-          const ok = streamComplete && httpOk;
+          const transportComplete = streamComplete && response.complete;
+          const ok = transportComplete && httpOk;
           const healthOutcome = providerHealthOutcome(status);
           const attemptAborted = request.signal.aborted || attemptController.signal.aborted;
           if (!attemptAborted && healthOutcome !== "NEUTRAL") {
             await recordProviderHealth(
               target,
               request.userId,
-              streamComplete && healthOutcome === "SUCCESS",
+              transportComplete && healthOutcome === "SUCCESS",
               { status, retryAfter: response.headers["retry-after"] },
               { attemptId, fencingToken },
             ).catch(() => undefined);
@@ -1760,7 +1761,7 @@ export async function dispatchPublicOverflow(
           }
           const observedUsage = parseProviderUsage(usageChunks, pricing);
           const observationComplete =
-            streamComplete &&
+            transportComplete &&
             (!request.stream ||
               providerStreamHasTerminalUsageEvent(
                 usageChunks,
@@ -1825,7 +1826,7 @@ export async function dispatchPublicOverflow(
                   confidence: usage.confidence,
                 }
               : undefined,
-            metadata: { status, responseBytes, streamComplete },
+            metadata: { status, responseBytes, streamComplete: transportComplete },
           }).catch(() => undefined);
           resolveTerminal({ ok, responseBytes });
         })();
@@ -1842,8 +1843,10 @@ export async function dispatchPublicOverflow(
               // health release are durable. Sequential Responses lifecycle
               // calls issued immediately after body consumption must not race
               // the preceding attempt's half-open claim.
-              await reconcile(true);
-              controller.close();
+              await reconcile(response.complete);
+              if (response.complete || !httpOk) controller.close();
+              else
+                controller.error(new Error("Provider response ended before transport completion"));
             } else {
               responseBytes += chunk.value.byteLength;
               // Retain the bounded tail, not merely the prefix. Streaming APIs

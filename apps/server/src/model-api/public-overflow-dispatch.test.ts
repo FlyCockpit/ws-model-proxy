@@ -512,6 +512,7 @@ describe("public overflow terminal response dispatch", () => {
   it.each([
     {
       label: "OpenAI partial usage",
+      stream: true,
       protocol: "openai",
       surface: "openai-chat",
       path: "/v1/chat/completions",
@@ -521,12 +522,22 @@ describe("public overflow terminal response dispatch", () => {
     },
     {
       label: "Anthropic message_start usage",
+      stream: true,
       protocol: "anthropic",
       surface: "anthropic-messages",
       path: "/v1/messages",
       chunk:
         'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":0}}}\n\n',
       expected: { inputTokens: 12n, outputTokens: 0n },
+    },
+    {
+      label: "non-stream cost-only usage",
+      stream: false,
+      protocol: "openai",
+      surface: "openai-chat",
+      path: "/v1/chat/completions",
+      chunk: '{"usage":{"cost":1,"currency":"USD","pricing_version":"price-v1"}}',
+      expected: { reportedCost: 1 },
     },
   ])("retains $label when the upstream ends before its terminal event", async (fixture) => {
     reconcileProviderBudget.mockClear();
@@ -567,7 +578,7 @@ describe("public overflow terminal response dispatch", () => {
       reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
       requestedProtocol: fixture.protocol as "openai" | "anthropic",
       requestedSurface: fixture.surface as "openai-chat" | "anthropic-messages",
-      stream: true,
+      stream: fixture.stream,
       requiredFeatures: [],
       path: fixture.path,
       headers: new Headers({ "content-type": "application/json" }),
@@ -581,7 +592,7 @@ describe("public overflow terminal response dispatch", () => {
     });
     expect(result.dispatched).toBe(true);
     if (!result.dispatched) throw new Error("expected dispatch");
-    await result.response.text();
+    await expect(result.response.text()).rejects.toThrow("before transport completion");
     await result.terminal;
 
     expect(reconcileProviderBudget).toHaveBeenCalledWith(

@@ -340,6 +340,59 @@ integration("provider budget admission and reconciliation", () => {
     ).resolves.toMatchObject({ state: "COMPLETED", terminalReason: "COMPLETED" });
   });
 
+  it("finalizes an active legacy split-phase orphan on an idempotent terminal retry", async () => {
+    if (!db) return;
+    const row = await fixture({ metric: "TOKENS" });
+    const original = attempt(row, `legacy-terminal-orphan-${crypto.randomUUID()}`, {
+      tokens: 8n,
+      accountingVersion: "usage-v1",
+    });
+    await service.admitProviderBudget(original);
+    const terminal = {
+      ...original,
+      reason: "COMPLETED" as const,
+      revisionSequence: 1n,
+      revisionKind: "SNAPSHOT" as const,
+      observationComplete: true,
+      usage: {
+        accountingVersion: "usage-v1",
+        authoritativeBillableTokens: 3n,
+        confidence: "REPORTED" as const,
+      },
+    };
+    service.setTerminalPersistenceTestFailureInjector(() => "SIMULATE_LEGACY_SPLIT");
+    await service.reconcileProviderBudget(terminal);
+    service.setTerminalPersistenceTestFailureInjector(undefined);
+    await expect(
+      db.providerAttempt.findUniqueOrThrow({
+        where: {
+          attemptId_fencingToken: {
+            attemptId: original.attemptId,
+            fencingToken: original.fencingToken,
+          },
+        },
+      }),
+    ).resolves.toMatchObject({ state: "ACTIVE", terminalAt: null });
+    expect(await db.providerUsageLedger.count({ where: { attemptId: original.attemptId } })).toBe(
+      1,
+    );
+
+    await service.reconcileProviderBudget(terminal);
+    expect(await db.providerUsageLedger.count({ where: { attemptId: original.attemptId } })).toBe(
+      1,
+    );
+    await expect(
+      db.providerAttempt.findUniqueOrThrow({
+        where: {
+          attemptId_fencingToken: {
+            attemptId: original.attemptId,
+            fencingToken: original.fencingToken,
+          },
+        },
+      }),
+    ).resolves.toMatchObject({ state: "COMPLETED", terminalReason: "COMPLETED" });
+  });
+
   it("leaves a failed terminal transaction recoverable by the crash sweeper", async () => {
     if (!db) return;
     const row = await fixture({ metric: "TOKENS" });
