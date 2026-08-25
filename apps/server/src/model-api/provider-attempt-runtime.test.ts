@@ -118,6 +118,82 @@ describe("provider attempt failure policy", () => {
     expect(tx.providerModel.update).not.toHaveBeenCalled();
   });
 
+  it("atomically reclaims stale account and model half-open leases", async () => {
+    const now = new Date("2026-08-25T00:02:00.000Z");
+    const stale = new Date("2026-08-25T00:00:59.999Z");
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
+      providerAccount: {
+        findUniqueOrThrow: vi.fn().mockResolvedValue({
+          healthNextRetryAt: new Date("2026-08-25T00:00:30.000Z"),
+          healthHalfOpenAt: stale,
+        }),
+        update: vi.fn().mockResolvedValue({}),
+      },
+      providerModel: {
+        findUniqueOrThrow: vi.fn().mockResolvedValue({
+          healthNextRetryAt: new Date("2026-08-25T00:00:30.000Z"),
+          healthHalfOpenAt: stale,
+        }),
+        update: vi.fn().mockResolvedValue({}),
+      },
+    };
+    db.$transaction.mockImplementationOnce(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+
+    await expect(
+      claimProviderHealthTrial({
+        userId: "owner",
+        providerAccountId: "account",
+        providerModelId: "model",
+        now,
+      }),
+    ).resolves.toBe("HALF_OPEN");
+    expect(tx.providerAccount.update).toHaveBeenCalledWith({
+      where: { id: "account", userId: "owner" },
+      data: { healthHalfOpenAt: now },
+    });
+    expect(tx.providerModel.update).toHaveBeenCalledWith({
+      where: { id: "model", userId: "owner" },
+      data: { healthHalfOpenAt: now },
+    });
+  });
+
+  it("does not steal a live half-open lease", async () => {
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
+      providerAccount: {
+        findUniqueOrThrow: vi.fn().mockResolvedValue({
+          healthNextRetryAt: new Date("2026-08-25T00:00:30.000Z"),
+          healthHalfOpenAt: new Date("2026-08-25T00:01:30.001Z"),
+        }),
+        update: vi.fn(),
+      },
+      providerModel: {
+        findUniqueOrThrow: vi.fn().mockResolvedValue({
+          healthNextRetryAt: new Date("2026-08-25T00:00:30.000Z"),
+          healthHalfOpenAt: null,
+        }),
+        update: vi.fn(),
+      },
+    };
+    db.$transaction.mockImplementationOnce(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+
+    await expect(
+      claimProviderHealthTrial({
+        userId: "owner",
+        providerAccountId: "account",
+        providerModelId: "model",
+        now: new Date("2026-08-25T00:02:00.000Z"),
+      }),
+    ).resolves.toBe("COOLDOWN");
+    expect(tx.providerAccount.update).not.toHaveBeenCalled();
+    expect(tx.providerModel.update).not.toHaveBeenCalled();
+  });
+
   it("persists a prompt-free, fully correlated append-only attempt event", async () => {
     const firstClientByteAt = new Date("2026-08-25T00:00:00.000Z");
     await recordProviderAttemptEvent({

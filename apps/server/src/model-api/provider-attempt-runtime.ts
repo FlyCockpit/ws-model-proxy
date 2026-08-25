@@ -4,7 +4,11 @@ import prisma from "@ws-model-proxy/db";
 // prescribe a duration. Cap both local backoff and untrusted Retry-After at
 // five minutes so a provider response cannot disable a configured target
 // indefinitely; repeated failures re-enter the same bounded cooldown.
-const MAX_COOLDOWN_MS = 5 * 60_000;
+export const PROVIDER_MAX_COOLDOWN_MS = 5 * 60_000;
+// A half-open claim is a lease, not a permanent latch. Provider attempts are
+// heartbeated every ten seconds, so one minute allows ample scheduling jitter
+// while guaranteeing recovery after a worker dies between claim and outcome.
+export const PROVIDER_HALF_OPEN_LEASE_MS = 60_000;
 const BASE_COOLDOWN_MS = 1_000;
 
 export type ProviderFailureClass =
@@ -103,9 +107,12 @@ export async function claimProviderHealthTrial(input: {
     });
     const cooldowns = [account, model].filter((health) => health.healthNextRetryAt !== null);
     if (cooldowns.length === 0) return "READY";
+    const liveLeaseCutoff = new Date(now.getTime() - PROVIDER_HALF_OPEN_LEASE_MS);
     if (
       cooldowns.some(
-        (health) => health.healthNextRetryAt! > now || health.healthHalfOpenAt !== null,
+        (health) =>
+          health.healthNextRetryAt! > now ||
+          (health.healthHalfOpenAt !== null && health.healthHalfOpenAt > liveLeaseCutoff),
       )
     )
       return "COOLDOWN";
@@ -124,8 +131,11 @@ export async function claimProviderHealthTrial(input: {
 }
 
 function backoffMs(failures: number, retryAfterMs?: number): number {
-  const exponential = Math.min(MAX_COOLDOWN_MS, BASE_COOLDOWN_MS * 2 ** Math.min(12, failures - 1));
-  return Math.min(MAX_COOLDOWN_MS, Math.max(exponential, retryAfterMs ?? 0));
+  const exponential = Math.min(
+    PROVIDER_MAX_COOLDOWN_MS,
+    BASE_COOLDOWN_MS * 2 ** Math.min(12, failures - 1),
+  );
+  return Math.min(PROVIDER_MAX_COOLDOWN_MS, Math.max(exponential, retryAfterMs ?? 0));
 }
 
 export async function recordProviderOutcome(input: {
@@ -259,9 +269,10 @@ export function parseRetryAfter(
   const raw = Array.isArray(value) ? value[0] : value;
   if (!raw) return undefined;
   const seconds = Number(raw);
-  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(MAX_COOLDOWN_MS, seconds * 1_000);
+  if (Number.isFinite(seconds) && seconds >= 0)
+    return Math.min(PROVIDER_MAX_COOLDOWN_MS, seconds * 1_000);
   const timestamp = Date.parse(raw);
   return Number.isFinite(timestamp)
-    ? Math.min(MAX_COOLDOWN_MS, Math.max(0, timestamp - now))
+    ? Math.min(PROVIDER_MAX_COOLDOWN_MS, Math.max(0, timestamp - now))
     : undefined;
 }

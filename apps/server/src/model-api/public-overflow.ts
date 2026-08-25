@@ -323,6 +323,7 @@ export async function listPublicOverflowTargets(
                   maxOutputTokens: true,
                   nativeCapabilities: true,
                   healthStatus: true,
+                  healthNextRetryAt: true,
                   enabled: true,
                   deletedAt: true,
                   ProviderAccount: {
@@ -334,6 +335,7 @@ export async function listPublicOverflowTargets(
                       baseUrl: true,
                       authType: true,
                       healthStatus: true,
+                      healthNextRetryAt: true,
                       enabled: true,
                       deletedAt: true,
                       CurrentCredential: {
@@ -378,8 +380,8 @@ export async function listPublicOverflowTargets(
       model.deletedAt ||
       account.deletedAt ||
       credential.status !== "ACTIVE" ||
-      model.healthStatus === "UNAVAILABLE" ||
-      account.healthStatus === "UNAVAILABLE"
+      (model.healthStatus === "UNAVAILABLE" && model.healthNextRetryAt === null) ||
+      (account.healthStatus === "UNAVAILABLE" && account.healthNextRetryAt === null)
     )
       return [];
     return [
@@ -1049,13 +1051,18 @@ export async function dispatchPublicOverflow(
         }),
       };
     } catch {
-      await recordProviderOutcome({
-        userId: request.userId,
-        providerAccountId: target.providerAccountId,
-        providerModelId: target.providerModelId,
-        success: false,
-        failureClass: "TRANSPORT",
-      }).catch(() => undefined);
+      // A caller disappearing before provider response is not evidence that
+      // the provider transport is unhealthy. Keep the existing health state;
+      // cancellation still terminalizes and reconciles the durable attempt.
+      if (!request.signal.aborted) {
+        await recordProviderOutcome({
+          userId: request.userId,
+          providerAccountId: target.providerAccountId,
+          providerModelId: target.providerModelId,
+          success: false,
+          failureClass: "TRANSPORT",
+        }).catch(() => undefined);
+      }
       await reconcileProviderBudget({
         userId: request.userId,
         providerAccountId: target.providerAccountId,

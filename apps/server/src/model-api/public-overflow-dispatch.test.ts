@@ -41,9 +41,70 @@ vi.mock("./provider-attempt-runtime.js", () => ({
   recordProviderOutcome,
 }));
 
-import { dispatchPublicOverflow } from "./public-overflow.js";
+import { dispatchPublicOverflow, listPublicOverflowTargets } from "./public-overflow.js";
 
 describe("public overflow terminal response dispatch", () => {
+  it("keeps unavailable targets with cooldown metadata eligible for half-open recovery", async () => {
+    db.modelPool.findFirst.mockResolvedValue({
+      publicEgressEnabled: true,
+      publicEgressAcknowledged: true,
+      PoolMembers: [
+        {
+          id: "member",
+          publicOrder: 0,
+          ExecutionTarget: {
+            id: "target",
+            ProviderModel: {
+              id: "model",
+              userId: "owner",
+              upstreamModelId: "upstream-model",
+              contextWindow: 10_000,
+              maxOutputTokens: 1_000,
+              nativeCapabilities: {
+                protocols: ["openai"],
+                surfaces: ["openai-chat"],
+                streaming: true,
+                features: [],
+              },
+              healthStatus: "UNAVAILABLE",
+              healthNextRetryAt: new Date("2026-08-25T00:00:00.000Z"),
+              enabled: true,
+              deletedAt: null,
+              ProviderAccount: {
+                id: "account",
+                userId: "owner",
+                providerType: "openai",
+                providerVersion: null,
+                baseUrl: "https://provider.example",
+                authType: "BEARER",
+                healthStatus: "UNAVAILABLE",
+                healthNextRetryAt: new Date("2026-08-25T00:00:00.000Z"),
+                enabled: true,
+                deletedAt: null,
+                CurrentCredential: {
+                  id: "credential",
+                  credentialType: "BEARER",
+                  aadVersion: 1,
+                  algorithm: "AES-256-GCM",
+                  keyVersion: "v1",
+                  ciphertext: new Uint8Array(),
+                  nonce: new Uint8Array(),
+                  authTag: new Uint8Array(),
+                  status: "ACTIVE",
+                },
+              },
+            },
+          },
+        },
+      ],
+    });
+
+    const listed = await listPublicOverflowTargets("owner", "pool");
+
+    expect(listed.targets).toHaveLength(1);
+    expect(listed.targets[0]?.providerModelId).toBe("model");
+  });
+
   it("returns a non-retry-safe 429 with Retry-After and records its cooldown", async () => {
     db.modelPool.findFirst.mockResolvedValue({
       publicEgressEnabled: true,
@@ -156,5 +217,107 @@ describe("public overflow terminal response dispatch", () => {
         retryAfterMs: 37_000,
       }),
     );
+  });
+
+  it("does not record client cancellation before response as a provider transport failure", async () => {
+    recordProviderOutcome.mockClear();
+    db.modelPool.findFirst.mockResolvedValue({
+      publicEgressEnabled: true,
+      publicEgressAcknowledged: true,
+      PoolMembers: [
+        {
+          id: "member-cancel",
+          publicOrder: 0,
+          ExecutionTarget: {
+            id: "target-cancel",
+            ProviderModel: {
+              id: "model-cancel",
+              userId: "owner",
+              upstreamModelId: "upstream-model",
+              contextWindow: 10_000,
+              maxOutputTokens: 1_000,
+              nativeCapabilities: {
+                protocols: ["openai"],
+                surfaces: ["openai-chat"],
+                streaming: true,
+                features: [],
+              },
+              healthStatus: "HEALTHY",
+              healthNextRetryAt: null,
+              enabled: true,
+              deletedAt: null,
+              ProviderAccount: {
+                id: "account-cancel",
+                userId: "owner",
+                providerType: "openai",
+                providerVersion: null,
+                baseUrl: "https://provider.example",
+                authType: "BEARER",
+                healthStatus: "HEALTHY",
+                healthNextRetryAt: null,
+                enabled: true,
+                deletedAt: null,
+                CurrentCredential: {
+                  id: "credential-cancel",
+                  credentialType: "BEARER",
+                  aadVersion: 1,
+                  algorithm: "AES-256-GCM",
+                  keyVersion: "v1",
+                  ciphertext: new Uint8Array(),
+                  nonce: new Uint8Array(),
+                  authTag: new Uint8Array(),
+                  status: "ACTIVE",
+                },
+              },
+            },
+          },
+        },
+      ],
+    });
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
+      providerCredential: {
+        findFirst: vi.fn().mockResolvedValue({
+          id: "credential-cancel",
+          credentialType: "BEARER",
+          aadVersion: 1,
+          algorithm: "AES-256-GCM",
+          keyVersion: "v1",
+          ciphertext: new Uint8Array(),
+          nonce: new Uint8Array(),
+          authTag: new Uint8Array(),
+        }),
+        update: vi.fn().mockResolvedValue({ id: "credential-cancel" }),
+      },
+    };
+    db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+    const controller = new AbortController();
+    controller.abort(new Error("client disconnected"));
+    providerHttpsRequest.mockRejectedValueOnce(controller.signal.reason);
+
+    const result = await dispatchPublicOverflow({
+      userId: "owner",
+      poolId: "pool",
+      requestId: "request-cancel",
+      reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      requestedProtocol: "openai",
+      requestedSurface: "openai-chat",
+      stream: false,
+      requiredFeatures: [],
+      path: "/v1/chat/completions",
+      headers: new Headers({ "content-type": "application/json" }),
+      body: new TextEncoder().encode('{"model":"pool"}'),
+      signal: controller.signal,
+      liability: { tokens: 10n, accountingVersion: "provider-billable-v1" },
+      requestedOutputTokens: 1n,
+      releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+      adaptationEnabled: false,
+      retrySafe: false,
+    });
+
+    expect(result).toEqual({ dispatched: false, reason: "PROVIDER_UNAVAILABLE" });
+    expect(recordProviderOutcome).not.toHaveBeenCalled();
   });
 });
