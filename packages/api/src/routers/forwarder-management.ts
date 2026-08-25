@@ -1230,6 +1230,7 @@ export const forwarderManagementRouter = {
               .array(
                 z.object({
                   providerModelId: idSchema,
+                  tier: z.enum(["PRIMARY", "PUBLIC_OVERFLOW"]).default("PUBLIC_OVERFLOW"),
                   concurrencyLimit: z.number().int().min(1).max(10_000),
                   dailySpendLimit: z.string(),
                   budgetRules: z
@@ -1255,7 +1256,10 @@ export const forwarderManagementRouter = {
                 message: "Reserved slots exceed member concurrency",
               });
             }
-            if (input.providerModels.length > 0 && !input.publicEgressAcknowledged) {
+            if (
+              input.providerModels.some((provider) => provider.tier === "PUBLIC_OVERFLOW") &&
+              !input.publicEgressAcknowledged
+            ) {
               ctx.addIssue({
                 code: "custom",
                 path: ["publicEgressAcknowledged"],
@@ -1457,6 +1461,9 @@ export const forwarderManagementRouter = {
             });
           }
           const providerIds = input.providerModels.map((item) => item.providerModelId);
+          const hasPublicOverflow = input.providerModels.some(
+            (item) => item.tier === "PUBLIC_OVERFLOW",
+          );
           const providers = providerIds.length
             ? await tx.providerModel.findMany({
                 where: {
@@ -1498,8 +1505,8 @@ export const forwarderManagementRouter = {
               protocolAdaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
               allowLossyDeveloperRoleCollapse:
                 input.advanced?.allowLossyDeveloperRoleCollapse ?? false,
-              publicEgressEnabled: providerIds.length > 0,
-              publicEgressAcknowledged: providerIds.length > 0,
+              publicEgressEnabled: hasPublicOverflow,
+              publicEgressAcknowledged: hasPublicOverflow,
               recommendedSurfaceOverride: input.recommendedSurface,
               capacityPriority: 16,
               capacityConcurrencyLimit: input.memberConcurrencyLimit,
@@ -1572,7 +1579,8 @@ export const forwarderManagementRouter = {
             });
           }
           const providerById = new Map(providers.map((provider) => [provider.id, provider]));
-          for (const [publicOrder, protection] of input.providerModels.entries()) {
+          let publicOrder = 0;
+          for (const protection of input.providerModels) {
             const provider = providerById.get(protection.providerModelId);
             if (!provider) throw new ORPCError("PRECONDITION_FAILED");
             const target = await tx.executionTarget.upsert({
@@ -1585,9 +1593,9 @@ export const forwarderManagementRouter = {
               data: {
                 poolId: pool.id,
                 executionTargetId: target.id,
-                tier: "PUBLIC_OVERFLOW",
-                publicOrder,
-                weight: 0,
+                tier: protection.tier,
+                publicOrder: protection.tier === "PUBLIC_OVERFLOW" ? publicOrder++ : null,
+                weight: protection.tier === "PRIMARY" ? 1 : 0,
               },
             });
             const budget = await tx.providerBudgetPolicy.create({

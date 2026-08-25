@@ -163,6 +163,7 @@ export function GuardedPoolSetupWizard({
       localWaitBudgetMs: z.number().int().min(0).max(600_000),
       recommendedSurface: z.enum(surfaces),
       providerModelIds: z.array(z.string()).max(32),
+      providerTier: z.enum(["PRIMARY", "PUBLIC_OVERFLOW"]),
       providerConcurrencyLimit: z.number().int().min(1).max(10_000),
       dailySpendLimit: z.string(),
       publicEgressAcknowledged: z.boolean(),
@@ -199,7 +200,11 @@ export function GuardedPoolSetupWizard({
     .superRefine((value, ctx) => {
       if (value.reservedSlots > value.memberConcurrencyLimit)
         ctx.addIssue({ code: "custom", path: ["reservedSlots"] });
-      if (value.providerModelIds.length > 0 && !value.publicEgressAcknowledged)
+      if (
+        value.providerModelIds.length > 0 &&
+        value.providerTier === "PUBLIC_OVERFLOW" &&
+        !value.publicEgressAcknowledged
+      )
         ctx.addIssue({ code: "custom", path: ["publicEgressAcknowledged"] });
       if (
         value.localModelIds.length > 0 &&
@@ -252,6 +257,7 @@ export function GuardedPoolSetupWizard({
       localWaitBudgetMs: 30_000,
       recommendedSurface: "OPENAI_RESPONSES" as (typeof surfaces)[number],
       providerModelIds: initialProviderModelIds,
+      providerTier: "PUBLIC_OVERFLOW" as "PRIMARY" | "PUBLIC_OVERFLOW",
       providerConcurrencyLimit: 1,
       dailySpendLimit: "10.00",
       publicEgressAcknowledged: false,
@@ -338,6 +344,7 @@ export function GuardedPoolSetupWizard({
         },
         providerModels: value.providerModelIds.map((providerModelId) => ({
           providerModelId,
+          tier: value.providerTier,
           concurrencyLimit: value.providerConcurrencyLimit,
           dailySpendLimit: value.dailySpendLimit,
           budgetRules: {
@@ -387,6 +394,7 @@ export function GuardedPoolSetupWizard({
     [
       "recommendedSurface",
       "providerModelIds",
+      "providerTier",
       "providerConcurrencyLimit",
       "dailySpendLimit",
       "publicEgressAcknowledged",
@@ -936,6 +944,31 @@ export function GuardedPoolSetupWizard({
                       </p>
                     ) : null}
                   </fieldset>
+                )}
+              </form.Field>
+              <form.Field name="providerTier">
+                {(field) => (
+                  <div className="space-y-2">
+                    <Label htmlFor="guarded-provider-tier">
+                      {t("dashboard:pools.wizard.fields.providerTier")}
+                    </Label>
+                    <select
+                      id="guarded-provider-tier"
+                      className="h-11 w-full rounded-md border bg-background px-3 text-sm"
+                      value={field.state.value}
+                      onChange={(event) =>
+                        field.handleChange(event.target.value as typeof field.state.value)
+                      }
+                    >
+                      <option value="PRIMARY">{t("dashboard:pools.memberTiers.PRIMARY")}</option>
+                      <option value="PUBLIC_OVERFLOW">
+                        {t("dashboard:pools.memberTiers.PUBLIC_OVERFLOW")}
+                      </option>
+                    </select>
+                    <p className="text-sm text-muted-foreground">
+                      {t("dashboard:pools.wizard.providerTierDisclosure")}
+                    </p>
+                  </div>
                 )}
               </form.Field>
               <form.Subscribe selector={(state) => state.values.providerModelIds.length}>
