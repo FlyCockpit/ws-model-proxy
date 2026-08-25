@@ -18,6 +18,8 @@ export function holdCapacityLeaseForResponse({
   let finished = false;
   let heartbeatRunning = false;
   let timer: ReturnType<typeof setInterval> | undefined;
+  let downstream: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let terminalError: unknown;
   const finish = async () => {
     if (finished) return;
     finished = true;
@@ -30,14 +32,29 @@ export function holdCapacityLeaseForResponse({
     heartbeatRunning = true;
     try {
       const retained = await store.heartbeat(lease, new Date(Date.now() + leaseExtensionMs));
-      if (!retained) await finish();
+      if (!retained) await loseLease(new Error("Capacity lease was lost while streaming."));
+    } catch (error) {
+      await loseLease(error);
     } finally {
       heartbeatRunning = false;
     }
   };
   const reader = response.body?.getReader();
+  const loseLease = async (reason: unknown) => {
+    if (finished) return;
+    terminalError =
+      reason instanceof Error
+        ? reason
+        : new Error("Capacity lease was lost while streaming.", { cause: reason });
+    downstream?.error(terminalError);
+    try {
+      await reader?.cancel(terminalError);
+    } finally {
+      await finish();
+    }
+  };
   const abort = () => {
-    void reader?.cancel(signal?.reason).finally(finish);
+    void loseLease(signal?.reason ?? new DOMException("Aborted", "AbortError"));
   };
   signal?.addEventListener("abort", abort, { once: true });
   if (heartbeatIntervalMs > 0) timer = setInterval(() => void heartbeat(), heartbeatIntervalMs);
@@ -47,9 +64,14 @@ export function holdCapacityLeaseForResponse({
     return response;
   }
   const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      downstream = controller;
+      if (signal?.aborted) abort();
+    },
     async pull(controller) {
       try {
         const chunk = await reader.read();
+        if (terminalError) return;
         if (chunk.done) {
           controller.close();
           await finish();
@@ -57,7 +79,7 @@ export function holdCapacityLeaseForResponse({
         }
         controller.enqueue(chunk.value);
       } catch (error) {
-        controller.error(error);
+        if (!terminalError) controller.error(error);
         await finish();
       }
     },

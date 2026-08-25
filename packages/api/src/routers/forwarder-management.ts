@@ -479,7 +479,8 @@ function serializeCliDevice(row: CliDeviceRow, now: Date) {
         published: model.published,
         unpublishedAt: model.unpublishedAt,
         maxAttachmentBytes: model.maxAttachmentBytes,
-        executionTarget: model.ExecutionTargets[0] ?? null,
+        // Older mocked/serialized inventory rows predate execution targets.
+        executionTarget: model.ExecutionTargets?.[0] ?? null,
       })),
     })),
   };

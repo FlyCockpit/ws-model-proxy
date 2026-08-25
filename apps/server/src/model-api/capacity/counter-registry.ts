@@ -38,3 +38,6 @@ export class ContextCounterRegistry {
     return this.counters.get(key(identity)) ?? null;
   }
 }
+
+/** Process-wide hook point for tokenizer/template implementations loaded by the server runtime. */
+export const contextCounterRegistry = new ContextCounterRegistry();

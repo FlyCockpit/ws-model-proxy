@@ -716,6 +716,8 @@ function leaseHandle(lease: {
   poolMemberId: string | null;
   fencingToken: bigint;
   expiresAt: Date;
+  reservationClass: number;
+  borrowed: boolean;
 }): CapacityLeaseHandle {
   return {
     leaseId: lease.id,
@@ -725,5 +727,7 @@ function leaseHandle(lease: {
     ...(lease.poolMemberId ? { poolMemberId: lease.poolMemberId } : {}),
     fencingToken: lease.fencingToken,
     expiresAt: lease.expiresAt,
+    reservationClass: lease.reservationClass,
+    borrowed: lease.borrowed,
   };
 }

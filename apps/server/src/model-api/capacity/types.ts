@@ -29,6 +29,8 @@ export type CapacityLeaseHandle = {
   poolMemberId?: string;
   fencingToken: bigint;
   expiresAt: Date;
+  reservationClass?: number;
+  borrowed?: boolean;
 };
 
 export type AdmissionResult =

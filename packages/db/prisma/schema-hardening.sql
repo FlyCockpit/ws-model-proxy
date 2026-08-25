@@ -126,6 +126,18 @@ ALTER TABLE capacity_lease ADD CONSTRAINT capacity_lease_shape_check CHECK (
     OR (state <> 'ACTIVE' AND "releasedAt" IS NOT NULL))
 );
 
+ALTER TABLE response_stickiness_record
+  DROP CONSTRAINT IF EXISTS response_stickiness_routing_version_check;
+ALTER TABLE response_stickiness_record
+  ADD CONSTRAINT response_stickiness_routing_version_check CHECK ("routingVersion" >= 1);
+
+ALTER TABLE relay_request DROP CONSTRAINT IF EXISTS relay_request_admission_telemetry_check;
+ALTER TABLE relay_request ADD CONSTRAINT relay_request_admission_telemetry_check CHECK (
+  ("admissionWaitDurationMs" IS NULL OR "admissionWaitDurationMs" >= 0)
+  AND ("admissionReservationClass" IS NULL OR "admissionReservationClass" BETWEEN 0 AND 31)
+  AND ("admissionFencingToken" IS NULL OR "admissionFencingToken" > 0)
+);
+
 -- Partial indexes document and enforce the live-winner invariant even if a
 -- future archival change relaxes the stronger one-lease-per-attempt FK.
 CREATE UNIQUE INDEX IF NOT EXISTS capacity_waiter_one_admitted_winner

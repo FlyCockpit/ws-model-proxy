@@ -550,7 +550,7 @@ describe("forwarderManagementRouter", () => {
         discoveredModelId: "model-id",
         weight: 5,
       }),
-    ).resolves.toEqual({ id: "member-id" });
+    ).resolves.toEqual({ id: "member-id", executionTargetId: "target-id" });
     expect(db.poolMember.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
         poolId: "pool-id",

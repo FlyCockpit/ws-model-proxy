@@ -47,6 +47,7 @@ import {
   contextFitsLimits,
   countSerializedRequestContext,
 } from "./capacity/context.js";
+import { contextCounterRegistry } from "./capacity/counter-registry.js";
 import { PostgresCapacityAdmissionStore } from "./capacity/postgres-store.js";
 import {
   type CapacityAdmissionRuntime,
@@ -367,6 +368,27 @@ async function nativeContextCount({
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
 }): Promise<ContextCountTelemetry | null> {
   if (!operation.contextInput) return null;
+  const capacity = selected.ExecutionTarget?.InferenceCapacity;
+  const registeredCounter = capacity
+    ? contextCounterRegistry.resolve({
+        runtimeIdentityKey: capacity.runtimeIdentityKey,
+        runtimeModel: capacity.runtimeModel,
+        runtimeRevision: capacity.runtimeRevision,
+        tokenizer: capacity.tokenizer,
+        tokenizerVersion: capacity.tokenizerVersion,
+        template: capacity.template,
+        templateVersion: capacity.templateVersion,
+      })
+    : null;
+  const countWithRegisteredCounter = async () => {
+    if (!registeredCounter) return null;
+    return countSerializedRequestContext({
+      input: operation.contextInput,
+      counters: [registeredCounter],
+      useTokenEstimate: false,
+      signal: request.signal,
+    });
+  };
   if (
     operation.capability === "responses.countTokens" ||
     operation.capability === "messages.countTokens"
@@ -378,7 +400,7 @@ async function nativeContextCount({
       : operation.family === "messages"
         ? ("messages.countTokens" as const)
         : null;
-  if (!countCapability) return null;
+  if (!countCapability) return countWithRegisteredCounter();
   const countOperation: RelayOperation = {
     family: operation.family,
     method: "POST",
@@ -394,13 +416,13 @@ async function nativeContextCount({
       operation: countOperation,
     })
   ) {
-    return null;
+    return countWithRegisteredCounter();
   }
   let built: BuiltRelayRequest | undefined;
   let attempt: ReturnType<typeof startRelayAttempt> | undefined;
   try {
     built = await operation.buildRequest(selected.upstreamModelId);
-    if (!(built.body instanceof Uint8Array)) return null;
+    if (!(built.body instanceof Uint8Array)) return countWithRegisteredCounter();
     attempt = startRelayAttempt({
       manager,
       cliDeviceId: selected.Endpoint.cliDeviceId,
@@ -417,13 +439,14 @@ async function nativeContextCount({
     if (started.status < 200 || started.status >= 300) {
       await started.body.cancel("native_count_status");
       await attempt.terminal;
-      return null;
+      return countWithRegisteredCounter();
     }
     const payload = await readBoundedJson(started.body, NATIVE_CONTEXT_COUNT_MAX_BYTES);
     const terminal = await attempt.terminal;
-    if (!terminal.ok || !isJsonObject(payload)) return null;
+    if (!terminal.ok || !isJsonObject(payload)) return countWithRegisteredCounter();
     const tokens = payload.input_tokens;
-    if (!Number.isSafeInteger(tokens) || (tokens as number) < 0) return null;
+    if (!Number.isSafeInteger(tokens) || (tokens as number) < 0)
+      return countWithRegisteredCounter();
     return {
       tokens: tokens as number,
       method: "NATIVE",
@@ -435,7 +458,7 @@ async function nativeContextCount({
   } catch {
     attempt?.cancel(request.signal.aborted ? "cancelled" : "protocol_error");
     if (request.signal.aborted) throw request.signal.reason;
-    return null;
+    return countWithRegisteredCounter();
   }
 }
 
@@ -456,6 +479,7 @@ type ResponseStickinessCapture = {
 };
 
 type ResponseStickinessRecordRow = {
+  routingVersion?: number;
   userId: string;
   modelApiTokenId: string | null;
   targetDiscoveredModelId: string | null;
@@ -491,7 +515,16 @@ type DirectModelRelayRow = {
     inferenceCapacityId: string | null;
     directContextCeiling?: number | null;
     directContextMargin?: number;
-    InferenceCapacity?: { physicalMaxContext: number | null } | null;
+    InferenceCapacity?: {
+      physicalMaxContext: number | null;
+      runtimeIdentityKey: string;
+      runtimeModel: string;
+      runtimeRevision: string | null;
+      tokenizer: string | null;
+      tokenizerVersion: string | null;
+      template: string | null;
+      templateVersion: string | null;
+    } | null;
   } | null;
   Endpoint: {
     id: string;
@@ -508,7 +541,16 @@ type PoolMemberRelayRow = PoolMemberRouteRow & {
   ExecutionTarget: {
     id: string;
     inferenceCapacityId: string | null;
-    InferenceCapacity?: { physicalMaxContext: number | null } | null;
+    InferenceCapacity?: {
+      physicalMaxContext: number | null;
+      runtimeIdentityKey: string;
+      runtimeModel: string;
+      runtimeRevision: string | null;
+      tokenizer: string | null;
+      tokenizerVersion: string | null;
+      template: string | null;
+      templateVersion: string | null;
+    } | null;
     DiscoveredModel: PoolMemberRouteRow["DiscoveredModel"] & {
       id: string;
       userId: string;
@@ -1560,6 +1602,72 @@ async function updateContextCountMetadata(
   });
 }
 
+async function updateAdmissionMetadata(
+  relayRequestId: string,
+  input: {
+    attemptId: string;
+    waitDurationMs: number;
+    result: Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>>;
+  },
+) {
+  const lease = input.result.state === "ADMITTED" ? input.result.lease : null;
+  await prisma.relayRequest.update({
+    where: { id: relayRequestId },
+    data: {
+      admissionAttemptId: input.attemptId,
+      admissionLeaseId: lease?.leaseId ?? null,
+      admissionCapacityId: lease?.capacityId ?? null,
+      admissionFencingToken: lease?.fencingToken ?? null,
+      admissionWaitDurationMs: Math.max(0, input.waitDurationMs),
+      admissionReservationClass: lease?.reservationClass ?? null,
+      admissionBorrowed: lease?.borrowed ?? null,
+      admissionTerminalState: input.result.state,
+    },
+    select: { id: true },
+  });
+}
+
+async function acquireCapacityWithTelemetry({
+  runtime,
+  relayRequestId,
+  attempt,
+  signal,
+}: {
+  runtime: CapacityAdmissionRuntime;
+  relayRequestId: string;
+  attempt: Parameters<CapacityAdmissionRuntime["acquire"]>[0];
+  signal: AbortSignal;
+}) {
+  const waitingStartedAt = Date.now();
+  try {
+    const result = await runtime.acquire(attempt, signal);
+    try {
+      await updateAdmissionMetadata(relayRequestId, {
+        attemptId: attempt.attemptId,
+        waitDurationMs: Date.now() - waitingStartedAt,
+        result,
+      });
+    } catch (error) {
+      if (result.state === "ADMITTED") await runtime.release(result.lease);
+      throw error;
+    }
+    return result;
+  } catch (error) {
+    await prisma.relayRequest
+      .update({
+        where: { id: relayRequestId },
+        data: {
+          admissionAttemptId: attempt.attemptId,
+          admissionWaitDurationMs: Math.max(0, Date.now() - waitingStartedAt),
+          admissionTerminalState: signal.aborted ? "CANCELLED" : "ERROR",
+        },
+        select: { id: true },
+      })
+      .catch(metadataUpdateError);
+    throw error;
+  }
+}
+
 function terminalStatus(terminal: RelayAttemptTerminal): "SUCCEEDED" | "FAILED" | "CANCELED" {
   if (terminal.failure === "cancelled") return "CANCELED";
   return terminal.ok ? "SUCCEEDED" : "FAILED";
@@ -1677,6 +1785,7 @@ async function writeResponseStickiness({
       userId: requester.userId,
       modelApiTokenId: requester.modelApiTokenId,
       routingKeyDigest,
+      routingVersion: 2,
       targetDiscoveredModelId: targetDiscoveredModelId ?? null,
       targetExecutionTargetId: targetExecutionTarget?.id ?? null,
       targetModelPoolId: targetModelPoolId ?? null,
@@ -1685,6 +1794,7 @@ async function writeResponseStickiness({
       expiresAt,
     },
     update: {
+      routingVersion: 2,
       modelApiTokenId: requester.modelApiTokenId,
       targetDiscoveredModelId: targetDiscoveredModelId ?? null,
       targetExecutionTargetId: targetExecutionTarget?.id ?? null,
@@ -1803,6 +1913,7 @@ async function resolveStickyRoute({
     },
     select: {
       userId: true,
+      routingVersion: true,
       modelApiTokenId: true,
       targetDiscoveredModelId: true,
       targetModelPoolId: true,
@@ -1813,10 +1924,23 @@ async function resolveStickyRoute({
     },
   })) as ResponseStickinessRecordRow | null;
 
+  const targetBound = (record?.routingVersion ?? 1) >= 2;
+  if (
+    targetBound &&
+    (!record?.SelectedExecutionTarget ||
+      (record.targetDiscoveredModelId !== null && !record.TargetExecutionTarget))
+  ) {
+    return openAiFailureJsonResponse("not_found", "Response routing target no longer exists.");
+  }
+
   const targetDiscoveredModelId =
-    record?.TargetExecutionTarget?.discoveredModelId ?? record?.targetDiscoveredModelId ?? null;
+    record?.TargetExecutionTarget?.discoveredModelId ??
+    (targetBound ? null : record?.targetDiscoveredModelId) ??
+    null;
   const selectedDiscoveredModelId =
-    record?.SelectedExecutionTarget?.discoveredModelId ?? record?.selectedDiscoveredModelId ?? null;
+    record?.SelectedExecutionTarget?.discoveredModelId ??
+    (targetBound ? null : record?.selectedDiscoveredModelId) ??
+    null;
 
   if (
     !record ||
@@ -1883,7 +2007,18 @@ async function directModelRow(discoveredModelId: string): Promise<DirectModelRel
           inferenceCapacityId: true,
           directContextCeiling: true,
           directContextMargin: true,
-          InferenceCapacity: { select: { physicalMaxContext: true } },
+          InferenceCapacity: {
+            select: {
+              physicalMaxContext: true,
+              runtimeIdentityKey: true,
+              runtimeModel: true,
+              runtimeRevision: true,
+              tokenizer: true,
+              tokenizerVersion: true,
+              template: true,
+              templateVersion: true,
+            },
+          },
         },
       },
       Endpoint: {
@@ -1915,7 +2050,18 @@ async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
         select: {
           id: true,
           inferenceCapacityId: true,
-          InferenceCapacity: { select: { physicalMaxContext: true } },
+          InferenceCapacity: {
+            select: {
+              physicalMaxContext: true,
+              runtimeIdentityKey: true,
+              runtimeModel: true,
+              runtimeRevision: true,
+              tokenizer: true,
+              tokenizerVersion: true,
+              template: true,
+              templateVersion: true,
+            },
+          },
           DiscoveredModel: {
             select: {
               id: true,
@@ -2289,8 +2435,10 @@ async function relayDirect({
       );
     }
     try {
-      capacityLease = await capacityRuntime.acquire(
-        {
+      capacityLease = await acquireCapacityWithTelemetry({
+        runtime: capacityRuntime,
+        relayRequestId,
+        attempt: {
           requestId: crypto.randomUUID(),
           attemptId: crypto.randomUUID(),
           ownerId: selected.userId,
@@ -2306,8 +2454,8 @@ async function relayDirect({
             },
           ],
         },
-        request.signal,
-      );
+        signal: request.signal,
+      });
     } catch {
       await operation.dispose?.();
       await failRelayMetadata({ relayRequestId, startedAt, failure: "unknown" });
@@ -2666,8 +2814,10 @@ async function relayPool({
       return operationFailureResponse(operation, "unsupported_capability");
     }
     try {
-      capacityLease = await capacityRuntime.acquire(
-        {
+      capacityLease = await acquireCapacityWithTelemetry({
+        runtime: capacityRuntime,
+        relayRequestId,
+        attempt: {
           requestId: crypto.randomUUID(),
           attemptId: crypto.randomUUID(),
           ownerId: requester.userId,
@@ -2678,8 +2828,8 @@ async function relayPool({
           deadlineAt: new Date(Date.now() + 30_000),
           candidates: admissionCandidates.filter((candidate) => candidate !== null),
         },
-        request.signal,
-      );
+        signal: request.signal,
+      });
     } catch {
       globalLease?.release();
       await operation.dispose?.();
@@ -2745,8 +2895,10 @@ async function relayPool({
         };
       });
       try {
-        capacityLease = await capacityRuntime.acquire(
-          {
+        capacityLease = await acquireCapacityWithTelemetry({
+          runtime: capacityRuntime,
+          relayRequestId,
+          attempt: {
             requestId: crypto.randomUUID(),
             attemptId: crypto.randomUUID(),
             ownerId: requester.userId,
@@ -2757,8 +2909,8 @@ async function relayPool({
             deadlineAt: new Date(Math.min(relayDeadlineMs, Date.now() + 30_000)),
             candidates: admissionCandidates,
           },
-          request.signal,
-        );
+          signal: request.signal,
+        });
       } catch {
         finalFailure = "unknown";
         break;
@@ -3283,8 +3435,10 @@ async function relaySelectedModelNoFailover({
       return operationFailureResponse(operation, "unsupported_capability");
     }
     try {
-      capacityLease = await capacityRuntime.acquire(
-        {
+      capacityLease = await acquireCapacityWithTelemetry({
+        runtime: capacityRuntime,
+        relayRequestId,
+        attempt: {
           requestId: crypto.randomUUID(),
           attemptId: crypto.randomUUID(),
           ownerId: selected.userId,
@@ -3301,8 +3455,8 @@ async function relaySelectedModelNoFailover({
             },
           ],
         },
-        request.signal,
-      );
+        signal: request.signal,
+      });
     } catch {
       await operation.dispose?.();
       await failRelayMetadata({ relayRequestId, startedAt, failure: "unknown" });
@@ -4056,6 +4210,22 @@ async function relayPreparedModeledRequest({
       return maybeTransformed;
     }
     prepared = maybeTransformed;
+    if (capacityRuntime && prepared.payload) {
+      try {
+        // Media descriptions can grow or shrink the serialized request. Pool
+        // eligibility must use the payload that will actually reach members.
+        contextCount = await countSerializedRequestContext({
+          input: prepared.payload,
+          signal: request.signal,
+        });
+      } catch {
+        await prepared.dispose?.();
+        return operationFailureResponse(
+          operation,
+          request.signal.aborted ? "cancelled" : "unknown",
+        );
+      }
+    }
 
     const relayOperation: RelayOperation = {
       ...operation,

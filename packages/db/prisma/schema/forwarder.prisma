@@ -699,6 +699,9 @@ model ResponseStickinessRecord {
   userId                    String
   modelApiTokenId           String?
   routingKeyDigest          String
+  /// Version 2+ rows are bound to immutable ExecutionTarget identities and
+  /// must never fall back to legacy discovered-model columns after deletion.
+  routingVersion            Int              @default(1)
   targetDiscoveredModelId   String?
   targetModelPoolId         String?
   selectedDiscoveredModelId String?
@@ -756,6 +759,15 @@ model RelayRequest {
   contextCountExact          Boolean?
   contextSafetyMargin        Float?
   contextSerializedChars     Int?
+  /// Prompt-free global admission correlation and outcome telemetry.
+  admissionAttemptId         String?
+  admissionLeaseId           String?
+  admissionCapacityId        String?
+  admissionFencingToken      BigInt?
+  admissionWaitDurationMs    Int?
+  admissionReservationClass  Int?
+  admissionBorrowed          Boolean?
+  admissionTerminalState     String?
   /// Protocol operation only; never stores prompts, filenames, audio, or transcripts.
   operation                  String?
   /// Sum of rebuilt upstream request-body bytes across all relay attempts.

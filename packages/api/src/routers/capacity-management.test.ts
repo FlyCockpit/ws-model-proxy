@@ -25,6 +25,8 @@ const db = prisma as unknown as {
     delete: MockInstance;
   };
   executionTarget: { findUnique: MockInstance; update: MockInstance };
+  modelPool: { findUnique: MockInstance; update: MockInstance };
+  poolMember: { findUnique: MockInstance; update: MockInstance };
   capacityAuditEvent: { create: MockInstance; findMany: MockInstance };
 };
 
@@ -162,5 +164,40 @@ describe("capacityManagementRouter", () => {
       }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect(db.executionTarget.update).not.toHaveBeenCalled();
+  });
+
+  it("validates direct changes against the already attached capacity", async () => {
+    db.executionTarget.findUnique.mockResolvedValue({
+      id: "target",
+      userId: "owner",
+      inferenceCapacityId: "capacity",
+      directConcurrencyLimit: null,
+      directReservedSlots: 0,
+      InferenceCapacity: { hardConcurrencyLimit: 2 },
+    });
+    const client = createRouterClient(capacityManagementRouter, { context });
+    await expect(
+      client.updateDirectPolicy({ executionTargetId: "target", directConcurrencyLimit: 3 }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.executionTarget.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects hard-limit reductions that invalidate attached direct or pool policies", async () => {
+    db.inferenceCapacity.findUnique.mockResolvedValue({
+      id: "capacity",
+      userId: "owner",
+      ExecutionTargets: [
+        {
+          directConcurrencyLimit: 4,
+          directReservedSlots: 0,
+          PoolMembers: [],
+        },
+      ],
+    });
+    const client = createRouterClient(capacityManagementRouter, { context });
+    await expect(client.update({ id: "capacity", hardConcurrencyLimit: 3 })).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+    });
+    expect(db.inferenceCapacity.update).not.toHaveBeenCalled();
   });
 });

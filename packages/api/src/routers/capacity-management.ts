@@ -30,6 +30,28 @@ function auditJson(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
 }
 
+function assertPolicyWithinHardLimit(input: {
+  hardLimit: number | null | undefined;
+  concurrencyLimit: number | null | undefined;
+  reservedSlots: number | null | undefined;
+}) {
+  if (input.hardLimit === null || input.hardLimit === undefined) return;
+  if (
+    input.concurrencyLimit !== null &&
+    input.concurrencyLimit !== undefined &&
+    input.concurrencyLimit > input.hardLimit
+  ) {
+    throw new ORPCError("BAD_REQUEST", { message: "Concurrency limit exceeds capacity." });
+  }
+  if (
+    input.reservedSlots !== null &&
+    input.reservedSlots !== undefined &&
+    input.reservedSlots > input.hardLimit
+  ) {
+    throw new ORPCError("BAD_REQUEST", { message: "Reserved slots exceed capacity." });
+  }
+}
+
 async function audit(
   tx: Prisma.TransactionClient,
   input: {
@@ -160,8 +182,48 @@ export const capacityManagementRouter = {
       return prisma.$transaction(async (tx) => {
         const current = await tx.inferenceCapacity.findUnique({
           where: { id: capacityId },
+          include: {
+            ExecutionTargets: {
+              select: {
+                directConcurrencyLimit: true,
+                directReservedSlots: true,
+                PoolMembers: {
+                  select: {
+                    capacityConcurrencyLimit: true,
+                    capacityReservedSlots: true,
+                    ModelPool: {
+                      select: {
+                        capacityConcurrencyLimit: true,
+                        capacityReservedSlots: true,
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
         });
         if (!current || current.userId !== userId) return notFound();
+        const requestedHardLimit = (data as { hardConcurrencyLimit?: number | null })
+          .hardConcurrencyLimit;
+        if (requestedHardLimit !== undefined) {
+          for (const target of current.ExecutionTargets ?? []) {
+            assertPolicyWithinHardLimit({
+              hardLimit: requestedHardLimit,
+              concurrencyLimit: target.directConcurrencyLimit,
+              reservedSlots: target.directReservedSlots,
+            });
+            for (const member of target.PoolMembers) {
+              assertPolicyWithinHardLimit({
+                hardLimit: requestedHardLimit,
+                concurrencyLimit:
+                  member.capacityConcurrencyLimit ?? member.ModelPool.capacityConcurrencyLimit,
+                reservedSlots:
+                  member.capacityReservedSlots ?? member.ModelPool.capacityReservedSlots,
+              });
+            }
+          }
+        }
         const updated = await tx.inferenceCapacity.update({ where: { id: capacityId }, data });
         await audit(tx, {
           userId,
@@ -216,23 +278,26 @@ export const capacityManagementRouter = {
           directWaitBudgetMs: true,
           directContextCeiling: true,
           directContextMargin: true,
+          InferenceCapacity: { select: { hardConcurrencyLimit: true } },
         },
       });
       if (!target || target.userId !== userId) return notFound();
+      let hardConcurrencyLimit = target.InferenceCapacity?.hardConcurrencyLimit;
       if (input.inferenceCapacityId) {
         const capacity = await tx.inferenceCapacity.findUnique({
           where: { id: input.inferenceCapacityId },
           select: { userId: true, hardConcurrencyLimit: true },
         });
         if (!capacity || capacity.userId !== userId) return notFound();
-        if (
-          input.directReservedSlots !== undefined &&
-          capacity.hardConcurrencyLimit !== null &&
-          input.directReservedSlots > capacity.hardConcurrencyLimit
-        ) {
-          throw new ORPCError("BAD_REQUEST", { message: "Reserved slots exceed capacity." });
-        }
+        hardConcurrencyLimit = capacity.hardConcurrencyLimit;
+      } else if (input.inferenceCapacityId === null) {
+        hardConcurrencyLimit = null;
       }
+      assertPolicyWithinHardLimit({
+        hardLimit: hardConcurrencyLimit,
+        concurrencyLimit: input.directConcurrencyLimit ?? target.directConcurrencyLimit,
+        reservedSlots: input.directReservedSlots ?? target.directReservedSlots,
+      });
       const { executionTargetId, ...data } = input;
       const updated = await tx.executionTarget.update({ where: { id: executionTargetId }, data });
       await audit(tx, {
@@ -274,9 +339,31 @@ export const capacityManagementRouter = {
             capacityContextMargin: true,
             protocolAdaptationEnabled: true,
             allowLossyDeveloperRoleCollapse: true,
+            PoolMembers: {
+              select: {
+                capacityConcurrencyLimit: true,
+                capacityReservedSlots: true,
+                ExecutionTarget: {
+                  select: { InferenceCapacity: { select: { hardConcurrencyLimit: true } } },
+                },
+              },
+            },
           },
         });
         if (!pool || pool.userId !== userId) return notFound();
+        for (const member of pool.PoolMembers ?? []) {
+          assertPolicyWithinHardLimit({
+            hardLimit: member.ExecutionTarget?.InferenceCapacity?.hardConcurrencyLimit,
+            concurrencyLimit:
+              member.capacityConcurrencyLimit ??
+              input.capacityConcurrencyLimit ??
+              pool.capacityConcurrencyLimit,
+            reservedSlots:
+              member.capacityReservedSlots ??
+              input.capacityReservedSlots ??
+              pool.capacityReservedSlots,
+          });
+        }
         const { modelPoolId, ...data } = input;
         const updated = await tx.modelPool.update({ where: { id: modelPoolId }, data });
         await audit(tx, {
@@ -308,10 +395,32 @@ export const capacityManagementRouter = {
             capacityWaitBudgetMs: true,
             capacityContextCeiling: true,
             capacityContextMargin: true,
-            ModelPool: { select: { userId: true } },
+            ModelPool: {
+              select: {
+                userId: true,
+                capacityConcurrencyLimit: true,
+                capacityReservedSlots: true,
+              },
+            },
+            ExecutionTarget: {
+              select: { InferenceCapacity: { select: { hardConcurrencyLimit: true } } },
+            },
           },
         });
         if (!member || member.ModelPool.userId !== userId) return notFound();
+        const nextConcurrency =
+          input.capacityConcurrencyLimit !== undefined
+            ? input.capacityConcurrencyLimit
+            : member.capacityConcurrencyLimit;
+        const nextReserved =
+          input.capacityReservedSlots !== undefined
+            ? input.capacityReservedSlots
+            : member.capacityReservedSlots;
+        assertPolicyWithinHardLimit({
+          hardLimit: member.ExecutionTarget?.InferenceCapacity?.hardConcurrencyLimit,
+          concurrencyLimit: nextConcurrency ?? member.ModelPool.capacityConcurrencyLimit,
+          reservedSlots: nextReserved ?? member.ModelPool.capacityReservedSlots,
+        });
         const { poolMemberId, ...data } = input;
         const updated = await tx.poolMember.update({ where: { id: poolMemberId }, data });
         await audit(tx, {
