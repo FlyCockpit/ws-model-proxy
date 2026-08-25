@@ -162,14 +162,19 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
     const row = await fixture();
     const blocker = createPrismaClient(databaseUrl);
     let releaseLock!: () => void;
+    let signalLockAcquired!: () => void;
+    const lockAcquired = new Promise<void>((resolve) => {
+      signalLockAcquired = resolve;
+    });
     const release = new Promise<void>((resolve) => {
       releaseLock = resolve;
     });
     const lock = blocker.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${row.pool.id} FOR UPDATE`;
+      signalLockAcquired();
       await release;
     });
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await lockAcquired;
     let settled = false;
     const remembering = service
       .rememberAffinity({

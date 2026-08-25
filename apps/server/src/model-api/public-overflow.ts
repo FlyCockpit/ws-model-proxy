@@ -1036,8 +1036,7 @@ export async function rankPublicOverflowTargets(input: {
   policy: AffinityPolicy;
   targets: PublicProviderTarget[];
 }): Promise<{ targets: PublicProviderTarget[]; decision: AffinityDecision | null }> {
-  if (!input.policy.enabled || input.targets.length < 2)
-    return { targets: input.targets, decision: null };
+  if (!input.policy.enabled) return { targets: input.targets, decision: null };
   let payload: Record<string, unknown>;
   try {
     const parsed: unknown = JSON.parse(new TextDecoder().decode(input.request.body));
@@ -1068,17 +1067,21 @@ export async function rankPublicOverflowTargets(input: {
     ),
   ]);
   const loadByModel = new Map(loads.map((row) => [row.providerModelId, row._count._all]));
-  const affinityTargets = input.targets.map((target, index) => {
+  const liabilities = input.targets.map((_target, index) => {
     const targetPricing = pricing[index];
-    const liability =
-      input.request.estimatedInputTokens !== undefined &&
+    return input.request.estimatedInputTokens !== undefined &&
       input.request.requestedOutputTokens !== undefined
-        ? liabilityFromPricing({
-            estimatedInputTokens: input.request.estimatedInputTokens,
-            requestedOutputTokens: input.request.requestedOutputTokens,
-            pricing: targetPricing,
-          })
-        : input.request.liability;
+      ? liabilityFromPricing({
+          estimatedInputTokens: input.request.estimatedInputTokens,
+          requestedOutputTokens: input.request.requestedOutputTokens,
+          pricing: targetPricing,
+        })
+      : input.request.liability;
+  });
+  const comparableCurrency =
+    new Set(liabilities.map(({ currency }) => currency ?? null)).size === 1;
+  const affinityTargets = input.targets.map((target, index) => {
+    const liability = liabilities[index] ?? input.request.liability;
     return {
       poolMemberId: target.poolMemberId,
       executionTargetId: target.executionTargetId,
@@ -1110,7 +1113,7 @@ export async function rankPublicOverflowTargets(input: {
       waitingLoad: 0,
       healthPenalty: providerHealthPenalty(target.healthStatus),
       publicEgressPenalty: 100,
-      costPenalty: providerCostPenalty(liability),
+      costPenalty: comparableCurrency ? providerCostPenalty(liability) : 0,
     };
   });
   const decision = await rankAffinityTargets({
@@ -1192,11 +1195,22 @@ export async function dispatchPublicOverflow(
     return { dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" };
   }
 
-  const ranked = await rankPublicOverflowTargets({
-    request,
-    policy: listed.affinityPolicy,
-    targets: compatible,
-  });
+  let ranked: Awaited<ReturnType<typeof rankPublicOverflowTargets>>;
+  try {
+    ranked = await rankPublicOverflowTargets({
+      request,
+      policy: listed.affinityPolicy,
+      targets: compatible,
+    });
+  } catch {
+    ranked = {
+      decision: null,
+      targets: compatible.map((target) => ({
+        ...target,
+        affinity: { outcome: "NO_MATCH", score: 0, prefixDepth: 0, reason: "affinity_error" },
+      })),
+    };
+  }
 
   await request.releaseLocalCapacity();
   const keyringValue = env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS;
@@ -1205,7 +1219,7 @@ export async function dispatchPublicOverflow(
   let lastAdmission: ProviderBudgetAdmission | undefined;
   let attemptCount = 0;
 
-  for (const target of ranked.targets) {
+  for (const [rankedIndex, target] of ranked.targets.entries()) {
     const nativeSurface = selectedNativeSurface(target, request.requestedSurface);
     if (!nativeSurface) continue;
     attemptCount += 1;
@@ -1491,7 +1505,7 @@ export async function dispatchPublicOverflow(
       // Retry only before exposing headers/body to the caller.
       if (
         request.retrySafe &&
-        target !== compatible.at(-1) &&
+        rankedIndex < ranked.targets.length - 1 &&
         (status === 408 || status === 409 || status === 429 || status >= 500)
       ) {
         // Failed/rate-limited calls may still be billed. Consume only a strict

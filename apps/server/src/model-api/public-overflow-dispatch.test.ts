@@ -174,10 +174,10 @@ describe("public overflow terminal response dispatch", () => {
     db.providerAttempt.groupBy.mockResolvedValue([
       { providerModelId: "model-expensive", _count: { _all: 1 } },
     ]);
-    const schedule = (rate: number) => ({
+    const schedule = (rate: number, currency = "USD") => ({
       id: `price-${rate}`,
       version: `v-${rate}`,
-      currency: "USD",
+      currency,
       accountingVersion: "provider-billable-v1",
       confidence: "CALCULATED",
       effectiveAt: new Date(0),
@@ -230,6 +230,224 @@ describe("public overflow terminal response dispatch", () => {
     ]);
     expect(ranked.targets[0]?.affinity?.reason).toContain("publicPenalty:100");
     expect(ranked.targets[1]?.affinity?.reason).toContain("active:1");
+
+    db.providerAttempt.groupBy.mockResolvedValue([]);
+    db.providerPricingVersion.findFirst
+      .mockResolvedValueOnce(schedule(100, "JPY"))
+      .mockResolvedValueOnce(schedule(1, "USD"));
+    const mixedCurrency = await rankPublicOverflowTargets({
+      request,
+      policy: listed.affinityPolicy,
+      targets: listed.targets,
+    });
+    expect(mixedCurrency.targets.map((target) => target.executionTargetId)).toEqual([
+      "target-expensive",
+      "target-cheap",
+    ]);
+    expect(mixedCurrency.targets[0]?.affinity?.reason).toContain("costPenalty:0");
+  });
+
+  it("fails open to configured provider order when affinity ranking is unavailable", async () => {
+    const fixture = dispatchPoolFixture();
+    Object.assign(fixture, {
+      affinityEnabled: true,
+      affinityTtlSeconds: 600,
+      affinityMaxRecords: 100,
+      affinityPrefixWeight: 100,
+      affinityConversationWeight: 150,
+      affinityConfirmedCacheWeight: 250,
+      affinityLoadPenaltyWeight: 100,
+    });
+    db.modelPool.findFirst.mockResolvedValue(fixture);
+    db.providerAttempt.groupBy.mockRejectedValueOnce(new Error("affinity load unavailable"));
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
+      providerCredential: {
+        findFirst: vi.fn().mockResolvedValue({
+          id: "credential-heartbeat",
+          credentialType: "BEARER",
+          aadVersion: 1,
+          algorithm: "AES-256-GCM",
+          keyVersion: "v1",
+          ciphertext: new Uint8Array(),
+          nonce: new Uint8Array(),
+          authTag: new Uint8Array(),
+        }),
+        update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+      },
+    };
+    db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+    const upstream = Readable.from([Buffer.from('{"choices":[],"usage":{}}')]);
+    Object.assign(upstream, {
+      statusCode: 200,
+      headers: { "content-type": "application/json" },
+      complete: true,
+    });
+    providerHttpsRequest.mockResolvedValueOnce(upstream);
+
+    const result = await dispatchPublicOverflow({
+      userId: "owner",
+      poolId: "pool",
+      requestId: "request-affinity-fail-open",
+      reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      requestedProtocol: "openai",
+      requestedSurface: "openai-chat",
+      stream: false,
+      requiredFeatures: [],
+      path: "/v1/chat/completions",
+      headers: new Headers({ "content-type": "application/json" }),
+      body: new TextEncoder().encode(
+        '{"model":"pool","messages":[{"role":"user","content":"retry me"}]}',
+      ),
+      signal: new AbortController().signal,
+      liability: { tokens: 10n, accountingVersion: "provider-billable-v1" },
+      requestedOutputTokens: 1n,
+      releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+      adaptationEnabled: false,
+      retrySafe: false,
+    });
+
+    expect(result).toMatchObject({ dispatched: true, attemptCount: 1 });
+    if (!result.dispatched) throw new Error("expected fail-open dispatch");
+    expect(result.affinity?.reason).toBe("affinity_error");
+    await result.response.text();
+    await result.terminal;
+  });
+
+  it("decorates a single compatible provider so successful dispatches can build history", async () => {
+    const fixture = dispatchPoolFixture();
+    Object.assign(fixture, {
+      affinityEnabled: true,
+      affinityTtlSeconds: 600,
+      affinityMaxRecords: 100,
+      affinityPrefixWeight: 100,
+      affinityConversationWeight: 150,
+      affinityConfirmedCacheWeight: 250,
+      affinityLoadPenaltyWeight: 100,
+    });
+    db.modelPool.findFirst.mockResolvedValue(fixture);
+    db.providerAttempt.groupBy.mockResolvedValue([]);
+    db.providerPricingVersion.findFirst.mockResolvedValue(null);
+    const listed = await listPublicOverflowTargets("owner", "pool");
+    const ranked = await rankPublicOverflowTargets({
+      request: {
+        userId: "owner",
+        poolId: "pool",
+        requestId: "single-history",
+        reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+        requestedProtocol: "openai",
+        requestedSurface: "openai-chat",
+        stream: false,
+        requiredFeatures: [],
+        path: "/v1/chat/completions",
+        headers: new Headers(),
+        body: new TextEncoder().encode(
+          '{"model":"pool","messages":[{"role":"user","content":"remember"}]}',
+        ),
+        signal: new AbortController().signal,
+        liability: { accountingVersion: "provider-billable-v1" },
+        releaseLocalCapacity: vi.fn(),
+        adaptationEnabled: false,
+        retrySafe: false,
+      },
+      policy: listed.affinityPolicy,
+      targets: listed.targets,
+    });
+    expect(ranked.targets[0]?.affinityTarget).toBeDefined();
+  });
+
+  it("retries according to affinity-ranked order rather than configured order", async () => {
+    providerHttpsRequest.mockClear();
+    const fixture = dispatchPoolFixture();
+    const expensive = fixture.PoolMembers[0]!;
+    const cheap = structuredClone(expensive);
+    expensive.id = "member-expensive-retry";
+    expensive.ExecutionTarget.id = "target-expensive-retry";
+    expensive.ExecutionTarget.ProviderModel.id = "model-expensive-retry";
+    expensive.ExecutionTarget.ProviderModel.ProviderAccount.id = "account-expensive-retry";
+    expensive.ExecutionTarget.ProviderModel.ProviderAccount.baseUrl = "https://expensive.example";
+    cheap.id = "member-cheap-retry";
+    cheap.publicOrder = 1;
+    cheap.ExecutionTarget.id = "target-cheap-retry";
+    cheap.ExecutionTarget.ProviderModel.id = "model-cheap-retry";
+    cheap.ExecutionTarget.ProviderModel.ProviderAccount.id = "account-cheap-retry";
+    cheap.ExecutionTarget.ProviderModel.ProviderAccount.baseUrl = "https://cheap.example";
+    fixture.PoolMembers.push(cheap);
+    Object.assign(fixture, {
+      affinityEnabled: true,
+      affinityTtlSeconds: 600,
+      affinityMaxRecords: 100,
+      affinityPrefixWeight: 100,
+      affinityConversationWeight: 150,
+      affinityConfirmedCacheWeight: 250,
+      affinityLoadPenaltyWeight: 100,
+    });
+    db.modelPool.findFirst.mockResolvedValue(fixture);
+    db.providerAttempt.groupBy.mockResolvedValue([
+      { providerModelId: "model-expensive-retry", _count: { _all: 10 } },
+    ]);
+    db.providerPricingVersion.findFirst.mockReset().mockResolvedValue(null);
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
+      providerCredential: {
+        findFirst: vi.fn().mockResolvedValue({
+          id: "credential-heartbeat",
+          credentialType: "BEARER",
+          aadVersion: 1,
+          algorithm: "AES-256-GCM",
+          keyVersion: "v1",
+          ciphertext: new Uint8Array(),
+          nonce: new Uint8Array(),
+          authTag: new Uint8Array(),
+        }),
+        update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+      },
+    };
+    db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+    const retryable = Readable.from([]);
+    Object.assign(retryable, { statusCode: 503, headers: {}, complete: true });
+    const success = Readable.from([Buffer.from('{"choices":[],"usage":{}}')]);
+    Object.assign(success, {
+      statusCode: 200,
+      headers: { "content-type": "application/json" },
+      complete: true,
+    });
+    providerHttpsRequest.mockResolvedValueOnce(retryable).mockResolvedValueOnce(success);
+
+    const result = await dispatchPublicOverflow({
+      userId: "owner",
+      poolId: "pool",
+      requestId: "request-ranked-retry",
+      reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      requestedProtocol: "openai",
+      requestedSurface: "openai-chat",
+      stream: false,
+      requiredFeatures: [],
+      path: "/v1/chat/completions",
+      headers: new Headers({ "content-type": "application/json" }),
+      body: new TextEncoder().encode(
+        '{"model":"pool","messages":[{"role":"user","content":"retry me"}]}',
+      ),
+      signal: new AbortController().signal,
+      liability: { accountingVersion: "provider-billable-v1" },
+      estimatedInputTokens: 100n,
+      requestedOutputTokens: 100n,
+      releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+      adaptationEnabled: false,
+      retrySafe: true,
+    });
+
+    expect(result).toMatchObject({ dispatched: true, attemptCount: 2 });
+    if (!result.dispatched) throw new Error("expected ranked retry dispatch");
+    expect(providerHttpsRequest).toHaveBeenCalledTimes(2);
+    expect(String(providerHttpsRequest.mock.calls[0]?.[0])).toContain("cheap.example");
+    expect(String(providerHttpsRequest.mock.calls[1]?.[0])).toContain("expensive.example");
+    await result.response.text();
+    await result.terminal;
   });
   it.each([
     {
