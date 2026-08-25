@@ -128,6 +128,8 @@ export interface PublicOverflowRequest {
 export interface PublicProviderTarget {
   poolMemberId: string;
   executionTargetId: string;
+  inferenceCapacityId?: string | null;
+  capacityWaitBudgetMs?: number | null;
   publicOrder: number;
   providerModelId: string;
   upstreamModelId: string;
@@ -517,6 +519,7 @@ export async function listPublicOverflowTargets(
       affinityConversationWeight: true,
       affinityConfirmedCacheWeight: true,
       affinityLoadPenaltyWeight: true,
+      capacityWaitBudgetMs: true,
       PoolMembers: {
         where: {
           tier: memberTier,
@@ -531,9 +534,12 @@ export async function listPublicOverflowTargets(
           id: true,
           publicOrder: true,
           weight: true,
+          capacityWaitBudgetMs: true,
+          capacityWaitBudgetMode: true,
           ExecutionTarget: {
             select: {
               id: true,
+              inferenceCapacityId: true,
               ProviderModel: {
                 select: {
                   id: true,
@@ -626,6 +632,13 @@ export async function listPublicOverflowTargets(
       {
         poolMemberId: member.id,
         executionTargetId: member.ExecutionTarget!.id,
+        inferenceCapacityId: member.ExecutionTarget!.inferenceCapacityId,
+        capacityWaitBudgetMs:
+          member.capacityWaitBudgetMode === "UNLIMITED"
+            ? null
+            : member.capacityWaitBudgetMode === "LIMITED"
+              ? member.capacityWaitBudgetMs
+              : pool.capacityWaitBudgetMs,
         publicOrder: member.publicOrder ?? 0,
         providerModelId: model.id,
         upstreamModelId: model.upstreamModelId,

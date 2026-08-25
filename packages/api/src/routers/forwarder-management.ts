@@ -1480,6 +1480,9 @@ export const forwarderManagementRouter = {
                 select: {
                   id: true,
                   providerAccountId: true,
+                  upstreamModelId: true,
+                  contextWindow: true,
+                  concurrencyLimit: true,
                   PricingVersions: {
                     where: { status: "ACTIVE", retiredAt: null, effectiveAt: { lte: now } },
                     orderBy: [{ effectiveAt: "desc" }, { id: "desc" }],
@@ -1583,10 +1586,40 @@ export const forwarderManagementRouter = {
           for (const protection of input.providerModels) {
             const provider = providerById.get(protection.providerModelId);
             if (!provider) throw new ORPCError("PRECONDITION_FAILED");
+            const capacity = await tx.inferenceCapacity.upsert({
+              where: {
+                userId_runtimeIdentityKey: {
+                  userId,
+                  runtimeIdentityKey: `provider-model:${provider.id}`,
+                },
+              },
+              update: {},
+              create: {
+                userId,
+                label: `Provider model ${provider.id}`,
+                runtimeIdentityKey: `provider-model:${provider.id}`,
+                runtimeModel: provider.upstreamModelId,
+                hardConcurrencyLimit: provider.concurrencyLimit,
+                physicalMaxContext: provider.contextWindow,
+                countStrategy: "CONSERVATIVE_ESTIMATE",
+              },
+              select: { id: true },
+            });
+            const existingTarget = await tx.executionTarget.findUnique({
+              where: { providerModelId: provider.id },
+              select: { inferenceCapacityId: true },
+            });
             const target = await tx.executionTarget.upsert({
               where: { providerModelId: provider.id },
-              update: {},
-              create: { userId, kind: "PROVIDER_MODEL", providerModelId: provider.id },
+              update: existingTarget?.inferenceCapacityId
+                ? {}
+                : { inferenceCapacityId: capacity.id },
+              create: {
+                userId,
+                kind: "PROVIDER_MODEL",
+                providerModelId: provider.id,
+                inferenceCapacityId: capacity.id,
+              },
               select: { id: true },
             });
             await tx.poolMember.create({
@@ -2337,7 +2370,14 @@ export const forwarderManagementRouter = {
         }
         const providerModel = await tx.providerModel.findFirst({
           where: { id: input.providerModelId, userId, deletedAt: null },
-          select: { id: true, providerAccountId: true, enabled: true },
+          select: {
+            id: true,
+            providerAccountId: true,
+            upstreamModelId: true,
+            contextWindow: true,
+            concurrencyLimit: true,
+            enabled: true,
+          },
         });
         if (!providerModel) {
           throw new ORPCError("NOT_FOUND", { message: "Provider model not found." });
@@ -2392,10 +2432,38 @@ export const forwarderManagementRouter = {
             message: "The attachment protection policy must have an activation audit trail.",
           });
         }
+        const capacity = await tx.inferenceCapacity.upsert({
+          where: {
+            userId_runtimeIdentityKey: {
+              userId,
+              runtimeIdentityKey: `provider-model:${providerModel.id}`,
+            },
+          },
+          update: {},
+          create: {
+            userId,
+            label: `Provider model ${providerModel.id}`,
+            runtimeIdentityKey: `provider-model:${providerModel.id}`,
+            runtimeModel: providerModel.upstreamModelId,
+            hardConcurrencyLimit: providerModel.concurrencyLimit,
+            physicalMaxContext: providerModel.contextWindow,
+            countStrategy: "CONSERVATIVE_ESTIMATE",
+          },
+          select: { id: true },
+        });
+        const existingTarget = await tx.executionTarget.findUnique({
+          where: { providerModelId: input.providerModelId },
+          select: { inferenceCapacityId: true },
+        });
         const target = await tx.executionTarget.upsert({
           where: { providerModelId: input.providerModelId },
-          update: {},
-          create: { userId, kind: "PROVIDER_MODEL", providerModelId: input.providerModelId },
+          update: existingTarget?.inferenceCapacityId ? {} : { inferenceCapacityId: capacity.id },
+          create: {
+            userId,
+            kind: "PROVIDER_MODEL",
+            providerModelId: input.providerModelId,
+            inferenceCapacityId: capacity.id,
+          },
           select: { id: true },
         });
         const member = await tx.poolMember.create({

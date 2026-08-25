@@ -144,8 +144,11 @@ import {
   conservativeProviderLiability,
   conservativeSerializedInputTokens,
   dispatchPublicOverflow,
+  listPublicOverflowTargets,
+  matchesChatTestProviderMode,
   type PublicOverflowReason,
   type PublicOverflowRequest,
+  publicTargetCompatibility,
 } from "./public-overflow.js";
 import { type RelayAttemptTerminal, startRelayAttempt } from "./relay-executor.js";
 import { shouldRetryRelayOperation } from "./relay-retry-policy.js";
@@ -3351,11 +3354,74 @@ async function relayPool({
           }
         : undefined,
     } satisfies PublicOverflowRequest;
+    let providerCapacityLease:
+      | Extract<
+          Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>>,
+          { state: "ADMITTED" }
+        >["lease"]
+      | undefined;
+    const dispatchProviderTier = async (memberTier: "PRIMARY" | "PUBLIC_OVERFLOW") => {
+      if (!capacityRuntime) return dispatchPublicOverflow({ ...providerRequest, memberTier });
+      const listed = await listPublicOverflowTargets(target.ownerUserId, target.id, memberTier);
+      const compatible = listed.targets.filter(
+        (providerTarget) =>
+          (!forcedPoolMemberId || providerTarget.poolMemberId === forcedPoolMemberId) &&
+          publicTargetCompatibility(providerTarget, providerRequest) === "COMPATIBLE" &&
+          matchesChatTestProviderMode(providerTarget, requestedSurface, testRoutingMode),
+      );
+      // A provider-backed primary is a physical execution target too. Missing
+      // capacity identity is a configuration error, never permission to bypass
+      // durable concurrency and fencing.
+      if (compatible.length === 0 || compatible.some((item) => !item.inferenceCapacityId))
+        return { dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" } as const;
+      await releaseProviderCapacity();
+      const admissionStartedAt = Date.now();
+      const admission = await acquireCapacityWithTelemetry({
+        runtime: capacityRuntime,
+        relayRequestId,
+        attempt: {
+          requestId: crypto.randomUUID(),
+          relayRequestId,
+          attemptId: crypto.randomUUID(),
+          ownerId: requester.userId,
+          sourceKind: "POOL",
+          poolId: target.id,
+          basePriority: 16,
+          connectionOwner: "model-api-provider",
+          deadlineAt: new Date(relayDeadlineMs),
+          candidates: compatible.map((providerTarget, candidateOrder) => ({
+            capacityId: providerTarget.inferenceCapacityId!,
+            executionTargetId: providerTarget.executionTargetId,
+            poolMemberId: providerTarget.poolMemberId,
+            candidateOrder,
+            deadlineAt: boundedAdmissionDeadline(
+              admissionStartedAt,
+              relayDeadlineMs,
+              providerTarget.capacityWaitBudgetMs ?? null,
+            ),
+          })),
+        },
+        signal: request.signal,
+      });
+      if (admission.state !== "ADMITTED" || !admission.lease.poolMemberId)
+        return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" } as const;
+      const result = await dispatchPublicOverflow({
+        ...providerRequest,
+        memberTier,
+        forcedPoolMemberId: admission.lease.poolMemberId,
+      });
+      if (!result.dispatched) {
+        await capacityRuntime.release(admission.lease);
+        return result;
+      }
+      providerCapacityLease = admission.lease;
+      return result;
+    };
     let selectedTier: "PRIMARY" | "PUBLIC_OVERFLOW" = "PRIMARY";
-    let result = await dispatchPublicOverflow({ ...providerRequest, memberTier: "PRIMARY" });
+    let result = await dispatchProviderTier("PRIMARY");
     if (!result.dispatched) {
       selectedTier = "PUBLIC_OVERFLOW";
-      result = await dispatchPublicOverflow({ ...providerRequest, memberTier: "PUBLIC_OVERFLOW" });
+      result = await dispatchProviderTier("PUBLIC_OVERFLOW");
     }
     if (!result.dispatched) return null;
     await prisma.relayRequest
@@ -3408,8 +3474,12 @@ async function relayPool({
     // Native response bytes remain opaque. Cross-protocol provider response
     // adaptation is handled by the same strict streaming/non-streaming state
     // machines as local targets.
-    const commitAwareResponse = (response: Response) =>
-      responseWithFirstClientByte(response, result.markFirstClientByte);
+    const commitAwareResponse = (response: Response) => {
+      const committed = responseWithFirstClientByte(response, result.markFirstClientByte);
+      return providerCapacityLease && capacityRuntime
+        ? capacityRuntime.hold(committed, providerCapacityLease, request.signal)
+        : committed;
+    };
     if (
       result.nativeSurface === requestedSurface &&
       (result.response.status < 200 || result.response.status >= 300)
@@ -3481,7 +3551,7 @@ async function relayPool({
       );
     }
     if (operation.stream) {
-      if (!result.response.body) return result.response;
+      if (!result.response.body) return commitAwareResponse(result.response);
       return commitAwareResponse(
         new Response(
           adaptedResponseBody({
@@ -5625,6 +5695,7 @@ async function relayBoundProviderResponse(input: {
   captureReturnedResponse: boolean;
   contextInput?: JsonObject;
   contextCount?: ContextCountTelemetry;
+  capacityRuntime?: CapacityAdmissionRuntime;
 }): Promise<Response> {
   const relayRequestId = await createRelayMetadata({
     userId: input.requester.userId,
@@ -5669,11 +5740,75 @@ async function relayBoundProviderResponse(input: {
     exactResponsesBinding: input.stickyRoute.binding,
     skipContextValidation: input.contextInput === undefined,
   } satisfies PublicOverflowRequest;
+  let providerCapacityLease:
+    | Extract<
+        Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>>,
+        { state: "ADMITTED" }
+      >["lease"]
+    | undefined;
+  const dispatchBoundTier = async (memberTier: "PRIMARY" | "PUBLIC_OVERFLOW") => {
+    if (!input.capacityRuntime) return dispatchPublicOverflow({ ...boundRequest, memberTier });
+    const listed = await listPublicOverflowTargets(
+      input.stickyRoute.visibleTarget.ownerUserId,
+      input.stickyRoute.visibleTarget.id,
+      memberTier,
+    );
+    const exactTarget = listed.targets.find(
+      (target) =>
+        target.executionTargetId === input.stickyRoute.binding.executionTargetId &&
+        target.providerAccountId === input.stickyRoute.binding.providerAccountId &&
+        target.providerModelId === input.stickyRoute.binding.providerModelId,
+    );
+    if (!exactTarget?.inferenceCapacityId)
+      return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" } as const;
+    const admission = await acquireCapacityWithTelemetry({
+      runtime: input.capacityRuntime,
+      relayRequestId,
+      attempt: {
+        requestId: crypto.randomUUID(),
+        relayRequestId,
+        attemptId: crypto.randomUUID(),
+        ownerId: input.requester.userId,
+        sourceKind: "POOL",
+        poolId: input.stickyRoute.visibleTarget.id,
+        basePriority: 16,
+        connectionOwner: "model-api-provider-stickiness",
+        deadlineAt: new Date(Date.now() + MODEL_API_RELAY_TIMEOUT_MS),
+        candidates: [
+          {
+            capacityId: exactTarget.inferenceCapacityId,
+            executionTargetId: exactTarget.executionTargetId,
+            poolMemberId: exactTarget.poolMemberId,
+            candidateOrder: 0,
+            deadlineAt: boundedAdmissionDeadline(
+              Date.now(),
+              Date.now() + MODEL_API_RELAY_TIMEOUT_MS,
+              exactTarget.capacityWaitBudgetMs ?? null,
+            ),
+          },
+        ],
+      },
+      signal: input.request.signal,
+    });
+    if (admission.state !== "ADMITTED")
+      return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" } as const;
+    const result = await dispatchPublicOverflow({
+      ...boundRequest,
+      memberTier,
+      forcedPoolMemberId: exactTarget.poolMemberId,
+    });
+    if (!result.dispatched) {
+      await input.capacityRuntime.release(admission.lease);
+      return result;
+    }
+    providerCapacityLease = admission.lease;
+    return result;
+  };
   let selectedTier: "PRIMARY" | "PUBLIC_OVERFLOW" = "PRIMARY";
-  let result = await dispatchPublicOverflow({ ...boundRequest, memberTier: "PRIMARY" });
+  let result = await dispatchBoundTier("PRIMARY");
   if (!result.dispatched) {
     selectedTier = "PUBLIC_OVERFLOW";
-    result = await dispatchPublicOverflow({ ...boundRequest, memberTier: "PUBLIC_OVERFLOW" });
+    result = await dispatchBoundTier("PUBLIC_OVERFLOW");
   }
   if (!result.dispatched) {
     await prisma.relayRequest
@@ -5751,7 +5886,10 @@ async function relayBoundProviderResponse(input: {
       terminal: result.terminal,
     });
   }
-  return responseWithFirstClientByte(response, result.markFirstClientByte);
+  const committed = responseWithFirstClientByte(response, result.markFirstClientByte);
+  return providerCapacityLease && input.capacityRuntime
+    ? input.capacityRuntime.hold(committed, providerCapacityLease, input.request.signal)
+    : committed;
 }
 
 function responseIdParam(responseId: string | undefined): string | Response {
@@ -5844,6 +5982,7 @@ export async function responsesCreateHandler({
       stream: prepared.stream,
       captureReturnedResponse: true,
       contextInput: prepared.payload ?? undefined,
+      capacityRuntime,
     });
   }
   if (
@@ -5929,6 +6068,7 @@ async function responsesStickyHandler({
       headers: prepared.headers,
       stream: false,
       captureReturnedResponse: false,
+      capacityRuntime,
     });
   }
 

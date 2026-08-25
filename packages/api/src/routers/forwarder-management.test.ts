@@ -82,8 +82,8 @@ const db = prisma as unknown as {
     update: MockInstance;
     delete: MockInstance;
   };
-  executionTarget: { findMany: MockInstance; upsert: MockInstance };
-  inferenceCapacity: { updateMany: MockInstance };
+  executionTarget: { findMany: MockInstance; findUnique: MockInstance; upsert: MockInstance };
+  inferenceCapacity: { updateMany: MockInstance; upsert: MockInstance };
   providerModel: { findFirst: MockInstance; findMany: MockInstance };
   providerBudgetPolicy: { create: MockInstance; findFirst: MockInstance; findMany: MockInstance };
   providerAuditEvent: { create: MockInstance; findFirst: MockInstance };
@@ -223,6 +223,8 @@ describe("forwarderManagementRouter", () => {
       callback(db),
     );
     db.executionTarget.upsert.mockResolvedValue({ id: "target-id" });
+    db.executionTarget.findUnique.mockResolvedValue(null);
+    db.inferenceCapacity.upsert.mockResolvedValue({ id: "provider-capacity-id" });
     db.capacityAuditEvent.create.mockResolvedValue({ id: "audit-id" });
     db.appSetting.findUnique.mockResolvedValue(null);
   });
@@ -481,9 +483,10 @@ describe("forwarderManagementRouter", () => {
     expect(db.providerBudgetPolicy.create.mock.calls[0]?.[0].data.Rules.create).toHaveLength(7);
     expect(db.providerAuditEvent.create).toHaveBeenCalledTimes(2);
     expect(db.capacityAuditEvent.create).toHaveBeenCalledTimes(1);
-    expect(db.executionTarget.upsert.mock.calls).not.toContainEqual([
+    expect(db.inferenceCapacity.upsert).toHaveBeenCalledTimes(2);
+    expect(db.executionTarget.upsert.mock.calls).toContainEqual([
       expect.objectContaining({
-        update: expect.objectContaining({ inferenceCapacityId: expect.anything() }),
+        update: expect.objectContaining({ inferenceCapacityId: "provider-capacity-id" }),
       }),
     ]);
   });
