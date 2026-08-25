@@ -26,9 +26,11 @@ const requiredFragments = [
   "model_pool_capacity_policy_check",
   "model_pool_affinity_policy_check",
   "cache_affinity_record_shape_check",
+  "cache_affinity_conversation_unique",
   "enforce_cache_affinity_identity_immutable",
-  'DELETE FROM cache_affinity_record\n WHERE "digestVersion" < 2',
+  'DELETE FROM cache_affinity_record\n WHERE "digestVersion" < 3',
   'ALTER COLUMN "tenantUserId" SET NOT NULL',
+  'ALTER COLUMN "bindingDigest" SET NOT NULL',
   "pool_member_capacity_policy_check",
   "admission_request_shape_check",
   "capacity_waiter_shape_check",
@@ -706,17 +708,17 @@ try {
   await client.query(`
     INSERT INTO cache_affinity_record
       (id, "createdAt", "lastUsedAt", "expiresAt", "userId", "tenantUserId", "poolId",
-       "executionTargetId", "targetIdentity", "digestVersion", "prefixDigest",
+       "executionTargetId", "targetIdentity", "digestVersion", "bindingDigest", "prefixDigest",
        "conversationDigest", "prefixDepth")
     SELECT 'affinity-a', NOW(), NOW(), NOW() + interval '1 hour', 'owner-a', 'owner-b',
-      'pool-a', id, repeat('t', 32), 2, repeat('p', 43), repeat('a', 43), 1
+      'pool-a', id, repeat('t', 32), 3, repeat('d', 43), repeat('p', 43), NULL, 1
       FROM execution_target WHERE "discoveredModelId" = 'model-a';
     INSERT INTO cache_affinity_record
       (id, "createdAt", "lastUsedAt", "expiresAt", "userId", "tenantUserId", "poolId",
-       "executionTargetId", "targetIdentity", "digestVersion", "prefixDigest",
+       "executionTargetId", "targetIdentity", "digestVersion", "bindingDigest", "prefixDigest",
        "conversationDigest", "prefixDepth")
     SELECT 'affinity-b', NOW(), NOW(), NOW() + interval '1 hour', 'owner-a', 'owner-b',
-      'pool-a', id, repeat('t', 32), 2, repeat('p', 43), repeat('b', 43), 1
+      'pool-a', id, repeat('t', 32), 3, repeat('d', 43), NULL, repeat('b', 43), 0
       FROM execution_target WHERE "discoveredModelId" = 'model-a';
   `);
   const conversationRows = await client.query(`
@@ -724,8 +726,21 @@ try {
      WHERE "tenantUserId" = 'owner-b' AND "poolId" = 'pool-a'
   `);
   if (conversationRows.rows[0].count !== 2) {
-    throw new Error("Affinity did not preserve tenant-scoped multi-conversation records");
+    throw new Error("Affinity prefix and conversation records did not coexist");
   }
+  await expectConstraintFailure(
+    `
+    INSERT INTO cache_affinity_record
+      (id, "createdAt", "lastUsedAt", "expiresAt", "userId", "tenantUserId", "poolId",
+       "executionTargetId", "targetIdentity", "digestVersion", "bindingDigest", "prefixDigest",
+       "conversationDigest", "prefixDepth")
+    SELECT 'affinity-conversation-duplicate', NOW(), NOW(), NOW() + interval '1 hour',
+      'owner-a', 'owner-b', 'pool-a', id, repeat('t', 32), 3, repeat('d', 43), NULL,
+      repeat('b', 43), 0
+      FROM execution_target WHERE "discoveredModelId" = 'model-a'
+  `,
+    "23505",
+  );
   await expectConstraintFailure(`
     UPDATE cache_affinity_record SET "prefixDigest" = repeat('x', 43)
      WHERE id = 'affinity-a'
@@ -734,10 +749,10 @@ try {
     `
     INSERT INTO cache_affinity_record
       (id, "createdAt", "lastUsedAt", "expiresAt", "userId", "tenantUserId", "poolId",
-       "executionTargetId", "targetIdentity", "digestVersion", "prefixDigest",
+       "executionTargetId", "targetIdentity", "digestVersion", "bindingDigest", "prefixDigest",
        "conversationDigest", "prefixDepth")
     SELECT 'affinity-cross-owner', NOW(), NOW(), NOW() + interval '1 hour', 'owner-b',
-      'owner-b', 'pool-a', id, repeat('t', 32), 2, repeat('q', 43), repeat('c', 43), 1
+      'owner-b', 'pool-a', id, repeat('t', 32), 3, repeat('d', 43), repeat('q', 43), NULL, 1
       FROM execution_target WHERE "discoveredModelId" = 'model-a'
   `,
     "23503",
@@ -745,10 +760,10 @@ try {
   await expectConstraintFailure(`
     INSERT INTO cache_affinity_record
       (id, "createdAt", "lastUsedAt", "expiresAt", "userId", "tenantUserId", "poolId",
-       "executionTargetId", "targetIdentity", "digestVersion", "prefixDigest",
+       "executionTargetId", "targetIdentity", "digestVersion", "bindingDigest", "prefixDigest",
        "conversationDigest", "prefixDepth")
     SELECT 'affinity-expired', NOW(), NOW(), NOW(), 'owner-a', 'owner-a', 'pool-a', id,
-      repeat('t', 32), 2, repeat('q', 43), repeat('c', 43), 1
+      repeat('t', 32), 3, repeat('d', 43), repeat('q', 43), NULL, 1
       FROM execution_target WHERE "discoveredModelId" = 'model-a'
   `);
   await expectConstraintFailure(

@@ -3,8 +3,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const db = vi.hoisted(() => ({
   cacheAffinityRecord: {
     findMany: vi.fn(),
+    findFirst: vi.fn(),
     deleteMany: vi.fn(),
     upsert: vi.fn(),
+    update: vi.fn(),
+    create: vi.fn(),
   },
   capacityLease: { groupBy: vi.fn() },
   capacityWaiter: { groupBy: vi.fn() },
@@ -66,6 +69,7 @@ describe("cache affinity", () => {
     db.$transaction.mockImplementation((callback) => callback(db));
     db.$queryRaw.mockResolvedValue([{ id: "pool" }]);
     db.cacheAffinityRecord.findMany.mockResolvedValue([]);
+    db.cacheAffinityRecord.findFirst.mockResolvedValue(null);
     db.cacheAffinityRecord.deleteMany.mockResolvedValue({ count: 0 });
     db.cacheAffinityRecord.upsert.mockResolvedValue({});
     db.capacityLease.groupBy.mockResolvedValue([]);
@@ -76,6 +80,9 @@ describe("cache affinity", () => {
     const digest = (overrides: Partial<Parameters<typeof affinityPrefixDigests>[0]> = {}) =>
       affinityPrefixDigests({
         ownerId: "owner-a",
+        resourceOwnerId: "resource-owner",
+        poolId: "pool",
+        securityScope: "token-a",
         surface: "OPENAI_CHAT_COMPLETIONS",
         payload,
         runtimeIdentity: "runtime-a",
@@ -100,12 +107,18 @@ describe("cache affinity", () => {
   it("supports scalar Responses input without storing or truncating it", () => {
     const first = affinityPrefixDigests({
       ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
       surface: "OPENAI_RESPONSES",
       payload: { input: "first private input" },
       runtimeIdentity: "runtime",
     });
     const second = affinityPrefixDigests({
       ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
       surface: "OPENAI_RESPONSES",
       payload: { input: "different private input" },
       runtimeIdentity: "runtime",
@@ -113,6 +126,121 @@ describe("cache affinity", () => {
     expect(first.digests).toHaveLength(1);
     expect(first.digests[0]).not.toBe(second.digests[0]);
     expect(first.digests[0]).not.toContain("private input");
+  });
+
+  it("keeps explicit conversation identity stable across turns while exact prefixes change", () => {
+    const digest = (requestPayload: Record<string, unknown>) =>
+      affinityPrefixDigests({
+        ownerId: "tenant",
+        resourceOwnerId: "pool-owner",
+        poolId: "pool",
+        securityScope: "token-a",
+        surface: "OPENAI_RESPONSES",
+        payload: requestPayload,
+        runtimeIdentity: "target-runtime",
+      });
+    const first = digest({
+      conversation: "conversation-secret",
+      input: "turn one",
+      instructions: "first instructions",
+      tools: [{ name: "first-tool" }],
+      temperature: 0.1,
+    });
+    const second = digest({
+      conversation: "conversation-secret",
+      input: "turn two",
+      instructions: "changed instructions",
+      tools: [{ name: "second-tool" }],
+      temperature: 0.9,
+    });
+    expect(second.conversationDigest).toBe(first.conversationDigest);
+    expect(second.bindingDigest).toBe(first.bindingDigest);
+    expect(second.digests).not.toEqual(first.digests);
+    expect(first.conversationDigest).not.toContain("conversation-secret");
+
+    for (const isolation of [
+      { ownerId: "other-tenant" },
+      { resourceOwnerId: "other-owner" },
+      { poolId: "other-pool" },
+      { securityScope: "token-b" },
+    ]) {
+      expect(
+        affinityPrefixDigests({
+          ownerId: "tenant",
+          resourceOwnerId: "pool-owner",
+          poolId: "pool",
+          securityScope: "token-a",
+          surface: "OPENAI_RESPONSES",
+          payload: { conversation: "conversation-secret", input: "turn one" },
+          runtimeIdentity: "target-runtime",
+          ...isolation,
+        }).conversationDigest,
+      ).not.toBe(first.conversationDigest);
+    }
+  });
+
+  it("persists an explicit conversation even when there are no content prefixes", async () => {
+    await rememberAffinity({
+      ownerId: "tenant",
+      resourceOwnerId: "pool-owner",
+      poolId: "pool",
+      securityScope: "grant-and-token",
+      policy,
+      surface: "OPENAI_RESPONSES",
+      payload: { conversation: "conversation-only" },
+      target: target("target", "runtime"),
+    });
+    expect(db.cacheAffinityRecord.upsert).not.toHaveBeenCalled();
+    expect(db.cacheAffinityRecord.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        prefixDigest: null,
+        prefixDepth: 0,
+        conversationDigest: expect.any(String),
+      }),
+    });
+  });
+
+  it("ranks a prior explicit conversation after content and sampling fields change", async () => {
+    const selected = target("target-a", "runtime-a");
+    const prior = affinityPrefixDigests({
+      ownerId: "tenant",
+      resourceOwnerId: "pool-owner",
+      poolId: "pool",
+      securityScope: "token",
+      surface: "OPENAI_RESPONSES",
+      payload: { conversation: "conversation", input: "first", temperature: 0.1 },
+      runtimeIdentity: selected.targetIdentity,
+    });
+    db.cacheAffinityRecord.findMany.mockResolvedValue([
+      {
+        executionTargetId: selected.executionTargetId,
+        targetIdentity: selected.targetIdentity,
+        bindingDigest: prior.bindingDigest,
+        prefixDigest: null,
+        conversationDigest: prior.conversationDigest,
+        prefixDepth: 0,
+        engineCacheConfirmed: false,
+      },
+    ]);
+    const ranked = await rankAffinityTargets({
+      ownerId: "tenant",
+      resourceOwnerId: "pool-owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "OPENAI_RESPONSES",
+      payload: {
+        conversation: "conversation",
+        input: "second",
+        instructions: "changed",
+        tools: [{ name: "changed" }],
+        temperature: 0.9,
+      },
+      targets: [target("target-b", "runtime-b"), selected],
+    });
+    expect(ranked.orderedTargetIds[0]).toBe(selected.executionTargetId);
+    expect(ranked.conversationMatches[selected.executionTargetId]).toBe(true);
+    expect(ranked.prefixDepths[selected.executionTargetId]).toBe(0);
   });
 
   it("invalidates identity across native surface, adapter, endpoint, and every runtime projection", () => {
@@ -174,6 +302,7 @@ describe("cache affinity", () => {
       ownerId: "owner",
       resourceOwnerId: "owner",
       poolId: "pool",
+      securityScope: "token",
       policy,
       surface: "OPENAI_CHAT_COMPLETIONS",
       payload: { messages: [{ role: "user", content: "unrelated" }] },
@@ -188,12 +317,18 @@ describe("cache affinity", () => {
     const targetB = target("target-b", "runtime-b", "capacity-b");
     const a = affinityPrefixDigests({
       ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
       surface: "OPENAI_CHAT_COMPLETIONS",
       payload,
       runtimeIdentity: targetA.targetIdentity,
     });
     const b = affinityPrefixDigests({
       ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
       surface: "OPENAI_CHAT_COMPLETIONS",
       payload,
       runtimeIdentity: targetB.targetIdentity,
@@ -202,6 +337,7 @@ describe("cache affinity", () => {
       {
         executionTargetId: "target-a",
         targetIdentity: "runtime-a",
+        bindingDigest: a.bindingDigest,
         prefixDigest: a.digests[0],
         conversationDigest: null,
         prefixDepth: 1,
@@ -210,6 +346,7 @@ describe("cache affinity", () => {
       {
         executionTargetId: "target-b",
         targetIdentity: "runtime-b",
+        bindingDigest: b.bindingDigest,
         prefixDigest: b.digests[1],
         conversationDigest: null,
         prefixDepth: 2,
@@ -243,6 +380,9 @@ describe("cache affinity", () => {
     const local = target("target-b", "runtime-b", "capacity-b");
     const prefixes = affinityPrefixDigests({
       ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
       surface: "OPENAI_CHAT_COMPLETIONS",
       payload,
       runtimeIdentity: expensive.targetIdentity,
@@ -252,6 +392,7 @@ describe("cache affinity", () => {
       {
         executionTargetId: expensive.executionTargetId,
         targetIdentity: expensive.targetIdentity,
+        bindingDigest: prefixes.bindingDigest,
         prefixDigest: deepestDigest,
         prefixDepth: prefixes.digests.length,
         conversationDigest: prefixes.conversationDigest,
@@ -323,7 +464,7 @@ describe("cache affinity", () => {
     });
   });
 
-  it("keeps the same prefix independently for multiple conversation digests", async () => {
+  it("deduplicates the exact prefix while storing distinct conversation identities", async () => {
     for (const conversation of ["conversation-a", "conversation-b"]) {
       await rememberAffinity({
         ownerId: "owner",
@@ -337,11 +478,15 @@ describe("cache affinity", () => {
     }
     const uniqueInputs = db.cacheAffinityRecord.upsert.mock.calls.map(
       ([input]) =>
-        input.where
-          .tenantUserId_poolId_executionTargetId_targetIdentity_prefixDigest_conversationDigest
-          .conversationDigest,
+        input.where.tenantUserId_poolId_executionTargetId_targetIdentity_bindingDigest_prefixDigest
+          .prefixDigest,
     );
-    expect(new Set(uniqueInputs).size).toBe(2);
+    expect(new Set(uniqueInputs).size).toBe(1);
+    expect(db.cacheAffinityRecord.create).toHaveBeenCalledTimes(2);
+    const conversations = db.cacheAffinityRecord.create.mock.calls.map(
+      ([input]) => input.data.conversationDigest,
+    );
+    expect(new Set(conversations).size).toBe(2);
   });
 
   it("sweeps expired rows in bounded batches", async () => {

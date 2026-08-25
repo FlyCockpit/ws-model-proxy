@@ -98,6 +98,98 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
     loadPenaltyWeight: 100,
   };
 
+  it("keeps a conversation on its target across changed turn fields without leaking across tenant, token, or runtime", async () => {
+    if (!db) return;
+    const row = await fixture();
+    await service.rememberAffinity({
+      ownerId: row.tenant.id,
+      resourceOwnerId: row.owner.id,
+      poolId: row.pool.id,
+      securityScope: "grant-a:token-a",
+      policy,
+      surface: "OPENAI_RESPONSES",
+      payload: {
+        conversation: "private-conversation-id",
+        input: "first turn",
+        instructions: "old instructions",
+        tools: [{ name: "old-tool" }],
+        temperature: 0.1,
+      },
+      target: row.target(0),
+    });
+    const changedTurn = {
+      conversation: "private-conversation-id",
+      input: "second turn",
+      instructions: "new instructions",
+      tools: [{ name: "new-tool" }],
+      temperature: 0.9,
+    };
+    const ranked = await service.rankAffinityTargets({
+      ownerId: row.tenant.id,
+      resourceOwnerId: row.owner.id,
+      poolId: row.pool.id,
+      securityScope: "grant-a:token-a",
+      policy,
+      surface: "OPENAI_RESPONSES",
+      payload: changedTurn,
+      targets: [row.target(1), row.target(0)],
+    });
+    expect(ranked.orderedTargetIds[0]).toBe(row.target(0).executionTargetId);
+    expect(ranked.conversationMatches[row.target(0).executionTargetId]).toBe(true);
+    expect(ranked.prefixDepths[row.target(0).executionTargetId]).toBe(0);
+
+    for (const isolation of [
+      { ownerId: row.otherTenant.id, securityScope: "grant-a:token-a" },
+      { ownerId: row.tenant.id, securityScope: "grant-a:token-b" },
+    ]) {
+      const isolated = await service.rankAffinityTargets({
+        resourceOwnerId: row.owner.id,
+        poolId: row.pool.id,
+        policy,
+        surface: "OPENAI_RESPONSES",
+        payload: changedTurn,
+        targets: [row.target(1), row.target(0)],
+        ...isolation,
+      });
+      expect(isolated.conversationMatches[row.target(0).executionTargetId]).toBe(false);
+    }
+    const changedRuntime = { ...row.target(0), targetIdentity: "changed-runtime-binding" };
+    const runtimeIsolated = await service.rankAffinityTargets({
+      ownerId: row.tenant.id,
+      resourceOwnerId: row.owner.id,
+      poolId: row.pool.id,
+      securityScope: "grant-a:token-a",
+      policy,
+      surface: "OPENAI_RESPONSES",
+      payload: changedTurn,
+      targets: [row.target(1), changedRuntime],
+    });
+    expect(runtimeIsolated.conversationMatches[changedRuntime.executionTargetId]).toBe(false);
+  });
+
+  it("persists one bounded conversation-only record under concurrent refreshes", async () => {
+    if (!db) return;
+    const row = await fixture();
+    const args = {
+      ownerId: row.tenant.id,
+      resourceOwnerId: row.owner.id,
+      poolId: row.pool.id,
+      securityScope: "grant:token",
+      policy,
+      surface: "OPENAI_RESPONSES",
+      payload: { conversation: "conversation-only" },
+      target: row.target(0),
+    };
+    await Promise.all(Array.from({ length: 8 }, () => service.rememberAffinity(args)));
+    const records = await db.cacheAffinityRecord.findMany({
+      where: { tenantUserId: row.tenant.id, poolId: row.pool.id },
+      select: { prefixDigest: true, conversationDigest: true, prefixDepth: true },
+    });
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({ prefixDigest: null, prefixDepth: 0 });
+    expect(records[0]?.conversationDigest).toHaveLength(43);
+  });
+
   it("serializes concurrent remembers and enforces a bound independently per target and tenant", async () => {
     if (!db) return;
     const row = await fixture();

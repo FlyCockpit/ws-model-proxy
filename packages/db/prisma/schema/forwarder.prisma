@@ -968,8 +968,10 @@ model CacheAffinityRecord {
   poolId               String
   executionTargetId    String
   targetIdentity       String
-  digestVersion        Int             @default(2)
-  prefixDigest         String
+  digestVersion        Int             @default(3)
+  /// Stable execution/security binding, separate from request content and conversation identity.
+  bindingDigest        String?
+  prefixDigest         String?
   conversationDigest   String?
   prefixDepth          Int
   estimatedTokens      Int?
@@ -979,7 +981,7 @@ model CacheAffinityRecord {
   ModelPool            ModelPool       @relation(fields: [poolId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
   ExecutionTarget      ExecutionTarget @relation(fields: [executionTargetId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
 
-  @@unique([tenantUserId, poolId, executionTargetId, targetIdentity, prefixDigest, conversationDigest])
+  @@unique([tenantUserId, poolId, executionTargetId, targetIdentity, bindingDigest, prefixDigest])
   @@index([tenantUserId, poolId, prefixDigest, expiresAt])
   @@index([tenantUserId, poolId, conversationDigest, expiresAt])
   @@index([userId, poolId, expiresAt])

@@ -3343,6 +3343,8 @@ async function relayPool({
       // requester may be an explicitly granted tenant; relay metadata and the
       // stickiness visibility tuple remain requester/token scoped.
       userId: target.ownerUserId,
+      affinityTenantUserId: requester.userId,
+      affinitySecurityScope: requester.limitKey,
       poolId: target.id,
       requestId: relayRequestId,
       reason,
@@ -4065,6 +4067,7 @@ async function relayPool({
           ownerId: requester.userId,
           resourceOwnerId: target.ownerUserId,
           poolId: target.id,
+          securityScope: requester.limitKey,
           policy: affinityPolicy,
           surface: requestedSurface,
           payload: affinityPayload,
@@ -4681,6 +4684,7 @@ async function relayPool({
                   ownerId: requester.userId,
                   resourceOwnerId: member.DiscoveredModel.userId,
                   poolId: target.id,
+                  securityScope: requester.limitKey,
                   policy: affinityPolicy,
                   surface: requestedSurface,
                   payload: affinityPayload,

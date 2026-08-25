@@ -105,22 +105,36 @@ ALTER TABLE model_pool ADD CONSTRAINT model_pool_affinity_policy_check CHECK (
   AND "affinityLoadPenaltyWeight" BETWEEN 0 AND 10000
 );
 
--- Affinity is disposable prediction state. Version 2 adds requester tenancy,
--- explicit execution-path identity, and multi-conversation uniqueness; old
--- version-1 predictions cannot be safely reinterpreted and are discarded.
+-- Affinity is disposable prediction state. Version 3 separates stable explicit
+-- conversation identity from exact cache-prefix bindings. Older predictions
+-- cannot be safely reinterpreted and are discarded.
 DELETE FROM cache_affinity_record
- WHERE "digestVersion" < 2 OR "tenantUserId" IS NULL OR "conversationDigest" IS NULL;
+ WHERE "digestVersion" < 3 OR "tenantUserId" IS NULL;
 ALTER TABLE cache_affinity_record ALTER COLUMN "tenantUserId" SET NOT NULL;
-ALTER TABLE cache_affinity_record ALTER COLUMN "conversationDigest" SET NOT NULL;
+ALTER TABLE cache_affinity_record ADD COLUMN IF NOT EXISTS "bindingDigest" TEXT;
+DELETE FROM cache_affinity_record WHERE "bindingDigest" IS NULL;
+ALTER TABLE cache_affinity_record ALTER COLUMN "bindingDigest" SET NOT NULL;
+ALTER TABLE cache_affinity_record ALTER COLUMN "prefixDigest" DROP NOT NULL;
+ALTER TABLE cache_affinity_record ALTER COLUMN "conversationDigest" DROP NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS cache_affinity_conversation_unique
+  ON cache_affinity_record
+    ("tenantUserId", "poolId", "executionTargetId", "targetIdentity", "bindingDigest", "conversationDigest")
+  WHERE "conversationDigest" IS NOT NULL AND "prefixDigest" IS NULL;
 
 ALTER TABLE cache_affinity_record DROP CONSTRAINT IF EXISTS cache_affinity_record_shape_check;
 ALTER TABLE cache_affinity_record ADD CONSTRAINT cache_affinity_record_shape_check CHECK (
-  "digestVersion" >= 2
-  AND "prefixDepth" > 0 AND "prefixDepth" <= 64
+  "digestVersion" >= 3
+  AND "prefixDepth" >= 0 AND "prefixDepth" <= 64
   AND ("estimatedTokens" IS NULL OR "estimatedTokens" >= 0)
   AND "expiresAt" > "createdAt"
-  AND length("prefixDigest") BETWEEN 32 AND 128
-  AND length("conversationDigest") BETWEEN 32 AND 128
+  AND length("bindingDigest") BETWEEN 32 AND 128
+  AND (("prefixDigest" IS NOT NULL AND "prefixDepth" > 0
+        AND "conversationDigest" IS NULL
+        AND length("prefixDigest") BETWEEN 32 AND 128)
+    OR ("prefixDigest" IS NULL AND "prefixDepth" = 0
+        AND "conversationDigest" IS NOT NULL
+        AND length("conversationDigest") BETWEEN 32 AND 128))
   AND length("targetIdentity") BETWEEN 1 AND 2048
 );
 
@@ -133,6 +147,7 @@ BEGIN
     OR NEW."executionTargetId" IS DISTINCT FROM OLD."executionTargetId"
     OR NEW."targetIdentity" IS DISTINCT FROM OLD."targetIdentity"
     OR NEW."digestVersion" IS DISTINCT FROM OLD."digestVersion"
+    OR NEW."bindingDigest" IS DISTINCT FROM OLD."bindingDigest"
     OR NEW."prefixDigest" IS DISTINCT FROM OLD."prefixDigest"
     OR NEW."conversationDigest" IS DISTINCT FROM OLD."conversationDigest"
     OR NEW."prefixDepth" IS DISTINCT FROM OLD."prefixDepth" THEN

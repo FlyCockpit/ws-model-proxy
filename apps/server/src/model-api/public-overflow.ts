@@ -73,6 +73,9 @@ export type PublicOverflowSkipReason =
 
 export interface PublicOverflowRequest {
   userId: string;
+  /** Requester and credential scopes remain distinct from the pool owner. */
+  affinityTenantUserId?: string;
+  affinitySecurityScope?: string;
   poolId: string;
   requestId: string;
   reason: PublicOverflowReason;
@@ -1372,9 +1375,10 @@ export async function rankPublicOverflowTargets(input: {
     targets: input.targets,
   });
   const decision = await rankAffinityTargets({
-    ownerId: input.request.userId,
+    ownerId: input.request.affinityTenantUserId ?? input.request.userId,
     resourceOwnerId: input.request.userId,
     poolId: input.request.poolId,
+    securityScope: input.request.affinitySecurityScope ?? input.request.userId,
     policy: input.policy,
     surface: input.request.requestedSurface,
     payload,
@@ -2281,9 +2285,10 @@ export async function dispatchPublicOverflow(
               const parsed: unknown = JSON.parse(new TextDecoder().decode(request.body));
               if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
                 await rememberAffinity({
-                  ownerId: request.userId,
+                  ownerId: request.affinityTenantUserId ?? request.userId,
                   resourceOwnerId: request.userId,
                   poolId: request.poolId,
+                  securityScope: request.affinitySecurityScope ?? request.userId,
                   policy: listed.affinityPolicy,
                   surface: request.requestedSurface,
                   payload: parsed as Record<string, unknown>,

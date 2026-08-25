@@ -1,7 +1,7 @@
 import prisma from "@ws-model-proxy/db";
 import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
 
-const DIGEST_VERSION = 2;
+const DIGEST_VERSION = 3;
 const MAX_PREFIXES_PER_REQUEST = 64;
 const MAX_CANONICAL_BYTES = 2 * 1024 * 1024;
 
@@ -98,6 +98,7 @@ const CONTENT_BINDING_KEYS = new Set([
   "tools",
 ]);
 const ROUTING_ONLY_KEYS = new Set(["model", "stream"]);
+const CONVERSATION_KEYS = new Set(["conversation", "conversation_id"]);
 
 /**
  * Produces cumulative canonical prefixes without retaining source material.
@@ -106,15 +107,26 @@ const ROUTING_ONLY_KEYS = new Set(["model", "stream"]);
  */
 export function affinityPrefixDigests({
   ownerId,
+  resourceOwnerId,
+  poolId,
+  securityScope,
   surface,
   payload,
   runtimeIdentity,
 }: {
   ownerId: string;
+  resourceOwnerId: string;
+  poolId: string;
+  securityScope?: string;
   surface: string;
   payload: Record<string, unknown>;
   runtimeIdentity: string;
-}): { digests: string[]; conversationDigest: string; hasExplicitConversation: boolean } {
+}): {
+  bindingDigest: string;
+  digests: string[];
+  conversationDigest: string | null;
+  hasExplicitConversation: boolean;
+} {
   const orderedSource = payload.input ?? payload.messages ?? payload.prompt;
   const ordered = Array.isArray(orderedSource)
     ? orderedSource
@@ -128,7 +140,8 @@ export function affinityPrefixDigests({
   // not. Only the visible pool alias and transport framing are routing-only.
   const parameters = Object.fromEntries(
     Object.entries(payload).flatMap(([key, raw]) => {
-      if (CONTENT_BINDING_KEYS.has(key) || ROUTING_ONLY_KEYS.has(key)) return [];
+      if (CONTENT_BINDING_KEYS.has(key) || ROUTING_ONLY_KEYS.has(key) || CONVERSATION_KEYS.has(key))
+        return [];
       const value = asJson(raw);
       return value === undefined ? [] : [[key, value] as const];
     }),
@@ -136,15 +149,23 @@ export function affinityPrefixDigests({
   const binding = stableJson({
     v: DIGEST_VERSION,
     ownerId,
+    resourceOwnerId,
+    poolId,
     surface,
     runtimeIdentity,
-    instructions: instructions ?? null,
-    tools: tools ?? null,
-    parameters,
   });
   const bindingDigest = hmacDigestForForwarderPurpose({
     purpose: "cacheAffinity",
-    value: `binding:${binding}`,
+    value: `affinity-binding-v3:${binding}`,
+  });
+  const prefixBindingDigest = hmacDigestForForwarderPurpose({
+    purpose: "cacheAffinity",
+    value: `affinity-prefix-binding-v3:${stableJson({
+      bindingDigest,
+      instructions: instructions ?? null,
+      tools: tools ?? null,
+      parameters,
+    })}`,
   });
   const units = ordered
     .slice(0, MAX_PREFIXES_PER_REQUEST)
@@ -158,20 +179,28 @@ export function affinityPrefixDigests({
     digests.push(
       hmacDigestForForwarderPurpose({
         purpose: "cacheAffinity",
-        value: `binding:${bindingDigest}\nprefix:${index + 1}\n${cumulative}`,
+        value: `prefix-binding:${prefixBindingDigest}\nprefix:${index + 1}\n${cumulative}`,
       }),
     );
   }
   const conversationSource = asJson(payload.conversation ?? payload.conversation_id);
   return {
+    bindingDigest,
     digests,
     hasExplicitConversation: conversationSource !== undefined,
-    conversationDigest: hmacDigestForForwarderPurpose({
-      purpose: "cacheAffinity",
-      value: `binding:${bindingDigest}\nconversation:${
-        conversationSource === undefined ? "none" : stableJson(conversationSource)
-      }`,
-    }),
+    conversationDigest:
+      conversationSource === undefined
+        ? null
+        : hmacDigestForForwarderPurpose({
+            purpose: "cacheAffinity",
+            value: `affinity-conversation-v3:${stableJson({
+              ownerId,
+              resourceOwnerId,
+              poolId,
+              securityScope: securityScope ?? ownerId,
+              conversation: conversationSource,
+            })}`,
+          }),
   };
 }
 
@@ -179,6 +208,7 @@ export async function rankAffinityTargets({
   ownerId,
   resourceOwnerId,
   poolId,
+  securityScope,
   policy,
   surface,
   payload,
@@ -188,6 +218,7 @@ export async function rankAffinityTargets({
   ownerId: string;
   resourceOwnerId: string;
   poolId: string;
+  securityScope?: string;
   policy: AffinityPolicy;
   surface: string;
   payload: Record<string, unknown>;
@@ -207,7 +238,15 @@ export async function rankAffinityTargets({
   const materialByIdentity = new Map(
     targets.map((target) => [
       target.targetIdentity,
-      affinityPrefixDigests({ ownerId, surface, payload, runtimeIdentity: target.targetIdentity }),
+      affinityPrefixDigests({
+        ownerId,
+        resourceOwnerId,
+        poolId,
+        securityScope: securityScope ?? ownerId,
+        surface,
+        payload,
+        runtimeIdentity: target.targetIdentity,
+      }),
     ]),
   );
   const allDigests = [
@@ -217,7 +256,7 @@ export async function rankAffinityTargets({
     ...new Set(
       [...materialByIdentity.values()]
         .filter(({ hasExplicitConversation }) => hasExplicitConversation)
-        .map(({ conversationDigest }) => conversationDigest),
+        .flatMap(({ conversationDigest }) => (conversationDigest ? [conversationDigest] : [])),
     ),
   ];
   if (allDigests.length === 0 && conversationDigests.length === 0) return unchanged;
@@ -240,6 +279,7 @@ export async function rankAffinityTargets({
       select: {
         executionTargetId: true,
         targetIdentity: true,
+        bindingDigest: true,
         prefixDigest: true,
         conversationDigest: true,
         prefixDepth: true,
@@ -273,10 +313,12 @@ export async function rankAffinityTargets({
     const compatible = records.filter(
       (record) =>
         record.executionTargetId === target.executionTargetId &&
-        record.targetIdentity === target.targetIdentity,
+        record.targetIdentity === target.targetIdentity &&
+        record.bindingDigest === material.bindingDigest,
     );
     const prefixDepth = compatible.reduce(
-      (best, record) => Math.max(best, digestDepth.get(record.prefixDigest) ?? 0),
+      (best, record) =>
+        Math.max(best, record.prefixDigest ? (digestDepth.get(record.prefixDigest) ?? 0) : 0),
       0,
     );
     const conversation =
@@ -284,7 +326,10 @@ export async function rankAffinityTargets({
       compatible.some((record) => record.conversationDigest === material.conversationDigest);
     const confirmed = compatible.some(
       (record) =>
-        (digestDepth.get(record.prefixDigest) ?? 0) === prefixDepth && record.engineCacheConfirmed,
+        prefixDepth > 0 &&
+        record.prefixDigest !== null &&
+        (digestDepth.get(record.prefixDigest) ?? 0) === prefixDepth &&
+        record.engineCacheConfirmed,
     );
     const active = target.activeLoad ?? activeByCapacity.get(target.capacityId) ?? 0;
     const waiting = target.waitingLoad ?? waitingByCapacity.get(target.capacityId) ?? 0;
@@ -329,6 +374,7 @@ export async function rememberAffinity({
   ownerId,
   resourceOwnerId,
   poolId,
+  securityScope,
   policy,
   surface,
   payload,
@@ -340,6 +386,7 @@ export async function rememberAffinity({
   ownerId: string;
   resourceOwnerId: string;
   poolId: string;
+  securityScope?: string;
   policy: AffinityPolicy;
   surface: string;
   payload: Record<string, unknown>;
@@ -351,11 +398,14 @@ export async function rememberAffinity({
   if (!policy.enabled) return;
   const material = affinityPrefixDigests({
     ownerId,
+    resourceOwnerId,
+    poolId,
+    securityScope: securityScope ?? ownerId,
     surface,
     payload,
     runtimeIdentity: target.targetIdentity,
   });
-  if (material.digests.length === 0) return;
+  if (material.digests.length === 0 && !material.conversationDigest) return;
   const expiresAt = new Date(now.getTime() + policy.ttlSeconds * 1000);
   await prisma.$transaction(async (tx) => {
     // Serialize retention enforcement per owner/pool so concurrent successful
@@ -377,13 +427,13 @@ export async function rememberAffinity({
     for (const [index, prefixDigest] of material.digests.entries()) {
       await tx.cacheAffinityRecord.upsert({
         where: {
-          tenantUserId_poolId_executionTargetId_targetIdentity_prefixDigest_conversationDigest: {
+          tenantUserId_poolId_executionTargetId_targetIdentity_bindingDigest_prefixDigest: {
             tenantUserId: ownerId,
             poolId,
             executionTargetId: target.executionTargetId,
             targetIdentity: target.targetIdentity,
+            bindingDigest: material.bindingDigest,
             prefixDigest,
-            conversationDigest: material.conversationDigest,
           },
         },
         create: {
@@ -392,8 +442,9 @@ export async function rememberAffinity({
           poolId,
           executionTargetId: target.executionTargetId,
           targetIdentity: target.targetIdentity,
+          bindingDigest: material.bindingDigest,
           prefixDigest,
-          conversationDigest: material.conversationDigest,
+          conversationDigest: null,
           prefixDepth: index + 1,
           estimatedTokens,
           engineCacheConfirmed,
@@ -406,6 +457,38 @@ export async function rememberAffinity({
           engineCacheConfirmed,
         },
       });
+    }
+    if (material.conversationDigest) {
+      const identity = {
+        tenantUserId: ownerId,
+        poolId,
+        executionTargetId: target.executionTargetId,
+        targetIdentity: target.targetIdentity,
+        bindingDigest: material.bindingDigest,
+        prefixDigest: null,
+        conversationDigest: material.conversationDigest,
+      };
+      const existing = await tx.cacheAffinityRecord.findFirst({
+        where: identity,
+        select: { id: true },
+      });
+      if (existing) {
+        await tx.cacheAffinityRecord.update({
+          where: { id: existing.id },
+          data: { lastUsedAt: now, expiresAt, estimatedTokens, engineCacheConfirmed },
+        });
+      } else {
+        await tx.cacheAffinityRecord.create({
+          data: {
+            userId: resourceOwnerId,
+            ...identity,
+            prefixDepth: 0,
+            estimatedTokens,
+            engineCacheConfirmed,
+            expiresAt,
+          },
+        });
+      }
     }
     const overflow = await tx.cacheAffinityRecord.findMany({
       where: {
