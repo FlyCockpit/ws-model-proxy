@@ -1791,7 +1791,7 @@ export async function dispatchPublicOverflow(
           const providerFailed =
             protocolFailed ||
             (!request.stream &&
-              (nonstreamEnvelope?.error !== undefined ||
+              (nonstreamEnvelope?.error != null ||
                 (surface === "anthropic-messages" && nonstreamEnvelope?.type === "error") ||
                 (surface === "openai-responses" &&
                   ["failed", "cancelled", "incomplete"].includes(
