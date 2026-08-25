@@ -3621,6 +3621,63 @@ describe("model API routes", () => {
     expect(manager.sent).toHaveLength(1);
   });
 
+  it("releases every admitted direct-request permit when relay startup throws", async () => {
+    const manager = new FakeRelayManager();
+    vi.spyOn(manager, "registerRelayResponseHandlers").mockImplementation(() => {
+      throw new Error("relay transport closed during startup");
+    });
+    const limiter = new ModelApiConcurrencyLimiter();
+    const globalRelease = vi.fn();
+    const cliRelease = vi.fn(() => {
+      throw new Error("local CLI release failed");
+    });
+    vi.spyOn(limiter, "acquireGlobal").mockReturnValue({ release: globalRelease });
+    vi.spyOn(limiter, "acquireCli").mockReturnValue({ release: cliRelease });
+    const capacityRelease = vi.fn().mockResolvedValue(true);
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async (attempt) => {
+        const candidate = attempt.candidates[0]!;
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: "startup-failure-lease",
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      }),
+      release: capacityRelease,
+      hold: vi.fn((response) => response),
+    };
+
+    const response = await appWith(manager, true, false, capacityRuntime, limiter).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: requestBody(),
+      },
+    );
+
+    expect(response.status).toBe(500);
+    expect(cliRelease).toHaveBeenCalledTimes(1);
+    expect(globalRelease).toHaveBeenCalledTimes(1);
+    expect(capacityRelease).toHaveBeenCalledTimes(1);
+    expect(capacityRuntime.hold).not.toHaveBeenCalled();
+    expect(db.relayRequest.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "FAILED", attemptCount: 1 }),
+      }),
+    );
+  });
+
   it.each([
     ["follow-up create", "/responses", "POST", true],
     ["retrieve", "/responses/resp_123", "GET", false],

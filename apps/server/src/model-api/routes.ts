@@ -2585,11 +2585,16 @@ async function relayDirect({
     });
     cliLease = limiter.acquireCli(selected.Endpoint.cliDeviceId);
   } catch (error) {
-    cliLease?.release();
-    globalLease?.release();
-    if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
+    await settleRelayCleanup([
+      () => cliLease?.release(),
+      () => globalLease?.release(),
+      () =>
+        capacityLease?.state === "ADMITTED"
+          ? capacityRuntime?.release(capacityLease.lease)
+          : undefined,
+      () => operation.dispose?.(),
+    ]);
     if (error instanceof ModelApiLimitError) {
-      await operation.dispose?.();
       await failRelayMetadata({
         relayRequestId,
         startedAt,
@@ -2598,17 +2603,28 @@ async function relayDirect({
       });
       return operationFailureResponse(operation, error.failure);
     }
-    throw error;
+    await failRelayMetadata({
+      relayRequestId,
+      startedAt,
+      failure: "unknown",
+      selectedDiscoveredModelId: selected.id,
+    });
+    return operationFailureResponse(operation, "unknown");
   }
 
   let builtRequest: BuiltRelayRequest;
   try {
     builtRequest = await operation.buildRequest(selected.upstreamModelId);
   } catch {
-    cliLease.release();
-    globalLease?.release();
-    if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
-    await operation.dispose?.();
+    await settleRelayCleanup([
+      () => cliLease.release(),
+      () => globalLease?.release(),
+      () =>
+        capacityLease?.state === "ADMITTED"
+          ? capacityRuntime?.release(capacityLease.lease)
+          : undefined,
+      () => operation.dispose?.(),
+    ]);
     await failRelayMetadata({
       relayRequestId,
       startedAt,
@@ -2621,21 +2637,43 @@ async function relayDirect({
     operation.responseStickiness && operation.family === "responses"
       ? createResponseIdCapture()
       : null;
-  const attempt = startRelayAttempt({
-    manager,
-    cliDeviceId: selected.Endpoint.cliDeviceId,
-    endpointSlug: selected.Endpoint.slug,
-    family: operation.family,
-    method: operation.method,
-    path: operation.path,
-    headers: builtRequest.headers,
-    ...relayAttemptBody(builtRequest.body),
-    timeoutMs: MODEL_API_RELAY_TIMEOUT_MS,
-    abortSignal: request.signal,
-    onResponseBodyChunk: responseIdCapture
-      ? (chunk) => responseIdCapture.push(chunk, operation.stream)
-      : undefined,
-  });
+  let attempt: ReturnType<typeof startRelayAttempt>;
+  try {
+    attempt = startRelayAttempt({
+      manager,
+      cliDeviceId: selected.Endpoint.cliDeviceId,
+      endpointSlug: selected.Endpoint.slug,
+      family: operation.family,
+      method: operation.method,
+      path: operation.path,
+      headers: builtRequest.headers,
+      ...relayAttemptBody(builtRequest.body),
+      timeoutMs: MODEL_API_RELAY_TIMEOUT_MS,
+      abortSignal: request.signal,
+      onResponseBodyChunk: responseIdCapture
+        ? (chunk) => responseIdCapture.push(chunk, operation.stream)
+        : undefined,
+    });
+  } catch {
+    await settleRelayCleanup([
+      () => cliLease.release(),
+      () => globalLease?.release(),
+      () =>
+        capacityLease?.state === "ADMITTED"
+          ? capacityRuntime?.release(capacityLease.lease)
+          : undefined,
+      () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
+      () => operation.dispose?.(),
+    ]);
+    await failRelayMetadata({
+      relayRequestId,
+      startedAt,
+      failure: "unknown",
+      selectedDiscoveredModelId: selected.id,
+      attemptCount: 1,
+    });
+    return operationFailureResponse(operation, "unknown");
+  }
 
   try {
     const started = await attempt.started;
@@ -2968,7 +3006,19 @@ async function relayPool({
       return operationFailureResponse(operation, "rate_limited");
     }
     const selectedPoolMemberId = capacityLease.lease.poolMemberId;
-    await applyMemberContextCount(selectedPoolMemberId);
+    try {
+      await applyMemberContextCount(selectedPoolMemberId);
+    } catch {
+      const admittedLease = capacityLease.lease;
+      await settleRelayCleanup([
+        () => capacityRuntime.release(admittedLease),
+        () => operation.dispose?.(),
+      ]);
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "unknown" }).catch(
+        metadataUpdateError,
+      );
+      return operationFailureResponse(operation, "unknown");
+    }
     selectedRouteCandidates = [
       ...routeCandidates.filter(({ poolMemberId }) => poolMemberId === selectedPoolMemberId),
       ...routeCandidates.filter(({ poolMemberId }) => poolMemberId !== selectedPoolMemberId),
@@ -2991,7 +3041,10 @@ async function relayPool({
       await failRelayMetadata({ relayRequestId, startedAt, failure: error.failure });
       return operationFailureResponse(operation, error.failure);
     }
-    throw error;
+    await failRelayMetadata({ relayRequestId, startedAt, failure: "unknown" }).catch(
+      metadataUpdateError,
+    );
+    return operationFailureResponse(operation, "unknown");
   }
   let finalFailure: RelayFailure = "unknown";
   let attemptCount = 0;
@@ -3057,7 +3110,13 @@ async function relayPool({
         break;
       }
       const admittedPoolMemberId = capacityLease.lease.poolMemberId;
-      await applyMemberContextCount(admittedPoolMemberId);
+      try {
+        await applyMemberContextCount(admittedPoolMemberId);
+      } catch {
+        await releaseCapacityAttempt();
+        finalFailure = "unknown";
+        break;
+      }
       const selectedIndex = selectedRouteCandidates.findIndex(
         ({ poolMemberId }, index) =>
           index >= candidateIndex && poolMemberId === admittedPoolMemberId,
@@ -3103,15 +3162,25 @@ async function relayPool({
         await releaseCapacityAttempt();
         continue;
       }
-      throw error;
+      finalFailure = "unknown";
+      await releaseCapacityAttempt();
+      break;
     }
 
     if (candidate.healthStatus === "HALF_OPEN") {
-      const claimed = await markPoolMemberHalfOpenTrial({
-        poolMemberId: candidate.poolMemberId,
-      });
+      let claimed: number;
+      try {
+        claimed = await markPoolMemberHalfOpenTrial({
+          poolMemberId: candidate.poolMemberId,
+        });
+      } catch {
+        await settleRelayCleanup([() => cliLease.release()]);
+        finalFailure = "unknown";
+        await releaseCapacityAttempt();
+        break;
+      }
       if (claimed === 0) {
-        cliLease.release();
+        await settleRelayCleanup([() => cliLease.release()]);
         await releaseCapacityAttempt();
         continue;
       }
@@ -3184,7 +3253,7 @@ async function relayPool({
       await recordPoolMemberRelayFailure({
         poolMemberId: candidate.poolMemberId,
         failure: "unknown",
-      });
+      }).catch(metadataUpdateError);
       await releaseCapacityAttempt();
       continue;
     }
@@ -3194,27 +3263,44 @@ async function relayPool({
         : null;
     const attemptTimeoutMs = remainingRelayBudgetMs(relayDeadlineMs);
     if (attemptTimeoutMs === 0) {
-      cliLease.release();
-      if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+      await settleRelayCleanup([
+        () => cliLease.release(),
+        () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
+      ]);
       finalFailure = "timeout";
       break;
     }
-    const attempt = startRelayAttempt({
-      manager,
-      cliDeviceId: candidate.cliDeviceId,
-      endpointSlug: member.DiscoveredModel.Endpoint.slug,
-      family: adaptedSource ? nativeRouteForSurface(adaptedSource).family : operation.family,
-      method: operation.method,
-      path: adaptedSource ? nativeRouteForSurface(adaptedSource).path : operation.path,
-      headers: builtRequest.headers,
-      ...relayAttemptBody(builtRequest.body),
-      timeoutMs: attemptTimeoutMs,
-      abortSignal: request.signal,
-      onResponseBodyChunk: responseIdCapture
-        ? (chunk) => responseIdCapture.push(chunk, operation.stream)
-        : undefined,
-    });
     attemptCount += 1;
+    let attempt: ReturnType<typeof startRelayAttempt>;
+    try {
+      attempt = startRelayAttempt({
+        manager,
+        cliDeviceId: candidate.cliDeviceId,
+        endpointSlug: member.DiscoveredModel.Endpoint.slug,
+        family: adaptedSource ? nativeRouteForSurface(adaptedSource).family : operation.family,
+        method: operation.method,
+        path: adaptedSource ? nativeRouteForSurface(adaptedSource).path : operation.path,
+        headers: builtRequest.headers,
+        ...relayAttemptBody(builtRequest.body),
+        timeoutMs: attemptTimeoutMs,
+        abortSignal: request.signal,
+        onResponseBodyChunk: responseIdCapture
+          ? (chunk) => responseIdCapture.push(chunk, operation.stream)
+          : undefined,
+      });
+    } catch {
+      await settleRelayCleanup([
+        () => cliLease.release(),
+        () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
+      ]);
+      finalFailure = "unknown";
+      await recordPoolMemberRelayFailure({
+        poolMemberId: candidate.poolMemberId,
+        failure: "unknown",
+      }).catch(metadataUpdateError);
+      await releaseCapacityAttempt();
+      continue;
+    }
 
     try {
       const started = await attempt.started;
@@ -3223,13 +3309,15 @@ async function relayPool({
         const terminal = await attempt.terminal;
         cumulativeRequestBytes += terminal.requestBytes;
         cumulativeResponseBytes += terminal.responseBytes;
-        cliLease.release();
-        if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+        await settleRelayCleanup([
+          () => cliLease.release(),
+          () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
+        ]);
         finalFailure = "upstream_5xx";
         await recordPoolMemberRelayFailure({
           poolMemberId: candidate.poolMemberId,
           failure: "upstream_5xx",
-        });
+        }).catch(metadataUpdateError);
         await releaseCapacityAttempt();
         continue;
       }
@@ -3243,13 +3331,16 @@ async function relayPool({
           const terminal = await attempt.terminal;
           cumulativeRequestBytes += terminal.requestBytes;
           cumulativeResponseBytes += terminal.responseBytes;
-          cliLease.release();
-          if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+          await settleRelayCleanup([
+            () => cliLease.release(),
+            () =>
+              builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose(),
+          ]);
           finalFailure = "protocol_error";
           await recordPoolMemberRelayFailure({
             poolMemberId: candidate.poolMemberId,
             failure: "protocol_error",
-          });
+          }).catch(metadataUpdateError);
           if (!shouldRetryRelayOperation(operation, "precommit_content_type_mismatch")) break;
           await releaseCapacityAttempt();
           continue;
@@ -3275,13 +3366,16 @@ async function relayPool({
           const terminal = await attempt.terminal;
           cumulativeRequestBytes += terminal.requestBytes;
           cumulativeResponseBytes += terminal.responseBytes;
-          cliLease.release();
-          if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+          await settleRelayCleanup([
+            () => cliLease.release(),
+            () =>
+              builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose(),
+          ]);
           finalFailure = "protocol_error";
           await recordPoolMemberRelayFailure({
             poolMemberId: candidate.poolMemberId,
             failure: "protocol_error",
-          });
+          }).catch(metadataUpdateError);
           await releaseCapacityAttempt();
           continue;
         }
@@ -3313,13 +3407,16 @@ async function relayPool({
           const terminal = await attempt.terminal;
           cumulativeRequestBytes += terminal.requestBytes;
           cumulativeResponseBytes += terminal.responseBytes;
-          cliLease.release();
-          if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+          await settleRelayCleanup([
+            () => cliLease.release(),
+            () =>
+              builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose(),
+          ]);
           finalFailure = "protocol_error";
           await recordPoolMemberRelayFailure({
             poolMemberId: candidate.poolMemberId,
             failure: "protocol_error",
-          });
+          }).catch(metadataUpdateError);
           await releaseCapacityAttempt();
           continue;
         }
@@ -3461,11 +3558,13 @@ async function relayPool({
         ? (capacityRuntime?.hold(response, capacityLease.lease, request.signal) ?? response)
         : response;
     } catch {
-      const terminal = await attempt.terminal;
+      const terminal = await attempt.terminal.catch(() => rejectedRelayTerminal());
       cumulativeRequestBytes += terminal.requestBytes;
       cumulativeResponseBytes += terminal.responseBytes;
-      cliLease.release();
-      if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+      await settleRelayCleanup([
+        () => cliLease.release(),
+        () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
+      ]);
       const failure = terminal.failure ?? "unknown";
       finalFailure = failure;
       if (!shouldRetryRelayOperation(operation, "precommit_transport")) break;
@@ -3473,7 +3572,7 @@ async function relayPool({
         await recordPoolMemberRelayFailure({
           poolMemberId: candidate.poolMemberId,
           failure,
-        });
+        }).catch(metadataUpdateError);
         await releaseCapacityAttempt();
         continue;
       }
