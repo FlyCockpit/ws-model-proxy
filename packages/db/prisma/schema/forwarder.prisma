@@ -1276,8 +1276,8 @@ model ResponseStickinessRecord {
   SelectedDiscoveredModel   DiscoveredModel? @relation("ResponseStickinessSelectedModel", fields: [selectedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   TargetExecutionTarget     ExecutionTarget? @relation("ResponseStickinessTargetExecutionTarget", fields: [targetExecutionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   SelectedExecutionTarget   ExecutionTarget? @relation("ResponseStickinessSelectedExecutionTarget", fields: [selectedExecutionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ProviderAccount           ProviderAccount? @relation("ResponseStickinessProviderAccount", fields: [providerAccountId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
-  ProviderModel             ProviderModel?   @relation("ResponseStickinessProviderModel", fields: [providerModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  ProviderAccount           ProviderAccount? @relation("ResponseStickinessProviderAccount", fields: [providerAccountId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ProviderModel             ProviderModel?   @relation("ResponseStickinessProviderModel", fields: [providerModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
   @@unique([userId, routingKeyDigest])
   @@index([modelApiTokenId])

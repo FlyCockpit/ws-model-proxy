@@ -1064,6 +1064,13 @@ DECLARE
   target_owner TEXT;
   target_model TEXT;
   consumer_owner TEXT;
+  provider_model TEXT;
+  provider_account TEXT;
+  provider_upstream_model TEXT;
+  provider_endpoint_identity TEXT;
+  provider_endpoint_version INTEGER;
+  pool_owner TEXT;
+  token_owner TEXT;
 BEGIN
   IF TG_TABLE_NAME = 'pool_member' THEN
     IF NEW."executionTargetId" IS NULL THEN
@@ -1105,6 +1112,49 @@ BEGIN
         USING ERRCODE = '23514';
     END IF;
   ELSIF TG_TABLE_NAME = 'response_stickiness_record' THEN
+    IF NEW."routingVersion" >= 3 THEN
+      SELECT et."userId", et."providerModelId", model."providerAccountId",
+             model."upstreamModelId", account."endpointIdentity", account."endpointVersion",
+             pool."userId"
+        INTO target_owner, provider_model, provider_account, provider_upstream_model,
+             provider_endpoint_identity, provider_endpoint_version, pool_owner
+        FROM execution_target et
+        JOIN provider_model model ON model.id = et."providerModelId"
+        JOIN provider_account account ON account.id = model."providerAccountId"
+        JOIN model_pool pool ON pool.id = NEW."targetModelPoolId"
+       WHERE et.id = NEW."selectedExecutionTargetId";
+      IF target_owner IS NULL
+         OR provider_model IS DISTINCT FROM NEW."providerModelId"
+         OR provider_account IS DISTINCT FROM NEW."providerAccountId"
+         OR provider_upstream_model IS DISTINCT FROM NEW."providerUpstreamModelId"
+         OR provider_endpoint_identity IS DISTINCT FROM NEW."providerEndpointIdentity"
+         OR provider_endpoint_version IS DISTINCT FROM NEW."providerEndpointVersion"
+         OR pool_owner IS DISTINCT FROM target_owner
+         OR NOT EXISTS (
+           SELECT 1 FROM pool_member member
+            WHERE member."poolId" = NEW."targetModelPoolId"
+              AND member."executionTargetId" = NEW."selectedExecutionTargetId"
+              AND member.tier = 'PUBLIC_OVERFLOW'::"PoolMemberTier"
+         )
+         OR (NEW."userId" IS DISTINCT FROM pool_owner AND NOT EXISTS (
+           SELECT 1 FROM pool_grant grant_row
+            WHERE grant_row."poolId" = NEW."targetModelPoolId"
+              AND grant_row."ownerUserId" = pool_owner
+              AND grant_row."granteeUserId" = NEW."userId"
+         )) THEN
+        RAISE EXCEPTION 'provider stickiness binding must match its exact account, model, target, pool, endpoint, and visibility graph'
+          USING ERRCODE = '23514';
+      END IF;
+      IF NEW."modelApiTokenId" IS NOT NULL THEN
+        SELECT "userId" INTO token_owner FROM model_api_token
+         WHERE id = NEW."modelApiTokenId";
+        IF token_owner IS NULL OR token_owner IS DISTINCT FROM NEW."userId" THEN
+          RAISE EXCEPTION 'provider stickiness token must belong to its requester'
+            USING ERRCODE = '23514';
+        END IF;
+      END IF;
+      RETURN NEW;
+    END IF;
     IF NEW."targetExecutionTargetId" IS NOT NULL THEN
       SELECT "userId", "discoveredModelId" INTO target_owner, target_model
         FROM execution_target WHERE id = NEW."targetExecutionTargetId";

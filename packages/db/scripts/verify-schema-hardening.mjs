@@ -370,21 +370,45 @@ try {
        "endpointIdentity", "endpointVersion", "authType")
     VALUES ('sticky-provider-account', NOW(), NOW(), 'owner-a', 'openai', 'Sticky provider',
       'https://api.example.test/v1', 'https://api.example.test/v1', 1, 'BEARER');
+    INSERT INTO provider_account
+      (id, "createdAt", "updatedAt", "userId", "providerType", label, "baseUrl",
+       "endpointIdentity", "endpointVersion", "authType")
+    VALUES ('other-provider-account', NOW(), NOW(), 'owner-a', 'openai', 'Other provider',
+      'https://other.example.test/v1', 'https://other.example.test/v1', 1, 'BEARER');
     INSERT INTO provider_model
       (id, "createdAt", "updatedAt", "userId", "providerAccountId", "upstreamModelId")
     VALUES ('sticky-provider-model', NOW(), NOW(), 'owner-a', 'sticky-provider-account',
       'gpt-responses');
+    INSERT INTO provider_model
+      (id, "createdAt", "updatedAt", "userId", "providerAccountId", "upstreamModelId")
+    VALUES ('other-provider-model', NOW(), NOW(), 'owner-a', 'sticky-provider-account',
+      'gpt-other');
     INSERT INTO execution_target
       (id, "createdAt", "updatedAt", "userId", kind, "providerModelId")
     VALUES ('sticky-provider-target', NOW(), NOW(), 'owner-a', 'PROVIDER_MODEL',
       'sticky-provider-model');
+    INSERT INTO execution_target
+      (id, "createdAt", "updatedAt", "userId", kind, "providerModelId")
+    VALUES ('other-provider-target', NOW(), NOW(), 'owner-a', 'PROVIDER_MODEL',
+      'other-provider-model');
     INSERT INTO model_pool (id, "createdAt", "updatedAt", "userId", slug, name)
     VALUES ('sticky-provider-pool', NOW(), NOW(), 'owner-a', 'sticky-provider',
       'Sticky provider');
+    INSERT INTO pool_member
+      (id, "createdAt", "updatedAt", "poolId", "executionTargetId", tier, "publicOrder")
+    VALUES ('sticky-provider-member', NOW(), NOW(), 'sticky-provider-pool',
+      'sticky-provider-target', 'PUBLIC_OVERFLOW', 0);
     INSERT INTO model_api_token
       (id, "createdAt", "updatedAt", "userId", name, "lookupPrefix", "secretDigest")
     VALUES ('sticky-provider-token', NOW(), NOW(), 'owner-a', 'Sticky token',
       'sticky-provider-prefix', 'sticky-provider-secret-digest');
+    INSERT INTO model_api_token
+      (id, "createdAt", "updatedAt", "userId", name, "lookupPrefix", "secretDigest")
+    VALUES ('grantee-provider-token', NOW(), NOW(), 'owner-b', 'Grantee sticky token',
+      'grantee-provider-prefix', 'grantee-provider-secret-digest');
+    INSERT INTO pool_grant
+      (id, "createdAt", "updatedAt", "poolId", "ownerUserId", "granteeUserId")
+    VALUES ('sticky-provider-grant', NOW(), NOW(), 'sticky-provider-pool', 'owner-a', 'owner-b');
     INSERT INTO response_stickiness_record
       (id, "createdAt", "updatedAt", "userId", "modelApiTokenId", "routingKeyDigest",
        "routingVersion", "targetModelPoolId", "selectedExecutionTargetId",
@@ -396,6 +420,18 @@ try {
       'sticky-provider-account', 'sticky-provider-model', 'https://api.example.test/v1', 1,
       'gpt-responses', 'OPENAI_RESPONSES',
       'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-', NOW() + INTERVAL '1 hour');
+    INSERT INTO response_stickiness_record
+      (id, "createdAt", "updatedAt", "userId", "modelApiTokenId", "routingKeyDigest",
+       "routingVersion", "targetModelPoolId", "selectedExecutionTargetId",
+       "providerAccountId", "providerModelId", "providerEndpointIdentity",
+       "providerEndpointVersion", "providerUpstreamModelId", "nativeSurface",
+       "upstreamResponseIdDigest", "expiresAt")
+    VALUES ('grantee-provider-binding', NOW(), NOW(), 'owner-b', 'grantee-provider-token',
+      'grantee-sticky-routing-digest', 3, 'sticky-provider-pool', 'sticky-provider-target',
+      'sticky-provider-account', 'sticky-provider-model', 'https://api.example.test/v1', 1,
+      'gpt-responses', 'OPENAI_RESPONSES',
+      'efghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-abcd',
+      NOW() + INTERVAL '1 hour');
     INSERT INTO response_stickiness_record
       (id, "createdAt", "updatedAt", "userId", "modelApiTokenId", "routingKeyDigest",
        "routingVersion", "targetDiscoveredModelId", "selectedDiscoveredModelId", "expiresAt")
@@ -424,6 +460,48 @@ try {
              'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-'
      WHERE id = 'legacy-sticky-collision'
   `);
+  await expectConstraintFailure(`
+    INSERT INTO response_stickiness_record
+      (id, "createdAt", "updatedAt", "userId", "modelApiTokenId", "routingKeyDigest",
+       "routingVersion", "targetModelPoolId", "selectedExecutionTargetId",
+       "providerAccountId", "providerModelId", "providerEndpointIdentity",
+       "providerEndpointVersion", "providerUpstreamModelId", "nativeSurface",
+       "upstreamResponseIdDigest", "expiresAt")
+    VALUES ('cross-wired-provider-model', NOW(), NOW(), 'owner-a', 'sticky-provider-token',
+      'cross-wired-provider-model-digest', 3, 'sticky-provider-pool',
+      'sticky-provider-target', 'sticky-provider-account', 'other-provider-model',
+      'https://api.example.test/v1', 1, 'gpt-other', 'OPENAI_RESPONSES',
+      'bcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-a',
+      NOW() + INTERVAL '1 hour')
+  `);
+  await expectConstraintFailure(`
+    INSERT INTO response_stickiness_record
+      (id, "createdAt", "updatedAt", "userId", "modelApiTokenId", "routingKeyDigest",
+       "routingVersion", "targetModelPoolId", "selectedExecutionTargetId",
+       "providerAccountId", "providerModelId", "providerEndpointIdentity",
+       "providerEndpointVersion", "providerUpstreamModelId", "nativeSurface",
+       "upstreamResponseIdDigest", "expiresAt")
+    VALUES ('cross-wired-provider-account', NOW(), NOW(), 'owner-a', 'sticky-provider-token',
+      'cross-wired-provider-account-digest', 3, 'sticky-provider-pool',
+      'sticky-provider-target', 'other-provider-account', 'sticky-provider-model',
+      'https://other.example.test/v1', 1, 'gpt-responses', 'OPENAI_RESPONSES',
+      'cdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-ab',
+      NOW() + INTERVAL '1 hour')
+  `);
+  await expectConstraintFailure(`
+    INSERT INTO response_stickiness_record
+      (id, "createdAt", "updatedAt", "userId", "modelApiTokenId", "routingKeyDigest",
+       "routingVersion", "targetModelPoolId", "selectedExecutionTargetId",
+       "providerAccountId", "providerModelId", "providerEndpointIdentity",
+       "providerEndpointVersion", "providerUpstreamModelId", "nativeSurface",
+       "upstreamResponseIdDigest", "expiresAt")
+    VALUES ('cross-wired-provider-pool', NOW(), NOW(), 'owner-a', 'sticky-provider-token',
+      'cross-wired-provider-pool-digest', 3, 'sticky-provider-pool',
+      'other-provider-target', 'sticky-provider-account', 'other-provider-model',
+      'https://api.example.test/v1', 1, 'gpt-other', 'OPENAI_RESPONSES',
+      'defghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-abc',
+      NOW() + INTERVAL '1 hour')
+  `);
   await client.query(`
     UPDATE provider_account
        SET "baseUrl" = 'https://replacement.example.test/v1',
@@ -451,6 +529,14 @@ try {
   `);
   if (deletedTokenBinding.rows[0]?.count !== 0) {
     throw new Error("Deleted model API token retained a provider Responses binding");
+  }
+  await client.query(`DELETE FROM model_api_token WHERE id = 'grantee-provider-token'`);
+  const deletedGranteeBinding = await client.query(`
+    SELECT COUNT(*)::int AS count FROM response_stickiness_record
+     WHERE id = 'grantee-provider-binding'
+  `);
+  if (deletedGranteeBinding.rows[0]?.count !== 0) {
+    throw new Error("Deleted grantee token retained a provider Responses binding");
   }
   const reverseBackfill = await client.query(`
     SELECT "discoveredModelId" FROM pool_member WHERE id = 'conflict-target-row'
