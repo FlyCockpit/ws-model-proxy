@@ -1982,9 +1982,15 @@ export function PoolsSection() {
                           setMemberTestSurface(event.target.value as MemberTestSurface)
                         }
                       >
-                        <option value="OPENAI_CHAT_COMPLETIONS">OpenAI Chat</option>
-                        <option value="OPENAI_RESPONSES">OpenAI Responses</option>
-                        <option value="ANTHROPIC_MESSAGES">Anthropic Messages</option>
+                        <option value="OPENAI_CHAT_COMPLETIONS">
+                          {t("dashboard:pools.memberTestSurfaces.OPENAI_CHAT_COMPLETIONS")}
+                        </option>
+                        <option value="OPENAI_RESPONSES">
+                          {t("dashboard:pools.memberTestSurfaces.OPENAI_RESPONSES")}
+                        </option>
+                        <option value="ANTHROPIC_MESSAGES">
+                          {t("dashboard:pools.memberTestSurfaces.ANTHROPIC_MESSAGES")}
+                        </option>
                       </select>
                       <Label className="sr-only" htmlFor={`member-test-mode-${pool.id}`}>
                         {t("dashboard:pools.memberTestMode")}

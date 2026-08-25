@@ -350,7 +350,7 @@
         "memberConcurrencyLimit": "Ingresa un límite de concurrencia del miembro de 1 a 10000.",
         "memberContextCeiling": "El contexto del miembro debe ser positivo y no superar el contexto físico.",
         "name": "Ingresa un nombre para el pool.",
-        "providerConcurrencyLimit": "Ingresa un límite finito de concurrencia del proveedor.",
+        "providerConcurrencyLimit": "Ingresa un límite entero de concurrencia del proveedor de 1 a 10000.",
         "providerModelIds": "Selecciona como máximo 32 modelos de proveedor.",
         "physicalConcurrencyLimit": "Ingresa un límite de concurrencia física de 1 a 10000.",
         "physicalMaxContext": "Ingresa un límite de contexto físico de 1 a 100000000.",
@@ -406,6 +406,11 @@
     "grantEgressAcknowledge": "Entiendo que las solicitudes de esta persona pueden salir del despliegue local mediante los proveedores de este pool.",
     "memberTestSurface": "Superficie de API para probar el miembro",
     "memberTestMode": "Modo de ejecución para probar el miembro",
+    "memberTestSurfaces": {
+      "OPENAI_CHAT_COMPLETIONS": "OpenAI Chat Completions",
+      "OPENAI_RESPONSES": "OpenAI Responses",
+      "ANTHROPIC_MESSAGES": "Anthropic Messages"
+    },
     "memberTestPreferred": "Preferir nativo",
     "memberTestNative": "Exigir nativo",
     "memberTestAdapted": "Exigir adaptado",

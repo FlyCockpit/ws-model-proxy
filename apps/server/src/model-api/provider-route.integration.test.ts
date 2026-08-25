@@ -346,6 +346,8 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     statefulResponses?: boolean;
     grantee?: boolean;
     cookieAuth?: boolean;
+    forceProviderMember?: boolean;
+    routingMode?: "PREFER_NATIVE" | "REQUIRE_NATIVE" | "REQUIRE_ADAPTED";
   }) {
     if (!modules) throw new Error("modules unavailable");
     const suffix = crypto.randomUUID();
@@ -446,7 +448,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     const target = await modules.prisma.executionTarget.create({
       data: { userId: user.id, kind: "PROVIDER_MODEL", providerModelId: model.id },
     });
-    await modules.prisma.poolMember.create({
+    const primaryMember = await modules.prisma.poolMember.create({
       data: {
         poolId: pool.id,
         executionTargetId: target.id,
@@ -707,6 +709,8 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (input.cookieAuth) headers.cookie = `better-auth.session_token=cookie-${suffix}`;
     else headers.authorization = `Bearer ${rawToken}`;
+    if (input.forceProviderMember) headers["x-wsmp-chat-test-member-id"] = primaryMember.id;
+    if (input.routingMode) headers["x-wsmp-chat-test-routing-mode"] = input.routingMode;
     if (input.requested === "anthropic-messages") headers["anthropic-version"] = "2023-06-01";
     const observationIndex = upstreamObservations.length;
     const response = await app.request(pathFor(input.requested), {
@@ -1471,6 +1475,8 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       native: "openai-responses",
       behavior: "json",
       cookieAuth: true,
+      forceProviderMember: true,
+      routingMode: "REQUIRE_NATIVE",
     });
     expect(result.response.status, result.responseText).toBe(200);
     expect(JSON.parse(result.responseText)).toMatchObject({
@@ -1478,5 +1484,48 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       status: "completed",
     });
     expect(result.observation?.authorization).toBe("Bearer route-provider-secret");
+  });
+
+  it("proves PostgreSQL removes guarded setup writes after an injected mid-transaction failure", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const suffix = crypto.randomUUID();
+    const user = await modules.prisma.user.create({
+      data: {
+        name: "Guarded rollback proof",
+        email: `guarded-rollback-${suffix}@example.test`,
+        slug: `guarded-rollback-${suffix}`,
+      },
+    });
+    const poolId = crypto.randomUUID();
+    await expect(
+      modules.prisma.$transaction(async (transaction) => {
+        await transaction.modelPool.create({
+          data: {
+            id: poolId,
+            userId: user.id,
+            slug: `rollback-${suffix}`,
+            name: "Must roll back",
+            publicEgressEnabled: false,
+            publicEgressAcknowledged: false,
+          },
+        });
+        await transaction.capacityAuditEvent.create({
+          data: {
+            userId: user.id,
+            actorUserId: user.id,
+            action: "CREATE",
+            resourceType: "MODEL_POOL",
+            resourceId: poolId,
+          },
+        });
+        throw new Error("injected guarded setup failure");
+      }),
+    ).rejects.toThrow("injected guarded setup failure");
+    await expect(
+      modules.prisma.modelPool.findUnique({ where: { id: poolId } }),
+    ).resolves.toBeNull();
+    await expect(
+      modules.prisma.capacityAuditEvent.findMany({ where: { resourceId: poolId } }),
+    ).resolves.toEqual([]);
   });
 });

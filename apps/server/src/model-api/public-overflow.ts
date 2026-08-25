@@ -159,7 +159,14 @@ export function matchesChatTestProviderMode(
   mode: PublicOverflowRequest["chatTestRoutingMode"],
 ) {
   if (mode === "REQUIRE_NATIVE") return target.nativeSurfaces.includes(requestedSurface);
-  if (mode === "REQUIRE_ADAPTED") return !target.nativeSurfaces.includes(requestedSurface);
+  if (mode === "REQUIRE_ADAPTED")
+    return target.nativeSurfaces.some(
+      (surface) =>
+        surface !== requestedSurface &&
+        (surface === "anthropic-messages" ||
+          surface === "openai-responses" ||
+          surface === "openai-chat"),
+    );
   return true;
 }
 
@@ -170,6 +177,20 @@ export function targetsForForcedPoolMember<T extends Pick<PublicProviderTarget, 
   return forcedPoolMemberId
     ? targets.filter((target) => target.poolMemberId === forcedPoolMemberId)
     : [...targets];
+}
+
+export function orderChatTestProviderTargets<
+  T extends Pick<PublicProviderTarget, "nativeSurfaces">,
+>(
+  targets: readonly T[],
+  requestedSurface: ProtocolSurface,
+  mode: PublicOverflowRequest["chatTestRoutingMode"],
+) {
+  if (mode !== "PREFER_NATIVE") return [...targets];
+  return [
+    ...targets.filter((target) => target.nativeSurfaces.includes(requestedSurface)),
+    ...targets.filter((target) => !target.nativeSurfaces.includes(requestedSurface)),
+  ];
 }
 
 export function matchesExactResponsesBinding(
@@ -1076,6 +1097,21 @@ function selectedNativeSurface(target: PublicProviderTarget, requested: Protocol
   );
 }
 
+function selectedProviderSurface(
+  target: PublicProviderTarget,
+  requested: ProtocolSurface,
+  mode: PublicOverflowRequest["chatTestRoutingMode"],
+) {
+  if (mode !== "REQUIRE_ADAPTED") return selectedNativeSurface(target, requested);
+  return target.nativeSurfaces.find(
+    (surface) =>
+      surface !== requested &&
+      (target.protocol === "anthropic"
+        ? surface === "anthropic-messages"
+        : surface === "openai-responses" || surface === "openai-chat"),
+  );
+}
+
 function providerHealthPenalty(status: PublicProviderTarget["healthStatus"]): number {
   return status === "UNAVAILABLE"
     ? 200
@@ -1301,12 +1337,17 @@ export async function dispatchPublicOverflow(
   let lastAdmission: ProviderBudgetAdmission | undefined;
   let attemptCount = 0;
 
-  for (const [rankedIndex, target] of ranked.targets.entries()) {
+  const rankedTargets = orderChatTestProviderTargets(
+    ranked.targets,
+    request.requestedSurface,
+    request.chatTestRoutingMode,
+  );
+  for (const [rankedIndex, target] of rankedTargets.entries()) {
     const nativeSurface = binding
       ? target.nativeSurfaces.includes("openai-responses")
         ? "openai-responses"
         : undefined
-      : selectedNativeSurface(target, request.requestedSurface);
+      : selectedProviderSurface(target, request.requestedSurface, request.chatTestRoutingMode);
     if (!nativeSurface) continue;
     attemptCount += 1;
     const attemptId = crypto.randomUUID();

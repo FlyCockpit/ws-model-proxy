@@ -433,6 +433,10 @@ export function GuardedPoolSetupWizard({
                                   id={`guarded-${name}`}
                                   className="min-h-11"
                                   type={name === "providerConcurrencyLimit" ? "number" : "text"}
+                                  min={name === "providerConcurrencyLimit" ? 1 : undefined}
+                                  max={name === "providerConcurrencyLimit" ? 10_000 : undefined}
+                                  step={name === "providerConcurrencyLimit" ? 1 : undefined}
+                                  inputMode={name === "dailySpendLimit" ? "decimal" : undefined}
                                   value={field.state.value}
                                   onChange={(event) =>
                                     field.handleChange(

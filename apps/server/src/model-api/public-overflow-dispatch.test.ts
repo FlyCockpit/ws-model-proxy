@@ -83,6 +83,7 @@ import {
   dispatchPublicOverflow,
   listPublicOverflowTargets,
   matchesChatTestProviderMode,
+  orderChatTestProviderTargets,
   rankPublicOverflowTargets,
   targetsForForcedPoolMember,
 } from "./public-overflow.js";
@@ -93,6 +94,20 @@ it("applies explicit native and adapted Chat Test modes to provider targets", ()
   expect(matchesChatTestProviderMode(target, "openai-responses", "REQUIRE_NATIVE")).toBe(false);
   expect(matchesChatTestProviderMode(target, "openai-responses", "REQUIRE_ADAPTED")).toBe(true);
   expect(matchesChatTestProviderMode(target, "openai-chat", "REQUIRE_ADAPTED")).toBe(false);
+  expect(
+    matchesChatTestProviderMode(
+      { nativeSurfaces: ["openai-responses", "openai-chat"] },
+      "openai-responses",
+      "REQUIRE_ADAPTED",
+    ),
+  ).toBe(true);
+  expect(
+    matchesChatTestProviderMode(
+      { nativeSurfaces: ["openai-responses"] },
+      "openai-responses",
+      "REQUIRE_ADAPTED",
+    ),
+  ).toBe(false);
 });
 
 it("constrains a member probe to the selected public-overflow member", () => {
@@ -101,6 +116,18 @@ it("constrains a member probe to the selected public-overflow member", () => {
     { poolMemberId: "provider-b" },
   ]);
   expect(targetsForForcedPoolMember(targets, undefined)).toEqual(targets);
+});
+
+it("keeps provider ranking stable within native-first Chat Test classes", () => {
+  const adaptedFirst = { id: "adapted", nativeSurfaces: ["openai-chat"] as const };
+  const nativeSecond = { id: "native", nativeSurfaces: ["openai-responses"] as const };
+  expect(
+    orderChatTestProviderTargets(
+      [adaptedFirst, nativeSecond],
+      "openai-responses",
+      "PREFER_NATIVE",
+    ).map((target) => target.id),
+  ).toEqual(["native", "adapted"]);
 });
 
 function dispatchPoolFixture(

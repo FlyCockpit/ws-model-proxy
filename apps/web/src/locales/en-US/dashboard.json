@@ -350,7 +350,7 @@
         "memberConcurrencyLimit": "Enter a member concurrency limit from 1 to 10000.",
         "memberContextCeiling": "Member context must be positive and no larger than physical context.",
         "name": "Enter a pool name.",
-        "providerConcurrencyLimit": "Enter a finite provider concurrency ceiling.",
+        "providerConcurrencyLimit": "Enter a whole-number provider concurrency ceiling from 1 to 10000.",
         "providerModelIds": "Select no more than 32 provider models.",
         "physicalConcurrencyLimit": "Enter a physical concurrency limit from 1 to 10000.",
         "physicalMaxContext": "Enter a physical context limit from 1 to 100000000.",
@@ -406,6 +406,11 @@
     "grantEgressAcknowledge": "I understand this user's requests can leave the local deployment through this pool's providers.",
     "memberTestSurface": "Member test API surface",
     "memberTestMode": "Member test execution mode",
+    "memberTestSurfaces": {
+      "OPENAI_CHAT_COMPLETIONS": "OpenAI Chat Completions",
+      "OPENAI_RESPONSES": "OpenAI Responses",
+      "ANTHROPIC_MESSAGES": "Anthropic Messages"
+    },
     "memberTestPreferred": "Native preferred",
     "memberTestNative": "Require native",
     "memberTestAdapted": "Require adapted",

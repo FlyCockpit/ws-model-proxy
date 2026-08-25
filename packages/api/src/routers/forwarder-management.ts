@@ -639,8 +639,8 @@ function serializePool(row: ModelPoolRow) {
   >;
   const recommendedSurface =
     recommendedSurfaceOverride ??
-    recommendationOrder.find((surface) => surfaces[surface].native > 0) ??
-    recommendationOrder.find((surface) => surfaces[surface].adapted > 0) ??
+    recommendationOrder.find((surface) => surfaces[surface].primary.native > 0) ??
+    recommendationOrder.find((surface) => surfaces[surface].primary.adapted > 0) ??
     null;
   const transformerModel = row.TransformerDiscoveredModel
     ? {
