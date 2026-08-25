@@ -192,3 +192,65 @@ describe("detailed transcription capabilities", () => {
     });
   });
 });
+
+describe("v4 inventory invariants", () => {
+  const anthropic = {
+    version: 4,
+    protocol: "anthropic-compatible",
+    surfaces: {
+      anthropicMessages: {
+        source: "provider",
+        confidence: "exact",
+        operations: ["create"],
+        protocolVersions: [{ version: "2023-06-01", betaFeatures: ["beta-one"] }],
+      },
+    },
+  };
+
+  it("rejects trimmed duplicate Anthropic versions and betas", () => {
+    expect(
+      parseOpenAiCompatibleCapabilities({
+        ...anthropic,
+        surfaces: {
+          anthropicMessages: {
+            ...anthropic.surfaces.anthropicMessages,
+            protocolVersions: [{ version: "2023-06-01", betaFeatures: ["beta-one", " beta-one "] }],
+          },
+        },
+      }),
+    ).toBeNull();
+    expect(
+      parseOpenAiCompatibleCapabilities({
+        ...anthropic,
+        surfaces: {
+          anthropicMessages: {
+            ...anthropic.surfaces.anthropicMessages,
+            protocolVersions: [
+              { version: "2023-06-01", betaFeatures: [] },
+              { version: " 2023-06-01 ", betaFeatures: [] },
+            ],
+          },
+        },
+      }),
+    ).toBeNull();
+  });
+
+  it("rejects surfaces inconsistent with the declared protocol", () => {
+    expect(
+      parseOpenAiCompatibleCapabilities({ ...anthropic, protocol: "openai-compatible" }),
+    ).toBeNull();
+    expect(
+      parseOpenAiCompatibleCapabilities({
+        version: 4,
+        protocol: "anthropic-compatible",
+        surfaces: {
+          openaiResponses: {
+            source: "provider",
+            confidence: "exact",
+            operations: ["create"],
+          },
+        },
+      }),
+    ).toBeNull();
+  });
+});

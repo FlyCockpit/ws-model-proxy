@@ -515,7 +515,10 @@ export const providerManagementRouter = {
   }),
   updateModel: protectedProcedure
     .input(
-      modelInput.omit({ providerAccountId: true, upstreamModelId: true }).partial().extend({ id }),
+      modelInput
+        .omit({ providerAccountId: true, upstreamModelId: true })
+        .partial()
+        .extend({ id, enabled: z.boolean().optional() }),
     )
     .handler(async ({ input, context }) => {
       enabled();

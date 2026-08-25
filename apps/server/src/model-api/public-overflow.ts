@@ -12,7 +12,10 @@ import {
   type ProviderProtocol,
   providerHttpsRequest,
 } from "@ws-model-proxy/api/lib/provider-egress";
-import { resolveExecutionPath } from "@ws-model-proxy/api/lib/surface-capabilities";
+import {
+  resolveExecutionPath,
+  surfaceAvailabilityMatrix,
+} from "@ws-model-proxy/api/lib/surface-capabilities";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
 import {
@@ -364,9 +367,12 @@ export function publicTargetCompatibility(
     if (requestedOutputTokens > BigInt(target.maxOutputTokens)) return "CONTEXT_EXCEEDED";
   }
   if (request.stream && !target.supportsStreaming) return "PROTOCOL_UNAVAILABLE";
-  if (request.requiredFeatures.some((feature) => !target.supportedFeatures.includes(feature)))
+  if (
+    !target.capabilityInventory &&
+    request.requiredFeatures.some((feature) => !target.supportedFeatures.includes(feature))
+  )
     return "PROTOCOL_UNAVAILABLE";
-  if (target.capabilityInventory?.version === 4) {
+  if (target.capabilityInventory) {
     const requestedSurface = {
       "openai-chat": "OPENAI_CHAT_COMPLETIONS",
       "openai-responses": "OPENAI_RESPONSES",
@@ -398,6 +404,7 @@ export function publicTargetCompatibility(
       requestedSurface,
       request: {
         stream: request.stream,
+        ...Object.fromEntries(request.requiredFeatures.map((feature) => [feature, true])),
         responsesOperation,
         countTokens:
           request.requestedSurface === "anthropic-messages" &&
@@ -408,6 +415,7 @@ export function publicTargetCompatibility(
       adaptationEnabled: request.adaptationEnabled,
     });
     if (resolved.mode === "unavailable") return "PROTOCOL_UNAVAILABLE";
+    if (resolved.mode === "native") return "COMPATIBLE";
   }
   if (target.nativeSurfaces.includes(request.requestedSurface)) return "COMPATIBLE";
   // OpenAI streams cannot provide Anthropic's required initial input usage.
@@ -456,8 +464,7 @@ function targetProtocol(providerType: string): ProviderProtocol | null {
 
 function nativeProtocols(value: unknown): ProviderProtocol[] {
   const inventory = parseOpenAiCompatibleCapabilities(value);
-  if (inventory?.version === 4)
-    return [inventory.protocol === "anthropic-compatible" ? "anthropic" : "openai"];
+  if (inventory) return [inventory.protocol === "anthropic-compatible" ? "anthropic" : "openai"];
   if (!value || typeof value !== "object") return [];
   const record = value as Record<string, unknown>;
   const values = Array.isArray(record.protocols) ? record.protocols : [];
@@ -469,11 +476,12 @@ function nativeProtocols(value: unknown): ProviderProtocol[] {
 
 function nativeSurfaces(value: unknown): ProtocolSurface[] {
   const inventory = parseOpenAiCompatibleCapabilities(value);
-  if (inventory?.version === 4) {
+  if (inventory) {
+    const matrix = surfaceAvailabilityMatrix({ capabilities: inventory });
     return [
-      ...(inventory.surfaces.openaiChatCompletions ? (["openai-chat"] as const) : []),
-      ...(inventory.surfaces.openaiResponses ? (["openai-responses"] as const) : []),
-      ...(inventory.surfaces.anthropicMessages ? (["anthropic-messages"] as const) : []),
+      ...(matrix.OPENAI_CHAT_COMPLETIONS.mode === "native" ? (["openai-chat"] as const) : []),
+      ...(matrix.OPENAI_RESPONSES.mode === "native" ? (["openai-responses"] as const) : []),
+      ...(matrix.ANTHROPIC_MESSAGES.mode === "native" ? (["anthropic-messages"] as const) : []),
     ];
   }
   if (!value || typeof value !== "object") return [];
@@ -487,8 +495,10 @@ function nativeSurfaces(value: unknown): ProtocolSurface[] {
 
 function supportsStreaming(value: unknown): boolean {
   const inventory = parseOpenAiCompatibleCapabilities(value);
-  if (inventory?.version === 4)
-    return Object.values(inventory.surfaces).some((surface) => surface?.streaming === true);
+  if (inventory)
+    return Object.values(surfaceAvailabilityMatrix({ capabilities: inventory })).some(
+      (surface) => surface.mode === "native" && surface.streaming,
+    );
   return Boolean(
     value && typeof value === "object" && (value as Record<string, unknown>).streaming === true,
   );

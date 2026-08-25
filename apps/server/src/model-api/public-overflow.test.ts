@@ -35,6 +35,134 @@ const request = {
 };
 
 describe("public overflow compatibility", () => {
+  it("decodes v1-v3 inventories through the shared resolver and fails closed per surface", () => {
+    const inventories = [
+      {
+        version: 1 as const,
+        protocol: "openai-compatible" as const,
+        chatCompletions: { supported: true, vision: true },
+      },
+      {
+        version: 2 as const,
+        protocol: "openai-compatible" as const,
+        chatCompletions: { supported: true, vision: true },
+      },
+      {
+        version: 3 as const,
+        protocol: "openai-compatible" as const,
+        surfaces: {
+          openaiChatCompletions: {
+            source: "provider" as const,
+            confidence: "exact" as const,
+            supported: true,
+            inputImages: true,
+          },
+        },
+      },
+    ];
+    for (const capabilityInventory of inventories) {
+      const target = {
+        contextWindow: 1_000,
+        maxOutputTokens: 100,
+        protocol: "openai" as const,
+        nativeProtocols: ["openai" as const],
+        nativeSurfaces: ["openai-chat" as const],
+        supportsStreaming: false,
+        supportedFeatures: [],
+        capabilityInventory,
+      };
+      expect(
+        publicTargetCompatibility(target, { ...request, requiredFeatures: ["inputImages"] }),
+      ).toBe("COMPATIBLE");
+      expect(
+        publicTargetCompatibility(
+          {
+            ...target,
+            capabilityInventory:
+              capabilityInventory.version === 3
+                ? {
+                    ...capabilityInventory,
+                    surfaces: {
+                      openaiChatCompletions: {
+                        ...capabilityInventory.surfaces.openaiChatCompletions,
+                        inputImages: false,
+                      },
+                    },
+                  }
+                : {
+                    ...capabilityInventory,
+                    chatCompletions: {
+                      ...capabilityInventory.chatCompletions,
+                      vision: false,
+                    },
+                  },
+          },
+          { ...request, requiredFeatures: ["inputImages"] },
+        ),
+      ).toBe("PROTOCOL_UNAVAILABLE");
+    }
+  });
+
+  it("gates every profiled v4 request feature against the requested native surface", () => {
+    const featureNames = [
+      "inputImages",
+      "outputImages",
+      "inputAudio",
+      "outputAudio",
+      "inputVideo",
+      "outputVideo",
+      "tools",
+      "parallelTools",
+      "structuredOutput",
+      "reasoning",
+      "hostedTools",
+    ] as const;
+    for (const feature of featureNames) {
+      const inventory = {
+        version: 4 as const,
+        protocol: "openai-compatible" as const,
+        surfaces: {
+          openaiChatCompletions: {
+            source: "provider" as const,
+            confidence: "exact" as const,
+            operations: ["create" as const],
+            [feature]: true,
+          },
+        },
+      };
+      const target = {
+        contextWindow: 1_000,
+        maxOutputTokens: 100,
+        protocol: "openai" as const,
+        nativeProtocols: ["openai" as const],
+        nativeSurfaces: ["openai-chat" as const],
+        supportsStreaming: false,
+        supportedFeatures: [],
+        capabilityInventory: inventory,
+      };
+      expect(publicTargetCompatibility(target, { ...request, requiredFeatures: [feature] })).toBe(
+        "COMPATIBLE",
+      );
+      expect(
+        publicTargetCompatibility(
+          {
+            ...target,
+            capabilityInventory: {
+              ...inventory,
+              surfaces: {
+                openaiChatCompletions: {
+                  ...inventory.surfaces.openaiChatCompletions,
+                  [feature]: false,
+                },
+              },
+            },
+          },
+          { ...request, requiredFeatures: [feature] },
+        ),
+      ).toBe("PROTOCOL_UNAVAILABLE");
+    }
+  });
+
   it("fails closed on v4 operation and Anthropic version/beta mismatches", () => {
     const target = {
       contextWindow: 1_000,

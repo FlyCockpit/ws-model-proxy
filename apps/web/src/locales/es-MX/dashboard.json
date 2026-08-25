@@ -710,7 +710,8 @@
       "positiveInteger": "Introduce un número entero mayor que cero o déjalo vacío si es opcional.",
       "money": "Introduce un importe no negativo con hasta nueve decimales.",
       "currency": "Introduce un código de moneda de tres letras, como USD.",
-      "positiveRequired": "LIMITED requiere un valor mayor que cero. Elige UNLIMITED explícitamente para quitar este límite."
+      "positiveRequired": "LIMITED requiere un valor mayor que cero. Elige UNLIMITED explícitamente para quitar este límite.",
+      "invalidCapabilities": "Introduce un inventario de capacidades versión 4 válido cuyo protocolo coincida con sus superficies."
     },
     "complete": "completo",
     "partial": "parcial o desconocido",
@@ -719,6 +720,7 @@
     "noAttempts": "No hay eventos de intentos en esta ventana.",
     "noAudit": "No hay eventos de auditoría para esta cuenta.",
     "noCapabilities": "No hay un inventario validado de capacidades nativas",
+    "capabilityInventoryHint": "Inventario JSON v4 exacto opcional. Úsalo para declarar varias superficies y sus operaciones, versiones/betas de Anthropic, streaming, modalidades, herramientas, herramientas paralelas y alojadas, salida estructurada, razonamiento, límites de contexto, fuente y confianza.",
     "visibilityDisclosure": "Quien tenga un token de API de modelo o un permiso de pool visible puede provocar que las solicitudes salgan del despliegue y consuman los presupuestos adjuntos.",
     "fields": {
       "label": "Etiqueta de cuenta",
@@ -732,6 +734,7 @@
       "streaming": "Admite streaming",
       "anthropicVersion": "Versión del protocolo Anthropic",
       "anthropicBetas": "Betas de Anthropic permitidas (separadas por comas)",
+      "capabilityInventory": "Inventario exacto de capacidades (JSON v4)",
       "displayName": "Nombre visible (opcional)",
       "model": "Modelo del proveedor",
       "pricingVersion": "Versión de precios",

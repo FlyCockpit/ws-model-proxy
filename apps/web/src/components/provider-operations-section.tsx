@@ -9,6 +9,7 @@ import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { Textarea } from "@ws-model-proxy/ui/components/textarea";
 import {
   AlertTriangle,
   KeyRound,
@@ -56,7 +57,7 @@ export const providerAccountFormSchema = z.object({
 const credentialFormSchema = z.object({
   credential: z.string().min(1, "required").max(16_384, "tooLong"),
 });
-const createModelFormSchema = z.object({
+export const createModelFormSchema = z.object({
   upstreamModelId: z.string().trim().min(1, "required").max(255, "tooLong"),
   displayName: z.string().trim().max(255, "tooLong"),
   nativeSurface: z.enum([
@@ -68,6 +69,18 @@ const createModelFormSchema = z.object({
   streaming: z.boolean(),
   anthropicVersion: z.string().trim().min(1, "required").max(64, "tooLong"),
   betaFeatures: z.string().max(4096, "tooLong"),
+  capabilityInventory: z
+    .string()
+    .max(65_536, "tooLong")
+    .superRefine((value, context) => {
+      if (!value.trim()) return;
+      try {
+        if (!parseOpenAiCompatibleCapabilities(JSON.parse(value)))
+          context.addIssue({ code: "custom", message: "invalidCapabilities" });
+      } catch {
+        context.addIssue({ code: "custom", message: "invalidCapabilities" });
+      }
+    }),
 });
 
 type ProviderNativeSurface = z.infer<typeof createModelFormSchema>["nativeSurface"];
@@ -94,7 +107,9 @@ export function providerCapabilityInventory(input: {
       surfaces: {
         anthropicMessages: {
           ...common,
-          operations: ["create", "countTokens"],
+          // Count-tokens is a separately advertised operation. Never infer it
+          // merely because the provider speaks the Messages protocol.
+          operations: ["create"],
           streaming: input.streaming,
           protocolVersions: [{ version: input.anthropicVersion, betaFeatures }],
         },
@@ -117,6 +132,44 @@ export function providerCapabilityInventory(input: {
   return parsed;
 }
 
+export function parseProviderCapabilityInventory(value: string): OpenAiCompatibleCapabilities {
+  const parsed = parseOpenAiCompatibleCapabilities(JSON.parse(value));
+  if (!parsed) throw new Error("Invalid provider capability inventory");
+  return parsed;
+}
+
+export function CapabilityInventoryInput({
+  id,
+  label,
+  value,
+  errors = [],
+  placeholder,
+  onBlur,
+  onChange,
+  className,
+}: {
+  id: string;
+  label: string;
+  value: string;
+  errors?: unknown[];
+  placeholder?: string;
+  onBlur: () => void;
+  onChange: (value: string) => void;
+  className?: string;
+}) {
+  return (
+    <Field id={id} errors={errors} label={label} className={className}>
+      <Textarea
+        className="min-h-48 font-mono text-xs"
+        value={value}
+        onBlur={onBlur}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder={placeholder}
+      />
+    </Field>
+  );
+}
+
 function capabilitySummary(value: unknown): string | null {
   const parsed = parseOpenAiCompatibleCapabilities(value);
   if (!parsed) return null;
@@ -130,11 +183,23 @@ const optionalPositiveInteger = z.union([
   z.literal(""),
   z.string().regex(/^[1-9]\d*$/u, "positiveInteger"),
 ]);
-const updateModelFormSchema = z.object({
+export const updateModelFormSchema = z.object({
   displayName: z.string().trim().max(255, "tooLong"),
   contextWindow: optionalPositiveInteger,
   maxOutputTokens: optionalPositiveInteger,
   concurrencyLimit: optionalPositiveInteger,
+  capabilityInventory: z
+    .string()
+    .max(65_536, "tooLong")
+    .superRefine((value, context) => {
+      if (!value.trim()) return;
+      try {
+        if (!parseOpenAiCompatibleCapabilities(JSON.parse(value)))
+          context.addIssue({ code: "custom", message: "invalidCapabilities" });
+      } catch {
+        context.addIssue({ code: "custom", message: "invalidCapabilities" });
+      }
+    }),
 });
 const moneyRateSchema = z.string().regex(/^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/u, "money");
 const pricingFormSchema = z.object({
@@ -568,6 +633,7 @@ export function ProviderOperationsSection() {
       streaming: true,
       anthropicVersion: "2023-06-01",
       betaFeatures: "",
+      capabilityInventory: "",
     },
     validators: { onSubmit: createModelFormSchema },
     onSubmit: async ({ value }) => {
@@ -576,7 +642,9 @@ export function ProviderOperationsSection() {
         upstreamModelId: value.upstreamModelId,
         displayName: value.displayName || null,
         capabilityMetadata: null,
-        nativeCapabilities: providerCapabilityInventory(value),
+        nativeCapabilities: value.capabilityInventory.trim()
+          ? parseProviderCapabilityInventory(value.capabilityInventory)
+          : providerCapabilityInventory(value),
         contextWindow: null,
         maxOutputTokens: null,
         concurrencyLimit: null,
@@ -968,6 +1036,19 @@ export function ProviderOperationsSection() {
                       ) : null
                     }
                   </createModelForm.Subscribe>
+                  <createModelForm.Field name="capabilityInventory">
+                    {(field) => (
+                      <CapabilityInventoryInput
+                        id="provider-new-model-capabilityInventory"
+                        errors={field.state.meta.errors}
+                        label={t("dashboard:providers.fields.capabilityInventory")}
+                        value={field.state.value}
+                        onBlur={field.handleBlur}
+                        onChange={field.handleChange}
+                        placeholder={t("dashboard:providers.capabilityInventoryHint")}
+                      />
+                    )}
+                  </createModelForm.Field>
                   <Button type="submit" size="touch" disabled={createModel.isPending}>
                     <Plus className="size-4" />
                     {t("dashboard:providers.actions.addModel")}
@@ -1975,6 +2056,7 @@ function UpdateModelForm({
     contextWindow: number | null;
     maxOutputTokens: number | null;
     concurrencyLimit: number | null;
+    nativeCapabilities: unknown;
   };
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
@@ -1992,6 +2074,9 @@ function UpdateModelForm({
       contextWindow: model.contextWindow?.toString() ?? "",
       maxOutputTokens: model.maxOutputTokens?.toString() ?? "",
       concurrencyLimit: model.concurrencyLimit?.toString() ?? "",
+      capabilityInventory: model.nativeCapabilities
+        ? JSON.stringify(model.nativeCapabilities, null, 2)
+        : "",
     },
     validators: { onSubmit: updateModelFormSchema },
     onSubmit: async ({ value }) => {
@@ -2002,6 +2087,9 @@ function UpdateModelForm({
         contextWindow: numberOrNull(value.contextWindow),
         maxOutputTokens: numberOrNull(value.maxOutputTokens),
         concurrencyLimit: numberOrNull(value.concurrencyLimit),
+        nativeCapabilities: value.capabilityInventory.trim()
+          ? parseProviderCapabilityInventory(value.capabilityInventory)
+          : null,
       });
     },
   });
@@ -2035,6 +2123,19 @@ function UpdateModelForm({
           </form.Field>
         ),
       )}
+      <form.Field name="capabilityInventory">
+        {(field) => (
+          <CapabilityInventoryInput
+            className="sm:col-span-2 lg:col-span-3"
+            id={`provider-update-model-${model.id}-capabilityInventory`}
+            errors={field.state.meta.errors}
+            label={t("dashboard:providers.fields.capabilityInventory")}
+            value={field.state.value}
+            onBlur={field.handleBlur}
+            onChange={field.handleChange}
+          />
+        )}
+      </form.Field>
       <div className="flex items-end">
         <Button type="submit" size="touch" disabled={updateModel.isPending}>
           {t("dashboard:providers.actions.saveModel")}

@@ -350,7 +350,7 @@ impl TryFrom<RawCapabilities> for OpenAiCompatibleCapabilities {
                 .surfaces
                 .as_ref()
                 .expect("checked above")
-                .validate_v4()?;
+                .validate_v4(&value.protocol)?;
         }
         Ok(Self {
             version: value.version,
@@ -527,7 +527,7 @@ impl SurfaceInventory {
             })
     }
 
-    fn validate_v4(&self) -> std::result::Result<(), String> {
+    fn validate_v4(&self, protocol: &str) -> std::result::Result<(), String> {
         fn validate_common(
             name: &str,
             surface: &SurfaceCapabilities,
@@ -601,20 +601,35 @@ impl SurfaceInventory {
             }
             let mut versions = std::collections::HashSet::new();
             for version in &surface.protocol_versions {
-                if version.version.trim().is_empty() || !versions.insert(&version.version) {
+                let normalized_version = version.version.trim();
+                if normalized_version.is_empty() || !versions.insert(normalized_version) {
                     return Err(
                         "Anthropic protocol versions must be non-empty and unique".to_string()
                     );
                 }
                 let mut betas = std::collections::HashSet::new();
-                if version
-                    .beta_features
-                    .iter()
-                    .any(|beta| beta.trim().is_empty() || !betas.insert(beta))
-                {
+                if version.beta_features.iter().any(|beta| {
+                    let normalized_beta = beta.trim();
+                    normalized_beta.is_empty() || !betas.insert(normalized_beta)
+                }) {
                     return Err("Anthropic beta features must be non-empty and unique".to_string());
                 }
             }
+        }
+        let has_openai = self.openai_chat_completions.is_some()
+            || self.openai_responses.is_some()
+            || self.openai_completions.is_some();
+        if protocol == "openai-compatible" && self.anthropic_messages.is_some() {
+            return Err(
+                "openai-compatible version 4 capabilities cannot declare anthropicMessages"
+                    .to_string(),
+            );
+        }
+        if protocol == "anthropic-compatible" && has_openai {
+            return Err(
+                "anthropic-compatible version 4 capabilities cannot declare OpenAI surfaces"
+                    .to_string(),
+            );
         }
         Ok(())
     }
@@ -1316,6 +1331,35 @@ mod tests {
                 "version": 4,
                 "protocol": "anthropic-compatible",
                 "surfaces": { "anthropicMessages": {
+                    "source": "provider", "confidence": "exact",
+                    "operations": ["create"]
+                }}
+            }),
+            serde_json::json!({
+                "version": 4,
+                "protocol": "anthropic-compatible",
+                "surfaces": { "anthropicMessages": {
+                    "source": "provider", "confidence": "exact",
+                    "operations": ["create"],
+                    "protocolVersions": [{
+                        "version": "2023-06-01",
+                        "betaFeatures": ["beta-one", " beta-one "]
+                    }]
+                }}
+            }),
+            serde_json::json!({
+                "version": 4,
+                "protocol": "openai-compatible",
+                "surfaces": { "anthropicMessages": {
+                    "source": "provider", "confidence": "exact",
+                    "operations": ["create"],
+                    "protocolVersions": [{"version": "2023-06-01"}]
+                }}
+            }),
+            serde_json::json!({
+                "version": 4,
+                "protocol": "anthropic-compatible",
+                "surfaces": { "openaiResponses": {
                     "source": "provider", "confidence": "exact",
                     "operations": ["create"]
                 }}

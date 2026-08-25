@@ -52,6 +52,8 @@ export type SurfaceAvailability = {
   retrySafety?: "pre_commit_only" | "idempotent" | "never";
   streaming: boolean;
   limitations: string[];
+  /** Native Responses lifecycle support, reported separately from create. */
+  lifecycleOperations?: readonly Exclude<ResponsesOperation, "create">[];
 };
 
 type SurfaceFeatures = {
@@ -95,7 +97,10 @@ function nativeFeatures(
       const operations: readonly string[] = inventorySurface.operations;
       return {
         ...inventorySurface,
-        supported: operations.length > 0,
+        // The matrix describes whether a native create endpoint exists. A
+        // lifecycle-only inventory remains addressable through the exact
+        // resolver, but must not advertise native create support.
+        supported: operations.includes("create"),
         countTokens: operations.includes("countTokens"),
         responsesLifecycle:
           inventorySurface === capabilities.surfaces.openaiResponses
@@ -266,11 +271,26 @@ export function surfaceAvailabilityMatrix({
   for (const requested of modelApiSurfaces) {
     const native = capabilities ? nativeFeatures(capabilities, requested) : undefined;
     if (native?.supported === true) {
+      const lifecycleOperations =
+        requested === "OPENAI_RESPONSES"
+          ? (
+              [
+                "statefulFollowUps",
+                "retrieve",
+                "delete",
+                "cancel",
+                "listInputItems",
+                "countTokens",
+                "compact",
+              ] as const
+            ).filter((operation) => native.responsesLifecycle?.[operation] === true)
+          : undefined;
       result[requested] = {
         mode: "native",
         nativeSurface: requested,
         streaming: native.streaming === true,
         limitations: [],
+        ...(lifecycleOperations?.length ? { lifecycleOperations } : {}),
       };
       continue;
     }
@@ -328,7 +348,19 @@ export function resolveExecutionPath({
     retrySafety: retrySafetyFor(requestedSurface, request),
   });
   const matrix = surfaceAvailabilityMatrix({ capabilities, adaptationEnabled });
-  const selected = matrix[requestedSurface];
+  let selected = matrix[requestedSurface];
+  // v4 can truthfully advertise a lifecycle operation without advertising
+  // create. Let the exact resolver evaluate that operation directly.
+  if (capabilities?.version === 4 && selected.mode === "unavailable") {
+    const exact = nativeFeatures(capabilities, requestedSurface);
+    if (exact?.operations?.includes(requestedOperation(requestedSurface, request)))
+      selected = {
+        mode: "native",
+        nativeSurface: requestedSurface,
+        streaming: exact.streaming === true,
+        limitations: [],
+      };
+  }
   if (selected.mode === "unavailable" || !capabilities || !selected.nativeSurface)
     return describe(selected);
   if (

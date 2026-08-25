@@ -86,6 +86,54 @@ describe("surface capability resolution", () => {
     }
   });
 
+  it("does not advertise lifecycle-only Responses as native create", () => {
+    const lifecycleOnly = parseOpenAiCompatibleCapabilities({
+      version: 4,
+      protocol: "openai-compatible",
+      surfaces: {
+        openaiResponses: {
+          source: "provider",
+          confidence: "exact",
+          operations: ["retrieve"],
+        },
+      },
+    });
+    expect(surfaceAvailabilityMatrix({ capabilities: lifecycleOnly }).OPENAI_RESPONSES.mode).toBe(
+      "unavailable",
+    );
+    expect(
+      resolveExecutionPath({
+        capabilities: lifecycleOnly,
+        requestedSurface: "OPENAI_RESPONSES",
+        request: { responsesOperation: "retrieve", responseId: "response" },
+      }).mode,
+    ).toBe("native");
+    expect(
+      resolveExecutionPath({
+        capabilities: lifecycleOnly,
+        requestedSurface: "OPENAI_RESPONSES",
+      }).mode,
+    ).toBe("unavailable");
+  });
+
+  it("reports Responses create and lifecycle operations separately", () => {
+    const inventory = parseOpenAiCompatibleCapabilities({
+      version: 4,
+      protocol: "openai-compatible",
+      surfaces: {
+        openaiResponses: {
+          source: "provider",
+          confidence: "exact",
+          operations: ["create", "retrieve", "countTokens"],
+        },
+      },
+    });
+    expect(surfaceAvailabilityMatrix({ capabilities: inventory }).OPENAI_RESPONSES).toMatchObject({
+      mode: "native",
+      lifecycleOperations: ["retrieve", "countTokens"],
+    });
+  });
+
   it("reports native, adapted, and unavailable surfaces", () => {
     const matrix = surfaceAvailabilityMatrix({ capabilities: anthropic, adaptationEnabled: true });
     expect(matrix.ANTHROPIC_MESSAGES.mode).toBe("native");

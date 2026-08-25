@@ -1,5 +1,8 @@
+// @vitest-environment jsdom
+
 import { FormApi } from "@tanstack/react-form";
-import { isValidElement, type ReactElement, type ReactNode } from "react";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { isValidElement, type ReactElement, type ReactNode, useState } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
@@ -12,7 +15,9 @@ vi.mock("react-i18next", () => ({
 
 import {
   BudgetRuleField,
+  CapabilityInventoryInput,
   focusFirstInvalidProviderField,
+  parseProviderCapabilityInventory,
   providerAccountFormSchema,
   providerBudgetFormSchema,
   providerBudgetRules,
@@ -52,6 +57,64 @@ function findElement(
 }
 
 describe("ProviderOperationsSection form workflows", () => {
+  it("mounts the exact inventory editor and submits a multi-surface v4 inventory", () => {
+    let submitted: ReturnType<typeof parseProviderCapabilityInventory> | undefined;
+    function Harness() {
+      const [value, setValue] = useState("");
+      return (
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            submitted = parseProviderCapabilityInventory(value);
+          }}
+        >
+          <CapabilityInventoryInput
+            id="inventory"
+            label="Exact capability inventory"
+            value={value}
+            onBlur={() => undefined}
+            onChange={setValue}
+          />
+          <button type="submit">Save inventory</button>
+        </form>
+      );
+    }
+    render(<Harness />);
+    fireEvent.change(screen.getByLabelText("Exact capability inventory"), {
+      target: {
+        value: JSON.stringify({
+          version: 4,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiChatCompletions: {
+              source: "dashboard",
+              confidence: "exact",
+              operations: ["create"],
+              tools: true,
+              parallelTools: true,
+            },
+            openaiResponses: {
+              source: "dashboard",
+              confidence: "exact",
+              operations: ["create", "retrieve", "countTokens"],
+              structuredOutput: true,
+              reasoning: true,
+              hostedTools: true,
+              maxContextTokens: 128000,
+            },
+          },
+        }),
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save inventory" }));
+    expect(submitted).toMatchObject({
+      surfaces: {
+        openaiChatCompletions: { operations: ["create"], parallelTools: true },
+        openaiResponses: { operations: ["create", "retrieve", "countTokens"] },
+      },
+    });
+  });
+
   it("builds strict v4 native inventories including version-scoped Anthropic betas", () => {
     expect(
       providerCapabilityInventory({
@@ -77,7 +140,7 @@ describe("ProviderOperationsSection form workflows", () => {
       protocol: "anthropic-compatible",
       surfaces: {
         anthropicMessages: {
-          operations: ["create", "countTokens"],
+          operations: ["create"],
           protocolVersions: [{ version: "2023-06-01", betaFeatures: ["cache-beta", "tools-beta"] }],
         },
       },

@@ -25,6 +25,7 @@ import {
   coarseCapabilitiesFromOpenAi,
   openAiCapabilitiesFromCoarse,
   openAiCompatibleCapabilitiesSchema,
+  parseOpenAiCompatibleCapabilities,
   resolveEffectiveCapabilityMetadata,
   transformerModalityMismatchErrors,
   transformerSupportedModalities,
@@ -566,6 +567,15 @@ function serializePool(row: ModelPoolRow) {
         }),
       };
     const provider = member.ExecutionTarget?.ProviderModel;
+    const providerInventory = parseOpenAiCompatibleCapabilities(provider?.nativeCapabilities);
+    if (providerInventory)
+      return {
+        tier: member.tier,
+        matrix: surfaceAvailabilityMatrix({
+          capabilities: providerInventory,
+          adaptationEnabled: row.protocolAdaptationEnabled,
+        }),
+      };
     const native =
       provider?.nativeCapabilities && typeof provider.nativeCapabilities === "object"
         ? (provider.nativeCapabilities as { surfaces?: unknown; streaming?: unknown })

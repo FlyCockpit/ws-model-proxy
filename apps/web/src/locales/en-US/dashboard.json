@@ -710,7 +710,8 @@
       "positiveInteger": "Enter a whole number greater than zero, or leave it blank when optional.",
       "money": "Enter a non-negative amount with up to nine decimal places.",
       "currency": "Enter a three-letter currency code, such as USD.",
-      "positiveRequired": "LIMITED requires a value greater than zero. Choose UNLIMITED explicitly to remove this ceiling."
+      "positiveRequired": "LIMITED requires a value greater than zero. Choose UNLIMITED explicitly to remove this ceiling.",
+      "invalidCapabilities": "Enter a valid version 4 capability inventory whose protocol matches its surfaces."
     },
     "complete": "complete",
     "partial": "partial or unknown",
@@ -719,6 +720,7 @@
     "noAttempts": "No provider attempt events in this window.",
     "noAudit": "No audit events for this account.",
     "noCapabilities": "No validated native capability inventory",
+    "capabilityInventoryHint": "Optional exact v4 JSON inventory. Use this to declare multiple surfaces and their operations, Anthropic versions/betas, streaming, modalities, tools, parallel tools, structured output, reasoning, hosted tools, context limits, source, and confidence.",
     "visibilityDisclosure": "Anyone with a model API token or pool grant that can see a public-egress pool may cause requests to leave your deployment and consume the attached provider budgets.",
     "fields": {
       "label": "Account label",
@@ -732,6 +734,7 @@
       "streaming": "Supports streaming",
       "anthropicVersion": "Anthropic protocol version",
       "anthropicBetas": "Allowed Anthropic betas (comma-separated)",
+      "capabilityInventory": "Exact capability inventory (v4 JSON)",
       "displayName": "Display name (optional)",
       "model": "Provider model",
       "pricingVersion": "Pricing version",

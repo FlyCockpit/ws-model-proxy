@@ -194,7 +194,13 @@ const v4SurfaceFeatureShape = {
 const anthropicProtocolVersionSchema = z
   .object({
     version: z.string().trim().min(1).max(64),
-    betaFeatures: z.array(z.string().trim().min(1).max(128)).max(64).default([]),
+    betaFeatures: z
+      .array(z.string().trim().min(1).max(128))
+      .max(64)
+      .refine((betas) => new Set(betas).size === betas.length, {
+        message: "Anthropic beta features must be unique.",
+      })
+      .default([]),
   })
   .strict();
 
@@ -252,7 +258,26 @@ const v4CapabilitiesSchema = z
     source: z.enum(["declared", "probe", "dashboard", "provider"]).optional(),
     confidence: z.enum(["exact", "high", "estimated", "unknown"]).optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((inventory, context) => {
+    const hasAnthropic = inventory.surfaces.anthropicMessages !== undefined;
+    const hasOpenAi =
+      inventory.surfaces.openaiChatCompletions !== undefined ||
+      inventory.surfaces.openaiResponses !== undefined ||
+      inventory.surfaces.openaiCompletions !== undefined;
+    if (inventory.protocol === "openai-compatible" && hasAnthropic)
+      context.addIssue({
+        code: "custom",
+        message: "OpenAI-compatible inventories cannot declare Anthropic surfaces.",
+        path: ["surfaces", "anthropicMessages"],
+      });
+    if (inventory.protocol === "anthropic-compatible" && hasOpenAi)
+      context.addIssue({
+        code: "custom",
+        message: "Anthropic-compatible inventories cannot declare OpenAI surfaces.",
+        path: ["surfaces"],
+      });
+  });
 
 /**
  * Version 3 is the provider-independent inventory. The legacy operation fields

@@ -369,6 +369,44 @@ describe("providerManagementRouter security boundary", () => {
     expect(db.providerAccount.findFirst).not.toHaveBeenCalled();
   });
 
+  it("updates a full owner-scoped v4 capability inventory", async () => {
+    envMock.enabled = true;
+    db.$queryRaw.mockResolvedValue([]);
+    db.providerModel.findFirst.mockResolvedValue({ id: "model", providerAccountId: "account" });
+    db.providerAccount.findFirst.mockResolvedValue({ id: "account" });
+    db.providerModel.update.mockResolvedValue({ id: "model" });
+    db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
+    const nativeCapabilities = {
+      version: 4 as const,
+      protocol: "openai-compatible" as const,
+      surfaces: {
+        openaiChatCompletions: {
+          source: "dashboard" as const,
+          confidence: "exact" as const,
+          operations: ["create" as const],
+          tools: true,
+          parallelTools: true,
+        },
+        openaiResponses: {
+          source: "dashboard" as const,
+          confidence: "exact" as const,
+          operations: ["create" as const, "retrieve" as const, "countTokens" as const],
+          structuredOutput: true,
+          reasoning: true,
+          hostedTools: true,
+          maxContextTokens: 128_000,
+        },
+      },
+    };
+    const client = createRouterClient(providerManagementRouter, { context });
+    await client.updateModel({ id: "model", nativeCapabilities });
+    expect(db.providerModel.update).toHaveBeenCalledWith({
+      where: { id: "model" },
+      data: { nativeCapabilities },
+      select: expect.any(Object),
+    });
+  });
+
   it("creates owner-scoped draft pricing with explicit accounting rules and audit", async () => {
     envMock.enabled = true;
     db.providerModel.findFirst.mockResolvedValue({ id: "model", providerAccountId: "account" });
