@@ -209,4 +209,89 @@ describe("capacity admission runtime", () => {
     ).resolves.toEqual({ state: "EXPIRED" });
     expect(terminalizeAttempt).toHaveBeenCalledWith("attempt", "EXPIRED");
   });
+
+  it("keeps polling when a fast local clock reaches the deadline before the store", async () => {
+    const terminalizeAttempt = vi
+      .fn()
+      .mockResolvedValueOnce({ state: "WAITING", requestId: "request" })
+      .mockResolvedValueOnce({ state: "EXPIRED" });
+    const acquire = vi.fn().mockResolvedValue({ state: "WAITING", requestId: "request" });
+    const deadlineAt = new Date(Date.now() + 60_000);
+    const runtime = new StoreCapacityAdmissionRuntime(
+      {
+        acquire,
+        release: vi.fn(),
+        heartbeat: vi.fn(),
+        terminalizeAttempt,
+        reclaimExpired: vi.fn(),
+      },
+      1,
+      5_000,
+      undefined,
+      () => deadlineAt.getTime() + 60_000,
+    );
+
+    await expect(
+      runtime.acquire({
+        requestId: "request",
+        attemptId: "attempt",
+        ownerId: "owner",
+        sourceKind: "DIRECT",
+        basePriority: 16,
+        connectionOwner: "server",
+        deadlineAt,
+        candidates: [{ capacityId: "capacity", executionTargetId: "target", candidateOrder: 0 }],
+      }),
+    ).resolves.toEqual({ state: "EXPIRED" });
+    expect(terminalizeAttempt).toHaveBeenCalledTimes(2);
+    expect(acquire).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancels immediately when aborted during a database-clock retry delay", async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const terminalizeAttempt = vi
+        .fn()
+        .mockResolvedValueOnce({ state: "WAITING", requestId: "request" })
+        .mockResolvedValueOnce({ state: "CANCELLED" });
+      const deadlineAt = new Date(Date.now() + 60_000);
+      const runtime = new StoreCapacityAdmissionRuntime(
+        {
+          acquire: vi.fn().mockResolvedValue({ state: "WAITING", requestId: "request" }),
+          release: vi.fn(),
+          heartbeat: vi.fn(),
+          terminalizeAttempt,
+          reclaimExpired: vi.fn(),
+        },
+        10_000,
+        5_000,
+        undefined,
+        () => deadlineAt.getTime() + 60_000,
+      );
+
+      const result = runtime.acquire(
+        {
+          requestId: "request",
+          attemptId: "attempt",
+          ownerId: "owner",
+          sourceKind: "DIRECT",
+          basePriority: 16,
+          connectionOwner: "server",
+          deadlineAt,
+          candidates: [{ capacityId: "capacity", executionTargetId: "target", candidateOrder: 0 }],
+        },
+        controller.signal,
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(terminalizeAttempt).toHaveBeenCalledWith("attempt", "EXPIRED");
+
+      controller.abort();
+      await expect(result).resolves.toEqual({ state: "CANCELLED" });
+      expect(terminalizeAttempt).toHaveBeenLastCalledWith("attempt", "CANCELLED");
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

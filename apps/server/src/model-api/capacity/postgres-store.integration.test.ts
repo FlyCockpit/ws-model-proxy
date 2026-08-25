@@ -157,6 +157,7 @@ integration("PostgreSQL capacity admission primitives", () => {
         },
       });
       const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
+      const { StoreCapacityAdmissionRuntime } = await import("./runtime.js");
       const firstManager = new PostgresCapacityAdmissionStore(first, "database-clock-a");
       const secondManager = new PostgresCapacityAdmissionStore(second, "database-clock-b");
       const databaseNow = async () => {
@@ -186,6 +187,42 @@ integration("PostgreSQL capacity admission primitives", () => {
       await expect(secondManager.acquire(deadlineAttempt)).resolves.toMatchObject({
         state: "WAITING",
       });
+
+      const skewDeadline = new Date((await databaseNow()).getTime() + 60_000);
+      const skewAttempt = attempt("clock-skew", skewDeadline);
+      await expect(secondManager.acquire(skewAttempt)).resolves.toMatchObject({ state: "WAITING" });
+      await first.$executeRaw`
+        UPDATE "AdmissionRequest" SET "deadlineAt" = NULL
+         WHERE "attemptId" = ${skewAttempt.attemptId}`;
+      await first.$executeRaw`
+        UPDATE "CapacityWaiter" SET "deadlineAt" = NULL
+         WHERE "admissionRequestId" = (
+           SELECT id FROM "AdmissionRequest" WHERE "attemptId" = ${skewAttempt.attemptId}
+         )`;
+      await expect(
+        secondManager.terminalizeAttempt(skewAttempt.attemptId, "EXPIRED"),
+      ).resolves.toMatchObject({ state: "WAITING" });
+      await expect(
+        secondManager.acquire({ ...skewAttempt, candidates: [] }),
+      ).resolves.toMatchObject({ state: "WAITING" });
+      await expect(
+        first.admissionRequest.findUniqueOrThrow({ where: { attemptId: skewAttempt.attemptId } }),
+      ).resolves.toMatchObject({ state: "WAITING", deadlineAt: skewDeadline });
+      await first.$executeRaw`
+        UPDATE "AdmissionRequest"
+           SET "deadlineAt" = clock_timestamp() + interval '250 milliseconds'
+         WHERE "attemptId" = ${skewAttempt.attemptId}`;
+      const skewRuntime = new StoreCapacityAdmissionRuntime(
+        secondManager,
+        10,
+        5_000,
+        undefined,
+        () => skewDeadline.getTime() + 60_000,
+      );
+      await expect(skewRuntime.acquire(skewAttempt)).resolves.toEqual({ state: "EXPIRED" });
+      await expect(
+        first.admissionRequest.findUniqueOrThrow({ where: { attemptId: skewAttempt.attemptId } }),
+      ).resolves.toMatchObject({ state: "EXPIRED" });
 
       let locked!: () => void;
       let unlock!: () => void;

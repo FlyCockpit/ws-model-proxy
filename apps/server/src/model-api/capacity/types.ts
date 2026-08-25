@@ -43,6 +43,7 @@ export type AdmissionResult =
 
 export type AdmissionTerminalizationResult =
   | { state: "ADMITTED"; lease: CapacityLeaseHandle }
+  | { state: "WAITING"; requestId: string }
   | { state: "CANCELLED" | "EXPIRED" | "TERMINAL" }
   | { state: "MISSING" };
 

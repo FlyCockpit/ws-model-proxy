@@ -116,6 +116,19 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       >`SELECT clock_timestamp() AS now`;
       const observedAt = observedRows[0]?.now;
       if (!observedAt) throw new Error("Database clock unavailable.");
+      if (existing?.deadlineAt === null) {
+        await tx.admissionRequest.update({
+          where: { id: existing.id },
+          data: { deadlineAt: attempt.deadlineAt },
+        });
+        await tx.capacityWaiter.updateMany({
+          where: { admissionRequestId: existing.id, deadlineAt: null },
+          data: { deadlineAt: attempt.deadlineAt },
+        });
+        // The request was read before the capacity locks. Keep the local view
+        // aligned with the durable compatibility repair for checks below.
+        existing.deadlineAt = attempt.deadlineAt;
+      }
       if (existing?.Lease?.state === "ACTIVE" && existing.Lease.expiresAt <= observedAt) {
         const currentLease = await tx.capacityLease.findUniqueOrThrow({
           where: { id: existing.Lease.id },
@@ -663,8 +676,20 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           } as AdmissionTerminalizationResult,
           capacities: lockedCapacities,
         };
+      // Process clocks are only polling hints. A caller may ask to expire an
+      // attempt before PostgreSQL's authoritative clock reaches the durable
+      // deadline, so preserve the waiter and tell it to keep polling.
+      if (state === "EXPIRED" && (!current.deadlineAt || current.deadlineAt > now))
+        return {
+          result: { state: "WAITING", requestId: current.id } as const,
+          capacities: lockedCapacities,
+        };
       const result = await tx.admissionRequest.updateMany({
-        where: { id: request.id, state: "WAITING" },
+        where: {
+          id: request.id,
+          state: "WAITING",
+          ...(state === "EXPIRED" ? { deadlineAt: { lte: now } } : {}),
+        },
         data: { state, terminalAt: now, terminalReason: reason },
       });
       if (result.count)
