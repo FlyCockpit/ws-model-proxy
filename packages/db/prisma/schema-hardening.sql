@@ -1551,6 +1551,10 @@ UPDATE provider_usage_ledger
 
 -- Close the legacy split reconcile/finalize crash gap from deployments that
 -- committed an immutable terminal ledger before updating its attempt anchor.
+-- An older runtime may already have swept the split-phase orphan to EXPIRED.
+-- Temporarily remove the transition trigger for this narrowly keyed repair;
+-- the canonical trigger is recreated later in this same transaction.
+DROP TRIGGER IF EXISTS provider_attempt_transition ON provider_attempt;
 WITH latest_terminal AS (
   SELECT DISTINCT ON ("attemptId", "fencingToken")
          "attemptId", "fencingToken", "terminalReason", "createdAt"
@@ -1568,7 +1572,9 @@ UPDATE provider_attempt attempt
        "terminalAt" = latest."createdAt",
        "heartbeatAt" = GREATEST(attempt."heartbeatAt", latest."createdAt")
   FROM latest_terminal latest
- WHERE attempt.state = 'ACTIVE'
+ WHERE (attempt.state = 'ACTIVE'
+        OR (attempt.state = 'EXPIRED' AND attempt."terminalReason" = 'CRASH_RECOVERY'
+            AND latest."terminalReason" <> 'CRASH_RECOVERY'))
    AND latest."attemptId" = attempt."attemptId"
    AND latest."fencingToken" = attempt."fencingToken";
 

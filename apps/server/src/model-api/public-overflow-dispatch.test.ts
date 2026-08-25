@@ -71,7 +71,6 @@ vi.mock("./provider-attempt-runtime.js", () => ({
   allocateProviderFence: vi.fn().mockResolvedValue(1n),
   claimProviderHealthTrial: vi.fn().mockResolvedValue("READY"),
   classifyProviderFailure: vi.fn((status?: number) => (status === 429 ? "RATE_LIMIT" : "SERVER")),
-  finishProviderAttempt: vi.fn().mockResolvedValue(true),
   heartbeatProviderAttempt,
   parseRetryAfter: vi.fn((value?: string) => (value === "37" ? 37_000 : undefined)),
   recordProviderAttemptEvent: vi.fn().mockResolvedValue(undefined),

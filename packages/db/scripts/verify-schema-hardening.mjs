@@ -1166,9 +1166,11 @@ try {
   await client.query(`
     INSERT INTO provider_attempt
       (id, "createdAt", "userId", "providerAccountId", "providerModelId", "requestId",
-       "attemptId", "fencingToken", "expiresAt", "liabilityTokens", "accountingVersion")
+       "attemptId", "fencingToken", "expiresAt", "liabilityTokens", "accountingVersion",
+       state, "terminalAt", "terminalReason")
     VALUES ('legacy-history-attempt', NOW(), 'owner-a', 'provider-account-a', 'provider-model-a',
-      'legacy-history-request', 'legacy-history', 8, NOW() + interval '1 hour', 4, 'usage-v1');
+      'legacy-history-request', 'legacy-history', 8, NOW() + interval '1 hour', 4, 'usage-v1',
+      'EXPIRED', NOW(), 'CRASH_RECOVERY');
     INSERT INTO provider_budget_reservation
       (id, "createdAt", "userId", "providerAccountId", "providerModelId", "policyId", "ruleId",
        "requestId", "attemptId", "fencingToken", metric, period, "policyVersion", "windowStart",

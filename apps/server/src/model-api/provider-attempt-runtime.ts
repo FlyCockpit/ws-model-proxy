@@ -105,20 +105,6 @@ export async function heartbeatProviderAttempt(input: {
   });
 }
 
-export async function finishProviderAttempt(input: {
-  attemptId: string;
-  fencingToken: bigint;
-  state: "COMPLETED" | "FAILED" | "CANCELLED";
-  reason: string;
-}): Promise<boolean> {
-  const now = new Date();
-  const updated = await prisma.providerAttempt.updateMany({
-    where: { attemptId: input.attemptId, fencingToken: input.fencingToken, state: "ACTIVE" },
-    data: { state: input.state, terminalReason: input.reason, terminalAt: now, heartbeatAt: now },
-  });
-  return updated.count === 1;
-}
-
 export async function expireProviderAttempts(now = new Date()): Promise<number> {
   return prisma.$executeRaw`
     UPDATE provider_attempt attempt

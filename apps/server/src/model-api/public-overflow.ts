@@ -25,7 +25,6 @@ import {
   allocateProviderFence,
   claimProviderHealthTrial,
   classifyProviderFailure,
-  finishProviderAttempt,
   heartbeatProviderAttempt,
   parseRetryAfter,
   recordProviderAttemptEvent,
@@ -1538,12 +1537,6 @@ export async function dispatchPublicOverflow(
         revisionSequence: 1n,
         revisionKind: "SNAPSHOT",
       }).catch(() => undefined);
-      await finishProviderAttempt({
-        attemptId,
-        fencingToken,
-        state: "FAILED",
-        reason: "PROVIDER_HEALTH_COOLDOWN",
-      }).catch(() => false);
       await recordProviderAttemptEvent({
         userId: request.userId,
         providerAccountId: target.providerAccountId,
@@ -1694,12 +1687,6 @@ export async function dispatchPublicOverflow(
           observationComplete: response.complete,
           usageSource: retryUsage ? `${upstream.protocol}-retryable-response` : undefined,
           usage: retryUsage,
-        });
-        await finishProviderAttempt({
-          attemptId,
-          fencingToken,
-          state: "FAILED",
-          reason: `HTTP_${status}`,
         });
         await recordProviderAttemptEvent({
           userId: request.userId,
@@ -1990,12 +1977,6 @@ export async function dispatchPublicOverflow(
         revisionSequence: 1n,
         revisionKind: "SNAPSHOT",
       }).catch(() => undefined);
-      await finishProviderAttempt({
-        attemptId,
-        fencingToken,
-        state: request.signal.aborted ? "CANCELLED" : "FAILED",
-        reason: request.signal.aborted ? "CANCELLED" : "TRANSPORT",
-      }).catch(() => false);
       await recordProviderAttemptEvent({
         userId: request.userId,
         providerAccountId: target.providerAccountId,
