@@ -688,12 +688,17 @@ describe("model API routes", () => {
     await response.text();
     await vi.waitFor(() => expect(affinity.remember).toHaveBeenCalledTimes(1));
     expect(affinity.rank).toHaveBeenCalledWith(
-      expect.objectContaining({ ownerId: "user-id", resourceOwnerId: "user-id" }),
+      expect.objectContaining({
+        ownerId: "user-id",
+        resourceOwnerId: "user-id",
+        accessGrantId: null,
+      }),
     );
     expect(affinity.remember).toHaveBeenCalledWith(
       expect.objectContaining({
         ownerId: "user-id",
         resourceOwnerId: "user-id",
+        accessGrantId: null,
         target: expect.objectContaining({ executionTargetId: "member-b-target" }),
       }),
     );
@@ -3672,11 +3677,15 @@ describe("model API routes", () => {
       expect.objectContaining({
         ownerId: "user-id",
         resourceOwnerId: "pool-owner-id",
+        accessGrantId: "grant-id",
         targets: expect.arrayContaining([
           expect.objectContaining({ poolMemberId: provider.poolMemberId }),
           expect.objectContaining({ poolMemberId: "local-primary" }),
         ]),
       }),
+    );
+    expect(publicOverflow.dispatch).toHaveBeenCalledWith(
+      expect.objectContaining({ affinityAccessGrantId: "grant-id" }),
     );
   });
 

@@ -105,7 +105,8 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
       ownerId: row.tenant.id,
       resourceOwnerId: row.owner.id,
       poolId: row.pool.id,
-      securityScope: "grant-a:token-a",
+      securityScope: "token-a",
+      accessGrantId: "grant-a",
       policy,
       surface: "OPENAI_RESPONSES",
       payload: {
@@ -128,7 +129,8 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
       ownerId: row.tenant.id,
       resourceOwnerId: row.owner.id,
       poolId: row.pool.id,
-      securityScope: "grant-a:token-a",
+      securityScope: "token-a",
+      accessGrantId: "grant-a",
       policy,
       surface: "OPENAI_RESPONSES",
       payload: changedTurn,
@@ -139,8 +141,9 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
     expect(ranked.prefixDepths[row.target(0).executionTargetId]).toBe(0);
 
     for (const isolation of [
-      { ownerId: row.otherTenant.id, securityScope: "grant-a:token-a" },
-      { ownerId: row.tenant.id, securityScope: "grant-a:token-b" },
+      { ownerId: row.otherTenant.id, securityScope: "token-a", accessGrantId: "grant-a" },
+      { ownerId: row.tenant.id, securityScope: "token-b", accessGrantId: "grant-a" },
+      { ownerId: row.tenant.id, securityScope: "token-a", accessGrantId: "grant-b" },
     ]) {
       const isolated = await service.rankAffinityTargets({
         resourceOwnerId: row.owner.id,
@@ -153,12 +156,32 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
       });
       expect(isolated.conversationMatches[row.target(0).executionTargetId]).toBe(false);
     }
+    const replacementGrant = await service.rankAffinityTargets({
+      ownerId: row.tenant.id,
+      resourceOwnerId: row.owner.id,
+      poolId: row.pool.id,
+      securityScope: "token-a",
+      accessGrantId: "grant-b",
+      policy,
+      surface: "OPENAI_RESPONSES",
+      payload: {
+        conversation: "private-conversation-id",
+        input: "first turn",
+        instructions: "old instructions",
+        tools: [{ name: "old-tool" }],
+        temperature: 0.1,
+      },
+      targets: [row.target(1), row.target(0)],
+    });
+    expect(replacementGrant.prefixDepths[row.target(0).executionTargetId]).toBe(0);
+    expect(replacementGrant.conversationMatches[row.target(0).executionTargetId]).toBe(false);
     const changedRuntime = { ...row.target(0), targetIdentity: "changed-runtime-binding" };
     const runtimeIsolated = await service.rankAffinityTargets({
       ownerId: row.tenant.id,
       resourceOwnerId: row.owner.id,
       poolId: row.pool.id,
-      securityScope: "grant-a:token-a",
+      securityScope: "token-a",
+      accessGrantId: "grant-a",
       policy,
       surface: "OPENAI_RESPONSES",
       payload: changedTurn,

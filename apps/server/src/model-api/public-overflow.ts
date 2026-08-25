@@ -76,6 +76,8 @@ export interface PublicOverflowRequest {
   /** Requester and credential scopes remain distinct from the pool owner. */
   affinityTenantUserId?: string;
   affinitySecurityScope?: string;
+  /** Exact visibility grant; replacement or revocation invalidates affinity. */
+  affinityAccessGrantId?: string | null;
   poolId: string;
   requestId: string;
   reason: PublicOverflowReason;
@@ -1379,6 +1381,7 @@ export async function rankPublicOverflowTargets(input: {
     resourceOwnerId: input.request.userId,
     poolId: input.request.poolId,
     securityScope: input.request.affinitySecurityScope ?? input.request.userId,
+    accessGrantId: input.request.affinityAccessGrantId,
     policy: input.policy,
     surface: input.request.requestedSurface,
     payload,
@@ -2289,6 +2292,7 @@ export async function dispatchPublicOverflow(
                   resourceOwnerId: request.userId,
                   poolId: request.poolId,
                   securityScope: request.affinitySecurityScope ?? request.userId,
+                  accessGrantId: request.affinityAccessGrantId,
                   policy: listed.affinityPolicy,
                   surface: request.requestedSurface,
                   payload: parsed as Record<string, unknown>,

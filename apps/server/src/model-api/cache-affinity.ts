@@ -110,6 +110,7 @@ export function affinityPrefixDigests({
   resourceOwnerId,
   poolId,
   securityScope,
+  accessGrantId,
   surface,
   payload,
   runtimeIdentity,
@@ -118,6 +119,7 @@ export function affinityPrefixDigests({
   resourceOwnerId: string;
   poolId: string;
   securityScope?: string;
+  accessGrantId?: string | null;
   surface: string;
   payload: Record<string, unknown>;
   runtimeIdentity: string;
@@ -151,6 +153,8 @@ export function affinityPrefixDigests({
     ownerId,
     resourceOwnerId,
     poolId,
+    securityScope: securityScope ?? ownerId,
+    accessGrantId: accessGrantId ?? null,
     surface,
     runtimeIdentity,
   });
@@ -198,6 +202,7 @@ export function affinityPrefixDigests({
               resourceOwnerId,
               poolId,
               securityScope: securityScope ?? ownerId,
+              accessGrantId: accessGrantId ?? null,
               conversation: conversationSource,
             })}`,
           }),
@@ -209,6 +214,7 @@ export async function rankAffinityTargets({
   resourceOwnerId,
   poolId,
   securityScope,
+  accessGrantId,
   policy,
   surface,
   payload,
@@ -219,6 +225,7 @@ export async function rankAffinityTargets({
   resourceOwnerId: string;
   poolId: string;
   securityScope?: string;
+  accessGrantId?: string | null;
   policy: AffinityPolicy;
   surface: string;
   payload: Record<string, unknown>;
@@ -243,6 +250,7 @@ export async function rankAffinityTargets({
         resourceOwnerId,
         poolId,
         securityScope: securityScope ?? ownerId,
+        accessGrantId,
         surface,
         payload,
         runtimeIdentity: target.targetIdentity,
@@ -375,6 +383,7 @@ export async function rememberAffinity({
   resourceOwnerId,
   poolId,
   securityScope,
+  accessGrantId,
   policy,
   surface,
   payload,
@@ -387,6 +396,7 @@ export async function rememberAffinity({
   resourceOwnerId: string;
   poolId: string;
   securityScope?: string;
+  accessGrantId?: string | null;
   policy: AffinityPolicy;
   surface: string;
   payload: Record<string, unknown>;
@@ -401,6 +411,7 @@ export async function rememberAffinity({
     resourceOwnerId,
     poolId,
     securityScope: securityScope ?? ownerId,
+    accessGrantId,
     surface,
     payload,
     runtimeIdentity: target.targetIdentity,

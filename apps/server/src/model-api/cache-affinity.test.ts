@@ -83,6 +83,7 @@ describe("cache affinity", () => {
         resourceOwnerId: "resource-owner",
         poolId: "pool",
         securityScope: "token-a",
+        accessGrantId: "grant-a",
         surface: "OPENAI_CHAT_COMPLETIONS",
         payload,
         runtimeIdentity: "runtime-a",
@@ -92,6 +93,8 @@ describe("cache affinity", () => {
     const baseline = digest();
     expect(digest()).toBe(baseline);
     expect(digest({ ownerId: "owner-b" })).not.toBe(baseline);
+    expect(digest({ securityScope: "token-b" })).not.toBe(baseline);
+    expect(digest({ accessGrantId: "grant-b" })).not.toBe(baseline);
     expect(digest({ runtimeIdentity: "runtime-b" })).not.toBe(baseline);
     expect(digest({ surface: "ANTHROPIC_MESSAGES" })).not.toBe(baseline);
     expect(digest({ payload: { ...payload, messages: [...payload.messages].reverse() } })).not.toBe(
@@ -135,6 +138,7 @@ describe("cache affinity", () => {
         resourceOwnerId: "pool-owner",
         poolId: "pool",
         securityScope: "token-a",
+        accessGrantId: "grant-a",
         surface: "OPENAI_RESPONSES",
         payload: requestPayload,
         runtimeIdentity: "target-runtime",
@@ -163,6 +167,7 @@ describe("cache affinity", () => {
       { resourceOwnerId: "other-owner" },
       { poolId: "other-pool" },
       { securityScope: "token-b" },
+      { accessGrantId: "grant-b" },
     ]) {
       expect(
         affinityPrefixDigests({
@@ -170,6 +175,7 @@ describe("cache affinity", () => {
           resourceOwnerId: "pool-owner",
           poolId: "pool",
           securityScope: "token-a",
+          accessGrantId: "grant-a",
           surface: "OPENAI_RESPONSES",
           payload: { conversation: "conversation-secret", input: "turn one" },
           runtimeIdentity: "target-runtime",
@@ -359,6 +365,7 @@ describe("cache affinity", () => {
       ownerId: "owner",
       resourceOwnerId: "owner",
       poolId: "pool",
+      securityScope: "token",
       policy,
       surface: "OPENAI_CHAT_COMPLETIONS",
       payload,
