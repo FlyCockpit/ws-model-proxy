@@ -7,11 +7,19 @@ export const capacityCountStrategies = [
   "TEMPLATE_AWARE",
 ] as const;
 
+export const finiteLimitModes = ["LIMITED", "UNLIMITED"] as const;
+export const inheritedLimitModes = ["INHERIT", "LIMITED"] as const;
+export type FiniteLimitMode = (typeof finiteLimitModes)[number];
+export type InheritedLimitMode = (typeof inheritedLimitModes)[number];
+export type MemberLimitMode = "INHERIT" | FiniteLimitMode;
+
 export const capacityFormSchema = z.object({
   label: z.string().trim().min(1).max(120),
   runtimeModel: z.string().trim().min(1).max(500),
   runtimeIdentityKey: z.string().trim().min(1).max(500),
+  hardConcurrencyMode: z.enum(finiteLimitModes),
   hardConcurrencyLimit: z.number().int().min(1).max(10_000),
+  physicalMaxContextMode: z.enum(finiteLimitModes),
   physicalMaxContext: z.number().int().min(1).max(100_000_000),
   countStrategy: z.enum(capacityCountStrategies),
   runtimeRevision: z.string().trim().max(500),
@@ -25,7 +33,9 @@ export const newCapacityDefaults: CapacityFormValue = {
   label: "",
   runtimeModel: "",
   runtimeIdentityKey: "",
+  hardConcurrencyMode: "LIMITED",
   hardConcurrencyLimit: 1,
+  physicalMaxContextMode: "LIMITED",
   physicalMaxContext: 32_768,
   countStrategy: "CONSERVATIVE_ESTIMATE",
   runtimeRevision: "",
@@ -38,8 +48,10 @@ export function capacityMutationPayload(value: CapacityFormValue) {
     label: value.label.trim(),
     runtimeModel: value.runtimeModel.trim(),
     runtimeIdentityKey: value.runtimeIdentityKey.trim(),
-    hardConcurrencyLimit: value.hardConcurrencyLimit,
-    physicalMaxContext: value.physicalMaxContext,
+    hardConcurrencyLimit:
+      value.hardConcurrencyMode === "LIMITED" ? value.hardConcurrencyLimit : null,
+    physicalMaxContext:
+      value.physicalMaxContextMode === "LIMITED" ? value.physicalMaxContext : null,
     countStrategy: value.countStrategy,
     runtimeRevision: value.runtimeRevision.trim() || null,
     tokenizer: value.tokenizer.trim() || null,
@@ -59,26 +71,39 @@ export function directPolicyIsValid(input: {
   ceiling: string;
   margin: string;
   hardLimit: number | null;
+  concurrencyMode?: FiniteLimitMode;
+  waitMode?: FiniteLimitMode;
+  ceilingMode?: FiniteLimitMode;
 }) {
-  const values = [
-    input.priority,
-    input.concurrency,
-    input.reserved,
-    input.wait,
-    input.ceiling,
-    input.margin,
-  ];
+  const concurrencyMode = input.concurrencyMode ?? "LIMITED";
+  const waitMode = input.waitMode ?? "LIMITED";
+  const ceilingMode = input.ceilingMode ?? "LIMITED";
+  const values = [input.priority, input.reserved, input.margin];
+  if (concurrencyMode === "LIMITED") values.push(input.concurrency);
+  if (waitMode === "LIMITED") values.push(input.wait);
+  if (ceilingMode === "LIMITED") values.push(input.ceiling);
   if (values.some((value) => value.trim() === "")) return false;
-  const [priority, concurrency, reserved, wait, ceiling, margin] = values.map(Number);
+  const priority = Number(input.priority);
+  const concurrency = Number(input.concurrency);
+  const reserved = Number(input.reserved);
+  const wait = Number(input.wait);
+  const ceiling = Number(input.ceiling);
+  const margin = Number(input.margin);
   return (
-    [priority, concurrency, reserved, wait, ceiling, margin].every(Number.isInteger) &&
+    [priority, reserved, margin].every(Number.isInteger) &&
+    (concurrencyMode === "UNLIMITED" || Number.isInteger(concurrency)) &&
+    (waitMode === "UNLIMITED" || Number.isInteger(wait)) &&
+    (ceilingMode === "UNLIMITED" || Number.isInteger(ceiling)) &&
     priority >= 0 &&
     priority <= 31 &&
-    concurrency > 0 &&
+    (concurrencyMode === "UNLIMITED" || concurrency > 0) &&
     reserved >= 0 &&
-    wait >= 0 &&
-    ceiling > 0 &&
+    (waitMode === "UNLIMITED" || wait >= 0) &&
+    (ceilingMode === "UNLIMITED" || ceiling > 0) &&
     margin >= 0 &&
+    (input.hardLimit === null ||
+      concurrencyMode === "UNLIMITED" ||
+      concurrency <= input.hardLimit) &&
     (input.hardLimit === null || reserved <= input.hardLimit)
   );
 }
@@ -116,15 +141,20 @@ export function directPolicyPayload(input: {
   ceiling: string;
   margin: string;
   borrow: "NEVER" | "WHEN_IDLE";
+  concurrencyMode?: FiniteLimitMode;
+  waitMode?: FiniteLimitMode;
+  ceilingMode?: FiniteLimitMode;
 }) {
   return {
     executionTargetId: input.executionTargetId,
     inferenceCapacityId: input.capacityId || null,
     directPriority: Number(input.priority),
-    directConcurrencyLimit: Number(input.concurrency),
+    directConcurrencyLimit:
+      (input.concurrencyMode ?? "LIMITED") === "LIMITED" ? Number(input.concurrency) : null,
     directReservedSlots: Number(input.reserved),
-    directWaitBudgetMs: Number(input.wait),
-    directContextCeiling: Number(input.ceiling),
+    directWaitBudgetMs: (input.waitMode ?? "LIMITED") === "LIMITED" ? Number(input.wait) : null,
+    directContextCeiling:
+      (input.ceilingMode ?? "LIMITED") === "LIMITED" ? Number(input.ceiling) : null,
     directContextMargin: Number(input.margin),
     directBorrowPolicy: input.borrow,
   };
@@ -133,16 +163,36 @@ export function directPolicyPayload(input: {
 export function memberPolicyPayload(input: {
   poolMemberId: string;
   priority: string;
+  concurrency?: string;
   reserved: string;
   wait: string;
   ceiling: string;
+  margin?: string;
+  borrow?: "NEVER" | "WHEN_IDLE";
+  concurrencyMode?: MemberLimitMode;
+  priorityMode?: "INHERIT" | "OVERRIDE";
+  reservedMode?: "INHERIT" | "OVERRIDE";
+  waitMode?: "INHERIT" | "LIMITED" | "UNLIMITED";
+  ceilingMode?: "INHERIT" | "LIMITED" | "UNLIMITED";
+  borrowMode?: "INHERIT" | "OVERRIDE";
+  marginMode?: InheritedLimitMode;
 }) {
   return {
     poolMemberId: input.poolMemberId,
-    capacityPriority: Number(input.priority),
-    capacityReservedSlots: Number(input.reserved),
-    capacityWaitBudgetMs: Number(input.wait),
-    capacityContextCeiling: Number(input.ceiling),
+    capacityPriority:
+      (input.priorityMode ?? "OVERRIDE") === "OVERRIDE" ? Number(input.priority) : null,
+    capacityConcurrencyMode: input.concurrencyMode ?? "INHERIT",
+    capacityConcurrencyLimit:
+      input.concurrencyMode === "LIMITED" ? Number(input.concurrency) : null,
+    capacityReservedSlots:
+      (input.reservedMode ?? "OVERRIDE") === "OVERRIDE" ? Number(input.reserved) : null,
+    capacityWaitBudgetMode: input.waitMode ?? "INHERIT",
+    capacityWaitBudgetMs: input.waitMode === "LIMITED" ? Number(input.wait) : null,
+    capacityContextCeilingMode: input.ceilingMode ?? "INHERIT",
+    capacityContextCeiling: input.ceilingMode === "LIMITED" ? Number(input.ceiling) : null,
+    capacityBorrowPolicy: (input.borrowMode ?? "INHERIT") === "OVERRIDE" ? input.borrow : null,
+    capacityContextMargin:
+      (input.marginMode ?? "INHERIT") === "LIMITED" ? Number(input.margin) : null,
   };
 }
 
@@ -158,7 +208,12 @@ export function createMemberFollowUps(input: {
   return [
     {
       kind: "member-policy" as const,
-      input: memberPolicyPayload({ poolMemberId: input.memberId, ...input }),
+      input: memberPolicyPayload({
+        poolMemberId: input.memberId,
+        ...input,
+        waitMode: "LIMITED",
+        ceilingMode: "LIMITED",
+      }),
     },
     {
       kind: "capacity-attachment" as const,

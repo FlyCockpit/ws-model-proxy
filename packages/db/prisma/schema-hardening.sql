@@ -18,6 +18,23 @@ LOCK TABLE discovered_model, execution_target, model_pool, model_api_token,
 
 -- Capacity policy bounds are database invariants because admission correctness
 -- must not depend on every rolling-deploy writer running the same validator.
+-- Prisma adds the discriminator columns with INHERIT defaults. Preserve legacy
+-- finite member overrides by tagging every existing non-null value as LIMITED.
+UPDATE pool_member
+   SET "capacityConcurrencyMode" = 'LIMITED'
+ WHERE "capacityConcurrencyLimit" IS NOT NULL
+   AND "capacityConcurrencyMode" = 'INHERIT';
+
+UPDATE pool_member
+   SET "capacityWaitBudgetMode" = 'LIMITED'
+ WHERE "capacityWaitBudgetMs" IS NOT NULL
+   AND "capacityWaitBudgetMode" = 'INHERIT';
+
+UPDATE pool_member
+   SET "capacityContextCeilingMode" = 'LIMITED'
+ WHERE "capacityContextCeiling" IS NOT NULL
+   AND "capacityContextCeilingMode" = 'INHERIT';
+
 UPDATE capacity_waiter waiter
    SET "requestId" = request."requestId",
        "attemptId" = request."attemptId",
@@ -35,9 +52,9 @@ UPDATE capacity_waiter
 
 UPDATE capacity_waiter waiter
    SET "effectiveConcurrencyScope" = CASE
-         WHEN member."capacityConcurrencyLimit" IS NULL THEN 'POOL' ELSE 'MEMBER' END,
+         WHEN member."capacityConcurrencyMode" = 'INHERIT' THEN 'POOL' ELSE 'MEMBER' END,
        "effectiveConcurrencyScopeId" = CASE
-         WHEN member."capacityConcurrencyLimit" IS NULL THEN waiter."poolId" ELSE waiter."poolMemberId" END
+         WHEN member."capacityConcurrencyMode" = 'INHERIT' THEN waiter."poolId" ELSE waiter."poolMemberId" END
   FROM pool_member member
  WHERE waiter."effectiveConcurrencyScope" = ''
    AND member.id = waiter."poolMemberId";
@@ -78,12 +95,16 @@ ALTER TABLE model_pool ADD CONSTRAINT model_pool_capacity_policy_check CHECK (
 ALTER TABLE pool_member DROP CONSTRAINT IF EXISTS pool_member_capacity_policy_check;
 ALTER TABLE pool_member ADD CONSTRAINT pool_member_capacity_policy_check CHECK (
   ("capacityPriority" IS NULL OR "capacityPriority" BETWEEN 0 AND 31)
-  AND ("capacityConcurrencyLimit" IS NULL OR "capacityConcurrencyLimit" > 0)
+  AND (("capacityConcurrencyMode" = 'LIMITED' AND "capacityConcurrencyLimit" > 0)
+    OR ("capacityConcurrencyMode" IN ('INHERIT', 'UNLIMITED') AND "capacityConcurrencyLimit" IS NULL))
   AND ("capacityReservedSlots" IS NULL OR "capacityReservedSlots" >= 0)
-  AND ("capacityWaitBudgetMs" IS NULL OR "capacityWaitBudgetMs" >= 0)
-  AND ("capacityContextCeiling" IS NULL OR "capacityContextCeiling" > 0)
-  AND "capacityContextMargin" >= 0
-  AND ("capacityContextCeiling" IS NULL OR "capacityContextMargin" < "capacityContextCeiling")
+  AND (("capacityWaitBudgetMode" = 'LIMITED' AND "capacityWaitBudgetMs" > 0)
+    OR ("capacityWaitBudgetMode" IN ('INHERIT', 'UNLIMITED') AND "capacityWaitBudgetMs" IS NULL))
+  AND (("capacityContextCeilingMode" = 'LIMITED' AND "capacityContextCeiling" > 0)
+    OR ("capacityContextCeilingMode" IN ('INHERIT', 'UNLIMITED') AND "capacityContextCeiling" IS NULL))
+  AND ("capacityContextMargin" IS NULL OR "capacityContextMargin" >= 0)
+  AND ("capacityContextCeilingMode" <> 'LIMITED' OR "capacityContextMargin" IS NULL
+    OR "capacityContextMargin" < "capacityContextCeiling")
 );
 
 ALTER TABLE admission_request DROP CONSTRAINT IF EXISTS admission_request_shape_check;
@@ -233,11 +254,14 @@ BEGIN
        WHERE member.id = NEW."poolMemberId"
          AND NEW."effectivePriority" = COALESCE(member."capacityPriority", pool."capacityPriority")
          AND NEW."effectiveConcurrencyLimit" IS NOT DISTINCT FROM
-           COALESCE(member."capacityConcurrencyLimit", pool."capacityConcurrencyLimit")
+           CASE member."capacityConcurrencyMode"
+             WHEN 'LIMITED' THEN member."capacityConcurrencyLimit"
+             WHEN 'UNLIMITED' THEN NULL
+             ELSE pool."capacityConcurrencyLimit" END
          AND NEW."effectiveConcurrencyScope" = CASE
-           WHEN member."capacityConcurrencyLimit" IS NULL THEN 'POOL' ELSE 'MEMBER' END
+           WHEN member."capacityConcurrencyMode" = 'INHERIT' THEN 'POOL' ELSE 'MEMBER' END
          AND NEW."effectiveConcurrencyScopeId" = CASE
-           WHEN member."capacityConcurrencyLimit" IS NULL THEN pool.id ELSE member.id END
+           WHEN member."capacityConcurrencyMode" = 'INHERIT' THEN pool.id ELSE member.id END
          AND NEW."effectiveReservedSlots" = COALESCE(member."capacityReservedSlots", pool."capacityReservedSlots")
          AND NEW."effectiveBorrowPolicy" = COALESCE(member."capacityBorrowPolicy", pool."capacityBorrowPolicy")
     ) THEN

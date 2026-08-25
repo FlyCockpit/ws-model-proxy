@@ -182,6 +182,37 @@ describe("capacityManagementRouter", () => {
     expect(db.executionTarget.update).not.toHaveBeenCalled();
   });
 
+  it("rejects a capacity attachment that invalidates any inherited membership policy", async () => {
+    db.executionTarget.findUnique.mockResolvedValue({
+      id: "target",
+      userId: "owner",
+      inferenceCapacityId: null,
+      directConcurrencyLimit: null,
+      directReservedSlots: 0,
+      InferenceCapacity: null,
+      PoolMembers: [
+        {
+          capacityConcurrencyMode: "INHERIT",
+          capacityConcurrencyLimit: null,
+          capacityReservedSlots: null,
+          ModelPool: { capacityConcurrencyLimit: 4, capacityReservedSlots: 0 },
+        },
+      ],
+    });
+    db.inferenceCapacity.findUnique.mockResolvedValue({
+      userId: "owner",
+      hardConcurrencyLimit: 2,
+    });
+    const client = createRouterClient(capacityManagementRouter, { context });
+    await expect(
+      client.updateDirectPolicy({
+        executionTargetId: "target",
+        inferenceCapacityId: "capacity",
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.executionTarget.update).not.toHaveBeenCalled();
+  });
+
   it("rejects hard-limit reductions that invalidate attached direct or pool policies", async () => {
     db.inferenceCapacity.findUnique.mockResolvedValue({
       id: "capacity",
@@ -199,5 +230,54 @@ describe("capacityManagementRouter", () => {
       code: "BAD_REQUEST",
     });
     expect(db.inferenceCapacity.update).not.toHaveBeenCalled();
+  });
+
+  it("requires coherent tagged member limits and normalizes legacy finite writes", async () => {
+    db.poolMember.findUnique.mockResolvedValue({
+      id: "member",
+      capacityConcurrencyMode: "INHERIT",
+      capacityConcurrencyLimit: null,
+      capacityReservedSlots: null,
+      ModelPool: {
+        userId: "owner",
+        capacityConcurrencyLimit: 4,
+        capacityReservedSlots: 0,
+      },
+      ExecutionTarget: { InferenceCapacity: { hardConcurrencyLimit: 4 } },
+    });
+    db.poolMember.update.mockResolvedValue({ id: "member" });
+    const client = createRouterClient(capacityManagementRouter, { context });
+
+    await expect(
+      client.updateMemberPolicy({
+        poolMemberId: "member",
+        capacityConcurrencyMode: "UNLIMITED",
+        capacityConcurrencyLimit: 2,
+      }),
+    ).rejects.toBeTruthy();
+
+    await client.updateMemberPolicy({
+      poolMemberId: "member",
+      capacityConcurrencyLimit: 2,
+    });
+    expect(db.poolMember.update).toHaveBeenCalledWith({
+      where: { id: "member" },
+      data: expect.objectContaining({
+        capacityConcurrencyMode: "LIMITED",
+        capacityConcurrencyLimit: 2,
+      }),
+    });
+
+    await client.updateMemberPolicy({
+      poolMemberId: "member",
+      capacityConcurrencyMode: "UNLIMITED",
+    });
+    expect(db.poolMember.update).toHaveBeenLastCalledWith({
+      where: { id: "member" },
+      data: expect.objectContaining({
+        capacityConcurrencyMode: "UNLIMITED",
+        capacityConcurrencyLimit: null,
+      }),
+    });
   });
 });

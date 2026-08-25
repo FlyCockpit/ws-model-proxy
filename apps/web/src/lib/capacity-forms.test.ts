@@ -17,7 +17,9 @@ import {
 describe("capacity form", () => {
   it("uses conservative finite create defaults", () => {
     expect(newCapacityDefaults).toMatchObject({
+      hardConcurrencyMode: "LIMITED",
       hardConcurrencyLimit: 1,
+      physicalMaxContextMode: "LIMITED",
       physicalMaxContext: 32_768,
       countStrategy: "CONSERVATIVE_ESTIMATE",
     });
@@ -50,6 +52,16 @@ describe("capacity form", () => {
       runtimeIdentityKey: "key",
       tokenizer: null,
     });
+  });
+
+  it("persists explicit unlimited physical limits without coercing fallback values", () => {
+    expect(
+      capacityMutationPayload({
+        ...newCapacityDefaults,
+        hardConcurrencyMode: "UNLIMITED",
+        physicalMaxContextMode: "UNLIMITED",
+      }),
+    ).toMatchObject({ hardConcurrencyLimit: null, physicalMaxContext: null });
   });
 });
 
@@ -89,9 +101,39 @@ describe("capacity mutation planning", () => {
     ).toEqual({
       poolMemberId: "member",
       capacityPriority: 4,
+      capacityConcurrencyMode: "INHERIT",
+      capacityConcurrencyLimit: null,
       capacityReservedSlots: 0,
-      capacityWaitBudgetMs: 30,
-      capacityContextCeiling: 2048,
+      capacityWaitBudgetMode: "INHERIT",
+      capacityWaitBudgetMs: null,
+      capacityContextCeilingMode: "INHERIT",
+      capacityContextCeiling: null,
+      capacityBorrowPolicy: null,
+      capacityContextMargin: null,
+    });
+  });
+
+  it("keeps member inheritance distinct from explicit unlimited limits", () => {
+    const base = {
+      poolMemberId: "member",
+      priority: "16",
+      concurrency: "2",
+      reserved: "0",
+      wait: "30",
+      ceiling: "2048",
+      margin: "128",
+    };
+    expect(memberPolicyPayload({ ...base, concurrencyMode: "INHERIT" })).toMatchObject({
+      capacityConcurrencyMode: "INHERIT",
+      capacityConcurrencyLimit: null,
+    });
+    expect(memberPolicyPayload({ ...base, concurrencyMode: "UNLIMITED" })).toMatchObject({
+      capacityConcurrencyMode: "UNLIMITED",
+      capacityConcurrencyLimit: null,
+    });
+    expect(memberPolicyPayload({ ...base, concurrencyMode: "LIMITED" })).toMatchObject({
+      capacityConcurrencyMode: "LIMITED",
+      capacityConcurrencyLimit: 2,
     });
   });
 
@@ -152,6 +194,20 @@ describe("admission policy validation", () => {
 
   it("rejects reservations above the attached hard limit", () => {
     expect(directPolicyIsValid({ ...valid, reserved: "3" })).toBe(false);
+  });
+
+  it("rejects concurrency above the attached hard limit", () => {
+    expect(directPolicyIsValid({ ...valid, concurrency: "3" })).toBe(false);
+  });
+
+  it("accepts blank stored values only when the explicit mode is unlimited", () => {
+    expect(
+      directPolicyIsValid({
+        ...valid,
+        concurrency: "",
+        concurrencyMode: "UNLIMITED",
+      }),
+    ).toBe(true);
   });
 });
 

@@ -15,6 +15,15 @@ export function holdCapacityLeaseForResponse({
   heartbeatIntervalMs?: number;
   leaseExtensionMs?: number;
 }): Response {
+  const reportCleanupFailure = (operation: "cancel" | "release", error: unknown) => {
+    // Never include arbitrary upstream/driver messages: they may contain request
+    // or credential material. The operation and error class are sufficient for
+    // an operator to correlate cleanup failures with service telemetry.
+    console.warn("[capacity] response lease cleanup failed", {
+      operation,
+      errorClass: error instanceof Error ? error.name : "UnknownError",
+    });
+  };
   let finished = false;
   let heartbeatRunning = false;
   let timer: ReturnType<typeof setInterval> | undefined;
@@ -25,7 +34,11 @@ export function holdCapacityLeaseForResponse({
     finished = true;
     if (timer) clearInterval(timer);
     signal?.removeEventListener("abort", abort);
-    await store.release(lease);
+    try {
+      await store.release(lease);
+    } catch (error) {
+      reportCleanupFailure("release", error);
+    }
   };
   const heartbeat = async () => {
     if (finished || heartbeatRunning) return;
@@ -49,9 +62,10 @@ export function holdCapacityLeaseForResponse({
     downstream?.error(terminalError);
     try {
       await reader?.cancel(terminalError);
-    } finally {
-      await finish();
+    } catch (error) {
+      reportCleanupFailure("cancel", error);
     }
+    await finish();
   };
   const abort = () => {
     void loseLease(signal?.reason ?? new DOMException("Aborted", "AbortError"));
@@ -86,9 +100,10 @@ export function holdCapacityLeaseForResponse({
     async cancel(reason) {
       try {
         await reader.cancel(reason);
-      } finally {
-        await finish();
+      } catch (error) {
+        reportCleanupFailure("cancel", error);
       }
+      await finish();
     },
   });
   return new Response(body, {

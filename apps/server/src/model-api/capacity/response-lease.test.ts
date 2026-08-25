@@ -100,4 +100,24 @@ describe("capacity response lease lifetime", () => {
     expect(cancelled).toHaveBeenCalledTimes(1);
     expect(release).toHaveBeenCalledTimes(1);
   });
+
+  it("contains cancel and release cleanup rejections without exposing messages", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const source = new ReadableStream<Uint8Array>({
+      cancel: vi.fn().mockRejectedValue(new Error("secret upstream detail")),
+    });
+    const response = holdCapacityLeaseForResponse({
+      response: new Response(source),
+      store: {
+        heartbeat: vi.fn(),
+        release: vi.fn().mockRejectedValue(new Error("secret database detail")),
+      },
+      lease,
+      heartbeatIntervalMs: 0,
+    });
+    await expect(response.body!.cancel("done")).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("secret");
+    warn.mockRestore();
+  });
 });

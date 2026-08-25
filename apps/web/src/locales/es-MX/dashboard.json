@@ -190,17 +190,27 @@
       "memberPolicy": "Capacidad vinculada y ajustes",
       "directPolicy": "Política de capacidad del modelo directo",
       "policyUpdated": "Política de capacidad actualizada",
+      "directGlobalEffect": "Estos ajustes se aplican a cada solicitud directa enviada a este destino de ejecución, no solo a esta entrada de modelo.",
+      "attachmentGlobalEffect": "Cambiar la capacidad compartida vinculada modifica la admisión de este destino de ejecución dondequiera que se use.",
       "attachment": "Capacidad compartida",
       "unattached": "Sin vincular",
       "borrowIdle": "Tomar prestado solo cuando la capacidad reservada esté inactiva",
       "borrowNever": "Nunca tomar prestada capacidad reservada",
       "save": "Guardar capacidad",
+      "limitValue": "Valor del límite",
+      "modes": {
+        "inherit": "Heredar política del pool",
+        "limited": "Limitado",
+        "unlimited": "Ilimitado",
+        "override": "Reemplazar"
+      },
       "fields": {
         "label": "Nombre de capacidad",
         "runtimeModel": "Modelo del runtime",
         "runtimeIdentityKey": "Identidad del runtime",
         "hardConcurrencyLimit": "Concurrencia física",
         "directConcurrencyLimit": "Límite de concurrencia directa",
+        "capacityConcurrencyLimit": "Límite de concurrencia del miembro",
         "physicalMaxContext": "Máximo de tokens de contexto",
         "countStrategy": "Conteo de contexto",
         "runtimeRevision": "Revisión del runtime (opcional)",
@@ -215,9 +225,11 @@
       },
       "strategies": {
         "estimate": "Estimación conservadora",
-        "engine": "Reportado por el motor",
-        "tokenizer": "Tokenizador coincidente",
-        "template": "Tokenizador y plantilla de prompt"
+        "engine": "Usar el conteo del motor cuando esté disponible",
+        "tokenizer": "Usar un tokenizador registrado coincidente",
+        "template": "Usar un tokenizador y plantilla registrados coincidentes",
+        "engineRequirement": "Requiere soporte para contar tokens en el destino seleccionado. WSMP usa una estimación conservadora cuando no está disponible.",
+        "registeredRequirement": "Requiere un contador registrado que coincida con esta identidad de runtime. WSMP usa una estimación conservadora cuando no hay coincidencia."
       }
     },
     "allowLossyDeveloperRoleCollapse": "Permitir la conversión con pérdida del rol developer",

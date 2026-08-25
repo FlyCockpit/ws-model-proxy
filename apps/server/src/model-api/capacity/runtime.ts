@@ -45,16 +45,37 @@ export class StoreCapacityAdmissionRuntime implements CapacityAdmissionRuntime {
   async acquire(attempt: AdmissionAttempt, signal?: AbortSignal): Promise<AdmissionResult> {
     await this.maintain();
     const initial = await this.store.acquire(attempt, signal);
-    if (initial.state !== "WAITING") return initial;
-    return waitWithCapacityPolling({
-      capacityIds: [...new Set(attempt.candidates.map(({ capacityId }) => capacityId))],
-      deadlineAt: attempt.deadlineAt,
-      signal,
-      minimumPollMs: this.pollIntervalMs,
-      maximumPollMs: this.pollIntervalMs,
-      wakeSource: this.wakeSource,
-      poll: () => this.store.acquire({ ...attempt, candidates: [] }, signal),
-    });
+    const result =
+      initial.state !== "WAITING"
+        ? initial
+        : await waitWithCapacityPolling({
+            capacityIds: [...new Set(attempt.candidates.map(({ capacityId }) => capacityId))],
+            deadlineAt: attempt.deadlineAt,
+            signal,
+            minimumPollMs: this.pollIntervalMs,
+            maximumPollMs: this.pollIntervalMs,
+            wakeSource: this.wakeSource,
+            poll: () => this.store.acquire({ ...attempt, candidates: [] }, signal),
+          });
+
+    // The durable row, not the polling loop, is the source of truth. Terminalize
+    // it before returning so a wakeup/poll on another server cannot admit this
+    // attempt after its client has stopped waiting. If admission won the race,
+    // release that lease immediately instead of leaking a slot.
+    const terminal = signal?.aborted
+      ? "CANCELLED"
+      : Date.now() >= attempt.deadlineAt.getTime()
+        ? "EXPIRED"
+        : null;
+    if (terminal) {
+      if (result.state === "ADMITTED") await this.store.release(result.lease);
+      else if (terminal === "CANCELLED") await this.store.cancelAttempt(attempt.attemptId);
+      else await this.store.expireAttempt(attempt.attemptId);
+      return { state: terminal };
+    }
+    if (result.state === "CANCELLED") await this.store.cancelAttempt(attempt.attemptId);
+    if (result.state === "EXPIRED") await this.store.expireAttempt(attempt.attemptId);
+    return result;
   }
 
   async maintain(): Promise<void> {

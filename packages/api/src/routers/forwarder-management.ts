@@ -218,10 +218,13 @@ type PoolMemberRow = {
   nextRetryAt: Date | null;
   halfOpenTrialStartedAt: Date | null;
   capacityPriority: number | null;
+  capacityConcurrencyMode: "INHERIT" | "LIMITED" | "UNLIMITED";
   capacityConcurrencyLimit: number | null;
   capacityReservedSlots: number | null;
   capacityBorrowPolicy: string | null;
+  capacityWaitBudgetMode: "INHERIT" | "LIMITED" | "UNLIMITED";
   capacityWaitBudgetMs: number | null;
+  capacityContextCeilingMode: "INHERIT" | "LIMITED" | "UNLIMITED";
   capacityContextCeiling: number | null;
   capacityContextMargin: number | null;
   DiscoveredModel: PoolMemberModelRow | null;
@@ -613,10 +616,13 @@ function serializePool(row: ModelPoolRow) {
         executionTargetId: member.ExecutionTarget?.id ?? null,
         inferenceCapacityId: member.ExecutionTarget?.inferenceCapacityId ?? null,
         capacityPriority: member.capacityPriority,
+        capacityConcurrencyMode: member.capacityConcurrencyMode,
         capacityConcurrencyLimit: member.capacityConcurrencyLimit,
         capacityReservedSlots: member.capacityReservedSlots,
         capacityBorrowPolicy: member.capacityBorrowPolicy,
+        capacityWaitBudgetMode: member.capacityWaitBudgetMode,
         capacityWaitBudgetMs: member.capacityWaitBudgetMs,
+        capacityContextCeilingMode: member.capacityContextCeilingMode,
         capacityContextCeiling: member.capacityContextCeiling,
         capacityContextMargin: member.capacityContextMargin,
         weight: member.weight,
@@ -888,10 +894,13 @@ const poolSelect = {
       },
       weight: true,
       capacityPriority: true,
+      capacityConcurrencyMode: true,
       capacityConcurrencyLimit: true,
       capacityReservedSlots: true,
       capacityBorrowPolicy: true,
+      capacityWaitBudgetMode: true,
       capacityWaitBudgetMs: true,
+      capacityContextCeilingMode: true,
       capacityContextCeiling: true,
       capacityContextMargin: true,
       healthStatus: true,

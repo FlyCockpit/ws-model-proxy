@@ -19,6 +19,7 @@ describe("capacity admission runtime", () => {
         release: vi.fn(),
         heartbeat: vi.fn(),
         cancelAttempt: vi.fn(),
+        expireAttempt: vi.fn(),
         reclaimExpired: vi.fn(),
       },
       1,
@@ -45,6 +46,7 @@ describe("capacity admission runtime", () => {
       release: vi.fn(),
       heartbeat: vi.fn(),
       cancelAttempt: vi.fn(),
+      expireAttempt: vi.fn(),
       reclaimExpired: vi.fn(),
       sweepAbandoned,
     };
@@ -62,5 +64,112 @@ describe("capacity admission runtime", () => {
     await runtime.acquire(attempt);
     await runtime.acquire({ ...attempt, attemptId: "attempt-2" });
     expect(sweepAbandoned).toHaveBeenCalledTimes(1);
+  });
+
+  it("durably cancels an aborted waiter before returning", async () => {
+    const controller = new AbortController();
+    const cancelAttempt = vi.fn().mockResolvedValue(true);
+    const acquire = vi.fn().mockImplementation(async () => {
+      controller.abort();
+      return { state: "WAITING", requestId: "request" };
+    });
+    const runtime = new StoreCapacityAdmissionRuntime(
+      {
+        acquire,
+        release: vi.fn(),
+        heartbeat: vi.fn(),
+        cancelAttempt,
+        expireAttempt: vi.fn(),
+        reclaimExpired: vi.fn(),
+      },
+      1,
+    );
+    await expect(
+      runtime.acquire(
+        {
+          requestId: "request",
+          attemptId: "attempt",
+          ownerId: "owner",
+          sourceKind: "DIRECT",
+          basePriority: 16,
+          connectionOwner: "server",
+          deadlineAt: new Date(Date.now() + 100),
+          candidates: [{ capacityId: "capacity", executionTargetId: "target", candidateOrder: 0 }],
+        },
+        controller.signal,
+      ),
+    ).resolves.toEqual({ state: "CANCELLED" });
+    expect(cancelAttempt).toHaveBeenCalledWith("attempt");
+  });
+
+  it("releases admission when abort wins immediately after acquire", async () => {
+    const controller = new AbortController();
+    const lease = {
+      leaseId: "lease",
+      attemptId: "attempt",
+      capacityId: "capacity",
+      executionTargetId: "target",
+      fencingToken: 1n,
+      expiresAt: new Date(Date.now() + 30_000),
+    };
+    const release = vi.fn().mockResolvedValue(true);
+    const runtime = new StoreCapacityAdmissionRuntime(
+      {
+        acquire: vi.fn().mockImplementation(async () => {
+          controller.abort();
+          return { state: "ADMITTED", lease };
+        }),
+        release,
+        heartbeat: vi.fn(),
+        cancelAttempt: vi.fn(),
+        expireAttempt: vi.fn(),
+        reclaimExpired: vi.fn(),
+      },
+      1,
+    );
+    await expect(
+      runtime.acquire(
+        {
+          requestId: "request",
+          attemptId: "attempt",
+          ownerId: "owner",
+          sourceKind: "DIRECT",
+          basePriority: 16,
+          connectionOwner: "server",
+          deadlineAt: new Date(Date.now() + 100),
+          candidates: [{ capacityId: "capacity", executionTargetId: "target", candidateOrder: 0 }],
+        },
+        controller.signal,
+      ),
+    ).resolves.toEqual({ state: "CANCELLED" });
+    expect(release).toHaveBeenCalledWith(lease);
+  });
+
+  it("durably expires a waiter at its deadline", async () => {
+    const expireAttempt = vi.fn().mockResolvedValue(true);
+    const runtime = new StoreCapacityAdmissionRuntime(
+      {
+        acquire: vi.fn().mockResolvedValue({ state: "WAITING", requestId: "request" }),
+        release: vi.fn(),
+        heartbeat: vi.fn(),
+        cancelAttempt: vi.fn(),
+        expireAttempt,
+        reclaimExpired: vi.fn(),
+      },
+      1,
+    );
+    await expect(
+      runtime.acquire({
+        requestId: "request",
+        attemptId: "attempt",
+        ownerId: "owner",
+        sourceKind: "DIRECT",
+        basePriority: 16,
+        connectionOwner: "server",
+        deadlineAt: new Date(Date.now() + 5),
+        candidates: [{ capacityId: "capacity", executionTargetId: "target", candidateOrder: 0 }],
+      }),
+    ).resolves.toEqual({ state: "EXPIRED" });
+    expect(expireAttempt).toHaveBeenCalledWith("attempt");
   });
 });

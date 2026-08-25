@@ -227,6 +227,7 @@ function directRow({
   physicalMaxContext,
   directContextCeiling,
   directContextMargin = 0,
+  countStrategy,
 }: {
   id?: string;
   upstreamModelId?: string;
@@ -244,6 +245,7 @@ function directRow({
   physicalMaxContext?: number;
   directContextCeiling?: number;
   directContextMargin?: number;
+  countStrategy?: "TOKENIZER" | "TEMPLATE_AWARE" | "ENGINE_REPORTED" | "CONSERVATIVE_ESTIMATE";
 } = {}) {
   return {
     id,
@@ -258,7 +260,21 @@ function directRow({
       inferenceCapacityId: `${id}-capacity`,
       directContextCeiling,
       directContextMargin,
-      InferenceCapacity: physicalMaxContext === undefined ? null : { physicalMaxContext },
+      InferenceCapacity:
+        physicalMaxContext === undefined && countStrategy === undefined
+          ? null
+          : {
+              physicalMaxContext: physicalMaxContext ?? null,
+              countStrategy: countStrategy ?? "ENGINE_REPORTED",
+              runtimeIdentityKey: `${id}-runtime`,
+              runtimeModel: upstreamModelId,
+              runtimeRevision: null,
+              tokenizer: null,
+              tokenizerVersion: null,
+              template: null,
+              templateVersion: null,
+              engine: null,
+            },
     },
     Endpoint: {
       id: "endpoint-id",
@@ -3147,6 +3163,50 @@ describe("model API routes", () => {
     );
   });
 
+  it("honors a selected capacity's conservative strategy without dispatching native count", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({ countStrategy: "CONSERVATIVE_ESTIMATE" }),
+    );
+    const manager = new FakeRelayManager();
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async (attempt) => ({
+        state: "ADMITTED" as const,
+        lease: {
+          leaseId: "estimate-lease",
+          attemptId: attempt.attemptId,
+          capacityId: attempt.candidates[0]!.capacityId,
+          executionTargetId: attempt.candidates[0]!.executionTargetId,
+          fencingToken: 1n,
+          expiresAt: new Date(Date.now() + 30_000),
+        },
+      })),
+      release: vi.fn().mockResolvedValue(true),
+      hold: vi.fn((response) => response),
+    };
+    const responsePromise = appWith(manager, true, false, capacityRuntime).request("/responses", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: JSON.stringify({ model: directTarget.modelId, input: "hello" }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const inference = requireSent(manager);
+    expect(inference.path).toBe("/v1/responses");
+    expect(capacityRuntime.acquire).toHaveBeenCalledTimes(1);
+    manager.headers(inference.requestId, 200, { "content-type": "application/json" });
+    const response = await responsePromise;
+    manager.body(inference.requestId, JSON.stringify({ id: "resp", object: "response" }));
+    manager.complete(inference.requestId);
+    await response.text();
+    expect(db.relayRequest.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          contextCountMethod: "TOKEN_ESTIMATE",
+          contextCountExact: false,
+        }),
+      }),
+    );
+  });
+
   it("filters over-context pool members before admission", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
@@ -3449,6 +3509,7 @@ describe("model API routes", () => {
     expect(persistenceCalls).not.toContain("resp_123");
     expect(db.responseStickinessRecord.upsert.mock.calls[0]?.[0]).toMatchObject({
       create: {
+        routingVersion: 2,
         userId: "user-id",
         modelApiTokenId: "token-id",
         targetDiscoveredModelId: "model-id",
@@ -3461,6 +3522,7 @@ describe("model API routes", () => {
 
   it("uses metadata-only sticky routing for Responses API follow-up requests", async () => {
     db.responseStickinessRecord.findUnique.mockResolvedValue({
+      routingVersion: 2,
       userId: "user-id",
       modelApiTokenId: "token-id",
       targetDiscoveredModelId: null,
@@ -3660,6 +3722,7 @@ describe("model API routes", () => {
 
   it("routes Responses retrieve through the sticky selected model with no request body", async () => {
     db.responseStickinessRecord.findUnique.mockResolvedValue({
+      routingVersion: 1,
       userId: "user-id",
       modelApiTokenId: "token-id",
       targetDiscoveredModelId: "model-id",
@@ -3686,17 +3749,100 @@ describe("model API routes", () => {
     expect(response.status).toBe(200);
   });
 
+  it.each([
+    [
+      "deleted selected target",
+      {
+        routingVersion: 2,
+        userId: "user-id",
+        modelApiTokenId: "token-id",
+        targetDiscoveredModelId: "model-id",
+        targetModelPoolId: null,
+        selectedDiscoveredModelId: "model-id",
+        TargetExecutionTarget: { discoveredModelId: "model-id" },
+        SelectedExecutionTarget: null,
+        expiresAt: new Date(Date.now() + 60_000),
+      },
+      404,
+    ],
+    [
+      "different token",
+      {
+        routingVersion: 2,
+        userId: "user-id",
+        modelApiTokenId: "other-token",
+        targetDiscoveredModelId: "model-id",
+        targetModelPoolId: null,
+        selectedDiscoveredModelId: "model-id",
+        TargetExecutionTarget: { discoveredModelId: "model-id" },
+        SelectedExecutionTarget: { discoveredModelId: "model-id" },
+        expiresAt: new Date(Date.now() + 60_000),
+      },
+      404,
+    ],
+    [
+      "expired binding",
+      {
+        routingVersion: 2,
+        userId: "user-id",
+        modelApiTokenId: "token-id",
+        targetDiscoveredModelId: "model-id",
+        targetModelPoolId: null,
+        selectedDiscoveredModelId: "model-id",
+        TargetExecutionTarget: { discoveredModelId: "model-id" },
+        SelectedExecutionTarget: { discoveredModelId: "model-id" },
+        expiresAt: new Date(Date.now() - 1),
+      },
+      404,
+    ],
+  ] as const)("fails closed for v2 Responses lifecycle with %s", async (_label, record, status) => {
+    db.responseStickinessRecord.findUnique.mockResolvedValue(record);
+    const manager = new FakeRelayManager();
+    const response = await appWith(manager).request("/responses/resp_123", {
+      headers: { authorization: "Bearer wsmp_model_test" },
+    });
+    expect(response.status).toBe(status);
+    expect(manager.sent).toEqual([]);
+  });
+
+  it("rejects a v2 direct binding when its original target is no longer visible", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [{ ...directTarget, id: "other-model-id", modelId: "owner/other" }],
+      modelPools: [],
+    });
+    db.responseStickinessRecord.findUnique.mockResolvedValue({
+      routingVersion: 2,
+      userId: "user-id",
+      modelApiTokenId: "token-id",
+      targetDiscoveredModelId: "model-id",
+      targetModelPoolId: null,
+      selectedDiscoveredModelId: "model-id",
+      TargetExecutionTarget: { discoveredModelId: "model-id" },
+      SelectedExecutionTarget: { discoveredModelId: "model-id" },
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+    const manager = new FakeRelayManager();
+    const response = await appWith(manager).request("/responses/resp_123", {
+      headers: { authorization: "Bearer wsmp_model_test" },
+    });
+    expect(response.status).toBe(401);
+    expect(manager.sent).toEqual([]);
+  });
+
   it("admits a sticky pool lifecycle request through its exact bound member", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
       modelPools: [poolTarget],
     });
     db.responseStickinessRecord.findUnique.mockResolvedValue({
+      routingVersion: 2,
       userId: "user-id",
       modelApiTokenId: "token-id",
       targetDiscoveredModelId: null,
       targetModelPoolId: "pool-id",
       selectedDiscoveredModelId: "model-a",
+      TargetExecutionTarget: null,
+      SelectedExecutionTarget: { discoveredModelId: "model-a" },
       expiresAt: new Date(Date.now() + 60_000),
     });
     db.discoveredModel.findUnique.mockResolvedValue(

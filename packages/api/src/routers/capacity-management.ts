@@ -9,8 +9,10 @@ const priority = z.number().int().min(0).max(31);
 const optionalLimit = z.number().int().positive().nullable();
 const reservedSlots = z.number().int().min(0);
 const waitBudget = z.number().int().min(0).max(600_000).nullable();
+const memberWaitBudget = z.number().int().positive().max(600_000).nullable();
 const contextMargin = z.number().int().min(0).max(10_000_000);
 const borrowPolicy = z.enum(["NEVER", "WHEN_IDLE"]);
+const capacityLimitMode = z.enum(["INHERIT", "LIMITED", "UNLIMITED"]);
 const countStrategy = z.enum([
   "TOKENIZER",
   "TEMPLATE_AWARE",
@@ -114,6 +116,46 @@ const sharedPolicyFields = {
   capacityContextMargin: contextMargin.optional(),
 };
 
+const memberPolicy = z
+  .object({
+    poolMemberId: id,
+    capacityPriority: priority.nullable().optional(),
+    capacityConcurrencyMode: capacityLimitMode.optional(),
+    capacityConcurrencyLimit: optionalLimit.optional(),
+    capacityReservedSlots: reservedSlots.nullable().optional(),
+    capacityBorrowPolicy: borrowPolicy.nullable().optional(),
+    capacityWaitBudgetMode: capacityLimitMode.optional(),
+    capacityWaitBudgetMs: memberWaitBudget.optional(),
+    capacityContextCeilingMode: capacityLimitMode.optional(),
+    capacityContextCeiling: optionalLimit.optional(),
+    capacityContextMargin: contextMargin.nullable().optional(),
+  })
+  .superRefine((value, ctx) => {
+    for (const [modeKey, valueKey] of [
+      ["capacityConcurrencyMode", "capacityConcurrencyLimit"],
+      ["capacityWaitBudgetMode", "capacityWaitBudgetMs"],
+      ["capacityContextCeilingMode", "capacityContextCeiling"],
+    ] as const) {
+      const mode = value[modeKey];
+      const limit = value[valueKey];
+      if (mode === undefined) continue;
+      if (mode === "LIMITED" && limit == null) {
+        ctx.addIssue({
+          code: "custom",
+          path: [valueKey],
+          message: "A limited policy requires a value.",
+        });
+      }
+      if (mode !== "LIMITED" && limit != null) {
+        ctx.addIssue({
+          code: "custom",
+          path: [valueKey],
+          message: "Inherited and unlimited policies cannot include a value.",
+        });
+      }
+    }
+  });
+
 export const capacityManagementRouter = {
   list: protectedProcedure.handler(async ({ context }) => {
     enabled();
@@ -153,17 +195,20 @@ export const capacityManagementRouter = {
     )
       throw new ORPCError("BAD_REQUEST");
     const userId = context.session.user.id;
-    return prisma.$transaction(async (tx) => {
-      const created = await tx.inferenceCapacity.create({ data: { userId, ...input } });
-      await audit(tx, {
-        userId,
-        action: "CREATE",
-        resourceType: "INFERENCE_CAPACITY",
-        resourceId: created.id,
-        after: input,
-      });
-      return created;
-    });
+    return prisma.$transaction(
+      async (tx) => {
+        const created = await tx.inferenceCapacity.create({ data: { userId, ...input } });
+        await audit(tx, {
+          userId,
+          action: "CREATE",
+          resourceType: "INFERENCE_CAPACITY",
+          resourceId: created.id,
+          after: input,
+        });
+        return created;
+      },
+      { isolationLevel: "Serializable" },
+    );
   }),
 
   update: protectedProcedure
@@ -179,137 +224,179 @@ export const capacityManagementRouter = {
       enabled();
       const { id: capacityId, ...data } = input;
       const userId = context.session.user.id;
-      return prisma.$transaction(async (tx) => {
-        const current = await tx.inferenceCapacity.findUnique({
-          where: { id: capacityId },
-          include: {
-            ExecutionTargets: {
-              select: {
-                directConcurrencyLimit: true,
-                directReservedSlots: true,
-                PoolMembers: {
-                  select: {
-                    capacityConcurrencyLimit: true,
-                    capacityReservedSlots: true,
-                    ModelPool: {
-                      select: {
-                        capacityConcurrencyLimit: true,
-                        capacityReservedSlots: true,
+      return prisma.$transaction(
+        async (tx) => {
+          const current = await tx.inferenceCapacity.findUnique({
+            where: { id: capacityId },
+            include: {
+              ExecutionTargets: {
+                select: {
+                  directConcurrencyLimit: true,
+                  directReservedSlots: true,
+                  PoolMembers: {
+                    select: {
+                      capacityConcurrencyMode: true,
+                      capacityConcurrencyLimit: true,
+                      capacityReservedSlots: true,
+                      ModelPool: {
+                        select: {
+                          capacityConcurrencyLimit: true,
+                          capacityReservedSlots: true,
+                        },
                       },
                     },
                   },
                 },
               },
             },
-          },
-        });
-        if (!current || current.userId !== userId) return notFound();
-        const requestedHardLimit = (data as { hardConcurrencyLimit?: number | null })
-          .hardConcurrencyLimit;
-        if (requestedHardLimit !== undefined) {
-          for (const target of current.ExecutionTargets ?? []) {
-            assertPolicyWithinHardLimit({
-              hardLimit: requestedHardLimit,
-              concurrencyLimit: target.directConcurrencyLimit,
-              reservedSlots: target.directReservedSlots,
-            });
-            for (const member of target.PoolMembers) {
+          });
+          if (!current || current.userId !== userId) return notFound();
+          const requestedHardLimit = (data as { hardConcurrencyLimit?: number | null })
+            .hardConcurrencyLimit;
+          if (requestedHardLimit !== undefined) {
+            for (const target of current.ExecutionTargets ?? []) {
               assertPolicyWithinHardLimit({
                 hardLimit: requestedHardLimit,
-                concurrencyLimit:
-                  member.capacityConcurrencyLimit ?? member.ModelPool.capacityConcurrencyLimit,
-                reservedSlots:
-                  member.capacityReservedSlots ?? member.ModelPool.capacityReservedSlots,
+                concurrencyLimit: target.directConcurrencyLimit,
+                reservedSlots: target.directReservedSlots,
               });
+              for (const member of target.PoolMembers) {
+                assertPolicyWithinHardLimit({
+                  hardLimit: requestedHardLimit,
+                  concurrencyLimit:
+                    member.capacityConcurrencyMode === "UNLIMITED"
+                      ? null
+                      : member.capacityConcurrencyMode === "LIMITED"
+                        ? member.capacityConcurrencyLimit
+                        : member.ModelPool.capacityConcurrencyLimit,
+                  reservedSlots:
+                    member.capacityReservedSlots ?? member.ModelPool.capacityReservedSlots,
+                });
+              }
             }
           }
-        }
-        const updated = await tx.inferenceCapacity.update({ where: { id: capacityId }, data });
-        await audit(tx, {
-          userId,
-          action: "UPDATE",
-          resourceType: "INFERENCE_CAPACITY",
-          resourceId: capacityId,
-          before: current,
-          after: updated,
-        });
-        return updated;
-      });
+          const updated = await tx.inferenceCapacity.update({ where: { id: capacityId }, data });
+          await audit(tx, {
+            userId,
+            action: "UPDATE",
+            resourceType: "INFERENCE_CAPACITY",
+            resourceId: capacityId,
+            before: current,
+            after: updated,
+          });
+          return updated;
+        },
+        { isolationLevel: "Serializable" },
+      );
     }),
 
   remove: protectedProcedure.input(z.object({ id })).handler(async ({ input, context }) => {
     enabled();
     const userId = context.session.user.id;
-    return prisma.$transaction(async (tx) => {
-      const current = await tx.inferenceCapacity.findUnique({
-        where: { id: input.id },
-        select: { userId: true, _count: { select: { ExecutionTargets: true } } },
-      });
-      if (!current || current.userId !== userId) return notFound();
-      if (current._count.ExecutionTargets > 0) {
-        throw new ORPCError("CONFLICT", { message: "Capacity is still attached." });
-      }
-      await tx.inferenceCapacity.delete({ where: { id: input.id } });
-      await audit(tx, {
-        userId,
-        action: "DELETE",
-        resourceType: "INFERENCE_CAPACITY",
-        resourceId: input.id,
-        before: current,
-      });
-      return { success: true };
-    });
+    return prisma.$transaction(
+      async (tx) => {
+        const current = await tx.inferenceCapacity.findUnique({
+          where: { id: input.id },
+          select: { userId: true, _count: { select: { ExecutionTargets: true } } },
+        });
+        if (!current || current.userId !== userId) return notFound();
+        if (current._count.ExecutionTargets > 0) {
+          throw new ORPCError("CONFLICT", { message: "Capacity is still attached." });
+        }
+        await tx.inferenceCapacity.delete({ where: { id: input.id } });
+        await audit(tx, {
+          userId,
+          action: "DELETE",
+          resourceType: "INFERENCE_CAPACITY",
+          resourceId: input.id,
+          before: current,
+        });
+        return { success: true };
+      },
+      { isolationLevel: "Serializable" },
+    );
   }),
 
   updateDirectPolicy: protectedProcedure.input(directPolicy).handler(async ({ input, context }) => {
     enabled();
     const userId = context.session.user.id;
-    return prisma.$transaction(async (tx) => {
-      const target = await tx.executionTarget.findUnique({
-        where: { id: input.executionTargetId },
-        select: {
-          id: true,
-          userId: true,
-          inferenceCapacityId: true,
-          directPriority: true,
-          directConcurrencyLimit: true,
-          directReservedSlots: true,
-          directBorrowPolicy: true,
-          directWaitBudgetMs: true,
-          directContextCeiling: true,
-          directContextMargin: true,
-          InferenceCapacity: { select: { hardConcurrencyLimit: true } },
-        },
-      });
-      if (!target || target.userId !== userId) return notFound();
-      let hardConcurrencyLimit = target.InferenceCapacity?.hardConcurrencyLimit;
-      if (input.inferenceCapacityId) {
-        const capacity = await tx.inferenceCapacity.findUnique({
-          where: { id: input.inferenceCapacityId },
-          select: { userId: true, hardConcurrencyLimit: true },
+    return prisma.$transaction(
+      async (tx) => {
+        const target = await tx.executionTarget.findUnique({
+          where: { id: input.executionTargetId },
+          select: {
+            id: true,
+            userId: true,
+            inferenceCapacityId: true,
+            directPriority: true,
+            directConcurrencyLimit: true,
+            directReservedSlots: true,
+            directBorrowPolicy: true,
+            directWaitBudgetMs: true,
+            directContextCeiling: true,
+            directContextMargin: true,
+            InferenceCapacity: { select: { hardConcurrencyLimit: true } },
+            PoolMembers: {
+              select: {
+                capacityConcurrencyMode: true,
+                capacityConcurrencyLimit: true,
+                capacityReservedSlots: true,
+                ModelPool: {
+                  select: {
+                    capacityConcurrencyLimit: true,
+                    capacityReservedSlots: true,
+                  },
+                },
+              },
+            },
+          },
         });
-        if (!capacity || capacity.userId !== userId) return notFound();
-        hardConcurrencyLimit = capacity.hardConcurrencyLimit;
-      } else if (input.inferenceCapacityId === null) {
-        hardConcurrencyLimit = null;
-      }
-      assertPolicyWithinHardLimit({
-        hardLimit: hardConcurrencyLimit,
-        concurrencyLimit: input.directConcurrencyLimit ?? target.directConcurrencyLimit,
-        reservedSlots: input.directReservedSlots ?? target.directReservedSlots,
-      });
-      const { executionTargetId, ...data } = input;
-      const updated = await tx.executionTarget.update({ where: { id: executionTargetId }, data });
-      await audit(tx, {
-        userId,
-        action: "UPDATE_POLICY",
-        resourceType: "EXECUTION_TARGET",
-        resourceId: executionTargetId,
-        before: target,
-        after: data,
-      });
-      return updated;
-    });
+        if (!target || target.userId !== userId) return notFound();
+        let hardConcurrencyLimit = target.InferenceCapacity?.hardConcurrencyLimit;
+        if (input.inferenceCapacityId) {
+          const capacity = await tx.inferenceCapacity.findUnique({
+            where: { id: input.inferenceCapacityId },
+            select: { userId: true, hardConcurrencyLimit: true },
+          });
+          if (!capacity || capacity.userId !== userId) return notFound();
+          hardConcurrencyLimit = capacity.hardConcurrencyLimit;
+        } else if (input.inferenceCapacityId === null) {
+          hardConcurrencyLimit = null;
+        }
+        assertPolicyWithinHardLimit({
+          hardLimit: hardConcurrencyLimit,
+          concurrencyLimit: input.directConcurrencyLimit ?? target.directConcurrencyLimit,
+          reservedSlots: input.directReservedSlots ?? target.directReservedSlots,
+        });
+        // Attaching a target changes the physical ceiling for every pool that
+        // already references it. Validate both explicit member overrides and
+        // inherited pool policies before committing the attachment.
+        for (const member of target.PoolMembers ?? []) {
+          assertPolicyWithinHardLimit({
+            hardLimit: hardConcurrencyLimit,
+            concurrencyLimit:
+              member.capacityConcurrencyMode === "UNLIMITED"
+                ? null
+                : member.capacityConcurrencyMode === "LIMITED"
+                  ? member.capacityConcurrencyLimit
+                  : member.ModelPool.capacityConcurrencyLimit,
+            reservedSlots: member.capacityReservedSlots ?? member.ModelPool.capacityReservedSlots,
+          });
+        }
+        const { executionTargetId, ...data } = input;
+        const updated = await tx.executionTarget.update({ where: { id: executionTargetId }, data });
+        await audit(tx, {
+          userId,
+          action: "UPDATE_POLICY",
+          resourceType: "EXECUTION_TARGET",
+          resourceId: executionTargetId,
+          before: target,
+          after: data,
+        });
+        return updated;
+      },
+      { isolationLevel: "Serializable" },
+    );
   }),
 
   updatePoolPolicy: protectedProcedure
@@ -324,75 +411,120 @@ export const capacityManagementRouter = {
     .handler(async ({ input, context }) => {
       enabled();
       const userId = context.session.user.id;
-      return prisma.$transaction(async (tx) => {
-        const pool = await tx.modelPool.findUnique({
-          where: { id: input.modelPoolId },
-          select: {
-            id: true,
-            userId: true,
-            capacityPriority: true,
-            capacityConcurrencyLimit: true,
-            capacityReservedSlots: true,
-            capacityBorrowPolicy: true,
-            capacityWaitBudgetMs: true,
-            capacityContextCeiling: true,
-            capacityContextMargin: true,
-            protocolAdaptationEnabled: true,
-            allowLossyDeveloperRoleCollapse: true,
-            PoolMembers: {
-              select: {
-                capacityConcurrencyLimit: true,
-                capacityReservedSlots: true,
-                ExecutionTarget: {
-                  select: { InferenceCapacity: { select: { hardConcurrencyLimit: true } } },
+      return prisma.$transaction(
+        async (tx) => {
+          const pool = await tx.modelPool.findUnique({
+            where: { id: input.modelPoolId },
+            select: {
+              id: true,
+              userId: true,
+              capacityPriority: true,
+              capacityConcurrencyLimit: true,
+              capacityReservedSlots: true,
+              capacityBorrowPolicy: true,
+              capacityWaitBudgetMs: true,
+              capacityContextCeiling: true,
+              capacityContextMargin: true,
+              protocolAdaptationEnabled: true,
+              allowLossyDeveloperRoleCollapse: true,
+              PoolMembers: {
+                select: {
+                  capacityConcurrencyMode: true,
+                  capacityConcurrencyLimit: true,
+                  capacityReservedSlots: true,
+                  ExecutionTarget: {
+                    select: { InferenceCapacity: { select: { hardConcurrencyLimit: true } } },
+                  },
                 },
               },
             },
-          },
-        });
-        if (!pool || pool.userId !== userId) return notFound();
-        for (const member of pool.PoolMembers ?? []) {
-          assertPolicyWithinHardLimit({
-            hardLimit: member.ExecutionTarget?.InferenceCapacity?.hardConcurrencyLimit,
-            concurrencyLimit:
-              member.capacityConcurrencyLimit ??
-              input.capacityConcurrencyLimit ??
-              pool.capacityConcurrencyLimit,
-            reservedSlots:
-              member.capacityReservedSlots ??
-              input.capacityReservedSlots ??
-              pool.capacityReservedSlots,
           });
-        }
-        const { modelPoolId, ...data } = input;
-        const updated = await tx.modelPool.update({ where: { id: modelPoolId }, data });
-        await audit(tx, {
-          userId,
-          action: "UPDATE_POLICY",
-          resourceType: "MODEL_POOL",
-          resourceId: modelPoolId,
-          before: pool,
-          after: data,
-        });
-        return updated;
-      });
+          if (!pool || pool.userId !== userId) return notFound();
+          for (const member of pool.PoolMembers ?? []) {
+            assertPolicyWithinHardLimit({
+              hardLimit: member.ExecutionTarget?.InferenceCapacity?.hardConcurrencyLimit,
+              concurrencyLimit:
+                member.capacityConcurrencyMode === "UNLIMITED"
+                  ? null
+                  : member.capacityConcurrencyMode === "LIMITED"
+                    ? member.capacityConcurrencyLimit
+                    : (input.capacityConcurrencyLimit ?? pool.capacityConcurrencyLimit),
+              reservedSlots:
+                member.capacityReservedSlots ??
+                input.capacityReservedSlots ??
+                pool.capacityReservedSlots,
+            });
+          }
+          const { modelPoolId, ...data } = input;
+          const updated = await tx.modelPool.update({ where: { id: modelPoolId }, data });
+          await audit(tx, {
+            userId,
+            action: "UPDATE_POLICY",
+            resourceType: "MODEL_POOL",
+            resourceId: modelPoolId,
+            before: pool,
+            after: data,
+          });
+          return updated;
+        },
+        { isolationLevel: "Serializable" },
+      );
     }),
 
-  updateMemberPolicy: protectedProcedure
-    .input(z.object({ poolMemberId: id, ...sharedPolicyFields }))
-    .handler(async ({ input, context }) => {
-      enabled();
-      const userId = context.session.user.id;
-      return prisma.$transaction(async (tx) => {
+  updateMemberPolicy: protectedProcedure.input(memberPolicy).handler(async ({ input, context }) => {
+    enabled();
+    const userId = context.session.user.id;
+    const normalizedInput = {
+      ...input,
+      capacityConcurrencyLimit:
+        input.capacityConcurrencyMode !== undefined && input.capacityConcurrencyMode !== "LIMITED"
+          ? null
+          : input.capacityConcurrencyLimit,
+      capacityConcurrencyMode:
+        input.capacityConcurrencyMode ??
+        (input.capacityConcurrencyLimit !== undefined
+          ? input.capacityConcurrencyLimit === null
+            ? ("INHERIT" as const)
+            : ("LIMITED" as const)
+          : undefined),
+      capacityWaitBudgetMode:
+        input.capacityWaitBudgetMode ??
+        (input.capacityWaitBudgetMs !== undefined
+          ? input.capacityWaitBudgetMs === null
+            ? ("INHERIT" as const)
+            : ("LIMITED" as const)
+          : undefined),
+      capacityWaitBudgetMs:
+        input.capacityWaitBudgetMode !== undefined && input.capacityWaitBudgetMode !== "LIMITED"
+          ? null
+          : input.capacityWaitBudgetMs,
+      capacityContextCeilingMode:
+        input.capacityContextCeilingMode ??
+        (input.capacityContextCeiling !== undefined
+          ? input.capacityContextCeiling === null
+            ? ("INHERIT" as const)
+            : ("LIMITED" as const)
+          : undefined),
+      capacityContextCeiling:
+        input.capacityContextCeilingMode !== undefined &&
+        input.capacityContextCeilingMode !== "LIMITED"
+          ? null
+          : input.capacityContextCeiling,
+    };
+    return prisma.$transaction(
+      async (tx) => {
         const member = await tx.poolMember.findUnique({
           where: { id: input.poolMemberId },
           select: {
             id: true,
             capacityPriority: true,
+            capacityConcurrencyMode: true,
             capacityConcurrencyLimit: true,
             capacityReservedSlots: true,
             capacityBorrowPolicy: true,
+            capacityWaitBudgetMode: true,
             capacityWaitBudgetMs: true,
+            capacityContextCeilingMode: true,
             capacityContextCeiling: true,
             capacityContextMargin: true,
             ModelPool: {
@@ -408,9 +540,11 @@ export const capacityManagementRouter = {
           },
         });
         if (!member || member.ModelPool.userId !== userId) return notFound();
+        const nextConcurrencyMode =
+          normalizedInput.capacityConcurrencyMode ?? member.capacityConcurrencyMode;
         const nextConcurrency =
-          input.capacityConcurrencyLimit !== undefined
-            ? input.capacityConcurrencyLimit
+          normalizedInput.capacityConcurrencyLimit !== undefined
+            ? normalizedInput.capacityConcurrencyLimit
             : member.capacityConcurrencyLimit;
         const nextReserved =
           input.capacityReservedSlots !== undefined
@@ -418,10 +552,15 @@ export const capacityManagementRouter = {
             : member.capacityReservedSlots;
         assertPolicyWithinHardLimit({
           hardLimit: member.ExecutionTarget?.InferenceCapacity?.hardConcurrencyLimit,
-          concurrencyLimit: nextConcurrency ?? member.ModelPool.capacityConcurrencyLimit,
+          concurrencyLimit:
+            nextConcurrencyMode === "UNLIMITED"
+              ? null
+              : nextConcurrencyMode === "LIMITED"
+                ? nextConcurrency
+                : member.ModelPool.capacityConcurrencyLimit,
           reservedSlots: nextReserved ?? member.ModelPool.capacityReservedSlots,
         });
-        const { poolMemberId, ...data } = input;
+        const { poolMemberId, ...data } = normalizedInput;
         const updated = await tx.poolMember.update({ where: { id: poolMemberId }, data });
         await audit(tx, {
           userId,
@@ -432,6 +571,8 @@ export const capacityManagementRouter = {
           after: data,
         });
         return updated;
-      });
-    }),
+      },
+      { isolationLevel: "Serializable" },
+    );
+  }),
 };

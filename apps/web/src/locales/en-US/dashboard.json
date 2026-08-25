@@ -190,17 +190,27 @@
       "memberPolicy": "Capacity attachment and overrides",
       "directPolicy": "Direct model capacity policy",
       "policyUpdated": "Capacity policy updated",
+      "directGlobalEffect": "These settings apply to every direct request sent to this execution target, not only this model entry.",
+      "attachmentGlobalEffect": "Changing the shared capacity attachment changes admission for this execution target everywhere it is used.",
       "attachment": "Shared capacity",
       "unattached": "Not attached",
       "borrowIdle": "Borrow only while reserved capacity is idle",
       "borrowNever": "Never borrow reserved capacity",
       "save": "Save capacity",
+      "limitValue": "Limit value",
+      "modes": {
+        "inherit": "Inherit pool policy",
+        "limited": "Limited",
+        "unlimited": "Unlimited",
+        "override": "Override"
+      },
       "fields": {
         "label": "Capacity name",
         "runtimeModel": "Runtime model",
         "runtimeIdentityKey": "Runtime identity",
         "hardConcurrencyLimit": "Physical concurrency",
         "directConcurrencyLimit": "Direct concurrency ceiling",
+        "capacityConcurrencyLimit": "Member concurrency ceiling",
         "physicalMaxContext": "Maximum context tokens",
         "countStrategy": "Context counting",
         "runtimeRevision": "Runtime revision (optional)",
@@ -215,9 +225,11 @@
       },
       "strategies": {
         "estimate": "Conservative estimate",
-        "engine": "Engine reported",
-        "tokenizer": "Matching tokenizer",
-        "template": "Tokenizer and prompt template"
+        "engine": "Use engine-reported count when available",
+        "tokenizer": "Use a matching registered tokenizer",
+        "template": "Use a matching registered tokenizer and template",
+        "engineRequirement": "Requires count-token support on the selected target. WSMP uses a conservative estimate when that support is unavailable.",
+        "registeredRequirement": "Requires a registered counter matching this runtime identity. WSMP uses a conservative estimate when no match is available."
       }
     },
     "allowLossyDeveloperRoleCollapse": "Allow lossy developer-role collapse",

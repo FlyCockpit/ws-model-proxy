@@ -45,9 +45,10 @@ import { WideContent } from "@/components/wide-content";
 import {
   capacityFormSchema,
   capacityMutationPayload,
-  createMemberFollowUps,
   directPolicyIsValid,
   directPolicyPayload,
+  type FiniteLimitMode,
+  memberPolicyPayload,
   newCapacityDefaults,
 } from "@/lib/capacity-forms";
 import { orpc } from "@/utils/orpc";
@@ -960,9 +961,18 @@ function DirectCapacityPolicyForm({
   const queryClient = useQueryClient();
   const [capacityId, setCapacityId] = useState(target.inferenceCapacityId ?? "");
   const [priority, setPriority] = useState(String(target.directPriority));
+  const [concurrencyMode, setConcurrencyMode] = useState<FiniteLimitMode>(
+    target.directConcurrencyLimit === null ? "UNLIMITED" : "LIMITED",
+  );
   const [concurrency, setConcurrency] = useState(String(target.directConcurrencyLimit ?? 1));
   const [reserved, setReserved] = useState(String(target.directReservedSlots));
+  const [waitMode, setWaitMode] = useState<FiniteLimitMode>(
+    target.directWaitBudgetMs === null ? "UNLIMITED" : "LIMITED",
+  );
   const [wait, setWait] = useState(String(target.directWaitBudgetMs ?? 30_000));
+  const [ceilingMode, setCeilingMode] = useState<FiniteLimitMode>(
+    target.directContextCeiling === null ? "UNLIMITED" : "LIMITED",
+  );
   const [ceiling, setCeiling] = useState(String(target.directContextCeiling ?? 32_768));
   const [margin, setMargin] = useState(String(target.directContextMargin));
   const [borrow, setBorrow] = useState<"NEVER" | "WHEN_IDLE">(
@@ -988,6 +998,9 @@ function DirectCapacityPolicyForm({
     hardLimit: capacityId
       ? (capacities.find((capacity) => capacity.id === capacityId)?.hardConcurrencyLimit ?? null)
       : null,
+    concurrencyMode,
+    waitMode,
+    ceilingMode,
   });
   return (
     <form
@@ -1006,10 +1019,16 @@ function DirectCapacityPolicyForm({
             ceiling,
             margin,
             borrow,
+            concurrencyMode,
+            waitMode,
+            ceilingMode,
           }),
         );
       }}
     >
+      <p className="text-sm text-muted-foreground">
+        {t("dashboard:pools.capacity.directGlobalEffect")}
+      </p>
       <div className="space-y-2">
         <Label htmlFor="direct-capacity">{t("dashboard:pools.capacity.attachment")}</Label>
         <select
@@ -1028,10 +1047,7 @@ function DirectCapacityPolicyForm({
       </div>
       {[
         ["direct-priority", "capacityPriority", priority, setPriority, 0, 31],
-        ["direct-concurrency", "hardConcurrencyLimit", concurrency, setConcurrency, 1],
         ["direct-reserved", "capacityReservedSlots", reserved, setReserved, 0],
-        ["direct-wait", "capacityWaitBudgetMs", wait, setWait, 0],
-        ["direct-ceiling", "capacityContextCeiling", ceiling, setCeiling, 1],
         ["direct-margin", "capacityContextMargin", margin, setMargin, 0],
       ].map(([id, label, value, setter, min, max]) => (
         <div key={String(id)} className="space-y-2">
@@ -1047,6 +1063,57 @@ function DirectCapacityPolicyForm({
               (setter as React.Dispatch<React.SetStateAction<string>>)(event.target.value)
             }
           />
+        </div>
+      ))}
+      {(
+        [
+          [
+            "direct-concurrency",
+            "hardConcurrencyLimit",
+            concurrencyMode,
+            setConcurrencyMode,
+            concurrency,
+            setConcurrency,
+            1,
+          ],
+          ["direct-wait", "capacityWaitBudgetMs", waitMode, setWaitMode, wait, setWait, 0],
+          [
+            "direct-ceiling",
+            "capacityContextCeiling",
+            ceilingMode,
+            setCeilingMode,
+            ceiling,
+            setCeiling,
+            1,
+          ],
+        ] as const
+      ).map(([id, label, mode, setMode, value, setValue, min]) => (
+        <div key={id} className="grid min-w-0 gap-2 sm:grid-cols-[minmax(0,0.7fr)_minmax(0,1fr)]">
+          <div className="space-y-2">
+            <Label htmlFor={`${id}-mode`}>{t(`dashboard:pools.capacity.fields.${label}`)}</Label>
+            <select
+              id={`${id}-mode`}
+              className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+              value={mode}
+              onChange={(event) => setMode(event.target.value as FiniteLimitMode)}
+            >
+              <option value="LIMITED">{t("dashboard:pools.capacity.modes.limited")}</option>
+              <option value="UNLIMITED">{t("dashboard:pools.capacity.modes.unlimited")}</option>
+            </select>
+          </div>
+          {mode === "LIMITED" ? (
+            <div className="space-y-2">
+              <Label htmlFor={id}>{t("dashboard:pools.capacity.limitValue")}</Label>
+              <Input
+                id={id}
+                className="min-h-11"
+                type="number"
+                min={min}
+                value={value}
+                onChange={(event) => setValue(event.target.value)}
+              />
+            </div>
+          ) : null}
         </div>
       ))}
       <div className="space-y-2">
@@ -1735,8 +1802,18 @@ function CapacitySetupForm({
       label: capacity?.label ?? newCapacityDefaults.label,
       runtimeModel: capacity?.runtimeModel ?? newCapacityDefaults.runtimeModel,
       runtimeIdentityKey: capacity?.runtimeIdentityKey ?? newCapacityDefaults.runtimeIdentityKey,
+      hardConcurrencyMode: capacity
+        ? capacity.hardConcurrencyLimit === null
+          ? "UNLIMITED"
+          : "LIMITED"
+        : newCapacityDefaults.hardConcurrencyMode,
       hardConcurrencyLimit:
         capacity?.hardConcurrencyLimit ?? newCapacityDefaults.hardConcurrencyLimit,
+      physicalMaxContextMode: capacity
+        ? capacity.physicalMaxContext === null
+          ? "UNLIMITED"
+          : "LIMITED"
+        : newCapacityDefaults.physicalMaxContextMode,
       physicalMaxContext: capacity?.physicalMaxContext ?? newCapacityDefaults.physicalMaxContext,
       countStrategy: (capacity?.countStrategy ?? newCapacityDefaults.countStrategy) as
         | "CONSERVATIVE_ESTIMATE"
@@ -1785,27 +1862,53 @@ function CapacitySetupForm({
         {textField("label")}
         {textField("runtimeModel")}
         <div className="sm:col-span-2">{textField("runtimeIdentityKey")}</div>
-        {(["hardConcurrencyLimit", "physicalMaxContext"] as const).map((name) => (
-          <form.Field key={name} name={name}>
-            {(field) => (
-              <div className="space-y-2">
-                <Label htmlFor={`capacity-${field.name}`}>
-                  {t(`dashboard:pools.capacity.fields.${field.name}`)}
-                </Label>
-                <Input
-                  id={`capacity-${field.name}`}
-                  className="min-h-11"
-                  type="number"
-                  min={1}
-                  inputMode="numeric"
-                  value={field.state.value}
-                  onBlur={field.handleBlur}
-                  onChange={(event) => field.handleChange(Number(event.target.value))}
-                />
-              </div>
-            )}
-          </form.Field>
-        ))}
+        {(["hardConcurrency", "physicalMaxContext"] as const).map((kind) => {
+          const modeName =
+            kind === "hardConcurrency" ? "hardConcurrencyMode" : "physicalMaxContextMode";
+          const valueName =
+            kind === "hardConcurrency" ? "hardConcurrencyLimit" : "physicalMaxContext";
+          return (
+            <form.Field key={kind} name={modeName}>
+              {(modeField) => (
+                <div className="min-w-0 space-y-2">
+                  <Label htmlFor={`capacity-${valueName}-mode`}>
+                    {t(`dashboard:pools.capacity.fields.${valueName}`)}
+                  </Label>
+                  <select
+                    id={`capacity-${valueName}-mode`}
+                    className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+                    value={modeField.state.value}
+                    onChange={(event) =>
+                      modeField.handleChange(event.target.value as FiniteLimitMode)
+                    }
+                  >
+                    <option value="LIMITED">{t("dashboard:pools.capacity.modes.limited")}</option>
+                    <option value="UNLIMITED">
+                      {t("dashboard:pools.capacity.modes.unlimited")}
+                    </option>
+                  </select>
+                  {modeField.state.value === "LIMITED" ? (
+                    <form.Field name={valueName}>
+                      {(field) => (
+                        <Input
+                          id={`capacity-${field.name}`}
+                          className="min-h-11"
+                          type="number"
+                          min={1}
+                          inputMode="numeric"
+                          value={field.state.value}
+                          onBlur={field.handleBlur}
+                          onChange={(event) => field.handleChange(Number(event.target.value))}
+                          aria-label={t("dashboard:pools.capacity.limitValue")}
+                        />
+                      )}
+                    </form.Field>
+                  ) : null}
+                </div>
+              )}
+            </form.Field>
+          );
+        })}
       </div>
       <p className="text-sm text-muted-foreground">{t("dashboard:pools.capacity.safeDefaults")}</p>
       <details className="rounded-md border p-3">
@@ -1840,6 +1943,15 @@ function CapacitySetupForm({
                     {t("dashboard:pools.capacity.strategies.template")}
                   </option>
                 </select>
+                {field.state.value === "ENGINE_REPORTED" ? (
+                  <p className="text-xs text-muted-foreground">
+                    {t("dashboard:pools.capacity.strategies.engineRequirement")}
+                  </p>
+                ) : field.state.value === "TOKENIZER" || field.state.value === "TEMPLATE_AWARE" ? (
+                  <p className="text-xs text-muted-foreground">
+                    {t("dashboard:pools.capacity.strategies.registeredRequirement")}
+                  </p>
+                ) : null}
               </div>
             )}
           </form.Field>
@@ -1939,8 +2051,12 @@ function PoolForm({
       "OPENAI_COMPLETIONS",
     ]),
     capacityPriority: z.number().int().min(0).max(31),
+    capacityConcurrencyMode: z.enum(["LIMITED", "UNLIMITED"]),
+    capacityConcurrencyLimit: z.number().int().min(1).max(10_000),
     capacityReservedSlots: z.number().int().min(0).max(10_000),
+    capacityWaitBudgetMode: z.enum(["LIMITED", "UNLIMITED"]),
     capacityWaitBudgetMs: z.number().int().min(0).max(600_000),
+    capacityContextCeilingMode: z.enum(["LIMITED", "UNLIMITED"]),
     capacityContextCeiling: z.number().int().min(1).max(100_000_000),
     capacityContextMargin: z.number().int().min(0).max(100_000_000),
     capacityBorrowPolicy: z.enum(["NEVER", "WHEN_IDLE"]),
@@ -1991,8 +2107,18 @@ function PoolForm({
       allowLossyDeveloperRoleCollapse: pool?.allowLossyDeveloperRoleCollapse ?? false,
       recommendedSurfaceOverride: pool?.recommendedSurfaceOverride ?? "",
       capacityPriority: pool?.capacityPriority ?? 16,
+      capacityConcurrencyMode: (pool?.capacityConcurrencyLimit === null
+        ? "UNLIMITED"
+        : "LIMITED") as FiniteLimitMode,
+      capacityConcurrencyLimit: pool?.capacityConcurrencyLimit ?? 1,
       capacityReservedSlots: pool?.capacityReservedSlots ?? 0,
+      capacityWaitBudgetMode: (pool?.capacityWaitBudgetMs === null
+        ? "UNLIMITED"
+        : "LIMITED") as FiniteLimitMode,
       capacityWaitBudgetMs: pool?.capacityWaitBudgetMs ?? 30_000,
+      capacityContextCeilingMode: (pool?.capacityContextCeiling === null
+        ? "UNLIMITED"
+        : "LIMITED") as FiniteLimitMode,
       capacityContextCeiling: pool?.capacityContextCeiling ?? 32_768,
       capacityContextMargin: pool?.capacityContextMargin ?? 1_024,
       capacityBorrowPolicy: (pool?.capacityBorrowPolicy === "NEVER" ? "NEVER" : "WHEN_IDLE") as
@@ -2064,9 +2190,13 @@ function PoolForm({
         await updatePoolPolicy.mutateAsync({
           modelPoolId: pool.id,
           capacityPriority: value.capacityPriority,
+          capacityConcurrencyLimit:
+            value.capacityConcurrencyMode === "LIMITED" ? value.capacityConcurrencyLimit : null,
           capacityReservedSlots: value.capacityReservedSlots,
-          capacityWaitBudgetMs: value.capacityWaitBudgetMs,
-          capacityContextCeiling: value.capacityContextCeiling,
+          capacityWaitBudgetMs:
+            value.capacityWaitBudgetMode === "LIMITED" ? value.capacityWaitBudgetMs : null,
+          capacityContextCeiling:
+            value.capacityContextCeilingMode === "LIMITED" ? value.capacityContextCeiling : null,
           capacityContextMargin: value.capacityContextMargin,
           capacityBorrowPolicy: value.capacityBorrowPolicy,
           protocolAdaptationEnabled: value.protocolAdaptationEnabled,
@@ -2196,28 +2326,66 @@ function PoolForm({
             {t("dashboard:pools.capacity.poolPolicyHint", { count: capacities.length })}
           </p>
           <div className="grid gap-4 sm:grid-cols-2">
+            {(["capacityPriority", "capacityReservedSlots", "capacityContextMargin"] as const).map(
+              (name) => (
+                <form.Field key={name} name={name}>
+                  {(field) => (
+                    <div className="space-y-2">
+                      <Label htmlFor={name}>{t(`dashboard:pools.capacity.fields.${name}`)}</Label>
+                      <Input
+                        id={name}
+                        className="min-h-11"
+                        type="number"
+                        value={field.state.value}
+                        min={0}
+                        max={name === "capacityPriority" ? 31 : undefined}
+                        onChange={(event) => field.handleChange(Number(event.target.value))}
+                      />
+                    </div>
+                  )}
+                </form.Field>
+              ),
+            )}
             {(
               [
-                "capacityPriority",
-                "capacityReservedSlots",
-                "capacityWaitBudgetMs",
-                "capacityContextCeiling",
-                "capacityContextMargin",
+                ["capacityConcurrencyMode", "capacityConcurrencyLimit"],
+                ["capacityWaitBudgetMode", "capacityWaitBudgetMs"],
+                ["capacityContextCeilingMode", "capacityContextCeiling"],
               ] as const
-            ).map((name) => (
-              <form.Field key={name} name={name}>
-                {(field) => (
-                  <div className="space-y-2">
-                    <Label htmlFor={name}>{t(`dashboard:pools.capacity.fields.${name}`)}</Label>
-                    <Input
-                      id={name}
-                      className="min-h-11"
-                      type="number"
-                      value={field.state.value}
-                      min={name === "capacityContextCeiling" ? 1 : 0}
-                      max={name === "capacityPriority" ? 31 : undefined}
-                      onChange={(event) => field.handleChange(Number(event.target.value))}
-                    />
+            ).map(([modeName, valueName]) => (
+              <form.Field key={modeName} name={modeName}>
+                {(modeField) => (
+                  <div className="min-w-0 space-y-2">
+                    <Label htmlFor={modeName}>
+                      {t(`dashboard:pools.capacity.fields.${valueName}`)}
+                    </Label>
+                    <select
+                      id={modeName}
+                      className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+                      value={modeField.state.value}
+                      onChange={(event) =>
+                        modeField.handleChange(event.target.value as FiniteLimitMode)
+                      }
+                    >
+                      <option value="LIMITED">{t("dashboard:pools.capacity.modes.limited")}</option>
+                      <option value="UNLIMITED">
+                        {t("dashboard:pools.capacity.modes.unlimited")}
+                      </option>
+                    </select>
+                    {modeField.state.value === "LIMITED" ? (
+                      <form.Field name={valueName}>
+                        {(field) => (
+                          <Input
+                            className="min-h-11"
+                            type="number"
+                            min={valueName === "capacityWaitBudgetMs" ? 0 : 1}
+                            value={field.state.value}
+                            onChange={(event) => field.handleChange(Number(event.target.value))}
+                            aria-label={t("dashboard:pools.capacity.limitValue")}
+                          />
+                        )}
+                      </form.Field>
+                    ) : null}
                   </div>
                 )}
               </form.Field>
@@ -2546,6 +2714,59 @@ function PoolForm({
   );
 }
 
+function CapacityPolicyModeField({
+  id,
+  label,
+  mode,
+  onModeChange,
+  options,
+  value,
+  onValueChange,
+  min = 0,
+  max,
+}: {
+  id: string;
+  label: string;
+  mode: string;
+  onModeChange: (mode: string) => void;
+  options: Array<{ value: string; label: string }>;
+  value?: string;
+  onValueChange?: (value: string) => void;
+  min?: number;
+  max?: number;
+}) {
+  const showsValue = mode === "LIMITED" || mode === "OVERRIDE";
+  return (
+    <div className="min-w-0 space-y-2">
+      <Label htmlFor={`${id}-mode`}>{label}</Label>
+      <select
+        id={`${id}-mode`}
+        className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+        value={mode}
+        onChange={(event) => onModeChange(event.target.value)}
+      >
+        {options.map((option) => (
+          <option key={option.value} value={option.value}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+      {showsValue && value !== undefined && onValueChange ? (
+        <Input
+          id={id}
+          className="min-h-11"
+          type="number"
+          min={min}
+          max={max}
+          value={value}
+          onChange={(event) => onValueChange(event.target.value)}
+          aria-label={label}
+        />
+      ) : null}
+    </div>
+  );
+}
+
 function PoolMemberForm({
   mode,
   poolId,
@@ -2569,11 +2790,37 @@ function PoolMemberForm({
     routingStatusValue(member?.routingStatus),
   );
   const [capacityId, setCapacityId] = useState(member?.inferenceCapacityId ?? "");
+  const [priorityMode, setPriorityMode] = useState<"INHERIT" | "OVERRIDE">(
+    member?.capacityPriority == null ? "INHERIT" : "OVERRIDE",
+  );
   const [priority, setPriority] = useState(String(member?.capacityPriority ?? 16));
+  const [concurrencyMode, setConcurrencyMode] = useState<"INHERIT" | "LIMITED" | "UNLIMITED">(
+    member?.capacityConcurrencyMode ?? "INHERIT",
+  );
+  const [concurrency, setConcurrency] = useState(String(member?.capacityConcurrencyLimit ?? 1));
+  const [reservedMode, setReservedMode] = useState<"INHERIT" | "OVERRIDE">(
+    member?.capacityReservedSlots == null ? "INHERIT" : "OVERRIDE",
+  );
   const [reservedSlots, setReservedSlots] = useState(String(member?.capacityReservedSlots ?? 0));
+  const [waitMode, setWaitMode] = useState<"INHERIT" | "LIMITED" | "UNLIMITED">(
+    member?.capacityWaitBudgetMode ?? "INHERIT",
+  );
   const [waitBudget, setWaitBudget] = useState(String(member?.capacityWaitBudgetMs ?? 30_000));
+  const [ceilingMode, setCeilingMode] = useState<"INHERIT" | "LIMITED" | "UNLIMITED">(
+    member?.capacityContextCeilingMode ?? "INHERIT",
+  );
   const [contextCeiling, setContextCeiling] = useState(
     String(member?.capacityContextCeiling ?? 32_768),
+  );
+  const [marginMode, setMarginMode] = useState<"INHERIT" | "LIMITED">(
+    member?.capacityContextMargin == null ? "INHERIT" : "LIMITED",
+  );
+  const [contextMargin, setContextMargin] = useState(String(member?.capacityContextMargin ?? 0));
+  const [borrowMode, setBorrowMode] = useState<"INHERIT" | "OVERRIDE">(
+    member?.capacityBorrowPolicy == null ? "INHERIT" : "OVERRIDE",
+  );
+  const [borrow, setBorrow] = useState<"NEVER" | "WHEN_IDLE">(
+    member?.capacityBorrowPolicy === "NEVER" ? "NEVER" : "WHEN_IDLE",
   );
   const selectId = useId();
   const createMember = useMutation(
@@ -2598,21 +2845,31 @@ function PoolMemberForm({
   const attachCapacity = useMutation(orpc.capacityManagement.updateDirectPolicy.mutationOptions());
   const isPending = createMember.isPending || updateMember.isPending;
   const parsedWeight = Number.parseInt(weight, 10);
+  const hardLimit = capacityId
+    ? (capacities.find((capacity) => capacity.id === capacityId)?.hardConcurrencyLimit ?? null)
+    : null;
+  const memberPolicyValid =
+    (priorityMode === "INHERIT" ||
+      (Number.isInteger(Number(priority)) && Number(priority) >= 0 && Number(priority) <= 31)) &&
+    (concurrencyMode !== "LIMITED" ||
+      (Number.isInteger(Number(concurrency)) &&
+        Number(concurrency) > 0 &&
+        (hardLimit === null || Number(concurrency) <= hardLimit))) &&
+    (reservedMode === "INHERIT" ||
+      (Number.isInteger(Number(reservedSlots)) &&
+        Number(reservedSlots) >= 0 &&
+        (hardLimit === null || Number(reservedSlots) <= hardLimit))) &&
+    (waitMode !== "LIMITED" || (Number.isInteger(Number(waitBudget)) && Number(waitBudget) > 0)) &&
+    (ceilingMode !== "LIMITED" ||
+      (Number.isInteger(Number(contextCeiling)) && Number(contextCeiling) > 0)) &&
+    (marginMode === "INHERIT" ||
+      (Number.isInteger(Number(contextMargin)) && Number(contextMargin) >= 0));
   const canSubmit =
     Number.isInteger(parsedWeight) &&
     parsedWeight >= 0 &&
     parsedWeight <= 10_000 &&
     (mode === "edit" || discoveredModelId.length > 0) &&
-    (mode !== "edit" ||
-      (Number.isInteger(Number(priority)) &&
-        Number(priority) >= 0 &&
-        Number(priority) <= 31 &&
-        Number.isInteger(Number(reservedSlots)) &&
-        Number(reservedSlots) >= 0 &&
-        Number.isInteger(Number(waitBudget)) &&
-        Number(waitBudget) >= 0 &&
-        Number.isInteger(Number(contextCeiling)) &&
-        Number(contextCeiling) > 0));
+    memberPolicyValid;
 
   return (
     <form
@@ -2627,29 +2884,53 @@ function PoolMemberForm({
             weight: parsedWeight,
             routingStatus,
           });
-          const followUps = createMemberFollowUps({
-            memberId: created.id,
+          await updateMemberPolicy.mutateAsync(
+            memberPolicyPayload({
+              poolMemberId: created.id,
+              priority,
+              concurrency,
+              reserved: reservedSlots,
+              wait: waitBudget,
+              ceiling: contextCeiling,
+              margin: contextMargin,
+              borrow,
+              priorityMode,
+              concurrencyMode,
+              reservedMode,
+              waitMode,
+              ceilingMode,
+              marginMode,
+              borrowMode,
+            }),
+          );
+          await attachCapacity.mutateAsync({
             executionTargetId: created.executionTargetId,
-            capacityId,
-            priority,
-            reserved: reservedSlots,
-            wait: waitBudget,
-            ceiling: contextCeiling,
+            inferenceCapacityId: capacityId || null,
           });
-          await updateMemberPolicy.mutateAsync(followUps[0].input);
-          await attachCapacity.mutateAsync(followUps[1].input);
           queryClient.invalidateQueries({ queryKey: orpc.capacityManagement.key() });
           onSuccess();
         }
         if (mode === "edit" && member) {
           await updateMember.mutateAsync({ id: member.id, weight: parsedWeight, routingStatus });
-          await updateMemberPolicy.mutateAsync({
-            poolMemberId: member.id,
-            capacityPriority: Number(priority),
-            capacityReservedSlots: Number(reservedSlots),
-            capacityWaitBudgetMs: Number(waitBudget),
-            capacityContextCeiling: Number(contextCeiling),
-          });
+          await updateMemberPolicy.mutateAsync(
+            memberPolicyPayload({
+              poolMemberId: member.id,
+              priority,
+              concurrency,
+              reserved: reservedSlots,
+              wait: waitBudget,
+              ceiling: contextCeiling,
+              margin: contextMargin,
+              borrow,
+              priorityMode,
+              concurrencyMode,
+              reservedMode,
+              waitMode,
+              ceilingMode,
+              marginMode,
+              borrowMode,
+            }),
+          );
           if (member.executionTargetId) {
             await attachCapacity.mutateAsync({
               executionTargetId: member.executionTargetId,
@@ -2719,28 +3000,114 @@ function PoolMemberForm({
                 </option>
               ))}
             </select>
+            <p className="text-xs text-muted-foreground">
+              {t("dashboard:pools.capacity.attachmentGlobalEffect")}
+            </p>
           </div>
-          {[
-            ["member-priority", priority, setPriority, "capacityPriority", 0, 31],
-            ["member-reserved", reservedSlots, setReservedSlots, "capacityReservedSlots", 0],
-            ["member-wait", waitBudget, setWaitBudget, "capacityWaitBudgetMs", 0],
-            ["member-context", contextCeiling, setContextCeiling, "capacityContextCeiling", 1],
-          ].map(([id, value, setter, label, min, max]) => (
-            <div key={String(id)} className="space-y-2">
-              <Label htmlFor={String(id)}>{t(`dashboard:pools.capacity.fields.${label}`)}</Label>
-              <Input
-                id={String(id)}
-                className="min-h-11"
-                type="number"
-                min={Number(min)}
-                max={max == null ? undefined : Number(max)}
-                value={String(value)}
-                onChange={(event) =>
-                  (setter as React.Dispatch<React.SetStateAction<string>>)(event.target.value)
-                }
-              />
-            </div>
-          ))}
+          <CapacityPolicyModeField
+            id="member-priority"
+            label={t("dashboard:pools.capacity.fields.capacityPriority")}
+            mode={priorityMode}
+            onModeChange={(value) => setPriorityMode(value as typeof priorityMode)}
+            options={[
+              { value: "INHERIT", label: t("dashboard:pools.capacity.modes.inherit") },
+              { value: "OVERRIDE", label: t("dashboard:pools.capacity.modes.override") },
+            ]}
+            value={priority}
+            onValueChange={setPriority}
+            max={31}
+          />
+          <CapacityPolicyModeField
+            id="member-concurrency"
+            label={t("dashboard:pools.capacity.fields.capacityConcurrencyLimit")}
+            mode={concurrencyMode}
+            onModeChange={(value) => setConcurrencyMode(value as typeof concurrencyMode)}
+            options={[
+              { value: "INHERIT", label: t("dashboard:pools.capacity.modes.inherit") },
+              { value: "LIMITED", label: t("dashboard:pools.capacity.modes.limited") },
+              { value: "UNLIMITED", label: t("dashboard:pools.capacity.modes.unlimited") },
+            ]}
+            value={concurrency}
+            onValueChange={setConcurrency}
+            min={1}
+          />
+          <CapacityPolicyModeField
+            id="member-reserved"
+            label={t("dashboard:pools.capacity.fields.capacityReservedSlots")}
+            mode={reservedMode}
+            onModeChange={(value) => setReservedMode(value as typeof reservedMode)}
+            options={[
+              { value: "INHERIT", label: t("dashboard:pools.capacity.modes.inherit") },
+              { value: "OVERRIDE", label: t("dashboard:pools.capacity.modes.override") },
+            ]}
+            value={reservedSlots}
+            onValueChange={setReservedSlots}
+          />
+          <CapacityPolicyModeField
+            id="member-wait"
+            label={t("dashboard:pools.capacity.fields.capacityWaitBudgetMs")}
+            mode={waitMode}
+            onModeChange={(value) => setWaitMode(value as typeof waitMode)}
+            options={[
+              { value: "INHERIT", label: t("dashboard:pools.capacity.modes.inherit") },
+              { value: "LIMITED", label: t("dashboard:pools.capacity.modes.limited") },
+              { value: "UNLIMITED", label: t("dashboard:pools.capacity.modes.unlimited") },
+            ]}
+            value={waitBudget}
+            onValueChange={setWaitBudget}
+            min={1}
+          />
+          <CapacityPolicyModeField
+            id="member-context"
+            label={t("dashboard:pools.capacity.fields.capacityContextCeiling")}
+            mode={ceilingMode}
+            onModeChange={(value) => setCeilingMode(value as typeof ceilingMode)}
+            options={[
+              { value: "INHERIT", label: t("dashboard:pools.capacity.modes.inherit") },
+              { value: "LIMITED", label: t("dashboard:pools.capacity.modes.limited") },
+              { value: "UNLIMITED", label: t("dashboard:pools.capacity.modes.unlimited") },
+            ]}
+            value={contextCeiling}
+            onValueChange={setContextCeiling}
+            min={1}
+          />
+          <CapacityPolicyModeField
+            id="member-margin"
+            label={t("dashboard:pools.capacity.fields.capacityContextMargin")}
+            mode={marginMode}
+            onModeChange={(value) => setMarginMode(value as typeof marginMode)}
+            options={[
+              { value: "INHERIT", label: t("dashboard:pools.capacity.modes.inherit") },
+              { value: "LIMITED", label: t("dashboard:pools.capacity.modes.limited") },
+            ]}
+            value={contextMargin}
+            onValueChange={setContextMargin}
+          />
+          <div className="min-w-0 space-y-2">
+            <Label htmlFor="member-borrow-mode">
+              {t("dashboard:pools.capacity.fields.capacityBorrowPolicy")}
+            </Label>
+            <select
+              id="member-borrow-mode"
+              className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+              value={borrowMode}
+              onChange={(event) => setBorrowMode(event.target.value as typeof borrowMode)}
+            >
+              <option value="INHERIT">{t("dashboard:pools.capacity.modes.inherit")}</option>
+              <option value="OVERRIDE">{t("dashboard:pools.capacity.modes.override")}</option>
+            </select>
+            {borrowMode === "OVERRIDE" ? (
+              <select
+                aria-label={t("dashboard:pools.capacity.fields.capacityBorrowPolicy")}
+                className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+                value={borrow}
+                onChange={(event) => setBorrow(event.target.value as typeof borrow)}
+              >
+                <option value="WHEN_IDLE">{t("dashboard:pools.capacity.borrowIdle")}</option>
+                <option value="NEVER">{t("dashboard:pools.capacity.borrowNever")}</option>
+              </select>
+            ) : null}
+          </div>
         </div>
       </details>
       <div className="space-y-2">

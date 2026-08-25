@@ -369,6 +369,9 @@ async function nativeContextCount({
 }): Promise<ContextCountTelemetry | null> {
   if (!operation.contextInput) return null;
   const capacity = selected.ExecutionTarget?.InferenceCapacity;
+  // Undefined is retained for compatibility with pre-capacity mocks/rows that
+  // behaved as native-first before countStrategy was projected here.
+  const countStrategy = capacity?.countStrategy ?? "ENGINE_REPORTED";
   const registeredCounter = capacity
     ? contextCounterRegistry.resolve({
         runtimeIdentityKey: capacity.runtimeIdentityKey,
@@ -380,12 +383,15 @@ async function nativeContextCount({
         templateVersion: capacity.templateVersion,
       })
     : null;
-  const countWithRegisteredCounter = async () => {
-    if (!registeredCounter) return null;
+  const countWithConfiguredCounter = async () => {
+    const useRegistry =
+      countStrategy === "TOKENIZER" ||
+      countStrategy === "TEMPLATE_AWARE" ||
+      countStrategy === "ENGINE_REPORTED";
     return countSerializedRequestContext({
       input: operation.contextInput,
-      counters: [registeredCounter],
-      useTokenEstimate: false,
+      counters: useRegistry && registeredCounter ? [registeredCounter] : [],
+      useTokenEstimate: true,
       signal: request.signal,
     });
   };
@@ -394,13 +400,14 @@ async function nativeContextCount({
     operation.capability === "messages.countTokens"
   )
     return null;
+  if (countStrategy !== "ENGINE_REPORTED") return countWithConfiguredCounter();
   const countCapability =
     operation.family === "responses"
       ? ("responses.countTokens" as const)
       : operation.family === "messages"
         ? ("messages.countTokens" as const)
         : null;
-  if (!countCapability) return countWithRegisteredCounter();
+  if (!countCapability) return countWithConfiguredCounter();
   const countOperation: RelayOperation = {
     family: operation.family,
     method: "POST",
@@ -416,13 +423,13 @@ async function nativeContextCount({
       operation: countOperation,
     })
   ) {
-    return countWithRegisteredCounter();
+    return countWithConfiguredCounter();
   }
   let built: BuiltRelayRequest | undefined;
   let attempt: ReturnType<typeof startRelayAttempt> | undefined;
   try {
     built = await operation.buildRequest(selected.upstreamModelId);
-    if (!(built.body instanceof Uint8Array)) return countWithRegisteredCounter();
+    if (!(built.body instanceof Uint8Array)) return countWithConfiguredCounter();
     attempt = startRelayAttempt({
       manager,
       cliDeviceId: selected.Endpoint.cliDeviceId,
@@ -439,14 +446,14 @@ async function nativeContextCount({
     if (started.status < 200 || started.status >= 300) {
       await started.body.cancel("native_count_status");
       await attempt.terminal;
-      return countWithRegisteredCounter();
+      return countWithConfiguredCounter();
     }
     const payload = await readBoundedJson(started.body, NATIVE_CONTEXT_COUNT_MAX_BYTES);
     const terminal = await attempt.terminal;
-    if (!terminal.ok || !isJsonObject(payload)) return countWithRegisteredCounter();
+    if (!terminal.ok || !isJsonObject(payload)) return countWithConfiguredCounter();
     const tokens = payload.input_tokens;
     if (!Number.isSafeInteger(tokens) || (tokens as number) < 0)
-      return countWithRegisteredCounter();
+      return countWithConfiguredCounter();
     return {
       tokens: tokens as number,
       method: "NATIVE",
@@ -458,7 +465,7 @@ async function nativeContextCount({
   } catch {
     attempt?.cancel(request.signal.aborted ? "cancelled" : "protocol_error");
     if (request.signal.aborted) throw request.signal.reason;
-    return countWithRegisteredCounter();
+    return countWithConfiguredCounter();
   }
 }
 
@@ -517,6 +524,7 @@ type DirectModelRelayRow = {
     directContextMargin?: number;
     InferenceCapacity?: {
       physicalMaxContext: number | null;
+      countStrategy: "TOKENIZER" | "TEMPLATE_AWARE" | "ENGINE_REPORTED" | "CONSERVATIVE_ESTIMATE";
       runtimeIdentityKey: string;
       runtimeModel: string;
       runtimeRevision: string | null;
@@ -524,6 +532,7 @@ type DirectModelRelayRow = {
       tokenizerVersion: string | null;
       template: string | null;
       templateVersion: string | null;
+      engine: string | null;
     } | null;
   } | null;
   Endpoint: {
@@ -543,6 +552,7 @@ type PoolMemberRelayRow = PoolMemberRouteRow & {
     inferenceCapacityId: string | null;
     InferenceCapacity?: {
       physicalMaxContext: number | null;
+      countStrategy: "TOKENIZER" | "TEMPLATE_AWARE" | "ENGINE_REPORTED" | "CONSERVATIVE_ESTIMATE";
       runtimeIdentityKey: string;
       runtimeModel: string;
       runtimeRevision: string | null;
@@ -550,6 +560,7 @@ type PoolMemberRelayRow = PoolMemberRouteRow & {
       tokenizerVersion: string | null;
       template: string | null;
       templateVersion: string | null;
+      engine: string | null;
     } | null;
     DiscoveredModel: PoolMemberRouteRow["DiscoveredModel"] & {
       id: string;
@@ -562,7 +573,12 @@ type PoolMemberRelayRow = PoolMemberRouteRow & {
     };
   } | null;
   capacityContextCeiling?: number | null;
-  capacityContextMargin?: number;
+  capacityContextCeilingMode?: "INHERIT" | "LIMITED" | "UNLIMITED";
+  capacityContextMargin?: number | null;
+  ModelPool?: {
+    capacityContextCeiling: number | null;
+    capacityContextMargin: number;
+  };
   DiscoveredModel: PoolMemberRouteRow["DiscoveredModel"] & {
     id: string;
     userId: string;
@@ -2010,6 +2026,7 @@ async function directModelRow(discoveredModelId: string): Promise<DirectModelRel
           InferenceCapacity: {
             select: {
               physicalMaxContext: true,
+              countStrategy: true,
               runtimeIdentityKey: true,
               runtimeModel: true,
               runtimeRevision: true,
@@ -2017,6 +2034,7 @@ async function directModelRow(discoveredModelId: string): Promise<DirectModelRel
               tokenizerVersion: true,
               template: true,
               templateVersion: true,
+              engine: true,
             },
           },
         },
@@ -2045,7 +2063,11 @@ async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
       poolId: true,
       discoveredModelId: true,
       capacityContextCeiling: true,
+      capacityContextCeilingMode: true,
       capacityContextMargin: true,
+      ModelPool: {
+        select: { capacityContextCeiling: true, capacityContextMargin: true },
+      },
       ExecutionTarget: {
         select: {
           id: true,
@@ -2053,6 +2075,7 @@ async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
           InferenceCapacity: {
             select: {
               physicalMaxContext: true,
+              countStrategy: true,
               runtimeIdentityKey: true,
               runtimeModel: true,
               runtimeRevision: true,
@@ -2060,6 +2083,7 @@ async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
               tokenizerVersion: true,
               template: true,
               templateVersion: true,
+              engine: true,
             },
           },
           DiscoveredModel: {
@@ -2439,7 +2463,12 @@ async function relayDirect({
         runtime: capacityRuntime,
         relayRequestId,
         attempt: {
+          // Every retry gets a unique attemptId while retaining the durable
+          // relay request link. AdmissionRequest/Lease rows therefore preserve
+          // the full attempt history even though RelayRequest exposes the most
+          // recently active admission as a convenience projection.
           requestId: crypto.randomUUID(),
+          relayRequestId,
           attemptId: crypto.randomUUID(),
           ownerId: selected.userId,
           sourceKind: "DIRECT",
@@ -2652,8 +2681,16 @@ async function relayPool({
         contextFitsLimits({
           count: nativeCounts.get(member.id) ?? operation.contextCount!,
           physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
-          effectiveContextCeiling: member.capacityContextCeiling,
-          contextMargin: member.capacityContextMargin ?? 0,
+          effectiveContextCeiling:
+            member.capacityContextCeilingMode === "UNLIMITED"
+              ? null
+              : member.capacityContextCeilingMode === "LIMITED" ||
+                  (member.capacityContextCeilingMode === undefined &&
+                    member.capacityContextCeiling != null)
+                ? member.capacityContextCeiling
+                : member.ModelPool?.capacityContextCeiling,
+          contextMargin:
+            member.capacityContextMargin ?? member.ModelPool?.capacityContextMargin ?? 0,
         }),
       )
     : members;
@@ -2819,6 +2856,7 @@ async function relayPool({
         relayRequestId,
         attempt: {
           requestId: crypto.randomUUID(),
+          relayRequestId,
           attemptId: crypto.randomUUID(),
           ownerId: requester.userId,
           sourceKind: "POOL",
@@ -2900,6 +2938,7 @@ async function relayPool({
           relayRequestId,
           attempt: {
             requestId: crypto.randomUUID(),
+            relayRequestId,
             attemptId: crypto.randomUUID(),
             ownerId: requester.userId,
             sourceKind: "POOL",
@@ -3440,6 +3479,7 @@ async function relaySelectedModelNoFailover({
         relayRequestId,
         attempt: {
           requestId: crypto.randomUUID(),
+          relayRequestId,
           attemptId: crypto.randomUUID(),
           ownerId: selected.userId,
           sourceKind: requestedModelPoolId ? "POOL" : "DIRECT",

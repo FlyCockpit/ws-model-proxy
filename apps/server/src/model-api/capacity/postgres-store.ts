@@ -114,6 +114,11 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           where: { id: existing.id },
           data: { state: "TERMINAL", terminalAt: lockedNow, terminalReason: "lease_expired" },
         });
+        if (existing.relayRequestId)
+          await tx.relayRequest.updateMany({
+            where: { id: existing.relayRequestId, admissionAttemptId: attempt.attemptId },
+            data: { admissionTerminalState: "TERMINAL" },
+          });
         return { result: { state: "EXPIRED" } as const, notify: [existing.Lease.capacityId] };
       }
       if (existing?.Lease?.state === "ACTIVE")
@@ -136,6 +141,11 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           where: { admissionRequestId: existing.id, state: "WAITING" },
           data: { state: "EXPIRED", stateChangedAt: expiredAt, terminalReason: "deadline" },
         });
+        if (existing.relayRequestId)
+          await tx.relayRequest.updateMany({
+            where: { id: existing.relayRequestId, admissionAttemptId: attempt.attemptId },
+            data: { admissionTerminalState: "EXPIRED" },
+          });
         return { result: { state: "EXPIRED" } as const, notify: [] };
       }
 
@@ -168,6 +178,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           data: {
             userId: attempt.ownerId,
             requestId: attempt.requestId,
+            relayRequestId: attempt.relayRequestId,
             attemptId: attempt.attemptId,
             sourceKind: attempt.sourceKind,
             poolId: attempt.poolId,
@@ -268,18 +279,32 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         });
         if (!member)
           throw new Error("Admission pool candidate is not an owned member of the requested pool.");
-        // Member settings are the most-specific policy. Nullable limits inherit
-        // the pool limit; scalar member values intentionally override pool defaults.
+        const hasMemberConcurrencyOverride =
+          member.capacityConcurrencyMode === "LIMITED" ||
+          (member.capacityConcurrencyMode === undefined &&
+            member.capacityConcurrencyLimit !== null);
+        const memberConcurrencyCeiling =
+          member.capacityConcurrencyMode === "UNLIMITED"
+            ? undefined
+            : hasMemberConcurrencyOverride
+              ? (member.capacityConcurrencyLimit ?? undefined)
+              : (member.ModelPool.capacityConcurrencyLimit ?? undefined);
         return {
           ...candidate,
           priority: member.capacityPriority ?? member.ModelPool.capacityPriority,
-          memberConcurrencyCeiling:
-            member.capacityConcurrencyLimit ??
-            member.ModelPool.capacityConcurrencyLimit ??
-            undefined,
-          concurrencyScope: member.capacityConcurrencyLimit !== null ? "MEMBER" : "POOL",
+          memberConcurrencyCeiling,
+          concurrencyScope:
+            member.capacityConcurrencyMode === "INHERIT" ||
+            (member.capacityConcurrencyMode === undefined &&
+              member.capacityConcurrencyLimit === null)
+              ? "POOL"
+              : "MEMBER",
           concurrencyScopeId:
-            member.capacityConcurrencyLimit !== null ? member.id : member.ModelPool.id,
+            member.capacityConcurrencyMode === "INHERIT" ||
+            (member.capacityConcurrencyMode === undefined &&
+              member.capacityConcurrencyLimit === null)
+              ? member.ModelPool.id
+              : member.id,
           reservedSlots: member.capacityReservedSlots ?? member.ModelPool.capacityReservedSlots,
           allowBorrowReserved:
             (member.capacityBorrowPolicy ?? member.ModelPool.capacityBorrowPolicy) === "WHEN_IDLE",
@@ -510,6 +535,17 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           where: { attemptId: lease.attemptId, state: "ADMITTED" },
           data: { state: "TERMINAL", terminalAt: now },
         });
+      if (result.count) {
+        const admission = await tx.admissionRequest.findUnique({
+          where: { attemptId: lease.attemptId },
+          select: { relayRequestId: true },
+        });
+        if (admission?.relayRequestId)
+          await tx.relayRequest.updateMany({
+            where: { id: admission.relayRequestId, admissionAttemptId: lease.attemptId },
+            data: { admissionTerminalState: "TERMINAL" },
+          });
+      }
       if (result.count) await this.#fillAvailable(tx, lease.capacityId, now);
       return result.count === 1;
     });
@@ -518,6 +554,18 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
   }
 
   async cancelAttempt(attemptId: string): Promise<boolean> {
+    return this.#terminalizeWaitingAttempt(attemptId, "CANCELLED", "cancelled");
+  }
+
+  async expireAttempt(attemptId: string): Promise<boolean> {
+    return this.#terminalizeWaitingAttempt(attemptId, "EXPIRED", "deadline");
+  }
+
+  async #terminalizeWaitingAttempt(
+    attemptId: string,
+    state: "CANCELLED" | "EXPIRED",
+    reason: "cancelled" | "deadline",
+  ): Promise<boolean> {
     const now = new Date();
     const cancelled = await this.#serializable(async (tx) => {
       const request = await tx.admissionRequest.findUnique({
@@ -530,12 +578,17 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${capacityId}, 0))`;
       const result = await tx.admissionRequest.updateMany({
         where: { id: request.id, state: "WAITING" },
-        data: { state: "CANCELLED", terminalAt: now, terminalReason: "cancelled" },
+        data: { state, terminalAt: now, terminalReason: reason },
       });
       if (result.count)
         await tx.capacityWaiter.updateMany({
           where: { admissionRequestId: request.id, state: "WAITING" },
-          data: { state: "CANCELLED", stateChangedAt: now, terminalReason: "cancelled" },
+          data: { state, stateChangedAt: now, terminalReason: reason },
+        });
+      if (result.count && request.relayRequestId)
+        await tx.relayRequest.updateMany({
+          where: { id: request.relayRequestId, admissionAttemptId: attemptId },
+          data: { admissionTerminalState: state },
         });
       return { count: result.count, capacities };
     });
@@ -578,6 +631,15 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
             where: { id: lease.admissionRequestId, state: "ADMITTED" },
             data: { state: "TERMINAL", terminalAt: lockedNow, terminalReason: "lease_expired" },
           });
+          const admission = await tx.admissionRequest.findUnique({
+            where: { id: lease.admissionRequestId },
+            select: { relayRequestId: true },
+          });
+          if (admission?.relayRequestId)
+            await tx.relayRequest.updateMany({
+              where: { id: admission.relayRequestId, admissionAttemptId: lease.attemptId },
+              data: { admissionTerminalState: "TERMINAL" },
+            });
           await this.#fillAvailable(tx, lease.capacityId, lockedNow);
         }
         return update;
@@ -661,6 +723,11 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
             terminalReason: expired ? "deadline" : "connection_abandoned",
           },
         });
+        if (current.relayRequestId)
+          await tx.relayRequest.updateMany({
+            where: { id: current.relayRequestId, admissionAttemptId: current.attemptId },
+            data: { admissionTerminalState: expired ? "EXPIRED" : "CANCELLED" },
+          });
         return capacities;
       });
       if (swept.length) {

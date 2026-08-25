@@ -116,6 +116,12 @@ enum CapacityBorrowPolicy {
   WHEN_IDLE
 }
 
+enum CapacityLimitMode {
+  INHERIT
+  LIMITED
+  UNLIMITED
+}
+
 enum AdmissionSourceKind {
   DIRECT
   POOL
@@ -452,12 +458,15 @@ model PoolMember {
   executionTargetId            String?
   /// Null inherits the owning pool policy.
   capacityPriority             Int?
+  capacityConcurrencyMode      CapacityLimitMode       @default(INHERIT)
   capacityConcurrencyLimit     Int?
   capacityReservedSlots        Int?
   capacityBorrowPolicy         CapacityBorrowPolicy?
+  capacityWaitBudgetMode       CapacityLimitMode       @default(INHERIT)
   capacityWaitBudgetMs         Int?
+  capacityContextCeilingMode   CapacityLimitMode       @default(INHERIT)
   capacityContextCeiling       Int?
-  capacityContextMargin        Int                     @default(0)
+  capacityContextMargin        Int?
   weight                       Int                     @default(1)
   healthStatus                 PoolMemberHealthStatus  @default(UNKNOWN)
   routingStatus                PoolMemberRoutingStatus @default(ACTIVE)
@@ -526,6 +535,7 @@ model AdmissionRequest {
   updatedAt               DateTime              @default(now()) @updatedAt
   userId                  String
   requestId               String
+  relayRequestId          String?
   attemptId               String                @unique
   sourceKind              AdmissionSourceKind
   poolId                  String?
@@ -544,11 +554,13 @@ model AdmissionRequest {
   DirectExecutionTarget   ExecutionTarget?      @relation("AdmissionRequestDirectTarget", fields: [directExecutionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   Waiters                 CapacityWaiter[]
   Lease                   CapacityLease?
+  RelayRequest            RelayRequest?         @relation(fields: [relayRequestId], references: [id], onDelete: SetNull, onUpdate: Cascade)
 
   @@unique([userId, requestId, attemptId])
   @@index([userId, state, deadlineAt])
   @@index([state, heartbeatAt])
   @@index([basePriority, enqueueSequence, id])
+  @@index([relayRequestId])
   @@map("admission_request")
 }
 
@@ -785,6 +797,7 @@ model RelayRequest {
   SelectedDiscoveredModel    DiscoveredModel?   @relation("RelayRequestSelectedModel", fields: [selectedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   RequestedExecutionTarget   ExecutionTarget?   @relation("RelayRequestRequestedExecutionTarget", fields: [requestedExecutionTargetId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   SelectedExecutionTarget    ExecutionTarget?   @relation("RelayRequestSelectedExecutionTarget", fields: [selectedExecutionTargetId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  AdmissionRequests          AdmissionRequest[]
 
   @@index([userId, createdAt])
   @@index([modelApiTokenId, createdAt])

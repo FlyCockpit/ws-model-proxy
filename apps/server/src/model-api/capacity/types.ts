@@ -12,6 +12,7 @@ export type AdmissionCandidate = {
 export type AdmissionAttempt = {
   attemptId: string;
   requestId: string;
+  relayRequestId?: string;
   ownerId: string;
   sourceKind: "DIRECT" | "POOL";
   poolId?: string;
@@ -43,6 +44,7 @@ export interface CapacityAdmissionStore {
   heartbeat(lease: CapacityLeaseHandle, expiresAt: Date): Promise<boolean>;
   release(lease: CapacityLeaseHandle): Promise<boolean>;
   cancelAttempt(attemptId: string): Promise<boolean>;
+  expireAttempt(attemptId: string): Promise<boolean>;
   reclaimExpired(now: Date, limit: number): Promise<number>;
 }
 
