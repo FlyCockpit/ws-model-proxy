@@ -66,6 +66,39 @@ const pricingFormSchema = z.object({
   input: moneyRateSchema,
   output: moneyRateSchema,
 });
+const budgetFormSchema = z
+  .object({
+    concurrencyMode: z.enum(["LIMITED", "UNLIMITED"]),
+    concurrency: optionalPositiveInteger,
+    tokenAttemptMode: z.enum(["LIMITED", "UNLIMITED"]),
+    tokenAttempt: optionalPositiveInteger,
+    tokenDayMode: z.enum(["LIMITED", "UNLIMITED"]),
+    tokenDay: optionalPositiveInteger,
+    tokenMonthMode: z.enum(["LIMITED", "UNLIMITED"]),
+    tokenMonth: optionalPositiveInteger,
+    tokenLifetimeMode: z.enum(["LIMITED", "UNLIMITED"]),
+    tokenLifetime: optionalPositiveInteger,
+    spendDayMode: z.enum(["LIMITED", "UNLIMITED"]),
+    spendDay: z.union([z.literal(""), moneyRateSchema]),
+    spendMonthMode: z.enum(["LIMITED", "UNLIMITED"]),
+    spendMonth: z.union([z.literal(""), moneyRateSchema]),
+  })
+  .superRefine((value, context) => {
+    const pairs = [
+      [value.concurrencyMode, value.concurrency],
+      [value.tokenAttemptMode, value.tokenAttempt],
+      [value.tokenDayMode, value.tokenDay],
+      [value.tokenMonthMode, value.tokenMonth],
+      [value.tokenLifetimeMode, value.tokenLifetime],
+      [value.spendDayMode, value.spendDay],
+      [value.spendMonthMode, value.spendMonth],
+    ] as const;
+    if (pairs.some(([mode, limit]) => mode === "LIMITED" && (!limit || Number(limit) <= 0)))
+      context.addIssue({
+        code: "custom",
+        message: "Limited budget rules require a positive value",
+      });
+  });
 
 export function ProviderOperationsSection() {
   const { t, i18n } = useTranslation(["common", "dashboard"]);
@@ -167,13 +200,7 @@ export function ProviderOperationsSection() {
     retry: false,
   });
   const [attachmentDraft, setAttachmentDraft] = useState({ poolId: "", publicOrder: "0" });
-  const [pricingDraft, setPricingDraft] = useState({
-    version: "",
-    currency: "USD",
-    input: "",
-    output: "",
-  });
-  const [limits, setLimits] = useState({
+  const budgetDefaults = {
     concurrencyMode: "LIMITED" as "LIMITED" | "UNLIMITED",
     concurrency: "1",
     tokenAttemptMode: "LIMITED" as "LIMITED" | "UNLIMITED",
@@ -188,24 +215,8 @@ export function ProviderOperationsSection() {
     spendDay: "10",
     spendMonthMode: "LIMITED" as "LIMITED" | "UNLIMITED",
     spendMonth: "100",
-  });
-  const positiveInteger = /^[1-9]\d*$/u;
-  const moneyRate = /^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/u;
-  const limitsValid =
-    [
-      [limits.concurrencyMode, limits.concurrency],
-      [limits.tokenAttemptMode, limits.tokenAttempt],
-      [limits.tokenDayMode, limits.tokenDay],
-      [limits.tokenMonthMode, limits.tokenMonth],
-      [limits.tokenLifetimeMode, limits.tokenLifetime],
-    ].every(([mode, value]) => mode === "UNLIMITED" || positiveInteger.test(value)) &&
-    [
-      [limits.spendDayMode, limits.spendDay],
-      [limits.spendMonthMode, limits.spendMonth],
-    ].every(
-      ([mode, value]) => mode === "UNLIMITED" || (moneyRate.test(value) && Number(value) > 0),
-    );
-  const budgetRules = (currency: string | null) =>
+  };
+  const budgetRules = (limits: typeof budgetDefaults, currency: string | null) =>
     [
       ["CONCURRENCY", "PER_ATTEMPT", limits.concurrencyMode, limits.concurrency, null],
       ["TOKENS", "PER_ATTEMPT", limits.tokenAttemptMode, limits.tokenAttempt, null],
@@ -282,7 +293,7 @@ export function ProviderOperationsSection() {
   const createPricing = useMutation(
     orpc.providerManagement.createPricingVersion.mutationOptions({
       onSuccess: () => {
-        setPricingDraft({ version: "", currency: "USD", input: "", output: "" });
+        pricingForm.reset();
         invalidate();
         toast.success(t("dashboard:providers.feedback.pricingCreated"));
       },
@@ -443,6 +454,48 @@ export function ProviderOperationsSection() {
         pricingMetadata: null,
         pricingVersion: null,
         enabled: false,
+      });
+    },
+  });
+  const pricingForm = useForm({
+    defaultValues: { version: "", currency: "USD", input: "", output: "" },
+    validators: { onSubmit: pricingFormSchema },
+    onSubmit: async ({ value }) => {
+      if (!activeModelId) return;
+      await createPricing.mutateAsync({
+        providerModelId: activeModelId,
+        version: value.version,
+        currency: value.currency,
+        accountingVersion: "provider-billable-v1",
+        confidence: "CALCULATED",
+        ratesPerMillion: { input: value.input, output: value.output },
+        chargeRules: {
+          inputIncludesCacheRead: false,
+          inputIncludesCacheWrite: false,
+          outputIncludesReasoning: false,
+          outputIncludesTool: false,
+          reasoningAllowanceTokens: 0,
+          toolAllowanceTokens: 0,
+          cacheReadAllowanceTokens: 0,
+          cacheWriteAllowanceTokens: 0,
+          additionalAllowanceTokens: 0,
+          unknownCategories: "FAIL_CLOSED",
+        },
+        effectiveAt: new Date(),
+      });
+    },
+  });
+  const budgetForm = useForm({
+    defaultValues: budgetDefaults,
+    validators: { onSubmit: budgetFormSchema },
+    onSubmit: async ({ value }) => {
+      await createBudget.mutateAsync({
+        scopeType: "PROVIDER_ACCOUNT",
+        providerAccountId: accountId,
+        poolId: null,
+        providerModelId: null,
+        active: true,
+        rules: budgetRules(value, activePricing?.currency ?? null),
       });
     },
   });
@@ -792,28 +845,7 @@ export function ProviderOperationsSection() {
                     className="min-w-0 space-y-3"
                     onSubmit={(event) => {
                       event.preventDefault();
-                      if (!activeModelId) return;
-                      createPricing.mutate({
-                        providerModelId: activeModelId,
-                        version: pricingDraft.version,
-                        currency: pricingDraft.currency,
-                        accountingVersion: "provider-billable-v1",
-                        confidence: "CALCULATED",
-                        ratesPerMillion: { input: pricingDraft.input, output: pricingDraft.output },
-                        chargeRules: {
-                          inputIncludesCacheRead: false,
-                          inputIncludesCacheWrite: false,
-                          outputIncludesReasoning: false,
-                          outputIncludesTool: false,
-                          reasoningAllowanceTokens: 0,
-                          toolAllowanceTokens: 0,
-                          cacheReadAllowanceTokens: 0,
-                          cacheWriteAllowanceTokens: 0,
-                          additionalAllowanceTokens: 0,
-                          unknownCategories: "FAIL_CLOSED",
-                        },
-                        effectiveAt: new Date(),
-                      });
+                      pricingForm.handleSubmit();
                     }}
                   >
                     <h3 className="font-medium">{t("dashboard:providers.pricing")}</h3>
@@ -836,58 +868,35 @@ export function ProviderOperationsSection() {
                       ))}
                     </select>
                     <div className="grid gap-3 sm:grid-cols-2">
-                      <Field label={t("dashboard:providers.fields.pricingVersion")}>
-                        <Input
-                          required
-                          value={pricingDraft.version}
-                          onChange={(event) =>
-                            setPricingDraft({ ...pricingDraft, version: event.target.value })
-                          }
-                        />
-                      </Field>
-                      <Field label={t("dashboard:providers.fields.currency")}>
-                        <Input
-                          required
-                          maxLength={3}
-                          value={pricingDraft.currency}
-                          onChange={(event) =>
-                            setPricingDraft({
-                              ...pricingDraft,
-                              currency: event.target.value.toUpperCase(),
-                            })
-                          }
-                        />
-                      </Field>
-                      <Field label={t("dashboard:providers.fields.inputRate")}>
-                        <Input
-                          required
-                          inputMode="decimal"
-                          value={pricingDraft.input}
-                          onChange={(event) =>
-                            setPricingDraft({ ...pricingDraft, input: event.target.value })
-                          }
-                        />
-                      </Field>
-                      <Field label={t("dashboard:providers.fields.outputRate")}>
-                        <Input
-                          required
-                          inputMode="decimal"
-                          value={pricingDraft.output}
-                          onChange={(event) =>
-                            setPricingDraft({ ...pricingDraft, output: event.target.value })
-                          }
-                        />
-                      </Field>
+                      {(["version", "currency", "input", "output"] as const).map((name) => (
+                        <pricingForm.Field key={name} name={name}>
+                          {(field) => (
+                            <Field
+                              label={t(
+                                `dashboard:providers.fields.${name === "version" ? "pricingVersion" : name === "input" ? "inputRate" : name === "output" ? "outputRate" : name}`,
+                              )}
+                            >
+                              <Input
+                                maxLength={name === "currency" ? 3 : undefined}
+                                inputMode={
+                                  name === "input" || name === "output" ? "decimal" : undefined
+                                }
+                                value={field.state.value}
+                                onBlur={field.handleBlur}
+                                onChange={(event) =>
+                                  field.handleChange(
+                                    name === "currency"
+                                      ? event.target.value.toUpperCase()
+                                      : event.target.value,
+                                  )
+                                }
+                              />
+                            </Field>
+                          )}
+                        </pricingForm.Field>
+                      ))}
                     </div>
-                    <Button
-                      size="touch"
-                      disabled={
-                        !pricingDraft.version ||
-                        !pricingDraft.input ||
-                        !pricingDraft.output ||
-                        createPricing.isPending
-                      }
-                    >
+                    <Button size="touch" disabled={createPricing.isPending}>
                       {t("dashboard:providers.actions.savePricingDraft")}
                     </Button>
                     <div className="divide-y rounded-xl border">
@@ -913,16 +922,16 @@ export function ProviderOperationsSection() {
                                 variant="outline"
                                 disabled={
                                   updatePricing.isPending ||
-                                  !pricingDraft.input ||
-                                  !pricingDraft.output
+                                  !pricingForm.state.values.input ||
+                                  !pricingForm.state.values.output
                                 }
                                 onClick={() =>
                                   updatePricing.mutate({
                                     id: row.id,
-                                    currency: pricingDraft.currency,
+                                    currency: pricingForm.state.values.currency,
                                     ratesPerMillion: {
-                                      input: pricingDraft.input,
-                                      output: pricingDraft.output,
+                                      input: pricingForm.state.values.input,
+                                      output: pricingForm.state.values.output,
                                     },
                                   })
                                 }
@@ -970,14 +979,7 @@ export function ProviderOperationsSection() {
                     className="min-w-0 space-y-3"
                     onSubmit={(event) => {
                       event.preventDefault();
-                      createBudget.mutate({
-                        scopeType: "PROVIDER_ACCOUNT",
-                        providerAccountId: selected.id,
-                        poolId: null,
-                        providerModelId: null,
-                        active: true,
-                        rules: budgetRules(activePricing?.currency ?? null),
-                      });
+                      budgetForm.handleSubmit();
                     }}
                   >
                     <h3 className="font-medium">{t("dashboard:providers.budgets")}</h3>
@@ -990,59 +992,61 @@ export function ProviderOperationsSection() {
                     <div className="grid gap-3 sm:grid-cols-2">
                       <BudgetRuleField
                         label={t("dashboard:providers.fields.concurrencyAttempt")}
-                        mode={limits.concurrencyMode}
-                        value={limits.concurrency}
-                        onMode={(concurrencyMode) => setLimits({ ...limits, concurrencyMode })}
-                        onValue={(concurrency) => setLimits({ ...limits, concurrency })}
+                        mode={budgetForm.state.values.concurrencyMode}
+                        value={budgetForm.state.values.concurrency}
+                        onMode={(value) => budgetForm.setFieldValue("concurrencyMode", value)}
+                        onValue={(value) => budgetForm.setFieldValue("concurrency", value)}
                       />
                       <BudgetRuleField
                         label={t("dashboard:providers.fields.tokensAttempt")}
-                        mode={limits.tokenAttemptMode}
-                        value={limits.tokenAttempt}
-                        onMode={(tokenAttemptMode) => setLimits({ ...limits, tokenAttemptMode })}
-                        onValue={(tokenAttempt) => setLimits({ ...limits, tokenAttempt })}
+                        mode={budgetForm.state.values.tokenAttemptMode}
+                        value={budgetForm.state.values.tokenAttempt}
+                        onMode={(value) => budgetForm.setFieldValue("tokenAttemptMode", value)}
+                        onValue={(value) => budgetForm.setFieldValue("tokenAttempt", value)}
                       />
                       <BudgetRuleField
                         label={t("dashboard:providers.fields.tokensDay")}
-                        mode={limits.tokenDayMode}
-                        value={limits.tokenDay}
-                        onMode={(tokenDayMode) => setLimits({ ...limits, tokenDayMode })}
-                        onValue={(tokenDay) => setLimits({ ...limits, tokenDay })}
+                        mode={budgetForm.state.values.tokenDayMode}
+                        value={budgetForm.state.values.tokenDay}
+                        onMode={(value) => budgetForm.setFieldValue("tokenDayMode", value)}
+                        onValue={(value) => budgetForm.setFieldValue("tokenDay", value)}
                       />
                       <BudgetRuleField
                         label={t("dashboard:providers.fields.tokensMonth")}
-                        mode={limits.tokenMonthMode}
-                        value={limits.tokenMonth}
-                        onMode={(tokenMonthMode) => setLimits({ ...limits, tokenMonthMode })}
-                        onValue={(tokenMonth) => setLimits({ ...limits, tokenMonth })}
+                        mode={budgetForm.state.values.tokenMonthMode}
+                        value={budgetForm.state.values.tokenMonth}
+                        onMode={(value) => budgetForm.setFieldValue("tokenMonthMode", value)}
+                        onValue={(value) => budgetForm.setFieldValue("tokenMonth", value)}
                       />
                       <BudgetRuleField
                         label={t("dashboard:providers.fields.tokensLifetime")}
-                        mode={limits.tokenLifetimeMode}
-                        value={limits.tokenLifetime}
-                        onMode={(tokenLifetimeMode) => setLimits({ ...limits, tokenLifetimeMode })}
-                        onValue={(tokenLifetime) => setLimits({ ...limits, tokenLifetime })}
+                        mode={budgetForm.state.values.tokenLifetimeMode}
+                        value={budgetForm.state.values.tokenLifetime}
+                        onMode={(value) => budgetForm.setFieldValue("tokenLifetimeMode", value)}
+                        onValue={(value) => budgetForm.setFieldValue("tokenLifetime", value)}
                       />
                       <BudgetRuleField
                         label={t("dashboard:providers.fields.spendDay")}
-                        mode={limits.spendDayMode}
-                        value={limits.spendDay}
-                        onMode={(spendDayMode) => setLimits({ ...limits, spendDayMode })}
-                        onValue={(spendDay) => setLimits({ ...limits, spendDay })}
+                        mode={budgetForm.state.values.spendDayMode}
+                        value={budgetForm.state.values.spendDay}
+                        onMode={(value) => budgetForm.setFieldValue("spendDayMode", value)}
+                        onValue={(value) => budgetForm.setFieldValue("spendDay", value)}
                         decimal
                       />
                       <BudgetRuleField
                         label={t("dashboard:providers.fields.spendMonth")}
-                        mode={limits.spendMonthMode}
-                        value={limits.spendMonth}
-                        onMode={(spendMonthMode) => setLimits({ ...limits, spendMonthMode })}
-                        onValue={(spendMonth) => setLimits({ ...limits, spendMonth })}
+                        mode={budgetForm.state.values.spendMonthMode}
+                        value={budgetForm.state.values.spendMonth}
+                        onMode={(value) => budgetForm.setFieldValue("spendMonthMode", value)}
+                        onValue={(value) => budgetForm.setFieldValue("spendMonth", value)}
                         decimal
                       />
                     </div>
                     <Button
                       size="touch"
-                      disabled={createBudget.isPending || !limitsValid || !activePricing}
+                      disabled={
+                        createBudget.isPending || !budgetForm.state.canSubmit || !activePricing
+                      }
                     >
                       {t("dashboard:providers.actions.activateBudget")}
                     </Button>
@@ -1093,7 +1097,10 @@ export function ProviderOperationsSection() {
                                     replaceBudget.mutate({
                                       id: policy.id,
                                       active: true,
-                                      rules: budgetRules(activePricing?.currency ?? null),
+                                      rules: budgetRules(
+                                        budgetForm.state.values,
+                                        activePricing?.currency ?? null,
+                                      ),
                                     })
                                   }
                                 >
@@ -1172,7 +1179,7 @@ export function ProviderOperationsSection() {
                           disabled={
                             !attachmentDraft.poolId ||
                             createBudget.isPending ||
-                            !limitsValid ||
+                            !budgetForm.state.canSubmit ||
                             !activePricing
                           }
                           onClick={() => {
@@ -1183,7 +1190,7 @@ export function ProviderOperationsSection() {
                               poolId: attachmentDraft.poolId,
                               providerModelId: activeModelId,
                               active: true,
-                              rules: budgetRules(currency),
+                              rules: budgetRules(budgetForm.state.values, currency),
                             });
                           }}
                         >
