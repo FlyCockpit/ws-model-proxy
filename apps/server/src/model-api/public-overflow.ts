@@ -33,6 +33,7 @@ export type PublicOverflowSkipReason =
   | "NO_COMPATIBLE_PROVIDER"
   | "PROVIDER_UNHEALTHY"
   | "BUDGET_EXCEEDED"
+  | "PROTECTION_POLICY_MISSING"
   | "PROVIDER_UNAVAILABLE";
 
 export interface PublicOverflowRequest {
@@ -91,6 +92,62 @@ export interface PublicProviderTarget {
     nonce: Uint8Array<ArrayBuffer>;
     authTag: Uint8Array<ArrayBuffer>;
   };
+}
+
+/**
+ * Atomically claims the current credential for a send that is about to start.
+ * `lastUsedAt` is the durable boundary: credential lifecycle changes serialize
+ * on the same rows, while the actual provider request happens after commit.
+ */
+export async function claimPublicProviderCredentialForSend(input: {
+  userId: string;
+  target: PublicProviderTarget;
+  keyring: ReturnType<typeof parseProviderCredentialKeyring>;
+}): Promise<string> {
+  return prisma.$transaction(
+    async (tx) => {
+      await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.target.providerAccountId} AND "userId" = ${input.userId} FOR UPDATE`;
+      await tx.$queryRaw`SELECT id FROM provider_credential WHERE id = ${input.target.credential.id} AND "userId" = ${input.userId} FOR UPDATE`;
+      const current = await tx.providerCredential.findFirst({
+        where: {
+          id: input.target.credential.id,
+          userId: input.userId,
+          providerAccountId: input.target.providerAccountId,
+          status: "ACTIVE",
+          CurrentForAccount: {
+            id: input.target.providerAccountId,
+            enabled: true,
+            deletedAt: null,
+            currentCredentialId: input.target.credential.id,
+          },
+        },
+      });
+      if (!current) throw new Error("provider credential is no longer current");
+      const secret = decryptProviderCredential(
+        {
+          algorithm: current.algorithm as "AES-256-GCM",
+          keyVersion: current.keyVersion,
+          ciphertext: new Uint8Array(current.ciphertext),
+          nonce: new Uint8Array(current.nonce),
+          authTag: new Uint8Array(current.authTag),
+        },
+        {
+          credentialId: current.id,
+          userId: input.userId,
+          providerAccountId: input.target.providerAccountId,
+          credentialType: current.credentialType,
+          aadVersion: current.aadVersion,
+        },
+        input.keyring,
+      );
+      await tx.providerCredential.update({
+        where: { id: current.id },
+        data: { lastUsedAt: new Date() },
+      });
+      return secret;
+    },
+    { maxWait: 5_000, timeout: 10_000 },
+  );
 }
 
 export function publicTargetCompatibility(
@@ -451,8 +508,15 @@ export async function dispatchPublicOverflow(
   const listed = await listPublicOverflowTargets(request.userId, request.poolId);
   if (!listed.enabled) return { dispatched: false, reason: "POOL_PRIVATE" };
   if (!listed.acknowledged) return { dispatched: false, reason: "POOL_ACKNOWLEDGEMENT_MISSING" };
+  // Payload size may change during cross-protocol rendering. Do the initial
+  // pass with zero input solely to reject protocol/feature/output mismatches;
+  // each target is checked again with its actual rendered wire size below.
   const compatible = listed.targets.filter(
-    (target) => publicTargetCompatibility(target, request) === "COMPATIBLE",
+    (target) =>
+      publicTargetCompatibility(target, {
+        ...request,
+        liability: { ...request.liability, tokens: 0n },
+      }) === "COMPATIBLE",
   );
   if (compatible.length === 0) return { dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" };
 
@@ -468,21 +532,6 @@ export async function dispatchPublicOverflow(
     const attemptId = crypto.randomUUID();
     const fencingToken =
       BigInt(Date.now()) * 1_000_000n + BigInt(Math.floor(Math.random() * 1_000_000));
-    const admission = await admitProviderBudget({
-      userId: request.userId,
-      providerAccountId: target.providerAccountId,
-      providerModelId: target.providerModelId,
-      credentialId: target.credential.id,
-      poolId: request.poolId,
-      requestId: request.requestId,
-      attemptId,
-      fencingToken,
-      liability: request.liability,
-      expiresAt: new Date(Date.now() + 15 * 60_000),
-    });
-    lastAdmission = admission;
-    if (!admission.admitted) continue;
-
     let upstream: { protocol: ProviderProtocol; path: string; headers: Headers; body: Uint8Array };
     try {
       upstream = target.nativeSurfaces.includes(request.requestedSurface)
@@ -493,31 +542,50 @@ export async function dispatchPublicOverflow(
             body: replaceModel(request.body, target.upstreamModelId),
           }
         : await request.renderForTarget!(target);
-      const secret = decryptProviderCredential(
-        {
-          algorithm: target.credential.algorithm as "AES-256-GCM",
-          keyVersion: target.credential.keyVersion,
-          ciphertext: target.credential.ciphertext,
-          nonce: target.credential.nonce,
-          authTag: target.credential.authTag,
-        },
-        {
-          credentialId: target.credential.id,
-          userId: request.userId,
-          providerAccountId: target.providerAccountId,
-          credentialType: target.credential.credentialType,
-          aadVersion: target.credential.aadVersion,
-        },
+    } catch {
+      continue;
+    }
+    const renderedLiability = conservativeProviderLiability({
+      estimatedInputTokens: conservativeSerializedInputTokens(upstream.body.byteLength),
+      requestedOutputTokens: request.requestedOutputTokens,
+    });
+    if (
+      publicTargetCompatibility(target, { ...request, liability: renderedLiability }) !==
+      "COMPATIBLE"
+    )
+      continue;
+    const admission = await admitProviderBudget({
+      userId: request.userId,
+      providerAccountId: target.providerAccountId,
+      providerModelId: target.providerModelId,
+      credentialId: target.credential.id,
+      poolId: request.poolId,
+      requestId: request.requestId,
+      attemptId,
+      fencingToken,
+      liability: renderedLiability,
+      expiresAt: new Date(Date.now() + 15 * 60_000),
+    });
+    lastAdmission = admission;
+    if (!admission.admitted) continue;
+
+    try {
+      // Establish a durable send-start boundary while holding the same
+      // account-then-credential locks used by lifecycle mutations. A revoke or
+      // replacement that commits before this transaction is rejected here; one
+      // that commits afterwards cannot retroactively cancel a send that has
+      // already been claimed. Never hold database locks across provider I/O.
+      const secret = await claimPublicProviderCredentialForSend({
+        userId: request.userId,
+        target,
         keyring,
-      );
+      });
       const response = await providerHttpsRequest(
         joinProviderUrl(target.baseUrl, upstream.path),
         {
           method: "POST",
           headers: Object.fromEntries(upstream.headers.entries()),
           body: upstream.body,
-          // Keep every live stream inside its durable reservation lifetime so
-          // provider concurrency and budget liability cannot expire mid-body.
           signal: AbortSignal.any([request.signal, AbortSignal.timeout(14 * 60_000)]),
         },
         {
@@ -658,7 +726,12 @@ export async function dispatchPublicOverflow(
   }
   return {
     dispatched: false,
-    reason: lastAdmission && !lastAdmission.admitted ? "BUDGET_EXCEEDED" : "PROVIDER_UNAVAILABLE",
+    reason:
+      lastAdmission && !lastAdmission.admitted
+        ? lastAdmission.reason === "PROTECTION_POLICY_MISSING"
+          ? "PROTECTION_POLICY_MISSING"
+          : "BUDGET_EXCEEDED"
+        : "PROVIDER_UNAVAILABLE",
   };
 }
 
@@ -676,6 +749,21 @@ export function conservativeProviderLiability(input: {
     pricingVersion: input.pricingVersion,
     accountingVersion: "provider-billable-v1",
   };
+}
+
+/**
+ * Fail-safe input estimate for public egress when the local tokenizer did not
+ * produce a count. UTF-8 bytes are used rather than JavaScript string length:
+ * one token per byte is intentionally pessimistic for known provider
+ * tokenizers, and the additional 10% plus fixed envelope covers provider-side
+ * chat templates and small serialization differences. Most importantly, an
+ * absent count can never become a zero-token budget reservation.
+ */
+export function conservativeSerializedInputTokens(serializedBytes: number): bigint {
+  if (!Number.isSafeInteger(serializedBytes) || serializedBytes < 0)
+    throw new TypeError("serializedBytes must be a non-negative safe integer");
+  const bytes = BigInt(serializedBytes);
+  return (bytes * 11n + 9n) / 10n + 64n;
 }
 
 export type { RawProviderUsage };

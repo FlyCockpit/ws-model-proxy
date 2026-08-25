@@ -135,6 +135,21 @@ const rule = z
       ctx.addIssue({ code: "custom", message: "Token and concurrency limits must be integers" });
   });
 
+function budgetAuditMetadata(
+  rules: readonly z.infer<typeof rule>[],
+  extra: Record<string, string> = {},
+): Prisma.InputJsonObject {
+  return {
+    ...extra,
+    // UNLIMITED is an explicit safety decision, not an omitted limit. Record
+    // only non-secret rule identity so an audit reader can distinguish it from
+    // a missing protection rule without exposing values or provider details.
+    unlimitedRules: rules
+      .filter(({ mode }) => mode === "UNLIMITED")
+      .map(({ metric, period }) => ({ metric, period })),
+  };
+}
+
 export const providerManagementRouter = {
   listAccounts: protectedProcedure.handler(({ context }) => {
     enabled();
@@ -809,6 +824,7 @@ export const providerManagementRouter = {
             providerAccountId: input.providerAccountId,
             action: "BUDGET_CREATED",
             subjectId: row.id,
+            metadata: budgetAuditMetadata(input.rules),
           },
         });
         return row;
@@ -876,7 +892,7 @@ export const providerManagementRouter = {
               providerAccountId: locked.providerAccountId,
               action: "BUDGET_UPDATED",
               subjectId: row.id,
-              metadata: { replacesPolicyId: locked.id },
+              metadata: budgetAuditMetadata(input.rules, { replacesPolicyId: locked.id }),
             },
           });
           return row;

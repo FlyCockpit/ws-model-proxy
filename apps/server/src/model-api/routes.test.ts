@@ -2867,6 +2867,45 @@ describe("model API routes", () => {
     await expect(response.json()).resolves.toEqual({ id: "chatcmpl", choices: [] });
   });
 
+  it("queries only concrete PRIMARY targets when a pool has mixed local and public tiers", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockImplementation(async (args: { where?: unknown }) => {
+      expect(args.where).toEqual({
+        poolId: poolTarget.id,
+        tier: "PRIMARY",
+        ExecutionTarget: { DiscoveredModel: { isNot: null } },
+      });
+      // A real database applies the predicate and excludes the provider-backed
+      // PUBLIC_OVERFLOW row; return the surviving primary row here.
+      return [
+        poolMemberRow({
+          id: "local-primary",
+          discoveredModelId: "local-model",
+          upstreamModelId: "local-upstream",
+          cliDeviceId: "cli-local",
+        }),
+      ];
+    });
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-local"];
+    const responsePromise = appWith(manager).request("/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "content-type": "application/json",
+      },
+      body: requestBody(poolTarget.modelId),
+    });
+
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    expect(requireSent(manager).cliDeviceId).toBe("cli-local");
+    await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+    expect((await responsePromise).status).toBe(200);
+  });
+
   it("returns Anthropic-shaped pool compatibility failures", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],

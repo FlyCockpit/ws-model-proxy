@@ -46,6 +46,7 @@ export type ProviderBudgetAdmission =
       reason:
         | "BUDGET_EXCEEDED"
         | "PROVIDER_CONCURRENCY_EXCEEDED"
+        | "PROTECTION_POLICY_MISSING"
         | "CURRENCY_UNAVAILABLE"
         | "PRICING_UNAVAILABLE"
         | "TOKEN_BOUND_UNAVAILABLE";
@@ -423,6 +424,29 @@ export async function admitProviderBudget(
       include: { Rules: true },
       orderBy: { id: "asc" },
     });
+    // Public egress is fail-closed: an account-wide policy may add additional
+    // limits, but it does not constitute consent for a particular pool/model
+    // attachment. That attachment needs its own active policy, including an
+    // explicit concurrency decision. LIMITED is enforced below; UNLIMITED is
+    // an intentional persisted rule (and its policy creation is audited by the
+    // management API), never an implicit null/default.
+    const attachmentPolicies = policies.filter(
+      (policy) =>
+        policy.scopeType === "POOL_PROVIDER_MODEL" &&
+        policy.poolId === attempt.poolId &&
+        policy.providerModelId === attempt.providerModelId,
+    );
+    if (
+      attempt.poolId !== undefined &&
+      (attachmentPolicies.length === 0 ||
+        !attachmentPolicies.some((policy) =>
+          policy.Rules.some(
+            (rule) => rule.metric === "CONCURRENCY" && rule.period === "PER_ATTEMPT",
+          ),
+        ))
+    ) {
+      return { admitted: false, reason: "PROTECTION_POLICY_MISSING" };
+    }
     for (const policy of policies) {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget:${policy.id}`}, 0))`;
     }

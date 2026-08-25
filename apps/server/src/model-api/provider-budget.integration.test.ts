@@ -83,12 +83,24 @@ integration("provider budget admission and reconciliation", () => {
                     active: true,
                     activatedAt: new Date(),
                     Rules: {
-                      create: {
-                        metric: options?.metric ?? "CONCURRENCY",
-                        period: options?.metric === "TOKENS" ? "UTC_DAY" : "PER_ATTEMPT",
-                        mode: "LIMITED",
-                        limitValue: options?.metric === "TOKENS" ? 10 : 1,
-                      },
+                      create: [
+                        {
+                          metric: options?.metric ?? "CONCURRENCY",
+                          period: options?.metric === "TOKENS" ? "UTC_DAY" : "PER_ATTEMPT",
+                          mode: "LIMITED",
+                          limitValue: options?.metric === "TOKENS" ? 10 : 1,
+                        },
+                        ...(options?.metric === "TOKENS"
+                          ? [
+                              {
+                                metric: "CONCURRENCY" as const,
+                                period: "PER_ATTEMPT" as const,
+                                mode: "LIMITED" as const,
+                                limitValue: 1,
+                              },
+                            ]
+                          : []),
+                      ],
                     },
                   },
                 }),
@@ -166,6 +178,17 @@ integration("provider budget admission and reconciliation", () => {
     const winner = first.admitted ? first : second;
     if (!winner.admitted) throw new Error("winner unavailable");
     expect(winner.reservationIds).toHaveLength(2);
+  });
+
+  it("fails closed when a public pool attachment has no explicit concurrency protection", async () => {
+    if (!db) return;
+    const row = await fixture({ attachment: true, noPolicy: true });
+    await policy(row, [{ metric: "TOKENS", period: "UTC_DAY", limitValue: 100 }], {
+      poolId: row.poolId,
+    });
+    await expect(
+      service.admitProviderBudget(attempt(row, `unprotected-${crypto.randomUUID()}`)),
+    ).resolves.toEqual({ admitted: false, reason: "PROTECTION_POLICY_MISSING" });
   });
 
   it("returns only an exact complete live replay and rejects fencing or request conflicts", async () => {

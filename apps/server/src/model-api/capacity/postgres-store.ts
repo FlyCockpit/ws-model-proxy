@@ -414,7 +414,16 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       include: { AdmissionRequest: true, PoolMember: true },
     });
     const configuredReservationMembers = await tx.poolMember.findMany({
-      where: { ExecutionTarget: { inferenceCapacityId: capacityId } },
+      // Only concrete local primary targets participate in local capacity
+      // reservation accounting. Public provider overflow has independent
+      // provider concurrency and budget admission.
+      where: {
+        tier: "PRIMARY",
+        ExecutionTarget: {
+          inferenceCapacityId: capacityId,
+          DiscoveredModel: { isNot: null },
+        },
+      },
       include: { ModelPool: true },
     });
     const configuredReservations: Array<{ ownerKey: string; capacityReservedSlots: number }> = [];

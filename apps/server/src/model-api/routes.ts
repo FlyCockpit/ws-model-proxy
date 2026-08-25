@@ -125,6 +125,7 @@ import {
 } from "./protocols/index.js";
 import {
   conservativeProviderLiability,
+  conservativeSerializedInputTokens,
   dispatchPublicOverflow,
   type PublicOverflowReason,
 } from "./public-overflow.js";
@@ -2130,7 +2131,16 @@ async function directModelRow(discoveredModelId: string): Promise<DirectModelRel
 
 async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
   const rows = await prisma.poolMember.findMany({
-    where: { poolId },
+    // The relay scheduler is exclusively the local/primary execution path.
+    // Public overflow members are provider-backed and must only be considered
+    // by public-overflow.ts after its egress, policy, budget, and credential
+    // gates have run. Requiring the concrete target kind also prevents legacy
+    // or partially-backfilled rows from leaking into local routing.
+    where: {
+      poolId,
+      tier: "PRIMARY",
+      ExecutionTarget: { DiscoveredModel: { isNot: null } },
+    },
     orderBy: { id: "asc" },
     select: {
       id: true,
@@ -2275,7 +2285,13 @@ async function modelListResponse(targets: {
     poolIds.length === 0
       ? []
       : await prisma.poolMember.findMany({
-          where: { poolId: { in: poolIds } },
+          // Model-list capabilities describe the local pool. Provider overflow
+          // is deliberately not advertised as ordinary local capacity.
+          where: {
+            poolId: { in: poolIds },
+            tier: "PRIMARY",
+            ExecutionTarget: { DiscoveredModel: { isNot: null } },
+          },
           select: {
             poolId: true,
             ExecutionTarget: {
@@ -2850,7 +2866,10 @@ async function relayPool({
         shouldRetryRelayOperation(operation, "precommit_5xx") &&
         shouldRetryRelayOperation(operation, "precommit_transport"),
       liability: conservativeProviderLiability({
-        estimatedInputTokens: BigInt(operation.contextCount?.tokens ?? 0),
+        estimatedInputTokens:
+          operation.contextCount?.tokens !== undefined
+            ? BigInt(operation.contextCount.tokens)
+            : conservativeSerializedInputTokens(publicRequestBytes),
         requestedOutputTokens,
       }),
       requestedOutputTokens,

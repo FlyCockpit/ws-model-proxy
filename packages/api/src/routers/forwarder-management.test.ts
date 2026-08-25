@@ -61,6 +61,9 @@ const db = prisma as unknown as {
     delete: MockInstance;
   };
   executionTarget: { upsert: MockInstance };
+  providerModel: { findFirst: MockInstance };
+  providerBudgetPolicy: { findFirst: MockInstance; findMany: MockInstance };
+  providerAuditEvent: { findFirst: MockInstance };
   poolGrant: {
     upsert: MockInstance;
     deleteMany: MockInstance;
@@ -331,6 +334,138 @@ describe("forwarderManagementRouter", () => {
       }),
     );
     expect(db.poolGrant.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when enabling public egress without acknowledgement", async () => {
+    db.modelPool.findUnique.mockResolvedValue(
+      poolRow({ userId: "user-id", publicEgressEnabled: false, publicEgressAcknowledged: false }),
+    );
+
+    await expect(
+      client().updateModelPool({ id: "pool-id", publicEgressEnabled: true }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.modelPool.update).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["inactive", { mode: "LIMITED", limitValue: "2" }, null],
+    ["LIMITED without a positive limit", { mode: "LIMITED", limitValue: null }, new Date()],
+    ["UNLIMITED with a value", { mode: "UNLIMITED", limitValue: "1" }, new Date()],
+  ])(
+    "rejects public-egress enablement when an attachment policy is %s",
+    async (_label, rule, activatedAt) => {
+      db.modelPool.findUnique.mockResolvedValue(
+        poolRow({ userId: "user-id", publicEgressEnabled: false, publicEgressAcknowledged: false }),
+      );
+      db.poolMember.findMany.mockResolvedValue([
+        {
+          id: "member-1",
+          ExecutionTarget: {
+            ProviderModel: { id: "provider-model", providerAccountId: "provider-account" },
+          },
+        },
+      ]);
+      db.providerBudgetPolicy.findMany.mockResolvedValue([
+        {
+          id: "policy",
+          providerModelId: "provider-model",
+          providerAccountId: "provider-account",
+          activatedAt,
+          Rules: [rule],
+        },
+      ]);
+      db.providerAuditEvent.findFirst.mockResolvedValue({ id: "audit" });
+
+      await expect(
+        client().updateModelPool({
+          id: "pool-id",
+          publicEgressEnabled: true,
+          publicEgressAcknowledged: true,
+        }),
+      ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+      expect(db.modelPool.update).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects public-egress enablement when an otherwise valid policy lacks an audit", async () => {
+    db.modelPool.findUnique.mockResolvedValue(
+      poolRow({ userId: "user-id", publicEgressEnabled: false, publicEgressAcknowledged: false }),
+    );
+    db.poolMember.findMany.mockResolvedValue([
+      {
+        id: "member-1",
+        ExecutionTarget: {
+          ProviderModel: { id: "provider-model", providerAccountId: "provider-account" },
+        },
+      },
+    ]);
+    db.providerBudgetPolicy.findMany.mockResolvedValue([
+      {
+        id: "policy",
+        providerModelId: "provider-model",
+        providerAccountId: "provider-account",
+        activatedAt: new Date(),
+        Rules: [{ mode: "LIMITED", limitValue: "2" }],
+      },
+    ]);
+    db.providerAuditEvent.findFirst.mockResolvedValue(null);
+
+    await expect(
+      client().updateModelPool({
+        id: "pool-id",
+        publicEgressEnabled: true,
+        publicEgressAcknowledged: true,
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.modelPool.update).not.toHaveBeenCalled();
+  });
+
+  it("enables public egress only when every attachment has an audited explicit rule", async () => {
+    db.modelPool.findUnique.mockResolvedValue(
+      poolRow({ userId: "user-id", publicEgressEnabled: false, publicEgressAcknowledged: false }),
+    );
+    db.poolMember.findMany.mockResolvedValue([
+      {
+        id: "member-1",
+        ExecutionTarget: {
+          ProviderModel: { id: "provider-model-1", providerAccountId: "provider-account-1" },
+        },
+      },
+      {
+        id: "member-2",
+        ExecutionTarget: {
+          ProviderModel: { id: "provider-model-2", providerAccountId: "provider-account-2" },
+        },
+      },
+    ]);
+    db.providerBudgetPolicy.findMany.mockResolvedValue([
+      {
+        id: "policy-1",
+        providerModelId: "provider-model-1",
+        providerAccountId: "provider-account-1",
+        activatedAt: new Date(),
+        Rules: [{ mode: "LIMITED", limitValue: "2" }],
+      },
+      {
+        id: "policy-2",
+        providerModelId: "provider-model-2",
+        providerAccountId: "provider-account-2",
+        activatedAt: new Date(),
+        Rules: [{ mode: "UNLIMITED", limitValue: null }],
+      },
+    ]);
+    db.providerAuditEvent.findFirst.mockResolvedValue({ id: "audit" });
+    db.modelPool.update.mockResolvedValue(
+      poolRow({ publicEgressEnabled: true, publicEgressAcknowledged: true }),
+    );
+
+    await expect(
+      client().updateModelPool({
+        id: "pool-id",
+        publicEgressEnabled: true,
+        publicEgressAcknowledged: true,
+      }),
+    ).resolves.toMatchObject({ publicEgressEnabled: true, publicEgressAcknowledged: true });
   });
 
   it("atomically creates a pool and its capacity-policy audit record", async () => {
@@ -642,6 +777,44 @@ describe("forwarderManagementRouter", () => {
       weight: 0,
       routingStatus: "DISABLED",
     });
+  });
+
+  it("requires an active explicit concurrency policy before attaching public overflow", async () => {
+    db.modelPool.findFirst.mockResolvedValue({
+      id: "pool-id",
+      publicEgressEnabled: true,
+      publicEgressAcknowledged: true,
+    });
+    db.providerModel.findFirst.mockResolvedValue({
+      id: "provider-model",
+      providerAccountId: "provider-account",
+      enabled: true,
+    });
+    db.providerBudgetPolicy.findFirst.mockResolvedValue(null);
+    await expect(
+      client().addProviderPoolMember({
+        poolId: "pool-id",
+        providerModelId: "provider-model",
+        publicOrder: 0,
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.executionTarget.upsert).not.toHaveBeenCalled();
+
+    db.providerBudgetPolicy.findFirst.mockResolvedValue({
+      id: "policy",
+      activatedAt: new Date(),
+      Rules: [{ id: "rule", mode: "UNLIMITED", limitValue: null }],
+    });
+    db.providerAuditEvent.findFirst.mockResolvedValue({ id: "audit" });
+    db.executionTarget.upsert.mockResolvedValue({ id: "provider-target" });
+    db.poolMember.create.mockResolvedValue({ id: "provider-member" });
+    await expect(
+      client().addProviderPoolMember({
+        poolId: "pool-id",
+        providerModelId: "provider-model",
+        publicOrder: 0,
+      }),
+    ).resolves.toEqual({ id: "provider-member", executionTargetId: "provider-target" });
   });
 
   it("makes missing and cross-owner nested pool-member ids indistinguishable", async () => {

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
-vi.mock("@ws-model-proxy/db", () => ({ default: {} }));
+const db = vi.hoisted(() => ({ $transaction: vi.fn() }));
+vi.mock("@ws-model-proxy/db", () => ({ default: db }));
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
     WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: false,
@@ -9,7 +10,13 @@ vi.mock("@ws-model-proxy/env/server", () => ({
 }));
 
 import {
+  encryptProviderCredential,
+  parseProviderCredentialKeyring,
+} from "@ws-model-proxy/api/lib/provider-credential-crypto";
+import {
+  claimPublicProviderCredentialForSend,
   conservativeProviderLiability,
+  conservativeSerializedInputTokens,
   parseProviderUsage,
   publicTargetCompatibility,
 } from "./public-overflow.js";
@@ -26,6 +33,136 @@ const request = {
 };
 
 describe("public overflow compatibility", () => {
+  it("commits the credential send-start claim before provider I/O can begin", async () => {
+    const keyring = parseProviderCredentialKeyring(`v1:${Buffer.alloc(32, 7).toString("base64")}`);
+    const identity = {
+      credentialId: "credential",
+      userId: "owner",
+      providerAccountId: "account",
+      credentialType: "BEARER" as const,
+      aadVersion: 1,
+    };
+    const envelope = encryptProviderCredential("provider-secret", identity, keyring);
+    const order: string[] = [];
+    const tx = {
+      $queryRaw: vi.fn(async () => {
+        order.push("lock");
+        return [];
+      }),
+      providerCredential: {
+        findFirst: vi.fn(async () => ({
+          id: identity.credentialId,
+          credentialType: identity.credentialType,
+          aadVersion: identity.aadVersion,
+          ...envelope,
+        })),
+        update: vi.fn(async () => {
+          order.push("durable-claim");
+          return { id: identity.credentialId };
+        }),
+      },
+    };
+    db.$transaction.mockImplementationOnce(async (callback: (value: typeof tx) => unknown) => {
+      const result = await callback(tx);
+      order.push("commit");
+      return result;
+    });
+    const target = {
+      poolMemberId: "member",
+      executionTargetId: "target",
+      publicOrder: 0,
+      providerModelId: "model",
+      upstreamModelId: "upstream",
+      contextWindow: 1_000,
+      maxOutputTokens: 100,
+      protocol: "openai" as const,
+      providerAccountId: identity.providerAccountId,
+      providerVersion: null,
+      baseUrl: "https://provider.example",
+      authType: "BEARER" as const,
+      healthStatus: "HEALTHY" as const,
+      nativeProtocols: ["openai" as const],
+      nativeSurfaces: ["openai-chat" as const],
+      supportsStreaming: true,
+      supportedFeatures: [],
+      credential: {
+        id: identity.credentialId,
+        credentialType: identity.credentialType,
+        keyVersion: envelope.keyVersion,
+        aadVersion: identity.aadVersion,
+        algorithm: envelope.algorithm,
+        ciphertext: envelope.ciphertext,
+        nonce: envelope.nonce,
+        authTag: envelope.authTag,
+      },
+    };
+
+    const secret = await claimPublicProviderCredentialForSend({
+      userId: identity.userId,
+      target,
+      keyring,
+    });
+    order.push("network-may-start");
+
+    expect(secret).toBe("provider-secret");
+    expect(order).toEqual(["lock", "lock", "durable-claim", "commit", "network-may-start"]);
+    expect(db.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+      maxWait: 5_000,
+      timeout: 10_000,
+    });
+  });
+
+  it("fails a send-start claim when revocation won the lifecycle lock", async () => {
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
+      providerCredential: {
+        findFirst: vi.fn().mockResolvedValue(null),
+        update: vi.fn(),
+      },
+    };
+    db.$transaction.mockImplementationOnce(async (callback: (value: typeof tx) => unknown) =>
+      callback(tx),
+    );
+    const keyring = parseProviderCredentialKeyring(`v1:${Buffer.alloc(32, 7).toString("base64")}`);
+
+    await expect(
+      claimPublicProviderCredentialForSend({
+        userId: "owner",
+        target: {
+          poolMemberId: "member",
+          executionTargetId: "target",
+          publicOrder: 0,
+          providerModelId: "model",
+          upstreamModelId: "upstream",
+          contextWindow: 1_000,
+          maxOutputTokens: 100,
+          protocol: "openai",
+          providerAccountId: "account",
+          providerVersion: null,
+          baseUrl: "https://provider.example",
+          authType: "BEARER",
+          healthStatus: "HEALTHY",
+          nativeProtocols: ["openai"],
+          nativeSurfaces: ["openai-chat"],
+          supportsStreaming: true,
+          supportedFeatures: [],
+          credential: {
+            id: "credential",
+            credentialType: "BEARER",
+            keyVersion: "v1",
+            aadVersion: 1,
+            algorithm: "AES-256-GCM",
+            ciphertext: new Uint8Array(),
+            nonce: new Uint8Array(),
+            authTag: new Uint8Array(),
+          },
+        },
+        keyring,
+      }),
+    ).rejects.toThrow("no longer current");
+    expect(tx.providerCredential.update).not.toHaveBeenCalled();
+  });
+
   it("fails closed when context or native capability inventory is unknown", () => {
     expect(
       publicTargetCompatibility(
@@ -109,6 +246,12 @@ describe("public overflow compatibility", () => {
       pricingVersion: undefined,
       accountingVersion: "provider-billable-v1",
     });
+  });
+
+  it("produces a non-zero, margin-bearing estimate when tokenizer context is missing", () => {
+    expect(conservativeSerializedInputTokens(0)).toBe(64n);
+    expect(conservativeSerializedInputTokens(100)).toBe(174n);
+    expect(() => conservativeSerializedInputTokens(-1)).toThrow(/non-negative/u);
   });
 
   it("merges split Anthropic usage without erasing earlier billable categories", () => {

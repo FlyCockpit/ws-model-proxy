@@ -202,6 +202,42 @@ describe("providerManagementRouter security boundary", () => {
     expect(db.providerBudgetPolicy.create).not.toHaveBeenCalled();
   });
 
+  it("audits an explicit UNLIMITED choice with only safe rule identity", async () => {
+    envMock.enabled = true;
+    db.$queryRaw.mockResolvedValue([{ id: "account" }]);
+    db.providerAccount.findFirst.mockResolvedValue({ id: "account" });
+    db.providerBudgetPolicy.create.mockResolvedValue({ id: "policy", Rules: [] });
+    db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
+    const client = createRouterClient(providerManagementRouter, { context });
+    await client.createBudgetPolicy({
+      scopeType: "PROVIDER_ACCOUNT",
+      providerAccountId: "account",
+      providerModelId: null,
+      poolId: null,
+      active: true,
+      rules: [
+        {
+          metric: "CONCURRENCY",
+          period: "PER_ATTEMPT",
+          mode: "UNLIMITED",
+          limitValue: null,
+          currency: null,
+        },
+      ],
+    });
+    expect(db.providerAuditEvent.create).toHaveBeenCalledWith({
+      data: {
+        userId: "owner",
+        providerAccountId: "account",
+        action: "BUDGET_CREATED",
+        subjectId: "policy",
+        metadata: {
+          unlimitedRules: [{ metric: "CONCURRENCY", period: "PER_ATTEMPT" }],
+        },
+      },
+    });
+  });
+
   it("owner-scopes audit history and never returns credential envelopes", async () => {
     envMock.enabled = true;
     db.providerAuditEvent.findMany.mockResolvedValue([

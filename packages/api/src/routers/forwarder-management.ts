@@ -1245,6 +1245,8 @@ export const forwarderManagementRouter = {
           transformerAudio: true,
           transformerVideo: true,
           transformerCacheMode: true,
+          publicEgressEnabled: true,
+          publicEgressAcknowledged: true,
         },
       })) as {
         id: string;
@@ -1254,6 +1256,8 @@ export const forwarderManagementRouter = {
         transformerAudio: boolean;
         transformerVideo: boolean;
         transformerCacheMode: string;
+        publicEgressEnabled: boolean;
+        publicEgressAcknowledged: boolean;
       } | null;
       if (!existing || existing.userId !== context.session.user.id) {
         throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
@@ -1262,6 +1266,102 @@ export const forwarderManagementRouter = {
         await assertPoolSlugAvailable(input.slug, context.session.user.id, input.id);
       }
       await assertAttachmentLimitWithinGlobal(input.maxAttachmentBytes);
+
+      const nextPublicEgressEnabled = input.publicEgressEnabled ?? existing.publicEgressEnabled;
+      const nextPublicEgressAcknowledged =
+        input.publicEgressAcknowledged ?? existing.publicEgressAcknowledged;
+      if (nextPublicEgressEnabled && !nextPublicEgressAcknowledged) {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Acknowledge public egress before enabling it.",
+        });
+      }
+      if (input.publicEgressEnabled === true) {
+        const attachments = await prisma.poolMember.findMany({
+          where: { poolId: existing.id, tier: "PUBLIC_OVERFLOW" },
+          select: {
+            id: true,
+            ExecutionTarget: {
+              select: {
+                ProviderModel: { select: { id: true, providerAccountId: true } },
+              },
+            },
+          },
+        });
+        const targets = attachments.flatMap((attachment) => {
+          const model = attachment.ExecutionTarget?.ProviderModel;
+          return model ? [{ attachmentId: attachment.id, ...model }] : [];
+        });
+        if (targets.length !== attachments.length) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: "Every public overflow attachment must reference a provider model.",
+          });
+        }
+        const policies = await prisma.providerBudgetPolicy.findMany({
+          where: {
+            userId: context.session.user.id,
+            active: true,
+            scopeType: "POOL_PROVIDER_MODEL",
+            poolId: existing.id,
+            OR: targets.map(({ id, providerAccountId }) => ({
+              providerModelId: id,
+              providerAccountId,
+            })),
+          },
+          select: {
+            id: true,
+            providerModelId: true,
+            providerAccountId: true,
+            activatedAt: true,
+            Rules: {
+              where: { metric: "CONCURRENCY", period: "PER_ATTEMPT" },
+              select: { mode: true, limitValue: true },
+            },
+          },
+        });
+        const validPolicies = new Map(
+          policies
+            .filter(
+              (policy) =>
+                policy.activatedAt &&
+                policy.Rules.length === 1 &&
+                policy.Rules.every(
+                  (rule) =>
+                    (rule.mode === "LIMITED" &&
+                      rule.limitValue !== null &&
+                      Number(rule.limitValue.toString()) > 0) ||
+                    (rule.mode === "UNLIMITED" && rule.limitValue === null),
+                ),
+            )
+            .map((policy) => [`${policy.providerAccountId}:${policy.providerModelId}`, policy]),
+        );
+        const selectedPolicies = targets.map((target) =>
+          validPolicies.get(`${target.providerAccountId}:${target.id}`),
+        );
+        if (selectedPolicies.some((policy) => !policy)) {
+          throw new ORPCError("BAD_REQUEST", {
+            message:
+              "Every public overflow attachment requires an active explicit LIMITED or UNLIMITED concurrency policy.",
+          });
+        }
+        const auditChecks = await Promise.all(
+          selectedPolicies.map((policy) =>
+            prisma.providerAuditEvent.findFirst({
+              where: {
+                userId: context.session.user.id,
+                providerAccountId: policy!.providerAccountId,
+                subjectId: policy!.id,
+                action: { in: ["BUDGET_CREATED", "BUDGET_UPDATED", "BUDGET_ACTIVATED"] },
+              },
+              select: { id: true },
+            }),
+          ),
+        );
+        if (auditChecks.some((audit) => !audit)) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: "Every public overflow protection policy must have an activation audit trail.",
+          });
+        }
+      }
 
       const nextTransformerId =
         input.transformerDiscoveredModelId !== undefined
@@ -1425,10 +1525,60 @@ export const forwarderManagementRouter = {
         }
         const providerModel = await tx.providerModel.findFirst({
           where: { id: input.providerModelId, userId, deletedAt: null },
-          select: { id: true },
+          select: { id: true, providerAccountId: true, enabled: true },
         });
         if (!providerModel) {
           throw new ORPCError("NOT_FOUND", { message: "Provider model not found." });
+        }
+        if (!providerModel.enabled) {
+          throw new ORPCError("BAD_REQUEST", { message: "Enable the provider model first." });
+        }
+        const protectionPolicy = await tx.providerBudgetPolicy.findFirst({
+          where: {
+            userId,
+            active: true,
+            scopeType: "POOL_PROVIDER_MODEL",
+            poolId: input.poolId,
+            providerModelId: providerModel.id,
+            providerAccountId: providerModel.providerAccountId,
+          },
+          select: {
+            id: true,
+            activatedAt: true,
+            Rules: {
+              where: { metric: "CONCURRENCY", period: "PER_ATTEMPT" },
+              select: { id: true, mode: true, limitValue: true },
+            },
+          },
+        });
+        if (
+          !protectionPolicy?.activatedAt ||
+          protectionPolicy.Rules.length !== 1 ||
+          protectionPolicy.Rules.some(
+            (rule) =>
+              (rule.mode === "LIMITED" &&
+                (rule.limitValue === null || Number(rule.limitValue.toString()) <= 0)) ||
+              (rule.mode === "UNLIMITED" && rule.limitValue !== null),
+          )
+        ) {
+          throw new ORPCError("BAD_REQUEST", {
+            message:
+              "Create and activate an attachment protection policy with explicit LIMITED or UNLIMITED concurrency before adding this overflow target.",
+          });
+        }
+        const protectionAudit = await tx.providerAuditEvent.findFirst({
+          where: {
+            userId,
+            providerAccountId: providerModel.providerAccountId,
+            subjectId: protectionPolicy.id,
+            action: { in: ["BUDGET_CREATED", "BUDGET_UPDATED", "BUDGET_ACTIVATED"] },
+          },
+          select: { id: true },
+        });
+        if (!protectionAudit) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: "The attachment protection policy must have an activation audit trail.",
+          });
         }
         const target = await tx.executionTarget.upsert({
           where: { providerModelId: input.providerModelId },
