@@ -1193,7 +1193,7 @@ export const forwarderManagementRouter = {
           .object({
             slug: poolSlugSchema,
             name: poolNameSchema,
-            localModelIds: z.array(idSchema).min(1).max(64),
+            localModelIds: z.array(idSchema).max(64),
             recommendedSurface: z.enum(modelApiSurfaces),
             memberConcurrencyLimit: z.number().int().min(1).max(10_000),
             memberContextCeiling: z.number().int().min(1).max(100_000_000),
@@ -1259,6 +1259,13 @@ export const forwarderManagementRouter = {
               .max(32),
           })
           .superRefine((input, ctx) => {
+            if (input.localModelIds.length + input.providerModels.length === 0) {
+              ctx.addIssue({
+                code: "custom",
+                path: ["localModelIds"],
+                message: "Select at least one local or provider target",
+              });
+            }
             if (input.reservedSlots > input.memberConcurrencyLimit) {
               ctx.addIssue({
                 code: "custom",
@@ -1345,22 +1352,78 @@ export const forwarderManagementRouter = {
           if (localModels.length !== input.localModelIds.length) {
             throw new ORPCError("NOT_FOUND", { message: "A selected local model is unavailable" });
           }
-          const primaryMatrices = localModels.map((model) =>
-            surfaceAvailabilityMatrix({
-              capabilities:
-                resolveEffectiveCapabilityMetadata({
-                  capabilityOverrideMode: model.capabilityOverrideMode,
-                  capabilityOverrideMetadata: model.capabilityOverrideMetadata,
-                  endpointCapabilityMetadata: model.Endpoint.capabilityMetadata,
-                }) ??
-                openAiCapabilitiesFromCoarse(
-                  model.capabilityOverrideMode === "OVERRIDE"
-                    ? model.capabilityOverrides
-                    : model.Endpoint.defaultCapabilities,
-                ),
-              adaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
-            }),
+          const providerIds = input.providerModels.map((item) => item.providerModelId);
+          const hasPublicOverflow = input.providerModels.some(
+            (item) => item.tier === "PUBLIC_OVERFLOW",
           );
+          const providers = providerIds.length
+            ? await tx.providerModel.findMany({
+                where: {
+                  id: { in: providerIds },
+                  userId,
+                  enabled: true,
+                  deletedAt: null,
+                  ProviderAccount: {
+                    enabled: true,
+                    deletedAt: null,
+                    CurrentCredential: { status: "ACTIVE" },
+                  },
+                },
+                select: {
+                  id: true,
+                  providerAccountId: true,
+                  upstreamModelId: true,
+                  contextWindow: true,
+                  concurrencyLimit: true,
+                  nativeCapabilities: true,
+                  PricingVersions: {
+                    where: { status: "ACTIVE", retiredAt: null, effectiveAt: { lte: now } },
+                    orderBy: [{ effectiveAt: "desc" }, { id: "desc" }],
+                    take: 1,
+                    select: { id: true, currency: true },
+                  },
+                },
+              })
+            : [];
+          if (
+            providers.length !== providerIds.length ||
+            providers.some((row) => !row.PricingVersions[0])
+          ) {
+            throw new ORPCError("PRECONDITION_FAILED", {
+              message: "A selected provider is not ready for guarded routing",
+            });
+          }
+          const primaryProviderIds = new Set(
+            input.providerModels
+              .filter((item) => item.tier === "PRIMARY")
+              .map((item) => item.providerModelId),
+          );
+          const primaryMatrices = [
+            ...localModels.map((model) =>
+              surfaceAvailabilityMatrix({
+                capabilities:
+                  resolveEffectiveCapabilityMetadata({
+                    capabilityOverrideMode: model.capabilityOverrideMode,
+                    capabilityOverrideMetadata: model.capabilityOverrideMetadata,
+                    endpointCapabilityMetadata: model.Endpoint.capabilityMetadata,
+                  }) ??
+                  openAiCapabilitiesFromCoarse(
+                    model.capabilityOverrideMode === "OVERRIDE"
+                      ? model.capabilityOverrides
+                      : model.Endpoint.defaultCapabilities,
+                  ),
+                adaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
+              }),
+            ),
+            ...providers
+              .filter((provider) => primaryProviderIds.has(provider.id))
+              .map((provider) =>
+                surfaceAvailabilityMatrix({
+                  capabilities: parseOpenAiCompatibleCapabilities(provider.nativeCapabilities),
+                  adaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
+                }),
+              ),
+          ];
           const recommendedSurface = [
             "OPENAI_RESPONSES",
             "OPENAI_CHAT_COMPLETIONS",
@@ -1470,44 +1533,17 @@ export const forwarderManagementRouter = {
               message: "Member context exceeds a selected model's physical capacity.",
             });
           }
-          const providerIds = input.providerModels.map((item) => item.providerModelId);
-          const hasPublicOverflow = input.providerModels.some(
-            (item) => item.tier === "PUBLIC_OVERFLOW",
-          );
-          const providers = providerIds.length
-            ? await tx.providerModel.findMany({
-                where: {
-                  id: { in: providerIds },
-                  userId,
-                  enabled: true,
-                  deletedAt: null,
-                  ProviderAccount: {
-                    enabled: true,
-                    deletedAt: null,
-                    CurrentCredential: { status: "ACTIVE" },
-                  },
-                },
-                select: {
-                  id: true,
-                  providerAccountId: true,
-                  upstreamModelId: true,
-                  contextWindow: true,
-                  concurrencyLimit: true,
-                  PricingVersions: {
-                    where: { status: "ACTIVE", retiredAt: null, effectiveAt: { lte: now } },
-                    orderBy: [{ effectiveAt: "desc" }, { id: "desc" }],
-                    take: 1,
-                    select: { id: true, currency: true },
-                  },
-                },
-              })
-            : [];
           if (
-            providers.length !== providerIds.length ||
-            providers.some((row) => !row.PricingVersions[0])
+            providers.some(
+              (provider) =>
+                primaryProviderIds.has(provider.id) &&
+                provider.contextWindow != null &&
+                input.memberContextCeiling + (input.advanced?.contextMargin ?? 0) >
+                  provider.contextWindow,
+            )
           ) {
-            throw new ORPCError("PRECONDITION_FAILED", {
-              message: "A selected provider is not ready for guarded overflow",
+            throw new ORPCError("BAD_REQUEST", {
+              message: "Member context exceeds a selected provider's context window.",
             });
           }
           const pool = await tx.modelPool.create({
@@ -2506,13 +2542,65 @@ export const forwarderManagementRouter = {
 
   updatePoolMember: protectedProcedure
     .input(
-      z.object({
-        id: idSchema,
-        weight: z.number().int().min(0).max(10_000).optional(),
-        routingStatus: routingStatusSchema.optional(),
-        tier: z.enum(["PRIMARY", "PUBLIC_OVERFLOW"]).optional(),
-        publicOrder: z.number().int().min(0).max(10_000).optional(),
-      }),
+      z
+        .object({
+          id: idSchema,
+          weight: z.number().int().min(0).max(10_000).optional(),
+          routingStatus: routingStatusSchema.optional(),
+          tier: z.enum(["PRIMARY", "PUBLIC_OVERFLOW"]).optional(),
+          publicOrder: z.number().int().min(0).max(10_000).optional(),
+          capacityPriority: z.number().int().min(0).max(31).nullable().optional(),
+          capacityConcurrencyMode: z.enum(["INHERIT", "LIMITED", "UNLIMITED"]).optional(),
+          capacityConcurrencyLimit: z.number().int().min(1).max(10_000).nullable().optional(),
+          capacityReservedSlots: z.number().int().min(0).max(10_000).nullable().optional(),
+          capacityBorrowPolicy: z.enum(["NEVER", "WHEN_IDLE"]).nullable().optional(),
+          capacityWaitBudgetMode: z.enum(["INHERIT", "LIMITED", "UNLIMITED"]).optional(),
+          capacityWaitBudgetMs: z.number().int().min(1).max(600_000).nullable().optional(),
+          capacityContextCeilingMode: z.enum(["INHERIT", "LIMITED", "UNLIMITED"]).optional(),
+          capacityContextCeiling: z.number().int().min(1).max(100_000_000).nullable().optional(),
+          capacityContextMargin: z.number().int().min(0).max(10_000_000).nullable().optional(),
+        })
+        .superRefine((input, context) => {
+          const requireLimit = (
+            mode: "INHERIT" | "LIMITED" | "UNLIMITED" | undefined,
+            value: number | null | undefined,
+            path: string,
+          ) => {
+            if (mode === "LIMITED" && value == null)
+              context.addIssue({
+                code: "custom",
+                path: [path],
+                message: "Limited mode requires a limit",
+              });
+            if ((mode === "INHERIT" || mode === "UNLIMITED") && value != null)
+              context.addIssue({
+                code: "custom",
+                path: [path],
+                message: "This mode cannot include a limit",
+              });
+            if (mode === undefined && value !== undefined)
+              context.addIssue({
+                code: "custom",
+                path: [path],
+                message: "Changing a limit requires its mode",
+              });
+          };
+          requireLimit(
+            input.capacityConcurrencyMode,
+            input.capacityConcurrencyLimit,
+            "capacityConcurrencyLimit",
+          );
+          requireLimit(
+            input.capacityWaitBudgetMode,
+            input.capacityWaitBudgetMs,
+            "capacityWaitBudgetMs",
+          );
+          requireLimit(
+            input.capacityContextCeilingMode,
+            input.capacityContextCeiling,
+            "capacityContextCeiling",
+          );
+        }),
     )
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
@@ -2536,9 +2624,18 @@ export const forwarderManagementRouter = {
               poolId: true,
               tier: true,
               publicOrder: true,
+              weight: true,
+              routingStatus: true,
+              capacityConcurrencyMode: true,
+              capacityConcurrencyLimit: true,
+              capacityReservedSlots: true,
+              capacityContextCeilingMode: true,
+              capacityContextCeiling: true,
+              capacityContextMargin: true,
               ExecutionTarget: {
                 select: {
                   ProviderModel: { select: { id: true, providerAccountId: true } },
+                  InferenceCapacity: { select: { physicalMaxContext: true } },
                 },
               },
               ModelPool: {
@@ -2554,6 +2651,12 @@ export const forwarderManagementRouter = {
             throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
           const providerModel = member.ExecutionTarget?.ProviderModel;
           const nextTier = input.tier ?? member.tier;
+          const nextWeight = input.weight ?? member.weight;
+          const nextRoutingStatus = input.routingStatus ?? member.routingStatus;
+          if (nextTier === "PRIMARY" && nextRoutingStatus === "ACTIVE" && nextWeight <= 0)
+            throw new ORPCError("BAD_REQUEST", {
+              message: "Primary members require a positive routing weight.",
+            });
           if (input.tier && !providerModel)
             throw new ORPCError("BAD_REQUEST", {
               message: "Only provider-backed members can change tier.",
@@ -2564,6 +2667,46 @@ export const forwarderManagementRouter = {
           )
             throw new ORPCError("BAD_REQUEST", {
               message: "Acknowledge and enable public egress before moving a target to overflow.",
+            });
+          const nextConcurrencyMode =
+            input.capacityConcurrencyMode ?? member.capacityConcurrencyMode;
+          const nextConcurrencyLimit =
+            input.capacityConcurrencyLimit !== undefined
+              ? input.capacityConcurrencyLimit
+              : member.capacityConcurrencyLimit;
+          const nextReservedSlots =
+            input.capacityReservedSlots !== undefined
+              ? input.capacityReservedSlots
+              : member.capacityReservedSlots;
+          if (
+            nextConcurrencyMode === "LIMITED" &&
+            nextConcurrencyLimit != null &&
+            nextReservedSlots != null &&
+            nextReservedSlots > nextConcurrencyLimit
+          )
+            throw new ORPCError("BAD_REQUEST", {
+              message: "Reserved slots exceed the member concurrency limit.",
+            });
+          const nextContextMode =
+            input.capacityContextCeilingMode ?? member.capacityContextCeilingMode;
+          const nextContextCeiling =
+            input.capacityContextCeiling !== undefined
+              ? input.capacityContextCeiling
+              : member.capacityContextCeiling;
+          const nextContextMargin =
+            input.capacityContextMargin !== undefined
+              ? input.capacityContextMargin
+              : member.capacityContextMargin;
+          const physicalMaxContext = member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext;
+          if (
+            nextContextMode === "LIMITED" &&
+            nextContextCeiling != null &&
+            ((nextContextMargin != null && nextContextMargin >= nextContextCeiling) ||
+              (physicalMaxContext != null &&
+                nextContextCeiling + (nextContextMargin ?? 0) > physicalMaxContext))
+          )
+            throw new ORPCError("BAD_REQUEST", {
+              message: "Member context policy exceeds its physical capacity.",
             });
 
           if (nextTier === "PUBLIC_OVERFLOW" && member.tier !== "PUBLIC_OVERFLOW") {
@@ -2637,9 +2780,50 @@ export const forwarderManagementRouter = {
           const updated = await tx.poolMember.update({
             where: { id: member.id },
             data: {
-              ...(input.weight !== undefined ? { weight: input.weight } : {}),
+              ...(input.weight !== undefined || input.tier
+                ? { weight: nextTier === "PUBLIC_OVERFLOW" ? 0 : nextWeight }
+                : {}),
               ...(input.routingStatus ? { routingStatus: input.routingStatus } : {}),
               ...(input.tier ? { tier: input.tier } : {}),
+              ...(input.capacityPriority !== undefined
+                ? { capacityPriority: input.capacityPriority }
+                : {}),
+              ...(input.capacityConcurrencyMode
+                ? {
+                    capacityConcurrencyMode: input.capacityConcurrencyMode,
+                    capacityConcurrencyLimit:
+                      input.capacityConcurrencyMode === "LIMITED"
+                        ? input.capacityConcurrencyLimit
+                        : null,
+                  }
+                : {}),
+              ...(input.capacityReservedSlots !== undefined
+                ? { capacityReservedSlots: input.capacityReservedSlots }
+                : {}),
+              ...(input.capacityBorrowPolicy !== undefined
+                ? { capacityBorrowPolicy: input.capacityBorrowPolicy }
+                : {}),
+              ...(input.capacityWaitBudgetMode
+                ? {
+                    capacityWaitBudgetMode: input.capacityWaitBudgetMode,
+                    capacityWaitBudgetMs:
+                      input.capacityWaitBudgetMode === "LIMITED"
+                        ? input.capacityWaitBudgetMs
+                        : null,
+                  }
+                : {}),
+              ...(input.capacityContextCeilingMode
+                ? {
+                    capacityContextCeilingMode: input.capacityContextCeilingMode,
+                    capacityContextCeiling:
+                      input.capacityContextCeilingMode === "LIMITED"
+                        ? input.capacityContextCeiling
+                        : null,
+                  }
+                : {}),
+              ...(input.capacityContextMargin !== undefined
+                ? { capacityContextMargin: input.capacityContextMargin }
+                : {}),
               publicOrder: nextTier === "PUBLIC_OVERFLOW" ? desiredOrder + 40_000 : null,
             },
             select: { id: true, weight: true, routingStatus: true, tier: true, publicOrder: true },

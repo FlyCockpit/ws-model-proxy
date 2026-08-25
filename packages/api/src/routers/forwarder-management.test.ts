@@ -491,6 +491,79 @@ describe("forwarderManagementRouter", () => {
     ]);
   });
 
+  it("creates a provider-only PRIMARY pool and derives its recommended surface", async () => {
+    db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(poolRow());
+    db.discoveredModel.findMany.mockResolvedValue([]);
+    db.executionTarget.findMany.mockResolvedValue([]);
+    db.providerModel.findMany.mockResolvedValue([
+      {
+        id: "provider-primary",
+        providerAccountId: "account-primary",
+        upstreamModelId: "provider-upstream",
+        contextWindow: 65_536,
+        concurrencyLimit: 4,
+        nativeCapabilities: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiResponses: {
+              source: "provider",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+            },
+          },
+        },
+        PricingVersions: [{ id: "price-primary", currency: "USD" }],
+      },
+    ]);
+    db.modelPool.create.mockResolvedValue({ id: "provider-only-pool" });
+    db.executionTarget.upsert.mockResolvedValue({ id: "provider-primary-target" });
+    db.providerBudgetPolicy.create.mockResolvedValue({ id: "provider-primary-budget" });
+
+    await expect(
+      client().createGuardedModelPool({
+        slug: "provider-only",
+        name: "Provider only",
+        localModelIds: [],
+        recommendedSurface: "OPENAI_RESPONSES",
+        memberConcurrencyLimit: 2,
+        memberContextCeiling: 32_768,
+        reservedSlots: 0,
+        localWaitBudgetMs: 30_000,
+        publicEgressAcknowledged: false,
+        providerModels: [
+          {
+            providerModelId: "provider-primary",
+            tier: "PRIMARY",
+            concurrencyLimit: 2,
+            dailySpendLimit: "10.00",
+          },
+        ],
+      }),
+    ).resolves.toBeDefined();
+
+    expect(db.modelPool.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          publicEgressEnabled: false,
+          publicEgressAcknowledged: false,
+          recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        }),
+      }),
+    );
+    expect(db.poolMember.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          executionTargetId: "provider-primary-target",
+          tier: "PRIMARY",
+          publicOrder: null,
+          weight: 1,
+        }),
+      }),
+    );
+  });
+
   it("refuses guarded setup instead of inventing or overwriting physical capacity mapping", async () => {
     db.modelPool.findUnique.mockResolvedValue(null);
     db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel()]);
@@ -1333,6 +1406,82 @@ describe("forwarderManagementRouter", () => {
       { where: { id: "member-c" }, data: { publicOrder: 1 } },
       { where: { id: "member-b" }, data: { publicOrder: 2 } },
     ]);
+  });
+
+  it("transactionally validates and updates provider primary routing and capacity policy", async () => {
+    db.poolMember.findUnique
+      .mockResolvedValueOnce({
+        id: "provider-primary-member",
+        poolId: "pool-id",
+        ModelPool: { userId: "user-id" },
+      })
+      .mockResolvedValueOnce({
+        id: "provider-primary-member",
+        poolId: "pool-id",
+        tier: "PRIMARY",
+        publicOrder: null,
+        weight: 1,
+        routingStatus: "ACTIVE",
+        capacityConcurrencyMode: "INHERIT",
+        capacityConcurrencyLimit: null,
+        capacityReservedSlots: null,
+        capacityContextCeilingMode: "INHERIT",
+        capacityContextCeiling: null,
+        capacityContextMargin: null,
+        ExecutionTarget: {
+          ProviderModel: { id: "provider-model", providerAccountId: "provider-account" },
+          InferenceCapacity: { physicalMaxContext: 65_536 },
+        },
+        ModelPool: {
+          userId: "user-id",
+          publicEgressEnabled: false,
+          publicEgressAcknowledged: false,
+        },
+      });
+    db.poolMember.findMany.mockResolvedValue([]);
+    db.poolMember.update.mockResolvedValue({
+      id: "provider-primary-member",
+      weight: 5,
+      routingStatus: "ACTIVE",
+      tier: "PRIMARY",
+      publicOrder: null,
+    });
+
+    await expect(
+      client().updatePoolMember({
+        id: "provider-primary-member",
+        weight: 5,
+        capacityPriority: 24,
+        capacityConcurrencyMode: "LIMITED",
+        capacityConcurrencyLimit: 4,
+        capacityReservedSlots: 2,
+        capacityBorrowPolicy: "NEVER",
+        capacityWaitBudgetMode: "LIMITED",
+        capacityWaitBudgetMs: 15_000,
+        capacityContextCeilingMode: "LIMITED",
+        capacityContextCeiling: 32_768,
+        capacityContextMargin: 1_024,
+      }),
+    ).resolves.toMatchObject({ id: "provider-primary-member", weight: 5, tier: "PRIMARY" });
+
+    expect(db.poolMember.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "provider-primary-member" },
+        data: expect.objectContaining({
+          weight: 5,
+          capacityPriority: 24,
+          capacityConcurrencyMode: "LIMITED",
+          capacityConcurrencyLimit: 4,
+          capacityReservedSlots: 2,
+          capacityBorrowPolicy: "NEVER",
+          capacityWaitBudgetMode: "LIMITED",
+          capacityWaitBudgetMs: 15_000,
+          capacityContextCeilingMode: "LIMITED",
+          capacityContextCeiling: 32_768,
+          capacityContextMargin: 1_024,
+        }),
+      }),
+    );
   });
 
   it("requires an active explicit concurrency policy before attaching public overflow", async () => {
