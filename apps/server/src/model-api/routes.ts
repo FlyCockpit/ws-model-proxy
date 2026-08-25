@@ -2874,13 +2874,7 @@ async function relayPool({
       }),
       requestedOutputTokens,
       renderForTarget: canonical
-        ? async (providerTarget) => {
-            const targetSurface: ProtocolSurface =
-              providerTarget.protocol === "anthropic"
-                ? "anthropic-messages"
-                : operation.adaptation?.requestedSurface === "openai-responses"
-                  ? "openai-responses"
-                  : "openai-chat";
+        ? async (providerTarget, targetSurface) => {
             const payload = renderCanonicalRequest({
               request: canonical,
               target: targetSurface,
@@ -2918,7 +2912,6 @@ async function relayPool({
           providerModelId: result.target.providerModelId,
           providerAttemptId: result.attemptId,
           providerFencingToken: result.fencingToken,
-          streamCommitted: true,
           attemptCount: result.attemptCount,
         },
         select: { id: true },
@@ -2951,14 +2944,29 @@ async function relayPool({
     // Native response bytes remain opaque. Cross-protocol provider response
     // adaptation is handled by the same strict streaming/non-streaming state
     // machines as local targets.
-    if (result.target.protocol === requestedProtocol || !operation.adaptation)
-      return result.response;
-    const source: ProtocolSurface =
-      result.target.protocol === "anthropic"
-        ? "anthropic-messages"
-        : operation.adaptation.requestedSurface === "openai-responses"
-          ? "openai-responses"
-          : "openai-chat";
+    if (result.nativeSurface === requestedSurface || !operation.adaptation) return result.response;
+    const source: ProtocolSurface = result.nativeSurface;
+    // Providers return ordinary JSON error envelopes even when the successful
+    // operation would have streamed. Adapt that envelope as JSON; never feed
+    // it into an SSE state machine or advertise it as an event stream.
+    if (result.response.status < 200 || result.response.status >= 300) {
+      if (!result.response.body) return result.response;
+      const adapted = await readAdaptedNonstreamBody({
+        body: result.response.body,
+        source,
+        target: operation.adaptation.requestedSurface,
+        status: result.response.status,
+        headers: result.response.headers,
+        signal: request.signal,
+      });
+      return new Response(adapted, {
+        status: result.response.status,
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "x-wsmp-adapter-version": "1.0.0",
+        },
+      });
+    }
     if (operation.stream) {
       if (!result.response.body) return result.response;
       return new Response(

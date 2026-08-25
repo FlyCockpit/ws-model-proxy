@@ -35,6 +35,14 @@ enum ProviderHealthStatus {
   UNAVAILABLE
 }
 
+enum ProviderAttemptState {
+  ACTIVE
+  COMPLETED
+  FAILED
+  CANCELLED
+  EXPIRED
+}
+
 enum BudgetLimitMode {
   LIMITED
   UNLIMITED
@@ -381,9 +389,9 @@ model DiscoveredModel {
 /// remain feature-gated until credential, SSRF, admission, and budget controls
 /// are implemented.
 model ProviderAccount {
-  id                  String                   @id @default(cuid(2))
-  createdAt           DateTime                 @default(now())
-  updatedAt           DateTime                 @default(now()) @updatedAt
+  id                  String                       @id @default(cuid(2))
+  createdAt           DateTime                     @default(now())
+  updatedAt           DateTime                     @default(now()) @updatedAt
   deletedAt           DateTime?
   userId              String
   providerType        String
@@ -391,24 +399,29 @@ model ProviderAccount {
   label               String
   baseUrl             String
   /// Canonical endpoint identity used by affinity keys; changes only with baseUrl.
-  endpointIdentity    String                   @default("")
-  endpointVersion     Int                      @default(1)
+  endpointIdentity    String                       @default("")
+  endpointVersion     Int                          @default(1)
   authType            ProviderAuthType
-  status              ProviderAccountStatus    @default(DISABLED)
-  enabled             Boolean                  @default(false)
+  status              ProviderAccountStatus        @default(DISABLED)
+  enabled             Boolean                      @default(false)
   safeConfiguration   Json?
-  currentCredentialId String?                  @unique
-  healthStatus        ProviderHealthStatus     @default(UNKNOWN)
+  currentCredentialId String?                      @unique
+  healthStatus        ProviderHealthStatus         @default(UNKNOWN)
   healthCheckedAt     DateTime?
-  User                User                     @relation("ProviderAccountOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  healthFailureCount  Int                          @default(0)
+  healthNextRetryAt   DateTime?
+  healthHalfOpenAt    DateTime?
+  nextFencingToken    BigInt                       @default(0)
+  User                User                         @relation("ProviderAccountOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ProviderModels      ProviderModel[]
-  Credentials         ProviderCredential[]     @relation("ProviderAccountCredentials")
-  CurrentCredential   ProviderCredential?      @relation("ProviderAccountCurrentCredential", fields: [currentCredentialId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  Credentials         ProviderCredential[]         @relation("ProviderAccountCredentials")
+  CurrentCredential   ProviderCredential?          @relation("ProviderAccountCurrentCredential", fields: [currentCredentialId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   BudgetPolicies      ProviderBudgetPolicy[]
   UsageLedger         ProviderUsageLedger[]
   Attempts            ProviderAttempt[]
   PricingVersions     ProviderPricingVersion[]
   AuditEvents         ProviderAuditEvent[]
+  AttemptEvents       PublicProviderAttemptEvent[]
 
   @@unique([userId, label])
   @@unique([id, userId])
@@ -418,9 +431,9 @@ model ProviderAccount {
 }
 
 model ProviderModel {
-  id                 String                   @id @default(cuid(2))
-  createdAt          DateTime                 @default(now())
-  updatedAt          DateTime                 @default(now()) @updatedAt
+  id                 String                       @id @default(cuid(2))
+  createdAt          DateTime                     @default(now())
+  updatedAt          DateTime                     @default(now()) @updatedAt
   deletedAt          DateTime?
   userId             String
   providerAccountId  String
@@ -433,16 +446,20 @@ model ProviderModel {
   concurrencyLimit   Int?
   pricingMetadata    Json?
   pricingVersion     String?
-  healthStatus       ProviderHealthStatus     @default(UNKNOWN)
+  healthStatus       ProviderHealthStatus         @default(UNKNOWN)
   healthCheckedAt    DateTime?
-  enabled            Boolean                  @default(false)
-  User               User                     @relation("ProviderModelOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ProviderAccount    ProviderAccount          @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  healthFailureCount Int                          @default(0)
+  healthNextRetryAt  DateTime?
+  healthHalfOpenAt   DateTime?
+  enabled            Boolean                      @default(false)
+  User               User                         @relation("ProviderModelOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ProviderAccount    ProviderAccount              @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
   ExecutionTarget    ExecutionTarget?
   BudgetPolicies     ProviderBudgetPolicy[]
   UsageLedger        ProviderUsageLedger[]
   Attempts           ProviderAttempt[]
   PricingVersions    ProviderPricingVersion[]
+  AttemptEvents      PublicProviderAttemptEvent[]
 
   @@unique([providerAccountId, upstreamModelId])
   @@unique([id, userId])
@@ -577,8 +594,8 @@ model ProviderBudgetReservation {
 /// including attempts for which every applicable rule is unlimited (or no
 /// policy is attached). This makes terminal and delayed reconciliation total.
 model ProviderAttempt {
-  id                String              @id @default(cuid(2))
-  createdAt         DateTime            @default(now())
+  id                String                       @id @default(cuid(2))
+  createdAt         DateTime                     @default(now())
   userId            String
   providerAccountId String
   providerModelId   String
@@ -587,20 +604,59 @@ model ProviderAttempt {
   requestId         String
   attemptId         String
   fencingToken      BigInt
+  state             ProviderAttemptState         @default(ACTIVE)
+  heartbeatAt       DateTime                     @default(now())
+  terminalAt        DateTime?
+  terminalReason    String?
   expiresAt         DateTime
   liabilityTokens   BigInt?
-  liabilitySpend    Decimal?            @db.Decimal(30, 9)
+  liabilitySpend    Decimal?                     @db.Decimal(30, 9)
   liabilityCurrency String?
   pricingVersion    String?
   accountingVersion String
-  User              User                @relation("ProviderAttemptOwner", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  ProviderAccount   ProviderAccount     @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  ProviderModel     ProviderModel       @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  Credential        ProviderCredential? @relation(fields: [credentialId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  User              User                         @relation("ProviderAttemptOwner", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  ProviderAccount   ProviderAccount              @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  ProviderModel     ProviderModel                @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  Credential        ProviderCredential?          @relation(fields: [credentialId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  Events            PublicProviderAttemptEvent[]
 
   @@unique([attemptId, fencingToken])
   @@index([userId, expiresAt])
+  @@index([state, heartbeatAt, expiresAt])
   @@map("provider_attempt")
+}
+
+/// Immutable, prompt-free execution telemetry. Database hardening makes this
+/// append-only just like the usage ledger.
+model PublicProviderAttemptEvent {
+  id                String           @id @default(cuid(2))
+  createdAt         DateTime         @default(now())
+  userId            String
+  providerAccountId String
+  providerModelId   String
+  providerAttemptId String?
+  requestId         String
+  attemptId         String
+  fencingToken      BigInt?
+  eventType         String
+  reason            String?
+  requestedSurface  String?
+  nativeSurface     String?
+  adapterMode       String?
+  adapterVersion    String?
+  waitDurationMs    Int?
+  reservationId     String?
+  contextTokens     BigInt?
+  usage             Json?
+  metadata          Json?
+  User              User             @relation("PublicProviderAttemptEventOwner", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  ProviderAccount   ProviderAccount  @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  ProviderModel     ProviderModel    @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  ProviderAttempt   ProviderAttempt? @relation(fields: [providerAttemptId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([attemptId, fencingToken, createdAt])
+  @@map("public_provider_attempt_event")
 }
 
 /// Append-only accounting row. Application APIs expose creation only; database

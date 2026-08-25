@@ -12,6 +12,16 @@ import prisma from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
 import type { ProtocolSurface } from "./protocols/index.js";
 import {
+  allocateProviderFence,
+  claimProviderHealthTrial,
+  classifyProviderFailure,
+  finishProviderAttempt,
+  heartbeatProviderAttempt,
+  parseRetryAfter,
+  recordProviderAttemptEvent,
+  recordProviderOutcome,
+} from "./provider-attempt-runtime.js";
+import {
   admitProviderBudget,
   type ProviderBudgetAdmission,
   type ProviderLiability,
@@ -56,7 +66,10 @@ export interface PublicOverflowRequest {
   adaptationEnabled: boolean;
   /** True only when the operation resolver proves a second attempt is safe. */
   retrySafe: boolean;
-  renderForTarget?: (target: PublicProviderTarget) => Promise<{
+  renderForTarget?: (
+    target: PublicProviderTarget,
+    nativeSurface: ProtocolSurface,
+  ) => Promise<{
     protocol: ProviderProtocol;
     path: string;
     headers: Headers;
@@ -204,6 +217,7 @@ export type PublicOverflowResult =
       target: PublicProviderTarget;
       attemptId: string;
       fencingToken: bigint;
+      nativeSurface: ProtocolSurface;
       attemptCount: number;
       terminal: Promise<{ ok: boolean; responseBytes: number }>;
     }
@@ -479,20 +493,21 @@ async function recordProviderHealth(
   userId: string,
   success: boolean,
 ): Promise<void> {
-  const healthStatus = success ? ("HEALTHY" as const) : ("DEGRADED" as const);
-  const healthCheckedAt = new Date();
-  await prisma
-    .$transaction([
-      prisma.providerModel.updateMany({
-        where: { id: target.providerModelId, userId },
-        data: { healthStatus, healthCheckedAt },
-      }),
-      prisma.providerAccount.updateMany({
-        where: { id: target.providerAccountId, userId },
-        data: { healthStatus, healthCheckedAt },
-      }),
-    ])
-    .catch(() => undefined);
+  await recordProviderOutcome({
+    userId,
+    providerAccountId: target.providerAccountId,
+    providerModelId: target.providerModelId,
+    success,
+  }).catch(() => undefined);
+}
+
+function selectedNativeSurface(target: PublicProviderTarget, requested: ProtocolSurface) {
+  if (target.nativeSurfaces.includes(requested)) return requested;
+  return target.nativeSurfaces.find((surface) =>
+    target.protocol === "anthropic"
+      ? surface === "anthropic-messages"
+      : surface === "openai-responses" || surface === "openai-chat",
+  );
 }
 
 /**
@@ -518,7 +533,23 @@ export async function dispatchPublicOverflow(
         liability: { ...request.liability, tokens: 0n },
       }) === "COMPATIBLE",
   );
-  if (compatible.length === 0) return { dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" };
+  if (compatible.length === 0) {
+    await Promise.allSettled(
+      listed.targets.map((target) =>
+        recordProviderAttemptEvent({
+          userId: request.userId,
+          providerAccountId: target.providerAccountId,
+          providerModelId: target.providerModelId,
+          requestId: request.requestId,
+          attemptId: `${request.requestId}:compatibility-skip:${target.providerModelId}`,
+          eventType: "SKIP",
+          reason: publicTargetCompatibility(target, request),
+          requestedSurface: request.requestedSurface,
+        }),
+      ),
+    );
+    return { dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" };
+  }
 
   await request.releaseLocalCapacity();
   const keyringValue = env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS;
@@ -529,19 +560,24 @@ export async function dispatchPublicOverflow(
 
   for (const target of compatible) {
     attemptCount += 1;
+    const nativeSurface = selectedNativeSurface(target, request.requestedSurface);
+    if (!nativeSurface) continue;
     const attemptId = crypto.randomUUID();
-    const fencingToken =
-      BigInt(Date.now()) * 1_000_000n + BigInt(Math.floor(Math.random() * 1_000_000));
+    const fencingToken = await allocateProviderFence({
+      userId: request.userId,
+      providerAccountId: target.providerAccountId,
+    });
     let upstream: { protocol: ProviderProtocol; path: string; headers: Headers; body: Uint8Array };
     try {
-      upstream = target.nativeSurfaces.includes(request.requestedSurface)
-        ? {
-            protocol: request.requestedProtocol,
-            path: request.path,
-            headers: request.headers,
-            body: replaceModel(request.body, target.upstreamModelId),
-          }
-        : await request.renderForTarget!(target);
+      upstream =
+        nativeSurface === request.requestedSurface
+          ? {
+              protocol: request.requestedProtocol,
+              path: request.path,
+              headers: request.headers,
+              body: replaceModel(request.body, target.upstreamModelId),
+            }
+          : await request.renderForTarget!(target, nativeSurface);
     } catch {
       continue;
     }
@@ -567,7 +603,77 @@ export async function dispatchPublicOverflow(
       expiresAt: new Date(Date.now() + 15 * 60_000),
     });
     lastAdmission = admission;
-    if (!admission.admitted) continue;
+    if (!admission.admitted) {
+      await recordProviderAttemptEvent({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        eventType: "SKIP",
+        reason: admission.reason,
+        requestedSurface: request.requestedSurface,
+        nativeSurface,
+      }).catch(() => undefined);
+      continue;
+    }
+
+    const healthClaim = await claimProviderHealthTrial({
+      userId: request.userId,
+      providerModelId: target.providerModelId,
+    }).catch(() => "COOLDOWN" as const);
+    if (healthClaim === "COOLDOWN") {
+      await reconcileProviderBudget({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        credentialId: target.credential.id,
+        poolId: request.poolId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        reason: "FAILED",
+        revisionSequence: 1n,
+        revisionKind: "SNAPSHOT",
+      }).catch(() => undefined);
+      await finishProviderAttempt({
+        attemptId,
+        fencingToken,
+        state: "FAILED",
+        reason: "PROVIDER_HEALTH_COOLDOWN",
+      }).catch(() => false);
+      await recordProviderAttemptEvent({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        eventType: "SKIP",
+        reason: "PROVIDER_HEALTH_COOLDOWN",
+        requestedSurface: request.requestedSurface,
+        nativeSurface,
+      }).catch(() => undefined);
+      continue;
+    }
+
+    await recordProviderAttemptEvent({
+      userId: request.userId,
+      providerAccountId: target.providerAccountId,
+      providerModelId: target.providerModelId,
+      requestId: request.requestId,
+      attemptId,
+      fencingToken,
+      eventType: "DISPATCH",
+      reason: request.reason,
+      requestedSurface: request.requestedSurface,
+      nativeSurface,
+      adapterMode: nativeSurface === request.requestedSurface ? "native" : "adapted",
+      adapterVersion: nativeSurface === request.requestedSurface ? undefined : "1.0.0",
+      contextTokens: renderedLiability.tokens,
+      metadata: { healthClaim },
+    }).catch(() => undefined);
 
     try {
       // Establish a durable send-start boundary while holding the same
@@ -610,7 +716,14 @@ export async function dispatchPublicOverflow(
             });
         response.destroy();
         await closed;
-        await recordProviderHealth(target, request.userId, false);
+        await recordProviderOutcome({
+          userId: request.userId,
+          providerAccountId: target.providerAccountId,
+          providerModelId: target.providerModelId,
+          success: false,
+          failureClass: classifyProviderFailure(status),
+          retryAfterMs: parseRetryAfter(response.headers["retry-after"]),
+        }).catch(() => undefined);
         await reconcileProviderBudget({
           userId: request.userId,
           providerAccountId: target.providerAccountId,
@@ -624,11 +737,37 @@ export async function dispatchPublicOverflow(
           revisionSequence: 1n,
           revisionKind: "SNAPSHOT",
         });
+        await finishProviderAttempt({
+          attemptId,
+          fencingToken,
+          state: "FAILED",
+          reason: `HTTP_${status}`,
+        });
+        await recordProviderAttemptEvent({
+          userId: request.userId,
+          providerAccountId: target.providerAccountId,
+          providerModelId: target.providerModelId,
+          requestId: request.requestId,
+          attemptId,
+          fencingToken,
+          eventType: "RETRY",
+          reason: classifyProviderFailure(status),
+          requestedSurface: request.requestedSurface,
+          nativeSurface,
+        }).catch(() => undefined);
         continue;
       }
       const body = Readable.toWeb(response) as ReadableStream<Uint8Array>;
       const reader = body.getReader();
       let reconciled = false;
+      const heartbeatTimer = setInterval(() => {
+        void heartbeatProviderAttempt({ attemptId, fencingToken, extensionMs: 15 * 60_000 })
+          .then((alive) => {
+            if (!alive) response.destroy(new Error("provider attempt lease expired"));
+          })
+          .catch(() => response.destroy(new Error("provider attempt heartbeat failed")));
+      }, 10_000);
+      heartbeatTimer.unref();
       let responseBytes = 0;
       const usageChunks: Uint8Array[] = [];
       let usageBytes = 0;
@@ -640,9 +779,14 @@ export async function dispatchPublicOverflow(
       const reconcile = async (streamComplete: boolean) => {
         if (reconciled) return;
         reconciled = true;
+        clearInterval(heartbeatTimer);
         const ok = streamComplete && httpOk;
         if (!request.signal.aborted) {
-          await recordProviderHealth(target, request.userId, streamComplete && status < 500);
+          await recordProviderHealth(
+            target,
+            request.userId,
+            streamComplete && ![408, 409, 429].includes(status) && status < 500,
+          );
         }
         const usage = streamComplete ? parseProviderUsage(usageChunks) : undefined;
         await reconcileProviderBudget({
@@ -659,6 +803,34 @@ export async function dispatchPublicOverflow(
           revisionKind: "SNAPSHOT",
           usageSource: usage ? `${upstream.protocol}-response` : "missing-provider-usage",
           usage,
+        }).catch(() => undefined);
+        const state = request.signal.aborted ? "CANCELLED" : ok ? "COMPLETED" : "FAILED";
+        await finishProviderAttempt({
+          attemptId,
+          fencingToken,
+          state,
+          reason: terminalReason(request.signal, ok),
+        }).catch(() => false);
+        await recordProviderAttemptEvent({
+          userId: request.userId,
+          providerAccountId: target.providerAccountId,
+          providerModelId: target.providerModelId,
+          requestId: request.requestId,
+          attemptId,
+          fencingToken,
+          eventType: "TERMINAL",
+          reason: terminalReason(request.signal, ok),
+          requestedSurface: request.requestedSurface,
+          nativeSurface,
+          adapterMode: nativeSurface === request.requestedSurface ? "native" : "adapted",
+          usage: usage
+            ? {
+                inputTokens: usage.inputTokens?.toString() ?? null,
+                outputTokens: usage.outputTokens?.toString() ?? null,
+                confidence: usage.confidence,
+              }
+            : undefined,
+          metadata: { status, responseBytes, streamComplete },
         }).catch(() => undefined);
         resolveTerminal({ ok, responseBytes });
       };
@@ -699,6 +871,7 @@ export async function dispatchPublicOverflow(
         target,
         attemptId,
         fencingToken,
+        nativeSurface,
         attemptCount,
         terminal,
         response: new Response(bodyForbidden ? null : heldBody, {
@@ -707,7 +880,13 @@ export async function dispatchPublicOverflow(
         }),
       };
     } catch {
-      await recordProviderHealth(target, request.userId, false);
+      await recordProviderOutcome({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        success: false,
+        failureClass: "TRANSPORT",
+      }).catch(() => undefined);
       await reconcileProviderBudget({
         userId: request.userId,
         providerAccountId: target.providerAccountId,
@@ -721,6 +900,12 @@ export async function dispatchPublicOverflow(
         revisionSequence: 1n,
         revisionKind: "SNAPSHOT",
       }).catch(() => undefined);
+      await finishProviderAttempt({
+        attemptId,
+        fencingToken,
+        state: request.signal.aborted ? "CANCELLED" : "FAILED",
+        reason: request.signal.aborted ? "CANCELLED" : "TRANSPORT",
+      }).catch(() => false);
       if (!request.retrySafe) break;
     }
   }

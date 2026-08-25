@@ -17,7 +17,7 @@ LOCK TABLE discovered_model, execution_target, model_pool, model_api_token,
   capacity_lease, provider_account, provider_model, provider_credential,
   provider_budget_policy, provider_budget_rule, provider_attempt, provider_budget_reservation,
   provider_usage_ledger, provider_pricing_version, provider_budget_settlement,
-  provider_audit_event IN SHARE ROW EXCLUSIVE MODE;
+  provider_audit_event, public_provider_attempt_event IN SHARE ROW EXCLUSIVE MODE;
 
 -- Capacity policy bounds are database invariants because admission correctness
 -- must not depend on every rolling-deploy writer running the same validator.
@@ -1322,7 +1322,46 @@ DROP TRIGGER IF EXISTS provider_budget_settlement_immutable ON provider_budget_s
 CREATE TRIGGER provider_budget_settlement_immutable BEFORE UPDATE OR DELETE ON provider_budget_settlement
 FOR EACH ROW EXECUTE FUNCTION reject_immutable_provider_history_mutation();
 DROP TRIGGER IF EXISTS provider_attempt_immutable ON provider_attempt;
-CREATE TRIGGER provider_attempt_immutable BEFORE UPDATE OR DELETE ON provider_attempt
+DROP TRIGGER IF EXISTS provider_attempt_transition ON provider_attempt;
+CREATE OR REPLACE FUNCTION enforce_provider_attempt_transition()
+RETURNS trigger LANGUAGE plpgsql AS $provider_attempt_transition$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'provider_attempt is durable history' USING ERRCODE = '55000';
+  END IF;
+  IF ROW(NEW.id, NEW."createdAt", NEW."userId", NEW."providerAccountId", NEW."providerModelId", NEW."credentialId",
+         NEW."poolId", NEW."requestId", NEW."attemptId", NEW."fencingToken",
+         NEW."liabilityTokens", NEW."liabilitySpend", NEW."liabilityCurrency",
+         NEW."pricingVersion", NEW."accountingVersion")
+     IS DISTINCT FROM
+     ROW(OLD.id, OLD."createdAt", OLD."userId", OLD."providerAccountId", OLD."providerModelId", OLD."credentialId",
+         OLD."poolId", OLD."requestId", OLD."attemptId", OLD."fencingToken",
+         OLD."liabilityTokens", OLD."liabilitySpend", OLD."liabilityCurrency",
+         OLD."pricingVersion", OLD."accountingVersion") THEN
+    RAISE EXCEPTION 'provider_attempt identity and liability are immutable' USING ERRCODE = '55000';
+  END IF;
+  IF OLD.state <> 'ACTIVE' THEN
+    RAISE EXCEPTION 'invalid provider_attempt terminal transition' USING ERRCODE = '55000';
+  END IF;
+  IF NEW.state = 'ACTIVE' THEN
+    IF NEW."terminalAt" IS NOT NULL OR NEW."terminalReason" IS NOT NULL
+       OR NEW."heartbeatAt" < OLD."heartbeatAt" OR NEW."expiresAt" < NEW."heartbeatAt" THEN
+      RAISE EXCEPTION 'invalid active provider_attempt heartbeat' USING ERRCODE = '55000';
+    END IF;
+  ELSIF NEW.state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'EXPIRED')
+        OR NEW."terminalAt" IS NULL OR btrim(COALESCE(NEW."terminalReason", '')) = ''
+        OR NEW."expiresAt" IS DISTINCT FROM OLD."expiresAt"
+        OR NEW."heartbeatAt" < OLD."heartbeatAt" THEN
+    RAISE EXCEPTION 'invalid provider_attempt terminal fields' USING ERRCODE = '55000';
+  END IF;
+  RETURN NEW;
+END
+$provider_attempt_transition$;
+CREATE TRIGGER provider_attempt_transition BEFORE UPDATE OR DELETE ON provider_attempt
+FOR EACH ROW EXECUTE FUNCTION enforce_provider_attempt_transition();
+
+DROP TRIGGER IF EXISTS public_provider_attempt_event_immutable ON public_provider_attempt_event;
+CREATE TRIGGER public_provider_attempt_event_immutable BEFORE UPDATE OR DELETE ON public_provider_attempt_event
 FOR EACH ROW EXECUTE FUNCTION reject_immutable_provider_history_mutation();
 CREATE OR REPLACE FUNCTION enforce_provider_budget_reservation_transition()
 RETURNS trigger LANGUAGE plpgsql AS $provider_budget_reservation_transition$
