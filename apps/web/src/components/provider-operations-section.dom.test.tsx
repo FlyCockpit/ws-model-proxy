@@ -184,14 +184,29 @@ describe("ProviderOperationsSection mounted forms", () => {
     const budgetHeading = await screen.findByText("dashboard:providers.budgets");
     const form = budgetHeading.closest("form");
     if (!form) throw new Error("budget form missing");
-    const controls = within(form).getAllByRole("combobox");
-    expect(controls).toHaveLength(7);
-    for (const control of controls) await user.selectOptions(control, "UNLIMITED");
+    const budgetLabels = [
+      "dashboard:providers.fields.concurrencyAttempt",
+      "dashboard:providers.fields.tokensAttempt",
+      "dashboard:providers.fields.tokensDay",
+      "dashboard:providers.fields.tokensMonth",
+      "dashboard:providers.fields.tokensLifetime",
+      "dashboard:providers.fields.spendDay",
+      "dashboard:providers.fields.spendMonth",
+    ];
+    const budgetCards = budgetLabels.map((label) => {
+      const card = within(form).getByText(label).parentElement;
+      if (!card) throw new Error(`budget card missing: ${label}`);
+      return card;
+    });
+    for (const card of budgetCards)
+      await user.selectOptions(within(card).getByRole("combobox"), "UNLIMITED");
     expect(within(form).getAllByText("providers.unlimitedRuleWarning")).toHaveLength(7);
 
-    await user.selectOptions(controls[2]!, "LIMITED");
-    const dayValue = form.querySelector<HTMLInputElement>("#provider-budget-token-day-value");
-    if (!dayValue) throw new Error("daily token value missing");
+    const dayCard = budgetCards[2]!;
+    await user.selectOptions(within(dayCard).getByRole("combobox"), "LIMITED");
+    const dayValue = within(dayCard).getByRole("spinbutton", {
+      name: "providers.fields.limitValue",
+    });
     await user.clear(dayValue);
     const activate = within(form).getByRole("button", {
       name: "dashboard:providers.actions.activateBudget",
