@@ -264,7 +264,85 @@ describe("providerManagementRouter security boundary", () => {
     await expect(
       client.updateAccount({ id: "account", authType: "API_KEY" }),
     ).rejects.toMatchObject({ code: "CONFLICT" });
-    expect(db.$transaction).not.toHaveBeenCalled();
+    expect(db.$queryRaw).toHaveBeenCalledOnce();
+    expect(db.providerCredential.count).toHaveBeenCalledWith({
+      where: { userId: "owner", providerAccountId: "account" },
+    });
+    expect(db.providerAccount.updateMany).not.toHaveBeenCalled();
+    expect(db.$transaction).toHaveBeenCalledWith(expect.any(Function), {
+      isolationLevel: "Serializable",
+      maxWait: 5_000,
+      timeout: 10_000,
+    });
+  });
+
+  it("rechecks updateAccount ownership and liveness after locking", async () => {
+    envMock.enabled = true;
+    db.$queryRaw.mockResolvedValue([]);
+    db.providerAccount.findFirst.mockResolvedValue(null);
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(client.updateAccount({ id: "deleted", label: "changed" })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
+    expect(db.providerAccount.updateMany).not.toHaveBeenCalled();
+    expect(db.providerAuditEvent.create).not.toHaveBeenCalled();
+  });
+
+  it("conditionally updates a live account and emits exactly one audit", async () => {
+    envMock.enabled = true;
+    db.providerAccount.findFirst
+      .mockResolvedValueOnce({
+        id: "account",
+        userId: "owner",
+        authType: "BEARER",
+        baseUrl: "https://old.example",
+      })
+      .mockResolvedValueOnce({ id: "account", label: "changed" });
+    db.providerAccount.updateMany.mockResolvedValue({ count: 1 });
+    db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(client.updateAccount({ id: "account", label: "changed" })).resolves.toEqual({
+      id: "account",
+      label: "changed",
+    });
+    expect(db.providerAccount.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "account", userId: "owner", deletedAt: null } }),
+    );
+    expect(db.providerAuditEvent.create).toHaveBeenCalledOnce();
+  });
+
+  it("locks account then model and audits deleteModel exactly once", async () => {
+    envMock.enabled = true;
+    db.providerModel.findFirst.mockResolvedValue({
+      id: "model",
+      userId: "owner",
+      providerAccountId: "account",
+      deletedAt: null,
+    });
+    db.providerModel.updateMany.mockResolvedValue({ count: 1 });
+    db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(client.deleteModel({ id: "model" })).resolves.toEqual({ success: true });
+    expect(db.$queryRaw).toHaveBeenCalledTimes(2);
+    expect(db.providerModel.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: "model",
+        userId: "owner",
+        providerAccountId: "account",
+        deletedAt: null,
+      },
+      data: { deletedAt: expect.any(Date), enabled: false },
+    });
+    expect(db.providerAuditEvent.create).toHaveBeenCalledOnce();
+  });
+
+  it("does not duplicate deleteModel writes or audits after deletion", async () => {
+    envMock.enabled = true;
+    db.providerModel.findFirst.mockResolvedValue(null);
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(client.deleteModel({ id: "model" })).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(db.providerModel.updateMany).not.toHaveBeenCalled();
+    expect(db.providerAuditEvent.create).not.toHaveBeenCalled();
   });
 
   it("serializes credential revocation against replacement and remains idempotent", async () => {

@@ -79,13 +79,6 @@ async function accountFor(userId: string, accountId: string) {
   if (!row) throw missing();
   return row;
 }
-async function modelFor(userId: string, modelId: string) {
-  const row = await prisma.providerModel.findFirst({
-    where: { id: modelId, userId, deletedAt: null, ProviderAccount: { deletedAt: null } },
-  });
-  if (!row) throw missing();
-  return row;
-}
 const json = z.record(z.string(), z.unknown()).nullable().optional();
 const accountInput = z.object({
   providerType: z
@@ -179,33 +172,41 @@ export const providerManagementRouter = {
     .handler(async ({ input, context }) => {
       enabled();
       const userId = context.session.user.id;
-      const current = await accountFor(userId, input.id);
       const { id: accountId, ...data } = input;
-      if (data.authType && data.authType !== current.authType) {
-        const credentialCount = await prisma.providerCredential.count({
-          where: { userId, providerAccountId: accountId },
-        });
-        if (credentialCount > 0)
-          throw new ORPCError("CONFLICT", {
-            message: "Replace or revoke provider credentials before changing authentication type",
-          });
-      }
-      let endpointChanged = false;
       if (data.baseUrl) {
         data.baseUrl = validateProviderBaseUrl(data.baseUrl, policy()).href.replace(/\/$/u, "");
-        endpointChanged = data.baseUrl !== current.baseUrl;
       }
       return prisma.$transaction(async (tx) => {
-        const row = await tx.providerAccount.update({
-          where: { id: accountId },
+        await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${accountId} AND "userId" = ${userId} FOR UPDATE`;
+        const current = await tx.providerAccount.findFirst({
+          where: { id: accountId, userId, deletedAt: null },
+        });
+        if (!current) throw missing();
+        if (data.authType && data.authType !== current.authType) {
+          const credentialCount = await tx.providerCredential.count({
+            where: { userId, providerAccountId: accountId },
+          });
+          if (credentialCount > 0)
+            throw new ORPCError("CONFLICT", {
+              message: "Replace or revoke provider credentials before changing authentication type",
+            });
+        }
+        const endpointChanged = data.baseUrl !== undefined && data.baseUrl !== current.baseUrl;
+        const updated = await tx.providerAccount.updateMany({
+          where: { id: accountId, userId, deletedAt: null },
           data: {
             ...(data as Prisma.ProviderAccountUpdateInput),
             ...(endpointChanged
               ? { endpointIdentity: data.baseUrl, endpointVersion: { increment: 1 } }
               : {}),
           },
+        });
+        if (updated.count !== 1) throw missing();
+        const row = await tx.providerAccount.findFirst({
+          where: { id: accountId, userId, deletedAt: null },
           select: accountSelect,
         });
+        if (!row) throw missing();
         await tx.providerAuditEvent.create({
           data: {
             userId,
@@ -215,7 +216,7 @@ export const providerManagementRouter = {
           },
         });
         return row;
-      });
+      }, providerWriteTransaction);
     }),
   deleteAccount: protectedProcedure.input(z.object({ id })).handler(async ({ input, context }) => {
     enabled();
@@ -229,7 +230,7 @@ export const providerManagementRouter = {
       });
       if (!account) throw missing();
       const deleted = await tx.providerAccount.updateMany({
-        where: { id: input.id },
+        where: { id: input.id, userId, deletedAt: null },
         data: { deletedAt: now, enabled: false, status: "DISABLED", currentCredentialId: null },
       });
       if (deleted.count !== 1) throw new ORPCError("CONFLICT");
@@ -338,12 +339,28 @@ export const providerManagementRouter = {
   deleteModel: protectedProcedure.input(z.object({ id })).handler(async ({ input, context }) => {
     enabled();
     const userId = context.session.user.id;
-    const current = await modelFor(userId, input.id);
     await prisma.$transaction(async (tx) => {
-      await tx.providerModel.update({
-        where: { id: input.id },
+      await tx.$queryRaw`SELECT a.id FROM provider_account a WHERE a.id = (SELECT m."providerAccountId" FROM provider_model m WHERE m.id = ${input.id} AND m."userId" = ${userId}) AND a."userId" = ${userId} FOR UPDATE`;
+      await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${input.id} AND "userId" = ${userId} FOR UPDATE`;
+      const current = await tx.providerModel.findFirst({
+        where: {
+          id: input.id,
+          userId,
+          deletedAt: null,
+          ProviderAccount: { deletedAt: null },
+        },
+      });
+      if (!current) throw missing();
+      const deleted = await tx.providerModel.updateMany({
+        where: {
+          id: input.id,
+          userId,
+          providerAccountId: current.providerAccountId,
+          deletedAt: null,
+        },
         data: { deletedAt: new Date(), enabled: false },
       });
+      if (deleted.count !== 1) throw missing();
       await tx.providerAuditEvent.create({
         data: {
           userId,
@@ -352,7 +369,7 @@ export const providerManagementRouter = {
           subjectId: input.id,
         },
       });
-    });
+    }, providerWriteTransaction);
     return { success: true };
   }),
   listCredentials: protectedProcedure
