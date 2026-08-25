@@ -1705,6 +1705,7 @@ describe("forwarderManagementRouter", () => {
 
   it("returns a generic not-found result for unmatched grant emails", async () => {
     db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+    db.poolMember.findFirst.mockResolvedValue(null);
     db.user.findFirst.mockResolvedValue(null);
 
     await expect(

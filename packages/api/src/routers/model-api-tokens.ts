@@ -104,6 +104,8 @@ function serializeTargets(targets: VisibleModelTargets) {
       description: pool.description,
       publicEgressEnabled: pool.publicEgressEnabled,
       publicEgressAcknowledged: pool.publicEgressAcknowledged,
+      effectiveProviderEgress: pool.effectiveProviderEgress,
+      providerPrimaryMemberCount: pool.providerPrimaryMemberCount,
       ownerUserId: pool.ownerUserId,
       ownerUserSlug: pool.ownerUserSlug,
       poolSlug: pool.poolSlug,

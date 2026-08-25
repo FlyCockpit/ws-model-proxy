@@ -4694,6 +4694,8 @@ function TokenEgressWarnings({
     name: string;
     publicEgressEnabled: boolean;
     publicEgressAcknowledged: boolean;
+    effectiveProviderEgress?: boolean;
+    providerPrimaryMemberCount?: number;
   }>;
   compact?: boolean;
 }) {

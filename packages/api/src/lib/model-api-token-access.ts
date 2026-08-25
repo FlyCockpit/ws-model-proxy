@@ -45,6 +45,9 @@ export type VisibleModelPoolTarget = {
   protocolAdaptationEnabled: boolean;
   publicEgressEnabled: boolean;
   publicEgressAcknowledged: boolean;
+  /** True when this pool can send requests to any external provider, including PRIMARY. */
+  effectiveProviderEgress: boolean;
+  providerPrimaryMemberCount: number;
   allowLossyDeveloperRoleCollapse: boolean;
   recommendedSurfaceOverride: ModelApiSurface | null;
 };
@@ -89,6 +92,7 @@ type ModelPoolRow = {
   publicEgressAcknowledged: boolean;
   allowLossyDeveloperRoleCollapse: boolean;
   recommendedSurfaceOverride: string | null;
+  PoolMembers?: Array<{ id: string }>;
   User: { slug: string };
 };
 
@@ -143,6 +147,8 @@ function serializeModelPool(
     protocolAdaptationEnabled: row.protocolAdaptationEnabled,
     publicEgressEnabled: row.publicEgressEnabled,
     publicEgressAcknowledged: row.publicEgressAcknowledged,
+    effectiveProviderEgress: row.publicEgressEnabled || (row.PoolMembers?.length ?? 0) > 0,
+    providerPrimaryMemberCount: row.PoolMembers?.length ?? 0,
     allowLossyDeveloperRoleCollapse: row.allowLossyDeveloperRoleCollapse,
     recommendedSurfaceOverride: parseModelApiSurface(row.recommendedSurfaceOverride),
   };
@@ -196,6 +202,14 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
         publicEgressAcknowledged: true,
         allowLossyDeveloperRoleCollapse: true,
         recommendedSurfaceOverride: true,
+        PoolMembers: {
+          where: {
+            tier: "PRIMARY",
+            routingStatus: "ACTIVE",
+            ExecutionTarget: { ProviderModel: { isNot: null } },
+          },
+          select: { id: true },
+        },
         User: { select: { slug: true } },
       },
     }),
@@ -218,6 +232,14 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
             publicEgressAcknowledged: true,
             allowLossyDeveloperRoleCollapse: true,
             recommendedSurfaceOverride: true,
+            PoolMembers: {
+              where: {
+                tier: "PRIMARY",
+                routingStatus: "ACTIVE",
+                ExecutionTarget: { ProviderModel: { isNot: null } },
+              },
+              select: { id: true },
+            },
             User: { select: { slug: true } },
           },
         },

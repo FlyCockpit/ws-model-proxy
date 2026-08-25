@@ -10,7 +10,7 @@ describe("publicEgressResourceNames", () => {
         {
           name: "Provider primary",
           publicEgressEnabled: false,
-          members: [{ providerModel: { id: "provider" } }],
+          effectiveProviderEgress: true,
         },
         { name: "Guarded overflow", publicEgressEnabled: true },
       ]),

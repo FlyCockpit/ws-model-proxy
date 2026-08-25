@@ -1,6 +1,7 @@
 export type PublicEgressResource = {
   name: string;
   publicEgressEnabled: boolean;
+  effectiveProviderEgress?: boolean;
   members?: ReadonlyArray<{ providerModel?: unknown | null }>;
 };
 
@@ -8,7 +9,9 @@ export function publicEgressResourceNames(resources: PublicEgressResource[]): st
   return resources
     .filter(
       (resource) =>
-        resource.publicEgressEnabled || resource.members?.some((member) => member.providerModel),
+        resource.effectiveProviderEgress === true ||
+        resource.publicEgressEnabled ||
+        resource.members?.some((member) => member.providerModel),
     )
     .map((resource) => resource.name);
 }

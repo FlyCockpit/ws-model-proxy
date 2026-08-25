@@ -166,6 +166,8 @@ const poolTarget: VisibleModelPoolTarget = {
   protocolAdaptationEnabled: false,
   publicEgressEnabled: false,
   publicEgressAcknowledged: false,
+  effectiveProviderEgress: false,
+  providerPrimaryMemberCount: 0,
   allowLossyDeveloperRoleCollapse: false,
   recommendedSurfaceOverride: null,
 };

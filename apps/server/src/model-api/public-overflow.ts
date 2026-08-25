@@ -639,6 +639,7 @@ export async function listPublicOverflowTargets(
       affinityPolicy: defaultAffinityPolicy,
       targets: [],
     };
+  const now = new Date();
   const targets = pool.PoolMembers.flatMap((member) => {
     const model = member.ExecutionTarget?.ProviderModel;
     const account = model?.ProviderAccount;
@@ -659,8 +660,8 @@ export async function listPublicOverflowTargets(
       model.deletedAt ||
       account.deletedAt ||
       credential.status !== "ACTIVE" ||
-      (model.healthStatus === "UNAVAILABLE" && model.healthNextRetryAt === null) ||
-      (account.healthStatus === "UNAVAILABLE" && account.healthNextRetryAt === null)
+      !providerHealthCooldownElapsed(model.healthStatus, model.healthNextRetryAt, now) ||
+      !providerHealthCooldownElapsed(account.healthStatus, account.healthNextRetryAt, now)
     )
       return [];
     return [
@@ -712,6 +713,14 @@ export async function listPublicOverflowTargets(
     },
     targets,
   };
+}
+
+export function providerHealthCooldownElapsed(
+  status: string,
+  nextRetryAt: Date | null,
+  now: Date,
+): boolean {
+  return status !== "UNAVAILABLE" || (nextRetryAt !== null && nextRetryAt <= now);
 }
 
 function joinProviderPath(baseUrl: string, path: string): string {
@@ -1318,76 +1327,9 @@ export async function rankPublicOverflowTargets(input: {
   } catch {
     return { targets: input.targets, decision: null };
   }
-  const [loads, pricing] = await Promise.all([
-    prisma.providerAttempt.groupBy({
-      by: ["providerModelId"],
-      where: {
-        userId: input.request.userId,
-        state: "ACTIVE",
-        providerModelId: { in: input.targets.map((target) => target.providerModelId) },
-      },
-      _count: { _all: true },
-    }),
-    Promise.all(
-      input.targets.map((target) =>
-        resolveActiveProviderPricing({
-          userId: input.request.userId,
-          providerAccountId: target.providerAccountId,
-          providerModelId: target.providerModelId,
-        }),
-      ),
-    ),
-  ]);
-  const loadByModel = new Map(loads.map((row) => [row.providerModelId, row._count._all]));
-  const liabilities = input.targets.map((_target, index) => {
-    const targetPricing = pricing[index];
-    return input.request.estimatedInputTokens !== undefined &&
-      input.request.requestedOutputTokens !== undefined
-      ? liabilityFromPricing({
-          estimatedInputTokens: input.request.estimatedInputTokens,
-          requestedOutputTokens: input.request.requestedOutputTokens,
-          pricing: targetPricing,
-        })
-      : input.request.liability;
-  });
-  const comparableCurrency =
-    liabilities.every(({ spend }) => spend !== undefined) &&
-    new Set(liabilities.map(({ currency }) => currency ?? null)).size === 1;
-  const affinityTargets = input.targets.map((target, index) => {
-    const liability = liabilities[index] ?? input.request.liability;
-    return {
-      poolMemberId: target.poolMemberId,
-      executionTargetId: target.executionTargetId,
-      targetIdentity: buildAffinityTargetIdentity({
-        executionTargetId: target.executionTargetId,
-        endpointIdentity: `${target.providerAccountId}:${target.endpointIdentity}:${target.endpointVersion}`,
-        upstreamModelId: `${target.providerModelId}:${target.upstreamModelId}`,
-        runtimeIdentityKey: target.providerAccountId,
-        runtimeModel: target.upstreamModelId,
-        runtimeRevision: target.providerVersion,
-        tokenizer: null,
-        tokenizerVersion: null,
-        template: null,
-        templateVersion: null,
-        engine: target.protocol,
-        cacheNamespace: null,
-        requestedSurface: input.request.requestedSurface,
-        nativeSurface:
-          selectedNativeSurface(target, input.request.requestedSurface) ??
-          input.request.requestedSurface,
-        mode: target.nativeSurfaces.includes(input.request.requestedSurface) ? "native" : "adapted",
-        adapterVersion: target.nativeSurfaces.includes(input.request.requestedSurface)
-          ? "native"
-          : ADAPTER_VERSION,
-      }),
-      capacityId: `provider:${target.providerModelId}`,
-      hardConcurrencyLimit: target.concurrencyLimit ?? null,
-      activeLoad: loadByModel.get(target.providerModelId) ?? 0,
-      waitingLoad: 0,
-      healthPenalty: providerHealthPenalty(target.healthStatus),
-      publicEgressPenalty: 100,
-      costPenalty: comparableCurrency ? providerCostPenalty(liability) : 0,
-    };
+  const affinityTargets = await buildProviderAffinityTargets({
+    request: input.request,
+    targets: input.targets,
   });
   const decision = await rankAffinityTargets({
     ownerId: input.request.userId,
@@ -1424,6 +1366,86 @@ export async function rankPublicOverflowTargets(input: {
         : [];
     }),
   };
+}
+
+export async function buildProviderAffinityTargets(input: {
+  request: Pick<
+    PublicOverflowRequest,
+    "userId" | "requestedSurface" | "estimatedInputTokens" | "requestedOutputTokens" | "liability"
+  >;
+  targets: PublicProviderTarget[];
+}): Promise<AffinityTarget[]> {
+  const [loads, pricing] = await Promise.all([
+    prisma.providerAttempt.groupBy({
+      by: ["providerModelId"],
+      where: {
+        userId: input.request.userId,
+        state: "ACTIVE",
+        providerModelId: { in: input.targets.map((target) => target.providerModelId) },
+      },
+      _count: { _all: true },
+    }),
+    Promise.all(
+      input.targets.map((target) =>
+        resolveActiveProviderPricing({
+          userId: input.request.userId,
+          providerAccountId: target.providerAccountId,
+          providerModelId: target.providerModelId,
+        }),
+      ),
+    ),
+  ]);
+  const loadByModel = new Map(loads.map((row) => [row.providerModelId, row._count._all]));
+  const liabilities = input.targets.map((_target, index) => {
+    const targetPricing = pricing[index];
+    return input.request.estimatedInputTokens !== undefined &&
+      input.request.requestedOutputTokens !== undefined
+      ? liabilityFromPricing({
+          estimatedInputTokens: input.request.estimatedInputTokens,
+          requestedOutputTokens: input.request.requestedOutputTokens,
+          pricing: targetPricing,
+        })
+      : input.request.liability;
+  });
+  const comparableCurrency =
+    liabilities.every(({ spend }) => spend !== undefined) &&
+    new Set(liabilities.map(({ currency }) => currency ?? null)).size === 1;
+  return input.targets.map((target, index) => {
+    const liability = liabilities[index] ?? input.request.liability;
+    return {
+      poolMemberId: target.poolMemberId,
+      executionTargetId: target.executionTargetId,
+      targetIdentity: buildAffinityTargetIdentity({
+        executionTargetId: target.executionTargetId,
+        endpointIdentity: `${target.providerAccountId}:${target.endpointIdentity}:${target.endpointVersion}`,
+        upstreamModelId: `${target.providerModelId}:${target.upstreamModelId}`,
+        runtimeIdentityKey: target.providerAccountId,
+        runtimeModel: target.upstreamModelId,
+        runtimeRevision: target.providerVersion,
+        tokenizer: null,
+        tokenizerVersion: null,
+        template: null,
+        templateVersion: null,
+        engine: target.protocol,
+        cacheNamespace: null,
+        requestedSurface: input.request.requestedSurface,
+        nativeSurface:
+          selectedNativeSurface(target, input.request.requestedSurface) ??
+          input.request.requestedSurface,
+        mode: target.nativeSurfaces.includes(input.request.requestedSurface) ? "native" : "adapted",
+        adapterVersion: target.nativeSurfaces.includes(input.request.requestedSurface)
+          ? "native"
+          : ADAPTER_VERSION,
+      }),
+      capacityId: `provider:${target.providerModelId}`,
+      hardConcurrencyLimit: target.concurrencyLimit ?? null,
+      activeLoad: loadByModel.get(target.providerModelId) ?? 0,
+      waitingLoad: 0,
+      healthPenalty: providerHealthPenalty(target.healthStatus),
+      publicEgressPenalty: 100,
+      costPenalty: comparableCurrency ? providerCostPenalty(liability) : 0,
+    };
+  });
 }
 
 /**

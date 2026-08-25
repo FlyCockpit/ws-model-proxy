@@ -220,6 +220,7 @@ describe("modelApiTokenAccess", () => {
         recommendedSurfaceOverride: "UNSUPPORTED_FUTURE_SURFACE",
         publicEgressEnabled: true,
         publicEgressAcknowledged: true,
+        PoolMembers: [{ id: "provider-primary-member" }],
       };
       db.discoveredModel.findMany.mockResolvedValue([]);
       db.modelPool.findMany.mockResolvedValue([ownedPool]);
@@ -235,6 +236,8 @@ describe("modelApiTokenAccess", () => {
       expect(result.modelPools[0]).toMatchObject({
         publicEgressEnabled: true,
         publicEgressAcknowledged: true,
+        effectiveProviderEgress: true,
+        providerPrimaryMemberCount: 1,
       });
     });
 

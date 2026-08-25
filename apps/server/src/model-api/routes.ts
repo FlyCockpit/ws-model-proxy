@@ -142,6 +142,7 @@ import {
   safeProviderRetryAfter,
 } from "./protocols/index.js";
 import {
+  buildProviderAffinityTargets,
   conservativeProviderLiability,
   conservativeSerializedInputTokens,
   dispatchPublicOverflow,
@@ -3427,7 +3428,7 @@ async function relayPool({
           requestId: crypto.randomUUID(),
           relayRequestId,
           attemptId: crypto.randomUUID(),
-          ownerId: requester.userId,
+          ownerId: target.ownerUserId,
           sourceKind: "POOL",
           poolId: target.id,
           basePriority: 16,
@@ -3776,8 +3777,14 @@ async function relayPool({
   // Known-compatible members always route before optimistic unknown fallbacks.
   const eligibleMembers = [...knownEligibleMembers, ...unknownFallbackMembers];
   let providerPrimaryTargets: PublicProviderTarget[] = [];
+  let providerAffinityPolicy: AffinityPolicy | null = null;
+  let providerAffinityLiability: Pick<
+    PublicOverflowRequest,
+    "userId" | "requestedSurface" | "estimatedInputTokens" | "requestedOutputTokens" | "liability"
+  > | null = null;
   if (operation.contextInput && requestedSurface) {
     const listed = await listPublicOverflowTargets(target.ownerUserId, target.id, "PRIMARY");
+    providerAffinityPolicy = listed.affinityPolicy;
     const maxOutput = operation.contextInput.max_output_tokens ?? operation.contextInput.max_tokens;
     const requestedOutputTokens =
       typeof maxOutput === "number" && Number.isSafeInteger(maxOutput) && maxOutput >= 0
@@ -3793,6 +3800,16 @@ async function relayPool({
     const requiredFeatures = Object.entries(requestedFeatures)
       .filter(([, enabled]) => enabled === true)
       .map(([feature]) => feature);
+    providerAffinityLiability = {
+      userId: target.ownerUserId,
+      requestedSurface,
+      estimatedInputTokens,
+      requestedOutputTokens,
+      liability:
+        requestedOutputTokens === undefined
+          ? { accountingVersion: "provider-billable-v1" }
+          : conservativeProviderLiability({ estimatedInputTokens, requestedOutputTokens }),
+    };
     providerPrimaryTargets = listed.targets.filter(
       (providerTarget) =>
         (!forcedPoolMemberId || providerTarget.poolMemberId === forcedPoolMemberId) &&
@@ -3958,7 +3975,7 @@ async function relayPool({
   const affinityPayload = operation.contextInput ?? operation.adaptation?.payload ?? null;
   const affinityPolicy = eligibleMembers[0]
     ? affinityPolicyForMember(eligibleMembers[0])
-    : {
+    : (providerAffinityPolicy ?? {
         enabled: false,
         ttlSeconds: 3600,
         maxRecords: 10_000,
@@ -3966,8 +3983,17 @@ async function relayPool({
         conversationWeight: 150,
         confirmedCacheWeight: 250,
         loadPenaltyWeight: 100,
-      };
+      });
   if (requestedSurface && affinityPayload && affinityPolicy.enabled) {
+    const providerAffinityTargets = providerAffinityLiability
+      ? await buildProviderAffinityTargets({
+          request: providerAffinityLiability,
+          targets: providerPrimaryTargets,
+        })
+      : [];
+    const providerAffinityByMember = new Map(
+      providerAffinityTargets.map((candidate) => [candidate.poolMemberId, candidate]),
+    );
     const affinityTargets = routeCandidates.flatMap((candidate) => {
       const member = memberById.get(candidate.poolMemberId);
       const affinityTarget = member
@@ -3977,14 +4003,14 @@ async function relayPool({
             executionByMember.get(member.id),
             candidate.healthStatus,
           )
-        : null;
+        : (providerAffinityByMember.get(candidate.poolMemberId) ?? null);
       return affinityTarget ? [affinityTarget] : [];
     });
     if (affinityTargets.length === routeCandidates.length) {
       try {
         affinityDecision = await rankAffinityTargets({
           ownerId: requester.userId,
-          resourceOwnerId: eligibleMembers[0]!.DiscoveredModel.userId,
+          resourceOwnerId: target.ownerUserId,
           poolId: target.id,
           policy: affinityPolicy,
           surface: requestedSurface,
@@ -4007,8 +4033,12 @@ async function relayPool({
             const classDifference =
               modeRank(left.candidate.poolMemberId) - modeRank(right.candidate.poolMemberId);
             if (classDifference !== 0) return classDifference;
-            const leftTarget = memberById.get(left.candidate.poolMemberId)?.ExecutionTarget?.id;
-            const rightTarget = memberById.get(right.candidate.poolMemberId)?.ExecutionTarget?.id;
+            const leftTarget =
+              memberById.get(left.candidate.poolMemberId)?.ExecutionTarget?.id ??
+              providerByMemberId.get(left.candidate.poolMemberId)?.executionTargetId;
+            const rightTarget =
+              memberById.get(right.candidate.poolMemberId)?.ExecutionTarget?.id ??
+              providerByMemberId.get(right.candidate.poolMemberId)?.executionTargetId;
             return (
               (leftTarget
                 ? (affinityOrder.get(leftTarget) ?? left.originalIndex)
@@ -4052,7 +4082,7 @@ async function relayPool({
           requestId: crypto.randomUUID(),
           relayRequestId,
           attemptId: crypto.randomUUID(),
-          ownerId: requester.userId,
+          ownerId: target.ownerUserId,
           sourceKind: "POOL",
           poolId: target.id,
           basePriority: 16,
@@ -4160,7 +4190,7 @@ async function relayPool({
             requestId: crypto.randomUUID(),
             relayRequestId,
             attemptId: crypto.randomUUID(),
-            ownerId: requester.userId,
+            ownerId: target.ownerUserId,
             sourceKind: "POOL",
             poolId: target.id,
             basePriority: 16,

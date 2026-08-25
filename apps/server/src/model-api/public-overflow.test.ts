@@ -20,9 +20,28 @@ import {
   exactResponsesNativeSurface,
   matchesExactResponsesBinding,
   parseProviderUsage,
+  providerHealthCooldownElapsed,
   providerHealthOutcome,
   publicTargetCompatibility,
 } from "./public-overflow.js";
+
+describe("provider health cooldown", () => {
+  const now = new Date("2026-08-25T12:00:00.000Z");
+
+  it.each(["provider model", "provider account"])(
+    "excludes an unavailable %s until its database cooldown is due",
+    () => {
+      expect(
+        providerHealthCooldownElapsed("UNAVAILABLE", new Date("2026-08-25T12:00:01.000Z"), now),
+      ).toBe(false);
+      expect(providerHealthCooldownElapsed("UNAVAILABLE", null, now)).toBe(false);
+      expect(providerHealthCooldownElapsed("UNAVAILABLE", now, now)).toBe(true);
+      expect(
+        providerHealthCooldownElapsed("UNAVAILABLE", new Date("2026-08-25T11:59:59.000Z"), now),
+      ).toBe(true);
+    },
+  );
+});
 
 const request = {
   requestedProtocol: "openai" as const,

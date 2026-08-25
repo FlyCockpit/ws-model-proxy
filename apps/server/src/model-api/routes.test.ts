@@ -20,13 +20,18 @@ const affinity = vi.hoisted(() => ({
   rank: vi.fn(),
   remember: vi.fn(),
 }));
-const publicOverflow = vi.hoisted(() => ({ dispatch: vi.fn(), list: vi.fn() }));
+const publicOverflow = vi.hoisted(() => ({
+  dispatch: vi.fn(),
+  list: vi.fn(),
+  buildAffinityTargets: vi.fn(),
+}));
 vi.mock("./public-overflow.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./public-overflow.js")>();
   return {
     ...actual,
     dispatchPublicOverflow: publicOverflow.dispatch,
     listPublicOverflowTargets: publicOverflow.list,
+    buildProviderAffinityTargets: publicOverflow.buildAffinityTargets,
   };
 });
 vi.mock("./cache-affinity.js", async (importOriginal) => {
@@ -233,6 +238,8 @@ const poolTarget: VisibleModelPoolTarget = {
   protocolAdaptationEnabled: false,
   publicEgressEnabled: false,
   publicEgressAcknowledged: false,
+  effectiveProviderEgress: false,
+  providerPrimaryMemberCount: 0,
   allowLossyDeveloperRoleCollapse: false,
   recommendedSurfaceOverride: null,
 };
@@ -619,6 +626,20 @@ describe("model API routes", () => {
       },
       targets: [],
     });
+    publicOverflow.buildAffinityTargets.mockImplementation(async ({ targets }) =>
+      targets.map((target: { poolMemberId: string; executionTargetId: string }) => ({
+        poolMemberId: target.poolMemberId,
+        executionTargetId: target.executionTargetId,
+        targetIdentity: `identity:${target.executionTargetId}`,
+        capacityId: `capacity:${target.executionTargetId}`,
+        hardConcurrencyLimit: 4,
+        activeLoad: 0,
+        waitingLoad: 0,
+        healthPenalty: 0,
+        publicEgressPenalty: 100,
+        costPenalty: 0,
+      })),
+    );
   });
 
   it("applies affinity only after pool compatibility and persists it after success", async () => {
@@ -3265,7 +3286,7 @@ describe("model API routes", () => {
       enabled: false,
       acknowledged: false,
       affinityPolicy: {
-        enabled: false,
+        enabled: true,
         ttlSeconds: 3600,
         maxRecords: 10_000,
         prefixWeight: 100,
@@ -3311,6 +3332,13 @@ describe("model API routes", () => {
     expect(response.status).toBe(200);
     expect(publicOverflow.dispatch).toHaveBeenCalledTimes(1);
     expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({ memberTier: "PRIMARY" });
+    expect(affinity.rank).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ownerId: "user-id",
+        resourceOwnerId: "user-id",
+        targets: [expect.objectContaining({ poolMemberId: "primary-provider-member" })],
+      }),
+    );
     expect(db.relayRequest.update).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
@@ -3323,9 +3351,14 @@ describe("model API routes", () => {
   });
 
   it("admits local and provider PRIMARY members through one scored capacity candidate set", async () => {
+    const grantedPoolTarget = {
+      ...poolTarget,
+      ownerUserId: "pool-owner-id",
+      accessGrantId: "grant-id",
+    };
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
-      modelPools: [poolTarget],
+      modelPools: [grantedPoolTarget],
     });
     db.poolMember.findMany.mockResolvedValue([
       poolMemberRow({
@@ -3334,6 +3367,7 @@ describe("model API routes", () => {
         upstreamModelId: "local-upstream",
         cliDeviceId: "cli-local",
         weight: 1,
+        affinityEnabled: true,
       }),
     ]);
     const provider = { ...providerPrimaryTarget(), weight: 5 };
@@ -3341,7 +3375,7 @@ describe("model API routes", () => {
       enabled: false,
       acknowledged: false,
       affinityPolicy: {
-        enabled: false,
+        enabled: true,
         ttlSeconds: 3600,
         maxRecords: 10_000,
         prefixWeight: 100,
@@ -3388,7 +3422,7 @@ describe("model API routes", () => {
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-local"];
 
-    const response = await appWith(manager, true, false, capacityRuntime).request(
+    const responsePromise = appWith(manager, true, false, capacityRuntime).request(
       "/chat/completions",
       {
         method: "POST",
@@ -3396,31 +3430,35 @@ describe("model API routes", () => {
           authorization: "Bearer wsmp_model_test",
           "content-type": "application/json",
         },
-        body: requestBody(poolTarget.modelId),
+        body: requestBody(grantedPoolTarget.modelId),
       },
     );
+    await vi.waitFor(() => {
+      expect(publicOverflow.dispatch.mock.calls.length + manager.sent.length).toBeGreaterThan(0);
+    });
+    if (manager.sent[0]) await completeJsonRelay({ manager, requestId: manager.sent[0].requestId });
+    const response = await responsePromise;
 
     expect(response.status).toBe(200);
-    expect(manager.sent).toHaveLength(0);
     expect(capacityRuntime.acquire).toHaveBeenCalledWith(
       expect.objectContaining({
-        candidates: [
-          expect.objectContaining({ poolMemberId: provider.poolMemberId, candidateOrder: 0 }),
-          expect.objectContaining({ poolMemberId: "local-primary", candidateOrder: 1 }),
-        ],
+        ownerId: "pool-owner-id",
+        candidates: expect.arrayContaining([
+          expect.objectContaining({ poolMemberId: provider.poolMemberId }),
+          expect.objectContaining({ poolMemberId: "local-primary" }),
+        ]),
       }),
       expect.any(AbortSignal),
     );
-    expect(publicOverflow.dispatch).toHaveBeenCalledWith(
+    expect(affinity.rank).toHaveBeenCalledWith(
       expect.objectContaining({
-        memberTier: "PRIMARY",
-        forcedPoolMemberId: provider.poolMemberId,
+        ownerId: "user-id",
+        resourceOwnerId: "pool-owner-id",
+        targets: expect.arrayContaining([
+          expect.objectContaining({ poolMemberId: provider.poolMemberId }),
+          expect.objectContaining({ poolMemberId: "local-primary" }),
+        ]),
       }),
-    );
-    expect(capacityRuntime.hold).toHaveBeenCalledWith(
-      expect.any(Response),
-      expect.objectContaining({ poolMemberId: provider.poolMemberId }),
-      expect.any(AbortSignal),
     );
   });
 
