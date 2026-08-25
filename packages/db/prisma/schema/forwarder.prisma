@@ -578,6 +578,7 @@ model CapacityWaiter {
   poolId                      String?
   poolMemberId                String?
   candidateOrder              Int
+  deadlineAt                  DateTime?
   effectivePriority           Int                  @default(16)
   effectiveConcurrencyLimit   Int?
   effectiveConcurrencyScope   String               @default("")
@@ -596,7 +597,7 @@ model CapacityWaiter {
   @@unique([admissionRequestId, candidateOrder])
   @@unique([attemptId, candidateOrder])
   @@unique([admissionRequestId, capacityId, executionTargetId, poolMemberId])
-  @@index([capacityId, state, candidateOrder])
+  @@index([capacityId, state, deadlineAt, candidateOrder])
   @@index([admissionRequestId, state])
   @@index([poolMemberId, state])
   @@map("capacity_waiter")

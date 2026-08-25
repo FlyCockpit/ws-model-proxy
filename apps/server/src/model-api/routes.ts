@@ -648,11 +648,25 @@ function effectiveMemberWaitBudget(member: PoolMemberRelayRow): number | null {
   return member.ModelPool?.capacityWaitBudgetMs ?? null;
 }
 
-function effectivePoolCandidateWaitBudget(members: readonly PoolMemberRelayRow[]): number | null {
-  const limited = members
-    .map(effectiveMemberWaitBudget)
-    .filter((budget): budget is number => budget !== null);
-  return limited.length ? Math.min(...limited) : null;
+function poolAdmissionCandidate(
+  member: PoolMemberRelayRow,
+  candidateOrder: number,
+  nowMs: number,
+  requestDeadlineMs: number,
+) {
+  const identity = member.ExecutionTarget;
+  if (!identity?.inferenceCapacityId) return null;
+  return {
+    capacityId: identity.inferenceCapacityId,
+    executionTargetId: identity.id,
+    poolMemberId: member.id,
+    candidateOrder,
+    deadlineAt: boundedAdmissionDeadline(
+      nowMs,
+      requestDeadlineMs,
+      effectiveMemberWaitBudget(member),
+    ),
+  };
 }
 
 const poolRelayFailureClassSet: ReadonlySet<string> = new Set(relayFailureClasses);
@@ -1864,6 +1878,11 @@ function reportCleanupFailures(results: readonly PromiseSettledResult<unknown>[]
   if (failures) console.warn(`[model-api] ${failures} relay cleanup operation(s) failed`);
 }
 
+async function settleRelayCleanup(tasks: readonly (() => unknown | PromiseLike<unknown>)[]) {
+  const results = await Promise.allSettled(tasks.map((task) => Promise.resolve().then(task)));
+  reportCleanupFailures(results);
+}
+
 function rejectedRelayTerminal(): RelayAttemptTerminal {
   return {
     ok: false,
@@ -2905,16 +2924,12 @@ async function relayPool({
     await updateContextCountMetadata(relayRequestId, count);
   };
   if (capacityRuntime) {
+    const admissionStartedAt = Date.now();
     const admissionCandidates = routeCandidates.map((candidate, candidateOrder) => {
       const member = memberById.get(candidate.poolMemberId);
-      const identity = member?.ExecutionTarget;
-      if (!identity?.inferenceCapacityId) return null;
-      return {
-        capacityId: identity.inferenceCapacityId,
-        executionTargetId: identity.id,
-        poolMemberId: candidate.poolMemberId,
-        candidateOrder,
-      };
+      return member
+        ? poolAdmissionCandidate(member, candidateOrder, admissionStartedAt, relayDeadlineMs)
+        : null;
     });
     if (admissionCandidates.some((candidate) => candidate === null)) {
       globalLease?.release();
@@ -2935,15 +2950,7 @@ async function relayPool({
           poolId: target.id,
           basePriority: 16,
           connectionOwner: "model-api",
-          deadlineAt: boundedAdmissionDeadline(
-            Date.now(),
-            relayDeadlineMs,
-            effectivePoolCandidateWaitBudget(
-              routeCandidates
-                .map(({ poolMemberId }) => memberById.get(poolMemberId))
-                .filter((member): member is PoolMemberRelayRow => member !== undefined),
-            ),
-          ),
+          deadlineAt: new Date(relayDeadlineMs),
           candidates: admissionCandidates.filter((candidate) => candidate !== null),
         },
         signal: request.signal,
@@ -2973,9 +2980,14 @@ async function relayPool({
       userId: requester.userId,
     });
   } catch (error) {
-    if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
+    await settleRelayCleanup([
+      () =>
+        capacityLease?.state === "ADMITTED"
+          ? capacityRuntime?.release(capacityLease.lease)
+          : undefined,
+      () => operation.dispose?.(),
+    ]);
     if (error instanceof ModelApiLimitError) {
-      await operation.dispose?.();
       await failRelayMetadata({ relayRequestId, startedAt, failure: error.failure });
       return operationFailureResponse(operation, error.failure);
     }
@@ -2991,25 +3003,32 @@ async function relayPool({
     if (capacityLease?.state !== "ADMITTED") return;
     const lease = capacityLease.lease;
     capacityLease = undefined;
-    globalLease?.release();
+    const localGlobalLease = globalLease;
     globalLease = undefined;
-    await capacityRuntime?.release(lease);
+    await settleRelayCleanup([
+      () => localGlobalLease?.release(),
+      () => capacityRuntime?.release(lease),
+    ]);
   };
 
   for (let candidateIndex = 0; candidateIndex < selectedRouteCandidates.length; candidateIndex++) {
     let candidate = selectedRouteCandidates[candidateIndex]!;
     if (capacityRuntime && capacityLease?.state !== "ADMITTED") {
       const remaining = selectedRouteCandidates.slice(candidateIndex);
+      const admissionStartedAt = Date.now();
       const admissionCandidates = remaining.map((remainingCandidate, candidateOrder) => {
-        const identity = memberById.get(remainingCandidate.poolMemberId)?.ExecutionTarget;
-        if (!identity?.inferenceCapacityId)
+        const member = memberById.get(remainingCandidate.poolMemberId);
+        if (!member)
           throw new Error("Capacity-enabled pool member lost execution target identity.");
-        return {
-          capacityId: identity.inferenceCapacityId,
-          executionTargetId: identity.id,
-          poolMemberId: remainingCandidate.poolMemberId,
+        const resolved = poolAdmissionCandidate(
+          member,
           candidateOrder,
-        };
+          admissionStartedAt,
+          relayDeadlineMs,
+        );
+        if (!resolved)
+          throw new Error("Capacity-enabled pool member lost execution target identity.");
+        return resolved;
       });
       try {
         capacityLease = await acquireCapacityWithTelemetry({
@@ -3024,15 +3043,7 @@ async function relayPool({
             poolId: target.id,
             basePriority: 16,
             connectionOwner: "model-api",
-            deadlineAt: boundedAdmissionDeadline(
-              Date.now(),
-              relayDeadlineMs,
-              effectivePoolCandidateWaitBudget(
-                remaining
-                  .map(({ poolMemberId }) => memberById.get(poolMemberId))
-                  .filter((member): member is PoolMemberRelayRow => member !== undefined),
-              ),
-            ),
+            deadlineAt: new Date(relayDeadlineMs),
             candidates: admissionCandidates,
           },
           signal: request.signal,
@@ -3052,7 +3063,8 @@ async function relayPool({
           index >= candidateIndex && poolMemberId === admittedPoolMemberId,
       );
       if (selectedIndex < 0) {
-        await capacityRuntime.release(capacityLease.lease);
+        const unexpectedLease = capacityLease.lease;
+        await settleRelayCleanup([() => capacityRuntime.release(unexpectedLease)]);
         capacityLease = undefined;
         finalFailure = "unknown";
         break;
@@ -3140,12 +3152,16 @@ async function relayPool({
         };
       }
     } catch (error) {
-      cliLease.release();
       if (error instanceof AdapterError && operation.adaptation) {
-        globalLease.release();
-        if (capacityLease?.state === "ADMITTED")
-          await capacityRuntime?.release(capacityLease.lease);
-        await operation.dispose?.();
+        await settleRelayCleanup([
+          () => cliLease.release(),
+          () => globalLease?.release(),
+          () =>
+            capacityLease?.state === "ADMITTED"
+              ? capacityRuntime?.release(capacityLease.lease)
+              : undefined,
+          () => operation.dispose?.(),
+        ]);
         const canonicalError = {
           code: "invalid_request_error",
           message: error.message,
@@ -3163,6 +3179,7 @@ async function relayPool({
           { status: metadata.status, headers: metadata.headers },
         );
       }
+      await settleRelayCleanup([() => cliLease.release()]);
       finalFailure = "unknown";
       await recordPoolMemberRelayFailure({
         poolMemberId: candidate.poolMemberId,
@@ -3460,9 +3477,14 @@ async function relayPool({
         await releaseCapacityAttempt();
         continue;
       }
-      globalLease.release();
-      if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
-      await operation.dispose?.();
+      await settleRelayCleanup([
+        () => globalLease?.release(),
+        () =>
+          capacityLease?.state === "ADMITTED"
+            ? capacityRuntime?.release(capacityLease.lease)
+            : undefined,
+        () => operation.dispose?.(),
+      ]);
       await updateRelayMetadata(relayRequestId, {
         selectedDiscoveredModelId: member.discoveredModelId,
         status: terminalStatus(terminal),
@@ -3478,9 +3500,14 @@ async function relayPool({
     }
   }
 
-  globalLease.release();
-  if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
-  await operation.dispose?.();
+  await settleRelayCleanup([
+    () => globalLease?.release(),
+    () =>
+      capacityLease?.state === "ADMITTED"
+        ? capacityRuntime?.release(capacityLease.lease)
+        : undefined,
+    () => operation.dispose?.(),
+  ]);
   await failRelayMetadata({
     relayRequestId,
     startedAt,

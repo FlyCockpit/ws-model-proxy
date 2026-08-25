@@ -343,6 +343,7 @@ integration("PostgreSQL capacity admission primitives", () => {
           executionTargetId: targets[candidateOrder]!.id,
           poolMemberId: member.id,
           candidateOrder,
+          deadlineAt: new Date(deadlineAt.getTime() - (candidateOrder === 0 ? 30_000 : 0)),
           ...spoofedCallerPolicy,
         })),
       });
@@ -352,6 +353,10 @@ integration("PostgreSQL capacity admission primitives", () => {
         orderBy: { candidateOrder: "asc" },
       });
       expect(waiters.map((waiter) => waiter.candidateOrder)).toEqual([0, 1]);
+      expect(waiters.map((waiter) => waiter.deadlineAt?.getTime())).toEqual([
+        deadlineAt.getTime() - 30_000,
+        deadlineAt.getTime(),
+      ]);
       expect(waiters[0]).toMatchObject({
         effectivePriority: 16,
         effectiveConcurrencyLimit: 2,

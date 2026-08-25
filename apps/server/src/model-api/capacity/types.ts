@@ -7,6 +7,8 @@ export type AdmissionCandidate = {
   executionTargetId: string;
   poolMemberId?: string;
   candidateOrder: number;
+  /** Candidate-local deadline; sibling candidates may remain eligible longer. */
+  deadlineAt?: Date;
 };
 
 export type AdmissionAttempt = {

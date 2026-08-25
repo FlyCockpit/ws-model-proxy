@@ -326,6 +326,8 @@ function poolMemberRow({
   physicalMaxContext,
   capacityContextCeiling,
   capacityContextMargin = 0,
+  capacityWaitBudgetMode,
+  capacityWaitBudgetMs,
 }: {
   id: string;
   discoveredModelId: string;
@@ -339,6 +341,8 @@ function poolMemberRow({
   physicalMaxContext?: number;
   capacityContextCeiling?: number;
   capacityContextMargin?: number;
+  capacityWaitBudgetMode?: "INHERIT" | "LIMITED" | "UNLIMITED";
+  capacityWaitBudgetMs?: number | null;
 }) {
   return {
     id,
@@ -354,6 +358,9 @@ function poolMemberRow({
     halfOpenTrialStartedAt: null,
     capacityContextCeiling,
     capacityContextMargin,
+    capacityWaitBudgetMode,
+    capacityWaitBudgetMs,
+    ModelPool: { capacityWaitBudgetMs: 30_000 },
     ExecutionTarget: {
       id: `${id}-target`,
       inferenceCapacityId: `${id}-capacity`,
@@ -2905,12 +2912,15 @@ describe("model API routes", () => {
         discoveredModelId: "model-a",
         upstreamModelId: "upstream-a",
         cliDeviceId: "cli-a",
+        capacityWaitBudgetMode: "LIMITED",
+        capacityWaitBudgetMs: 50,
       }),
       poolMemberRow({
         id: "member-b",
         discoveredModelId: "model-b",
         upstreamModelId: "upstream-b",
         cliDeviceId: "cli-b",
+        capacityWaitBudgetMode: "UNLIMITED",
       }),
     ]);
     db.poolMember.findUnique.mockResolvedValue({
@@ -3004,6 +3014,13 @@ describe("model API routes", () => {
     expect(capacityAttempts[0]?.requestId).not.toBe(capacityAttempts[1]?.requestId);
     expect(capacityAttempts[0]?.attemptId).not.toBe(capacityAttempts[1]?.attemptId);
     expect(capacityAttempts[0]?.candidates).toHaveLength(2);
+    const firstAdmissionCandidates = capacityAttempts[0]?.candidates as Array<{
+      poolMemberId: string;
+      deadlineAt: Date;
+    }>;
+    expect(firstAdmissionCandidates[1]!.deadlineAt.getTime()).toBeGreaterThan(
+      firstAdmissionCandidates[0]!.deadlineAt.getTime() + 1_000,
+    );
     expect(capacityAttempts[1]?.candidates).toMatchObject([{ poolMemberId: "member-b" }]);
     expect(capacityEvents).toEqual([
       "acquire:member-a",

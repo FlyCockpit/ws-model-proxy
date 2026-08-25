@@ -132,8 +132,8 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           result: { state: existing.state === "EXPIRED" ? "EXPIRED" : "CANCELLED" } as const,
           notify: [],
         };
-      if (existing?.deadlineAt && existing.deadlineAt <= new Date()) {
-        const expiredAt = new Date();
+      if (existing?.deadlineAt && existing.deadlineAt <= observedAt) {
+        const expiredAt = observedAt;
         await tx.admissionRequest.update({
           where: { id: existing.id },
           data: { state: "EXPIRED", terminalAt: expiredAt, terminalReason: "deadline" },
@@ -150,10 +150,52 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         return { result: { state: "EXPIRED" } as const, notify: [] };
       }
 
+      if (existing) {
+        await tx.capacityWaiter.updateMany({
+          where: {
+            admissionRequestId: existing.id,
+            state: "WAITING",
+            deadlineAt: { lte: observedAt },
+          },
+          data: {
+            state: "EXPIRED",
+            stateChangedAt: observedAt,
+            terminalReason: "candidate_deadline",
+          },
+        });
+        const liveWaiters = await tx.capacityWaiter.count({
+          where: {
+            admissionRequestId: existing.id,
+            state: "WAITING",
+            OR: [{ deadlineAt: null }, { deadlineAt: { gt: observedAt } }],
+          },
+        });
+        if (liveWaiters === 0) {
+          await tx.admissionRequest.update({
+            where: { id: existing.id },
+            data: {
+              state: "EXPIRED",
+              terminalAt: observedAt,
+              terminalReason: "candidate_deadlines",
+            },
+          });
+          if (existing.relayRequestId)
+            await tx.relayRequest.updateMany({
+              where: { id: existing.relayRequestId, admissionAttemptId: attempt.attemptId },
+              data: { admissionTerminalState: "EXPIRED" },
+            });
+          return { result: { state: "EXPIRED" } as const, notify: [] };
+        }
+      }
+
       const capacityIds = [
         ...new Set(
           existing
-            ? existing.Waiters.map((waiter) => waiter.capacityId)
+            ? existing.Waiters.filter(
+                (waiter) =>
+                  waiter.state === "WAITING" &&
+                  (waiter.deadlineAt === null || waiter.deadlineAt > observedAt),
+              ).map((waiter) => waiter.capacityId)
             : attempt.candidates.map((candidate) => candidate.capacityId),
         ),
       ].sort();
@@ -203,6 +245,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
                 poolId: attempt.poolId,
                 poolMemberId: candidate.poolMemberId,
                 candidateOrder: candidate.candidateOrder,
+                deadlineAt: candidate.deadlineAt ?? attempt.deadlineAt,
                 effectivePriority: candidate.priority,
                 effectiveConcurrencyLimit: candidate.memberConcurrencyCeiling,
                 effectiveConcurrencyScope: candidate.concurrencyScope,
@@ -315,6 +358,14 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
   }
 
   async #admitOne(tx: Prisma.TransactionClient, capacityId: string, now: Date): Promise<boolean> {
+    await tx.capacityWaiter.updateMany({
+      where: { capacityId, state: "WAITING", deadlineAt: { lte: now } },
+      data: {
+        state: "EXPIRED",
+        stateChangedAt: now,
+        terminalReason: "candidate_deadline",
+      },
+    });
     const capacity = await tx.inferenceCapacity.findUniqueOrThrow({ where: { id: capacityId } });
     const activeLeases = await tx.capacityLease.findMany({
       where: { capacityId, state: "ACTIVE" },
@@ -327,6 +378,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       where: {
         capacityId,
         state: "WAITING",
+        OR: [{ deadlineAt: null }, { deadlineAt: { gt: now } }],
         AdmissionRequest: {
           state: "WAITING",
           OR: [{ deadlineAt: null }, { deadlineAt: { gt: now } }],
@@ -487,7 +539,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       data: { state: "ADMITTED" },
     });
     await tx.capacityWaiter.updateMany({
-      where: { admissionRequestId: waiter.admissionRequestId },
+      where: { admissionRequestId: waiter.admissionRequestId, state: "WAITING" },
       data: { state: "CANCELLED", stateChangedAt: now, terminalReason: "sibling_lost" },
     });
     await tx.capacityWaiter.update({
