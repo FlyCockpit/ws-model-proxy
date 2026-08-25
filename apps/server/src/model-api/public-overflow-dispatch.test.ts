@@ -245,6 +245,21 @@ describe("public overflow terminal response dispatch", () => {
       "target-cheap",
     ]);
     expect(mixedCurrency.targets[0]?.affinity?.reason).toContain("costPenalty:0");
+
+    const incomplete = { ...schedule(1), pricing: { ratesPerMillion: { input: 1 } } };
+    db.providerPricingVersion.findFirst
+      .mockResolvedValueOnce(incomplete)
+      .mockResolvedValueOnce(schedule(1));
+    const incompletePricing = await rankPublicOverflowTargets({
+      request,
+      policy: listed.affinityPolicy,
+      targets: listed.targets,
+    });
+    expect(incompletePricing.targets.map((target) => target.executionTargetId)).toEqual([
+      "target-expensive",
+      "target-cheap",
+    ]);
+    expect(incompletePricing.targets[0]?.affinity?.reason).toContain("costPenalty:0");
   });
 
   it("fails open to configured provider order when affinity ranking is unavailable", async () => {

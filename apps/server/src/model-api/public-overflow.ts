@@ -18,6 +18,7 @@ import {
   rankAffinityTargets,
   rememberAffinity,
 } from "./cache-affinity.js";
+import { ADAPTER_VERSION } from "./protocols/canonical.js";
 import type { ProtocolSurface } from "./protocols/index.js";
 import { SseDecoder } from "./protocols/sse.js";
 import {
@@ -1079,6 +1080,7 @@ export async function rankPublicOverflowTargets(input: {
       : input.request.liability;
   });
   const comparableCurrency =
+    liabilities.every(({ spend }) => spend !== undefined) &&
     new Set(liabilities.map(({ currency }) => currency ?? null)).size === 1;
   const affinityTargets = input.targets.map((target, index) => {
     const liability = liabilities[index] ?? input.request.liability;
@@ -1105,7 +1107,7 @@ export async function rankPublicOverflowTargets(input: {
         mode: target.nativeSurfaces.includes(input.request.requestedSurface) ? "native" : "adapted",
         adapterVersion: target.nativeSurfaces.includes(input.request.requestedSurface)
           ? "native"
-          : "1.0.0",
+          : ADAPTER_VERSION,
       }),
       capacityId: `provider:${target.providerModelId}`,
       hardConcurrencyLimit: target.concurrencyLimit ?? null,
