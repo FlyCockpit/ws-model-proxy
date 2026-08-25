@@ -166,6 +166,8 @@ export interface PublicProviderTarget {
   supportsStreaming: boolean;
   supportedFeatures: readonly string[];
   capabilityInventory?: OpenAiCompatibleCapabilities | null;
+  /** Exact operation-aware resolver result carried through ranking and send. */
+  resolvedExecution?: ProviderSurfaceExecution;
   credential: {
     id: string;
     credentialType: "API_KEY" | "BEARER";
@@ -180,11 +182,21 @@ export interface PublicProviderTarget {
   affinityTarget?: AffinityTarget;
 }
 
+export type ProviderSurfaceExecution = {
+  mode: "native" | "adapted";
+  nativeSurface: ProtocolSurface;
+  limitations: readonly string[];
+};
+
 export function matchesChatTestProviderMode(
-  target: Pick<PublicProviderTarget, "nativeSurfaces">,
+  target: Pick<PublicProviderTarget, "nativeSurfaces" | "resolvedExecution">,
   requestedSurface: ProtocolSurface,
   mode: PublicOverflowRequest["chatTestRoutingMode"],
 ) {
+  if (target.resolvedExecution) {
+    if (mode === "REQUIRE_NATIVE") return target.resolvedExecution.mode === "native";
+    if (mode === "REQUIRE_ADAPTED") return target.resolvedExecution.mode === "adapted";
+  }
   if (mode === "REQUIRE_NATIVE") return target.nativeSurfaces.includes(requestedSurface);
   if (mode === "REQUIRE_ADAPTED")
     return target.nativeSurfaces.some(
@@ -207,7 +219,7 @@ export function targetsForForcedPoolMember<T extends Pick<PublicProviderTarget, 
 }
 
 export function orderChatTestProviderTargets<
-  T extends Pick<PublicProviderTarget, "nativeSurfaces">,
+  T extends Pick<PublicProviderTarget, "nativeSurfaces" | "resolvedExecution">,
 >(
   targets: readonly T[],
   requestedSurface: ProtocolSurface,
@@ -215,8 +227,16 @@ export function orderChatTestProviderTargets<
 ) {
   if (mode !== "PREFER_NATIVE") return [...targets];
   return [
-    ...targets.filter((target) => target.nativeSurfaces.includes(requestedSurface)),
-    ...targets.filter((target) => !target.nativeSurfaces.includes(requestedSurface)),
+    ...targets.filter((target) =>
+      target.resolvedExecution
+        ? target.resolvedExecution.mode === "native"
+        : target.nativeSurfaces.includes(requestedSurface),
+    ),
+    ...targets.filter((target) =>
+      target.resolvedExecution
+        ? target.resolvedExecution.mode !== "native"
+        : !target.nativeSurfaces.includes(requestedSurface),
+    ),
   ];
 }
 
@@ -348,6 +368,67 @@ export async function claimPublicProviderCredentialForSend(input: {
   );
 }
 
+export function resolvePublicProviderExecution(
+  target: Pick<PublicProviderTarget, "capabilityInventory">,
+  request: Pick<
+    PublicOverflowRequest,
+    "requestedSurface" | "stream" | "requiredFeatures" | "adaptationEnabled"
+  > &
+    Partial<Pick<PublicOverflowRequest, "path" | "headers" | "method">>,
+): ProviderSurfaceExecution | undefined {
+  if (!target.capabilityInventory) return undefined;
+  const requestedSurface = {
+    "openai-chat": "OPENAI_CHAT_COMPLETIONS",
+    "openai-responses": "OPENAI_RESPONSES",
+    "anthropic-messages": "ANTHROPIC_MESSAGES",
+  }[request.requestedSurface] as
+    | "OPENAI_CHAT_COMPLETIONS"
+    | "OPENAI_RESPONSES"
+    | "ANTHROPIC_MESSAGES";
+  const responsePath = new URL(request.path ?? "/v1/messages", "http://wsmp.invalid").pathname;
+  const responsesOperation = responsePath.endsWith("/input_items")
+    ? "listInputItems"
+    : responsePath.endsWith("/cancel")
+      ? "cancel"
+      : responsePath.endsWith("/compact")
+        ? "compact"
+        : responsePath.endsWith("/count_tokens")
+          ? "countTokens"
+          : /^\/v1\/responses\/[^/]+$/u.test(responsePath)
+            ? request.method === "DELETE"
+              ? "delete"
+              : "retrieve"
+            : "create";
+  const betaFeatures = (request.headers?.get("anthropic-beta") ?? "")
+    .split(",")
+    .map((beta) => beta.trim())
+    .filter(Boolean);
+  const resolved = resolveExecutionPath({
+    capabilities: target.capabilityInventory,
+    requestedSurface,
+    request: {
+      stream: request.stream,
+      ...Object.fromEntries(request.requiredFeatures.map((feature) => [feature, true])),
+      responsesOperation,
+      countTokens:
+        request.requestedSurface === "anthropic-messages" && responsePath.endsWith("/count_tokens"),
+      protocolVersion: request.headers?.get("anthropic-version") ?? undefined,
+      betaFeatures,
+    },
+    adaptationEnabled: request.adaptationEnabled,
+  });
+  if (resolved.mode === "unavailable" || !resolved.nativeSurface) return undefined;
+  const nativeSurface: ProtocolSurface | undefined = {
+    OPENAI_CHAT_COMPLETIONS: "openai-chat",
+    OPENAI_RESPONSES: "openai-responses",
+    ANTHROPIC_MESSAGES: "anthropic-messages",
+    OPENAI_COMPLETIONS: undefined,
+  }[resolved.nativeSurface] as ProtocolSurface | undefined;
+  return nativeSurface
+    ? { mode: resolved.mode, nativeSurface, limitations: resolved.limitations }
+    : undefined;
+}
+
 export function publicTargetCompatibility(
   target: Pick<
     PublicProviderTarget,
@@ -405,56 +486,15 @@ export function publicTargetCompatibility(
       return "CONTEXT_UNKNOWN";
     if (requestedOutputTokens > BigInt(target.maxOutputTokens)) return "CONTEXT_EXCEEDED";
   }
-  if (request.stream && !target.supportsStreaming) return "PROTOCOL_UNAVAILABLE";
+  if (!target.capabilityInventory && request.stream && !target.supportsStreaming)
+    return "PROTOCOL_UNAVAILABLE";
   if (
     !target.capabilityInventory &&
     request.requiredFeatures.some((feature) => !target.supportedFeatures.includes(feature))
   )
     return "PROTOCOL_UNAVAILABLE";
   if (target.capabilityInventory) {
-    const requestedSurface = {
-      "openai-chat": "OPENAI_CHAT_COMPLETIONS",
-      "openai-responses": "OPENAI_RESPONSES",
-      "anthropic-messages": "ANTHROPIC_MESSAGES",
-    }[request.requestedSurface] as
-      | "OPENAI_CHAT_COMPLETIONS"
-      | "OPENAI_RESPONSES"
-      | "ANTHROPIC_MESSAGES";
-    const responsePath = new URL(request.path ?? "/v1/messages", "http://wsmp.invalid").pathname;
-    const responsesOperation = responsePath.endsWith("/input_items")
-      ? "listInputItems"
-      : responsePath.endsWith("/cancel")
-        ? "cancel"
-        : responsePath.endsWith("/compact")
-          ? "compact"
-          : responsePath.endsWith("/count_tokens")
-            ? "countTokens"
-            : /^\/v1\/responses\/[^/]+$/u.test(responsePath)
-              ? request.method === "DELETE"
-                ? "delete"
-                : "retrieve"
-              : "create";
-    const betaFeatures = (request.headers?.get("anthropic-beta") ?? "")
-      .split(",")
-      .map((beta) => beta.trim())
-      .filter(Boolean);
-    const resolved = resolveExecutionPath({
-      capabilities: target.capabilityInventory,
-      requestedSurface,
-      request: {
-        stream: request.stream,
-        ...Object.fromEntries(request.requiredFeatures.map((feature) => [feature, true])),
-        responsesOperation,
-        countTokens:
-          request.requestedSurface === "anthropic-messages" &&
-          responsePath.endsWith("/count_tokens"),
-        protocolVersion: request.headers?.get("anthropic-version") ?? undefined,
-        betaFeatures,
-      },
-      adaptationEnabled: request.adaptationEnabled,
-    });
-    if (resolved.mode === "unavailable") return "PROTOCOL_UNAVAILABLE";
-    if (resolved.mode === "native") return "COMPATIBLE";
+    return resolvePublicProviderExecution(target, request) ? "COMPATIBLE" : "PROTOCOL_UNAVAILABLE";
   }
   if (target.nativeSurfaces.includes(request.requestedSurface)) return "COMPATIBLE";
   // OpenAI streams cannot provide Anthropic's required initial input usage.
@@ -1313,6 +1353,7 @@ export function providerHealthOutcome(status: number): "SUCCESS" | "FAILURE" | "
 }
 
 function selectedNativeSurface(target: PublicProviderTarget, requested: ProtocolSurface) {
+  if (target.resolvedExecution) return target.resolvedExecution.nativeSurface;
   if (target.nativeSurfaces.includes(requested)) return requested;
   return target.nativeSurfaces.find((surface) =>
     target.protocol === "anthropic"
@@ -1326,6 +1367,10 @@ function selectedProviderSurface(
   requested: ProtocolSurface,
   mode: PublicOverflowRequest["chatTestRoutingMode"],
 ) {
+  if (target.resolvedExecution) {
+    if (mode === "REQUIRE_ADAPTED" && target.resolvedExecution.mode !== "adapted") return undefined;
+    return target.resolvedExecution.nativeSurface;
+  }
   if (mode !== "REQUIRE_ADAPTED") return selectedNativeSurface(target, requested);
   return target.nativeSurfaces.find(
     (surface) =>
@@ -1479,10 +1524,16 @@ export async function buildProviderAffinityTargets(input: {
         nativeSurface:
           selectedNativeSurface(target, input.request.requestedSurface) ??
           input.request.requestedSurface,
-        mode: target.nativeSurfaces.includes(input.request.requestedSurface) ? "native" : "adapted",
-        adapterVersion: target.nativeSurfaces.includes(input.request.requestedSurface)
-          ? "native"
-          : ADAPTER_VERSION,
+        mode:
+          target.resolvedExecution?.mode ??
+          (target.nativeSurfaces.includes(input.request.requestedSurface) ? "native" : "adapted"),
+        adapterVersion:
+          (target.resolvedExecution?.mode ??
+            (target.nativeSurfaces.includes(input.request.requestedSurface)
+              ? "native"
+              : "adapted")) === "native"
+            ? "native"
+            : ADAPTER_VERSION,
       }),
       capacityId: `provider:${target.providerModelId}`,
       hardConcurrencyLimit: target.concurrencyLimit ?? null,
@@ -1526,15 +1577,25 @@ export async function dispatchPublicOverflow(
               target.protocol === "anthropic"),
         )
       : memberEligible;
-  const compatible = eligible.filter(
-    (target) =>
-      publicTargetCompatibility(target, {
-        ...request,
-        liability: request.liability,
-        contextTokens: 0n,
-      }) === "COMPATIBLE" &&
-      matchesChatTestProviderMode(target, request.requestedSurface, request.chatTestRoutingMode),
-  );
+  const compatibilityRequest = {
+    ...request,
+    liability: request.liability,
+    contextTokens: 0n,
+  };
+  const compatible = eligible.flatMap((target) => {
+    const resolvedExecution = resolvePublicProviderExecution(target, compatibilityRequest);
+    const resolvedTarget = { ...target, resolvedExecution };
+    if (
+      publicTargetCompatibility(target, compatibilityRequest) !== "COMPATIBLE" ||
+      !matchesChatTestProviderMode(
+        resolvedTarget,
+        request.requestedSurface,
+        request.chatTestRoutingMode,
+      )
+    )
+      return [];
+    return [resolvedTarget];
+  });
   if (compatible.length === 0) {
     await Promise.allSettled(
       listed.targets.map((target) =>

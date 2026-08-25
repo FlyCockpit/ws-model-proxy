@@ -10,6 +10,11 @@
     { "role": "developer", "text": "developer only", "sourceIndex": 0 }
   ],
   "developerOnlyAnthropicSystem": [{ "type": "text", "text": "developer only" }],
+  "interleavedMessages": [
+    { "role": "developer", "content": "prefix" },
+    { "role": "user", "content": "message" },
+    { "role": "system", "content": "late instruction" }
+  ],
   "lossyOptInAnthropicSystem": [
     { "type": "text", "text": "system one" },
     { "type": "text", "text": "developer one" },

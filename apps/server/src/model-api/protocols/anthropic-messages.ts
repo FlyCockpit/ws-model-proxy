@@ -172,6 +172,23 @@ export function renderAnthropicMessagesRequest(
   model: string,
   options: { allowLossyInstructionRoleCollapse?: boolean } = {},
 ): Record<string, unknown> {
+  const firstMessageIndex = request.messages.reduce(
+    (first, message) =>
+      message.boundary.sourceIndex >= 0 ? Math.min(first, message.boundary.sourceIndex) : first,
+    Number.POSITIVE_INFINITY,
+  );
+  if (
+    request.instructions.some(
+      (instruction) =>
+        instruction.boundary.sourceIndex >= 0 &&
+        instruction.boundary.sourceIndex > firstMessageIndex,
+    )
+  ) {
+    unsupported(
+      "instructions",
+      "system and developer instructions must form a prefix before user or assistant messages",
+    );
+  }
   const roles = new Set(request.instructions.map((item) => item.role));
   // Anthropic has one top-level instruction channel. A developer-only sequence
   // can therefore stay in its original order and authority tier (there is no

@@ -853,6 +853,74 @@ describe("model API routes", () => {
     });
   });
 
+  it("surfaces developer authority loss when Chat adapts through Anthropic", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "anthropic-member",
+        discoveredModelId: "anthropic-model",
+        upstreamModelId: "claude-upstream",
+        cliDeviceId: "cli-anthropic",
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "anthropic-compatible",
+          surfaces: {
+            anthropicMessages: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+              protocolVersion: "2023-06-01",
+            },
+          },
+        },
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-anthropic"];
+    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        messages: [
+          { role: "developer", content: "policy" },
+          { role: "user", content: "hello" },
+        ],
+      }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    expect(sent.family).toBe("messages");
+    expect(JSON.parse(await relayBodyText(sent))).toMatchObject({
+      system: [{ type: "text", text: "policy" }],
+      messages: [{ role: "user" }],
+    });
+    manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+    manager.body(
+      sent.requestId,
+      JSON.stringify({
+        id: "msg",
+        type: "message",
+        role: "assistant",
+        model: "claude-upstream",
+        content: [{ type: "text", text: "ok" }],
+        stop_reason: "end_turn",
+        stop_sequence: null,
+        usage: { input_tokens: 2, output_tokens: 1 },
+      }),
+    );
+    manager.complete(sent.requestId);
+    const response = await responsePromise;
+    expect(response.headers.get("x-wsmp-adapter-limitations")).toBe(
+      "strict_common_subset,anthropic_instruction_authority_collapse",
+    );
+    await response.text();
+  });
+
   it("keeps pool adaptation unavailable when the release gate is off", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],

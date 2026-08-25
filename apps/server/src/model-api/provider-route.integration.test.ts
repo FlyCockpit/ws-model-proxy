@@ -350,6 +350,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     memberTier?: "PRIMARY" | "PUBLIC_OVERFLOW";
     privatePool?: boolean;
     routingMode?: "PREFER_NATIVE" | "REQUIRE_NATIVE" | "REQUIRE_ADAPTED";
+    multiSurfaceStreamingFallback?: boolean;
   }) {
     if (!modules) throw new Error("modules unavailable");
     const suffix = crypto.randomUUID();
@@ -443,12 +444,31 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         healthStatus: "HEALTHY",
         contextWindow: 8_192,
         maxOutputTokens: 256,
-        nativeCapabilities: {
-          protocols: [protocolFor(input.native)],
-          surfaces: [input.native],
-          streaming: true,
-          features: [],
-        },
+        nativeCapabilities: input.multiSurfaceStreamingFallback
+          ? {
+              version: 4,
+              protocol: "openai-compatible",
+              surfaces: {
+                openaiChatCompletions: {
+                  source: "provider",
+                  confidence: "exact",
+                  operations: ["create"],
+                  streaming: false,
+                },
+                openaiResponses: {
+                  source: "provider",
+                  confidence: "exact",
+                  operations: ["create"],
+                  streaming: true,
+                },
+              },
+            }
+          : {
+              protocols: [protocolFor(input.native)],
+              surfaces: [input.native],
+              streaming: true,
+              features: [],
+            },
       },
     });
     const target = await modules.prisma.executionTarget.create({
@@ -460,7 +480,12 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         executionTargetId: target.id,
         tier: input.memberTier ?? "PUBLIC_OVERFLOW",
         publicOrder: (input.memberTier ?? "PUBLIC_OVERFLOW") === "PUBLIC_OVERFLOW" ? 0 : null,
-        weight: (input.memberTier ?? "PUBLIC_OVERFLOW") === "PRIMARY" ? 1 : 0,
+        weight:
+          (input.memberTier ?? "PUBLIC_OVERFLOW") === "PRIMARY"
+            ? input.secondBehavior
+              ? 2
+              : 1
+            : 0,
       },
     });
     await modules.prisma.providerPricingVersion.create({
@@ -585,9 +610,9 @@ integration("provider dispatch routes with real PostgreSQL", () => {
           executionTargetId: secondTarget.id,
           tier: secondTier,
           publicOrder: secondTier === "PUBLIC_OVERFLOW" ? 1 : null,
-          // Keep the first model deterministic while retaining this lower
-          // priority primary as the private-pool failover candidate.
-          weight: 0,
+          // The first model's higher weight makes the initial selection
+          // deterministic while this member remains a routable failover.
+          weight: secondTier === "PRIMARY" ? 1 : 0,
         },
       });
       await modules.prisma.providerPricingVersion.create({
@@ -999,6 +1024,12 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     expect(
       pinned.every(({ authorization }) => authorization !== "Bearer route-provider-secret-second"),
     ).toBe(true);
+    if (!result.secondModel) throw new Error("expected competing provider model");
+    expect(
+      await modules.prisma.providerAttempt.count({
+        where: { providerModelId: result.secondModel.id },
+      }),
+    ).toBe(0);
 
     const strangerSecret = `wsmp_model_${crypto.randomUUID().replaceAll("-", "")}`;
     const stranger = await modules.prisma.user.create({
@@ -1039,7 +1070,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       headers: bearerHeaders(result.rawToken),
     });
     expect(afterReplacement.status).toBe(404);
-  });
+  }, 15_000);
 
   it.each([
     "expiry",
@@ -1313,6 +1344,19 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     expectExactSuccessAccounting(result);
     expectStreamEnvelope(result, requested);
     expectAdapterTelemetry(result, "adapted", requested, native);
+  });
+
+  it("routes streaming Chat through resolver-selected Responses on a multi-surface provider", async () => {
+    const result = await runCase({
+      requested: "openai-chat",
+      native: "openai-responses",
+      behavior: "stream",
+      multiSurfaceStreamingFallback: true,
+    });
+    expect(result.response.status).toBe(200);
+    expect(result.observation?.path).toBe("/stream/v1/responses");
+    expectAdapterTelemetry(result, "adapted", "openai-chat", "openai-responses");
+    expectStreamEnvelope(result, "openai-chat");
   });
 
   it.each([

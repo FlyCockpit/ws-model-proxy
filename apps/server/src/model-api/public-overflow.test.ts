@@ -23,6 +23,7 @@ import {
   providerHealthCooldownElapsed,
   providerHealthOutcome,
   publicTargetCompatibility,
+  resolvePublicProviderExecution,
 } from "./public-overflow.js";
 
 describe("provider health cooldown", () => {
@@ -55,6 +56,54 @@ const request = {
 };
 
 describe("public overflow compatibility", () => {
+  it("carries the exact alternate surface selected for a streaming request", () => {
+    const target = {
+      capabilityInventory: {
+        version: 4 as const,
+        protocol: "openai-compatible" as const,
+        surfaces: {
+          openaiChatCompletions: {
+            source: "provider" as const,
+            confidence: "exact" as const,
+            operations: ["create" as const],
+            streaming: false,
+          },
+          openaiResponses: {
+            source: "provider" as const,
+            confidence: "exact" as const,
+            operations: ["create" as const],
+            streaming: true,
+          },
+        },
+      },
+    };
+    expect(
+      resolvePublicProviderExecution(target, {
+        requestedSurface: "openai-chat",
+        stream: true,
+        requiredFeatures: [],
+        adaptationEnabled: true,
+      }),
+    ).toMatchObject({ mode: "adapted", nativeSurface: "openai-responses" });
+    expect(
+      publicTargetCompatibility(
+        {
+          ...target,
+          contextWindow: 1_000,
+          maxOutputTokens: 100,
+          protocol: "openai" as const,
+          nativeProtocols: ["openai" as const],
+          nativeSurfaces: ["openai-chat" as const, "openai-responses" as const],
+          // The legacy aggregate describes the first/requested surface. The
+          // inventory is authoritative when selecting an alternate surface.
+          supportsStreaming: false,
+          supportedFeatures: [],
+        },
+        { ...request, stream: true, adaptationEnabled: true },
+      ),
+    ).toBe("COMPATIBLE");
+  });
+
   it.each([
     {
       name: "accepts the exact member ceiling after margin",

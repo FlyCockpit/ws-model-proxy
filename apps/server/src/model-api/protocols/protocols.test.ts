@@ -21,9 +21,9 @@ describe("canonical request adapters", () => {
       model: "requested",
       messages: [
         { role: "system", content: "system one" },
-        { role: "user", content: "hello" },
         { role: "developer", content: [{ type: "text", text: "developer one" }] },
         { role: "system", content: "system two" },
+        { role: "user", content: "hello" },
       ],
     });
     expect(canonical.instructions).toEqual([
@@ -35,12 +35,12 @@ describe("canonical request adapters", () => {
       {
         role: "developer",
         content: [{ type: "text", text: "developer one" }],
-        boundary: { sourceIndex: 2 },
+        boundary: { sourceIndex: 1 },
       },
       {
         role: "system",
         content: [{ type: "text", text: "system two" }],
-        boundary: { sourceIndex: 3 },
+        boundary: { sourceIndex: 2 },
       },
     ]);
     expect(() => renderAnthropicMessagesRequest(canonical, "upstream")).toThrowError(AdapterError);
@@ -75,6 +75,26 @@ describe("canonical request adapters", () => {
       });
       expect(canonical).toEqual(before);
       expect(canonical.limitations).toContain("anthropic_instruction_authority_collapse");
+    },
+  );
+
+  it.each([false, true])(
+    "rejects instructions interleaved after a user boundary for stream=%s even with collapse opt-in",
+    (stream) => {
+      const canonical = parseOpenAiChatRequest({
+        model: "requested",
+        stream,
+        messages: [
+          { role: "developer", content: "prefix" },
+          { role: "user", content: "hello" },
+          { role: "developer", content: "late policy" },
+        ],
+      });
+      expect(() =>
+        renderAnthropicMessagesRequest(canonical, "upstream", {
+          allowLossyInstructionRoleCollapse: true,
+        }),
+      ).toThrow(/must form a prefix/i);
     },
   );
 

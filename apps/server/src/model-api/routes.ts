@@ -152,6 +152,7 @@ import {
   type PublicOverflowRequest,
   type PublicProviderTarget,
   publicTargetCompatibility,
+  resolvePublicProviderExecution,
 } from "./public-overflow.js";
 import { type RelayAttemptTerminal, startRelayAttempt } from "./relay-executor.js";
 import { shouldRetryRelayOperation } from "./relay-retry-policy.js";
@@ -3866,37 +3867,45 @@ async function relayPool({
           ? { accountingVersion: "provider-billable-v1" }
           : conservativeProviderLiability({ estimatedInputTokens, requestedOutputTokens }),
     };
-    providerPrimaryTargets = listed.targets.filter(
-      (providerTarget) =>
-        (!forcedPoolMemberId || providerTarget.poolMemberId === forcedPoolMemberId) &&
-        matchesChatTestProviderMode(providerTarget, requestedSurface, testRoutingMode) &&
-        publicTargetCompatibility(providerTarget, {
-          requestedProtocol: operation.family === "messages" ? "anthropic" : "openai",
-          requestedSurface,
-          stream: operation.stream,
-          requiredFeatures,
-          requestedOutputTokens,
-          adaptationEnabled:
-            operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled,
-          renderForTarget: canonicalAdaptationRequest
-            ? async () => {
-                throw new Error("Compatibility probe only.");
-              }
-            : undefined,
-          liability:
-            requestedOutputTokens === undefined
-              ? { accountingVersion: "provider-billable-v1" }
-              : conservativeProviderLiability({ estimatedInputTokens, requestedOutputTokens }),
-          estimatedInputTokens,
-          contextTokens:
-            requestedOutputTokens === undefined
-              ? undefined
-              : estimatedInputTokens + requestedOutputTokens,
-          path: operation.path,
-          headers: request.headers,
-          method: request.method,
-        }) === "COMPATIBLE",
-    );
+    const providerCompatibilityRequest = {
+      requestedProtocol: operation.family === "messages" ? "anthropic" : "openai",
+      requestedSurface,
+      stream: operation.stream,
+      requiredFeatures,
+      requestedOutputTokens,
+      adaptationEnabled:
+        operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled,
+      renderForTarget: canonicalAdaptationRequest
+        ? async () => {
+            throw new Error("Compatibility probe only.");
+          }
+        : undefined,
+      liability:
+        requestedOutputTokens === undefined
+          ? { accountingVersion: "provider-billable-v1" }
+          : conservativeProviderLiability({ estimatedInputTokens, requestedOutputTokens }),
+      estimatedInputTokens,
+      contextTokens:
+        requestedOutputTokens === undefined
+          ? undefined
+          : estimatedInputTokens + requestedOutputTokens,
+      path: operation.path,
+      headers: request.headers,
+      method: request.method,
+    } as const;
+    providerPrimaryTargets = listed.targets.flatMap((providerTarget) => {
+      if (forcedPoolMemberId && providerTarget.poolMemberId !== forcedPoolMemberId) return [];
+      const resolvedExecution = resolvePublicProviderExecution(
+        providerTarget,
+        providerCompatibilityRequest,
+      );
+      const resolvedTarget = { ...providerTarget, resolvedExecution };
+      return publicTargetCompatibility(providerTarget, providerCompatibilityRequest) ===
+        "COMPATIBLE" &&
+        matchesChatTestProviderMode(resolvedTarget, requestedSurface, testRoutingMode)
+        ? [resolvedTarget]
+        : [];
+    });
   }
   if (
     members.length > 0 &&
@@ -3978,7 +3987,14 @@ async function relayPool({
   }));
   const routeModeRank = (candidate: (typeof localRouteCandidates)[number]) => {
     const provider = providerByMemberId.get(candidate.poolMemberId);
-    if (provider) return provider.nativeSurfaces.includes(requestedSurface!) ? 0 : 1;
+    if (provider)
+      return provider.resolvedExecution
+        ? provider.resolvedExecution.mode === "native"
+          ? 0
+          : 1
+        : provider.nativeSurfaces.includes(requestedSurface!)
+          ? 0
+          : 1;
     const mode = executionByMember.get(candidate.poolMemberId)?.mode;
     return mode === "native" ? 0 : mode === "adapted" ? 1 : 2;
   };
@@ -4715,9 +4731,7 @@ async function relayPool({
         : [];
       const adapterLimitations = [
         "strict_common_subset",
-        ...(operation.adaptation?.requestedSurface === "anthropic-messages"
-          ? adaptedRequestLimitations
-          : []),
+        ...(adaptedSource === "anthropic-messages" ? adaptedRequestLimitations : []),
       ].join(",");
       let responseBody = primedAdaptedStream
         ? primedAdaptedStream

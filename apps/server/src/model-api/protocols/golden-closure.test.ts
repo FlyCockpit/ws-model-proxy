@@ -96,6 +96,7 @@ describe("adapter golden behavior", () => {
       strictResult: string;
       developerOnlyInstructions: Array<{ role: "developer"; text: string; sourceIndex: number }>;
       developerOnlyAnthropicSystem: Array<{ type: "text"; text: string }>;
+      interleavedMessages: Array<{ role: "system" | "developer" | "user"; content: string }>;
       lossyOptInAnthropicSystem: Array<{ type: "text"; text: string }>;
       limitation: string;
     };
@@ -129,5 +130,14 @@ describe("adapter golden behavior", () => {
     expect(renderAnthropicMessagesRequest(developerOnly, "claude").system).toEqual(
       golden.developerOnlyAnthropicSystem,
     );
+    const interleaved = parseOpenAiChatRequest({
+      model: "m",
+      messages: golden.interleavedMessages,
+    });
+    expect(() =>
+      renderAnthropicMessagesRequest(interleaved, "claude", {
+        allowLossyInstructionRoleCollapse: true,
+      }),
+    ).toThrow(/must form a prefix/i);
   });
 });
