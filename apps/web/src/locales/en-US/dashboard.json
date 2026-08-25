@@ -352,6 +352,7 @@
         "name": "Enter a pool name.",
         "providerConcurrencyLimit": "Enter a whole-number provider concurrency ceiling from 1 to 10000.",
         "providerModelIds": "Select no more than 32 provider models.",
+        "recommendedSurface": "Choose the native API recommended by the selected primary models.",
         "physicalConcurrencyLimit": "Enter a physical concurrency limit from 1 to 10000.",
         "physicalMaxContext": "Enter a physical context limit from 1 to 100000000.",
         "publicEgressAcknowledged": "Acknowledge the exact public-egress disclosure.",

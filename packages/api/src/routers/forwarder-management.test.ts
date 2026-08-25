@@ -192,6 +192,29 @@ function poolRow(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function guardedLocalModel(
+  overrides: Record<string, unknown> = {},
+  native: "chat" | "responses" = "responses",
+) {
+  return {
+    id: "local-id",
+    upstreamModelId: "local-model",
+    capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+    capabilityOverrides: [],
+    capabilityOverrideMetadata: null,
+    Endpoint: {
+      capabilityMetadata: {
+        version: 1,
+        protocol: "openai-compatible",
+        chatCompletions: { supported: native === "chat", streaming: true },
+        responses: { supported: native === "responses", streaming: true },
+      },
+      defaultCapabilities: [],
+    },
+    ...overrides,
+  };
+}
+
 describe("forwarderManagementRouter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -318,12 +341,7 @@ describe("forwarderManagementRouter", () => {
         publicEgressAcknowledged: true,
       }),
     );
-    db.discoveredModel.findMany.mockResolvedValue([
-      {
-        id: "local-id",
-        upstreamModelId: "local-model",
-      },
-    ]);
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel()]);
     db.executionTarget.findMany.mockResolvedValue([
       {
         id: "existing-target",
@@ -403,9 +421,7 @@ describe("forwarderManagementRouter", () => {
 
   it("refuses guarded setup instead of inventing or overwriting physical capacity mapping", async () => {
     db.modelPool.findUnique.mockResolvedValue(null);
-    db.discoveredModel.findMany.mockResolvedValue([
-      { id: "local-id", upstreamModelId: "local-model" },
-    ]);
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel()]);
     db.executionTarget.findMany.mockResolvedValue([
       {
         id: "existing-target",
@@ -433,6 +449,30 @@ describe("forwarderManagementRouter", () => {
     expect(db.executionTarget.upsert).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["OPENAI_RESPONSES", "adapted recommendation when a native primary API exists"],
+    ["OPENAI_COMPLETIONS", "unavailable primary recommendation"],
+  ] as const)("rejects %s as an %s", async (recommendedSurface) => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel({}, "chat")]);
+
+    await expect(
+      client().createGuardedModelPool({
+        slug: "guarded-recommendation",
+        name: "Guarded recommendation",
+        localModelIds: ["local-id"],
+        recommendedSurface,
+        memberConcurrencyLimit: 1,
+        memberContextCeiling: 8_192,
+        reservedSlots: 0,
+        localWaitBudgetMs: 30_000,
+        publicEgressAcknowledged: false,
+        providerModels: [],
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
   it("rolls back guarded setup when a mid-transaction provider budget write fails", async () => {
     let rolledBack = false;
     db.$transaction.mockImplementationOnce(async (callback: (tx: typeof db) => unknown) => {
@@ -444,12 +484,7 @@ describe("forwarderManagementRouter", () => {
       }
     });
     db.modelPool.findUnique.mockResolvedValue(null);
-    db.discoveredModel.findMany.mockResolvedValue([
-      {
-        id: "local-id",
-        upstreamModelId: "local-model",
-      },
-    ]);
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel()]);
     db.executionTarget.findMany.mockResolvedValue([
       {
         id: "existing-target",
@@ -494,17 +529,17 @@ describe("forwarderManagementRouter", () => {
       callback(db),
     );
     db.modelPool.findUnique.mockResolvedValue(null);
-    db.discoveredModel.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce([
+    db.discoveredModel.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        guardedLocalModel({ id: "owned-local-model", upstreamModelId: "owned-model" }),
+      ]);
+    db.executionTarget.findMany.mockResolvedValue([
       {
-        id: "owned-local-model",
-        upstreamModelId: "owned-model",
-        ExecutionTargets: [
-          {
-            id: "owned-local-target",
-            inferenceCapacityId: "owned-capacity",
-            InferenceCapacity: { physicalMaxContext: 32_768 },
-          },
-        ],
+        id: "owned-local-target",
+        discoveredModelId: "owned-local-model",
+        inferenceCapacityId: "owned-capacity",
+        InferenceCapacity: { physicalMaxContext: 32_768 },
       },
     ]);
     db.providerModel.findMany.mockResolvedValueOnce([]);

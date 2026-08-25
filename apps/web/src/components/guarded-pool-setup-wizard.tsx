@@ -19,12 +19,18 @@ import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
+import {
+  type GuardedWizardLocalModel,
+  minimumSelectedPhysicalContext,
+  primarySurfaceIsSelectable,
+  providerOrderAfterMove,
+  providerOrderAfterToggle,
+  recommendedPrimarySurface,
+} from "@/lib/guarded-pool-wizard-validation";
 import { orpc } from "@/utils/orpc";
 
-type LocalModel = {
-  id: string;
+type LocalModel = GuardedWizardLocalModel & {
   canonicalModelId: string;
-  executionTarget?: { inferenceCapacityId: string | null } | null;
 };
 const surfaces = ["OPENAI_CHAT_COMPLETIONS", "OPENAI_RESPONSES", "ANTHROPIC_MESSAGES"] as const;
 
@@ -86,6 +92,18 @@ export function GuardedPoolSetupWizard({
         ctx.addIssue({ code: "custom", path: ["reservedSlots"] });
       if (value.providerModelIds.length > 0 && !value.publicEgressAcknowledged)
         ctx.addIssue({ code: "custom", path: ["publicEgressAcknowledged"] });
+      if (
+        value.localModelIds.length > 0 &&
+        !primarySurfaceIsSelectable(value.recommendedSurface, value.localModelIds, directModels)
+      )
+        ctx.addIssue({ code: "custom", path: ["recommendedSurface"] });
+      const physicalMaximum = minimumSelectedPhysicalContext(
+        value.localModelIds,
+        directModels,
+        capacities.data ?? [],
+      );
+      if (physicalMaximum != null && value.memberContextCeiling > physicalMaximum)
+        ctx.addIssue({ code: "custom", path: ["memberContextCeiling"] });
     });
   const form = useForm({
     defaultValues: {
@@ -220,11 +238,16 @@ export function GuardedPoolSetupWizard({
                             disabled={!model.executionTarget?.inferenceCapacityId}
                             checked={field.state.value.includes(model.id)}
                             onCheckedChange={(checked) =>
-                              field.handleChange(
-                                checked === true
-                                  ? [...field.state.value, model.id]
-                                  : field.state.value.filter((id) => id !== model.id),
-                              )
+                              (() => {
+                                const next =
+                                  checked === true
+                                    ? [...field.state.value, model.id]
+                                    : field.state.value.filter((id) => id !== model.id);
+                                field.handleChange(next);
+                                const recommended = recommendedPrimarySurface(next, directModels);
+                                if (recommended)
+                                  form.setFieldValue("recommendedSurface", recommended);
+                              })()
                             }
                           />
                           <span className="min-w-0 flex-1">
@@ -315,6 +338,7 @@ export function GuardedPoolSetupWizard({
                       onChange={(event) =>
                         field.handleChange(event.target.value as typeof field.state.value)
                       }
+                      {...errorProps("recommendedSurface")}
                     >
                       {surfaces.map((surface) => (
                         <option key={surface} value={surface}>
@@ -322,6 +346,11 @@ export function GuardedPoolSetupWizard({
                         </option>
                       ))}
                     </select>
+                    {stepErrors.recommendedSurface ? (
+                      <p id="wizard-recommendedSurface-error" className="text-sm text-destructive">
+                        {stepErrors.recommendedSurface}
+                      </p>
+                    ) : null}
                   </div>
                 )}
               </form.Field>
@@ -347,9 +376,11 @@ export function GuardedPoolSetupWizard({
                               checked={order >= 0}
                               onCheckedChange={(checked) =>
                                 field.handleChange(
-                                  checked === true
-                                    ? [...field.state.value, candidate.id]
-                                    : field.state.value.filter((id) => id !== candidate.id),
+                                  providerOrderAfterToggle(
+                                    field.state.value,
+                                    candidate.id,
+                                    checked === true,
+                                  ),
                                 )
                               }
                             />
@@ -370,12 +401,9 @@ export function GuardedPoolSetupWizard({
                                   disabled={order === 0}
                                   aria-label={t("dashboard:pools.wizard.moveProviderUp")}
                                   onClick={() => {
-                                    const next = [...field.state.value];
-                                    [next[order - 1], next[order]] = [
-                                      next[order]!,
-                                      next[order - 1]!,
-                                    ];
-                                    field.handleChange(next);
+                                    field.handleChange(
+                                      providerOrderAfterMove(field.state.value, order, -1),
+                                    );
                                   }}
                                 >
                                   <ArrowUp className="size-4" />
@@ -387,12 +415,9 @@ export function GuardedPoolSetupWizard({
                                   disabled={order === field.state.value.length - 1}
                                   aria-label={t("dashboard:pools.wizard.moveProviderDown")}
                                   onClick={() => {
-                                    const next = [...field.state.value];
-                                    [next[order], next[order + 1]] = [
-                                      next[order + 1]!,
-                                      next[order]!,
-                                    ];
-                                    field.handleChange(next);
+                                    field.handleChange(
+                                      providerOrderAfterMove(field.state.value, order, 1),
+                                    );
                                   }}
                                 >
                                   <ArrowDown className="size-4" />

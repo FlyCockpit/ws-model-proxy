@@ -38,6 +38,13 @@ import { visibleModelAttachmentModalities } from "../lib/visible-model-modalitie
 
 const CLI_HEARTBEAT_STALE_AFTER_MS = 60_000;
 
+let guardedSetupTestFailure: (() => void) | undefined;
+
+export function setGuardedSetupTestFailureInjector(injector: (() => void) | undefined) {
+  if (env.NODE_ENV !== "test") throw new Error("Guarded setup failure injection is test-only.");
+  guardedSetupTestFailure = injector;
+}
+
 const slugSchema = z
   .string()
   .trim()
@@ -1226,10 +1233,50 @@ export const forwarderManagementRouter = {
               published: true,
               Endpoint: { published: true },
             },
-            select: { id: true, upstreamModelId: true },
+            select: {
+              id: true,
+              upstreamModelId: true,
+              capabilityOverrideMode: true,
+              capabilityOverrides: true,
+              capabilityOverrideMetadata: true,
+              Endpoint: {
+                select: { capabilityMetadata: true, defaultCapabilities: true },
+              },
+            },
           });
           if (localModels.length !== input.localModelIds.length) {
             throw new ORPCError("NOT_FOUND", { message: "A selected local model is unavailable" });
+          }
+          const primaryMatrices = localModels.map((model) =>
+            surfaceAvailabilityMatrix({
+              capabilities:
+                resolveEffectiveCapabilityMetadata({
+                  capabilityOverrideMode: model.capabilityOverrideMode,
+                  capabilityOverrideMetadata: model.capabilityOverrideMetadata,
+                  endpointCapabilityMetadata: model.Endpoint.capabilityMetadata,
+                }) ??
+                openAiCapabilitiesFromCoarse(
+                  model.capabilityOverrideMode === "OVERRIDE"
+                    ? model.capabilityOverrides
+                    : model.Endpoint.defaultCapabilities,
+                ),
+              adaptationEnabled: true,
+            }),
+          );
+          const recommendedEntries = primaryMatrices.map(
+            (matrix) => matrix[input.recommendedSurface],
+          );
+          const anyPrimaryNative = modelApiSurfaces.some((surface) =>
+            primaryMatrices.some((matrix) => matrix[surface].mode === "native"),
+          );
+          if (
+            recommendedEntries.every((entry) => entry.mode === "unavailable") ||
+            (anyPrimaryNative && recommendedEntries.every((entry) => entry.mode !== "native"))
+          ) {
+            throw new ORPCError("BAD_REQUEST", {
+              message:
+                "Recommended API must be supported by a selected primary model and prefer a native primary API when available.",
+            });
           }
           const localTargets = await tx.executionTarget.findMany({
             where: { userId, discoveredModelId: { in: input.localModelIds } },
@@ -1394,6 +1441,7 @@ export const forwarderManagementRouter = {
               resourceId: pool.id,
             },
           });
+          guardedSetupTestFailure?.();
           const created = (await tx.modelPool.findUnique({
             where: { id: pool.id },
             select: poolSelect,

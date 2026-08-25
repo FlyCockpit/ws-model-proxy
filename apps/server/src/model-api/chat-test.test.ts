@@ -218,7 +218,7 @@ function directRow() {
   };
 }
 
-function poolMemberRow() {
+function poolMemberRow(native: "chat" | "responses" = "responses") {
   return {
     id: "member-id",
     poolId: "pool-id",
@@ -257,8 +257,8 @@ function poolMemberRow() {
       capabilityOverrideMetadata: {
         version: 1,
         protocol: "openai-compatible",
-        chatCompletions: { supported: true, streaming: true },
-        responses: { supported: true, streaming: true },
+        chatCompletions: { supported: native === "chat", streaming: true },
+        responses: { supported: native === "responses", streaming: true },
       },
     },
   };
@@ -374,6 +374,43 @@ describe("chat test routes", () => {
     expect(sent.endpointSlug).toBe("local");
     manager.headers(sent.requestId, 200, { "content-type": "application/json" });
     manager.body(sent.requestId, '{"id":"resp_1","output":[]}');
+    manager.complete(sent.requestId);
+    await expect(responsePromise).resolves.toMatchObject({ status: 200 });
+  });
+
+  it("keeps PREFERRED on the recommended native primary without unexpected public overflow", async () => {
+    const manager = new FakeRelayManager();
+    mockedTokenAccess.listVisibleModelTargetsForUser.mockResolvedValue({
+      directModels: [directTarget],
+      modelPools: [
+        {
+          ...poolTarget,
+          protocolAdaptationEnabled: true,
+          publicEgressEnabled: true,
+          publicEgressAcknowledged: true,
+          recommendedSurfaceOverride: "OPENAI_CHAT_COMPLETIONS",
+        },
+      ],
+    });
+    db.poolMember.findMany.mockResolvedValue([poolMemberRow("chat")]);
+    const responsePromise = appWith(manager).request("/chat/completions", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-wsmp-chat-test-routing-mode": "PREFER_NATIVE",
+      },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        messages: [{ role: "user", content: "Reply with pong." }],
+        stream: false,
+      }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    expect(sent.family).toBe("chat.completions");
+    expect(sent.cliDeviceId).toBe("cli-device-id");
+    manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+    manager.body(sent.requestId, '{"choices":[{"message":{"role":"assistant","content":"pong"}}]}');
     manager.complete(sent.requestId);
     await expect(responsePromise).resolves.toMatchObject({ status: 200 });
   });

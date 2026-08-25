@@ -352,6 +352,7 @@
         "name": "Ingresa un nombre para el pool.",
         "providerConcurrencyLimit": "Ingresa un límite entero de concurrencia del proveedor de 1 a 10000.",
         "providerModelIds": "Selecciona como máximo 32 modelos de proveedor.",
+        "recommendedSurface": "Elige la API nativa recomendada por los modelos primarios seleccionados.",
         "physicalConcurrencyLimit": "Ingresa un límite de concurrencia física de 1 a 10000.",
         "physicalMaxContext": "Ingresa un límite de contexto físico de 1 a 100000000.",
         "publicEgressAcknowledged": "Reconoce la divulgación exacta de salida pública.",
