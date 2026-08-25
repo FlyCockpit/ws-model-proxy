@@ -20,10 +20,14 @@ const affinity = vi.hoisted(() => ({
   rank: vi.fn(),
   remember: vi.fn(),
 }));
-const publicOverflow = vi.hoisted(() => ({ dispatch: vi.fn() }));
+const publicOverflow = vi.hoisted(() => ({ dispatch: vi.fn(), list: vi.fn() }));
 vi.mock("./public-overflow.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./public-overflow.js")>();
-  return { ...actual, dispatchPublicOverflow: publicOverflow.dispatch };
+  return {
+    ...actual,
+    dispatchPublicOverflow: publicOverflow.dispatch,
+    listPublicOverflowTargets: publicOverflow.list,
+  };
 });
 vi.mock("./cache-affinity.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./cache-affinity.js")>();
@@ -462,6 +466,56 @@ function requestBody(model = directTarget.modelId) {
   });
 }
 
+function providerPrimaryTarget(poolMemberId = "primary-provider-member") {
+  return {
+    poolMemberId,
+    executionTargetId: `${poolMemberId}-target`,
+    inferenceCapacityId: `${poolMemberId}-capacity`,
+    capacityWaitBudgetMs: 30_000,
+    publicOrder: 0,
+    weight: 1,
+    providerModelId: `${poolMemberId}-model`,
+    upstreamModelId: "provider-upstream",
+    contextWindow: 128_000,
+    maxOutputTokens: 16_384,
+    protocol: "openai" as const,
+    providerAccountId: "provider-account",
+    endpointIdentity: "https://provider.example/v1",
+    endpointVersion: 1,
+    concurrencyLimit: 4,
+    providerVersion: null,
+    baseUrl: "https://provider.example/v1",
+    authType: "BEARER" as const,
+    healthStatus: "HEALTHY" as const,
+    nativeProtocols: ["openai" as const],
+    nativeSurfaces: ["openai-chat" as const],
+    supportsStreaming: true,
+    supportedFeatures: [],
+    capabilityInventory: {
+      version: 3 as const,
+      protocol: "openai-compatible" as const,
+      surfaces: {
+        openaiChatCompletions: {
+          source: "provider" as const,
+          confidence: "exact" as const,
+          supported: true,
+          streaming: true,
+        },
+      },
+    },
+    credential: {
+      id: "credential",
+      credentialType: "BEARER" as const,
+      keyVersion: "v1",
+      aadVersion: 1,
+      algorithm: "aes-256-gcm",
+      ciphertext: new Uint8Array(),
+      nonce: new Uint8Array(),
+      authTag: new Uint8Array(),
+    },
+  };
+}
+
 function requireSent(manager: FakeRelayManager, index = 0): SendRelayRequestArgs {
   const sent = manager.sent[index];
   if (!sent) throw new Error("Expected relay request to be sent.");
@@ -551,6 +605,20 @@ describe("model API routes", () => {
       dispatched: false,
       reason: "DEPLOYMENT_GATE_DISABLED",
     });
+    publicOverflow.list.mockResolvedValue({
+      enabled: false,
+      acknowledged: false,
+      affinityPolicy: {
+        enabled: false,
+        ttlSeconds: 3600,
+        maxRecords: 10_000,
+        prefixWeight: 100,
+        conversationWeight: 150,
+        confirmedCacheWeight: 250,
+        loadPenaltyWeight: 100,
+      },
+      targets: [],
+    });
   });
 
   it("applies affinity only after pool compatibility and persists it after success", async () => {
@@ -617,9 +685,10 @@ describe("model API routes", () => {
         }),
       }),
     );
-    // An acceptable primary completes without even listing public providers;
-    // overflow affinity is therefore incapable of crossing the tier boundary.
-    expect(db.modelPool.findFirst).not.toHaveBeenCalled();
+    // Provider-backed and local primaries are discovered before scoring, but
+    // successful PRIMARY execution never inspects PUBLIC_OVERFLOW members.
+    expect(publicOverflow.list).toHaveBeenCalledWith("user-id", poolTarget.id, "PRIMARY");
+    expect(publicOverflow.dispatch).not.toHaveBeenCalled();
   });
 
   it("adapts an opted-in Chat pool request through a Responses-only member", async () => {
@@ -3120,6 +3189,20 @@ describe("model API routes", () => {
       modelPools: [poolTarget],
     });
     db.poolMember.findMany.mockResolvedValue([]);
+    publicOverflow.list.mockResolvedValueOnce({
+      enabled: false,
+      acknowledged: false,
+      affinityPolicy: {
+        enabled: false,
+        ttlSeconds: 3600,
+        maxRecords: 10_000,
+        prefixWeight: 100,
+        conversationWeight: 150,
+        confirmedCacheWeight: 250,
+        loadPenaltyWeight: 100,
+      },
+      targets: [providerPrimaryTarget()],
+    });
     publicOverflow.dispatch.mockResolvedValueOnce({
       dispatched: false,
       reason: "NO_COMPATIBLE_PROVIDER",
@@ -3178,6 +3261,20 @@ describe("model API routes", () => {
       modelPools: [poolTarget],
     });
     db.poolMember.findMany.mockResolvedValue([]);
+    publicOverflow.list.mockResolvedValueOnce({
+      enabled: false,
+      acknowledged: false,
+      affinityPolicy: {
+        enabled: false,
+        ttlSeconds: 3600,
+        maxRecords: 10_000,
+        prefixWeight: 100,
+        conversationWeight: 150,
+        confirmedCacheWeight: 250,
+        loadPenaltyWeight: 100,
+      },
+      targets: [providerPrimaryTarget()],
+    });
     publicOverflow.dispatch.mockResolvedValueOnce({
       dispatched: true,
       response: new Response(JSON.stringify({ id: "primary" }), {
@@ -3222,6 +3319,108 @@ describe("model API routes", () => {
           selectedPoolMemberTier: "PRIMARY",
         }),
       }),
+    );
+  });
+
+  it("admits local and provider PRIMARY members through one scored capacity candidate set", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "local-primary",
+        discoveredModelId: "local-model",
+        upstreamModelId: "local-upstream",
+        cliDeviceId: "cli-local",
+        weight: 1,
+      }),
+    ]);
+    const provider = { ...providerPrimaryTarget(), weight: 5 };
+    publicOverflow.list.mockResolvedValue({
+      enabled: false,
+      acknowledged: false,
+      affinityPolicy: {
+        enabled: false,
+        ttlSeconds: 3600,
+        maxRecords: 10_000,
+        prefixWeight: 100,
+        conversationWeight: 150,
+        confirmedCacheWeight: 250,
+        loadPenaltyWeight: 100,
+      },
+      targets: [provider],
+    });
+    publicOverflow.dispatch.mockResolvedValue({
+      dispatched: true,
+      response: new Response(JSON.stringify({ id: "provider-primary" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+      target: provider,
+      attemptId: "provider-attempt",
+      fencingToken: 7n,
+      nativeSurface: "openai-chat",
+      attemptCount: 1,
+      terminal: Promise.resolve({ ok: true, responseBytes: 25 }),
+      markFirstClientByte: vi.fn().mockResolvedValue(undefined),
+      affinity: undefined,
+    });
+    const capacityRuntime: CapacityAdmissionRuntime = {
+      acquire: vi.fn(async (attempt) => {
+        const selected = attempt.candidates[0]!;
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: "provider-lease",
+            attemptId: attempt.attemptId,
+            capacityId: selected.capacityId,
+            executionTargetId: selected.executionTargetId,
+            poolMemberId: selected.poolMemberId,
+            fencingToken: 3n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      }),
+      release: vi.fn(async () => true),
+      hold: vi.fn((response) => response),
+    };
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-local"];
+
+    const response = await appWith(manager, true, false, capacityRuntime).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: requestBody(poolTarget.modelId),
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(manager.sent).toHaveLength(0);
+    expect(capacityRuntime.acquire).toHaveBeenCalledWith(
+      expect.objectContaining({
+        candidates: [
+          expect.objectContaining({ poolMemberId: provider.poolMemberId, candidateOrder: 0 }),
+          expect.objectContaining({ poolMemberId: "local-primary", candidateOrder: 1 }),
+        ],
+      }),
+      expect.any(AbortSignal),
+    );
+    expect(publicOverflow.dispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        memberTier: "PRIMARY",
+        forcedPoolMemberId: provider.poolMemberId,
+      }),
+    );
+    expect(capacityRuntime.hold).toHaveBeenCalledWith(
+      expect.any(Response),
+      expect.objectContaining({ poolMemberId: provider.poolMemberId }),
+      expect.any(AbortSignal),
     );
   });
 

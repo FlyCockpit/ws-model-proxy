@@ -134,6 +134,8 @@ export interface PublicProviderTarget {
   inferenceCapacityId?: string | null;
   capacityWaitBudgetMs?: number | null;
   publicOrder: number;
+  /** Pool-member weight used only by the unified PRIMARY scheduler. */
+  weight?: number;
   providerModelId: string;
   upstreamModelId: string;
   contextWindow: number | null;
@@ -673,6 +675,7 @@ export async function listPublicOverflowTargets(
               ? member.capacityWaitBudgetMs
               : pool.capacityWaitBudgetMs,
         publicOrder: member.publicOrder ?? 0,
+        weight: member.weight,
         providerModelId: model.id,
         upstreamModelId: model.upstreamModelId,
         contextWindow: model.contextWindow,

@@ -149,6 +149,7 @@ import {
   matchesChatTestProviderMode,
   type PublicOverflowReason,
   type PublicOverflowRequest,
+  type PublicProviderTarget,
   publicTargetCompatibility,
 } from "./public-overflow.js";
 import { type RelayAttemptTerminal, startRelayAttempt } from "./relay-executor.js";
@@ -3255,6 +3256,14 @@ async function relayPool({
   const tryPublicOverflow = async (
     reason: PublicOverflowReason,
     releaseLocalCapacity: () => Promise<void>,
+    options?: {
+      onlyTier?: "PRIMARY" | "PUBLIC_OVERFLOW";
+      forcedProviderMemberId?: string;
+      preAdmittedProviderLease?: Extract<
+        Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>>,
+        { state: "ADMITTED" }
+      >["lease"];
+    },
   ): Promise<Response | null> => {
     // Public provider dispatch is intentionally limited to replayable modern
     // JSON operations. Stateful Responses and multipart/audio paths must retain
@@ -3332,7 +3341,7 @@ async function relayPool({
       adaptationEnabled:
         operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled,
       chatTestRoutingMode: testRoutingMode,
-      forcedPoolMemberId,
+      forcedPoolMemberId: options?.forcedProviderMemberId ?? forcedPoolMemberId,
       retrySafe:
         shouldRetryRelayOperation(operation, "precommit_5xx") &&
         shouldRetryRelayOperation(operation, "precommit_transport"),
@@ -3382,11 +3391,25 @@ async function relayPool({
         >["lease"]
       | undefined;
     const dispatchProviderTier = async (memberTier: "PRIMARY" | "PUBLIC_OVERFLOW") => {
+      if (options?.preAdmittedProviderLease && memberTier === "PRIMARY") {
+        const result = await dispatchPublicOverflow({
+          ...providerRequest,
+          memberTier,
+          forcedPoolMemberId: options.forcedProviderMemberId,
+        });
+        if (!result.dispatched) {
+          await capacityRuntime?.release(options.preAdmittedProviderLease);
+          return result;
+        }
+        providerCapacityLease = options.preAdmittedProviderLease;
+        return result;
+      }
       if (!capacityRuntime) return dispatchPublicOverflow({ ...providerRequest, memberTier });
       const listed = await listPublicOverflowTargets(target.ownerUserId, target.id, memberTier);
       const compatible = listed.targets.filter(
         (providerTarget) =>
-          (!forcedPoolMemberId || providerTarget.poolMemberId === forcedPoolMemberId) &&
+          (!providerRequest.forcedPoolMemberId ||
+            providerTarget.poolMemberId === providerRequest.forcedPoolMemberId) &&
           publicTargetCompatibility(providerTarget, providerRequest) === "COMPATIBLE" &&
           matchesChatTestProviderMode(providerTarget, requestedSurface, testRoutingMode),
       );
@@ -3438,11 +3461,11 @@ async function relayPool({
       providerCapacityLease = admission.lease;
       return result;
     };
-    let selectedTier: "PRIMARY" | "PUBLIC_OVERFLOW" = "PRIMARY";
-    let result = await dispatchProviderTier("PRIMARY");
-    if (!result.dispatched) {
+    let selectedTier: "PRIMARY" | "PUBLIC_OVERFLOW" = options?.onlyTier ?? "PRIMARY";
+    let result = await dispatchProviderTier(selectedTier);
+    if (!result.dispatched && !options?.onlyTier) {
       selectedTier = "PUBLIC_OVERFLOW";
-      result = await dispatchProviderTier("PUBLIC_OVERFLOW");
+      result = await dispatchProviderTier(selectedTier);
     }
     if (!result.dispatched) return null;
     await prisma.relayRequest
@@ -3668,16 +3691,6 @@ async function relayPool({
         }),
       )
     : members;
-  if (members.length > 0 && contextEligibleMembers.length === 0) {
-    const overflow = await tryPublicOverflow("LOCAL_CONTEXT_CEILING", async () => undefined);
-    if (overflow) return overflow;
-    await operation.dispose?.();
-    await failRelayMetadata({ relayRequestId, startedAt, failure: "request_too_large" });
-    return contextExceededResponse(
-      operation,
-      "Request context exceeds every compatible pool member ceiling.",
-    );
-  }
   let canonicalAdaptationRequest: ReturnType<typeof parseCanonicalRequest> | null = null;
   if (operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled) {
     try {
@@ -3762,10 +3775,77 @@ async function relayPool({
       : [];
   // Known-compatible members always route before optimistic unknown fallbacks.
   const eligibleMembers = [...knownEligibleMembers, ...unknownFallbackMembers];
-  if (eligibleMembers.length === 0) {
+  let providerPrimaryTargets: PublicProviderTarget[] = [];
+  if (operation.contextInput && requestedSurface) {
+    const listed = await listPublicOverflowTargets(target.ownerUserId, target.id, "PRIMARY");
+    const maxOutput = operation.contextInput.max_output_tokens ?? operation.contextInput.max_tokens;
+    const requestedOutputTokens =
+      typeof maxOutput === "number" && Number.isSafeInteger(maxOutput) && maxOutput >= 0
+        ? BigInt(maxOutput)
+        : undefined;
+    const estimatedInputTokens =
+      operation.contextCount?.tokens !== undefined
+        ? BigInt(operation.contextCount.tokens)
+        : conservativeSerializedInputTokens(
+            new TextEncoder().encode(JSON.stringify(operation.contextInput)).byteLength,
+          );
+    const requestedFeatures = profileSurfaceRequest(operation.contextInput);
+    const requiredFeatures = Object.entries(requestedFeatures)
+      .filter(([, enabled]) => enabled === true)
+      .map(([feature]) => feature);
+    providerPrimaryTargets = listed.targets.filter(
+      (providerTarget) =>
+        (!forcedPoolMemberId || providerTarget.poolMemberId === forcedPoolMemberId) &&
+        matchesChatTestProviderMode(providerTarget, requestedSurface, testRoutingMode) &&
+        publicTargetCompatibility(providerTarget, {
+          requestedProtocol: operation.family === "messages" ? "anthropic" : "openai",
+          requestedSurface,
+          stream: operation.stream,
+          requiredFeatures,
+          requestedOutputTokens,
+          adaptationEnabled:
+            operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled,
+          renderForTarget: canonicalAdaptationRequest
+            ? async () => {
+                throw new Error("Compatibility probe only.");
+              }
+            : undefined,
+          liability:
+            requestedOutputTokens === undefined
+              ? { accountingVersion: "provider-billable-v1" }
+              : conservativeProviderLiability({ estimatedInputTokens, requestedOutputTokens }),
+          estimatedInputTokens,
+          contextTokens:
+            requestedOutputTokens === undefined
+              ? undefined
+              : estimatedInputTokens + requestedOutputTokens,
+          path: operation.path,
+          headers: request.headers,
+          method: request.method,
+        }) === "COMPATIBLE",
+    );
+  }
+  if (
+    members.length > 0 &&
+    contextEligibleMembers.length === 0 &&
+    providerPrimaryTargets.length === 0
+  ) {
+    const overflow = await tryPublicOverflow("LOCAL_CONTEXT_CEILING", async () => undefined, {
+      onlyTier: "PUBLIC_OVERFLOW",
+    });
+    if (overflow) return overflow;
+    await operation.dispose?.();
+    await failRelayMetadata({ relayRequestId, startedAt, failure: "request_too_large" });
+    return contextExceededResponse(
+      operation,
+      "Request context exceeds every compatible pool member ceiling.",
+    );
+  }
+  if (eligibleMembers.length === 0 && providerPrimaryTargets.length === 0) {
     const overflow = await tryPublicOverflow(
       "NO_COMPATIBLE_HEALTHY_PRIMARY",
       async () => undefined,
+      { onlyTier: "PUBLIC_OVERFLOW" },
     );
     if (overflow) return overflow;
     globalLease?.release();
@@ -3800,16 +3880,49 @@ async function relayPool({
     activeCliDeviceIds,
     now,
   });
-  let routeCandidates = [
+  const localRouteCandidates = [
     ...(nativeSequence.ok ? nativeSequence.candidates : []),
     ...(adaptedSequence.ok ? adaptedSequence.candidates : []),
     ...(legacySequence.ok ? legacySequence.candidates : []),
     ...(unknownSequence.ok ? unknownSequence.candidates : []),
   ];
+  const providerByMemberId = new Map(
+    providerPrimaryTargets.map((providerTarget) => [providerTarget.poolMemberId, providerTarget]),
+  );
+  const providerRouteCandidates = providerPrimaryTargets.map((providerTarget) => ({
+    poolMemberId: providerTarget.poolMemberId,
+    poolId: target.id,
+    discoveredModelId: "",
+    upstreamModelId: providerTarget.upstreamModelId,
+    endpointId: providerTarget.executionTargetId,
+    cliDeviceId: "",
+    weight: providerTarget.weight ?? 1,
+    healthStatus: "HEALTHY" as const,
+    consecutiveRetryableFailures: 0,
+    lastFailureClass: null,
+    lastFailureAt: null,
+    nextRetryAt: null,
+  }));
+  const routeModeRank = (candidate: (typeof localRouteCandidates)[number]) => {
+    const provider = providerByMemberId.get(candidate.poolMemberId);
+    if (provider) return provider.nativeSurfaces.includes(requestedSurface!) ? 0 : 1;
+    const mode = executionByMember.get(candidate.poolMemberId)?.mode;
+    return mode === "native" ? 0 : mode === "adapted" ? 1 : 2;
+  };
+  // Local and provider-backed PRIMARY members enter one scored sequence.
+  // Native compatibility is the first class; member weight is the shared
+  // score within a class, with stable member IDs providing deterministic ties.
+  let routeCandidates = [...localRouteCandidates, ...providerRouteCandidates].sort(
+    (left, right) =>
+      routeModeRank(left) - routeModeRank(right) ||
+      right.weight - left.weight ||
+      left.poolMemberId.localeCompare(right.poolMemberId),
+  );
   if (routeCandidates.length === 0) {
     const overflow = await tryPublicOverflow(
       "NO_COMPATIBLE_HEALTHY_PRIMARY",
       async () => undefined,
+      { onlyTier: "PUBLIC_OVERFLOW" },
     );
     if (overflow) return overflow;
     globalLease?.release();
@@ -3819,9 +3932,41 @@ async function relayPool({
   }
 
   const memberById = new Map(eligibleMembers.map((member) => [member.id, member] as const));
+  const admissionCandidateForRoute = (
+    candidate: (typeof routeCandidates)[number],
+    candidateOrder: number,
+    admissionStartedAt: number,
+  ) => {
+    const member = memberById.get(candidate.poolMemberId);
+    if (member)
+      return poolAdmissionCandidate(member, candidateOrder, admissionStartedAt, relayDeadlineMs);
+    const provider = providerByMemberId.get(candidate.poolMemberId);
+    if (!provider?.inferenceCapacityId) return null;
+    return {
+      capacityId: provider.inferenceCapacityId,
+      executionTargetId: provider.executionTargetId,
+      poolMemberId: provider.poolMemberId,
+      candidateOrder,
+      deadlineAt: boundedAdmissionDeadline(
+        admissionStartedAt,
+        relayDeadlineMs,
+        provider.capacityWaitBudgetMs ?? null,
+      ),
+    };
+  };
   let affinityDecision: AffinityDecision | null = null;
   const affinityPayload = operation.contextInput ?? operation.adaptation?.payload ?? null;
-  const affinityPolicy = affinityPolicyForMember(eligibleMembers[0]!);
+  const affinityPolicy = eligibleMembers[0]
+    ? affinityPolicyForMember(eligibleMembers[0])
+    : {
+        enabled: false,
+        ttlSeconds: 3600,
+        maxRecords: 10_000,
+        prefixWeight: 100,
+        conversationWeight: 150,
+        confirmedCacheWeight: 250,
+        loadPenaltyWeight: 100,
+      };
   if (requestedSurface && affinityPayload && affinityPolicy.enabled) {
     const affinityTargets = routeCandidates.flatMap((candidate) => {
       const member = memberById.get(candidate.poolMemberId);
@@ -3890,12 +4035,9 @@ async function relayPool({
   };
   if (capacityRuntime) {
     const admissionStartedAt = Date.now();
-    const admissionCandidates = routeCandidates.map((candidate, candidateOrder) => {
-      const member = memberById.get(candidate.poolMemberId);
-      return member
-        ? poolAdmissionCandidate(member, candidateOrder, admissionStartedAt, relayDeadlineMs)
-        : null;
-    });
+    const admissionCandidates = routeCandidates.map((candidate, candidateOrder) =>
+      admissionCandidateForRoute(candidate, candidateOrder, admissionStartedAt),
+    );
     if (admissionCandidates.some((candidate) => candidate === null)) {
       globalLease?.release();
       await operation.dispose?.();
@@ -3927,7 +4069,9 @@ async function relayPool({
       return operationFailureResponse(operation, "unknown");
     }
     if (capacityLease.state !== "ADMITTED" || !capacityLease.lease.poolMemberId) {
-      const overflow = await tryPublicOverflow("LOCAL_WAIT_EXPIRED", async () => undefined);
+      const overflow = await tryPublicOverflow("LOCAL_WAIT_EXPIRED", async () => undefined, {
+        onlyTier: "PUBLIC_OVERFLOW",
+      });
       if (overflow) return overflow;
       globalLease?.release();
       await operation.dispose?.();
@@ -3999,14 +4143,10 @@ async function relayPool({
       const remaining = selectedRouteCandidates.slice(candidateIndex);
       const admissionStartedAt = Date.now();
       const admissionCandidates = remaining.map((remainingCandidate, candidateOrder) => {
-        const member = memberById.get(remainingCandidate.poolMemberId);
-        if (!member)
-          throw new Error("Capacity-enabled pool member lost execution target identity.");
-        const resolved = poolAdmissionCandidate(
-          member,
+        const resolved = admissionCandidateForRoute(
+          remainingCandidate,
           candidateOrder,
           admissionStartedAt,
-          relayDeadlineMs,
         );
         if (!resolved)
           throw new Error("Capacity-enabled pool member lost execution target identity.");
@@ -4078,6 +4218,26 @@ async function relayPool({
     if (remainingRelayBudgetMs(relayDeadlineMs) === 0) {
       finalFailure = "timeout";
       break;
+    }
+    const providerTarget = providerByMemberId.get(candidate.poolMemberId);
+    if (providerTarget) {
+      const providerLease = capacityLease?.state === "ADMITTED" ? capacityLease.lease : undefined;
+      capacityLease = undefined;
+      globalLease?.release();
+      globalLease = undefined;
+      const providerResponse = await tryPublicOverflow(
+        "NO_COMPATIBLE_HEALTHY_PRIMARY",
+        async () => undefined,
+        {
+          onlyTier: "PRIMARY",
+          forcedProviderMemberId: providerTarget.poolMemberId,
+          preAdmittedProviderLease: providerLease,
+        },
+      );
+      if (providerResponse) return providerResponse;
+      if (providerLease) await capacityRuntime?.release(providerLease);
+      finalFailure = "upstream_5xx";
+      continue;
     }
     const member = memberById.get(candidate.poolMemberId);
     if (!member) continue;
@@ -4600,16 +4760,20 @@ async function relayPool({
     finalFailure === "rate_limited" || finalFailure === "timeout"
       ? "LOCAL_WAIT_EXPIRED"
       : "RETRYABLE_PRECOMMIT_PRIMARY_FAILURE";
-  const overflow = await tryPublicOverflow(overflowReason, async () => {
-    const lease = capacityLease?.state === "ADMITTED" ? capacityLease.lease : undefined;
-    capacityLease = undefined;
-    const acquiredGlobalLease = globalLease;
-    globalLease = undefined;
-    await settleRelayCleanup([
-      () => acquiredGlobalLease?.release(),
-      () => (lease ? capacityRuntime?.release(lease) : undefined),
-    ]);
-  });
+  const overflow = await tryPublicOverflow(
+    overflowReason,
+    async () => {
+      const lease = capacityLease?.state === "ADMITTED" ? capacityLease.lease : undefined;
+      capacityLease = undefined;
+      const acquiredGlobalLease = globalLease;
+      globalLease = undefined;
+      await settleRelayCleanup([
+        () => acquiredGlobalLease?.release(),
+        () => (lease ? capacityRuntime?.release(lease) : undefined),
+      ]);
+    },
+    { onlyTier: "PUBLIC_OVERFLOW" },
+  );
   if (overflow) return overflow;
 
   await settleRelayCleanup([
