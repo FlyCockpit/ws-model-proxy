@@ -1543,10 +1543,34 @@ CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_settlement_reservation_revisio
 -- Rows created before observationComplete was persisted already passed the
 -- then-current known-usage/cost invariants. Preserve that immutable accounting
 -- decision explicitly; unknown/conservative legacy rows remain NULL.
+DROP TRIGGER IF EXISTS provider_usage_ledger_immutable ON provider_usage_ledger;
 UPDATE provider_usage_ledger
    SET "observationComplete" = TRUE
  WHERE "observationComplete" IS NULL
    AND ("usageKnown" OR "costKnown");
+
+-- Close the legacy split reconcile/finalize crash gap from deployments that
+-- committed an immutable terminal ledger before updating its attempt anchor.
+WITH latest_terminal AS (
+  SELECT DISTINCT ON ("attemptId", "fencingToken")
+         "attemptId", "fencingToken", "terminalReason", "createdAt"
+    FROM provider_usage_ledger
+   ORDER BY "attemptId", "fencingToken", "revisionSequence" DESC, "createdAt" DESC
+)
+UPDATE provider_attempt attempt
+   SET state = CASE
+         WHEN latest."terminalReason" = 'COMPLETED' THEN 'COMPLETED'::"ProviderAttemptState"
+         WHEN latest."terminalReason" = 'CANCELLED' THEN 'CANCELLED'::"ProviderAttemptState"
+         WHEN latest."terminalReason" = 'CRASH_RECOVERY' THEN 'EXPIRED'::"ProviderAttemptState"
+         ELSE 'FAILED'::"ProviderAttemptState"
+       END,
+       "terminalReason" = latest."terminalReason",
+       "terminalAt" = latest."createdAt",
+       "heartbeatAt" = GREATEST(attempt."heartbeatAt", latest."createdAt")
+  FROM latest_terminal latest
+ WHERE attempt.state = 'ACTIVE'
+   AND latest."attemptId" = attempt."attemptId"
+   AND latest."fencingToken" = attempt."fencingToken";
 
 ALTER TABLE provider_usage_ledger DROP CONSTRAINT IF EXISTS provider_usage_ledger_shape_check;
 ALTER TABLE provider_usage_ledger ADD CONSTRAINT provider_usage_ledger_shape_check CHECK (

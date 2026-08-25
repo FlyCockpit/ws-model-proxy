@@ -120,14 +120,16 @@ export async function finishProviderAttempt(input: {
 }
 
 export async function expireProviderAttempts(now = new Date()): Promise<number> {
-  const result = await prisma.providerAttempt.updateMany({
-    where: {
-      state: "ACTIVE",
-      OR: [{ expiresAt: { lte: now } }, { heartbeatAt: { lt: new Date(now.getTime() - 60_000) } }],
-    },
-    data: { state: "EXPIRED", terminalReason: "CRASH_RECOVERY", terminalAt: now },
-  });
-  return result.count;
+  return prisma.$executeRaw`
+    UPDATE provider_attempt attempt
+       SET state = 'EXPIRED', "terminalReason" = 'CRASH_RECOVERY', "terminalAt" = ${now}
+     WHERE attempt.state = 'ACTIVE'
+       AND (attempt."expiresAt" <= ${now} OR attempt."heartbeatAt" < ${new Date(now.getTime() - 60_000)})
+       AND NOT EXISTS (
+         SELECT 1 FROM provider_usage_ledger ledger
+          WHERE ledger."attemptId" = attempt."attemptId"
+            AND ledger."fencingToken" = attempt."fencingToken"
+       )`;
 }
 
 /** Atomically excludes cooldown targets and grants at most one half-open probe. */

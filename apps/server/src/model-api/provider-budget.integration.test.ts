@@ -260,6 +260,7 @@ integration("provider budget admission and reconciliation", () => {
       reason: "FAILED" as const,
       revisionSequence: 1n,
       revisionKind: "SNAPSHOT" as const,
+      observationComplete: true,
       usage: {
         accountingVersion: "usage-v1",
         inputTokens: 2n,
@@ -340,13 +341,14 @@ integration("provider budget admission and reconciliation", () => {
     ).resolves.toMatchObject({ state: "COMPLETED", terminalReason: "COMPLETED" });
   });
 
-  it("finalizes an active legacy split-phase orphan on an idempotent terminal retry", async () => {
+  it("repairs an expired active legacy split-phase orphan without an application retry", async () => {
     if (!db) return;
     const row = await fixture({ metric: "TOKENS" });
     const original = attempt(row, `legacy-terminal-orphan-${crypto.randomUUID()}`, {
       tokens: 8n,
       accountingVersion: "usage-v1",
     });
+    original.expiresAt = new Date(Date.now() + 100);
     await service.admitProviderBudget(original);
     const terminal = {
       ...original,
@@ -377,7 +379,7 @@ integration("provider budget admission and reconciliation", () => {
       1,
     );
 
-    await service.reconcileProviderBudget(terminal);
+    await service.repairExpiredProviderBudgets(new Date(Date.now() + 1_000));
     expect(await db.providerUsageLedger.count({ where: { attemptId: original.attemptId } })).toBe(
       1,
     );
@@ -691,6 +693,7 @@ integration("provider budget admission and reconciliation", () => {
       usageSource: " provider-poll ",
       revisionSequence: 1n,
       revisionKind: "SNAPSHOT" as const,
+      observationComplete: true,
       usage: {
         accountingVersion: " usage-v1 ",
         authoritativeBillableTokens: 3n,
@@ -714,9 +717,11 @@ integration("provider budget admission and reconciliation", () => {
       ...revision,
       sourceVersion: "provider-v1",
       usageSource: "provider-poll",
+      observationComplete: undefined,
       transportTrace: "retry delivery",
       usage: {
         ...revision.usage,
+        observationComplete: true,
         accountingVersion: "usage-v1",
         reportedCost: new (await import("@ws-model-proxy/db")).Prisma.Decimal("1"),
         reportedCostCurrency: "USD",
@@ -725,6 +730,13 @@ integration("provider budget admission and reconciliation", () => {
       },
     };
     await expect(service.reconcileProviderBudget(equivalentRetry)).resolves.toBeUndefined();
+    await expect(
+      service.reconcileProviderBudget({
+        ...revision,
+        observationComplete: true,
+        usage: { ...revision.usage, observationComplete: false },
+      }),
+    ).rejects.toThrow("Conflicting terminal observation completeness");
     await expect(
       service.reconcileProviderBudget({
         ...revision,

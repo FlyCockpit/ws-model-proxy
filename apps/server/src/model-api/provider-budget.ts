@@ -202,6 +202,7 @@ function terminalPayloadHash(
   sourceVersion: string,
   usageSource: string,
   accountingMatches: boolean,
+  observationComplete: boolean | undefined,
 ): string {
   const usage = terminal.usage;
   const sourceUsageAccountingVersion = usage
@@ -220,7 +221,6 @@ function terminalPayloadHash(
         reportedTotalTokens: usage.reportedTotalTokens,
         categoriesComplete: usage.categoriesComplete,
         rawUsage: usage.rawUsage,
-        observationComplete: usage.observationComplete,
         reportedCost: usage.reportedCost === undefined ? undefined : decimal(usage.reportedCost),
         reportedCostCurrency: normalizedCurrency(usage.reportedCostCurrency ?? usage.currency),
         reportedCostPricingVersion:
@@ -266,7 +266,7 @@ function terminalPayloadHash(
     sourceVersion,
     revisionSequence: terminal.revisionSequence,
     revisionKind: terminal.revisionKind,
-    observationComplete: terminal.observationComplete,
+    observationComplete,
     usageSource,
     usage: normalizedUsage,
   });
@@ -705,6 +705,14 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
   )
     throw new ProviderBudgetConfigurationError("Invalid fencing token");
   assertUsage(terminal.usage);
+  if (
+    terminal.observationComplete !== undefined &&
+    terminal.usage?.observationComplete !== undefined &&
+    terminal.observationComplete !== terminal.usage.observationComplete
+  )
+    throw new ProviderBudgetConfigurationError("Conflicting terminal observation completeness");
+  const normalizedObservationComplete =
+    terminal.observationComplete ?? terminal.usage?.observationComplete;
   const sourceVersion = normalizedVersion(
     terminal.sourceVersion ??
       (terminal.reason === "CRASH_RECOVERY" ? "crash-recovery-v1" : "terminal-v1"),
@@ -772,7 +780,7 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
     };
 
     const usage = terminal.usage;
-    const observationComplete = terminal.observationComplete ?? usage?.observationComplete;
+    const observationComplete = normalizedObservationComplete;
     const sourceUsageAccountingVersion = usage
       ? normalizedVersion(usage.accountingVersion, "accountingVersion")
       : undefined;
@@ -783,6 +791,7 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
       sourceVersion,
       usageSource,
       accountingMatches,
+      observationComplete,
     );
     const priorRevision = await tx.providerUsageLedger.findUnique({
       where: {
@@ -1014,19 +1023,48 @@ export async function repairExpiredProviderBudgets(
       requestId: string;
       attemptId: string;
       fencingToken: bigint;
+      ledgerTerminalReason: string | null;
     }>
   >`SELECT a."userId", a."providerAccountId", a."providerModelId", a."credentialId",
-           a."poolId", a."requestId", a."attemptId", a."fencingToken"
+           a."poolId", a."requestId", a."attemptId", a."fencingToken",
+           (SELECT l."terminalReason" FROM provider_usage_ledger l
+             WHERE l."attemptId" = a."attemptId" AND l."fencingToken" = a."fencingToken"
+             ORDER BY l."revisionSequence" DESC, l."createdAt" DESC LIMIT 1) AS "ledgerTerminalReason"
      FROM provider_attempt a
-     WHERE a."expiresAt" <= ${now}
+     WHERE a.state = 'ACTIVE' AND a."expiresAt" <= ${now}
        AND (${scope?.userId ?? null}::text IS NULL OR a."userId" = ${scope?.userId ?? null})
        AND (${scope?.providerAccountId ?? null}::text IS NULL OR a."providerAccountId" = ${scope?.providerAccountId ?? null})
-       AND NOT EXISTS (
-         SELECT 1 FROM provider_usage_ledger l
-          WHERE l."attemptId" = a."attemptId" AND l."fencingToken" = a."fencingToken"
-       )
      ORDER BY a."attemptId"`;
   for (const row of expired) {
+    if (row.ledgerTerminalReason) {
+      await prisma.$transaction(async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-attempt:${row.attemptId}`}, 0))`;
+        const latest = await tx.providerUsageLedger.findFirst({
+          where: { attemptId: row.attemptId, fencingToken: row.fencingToken },
+          orderBy: [{ revisionSequence: "desc" }, { createdAt: "desc" }],
+          select: { terminalReason: true },
+        });
+        if (!latest) return;
+        const terminalAt = new Date();
+        await tx.providerAttempt.updateMany({
+          where: { attemptId: row.attemptId, fencingToken: row.fencingToken, state: "ACTIVE" },
+          data: {
+            state:
+              latest.terminalReason === "COMPLETED"
+                ? "COMPLETED"
+                : latest.terminalReason === "CANCELLED"
+                  ? "CANCELLED"
+                  : latest.terminalReason === "CRASH_RECOVERY"
+                    ? "EXPIRED"
+                    : "FAILED",
+            terminalReason: latest.terminalReason,
+            terminalAt,
+            heartbeatAt: terminalAt,
+          },
+        });
+      });
+      continue;
+    }
     await reconcileProviderBudget({
       userId: row.userId,
       providerAccountId: row.providerAccountId,

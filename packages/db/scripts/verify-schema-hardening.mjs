@@ -1158,6 +1158,9 @@ try {
     `ALTER TABLE provider_budget_settlement DROP CONSTRAINT provider_budget_settlement_shape_check`,
   );
   await client.query(
+    `ALTER TABLE provider_usage_ledger DROP CONSTRAINT provider_usage_ledger_shape_check`,
+  );
+  await client.query(
     `DROP TRIGGER provider_budget_settlement_graph_consistency ON provider_budget_settlement`,
   );
   await client.query(`
@@ -1178,11 +1181,11 @@ try {
       (id, "createdAt", "userId", "providerAccountId", "providerModelId", "reservationId",
        "requestId", "attemptId", "fencingToken", "accountingVersion", "sourceVersion",
        "usageSource", "revisionSequence", "revisionKind", "payloadHash", "usageKnown",
-       "costKnown", "terminalReason", confidence)
+       "costKnown", "terminalReason", confidence, "billableTotal", "categoriesComplete")
     VALUES ('legacy-history-ledger', NOW(), 'owner-a', 'provider-account-a', 'provider-model-a',
       'legacy-history-reservation', 'legacy-history-request', 'legacy-history', 8, 'usage-v1',
-      'legacy-history-v1', 'legacy', 1, 'SNAPSHOT', 'legacy-pending', false, false,
-      'FAILED', 'ESTIMATED');
+      'legacy-history-v1', 'legacy', 1, 'SNAPSHOT', 'legacy-pending', true, false,
+      'FAILED', 'REPORTED', 4, true);
     INSERT INTO provider_budget_settlement
       (id, "createdAt", "userId", "providerAccountId", "providerModelId", "requestId",
        "reservationId", "attemptId", "fencingToken", "sourceVersion", "revisionSequence",
@@ -1225,17 +1228,24 @@ try {
   await concurrentHardening;
   const upgradedHistory = await client.query(`
     SELECT ledger."payloadHash" AS ledger_hash, settlement."payloadHash" AS settlement_hash,
-           settlement."providerAccountId" AS account_id, settlement."requestId" AS request_id
+           settlement."providerAccountId" AS account_id, settlement."requestId" AS request_id,
+           ledger."observationComplete" AS observation_complete,
+           attempt.state AS attempt_state, attempt."terminalReason" AS attempt_reason
       FROM provider_usage_ledger ledger
       JOIN provider_budget_settlement settlement
         ON settlement."attemptId" = ledger."attemptId"
+      JOIN provider_attempt attempt
+        ON attempt."attemptId" = ledger."attemptId" AND attempt."fencingToken" = ledger."fencingToken"
      WHERE ledger.id = 'legacy-history-ledger'
   `);
   if (
     upgradedHistory.rows[0]?.ledger_hash === "legacy-pending" ||
     upgradedHistory.rows[0]?.settlement_hash !== upgradedHistory.rows[0]?.ledger_hash ||
     upgradedHistory.rows[0]?.account_id !== "provider-account-a" ||
-    upgradedHistory.rows[0]?.request_id !== "legacy-history-request"
+    upgradedHistory.rows[0]?.request_id !== "legacy-history-request" ||
+    upgradedHistory.rows[0]?.observation_complete !== true ||
+    upgradedHistory.rows[0]?.attempt_state !== "FAILED" ||
+    upgradedHistory.rows[0]?.attempt_reason !== "FAILED"
   ) {
     throw new Error("Previous-schema accounting history was not upgraded atomically");
   }
