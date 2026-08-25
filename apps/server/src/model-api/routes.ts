@@ -23,6 +23,7 @@ import {
 } from "@ws-model-proxy/api/lib/model-pool-routing";
 import {
   normalizeTranscriptionCapabilities,
+  parseOpenAiCompatibleCapabilities,
   resolveEffectiveCapabilityMetadata,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import {
@@ -2714,7 +2715,10 @@ async function modelListResponse(targets: {
           where: {
             poolId: { in: poolIds },
             tier: "PRIMARY",
-            ExecutionTarget: { DiscoveredModel: { isNot: null } },
+            OR: [
+              { ExecutionTarget: { DiscoveredModel: { isNot: null } } },
+              { ExecutionTarget: { ProviderModel: { isNot: null } } },
+            ],
           },
           select: {
             poolId: true,
@@ -2725,6 +2729,16 @@ async function modelListResponse(targets: {
                     capabilityOverrideMode: true,
                     capabilityOverrideMetadata: true,
                     Endpoint: { select: { capabilityMetadata: true } },
+                  },
+                },
+                ProviderModel: {
+                  select: {
+                    enabled: true,
+                    deletedAt: true,
+                    nativeCapabilities: true,
+                    ProviderAccount: {
+                      select: { enabled: true, deletedAt: true },
+                    },
                   },
                 },
               },
@@ -2805,12 +2819,19 @@ async function modelListResponse(targets: {
       .filter((row) => row.poolId === poolId)
       .map((row) => {
         const dm = row.ExecutionTarget?.DiscoveredModel ?? row.DiscoveredModel;
-        if (!dm) return multimodalFlagsFromCapabilities(null);
-        const caps = effectiveCapabilitiesFrom({
-          capabilityOverrideMode: dm.capabilityOverrideMode,
-          capabilityOverrideMetadata: dm.capabilityOverrideMetadata,
-          endpointCapabilityMetadata: dm.Endpoint.capabilityMetadata,
-        });
+        const provider = row.ExecutionTarget?.ProviderModel;
+        const caps = dm
+          ? effectiveCapabilitiesFrom({
+              capabilityOverrideMode: dm.capabilityOverrideMode,
+              capabilityOverrideMetadata: dm.capabilityOverrideMetadata,
+              endpointCapabilityMetadata: dm.Endpoint.capabilityMetadata,
+            })
+          : provider?.enabled &&
+              !provider.deletedAt &&
+              provider.ProviderAccount.enabled &&
+              !provider.ProviderAccount.deletedAt
+            ? parseOpenAiCompatibleCapabilities(provider.nativeCapabilities)
+            : null;
         return multimodalFlagsFromCapabilities(caps);
       });
     let flags = unionMultimodalFlags(memberFlags);

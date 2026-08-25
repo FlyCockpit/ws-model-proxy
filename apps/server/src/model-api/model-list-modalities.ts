@@ -64,6 +64,29 @@ export function multimodalFlagsFromCapabilities(
     };
   }
 
+  if (capabilities.version === 3 || capabilities.version === 4) {
+    const surfaces = Object.values(capabilities.surfaces).filter(
+      (surface): surface is NonNullable<typeof surface> => surface !== undefined,
+    );
+    const enabledSurfaces = surfaces.filter((surface) =>
+      "operations" in surface ? surface.operations.includes("create") : surface.supported === true,
+    );
+    const legacyAudio = capabilities.version === 3 ? capabilities.audio : undefined;
+    const audioTranscription = audioOperationSupported(legacyAudio?.transcriptions) === true;
+    const audioTranslation = audioOperationSupported(legacyAudio?.translations) === true;
+    return {
+      text: enabledSurfaces.length > 0,
+      vision: enabledSurfaces.some((surface) => surface.inputImages === true),
+      video: enabledSurfaces.some((surface) => surface.inputVideo === true),
+      audioInput: enabledSurfaces.some((surface) => surface.inputAudio === true),
+      audioOutput:
+        enabledSurfaces.some((surface) => surface.outputAudio === true) ||
+        legacyAudio?.speech === true,
+      audioTranscription,
+      audioTranslation,
+    };
+  }
+
   const chat = capabilities.chatCompletions;
   const text = Boolean(
     chat?.supported || capabilities.completions?.supported || capabilities.responses?.supported,

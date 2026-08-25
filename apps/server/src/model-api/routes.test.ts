@@ -1759,6 +1759,79 @@ describe("model API routes", () => {
     expect(direct?.supports_vision).toBe(true);
   });
 
+  it("unions enabled provider PRIMARY modalities into provider-only and mixed pool listings", async () => {
+    db.discoveredModel.findMany.mockResolvedValue([]);
+    db.poolMember.findMany.mockResolvedValue([
+      {
+        poolId: poolTarget.id,
+        ExecutionTarget: {
+          DiscoveredModel: null,
+          ProviderModel: {
+            enabled: true,
+            deletedAt: null,
+            nativeCapabilities: {
+              version: 3,
+              protocol: "openai-compatible",
+              surfaces: {
+                openaiChatCompletions: {
+                  source: "declared",
+                  confidence: "exact",
+                  supported: true,
+                  inputImages: true,
+                  inputAudio: true,
+                },
+              },
+            },
+            ProviderAccount: { enabled: true, deletedAt: null },
+          },
+        },
+        DiscoveredModel: null,
+      },
+      {
+        poolId: poolTarget.id,
+        ExecutionTarget: {
+          DiscoveredModel: {
+            capabilityOverrideMode: "OVERRIDE",
+            capabilityOverrideMetadata: {
+              version: 1,
+              protocol: "openai-compatible",
+              chatCompletions: { supported: true, streaming: true, video: true },
+            },
+            Endpoint: { capabilityMetadata: null },
+          },
+          ProviderModel: null,
+        },
+        DiscoveredModel: null,
+      },
+    ]);
+
+    const response = await appWith(new FakeRelayManager()).request("/models", {
+      headers: { authorization: "Bearer wsmp_model_test" },
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      data: Array<{
+        id: string;
+        supports_vision: boolean;
+        supports_audio_input: boolean;
+        supports_video_input: boolean;
+      }>;
+    };
+    expect(body.data.find((entry) => entry.id === poolTarget.modelId)).toMatchObject({
+      supports_vision: true,
+      supports_audio_input: true,
+      supports_video_input: true,
+    });
+    expect(db.poolMember.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ tier: "PRIMARY" }),
+      }),
+    );
+    expect(stringifyPersistenceCalls(db.poolMember.findMany.mock.calls)).not.toContain(
+      "PUBLIC_OVERFLOW",
+    );
+  });
+
   it("rejects missing or invalid bearer tokens with 401", async () => {
     mockedTokenAccess.authenticateModelApiTokenSecret.mockResolvedValue(null);
 
