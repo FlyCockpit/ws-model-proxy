@@ -439,6 +439,7 @@ model ProviderAccount {
   PricingVersions            ProviderPricingVersion[]
   AuditEvents                ProviderAuditEvent[]
   AttemptEvents              PublicProviderAttemptEvent[]
+  ResponseStickinessRecords  ResponseStickinessRecord[]   @relation("ResponseStickinessProviderAccount")
 
   @@unique([userId, label])
   @@unique([id, userId])
@@ -482,6 +483,7 @@ model ProviderModel {
   Attempts                   ProviderAttempt[]
   PricingVersions            ProviderPricingVersion[]
   AttemptEvents              PublicProviderAttemptEvent[]
+  ResponseStickinessRecords  ResponseStickinessRecord[]   @relation("ResponseStickinessProviderModel")
 
   @@unique([providerAccountId, upstreamModelId])
   @@unique([id, userId])
@@ -1257,14 +1259,25 @@ model ResponseStickinessRecord {
   selectedDiscoveredModelId String?
   targetExecutionTargetId   String?
   selectedExecutionTargetId String?
+  /// Version 3 provider bindings are immutable snapshots. Credential identity
+  /// is deliberately omitted so rotation can retain the account endpoint.
+  providerAccountId         String?
+  providerModelId           String?
+  providerEndpointIdentity  String?
+  providerEndpointVersion   Int?
+  providerUpstreamModelId   String?
+  nativeSurface             String?
+  upstreamResponseIdDigest  String?
   expiresAt                 DateTime?
   User                      User             @relation("ResponseStickinessOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ModelApiToken             ModelApiToken?   @relation(fields: [modelApiTokenId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  ModelApiToken             ModelApiToken?   @relation(fields: [modelApiTokenId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   TargetDiscoveredModel     DiscoveredModel? @relation("ResponseStickinessTargetModel", fields: [targetDiscoveredModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   TargetModelPool           ModelPool?       @relation(fields: [targetModelPoolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   SelectedDiscoveredModel   DiscoveredModel? @relation("ResponseStickinessSelectedModel", fields: [selectedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   TargetExecutionTarget     ExecutionTarget? @relation("ResponseStickinessTargetExecutionTarget", fields: [targetExecutionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  SelectedExecutionTarget   ExecutionTarget? @relation("ResponseStickinessSelectedExecutionTarget", fields: [selectedExecutionTargetId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  SelectedExecutionTarget   ExecutionTarget? @relation("ResponseStickinessSelectedExecutionTarget", fields: [selectedExecutionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ProviderAccount           ProviderAccount? @relation("ResponseStickinessProviderAccount", fields: [providerAccountId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  ProviderModel             ProviderModel?   @relation("ResponseStickinessProviderModel", fields: [providerModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
 
   @@unique([userId, routingKeyDigest])
   @@index([modelApiTokenId])
@@ -1273,6 +1286,8 @@ model ResponseStickinessRecord {
   @@index([selectedDiscoveredModelId])
   @@index([targetExecutionTargetId])
   @@index([selectedExecutionTargetId])
+  @@index([providerAccountId, providerEndpointVersion])
+  @@index([providerModelId])
   @@index([expiresAt])
   @@map("response_stickiness_record")
 }

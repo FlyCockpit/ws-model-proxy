@@ -59,6 +59,8 @@ const requiredFragments = [
   "enforce_provider_budget_reservation_transition",
   "provider_pricing_version_shape_check",
   "enforce_provider_pricing_version_immutability",
+  "response_stickiness_provider_binding_check",
+  "enforce_response_stickiness_provider_binding_immutable",
   "activated provider pricing billing fields are immutable",
   "provider pricing lifecycle timestamps are immutable",
   "pricing retirement preserves activation and sets retirement",

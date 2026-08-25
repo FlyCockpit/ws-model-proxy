@@ -3,6 +3,7 @@ import type {
   VisibleDirectModelTarget,
   VisibleModelPoolTarget,
 } from "@ws-model-proxy/api/lib/model-api-token-access";
+import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import type { ActiveRelayResponseHandlers, RelaySessionManager } from "../relay/session-manager.js";
 import { holdCapacityLeaseForResponse } from "./capacity/response-lease.js";
@@ -220,6 +221,8 @@ const poolTarget: VisibleModelPoolTarget = {
   maxAttachmentBytes: null,
   optimisticBasicTranscription: false,
   protocolAdaptationEnabled: false,
+  publicEgressEnabled: false,
+  publicEgressAcknowledged: false,
   allowLossyDeveloperRoleCollapse: false,
   recommendedSurfaceOverride: null,
 };
@@ -3985,6 +3988,42 @@ describe("model API routes", () => {
     manager.complete(sent.requestId);
 
     expect(response.status).toBe(200);
+  });
+
+  it("never falls back to a relay or adapter when an exact provider binding is unavailable", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.responseStickinessRecord.findUnique.mockResolvedValue({
+      routingVersion: 3,
+      userId: "user-id",
+      modelApiTokenId: "token-id",
+      targetDiscoveredModelId: null,
+      targetModelPoolId: "pool-id",
+      selectedDiscoveredModelId: null,
+      selectedExecutionTargetId: "provider-target",
+      providerAccountId: "provider-account",
+      providerModelId: "provider-model",
+      providerEndpointIdentity: "https://provider.example/v1",
+      providerEndpointVersion: 1,
+      providerUpstreamModelId: "gpt-response",
+      nativeSurface: "OPENAI_RESPONSES",
+      upstreamResponseIdDigest: hmacDigestForForwarderPurpose({
+        purpose: "responsesStickinessUpstreamId",
+        value: "resp_provider",
+      }),
+      TargetExecutionTarget: null,
+      SelectedExecutionTarget: { discoveredModelId: null },
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+    const manager = new FakeRelayManager();
+    const response = await appWith(manager).request("/responses/resp_provider", {
+      headers: { authorization: "Bearer wsmp_model_test" },
+    });
+    expect(response.status).toBe(404);
+    expect(manager.sent).toEqual([]);
+    expect(affinity.rank).not.toHaveBeenCalled();
   });
 
   it.each([

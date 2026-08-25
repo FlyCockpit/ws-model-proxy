@@ -287,6 +287,56 @@ ALTER TABLE response_stickiness_record
 ALTER TABLE response_stickiness_record
   ADD CONSTRAINT response_stickiness_routing_version_check CHECK ("routingVersion" >= 1);
 
+-- Provider-backed Responses bindings are complete immutable snapshots. Older
+-- rows remain readable during rolling deployment and are not reinterpreted.
+ALTER TABLE response_stickiness_record
+  DROP CONSTRAINT IF EXISTS response_stickiness_provider_binding_check;
+ALTER TABLE response_stickiness_record
+  ADD CONSTRAINT response_stickiness_provider_binding_check CHECK (
+    ("routingVersion" < 3 AND "providerAccountId" IS NULL AND "providerModelId" IS NULL
+      AND "providerEndpointIdentity" IS NULL AND "providerEndpointVersion" IS NULL
+      AND "providerUpstreamModelId" IS NULL AND "nativeSurface" IS NULL
+      AND "upstreamResponseIdDigest" IS NULL)
+    OR
+    ("routingVersion" >= 3 AND "providerAccountId" IS NOT NULL AND "providerModelId" IS NOT NULL
+      AND "selectedExecutionTargetId" IS NOT NULL AND "targetModelPoolId" IS NOT NULL
+      AND "providerEndpointIdentity" IS NOT NULL AND length("providerEndpointIdentity") > 0
+      AND "providerEndpointVersion" IS NOT NULL AND "providerEndpointVersion" > 0
+      AND "providerUpstreamModelId" IS NOT NULL AND length("providerUpstreamModelId") > 0
+      AND "nativeSurface" = 'OPENAI_RESPONSES'
+      AND "upstreamResponseIdDigest" IS NOT NULL
+      AND length("upstreamResponseIdDigest") BETWEEN 32 AND 128)
+  );
+
+CREATE OR REPLACE FUNCTION enforce_response_stickiness_provider_binding_immutable()
+RETURNS trigger LANGUAGE plpgsql AS $response_stickiness_provider_binding_immutable$
+BEGIN
+  IF OLD."routingVersion" >= 3 AND (
+    NEW."userId" IS DISTINCT FROM OLD."userId"
+    OR NEW."modelApiTokenId" IS DISTINCT FROM OLD."modelApiTokenId"
+    OR NEW."routingKeyDigest" IS DISTINCT FROM OLD."routingKeyDigest"
+    OR NEW."targetModelPoolId" IS DISTINCT FROM OLD."targetModelPoolId"
+    OR NEW."selectedExecutionTargetId" IS DISTINCT FROM OLD."selectedExecutionTargetId"
+    OR NEW."providerAccountId" IS DISTINCT FROM OLD."providerAccountId"
+    OR NEW."providerModelId" IS DISTINCT FROM OLD."providerModelId"
+    OR NEW."providerEndpointIdentity" IS DISTINCT FROM OLD."providerEndpointIdentity"
+    OR NEW."providerEndpointVersion" IS DISTINCT FROM OLD."providerEndpointVersion"
+    OR NEW."providerUpstreamModelId" IS DISTINCT FROM OLD."providerUpstreamModelId"
+    OR NEW."nativeSurface" IS DISTINCT FROM OLD."nativeSurface"
+    OR NEW."upstreamResponseIdDigest" IS DISTINCT FROM OLD."upstreamResponseIdDigest"
+  ) THEN
+    RAISE EXCEPTION 'provider Responses binding is immutable' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END
+$response_stickiness_provider_binding_immutable$;
+
+DROP TRIGGER IF EXISTS response_stickiness_provider_binding_immutable
+  ON response_stickiness_record;
+CREATE TRIGGER response_stickiness_provider_binding_immutable
+BEFORE UPDATE ON response_stickiness_record
+FOR EACH ROW EXECUTE FUNCTION enforce_response_stickiness_provider_binding_immutable();
+
 ALTER TABLE relay_request DROP CONSTRAINT IF EXISTS relay_request_admission_telemetry_check;
 ALTER TABLE relay_request ADD CONSTRAINT relay_request_admission_telemetry_check CHECK (
   ("admissionWaitDurationMs" IS NULL OR "admissionWaitDurationMs" >= 0)

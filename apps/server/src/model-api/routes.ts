@@ -513,6 +513,14 @@ type ResponseStickinessRecordRow = {
   selectedDiscoveredModelId: string | null;
   TargetExecutionTarget: { discoveredModelId: string | null } | null;
   SelectedExecutionTarget: { discoveredModelId: string | null } | null;
+  selectedExecutionTargetId?: string | null;
+  providerAccountId?: string | null;
+  providerModelId?: string | null;
+  providerEndpointIdentity?: string | null;
+  providerEndpointVersion?: number | null;
+  providerUpstreamModelId?: string | null;
+  nativeSurface?: string | null;
+  upstreamResponseIdDigest?: string | null;
   expiresAt: Date | null;
 };
 
@@ -526,6 +534,18 @@ type StickyRoute =
       target: "MODEL_POOL";
       visibleTarget: VisibleModelPoolTarget;
       selectedDiscoveredModelId: string;
+    }
+  | {
+      target: "PROVIDER";
+      visibleTarget: VisibleModelPoolTarget;
+      binding: {
+        executionTargetId: string;
+        providerAccountId: string;
+        providerModelId: string;
+        endpointIdentity: string;
+        endpointVersion: number;
+        upstreamModelId: string;
+      };
     };
 
 type DirectModelRelayRow = {
@@ -1997,6 +2017,52 @@ function responseStickinessDigest({
   });
 }
 
+function upstreamResponseIdDigest(responseId: string): string {
+  return hmacDigestForForwarderPurpose({
+    purpose: "responsesStickinessUpstreamId",
+    value: responseId,
+  });
+}
+
+async function writeProviderResponseStickiness(input: {
+  requester: RelayRequester;
+  responseId: string;
+  targetModelPoolId: string;
+  executionTargetId: string;
+  providerAccountId: string;
+  providerModelId: string;
+  endpointIdentity: string;
+  endpointVersion: number;
+  upstreamModelId: string;
+}) {
+  const routingKeyDigest = responseStickinessDigest(input);
+  await prisma.responseStickinessRecord.upsert({
+    where: {
+      userId_routingKeyDigest: { userId: input.requester.userId, routingKeyDigest },
+    },
+    create: {
+      userId: input.requester.userId,
+      modelApiTokenId: input.requester.modelApiTokenId,
+      routingKeyDigest,
+      routingVersion: 3,
+      targetModelPoolId: input.targetModelPoolId,
+      selectedExecutionTargetId: input.executionTargetId,
+      providerAccountId: input.providerAccountId,
+      providerModelId: input.providerModelId,
+      providerEndpointIdentity: input.endpointIdentity,
+      providerEndpointVersion: input.endpointVersion,
+      providerUpstreamModelId: input.upstreamModelId,
+      nativeSurface: "OPENAI_RESPONSES",
+      upstreamResponseIdDigest: upstreamResponseIdDigest(input.responseId),
+      expiresAt: new Date(Date.now() + RESPONSES_STICKINESS_TTL_MS),
+    },
+    // Provider bindings are immutable. A duplicate upstream id can only extend
+    // expiry for the identical tuple; the database trigger rejects identity drift.
+    update: { expiresAt: new Date(Date.now() + RESPONSES_STICKINESS_TTL_MS) },
+    select: { id: true },
+  });
+}
+
 async function writeResponseStickiness({
   requester,
   responseId,
@@ -2161,6 +2227,65 @@ function createResponseIdCapture() {
   };
 }
 
+function captureProviderResponseBinding(input: {
+  response: Response;
+  streaming: boolean;
+  requester: RelayRequester;
+  targetModelPoolId: string;
+  target: {
+    executionTargetId: string;
+    providerAccountId: string;
+    providerModelId: string;
+    endpointIdentity: string;
+    endpointVersion: number;
+    upstreamModelId: string;
+  };
+  terminal: Promise<{ ok: boolean }>;
+}): Response {
+  if (!input.response.body || input.response.status < 200 || input.response.status >= 300)
+    return input.response;
+  const reader = input.response.body.getReader();
+  const capture = createResponseIdCapture();
+  let finished = false;
+  const persist = async () => {
+    if (finished) return;
+    finished = true;
+    const responseId = capture.finish(input.streaming);
+    const terminal = await input.terminal;
+    if (!terminal.ok || !responseId) return;
+    await writeProviderResponseStickiness({
+      requester: input.requester,
+      responseId,
+      targetModelPoolId: input.targetModelPoolId,
+      ...input.target,
+    }).catch(stickinessWriteError);
+  };
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const next = await reader.read();
+        if (next.done) {
+          controller.close();
+          await persist();
+          return;
+        }
+        capture.push(next.value, input.streaming);
+        controller.enqueue(next.value);
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      await reader.cancel(reason).catch(() => undefined);
+    },
+  });
+  return new Response(body, {
+    status: input.response.status,
+    statusText: input.response.statusText,
+    headers: input.response.headers,
+  });
+}
+
 async function resolveStickyRoute({
   requester,
   responseId,
@@ -2188,11 +2313,58 @@ async function resolveStickyRoute({
       targetDiscoveredModelId: true,
       targetModelPoolId: true,
       selectedDiscoveredModelId: true,
+      selectedExecutionTargetId: true,
+      providerAccountId: true,
+      providerModelId: true,
+      providerEndpointIdentity: true,
+      providerEndpointVersion: true,
+      providerUpstreamModelId: true,
+      nativeSurface: true,
+      upstreamResponseIdDigest: true,
       TargetExecutionTarget: { select: { discoveredModelId: true } },
       SelectedExecutionTarget: { select: { discoveredModelId: true } },
       expiresAt: true,
     },
   })) as ResponseStickinessRecordRow | null;
+
+  if ((record?.routingVersion ?? 1) >= 3) {
+    const validRequester =
+      record?.userId === requester.userId &&
+      record.modelApiTokenId === requester.modelApiTokenId &&
+      record.expiresAt !== null &&
+      record.expiresAt > new Date() &&
+      record.upstreamResponseIdDigest === upstreamResponseIdDigest(responseId);
+    const visibleTarget = record?.targetModelPoolId
+      ? (targets.modelPools.find((target) => target.id === record.targetModelPoolId) ?? null)
+      : null;
+    if (!validRequester || !visibleTarget)
+      return openAiFailureJsonResponse(
+        "not_found",
+        "Response routing metadata was not found or has expired.",
+      );
+    if (
+      !record.selectedExecutionTargetId ||
+      !record.providerAccountId ||
+      !record.providerModelId ||
+      !record.providerEndpointIdentity ||
+      !record.providerEndpointVersion ||
+      !record.providerUpstreamModelId ||
+      record.nativeSurface !== "OPENAI_RESPONSES"
+    )
+      return openAiFailureJsonResponse("not_found", "Response routing metadata is incomplete.");
+    return {
+      target: "PROVIDER",
+      visibleTarget,
+      binding: {
+        executionTargetId: record.selectedExecutionTargetId,
+        providerAccountId: record.providerAccountId,
+        providerModelId: record.providerModelId,
+        endpointIdentity: record.providerEndpointIdentity,
+        endpointVersion: record.providerEndpointVersion,
+        upstreamModelId: record.providerUpstreamModelId,
+      },
+    };
+  }
 
   const targetBound = (record?.routingVersion ?? 1) >= 2;
   if (
@@ -2999,7 +3171,9 @@ async function relayPool({
     // Public provider dispatch is intentionally limited to replayable modern
     // JSON operations. Stateful Responses and multipart/audio paths must retain
     // their exact target or fail safely.
-    if (!operation.contextInput || operation.responseStickiness) return null;
+    if (!operation.contextInput) return null;
+    const providerResponsesStickiness =
+      operation.family === "responses" && operation.responseStickiness !== undefined;
     let built: BuiltRelayRequest;
     try {
       built = await operation.buildRequest("__public_provider_model__");
@@ -3045,7 +3219,10 @@ async function relayPool({
         })()
       : null;
     const result = await dispatchPublicOverflow({
-      userId: requester.userId,
+      // Provider configuration and budgets belong to the pool owner. The
+      // requester may be an explicitly granted tenant; relay metadata and the
+      // stickiness visibility tuple remain requester/token scoped.
+      userId: target.ownerUserId,
       poolId: target.id,
       requestId: relayRequestId,
       reason,
@@ -3063,6 +3240,7 @@ async function relayPool({
       retrySafe:
         shouldRetryRelayOperation(operation, "precommit_5xx") &&
         shouldRetryRelayOperation(operation, "precommit_transport"),
+      requireNativeSurface: providerResponsesStickiness ? "openai-responses" : undefined,
       liability:
         requestedOutputTokens === undefined
           ? { accountingVersion: "provider-billable-v1" }
@@ -3179,8 +3357,20 @@ async function relayPool({
         }),
       );
     }
-    if (result.nativeSurface === requestedSurface || !operation.adaptation)
-      return commitAwareResponse(result.response);
+    if (result.nativeSurface === requestedSurface || !operation.adaptation) {
+      const response =
+        providerResponsesStickiness && result.nativeSurface === "openai-responses"
+          ? captureProviderResponseBinding({
+              response: result.response,
+              streaming: operation.stream,
+              requester,
+              targetModelPoolId: target.id,
+              target: result.target,
+              terminal: result.terminal,
+            })
+          : result.response;
+      return commitAwareResponse(response);
+    }
     const source: ProtocolSurface = result.nativeSurface;
     // Providers return ordinary JSON error envelopes even when the successful
     // operation would have streamed. Adapt that envelope as JSON; never feed
@@ -5329,6 +5519,140 @@ function previousResponseId(payload: JsonObject | null): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
+async function relayBoundProviderResponse(input: {
+  request: Request;
+  requester: RelayRequester;
+  stickyRoute: Extract<StickyRoute, { target: "PROVIDER" }>;
+  method: string;
+  path: string;
+  body: Uint8Array;
+  headers: Headers;
+  stream: boolean;
+  captureReturnedResponse: boolean;
+  contextInput?: JsonObject;
+  contextCount?: ContextCountTelemetry;
+}): Promise<Response> {
+  const relayRequestId = await createRelayMetadata({
+    userId: input.requester.userId,
+    modelApiTokenId: input.requester.modelApiTokenId,
+    modelApiTokenLookupPrefix: input.requester.modelApiTokenLookupPrefix,
+    requestedModelPoolId: input.stickyRoute.visibleTarget.id,
+    operation: "responses.create",
+    requestBytes: input.body.byteLength,
+    contextCount: input.contextCount,
+  });
+  const maxOutput = input.contextInput?.max_output_tokens;
+  const requestedOutputTokens =
+    typeof maxOutput === "number" && Number.isSafeInteger(maxOutput) && maxOutput >= 0
+      ? BigInt(maxOutput)
+      : 0n;
+  const estimatedInputTokens = input.contextInput
+    ? input.contextCount?.tokens === undefined
+      ? conservativeSerializedInputTokens(input.body.byteLength)
+      : BigInt(input.contextCount.tokens)
+    : 0n;
+  const result = await dispatchPublicOverflow({
+    userId: input.stickyRoute.visibleTarget.ownerUserId,
+    poolId: input.stickyRoute.visibleTarget.id,
+    requestId: relayRequestId,
+    reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+    requestedProtocol: "openai",
+    requestedSurface: "openai-responses",
+    stream: input.stream,
+    requiredFeatures: [],
+    method: input.method,
+    path: input.path,
+    headers: input.headers,
+    body: input.body,
+    signal: input.request.signal,
+    liability: conservativeProviderLiability({ estimatedInputTokens, requestedOutputTokens }),
+    estimatedInputTokens,
+    requestedOutputTokens,
+    contextTokens: estimatedInputTokens + requestedOutputTokens,
+    releaseLocalCapacity: async () => undefined,
+    adaptationEnabled: false,
+    retrySafe: false,
+    exactResponsesBinding: input.stickyRoute.binding,
+    skipContextValidation: input.contextInput === undefined,
+  });
+  if (!result.dispatched) {
+    await prisma.relayRequest
+      .update({
+        where: { id: relayRequestId },
+        data: { status: "FAILED", completedAt: new Date(), errorClass: "not_found" },
+        select: { id: true },
+      })
+      .catch(metadataUpdateError);
+    return openAiFailureJsonResponse(
+      "not_found",
+      "The bound provider Responses target is no longer available.",
+    );
+  }
+  await prisma.relayRequest
+    .update({
+      where: { id: relayRequestId },
+      data: {
+        selectedExecutionTargetId: result.target.executionTargetId,
+        publicEgress: true,
+        selectedPoolMemberTier: "PUBLIC_OVERFLOW",
+        providerAccountId: result.target.providerAccountId,
+        providerModelId: result.target.providerModelId,
+        providerAttemptId: result.attemptId,
+        providerFencingToken: result.fencingToken,
+        attemptCount: 1,
+      },
+      select: { id: true },
+    })
+    .catch(metadataUpdateError);
+  void result.terminal
+    .then((terminal) =>
+      prisma.relayRequest.update({
+        where: { id: relayRequestId },
+        data: {
+          status: terminal.ok ? "SUCCEEDED" : input.request.signal.aborted ? "CANCELED" : "FAILED",
+          completedAt: new Date(),
+          httpStatusCode: result.response.status,
+          upstreamStatusCode: result.response.status,
+          responseBytes: BigInt(terminal.responseBytes),
+          errorClass: terminal.ok ? null : input.request.signal.aborted ? "cancelled" : "unknown",
+        },
+        select: { id: true },
+      }),
+    )
+    .catch(metadataUpdateError);
+  let response = result.response;
+  if (response.status < 200 || response.status >= 300) {
+    const sanitized = await readAdaptedNonstreamBody({
+      body: response.body,
+      source: "openai-responses",
+      target: "openai-responses",
+      status: response.status,
+      headers: response.headers,
+      signal: input.request.signal,
+    });
+    response = new Response(sanitized, {
+      status: response.status >= 400 && response.status <= 599 ? response.status : 502,
+      headers: adaptedProviderResponseHeaders(
+        "openai-responses",
+        "openai-responses",
+        response.headers,
+        false,
+      ),
+    });
+  }
+  if (input.captureReturnedResponse) {
+    response = captureProviderResponseBinding({
+      response,
+      streaming: input.stream,
+      requester: input.requester,
+      targetModelPoolId: input.stickyRoute.visibleTarget.id,
+      target: result.target,
+      terminal: result.terminal,
+    });
+  }
+  return responseWithFirstClientByte(response, result.markFirstClientByte);
+}
+
 function responseIdParam(responseId: string | undefined): string | Response {
   if (typeof responseId !== "string" || responseId.trim().length === 0) {
     return openAiFailureJsonResponse("not_found", "Response ID is required.");
@@ -5386,6 +5710,30 @@ async function responsesCreateHandler({
 
   const stickyRoute = await resolveStickyRoute({ requester, responseId: previousId, targets });
   if (stickyRoute instanceof Response) return stickyRoute;
+  if (stickyRoute.target === "PROVIDER") {
+    if (prepared.model !== stickyRoute.visibleTarget.modelId)
+      return openAiFailureJsonResponse(
+        "access_denied",
+        "Response follow-up model does not match the original route.",
+      );
+    const built = await prepared.buildRequest(stickyRoute.binding.upstreamModelId);
+    if (!(built.body instanceof Uint8Array)) {
+      await built.body.dispose();
+      return openAiFailureJsonResponse("unsupported_capability");
+    }
+    return relayBoundProviderResponse({
+      request,
+      requester,
+      stickyRoute,
+      method: "POST",
+      path: "/v1/responses",
+      body: built.body,
+      headers: built.headers,
+      stream: prepared.stream,
+      captureReturnedResponse: true,
+      contextInput: prepared.payload ?? undefined,
+    });
+  }
   if (
     (stickyRoute.target === "DIRECT_MODEL" &&
       prepared.model !== stickyRoute.visibleTarget.modelId) ||
@@ -5450,6 +5798,26 @@ async function responsesStickyHandler({
   const targets = await listVisibleModelTargetsForToken(token);
   const stickyRoute = await resolveStickyRoute({ requester, responseId, targets });
   if (stickyRoute instanceof Response) return stickyRoute;
+
+  if (stickyRoute.target === "PROVIDER") {
+    const built = prepareEmptyRelayRequest(request);
+    const prepared = await built(stickyRoute.binding.upstreamModelId);
+    if (!(prepared.body instanceof Uint8Array)) {
+      await prepared.body.dispose();
+      return openAiFailureJsonResponse("unsupported_capability");
+    }
+    return relayBoundProviderResponse({
+      request,
+      requester,
+      stickyRoute,
+      method,
+      path,
+      body: prepared.body,
+      headers: prepared.headers,
+      stream: false,
+      captureReturnedResponse: false,
+    });
+  }
 
   return relaySelectedModelNoFailover({
     request,

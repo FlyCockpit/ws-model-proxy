@@ -160,6 +160,8 @@ const poolTarget: VisibleModelPoolTarget = {
   maxAttachmentBytes: null,
   optimisticBasicTranscription: false,
   protocolAdaptationEnabled: false,
+  publicEgressEnabled: false,
+  publicEgressAcknowledged: false,
   allowLossyDeveloperRoleCollapse: false,
   recommendedSurfaceOverride: null,
 };

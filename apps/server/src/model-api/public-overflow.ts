@@ -90,6 +90,19 @@ export interface PublicOverflowRequest {
   adaptationEnabled: boolean;
   /** True only when the operation resolver proves a second attempt is safe. */
   retrySafe: boolean;
+  requireNativeSurface?: ProtocolSurface;
+  /** Correctness-required Responses binding. It disables ranking, adaptation,
+   * and all post-binding failover and validates the immutable endpoint tuple. */
+  exactResponsesBinding?: {
+    executionTargetId: string;
+    providerAccountId: string;
+    providerModelId: string;
+    endpointIdentity: string;
+    endpointVersion: number;
+    upstreamModelId: string;
+  };
+  method?: string;
+  skipContextValidation?: boolean;
   renderForTarget?: (
     target: PublicProviderTarget,
     nativeSurface: ProtocolSurface,
@@ -134,6 +147,32 @@ export interface PublicProviderTarget {
   };
   affinity?: { outcome: string; score?: number; prefixDepth?: number; reason?: string };
   affinityTarget?: AffinityTarget;
+}
+
+export function matchesExactResponsesBinding(
+  target: Pick<
+    PublicProviderTarget,
+    | "executionTargetId"
+    | "providerAccountId"
+    | "providerModelId"
+    | "endpointIdentity"
+    | "endpointVersion"
+    | "upstreamModelId"
+    | "nativeSurfaces"
+    | "protocol"
+  >,
+  binding: NonNullable<PublicOverflowRequest["exactResponsesBinding"]>,
+): boolean {
+  return (
+    target.executionTargetId === binding.executionTargetId &&
+    target.providerAccountId === binding.providerAccountId &&
+    target.providerModelId === binding.providerModelId &&
+    target.endpointIdentity === binding.endpointIdentity &&
+    target.endpointVersion === binding.endpointVersion &&
+    target.upstreamModelId === binding.upstreamModelId &&
+    target.nativeSurfaces.includes("openai-responses") &&
+    target.protocol === "openai"
+  );
 }
 
 type ListedPublicOverflowTargets = {
@@ -250,6 +289,7 @@ export function publicTargetCompatibility(
     | "liability"
     | "estimatedInputTokens"
     | "contextTokens"
+    | "skipContextValidation"
   >,
 ): "COMPATIBLE" | "CONTEXT_UNKNOWN" | "CONTEXT_EXCEEDED" | "PROTOCOL_UNAVAILABLE" {
   const requestedOutputTokens =
@@ -259,11 +299,13 @@ export function publicTargetCompatibility(
     request.estimatedInputTokens !== undefined && requestedOutputTokens !== undefined
       ? checkedContextTokens(request.estimatedInputTokens, requestedOutputTokens)
       : (request.contextTokens ?? request.liability.tokens);
-  if (target.contextWindow === null || contextTokens === undefined) return "CONTEXT_UNKNOWN";
-  if (contextTokens > BigInt(target.contextWindow)) return "CONTEXT_EXCEEDED";
-  if (target.maxOutputTokens === null || requestedOutputTokens === undefined)
-    return "CONTEXT_UNKNOWN";
-  if (requestedOutputTokens > BigInt(target.maxOutputTokens)) return "CONTEXT_EXCEEDED";
+  if (!request.skipContextValidation) {
+    if (target.contextWindow === null || contextTokens === undefined) return "CONTEXT_UNKNOWN";
+    if (contextTokens > BigInt(target.contextWindow)) return "CONTEXT_EXCEEDED";
+    if (target.maxOutputTokens === null || requestedOutputTokens === undefined)
+      return "CONTEXT_UNKNOWN";
+    if (requestedOutputTokens > BigInt(target.maxOutputTokens)) return "CONTEXT_EXCEEDED";
+  }
   if (request.stream && !target.supportsStreaming) return "PROTOCOL_UNAVAILABLE";
   if (request.requiredFeatures.some((feature) => !target.supportedFeatures.includes(feature)))
     return "PROTOCOL_UNAVAILABLE";
@@ -1171,7 +1213,18 @@ export async function dispatchPublicOverflow(
   // Payload size may change during cross-protocol rendering. Do the initial
   // pass with zero input solely to reject protocol/feature/output mismatches;
   // each target is checked again with its actual rendered wire size below.
-  const compatible = listed.targets.filter(
+  const binding = request.exactResponsesBinding;
+  const eligible = binding
+    ? listed.targets.filter((target) => matchesExactResponsesBinding(target, binding))
+    : request.requireNativeSurface
+      ? listed.targets.filter(
+          (target) =>
+            target.nativeSurfaces.includes(request.requireNativeSurface!) &&
+            (request.requireNativeSurface !== "anthropic-messages" ||
+              target.protocol === "anthropic"),
+        )
+      : listed.targets;
+  const compatible = eligible.filter(
     (target) =>
       publicTargetCompatibility(target, {
         ...request,
@@ -1199,11 +1252,13 @@ export async function dispatchPublicOverflow(
 
   let ranked: Awaited<ReturnType<typeof rankPublicOverflowTargets>>;
   try {
-    ranked = await rankPublicOverflowTargets({
-      request,
-      policy: listed.affinityPolicy,
-      targets: compatible,
-    });
+    ranked = binding
+      ? { decision: null, targets: compatible }
+      : await rankPublicOverflowTargets({
+          request,
+          policy: listed.affinityPolicy,
+          targets: compatible,
+        });
   } catch {
     ranked = {
       decision: null,
@@ -1222,7 +1277,11 @@ export async function dispatchPublicOverflow(
   let attemptCount = 0;
 
   for (const [rankedIndex, target] of ranked.targets.entries()) {
-    const nativeSurface = selectedNativeSurface(target, request.requestedSurface);
+    const nativeSurface = binding
+      ? target.nativeSurfaces.includes("openai-responses")
+        ? "openai-responses"
+        : undefined
+      : selectedNativeSurface(target, request.requestedSurface);
     if (!nativeSurface) continue;
     attemptCount += 1;
     const attemptId = crypto.randomUUID();
@@ -1248,8 +1307,14 @@ export async function dispatchPublicOverflow(
     }
     let upstream: { protocol: ProviderProtocol; path: string; headers: Headers; body: Uint8Array };
     try {
-      upstream =
-        nativeSurface === request.requestedSurface
+      upstream = binding
+        ? {
+            protocol: "openai",
+            path: request.path,
+            headers: request.headers,
+            body: request.body,
+          }
+        : nativeSurface === request.requestedSurface
           ? {
               protocol: request.requestedProtocol,
               path: request.path,
@@ -1485,7 +1550,7 @@ export async function dispatchPublicOverflow(
       const response = await providerHttpsRequest(
         joinProviderUrl(target.baseUrl, upstream.path),
         {
-          method: "POST",
+          method: request.method ?? "POST",
           headers: Object.fromEntries(upstream.headers.entries()),
           body: upstream.body,
           signal: AbortSignal.any([

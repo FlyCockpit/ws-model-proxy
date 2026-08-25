@@ -17,6 +17,7 @@ import {
   claimPublicProviderCredentialForSend,
   conservativeProviderLiability,
   conservativeSerializedInputTokens,
+  matchesExactResponsesBinding,
   parseProviderUsage,
   providerHealthOutcome,
   publicTargetCompatibility,
@@ -34,6 +35,39 @@ const request = {
 };
 
 describe("public overflow compatibility", () => {
+  it("matches provider Responses bindings only on the full immutable native tuple", () => {
+    const target = {
+      executionTargetId: "execution-target",
+      providerAccountId: "account",
+      providerModelId: "provider-model",
+      endpointIdentity: "https://api.example/v1",
+      endpointVersion: 7,
+      upstreamModelId: "gpt-response",
+      nativeSurfaces: ["openai-responses"],
+      protocol: "openai",
+    } satisfies Parameters<typeof matchesExactResponsesBinding>[0];
+    const binding = {
+      executionTargetId: "execution-target",
+      providerAccountId: "account",
+      providerModelId: "provider-model",
+      endpointIdentity: "https://api.example/v1",
+      endpointVersion: 7,
+      upstreamModelId: "gpt-response",
+    };
+    expect(matchesExactResponsesBinding(target, binding)).toBe(true);
+    for (const changed of [
+      { endpointVersion: 8 },
+      { endpointIdentity: "https://replacement.example/v1" },
+      { providerAccountId: "replacement-account" },
+      { providerModelId: "replacement-model" },
+      { upstreamModelId: "same-looking-model" },
+      { executionTargetId: "replacement-target" },
+      { nativeSurfaces: ["openai-chat"] as const },
+      { protocol: "anthropic" as const },
+    ]) {
+      expect(matchesExactResponsesBinding({ ...target, ...changed }, binding)).toBe(false);
+    }
+  });
   it("treats ordinary client errors as health-neutral and 429 as failure", () => {
     expect(providerHealthOutcome(200)).toBe("SUCCESS");
     expect(providerHealthOutcome(400)).toBe("NEUTRAL");
