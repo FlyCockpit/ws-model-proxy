@@ -900,6 +900,8 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       statefulResponses: true,
       grantee: true,
       secondBehavior: "json",
+      memberTier: "PRIMARY",
+      privatePool: true,
     });
     if (!result.grant) throw new Error("expected exact pool grant");
     expect(result.response.status).toBe(200);
@@ -919,6 +921,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       nativeSurface: "OPENAI_RESPONSES",
       poolGrantId: result.grant.id,
     });
+    expect(result.attemptEvents.every((event) => event.memberTier === "PRIMARY")).toBe(true);
     const observationStart = upstreamObservations.length;
     const followUp = await result.app.request("/responses", {
       method: "POST",
@@ -1150,24 +1153,88 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     });
   }
 
-  it("routes a provider PRIMARY in a private pool with durable settlement", async () => {
-    const result = await runCase({
-      requested: "openai-chat",
-      native: "openai-chat",
-      behavior: "json",
-      memberTier: "PRIMARY",
-      privatePool: true,
+  for (const requested of requestedSurfaces) {
+    it(`${requested} executes provider PRIMARY native JSON in a private pool`, async () => {
+      const result = await runCase({
+        requested,
+        native: requested,
+        behavior: "json",
+        memberTier: "PRIMARY",
+        privatePool: true,
+      });
+      expect(result.response.status).toBe(200);
+      expect(result.pool).toMatchObject({
+        publicEgressEnabled: false,
+        publicEgressAcknowledged: false,
+      });
+      expect(result.attemptEvents).not.toHaveLength(0);
+      expect(result.attemptEvents.every((event) => event.memberTier === "PRIMARY")).toBe(true);
+      expect(result.settlements).toHaveLength(result.reservations.length);
+      expectExactSuccessAccounting(result);
+      expectJsonEnvelope(result, requested);
+      expectAdapterTelemetry(result, "native", requested, requested);
     });
-    expect(result.response.status).toBe(200);
-    expect(result.pool).toMatchObject({
-      publicEgressEnabled: false,
-      publicEgressAcknowledged: false,
+
+    it(`${requested} executes provider PRIMARY native SSE in a private pool`, async () => {
+      const result = await runCase({
+        requested,
+        native: requested,
+        behavior: "stream",
+        memberTier: "PRIMARY",
+        privatePool: true,
+      });
+      expect(result.response.status).toBe(200);
+      expect(result.attempt.state).toBe("COMPLETED");
+      expect(result.attemptEvents.every((event) => event.memberTier === "PRIMARY")).toBe(true);
+      expect(result.settlements).toHaveLength(result.reservations.length);
+      expectExactSuccessAccounting(result);
+      expectStreamEnvelope(result, requested);
+      expectAdapterTelemetry(result, "native", requested, requested);
     });
-    expect(result.attemptEvents).not.toHaveLength(0);
-    expect(result.attemptEvents.every((event) => event.memberTier === "PRIMARY")).toBe(true);
-    expect(result.settlements).toHaveLength(result.reservations.length);
-    expectExactSuccessAccounting(result);
-  });
+  }
+
+  it.each(crossPairs)(
+    "$requested executes provider PRIMARY adapted JSON from $native in a private pool",
+    async ({ requested, native }) => {
+      const result = await runCase({
+        requested,
+        native,
+        behavior: "json",
+        memberTier: "PRIMARY",
+        privatePool: true,
+      });
+      expect(result.response.status).toBe(200);
+      expect(result.attemptEvents.every((event) => event.memberTier === "PRIMARY")).toBe(true);
+      expect(result.settlements).toHaveLength(result.reservations.length);
+      expectExactSuccessAccounting(result);
+      expectJsonEnvelope(result, requested);
+      expectAdapterTelemetry(result, "adapted", requested, native);
+    },
+  );
+
+  it.each([
+    ["openai-chat", "openai-responses"],
+    ["openai-chat", "anthropic-messages"],
+    ["openai-responses", "openai-chat"],
+    ["openai-responses", "anthropic-messages"],
+  ] as const)(
+    "%s executes provider PRIMARY adapted SSE from %s in a private pool",
+    async (requested, native) => {
+      const result = await runCase({
+        requested,
+        native,
+        behavior: "stream",
+        memberTier: "PRIMARY",
+        privatePool: true,
+      });
+      expect(result.response.status).toBe(200);
+      expect(result.attemptEvents.every((event) => event.memberTier === "PRIMARY")).toBe(true);
+      expect(result.settlements).toHaveLength(result.reservations.length);
+      expectExactSuccessAccounting(result);
+      expectStreamEnvelope(result, requested);
+      expectAdapterTelemetry(result, "adapted", requested, native);
+    },
+  );
 
   it.each(crossPairs)(
     "$requested executes the full non-stream matrix from $native",
