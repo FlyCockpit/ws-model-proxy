@@ -1,3 +1,4 @@
+import { isValidElement, type ReactElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
@@ -13,6 +14,7 @@ import {
   focusFirstInvalidProviderField,
   providerAccountFormSchema,
   providerBudgetFormSchema,
+  providerBudgetRules,
 } from "./provider-operations-section";
 
 const unlimitedBudget = {
@@ -31,6 +33,21 @@ const unlimitedBudget = {
   spendMonthMode: "UNLIMITED" as const,
   spendMonth: "",
 };
+
+function findElement(
+  node: ReactNode,
+  predicate: (element: ReactElement<Record<string, unknown>>) => boolean,
+): ReactElement<Record<string, unknown>> | undefined {
+  if (!isValidElement(node)) return undefined;
+  const element = node as ReactElement<Record<string, unknown>>;
+  if (predicate(element)) return element;
+  const children = element.props.children;
+  for (const child of Array.isArray(children) ? children : [children]) {
+    const match = findElement(child as ReactNode, predicate);
+    if (match) return match;
+  }
+  return undefined;
+}
 
 describe("ProviderOperationsSection form workflows", () => {
   it("rejects invalid account setup and accepts a valid HTTPS account", () => {
@@ -70,6 +87,43 @@ describe("ProviderOperationsSection form workflows", () => {
     expect(providerBudgetFormSchema.safeParse(unlimitedBudget).success).toBe(true);
   });
 
+  it("builds the successful seven-rule mutation payload with explicit modes", () => {
+    const rules = providerBudgetRules(
+      {
+        ...unlimitedBudget,
+        concurrencyMode: "LIMITED",
+        concurrency: "2",
+        tokenAttemptMode: "LIMITED",
+        tokenAttempt: "1000",
+        spendDayMode: "LIMITED",
+        spendDay: "5.50",
+      },
+      "USD",
+    );
+    expect(rules).toHaveLength(7);
+    expect(rules).toContainEqual({
+      metric: "CONCURRENCY",
+      period: "PER_ATTEMPT",
+      mode: "LIMITED",
+      limitValue: "2",
+      currency: null,
+    });
+    expect(rules).toContainEqual({
+      metric: "SPEND",
+      period: "UTC_DAY",
+      mode: "LIMITED",
+      limitValue: "5.50",
+      currency: "USD",
+    });
+    expect(rules).toContainEqual({
+      metric: "SPEND",
+      period: "UTC_MONTH",
+      mode: "UNLIMITED",
+      limitValue: null,
+      currency: "USD",
+    });
+  });
+
   it("renders a keyboard-native mode control and a strong warning for UNLIMITED", () => {
     const markup = renderToStaticMarkup(
       <BudgetRuleField
@@ -85,6 +139,32 @@ describe("ProviderOperationsSection form workflows", () => {
     expect(markup).toContain("providers.unlimitedRuleWarning");
     expect(markup).not.toContain('id="test-budget-value"');
     expect(markup).toContain("min-w-0");
+  });
+
+  it("handles a mode-control interaction and rerenders the unlimited warning", () => {
+    let mode: "LIMITED" | "UNLIMITED" = "LIMITED";
+    const renderRule = () =>
+      BudgetRuleField({
+        id: "interactive-budget",
+        label: "Tokens / day",
+        mode,
+        value: "100",
+        onMode: (next) => {
+          mode = next;
+        },
+        onValue: () => undefined,
+      });
+    const select = findElement(
+      renderRule(),
+      (element) => element.props.id === "interactive-budget-mode",
+    );
+    expect(select).toBeDefined();
+    if (!select) throw new Error("budget mode select not rendered");
+    (select.props.onChange as (event: { target: { value: string } }) => void)({
+      target: { value: "UNLIMITED" },
+    });
+    expect(mode).toBe("UNLIMITED");
+    expect(renderToStaticMarkup(renderRule())).toContain("providers.unlimitedRuleWarning");
   });
 
   it("links a stable localized error to the finite value control", () => {

@@ -1231,7 +1231,7 @@ export const forwarderManagementRouter = {
                 z.object({
                   providerModelId: idSchema,
                   concurrencyLimit: z.number().int().min(1).max(10_000),
-                  dailySpendLimit: positiveDecimal,
+                  dailySpendLimit: z.string(),
                   budgetRules: z
                     .object({
                       concurrency: integerRule(10_000),
@@ -1290,6 +1290,17 @@ export const forwarderManagementRouter = {
                 message: "Duplicate local member override",
               });
             }
+            for (const [index, provider] of input.providerModels.entries()) {
+              if (
+                !provider.budgetRules &&
+                !positiveDecimal.safeParse(provider.dailySpendLimit).success
+              )
+                ctx.addIssue({
+                  code: "custom",
+                  path: ["providerModels", index, "dailySpendLimit"],
+                  message: "Legacy guarded setup requires a positive daily spend limit",
+                });
+            }
           });
       })(),
     )
@@ -1333,7 +1344,7 @@ export const forwarderManagementRouter = {
                     ? model.capabilityOverrides
                     : model.Endpoint.defaultCapabilities,
                 ),
-              adaptationEnabled: true,
+              adaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? true,
             }),
           );
           const recommendedEntries = primaryMatrices.map(

@@ -412,14 +412,14 @@ describe("forwarderManagementRouter", () => {
         {
           providerModelId: "provider-b",
           concurrencyLimit: 2,
-          dailySpendLimit: "8.50",
+          dailySpendLimit: "",
           budgetRules: {
             concurrency: { mode: "LIMITED", limitValue: 2 },
             tokensPerAttempt: { mode: "LIMITED", limitValue: 100_000 },
             tokensPerDay: { mode: "LIMITED", limitValue: 1_000_000 },
             tokensPerMonth: { mode: "LIMITED", limitValue: 10_000_000 },
             tokensLifetime: { mode: "UNLIMITED", limitValue: null },
-            spendPerDay: { mode: "LIMITED", limitValue: "8.50" },
+            spendPerDay: { mode: "UNLIMITED", limitValue: null },
             spendPerMonth: { mode: "LIMITED", limitValue: "100" },
           },
         },

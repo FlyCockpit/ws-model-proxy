@@ -248,5 +248,116 @@ integration("guarded pool setup with real PostgreSQL", () => {
         select: { countStrategy: true },
       }),
     ).toEqual({ countStrategy: "CONSERVATIVE_ESTIMATE" });
+
+    await client.createGuardedModelPool({
+      slug: `guarded-success-${suffix}`,
+      name: "Guarded success",
+      localModelIds: [local.id],
+      recommendedSurface: "OPENAI_RESPONSES",
+      memberConcurrencyLimit: 1,
+      memberContextCeiling: 32_768,
+      reservedSlots: 0,
+      localWaitBudgetMs: 30_000,
+      publicEgressAcknowledged: true,
+      advanced: {
+        physicalCountStrategy: "ENGINE_REPORTED",
+        contextMargin: 1_024,
+        borrowPolicy: "NEVER",
+        protocolAdaptationEnabled: false,
+        allowLossyDeveloperRoleCollapse: true,
+        affinity: {
+          enabled: true,
+          ttlSeconds: 7_200,
+          maxRecords: 20_000,
+          prefixWeight: 110,
+          conversationWeight: 160,
+          confirmedCacheWeight: 260,
+          loadPenaltyWeight: 120,
+        },
+        memberOverrides: [
+          {
+            discoveredModelId: local.id,
+            concurrency: { mode: "LIMITED", limitValue: 1 },
+            reservedSlots: 0,
+            borrowPolicy: "NEVER",
+            waitBudget: { mode: "LIMITED", limitValue: 15_000 },
+            contextCeiling: { mode: "LIMITED", limitValue: 31_744 },
+            contextMargin: 1_024,
+          },
+        ],
+      },
+      providerModels: [
+        {
+          providerModelId: provider.id,
+          concurrencyLimit: 1,
+          dailySpendLimit: "5",
+          budgetRules: {
+            concurrency: { mode: "LIMITED", limitValue: 1 },
+            tokensPerAttempt: { mode: "LIMITED", limitValue: 100_000 },
+            tokensPerDay: { mode: "LIMITED", limitValue: 1_000_000 },
+            tokensPerMonth: { mode: "LIMITED", limitValue: 10_000_000 },
+            tokensLifetime: { mode: "UNLIMITED", limitValue: null },
+            spendPerDay: { mode: "LIMITED", limitValue: "5" },
+            spendPerMonth: { mode: "LIMITED", limitValue: "100" },
+          },
+        },
+      ],
+    });
+    const persisted = await modules.prisma.modelPool.findFirstOrThrow({
+      where: { userId: user.id, slug: `guarded-success-${suffix}` },
+      include: {
+        PoolMembers: { orderBy: { tier: "asc" } },
+        ProviderBudgetPolicies: { include: { Rules: true } },
+      },
+    });
+    expect(persisted).toMatchObject({
+      protocolAdaptationEnabled: false,
+      allowLossyDeveloperRoleCollapse: true,
+      capacityContextMargin: 1_024,
+      capacityBorrowPolicy: "NEVER",
+      affinityEnabled: true,
+      affinityTtlSeconds: 7_200,
+      affinityMaxRecords: 20_000,
+      affinityPrefixWeight: 110,
+      affinityConversationWeight: 160,
+      affinityConfirmedCacheWeight: 260,
+      affinityLoadPenaltyWeight: 120,
+    });
+    expect(persisted.PoolMembers.find((member) => member.tier === "PRIMARY")).toMatchObject({
+      capacityConcurrencyMode: "LIMITED",
+      capacityConcurrencyLimit: 1,
+      capacityReservedSlots: 0,
+      capacityBorrowPolicy: "NEVER",
+      capacityWaitBudgetMode: "LIMITED",
+      capacityWaitBudgetMs: 15_000,
+      capacityContextCeilingMode: "LIMITED",
+      capacityContextCeiling: 31_744,
+      capacityContextMargin: 1_024,
+    });
+    expect(persisted.ProviderBudgetPolicies).toHaveLength(1);
+    expect(persisted.ProviderBudgetPolicies[0]?.Rules).toHaveLength(7);
+    expect(
+      persisted.ProviderBudgetPolicies[0]?.Rules.map((rule) => [
+        rule.metric,
+        rule.period,
+        rule.mode,
+      ]),
+    ).toEqual(
+      expect.arrayContaining([
+        ["CONCURRENCY", "PER_ATTEMPT", "LIMITED"],
+        ["TOKENS", "PER_ATTEMPT", "LIMITED"],
+        ["TOKENS", "UTC_DAY", "LIMITED"],
+        ["TOKENS", "UTC_MONTH", "LIMITED"],
+        ["TOKENS", "LIFETIME", "UNLIMITED"],
+        ["SPEND", "UTC_DAY", "LIMITED"],
+        ["SPEND", "UTC_MONTH", "LIMITED"],
+      ]),
+    );
+    expect(
+      await modules.prisma.inferenceCapacity.findUnique({
+        where: { id: capacity.id },
+        select: { countStrategy: true },
+      }),
+    ).toEqual({ countStrategy: "ENGINE_REPORTED" });
   });
 });

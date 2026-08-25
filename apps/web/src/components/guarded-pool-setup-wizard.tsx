@@ -33,8 +33,8 @@ type LocalModel = GuardedWizardLocalModel & {
   canonicalModelId: string;
 };
 const surfaces = ["OPENAI_CHAT_COMPLETIONS", "OPENAI_RESPONSES", "ANTHROPIC_MESSAGES"] as const;
-type LimitMode = "LIMITED" | "UNLIMITED";
-type MemberOverride = {
+export type LimitMode = "LIMITED" | "UNLIMITED";
+export type MemberOverride = {
   concurrencyMode: LimitMode;
   concurrencyLimit: number;
   reservedSlots: number;
@@ -57,11 +57,41 @@ const defaultMemberOverride = (): MemberOverride => ({
   contextCeiling: 31_744,
   contextMargin: 1_024,
 });
-const budgetIntegerRule = (mode: LimitMode, value: string) =>
+export function deriveMemberOverride(values: {
+  memberConcurrencyLimit: number;
+  reservedSlots: number;
+  borrowPolicy: "NEVER" | "WHEN_IDLE";
+  localWaitBudgetMs: number;
+  memberContextCeiling: number;
+  contextMargin: number;
+}): MemberOverride {
+  return {
+    concurrencyMode: "LIMITED",
+    concurrencyLimit: values.memberConcurrencyLimit,
+    reservedSlots: values.reservedSlots,
+    borrowPolicy: values.borrowPolicy,
+    waitBudgetMode: "LIMITED",
+    waitBudgetMs: values.localWaitBudgetMs,
+    contextCeilingMode: "LIMITED",
+    contextCeiling: values.memberContextCeiling,
+    contextMargin: values.contextMargin,
+  };
+}
+export function memberContextFitsPhysical(
+  override: MemberOverride,
+  physicalMaxContext: number | null | undefined,
+) {
+  return (
+    override.contextCeilingMode === "UNLIMITED" ||
+    physicalMaxContext == null ||
+    override.contextCeiling + override.contextMargin <= physicalMaxContext
+  );
+}
+export const budgetIntegerRule = (mode: LimitMode, value: string) =>
   mode === "LIMITED"
     ? ({ mode, limitValue: Number(value) } as const)
     : ({ mode, limitValue: null } as const);
-const budgetSpendRule = (mode: LimitMode, value: string) =>
+export const budgetSpendRule = (mode: LimitMode, value: string) =>
   mode === "LIMITED"
     ? ({ mode, limitValue: value } as const)
     : ({ mode, limitValue: null } as const);
@@ -85,6 +115,7 @@ export function GuardedPoolSetupWizard({
   const [step, setStep] = useState<number>(initialStep);
   const [stepErrors, setStepErrors] = useState<Record<string, string>>({});
   const [memberOverrides, setMemberOverrides] = useState<Record<string, MemberOverride>>({});
+  const [enabledMemberOverrides, setEnabledMemberOverrides] = useState<Record<string, boolean>>({});
   const candidates = useQuery(
     orpc.forwarderManagement.listGuardedOverflowCandidates.queryOptions(),
   );
@@ -260,21 +291,24 @@ export function GuardedPoolSetupWizard({
             confirmedCacheWeight: value.affinityConfirmedCacheWeight,
             loadPenaltyWeight: value.affinityLoadPenaltyWeight,
           },
-          memberOverrides: value.localModelIds.map((discoveredModelId) => {
-            const override = memberOverrides[discoveredModelId] ?? defaultMemberOverride();
+          memberOverrides: value.localModelIds.flatMap((discoveredModelId) => {
+            if (!enabledMemberOverrides[discoveredModelId]) return [];
+            const override = memberOverrides[discoveredModelId] ?? deriveMemberOverride(value);
             const rule = (mode: LimitMode, limitValue: number) =>
               mode === "LIMITED"
                 ? ({ mode, limitValue } as const)
                 : ({ mode, limitValue: null } as const);
-            return {
-              discoveredModelId,
-              concurrency: rule(override.concurrencyMode, override.concurrencyLimit),
-              reservedSlots: override.reservedSlots,
-              borrowPolicy: override.borrowPolicy,
-              waitBudget: rule(override.waitBudgetMode, override.waitBudgetMs),
-              contextCeiling: rule(override.contextCeilingMode, override.contextCeiling),
-              contextMargin: override.contextMargin,
-            };
+            return [
+              {
+                discoveredModelId,
+                concurrency: rule(override.concurrencyMode, override.concurrencyLimit),
+                reservedSlots: override.reservedSlots,
+                borrowPolicy: override.borrowPolicy,
+                waitBudget: rule(override.waitBudgetMode, override.waitBudgetMs),
+                contextCeiling: rule(override.contextCeilingMode, override.contextCeiling),
+                contextMargin: override.contextMargin,
+              },
+            ];
           }),
         },
         providerModels: value.providerModelIds.map((providerModelId) => ({
@@ -338,6 +372,7 @@ export function GuardedPoolSetupWizard({
     }
     if (step === 1) {
       const invalidOverride = form.state.values.localModelIds.some((modelId) => {
+        if (!enabledMemberOverrides[modelId]) return false;
         const override = memberOverrides[modelId] ?? defaultMemberOverride();
         return (
           (override.concurrencyMode === "LIMITED" && override.concurrencyLimit < 1) ||
@@ -351,6 +386,18 @@ export function GuardedPoolSetupWizard({
       });
       if (invalidOverride)
         errors.memberOverrides = t("dashboard:pools.wizard.errors.memberOverrides");
+      for (const modelId of form.state.values.localModelIds) {
+        if (!enabledMemberOverrides[modelId]) continue;
+        const override = memberOverrides[modelId] ?? defaultMemberOverride();
+        const model = directModels.find((candidate) => candidate.id === modelId);
+        const capacity = capacities.data?.find(
+          (item) => item.id === model?.executionTarget?.inferenceCapacityId,
+        );
+        if (!memberContextFitsPhysical(override, capacity?.physicalMaxContext))
+          errors[`member-${modelId}-context`] = t(
+            "dashboard:pools.wizard.errors.memberContextPhysical",
+          );
+      }
     }
     setStepErrors(errors);
     if (Object.keys(errors).length > 0) {
@@ -640,13 +687,27 @@ export function GuardedPoolSetupWizard({
                   </h3>
                   {form.state.values.localModelIds.map((modelId) => {
                     const model = directModels.find((candidate) => candidate.id === modelId);
-                    const override = memberOverrides[modelId] ?? defaultMemberOverride();
+                    const override =
+                      memberOverrides[modelId] ?? deriveMemberOverride(form.state.values);
                     return (
                       <MemberOverrideEditor
                         key={modelId}
                         modelId={modelId}
                         label={model?.canonicalModelId ?? modelId}
                         value={override}
+                        enabled={Boolean(enabledMemberOverrides[modelId])}
+                        contextError={stepErrors[`member-${modelId}-context`]}
+                        onEnabled={(enabled) => {
+                          setEnabledMemberOverrides((current) => ({
+                            ...current,
+                            [modelId]: enabled,
+                          }));
+                          if (enabled)
+                            setMemberOverrides((current) => ({
+                              ...current,
+                              [modelId]: current[modelId] ?? override,
+                            }));
+                        }}
                         onChange={(next) =>
                           setMemberOverrides((current) => ({ ...current, [modelId]: next }))
                         }
@@ -982,16 +1043,22 @@ export function focusFirstInvalidWizardField(form: Pick<HTMLFormElement, "queryS
   form?.querySelector<HTMLElement>("[aria-invalid='true']")?.focus();
 }
 
-function MemberOverrideEditor({
+export function MemberOverrideEditor({
   modelId,
   label,
   value,
   onChange,
+  enabled,
+  onEnabled,
+  contextError,
 }: {
   modelId: string;
   label: string;
   value: MemberOverride;
   onChange: (value: MemberOverride) => void;
+  enabled: boolean;
+  onEnabled: (enabled: boolean) => void;
+  contextError?: string;
 }) {
   const { t } = useTranslation("dashboard");
   const safeId = modelId.replace(/[^a-zA-Z0-9_-]/g, "-");
@@ -1000,65 +1067,72 @@ function MemberOverrideEditor({
       <summary className="min-h-11 cursor-pointer break-all py-2 text-sm font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
         {label}
       </summary>
-      <div className="grid min-w-0 gap-4 sm:grid-cols-2">
-        <MemberLimitControl
-          id={`${safeId}-concurrency`}
-          label={t("pools.wizard.fields.memberConcurrencyOverride")}
-          mode={value.concurrencyMode}
-          value={value.concurrencyLimit}
-          onMode={(mode) => onChange({ ...value, concurrencyMode: mode })}
-          onValue={(limit) => onChange({ ...value, concurrencyLimit: limit })}
-        />
-        <MemberLimitControl
-          id={`${safeId}-wait`}
-          label={t("pools.wizard.fields.memberWaitOverride")}
-          mode={value.waitBudgetMode}
-          value={value.waitBudgetMs}
-          onMode={(mode) => onChange({ ...value, waitBudgetMode: mode })}
-          onValue={(limit) => onChange({ ...value, waitBudgetMs: limit })}
-        />
-        <MemberLimitControl
-          id={`${safeId}-context`}
-          label={t("pools.wizard.fields.memberContextOverride")}
-          mode={value.contextCeilingMode}
-          value={value.contextCeiling}
-          onMode={(mode) => onChange({ ...value, contextCeilingMode: mode })}
-          onValue={(limit) => onChange({ ...value, contextCeiling: limit })}
-        />
-        {(["reservedSlots", "contextMargin"] as const).map((name) => (
-          <div key={name} className="min-w-0 space-y-2">
-            <Label htmlFor={`${safeId}-${name}`}>
-              {t(`pools.wizard.fields.member${name[0]!.toUpperCase()}${name.slice(1)}`)}
+      <label className="mb-3 flex min-h-11 items-center gap-3">
+        <Checkbox checked={enabled} onCheckedChange={(checked) => onEnabled(checked === true)} />
+        <span className="text-sm">{t("pools.wizard.fields.enableMemberOverride")}</span>
+      </label>
+      {enabled ? (
+        <div className="grid min-w-0 gap-4 sm:grid-cols-2">
+          <MemberLimitControl
+            id={`${safeId}-concurrency`}
+            label={t("pools.wizard.fields.memberConcurrencyOverride")}
+            mode={value.concurrencyMode}
+            value={value.concurrencyLimit}
+            onMode={(mode) => onChange({ ...value, concurrencyMode: mode })}
+            onValue={(limit) => onChange({ ...value, concurrencyLimit: limit })}
+          />
+          <MemberLimitControl
+            id={`${safeId}-wait`}
+            label={t("pools.wizard.fields.memberWaitOverride")}
+            mode={value.waitBudgetMode}
+            value={value.waitBudgetMs}
+            onMode={(mode) => onChange({ ...value, waitBudgetMode: mode })}
+            onValue={(limit) => onChange({ ...value, waitBudgetMs: limit })}
+          />
+          <MemberLimitControl
+            id={`${safeId}-context`}
+            label={t("pools.wizard.fields.memberContextOverride")}
+            mode={value.contextCeilingMode}
+            value={value.contextCeiling}
+            error={contextError}
+            onMode={(mode) => onChange({ ...value, contextCeilingMode: mode })}
+            onValue={(limit) => onChange({ ...value, contextCeiling: limit })}
+          />
+          {(["reservedSlots", "contextMargin"] as const).map((name) => (
+            <div key={name} className="min-w-0 space-y-2">
+              <Label htmlFor={`${safeId}-${name}`}>
+                {t(`pools.wizard.fields.member${name[0]!.toUpperCase()}${name.slice(1)}`)}
+              </Label>
+              <Input
+                id={`${safeId}-${name}`}
+                type="number"
+                min={0}
+                value={value[name]}
+                onChange={(event) => onChange({ ...value, [name]: Number(event.target.value) })}
+              />
+            </div>
+          ))}
+          <div className="min-w-0 space-y-2">
+            <Label htmlFor={`${safeId}-borrowPolicy`}>
+              {t("pools.wizard.fields.memberBorrowPolicy")}
             </Label>
-            <Input
-              id={`${safeId}-${name}`}
-              type="number"
-              min={0}
-              value={value[name]}
-              onChange={(event) => onChange({ ...value, [name]: Number(event.target.value) })}
-            />
+            <select
+              id={`${safeId}-borrowPolicy`}
+              className="h-11 w-full rounded-md border bg-background px-3 text-base sm:text-sm"
+              value={value.borrowPolicy}
+              onChange={(event) =>
+                onChange({
+                  ...value,
+                  borrowPolicy: event.target.value as MemberOverride["borrowPolicy"],
+                })
+              }
+            >
+              <option value="NEVER">{t("pools.wizard.enums.NEVER")}</option>
+              <option value="WHEN_IDLE">{t("pools.wizard.enums.WHEN_IDLE")}</option>
+            </select>
           </div>
-        ))}
-        <div className="min-w-0 space-y-2">
-          <Label htmlFor={`${safeId}-borrowPolicy`}>
-            {t("pools.wizard.fields.memberBorrowPolicy")}
-          </Label>
-          <select
-            id={`${safeId}-borrowPolicy`}
-            className="h-11 w-full rounded-md border bg-background px-3 text-base sm:text-sm"
-            value={value.borrowPolicy}
-            onChange={(event) =>
-              onChange({
-                ...value,
-                borrowPolicy: event.target.value as MemberOverride["borrowPolicy"],
-              })
-            }
-          >
-            <option value="NEVER">{t("pools.wizard.enums.NEVER")}</option>
-            <option value="WHEN_IDLE">{t("pools.wizard.enums.WHEN_IDLE")}</option>
-          </select>
         </div>
-      </div>
+      ) : null}
     </details>
   );
 }
@@ -1070,6 +1144,7 @@ function MemberLimitControl({
   value,
   onMode,
   onValue,
+  error,
 }: {
   id: string;
   label: string;
@@ -1077,6 +1152,7 @@ function MemberLimitControl({
   value: number;
   onMode: (mode: LimitMode) => void;
   onValue: (value: number) => void;
+  error?: string;
 }) {
   const { t } = useTranslation("dashboard");
   return (
@@ -1092,14 +1168,23 @@ function MemberLimitControl({
         <option value="UNLIMITED">{t("pools.wizard.enums.UNLIMITED")}</option>
       </select>
       {mode === "LIMITED" ? (
-        <Input
-          id={`${id}-value`}
-          aria-label={`${label} ${t("pools.wizard.fields.limitValue")}`}
-          type="number"
-          min={1}
-          value={value}
-          onChange={(event) => onValue(Number(event.target.value))}
-        />
+        <>
+          <Input
+            id={`${id}-value`}
+            aria-label={`${label} ${t("pools.wizard.fields.limitValue")}`}
+            type="number"
+            min={1}
+            value={value}
+            onChange={(event) => onValue(Number(event.target.value))}
+            aria-invalid={Boolean(error)}
+            aria-describedby={error ? `${id}-error` : undefined}
+          />
+          {error ? (
+            <p id={`${id}-error`} className="text-sm text-destructive">
+              {error}
+            </p>
+          ) : null}
+        </>
       ) : (
         <p className="text-xs text-amber-700 dark:text-amber-300">
           {t("pools.wizard.advanced.unlimitedWarning")}

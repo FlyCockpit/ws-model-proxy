@@ -1,4 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { isValidElement, type ReactElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
@@ -44,7 +45,30 @@ import {
   providerOrderAfterToggle,
   recommendedPrimarySurface,
 } from "../lib/guarded-pool-wizard-validation";
-import { focusFirstInvalidWizardField, GuardedPoolSetupWizard } from "./guarded-pool-setup-wizard";
+import {
+  budgetIntegerRule,
+  budgetSpendRule,
+  deriveMemberOverride,
+  focusFirstInvalidWizardField,
+  GuardedPoolSetupWizard,
+  MemberOverrideEditor,
+  memberContextFitsPhysical,
+} from "./guarded-pool-setup-wizard";
+
+function findElement(
+  node: ReactNode,
+  predicate: (element: ReactElement<Record<string, unknown>>) => boolean,
+): ReactElement<Record<string, unknown>> | undefined {
+  if (!isValidElement(node)) return undefined;
+  const element = node as ReactElement<Record<string, unknown>>;
+  if (predicate(element)) return element;
+  const children = element.props.children;
+  for (const child of Array.isArray(children) ? children : [children]) {
+    const match = findElement(child as ReactNode, predicate);
+    if (match) return match;
+  }
+  return undefined;
+}
 
 const chatCapabilities = {
   version: 1 as const,
@@ -123,6 +147,102 @@ describe("GuardedPoolSetupWizard", () => {
         }) as HTMLElement,
     });
     expect(focused).toBe(true);
+  });
+
+  it("derives safe member defaults only when customization is enabled by the caller", () => {
+    expect(
+      deriveMemberOverride({
+        memberConcurrencyLimit: 3,
+        reservedSlots: 1,
+        borrowPolicy: "NEVER",
+        localWaitBudgetMs: 12_000,
+        memberContextCeiling: 30_000,
+        contextMargin: 2_000,
+      }),
+    ).toEqual({
+      concurrencyMode: "LIMITED",
+      concurrencyLimit: 3,
+      reservedSlots: 1,
+      borrowPolicy: "NEVER",
+      waitBudgetMode: "LIMITED",
+      waitBudgetMs: 12_000,
+      contextCeilingMode: "LIMITED",
+      contextCeiling: 30_000,
+      contextMargin: 2_000,
+    });
+  });
+
+  it("enables a member editor through its keyboard-operable checkbox callback", () => {
+    let enabled = false;
+    const editor = MemberOverrideEditor({
+      modelId: "local",
+      label: "owner/cli/local/model",
+      value: deriveMemberOverride({
+        memberConcurrencyLimit: 1,
+        reservedSlots: 0,
+        borrowPolicy: "WHEN_IDLE",
+        localWaitBudgetMs: 30_000,
+        memberContextCeiling: 31_744,
+        contextMargin: 1_024,
+      }),
+      enabled,
+      onEnabled: (next) => {
+        enabled = next;
+      },
+      onChange: () => undefined,
+    });
+    const checkbox = findElement(
+      editor,
+      (element) => typeof element.props.onCheckedChange === "function",
+    );
+    expect(checkbox).toBeDefined();
+    if (!checkbox) throw new Error("member override checkbox not rendered");
+    (checkbox.props.onCheckedChange as (checked: boolean) => void)(true);
+    expect(enabled).toBe(true);
+  });
+
+  it("renders and detects a model-specific physical context error", () => {
+    const value = deriveMemberOverride({
+      memberConcurrencyLimit: 1,
+      reservedSlots: 0,
+      borrowPolicy: "WHEN_IDLE",
+      localWaitBudgetMs: 30_000,
+      memberContextCeiling: 32_000,
+      contextMargin: 1_000,
+    });
+    expect(memberContextFitsPhysical(value, 32_768)).toBe(false);
+    const markup = renderToStaticMarkup(
+      MemberOverrideEditor({
+        modelId: "local",
+        label: "local",
+        value,
+        enabled: true,
+        contextError: "localized context error",
+        onEnabled: () => undefined,
+        onChange: () => undefined,
+      }),
+    );
+    expect(markup).toContain('aria-invalid="true"');
+    expect(markup).toContain("localized context error");
+  });
+
+  it("serializes independent LIMITED and UNLIMITED budget transitions", () => {
+    expect(budgetIntegerRule("LIMITED", "1200")).toEqual({
+      mode: "LIMITED",
+      limitValue: 1200,
+    });
+    expect(budgetIntegerRule("UNLIMITED", "")).toEqual({
+      mode: "UNLIMITED",
+      limitValue: null,
+    });
+    expect(budgetSpendRule("LIMITED", "12.50")).toEqual({
+      mode: "LIMITED",
+      limitValue: "12.50",
+    });
+    expect(budgetSpendRule("UNLIMITED", "")).toEqual({
+      mode: "UNLIMITED",
+      limitValue: null,
+    });
   });
 
   it("preserves explicit provider order across selection and arrow moves", () => {

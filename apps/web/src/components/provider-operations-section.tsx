@@ -114,6 +114,40 @@ export function focusFirstInvalidProviderField(form: HTMLFormElement | null) {
   invalid?.focus();
 }
 
+type ProviderBudgetValues = {
+  concurrencyMode: "LIMITED" | "UNLIMITED";
+  concurrency: string;
+  tokenAttemptMode: "LIMITED" | "UNLIMITED";
+  tokenAttempt: string;
+  tokenDayMode: "LIMITED" | "UNLIMITED";
+  tokenDay: string;
+  tokenMonthMode: "LIMITED" | "UNLIMITED";
+  tokenMonth: string;
+  tokenLifetimeMode: "LIMITED" | "UNLIMITED";
+  tokenLifetime: string;
+  spendDayMode: "LIMITED" | "UNLIMITED";
+  spendDay: string;
+  spendMonthMode: "LIMITED" | "UNLIMITED";
+  spendMonth: string;
+};
+
+export const providerBudgetRules = (limits: ProviderBudgetValues, currency: string | null) =>
+  [
+    ["CONCURRENCY", "PER_ATTEMPT", limits.concurrencyMode, limits.concurrency, null],
+    ["TOKENS", "PER_ATTEMPT", limits.tokenAttemptMode, limits.tokenAttempt, null],
+    ["TOKENS", "UTC_DAY", limits.tokenDayMode, limits.tokenDay, null],
+    ["TOKENS", "UTC_MONTH", limits.tokenMonthMode, limits.tokenMonth, null],
+    ["TOKENS", "LIFETIME", limits.tokenLifetimeMode, limits.tokenLifetime, null],
+    ["SPEND", "UTC_DAY", limits.spendDayMode, limits.spendDay, currency],
+    ["SPEND", "UTC_MONTH", limits.spendMonthMode, limits.spendMonth, currency],
+  ].map(([metric, period, mode, value, ruleCurrency]) => ({
+    metric: metric as "CONCURRENCY" | "TOKENS" | "SPEND",
+    period: period as "PER_ATTEMPT" | "UTC_DAY" | "UTC_MONTH" | "LIFETIME",
+    mode: mode as "LIMITED" | "UNLIMITED",
+    limitValue: mode === "UNLIMITED" ? null : value,
+    currency: metric === "SPEND" ? ruleCurrency : null,
+  }));
+
 function submitProviderForm(event: FormEvent<HTMLFormElement>, submit: () => void | Promise<void>) {
   event.preventDefault();
   const form = event.currentTarget;
@@ -243,22 +277,6 @@ export function ProviderOperationsSection() {
     spendMonthMode: "LIMITED" as "LIMITED" | "UNLIMITED",
     spendMonth: "100",
   };
-  const budgetRules = (limits: typeof budgetDefaults, currency: string | null) =>
-    [
-      ["CONCURRENCY", "PER_ATTEMPT", limits.concurrencyMode, limits.concurrency, null],
-      ["TOKENS", "PER_ATTEMPT", limits.tokenAttemptMode, limits.tokenAttempt, null],
-      ["TOKENS", "UTC_DAY", limits.tokenDayMode, limits.tokenDay, null],
-      ["TOKENS", "UTC_MONTH", limits.tokenMonthMode, limits.tokenMonth, null],
-      ["TOKENS", "LIFETIME", limits.tokenLifetimeMode, limits.tokenLifetime, null],
-      ["SPEND", "UTC_DAY", limits.spendDayMode, limits.spendDay, currency],
-      ["SPEND", "UTC_MONTH", limits.spendMonthMode, limits.spendMonth, currency],
-    ].map(([metric, period, mode, value, ruleCurrency]) => ({
-      metric: metric as "CONCURRENCY" | "TOKENS" | "SPEND",
-      period: period as "PER_ATTEMPT" | "UTC_DAY" | "UTC_MONTH" | "LIFETIME",
-      mode: mode as "LIMITED" | "UNLIMITED",
-      limitValue: mode === "UNLIMITED" ? null : value,
-      currency: metric === "SPEND" ? ruleCurrency : null,
-    }));
   const invalidate = async () => {
     await Promise.all([
       queryClient.invalidateQueries({ queryKey: orpc.providerManagement.key() }),
@@ -522,7 +540,7 @@ export function ProviderOperationsSection() {
         poolId: null,
         providerModelId: null,
         active: true,
-        rules: budgetRules(value, activePricing?.currency ?? null),
+        rules: providerBudgetRules(value, activePricing?.currency ?? null),
       });
     },
   });
@@ -1031,81 +1049,87 @@ export function ProviderOperationsSection() {
                         onRetry={policies.refetch}
                       />
                     ) : null}
-                    <div className="grid gap-3 sm:grid-cols-2">
-                      <BudgetRuleField
-                        id="provider-budget-concurrency"
-                        errors={budgetForm.getFieldMeta("concurrency")?.errors}
-                        label={t("dashboard:providers.fields.concurrencyAttempt")}
-                        mode={budgetForm.state.values.concurrencyMode}
-                        value={budgetForm.state.values.concurrency}
-                        onMode={(value) => budgetForm.setFieldValue("concurrencyMode", value)}
-                        onValue={(value) => budgetForm.setFieldValue("concurrency", value)}
-                      />
-                      <BudgetRuleField
-                        id="provider-budget-token-attempt"
-                        errors={budgetForm.getFieldMeta("tokenAttempt")?.errors}
-                        label={t("dashboard:providers.fields.tokensAttempt")}
-                        mode={budgetForm.state.values.tokenAttemptMode}
-                        value={budgetForm.state.values.tokenAttempt}
-                        onMode={(value) => budgetForm.setFieldValue("tokenAttemptMode", value)}
-                        onValue={(value) => budgetForm.setFieldValue("tokenAttempt", value)}
-                      />
-                      <BudgetRuleField
-                        id="provider-budget-token-day"
-                        errors={budgetForm.getFieldMeta("tokenDay")?.errors}
-                        label={t("dashboard:providers.fields.tokensDay")}
-                        mode={budgetForm.state.values.tokenDayMode}
-                        value={budgetForm.state.values.tokenDay}
-                        onMode={(value) => budgetForm.setFieldValue("tokenDayMode", value)}
-                        onValue={(value) => budgetForm.setFieldValue("tokenDay", value)}
-                      />
-                      <BudgetRuleField
-                        id="provider-budget-token-month"
-                        errors={budgetForm.getFieldMeta("tokenMonth")?.errors}
-                        label={t("dashboard:providers.fields.tokensMonth")}
-                        mode={budgetForm.state.values.tokenMonthMode}
-                        value={budgetForm.state.values.tokenMonth}
-                        onMode={(value) => budgetForm.setFieldValue("tokenMonthMode", value)}
-                        onValue={(value) => budgetForm.setFieldValue("tokenMonth", value)}
-                      />
-                      <BudgetRuleField
-                        id="provider-budget-token-lifetime"
-                        errors={budgetForm.getFieldMeta("tokenLifetime")?.errors}
-                        label={t("dashboard:providers.fields.tokensLifetime")}
-                        mode={budgetForm.state.values.tokenLifetimeMode}
-                        value={budgetForm.state.values.tokenLifetime}
-                        onMode={(value) => budgetForm.setFieldValue("tokenLifetimeMode", value)}
-                        onValue={(value) => budgetForm.setFieldValue("tokenLifetime", value)}
-                      />
-                      <BudgetRuleField
-                        id="provider-budget-spend-day"
-                        errors={budgetForm.getFieldMeta("spendDay")?.errors}
-                        label={t("dashboard:providers.fields.spendDay")}
-                        mode={budgetForm.state.values.spendDayMode}
-                        value={budgetForm.state.values.spendDay}
-                        onMode={(value) => budgetForm.setFieldValue("spendDayMode", value)}
-                        onValue={(value) => budgetForm.setFieldValue("spendDay", value)}
-                        decimal
-                      />
-                      <BudgetRuleField
-                        id="provider-budget-spend-month"
-                        errors={budgetForm.getFieldMeta("spendMonth")?.errors}
-                        label={t("dashboard:providers.fields.spendMonth")}
-                        mode={budgetForm.state.values.spendMonthMode}
-                        value={budgetForm.state.values.spendMonth}
-                        onMode={(value) => budgetForm.setFieldValue("spendMonthMode", value)}
-                        onValue={(value) => budgetForm.setFieldValue("spendMonth", value)}
-                        decimal
-                      />
-                    </div>
-                    <Button
-                      size="touch"
-                      disabled={
-                        createBudget.isPending || !budgetForm.state.canSubmit || !activePricing
-                      }
-                    >
-                      {t("dashboard:providers.actions.activateBudget")}
-                    </Button>
+                    <budgetForm.Subscribe selector={(state) => state}>
+                      {(budgetState) => (
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <BudgetRuleField
+                            id="provider-budget-concurrency"
+                            errors={budgetState.fieldMeta.concurrency?.errors}
+                            label={t("dashboard:providers.fields.concurrencyAttempt")}
+                            mode={budgetState.values.concurrencyMode}
+                            value={budgetState.values.concurrency}
+                            onMode={(value) => budgetForm.setFieldValue("concurrencyMode", value)}
+                            onValue={(value) => budgetForm.setFieldValue("concurrency", value)}
+                          />
+                          <BudgetRuleField
+                            id="provider-budget-token-attempt"
+                            errors={budgetState.fieldMeta.tokenAttempt?.errors}
+                            label={t("dashboard:providers.fields.tokensAttempt")}
+                            mode={budgetState.values.tokenAttemptMode}
+                            value={budgetState.values.tokenAttempt}
+                            onMode={(value) => budgetForm.setFieldValue("tokenAttemptMode", value)}
+                            onValue={(value) => budgetForm.setFieldValue("tokenAttempt", value)}
+                          />
+                          <BudgetRuleField
+                            id="provider-budget-token-day"
+                            errors={budgetState.fieldMeta.tokenDay?.errors}
+                            label={t("dashboard:providers.fields.tokensDay")}
+                            mode={budgetState.values.tokenDayMode}
+                            value={budgetState.values.tokenDay}
+                            onMode={(value) => budgetForm.setFieldValue("tokenDayMode", value)}
+                            onValue={(value) => budgetForm.setFieldValue("tokenDay", value)}
+                          />
+                          <BudgetRuleField
+                            id="provider-budget-token-month"
+                            errors={budgetState.fieldMeta.tokenMonth?.errors}
+                            label={t("dashboard:providers.fields.tokensMonth")}
+                            mode={budgetState.values.tokenMonthMode}
+                            value={budgetState.values.tokenMonth}
+                            onMode={(value) => budgetForm.setFieldValue("tokenMonthMode", value)}
+                            onValue={(value) => budgetForm.setFieldValue("tokenMonth", value)}
+                          />
+                          <BudgetRuleField
+                            id="provider-budget-token-lifetime"
+                            errors={budgetState.fieldMeta.tokenLifetime?.errors}
+                            label={t("dashboard:providers.fields.tokensLifetime")}
+                            mode={budgetState.values.tokenLifetimeMode}
+                            value={budgetState.values.tokenLifetime}
+                            onMode={(value) => budgetForm.setFieldValue("tokenLifetimeMode", value)}
+                            onValue={(value) => budgetForm.setFieldValue("tokenLifetime", value)}
+                          />
+                          <BudgetRuleField
+                            id="provider-budget-spend-day"
+                            errors={budgetState.fieldMeta.spendDay?.errors}
+                            label={t("dashboard:providers.fields.spendDay")}
+                            mode={budgetState.values.spendDayMode}
+                            value={budgetState.values.spendDay}
+                            onMode={(value) => budgetForm.setFieldValue("spendDayMode", value)}
+                            onValue={(value) => budgetForm.setFieldValue("spendDay", value)}
+                            decimal
+                          />
+                          <BudgetRuleField
+                            id="provider-budget-spend-month"
+                            errors={budgetState.fieldMeta.spendMonth?.errors}
+                            label={t("dashboard:providers.fields.spendMonth")}
+                            mode={budgetState.values.spendMonthMode}
+                            value={budgetState.values.spendMonth}
+                            onMode={(value) => budgetForm.setFieldValue("spendMonthMode", value)}
+                            onValue={(value) => budgetForm.setFieldValue("spendMonth", value)}
+                            decimal
+                          />
+                        </div>
+                      )}
+                    </budgetForm.Subscribe>
+                    <budgetForm.Subscribe selector={(state) => state.canSubmit}>
+                      {(canSubmit) => (
+                        <Button
+                          size="touch"
+                          disabled={createBudget.isPending || !canSubmit || !activePricing}
+                        >
+                          {t("dashboard:providers.actions.activateBudget")}
+                        </Button>
+                      )}
+                    </budgetForm.Subscribe>
                     <p className="text-xs text-muted-foreground">
                       {t("dashboard:providers.budgetPeriods")}
                     </p>
@@ -1153,7 +1177,7 @@ export function ProviderOperationsSection() {
                                     replaceBudget.mutate({
                                       id: policy.id,
                                       active: true,
-                                      rules: budgetRules(
+                                      rules: providerBudgetRules(
                                         budgetForm.state.values,
                                         activePricing?.currency ?? null,
                                       ),
@@ -1246,7 +1270,7 @@ export function ProviderOperationsSection() {
                               poolId: attachmentDraft.poolId,
                               providerModelId: activeModelId,
                               active: true,
-                              rules: budgetRules(budgetForm.state.values, currency),
+                              rules: providerBudgetRules(budgetForm.state.values, currency),
                             });
                           }}
                         >
