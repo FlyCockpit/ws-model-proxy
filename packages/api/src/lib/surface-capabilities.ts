@@ -72,6 +72,8 @@ type SurfaceFeatures = {
   countTokens?: boolean;
   protocolVersion?: string;
   betaFeatures?: string[];
+  protocolVersions?: Array<{ version: string; betaFeatures: string[] }>;
+  operations?: string[];
   responsesLifecycle?: Partial<Record<Exclude<ResponsesOperation, "create">, boolean>>;
 };
 
@@ -79,14 +81,37 @@ function nativeFeatures(
   capabilities: OpenAiCompatibleCapabilities,
   surface: ModelApiSurface,
 ): SurfaceFeatures | undefined {
-  if (capabilities.version === 3) {
+  if (capabilities.version === 3 || capabilities.version === 4) {
     const key = {
       OPENAI_CHAT_COMPLETIONS: "openaiChatCompletions",
       OPENAI_RESPONSES: "openaiResponses",
       ANTHROPIC_MESSAGES: "anthropicMessages",
       OPENAI_COMPLETIONS: "openaiCompletions",
     }[surface] as keyof typeof capabilities.surfaces;
-    return capabilities.surfaces[key];
+    const inventorySurface = capabilities.surfaces[key];
+    if (!inventorySurface) return undefined;
+    if (capabilities.version === 4) {
+      if (!("operations" in inventorySurface)) return undefined;
+      const operations: readonly string[] = inventorySurface.operations;
+      return {
+        ...inventorySurface,
+        supported: operations.length > 0,
+        countTokens: operations.includes("countTokens"),
+        responsesLifecycle:
+          inventorySurface === capabilities.surfaces.openaiResponses
+            ? {
+                statefulFollowUps: operations.includes("statefulFollowUps"),
+                retrieve: operations.includes("retrieve"),
+                delete: operations.includes("delete"),
+                cancel: operations.includes("cancel"),
+                listInputItems: operations.includes("listInputItems"),
+                countTokens: operations.includes("countTokens"),
+                compact: operations.includes("compact"),
+              }
+            : undefined,
+      };
+    }
+    return inventorySurface;
   }
   if (surface === "OPENAI_CHAT_COMPLETIONS") {
     const legacy = capabilities.chatCompletions;
@@ -202,14 +227,32 @@ function incompatibilities(features: SurfaceFeatures, request: SurfaceRequestReq
   ] as const) {
     if (request[key] && features[key] !== true) failures.push(`${key}_unavailable`);
   }
-  if (request.protocolVersion && features.protocolVersion !== request.protocolVersion) {
+  const versionInventory = request.protocolVersion
+    ? features.protocolVersions?.find(({ version }) => version === request.protocolVersion)
+    : undefined;
+  if (
+    request.protocolVersion &&
+    (features.protocolVersions
+      ? !versionInventory
+      : features.protocolVersion !== request.protocolVersion)
+  ) {
     failures.push("protocol_version_unsupported");
   }
-  const allowedBetas = new Set(features.betaFeatures ?? []);
+  const allowedBetas = new Set(
+    features.protocolVersions
+      ? (versionInventory?.betaFeatures ?? [])
+      : (features.betaFeatures ?? []),
+  );
   if (request.betaFeatures?.some((beta) => !allowedBetas.has(beta))) {
     failures.push("beta_feature_unsupported");
   }
   return failures;
+}
+
+function requestedOperation(surface: ModelApiSurface, request: SurfaceRequestRequirements): string {
+  if (surface === "OPENAI_RESPONSES") return responsesOperationFor(request);
+  if (surface === "ANTHROPIC_MESSAGES" && request.countTokens) return "countTokens";
+  return "create";
 }
 
 export function surfaceAvailabilityMatrix({
@@ -325,6 +368,11 @@ export function resolveExecutionPath({
     ),
     ...(lifecycleUnsupported ? [`responses_${lifecycleOperation}_unavailable`] : []),
     ...(anthropicCountTokensUnsupported ? ["countTokens_unavailable"] : []),
+    ...(capabilities.version === 4 &&
+    selected.mode === "native" &&
+    !features.operations?.includes(requestedOperation(requestedSurface, request))
+      ? ["operation_unavailable"]
+      : []),
     ...(selected.mode === "adapted" ? adaptedSubsetFailures(request) : []),
     ...(selected.mode === "adapted" &&
     requestedSurface === "ANTHROPIC_MESSAGES" &&

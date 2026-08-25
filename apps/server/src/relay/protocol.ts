@@ -136,11 +136,11 @@ const endpointInventorySchema = z
       ...endpoint.models.flatMap((model) => [model.capabilities, model.probeSuggestions]),
     ];
     for (const profile of profiles) {
-      if (profile?.version === 3 && profile.protocol !== expected) {
+      if ((profile?.version === 3 || profile?.version === 4) && profile.protocol !== expected) {
         context.addIssue({
           code: "custom",
           path: ["defaultCapabilities", "protocol"],
-          message: "Version 3 capability protocol must match endpoint kind.",
+          message: "Capability protocol must match endpoint kind.",
         });
         return;
       }

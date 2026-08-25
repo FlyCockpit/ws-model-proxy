@@ -147,6 +147,113 @@ const responsesSurfaceFeatureSchema = surfaceFeatureSchema.extend({
     .optional(),
 });
 
+const capabilityOperationSchema = {
+  openaiChatCompletions: z.enum(["create"]),
+  openaiResponses: z.enum([
+    "create",
+    "statefulFollowUps",
+    "retrieve",
+    "delete",
+    "cancel",
+    "listInputItems",
+    "countTokens",
+    "compact",
+  ]),
+  anthropicMessages: z.enum(["create", "countTokens"]),
+  openaiCompletions: z.enum(["create"]),
+} as const;
+
+function uniqueOperations<T extends z.ZodTypeAny>(operation: T) {
+  return z
+    .array(operation)
+    .min(1)
+    .max(16)
+    .refine((operations) => new Set(operations).size === operations.length, {
+      message: "Capability operations must be unique.",
+    });
+}
+
+const v4SurfaceFeatureShape = {
+  source: z.enum(["declared", "probe", "dashboard", "provider"]),
+  confidence: z.enum(["exact", "high", "estimated", "unknown"]),
+  streaming: booleanSupportSchema,
+  maxContextTokens: z.number().int().positive().optional(),
+  inputImages: booleanSupportSchema,
+  outputImages: booleanSupportSchema,
+  inputAudio: booleanSupportSchema,
+  outputAudio: booleanSupportSchema,
+  inputVideo: booleanSupportSchema,
+  outputVideo: booleanSupportSchema,
+  tools: booleanSupportSchema,
+  parallelTools: booleanSupportSchema,
+  structuredOutput: booleanSupportSchema,
+  reasoning: booleanSupportSchema,
+  hostedTools: booleanSupportSchema,
+} as const;
+
+const anthropicProtocolVersionSchema = z
+  .object({
+    version: z.string().trim().min(1).max(64),
+    betaFeatures: z.array(z.string().trim().min(1).max(128)).max(64).default([]),
+  })
+  .strict();
+
+const v4CapabilitiesSchema = z
+  .object({
+    version: z.literal(4),
+    protocol: z.enum(["openai-compatible", "anthropic-compatible"]),
+    models: z.never().optional(),
+    chatCompletions: z.never().optional(),
+    completions: z.never().optional(),
+    embeddings: z.never().optional(),
+    responses: z.never().optional(),
+    audio: z.never().optional(),
+    surfaces: z
+      .object({
+        openaiChatCompletions: z
+          .object({
+            ...v4SurfaceFeatureShape,
+            operations: uniqueOperations(capabilityOperationSchema.openaiChatCompletions),
+          })
+          .strict()
+          .optional(),
+        openaiResponses: z
+          .object({
+            ...v4SurfaceFeatureShape,
+            operations: uniqueOperations(capabilityOperationSchema.openaiResponses),
+          })
+          .strict()
+          .optional(),
+        anthropicMessages: z
+          .object({
+            ...v4SurfaceFeatureShape,
+            operations: uniqueOperations(capabilityOperationSchema.anthropicMessages),
+            protocolVersions: z
+              .array(anthropicProtocolVersionSchema)
+              .min(1)
+              .max(16)
+              .refine(
+                (versions) =>
+                  new Set(versions.map(({ version }) => version)).size === versions.length,
+                { message: "Anthropic protocol versions must be unique." },
+              ),
+          })
+          .strict()
+          .optional(),
+        openaiCompletions: z
+          .object({
+            ...v4SurfaceFeatureShape,
+            operations: uniqueOperations(capabilityOperationSchema.openaiCompletions),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict(),
+    source: z.enum(["declared", "probe", "dashboard", "provider"]).optional(),
+    confidence: z.enum(["exact", "high", "estimated", "unknown"]).optional(),
+  })
+  .strict();
+
 /**
  * Version 3 is the provider-independent inventory. The legacy operation fields
  * remain present so v1/v2 readers and non-generation routes can be migrated
@@ -182,6 +289,7 @@ export const openAiCompatibleCapabilitiesSchema = z.discriminatedUnion("version"
   v1CapabilitiesSchema,
   v2CapabilitiesSchema,
   v3CapabilitiesSchema,
+  v4CapabilitiesSchema,
 ]);
 
 export type OpenAiCompatibleCapabilities = z.infer<typeof openAiCompatibleCapabilitiesSchema>;
@@ -285,6 +393,22 @@ export function coarseCapabilitiesFromOpenAi(
   | "RESPONSES_API"
 > {
   const coarse: ReturnType<typeof coarseCapabilitiesFromOpenAi> = [];
+  if (capabilities.version === 4) {
+    const surfaces = capabilities.surfaces;
+    if (
+      surfaces.openaiChatCompletions?.operations.includes("create") ||
+      surfaces.openaiCompletions?.operations.includes("create") ||
+      surfaces.openaiResponses?.operations.includes("create") ||
+      surfaces.anthropicMessages?.operations.includes("create")
+    )
+      coarse.push("TEXT_GENERATION");
+    if (surfaces.openaiChatCompletions?.inputImages) coarse.push("VISION_INPUT");
+    if (surfaces.openaiChatCompletions?.inputAudio) coarse.push("AUDIO_INPUT");
+    if (surfaces.openaiChatCompletions?.inputVideo) coarse.push("VIDEO_INPUT");
+    if (surfaces.openaiChatCompletions?.outputAudio) coarse.push("AUDIO_OUTPUT");
+    if (surfaces.openaiResponses?.operations.includes("create")) coarse.push("RESPONSES_API");
+    return coarse;
+  }
   if (
     capabilities.chatCompletions?.supported === true ||
     capabilities.completions?.supported === true ||
@@ -314,6 +438,8 @@ export function supportsChatCompletions({
   coarse?: readonly string[] | null;
 }): boolean {
   if (capabilities) {
+    if (capabilities.version === 4)
+      return capabilities.surfaces.openaiChatCompletions?.operations.includes("create") === true;
     return capabilities.chatCompletions?.supported === true;
   }
   return Array.isArray(coarse) && coarse.includes("TEXT_GENERATION");
@@ -322,6 +448,16 @@ export function supportsChatCompletions({
 export function transformerSupportedModalities(
   capabilities: OpenAiCompatibleCapabilities | null | undefined,
 ): TransformerModalities {
+  if (capabilities?.version === 4) {
+    const surface = capabilities.surfaces.openaiChatCompletions;
+    if (!surface?.operations.includes("create"))
+      return { images: false, audio: false, video: false };
+    return {
+      images: surface.inputImages === true,
+      audio: surface.inputAudio === true,
+      video: surface.inputVideo === true,
+    };
+  }
   const chat = capabilities?.chatCompletions;
   if (chat?.supported !== true) {
     return { images: false, audio: false, video: false };

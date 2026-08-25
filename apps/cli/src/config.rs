@@ -24,11 +24,11 @@ where
     D: serde::Deserializer<'de>,
 {
     let version = u8::deserialize(deserializer)?;
-    if matches!(version, 1..=3) {
+    if matches!(version, 1..=4) {
         Ok(version)
     } else {
         Err(serde::de::Error::custom(
-            "capability version must be 1, 2, or 3",
+            "capability version must be 1, 2, 3, or 4",
         ))
     }
 }
@@ -322,8 +322,35 @@ impl TryFrom<RawCapabilities> for OpenAiCompatibleCapabilities {
                     .to_string(),
             );
         }
-        if value.version == 3 && value.surfaces.is_none() {
-            return Err("version 3 capabilities require `surfaces`".to_string());
+        if value.version >= 3 && value.surfaces.is_none() {
+            return Err(format!(
+                "version {} capabilities require `surfaces`",
+                value.version
+            ));
+        }
+        if value.version == 3
+            && value
+                .surfaces
+                .as_ref()
+                .is_some_and(SurfaceInventory::has_v4_fields)
+        {
+            return Err("version 3 capabilities cannot use version 4 operation fields".to_string());
+        }
+        if value.version == 4 {
+            if value.models.is_some()
+                || value.chat_completions.is_some()
+                || value.completions.is_some()
+                || value.embeddings.is_some()
+                || value.responses.is_some()
+                || value.audio.is_some()
+            {
+                return Err("version 4 capabilities cannot use legacy operation fields".to_string());
+            }
+            value
+                .surfaces
+                .as_ref()
+                .expect("checked above")
+                .validate_v4()?;
         }
         Ok(Self {
             version: value.version,
@@ -482,6 +509,117 @@ pub struct SurfaceInventory {
     pub openai_completions: Option<SurfaceCapabilities>,
 }
 
+impl SurfaceInventory {
+    fn has_v4_fields(&self) -> bool {
+        self.openai_chat_completions
+            .as_ref()
+            .is_some_and(|surface| !surface.operations.is_empty())
+            || self
+                .openai_completions
+                .as_ref()
+                .is_some_and(|surface| !surface.operations.is_empty())
+            || self
+                .openai_responses
+                .as_ref()
+                .is_some_and(|surface| !surface.common.operations.is_empty())
+            || self.anthropic_messages.as_ref().is_some_and(|surface| {
+                !surface.common.operations.is_empty() || !surface.protocol_versions.is_empty()
+            })
+    }
+
+    fn validate_v4(&self) -> std::result::Result<(), String> {
+        fn validate_common(
+            name: &str,
+            surface: &SurfaceCapabilities,
+            allowed: &[&str],
+        ) -> std::result::Result<(), String> {
+            if surface.operations.is_empty() {
+                return Err(format!("version 4 surface `{name}` requires `operations`"));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for operation in &surface.operations {
+                if !allowed.contains(&operation.as_str()) {
+                    return Err(format!(
+                        "version 4 surface `{name}` has unknown operation `{operation}`"
+                    ));
+                }
+                if !seen.insert(operation) {
+                    return Err(format!(
+                        "version 4 surface `{name}` has duplicate operation `{operation}`"
+                    ));
+                }
+            }
+            if surface.supported.is_some()
+                || surface.protocol_version.is_some()
+                || !surface.beta_features.is_empty()
+            {
+                return Err(format!(
+                    "version 4 surface `{name}` uses legacy capability fields"
+                ));
+            }
+            Ok(())
+        }
+
+        if let Some(surface) = &self.openai_chat_completions {
+            validate_common("openaiChatCompletions", surface, &["create"])?;
+        }
+        if let Some(surface) = &self.openai_completions {
+            validate_common("openaiCompletions", surface, &["create"])?;
+        }
+        if let Some(surface) = &self.openai_responses {
+            validate_common(
+                "openaiResponses",
+                &surface.common,
+                &[
+                    "create",
+                    "statefulFollowUps",
+                    "retrieve",
+                    "delete",
+                    "cancel",
+                    "listInputItems",
+                    "countTokens",
+                    "compact",
+                ],
+            )?;
+            if surface.responses_lifecycle.is_some() {
+                return Err(
+                    "version 4 openaiResponses uses legacy `responsesLifecycle`".to_string()
+                );
+            }
+        }
+        if let Some(surface) = &self.anthropic_messages {
+            validate_common(
+                "anthropicMessages",
+                &surface.common,
+                &["create", "countTokens"],
+            )?;
+            if surface.count_tokens.is_some() || surface.protocol_versions.is_empty() {
+                return Err(
+                    "version 4 anthropicMessages requires `protocolVersions` and cannot use legacy `countTokens`"
+                        .to_string(),
+                );
+            }
+            let mut versions = std::collections::HashSet::new();
+            for version in &surface.protocol_versions {
+                if version.version.trim().is_empty() || !versions.insert(&version.version) {
+                    return Err(
+                        "Anthropic protocol versions must be non-empty and unique".to_string()
+                    );
+                }
+                let mut betas = std::collections::HashSet::new();
+                if version
+                    .beta_features
+                    .iter()
+                    .any(|beta| beta.trim().is_empty() || !betas.insert(beta))
+                {
+                    return Err("Anthropic beta features must be non-empty and unique".to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SurfaceCapabilities {
@@ -489,6 +627,8 @@ pub struct SurfaceCapabilities {
     pub confidence: CapabilityConfidence,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supported: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operations: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub streaming: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -528,6 +668,16 @@ pub struct AnthropicSurfaceCapabilities {
     pub common: SurfaceCapabilities,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count_tokens: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocol_versions: Vec<AnthropicProtocolVersion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnthropicProtocolVersion {
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub beta_features: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -822,7 +972,7 @@ impl Config {
                     EndpointKind::OpenAiCompatible => "openai-compatible",
                     EndpointKind::AnthropicCompatible => "anthropic-compatible",
                 };
-                if !(1..=3).contains(&profile.version) {
+                if !(1..=4).contains(&profile.version) {
                     anyhow::bail!(
                         "endpoint `{}` has unsupported capability inventory version {}",
                         endpoint.slug,
@@ -841,15 +991,18 @@ impl Config {
                         endpoint.slug
                     );
                 }
-                if profile.version == 3 && profile.protocol != expected_protocol {
+                if profile.version >= 3 && profile.protocol != expected_protocol {
                     anyhow::bail!(
                         "endpoint `{}` kind `{expected_protocol}` does not match capability protocol `{}`",
                         endpoint.slug,
                         profile.protocol
                     );
                 }
-                if profile.version == 3 && profile.surfaces.is_none() {
-                    anyhow::bail!("version 3 capabilities require `surfaces`");
+                if profile.version >= 3 && profile.surfaces.is_none() {
+                    anyhow::bail!(
+                        "version {} capabilities require `surfaces`",
+                        profile.version
+                    );
                 }
             }
             for model in &endpoint.models {
@@ -1116,6 +1269,60 @@ mod tests {
             config.validate().is_err(),
             "accepted a programmatically constructed legacy protocol mismatch"
         );
+    }
+
+    #[test]
+    fn validates_exact_v4_operations_and_anthropic_versions() {
+        let valid = serde_json::json!({
+            "version": 4,
+            "protocol": "anthropic-compatible",
+            "surfaces": {
+                "anthropicMessages": {
+                    "source": "provider",
+                    "confidence": "exact",
+                    "operations": ["create", "countTokens"],
+                    "streaming": true,
+                    "protocolVersions": [{
+                        "version": "2023-06-01",
+                        "betaFeatures": ["prompt-caching-2024-07-31"]
+                    }]
+                }
+            }
+        });
+        let parsed: OpenAiCompatibleCapabilities =
+            serde_json::from_value(valid.clone()).expect("valid v4 inventory");
+        assert_eq!(parsed.version, 4);
+
+        for invalid in [
+            serde_json::json!({
+                "version": 4,
+                "protocol": "anthropic-compatible",
+                "surfaces": { "anthropicMessages": {
+                    "source": "provider", "confidence": "exact",
+                    "operations": ["unknown"],
+                    "protocolVersions": [{"version": "2023-06-01"}]
+                }}
+            }),
+            serde_json::json!({
+                "version": 4,
+                "protocol": "anthropic-compatible",
+                "surfaces": { "anthropicMessages": {
+                    "source": "provider", "confidence": "exact",
+                    "operations": ["create", "create"],
+                    "protocolVersions": [{"version": "2023-06-01"}]
+                }}
+            }),
+            serde_json::json!({
+                "version": 4,
+                "protocol": "anthropic-compatible",
+                "surfaces": { "anthropicMessages": {
+                    "source": "provider", "confidence": "exact",
+                    "operations": ["create"]
+                }}
+            }),
+        ] {
+            assert!(serde_json::from_value::<OpenAiCompatibleCapabilities>(invalid).is_err());
+        }
     }
 
     #[test]

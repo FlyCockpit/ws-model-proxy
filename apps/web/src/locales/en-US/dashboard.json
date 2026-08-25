@@ -715,6 +715,7 @@
     "audit": "Owner audit trail",
     "noAttempts": "No provider attempt events in this window.",
     "noAudit": "No audit events for this account.",
+    "noCapabilities": "No validated native capability inventory",
     "visibilityDisclosure": "Anyone with a model API token or pool grant that can see a public-egress pool may cause requests to leave your deployment and consume the attached provider budgets.",
     "fields": {
       "label": "Account label",
@@ -724,6 +725,10 @@
       "secret": "Provider secret",
       "replacementSecret": "Replacement secret",
       "upstreamModel": "Upstream model ID",
+      "nativeSurface": "Native API surface",
+      "streaming": "Supports streaming",
+      "anthropicVersion": "Anthropic protocol version",
+      "anthropicBetas": "Allowed Anthropic betas (comma-separated)",
       "displayName": "Display name (optional)",
       "model": "Provider model",
       "pricingVersion": "Pricing version",

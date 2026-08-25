@@ -2546,6 +2546,38 @@ export const forwarderManagementRouter = {
           },
         });
       }
+      if (parsed.version === 4) {
+        const current = parsed.surfaces.openaiChatCompletions;
+        const metadata = {
+          ...parsed,
+          surfaces: {
+            ...parsed.surfaces,
+            openaiChatCompletions: current
+              ? {
+                  ...current,
+                  inputImages: input.vision,
+                  inputAudio: input.audio,
+                  inputVideo: input.video,
+                }
+              : current,
+          },
+        };
+        return prisma.discoveredModel.update({
+          where: { id: input.id },
+          data: {
+            capabilityOverrideMode: "OVERRIDE",
+            capabilityOverrideOrigin: "DASHBOARD",
+            capabilityOverrides: { set: coarseCapabilitiesFromOpenAi(metadata) },
+            capabilityOverrideMetadata: metadata,
+          },
+          select: {
+            id: true,
+            capabilityOverrideMode: true,
+            capabilityOverrides: true,
+            capabilityOverrideMetadata: true,
+          },
+        });
+      }
       const base = parsed;
       const chatExisted = Boolean(base.chatCompletions);
       const needsChat = chatExisted || input.vision || input.audio || input.video;

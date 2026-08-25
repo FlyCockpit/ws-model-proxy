@@ -1,5 +1,9 @@
 import { Readable } from "node:stream";
 import {
+  type OpenAiCompatibleCapabilities,
+  parseOpenAiCompatibleCapabilities,
+} from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import {
   decryptProviderCredential,
   parseProviderCredentialKeyring,
 } from "@ws-model-proxy/api/lib/provider-credential-crypto";
@@ -8,6 +12,7 @@ import {
   type ProviderProtocol,
   providerHttpsRequest,
 } from "@ws-model-proxy/api/lib/provider-egress";
+import { resolveExecutionPath } from "@ws-model-proxy/api/lib/surface-capabilities";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
 import {
@@ -138,6 +143,7 @@ export interface PublicProviderTarget {
   nativeSurfaces: readonly ProtocolSurface[];
   supportsStreaming: boolean;
   supportedFeatures: readonly string[];
+  capabilityInventory?: OpenAiCompatibleCapabilities | null;
   credential: {
     id: string;
     credentialType: "API_KEY" | "BEARER";
@@ -203,6 +209,7 @@ export function matchesExactResponsesBinding(
     | "upstreamModelId"
     | "nativeSurfaces"
     | "protocol"
+    | "capabilityInventory"
   >,
   binding: NonNullable<PublicOverflowRequest["exactResponsesBinding"]>,
 ): boolean {
@@ -319,6 +326,7 @@ export function publicTargetCompatibility(
     | "supportsStreaming"
     | "supportedFeatures"
     | "protocol"
+    | "capabilityInventory"
   >,
   request: Pick<
     PublicOverflowRequest,
@@ -333,7 +341,8 @@ export function publicTargetCompatibility(
     | "estimatedInputTokens"
     | "contextTokens"
     | "skipContextValidation"
-  >,
+  > &
+    Partial<Pick<PublicOverflowRequest, "path" | "headers" | "method">>,
 ): "COMPATIBLE" | "CONTEXT_UNKNOWN" | "CONTEXT_EXCEEDED" | "PROTOCOL_UNAVAILABLE" {
   const requestedOutputTokens =
     request.requestedOutputTokens ??
@@ -352,6 +361,49 @@ export function publicTargetCompatibility(
   if (request.stream && !target.supportsStreaming) return "PROTOCOL_UNAVAILABLE";
   if (request.requiredFeatures.some((feature) => !target.supportedFeatures.includes(feature)))
     return "PROTOCOL_UNAVAILABLE";
+  if (target.capabilityInventory?.version === 4) {
+    const requestedSurface = {
+      "openai-chat": "OPENAI_CHAT_COMPLETIONS",
+      "openai-responses": "OPENAI_RESPONSES",
+      "anthropic-messages": "ANTHROPIC_MESSAGES",
+    }[request.requestedSurface] as
+      | "OPENAI_CHAT_COMPLETIONS"
+      | "OPENAI_RESPONSES"
+      | "ANTHROPIC_MESSAGES";
+    const responsePath = new URL(request.path ?? "/v1/messages", "http://wsmp.invalid").pathname;
+    const responsesOperation = responsePath.endsWith("/input_items")
+      ? "listInputItems"
+      : responsePath.endsWith("/cancel")
+        ? "cancel"
+        : responsePath.endsWith("/compact")
+          ? "compact"
+          : responsePath.endsWith("/count_tokens")
+            ? "countTokens"
+            : /^\/v1\/responses\/[^/]+$/u.test(responsePath)
+              ? request.method === "DELETE"
+                ? "delete"
+                : "retrieve"
+              : "create";
+    const betaFeatures = (request.headers?.get("anthropic-beta") ?? "")
+      .split(",")
+      .map((beta) => beta.trim())
+      .filter(Boolean);
+    const resolved = resolveExecutionPath({
+      capabilities: target.capabilityInventory,
+      requestedSurface,
+      request: {
+        stream: request.stream,
+        responsesOperation,
+        countTokens:
+          request.requestedSurface === "anthropic-messages" &&
+          responsePath.endsWith("/count_tokens"),
+        protocolVersion: request.headers?.get("anthropic-version") ?? undefined,
+        betaFeatures,
+      },
+      adaptationEnabled: request.adaptationEnabled,
+    });
+    if (resolved.mode === "unavailable") return "PROTOCOL_UNAVAILABLE";
+  }
   if (target.nativeSurfaces.includes(request.requestedSurface)) return "COMPATIBLE";
   // OpenAI streams cannot provide Anthropic's required initial input usage.
   // Reject before provider commitment instead of failing the adapter after a
@@ -398,6 +450,9 @@ function targetProtocol(providerType: string): ProviderProtocol | null {
 }
 
 function nativeProtocols(value: unknown): ProviderProtocol[] {
+  const inventory = parseOpenAiCompatibleCapabilities(value);
+  if (inventory?.version === 4)
+    return [inventory.protocol === "anthropic-compatible" ? "anthropic" : "openai"];
   if (!value || typeof value !== "object") return [];
   const record = value as Record<string, unknown>;
   const values = Array.isArray(record.protocols) ? record.protocols : [];
@@ -408,6 +463,14 @@ function nativeProtocols(value: unknown): ProviderProtocol[] {
 }
 
 function nativeSurfaces(value: unknown): ProtocolSurface[] {
+  const inventory = parseOpenAiCompatibleCapabilities(value);
+  if (inventory?.version === 4) {
+    return [
+      ...(inventory.surfaces.openaiChatCompletions ? (["openai-chat"] as const) : []),
+      ...(inventory.surfaces.openaiResponses ? (["openai-responses"] as const) : []),
+      ...(inventory.surfaces.anthropicMessages ? (["anthropic-messages"] as const) : []),
+    ];
+  }
   if (!value || typeof value !== "object") return [];
   const values = (value as Record<string, unknown>).surfaces;
   if (!Array.isArray(values)) return [];
@@ -418,6 +481,9 @@ function nativeSurfaces(value: unknown): ProtocolSurface[] {
 }
 
 function supportsStreaming(value: unknown): boolean {
+  const inventory = parseOpenAiCompatibleCapabilities(value);
+  if (inventory?.version === 4)
+    return Object.values(inventory.surfaces).some((surface) => surface?.streaming === true);
   return Boolean(
     value && typeof value === "object" && (value as Record<string, unknown>).streaming === true,
   );
@@ -566,6 +632,7 @@ export async function listPublicOverflowTargets(
         nativeSurfaces: nativeSurfaces(model.nativeCapabilities),
         supportsStreaming: supportsStreaming(model.nativeCapabilities),
         supportedFeatures: supportedFeatures(model.nativeCapabilities),
+        capabilityInventory: parseOpenAiCompatibleCapabilities(model.nativeCapabilities),
         credential,
       } satisfies PublicProviderTarget,
     ];

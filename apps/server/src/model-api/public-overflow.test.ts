@@ -35,6 +35,60 @@ const request = {
 };
 
 describe("public overflow compatibility", () => {
+  it("fails closed on v4 operation and Anthropic version/beta mismatches", () => {
+    const target = {
+      contextWindow: 1_000,
+      maxOutputTokens: 100,
+      protocol: "anthropic" as const,
+      nativeProtocols: ["anthropic" as const],
+      nativeSurfaces: ["anthropic-messages" as const],
+      supportsStreaming: true,
+      supportedFeatures: [],
+      capabilityInventory: {
+        version: 4 as const,
+        protocol: "anthropic-compatible" as const,
+        surfaces: {
+          anthropicMessages: {
+            source: "provider" as const,
+            confidence: "exact" as const,
+            operations: ["create" as const],
+            streaming: true,
+            protocolVersions: [{ version: "2023-06-01", betaFeatures: ["cache-2026-01-01"] }],
+          },
+        },
+      },
+    };
+    const headers = new Headers({ "anthropic-version": "2023-06-01" });
+    expect(
+      publicTargetCompatibility(target, {
+        ...request,
+        requestedProtocol: "anthropic",
+        requestedSurface: "anthropic-messages",
+        path: "/v1/messages",
+        headers,
+      }),
+    ).toBe("COMPATIBLE");
+    expect(
+      publicTargetCompatibility(target, {
+        ...request,
+        requestedProtocol: "anthropic",
+        requestedSurface: "anthropic-messages",
+        path: "/v1/messages/count_tokens",
+        headers,
+      }),
+    ).toBe("PROTOCOL_UNAVAILABLE");
+    headers.set("anthropic-beta", "unsupported-beta");
+    expect(
+      publicTargetCompatibility(target, {
+        ...request,
+        requestedProtocol: "anthropic",
+        requestedSurface: "anthropic-messages",
+        path: "/v1/messages",
+        headers,
+      }),
+    ).toBe("PROTOCOL_UNAVAILABLE");
+  });
+
   it("matches provider Responses bindings only on the full immutable native tuple", () => {
     const target = {
       executionTargetId: "execution-target",

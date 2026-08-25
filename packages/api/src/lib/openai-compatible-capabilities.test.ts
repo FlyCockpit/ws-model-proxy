@@ -88,6 +88,55 @@ describe("supportsChatCompletions", () => {
   });
 });
 
+describe("capability inventory v4", () => {
+  const v4 = {
+    version: 4,
+    protocol: "openai-compatible",
+    surfaces: {
+      openaiChatCompletions: {
+        source: "provider",
+        confidence: "exact",
+        operations: ["create"],
+        inputImages: true,
+      },
+    },
+  } as const;
+
+  it("derives support from exact operations while retaining old readers", () => {
+    const parsed = parseOpenAiCompatibleCapabilities(v4);
+    expect(parsed?.version).toBe(4);
+    expect(supportsChatCompletions({ capabilities: parsed })).toBe(true);
+    expect(transformerSupportedModalities(parsed)).toEqual({
+      images: true,
+      audio: false,
+      video: false,
+    });
+    expect(parseOpenAiCompatibleCapabilities(endpointCaps)?.version).toBe(1);
+  });
+
+  it("rejects unknown, duplicate, and legacy boolean operation declarations", () => {
+    for (const operations of [["unknown"], ["create", "create"]]) {
+      expect(
+        parseOpenAiCompatibleCapabilities({
+          ...v4,
+          surfaces: { openaiChatCompletions: { ...v4.surfaces.openaiChatCompletions, operations } },
+        }),
+      ).toBeNull();
+    }
+    expect(
+      parseOpenAiCompatibleCapabilities({
+        ...v4,
+        surfaces: {
+          openaiChatCompletions: {
+            ...v4.surfaces.openaiChatCompletions,
+            supported: true,
+          },
+        },
+      }),
+    ).toBeNull();
+  });
+});
+
 describe("openAiCapabilitiesFromCoarse", () => {
   it("preserves embeddings and responses while enabling vision", () => {
     const caps = openAiCapabilitiesFromCoarse([

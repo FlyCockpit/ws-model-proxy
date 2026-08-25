@@ -4,6 +4,7 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
+import { openAiCompatibleCapabilitiesSchema } from "../lib/openai-compatible-capabilities";
 import {
   decryptProviderCredential,
   encryptProviderCredential,
@@ -179,7 +180,7 @@ const modelInput = z.object({
   upstreamModelId: z.string().trim().min(1).max(255),
   displayName: z.string().trim().min(1).max(255).nullable().optional(),
   capabilityMetadata: json,
-  nativeCapabilities: json,
+  nativeCapabilities: openAiCompatibleCapabilitiesSchema.nullable().optional(),
   contextWindow: z.number().int().positive().nullable().optional(),
   maxOutputTokens: z.number().int().positive().nullable().optional(),
   concurrencyLimit: z.number().int().positive().nullable().optional(),

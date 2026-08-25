@@ -1,5 +1,9 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  type OpenAiCompatibleCapabilities,
+  parseOpenAiCompatibleCapabilities,
+} from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
@@ -55,7 +59,73 @@ const credentialFormSchema = z.object({
 const createModelFormSchema = z.object({
   upstreamModelId: z.string().trim().min(1, "required").max(255, "tooLong"),
   displayName: z.string().trim().max(255, "tooLong"),
+  nativeSurface: z.enum([
+    "OPENAI_CHAT_COMPLETIONS",
+    "OPENAI_RESPONSES",
+    "ANTHROPIC_MESSAGES",
+    "OPENAI_COMPLETIONS",
+  ]),
+  streaming: z.boolean(),
+  anthropicVersion: z.string().trim().min(1, "required").max(64, "tooLong"),
+  betaFeatures: z.string().max(4096, "tooLong"),
 });
+
+type ProviderNativeSurface = z.infer<typeof createModelFormSchema>["nativeSurface"];
+
+export function providerCapabilityInventory(input: {
+  nativeSurface: ProviderNativeSurface;
+  streaming: boolean;
+  anthropicVersion: string;
+  betaFeatures: string;
+}): OpenAiCompatibleCapabilities {
+  const common = { source: "dashboard" as const, confidence: "exact" as const };
+  if (input.nativeSurface === "ANTHROPIC_MESSAGES") {
+    const betaFeatures = [
+      ...new Set(
+        input.betaFeatures
+          .split(",")
+          .map((v) => v.trim())
+          .filter(Boolean),
+      ),
+    ];
+    return {
+      version: 4 as const,
+      protocol: "anthropic-compatible" as const,
+      surfaces: {
+        anthropicMessages: {
+          ...common,
+          operations: ["create", "countTokens"],
+          streaming: input.streaming,
+          protocolVersions: [{ version: input.anthropicVersion, betaFeatures }],
+        },
+      },
+    };
+  }
+  const surface = { ...common, operations: ["create"], streaming: input.streaming };
+  const inventory = {
+    version: 4 as const,
+    protocol: "openai-compatible" as const,
+    surfaces:
+      input.nativeSurface === "OPENAI_RESPONSES"
+        ? { openaiResponses: surface }
+        : input.nativeSurface === "OPENAI_COMPLETIONS"
+          ? { openaiCompletions: surface }
+          : { openaiChatCompletions: surface },
+  };
+  const parsed = parseOpenAiCompatibleCapabilities(inventory);
+  if (!parsed) throw new Error("Invalid provider capability inventory");
+  return parsed;
+}
+
+function capabilitySummary(value: unknown): string | null {
+  const parsed = parseOpenAiCompatibleCapabilities(value);
+  if (!parsed) return null;
+  if (parsed.version !== 4) return `v${parsed.version}`;
+  return Object.entries(parsed.surfaces)
+    .filter(([, surface]) => surface)
+    .map(([name, surface]) => `${name}: ${(surface?.operations ?? []).join(", ")}`)
+    .join(" · ");
+}
 const optionalPositiveInteger = z.union([
   z.literal(""),
   z.string().regex(/^[1-9]\d*$/u, "positiveInteger"),
@@ -487,7 +557,14 @@ export function ProviderOperationsSection() {
     },
   });
   const createModelForm = useForm({
-    defaultValues: { upstreamModelId: "", displayName: "" },
+    defaultValues: {
+      upstreamModelId: "",
+      displayName: "",
+      nativeSurface: "OPENAI_CHAT_COMPLETIONS" as ProviderNativeSurface,
+      streaming: true,
+      anthropicVersion: "2023-06-01",
+      betaFeatures: "",
+    },
     validators: { onSubmit: createModelFormSchema },
     onSubmit: async ({ value }) => {
       await createModel.mutateAsync({
@@ -495,7 +572,7 @@ export function ProviderOperationsSection() {
         upstreamModelId: value.upstreamModelId,
         displayName: value.displayName || null,
         capabilityMetadata: null,
-        nativeCapabilities: null,
+        nativeCapabilities: providerCapabilityInventory(value),
         contextWindow: null,
         maxOutputTokens: null,
         concurrencyLimit: null,
@@ -818,6 +895,75 @@ export function ProviderOperationsSection() {
                       </Field>
                     )}
                   </createModelForm.Field>
+                  <createModelForm.Field name="nativeSurface">
+                    {(field) => (
+                      <Field label={t("dashboard:providers.fields.nativeSurface")}>
+                        <select
+                          className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+                          value={field.state.value}
+                          onChange={(event) =>
+                            field.handleChange(event.target.value as typeof field.state.value)
+                          }
+                        >
+                          {[
+                            "OPENAI_CHAT_COMPLETIONS",
+                            "OPENAI_RESPONSES",
+                            "ANTHROPIC_MESSAGES",
+                            "OPENAI_COMPLETIONS",
+                          ].map((surface) => (
+                            <option key={surface} value={surface}>
+                              {t(`dashboard:models.surfaces.${surface}`)}
+                            </option>
+                          ))}
+                        </select>
+                      </Field>
+                    )}
+                  </createModelForm.Field>
+                  <createModelForm.Field name="streaming">
+                    {(field) => (
+                      <label className="flex min-h-11 items-center gap-3 text-sm">
+                        <input
+                          type="checkbox"
+                          checked={field.state.value}
+                          onChange={(event) => field.handleChange(event.target.checked)}
+                        />
+                        {t("dashboard:providers.fields.streaming")}
+                      </label>
+                    )}
+                  </createModelForm.Field>
+                  <createModelForm.Subscribe selector={(state) => state.values.nativeSurface}>
+                    {(nativeSurface) =>
+                      nativeSurface === "ANTHROPIC_MESSAGES" ? (
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <createModelForm.Field name="anthropicVersion">
+                            {(field) => (
+                              <Field
+                                errors={field.state.meta.errors}
+                                label={t("dashboard:providers.fields.anthropicVersion")}
+                              >
+                                <Input
+                                  value={field.state.value}
+                                  onBlur={field.handleBlur}
+                                  onChange={(event) => field.handleChange(event.target.value)}
+                                />
+                              </Field>
+                            )}
+                          </createModelForm.Field>
+                          <createModelForm.Field name="betaFeatures">
+                            {(field) => (
+                              <Field label={t("dashboard:providers.fields.anthropicBetas")}>
+                                <Input
+                                  value={field.state.value}
+                                  onBlur={field.handleBlur}
+                                  onChange={(event) => field.handleChange(event.target.value)}
+                                />
+                              </Field>
+                            )}
+                          </createModelForm.Field>
+                        </div>
+                      ) : null
+                    }
+                  </createModelForm.Subscribe>
                   <Button type="submit" size="touch" disabled={createModel.isPending}>
                     <Plus className="size-4" />
                     {t("dashboard:providers.actions.addModel")}
@@ -844,6 +990,10 @@ export function ProviderOperationsSection() {
                           <p className="truncate text-xs text-muted-foreground">
                             {model.pricingVersion || t("dashboard:providers.noActivePricing")} ·{" "}
                             {t(`dashboard:providers.enums.${model.healthStatus}`)}
+                          </p>
+                          <p className="truncate text-xs text-muted-foreground">
+                            {capabilitySummary(model.nativeCapabilities) ??
+                              t("dashboard:providers.noCapabilities")}
                           </p>
                         </div>
                         <div className="flex shrink-0 flex-wrap gap-2">

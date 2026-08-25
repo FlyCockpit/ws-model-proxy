@@ -715,6 +715,7 @@
     "audit": "Auditoría del propietario",
     "noAttempts": "No hay eventos de intentos en esta ventana.",
     "noAudit": "No hay eventos de auditoría para esta cuenta.",
+    "noCapabilities": "No hay un inventario validado de capacidades nativas",
     "visibilityDisclosure": "Quien tenga un token de API de modelo o un permiso de pool visible puede provocar que las solicitudes salgan del despliegue y consuman los presupuestos adjuntos.",
     "fields": {
       "label": "Etiqueta de cuenta",
@@ -724,6 +725,10 @@
       "secret": "Secreto del proveedor",
       "replacementSecret": "Secreto de reemplazo",
       "upstreamModel": "ID de modelo ascendente",
+      "nativeSurface": "Superficie de API nativa",
+      "streaming": "Admite streaming",
+      "anthropicVersion": "Versión del protocolo Anthropic",
+      "anthropicBetas": "Betas de Anthropic permitidas (separadas por comas)",
       "displayName": "Nombre visible (opcional)",
       "model": "Modelo del proveedor",
       "pricingVersion": "Versión de precios",

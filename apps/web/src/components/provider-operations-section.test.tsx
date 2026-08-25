@@ -16,6 +16,7 @@ import {
   providerAccountFormSchema,
   providerBudgetFormSchema,
   providerBudgetRules,
+  providerCapabilityInventory,
 } from "./provider-operations-section";
 
 const unlimitedBudget = {
@@ -51,6 +52,38 @@ function findElement(
 }
 
 describe("ProviderOperationsSection form workflows", () => {
+  it("builds strict v4 native inventories including version-scoped Anthropic betas", () => {
+    expect(
+      providerCapabilityInventory({
+        nativeSurface: "OPENAI_RESPONSES",
+        streaming: true,
+        anthropicVersion: "2023-06-01",
+        betaFeatures: "",
+      }),
+    ).toMatchObject({
+      version: 4,
+      protocol: "openai-compatible",
+      surfaces: { openaiResponses: { operations: ["create"], streaming: true } },
+    });
+    expect(
+      providerCapabilityInventory({
+        nativeSurface: "ANTHROPIC_MESSAGES",
+        streaming: false,
+        anthropicVersion: "2023-06-01",
+        betaFeatures: "cache-beta, tools-beta, cache-beta",
+      }),
+    ).toMatchObject({
+      version: 4,
+      protocol: "anthropic-compatible",
+      surfaces: {
+        anthropicMessages: {
+          operations: ["create", "countTokens"],
+          protocolVersions: [{ version: "2023-06-01", betaFeatures: ["cache-beta", "tools-beta"] }],
+        },
+      },
+    });
+  });
+
   it("rejects invalid account setup and accepts a valid HTTPS account", () => {
     expect(
       providerAccountFormSchema.safeParse({

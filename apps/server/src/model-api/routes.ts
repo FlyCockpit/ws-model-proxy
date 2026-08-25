@@ -1109,7 +1109,7 @@ function supportsCapability({
   }
 
   if (capability === "messages.create" || capability === "messages.countTokens") {
-    if (capabilities?.version !== 3) return false;
+    if (capabilities?.version !== 3 && capabilities?.version !== 4) return false;
     const result = resolveExecutionPath({
       capabilities,
       requestedSurface: "ANTHROPIC_MESSAGES",
@@ -1124,7 +1124,7 @@ function supportsCapability({
   }
 
   if (capability === "responses.statefulFollowUps") {
-    if (capabilities?.version === 3)
+    if (capabilities?.version === 3 || capabilities?.version === 4)
       return (
         resolveExecutionPath({
           capabilities,
@@ -1136,7 +1136,7 @@ function supportsCapability({
   }
 
   if (capability === "responses.retrieve") {
-    if (capabilities?.version === 3)
+    if (capabilities?.version === 3 || capabilities?.version === 4)
       return (
         resolveExecutionPath({
           capabilities,
@@ -1148,7 +1148,7 @@ function supportsCapability({
   }
 
   if (capability === "responses.delete") {
-    if (capabilities?.version === 3)
+    if (capabilities?.version === 3 || capabilities?.version === 4)
       return (
         resolveExecutionPath({
           capabilities,
@@ -1160,7 +1160,7 @@ function supportsCapability({
   }
 
   if (capability === "responses.cancel") {
-    if (capabilities?.version === 3)
+    if (capabilities?.version === 3 || capabilities?.version === 4)
       return (
         resolveExecutionPath({
           capabilities,
@@ -1172,7 +1172,7 @@ function supportsCapability({
   }
 
   if (capability === "responses.listInputItems") {
-    if (capabilities?.version === 3)
+    if (capabilities?.version === 3 || capabilities?.version === 4)
       return (
         resolveExecutionPath({
           capabilities,
@@ -1184,7 +1184,7 @@ function supportsCapability({
   }
 
   if (capability === "responses.countTokens") {
-    if (capabilities?.version === 3)
+    if (capabilities?.version === 3 || capabilities?.version === 4)
       return (
         resolveExecutionPath({
           capabilities,
@@ -1195,7 +1195,7 @@ function supportsCapability({
     return capabilities?.responses?.countTokens === true;
   }
 
-  if (capabilities?.version === 3)
+  if (capabilities?.version === 3 || capabilities?.version === 4)
     return (
       resolveExecutionPath({
         capabilities,

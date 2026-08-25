@@ -23,6 +23,26 @@ const anthropic = parseOpenAiCompatibleCapabilities({
   confidence: "exact",
 });
 
+const anthropicV4 = parseOpenAiCompatibleCapabilities({
+  version: 4,
+  protocol: "anthropic-compatible",
+  surfaces: {
+    anthropicMessages: {
+      source: "provider",
+      confidence: "exact",
+      operations: ["create", "countTokens"],
+      streaming: true,
+      protocolVersions: [
+        {
+          version: "2023-06-01",
+          betaFeatures: ["prompt-caching-2024-07-31"],
+        },
+        { version: "2025-01-01", betaFeatures: [] },
+      ],
+    },
+  },
+});
+
 describe("surface capability resolution", () => {
   it("accepts and rejects the shared v3 wire fixtures", () => {
     for (const fixture of wireFixtures.valid)
@@ -38,6 +58,32 @@ describe("surface capability resolution", () => {
       parseOpenAiCompatibleCapabilities({ version: 2, protocol: "openai-compatible" }),
     ).not.toBeNull();
     expect(anthropic?.version).toBe(3);
+  });
+
+  it("gates v4 Anthropic operations, versions, and version-scoped betas exactly", () => {
+    expect(
+      resolveExecutionPath({
+        capabilities: anthropicV4,
+        requestedSurface: "ANTHROPIC_MESSAGES",
+        request: {
+          countTokens: true,
+          protocolVersion: "2023-06-01",
+          betaFeatures: ["prompt-caching-2024-07-31"],
+        },
+      }).mode,
+    ).toBe("native");
+    for (const request of [
+      { protocolVersion: "2099-01-01" },
+      { protocolVersion: "2025-01-01", betaFeatures: ["prompt-caching-2024-07-31"] },
+    ]) {
+      expect(
+        resolveExecutionPath({
+          capabilities: anthropicV4,
+          requestedSurface: "ANTHROPIC_MESSAGES",
+          request,
+        }).mode,
+      ).toBe("unavailable");
+    }
   });
 
   it("reports native, adapted, and unavailable surfaces", () => {
