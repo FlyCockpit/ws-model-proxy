@@ -118,6 +118,20 @@ describe("opaque native provider response headers", () => {
       ),
     ).toBeNull();
   });
+
+  it.each([undefined, "text/html", "application/octet-stream"])(
+    "does not preserve compression for non-JSON/SSE content type %s",
+    (contentType) => {
+      const headers = providerResponseHeaders(
+        {
+          ...(contentType ? { "content-type": contentType } : {}),
+          "content-encoding": "gzip",
+        },
+        true,
+      );
+      expect(headers.get("content-encoding")).toBeNull();
+    },
+  );
 });
 
 it("applies explicit native and adapted Chat Test modes to provider targets", () => {

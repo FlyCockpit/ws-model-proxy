@@ -841,6 +841,16 @@ function validatedContentEncoding(value: string | string[] | undefined): string 
   return encodings.join(", ");
 }
 
+function isOpaqueJsonOrSseContentType(value: string | string[] | undefined): boolean {
+  if (value === undefined || Array.isArray(value)) return false;
+  const mediaType = value.split(";", 1)[0]?.trim().toLowerCase();
+  return (
+    mediaType === "application/json" ||
+    mediaType === "text/event-stream" ||
+    (mediaType?.startsWith("application/") === true && mediaType.endsWith("+json"))
+  );
+}
+
 export function providerResponseHeaders(
   headers: import("node:http").IncomingHttpHeaders,
   preserveOpaqueRepresentation: boolean,
@@ -875,7 +885,7 @@ export function providerResponseHeaders(
   // decompression. Preserve a validated encoding only when those exact bytes
   // are passed through natively. Adapted responses are decoded and rendered,
   // so their representation validators and encoding must be stripped.
-  if (preserveOpaqueRepresentation) {
+  if (preserveOpaqueRepresentation && isOpaqueJsonOrSseContentType(headers["content-type"])) {
     const encoding = validatedContentEncoding(headers["content-encoding"]);
     if (encoding) result.set("content-encoding", encoding);
   }
