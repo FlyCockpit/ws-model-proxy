@@ -166,7 +166,7 @@
       "title": "Enrutamiento según caché",
       "description": "Prefiere un entorno que quizá conserve un prefijo de solicitud coincidente y permite que la carga actual supere coincidencias débiles.",
       "enabled": "Activar afinidad de caché opcional",
-      "stats": "{{records}} registros activos en {{targets}} destinos; {{confirmed}} confirmados por el motor",
+      "stats": "{{records}} registros activos en {{targets}} destinos",
       "clear": "Borrar registros de afinidad",
       "privacy": "Solo se guardan resúmenes HMAC por inquilino y metadatos de enrutamiento sin solicitudes. Una coincidencia predice la residencia en caché; no la confirma.",
       "fields": {
@@ -174,7 +174,6 @@
         "affinityMaxRecords": "Máximo de registros por destino",
         "affinityPrefixWeight": "Peso por profundidad del prefijo",
         "affinityConversationWeight": "Peso de conversación",
-        "affinityConfirmedCacheWeight": "Peso de caché confirmada",
         "affinityLoadPenaltyWeight": "Penalización por carga activa"
       }
     },
@@ -383,6 +382,7 @@
     "requestBytes": "Bytes de solicitud",
     "responseBytes": "Bytes de respuesta",
     "attempts": "Intentos",
+    "affinity": "Afinidad / puntuación / profundidad",
     "status": "Estado",
     "title": "Metadatos de relay",
     "tokenPrefix": "Prefijo del token",

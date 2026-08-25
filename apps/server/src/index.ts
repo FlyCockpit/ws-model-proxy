@@ -42,6 +42,7 @@ import {
   createMediaSignHandler,
   createMediaUploadHandler,
 } from "./media/routes.js";
+import { startCacheAffinityCleanup } from "./model-api/cache-affinity-runtime.js";
 import { createProductionCapacityRuntime } from "./model-api/capacity/production-runtime.js";
 import { createChatTestRoutes } from "./model-api/chat-test.js";
 import {
@@ -614,6 +615,7 @@ const server = serve(
 // bytes). No-op when media storage is not configured. Complements the lazy
 // delete-on-GET in media/routes.ts.
 const stopMediaCleanup = startMediaCleanup();
+const stopCacheAffinityCleanup = startCacheAffinityCleanup();
 const stopProviderBudgetRepair = startProviderBudgetRepair();
 const stopProviderAttemptExpiry = providerAttemptExpiryEnabled(
   env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
@@ -634,6 +636,7 @@ async function shutdown(signal: string) {
 
   // Stop the media cleanup timer so it can't fire mid-shutdown.
   stopMediaCleanup?.();
+  stopCacheAffinityCleanup();
   stopProviderBudgetRepair();
   stopProviderAttemptExpiry?.();
   await capacityLifecycle?.close();

@@ -1,7 +1,7 @@
 import prisma from "@ws-model-proxy/db";
 import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
 
-const DIGEST_VERSION = 1;
+const DIGEST_VERSION = 2;
 const MAX_PREFIXES_PER_REQUEST = 64;
 const MAX_CANONICAL_BYTES = 2 * 1024 * 1024;
 
@@ -21,15 +21,60 @@ export type AffinityTarget = {
   poolMemberId: string;
   executionTargetId: string;
   targetIdentity: string;
+  capacityId: string;
+  hardConcurrencyLimit: number | null;
+  healthPenalty: number;
+  publicEgressPenalty: number;
+  costPenalty: number;
 };
 
 export type AffinityDecision = {
   orderedTargetIds: string[];
   scores: Record<string, number>;
   prefixDepths: Record<string, number>;
+  conversationMatches: Record<string, boolean>;
   reasons: Record<string, string>;
   matchedPrefixDepth: number;
 };
+
+export function buildAffinityTargetIdentity(parts: {
+  executionTargetId: string;
+  endpointIdentity: string;
+  upstreamModelId: string;
+  runtimeIdentityKey: string;
+  runtimeModel: string;
+  runtimeRevision: string | null;
+  tokenizer: string | null;
+  tokenizerVersion: string | null;
+  template: string | null;
+  templateVersion: string | null;
+  engine: string | null;
+  cacheNamespace: string | null;
+  requestedSurface: string;
+  nativeSurface: string;
+  mode: string;
+  adapterVersion: string;
+}) {
+  return [
+    "affinity-target:v2",
+    parts.executionTargetId,
+    parts.endpointIdentity,
+    parts.upstreamModelId,
+    parts.runtimeIdentityKey,
+    parts.runtimeModel,
+    parts.runtimeRevision ?? "",
+    parts.tokenizer ?? "",
+    parts.tokenizerVersion ?? "",
+    parts.template ?? "",
+    parts.templateVersion ?? "",
+    parts.engine ?? "",
+    parts.cacheNamespace ?? "",
+    parts.requestedSurface,
+    parts.nativeSurface,
+    parts.mode,
+    parts.adapterVersion,
+  ].join("\u001f");
+}
 
 function stableJson(value: JsonValue): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -81,7 +126,7 @@ export function affinityPrefixDigests({
   surface: string;
   payload: Record<string, unknown>;
   runtimeIdentity: string;
-}): { digests: string[]; conversationDigest: string | null } {
+}): { digests: string[]; conversationDigest: string } {
   const orderedSource = payload.input ?? payload.messages ?? payload.prompt;
   const ordered = Array.isArray(orderedSource)
     ? orderedSource
@@ -132,18 +177,18 @@ export function affinityPrefixDigests({
   const conversationSource = asJson(payload.conversation ?? payload.conversation_id);
   return {
     digests,
-    conversationDigest:
-      conversationSource === undefined
-        ? null
-        : hmacDigestForForwarderPurpose({
-            purpose: "cacheAffinity",
-            value: `binding:${bindingDigest}\nconversation:${stableJson(conversationSource)}`,
-          }),
+    conversationDigest: hmacDigestForForwarderPurpose({
+      purpose: "cacheAffinity",
+      value: `binding:${bindingDigest}\nconversation:${
+        conversationSource === undefined ? "none" : stableJson(conversationSource)
+      }`,
+    }),
   };
 }
 
 export async function rankAffinityTargets({
   ownerId,
+  resourceOwnerId,
   poolId,
   policy,
   surface,
@@ -152,6 +197,7 @@ export async function rankAffinityTargets({
   now = new Date(),
 }: {
   ownerId: string;
+  resourceOwnerId: string;
   poolId: string;
   policy: AffinityPolicy;
   surface: string;
@@ -163,6 +209,7 @@ export async function rankAffinityTargets({
     orderedTargetIds: targets.map(({ executionTargetId }) => executionTargetId),
     scores: {},
     prefixDepths: {},
+    conversationMatches: {},
     reasons: {},
     matchedPrefixDepth: 0,
   };
@@ -179,25 +226,22 @@ export async function rankAffinityTargets({
   ];
   const conversationDigests = [
     ...new Set(
-      [...materialByIdentity.values()].flatMap(({ conversationDigest }) =>
-        conversationDigest ? [conversationDigest] : [],
-      ),
+      [...materialByIdentity.values()].map(({ conversationDigest }) => conversationDigest),
     ),
   ];
   if (allDigests.length === 0 && conversationDigests.length === 0) return unchanged;
 
-  const [records, activeLoads] = await Promise.all([
+  const [records, activeLoads, waitingLoads] = await Promise.all([
     prisma.cacheAffinityRecord.findMany({
       where: {
-        userId: ownerId,
+        userId: resourceOwnerId,
+        tenantUserId: ownerId,
         poolId,
         expiresAt: { gt: now },
         executionTargetId: { in: targets.map(({ executionTargetId }) => executionTargetId) },
         OR: [
           ...(allDigests.length ? [{ prefixDigest: { in: allDigests } }] : []),
-          ...(conversationDigests.length
-            ? [{ conversationDigest: { in: conversationDigests } }]
-            : []),
+          { conversationDigest: { in: conversationDigests } },
         ],
       },
       select: {
@@ -210,16 +254,26 @@ export async function rankAffinityTargets({
       },
     }),
     prisma.capacityLease.groupBy({
-      by: ["executionTargetId"],
+      by: ["capacityId"],
       where: {
-        executionTargetId: { in: targets.map(({ executionTargetId }) => executionTargetId) },
+        capacityId: { in: targets.map(({ capacityId }) => capacityId) },
         state: "ACTIVE",
         expiresAt: { gt: now },
       },
       _count: { _all: true },
     }),
+    prisma.capacityWaiter.groupBy({
+      by: ["capacityId"],
+      where: {
+        capacityId: { in: targets.map(({ capacityId }) => capacityId) },
+        state: "WAITING",
+        OR: [{ deadlineAt: null }, { deadlineAt: { gt: now } }],
+      },
+      _count: { _all: true },
+    }),
   ]);
-  const loadByTarget = new Map(activeLoads.map((row) => [row.executionTargetId, row._count._all]));
+  const activeByCapacity = new Map(activeLoads.map((row) => [row.capacityId, row._count._all]));
+  const waitingByCapacity = new Map(waitingLoads.map((row) => [row.capacityId, row._count._all]));
   const scored = targets.map((target, originalIndex) => {
     const material = materialByIdentity.get(target.targetIdentity)!;
     const digestDepth = new Map(material.digests.map((digest, index) => [digest, index + 1]));
@@ -233,21 +287,26 @@ export async function rankAffinityTargets({
       0,
     );
     const conversation = compatible.some(
-      (record) =>
-        material.conversationDigest !== null &&
-        record.conversationDigest === material.conversationDigest,
+      (record) => record.conversationDigest === material.conversationDigest,
     );
     const confirmed = compatible.some(
       (record) =>
         (digestDepth.get(record.prefixDigest) ?? 0) === prefixDepth && record.engineCacheConfirmed,
     );
-    const load = loadByTarget.get(target.executionTargetId) ?? 0;
+    const active = activeByCapacity.get(target.capacityId) ?? 0;
+    const waiting = waitingByCapacity.get(target.capacityId) ?? 0;
+    const normalizedLoad = target.hardConcurrencyLimit
+      ? Math.ceil((active * 100) / target.hardConcurrencyLimit) + waiting * 100
+      : active * 100 + waiting * 100;
     const score =
       prefixDepth * policy.prefixWeight +
       (conversation ? policy.conversationWeight : 0) +
       (confirmed ? policy.confirmedCacheWeight : 0) -
-      load * policy.loadPenaltyWeight;
-    return { target, originalIndex, score, prefixDepth, conversation, confirmed, load };
+      Math.ceil((normalizedLoad * policy.loadPenaltyWeight) / 100) -
+      target.healthPenalty -
+      target.publicEgressPenalty -
+      target.costPenalty;
+    return { target, originalIndex, score, prefixDepth, conversation, confirmed, active, waiting };
   });
   scored.sort(
     (left, right) => right.score - left.score || left.originalIndex - right.originalIndex,
@@ -260,10 +319,13 @@ export async function rankAffinityTargets({
     prefixDepths: Object.fromEntries(
       scored.map(({ target, prefixDepth }) => [target.executionTargetId, prefixDepth]),
     ),
+    conversationMatches: Object.fromEntries(
+      scored.map(({ target, conversation }) => [target.executionTargetId, conversation]),
+    ),
     reasons: Object.fromEntries(
-      scored.map(({ target, prefixDepth, conversation, confirmed, load }) => [
+      scored.map(({ target, prefixDepth, conversation, confirmed, active, waiting }) => [
         target.executionTargetId,
-        `prefix:${prefixDepth};conversation:${conversation};confirmed:${confirmed};load:${load}`,
+        `prefix:${prefixDepth};conversation:${conversation};confirmed:${confirmed};active:${active};waiting:${waiting};healthPenalty:${target.healthPenalty};publicPenalty:${target.publicEgressPenalty};costPenalty:${target.costPenalty}`,
       ]),
     ),
     matchedPrefixDepth: Math.max(0, ...scored.map(({ prefixDepth }) => prefixDepth)),
@@ -272,6 +334,7 @@ export async function rankAffinityTargets({
 
 export async function rememberAffinity({
   ownerId,
+  resourceOwnerId,
   poolId,
   policy,
   surface,
@@ -282,6 +345,7 @@ export async function rememberAffinity({
   now = new Date(),
 }: {
   ownerId: string;
+  resourceOwnerId: string;
   poolId: string;
   policy: AffinityPolicy;
   surface: string;
@@ -305,26 +369,33 @@ export async function rememberAffinity({
     // requests cannot race past the configured bound.
     const lockedPool = await tx.$queryRaw<Array<{ id: string }>>`
       SELECT id FROM model_pool
-       WHERE id = ${poolId} AND "userId" = ${ownerId}
+       WHERE id = ${poolId} AND "userId" = ${resourceOwnerId}
        FOR UPDATE
     `;
     if (lockedPool.length !== 1) return;
     await tx.cacheAffinityRecord.deleteMany({
-      where: { userId: ownerId, poolId, expiresAt: { lte: now } },
+      where: {
+        userId: resourceOwnerId,
+        tenantUserId: ownerId,
+        poolId,
+        expiresAt: { lte: now },
+      },
     });
     for (const [index, prefixDigest] of material.digests.entries()) {
       await tx.cacheAffinityRecord.upsert({
         where: {
-          userId_poolId_executionTargetId_targetIdentity_prefixDigest: {
-            userId: ownerId,
+          tenantUserId_poolId_executionTargetId_targetIdentity_prefixDigest_conversationDigest: {
+            tenantUserId: ownerId,
             poolId,
             executionTargetId: target.executionTargetId,
             targetIdentity: target.targetIdentity,
             prefixDigest,
+            conversationDigest: material.conversationDigest,
           },
         },
         create: {
-          userId: ownerId,
+          userId: resourceOwnerId,
+          tenantUserId: ownerId,
           poolId,
           executionTargetId: target.executionTargetId,
           targetIdentity: target.targetIdentity,
@@ -344,7 +415,12 @@ export async function rememberAffinity({
       });
     }
     const overflow = await tx.cacheAffinityRecord.findMany({
-      where: { userId: ownerId, poolId, executionTargetId: target.executionTargetId },
+      where: {
+        userId: resourceOwnerId,
+        tenantUserId: ownerId,
+        poolId,
+        executionTargetId: target.executionTargetId,
+      },
       orderBy: [{ lastUsedAt: "desc" }, { id: "desc" }],
       skip: policy.maxRecords,
       select: { id: true },

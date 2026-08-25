@@ -72,6 +72,10 @@ export const relayMetadataRouter = {
           requestBytes: true,
           responseBytes: true,
           attemptCount: true,
+          affinityOutcome: true,
+          affinityScore: true,
+          affinityPrefixDepth: true,
+          affinityReason: true,
         },
       });
       return rows.map((row) => ({
@@ -97,6 +101,10 @@ export const relayMetadataRouter = {
         requestBytes: row.requestBytes === null ? null : Number(row.requestBytes),
         responseBytes: row.responseBytes === null ? null : Number(row.responseBytes),
         attemptCount: row.attemptCount,
+        affinityOutcome: row.affinityOutcome,
+        affinityScore: row.affinityScore,
+        affinityPrefixDepth: row.affinityPrefixDepth,
+        affinityReason: row.affinityReason,
       }));
     }),
 

@@ -105,14 +105,22 @@ ALTER TABLE model_pool ADD CONSTRAINT model_pool_affinity_policy_check CHECK (
   AND "affinityLoadPenaltyWeight" BETWEEN 0 AND 10000
 );
 
+-- Affinity is disposable prediction state. Version 2 adds requester tenancy,
+-- explicit execution-path identity, and multi-conversation uniqueness; old
+-- version-1 predictions cannot be safely reinterpreted and are discarded.
+DELETE FROM cache_affinity_record
+ WHERE "digestVersion" < 2 OR "tenantUserId" IS NULL OR "conversationDigest" IS NULL;
+ALTER TABLE cache_affinity_record ALTER COLUMN "tenantUserId" SET NOT NULL;
+ALTER TABLE cache_affinity_record ALTER COLUMN "conversationDigest" SET NOT NULL;
+
 ALTER TABLE cache_affinity_record DROP CONSTRAINT IF EXISTS cache_affinity_record_shape_check;
 ALTER TABLE cache_affinity_record ADD CONSTRAINT cache_affinity_record_shape_check CHECK (
-  "digestVersion" >= 1
+  "digestVersion" >= 2
   AND "prefixDepth" > 0 AND "prefixDepth" <= 64
   AND ("estimatedTokens" IS NULL OR "estimatedTokens" >= 0)
   AND "expiresAt" > "createdAt"
   AND length("prefixDigest") BETWEEN 32 AND 128
-  AND ("conversationDigest" IS NULL OR length("conversationDigest") BETWEEN 32 AND 128)
+  AND length("conversationDigest") BETWEEN 32 AND 128
   AND length("targetIdentity") BETWEEN 1 AND 2048
 );
 
@@ -120,6 +128,7 @@ CREATE OR REPLACE FUNCTION enforce_cache_affinity_identity_immutable()
 RETURNS trigger LANGUAGE plpgsql AS $cache_affinity_identity_immutable$
 BEGIN
   IF NEW."userId" IS DISTINCT FROM OLD."userId"
+    OR NEW."tenantUserId" IS DISTINCT FROM OLD."tenantUserId"
     OR NEW."poolId" IS DISTINCT FROM OLD."poolId"
     OR NEW."executionTargetId" IS DISTINCT FROM OLD."executionTargetId"
     OR NEW."targetIdentity" IS DISTINCT FROM OLD."targetIdentity"

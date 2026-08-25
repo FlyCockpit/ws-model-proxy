@@ -7,6 +7,7 @@ const db = vi.hoisted(() => ({
     upsert: vi.fn(),
   },
   capacityLease: { groupBy: vi.fn() },
+  capacityWaiter: { groupBy: vi.fn() },
   $transaction: vi.fn(),
   $queryRaw: vi.fn(),
 }));
@@ -18,6 +19,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
 
 import {
   affinityPrefixDigests,
+  buildAffinityTargetIdentity,
   rankAffinityTargets,
   rememberAffinity,
   sweepExpiredAffinity,
@@ -32,6 +34,21 @@ const policy = {
   confirmedCacheWeight: 250,
   loadPenaltyWeight: 100,
 };
+
+const target = (
+  executionTargetId: string,
+  targetIdentity: string,
+  capacityId = executionTargetId,
+) => ({
+  poolMemberId: `member-${executionTargetId}`,
+  executionTargetId,
+  targetIdentity,
+  capacityId,
+  hardConcurrencyLimit: 1,
+  healthPenalty: 0,
+  publicEgressPenalty: 0,
+  costPenalty: 0,
+});
 
 const payload = {
   model: "alias",
@@ -52,6 +69,7 @@ describe("cache affinity", () => {
     db.cacheAffinityRecord.deleteMany.mockResolvedValue({ count: 0 });
     db.cacheAffinityRecord.upsert.mockResolvedValue({});
     db.capacityLease.groupBy.mockResolvedValue([]);
+    db.capacityWaiter.groupBy.mockResolvedValue([]);
   });
 
   it("separates tenants, runtimes, surfaces, ordered content, tools, and parameters", () => {
@@ -97,17 +115,47 @@ describe("cache affinity", () => {
     expect(first.digests[0]).not.toContain("private input");
   });
 
+  it("invalidates identity across native surface, adapter, endpoint, and every runtime projection", () => {
+    const base = {
+      executionTargetId: "target",
+      endpointIdentity: "endpoint",
+      upstreamModelId: "model",
+      runtimeIdentityKey: "runtime-key",
+      runtimeModel: "runtime-model",
+      runtimeRevision: "revision",
+      tokenizer: "tokenizer",
+      tokenizerVersion: "tokenizer-version",
+      template: "template",
+      templateVersion: "template-version",
+      engine: "engine",
+      cacheNamespace: "namespace",
+      requestedSurface: "OPENAI_RESPONSES",
+      nativeSurface: "OPENAI_RESPONSES",
+      mode: "native",
+      adapterVersion: "native",
+    };
+    const baseline = buildAffinityTargetIdentity(base);
+    for (const [key, value] of Object.entries({
+      endpointIdentity: "other-endpoint",
+      runtimeModel: "other-runtime",
+      runtimeRevision: "other-revision",
+      tokenizer: "other-tokenizer",
+      tokenizerVersion: "other-tokenizer-version",
+      template: "other-template",
+      templateVersion: "other-template-version",
+      engine: "other-engine",
+      cacheNamespace: "other-namespace",
+      nativeSurface: "ANTHROPIC_MESSAGES",
+      mode: "adapted",
+      adapterVersion: "2.0.0",
+    })) {
+      expect(buildAffinityTargetIdentity({ ...base, [key]: value })).not.toBe(baseline);
+    }
+  });
+
   it("selects the longest compatible prefix but lets load override a weak match", async () => {
-    const targetA = {
-      poolMemberId: "member-a",
-      executionTargetId: "target-a",
-      targetIdentity: "runtime-a",
-    };
-    const targetB = {
-      poolMemberId: "member-b",
-      executionTargetId: "target-b",
-      targetIdentity: "runtime-b",
-    };
+    const targetA = target("target-a", "runtime-a", "capacity-a");
+    const targetB = target("target-b", "runtime-b", "capacity-b");
     const a = affinityPrefixDigests({
       ownerId: "owner",
       surface: "OPENAI_CHAT_COMPLETIONS",
@@ -138,12 +186,11 @@ describe("cache affinity", () => {
         engineCacheConfirmed: false,
       },
     ]);
-    db.capacityLease.groupBy.mockResolvedValue([
-      { executionTargetId: "target-b", _count: { _all: 2 } },
-    ]);
+    db.capacityLease.groupBy.mockResolvedValue([{ capacityId: "capacity-b", _count: { _all: 2 } }]);
 
     const result = await rankAffinityTargets({
       ownerId: "owner",
+      resourceOwnerId: "owner",
       poolId: "pool",
       policy,
       surface: "OPENAI_CHAT_COMPLETIONS",
@@ -156,24 +203,65 @@ describe("cache affinity", () => {
     expect(result.scores).toEqual({ "target-a": 100, "target-b": 0 });
   });
 
-  it("queries only unexpired owner-scoped records with target identities", async () => {
-    const now = new Date("2026-08-25T12:00:00.000Z");
-    await rankAffinityTargets({
+  it("does not let affinity outweigh queue, health, public-egress, and cost penalties", async () => {
+    const expensive = {
+      ...target("target-a", "runtime-a", "capacity-a"),
+      healthPenalty: 100,
+      publicEgressPenalty: 100,
+      costPenalty: 100,
+    };
+    const local = target("target-b", "runtime-b", "capacity-b");
+    const prefixes = affinityPrefixDigests({
       ownerId: "owner",
+      surface: "OPENAI_CHAT_COMPLETIONS",
+      payload,
+      runtimeIdentity: expensive.targetIdentity,
+    });
+    const deepestDigest = prefixes.digests[prefixes.digests.length - 1];
+    db.cacheAffinityRecord.findMany.mockResolvedValue([
+      {
+        executionTargetId: expensive.executionTargetId,
+        targetIdentity: expensive.targetIdentity,
+        prefixDigest: deepestDigest,
+        prefixDepth: prefixes.digests.length,
+        conversationDigest: prefixes.conversationDigest,
+        engineCacheConfirmed: false,
+      },
+    ]);
+    db.capacityWaiter.groupBy.mockResolvedValue([
+      { capacityId: expensive.capacityId, _count: { _all: 10 } },
+    ]);
+
+    const result = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
       poolId: "pool",
       policy,
       surface: "OPENAI_CHAT_COMPLETIONS",
       payload,
-      targets: [
-        { poolMemberId: "a", executionTargetId: "target-a", targetIdentity: "runtime-a" },
-        { poolMemberId: "b", executionTargetId: "target-b", targetIdentity: "runtime-b" },
-      ],
+      targets: [expensive, local],
+    });
+
+    expect(result.orderedTargetIds[0]).toBe(local.executionTargetId);
+  });
+
+  it("queries only unexpired owner-scoped records with target identities", async () => {
+    const now = new Date("2026-08-25T12:00:00.000Z");
+    await rankAffinityTargets({
+      ownerId: "grantee",
+      resourceOwnerId: "pool-owner",
+      poolId: "pool",
+      policy,
+      surface: "OPENAI_CHAT_COMPLETIONS",
+      payload,
+      targets: [target("target-a", "runtime-a"), target("target-b", "runtime-b")],
       now,
     });
     expect(db.cacheAffinityRecord.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({
-          userId: "owner",
+          userId: "pool-owner",
+          tenantUserId: "grantee",
           poolId: "pool",
           expiresAt: { gt: now },
         }),
@@ -185,25 +273,45 @@ describe("cache affinity", () => {
     db.cacheAffinityRecord.findMany.mockResolvedValue([{ id: "old" }]);
     const now = new Date("2026-08-25T12:00:00.000Z");
     await rememberAffinity({
-      ownerId: "owner",
+      ownerId: "grantee",
+      resourceOwnerId: "pool-owner",
       poolId: "pool",
       policy: { ...policy, maxRecords: 1 },
       surface: "OPENAI_CHAT_COMPLETIONS",
       payload,
-      target: {
-        poolMemberId: "member",
-        executionTargetId: "target",
-        targetIdentity: "runtime",
-      },
+      target: target("target", "runtime"),
       now,
     });
     const serializedWrites = JSON.stringify(db.cacheAffinityRecord.upsert.mock.calls);
     expect(serializedWrites).not.toContain("secret prompt");
     expect(serializedWrites).not.toContain("secret instructions");
     expect(serializedWrites).not.toContain("lookup");
+    expect(serializedWrites).toContain("grantee");
+    expect(serializedWrites).toContain("pool-owner");
     expect(db.cacheAffinityRecord.deleteMany).toHaveBeenCalledWith({
       where: { id: { in: ["old"] } },
     });
+  });
+
+  it("keeps the same prefix independently for multiple conversation digests", async () => {
+    for (const conversation of ["conversation-a", "conversation-b"]) {
+      await rememberAffinity({
+        ownerId: "owner",
+        resourceOwnerId: "owner",
+        poolId: "pool",
+        policy,
+        surface: "OPENAI_RESPONSES",
+        payload: { input: "shared prefix", conversation },
+        target: target("target", "runtime"),
+      });
+    }
+    const uniqueInputs = db.cacheAffinityRecord.upsert.mock.calls.map(
+      ([input]) =>
+        input.where
+          .tenantUserId_poolId_executionTargetId_targetIdentity_prefixDigest_conversationDigest
+          .conversationDigest,
+    );
+    expect(new Set(uniqueInputs).size).toBe(2);
   });
 
   it("sweeps expired rows in bounded batches", async () => {

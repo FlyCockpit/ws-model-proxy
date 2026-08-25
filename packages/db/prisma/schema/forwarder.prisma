@@ -959,22 +959,25 @@ model CacheAffinityRecord {
   lastUsedAt           DateTime        @default(now())
   expiresAt            DateTime
   userId               String
+  /// Requester tenant; may differ from userId for an explicitly granted pool.
+  tenantUserId         String?
   poolId               String
   executionTargetId    String
   targetIdentity       String
-  digestVersion        Int             @default(1)
+  digestVersion        Int             @default(2)
   prefixDigest         String
   conversationDigest   String?
   prefixDepth          Int
   estimatedTokens      Int?
   engineCacheConfirmed Boolean         @default(false)
   User                 User            @relation("CacheAffinityRecordOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  TenantUser           User?           @relation("CacheAffinityRecordTenant", fields: [tenantUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ModelPool            ModelPool       @relation(fields: [poolId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
   ExecutionTarget      ExecutionTarget @relation(fields: [executionTargetId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
 
-  @@unique([userId, poolId, executionTargetId, targetIdentity, prefixDigest])
-  @@index([userId, poolId, prefixDigest, expiresAt])
-  @@index([userId, poolId, conversationDigest, expiresAt])
+  @@unique([tenantUserId, poolId, executionTargetId, targetIdentity, prefixDigest, conversationDigest])
+  @@index([tenantUserId, poolId, prefixDigest, expiresAt])
+  @@index([tenantUserId, poolId, conversationDigest, expiresAt])
   @@index([userId, poolId, expiresAt])
   @@index([executionTargetId, expiresAt])
   @@map("cache_affinity_record")

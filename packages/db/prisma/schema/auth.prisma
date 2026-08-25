@@ -1,56 +1,57 @@
 model User {
-  id                        String                       @id @default(cuid(2))
-  createdAt                 DateTime                     @default(now())
-  updatedAt                 DateTime                     @default(now()) @updatedAt
-  name                      String
-  email                     String
-  slug                      String                       @unique @default(cuid(2))
-  emailVerified             Boolean                      @default(false)
-  image                     String?
+  id                         String                       @id @default(cuid(2))
+  createdAt                  DateTime                     @default(now())
+  updatedAt                  DateTime                     @default(now()) @updatedAt
+  name                       String
+  email                      String
+  slug                       String                       @unique @default(cuid(2))
+  emailVerified              Boolean                      @default(false)
+  image                      String?
   // Better-Auth's admin plugin stores role as a string and supports arbitrary
   // custom roles plus comma-separated multi-role values. Do not narrow this to
   // a Prisma enum unless you also drop those Better-Auth capabilities.
-  role                      String                       @default("user")
+  role                       String                       @default("user")
   // Preferred UI locale (BCP 47 tag). Synced into the i18n detection chain
   // ahead of localStorage / navigator so a signed-in user's choice follows
   // them across devices. Stored as String (not enum) because the supported-
   // locale set evolves outside the schema; new locales are added in
   // apps/web/src/i18n/config.ts without a Prisma migration.
-  locale                    String                       @default("en-US")
-  banned                    Boolean?
-  banReason                 String?
-  banExpires                DateTime?
-  twoFactorEnabled          Boolean?
-  operationalAlerts         Boolean                      @default(true)
-  sessions                  Session[]
-  accounts                  Account[]
-  twoFactors                TwoFactor[]
-  deviceCodes               DeviceCode[]
-  cliDevices                CliDevice[]                  @relation("CliDeviceOwner")
-  cliTokens                 CliToken[]                   @relation("CliTokenOwner")
-  cliDeviceCredentials      CliDeviceCredential[]        @relation("CliDeviceCredentialOwner")
-  endpoints                 Endpoint[]                   @relation("EndpointOwner")
-  discoveredModels          DiscoveredModel[]            @relation("DiscoveredModelOwner")
-  modelPools                ModelPool[]                  @relation("ModelPoolOwner")
-  ownedPoolGrants           PoolGrant[]                  @relation("PoolGrantOwner")
-  receivedPoolGrants        PoolGrant[]                  @relation("PoolGrantGrantee")
-  modelApiTokens            ModelApiToken[]              @relation("ModelApiTokenOwner")
-  responseStickinessRecords ResponseStickinessRecord[]   @relation("ResponseStickinessOwner")
-  relayRequests             RelayRequest[]               @relation("RelayRequestOwner")
-  mediaAssets               MediaAsset[]                 @relation("MediaAssetOwner")
-  providerAccounts          ProviderAccount[]            @relation("ProviderAccountOwner")
-  providerModels            ProviderModel[]              @relation("ProviderModelOwner")
-  providerCredentials       ProviderCredential[]         @relation("ProviderCredentialOwner")
-  providerBudgetPolicies    ProviderBudgetPolicy[]       @relation("ProviderBudgetPolicyOwner")
-  providerUsageLedger       ProviderUsageLedger[]        @relation("ProviderUsageLedgerOwner")
-  providerAttempts          ProviderAttempt[]            @relation("ProviderAttemptOwner")
-  providerAuditEvents       ProviderAuditEvent[]         @relation("ProviderAuditEventOwner")
-  providerAttemptEvents     PublicProviderAttemptEvent[] @relation("PublicProviderAttemptEventOwner")
-  executionTargets          ExecutionTarget[]            @relation("ExecutionTargetOwner")
-  inferenceCapacities       InferenceCapacity[]          @relation("InferenceCapacityOwner")
-  admissionRequests         AdmissionRequest[]           @relation("AdmissionRequestOwner")
-  capacityAuditEvents       CapacityAuditEvent[]         @relation("CapacityAuditEventOwner")
-  cacheAffinityRecords      CacheAffinityRecord[]        @relation("CacheAffinityRecordOwner")
+  locale                     String                       @default("en-US")
+  banned                     Boolean?
+  banReason                  String?
+  banExpires                 DateTime?
+  twoFactorEnabled           Boolean?
+  operationalAlerts          Boolean                      @default(true)
+  sessions                   Session[]
+  accounts                   Account[]
+  twoFactors                 TwoFactor[]
+  deviceCodes                DeviceCode[]
+  cliDevices                 CliDevice[]                  @relation("CliDeviceOwner")
+  cliTokens                  CliToken[]                   @relation("CliTokenOwner")
+  cliDeviceCredentials       CliDeviceCredential[]        @relation("CliDeviceCredentialOwner")
+  endpoints                  Endpoint[]                   @relation("EndpointOwner")
+  discoveredModels           DiscoveredModel[]            @relation("DiscoveredModelOwner")
+  modelPools                 ModelPool[]                  @relation("ModelPoolOwner")
+  ownedPoolGrants            PoolGrant[]                  @relation("PoolGrantOwner")
+  receivedPoolGrants         PoolGrant[]                  @relation("PoolGrantGrantee")
+  modelApiTokens             ModelApiToken[]              @relation("ModelApiTokenOwner")
+  responseStickinessRecords  ResponseStickinessRecord[]   @relation("ResponseStickinessOwner")
+  relayRequests              RelayRequest[]               @relation("RelayRequestOwner")
+  mediaAssets                MediaAsset[]                 @relation("MediaAssetOwner")
+  providerAccounts           ProviderAccount[]            @relation("ProviderAccountOwner")
+  providerModels             ProviderModel[]              @relation("ProviderModelOwner")
+  providerCredentials        ProviderCredential[]         @relation("ProviderCredentialOwner")
+  providerBudgetPolicies     ProviderBudgetPolicy[]       @relation("ProviderBudgetPolicyOwner")
+  providerUsageLedger        ProviderUsageLedger[]        @relation("ProviderUsageLedgerOwner")
+  providerAttempts           ProviderAttempt[]            @relation("ProviderAttemptOwner")
+  providerAuditEvents        ProviderAuditEvent[]         @relation("ProviderAuditEventOwner")
+  providerAttemptEvents      PublicProviderAttemptEvent[] @relation("PublicProviderAttemptEventOwner")
+  executionTargets           ExecutionTarget[]            @relation("ExecutionTargetOwner")
+  inferenceCapacities        InferenceCapacity[]          @relation("InferenceCapacityOwner")
+  admissionRequests          AdmissionRequest[]           @relation("AdmissionRequestOwner")
+  capacityAuditEvents        CapacityAuditEvent[]         @relation("CapacityAuditEventOwner")
+  cacheAffinityRecords       CacheAffinityRecord[]        @relation("CacheAffinityRecordOwner")
+  cacheAffinityTenantRecords CacheAffinityRecord[]        @relation("CacheAffinityRecordTenant")
 
   @@unique([email])
   @@index([slug])

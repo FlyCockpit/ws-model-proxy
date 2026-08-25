@@ -2067,7 +2067,6 @@ function PoolForm({
     affinityMaxRecords: z.number().int().min(100).max(100_000),
     affinityPrefixWeight: z.number().int().min(0).max(10_000),
     affinityConversationWeight: z.number().int().min(0).max(10_000),
-    affinityConfirmedCacheWeight: z.number().int().min(0).max(10_000),
     affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000),
   });
   const createPool = useMutation(
@@ -2153,7 +2152,6 @@ function PoolForm({
       affinityMaxRecords: pool?.affinity.maxRecords ?? 10_000,
       affinityPrefixWeight: pool?.affinity.prefixWeight ?? 100,
       affinityConversationWeight: pool?.affinity.conversationWeight ?? 150,
-      affinityConfirmedCacheWeight: pool?.affinity.confirmedCacheWeight ?? 250,
       affinityLoadPenaltyWeight: pool?.affinity.loadPenaltyWeight ?? 100,
     },
     validators: { onSubmit: poolSchema },
@@ -2192,7 +2190,6 @@ function PoolForm({
           affinityMaxRecords: value.affinityMaxRecords,
           affinityPrefixWeight: value.affinityPrefixWeight,
           affinityConversationWeight: value.affinityConversationWeight,
-          affinityConfirmedCacheWeight: value.affinityConfirmedCacheWeight,
           affinityLoadPenaltyWeight: value.affinityLoadPenaltyWeight,
         });
       } else if (pool) {
@@ -2239,7 +2236,6 @@ function PoolForm({
           affinityMaxRecords: value.affinityMaxRecords,
           affinityPrefixWeight: value.affinityPrefixWeight,
           affinityConversationWeight: value.affinityConversationWeight,
-          affinityConfirmedCacheWeight: value.affinityConfirmedCacheWeight,
           affinityLoadPenaltyWeight: value.affinityLoadPenaltyWeight,
         });
         await updatePoolPolicy.mutateAsync({
@@ -2399,7 +2395,6 @@ function PoolForm({
               "affinityMaxRecords",
               "affinityPrefixWeight",
               "affinityConversationWeight",
-              "affinityConfirmedCacheWeight",
               "affinityLoadPenaltyWeight",
             ] as const
           ).map((name) => (
@@ -2438,7 +2433,6 @@ function PoolForm({
               {t("dashboard:pools.affinity.stats", {
                 records: affinityStats.data?.activeRecords ?? 0,
                 targets: affinityStats.data?.targets.length ?? 0,
-                confirmed: affinityStats.data?.confirmedRecords ?? 0,
               })}
             </span>
             <Button
@@ -3890,7 +3884,7 @@ export function RelayMetadataSection() {
         <EmptyState>{t("dashboard:relay.empty")}</EmptyState>
       ) : (
         <WideContent className="rounded-md border">
-          <table className="w-full min-w-[900px] text-left text-xs">
+          <table className="w-full min-w-[1000px] text-left text-xs">
             <thead className="border-b text-muted-foreground">
               <tr>
                 <th className="p-3 font-medium">{t("dashboard:relay.createdAt")}</th>
@@ -3899,6 +3893,7 @@ export function RelayMetadataSection() {
                 <th className="p-3 font-medium">{t("dashboard:relay.requestBytes")}</th>
                 <th className="p-3 font-medium">{t("dashboard:relay.responseBytes")}</th>
                 <th className="p-3 font-medium">{t("dashboard:relay.attempts")}</th>
+                <th className="p-3 font-medium">{t("dashboard:relay.affinity")}</th>
                 <th className="p-3 font-medium">{t("dashboard:relay.tokenPrefix")}</th>
                 <th className="p-3 font-medium">{t("dashboard:relay.duration")}</th>
                 <th className="p-3 font-medium">{t("dashboard:relay.tokens")}</th>
@@ -3915,6 +3910,11 @@ export function RelayMetadataSection() {
                   <td className="p-3 align-top tabular-nums">{numberOrDash(row.requestBytes)}</td>
                   <td className="p-3 align-top tabular-nums">{numberOrDash(row.responseBytes)}</td>
                   <td className="p-3 align-top tabular-nums">{numberOrDash(row.attemptCount)}</td>
+                  <td className="p-3 align-top" title={row.affinityReason ?? undefined}>
+                    {row.affinityOutcome
+                      ? `${row.affinityOutcome} · ${row.affinityScore ?? 0} · ${row.affinityPrefixDepth ?? 0}`
+                      : "—"}
+                  </td>
                   <td className="p-3 align-top font-mono">
                     {row.modelApiTokenLookupPrefix ?? "—"}
                   </td>

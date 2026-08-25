@@ -166,7 +166,7 @@
       "title": "Cache-aware routing",
       "description": "Prefer a runtime that may still hold a matching prompt prefix, while letting current load override weak matches.",
       "enabled": "Enable optional cache affinity",
-      "stats": "{{records}} active records across {{targets}} targets; {{confirmed}} engine-confirmed",
+      "stats": "{{records}} active records across {{targets}} targets",
       "clear": "Clear affinity records",
       "privacy": "Only tenant-scoped HMAC digests and prompt-free routing metadata are stored. A match predicts cache residency; it does not prove it.",
       "fields": {
@@ -174,7 +174,6 @@
         "affinityMaxRecords": "Maximum records per target",
         "affinityPrefixWeight": "Prefix-depth weight",
         "affinityConversationWeight": "Conversation weight",
-        "affinityConfirmedCacheWeight": "Confirmed-cache weight",
         "affinityLoadPenaltyWeight": "Active-load penalty"
       }
     },
@@ -383,6 +382,7 @@
     "requestBytes": "Request bytes",
     "responseBytes": "Response bytes",
     "attempts": "Attempts",
+    "affinity": "Affinity / score / depth",
     "status": "Status",
     "title": "Relay Metadata",
     "tokenPrefix": "Token prefix",

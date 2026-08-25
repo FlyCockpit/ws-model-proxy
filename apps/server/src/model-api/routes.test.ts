@@ -15,6 +15,19 @@ vi.mock("@ws-model-proxy/db", async () => {
   return { default: mockDeep() };
 });
 
+const affinity = vi.hoisted(() => ({
+  rank: vi.fn(),
+  remember: vi.fn(),
+}));
+vi.mock("./cache-affinity.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./cache-affinity.js")>();
+  return {
+    ...actual,
+    rankAffinityTargets: affinity.rank,
+    rememberAffinity: affinity.remember,
+  };
+});
+
 // routes.ts now derives the responses-stickiness digest through
 // @ws-model-proxy/db/forwarder-security, which reads env.BETTER_AUTH_SECRET.
 // Mock the env module so the suite never runs real env validation.
@@ -328,6 +341,7 @@ function poolMemberRow({
   capacityContextMargin = 0,
   capacityWaitBudgetMode,
   capacityWaitBudgetMs,
+  affinityEnabled = false,
 }: {
   id: string;
   discoveredModelId: string;
@@ -343,6 +357,7 @@ function poolMemberRow({
   capacityContextMargin?: number;
   capacityWaitBudgetMode?: "INHERIT" | "LIMITED" | "UNLIMITED";
   capacityWaitBudgetMs?: number | null;
+  affinityEnabled?: boolean;
 }) {
   return {
     id,
@@ -360,11 +375,37 @@ function poolMemberRow({
     capacityContextMargin,
     capacityWaitBudgetMode,
     capacityWaitBudgetMs,
-    ModelPool: { capacityWaitBudgetMs: 30_000 },
+    ModelPool: {
+      capacityWaitBudgetMs: 30_000,
+      affinityEnabled,
+      affinityTtlSeconds: 3600,
+      affinityMaxRecords: 10_000,
+      affinityPrefixWeight: 100,
+      affinityConversationWeight: 150,
+      affinityConfirmedCacheWeight: 250,
+      affinityLoadPenaltyWeight: 100,
+    },
     ExecutionTarget: {
       id: `${id}-target`,
       inferenceCapacityId: `${id}-capacity`,
-      InferenceCapacity: physicalMaxContext === undefined ? null : { physicalMaxContext },
+      InferenceCapacity:
+        physicalMaxContext === undefined && !affinityEnabled
+          ? null
+          : {
+              id: `${id}-capacity`,
+              hardConcurrencyLimit: 4,
+              physicalMaxContext: physicalMaxContext ?? null,
+              countStrategy: "CONSERVATIVE_ESTIMATE",
+              runtimeIdentityKey: `${id}-runtime-key`,
+              runtimeModel: upstreamModelId,
+              runtimeRevision: "revision",
+              tokenizer: "tokenizer",
+              tokenizerVersion: "1",
+              template: "chat",
+              templateVersion: "1",
+              engine: "engine",
+              cacheNamespace: "cache",
+            },
       DiscoveredModel: null,
     },
     DiscoveredModel: {
@@ -485,6 +526,83 @@ describe("model API routes", () => {
     db.relayRequest.update.mockResolvedValue({ id: "relay-request-id" });
     db.responseStickinessRecord.findUnique.mockResolvedValue(null);
     db.responseStickinessRecord.upsert.mockResolvedValue({ id: "stickiness-id" });
+    affinity.rank.mockImplementation(async ({ targets }) => ({
+      orderedTargetIds: targets.map(
+        (target: { executionTargetId: string }) => target.executionTargetId,
+      ),
+      scores: {},
+      prefixDepths: {},
+      conversationMatches: {},
+      reasons: {},
+      matchedPrefixDepth: 0,
+    }));
+    affinity.remember.mockResolvedValue(undefined);
+  });
+
+  it("applies affinity only after pool compatibility and persists it after success", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "member-a",
+        discoveredModelId: "model-a",
+        upstreamModelId: "upstream-a",
+        cliDeviceId: "cli-a",
+        affinityEnabled: true,
+      }),
+      poolMemberRow({
+        id: "member-b",
+        discoveredModelId: "model-b",
+        upstreamModelId: "upstream-b",
+        cliDeviceId: "cli-b",
+        affinityEnabled: true,
+      }),
+    ]);
+    affinity.rank.mockResolvedValue({
+      orderedTargetIds: ["member-b-target", "member-a-target"],
+      scores: { "member-b-target": 200 },
+      prefixDepths: { "member-b-target": 2 },
+      conversationMatches: { "member-b-target": false },
+      reasons: { "member-b-target": "prefix:2;active:0;waiting:0" },
+      matchedPrefixDepth: 2,
+    });
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-a", "cli-b"];
+    const responsePromise = appWith(manager).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(poolTarget.modelId),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    expect(sent.endpointSlug).toBe("member-b-endpoint");
+    manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+    manager.body(sent.requestId, JSON.stringify({ id: "chatcmpl-affinity" }));
+    manager.complete(sent.requestId);
+    const response = await responsePromise;
+    await response.text();
+    await vi.waitFor(() => expect(affinity.remember).toHaveBeenCalledTimes(1));
+    expect(affinity.rank).toHaveBeenCalledWith(
+      expect.objectContaining({ ownerId: "user-id", resourceOwnerId: "user-id" }),
+    );
+    expect(affinity.remember).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ownerId: "user-id",
+        resourceOwnerId: "user-id",
+        target: expect.objectContaining({ executionTargetId: "member-b-target" }),
+      }),
+    );
+    expect(db.relayRequest.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          affinityOutcome: "PREDICTED_MATCH",
+          affinityScore: 200,
+          affinityPrefixDepth: 2,
+        }),
+      }),
+    );
   });
 
   it("adapts an opted-in Chat pool request through a Responses-only member", async () => {
@@ -3745,12 +3863,14 @@ describe("model API routes", () => {
           discoveredModelId: "model-a",
           upstreamModelId: "upstream-a",
           cliDeviceId: "cli-a",
+          affinityEnabled: true,
         }),
         poolMemberRow({
           id: "member-b",
           discoveredModelId: "model-b",
           upstreamModelId: "upstream-b",
           cliDeviceId: "cli-b",
+          affinityEnabled: true,
         }),
       ]);
       db.discoveredModel.findUnique.mockResolvedValue(
@@ -3781,6 +3901,7 @@ describe("model API routes", () => {
       expect(response.status).toBe(500);
       await response.text();
       expect(manager.sent).toHaveLength(1);
+      expect(affinity.rank).not.toHaveBeenCalled();
     },
   );
 

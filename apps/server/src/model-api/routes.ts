@@ -45,6 +45,7 @@ import {
 import {
   type AffinityDecision,
   type AffinityPolicy,
+  buildAffinityTargetIdentity,
   rankAffinityTargets,
   rememberAffinity,
 } from "./cache-affinity.js";
@@ -120,6 +121,7 @@ import {
   relayFailureHttpStatus,
 } from "./openai-errors.js";
 import {
+  ADAPTER_VERSION,
   AdapterError,
   adaptNonstreamResponse,
   CanonicalStreamRenderer,
@@ -541,6 +543,8 @@ type DirectModelRelayRow = {
     directContextMargin?: number;
     directWaitBudgetMs?: number | null;
     InferenceCapacity?: {
+      id: string;
+      hardConcurrencyLimit: number | null;
       physicalMaxContext: number | null;
       countStrategy: "TOKENIZER" | "TEMPLATE_AWARE" | "ENGINE_REPORTED" | "CONSERVATIVE_ESTIMATE";
       runtimeIdentityKey: string;
@@ -570,6 +574,8 @@ type PoolMemberRelayRow = PoolMemberRouteRow & {
     id: string;
     inferenceCapacityId: string | null;
     InferenceCapacity?: {
+      id: string;
+      hardConcurrencyLimit: number | null;
       physicalMaxContext: number | null;
       countStrategy: "TOKENIZER" | "TEMPLATE_AWARE" | "ENGINE_REPORTED" | "CONSERVATIVE_ESTIMATE";
       runtimeIdentityKey: string;
@@ -709,24 +715,51 @@ function affinityPolicyForMember(member: PoolMemberRelayRow): AffinityPolicy {
   };
 }
 
-function affinityTargetForMember(member: PoolMemberRelayRow) {
+function affinityTargetForMember(
+  member: PoolMemberRelayRow,
+  requestedSurface: ProtocolSurface,
+  execution: { mode: string; nativeSurface?: string } | null | undefined,
+) {
   const target = member.ExecutionTarget;
   const capacity = target?.InferenceCapacity;
   if (!target || !capacity) return null;
   // Target and endpoint IDs are immutable. The runtime identity includes the
   // model/revision/tokenizer/template/engine/cache namespace tuple.
-  const targetIdentity = [
-    "affinity-target:v1",
-    target.id,
-    member.DiscoveredModel.Endpoint.id,
-    member.DiscoveredModel.upstreamModelId,
-    capacity.runtimeIdentityKey,
-    capacity.cacheNamespace ?? "",
-  ].join("\u001f");
+  const targetIdentity = buildAffinityTargetIdentity({
+    executionTargetId: target.id,
+    endpointIdentity: member.DiscoveredModel.Endpoint.id,
+    upstreamModelId: member.DiscoveredModel.upstreamModelId,
+    runtimeIdentityKey: capacity.runtimeIdentityKey,
+    runtimeModel: capacity.runtimeModel,
+    runtimeRevision: capacity.runtimeRevision,
+    tokenizer: capacity.tokenizer,
+    tokenizerVersion: capacity.tokenizerVersion,
+    template: capacity.template,
+    templateVersion: capacity.templateVersion,
+    engine: capacity.engine,
+    cacheNamespace: capacity.cacheNamespace,
+    requestedSurface,
+    nativeSurface: execution?.nativeSurface ?? requestedSurface,
+    mode: execution?.mode ?? "legacy-native",
+    adapterVersion: execution?.mode === "adapted" ? ADAPTER_VERSION : "native",
+  });
+  const healthPenalty =
+    member.healthStatus === "HALF_OPEN"
+      ? 200
+      : member.healthStatus === "DEGRADED"
+        ? 100
+        : member.healthStatus === "UNKNOWN"
+          ? 25
+          : 0;
   return {
     poolMemberId: member.id,
     executionTargetId: target.id,
     targetIdentity,
+    capacityId: capacity.id,
+    hardConcurrencyLimit: capacity.hardConcurrencyLimit,
+    healthPenalty,
+    publicEgressPenalty: 0,
+    costPenalty: 0,
   };
 }
 
@@ -2246,6 +2279,8 @@ async function directModelRow(discoveredModelId: string): Promise<DirectModelRel
           directWaitBudgetMs: true,
           InferenceCapacity: {
             select: {
+              id: true,
+              hardConcurrencyLimit: true,
               physicalMaxContext: true,
               countStrategy: true,
               runtimeIdentityKey: true,
@@ -2318,6 +2353,8 @@ async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
           inferenceCapacityId: true,
           InferenceCapacity: {
             select: {
+              id: true,
+              hardConcurrencyLimit: true,
               physicalMaxContext: true,
               countStrategy: true,
               runtimeIdentityKey: true,
@@ -3409,13 +3446,16 @@ async function relayPool({
   if (requestedSurface && affinityPayload && affinityPolicy.enabled) {
     const affinityTargets = routeCandidates.flatMap((candidate) => {
       const member = memberById.get(candidate.poolMemberId);
-      const affinityTarget = member ? affinityTargetForMember(member) : null;
+      const affinityTarget = member
+        ? affinityTargetForMember(member, requestedSurface, executionByMember.get(member.id))
+        : null;
       return affinityTarget ? [affinityTarget] : [];
     });
     if (affinityTargets.length === routeCandidates.length) {
       try {
         affinityDecision = await rankAffinityTargets({
           ownerId: requester.userId,
+          resourceOwnerId: eligibleMembers[0]!.DiscoveredModel.userId,
           poolId: target.id,
           policy: affinityPolicy,
           surface: requestedSurface,
@@ -3959,13 +3999,18 @@ async function relayPool({
           ]);
           reportCleanupFailures(cleanup);
           const responseId = responseIdCapture?.finish(operation.stream) ?? null;
-          const affinityTarget = affinityTargetForMember(member);
+          const affinityTarget = requestedSurface
+            ? affinityTargetForMember(member, requestedSurface, executionByMember.get(member.id))
+            : null;
           const selectedAffinityScore = affinityTarget
             ? (affinityDecision?.scores[affinityTarget.executionTargetId] ?? 0)
             : 0;
           const selectedAffinityPrefixDepth = affinityTarget
             ? (affinityDecision?.prefixDepths[affinityTarget.executionTargetId] ?? 0)
             : 0;
+          const selectedConversationMatch = affinityTarget
+            ? (affinityDecision?.conversationMatches[affinityTarget.executionTargetId] ?? false)
+            : false;
           const selectedAffinityReason = affinityTarget
             ? (affinityDecision?.reasons[affinityTarget.executionTargetId] ?? "no_match")
             : "identity_unavailable";
@@ -3986,7 +4031,7 @@ async function relayPool({
               attemptCount,
               affinity: {
                 outcome:
-                  affinityDecision && selectedAffinityPrefixDepth > 0
+                  affinityDecision && (selectedAffinityPrefixDepth > 0 || selectedConversationMatch)
                     ? "PREDICTED_MATCH"
                     : affinityPolicy.enabled
                       ? "NO_MATCH"
@@ -4007,6 +4052,7 @@ async function relayPool({
             terminal.ok && requestedSurface && affinityPayload && affinityTarget
               ? rememberAffinity({
                   ownerId: requester.userId,
+                  resourceOwnerId: member.DiscoveredModel.userId,
                   poolId: target.id,
                   policy: affinityPolicy,
                   surface: requestedSurface,
