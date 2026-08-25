@@ -181,9 +181,7 @@ describe("ProviderOperationsSection mounted forms", () => {
     ];
     const user = userEvent.setup();
     mount();
-    const budgetHeading = await screen.findByText("dashboard:providers.budgets");
-    const form = budgetHeading.closest("form");
-    if (!form) throw new Error("budget form missing");
+    const form = await screen.findByRole("form", { name: "dashboard:providers.budgets" });
     const budgetLabels = [
       "dashboard:providers.fields.concurrencyAttempt",
       "dashboard:providers.fields.tokensAttempt",
@@ -193,11 +191,9 @@ describe("ProviderOperationsSection mounted forms", () => {
       "dashboard:providers.fields.spendDay",
       "dashboard:providers.fields.spendMonth",
     ];
-    const budgetCards = budgetLabels.map((label) => {
-      const card = within(form).getByText(label).parentElement;
-      if (!card) throw new Error(`budget card missing: ${label}`);
-      return card;
-    });
+    const budgetCards = budgetLabels.map((label) =>
+      within(form).getByRole("group", { name: label }),
+    );
     for (const card of budgetCards)
       await user.selectOptions(within(card).getByRole("combobox"), "UNLIMITED");
     expect(within(form).getAllByText("providers.unlimitedRuleWarning")).toHaveLength(7);

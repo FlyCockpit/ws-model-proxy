@@ -146,8 +146,7 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
 
     await user.click(screen.getByText("dashboard:pools.wizard.advanced.title"));
     await user.click(screen.getByText("dashboard:pools.wizard.fields.protocolAdaptationEnabled"));
-    const memberEditor = screen.getByText("owner/cli/chat").closest("details");
-    if (!memberEditor) throw new Error("member editor missing");
+    const memberEditor = screen.getByRole("group", { name: "owner/cli/chat" });
     await user.click(within(memberEditor).getByText("owner/cli/chat"));
     await user.click(within(memberEditor).getByText("pools.wizard.fields.enableMemberOverride"));
     const override = within(memberEditor).getByRole("spinbutton", {
@@ -170,10 +169,6 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
     expect(screen.getByText("dashboard:pools.wizard.egressWarning")).toBeTruthy();
     await user.click(screen.getByText("dashboard:pools.wizard.advanced.budgetTitle"));
 
-    const budgetRegion = screen
-      .getByText("dashboard:pools.wizard.advanced.budgetDescription")
-      .closest("details");
-    if (!budgetRegion) throw new Error("budget controls missing");
     const budgetLabels = [
       "dashboard:pools.wizard.fields.budgetConcurrency",
       "dashboard:pools.wizard.fields.tokenAttempt",
@@ -183,16 +178,10 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
       "dashboard:pools.wizard.fields.spendDay",
       "dashboard:pools.wizard.fields.spendMonth",
     ];
-    const budgetCards = budgetLabels.map((label) => {
-      const card = within(budgetRegion).getByText(label).parentElement;
-      if (!card) throw new Error(`budget card missing: ${label}`);
-      return card;
-    });
+    const budgetCards = budgetLabels.map((label) => screen.getByRole("group", { name: label }));
     for (const card of budgetCards)
       await user.selectOptions(within(card).getByRole("combobox"), "UNLIMITED");
-    expect(
-      within(budgetRegion).getAllByText("pools.wizard.advanced.unlimitedWarning"),
-    ).toHaveLength(7);
+    expect(screen.getAllByText("pools.wizard.advanced.unlimitedWarning")).toHaveLength(7);
     const concurrencyCard = budgetCards[0]!;
     await user.selectOptions(within(concurrencyCard).getByRole("combobox"), "LIMITED");
     const concurrency = within(concurrencyCard).getByRole("spinbutton", {

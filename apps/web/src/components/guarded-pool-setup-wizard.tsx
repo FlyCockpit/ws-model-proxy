@@ -1160,8 +1160,11 @@ export function MemberOverrideEditor({
   const { t } = useTranslation("dashboard");
   const safeId = modelId.replace(/[^a-zA-Z0-9_-]/g, "-");
   return (
-    <details className="min-w-0 rounded-xl border p-3">
-      <summary className="min-h-11 cursor-pointer break-all py-2 text-sm font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+    <details className="min-w-0 rounded-xl border p-3" aria-labelledby={`${safeId}-member-label`}>
+      <summary
+        id={`${safeId}-member-label`}
+        className="min-h-11 cursor-pointer break-all py-2 text-sm font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
         {label}
       </summary>
       <label className="mb-3 flex min-h-11 items-center gap-3">
@@ -1313,8 +1316,14 @@ function WizardBudgetRuleControl({
   const { t } = useTranslation("dashboard");
   const errorId = `${id}-error`;
   return (
-    <div className="min-w-0 space-y-2 rounded-xl border p-3">
-      <p className="text-sm font-medium">{label}</p>
+    <div
+      className="min-w-0 space-y-2 rounded-xl border p-3"
+      role="group"
+      aria-labelledby={`${id}-label`}
+    >
+      <p id={`${id}-label`} className="text-sm font-medium">
+        {label}
+      </p>
       <Label htmlFor={`${id}-mode`}>{t("pools.wizard.fields.limitMode")}</Label>
       <select
         id={`${id}-mode`}

@@ -1045,6 +1045,7 @@ export function ProviderOperationsSection() {
                   </form>
                   <form
                     ref={budgetFormRef}
+                    aria-label={t("dashboard:providers.budgets")}
                     noValidate
                     className="min-w-0 space-y-3"
                     onSubmit={(event) => submitProviderForm(event, budgetForm.handleSubmit)}
@@ -1941,8 +1942,14 @@ export function BudgetRuleField({
         ? String(firstError.message)
         : "invalid";
   return (
-    <div className="min-w-0 space-y-2 rounded-xl border p-3">
-      <p className="text-sm font-medium">{label}</p>
+    <div
+      className="min-w-0 space-y-2 rounded-xl border p-3"
+      role="group"
+      aria-labelledby={`${id}-label`}
+    >
+      <p id={`${id}-label`} className="text-sm font-medium">
+        {label}
+      </p>
       <Label htmlFor={modeId}>{t("providers.fields.limitMode")}</Label>
       <select
         id={modeId}
