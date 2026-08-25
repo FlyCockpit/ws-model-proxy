@@ -55,6 +55,45 @@ const request = {
 };
 
 describe("public overflow compatibility", () => {
+  it.each([
+    {
+      name: "accepts the exact member ceiling after margin",
+      target: { effectiveContextCeiling: 210, contextMargin: 10 },
+      expected: "COMPATIBLE",
+    },
+    {
+      name: "rejects one token beyond the member ceiling after margin",
+      target: { effectiveContextCeiling: 209, contextMargin: 10 },
+      expected: "CONTEXT_EXCEEDED",
+    },
+    {
+      name: "rejects one token beyond the physical runtime maximum after margin",
+      target: { physicalMaxContext: 209, contextMargin: 10 },
+      expected: "CONTEXT_EXCEEDED",
+    },
+    {
+      name: "still enforces the physical maximum when the policy ceiling is unlimited",
+      target: { effectiveContextCeiling: null, physicalMaxContext: 209, contextMargin: 10 },
+      expected: "CONTEXT_EXCEEDED",
+    },
+  ])("$name", ({ target, expected }) => {
+    expect(
+      publicTargetCompatibility(
+        {
+          contextWindow: 1_000,
+          maxOutputTokens: 100,
+          protocol: "openai",
+          nativeProtocols: ["openai"],
+          nativeSurfaces: ["openai-chat"],
+          supportsStreaming: true,
+          supportedFeatures: [],
+          ...target,
+        },
+        request,
+      ),
+    ).toBe(expected);
+  });
+
   it("fails closed when a v1-v4 inventory protocol disagrees with the provider account", () => {
     const target = {
       contextWindow: 1_000,

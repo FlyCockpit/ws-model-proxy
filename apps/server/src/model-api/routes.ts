@@ -4026,12 +4026,7 @@ async function relayPool({
         routeCandidates = routeCandidates
           .map((candidate, originalIndex) => ({ candidate, originalIndex }))
           .sort((left, right) => {
-            const modeRank = (poolMemberId: string) => {
-              const mode = executionByMember.get(poolMemberId)?.mode;
-              return mode === "native" ? 0 : mode === "adapted" ? 1 : 2;
-            };
-            const classDifference =
-              modeRank(left.candidate.poolMemberId) - modeRank(right.candidate.poolMemberId);
+            const classDifference = routeModeRank(left.candidate) - routeModeRank(right.candidate);
             if (classDifference !== 0) return classDifference;
             const leftTarget =
               memberById.get(left.candidate.poolMemberId)?.ExecutionTarget?.id ??

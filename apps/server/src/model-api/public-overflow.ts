@@ -139,6 +139,12 @@ export interface PublicProviderTarget {
   providerModelId: string;
   upstreamModelId: string;
   contextWindow: number | null;
+  /** PRIMARY-only pool policy resolved from the member override and pool default. */
+  effectiveContextCeiling?: number | null;
+  /** PRIMARY-only safety margin applied in addition to the requested context. */
+  contextMargin?: number;
+  /** Physical runtime ceiling shared by every target on the capacity. */
+  physicalMaxContext?: number | null;
   maxOutputTokens: number | null;
   protocol: ProviderProtocol;
   providerAccountId: string;
@@ -340,6 +346,9 @@ export function publicTargetCompatibility(
   target: Pick<
     PublicProviderTarget,
     | "contextWindow"
+    | "effectiveContextCeiling"
+    | "contextMargin"
+    | "physicalMaxContext"
     | "maxOutputTokens"
     | "nativeProtocols"
     | "nativeSurfaces"
@@ -375,7 +384,17 @@ export function publicTargetCompatibility(
       : (request.contextTokens ?? request.liability.tokens);
   if (!request.skipContextValidation) {
     if (target.contextWindow === null || contextTokens === undefined) return "CONTEXT_UNKNOWN";
-    if (contextTokens > BigInt(target.contextWindow)) return "CONTEXT_EXCEEDED";
+    const margin = target.contextMargin ?? 0;
+    if (!Number.isSafeInteger(margin) || margin < 0) return "CONTEXT_UNKNOWN";
+    const contextWithMargin = contextTokens + BigInt(margin);
+    const ceilings = [
+      target.contextWindow,
+      target.effectiveContextCeiling,
+      target.physicalMaxContext,
+    ].filter((ceiling): ceiling is number => ceiling !== null && ceiling !== undefined);
+    if (ceilings.some((ceiling) => !Number.isSafeInteger(ceiling) || ceiling <= 0))
+      return "CONTEXT_UNKNOWN";
+    if (ceilings.some((ceiling) => contextWithMargin > BigInt(ceiling))) return "CONTEXT_EXCEEDED";
     if (target.maxOutputTokens === null || requestedOutputTokens === undefined)
       return "CONTEXT_UNKNOWN";
     if (requestedOutputTokens > BigInt(target.maxOutputTokens)) return "CONTEXT_EXCEEDED";
@@ -545,6 +564,8 @@ export async function listPublicOverflowTargets(
     select: {
       publicEgressEnabled: true,
       publicEgressAcknowledged: true,
+      capacityContextCeiling: true,
+      capacityContextMargin: true,
       affinityEnabled: true,
       affinityTtlSeconds: true,
       affinityMaxRecords: true,
@@ -569,10 +590,14 @@ export async function listPublicOverflowTargets(
           weight: true,
           capacityWaitBudgetMs: true,
           capacityWaitBudgetMode: true,
+          capacityContextCeiling: true,
+          capacityContextCeilingMode: true,
+          capacityContextMargin: true,
           ExecutionTarget: {
             select: {
               id: true,
               inferenceCapacityId: true,
+              InferenceCapacity: { select: { physicalMaxContext: true } },
               ProviderModel: {
                 select: {
                   id: true,
@@ -680,6 +705,22 @@ export async function listPublicOverflowTargets(
         providerModelId: model.id,
         upstreamModelId: model.upstreamModelId,
         contextWindow: model.contextWindow,
+        effectiveContextCeiling:
+          memberTier !== "PRIMARY"
+            ? undefined
+            : member.capacityContextCeilingMode === "UNLIMITED"
+              ? null
+              : member.capacityContextCeilingMode === "LIMITED"
+                ? member.capacityContextCeiling
+                : pool.capacityContextCeiling,
+        contextMargin:
+          memberTier === "PRIMARY"
+            ? (member.capacityContextMargin ?? pool.capacityContextMargin)
+            : undefined,
+        physicalMaxContext:
+          memberTier === "PRIMARY"
+            ? member.ExecutionTarget!.InferenceCapacity?.physicalMaxContext
+            : undefined,
         maxOutputTokens: model.maxOutputTokens,
         protocol,
         providerAccountId: account.id,

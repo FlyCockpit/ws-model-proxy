@@ -3462,6 +3462,128 @@ describe("model API routes", () => {
     );
   });
 
+  it.each([
+    { nativeKind: "provider" as const, expectedMember: "provider-primary" },
+    { nativeKind: "local" as const, expectedMember: "local-primary" },
+  ])(
+    "keeps the $nativeKind native PRIMARY ahead of an affinity-preferred adapted target",
+    async ({ nativeKind, expectedMember }) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+      });
+      const responsesOnly = {
+        version: 3 as const,
+        protocol: "openai-compatible" as const,
+        surfaces: {
+          openaiResponses: {
+            source: "declared" as const,
+            confidence: "exact" as const,
+            supported: true,
+            streaming: true,
+          },
+        },
+      };
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "local-primary",
+          discoveredModelId: "local-model",
+          upstreamModelId: "local-upstream",
+          cliDeviceId: "cli-local",
+          affinityEnabled: true,
+          capabilityOverrideMetadata: nativeKind === "provider" ? responsesOnly : null,
+        }),
+      ]);
+      const provider = {
+        ...providerPrimaryTarget("provider-primary"),
+        ...(nativeKind === "local"
+          ? {
+              nativeSurfaces: ["openai-responses" as const],
+              capabilityInventory: responsesOnly,
+            }
+          : {}),
+      };
+      publicOverflow.list.mockResolvedValue({
+        enabled: false,
+        acknowledged: false,
+        affinityPolicy: {
+          enabled: true,
+          ttlSeconds: 3600,
+          maxRecords: 10_000,
+          prefixWeight: 100,
+          conversationWeight: 150,
+          confirmedCacheWeight: 250,
+          loadPenaltyWeight: 100,
+        },
+        targets: [provider],
+      });
+      // Deliberately prefer the adapted target. Affinity may reorder only
+      // within a native/adapted class, never across that compatibility boundary.
+      affinity.rank.mockResolvedValue({
+        orderedTargetIds:
+          nativeKind === "provider"
+            ? ["local-primary-target", "provider-primary-target"]
+            : ["provider-primary-target", "local-primary-target"],
+        scores: {},
+        prefixDepths: {},
+        conversationMatches: {},
+        reasons: {},
+        matchedPrefixDepth: 0,
+      });
+      const selectedMembers: string[] = [];
+      const capacityRuntime: CapacityAdmissionRuntime = {
+        acquire: vi.fn(async (attempt) => {
+          const selected = attempt.candidates[0]!;
+          selectedMembers.push(selected.poolMemberId!);
+          return {
+            state: "ADMITTED" as const,
+            lease: {
+              leaseId: "lease",
+              attemptId: attempt.attemptId,
+              capacityId: selected.capacityId,
+              executionTargetId: selected.executionTargetId,
+              poolMemberId: selected.poolMemberId,
+              fencingToken: 1n,
+              expiresAt: new Date(Date.now() + 30_000),
+            },
+          };
+        }),
+        release: vi.fn(async () => true),
+        hold: vi.fn((response) => response),
+      };
+      publicOverflow.dispatch.mockResolvedValue({
+        dispatched: true,
+        response: new Response(JSON.stringify({ id: "provider" }), {
+          headers: { "content-type": "application/json" },
+        }),
+        target: provider,
+        attemptId: "attempt",
+        fencingToken: 1n,
+        nativeSurface: nativeKind === "provider" ? "openai-chat" : "openai-responses",
+        attemptCount: 1,
+        terminal: Promise.resolve({ ok: true, responseBytes: 10 }),
+        markFirstClientByte: vi.fn().mockResolvedValue(undefined),
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+      const responsePromise = appWith(manager, true, true, capacityRuntime).request(
+        "/chat/completions",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(poolTarget.modelId),
+        },
+      );
+      await vi.waitFor(() => expect(selectedMembers).toHaveLength(1));
+      expect(selectedMembers[0]).toBe(expectedMember);
+      if (nativeKind === "local") {
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+        await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+      }
+      expect((await responsePromise).status).toBe(200);
+    },
+  );
+
   it("returns Anthropic-shaped pool compatibility failures", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],

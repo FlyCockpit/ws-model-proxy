@@ -212,6 +212,36 @@ it("excludes protocol-mismatched legacy inventories from PRIMARY before egress",
   expect(providerHttpsRequest).not.toHaveBeenCalled();
 });
 
+it("resolves PRIMARY context policy and physical capacity without changing overflow semantics", async () => {
+  const fixture = dispatchPoolFixture();
+  Object.assign(fixture, {
+    capacityContextCeiling: 900,
+    capacityContextMargin: 30,
+  });
+  Object.assign(fixture.PoolMembers[0]!, {
+    capacityContextCeilingMode: "LIMITED",
+    capacityContextCeiling: 700,
+    capacityContextMargin: 20,
+  });
+  Object.assign(fixture.PoolMembers[0]!.ExecutionTarget, {
+    InferenceCapacity: { physicalMaxContext: 650 },
+  });
+  db.modelPool.findFirst.mockResolvedValue(fixture);
+
+  const primary = await listPublicOverflowTargets("owner", "pool", "PRIMARY");
+  expect(primary.targets[0]).toMatchObject({
+    effectiveContextCeiling: 700,
+    contextMargin: 20,
+    physicalMaxContext: 650,
+  });
+
+  const overflow = await listPublicOverflowTargets("owner", "pool", "PUBLIC_OVERFLOW");
+  expect(overflow.targets[0]).toMatchObject({ contextWindow: 10_000 });
+  expect(overflow.targets[0]?.effectiveContextCeiling).toBeUndefined();
+  expect(overflow.targets[0]?.contextMargin).toBeUndefined();
+  expect(overflow.targets[0]?.physicalMaxContext).toBeUndefined();
+});
+
 describe("public overflow terminal response dispatch", () => {
   it("ranks only overflow-eligible providers and uses immutable pricing, health, and load penalties", async () => {
     const fixture = dispatchPoolFixture();
