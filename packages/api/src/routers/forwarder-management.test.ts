@@ -779,6 +779,30 @@ describe("forwarderManagementRouter", () => {
     });
   });
 
+  it("transactionally reindexes public overflow order without duplicate positions", async () => {
+    db.poolMember.findUnique.mockResolvedValue({
+      id: "member-b",
+      poolId: "pool-id",
+      tier: "PUBLIC_OVERFLOW",
+      ModelPool: { userId: "user-id" },
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      { id: "member-a" },
+      { id: "member-b" },
+      { id: "member-c" },
+    ]);
+    db.poolMember.update.mockResolvedValue({});
+
+    await expect(
+      client().reorderProviderPoolMember({ id: "member-b", direction: "LATER" }),
+    ).resolves.toEqual({ moved: true });
+    expect(db.poolMember.update.mock.calls.map(([input]) => input)).toEqual([
+      { where: { id: "member-a" }, data: { publicOrder: 0 } },
+      { where: { id: "member-c" }, data: { publicOrder: 1 } },
+      { where: { id: "member-b" }, data: { publicOrder: 2 } },
+    ]);
+  });
+
   it("requires an active explicit concurrency policy before attaching public overflow", async () => {
     db.modelPool.findFirst.mockResolvedValue({
       id: "pool-id",
@@ -808,6 +832,7 @@ describe("forwarderManagementRouter", () => {
     db.providerAuditEvent.findFirst.mockResolvedValue({ id: "audit" });
     db.executionTarget.upsert.mockResolvedValue({ id: "provider-target" });
     db.poolMember.create.mockResolvedValue({ id: "provider-member" });
+    db.poolMember.findMany.mockResolvedValue([]);
     await expect(
       client().addProviderPoolMember({
         poolId: "pool-id",
@@ -815,6 +840,10 @@ describe("forwarderManagementRouter", () => {
         publicOrder: 0,
       }),
     ).resolves.toEqual({ id: "provider-member", executionTargetId: "provider-target" });
+    expect(db.poolMember.update).toHaveBeenCalledWith({
+      where: { id: "provider-member" },
+      data: { publicOrder: 0 },
+    });
   });
 
   it("makes missing and cross-owner nested pool-member ids indistinguishable", async () => {

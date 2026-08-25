@@ -55,6 +55,7 @@ import {
   providerAttemptExpiryEnabled,
   startProviderAttemptExpiry,
 } from "./model-api/provider-attempt-lifecycle.js";
+import { repairExpiredProviderBudgets } from "./model-api/provider-budget.js";
 import { startProviderBudgetRepair } from "./model-api/provider-budget-runtime.js";
 import { createModelApiRoutes } from "./model-api/routes.js";
 import { transcriptionContentLengthGuard } from "./model-api/transcription-body-guard.js";
@@ -472,7 +473,12 @@ export const rpcHandler = new RPCHandler(appRouter, {
 });
 
 app.use("/*", async (c, next) => {
-  const context = await createContext({ context: c });
+  const context = await createContext({
+    context: c,
+    services: {
+      repairExpiredProviderBudgets: (scope) => repairExpiredProviderBudgets(new Date(), scope),
+    },
+  });
 
   const rpcResult = await rpcHandler.handle(c.req.raw, {
     prefix: "/rpc",

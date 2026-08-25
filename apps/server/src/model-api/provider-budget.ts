@@ -938,7 +938,10 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
 }
 
 /** Crash repair is conservative: expired liability is settled, never silently refunded. */
-export async function repairExpiredProviderBudgets(now = new Date()): Promise<number> {
+export async function repairExpiredProviderBudgets(
+  now = new Date(),
+  scope?: { userId: string; providerAccountId: string },
+): Promise<number> {
   if (!Number.isFinite(now.getTime()))
     throw new ProviderBudgetConfigurationError("Invalid repair date");
   const expired = await prisma.$queryRaw<
@@ -954,8 +957,10 @@ export async function repairExpiredProviderBudgets(now = new Date()): Promise<nu
     }>
   >`SELECT a."userId", a."providerAccountId", a."providerModelId", a."credentialId",
            a."poolId", a."requestId", a."attemptId", a."fencingToken"
-      FROM provider_attempt a
+     FROM provider_attempt a
      WHERE a."expiresAt" <= ${now}
+       AND (${scope?.userId ?? null}::text IS NULL OR a."userId" = ${scope?.userId ?? null})
+       AND (${scope?.providerAccountId ?? null}::text IS NULL OR a."providerAccountId" = ${scope?.providerAccountId ?? null})
        AND NOT EXISTS (
          SELECT 1 FROM provider_usage_ledger l
           WHERE l."attemptId" = a."attemptId" AND l."fencingToken" = a."fencingToken"

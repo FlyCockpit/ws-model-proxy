@@ -1072,6 +1072,7 @@ export const providerManagementRouter = {
           ruleId: true,
           requestId: true,
           attemptId: true,
+          fencingToken: true,
           metric: true,
           period: true,
           policyVersion: true,
@@ -1174,9 +1175,28 @@ export const providerManagementRouter = {
           providerAccountId: true,
           providerModelId: true,
           poolId: true,
+          requestId: true,
+          attemptId: true,
           inputTokens: true,
           outputTokens: true,
+          cacheReadTokens: true,
+          cacheWriteTokens: true,
+          reasoningTokens: true,
+          toolTokens: true,
+          additionalBillableTokens: true,
+          authoritativeBillableTokens: true,
+          reportedTotalTokens: true,
           billableTotal: true,
+          categoriesComplete: true,
+          rawUsage: true,
+          reportedCost: true,
+          reportedCostCurrency: true,
+          reportedCostPricingVersion: true,
+          reportedCostSource: true,
+          calculatedCost: true,
+          calculatedCostCurrency: true,
+          calculatedCostPricingVersion: true,
+          calculatedCostSource: true,
           settledCost: true,
           currency: true,
           pricingVersion: true,
@@ -1195,20 +1215,37 @@ export const providerManagementRouter = {
     enabled();
     const userId = context.session.user.id;
     await reportScopeFor(userId, input);
-    const groups = await prisma.providerUsageLedger.groupBy({
-      by: ["currency"],
-      where: { ...reportWhere(userId, input), costKnown: true, currency: { not: null } },
-      _sum: { settledCost: true },
-      _count: { _all: true },
-      orderBy: { currency: "asc" },
-    });
-    return groups.map((group) => ({
-      currency: group.currency,
-      settledCost: group._sum.settledCost,
-      rowCount: group._count._all,
-      from: input.from ?? null,
-      to: input.to ?? null,
-    }));
+    const where = reportWhere(userId, input);
+    const [groups, excludedRowCount] = await Promise.all([
+      prisma.providerUsageLedger.groupBy({
+        by: ["currency"],
+        where: {
+          ...where,
+          costKnown: true,
+          currency: { not: null },
+          settledCost: { not: null },
+        },
+        _sum: { settledCost: true },
+        _count: { _all: true },
+        orderBy: { currency: "asc" },
+      }),
+      prisma.providerUsageLedger.count({
+        where: {
+          ...where,
+          OR: [{ costKnown: false }, { currency: null }, { settledCost: null }],
+        },
+      }),
+    ]);
+    return {
+      totals: groups.map((group) => ({
+        currency: group.currency,
+        settledCost: group._sum.settledCost,
+        rowCount: group._count._all,
+        from: input.from ?? null,
+        to: input.to ?? null,
+      })),
+      excludedRowCount,
+    };
   }),
   listProviderAttempts: protectedProcedure
     .input(pagedReportInput)
@@ -1227,6 +1264,7 @@ export const providerManagementRouter = {
           poolId: true,
           requestId: true,
           attemptId: true,
+          fencingToken: true,
           state: true,
           heartbeatAt: true,
           terminalAt: true,
@@ -1242,28 +1280,60 @@ export const providerManagementRouter = {
         take: input.limit + 1,
       });
       const result = page(rows, input.limit);
-      const attemptIds = result.items.map((row) => row.attemptId);
-      const ledgerCounts = attemptIds.length
+      const attemptKeys = result.items.map((row) => ({
+        attemptId: row.attemptId,
+        fencingToken: row.fencingToken,
+      }));
+      const ledgerCounts = attemptKeys.length
         ? await prisma.providerUsageLedger.groupBy({
-            by: ["attemptId"],
-            where: { userId, attemptId: { in: attemptIds } },
+            by: ["attemptId", "fencingToken"],
+            where: { userId, OR: attemptKeys },
             _count: { _all: true },
           })
         : [];
-      const counts = new Map(ledgerCounts.map((row) => [row.attemptId, row._count._all]));
+      const accountingKey = (attemptId: string, fencingToken: bigint) =>
+        `${attemptId}:${fencingToken.toString()}`;
+      const counts = new Map(
+        ledgerCounts.map((row) => [
+          accountingKey(row.attemptId, row.fencingToken),
+          row._count._all,
+        ]),
+      );
       return {
         ...result,
         items: result.items.map((row) => ({
           ...row,
           stale: row.state === "ACTIVE" && row.expiresAt <= now,
           reconciliationStatus:
-            (counts.get(row.attemptId) ?? 0) > 0
+            (counts.get(accountingKey(row.attemptId, row.fencingToken)) ?? 0) > 0
               ? "RECORDED"
               : row.state === "ACTIVE"
                 ? "PENDING"
                 : "MISSING",
         })),
       };
+    }),
+  repairExpiredAttempts: protectedProcedure
+    .input(z.object({ providerAccountId: id }))
+    .handler(async ({ input, context }) => {
+      enabled();
+      const userId = context.session.user.id;
+      await accountFor(userId, input.providerAccountId);
+      const repair = context.services?.repairExpiredProviderBudgets;
+      if (!repair)
+        throw new ORPCError("PRECONDITION_FAILED", {
+          message: "Provider repair service is unavailable",
+        });
+      await prisma.providerAuditEvent.create({
+        data: {
+          userId,
+          providerAccountId: input.providerAccountId,
+          action: "ACCOUNTING_REPAIR_REQUESTED",
+          subjectId: input.providerAccountId,
+        },
+      });
+      const repaired = await repair({ userId, providerAccountId: input.providerAccountId });
+      return { repaired };
     }),
   rotateCredential: protectedProcedure
     .input(z.object({ id }))

@@ -1513,8 +1513,14 @@ export const forwarderManagementRouter = {
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
       return prisma.$transaction(async (tx) => {
-        const pool = await tx.modelPool.findFirst({
+        const candidatePool = await tx.modelPool.findFirst({
           where: { id: input.poolId, userId },
+          select: { id: true },
+        });
+        if (!candidatePool) throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidatePool.id} AND "userId" = ${userId} FOR UPDATE`;
+        const pool = await tx.modelPool.findFirst({
+          where: { id: candidatePool.id, userId },
           select: { id: true, publicEgressEnabled: true, publicEgressAcknowledged: true },
         });
         if (!pool) throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
@@ -1596,6 +1602,18 @@ export const forwarderManagementRouter = {
           },
           select: { id: true },
         });
+        const ordered = await tx.poolMember.findMany({
+          where: { poolId: input.poolId, tier: "PUBLIC_OVERFLOW", id: { not: member.id } },
+          orderBy: [{ publicOrder: "asc" }, { id: "asc" }],
+          select: { id: true },
+        });
+        ordered.splice(Math.min(input.publicOrder, ordered.length), 0, member);
+        for (const [publicOrder, orderedMember] of ordered.entries()) {
+          await tx.poolMember.update({
+            where: { id: orderedMember.id },
+            data: { publicOrder },
+          });
+        }
         return { id: member.id, executionTargetId: target.id };
       });
     }),
@@ -1625,6 +1643,39 @@ export const forwarderManagementRouter = {
           ...(input.publicOrder !== undefined ? { publicOrder: input.publicOrder } : {}),
         },
         select: { id: true, weight: true, routingStatus: true, tier: true, publicOrder: true },
+      });
+    }),
+
+  reorderProviderPoolMember: protectedProcedure
+    .input(z.object({ id: idSchema, direction: z.enum(["EARLIER", "LATER"]) }))
+    .handler(async ({ input, context }) => {
+      const userId = context.session.user.id;
+      return prisma.$transaction(async (tx) => {
+        const candidate = await tx.poolMember.findUnique({
+          where: { id: input.id },
+          select: { id: true, poolId: true, tier: true, ModelPool: { select: { userId: true } } },
+        });
+        if (
+          !candidate ||
+          candidate.ModelPool.userId !== userId ||
+          candidate.tier !== "PUBLIC_OVERFLOW"
+        )
+          throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidate.poolId} AND "userId" = ${userId} FOR UPDATE`;
+        const members = await tx.poolMember.findMany({
+          where: { poolId: candidate.poolId, tier: "PUBLIC_OVERFLOW" },
+          orderBy: [{ publicOrder: "asc" }, { id: "asc" }],
+          select: { id: true },
+        });
+        const currentIndex = members.findIndex((member) => member.id === candidate.id);
+        const nextIndex = input.direction === "EARLIER" ? currentIndex - 1 : currentIndex + 1;
+        if (currentIndex < 0 || nextIndex < 0 || nextIndex >= members.length)
+          return { moved: false };
+        [members[currentIndex], members[nextIndex]] = [members[nextIndex]!, members[currentIndex]!];
+        for (const [publicOrder, member] of members.entries()) {
+          await tx.poolMember.update({ where: { id: member.id }, data: { publicOrder } });
+        }
+        return { moved: true };
       });
     }),
 

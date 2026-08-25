@@ -111,6 +111,7 @@ enum ProviderAuditAction {
   PRICING_ACTIVATED
   PRICING_RETIRED
   PRICING_DELETED
+  ACCOUNTING_REPAIR_REQUESTED
 }
 
 enum ExecutionTargetKind {

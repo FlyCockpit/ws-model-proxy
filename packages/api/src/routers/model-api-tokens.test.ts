@@ -250,6 +250,7 @@ describe("modelApiTokensRouter", () => {
         allowlist: {
           directModelCount: 1,
           modelPoolCount: 2,
+          modelPoolIds: ["owned-pool-id", "granted-pool-id"],
         },
       });
       expect(JSON.stringify(result.token)).not.toContain(result.secret);
@@ -288,7 +289,11 @@ describe("modelApiTokensRouter", () => {
         scopeMode: "ALL_VISIBLE",
       });
 
-      expect(result.token.allowlist).toEqual({ directModelCount: 0, modelPoolCount: 0 });
+      expect(result.token.allowlist).toEqual({
+        directModelCount: 0,
+        modelPoolCount: 0,
+        modelPoolIds: [],
+      });
       const createCall = db.modelApiToken.create.mock.calls[0]?.[0] as TokenCreateArgs;
       expect(createCall.data.AllowlistEntries.create).toEqual([]);
     });
@@ -383,6 +388,7 @@ describe("modelApiTokensRouter", () => {
           allowlist: {
             directModelCount: 1,
             modelPoolCount: 0,
+            modelPoolIds: [],
           },
         },
       ]);

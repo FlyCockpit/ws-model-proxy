@@ -4,9 +4,18 @@ import type { Context as HonoContext } from "hono";
 
 export type CreateContextOptions = {
   context: HonoContext;
+  services?: ContextServices;
 };
 
-export async function createContext({ context }: CreateContextOptions) {
+export type ContextServices = {
+  /** Server-owned accounting repair. Kept injectable so the API package does not depend on the server. */
+  repairExpiredProviderBudgets?: (scope: {
+    userId: string;
+    providerAccountId: string;
+  }) => Promise<number>;
+};
+
+export async function createContext({ context, services }: CreateContextOptions) {
   // The session is resolved once per request by `sessionMiddleware` in
   // apps/server. Test harnesses that bypass the Hono middleware stack will
   // see undefined here — fall back to a direct lookup so they still work.
@@ -19,6 +28,7 @@ export async function createContext({ context }: CreateContextOptions) {
         })) as Session | null);
   return {
     session,
+    services,
   };
 }
 

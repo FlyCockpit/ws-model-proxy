@@ -78,6 +78,9 @@ function serializeToken(row: TokenListRow) {
       modelPoolCount: row.AllowlistEntries.filter(
         (entry) => entry.target === "MODEL_POOL" && entry.modelPoolId,
       ).length,
+      modelPoolIds: row.AllowlistEntries.flatMap((entry) =>
+        entry.target === "MODEL_POOL" && entry.modelPoolId ? [entry.modelPoolId] : [],
+      ),
     },
   };
 }

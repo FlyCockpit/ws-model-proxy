@@ -73,7 +73,7 @@ const db = prisma as unknown as {
     findFirst: MockInstance;
     updateMany: MockInstance;
   };
-  providerUsageLedger: { findMany: MockInstance; groupBy: MockInstance };
+  providerUsageLedger: { findMany: MockInstance; groupBy: MockInstance; count: MockInstance };
   providerBudgetReservation: { findMany: MockInstance };
   providerBudgetSettlement: { findMany: MockInstance };
   publicProviderAttemptEvent: { findMany: MockInstance };
@@ -143,6 +143,27 @@ describe("providerManagementRouter security boundary", () => {
       typeof createRouterClient<typeof providerManagementRouter>
     >;
     await expect(client.listAccounts()).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(db.providerAccount.findMany).not.toHaveBeenCalled();
+  });
+
+  it("enforces authentication through the HTTP RPC transport when provider egress is enabled", async () => {
+    envMock.enabled = true;
+    const handler = new RPCHandler(providerManagementRouter);
+    const link = new RPCLink({
+      url: "https://example.test/rpc",
+      fetch: async (request, init) => {
+        const result = await handler.handle(new Request(request, init), {
+          prefix: "/rpc",
+          context: { session: null },
+        });
+        if (!result.matched) return new Response(null, { status: 404 });
+        return result.response;
+      },
+    });
+    const client = createORPCClient(link) as ReturnType<
+      typeof createRouterClient<typeof providerManagementRouter>
+    >;
+    await expect(client.listAccounts()).rejects.toMatchObject({ code: "UNAUTHORIZED" });
     expect(db.providerAccount.findMany).not.toHaveBeenCalled();
   });
 
@@ -648,18 +669,38 @@ describe("providerManagementRouter security boundary", () => {
       { currency: "EUR", _sum: { settledCost: "1.25" }, _count: { _all: 2 } },
       { currency: "USD", _sum: { settledCost: "3.5" }, _count: { _all: 4 } },
     ]);
+    db.providerUsageLedger.count.mockResolvedValue(3);
     const client = createRouterClient(providerManagementRouter, { context });
     await expect(client.listUsageReportPage({ limit: 1 })).resolves.toEqual({
       items: [{ id: "b", createdAt }],
       nextCursor: { id: "b", createdAt },
     });
-    await expect(client.getUsageTotals({ limit: 50 })).resolves.toEqual([
-      { currency: "EUR", settledCost: "1.25", rowCount: 2, from: null, to: null },
-      { currency: "USD", settledCost: "3.5", rowCount: 4, from: null, to: null },
-    ]);
+    await expect(client.getUsageTotals({ limit: 50 })).resolves.toEqual({
+      totals: [
+        { currency: "EUR", settledCost: "1.25", rowCount: 2, from: null, to: null },
+        { currency: "USD", settledCost: "3.5", rowCount: 4, from: null, to: null },
+      ],
+      excludedRowCount: 3,
+    });
     expect(db.providerUsageLedger.findMany).toHaveBeenCalledWith(
       expect.objectContaining({ where: { userId: "owner" }, take: 2 }),
     );
+    expect(db.providerUsageLedger.groupBy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          userId: "owner",
+          costKnown: true,
+          currency: { not: null },
+          settledCost: { not: null },
+        },
+      }),
+    );
+    expect(db.providerUsageLedger.count).toHaveBeenCalledWith({
+      where: {
+        userId: "owner",
+        OR: [{ costKnown: false }, { currency: null }, { settledCost: null }],
+      },
+    });
   });
 
   it("reports stale and unreconciled attempts without credential material", async () => {
@@ -669,11 +710,14 @@ describe("providerManagementRouter security boundary", () => {
         id: "attempt-row",
         createdAt: new Date("2026-08-24T00:00:00Z"),
         attemptId: "attempt",
+        fencingToken: 2n,
         state: "ACTIVE",
         expiresAt: new Date("2026-08-24T00:01:00Z"),
       },
     ]);
-    db.providerUsageLedger.groupBy.mockResolvedValue([]);
+    db.providerUsageLedger.groupBy.mockResolvedValue([
+      { attemptId: "attempt", fencingToken: 1n, _count: { _all: 1 } },
+    ]);
     const client = createRouterClient(providerManagementRouter, { context });
     const result = await client.listProviderAttempts({ limit: 10 });
     expect(result.items[0]).toMatchObject({ stale: true, reconciliationStatus: "PENDING" });
@@ -683,6 +727,57 @@ describe("providerManagementRouter security boundary", () => {
         select: expect.not.objectContaining({ credentialId: true }),
       }),
     );
+    expect(db.providerUsageLedger.groupBy).toHaveBeenCalledWith({
+      by: ["attemptId", "fencingToken"],
+      where: { userId: "owner", OR: [{ attemptId: "attempt", fencingToken: 2n }] },
+      _count: { _all: true },
+    });
+  });
+
+  it("runs server-owned repair only for the authenticated account and audits the result", async () => {
+    envMock.enabled = true;
+    db.providerAccount.findFirst.mockResolvedValue({ id: "account", userId: "owner" });
+    db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
+    const repair = vi.fn().mockResolvedValue(2);
+    const client = createRouterClient(providerManagementRouter, {
+      context: { session, services: { repairExpiredProviderBudgets: repair } },
+    });
+    await expect(client.repairExpiredAttempts({ providerAccountId: "account" })).resolves.toEqual({
+      repaired: 2,
+    });
+    expect(repair).toHaveBeenCalledWith({ userId: "owner", providerAccountId: "account" });
+    expect(db.providerAuditEvent.create).toHaveBeenCalledWith({
+      data: {
+        userId: "owner",
+        providerAccountId: "account",
+        action: "ACCOUNTING_REPAIR_REQUESTED",
+        subjectId: "account",
+      },
+    });
+  });
+
+  it("fails closed when the server repair service is unavailable", async () => {
+    envMock.enabled = true;
+    db.providerAccount.findFirst.mockResolvedValue({ id: "account", userId: "owner" });
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(
+      client.repairExpiredAttempts({ providerAccountId: "account" }),
+    ).rejects.toMatchObject({ code: "PRECONDITION_FAILED" });
+    expect(db.providerAuditEvent.create).not.toHaveBeenCalled();
+  });
+
+  it("does not invoke repair for a missing or cross-owner account", async () => {
+    envMock.enabled = true;
+    db.providerAccount.findFirst.mockResolvedValue(null);
+    const repair = vi.fn();
+    const client = createRouterClient(providerManagementRouter, {
+      context: { session, services: { repairExpiredProviderBudgets: repair } },
+    });
+    await expect(
+      client.repairExpiredAttempts({ providerAccountId: "foreign-account" }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND", message: "Not found" });
+    expect(repair).not.toHaveBeenCalled();
+    expect(db.providerAuditEvent.create).not.toHaveBeenCalled();
   });
 
   it("locks account then model and audits deleteModel exactly once", async () => {
