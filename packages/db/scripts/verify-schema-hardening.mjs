@@ -51,6 +51,9 @@ const requiredFragments = [
   "enforce_provider_credential_account_consistency",
   "enforce_provider_budget_graph_consistency",
   "enforce_provider_budget_history_transitions",
+  "enforce_provider_budget_reservation_transition",
+  'btrim("accountingVersion")',
+  'AND br."pricingVersion" IS NOT DISTINCT FROM NEW."pricingVersion"',
 ];
 for (const fragment of requiredFragments) {
   if (!sql.includes(fragment)) throw new Error(`Missing schema-hardening fragment: ${fragment}`);
@@ -722,10 +725,12 @@ try {
   `);
   await expectConstraintFailure(`
     INSERT INTO provider_budget_reservation
-      (id, "createdAt", "userId", "policyId", "ruleId", "requestId", "attemptId",
-       "fencingToken", metric, period, "policyVersion", "windowStart", "windowEnd", "reservedValue")
-    VALUES ('bad-reservation', NOW(), 'owner-a', 'budget-policy-a', 'token-rule', 'r', 'a',
-      1, 'SPEND', 'UTC_DAY', 1, date_trunc('day', NOW()), date_trunc('day', NOW()) + interval '1 day', 1)
+      (id, "createdAt", "userId", "providerAccountId", "providerModelId", "policyId", "ruleId",
+       "requestId", "attemptId", "fencingToken", metric, period, "policyVersion", "windowStart",
+       "windowEnd", "reservedValue", "accountingVersion")
+    VALUES ('bad-reservation', NOW(), 'owner-a', 'provider-account-a', 'provider-model-a',
+      'budget-policy-a', 'token-rule', 'r', 'a', 1, 'SPEND', 'UTC_DAY', 1,
+      date_trunc('day', NOW()), date_trunc('day', NOW()) + interval '1 day', 1, 'usage-v1')
   `);
 
   // Recreate the deployment boundary and prove a transaction from an old

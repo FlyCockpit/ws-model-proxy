@@ -9,6 +9,10 @@ export interface ProviderTokenUsage {
   toolTokens?: bigint;
   /** Only categories not already represented by the fields above. */
   additionalBillableTokens?: bigint;
+  /** True only when every provider-billable category is represented above. */
+  categoriesComplete?: boolean;
+  /** Provider-authoritative total. It is used instead of, never added to, categories. */
+  authoritativeBillableTokens?: bigint;
 }
 
 export function budgetWindow(
@@ -32,6 +36,8 @@ export function budgetWindow(
 }
 
 export function providerBillableTokens(usage: ProviderTokenUsage): bigint | undefined {
+  if (usage.authoritativeBillableTokens !== undefined) return usage.authoritativeBillableTokens;
+  if (usage.categoriesComplete !== true) return undefined;
   const categories = [
     usage.inputTokens,
     usage.outputTokens,
@@ -41,6 +47,5 @@ export function providerBillableTokens(usage: ProviderTokenUsage): bigint | unde
     usage.toolTokens,
     usage.additionalBillableTokens,
   ];
-  if (categories.every((value) => value === undefined)) return undefined;
   return categories.reduce<bigint>((sum, value) => sum + (value ?? 0n), 0n);
 }

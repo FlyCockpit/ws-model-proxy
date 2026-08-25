@@ -49,11 +49,19 @@ describe("provider budget accounting", () => {
         reasoningTokens: 7n,
         toolTokens: 3n,
         additionalBillableTokens: 2n,
+        categoriesComplete: true,
       }),
     ).toBe(147n);
   });
 
   it("keeps wholly missing usage unknown rather than treating it as zero", () => {
     expect(providerBillableTokens({})).toBeUndefined();
+  });
+
+  it("keeps partial categories unknown and trusts an authoritative total without double counting", () => {
+    expect(providerBillableTokens({ inputTokens: 10n })).toBeUndefined();
+    expect(providerBillableTokens({ inputTokens: 10n, authoritativeBillableTokens: 12n })).toBe(
+      12n,
+    );
   });
 });

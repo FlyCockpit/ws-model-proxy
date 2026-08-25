@@ -1059,6 +1059,13 @@ ALTER TABLE provider_budget_rule ADD CONSTRAINT provider_budget_rule_shape_check
 ALTER TABLE provider_budget_reservation DROP CONSTRAINT IF EXISTS provider_budget_reservation_shape_check;
 ALTER TABLE provider_budget_reservation ADD CONSTRAINT provider_budget_reservation_shape_check CHECK (
   "fencingToken" > 0 AND "policyVersion" > 0 AND "reservedValue" > 0
+  AND btrim("providerAccountId") <> '' AND btrim("providerModelId") <> ''
+  AND btrim("requestId") <> '' AND btrim("attemptId") <> ''
+  AND btrim("accountingVersion") <> ''
+  AND ("pricingVersion" IS NULL OR btrim("pricingVersion") <> '')
+  AND ("liabilityTokens" IS NULL OR "liabilityTokens" >= 0)
+  AND ("liabilitySpend" IS NULL OR "liabilitySpend" >= 0)
+  AND ("liabilityCurrency" IS NULL OR "liabilityCurrency" ~ '^[A-Z]{3}$')
   AND "utcBasis" = 'UTC'
   AND ((period = 'LIFETIME' AND "windowStart" IS NOT NULL AND "windowEnd" IS NULL)
     OR (period = 'PER_ATTEMPT' AND "windowStart" IS NULL AND "windowEnd" IS NULL)
@@ -1069,8 +1076,11 @@ ALTER TABLE provider_budget_reservation ADD CONSTRAINT provider_budget_reservati
 
 ALTER TABLE provider_usage_ledger DROP CONSTRAINT IF EXISTS provider_usage_ledger_shape_check;
 ALTER TABLE provider_usage_ledger ADD CONSTRAINT provider_usage_ledger_shape_check CHECK (
-  "fencingToken" > 0 AND "settledCost" >= 0 AND currency ~ '^[A-Z]{3}$'
-  AND btrim("pricingVersion") <> ''
+  "fencingToken" > 0 AND ("settledCost" IS NULL OR "settledCost" >= 0)
+  AND (currency IS NULL OR currency ~ '^[A-Z]{3}$')
+  AND ("pricingVersion" IS NULL OR btrim("pricingVersion") <> '')
+  AND btrim("accountingVersion") <> '' AND btrim("terminalReason") <> ''
+  AND (NOT "costKnown" OR ("settledCost" IS NOT NULL AND currency IS NOT NULL AND "pricingVersion" IS NOT NULL))
   AND ("reportedCost" IS NULL OR "reportedCost" >= 0)
   AND ("calculatedCost" IS NULL OR "calculatedCost" >= 0)
   AND ("inputTokens" IS NULL OR "inputTokens" >= 0)
@@ -1109,6 +1119,25 @@ FOR EACH ROW EXECUTE FUNCTION reject_immutable_provider_history_mutation();
 DROP TRIGGER IF EXISTS provider_budget_settlement_immutable ON provider_budget_settlement;
 CREATE TRIGGER provider_budget_settlement_immutable BEFORE UPDATE OR DELETE ON provider_budget_settlement
 FOR EACH ROW EXECUTE FUNCTION reject_immutable_provider_history_mutation();
+CREATE OR REPLACE FUNCTION enforce_provider_budget_reservation_transition()
+RETURNS trigger LANGUAGE plpgsql AS $provider_budget_reservation_transition$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'provider budget reservations cannot be deleted' USING ERRCODE = '55000';
+  END IF;
+  IF (to_jsonb(NEW) - ARRAY['state', 'settledValue', 'settledAt']::text[])
+      IS DISTINCT FROM
+     (to_jsonb(OLD) - ARRAY['state', 'settledValue', 'settledAt']::text[])
+     OR OLD.state <> 'RESERVED' OR NEW.state <> 'SETTLED'
+     OR NEW."settledValue" IS NULL OR NEW."settledAt" IS NULL THEN
+    RAISE EXCEPTION 'provider budget reservation identity is immutable' USING ERRCODE = '55000';
+  END IF;
+  RETURN NEW;
+END
+$provider_budget_reservation_transition$;
+DROP TRIGGER IF EXISTS provider_budget_reservation_transition ON provider_budget_reservation;
+CREATE TRIGGER provider_budget_reservation_transition BEFORE UPDATE OR DELETE ON provider_budget_reservation
+FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_reservation_transition();
 DROP TRIGGER IF EXISTS provider_audit_event_immutable ON provider_audit_event;
 CREATE TRIGGER provider_audit_event_immutable BEFORE UPDATE OR DELETE ON provider_audit_event
 FOR EACH ROW EXECUTE FUNCTION reject_immutable_provider_history_mutation();
@@ -1257,7 +1286,11 @@ BEGIN
     IF p.id IS NULL OR r.id IS NULL OR r."policyId" <> p.id
        OR p."userId" <> NEW."userId" OR p.version <> NEW."policyVersion"
        OR r.metric::text <> NEW.metric::text OR r.period::text <> NEW.period::text
-       OR r.currency IS DISTINCT FROM NEW.currency THEN
+       OR r.currency IS DISTINCT FROM NEW.currency
+       OR p."providerAccountId" <> NEW."providerAccountId"
+       OR NEW."providerModelId" = ''
+       OR p."poolId" IS DISTINCT FROM NEW."poolId"
+       OR (p."providerModelId" IS NOT NULL AND p."providerModelId" <> NEW."providerModelId") THEN
       RAISE EXCEPTION 'budget reservation must match its policy version and rule' USING ERRCODE = '23514';
     END IF;
     IF NEW."credentialId" IS NOT NULL THEN
@@ -1265,6 +1298,23 @@ BEGIN
       IF c."userId" IS DISTINCT FROM NEW."userId" OR c."providerAccountId" IS DISTINCT FROM p."providerAccountId" THEN
         RAISE EXCEPTION 'budget reservation credential must match policy account' USING ERRCODE = '23514';
       END IF;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM provider_model m WHERE m.id = NEW."providerModelId"
+      AND m."userId" = NEW."userId" AND m."providerAccountId" = NEW."providerAccountId") THEN
+      RAISE EXCEPTION 'budget reservation model must match provider account' USING ERRCODE = '23514';
+    END IF;
+    IF EXISTS (SELECT 1 FROM provider_budget_reservation existing
+      WHERE existing."attemptId" = NEW."attemptId" AND existing.id <> NEW.id
+        AND (existing."userId", existing."providerAccountId", existing."providerModelId",
+             existing."credentialId", existing."poolId", existing."requestId",
+             existing."fencingToken", existing."accountingVersion", existing."pricingVersion",
+             existing."liabilityTokens", existing."liabilitySpend", existing."liabilityCurrency")
+          IS DISTINCT FROM
+            (NEW."userId", NEW."providerAccountId", NEW."providerModelId",
+             NEW."credentialId", NEW."poolId", NEW."requestId",
+             NEW."fencingToken", NEW."accountingVersion", NEW."pricingVersion",
+             NEW."liabilityTokens", NEW."liabilitySpend", NEW."liabilityCurrency")) THEN
+      RAISE EXCEPTION 'budget attempt identity is immutable globally' USING ERRCODE = '23514';
     END IF;
   ELSIF TG_TABLE_NAME = 'provider_pricing_version' THEN
     IF NOT EXISTS (SELECT 1 FROM provider_model m WHERE m.id = NEW."providerModelId"
@@ -1274,9 +1324,10 @@ BEGIN
   ELSIF TG_TABLE_NAME = 'provider_usage_ledger' THEN
     IF NOT EXISTS (SELECT 1 FROM provider_model m WHERE m.id = NEW."providerModelId"
       AND m."userId" = NEW."userId" AND m."providerAccountId" = NEW."providerAccountId")
-      OR NOT EXISTS (SELECT 1 FROM provider_pricing_version pv WHERE pv."providerModelId" = NEW."providerModelId"
-        AND pv.version = NEW."pricingVersion" AND pv.currency = NEW.currency
-        AND pv."providerAccountId" = NEW."providerAccountId" AND pv."userId" = NEW."userId") THEN
+      OR (NEW."pricingVersion" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM provider_pricing_version pv
+        WHERE pv."providerModelId" = NEW."providerModelId"
+          AND pv.version = NEW."pricingVersion" AND pv.currency = NEW.currency
+          AND pv."providerAccountId" = NEW."providerAccountId" AND pv."userId" = NEW."userId")) THEN
       RAISE EXCEPTION 'usage ledger provider and pricing graph is inconsistent' USING ERRCODE = '23514';
     END IF;
     IF NEW."credentialId" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM provider_credential c
@@ -1288,7 +1339,12 @@ BEGIN
       JOIN provider_budget_policy bp ON bp.id = br."policyId" WHERE br.id = NEW."reservationId"
         AND br."userId" = NEW."userId" AND bp."providerAccountId" = NEW."providerAccountId"
         AND br."requestId" = NEW."requestId" AND br."attemptId" = NEW."attemptId"
-        AND br."fencingToken" = NEW."fencingToken") THEN
+        AND br."fencingToken" = NEW."fencingToken"
+        AND br."providerModelId" = NEW."providerModelId"
+        AND br."credentialId" IS NOT DISTINCT FROM NEW."credentialId"
+        AND br."poolId" IS NOT DISTINCT FROM NEW."poolId"
+        AND br."accountingVersion" = NEW."accountingVersion"
+        AND br."pricingVersion" IS NOT DISTINCT FROM NEW."pricingVersion") THEN
       RAISE EXCEPTION 'usage ledger reservation is inconsistent' USING ERRCODE = '23514';
     END IF;
   ELSIF TG_TABLE_NAME = 'provider_budget_settlement' THEN

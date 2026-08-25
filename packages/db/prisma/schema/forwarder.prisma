@@ -518,32 +518,40 @@ model ProviderBudgetRule {
 }
 
 model ProviderBudgetReservation {
-  id            String                     @id @default(cuid(2))
-  createdAt     DateTime                   @default(now())
-  settledAt     DateTime?
-  expiresAt     DateTime?
-  userId        String
-  policyId      String
-  ruleId        String
-  credentialId  String?
-  requestId     String
-  attemptId     String
-  fencingToken  BigInt
-  metric        BudgetMetric
-  period        BudgetPeriod
-  policyVersion Int
-  utcBasis      String                     @default("UTC")
-  windowStart   DateTime?
-  windowEnd     DateTime?
-  reservedValue Decimal                    @db.Decimal(30, 9)
-  settledValue  Decimal?                   @db.Decimal(30, 9)
-  currency      String?
-  state         BudgetReservationState     @default(RESERVED)
-  Policy        ProviderBudgetPolicy       @relation(fields: [policyId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  Rule          ProviderBudgetRule         @relation(fields: [ruleId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  Credential    ProviderCredential?        @relation(fields: [credentialId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
-  UsageLedger   ProviderUsageLedger[]
-  Settlements   ProviderBudgetSettlement[]
+  id                String                     @id @default(cuid(2))
+  createdAt         DateTime                   @default(now())
+  settledAt         DateTime?
+  expiresAt         DateTime?
+  userId            String
+  providerAccountId String
+  providerModelId   String
+  poolId            String?
+  policyId          String
+  ruleId            String
+  credentialId      String?
+  requestId         String
+  attemptId         String
+  fencingToken      BigInt
+  metric            BudgetMetric
+  period            BudgetPeriod
+  policyVersion     Int
+  utcBasis          String                     @default("UTC")
+  windowStart       DateTime?
+  windowEnd         DateTime?
+  reservedValue     Decimal                    @db.Decimal(30, 9)
+  liabilityTokens   BigInt?
+  liabilitySpend    Decimal?                   @db.Decimal(30, 9)
+  liabilityCurrency String?
+  settledValue      Decimal?                   @db.Decimal(30, 9)
+  currency          String?
+  pricingVersion    String?
+  accountingVersion String
+  state             BudgetReservationState     @default(RESERVED)
+  Policy            ProviderBudgetPolicy       @relation(fields: [policyId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  Rule              ProviderBudgetRule         @relation(fields: [ruleId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  Credential        ProviderCredential?        @relation(fields: [credentialId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  UsageLedger       ProviderUsageLedger[]
+  Settlements       ProviderBudgetSettlement[]
 
   @@unique([policyId, ruleId, attemptId])
   @@unique([id, userId])
@@ -575,9 +583,13 @@ model ProviderUsageLedger {
   rawUsage          Json?
   reportedCost      Decimal?                   @db.Decimal(30, 9)
   calculatedCost    Decimal?                   @db.Decimal(30, 9)
-  settledCost       Decimal                    @db.Decimal(30, 9)
-  currency          String
-  pricingVersion    String
+  settledCost       Decimal?                   @db.Decimal(30, 9)
+  currency          String?
+  pricingVersion    String?
+  accountingVersion String
+  usageKnown        Boolean
+  costKnown         Boolean
+  terminalReason    String
   confidence        UsageCostConfidence
   User              User                       @relation("ProviderUsageLedgerOwner", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
   ProviderAccount   ProviderAccount            @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
