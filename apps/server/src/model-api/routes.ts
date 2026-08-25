@@ -3115,6 +3115,10 @@ async function relayPool({
           providerAttemptId: result.attemptId,
           providerFencingToken: result.fencingToken,
           attemptCount: result.attemptCount,
+          affinityOutcome: result.affinity?.outcome ?? "DISABLED",
+          affinityScore: result.affinity?.score,
+          affinityPrefixDepth: result.affinity?.prefixDepth,
+          affinityReason: result.affinity?.reason,
         },
         select: { id: true },
       })

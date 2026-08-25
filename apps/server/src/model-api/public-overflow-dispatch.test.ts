@@ -8,13 +8,47 @@ const releaseProviderHealthTrial = vi.hoisted(() => vi.fn().mockResolvedValue(tr
 const reconcileProviderBudget = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const db = vi.hoisted(() => ({
   modelPool: { findFirst: vi.fn() },
+  providerAttempt: { groupBy: vi.fn().mockResolvedValue([]) },
+  providerPricingVersion: { findFirst: vi.fn() },
+  cacheAffinityRecord: { findMany: vi.fn().mockResolvedValue([]) },
+  capacityLease: { groupBy: vi.fn().mockResolvedValue([]) },
+  capacityWaiter: { groupBy: vi.fn().mockResolvedValue([]) },
   relayRequest: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
   $transaction: vi.fn(),
 }));
 
-vi.mock("@ws-model-proxy/db", () => ({ default: db }));
+const MockDecimal = vi.hoisted(
+  () =>
+    class MockDecimal {
+      value: number;
+      constructor(value: string | number | { toString(): string }) {
+        this.value = Number(value.toString());
+      }
+      isFinite() {
+        return Number.isFinite(this.value);
+      }
+      isNegative() {
+        return this.value < 0;
+      }
+      mul(value: string | number | { toString(): string }) {
+        return new MockDecimal(this.value * Number(value.toString()));
+      }
+      plus(value: string | number | { toString(): string }) {
+        return new MockDecimal(this.value + Number(value.toString()));
+      }
+      div(value: string | number | { toString(): string }) {
+        return new MockDecimal(this.value / Number(value.toString()));
+      }
+      toString() {
+        return String(this.value);
+      }
+    },
+);
+
+vi.mock("@ws-model-proxy/db", () => ({ default: db, Prisma: { Decimal: MockDecimal } }));
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
+    BETTER_AUTH_SECRET: "test-better-auth-secret-at-least-32-bytes",
     WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
     WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: false,
     WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS: `v1:${Buffer.alloc(32, 7).toString("base64")}`,
@@ -45,7 +79,11 @@ vi.mock("./provider-attempt-runtime.js", () => ({
   releaseProviderHealthTrial,
 }));
 
-import { dispatchPublicOverflow, listPublicOverflowTargets } from "./public-overflow.js";
+import {
+  dispatchPublicOverflow,
+  listPublicOverflowTargets,
+  rankPublicOverflowTargets,
+} from "./public-overflow.js";
 
 function dispatchPoolFixture(
   protocol = "openai",
@@ -108,6 +146,91 @@ function dispatchPoolFixture(
 }
 
 describe("public overflow terminal response dispatch", () => {
+  it("ranks only overflow-eligible providers and uses immutable pricing, health, and load penalties", async () => {
+    const fixture = dispatchPoolFixture();
+    const first = fixture.PoolMembers[0]!;
+    const second = structuredClone(first);
+    first.id = "member-expensive";
+    first.publicOrder = 0;
+    first.ExecutionTarget.id = "target-expensive";
+    first.ExecutionTarget.ProviderModel.id = "model-expensive";
+    first.ExecutionTarget.ProviderModel.ProviderAccount.id = "account-expensive";
+    second.id = "member-cheap";
+    second.publicOrder = 1;
+    second.ExecutionTarget.id = "target-cheap";
+    second.ExecutionTarget.ProviderModel.id = "model-cheap";
+    second.ExecutionTarget.ProviderModel.ProviderAccount.id = "account-cheap";
+    fixture.PoolMembers.push(second);
+    Object.assign(fixture, {
+      affinityEnabled: true,
+      affinityTtlSeconds: 600,
+      affinityMaxRecords: 100,
+      affinityPrefixWeight: 100,
+      affinityConversationWeight: 150,
+      affinityConfirmedCacheWeight: 250,
+      affinityLoadPenaltyWeight: 100,
+    });
+    db.modelPool.findFirst.mockResolvedValue(fixture);
+    db.providerAttempt.groupBy.mockResolvedValue([
+      { providerModelId: "model-expensive", _count: { _all: 1 } },
+    ]);
+    const schedule = (rate: number) => ({
+      id: `price-${rate}`,
+      version: `v-${rate}`,
+      currency: "USD",
+      accountingVersion: "provider-billable-v1",
+      confidence: "CALCULATED",
+      effectiveAt: new Date(0),
+      pricing: { ratesPerMillion: { input: rate, output: rate } },
+      chargeRules: {
+        unknownCategories: "FAIL_CLOSED",
+        inputIncludesCacheRead: true,
+        inputIncludesCacheWrite: true,
+        outputIncludesReasoning: true,
+        outputIncludesTool: true,
+        cacheReadAllowanceTokens: 0,
+        cacheWriteAllowanceTokens: 0,
+        reasoningAllowanceTokens: 0,
+        toolAllowanceTokens: 0,
+        additionalAllowanceTokens: 0,
+      },
+    });
+    db.providerPricingVersion.findFirst
+      .mockResolvedValueOnce(schedule(100))
+      .mockResolvedValueOnce(schedule(1));
+    const listed = await listPublicOverflowTargets("owner", "pool");
+    const request = {
+      userId: "owner",
+      poolId: "pool",
+      requestId: "request",
+      reason: "NO_COMPATIBLE_HEALTHY_PRIMARY" as const,
+      requestedProtocol: "openai" as const,
+      requestedSurface: "openai-chat" as const,
+      stream: false,
+      requiredFeatures: [],
+      path: "/v1/chat/completions",
+      headers: new Headers(),
+      body: new TextEncoder().encode('{"model":"pool","messages":[{"role":"user","content":"x"}]}'),
+      signal: new AbortController().signal,
+      liability: { accountingVersion: "provider-billable-v1" },
+      estimatedInputTokens: 100n,
+      requestedOutputTokens: 100n,
+      releaseLocalCapacity: vi.fn(),
+      adaptationEnabled: false,
+      retrySafe: false,
+    };
+    const ranked = await rankPublicOverflowTargets({
+      request,
+      policy: listed.affinityPolicy,
+      targets: listed.targets,
+    });
+    expect(ranked.targets.map((target) => target.executionTargetId)).toEqual([
+      "target-cheap",
+      "target-expensive",
+    ]);
+    expect(ranked.targets[0]?.affinity?.reason).toContain("publicPenalty:100");
+    expect(ranked.targets[1]?.affinity?.reason).toContain("active:1");
+  });
   it.each([
     {
       label: "OpenAI partial usage",

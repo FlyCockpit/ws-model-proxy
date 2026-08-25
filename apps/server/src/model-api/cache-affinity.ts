@@ -26,6 +26,9 @@ export type AffinityTarget = {
   healthPenalty: number;
   publicEgressPenalty: number;
   costPenalty: number;
+  /** Precomputed load for targets that do not use the local capacity tables. */
+  activeLoad?: number;
+  waitingLoad?: number;
 };
 
 export type AffinityDecision = {
@@ -283,8 +286,8 @@ export async function rankAffinityTargets({
       (record) =>
         (digestDepth.get(record.prefixDigest) ?? 0) === prefixDepth && record.engineCacheConfirmed,
     );
-    const active = activeByCapacity.get(target.capacityId) ?? 0;
-    const waiting = waitingByCapacity.get(target.capacityId) ?? 0;
+    const active = target.activeLoad ?? activeByCapacity.get(target.capacityId) ?? 0;
+    const waiting = target.waitingLoad ?? waitingByCapacity.get(target.capacityId) ?? 0;
     const normalizedLoad = target.hardConcurrencyLimit
       ? Math.ceil((active * 100) / target.hardConcurrencyLimit) + waiting * 100
       : active * 100 + waiting * 100;

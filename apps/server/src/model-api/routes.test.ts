@@ -78,6 +78,7 @@ const db = prisma as unknown as {
     update: MockInstance;
   };
   modelPool: {
+    findFirst: MockInstance;
     findUnique: MockInstance;
     findMany: MockInstance;
   };
@@ -603,6 +604,9 @@ describe("model API routes", () => {
         }),
       }),
     );
+    // An acceptable primary completes without even listing public providers;
+    // overflow affinity is therefore incapable of crossing the tier boundary.
+    expect(db.modelPool.findFirst).not.toHaveBeenCalled();
   });
 
   it("adapts an opted-in Chat pool request through a Responses-only member", async () => {

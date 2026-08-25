@@ -10,6 +10,14 @@ import {
 } from "@ws-model-proxy/api/lib/provider-egress";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
+import {
+  type AffinityDecision,
+  type AffinityPolicy,
+  type AffinityTarget,
+  buildAffinityTargetIdentity,
+  rankAffinityTargets,
+  rememberAffinity,
+} from "./cache-affinity.js";
 import type { ProtocolSurface } from "./protocols/index.js";
 import { SseDecoder } from "./protocols/sse.js";
 import {
@@ -102,6 +110,9 @@ export interface PublicProviderTarget {
   maxOutputTokens: number | null;
   protocol: ProviderProtocol;
   providerAccountId: string;
+  endpointIdentity: string;
+  endpointVersion: number;
+  concurrencyLimit: number | null;
   providerVersion: string | null;
   baseUrl: string;
   authType: "API_KEY" | "BEARER";
@@ -120,7 +131,16 @@ export interface PublicProviderTarget {
     nonce: Uint8Array<ArrayBuffer>;
     authTag: Uint8Array<ArrayBuffer>;
   };
+  affinity?: { outcome: string; score?: number; prefixDepth?: number; reason?: string };
+  affinityTarget?: AffinityTarget;
 }
+
+type ListedPublicOverflowTargets = {
+  enabled: boolean;
+  acknowledged: boolean;
+  affinityPolicy: AffinityPolicy;
+  targets: PublicProviderTarget[];
+};
 
 function providerEventRouting(input: {
   request: PublicOverflowRequest;
@@ -144,7 +164,7 @@ function providerEventRouting(input: {
     executionTargetId: input.target.executionTargetId,
     memberTier: "PUBLIC_OVERFLOW",
     triggerReason: input.request.reason,
-    affinityOutcome: "NONE",
+    affinityOutcome: input.target.affinity?.outcome ?? "NONE",
     contextCountMethod: input.request.contextCountMethod,
     contextCountConfidence: input.request.contextCountConfidence,
   };
@@ -280,6 +300,7 @@ export type PublicOverflowResult =
       terminal: Promise<{ ok: boolean; responseBytes: number }>;
       /** Record commitment only when the final rendered response emits a byte. */
       markFirstClientByte: () => Promise<void>;
+      affinity: PublicProviderTarget["affinity"];
     }
   | { dispatched: false; reason: PublicOverflowSkipReason; detail?: string };
 
@@ -327,12 +348,19 @@ function supportedFeatures(value: unknown): string[] {
 export async function listPublicOverflowTargets(
   userId: string,
   poolId: string,
-): Promise<{ enabled: boolean; acknowledged: boolean; targets: PublicProviderTarget[] }> {
+): Promise<ListedPublicOverflowTargets> {
   const pool = await prisma.modelPool.findFirst({
     where: { id: poolId, userId },
     select: {
       publicEgressEnabled: true,
       publicEgressAcknowledged: true,
+      affinityEnabled: true,
+      affinityTtlSeconds: true,
+      affinityMaxRecords: true,
+      affinityPrefixWeight: true,
+      affinityConversationWeight: true,
+      affinityConfirmedCacheWeight: true,
+      affinityLoadPenaltyWeight: true,
       PoolMembers: {
         where: { tier: "PUBLIC_OVERFLOW", routingStatus: "ACTIVE" },
         orderBy: [{ publicOrder: "asc" }, { id: "asc" }],
@@ -349,6 +377,7 @@ export async function listPublicOverflowTargets(
                   upstreamModelId: true,
                   contextWindow: true,
                   maxOutputTokens: true,
+                  concurrencyLimit: true,
                   nativeCapabilities: true,
                   healthStatus: true,
                   healthNextRetryAt: true,
@@ -361,6 +390,8 @@ export async function listPublicOverflowTargets(
                       providerType: true,
                       providerVersion: true,
                       baseUrl: true,
+                      endpointIdentity: true,
+                      endpointVersion: true,
                       authType: true,
                       healthStatus: true,
                       healthNextRetryAt: true,
@@ -389,7 +420,22 @@ export async function listPublicOverflowTargets(
       },
     },
   });
-  if (!pool) return { enabled: false, acknowledged: false, targets: [] };
+  const defaultAffinityPolicy: AffinityPolicy = {
+    enabled: false,
+    ttlSeconds: 3600,
+    maxRecords: 10_000,
+    prefixWeight: 100,
+    conversationWeight: 150,
+    confirmedCacheWeight: 250,
+    loadPenaltyWeight: 100,
+  };
+  if (!pool)
+    return {
+      enabled: false,
+      acknowledged: false,
+      affinityPolicy: defaultAffinityPolicy,
+      targets: [],
+    };
   const targets = pool.PoolMembers.flatMap((member) => {
     const model = member.ExecutionTarget?.ProviderModel;
     const account = model?.ProviderAccount;
@@ -423,6 +469,9 @@ export async function listPublicOverflowTargets(
         maxOutputTokens: model.maxOutputTokens,
         protocol,
         providerAccountId: account.id,
+        endpointIdentity: account.endpointIdentity,
+        endpointVersion: account.endpointVersion,
+        concurrencyLimit: model.concurrencyLimit,
         providerVersion: account.providerVersion,
         baseUrl: account.baseUrl,
         authType: account.authType,
@@ -438,6 +487,15 @@ export async function listPublicOverflowTargets(
   return {
     enabled: pool.publicEgressEnabled,
     acknowledged: pool.publicEgressAcknowledged,
+    affinityPolicy: {
+      enabled: pool.affinityEnabled,
+      ttlSeconds: pool.affinityTtlSeconds,
+      maxRecords: pool.affinityMaxRecords,
+      prefixWeight: pool.affinityPrefixWeight,
+      conversationWeight: pool.affinityConversationWeight,
+      confirmedCacheWeight: pool.affinityConfirmedCacheWeight,
+      loadPenaltyWeight: pool.affinityLoadPenaltyWeight,
+    },
     targets,
   };
 }
@@ -952,6 +1010,146 @@ function selectedNativeSurface(target: PublicProviderTarget, requested: Protocol
   );
 }
 
+function providerHealthPenalty(status: PublicProviderTarget["healthStatus"]): number {
+  return status === "UNAVAILABLE"
+    ? 200
+    : status === "DEGRADED"
+      ? 100
+      : status === "UNKNOWN"
+        ? 25
+        : 0;
+}
+
+function providerCostPenalty(liability: ProviderLiability): number {
+  if (!liability.spend) return 0;
+  // One score point per micro-unit of the provider's configured currency. The
+  // value is derived from the selected immutable pricing schedule, not labels
+  // or administrator ordering.
+  return Math.min(
+    Number.MAX_SAFE_INTEGER,
+    Math.ceil(Number(liability.spend.toString()) * 1_000_000),
+  );
+}
+
+export async function rankPublicOverflowTargets(input: {
+  request: PublicOverflowRequest;
+  policy: AffinityPolicy;
+  targets: PublicProviderTarget[];
+}): Promise<{ targets: PublicProviderTarget[]; decision: AffinityDecision | null }> {
+  if (!input.policy.enabled || input.targets.length < 2)
+    return { targets: input.targets, decision: null };
+  let payload: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(input.request.body));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+      return { targets: input.targets, decision: null };
+    payload = parsed as Record<string, unknown>;
+  } catch {
+    return { targets: input.targets, decision: null };
+  }
+  const [loads, pricing] = await Promise.all([
+    prisma.providerAttempt.groupBy({
+      by: ["providerModelId"],
+      where: {
+        userId: input.request.userId,
+        state: "ACTIVE",
+        providerModelId: { in: input.targets.map((target) => target.providerModelId) },
+      },
+      _count: { _all: true },
+    }),
+    Promise.all(
+      input.targets.map((target) =>
+        resolveActiveProviderPricing({
+          userId: input.request.userId,
+          providerAccountId: target.providerAccountId,
+          providerModelId: target.providerModelId,
+        }),
+      ),
+    ),
+  ]);
+  const loadByModel = new Map(loads.map((row) => [row.providerModelId, row._count._all]));
+  const affinityTargets = input.targets.map((target, index) => {
+    const targetPricing = pricing[index];
+    const liability =
+      input.request.estimatedInputTokens !== undefined &&
+      input.request.requestedOutputTokens !== undefined
+        ? liabilityFromPricing({
+            estimatedInputTokens: input.request.estimatedInputTokens,
+            requestedOutputTokens: input.request.requestedOutputTokens,
+            pricing: targetPricing,
+          })
+        : input.request.liability;
+    return {
+      poolMemberId: target.poolMemberId,
+      executionTargetId: target.executionTargetId,
+      targetIdentity: buildAffinityTargetIdentity({
+        executionTargetId: target.executionTargetId,
+        endpointIdentity: `${target.providerAccountId}:${target.endpointIdentity}:${target.endpointVersion}`,
+        upstreamModelId: `${target.providerModelId}:${target.upstreamModelId}`,
+        runtimeIdentityKey: target.providerAccountId,
+        runtimeModel: target.upstreamModelId,
+        runtimeRevision: target.providerVersion,
+        tokenizer: null,
+        tokenizerVersion: null,
+        template: null,
+        templateVersion: null,
+        engine: target.protocol,
+        cacheNamespace: null,
+        requestedSurface: input.request.requestedSurface,
+        nativeSurface:
+          selectedNativeSurface(target, input.request.requestedSurface) ??
+          input.request.requestedSurface,
+        mode: target.nativeSurfaces.includes(input.request.requestedSurface) ? "native" : "adapted",
+        adapterVersion: target.nativeSurfaces.includes(input.request.requestedSurface)
+          ? "native"
+          : "1.0.0",
+      }),
+      capacityId: `provider:${target.providerModelId}`,
+      hardConcurrencyLimit: target.concurrencyLimit ?? null,
+      activeLoad: loadByModel.get(target.providerModelId) ?? 0,
+      waitingLoad: 0,
+      healthPenalty: providerHealthPenalty(target.healthStatus),
+      publicEgressPenalty: 100,
+      costPenalty: providerCostPenalty(liability),
+    };
+  });
+  const decision = await rankAffinityTargets({
+    ownerId: input.request.userId,
+    resourceOwnerId: input.request.userId,
+    poolId: input.request.poolId,
+    policy: input.policy,
+    surface: input.request.requestedSurface,
+    payload,
+    targets: affinityTargets,
+  });
+  const byId = new Map(input.targets.map((target) => [target.executionTargetId, target]));
+  return {
+    decision,
+    targets: decision.orderedTargetIds.flatMap((id) => {
+      const target = byId.get(id);
+      return target
+        ? [
+            {
+              ...target,
+              affinityTarget: affinityTargets.find(
+                (candidate) => candidate.executionTargetId === id,
+              ),
+              affinity: {
+                outcome:
+                  (decision.prefixDepths[id] ?? 0) > 0 || decision.conversationMatches[id]
+                    ? "PREDICTED_MATCH"
+                    : "NO_MATCH",
+                score: decision.scores[id],
+                prefixDepth: decision.prefixDepths[id],
+                reason: decision.reasons[id],
+              },
+            },
+          ]
+        : [];
+    }),
+  };
+}
+
 /**
  * Dispatches ordered provider attempts. Every attempt owns a distinct durable
  * budget reservation and is reconciled before the next target is considered.
@@ -994,6 +1192,12 @@ export async function dispatchPublicOverflow(
     return { dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" };
   }
 
+  const ranked = await rankPublicOverflowTargets({
+    request,
+    policy: listed.affinityPolicy,
+    targets: compatible,
+  });
+
   await request.releaseLocalCapacity();
   const keyringValue = env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS;
   if (!keyringValue) return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
@@ -1001,7 +1205,7 @@ export async function dispatchPublicOverflow(
   let lastAdmission: ProviderBudgetAdmission | undefined;
   let attemptCount = 0;
 
-  for (const target of compatible) {
+  for (const target of ranked.targets) {
     const nativeSurface = selectedNativeSurface(target, request.requestedSurface);
     if (!nativeSurface) continue;
     attemptCount += 1;
@@ -1543,8 +1747,36 @@ export async function dispatchPublicOverflow(
         fencingToken,
         nativeSurface,
         attemptCount,
-        terminal,
+        terminal: terminal.then(async (outcome) => {
+          if (outcome.ok && target.affinityTarget) {
+            try {
+              const parsed: unknown = JSON.parse(new TextDecoder().decode(request.body));
+              if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+                await rememberAffinity({
+                  ownerId: request.userId,
+                  resourceOwnerId: request.userId,
+                  poolId: request.poolId,
+                  policy: listed.affinityPolicy,
+                  surface: request.requestedSurface,
+                  payload: parsed as Record<string, unknown>,
+                  target: target.affinityTarget,
+                  estimatedTokens:
+                    request.estimatedInputTokens === undefined
+                      ? undefined
+                      : Number(
+                          request.estimatedInputTokens > BigInt(Number.MAX_SAFE_INTEGER)
+                            ? BigInt(Number.MAX_SAFE_INTEGER)
+                            : request.estimatedInputTokens,
+                        ),
+                });
+            } catch {
+              // Affinity is a best-effort routing hint and cannot change a terminal result.
+            }
+          }
+          return outcome;
+        }),
         markFirstClientByte,
+        affinity: target.affinity,
         response: new Response(bodyForbidden ? null : heldBody, {
           status,
           headers: responseHeaders(response.headers),
