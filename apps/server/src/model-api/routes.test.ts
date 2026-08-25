@@ -20,6 +20,11 @@ const affinity = vi.hoisted(() => ({
   rank: vi.fn(),
   remember: vi.fn(),
 }));
+const publicOverflow = vi.hoisted(() => ({ dispatch: vi.fn() }));
+vi.mock("./public-overflow.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./public-overflow.js")>();
+  return { ...actual, dispatchPublicOverflow: publicOverflow.dispatch };
+});
 vi.mock("./cache-affinity.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./cache-affinity.js")>();
   return {
@@ -541,6 +546,10 @@ describe("model API routes", () => {
       matchedPrefixDepth: 0,
     }));
     affinity.remember.mockResolvedValue(undefined);
+    publicOverflow.dispatch.mockResolvedValue({
+      dispatched: false,
+      reason: "DEPLOYMENT_GATE_DISABLED",
+    });
   });
 
   it("applies affinity only after pool compatibility and persists it after success", async () => {
@@ -3761,6 +3770,111 @@ describe("model API routes", () => {
     );
     resolveUpsert({ id: "binding-id" });
     await expect(eof).resolves.toEqual({ done: true, value: undefined });
+  });
+
+  it("round-trips stored provider Responses through one native immutable binding", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([]);
+    const providerTarget = {
+      poolMemberId: "provider-member",
+      executionTargetId: "provider-target",
+      providerAccountId: "provider-account",
+      providerModelId: "provider-model",
+      endpointIdentity: "https://provider.example/v1",
+      endpointVersion: 4,
+      upstreamModelId: "gpt-response",
+    };
+    publicOverflow.dispatch.mockResolvedValueOnce({
+      dispatched: true,
+      response: new Response(JSON.stringify({ id: "resp_provider", object: "response" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+      target: providerTarget,
+      attemptId: "provider-attempt-create",
+      fencingToken: 1n,
+      nativeSurface: "openai-responses",
+      attemptCount: 1,
+      terminal: Promise.resolve({ ok: true, responseBytes: 48 }),
+      markFirstClientByte: vi.fn().mockResolvedValue(undefined),
+      affinity: undefined,
+    });
+    const create = await appWith(new FakeRelayManager()).request("/responses", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: poolTarget.modelId, input: "hello", store: true }),
+    });
+    expect(create.status).toBe(200);
+    await expect(create.json()).resolves.toMatchObject({ id: "resp_provider" });
+    await vi.waitFor(() => expect(db.responseStickinessRecord.upsert).toHaveBeenCalled());
+    const binding = db.responseStickinessRecord.upsert.mock.calls.at(-1)?.[0].create;
+    expect(binding).toMatchObject({
+      routingVersion: 3,
+      targetModelPoolId: "pool-id",
+      selectedExecutionTargetId: "provider-target",
+      providerAccountId: "provider-account",
+      providerModelId: "provider-model",
+      providerEndpointIdentity: "https://provider.example/v1",
+      providerEndpointVersion: 4,
+      providerUpstreamModelId: "gpt-response",
+      nativeSurface: "OPENAI_RESPONSES",
+    });
+    expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({
+      requestedSurface: "openai-responses",
+      requireNativeSurface: "openai-responses",
+      adaptationEnabled: false,
+    });
+
+    db.responseStickinessRecord.findUnique.mockResolvedValue({
+      ...binding,
+      userId: "user-id",
+      modelApiTokenId: "token-id",
+      TargetExecutionTarget: null,
+      SelectedExecutionTarget: { discoveredModelId: null },
+    });
+    publicOverflow.dispatch.mockResolvedValueOnce({
+      dispatched: true,
+      response: new Response(JSON.stringify({ id: "resp_provider", object: "response" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+      target: providerTarget,
+      attemptId: "provider-attempt-retrieve",
+      fencingToken: 2n,
+      nativeSurface: "openai-responses",
+      attemptCount: 1,
+      terminal: Promise.resolve({ ok: true, responseBytes: 48 }),
+      markFirstClientByte: vi.fn().mockResolvedValue(undefined),
+      affinity: undefined,
+    });
+    const retrieve = await appWith(new FakeRelayManager()).request(
+      "/responses/resp_provider?include[]=output",
+      { headers: { authorization: "Bearer wsmp_model_test" } },
+    );
+    expect(retrieve.status).toBe(200);
+    await retrieve.text();
+    expect(publicOverflow.dispatch).toHaveBeenCalledTimes(2);
+    expect(publicOverflow.dispatch.mock.calls[1]?.[0]).toMatchObject({
+      method: "GET",
+      path: "/v1/responses/resp_provider?include[]=output",
+      retrySafe: false,
+      adaptationEnabled: false,
+      exactResponsesBinding: {
+        executionTargetId: "provider-target",
+        providerAccountId: "provider-account",
+        providerModelId: "provider-model",
+        endpointIdentity: "https://provider.example/v1",
+        endpointVersion: 4,
+        upstreamModelId: "gpt-response",
+      },
+    });
+    expect(db.relayRequest.create.mock.calls.at(-1)?.[0].data.operation).toBe("responses.retrieve");
   });
 
   it("uses metadata-only sticky routing for Responses API follow-up requests", async () => {

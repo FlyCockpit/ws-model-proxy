@@ -396,11 +396,33 @@ try {
       'sticky-provider-account', 'sticky-provider-model', 'https://api.example.test/v1', 1,
       'gpt-responses', 'OPENAI_RESPONSES',
       'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-', NOW() + INTERVAL '1 hour');
+    INSERT INTO response_stickiness_record
+      (id, "createdAt", "updatedAt", "userId", "modelApiTokenId", "routingKeyDigest",
+       "routingVersion", "targetDiscoveredModelId", "selectedDiscoveredModelId", "expiresAt")
+    VALUES ('legacy-sticky-collision', NOW(), NOW(), 'owner-a', 'sticky-provider-token',
+      'legacy-sticky-routing-digest', 1, 'model-a', 'model-a', NOW() + INTERVAL '1 hour');
   `);
   await expectConstraintFailure(`
     UPDATE response_stickiness_record
        SET "providerEndpointVersion" = 2
      WHERE id = 'sticky-provider-binding'
+  `);
+  await expectConstraintFailure(`
+    UPDATE response_stickiness_record
+       SET "routingVersion" = 3,
+           "targetDiscoveredModelId" = NULL,
+           "selectedDiscoveredModelId" = NULL,
+           "targetModelPoolId" = 'sticky-provider-pool',
+           "selectedExecutionTargetId" = 'sticky-provider-target',
+           "providerAccountId" = 'sticky-provider-account',
+           "providerModelId" = 'sticky-provider-model',
+           "providerEndpointIdentity" = 'https://api.example.test/v1',
+           "providerEndpointVersion" = 1,
+           "providerUpstreamModelId" = 'gpt-responses',
+           "nativeSurface" = 'OPENAI_RESPONSES',
+           "upstreamResponseIdDigest" =
+             'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-'
+     WHERE id = 'legacy-sticky-collision'
   `);
   await client.query(`
     UPDATE provider_account

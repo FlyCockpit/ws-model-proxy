@@ -300,6 +300,8 @@ ALTER TABLE response_stickiness_record
     OR
     ("routingVersion" >= 3 AND "providerAccountId" IS NOT NULL AND "providerModelId" IS NOT NULL
       AND "selectedExecutionTargetId" IS NOT NULL AND "targetModelPoolId" IS NOT NULL
+      AND "targetDiscoveredModelId" IS NULL AND "targetExecutionTargetId" IS NULL
+      AND "selectedDiscoveredModelId" IS NULL
       AND "providerEndpointIdentity" IS NOT NULL AND length("providerEndpointIdentity") > 0
       AND "providerEndpointVersion" IS NOT NULL AND "providerEndpointVersion" > 0
       AND "providerUpstreamModelId" IS NOT NULL AND length("providerUpstreamModelId") > 0
@@ -311,11 +313,16 @@ ALTER TABLE response_stickiness_record
 CREATE OR REPLACE FUNCTION enforce_response_stickiness_provider_binding_immutable()
 RETURNS trigger LANGUAGE plpgsql AS $response_stickiness_provider_binding_immutable$
 BEGIN
-  IF OLD."routingVersion" >= 3 AND (
-    NEW."userId" IS DISTINCT FROM OLD."userId"
+  IF NEW."routingVersion" >= 3 AND (
+    OLD."routingVersion" < 3
+    OR NEW."routingVersion" IS DISTINCT FROM OLD."routingVersion"
+    OR NEW."userId" IS DISTINCT FROM OLD."userId"
     OR NEW."modelApiTokenId" IS DISTINCT FROM OLD."modelApiTokenId"
     OR NEW."routingKeyDigest" IS DISTINCT FROM OLD."routingKeyDigest"
+    OR NEW."targetDiscoveredModelId" IS DISTINCT FROM OLD."targetDiscoveredModelId"
+    OR NEW."targetExecutionTargetId" IS DISTINCT FROM OLD."targetExecutionTargetId"
     OR NEW."targetModelPoolId" IS DISTINCT FROM OLD."targetModelPoolId"
+    OR NEW."selectedDiscoveredModelId" IS DISTINCT FROM OLD."selectedDiscoveredModelId"
     OR NEW."selectedExecutionTargetId" IS DISTINCT FROM OLD."selectedExecutionTargetId"
     OR NEW."providerAccountId" IS DISTINCT FROM OLD."providerAccountId"
     OR NEW."providerModelId" IS DISTINCT FROM OLD."providerModelId"

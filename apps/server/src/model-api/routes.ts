@@ -2060,9 +2060,26 @@ async function writeProviderResponseStickiness(input: {
       upstreamResponseIdDigest: upstreamResponseIdDigest(input.responseId),
       expiresAt: new Date(Date.now() + RESPONSES_STICKINESS_TTL_MS),
     },
-    // Provider bindings are immutable. A duplicate upstream id can only extend
-    // expiry for the identical tuple; the database trigger rejects identity drift.
-    update: { expiresAt: new Date(Date.now() + RESPONSES_STICKINESS_TTL_MS) },
+    // Submit the complete tuple on conflict. The database trigger permits an
+    // expiry refresh only when every v3 identity field is identical and rejects
+    // collisions with legacy/local rows or another provider endpoint.
+    update: {
+      routingVersion: 3,
+      modelApiTokenId: input.requester.modelApiTokenId,
+      targetDiscoveredModelId: null,
+      targetExecutionTargetId: null,
+      targetModelPoolId: input.targetModelPoolId,
+      selectedDiscoveredModelId: null,
+      selectedExecutionTargetId: input.executionTargetId,
+      providerAccountId: input.providerAccountId,
+      providerModelId: input.providerModelId,
+      providerEndpointIdentity: input.endpointIdentity,
+      providerEndpointVersion: input.endpointVersion,
+      providerUpstreamModelId: input.upstreamModelId,
+      nativeSurface: "OPENAI_RESPONSES",
+      upstreamResponseIdDigest: upstreamResponseIdDigest(input.responseId),
+      expiresAt: new Date(Date.now() + RESPONSES_STICKINESS_TTL_MS),
+    },
     select: { id: true },
   });
 }
