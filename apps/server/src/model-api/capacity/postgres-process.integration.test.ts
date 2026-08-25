@@ -918,7 +918,10 @@ integration("capacity admission across operating-system processes", () => {
         ports[0] = restartedResult.port;
       }
 
-      const interrupted = request(ports[0]!);
+      const interruptedOutcome = request(ports[0]!).then(
+        (response) => ({ response, error: undefined }),
+        (error: unknown) => ({ response: undefined, error }),
+      );
       const controlled = await waitFor(() => upstreamResponses.shift(), 10_000);
       const selectedApplicationName = workers[0]!.applicationName;
       if (!selectedApplicationName) throw new Error("Production worker application name missing.");
@@ -953,10 +956,23 @@ integration("capacity admission across operating-system processes", () => {
         () => upstreamResponses.find((entry) => entry.path.includes("/secondary/")),
         10_000,
       );
+      const recoveredBackendRows = await waitFor(() =>
+        db.$queryRaw<Array<{ pid: number }>>`
+          SELECT pid FROM pg_stat_activity
+           WHERE application_name = ${selectedApplicationName}
+             AND pid <> pg_backend_pid()`.then((rows) => {
+          const recovered = rows.filter((row) => !selectedBackendPids.includes(row.pid));
+          return recovered.length > 0 ? recovered : undefined;
+        }),
+      );
+      expect(recoveredBackendRows.every((row) => !selectedBackendPids.includes(row.pid))).toBe(
+        true,
+      );
       fallback.response.writeHead(503, { "content-type": "application/json" });
       fallback.response.end(JSON.stringify({ error: { message: "controlled fallback failure" } }));
-      const interruptedResponse = await interrupted;
-      expect(interruptedResponse.status).toBeGreaterThanOrEqual(400);
+      const interrupted = await interruptedOutcome;
+      if (!interrupted.response) throw interrupted.error;
+      expect(interrupted.response.status).toBeGreaterThanOrEqual(400);
       const interruptedLease = await db.providerAttempt.findFirst({
         where: { providerModelId: primary.model.id },
         orderBy: { createdAt: "desc" },
