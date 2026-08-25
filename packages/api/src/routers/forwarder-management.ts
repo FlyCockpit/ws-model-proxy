@@ -1162,63 +1162,136 @@ export const forwarderManagementRouter = {
   }),
   createGuardedModelPool: protectedProcedure
     .input(
-      z
-        .object({
-          slug: poolSlugSchema,
-          name: poolNameSchema,
-          localModelIds: z.array(idSchema).min(1).max(64),
-          recommendedSurface: z.enum(modelApiSurfaces),
-          memberConcurrencyLimit: z.number().int().min(1).max(10_000),
-          memberContextCeiling: z.number().int().min(1).max(100_000_000),
-          reservedSlots: z.number().int().min(0).max(10_000),
-          localWaitBudgetMs: z.number().int().min(0).max(600_000),
-          publicEgressAcknowledged: z.boolean(),
-          providerModels: z
-            .array(
-              z.object({
-                providerModelId: idSchema,
-                concurrencyLimit: z.number().int().min(1).max(10_000),
-                dailySpendLimit: z
-                  .string()
-                  .regex(/^\d+(?:\.\d{1,9})?$/)
-                  .refine((value) => new Prisma.Decimal(value).greaterThan(0)),
-              }),
-            )
-            .max(32),
-        })
-        .superRefine((input, ctx) => {
-          if (input.reservedSlots > input.memberConcurrencyLimit) {
-            ctx.addIssue({
-              code: "custom",
-              path: ["reservedSlots"],
-              message: "Reserved slots exceed member concurrency",
-            });
-          }
-          if (input.providerModels.length > 0 && !input.publicEgressAcknowledged) {
-            ctx.addIssue({
-              code: "custom",
-              path: ["publicEgressAcknowledged"],
-              message: "Public egress acknowledgement is required",
-            });
-          }
-          if (new Set(input.localModelIds).size !== input.localModelIds.length) {
-            ctx.addIssue({
-              code: "custom",
-              path: ["localModelIds"],
-              message: "Duplicate local model",
-            });
-          }
-          if (
-            new Set(input.providerModels.map((item) => item.providerModelId)).size !==
-            input.providerModels.length
-          ) {
-            ctx.addIssue({
-              code: "custom",
-              path: ["providerModels"],
-              message: "Duplicate provider model",
-            });
-          }
-        }),
+      (() => {
+        const positiveDecimal = z
+          .string()
+          .regex(/^\d+(?:\.\d{1,9})?$/)
+          .refine((value) => new Prisma.Decimal(value).greaterThan(0));
+        const integerRule = (maximum: number) =>
+          z.discriminatedUnion("mode", [
+            z.object({ mode: z.literal("UNLIMITED"), limitValue: z.null() }),
+            z.object({
+              mode: z.literal("LIMITED"),
+              limitValue: z.number().int().min(1).max(maximum),
+            }),
+          ]);
+        const spendRule = z.discriminatedUnion("mode", [
+          z.object({ mode: z.literal("UNLIMITED"), limitValue: z.null() }),
+          z.object({ mode: z.literal("LIMITED"), limitValue: positiveDecimal }),
+        ]);
+        return z
+          .object({
+            slug: poolSlugSchema,
+            name: poolNameSchema,
+            localModelIds: z.array(idSchema).min(1).max(64),
+            recommendedSurface: z.enum(modelApiSurfaces),
+            memberConcurrencyLimit: z.number().int().min(1).max(10_000),
+            memberContextCeiling: z.number().int().min(1).max(100_000_000),
+            reservedSlots: z.number().int().min(0).max(10_000),
+            localWaitBudgetMs: z.number().int().min(0).max(600_000),
+            publicEgressAcknowledged: z.boolean(),
+            advanced: z
+              .object({
+                physicalCountStrategy: z.enum([
+                  "TOKENIZER",
+                  "TEMPLATE_AWARE",
+                  "ENGINE_REPORTED",
+                  "CONSERVATIVE_ESTIMATE",
+                ]),
+                contextMargin: z.number().int().min(0).max(10_000_000),
+                borrowPolicy: z.enum(["NEVER", "WHEN_IDLE"]),
+                protocolAdaptationEnabled: z.boolean(),
+                allowLossyDeveloperRoleCollapse: z.boolean(),
+                affinity: z.object({
+                  enabled: z.boolean(),
+                  ttlSeconds: z.number().int().min(60).max(604_800),
+                  maxRecords: z.number().int().min(100).max(100_000),
+                  prefixWeight: z.number().int().min(0).max(10_000),
+                  conversationWeight: z.number().int().min(0).max(10_000),
+                  confirmedCacheWeight: z.number().int().min(0).max(10_000),
+                  loadPenaltyWeight: z.number().int().min(0).max(10_000),
+                }),
+                memberOverrides: z
+                  .array(
+                    z.object({
+                      discoveredModelId: idSchema,
+                      concurrency: integerRule(10_000),
+                      reservedSlots: z.number().int().min(0).max(10_000),
+                      borrowPolicy: z.enum(["NEVER", "WHEN_IDLE"]),
+                      waitBudget: integerRule(600_000),
+                      contextCeiling: integerRule(100_000_000),
+                      contextMargin: z.number().int().min(0).max(10_000_000),
+                    }),
+                  )
+                  .max(64),
+              })
+              .optional(),
+            providerModels: z
+              .array(
+                z.object({
+                  providerModelId: idSchema,
+                  concurrencyLimit: z.number().int().min(1).max(10_000),
+                  dailySpendLimit: positiveDecimal,
+                  budgetRules: z
+                    .object({
+                      concurrency: integerRule(10_000),
+                      tokensPerAttempt: integerRule(100_000_000_000),
+                      tokensPerDay: integerRule(100_000_000_000),
+                      tokensPerMonth: integerRule(100_000_000_000),
+                      tokensLifetime: integerRule(100_000_000_000),
+                      spendPerDay: spendRule,
+                      spendPerMonth: spendRule,
+                    })
+                    .optional(),
+                }),
+              )
+              .max(32),
+          })
+          .superRefine((input, ctx) => {
+            if (input.reservedSlots > input.memberConcurrencyLimit) {
+              ctx.addIssue({
+                code: "custom",
+                path: ["reservedSlots"],
+                message: "Reserved slots exceed member concurrency",
+              });
+            }
+            if (input.providerModels.length > 0 && !input.publicEgressAcknowledged) {
+              ctx.addIssue({
+                code: "custom",
+                path: ["publicEgressAcknowledged"],
+                message: "Public egress acknowledgement is required",
+              });
+            }
+            if (new Set(input.localModelIds).size !== input.localModelIds.length) {
+              ctx.addIssue({
+                code: "custom",
+                path: ["localModelIds"],
+                message: "Duplicate local model",
+              });
+            }
+            if (
+              new Set(input.providerModels.map((item) => item.providerModelId)).size !==
+              input.providerModels.length
+            ) {
+              ctx.addIssue({
+                code: "custom",
+                path: ["providerModels"],
+                message: "Duplicate provider model",
+              });
+            }
+            if (
+              input.advanced &&
+              new Set(input.advanced.memberOverrides.map((item) => item.discoveredModelId)).size !==
+                input.advanced.memberOverrides.length
+            ) {
+              ctx.addIssue({
+                code: "custom",
+                path: ["advanced", "memberOverrides"],
+                message: "Duplicate local member override",
+              });
+            }
+          });
+      })(),
     )
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
@@ -1296,10 +1369,53 @@ export const forwarderManagementRouter = {
                 "Every selected local model must already have an explicitly assigned physical capacity.",
             });
           }
+          const memberOverrideByModelId = new Map(
+            input.advanced?.memberOverrides.map((override) => [
+              override.discoveredModelId,
+              override,
+            ]) ?? [],
+          );
+          if (
+            memberOverrideByModelId.size > 0 &&
+            [...memberOverrideByModelId.keys()].some(
+              (modelId) => !input.localModelIds.includes(modelId),
+            )
+          ) {
+            throw new ORPCError("BAD_REQUEST", {
+              message: "A member override does not belong to a selected local model.",
+            });
+          }
+          for (const target of localTargets) {
+            const override = target.discoveredModelId
+              ? memberOverrideByModelId.get(target.discoveredModelId)
+              : undefined;
+            if (!override) continue;
+            if (
+              override.concurrency.mode === "LIMITED" &&
+              override.reservedSlots > override.concurrency.limitValue
+            ) {
+              throw new ORPCError("BAD_REQUEST", {
+                message: "Reserved slots exceed a member concurrency override.",
+              });
+            }
+            const physicalMaximum = target.InferenceCapacity?.physicalMaxContext;
+            if (
+              override.contextCeiling.mode === "LIMITED" &&
+              physicalMaximum != null &&
+              override.contextCeiling.limitValue + override.contextMargin > physicalMaximum
+            ) {
+              throw new ORPCError("BAD_REQUEST", {
+                message: "A member context override exceeds physical capacity after margin.",
+              });
+            }
+          }
           if (
             localTargets.some((target) => {
               const maximum = target.InferenceCapacity?.physicalMaxContext;
-              return maximum != null && input.memberContextCeiling > maximum;
+              return (
+                maximum != null &&
+                input.memberContextCeiling + (input.advanced?.contextMargin ?? 0) > maximum
+              );
             })
           ) {
             throw new ORPCError("BAD_REQUEST", {
@@ -1345,7 +1461,9 @@ export const forwarderManagementRouter = {
               userId,
               slug: input.slug,
               name: input.name,
-              protocolAdaptationEnabled: true,
+              protocolAdaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? true,
+              allowLossyDeveloperRoleCollapse:
+                input.advanced?.allowLossyDeveloperRoleCollapse ?? false,
               publicEgressEnabled: providerIds.length > 0,
               publicEgressAcknowledged: providerIds.length > 0,
               recommendedSurfaceOverride: input.recommendedSurface,
@@ -1354,16 +1472,39 @@ export const forwarderManagementRouter = {
               capacityReservedSlots: input.reservedSlots,
               capacityWaitBudgetMs: input.localWaitBudgetMs,
               capacityContextCeiling: input.memberContextCeiling,
-              capacityContextMargin: Math.min(1024, Math.max(0, input.memberContextCeiling - 1)),
-              capacityBorrowPolicy: "WHEN_IDLE",
+              capacityContextMargin:
+                input.advanced?.contextMargin ??
+                Math.min(1024, Math.max(0, input.memberContextCeiling - 1)),
+              capacityBorrowPolicy: input.advanced?.borrowPolicy ?? "WHEN_IDLE",
+              affinityEnabled: input.advanced?.affinity.enabled ?? false,
+              affinityTtlSeconds: input.advanced?.affinity.ttlSeconds ?? 3600,
+              affinityMaxRecords: input.advanced?.affinity.maxRecords ?? 10_000,
+              affinityPrefixWeight: input.advanced?.affinity.prefixWeight ?? 100,
+              affinityConversationWeight: input.advanced?.affinity.conversationWeight ?? 150,
+              affinityConfirmedCacheWeight: input.advanced?.affinity.confirmedCacheWeight ?? 250,
+              affinityLoadPenaltyWeight: input.advanced?.affinity.loadPenaltyWeight ?? 100,
             },
             select: { id: true },
           });
+          if (input.advanced) {
+            await tx.inferenceCapacity.updateMany({
+              where: {
+                userId,
+                id: {
+                  in: [
+                    ...new Set(localTargets.flatMap((target) => target.inferenceCapacityId ?? [])),
+                  ],
+                },
+              },
+              data: { countStrategy: input.advanced.physicalCountStrategy },
+            });
+          }
           const localTargetByModelId = new Map(
             localTargets.map((target) => [target.discoveredModelId, target]),
           );
           for (const model of localModels) {
             const target = localTargetByModelId.get(model.id)!;
+            const override = memberOverrideByModelId.get(model.id);
             await tx.poolMember.create({
               data: {
                 poolId: pool.id,
@@ -1371,6 +1512,28 @@ export const forwarderManagementRouter = {
                 executionTargetId: target.id,
                 tier: "PRIMARY",
                 weight: 1,
+                ...(override
+                  ? {
+                      capacityConcurrencyMode: override.concurrency.mode,
+                      capacityConcurrencyLimit:
+                        override.concurrency.mode === "LIMITED"
+                          ? override.concurrency.limitValue
+                          : null,
+                      capacityReservedSlots: override.reservedSlots,
+                      capacityBorrowPolicy: override.borrowPolicy,
+                      capacityWaitBudgetMode: override.waitBudget.mode,
+                      capacityWaitBudgetMs:
+                        override.waitBudget.mode === "LIMITED"
+                          ? override.waitBudget.limitValue
+                          : null,
+                      capacityContextCeilingMode: override.contextCeiling.mode,
+                      capacityContextCeiling:
+                        override.contextCeiling.mode === "LIMITED"
+                          ? override.contextCeiling.limitValue
+                          : null,
+                      capacityContextMargin: override.contextMargin,
+                    }
+                  : {}),
               },
             });
           }
@@ -1403,21 +1566,48 @@ export const forwarderManagementRouter = {
                 active: true,
                 activatedAt: now,
                 Rules: {
-                  create: [
-                    {
-                      metric: "CONCURRENCY",
-                      period: "PER_ATTEMPT",
-                      mode: "LIMITED",
-                      limitValue: new Prisma.Decimal(protection.concurrencyLimit),
-                    },
-                    {
-                      metric: "SPEND",
-                      period: "UTC_DAY",
-                      mode: "LIMITED",
-                      limitValue: new Prisma.Decimal(protection.dailySpendLimit),
-                      currency: provider.PricingVersions[0]!.currency,
-                    },
-                  ],
+                  create: (() => {
+                    const rules = protection.budgetRules;
+                    if (!rules)
+                      return [
+                        {
+                          metric: "CONCURRENCY" as const,
+                          period: "PER_ATTEMPT" as const,
+                          mode: "LIMITED" as const,
+                          limitValue: new Prisma.Decimal(protection.concurrencyLimit),
+                        },
+                        {
+                          metric: "SPEND" as const,
+                          period: "UTC_DAY" as const,
+                          mode: "LIMITED" as const,
+                          limitValue: new Prisma.Decimal(protection.dailySpendLimit),
+                          currency: provider.PricingVersions[0]!.currency,
+                        },
+                      ];
+                    const rule = (
+                      metric: "CONCURRENCY" | "TOKENS" | "SPEND",
+                      period: "PER_ATTEMPT" | "UTC_DAY" | "UTC_MONTH" | "LIFETIME",
+                      value:
+                        | { mode: "UNLIMITED"; limitValue: null }
+                        | { mode: "LIMITED"; limitValue: string | number },
+                    ) => ({
+                      metric,
+                      period,
+                      mode: value.mode,
+                      limitValue:
+                        value.mode === "LIMITED" ? new Prisma.Decimal(value.limitValue) : null,
+                      currency: metric === "SPEND" ? provider.PricingVersions[0]!.currency : null,
+                    });
+                    return [
+                      rule("CONCURRENCY", "PER_ATTEMPT", rules.concurrency),
+                      rule("TOKENS", "PER_ATTEMPT", rules.tokensPerAttempt),
+                      rule("TOKENS", "UTC_DAY", rules.tokensPerDay),
+                      rule("TOKENS", "UTC_MONTH", rules.tokensPerMonth),
+                      rule("TOKENS", "LIFETIME", rules.tokensLifetime),
+                      rule("SPEND", "UTC_DAY", rules.spendPerDay),
+                      rule("SPEND", "UTC_MONTH", rules.spendPerMonth),
+                    ];
+                  })(),
                 },
               },
               select: { id: true },

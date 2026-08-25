@@ -83,6 +83,7 @@ const db = prisma as unknown as {
     delete: MockInstance;
   };
   executionTarget: { findMany: MockInstance; upsert: MockInstance };
+  inferenceCapacity: { updateMany: MockInstance };
   providerModel: { findFirst: MockInstance; findMany: MockInstance };
   providerBudgetPolicy: { create: MockInstance; findFirst: MockInstance; findMany: MockInstance };
   providerAuditEvent: { create: MockInstance; findFirst: MockInstance };
@@ -380,10 +381,67 @@ describe("forwarderManagementRouter", () => {
       reservedSlots: 1,
       localWaitBudgetMs: 30_000,
       publicEgressAcknowledged: true,
+      advanced: {
+        physicalCountStrategy: "TEMPLATE_AWARE",
+        contextMargin: 2_048,
+        borrowPolicy: "NEVER",
+        protocolAdaptationEnabled: false,
+        allowLossyDeveloperRoleCollapse: true,
+        affinity: {
+          enabled: true,
+          ttlSeconds: 7_200,
+          maxRecords: 20_000,
+          prefixWeight: 110,
+          conversationWeight: 160,
+          confirmedCacheWeight: 260,
+          loadPenaltyWeight: 120,
+        },
+        memberOverrides: [
+          {
+            discoveredModelId: "local-id",
+            concurrency: { mode: "LIMITED", limitValue: 2 },
+            reservedSlots: 1,
+            borrowPolicy: "NEVER",
+            waitBudget: { mode: "LIMITED", limitValue: 15_000 },
+            contextCeiling: { mode: "LIMITED", limitValue: 30_000 },
+            contextMargin: 2_000,
+          },
+        ],
+      },
       providerModels: [
-        { providerModelId: "provider-b", concurrencyLimit: 2, dailySpendLimit: "8.50" },
+        {
+          providerModelId: "provider-b",
+          concurrencyLimit: 2,
+          dailySpendLimit: "8.50",
+          budgetRules: {
+            concurrency: { mode: "LIMITED", limitValue: 2 },
+            tokensPerAttempt: { mode: "LIMITED", limitValue: 100_000 },
+            tokensPerDay: { mode: "LIMITED", limitValue: 1_000_000 },
+            tokensPerMonth: { mode: "LIMITED", limitValue: 10_000_000 },
+            tokensLifetime: { mode: "UNLIMITED", limitValue: null },
+            spendPerDay: { mode: "LIMITED", limitValue: "8.50" },
+            spendPerMonth: { mode: "LIMITED", limitValue: "100" },
+          },
+        },
         { providerModelId: "provider-a", concurrencyLimit: 1, dailySpendLimit: "4.25" },
       ],
+    });
+
+    expect(db.modelPool.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        protocolAdaptationEnabled: false,
+        allowLossyDeveloperRoleCollapse: true,
+        capacityContextMargin: 2_048,
+        capacityBorrowPolicy: "NEVER",
+        affinityEnabled: true,
+        affinityTtlSeconds: 7_200,
+        affinityMaxRecords: 20_000,
+      }),
+      select: { id: true },
+    });
+    expect(db.inferenceCapacity.updateMany).toHaveBeenCalledWith({
+      where: { userId: "user-id", id: { in: ["shared-capacity"] } },
+      data: { countStrategy: "TEMPLATE_AWARE" },
     });
 
     expect(db.poolMember.create).toHaveBeenNthCalledWith(
@@ -392,6 +450,15 @@ describe("forwarderManagementRouter", () => {
         data: expect.objectContaining({
           executionTargetId: "existing-target",
           tier: "PRIMARY",
+          capacityConcurrencyMode: "LIMITED",
+          capacityConcurrencyLimit: 2,
+          capacityReservedSlots: 1,
+          capacityBorrowPolicy: "NEVER",
+          capacityWaitBudgetMode: "LIMITED",
+          capacityWaitBudgetMs: 15_000,
+          capacityContextCeilingMode: "LIMITED",
+          capacityContextCeiling: 30_000,
+          capacityContextMargin: 2_000,
         }),
       }),
     );
@@ -408,8 +475,10 @@ describe("forwarderManagementRouter", () => {
       expect.arrayContaining([
         expect.objectContaining({ metric: "CONCURRENCY", mode: "LIMITED" }),
         expect.objectContaining({ metric: "SPEND", mode: "LIMITED", currency: "USD" }),
+        expect.objectContaining({ metric: "TOKENS", period: "LIFETIME", mode: "UNLIMITED" }),
       ]),
     );
+    expect(db.providerBudgetPolicy.create.mock.calls[0]?.[0].data.Rules.create).toHaveLength(7);
     expect(db.providerAuditEvent.create).toHaveBeenCalledTimes(2);
     expect(db.capacityAuditEvent.create).toHaveBeenCalledTimes(1);
     expect(db.executionTarget.upsert.mock.calls).not.toContainEqual([
@@ -515,12 +584,30 @@ describe("forwarderManagementRouter", () => {
         reservedSlots: 0,
         localWaitBudgetMs: 30_000,
         publicEgressAcknowledged: true,
+        advanced: {
+          physicalCountStrategy: "ENGINE_REPORTED",
+          contextMargin: 1_024,
+          borrowPolicy: "WHEN_IDLE",
+          protocolAdaptationEnabled: true,
+          allowLossyDeveloperRoleCollapse: false,
+          affinity: {
+            enabled: false,
+            ttlSeconds: 3_600,
+            maxRecords: 10_000,
+            prefixWeight: 100,
+            conversationWeight: 150,
+            confirmedCacheWeight: 250,
+            loadPenaltyWeight: 100,
+          },
+          memberOverrides: [],
+        },
         providerModels: [
           { providerModelId: "provider-id", concurrencyLimit: 1, dailySpendLimit: "5" },
         ],
       }),
     ).rejects.toThrow("injected budget failure");
     expect(rolledBack).toBe(true);
+    expect(db.inferenceCapacity.updateMany).toHaveBeenCalled();
     expect(db.capacityAuditEvent.create).not.toHaveBeenCalled();
   });
 

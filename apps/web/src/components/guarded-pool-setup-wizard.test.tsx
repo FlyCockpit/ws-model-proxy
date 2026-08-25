@@ -29,7 +29,7 @@ vi.mock("@/utils/orpc", () => ({
 }));
 vi.mock("@ws-model-proxy/ui/components/dialog", () => ({
   Dialog: ({ open, children }: { open: boolean; children: React.ReactNode }) =>
-    open ? <>{children}</> : null,
+    open ? children : null,
   DialogContent: ({ children }: { children: React.ReactNode }) => <section>{children}</section>,
   DialogDescription: ({ children }: { children: React.ReactNode }) => <p>{children}</p>,
   DialogFooter: ({ children }: { children: React.ReactNode }) => <footer>{children}</footer>,
@@ -80,6 +80,29 @@ describe("GuardedPoolSetupWizard", () => {
     expect(renderStep(1)).toContain("dashboard:pools.wizard.capacityDistinctHint");
     expect(renderStep(2)).toContain("dashboard:pools.wizard.providerOrder");
     expect(renderStep(3)).toContain("dashboard:pools.wizard.atomicRollback");
+  });
+
+  it("renders optional advanced capacity, member, affinity, adaptation, and budget controls", () => {
+    const capacity = renderStep(1);
+    expect(capacity).toContain("dashboard:pools.wizard.advanced.title");
+    expect(capacity).toContain("dashboard:pools.wizard.fields.physicalCountStrategy");
+    expect(capacity).toContain("dashboard:pools.wizard.fields.protocolAdaptationEnabled");
+    expect(capacity).toContain("dashboard:pools.wizard.fields.affinityEnabled");
+    expect(capacity).toContain("dashboard:pools.wizard.advanced.memberOverrides");
+    expect(capacity).toContain("sm:grid-cols-2");
+
+    const budgets = renderStep(2, ["provider"]);
+    expect(budgets).toContain("dashboard:pools.wizard.advanced.budgetTitle");
+    for (const field of [
+      "tokenAttempt",
+      "tokenDay",
+      "tokenMonth",
+      "tokenLifetime",
+      "spendDay",
+      "spendMonth",
+    ])
+      expect(budgets).toContain(`dashboard:pools.wizard.fields.${field}`);
+    expect(budgets).toContain("pools.wizard.advanced.unlimitedWarning");
   });
 
   it("renders the egress acknowledgement only after provider selection", () => {
