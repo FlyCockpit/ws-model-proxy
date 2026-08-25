@@ -121,7 +121,13 @@ export class StoreCapacityAdmissionRuntime implements CapacityAdmissionRuntime {
       // The terminalization transaction serializes with admission under the
       // same capacity locks. Its answer is authoritative even when our last
       // poll observed WAITING; release a lease that won that race.
-      if (finalized.state === "ADMITTED") await this.store.release(finalized.lease);
+      if (finalized.state === "ADMITTED") {
+        await this.store.release(finalized.lease);
+        return { state: terminal };
+      }
+      if (finalized.state === "CANCELLED" || finalized.state === "EXPIRED") {
+        return { state: finalized.state };
+      }
       return { state: terminal };
     }
     if (result.state === "CANCELLED" || result.state === "EXPIRED") {

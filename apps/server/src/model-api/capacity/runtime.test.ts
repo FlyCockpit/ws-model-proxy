@@ -141,6 +141,43 @@ describe("capacity admission runtime", () => {
     expect(release).toHaveBeenCalledWith(lease);
   });
 
+  it("returns durable expiry when abort races a database-expired attempt after acquire", async () => {
+    const controller = new AbortController();
+    const terminalizeAttempt = vi.fn().mockResolvedValue({ state: "EXPIRED" });
+    const release = vi.fn();
+    const runtime = new StoreCapacityAdmissionRuntime(
+      {
+        acquire: vi.fn().mockImplementation(async () => {
+          controller.abort();
+          return { state: "CANCELLED" };
+        }),
+        release,
+        heartbeat: vi.fn(),
+        terminalizeAttempt,
+        reclaimExpired: vi.fn(),
+      },
+      1,
+    );
+
+    await expect(
+      runtime.acquire(
+        {
+          requestId: "request",
+          attemptId: "attempt",
+          ownerId: "owner",
+          sourceKind: "DIRECT",
+          basePriority: 16,
+          connectionOwner: "server",
+          deadlineAt: new Date(Date.now() + 100),
+          candidates: [{ capacityId: "capacity", executionTargetId: "target", candidateOrder: 0 }],
+        },
+        controller.signal,
+      ),
+    ).resolves.toEqual({ state: "EXPIRED" });
+    expect(terminalizeAttempt).toHaveBeenCalledWith("attempt", "CANCELLED");
+    expect(release).not.toHaveBeenCalled();
+  });
+
   it("releases a lease that atomically wins against waiter cancellation", async () => {
     const controller = new AbortController();
     const lease = {
