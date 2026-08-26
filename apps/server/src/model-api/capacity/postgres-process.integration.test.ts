@@ -1006,6 +1006,16 @@ integration("capacity admission across operating-system processes", () => {
           const parsed = JSON.parse(body) as { messages?: Array<{ content?: unknown }> };
           const content = parsed.messages?.[0]?.content;
           if (typeof content === "string") label = content;
+          else if (Array.isArray(content)) {
+            const textPart = content.find(
+              (part): part is { text: string } =>
+                typeof part === "object" &&
+                part !== null &&
+                "text" in part &&
+                typeof part.text === "string",
+            );
+            label = textPart?.text;
+          }
         } catch {
           // Protocol validation is exercised by the production route. The
           // upstream collector only needs labels for the scheduler proof.
@@ -1056,6 +1066,7 @@ integration("capacity admission across operating-system processes", () => {
       publicOrder: number,
       providerPool = pool,
       providerCapacity = capacity,
+      tier: "PRIMARY" | "PUBLIC_OVERFLOW" = "PUBLIC_OVERFLOW",
     ) => {
       const accountId = crypto.randomUUID();
       const credentialId = crypto.randomUUID();
@@ -1128,8 +1139,8 @@ integration("capacity admission across operating-system processes", () => {
         data: {
           poolId: providerPool.id,
           executionTargetId: target.id,
-          tier: "PUBLIC_OVERFLOW",
-          publicOrder,
+          tier,
+          ...(tier === "PUBLIC_OVERFLOW" ? { publicOrder } : {}),
         },
       });
       await db.providerPricingVersion.create({
@@ -1479,10 +1490,16 @@ integration("capacity admission across operating-system processes", () => {
           publicEgressAcknowledged: true,
         },
       });
-      await createProvider("wdrr-low", 0, lowPool);
-      await createProvider("wdrr-high", 0, highPool);
+      await createProvider("wdrr-low", 0, lowPool, capacity, "PRIMARY");
+      await createProvider("wdrr-high", 0, highPool, capacity, "PRIMARY");
       const lowModelId = poolModelId({ userSlug: owner.slug, poolSlug: lowPool.slug });
       const highModelId = poolModelId({ userSlug: owner.slug, poolSlug: highPool.slug });
+      const schedulerWorker = startWorker({ operation: "production-server" });
+      children.add(schedulerWorker.child);
+      const schedulerReady = await schedulerWorker.result;
+      if (!("port" in schedulerReady)) throw new Error("Production scheduler worker unavailable.");
+      workers.push(schedulerWorker);
+      ports.push(schedulerReady.port);
       upstreamResponses.length = 0;
 
       const finishUpstream = (entry: { response: ServerResponse }, label: string) => {
@@ -1525,8 +1542,13 @@ integration("capacity admission across operating-system processes", () => {
       // The tenth high-priority request is isolated on worker zero so that
       // killing its admitted owner does not also kill the durable backlog.
       const initialHighBacklog = 4;
-      for (const [index, label] of highLabels.slice(0, initialHighBacklog).entries())
-        enqueueProduction(label, highModelId, index === 9 ? 0 : 1);
+      for (const [index, label] of highLabels.slice(0, initialHighBacklog).entries()) {
+        enqueueProduction(label, highModelId, index === 9 ? 0 : 1 + (index % 2));
+        await waitFor(async () => {
+          const queued = await db.admissionRequest.count({ where: { poolId: highPool.id } });
+          return queued === index + 1 ? true : undefined;
+        });
+      }
       await waitFor(async () => {
         const queued = await db.capacityWaiter.count({
           where: { capacityId: capacity.id, state: "WAITING" },
@@ -1542,29 +1564,41 @@ integration("capacity admission across operating-system processes", () => {
       pending.delete("wdrr-blocker");
 
       const winners: string[] = [];
-      const consumedLabels = new Set(["wdrr-blocker"]);
+      const consumedUpstreams = new Set([blockerUpstream.response]);
       const starvationBoundRounds = 33;
       const totalQueued = lowLabels.length + highLabels.length;
       let nextHighIndex = initialHighBacklog;
       for (let round = 0; round < totalQueued; round++) {
         const admittedUpstream = await waitFor(
-          () => upstreamResponses.find((entry) => entry.label && !consumedLabels.has(entry.label)),
-          20_000,
+          () =>
+            upstreamResponses.find(
+              (entry) =>
+                !consumedUpstreams.has(entry.response) &&
+                (entry.path.includes("/wdrr-low/") || entry.path.includes("/wdrr-high/")),
+            ),
+          60_000,
         );
-        const label = admittedUpstream.label;
-        if (!label) throw new Error("Production WDRR upstream label missing.");
-        consumedLabels.add(label);
+        consumedUpstreams.add(admittedUpstream.response);
+        const label =
+          admittedUpstream.label ??
+          (admittedUpstream.path.includes("/wdrr-high/")
+            ? highLabels[winners.filter((winner) => winner.startsWith("wdrr-high-")).length]
+            : lowLabels[winners.filter((winner) => winner.startsWith("wdrr-low-")).length]);
+        if (!label) throw new Error("Production WDRR FIFO label unavailable.");
         winners.push(label);
         expect(
           await db.capacityLease.count({ where: { capacityId: capacity.id, state: "ACTIVE" } }),
         ).toBe(1);
+        const admittedLease = await db.capacityLease.findFirstOrThrow({
+          where: { capacityId: capacity.id, state: "ACTIVE" },
+        });
 
         if (label.startsWith("wdrr-high-") && nextHighIndex < highLabels.length) {
           const replacementIndex = nextHighIndex++;
           enqueueProduction(
             highLabels[replacementIndex]!,
             highModelId,
-            replacementIndex === 9 ? 0 : 1,
+            replacementIndex === 9 ? 0 : 1 + (replacementIndex % 2),
           );
           await waitFor(async () => {
             const enqueued = await db.admissionRequest.count({
@@ -1584,6 +1618,8 @@ integration("capacity admission across operating-system processes", () => {
           await stop(workers[ownerIndex]!.child);
           children.delete(workers[ownerIndex]!.child);
           admittedUpstream.response.destroy(new Error("deterministic WDRR worker crash"));
+          await pending.get(label)?.catch(() => undefined);
+          pending.delete(label);
           const restarted = startWorker({ operation: "production-server" });
           children.add(restarted.child);
           const ready = await restarted.result;
@@ -1647,16 +1683,33 @@ integration("capacity admission across operating-system processes", () => {
           ).resolves.toMatchObject({ attemptId: expectedRequest?.AdmissionRequest.attemptId });
         } else {
           finishUpstream(admittedUpstream, label);
-          await (await pending.get(label))?.arrayBuffer();
-          pending.delete(label);
+          const completed = await Promise.race(
+            [...pending].map(async ([pendingLabel, response]) => ({
+              pendingLabel,
+              response: await response,
+            })),
+          );
+          expect(completed.pendingLabel).toBe(label);
+          await completed.response.arrayBuffer();
+          pending.delete(completed.pendingLabel);
+          await waitFor(async () => {
+            const terminalLease = await db.capacityLease.findUniqueOrThrow({
+              where: { id: admittedLease.id },
+            });
+            return terminalLease.state !== "ACTIVE" ? true : undefined;
+          }, 60_000);
         }
       }
       expect(winners[0]).toBe(lowLabels[0]);
-      expect(winners.indexOf(lowLabels[1]!)).toBeGreaterThan(0);
-      expect(winners.indexOf(lowLabels[1]!)).toBeLessThanOrEqual(starvationBoundRounds);
-      expect(winners.filter((label) => label.startsWith("wdrr-high-")).length).toBeGreaterThan(
-        winners.filter((label) => label.startsWith("wdrr-low-")).length,
-      );
+      const secondLowRound = winners.indexOf(lowLabels[1]!);
+      expect(secondLowRound).toBe(starvationBoundRounds);
+      const continuouslyBackloggedPrefix = winners.slice(0, secondLowRound + 1);
+      expect(
+        continuouslyBackloggedPrefix.filter((label) => label.startsWith("wdrr-high-")).length,
+      ).toBe(32);
+      expect(
+        continuouslyBackloggedPrefix.filter((label) => label.startsWith("wdrr-low-")).length,
+      ).toBe(2);
       expect(new Set(winners).size).toBe(winners.length);
       await waitFor(async () => {
         const [activeLeases, liveWaiters, liveRequests] = await Promise.all([
@@ -1688,5 +1741,5 @@ integration("capacity admission across operating-system processes", () => {
       // their owner. Quiescing capacity state prevents fixture rows from
       // affecting global sweepers while preserving that production invariant.
     }
-  }, 120_000);
+  }, 240_000);
 });

@@ -34,11 +34,17 @@ export function holdCapacityLeaseForResponse({
     finished = true;
     if (timer) clearInterval(timer);
     signal?.removeEventListener("abort", abort);
-    try {
-      await store.release(lease);
-    } catch (error) {
-      reportCleanupFailure("release", error);
+    let lastError: unknown;
+    for (const retryDelayMs of [0, 25, 100, 250]) {
+      if (retryDelayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, retryDelayMs));
+      try {
+        if (await store.release(lease)) return;
+        lastError = new Error("Capacity release was not acknowledged.");
+      } catch (error) {
+        lastError = error;
+      }
     }
+    reportCleanupFailure("release", lastError);
   };
   const heartbeat = async () => {
     if (finished || heartbeatRunning) return;
@@ -87,8 +93,11 @@ export function holdCapacityLeaseForResponse({
         const chunk = await reader.read();
         if (terminalError) return;
         if (chunk.done) {
-          controller.close();
+          // Do not expose downstream EOF until the durable release attempt has
+          // finished. Closing first lets consumers resolve and processes move
+          // on while the physical slot is still ACTIVE.
           await finish();
+          controller.close();
           return;
         }
         controller.enqueue(chunk.value);

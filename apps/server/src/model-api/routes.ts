@@ -6727,14 +6727,21 @@ async function relayBoundProviderResponse(input: {
     .catch(metadataUpdateError);
   let response = result.response;
   if (response.status < 200 || response.status >= 300) {
-    const sanitized = await readAdaptedNonstreamBody({
-      body: response.body,
-      source: "openai-responses",
-      target: "openai-responses",
-      status: response.status,
-      headers: response.headers,
-      signal: input.request.signal,
-    });
+    let sanitized: Uint8Array;
+    try {
+      sanitized = await readAdaptedNonstreamBody({
+        body: response.body,
+        source: "openai-responses",
+        target: "openai-responses",
+        status: response.status,
+        headers: response.headers,
+        signal: input.request.signal,
+      });
+    } catch (error) {
+      if (providerCapacityLease && input.capacityRuntime)
+        await input.capacityRuntime.release(providerCapacityLease);
+      throw error;
+    }
     response = new Response(sanitized, {
       status: response.status >= 400 && response.status <= 599 ? response.status : 502,
       headers: adaptedProviderResponseHeaders(

@@ -4970,6 +4970,35 @@ describe("model API routes", () => {
       },
     });
     expect(db.relayRequest.create.mock.calls.at(-1)?.[0].data.operation).toBe("responses.retrieve");
+
+    const releaseCount = vi.mocked(capacityRuntime.release).mock.calls.length;
+    publicOverflow.dispatch.mockResolvedValueOnce({
+      dispatched: true,
+      response: new Response(
+        new ReadableStream({
+          pull() {
+            throw new Error("provider body disconnected");
+          },
+        }),
+        { status: 503, headers: { "content-type": "application/json" } },
+      ),
+      target: providerTarget,
+      attemptId: "provider-attempt-rejecting-body",
+      fencingToken: 3n,
+      nativeSurface: "openai-responses",
+      attemptCount: 1,
+      terminal: Promise.resolve({ ok: false, responseBytes: 0 }),
+      markFirstClientByte: vi.fn().mockResolvedValue(undefined),
+      affinity: undefined,
+    });
+    const failedRead = await appWith(new FakeRelayManager(), true, false, capacityRuntime).request(
+      "/responses/resp_provider",
+      {
+        headers: { authorization: "Bearer wsmp_model_test" },
+      },
+    );
+    expect(failedRead.status).toBe(500);
+    expect(capacityRuntime.release).toHaveBeenCalledTimes(releaseCount + 1);
   });
 
   it("uses metadata-only sticky routing for Responses API follow-up requests", async () => {

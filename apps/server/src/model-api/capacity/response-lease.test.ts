@@ -48,6 +48,22 @@ describe("capacity response lease lifetime", () => {
     expect(store.release).toHaveBeenCalledTimes(1);
   });
 
+  it("retries release after a transient database disconnect", async () => {
+    const release = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("connection closed"))
+      .mockResolvedValue(true);
+    const response = holdCapacityLeaseForResponse({
+      response: new Response("complete"),
+      store: { heartbeat: vi.fn().mockResolvedValue(true), release },
+      lease,
+      heartbeatIntervalMs: 0,
+    });
+
+    await expect(response.text()).resolves.toBe("complete");
+    expect(release).toHaveBeenCalledTimes(2);
+  });
+
   it.each([
     ["returns false", vi.fn().mockResolvedValue(false)],
     ["rejects", vi.fn().mockRejectedValue(new Error("database unavailable"))],
