@@ -83,6 +83,7 @@ type SendRelayRequestArgs = Parameters<RelaySessionManager["sendRelayRequest"]>[
 type CancelRelayRequestArgs = Parameters<RelaySessionManager["cancelRelayRequest"]>[0];
 
 const db = prisma as unknown as {
+  $transaction: MockInstance;
   executionTarget: { findUnique: MockInstance };
   discoveredModel: {
     findUnique: MockInstance;
@@ -103,7 +104,8 @@ const db = prisma as unknown as {
     update: MockInstance;
     updateMany: MockInstance;
   };
-  relayExecutionEvent: { create: MockInstance };
+  relayExecutionEvent: { create: MockInstance; createMany: MockInstance };
+  relayExecutionAttempt: { create: MockInstance; updateMany: MockInstance };
   responseStickinessRecord: {
     findUnique: MockInstance;
     upsert: MockInstance;
@@ -597,6 +599,10 @@ describe("model API routes", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    db.$transaction.mockImplementation(async (input: unknown) => {
+      if (typeof input === "function") return input(db);
+      return Promise.all(input as Promise<unknown>[]);
+    });
     mockedTokenAccess.authenticateModelApiTokenSecret.mockResolvedValue(token);
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [directTarget],
@@ -623,6 +629,9 @@ describe("model API routes", () => {
     db.relayRequest.update.mockResolvedValue({ id: "relay-request-id" });
     db.relayRequest.updateMany.mockResolvedValue({ count: 1 });
     db.relayExecutionEvent.create.mockResolvedValue({ id: "relay-event-id" });
+    db.relayExecutionEvent.createMany.mockResolvedValue({ count: 1 });
+    db.relayExecutionAttempt.create.mockResolvedValue({ attemptId: "attempt-id" });
+    db.relayExecutionAttempt.updateMany.mockResolvedValue({ count: 1 });
     db.responseStickinessRecord.findUnique.mockResolvedValue(null);
     db.responseStickinessRecord.upsert.mockResolvedValue({ id: "stickiness-id" });
     affinity.rank.mockImplementation(async ({ targets }) => ({
@@ -854,13 +863,17 @@ describe("model API routes", () => {
       db.relayRequest.create.mock.calls,
       db.relayRequest.update.mock.calls,
       db.relayExecutionEvent.create.mock.calls,
+      db.relayExecutionEvent.createMany.mock.calls,
     ]);
     expect(persisted).not.toContain("hello");
     expect(persisted).not.toContain("upstream-responses");
     await vi.waitFor(() => {
-      const eventTypes = db.relayExecutionEvent.create.mock.calls.map(
-        (call) => call[0]?.data?.eventType,
-      );
+      const eventTypes = [
+        ...db.relayExecutionEvent.create.mock.calls.map((call) => call[0]?.data?.eventType),
+        ...db.relayExecutionEvent.createMany.mock.calls.flatMap((call) =>
+          call[0]?.data?.map((event: { eventType: string }) => event.eventType),
+        ),
+      ];
       expect(eventTypes).toEqual(
         expect.arrayContaining(["ATTEMPT_STARTED", "FIRST_CLIENT_BYTE", "TERMINAL"]),
       );

@@ -192,6 +192,9 @@ type RelayRequestRow = {
   requestBytes: bigint | null;
   responseBytes: bigint | null;
   attemptCount: number;
+  auxiliaryAttemptCount: number;
+  auxiliaryRequestBytes: bigint;
+  auxiliaryResponseBytes: bigint;
   requestedSurface: string | null;
   selectedNativeSurface: string | null;
   adapterMode: string | null;
@@ -557,6 +560,9 @@ function serializeRelay(row: RelayRequestRow) {
     requestBytes: row.requestBytes === null ? null : Number(row.requestBytes),
     responseBytes: row.responseBytes === null ? null : Number(row.responseBytes),
     attemptCount: row.attemptCount,
+    auxiliaryAttemptCount: row.auxiliaryAttemptCount,
+    auxiliaryRequestBytes: Number(row.auxiliaryRequestBytes),
+    auxiliaryResponseBytes: Number(row.auxiliaryResponseBytes),
     requestedSurface: row.requestedSurface,
     selectedNativeSurface: row.selectedNativeSurface,
     adapterMode: row.adapterMode,
@@ -946,6 +952,9 @@ export const adminObservabilityRouter = {
             requestBytes: true,
             responseBytes: true,
             attemptCount: true,
+            auxiliaryAttemptCount: true,
+            auxiliaryRequestBytes: true,
+            auxiliaryResponseBytes: true,
             requestedSurface: true,
             selectedNativeSurface: true,
             adapterMode: true,

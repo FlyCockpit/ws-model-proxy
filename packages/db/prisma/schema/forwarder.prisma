@@ -1302,9 +1302,9 @@ model ResponseStickinessRecord {
 }
 
 model RelayRequest {
-  id                         String                @id @default(cuid(2))
-  createdAt                  DateTime              @default(now())
-  updatedAt                  DateTime              @default(now()) @updatedAt
+  id                         String                  @id @default(cuid(2))
+  createdAt                  DateTime                @default(now())
+  updatedAt                  DateTime                @default(now()) @updatedAt
   userId                     String
   modelApiTokenId            String?
   modelApiTokenLookupPrefix  String?
@@ -1313,8 +1313,8 @@ model RelayRequest {
   selectedDiscoveredModelId  String?
   requestedExecutionTargetId String?
   selectedExecutionTargetId  String?
-  status                     RelayRequestStatus    @default(PENDING)
-  startedAt                  DateTime              @default(now())
+  status                     RelayRequestStatus      @default(PENDING)
+  startedAt                  DateTime                @default(now())
   completedAt                DateTime?
   durationMs                 Int?
   promptTokens               Int?
@@ -1352,14 +1352,14 @@ model RelayRequest {
   admissionBorrowed          Boolean?
   admissionTerminalState     String?
   /// Prompt-free public overflow correlation and commitment telemetry.
-  publicEgress               Boolean               @default(false)
+  publicEgress               Boolean                 @default(false)
   publicOverflowReason       String?
   selectedPoolMemberTier     String?
   providerAccountId          String?
   providerModelId            String?
   providerAttemptId          String?
   providerFencingToken       BigInt?
-  streamCommitted            Boolean               @default(false)
+  streamCommitted            Boolean                 @default(false)
   affinityOutcome            String?
   affinityScore              Int?
   affinityPrefixDepth        Int?
@@ -1373,17 +1373,21 @@ model RelayRequest {
   /// including retryable failed attempts, counted without retaining content.
   responseBytes              BigInt?
   /// Number of upstream relay attempts (greater than one indicates pool retry).
-  attemptCount               Int                   @default(0)
-  User                       User                  @relation("RelayRequestOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ModelApiToken              ModelApiToken?        @relation(fields: [modelApiTokenId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-  RequestedDiscoveredModel   DiscoveredModel?      @relation("RelayRequestRequestedModel", fields: [requestedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-  RequestedModelPool         ModelPool?            @relation("RelayRequestRequestedPool", fields: [requestedModelPoolId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-  SelectedDiscoveredModel    DiscoveredModel?      @relation("RelayRequestSelectedModel", fields: [selectedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-  RequestedExecutionTarget   ExecutionTarget?      @relation("RelayRequestRequestedExecutionTarget", fields: [requestedExecutionTargetId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-  SelectedExecutionTarget    ExecutionTarget?      @relation("RelayRequestSelectedExecutionTarget", fields: [selectedExecutionTargetId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  attemptCount               Int                     @default(0)
+  auxiliaryAttemptCount      Int                     @default(0)
+  auxiliaryRequestBytes      BigInt                  @default(0)
+  auxiliaryResponseBytes     BigInt                  @default(0)
+  User                       User                    @relation("RelayRequestOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ModelApiToken              ModelApiToken?          @relation(fields: [modelApiTokenId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  RequestedDiscoveredModel   DiscoveredModel?        @relation("RelayRequestRequestedModel", fields: [requestedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  RequestedModelPool         ModelPool?              @relation("RelayRequestRequestedPool", fields: [requestedModelPoolId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  SelectedDiscoveredModel    DiscoveredModel?        @relation("RelayRequestSelectedModel", fields: [selectedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  RequestedExecutionTarget   ExecutionTarget?        @relation("RelayRequestRequestedExecutionTarget", fields: [requestedExecutionTargetId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  SelectedExecutionTarget    ExecutionTarget?        @relation("RelayRequestSelectedExecutionTarget", fields: [selectedExecutionTargetId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   AdmissionRequests          AdmissionRequest[]
-  SelectedPoolMember         PoolMember?           @relation("RelayRequestSelectedPoolMember", fields: [selectedPoolMemberId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  SelectedPoolMember         PoolMember?             @relation("RelayRequestSelectedPoolMember", fields: [selectedPoolMemberId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   ExecutionEvents            RelayExecutionEvent[]
+  ExecutionAttempts          RelayExecutionAttempt[]
 
   @@index([userId, createdAt])
   @@index([modelApiTokenId, createdAt])
@@ -1406,6 +1410,7 @@ model RelayExecutionEvent {
   relayRequestId         String
   attemptId              String
   eventType              String
+  attemptKind            String       @default("EXECUTION")
   requestedSurface       String
   nativeSurface          String?
   adapterMode            String?
@@ -1437,6 +1442,40 @@ model RelayExecutionEvent {
   @@index([userId, createdAt])
   @@index([relayRequestId, createdAt])
   @@map("relay_execution_event")
+}
+
+/// Mutable fenced ownership for one local CLI attempt. History remains in
+/// RelayExecutionEvent; this row exists only to make liveness and crash repair safe.
+model RelayExecutionAttempt {
+  attemptId         String       @id
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @default(now()) @updatedAt
+  userId            String
+  relayRequestId    String
+  ownerEpoch        String
+  heartbeatAt       DateTime     @default(now())
+  expiresAt         DateTime
+  state             String       @default("ACTIVE")
+  attemptKind       String       @default("EXECUTION")
+  terminalAt        DateTime?
+  terminalState     String?
+  requestedSurface  String
+  nativeSurface     String?
+  adapterMode       String?
+  adapterVersion    String?
+  poolId            String?
+  poolMemberId      String?
+  executionTargetId String?
+  memberTier        String?
+  requestBytes      BigInt?
+  responseBytes     BigInt?
+  User              User         @relation("RelayExecutionAttemptOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  RelayRequest      RelayRequest @relation(fields: [relayRequestId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([state, expiresAt])
+  @@index([ownerEpoch, state])
+  @@index([relayRequestId, createdAt])
+  @@map("relay_execution_attempt")
 }
 
 /// Prompt-free, owner-scoped history of capacity and admission-policy changes.

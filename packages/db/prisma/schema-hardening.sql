@@ -17,7 +17,8 @@ LOCK TABLE discovered_model, execution_target, model_pool, model_api_token,
   capacity_lease, provider_account, provider_model, provider_credential,
   provider_budget_policy, provider_budget_rule, provider_attempt, provider_budget_reservation,
   provider_usage_ledger, provider_pricing_version, provider_budget_settlement,
-  provider_audit_event, public_provider_attempt_event, relay_execution_event,
+  provider_audit_event, public_provider_attempt_event, relay_execution_attempt,
+  relay_execution_event,
   cache_affinity_record IN SHARE ROW EXCLUSIVE MODE;
 
 -- Capacity policy bounds are database invariants because admission correctness
@@ -400,6 +401,7 @@ ALTER TABLE relay_request ADD CONSTRAINT relay_request_execution_telemetry_check
 ALTER TABLE relay_execution_event DROP CONSTRAINT IF EXISTS relay_execution_event_shape_check;
 ALTER TABLE relay_execution_event ADD CONSTRAINT relay_execution_event_shape_check CHECK (
   "eventType" IN ('ATTEMPT_STARTED', 'FIRST_CLIENT_BYTE', 'TERMINAL', 'CRASH_RECOVERED')
+  AND "attemptKind" IN ('EXECUTION', 'CONTEXT_COUNT')
   AND "requestedSurface" IN (
     'OPENAI_CHAT_COMPLETIONS', 'OPENAI_COMPLETIONS', 'OPENAI_EMBEDDINGS',
     'OPENAI_RESPONSES', 'ANTHROPIC_MESSAGES', 'OPENAI_AUDIO'
@@ -410,6 +412,74 @@ ALTER TABLE relay_execution_event ADD CONSTRAINT relay_execution_event_shape_che
   AND ("waitDurationMs" IS NULL OR "waitDurationMs" >= 0)
   AND ("contextTokens" IS NULL OR "contextTokens" >= 0)
 );
+
+INSERT INTO relay_execution_attempt
+  ("attemptId", "createdAt", "updatedAt", "userId", "relayRequestId", "ownerEpoch",
+   "heartbeatAt", "expiresAt", state, "terminalAt", "terminalState", "attemptKind",
+   "requestedSurface", "nativeSurface",
+   "adapterMode", "adapterVersion", "poolId", "poolMemberId", "executionTargetId", "memberTier")
+SELECT DISTINCT ON (event."attemptId")
+  event."attemptId", event."createdAt", event."createdAt", event."userId", event."relayRequestId",
+  'historical-split', event."createdAt", event."createdAt",
+  COALESCE((SELECT terminal."terminalState" FROM relay_execution_event terminal
+    WHERE terminal."attemptId" = event."attemptId"
+      AND terminal."eventType" IN ('TERMINAL', 'CRASH_RECOVERED')
+    ORDER BY terminal."createdAt" DESC LIMIT 1), 'ACTIVE'),
+  (SELECT MAX(terminal."createdAt") FROM relay_execution_event terminal
+    WHERE terminal."attemptId" = event."attemptId"
+      AND terminal."eventType" IN ('TERMINAL', 'CRASH_RECOVERED')),
+  (SELECT terminal."terminalState" FROM relay_execution_event terminal
+    WHERE terminal."attemptId" = event."attemptId"
+      AND terminal."eventType" IN ('TERMINAL', 'CRASH_RECOVERED')
+    ORDER BY terminal."createdAt" DESC LIMIT 1),
+  event."attemptKind", event."requestedSurface", event."nativeSurface", event."adapterMode",
+  event."adapterVersion", event."poolId", event."poolMemberId", event."executionTargetId",
+  event."memberTier"
+FROM relay_execution_event event
+WHERE event."eventType" = 'ATTEMPT_STARTED'
+ON CONFLICT ("attemptId") DO NOTHING;
+
+ALTER TABLE relay_execution_attempt DROP CONSTRAINT IF EXISTS relay_execution_attempt_shape_check;
+ALTER TABLE relay_execution_attempt ADD CONSTRAINT relay_execution_attempt_shape_check CHECK (
+  state IN ('ACTIVE', 'SUCCEEDED', 'FAILED', 'CANCELED')
+  AND "attemptKind" IN ('EXECUTION', 'CONTEXT_COUNT')
+  AND btrim("ownerEpoch") <> ''
+  AND "expiresAt" >= "heartbeatAt"
+  AND ((state = 'ACTIVE' AND "terminalAt" IS NULL AND "terminalState" IS NULL)
+    OR (state <> 'ACTIVE' AND "terminalAt" IS NOT NULL AND "terminalState" = state))
+);
+
+CREATE OR REPLACE FUNCTION enforce_relay_execution_attempt_transition()
+RETURNS trigger LANGUAGE plpgsql AS $relay_execution_attempt_transition$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'relay execution attempts cannot be deleted' USING ERRCODE = '55000';
+  END IF;
+  IF NEW."attemptId" IS DISTINCT FROM OLD."attemptId"
+     OR NEW."userId" IS DISTINCT FROM OLD."userId"
+     OR NEW."relayRequestId" IS DISTINCT FROM OLD."relayRequestId"
+     OR NEW."ownerEpoch" IS DISTINCT FROM OLD."ownerEpoch"
+     OR NEW."attemptKind" IS DISTINCT FROM OLD."attemptKind"
+     OR NEW."requestedSurface" IS DISTINCT FROM OLD."requestedSurface"
+     OR NEW."nativeSurface" IS DISTINCT FROM OLD."nativeSurface"
+     OR NEW."poolId" IS DISTINCT FROM OLD."poolId"
+     OR NEW."poolMemberId" IS DISTINCT FROM OLD."poolMemberId"
+     OR NEW."executionTargetId" IS DISTINCT FROM OLD."executionTargetId" THEN
+    RAISE EXCEPTION 'relay execution attempt identity is immutable' USING ERRCODE = '55000';
+  END IF;
+  IF OLD.state <> 'ACTIVE' THEN
+    RAISE EXCEPTION 'terminal relay execution attempt is immutable' USING ERRCODE = '55000';
+  END IF;
+  IF NEW."heartbeatAt" < OLD."heartbeatAt" OR NEW."expiresAt" < NEW."heartbeatAt" THEN
+    RAISE EXCEPTION 'invalid relay execution heartbeat' USING ERRCODE = '55000';
+  END IF;
+  RETURN NEW;
+END;
+$relay_execution_attempt_transition$;
+DROP TRIGGER IF EXISTS relay_execution_attempt_transition ON relay_execution_attempt;
+CREATE TRIGGER relay_execution_attempt_transition
+BEFORE UPDATE OR DELETE ON relay_execution_attempt
+FOR EACH ROW EXECUTE FUNCTION enforce_relay_execution_attempt_transition();
 
 -- Partial indexes document and enforce the live-winner invariant even if a
 -- future archival change relaxes the stronger one-lease-per-attempt FK.

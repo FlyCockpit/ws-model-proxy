@@ -157,6 +157,10 @@ import {
 } from "./public-overflow.js";
 import { type RelayAttemptTerminal, startRelayAttempt } from "./relay-executor.js";
 import { shouldRetryRelayOperation } from "./relay-retry-policy.js";
+import {
+  LOCAL_RELAY_ATTEMPT_TTL_MS,
+  LOCAL_RELAY_PROCESS_EPOCH,
+} from "./relay-telemetry-recovery.js";
 import { type RelayBodySource } from "./request-body-source.js";
 import { profileSurfaceRequest } from "./request-feature-profiler.js";
 import {
@@ -466,6 +470,7 @@ async function nativeContextCount({
   let built: BuiltRelayRequest | undefined;
   let attempt: ReturnType<typeof startRelayAttempt> | undefined;
   const localExecution: LocalExecutionTelemetry = {
+    attemptKind: "CONTEXT_COUNT",
     selectedExecutionTargetId: selected.ExecutionTarget?.id,
     selectedPoolMemberId: pool?.memberId,
     selectedPoolMemberTier: pool?.tier,
@@ -730,6 +735,7 @@ type RelayMetadataUpdate = {
   };
   localExecution?: LocalExecutionTelemetry;
   userId?: string;
+  localTerminal?: RelayAttemptTerminal;
 };
 
 type RelayRequester = {
@@ -1933,14 +1939,32 @@ async function updateRelayMetadata(relayRequestId: string, update: RelayMetadata
     select: { id: true },
   });
   if (update.localExecution && update.userId) {
+    const localTerminal = update.localTerminal ?? update.terminal;
     await prisma.$transaction([
-      prisma.relayExecutionEvent.create({
-        data: localTerminalEventData(
-          relayRequestId,
-          update.userId,
-          update.localExecution,
-          update.terminal,
-        ),
+      prisma.relayExecutionAttempt.updateMany({
+        where: {
+          attemptId: update.localExecution.localAttemptId,
+          ownerEpoch: LOCAL_RELAY_PROCESS_EPOCH,
+          state: "ACTIVE",
+        },
+        data: {
+          state: terminalStatus(localTerminal),
+          terminalAt: new Date(),
+          terminalState: terminalStatus(localTerminal),
+          requestBytes: BigInt(localTerminal.requestBytes),
+          responseBytes: BigInt(localTerminal.responseBytes),
+        },
+      }),
+      prisma.relayExecutionEvent.createMany({
+        data: [
+          localTerminalEventData(
+            relayRequestId,
+            update.userId,
+            update.localExecution,
+            localTerminal,
+          ),
+        ],
+        skipDuplicates: true,
       }),
       relayUpdate,
     ]);
@@ -1968,6 +1992,7 @@ async function updateContextCountMetadata(
 
 type LocalExecutionTelemetry = NonNullable<RelayMetadataUpdate["execution"]> & {
   requestedSurface: string;
+  attemptKind?: "EXECUTION" | "CONTEXT_COUNT";
   poolId?: string;
   contextCount?: ContextCountTelemetry;
   admission?: {
@@ -1983,44 +2008,67 @@ async function startLocalExecutionTelemetry(
   userId: string,
   execution: LocalExecutionTelemetry,
 ) {
-  await prisma.relayExecutionEvent.create({
-    data: {
-      userId,
-      relayRequestId,
-      attemptId: execution.localAttemptId,
-      eventType: "ATTEMPT_STARTED",
-      requestedSurface: execution.requestedSurface,
-      nativeSurface: execution.nativeSurface,
-      adapterMode: execution.adapterMode,
-      adapterVersion: execution.adapterVersion ?? null,
-      poolId: execution.poolId ?? null,
-      poolMemberId: execution.selectedPoolMemberId ?? null,
-      executionTargetId: execution.selectedExecutionTargetId ?? null,
-      memberTier: execution.selectedPoolMemberTier ?? null,
-      contextCountMethod: execution.contextCount?.method ?? null,
-      contextCountConfidence: execution.contextCount?.confidence ?? null,
-      contextTokens: execution.contextCount?.tokens ?? null,
-      admissionAttemptId: execution.admission?.attemptId ?? null,
-      admissionLeaseId: execution.admission?.leaseId ?? null,
-      admissionFencingToken: execution.admission?.fencingToken ?? null,
-      waitDurationMs: execution.admission?.waitDurationMs ?? null,
-    },
-  });
-  await prisma.relayRequest.update({
-    where: { id: relayRequestId },
-    data: {
-      ...(execution.selectedExecutionTargetId
-        ? { selectedExecutionTargetId: execution.selectedExecutionTargetId }
-        : {}),
-      selectedPoolMemberId: execution.selectedPoolMemberId ?? null,
-      selectedPoolMemberTier: execution.selectedPoolMemberTier ?? null,
-      selectedNativeSurface: execution.nativeSurface,
-      adapterMode: execution.adapterMode,
-      adapterVersion: execution.adapterVersion ?? null,
-      localAttemptId: execution.localAttemptId,
-    },
-    select: { id: true },
-  });
+  const now = new Date();
+  await prisma.$transaction([
+    prisma.relayExecutionAttempt.create({
+      data: {
+        attemptId: execution.localAttemptId,
+        userId,
+        relayRequestId,
+        ownerEpoch: LOCAL_RELAY_PROCESS_EPOCH,
+        attemptKind: execution.attemptKind ?? "EXECUTION",
+        heartbeatAt: now,
+        expiresAt: new Date(now.getTime() + LOCAL_RELAY_ATTEMPT_TTL_MS),
+        requestedSurface: execution.requestedSurface,
+        nativeSurface: execution.nativeSurface,
+        adapterMode: execution.adapterMode,
+        adapterVersion: execution.adapterVersion ?? null,
+        poolId: execution.poolId ?? null,
+        poolMemberId: execution.selectedPoolMemberId ?? null,
+        executionTargetId: execution.selectedExecutionTargetId ?? null,
+        memberTier: execution.selectedPoolMemberTier ?? null,
+      },
+    }),
+    prisma.relayExecutionEvent.create({
+      data: {
+        userId,
+        relayRequestId,
+        attemptId: execution.localAttemptId,
+        eventType: "ATTEMPT_STARTED",
+        attemptKind: execution.attemptKind ?? "EXECUTION",
+        requestedSurface: execution.requestedSurface,
+        nativeSurface: execution.nativeSurface,
+        adapterMode: execution.adapterMode,
+        adapterVersion: execution.adapterVersion ?? null,
+        poolId: execution.poolId ?? null,
+        poolMemberId: execution.selectedPoolMemberId ?? null,
+        executionTargetId: execution.selectedExecutionTargetId ?? null,
+        memberTier: execution.selectedPoolMemberTier ?? null,
+        contextCountMethod: execution.contextCount?.method ?? null,
+        contextCountConfidence: execution.contextCount?.confidence ?? null,
+        contextTokens: execution.contextCount?.tokens ?? null,
+        admissionAttemptId: execution.admission?.attemptId ?? null,
+        admissionLeaseId: execution.admission?.leaseId ?? null,
+        admissionFencingToken: execution.admission?.fencingToken ?? null,
+        waitDurationMs: execution.admission?.waitDurationMs ?? null,
+      },
+    }),
+    prisma.relayRequest.update({
+      where: { id: relayRequestId },
+      data: {
+        ...(execution.selectedExecutionTargetId
+          ? { selectedExecutionTargetId: execution.selectedExecutionTargetId }
+          : {}),
+        selectedPoolMemberId: execution.selectedPoolMemberId ?? null,
+        selectedPoolMemberTier: execution.selectedPoolMemberTier ?? null,
+        selectedNativeSurface: execution.nativeSurface,
+        adapterMode: execution.adapterMode,
+        adapterVersion: execution.adapterVersion ?? null,
+        localAttemptId: execution.localAttemptId,
+      },
+      select: { id: true },
+    }),
+  ]);
 }
 
 async function recordLocalTerminal(
@@ -2029,8 +2077,35 @@ async function recordLocalTerminal(
   execution: LocalExecutionTelemetry,
   terminal: RelayAttemptTerminal,
 ) {
-  await prisma.relayExecutionEvent.create({
-    data: localTerminalEventData(relayRequestId, userId, execution, terminal),
+  await prisma.$transaction(async (tx) => {
+    const claimed = await tx.relayExecutionAttempt.updateMany({
+      where: {
+        attemptId: execution.localAttemptId,
+        ownerEpoch: LOCAL_RELAY_PROCESS_EPOCH,
+        state: "ACTIVE",
+      },
+      data: {
+        state: terminalStatus(terminal),
+        terminalAt: new Date(),
+        terminalState: terminalStatus(terminal),
+        requestBytes: BigInt(terminal.requestBytes),
+        responseBytes: BigInt(terminal.responseBytes),
+      },
+    });
+    await tx.relayExecutionEvent.createMany({
+      data: [localTerminalEventData(relayRequestId, userId, execution, terminal)],
+      skipDuplicates: true,
+    });
+    if (claimed.count > 0 && execution.attemptKind === "CONTEXT_COUNT") {
+      await tx.relayRequest.update({
+        where: { id: relayRequestId },
+        data: {
+          auxiliaryAttemptCount: { increment: 1 },
+          auxiliaryRequestBytes: { increment: BigInt(terminal.requestBytes) },
+          auxiliaryResponseBytes: { increment: BigInt(terminal.responseBytes) },
+        },
+      });
+    }
   });
 }
 
@@ -2045,6 +2120,7 @@ function localTerminalEventData(
     relayRequestId,
     attemptId: execution.localAttemptId,
     eventType: "TERMINAL",
+    attemptKind: execution.attemptKind ?? "EXECUTION",
     requestedSurface: execution.requestedSurface,
     nativeSurface: execution.nativeSurface,
     adapterMode: execution.adapterMode,
@@ -2069,27 +2145,45 @@ async function markLocalFirstClientByte(
   userId: string,
   execution: LocalExecutionTelemetry,
 ) {
-  await prisma.relayExecutionEvent.create({
-    data: {
-      userId,
-      relayRequestId,
-      attemptId: execution.localAttemptId,
-      eventType: "FIRST_CLIENT_BYTE",
-      requestedSurface: execution.requestedSurface,
-      nativeSurface: execution.nativeSurface,
-      adapterMode: execution.adapterMode,
-      adapterVersion: execution.adapterVersion ?? null,
-      poolId: execution.poolId ?? null,
-      poolMemberId: execution.selectedPoolMemberId ?? null,
-      executionTargetId: execution.selectedExecutionTargetId ?? null,
-      memberTier: execution.selectedPoolMemberTier ?? null,
-      streamCommitted: true,
-    },
-  });
-  await prisma.relayRequest.updateMany({
-    where: { id: relayRequestId, firstClientByteAt: null },
-    data: { firstClientByteAt: new Date(), streamCommitted: true },
-  });
+  const now = new Date();
+  await prisma.$transaction([
+    prisma.relayExecutionEvent.createMany({
+      data: [
+        {
+          userId,
+          relayRequestId,
+          attemptId: execution.localAttemptId,
+          eventType: "FIRST_CLIENT_BYTE",
+          attemptKind: execution.attemptKind ?? "EXECUTION",
+          requestedSurface: execution.requestedSurface,
+          nativeSurface: execution.nativeSurface,
+          adapterMode: execution.adapterMode,
+          adapterVersion: execution.adapterVersion ?? null,
+          poolId: execution.poolId ?? null,
+          poolMemberId: execution.selectedPoolMemberId ?? null,
+          executionTargetId: execution.selectedExecutionTargetId ?? null,
+          memberTier: execution.selectedPoolMemberTier ?? null,
+          streamCommitted: true,
+        },
+      ],
+      skipDuplicates: true,
+    }),
+    prisma.relayExecutionAttempt.updateMany({
+      where: {
+        attemptId: execution.localAttemptId,
+        ownerEpoch: LOCAL_RELAY_PROCESS_EPOCH,
+        state: "ACTIVE",
+      },
+      data: {
+        heartbeatAt: now,
+        expiresAt: new Date(now.getTime() + LOCAL_RELAY_ATTEMPT_TTL_MS),
+      },
+    }),
+    prisma.relayRequest.updateMany({
+      where: { id: relayRequestId, firstClientByteAt: null },
+      data: { firstClientByteAt: now, streamCommitted: true },
+    }),
+  ]);
 }
 
 async function updateAdmissionMetadata(
@@ -2173,6 +2267,9 @@ async function failRelayMetadata({
   attemptCount,
   requestBytes,
   responseBytes,
+  localExecution,
+  userId,
+  localTerminal,
 }: {
   relayRequestId: string;
   startedAt: Date;
@@ -2183,6 +2280,9 @@ async function failRelayMetadata({
   attemptCount?: number;
   requestBytes?: number;
   responseBytes?: number;
+  localExecution?: LocalExecutionTelemetry;
+  userId?: string;
+  localTerminal?: RelayAttemptTerminal;
 }) {
   if (requestBytes !== undefined) {
     await prisma.relayRequest.update({
@@ -2199,6 +2299,9 @@ async function failRelayMetadata({
     transformerErrorClass,
     transformerLatencyMs,
     attemptCount,
+    localExecution,
+    userId,
+    localTerminal,
     terminal: {
       ok: false,
       failure,
@@ -5003,7 +5106,6 @@ async function relayPool({
             ? (affinityDecision?.reasons[affinityTarget.executionTargetId] ?? "no_match")
             : "identity_unavailable";
           const terminalWrites = await Promise.allSettled([
-            recordLocalTerminal(relayRequestId, requester.userId, localExecution, terminal),
             terminal.ok
               ? markPoolMemberRelaySuccess(candidate.poolMemberId)
               : adaptationOutcome === "protocol_error"
@@ -5018,6 +5120,9 @@ async function relayPool({
               startedAt,
               terminal: cumulativeTerminal,
               attemptCount,
+              localExecution,
+              userId: requester.userId,
+              localTerminal: terminal,
               affinity: {
                 outcome:
                   affinityDecision && (selectedAffinityPrefixDepth > 0 || selectedConversationMatch)
@@ -5216,6 +5321,9 @@ async function relayPool({
           responseBytes: cumulativeResponseBytes,
         },
         attemptCount,
+        localExecution,
+        userId: requester.userId,
+        localTerminal: terminal,
       });
       return operationFailureResponse(operation, failure);
     }
@@ -5839,12 +5947,6 @@ async function maybeApplyPoolMediaTransformer({
         onOverflow: () => attempt.cancel("request_too_large"),
       });
       const terminal = await attempt.terminal;
-      await recordLocalTerminal(
-        transformRelayRequestId,
-        requester.userId,
-        localExecution,
-        terminal,
-      ).catch(metadataUpdateError);
       cliLease.release();
       globalLease.release();
       cliLease = null;
@@ -5859,6 +5961,8 @@ async function maybeApplyPoolMediaTransformer({
           fallbackFailure: terminal.failure ?? "upstream_4xx",
           transformerErrorClass: terminal.failure ?? "upstream_4xx",
           transformerLatencyMs: Math.max(0, Date.now() - hopStartedAt.getTime()),
+          localExecution,
+          userId: requester.userId,
         }).catch(metadataUpdateError);
         return transformerFailureResponse(
           terminal.failure ?? "upstream_4xx",
@@ -5880,6 +5984,9 @@ async function maybeApplyPoolMediaTransformer({
           selectedDiscoveredModelId: transformer.id,
           transformerErrorClass: "protocol_error",
           transformerLatencyMs: Math.max(0, Date.now() - hopStartedAt.getTime()),
+          localExecution,
+          userId: requester.userId,
+          localTerminal: terminal,
         }).catch(metadataUpdateError);
         return transformerFailureResponse(
           "protocol_error",
@@ -5895,6 +6002,9 @@ async function maybeApplyPoolMediaTransformer({
           selectedDiscoveredModelId: transformer.id,
           transformerErrorClass: "protocol_error",
           transformerLatencyMs: Math.max(0, Date.now() - hopStartedAt.getTime()),
+          localExecution,
+          userId: requester.userId,
+          localTerminal: terminal,
         }).catch(metadataUpdateError);
         return transformerFailureResponse(
           "protocol_error",
@@ -5911,6 +6021,9 @@ async function maybeApplyPoolMediaTransformer({
           selectedDiscoveredModelId: transformer.id,
           transformerErrorClass: "request_too_large",
           transformerLatencyMs: Math.max(0, Date.now() - hopStartedAt.getTime()),
+          localExecution,
+          userId: requester.userId,
+          localTerminal: terminal,
         }).catch(metadataUpdateError);
         return transformerFailureResponse(
           "request_too_large",
@@ -5925,6 +6038,8 @@ async function maybeApplyPoolMediaTransformer({
         terminal: { ...terminal, ok: true, failure: null },
         transformerLatencyMs: Math.max(0, Date.now() - hopStartedAt.getTime()),
         transformerCacheHit: false,
+        localExecution,
+        userId: requester.userId,
       }).catch(metadataUpdateError);
 
       if (canCache) {
@@ -5941,6 +6056,7 @@ async function maybeApplyPoolMediaTransformer({
     } catch (error) {
       attempt.cancel("unknown");
       const terminal = await attempt.terminal.catch(() => null);
+      const observedTerminal = terminal ?? rejectedRelayTerminal();
       cliLease?.release();
       globalLease?.release();
       const failure: RelayFailure =
@@ -5954,6 +6070,9 @@ async function maybeApplyPoolMediaTransformer({
         selectedDiscoveredModelId: transformer.id,
         transformerErrorClass: failure,
         transformerLatencyMs: Math.max(0, Date.now() - hopStartedAt.getTime()),
+        localExecution,
+        userId: requester.userId,
+        localTerminal: observedTerminal,
       }).catch(metadataUpdateError);
       if (error instanceof TransformerResponseTooLargeError) {
         return transformerFailureResponse(
