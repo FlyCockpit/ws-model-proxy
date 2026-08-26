@@ -728,6 +728,8 @@ type RelayMetadataUpdate = {
     adapterVersion?: string;
     localAttemptId: string;
   };
+  localExecution?: LocalExecutionTelemetry;
+  userId?: string;
 };
 
 type RelayRequester = {
@@ -1879,7 +1881,7 @@ async function updateRelayMetadata(relayRequestId: string, update: RelayMetadata
         select: { id: true },
       })
     : null;
-  await prisma.relayRequest.update({
+  const relayUpdate = prisma.relayRequest.update({
     where: { id: relayRequestId },
     data: {
       selectedDiscoveredModelId: update.selectedDiscoveredModelId ?? null,
@@ -1930,6 +1932,21 @@ async function updateRelayMetadata(relayRequestId: string, update: RelayMetadata
     },
     select: { id: true },
   });
+  if (update.localExecution && update.userId) {
+    await prisma.$transaction([
+      prisma.relayExecutionEvent.create({
+        data: localTerminalEventData(
+          relayRequestId,
+          update.userId,
+          update.localExecution,
+          update.terminal,
+        ),
+      }),
+      relayUpdate,
+    ]);
+    return;
+  }
+  await relayUpdate;
 }
 
 async function updateContextCountMetadata(
@@ -2013,29 +2030,38 @@ async function recordLocalTerminal(
   terminal: RelayAttemptTerminal,
 ) {
   await prisma.relayExecutionEvent.create({
-    data: {
-      userId,
-      relayRequestId,
-      attemptId: execution.localAttemptId,
-      eventType: "TERMINAL",
-      requestedSurface: execution.requestedSurface,
-      nativeSurface: execution.nativeSurface,
-      adapterMode: execution.adapterMode,
-      adapterVersion: execution.adapterVersion ?? null,
-      poolId: execution.poolId ?? null,
-      poolMemberId: execution.selectedPoolMemberId ?? null,
-      executionTargetId: execution.selectedExecutionTargetId ?? null,
-      memberTier: execution.selectedPoolMemberTier ?? null,
-      terminalState: terminalStatus(terminal),
-      httpStatusCode: terminal.httpStatusCode,
-      upstreamStatusCode: terminal.upstreamStatusCode,
-      errorClass: terminal.failure,
-      promptTokens: terminal.usage?.promptTokens ?? null,
-      completionTokens: terminal.usage?.completionTokens ?? null,
-      totalTokens: terminal.usage?.totalTokens ?? null,
-      usageSource: terminal.usage ? "CLI_NORMALIZED" : null,
-    },
+    data: localTerminalEventData(relayRequestId, userId, execution, terminal),
   });
+}
+
+function localTerminalEventData(
+  relayRequestId: string,
+  userId: string,
+  execution: LocalExecutionTelemetry,
+  terminal: RelayAttemptTerminal,
+) {
+  return {
+    userId,
+    relayRequestId,
+    attemptId: execution.localAttemptId,
+    eventType: "TERMINAL",
+    requestedSurface: execution.requestedSurface,
+    nativeSurface: execution.nativeSurface,
+    adapterMode: execution.adapterMode,
+    adapterVersion: execution.adapterVersion ?? null,
+    poolId: execution.poolId ?? null,
+    poolMemberId: execution.selectedPoolMemberId ?? null,
+    executionTargetId: execution.selectedExecutionTargetId ?? null,
+    memberTier: execution.selectedPoolMemberTier ?? null,
+    terminalState: terminalStatus(terminal),
+    httpStatusCode: terminal.httpStatusCode,
+    upstreamStatusCode: terminal.upstreamStatusCode,
+    errorClass: terminal.failure,
+    promptTokens: terminal.usage?.promptTokens ?? null,
+    completionTokens: terminal.usage?.completionTokens ?? null,
+    totalTokens: terminal.usage?.totalTokens ?? null,
+    usageSource: terminal.usage ? "CLI_NORMALIZED" : null,
+  };
 }
 
 async function markLocalFirstClientByte(
@@ -3364,13 +3390,14 @@ async function relayDirect({
         reportCleanupFailures(cleanup);
         const responseId = responseIdCapture?.finish(operation.stream) ?? null;
         await Promise.allSettled([
-          recordLocalTerminal(relayRequestId, requester.userId, localExecution, terminal),
           updateRelayMetadata(relayRequestId, {
             selectedDiscoveredModelId: selected.id,
             status: terminalStatus(terminal),
             startedAt,
             terminal,
             attemptCount: 1,
+            localExecution,
+            userId: requester.userId,
           }).catch(metadataUpdateError),
           terminal.ok && responseId && operation.responseStickiness
             ? writeResponseStickiness({
@@ -3411,15 +3438,14 @@ async function relayDirect({
       operation.dispose?.() ?? Promise.resolve(),
     ]);
     reportCleanupFailures(cleanup);
-    await recordLocalTerminal(relayRequestId, requester.userId, localExecution, terminal).catch(
-      metadataUpdateError,
-    );
     await updateRelayMetadata(relayRequestId, {
       selectedDiscoveredModelId: selected.id,
       status: terminalStatus(terminal),
       startedAt,
       terminal,
       attemptCount: 1,
+      localExecution,
+      userId: requester.userId,
     });
     return operationFailureResponse(operation, terminal.failure ?? "unknown");
   }
@@ -5449,13 +5475,14 @@ async function relaySelectedModelNoFailover({
         reportCleanupFailures(cleanup);
         const responseId = responseIdCapture?.finish(operation.stream) ?? null;
         await Promise.allSettled([
-          recordLocalTerminal(relayRequestId, requester.userId, localExecution, terminal),
           updateRelayMetadata(relayRequestId, {
             selectedDiscoveredModelId: selected.id,
             status: terminalStatus(terminal),
             startedAt,
             terminal,
             attemptCount: 1,
+            localExecution,
+            userId: requester.userId,
           }).catch(metadataUpdateError),
           terminal.ok && responseId && operation.responseStickiness
             ? writeResponseStickiness({
@@ -5496,15 +5523,14 @@ async function relaySelectedModelNoFailover({
       operation.dispose?.() ?? Promise.resolve(),
     ]);
     reportCleanupFailures(cleanup);
-    await recordLocalTerminal(relayRequestId, requester.userId, localExecution, terminal).catch(
-      metadataUpdateError,
-    );
     await updateRelayMetadata(relayRequestId, {
       selectedDiscoveredModelId: selected.id,
       status: terminalStatus(terminal),
       startedAt,
       terminal,
       attemptCount: 1,
+      localExecution,
+      userId: requester.userId,
     });
     return operationFailureResponse(operation, terminal.failure ?? "unknown");
   }
