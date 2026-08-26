@@ -1,11 +1,16 @@
 import prisma from "@ws-model-proxy/db";
 import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
+import {
+  asJson,
+  canonicalizeAffinitySurface,
+  extractAffinityLayers,
+  type JsonValue,
+} from "./cache-affinity-layers.js";
 
-const DIGEST_VERSION = 3;
+const DIGEST_VERSION = 4;
 const MAX_PREFIXES_PER_REQUEST = 64;
+const MAX_INSTRUCTION_PREFIXES = 8;
 const MAX_CANONICAL_BYTES = 2 * 1024 * 1024;
-
-type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 export type AffinityPolicy = {
   enabled: boolean;
@@ -73,37 +78,30 @@ function stableJson(value: JsonValue): string {
     .join(",")}}`;
 }
 
-function asJson(value: unknown): JsonValue | undefined {
-  if (value === null || typeof value === "boolean" || typeof value === "string") return value;
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (Array.isArray(value)) {
-    const values = value.map(asJson);
-    return values.some((entry) => entry === undefined) ? undefined : (values as JsonValue[]);
-  }
-  if (typeof value !== "object") return undefined;
-  const result: Record<string, JsonValue> = {};
-  for (const [key, nested] of Object.entries(value)) {
-    const parsed = asJson(nested);
-    if (parsed !== undefined) result[key] = parsed;
-  }
-  return result;
+const PARAMETER_EXCLUSIONS = new Set(["model", "stream", "conversation", "conversation_id"]);
+
+function hmacValue(value: string) {
+  return hmacDigestForForwarderPurpose({ purpose: "cacheAffinity", value });
 }
 
-const CONTENT_BINDING_KEYS = new Set([
-  "input",
-  "messages",
-  "prompt",
-  "instructions",
-  "system",
-  "tools",
-]);
-const ROUTING_ONLY_KEYS = new Set(["model", "stream"]);
-const CONVERSATION_KEYS = new Set(["conversation", "conversation_id"]);
+function cumulativePrefixDigests(
+  units: JsonValue[],
+  encode: (index: number, cumulative: string) => string,
+) {
+  const digests: string[] = [];
+  let cumulative = "";
+  for (let index = 0; index < units.length; index += 1) {
+    cumulative += `${index}:${stableJson(units[index]!)}\n`;
+    if (Buffer.byteLength(cumulative) > MAX_CANONICAL_BYTES) break;
+    digests.push(encode(index + 1, cumulative));
+  }
+  return digests;
+}
 
 /**
- * Produces cumulative canonical prefixes without retaining source material.
- * Array order and content-block/tool order remain significant; object key order
- * does not. Transport-only and client metadata fields are deliberately absent.
+ * Produces layered HMAC prefixes without retaining source material.
+ * Conversation `digests` exclude instruction roles. Instruction warmth is a
+ * separate cumulative list. Object key order does not affect canonical JSON.
  */
 export function affinityPrefixDigests({
   ownerId,
@@ -125,25 +123,21 @@ export function affinityPrefixDigests({
   runtimeIdentity: string;
 }): {
   bindingDigest: string;
+  instructionDigests: string[];
   digests: string[];
   conversationDigest: string | null;
   hasExplicitConversation: boolean;
+  isContinuation: boolean;
 } {
-  const orderedSource = payload.input ?? payload.messages ?? payload.prompt;
-  const ordered = Array.isArray(orderedSource)
-    ? orderedSource
-    : orderedSource === undefined
-      ? []
-      : [orderedSource];
-  const instructions = asJson(payload.instructions ?? payload.system);
-  const tools = asJson(payload.tools);
+  const canonicalSurface = canonicalizeAffinitySurface(surface);
+  const layers = extractAffinityLayers(canonicalSurface, payload);
+  const excluded = new Set([...layers.consumedKeys, ...PARAMETER_EXCLUSIONS]);
   // Bind every other JSON field, including unknown native extensions. False
   // negatives are safe; matching requests whose unknown semantics differ is
-  // not. Only the visible pool alias and transport framing are routing-only.
+  // not. Only consumed content keys and transport/session framing are omitted.
   const parameters = Object.fromEntries(
     Object.entries(payload).flatMap(([key, raw]) => {
-      if (CONTENT_BINDING_KEYS.has(key) || ROUTING_ONLY_KEYS.has(key) || CONVERSATION_KEYS.has(key))
-        return [];
+      if (excluded.has(key)) return [];
       const value = asJson(raw);
       return value === undefined ? [] : [[key, value] as const];
     }),
@@ -155,49 +149,45 @@ export function affinityPrefixDigests({
     poolId,
     securityScope: securityScope ?? ownerId,
     accessGrantId: accessGrantId ?? null,
-    surface,
+    surface: canonicalSurface ?? surface,
     runtimeIdentity,
   });
-  const bindingDigest = hmacDigestForForwarderPurpose({
-    purpose: "cacheAffinity",
-    value: `affinity-binding-v3:${binding}`,
-  });
-  const prefixBindingDigest = hmacDigestForForwarderPurpose({
-    purpose: "cacheAffinity",
-    value: `affinity-prefix-binding-v3:${stableJson({
+  const bindingDigest = hmacValue(`affinity-binding-v4:${binding}`);
+  const prefixBindingDigest = hmacValue(
+    `affinity-prefix-binding-v4:${stableJson({
       bindingDigest,
-      instructions: instructions ?? null,
-      tools: tools ?? null,
+      instructions: layers.instructionUnits,
+      tools: layers.tools ?? null,
       parameters,
     })}`,
-  });
-  const units = ordered
-    .slice(0, MAX_PREFIXES_PER_REQUEST)
-    .map(asJson)
-    .filter(Boolean) as JsonValue[];
-  const digests: string[] = [];
-  let cumulative = "";
-  for (let index = 0; index < units.length; index += 1) {
-    cumulative += `${index}:${stableJson(units[index]!)}\n`;
-    if (Buffer.byteLength(cumulative) > MAX_CANONICAL_BYTES) break;
-    digests.push(
-      hmacDigestForForwarderPurpose({
-        purpose: "cacheAffinity",
-        value: `prefix-binding:${prefixBindingDigest}\nprefix:${index + 1}\n${cumulative}`,
-      }),
-    );
-  }
+  );
+  const digests = cumulativePrefixDigests(
+    layers.conversationUnits.slice(0, MAX_PREFIXES_PER_REQUEST),
+    (index, cumulative) =>
+      hmacValue(`prefix-binding:${prefixBindingDigest}\nprefix:${index}\n${cumulative}`),
+  );
+  const textCap =
+    layers.tools !== undefined ? MAX_INSTRUCTION_PREFIXES - 1 : MAX_INSTRUCTION_PREFIXES;
+  const hmacInstructionUnits =
+    layers.tools !== undefined
+      ? [...layers.instructionUnits.slice(0, textCap), layers.tools]
+      : layers.instructionUnits.slice(0, textCap);
+  const instructionDigests = cumulativePrefixDigests(hmacInstructionUnits, (index, cumulative) =>
+    hmacValue(`instruction-layer-v4:${bindingDigest}\nprefix:${index}\n${cumulative}`),
+  );
   const conversationSource = asJson(payload.conversation ?? payload.conversation_id);
   return {
     bindingDigest,
+    instructionDigests,
     digests,
+    isContinuation: layers.isContinuation,
     hasExplicitConversation: conversationSource !== undefined,
     conversationDigest:
       conversationSource === undefined
         ? null
-        : hmacDigestForForwarderPurpose({
-            purpose: "cacheAffinity",
-            value: `affinity-conversation-v3:${stableJson({
+        : hmacValue(
+            `affinity-conversation-v4:${stableJson({
+              v: DIGEST_VERSION,
               ownerId,
               resourceOwnerId,
               poolId,
@@ -205,7 +195,7 @@ export function affinityPrefixDigests({
               accessGrantId: accessGrantId ?? null,
               conversation: conversationSource,
             })}`,
-          }),
+          ),
   };
 }
 
