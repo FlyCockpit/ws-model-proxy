@@ -1024,6 +1024,7 @@ model PoolMember {
   ExecutionTarget              ExecutionTarget?        @relation(fields: [executionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   CapacityWaiters              CapacityWaiter[]
   CapacityLeases               CapacityLease[]
+  RelayRequests                RelayRequest[]          @relation("RelayRequestSelectedPoolMember")
 
   @@unique([poolId, discoveredModelId])
   @@unique([poolId, executionTargetId])
@@ -1325,6 +1326,15 @@ model RelayRequest {
   transformerLatencyMs       Int?
   transformerCacheHit        Boolean?
   transformerErrorClass      String?
+  /// Prompt-free protocol routing facts. These fields contain only bounded
+  /// identifiers/enums and never request content, tool arguments, media, or headers.
+  requestedSurface           String?
+  selectedNativeSurface      String?
+  adapterMode                String?
+  adapterVersion             String?
+  selectedPoolMemberId       String?
+  localAttemptId             String?
+  firstClientByteAt          DateTime?
   /// Prompt-free context admission telemetry. Never stores request content.
   contextTokenCount          Int?
   contextCountMethod         String?
@@ -1372,12 +1382,14 @@ model RelayRequest {
   RequestedExecutionTarget   ExecutionTarget?   @relation("RelayRequestRequestedExecutionTarget", fields: [requestedExecutionTargetId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   SelectedExecutionTarget    ExecutionTarget?   @relation("RelayRequestSelectedExecutionTarget", fields: [selectedExecutionTargetId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   AdmissionRequests          AdmissionRequest[]
+  SelectedPoolMember         PoolMember?        @relation("RelayRequestSelectedPoolMember", fields: [selectedPoolMemberId], references: [id], onDelete: SetNull, onUpdate: Cascade)
 
   @@index([userId, createdAt])
   @@index([modelApiTokenId, createdAt])
   @@index([requestedDiscoveredModelId, createdAt])
   @@index([requestedModelPoolId, createdAt])
   @@index([selectedDiscoveredModelId])
+  @@index([selectedPoolMemberId])
   @@index([requestedExecutionTargetId, createdAt])
   @@index([selectedExecutionTargetId])
   @@index([status, createdAt])

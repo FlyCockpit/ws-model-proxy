@@ -678,6 +678,7 @@ type RelayMetadataCreate = {
   operation?: ModelApiCapability;
   requestBytes?: number | null;
   contextCount?: ContextCountTelemetry;
+  requestedSurface: string;
 };
 
 type RelayMetadataUpdate = {
@@ -691,6 +692,15 @@ type RelayMetadataUpdate = {
   transformerErrorClass?: string | null;
   attemptCount?: number;
   affinity?: { outcome: string; score: number; prefixDepth: number; reason: string };
+  execution?: {
+    selectedExecutionTargetId?: string;
+    selectedPoolMemberId?: string;
+    selectedPoolMemberTier?: "PRIMARY" | "PUBLIC_OVERFLOW";
+    nativeSurface: string;
+    adapterMode: "NATIVE" | "ADAPTED";
+    adapterVersion?: string;
+    localAttemptId: string;
+  };
 };
 
 type RelayRequester = {
@@ -1255,6 +1265,15 @@ function requestedSurfaceForOperation(operation: RelayOperation): ProtocolSurfac
   return null;
 }
 
+function telemetrySurfaceForOperation(operation: RelayOperation): string {
+  if (operation.family === "chat.completions") return "OPENAI_CHAT_COMPLETIONS";
+  if (operation.family === "completions") return "OPENAI_COMPLETIONS";
+  if (operation.family === "embeddings") return "OPENAI_EMBEDDINGS";
+  if (operation.family === "responses") return "OPENAI_RESPONSES";
+  if (operation.family === "messages") return "ANTHROPIC_MESSAGES";
+  return "OPENAI_AUDIO";
+}
+
 function modelApiSurface(surface: ProtocolSurface) {
   return surface === "openai-chat"
     ? ("OPENAI_CHAT_COMPLETIONS" as const)
@@ -1789,6 +1808,7 @@ async function createRelayMetadata(input: RelayMetadataCreate): Promise<string> 
       transformerLatencyMs: input.transformerLatencyMs ?? null,
       transformerCacheHit: input.transformerCacheHit ?? null,
       transformerErrorClass: input.transformerErrorClass ?? null,
+      requestedSurface: input.requestedSurface,
       operation: input.operation ?? null,
       requestBytes: input.requestBytes == null ? null : BigInt(input.requestBytes),
       contextTokenCount: input.contextCount?.tokens ?? null,
@@ -1857,6 +1877,19 @@ async function updateRelayMetadata(relayRequestId: string, update: RelayMetadata
             affinityReason: update.affinity.reason,
           }
         : {}),
+      ...(update.execution
+        ? {
+            ...(update.execution.selectedExecutionTargetId
+              ? { selectedExecutionTargetId: update.execution.selectedExecutionTargetId }
+              : {}),
+            selectedPoolMemberId: update.execution.selectedPoolMemberId ?? null,
+            selectedPoolMemberTier: update.execution.selectedPoolMemberTier ?? null,
+            selectedNativeSurface: update.execution.nativeSurface,
+            adapterMode: update.execution.adapterMode,
+            adapterVersion: update.execution.adapterVersion ?? null,
+            localAttemptId: update.execution.localAttemptId,
+          }
+        : {}),
       errorClass: failure,
       ...(update.transformerLatencyMs !== undefined
         ? { transformerLatencyMs: update.transformerLatencyMs }
@@ -1886,6 +1919,34 @@ async function updateContextCountMetadata(
       contextSafetyMargin: contextCount.safetyMargin,
       contextSerializedChars: contextCount.serializedChars,
     },
+  });
+}
+
+async function updateLocalExecutionMetadata(
+  relayRequestId: string,
+  execution: NonNullable<RelayMetadataUpdate["execution"]>,
+) {
+  await prisma.relayRequest.update({
+    where: { id: relayRequestId },
+    data: {
+      ...(execution.selectedExecutionTargetId
+        ? { selectedExecutionTargetId: execution.selectedExecutionTargetId }
+        : {}),
+      selectedPoolMemberId: execution.selectedPoolMemberId ?? null,
+      selectedPoolMemberTier: execution.selectedPoolMemberTier ?? null,
+      selectedNativeSurface: execution.nativeSurface,
+      adapterMode: execution.adapterMode,
+      adapterVersion: execution.adapterVersion ?? null,
+      localAttemptId: execution.localAttemptId,
+    },
+    select: { id: true },
+  });
+}
+
+async function markLocalFirstClientByte(relayRequestId: string) {
+  await prisma.relayRequest.updateMany({
+    where: { id: relayRequestId, firstClientByteAt: null },
+    data: { firstClientByteAt: new Date(), streamCommitted: true },
   });
 }
 
@@ -2920,6 +2981,7 @@ async function relayDirect({
     modelApiTokenId: requester.modelApiTokenId,
     modelApiTokenLookupPrefix: requester.modelApiTokenLookupPrefix,
     requestedDiscoveredModelId: target.id,
+    requestedSurface: telemetrySurfaceForOperation(operation),
     operation: operation.capability,
     requestBytes: null,
     contextCount: operation.contextCount,
@@ -3107,7 +3169,7 @@ async function relayDirect({
     operation.responseStickiness && operation.family === "responses"
       ? createResponseIdCapture()
       : null;
-  let attempt: ReturnType<typeof startRelayAttempt>;
+  let attempt: ReturnType<typeof startRelayAttempt> | null = null;
   try {
     attempt = startRelayAttempt({
       manager,
@@ -3124,7 +3186,14 @@ async function relayDirect({
         ? (chunk) => responseIdCapture.push(chunk, operation.stream)
         : undefined,
     });
+    await updateLocalExecutionMetadata(relayRequestId, {
+      selectedExecutionTargetId: selected.ExecutionTarget?.id,
+      nativeSurface: telemetrySurfaceForOperation(operation),
+      adapterMode: "NATIVE",
+      localAttemptId: attempt.requestId,
+    });
   } catch {
+    attempt?.cancel("unknown");
     await settleRelayCleanup([
       () => cliLease.release(),
       () => globalLease?.release(),
@@ -3144,6 +3213,7 @@ async function relayDirect({
     });
     return operationFailureResponse(operation, "unknown");
   }
+  if (!attempt) throw new Error("local relay attempt was not initialized");
 
   try {
     const started = await attempt.started;
@@ -3178,14 +3248,17 @@ async function relayDirect({
       })
       .catch(metadataUpdateError);
     void finalize;
-    const response = new Response(
-      responseBodyForOperation({
-        body: started.body,
-        headers: started.headers,
-        terminal: attempt.terminal,
-        operation,
-      }),
-      { status: started.status, headers: started.headers },
+    const response = responseWithFirstClientByte(
+      new Response(
+        responseBodyForOperation({
+          body: started.body,
+          headers: started.headers,
+          terminal: attempt.terminal,
+          operation,
+        }),
+        { status: started.status, headers: started.headers },
+      ),
+      () => markLocalFirstClientByte(relayRequestId),
     );
     return capacityLease?.state === "ADMITTED"
       ? (capacityRuntime?.hold(response, capacityLease.lease, request.signal) ?? response)
@@ -3248,6 +3321,7 @@ async function relayPool({
     modelApiTokenId: requester.modelApiTokenId,
     modelApiTokenLookupPrefix: requester.modelApiTokenLookupPrefix,
     requestedModelPoolId: target.id,
+    requestedSurface: telemetrySurfaceForOperation(operation),
     transformerLatencyMs: transformDebug?.latencyMs ?? null,
     transformerCacheHit: transformDebug?.cacheHit ?? null,
     transformerErrorClass: transformDebug?.error ?? null,
@@ -3546,6 +3620,10 @@ async function relayPool({
         where: { id: relayRequestId },
         data: {
           selectedExecutionTargetId: result.target.executionTargetId,
+          selectedPoolMemberId: result.target.poolMemberId,
+          selectedNativeSurface: modelApiSurface(result.nativeSurface),
+          adapterMode: result.nativeSurface === requestedSurface ? "NATIVE" : "ADAPTED",
+          adapterVersion: result.nativeSurface === requestedSurface ? null : "1.0.0",
           // Provider-backed PRIMARY is still external egress even though it is
           // not public fallback. The tier and overflow reason distinguish it.
           publicEgress: true,
@@ -4503,7 +4581,7 @@ async function relayPool({
       break;
     }
     attemptCount += 1;
-    let attempt: ReturnType<typeof startRelayAttempt>;
+    let attempt: ReturnType<typeof startRelayAttempt> | null = null;
     try {
       attempt = startRelayAttempt({
         manager,
@@ -4520,7 +4598,17 @@ async function relayPool({
           ? (chunk) => responseIdCapture.push(chunk, operation.stream)
           : undefined,
       });
+      await updateLocalExecutionMetadata(relayRequestId, {
+        selectedExecutionTargetId: member.ExecutionTarget?.id,
+        selectedPoolMemberId: member.id,
+        selectedPoolMemberTier: "PRIMARY",
+        nativeSurface: execution?.nativeSurface ?? telemetrySurfaceForOperation(operation),
+        adapterMode: adaptedSource ? "ADAPTED" : "NATIVE",
+        adapterVersion: adaptedSource ? "1.0.0" : undefined,
+        localAttemptId: attempt.requestId,
+      });
     } catch {
+      attempt?.cancel("unknown");
       await settleRelayCleanup([
         () => cliLease.release(),
         () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
@@ -4533,6 +4621,7 @@ async function relayPool({
       await releaseCapacityAttempt();
       continue;
     }
+    if (!attempt) throw new Error("pool relay attempt was not initialized");
 
     try {
       const started = await attempt.started;
@@ -4868,10 +4957,14 @@ async function relayPool({
             );
         }
       }
-      const response = new Response(responseBody, {
-        status: nonSuccess && (started.status < 400 || started.status > 599) ? 502 : started.status,
-        headers: responseHeaders,
-      });
+      const response = responseWithFirstClientByte(
+        new Response(responseBody, {
+          status:
+            nonSuccess && (started.status < 400 || started.status > 599) ? 502 : started.status,
+          headers: responseHeaders,
+        }),
+        () => markLocalFirstClientByte(relayRequestId),
+      );
       return capacityLease?.state === "ADMITTED"
         ? (capacityRuntime?.hold(response, capacityLease.lease, request.signal) ?? response)
         : response;
@@ -4984,6 +5077,7 @@ async function relaySelectedModelNoFailover({
     modelApiTokenLookupPrefix: requester.modelApiTokenLookupPrefix,
     requestedDiscoveredModelId,
     requestedModelPoolId,
+    requestedSurface: telemetrySurfaceForOperation(operation),
     operation: operation.capability,
     requestBytes: null,
     contextCount: operation.contextCount,
@@ -5135,6 +5229,12 @@ async function relaySelectedModelNoFailover({
   });
 
   try {
+    await updateLocalExecutionMetadata(relayRequestId, {
+      selectedExecutionTargetId: selected.ExecutionTarget?.id,
+      nativeSurface: telemetrySurfaceForOperation(operation),
+      adapterMode: "NATIVE",
+      localAttemptId: attempt.requestId,
+    });
     const started = await attempt.started;
     const finalize = attempt.terminal
       .catch(() => rejectedRelayTerminal())
@@ -5166,19 +5266,23 @@ async function relaySelectedModelNoFailover({
       })
       .catch(metadataUpdateError);
     void finalize;
-    const response = new Response(
-      responseBodyForOperation({
-        body: started.body,
-        headers: started.headers,
-        terminal: attempt.terminal,
-        operation,
-      }),
-      { status: started.status, headers: started.headers },
+    const response = responseWithFirstClientByte(
+      new Response(
+        responseBodyForOperation({
+          body: started.body,
+          headers: started.headers,
+          terminal: attempt.terminal,
+          operation,
+        }),
+        { status: started.status, headers: started.headers },
+      ),
+      () => markLocalFirstClientByte(relayRequestId),
     );
     return capacityLease?.state === "ADMITTED"
       ? (capacityRuntime?.hold(response, capacityLease.lease, request.signal) ?? response)
       : response;
   } catch {
+    attempt.cancel("unknown");
     const terminal = await attempt.terminal.catch(() => rejectedRelayTerminal());
     const cleanup = await Promise.allSettled([
       Promise.resolve().then(() => cliLease.release()),
@@ -5466,6 +5570,7 @@ async function maybeApplyPoolMediaTransformer({
         modelApiTokenLookupPrefix: requester.modelApiTokenLookupPrefix,
         requestedDiscoveredModelId: transformer.id,
         requestedModelPoolId: poolId,
+        requestedSurface: "OPENAI_CHAT_COMPLETIONS",
         operation: "chat.completions",
       });
     } catch (error) {
@@ -5488,6 +5593,12 @@ async function maybeApplyPoolMediaTransformer({
     });
 
     try {
+      await updateLocalExecutionMetadata(transformRelayRequestId, {
+        selectedExecutionTargetId: transformer.ExecutionTarget?.id,
+        nativeSurface: "OPENAI_CHAT_COMPLETIONS",
+        adapterMode: "NATIVE",
+        localAttemptId: attempt.requestId,
+      });
       const started = await attempt.started;
       const rawText = await readResponseUtf8(started.body, {
         onOverflow: () => attempt.cancel("request_too_large"),
@@ -5587,6 +5698,7 @@ async function maybeApplyPoolMediaTransformer({
         }),
       );
     } catch (error) {
+      attempt.cancel("unknown");
       const terminal = await attempt.terminal.catch(() => null);
       cliLease?.release();
       globalLease?.release();
@@ -6051,6 +6163,7 @@ async function relayBoundProviderResponse(input: {
     modelApiTokenId: input.requester.modelApiTokenId,
     modelApiTokenLookupPrefix: input.requester.modelApiTokenLookupPrefix,
     requestedModelPoolId: input.stickyRoute.visibleTarget.id,
+    requestedSurface: "OPENAI_RESPONSES",
     operation: input.capability,
     requestBytes: input.body.byteLength,
     contextCount: input.contextCount,
@@ -6178,6 +6291,9 @@ async function relayBoundProviderResponse(input: {
       where: { id: relayRequestId },
       data: {
         selectedExecutionTargetId: result.target.executionTargetId,
+        selectedPoolMemberId: result.target.poolMemberId,
+        selectedNativeSurface: "OPENAI_RESPONSES",
+        adapterMode: "NATIVE",
         publicEgress: true,
         selectedPoolMemberTier: selectedTier,
         providerAccountId: result.target.providerAccountId,

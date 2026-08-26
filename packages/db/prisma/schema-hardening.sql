@@ -380,6 +380,22 @@ ALTER TABLE relay_request ADD CONSTRAINT relay_request_admission_telemetry_check
   AND ("admissionFencingToken" IS NULL OR "admissionFencingToken" > 0)
 );
 
+ALTER TABLE relay_request DROP CONSTRAINT IF EXISTS relay_request_execution_telemetry_check;
+ALTER TABLE relay_request ADD CONSTRAINT relay_request_execution_telemetry_check CHECK (
+  ("requestedSurface" IS NULL OR "requestedSurface" IN (
+    'OPENAI_CHAT_COMPLETIONS', 'OPENAI_COMPLETIONS', 'OPENAI_EMBEDDINGS',
+    'OPENAI_RESPONSES', 'ANTHROPIC_MESSAGES', 'OPENAI_AUDIO'
+  ))
+  AND ("selectedNativeSurface" IS NULL OR "selectedNativeSurface" IN (
+    'OPENAI_CHAT_COMPLETIONS', 'OPENAI_COMPLETIONS', 'OPENAI_EMBEDDINGS',
+    'OPENAI_RESPONSES', 'ANTHROPIC_MESSAGES', 'OPENAI_AUDIO'
+  ))
+  AND ("adapterMode" IS NULL OR "adapterMode" IN ('NATIVE', 'ADAPTED'))
+  AND ("adapterVersion" IS NULL OR ("adapterMode" = 'ADAPTED' AND length("adapterVersion") <= 32))
+  AND ("localAttemptId" IS NULL OR length("localAttemptId") BETWEEN 1 AND 128)
+  AND ("firstClientByteAt" IS NULL OR "streamCommitted")
+);
+
 -- Partial indexes document and enforce the live-winner invariant even if a
 -- future archival change relaxes the stronger one-lease-per-attempt FK.
 CREATE UNIQUE INDEX IF NOT EXISTS capacity_waiter_one_admitted_winner

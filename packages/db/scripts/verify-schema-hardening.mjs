@@ -25,6 +25,7 @@ const requiredFragments = [
   "execution_target_capacity_policy_check",
   "model_pool_capacity_policy_check",
   "model_pool_affinity_policy_check",
+  "relay_request_execution_telemetry_check",
   "cache_affinity_record_shape_check",
   "cache_affinity_conversation_unique",
   "enforce_cache_affinity_identity_immutable",

@@ -101,6 +101,7 @@ const db = prisma as unknown as {
   relayRequest: {
     create: MockInstance;
     update: MockInstance;
+    updateMany: MockInstance;
   };
   responseStickinessRecord: {
     findUnique: MockInstance;
@@ -619,6 +620,7 @@ describe("model API routes", () => {
     db.relayRequest.create.mockResolvedValue({ id: "relay-request-id" });
     db.appSetting.findUnique.mockResolvedValue(null);
     db.relayRequest.update.mockResolvedValue({ id: "relay-request-id" });
+    db.relayRequest.updateMany.mockResolvedValue({ count: 1 });
     db.responseStickinessRecord.findUnique.mockResolvedValue(null);
     db.responseStickinessRecord.upsert.mockResolvedValue({ id: "stickiness-id" });
     affinity.rank.mockImplementation(async ({ targets }) => ({
@@ -828,6 +830,30 @@ describe("model API routes", () => {
       object: "chat.completion",
       choices: [{ message: { content: "hello" } }],
     });
+    expect(db.relayRequest.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ requestedSurface: "OPENAI_CHAT_COMPLETIONS" }),
+      }),
+    );
+    expect(db.relayRequest.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          selectedExecutionTargetId: "responses-member-target",
+          selectedPoolMemberId: "responses-member",
+          selectedPoolMemberTier: "PRIMARY",
+          selectedNativeSurface: "OPENAI_RESPONSES",
+          adapterMode: "ADAPTED",
+          adapterVersion: "1.0.0",
+          localAttemptId: sent.requestId,
+        }),
+      }),
+    );
+    const persisted = stringifyPersistenceCalls([
+      db.relayRequest.create.mock.calls,
+      db.relayRequest.update.mock.calls,
+    ]);
+    expect(persisted).not.toContain("hello");
+    expect(persisted).not.toContain("upstream-responses");
   });
 
   it("rejects strict fields that cannot be adapted before relay dispatch", async () => {

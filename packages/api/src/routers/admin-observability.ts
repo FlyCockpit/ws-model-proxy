@@ -192,6 +192,15 @@ type RelayRequestRow = {
   requestBytes: bigint | null;
   responseBytes: bigint | null;
   attemptCount: number;
+  requestedSurface: string | null;
+  selectedNativeSurface: string | null;
+  adapterMode: string | null;
+  adapterVersion: string | null;
+  selectedPoolMemberId: string | null;
+  selectedPoolMemberTier: string | null;
+  localAttemptId: string | null;
+  firstClientByteAt: Date | null;
+  streamCommitted: boolean;
   User: OwnerRow;
   ModelApiToken: { id: string; name: string; lookupPrefix: string } | null;
   RequestedDiscoveredModel: RelayModelRow | null;
@@ -548,6 +557,15 @@ function serializeRelay(row: RelayRequestRow) {
     requestBytes: row.requestBytes === null ? null : Number(row.requestBytes),
     responseBytes: row.responseBytes === null ? null : Number(row.responseBytes),
     attemptCount: row.attemptCount,
+    requestedSurface: row.requestedSurface,
+    selectedNativeSurface: row.selectedNativeSurface,
+    adapterMode: row.adapterMode,
+    adapterVersion: row.adapterVersion,
+    selectedPoolMemberId: row.selectedPoolMemberId,
+    selectedPoolMemberTier: row.selectedPoolMemberTier,
+    localAttemptId: row.localAttemptId,
+    firstClientByteAt: row.firstClientByteAt,
+    streamCommitted: row.streamCommitted,
   };
 }
 
@@ -928,6 +946,15 @@ export const adminObservabilityRouter = {
             requestBytes: true,
             responseBytes: true,
             attemptCount: true,
+            requestedSurface: true,
+            selectedNativeSurface: true,
+            adapterMode: true,
+            adapterVersion: true,
+            selectedPoolMemberId: true,
+            selectedPoolMemberTier: true,
+            localAttemptId: true,
+            firstClientByteAt: true,
+            streamCommitted: true,
             User: { select: ownerSelect },
             ModelApiToken: { select: { id: true, name: true, lookupPrefix: true } },
             RequestedDiscoveredModel: { select: relayModelSelect },
