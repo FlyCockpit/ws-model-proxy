@@ -1,7 +1,3 @@
-export type AdmissionState = "WAITING" | "ADMITTED" | "CANCELLED" | "EXPIRED" | "TERMINAL";
-export type WaiterState = "WAITING" | "WON" | "CANCELLED" | "EXPIRED";
-export type LeaseState = "ACTIVE" | "RELEASED" | "EXPIRED" | "RECLAIMED";
-
 export type AdmissionCandidate = {
   capacityId: string;
   executionTargetId: string;

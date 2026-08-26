@@ -4,7 +4,6 @@ import {
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import {
   type ModelApiSurface,
-  modelApiSurfaces,
   surfaceAvailabilityMatrix,
 } from "@ws-model-proxy/api/lib/surface-capabilities";
 
@@ -192,20 +191,3 @@ export function providerOrderAfterMove(
   [next[index], next[target]] = [next[target]!, next[index]!];
   return next;
 }
-
-export function egressAcknowledgementIsValid(
-  providerIds: readonly string[],
-  acknowledged: boolean,
-) {
-  return providerIds.length === 0 || acknowledged;
-}
-
-export function firstInvalidWizardField(
-  orderedFields: readonly string[],
-  errors: Readonly<Record<string, string>>,
-) {
-  return orderedFields.find((field) => Boolean(errors[field])) ?? null;
-}
-
-export const guardedWizardStepCount = 4;
-export const guardedWizardSurfaces = modelApiSurfaces;

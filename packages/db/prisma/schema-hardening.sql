@@ -114,7 +114,7 @@ DELETE FROM cache_affinity_record
  WHERE "digestVersion" < 3 OR "tenantUserId" IS NULL;
 ALTER TABLE cache_affinity_record ALTER COLUMN "tenantUserId" SET NOT NULL;
 ALTER TABLE cache_affinity_record ADD COLUMN IF NOT EXISTS "bindingDigest" TEXT;
-DELETE FROM cache_affinity_record WHERE "bindingDigest" IS NULL;
+DELETE FROM cache_affinity_record WHERE "bindingDigest" IS NULL; -- policy: bounded-delete
 ALTER TABLE cache_affinity_record ALTER COLUMN "bindingDigest" SET NOT NULL;
 ALTER TABLE cache_affinity_record ALTER COLUMN "prefixDigest" DROP NOT NULL;
 ALTER TABLE cache_affinity_record ALTER COLUMN "conversationDigest" DROP NOT NULL;

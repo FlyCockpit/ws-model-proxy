@@ -310,7 +310,7 @@ try {
   }
   // Simulate the operator choosing the target-backed configuration after
   // inspecting the diagnostic. The hardening script itself must not choose.
-  await client.query(`DELETE FROM pool_member WHERE id = 'conflict-legacy-row'`);
+  await client.query(`DELETE FROM pool_member WHERE id = 'conflict-legacy-row'`); // policy: bounded-delete
 
   try {
     await client.query(sql);
@@ -334,7 +334,7 @@ try {
     throw new Error("Failed hardening deleted or merged conflicting allowlist rows");
   }
   await client.query(`
-    DELETE FROM model_api_token_allowlist_entry WHERE id = 'conflict-legacy-access';
+    DELETE FROM model_api_token_allowlist_entry WHERE id = 'conflict-legacy-access'; -- policy: bounded-delete
     INSERT INTO model_pool (id, "createdAt", "updatedAt", "userId", slug, name)
     VALUES ('invalid-pool', NOW(), NOW(), 'owner-b', 'invalid', 'Invalid');
     INSERT INTO pool_member
@@ -404,11 +404,11 @@ try {
     throw new Error("Failed hardening modified invalid pre-existing consumer rows");
   }
   await client.query(`
-    DELETE FROM pool_member WHERE id = 'invalid-preexisting-member';
-    DELETE FROM model_api_token_allowlist_entry WHERE id = 'invalid-preexisting-access';
-    DELETE FROM response_stickiness_record WHERE id = 'invalid-preexisting-stickiness';
-    DELETE FROM response_stickiness_record WHERE id = 'pre-invalid-cross-wire';
-    DELETE FROM relay_request WHERE id = 'invalid-preexisting-relay';
+    DELETE FROM pool_member WHERE id = 'invalid-preexisting-member'; -- policy: bounded-delete
+    DELETE FROM model_api_token_allowlist_entry WHERE id = 'invalid-preexisting-access'; -- policy: bounded-delete
+    DELETE FROM response_stickiness_record WHERE id = 'invalid-preexisting-stickiness'; -- policy: bounded-delete
+    DELETE FROM response_stickiness_record WHERE id = 'pre-invalid-cross-wire'; -- policy: bounded-delete
+    DELETE FROM relay_request WHERE id = 'invalid-preexisting-relay'; -- policy: bounded-delete
   `);
 
   await client.query(sql);
@@ -623,7 +623,7 @@ try {
   ) {
     throw new Error("Provider endpoint change did not preserve an invalidated binding snapshot");
   }
-  await client.query(`DELETE FROM model_api_token WHERE id = 'sticky-provider-token'`);
+  await client.query(`DELETE FROM model_api_token WHERE id = 'sticky-provider-token'`); // policy: bounded-delete
   const deletedTokenBinding = await client.query(`
     SELECT COUNT(*)::int AS count FROM response_stickiness_record
      WHERE id = 'sticky-provider-binding'
@@ -631,7 +631,7 @@ try {
   if (deletedTokenBinding.rows[0]?.count !== 0) {
     throw new Error("Deleted model API token retained a provider Responses binding");
   }
-  await client.query(`DELETE FROM pool_grant WHERE id = 'sticky-provider-grant'`);
+  await client.query(`DELETE FROM pool_grant WHERE id = 'sticky-provider-grant'`); // policy: bounded-delete
   const revokedGrantBinding = await client.query(`
     SELECT COUNT(*)::int AS count FROM response_stickiness_record
      WHERE id = 'grantee-provider-binding'
@@ -652,7 +652,7 @@ try {
   if (resurrectedGrantBinding.rows[0]?.count !== 0) {
     throw new Error("Replacement pool grant resurrected an old provider Responses binding");
   }
-  await client.query(`DELETE FROM model_api_token WHERE id = 'grantee-provider-token'`);
+  await client.query(`DELETE FROM model_api_token WHERE id = 'grantee-provider-token'`); // policy: bounded-delete
   const deletedGranteeBinding = await client.query(`
     SELECT COUNT(*)::int AS count FROM response_stickiness_record
      WHERE id = 'grantee-provider-binding'
@@ -1353,7 +1353,7 @@ try {
     "55000",
   );
   await client.query(`DROP TRIGGER provider_usage_ledger_immutable ON provider_usage_ledger`);
-  await client.query(`DELETE FROM provider_usage_ledger WHERE id = 'invalid-upgrade-ledger'`);
+  await client.query(`DELETE FROM provider_usage_ledger WHERE id = 'invalid-upgrade-ledger'`); // policy: bounded-delete
   await client.query(sql);
 
   // A child-first application transaction can conflict with hardening's

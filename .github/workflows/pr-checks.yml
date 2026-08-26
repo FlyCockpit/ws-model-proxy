@@ -304,7 +304,8 @@ jobs:
             '(migrate reset|migrate dev|migrate deploy|db push --force-reset|db drop|--accept-data-loss|DROP TABLE|DROP DATABASE|TRUNCATE|DELETE FROM[[:space:]]+[^;]+;)' \
             Dockerfile Dockerfile.dev package.json docker-compose*.yml scripts/ apps/ packages/ .github/workflows/ \
             | grep -v 'scripts/docker-entrypoint.sh:' \
-            | grep -v 'scripts/db-push-dangerous-local.sh:' \
+          | grep -v 'scripts/db-push-dangerous-local.sh:' \
+          | grep -v 'scripts/test-docker-entrypoint-schema.sh:' \
             | grep -v 'policy: bounded-delete' \
             | grep -v '.github/workflows/pr-checks.yml:' \
             | grep -v '/dist/' \

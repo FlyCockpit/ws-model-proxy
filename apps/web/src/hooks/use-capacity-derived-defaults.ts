@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useEffectEvent } from "react";
 
 import {
   type GuardedWizardCapacity,
@@ -44,13 +44,12 @@ export function useCapacityDerivedDefaults({
   contextMarginCustomized: boolean;
   apply: (defaults: { contextCeiling?: number; contextMargin?: number }) => void;
 }) {
-  const applyRef = useRef(apply);
-  applyRef.current = apply;
+  const applyDefaults = useEffectEvent(apply);
   const physicalMaximum = minimumSelectedPhysicalContext(selectedIds, models, capacities);
   useEffect(() => {
     if (physicalMaximum == null) return;
     const safe = safeContextControls(physicalMaximum);
-    applyRef.current({
+    applyDefaults({
       contextCeiling: contextCeilingCustomized ? undefined : safe.contextCeiling,
       contextMargin: contextMarginCustomized ? undefined : safe.contextMargin,
     });

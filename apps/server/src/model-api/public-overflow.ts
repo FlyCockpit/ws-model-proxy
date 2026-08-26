@@ -1214,21 +1214,6 @@ export function parseProviderUsage(
     : normalized;
 }
 
-export function providerStreamHasTerminalUsageEvent(
-  chunks: readonly Uint8Array[],
-  surface: ProtocolSurface,
-): boolean {
-  const text = new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))));
-  if (surface === "anthropic-messages")
-    return (
-      /(?:^|\n)event:\s*message_stop\s*(?:\r?\n|$)/u.test(text) ||
-      /"type"\s*:\s*"message_stop"/u.test(text)
-    );
-  if (surface === "openai-responses")
-    return /"type"\s*:\s*"response\.(?:completed|failed|cancelled|incomplete)"/u.test(text);
-  return /(?:^|\n)data:\s*\[DONE\]\s*(?:\r?\n|$)/u.test(text);
-}
-
 function classifyTerminalRecord(
   record: SseRecord,
   surface: ProtocolSurface,

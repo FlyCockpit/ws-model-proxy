@@ -7,7 +7,10 @@
   ],
   "ignoreExportsUsedInFile": true,
   "ignoreIssues": {
-    "apps/server/src/ssr-cache.ts": ["exports"]
+    "apps/server/src/ssr-cache.ts": ["exports"],
+    // Dynamically imported by the PostgreSQL integration test to verify that
+    // guarded setup rolls back atomically after an injected failure.
+    "packages/api/src/routers/forwarder-management.ts": ["exports"]
   },
   "workspaces": {
     ".": {
@@ -45,10 +48,10 @@
       "entry": ["src/components/**/*.tsx", "src/styles/**/*.css"]
     },
     "packages/api": {
-      "ignoreDependencies": ["@orpc/client", "@orpc/openapi", "@orpc/zod"]
+      "ignoreDependencies": ["@orpc/openapi", "@orpc/zod"]
     },
     "packages/db": {
-      "ignoreDependencies": ["@prisma/client", "pg", "zod"]
+      "ignoreDependencies": ["@prisma/client", "zod"]
     }
   }
 }
