@@ -181,7 +181,7 @@
   "pools": {
     "affinity": {
       "title": "Cache-aware routing",
-      "description": "Prefer a runtime that may still hold a matching prompt prefix, while letting current load override weak matches.",
+      "description": "New sessions go to the member with the best availability score (load, health, public-egress, and cost). When those scores tie, prefer a runtime that may still hold a matching instruction prefix. After an assistant or tool turn, prefer the member that served the conversation so far. A long conversation can outweigh modest load or a half-open member; a large queue still spills the request.",
       "enabled": "Enable optional cache affinity",
       "stats": "{{records}} active records across {{targets}} targets",
       "clear": "Clear affinity records",
@@ -189,7 +189,7 @@
       "fields": {
         "affinityTtlSeconds": "Prediction TTL (seconds)",
         "affinityMaxRecords": "Maximum records per target",
-        "affinityPrefixWeight": "Prefix-depth weight",
+        "affinityPrefixWeight": "Conversation prefix-depth weight",
         "affinityConversationWeight": "Conversation weight",
         "affinityLoadPenaltyWeight": "Active-load penalty"
       }
@@ -346,7 +346,7 @@
         "affinityEnabled": "Enable cache-affinity routing hints",
         "affinityTtlSeconds": "Affinity record lifetime (seconds)",
         "affinityMaxRecords": "Maximum affinity records",
-        "affinityPrefixWeight": "Prefix-match weight",
+        "affinityPrefixWeight": "Conversation prefix-match weight",
         "affinityConversationWeight": "Conversation-match weight",
         "affinityConfirmedCacheWeight": "Confirmed-cache weight",
         "affinityLoadPenaltyWeight": "Current-load penalty weight",

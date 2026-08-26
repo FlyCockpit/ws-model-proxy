@@ -181,7 +181,7 @@
   "pools": {
     "affinity": {
       "title": "Enrutamiento según caché",
-      "description": "Prefiere un entorno que quizá conserve un prefijo de solicitud coincidente y permite que la carga actual supere coincidencias débiles.",
+      "description": "Las sesiones nuevas van al miembro con la mejor puntuación de disponibilidad (carga, salud, salida pública y costo). Cuando esas puntuaciones empatan, se prefiere un entorno que quizá conserve un prefijo de instrucción coincidente. Después de un turno de asistente o de herramienta, se prefiere el miembro que sirvió la conversación hasta ahora. Una conversación larga puede superar una carga moderada o un miembro medio abierto; una cola grande igual desborda la solicitud.",
       "enabled": "Activar afinidad de caché opcional",
       "stats": "{{records}} registros activos en {{targets}} destinos",
       "clear": "Borrar registros de afinidad",
@@ -189,7 +189,7 @@
       "fields": {
         "affinityTtlSeconds": "TTL de predicción (segundos)",
         "affinityMaxRecords": "Máximo de registros por destino",
-        "affinityPrefixWeight": "Peso por profundidad del prefijo",
+        "affinityPrefixWeight": "Peso por profundidad del prefijo de conversación",
         "affinityConversationWeight": "Peso de conversación",
         "affinityLoadPenaltyWeight": "Penalización por carga activa"
       }
@@ -346,7 +346,7 @@
         "affinityEnabled": "Activar sugerencias de enrutamiento por afinidad de caché",
         "affinityTtlSeconds": "Duración del registro de afinidad (segundos)",
         "affinityMaxRecords": "Máximo de registros de afinidad",
-        "affinityPrefixWeight": "Peso de coincidencia de prefijo",
+        "affinityPrefixWeight": "Peso de coincidencia de prefijo de conversación",
         "affinityConversationWeight": "Peso de coincidencia de conversación",
         "affinityConfirmedCacheWeight": "Peso de caché confirmada",
         "affinityLoadPenaltyWeight": "Penalización por carga actual",
