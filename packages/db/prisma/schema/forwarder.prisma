@@ -968,7 +968,7 @@ model CacheAffinityRecord {
   poolId               String
   executionTargetId    String
   targetIdentity       String
-  digestVersion        Int             @default(3)
+  digestVersion        Int             @default(4)
   /// Stable execution/security binding, separate from request content and conversation identity.
   bindingDigest        String?
   prefixDigest         String?
