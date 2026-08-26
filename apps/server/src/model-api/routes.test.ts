@@ -857,6 +857,29 @@ describe("model API routes", () => {
     ]);
     expect(persisted).not.toContain("hello");
     expect(persisted).not.toContain("upstream-responses");
+    await vi.waitFor(() => {
+      const eventTypes = db.relayExecutionEvent.create.mock.calls.map(
+        (call) => call[0]?.data?.eventType,
+      );
+      expect(eventTypes).toEqual(
+        expect.arrayContaining(["ATTEMPT_STARTED", "FIRST_CLIENT_BYTE", "TERMINAL"]),
+      );
+    });
+    expect(db.relayExecutionEvent.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          attemptId: sent.requestId,
+          requestedSurface: "OPENAI_CHAT_COMPLETIONS",
+          nativeSurface: "OPENAI_RESPONSES",
+          adapterMode: "ADAPTED",
+          adapterVersion: "1.0.0",
+          poolId: "pool-id",
+          poolMemberId: "responses-member",
+          executionTargetId: "responses-member-target",
+          memberTier: "PRIMARY",
+        }),
+      }),
+    );
   });
 
   it("rejects strict fields that cannot be adapted before relay dispatch", async () => {
