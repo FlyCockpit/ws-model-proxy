@@ -24,25 +24,28 @@ where
     D: serde::Deserializer<'de>,
 {
     let version = u8::deserialize(deserializer)?;
-    if matches!(version, 1 | 2) {
+    if matches!(version, 1..=4) {
         Ok(version)
     } else {
         Err(serde::de::Error::custom(
-            "capability version must be 1 or 2",
+            "capability version must be 1, 2, 3, or 4",
         ))
     }
 }
 
-fn deserialize_openai_compatible_protocol<'de, D>(deserializer: D) -> Result<String, D::Error>
+fn deserialize_compatible_protocol<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let protocol = String::deserialize(deserializer)?;
-    if protocol == "openai-compatible" {
+    if matches!(
+        protocol.as_str(),
+        "openai-compatible" | "anthropic-compatible"
+    ) {
         Ok(protocol)
     } else {
         Err(serde::de::Error::custom(
-            "capability protocol must be openai-compatible",
+            "capability protocol must be openai-compatible or anthropic-compatible",
         ))
     }
 }
@@ -142,6 +145,8 @@ pub struct EndpointConfig {
     pub expand_media: bool,
     pub default_capabilities: OpenAiCompatibleCapabilities,
     pub headers: Vec<HeaderEnvRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth: Option<EndpointAuthConfig>,
     pub models: Vec<ModelConfig>,
     pub last_probe: Option<ProbeSnapshot>,
 }
@@ -157,10 +162,25 @@ impl Default for EndpointConfig {
             expand_media: false,
             default_capabilities: OpenAiCompatibleCapabilities::default(),
             headers: Vec::new(),
+            auth: None,
             models: Vec::new(),
             last_probe: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointAuthConfig {
+    pub mode: EndpointAuthMode,
+    pub env: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EndpointAuthMode {
+    ApiKey,
+    Bearer,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,6 +189,8 @@ pub enum EndpointKind {
     #[serde(rename = "openai-compatible")]
     #[default]
     OpenAiCompatible,
+    #[serde(rename = "anthropic-compatible")]
+    AnthropicCompatible,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,12 +250,18 @@ pub enum ProbeStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase", try_from = "RawCapabilities")]
 pub struct OpenAiCompatibleCapabilities {
     #[serde(deserialize_with = "deserialize_capability_version")]
     pub version: u8,
-    #[serde(deserialize_with = "deserialize_openai_compatible_protocol")]
+    #[serde(deserialize_with = "deserialize_compatible_protocol")]
     pub protocol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub surfaces: Option<SurfaceInventory>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<CapabilitySource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<CapabilityConfidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub models: Option<ModelListCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -248,6 +276,116 @@ pub struct OpenAiCompatibleCapabilities {
     pub audio: Option<AudioCapabilities>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+struct RawCapabilities {
+    #[serde(deserialize_with = "deserialize_capability_version")]
+    version: u8,
+    #[serde(deserialize_with = "deserialize_compatible_protocol")]
+    protocol: String,
+    surfaces: Option<SurfaceInventory>,
+    source: Option<CapabilitySource>,
+    confidence: Option<CapabilityConfidence>,
+    models: Option<ModelListCapabilities>,
+    chat_completions: Option<ChatCompletionsCapabilities>,
+    completions: Option<CompletionsCapabilities>,
+    embeddings: Option<EmbeddingsCapabilities>,
+    responses: Option<ResponsesCapabilities>,
+    audio: Option<AudioCapabilities>,
+}
+
+impl Default for RawCapabilities {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            protocol: "openai-compatible".to_string(),
+            surfaces: None,
+            source: None,
+            confidence: None,
+            models: None,
+            chat_completions: None,
+            completions: None,
+            embeddings: None,
+            responses: None,
+            audio: None,
+        }
+    }
+}
+
+impl TryFrom<RawCapabilities> for OpenAiCompatibleCapabilities {
+    type Error = String;
+
+    fn try_from(value: RawCapabilities) -> std::result::Result<Self, Self::Error> {
+        if value.version < 3 && value.protocol != "openai-compatible" {
+            return Err(
+                "capability inventory versions 1 and 2 require protocol `openai-compatible`"
+                    .to_string(),
+            );
+        }
+        if value.version >= 3 && value.surfaces.is_none() {
+            return Err(format!(
+                "version {} capabilities require `surfaces`",
+                value.version
+            ));
+        }
+        if value.version == 3
+            && value
+                .surfaces
+                .as_ref()
+                .is_some_and(SurfaceInventory::has_v4_fields)
+        {
+            return Err("version 3 capabilities cannot use version 4 operation fields".to_string());
+        }
+        if value.version == 4 {
+            if value.models.is_some()
+                || value.chat_completions.is_some()
+                || value.completions.is_some()
+                || value.embeddings.is_some()
+                || value.responses.is_some()
+                || value.audio.is_some()
+            {
+                return Err("version 4 capabilities cannot use legacy operation fields".to_string());
+            }
+            value
+                .surfaces
+                .as_ref()
+                .expect("checked above")
+                .validate_v4(&value.protocol)?;
+        }
+        Ok(Self {
+            version: value.version,
+            protocol: value.protocol,
+            surfaces: value.surfaces,
+            source: value.source,
+            confidence: value.confidence,
+            models: value.models,
+            chat_completions: value.chat_completions,
+            completions: value.completions,
+            embeddings: value.embeddings,
+            responses: value.responses,
+            audio: value.audio,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CapabilitySource {
+    Declared,
+    Probe,
+    Dashboard,
+    Provider,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CapabilityConfidence {
+    Exact,
+    High,
+    Estimated,
+    Unknown,
+}
+
 impl Default for OpenAiCompatibleCapabilities {
     fn default() -> Self {
         Self::openai_defaults()
@@ -259,6 +397,9 @@ impl OpenAiCompatibleCapabilities {
         Self {
             version: 1,
             protocol: "openai-compatible".to_string(),
+            surfaces: None,
+            source: None,
+            confidence: None,
             models: Some(ModelListCapabilities { list: Some(true) }),
             chat_completions: Some(ChatCompletionsCapabilities {
                 supported: Some(true),
@@ -278,6 +419,9 @@ impl OpenAiCompatibleCapabilities {
         Self {
             version: 1,
             protocol: "openai-compatible".to_string(),
+            surfaces: None,
+            source: None,
+            confidence: None,
             models: Some(ModelListCapabilities { list: Some(true) }),
             chat_completions: None,
             completions: None,
@@ -350,6 +494,233 @@ impl OpenAiCompatibleCapabilities {
         self.chat_completions = Some(chat);
         self
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct SurfaceInventory {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openai_chat_completions: Option<SurfaceCapabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openai_responses: Option<ResponsesSurfaceCapabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anthropic_messages: Option<AnthropicSurfaceCapabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openai_completions: Option<SurfaceCapabilities>,
+}
+
+impl SurfaceInventory {
+    fn has_v4_fields(&self) -> bool {
+        self.openai_chat_completions
+            .as_ref()
+            .is_some_and(|surface| !surface.operations.is_empty())
+            || self
+                .openai_completions
+                .as_ref()
+                .is_some_and(|surface| !surface.operations.is_empty())
+            || self
+                .openai_responses
+                .as_ref()
+                .is_some_and(|surface| !surface.common.operations.is_empty())
+            || self.anthropic_messages.as_ref().is_some_and(|surface| {
+                !surface.common.operations.is_empty() || !surface.protocol_versions.is_empty()
+            })
+    }
+
+    fn validate_v4(&self, protocol: &str) -> std::result::Result<(), String> {
+        fn validate_common(
+            name: &str,
+            surface: &SurfaceCapabilities,
+            allowed: &[&str],
+        ) -> std::result::Result<(), String> {
+            if surface.operations.is_empty() {
+                return Err(format!("version 4 surface `{name}` requires `operations`"));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for operation in &surface.operations {
+                if !allowed.contains(&operation.as_str()) {
+                    return Err(format!(
+                        "version 4 surface `{name}` has unknown operation `{operation}`"
+                    ));
+                }
+                if !seen.insert(operation) {
+                    return Err(format!(
+                        "version 4 surface `{name}` has duplicate operation `{operation}`"
+                    ));
+                }
+            }
+            if surface.supported.is_some()
+                || surface.protocol_version.is_some()
+                || !surface.beta_features.is_empty()
+            {
+                return Err(format!(
+                    "version 4 surface `{name}` uses legacy capability fields"
+                ));
+            }
+            Ok(())
+        }
+
+        if let Some(surface) = &self.openai_chat_completions {
+            validate_common("openaiChatCompletions", surface, &["create"])?;
+        }
+        if let Some(surface) = &self.openai_completions {
+            validate_common("openaiCompletions", surface, &["create"])?;
+        }
+        if let Some(surface) = &self.openai_responses {
+            validate_common(
+                "openaiResponses",
+                &surface.common,
+                &[
+                    "create",
+                    "statefulFollowUps",
+                    "retrieve",
+                    "delete",
+                    "cancel",
+                    "listInputItems",
+                    "countTokens",
+                    "compact",
+                ],
+            )?;
+            if surface.responses_lifecycle.is_some() {
+                return Err(
+                    "version 4 openaiResponses uses legacy `responsesLifecycle`".to_string()
+                );
+            }
+        }
+        if let Some(surface) = &self.anthropic_messages {
+            validate_common(
+                "anthropicMessages",
+                &surface.common,
+                &["create", "countTokens"],
+            )?;
+            if surface.count_tokens.is_some() || surface.protocol_versions.is_empty() {
+                return Err(
+                    "version 4 anthropicMessages requires `protocolVersions` and cannot use legacy `countTokens`"
+                        .to_string(),
+                );
+            }
+            let mut versions = std::collections::HashSet::new();
+            for version in &surface.protocol_versions {
+                let normalized_version = version.version.trim();
+                if normalized_version.is_empty() || !versions.insert(normalized_version) {
+                    return Err(
+                        "Anthropic protocol versions must be non-empty and unique".to_string()
+                    );
+                }
+                let mut betas = std::collections::HashSet::new();
+                if version.beta_features.iter().any(|beta| {
+                    let normalized_beta = beta.trim();
+                    normalized_beta.is_empty() || !betas.insert(normalized_beta)
+                }) {
+                    return Err("Anthropic beta features must be non-empty and unique".to_string());
+                }
+            }
+        }
+        let has_openai = self.openai_chat_completions.is_some()
+            || self.openai_responses.is_some()
+            || self.openai_completions.is_some();
+        if protocol == "openai-compatible" && self.anthropic_messages.is_some() {
+            return Err(
+                "openai-compatible version 4 capabilities cannot declare anthropicMessages"
+                    .to_string(),
+            );
+        }
+        if protocol == "anthropic-compatible" && has_openai {
+            return Err(
+                "anthropic-compatible version 4 capabilities cannot declare OpenAI surfaces"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SurfaceCapabilities {
+    pub source: CapabilitySource,
+    pub confidence: CapabilityConfidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supported: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operations: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub streaming: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_images: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_images: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_audio: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_audio: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_video: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_video: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tools: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hosted_tools: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub beta_features: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnthropicSurfaceCapabilities {
+    #[serde(flatten)]
+    pub common: SurfaceCapabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count_tokens: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocol_versions: Vec<AnthropicProtocolVersion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnthropicProtocolVersion {
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub beta_features: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResponsesSurfaceCapabilities {
+    #[serde(flatten)]
+    pub common: SurfaceCapabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub responses_lifecycle: Option<ResponsesLifecycleCapabilities>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResponsesLifecycleCapabilities {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stateful_follow_ups: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieve: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancel: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_input_items: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count_tokens: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -581,6 +952,74 @@ impl Config {
         for endpoint in &self.endpoints {
             validate_slug(&endpoint.slug)
                 .with_context(|| format!("validating endpoint slug `{}`", endpoint.slug))?;
+            if let Some(auth) = &endpoint.auth {
+                validate_env_name(&auth.env)?;
+            }
+            let mut endpoint_header_names = std::collections::BTreeSet::new();
+            for header in &endpoint.headers {
+                validate_env_name(&header.env)?;
+                validate_endpoint_header_name(&endpoint.slug, &endpoint.kind, &header.name)?;
+                if !endpoint_header_names.insert(header.name.to_ascii_lowercase()) {
+                    anyhow::bail!(
+                        "endpoint `{}` configures duplicate custom header `{}`",
+                        endpoint.slug,
+                        header.name
+                    );
+                }
+            }
+            let profiles = std::iter::once(&endpoint.default_capabilities)
+                .chain(
+                    endpoint
+                        .last_probe
+                        .iter()
+                        .map(|probe| &probe.suggested_capabilities),
+                )
+                .chain(endpoint.models.iter().flat_map(|model| {
+                    [
+                        model.capabilities.as_ref(),
+                        model.probe_suggestions.as_ref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                }));
+            for profile in profiles {
+                let expected_protocol = match endpoint.kind {
+                    EndpointKind::OpenAiCompatible => "openai-compatible",
+                    EndpointKind::AnthropicCompatible => "anthropic-compatible",
+                };
+                if !(1..=4).contains(&profile.version) {
+                    anyhow::bail!(
+                        "endpoint `{}` has unsupported capability inventory version {}",
+                        endpoint.slug,
+                        profile.version
+                    );
+                }
+                if profile.version < 3 && profile.protocol != "openai-compatible" {
+                    anyhow::bail!(
+                        "endpoint `{}` capability inventory versions 1 and 2 require protocol `openai-compatible`",
+                        endpoint.slug
+                    );
+                }
+                if profile.version < 3 && endpoint.kind != EndpointKind::OpenAiCompatible {
+                    anyhow::bail!(
+                        "endpoint `{}` is anthropic-compatible and requires capability inventory version 3",
+                        endpoint.slug
+                    );
+                }
+                if profile.version >= 3 && profile.protocol != expected_protocol {
+                    anyhow::bail!(
+                        "endpoint `{}` kind `{expected_protocol}` does not match capability protocol `{}`",
+                        endpoint.slug,
+                        profile.protocol
+                    );
+                }
+                if profile.version >= 3 && profile.surfaces.is_none() {
+                    anyhow::bail!(
+                        "version {} capabilities require `surfaces`",
+                        profile.version
+                    );
+                }
+            }
             for model in &endpoint.models {
                 if let Some(slug) = &model.slug {
                     validate_slug(slug)
@@ -590,6 +1029,72 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// Environment-backed endpoint headers are deliberately much narrower than
+/// relayed request headers. Protocol headers belong to the server and
+/// credentials belong to `EndpointAuthConfig`, so configuration cannot replace
+/// either one after the server has sanitized and validated a request.
+fn validate_endpoint_header_name(slug: &str, kind: &EndpointKind, raw_name: &str) -> Result<()> {
+    reqwest::header::HeaderName::from_bytes(raw_name.as_bytes())
+        .with_context(|| format!("validating custom header `{raw_name}` for endpoint `{slug}`"))?;
+    let name = raw_name.trim().to_ascii_lowercase();
+
+    const FORBIDDEN: &[&str] = &[
+        "authorization",
+        "proxy-authorization",
+        "proxy-authenticate",
+        "www-authenticate",
+        "cookie",
+        "cookie2",
+        "set-cookie",
+        "set-cookie2",
+        "host",
+        "connection",
+        "keep-alive",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "content-length",
+        "x-api-key",
+        "api-key",
+        "openai-api-key",
+        "anthropic-api-key",
+        "openai-version",
+        "openai-beta",
+        "anthropic-version",
+        "anthropic-beta",
+    ];
+    let credential_like = ["token", "secret", "credential", "password"]
+        .iter()
+        .any(|part| name.contains(part));
+    if name.is_empty()
+        || FORBIDDEN.contains(&name.as_str())
+        || name.starts_with("proxy-")
+        || name.starts_with("sec-")
+        || credential_like
+    {
+        anyhow::bail!(
+            "endpoint `{slug}` cannot configure protected custom header `{raw_name}`; use typed `auth` for credentials"
+        );
+    }
+
+    let allowed = match kind {
+        EndpointKind::OpenAiCompatible => {
+            matches!(name.as_str(), "openai-organization" | "openai-project")
+        }
+        // Anthropic version, beta, and authentication headers are owned by the
+        // validated protocol/auth path. There are currently no safe static
+        // Anthropic endpoint headers whose values should come from secrets.
+        EndpointKind::AnthropicCompatible => false,
+    };
+    if !allowed {
+        anyhow::bail!(
+            "endpoint `{slug}` custom header `{raw_name}` is not allowed for this endpoint kind"
+        );
+    }
+    Ok(())
 }
 
 fn is_false(value: &bool) -> bool {
@@ -674,6 +1179,197 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_headers_use_kind_specific_allowlists_and_protect_transport() {
+        let mut config = Config::default();
+        config.endpoints.push(EndpointConfig {
+            slug: "openai".to_string(),
+            headers: vec![HeaderEnvRef {
+                name: "Authorization".to_string(),
+                env: "OTHER_KEY".to_string(),
+            }],
+            ..EndpointConfig::default()
+        });
+        assert!(config.validate().is_err());
+        for protected in [
+            "Content-Length",
+            "Cookie",
+            "Host",
+            "Proxy-Authorization",
+            "OpenAI-Version",
+            "OpenAI-Beta",
+            "Anthropic-Version",
+            "Anthropic-Beta",
+            "X-Custom-Token",
+            " OpenAI-Project",
+        ] {
+            config.endpoints[0].headers[0].name = protected.to_string();
+            assert!(
+                config.validate().is_err(),
+                "accepted protected `{protected}`"
+            );
+        }
+        config.endpoints[0].headers[0].name = "OpenAI-Organization".to_string();
+        config
+            .validate()
+            .expect("OpenAI account-routing header is allowlisted");
+        config.endpoints[0].headers.push(HeaderEnvRef {
+            name: "openai-organization".to_string(),
+            env: "SECOND_ORG".to_string(),
+        });
+        assert!(
+            config.validate().is_err(),
+            "accepted duplicate header names"
+        );
+        config.endpoints[0].headers.pop();
+
+        config.endpoints[0].kind = EndpointKind::AnthropicCompatible;
+        config.endpoints[0].default_capabilities = serde_json::from_value(serde_json::json!({
+            "version": 3,
+            "protocol": "anthropic-compatible",
+            "surfaces": {}
+        }))
+        .expect("Anthropic capabilities");
+        for protocol_owned in ["Anthropic-Version", "Anthropic-Beta", "OpenAI-Organization"] {
+            config.endpoints[0].headers[0].name = protocol_owned.to_string();
+            assert!(
+                config.validate().is_err(),
+                "accepted non-allowlisted `{protocol_owned}`"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_kind_matches_every_capability_profile() {
+        let anthropic: OpenAiCompatibleCapabilities = serde_json::from_value(serde_json::json!({
+            "version": 3,
+            "protocol": "anthropic-compatible",
+            "surfaces": {}
+        }))
+        .expect("Anthropic capabilities");
+        let mut endpoint = EndpointConfig {
+            slug: "anthropic".to_string(),
+            kind: EndpointKind::AnthropicCompatible,
+            default_capabilities: anthropic.clone(),
+            ..EndpointConfig::default()
+        };
+        let mut config = Config {
+            endpoints: vec![endpoint.clone()],
+            ..Config::default()
+        };
+        config.validate().expect("matching endpoint kind");
+
+        endpoint.models.push(ModelConfig {
+            upstream_model_id: "model".to_string(),
+            probe_suggestions: Some(OpenAiCompatibleCapabilities::default()),
+            ..ModelConfig::default()
+        });
+        config.endpoints[0] = endpoint;
+        assert!(config.validate().is_err());
+
+        config.endpoints[0].models.clear();
+        config.endpoints[0].last_probe = Some(ProbeSnapshot {
+            status: ProbeStatus::Online,
+            models: Vec::new(),
+            suggested_capabilities: OpenAiCompatibleCapabilities::default(),
+        });
+        assert!(config.validate().is_err());
+
+        config.endpoints[0].last_probe = None;
+        config.endpoints[0].kind = EndpointKind::OpenAiCompatible;
+        config.endpoints[0].default_capabilities = OpenAiCompatibleCapabilities {
+            protocol: "anthropic-compatible".to_string(),
+            ..OpenAiCompatibleCapabilities::default()
+        };
+        assert!(
+            config.validate().is_err(),
+            "accepted a programmatically constructed legacy protocol mismatch"
+        );
+    }
+
+    #[test]
+    fn validates_exact_v4_operations_and_anthropic_versions() {
+        let valid = serde_json::json!({
+            "version": 4,
+            "protocol": "anthropic-compatible",
+            "surfaces": {
+                "anthropicMessages": {
+                    "source": "provider",
+                    "confidence": "exact",
+                    "operations": ["create", "countTokens"],
+                    "streaming": true,
+                    "protocolVersions": [{
+                        "version": "2023-06-01",
+                        "betaFeatures": ["prompt-caching-2024-07-31"]
+                    }]
+                }
+            }
+        });
+        let parsed: OpenAiCompatibleCapabilities =
+            serde_json::from_value(valid.clone()).expect("valid v4 inventory");
+        assert_eq!(parsed.version, 4);
+
+        for invalid in [
+            serde_json::json!({
+                "version": 4,
+                "protocol": "anthropic-compatible",
+                "surfaces": { "anthropicMessages": {
+                    "source": "provider", "confidence": "exact",
+                    "operations": ["unknown"],
+                    "protocolVersions": [{"version": "2023-06-01"}]
+                }}
+            }),
+            serde_json::json!({
+                "version": 4,
+                "protocol": "anthropic-compatible",
+                "surfaces": { "anthropicMessages": {
+                    "source": "provider", "confidence": "exact",
+                    "operations": ["create", "create"],
+                    "protocolVersions": [{"version": "2023-06-01"}]
+                }}
+            }),
+            serde_json::json!({
+                "version": 4,
+                "protocol": "anthropic-compatible",
+                "surfaces": { "anthropicMessages": {
+                    "source": "provider", "confidence": "exact",
+                    "operations": ["create"]
+                }}
+            }),
+            serde_json::json!({
+                "version": 4,
+                "protocol": "anthropic-compatible",
+                "surfaces": { "anthropicMessages": {
+                    "source": "provider", "confidence": "exact",
+                    "operations": ["create"],
+                    "protocolVersions": [{
+                        "version": "2023-06-01",
+                        "betaFeatures": ["beta-one", " beta-one "]
+                    }]
+                }}
+            }),
+            serde_json::json!({
+                "version": 4,
+                "protocol": "openai-compatible",
+                "surfaces": { "anthropicMessages": {
+                    "source": "provider", "confidence": "exact",
+                    "operations": ["create"],
+                    "protocolVersions": [{"version": "2023-06-01"}]
+                }}
+            }),
+            serde_json::json!({
+                "version": 4,
+                "protocol": "anthropic-compatible",
+                "surfaces": { "openaiResponses": {
+                    "source": "provider", "confidence": "exact",
+                    "operations": ["create"]
+                }}
+            }),
+        ] {
+            assert!(serde_json::from_value::<OpenAiCompatibleCapabilities>(invalid).is_err());
+        }
+    }
+
+    #[test]
     fn reads_legacy_and_detailed_transcription_capabilities() {
         let legacy: OpenAiCompatibleCapabilities = serde_json::from_value(serde_json::json!({
             "version": 1,
@@ -707,11 +1403,55 @@ mod tests {
         assert_eq!(profile.supported(), Some(true));
         assert!(matches!(profile, AudioOperationCapabilities::Detailed(_)));
 
+        let anthropic: OpenAiCompatibleCapabilities = serde_json::from_value(serde_json::json!({
+            "version": 3,
+            "protocol": "anthropic-compatible",
+            "surfaces": {
+                "anthropicMessages": {
+                    "source": "declared",
+                    "confidence": "exact",
+                    "supported": true,
+                    "streaming": true,
+                    "protocolVersion": "2023-06-01"
+                }
+            }
+        }))
+        .expect("v3 Anthropic profile");
+        assert_eq!(anthropic.version, 3);
+
         for invalid in [
-            serde_json::json!({ "version": 3, "protocol": "openai-compatible" }),
+            serde_json::json!({ "version": 4, "protocol": "openai-compatible" }),
             serde_json::json!({ "version": 2, "protocol": "other" }),
+            serde_json::json!({ "version": 1, "protocol": "anthropic-compatible" }),
+            serde_json::json!({ "version": 2, "protocol": "anthropic-compatible" }),
         ] {
             assert!(serde_json::from_value::<OpenAiCompatibleCapabilities>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn matches_shared_v3_wire_fixtures() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../packages/api/src/lib/fixtures/capabilities-v3-wire.json"
+        ))
+        .expect("shared capability fixture");
+        for valid in fixture["valid"].as_array().expect("valid fixtures") {
+            let parsed = serde_json::from_value::<OpenAiCompatibleCapabilities>(valid.clone())
+                .expect("valid TS/Rust fixture");
+            let serialized = serde_json::to_value(&parsed).expect("serialize valid fixture");
+            assert_eq!(serialized, *valid, "Rust wire output stays sparse");
+            assert!(
+                !serialized.to_string().contains(":null"),
+                "Rust capability profiles must omit absent optional fields"
+            );
+            let round_trip: OpenAiCompatibleCapabilities =
+                serde_json::from_value(serialized).expect("round-trip serialized profile");
+            assert_eq!(round_trip, parsed);
+        }
+        for invalid in fixture["invalid"].as_array().expect("invalid fixtures") {
+            assert!(
+                serde_json::from_value::<OpenAiCompatibleCapabilities>(invalid.clone()).is_err()
+            );
         }
     }
 }

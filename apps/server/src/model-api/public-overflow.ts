@@ -1,0 +1,2527 @@
+import { Readable } from "node:stream";
+import {
+  type OpenAiCompatibleCapabilities,
+  parseOpenAiCompatibleCapabilities,
+} from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import {
+  decryptProviderCredential,
+  parseProviderCredentialKeyring,
+} from "@ws-model-proxy/api/lib/provider-credential-crypto";
+import {
+  type ProviderEgressAuth,
+  type ProviderProtocol,
+  providerHttpsRequest,
+} from "@ws-model-proxy/api/lib/provider-egress";
+import { providerProtocolForType } from "@ws-model-proxy/api/lib/provider-protocol";
+import {
+  resolveExecutionPath,
+  surfaceAvailabilityMatrix,
+} from "@ws-model-proxy/api/lib/surface-capabilities";
+import prisma, { Prisma } from "@ws-model-proxy/db";
+import { env } from "@ws-model-proxy/env/server";
+import {
+  type AffinityDecision,
+  type AffinityPolicy,
+  type AffinityTarget,
+  buildAffinityTargetIdentity,
+  rankAffinityTargets,
+  rememberAffinity,
+} from "./cache-affinity.js";
+import { ADAPTER_VERSION } from "./protocols/canonical.js";
+import type { ProtocolSurface } from "./protocols/index.js";
+import { SseDecoder, type SseRecord } from "./protocols/sse.js";
+import {
+  allocateProviderFence,
+  claimProviderHealthTrial,
+  classifyProviderFailure,
+  heartbeatProviderAttempt,
+  parseRetryAfter,
+  recordProviderAttemptEvent,
+  recordProviderOutcome,
+  releaseProviderHealthTrial,
+} from "./provider-attempt-runtime.js";
+import {
+  admitProviderBudget,
+  type ProviderBudgetAdmission,
+  type ProviderLiability,
+  type RawProviderUsage,
+  reconcileProviderBudget,
+} from "./provider-budget.js";
+import {
+  calculatedCostForUsage,
+  liabilityFromPricing,
+  type ProviderPricingSchedule,
+  resolveActiveProviderPricing,
+} from "./provider-pricing.js";
+
+export type PublicOverflowReason =
+  | "NO_COMPATIBLE_HEALTHY_PRIMARY"
+  | "LOCAL_WAIT_EXPIRED"
+  | "LOCAL_CONTEXT_CEILING"
+  | "RETRYABLE_PRECOMMIT_PRIMARY_FAILURE";
+
+export type PublicOverflowSkipReason =
+  | "DEPLOYMENT_GATE_DISABLED"
+  | "POOL_PRIVATE"
+  | "POOL_ACKNOWLEDGEMENT_MISSING"
+  | "ADAPTATION_GATE_DISABLED"
+  | "NO_COMPATIBLE_PROVIDER"
+  | "PROVIDER_UNHEALTHY"
+  | "BUDGET_EXCEEDED"
+  | "PROTECTION_POLICY_MISSING"
+  | "PROVIDER_UNAVAILABLE";
+
+export interface PublicOverflowRequest {
+  userId: string;
+  /** Requester and credential scopes remain distinct from the pool owner. */
+  affinityTenantUserId?: string;
+  affinitySecurityScope?: string;
+  /** Exact visibility grant; replacement or revocation invalidates affinity. */
+  affinityAccessGrantId?: string | null;
+  poolId: string;
+  requestId: string;
+  reason: PublicOverflowReason;
+  /** Provider-backed PRIMARY reuses the guarded provider execution pipeline.
+   * It requires deployment approval and pool acknowledgement, but not the
+   * separate public-overflow enablement switch. */
+  memberTier?: "PRIMARY" | "PUBLIC_OVERFLOW";
+  requestedProtocol: ProviderProtocol;
+  requestedSurface: ProtocolSurface;
+  stream: boolean;
+  requiredFeatures: readonly string[];
+  path: string;
+  headers: Headers;
+  body: Uint8Array;
+  signal: AbortSignal;
+  liability: ProviderLiability;
+  /** Conservative rendered input bound before any provider output. */
+  estimatedInputTokens?: bigint;
+  /** Conservative rendered input plus requested output, used only for context fit. */
+  contextTokens?: bigint;
+  /** Undefined means reserve the selected provider model's maximum output. */
+  requestedOutputTokens?: bigint;
+  contextCountMethod?: string;
+  contextCountConfidence?: string;
+  /** Must be called before credential decryption or any network attempt. */
+  releaseLocalCapacity: () => Promise<void>;
+  adaptationEnabled: boolean;
+  /** Cookie-authenticated Chat Test may constrain provider execution mode. */
+  chatTestRoutingMode?: "PREFER_NATIVE" | "REQUIRE_NATIVE" | "REQUIRE_ADAPTED";
+  /** Cookie-authenticated member probe can constrain dispatch to one pool member. */
+  forcedPoolMemberId?: string;
+  /** True only when the operation resolver proves a second attempt is safe. */
+  retrySafe: boolean;
+  /** The caller admitted one target at a time and has another capacity-fenced
+   * candidate available. Consume and settle a retryable response, then return
+   * uncommitted so the caller can admit the next target. */
+  retrySingleTargetPrecommit?: boolean;
+  requireNativeSurface?: ProtocolSurface;
+  /** Correctness-required Responses binding. It disables ranking, adaptation,
+   * and all post-binding failover and validates the immutable endpoint tuple. */
+  exactResponsesBinding?: {
+    executionTargetId: string;
+    providerAccountId: string;
+    providerModelId: string;
+    endpointIdentity: string;
+    endpointVersion: number;
+    upstreamModelId: string;
+  };
+  method?: string;
+  skipContextValidation?: boolean;
+  renderForTarget?: (
+    target: PublicProviderTarget,
+    nativeSurface: ProtocolSurface,
+  ) => Promise<{
+    protocol: ProviderProtocol;
+    path: string;
+    headers: Headers;
+    body: Uint8Array;
+  }>;
+}
+
+export interface PublicProviderTarget {
+  poolMemberId: string;
+  executionTargetId: string;
+  inferenceCapacityId?: string | null;
+  capacityWaitBudgetMs?: number | null;
+  publicOrder: number;
+  /** Pool-member weight used only by the unified PRIMARY scheduler. */
+  weight?: number;
+  providerModelId: string;
+  upstreamModelId: string;
+  contextWindow: number | null;
+  /** PRIMARY-only pool policy resolved from the member override and pool default. */
+  effectiveContextCeiling?: number | null;
+  /** PRIMARY-only safety margin applied in addition to the requested context. */
+  contextMargin?: number;
+  /** Physical runtime ceiling shared by every target on the capacity. */
+  physicalMaxContext?: number | null;
+  maxOutputTokens: number | null;
+  protocol: ProviderProtocol;
+  providerAccountId: string;
+  endpointIdentity: string;
+  endpointVersion: number;
+  concurrencyLimit: number | null;
+  providerVersion: string | null;
+  baseUrl: string;
+  authType: "API_KEY" | "BEARER";
+  healthStatus: "UNKNOWN" | "HEALTHY" | "DEGRADED" | "UNAVAILABLE";
+  nativeProtocols: readonly ProviderProtocol[];
+  nativeSurfaces: readonly ProtocolSurface[];
+  supportsStreaming: boolean;
+  supportedFeatures: readonly string[];
+  capabilityInventory?: OpenAiCompatibleCapabilities | null;
+  /** Exact operation-aware resolver result carried through ranking and send. */
+  resolvedExecution?: ProviderSurfaceExecution;
+  credential: {
+    id: string;
+    credentialType: "API_KEY" | "BEARER";
+    keyVersion: string;
+    aadVersion: number;
+    algorithm: string;
+    ciphertext: Uint8Array<ArrayBuffer>;
+    nonce: Uint8Array<ArrayBuffer>;
+    authTag: Uint8Array<ArrayBuffer>;
+  };
+  affinity?: { outcome: string; score?: number; prefixDepth?: number; reason?: string };
+  affinityTarget?: AffinityTarget;
+}
+
+export type ProviderSurfaceExecution = {
+  mode: "native" | "adapted";
+  nativeSurface: ProtocolSurface;
+  limitations: readonly string[];
+};
+
+export function matchesChatTestProviderMode(
+  target: Pick<PublicProviderTarget, "nativeSurfaces" | "resolvedExecution">,
+  requestedSurface: ProtocolSurface,
+  mode: PublicOverflowRequest["chatTestRoutingMode"],
+) {
+  if (target.resolvedExecution) {
+    if (mode === "REQUIRE_NATIVE") return target.resolvedExecution.mode === "native";
+    if (mode === "REQUIRE_ADAPTED") return target.resolvedExecution.mode === "adapted";
+  }
+  if (mode === "REQUIRE_NATIVE") return target.nativeSurfaces.includes(requestedSurface);
+  if (mode === "REQUIRE_ADAPTED")
+    return target.nativeSurfaces.some(
+      (surface) =>
+        surface !== requestedSurface &&
+        (surface === "anthropic-messages" ||
+          surface === "openai-responses" ||
+          surface === "openai-chat"),
+    );
+  return true;
+}
+
+export function targetsForForcedPoolMember<T extends Pick<PublicProviderTarget, "poolMemberId">>(
+  targets: readonly T[],
+  forcedPoolMemberId: string | undefined,
+) {
+  return forcedPoolMemberId
+    ? targets.filter((target) => target.poolMemberId === forcedPoolMemberId)
+    : [...targets];
+}
+
+export function orderChatTestProviderTargets<
+  T extends Pick<PublicProviderTarget, "nativeSurfaces" | "resolvedExecution">,
+>(
+  targets: readonly T[],
+  requestedSurface: ProtocolSurface,
+  mode: PublicOverflowRequest["chatTestRoutingMode"],
+) {
+  if (mode !== "PREFER_NATIVE") return [...targets];
+  return [
+    ...targets.filter((target) =>
+      target.resolvedExecution
+        ? target.resolvedExecution.mode === "native"
+        : target.nativeSurfaces.includes(requestedSurface),
+    ),
+    ...targets.filter((target) =>
+      target.resolvedExecution
+        ? target.resolvedExecution.mode !== "native"
+        : !target.nativeSurfaces.includes(requestedSurface),
+    ),
+  ];
+}
+
+export function exactResponsesNativeSurface(
+  target: Pick<PublicProviderTarget, "nativeSurfaces" | "capabilityInventory" | "protocol">,
+): "openai-responses" | undefined {
+  if (target.protocol !== "openai") return undefined;
+  if (target.nativeSurfaces.includes("openai-responses")) return "openai-responses";
+  return target.capabilityInventory?.version === 4 &&
+    target.capabilityInventory.surfaces.openaiResponses !== undefined
+    ? "openai-responses"
+    : undefined;
+}
+
+export function matchesExactResponsesBinding(
+  target: Pick<
+    PublicProviderTarget,
+    | "executionTargetId"
+    | "providerAccountId"
+    | "providerModelId"
+    | "endpointIdentity"
+    | "endpointVersion"
+    | "upstreamModelId"
+    | "nativeSurfaces"
+    | "protocol"
+    | "capabilityInventory"
+  >,
+  binding: NonNullable<PublicOverflowRequest["exactResponsesBinding"]>,
+): boolean {
+  return (
+    target.executionTargetId === binding.executionTargetId &&
+    target.providerAccountId === binding.providerAccountId &&
+    target.providerModelId === binding.providerModelId &&
+    target.endpointIdentity === binding.endpointIdentity &&
+    target.endpointVersion === binding.endpointVersion &&
+    target.upstreamModelId === binding.upstreamModelId &&
+    exactResponsesNativeSurface(target) === "openai-responses"
+  );
+}
+
+type ListedPublicOverflowTargets = {
+  enabled: boolean;
+  acknowledged: boolean;
+  affinityPolicy: AffinityPolicy;
+  targets: PublicProviderTarget[];
+};
+
+function providerEventRouting(input: {
+  request: PublicOverflowRequest;
+  target: PublicProviderTarget;
+  nativeSurface?: ProtocolSurface;
+}) {
+  return {
+    requestedSurface: input.request.requestedSurface,
+    nativeSurface: input.nativeSurface,
+    adapterMode: input.nativeSurface
+      ? input.nativeSurface === input.request.requestedSurface
+        ? "native"
+        : "adapted"
+      : undefined,
+    adapterVersion:
+      input.nativeSurface && input.nativeSurface !== input.request.requestedSurface
+        ? "1.0.0"
+        : undefined,
+    poolId: input.request.poolId,
+    poolMemberId: input.target.poolMemberId,
+    executionTargetId: input.target.executionTargetId,
+    memberTier: input.request.memberTier ?? "PUBLIC_OVERFLOW",
+    triggerReason: input.request.reason,
+    affinityOutcome: input.target.affinity?.outcome ?? "NONE",
+    contextCountMethod: input.request.contextCountMethod,
+    contextCountConfidence: input.request.contextCountConfidence,
+  };
+}
+
+/**
+ * Atomically claims the current credential for a send that is about to start.
+ * `lastUsedAt` is the durable boundary: credential lifecycle changes serialize
+ * on the same rows, while the actual provider request happens after commit.
+ */
+export async function claimPublicProviderCredentialForSend(input: {
+  userId: string;
+  target: PublicProviderTarget;
+  keyring: ReturnType<typeof parseProviderCredentialKeyring>;
+}): Promise<string> {
+  return prisma.$transaction(
+    async (tx) => {
+      await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.target.providerAccountId} AND "userId" = ${input.userId} FOR UPDATE`;
+      await tx.$queryRaw`SELECT id FROM provider_credential WHERE id = ${input.target.credential.id} AND "userId" = ${input.userId} FOR UPDATE`;
+      const current = await tx.providerCredential.findFirst({
+        where: {
+          id: input.target.credential.id,
+          userId: input.userId,
+          providerAccountId: input.target.providerAccountId,
+          status: "ACTIVE",
+          CurrentForAccount: {
+            id: input.target.providerAccountId,
+            enabled: true,
+            deletedAt: null,
+            currentCredentialId: input.target.credential.id,
+          },
+        },
+      });
+      if (!current) throw new Error("provider credential is no longer current");
+      const secret = decryptProviderCredential(
+        {
+          algorithm: current.algorithm as "AES-256-GCM",
+          keyVersion: current.keyVersion,
+          ciphertext: new Uint8Array(current.ciphertext),
+          nonce: new Uint8Array(current.nonce),
+          authTag: new Uint8Array(current.authTag),
+        },
+        {
+          credentialId: current.id,
+          userId: input.userId,
+          providerAccountId: input.target.providerAccountId,
+          credentialType: current.credentialType,
+          aadVersion: current.aadVersion,
+        },
+        input.keyring,
+      );
+      await tx.providerCredential.update({
+        where: { id: current.id },
+        data: { lastUsedAt: new Date() },
+      });
+      return secret;
+    },
+    { maxWait: 5_000, timeout: 10_000 },
+  );
+}
+
+export function resolvePublicProviderExecution(
+  target: Pick<PublicProviderTarget, "capabilityInventory">,
+  request: Pick<
+    PublicOverflowRequest,
+    "requestedSurface" | "stream" | "requiredFeatures" | "adaptationEnabled"
+  > &
+    Partial<Pick<PublicOverflowRequest, "path" | "headers" | "method">>,
+): ProviderSurfaceExecution | undefined {
+  if (!target.capabilityInventory) return undefined;
+  const requestedSurface = {
+    "openai-chat": "OPENAI_CHAT_COMPLETIONS",
+    "openai-responses": "OPENAI_RESPONSES",
+    "anthropic-messages": "ANTHROPIC_MESSAGES",
+  }[request.requestedSurface] as
+    | "OPENAI_CHAT_COMPLETIONS"
+    | "OPENAI_RESPONSES"
+    | "ANTHROPIC_MESSAGES";
+  const responsePath = new URL(request.path ?? "/v1/messages", "http://wsmp.invalid").pathname;
+  const responsesOperation = responsePath.endsWith("/input_items")
+    ? "listInputItems"
+    : responsePath.endsWith("/cancel")
+      ? "cancel"
+      : responsePath.endsWith("/compact")
+        ? "compact"
+        : responsePath.endsWith("/count_tokens")
+          ? "countTokens"
+          : /^\/v1\/responses\/[^/]+$/u.test(responsePath)
+            ? request.method === "DELETE"
+              ? "delete"
+              : "retrieve"
+            : "create";
+  const betaFeatures = (request.headers?.get("anthropic-beta") ?? "")
+    .split(",")
+    .map((beta) => beta.trim())
+    .filter(Boolean);
+  const resolved = resolveExecutionPath({
+    capabilities: target.capabilityInventory,
+    requestedSurface,
+    request: {
+      stream: request.stream,
+      ...Object.fromEntries(request.requiredFeatures.map((feature) => [feature, true])),
+      responsesOperation,
+      countTokens:
+        request.requestedSurface === "anthropic-messages" && responsePath.endsWith("/count_tokens"),
+      protocolVersion: request.headers?.get("anthropic-version") ?? undefined,
+      betaFeatures,
+    },
+    adaptationEnabled: request.adaptationEnabled,
+  });
+  if (resolved.mode === "unavailable" || !resolved.nativeSurface) return undefined;
+  const nativeSurface: ProtocolSurface | undefined = {
+    OPENAI_CHAT_COMPLETIONS: "openai-chat",
+    OPENAI_RESPONSES: "openai-responses",
+    ANTHROPIC_MESSAGES: "anthropic-messages",
+    OPENAI_COMPLETIONS: undefined,
+  }[resolved.nativeSurface] as ProtocolSurface | undefined;
+  return nativeSurface
+    ? { mode: resolved.mode, nativeSurface, limitations: resolved.limitations }
+    : undefined;
+}
+
+export function publicTargetCompatibility(
+  target: Pick<
+    PublicProviderTarget,
+    | "contextWindow"
+    | "effectiveContextCeiling"
+    | "contextMargin"
+    | "physicalMaxContext"
+    | "maxOutputTokens"
+    | "nativeProtocols"
+    | "nativeSurfaces"
+    | "supportsStreaming"
+    | "supportedFeatures"
+    | "protocol"
+    | "capabilityInventory"
+  >,
+  request: Pick<
+    PublicOverflowRequest,
+    | "requestedProtocol"
+    | "requestedSurface"
+    | "stream"
+    | "requiredFeatures"
+    | "requestedOutputTokens"
+    | "adaptationEnabled"
+    | "renderForTarget"
+    | "liability"
+    | "estimatedInputTokens"
+    | "contextTokens"
+    | "skipContextValidation"
+  > &
+    Partial<Pick<PublicOverflowRequest, "path" | "headers" | "method">>,
+): "COMPATIBLE" | "CONTEXT_UNKNOWN" | "CONTEXT_EXCEEDED" | "PROTOCOL_UNAVAILABLE" {
+  if (!inventoryMatchesProtocol(target.capabilityInventory, target.protocol))
+    return "PROTOCOL_UNAVAILABLE";
+  const requestedOutputTokens =
+    request.requestedOutputTokens ??
+    (target.maxOutputTokens === null ? undefined : BigInt(target.maxOutputTokens));
+  const contextTokens =
+    request.estimatedInputTokens !== undefined && requestedOutputTokens !== undefined
+      ? checkedContextTokens(request.estimatedInputTokens, requestedOutputTokens)
+      : (request.contextTokens ?? request.liability.tokens);
+  if (!request.skipContextValidation) {
+    if (target.contextWindow === null || contextTokens === undefined) return "CONTEXT_UNKNOWN";
+    const margin = target.contextMargin ?? 0;
+    if (!Number.isSafeInteger(margin) || margin < 0) return "CONTEXT_UNKNOWN";
+    const contextWithMargin = contextTokens + BigInt(margin);
+    const ceilings = [
+      target.contextWindow,
+      target.effectiveContextCeiling,
+      target.physicalMaxContext,
+    ].filter((ceiling): ceiling is number => ceiling !== null && ceiling !== undefined);
+    if (ceilings.some((ceiling) => !Number.isSafeInteger(ceiling) || ceiling <= 0))
+      return "CONTEXT_UNKNOWN";
+    if (ceilings.some((ceiling) => contextWithMargin > BigInt(ceiling))) return "CONTEXT_EXCEEDED";
+    if (target.maxOutputTokens === null || requestedOutputTokens === undefined)
+      return "CONTEXT_UNKNOWN";
+    if (requestedOutputTokens > BigInt(target.maxOutputTokens)) return "CONTEXT_EXCEEDED";
+  }
+  if (!target.capabilityInventory && request.stream && !target.supportsStreaming)
+    return "PROTOCOL_UNAVAILABLE";
+  if (
+    !target.capabilityInventory &&
+    request.requiredFeatures.some((feature) => !target.supportedFeatures.includes(feature))
+  )
+    return "PROTOCOL_UNAVAILABLE";
+  if (target.capabilityInventory) {
+    return resolvePublicProviderExecution(target, request) ? "COMPATIBLE" : "PROTOCOL_UNAVAILABLE";
+  }
+  if (target.nativeSurfaces.includes(request.requestedSurface)) return "COMPATIBLE";
+  // OpenAI streams cannot provide Anthropic's required initial input usage.
+  // Reject before provider commitment instead of failing the adapter after a
+  // successful upstream stream has begun.
+  if (
+    request.stream &&
+    request.requestedSurface === "anthropic-messages" &&
+    target.protocol === "openai"
+  )
+    return "PROTOCOL_UNAVAILABLE";
+  return request.adaptationEnabled &&
+    request.renderForTarget !== undefined &&
+    target.nativeProtocols.includes(target.protocol) &&
+    target.nativeSurfaces.some((surface) =>
+      target.protocol === "anthropic"
+        ? surface === "anthropic-messages"
+        : surface !== "anthropic-messages",
+    )
+    ? "COMPATIBLE"
+    : "PROTOCOL_UNAVAILABLE";
+}
+
+export type PublicOverflowResult =
+  | {
+      dispatched: true;
+      response: Response;
+      target: PublicProviderTarget;
+      attemptId: string;
+      fencingToken: bigint;
+      nativeSurface: ProtocolSurface;
+      attemptCount: number;
+      terminal: Promise<{ ok: boolean; responseBytes: number }>;
+      /** Record commitment only when the final rendered response emits a byte. */
+      markFirstClientByte: () => Promise<void>;
+      affinity: PublicProviderTarget["affinity"];
+    }
+  | { dispatched: false; reason: PublicOverflowSkipReason; detail?: string };
+
+function targetProtocol(providerType: string): ProviderProtocol | null {
+  return providerProtocolForType(providerType);
+}
+
+function inventoryMatchesProtocol(
+  inventory: OpenAiCompatibleCapabilities | null | undefined,
+  protocol: ProviderProtocol,
+) {
+  if (!inventory) return true;
+  return (
+    inventory.protocol === (protocol === "anthropic" ? "anthropic-compatible" : "openai-compatible")
+  );
+}
+
+function nativeProtocols(value: unknown): ProviderProtocol[] {
+  const inventory = parseOpenAiCompatibleCapabilities(value);
+  if (inventory) return [inventory.protocol === "anthropic-compatible" ? "anthropic" : "openai"];
+  if (!value || typeof value !== "object") return [];
+  const record = value as Record<string, unknown>;
+  const values = Array.isArray(record.protocols) ? record.protocols : [];
+  const parsed = values.filter(
+    (item): item is ProviderProtocol => item === "openai" || item === "anthropic",
+  );
+  return parsed;
+}
+
+function nativeSurfaces(value: unknown): ProtocolSurface[] {
+  const inventory = parseOpenAiCompatibleCapabilities(value);
+  if (inventory) {
+    const matrix = surfaceAvailabilityMatrix({ capabilities: inventory });
+    return [
+      ...(matrix.OPENAI_CHAT_COMPLETIONS.mode === "native" ? (["openai-chat"] as const) : []),
+      ...(matrix.OPENAI_RESPONSES.mode === "native" ? (["openai-responses"] as const) : []),
+      ...(matrix.ANTHROPIC_MESSAGES.mode === "native" ? (["anthropic-messages"] as const) : []),
+    ];
+  }
+  if (!value || typeof value !== "object") return [];
+  const values = (value as Record<string, unknown>).surfaces;
+  if (!Array.isArray(values)) return [];
+  return values.filter(
+    (item): item is ProtocolSurface =>
+      item === "openai-chat" || item === "openai-responses" || item === "anthropic-messages",
+  );
+}
+
+function supportsStreaming(value: unknown): boolean {
+  const inventory = parseOpenAiCompatibleCapabilities(value);
+  if (inventory)
+    return Object.values(surfaceAvailabilityMatrix({ capabilities: inventory })).some(
+      (surface) => surface.mode === "native" && surface.streaming,
+    );
+  return Boolean(
+    value && typeof value === "object" && (value as Record<string, unknown>).streaming === true,
+  );
+}
+
+function supportedFeatures(value: unknown): string[] {
+  if (!value || typeof value !== "object") return [];
+  const features = (value as Record<string, unknown>).features;
+  return Array.isArray(features)
+    ? features.filter((feature): feature is string => typeof feature === "string")
+    : [];
+}
+
+export async function listPublicOverflowTargets(
+  userId: string,
+  poolId: string,
+  memberTier: "PRIMARY" | "PUBLIC_OVERFLOW" = "PUBLIC_OVERFLOW",
+): Promise<ListedPublicOverflowTargets> {
+  const pool = await prisma.modelPool.findFirst({
+    where: { id: poolId, userId },
+    select: {
+      publicEgressEnabled: true,
+      publicEgressAcknowledged: true,
+      capacityContextCeiling: true,
+      capacityContextMargin: true,
+      affinityEnabled: true,
+      affinityTtlSeconds: true,
+      affinityMaxRecords: true,
+      affinityPrefixWeight: true,
+      affinityConversationWeight: true,
+      affinityConfirmedCacheWeight: true,
+      affinityLoadPenaltyWeight: true,
+      capacityWaitBudgetMs: true,
+      PoolMembers: {
+        where: {
+          tier: memberTier,
+          routingStatus: "ACTIVE",
+          ExecutionTarget: { ProviderModel: { isNot: null } },
+        },
+        orderBy:
+          memberTier === "PUBLIC_OVERFLOW"
+            ? [{ publicOrder: "asc" }, { id: "asc" }]
+            : [{ weight: "desc" }, { id: "asc" }],
+        select: {
+          id: true,
+          publicOrder: true,
+          weight: true,
+          capacityWaitBudgetMs: true,
+          capacityWaitBudgetMode: true,
+          capacityContextCeiling: true,
+          capacityContextCeilingMode: true,
+          capacityContextMargin: true,
+          ExecutionTarget: {
+            select: {
+              id: true,
+              inferenceCapacityId: true,
+              InferenceCapacity: { select: { physicalMaxContext: true } },
+              ProviderModel: {
+                select: {
+                  id: true,
+                  userId: true,
+                  upstreamModelId: true,
+                  contextWindow: true,
+                  maxOutputTokens: true,
+                  concurrencyLimit: true,
+                  nativeCapabilities: true,
+                  healthStatus: true,
+                  healthNextRetryAt: true,
+                  enabled: true,
+                  deletedAt: true,
+                  ProviderAccount: {
+                    select: {
+                      id: true,
+                      userId: true,
+                      providerType: true,
+                      providerVersion: true,
+                      baseUrl: true,
+                      endpointIdentity: true,
+                      endpointVersion: true,
+                      authType: true,
+                      healthStatus: true,
+                      healthNextRetryAt: true,
+                      enabled: true,
+                      deletedAt: true,
+                      CurrentCredential: {
+                        select: {
+                          id: true,
+                          credentialType: true,
+                          aadVersion: true,
+                          algorithm: true,
+                          keyVersion: true,
+                          ciphertext: true,
+                          nonce: true,
+                          authTag: true,
+                          status: true,
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+  const defaultAffinityPolicy: AffinityPolicy = {
+    enabled: false,
+    ttlSeconds: 3600,
+    maxRecords: 10_000,
+    prefixWeight: 100,
+    conversationWeight: 150,
+    confirmedCacheWeight: 250,
+    loadPenaltyWeight: 100,
+  };
+  if (!pool)
+    return {
+      enabled: false,
+      acknowledged: false,
+      affinityPolicy: defaultAffinityPolicy,
+      targets: [],
+    };
+  const now = new Date();
+  const targets = pool.PoolMembers.flatMap((member) => {
+    const model = member.ExecutionTarget?.ProviderModel;
+    const account = model?.ProviderAccount;
+    const credential = account?.CurrentCredential;
+    const protocol = account ? targetProtocol(account.providerType) : null;
+    const capabilityInventory = parseOpenAiCompatibleCapabilities(model?.nativeCapabilities);
+    if (
+      !model ||
+      !account ||
+      !credential ||
+      !protocol ||
+      !inventoryMatchesProtocol(capabilityInventory, protocol) ||
+      (memberTier === "PUBLIC_OVERFLOW" && member.publicOrder == null) ||
+      model.userId !== userId ||
+      account.userId !== userId ||
+      !model.enabled ||
+      !account.enabled ||
+      model.deletedAt ||
+      account.deletedAt ||
+      credential.status !== "ACTIVE" ||
+      !providerHealthCooldownElapsed(model.healthStatus, model.healthNextRetryAt, now) ||
+      !providerHealthCooldownElapsed(account.healthStatus, account.healthNextRetryAt, now)
+    )
+      return [];
+    return [
+      {
+        poolMemberId: member.id,
+        executionTargetId: member.ExecutionTarget!.id,
+        inferenceCapacityId: member.ExecutionTarget!.inferenceCapacityId,
+        capacityWaitBudgetMs:
+          member.capacityWaitBudgetMode === "UNLIMITED"
+            ? null
+            : member.capacityWaitBudgetMode === "LIMITED"
+              ? member.capacityWaitBudgetMs
+              : pool.capacityWaitBudgetMs,
+        publicOrder: member.publicOrder ?? 0,
+        weight: member.weight,
+        providerModelId: model.id,
+        upstreamModelId: model.upstreamModelId,
+        contextWindow: model.contextWindow,
+        effectiveContextCeiling:
+          memberTier !== "PRIMARY"
+            ? undefined
+            : member.capacityContextCeilingMode === "UNLIMITED"
+              ? null
+              : member.capacityContextCeilingMode === "LIMITED"
+                ? member.capacityContextCeiling
+                : pool.capacityContextCeiling,
+        contextMargin:
+          memberTier === "PRIMARY"
+            ? (member.capacityContextMargin ?? pool.capacityContextMargin)
+            : undefined,
+        physicalMaxContext:
+          memberTier === "PRIMARY"
+            ? member.ExecutionTarget!.InferenceCapacity?.physicalMaxContext
+            : undefined,
+        maxOutputTokens: model.maxOutputTokens,
+        protocol,
+        providerAccountId: account.id,
+        endpointIdentity: account.endpointIdentity,
+        endpointVersion: account.endpointVersion,
+        concurrencyLimit: model.concurrencyLimit,
+        providerVersion: account.providerVersion,
+        baseUrl: account.baseUrl,
+        authType: account.authType,
+        healthStatus: model.healthStatus,
+        nativeProtocols: nativeProtocols(model.nativeCapabilities),
+        nativeSurfaces: nativeSurfaces(model.nativeCapabilities),
+        supportsStreaming: supportsStreaming(model.nativeCapabilities),
+        supportedFeatures: supportedFeatures(model.nativeCapabilities),
+        capabilityInventory,
+        credential,
+      } satisfies PublicProviderTarget,
+    ];
+  });
+  return {
+    enabled: pool.publicEgressEnabled,
+    acknowledged: pool.publicEgressAcknowledged,
+    affinityPolicy: {
+      enabled: pool.affinityEnabled,
+      ttlSeconds: pool.affinityTtlSeconds,
+      maxRecords: pool.affinityMaxRecords,
+      prefixWeight: pool.affinityPrefixWeight,
+      conversationWeight: pool.affinityConversationWeight,
+      confirmedCacheWeight: pool.affinityConfirmedCacheWeight,
+      loadPenaltyWeight: pool.affinityLoadPenaltyWeight,
+    },
+    targets,
+  };
+}
+
+export function providerHealthCooldownElapsed(
+  status: string,
+  nextRetryAt: Date | null,
+  now: Date,
+): boolean {
+  return status !== "UNAVAILABLE" || (nextRetryAt !== null && nextRetryAt <= now);
+}
+
+function joinProviderPath(baseUrl: string, path: string): string {
+  const base = new URL(baseUrl);
+  const requested = new URL(path, "http://provider-path.invalid");
+  const cleanBase = base.pathname.replace(/\/$/u, "");
+  const cleanPath = requested.pathname.startsWith("/")
+    ? requested.pathname
+    : `/${requested.pathname}`;
+  return `${cleanBase}${cleanPath}${requested.search}`;
+}
+
+const SAFE_CONTENT_ENCODINGS = new Set(["br", "deflate", "gzip", "identity", "zstd"]);
+
+function validatedContentEncoding(value: string | string[] | undefined): string | null {
+  if (value === undefined) return null;
+  const joined = Array.isArray(value) ? value.join(",") : value;
+  const encodings = joined
+    .split(",")
+    .map((encoding) => encoding.trim().toLowerCase())
+    .filter(Boolean);
+  if (
+    encodings.length === 0 ||
+    encodings.length > 4 ||
+    encodings.some((encoding) => !SAFE_CONTENT_ENCODINGS.has(encoding))
+  )
+    return null;
+  return encodings.join(", ");
+}
+
+function isOpaqueJsonOrSseContentType(value: string | string[] | undefined): boolean {
+  if (value === undefined || Array.isArray(value)) return false;
+  const mediaType = value.split(";", 1)[0]?.trim().toLowerCase();
+  return (
+    mediaType === "application/json" ||
+    mediaType === "text/event-stream" ||
+    (mediaType?.startsWith("application/") === true && mediaType.endsWith("+json"))
+  );
+}
+
+export function providerResponseHeaders(
+  headers: import("node:http").IncomingHttpHeaders,
+  preserveOpaqueRepresentation: boolean,
+): Headers {
+  const result = new Headers();
+  const allowed = new Set([
+    "content-type",
+    "cache-control",
+    "retry-after",
+    "request-id",
+    "x-request-id",
+    "anthropic-request-id",
+    "openai-processing-ms",
+    "x-ratelimit-limit-requests",
+    "x-ratelimit-remaining-requests",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-limit-tokens",
+    "x-ratelimit-remaining-tokens",
+    "x-ratelimit-reset-tokens",
+    "anthropic-ratelimit-requests-limit",
+    "anthropic-ratelimit-requests-remaining",
+    "anthropic-ratelimit-requests-reset",
+    "anthropic-ratelimit-tokens-limit",
+    "anthropic-ratelimit-tokens-remaining",
+    "anthropic-ratelimit-tokens-reset",
+  ]);
+  for (const [name, value] of Object.entries(headers)) {
+    if (!allowed.has(name.toLowerCase()) || value === undefined) continue;
+    result.set(name, Array.isArray(value) ? value.join(", ") : value);
+  }
+  // node:http exposes the provider's wire bytes without transparent
+  // decompression. Preserve a validated encoding only when those exact bytes
+  // are passed through natively. Adapted responses are decoded and rendered,
+  // so their representation validators and encoding must be stripped.
+  if (preserveOpaqueRepresentation && isOpaqueJsonOrSseContentType(headers["content-type"])) {
+    const encoding = validatedContentEncoding(headers["content-encoding"]);
+    if (encoding) result.set("content-encoding", encoding);
+  }
+  return result;
+}
+
+function providerAuth(target: PublicProviderTarget, secret: string): ProviderEgressAuth {
+  if (target.authType !== target.credential.credentialType) throw new Error("credential mismatch");
+  return target.authType === "API_KEY"
+    ? { type: "API_KEY", apiKey: secret }
+    : { type: "BEARER", token: secret };
+}
+
+function replaceModel(body: Uint8Array, model: string): Uint8Array {
+  const parsed = JSON.parse(new TextDecoder().decode(body)) as Record<string, unknown>;
+  parsed.model = model;
+  return new TextEncoder().encode(JSON.stringify(parsed));
+}
+
+function terminalReason(signal: AbortSignal, ok: boolean) {
+  return signal.aborted
+    ? ("CANCELLED" as const)
+    : ok
+      ? ("COMPLETED" as const)
+      : ("FAILED" as const);
+}
+
+function usageInteger(value: unknown): bigint | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? BigInt(value)
+    : undefined;
+}
+
+function usageString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function usageCost(value: unknown): string | number | undefined {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+  const candidate = usageString(value);
+  if (!candidate) return undefined;
+  try {
+    const parsed = new Prisma.Decimal(candidate);
+    return parsed.isFinite() && !parsed.isNegative() ? candidate : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function usageRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function exclusiveMany(
+  total: bigint | undefined,
+  subsets: readonly (bigint | undefined)[],
+): bigint | undefined {
+  if (total === undefined) return undefined;
+  const represented = subsets.reduce<bigint>((sum, item) => sum + (item ?? 0n), 0n);
+  return represented <= total ? total - represented : undefined;
+}
+
+export function usageFromObject(value: unknown): RawProviderUsage | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const root = value as Record<string, unknown>;
+  // Responses terminal stream events nest the authoritative usage object in
+  // `response.usage`; Chat and Anthropic expose it at the other two shapes.
+  const raw = (root.usage ?? root.response ?? root.message) as Record<string, unknown> | undefined;
+  const usage =
+    raw?.usage && typeof raw.usage === "object" ? (raw.usage as Record<string, unknown>) : raw;
+  if (!usage || typeof usage !== "object") return undefined;
+  const promptDetails = usageRecord(usage.prompt_tokens_details ?? usage.input_tokens_details);
+  const completionDetails = usageRecord(
+    usage.completion_tokens_details ?? usage.output_tokens_details,
+  );
+  const cacheReadTokens = usageInteger(
+    usage.cache_read_input_tokens ?? promptDetails?.cached_tokens,
+  );
+  const cacheWriteTokens = usageInteger(usage.cache_creation_input_tokens);
+  const reasoningTokens = usageInteger(completionDetails?.reasoning_tokens);
+  const inputAudioTokens = usageInteger(promptDetails?.audio_tokens);
+  const outputAudioTokens = usageInteger(completionDetails?.audio_tokens);
+  const acceptedPredictionTokens = usageInteger(completionDetails?.accepted_prediction_tokens);
+  const rejectedPredictionTokens = usageInteger(completionDetails?.rejected_prediction_tokens);
+  const promptTotal = usageInteger(usage.input_tokens ?? usage.prompt_tokens);
+  const completionTotal = usageInteger(usage.output_tokens ?? usage.completion_tokens);
+  const openAiShape =
+    usage.prompt_tokens !== undefined ||
+    usage.completion_tokens !== undefined ||
+    usage.input_tokens_details !== undefined ||
+    usage.output_tokens_details !== undefined ||
+    usage.prompt_tokens_details !== undefined ||
+    usage.completion_tokens_details !== undefined;
+  const inputTokens = openAiShape
+    ? exclusiveMany(promptTotal, [cacheReadTokens, inputAudioTokens])
+    : promptTotal;
+  const outputTokens = openAiShape
+    ? exclusiveMany(completionTotal, [
+        reasoningTokens,
+        outputAudioTokens,
+        acceptedPredictionTokens,
+        rejectedPredictionTokens,
+      ])
+    : completionTotal;
+  const explicitAdditional = usageInteger(usage.additional_billable_tokens);
+  const additionalParts = [
+    explicitAdditional,
+    inputAudioTokens,
+    outputAudioTokens,
+    acceptedPredictionTokens,
+    rejectedPredictionTokens,
+  ];
+  const additionalBillableTokens = additionalParts.some((item) => item !== undefined)
+    ? additionalParts.reduce<bigint>((sum, item) => sum + (item ?? 0n), 0n)
+    : undefined;
+  const authoritativeBillableTokens = usageInteger(usage.billable_tokens);
+  const reportedTotalTokens = usageInteger(usage.total_tokens);
+  const reportedCost = usageCost(usage.cost ?? usage.total_cost);
+  if (
+    inputTokens === undefined &&
+    outputTokens === undefined &&
+    cacheReadTokens === undefined &&
+    cacheWriteTokens === undefined &&
+    authoritativeBillableTokens === undefined &&
+    reasoningTokens === undefined &&
+    usageInteger(usage.tool_tokens) === undefined &&
+    additionalBillableTokens === undefined &&
+    reportedCost === undefined
+  )
+    return undefined;
+  const knownUsageKeys = new Set([
+    "input_tokens",
+    "prompt_tokens",
+    "output_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "input_tokens_details",
+    "prompt_tokens_details",
+    "output_tokens_details",
+    "completion_tokens_details",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "billable_tokens",
+    "tool_tokens",
+    "additional_billable_tokens",
+    "cost",
+    "total_cost",
+    "currency",
+    "pricing_version",
+  ]);
+  const knownPromptDetailKeys = new Set(["cached_tokens", "audio_tokens"]);
+  const knownCompletionDetailKeys = new Set([
+    "reasoning_tokens",
+    "audio_tokens",
+    "accepted_prediction_tokens",
+    "rejected_prediction_tokens",
+  ]);
+  const hasUnknownUsageCategory = Object.keys(usage).some((key) => !knownUsageKeys.has(key));
+  const hasUnknownPromptDetail =
+    promptDetails !== undefined &&
+    Object.keys(promptDetails).some((key) => !knownPromptDetailKeys.has(key));
+  const hasUnknownCompletionDetail =
+    completionDetails !== undefined &&
+    Object.keys(completionDetails).some((key) => !knownCompletionDetailKeys.has(key));
+  const hasInvalidKnownDetail = [
+    [promptDetails, "cached_tokens"],
+    [promptDetails, "audio_tokens"],
+    [completionDetails, "reasoning_tokens"],
+    [completionDetails, "audio_tokens"],
+    [completionDetails, "accepted_prediction_tokens"],
+    [completionDetails, "rejected_prediction_tokens"],
+  ].some(
+    ([details, key]) =>
+      details !== undefined &&
+      Object.hasOwn(details as Record<string, unknown>, key as string) &&
+      usageInteger((details as Record<string, unknown>)[key as string]) === undefined,
+  );
+  const knownIntegerFields = [
+    "input_tokens",
+    "prompt_tokens",
+    "output_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "billable_tokens",
+    "tool_tokens",
+    "additional_billable_tokens",
+  ];
+  const hasInvalidKnownInteger = knownIntegerFields.some(
+    (key) => Object.hasOwn(usage, key) && usageInteger(usage[key]) === undefined,
+  );
+  const impossibleBreakdown =
+    (promptTotal !== undefined &&
+      exclusiveMany(promptTotal, [cacheReadTokens, inputAudioTokens]) === undefined) ||
+    (completionTotal !== undefined &&
+      exclusiveMany(completionTotal, [
+        reasoningTokens,
+        outputAudioTokens,
+        acceptedPredictionTokens,
+        rejectedPredictionTokens,
+      ]) === undefined);
+  const hasUnknownCategories =
+    hasUnknownUsageCategory ||
+    hasUnknownPromptDetail ||
+    hasUnknownCompletionDetail ||
+    hasInvalidKnownDetail ||
+    hasInvalidKnownInteger ||
+    impossibleBreakdown;
+  const normalizedCategoryTotal =
+    inputTokens !== undefined && outputTokens !== undefined
+      ? [
+          inputTokens,
+          outputTokens,
+          cacheReadTokens,
+          cacheWriteTokens,
+          reasoningTokens,
+          usageInteger(usage.tool_tokens),
+          additionalBillableTokens,
+        ].reduce<bigint>((sum, item) => sum + (item ?? 0n), 0n)
+      : undefined;
+  const categoriesComplete = hasUnknownCategories
+    ? false
+    : authoritativeBillableTokens !== undefined ||
+        inputTokens === undefined ||
+        outputTokens === undefined
+      ? undefined
+      : !(reportedTotalTokens !== undefined && reportedTotalTokens !== normalizedCategoryTotal);
+  return {
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    reasoningTokens,
+    toolTokens: usageInteger(usage.tool_tokens),
+    additionalBillableTokens,
+    authoritativeBillableTokens,
+    reportedTotalTokens,
+    categoriesComplete,
+    rawUsage: JSON.parse(JSON.stringify(usage)),
+    reportedCost,
+    reportedCostCurrency: usageString(usage.currency)?.toUpperCase(),
+    reportedCostPricingVersion: usageString(usage.pricing_version),
+    reportedCostSource: reportedCost === undefined ? undefined : "provider-runtime",
+    accountingVersion: "provider-billable-v1",
+    confidence: "REPORTED",
+  };
+}
+
+export function parseProviderUsage(
+  chunks: readonly Uint8Array[],
+  pricing?: ProviderPricingSchedule,
+) {
+  if (chunks.length === 0) return undefined;
+  const text = new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))));
+  const candidates = [text];
+  // SSE observations are decoded in wire order below. Tail extraction is for
+  // a bounded/truncated JSON response only; adding it for SSE would reorder
+  // and duplicate the terminal observation ahead of earlier events.
+  const tailUsage = /(?:^|\r?\n)data:/u.test(text) ? undefined : extractTailUsageObject(text);
+  if (tailUsage) candidates.push(JSON.stringify({ usage: tailUsage }));
+  const decoder = new SseDecoder();
+  try {
+    for (const chunk of chunks) {
+      for (const event of decoder.push(chunk)) candidates.push(event.data);
+    }
+    for (const event of decoder.finish()) candidates.push(event.data);
+  } catch {
+    // A non-SSE JSON response or a truncated error body is still considered
+    // through the whole-body candidate above.
+  }
+  let found: RawProviderUsage | undefined;
+  let categoriesComplete = true;
+  const rawObservations: Prisma.InputJsonValue[] = [];
+  const rawObservationKeys = new Set<string>();
+  for (const candidate of candidates) {
+    if (!candidate || candidate === "[DONE]") continue;
+    try {
+      const observed = usageFromObject(JSON.parse(candidate));
+      if (observed) {
+        if (observed.categoriesComplete === false) categoriesComplete = false;
+        if (observed.rawUsage !== undefined) {
+          const observationKey = JSON.stringify(observed.rawUsage);
+          if (!rawObservationKeys.has(observationKey)) {
+            rawObservationKeys.add(observationKey);
+            rawObservations.push(observed.rawUsage);
+          }
+        }
+        const definedObserved = Object.fromEntries(
+          Object.entries(observed).filter(([, item]) => item !== undefined),
+        );
+        found = { ...found, ...definedObserved } as RawProviderUsage;
+      }
+    } catch {
+      // Arbitrary stream splits and non-JSON events are expected. Missing
+      // trustworthy usage settles at the conservative admission liability.
+    }
+  }
+  if (!found) return undefined;
+  const normalized: RawProviderUsage = {
+    ...found,
+    rawUsage: rawObservations.length === 1 ? found.rawUsage : rawObservations,
+    categoriesComplete:
+      found.authoritativeBillableTokens === undefined &&
+      found.inputTokens !== undefined &&
+      found.outputTokens !== undefined
+        ? categoriesComplete
+        : found.categoriesComplete,
+  };
+  const calculated = pricing ? calculatedCostForUsage(normalized, pricing) : undefined;
+  return calculated
+    ? {
+        ...normalized,
+        calculatedCost: calculated,
+        calculatedCostCurrency: pricing!.currency,
+        calculatedCostPricingVersion: pricing!.version,
+        calculatedCostSource: "wsmp-pricing",
+        calculatedCostConfidence:
+          pricing!.confidence === "REPORTED" ? "CALCULATED" : pricing!.confidence,
+        pricingVersion: pricing!.version,
+        currency: pricing!.currency,
+        accountingVersion: pricing!.accountingVersion,
+      }
+    : normalized;
+}
+
+function classifyTerminalRecord(
+  record: SseRecord,
+  surface: ProtocolSurface,
+): "SUCCESS" | "FAILED" | undefined {
+  if (surface === "openai-chat") {
+    if (record.data === "[DONE]") return "SUCCESS";
+    try {
+      const value = JSON.parse(record.data) as Record<string, unknown>;
+      return value.error === undefined ? undefined : "FAILED";
+    } catch {
+      return undefined;
+    }
+  }
+  try {
+    const value = JSON.parse(record.data) as Record<string, unknown>;
+    const dataType = typeof value.type === "string" ? value.type : undefined;
+    if (!record.event || record.event !== dataType) return undefined;
+    if (record.event === "error") return "FAILED";
+    if (surface === "anthropic-messages")
+      return record.event === "message_stop" ? "SUCCESS" : undefined;
+    if (record.event === "response.completed") return "SUCCESS";
+    if (["response.failed", "response.cancelled", "response.incomplete"].includes(record.event))
+      return "FAILED";
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+export function extractTailUsageObject(text: string): Record<string, unknown> | undefined {
+  const marker = text.lastIndexOf('"usage"');
+  if (marker < 0) return undefined;
+  const colon = text.indexOf(":", marker + 7);
+  const start = colon < 0 ? -1 : text.indexOf("{", colon + 1);
+  if (start < 0) return undefined;
+  let depth = 0;
+  let quoted = false;
+  let escaped = false;
+  for (let index = start; index < text.length; index += 1) {
+    const character = text[index];
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') quoted = false;
+      continue;
+    }
+    if (character === '"') quoted = true;
+    else if (character === "{") depth += 1;
+    else if (character === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        try {
+          return usageRecord(JSON.parse(text.slice(start, index + 1)));
+        } catch {
+          return undefined;
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
+export function retainProviderUsageTail(
+  chunks: Uint8Array[],
+  currentBytes: number,
+  chunk: Uint8Array,
+  maxBytes = 1024 * 1024,
+): number {
+  const overflowed = currentBytes + chunk.byteLength > maxBytes;
+  const chunkView = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  const prior = Buffer.concat(chunks.map((item) => Buffer.from(item)));
+  let retained =
+    chunk.byteLength >= maxBytes
+      ? chunkView.subarray(-maxBytes)
+      : Buffer.concat([prior, chunkView]).subarray(-maxBytes);
+  // If truncation cut through an SSE event, begin at the next complete event.
+  // This prevents a partial multi-megabyte content delta from poisoning the
+  // decoder before it reaches terminal usage.
+  if (overflowed) {
+    const boundaries = [
+      retained.indexOf("\n\n"),
+      retained.indexOf("\r\n\r\n"),
+      retained.indexOf("\r\r"),
+    ]
+      .filter((index) => index >= 0)
+      .sort((left, right) => left - right);
+    const boundary = boundaries[0];
+    if (boundary !== undefined) {
+      const width = retained
+        .subarray(boundary, boundary + 4)
+        .toString()
+        .startsWith("\r\n\r\n")
+        ? 4
+        : 2;
+      retained = retained.subarray(boundary + width);
+    }
+  }
+  chunks.splice(0, chunks.length, new Uint8Array(retained));
+  return retained.byteLength;
+}
+
+const MAX_RETRYABLE_PROVIDER_BODY_BYTES = 1024 * 1024;
+
+async function readRetryableProviderUsage(
+  response: AsyncIterable<Uint8Array> & { complete: boolean; destroy(error?: Error): void },
+  pricing?: ProviderPricingSchedule,
+): Promise<RawProviderUsage | undefined> {
+  const chunks: Uint8Array[] = [];
+  let retainedBytes = 0;
+  let receivedBytes = 0;
+  try {
+    for await (const rawChunk of response) {
+      const chunk = Uint8Array.from(rawChunk);
+      receivedBytes += chunk.byteLength;
+      if (receivedBytes > MAX_RETRYABLE_PROVIDER_BODY_BYTES) {
+        response.destroy(new Error("Retryable provider response exceeded accounting limit"));
+        return undefined;
+      }
+      retainedBytes = retainProviderUsageTail(
+        chunks,
+        retainedBytes,
+        chunk,
+        MAX_RETRYABLE_PROVIDER_BODY_BYTES,
+      );
+    }
+  } catch {
+    return undefined;
+  }
+  if (!response.complete) return undefined;
+  try {
+    const parsed = JSON.parse(
+      new TextDecoder().decode(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)))),
+    );
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  } catch {
+    return undefined;
+  }
+  const usage = parseProviderUsage(chunks, pricing);
+  return usage ? { ...usage, observationComplete: true } : undefined;
+}
+
+async function recordProviderHealth(
+  target: PublicProviderTarget,
+  userId: string,
+  success: boolean,
+  response?: { status: number; retryAfter?: string | string[] },
+  owner?: { attemptId: string; fencingToken: bigint },
+): Promise<void> {
+  await recordProviderOutcome({
+    userId,
+    providerAccountId: target.providerAccountId,
+    providerModelId: target.providerModelId,
+    success,
+    failureClass: success ? undefined : classifyProviderFailure(response?.status),
+    retryAfterMs: success ? undefined : parseRetryAfter(response?.retryAfter),
+    ...owner,
+  }).catch(() => undefined);
+}
+
+export function providerHealthOutcome(status: number): "SUCCESS" | "FAILURE" | "NEUTRAL" {
+  if (status >= 200 && status < 400) return "SUCCESS";
+  if (status === 408 || status === 409 || status === 429 || status >= 500) return "FAILURE";
+  // Ordinary client errors demonstrate neither provider recovery nor provider
+  // failure. In particular they must not clear an existing cooldown.
+  return "NEUTRAL";
+}
+
+function selectedNativeSurface(target: PublicProviderTarget, requested: ProtocolSurface) {
+  if (target.resolvedExecution) return target.resolvedExecution.nativeSurface;
+  if (target.nativeSurfaces.includes(requested)) return requested;
+  return target.nativeSurfaces.find((surface) =>
+    target.protocol === "anthropic"
+      ? surface === "anthropic-messages"
+      : surface === "openai-responses" || surface === "openai-chat",
+  );
+}
+
+function selectedProviderSurface(
+  target: PublicProviderTarget,
+  requested: ProtocolSurface,
+  mode: PublicOverflowRequest["chatTestRoutingMode"],
+) {
+  if (target.resolvedExecution) {
+    if (mode === "REQUIRE_ADAPTED" && target.resolvedExecution.mode !== "adapted") return undefined;
+    return target.resolvedExecution.nativeSurface;
+  }
+  if (mode !== "REQUIRE_ADAPTED") return selectedNativeSurface(target, requested);
+  return target.nativeSurfaces.find(
+    (surface) =>
+      surface !== requested &&
+      (target.protocol === "anthropic"
+        ? surface === "anthropic-messages"
+        : surface === "openai-responses" || surface === "openai-chat"),
+  );
+}
+
+function providerHealthPenalty(status: PublicProviderTarget["healthStatus"]): number {
+  return status === "UNAVAILABLE"
+    ? 200
+    : status === "DEGRADED"
+      ? 100
+      : status === "UNKNOWN"
+        ? 25
+        : 0;
+}
+
+function providerCostPenalty(liability: ProviderLiability): number {
+  if (!liability.spend) return 0;
+  // One score point per micro-unit of the provider's configured currency. The
+  // value is derived from the selected immutable pricing schedule, not labels
+  // or administrator ordering.
+  return Math.min(
+    Number.MAX_SAFE_INTEGER,
+    Math.ceil(Number(liability.spend.toString()) * 1_000_000),
+  );
+}
+
+export async function rankPublicOverflowTargets(input: {
+  request: PublicOverflowRequest;
+  policy: AffinityPolicy;
+  targets: PublicProviderTarget[];
+}): Promise<{ targets: PublicProviderTarget[]; decision: AffinityDecision | null }> {
+  if (!input.policy.enabled) return { targets: input.targets, decision: null };
+  let payload: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(input.request.body));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+      return { targets: input.targets, decision: null };
+    payload = parsed as Record<string, unknown>;
+  } catch {
+    return { targets: input.targets, decision: null };
+  }
+  const affinityTargets = await buildProviderAffinityTargets({
+    request: input.request,
+    targets: input.targets,
+  });
+  const decision = await rankAffinityTargets({
+    ownerId: input.request.affinityTenantUserId ?? input.request.userId,
+    resourceOwnerId: input.request.userId,
+    poolId: input.request.poolId,
+    securityScope: input.request.affinitySecurityScope ?? input.request.userId,
+    accessGrantId: input.request.affinityAccessGrantId,
+    policy: input.policy,
+    surface: input.request.requestedSurface,
+    payload,
+    targets: affinityTargets,
+  });
+  const byId = new Map(input.targets.map((target) => [target.executionTargetId, target]));
+  return {
+    decision,
+    targets: decision.orderedTargetIds.flatMap((id) => {
+      const target = byId.get(id);
+      return target
+        ? [
+            {
+              ...target,
+              affinityTarget: affinityTargets.find(
+                (candidate) => candidate.executionTargetId === id,
+              ),
+              affinity: {
+                outcome:
+                  (decision.prefixDepths[id] ?? 0) > 0 || decision.conversationMatches[id]
+                    ? "PREDICTED_MATCH"
+                    : "NO_MATCH",
+                score: decision.scores[id],
+                prefixDepth: decision.prefixDepths[id],
+                reason: decision.reasons[id],
+              },
+            },
+          ]
+        : [];
+    }),
+  };
+}
+
+export async function buildProviderAffinityTargets(input: {
+  request: Pick<
+    PublicOverflowRequest,
+    "userId" | "requestedSurface" | "estimatedInputTokens" | "requestedOutputTokens" | "liability"
+  >;
+  targets: PublicProviderTarget[];
+}): Promise<AffinityTarget[]> {
+  const [loads, pricing] = await Promise.all([
+    prisma.providerAttempt.groupBy({
+      by: ["providerModelId"],
+      where: {
+        userId: input.request.userId,
+        state: "ACTIVE",
+        providerModelId: { in: input.targets.map((target) => target.providerModelId) },
+      },
+      _count: { _all: true },
+    }),
+    Promise.all(
+      input.targets.map((target) =>
+        resolveActiveProviderPricing({
+          userId: input.request.userId,
+          providerAccountId: target.providerAccountId,
+          providerModelId: target.providerModelId,
+        }),
+      ),
+    ),
+  ]);
+  const loadByModel = new Map(loads.map((row) => [row.providerModelId, row._count._all]));
+  const liabilities = input.targets.map((_target, index) => {
+    const targetPricing = pricing[index];
+    return input.request.estimatedInputTokens !== undefined &&
+      input.request.requestedOutputTokens !== undefined
+      ? liabilityFromPricing({
+          estimatedInputTokens: input.request.estimatedInputTokens,
+          requestedOutputTokens: input.request.requestedOutputTokens,
+          pricing: targetPricing,
+        })
+      : input.request.liability;
+  });
+  const comparableCurrency =
+    liabilities.every(({ spend }) => spend !== undefined) &&
+    new Set(liabilities.map(({ currency }) => currency ?? null)).size === 1;
+  return input.targets.map((target, index) => {
+    const liability = liabilities[index] ?? input.request.liability;
+    return {
+      poolMemberId: target.poolMemberId,
+      executionTargetId: target.executionTargetId,
+      targetIdentity: buildAffinityTargetIdentity({
+        executionTargetId: target.executionTargetId,
+        endpointIdentity: `${target.providerAccountId}:${target.endpointIdentity}:${target.endpointVersion}`,
+        upstreamModelId: `${target.providerModelId}:${target.upstreamModelId}`,
+        runtimeIdentityKey: target.providerAccountId,
+        runtimeModel: target.upstreamModelId,
+        runtimeRevision: target.providerVersion,
+        tokenizer: null,
+        tokenizerVersion: null,
+        template: null,
+        templateVersion: null,
+        engine: target.protocol,
+        cacheNamespace: null,
+        requestedSurface: input.request.requestedSurface,
+        nativeSurface:
+          selectedNativeSurface(target, input.request.requestedSurface) ??
+          input.request.requestedSurface,
+        mode:
+          target.resolvedExecution?.mode ??
+          (target.nativeSurfaces.includes(input.request.requestedSurface) ? "native" : "adapted"),
+        adapterVersion:
+          (target.resolvedExecution?.mode ??
+            (target.nativeSurfaces.includes(input.request.requestedSurface)
+              ? "native"
+              : "adapted")) === "native"
+            ? "native"
+            : ADAPTER_VERSION,
+      }),
+      capacityId: `provider:${target.providerModelId}`,
+      hardConcurrencyLimit: target.concurrencyLimit ?? null,
+      activeLoad: loadByModel.get(target.providerModelId) ?? 0,
+      waitingLoad: 0,
+      healthPenalty: providerHealthPenalty(target.healthStatus),
+      publicEgressPenalty: 100,
+      costPenalty: comparableCurrency ? providerCostPenalty(liability) : 0,
+    };
+  });
+}
+
+/**
+ * Dispatches ordered provider attempts. Every attempt owns a distinct durable
+ * budget reservation and is reconciled before the next target is considered.
+ * A returned response is committed: later body/stream failures never fail over.
+ */
+export async function dispatchPublicOverflow(
+  request: PublicOverflowRequest,
+): Promise<PublicOverflowResult> {
+  const memberTier = request.memberTier ?? "PUBLIC_OVERFLOW";
+  // The deployment release gate covers every request that can leave WSMP,
+  // including provider-backed PRIMARY members. Existing database state must
+  // not silently bypass an operator's disabled/missing deployment setting.
+  if (!env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED)
+    return { dispatched: false, reason: "DEPLOYMENT_GATE_DISABLED" };
+  const listed = await listPublicOverflowTargets(request.userId, request.poolId, memberTier);
+  if (memberTier === "PUBLIC_OVERFLOW" && !listed.enabled)
+    return { dispatched: false, reason: "POOL_PRIVATE" };
+  // Acknowledgement is the pool owner's consent for all provider egress.
+  // publicEgressEnabled remains the separate switch that makes a pool
+  // non-private by permitting fallback to PUBLIC_OVERFLOW members.
+  if (!listed.acknowledged) return { dispatched: false, reason: "POOL_ACKNOWLEDGEMENT_MISSING" };
+  // Payload size may change during cross-protocol rendering. Do the initial
+  // pass with zero input solely to reject protocol/feature/output mismatches;
+  // each target is checked again with its actual rendered wire size below.
+  const binding = request.exactResponsesBinding;
+  const memberEligible = targetsForForcedPoolMember(listed.targets, request.forcedPoolMemberId);
+  const eligible = binding
+    ? memberEligible.filter((target) => matchesExactResponsesBinding(target, binding))
+    : request.requireNativeSurface
+      ? memberEligible.filter(
+          (target) =>
+            target.nativeSurfaces.includes(request.requireNativeSurface!) &&
+            (request.requireNativeSurface !== "anthropic-messages" ||
+              target.protocol === "anthropic"),
+        )
+      : memberEligible;
+  const compatibilityRequest = {
+    ...request,
+    liability: request.liability,
+    contextTokens: 0n,
+  };
+  const compatible = eligible.flatMap((target) => {
+    const resolvedExecution = resolvePublicProviderExecution(target, compatibilityRequest);
+    const resolvedTarget = { ...target, resolvedExecution };
+    if (
+      publicTargetCompatibility(target, compatibilityRequest) !== "COMPATIBLE" ||
+      !matchesChatTestProviderMode(
+        resolvedTarget,
+        request.requestedSurface,
+        request.chatTestRoutingMode,
+      )
+    )
+      return [];
+    return [resolvedTarget];
+  });
+  if (compatible.length === 0) {
+    await Promise.allSettled(
+      listed.targets.map((target) =>
+        recordProviderAttemptEvent({
+          userId: request.userId,
+          providerAccountId: target.providerAccountId,
+          providerModelId: target.providerModelId,
+          requestId: request.requestId,
+          attemptId: `${request.requestId}:compatibility-skip:${target.providerModelId}`,
+          eventType: "SKIP",
+          reason: publicTargetCompatibility(target, request),
+          ...providerEventRouting({ request, target }),
+        }),
+      ),
+    );
+    return { dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" };
+  }
+
+  let ranked: Awaited<ReturnType<typeof rankPublicOverflowTargets>>;
+  try {
+    ranked = binding
+      ? { decision: null, targets: compatible }
+      : await rankPublicOverflowTargets({
+          request,
+          policy: listed.affinityPolicy,
+          targets: compatible,
+        });
+  } catch {
+    ranked = {
+      decision: null,
+      targets: compatible.map((target) => ({
+        ...target,
+        affinity: { outcome: "NO_MATCH", score: 0, prefixDepth: 0, reason: "affinity_error" },
+      })),
+    };
+  }
+
+  await request.releaseLocalCapacity();
+  const keyringValue = env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS;
+  if (!keyringValue) return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
+  const keyring = parseProviderCredentialKeyring(keyringValue);
+  let lastAdmission: ProviderBudgetAdmission | undefined;
+  let attemptCount = 0;
+
+  const rankedTargets = orderChatTestProviderTargets(
+    ranked.targets,
+    request.requestedSurface,
+    request.chatTestRoutingMode,
+  );
+  for (const [rankedIndex, target] of rankedTargets.entries()) {
+    const nativeSurface = binding
+      ? exactResponsesNativeSurface(target)
+      : selectedProviderSurface(target, request.requestedSurface, request.chatTestRoutingMode);
+    if (!nativeSurface) continue;
+    attemptCount += 1;
+    const attemptId = crypto.randomUUID();
+    let fencingToken: bigint;
+    try {
+      fencingToken = await allocateProviderFence({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+      });
+    } catch {
+      await recordProviderAttemptEvent({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        requestId: request.requestId,
+        attemptId,
+        eventType: "TERMINAL",
+        reason: "FENCE_ALLOCATION_FAILED",
+        ...providerEventRouting({ request, target, nativeSurface }),
+        terminalState: "FAILED",
+      }).catch(() => undefined);
+      continue;
+    }
+    let upstream: { protocol: ProviderProtocol; path: string; headers: Headers; body: Uint8Array };
+    try {
+      upstream = binding
+        ? {
+            protocol: "openai",
+            path: request.path,
+            headers: request.headers,
+            body: request.body,
+          }
+        : nativeSurface === request.requestedSurface
+          ? {
+              protocol: request.requestedProtocol,
+              path: request.path,
+              headers: request.headers,
+              body: replaceModel(request.body, target.upstreamModelId),
+            }
+          : await request.renderForTarget!(target, nativeSurface);
+    } catch {
+      await recordProviderAttemptEvent({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        eventType: "TERMINAL",
+        reason: "REQUEST_RENDER_FAILED",
+        ...providerEventRouting({ request, target, nativeSurface }),
+        terminalState: "SKIPPED",
+      }).catch(() => undefined);
+      continue;
+    }
+    // Resolve by immutable account/model identity and admission time. This is
+    // intentionally per attempt so fallback cannot inherit another target's
+    // price, currency, or accounting contract.
+    const pricing = await resolveActiveProviderPricing({
+      userId: request.userId,
+      providerAccountId: target.providerAccountId,
+      providerModelId: target.providerModelId,
+    }).catch(() => undefined);
+    const requestedOutputTokens =
+      request.requestedOutputTokens ??
+      (target.maxOutputTokens === null ? undefined : BigInt(target.maxOutputTokens));
+    if (requestedOutputTokens === undefined) {
+      await recordProviderAttemptEvent({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        eventType: "TERMINAL",
+        reason: "OUTPUT_BOUND_UNAVAILABLE",
+        ...providerEventRouting({ request, target, nativeSurface }),
+        terminalState: "SKIPPED",
+      }).catch(() => undefined);
+      continue;
+    }
+    const renderedInputTokens = conservativeSerializedInputTokens(upstream.body.byteLength);
+    const renderedLiability = liabilityFromPricing({
+      estimatedInputTokens: renderedInputTokens,
+      requestedOutputTokens,
+      pricing,
+    });
+    const renderedContextTokens = checkedContextTokens(renderedInputTokens, requestedOutputTokens);
+    const renderedCompatibility = publicTargetCompatibility(target, {
+      ...request,
+      liability: renderedLiability,
+      estimatedInputTokens: renderedInputTokens,
+      contextTokens: renderedContextTokens,
+      requestedOutputTokens,
+    });
+    if (renderedCompatibility !== "COMPATIBLE") {
+      await recordProviderAttemptEvent({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        eventType: "TERMINAL",
+        reason: renderedCompatibility,
+        ...providerEventRouting({ request, target, nativeSurface }),
+        contextTokens: renderedContextTokens,
+        terminalState: "SKIPPED",
+      }).catch(() => undefined);
+      continue;
+    }
+    const admissionStartedAt = Date.now();
+    let admission: ProviderBudgetAdmission;
+    try {
+      admission = await admitProviderBudget({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        credentialId: target.credential.id,
+        poolId: request.poolId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        liability: renderedLiability,
+        expiresAt: new Date(Date.now() + 15 * 60_000),
+      });
+    } catch {
+      await recordProviderAttemptEvent({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        eventType: "TERMINAL",
+        reason: "BUDGET_ADMISSION_FAILED",
+        ...providerEventRouting({ request, target, nativeSurface }),
+        contextTokens: renderedContextTokens,
+        terminalState: "FAILED",
+      }).catch(() => undefined);
+      continue;
+    }
+    const providerWaitDurationMs = Math.max(0, Date.now() - admissionStartedAt);
+    lastAdmission = admission;
+    if (!admission.admitted) {
+      await recordProviderAttemptEvent({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        eventType: "TERMINAL",
+        reason: admission.reason,
+        ...providerEventRouting({ request, target, nativeSurface }),
+        waitDurationMs: providerWaitDurationMs,
+        contextTokens: renderedLiability.tokens,
+        terminalState: "SKIPPED",
+      }).catch(() => undefined);
+      continue;
+    }
+    const providerAttemptId = admission.providerAttemptId;
+
+    const healthClaim = await claimProviderHealthTrial({
+      userId: request.userId,
+      providerAccountId: target.providerAccountId,
+      providerModelId: target.providerModelId,
+      attemptId,
+      fencingToken,
+    }).catch(() => "COOLDOWN" as const);
+    if (healthClaim === "COOLDOWN") {
+      await reconcileProviderBudget({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        credentialId: target.credential.id,
+        poolId: request.poolId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        reason: "FAILED",
+        revisionSequence: 1n,
+        revisionKind: "SNAPSHOT",
+      }).catch(() => undefined);
+      await recordProviderAttemptEvent({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        providerAttemptId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        eventType: "TERMINAL",
+        reason: "PROVIDER_HEALTH_COOLDOWN",
+        ...providerEventRouting({ request, target, nativeSurface }),
+        reservationId: admission.reservationIds[0],
+        reservationIds: admission.reservationIds,
+        waitDurationMs: providerWaitDurationMs,
+        contextTokens: renderedLiability.tokens,
+        terminalState: "FAILED",
+      }).catch(() => undefined);
+      continue;
+    }
+
+    // Start before credential lookup and provider connection establishment:
+    // either can consume most of the 14-minute end-to-end timeout. Renewal is
+    // fenced to this exact account+model claim, so an orphan cannot revive a
+    // successor's half-open lease.
+    let destroyAttempt: ((error: Error) => void) | undefined;
+    const attemptController = new AbortController();
+    let heartbeatActive = true;
+    const stopHeartbeat = () => {
+      heartbeatActive = false;
+      clearInterval(heartbeatTimer);
+    };
+    const loseOwnership = (error: Error) => {
+      if (!heartbeatActive) return;
+      heartbeatActive = false;
+      attemptController.abort(error);
+      destroyAttempt?.(error);
+    };
+    const heartbeatTimer = setInterval(() => {
+      void heartbeatProviderAttempt({ attemptId, fencingToken, extensionMs: 15 * 60_000 })
+        .then((alive) => {
+          if (!alive) loseOwnership(new Error("provider attempt lease expired"));
+        })
+        .catch(() => loseOwnership(new Error("provider attempt heartbeat failed")));
+    }, 10_000);
+    heartbeatTimer.unref();
+
+    await recordProviderAttemptEvent({
+      userId: request.userId,
+      providerAccountId: target.providerAccountId,
+      providerModelId: target.providerModelId,
+      providerAttemptId,
+      requestId: request.requestId,
+      attemptId,
+      fencingToken,
+      eventType: "DISPATCH",
+      reason: request.reason,
+      ...providerEventRouting({ request, target, nativeSurface }),
+      reservationId: admission.reservationIds[0],
+      reservationIds: admission.reservationIds,
+      waitDurationMs: providerWaitDurationMs,
+      contextTokens: renderedLiability.tokens,
+      metadata: { healthClaim },
+    }).catch(() => undefined);
+
+    try {
+      // Establish a durable send-start boundary while holding the same
+      // account-then-credential locks used by lifecycle mutations. A revoke or
+      // replacement that commits before this transaction is rejected here; one
+      // that commits afterwards cannot retroactively cancel a send that has
+      // already been claimed. Never hold database locks across provider I/O.
+      const secret = await claimPublicProviderCredentialForSend({
+        userId: request.userId,
+        target,
+        keyring,
+      });
+      const response = await providerHttpsRequest(
+        target.baseUrl,
+        {
+          method: request.method ?? "POST",
+          path: joinProviderPath(target.baseUrl, upstream.path),
+          headers: Object.fromEntries(upstream.headers.entries()),
+          body: upstream.body,
+          signal: AbortSignal.any([
+            request.signal,
+            attemptController.signal,
+            AbortSignal.timeout(14 * 60_000),
+          ]),
+        },
+        {
+          egressEnabled: true,
+          allowPrivateNetworks: env.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS,
+          timeoutMs: 60_000,
+        },
+        upstream.protocol,
+        providerAuth(target, secret),
+      );
+      destroyAttempt = (error) => response.destroy(error);
+      const status = response.statusCode ?? 502;
+      // Retry only before exposing headers/body to the caller.
+      if (
+        request.retrySafe &&
+        (rankedIndex < ranked.targets.length - 1 || request.retrySingleTargetPrecommit === true) &&
+        (status === 408 || status === 409 || status === 429 || status >= 500)
+      ) {
+        // Failed/rate-limited calls may still be billed. Consume only a strict
+        // bounded body before retry, retaining raw usage/cost when present;
+        // ambiguous, truncated, or oversized bodies keep conservative liability.
+        const retryUsage = await readRetryableProviderUsage(response, pricing);
+        if (!response.complete) response.destroy();
+        // Heartbeat loss means a successor may already own health state. Do
+        // not let this orphan's retryable response mutate that state. The
+        // fenced release is deliberately attempted in either case: it clears
+        // only this exact half-open owner and is a no-op for READY attempts or
+        // a successor-owned probe.
+        if (!attemptController.signal.aborted) {
+          await recordProviderOutcome({
+            userId: request.userId,
+            providerAccountId: target.providerAccountId,
+            providerModelId: target.providerModelId,
+            success: false,
+            failureClass: classifyProviderFailure(status),
+            retryAfterMs: parseRetryAfter(response.headers["retry-after"]),
+            attemptId,
+            fencingToken,
+          }).catch(() => undefined);
+        } else {
+          await releaseProviderHealthTrial({
+            userId: request.userId,
+            providerAccountId: target.providerAccountId,
+            providerModelId: target.providerModelId,
+            attemptId,
+            fencingToken,
+          }).catch(() => false);
+        }
+        stopHeartbeat();
+        await reconcileProviderBudget({
+          userId: request.userId,
+          providerAccountId: target.providerAccountId,
+          providerModelId: target.providerModelId,
+          credentialId: target.credential.id,
+          poolId: request.poolId,
+          requestId: request.requestId,
+          attemptId,
+          fencingToken,
+          reason: "FAILED",
+          revisionSequence: 1n,
+          revisionKind: "SNAPSHOT",
+          observationComplete: response.complete,
+          usageSource: retryUsage ? `${upstream.protocol}-retryable-response` : undefined,
+          usage: retryUsage,
+        });
+        await recordProviderAttemptEvent({
+          userId: request.userId,
+          providerAccountId: target.providerAccountId,
+          providerModelId: target.providerModelId,
+          providerAttemptId,
+          requestId: request.requestId,
+          attemptId,
+          fencingToken,
+          eventType: "TERMINAL",
+          reason: classifyProviderFailure(status),
+          ...providerEventRouting({ request, target, nativeSurface }),
+          reservationId: admission.reservationIds[0],
+          reservationIds: admission.reservationIds,
+          waitDurationMs: providerWaitDurationMs,
+          terminalState: "FAILED",
+          contextTokens: renderedLiability.tokens,
+        }).catch(() => undefined);
+        continue;
+      }
+      const body = Readable.toWeb(response) as ReadableStream<Uint8Array>;
+      const reader = body.getReader();
+      let reconciliation: Promise<void> | undefined;
+      let responseBytes = 0;
+      let firstClientByteAt: Date | undefined;
+      let firstClientBytePersistence: Promise<void> | undefined;
+      const usageChunks: Uint8Array[] = [];
+      const initialUsageChunks: Uint8Array[] = [];
+      let initialUsageBytes = 0;
+      const nonstreamChunks: Uint8Array[] = [];
+      let nonstreamBytes = 0;
+      let nonstreamOverflow = false;
+      let usageBytes = 0;
+      let resolveTerminal!: (value: { ok: boolean; responseBytes: number }) => void;
+      const terminal = new Promise<{ ok: boolean; responseBytes: number }>((resolve) => {
+        resolveTerminal = resolve;
+      });
+      const httpOk = status >= 200 && status < 400;
+      let clientCancelled = false;
+      let protocolTerminal = false;
+      let protocolFailed = false;
+      let deliveredProtocolTerminal = false;
+      const terminalDecoder = request.stream ? new SseDecoder() : undefined;
+      const reconcile = (streamComplete: boolean): Promise<void> => {
+        if (reconciliation) return reconciliation;
+        reconciliation = (async () => {
+          stopHeartbeat();
+          const transportComplete = streamComplete && (response.complete || protocolTerminal);
+          const surface = nativeSurface ?? request.requestedSurface;
+          let nonstreamEnvelope: Record<string, unknown> | undefined;
+          if (!request.stream && !nonstreamOverflow) {
+            try {
+              const parsed = JSON.parse(
+                new TextDecoder().decode(
+                  Buffer.concat(nonstreamChunks.map((chunk) => Buffer.from(chunk))),
+                ),
+              );
+              if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+                nonstreamEnvelope = parsed as Record<string, unknown>;
+            } catch {
+              nonstreamEnvelope = undefined;
+            }
+          }
+          const streamTerminal = !request.stream || protocolTerminal;
+          const providerFailed =
+            protocolFailed ||
+            (!request.stream &&
+              (nonstreamEnvelope?.error != null ||
+                (surface === "anthropic-messages" && nonstreamEnvelope?.type === "error") ||
+                (surface === "openai-responses" &&
+                  ["failed", "cancelled", "incomplete"].includes(
+                    typeof nonstreamEnvelope?.status === "string" ? nonstreamEnvelope.status : "",
+                  ))));
+          const ok =
+            transportComplete &&
+            httpOk &&
+            streamTerminal &&
+            (request.stream || nonstreamEnvelope !== undefined) &&
+            !providerFailed &&
+            !clientCancelled;
+          const healthOutcome = providerHealthOutcome(status);
+          const attemptAborted =
+            request.signal.aborted || attemptController.signal.aborted || clientCancelled;
+          if (!attemptAborted && healthOutcome !== "NEUTRAL") {
+            await recordProviderHealth(
+              target,
+              request.userId,
+              ok && healthOutcome === "SUCCESS",
+              { status, retryAfter: response.headers["retry-after"] },
+              { attemptId, fencingToken },
+            ).catch(() => undefined);
+          }
+          if (attemptAborted || healthOutcome === "NEUTRAL") {
+            await releaseProviderHealthTrial({
+              userId: request.userId,
+              providerAccountId: target.providerAccountId,
+              providerModelId: target.providerModelId,
+              attemptId,
+              fencingToken,
+            }).catch(() => false);
+          }
+          const tailUsage = parseProviderUsage(
+            !request.stream && !nonstreamOverflow ? nonstreamChunks : usageChunks,
+            pricing,
+          );
+          const initialUsage =
+            responseBytes > 1024 * 1024
+              ? parseProviderUsage(initialUsageChunks, pricing)
+              : undefined;
+          const combinedUsage =
+            initialUsage && tailUsage
+              ? ({
+                  ...initialUsage,
+                  ...Object.fromEntries(
+                    Object.entries(tailUsage).filter(([, value]) => value !== undefined),
+                  ),
+                  inputTokens: tailUsage.inputTokens ?? initialUsage.inputTokens,
+                  outputTokens: tailUsage.outputTokens ?? initialUsage.outputTokens,
+                  categoriesComplete:
+                    initialUsage.categoriesComplete === false ||
+                    tailUsage.categoriesComplete === false
+                      ? false
+                      : surface === "anthropic-messages" &&
+                          (tailUsage.inputTokens ?? initialUsage.inputTokens) !== undefined &&
+                          (tailUsage.outputTokens ?? initialUsage.outputTokens) !== undefined
+                        ? true
+                        : (tailUsage.categoriesComplete ?? initialUsage.categoriesComplete),
+                  rawUsage: [initialUsage.rawUsage, tailUsage.rawUsage],
+                } as RawProviderUsage)
+              : (tailUsage ?? initialUsage);
+          const combinedCost =
+            combinedUsage && pricing ? calculatedCostForUsage(combinedUsage, pricing) : undefined;
+          const observedUsage: RawProviderUsage | undefined = combinedCost
+            ? ({
+                ...combinedUsage,
+                calculatedCost: combinedCost,
+                calculatedCostCurrency: pricing!.currency,
+                calculatedCostPricingVersion: pricing!.version,
+                calculatedCostSource: "wsmp-pricing",
+                calculatedCostConfidence:
+                  pricing!.confidence === "REPORTED" ? "CALCULATED" : pricing!.confidence,
+              } as RawProviderUsage)
+            : combinedUsage;
+          const observationComplete =
+            transportComplete &&
+            (request.stream
+              ? protocolTerminal && !protocolFailed
+              : nonstreamEnvelope !== undefined && !nonstreamOverflow);
+          const usage = observedUsage
+            ? {
+                ...observedUsage,
+                // Transport completion is independent from whether the provider
+                // exposes every token category. A complete cost-only observation
+                // may settle spend, while truncated observations remain audit-only.
+                observationComplete,
+              }
+            : undefined;
+          await reconcileProviderBudget({
+            userId: request.userId,
+            providerAccountId: target.providerAccountId,
+            providerModelId: target.providerModelId,
+            credentialId: target.credential.id,
+            poolId: request.poolId,
+            requestId: request.requestId,
+            attemptId,
+            fencingToken,
+            reason: clientCancelled ? "CANCELLED" : terminalReason(request.signal, ok),
+            revisionSequence: 1n,
+            revisionKind: "SNAPSHOT",
+            observationComplete,
+            usageSource: usage ? `${upstream.protocol}-response` : "missing-provider-usage",
+            usage,
+          });
+          const state =
+            request.signal.aborted || clientCancelled ? "CANCELLED" : ok ? "COMPLETED" : "FAILED";
+          // If client commitment already began, retain event creation order
+          // without ever making client delivery wait for telemetry persistence.
+          await firstClientBytePersistence;
+          await recordProviderAttemptEvent({
+            userId: request.userId,
+            providerAccountId: target.providerAccountId,
+            providerModelId: target.providerModelId,
+            providerAttemptId,
+            requestId: request.requestId,
+            attemptId,
+            fencingToken,
+            eventType: "TERMINAL",
+            reason: terminalReason(request.signal, ok),
+            ...providerEventRouting({ request, target, nativeSurface }),
+            reservationId: admission.reservationIds[0],
+            reservationIds: admission.reservationIds,
+            waitDurationMs: providerWaitDurationMs,
+            terminalState: state,
+            firstClientByteAt,
+            streamCommitted: firstClientByteAt !== undefined,
+            usage: usage
+              ? {
+                  inputTokens: usage.inputTokens?.toString() ?? null,
+                  outputTokens: usage.outputTokens?.toString() ?? null,
+                  cacheReadTokens: usage.cacheReadTokens?.toString() ?? null,
+                  cacheWriteTokens: usage.cacheWriteTokens?.toString() ?? null,
+                  reasoningTokens: usage.reasoningTokens?.toString() ?? null,
+                  toolTokens: usage.toolTokens?.toString() ?? null,
+                  categoriesComplete: usage.categoriesComplete ?? null,
+                  accountingVersion: usage.accountingVersion,
+                  confidence: usage.confidence,
+                }
+              : undefined,
+            metadata: { status, responseBytes, streamComplete: transportComplete },
+          }).catch(() => undefined);
+          resolveTerminal({ ok, responseBytes });
+        })();
+        return reconciliation;
+      };
+      const heldBody = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          if (deliveredProtocolTerminal) {
+            controller.close();
+            return;
+          }
+          let reachedEof = false;
+          try {
+            while (true) {
+              const chunk = await reader.read();
+              if (chunk.done) {
+                reachedEof = true;
+                if (terminalDecoder && !protocolTerminal) {
+                  const records = terminalDecoder.finish();
+                  for (const record of records) {
+                    const outcome = classifyTerminalRecord(
+                      record,
+                      nativeSurface ?? request.requestedSurface,
+                    );
+                    protocolTerminal ||= outcome !== undefined;
+                    protocolFailed ||= outcome === "FAILED";
+                  }
+                }
+                // Do not expose either a streaming terminal event or EOF until
+                // correctness-required settlement and health release are durable.
+                await reconcile(response.complete);
+                if (response.complete || !httpOk) {
+                  controller.close();
+                } else
+                  controller.error(
+                    new Error("Provider response ended before transport completion"),
+                  );
+                return;
+              }
+              responseBytes += chunk.value.byteLength;
+              if (!request.stream && !nonstreamOverflow) {
+                if (nonstreamBytes + chunk.value.byteLength <= 8 * 1024 * 1024) {
+                  nonstreamChunks.push(chunk.value);
+                  nonstreamBytes += chunk.value.byteLength;
+                } else {
+                  nonstreamOverflow = true;
+                  nonstreamChunks.length = 0;
+                }
+              }
+              if (initialUsageBytes < 64 * 1024) {
+                const prefix = chunk.value.subarray(0, 64 * 1024 - initialUsageBytes);
+                if (prefix.byteLength > 0) {
+                  initialUsageChunks.push(prefix);
+                  initialUsageBytes += prefix.byteLength;
+                }
+              }
+              // Retain the bounded tail, not merely the prefix. Streaming APIs
+              // report authoritative usage in terminal events, which may occur
+              // after arbitrarily large content deltas.
+              usageBytes = retainProviderUsageTail(usageChunks, usageBytes, chunk.value);
+              if (terminalDecoder) {
+                const records = terminalDecoder.push(chunk.value);
+                for (const record of records) {
+                  const outcome = classifyTerminalRecord(
+                    record,
+                    nativeSurface ?? request.requestedSurface,
+                  );
+                  protocolTerminal ||= outcome !== undefined;
+                  protocolFailed ||= outcome === "FAILED";
+                }
+              }
+              if (protocolTerminal) {
+                await reconcile(true);
+                deliveredProtocolTerminal = true;
+                controller.enqueue(chunk.value);
+                await reader.cancel().catch(() => undefined);
+                response.destroy();
+                return;
+              }
+              controller.enqueue(chunk.value);
+              return;
+            }
+          } catch (error) {
+            if (reachedEof && reconciliation) {
+              // A failed durable success terminal remains ACTIVE for retry or
+              // crash repair; never rewrite it as a transport failure.
+              resolveTerminal({ ok: false, responseBytes });
+            } else {
+              // A provider-side truncation is itself the terminal observation.
+              // Persist its conservative failure settlement before resolving
+              // the terminal promise, while preserving the stream error.
+              try {
+                await reconcile(false);
+              } catch (reconcileError) {
+                resolveTerminal({ ok: false, responseBytes });
+                controller.error(reconcileError);
+                return;
+              }
+            }
+            controller.error(error);
+          }
+        },
+        async cancel(reason) {
+          clientCancelled = true;
+          await reader.cancel(reason).catch(() => undefined);
+          response.destroy(reason instanceof Error ? reason : undefined);
+          await reconcile(false).catch(() => resolveTerminal({ ok: false, responseBytes }));
+        },
+      });
+      const bodyForbidden = status === 204 || status === 205 || status === 304;
+      if (bodyForbidden) {
+        await reader.cancel().catch(() => undefined);
+        response.destroy();
+        await reconcile(true);
+      }
+      const markFirstClientByte = async () => {
+        if (firstClientByteAt) return;
+        firstClientByteAt = new Date();
+        firstClientBytePersistence = Promise.allSettled([
+          prisma.relayRequest.updateMany({
+            where: { id: request.requestId, providerAttemptId: attemptId },
+            data: { streamCommitted: true },
+          }),
+          recordProviderAttemptEvent({
+            userId: request.userId,
+            providerAccountId: target.providerAccountId,
+            providerModelId: target.providerModelId,
+            providerAttemptId,
+            requestId: request.requestId,
+            attemptId,
+            fencingToken,
+            eventType: "FIRST_CLIENT_BYTE",
+            reason: "RESPONSE_COMMITTED",
+            ...providerEventRouting({ request, target, nativeSurface }),
+            reservationId: admission.reservationIds[0],
+            reservationIds: admission.reservationIds,
+            waitDurationMs: providerWaitDurationMs,
+            contextTokens: renderedLiability.tokens,
+            firstClientByteAt,
+            streamCommitted: true,
+          }),
+        ]).then(() => undefined);
+        await firstClientBytePersistence;
+      };
+      return {
+        dispatched: true,
+        target,
+        attemptId,
+        fencingToken,
+        nativeSurface,
+        attemptCount,
+        terminal: terminal.then(async (outcome) => {
+          if (outcome.ok && target.affinityTarget) {
+            try {
+              const parsed: unknown = JSON.parse(new TextDecoder().decode(request.body));
+              if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+                await rememberAffinity({
+                  ownerId: request.affinityTenantUserId ?? request.userId,
+                  resourceOwnerId: request.userId,
+                  poolId: request.poolId,
+                  securityScope: request.affinitySecurityScope ?? request.userId,
+                  accessGrantId: request.affinityAccessGrantId,
+                  policy: listed.affinityPolicy,
+                  surface: request.requestedSurface,
+                  payload: parsed as Record<string, unknown>,
+                  target: target.affinityTarget,
+                  estimatedTokens:
+                    request.estimatedInputTokens === undefined
+                      ? undefined
+                      : Number(
+                          request.estimatedInputTokens > BigInt(Number.MAX_SAFE_INTEGER)
+                            ? BigInt(Number.MAX_SAFE_INTEGER)
+                            : request.estimatedInputTokens,
+                        ),
+                });
+            } catch {
+              // Affinity is a best-effort routing hint and cannot change a terminal result.
+            }
+          }
+          return outcome;
+        }),
+        markFirstClientByte,
+        affinity: target.affinity,
+        response: new Response(bodyForbidden ? null : heldBody, {
+          status,
+          headers: providerResponseHeaders(
+            response.headers,
+            nativeSurface === request.requestedSurface &&
+              target.resolvedExecution?.mode !== "adapted",
+          ),
+        }),
+      };
+    } catch {
+      stopHeartbeat();
+      // A caller disappearing before provider response is not evidence that
+      // the provider transport is unhealthy. Keep the existing health state;
+      // cancellation still terminalizes and reconciles the durable attempt.
+      if (!request.signal.aborted && !attemptController.signal.aborted) {
+        await recordProviderOutcome({
+          userId: request.userId,
+          providerAccountId: target.providerAccountId,
+          providerModelId: target.providerModelId,
+          success: false,
+          failureClass: "TRANSPORT",
+          attemptId,
+          fencingToken,
+        }).catch(() => undefined);
+      }
+      if (request.signal.aborted || attemptController.signal.aborted) {
+        await releaseProviderHealthTrial({
+          userId: request.userId,
+          providerAccountId: target.providerAccountId,
+          providerModelId: target.providerModelId,
+          attemptId,
+          fencingToken,
+        }).catch(() => false);
+      }
+      await reconcileProviderBudget({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        credentialId: target.credential.id,
+        poolId: request.poolId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        reason: request.signal.aborted ? "CANCELLED" : "FAILED",
+        revisionSequence: 1n,
+        revisionKind: "SNAPSHOT",
+      }).catch(() => undefined);
+      await recordProviderAttemptEvent({
+        userId: request.userId,
+        providerAccountId: target.providerAccountId,
+        providerModelId: target.providerModelId,
+        providerAttemptId,
+        requestId: request.requestId,
+        attemptId,
+        fencingToken,
+        eventType: "TERMINAL",
+        reason: request.signal.aborted ? "CANCELLED" : "TRANSPORT",
+        ...providerEventRouting({ request, target, nativeSurface }),
+        reservationId: admission.reservationIds[0],
+        reservationIds: admission.reservationIds,
+        waitDurationMs: providerWaitDurationMs,
+        terminalState: request.signal.aborted ? "CANCELLED" : "FAILED",
+        contextTokens: renderedLiability.tokens,
+        streamCommitted: false,
+      }).catch(() => undefined);
+      if (!request.retrySafe) break;
+    }
+  }
+  return {
+    dispatched: false,
+    reason:
+      lastAdmission && !lastAdmission.admitted
+        ? lastAdmission.reason === "PROTECTION_POLICY_MISSING"
+          ? "PROTECTION_POLICY_MISSING"
+          : "BUDGET_EXCEEDED"
+        : "PROVIDER_UNAVAILABLE",
+  };
+}
+
+export function conservativeProviderLiability(input: {
+  estimatedInputTokens: bigint;
+  requestedOutputTokens: bigint;
+  estimatedSpend?: string;
+  currency?: string;
+  pricingVersion?: string;
+}): ProviderLiability {
+  return {
+    tokens: input.estimatedInputTokens + input.requestedOutputTokens,
+    spend: input.estimatedSpend,
+    currency: input.currency,
+    pricingVersion: input.pricingVersion,
+    accountingVersion: "provider-billable-v1",
+  };
+}
+
+function checkedContextTokens(inputTokens: bigint, outputTokens: bigint): bigint {
+  const total = inputTokens + outputTokens;
+  return total <= 9_223_372_036_854_775_807n ? total : 9_223_372_036_854_775_807n;
+}
+
+/**
+ * Fail-safe input estimate for public egress when the local tokenizer did not
+ * produce a count. UTF-8 bytes are used rather than JavaScript string length:
+ * one token per byte is intentionally pessimistic for known provider
+ * tokenizers, and the additional 10% plus fixed envelope covers provider-side
+ * chat templates and small serialization differences. Most importantly, an
+ * absent count can never become a zero-token budget reservation.
+ */
+export function conservativeSerializedInputTokens(serializedBytes: number): bigint {
+  if (!Number.isSafeInteger(serializedBytes) || serializedBytes < 0)
+    throw new TypeError("serializedBytes must be a non-negative safe integer");
+  const bytes = BigInt(serializedBytes);
+  return (bytes * 11n + 9n) / 10n + 64n;
+}
+
+export type { RawProviderUsage };

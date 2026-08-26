@@ -14,6 +14,8 @@ export const FORWARDER_HMAC_CONTEXTS = {
   cliToken: "ws-model-proxy:cli-token:v1",
   deviceCredential: "ws-model-proxy:device-credential:v1",
   responsesStickiness: "ws-model-proxy:responses-stickiness:v1",
+  responsesStickinessUpstreamId: "ws-model-proxy:responses-stickiness-upstream-id:v1",
+  cacheAffinity: "ws-model-proxy:cache-affinity:v1",
   mediaSignedUrl: "ws-model-proxy:media-signed-url:v1",
 } as const;
 

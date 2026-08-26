@@ -38,15 +38,33 @@ const mockedTokenAccess = tokenAccess as unknown as {
 };
 
 const db = prisma as unknown as {
+  $transaction: MockInstance;
+  $queryRaw: MockInstance;
   discoveredModel: {
+    findUnique: MockInstance;
+  };
+  executionTarget: {
     findUnique: MockInstance;
   };
   poolMember: {
     findMany: MockInstance;
   };
+  modelPool: {
+    findFirst: MockInstance;
+  };
   relayRequest: {
     create: MockInstance;
     update: MockInstance;
+    updateMany: MockInstance;
+  };
+  relayExecutionEvent: {
+    create: MockInstance;
+    createMany: MockInstance;
+  };
+  relayExecutionAttempt: {
+    create: MockInstance;
+    findFirst: MockInstance;
+    updateMany: MockInstance;
   };
 };
 
@@ -156,9 +174,17 @@ const poolTarget: VisibleModelPoolTarget = {
   description: null,
   ownerUserId: "user-id",
   ownerUserSlug: "owner",
+  accessGrantId: null,
   poolSlug: "general",
   maxAttachmentBytes: null,
   optimisticBasicTranscription: false,
+  protocolAdaptationEnabled: false,
+  publicEgressEnabled: false,
+  publicEgressAcknowledged: false,
+  effectiveProviderEgress: false,
+  providerPrimaryMemberCount: 0,
+  allowLossyDeveloperRoleCollapse: false,
+  recommendedSurfaceOverride: null,
 };
 
 const session = {
@@ -212,6 +238,108 @@ function directRow() {
   };
 }
 
+function poolMemberRow(native: "chat" | "responses" = "responses") {
+  return {
+    id: "member-id",
+    poolId: "pool-id",
+    discoveredModelId: "model-id",
+    weight: 1,
+    healthStatus: "HEALTHY",
+    routingStatus: "ACTIVE",
+    lastFailureClass: null,
+    consecutiveRetryableFailures: 0,
+    lastFailureAt: null,
+    nextRetryAt: null,
+    halfOpenTrialStartedAt: null,
+    capacityContextCeiling: null,
+    capacityContextMargin: 0,
+    capacityWaitBudgetMode: "INHERIT",
+    capacityWaitBudgetMs: null,
+    ModelPool: {
+      capacityWaitBudgetMs: 30_000,
+      affinityEnabled: false,
+      affinityTtlSeconds: 3600,
+      affinityMaxRecords: 10_000,
+      affinityPrefixWeight: 100,
+      affinityConversationWeight: 150,
+      affinityConfirmedCacheWeight: 250,
+      affinityLoadPenaltyWeight: 100,
+    },
+    ExecutionTarget: {
+      id: "member-target",
+      inferenceCapacityId: null,
+      InferenceCapacity: null,
+      DiscoveredModel: null,
+    },
+    DiscoveredModel: {
+      ...directRow(),
+      capabilityOverrideMode: "OVERRIDE",
+      capabilityOverrideMetadata: {
+        version: 1,
+        protocol: "openai-compatible",
+        chatCompletions: { supported: native === "chat", streaming: true },
+        responses: { supported: native === "responses", streaming: true },
+      },
+    },
+  };
+}
+
+function publicOverflowPoolRow() {
+  return {
+    publicEgressEnabled: true,
+    publicEgressAcknowledged: true,
+    PoolMembers: [
+      {
+        id: "provider-member-id",
+        publicOrder: 0,
+        ExecutionTarget: {
+          id: "provider-target-id",
+          ProviderModel: {
+            id: "provider-model-id",
+            userId: "user-id",
+            upstreamModelId: "provider-chat",
+            contextWindow: 128_000,
+            maxOutputTokens: 4_096,
+            nativeCapabilities: {
+              protocols: ["openai"],
+              surfaces: ["openai-chat"],
+              streaming: true,
+              features: [],
+            },
+            healthStatus: "HEALTHY",
+            healthNextRetryAt: null,
+            enabled: true,
+            deletedAt: null,
+            ProviderAccount: {
+              id: "provider-account-id",
+              userId: "user-id",
+              providerType: "openai",
+              providerVersion: null,
+              baseUrl: "https://provider.invalid",
+              authType: "BEARER",
+              healthStatus: "HEALTHY",
+              healthNextRetryAt: null,
+              enabled: true,
+              deletedAt: null,
+              CurrentCredential: {
+                id: "credential-id",
+                credentialType: "BEARER",
+                aadVersion: 1,
+                algorithm: "AES-256-GCM",
+                keyVersion: "v1",
+                ciphertext: new Uint8Array(),
+                nonce: new Uint8Array(),
+                authTag: new Uint8Array(),
+                status: "ACTIVE",
+              },
+            },
+          },
+        },
+      },
+    ],
+  };
+}
+
 function appWith(manager: FakeRelayManager, authSession: Session | null = session) {
   const app = new Hono<{ Variables: { session: Session | null } }>();
   app.use("*", async (c, next) => {
@@ -237,13 +365,24 @@ function requireSent(manager: FakeRelayManager): SendRelayRequestArgs {
 describe("chat test routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    db.$transaction.mockImplementation(async (input: unknown) => {
+      if (typeof input === "function") return input(db);
+      return Promise.all(input as Promise<unknown>[]);
+    });
+    db.$queryRaw.mockResolvedValue([{ now: new Date("2026-08-26T00:00:00.000Z") }]);
     mockedTokenAccess.listVisibleModelTargetsForUser.mockResolvedValue({
       directModels: [directTarget],
       modelPools: [poolTarget],
     });
     db.discoveredModel.findUnique.mockResolvedValue(directRow());
+    db.executionTarget.findUnique.mockResolvedValue({ id: "execution-target-id" });
     db.relayRequest.create.mockResolvedValue({ id: "relay-request-id" });
     db.relayRequest.update.mockResolvedValue({ id: "relay-request-id" });
+    db.relayRequest.updateMany.mockResolvedValue({ count: 1 });
+    db.relayExecutionEvent.create.mockResolvedValue({ id: "relay-event-id" });
+    db.relayExecutionEvent.createMany.mockResolvedValue({ count: 1 });
+    db.relayExecutionAttempt.create.mockResolvedValue({ attemptId: "attempt-id" });
+    db.relayExecutionAttempt.updateMany.mockResolvedValue({ count: 1 });
   });
 
   it("requires a cookie-authenticated session", async () => {
@@ -292,6 +431,79 @@ describe("chat test routes", () => {
         }),
       }),
     );
+  });
+
+  it("applies the selected Responses surface, native mode, and forced local member", async () => {
+    const manager = new FakeRelayManager();
+    mockedTokenAccess.listVisibleModelTargetsForUser.mockResolvedValue({
+      directModels: [directTarget],
+      modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+    });
+    db.poolMember.findMany.mockResolvedValue([poolMemberRow()]);
+    const responsePromise = appWith(manager).request("/responses", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-wsmp-chat-test-member-id": "member-id",
+        "x-wsmp-chat-test-routing-mode": "REQUIRE_NATIVE",
+      },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        input: "Reply with pong.",
+        stream: false,
+      }),
+    });
+
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    expect(sent.family).toBe("responses");
+    expect(sent.path).toBe("/v1/responses");
+    expect(sent.endpointSlug).toBe("local");
+    manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+    manager.body(sent.requestId, '{"id":"resp_1","output":[]}');
+    manager.complete(sent.requestId);
+    await expect(responsePromise).resolves.toMatchObject({ status: 200 });
+  });
+
+  it("keeps PREFERRED on the recommended native primary without unexpected public overflow", async () => {
+    const manager = new FakeRelayManager();
+    mockedTokenAccess.listVisibleModelTargetsForUser.mockResolvedValue({
+      directModels: [directTarget],
+      modelPools: [
+        {
+          ...poolTarget,
+          protocolAdaptationEnabled: true,
+          publicEgressEnabled: true,
+          publicEgressAcknowledged: true,
+          recommendedSurfaceOverride: "OPENAI_CHAT_COMPLETIONS",
+        },
+      ],
+    });
+    db.poolMember.findMany.mockResolvedValue([poolMemberRow("chat")]);
+    db.modelPool.findFirst.mockResolvedValue(publicOverflowPoolRow());
+    const responsePromise = appWith(manager).request("/chat/completions", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-wsmp-chat-test-routing-mode": "PREFER_NATIVE",
+      },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        messages: [{ role: "user", content: "Reply with pong." }],
+        stream: false,
+      }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    expect(sent.family).toBe("chat.completions");
+    expect(sent.cliDeviceId).toBe("cli-device-id");
+    // With durable global capacity disabled, Chat Test must not even discover
+    // provider candidates; the healthy local primary remains available.
+    expect(db.modelPool.findFirst).not.toHaveBeenCalled();
+    manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+    manager.body(sent.requestId, '{"choices":[{"message":{"role":"assistant","content":"pong"}}]}');
+    manager.complete(sent.requestId);
+    await expect(responsePromise).resolves.toMatchObject({ status: 200 });
   });
 
   it("cancels the websocket relay request when the browser stops reading", async () => {
@@ -355,12 +567,41 @@ describe("chat test routes", () => {
     await expect(response.text()).resolves.toBe(
       'data: {}\n\ndata: {"wsmp_metrics":{"completion_tokens":2,"tokenizer":"cl100k_base"}}\n\n',
     );
-    await vi.waitFor(() =>
+    await vi.waitFor(() => {
+      expect(db.relayExecutionAttempt.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            attemptId: sent.requestId,
+            state: "ACTIVE",
+          }),
+          data: expect.objectContaining({ state: "SUCCEEDED" }),
+        }),
+      );
+      expect(db.relayExecutionEvent.createMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: [
+            expect.objectContaining({
+              attemptId: sent.requestId,
+              eventType: "TERMINAL",
+              terminalState: "SUCCEEDED",
+              completionTokens: 3,
+              usageSource: "CLI_NORMALIZED",
+            }),
+          ],
+          skipDuplicates: true,
+        }),
+      );
       expect(db.relayRequest.update).toHaveBeenCalledWith(
         expect.objectContaining({
-          data: expect.objectContaining({ completionTokens: 3 }),
+          where: { id: "relay-request-id" },
+          data: expect.objectContaining({
+            status: "SUCCEEDED",
+            completionTokens: 3,
+            completedAt: new Date("2026-08-26T00:00:00.000Z"),
+          }),
+          select: { id: true },
         }),
-      ),
-    );
+      );
+    });
   });
 });

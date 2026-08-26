@@ -1,0 +1,92 @@
+{
+  "derivedOn": "2026-08-24",
+  "sources": {
+    "openai-chat": "https://platform.openai.com/docs/api-reference/chat/create",
+    "openai-responses": "https://platform.openai.com/docs/api-reference/responses/create",
+    "anthropic-messages": "https://docs.anthropic.com/en/api/messages"
+  },
+  "cases": [
+    {
+      "surface": "openai-chat",
+      "request": { "model": "gpt-fixture", "messages": [{ "role": "user", "content": "Hello" }] },
+      "response": {
+        "id": "chat_fixture",
+        "object": "chat.completion",
+        "model": "gpt-fixture",
+        "choices": [
+          {
+            "index": 0,
+            "message": { "role": "assistant", "content": "Hello" },
+            "finish_reason": "stop",
+            "logprobs": null
+          }
+        ],
+        "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+      },
+      "errorStatus": 429,
+      "error": {
+        "error": {
+          "message": "Rate limit reached",
+          "type": "rate_limit_error",
+          "param": null,
+          "code": "rate_limit_exceeded"
+        }
+      }
+    },
+    {
+      "surface": "openai-responses",
+      "request": { "model": "gpt-fixture", "input": "Hello", "store": false },
+      "response": {
+        "id": "resp_fixture",
+        "object": "response",
+        "status": "completed",
+        "model": "gpt-fixture",
+        "output": [
+          {
+            "id": "msg_fixture",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [
+              { "type": "output_text", "text": "Hello", "annotations": [], "logprobs": [] }
+            ]
+          }
+        ],
+        "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+      },
+      "errorStatus": 400,
+      "error": {
+        "error": {
+          "message": "Invalid input",
+          "type": "invalid_request_error",
+          "param": "input",
+          "code": "invalid_input"
+        }
+      }
+    },
+    {
+      "surface": "anthropic-messages",
+      "request": {
+        "model": "claude-fixture",
+        "max_tokens": 32,
+        "messages": [{ "role": "user", "content": "Hello" }]
+      },
+      "response": {
+        "id": "msg_fixture",
+        "type": "message",
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "Hello" }],
+        "model": "claude-fixture",
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": { "input_tokens": 1, "output_tokens": 1 }
+      },
+      "errorStatus": 429,
+      "error": {
+        "type": "error",
+        "error": { "type": "rate_limit_error", "message": "Rate limit reached" },
+        "request_id": "req_fixture"
+      }
+    }
+  ]
+}

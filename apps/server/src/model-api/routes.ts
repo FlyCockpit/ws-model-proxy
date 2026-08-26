@@ -23,8 +23,13 @@ import {
 } from "@ws-model-proxy/api/lib/model-pool-routing";
 import {
   normalizeTranscriptionCapabilities,
+  parseOpenAiCompatibleCapabilities,
   resolveEffectiveCapabilityMetadata,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import {
+  resolveExecutionPath,
+  type SurfaceRequestRequirements,
+} from "@ws-model-proxy/api/lib/surface-capabilities";
 import prisma from "@ws-model-proxy/db";
 import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
 import { env } from "@ws-model-proxy/env/server";
@@ -32,6 +37,37 @@ import { Hono } from "hono";
 import { getMediaConfig } from "../media/config.js";
 import { type OpenAiCompatibleCapabilities, type RelayFailure } from "../relay/protocol.js";
 import { type RelaySessionManager, relaySessionManager } from "../relay/session-manager.js";
+import {
+  type AnthropicIngress,
+  anthropicErrorResponse,
+  anthropicRelayHeaders,
+  parseAnthropicIngress,
+} from "./anthropic-protocol.js";
+import {
+  type AffinityDecision,
+  type AffinityPolicy,
+  buildAffinityTargetIdentity,
+  rankAffinityTargets,
+  rememberAffinity,
+} from "./cache-affinity.js";
+import {
+  type ContextCountTelemetry,
+  contextFitsLimits,
+  countSerializedRequestContext,
+} from "./capacity/context.js";
+import { contextCounterRegistry } from "./capacity/counter-registry.js";
+import { PostgresCapacityAdmissionStore } from "./capacity/postgres-store.js";
+import { releaseCapacityLeaseWithRetry } from "./capacity/response-lease.js";
+import {
+  type CapacityAdmissionRuntime,
+  StoreCapacityAdmissionRuntime,
+} from "./capacity/runtime.js";
+import type { CapacityLeaseHandle } from "./capacity/types.js";
+import {
+  allowsChatTestExecutionMode,
+  resolveChatTestRoutingMode,
+} from "./chat-test-routing-mode.js";
+import { responseWithFirstClientByte } from "./client-byte-commit.js";
 import {
   MODEL_API_MAX_REQUEST_BODY_BYTES,
   MODEL_API_RELAY_TIMEOUT_MS,
@@ -85,13 +121,50 @@ import {
   parseMultipartToSpool,
   type ReplayableMultipart,
 } from "./multipart-form-data.js";
+import { nativeRequestHeaders } from "./native-request-headers.js";
 import {
   openAiErrorBody,
   openAiFailureJsonResponse,
   relayFailureHttpStatus,
 } from "./openai-errors.js";
+import {
+  ADAPTER_VERSION,
+  AdapterError,
+  adaptNonstreamResponse,
+  CanonicalStreamRenderer,
+  createProtocolAdaptationTransform,
+  type ProtocolSurface,
+  parseCanonicalRequest,
+  renderCanonicalRequest,
+  renderProtocolError,
+  renderProtocolErrorMetadata,
+  safeProviderRateCount,
+  safeProviderRateReset,
+  safeProviderRequestId,
+  safeProviderRetryAfter,
+} from "./protocols/index.js";
+import {
+  buildProviderAffinityTargets,
+  conservativeProviderLiability,
+  conservativeSerializedInputTokens,
+  dispatchPublicOverflow,
+  listPublicOverflowTargets,
+  matchesChatTestProviderMode,
+  orderChatTestProviderTargets,
+  type PublicOverflowReason,
+  type PublicOverflowRequest,
+  type PublicProviderTarget,
+  publicTargetCompatibility,
+  resolvePublicProviderExecution,
+} from "./public-overflow.js";
 import { type RelayAttemptTerminal, startRelayAttempt } from "./relay-executor.js";
+import { shouldRetryRelayOperation } from "./relay-retry-policy.js";
+import {
+  LOCAL_RELAY_ATTEMPT_TTL_MS,
+  LOCAL_RELAY_PROCESS_EPOCH,
+} from "./relay-telemetry-recovery.js";
 import { type RelayBodySource } from "./request-body-source.js";
+import { profileSurfaceRequest } from "./request-feature-profiler.js";
 import {
   isBasicTranscriptionRequest,
   TranscriptionRequestError,
@@ -110,7 +183,24 @@ type ModelApiRouteDependencies = {
     | "completeRelayRequest"
   >;
   concurrencyLimiter?: ModelApiConcurrencyLimiter;
+  /** Test/deployment release gate; defaults to the validated env flag. */
+  anthropicEnabled?: boolean;
+  /** Independent release gate for opt-in pool protocol adaptation. */
+  protocolAdaptationEnabled?: boolean;
+  capacityEnabled?: boolean;
+  capacityRuntime?: CapacityAdmissionRuntime;
 };
+
+async function holdOrReleaseCapacityResponse(
+  runtime: CapacityAdmissionRuntime,
+  response: Response,
+  lease: CapacityLeaseHandle,
+  signal?: AbortSignal,
+): Promise<Response> {
+  if (response.body) return runtime.hold(response, lease, signal);
+  await releaseCapacityLeaseWithRetry({ store: runtime, lease });
+  return response;
+}
 
 type JsonObject = Record<string, unknown>;
 
@@ -119,6 +209,7 @@ type ModelApiEndpointFamily =
   | "completions"
   | "embeddings"
   | "responses"
+  | "messages"
   | "audio";
 
 type ModelApiCapability =
@@ -135,7 +226,9 @@ type ModelApiCapability =
   | "responses.cancel"
   | "responses.listInputItems"
   | "responses.countTokens"
-  | "responses.compact";
+  | "responses.compact"
+  | "messages.create"
+  | "messages.countTokens";
 
 type BuiltRelayRequest = {
   headers: Headers;
@@ -162,8 +255,68 @@ type RelayOperation = {
   appendTerminalUsage?: boolean;
   buildRequest: RelayRequestBuilder;
   responseStickiness?: ResponseStickinessCapture;
+  anthropicIngress?: AnthropicIngress;
   dispose?: () => Promise<void>;
+  contextCount?: ContextCountTelemetry;
+  contextInput?: JsonObject;
+  adaptation?: {
+    featureEnabled: boolean;
+    poolEnabled: boolean;
+    allowLossyDeveloperRoleCollapse: boolean;
+    requestedSurface: ProtocolSurface;
+    payload: JsonObject;
+  };
 };
+
+function operationFailureResponse(
+  operation: Pick<RelayOperation, "family">,
+  failure: RelayFailure,
+  message?: string,
+) {
+  if (operation.family !== "messages") return openAiFailureJsonResponse(failure, message);
+  const status = relayFailureHttpStatus(failure);
+  return anthropicErrorResponse(
+    status,
+    message ??
+      (failure === "request_too_large"
+        ? "Request body is too large."
+        : failure === "unsupported_capability"
+          ? "The requested Anthropic operation is not supported by this target."
+          : failure === "not_found"
+            ? "The requested model was not found."
+            : failure === "access_denied"
+              ? "Access denied."
+              : "The request could not be completed."),
+    status === 404
+      ? "not_found_error"
+      : status === 401 || status === 403
+        ? "authentication_error"
+        : status === 429
+          ? "rate_limit_error"
+          : failure === "request_too_large"
+            ? "request_too_large"
+            : status >= 500
+              ? "api_error"
+              : "invalid_request_error",
+  );
+}
+
+function contextExceededResponse(operation: Pick<RelayOperation, "family">, message: string) {
+  if (operation.family === "messages") {
+    return anthropicErrorResponse(400, message, "invalid_request_error");
+  }
+  return new Response(
+    JSON.stringify({
+      error: {
+        message,
+        type: "invalid_request_error",
+        param: null,
+        code: "context_exceeded",
+      },
+    }),
+    { status: 400, headers: { "content-type": "application/json; charset=utf-8" } },
+  );
+}
 
 function responseBodyForOperation({
   body,
@@ -224,6 +377,186 @@ function responseBodyForOperation({
   });
 }
 
+const NATIVE_CONTEXT_COUNT_MAX_BYTES = 64 * 1024;
+
+async function readBoundedJson(
+  stream: ReadableStream<Uint8Array>,
+  maximumBytes: number,
+): Promise<unknown> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    length += chunk.value.byteLength;
+    if (length > maximumBytes) {
+      await reader.cancel("native_count_response_too_large");
+      throw new Error("Native count response exceeds its size limit.");
+    }
+    chunks.push(chunk.value);
+  }
+  const body = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body));
+}
+
+async function nativeContextCount({
+  request,
+  selected,
+  operation,
+  manager,
+  relayRequestId,
+  requester,
+  pool,
+}: {
+  request: Request;
+  selected: DirectModelRelayRow;
+  operation: RelayOperation;
+  manager: NonNullable<ModelApiRouteDependencies["manager"]>;
+  relayRequestId: string;
+  requester: RelayRequester;
+  pool?: { id: string; memberId: string; tier: "PRIMARY" | "PUBLIC_OVERFLOW" };
+}): Promise<ContextCountTelemetry | null> {
+  if (!operation.contextInput) return null;
+  const capacity = selected.ExecutionTarget?.InferenceCapacity;
+  // Undefined is retained for compatibility with pre-capacity mocks/rows that
+  // behaved as native-first before countStrategy was projected here.
+  const countStrategy = capacity?.countStrategy ?? "ENGINE_REPORTED";
+  const registeredCounter = capacity
+    ? contextCounterRegistry.resolve({
+        runtimeIdentityKey: capacity.runtimeIdentityKey,
+        runtimeModel: capacity.runtimeModel,
+        runtimeRevision: capacity.runtimeRevision,
+        tokenizer: capacity.tokenizer,
+        tokenizerVersion: capacity.tokenizerVersion,
+        template: capacity.template,
+        templateVersion: capacity.templateVersion,
+      })
+    : null;
+  const countWithConfiguredCounter = async () => {
+    const useRegistry =
+      countStrategy === "TOKENIZER" ||
+      countStrategy === "TEMPLATE_AWARE" ||
+      countStrategy === "ENGINE_REPORTED";
+    return countSerializedRequestContext({
+      input: operation.contextInput,
+      counters: useRegistry && registeredCounter ? [registeredCounter] : [],
+      useTokenEstimate: true,
+      signal: request.signal,
+    });
+  };
+  if (
+    operation.capability === "responses.countTokens" ||
+    operation.capability === "messages.countTokens"
+  )
+    return null;
+  if (countStrategy !== "ENGINE_REPORTED") return countWithConfiguredCounter();
+  const countCapability =
+    operation.family === "responses"
+      ? ("responses.countTokens" as const)
+      : operation.family === "messages"
+        ? ("messages.countTokens" as const)
+        : null;
+  if (!countCapability) return countWithConfiguredCounter();
+  const countOperation: RelayOperation = {
+    family: operation.family,
+    method: "POST",
+    path:
+      operation.family === "responses" ? "/v1/responses/count_tokens" : "/v1/messages/count_tokens",
+    capability: countCapability,
+    stream: false,
+    buildRequest: operation.buildRequest,
+  };
+  if (
+    !supportsOperation({
+      capabilities: effectiveDirectCapabilities(selected),
+      operation: countOperation,
+    })
+  ) {
+    return countWithConfiguredCounter();
+  }
+  let built: BuiltRelayRequest | undefined;
+  let attempt: ReturnType<typeof startRelayAttempt> | undefined;
+  const localExecution: LocalExecutionTelemetry = {
+    attemptKind: "CONTEXT_COUNT",
+    selectedExecutionTargetId: selected.ExecutionTarget?.id,
+    selectedPoolMemberId: pool?.memberId,
+    selectedPoolMemberTier: pool?.tier,
+    nativeSurface: telemetrySurfaceForOperation(countOperation),
+    requestedSurface: telemetrySurfaceForOperation(countOperation),
+    adapterMode: "NATIVE",
+    localAttemptId: crypto.randomUUID(),
+    poolId: pool?.id,
+    contextCount: operation.contextCount,
+  };
+  try {
+    built = await operation.buildRequest(selected.upstreamModelId);
+    if (!(built.body instanceof Uint8Array)) return countWithConfiguredCounter();
+    await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
+    attempt = startRelayAttempt({
+      requestId: localExecution.localAttemptId,
+      manager,
+      cliDeviceId: selected.Endpoint.cliDeviceId,
+      endpointSlug: selected.Endpoint.slug,
+      family: operation.family,
+      method: "POST",
+      path: countOperation.path,
+      headers: built.headers,
+      body: built.body,
+      timeoutMs: 5_000,
+      abortSignal: request.signal,
+    });
+    const started = await attempt.started;
+    if (started.status < 200 || started.status >= 300) {
+      await started.body.cancel("native_count_status");
+      const terminal = await attempt.terminal;
+      await recordLocalTerminal(relayRequestId, requester.userId, localExecution, terminal);
+      return countWithConfiguredCounter();
+    }
+    const payload = await readBoundedJson(started.body, NATIVE_CONTEXT_COUNT_MAX_BYTES);
+    const terminal = await attempt.terminal;
+    if (!terminal.ok || !isJsonObject(payload)) {
+      await recordLocalTerminal(relayRequestId, requester.userId, localExecution, terminal);
+      return countWithConfiguredCounter();
+    }
+    const tokens = payload.input_tokens;
+    if (!Number.isSafeInteger(tokens) || (tokens as number) < 0) {
+      await recordLocalTerminal(relayRequestId, requester.userId, localExecution, terminal);
+      return countWithConfiguredCounter();
+    }
+    const exactCount = {
+      tokens: tokens as number,
+      method: "NATIVE" as const,
+      exact: true as const,
+      confidence: "EXACT" as const,
+      safetyMargin: 1,
+      serializedChars: JSON.stringify(operation.contextInput).length,
+    };
+    await recordLocalTerminal(
+      relayRequestId,
+      requester.userId,
+      { ...localExecution, contextCount: exactCount },
+      terminal,
+    );
+    return exactCount;
+  } catch {
+    attempt?.cancel(request.signal.aborted ? "cancelled" : "protocol_error");
+    if (attempt) {
+      const terminal = await attempt.terminal.catch(() => rejectedRelayTerminal());
+      await recordLocalTerminal(relayRequestId, requester.userId, localExecution, terminal).catch(
+        metadataUpdateError,
+      );
+    }
+    if (request.signal.aborted) throw request.signal.reason;
+    return countWithConfiguredCounter();
+  }
+}
+
 type PreparedModeledRequest = {
   model: string;
   payload: JsonObject | null;
@@ -241,11 +574,29 @@ type ResponseStickinessCapture = {
 };
 
 type ResponseStickinessRecordRow = {
+  routingVersion?: number;
   userId: string;
   modelApiTokenId: string | null;
   targetDiscoveredModelId: string | null;
   targetModelPoolId: string | null;
   selectedDiscoveredModelId: string | null;
+  TargetExecutionTarget: { discoveredModelId: string | null } | null;
+  SelectedExecutionTarget: { discoveredModelId: string | null } | null;
+  selectedExecutionTargetId?: string | null;
+  providerAccountId?: string | null;
+  providerModelId?: string | null;
+  providerEndpointIdentity?: string | null;
+  providerEndpointVersion?: number | null;
+  providerUpstreamModelId?: string | null;
+  nativeSurface?: string | null;
+  upstreamResponseIdDigest?: string | null;
+  poolGrantId?: string | null;
+  PoolGrant?: {
+    id: string;
+    poolId: string;
+    ownerUserId: string;
+    granteeUserId: string;
+  } | null;
   expiresAt: Date | null;
 };
 
@@ -259,6 +610,18 @@ type StickyRoute =
       target: "MODEL_POOL";
       visibleTarget: VisibleModelPoolTarget;
       selectedDiscoveredModelId: string;
+    }
+  | {
+      target: "PROVIDER";
+      visibleTarget: VisibleModelPoolTarget;
+      binding: {
+        executionTargetId: string;
+        providerAccountId: string;
+        providerModelId: string;
+        endpointIdentity: string;
+        endpointVersion: number;
+        upstreamModelId: string;
+      };
     };
 
 type DirectModelRelayRow = {
@@ -269,6 +632,28 @@ type DirectModelRelayRow = {
   capabilityOverrideMode: string;
   capabilityOverrideMetadata: unknown | null;
   optimisticBasicTranscription: boolean;
+  ExecutionTarget: {
+    id: string;
+    inferenceCapacityId: string | null;
+    directContextCeiling?: number | null;
+    directContextMargin?: number;
+    directWaitBudgetMs?: number | null;
+    InferenceCapacity?: {
+      id: string;
+      hardConcurrencyLimit: number | null;
+      physicalMaxContext: number | null;
+      countStrategy: "TOKENIZER" | "TEMPLATE_AWARE" | "ENGINE_REPORTED" | "CONSERVATIVE_ESTIMATE";
+      runtimeIdentityKey: string;
+      runtimeModel: string;
+      runtimeRevision: string | null;
+      tokenizer: string | null;
+      tokenizerVersion: string | null;
+      template: string | null;
+      templateVersion: string | null;
+      engine: string | null;
+      cacheNamespace: string | null;
+    } | null;
+  } | null;
   Endpoint: {
     id: string;
     slug: string;
@@ -281,6 +666,51 @@ type DirectModelRelayRow = {
 };
 
 type PoolMemberRelayRow = PoolMemberRouteRow & {
+  ExecutionTarget: {
+    id: string;
+    inferenceCapacityId: string | null;
+    InferenceCapacity?: {
+      id: string;
+      hardConcurrencyLimit: number | null;
+      physicalMaxContext: number | null;
+      countStrategy: "TOKENIZER" | "TEMPLATE_AWARE" | "ENGINE_REPORTED" | "CONSERVATIVE_ESTIMATE";
+      runtimeIdentityKey: string;
+      runtimeModel: string;
+      runtimeRevision: string | null;
+      tokenizer: string | null;
+      tokenizerVersion: string | null;
+      template: string | null;
+      templateVersion: string | null;
+      engine: string | null;
+      cacheNamespace: string | null;
+    } | null;
+    DiscoveredModel: PoolMemberRouteRow["DiscoveredModel"] & {
+      id: string;
+      userId: string;
+      capabilityOverrideMode: string;
+      capabilityOverrideMetadata: unknown | null;
+      Endpoint: PoolMemberRouteRow["DiscoveredModel"]["Endpoint"] & {
+        capabilityMetadata: unknown | null;
+      };
+    };
+  } | null;
+  capacityContextCeiling?: number | null;
+  capacityContextCeilingMode?: "INHERIT" | "LIMITED" | "UNLIMITED";
+  capacityContextMargin?: number | null;
+  capacityWaitBudgetMs?: number | null;
+  capacityWaitBudgetMode?: "INHERIT" | "LIMITED" | "UNLIMITED";
+  ModelPool?: {
+    capacityContextCeiling: number | null;
+    capacityContextMargin: number;
+    capacityWaitBudgetMs: number | null;
+    affinityEnabled: boolean;
+    affinityTtlSeconds: number;
+    affinityMaxRecords: number;
+    affinityPrefixWeight: number;
+    affinityConversationWeight: number;
+    affinityConfirmedCacheWeight: number;
+    affinityLoadPenaltyWeight: number;
+  };
   DiscoveredModel: PoolMemberRouteRow["DiscoveredModel"] & {
     id: string;
     userId: string;
@@ -303,6 +733,8 @@ type RelayMetadataCreate = {
   transformerErrorClass?: string | null;
   operation?: ModelApiCapability;
   requestBytes?: number | null;
+  contextCount?: ContextCountTelemetry;
+  requestedSurface: string;
 };
 
 type RelayMetadataUpdate = {
@@ -315,6 +747,19 @@ type RelayMetadataUpdate = {
   transformerCacheHit?: boolean | null;
   transformerErrorClass?: string | null;
   attemptCount?: number;
+  affinity?: { outcome: string; score: number; prefixDepth: number; reason: string };
+  execution?: {
+    selectedExecutionTargetId?: string;
+    selectedPoolMemberId?: string;
+    selectedPoolMemberTier?: "PRIMARY" | "PUBLIC_OVERFLOW";
+    nativeSurface: string;
+    adapterMode: "NATIVE" | "ADAPTED";
+    adapterVersion?: string;
+    localAttemptId: string;
+  };
+  localExecution?: LocalExecutionTelemetry;
+  userId?: string;
+  localTerminal?: RelayAttemptTerminal;
 };
 
 type RelayRequester = {
@@ -324,6 +769,109 @@ type RelayRequester = {
   modelApiTokenLookupPrefix: string | null;
   exposeTransformDebug?: boolean;
 };
+
+function boundedAdmissionDeadline(
+  nowMs: number,
+  requestDeadlineMs: number,
+  waitBudgetMs: number | null,
+) {
+  return new Date(
+    Math.min(requestDeadlineMs, waitBudgetMs === null ? requestDeadlineMs : nowMs + waitBudgetMs),
+  );
+}
+
+function effectiveMemberWaitBudget(member: PoolMemberRelayRow): number | null {
+  if (member.capacityWaitBudgetMode === "UNLIMITED") return null;
+  if (
+    member.capacityWaitBudgetMode === "LIMITED" ||
+    (member.capacityWaitBudgetMode === undefined && member.capacityWaitBudgetMs != null)
+  )
+    return member.capacityWaitBudgetMs ?? 0;
+  return member.ModelPool?.capacityWaitBudgetMs ?? null;
+}
+
+function poolAdmissionCandidate(
+  member: PoolMemberRelayRow,
+  candidateOrder: number,
+  nowMs: number,
+  requestDeadlineMs: number,
+) {
+  const identity = member.ExecutionTarget;
+  if (!identity?.inferenceCapacityId) return null;
+  return {
+    capacityId: identity.inferenceCapacityId,
+    executionTargetId: identity.id,
+    poolMemberId: member.id,
+    candidateOrder,
+    deadlineAt: boundedAdmissionDeadline(
+      nowMs,
+      requestDeadlineMs,
+      effectiveMemberWaitBudget(member),
+    ),
+  };
+}
+
+function affinityPolicyForMember(member: PoolMemberRelayRow): AffinityPolicy {
+  const pool = member.ModelPool;
+  return {
+    enabled: pool?.affinityEnabled ?? false,
+    ttlSeconds: pool?.affinityTtlSeconds ?? 3600,
+    maxRecords: pool?.affinityMaxRecords ?? 10_000,
+    prefixWeight: pool?.affinityPrefixWeight ?? 100,
+    conversationWeight: pool?.affinityConversationWeight ?? 150,
+    confirmedCacheWeight: pool?.affinityConfirmedCacheWeight ?? 250,
+    loadPenaltyWeight: pool?.affinityLoadPenaltyWeight ?? 100,
+  };
+}
+
+function affinityTargetForMember(
+  member: PoolMemberRelayRow,
+  requestedSurface: ProtocolSurface,
+  execution: { mode: string; nativeSurface?: string } | null | undefined,
+  effectiveHealthStatus = member.healthStatus,
+) {
+  const target = member.ExecutionTarget;
+  const capacity = target?.InferenceCapacity;
+  if (!target || !capacity) return null;
+  // Target and endpoint IDs are immutable. The runtime identity includes the
+  // model/revision/tokenizer/template/engine/cache namespace tuple.
+  const targetIdentity = buildAffinityTargetIdentity({
+    executionTargetId: target.id,
+    endpointIdentity: member.DiscoveredModel.Endpoint.id,
+    upstreamModelId: member.DiscoveredModel.upstreamModelId,
+    runtimeIdentityKey: capacity.runtimeIdentityKey,
+    runtimeModel: capacity.runtimeModel,
+    runtimeRevision: capacity.runtimeRevision,
+    tokenizer: capacity.tokenizer,
+    tokenizerVersion: capacity.tokenizerVersion,
+    template: capacity.template,
+    templateVersion: capacity.templateVersion,
+    engine: capacity.engine,
+    cacheNamespace: capacity.cacheNamespace,
+    requestedSurface,
+    nativeSurface: execution?.nativeSurface ?? requestedSurface,
+    mode: execution?.mode ?? "legacy-native",
+    adapterVersion: execution?.mode === "adapted" ? ADAPTER_VERSION : "native",
+  });
+  const healthPenalty =
+    effectiveHealthStatus === "HALF_OPEN"
+      ? 200
+      : effectiveHealthStatus === "DEGRADED"
+        ? 100
+        : effectiveHealthStatus === "UNKNOWN"
+          ? 25
+          : 0;
+  return {
+    poolMemberId: member.id,
+    executionTargetId: target.id,
+    targetIdentity,
+    capacityId: capacity.id,
+    hardConcurrencyLimit: capacity.hardConcurrencyLimit,
+    healthPenalty,
+    publicEgressPenalty: 0,
+    costPenalty: 0,
+  };
+}
 
 const poolRelayFailureClassSet: ReadonlySet<string> = new Set(relayFailureClasses);
 const RESPONSES_STICKINESS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -522,18 +1070,7 @@ async function transcriptionUploadLimitResponse({
 }
 
 function relayRequestHeaders(request: Request): Headers {
-  const headers = new Headers(request.headers);
-  headers.delete("authorization");
-  headers.delete("cookie");
-  headers.delete("content-length");
-  headers.delete("host");
-  headers.delete("origin");
-  headers.delete("referer");
-  headers.delete("x-csrf-token");
-  if (!headers.has("content-type")) {
-    headers.set("content-type", "application/json");
-  }
-  return headers;
+  return nativeRequestHeaders(request, "openai");
 }
 
 /** Nested transform prepass must not reuse client Idempotency-Key. */
@@ -589,22 +1126,32 @@ function supportsCapability({
   capability,
   stream,
   transcriptionProfile,
+  anthropicIngress,
 }: {
   capabilities: OpenAiCompatibleCapabilities | null;
   capability: ModelApiCapability;
   stream: boolean;
   transcriptionProfile?: TranscriptionRequestProfile;
+  anthropicIngress?: AnthropicIngress;
 }): boolean {
   if (capability === "chat.completions") {
-    if (capabilities?.chatCompletions?.supported !== true) return false;
-    if (stream && capabilities.chatCompletions.streaming === false) return false;
-    return true;
+    return (
+      resolveExecutionPath({
+        capabilities,
+        requestedSurface: "OPENAI_CHAT_COMPLETIONS",
+        request: { stream },
+      }).mode === "native"
+    );
   }
 
   if (capability === "completions") {
-    if (capabilities?.completions?.supported !== true) return false;
-    if (stream && capabilities.completions.streaming === false) return false;
-    return true;
+    return (
+      resolveExecutionPath({
+        capabilities,
+        requestedSurface: "OPENAI_COMPLETIONS",
+        request: { stream },
+      }).mode === "native"
+    );
   }
 
   if (capability === "embeddings") {
@@ -630,35 +1177,110 @@ function supportsCapability({
   }
 
   if (capability === "responses.create") {
-    if (capabilities?.responses?.supported !== true) return false;
-    if (stream && capabilities.responses.streaming === false) return false;
-    return true;
+    return (
+      resolveExecutionPath({
+        capabilities,
+        requestedSurface: "OPENAI_RESPONSES",
+        request: { stream, responsesOperation: "create" },
+      }).mode === "native"
+    );
+  }
+
+  if (capability === "messages.create" || capability === "messages.countTokens") {
+    if (capabilities?.version !== 3 && capabilities?.version !== 4) return false;
+    const result = resolveExecutionPath({
+      capabilities,
+      requestedSurface: "ANTHROPIC_MESSAGES",
+      request: {
+        stream,
+        countTokens: capability === "messages.countTokens",
+        protocolVersion: anthropicIngress?.version,
+        betaFeatures: anthropicIngress?.betaFeatures,
+      },
+    });
+    return result.mode === "native";
   }
 
   if (capability === "responses.statefulFollowUps") {
+    if (capabilities?.version === 3 || capabilities?.version === 4)
+      return (
+        resolveExecutionPath({
+          capabilities,
+          requestedSurface: "OPENAI_RESPONSES",
+          request: { stateful: true, responsesOperation: "statefulFollowUps" },
+        }).mode === "native"
+      );
     return capabilities?.responses?.statefulFollowUps === true;
   }
 
   if (capability === "responses.retrieve") {
+    if (capabilities?.version === 3 || capabilities?.version === 4)
+      return (
+        resolveExecutionPath({
+          capabilities,
+          requestedSurface: "OPENAI_RESPONSES",
+          request: { stateful: true, responsesOperation: "retrieve" },
+        }).mode === "native"
+      );
     return capabilities?.responses?.retrieve === true;
   }
 
   if (capability === "responses.delete") {
+    if (capabilities?.version === 3 || capabilities?.version === 4)
+      return (
+        resolveExecutionPath({
+          capabilities,
+          requestedSurface: "OPENAI_RESPONSES",
+          request: { stateful: true, responsesOperation: "delete" },
+        }).mode === "native"
+      );
     return capabilities?.responses?.delete === true;
   }
 
   if (capability === "responses.cancel") {
+    if (capabilities?.version === 3 || capabilities?.version === 4)
+      return (
+        resolveExecutionPath({
+          capabilities,
+          requestedSurface: "OPENAI_RESPONSES",
+          request: { stateful: true, responsesOperation: "cancel" },
+        }).mode === "native"
+      );
     return capabilities?.responses?.cancel === true;
   }
 
   if (capability === "responses.listInputItems") {
+    if (capabilities?.version === 3 || capabilities?.version === 4)
+      return (
+        resolveExecutionPath({
+          capabilities,
+          requestedSurface: "OPENAI_RESPONSES",
+          request: { stateful: true, responsesOperation: "listInputItems" },
+        }).mode === "native"
+      );
     return capabilities?.responses?.listInputItems === true;
   }
 
   if (capability === "responses.countTokens") {
+    if (capabilities?.version === 3 || capabilities?.version === 4)
+      return (
+        resolveExecutionPath({
+          capabilities,
+          requestedSurface: "OPENAI_RESPONSES",
+          request: { countTokens: true, responsesOperation: "countTokens" },
+        }).mode === "native"
+      );
     return capabilities?.responses?.countTokens === true;
   }
 
+  if (capabilities?.version === 3 || capabilities?.version === 4)
+    return (
+      resolveExecutionPath({
+        capabilities,
+        requestedSurface: "OPENAI_RESPONSES",
+        request: { responsesOperation: "compact" },
+      }).mode === "native"
+    );
   return capabilities?.responses?.compact === true;
 }
 
@@ -669,7 +1291,7 @@ function supportsOperation({
   capabilities: OpenAiCompatibleCapabilities | null;
   operation: Pick<
     RelayOperation,
-    "capability" | "additionalCapabilities" | "stream" | "transcriptionProfile"
+    "capability" | "additionalCapabilities" | "stream" | "transcriptionProfile" | "anthropicIngress"
   >;
 }): boolean {
   if (
@@ -678,6 +1300,7 @@ function supportsOperation({
       capability: operation.capability,
       stream: operation.stream,
       transcriptionProfile: operation.transcriptionProfile,
+      anthropicIngress: operation.anthropicIngress,
     })
   ) {
     return false;
@@ -691,6 +1314,394 @@ function supportsOperation({
       transcriptionProfile: operation.transcriptionProfile,
     }),
   );
+}
+
+function requestedSurfaceForOperation(operation: RelayOperation): ProtocolSurface | null {
+  if (operation.family === "chat.completions") return "openai-chat";
+  if (operation.family === "responses") return "openai-responses";
+  if (operation.family === "messages" && operation.capability === "messages.create")
+    return "anthropic-messages";
+  return null;
+}
+
+function telemetrySurfaceForOperation(operation: RelayOperation): string {
+  if (operation.family === "chat.completions") return "OPENAI_CHAT_COMPLETIONS";
+  if (operation.family === "completions") return "OPENAI_COMPLETIONS";
+  if (operation.family === "embeddings") return "OPENAI_EMBEDDINGS";
+  if (operation.family === "responses") return "OPENAI_RESPONSES";
+  if (operation.family === "messages") return "ANTHROPIC_MESSAGES";
+  return "OPENAI_AUDIO";
+}
+
+function modelApiSurface(surface: ProtocolSurface) {
+  return surface === "openai-chat"
+    ? ("OPENAI_CHAT_COMPLETIONS" as const)
+    : surface === "openai-responses"
+      ? ("OPENAI_RESPONSES" as const)
+      : ("ANTHROPIC_MESSAGES" as const);
+}
+
+function protocolSurface(surface: string): ProtocolSurface | null {
+  if (surface === "OPENAI_CHAT_COMPLETIONS") return "openai-chat";
+  if (surface === "OPENAI_RESPONSES") return "openai-responses";
+  if (surface === "ANTHROPIC_MESSAGES") return "anthropic-messages";
+  return null;
+}
+
+function nativeRouteForSurface(surface: ProtocolSurface) {
+  if (surface === "openai-chat")
+    return { family: "chat.completions" as const, path: "/v1/chat/completions" };
+  if (surface === "openai-responses")
+    return { family: "responses" as const, path: "/v1/responses" };
+  return { family: "messages" as const, path: "/v1/messages" };
+}
+
+function adaptedResponseBody({
+  body,
+  source,
+  target,
+  stream,
+  status,
+  headers,
+  signal,
+  onProtocolError,
+}: {
+  body: ReadableStream<Uint8Array>;
+  source: ProtocolSurface;
+  target: ProtocolSurface;
+  stream: boolean;
+  status: number;
+  headers: Headers;
+  signal: AbortSignal;
+  onProtocolError?: (error: unknown) => void;
+}): ReadableStream<Uint8Array> {
+  if (stream)
+    return body.pipeThrough(
+      createProtocolAdaptationTransform({
+        source,
+        target,
+        signal,
+        recoverProtocolErrors: onProtocolError !== undefined,
+        onProtocolError,
+      }),
+      { signal },
+    );
+  const reader = body.getReader();
+  return new ReadableStream({
+    async start(controller) {
+      try {
+        const chunks: Uint8Array[] = [];
+        let bytes = 0;
+        while (true) {
+          const result = await reader.read();
+          if (result.done) break;
+          bytes += result.value.byteLength;
+          if (bytes > MODEL_API_MAX_REQUEST_BODY_BYTES)
+            throw new Error("adapted response exceeded bounded buffer");
+          chunks.push(result.value);
+        }
+        const merged = new Uint8Array(bytes);
+        let offset = 0;
+        for (const chunk of chunks) {
+          merged.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        const parsed = JSON.parse(new TextDecoder().decode(merged)) as unknown;
+        const adapted = adaptNonstreamResponse({ source, target, body: parsed, status, headers });
+        const output = adapted.ok ? adapted.body : renderProtocolError(target, adapted.error);
+        controller.enqueue(new TextEncoder().encode(JSON.stringify(output)));
+        controller.close();
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+}
+
+async function readAdaptedNonstreamBody({
+  body,
+  source,
+  target,
+  status,
+  headers,
+  signal,
+}: {
+  body: ReadableStream<Uint8Array> | null;
+  source: ProtocolSurface;
+  target: ProtocolSurface;
+  status: number;
+  headers: Headers;
+  signal: AbortSignal;
+}): Promise<Uint8Array> {
+  if (!body) {
+    const adapted = adaptNonstreamResponse({ source, target, body: null, status, headers });
+    const output = adapted.ok ? adapted.body : renderProtocolError(target, adapted.error);
+    return new TextEncoder().encode(JSON.stringify(output));
+  }
+  const reader = body.getReader();
+  const abort = () => void reader.cancel(signal.reason);
+  signal.addEventListener("abort", abort, { once: true });
+  try {
+    const chunks: Uint8Array[] = [];
+    let bytes = 0;
+    let discardedOversizedError = false;
+    while (true) {
+      if (signal.aborted) throw signal.reason;
+      const result = await reader.read();
+      if (result.done) break;
+      bytes += result.value.byteLength;
+      if (bytes > MODEL_API_MAX_REQUEST_BODY_BYTES) {
+        if (status >= 200 && status < 300)
+          throw new Error("adapted response exceeded bounded buffer");
+        discardedOversizedError = true;
+        chunks.length = 0;
+        await reader.cancel("oversized provider error discarded");
+        break;
+      }
+      chunks.push(result.value);
+    }
+    const merged = new Uint8Array(discardedOversizedError ? 0 : bytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    const text = new TextDecoder().decode(merged).trim();
+    let parsed: unknown = null;
+    if (text) {
+      try {
+        parsed = JSON.parse(text) as unknown;
+      } catch {
+        // Non-success provider bodies are never reflected. Malformed JSON is
+        // equivalent to an absent body at this trust boundary.
+      }
+    }
+    const adapted = adaptNonstreamResponse({ source, target, body: parsed, status, headers });
+    const output = adapted.ok ? adapted.body : renderProtocolError(target, adapted.error);
+    return new TextEncoder().encode(JSON.stringify(output));
+  } finally {
+    signal.removeEventListener("abort", abort);
+    reader.releaseLock();
+  }
+}
+
+function adaptedProviderResponseHeaders(
+  source: ProtocolSurface,
+  target: ProtocolSurface,
+  sourceHeaders: Headers,
+  adapted = true,
+): Headers {
+  const headers = new Headers({ "content-type": "application/json; charset=utf-8" });
+  if (adapted) headers.set("x-wsmp-adapter-version", "1.0.0");
+  const validatedRetryAfter = safeProviderRetryAfter(sourceHeaders.get("retry-after"));
+  if (validatedRetryAfter) headers.set("retry-after", validatedRetryAfter);
+  const requestId = safeProviderRequestId(
+    source === "anthropic-messages"
+      ? sourceHeaders.get("request-id")
+      : sourceHeaders.get("x-request-id"),
+  );
+  if (requestId)
+    headers.set(target === "anthropic-messages" ? "request-id" : "x-request-id", requestId);
+  const rateHeaderPairs = [
+    ["x-ratelimit-limit-requests", "anthropic-ratelimit-requests-limit", "count"],
+    ["x-ratelimit-remaining-requests", "anthropic-ratelimit-requests-remaining", "count"],
+    ["x-ratelimit-reset-requests", "anthropic-ratelimit-requests-reset", "reset"],
+    ["x-ratelimit-limit-tokens", "anthropic-ratelimit-tokens-limit", "count"],
+    ["x-ratelimit-remaining-tokens", "anthropic-ratelimit-tokens-remaining", "count"],
+    ["x-ratelimit-reset-tokens", "anthropic-ratelimit-tokens-reset", "reset"],
+  ] as const;
+  for (const [openAiName, anthropicName, kind] of rateHeaderPairs) {
+    const sourceName = source === "anthropic-messages" ? anthropicName : openAiName;
+    const raw = sourceHeaders.get(sourceName);
+    const limitName = sourceName.replace("remaining", "limit");
+    const value =
+      kind === "count"
+        ? safeProviderBoundedRemaining(
+            raw,
+            sourceName.includes("remaining"),
+            sourceHeaders.get(limitName),
+          )
+        : source === target
+          ? safeProviderRateReset(raw, source === "anthropic-messages")
+          : undefined;
+    if (value) headers.set(target === "anthropic-messages" ? anthropicName : openAiName, value);
+  }
+  return headers;
+}
+
+function safeProviderBoundedRemaining(
+  raw: string | null,
+  isRemaining: boolean,
+  rawLimit: string | null,
+): string | undefined {
+  const value = safeProviderRateCount(raw);
+  if (!value || !isRemaining) return value;
+  const limit = safeProviderRateCount(rawLimit);
+  return !limit || BigInt(value) <= BigInt(limit) ? value : undefined;
+}
+
+async function primeReadableStream(
+  stream: ReadableStream<Uint8Array>,
+  target: ProtocolSurface,
+): Promise<{
+  body: ReadableStream<Uint8Array>;
+  completion: Promise<"ok" | "protocol_error" | "cancelled">;
+}> {
+  const reader = stream.getReader();
+  const first = await reader.read();
+  let pending = first.done ? null : first.value;
+  let terminalObserved = pending ? targetStreamTerminal(target, pending) : false;
+  let nextResponsesSequence = pending ? responseSequenceAfter(pending) : 0;
+  let resolveCompletion: (result: "ok" | "protocol_error" | "cancelled") => void = () => undefined;
+  const completion = new Promise<"ok" | "protocol_error" | "cancelled">((resolve) => {
+    resolveCompletion = resolve;
+  });
+  if (first.done) resolveCompletion("ok");
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        if (pending) {
+          controller.enqueue(pending);
+          pending = null;
+          return;
+        }
+        const next = await reader.read();
+        if (next.done) {
+          resolveCompletion("ok");
+          controller.close();
+        } else {
+          terminalObserved ||= targetStreamTerminal(target, next.value);
+          nextResponsesSequence = Math.max(
+            nextResponsesSequence,
+            responseSequenceAfter(next.value),
+          );
+          controller.enqueue(next.value);
+        }
+      } catch {
+        resolveCompletion("protocol_error");
+        if (!terminalObserved) {
+          for (const chunk of renderCommittedProtocolError(target, nextResponsesSequence))
+            controller.enqueue(chunk);
+        }
+        controller.close();
+      }
+    },
+    async cancel(reason) {
+      resolveCompletion("cancelled");
+      return reader.cancel(reason);
+    },
+  });
+  return { body, completion };
+}
+
+function responseSequenceAfter(chunk: Uint8Array): number {
+  let next = 0;
+  for (const match of new TextDecoder().decode(chunk).matchAll(/"sequence_number":(\d+)/g))
+    next = Math.max(next, Number(match[1]) + 1);
+  return next;
+}
+
+function renderCommittedProtocolError(
+  target: ProtocolSurface,
+  responsesSequence: number,
+): Uint8Array[] {
+  if (target === "openai-responses") {
+    return [
+      new TextEncoder().encode(
+        `event: error\ndata: ${JSON.stringify({
+          type: "error",
+          sequence_number: responsesSequence,
+          code: "protocol_error",
+          message: "The upstream stream violated the adapted protocol.",
+          param: null,
+        })}\n\n`,
+      ),
+    ];
+  }
+  const renderer = new CanonicalStreamRenderer(target);
+  return renderer.push({
+    type: "error",
+    error: {
+      code: "protocol_error",
+      message: "The upstream stream violated the adapted protocol.",
+      upstreamStatus: 502,
+    },
+  });
+}
+
+function targetStreamTerminal(target: ProtocolSurface, chunk: Uint8Array): boolean {
+  const text = new TextDecoder().decode(chunk);
+  if (target === "openai-chat") return text.includes("data: [DONE]");
+  if (target === "openai-responses")
+    return /event: (?:response\.(?:completed|incomplete|failed)|error)\r?\n/.test(text);
+  return /event: (?:message_stop|error)\r?\n/.test(text);
+}
+
+function executionPathForPoolMember(
+  capabilities: OpenAiCompatibleCapabilities | null,
+  operation: RelayOperation,
+  canonical?: ReturnType<typeof parseCanonicalRequest> | null,
+) {
+  const requestedSurface = requestedSurfaceForOperation(operation);
+  if (!requestedSurface) return null;
+  const adaptationEnabled =
+    operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled;
+  const responsesOperation = responsesOperationForRelay(operation);
+  const rawRequirements = operation.adaptation
+    ? profileSurfaceRequest(operation.adaptation.payload)
+    : {};
+  return resolveExecutionPath({
+    capabilities,
+    requestedSurface: modelApiSurface(requestedSurface),
+    request: {
+      stream: operation.stream,
+      protocolVersion: operation.anthropicIngress?.version,
+      betaFeatures: operation.anthropicIngress?.betaFeatures,
+      responsesOperation,
+      stateful:
+        responsesOperation !== undefined &&
+        responsesOperation !== "create" &&
+        responsesOperation !== "countTokens",
+      ...rawRequirements,
+      ...(canonical ? canonicalRequestRequirements(canonical) : {}),
+    },
+    adaptationEnabled,
+  });
+}
+
+function responsesOperationForRelay(
+  operation: RelayOperation,
+): SurfaceRequestRequirements["responsesOperation"] {
+  if (operation.additionalCapabilities?.includes("responses.statefulFollowUps"))
+    return "statefulFollowUps";
+  const mapping: Partial<
+    Record<ModelApiCapability, SurfaceRequestRequirements["responsesOperation"]>
+  > = {
+    "responses.create": "create",
+    "responses.statefulFollowUps": "statefulFollowUps",
+    "responses.retrieve": "retrieve",
+    "responses.delete": "delete",
+    "responses.cancel": "cancel",
+    "responses.listInputItems": "listInputItems",
+    "responses.countTokens": "countTokens",
+    "responses.compact": "compact",
+  };
+  return mapping[operation.capability];
+}
+
+function canonicalRequestRequirements(
+  request: ReturnType<typeof parseCanonicalRequest>,
+): SurfaceRequestRequirements {
+  return {
+    stream: request.stream,
+    tools: request.tools.length > 0,
+    inputImages: request.messages.some((message) =>
+      message.content.some((content) => content.type === "image"),
+    ),
+  };
 }
 
 function isEndpointConnected(row: DirectModelRelayRow, activeCliDeviceIds: Set<string>): boolean {
@@ -839,18 +1850,32 @@ function prepareEmptyRelayRequest(request: Request): RelayRequestBuilder {
 }
 
 async function createRelayMetadata(input: RelayMetadataCreate): Promise<string> {
+  const requestedExecutionTarget = input.requestedDiscoveredModelId
+    ? await prisma.executionTarget.findUnique({
+        where: { discoveredModelId: input.requestedDiscoveredModelId },
+        select: { id: true },
+      })
+    : null;
   const row = await prisma.relayRequest.create({
     data: {
       userId: input.userId,
       modelApiTokenId: input.modelApiTokenId ?? null,
       modelApiTokenLookupPrefix: input.modelApiTokenLookupPrefix ?? null,
       requestedDiscoveredModelId: input.requestedDiscoveredModelId ?? null,
+      requestedExecutionTargetId: requestedExecutionTarget?.id ?? null,
       requestedModelPoolId: input.requestedModelPoolId ?? null,
       transformerLatencyMs: input.transformerLatencyMs ?? null,
       transformerCacheHit: input.transformerCacheHit ?? null,
       transformerErrorClass: input.transformerErrorClass ?? null,
+      requestedSurface: input.requestedSurface,
       operation: input.operation ?? null,
       requestBytes: input.requestBytes == null ? null : BigInt(input.requestBytes),
+      contextTokenCount: input.contextCount?.tokens ?? null,
+      contextCountMethod: input.contextCount?.method ?? null,
+      contextCountConfidence: input.contextCount?.confidence ?? null,
+      contextCountExact: input.contextCount?.exact ?? null,
+      contextSafetyMargin: input.contextCount?.safetyMargin ?? null,
+      contextSerializedChars: input.contextCount?.serializedChars ?? null,
       status: "PENDING",
     },
     select: { id: true },
@@ -880,35 +1905,402 @@ function requesterFromChatTestUser(userId: string): RelayRequester {
 async function updateRelayMetadata(relayRequestId: string, update: RelayMetadataUpdate) {
   const completedAt = new Date();
   const failure = update.terminal.failure ?? update.fallbackFailure ?? null;
+  const selectedExecutionTarget = update.selectedDiscoveredModelId
+    ? await prisma.executionTarget.findUnique({
+        where: { discoveredModelId: update.selectedDiscoveredModelId },
+        select: { id: true },
+      })
+    : null;
+  const relayData = {
+    selectedDiscoveredModelId: update.selectedDiscoveredModelId ?? null,
+    selectedExecutionTargetId: selectedExecutionTarget?.id ?? null,
+    status: update.status,
+    completedAt,
+    durationMs: Math.max(0, completedAt.getTime() - update.startedAt.getTime()),
+    promptTokens: update.terminal.usage?.promptTokens ?? null,
+    completionTokens: update.terminal.usage?.completionTokens ?? null,
+    totalTokens: update.terminal.usage?.totalTokens ?? null,
+    httpStatusCode:
+      update.terminal.httpStatusCode ?? (failure ? relayFailureHttpStatus(failure) : null),
+    upstreamStatusCode: update.terminal.upstreamStatusCode,
+    requestBytes: BigInt(update.terminal.requestBytes),
+    responseBytes: BigInt(update.terminal.responseBytes),
+    ...(update.attemptCount !== undefined ? { attemptCount: update.attemptCount } : {}),
+    ...(update.affinity
+      ? {
+          affinityOutcome: update.affinity.outcome,
+          affinityScore: update.affinity.score,
+          affinityPrefixDepth: update.affinity.prefixDepth,
+          affinityReason: update.affinity.reason,
+        }
+      : {}),
+    ...(update.execution
+      ? {
+          ...(update.execution.selectedExecutionTargetId
+            ? { selectedExecutionTargetId: update.execution.selectedExecutionTargetId }
+            : {}),
+          selectedPoolMemberId: update.execution.selectedPoolMemberId ?? null,
+          selectedPoolMemberTier: update.execution.selectedPoolMemberTier ?? null,
+          selectedNativeSurface: update.execution.nativeSurface,
+          adapterMode: update.execution.adapterMode,
+          adapterVersion: update.execution.adapterVersion ?? null,
+          localAttemptId: update.execution.localAttemptId,
+        }
+      : {}),
+    errorClass: failure,
+    ...(update.transformerLatencyMs !== undefined
+      ? { transformerLatencyMs: update.transformerLatencyMs }
+      : {}),
+    ...(update.transformerCacheHit !== undefined
+      ? { transformerCacheHit: update.transformerCacheHit }
+      : {}),
+    ...(update.transformerErrorClass !== undefined
+      ? { transformerErrorClass: update.transformerErrorClass }
+      : {}),
+  };
+  if (update.localExecution && update.userId) {
+    const localExecution = update.localExecution;
+    const updateUserId = update.userId;
+    const localTerminal = update.localTerminal ?? update.terminal;
+    await prisma.$transaction(async (tx) => {
+      const [clock] = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
+      if (!clock) throw new Error("Database clock query returned no row");
+      const claimed = await tx.relayExecutionAttempt.updateMany({
+        where: {
+          attemptId: localExecution.localAttemptId,
+          ownerEpoch: LOCAL_RELAY_PROCESS_EPOCH,
+          state: "ACTIVE",
+        },
+        data: {
+          state: terminalStatus(localTerminal),
+          terminalAt: clock.now,
+          terminalState: terminalStatus(localTerminal),
+          requestBytes: BigInt(localTerminal.requestBytes),
+          responseBytes: BigInt(localTerminal.responseBytes),
+        },
+      });
+      if (claimed.count === 0) return;
+      await tx.relayExecutionEvent.createMany({
+        data: [localTerminalEventData(relayRequestId, updateUserId, localExecution, localTerminal)],
+        skipDuplicates: true,
+      });
+      await tx.relayRequest.update({
+        where: { id: relayRequestId },
+        data: {
+          ...relayData,
+          completedAt: clock.now,
+          durationMs: Math.max(0, clock.now.getTime() - update.startedAt.getTime()),
+        },
+        select: { id: true },
+      });
+    });
+    return;
+  }
+  await prisma.relayRequest.update({
+    where: { id: relayRequestId },
+    data: relayData,
+    select: { id: true },
+  });
+}
+
+async function updateContextCountMetadata(
+  relayRequestId: string,
+  contextCount: ContextCountTelemetry,
+) {
   await prisma.relayRequest.update({
     where: { id: relayRequestId },
     data: {
-      selectedDiscoveredModelId: update.selectedDiscoveredModelId ?? null,
-      status: update.status,
-      completedAt,
-      durationMs: Math.max(0, completedAt.getTime() - update.startedAt.getTime()),
-      promptTokens: update.terminal.usage?.promptTokens ?? null,
-      completionTokens: update.terminal.usage?.completionTokens ?? null,
-      totalTokens: update.terminal.usage?.totalTokens ?? null,
-      httpStatusCode:
-        update.terminal.httpStatusCode ?? (failure ? relayFailureHttpStatus(failure) : null),
-      upstreamStatusCode: update.terminal.upstreamStatusCode,
-      requestBytes: BigInt(update.terminal.requestBytes),
-      responseBytes: BigInt(update.terminal.responseBytes),
-      ...(update.attemptCount !== undefined ? { attemptCount: update.attemptCount } : {}),
-      errorClass: failure,
-      ...(update.transformerLatencyMs !== undefined
-        ? { transformerLatencyMs: update.transformerLatencyMs }
-        : {}),
-      ...(update.transformerCacheHit !== undefined
-        ? { transformerCacheHit: update.transformerCacheHit }
-        : {}),
-      ...(update.transformerErrorClass !== undefined
-        ? { transformerErrorClass: update.transformerErrorClass }
-        : {}),
+      contextTokenCount: contextCount.tokens,
+      contextCountMethod: contextCount.method,
+      contextCountConfidence: contextCount.confidence,
+      contextCountExact: contextCount.exact,
+      contextSafetyMargin: contextCount.safetyMargin,
+      contextSerializedChars: contextCount.serializedChars,
+    },
+  });
+}
+
+type LocalExecutionTelemetry = NonNullable<RelayMetadataUpdate["execution"]> & {
+  requestedSurface: string;
+  attemptKind?: "EXECUTION" | "CONTEXT_COUNT";
+  poolId?: string;
+  contextCount?: ContextCountTelemetry;
+  admission?: {
+    attemptId: string;
+    leaseId: string;
+    fencingToken: bigint;
+    waitDurationMs?: number;
+  };
+};
+
+async function startLocalExecutionTelemetry(
+  relayRequestId: string,
+  userId: string,
+  execution: LocalExecutionTelemetry,
+) {
+  await prisma.$transaction(async (tx) => {
+    const [clock] = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
+    if (!clock) throw new Error("Database clock query returned no row");
+    const now = clock.now;
+    await tx.relayExecutionAttempt.create({
+      data: {
+        attemptId: execution.localAttemptId,
+        userId,
+        relayRequestId,
+        ownerEpoch: LOCAL_RELAY_PROCESS_EPOCH,
+        attemptKind: execution.attemptKind ?? "EXECUTION",
+        heartbeatAt: now,
+        expiresAt: new Date(now.getTime() + LOCAL_RELAY_ATTEMPT_TTL_MS),
+        requestedSurface: execution.requestedSurface,
+        nativeSurface: execution.nativeSurface,
+        adapterMode: execution.adapterMode,
+        adapterVersion: execution.adapterVersion ?? null,
+        poolId: execution.poolId ?? null,
+        poolMemberId: execution.selectedPoolMemberId ?? null,
+        executionTargetId: execution.selectedExecutionTargetId ?? null,
+        memberTier: execution.selectedPoolMemberTier ?? null,
+      },
+    });
+    await tx.relayExecutionEvent.create({
+      data: {
+        userId,
+        relayRequestId,
+        attemptId: execution.localAttemptId,
+        eventType: "ATTEMPT_STARTED",
+        attemptKind: execution.attemptKind ?? "EXECUTION",
+        requestedSurface: execution.requestedSurface,
+        nativeSurface: execution.nativeSurface,
+        adapterMode: execution.adapterMode,
+        adapterVersion: execution.adapterVersion ?? null,
+        poolId: execution.poolId ?? null,
+        poolMemberId: execution.selectedPoolMemberId ?? null,
+        executionTargetId: execution.selectedExecutionTargetId ?? null,
+        memberTier: execution.selectedPoolMemberTier ?? null,
+        contextCountMethod: execution.contextCount?.method ?? null,
+        contextCountConfidence: execution.contextCount?.confidence ?? null,
+        contextTokens: execution.contextCount?.tokens ?? null,
+        admissionAttemptId: execution.admission?.attemptId ?? null,
+        admissionLeaseId: execution.admission?.leaseId ?? null,
+        admissionFencingToken: execution.admission?.fencingToken ?? null,
+        waitDurationMs: execution.admission?.waitDurationMs ?? null,
+      },
+    });
+    await tx.relayRequest.update({
+      where: { id: relayRequestId },
+      data: {
+        ...(execution.selectedExecutionTargetId
+          ? { selectedExecutionTargetId: execution.selectedExecutionTargetId }
+          : {}),
+        selectedPoolMemberId: execution.selectedPoolMemberId ?? null,
+        selectedPoolMemberTier: execution.selectedPoolMemberTier ?? null,
+        selectedNativeSurface: execution.nativeSurface,
+        adapterMode: execution.adapterMode,
+        adapterVersion: execution.adapterVersion ?? null,
+        localAttemptId: execution.localAttemptId,
+      },
+      select: { id: true },
+    });
+  });
+}
+
+async function recordLocalTerminal(
+  relayRequestId: string,
+  userId: string,
+  execution: LocalExecutionTelemetry,
+  terminal: RelayAttemptTerminal,
+) {
+  await prisma.$transaction(async (tx) => {
+    const [clock] = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
+    if (!clock) throw new Error("Database clock query returned no row");
+    const claimed = await tx.relayExecutionAttempt.updateMany({
+      where: {
+        attemptId: execution.localAttemptId,
+        ownerEpoch: LOCAL_RELAY_PROCESS_EPOCH,
+        state: "ACTIVE",
+      },
+      data: {
+        state: terminalStatus(terminal),
+        terminalAt: clock.now,
+        terminalState: terminalStatus(terminal),
+        requestBytes: BigInt(terminal.requestBytes),
+        responseBytes: BigInt(terminal.responseBytes),
+      },
+    });
+    if (claimed.count === 0) return;
+    await tx.relayExecutionEvent.createMany({
+      data: [localTerminalEventData(relayRequestId, userId, execution, terminal)],
+      skipDuplicates: true,
+    });
+    if (claimed.count > 0 && execution.attemptKind === "CONTEXT_COUNT") {
+      await tx.relayRequest.update({
+        where: { id: relayRequestId },
+        data: {
+          auxiliaryAttemptCount: { increment: 1 },
+          auxiliaryRequestBytes: { increment: BigInt(terminal.requestBytes) },
+          auxiliaryResponseBytes: { increment: BigInt(terminal.responseBytes) },
+        },
+      });
+    }
+  });
+}
+
+function localTerminalEventData(
+  relayRequestId: string,
+  userId: string,
+  execution: LocalExecutionTelemetry,
+  terminal: RelayAttemptTerminal,
+) {
+  return {
+    userId,
+    relayRequestId,
+    attemptId: execution.localAttemptId,
+    eventType: "TERMINAL",
+    attemptKind: execution.attemptKind ?? "EXECUTION",
+    requestedSurface: execution.requestedSurface,
+    nativeSurface: execution.nativeSurface,
+    adapterMode: execution.adapterMode,
+    adapterVersion: execution.adapterVersion ?? null,
+    poolId: execution.poolId ?? null,
+    poolMemberId: execution.selectedPoolMemberId ?? null,
+    executionTargetId: execution.selectedExecutionTargetId ?? null,
+    memberTier: execution.selectedPoolMemberTier ?? null,
+    contextCountMethod: execution.contextCount?.method ?? null,
+    contextCountConfidence: execution.contextCount?.confidence ?? null,
+    contextTokens: execution.contextCount?.tokens ?? null,
+    terminalState: terminalStatus(terminal),
+    httpStatusCode: terminal.httpStatusCode,
+    upstreamStatusCode: terminal.upstreamStatusCode,
+    errorClass: terminal.failure,
+    promptTokens: terminal.usage?.promptTokens ?? null,
+    completionTokens: terminal.usage?.completionTokens ?? null,
+    totalTokens: terminal.usage?.totalTokens ?? null,
+    usageSource: terminal.usage ? "CLI_NORMALIZED" : null,
+  };
+}
+
+async function markLocalFirstClientByte(
+  relayRequestId: string,
+  userId: string,
+  execution: LocalExecutionTelemetry,
+) {
+  await prisma.$transaction(async (tx) => {
+    const [clock] = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
+    if (!clock) throw new Error("Database clock query returned no row");
+    const now = clock.now;
+    const claimed = await tx.relayExecutionAttempt.updateMany({
+      where: {
+        attemptId: execution.localAttemptId,
+        ownerEpoch: LOCAL_RELAY_PROCESS_EPOCH,
+        state: "ACTIVE",
+      },
+      data: {
+        heartbeatAt: now,
+        expiresAt: new Date(now.getTime() + LOCAL_RELAY_ATTEMPT_TTL_MS),
+      },
+    });
+    if (claimed.count === 0) {
+      const ownedTerminal = await tx.relayExecutionAttempt.findFirst({
+        where: {
+          attemptId: execution.localAttemptId,
+          ownerEpoch: LOCAL_RELAY_PROCESS_EPOCH,
+          state: { in: ["SUCCEEDED", "FAILED", "CANCELED"] },
+        },
+        select: { attemptId: true },
+      });
+      if (!ownedTerminal) return;
+    }
+    await tx.relayExecutionEvent.createMany({
+      data: [
+        {
+          userId,
+          relayRequestId,
+          attemptId: execution.localAttemptId,
+          eventType: "FIRST_CLIENT_BYTE",
+          attemptKind: execution.attemptKind ?? "EXECUTION",
+          requestedSurface: execution.requestedSurface,
+          nativeSurface: execution.nativeSurface,
+          adapterMode: execution.adapterMode,
+          adapterVersion: execution.adapterVersion ?? null,
+          poolId: execution.poolId ?? null,
+          poolMemberId: execution.selectedPoolMemberId ?? null,
+          executionTargetId: execution.selectedExecutionTargetId ?? null,
+          memberTier: execution.selectedPoolMemberTier ?? null,
+          streamCommitted: true,
+        },
+      ],
+      skipDuplicates: true,
+    });
+    await tx.relayRequest.updateMany({
+      where: { id: relayRequestId, firstClientByteAt: null },
+      data: { firstClientByteAt: now, streamCommitted: true },
+    });
+  });
+}
+
+async function updateAdmissionMetadata(
+  relayRequestId: string,
+  input: {
+    attemptId: string;
+    waitDurationMs: number;
+    result: Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>>;
+  },
+) {
+  const lease = input.result.state === "ADMITTED" ? input.result.lease : null;
+  await prisma.relayRequest.update({
+    where: { id: relayRequestId },
+    data: {
+      admissionAttemptId: input.attemptId,
+      admissionLeaseId: lease?.leaseId ?? null,
+      admissionCapacityId: lease?.capacityId ?? null,
+      admissionFencingToken: lease?.fencingToken ?? null,
+      admissionWaitDurationMs: Math.max(0, input.waitDurationMs),
+      admissionReservationClass: lease?.reservationClass ?? null,
+      admissionBorrowed: lease?.borrowed ?? null,
+      admissionTerminalState: input.result.state,
     },
     select: { id: true },
   });
+}
+
+async function acquireCapacityWithTelemetry({
+  runtime,
+  relayRequestId,
+  attempt,
+  signal,
+}: {
+  runtime: CapacityAdmissionRuntime;
+  relayRequestId: string;
+  attempt: Parameters<CapacityAdmissionRuntime["acquire"]>[0];
+  signal: AbortSignal;
+}) {
+  const waitingStartedAt = Date.now();
+  try {
+    const result = await runtime.acquire(attempt, signal);
+    try {
+      await updateAdmissionMetadata(relayRequestId, {
+        attemptId: attempt.attemptId,
+        waitDurationMs: Date.now() - waitingStartedAt,
+        result,
+      });
+    } catch (error) {
+      if (result.state === "ADMITTED") await runtime.release(result.lease);
+      throw error;
+    }
+    return result;
+  } catch (error) {
+    await prisma.relayRequest
+      .update({
+        where: { id: relayRequestId },
+        data: {
+          admissionAttemptId: attempt.attemptId,
+          admissionWaitDurationMs: Math.max(0, Date.now() - waitingStartedAt),
+          admissionTerminalState: signal.aborted ? "CANCELLED" : "ERROR",
+        },
+        select: { id: true },
+      })
+      .catch(metadataUpdateError);
+    throw error;
+  }
 }
 
 function terminalStatus(terminal: RelayAttemptTerminal): "SUCCEEDED" | "FAILED" | "CANCELED" {
@@ -926,6 +2318,9 @@ async function failRelayMetadata({
   attemptCount,
   requestBytes,
   responseBytes,
+  localExecution,
+  userId,
+  localTerminal,
 }: {
   relayRequestId: string;
   startedAt: Date;
@@ -936,6 +2331,9 @@ async function failRelayMetadata({
   attemptCount?: number;
   requestBytes?: number;
   responseBytes?: number;
+  localExecution?: LocalExecutionTelemetry;
+  userId?: string;
+  localTerminal?: RelayAttemptTerminal;
 }) {
   if (requestBytes !== undefined) {
     await prisma.relayRequest.update({
@@ -952,6 +2350,9 @@ async function failRelayMetadata({
     transformerErrorClass,
     transformerLatencyMs,
     attemptCount,
+    localExecution,
+    userId,
+    localTerminal,
     terminal: {
       ok: false,
       failure,
@@ -966,8 +2367,8 @@ async function failRelayMetadata({
 }
 
 function metadataUpdateError(error: unknown) {
-  const message = error instanceof Error ? error.message : "unknown error";
-  console.warn(`[model-api] relay metadata update failed: ${message}`);
+  void error;
+  console.warn("[model-api] relay metadata update failed");
 }
 
 function responseStickinessDigest({
@@ -993,6 +2394,72 @@ function responseStickinessDigest({
   });
 }
 
+function upstreamResponseIdDigest(responseId: string): string {
+  return hmacDigestForForwarderPurpose({
+    purpose: "responsesStickinessUpstreamId",
+    value: responseId,
+  });
+}
+
+async function writeProviderResponseStickiness(input: {
+  requester: RelayRequester;
+  responseId: string;
+  targetModelPoolId: string;
+  executionTargetId: string;
+  providerAccountId: string;
+  providerModelId: string;
+  endpointIdentity: string;
+  endpointVersion: number;
+  upstreamModelId: string;
+  poolGrantId: string | null;
+}) {
+  const routingKeyDigest = responseStickinessDigest(input);
+  await prisma.responseStickinessRecord.upsert({
+    where: {
+      userId_routingKeyDigest: { userId: input.requester.userId, routingKeyDigest },
+    },
+    create: {
+      userId: input.requester.userId,
+      modelApiTokenId: input.requester.modelApiTokenId,
+      routingKeyDigest,
+      routingVersion: 3,
+      targetModelPoolId: input.targetModelPoolId,
+      selectedExecutionTargetId: input.executionTargetId,
+      providerAccountId: input.providerAccountId,
+      providerModelId: input.providerModelId,
+      providerEndpointIdentity: input.endpointIdentity,
+      providerEndpointVersion: input.endpointVersion,
+      providerUpstreamModelId: input.upstreamModelId,
+      poolGrantId: input.poolGrantId,
+      nativeSurface: "OPENAI_RESPONSES",
+      upstreamResponseIdDigest: upstreamResponseIdDigest(input.responseId),
+      expiresAt: new Date(Date.now() + RESPONSES_STICKINESS_TTL_MS),
+    },
+    // Submit the complete tuple on conflict. The database trigger permits an
+    // expiry refresh only when every v3 identity field is identical and rejects
+    // collisions with legacy/local rows or another provider endpoint.
+    update: {
+      routingVersion: 3,
+      modelApiTokenId: input.requester.modelApiTokenId,
+      targetDiscoveredModelId: null,
+      targetExecutionTargetId: null,
+      targetModelPoolId: input.targetModelPoolId,
+      selectedDiscoveredModelId: null,
+      selectedExecutionTargetId: input.executionTargetId,
+      providerAccountId: input.providerAccountId,
+      providerModelId: input.providerModelId,
+      providerEndpointIdentity: input.endpointIdentity,
+      providerEndpointVersion: input.endpointVersion,
+      providerUpstreamModelId: input.upstreamModelId,
+      poolGrantId: input.poolGrantId,
+      nativeSurface: "OPENAI_RESPONSES",
+      upstreamResponseIdDigest: upstreamResponseIdDigest(input.responseId),
+      expiresAt: new Date(Date.now() + RESPONSES_STICKINESS_TTL_MS),
+    },
+    select: { id: true },
+  });
+}
+
 async function writeResponseStickiness({
   requester,
   responseId,
@@ -1005,6 +2472,18 @@ async function writeResponseStickiness({
 }) {
   const routingKeyDigest = responseStickinessDigest({ requester, responseId });
   const expiresAt = new Date(Date.now() + RESPONSES_STICKINESS_TTL_MS);
+  const [targetExecutionTarget, selectedExecutionTarget] = await Promise.all([
+    targetDiscoveredModelId
+      ? prisma.executionTarget.findUnique({
+          where: { discoveredModelId: targetDiscoveredModelId },
+          select: { id: true },
+        })
+      : null,
+    prisma.executionTarget.findUnique({
+      where: { discoveredModelId: selectedDiscoveredModelId },
+      select: { id: true },
+    }),
+  ]);
   await prisma.responseStickinessRecord.upsert({
     where: {
       userId_routingKeyDigest: {
@@ -1016,16 +2495,22 @@ async function writeResponseStickiness({
       userId: requester.userId,
       modelApiTokenId: requester.modelApiTokenId,
       routingKeyDigest,
+      routingVersion: 2,
       targetDiscoveredModelId: targetDiscoveredModelId ?? null,
+      targetExecutionTargetId: targetExecutionTarget?.id ?? null,
       targetModelPoolId: targetModelPoolId ?? null,
       selectedDiscoveredModelId,
+      selectedExecutionTargetId: selectedExecutionTarget?.id ?? null,
       expiresAt,
     },
     update: {
+      routingVersion: 2,
       modelApiTokenId: requester.modelApiTokenId,
       targetDiscoveredModelId: targetDiscoveredModelId ?? null,
+      targetExecutionTargetId: targetExecutionTarget?.id ?? null,
       targetModelPoolId: targetModelPoolId ?? null,
       selectedDiscoveredModelId,
+      selectedExecutionTargetId: selectedExecutionTarget?.id ?? null,
       expiresAt,
     },
     select: { id: true },
@@ -1033,8 +2518,31 @@ async function writeResponseStickiness({
 }
 
 function stickinessWriteError(error: unknown) {
-  const message = error instanceof Error ? error.message : "unknown error";
-  console.warn(`[model-api] responses stickiness write failed: ${message}`);
+  void error;
+  console.warn("[model-api] responses stickiness write failed");
+}
+
+function reportCleanupFailures(results: readonly PromiseSettledResult<unknown>[]) {
+  const failures = results.filter(({ status }) => status === "rejected").length;
+  if (failures) console.warn(`[model-api] ${failures} relay cleanup operation(s) failed`);
+}
+
+async function settleRelayCleanup(tasks: readonly (() => unknown | PromiseLike<unknown>)[]) {
+  const results = await Promise.allSettled(tasks.map((task) => Promise.resolve().then(task)));
+  reportCleanupFailures(results);
+}
+
+function rejectedRelayTerminal(): RelayAttemptTerminal {
+  return {
+    ok: false,
+    failure: "unknown",
+    httpStatusCode: 500,
+    upstreamStatusCode: null,
+    usage: null,
+    metrics: null,
+    responseBytes: 0,
+    requestBytes: 0,
+  };
 }
 
 function extractResponseIdFromJson(value: unknown): string | null {
@@ -1116,6 +2624,76 @@ function createResponseIdCapture() {
   };
 }
 
+export function captureProviderResponseBinding(input: {
+  response: Response;
+  streaming: boolean;
+  requester: RelayRequester;
+  targetModelPoolId: string;
+  poolGrantId: string | null;
+  target: {
+    executionTargetId: string;
+    providerAccountId: string;
+    providerModelId: string;
+    endpointIdentity: string;
+    endpointVersion: number;
+    upstreamModelId: string;
+  };
+  terminal: Promise<{ ok: boolean }>;
+}): Response {
+  if (!input.response.body || input.response.status < 200 || input.response.status >= 300)
+    return input.response;
+  const reader = input.response.body.getReader();
+  const capture = createResponseIdCapture();
+  let finished = false;
+  const persist = async () => {
+    if (finished) return;
+    finished = true;
+    const responseId = capture.finish(input.streaming);
+    const terminal = await input.terminal;
+    if (!terminal.ok) throw new Error("Provider response did not complete successfully");
+    if (!responseId) throw new Error("Provider response did not include a response id");
+    try {
+      await writeProviderResponseStickiness({
+        requester: input.requester,
+        responseId,
+        targetModelPoolId: input.targetModelPoolId,
+        poolGrantId: input.poolGrantId,
+        ...input.target,
+      });
+    } catch (error) {
+      stickinessWriteError(error);
+      throw new Error("Response routing metadata could not be persisted");
+    }
+  };
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const next = await reader.read();
+        if (next.done) {
+          await persist();
+          // The successful upstream response is not observably complete until
+          // its correctness-required binding is durable. A follow-up issued as
+          // soon as EOF is observed can therefore never race the database row.
+          controller.close();
+          return;
+        }
+        capture.push(next.value, input.streaming);
+        controller.enqueue(next.value);
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      await reader.cancel(reason).catch(() => undefined);
+    },
+  });
+  return new Response(body, {
+    status: input.response.status,
+    statusText: input.response.statusText,
+    headers: input.response.headers,
+  });
+}
+
 async function resolveStickyRoute({
   requester,
   responseId,
@@ -1138,19 +2716,100 @@ async function resolveStickyRoute({
     },
     select: {
       userId: true,
+      routingVersion: true,
       modelApiTokenId: true,
       targetDiscoveredModelId: true,
       targetModelPoolId: true,
       selectedDiscoveredModelId: true,
+      selectedExecutionTargetId: true,
+      providerAccountId: true,
+      providerModelId: true,
+      providerEndpointIdentity: true,
+      providerEndpointVersion: true,
+      providerUpstreamModelId: true,
+      nativeSurface: true,
+      upstreamResponseIdDigest: true,
+      poolGrantId: true,
+      PoolGrant: {
+        select: { id: true, poolId: true, ownerUserId: true, granteeUserId: true },
+      },
+      TargetExecutionTarget: { select: { discoveredModelId: true } },
+      SelectedExecutionTarget: { select: { discoveredModelId: true } },
       expiresAt: true,
     },
   })) as ResponseStickinessRecordRow | null;
+
+  if ((record?.routingVersion ?? 1) >= 3) {
+    const validRequester =
+      record?.userId === requester.userId &&
+      record.modelApiTokenId === requester.modelApiTokenId &&
+      record.expiresAt !== null &&
+      record.expiresAt > new Date() &&
+      record.upstreamResponseIdDigest === upstreamResponseIdDigest(responseId);
+    const visibleTarget = record?.targetModelPoolId
+      ? (targets.modelPools.find((target) => target.id === record.targetModelPoolId) ?? null)
+      : null;
+    const exactGrantVisible = visibleTarget
+      ? record?.poolGrantId === null
+        ? visibleTarget.accessGrantId === null && visibleTarget.ownerUserId === requester.userId
+        : visibleTarget.accessGrantId === record?.poolGrantId &&
+          record.PoolGrant?.id === record.poolGrantId &&
+          record.PoolGrant.poolId === visibleTarget.id &&
+          record.PoolGrant.ownerUserId === visibleTarget.ownerUserId &&
+          record.PoolGrant.granteeUserId === requester.userId
+      : false;
+    if (!validRequester || !visibleTarget || !exactGrantVisible)
+      return openAiFailureJsonResponse(
+        "not_found",
+        "Response routing metadata was not found or has expired.",
+      );
+    if (
+      !record.selectedExecutionTargetId ||
+      !record.providerAccountId ||
+      !record.providerModelId ||
+      !record.providerEndpointIdentity ||
+      !record.providerEndpointVersion ||
+      !record.providerUpstreamModelId ||
+      record.nativeSurface !== "OPENAI_RESPONSES"
+    )
+      return openAiFailureJsonResponse("not_found", "Response routing metadata is incomplete.");
+    return {
+      target: "PROVIDER",
+      visibleTarget,
+      binding: {
+        executionTargetId: record.selectedExecutionTargetId,
+        providerAccountId: record.providerAccountId,
+        providerModelId: record.providerModelId,
+        endpointIdentity: record.providerEndpointIdentity,
+        endpointVersion: record.providerEndpointVersion,
+        upstreamModelId: record.providerUpstreamModelId,
+      },
+    };
+  }
+
+  const targetBound = (record?.routingVersion ?? 1) >= 2;
+  if (
+    targetBound &&
+    (!record?.SelectedExecutionTarget ||
+      (record.targetDiscoveredModelId !== null && !record.TargetExecutionTarget))
+  ) {
+    return openAiFailureJsonResponse("not_found", "Response routing target no longer exists.");
+  }
+
+  const targetDiscoveredModelId =
+    record?.TargetExecutionTarget?.discoveredModelId ??
+    (targetBound ? null : record?.targetDiscoveredModelId) ??
+    null;
+  const selectedDiscoveredModelId =
+    record?.SelectedExecutionTarget?.discoveredModelId ??
+    (targetBound ? null : record?.selectedDiscoveredModelId) ??
+    null;
 
   if (
     !record ||
     record.userId !== requester.userId ||
     record.modelApiTokenId !== requester.modelApiTokenId ||
-    !record.selectedDiscoveredModelId ||
+    !selectedDiscoveredModelId ||
     (record.expiresAt !== null && record.expiresAt <= new Date())
   ) {
     return openAiFailureJsonResponse(
@@ -1159,9 +2818,9 @@ async function resolveStickyRoute({
     );
   }
 
-  if (record.targetDiscoveredModelId) {
+  if (targetDiscoveredModelId) {
     const visibleTarget =
-      targets.directModels.find((target) => target.id === record.targetDiscoveredModelId) ?? null;
+      targets.directModels.find((target) => target.id === targetDiscoveredModelId) ?? null;
     if (!visibleTarget) {
       return openAiFailureJsonResponse(
         "access_denied",
@@ -1171,7 +2830,7 @@ async function resolveStickyRoute({
     return {
       target: "DIRECT_MODEL",
       visibleTarget,
-      selectedDiscoveredModelId: record.selectedDiscoveredModelId,
+      selectedDiscoveredModelId,
     };
   }
 
@@ -1187,7 +2846,7 @@ async function resolveStickyRoute({
     return {
       target: "MODEL_POOL",
       visibleTarget,
-      selectedDiscoveredModelId: record.selectedDiscoveredModelId,
+      selectedDiscoveredModelId,
     };
   }
 
@@ -1205,6 +2864,32 @@ async function directModelRow(discoveredModelId: string): Promise<DirectModelRel
       capabilityOverrideMode: true,
       capabilityOverrideMetadata: true,
       optimisticBasicTranscription: true,
+      ExecutionTarget: {
+        select: {
+          id: true,
+          inferenceCapacityId: true,
+          directContextCeiling: true,
+          directContextMargin: true,
+          directWaitBudgetMs: true,
+          InferenceCapacity: {
+            select: {
+              id: true,
+              hardConcurrencyLimit: true,
+              physicalMaxContext: true,
+              countStrategy: true,
+              runtimeIdentityKey: true,
+              runtimeModel: true,
+              runtimeRevision: true,
+              tokenizer: true,
+              tokenizerVersion: true,
+              template: true,
+              templateVersion: true,
+              engine: true,
+              cacheNamespace: true,
+            },
+          },
+        },
+      },
       Endpoint: {
         select: {
           id: true,
@@ -1221,13 +2906,85 @@ async function directModelRow(discoveredModelId: string): Promise<DirectModelRel
 }
 
 async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
-  return (await prisma.poolMember.findMany({
-    where: { poolId },
+  const rows = await prisma.poolMember.findMany({
+    // The relay scheduler is exclusively the local/primary execution path.
+    // Public overflow members are provider-backed and must only be considered
+    // by public-overflow.ts after its egress, policy, budget, and credential
+    // gates have run. Requiring the concrete target kind also prevents legacy
+    // or partially-backfilled rows from leaking into local routing.
+    where: {
+      poolId,
+      tier: "PRIMARY",
+      ExecutionTarget: { DiscoveredModel: { isNot: null } },
+    },
     orderBy: { id: "asc" },
     select: {
       id: true,
       poolId: true,
       discoveredModelId: true,
+      capacityContextCeiling: true,
+      capacityContextCeilingMode: true,
+      capacityContextMargin: true,
+      capacityWaitBudgetMs: true,
+      capacityWaitBudgetMode: true,
+      ModelPool: {
+        select: {
+          capacityContextCeiling: true,
+          capacityContextMargin: true,
+          capacityWaitBudgetMs: true,
+          affinityEnabled: true,
+          affinityTtlSeconds: true,
+          affinityMaxRecords: true,
+          affinityPrefixWeight: true,
+          affinityConversationWeight: true,
+          affinityConfirmedCacheWeight: true,
+          affinityLoadPenaltyWeight: true,
+        },
+      },
+      ExecutionTarget: {
+        select: {
+          id: true,
+          inferenceCapacityId: true,
+          InferenceCapacity: {
+            select: {
+              id: true,
+              hardConcurrencyLimit: true,
+              physicalMaxContext: true,
+              countStrategy: true,
+              runtimeIdentityKey: true,
+              runtimeModel: true,
+              runtimeRevision: true,
+              tokenizer: true,
+              tokenizerVersion: true,
+              template: true,
+              templateVersion: true,
+              engine: true,
+              cacheNamespace: true,
+            },
+          },
+          DiscoveredModel: {
+            select: {
+              id: true,
+              userId: true,
+              published: true,
+              upstreamModelId: true,
+              capabilityOverrideMode: true,
+              capabilityOverrideMetadata: true,
+              Endpoint: {
+                select: {
+                  id: true,
+                  slug: true,
+                  published: true,
+                  cliDeviceId: true,
+                  status: true,
+                  capabilityMetadata: true,
+                  CliDevice: { select: { status: true } },
+                },
+              },
+            },
+          },
+        },
+      },
       weight: true,
       healthStatus: true,
       routingStatus: true,
@@ -1258,7 +3015,12 @@ async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
         },
       },
     },
-  })) as PoolMemberRelayRow[];
+  });
+  return rows.flatMap((row) => {
+    const discoveredModel = row.ExecutionTarget?.DiscoveredModel ?? row.DiscoveredModel;
+    if (!discoveredModel) return [];
+    return [{ ...row, discoveredModelId: discoveredModel.id, DiscoveredModel: discoveredModel }];
+  }) as PoolMemberRelayRow[];
 }
 
 function directTargetByModelId(targets: VisibleDirectModelTarget[], modelId: string) {
@@ -1309,9 +3071,39 @@ async function modelListResponse(targets: {
     poolIds.length === 0
       ? []
       : await prisma.poolMember.findMany({
-          where: { poolId: { in: poolIds } },
+          // Model-list capabilities describe the local pool. Provider overflow
+          // is deliberately not advertised as ordinary local capacity.
+          where: {
+            poolId: { in: poolIds },
+            tier: "PRIMARY",
+            OR: [
+              { ExecutionTarget: { DiscoveredModel: { isNot: null } } },
+              { ExecutionTarget: { ProviderModel: { isNot: null } } },
+            ],
+          },
           select: {
             poolId: true,
+            ExecutionTarget: {
+              select: {
+                DiscoveredModel: {
+                  select: {
+                    capabilityOverrideMode: true,
+                    capabilityOverrideMetadata: true,
+                    Endpoint: { select: { capabilityMetadata: true } },
+                  },
+                },
+                ProviderModel: {
+                  select: {
+                    enabled: true,
+                    deletedAt: true,
+                    nativeCapabilities: true,
+                    ProviderAccount: {
+                      select: { enabled: true, deletedAt: true },
+                    },
+                  },
+                },
+              },
+            },
             DiscoveredModel: {
               select: {
                 capabilityOverrideMode: true,
@@ -1387,12 +3179,20 @@ async function modelListResponse(targets: {
     const memberFlags = poolMemberRows
       .filter((row) => row.poolId === poolId)
       .map((row) => {
-        const dm = row.DiscoveredModel;
-        const caps = effectiveCapabilitiesFrom({
-          capabilityOverrideMode: dm.capabilityOverrideMode,
-          capabilityOverrideMetadata: dm.capabilityOverrideMetadata,
-          endpointCapabilityMetadata: dm.Endpoint.capabilityMetadata,
-        });
+        const dm = row.ExecutionTarget?.DiscoveredModel ?? row.DiscoveredModel;
+        const provider = row.ExecutionTarget?.ProviderModel;
+        const caps = dm
+          ? effectiveCapabilitiesFrom({
+              capabilityOverrideMode: dm.capabilityOverrideMode,
+              capabilityOverrideMetadata: dm.capabilityOverrideMetadata,
+              endpointCapabilityMetadata: dm.Endpoint.capabilityMetadata,
+            })
+          : provider?.enabled &&
+              !provider.deletedAt &&
+              provider.ProviderAccount.enabled &&
+              !provider.ProviderAccount.deletedAt
+            ? parseOpenAiCompatibleCapabilities(provider.nativeCapabilities)
+            : null;
         return multimodalFlagsFromCapabilities(caps);
       });
     let flags = unionMultimodalFlags(memberFlags);
@@ -1461,6 +3261,7 @@ async function relayDirect({
   operation,
   manager,
   limiter,
+  capacityRuntime,
 }: {
   request: Request;
   requester: RelayRequester;
@@ -1468,6 +3269,7 @@ async function relayDirect({
   operation: RelayOperation;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
+  capacityRuntime?: CapacityAdmissionRuntime;
 }): Promise<Response> {
   const startedAt = new Date();
   const relayRequestId = await createRelayMetadata({
@@ -1475,14 +3277,16 @@ async function relayDirect({
     modelApiTokenId: requester.modelApiTokenId,
     modelApiTokenLookupPrefix: requester.modelApiTokenLookupPrefix,
     requestedDiscoveredModelId: target.id,
+    requestedSurface: telemetrySurfaceForOperation(operation),
     operation: operation.capability,
     requestBytes: null,
+    contextCount: operation.contextCount,
   });
   const selected = await directModelRow(target.id);
   if (!selected) {
     await operation.dispose?.();
     await failRelayMetadata({ relayRequestId, startedAt, failure: "not_found" });
-    return openAiFailureJsonResponse("not_found");
+    return operationFailureResponse(operation, "not_found");
   }
   const capabilities = effectiveDirectCapabilities(selected);
   const optimisticBasic =
@@ -1506,7 +3310,7 @@ async function relayDirect({
       failure: "unsupported_capability",
       selectedDiscoveredModelId: selected.id,
     });
-    return openAiFailureJsonResponse("unsupported_capability");
+    return operationFailureResponse(operation, "unsupported_capability");
   }
   if (!isEndpointConnected(selected, new Set(manager.getActiveCliDeviceIds()))) {
     await operation.dispose?.();
@@ -1516,7 +3320,95 @@ async function relayDirect({
       failure: "disconnected",
       selectedDiscoveredModelId: selected.id,
     });
-    return openAiFailureJsonResponse("disconnected");
+    return operationFailureResponse(operation, "disconnected");
+  }
+
+  if (capacityRuntime && operation.contextInput) {
+    try {
+      const exactCount = await nativeContextCount({
+        request,
+        selected,
+        operation,
+        manager,
+        relayRequestId,
+        requester,
+      });
+      if (exactCount) {
+        operation.contextCount = exactCount;
+        await updateContextCountMetadata(relayRequestId, exactCount);
+      }
+    } catch {
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "cancelled" });
+      return operationFailureResponse(operation, "cancelled");
+    }
+  }
+
+  let capacityLease: Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>> | undefined;
+  if (capacityRuntime) {
+    const identity = selected.ExecutionTarget;
+    if (!identity?.inferenceCapacityId) {
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "unsupported_capability" });
+      return operationFailureResponse(operation, "unsupported_capability");
+    }
+    if (
+      operation.contextCount &&
+      !contextFitsLimits({
+        count: operation.contextCount,
+        physicalMaxContext: identity.InferenceCapacity?.physicalMaxContext,
+        effectiveContextCeiling: identity.directContextCeiling,
+        contextMargin: identity.directContextMargin ?? 0,
+      })
+    ) {
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "request_too_large" });
+      return contextExceededResponse(
+        operation,
+        "Request context exceeds the configured execution capacity ceiling.",
+      );
+    }
+    try {
+      capacityLease = await acquireCapacityWithTelemetry({
+        runtime: capacityRuntime,
+        relayRequestId,
+        attempt: {
+          // Every retry gets a unique attemptId while retaining the durable
+          // relay request link. AdmissionRequest/Lease rows therefore preserve
+          // the full attempt history even though RelayRequest exposes the most
+          // recently active admission as a convenience projection.
+          requestId: crypto.randomUUID(),
+          relayRequestId,
+          attemptId: crypto.randomUUID(),
+          ownerId: selected.userId,
+          sourceKind: "DIRECT",
+          basePriority: 16,
+          connectionOwner: "model-api",
+          deadlineAt: boundedAdmissionDeadline(
+            Date.now(),
+            startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS,
+            identity.directWaitBudgetMs ?? null,
+          ),
+          candidates: [
+            {
+              capacityId: identity.inferenceCapacityId,
+              executionTargetId: identity.id,
+              candidateOrder: 0,
+            },
+          ],
+        },
+        signal: request.signal,
+      });
+    } catch {
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "unknown" });
+      return operationFailureResponse(operation, "unknown");
+    }
+    if (capacityLease.state !== "ADMITTED") {
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "rate_limited" });
+      return operationFailureResponse(operation, "rate_limited");
+    }
   }
 
   let globalLease: ModelApiLimitLease | undefined;
@@ -1528,106 +3420,193 @@ async function relayDirect({
     });
     cliLease = limiter.acquireCli(selected.Endpoint.cliDeviceId);
   } catch (error) {
-    cliLease?.release();
-    globalLease?.release();
+    await settleRelayCleanup([
+      () => cliLease?.release(),
+      () => globalLease?.release(),
+      () =>
+        capacityLease?.state === "ADMITTED"
+          ? capacityRuntime?.release(capacityLease.lease)
+          : undefined,
+      () => operation.dispose?.(),
+    ]);
     if (error instanceof ModelApiLimitError) {
-      await operation.dispose?.();
       await failRelayMetadata({
         relayRequestId,
         startedAt,
         failure: error.failure,
         selectedDiscoveredModelId: selected.id,
       });
-      return openAiFailureJsonResponse(error.failure);
+      return operationFailureResponse(operation, error.failure);
     }
-    throw error;
-  }
-
-  let builtRequest: BuiltRelayRequest;
-  try {
-    builtRequest = await operation.buildRequest(selected.upstreamModelId);
-  } catch {
-    cliLease.release();
-    globalLease.release();
-    await operation.dispose?.();
     await failRelayMetadata({
       relayRequestId,
       startedAt,
       failure: "unknown",
       selectedDiscoveredModelId: selected.id,
     });
-    return openAiFailureJsonResponse("unknown");
+    return operationFailureResponse(operation, "unknown");
+  }
+
+  let builtRequest: BuiltRelayRequest;
+  try {
+    builtRequest = await operation.buildRequest(selected.upstreamModelId);
+  } catch {
+    await settleRelayCleanup([
+      () => cliLease.release(),
+      () => globalLease?.release(),
+      () =>
+        capacityLease?.state === "ADMITTED"
+          ? capacityRuntime?.release(capacityLease.lease)
+          : undefined,
+      () => operation.dispose?.(),
+    ]);
+    await failRelayMetadata({
+      relayRequestId,
+      startedAt,
+      failure: "unknown",
+      selectedDiscoveredModelId: selected.id,
+    });
+    return operationFailureResponse(operation, "unknown");
   }
   const responseIdCapture =
     operation.responseStickiness && operation.family === "responses"
       ? createResponseIdCapture()
       : null;
-  const attempt = startRelayAttempt({
-    manager,
-    cliDeviceId: selected.Endpoint.cliDeviceId,
-    endpointSlug: selected.Endpoint.slug,
-    family: operation.family,
-    method: operation.method,
-    path: operation.path,
-    headers: builtRequest.headers,
-    ...relayAttemptBody(builtRequest.body),
-    timeoutMs: MODEL_API_RELAY_TIMEOUT_MS,
-    abortSignal: request.signal,
-    onResponseBodyChunk: responseIdCapture
-      ? (chunk) => responseIdCapture.push(chunk, operation.stream)
-      : undefined,
-  });
+  let attempt: ReturnType<typeof startRelayAttempt> | null = null;
+  const localExecution: LocalExecutionTelemetry = {
+    selectedExecutionTargetId: selected.ExecutionTarget?.id,
+    nativeSurface: telemetrySurfaceForOperation(operation),
+    requestedSurface: telemetrySurfaceForOperation(operation),
+    adapterMode: "NATIVE",
+    localAttemptId: crypto.randomUUID(),
+    contextCount: operation.contextCount,
+    admission:
+      capacityLease?.state === "ADMITTED"
+        ? {
+            attemptId: capacityLease.lease.attemptId,
+            leaseId: capacityLease.lease.leaseId,
+            fencingToken: capacityLease.lease.fencingToken,
+          }
+        : undefined,
+  };
+  try {
+    await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
+    attempt = startRelayAttempt({
+      requestId: localExecution.localAttemptId,
+      manager,
+      cliDeviceId: selected.Endpoint.cliDeviceId,
+      endpointSlug: selected.Endpoint.slug,
+      family: operation.family,
+      method: operation.method,
+      path: operation.path,
+      headers: builtRequest.headers,
+      ...relayAttemptBody(builtRequest.body),
+      timeoutMs: MODEL_API_RELAY_TIMEOUT_MS,
+      abortSignal: request.signal,
+      onResponseBodyChunk: responseIdCapture
+        ? (chunk) => responseIdCapture.push(chunk, operation.stream)
+        : undefined,
+    });
+  } catch {
+    attempt?.cancel("unknown");
+    await settleRelayCleanup([
+      () => cliLease.release(),
+      () => globalLease?.release(),
+      () =>
+        capacityLease?.state === "ADMITTED"
+          ? capacityRuntime?.release(capacityLease.lease)
+          : undefined,
+      () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
+      () => operation.dispose?.(),
+    ]);
+    await failRelayMetadata({
+      relayRequestId,
+      startedAt,
+      failure: "unknown",
+      selectedDiscoveredModelId: selected.id,
+      attemptCount: 1,
+    });
+    return operationFailureResponse(operation, "unknown");
+  }
+  if (!attempt) throw new Error("local relay attempt was not initialized");
 
   try {
     const started = await attempt.started;
     const finalize = attempt.terminal
+      .catch(() => rejectedRelayTerminal())
       .then(async (terminal) => {
-        cliLease.release();
-        globalLease.release();
-        if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
-        await operation.dispose?.();
-        await updateRelayMetadata(relayRequestId, {
-          selectedDiscoveredModelId: selected.id,
-          status: terminalStatus(terminal),
-          startedAt,
-          terminal,
-          attemptCount: 1,
-        });
+        const cleanup = await Promise.allSettled([
+          Promise.resolve().then(() => cliLease.release()),
+          Promise.resolve().then(() => globalLease.release()),
+          builtRequest.body instanceof Uint8Array ? Promise.resolve() : builtRequest.body.dispose(),
+          operation.dispose?.() ?? Promise.resolve(),
+        ]);
+        reportCleanupFailures(cleanup);
         const responseId = responseIdCapture?.finish(operation.stream) ?? null;
-        if (terminal.ok && responseId && operation.responseStickiness) {
-          await writeResponseStickiness({
-            ...operation.responseStickiness,
-            responseId,
-            targetDiscoveredModelId: target.id,
+        await Promise.allSettled([
+          updateRelayMetadata(relayRequestId, {
             selectedDiscoveredModelId: selected.id,
-          }).catch(stickinessWriteError);
-        }
+            status: terminalStatus(terminal),
+            startedAt,
+            terminal,
+            attemptCount: 1,
+            localExecution,
+            userId: requester.userId,
+          }).catch(metadataUpdateError),
+          terminal.ok && responseId && operation.responseStickiness
+            ? writeResponseStickiness({
+                ...operation.responseStickiness,
+                responseId,
+                targetDiscoveredModelId: target.id,
+                selectedDiscoveredModelId: selected.id,
+              }).catch(stickinessWriteError)
+            : Promise.resolve(),
+        ]);
       })
       .catch(metadataUpdateError);
     void finalize;
-    return new Response(
-      responseBodyForOperation({
-        body: started.body,
-        headers: started.headers,
-        terminal: attempt.terminal,
-        operation,
-      }),
-      { status: started.status, headers: started.headers },
+    const response = responseWithFirstClientByte(
+      new Response(
+        responseBodyForOperation({
+          body: started.body,
+          headers: started.headers,
+          terminal: attempt.terminal,
+          operation,
+        }),
+        { status: started.status, headers: started.headers },
+      ),
+      () => markLocalFirstClientByte(relayRequestId, requester.userId, localExecution),
     );
+    return capacityLease?.state === "ADMITTED" && capacityRuntime
+      ? await holdOrReleaseCapacityResponse(
+          capacityRuntime,
+          response,
+          capacityLease.lease,
+          request.signal,
+        )
+      : response;
   } catch {
-    const terminal = await attempt.terminal;
-    cliLease.release();
-    globalLease.release();
-    if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
-    await operation.dispose?.();
+    const terminal = await attempt.terminal.catch(() => rejectedRelayTerminal());
+    const cleanup = await Promise.allSettled([
+      Promise.resolve().then(() => cliLease.release()),
+      Promise.resolve().then(() => globalLease?.release()),
+      capacityLease?.state === "ADMITTED"
+        ? (capacityRuntime?.release(capacityLease.lease) ?? Promise.resolve(false))
+        : Promise.resolve(),
+      builtRequest.body instanceof Uint8Array ? Promise.resolve() : builtRequest.body.dispose(),
+      operation.dispose?.() ?? Promise.resolve(),
+    ]);
+    reportCleanupFailures(cleanup);
     await updateRelayMetadata(relayRequestId, {
       selectedDiscoveredModelId: selected.id,
       status: terminalStatus(terminal),
       startedAt,
       terminal,
       attemptCount: 1,
+      localExecution,
+      userId: requester.userId,
     });
-    return openAiFailureJsonResponse(terminal.failure ?? "unknown");
+    return operationFailureResponse(operation, terminal.failure ?? "unknown");
   }
 }
 
@@ -1639,6 +3618,7 @@ async function relayPool({
   manager,
   limiter,
   transformDebug,
+  capacityRuntime,
 }: {
   request: Request;
   requester: RelayRequester;
@@ -1647,49 +3627,661 @@ async function relayPool({
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
   transformDebug?: TransformDebug;
+  capacityRuntime?: CapacityAdmissionRuntime;
 }): Promise<Response> {
   const startedAt = new Date();
+  const requestedSurface = requestedSurfaceForOperation(operation);
+  const testRoutingMode = resolveChatTestRoutingMode(
+    request.headers.get("x-wsmp-chat-test-routing-mode"),
+    requester.exposeTransformDebug === true,
+  );
+  const forcedPoolMemberId =
+    requester.exposeTransformDebug === true
+      ? request.headers.get("x-wsmp-chat-test-member-id")?.trim() || undefined
+      : undefined;
+  const relayDeadlineMs = startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS;
   const relayRequestId = await createRelayMetadata({
     userId: requester.userId,
     modelApiTokenId: requester.modelApiTokenId,
     modelApiTokenLookupPrefix: requester.modelApiTokenLookupPrefix,
     requestedModelPoolId: target.id,
+    requestedSurface: telemetrySurfaceForOperation(operation),
     transformerLatencyMs: transformDebug?.latencyMs ?? null,
     transformerCacheHit: transformDebug?.cacheHit ?? null,
     transformerErrorClass: transformDebug?.error ?? null,
     operation: operation.capability,
     requestBytes: null,
+    contextCount: operation.contextCount,
   });
 
-  let globalLease: ModelApiLimitLease;
-  try {
-    globalLease = limiter.acquireGlobal({
-      tokenId: requester.limitKey,
-      userId: requester.userId,
-    });
-  } catch (error) {
-    if (error instanceof ModelApiLimitError) {
-      await operation.dispose?.();
-      await failRelayMetadata({ relayRequestId, startedAt, failure: error.failure });
-      return openAiFailureJsonResponse(error.failure);
-    }
-    throw error;
-  }
+  // A provider lease admitted by the pool-routing loop remains owned by this
+  // request until dispatch commits it to the response. Keep cleanup idempotent
+  // across the nested dispatcher and its caller so every precommit exit,
+  // including a rejected dispatch promise, releases the lease exactly once.
+  const releasedPreAdmittedProviderLeaseIds = new Set<string>();
+  const releasePreAdmittedProviderLease = async (
+    lease: Extract<
+      Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>>,
+      { state: "ADMITTED" }
+    >["lease"],
+  ) => {
+    if (releasedPreAdmittedProviderLeaseIds.has(lease.leaseId)) return;
+    releasedPreAdmittedProviderLeaseIds.add(lease.leaseId);
+    await capacityRuntime?.release(lease);
+  };
 
-  const members = await poolMemberRows(target.id);
-  const knownEligibleMembers = members.filter((member) =>
-    supportsOperation({
-      capabilities: effectivePoolMemberCapabilities(member),
-      operation,
-    }),
+  const tryPublicOverflow = async (
+    reason: PublicOverflowReason,
+    releaseLocalCapacity: () => Promise<void>,
+    options?: {
+      onlyTier?: "PRIMARY" | "PUBLIC_OVERFLOW";
+      forcedProviderMemberId?: string;
+      preAdmittedProviderLease?: Extract<
+        Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>>,
+        { state: "ADMITTED" }
+      >["lease"];
+    },
+  ): Promise<Response | null> => {
+    // Public provider dispatch is intentionally limited to replayable modern
+    // JSON operations. Stateful Responses and multipart/audio paths must retain
+    // their exact target or fail safely.
+    if (!operation.contextInput) return null;
+    const providerResponsesStickiness =
+      operation.family === "responses" && operation.responseStickiness !== undefined;
+    let built: BuiltRelayRequest;
+    try {
+      built = await operation.buildRequest("__public_provider_model__");
+    } catch {
+      return null;
+    }
+    if (!(built.body instanceof Uint8Array)) {
+      await built.body.dispose();
+      return null;
+    }
+    const publicRequestBytes = built.body.byteLength;
+    const requestedProtocol: "openai" | "anthropic" =
+      operation.family === "messages" ? "anthropic" : "openai";
+    const requestedSurface: ProtocolSurface =
+      operation.family === "messages"
+        ? "anthropic-messages"
+        : operation.family === "responses"
+          ? "openai-responses"
+          : "openai-chat";
+    const maxOutput = operation.contextInput.max_output_tokens ?? operation.contextInput.max_tokens;
+    const requestedFeatures = profileSurfaceRequest(operation.contextInput);
+    const requiredFeatures = Object.entries(requestedFeatures)
+      .filter(([, enabled]) => enabled === true)
+      .map(([feature]) => feature);
+    const requestedOutputTokens =
+      typeof maxOutput === "number" && Number.isSafeInteger(maxOutput) && maxOutput >= 0
+        ? BigInt(maxOutput)
+        : undefined;
+    const estimatedInputTokens =
+      operation.contextCount?.tokens !== undefined
+        ? BigInt(operation.contextCount.tokens)
+        : conservativeSerializedInputTokens(publicRequestBytes);
+    const canonical = operation.adaptation
+      ? (() => {
+          try {
+            return parseCanonicalRequest(
+              operation.adaptation!.requestedSurface,
+              operation.adaptation!.payload,
+            );
+          } catch {
+            return null;
+          }
+        })()
+      : null;
+    let localCapacityReleased = false;
+    const releaseProviderCapacity = async () => {
+      if (localCapacityReleased) return;
+      localCapacityReleased = true;
+      await releaseLocalCapacity();
+    };
+    const providerRequest = {
+      // Provider configuration and budgets belong to the pool owner. The
+      // requester may be an explicitly granted tenant; relay metadata and the
+      // stickiness visibility tuple remain requester/token scoped.
+      userId: target.ownerUserId,
+      affinityTenantUserId: requester.userId,
+      affinitySecurityScope: requester.limitKey,
+      affinityAccessGrantId: target.accessGrantId,
+      poolId: target.id,
+      requestId: relayRequestId,
+      reason,
+      requestedProtocol,
+      requestedSurface,
+      stream: operation.stream,
+      requiredFeatures,
+      path: operation.path,
+      headers: built.headers,
+      body: built.body,
+      signal: request.signal,
+      releaseLocalCapacity: releaseProviderCapacity,
+      adaptationEnabled:
+        operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled,
+      chatTestRoutingMode: testRoutingMode,
+      forcedPoolMemberId: options?.forcedProviderMemberId ?? forcedPoolMemberId,
+      retrySafe:
+        shouldRetryRelayOperation(operation, "precommit_5xx") &&
+        shouldRetryRelayOperation(operation, "precommit_transport"),
+      requireNativeSurface: providerResponsesStickiness ? "openai-responses" : undefined,
+      liability:
+        requestedOutputTokens === undefined
+          ? { accountingVersion: "provider-billable-v1" }
+          : conservativeProviderLiability({ estimatedInputTokens, requestedOutputTokens }),
+      estimatedInputTokens,
+      contextTokens:
+        requestedOutputTokens === undefined
+          ? undefined
+          : estimatedInputTokens + requestedOutputTokens,
+      requestedOutputTokens,
+      contextCountMethod: operation.contextCount?.method,
+      contextCountConfidence: operation.contextCount?.confidence,
+      renderForTarget: canonical
+        ? async (providerTarget, targetSurface) => {
+            const payload = renderCanonicalRequest({
+              request: canonical,
+              target: targetSurface,
+              model: providerTarget.upstreamModelId,
+              allowLossyDeveloperRoleCollapse:
+                operation.adaptation?.allowLossyDeveloperRoleCollapse,
+            });
+            const headers = new Headers({ "content-type": "application/json" });
+            if (providerTarget.protocol === "anthropic")
+              headers.set("anthropic-version", providerTarget.providerVersion ?? "2023-06-01");
+            return {
+              protocol: providerTarget.protocol,
+              path:
+                targetSurface === "anthropic-messages"
+                  ? "/v1/messages"
+                  : targetSurface === "openai-responses"
+                    ? "/v1/responses"
+                    : "/v1/chat/completions",
+              headers,
+              body: new TextEncoder().encode(JSON.stringify(payload)),
+            };
+          }
+        : undefined,
+    } satisfies PublicOverflowRequest;
+    let providerCapacityLease:
+      | Extract<
+          Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>>,
+          { state: "ADMITTED" }
+        >["lease"]
+      | undefined;
+    const dispatchProviderTier = async (memberTier: "PRIMARY" | "PUBLIC_OVERFLOW") => {
+      if (options?.preAdmittedProviderLease && memberTier === "PRIMARY") {
+        let result: Awaited<ReturnType<typeof dispatchPublicOverflow>>;
+        try {
+          result = await dispatchPublicOverflow({
+            ...providerRequest,
+            memberTier,
+            forcedPoolMemberId: options.forcedProviderMemberId,
+          });
+        } catch (error) {
+          await releasePreAdmittedProviderLease(options.preAdmittedProviderLease);
+          throw error;
+        }
+        if (!result.dispatched) {
+          await releasePreAdmittedProviderLease(options.preAdmittedProviderLease);
+          return result;
+        }
+        providerCapacityLease = options.preAdmittedProviderLease;
+        return result;
+      }
+      // Provider egress never has a direct-dispatch fallback. Durable global
+      // admission supplies the cross-process concurrency fence; without it a
+      // provider request must fail closed even if legacy configuration exists.
+      if (!capacityRuntime) return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" } as const;
+      const listed = await listPublicOverflowTargets(target.ownerUserId, target.id, memberTier);
+      const compatible = orderChatTestProviderTargets(
+        listed.targets.flatMap((providerTarget) => {
+          if (
+            providerRequest.forcedPoolMemberId &&
+            providerTarget.poolMemberId !== providerRequest.forcedPoolMemberId
+          )
+            return [];
+          const resolvedExecution = resolvePublicProviderExecution(providerTarget, providerRequest);
+          const resolvedTarget = { ...providerTarget, resolvedExecution };
+          return publicTargetCompatibility(providerTarget, providerRequest) === "COMPATIBLE" &&
+            matchesChatTestProviderMode(resolvedTarget, requestedSurface, testRoutingMode)
+            ? [resolvedTarget]
+            : [];
+        }),
+        requestedSurface,
+        testRoutingMode,
+      );
+      // A provider-backed primary is a physical execution target too. Missing
+      // capacity identity is a configuration error, never permission to bypass
+      // durable concurrency and fencing.
+      if (compatible.length === 0 || compatible.some((item) => !item.inferenceCapacityId))
+        return { dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" } as const;
+      await releaseProviderCapacity();
+      let remaining = compatible;
+      let lastResult: Awaited<ReturnType<typeof dispatchPublicOverflow>> = {
+        dispatched: false,
+        reason: "PROVIDER_UNAVAILABLE",
+      };
+      while (
+        remaining.length > 0 &&
+        !request.signal.aborted &&
+        remainingRelayBudgetMs(relayDeadlineMs) > 0
+      ) {
+        const admissionStartedAt = Date.now();
+        const admission = await acquireCapacityWithTelemetry({
+          runtime: capacityRuntime,
+          relayRequestId,
+          attempt: {
+            requestId: crypto.randomUUID(),
+            relayRequestId,
+            attemptId: crypto.randomUUID(),
+            ownerId: target.ownerUserId,
+            sourceKind: "POOL",
+            poolId: target.id,
+            basePriority: 16,
+            connectionOwner: "model-api-provider",
+            deadlineAt: new Date(relayDeadlineMs),
+            candidates: remaining.map((providerTarget, candidateOrder) => ({
+              capacityId: providerTarget.inferenceCapacityId!,
+              executionTargetId: providerTarget.executionTargetId,
+              poolMemberId: providerTarget.poolMemberId,
+              candidateOrder,
+              deadlineAt: boundedAdmissionDeadline(
+                admissionStartedAt,
+                relayDeadlineMs,
+                providerTarget.capacityWaitBudgetMs ?? null,
+              ),
+            })),
+          },
+          signal: request.signal,
+        });
+        if (admission.state !== "ADMITTED" || !admission.lease.poolMemberId)
+          return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" } as const;
+        const selectedPoolMemberId = admission.lease.poolMemberId;
+        if (!remaining.some((item) => item.poolMemberId === selectedPoolMemberId)) {
+          await capacityRuntime.release(admission.lease);
+          return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" } as const;
+        }
+        let result: Awaited<ReturnType<typeof dispatchPublicOverflow>>;
+        try {
+          result = await dispatchPublicOverflow({
+            ...providerRequest,
+            memberTier,
+            forcedPoolMemberId: selectedPoolMemberId,
+            retrySingleTargetPrecommit: remaining.length > 1,
+          });
+        } catch (error) {
+          // Admission owns the lease until dispatch commits successfully. A
+          // rejected dispatch must not strand an ACTIVE lease or continue to
+          // another member as though this were a classified precommit result.
+          await capacityRuntime.release(admission.lease);
+          throw error;
+        }
+        if (result.dispatched) {
+          providerCapacityLease = admission.lease;
+          return result;
+        }
+        await capacityRuntime.release(admission.lease);
+        lastResult = result;
+        // A provider attempt that did not commit is retryable only under the
+        // operation's existing exact retry policy. Never re-admit the same
+        // physical member during this tier traversal.
+        if (!providerRequest.retrySafe) return result;
+        remaining = remaining.filter((item) => item.poolMemberId !== selectedPoolMemberId);
+      }
+      return lastResult;
+    };
+    let selectedTier: "PRIMARY" | "PUBLIC_OVERFLOW" = options?.onlyTier ?? "PRIMARY";
+    let result = await dispatchProviderTier(selectedTier);
+    if (!result.dispatched && !options?.onlyTier) {
+      selectedTier = "PUBLIC_OVERFLOW";
+      result = await dispatchProviderTier(selectedTier);
+    }
+    if (!result.dispatched) return null;
+    await prisma.relayRequest
+      .update({
+        where: { id: relayRequestId },
+        data: {
+          selectedExecutionTargetId: result.target.executionTargetId,
+          selectedPoolMemberId: result.target.poolMemberId,
+          selectedNativeSurface: modelApiSurface(result.nativeSurface),
+          adapterMode: result.nativeSurface === requestedSurface ? "NATIVE" : "ADAPTED",
+          adapterVersion: result.nativeSurface === requestedSurface ? null : "1.0.0",
+          // Provider-backed PRIMARY is still external egress even though it is
+          // not public fallback. The tier and overflow reason distinguish it.
+          publicEgress: true,
+          publicOverflowReason: selectedTier === "PUBLIC_OVERFLOW" ? reason : null,
+          selectedPoolMemberTier: selectedTier,
+          providerAccountId: result.target.providerAccountId,
+          providerModelId: result.target.providerModelId,
+          providerAttemptId: result.attemptId,
+          providerFencingToken: result.fencingToken,
+          attemptCount: result.attemptCount,
+          affinityOutcome: result.affinity?.outcome ?? "DISABLED",
+          affinityScore: result.affinity?.score,
+          affinityPrefixDepth: result.affinity?.prefixDepth,
+          affinityReason: result.affinity?.reason,
+        },
+        select: { id: true },
+      })
+      .catch(metadataUpdateError);
+    void result.terminal
+      .then(async (terminal) => {
+        const completedAt = new Date();
+        await Promise.allSettled([
+          prisma.relayRequest.update({
+            where: { id: relayRequestId },
+            data: {
+              selectedExecutionTargetId: result.target.executionTargetId,
+              status: terminal.ok ? "SUCCEEDED" : request.signal.aborted ? "CANCELED" : "FAILED",
+              completedAt,
+              durationMs: Math.max(0, completedAt.getTime() - startedAt.getTime()),
+              httpStatusCode: result.response.status,
+              upstreamStatusCode: result.response.status,
+              requestBytes: BigInt(publicRequestBytes),
+              responseBytes: BigInt(terminal.responseBytes),
+              attemptCount: result.attemptCount,
+              errorClass: terminal.ok ? null : request.signal.aborted ? "cancelled" : "unknown",
+            },
+            select: { id: true },
+          }),
+          operation.dispose?.() ?? Promise.resolve(),
+        ]);
+      })
+      .catch(metadataUpdateError);
+    // Native response bytes remain opaque. Cross-protocol provider response
+    // adaptation is handled by the same strict streaming/non-streaming state
+    // machines as local targets.
+    const commitAwareResponse = async (response: Response) => {
+      const committed = responseWithFirstClientByte(response, result.markFirstClientByte);
+      return providerCapacityLease && capacityRuntime
+        ? await holdOrReleaseCapacityResponse(
+            capacityRuntime,
+            committed,
+            providerCapacityLease,
+            request.signal,
+          )
+        : committed;
+    };
+    if (
+      result.nativeSurface === requestedSurface &&
+      (result.response.status < 200 || result.response.status >= 300)
+    ) {
+      let sanitized: Uint8Array;
+      try {
+        sanitized = await readAdaptedNonstreamBody({
+          body: result.response.body,
+          source: requestedSurface,
+          target: requestedSurface,
+          status: result.response.status,
+          headers: result.response.headers,
+          signal: request.signal,
+        });
+      } catch (error) {
+        if (providerCapacityLease) await releasePreAdmittedProviderLease(providerCapacityLease);
+        throw error;
+      }
+      return commitAwareResponse(
+        new Response(sanitized, {
+          status:
+            result.response.status >= 400 && result.response.status <= 599
+              ? result.response.status
+              : 502,
+          headers: adaptedProviderResponseHeaders(
+            requestedSurface,
+            requestedSurface,
+            result.response.headers,
+            false,
+          ),
+        }),
+      );
+    }
+    if (result.nativeSurface === requestedSurface || !operation.adaptation) {
+      const response =
+        providerResponsesStickiness && result.nativeSurface === "openai-responses"
+          ? captureProviderResponseBinding({
+              response: result.response,
+              streaming: operation.stream,
+              requester,
+              targetModelPoolId: target.id,
+              poolGrantId: target.accessGrantId,
+              target: result.target,
+              terminal: result.terminal,
+            })
+          : result.response;
+      return commitAwareResponse(response);
+    }
+    const source: ProtocolSurface = result.nativeSurface;
+    const adaptedRequestLimitations = (() => {
+      try {
+        return parseCanonicalRequest(
+          operation.adaptation.requestedSurface,
+          operation.adaptation.payload,
+        ).limitations;
+      } catch {
+        return [];
+      }
+    })();
+    const adapterLimitations = [
+      "strict_common_subset",
+      ...(source === "anthropic-messages" ? adaptedRequestLimitations : []),
+    ].join(",");
+    // Providers return ordinary JSON error envelopes even when the successful
+    // operation would have streamed. Adapt that envelope as JSON; never feed
+    // it into an SSE state machine or advertise it as an event stream.
+    if (result.response.status < 200 || result.response.status >= 300) {
+      const adapted = await readAdaptedNonstreamBody({
+        body: result.response.body,
+        source,
+        target: operation.adaptation.requestedSurface,
+        status: result.response.status,
+        headers: result.response.headers,
+        signal: request.signal,
+      });
+      const adaptedHeaders = adaptedProviderResponseHeaders(
+        source,
+        operation.adaptation.requestedSurface,
+        result.response.headers,
+      );
+      adaptedHeaders.set("x-wsmp-adapter-limitations", adapterLimitations);
+      return commitAwareResponse(
+        new Response(adapted, {
+          status:
+            result.response.status >= 400 && result.response.status <= 599
+              ? result.response.status
+              : 502,
+          headers: adaptedHeaders,
+        }),
+      );
+    }
+    if (operation.stream) {
+      if (!result.response.body) {
+        const headers = new Headers(result.response.headers);
+        headers.set("x-wsmp-adapter-version", "1.0.0");
+        headers.set("x-wsmp-adapter-limitations", adapterLimitations);
+        return commitAwareResponse(new Response(null, { status: result.response.status, headers }));
+      }
+      return commitAwareResponse(
+        new Response(
+          adaptedResponseBody({
+            body: result.response.body,
+            source,
+            target: operation.adaptation.requestedSurface,
+            stream: true,
+            status: result.response.status,
+            headers: result.response.headers,
+            signal: request.signal,
+          }),
+          {
+            status: result.response.status,
+            headers: {
+              "content-type": "text/event-stream; charset=utf-8",
+              "x-wsmp-adapter-version": "1.0.0",
+              "x-wsmp-adapter-limitations": adapterLimitations,
+            },
+          },
+        ),
+      );
+    }
+    const bytes = new Uint8Array(await result.response.arrayBuffer());
+    const adapted = await readAdaptedNonstreamBody({
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(bytes);
+          controller.close();
+        },
+      }),
+      source,
+      target: operation.adaptation.requestedSurface,
+      status: result.response.status,
+      headers: result.response.headers,
+      signal: request.signal,
+    });
+    return commitAwareResponse(
+      new Response(adapted, {
+        status: result.response.status,
+        headers: {
+          "content-type": "application/json; charset=utf-8",
+          "x-wsmp-adapter-version": "1.0.0",
+          "x-wsmp-adapter-limitations": adapterLimitations,
+        },
+      }),
+    );
+  };
+
+  let globalLease: ModelApiLimitLease | undefined;
+
+  const listedMembers = await poolMemberRows(target.id);
+  const members = forcedPoolMemberId
+    ? listedMembers.filter((member) => member.id === forcedPoolMemberId)
+    : listedMembers;
+  const nativeCounts = new Map<string, ContextCountTelemetry>();
+  if (capacityRuntime && operation.contextInput) {
+    await Promise.all(
+      members.map(async (member) => {
+        const selected = {
+          ...member.DiscoveredModel,
+          optimisticBasicTranscription: false,
+          ExecutionTarget: member.ExecutionTarget,
+          Endpoint: {
+            ...member.DiscoveredModel.Endpoint,
+            status: member.DiscoveredModel.Endpoint.status ?? null,
+            CliDevice: member.DiscoveredModel.Endpoint.CliDevice ?? null,
+          },
+        } satisfies DirectModelRelayRow;
+        if (!isEndpointConnected(selected, new Set(manager.getActiveCliDeviceIds()))) return;
+        try {
+          const count = await nativeContextCount({
+            request,
+            selected,
+            operation,
+            manager,
+            relayRequestId,
+            requester,
+            pool: { id: target.id, memberId: member.id, tier: "PRIMARY" },
+          });
+          if (count) nativeCounts.set(member.id, count);
+        } catch {
+          // The request-level abort is handled by admission/relay below; an
+          // individual unavailable counter safely retains the estimate.
+        }
+      }),
+    );
+  }
+  const contextEligibleMembers = operation.contextCount
+    ? members.filter((member) =>
+        contextFitsLimits({
+          count: nativeCounts.get(member.id) ?? operation.contextCount!,
+          physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+          effectiveContextCeiling:
+            member.capacityContextCeilingMode === "UNLIMITED"
+              ? null
+              : member.capacityContextCeilingMode === "LIMITED" ||
+                  (member.capacityContextCeilingMode === undefined &&
+                    member.capacityContextCeiling != null)
+                ? member.capacityContextCeiling
+                : member.ModelPool?.capacityContextCeiling,
+          contextMargin:
+            member.capacityContextMargin ?? member.ModelPool?.capacityContextMargin ?? 0,
+        }),
+      )
+    : members;
+  let canonicalAdaptationRequest: ReturnType<typeof parseCanonicalRequest> | null = null;
+  if (operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled) {
+    try {
+      canonicalAdaptationRequest = parseCanonicalRequest(
+        operation.adaptation.requestedSurface,
+        operation.adaptation.payload,
+      );
+    } catch {
+      // Native members may still accept extensions outside the strict adapted subset.
+    }
+  }
+  const executionByMember = new Map(
+    contextEligibleMembers.map((member) => [
+      member.id,
+      executionPathForPoolMember(
+        effectivePoolMemberCapabilities(member),
+        operation,
+        canonicalAdaptationRequest,
+      ),
+    ]),
   );
+  const protocolCandidates = contextEligibleMembers.filter((member) => {
+    const execution = executionByMember.get(member.id);
+    if (!execution)
+      return supportsOperation({
+        capabilities: effectivePoolMemberCapabilities(member),
+        operation,
+      });
+    if (execution.mode === "unavailable") return false;
+    if (execution.mode === "native") return true;
+    const source = execution.nativeSurface ? protocolSurface(execution.nativeSurface) : null;
+    if (!source || !canonicalAdaptationRequest) return false;
+    try {
+      renderCanonicalRequest({
+        request: canonicalAdaptationRequest,
+        target: source,
+        model: member.DiscoveredModel.upstreamModelId,
+        allowLossyDeveloperRoleCollapse: operation.adaptation?.allowLossyDeveloperRoleCollapse,
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  const nativeProtocolCandidates = protocolCandidates.filter(
+    (member) => executionByMember.get(member.id)?.mode === "native",
+  );
+  // Native-compatible members are preferred as a class before health/weight scoring.
+  const adaptedProtocolCandidates = protocolCandidates.filter(
+    (member) => executionByMember.get(member.id)?.mode === "adapted",
+  );
+  const legacyProtocolCandidates = protocolCandidates.filter(
+    (member) => executionByMember.get(member.id) == null,
+  );
+  const selectedNativeProtocolCandidates = allowsChatTestExecutionMode(testRoutingMode, "native")
+    ? nativeProtocolCandidates
+    : [];
+  const selectedAdaptedProtocolCandidates = allowsChatTestExecutionMode(testRoutingMode, "adapted")
+    ? adaptedProtocolCandidates
+    : [];
+  const selectedLegacyProtocolCandidates = allowsChatTestExecutionMode(testRoutingMode, "legacy")
+    ? legacyProtocolCandidates
+    : [];
+  const knownEligibleMembers = [
+    ...selectedNativeProtocolCandidates,
+    ...selectedAdaptedProtocolCandidates,
+    ...selectedLegacyProtocolCandidates,
+  ];
   const knownIds = new Set(knownEligibleMembers.map((member) => member.id));
   const unknownFallbackMembers =
     target.optimisticBasicTranscription &&
     operation.capability === "audio.transcriptions" &&
     operation.transcriptionProfile &&
     isBasicTranscriptionRequest(operation.transcriptionProfile)
-      ? members.filter((member) => {
+      ? contextEligibleMembers.filter((member) => {
           if (knownIds.has(member.id)) return false;
           const capability = normalizeTranscriptionCapabilities(
             effectivePoolMemberCapabilities(member)?.audio?.transcriptions,
@@ -1699,21 +4291,134 @@ async function relayPool({
       : [];
   // Known-compatible members always route before optimistic unknown fallbacks.
   const eligibleMembers = [...knownEligibleMembers, ...unknownFallbackMembers];
-  if (eligibleMembers.length === 0) {
-    globalLease.release();
+  let providerPrimaryTargets: PublicProviderTarget[] = [];
+  let providerAffinityPolicy: AffinityPolicy | null = null;
+  let providerAffinityLiability: Pick<
+    PublicOverflowRequest,
+    "userId" | "requestedSurface" | "estimatedInputTokens" | "requestedOutputTokens" | "liability"
+  > | null = null;
+  if (
+    capacityRuntime &&
+    env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED &&
+    operation.contextInput &&
+    requestedSurface
+  ) {
+    const listed = await listPublicOverflowTargets(target.ownerUserId, target.id, "PRIMARY");
+    providerAffinityPolicy = listed.affinityPolicy;
+    const maxOutput = operation.contextInput.max_output_tokens ?? operation.contextInput.max_tokens;
+    const requestedOutputTokens =
+      typeof maxOutput === "number" && Number.isSafeInteger(maxOutput) && maxOutput >= 0
+        ? BigInt(maxOutput)
+        : undefined;
+    const estimatedInputTokens =
+      operation.contextCount?.tokens !== undefined
+        ? BigInt(operation.contextCount.tokens)
+        : conservativeSerializedInputTokens(
+            new TextEncoder().encode(JSON.stringify(operation.contextInput)).byteLength,
+          );
+    const requestedFeatures = profileSurfaceRequest(operation.contextInput);
+    const requiredFeatures = Object.entries(requestedFeatures)
+      .filter(([, enabled]) => enabled === true)
+      .map(([feature]) => feature);
+    providerAffinityLiability = {
+      userId: target.ownerUserId,
+      requestedSurface,
+      estimatedInputTokens,
+      requestedOutputTokens,
+      liability:
+        requestedOutputTokens === undefined
+          ? { accountingVersion: "provider-billable-v1" }
+          : conservativeProviderLiability({ estimatedInputTokens, requestedOutputTokens }),
+    };
+    const providerCompatibilityRequest = {
+      requestedProtocol: operation.family === "messages" ? "anthropic" : "openai",
+      requestedSurface,
+      stream: operation.stream,
+      requiredFeatures,
+      requestedOutputTokens,
+      adaptationEnabled:
+        operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled,
+      renderForTarget: canonicalAdaptationRequest
+        ? async () => {
+            throw new Error("Compatibility probe only.");
+          }
+        : undefined,
+      liability:
+        requestedOutputTokens === undefined
+          ? { accountingVersion: "provider-billable-v1" }
+          : conservativeProviderLiability({ estimatedInputTokens, requestedOutputTokens }),
+      estimatedInputTokens,
+      contextTokens:
+        requestedOutputTokens === undefined
+          ? undefined
+          : estimatedInputTokens + requestedOutputTokens,
+      path: operation.path,
+      headers: request.headers,
+      method: request.method,
+    } as const;
+    providerPrimaryTargets = (listed.acknowledged ? listed.targets : []).flatMap(
+      (providerTarget) => {
+        if (forcedPoolMemberId && providerTarget.poolMemberId !== forcedPoolMemberId) return [];
+        const resolvedExecution = resolvePublicProviderExecution(
+          providerTarget,
+          providerCompatibilityRequest,
+        );
+        const resolvedTarget = { ...providerTarget, resolvedExecution };
+        return publicTargetCompatibility(providerTarget, providerCompatibilityRequest) ===
+          "COMPATIBLE" &&
+          matchesChatTestProviderMode(resolvedTarget, requestedSurface, testRoutingMode)
+          ? [resolvedTarget]
+          : [];
+      },
+    );
+  }
+  if (
+    members.length > 0 &&
+    contextEligibleMembers.length === 0 &&
+    providerPrimaryTargets.length === 0
+  ) {
+    const overflow = await tryPublicOverflow("LOCAL_CONTEXT_CEILING", async () => undefined, {
+      onlyTier: "PUBLIC_OVERFLOW",
+    });
+    if (overflow) return overflow;
+    await operation.dispose?.();
+    await failRelayMetadata({ relayRequestId, startedAt, failure: "request_too_large" });
+    return contextExceededResponse(
+      operation,
+      "Request context exceeds every compatible pool member ceiling.",
+    );
+  }
+  if (eligibleMembers.length === 0 && providerPrimaryTargets.length === 0) {
+    const overflow = await tryPublicOverflow(
+      "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      async () => undefined,
+      { onlyTier: "PUBLIC_OVERFLOW" },
+    );
+    if (overflow) return overflow;
+    globalLease?.release();
     await operation.dispose?.();
     await failRelayMetadata({
       relayRequestId,
       startedAt,
       failure: "unsupported_capability",
     });
-    return openAiFailureJsonResponse("unsupported_capability");
+    return operationFailureResponse(operation, "unsupported_capability");
   }
 
   const activeCliDeviceIds = manager.getActiveCliDeviceIds();
   const now = new Date();
-  const knownSequence = buildPoolRouteSequence({
-    members: knownEligibleMembers,
+  const nativeSequence = buildPoolRouteSequence({
+    members: selectedNativeProtocolCandidates,
+    activeCliDeviceIds,
+    now,
+  });
+  const adaptedSequence = buildPoolRouteSequence({
+    members: selectedAdaptedProtocolCandidates,
+    activeCliDeviceIds,
+    now,
+  });
+  const legacySequence = buildPoolRouteSequence({
+    members: selectedLegacyProtocolCandidates,
     activeCliDeviceIds,
     now,
   });
@@ -1722,30 +4427,381 @@ async function relayPool({
     activeCliDeviceIds,
     now,
   });
-  const routeCandidates = [
-    ...(knownSequence.ok ? knownSequence.candidates : []),
+  const localRouteCandidates = [
+    ...(nativeSequence.ok ? nativeSequence.candidates : []),
+    ...(adaptedSequence.ok ? adaptedSequence.candidates : []),
+    ...(legacySequence.ok ? legacySequence.candidates : []),
     ...(unknownSequence.ok ? unknownSequence.candidates : []),
   ];
+  const providerByMemberId = new Map(
+    providerPrimaryTargets.map((providerTarget) => [providerTarget.poolMemberId, providerTarget]),
+  );
+  const providerRouteCandidates = providerPrimaryTargets.map((providerTarget) => ({
+    poolMemberId: providerTarget.poolMemberId,
+    poolId: target.id,
+    discoveredModelId: "",
+    upstreamModelId: providerTarget.upstreamModelId,
+    endpointId: providerTarget.executionTargetId,
+    cliDeviceId: "",
+    weight: providerTarget.weight ?? 1,
+    healthStatus: "HEALTHY" as const,
+    consecutiveRetryableFailures: 0,
+    lastFailureClass: null,
+    lastFailureAt: null,
+    nextRetryAt: null,
+  }));
+  const routeModeRank = (candidate: (typeof localRouteCandidates)[number]) => {
+    const provider = providerByMemberId.get(candidate.poolMemberId);
+    if (provider)
+      return provider.resolvedExecution
+        ? provider.resolvedExecution.mode === "native"
+          ? 0
+          : 1
+        : provider.nativeSurfaces.includes(requestedSurface!)
+          ? 0
+          : 1;
+    const mode = executionByMember.get(candidate.poolMemberId)?.mode;
+    return mode === "native" ? 0 : mode === "adapted" ? 1 : 2;
+  };
+  // Local and provider-backed PRIMARY members enter one scored sequence.
+  // Native compatibility is the first class; member weight is the shared
+  // score within a class, with stable member IDs providing deterministic ties.
+  let routeCandidates = [...localRouteCandidates, ...providerRouteCandidates].sort(
+    (left, right) =>
+      routeModeRank(left) - routeModeRank(right) ||
+      right.weight - left.weight ||
+      left.poolMemberId.localeCompare(right.poolMemberId),
+  );
   if (routeCandidates.length === 0) {
-    globalLease.release();
+    const overflow = await tryPublicOverflow(
+      "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      async () => undefined,
+      { onlyTier: "PUBLIC_OVERFLOW" },
+    );
+    if (overflow) return overflow;
+    globalLease?.release();
     await operation.dispose?.();
     await failRelayMetadata({ relayRequestId, startedAt, failure: "disconnected" });
-    return openAiFailureJsonResponse("disconnected");
+    return operationFailureResponse(operation, "disconnected");
   }
 
   const memberById = new Map(eligibleMembers.map((member) => [member.id, member] as const));
+  const admissionCandidateForRoute = (
+    candidate: (typeof routeCandidates)[number],
+    candidateOrder: number,
+    admissionStartedAt: number,
+  ) => {
+    const member = memberById.get(candidate.poolMemberId);
+    if (member)
+      return poolAdmissionCandidate(member, candidateOrder, admissionStartedAt, relayDeadlineMs);
+    const provider = providerByMemberId.get(candidate.poolMemberId);
+    if (!provider?.inferenceCapacityId) return null;
+    return {
+      capacityId: provider.inferenceCapacityId,
+      executionTargetId: provider.executionTargetId,
+      poolMemberId: provider.poolMemberId,
+      candidateOrder,
+      deadlineAt: boundedAdmissionDeadline(
+        admissionStartedAt,
+        relayDeadlineMs,
+        provider.capacityWaitBudgetMs ?? null,
+      ),
+    };
+  };
+  let affinityDecision: AffinityDecision | null = null;
+  const affinityPayload = operation.contextInput ?? operation.adaptation?.payload ?? null;
+  const affinityPolicy = eligibleMembers[0]
+    ? affinityPolicyForMember(eligibleMembers[0])
+    : (providerAffinityPolicy ?? {
+        enabled: false,
+        ttlSeconds: 3600,
+        maxRecords: 10_000,
+        prefixWeight: 100,
+        conversationWeight: 150,
+        confirmedCacheWeight: 250,
+        loadPenaltyWeight: 100,
+      });
+  if (requestedSurface && affinityPayload && affinityPolicy.enabled) {
+    const providerAffinityTargets = providerAffinityLiability
+      ? await buildProviderAffinityTargets({
+          request: providerAffinityLiability,
+          targets: providerPrimaryTargets,
+        })
+      : [];
+    const providerAffinityByMember = new Map(
+      providerAffinityTargets.map((candidate) => [candidate.poolMemberId, candidate]),
+    );
+    const affinityTargets = routeCandidates.flatMap((candidate) => {
+      const member = memberById.get(candidate.poolMemberId);
+      const affinityTarget = member
+        ? affinityTargetForMember(
+            member,
+            requestedSurface,
+            executionByMember.get(member.id),
+            candidate.healthStatus,
+          )
+        : (providerAffinityByMember.get(candidate.poolMemberId) ?? null);
+      return affinityTarget ? [affinityTarget] : [];
+    });
+    if (affinityTargets.length === routeCandidates.length) {
+      try {
+        affinityDecision = await rankAffinityTargets({
+          ownerId: requester.userId,
+          resourceOwnerId: target.ownerUserId,
+          poolId: target.id,
+          securityScope: requester.limitKey,
+          accessGrantId: target.accessGrantId,
+          policy: affinityPolicy,
+          surface: requestedSurface,
+          payload: affinityPayload,
+          targets: affinityTargets,
+        });
+        const affinityOrder = new Map(
+          affinityDecision.orderedTargetIds.map((executionTargetId, index) => [
+            executionTargetId,
+            index,
+          ]),
+        );
+        routeCandidates = routeCandidates
+          .map((candidate, originalIndex) => ({ candidate, originalIndex }))
+          .sort((left, right) => {
+            const classDifference = routeModeRank(left.candidate) - routeModeRank(right.candidate);
+            if (classDifference !== 0) return classDifference;
+            const leftTarget =
+              memberById.get(left.candidate.poolMemberId)?.ExecutionTarget?.id ??
+              providerByMemberId.get(left.candidate.poolMemberId)?.executionTargetId;
+            const rightTarget =
+              memberById.get(right.candidate.poolMemberId)?.ExecutionTarget?.id ??
+              providerByMemberId.get(right.candidate.poolMemberId)?.executionTargetId;
+            return (
+              (leftTarget
+                ? (affinityOrder.get(leftTarget) ?? left.originalIndex)
+                : left.originalIndex) -
+                (rightTarget
+                  ? (affinityOrder.get(rightTarget) ?? right.originalIndex)
+                  : right.originalIndex) || left.originalIndex - right.originalIndex
+            );
+          })
+          .map(({ candidate }) => candidate);
+      } catch {
+        // Affinity is optional and never makes an otherwise valid route unavailable.
+        affinityDecision = null;
+      }
+    }
+  }
+  let capacityLease: Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>> | undefined;
+  let selectedRouteCandidates = routeCandidates;
+  const applyMemberContextCount = async (poolMemberId: string) => {
+    const count = nativeCounts.get(poolMemberId);
+    if (!count) return;
+    operation.contextCount = count;
+    await updateContextCountMetadata(relayRequestId, count);
+  };
+  if (capacityRuntime) {
+    const admissionStartedAt = Date.now();
+    const admissionCandidates = routeCandidates.map((candidate, candidateOrder) =>
+      admissionCandidateForRoute(candidate, candidateOrder, admissionStartedAt),
+    );
+    if (admissionCandidates.some((candidate) => candidate === null)) {
+      globalLease?.release();
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "unsupported_capability" });
+      return operationFailureResponse(operation, "unsupported_capability");
+    }
+    try {
+      capacityLease = await acquireCapacityWithTelemetry({
+        runtime: capacityRuntime,
+        relayRequestId,
+        attempt: {
+          requestId: crypto.randomUUID(),
+          relayRequestId,
+          attemptId: crypto.randomUUID(),
+          ownerId: target.ownerUserId,
+          sourceKind: "POOL",
+          poolId: target.id,
+          basePriority: 16,
+          connectionOwner: "model-api",
+          deadlineAt: new Date(relayDeadlineMs),
+          candidates: admissionCandidates.filter((candidate) => candidate !== null),
+        },
+        signal: request.signal,
+      });
+    } catch {
+      globalLease?.release();
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "unknown" });
+      return operationFailureResponse(operation, "unknown");
+    }
+    if (capacityLease.state !== "ADMITTED" || !capacityLease.lease.poolMemberId) {
+      const overflow = await tryPublicOverflow("LOCAL_WAIT_EXPIRED", async () => undefined, {
+        onlyTier: "PUBLIC_OVERFLOW",
+      });
+      if (overflow) return overflow;
+      globalLease?.release();
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "rate_limited" });
+      return operationFailureResponse(operation, "rate_limited");
+    }
+    const selectedPoolMemberId = capacityLease.lease.poolMemberId;
+    try {
+      await applyMemberContextCount(selectedPoolMemberId);
+    } catch {
+      const admittedLease = capacityLease.lease;
+      await settleRelayCleanup([
+        () => capacityRuntime.release(admittedLease),
+        () => operation.dispose?.(),
+      ]);
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "unknown" }).catch(
+        metadataUpdateError,
+      );
+      return operationFailureResponse(operation, "unknown");
+    }
+    selectedRouteCandidates = [
+      ...routeCandidates.filter(({ poolMemberId }) => poolMemberId === selectedPoolMemberId),
+      ...routeCandidates.filter(({ poolMemberId }) => poolMemberId !== selectedPoolMemberId),
+    ];
+  }
+  try {
+    globalLease = limiter.acquireGlobal({
+      tokenId: requester.limitKey,
+      userId: requester.userId,
+    });
+  } catch (error) {
+    await settleRelayCleanup([
+      () =>
+        capacityLease?.state === "ADMITTED"
+          ? capacityRuntime?.release(capacityLease.lease)
+          : undefined,
+      () => operation.dispose?.(),
+    ]);
+    if (error instanceof ModelApiLimitError) {
+      await failRelayMetadata({ relayRequestId, startedAt, failure: error.failure });
+      return operationFailureResponse(operation, error.failure);
+    }
+    await failRelayMetadata({ relayRequestId, startedAt, failure: "unknown" }).catch(
+      metadataUpdateError,
+    );
+    return operationFailureResponse(operation, "unknown");
+  }
   let finalFailure: RelayFailure = "unknown";
   let attemptCount = 0;
   // One wall-clock deadline covers body rebuild/reopen, every upstream attempt,
   // and retry bookkeeping. Pool size never multiplies the public timeout.
-  const relayDeadlineMs = startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS;
   let cumulativeRequestBytes = 0;
   let cumulativeResponseBytes = 0;
+  const releaseCapacityAttempt = async () => {
+    if (capacityLease?.state !== "ADMITTED") return;
+    const lease = capacityLease.lease;
+    capacityLease = undefined;
+    const localGlobalLease = globalLease;
+    globalLease = undefined;
+    await settleRelayCleanup([
+      () => localGlobalLease?.release(),
+      () => capacityRuntime?.release(lease),
+    ]);
+  };
 
-  for (const candidate of routeCandidates) {
+  for (let candidateIndex = 0; candidateIndex < selectedRouteCandidates.length; candidateIndex++) {
+    let candidate = selectedRouteCandidates[candidateIndex]!;
+    if (capacityRuntime && capacityLease?.state !== "ADMITTED") {
+      const remaining = selectedRouteCandidates.slice(candidateIndex);
+      const admissionStartedAt = Date.now();
+      const admissionCandidates = remaining.map((remainingCandidate, candidateOrder) => {
+        const resolved = admissionCandidateForRoute(
+          remainingCandidate,
+          candidateOrder,
+          admissionStartedAt,
+        );
+        if (!resolved)
+          throw new Error("Capacity-enabled pool member lost execution target identity.");
+        return resolved;
+      });
+      try {
+        capacityLease = await acquireCapacityWithTelemetry({
+          runtime: capacityRuntime,
+          relayRequestId,
+          attempt: {
+            requestId: crypto.randomUUID(),
+            relayRequestId,
+            attemptId: crypto.randomUUID(),
+            ownerId: target.ownerUserId,
+            sourceKind: "POOL",
+            poolId: target.id,
+            basePriority: 16,
+            connectionOwner: "model-api",
+            deadlineAt: new Date(relayDeadlineMs),
+            candidates: admissionCandidates,
+          },
+          signal: request.signal,
+        });
+      } catch {
+        finalFailure = "unknown";
+        break;
+      }
+      if (capacityLease.state !== "ADMITTED" || !capacityLease.lease.poolMemberId) {
+        finalFailure = "rate_limited";
+        break;
+      }
+      const admittedPoolMemberId = capacityLease.lease.poolMemberId;
+      try {
+        await applyMemberContextCount(admittedPoolMemberId);
+      } catch {
+        await releaseCapacityAttempt();
+        finalFailure = "unknown";
+        break;
+      }
+      const selectedIndex = selectedRouteCandidates.findIndex(
+        ({ poolMemberId }, index) =>
+          index >= candidateIndex && poolMemberId === admittedPoolMemberId,
+      );
+      if (selectedIndex < 0) {
+        const unexpectedLease = capacityLease.lease;
+        await settleRelayCleanup([() => capacityRuntime.release(unexpectedLease)]);
+        capacityLease = undefined;
+        finalFailure = "unknown";
+        break;
+      }
+      if (selectedIndex !== candidateIndex) {
+        const [selected] = selectedRouteCandidates.splice(selectedIndex, 1);
+        if (selected) selectedRouteCandidates.splice(candidateIndex, 0, selected);
+      }
+      candidate = selectedRouteCandidates[candidateIndex]!;
+    }
+    if (!globalLease) {
+      try {
+        globalLease = limiter.acquireGlobal({
+          tokenId: requester.limitKey,
+          userId: requester.userId,
+        });
+      } catch (error) {
+        await releaseCapacityAttempt();
+        finalFailure = error instanceof ModelApiLimitError ? error.failure : "unknown";
+        break;
+      }
+    }
     if (remainingRelayBudgetMs(relayDeadlineMs) === 0) {
       finalFailure = "timeout";
       break;
+    }
+    const providerTarget = providerByMemberId.get(candidate.poolMemberId);
+    if (providerTarget) {
+      const providerLease = capacityLease?.state === "ADMITTED" ? capacityLease.lease : undefined;
+      capacityLease = undefined;
+      globalLease?.release();
+      globalLease = undefined;
+      const providerResponse = await tryPublicOverflow(
+        "NO_COMPATIBLE_HEALTHY_PRIMARY",
+        async () => undefined,
+        {
+          onlyTier: "PRIMARY",
+          forcedProviderMemberId: providerTarget.poolMemberId,
+          preAdmittedProviderLease: providerLease,
+        },
+      );
+      if (providerResponse) return providerResponse;
+      if (providerLease) await releasePreAdmittedProviderLease(providerLease);
+      finalFailure = "upstream_5xx";
+      continue;
     }
     const member = memberById.get(candidate.poolMemberId);
     if (!member) continue;
@@ -1756,30 +4812,102 @@ async function relayPool({
     } catch (error) {
       if (error instanceof ModelApiLimitError) {
         finalFailure = error.failure;
+        await releaseCapacityAttempt();
         continue;
       }
-      throw error;
+      finalFailure = "unknown";
+      await releaseCapacityAttempt();
+      break;
     }
 
     if (candidate.healthStatus === "HALF_OPEN") {
-      const claimed = await markPoolMemberHalfOpenTrial({
-        poolMemberId: candidate.poolMemberId,
-      });
+      let claimed: number;
+      try {
+        claimed = await markPoolMemberHalfOpenTrial({
+          poolMemberId: candidate.poolMemberId,
+        });
+      } catch {
+        await settleRelayCleanup([() => cliLease.release()]);
+        finalFailure = "unknown";
+        await releaseCapacityAttempt();
+        break;
+      }
       if (claimed === 0) {
-        cliLease.release();
+        await settleRelayCleanup([() => cliLease.release()]);
+        await releaseCapacityAttempt();
         continue;
       }
     }
     let builtRequest: BuiltRelayRequest;
+    const execution = executionByMember.get(member.id);
+    const adaptedSource =
+      execution?.mode === "adapted" && execution.nativeSurface
+        ? protocolSurface(execution.nativeSurface)
+        : null;
     try {
       builtRequest = await operation.buildRequest(candidate.upstreamModelId);
-    } catch {
-      cliLease.release();
+      if (adaptedSource && operation.adaptation) {
+        if (!canonicalAdaptationRequest)
+          throw new AdapterError(
+            "unsupported_adaptation",
+            "Request is outside the strict adapted subset.",
+          );
+        const rendered = renderCanonicalRequest({
+          request: canonicalAdaptationRequest,
+          target: adaptedSource,
+          model: candidate.upstreamModelId,
+          allowLossyDeveloperRoleCollapse: operation.adaptation.allowLossyDeveloperRoleCollapse,
+        });
+        if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+        const adaptedHeaders = new Headers(builtRequest.headers);
+        adaptedHeaders.delete("content-length");
+        if (adaptedSource === "anthropic-messages") {
+          adaptedHeaders.set("anthropic-version", "2023-06-01");
+          adaptedHeaders.delete("anthropic-beta");
+        } else {
+          adaptedHeaders.delete("anthropic-version");
+          adaptedHeaders.delete("anthropic-beta");
+        }
+        builtRequest = {
+          headers: adaptedHeaders,
+          body: new TextEncoder().encode(JSON.stringify(rendered)),
+        };
+      }
+    } catch (error) {
+      if (error instanceof AdapterError && operation.adaptation) {
+        await settleRelayCleanup([
+          () => cliLease.release(),
+          () => globalLease?.release(),
+          () =>
+            capacityLease?.state === "ADMITTED"
+              ? capacityRuntime?.release(capacityLease.lease)
+              : undefined,
+          () => operation.dispose?.(),
+        ]);
+        const canonicalError = {
+          code: "invalid_request_error",
+          message: error.message,
+          parameter: error.parameter,
+          upstreamStatus: 400,
+        };
+        const metadata = renderProtocolErrorMetadata(
+          operation.adaptation.requestedSurface,
+          canonicalError,
+        );
+        return new Response(
+          JSON.stringify(
+            renderProtocolError(operation.adaptation.requestedSurface, canonicalError),
+          ),
+          { status: metadata.status, headers: metadata.headers },
+        );
+      }
+      await settleRelayCleanup([() => cliLease.release()]);
       finalFailure = "unknown";
       await recordPoolMemberRelayFailure({
         poolMemberId: candidate.poolMemberId,
         failure: "unknown",
-      });
+      }).catch(metadataUpdateError);
+      await releaseCapacityAttempt();
       continue;
     }
     const responseIdCapture =
@@ -1788,104 +4916,473 @@ async function relayPool({
         : null;
     const attemptTimeoutMs = remainingRelayBudgetMs(relayDeadlineMs);
     if (attemptTimeoutMs === 0) {
-      cliLease.release();
-      if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+      await settleRelayCleanup([
+        () => cliLease.release(),
+        () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
+      ]);
       finalFailure = "timeout";
       break;
     }
-    const attempt = startRelayAttempt({
-      manager,
-      cliDeviceId: candidate.cliDeviceId,
-      endpointSlug: member.DiscoveredModel.Endpoint.slug,
-      family: operation.family,
-      method: operation.method,
-      path: operation.path,
-      headers: builtRequest.headers,
-      ...relayAttemptBody(builtRequest.body),
-      timeoutMs: attemptTimeoutMs,
-      abortSignal: request.signal,
-      onResponseBodyChunk: responseIdCapture
-        ? (chunk) => responseIdCapture.push(chunk, operation.stream)
-        : undefined,
-    });
     attemptCount += 1;
+    let attempt: ReturnType<typeof startRelayAttempt> | null = null;
+    const localExecution: LocalExecutionTelemetry = {
+      selectedExecutionTargetId: member.ExecutionTarget?.id,
+      selectedPoolMemberId: member.id,
+      selectedPoolMemberTier: "PRIMARY",
+      nativeSurface: execution?.nativeSurface ?? telemetrySurfaceForOperation(operation),
+      requestedSurface: telemetrySurfaceForOperation(operation),
+      adapterMode: adaptedSource ? "ADAPTED" : "NATIVE",
+      adapterVersion: adaptedSource ? "1.0.0" : undefined,
+      localAttemptId: crypto.randomUUID(),
+      poolId: target.id,
+      contextCount: operation.contextCount,
+      admission:
+        capacityLease?.state === "ADMITTED"
+          ? {
+              attemptId: capacityLease.lease.attemptId,
+              leaseId: capacityLease.lease.leaseId,
+              fencingToken: capacityLease.lease.fencingToken,
+            }
+          : undefined,
+    };
+    try {
+      await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
+      attempt = startRelayAttempt({
+        requestId: localExecution.localAttemptId,
+        manager,
+        cliDeviceId: candidate.cliDeviceId,
+        endpointSlug: member.DiscoveredModel.Endpoint.slug,
+        family: adaptedSource ? nativeRouteForSurface(adaptedSource).family : operation.family,
+        method: operation.method,
+        path: adaptedSource ? nativeRouteForSurface(adaptedSource).path : operation.path,
+        headers: builtRequest.headers,
+        ...relayAttemptBody(builtRequest.body),
+        timeoutMs: attemptTimeoutMs,
+        abortSignal: request.signal,
+        onResponseBodyChunk: responseIdCapture
+          ? (chunk) => responseIdCapture.push(chunk, operation.stream)
+          : undefined,
+      });
+    } catch {
+      attempt?.cancel("unknown");
+      await settleRelayCleanup([
+        () => cliLease.release(),
+        () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
+      ]);
+      finalFailure = "unknown";
+      await recordPoolMemberRelayFailure({
+        poolMemberId: candidate.poolMemberId,
+        failure: "unknown",
+      }).catch(metadataUpdateError);
+      await releaseCapacityAttempt();
+      continue;
+    }
+    if (!attempt) throw new Error("pool relay attempt was not initialized");
 
     try {
       const started = await attempt.started;
-      if (started.status >= 500) {
+      if (started.status >= 500 && shouldRetryRelayOperation(operation, "precommit_5xx")) {
         attempt.cancel("upstream_5xx");
         const terminal = await attempt.terminal;
+        await recordLocalTerminal(relayRequestId, requester.userId, localExecution, terminal).catch(
+          metadataUpdateError,
+        );
         cumulativeRequestBytes += terminal.requestBytes;
         cumulativeResponseBytes += terminal.responseBytes;
-        cliLease.release();
-        if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+        await settleRelayCleanup([
+          () => cliLease.release(),
+          () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
+        ]);
         finalFailure = "upstream_5xx";
         await recordPoolMemberRelayFailure({
           poolMemberId: candidate.poolMemberId,
           failure: "upstream_5xx",
-        });
+        }).catch(metadataUpdateError);
+        await releaseCapacityAttempt();
         continue;
       }
 
-      const finalize = attempt.terminal
-        .then(async (terminal) => {
+      if (adaptedSource && operation.adaptation && started.status >= 200 && started.status < 300) {
+        const upstreamSse =
+          started.headers.get("content-type")?.toLowerCase().startsWith("text/event-stream") ===
+          true;
+        if (upstreamSse !== operation.stream) {
+          attempt.cancel("protocol_error");
+          const terminal = await attempt.terminal;
+          await recordLocalTerminal(
+            relayRequestId,
+            requester.userId,
+            localExecution,
+            terminal,
+          ).catch(metadataUpdateError);
+          cumulativeRequestBytes += terminal.requestBytes;
+          cumulativeResponseBytes += terminal.responseBytes;
+          await settleRelayCleanup([
+            () => cliLease.release(),
+            () =>
+              builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose(),
+          ]);
+          finalFailure = "protocol_error";
+          await recordPoolMemberRelayFailure({
+            poolMemberId: candidate.poolMemberId,
+            failure: "protocol_error",
+          }).catch(metadataUpdateError);
+          if (!shouldRetryRelayOperation(operation, "precommit_content_type_mismatch")) break;
+          await releaseCapacityAttempt();
+          continue;
+        }
+      }
+
+      let validatedAdaptedNonstream: Uint8Array | null = null;
+      let primedAdaptedStream: ReadableStream<Uint8Array> | null = null;
+      let adaptationCompletion: Promise<"ok" | "protocol_error" | "cancelled"> =
+        Promise.resolve("ok");
+      const nonSuccess = started.status < 200 || started.status >= 300;
+      const canonicalNonSuccess = nonSuccess && requestedSurface !== null;
+      if (canonicalNonSuccess || (adaptedSource && operation.adaptation && !operation.stream)) {
+        try {
+          validatedAdaptedNonstream = await readAdaptedNonstreamBody({
+            body: started.body,
+            source: adaptedSource ?? requestedSurface ?? "openai-responses",
+            target:
+              operation.adaptation?.requestedSurface ?? requestedSurface ?? "openai-responses",
+            status: started.status,
+            headers: started.headers,
+            signal: request.signal,
+          });
+        } catch {
+          attempt.cancel("protocol_error");
+          const terminal = await attempt.terminal;
+          await recordLocalTerminal(
+            relayRequestId,
+            requester.userId,
+            localExecution,
+            terminal,
+          ).catch(metadataUpdateError);
+          cumulativeRequestBytes += terminal.requestBytes;
+          cumulativeResponseBytes += terminal.responseBytes;
+          await settleRelayCleanup([
+            () => cliLease.release(),
+            () =>
+              builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose(),
+          ]);
+          finalFailure = "protocol_error";
+          await recordPoolMemberRelayFailure({
+            poolMemberId: candidate.poolMemberId,
+            failure: "protocol_error",
+          }).catch(metadataUpdateError);
+          await releaseCapacityAttempt();
+          continue;
+        }
+      }
+      if (adaptedSource && operation.adaptation && operation.stream && !canonicalNonSuccess) {
+        try {
+          let protocolFailureObserved = false;
+          const primed = await primeReadableStream(
+            adaptedResponseBody({
+              body: started.body,
+              source: adaptedSource,
+              target: operation.adaptation.requestedSurface,
+              stream: true,
+              status: started.status,
+              headers: started.headers,
+              signal: request.signal,
+              onProtocolError: () => {
+                protocolFailureObserved = true;
+              },
+            }),
+            operation.adaptation.requestedSurface,
+          );
+          primedAdaptedStream = primed.body;
+          adaptationCompletion = primed.completion.then((outcome) =>
+            protocolFailureObserved && outcome === "ok" ? "protocol_error" : outcome,
+          );
+        } catch {
+          attempt.cancel("protocol_error");
+          const terminal = await attempt.terminal;
+          await recordLocalTerminal(
+            relayRequestId,
+            requester.userId,
+            localExecution,
+            terminal,
+          ).catch(metadataUpdateError);
+          cumulativeRequestBytes += terminal.requestBytes;
+          cumulativeResponseBytes += terminal.responseBytes;
+          await settleRelayCleanup([
+            () => cliLease.release(),
+            () =>
+              builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose(),
+          ]);
+          finalFailure = "protocol_error";
+          await recordPoolMemberRelayFailure({
+            poolMemberId: candidate.poolMemberId,
+            failure: "protocol_error",
+          }).catch(metadataUpdateError);
+          await releaseCapacityAttempt();
+          continue;
+        }
+      }
+
+      const finalize = Promise.allSettled([attempt.terminal, adaptationCompletion])
+        .then(async ([terminalResult, adaptationResult]) => {
+          const upstreamTerminal =
+            terminalResult.status === "fulfilled" ? terminalResult.value : rejectedRelayTerminal();
+          const adaptationOutcome =
+            adaptationResult.status === "fulfilled" ? adaptationResult.value : "protocol_error";
+          const terminal: RelayAttemptTerminal =
+            adaptationOutcome !== "ok" && upstreamTerminal.ok
+              ? {
+                  ...upstreamTerminal,
+                  ok: false,
+                  failure: adaptationOutcome === "cancelled" ? "cancelled" : "protocol_error",
+                }
+              : upstreamTerminal;
           const cumulativeTerminal = {
             ...terminal,
             requestBytes: cumulativeRequestBytes + terminal.requestBytes,
             responseBytes: cumulativeResponseBytes + terminal.responseBytes,
           };
-          cliLease.release();
-          globalLease.release();
-          if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
-          await operation.dispose?.();
-          if (terminal.ok) {
-            await markPoolMemberRelaySuccess(candidate.poolMemberId);
-          }
-          await updateRelayMetadata(relayRequestId, {
-            selectedDiscoveredModelId: member.discoveredModelId,
-            status: terminalStatus(terminal),
-            startedAt,
-            terminal: cumulativeTerminal,
-            attemptCount,
-          });
+          const cleanup = await Promise.allSettled([
+            Promise.resolve().then(() => cliLease.release()),
+            Promise.resolve().then(() => globalLease?.release()),
+            builtRequest.body instanceof Uint8Array
+              ? Promise.resolve()
+              : builtRequest.body.dispose(),
+            operation.dispose?.() ?? Promise.resolve(),
+          ]);
+          reportCleanupFailures(cleanup);
           const responseId = responseIdCapture?.finish(operation.stream) ?? null;
-          if (terminal.ok && responseId && operation.responseStickiness) {
-            await writeResponseStickiness({
-              ...operation.responseStickiness,
-              responseId,
-              targetModelPoolId: target.id,
+          const affinityTarget = requestedSurface
+            ? affinityTargetForMember(
+                member,
+                requestedSurface,
+                executionByMember.get(member.id),
+                candidate.healthStatus,
+              )
+            : null;
+          const selectedAffinityScore = affinityTarget
+            ? (affinityDecision?.scores[affinityTarget.executionTargetId] ?? 0)
+            : 0;
+          const selectedAffinityPrefixDepth = affinityTarget
+            ? (affinityDecision?.prefixDepths[affinityTarget.executionTargetId] ?? 0)
+            : 0;
+          const selectedConversationMatch = affinityTarget
+            ? (affinityDecision?.conversationMatches[affinityTarget.executionTargetId] ?? false)
+            : false;
+          const selectedAffinityReason = affinityTarget
+            ? (affinityDecision?.reasons[affinityTarget.executionTargetId] ?? "no_match")
+            : "identity_unavailable";
+          const terminalWrites = await Promise.allSettled([
+            terminal.ok
+              ? markPoolMemberRelaySuccess(candidate.poolMemberId)
+              : adaptationOutcome === "protocol_error"
+                ? recordPoolMemberRelayFailure({
+                    poolMemberId: candidate.poolMemberId,
+                    failure: "protocol_error",
+                  })
+                : Promise.resolve(),
+            updateRelayMetadata(relayRequestId, {
               selectedDiscoveredModelId: member.discoveredModelId,
-            }).catch(stickinessWriteError);
-          }
+              status: terminalStatus(terminal),
+              startedAt,
+              terminal: cumulativeTerminal,
+              attemptCount,
+              localExecution,
+              userId: requester.userId,
+              localTerminal: terminal,
+              affinity: {
+                outcome:
+                  affinityDecision && (selectedAffinityPrefixDepth > 0 || selectedConversationMatch)
+                    ? "PREDICTED_MATCH"
+                    : affinityPolicy.enabled
+                      ? "NO_MATCH"
+                      : "DISABLED",
+                score: selectedAffinityScore,
+                prefixDepth: selectedAffinityPrefixDepth,
+                reason: selectedAffinityReason,
+              },
+            }).catch(metadataUpdateError),
+            terminal.ok && responseId && operation.responseStickiness
+              ? writeResponseStickiness({
+                  ...operation.responseStickiness,
+                  responseId,
+                  targetModelPoolId: target.id,
+                  selectedDiscoveredModelId: member.discoveredModelId,
+                }).catch(stickinessWriteError)
+              : Promise.resolve(),
+            terminal.ok && requestedSurface && affinityPayload && affinityTarget
+              ? rememberAffinity({
+                  ownerId: requester.userId,
+                  resourceOwnerId: member.DiscoveredModel.userId,
+                  poolId: target.id,
+                  securityScope: requester.limitKey,
+                  accessGrantId: target.accessGrantId,
+                  policy: affinityPolicy,
+                  surface: requestedSurface,
+                  payload: affinityPayload,
+                  target: affinityTarget,
+                  estimatedTokens: operation.contextCount?.tokens,
+                })
+              : Promise.resolve(),
+          ]);
+          reportCleanupFailures(terminalWrites);
         })
         .catch(metadataUpdateError);
       void finalize;
-      return new Response(
-        responseBodyForOperation({
-          body: started.body,
-          headers: started.headers,
-          terminal: attempt.terminal,
-          operation,
+      let responseHeaders = new Headers(started.headers);
+      const adaptedRequestLimitations = operation.adaptation
+        ? (() => {
+            try {
+              return parseCanonicalRequest(
+                operation.adaptation.requestedSurface,
+                operation.adaptation.payload,
+              ).limitations;
+            } catch {
+              return [];
+            }
+          })()
+        : [];
+      const adapterLimitations = [
+        "strict_common_subset",
+        ...(adaptedSource === "anthropic-messages" ? adaptedRequestLimitations : []),
+      ].join(",");
+      let responseBody = primedAdaptedStream
+        ? primedAdaptedStream
+        : validatedAdaptedNonstream
+          ? new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(validatedAdaptedNonstream as Uint8Array);
+                controller.close();
+              },
+            })
+          : responseBodyForOperation({
+              body: started.body,
+              headers: started.headers,
+              terminal: attempt.terminal,
+              operation,
+            });
+      if (canonicalNonSuccess) {
+        responseHeaders = adaptedProviderResponseHeaders(
+          adaptedSource ?? requestedSurface ?? "openai-responses",
+          operation.adaptation?.requestedSurface ?? requestedSurface ?? "openai-responses",
+          started.headers,
+          Boolean(adaptedSource && operation.adaptation),
+        );
+        if (adaptedSource && operation.adaptation)
+          responseHeaders.set("x-wsmp-adapter-limitations", adapterLimitations);
+      } else if (adaptedSource && operation.adaptation) {
+        const sourceHeaders = responseHeaders;
+        const adaptedStreaming =
+          operation.stream &&
+          responseHeaders.get("content-type")?.toLowerCase().startsWith("text/event-stream") ===
+            true;
+        if (adaptedStreaming && !primedAdaptedStream)
+          responseBody = adaptedResponseBody({
+            body: responseBody,
+            source: adaptedSource,
+            target: operation.adaptation.requestedSurface,
+            stream: true,
+            status: started.status,
+            headers: responseHeaders,
+            signal: request.signal,
+          });
+        responseHeaders = new Headers();
+        responseHeaders.set(
+          "content-type",
+          adaptedStreaming ? "text/event-stream; charset=utf-8" : "application/json; charset=utf-8",
+        );
+        responseHeaders.set("x-wsmp-adapter-version", "1.0.0");
+        responseHeaders.set("x-wsmp-adapter-limitations", adapterLimitations);
+        const retryAfter = safeProviderRetryAfter(sourceHeaders.get("retry-after"));
+        if (retryAfter) responseHeaders.set("retry-after", retryAfter);
+        const sourceRequestId = safeProviderRequestId(
+          adaptedSource === "anthropic-messages"
+            ? sourceHeaders.get("request-id")
+            : sourceHeaders.get("x-request-id"),
+        );
+        if (sourceRequestId)
+          responseHeaders.set(
+            operation.adaptation.requestedSurface === "anthropic-messages"
+              ? "request-id"
+              : "x-request-id",
+            sourceRequestId,
+          );
+        const rateHeaderPairs = [
+          ["x-ratelimit-limit-requests", "anthropic-ratelimit-requests-limit", "count"],
+          ["x-ratelimit-remaining-requests", "anthropic-ratelimit-requests-remaining", "count"],
+          ["x-ratelimit-reset-requests", "anthropic-ratelimit-requests-reset", "reset"],
+          ["x-ratelimit-limit-tokens", "anthropic-ratelimit-tokens-limit", "count"],
+          ["x-ratelimit-remaining-tokens", "anthropic-ratelimit-tokens-remaining", "count"],
+          ["x-ratelimit-reset-tokens", "anthropic-ratelimit-tokens-reset", "reset"],
+        ] as const;
+        for (const [openAiName, anthropicName, kind] of rateHeaderPairs) {
+          const sourceName = adaptedSource === "anthropic-messages" ? anthropicName : openAiName;
+          const rawValue = sourceHeaders.get(sourceName);
+          const value =
+            kind === "count"
+              ? safeProviderBoundedRemaining(
+                  rawValue,
+                  sourceName.includes("remaining"),
+                  sourceHeaders.get(sourceName.replace("remaining", "limit")),
+                )
+              : adaptedSource === operation.adaptation.requestedSurface
+                ? safeProviderRateReset(rawValue, adaptedSource === "anthropic-messages")
+                : undefined;
+          if (value)
+            responseHeaders.set(
+              operation.adaptation.requestedSurface === "anthropic-messages"
+                ? anthropicName
+                : openAiName,
+              value,
+            );
+        }
+      }
+      const response = responseWithFirstClientByte(
+        new Response(responseBody, {
+          status:
+            nonSuccess && (started.status < 400 || started.status > 599) ? 502 : started.status,
+          headers: responseHeaders,
         }),
-        { status: started.status, headers: started.headers },
+        () => markLocalFirstClientByte(relayRequestId, requester.userId, localExecution),
       );
+      return capacityLease?.state === "ADMITTED" && capacityRuntime
+        ? await holdOrReleaseCapacityResponse(
+            capacityRuntime,
+            response,
+            capacityLease.lease,
+            request.signal,
+          )
+        : response;
     } catch {
-      const terminal = await attempt.terminal;
+      const terminal = await attempt.terminal.catch(() => rejectedRelayTerminal());
+      await recordLocalTerminal(relayRequestId, requester.userId, localExecution, terminal).catch(
+        metadataUpdateError,
+      );
       cumulativeRequestBytes += terminal.requestBytes;
       cumulativeResponseBytes += terminal.responseBytes;
-      cliLease.release();
-      if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+      await settleRelayCleanup([
+        () => cliLease.release(),
+        () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
+      ]);
       const failure = terminal.failure ?? "unknown";
       finalFailure = failure;
+      if (!shouldRetryRelayOperation(operation, "precommit_transport")) break;
       if (isPoolRelayFailureClass(failure) && isRetryablePoolMemberRelayFailure(failure)) {
         await recordPoolMemberRelayFailure({
           poolMemberId: candidate.poolMemberId,
           failure,
-        });
+        }).catch(metadataUpdateError);
+        await releaseCapacityAttempt();
         continue;
       }
-      globalLease.release();
-      await operation.dispose?.();
+      await settleRelayCleanup([
+        () => globalLease?.release(),
+        () =>
+          capacityLease?.state === "ADMITTED"
+            ? capacityRuntime?.release(capacityLease.lease)
+            : undefined,
+        () => operation.dispose?.(),
+      ]);
       await updateRelayMetadata(relayRequestId, {
         selectedDiscoveredModelId: member.discoveredModelId,
         status: terminalStatus(terminal),
@@ -1896,13 +5393,42 @@ async function relayPool({
           responseBytes: cumulativeResponseBytes,
         },
         attemptCount,
+        localExecution,
+        userId: requester.userId,
+        localTerminal: terminal,
       });
-      return openAiFailureJsonResponse(failure);
+      return operationFailureResponse(operation, failure);
     }
   }
 
-  globalLease.release();
-  await operation.dispose?.();
+  const overflowReason: PublicOverflowReason =
+    finalFailure === "rate_limited" || finalFailure === "timeout"
+      ? "LOCAL_WAIT_EXPIRED"
+      : "RETRYABLE_PRECOMMIT_PRIMARY_FAILURE";
+  const overflow = await tryPublicOverflow(
+    overflowReason,
+    async () => {
+      const lease = capacityLease?.state === "ADMITTED" ? capacityLease.lease : undefined;
+      capacityLease = undefined;
+      const acquiredGlobalLease = globalLease;
+      globalLease = undefined;
+      await settleRelayCleanup([
+        () => acquiredGlobalLease?.release(),
+        () => (lease ? capacityRuntime?.release(lease) : undefined),
+      ]);
+    },
+    { onlyTier: "PUBLIC_OVERFLOW" },
+  );
+  if (overflow) return overflow;
+
+  await settleRelayCleanup([
+    () => globalLease?.release(),
+    () =>
+      capacityLease?.state === "ADMITTED"
+        ? capacityRuntime?.release(capacityLease.lease)
+        : undefined,
+    () => operation.dispose?.(),
+  ]);
   await failRelayMetadata({
     relayRequestId,
     startedAt,
@@ -1911,7 +5437,7 @@ async function relayPool({
     requestBytes: cumulativeRequestBytes,
     responseBytes: cumulativeResponseBytes,
   });
-  return openAiFailureJsonResponse(finalFailure);
+  return operationFailureResponse(operation, finalFailure);
 }
 
 async function relaySelectedModelNoFailover({
@@ -1923,6 +5449,7 @@ async function relaySelectedModelNoFailover({
   operation,
   manager,
   limiter,
+  capacityRuntime,
 }: {
   request: Request;
   requester: RelayRequester;
@@ -1932,6 +5459,7 @@ async function relaySelectedModelNoFailover({
   operation: RelayOperation;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
+  capacityRuntime?: CapacityAdmissionRuntime;
 }): Promise<Response> {
   const startedAt = new Date();
   const relayRequestId = await createRelayMetadata({
@@ -1940,13 +5468,15 @@ async function relaySelectedModelNoFailover({
     modelApiTokenLookupPrefix: requester.modelApiTokenLookupPrefix,
     requestedDiscoveredModelId,
     requestedModelPoolId,
+    requestedSurface: telemetrySurfaceForOperation(operation),
     operation: operation.capability,
     requestBytes: null,
+    contextCount: operation.contextCount,
   });
   const selected = await directModelRow(selectedDiscoveredModelId);
   if (!selected) {
     await failRelayMetadata({ relayRequestId, startedAt, failure: "not_found" });
-    return openAiFailureJsonResponse("not_found");
+    return operationFailureResponse(operation, "not_found");
   }
 
   if (
@@ -1961,7 +5491,7 @@ async function relaySelectedModelNoFailover({
       failure: "unsupported_capability",
       selectedDiscoveredModelId: selected.id,
     });
-    return openAiFailureJsonResponse("unsupported_capability");
+    return operationFailureResponse(operation, "unsupported_capability");
   }
 
   if (!isEndpointConnected(selected, new Set(manager.getActiveCliDeviceIds()))) {
@@ -1971,7 +5501,62 @@ async function relaySelectedModelNoFailover({
       failure: "disconnected",
       selectedDiscoveredModelId: selected.id,
     });
-    return openAiFailureJsonResponse("disconnected");
+    return operationFailureResponse(operation, "disconnected");
+  }
+
+  const selectedPoolMember = requestedModelPoolId
+    ? (await poolMemberRows(requestedModelPoolId)).find(
+        (member) => member.discoveredModelId === selectedDiscoveredModelId,
+      )
+    : undefined;
+  let capacityLease: Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>> | undefined;
+  if (capacityRuntime) {
+    const identity = selectedPoolMember?.ExecutionTarget ?? selected.ExecutionTarget;
+    if (!identity?.inferenceCapacityId || (requestedModelPoolId && !selectedPoolMember)) {
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "unsupported_capability" });
+      return operationFailureResponse(operation, "unsupported_capability");
+    }
+    try {
+      capacityLease = await acquireCapacityWithTelemetry({
+        runtime: capacityRuntime,
+        relayRequestId,
+        attempt: {
+          requestId: crypto.randomUUID(),
+          relayRequestId,
+          attemptId: crypto.randomUUID(),
+          ownerId: selected.userId,
+          sourceKind: requestedModelPoolId ? "POOL" : "DIRECT",
+          basePriority: 16,
+          connectionOwner: "model-api",
+          deadlineAt: boundedAdmissionDeadline(
+            Date.now(),
+            startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS,
+            selectedPoolMember
+              ? effectiveMemberWaitBudget(selectedPoolMember)
+              : (selected.ExecutionTarget?.directWaitBudgetMs ?? null),
+          ),
+          candidates: [
+            {
+              capacityId: identity.inferenceCapacityId,
+              executionTargetId: identity.id,
+              poolMemberId: selectedPoolMember?.id,
+              candidateOrder: 0,
+            },
+          ],
+        },
+        signal: request.signal,
+      });
+    } catch {
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "unknown" });
+      return operationFailureResponse(operation, "unknown");
+    }
+    if (capacityLease.state !== "ADMITTED") {
+      await operation.dispose?.();
+      await failRelayMetadata({ relayRequestId, startedAt, failure: "rate_limited" });
+      return operationFailureResponse(operation, "rate_limited");
+    }
   }
 
   let globalLease: ModelApiLimitLease | undefined;
@@ -1985,6 +5570,7 @@ async function relaySelectedModelNoFailover({
   } catch (error) {
     cliLease?.release();
     globalLease?.release();
+    if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
     if (error instanceof ModelApiLimitError) {
       await failRelayMetadata({
         relayRequestId,
@@ -1992,7 +5578,7 @@ async function relaySelectedModelNoFailover({
         failure: error.failure,
         selectedDiscoveredModelId: selected.id,
       });
-      return openAiFailureJsonResponse(error.failure);
+      return operationFailureResponse(operation, error.failure);
     }
     throw error;
   }
@@ -2003,6 +5589,7 @@ async function relaySelectedModelNoFailover({
   } catch {
     cliLease.release();
     globalLease.release();
+    if (capacityLease?.state === "ADMITTED") await capacityRuntime?.release(capacityLease.lease);
     await operation.dispose?.();
     await failRelayMetadata({
       relayRequestId,
@@ -2010,13 +5597,35 @@ async function relaySelectedModelNoFailover({
       failure: "unknown",
       selectedDiscoveredModelId: selected.id,
     });
-    return openAiFailureJsonResponse("unknown");
+    return operationFailureResponse(operation, "unknown");
   }
   const responseIdCapture =
     operation.responseStickiness && operation.family === "responses"
       ? createResponseIdCapture()
       : null;
+  const localExecution: LocalExecutionTelemetry = {
+    selectedExecutionTargetId:
+      selectedPoolMember?.ExecutionTarget?.id ?? selected.ExecutionTarget?.id,
+    selectedPoolMemberId: selectedPoolMember?.id,
+    selectedPoolMemberTier: selectedPoolMember ? "PRIMARY" : undefined,
+    nativeSurface: telemetrySurfaceForOperation(operation),
+    requestedSurface: telemetrySurfaceForOperation(operation),
+    adapterMode: "NATIVE",
+    localAttemptId: crypto.randomUUID(),
+    poolId: requestedModelPoolId,
+    contextCount: operation.contextCount,
+    admission:
+      capacityLease?.state === "ADMITTED"
+        ? {
+            attemptId: capacityLease.lease.attemptId,
+            leaseId: capacityLease.lease.leaseId,
+            fencingToken: capacityLease.lease.fencingToken,
+          }
+        : undefined,
+  };
+  await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
   const attempt = startRelayAttempt({
+    requestId: localExecution.localAttemptId,
     manager,
     cliDeviceId: selected.Endpoint.cliDeviceId,
     endpointSlug: selected.Endpoint.slug,
@@ -2035,50 +5644,80 @@ async function relaySelectedModelNoFailover({
   try {
     const started = await attempt.started;
     const finalize = attempt.terminal
+      .catch(() => rejectedRelayTerminal())
       .then(async (terminal) => {
-        cliLease.release();
-        globalLease.release();
-        if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
-        await updateRelayMetadata(relayRequestId, {
-          selectedDiscoveredModelId: selected.id,
-          status: terminalStatus(terminal),
-          startedAt,
-          terminal,
-          attemptCount: 1,
-        });
+        const cleanup = await Promise.allSettled([
+          Promise.resolve().then(() => cliLease.release()),
+          Promise.resolve().then(() => globalLease.release()),
+          builtRequest.body instanceof Uint8Array ? Promise.resolve() : builtRequest.body.dispose(),
+          operation.dispose?.() ?? Promise.resolve(),
+        ]);
+        reportCleanupFailures(cleanup);
         const responseId = responseIdCapture?.finish(operation.stream) ?? null;
-        if (terminal.ok && responseId && operation.responseStickiness) {
-          await writeResponseStickiness({
-            ...operation.responseStickiness,
-            responseId,
+        await Promise.allSettled([
+          updateRelayMetadata(relayRequestId, {
             selectedDiscoveredModelId: selected.id,
-          }).catch(stickinessWriteError);
-        }
+            status: terminalStatus(terminal),
+            startedAt,
+            terminal,
+            attemptCount: 1,
+            localExecution,
+            userId: requester.userId,
+          }).catch(metadataUpdateError),
+          terminal.ok && responseId && operation.responseStickiness
+            ? writeResponseStickiness({
+                ...operation.responseStickiness,
+                responseId,
+                selectedDiscoveredModelId: selected.id,
+              }).catch(stickinessWriteError)
+            : Promise.resolve(),
+        ]);
       })
       .catch(metadataUpdateError);
     void finalize;
-    return new Response(
-      responseBodyForOperation({
-        body: started.body,
-        headers: started.headers,
-        terminal: attempt.terminal,
-        operation,
-      }),
-      { status: started.status, headers: started.headers },
+    const response = responseWithFirstClientByte(
+      new Response(
+        responseBodyForOperation({
+          body: started.body,
+          headers: started.headers,
+          terminal: attempt.terminal,
+          operation,
+        }),
+        { status: started.status, headers: started.headers },
+      ),
+      () => markLocalFirstClientByte(relayRequestId, requester.userId, localExecution),
     );
+    return capacityLease?.state === "ADMITTED" && capacityRuntime
+      ? await holdOrReleaseCapacityResponse(
+          capacityRuntime,
+          response,
+          capacityLease.lease,
+          request.signal,
+        )
+      : response;
   } catch {
-    const terminal = await attempt.terminal;
-    cliLease.release();
-    globalLease.release();
-    if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+    attempt.cancel("unknown");
+    const terminal = await attempt.terminal.catch(() => rejectedRelayTerminal());
+    const cleanup = await Promise.allSettled([
+      Promise.resolve().then(() => cliLease.release()),
+      Promise.resolve().then(() => globalLease.release()),
+      capacityLease?.state === "ADMITTED"
+        ? (capacityRuntime?.release(capacityLease.lease) ?? Promise.resolve(false))
+        : Promise.resolve(),
+      builtRequest.body instanceof Uint8Array ? Promise.resolve() : builtRequest.body.dispose(),
+      operation.dispose?.() ?? Promise.resolve(),
+    ]);
+    reportCleanupFailures(cleanup);
     await updateRelayMetadata(relayRequestId, {
       selectedDiscoveredModelId: selected.id,
       status: terminalStatus(terminal),
       startedAt,
       terminal,
       attemptCount: 1,
+      localExecution,
+      userId: requester.userId,
     });
-    return openAiFailureJsonResponse(terminal.failure ?? "unknown");
+    return operationFailureResponse(operation, terminal.failure ?? "unknown");
   }
 }
 
@@ -2347,6 +5986,7 @@ async function maybeApplyPoolMediaTransformer({
         modelApiTokenLookupPrefix: requester.modelApiTokenLookupPrefix,
         requestedDiscoveredModelId: transformer.id,
         requestedModelPoolId: poolId,
+        requestedSurface: "OPENAI_CHAT_COMPLETIONS",
         operation: "chat.completions",
       });
     } catch (error) {
@@ -2355,7 +5995,17 @@ async function maybeApplyPoolMediaTransformer({
       throw error;
     }
 
+    const localExecution: LocalExecutionTelemetry = {
+      selectedExecutionTargetId: transformer.ExecutionTarget?.id,
+      nativeSurface: "OPENAI_CHAT_COMPLETIONS",
+      requestedSurface: "OPENAI_CHAT_COMPLETIONS",
+      adapterMode: "NATIVE",
+      localAttemptId: crypto.randomUUID(),
+      poolId,
+    };
+    await startLocalExecutionTelemetry(transformRelayRequestId, requester.userId, localExecution);
     const attempt = startRelayAttempt({
+      requestId: localExecution.localAttemptId,
       manager,
       cliDeviceId: transformer.Endpoint.cliDeviceId,
       endpointSlug: transformer.Endpoint.slug,
@@ -2388,6 +6038,8 @@ async function maybeApplyPoolMediaTransformer({
           fallbackFailure: terminal.failure ?? "upstream_4xx",
           transformerErrorClass: terminal.failure ?? "upstream_4xx",
           transformerLatencyMs: Math.max(0, Date.now() - hopStartedAt.getTime()),
+          localExecution,
+          userId: requester.userId,
         }).catch(metadataUpdateError);
         return transformerFailureResponse(
           terminal.failure ?? "upstream_4xx",
@@ -2409,6 +6061,9 @@ async function maybeApplyPoolMediaTransformer({
           selectedDiscoveredModelId: transformer.id,
           transformerErrorClass: "protocol_error",
           transformerLatencyMs: Math.max(0, Date.now() - hopStartedAt.getTime()),
+          localExecution,
+          userId: requester.userId,
+          localTerminal: terminal,
         }).catch(metadataUpdateError);
         return transformerFailureResponse(
           "protocol_error",
@@ -2424,6 +6079,9 @@ async function maybeApplyPoolMediaTransformer({
           selectedDiscoveredModelId: transformer.id,
           transformerErrorClass: "protocol_error",
           transformerLatencyMs: Math.max(0, Date.now() - hopStartedAt.getTime()),
+          localExecution,
+          userId: requester.userId,
+          localTerminal: terminal,
         }).catch(metadataUpdateError);
         return transformerFailureResponse(
           "protocol_error",
@@ -2440,6 +6098,9 @@ async function maybeApplyPoolMediaTransformer({
           selectedDiscoveredModelId: transformer.id,
           transformerErrorClass: "request_too_large",
           transformerLatencyMs: Math.max(0, Date.now() - hopStartedAt.getTime()),
+          localExecution,
+          userId: requester.userId,
+          localTerminal: terminal,
         }).catch(metadataUpdateError);
         return transformerFailureResponse(
           "request_too_large",
@@ -2454,6 +6115,8 @@ async function maybeApplyPoolMediaTransformer({
         terminal: { ...terminal, ok: true, failure: null },
         transformerLatencyMs: Math.max(0, Date.now() - hopStartedAt.getTime()),
         transformerCacheHit: false,
+        localExecution,
+        userId: requester.userId,
       }).catch(metadataUpdateError);
 
       if (canCache) {
@@ -2468,7 +6131,9 @@ async function maybeApplyPoolMediaTransformer({
         }),
       );
     } catch (error) {
+      attempt.cancel("unknown");
       const terminal = await attempt.terminal.catch(() => null);
+      const observedTerminal = terminal ?? rejectedRelayTerminal();
       cliLease?.release();
       globalLease?.release();
       const failure: RelayFailure =
@@ -2482,6 +6147,9 @@ async function maybeApplyPoolMediaTransformer({
         selectedDiscoveredModelId: transformer.id,
         transformerErrorClass: failure,
         transformerLatencyMs: Math.max(0, Date.now() - hopStartedAt.getTime()),
+        localExecution,
+        userId: requester.userId,
+        localTerminal: observedTerminal,
       }).catch(metadataUpdateError);
       if (error instanceof TransformerResponseTooLargeError) {
         return transformerFailureResponse(
@@ -2609,6 +6277,8 @@ async function relayPreparedModeledRequest({
   operation,
   manager,
   limiter,
+  adaptationFeatureEnabled = false,
+  capacityRuntime,
 }: {
   request: Request;
   requester: RelayRequester;
@@ -2618,9 +6288,23 @@ async function relayPreparedModeledRequest({
   };
   prepared: PreparedModeledRequest;
   operation: Omit<RelayOperation, "stream" | "buildRequest">;
+  adaptationFeatureEnabled?: boolean;
+  capacityRuntime?: CapacityAdmissionRuntime;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
 }) {
+  let contextCount: ContextCountTelemetry | undefined;
+  if (prepared.payload) {
+    try {
+      contextCount = await countSerializedRequestContext({
+        input: prepared.payload,
+        signal: request.signal,
+      });
+    } catch {
+      await prepared.dispose?.();
+      return operationFailureResponse(operation, request.signal.aborted ? "cancelled" : "unknown");
+    }
+  }
   const directTarget = directTargetByModelId(targets.directModels, prepared.model);
   if (directTarget) {
     const transcriptionLimitError = await transcriptionUploadLimitResponse({
@@ -2646,6 +6330,8 @@ async function relayPreparedModeledRequest({
       buildRequest: prepared.buildRequest,
       transcriptionProfile: prepared.transcriptionProfile,
       dispose: prepared.dispose,
+      contextCount,
+      contextInput: capacityRuntime ? (prepared.payload ?? undefined) : undefined,
     };
     return relayDirect({
       request,
@@ -2654,6 +6340,7 @@ async function relayPreparedModeledRequest({
       operation: relayOperation,
       manager,
       limiter,
+      capacityRuntime,
     });
   }
 
@@ -2690,6 +6377,22 @@ async function relayPreparedModeledRequest({
       return maybeTransformed;
     }
     prepared = maybeTransformed;
+    if (prepared.payload) {
+      try {
+        // Media descriptions can grow or shrink the serialized request. Pool
+        // eligibility must use the payload that will actually reach members.
+        contextCount = await countSerializedRequestContext({
+          input: prepared.payload,
+          signal: request.signal,
+        });
+      } catch {
+        await prepared.dispose?.();
+        return operationFailureResponse(
+          operation,
+          request.signal.aborted ? "cancelled" : "unknown",
+        );
+      }
+    }
 
     const relayOperation: RelayOperation = {
       ...operation,
@@ -2697,6 +6400,27 @@ async function relayPreparedModeledRequest({
       buildRequest: prepared.buildRequest,
       transcriptionProfile: prepared.transcriptionProfile,
       dispose: prepared.dispose,
+      contextCount,
+      contextInput: prepared.payload ?? undefined,
+      ...(prepared.payload &&
+      (operation.family === "chat.completions" ||
+        (operation.family === "responses" && operation.capability === "responses.create") ||
+        (operation.family === "messages" && operation.capability === "messages.create"))
+        ? {
+            adaptation: {
+              featureEnabled: adaptationFeatureEnabled,
+              poolEnabled: poolTarget.protocolAdaptationEnabled,
+              allowLossyDeveloperRoleCollapse: poolTarget.allowLossyDeveloperRoleCollapse,
+              requestedSurface:
+                operation.family === "chat.completions"
+                  ? ("openai-chat" as const)
+                  : operation.family === "responses" && operation.capability === "responses.create"
+                    ? ("openai-responses" as const)
+                    : ("anthropic-messages" as const),
+              payload: prepared.payload,
+            },
+          }
+        : {}),
     };
     const response = await relayPool({
       request,
@@ -2706,6 +6430,7 @@ async function relayPreparedModeledRequest({
       manager,
       limiter,
       transformDebug: prepared.transformDebug,
+      capacityRuntime,
     });
     if (requester.exposeTransformDebug && prepared.transformDebug) {
       return attachTransformDebug(response, prepared.transformDebug);
@@ -2714,7 +6439,7 @@ async function relayPreparedModeledRequest({
   }
 
   await prepared.dispose?.();
-  return openAiFailureJsonResponse("not_found");
+  return operationFailureResponse(operation, "not_found");
 }
 
 async function authenticatedModeledHandler({
@@ -2723,12 +6448,16 @@ async function authenticatedModeledHandler({
   prepare,
   manager,
   limiter,
+  adaptationFeatureEnabled,
+  capacityRuntime,
 }: {
   request: Request;
   operation: Omit<RelayOperation, "stream" | "buildRequest">;
   prepare: (request: Request) => Promise<PreparedModeledRequest | Response>;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
+  adaptationFeatureEnabled?: boolean;
+  capacityRuntime?: CapacityAdmissionRuntime;
 }) {
   const token = await authenticateRequest(request);
   if (!token)
@@ -2760,6 +6489,8 @@ async function authenticatedModeledHandler({
       operation,
       manager,
       limiter,
+      adaptationFeatureEnabled,
+      capacityRuntime,
     });
     responseReturned = true;
     return response;
@@ -2773,11 +6504,15 @@ async function completionsHandler({
   family,
   manager,
   limiter,
+  adaptationFeatureEnabled,
+  capacityRuntime,
 }: {
   request: Request;
   family: "chat.completions" | "completions";
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
+  adaptationFeatureEnabled?: boolean;
+  capacityRuntime?: CapacityAdmissionRuntime;
 }) {
   return authenticatedModeledHandler({
     request,
@@ -2790,6 +6525,8 @@ async function completionsHandler({
     prepare: prepareJsonModeledRequest,
     manager,
     limiter,
+    adaptationFeatureEnabled,
+    capacityRuntime,
   });
 }
 
@@ -2798,11 +6535,13 @@ export async function chatTestCompletionsHandler({
   userId,
   manager,
   limiter,
+  capacityRuntime,
 }: {
   request: Request;
   userId: string;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
+  capacityRuntime?: CapacityAdmissionRuntime;
 }) {
   const prepared = await prepareJsonModeledRequest(request);
   if (prepared instanceof Response) return prepared;
@@ -2823,6 +6562,7 @@ export async function chatTestCompletionsHandler({
     },
     manager,
     limiter,
+    capacityRuntime,
   });
 }
 
@@ -2840,30 +6580,280 @@ function previousResponseId(payload: JsonObject | null): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
-function responseIdParam(responseId: string | undefined): string | Response {
-  if (typeof responseId !== "string" || responseId.trim().length === 0) {
-    return openAiFailureJsonResponse("not_found", "Response ID is required.");
+async function relayBoundProviderResponse(input: {
+  request: Request;
+  requester: RelayRequester;
+  stickyRoute: Extract<StickyRoute, { target: "PROVIDER" }>;
+  method: string;
+  path: string;
+  capability: ModelApiCapability;
+  body: Uint8Array;
+  headers: Headers;
+  stream: boolean;
+  captureReturnedResponse: boolean;
+  contextInput?: JsonObject;
+  contextCount?: ContextCountTelemetry;
+  capacityRuntime?: CapacityAdmissionRuntime;
+}): Promise<Response> {
+  const relayRequestId = await createRelayMetadata({
+    userId: input.requester.userId,
+    modelApiTokenId: input.requester.modelApiTokenId,
+    modelApiTokenLookupPrefix: input.requester.modelApiTokenLookupPrefix,
+    requestedModelPoolId: input.stickyRoute.visibleTarget.id,
+    requestedSurface: "OPENAI_RESPONSES",
+    operation: input.capability,
+    requestBytes: input.body.byteLength,
+    contextCount: input.contextCount,
+  });
+  const maxOutput = input.contextInput?.max_output_tokens;
+  const requestedOutputTokens =
+    typeof maxOutput === "number" && Number.isSafeInteger(maxOutput) && maxOutput >= 0
+      ? BigInt(maxOutput)
+      : 0n;
+  const estimatedInputTokens = input.contextInput
+    ? input.contextCount?.tokens === undefined
+      ? conservativeSerializedInputTokens(input.body.byteLength)
+      : BigInt(input.contextCount.tokens)
+    : 0n;
+  const boundRequest = {
+    userId: input.stickyRoute.visibleTarget.ownerUserId,
+    poolId: input.stickyRoute.visibleTarget.id,
+    requestId: relayRequestId,
+    reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+    requestedProtocol: "openai",
+    requestedSurface: "openai-responses",
+    stream: input.stream,
+    requiredFeatures: [],
+    method: input.method,
+    path: input.path,
+    headers: input.headers,
+    body: input.body,
+    signal: input.request.signal,
+    liability: conservativeProviderLiability({ estimatedInputTokens, requestedOutputTokens }),
+    estimatedInputTokens,
+    requestedOutputTokens,
+    contextTokens: estimatedInputTokens + requestedOutputTokens,
+    releaseLocalCapacity: async () => undefined,
+    adaptationEnabled: false,
+    retrySafe: false,
+    exactResponsesBinding: input.stickyRoute.binding,
+    skipContextValidation: input.contextInput === undefined,
+  } satisfies PublicOverflowRequest;
+  let providerCapacityLease:
+    | Extract<
+        Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>>,
+        { state: "ADMITTED" }
+      >["lease"]
+    | undefined;
+  const dispatchBoundTier = async (memberTier: "PRIMARY" | "PUBLIC_OVERFLOW") => {
+    if (!input.capacityRuntime)
+      return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" } as const;
+    const listed = await listPublicOverflowTargets(
+      input.stickyRoute.visibleTarget.ownerUserId,
+      input.stickyRoute.visibleTarget.id,
+      memberTier,
+    );
+    const exactTarget = listed.targets.find(
+      (target) =>
+        target.executionTargetId === input.stickyRoute.binding.executionTargetId &&
+        target.providerAccountId === input.stickyRoute.binding.providerAccountId &&
+        target.providerModelId === input.stickyRoute.binding.providerModelId,
+    );
+    if (!exactTarget?.inferenceCapacityId)
+      return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" } as const;
+    const admission = await acquireCapacityWithTelemetry({
+      runtime: input.capacityRuntime,
+      relayRequestId,
+      attempt: {
+        requestId: crypto.randomUUID(),
+        relayRequestId,
+        attemptId: crypto.randomUUID(),
+        ownerId: input.stickyRoute.visibleTarget.ownerUserId,
+        sourceKind: "POOL",
+        poolId: input.stickyRoute.visibleTarget.id,
+        basePriority: 16,
+        connectionOwner: "model-api-provider-stickiness",
+        deadlineAt: new Date(Date.now() + MODEL_API_RELAY_TIMEOUT_MS),
+        candidates: [
+          {
+            capacityId: exactTarget.inferenceCapacityId,
+            executionTargetId: exactTarget.executionTargetId,
+            poolMemberId: exactTarget.poolMemberId,
+            candidateOrder: 0,
+            deadlineAt: boundedAdmissionDeadline(
+              Date.now(),
+              Date.now() + MODEL_API_RELAY_TIMEOUT_MS,
+              exactTarget.capacityWaitBudgetMs ?? null,
+            ),
+          },
+        ],
+      },
+      signal: input.request.signal,
+    });
+    if (admission.state !== "ADMITTED")
+      return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" } as const;
+    let result: Awaited<ReturnType<typeof dispatchPublicOverflow>>;
+    try {
+      result = await dispatchPublicOverflow({
+        ...boundRequest,
+        memberTier,
+        forcedPoolMemberId: exactTarget.poolMemberId,
+      });
+    } catch (error) {
+      await releaseCapacityLeaseWithRetry({ store: input.capacityRuntime, lease: admission.lease });
+      throw error;
+    }
+    if (!result.dispatched) {
+      await releaseCapacityLeaseWithRetry({ store: input.capacityRuntime, lease: admission.lease });
+      return result;
+    }
+    providerCapacityLease = admission.lease;
+    return result;
+  };
+  let selectedTier: "PRIMARY" | "PUBLIC_OVERFLOW" = "PRIMARY";
+  let result = await dispatchBoundTier("PRIMARY");
+  if (!result.dispatched) {
+    selectedTier = "PUBLIC_OVERFLOW";
+    result = await dispatchBoundTier("PUBLIC_OVERFLOW");
   }
-  return responseId;
+  if (!result.dispatched) {
+    await prisma.relayRequest
+      .update({
+        where: { id: relayRequestId },
+        data: { status: "FAILED", completedAt: new Date(), errorClass: "not_found" },
+        select: { id: true },
+      })
+      .catch(metadataUpdateError);
+    return openAiFailureJsonResponse(
+      "not_found",
+      "The bound provider Responses target is no longer available.",
+    );
+  }
+  await prisma.relayRequest
+    .update({
+      where: { id: relayRequestId },
+      data: {
+        selectedExecutionTargetId: result.target.executionTargetId,
+        selectedPoolMemberId: result.target.poolMemberId,
+        selectedNativeSurface: "OPENAI_RESPONSES",
+        adapterMode: "NATIVE",
+        publicEgress: true,
+        selectedPoolMemberTier: selectedTier,
+        providerAccountId: result.target.providerAccountId,
+        providerModelId: result.target.providerModelId,
+        providerAttemptId: result.attemptId,
+        providerFencingToken: result.fencingToken,
+        attemptCount: 1,
+      },
+      select: { id: true },
+    })
+    .catch(metadataUpdateError);
+  void result.terminal
+    .then((terminal) =>
+      prisma.relayRequest.update({
+        where: { id: relayRequestId },
+        data: {
+          status: terminal.ok ? "SUCCEEDED" : input.request.signal.aborted ? "CANCELED" : "FAILED",
+          completedAt: new Date(),
+          httpStatusCode: result.response.status,
+          upstreamStatusCode: result.response.status,
+          responseBytes: BigInt(terminal.responseBytes),
+          errorClass: terminal.ok ? null : input.request.signal.aborted ? "cancelled" : "unknown",
+        },
+        select: { id: true },
+      }),
+    )
+    .catch(metadataUpdateError);
+  let response = result.response;
+  if (response.status < 200 || response.status >= 300) {
+    let sanitized: Uint8Array;
+    try {
+      sanitized = await readAdaptedNonstreamBody({
+        body: response.body,
+        source: "openai-responses",
+        target: "openai-responses",
+        status: response.status,
+        headers: response.headers,
+        signal: input.request.signal,
+      });
+    } catch (error) {
+      if (providerCapacityLease && input.capacityRuntime)
+        await releaseCapacityLeaseWithRetry({
+          store: input.capacityRuntime,
+          lease: providerCapacityLease,
+        });
+      throw error;
+    }
+    response = new Response(sanitized, {
+      status: response.status >= 400 && response.status <= 599 ? response.status : 502,
+      headers: adaptedProviderResponseHeaders(
+        "openai-responses",
+        "openai-responses",
+        response.headers,
+        false,
+      ),
+    });
+  }
+  if (input.captureReturnedResponse) {
+    response = captureProviderResponseBinding({
+      response,
+      streaming: input.stream,
+      requester: input.requester,
+      targetModelPoolId: input.stickyRoute.visibleTarget.id,
+      poolGrantId: input.stickyRoute.visibleTarget.accessGrantId,
+      target: result.target,
+      terminal: result.terminal,
+    });
+  }
+  const committed = responseWithFirstClientByte(response, result.markFirstClientByte);
+  return providerCapacityLease && input.capacityRuntime
+    ? await holdOrReleaseCapacityResponse(
+        input.capacityRuntime,
+        committed,
+        providerCapacityLease,
+        input.request.signal,
+      )
+    : committed;
 }
 
-async function responsesCreateHandler({
+function responseIdParam(responseId: string | undefined): string | Response {
+  // Hono can preserve the raw query suffix in a route parameter when this app
+  // is mounted below another Hono router. Never let that suffix become part of
+  // the encoded upstream response ID; responsePathWithQuery forwards it once.
+  const normalized = responseId?.split(/\?|%3f/i, 1)[0]?.trim();
+  if (!normalized) {
+    return openAiFailureJsonResponse("not_found", "Response ID is required.");
+  }
+  return normalized;
+}
+
+export async function responsesCreateHandler({
   request,
   manager,
   limiter,
+  capacityRuntime,
+  adaptationFeatureEnabled,
+  chatTestUserId,
 }: {
   request: Request;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
+  adaptationFeatureEnabled?: boolean;
+  capacityRuntime?: CapacityAdmissionRuntime;
+  chatTestUserId?: string;
 }) {
-  const token = await authenticateRequest(request);
-  if (!token)
+  const token = chatTestUserId ? null : await authenticateRequest(request);
+  if (!token && !chatTestUserId)
     return openAiFailureJsonResponse("access_denied", "Missing or invalid model API token.");
 
   const prepared = await prepareJsonModeledRequest(request);
   if (prepared instanceof Response) return prepared;
-  const requester = requesterFromToken(token);
-  const targets = await listVisibleModelTargetsForToken(token);
+  const requester = chatTestUserId
+    ? requesterFromChatTestUser(chatTestUserId)
+    : requesterFromToken(token!);
+  const targets = chatTestUserId
+    ? await listVisibleModelTargetsForUser(chatTestUserId)
+    : await listVisibleModelTargetsForToken(token!);
   const previousId = previousResponseId(prepared.payload);
   const operation: Omit<RelayOperation, "stream" | "buildRequest"> = {
     family: "responses",
@@ -2871,7 +6861,10 @@ async function responsesCreateHandler({
     path: "/v1/responses",
     capability: "responses.create",
     additionalCapabilities: previousId ? ["responses.statefulFollowUps"] : undefined,
-    responseStickiness: { requester },
+    // Explicitly stateless Responses requests do not create a follow-up route
+    // and may therefore use a public provider target. Stored/default Responses
+    // remain pinned to relay targets until provider stickiness is implemented.
+    responseStickiness: prepared.payload?.store === false ? undefined : { requester },
   };
 
   if (!previousId) {
@@ -2883,11 +6876,39 @@ async function responsesCreateHandler({
       operation,
       manager,
       limiter,
+      adaptationFeatureEnabled,
+      capacityRuntime,
     });
   }
 
   const stickyRoute = await resolveStickyRoute({ requester, responseId: previousId, targets });
   if (stickyRoute instanceof Response) return stickyRoute;
+  if (stickyRoute.target === "PROVIDER") {
+    if (prepared.model !== stickyRoute.visibleTarget.modelId)
+      return openAiFailureJsonResponse(
+        "access_denied",
+        "Response follow-up model does not match the original route.",
+      );
+    const built = await prepared.buildRequest(stickyRoute.binding.upstreamModelId);
+    if (!(built.body instanceof Uint8Array)) {
+      await built.body.dispose();
+      return openAiFailureJsonResponse("unsupported_capability");
+    }
+    return relayBoundProviderResponse({
+      request,
+      requester,
+      stickyRoute,
+      method: "POST",
+      path: "/v1/responses",
+      capability: "responses.create",
+      body: built.body,
+      headers: built.headers,
+      stream: prepared.stream,
+      captureReturnedResponse: true,
+      contextInput: prepared.payload ?? undefined,
+      capacityRuntime,
+    });
+  }
   if (
     (stickyRoute.target === "DIRECT_MODEL" &&
       prepared.model !== stickyRoute.visibleTarget.modelId) ||
@@ -2921,6 +6942,7 @@ async function responsesCreateHandler({
     },
     manager,
     limiter,
+    capacityRuntime,
   });
 }
 
@@ -2932,6 +6954,7 @@ async function responsesStickyHandler({
   capability,
   manager,
   limiter,
+  capacityRuntime,
 }: {
   request: Request;
   responseId: string;
@@ -2940,6 +6963,7 @@ async function responsesStickyHandler({
   capability: ModelApiCapability;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
+  capacityRuntime?: CapacityAdmissionRuntime;
 }) {
   const token = await authenticateRequest(request);
   if (!token)
@@ -2949,6 +6973,28 @@ async function responsesStickyHandler({
   const targets = await listVisibleModelTargetsForToken(token);
   const stickyRoute = await resolveStickyRoute({ requester, responseId, targets });
   if (stickyRoute instanceof Response) return stickyRoute;
+
+  if (stickyRoute.target === "PROVIDER") {
+    const built = prepareEmptyRelayRequest(request);
+    const prepared = await built(stickyRoute.binding.upstreamModelId);
+    if (!(prepared.body instanceof Uint8Array)) {
+      await prepared.body.dispose();
+      return openAiFailureJsonResponse("unsupported_capability");
+    }
+    return relayBoundProviderResponse({
+      request,
+      requester,
+      stickyRoute,
+      method,
+      path,
+      capability,
+      body: prepared.body,
+      headers: prepared.headers,
+      stream: false,
+      captureReturnedResponse: false,
+      capacityRuntime,
+    });
+  }
 
   return relaySelectedModelNoFailover({
     request,
@@ -2968,14 +7014,109 @@ async function responsesStickyHandler({
     },
     manager,
     limiter,
+    capacityRuntime,
   });
+}
+
+async function prepareAnthropicModeledRequest(
+  request: Request,
+  ingress: AnthropicIngress,
+): Promise<PreparedModeledRequest | Response> {
+  const body = await readModelApiBody(request);
+  if (body instanceof Response) {
+    return anthropicErrorResponse(413, "Request body is too large.", "request_too_large");
+  }
+  let payload: JsonObject;
+  try {
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(body));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("object");
+    payload = parsed as JsonObject;
+  } catch {
+    return anthropicErrorResponse(400, "Request body must be a JSON object.");
+  }
+  if (typeof payload.model !== "string" || payload.model.trim().length === 0) {
+    return anthropicErrorResponse(400, "model is required and must be a non-empty string.");
+  }
+  return {
+    model: payload.model,
+    payload,
+    stream: payload.stream === true,
+    buildRequest: async (upstreamModelId) => ({
+      headers: anthropicRelayHeaders(request, ingress),
+      body: upstreamBody(payload, upstreamModelId),
+    }),
+  };
+}
+
+export async function anthropicMessagesHandler({
+  request,
+  countTokens,
+  manager,
+  limiter,
+  adaptationFeatureEnabled,
+  capacityRuntime,
+  chatTestUserId,
+}: {
+  request: Request;
+  countTokens: boolean;
+  manager: NonNullable<ModelApiRouteDependencies["manager"]>;
+  limiter: ModelApiConcurrencyLimiter;
+  adaptationFeatureEnabled?: boolean;
+  capacityRuntime?: CapacityAdmissionRuntime;
+  chatTestUserId?: string;
+}) {
+  const token = chatTestUserId ? null : await authenticateRequest(request);
+  if (!token && !chatTestUserId) {
+    return anthropicErrorResponse(
+      401,
+      "Missing or invalid WSMP bearer token.",
+      "authentication_error",
+    );
+  }
+  const ingress = parseAnthropicIngress(request.headers);
+  if (ingress instanceof Response) return ingress;
+  const prepared = await prepareAnthropicModeledRequest(request, ingress);
+  if (prepared instanceof Response) return prepared;
+  if (countTokens) prepared.stream = false;
+  const targets = chatTestUserId
+    ? await listVisibleModelTargetsForUser(chatTestUserId)
+    : await listVisibleModelTargetsForToken(token!);
+  const response = await relayPreparedModeledRequest({
+    request,
+    requester: chatTestUserId
+      ? requesterFromChatTestUser(chatTestUserId)
+      : requesterFromToken(token!),
+    targets,
+    prepared,
+    operation: {
+      family: "messages",
+      method: "POST",
+      path: countTokens ? "/v1/messages/count_tokens" : "/v1/messages",
+      capability: countTokens ? "messages.countTokens" : "messages.create",
+      anthropicIngress: ingress,
+    },
+    manager,
+    limiter,
+    adaptationFeatureEnabled,
+    capacityRuntime,
+  });
+  // Native upstream success and error bytes are intentionally opaque here.
+  // Reading or cloning the stream would violate streaming and backpressure.
+  return response;
 }
 
 export function createModelApiRoutes({
   manager = relaySessionManager,
   concurrencyLimiter = modelApiConcurrencyLimiter,
+  anthropicEnabled = env.MODEL_API_ANTHROPIC_ENABLED,
+  protocolAdaptationEnabled = env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
+  capacityEnabled = env.MODEL_API_GLOBAL_CAPACITY_ENABLED,
+  capacityRuntime,
 }: ModelApiRouteDependencies = {}) {
   const app = new Hono();
+  const admissionRuntime = capacityEnabled
+    ? (capacityRuntime ?? new StoreCapacityAdmissionRuntime(new PostgresCapacityAdmissionStore()))
+    : undefined;
 
   app.get("/models", async (c) => {
     const token = await authenticateRequest(c.req.raw);
@@ -2992,6 +7133,8 @@ export function createModelApiRoutes({
       family: "chat.completions",
       manager,
       limiter: concurrencyLimiter,
+      adaptationFeatureEnabled: protocolAdaptationEnabled,
+      capacityRuntime: admissionRuntime,
     }),
   );
 
@@ -3001,6 +7144,8 @@ export function createModelApiRoutes({
       family: "completions",
       manager,
       limiter: concurrencyLimiter,
+      adaptationFeatureEnabled: protocolAdaptationEnabled,
+      capacityRuntime: admissionRuntime,
     }),
   );
 
@@ -3016,6 +7161,8 @@ export function createModelApiRoutes({
       prepare: prepareJsonModeledRequest,
       manager,
       limiter: concurrencyLimiter,
+      capacityRuntime: admissionRuntime,
+      adaptationFeatureEnabled: protocolAdaptationEnabled,
     }),
   );
 
@@ -3031,6 +7178,7 @@ export function createModelApiRoutes({
       prepare: prepareMultipartModeledRequest,
       manager,
       limiter: concurrencyLimiter,
+      capacityRuntime: admissionRuntime,
     }),
   );
 
@@ -3069,8 +7217,33 @@ export function createModelApiRoutes({
       request: c.req.raw,
       manager,
       limiter: concurrencyLimiter,
+      adaptationFeatureEnabled: protocolAdaptationEnabled,
+      capacityRuntime: admissionRuntime,
     }),
   );
+
+  if (anthropicEnabled) {
+    app.post("/messages", async (c) =>
+      anthropicMessagesHandler({
+        request: c.req.raw,
+        countTokens: false,
+        manager,
+        limiter: concurrencyLimiter,
+        adaptationFeatureEnabled: protocolAdaptationEnabled,
+        capacityRuntime: admissionRuntime,
+      }),
+    );
+
+    app.post("/messages/count_tokens", async (c) =>
+      anthropicMessagesHandler({
+        request: c.req.raw,
+        countTokens: true,
+        manager,
+        limiter: concurrencyLimiter,
+        capacityRuntime: admissionRuntime,
+      }),
+    );
+  }
 
   app.post("/responses/count_tokens", async (c) =>
     authenticatedModeledHandler({
@@ -3098,6 +7271,7 @@ export function createModelApiRoutes({
       capability: "responses.retrieve",
       manager,
       limiter: concurrencyLimiter,
+      capacityRuntime: admissionRuntime,
     });
   });
 
@@ -3112,6 +7286,7 @@ export function createModelApiRoutes({
       capability: "responses.delete",
       manager,
       limiter: concurrencyLimiter,
+      capacityRuntime: admissionRuntime,
     });
   });
 
@@ -3126,6 +7301,7 @@ export function createModelApiRoutes({
       capability: "responses.cancel",
       manager,
       limiter: concurrencyLimiter,
+      capacityRuntime: admissionRuntime,
     });
   });
 
@@ -3140,6 +7316,7 @@ export function createModelApiRoutes({
       capability: "responses.listInputItems",
       manager,
       limiter: concurrencyLimiter,
+      capacityRuntime: admissionRuntime,
     });
   });
 
@@ -3154,6 +7331,7 @@ export function createModelApiRoutes({
       capability: "responses.compact",
       manager,
       limiter: concurrencyLimiter,
+      capacityRuntime: admissionRuntime,
     });
   });
 

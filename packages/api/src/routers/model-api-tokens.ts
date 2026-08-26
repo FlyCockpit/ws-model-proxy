@@ -33,6 +33,7 @@ const tokenSelection = {
     select: {
       target: true,
       discoveredModelId: true,
+      ExecutionTarget: { select: { discoveredModelId: true } },
       modelPoolId: true,
     },
   },
@@ -52,6 +53,7 @@ type TokenListRow = {
   AllowlistEntries: {
     target: string;
     discoveredModelId: string | null;
+    ExecutionTarget?: { discoveredModelId: string | null } | null;
     modelPoolId: string | null;
   }[];
 };
@@ -69,11 +71,16 @@ function serializeToken(row: TokenListRow) {
     expiresAt: row.expiresAt,
     allowlist: {
       directModelCount: row.AllowlistEntries.filter(
-        (entry) => entry.target === "DIRECT_MODEL" && entry.discoveredModelId,
+        (entry) =>
+          entry.target === "DIRECT_MODEL" &&
+          Boolean(entry.ExecutionTarget?.discoveredModelId ?? entry.discoveredModelId),
       ).length,
       modelPoolCount: row.AllowlistEntries.filter(
         (entry) => entry.target === "MODEL_POOL" && entry.modelPoolId,
       ).length,
+      modelPoolIds: row.AllowlistEntries.flatMap((entry) =>
+        entry.target === "MODEL_POOL" && entry.modelPoolId ? [entry.modelPoolId] : [],
+      ),
     },
   };
 }
@@ -95,6 +102,10 @@ function serializeTargets(targets: VisibleModelTargets) {
       id: pool.modelId,
       name: pool.name,
       description: pool.description,
+      publicEgressEnabled: pool.publicEgressEnabled,
+      publicEgressAcknowledged: pool.publicEgressAcknowledged,
+      effectiveProviderEgress: pool.effectiveProviderEgress,
+      providerPrimaryMemberCount: pool.providerPrimaryMemberCount,
       ownerUserId: pool.ownerUserId,
       ownerUserSlug: pool.ownerUserSlug,
       poolSlug: pool.poolSlug,
@@ -196,6 +207,7 @@ export const modelApiTokensRouter = {
               ...allowlistTargets.directModels.map((model) => ({
                 target: "DIRECT_MODEL" as const,
                 discoveredModelId: model.id,
+                ExecutionTarget: { connect: { discoveredModelId: model.id } },
               })),
               ...allowlistTargets.modelPools.map((pool) => ({
                 target: "MODEL_POOL" as const,

@@ -40,6 +40,7 @@ const requestIdSchema = z.string().trim().min(1).max(128);
 const headerNameSchema = z.string().trim().min(1).max(128);
 const headerValueSchema = z.string().max(8192);
 const headerSchema = z.record(headerNameSchema, headerValueSchema);
+const orderedHeadersSchema = z.array(z.tuple([headerNameSchema, headerValueSchema])).max(256);
 
 export { type OpenAiCompatibleCapabilities, openAiCompatibleCapabilitiesSchema };
 
@@ -120,13 +121,39 @@ const endpointInventorySchema = z
   .object({
     slug: z.string().trim().min(1).max(63),
     label: z.string().trim().min(1).max(160),
-    kind: z.literal("openai-compatible"),
+    kind: z.enum(["openai-compatible", "anthropic-compatible"]),
     status: z.enum(["unknown", "online", "degraded", "offline"]).default("unknown"),
     defaultCapabilities: openAiCompatibleCapabilitiesSchema,
     probeSuggestions: openAiCompatibleCapabilitiesSchema.optional(),
     models: z.array(discoveredModelSchema).max(1000).default([]),
   })
-  .strict();
+  .strict()
+  .superRefine((endpoint, context) => {
+    const expected = endpoint.kind;
+    const profiles = [
+      endpoint.defaultCapabilities,
+      endpoint.probeSuggestions,
+      ...endpoint.models.flatMap((model) => [model.capabilities, model.probeSuggestions]),
+    ];
+    for (const profile of profiles) {
+      if ((profile?.version === 3 || profile?.version === 4) && profile.protocol !== expected) {
+        context.addIssue({
+          code: "custom",
+          path: ["defaultCapabilities", "protocol"],
+          message: "Capability protocol must match endpoint kind.",
+        });
+        return;
+      }
+      if (profile && profile.version < 3 && expected !== "openai-compatible") {
+        context.addIssue({
+          code: "custom",
+          path: ["defaultCapabilities", "version"],
+          message: "Anthropic-compatible endpoints require capability inventory version 3.",
+        });
+        return;
+      }
+    }
+  });
 
 export type EndpointInventory = z.infer<typeof endpointInventorySchema>;
 
@@ -181,7 +208,7 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
       type: z.literal("relay.response.headers"),
       requestId: requestIdSchema,
       status: z.number().int().min(100).max(599),
-      headers: headerSchema.default({}),
+      headers: z.union([headerSchema, orderedHeadersSchema]).default({}),
     })
     .strict(),
   z
@@ -260,6 +287,7 @@ export type RelayServerControlMessage =
         | "completions"
         | "embeddings"
         | "responses"
+        | "messages"
         | "audio"
         | "images"
         | "generic";

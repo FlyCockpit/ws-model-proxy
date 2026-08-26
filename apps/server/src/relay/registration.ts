@@ -254,7 +254,10 @@ export async function persistRelayRegistration({
               update: {
                 cliDeviceId: cliDevice.id,
                 label: endpoint.label,
-                kind: "OPENAI_COMPATIBLE",
+                kind:
+                  endpoint.kind === "anthropic-compatible"
+                    ? "ANTHROPIC_COMPATIBLE"
+                    : "OPENAI_COMPATIBLE",
                 status: endpointStatus(endpoint.status),
                 defaultCapabilities: { set: coarseCapabilities },
                 capabilityMetadata: jsonOrUndefined(endpoint.defaultCapabilities),
@@ -272,7 +275,10 @@ export async function persistRelayRegistration({
                 cliDeviceId: cliDevice.id,
                 slug: endpoint.slug,
                 label: endpoint.label,
-                kind: "OPENAI_COMPATIBLE",
+                kind:
+                  endpoint.kind === "anthropic-compatible"
+                    ? "ANTHROPIC_COMPATIBLE"
+                    : "OPENAI_COMPATIBLE",
                 status: endpointStatus(endpoint.status),
                 defaultCapabilities: coarseCapabilities,
                 capabilityMetadata: jsonOrUndefined(endpoint.defaultCapabilities),
@@ -370,6 +376,16 @@ export async function persistRelayRegistration({
                 },
                 select: { id: true },
               });
+              await tx.executionTarget.upsert({
+                where: { discoveredModelId: discoveredModel.id },
+                update: { userId: identity.userId, kind: "DISCOVERED_MODEL" },
+                create: {
+                  userId: identity.userId,
+                  kind: "DISCOVERED_MODEL",
+                  discoveredModelId: discoveredModel.id,
+                },
+                select: { id: true },
+              });
               refreshedDiscoveredModelIds.push(discoveredModel.id);
             }
 
@@ -394,7 +410,18 @@ export async function persistRelayRegistration({
           if (inventoryChanged && refreshedDiscoveredModelIds.length > 0) {
             await tx.poolMember.updateMany({
               where: {
-                discoveredModelId: { in: refreshedDiscoveredModelIds },
+                OR: [
+                  {
+                    executionTargetId: { not: null },
+                    ExecutionTarget: {
+                      discoveredModelId: { in: refreshedDiscoveredModelIds },
+                    },
+                  },
+                  {
+                    executionTargetId: null,
+                    discoveredModelId: { in: refreshedDiscoveredModelIds },
+                  },
+                ],
                 routingStatus: { not: "DISABLED" },
               },
               data: resetPoolMemberHealth(),

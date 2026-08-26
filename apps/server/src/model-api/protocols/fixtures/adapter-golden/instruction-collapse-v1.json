@@ -1,0 +1,24 @@
+{
+  "adapterVersion": "1.0.0",
+  "sourceInstructions": [
+    { "role": "system", "text": "system one", "sourceIndex": 0 },
+    { "role": "developer", "text": "developer one", "sourceIndex": 2 },
+    { "role": "system", "text": "system two", "sourceIndex": 3 }
+  ],
+  "strictResult": "unsupported_feature",
+  "developerOnlyInstructions": [
+    { "role": "developer", "text": "developer only", "sourceIndex": 0 }
+  ],
+  "developerOnlyAnthropicSystem": [{ "type": "text", "text": "developer only" }],
+  "interleavedMessages": [
+    { "role": "developer", "content": "prefix" },
+    { "role": "user", "content": "message" },
+    { "role": "system", "content": "late instruction" }
+  ],
+  "lossyOptInAnthropicSystem": [
+    { "type": "text", "text": "system one" },
+    { "type": "text", "text": "developer one" },
+    { "type": "text", "text": "system two" }
+  ],
+  "limitation": "anthropic_instruction_authority_collapse"
+}

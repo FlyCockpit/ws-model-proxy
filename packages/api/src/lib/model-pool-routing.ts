@@ -131,6 +131,10 @@ export function poolMemberFailureClassForRelayFailure(
   if (failure === "timeout") return "RELAY_TIMEOUT";
   if (failure === "disconnected") return "WEBSOCKET_DISCONNECTED";
   if (failure === "upstream_5xx") return "UPSTREAM_5XX";
+  // A protocol violation is attributable to the selected upstream member in
+  // the same way as a broken relay payload: keep it out of the healthy path
+  // instead of recording the adapted request as an unpenalized failure.
+  if (failure === "protocol_error") return "TRANSPORT";
   return null;
 }
 
@@ -422,13 +426,34 @@ export async function selectPoolRouteSequence({
   now?: Date;
   state?: SmoothWeightedRoundRobinState;
 }): Promise<PoolRouteSequenceResult> {
-  const members = (await prisma.poolMember.findMany({
+  const rows = await prisma.poolMember.findMany({
     where: { poolId },
     orderBy: { id: "asc" },
     select: {
       id: true,
       poolId: true,
       discoveredModelId: true,
+      ExecutionTarget: {
+        select: {
+          DiscoveredModel: {
+            select: {
+              id: true,
+              published: true,
+              upstreamModelId: true,
+              Endpoint: {
+                select: {
+                  id: true,
+                  slug: true,
+                  published: true,
+                  cliDeviceId: true,
+                  status: true,
+                  CliDevice: { select: { status: true } },
+                },
+              },
+            },
+          },
+        },
+      },
       weight: true,
       healthStatus: true,
       routingStatus: true,
@@ -439,6 +464,7 @@ export async function selectPoolRouteSequence({
       halfOpenTrialStartedAt: true,
       DiscoveredModel: {
         select: {
+          id: true,
           published: true,
           upstreamModelId: true,
           Endpoint: {
@@ -454,7 +480,12 @@ export async function selectPoolRouteSequence({
         },
       },
     },
-  })) as PoolMemberRouteRow[];
+  });
+  const members = rows.flatMap((row) => {
+    const discoveredModel = row.ExecutionTarget?.DiscoveredModel ?? row.DiscoveredModel;
+    if (!discoveredModel) return [];
+    return [{ ...row, discoveredModelId: discoveredModel.id, DiscoveredModel: discoveredModel }];
+  }) as PoolMemberRouteRow[];
 
   return buildPoolRouteSequence({ members, activeCliDeviceIds, now, state });
 }
@@ -532,7 +563,13 @@ export async function resetPoolMemberHealthForDiscoveredModels(
   if (discoveredModelIds.length === 0) return;
   await prisma.poolMember.updateMany({
     where: {
-      discoveredModelId: { in: discoveredModelIds },
+      OR: [
+        {
+          executionTargetId: { not: null },
+          ExecutionTarget: { discoveredModelId: { in: discoveredModelIds } },
+        },
+        { executionTargetId: null, discoveredModelId: { in: discoveredModelIds } },
+      ],
       routingStatus: { not: "DISABLED" },
     },
     data: resetPoolMemberHealth(),
@@ -550,9 +587,16 @@ export async function markPoolMembersForCliUnavailable({
 }): Promise<void> {
   await prisma.poolMember.updateMany({
     where: {
-      DiscoveredModel: {
-        Endpoint: { cliDeviceId },
-      },
+      OR: [
+        {
+          executionTargetId: { not: null },
+          ExecutionTarget: { DiscoveredModel: { Endpoint: { cliDeviceId } } },
+        },
+        {
+          executionTargetId: null,
+          DiscoveredModel: { Endpoint: { cliDeviceId } },
+        },
+      ],
     },
     data: transitionPoolMemberHealthForCliUnavailable({ failureClass, now }),
   });

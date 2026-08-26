@@ -7,6 +7,8 @@ import {
   PRODUCT_CREDENTIAL_PREFIXES,
   verifyForwarderHmacDigest,
 } from "@ws-model-proxy/db/forwarder-security";
+import { parseModelApiSurface } from "./model-api-surface";
+import type { ModelApiSurface } from "./surface-capabilities";
 
 export const modelApiTokenScopeModes = ["ALL_VISIBLE", "ALLOWLIST"] as const;
 export type ModelApiTokenScopeMode = (typeof modelApiTokenScopeModes)[number];
@@ -35,9 +37,19 @@ export type VisibleModelPoolTarget = {
   description: string | null;
   ownerUserId: string;
   ownerUserSlug: string;
+  /** Exact grant row establishing visibility; null for the pool owner. */
+  accessGrantId: string | null;
   poolSlug: string;
   maxAttachmentBytes: number | null;
   optimisticBasicTranscription: boolean;
+  protocolAdaptationEnabled: boolean;
+  publicEgressEnabled: boolean;
+  publicEgressAcknowledged: boolean;
+  /** True when this pool can send requests to any external provider, including PRIMARY. */
+  effectiveProviderEgress: boolean;
+  providerPrimaryMemberCount: number;
+  allowLossyDeveloperRoleCollapse: boolean;
+  recommendedSurfaceOverride: ModelApiSurface | null;
 };
 
 export type VisibleModelTargets = {
@@ -75,16 +87,24 @@ type ModelPoolRow = {
   description: string | null;
   maxAttachmentBytes: number | null;
   optimisticBasicTranscription: boolean;
+  protocolAdaptationEnabled: boolean;
+  publicEgressEnabled: boolean;
+  publicEgressAcknowledged: boolean;
+  allowLossyDeveloperRoleCollapse: boolean;
+  recommendedSurfaceOverride: string | null;
+  PoolMembers?: Array<{ id: string }>;
   User: { slug: string };
 };
 
 type PoolGrantRow = {
+  id: string;
   ModelPool: ModelPoolRow;
 };
 
 type AllowlistEntryRow = {
   target: ModelApiTokenAllowlistTarget;
   discoveredModelId: string | null;
+  ExecutionTarget?: { discoveredModelId: string | null } | null;
   modelPoolId: string | null;
 };
 
@@ -108,7 +128,10 @@ function serializeDirectModel(row: DirectModelRow): VisibleDirectModelTarget {
   };
 }
 
-function serializeModelPool(row: ModelPoolRow): VisibleModelPoolTarget {
+function serializeModelPool(
+  row: ModelPoolRow,
+  accessGrantId: string | null = null,
+): VisibleModelPoolTarget {
   return {
     target: "MODEL_POOL",
     id: row.id,
@@ -117,9 +140,17 @@ function serializeModelPool(row: ModelPoolRow): VisibleModelPoolTarget {
     description: row.description,
     ownerUserId: row.userId,
     ownerUserSlug: row.User.slug,
+    accessGrantId,
     poolSlug: row.slug,
     maxAttachmentBytes: row.maxAttachmentBytes,
     optimisticBasicTranscription: row.optimisticBasicTranscription,
+    protocolAdaptationEnabled: row.protocolAdaptationEnabled,
+    publicEgressEnabled: row.publicEgressEnabled,
+    publicEgressAcknowledged: row.publicEgressAcknowledged,
+    effectiveProviderEgress: row.publicEgressEnabled || (row.PoolMembers?.length ?? 0) > 0,
+    providerPrimaryMemberCount: row.PoolMembers?.length ?? 0,
+    allowLossyDeveloperRoleCollapse: row.allowLossyDeveloperRoleCollapse,
+    recommendedSurfaceOverride: parseModelApiSurface(row.recommendedSurfaceOverride),
   };
 }
 
@@ -165,6 +196,20 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
         name: true,
         description: true,
         maxAttachmentBytes: true,
+        optimisticBasicTranscription: true,
+        protocolAdaptationEnabled: true,
+        publicEgressEnabled: true,
+        publicEgressAcknowledged: true,
+        allowLossyDeveloperRoleCollapse: true,
+        recommendedSurfaceOverride: true,
+        PoolMembers: {
+          where: {
+            tier: "PRIMARY",
+            routingStatus: "ACTIVE",
+            ExecutionTarget: { ProviderModel: { isNot: null } },
+          },
+          select: { id: true },
+        },
         User: { select: { slug: true } },
       },
     }),
@@ -172,6 +217,7 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
       where: { granteeUserId: userId },
       orderBy: { createdAt: "desc" },
       select: {
+        id: true,
         ModelPool: {
           select: {
             id: true,
@@ -181,6 +227,19 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
             description: true,
             maxAttachmentBytes: true,
             optimisticBasicTranscription: true,
+            protocolAdaptationEnabled: true,
+            publicEgressEnabled: true,
+            publicEgressAcknowledged: true,
+            allowLossyDeveloperRoleCollapse: true,
+            recommendedSurfaceOverride: true,
+            PoolMembers: {
+              where: {
+                tier: "PRIMARY",
+                routingStatus: "ACTIVE",
+                ExecutionTarget: { ProviderModel: { isNot: null } },
+              },
+              select: { id: true },
+            },
             User: { select: { slug: true } },
           },
         },
@@ -189,9 +248,9 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
   ]);
 
   const directModels = (directModelRows as DirectModelRow[]).map(serializeDirectModel);
-  const ownedPools = (ownedPoolRows as ModelPoolRow[]).map(serializeModelPool);
+  const ownedPools = (ownedPoolRows as ModelPoolRow[]).map((row) => serializeModelPool(row));
   const grantedPools = (grantedPoolRows as PoolGrantRow[]).map((grant) =>
-    serializeModelPool(grant.ModelPool),
+    serializeModelPool(grant.ModelPool, grant.id),
   );
 
   return {
@@ -255,14 +314,16 @@ export async function listVisibleModelTargetsForToken(
     select: {
       target: true,
       discoveredModelId: true,
+      ExecutionTarget: { select: { discoveredModelId: true } },
       modelPoolId: true,
     },
   })) as AllowlistEntryRow[];
 
   const allowedDirectIds = new Set(
     entries
-      .filter((entry) => entry.target === "DIRECT_MODEL" && entry.discoveredModelId)
-      .map((entry) => entry.discoveredModelId),
+      .filter((entry) => entry.target === "DIRECT_MODEL")
+      .map((entry) => entry.ExecutionTarget?.discoveredModelId ?? entry.discoveredModelId)
+      .filter((id): id is string => Boolean(id)),
   );
   const allowedPoolIds = new Set(
     entries

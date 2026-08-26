@@ -1,4 +1,7 @@
+import { createORPCClient } from "@orpc/client";
+import { RPCLink } from "@orpc/client/fetch";
 import { createRouterClient, ORPCError } from "@orpc/server";
+import { RPCHandler } from "@orpc/server/fetch";
 import type { Session } from "@ws-model-proxy/auth";
 import {
   parseDirectModelId,
@@ -9,19 +12,40 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Context } from "../context";
 import { forwarderManagementRouter } from "./forwarder-management";
 
+const testEnv = vi.hoisted(() => ({ WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true }));
+
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
-  return { default: mockDeep(), Prisma: { DbNull: { kind: "DbNull" } } };
+  class TestDecimal {
+    readonly value: string;
+
+    constructor(value: string | number) {
+      this.value = String(value);
+    }
+
+    greaterThan(other: string | number) {
+      return Number(this.value) > Number(other);
+    }
+  }
+  return {
+    default: mockDeep(),
+    Prisma: {
+      DbNull: { kind: "DbNull" },
+      Decimal: TestDecimal,
+      TransactionIsolationLevel: { Serializable: "Serializable" },
+    },
+  };
 });
 
 vi.mock("@ws-model-proxy/env/server", () => ({
-  env: {},
+  env: testEnv,
   ADMIN_EMAILS: new Set<string>(),
 }));
 
 const { default: prisma } = await import("@ws-model-proxy/db");
 
 const db = prisma as unknown as {
+  $transaction: MockInstance;
   user: {
     findUnique: MockInstance;
     findFirst: MockInstance;
@@ -39,6 +63,7 @@ const db = prisma as unknown as {
   modelPool: {
     findMany: MockInstance;
     findUnique: MockInstance;
+    findFirst: MockInstance;
     create: MockInstance;
     update: MockInstance;
     delete: MockInstance;
@@ -59,10 +84,21 @@ const db = prisma as unknown as {
     update: MockInstance;
     delete: MockInstance;
   };
+  executionTarget: { findMany: MockInstance; findUnique: MockInstance; upsert: MockInstance };
+  inferenceCapacity: { updateMany: MockInstance; upsert: MockInstance };
+  providerModel: { findFirst: MockInstance; findMany: MockInstance };
+  providerBudgetPolicy: { create: MockInstance; findFirst: MockInstance; findMany: MockInstance };
+  providerAuditEvent: { create: MockInstance; findFirst: MockInstance };
   poolGrant: {
     upsert: MockInstance;
     deleteMany: MockInstance;
     findMany: MockInstance;
+  };
+  capacityAuditEvent: { create: MockInstance };
+  cacheAffinityRecord: {
+    count: MockInstance;
+    groupBy: MockInstance;
+    deleteMany: MockInstance;
   };
 };
 
@@ -109,6 +145,29 @@ function client() {
   return createRouterClient(forwarderManagementRouter, { context: buildContext() });
 }
 
+function httpClient(captures?: Array<{ status: number; body: string }>) {
+  const handler = new RPCHandler(forwarderManagementRouter);
+  const link = new RPCLink({
+    url: "https://example.test/rpc",
+    fetch: async (request, init) => {
+      const result = await handler.handle(new Request(request, init), {
+        prefix: "/rpc",
+        context: buildContext(),
+      });
+      if (!result.matched) return new Response(null, { status: 404 });
+      if (captures)
+        captures.push({
+          status: result.response.status,
+          body: await result.response.clone().text(),
+        });
+      return result.response;
+    },
+  });
+  return createORPCClient(link) as ReturnType<
+    typeof createRouterClient<typeof forwarderManagementRouter>
+  >;
+}
+
 function poolRow(overrides: Record<string, unknown> = {}) {
   return {
     id: "pool-id",
@@ -118,6 +177,10 @@ function poolRow(overrides: Record<string, unknown> = {}) {
     name: "General",
     description: null,
     maxAttachmentBytes: null,
+    optimisticBasicTranscription: false,
+    protocolAdaptationEnabled: false,
+    allowLossyDeveloperRoleCollapse: false,
+    recommendedSurfaceOverride: null,
     transformerDiscoveredModelId: null,
     transformerSystemPrompt: null,
     transformerImages: true,
@@ -132,10 +195,610 @@ function poolRow(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function guardedLocalModel(
+  overrides: Record<string, unknown> = {},
+  native: "chat" | "responses" = "responses",
+) {
+  return {
+    id: "local-id",
+    upstreamModelId: "local-model",
+    capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+    capabilityOverrides: [],
+    capabilityOverrideMetadata: null,
+    Endpoint: {
+      capabilityMetadata: {
+        version: 1,
+        protocol: "openai-compatible",
+        chatCompletions: { supported: native === "chat", streaming: true },
+        responses: { supported: native === "responses", streaming: true },
+      },
+      defaultCapabilities: [],
+    },
+    ...overrides,
+  };
+}
+
 describe("forwarderManagementRouter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    testEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
+    db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
+      callback(db),
+    );
+    db.executionTarget.upsert.mockResolvedValue({ id: "target-id" });
+    db.executionTarget.findUnique.mockResolvedValue(null);
+    db.inferenceCapacity.upsert.mockResolvedValue({ id: "provider-capacity-id" });
+    db.capacityAuditEvent.create.mockResolvedValue({ id: "audit-id" });
     db.appSetting.findUnique.mockResolvedValue(null);
+  });
+
+  it("fails provider attachment closed when the deployment egress gate is disabled", async () => {
+    testEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = false;
+    await expect(
+      client().addProviderPoolMember({
+        poolId: "pool-id",
+        providerModelId: "provider-model",
+        tier: "PRIMARY",
+      }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(db.$transaction).not.toHaveBeenCalled();
+  });
+
+  it("denies guessed provider attachments and public-egress mutations over HTTP", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.modelPool.findFirst.mockResolvedValue(null);
+    db.poolMember.findUnique.mockResolvedValue(null);
+    db.providerModel.findFirst.mockResolvedValue(null);
+    const captures: Array<{ status: number; body: string }> = [];
+    const rpc = httpClient(captures);
+    const attempts = [
+      rpc.updateModelPool({
+        id: "foreign-pool",
+        publicEgressEnabled: true,
+        publicEgressAcknowledged: true,
+      }),
+      rpc.addProviderPoolMember({
+        poolId: "foreign-pool",
+        providerModelId: "foreign-provider-model",
+        publicOrder: 0,
+      }),
+      rpc.addPoolMember({
+        poolId: "foreign-pool",
+        discoveredModelId: "foreign-discovered-model",
+        weight: 1,
+        routingStatus: "ACTIVE",
+      }),
+      rpc.updatePoolMember({ id: "foreign-member", publicOrder: 1 }),
+      rpc.reorderProviderPoolMember({ id: "foreign-member", direction: "EARLIER" }),
+      rpc.removePoolMember({ id: "foreign-member" }),
+      rpc.deleteModelPool({ id: "foreign-pool" }),
+      rpc.grantPoolAccessByEmail({ poolId: "foreign-pool", email: "victim@example.test" }),
+      rpc.revokePoolAccessByEmail({ poolId: "foreign-pool", email: "victim@example.test" }),
+      rpc.cacheAffinityStats({ poolId: "foreign-pool" }),
+      rpc.clearCacheAffinity({ poolId: "foreign-pool" }),
+      rpc.removeCliDeviceMetadata({ id: "foreign-cli" }),
+      rpc.removeEndpointMetadata({ id: "foreign-endpoint" }),
+      rpc.removeDiscoveredModelMetadata({ id: "foreign-discovered-model" }),
+      rpc.updateDiscoveredModelCapabilities({
+        id: "foreign-discovered-model",
+        vision: true,
+        audio: false,
+        video: false,
+      }),
+      rpc.setDiscoveredModelCapabilityProfile({
+        id: "foreign-discovered-model",
+        mode: "inherit",
+        optimisticBasicTranscription: false,
+      }),
+      rpc.updateDiscoveredModelAttachmentLimit({
+        id: "foreign-discovered-model",
+        maxAttachmentBytes: null,
+      }),
+    ];
+    const results = await Promise.allSettled(attempts);
+    for (const result of results) {
+      expect(result.status).toBe("rejected");
+      if (result.status === "rejected") expect(result.reason).toMatchObject({ code: "NOT_FOUND" });
+    }
+    expect(captures).toHaveLength(attempts.length);
+    for (const capture of captures) {
+      expect(capture.status).toBe(404);
+      expect(capture.body).toContain("NOT_FOUND");
+      for (const identifier of [
+        "foreign-pool",
+        "foreign-provider-model",
+        "foreign-member",
+        "foreign-discovered-model",
+        "foreign-cli",
+        "foreign-endpoint",
+      ])
+        expect(capture.body).not.toContain(identifier);
+    }
+    expect(db.executionTarget.upsert).not.toHaveBeenCalled();
+    expect(db.poolMember.create).not.toHaveBeenCalled();
+    expect(db.poolMember.update).not.toHaveBeenCalled();
+    expect(db.poolMember.delete).not.toHaveBeenCalled();
+    expect(db.poolGrant.upsert).not.toHaveBeenCalled();
+    expect(db.poolGrant.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("rejects guarded overflow without acknowledgement or a positive finite spend cap", async () => {
+    const base = {
+      slug: "guarded",
+      name: "Guarded",
+      localModelIds: ["local-id"],
+      recommendedSurface: "OPENAI_RESPONSES" as const,
+      memberConcurrencyLimit: 1,
+      memberContextCeiling: 31_744,
+      reservedSlots: 0,
+      localWaitBudgetMs: 30_000,
+      providerModels: [
+        { providerModelId: "provider-id", concurrencyLimit: 1, dailySpendLimit: "10.00" },
+      ],
+    };
+    await expect(
+      client().createGuardedModelPool({ ...base, publicEgressAcknowledged: false }),
+    ).rejects.toBeDefined();
+    await expect(
+      client().createGuardedModelPool({
+        ...base,
+        publicEgressAcknowledged: true,
+        providerModels: [
+          { providerModelId: "provider-id", concurrencyLimit: 1, dailySpendLimit: "0" },
+        ],
+      }),
+    ).rejects.toBeDefined();
+    expect(db.$transaction).not.toHaveBeenCalled();
+  });
+
+  it("atomically persists guarded local capacity reuse, ordered providers, budgets, and audits", async () => {
+    db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(
+      poolRow({
+        protocolAdaptationEnabled: true,
+        publicEgressEnabled: true,
+        publicEgressAcknowledged: true,
+      }),
+    );
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel()]);
+    db.executionTarget.findMany.mockResolvedValue([
+      {
+        id: "existing-target",
+        discoveredModelId: "local-id",
+        inferenceCapacityId: "shared-capacity",
+        InferenceCapacity: { physicalMaxContext: 65_536 },
+      },
+    ]);
+    db.providerModel.findMany.mockResolvedValue([
+      {
+        id: "provider-b",
+        providerAccountId: "account-b",
+        PricingVersions: [{ id: "price-b", currency: "USD" }],
+      },
+      {
+        id: "provider-a",
+        providerAccountId: "account-a",
+        PricingVersions: [{ id: "price-a", currency: "USD" }],
+      },
+    ]);
+    db.modelPool.create.mockResolvedValue({ id: "pool-id" });
+    db.executionTarget.upsert
+      .mockResolvedValueOnce({ id: "provider-target-b" })
+      .mockResolvedValueOnce({ id: "provider-target-a" });
+    db.providerBudgetPolicy.create
+      .mockResolvedValueOnce({ id: "budget-b" })
+      .mockResolvedValueOnce({ id: "budget-a" });
+
+    await client().createGuardedModelPool({
+      slug: "guarded",
+      name: "Guarded",
+      localModelIds: ["local-id"],
+      recommendedSurface: "OPENAI_RESPONSES",
+      memberConcurrencyLimit: 2,
+      memberContextCeiling: 32_768,
+      reservedSlots: 1,
+      localWaitBudgetMs: 30_000,
+      publicEgressAcknowledged: true,
+      advanced: {
+        physicalCountStrategy: "TEMPLATE_AWARE",
+        contextMargin: 2_048,
+        borrowPolicy: "NEVER",
+        protocolAdaptationEnabled: false,
+        allowLossyDeveloperRoleCollapse: true,
+        affinity: {
+          enabled: true,
+          ttlSeconds: 7_200,
+          maxRecords: 20_000,
+          prefixWeight: 110,
+          conversationWeight: 160,
+          confirmedCacheWeight: 260,
+          loadPenaltyWeight: 120,
+        },
+        memberOverrides: [
+          {
+            discoveredModelId: "local-id",
+            concurrency: { mode: "LIMITED", limitValue: 2 },
+            reservedSlots: 1,
+            borrowPolicy: "NEVER",
+            waitBudget: { mode: "LIMITED", limitValue: 15_000 },
+            contextCeiling: { mode: "LIMITED", limitValue: 30_000 },
+            contextMargin: 2_000,
+          },
+        ],
+      },
+      providerModels: [
+        {
+          providerModelId: "provider-b",
+          concurrencyLimit: 2,
+          dailySpendLimit: "",
+          budgetRules: {
+            concurrency: { mode: "LIMITED", limitValue: 2 },
+            tokensPerAttempt: { mode: "LIMITED", limitValue: 100_000 },
+            tokensPerDay: { mode: "LIMITED", limitValue: 1_000_000 },
+            tokensPerMonth: { mode: "LIMITED", limitValue: 10_000_000 },
+            tokensLifetime: { mode: "UNLIMITED", limitValue: null },
+            spendPerDay: { mode: "UNLIMITED", limitValue: null },
+            spendPerMonth: { mode: "LIMITED", limitValue: "100" },
+          },
+        },
+        { providerModelId: "provider-a", concurrencyLimit: 1, dailySpendLimit: "4.25" },
+      ],
+    });
+
+    expect(db.modelPool.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        protocolAdaptationEnabled: false,
+        allowLossyDeveloperRoleCollapse: true,
+        capacityContextMargin: 2_048,
+        capacityBorrowPolicy: "NEVER",
+        affinityEnabled: true,
+        affinityTtlSeconds: 7_200,
+        affinityMaxRecords: 20_000,
+      }),
+      select: { id: true },
+    });
+    expect(db.inferenceCapacity.updateMany).toHaveBeenCalledWith({
+      where: { userId: "user-id", id: { in: ["shared-capacity"] } },
+      data: { countStrategy: "TEMPLATE_AWARE" },
+    });
+
+    expect(db.poolMember.create).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        data: expect.objectContaining({
+          executionTargetId: "existing-target",
+          tier: "PRIMARY",
+          capacityConcurrencyMode: "LIMITED",
+          capacityConcurrencyLimit: 2,
+          capacityReservedSlots: 1,
+          capacityBorrowPolicy: "NEVER",
+          capacityWaitBudgetMode: "LIMITED",
+          capacityWaitBudgetMs: 15_000,
+          capacityContextCeilingMode: "LIMITED",
+          capacityContextCeiling: 30_000,
+          capacityContextMargin: 2_000,
+        }),
+      }),
+    );
+    expect(db.poolMember.create).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ data: expect.objectContaining({ publicOrder: 0 }) }),
+    );
+    expect(db.poolMember.create).toHaveBeenNthCalledWith(
+      3,
+      expect.objectContaining({ data: expect.objectContaining({ publicOrder: 1 }) }),
+    );
+    expect(db.providerBudgetPolicy.create).toHaveBeenCalledTimes(2);
+    expect(db.providerBudgetPolicy.create.mock.calls[0]?.[0].data.Rules.create).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ metric: "CONCURRENCY", mode: "LIMITED" }),
+        expect.objectContaining({ metric: "SPEND", mode: "LIMITED", currency: "USD" }),
+        expect.objectContaining({ metric: "TOKENS", period: "LIFETIME", mode: "UNLIMITED" }),
+      ]),
+    );
+    expect(db.providerBudgetPolicy.create.mock.calls[0]?.[0].data.Rules.create).toHaveLength(7);
+    expect(db.providerAuditEvent.create).toHaveBeenCalledTimes(2);
+    expect(db.capacityAuditEvent.create).toHaveBeenCalledTimes(1);
+    expect(db.inferenceCapacity.upsert).toHaveBeenCalledTimes(2);
+    expect(db.executionTarget.update).toHaveBeenCalledWith({
+      where: { id: expect.stringMatching(/^provider-target-/) },
+      data: { inferenceCapacityId: "provider-capacity-id" },
+    });
+  });
+
+  it("creates a provider-only PRIMARY pool and derives its recommended surface", async () => {
+    db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(poolRow());
+    db.discoveredModel.findMany.mockResolvedValue([]);
+    db.executionTarget.findMany.mockResolvedValue([]);
+    db.providerModel.findMany.mockResolvedValue([
+      {
+        id: "provider-primary",
+        providerAccountId: "account-primary",
+        upstreamModelId: "provider-upstream",
+        contextWindow: 65_536,
+        concurrencyLimit: 4,
+        nativeCapabilities: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiResponses: {
+              source: "provider",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+            },
+          },
+        },
+        PricingVersions: [{ id: "price-primary", currency: "USD" }],
+      },
+    ]);
+    db.modelPool.create.mockResolvedValue({ id: "provider-only-pool" });
+    db.executionTarget.upsert.mockResolvedValue({ id: "provider-primary-target" });
+    db.providerBudgetPolicy.create.mockResolvedValue({ id: "provider-primary-budget" });
+
+    await expect(
+      client().createGuardedModelPool({
+        slug: "provider-only",
+        name: "Provider only",
+        localModelIds: [],
+        recommendedSurface: "OPENAI_RESPONSES",
+        memberConcurrencyLimit: 2,
+        memberContextCeiling: 32_768,
+        reservedSlots: 0,
+        localWaitBudgetMs: 30_000,
+        publicEgressAcknowledged: true,
+        providerModels: [
+          {
+            providerModelId: "provider-primary",
+            tier: "PRIMARY",
+            concurrencyLimit: 2,
+            dailySpendLimit: "10.00",
+          },
+        ],
+      }),
+    ).resolves.toBeDefined();
+
+    expect(db.modelPool.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          publicEgressEnabled: false,
+          publicEgressAcknowledged: true,
+          recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        }),
+      }),
+    );
+    expect(db.poolMember.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          executionTargetId: "provider-primary-target",
+          tier: "PRIMARY",
+          publicOrder: null,
+          weight: 1,
+        }),
+      }),
+    );
+  });
+
+  it("refuses guarded setup instead of inventing or overwriting physical capacity mapping", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel()]);
+    db.executionTarget.findMany.mockResolvedValue([
+      {
+        id: "existing-target",
+        discoveredModelId: "local-id",
+        inferenceCapacityId: null,
+        InferenceCapacity: null,
+      },
+    ]);
+
+    await expect(
+      client().createGuardedModelPool({
+        slug: "guarded",
+        name: "Guarded",
+        localModelIds: ["local-id"],
+        recommendedSurface: "OPENAI_RESPONSES",
+        memberConcurrencyLimit: 1,
+        memberContextCeiling: 32_768,
+        reservedSlots: 0,
+        localWaitBudgetMs: 30_000,
+        publicEgressAcknowledged: false,
+        providerModels: [],
+      }),
+    ).rejects.toMatchObject({ code: "PRECONDITION_FAILED" });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+    expect(db.executionTarget.upsert).not.toHaveBeenCalled();
+  });
+
+  it("rejects guarded setup when inherited local concurrency exceeds physical capacity", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel()]);
+    db.executionTarget.findMany.mockResolvedValue([
+      {
+        id: "existing-target",
+        discoveredModelId: "local-id",
+        inferenceCapacityId: "capacity-id",
+        InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: 2 },
+      },
+    ]);
+
+    await expect(
+      client().createGuardedModelPool({
+        slug: "guarded-capacity",
+        name: "Guarded capacity",
+        localModelIds: ["local-id"],
+        recommendedSurface: "OPENAI_RESPONSES",
+        memberConcurrencyLimit: 3,
+        memberContextCeiling: 32_768,
+        reservedSlots: 1,
+        localWaitBudgetMs: 30_000,
+        publicEgressAcknowledged: false,
+        providerModels: [],
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["OPENAI_RESPONSES", "adapted recommendation when a native primary API exists"],
+    ["OPENAI_COMPLETIONS", "unavailable primary recommendation"],
+  ] as const)("rejects %s as an %s", async (recommendedSurface) => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel({}, "chat")]);
+
+    await expect(
+      client().createGuardedModelPool({
+        slug: "guarded-recommendation",
+        name: "Guarded recommendation",
+        localModelIds: ["local-id"],
+        recommendedSurface,
+        memberConcurrencyLimit: 1,
+        memberContextCeiling: 8_192,
+        reservedSlots: 0,
+        localWaitBudgetMs: 30_000,
+        publicEgressAcknowledged: false,
+        providerModels: [],
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
+  it("rolls back guarded setup when a mid-transaction provider budget write fails", async () => {
+    let rolledBack = false;
+    db.$transaction.mockImplementationOnce(async (callback: (tx: typeof db) => unknown) => {
+      try {
+        return await callback(db);
+      } catch (error) {
+        rolledBack = true;
+        throw error;
+      }
+    });
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel()]);
+    db.executionTarget.findMany.mockResolvedValue([
+      {
+        id: "existing-target",
+        discoveredModelId: "local-id",
+        inferenceCapacityId: "shared-capacity",
+        InferenceCapacity: { physicalMaxContext: 65_536 },
+      },
+    ]);
+    db.providerModel.findMany.mockResolvedValue([
+      {
+        id: "provider-id",
+        providerAccountId: "account-id",
+        PricingVersions: [{ id: "price-id", currency: "USD" }],
+      },
+    ]);
+    db.modelPool.create.mockResolvedValue({ id: "pool-id" });
+    db.executionTarget.upsert.mockResolvedValue({ id: "provider-target" });
+    db.providerBudgetPolicy.create.mockRejectedValue(new Error("injected budget failure"));
+
+    await expect(
+      client().createGuardedModelPool({
+        slug: "guarded",
+        name: "Guarded",
+        localModelIds: ["local-id"],
+        recommendedSurface: "OPENAI_RESPONSES",
+        memberConcurrencyLimit: 1,
+        memberContextCeiling: 32_768,
+        reservedSlots: 0,
+        localWaitBudgetMs: 30_000,
+        publicEgressAcknowledged: true,
+        advanced: {
+          physicalCountStrategy: "ENGINE_REPORTED",
+          contextMargin: 1_024,
+          borrowPolicy: "WHEN_IDLE",
+          protocolAdaptationEnabled: true,
+          allowLossyDeveloperRoleCollapse: false,
+          affinity: {
+            enabled: false,
+            ttlSeconds: 3_600,
+            maxRecords: 10_000,
+            prefixWeight: 100,
+            conversationWeight: 150,
+            confirmedCacheWeight: 250,
+            loadPenaltyWeight: 100,
+          },
+          memberOverrides: [],
+        },
+        providerModels: [
+          { providerModelId: "provider-id", concurrencyLimit: 1, dailySpendLimit: "5" },
+        ],
+      }),
+    ).rejects.toThrow("injected budget failure");
+    expect(rolledBack).toBe(true);
+    expect(db.inferenceCapacity.updateMany).toHaveBeenCalled();
+    expect(db.capacityAuditEvent.create).not.toHaveBeenCalled();
+  });
+
+  it("does not reflect foreign guarded-pool model ids through HTTP response envelopes", async () => {
+    db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
+      callback(db),
+    );
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([
+        guardedLocalModel({ id: "owned-local-model", upstreamModelId: "owned-model" }),
+      ]);
+    db.executionTarget.findMany.mockResolvedValue([
+      {
+        id: "owned-local-target",
+        discoveredModelId: "owned-local-model",
+        inferenceCapacityId: "owned-capacity",
+        InferenceCapacity: { physicalMaxContext: 32_768 },
+      },
+    ]);
+    db.providerModel.findMany.mockResolvedValueOnce([]);
+    const captures: Array<{ status: number; body: string }> = [];
+    const rpc = httpClient(captures);
+    const base = {
+      slug: "guarded-auth-proof",
+      name: "Guarded auth proof",
+      recommendedSurface: "OPENAI_RESPONSES" as const,
+      memberConcurrencyLimit: 1,
+      memberContextCeiling: 31_744,
+      reservedSlots: 0,
+      localWaitBudgetMs: 30_000,
+      publicEgressAcknowledged: true,
+    };
+
+    const localResult = await Promise.allSettled([
+      rpc.createGuardedModelPool({
+        ...base,
+        localModelIds: ["foreign-local-model"],
+        providerModels: [],
+      }),
+    ]);
+    const providerResult = await Promise.allSettled([
+      rpc.createGuardedModelPool({
+        ...base,
+        slug: "guarded-provider-auth-proof",
+        localModelIds: ["owned-local-model"],
+        providerModels: [
+          {
+            providerModelId: "foreign-provider-model",
+            concurrencyLimit: 1,
+            dailySpendLimit: "10.00",
+          },
+        ],
+      }),
+    ]);
+
+    expect(localResult[0]).toMatchObject({ status: "rejected", reason: { code: "NOT_FOUND" } });
+    expect(providerResult[0]).toMatchObject({
+      status: "rejected",
+      reason: { code: "PRECONDITION_FAILED" },
+    });
+    expect(captures).toHaveLength(2);
+    expect(captures.map((capture) => capture.status)).toEqual([404, 412]);
+    expect(captures[0]?.body).toContain("NOT_FOUND");
+    expect(captures[1]?.body).toContain("PRECONDITION_FAILED");
+    for (const capture of captures) {
+      expect(capture.body).not.toContain("foreign-local-model");
+      expect(capture.body).not.toContain("foreign-provider-model");
+    }
+    expect(db.executionTarget.upsert).not.toHaveBeenCalled();
+    expect(db.modelPool.create).not.toHaveBeenCalled();
   });
 
   it("previews and updates the current user's slug without changing internal ids", async () => {
@@ -321,6 +984,299 @@ describe("forwarderManagementRouter", () => {
     expect(db.poolGrant.deleteMany).not.toHaveBeenCalled();
   });
 
+  it("fails closed when enabling public egress without acknowledgement", async () => {
+    db.modelPool.findUnique.mockResolvedValue(
+      poolRow({ userId: "user-id", publicEgressEnabled: false, publicEgressAcknowledged: false }),
+    );
+
+    await expect(
+      client().updateModelPool({ id: "pool-id", publicEgressEnabled: true }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.modelPool.update).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["inactive", { mode: "LIMITED", limitValue: "2" }, null],
+    ["LIMITED without a positive limit", { mode: "LIMITED", limitValue: null }, new Date()],
+    ["UNLIMITED with a value", { mode: "UNLIMITED", limitValue: "1" }, new Date()],
+  ])(
+    "rejects public-egress enablement when an attachment policy is %s",
+    async (_label, rule, activatedAt) => {
+      db.modelPool.findUnique.mockResolvedValue(
+        poolRow({ userId: "user-id", publicEgressEnabled: false, publicEgressAcknowledged: false }),
+      );
+      db.poolMember.findMany.mockResolvedValue([
+        {
+          id: "member-1",
+          ExecutionTarget: {
+            ProviderModel: { id: "provider-model", providerAccountId: "provider-account" },
+          },
+        },
+      ]);
+      db.providerBudgetPolicy.findMany.mockResolvedValue([
+        {
+          id: "policy",
+          providerModelId: "provider-model",
+          providerAccountId: "provider-account",
+          activatedAt,
+          Rules: [rule],
+        },
+      ]);
+      db.providerAuditEvent.findFirst.mockResolvedValue({ id: "audit" });
+
+      await expect(
+        client().updateModelPool({
+          id: "pool-id",
+          publicEgressEnabled: true,
+          publicEgressAcknowledged: true,
+        }),
+      ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+      expect(db.modelPool.update).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects public-egress enablement when an otherwise valid policy lacks an audit", async () => {
+    db.modelPool.findUnique.mockResolvedValue(
+      poolRow({ userId: "user-id", publicEgressEnabled: false, publicEgressAcknowledged: false }),
+    );
+    db.poolMember.findMany.mockResolvedValue([
+      {
+        id: "member-1",
+        ExecutionTarget: {
+          ProviderModel: { id: "provider-model", providerAccountId: "provider-account" },
+        },
+      },
+    ]);
+    db.providerBudgetPolicy.findMany.mockResolvedValue([
+      {
+        id: "policy",
+        providerModelId: "provider-model",
+        providerAccountId: "provider-account",
+        activatedAt: new Date(),
+        Rules: [{ mode: "LIMITED", limitValue: "2" }],
+      },
+    ]);
+    db.providerAuditEvent.findFirst.mockResolvedValue(null);
+
+    await expect(
+      client().updateModelPool({
+        id: "pool-id",
+        publicEgressEnabled: true,
+        publicEgressAcknowledged: true,
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.modelPool.update).not.toHaveBeenCalled();
+  });
+
+  it("enables public egress only when every attachment has an audited explicit rule", async () => {
+    db.modelPool.findUnique.mockResolvedValue(
+      poolRow({ userId: "user-id", publicEgressEnabled: false, publicEgressAcknowledged: false }),
+    );
+    db.poolMember.findMany.mockResolvedValue([
+      {
+        id: "member-1",
+        ExecutionTarget: {
+          ProviderModel: { id: "provider-model-1", providerAccountId: "provider-account-1" },
+        },
+      },
+      {
+        id: "member-2",
+        ExecutionTarget: {
+          ProviderModel: { id: "provider-model-2", providerAccountId: "provider-account-2" },
+        },
+      },
+    ]);
+    db.providerBudgetPolicy.findMany.mockResolvedValue([
+      {
+        id: "policy-1",
+        providerModelId: "provider-model-1",
+        providerAccountId: "provider-account-1",
+        activatedAt: new Date(),
+        Rules: [{ mode: "LIMITED", limitValue: "2" }],
+      },
+      {
+        id: "policy-2",
+        providerModelId: "provider-model-2",
+        providerAccountId: "provider-account-2",
+        activatedAt: new Date(),
+        Rules: [{ mode: "UNLIMITED", limitValue: null }],
+      },
+    ]);
+    db.providerAuditEvent.findFirst.mockResolvedValue({ id: "audit" });
+    db.modelPool.update.mockResolvedValue(
+      poolRow({ publicEgressEnabled: true, publicEgressAcknowledged: true }),
+    );
+
+    await expect(
+      client().updateModelPool({
+        id: "pool-id",
+        publicEgressEnabled: true,
+        publicEgressAcknowledged: true,
+      }),
+    ).resolves.toMatchObject({ publicEgressEnabled: true, publicEgressAcknowledged: true });
+  });
+
+  it("atomically creates a pool and its capacity-policy audit record", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.modelPool.create.mockResolvedValue(poolRow());
+
+    await client().createModelPool({
+      slug: "general",
+      name: "General",
+      capacityPriority: 23,
+      capacityConcurrencyLimit: 4,
+      capacityReservedSlots: 2,
+      capacityWaitBudgetMs: 1_500,
+      capacityContextCeiling: 32_768,
+      capacityContextMargin: 1_024,
+      capacityBorrowPolicy: "NEVER",
+    });
+
+    expect(db.$transaction).toHaveBeenCalledTimes(1);
+    expect(db.modelPool.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        userId: "user-id",
+        slug: "general",
+        capacityPriority: 23,
+        capacityConcurrencyLimit: 4,
+        capacityReservedSlots: 2,
+        capacityWaitBudgetMs: 1_500,
+        capacityContextCeiling: 32_768,
+        capacityContextMargin: 1_024,
+        capacityBorrowPolicy: "NEVER",
+      }),
+      select: expect.any(Object),
+    });
+    expect(db.capacityAuditEvent.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        userId: "user-id",
+        actorUserId: "user-id",
+        action: "CREATE",
+        resourceType: "MODEL_POOL",
+        resourceId: "pool-id",
+        after: expect.objectContaining({
+          capacityPriority: 23,
+          capacityConcurrencyLimit: 4,
+          capacityReservedSlots: 2,
+        }),
+      }),
+    });
+    expect(db.capacityAuditEvent.create.mock.calls[0]?.[0].data.after).not.toHaveProperty(
+      "description",
+    );
+    expect(db.modelPool.create.mock.invocationCallOrder[0]).toBeLessThan(
+      db.capacityAuditEvent.create.mock.invocationCallOrder[0] ?? 0,
+    );
+  });
+
+  it("fails pool creation when the atomic capacity-policy audit cannot be persisted", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.modelPool.create.mockResolvedValue(poolRow());
+    db.capacityAuditEvent.create.mockRejectedValue(new Error("policy audit failed"));
+
+    await expect(
+      client().createModelPool({
+        slug: "general",
+        name: "General",
+        capacityConcurrencyLimit: 2,
+      }),
+    ).rejects.toThrow("policy audit failed");
+    expect(db.$transaction).toHaveBeenCalledTimes(1);
+    expect(db.modelPool.create).toHaveBeenCalledTimes(1);
+    expect(db.capacityAuditEvent.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("persists explicit protocol policy and reports the full member compatibility matrix", async () => {
+    db.modelPool.findUnique.mockResolvedValueOnce(null);
+    db.modelPool.create.mockResolvedValue(
+      poolRow({
+        protocolAdaptationEnabled: true,
+        allowLossyDeveloperRoleCollapse: true,
+        recommendedSurfaceOverride: "ANTHROPIC_MESSAGES",
+        PoolMembers: [
+          {
+            id: "member-id",
+            createdAt: new Date("2026-01-01"),
+            updatedAt: new Date("2026-01-01"),
+            discoveredModelId: "model-id",
+            weight: 1,
+            healthStatus: "HEALTHY",
+            routingStatus: "ACTIVE",
+            lastFailureClass: null,
+            consecutiveRetryableFailures: 0,
+            lastFailureAt: null,
+            nextRetryAt: null,
+            halfOpenTrialStartedAt: null,
+            ExecutionTarget: null,
+            DiscoveredModel: {
+              id: "model-id",
+              upstreamModelId: "gpt-local",
+              capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+              capabilityOverrides: [],
+              capabilityOverrideMetadata: null,
+              User: { slug: "owner" },
+              Endpoint: {
+                id: "endpoint-id",
+                slug: "local",
+                capabilityMetadata: {
+                  version: 1,
+                  protocol: "openai-compatible",
+                  chatCompletions: { supported: true, streaming: true },
+                },
+                defaultCapabilities: [],
+                CliDevice: { slug: "desktop" },
+              },
+            },
+          },
+        ],
+      }),
+    );
+
+    const result = await client().createModelPool({
+      slug: "protocols",
+      name: "Protocols",
+      protocolAdaptationEnabled: true,
+      allowLossyDeveloperRoleCollapse: true,
+      recommendedSurfaceOverride: "ANTHROPIC_MESSAGES",
+    });
+
+    expect(db.modelPool.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          protocolAdaptationEnabled: true,
+          allowLossyDeveloperRoleCollapse: true,
+          recommendedSurfaceOverride: "ANTHROPIC_MESSAGES",
+        }),
+      }),
+    );
+    expect(result.members[0]?.model?.surfaces).toMatchObject({
+      OPENAI_CHAT_COMPLETIONS: { mode: "native", streaming: true },
+      OPENAI_RESPONSES: { mode: "adapted" },
+      ANTHROPIC_MESSAGES: { mode: "adapted" },
+      OPENAI_COMPLETIONS: { mode: "unavailable" },
+    });
+    expect(result.compatibility).toMatchObject({
+      recommendedSurface: "ANTHROPIC_MESSAGES",
+      warnings: expect.arrayContaining([
+        "adaptation_strict_subset",
+        "developer_role_collapse_lossy",
+      ]),
+    });
+  });
+
+  it("defensively clears an invalid stored recommended surface", async () => {
+    db.modelPool.findMany.mockResolvedValue([
+      poolRow({ recommendedSurfaceOverride: "UNSUPPORTED_FUTURE_SURFACE" }),
+    ]);
+
+    const [result] = await client().listModelPools();
+
+    expect(result).toMatchObject({
+      recommendedSurfaceOverride: null,
+      compatibility: { recommendedSurface: null, warnings: [] },
+    });
+  });
+
   it("persists an in-range pool attachment limit and rejects one above the global policy", async () => {
     db.modelPool.findUnique.mockResolvedValueOnce(null);
     db.modelPool.create.mockResolvedValue(poolRow({ maxAttachmentBytes: 2 * 1024 * 1024 }));
@@ -431,6 +1387,10 @@ describe("forwarderManagementRouter", () => {
 
   it("manages pool members within the owner boundary", async () => {
     db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+    db.modelPool.findFirst.mockResolvedValue({
+      capacityConcurrencyLimit: null,
+      capacityReservedSlots: 0,
+    });
     db.discoveredModel.findUnique.mockResolvedValue({ id: "model-id", userId: "user-id" });
     db.poolMember.create.mockResolvedValue({ id: "member-id" });
     db.poolMember.findUnique.mockResolvedValue({
@@ -449,7 +1409,15 @@ describe("forwarderManagementRouter", () => {
         discoveredModelId: "model-id",
         weight: 5,
       }),
-    ).resolves.toEqual({ id: "member-id" });
+    ).resolves.toEqual({ id: "member-id", executionTargetId: "target-id" });
+    expect(db.poolMember.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        poolId: "pool-id",
+        discoveredModelId: "model-id",
+        executionTargetId: "target-id",
+      }),
+      select: { id: true },
+    });
     await expect(
       client().updatePoolMember({
         id: "member-id",
@@ -463,8 +1431,411 @@ describe("forwarderManagementRouter", () => {
     });
   });
 
-  it("grants and revokes pool access by exact case-insensitive email without search", async () => {
+  it("rejects attaching a local target when inherited pool capacity exceeds its hard limit", async () => {
     db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+    db.discoveredModel.findUnique.mockResolvedValue({ id: "model-id", userId: "user-id" });
+    db.executionTarget.upsert.mockResolvedValue({
+      id: "target-id",
+      InferenceCapacity: { hardConcurrencyLimit: 2 },
+    });
+    db.modelPool.findFirst.mockResolvedValue({
+      capacityConcurrencyLimit: 3,
+      capacityReservedSlots: 0,
+    });
+
+    await expect(
+      client().addPoolMember({ poolId: "pool-id", discoveredModelId: "model-id" }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.poolMember.create).not.toHaveBeenCalled();
+  });
+
+  it("transactionally reindexes public overflow order without duplicate positions", async () => {
+    db.poolMember.findUnique.mockResolvedValue({
+      id: "member-b",
+      poolId: "pool-id",
+      tier: "PUBLIC_OVERFLOW",
+      ModelPool: { userId: "user-id" },
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      { id: "member-a" },
+      { id: "member-b" },
+      { id: "member-c" },
+    ]);
+    db.poolMember.update.mockResolvedValue({});
+
+    await expect(
+      client().reorderProviderPoolMember({ id: "member-b", direction: "LATER" }),
+    ).resolves.toEqual({ moved: true });
+    expect(db.poolMember.update.mock.calls.map(([input]) => input)).toEqual([
+      { where: { id: "member-a" }, data: { publicOrder: 0 } },
+      { where: { id: "member-c" }, data: { publicOrder: 1 } },
+      { where: { id: "member-b" }, data: { publicOrder: 2 } },
+    ]);
+  });
+
+  it("transactionally validates and updates provider primary routing and capacity policy", async () => {
+    db.poolMember.findUnique
+      .mockResolvedValueOnce({
+        id: "provider-primary-member",
+        poolId: "pool-id",
+        ModelPool: { userId: "user-id" },
+      })
+      .mockResolvedValueOnce({
+        id: "provider-primary-member",
+        poolId: "pool-id",
+        tier: "PRIMARY",
+        publicOrder: null,
+        weight: 1,
+        routingStatus: "ACTIVE",
+        capacityConcurrencyMode: "INHERIT",
+        capacityConcurrencyLimit: null,
+        capacityReservedSlots: null,
+        capacityContextCeilingMode: "INHERIT",
+        capacityContextCeiling: null,
+        capacityContextMargin: null,
+        ExecutionTarget: {
+          ProviderModel: { id: "provider-model", providerAccountId: "provider-account" },
+          InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: 8 },
+        },
+        ModelPool: {
+          userId: "user-id",
+          publicEgressEnabled: false,
+          publicEgressAcknowledged: true,
+          capacityConcurrencyLimit: 6,
+          capacityReservedSlots: 1,
+        },
+      });
+    db.poolMember.findMany.mockResolvedValue([]);
+    db.poolMember.update.mockResolvedValue({
+      id: "provider-primary-member",
+      weight: 5,
+      routingStatus: "ACTIVE",
+      tier: "PRIMARY",
+      publicOrder: null,
+    });
+
+    await expect(
+      client().updatePoolMember({
+        id: "provider-primary-member",
+        weight: 5,
+        capacityPriority: 24,
+        capacityConcurrencyMode: "LIMITED",
+        capacityConcurrencyLimit: 4,
+        capacityReservedSlots: 2,
+        capacityBorrowPolicy: "NEVER",
+        capacityWaitBudgetMode: "LIMITED",
+        capacityWaitBudgetMs: 15_000,
+        capacityContextCeilingMode: "LIMITED",
+        capacityContextCeiling: 32_768,
+        capacityContextMargin: 1_024,
+      }),
+    ).resolves.toMatchObject({ id: "provider-primary-member", weight: 5, tier: "PRIMARY" });
+
+    expect(db.poolMember.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "provider-primary-member" },
+        data: expect.objectContaining({
+          weight: 5,
+          capacityPriority: 24,
+          capacityConcurrencyMode: "LIMITED",
+          capacityConcurrencyLimit: 4,
+          capacityReservedSlots: 2,
+          capacityBorrowPolicy: "NEVER",
+          capacityWaitBudgetMode: "LIMITED",
+          capacityWaitBudgetMs: 15_000,
+          capacityContextCeilingMode: "LIMITED",
+          capacityContextCeiling: 32_768,
+          capacityContextMargin: 1_024,
+        }),
+      }),
+    );
+  });
+
+  it("rejects finite and inherited member policies above physical concurrency", async () => {
+    const member = (mode: "INHERIT" | "LIMITED" | "UNLIMITED") => ({
+      id: "member-id",
+      poolId: "pool-id",
+      tier: "PRIMARY",
+      publicOrder: null,
+      weight: 1,
+      routingStatus: "ACTIVE",
+      capacityConcurrencyMode: mode,
+      capacityConcurrencyLimit: mode === "LIMITED" ? 2 : null,
+      capacityReservedSlots: null,
+      capacityContextCeilingMode: "INHERIT",
+      capacityContextCeiling: null,
+      capacityContextMargin: null,
+      ExecutionTarget: {
+        ProviderModel: { id: "provider-model", providerAccountId: "provider-account" },
+        InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: 4 },
+      },
+      ModelPool: {
+        userId: "user-id",
+        publicEgressEnabled: false,
+        publicEgressAcknowledged: true,
+        capacityConcurrencyLimit: 6,
+        capacityReservedSlots: 1,
+      },
+    });
+    db.poolMember.findUnique
+      .mockResolvedValueOnce({
+        id: "member-id",
+        poolId: "pool-id",
+        ModelPool: { userId: "user-id" },
+      })
+      .mockResolvedValueOnce(member("INHERIT"));
+    await expect(client().updatePoolMember({ id: "member-id", weight: 2 })).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+    });
+
+    db.poolMember.findUnique
+      .mockResolvedValueOnce({
+        id: "member-id",
+        poolId: "pool-id",
+        ModelPool: { userId: "user-id" },
+      })
+      .mockResolvedValueOnce(member("LIMITED"));
+    await expect(
+      client().updatePoolMember({
+        id: "member-id",
+        capacityConcurrencyMode: "LIMITED",
+        capacityConcurrencyLimit: 5,
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.poolMember.update).not.toHaveBeenCalled();
+  });
+
+  it("allows unlimited member policy while enforcing its reservation against physical capacity", async () => {
+    const base = {
+      id: "member-id",
+      poolId: "pool-id",
+      tier: "PRIMARY",
+      publicOrder: null,
+      weight: 1,
+      routingStatus: "ACTIVE",
+      capacityConcurrencyMode: "INHERIT",
+      capacityConcurrencyLimit: null,
+      capacityReservedSlots: null,
+      capacityContextCeilingMode: "INHERIT",
+      capacityContextCeiling: null,
+      capacityContextMargin: null,
+      ExecutionTarget: {
+        ProviderModel: { id: "provider-model", providerAccountId: "provider-account" },
+        InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: 4 },
+      },
+      ModelPool: {
+        userId: "user-id",
+        publicEgressEnabled: false,
+        publicEgressAcknowledged: true,
+        capacityConcurrencyLimit: 8,
+        capacityReservedSlots: 0,
+      },
+    };
+    db.poolMember.findUnique
+      .mockResolvedValueOnce({
+        id: "member-id",
+        poolId: "pool-id",
+        ModelPool: { userId: "user-id" },
+      })
+      .mockResolvedValueOnce(base);
+    db.poolMember.findMany.mockResolvedValue([]);
+    db.poolMember.update.mockResolvedValue({
+      id: "member-id",
+      weight: 1,
+      routingStatus: "ACTIVE",
+      tier: "PRIMARY",
+      publicOrder: null,
+    });
+    await expect(
+      client().updatePoolMember({
+        id: "member-id",
+        capacityConcurrencyMode: "UNLIMITED",
+        capacityReservedSlots: 4,
+      }),
+    ).resolves.toMatchObject({ id: "member-id" });
+  });
+
+  it("requires an active explicit concurrency policy before attaching public overflow", async () => {
+    db.modelPool.findFirst.mockResolvedValue({
+      id: "pool-id",
+      publicEgressEnabled: true,
+      publicEgressAcknowledged: true,
+    });
+    db.providerModel.findFirst.mockResolvedValue({
+      id: "provider-model",
+      providerAccountId: "provider-account",
+      enabled: true,
+    });
+    db.providerBudgetPolicy.findFirst.mockResolvedValue(null);
+    await expect(
+      client().addProviderPoolMember({
+        poolId: "pool-id",
+        providerModelId: "provider-model",
+        publicOrder: 0,
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.executionTarget.upsert).not.toHaveBeenCalled();
+
+    db.providerBudgetPolicy.findFirst.mockResolvedValue({
+      id: "policy",
+      activatedAt: new Date(),
+      Rules: [{ id: "rule", mode: "UNLIMITED", limitValue: null }],
+    });
+    db.providerAuditEvent.findFirst.mockResolvedValue({ id: "audit" });
+    db.executionTarget.upsert.mockResolvedValue({ id: "provider-target" });
+    db.poolMember.create.mockResolvedValue({ id: "provider-member" });
+    db.poolMember.findMany.mockResolvedValue([]);
+    await expect(
+      client().addProviderPoolMember({
+        poolId: "pool-id",
+        providerModelId: "provider-model",
+        publicOrder: 0,
+      }),
+    ).resolves.toEqual({ id: "provider-member", executionTargetId: "provider-target" });
+    expect(db.poolMember.update).toHaveBeenCalledWith({
+      where: { id: "provider-member" },
+      data: { publicOrder: 0 },
+    });
+  });
+
+  it("rejects attaching a provider primary when inherited pool capacity exceeds its hard limit", async () => {
+    db.modelPool.findFirst.mockResolvedValue({
+      id: "pool-id",
+      publicEgressEnabled: false,
+      publicEgressAcknowledged: true,
+      capacityConcurrencyLimit: 5,
+      capacityReservedSlots: 1,
+    });
+    db.providerModel.findFirst.mockResolvedValue({
+      id: "provider-model",
+      providerAccountId: "provider-account",
+      concurrencyLimit: 4,
+      enabled: true,
+    });
+
+    await expect(
+      client().addProviderPoolMember({
+        poolId: "pool-id",
+        providerModelId: "provider-model",
+        tier: "PRIMARY",
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.providerBudgetPolicy.findFirst).not.toHaveBeenCalled();
+    expect(db.poolMember.create).not.toHaveBeenCalled();
+  });
+
+  it("attaches a provider PRIMARY without enabling public overflow", async () => {
+    db.modelPool.findFirst.mockResolvedValue({
+      id: "private-pool",
+      publicEgressEnabled: false,
+      publicEgressAcknowledged: true,
+    });
+    db.providerModel.findFirst.mockResolvedValue({
+      id: "provider-model",
+      providerAccountId: "provider-account",
+      enabled: true,
+    });
+    db.providerBudgetPolicy.findFirst.mockResolvedValue({
+      id: "policy",
+      activatedAt: new Date(),
+      Rules: [{ id: "rule", mode: "LIMITED", limitValue: 2 }],
+    });
+    db.providerAuditEvent.findFirst.mockResolvedValue({ id: "audit" });
+    db.executionTarget.upsert.mockResolvedValue({ id: "provider-target" });
+    db.poolMember.create.mockResolvedValue({ id: "primary-provider-member" });
+
+    await expect(
+      client().addProviderPoolMember({
+        poolId: "private-pool",
+        providerModelId: "provider-model",
+        tier: "PRIMARY",
+        weight: 7,
+      }),
+    ).resolves.toEqual({
+      id: "primary-provider-member",
+      executionTargetId: "provider-target",
+    });
+    expect(db.poolMember.create).toHaveBeenCalledWith({
+      data: {
+        poolId: "private-pool",
+        executionTargetId: "provider-target",
+        tier: "PRIMARY",
+        publicOrder: null,
+        weight: 7,
+      },
+      select: { id: true },
+    });
+    expect(db.poolMember.findMany).not.toHaveBeenCalled();
+  });
+
+  it("makes missing and cross-owner nested pool-member ids indistinguishable", async () => {
+    const expectedPoolError = { code: "NOT_FOUND", message: "Model pool not found." };
+    db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce({
+      id: "other-pool-id",
+      userId: "other-user-id",
+    });
+    await expect(
+      client().addPoolMember({ poolId: "missing-pool", discoveredModelId: "model-id" }),
+    ).rejects.toMatchObject(expectedPoolError);
+    await expect(
+      client().addPoolMember({ poolId: "other-pool-id", discoveredModelId: "model-id" }),
+    ).rejects.toMatchObject(expectedPoolError);
+
+    const expectedModelError = { code: "NOT_FOUND", message: "Discovered model not found." };
+    db.modelPool.findUnique
+      .mockResolvedValueOnce({ id: "pool-id", userId: "user-id" })
+      .mockResolvedValueOnce({ id: "pool-id", userId: "user-id" });
+    db.discoveredModel.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce({
+      id: "other-model-id",
+      userId: "other-user-id",
+    });
+    await expect(
+      client().addPoolMember({ poolId: "pool-id", discoveredModelId: "missing-model" }),
+    ).rejects.toMatchObject(expectedModelError);
+    await expect(
+      client().addPoolMember({ poolId: "pool-id", discoveredModelId: "other-model-id" }),
+    ).rejects.toMatchObject(expectedModelError);
+
+    expect(db.executionTarget.upsert).not.toHaveBeenCalled();
+    expect(db.poolMember.create).not.toHaveBeenCalled();
+  });
+
+  it("makes missing and cross-owner transformer ids indistinguishable", async () => {
+    const existingPool = {
+      id: "pool-id",
+      userId: "user-id",
+      transformerDiscoveredModelId: null,
+      transformerImages: true,
+      transformerAudio: false,
+      transformerVideo: false,
+      transformerCacheMode: "OFF",
+    };
+    db.modelPool.findUnique.mockResolvedValueOnce(existingPool).mockResolvedValueOnce(existingPool);
+    db.discoveredModel.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce({
+      id: "other-model-id",
+      userId: "other-user-id",
+      published: true,
+      capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+      capabilityOverrideMetadata: null,
+      Endpoint: { published: true, capabilityMetadata: null },
+    });
+
+    const expected = { code: "NOT_FOUND", message: "Discovered model not found." };
+    await expect(
+      client().updateModelPool({ id: "pool-id", transformerDiscoveredModelId: "missing-model" }),
+    ).rejects.toMatchObject(expected);
+    await expect(
+      client().updateModelPool({ id: "pool-id", transformerDiscoveredModelId: "other-model-id" }),
+    ).rejects.toMatchObject(expected);
+    expect(db.modelPool.update).not.toHaveBeenCalled();
+  });
+
+  it("grants and revokes pool access by exact case-insensitive email without search", async () => {
+    db.modelPool.findUnique.mockResolvedValue({
+      id: "pool-id",
+      userId: "user-id",
+      publicEgressEnabled: false,
+    });
     db.user.findFirst.mockResolvedValue({ id: "grantee-id" });
     db.poolGrant.upsert.mockResolvedValue({
       id: "grant-id",
@@ -485,8 +1856,53 @@ describe("forwarderManagementRouter", () => {
     expect(JSON.stringify(db.user.findFirst.mock.calls)).not.toContain("contains");
   });
 
+  it("requires an exact public-egress acknowledgement before creating a pool grant", async () => {
+    db.modelPool.findUnique.mockResolvedValue({
+      id: "pool-id",
+      userId: "user-id",
+      publicEgressEnabled: true,
+    });
+
+    await expect(
+      client().grantPoolAccessByEmail({
+        poolId: "pool-id",
+        email: "friend@example.com",
+        publicEgressAcknowledged: false,
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.user.findFirst).not.toHaveBeenCalled();
+    expect(db.poolGrant.upsert).not.toHaveBeenCalled();
+  });
+
+  it("requires provider-egress acknowledgement for provider PRIMARY grants", async () => {
+    db.modelPool.findUnique.mockResolvedValue({
+      id: "pool-id",
+      userId: "user-id",
+      publicEgressEnabled: false,
+    });
+    db.poolMember.findFirst.mockResolvedValue({ id: "provider-primary-member" });
+
+    await expect(
+      client().grantPoolAccessByEmail({
+        poolId: "pool-id",
+        email: "friend@example.com",
+        publicEgressAcknowledged: false,
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.poolMember.findFirst).toHaveBeenCalledWith({
+      where: {
+        poolId: "pool-id",
+        tier: "PRIMARY",
+        ExecutionTarget: { ProviderModel: { isNot: null } },
+      },
+      select: { id: true },
+    });
+    expect(db.poolGrant.upsert).not.toHaveBeenCalled();
+  });
+
   it("returns a generic not-found result for unmatched grant emails", async () => {
     db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+    db.poolMember.findFirst.mockResolvedValue(null);
     db.user.findFirst.mockResolvedValue(null);
 
     await expect(
@@ -571,7 +1987,7 @@ describe("forwarderManagementRouter", () => {
       },
     ]);
 
-    await expect(client().visibleModels()).resolves.toEqual({
+    await expect(client().visibleModels()).resolves.toMatchObject({
       directModels: [
         {
           target: "DIRECT_MODEL",
@@ -672,5 +2088,40 @@ describe("forwarderManagementRouter", () => {
         }),
       }),
     );
+  });
+
+  it("reports and clears cache affinity only after verifying pool ownership", async () => {
+    db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+    db.cacheAffinityRecord.count.mockResolvedValueOnce(7).mockResolvedValueOnce(2);
+    db.cacheAffinityRecord.groupBy.mockResolvedValue([
+      {
+        executionTargetId: "target-id",
+        _count: { _all: 7 },
+        _max: { lastUsedAt: new Date("2026-08-25"), expiresAt: new Date("2026-08-26") },
+      },
+    ]);
+    db.cacheAffinityRecord.deleteMany.mockResolvedValue({ count: 7 });
+
+    const stats = await client().cacheAffinityStats({ poolId: "pool-id" });
+    const cleared = await client().clearCacheAffinity({ poolId: "pool-id" });
+
+    expect(stats.activeRecords).toBe(7);
+    expect(stats.confirmedRecords).toBe(2);
+    expect(cleared).toEqual({ deleted: 7 });
+    expect(db.cacheAffinityRecord.deleteMany).toHaveBeenCalledWith({
+      where: { userId: "user-id", poolId: "pool-id" },
+    });
+  });
+
+  it("does not reveal or mutate another owner's affinity records", async () => {
+    db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "other-user" });
+    await expect(client().cacheAffinityStats({ poolId: "pool-id" })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
+    await expect(client().clearCacheAffinity({ poolId: "pool-id" })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
+    expect(db.cacheAffinityRecord.count).not.toHaveBeenCalled();
+    expect(db.cacheAffinityRecord.deleteMany).not.toHaveBeenCalled();
   });
 });

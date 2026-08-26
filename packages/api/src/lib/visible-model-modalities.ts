@@ -79,6 +79,17 @@ export async function visibleModelAttachmentModalities(targets: VisibleModelTarg
           where: { poolId: { in: poolIds } },
           select: {
             poolId: true,
+            ExecutionTarget: {
+              select: {
+                DiscoveredModel: {
+                  select: {
+                    capabilityOverrideMode: true,
+                    capabilityOverrideMetadata: true,
+                    Endpoint: { select: { capabilityMetadata: true } },
+                  },
+                },
+              },
+            },
             DiscoveredModel: {
               select: {
                 capabilityOverrideMode: true,
@@ -122,12 +133,14 @@ export async function visibleModelAttachmentModalities(targets: VisibleModelTarg
   );
   const membersByPoolId = new Map<string, VisibleModelAttachmentModalities[]>();
   for (const row of poolMemberRows) {
+    const discoveredModel = row.ExecutionTarget?.DiscoveredModel ?? row.DiscoveredModel;
+    if (!discoveredModel) continue;
     const current = membersByPoolId.get(row.poolId) ?? [];
     current.push(
       modalitiesFromCapabilities({
-        capabilityOverrideMode: row.DiscoveredModel.capabilityOverrideMode,
-        capabilityOverrideMetadata: row.DiscoveredModel.capabilityOverrideMetadata,
-        endpointCapabilityMetadata: row.DiscoveredModel.Endpoint.capabilityMetadata,
+        capabilityOverrideMode: discoveredModel.capabilityOverrideMode,
+        capabilityOverrideMetadata: discoveredModel.capabilityOverrideMetadata,
+        endpointCapabilityMetadata: discoveredModel.Endpoint.capabilityMetadata,
       }),
     );
     membersByPoolId.set(row.poolId, current);

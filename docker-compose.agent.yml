@@ -56,7 +56,7 @@ services:
         set -e
         pnpm install --frozen-lockfile --ignore-scripts
         pnpm -F @ws-model-proxy/db exec prisma generate
-        pnpm -F @ws-model-proxy/db exec prisma db push
+        pnpm -F @ws-model-proxy/db db:push
         exec pnpm dev:raw
     volumes:
       - ./:/app

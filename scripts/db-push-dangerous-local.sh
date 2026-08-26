@@ -33,3 +33,4 @@ EOF
 esac
 
 prisma db push --accept-data-loss
+node scripts/apply-schema-hardening.mjs

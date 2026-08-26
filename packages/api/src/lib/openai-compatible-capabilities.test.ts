@@ -88,6 +88,55 @@ describe("supportsChatCompletions", () => {
   });
 });
 
+describe("capability inventory v4", () => {
+  const v4 = {
+    version: 4,
+    protocol: "openai-compatible",
+    surfaces: {
+      openaiChatCompletions: {
+        source: "provider",
+        confidence: "exact",
+        operations: ["create"],
+        inputImages: true,
+      },
+    },
+  } as const;
+
+  it("derives support from exact operations while retaining old readers", () => {
+    const parsed = parseOpenAiCompatibleCapabilities(v4);
+    expect(parsed?.version).toBe(4);
+    expect(supportsChatCompletions({ capabilities: parsed })).toBe(true);
+    expect(transformerSupportedModalities(parsed)).toEqual({
+      images: true,
+      audio: false,
+      video: false,
+    });
+    expect(parseOpenAiCompatibleCapabilities(endpointCaps)?.version).toBe(1);
+  });
+
+  it("rejects unknown, duplicate, and legacy boolean operation declarations", () => {
+    for (const operations of [["unknown"], ["create", "create"]]) {
+      expect(
+        parseOpenAiCompatibleCapabilities({
+          ...v4,
+          surfaces: { openaiChatCompletions: { ...v4.surfaces.openaiChatCompletions, operations } },
+        }),
+      ).toBeNull();
+    }
+    expect(
+      parseOpenAiCompatibleCapabilities({
+        ...v4,
+        surfaces: {
+          openaiChatCompletions: {
+            ...v4.surfaces.openaiChatCompletions,
+            supported: true,
+          },
+        },
+      }),
+    ).toBeNull();
+  });
+});
+
 describe("openAiCapabilitiesFromCoarse", () => {
   it("preserves embeddings and responses while enabling vision", () => {
     const caps = openAiCapabilitiesFromCoarse([
@@ -141,5 +190,67 @@ describe("detailed transcription capabilities", () => {
       responseFormats: ["json", "verbose_json"],
       timestampGranularities: [],
     });
+  });
+});
+
+describe("v4 inventory invariants", () => {
+  const anthropic = {
+    version: 4,
+    protocol: "anthropic-compatible",
+    surfaces: {
+      anthropicMessages: {
+        source: "provider",
+        confidence: "exact",
+        operations: ["create"],
+        protocolVersions: [{ version: "2023-06-01", betaFeatures: ["beta-one"] }],
+      },
+    },
+  };
+
+  it("rejects trimmed duplicate Anthropic versions and betas", () => {
+    expect(
+      parseOpenAiCompatibleCapabilities({
+        ...anthropic,
+        surfaces: {
+          anthropicMessages: {
+            ...anthropic.surfaces.anthropicMessages,
+            protocolVersions: [{ version: "2023-06-01", betaFeatures: ["beta-one", " beta-one "] }],
+          },
+        },
+      }),
+    ).toBeNull();
+    expect(
+      parseOpenAiCompatibleCapabilities({
+        ...anthropic,
+        surfaces: {
+          anthropicMessages: {
+            ...anthropic.surfaces.anthropicMessages,
+            protocolVersions: [
+              { version: "2023-06-01", betaFeatures: [] },
+              { version: " 2023-06-01 ", betaFeatures: [] },
+            ],
+          },
+        },
+      }),
+    ).toBeNull();
+  });
+
+  it("rejects surfaces inconsistent with the declared protocol", () => {
+    expect(
+      parseOpenAiCompatibleCapabilities({ ...anthropic, protocol: "openai-compatible" }),
+    ).toBeNull();
+    expect(
+      parseOpenAiCompatibleCapabilities({
+        version: 4,
+        protocol: "anthropic-compatible",
+        surfaces: {
+          openaiResponses: {
+            source: "provider",
+            confidence: "exact",
+            operations: ["create"],
+          },
+        },
+      }),
+    ).toBeNull();
   });
 });

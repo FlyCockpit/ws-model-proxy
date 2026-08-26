@@ -139,7 +139,7 @@ type PoolMemberRow = {
   id: string;
   createdAt: Date;
   updatedAt: Date;
-  discoveredModelId: string;
+  discoveredModelId: string | null;
   weight: number;
   healthStatus: string;
   routingStatus: string;
@@ -149,22 +149,25 @@ type PoolMemberRow = {
   nextRetryAt: Date | null;
   halfOpenTrialStartedAt: Date | null;
   lastRoutedAt: Date | null;
-  DiscoveredModel: {
+  DiscoveredModel: PoolMemberModelRow | null;
+  ExecutionTarget: { kind: string; DiscoveredModel: PoolMemberModelRow | null } | null;
+};
+
+type PoolMemberModelRow = {
+  id: string;
+  upstreamModelId: string;
+  User: { slug: string };
+  Endpoint: {
     id: string;
-    upstreamModelId: string;
-    User: { slug: string };
-    Endpoint: {
+    slug: string;
+    label: string;
+    status: string;
+    CliDevice: {
       id: string;
       slug: string;
       label: string;
       status: string;
-      CliDevice: {
-        id: string;
-        slug: string;
-        label: string;
-        status: string;
-        lastHeartbeatAt: Date | null;
-      };
+      lastHeartbeatAt: Date | null;
     };
   };
 };
@@ -189,6 +192,18 @@ type RelayRequestRow = {
   requestBytes: bigint | null;
   responseBytes: bigint | null;
   attemptCount: number;
+  auxiliaryAttemptCount: number;
+  auxiliaryRequestBytes: bigint;
+  auxiliaryResponseBytes: bigint;
+  requestedSurface: string | null;
+  selectedNativeSurface: string | null;
+  adapterMode: string | null;
+  adapterVersion: string | null;
+  selectedPoolMemberId: string | null;
+  selectedPoolMemberTier: string | null;
+  localAttemptId: string | null;
+  firstClientByteAt: Date | null;
+  streamCommitted: boolean;
   User: OwnerRow;
   ModelApiToken: { id: string; name: string; lookupPrefix: string } | null;
   RequestedDiscoveredModel: RelayModelRow | null;
@@ -457,40 +472,45 @@ function serializePool(row: ModelPoolRow, now: Date) {
     canonicalModelId: poolModelId({ userSlug: row.User.slug, poolSlug: row.slug }),
     grantCount: row._count.PoolGrants,
     allowlistEntryCount: row._count.ModelApiTokenAllowlistEntries,
-    members: row.PoolMembers.map((member) => ({
-      id: member.id,
-      createdAt: member.createdAt,
-      updatedAt: member.updatedAt,
-      discoveredModelId: member.discoveredModelId,
-      weight: member.weight,
-      healthStatus: String(member.healthStatus),
-      routingStatus: String(member.routingStatus),
-      lastFailureClass: member.lastFailureClass,
-      consecutiveRetryableFailures: member.consecutiveRetryableFailures,
-      lastFailureAt: member.lastFailureAt,
-      nextRetryAt: member.nextRetryAt,
-      halfOpenTrialStartedAt: member.halfOpenTrialStartedAt,
-      lastRoutedAt: member.lastRoutedAt,
-      model: {
-        id: member.DiscoveredModel.id,
-        upstreamModelId: member.DiscoveredModel.upstreamModelId,
-        canonicalModelId: directModelId({
-          userSlug: member.DiscoveredModel.User.slug,
-          cliSlug: member.DiscoveredModel.Endpoint.CliDevice.slug,
-          endpointSlug: member.DiscoveredModel.Endpoint.slug,
-          upstreamModelId: member.DiscoveredModel.upstreamModelId,
-        }),
-        endpointId: member.DiscoveredModel.Endpoint.id,
-        endpointSlug: member.DiscoveredModel.Endpoint.slug,
-        endpointLabel: member.DiscoveredModel.Endpoint.label,
-        endpointStatus: String(member.DiscoveredModel.Endpoint.status),
-        cliDeviceId: member.DiscoveredModel.Endpoint.CliDevice.id,
-        cliDeviceSlug: member.DiscoveredModel.Endpoint.CliDevice.slug,
-        cliDeviceLabel: member.DiscoveredModel.Endpoint.CliDevice.label,
-        cliDeviceStatus: String(member.DiscoveredModel.Endpoint.CliDevice.status),
-        cliDeviceIsStale: isStale(member.DiscoveredModel.Endpoint.CliDevice.lastHeartbeatAt, now),
-      },
-    })),
+    members: row.PoolMembers.map((member) => {
+      const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
+      return {
+        id: member.id,
+        createdAt: member.createdAt,
+        updatedAt: member.updatedAt,
+        discoveredModelId: model?.id ?? member.discoveredModelId,
+        weight: member.weight,
+        healthStatus: String(member.healthStatus),
+        routingStatus: String(member.routingStatus),
+        lastFailureClass: member.lastFailureClass,
+        consecutiveRetryableFailures: member.consecutiveRetryableFailures,
+        lastFailureAt: member.lastFailureAt,
+        nextRetryAt: member.nextRetryAt,
+        halfOpenTrialStartedAt: member.halfOpenTrialStartedAt,
+        lastRoutedAt: member.lastRoutedAt,
+        model: model
+          ? {
+              id: model.id,
+              upstreamModelId: model.upstreamModelId,
+              canonicalModelId: directModelId({
+                userSlug: model.User.slug,
+                cliSlug: model.Endpoint.CliDevice.slug,
+                endpointSlug: model.Endpoint.slug,
+                upstreamModelId: model.upstreamModelId,
+              }),
+              endpointId: model.Endpoint.id,
+              endpointSlug: model.Endpoint.slug,
+              endpointLabel: model.Endpoint.label,
+              endpointStatus: String(model.Endpoint.status),
+              cliDeviceId: model.Endpoint.CliDevice.id,
+              cliDeviceSlug: model.Endpoint.CliDevice.slug,
+              cliDeviceLabel: model.Endpoint.CliDevice.label,
+              cliDeviceStatus: String(model.Endpoint.CliDevice.status),
+              cliDeviceIsStale: isStale(model.Endpoint.CliDevice.lastHeartbeatAt, now),
+            }
+          : null,
+      };
+    }),
   };
 }
 
@@ -540,6 +560,18 @@ function serializeRelay(row: RelayRequestRow) {
     requestBytes: row.requestBytes === null ? null : Number(row.requestBytes),
     responseBytes: row.responseBytes === null ? null : Number(row.responseBytes),
     attemptCount: row.attemptCount,
+    auxiliaryAttemptCount: row.auxiliaryAttemptCount,
+    auxiliaryRequestBytes: Number(row.auxiliaryRequestBytes),
+    auxiliaryResponseBytes: Number(row.auxiliaryResponseBytes),
+    requestedSurface: row.requestedSurface,
+    selectedNativeSurface: row.selectedNativeSurface,
+    adapterMode: row.adapterMode,
+    adapterVersion: row.adapterVersion,
+    selectedPoolMemberId: row.selectedPoolMemberId,
+    selectedPoolMemberTier: row.selectedPoolMemberTier,
+    localAttemptId: row.localAttemptId,
+    firstClientByteAt: row.firstClientByteAt,
+    streamCommitted: row.streamCommitted,
   };
 }
 
@@ -555,6 +587,29 @@ const poolMemberSelect = {
   createdAt: true,
   updatedAt: true,
   discoveredModelId: true,
+  ExecutionTarget: {
+    select: {
+      kind: true,
+      DiscoveredModel: {
+        select: {
+          id: true,
+          upstreamModelId: true,
+          User: { select: { slug: true } },
+          Endpoint: {
+            select: {
+              id: true,
+              slug: true,
+              label: true,
+              status: true,
+              CliDevice: {
+                select: { id: true, slug: true, label: true, status: true, lastHeartbeatAt: true },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
   weight: true,
   healthStatus: true,
   routingStatus: true,
@@ -897,6 +952,18 @@ export const adminObservabilityRouter = {
             requestBytes: true,
             responseBytes: true,
             attemptCount: true,
+            auxiliaryAttemptCount: true,
+            auxiliaryRequestBytes: true,
+            auxiliaryResponseBytes: true,
+            requestedSurface: true,
+            selectedNativeSurface: true,
+            adapterMode: true,
+            adapterVersion: true,
+            selectedPoolMemberId: true,
+            selectedPoolMemberTier: true,
+            localAttemptId: true,
+            firstClientByteAt: true,
+            streamCommitted: true,
             User: { select: ownerSelect },
             ModelApiToken: { select: { id: true, name: true, lookupPrefix: true } },
             RequestedDiscoveredModel: { select: relayModelSelect },

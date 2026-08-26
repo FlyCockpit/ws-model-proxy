@@ -381,6 +381,7 @@ export class RelaySessionManager {
       | "completions"
       | "embeddings"
       | "responses"
+      | "messages"
       | "audio"
       | "images"
       | "generic";

@@ -269,6 +269,7 @@ describe("modelPoolRouting", () => {
     expect(poolMemberFailureClassForRelayFailure("timeout")).toBe("RELAY_TIMEOUT");
     expect(poolMemberFailureClassForRelayFailure("disconnected")).toBe("WEBSOCKET_DISCONNECTED");
     expect(poolMemberFailureClassForRelayFailure("upstream_5xx")).toBe("UPSTREAM_5XX");
+    expect(poolMemberFailureClassForRelayFailure("protocol_error")).toBe("TRANSPORT");
     expect(poolMemberFailureClassForRelayFailure("upstream_4xx")).toBeNull();
     expect(poolMemberFailureClassForRelayFailure("access_denied")).toBeNull();
     expect(poolMemberFailureClassForRelayFailure("not_found")).toBeNull();
@@ -342,7 +343,13 @@ describe("modelPoolRouting", () => {
     });
     expect(db.poolMember.updateMany).toHaveBeenCalledWith({
       where: {
-        discoveredModelId: { in: ["model-a", "model-b"] },
+        OR: [
+          {
+            executionTargetId: { not: null },
+            ExecutionTarget: { discoveredModelId: { in: ["model-a", "model-b"] } },
+          },
+          { executionTargetId: null, discoveredModelId: { in: ["model-a", "model-b"] } },
+        ],
         routingStatus: { not: "DISABLED" },
       },
       data: resetPoolMemberHealth(),
@@ -390,9 +397,13 @@ describe("modelPoolRouting", () => {
     });
     expect(db.poolMember.updateMany).toHaveBeenCalledWith({
       where: {
-        DiscoveredModel: {
-          Endpoint: { cliDeviceId: "cli-1" },
-        },
+        OR: [
+          {
+            executionTargetId: { not: null },
+            ExecutionTarget: { DiscoveredModel: { Endpoint: { cliDeviceId: "cli-1" } } },
+          },
+          { executionTargetId: null, DiscoveredModel: { Endpoint: { cliDeviceId: "cli-1" } } },
+        ],
       },
       data: expect.objectContaining({
         healthStatus: "UNHEALTHY",

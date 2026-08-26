@@ -1,4 +1,7 @@
+import { createORPCClient } from "@orpc/client";
+import { RPCLink } from "@orpc/client/fetch";
 import { createRouterClient, ORPCError } from "@orpc/server";
+import { RPCHandler } from "@orpc/server/fetch";
 import type { Session } from "@ws-model-proxy/auth";
 import { directModelId, poolModelId } from "@ws-model-proxy/config/forwarder-identifiers";
 import {
@@ -107,6 +110,29 @@ function buildContext(
   };
 }
 
+function httpClient(captures?: Array<{ status: number; body: string }>) {
+  const handler = new RPCHandler(modelApiTokensRouter);
+  const link = new RPCLink({
+    url: "https://example.test/rpc",
+    fetch: async (request, init) => {
+      const result = await handler.handle(new Request(request, init), {
+        prefix: "/rpc",
+        context: buildContext(),
+      });
+      if (!result.matched) return new Response(null, { status: 404 });
+      if (captures)
+        captures.push({
+          status: result.response.status,
+          body: await result.response.clone().text(),
+        });
+      return result.response;
+    },
+  });
+  return createORPCClient(link) as ReturnType<
+    typeof createRouterClient<typeof modelApiTokensRouter>
+  >;
+}
+
 function directModelRow({
   id,
   userId = "user-id",
@@ -154,6 +180,8 @@ function poolRow({
     slug,
     name,
     description: null,
+    publicEgressEnabled: false,
+    publicEgressAcknowledged: false,
     User: { slug: userSlug },
   };
 }
@@ -250,6 +278,7 @@ describe("modelApiTokensRouter", () => {
         allowlist: {
           directModelCount: 1,
           modelPoolCount: 2,
+          modelPoolIds: ["owned-pool-id", "granted-pool-id"],
         },
       });
       expect(JSON.stringify(result.token)).not.toContain(result.secret);
@@ -266,7 +295,11 @@ describe("modelApiTokensRouter", () => {
       ).toBe(true);
       expect(createCall.data.AllowlistEntries.create).toEqual(
         expect.arrayContaining([
-          { target: "DIRECT_MODEL", discoveredModelId: "direct-model-id" },
+          expect.objectContaining({
+            target: "DIRECT_MODEL",
+            discoveredModelId: "direct-model-id",
+            ExecutionTarget: { connect: { discoveredModelId: "direct-model-id" } },
+          }),
           { target: "MODEL_POOL", modelPoolId: "owned-pool-id" },
           { target: "MODEL_POOL", modelPoolId: "granted-pool-id" },
         ]),
@@ -284,7 +317,11 @@ describe("modelApiTokensRouter", () => {
         scopeMode: "ALL_VISIBLE",
       });
 
-      expect(result.token.allowlist).toEqual({ directModelCount: 0, modelPoolCount: 0 });
+      expect(result.token.allowlist).toEqual({
+        directModelCount: 0,
+        modelPoolCount: 0,
+        modelPoolIds: [],
+      });
       const createCall = db.modelApiToken.create.mock.calls[0]?.[0] as TokenCreateArgs;
       expect(createCall.data.AllowlistEntries.create).toEqual([]);
     });
@@ -379,6 +416,7 @@ describe("modelApiTokensRouter", () => {
           allowlist: {
             directModelCount: 1,
             modelPoolCount: 0,
+            modelPoolIds: [],
           },
         },
       ]);
@@ -404,6 +442,44 @@ describe("modelApiTokensRouter", () => {
 
       expect(result.directModels.map((model) => model.id)).toEqual([modelIds.directModelId]);
       expect(result.modelPools.map((pool) => pool.id)).toEqual([modelIds.grantedPoolId]);
+    });
+
+    it("does not reflect a guessed foreign model id through preview or create HTTP envelopes", async () => {
+      seedVisibleModels();
+      mockTokenCreate();
+      const foreignModelId = directModelId({
+        userSlug: "foreign-owner",
+        cliSlug: "foreign-cli",
+        endpointSlug: "foreign-endpoint",
+        upstreamModelId: "foreign-model",
+      });
+      const captures: Array<{ status: number; body: string }> = [];
+      const rpc = httpClient(captures);
+
+      const results = await Promise.allSettled([
+        rpc.preview({ scopeMode: "ALLOWLIST", modelIds: [foreignModelId] }),
+        rpc.create({ name: "Foreign target", scopeMode: "ALLOWLIST", modelIds: [foreignModelId] }),
+      ]);
+
+      for (const result of results) {
+        expect(result.status).toBe("rejected");
+        if (result.status === "rejected")
+          expect(result.reason).toMatchObject({ code: "FORBIDDEN" });
+      }
+      expect(captures).toHaveLength(2);
+      for (const capture of captures) {
+        expect(capture.status).toBe(403);
+        expect(capture.body).toContain("FORBIDDEN");
+        expect(capture.body).not.toContain(foreignModelId);
+        for (const fragment of [
+          "foreign-owner",
+          "foreign-cli",
+          "foreign-endpoint",
+          "foreign-model",
+        ])
+          expect(capture.body).not.toContain(fragment);
+      }
+      expect(db.modelApiToken.create).not.toHaveBeenCalled();
     });
   });
 
@@ -454,6 +530,26 @@ describe("modelApiTokensRouter", () => {
         expect(error.code).toBe("NOT_FOUND");
         return true;
       });
+      expect(db.modelApiToken.update).not.toHaveBeenCalled();
+    });
+
+    it("does not reflect a guessed foreign token through the HTTP transport", async () => {
+      db.modelApiToken.findUnique.mockResolvedValue({
+        id: "foreign-token-id",
+        userId: "other-user-id",
+        revokedAt: null,
+      });
+      const captures: Array<{ status: number; body: string }> = [];
+      const result = await Promise.allSettled([
+        httpClient(captures).revoke({ id: "foreign-token-id" }),
+      ]);
+      expect(result[0]?.status).toBe("rejected");
+      if (result[0]?.status === "rejected")
+        expect(result[0].reason).toMatchObject({ code: "NOT_FOUND" });
+      expect(captures).toHaveLength(1);
+      expect(captures[0]?.status).toBe(404);
+      expect(captures[0]?.body).toContain("NOT_FOUND");
+      expect(captures[0]?.body).not.toContain("foreign-token-id");
       expect(db.modelApiToken.update).not.toHaveBeenCalled();
     });
   });

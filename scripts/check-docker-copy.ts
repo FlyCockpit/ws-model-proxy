@@ -41,8 +41,8 @@
  *   - apps/native — the Expo app enters the builder only via `COPY . .`; it is
  *                   never installed ahead of time and never reaches a runner.
  *
- * The runner stages are deliberately NOT checked: they copy only the minimal
- * set of manifests a running image needs, not the install closure.
+ * Runner workspace manifests are deliberately not checked as an install
+ * closure. Runtime files invoked by the entrypoint are checked separately.
  *
  * Dependency-free by design (node:fs only) — no new packages, safe to run in the
  * CI `lint` job alongside `pnpm env:check`.
@@ -61,9 +61,20 @@ const ALLOWLIST = new Set(["apps/cli"]);
 // out (they copy only what a running image needs, not the install closure).
 const BUILDER = "builder";
 const PROD_DEPS = "prod-deps";
+const RUNNER = "runner";
 
 // Single production image — no worker Dockerfile in this repo.
 const DOCKERFILES = ["Dockerfile"];
+
+// Runtime artifacts invoked by the production entrypoint. Unlike workspace
+// manifests, these are deliberately copied one-by-one into the minimal runner
+// image, so guard them explicitly against Dockerfile drift.
+const REQUIRED_RUNNER_COPIES = [
+  {
+    source: "/app/packages/db/scripts/apply-schema-hardening.mjs",
+    destination: "./packages/db/scripts/apply-schema-hardening.mjs",
+  },
+];
 
 /** Discover on-disk workspace members: `apps/*` / `packages/*` with a package.json. */
 function discoverMembers(): Set<string> {
@@ -196,7 +207,31 @@ const expectedBuilder = new Set([...members].filter((m) => !ALLOWLIST.has(m)).so
 const builderLists = new Map<string, Set<string>>();
 
 for (const dockerfile of DOCKERFILES) {
+  const dockerfileText = readFileSync(resolve(ROOT, dockerfile), "utf8");
   const stages = parseStages(dockerfile);
+
+  for (const required of REQUIRED_RUNNER_COPIES) {
+    let currentStage = "";
+    const found = [...logicalLines(dockerfileText)].some(({ line }) => {
+      const stageMatch = /^FROM\s+(?:--\S+\s+)*\S+\s+AS\s+(\S+)/i.exec(line);
+      if (stageMatch) {
+        currentStage = stageMatch[1] ?? "";
+        return false;
+      }
+      const fields = line.split(/\s+/);
+      return (
+        currentStage === RUNNER &&
+        fields[0]?.toUpperCase() === "COPY" &&
+        fields.at(-2) === required.source &&
+        fields.at(-1) === required.destination
+      );
+    });
+    if (!found) {
+      errors.push(
+        `${dockerfile}: missing runtime COPY for "${required.source}" to "${required.destination}".`,
+      );
+    }
+  }
 
   const builder = stages.get(BUILDER);
   if (!builder) {

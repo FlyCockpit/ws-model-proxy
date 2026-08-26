@@ -67,6 +67,12 @@ function modelPoolRow({
     name,
     description: null,
     maxAttachmentBytes: null,
+    optimisticBasicTranscription: false,
+    protocolAdaptationEnabled: false,
+    publicEgressEnabled: false,
+    publicEgressAcknowledged: false,
+    allowLossyDeveloperRoleCollapse: false,
+    recommendedSurfaceOverride: null,
     User: { slug: userSlug },
   };
 }
@@ -202,6 +208,39 @@ describe("modelApiTokenAccess", () => {
   });
 
   describe("listVisibleModelTargetsForToken", () => {
+    it("does not expose an invalid recommended surface read from storage", async () => {
+      const ownedPool = {
+        ...modelPoolRow({
+          id: "owned-pool-id",
+          userId: "user-id",
+          userSlug: "owner",
+          slug: "owned",
+          name: "Owned",
+        }),
+        recommendedSurfaceOverride: "UNSUPPORTED_FUTURE_SURFACE",
+        publicEgressEnabled: true,
+        publicEgressAcknowledged: true,
+        PoolMembers: [{ id: "provider-primary-member" }],
+      };
+      db.discoveredModel.findMany.mockResolvedValue([]);
+      db.modelPool.findMany.mockResolvedValue([ownedPool]);
+      db.poolGrant.findMany.mockResolvedValue([]);
+
+      const result = await listVisibleModelTargetsForToken({
+        id: "token-id",
+        userId: "user-id",
+        scopeMode: "ALL_VISIBLE",
+      });
+
+      expect(result.modelPools[0]?.recommendedSurfaceOverride).toBeNull();
+      expect(result.modelPools[0]).toMatchObject({
+        publicEgressEnabled: true,
+        publicEgressAcknowledged: true,
+        effectiveProviderEgress: true,
+        providerPrimaryMemberCount: 1,
+      });
+    });
+
     it("resolves ALL_VISIBLE pools from current grants on every call", async () => {
       const ownedPool = modelPoolRow({
         id: "owned-pool-id",
@@ -228,8 +267,8 @@ describe("modelApiTokenAccess", () => {
       db.discoveredModel.findMany.mockResolvedValue([]);
       db.modelPool.findMany.mockResolvedValue([ownedPool]);
       db.poolGrant.findMany
-        .mockResolvedValueOnce([{ ModelPool: firstGrantedPool }])
-        .mockResolvedValueOnce([{ ModelPool: secondGrantedPool }]);
+        .mockResolvedValueOnce([{ id: "grant-a", ModelPool: firstGrantedPool }])
+        .mockResolvedValueOnce([{ id: "grant-b", ModelPool: secondGrantedPool }]);
 
       const token = {
         id: "token-id",
@@ -248,6 +287,8 @@ describe("modelApiTokenAccess", () => {
         poolModelId({ userSlug: "owner", poolSlug: "owned" }),
         poolModelId({ userSlug: "team-b", poolSlug: "shared-b" }),
       ]);
+      expect(first.modelPools.map((pool) => pool.accessGrantId)).toEqual([null, "grant-a"]);
+      expect(second.modelPools.map((pool) => pool.accessGrantId)).toEqual([null, "grant-b"]);
     });
 
     it("intersects ALLOWLIST entries with current visibility", async () => {
@@ -262,7 +303,7 @@ describe("modelApiTokenAccess", () => {
       db.discoveredModel.findMany.mockResolvedValue([]);
       db.modelPool.findMany.mockResolvedValue([]);
       db.poolGrant.findMany
-        .mockResolvedValueOnce([{ ModelPool: grantedPool }])
+        .mockResolvedValueOnce([{ id: "grant-before-removal", ModelPool: grantedPool }])
         .mockResolvedValueOnce([]);
       db.modelApiTokenAllowlistEntry.findMany.mockResolvedValue([
         {
@@ -296,7 +337,9 @@ describe("modelApiTokenAccess", () => {
 
       db.discoveredModel.findMany.mockResolvedValue([]);
       db.modelPool.findMany.mockResolvedValue([]);
-      db.poolGrant.findMany.mockResolvedValue([{ ModelPool: renamedGrantedPool }]);
+      db.poolGrant.findMany.mockResolvedValue([
+        { id: "renamed-grant", ModelPool: renamedGrantedPool },
+      ]);
       db.modelApiTokenAllowlistEntry.findMany.mockResolvedValue([
         {
           target: "MODEL_POOL",
@@ -316,6 +359,7 @@ describe("modelApiTokenAccess", () => {
           id: "granted-pool-id",
           poolSlug: "renamed-shared",
           modelId: poolModelId({ userSlug: "team-a", poolSlug: "renamed-shared" }),
+          accessGrantId: "renamed-grant",
         }),
       ]);
     });

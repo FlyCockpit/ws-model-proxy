@@ -25,6 +25,7 @@ const db = prisma as unknown as {
     updateMany: MockInstance;
   };
   poolMember: { updateMany: MockInstance };
+  executionTarget: { upsert: MockInstance };
 };
 
 const identity: CliWebsocketIdentity = {
@@ -93,6 +94,7 @@ describe("capability override origin", () => {
     db.discoveredModel.upsert.mockResolvedValue({ id: "model-id" });
     db.discoveredModel.updateMany.mockResolvedValue({ count: 0 });
     db.poolMember.updateMany.mockResolvedValue({ count: 0 });
+    db.executionTarget.upsert.mockResolvedValue({ id: "execution-target-id" });
   });
 
   it("treats only dashboard origin as protected", () => {
@@ -125,6 +127,16 @@ describe("capability override origin", () => {
         }),
       }),
     );
+    expect(db.executionTarget.upsert).toHaveBeenCalledWith({
+      where: { discoveredModelId: "model-id" },
+      update: { userId: "user-id", kind: "DISCOVERED_MODEL" },
+      create: {
+        userId: "user-id",
+        kind: "DISCOVERED_MODEL",
+        discoveredModelId: "model-id",
+      },
+      select: { id: true },
+    });
   });
 
   it("preserves a dashboard-authored override when the CLI inherits", async () => {

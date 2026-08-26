@@ -30,7 +30,7 @@ export function relayFailureHttpStatus(failure: RelayFailure): number {
   if (failure === "not_found") return 404;
   if (failure === "protocol_error") return 502;
   if (failure === "rate_limited") return 429;
-  if (failure === "request_too_large") return 429;
+  if (failure === "request_too_large") return 413;
   if (failure === "timeout") return 504;
   if (failure === "unsupported_capability") return 400;
   if (failure === "upstream_4xx") return 400;
@@ -66,7 +66,9 @@ function openAiFailureResponse(failure: RelayFailure, message = relayFailureMess
             ? "authentication_error"
             : failure === "rate_limited"
               ? "rate_limit_error"
-              : "api_error",
+              : failure === "request_too_large"
+                ? "invalid_request_error"
+                : "api_error",
         code: failure,
       }),
     ),

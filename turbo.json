@@ -59,7 +59,15 @@
       "cache": false
     },
     "db:validate": {
-      "inputs": ["prisma/schema/**/*.prisma", "prisma.config.ts"]
+      "passThroughEnv": ["SCHEMA_VALIDATION_DATABASE_URL"],
+      "inputs": [
+        "prisma/schema/**/*.prisma",
+        "prisma/schema-hardening.sql",
+        "../../scripts/docker-entrypoint.sh",
+        "../../scripts/test-docker-entrypoint-schema.sh",
+        "scripts/verify-schema-hardening.mjs",
+        "prisma.config.ts"
+      ]
     },
     "db:studio": {
       "cache": false,

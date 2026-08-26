@@ -1,0 +1,92 @@
+{
+  "source": "WSMP provider-independent capability inventory v3, 2026-08-24",
+  "valid": [
+    {
+      "version": 3,
+      "protocol": "anthropic-compatible",
+      "surfaces": {
+        "anthropicMessages": {
+          "source": "declared",
+          "confidence": "exact",
+          "supported": true,
+          "streaming": true,
+          "inputImages": true,
+          "outputImages": false,
+          "inputAudio": false,
+          "outputAudio": false,
+          "inputVideo": false,
+          "outputVideo": false,
+          "protocolVersion": "2023-06-01"
+        }
+      },
+      "source": "declared",
+      "confidence": "exact"
+    },
+    {
+      "version": 3,
+      "protocol": "openai-compatible",
+      "surfaces": {
+        "openaiResponses": {
+          "source": "declared",
+          "confidence": "exact",
+          "supported": true,
+          "inputImages": true,
+          "outputImages": true,
+          "responsesLifecycle": {
+            "statefulFollowUps": true,
+            "retrieve": true,
+            "delete": true,
+            "cancel": true,
+            "listInputItems": true,
+            "countTokens": true,
+            "compact": true
+          }
+        }
+      }
+    }
+  ],
+  "invalid": [
+    { "version": 3, "protocol": "anthropic-compatible" },
+    { "version": 3, "protocol": "anthropic-compatible", "surfaces": {}, "source": "guess" },
+    { "version": 3, "protocol": "anthropic-compatible", "surfaces": {}, "confidence": "maybe" },
+    { "version": 1, "protocol": "anthropic-compatible" },
+    { "version": 2, "protocol": "anthropic-compatible" },
+    {
+      "version": 3,
+      "protocol": "openai-compatible",
+      "surfaces": {
+        "openaiResponses": {
+          "source": "declared",
+          "confidence": "exact",
+          "supported": true,
+          "stateful": true
+        }
+      }
+    },
+    {
+      "version": 3,
+      "protocol": "openai-compatible",
+      "surfaces": {
+        "openaiChatCompletions": {
+          "source": "declared",
+          "confidence": "exact",
+          "supported": true,
+          "images": true
+        }
+      }
+    },
+    {
+      "version": 3,
+      "protocol": "openai-compatible",
+      "surfaces": {
+        "openaiResponses": {
+          "source": "declared",
+          "confidence": "exact",
+          "supported": true,
+          "countTokens": true,
+          "responsesLifecycle": { "countTokens": true }
+        }
+      }
+    }
+  ]
+}

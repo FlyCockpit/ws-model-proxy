@@ -23,13 +23,26 @@
     "./lib/openai-compatible-capabilities": {
       "default": "./src/lib/openai-compatible-capabilities.ts"
     },
+    "./lib/surface-capabilities": {
+      "default": "./src/lib/surface-capabilities.ts"
+    },
+    "./lib/provider-credential-crypto": {
+      "default": "./src/lib/provider-credential-crypto.ts"
+    },
+    "./lib/provider-egress": {
+      "default": "./src/lib/provider-egress.ts"
+    },
+    "./lib/provider-protocol": {
+      "default": "./src/lib/provider-protocol.ts"
+    },
     "./routers/index": {
       "default": "./src/routers/index.ts"
     }
   },
   "scripts": {
     "check-types": "tsc -p tsconfig.check-types.json --noEmit",
-    "test": "vitest run --passWithNoTests"
+    "test": "vitest run --passWithNoTests",
+    "test:postgres": "vitest run --maxWorkers=1 --no-file-parallelism src/lib/capacity-policy-races.postgres.integration.test.ts src/routers/forwarder-management.postgres.integration.test.ts"
   },
   "dependencies": {
     "@orpc/client": "catalog:",

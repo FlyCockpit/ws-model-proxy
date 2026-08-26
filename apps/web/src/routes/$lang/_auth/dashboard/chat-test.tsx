@@ -77,7 +77,11 @@ type ModelOption = {
   kind: "DIRECT_MODEL" | "MODEL_POOL";
   attachmentModalities: AttachmentModalities;
   maxAttachmentBytes: number | null;
+  compatibility?: VisibleModels["modelPools"][number]["compatibility"];
 };
+type ChatTestRoutingMode = "PREFER_NATIVE" | "REQUIRE_NATIVE" | "REQUIRE_ADAPTED";
+type ChatTestSurface = "OPENAI_CHAT_COMPLETIONS" | "OPENAI_RESPONSES" | "ANTHROPIC_MESSAGES";
+type ChatTestSurfaceSelection = "PREFERRED" | ChatTestSurface;
 type ChatRole = "user" | "assistant";
 type ChatMessageStatus = "ready" | "streaming" | "error" | "stopped";
 // Attached media stored on a user message. An attachment is EITHER embedded as
@@ -229,6 +233,7 @@ function modelOptions(visibleModels: VisibleModels | undefined): ModelOption[] {
       kind: pool.target,
       attachmentModalities: pool.attachmentModalities,
       maxAttachmentBytes: pool.maxAttachmentBytes,
+      compatibility: pool.compatibility,
     })),
   ];
 }
@@ -559,6 +564,8 @@ async function signMediaUrls(ids: string[]): Promise<SignMediaResult> {
 async function streamChatCompletion({
   model,
   messages,
+  routingMode,
+  surface,
   signal,
   onDelta,
   onTransformDebug,
@@ -566,16 +573,71 @@ async function streamChatCompletion({
 }: {
   model: string;
   messages: RelayChatMessage[];
+  routingMode: ChatTestRoutingMode;
+  surface: ChatTestSurface;
   signal: AbortSignal;
   onDelta: (delta: string) => void;
   onTransformDebug?: (debug: TransformDebug) => void;
   fallbackErrorMessage: string;
 }): Promise<ChatTimingMetrics> {
   const startedAt = performance.now();
+  if (surface !== "OPENAI_CHAT_COMPLETIONS") {
+    const isResponses = surface === "OPENAI_RESPONSES";
+    const response = await fetch(
+      `${env.VITE_SERVER_URL}/api/internal/chat-test/${isResponses ? "responses" : "messages"}`,
+      {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "content-type": "application/json",
+          "x-wsmp-chat-test-routing-mode": routingMode,
+          ...(isResponses ? {} : { "anthropic-version": "2023-06-01" }),
+        },
+        body: JSON.stringify(
+          isResponses
+            ? { model, input: messages, stream: false, store: false }
+            : {
+                model,
+                messages: messages.filter((message) => message.role !== "system"),
+                system: messages.find((message) => message.role === "system")?.content,
+                max_tokens: 1024,
+                stream: false,
+              },
+        ),
+        signal,
+      },
+    );
+    if (!response.ok) throw new Error(await readErrorMessage(response, fallbackErrorMessage));
+    const payload = (await response.json()) as Record<string, unknown>;
+    const text = isResponses
+      ? Array.isArray(payload.output)
+        ? payload.output
+            .flatMap((item) =>
+              item &&
+              typeof item === "object" &&
+              Array.isArray((item as { content?: unknown }).content)
+                ? (item as { content: Array<{ text?: unknown }> }).content
+                : [],
+            )
+            .flatMap((item) => (typeof item.text === "string" ? [item.text] : []))
+            .join("")
+        : ""
+      : Array.isArray(payload.content)
+        ? (payload.content as Array<{ text?: unknown }>)
+            .flatMap((item) => (typeof item.text === "string" ? [item.text] : []))
+            .join("")
+        : "";
+    if (!text) throw new Error(fallbackErrorMessage);
+    onDelta(text);
+    return { ttftMs: performance.now() - startedAt };
+  }
   const response = await fetch(`${env.VITE_SERVER_URL}/api/internal/chat-test/chat/completions`, {
     method: "POST",
     credentials: "include",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      "x-wsmp-chat-test-routing-mode": routingMode,
+    },
     body: JSON.stringify({
       model,
       messages,
@@ -682,6 +744,8 @@ function ChatTestPage() {
   const mediaEnabled = mediaConfig?.enabled ?? false;
   const mediaMaxUploadBytes = mediaConfig?.maxUploadBytes ?? 0;
   const [selectedModelId, setSelectedModelId] = useState("");
+  const [routingMode, setRoutingMode] = useState<ChatTestRoutingMode>("PREFER_NATIVE");
+  const [surfaceSelection, setSurfaceSelection] = useState<ChatTestSurfaceSelection>("PREFERRED");
   const [draft, setDraft] = useState("");
   const [systemPrompt, setSystemPrompt] = useState("");
   // Collapsed by default so the mobile transcript keeps most of the viewport;
@@ -712,6 +776,17 @@ function ChatTestPage() {
     ? selectedModelId
     : (options[0]?.modelId ?? "");
   const selectedModel = options.find((option) => option.modelId === effectiveModelId);
+  const recommendedSurface = selectedModel?.compatibility?.recommendedSurface;
+  const effectiveSurface: ChatTestSurface | null =
+    selectedModel?.kind === "DIRECT_MODEL"
+      ? "OPENAI_CHAT_COMPLETIONS"
+      : surfaceSelection === "PREFERRED"
+        ? recommendedSurface === "OPENAI_CHAT_COMPLETIONS" ||
+          recommendedSurface === "OPENAI_RESPONSES" ||
+          recommendedSurface === "ANTHROPIC_MESSAGES"
+          ? recommendedSurface
+          : null
+        : surfaceSelection;
   const attachmentMaxBytes = Math.min(
     mediaConfig && mediaConfig.maxAttachmentBytes > 0
       ? mediaConfig.maxAttachmentBytes
@@ -736,6 +811,7 @@ function ChatTestPage() {
   const canSend =
     (draft.trim().length > 0 || attachments.length > 0) &&
     effectiveModelId.length > 0 &&
+    effectiveSurface !== null &&
     !isStreaming &&
     !isProcessingImages &&
     !isPreparingSend;
@@ -755,6 +831,10 @@ function ChatTestPage() {
         nextModel?.maxAttachmentBytes ?? Number.POSITIVE_INFINITY,
       );
       setSelectedModelId(modelId);
+      if (nextModel?.kind === "DIRECT_MODEL") {
+        setSurfaceSelection("PREFERRED");
+        setRoutingMode("PREFER_NATIVE");
+      }
       const retained = attachments.filter(
         (attachment) =>
           nextModalities[attachment.modality] && attachment.sizeBytes <= nextAttachmentMaxBytes,
@@ -1113,6 +1193,8 @@ function ChatTestPage() {
         const metrics = await streamChatCompletion({
           model: modelId,
           messages: relayInput,
+          routingMode,
+          surface: effectiveSurface ?? "OPENAI_CHAT_COMPLETIONS",
           signal: controller.signal,
           fallbackErrorMessage: t("dashboard:chatTest.errors.streamFailed"),
           onDelta: (delta) => {
@@ -1154,7 +1236,7 @@ function ChatTestPage() {
         scroll.markContentChanged();
       }
     },
-    [scroll, t, updateAssistant],
+    [effectiveSurface, routingMode, scroll, t, updateAssistant],
   );
 
   // Flag attachments whose media id came back invalid/expired from /sign, both
@@ -1437,13 +1519,71 @@ function ChatTestPage() {
             </p>
           ) : null}
         </div>
-        <div className="flex min-w-0 items-start gap-2">
+        <div className="flex min-w-0 flex-wrap items-start justify-end gap-2">
           <ModelPicker
             options={options}
             value={effectiveModelId}
             onValueChange={handleModelChange}
             disabled={isStreaming || isPreparingSend}
           />
+          <div className="min-w-[13rem] max-w-full space-y-1">
+            <Label htmlFor="chat-test-surface" className="sr-only">
+              {t("dashboard:chatTest.surface.label")}
+            </Label>
+            <select
+              id="chat-test-surface"
+              className="h-11 w-full rounded-md border bg-background px-3 text-sm"
+              value={surfaceSelection}
+              disabled={isStreaming || isPreparingSend || selectedModel?.kind !== "MODEL_POOL"}
+              aria-invalid={surfaceSelection === "PREFERRED" && effectiveSurface === null}
+              onChange={(event) =>
+                setSurfaceSelection(event.target.value as ChatTestSurfaceSelection)
+              }
+            >
+              <option value="PREFERRED">{t("dashboard:chatTest.surface.PREFERRED")}</option>
+              <option value="OPENAI_CHAT_COMPLETIONS">
+                {t("dashboard:chatTest.surface.OPENAI_CHAT_COMPLETIONS")}
+              </option>
+              <option value="OPENAI_RESPONSES">
+                {t("dashboard:chatTest.surface.OPENAI_RESPONSES")}
+              </option>
+              <option value="ANTHROPIC_MESSAGES">
+                {t("dashboard:chatTest.surface.ANTHROPIC_MESSAGES")}
+              </option>
+            </select>
+            <p className="text-xs text-muted-foreground">
+              {surfaceSelection === "PREFERRED" && recommendedSurface
+                ? t("dashboard:chatTest.surface.preferredHelp", { surface: recommendedSurface })
+                : t("dashboard:chatTest.surface.explicitHelp")}
+            </p>
+          </div>
+          <div className="min-w-[13rem] max-w-full space-y-1">
+            <Label htmlFor="chat-test-routing-mode" className="sr-only">
+              {t("dashboard:chatTest.routingMode.label")}
+            </Label>
+            <select
+              id="chat-test-routing-mode"
+              className="h-11 w-full rounded-md border bg-background px-3 text-sm"
+              value={routingMode}
+              disabled={isStreaming || isPreparingSend || selectedModel?.kind !== "MODEL_POOL"}
+              onChange={(event) => setRoutingMode(event.target.value as ChatTestRoutingMode)}
+            >
+              <option value="PREFER_NATIVE">
+                {t("dashboard:chatTest.routingMode.PREFER_NATIVE")}
+              </option>
+              <option value="REQUIRE_NATIVE">
+                {t("dashboard:chatTest.routingMode.REQUIRE_NATIVE")}
+              </option>
+              <option value="REQUIRE_ADAPTED">
+                {t("dashboard:chatTest.routingMode.REQUIRE_ADAPTED")}
+              </option>
+            </select>
+            <p className="text-xs text-muted-foreground">
+              {selectedModel?.kind === "MODEL_POOL"
+                ? t("dashboard:chatTest.routingMode.help")
+                : t("dashboard:chatTest.routingMode.directHelp")}
+            </p>
+          </div>
           <Button
             type="button"
             variant="outline"

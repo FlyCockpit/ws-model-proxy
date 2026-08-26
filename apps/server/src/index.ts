@@ -42,6 +42,8 @@ import {
   createMediaSignHandler,
   createMediaUploadHandler,
 } from "./media/routes.js";
+import { startCacheAffinityCleanup } from "./model-api/cache-affinity-runtime.js";
+import { createProductionCapacityRuntime } from "./model-api/capacity/production-runtime.js";
 import { createChatTestRoutes } from "./model-api/chat-test.js";
 import {
   createModelApiFileGetHandler,
@@ -50,6 +52,13 @@ import {
 import { MODEL_API_MAX_REQUEST_BODY_BYTES } from "./model-api/limits.js";
 import { openAiErrorBody } from "./model-api/openai-errors.js";
 import { createPoolMemberTestRoutes } from "./model-api/pool-member-test.js";
+import {
+  providerAttemptExpiryEnabled,
+  startProviderAttemptExpiry,
+} from "./model-api/provider-attempt-lifecycle.js";
+import { repairExpiredProviderBudgets } from "./model-api/provider-budget.js";
+import { startProviderBudgetRepair } from "./model-api/provider-budget-runtime.js";
+import { startRelayTelemetryRecovery } from "./model-api/relay-telemetry-recovery.js";
 import { createModelApiRoutes } from "./model-api/routes.js";
 import { transcriptionContentLengthGuard } from "./model-api/transcription-body-guard.js";
 import {
@@ -136,12 +145,12 @@ app.use(
         JSON.stringify(
           openAiErrorBody({
             message: "Model API request body is too large.",
-            type: "rate_limit_error",
+            type: "invalid_request_error",
             code: "request_too_large",
           }),
         ),
         {
-          status: 429,
+          status: 413,
           headers: { "content-type": "application/json; charset=utf-8" },
         },
       ),
@@ -167,12 +176,12 @@ const generalModelApiBodyLimit = bodyLimit({
       JSON.stringify(
         openAiErrorBody({
           message: "Model API request body is too large.",
-          type: "rate_limit_error",
+          type: "invalid_request_error",
           code: "request_too_large",
         }),
       ),
       {
-        status: 429,
+        status: 413,
         headers: { "content-type": "application/json; charset=utf-8" },
       },
     ),
@@ -183,7 +192,15 @@ app.use("/v1/*", (c, next) => {
   }
   return generalModelApiBodyLimit(c, next);
 });
-app.route("/v1", createModelApiRoutes());
+const capacityLifecycle = env.MODEL_API_GLOBAL_CAPACITY_ENABLED
+  ? createProductionCapacityRuntime()
+  : undefined;
+app.route(
+  "/v1",
+  createModelApiRoutes({
+    capacityRuntime: capacityLifecycle?.runtime,
+  }),
+);
 
 // Same-origin guard for the cookie-authenticated media MUTATION routes (upload,
 // sign, admin purge/delete). These plain Hono routes have no oRPC-style custom
@@ -458,7 +475,12 @@ export const rpcHandler = new RPCHandler(appRouter, {
 });
 
 app.use("/*", async (c, next) => {
-  const context = await createContext({ context: c });
+  const context = await createContext({
+    context: c,
+    services: {
+      repairExpiredProviderBudgets: (scope) => repairExpiredProviderBudgets(new Date(), scope),
+    },
+  });
 
   const rpcResult = await rpcHandler.handle(c.req.raw, {
     prefix: "/rpc",
@@ -594,6 +616,14 @@ const server = serve(
 // bytes). No-op when media storage is not configured. Complements the lazy
 // delete-on-GET in media/routes.ts.
 const stopMediaCleanup = startMediaCleanup();
+const stopCacheAffinityCleanup = startCacheAffinityCleanup();
+const stopRelayTelemetryRecovery = startRelayTelemetryRecovery();
+const stopProviderBudgetRepair = startProviderBudgetRepair();
+const stopProviderAttemptExpiry = providerAttemptExpiryEnabled(
+  env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
+)
+  ? startProviderAttemptExpiry()
+  : undefined;
 
 // ---------------------------------------------------------------------------
 // Graceful shutdown — drain in-flight requests, then close dependencies
@@ -608,6 +638,11 @@ async function shutdown(signal: string) {
 
   // Stop the media cleanup timer so it can't fire mid-shutdown.
   stopMediaCleanup?.();
+  stopCacheAffinityCleanup();
+  stopRelayTelemetryRecovery();
+  stopProviderBudgetRepair();
+  stopProviderAttemptExpiry?.();
+  await capacityLifecycle?.close();
 
   // 1. Stop accepting new connections and drain in-flight requests.
   await new Promise<void>((resolve) => {

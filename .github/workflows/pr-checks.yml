@@ -304,7 +304,8 @@ jobs:
             '(migrate reset|migrate dev|migrate deploy|db push --force-reset|db drop|--accept-data-loss|DROP TABLE|DROP DATABASE|TRUNCATE|DELETE FROM[[:space:]]+[^;]+;)' \
             Dockerfile Dockerfile.dev package.json docker-compose*.yml scripts/ apps/ packages/ .github/workflows/ \
             | grep -v 'scripts/docker-entrypoint.sh:' \
-            | grep -v 'scripts/db-push-dangerous-local.sh:' \
+          | grep -v 'scripts/db-push-dangerous-local.sh:' \
+          | grep -v 'scripts/test-docker-entrypoint-schema.sh:' \
             | grep -v 'policy: bounded-delete' \
             | grep -v '.github/workflows/pr-checks.yml:' \
             | grep -v '/dist/' \
@@ -316,10 +317,30 @@ jobs:
   # ── Prisma schema validation ──────────────────────────────────────
 
   prisma-validate:
-    name: Prisma validate
+    name: PostgreSQL schema validation
     needs: setup
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: schema_validation
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d schema_validation"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      SCHEMA_VALIDATION_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/schema_validation
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/schema_validation
+      REQUIRE_POSTGRES_INTEGRATION: "1"
+      BETTER_AUTH_SECRET: w7Qp9Lm2Nx4Rv6Tk8Yc3Hu5Jd1Fs0ZaB
+      BETTER_AUTH_URL: http://localhost:3000
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
@@ -342,11 +363,25 @@ jobs:
             packages/db/prisma/generated
           key: workspace-${{ github.sha }}
 
-      - name: Validate schema
-        run: pnpm -F @ws-model-proxy/db exec prisma validate
+      - name: Validate schema and hardening against PostgreSQL
+        run: pnpm db:validate
 
-      - name: Check schema formatting
-        run: pnpm -F @ws-model-proxy/db exec prisma format --check
+      - name: Apply validation schema
+        env:
+          DATABASE_URL: ${{ env.SCHEMA_VALIDATION_DATABASE_URL }}
+        run: pnpm --filter @ws-model-proxy/db db:push
+
+      - name: Prove capacity admission PostgreSQL primitives
+        run: pnpm --filter server test:postgres
+
+      - name: Prove provider management and capacity policy races
+        run: pnpm --filter @ws-model-proxy/api test:postgres
+
+      - name: Prove provider attempt lifecycle recovery
+        run: pnpm --filter server exec vitest run src/model-api/provider-attempt-runtime.integration.test.ts
+
+      - name: Prove cache affinity concurrency and retention
+        run: pnpm --filter server exec vitest run src/model-api/cache-affinity.integration.test.ts
 
   # ── React Doctor (React health scan: hooks, a11y, perf, security) ─
 

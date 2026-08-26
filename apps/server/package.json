@@ -8,7 +8,8 @@
     "compile": "bun build --compile --minify --sourcemap --bytecode ./src/index.ts --outfile server",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.mjs",
-    "test": "vitest run --passWithNoTests"
+    "test": "vitest run --passWithNoTests",
+    "test:postgres": "vitest run --maxWorkers=1 --no-file-parallelism src/model-api/capacity/postgres-store.integration.test.ts src/model-api/capacity/postgres-process.integration.test.ts src/model-api/provider-route.integration.test.ts src/model-api/provider-budget.integration.test.ts"
   },
   "dependencies": {
     "@fastify/busboy": "catalog:",

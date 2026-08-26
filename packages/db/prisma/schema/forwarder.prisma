@@ -7,6 +7,116 @@ enum CliConnectionStatus {
 
 enum EndpointKind {
   OPENAI_COMPATIBLE
+  ANTHROPIC_COMPATIBLE
+}
+
+enum ProviderAccountStatus {
+  DISABLED
+  ACTIVE
+  DEGRADED
+  UNAVAILABLE
+}
+
+enum ProviderAuthType {
+  API_KEY
+  BEARER
+}
+
+enum ProviderCredentialStatus {
+  ACTIVE
+  REPLACED
+  REVOKED
+}
+
+enum ProviderHealthStatus {
+  UNKNOWN
+  HEALTHY
+  DEGRADED
+  UNAVAILABLE
+}
+
+enum ProviderAttemptState {
+  ACTIVE
+  COMPLETED
+  FAILED
+  CANCELLED
+  EXPIRED
+}
+
+enum BudgetLimitMode {
+  LIMITED
+  UNLIMITED
+}
+
+enum BudgetScopeType {
+  PROVIDER_ACCOUNT
+  POOL_PROVIDER_MODEL
+}
+
+enum BudgetMetric {
+  CONCURRENCY
+  TOKENS
+  SPEND
+}
+
+enum BudgetPeriod {
+  PER_ATTEMPT
+  UTC_DAY
+  UTC_MONTH
+  LIFETIME
+}
+
+enum BudgetReservationState {
+  RESERVED
+  RELEASED
+  SETTLED
+  EXPIRED
+}
+
+enum UsageCostConfidence {
+  REPORTED
+  CALCULATED
+  ESTIMATED
+}
+
+enum ProviderPricingStatus {
+  DRAFT
+  ACTIVE
+  RETIRED
+}
+
+enum ProviderAccountingRevisionKind {
+  SNAPSHOT
+  DELTA
+}
+
+enum ProviderAuditAction {
+  ACCOUNT_CREATED
+  ACCOUNT_UPDATED
+  ACCOUNT_DELETED
+  MODEL_CREATED
+  MODEL_UPDATED
+  MODEL_DELETED
+  CREDENTIAL_CREATED
+  CREDENTIAL_REPLACED
+  CREDENTIAL_REVOKED
+  CREDENTIAL_ROTATED
+  CREDENTIAL_TESTED
+  BUDGET_CREATED
+  BUDGET_UPDATED
+  BUDGET_ACTIVATED
+  BUDGET_DEACTIVATED
+  PRICING_CREATED
+  PRICING_UPDATED
+  PRICING_ACTIVATED
+  PRICING_RETIRED
+  PRICING_DELETED
+  ACCOUNTING_REPAIR_REQUESTED
+}
+
+enum ExecutionTargetKind {
+  DISCOVERED_MODEL
+  PROVIDER_MODEL
 }
 
 enum EndpointStatus {
@@ -53,6 +163,11 @@ enum PoolMemberRoutingStatus {
   DISABLED
 }
 
+enum PoolMemberTier {
+  PRIMARY
+  PUBLIC_OVERFLOW
+}
+
 enum PoolMemberFailureClass {
   TRANSPORT
   RELAY_TIMEOUT
@@ -84,6 +199,52 @@ enum RelayRequestStatus {
   SUCCEEDED
   FAILED
   CANCELED
+}
+
+enum CapacityCountStrategy {
+  TOKENIZER
+  TEMPLATE_AWARE
+  ENGINE_REPORTED
+  CONSERVATIVE_ESTIMATE
+}
+
+enum CapacityBorrowPolicy {
+  NEVER
+  WHEN_IDLE
+}
+
+enum CapacityLimitMode {
+  INHERIT
+  LIMITED
+  UNLIMITED
+}
+
+enum AdmissionSourceKind {
+  DIRECT
+  POOL
+}
+
+enum AdmissionRequestState {
+  WAITING
+  ADMITTED
+  CANCELLED
+  EXPIRED
+  TERMINAL
+}
+
+enum CapacityWaiterState {
+  WAITING
+  ADMITTED
+  CANCELLED
+  EXPIRED
+  INCOMPATIBLE
+}
+
+enum CapacityLeaseState {
+  ACTIVE
+  RELEASED
+  EXPIRED
+  RECLAIMED
 }
 
 model CliDevice {
@@ -225,60 +386,607 @@ model DiscoveredModel {
   ResponseStickinessSelections  ResponseStickinessRecord[]     @relation("ResponseStickinessSelectedModel")
   RequestedRelayRequests        RelayRequest[]                 @relation("RelayRequestRequestedModel")
   SelectedRelayRequests         RelayRequest[]                 @relation("RelayRequestSelectedModel")
+  ExecutionTarget               ExecutionTarget?
 
   @@unique([endpointId, upstreamModelId])
   @@unique([endpointId, encodedModelId])
+  @@unique([id, userId])
   @@index([userId])
   @@index([endpointId, slug])
   @@index([endpointId, lastSeenAt])
   @@map("discovered_model")
 }
 
+/// Dormant reusable public-provider configuration. Management APIs and egress
+/// remain feature-gated until credential, SSRF, admission, and budget controls
+/// are implemented.
+model ProviderAccount {
+  id                         String                       @id @default(cuid(2))
+  createdAt                  DateTime                     @default(now())
+  updatedAt                  DateTime                     @default(now()) @updatedAt
+  deletedAt                  DateTime?
+  userId                     String
+  providerType               String
+  providerVersion            String?
+  label                      String
+  baseUrl                    String
+  /// Canonical endpoint identity used by affinity keys; changes only with baseUrl.
+  endpointIdentity           String                       @default("")
+  endpointVersion            Int                          @default(1)
+  authType                   ProviderAuthType
+  status                     ProviderAccountStatus        @default(DISABLED)
+  enabled                    Boolean                      @default(false)
+  safeConfiguration          Json?
+  currentCredentialId        String?                      @unique
+  healthStatus               ProviderHealthStatus         @default(UNKNOWN)
+  healthCheckedAt            DateTime?
+  healthFailureCount         Int                          @default(0)
+  healthNextRetryAt          DateTime?
+  healthHalfOpenAt           DateTime?
+  /// Fenced owner of the live half-open probe. Both fields are null together.
+  healthHalfOpenAttemptId    String?
+  healthHalfOpenFencingToken BigInt?
+  /// Durable high-water mark; owner cleanup must never make an older probe authoritative again.
+  healthFencingWatermark     BigInt                       @default(0)
+  nextFencingToken           BigInt                       @default(0)
+  User                       User                         @relation("ProviderAccountOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ProviderModels             ProviderModel[]
+  Credentials                ProviderCredential[]         @relation("ProviderAccountCredentials")
+  CurrentCredential          ProviderCredential?          @relation("ProviderAccountCurrentCredential", fields: [currentCredentialId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  BudgetPolicies             ProviderBudgetPolicy[]
+  UsageLedger                ProviderUsageLedger[]
+  Attempts                   ProviderAttempt[]
+  PricingVersions            ProviderPricingVersion[]
+  AuditEvents                ProviderAuditEvent[]
+  AttemptEvents              PublicProviderAttemptEvent[]
+  ResponseStickinessRecords  ResponseStickinessRecord[]   @relation("ResponseStickinessProviderAccount")
+
+  @@unique([userId, label])
+  @@unique([id, userId])
+  @@unique([id, userId, endpointVersion])
+  @@index([userId, status])
+  @@map("provider_account")
+}
+
+model ProviderModel {
+  id                         String                       @id @default(cuid(2))
+  createdAt                  DateTime                     @default(now())
+  updatedAt                  DateTime                     @default(now()) @updatedAt
+  deletedAt                  DateTime?
+  userId                     String
+  providerAccountId          String
+  upstreamModelId            String
+  displayName                String?
+  capabilityMetadata         Json?
+  nativeCapabilities         Json?
+  contextWindow              Int?
+  maxOutputTokens            Int?
+  concurrencyLimit           Int?
+  pricingMetadata            Json?
+  pricingVersion             String?
+  healthStatus               ProviderHealthStatus         @default(UNKNOWN)
+  healthCheckedAt            DateTime?
+  healthFailureCount         Int                          @default(0)
+  healthNextRetryAt          DateTime?
+  healthHalfOpenAt           DateTime?
+  /// Fenced owner of the live half-open probe. Both fields are null together.
+  healthHalfOpenAttemptId    String?
+  healthHalfOpenFencingToken BigInt?
+  /// Durable high-water mark; owner cleanup must never make an older probe authoritative again.
+  healthFencingWatermark     BigInt                       @default(0)
+  enabled                    Boolean                      @default(false)
+  User                       User                         @relation("ProviderModelOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ProviderAccount            ProviderAccount              @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  ExecutionTarget            ExecutionTarget?
+  BudgetPolicies             ProviderBudgetPolicy[]
+  UsageLedger                ProviderUsageLedger[]
+  Attempts                   ProviderAttempt[]
+  PricingVersions            ProviderPricingVersion[]
+  AttemptEvents              PublicProviderAttemptEvent[]
+  ResponseStickinessRecords  ResponseStickinessRecord[]   @relation("ResponseStickinessProviderModel")
+
+  @@unique([providerAccountId, upstreamModelId])
+  @@unique([id, userId])
+  @@index([userId])
+  @@index([providerAccountId, enabled])
+  @@map("provider_model")
+}
+
+/// Recoverable provider secret encrypted with application-layer AES-256-GCM.
+/// Identity fields are immutable because they form the authenticated AAD.
+model ProviderCredential {
+  id                 String                      @id @default(cuid(2))
+  createdAt          DateTime                    @default(now())
+  userId             String
+  providerAccountId  String
+  credentialType     ProviderAuthType
+  aadVersion         Int                         @default(1)
+  algorithm          String                      @default("AES-256-GCM")
+  keyVersion         String
+  ciphertext         Bytes
+  nonce              Bytes
+  authTag            Bytes
+  displaySuffix      String
+  status             ProviderCredentialStatus    @default(ACTIVE)
+  replacedAt         DateTime?
+  replacedById       String?                     @unique
+  lastUsedAt         DateTime?
+  revokedAt          DateTime?
+  User               User                        @relation("ProviderCredentialOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ProviderAccount    ProviderAccount             @relation("ProviderAccountCredentials", fields: [providerAccountId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  CurrentForAccount  ProviderAccount?            @relation("ProviderAccountCurrentCredential")
+  ReplacedBy         ProviderCredential?         @relation("ProviderCredentialReplacement", fields: [replacedById, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  Replaces           ProviderCredential?         @relation("ProviderCredentialReplacement")
+  BudgetReservations ProviderBudgetReservation[]
+  UsageLedger        ProviderUsageLedger[]
+  Attempts           ProviderAttempt[]
+
+  @@unique([id, userId])
+  @@unique([replacedById, userId])
+  @@unique([nonce, keyVersion])
+  @@index([providerAccountId, status])
+  @@index([userId])
+  @@map("provider_credential")
+}
+
+model ProviderBudgetPolicy {
+  id                String                      @id @default(cuid(2))
+  createdAt         DateTime                    @default(now())
+  updatedAt         DateTime                    @default(now()) @updatedAt
+  userId            String
+  scopeType         BudgetScopeType
+  providerAccountId String
+  poolId            String?
+  providerModelId   String?
+  version           Int                         @default(1)
+  active            Boolean                     @default(false)
+  activatedAt       DateTime?
+  deactivatedAt     DateTime?
+  User              User                        @relation("ProviderBudgetPolicyOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ProviderAccount   ProviderAccount             @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  Pool              ModelPool?                  @relation(fields: [poolId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  ProviderModel     ProviderModel?              @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  Rules             ProviderBudgetRule[]
+  Reservations      ProviderBudgetReservation[]
+
+  @@unique([id, userId])
+  @@unique([userId, scopeType, providerAccountId, poolId, providerModelId, version])
+  @@index([userId, active])
+  @@map("provider_budget_policy")
+}
+
+model ProviderBudgetRule {
+  id           String                      @id @default(cuid(2))
+  createdAt    DateTime                    @default(now())
+  policyId     String
+  metric       BudgetMetric
+  period       BudgetPeriod
+  mode         BudgetLimitMode
+  limitValue   Decimal?                    @db.Decimal(30, 9)
+  currency     String?
+  Policy       ProviderBudgetPolicy        @relation(fields: [policyId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Reservations ProviderBudgetReservation[]
+
+  @@unique([policyId, metric, period])
+  @@map("provider_budget_rule")
+}
+
+model ProviderBudgetReservation {
+  id                String                     @id @default(cuid(2))
+  createdAt         DateTime                   @default(now())
+  settledAt         DateTime?
+  expiresAt         DateTime?
+  userId            String
+  providerAccountId String
+  providerModelId   String
+  poolId            String?
+  policyId          String
+  ruleId            String
+  credentialId      String?
+  requestId         String
+  attemptId         String
+  fencingToken      BigInt
+  metric            BudgetMetric
+  period            BudgetPeriod
+  policyVersion     Int
+  utcBasis          String                     @default("UTC")
+  windowStart       DateTime?
+  windowEnd         DateTime?
+  reservedValue     Decimal                    @db.Decimal(30, 9)
+  liabilityTokens   BigInt?
+  liabilitySpend    Decimal?                   @db.Decimal(30, 9)
+  liabilityCurrency String?
+  settledValue      Decimal?                   @db.Decimal(30, 9)
+  currency          String?
+  pricingVersion    String?
+  accountingVersion String
+  state             BudgetReservationState     @default(RESERVED)
+  Policy            ProviderBudgetPolicy       @relation(fields: [policyId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  Rule              ProviderBudgetRule         @relation(fields: [ruleId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  Credential        ProviderCredential?        @relation(fields: [credentialId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  UsageLedger       ProviderUsageLedger[]
+  Settlements       ProviderBudgetSettlement[]
+
+  @@unique([policyId, ruleId, attemptId])
+  @@unique([id, userId])
+  @@index([userId, state, expiresAt])
+  @@index([policyId, ruleId, windowStart, windowEnd])
+  @@map("provider_budget_reservation")
+}
+
+/// Durable identity and liability snapshot for every admitted provider attempt,
+/// including attempts for which every applicable rule is unlimited (or no
+/// policy is attached). This makes terminal and delayed reconciliation total.
+model ProviderAttempt {
+  id                String                       @id @default(cuid(2))
+  createdAt         DateTime                     @default(now())
+  userId            String
+  providerAccountId String
+  providerModelId   String
+  credentialId      String?
+  poolId            String?
+  requestId         String
+  attemptId         String
+  fencingToken      BigInt
+  state             ProviderAttemptState         @default(ACTIVE)
+  heartbeatAt       DateTime                     @default(now())
+  terminalAt        DateTime?
+  terminalReason    String?
+  expiresAt         DateTime
+  liabilityTokens   BigInt?
+  liabilitySpend    Decimal?                     @db.Decimal(30, 9)
+  liabilityCurrency String?
+  pricingVersion    String?
+  accountingVersion String
+  User              User                         @relation("ProviderAttemptOwner", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  ProviderAccount   ProviderAccount              @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  ProviderModel     ProviderModel                @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  Credential        ProviderCredential?          @relation(fields: [credentialId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  Events            PublicProviderAttemptEvent[]
+
+  @@unique([attemptId, fencingToken])
+  @@index([userId, expiresAt])
+  @@index([state, heartbeatAt, expiresAt])
+  @@map("provider_attempt")
+}
+
+/// Immutable, prompt-free execution telemetry. Database hardening makes this
+/// append-only just like the usage ledger.
+model PublicProviderAttemptEvent {
+  id                     String           @id @default(cuid(2))
+  createdAt              DateTime         @default(now())
+  userId                 String
+  providerAccountId      String
+  providerModelId        String
+  providerAttemptId      String?
+  requestId              String
+  attemptId              String
+  fencingToken           BigInt?
+  eventType              String
+  reason                 String?
+  requestedSurface       String?
+  nativeSurface          String?
+  adapterMode            String?
+  adapterVersion         String?
+  poolId                 String?
+  poolMemberId           String?
+  executionTargetId      String?
+  memberTier             String?
+  triggerReason          String?
+  affinityOutcome        String?
+  contextCountMethod     String?
+  contextCountConfidence String?
+  waitDurationMs         Int?
+  reservationId          String?
+  reservationIds         Json?
+  contextTokens          BigInt?
+  firstClientByteAt      DateTime?
+  streamCommitted        Boolean?
+  terminalState          String?
+  usage                  Json?
+  metadata               Json?
+  User                   User             @relation("PublicProviderAttemptEventOwner", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  ProviderAccount        ProviderAccount  @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  ProviderModel          ProviderModel    @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  ProviderAttempt        ProviderAttempt? @relation(fields: [providerAttemptId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([attemptId, fencingToken, createdAt])
+  @@map("public_provider_attempt_event")
+}
+
+/// Append-only accounting row. Application APIs expose creation only; database
+/// hardening prevents UPDATE/DELETE outside the schema maintenance role.
+model ProviderUsageLedger {
+  id                           String                         @id @default(cuid(2))
+  createdAt                    DateTime                       @default(now())
+  userId                       String
+  providerAccountId            String
+  providerModelId              String
+  credentialId                 String?
+  reservationId                String?
+  poolId                       String?
+  requestId                    String
+  attemptId                    String
+  fencingToken                 BigInt
+  inputTokens                  BigInt?
+  outputTokens                 BigInt?
+  cacheReadTokens              BigInt?
+  cacheWriteTokens             BigInt?
+  reasoningTokens              BigInt?
+  toolTokens                   BigInt?
+  additionalBillableTokens     BigInt?
+  authoritativeBillableTokens  BigInt?
+  reportedTotalTokens          BigInt?
+  billableTotal                BigInt?
+  categoriesComplete           Boolean?
+  /// Whether the provider transport reached its terminal usage boundary.
+  observationComplete          Boolean?
+  rawUsage                     Json?
+  reportedCost                 Decimal?                       @db.Decimal(30, 9)
+  reportedCostCurrency         String?
+  reportedCostPricingVersion   String?
+  reportedCostSource           String?
+  calculatedCost               Decimal?                       @db.Decimal(30, 9)
+  calculatedCostCurrency       String?
+  calculatedCostPricingVersion String?
+  calculatedCostSource         String?
+  settledCost                  Decimal?                       @db.Decimal(30, 9)
+  currency                     String?
+  pricingVersion               String?
+  /// Normalized accounting contract claimed by the upstream usage observation.
+  /// This is distinct from accountingVersion, which is the admitted settlement anchor.
+  sourceUsageAccountingVersion String?
+  accountingVersion            String
+  sourceVersion                String                         @default("terminal-v1")
+  revisionSequence             BigInt                         @default(1)
+  revisionKind                 ProviderAccountingRevisionKind @default(SNAPSHOT)
+  payloadHash                  String                         @default("legacy-pending")
+  usageSource                  String                         @default("terminal")
+  usageKnown                   Boolean
+  costKnown                    Boolean
+  terminalReason               String
+  confidence                   UsageCostConfidence
+  User                         User                           @relation("ProviderUsageLedgerOwner", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  ProviderAccount              ProviderAccount                @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  ProviderModel                ProviderModel                  @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  Credential                   ProviderCredential?            @relation(fields: [credentialId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  Reservation                  ProviderBudgetReservation?     @relation(fields: [reservationId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([attemptId, fencingToken, sourceVersion])
+  @@index([userId, createdAt])
+  @@index([providerAccountId, createdAt])
+  @@map("provider_usage_ledger")
+}
+
+/// Immutable provider price schedule referenced by usage rows via version.
+model ProviderPricingVersion {
+  id                String                @id @default(cuid(2))
+  createdAt         DateTime              @default(now())
+  userId            String
+  providerAccountId String
+  providerModelId   String
+  version           String
+  currency          String
+  status            ProviderPricingStatus @default(ACTIVE)
+  accountingVersion String                @default("provider-billable-v1")
+  confidence        UsageCostConfidence   @default(ESTIMATED)
+  pricing           Json
+  chargeRules       Json                  @default("{}")
+  effectiveAt       DateTime
+  activatedAt       DateTime?             @default(now())
+  retiredAt         DateTime?
+  ProviderAccount   ProviderAccount       @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  ProviderModel     ProviderModel         @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([providerModelId, version])
+  @@index([providerModelId, status, effectiveAt, retiredAt])
+  @@index([userId, effectiveAt])
+  @@map("provider_pricing_version")
+}
+
+/// Append-only reconciliation entry. The unique fencing identity makes
+/// retries idempotent without rewriting historical reservations.
+model ProviderBudgetSettlement {
+  id                           String                         @id @default(cuid(2))
+  createdAt                    DateTime                       @default(now())
+  userId                       String
+  providerAccountId            String                         @default("")
+  providerModelId              String                         @default("")
+  credentialId                 String?
+  poolId                       String?
+  requestId                    String                         @default("")
+  reservationId                String
+  attemptId                    String
+  fencingToken                 BigInt
+  sourceVersion                String                         @default("terminal-v1")
+  revisionSequence             BigInt                         @default(1)
+  revisionKind                 ProviderAccountingRevisionKind @default(SNAPSHOT)
+  payloadHash                  String                         @default("legacy-pending")
+  sourceUsageAccountingVersion String?
+  accountingVersion            String                         @default("")
+  pricingVersion               String?
+  settledValue                 Decimal                        @db.Decimal(30, 9)
+  currency                     String?
+  confidence                   UsageCostConfidence
+  reason                       String
+  Reservation                  ProviderBudgetReservation      @relation(fields: [reservationId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([reservationId, attemptId, fencingToken, sourceVersion])
+  @@index([userId, createdAt])
+  @@map("provider_budget_settlement")
+}
+
+model ProviderAuditEvent {
+  id                String              @id @default(cuid(2))
+  createdAt         DateTime            @default(now())
+  userId            String
+  providerAccountId String?
+  action            ProviderAuditAction
+  subjectId         String
+  metadata          Json?
+  User              User                @relation("ProviderAuditEventOwner", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  ProviderAccount   ProviderAccount?    @relation(fields: [providerAccountId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("provider_audit_event")
+}
+
+/// Stable, owner-scoped identity for anything capable of executing inference.
+/// The named database CHECK installed by prisma/schema-hardening.sql enforces the
+/// kind/FK XOR that Prisma cannot express.
+model ExecutionTarget {
+  id                      String                        @id @default(cuid(2))
+  createdAt               DateTime                      @default(now())
+  updatedAt               DateTime                      @default(now()) @updatedAt
+  userId                  String
+  kind                    ExecutionTargetKind
+  discoveredModelId       String?                       @unique
+  providerModelId         String?                       @unique
+  inferenceCapacityId     String?
+  /// Direct requests participate in the same 0..31 scheduler as pool traffic.
+  directPriority          Int                           @default(16)
+  directConcurrencyLimit  Int?
+  directReservedSlots     Int                           @default(0)
+  directBorrowPolicy      CapacityBorrowPolicy          @default(WHEN_IDLE)
+  directWaitBudgetMs      Int?
+  directContextCeiling    Int?
+  directContextMargin     Int                           @default(0)
+  User                    User                          @relation("ExecutionTargetOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  DiscoveredModel         DiscoveredModel?              @relation(fields: [discoveredModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  ProviderModel           ProviderModel?                @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  InferenceCapacity       InferenceCapacity?            @relation(fields: [inferenceCapacityId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  PoolMembers             PoolMember[]
+  TokenAllowlistEntries   ModelApiTokenAllowlistEntry[]
+  StickinessTargets       ResponseStickinessRecord[]    @relation("ResponseStickinessTargetExecutionTarget")
+  StickinessSelections    ResponseStickinessRecord[]    @relation("ResponseStickinessSelectedExecutionTarget")
+  RequestedRelayRequests  RelayRequest[]                @relation("RelayRequestRequestedExecutionTarget")
+  SelectedRelayRequests   RelayRequest[]                @relation("RelayRequestSelectedExecutionTarget")
+  DirectAdmissionRequests AdmissionRequest[]            @relation("AdmissionRequestDirectTarget")
+  CapacityWaiters         CapacityWaiter[]
+  CapacityLeases          CapacityLease[]
+  CacheAffinityRecords    CacheAffinityRecord[]
+
+  @@unique([discoveredModelId, userId])
+  @@unique([providerModelId, userId])
+  @@unique([id, userId])
+  @@index([userId, kind])
+  @@index([inferenceCapacityId])
+  @@map("execution_target")
+}
+
 model ModelPool {
-  id                             String                        @id @default(cuid(2))
-  createdAt                      DateTime                      @default(now())
-  updatedAt                      DateTime                      @default(now()) @updatedAt
-  userId                         String
-  slug                           String
-  name                           String
-  description                    String?
+  id                              String                        @id @default(cuid(2))
+  createdAt                       DateTime                      @default(now())
+  updatedAt                       DateTime                      @default(now()) @updatedAt
+  userId                          String
+  slug                            String
+  name                            String
+  description                     String?
   /// Optional OpenAI-compatible model used to turn media into text before the
   /// primary pool members run. Null = transformer disabled (default).
-  transformerDiscoveredModelId   String?
+  transformerDiscoveredModelId    String?
   /// Free-text system prompt for the transformer call. Null = built-in default.
-  transformerSystemPrompt        String?
+  transformerSystemPrompt         String?
   /// When true (default if transformer set), image_url parts are transformed.
-  transformerImages              Boolean                       @default(true)
+  transformerImages               Boolean                       @default(true)
   /// When true, input_audio / audio parts are transformed (v1 may no-op if unsupported).
-  transformerAudio               Boolean                       @default(false)
+  transformerAudio                Boolean                       @default(false)
   /// When true, video_url parts are transformed.
-  transformerVideo               Boolean                       @default(false)
+  transformerVideo                Boolean                       @default(false)
   /// Description cache policy. Default OFF so screenshot/PII text is not retained.
-  transformerCacheMode           PoolTransformerCacheMode      @default(OFF)
+  transformerCacheMode            PoolTransformerCacheMode      @default(OFF)
   /// When true, inject a size-capped name+description list of the primary request's tools.
-  transformerIncludePrimaryTools Boolean                       @default(false)
-  transformerMaxTools            Int                           @default(32)
-  transformerMaxToolChars        Int                           @default(8000)
+  transformerIncludePrimaryTools  Boolean                       @default(false)
+  transformerMaxTools             Int                           @default(32)
+  transformerMaxToolChars         Int                           @default(8000)
   /// Per-hop transformer timeout. Null uses the server default.
-  transformerTimeoutMs           Int?
+  transformerTimeoutMs            Int?
   /// Max media parts across all transform jobs in one request. Null uses the server default.
-  transformerMaxAssets           Int?
+  transformerMaxAssets            Int?
   /// Optional per-pool attachment cap. Null inherits the global attachment cap.
-  maxAttachmentBytes             Int?
+  maxAttachmentBytes              Int?
   /// Permit unknown-capability members only as fallback for basic, non-streaming transcription.
-  optimisticBasicTranscription   Boolean                       @default(false)
-  User                           User                          @relation("ModelPoolOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  TransformerDiscoveredModel     DiscoveredModel?              @relation("ModelPoolTransformer", fields: [transformerDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-  PoolMembers                    PoolMember[]
-  PoolGrants                     PoolGrant[]
-  ModelApiTokenAllowlistEntries  ModelApiTokenAllowlistEntry[]
-  ResponseStickinessRecords      ResponseStickinessRecord[]
-  RelayRequests                  RelayRequest[]                @relation("RelayRequestRequestedPool")
+  optimisticBasicTranscription    Boolean                       @default(false)
+  /// Permit the documented strict-subset translation between modern model APIs.
+  protocolAdaptationEnabled       Boolean                       @default(false)
+  /// Explicit owner opt-in. Provider members are inert unless both this and
+  /// publicEgressAcknowledged are true and the deployment gate is enabled.
+  publicEgressEnabled             Boolean                       @default(false)
+  publicEgressAcknowledged        Boolean                       @default(false)
+  /// Permit developer instructions to collapse into the target protocol's system role.
+  allowLossyDeveloperRoleCollapse Boolean                       @default(false)
+  /// Optional validated preferred API surface; null lets WSMP recommend one.
+  recommendedSurfaceOverride      String?
+  capacityPriority                Int                           @default(16)
+  capacityConcurrencyLimit        Int?
+  capacityReservedSlots           Int                           @default(0)
+  capacityBorrowPolicy            CapacityBorrowPolicy          @default(WHEN_IDLE)
+  capacityWaitBudgetMs            Int?
+  capacityContextCeiling          Int?
+  capacityContextMargin           Int                           @default(0)
+  /// Cache affinity is a routing hint only and never overrides compatibility,
+  /// capacity, health, privacy, or provider-budget constraints.
+  affinityEnabled                 Boolean                       @default(false)
+  affinityTtlSeconds              Int                           @default(3600)
+  affinityMaxRecords              Int                           @default(10000)
+  affinityPrefixWeight            Int                           @default(100)
+  affinityConversationWeight      Int                           @default(150)
+  affinityConfirmedCacheWeight    Int                           @default(250)
+  affinityLoadPenaltyWeight       Int                           @default(100)
+  User                            User                          @relation("ModelPoolOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  TransformerDiscoveredModel      DiscoveredModel?              @relation("ModelPoolTransformer", fields: [transformerDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  PoolMembers                     PoolMember[]
+  ProviderBudgetPolicies          ProviderBudgetPolicy[]
+  PoolGrants                      PoolGrant[]
+  ModelApiTokenAllowlistEntries   ModelApiTokenAllowlistEntry[]
+  ResponseStickinessRecords       ResponseStickinessRecord[]
+  RelayRequests                   RelayRequest[]                @relation("RelayRequestRequestedPool")
+  AdmissionRequests               AdmissionRequest[]
+  CapacityWaiters                 CapacityWaiter[]
+  CapacityLeases                  CapacityLease[]
+  CacheAffinityRecords            CacheAffinityRecord[]
 
   @@unique([userId, slug])
+  @@unique([id, userId])
   @@index([userId])
   @@index([transformerDiscoveredModelId])
   @@map("model_pool")
+}
+
+/// Prompt-free, optional cache-routing predictions. `prefixDigest` and
+/// `conversationDigest` are tenant-scoped, purpose-separated HMACs over
+/// canonical material. The source material is never persisted.
+model CacheAffinityRecord {
+  id                   String          @id @default(cuid(2))
+  createdAt            DateTime        @default(now())
+  lastUsedAt           DateTime        @default(now())
+  expiresAt            DateTime
+  userId               String
+  /// Requester tenant; may differ from userId for an explicitly granted pool.
+  tenantUserId         String?
+  poolId               String
+  executionTargetId    String
+  targetIdentity       String
+  digestVersion        Int             @default(3)
+  /// Stable execution/security binding, separate from request content and conversation identity.
+  bindingDigest        String?
+  prefixDigest         String?
+  conversationDigest   String?
+  prefixDepth          Int
+  estimatedTokens      Int?
+  engineCacheConfirmed Boolean         @default(false)
+  User                 User            @relation("CacheAffinityRecordOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  TenantUser           User?           @relation("CacheAffinityRecordTenant", fields: [tenantUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ModelPool            ModelPool       @relation(fields: [poolId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  ExecutionTarget      ExecutionTarget @relation(fields: [executionTargetId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([tenantUserId, poolId, executionTargetId, targetIdentity, bindingDigest, prefixDigest])
+  @@index([tenantUserId, poolId, prefixDigest, expiresAt])
+  @@index([tenantUserId, poolId, conversationDigest, expiresAt])
+  @@index([userId, poolId, expiresAt])
+  @@index([executionTargetId, expiresAt])
+  @@map("cache_affinity_record")
 }
 
 model PoolMember {
@@ -286,7 +994,22 @@ model PoolMember {
   createdAt                    DateTime                @default(now())
   updatedAt                    DateTime                @default(now()) @updatedAt
   poolId                       String
-  discoveredModelId            String
+  discoveredModelId            String?
+  executionTargetId            String?
+  tier                         PoolMemberTier          @default(PRIMARY)
+  /// Stable owner-defined order for PUBLIC_OVERFLOW targets. Null for primaries.
+  publicOrder                  Int?
+  /// Null inherits the owning pool policy.
+  capacityPriority             Int?
+  capacityConcurrencyMode      CapacityLimitMode       @default(INHERIT)
+  capacityConcurrencyLimit     Int?
+  capacityReservedSlots        Int?
+  capacityBorrowPolicy         CapacityBorrowPolicy?
+  capacityWaitBudgetMode       CapacityLimitMode       @default(INHERIT)
+  capacityWaitBudgetMs         Int?
+  capacityContextCeilingMode   CapacityLimitMode       @default(INHERIT)
+  capacityContextCeiling       Int?
+  capacityContextMargin        Int?
   weight                       Int                     @default(1)
   healthStatus                 PoolMemberHealthStatus  @default(UNKNOWN)
   routingStatus                PoolMemberRoutingStatus @default(ACTIVE)
@@ -297,25 +1020,180 @@ model PoolMember {
   halfOpenTrialStartedAt       DateTime?
   lastRoutedAt                 DateTime?
   ModelPool                    ModelPool               @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  DiscoveredModel              DiscoveredModel         @relation(fields: [discoveredModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  DiscoveredModel              DiscoveredModel?        @relation(fields: [discoveredModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ExecutionTarget              ExecutionTarget?        @relation(fields: [executionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  CapacityWaiters              CapacityWaiter[]
+  CapacityLeases               CapacityLease[]
+  RelayRequests                RelayRequest[]          @relation("RelayRequestSelectedPoolMember")
 
   @@unique([poolId, discoveredModelId])
+  @@unique([poolId, executionTargetId])
   @@index([discoveredModelId])
+  @@index([executionTargetId])
   @@index([poolId, routingStatus, healthStatus])
   @@index([healthStatus, nextRetryAt])
   @@map("pool_member")
 }
 
+/// Owner-scoped physical inference capacity shared by every execution target
+/// that points at the same runtime/cache identity. Scheduler state is durable
+/// so a restart cannot reset fairness credit.
+model InferenceCapacity {
+  id                   String                @id @default(cuid(2))
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @default(now()) @updatedAt
+  userId               String
+  label                String
+  hardConcurrencyLimit Int?
+  physicalMaxContext   Int?
+  countStrategy        CapacityCountStrategy @default(CONSERVATIVE_ESTIMATE)
+  /// Stable, application-computed fingerprint for the physical runtime tuple.
+  runtimeIdentityKey   String
+  runtimeModel         String
+  runtimeRevision      String?
+  tokenizer            String?
+  tokenizerVersion     String?
+  template             String?
+  templateVersion      String?
+  engine               String?
+  cacheNamespace       String?
+  schedulerCursor      Int                   @default(31)
+  schedulerDeficits    Json                  @default("[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]")
+  schedulerVersion     Int                   @default(1)
+  nextFencingToken     BigInt                @default(1)
+  User                 User                  @relation("InferenceCapacityOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ExecutionTargets     ExecutionTarget[]
+  CapacityWaiters      CapacityWaiter[]
+  CapacityLeases       CapacityLease[]
+
+  @@unique([userId, label])
+  @@unique([userId, runtimeIdentityKey])
+  @@unique([id, userId])
+  @@index([userId])
+  @@map("inference_capacity")
+}
+
+model AdmissionRequest {
+  id                      String                @id @default(cuid(2))
+  createdAt               DateTime              @default(now())
+  updatedAt               DateTime              @default(now()) @updatedAt
+  userId                  String
+  requestId               String
+  relayRequestId          String?
+  attemptId               String                @unique
+  sourceKind              AdmissionSourceKind
+  poolId                  String?
+  directExecutionTargetId String?
+  basePriority            Int
+  enqueueSequence         BigInt
+  enqueuedAt              DateTime              @default(now())
+  deadlineAt              DateTime?
+  connectionOwner         String
+  heartbeatAt             DateTime
+  state                   AdmissionRequestState @default(WAITING)
+  terminalAt              DateTime?
+  terminalReason          String?
+  User                    User                  @relation("AdmissionRequestOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ModelPool               ModelPool?            @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  DirectExecutionTarget   ExecutionTarget?      @relation("AdmissionRequestDirectTarget", fields: [directExecutionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Waiters                 CapacityWaiter[]
+  Lease                   CapacityLease?
+  RelayRequest            RelayRequest?         @relation(fields: [relayRequestId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@unique([userId, requestId, attemptId])
+  @@index([userId, state, deadlineAt])
+  @@index([state, heartbeatAt])
+  @@index([basePriority, enqueueSequence, id])
+  @@index([relayRequestId])
+  @@map("admission_request")
+}
+
+model CapacityWaiter {
+  id                          String               @id @default(cuid(2))
+  createdAt                   DateTime             @default(now())
+  updatedAt                   DateTime             @default(now()) @updatedAt
+  userId                      String
+  admissionRequestId          String
+  requestId                   String               @default("")
+  attemptId                   String               @default("")
+  enqueueSequence             BigInt               @default(0)
+  capacityId                  String
+  executionTargetId           String
+  poolId                      String?
+  poolMemberId                String?
+  candidateOrder              Int
+  deadlineAt                  DateTime?
+  effectivePriority           Int                  @default(16)
+  effectiveConcurrencyLimit   Int?
+  effectiveConcurrencyScope   String               @default("")
+  effectiveConcurrencyScopeId String               @default("")
+  effectiveReservedSlots      Int                  @default(0)
+  effectiveBorrowPolicy       CapacityBorrowPolicy @default(WHEN_IDLE)
+  state                       CapacityWaiterState  @default(WAITING)
+  stateChangedAt              DateTime             @default(now())
+  terminalReason              String?
+  AdmissionRequest            AdmissionRequest     @relation(fields: [admissionRequestId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  InferenceCapacity           InferenceCapacity    @relation(fields: [capacityId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  ExecutionTarget             ExecutionTarget      @relation(fields: [executionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ModelPool                   ModelPool?           @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  PoolMember                  PoolMember?          @relation(fields: [poolMemberId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([admissionRequestId, candidateOrder])
+  @@unique([attemptId, candidateOrder])
+  @@unique([admissionRequestId, capacityId, executionTargetId, poolMemberId])
+  @@index([capacityId, state, deadlineAt, candidateOrder])
+  @@index([admissionRequestId, state])
+  @@index([poolMemberId, state])
+  @@map("capacity_waiter")
+}
+
+model CapacityLease {
+  id                  String             @id @default(cuid(2))
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @default(now()) @updatedAt
+  userId              String
+  admissionRequestId  String             @unique
+  requestId           String
+  attemptId           String             @unique
+  capacityId          String
+  executionTargetId   String
+  poolId              String?
+  poolMemberId        String?
+  priority            Int
+  reservationClass    Int
+  borrowed            Boolean            @default(false)
+  fencingToken        BigInt
+  state               CapacityLeaseState @default(ACTIVE)
+  ownerServerInstance String
+  acquiredAt          DateTime           @default(now())
+  heartbeatAt         DateTime
+  expiresAt           DateTime
+  releasedAt          DateTime?
+  releaseReason       String?
+  AdmissionRequest    AdmissionRequest   @relation(fields: [admissionRequestId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  InferenceCapacity   InferenceCapacity  @relation(fields: [capacityId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
+  ExecutionTarget     ExecutionTarget    @relation(fields: [executionTargetId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  ModelPool           ModelPool?         @relation(fields: [poolId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  PoolMember          PoolMember?        @relation(fields: [poolMemberId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([capacityId, fencingToken])
+  @@index([capacityId, state, expiresAt])
+  @@index([ownerServerInstance, state, heartbeatAt])
+  @@index([poolMemberId, state])
+  @@map("capacity_lease")
+}
+
 model PoolGrant {
-  id            String    @id @default(cuid(2))
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @default(now()) @updatedAt
-  poolId        String
-  ownerUserId   String
-  granteeUserId String
-  ModelPool     ModelPool @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  Owner         User      @relation("PoolGrantOwner", fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  Grantee       User      @relation("PoolGrantGrantee", fields: [granteeUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  id                        String                     @id @default(cuid(2))
+  createdAt                 DateTime                   @default(now())
+  updatedAt                 DateTime                   @default(now()) @updatedAt
+  poolId                    String
+  ownerUserId               String
+  granteeUserId             String
+  ModelPool                 ModelPool                  @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Owner                     User                       @relation("PoolGrantOwner", fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Grantee                   User                       @relation("PoolGrantGrantee", fields: [granteeUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ResponseStickinessRecords ResponseStickinessRecord[]
 
   @@unique([poolId, granteeUserId])
   @@index([ownerUserId])
@@ -355,14 +1233,18 @@ model ModelApiTokenAllowlistEntry {
   modelApiTokenId   String
   target            ModelApiTokenAllowlistTarget
   discoveredModelId String?
+  executionTargetId String?
   modelPoolId       String?
   ModelApiToken     ModelApiToken                @relation(fields: [modelApiTokenId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   DiscoveredModel   DiscoveredModel?             @relation(fields: [discoveredModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ExecutionTarget   ExecutionTarget?             @relation(fields: [executionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ModelPool         ModelPool?                   @relation(fields: [modelPoolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
   @@unique([modelApiTokenId, discoveredModelId])
+  @@unique([modelApiTokenId, executionTargetId])
   @@unique([modelApiTokenId, modelPoolId])
   @@index([discoveredModelId])
+  @@index([executionTargetId])
   @@index([modelPoolId])
   @@index([modelApiTokenId, target])
   @@map("model_api_token_allowlist_entry")
@@ -375,37 +1257,64 @@ model ResponseStickinessRecord {
   userId                    String
   modelApiTokenId           String?
   routingKeyDigest          String
+  /// Version 2+ rows are bound to immutable ExecutionTarget identities and
+  /// must never fall back to legacy discovered-model columns after deletion.
+  routingVersion            Int              @default(1)
   targetDiscoveredModelId   String?
   targetModelPoolId         String?
   selectedDiscoveredModelId String?
+  targetExecutionTargetId   String?
+  selectedExecutionTargetId String?
+  /// Version 3 provider bindings are immutable snapshots. Credential identity
+  /// is deliberately omitted so rotation can retain the account endpoint.
+  providerAccountId         String?
+  providerModelId           String?
+  providerEndpointIdentity  String?
+  providerEndpointVersion   Int?
+  providerUpstreamModelId   String?
+  poolGrantId               String?
+  nativeSurface             String?
+  upstreamResponseIdDigest  String?
   expiresAt                 DateTime?
   User                      User             @relation("ResponseStickinessOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ModelApiToken             ModelApiToken?   @relation(fields: [modelApiTokenId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  ModelApiToken             ModelApiToken?   @relation(fields: [modelApiTokenId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   TargetDiscoveredModel     DiscoveredModel? @relation("ResponseStickinessTargetModel", fields: [targetDiscoveredModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   TargetModelPool           ModelPool?       @relation(fields: [targetModelPoolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   SelectedDiscoveredModel   DiscoveredModel? @relation("ResponseStickinessSelectedModel", fields: [selectedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  TargetExecutionTarget     ExecutionTarget? @relation("ResponseStickinessTargetExecutionTarget", fields: [targetExecutionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  SelectedExecutionTarget   ExecutionTarget? @relation("ResponseStickinessSelectedExecutionTarget", fields: [selectedExecutionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ProviderAccount           ProviderAccount? @relation("ResponseStickinessProviderAccount", fields: [providerAccountId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ProviderModel             ProviderModel?   @relation("ResponseStickinessProviderModel", fields: [providerModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  PoolGrant                 PoolGrant?       @relation(fields: [poolGrantId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
   @@unique([userId, routingKeyDigest])
   @@index([modelApiTokenId])
   @@index([targetDiscoveredModelId])
   @@index([targetModelPoolId])
   @@index([selectedDiscoveredModelId])
+  @@index([targetExecutionTargetId])
+  @@index([selectedExecutionTargetId])
+  @@index([providerAccountId, providerEndpointVersion])
+  @@index([providerModelId])
+  @@index([poolGrantId])
   @@index([expiresAt])
   @@map("response_stickiness_record")
 }
 
 model RelayRequest {
-  id                         String             @id @default(cuid(2))
-  createdAt                  DateTime           @default(now())
-  updatedAt                  DateTime           @default(now()) @updatedAt
+  id                         String                  @id @default(cuid(2))
+  createdAt                  DateTime                @default(now())
+  updatedAt                  DateTime                @default(now()) @updatedAt
   userId                     String
   modelApiTokenId            String?
   modelApiTokenLookupPrefix  String?
   requestedDiscoveredModelId String?
   requestedModelPoolId       String?
   selectedDiscoveredModelId  String?
-  status                     RelayRequestStatus @default(PENDING)
-  startedAt                  DateTime           @default(now())
+  requestedExecutionTargetId String?
+  selectedExecutionTargetId  String?
+  status                     RelayRequestStatus      @default(PENDING)
+  startedAt                  DateTime                @default(now())
   completedAt                DateTime?
   durationMs                 Int?
   promptTokens               Int?
@@ -417,6 +1326,44 @@ model RelayRequest {
   transformerLatencyMs       Int?
   transformerCacheHit        Boolean?
   transformerErrorClass      String?
+  /// Prompt-free protocol routing facts. These fields contain only bounded
+  /// identifiers/enums and never request content, tool arguments, media, or headers.
+  requestedSurface           String?
+  selectedNativeSurface      String?
+  adapterMode                String?
+  adapterVersion             String?
+  selectedPoolMemberId       String?
+  localAttemptId             String?
+  firstClientByteAt          DateTime?
+  /// Prompt-free context admission telemetry. Never stores request content.
+  contextTokenCount          Int?
+  contextCountMethod         String?
+  contextCountConfidence     String?
+  contextCountExact          Boolean?
+  contextSafetyMargin        Float?
+  contextSerializedChars     Int?
+  /// Prompt-free global admission correlation and outcome telemetry.
+  admissionAttemptId         String?
+  admissionLeaseId           String?
+  admissionCapacityId        String?
+  admissionFencingToken      BigInt?
+  admissionWaitDurationMs    Int?
+  admissionReservationClass  Int?
+  admissionBorrowed          Boolean?
+  admissionTerminalState     String?
+  /// Prompt-free public overflow correlation and commitment telemetry.
+  publicEgress               Boolean                 @default(false)
+  publicOverflowReason       String?
+  selectedPoolMemberTier     String?
+  providerAccountId          String?
+  providerModelId            String?
+  providerAttemptId          String?
+  providerFencingToken       BigInt?
+  streamCommitted            Boolean                 @default(false)
+  affinityOutcome            String?
+  affinityScore              Int?
+  affinityPrefixDepth        Int?
+  affinityReason             String?
   /// Protocol operation only; never stores prompts, filenames, audio, or transcripts.
   operation                  String?
   /// Sum of rebuilt upstream request-body bytes across all relay attempts.
@@ -426,20 +1373,127 @@ model RelayRequest {
   /// including retryable failed attempts, counted without retaining content.
   responseBytes              BigInt?
   /// Number of upstream relay attempts (greater than one indicates pool retry).
-  attemptCount               Int                @default(0)
-  User                       User               @relation("RelayRequestOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ModelApiToken              ModelApiToken?     @relation(fields: [modelApiTokenId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-  RequestedDiscoveredModel   DiscoveredModel?   @relation("RelayRequestRequestedModel", fields: [requestedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-  RequestedModelPool         ModelPool?         @relation("RelayRequestRequestedPool", fields: [requestedModelPoolId], references: [id], onDelete: SetNull, onUpdate: Cascade)
-  SelectedDiscoveredModel    DiscoveredModel?   @relation("RelayRequestSelectedModel", fields: [selectedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  attemptCount               Int                     @default(0)
+  auxiliaryAttemptCount      Int                     @default(0)
+  auxiliaryRequestBytes      BigInt                  @default(0)
+  auxiliaryResponseBytes     BigInt                  @default(0)
+  User                       User                    @relation("RelayRequestOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ModelApiToken              ModelApiToken?          @relation(fields: [modelApiTokenId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  RequestedDiscoveredModel   DiscoveredModel?        @relation("RelayRequestRequestedModel", fields: [requestedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  RequestedModelPool         ModelPool?              @relation("RelayRequestRequestedPool", fields: [requestedModelPoolId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  SelectedDiscoveredModel    DiscoveredModel?        @relation("RelayRequestSelectedModel", fields: [selectedDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  RequestedExecutionTarget   ExecutionTarget?        @relation("RelayRequestRequestedExecutionTarget", fields: [requestedExecutionTargetId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  SelectedExecutionTarget    ExecutionTarget?        @relation("RelayRequestSelectedExecutionTarget", fields: [selectedExecutionTargetId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  AdmissionRequests          AdmissionRequest[]
+  SelectedPoolMember         PoolMember?             @relation("RelayRequestSelectedPoolMember", fields: [selectedPoolMemberId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  ExecutionEvents            RelayExecutionEvent[]
+  ExecutionAttempts          RelayExecutionAttempt[]
 
   @@index([userId, createdAt])
   @@index([modelApiTokenId, createdAt])
   @@index([requestedDiscoveredModelId, createdAt])
   @@index([requestedModelPoolId, createdAt])
   @@index([selectedDiscoveredModelId])
+  @@index([selectedPoolMemberId])
+  @@index([requestedExecutionTargetId, createdAt])
+  @@index([selectedExecutionTargetId])
   @@index([status, createdAt])
   @@map("relay_request")
+}
+
+/// Append-only, prompt-free facts for each local CLI relay attempt. A separate
+/// row per lifecycle transition preserves retries and crash-repair history.
+model RelayExecutionEvent {
+  id                     String       @id @default(cuid(2))
+  createdAt              DateTime     @default(now())
+  userId                 String
+  relayRequestId         String
+  attemptId              String
+  eventType              String
+  attemptKind            String       @default("EXECUTION")
+  requestedSurface       String
+  nativeSurface          String?
+  adapterMode            String?
+  adapterVersion         String?
+  poolId                 String?
+  poolMemberId           String?
+  executionTargetId      String?
+  memberTier             String?
+  contextCountMethod     String?
+  contextCountConfidence String?
+  contextTokens          Int?
+  admissionAttemptId     String?
+  admissionLeaseId       String?
+  admissionFencingToken  BigInt?
+  waitDurationMs         Int?
+  streamCommitted        Boolean      @default(false)
+  terminalState          String?
+  httpStatusCode         Int?
+  upstreamStatusCode     Int?
+  errorClass             String?
+  promptTokens           Int?
+  completionTokens       Int?
+  totalTokens            Int?
+  usageSource            String?
+  User                   User         @relation("RelayExecutionEventOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  RelayRequest           RelayRequest @relation(fields: [relayRequestId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([attemptId, eventType])
+  @@index([userId, createdAt])
+  @@index([relayRequestId, createdAt])
+  @@map("relay_execution_event")
+}
+
+/// Mutable fenced ownership for one local CLI attempt. History remains in
+/// RelayExecutionEvent; this row exists only to make liveness and crash repair safe.
+model RelayExecutionAttempt {
+  attemptId         String       @id
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @default(now()) @updatedAt
+  userId            String
+  relayRequestId    String
+  ownerEpoch        String
+  heartbeatAt       DateTime     @default(now())
+  expiresAt         DateTime
+  state             String       @default("ACTIVE")
+  attemptKind       String       @default("EXECUTION")
+  terminalAt        DateTime?
+  terminalState     String?
+  requestedSurface  String
+  nativeSurface     String?
+  adapterMode       String?
+  adapterVersion    String?
+  poolId            String?
+  poolMemberId      String?
+  executionTargetId String?
+  memberTier        String?
+  requestBytes      BigInt?
+  responseBytes     BigInt?
+  User              User         @relation("RelayExecutionAttemptOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  RelayRequest      RelayRequest @relation(fields: [relayRequestId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([state, expiresAt])
+  @@index([ownerEpoch, state])
+  @@index([relayRequestId, createdAt])
+  @@map("relay_execution_attempt")
+}
+
+/// Prompt-free, owner-scoped history of capacity and admission-policy changes.
+model CapacityAuditEvent {
+  id           String   @id @default(cuid(2))
+  createdAt    DateTime @default(now())
+  userId       String
+  actorUserId  String
+  action       String
+  resourceType String
+  resourceId   String
+  before       Json?
+  after        Json?
+  User         User     @relation("CapacityAuditEventOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([resourceType, resourceId, createdAt])
+  @@map("capacity_audit_event")
 }
 
 model MediaAsset {
