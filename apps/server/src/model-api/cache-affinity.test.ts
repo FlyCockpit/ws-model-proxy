@@ -21,6 +21,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
 }));
 
 import {
+  type AffinityTarget,
   affinityPrefixDigests,
   buildAffinityTargetIdentity,
   rankAffinityTargets,
@@ -63,6 +64,52 @@ const payload = {
   temperature: 0.2,
 };
 
+const digestArgs = (
+  runtimeIdentity: string,
+  requestPayload: Record<string, unknown>,
+  surface = "openai-chat",
+) => ({
+  ownerId: "owner",
+  resourceOwnerId: "owner",
+  poolId: "pool",
+  securityScope: "token",
+  surface,
+  payload: requestPayload,
+  runtimeIdentity,
+});
+
+const affinityRow = ({
+  target: affinityTarget,
+  material,
+  prefixDigest = null as string | null,
+  prefixDepth = 0,
+  conversationDigest = null as string | null,
+  digestVersion = 4,
+  engineCacheConfirmed = false,
+}: {
+  target: ReturnType<typeof target>;
+  material: ReturnType<typeof affinityPrefixDigests>;
+  prefixDigest?: string | null;
+  prefixDepth?: number;
+  conversationDigest?: string | null;
+  digestVersion?: number;
+  engineCacheConfirmed?: boolean;
+}) => ({
+  executionTargetId: affinityTarget.executionTargetId,
+  targetIdentity: affinityTarget.targetIdentity,
+  bindingDigest: material.bindingDigest,
+  prefixDigest,
+  conversationDigest,
+  prefixDepth,
+  digestVersion,
+  engineCacheConfirmed,
+});
+
+const cap8 = (affinityTarget: ReturnType<typeof target>) => ({
+  ...affinityTarget,
+  hardConcurrencyLimit: 8,
+});
+
 describe("cache affinity", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -97,8 +144,15 @@ describe("cache affinity", () => {
     expect(digest({ accessGrantId: "grant-b" })).not.toBe(baseline);
     expect(digest({ runtimeIdentity: "runtime-b" })).not.toBe(baseline);
     expect(digest({ surface: "ANTHROPIC_MESSAGES" })).not.toBe(baseline);
-    expect(digest({ payload: { ...payload, messages: [...payload.messages].reverse() } })).not.toBe(
-      baseline,
+    const turns = {
+      ...payload,
+      messages: [
+        { role: "user", content: "U1" },
+        { role: "assistant", content: "A1" },
+      ],
+    };
+    expect(digest({ payload: { ...turns, messages: [...turns.messages].reverse() } })).not.toBe(
+      digest({ payload: turns }),
     );
     expect(digest({ payload: { ...payload, tools: [] } })).not.toBe(baseline);
     expect(digest({ payload: { ...payload, temperature: 0.3 } })).not.toBe(baseline);
@@ -201,6 +255,7 @@ describe("cache affinity", () => {
       data: expect.objectContaining({
         prefixDigest: null,
         prefixDepth: 0,
+        digestVersion: 4,
         conversationDigest: expect.any(String),
       }),
     });
@@ -225,6 +280,7 @@ describe("cache affinity", () => {
         prefixDigest: null,
         conversationDigest: prior.conversationDigest,
         prefixDepth: 0,
+        digestVersion: 4,
         engineCacheConfirmed: false,
       },
     ]);
@@ -321,13 +377,17 @@ describe("cache affinity", () => {
   it("selects the longest compatible prefix but lets load override a weak match", async () => {
     const targetA = target("target-a", "runtime-a", "capacity-a");
     const targetB = target("target-b", "runtime-b", "capacity-b");
+    const continuationPayload = {
+      ...payload,
+      messages: [...payload.messages, { role: "assistant", content: "secret answer" }],
+    };
     const a = affinityPrefixDigests({
       ownerId: "owner",
       resourceOwnerId: "owner",
       poolId: "pool",
       securityScope: "token",
       surface: "OPENAI_CHAT_COMPLETIONS",
-      payload,
+      payload: continuationPayload,
       runtimeIdentity: targetA.targetIdentity,
     });
     const b = affinityPrefixDigests({
@@ -336,7 +396,7 @@ describe("cache affinity", () => {
       poolId: "pool",
       securityScope: "token",
       surface: "OPENAI_CHAT_COMPLETIONS",
-      payload,
+      payload: continuationPayload,
       runtimeIdentity: targetB.targetIdentity,
     });
     db.cacheAffinityRecord.findMany.mockResolvedValue([
@@ -347,6 +407,7 @@ describe("cache affinity", () => {
         prefixDigest: a.digests[0],
         conversationDigest: null,
         prefixDepth: 1,
+        digestVersion: 4,
         engineCacheConfirmed: false,
       },
       {
@@ -356,6 +417,7 @@ describe("cache affinity", () => {
         prefixDigest: b.digests[1],
         conversationDigest: null,
         prefixDepth: 2,
+        digestVersion: 4,
         engineCacheConfirmed: false,
       },
     ]);
@@ -368,7 +430,7 @@ describe("cache affinity", () => {
       securityScope: "token",
       policy,
       surface: "OPENAI_CHAT_COMPLETIONS",
-      payload,
+      payload: continuationPayload,
       targets: [targetA, targetB],
     });
 
@@ -403,6 +465,7 @@ describe("cache affinity", () => {
         prefixDigest: deepestDigest,
         prefixDepth: prefixes.digests.length,
         conversationDigest: prefixes.conversationDigest,
+        digestVersion: 4,
         engineCacheConfirmed: false,
       },
     ]);
@@ -471,6 +534,90 @@ describe("cache affinity", () => {
     });
   });
 
+  it("persists instruction prefixes for system-only Chat and writes digestVersion 4 on create only", async () => {
+    await rememberAffinity({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      policy,
+      surface: "openai-chat",
+      payload: { messages: [{ role: "system", content: "secret instructions" }] },
+      target: target("target", "runtime"),
+    });
+    expect(db.cacheAffinityRecord.upsert).toHaveBeenCalled();
+    const creates = db.cacheAffinityRecord.upsert.mock.calls.map(([input]) => input.create);
+    const updates = db.cacheAffinityRecord.upsert.mock.calls.map(([input]) => input.update);
+    expect(creates.length).toBeGreaterThan(0);
+    for (const create of creates) {
+      expect(create.digestVersion).toBe(4);
+      expect(create.prefixDigest).toEqual(expect.any(String));
+      expect(create.conversationDigest).toBeNull();
+      expect(create.prefixDepth).toBeGreaterThan(0);
+    }
+    for (const update of updates) {
+      expect(update).not.toHaveProperty("digestVersion");
+    }
+    expect(JSON.stringify(creates)).not.toContain("secret instructions");
+    expect(JSON.stringify(db.cacheAffinityRecord.upsert.mock.calls)).not.toContain(
+      "secret instructions",
+    );
+  });
+
+  it("writes digestVersion 4 on conversation-prefix and session creates and omits it on updates", async () => {
+    const requestPayload = {
+      conversation: "conversation-secret",
+      input: "turn one",
+      instructions: "secret instructions",
+    };
+    await rememberAffinity({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      policy,
+      surface: "openai-responses",
+      payload: requestPayload,
+      target: target("target", "runtime"),
+    });
+    const prefixCreates = db.cacheAffinityRecord.upsert.mock.calls.map(([input]) => input.create);
+    const prefixUpdates = db.cacheAffinityRecord.upsert.mock.calls.map(([input]) => input.update);
+    expect(prefixCreates.length).toBeGreaterThan(1);
+    for (const create of prefixCreates) {
+      expect(create.digestVersion).toBe(4);
+    }
+    for (const update of prefixUpdates) {
+      expect(update).not.toHaveProperty("digestVersion");
+    }
+    expect(db.cacheAffinityRecord.create.mock.calls[0]?.[0].data.digestVersion).toBe(4);
+    expect(JSON.stringify(db.cacheAffinityRecord.upsert.mock.calls)).not.toContain(
+      "secret instructions",
+    );
+    expect(JSON.stringify(db.cacheAffinityRecord.create.mock.calls)).not.toContain(
+      "conversation-secret",
+    );
+
+    db.cacheAffinityRecord.findFirst.mockResolvedValue({ id: "existing-session" });
+    db.cacheAffinityRecord.upsert.mockClear();
+    db.cacheAffinityRecord.create.mockClear();
+    db.cacheAffinityRecord.update.mockClear();
+    await rememberAffinity({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      policy,
+      surface: "openai-responses",
+      payload: requestPayload,
+      target: target("target", "runtime"),
+    });
+    expect(db.cacheAffinityRecord.create).not.toHaveBeenCalled();
+    expect(db.cacheAffinityRecord.update).toHaveBeenCalledWith({
+      where: { id: "existing-session" },
+      data: expect.not.objectContaining({ digestVersion: expect.anything() }),
+    });
+    expect(db.cacheAffinityRecord.update.mock.calls[0]?.[0].data).not.toHaveProperty(
+      "digestVersion",
+    );
+  });
+
   it("deduplicates the exact prefix while storing distinct conversation identities", async () => {
     for (const conversation of ["conversation-a", "conversation-b"]) {
       await rememberAffinity({
@@ -494,6 +641,855 @@ describe("cache affinity", () => {
       ([input]) => input.data.conversationDigest,
     );
     expect(new Set(conversations).size).toBe(2);
+  });
+
+  it("canonicalizes telemetry surfaces onto production ProtocolSurface HMACs", () => {
+    const args = {
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      payload,
+      runtimeIdentity: "runtime",
+    } as const;
+    const chat = affinityPrefixDigests({ ...args, surface: "openai-chat" });
+    const chatAlias = affinityPrefixDigests({ ...args, surface: "OPENAI_CHAT_COMPLETIONS" });
+    expect(chatAlias.bindingDigest).toBe(chat.bindingDigest);
+    expect(chatAlias.instructionDigests).toEqual(chat.instructionDigests);
+    expect(chatAlias.digests).toEqual(chat.digests);
+
+    const responsesPayload = { instructions: "S", input: "U", temperature: 0.2 };
+    const responses = affinityPrefixDigests({
+      ...args,
+      surface: "openai-responses",
+      payload: responsesPayload,
+    });
+    const responsesAlias = affinityPrefixDigests({
+      ...args,
+      surface: "OPENAI_RESPONSES",
+      payload: responsesPayload,
+    });
+    expect(responsesAlias.bindingDigest).toBe(responses.bindingDigest);
+    expect(responsesAlias.instructionDigests).toEqual(responses.instructionDigests);
+    expect(responsesAlias.digests).toEqual(responses.digests);
+
+    const anthropicPayload = { system: "S", messages: [{ role: "user", content: "U" }] };
+    const anthropic = affinityPrefixDigests({
+      ...args,
+      surface: "anthropic-messages",
+      payload: anthropicPayload,
+    });
+    const anthropicAlias = affinityPrefixDigests({
+      ...args,
+      surface: "ANTHROPIC_MESSAGES",
+      payload: anthropicPayload,
+    });
+    expect(anthropicAlias.bindingDigest).toBe(anthropic.bindingDigest);
+    expect(anthropicAlias.instructionDigests).toEqual(anthropic.instructionDigests);
+    expect(anthropicAlias.digests).toEqual(anthropic.digests);
+  });
+
+  it("splits Chat system into instruction HMACs and user turns into conversation prefixes", () => {
+    const args = {
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      surface: "openai-chat",
+      runtimeIdentity: "runtime",
+    };
+    const noTools = affinityPrefixDigests({
+      ...args,
+      payload: {
+        messages: [
+          { role: "system", content: "S" },
+          { role: "user", content: "U" },
+        ],
+      },
+    });
+    expect(noTools.instructionDigests).toHaveLength(1);
+    expect(noTools.digests).toHaveLength(1);
+    expect(noTools.isContinuation).toBe(false);
+
+    const withTools = affinityPrefixDigests({
+      ...args,
+      payload: {
+        messages: [
+          { role: "system", content: "S" },
+          { role: "user", content: "U" },
+        ],
+        tools: [{ type: "function", function: { name: "lookup" } }],
+      },
+    });
+    expect(withTools.instructionDigests).toHaveLength(2);
+    expect(withTools.instructionDigests[0]).toBe(noTools.instructionDigests[0]);
+    expect(withTools.digests).not.toEqual(noTools.digests);
+
+    const otherTools = affinityPrefixDigests({
+      ...args,
+      payload: {
+        messages: [
+          { role: "system", content: "S" },
+          { role: "user", content: "U" },
+        ],
+        tools: [{ type: "function", function: { name: "other" } }],
+      },
+    });
+    expect(otherTools.instructionDigests[0]).toBe(noTools.instructionDigests[0]);
+    expect(otherTools.instructionDigests[1]).not.toBe(withTools.instructionDigests[1]);
+  });
+
+  it("caps instruction HMAC units at 8 and keeps tools as the last unit", () => {
+    const args = {
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      surface: "openai-chat",
+      runtimeIdentity: "runtime",
+    };
+    const nine = Array.from({ length: 9 }, (_, index) => ({
+      role: "system",
+      content: `S${index}`,
+    }));
+    const nineText = affinityPrefixDigests({
+      ...args,
+      payload: { messages: [...nine, { role: "user", content: "U" }] },
+    });
+    expect(nineText.instructionDigests).toHaveLength(8);
+
+    const tools = [{ type: "function", function: { name: "lookup" } }];
+    const eightPlusTools = affinityPrefixDigests({
+      ...args,
+      payload: {
+        messages: [...nine.slice(0, 8), { role: "user", content: "U" }],
+        tools,
+      },
+    });
+    const sevenPlusTools = affinityPrefixDigests({
+      ...args,
+      payload: {
+        messages: [...nine.slice(0, 7), { role: "user", content: "U" }],
+        tools,
+      },
+    });
+    expect(eightPlusTools.instructionDigests).toHaveLength(8);
+    expect(eightPlusTools.instructionDigests).toEqual(sevenPlusTools.instructionDigests);
+    expect(eightPlusTools.instructionDigests[0]).toBe(
+      affinityPrefixDigests({
+        ...args,
+        payload: {
+          messages: [
+            { role: "system", content: "S0" },
+            { role: "user", content: "U" },
+          ],
+        },
+      }).instructionDigests[0],
+    );
+    const otherTools = affinityPrefixDigests({
+      ...args,
+      payload: {
+        messages: [...nine.slice(0, 8), { role: "user", content: "U" }],
+        tools: [{ type: "function", function: { name: "other" } }],
+      },
+    });
+    expect(otherTools.instructionDigests[7]).not.toBe(eightPlusTools.instructionDigests[7]);
+    expect(otherTools.instructionDigests.slice(0, 7)).toEqual(
+      eightPlusTools.instructionDigests.slice(0, 7),
+    );
+
+    const ninthDiffers = affinityPrefixDigests({
+      ...args,
+      payload: {
+        messages: [
+          ...nine.slice(0, 8),
+          { role: "system", content: "S8-other" },
+          { role: "user", content: "U" },
+        ],
+      },
+    });
+    expect(ninthDiffers.instructionDigests).toEqual(nineText.instructionDigests);
+    expect(ninthDiffers.digests).not.toEqual(nineText.digests);
+  });
+
+  it("omits remaining instruction HMACs when a unit exceeds the canonical byte cap", () => {
+    const huge = "x".repeat(2 * 1024 * 1024 + 64);
+    let result: ReturnType<typeof affinityPrefixDigests> | undefined;
+    expect(() => {
+      result = affinityPrefixDigests({
+        ownerId: "owner",
+        resourceOwnerId: "owner",
+        poolId: "pool",
+        securityScope: "token",
+        surface: "openai-chat",
+        runtimeIdentity: "runtime",
+        payload: {
+          messages: [
+            { role: "system", content: huge },
+            { role: "system", content: "after" },
+            { role: "user", content: "U" },
+          ],
+        },
+      });
+    }).not.toThrow();
+    expect(result?.instructionDigests).toEqual([]);
+    expect(result?.digests).toHaveLength(1);
+  });
+
+  it("keeps stray unconsumed fields in parameters so conversation prefixes do not collide", () => {
+    const args = {
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      runtimeIdentity: "runtime",
+    };
+    const chatPromptNone = affinityPrefixDigests({
+      ...args,
+      surface: "openai-chat",
+      payload: { messages: [{ role: "user", content: "U" }] },
+    });
+    const chatPromptA = affinityPrefixDigests({
+      ...args,
+      surface: "openai-chat",
+      payload: {
+        messages: [{ role: "user", content: "U" }],
+        prompt: "abc",
+      },
+    });
+    const chatPromptB = affinityPrefixDigests({
+      ...args,
+      surface: "openai-chat",
+      payload: {
+        messages: [{ role: "user", content: "U" }],
+        prompt: "xyz",
+      },
+    });
+    expect(chatPromptA.digests).toHaveLength(1);
+    expect(chatPromptB.digests).toHaveLength(1);
+    expect(chatPromptNone.digests).toHaveLength(1);
+    expect(chatPromptA.instructionDigests).toEqual([]);
+    expect(chatPromptB.instructionDigests).toEqual([]);
+    expect(chatPromptA.instructionDigests).toEqual(chatPromptNone.instructionDigests);
+    expect(chatPromptA.digests).not.toEqual(chatPromptB.digests);
+    expect(chatPromptA.digests).not.toEqual(chatPromptNone.digests);
+
+    const malformedA = affinityPrefixDigests({
+      ...args,
+      surface: "openai-chat",
+      payload: { messages: "abc", temperature: 0.1 },
+    });
+    const malformedB = affinityPrefixDigests({
+      ...args,
+      surface: "openai-chat",
+      payload: { messages: "xyz", temperature: 0.1 },
+    });
+    expect(malformedA.digests).toEqual([]);
+    expect(malformedB.digests).toEqual([]);
+    expect(malformedA.instructionDigests).toEqual([]);
+    // Binding is identical; the stray `messages` string lives in parameters and
+    // only changes prefixBinding, which is observable once a conversation unit
+    // exists. Pair with a Responses scalar input that also carries the stray.
+    const responsesWithStrayMessagesA = affinityPrefixDigests({
+      ...args,
+      surface: "openai-responses",
+      payload: { input: "U", messages: "abc" },
+    });
+    const responsesWithStrayMessagesB = affinityPrefixDigests({
+      ...args,
+      surface: "openai-responses",
+      payload: { input: "U", messages: "xyz" },
+    });
+    expect(responsesWithStrayMessagesA.digests).not.toEqual(responsesWithStrayMessagesB.digests);
+
+    const responsesSystemA = affinityPrefixDigests({
+      ...args,
+      surface: "openai-responses",
+      payload: { input: "U", system: "A" },
+    });
+    const responsesSystemB = affinityPrefixDigests({
+      ...args,
+      surface: "openai-responses",
+      payload: { input: "U", system: "B" },
+    });
+    expect(responsesSystemA.digests).not.toEqual(responsesSystemB.digests);
+
+    const anthropicInstructionsA = affinityPrefixDigests({
+      ...args,
+      surface: "anthropic-messages",
+      payload: { messages: [{ role: "user", content: "U" }], instructions: "A" },
+    });
+    const anthropicInstructionsB = affinityPrefixDigests({
+      ...args,
+      surface: "anthropic-messages",
+      payload: { messages: [{ role: "user", content: "U" }], instructions: "B" },
+    });
+    expect(anthropicInstructionsA.digests).not.toEqual(anthropicInstructionsB.digests);
+
+    const chatSystemA = affinityPrefixDigests({
+      ...args,
+      surface: "openai-chat",
+      payload: { messages: [{ role: "user", content: "U" }], system: "A" },
+    });
+    const chatSystemB = affinityPrefixDigests({
+      ...args,
+      surface: "openai-chat",
+      payload: { messages: [{ role: "user", content: "U" }], system: "B" },
+    });
+    expect(chatSystemA.instructionDigests).toEqual([]);
+    expect(chatSystemB.instructionDigests).toEqual([]);
+    expect(chatSystemA.digests).toHaveLength(1);
+    expect(chatSystemA.digests).not.toEqual(chatSystemB.digests);
+  });
+
+  it("does not leak consumed messages, input, or tools into prefix-binding parameters", () => {
+    const args = {
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      runtimeIdentity: "runtime",
+    };
+    const chatUser = affinityPrefixDigests({
+      ...args,
+      surface: "openai-chat",
+      payload: { messages: [{ role: "user", content: "U" }] },
+    });
+    const chatContinued = affinityPrefixDigests({
+      ...args,
+      surface: "openai-chat",
+      payload: {
+        messages: [
+          { role: "user", content: "U" },
+          { role: "assistant", content: "A" },
+        ],
+      },
+    });
+    expect(chatContinued.digests[0]).toBe(chatUser.digests[0]);
+
+    const responsesOne = affinityPrefixDigests({
+      ...args,
+      surface: "openai-responses",
+      payload: { input: [{ role: "user", content: "U" }] },
+    });
+    const responsesTwo = affinityPrefixDigests({
+      ...args,
+      surface: "openai-responses",
+      payload: {
+        input: [
+          { role: "user", content: "U" },
+          { role: "assistant", content: "A" },
+        ],
+      },
+    });
+    expect(responsesTwo.digests[0]).toBe(responsesOne.digests[0]);
+
+    const toolsA = affinityPrefixDigests({
+      ...args,
+      surface: "openai-chat",
+      payload: {
+        messages: [{ role: "user", content: "U" }],
+        tools: [{ type: "function", function: { name: "lookup" } }],
+      },
+    });
+    const toolsB = affinityPrefixDigests({
+      ...args,
+      surface: "openai-chat",
+      payload: {
+        messages: [
+          { role: "user", content: "U" },
+          { role: "assistant", content: "A" },
+        ],
+        tools: [{ type: "function", function: { name: "lookup" } }],
+      },
+    });
+    expect(toolsB.digests[0]).toBe(toolsA.digests[0]);
+    expect(toolsA.digests[0]).not.toBe(chatUser.digests[0]);
+  });
+
+  it("routes fresh Chat by availability and uses instruction depth only as a tie-break", async () => {
+    const warm = cap8(target("target-a", "runtime-a", "capacity-a"));
+    const idle = cap8(target("target-b", "runtime-b", "capacity-b"));
+    const seedPayload = {
+      messages: [
+        { role: "system", content: "S" },
+        { role: "user", content: "A" },
+      ],
+    };
+    const rankPayload = {
+      messages: [
+        { role: "system", content: "S" },
+        { role: "user", content: "B" },
+      ],
+    };
+    const seeded = affinityPrefixDigests(digestArgs(warm.targetIdentity, seedPayload));
+    const ranked = affinityPrefixDigests(digestArgs(warm.targetIdentity, rankPayload));
+    expect(seeded.instructionDigests[0]).toBe(ranked.instructionDigests[0]);
+    db.cacheAffinityRecord.findMany.mockResolvedValue([
+      affinityRow({
+        target: warm,
+        material: ranked,
+        prefixDigest: ranked.instructionDigests[0],
+        prefixDepth: 1,
+      }),
+    ]);
+    const busy = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [{ ...warm, activeLoad: 1 }, idle],
+    });
+    expect(busy.orderedTargetIds).toEqual(["target-b", "target-a"]);
+    expect(busy.instructionDepths?.["target-a"]).toBe(1);
+    expect(busy.prefixDepths["target-a"]).toBe(0);
+    expect(busy.prefixDepths["target-b"]).toBe(0);
+
+    db.cacheAffinityRecord.findMany.mockResolvedValue([
+      affinityRow({
+        target: warm,
+        material: ranked,
+        prefixDigest: ranked.instructionDigests[0],
+        prefixDepth: 1,
+      }),
+    ]);
+    const tied = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [idle, warm],
+    });
+    expect(tied.orderedTargetIds[0]).toBe("target-a");
+    expect(tied.instructionDepths?.["target-a"]).toBeGreaterThanOrEqual(1);
+    expect(tied.prefixDepths["target-a"]).toBe(0);
+    expect(tied.reasons["target-a"]).toContain("instruction:");
+    expect(tied.reasons["target-a"]).toContain("continuation:false");
+  });
+
+  it("does not pin continuations that share only the instruction layer", async () => {
+    const warm = cap8(target("target-a", "runtime-a", "capacity-a"));
+    const idle = cap8(target("target-b", "runtime-b", "capacity-b"));
+    const seedPayload = {
+      messages: [
+        { role: "system", content: "S" },
+        { role: "user", content: "A" },
+        { role: "assistant", content: "first" },
+      ],
+    };
+    const rankPayload = {
+      messages: [
+        { role: "system", content: "S" },
+        { role: "user", content: "B" },
+        { role: "assistant", content: "other" },
+      ],
+    };
+    const ranked = affinityPrefixDigests(digestArgs(warm.targetIdentity, rankPayload));
+    db.cacheAffinityRecord.findMany.mockResolvedValue([
+      affinityRow({
+        target: warm,
+        material: ranked,
+        prefixDigest: ranked.instructionDigests[0],
+        prefixDepth: 1,
+      }),
+    ]);
+    const result = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [{ ...warm, activeLoad: 1 }, idle],
+    });
+    expect(result.orderedTargetIds).toEqual(["target-b", "target-a"]);
+    expect(result.prefixDepths["target-a"]).toBe(0);
+    expect(result.instructionDepths?.["target-a"]).toBe(1);
+    expect(affinityPrefixDigests(digestArgs(warm.targetIdentity, seedPayload)).digests).not.toEqual(
+      ranked.digests,
+    );
+  });
+
+  it("keeps a real continuation stuck under 1/8 load at scored prefix depth 2", async () => {
+    const warm = cap8(target("target-a", "runtime-a", "capacity-a"));
+    const idle = cap8(target("target-b", "runtime-b", "capacity-b"));
+    const seedPayload = {
+      messages: [
+        { role: "system", content: "S" },
+        { role: "user", content: "U" },
+        { role: "assistant", content: "A" },
+      ],
+    };
+    const rankPayload = {
+      messages: [
+        { role: "system", content: "S" },
+        { role: "user", content: "U" },
+        { role: "assistant", content: "A" },
+        { role: "user", content: "next" },
+      ],
+    };
+    const seeded = affinityPrefixDigests(digestArgs(warm.targetIdentity, seedPayload));
+    const ranked = affinityPrefixDigests(digestArgs(warm.targetIdentity, rankPayload));
+    expect(ranked.digests.slice(0, 2)).toEqual(seeded.digests);
+    db.cacheAffinityRecord.findMany.mockResolvedValue(
+      seeded.digests.map((prefixDigest, index) =>
+        affinityRow({
+          target: warm,
+          material: ranked,
+          prefixDigest,
+          prefixDepth: index + 1,
+        }),
+      ),
+    );
+    const result = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [{ ...warm, activeLoad: 1 }, idle],
+    });
+    expect(result.orderedTargetIds[0]).toBe("target-a");
+    expect(result.prefixDepths["target-a"]).toBe(2);
+  });
+
+  it("ignores v3 rows even when the Prisma mock returns a matching instruction digest", async () => {
+    const warm = cap8(target("target-a", "runtime-a", "capacity-a"));
+    const idle = cap8(target("target-b", "runtime-b", "capacity-b"));
+    const rankPayload = {
+      messages: [
+        { role: "system", content: "S" },
+        { role: "user", content: "B" },
+      ],
+    };
+    const ranked = affinityPrefixDigests(digestArgs(warm.targetIdentity, rankPayload));
+    await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [idle, warm],
+    });
+    const query = db.cacheAffinityRecord.findMany.mock.calls.at(-1)?.[0];
+    expect(query?.where.digestVersion).toBe(4);
+    expect(query?.select.digestVersion).toBe(true);
+
+    db.cacheAffinityRecord.findMany.mockResolvedValue([
+      affinityRow({
+        target: warm,
+        material: ranked,
+        prefixDigest: ranked.instructionDigests[0],
+        prefixDepth: 1,
+        digestVersion: 3,
+      }),
+    ]);
+    const result = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [idle, warm],
+    });
+    expect(result.instructionDepths?.["target-a"]).toBe(0);
+    expect(result.orderedTargetIds[0]).toBe("target-b");
+  });
+
+  it("queries instruction prefix HMACs even when the conversation digest list is empty", async () => {
+    const warm = target("target-a", "runtime-a");
+    const idle = target("target-b", "runtime-b");
+    const rankPayload = { messages: [{ role: "system", content: "S" }] };
+    const ranked = affinityPrefixDigests(digestArgs(warm.targetIdentity, rankPayload));
+    expect(ranked.digests).toEqual([]);
+    expect(ranked.instructionDigests.length).toBeGreaterThan(0);
+    await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [warm, idle],
+    });
+    const query = db.cacheAffinityRecord.findMany.mock.calls.at(-1)?.[0];
+    const prefixIn = query?.where.OR.find(
+      (clause: { prefixDigest?: { in: string[] } }) => clause.prefixDigest?.in,
+    )?.prefixDigest.in;
+    expect(prefixIn).toEqual(expect.arrayContaining(ranked.instructionDigests));
+  });
+
+  it("returns original Completions order without querying records or load", async () => {
+    const busy = cap8(target("target-a", "runtime-a", "capacity-a"));
+    const idle = cap8(target("target-b", "runtime-b", "capacity-b"));
+    const result = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "OPENAI_COMPLETIONS",
+      payload: { prompt: "complete this" },
+      targets: [{ ...busy, activeLoad: 1 }, idle],
+    });
+    expect(result.orderedTargetIds).toEqual(["target-a", "target-b"]);
+    expect(db.cacheAffinityRecord.findMany).not.toHaveBeenCalled();
+    expect(db.capacityLease.groupBy).not.toHaveBeenCalled();
+    expect(db.capacityWaiter.groupBy).not.toHaveBeenCalled();
+  });
+
+  it("does not fire the confirmed-cache bonus on instruction-only matches", async () => {
+    const warm = cap8(target("target-a", "runtime-a", "capacity-a"));
+    const idle = cap8(target("target-b", "runtime-b", "capacity-b"));
+    const rankPayload = {
+      messages: [
+        { role: "system", content: "S" },
+        { role: "user", content: "B" },
+      ],
+    };
+    const ranked = affinityPrefixDigests(digestArgs(warm.targetIdentity, rankPayload));
+    db.cacheAffinityRecord.findMany.mockResolvedValue([
+      affinityRow({
+        target: warm,
+        material: ranked,
+        prefixDigest: ranked.instructionDigests[0],
+        prefixDepth: 1,
+        engineCacheConfirmed: true,
+      }),
+    ]);
+    const result = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [{ ...warm, activeLoad: 1 }, idle],
+    });
+    expect(result.orderedTargetIds[0]).toBe("target-b");
+    expect(result.scores["target-a"]).toBe(-13);
+    expect(result.reasons["target-a"]).toContain("confirmed:false");
+  });
+
+  it("spills or keeps continuations using the worked-example load and health arithmetic", async () => {
+    const warm = cap8(target("target-a", "runtime-a", "capacity-a"));
+    const idle = cap8(target("target-b", "runtime-b", "capacity-b"));
+    const continuation = (depth: number) => {
+      const messages: Record<string, string>[] = [{ role: "system", content: "S" }];
+      for (let index = 0; index < depth; index += 1) {
+        messages.push({ role: index % 2 === 0 ? "user" : "assistant", content: `t${index}` });
+      }
+      return { messages };
+    };
+    const rankAt = async (
+      depth: number,
+      warmOverrides: Partial<AffinityTarget>,
+      seedInstruction: boolean,
+    ) => {
+      const rankPayload = continuation(depth);
+      const ranked = affinityPrefixDigests(digestArgs(warm.targetIdentity, rankPayload));
+      const rows = ranked.digests.map((prefixDigest, index) =>
+        affinityRow({
+          target: warm,
+          material: ranked,
+          prefixDigest,
+          prefixDepth: index + 1,
+        }),
+      );
+      if (seedInstruction && ranked.instructionDigests[0]) {
+        rows.push(
+          affinityRow({
+            target: warm,
+            material: ranked,
+            prefixDigest: ranked.instructionDigests[0],
+            prefixDepth: 1,
+          }),
+        );
+      }
+      db.cacheAffinityRecord.findMany.mockResolvedValue(rows);
+      db.capacityLease.groupBy.mockResolvedValue([]);
+      db.capacityWaiter.groupBy.mockResolvedValue([]);
+      return rankAffinityTargets({
+        ownerId: "owner",
+        resourceOwnerId: "owner",
+        poolId: "pool",
+        securityScope: "token",
+        policy,
+        surface: "openai-chat",
+        payload: rankPayload,
+        targets: [idle, { ...warm, ...warmOverrides }],
+      });
+    };
+
+    const halfOpenIdle = await rankAt(2, { healthPenalty: 200 }, true);
+    expect(halfOpenIdle.scores["target-a"]).toBe(0);
+    expect(halfOpenIdle.scores["target-b"]).toBe(0);
+    expect(halfOpenIdle.orderedTargetIds[0]).toBe("target-a");
+
+    const halfOpenLoaded = await rankAt(2, { healthPenalty: 200, activeLoad: 1 }, true);
+    expect(halfOpenLoaded.orderedTargetIds[0]).toBe("target-b");
+
+    const depth3 = await rankAt(3, { healthPenalty: 200 }, true);
+    expect(depth3.orderedTargetIds[0]).toBe("target-a");
+    expect(depth3.scores["target-a"]).toBe(100);
+
+    const waiters = await rankAt(2, { waitingLoad: 3 }, true);
+    expect(waiters.orderedTargetIds[0]).toBe("target-b");
+
+    const deep = await rankAt(20, { waitingLoad: 5, activeLoad: 1 }, true);
+    expect(deep.orderedTargetIds[0]).toBe("target-a");
+    expect(deep.scores["target-a"]).toBe(1487);
+  });
+
+  it("does not pin fresh Responses instructions, input system items, or Anthropic system", async () => {
+    const cases = [
+      {
+        surface: "openai-responses",
+        seed: { instructions: "S", input: "user" },
+        rank: { instructions: "S", input: "other" },
+      },
+      {
+        surface: "openai-responses",
+        seed: {
+          input: [
+            { role: "system", content: "S" },
+            { role: "user", content: "user" },
+          ],
+        },
+        rank: {
+          input: [
+            { role: "system", content: "S" },
+            { role: "user", content: "other" },
+          ],
+        },
+      },
+      {
+        surface: "anthropic-messages",
+        seed: { system: "S", messages: [{ role: "user", content: "user" }] },
+        rank: { system: "S", messages: [{ role: "user", content: "other" }] },
+      },
+    ] as const;
+    for (const testCase of cases) {
+      const warm = cap8(target("target-a", "runtime-a", "capacity-a"));
+      const idle = cap8(target("target-b", "runtime-b", "capacity-b"));
+      const ranked = affinityPrefixDigests(
+        digestArgs(warm.targetIdentity, testCase.rank, testCase.surface),
+      );
+      db.cacheAffinityRecord.findMany.mockResolvedValue(
+        ranked.instructionDigests.map((prefixDigest, index) =>
+          affinityRow({
+            target: warm,
+            material: ranked,
+            prefixDigest,
+            prefixDepth: index + 1,
+          }),
+        ),
+      );
+      const result = await rankAffinityTargets({
+        ownerId: "owner",
+        resourceOwnerId: "owner",
+        poolId: "pool",
+        securityScope: "token",
+        policy,
+        surface: testCase.surface,
+        payload: testCase.rank,
+        targets: [{ ...warm, activeLoad: 1 }, idle],
+      });
+      expect(result.orderedTargetIds, testCase.surface).toEqual(["target-b", "target-a"]);
+      expect(result.prefixDepths["target-a"], testCase.surface).toBe(0);
+    }
+  });
+
+  it("still warmth-matches the same system when tools differ, without using prefixWeight", async () => {
+    const warm = cap8(target("target-a", "runtime-a", "capacity-a"));
+    const idle = cap8(target("target-b", "runtime-b", "capacity-b"));
+    const seedPayload = {
+      messages: [
+        { role: "system", content: "S" },
+        { role: "user", content: "A" },
+      ],
+    };
+    const rankPayload = {
+      messages: [
+        { role: "system", content: "S" },
+        { role: "user", content: "B" },
+      ],
+      tools: [{ type: "function", function: { name: "other" } }],
+    };
+    const seeded = affinityPrefixDigests(digestArgs(warm.targetIdentity, seedPayload));
+    const ranked = affinityPrefixDigests(digestArgs(warm.targetIdentity, rankPayload));
+    expect(ranked.instructionDigests[0]).toBe(seeded.instructionDigests[0]);
+    db.cacheAffinityRecord.findMany.mockResolvedValue([
+      affinityRow({
+        target: warm,
+        material: ranked,
+        prefixDigest: seeded.instructionDigests[0],
+        prefixDepth: 1,
+      }),
+    ]);
+    const result = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [idle, warm],
+    });
+    expect(result.scores["target-a"]).toBe(result.scores["target-b"]);
+    expect(result.instructionDepths?.["target-a"]).toBe(1);
+    expect(result.prefixDepths["target-a"]).toBe(0);
+    expect(result.orderedTargetIds[0]).toBe("target-a");
+  });
+
+  it("documents that a shared kickoff plus assistant prefill still pins", async () => {
+    const warm = cap8(target("target-a", "runtime-a", "capacity-a"));
+    const idle = cap8(target("target-b", "runtime-b", "capacity-b"));
+    const rankPayload = {
+      messages: [
+        { role: "user", content: "shared kickoff" },
+        { role: "assistant", content: "prefill" },
+      ],
+    };
+    const ranked = affinityPrefixDigests(digestArgs(warm.targetIdentity, rankPayload));
+    db.cacheAffinityRecord.findMany.mockResolvedValue(
+      ranked.digests.map((prefixDigest, index) =>
+        affinityRow({
+          target: warm,
+          material: ranked,
+          prefixDigest,
+          prefixDepth: index + 1,
+        }),
+      ),
+    );
+    const result = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [{ ...warm, activeLoad: 1 }, idle],
+    });
+    expect(result.orderedTargetIds[0]).toBe("target-a");
+    expect(result.prefixDepths["target-a"]).toBeGreaterThanOrEqual(1);
   });
 
   it("sweeps expired rows in bounded batches", async () => {

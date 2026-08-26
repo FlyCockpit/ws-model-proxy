@@ -107,7 +107,7 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
       poolId: row.pool.id,
       securityScope: "token-a",
       accessGrantId: "grant-a",
-      policy,
+      policy: { ...policy, maxRecords: 8 },
       surface: "OPENAI_RESPONSES",
       payload: {
         conversation: "private-conversation-id",
@@ -118,6 +118,22 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
       },
       target: row.target(0),
     });
+    const created = await db.cacheAffinityRecord.findMany({
+      where: { tenantUserId: row.tenant.id, poolId: row.pool.id },
+      select: {
+        digestVersion: true,
+        prefixDigest: true,
+        prefixDepth: true,
+        conversationDigest: true,
+      },
+    });
+    expect(created.length).toBeGreaterThan(0);
+    expect(created.every((record) => record.digestVersion === 4)).toBe(true);
+    expect(
+      created
+        .filter((record) => record.prefixDigest !== null)
+        .every((record) => record.prefixDepth > 0 && record.conversationDigest === null),
+    ).toBe(true);
     const changedTurn = {
       conversation: "private-conversation-id",
       input: "second turn",
@@ -206,10 +222,15 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
     await Promise.all(Array.from({ length: 8 }, () => service.rememberAffinity(args)));
     const records = await db.cacheAffinityRecord.findMany({
       where: { tenantUserId: row.tenant.id, poolId: row.pool.id },
-      select: { prefixDigest: true, conversationDigest: true, prefixDepth: true },
+      select: {
+        prefixDigest: true,
+        conversationDigest: true,
+        prefixDepth: true,
+        digestVersion: true,
+      },
     });
     expect(records).toHaveLength(1);
-    expect(records[0]).toMatchObject({ prefixDigest: null, prefixDepth: 0 });
+    expect(records[0]).toMatchObject({ prefixDigest: null, prefixDepth: 0, digestVersion: 4 });
     expect(records[0]?.conversationDigest).toHaveLength(43);
   });
 

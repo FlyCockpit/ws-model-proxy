@@ -118,6 +118,7 @@ DELETE FROM cache_affinity_record WHERE "bindingDigest" IS NULL; -- policy: boun
 ALTER TABLE cache_affinity_record ALTER COLUMN "bindingDigest" SET NOT NULL;
 ALTER TABLE cache_affinity_record ALTER COLUMN "prefixDigest" DROP NOT NULL;
 ALTER TABLE cache_affinity_record ALTER COLUMN "conversationDigest" DROP NOT NULL;
+ALTER TABLE cache_affinity_record ALTER COLUMN "digestVersion" SET DEFAULT 4;
 
 CREATE UNIQUE INDEX IF NOT EXISTS cache_affinity_conversation_unique
   ON cache_affinity_record

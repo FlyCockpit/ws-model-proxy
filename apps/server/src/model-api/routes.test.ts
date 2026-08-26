@@ -760,6 +760,41 @@ describe("model API routes", () => {
     expect(publicOverflow.dispatch).not.toHaveBeenCalled();
   });
 
+  it("does not rank Completions traffic even when a two-member pool has affinity enabled", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "member-a",
+        discoveredModelId: "model-a",
+        upstreamModelId: "upstream-a",
+        cliDeviceId: "cli-a",
+        affinityEnabled: true,
+      }),
+      poolMemberRow({
+        id: "member-b",
+        discoveredModelId: "model-b",
+        upstreamModelId: "upstream-b",
+        cliDeviceId: "cli-b",
+        affinityEnabled: true,
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-a", "cli-b"];
+    const responsePromise = appWith(manager).request("/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: JSON.stringify({ model: poolTarget.modelId, prompt: "secret prompt" }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    await completeJsonRelay({ manager, requestId: sent.requestId, body: { id: "cmpl-unranked" } });
+    expect((await responsePromise).status).toBe(200);
+    expect(affinity.rank).not.toHaveBeenCalled();
+  });
+
   it("adapts an opted-in Chat pool request through a Responses-only member", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
