@@ -8,6 +8,7 @@ import {
 import { poolModelId } from "@ws-model-proxy/config/forwarder-identifiers";
 import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { PRIORITY_CLASS_COUNT, scheduleWeightedDeficitRoundRobin } from "./scheduler.js";
 import type { AdmissionAttempt, CapacityLeaseHandle } from "./types.js";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
@@ -114,6 +115,19 @@ async function quiesceCapacityFixture(
   expect(await db.capacityLease.count({ where: { userId, state: "ACTIVE" } })).toBe(0);
   // Immutable lease/target history is retained until the disposable
   // validation database is removed; only live state can affect later tests.
+}
+
+async function expectCapacityFixtureQuiescent(
+  db: ReturnType<typeof createPrismaClient>,
+  userId: string,
+): Promise<void> {
+  expect(await db.capacityLease.count({ where: { userId, state: "ACTIVE" } })).toBe(0);
+  expect(await db.capacityWaiter.count({ where: { userId, state: "WAITING" } })).toBe(0);
+  expect(
+    await db.admissionRequest.count({
+      where: { userId, state: { in: ["WAITING", "ADMITTED"] } },
+    }),
+  ).toBe(0);
 }
 
 integration("capacity admission across operating-system processes", () => {
@@ -978,12 +992,26 @@ integration("capacity admission across operating-system processes", () => {
     const { credentialLookupPrefix, hmacDigestForForwarderPurpose } = await import(
       "@ws-model-proxy/db/forwarder-security"
     );
-    const upstreamResponses: Array<{ path: string; response: ServerResponse }> = [];
+    const upstreamResponses: Array<{ path: string; response: ServerResponse; label?: string }> = [];
     const observations: string[] = [];
     const upstream = createServer((request, response) => {
       const path = request.url ?? "";
       observations.push(path);
-      upstreamResponses.push({ path, response });
+      let body = "";
+      request.setEncoding("utf8");
+      request.on("data", (chunk: string) => (body += chunk));
+      request.on("end", () => {
+        let label: string | undefined;
+        try {
+          const parsed = JSON.parse(body) as { messages?: Array<{ content?: unknown }> };
+          const content = parsed.messages?.[0]?.content;
+          if (typeof content === "string") label = content;
+        } catch {
+          // Protocol validation is exercised by the production route. The
+          // upstream collector only needs labels for the scheduler proof.
+        }
+        upstreamResponses.push({ path, response, label });
+      });
     });
     await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
     const address = upstream.address();
@@ -998,7 +1026,9 @@ integration("capacity admission across operating-system processes", () => {
         slug: `production-process-${suffix}`,
       },
     });
-    fixtureUserIds.add(owner.id);
+    // This scenario proves that production lifecycle handling itself leaves no
+    // live capacity state. Its finally block asserts rather than repairing;
+    // exclude it from the generic repair-oriented fixture cleanup.
     const capacity = await db.inferenceCapacity.create({
       data: {
         userId: owner.id,
@@ -1021,7 +1051,12 @@ integration("capacity admission across operating-system processes", () => {
     const keyring = parseProviderCredentialKeyring(
       process.env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS,
     );
-    const createProvider = async (label: string, publicOrder: number) => {
+    const createProvider = async (
+      label: string,
+      publicOrder: number,
+      providerPool = pool,
+      providerCapacity = capacity,
+    ) => {
       const accountId = crypto.randomUUID();
       const credentialId = crypto.randomUUID();
       const account = await db.providerAccount.create({
@@ -1086,12 +1121,12 @@ integration("capacity admission across operating-system processes", () => {
           userId: owner.id,
           kind: "PROVIDER_MODEL",
           providerModelId: model.id,
-          inferenceCapacityId: capacity.id,
+          inferenceCapacityId: providerCapacity.id,
         },
       });
       await db.poolMember.create({
         data: {
-          poolId: pool.id,
+          poolId: providerPool.id,
           executionTargetId: target.id,
           tier: "PUBLIC_OVERFLOW",
           publicOrder,
@@ -1129,7 +1164,7 @@ integration("capacity admission across operating-system processes", () => {
           userId: owner.id,
           providerAccountId: account.id,
           providerModelId: model.id,
-          poolId: pool.id,
+          poolId: providerPool.id,
           scopeType: "POOL_PROVIDER_MODEL",
           active: true,
           activatedAt: new Date(Date.now() - 60_000),
@@ -1162,15 +1197,15 @@ integration("capacity admission across operating-system processes", () => {
       },
     });
     const modelId = poolModelId({ userSlug: owner.slug, poolSlug: pool.slug });
-    const request = (port: number) =>
+    const request = (port: number, requestedModelId = modelId, label = "hi", stream = true) =>
       fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
         method: "POST",
         headers: { authorization: `Bearer ${rawToken}`, "content-type": "application/json" },
         body: JSON.stringify({
-          model: modelId,
-          stream: true,
+          model: requestedModelId,
+          stream,
           max_tokens: 16,
-          messages: [{ role: "user", content: "hi" }],
+          messages: [{ role: "user", content: label }],
         }),
       });
     const workers = [
@@ -1183,6 +1218,7 @@ integration("capacity admission across operating-system processes", () => {
       if (!("port" in result)) throw new Error("Production worker did not become ready.");
       return result.port;
     });
+    let lifecycleCompleted = false;
     try {
       let priorProviderFence = 0n;
       for (const phase of ["before-byte", "after-byte"] as const) {
@@ -1363,6 +1399,24 @@ integration("capacity admission across operating-system processes", () => {
       const interrupted = await interruptedOutcome;
       if (!interrupted.response) throw interrupted.error;
       expect(interrupted.response.status).toBeGreaterThanOrEqual(400);
+      await interrupted.response.text();
+      try {
+        await waitFor(async () => {
+          const [activeLeases, liveWaiters, liveRequests] = await Promise.all([
+            db.capacityLease.count({ where: { userId: owner.id, state: "ACTIVE" } }),
+            db.capacityWaiter.count({ where: { userId: owner.id, state: "WAITING" } }),
+            db.admissionRequest.count({
+              where: { userId: owner.id, state: { in: ["WAITING", "ADMITTED"] } },
+            }),
+          ]);
+          return activeLeases === 0 && liveWaiters === 0 && liveRequests === 0 ? true : undefined;
+        });
+      } catch (error) {
+        throw new Error(
+          `Interrupted provider lifecycle did not terminalize: ${workers.map((worker) => worker.stderr()).join("\n")}`,
+          { cause: error },
+        );
+      }
       const interruptedLease = await db.providerAttempt.findFirst({
         where: { providerModelId: primary.model.id },
         orderBy: { createdAt: "desc" },
@@ -1391,10 +1445,245 @@ integration("capacity admission across operating-system processes", () => {
       expect(await db.providerAttempt.count({ where: { providerModelId: primary.model.id } })).toBe(
         3,
       );
+      expect(await db.capacityLease.count({ where: { userId: owner.id, state: "ACTIVE" } })).toBe(
+        0,
+      );
+      expect(await db.capacityWaiter.count({ where: { userId: owner.id, state: "WAITING" } })).toBe(
+        0,
+      );
+      expect(
+        await db.admissionRequest.count({
+          where: { userId: owner.id, state: { in: ["WAITING", "ADMITTED"] } },
+        }),
+      ).toBe(0);
+
+      const lowPool = await db.modelPool.create({
+        data: {
+          userId: owner.id,
+          slug: `production-low-${suffix}`,
+          name: "Production low-priority proof",
+          capacityPriority: 0,
+          protocolAdaptationEnabled: true,
+          publicEgressEnabled: true,
+          publicEgressAcknowledged: true,
+        },
+      });
+      const highPool = await db.modelPool.create({
+        data: {
+          userId: owner.id,
+          slug: `production-high-${suffix}`,
+          name: "Production high-priority proof",
+          capacityPriority: 31,
+          protocolAdaptationEnabled: true,
+          publicEgressEnabled: true,
+          publicEgressAcknowledged: true,
+        },
+      });
+      await createProvider("wdrr-low", 0, lowPool);
+      await createProvider("wdrr-high", 0, highPool);
+      const lowModelId = poolModelId({ userSlug: owner.slug, poolSlug: lowPool.slug });
+      const highModelId = poolModelId({ userSlug: owner.slug, poolSlug: highPool.slug });
+      upstreamResponses.length = 0;
+
+      const finishUpstream = (entry: { response: ServerResponse }, label: string) => {
+        entry.response.writeHead(200, { "content-type": "application/json" });
+        entry.response.end(
+          JSON.stringify({
+            id: `wdrr-${label}`,
+            object: "chat.completion",
+            created: 1,
+            model: "wdrr-proof",
+            choices: [{ index: 0, message: { role: "assistant", content: label } }],
+          }),
+        );
+      };
+      const pending = new Map<string, Promise<Response>>();
+      const owners = new Map<string, number>();
+      const enqueueProduction = (label: string, requestedModelId: string, workerIndex: number) => {
+        owners.set(label, workerIndex);
+        const promise = request(ports[workerIndex]!, requestedModelId, label, false);
+        pending.set(label, promise);
+        void promise.catch(() => undefined);
+      };
+
+      enqueueProduction("wdrr-blocker", lowModelId, 1);
+      const blockerUpstream = await waitFor(
+        () => upstreamResponses.find((entry) => entry.label === "wdrr-blocker"),
+        10_000,
+      );
+      const lowLabels = ["wdrr-low-head", "wdrr-low-second"];
+      for (const [index, label] of lowLabels.entries()) {
+        enqueueProduction(label, lowModelId, 1);
+        await waitFor(async () => {
+          const queued = await db.capacityWaiter.count({
+            where: { poolId: lowPool.id, state: "WAITING" },
+          });
+          return queued === index + 1 ? true : undefined;
+        });
+      }
+      const highLabels = Array.from({ length: 40 }, (_value, index) => `wdrr-high-${index}`);
+      // The tenth high-priority request is isolated on worker zero so that
+      // killing its admitted owner does not also kill the durable backlog.
+      const initialHighBacklog = 4;
+      for (const [index, label] of highLabels.slice(0, initialHighBacklog).entries())
+        enqueueProduction(label, highModelId, index === 9 ? 0 : 1);
+      await waitFor(async () => {
+        const queued = await db.capacityWaiter.count({
+          where: { capacityId: capacity.id, state: "WAITING" },
+        });
+        return queued === lowLabels.length + initialHighBacklog ? true : undefined;
+      }, 20_000);
+      await db.inferenceCapacity.update({
+        where: { id: capacity.id },
+        data: { schedulerCursor: 0, schedulerDeficits: Array(PRIORITY_CLASS_COUNT).fill(0) },
+      });
+      finishUpstream(blockerUpstream, "wdrr-blocker");
+      await (await pending.get("wdrr-blocker"))?.arrayBuffer();
+      pending.delete("wdrr-blocker");
+
+      const winners: string[] = [];
+      const consumedLabels = new Set(["wdrr-blocker"]);
+      const starvationBoundRounds = 33;
+      const totalQueued = lowLabels.length + highLabels.length;
+      let nextHighIndex = initialHighBacklog;
+      for (let round = 0; round < totalQueued; round++) {
+        const admittedUpstream = await waitFor(
+          () => upstreamResponses.find((entry) => entry.label && !consumedLabels.has(entry.label)),
+          20_000,
+        );
+        const label = admittedUpstream.label;
+        if (!label) throw new Error("Production WDRR upstream label missing.");
+        consumedLabels.add(label);
+        winners.push(label);
+        expect(
+          await db.capacityLease.count({ where: { capacityId: capacity.id, state: "ACTIVE" } }),
+        ).toBe(1);
+
+        if (label.startsWith("wdrr-high-") && nextHighIndex < highLabels.length) {
+          const replacementIndex = nextHighIndex++;
+          enqueueProduction(
+            highLabels[replacementIndex]!,
+            highModelId,
+            replacementIndex === 9 ? 0 : 1,
+          );
+          await waitFor(async () => {
+            const enqueued = await db.admissionRequest.count({
+              where: { poolId: highPool.id },
+            });
+            return enqueued === nextHighIndex ? true : undefined;
+          });
+        }
+
+        if (round === 10) {
+          expect(label).toBe("wdrr-high-9");
+          const ownerIndex = owners.get(label);
+          if (ownerIndex === undefined) throw new Error("Production WDRR owner missing.");
+          const schedulerBeforeRestart = await db.inferenceCapacity.findUniqueOrThrow({
+            where: { id: capacity.id },
+          });
+          await stop(workers[ownerIndex]!.child);
+          children.delete(workers[ownerIndex]!.child);
+          admittedUpstream.response.destroy(new Error("deterministic WDRR worker crash"));
+          const restarted = startWorker({ operation: "production-server" });
+          children.add(restarted.child);
+          const ready = await restarted.result;
+          if (!("port" in ready)) throw new Error("Production WDRR restart failed.");
+          workers[ownerIndex] = restarted;
+          ports[ownerIndex] = ready.port;
+          await expect(
+            db.inferenceCapacity.findUniqueOrThrow({ where: { id: capacity.id } }),
+          ).resolves.toMatchObject({
+            schedulerCursor: schedulerBeforeRestart.schedulerCursor,
+            schedulerDeficits: schedulerBeforeRestart.schedulerDeficits,
+          });
+
+          const candidates = await db.capacityWaiter.findMany({
+            where: {
+              capacityId: capacity.id,
+              state: "WAITING",
+              AdmissionRequest: { state: "WAITING" },
+            },
+            include: { AdmissionRequest: true },
+          });
+          const expected = scheduleWeightedDeficitRoundRobin({
+            state: {
+              cursor: schedulerBeforeRestart.schedulerCursor,
+              deficits: schedulerBeforeRestart.schedulerDeficits as number[],
+              version: schedulerBeforeRestart.schedulerVersion,
+            },
+            candidates: candidates.map((candidate) => ({
+              admissionRequestId: candidate.admissionRequestId,
+              waiterId: candidate.id,
+              candidateOrder: candidate.candidateOrder,
+              priority: candidate.effectivePriority,
+              enqueueSequence: candidate.AdmissionRequest.enqueueSequence,
+              eligible: true,
+            })),
+          });
+          if (!expected.winner) throw new Error("Expected a post-restart WDRR winner.");
+          const crashedLease = await db.capacityLease.findFirstOrThrow({
+            where: { capacityId: capacity.id, state: "ACTIVE" },
+          });
+          await db.capacityLease.update({
+            where: { id: crashedLease.id },
+            data: { expiresAt: new Date(Date.now() - 1) },
+          });
+          const repair = startWorker({ operation: "reclaim", limit: 10_000 });
+          children.add(repair.child);
+          await repair.result;
+          await expect(
+            db.inferenceCapacity.findUniqueOrThrow({ where: { id: capacity.id } }),
+          ).resolves.toMatchObject({
+            schedulerCursor: expected.state.cursor,
+            schedulerDeficits: expected.state.deficits,
+          });
+          const expectedRequest = candidates.find(
+            (candidate) => candidate.admissionRequestId === expected.winner?.admissionRequestId,
+          );
+          await expect(
+            db.capacityLease.findFirstOrThrow({
+              where: { capacityId: capacity.id, state: "ACTIVE" },
+            }),
+          ).resolves.toMatchObject({ attemptId: expectedRequest?.AdmissionRequest.attemptId });
+        } else {
+          finishUpstream(admittedUpstream, label);
+          await (await pending.get(label))?.arrayBuffer();
+          pending.delete(label);
+        }
+      }
+      expect(winners[0]).toBe(lowLabels[0]);
+      expect(winners.indexOf(lowLabels[1]!)).toBeGreaterThan(0);
+      expect(winners.indexOf(lowLabels[1]!)).toBeLessThanOrEqual(starvationBoundRounds);
+      expect(winners.filter((label) => label.startsWith("wdrr-high-")).length).toBeGreaterThan(
+        winners.filter((label) => label.startsWith("wdrr-low-")).length,
+      );
+      expect(new Set(winners).size).toBe(winners.length);
+      await waitFor(async () => {
+        const [activeLeases, liveWaiters, liveRequests] = await Promise.all([
+          db.capacityLease.count({ where: { userId: owner.id, state: "ACTIVE" } }),
+          db.capacityWaiter.count({ where: { userId: owner.id, state: "WAITING" } }),
+          db.admissionRequest.count({
+            where: { userId: owner.id, state: { in: ["WAITING", "ADMITTED"] } },
+          }),
+        ]);
+        return activeLeases === 0 && liveWaiters === 0 && liveRequests === 0 ? true : undefined;
+      });
+      expect(await db.capacityLease.count({ where: { userId: owner.id, state: "ACTIVE" } })).toBe(
+        0,
+      );
+      expect(await db.capacityWaiter.count({ where: { userId: owner.id, state: "WAITING" } })).toBe(
+        0,
+      );
+      expect(
+        await db.admissionRequest.count({
+          where: { userId: owner.id, state: { in: ["WAITING", "ADMITTED"] } },
+        }),
+      ).toBe(0);
+      lifecycleCompleted = true;
     } finally {
       for (const worker of workers) await stop(worker.child);
       await new Promise<void>((resolve) => upstream.close(() => resolve()));
-      await quiesceCapacityFixture(db, owner.id);
+      if (lifecycleCompleted) await expectCapacityFixtureQuiescent(db, owner.id);
       // Provider attempt/audit rows are append-only and deliberately retain
       // their owner. Quiescing capacity state prevents fixture rows from
       // affecting global sweepers while preserving that production invariant.
