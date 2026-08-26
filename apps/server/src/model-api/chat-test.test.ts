@@ -38,7 +38,12 @@ const mockedTokenAccess = tokenAccess as unknown as {
 };
 
 const db = prisma as unknown as {
+  $transaction: MockInstance;
+  $queryRaw: MockInstance;
   discoveredModel: {
+    findUnique: MockInstance;
+  };
+  executionTarget: {
     findUnique: MockInstance;
   };
   poolMember: {
@@ -50,6 +55,16 @@ const db = prisma as unknown as {
   relayRequest: {
     create: MockInstance;
     update: MockInstance;
+    updateMany: MockInstance;
+  };
+  relayExecutionEvent: {
+    create: MockInstance;
+    createMany: MockInstance;
+  };
+  relayExecutionAttempt: {
+    create: MockInstance;
+    findFirst: MockInstance;
+    updateMany: MockInstance;
   };
 };
 
@@ -350,13 +365,24 @@ function requireSent(manager: FakeRelayManager): SendRelayRequestArgs {
 describe("chat test routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    db.$transaction.mockImplementation(async (input: unknown) => {
+      if (typeof input === "function") return input(db);
+      return Promise.all(input as Promise<unknown>[]);
+    });
+    db.$queryRaw.mockResolvedValue([{ now: new Date("2026-08-26T00:00:00.000Z") }]);
     mockedTokenAccess.listVisibleModelTargetsForUser.mockResolvedValue({
       directModels: [directTarget],
       modelPools: [poolTarget],
     });
     db.discoveredModel.findUnique.mockResolvedValue(directRow());
+    db.executionTarget.findUnique.mockResolvedValue({ id: "execution-target-id" });
     db.relayRequest.create.mockResolvedValue({ id: "relay-request-id" });
     db.relayRequest.update.mockResolvedValue({ id: "relay-request-id" });
+    db.relayRequest.updateMany.mockResolvedValue({ count: 1 });
+    db.relayExecutionEvent.create.mockResolvedValue({ id: "relay-event-id" });
+    db.relayExecutionEvent.createMany.mockResolvedValue({ count: 1 });
+    db.relayExecutionAttempt.create.mockResolvedValue({ attemptId: "attempt-id" });
+    db.relayExecutionAttempt.updateMany.mockResolvedValue({ count: 1 });
   });
 
   it("requires a cookie-authenticated session", async () => {
@@ -541,12 +567,41 @@ describe("chat test routes", () => {
     await expect(response.text()).resolves.toBe(
       'data: {}\n\ndata: {"wsmp_metrics":{"completion_tokens":2,"tokenizer":"cl100k_base"}}\n\n',
     );
-    await vi.waitFor(() =>
+    await vi.waitFor(() => {
+      expect(db.relayExecutionAttempt.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            attemptId: sent.requestId,
+            state: "ACTIVE",
+          }),
+          data: expect.objectContaining({ state: "SUCCEEDED" }),
+        }),
+      );
+      expect(db.relayExecutionEvent.createMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: [
+            expect.objectContaining({
+              attemptId: sent.requestId,
+              eventType: "TERMINAL",
+              terminalState: "SUCCEEDED",
+              completionTokens: 3,
+              usageSource: "CLI_NORMALIZED",
+            }),
+          ],
+          skipDuplicates: true,
+        }),
+      );
       expect(db.relayRequest.update).toHaveBeenCalledWith(
         expect.objectContaining({
-          data: expect.objectContaining({ completionTokens: 3 }),
+          where: { id: "relay-request-id" },
+          data: expect.objectContaining({
+            status: "SUCCEEDED",
+            completionTokens: 3,
+            completedAt: new Date("2026-08-26T00:00:00.000Z"),
+          }),
+          select: { id: true },
         }),
-      ),
-    );
+      );
+    });
   });
 });
