@@ -6692,13 +6692,19 @@ async function relayBoundProviderResponse(input: {
     });
     if (admission.state !== "ADMITTED")
       return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" } as const;
-    const result = await dispatchPublicOverflow({
-      ...boundRequest,
-      memberTier,
-      forcedPoolMemberId: exactTarget.poolMemberId,
-    });
+    let result: Awaited<ReturnType<typeof dispatchPublicOverflow>>;
+    try {
+      result = await dispatchPublicOverflow({
+        ...boundRequest,
+        memberTier,
+        forcedPoolMemberId: exactTarget.poolMemberId,
+      });
+    } catch (error) {
+      await releaseCapacityLeaseWithRetry({ store: input.capacityRuntime, lease: admission.lease });
+      throw error;
+    }
     if (!result.dispatched) {
-      await input.capacityRuntime.release(admission.lease);
+      await releaseCapacityLeaseWithRetry({ store: input.capacityRuntime, lease: admission.lease });
       return result;
     }
     providerCapacityLease = admission.lease;

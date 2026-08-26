@@ -5003,6 +5003,22 @@ describe("model API routes", () => {
     expect(failedRead.status).toBe(500);
     expect(capacityRuntime.release).toHaveBeenCalledTimes(releaseCount + 2);
 
+    const dispatchFailureReleaseCount = vi.mocked(capacityRuntime.release).mock.calls.length;
+    publicOverflow.dispatch.mockRejectedValueOnce(new Error("provider dispatch disconnected"));
+    vi.mocked(capacityRuntime.release)
+      .mockRejectedValueOnce(new Error("capacity database disconnected"))
+      .mockResolvedValue(true);
+    const failedDispatch = await appWith(
+      new FakeRelayManager(),
+      true,
+      false,
+      capacityRuntime,
+    ).request("/responses/resp_provider", {
+      headers: { authorization: "Bearer wsmp_model_test" },
+    });
+    expect(failedDispatch.status).toBe(500);
+    expect(capacityRuntime.release).toHaveBeenCalledTimes(dispatchFailureReleaseCount + 2);
+
     publicOverflow.dispatch.mockResolvedValueOnce({
       dispatched: true,
       response: new Response(null, { status: 204 }),
@@ -5019,7 +5035,10 @@ describe("model API routes", () => {
     const releaseAcknowledged = new Promise<boolean>((resolve) => {
       acknowledgeRelease = resolve;
     });
-    vi.mocked(capacityRuntime.release).mockImplementationOnce(() => releaseAcknowledged);
+    const deleteReleaseCount = vi.mocked(capacityRuntime.release).mock.calls.length;
+    vi.mocked(capacityRuntime.release)
+      .mockRejectedValueOnce(new Error("capacity database disconnected"))
+      .mockImplementationOnce(() => releaseAcknowledged);
     let deleteSettled = false;
     const deletePromise = appWith(new FakeRelayManager(), true, false, capacityRuntime).request(
       "/responses/resp_provider",
@@ -5031,7 +5050,9 @@ describe("model API routes", () => {
     void Promise.resolve(deletePromise).then(() => {
       deleteSettled = true;
     });
-    await vi.waitFor(() => expect(capacityRuntime.release).toHaveBeenCalledTimes(releaseCount + 3));
+    await vi.waitFor(() =>
+      expect(capacityRuntime.release).toHaveBeenCalledTimes(deleteReleaseCount + 2),
+    );
     expect(deleteSettled).toBe(false);
     acknowledgeRelease(true);
     const deleted = await deletePromise;
