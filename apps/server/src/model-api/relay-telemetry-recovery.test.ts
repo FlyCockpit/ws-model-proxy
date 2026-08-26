@@ -12,6 +12,7 @@ const db = prisma as unknown as {
   relayExecutionEvent: { createMany: MockInstance };
   relayRequest: { update: MockInstance; updateMany: MockInstance };
   $transaction: MockInstance;
+  $queryRaw: MockInstance;
 };
 const recovery = await import("./relay-telemetry-recovery.js");
 
@@ -40,6 +41,7 @@ describe("local relay telemetry lifecycle", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     db.$transaction.mockImplementation(async (run: (tx: typeof db) => Promise<number>) => run(db));
+    db.$queryRaw.mockResolvedValue([{ now: new Date("2026-08-26T00:00:00.000Z") }]);
     db.relayExecutionAttempt.updateMany.mockResolvedValue({ count: 1 });
     db.relayExecutionEvent.createMany.mockResolvedValue({ count: 1 });
     db.relayRequest.updateMany.mockResolvedValue({ count: 1 });
@@ -48,7 +50,7 @@ describe("local relay telemetry lifecycle", () => {
 
   it("heartbeats only active attempts owned by this process epoch", async () => {
     const now = new Date("2026-08-26T00:00:00.000Z");
-    await recovery.heartbeatOwnedLocalRelayAttempts({ now });
+    await recovery.heartbeatOwnedLocalRelayAttempts();
     expect(db.relayExecutionAttempt.updateMany).toHaveBeenCalledWith({
       where: { ownerEpoch: recovery.LOCAL_RELAY_PROCESS_EPOCH, state: "ACTIVE" },
       data: {
@@ -60,11 +62,7 @@ describe("local relay telemetry lifecycle", () => {
 
   it("rechecks the expired foreign owner transactionally before crash recovery", async () => {
     db.relayExecutionAttempt.findMany.mockResolvedValue([attempt({ prompt: "must-not-copy" })]);
-    await expect(
-      recovery.reconcileStaleLocalRelayTelemetry({
-        now: new Date("2026-08-26T00:00:00.000Z"),
-      }),
-    ).resolves.toBe(1);
+    await expect(recovery.reconcileStaleLocalRelayTelemetry()).resolves.toBe(1);
     expect(db.relayExecutionAttempt.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({
@@ -94,7 +92,7 @@ describe("local relay telemetry lifecycle", () => {
   it("does not select healthy or current-process attempts for recovery", async () => {
     db.relayExecutionAttempt.findMany.mockResolvedValue([]);
     const now = new Date("2026-08-26T00:00:00.000Z");
-    await recovery.reconcileStaleLocalRelayTelemetry({ now });
+    await recovery.reconcileStaleLocalRelayTelemetry();
     expect(db.relayExecutionAttempt.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: {

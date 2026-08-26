@@ -439,6 +439,20 @@ FROM relay_execution_event event
 WHERE event."eventType" = 'ATTEMPT_STARTED'
 ON CONFLICT ("attemptId") DO NOTHING;
 
+WITH latest_terminal AS (
+  SELECT DISTINCT ON ("relayRequestId") "relayRequestId", "createdAt", "terminalState", "errorClass"
+    FROM relay_execution_event
+   WHERE "eventType" IN ('TERMINAL', 'CRASH_RECOVERED')
+     AND "attemptKind" = 'EXECUTION' AND "terminalState" IS NOT NULL
+   ORDER BY "relayRequestId", "createdAt" DESC
+)
+UPDATE relay_request request
+   SET status = terminal."terminalState"::"RelayRequestStatus",
+       "completedAt" = COALESCE(request."completedAt", terminal."createdAt"),
+       "errorClass" = COALESCE(request."errorClass", terminal."errorClass")
+  FROM latest_terminal terminal
+ WHERE request.id = terminal."relayRequestId" AND request.status = 'PENDING';
+
 ALTER TABLE relay_execution_attempt DROP CONSTRAINT IF EXISTS relay_execution_attempt_shape_check;
 ALTER TABLE relay_execution_attempt ADD CONSTRAINT relay_execution_attempt_shape_check CHECK (
   state IN ('ACTIVE', 'SUCCEEDED', 'FAILED', 'CANCELED')
@@ -453,12 +467,11 @@ CREATE OR REPLACE FUNCTION enforce_relay_execution_attempt_transition()
 RETURNS trigger LANGUAGE plpgsql AS $relay_execution_attempt_transition$
 BEGIN
   IF TG_OP = 'DELETE' THEN
-    RAISE EXCEPTION 'relay execution attempts cannot be deleted' USING ERRCODE = '55000';
+    RETURN OLD;
   END IF;
   IF NEW."attemptId" IS DISTINCT FROM OLD."attemptId"
      OR NEW."userId" IS DISTINCT FROM OLD."userId"
      OR NEW."relayRequestId" IS DISTINCT FROM OLD."relayRequestId"
-     OR NEW."ownerEpoch" IS DISTINCT FROM OLD."ownerEpoch"
      OR NEW."attemptKind" IS DISTINCT FROM OLD."attemptKind"
      OR NEW."requestedSurface" IS DISTINCT FROM OLD."requestedSurface"
      OR NEW."nativeSurface" IS DISTINCT FROM OLD."nativeSurface"
@@ -466,6 +479,9 @@ BEGIN
      OR NEW."poolMemberId" IS DISTINCT FROM OLD."poolMemberId"
      OR NEW."executionTargetId" IS DISTINCT FROM OLD."executionTargetId" THEN
     RAISE EXCEPTION 'relay execution attempt identity is immutable' USING ERRCODE = '55000';
+  END IF;
+  IF NEW."ownerEpoch" IS DISTINCT FROM OLD."ownerEpoch" AND NEW.state = 'ACTIVE' THEN
+    RAISE EXCEPTION 'active relay execution ownership is immutable' USING ERRCODE = '55000';
   END IF;
   IF OLD.state <> 'ACTIVE' THEN
     RAISE EXCEPTION 'terminal relay execution attempt is immutable' USING ERRCODE = '55000';
@@ -1889,7 +1905,7 @@ DROP TRIGGER IF EXISTS public_provider_attempt_event_immutable ON public_provide
 CREATE TRIGGER public_provider_attempt_event_immutable BEFORE UPDATE OR DELETE ON public_provider_attempt_event
 FOR EACH ROW EXECUTE FUNCTION reject_immutable_provider_history_mutation();
 DROP TRIGGER IF EXISTS relay_execution_event_immutable ON relay_execution_event;
-CREATE TRIGGER relay_execution_event_immutable BEFORE UPDATE OR DELETE ON relay_execution_event
+CREATE TRIGGER relay_execution_event_immutable BEFORE UPDATE ON relay_execution_event
 FOR EACH ROW EXECUTE FUNCTION reject_immutable_provider_history_mutation();
 CREATE OR REPLACE FUNCTION enforce_provider_budget_reservation_transition()
 RETURNS trigger LANGUAGE plpgsql AS $provider_budget_reservation_transition$

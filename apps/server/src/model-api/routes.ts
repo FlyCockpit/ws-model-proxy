@@ -507,19 +507,30 @@ async function nativeContextCount({
     }
     const payload = await readBoundedJson(started.body, NATIVE_CONTEXT_COUNT_MAX_BYTES);
     const terminal = await attempt.terminal;
-    await recordLocalTerminal(relayRequestId, requester.userId, localExecution, terminal);
-    if (!terminal.ok || !isJsonObject(payload)) return countWithConfiguredCounter();
-    const tokens = payload.input_tokens;
-    if (!Number.isSafeInteger(tokens) || (tokens as number) < 0)
+    if (!terminal.ok || !isJsonObject(payload)) {
+      await recordLocalTerminal(relayRequestId, requester.userId, localExecution, terminal);
       return countWithConfiguredCounter();
-    return {
+    }
+    const tokens = payload.input_tokens;
+    if (!Number.isSafeInteger(tokens) || (tokens as number) < 0) {
+      await recordLocalTerminal(relayRequestId, requester.userId, localExecution, terminal);
+      return countWithConfiguredCounter();
+    }
+    const exactCount = {
       tokens: tokens as number,
-      method: "NATIVE",
-      exact: true,
-      confidence: "EXACT",
+      method: "NATIVE" as const,
+      exact: true as const,
+      confidence: "EXACT" as const,
       safetyMargin: 1,
       serializedChars: JSON.stringify(operation.contextInput).length,
     };
+    await recordLocalTerminal(
+      relayRequestId,
+      requester.userId,
+      { ...localExecution, contextCount: exactCount },
+      terminal,
+    );
+    return exactCount;
   } catch {
     attempt?.cancel(request.signal.aborted ? "cancelled" : "protocol_error");
     if (attempt) {
@@ -1887,90 +1898,92 @@ async function updateRelayMetadata(relayRequestId: string, update: RelayMetadata
         select: { id: true },
       })
     : null;
-  const relayUpdate = prisma.relayRequest.update({
-    where: { id: relayRequestId },
-    data: {
-      selectedDiscoveredModelId: update.selectedDiscoveredModelId ?? null,
-      selectedExecutionTargetId: selectedExecutionTarget?.id ?? null,
-      status: update.status,
-      completedAt,
-      durationMs: Math.max(0, completedAt.getTime() - update.startedAt.getTime()),
-      promptTokens: update.terminal.usage?.promptTokens ?? null,
-      completionTokens: update.terminal.usage?.completionTokens ?? null,
-      totalTokens: update.terminal.usage?.totalTokens ?? null,
-      httpStatusCode:
-        update.terminal.httpStatusCode ?? (failure ? relayFailureHttpStatus(failure) : null),
-      upstreamStatusCode: update.terminal.upstreamStatusCode,
-      requestBytes: BigInt(update.terminal.requestBytes),
-      responseBytes: BigInt(update.terminal.responseBytes),
-      ...(update.attemptCount !== undefined ? { attemptCount: update.attemptCount } : {}),
-      ...(update.affinity
-        ? {
-            affinityOutcome: update.affinity.outcome,
-            affinityScore: update.affinity.score,
-            affinityPrefixDepth: update.affinity.prefixDepth,
-            affinityReason: update.affinity.reason,
-          }
-        : {}),
-      ...(update.execution
-        ? {
-            ...(update.execution.selectedExecutionTargetId
-              ? { selectedExecutionTargetId: update.execution.selectedExecutionTargetId }
-              : {}),
-            selectedPoolMemberId: update.execution.selectedPoolMemberId ?? null,
-            selectedPoolMemberTier: update.execution.selectedPoolMemberTier ?? null,
-            selectedNativeSurface: update.execution.nativeSurface,
-            adapterMode: update.execution.adapterMode,
-            adapterVersion: update.execution.adapterVersion ?? null,
-            localAttemptId: update.execution.localAttemptId,
-          }
-        : {}),
-      errorClass: failure,
-      ...(update.transformerLatencyMs !== undefined
-        ? { transformerLatencyMs: update.transformerLatencyMs }
-        : {}),
-      ...(update.transformerCacheHit !== undefined
-        ? { transformerCacheHit: update.transformerCacheHit }
-        : {}),
-      ...(update.transformerErrorClass !== undefined
-        ? { transformerErrorClass: update.transformerErrorClass }
-        : {}),
-    },
-    select: { id: true },
-  });
+  const relayData = {
+    selectedDiscoveredModelId: update.selectedDiscoveredModelId ?? null,
+    selectedExecutionTargetId: selectedExecutionTarget?.id ?? null,
+    status: update.status,
+    completedAt,
+    durationMs: Math.max(0, completedAt.getTime() - update.startedAt.getTime()),
+    promptTokens: update.terminal.usage?.promptTokens ?? null,
+    completionTokens: update.terminal.usage?.completionTokens ?? null,
+    totalTokens: update.terminal.usage?.totalTokens ?? null,
+    httpStatusCode:
+      update.terminal.httpStatusCode ?? (failure ? relayFailureHttpStatus(failure) : null),
+    upstreamStatusCode: update.terminal.upstreamStatusCode,
+    requestBytes: BigInt(update.terminal.requestBytes),
+    responseBytes: BigInt(update.terminal.responseBytes),
+    ...(update.attemptCount !== undefined ? { attemptCount: update.attemptCount } : {}),
+    ...(update.affinity
+      ? {
+          affinityOutcome: update.affinity.outcome,
+          affinityScore: update.affinity.score,
+          affinityPrefixDepth: update.affinity.prefixDepth,
+          affinityReason: update.affinity.reason,
+        }
+      : {}),
+    ...(update.execution
+      ? {
+          ...(update.execution.selectedExecutionTargetId
+            ? { selectedExecutionTargetId: update.execution.selectedExecutionTargetId }
+            : {}),
+          selectedPoolMemberId: update.execution.selectedPoolMemberId ?? null,
+          selectedPoolMemberTier: update.execution.selectedPoolMemberTier ?? null,
+          selectedNativeSurface: update.execution.nativeSurface,
+          adapterMode: update.execution.adapterMode,
+          adapterVersion: update.execution.adapterVersion ?? null,
+          localAttemptId: update.execution.localAttemptId,
+        }
+      : {}),
+    errorClass: failure,
+    ...(update.transformerLatencyMs !== undefined
+      ? { transformerLatencyMs: update.transformerLatencyMs }
+      : {}),
+    ...(update.transformerCacheHit !== undefined
+      ? { transformerCacheHit: update.transformerCacheHit }
+      : {}),
+    ...(update.transformerErrorClass !== undefined
+      ? { transformerErrorClass: update.transformerErrorClass }
+      : {}),
+  };
   if (update.localExecution && update.userId) {
+    const localExecution = update.localExecution;
+    const updateUserId = update.userId;
     const localTerminal = update.localTerminal ?? update.terminal;
-    await prisma.$transaction([
-      prisma.relayExecutionAttempt.updateMany({
+    await prisma.$transaction(async (tx) => {
+      const [clock] = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
+      if (!clock) throw new Error("Database clock query returned no row");
+      const claimed = await tx.relayExecutionAttempt.updateMany({
         where: {
-          attemptId: update.localExecution.localAttemptId,
+          attemptId: localExecution.localAttemptId,
           ownerEpoch: LOCAL_RELAY_PROCESS_EPOCH,
           state: "ACTIVE",
         },
         data: {
           state: terminalStatus(localTerminal),
-          terminalAt: new Date(),
+          terminalAt: clock.now,
           terminalState: terminalStatus(localTerminal),
           requestBytes: BigInt(localTerminal.requestBytes),
           responseBytes: BigInt(localTerminal.responseBytes),
         },
-      }),
-      prisma.relayExecutionEvent.createMany({
-        data: [
-          localTerminalEventData(
-            relayRequestId,
-            update.userId,
-            update.localExecution,
-            localTerminal,
-          ),
-        ],
+      });
+      if (claimed.count === 0) return;
+      await tx.relayExecutionEvent.createMany({
+        data: [localTerminalEventData(relayRequestId, updateUserId, localExecution, localTerminal)],
         skipDuplicates: true,
-      }),
-      relayUpdate,
-    ]);
+      });
+      await tx.relayRequest.update({
+        where: { id: relayRequestId },
+        data: relayData,
+        select: { id: true },
+      });
+    });
     return;
   }
-  await relayUpdate;
+  await prisma.relayRequest.update({
+    where: { id: relayRequestId },
+    data: relayData,
+    select: { id: true },
+  });
 }
 
 async function updateContextCountMetadata(
@@ -2008,9 +2021,11 @@ async function startLocalExecutionTelemetry(
   userId: string,
   execution: LocalExecutionTelemetry,
 ) {
-  const now = new Date();
-  await prisma.$transaction([
-    prisma.relayExecutionAttempt.create({
+  await prisma.$transaction(async (tx) => {
+    const [clock] = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
+    if (!clock) throw new Error("Database clock query returned no row");
+    const now = clock.now;
+    await tx.relayExecutionAttempt.create({
       data: {
         attemptId: execution.localAttemptId,
         userId,
@@ -2028,8 +2043,8 @@ async function startLocalExecutionTelemetry(
         executionTargetId: execution.selectedExecutionTargetId ?? null,
         memberTier: execution.selectedPoolMemberTier ?? null,
       },
-    }),
-    prisma.relayExecutionEvent.create({
+    });
+    await tx.relayExecutionEvent.create({
       data: {
         userId,
         relayRequestId,
@@ -2052,8 +2067,8 @@ async function startLocalExecutionTelemetry(
         admissionFencingToken: execution.admission?.fencingToken ?? null,
         waitDurationMs: execution.admission?.waitDurationMs ?? null,
       },
-    }),
-    prisma.relayRequest.update({
+    });
+    await tx.relayRequest.update({
       where: { id: relayRequestId },
       data: {
         ...(execution.selectedExecutionTargetId
@@ -2067,8 +2082,8 @@ async function startLocalExecutionTelemetry(
         localAttemptId: execution.localAttemptId,
       },
       select: { id: true },
-    }),
-  ]);
+    });
+  });
 }
 
 async function recordLocalTerminal(
@@ -2078,6 +2093,8 @@ async function recordLocalTerminal(
   terminal: RelayAttemptTerminal,
 ) {
   await prisma.$transaction(async (tx) => {
+    const [clock] = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
+    if (!clock) throw new Error("Database clock query returned no row");
     const claimed = await tx.relayExecutionAttempt.updateMany({
       where: {
         attemptId: execution.localAttemptId,
@@ -2086,12 +2103,13 @@ async function recordLocalTerminal(
       },
       data: {
         state: terminalStatus(terminal),
-        terminalAt: new Date(),
+        terminalAt: clock.now,
         terminalState: terminalStatus(terminal),
         requestBytes: BigInt(terminal.requestBytes),
         responseBytes: BigInt(terminal.responseBytes),
       },
     });
+    if (claimed.count === 0) return;
     await tx.relayExecutionEvent.createMany({
       data: [localTerminalEventData(relayRequestId, userId, execution, terminal)],
       skipDuplicates: true,
@@ -2129,6 +2147,9 @@ function localTerminalEventData(
     poolMemberId: execution.selectedPoolMemberId ?? null,
     executionTargetId: execution.selectedExecutionTargetId ?? null,
     memberTier: execution.selectedPoolMemberTier ?? null,
+    contextCountMethod: execution.contextCount?.method ?? null,
+    contextCountConfidence: execution.contextCount?.confidence ?? null,
+    contextTokens: execution.contextCount?.tokens ?? null,
     terminalState: terminalStatus(terminal),
     httpStatusCode: terminal.httpStatusCode,
     upstreamStatusCode: terminal.upstreamStatusCode,
@@ -2145,9 +2166,33 @@ async function markLocalFirstClientByte(
   userId: string,
   execution: LocalExecutionTelemetry,
 ) {
-  const now = new Date();
-  await prisma.$transaction([
-    prisma.relayExecutionEvent.createMany({
+  await prisma.$transaction(async (tx) => {
+    const [clock] = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
+    if (!clock) throw new Error("Database clock query returned no row");
+    const now = clock.now;
+    const claimed = await tx.relayExecutionAttempt.updateMany({
+      where: {
+        attemptId: execution.localAttemptId,
+        ownerEpoch: LOCAL_RELAY_PROCESS_EPOCH,
+        state: "ACTIVE",
+      },
+      data: {
+        heartbeatAt: now,
+        expiresAt: new Date(now.getTime() + LOCAL_RELAY_ATTEMPT_TTL_MS),
+      },
+    });
+    if (claimed.count === 0) {
+      const ownedTerminal = await tx.relayExecutionAttempt.findFirst({
+        where: {
+          attemptId: execution.localAttemptId,
+          ownerEpoch: LOCAL_RELAY_PROCESS_EPOCH,
+          state: { in: ["SUCCEEDED", "FAILED", "CANCELED"] },
+        },
+        select: { attemptId: true },
+      });
+      if (!ownedTerminal) return;
+    }
+    await tx.relayExecutionEvent.createMany({
       data: [
         {
           userId,
@@ -2167,23 +2212,12 @@ async function markLocalFirstClientByte(
         },
       ],
       skipDuplicates: true,
-    }),
-    prisma.relayExecutionAttempt.updateMany({
-      where: {
-        attemptId: execution.localAttemptId,
-        ownerEpoch: LOCAL_RELAY_PROCESS_EPOCH,
-        state: "ACTIVE",
-      },
-      data: {
-        heartbeatAt: now,
-        expiresAt: new Date(now.getTime() + LOCAL_RELAY_ATTEMPT_TTL_MS),
-      },
-    }),
-    prisma.relayRequest.updateMany({
+    });
+    await tx.relayRequest.updateMany({
       where: { id: relayRequestId, firstClientByteAt: null },
       data: { firstClientByteAt: now, streamCommitted: true },
-    }),
-  ]);
+    });
+  });
 }
 
 async function updateAdmissionMetadata(
@@ -3947,14 +3981,20 @@ async function relayPool({
       result.nativeSurface === requestedSurface &&
       (result.response.status < 200 || result.response.status >= 300)
     ) {
-      const sanitized = await readAdaptedNonstreamBody({
-        body: result.response.body,
-        source: requestedSurface,
-        target: requestedSurface,
-        status: result.response.status,
-        headers: result.response.headers,
-        signal: request.signal,
-      });
+      let sanitized: Uint8Array;
+      try {
+        sanitized = await readAdaptedNonstreamBody({
+          body: result.response.body,
+          source: requestedSurface,
+          target: requestedSurface,
+          status: result.response.status,
+          headers: result.response.headers,
+          signal: request.signal,
+        });
+      } catch (error) {
+        if (providerCapacityLease) await releasePreAdmittedProviderLease(providerCapacityLease);
+        throw error;
+      }
       return commitAwareResponse(
         new Response(sanitized, {
           status:

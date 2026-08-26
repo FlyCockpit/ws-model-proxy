@@ -84,6 +84,7 @@ type CancelRelayRequestArgs = Parameters<RelaySessionManager["cancelRelayRequest
 
 const db = prisma as unknown as {
   $transaction: MockInstance;
+  $queryRaw: MockInstance;
   executionTarget: { findUnique: MockInstance };
   discoveredModel: {
     findUnique: MockInstance;
@@ -105,7 +106,11 @@ const db = prisma as unknown as {
     updateMany: MockInstance;
   };
   relayExecutionEvent: { create: MockInstance; createMany: MockInstance };
-  relayExecutionAttempt: { create: MockInstance; updateMany: MockInstance };
+  relayExecutionAttempt: {
+    create: MockInstance;
+    findFirst: MockInstance;
+    updateMany: MockInstance;
+  };
   responseStickinessRecord: {
     findUnique: MockInstance;
     upsert: MockInstance;
@@ -603,6 +608,7 @@ describe("model API routes", () => {
       if (typeof input === "function") return input(db);
       return Promise.all(input as Promise<unknown>[]);
     });
+    db.$queryRaw.mockResolvedValue([{ now: new Date("2026-08-26T00:00:00.000Z") }]);
     mockedTokenAccess.authenticateModelApiTokenSecret.mockResolvedValue(token);
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [directTarget],

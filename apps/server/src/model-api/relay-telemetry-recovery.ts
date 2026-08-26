@@ -3,17 +3,27 @@ import prisma from "@ws-model-proxy/db";
 export const LOCAL_RELAY_PROCESS_EPOCH = crypto.randomUUID();
 export const LOCAL_RELAY_ATTEMPT_TTL_MS = 2 * 60 * 1000;
 
-export async function heartbeatOwnedLocalRelayAttempts({ now = new Date() } = {}) {
-  return prisma.relayExecutionAttempt.updateMany({
-    where: { ownerEpoch: LOCAL_RELAY_PROCESS_EPOCH, state: "ACTIVE" },
-    data: {
-      heartbeatAt: now,
-      expiresAt: new Date(now.getTime() + LOCAL_RELAY_ATTEMPT_TTL_MS),
-    },
+async function databaseNow(client: Pick<typeof prisma, "$queryRaw">) {
+  const [clock] = await client.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
+  if (!clock) throw new Error("Database clock query returned no row");
+  return clock.now;
+}
+
+export async function heartbeatOwnedLocalRelayAttempts() {
+  return prisma.$transaction(async (tx) => {
+    const now = await databaseNow(tx);
+    return tx.relayExecutionAttempt.updateMany({
+      where: { ownerEpoch: LOCAL_RELAY_PROCESS_EPOCH, state: "ACTIVE" },
+      data: {
+        heartbeatAt: now,
+        expiresAt: new Date(now.getTime() + LOCAL_RELAY_ATTEMPT_TTL_MS),
+      },
+    });
   });
 }
 
-export async function reconcileStaleLocalRelayTelemetry({ now = new Date(), limit = 500 } = {}) {
+export async function reconcileStaleLocalRelayTelemetry({ limit = 500 } = {}) {
+  const now = await databaseNow(prisma);
   const candidates = await prisma.relayExecutionAttempt.findMany({
     where: {
       state: "ACTIVE",
@@ -26,16 +36,18 @@ export async function reconcileStaleLocalRelayTelemetry({ now = new Date(), limi
   let recovered = 0;
   for (const attempt of candidates) {
     recovered += await prisma.$transaction(async (tx) => {
+      const claimTime = await databaseNow(tx);
       const claimed = await tx.relayExecutionAttempt.updateMany({
         where: {
           attemptId: attempt.attemptId,
           ownerEpoch: attempt.ownerEpoch,
           state: "ACTIVE",
-          expiresAt: { lte: now },
+          expiresAt: { lte: claimTime },
         },
         data: {
+          ownerEpoch: LOCAL_RELAY_PROCESS_EPOCH,
           state: "FAILED",
-          terminalAt: now,
+          terminalAt: claimTime,
           terminalState: "FAILED",
           requestBytes: attempt.requestBytes ?? 0n,
           responseBytes: attempt.responseBytes ?? 0n,
@@ -74,7 +86,7 @@ export async function reconcileStaleLocalRelayTelemetry({ now = new Date(), limi
           where: { id: attempt.relayRequestId, status: "PENDING" },
           data: {
             status: "FAILED",
-            completedAt: now,
+            completedAt: claimTime,
             errorClass: "crash_recovered",
             admissionTerminalState: "CRASH_RECOVERED",
           },
