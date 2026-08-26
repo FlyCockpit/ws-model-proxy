@@ -1579,12 +1579,12 @@ integration("capacity admission across operating-system processes", () => {
           60_000,
         );
         consumedUpstreams.add(admittedUpstream.response);
-        const label =
-          admittedUpstream.label ??
-          (admittedUpstream.path.includes("/wdrr-high/")
-            ? highLabels[winners.filter((winner) => winner.startsWith("wdrr-high-")).length]
-            : lowLabels[winners.filter((winner) => winner.startsWith("wdrr-low-")).length]);
+        const label = admittedUpstream.label;
         if (!label) throw new Error("Production WDRR FIFO label unavailable.");
+        const expectedLabel = label.startsWith("wdrr-high-")
+          ? highLabels[winners.filter((winner) => winner.startsWith("wdrr-high-")).length]
+          : lowLabels[winners.filter((winner) => winner.startsWith("wdrr-low-")).length];
+        expect(label).toBe(expectedLabel);
         winners.push(label);
         expect(
           await db.capacityLease.count({ where: { capacityId: capacity.id, state: "ACTIVE" } }),

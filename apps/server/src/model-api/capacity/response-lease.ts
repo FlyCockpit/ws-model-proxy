@@ -1,5 +1,32 @@
 import type { CapacityAdmissionStore, CapacityLeaseHandle } from "./types.js";
 
+const reportCleanupFailure = (operation: "cancel" | "release", error: unknown) => {
+  console.warn("[capacity] response lease cleanup failed", {
+    operation,
+    errorClass: error instanceof Error ? error.name : "UnknownError",
+  });
+};
+
+export async function releaseCapacityLeaseWithRetry({
+  store,
+  lease,
+}: {
+  store: Pick<CapacityAdmissionStore, "release">;
+  lease: CapacityLeaseHandle;
+}): Promise<void> {
+  let lastError: unknown;
+  for (const retryDelayMs of [0, 25, 100, 250]) {
+    if (retryDelayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, retryDelayMs));
+    try {
+      if (await store.release(lease)) return;
+      lastError = new Error("Capacity release was not acknowledged.");
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  reportCleanupFailure("release", lastError);
+}
+
 export function holdCapacityLeaseForResponse({
   response,
   store,
@@ -15,15 +42,8 @@ export function holdCapacityLeaseForResponse({
   heartbeatIntervalMs?: number;
   leaseExtensionMs?: number;
 }): Response {
-  const reportCleanupFailure = (operation: "cancel" | "release", error: unknown) => {
-    // Never include arbitrary upstream/driver messages: they may contain request
-    // or credential material. The operation and error class are sufficient for
-    // an operator to correlate cleanup failures with service telemetry.
-    console.warn("[capacity] response lease cleanup failed", {
-      operation,
-      errorClass: error instanceof Error ? error.name : "UnknownError",
-    });
-  };
+  if (!response.body)
+    throw new Error("Bodyless capacity responses must release before returning to the client.");
   let finished = false;
   let heartbeatRunning = false;
   let timer: ReturnType<typeof setInterval> | undefined;
@@ -34,17 +54,7 @@ export function holdCapacityLeaseForResponse({
     finished = true;
     if (timer) clearInterval(timer);
     signal?.removeEventListener("abort", abort);
-    let lastError: unknown;
-    for (const retryDelayMs of [0, 25, 100, 250]) {
-      if (retryDelayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, retryDelayMs));
-      try {
-        if (await store.release(lease)) return;
-        lastError = new Error("Capacity release was not acknowledged.");
-      } catch (error) {
-        lastError = error;
-      }
-    }
-    reportCleanupFailure("release", lastError);
+    await releaseCapacityLeaseWithRetry({ store, lease });
   };
   const heartbeat = async () => {
     if (finished || heartbeatRunning) return;
@@ -58,7 +68,7 @@ export function holdCapacityLeaseForResponse({
       heartbeatRunning = false;
     }
   };
-  const reader = response.body?.getReader();
+  const reader = response.body.getReader();
   const loseLease = async (reason: unknown) => {
     if (finished) return;
     terminalError =
@@ -67,7 +77,7 @@ export function holdCapacityLeaseForResponse({
         : new Error("Capacity lease was lost while streaming.", { cause: reason });
     downstream?.error(terminalError);
     try {
-      await reader?.cancel(terminalError);
+      await reader.cancel(terminalError);
     } catch (error) {
       reportCleanupFailure("cancel", error);
     }
@@ -79,10 +89,6 @@ export function holdCapacityLeaseForResponse({
   signal?.addEventListener("abort", abort, { once: true });
   if (heartbeatIntervalMs > 0) timer = setInterval(() => void heartbeat(), heartbeatIntervalMs);
 
-  if (!reader) {
-    void finish();
-    return response;
-  }
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
       downstream = controller;

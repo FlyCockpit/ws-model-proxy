@@ -57,10 +57,12 @@ import {
 } from "./capacity/context.js";
 import { contextCounterRegistry } from "./capacity/counter-registry.js";
 import { PostgresCapacityAdmissionStore } from "./capacity/postgres-store.js";
+import { releaseCapacityLeaseWithRetry } from "./capacity/response-lease.js";
 import {
   type CapacityAdmissionRuntime,
   StoreCapacityAdmissionRuntime,
 } from "./capacity/runtime.js";
+import type { CapacityLeaseHandle } from "./capacity/types.js";
 import {
   allowsChatTestExecutionMode,
   resolveChatTestRoutingMode,
@@ -188,6 +190,17 @@ type ModelApiRouteDependencies = {
   capacityEnabled?: boolean;
   capacityRuntime?: CapacityAdmissionRuntime;
 };
+
+async function holdOrReleaseCapacityResponse(
+  runtime: CapacityAdmissionRuntime,
+  response: Response,
+  lease: CapacityLeaseHandle,
+  signal?: AbortSignal,
+): Promise<Response> {
+  if (response.body) return runtime.hold(response, lease, signal);
+  await releaseCapacityLeaseWithRetry({ store: runtime, lease });
+  return response;
+}
 
 type JsonObject = Record<string, unknown>;
 
@@ -3564,8 +3577,13 @@ async function relayDirect({
       ),
       () => markLocalFirstClientByte(relayRequestId, requester.userId, localExecution),
     );
-    return capacityLease?.state === "ADMITTED"
-      ? (capacityRuntime?.hold(response, capacityLease.lease, request.signal) ?? response)
+    return capacityLease?.state === "ADMITTED" && capacityRuntime
+      ? await holdOrReleaseCapacityResponse(
+          capacityRuntime,
+          response,
+          capacityLease.lease,
+          request.signal,
+        )
       : response;
   } catch {
     const terminal = await attempt.terminal.catch(() => rejectedRelayTerminal());
@@ -3975,10 +3993,15 @@ async function relayPool({
     // Native response bytes remain opaque. Cross-protocol provider response
     // adaptation is handled by the same strict streaming/non-streaming state
     // machines as local targets.
-    const commitAwareResponse = (response: Response) => {
+    const commitAwareResponse = async (response: Response) => {
       const committed = responseWithFirstClientByte(response, result.markFirstClientByte);
       return providerCapacityLease && capacityRuntime
-        ? capacityRuntime.hold(committed, providerCapacityLease, request.signal)
+        ? await holdOrReleaseCapacityResponse(
+            capacityRuntime,
+            committed,
+            providerCapacityLease,
+            request.signal,
+          )
         : committed;
     };
     if (
@@ -5322,8 +5345,13 @@ async function relayPool({
         }),
         () => markLocalFirstClientByte(relayRequestId, requester.userId, localExecution),
       );
-      return capacityLease?.state === "ADMITTED"
-        ? (capacityRuntime?.hold(response, capacityLease.lease, request.signal) ?? response)
+      return capacityLease?.state === "ADMITTED" && capacityRuntime
+        ? await holdOrReleaseCapacityResponse(
+            capacityRuntime,
+            response,
+            capacityLease.lease,
+            request.signal,
+          )
         : response;
     } catch {
       const terminal = await attempt.terminal.catch(() => rejectedRelayTerminal());
@@ -5659,8 +5687,13 @@ async function relaySelectedModelNoFailover({
       ),
       () => markLocalFirstClientByte(relayRequestId, requester.userId, localExecution),
     );
-    return capacityLease?.state === "ADMITTED"
-      ? (capacityRuntime?.hold(response, capacityLease.lease, request.signal) ?? response)
+    return capacityLease?.state === "ADMITTED" && capacityRuntime
+      ? await holdOrReleaseCapacityResponse(
+          capacityRuntime,
+          response,
+          capacityLease.lease,
+          request.signal,
+        )
       : response;
   } catch {
     attempt.cancel("unknown");
@@ -6739,7 +6772,10 @@ async function relayBoundProviderResponse(input: {
       });
     } catch (error) {
       if (providerCapacityLease && input.capacityRuntime)
-        await input.capacityRuntime.release(providerCapacityLease);
+        await releaseCapacityLeaseWithRetry({
+          store: input.capacityRuntime,
+          lease: providerCapacityLease,
+        });
       throw error;
     }
     response = new Response(sanitized, {
@@ -6765,7 +6801,12 @@ async function relayBoundProviderResponse(input: {
   }
   const committed = responseWithFirstClientByte(response, result.markFirstClientByte);
   return providerCapacityLease && input.capacityRuntime
-    ? input.capacityRuntime.hold(committed, providerCapacityLease, input.request.signal)
+    ? await holdOrReleaseCapacityResponse(
+        input.capacityRuntime,
+        committed,
+        providerCapacityLease,
+        input.request.signal,
+      )
     : committed;
 }
 

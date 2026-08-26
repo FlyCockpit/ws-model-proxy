@@ -4991,6 +4991,9 @@ describe("model API routes", () => {
       markFirstClientByte: vi.fn().mockResolvedValue(undefined),
       affinity: undefined,
     });
+    vi.mocked(capacityRuntime.release)
+      .mockRejectedValueOnce(new Error("capacity database disconnected"))
+      .mockResolvedValue(true);
     const failedRead = await appWith(new FakeRelayManager(), true, false, capacityRuntime).request(
       "/responses/resp_provider",
       {
@@ -4998,7 +5001,41 @@ describe("model API routes", () => {
       },
     );
     expect(failedRead.status).toBe(500);
-    expect(capacityRuntime.release).toHaveBeenCalledTimes(releaseCount + 1);
+    expect(capacityRuntime.release).toHaveBeenCalledTimes(releaseCount + 2);
+
+    publicOverflow.dispatch.mockResolvedValueOnce({
+      dispatched: true,
+      response: new Response(null, { status: 204 }),
+      target: providerTarget,
+      attemptId: "provider-attempt-delete",
+      fencingToken: 4n,
+      nativeSurface: "openai-responses",
+      attemptCount: 1,
+      terminal: Promise.resolve({ ok: true, responseBytes: 0 }),
+      markFirstClientByte: vi.fn().mockResolvedValue(undefined),
+      affinity: undefined,
+    });
+    let acknowledgeRelease!: (released: boolean) => void;
+    const releaseAcknowledged = new Promise<boolean>((resolve) => {
+      acknowledgeRelease = resolve;
+    });
+    vi.mocked(capacityRuntime.release).mockImplementationOnce(() => releaseAcknowledged);
+    let deleteSettled = false;
+    const deletePromise = appWith(new FakeRelayManager(), true, false, capacityRuntime).request(
+      "/responses/resp_provider",
+      {
+        method: "DELETE",
+        headers: { authorization: "Bearer wsmp_model_test" },
+      },
+    );
+    void Promise.resolve(deletePromise).then(() => {
+      deleteSettled = true;
+    });
+    await vi.waitFor(() => expect(capacityRuntime.release).toHaveBeenCalledTimes(releaseCount + 3));
+    expect(deleteSettled).toBe(false);
+    acknowledgeRelease(true);
+    const deleted = await deletePromise;
+    expect(deleted.status).toBe(204);
   });
 
   it("uses metadata-only sticky routing for Responses API follow-up requests", async () => {
