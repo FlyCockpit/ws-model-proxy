@@ -7,7 +7,7 @@ import {
 } from "@ws-model-proxy/api/lib/provider-credential-crypto";
 import { poolModelId } from "@ws-model-proxy/config/forwarder-identifiers";
 import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
 import type { AdmissionAttempt, CapacityLeaseHandle } from "./types.js";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
@@ -57,9 +57,9 @@ function startWorker(command: unknown, requestedApplicationName?: string) {
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
+  let stderr = "";
   const result = new Promise<WorkerResult>((resolve, reject) => {
     let stdout = "";
-    let stderr = "";
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
       const line = stdout.split("\n").find((candidate) => candidate.trim().startsWith("{"));
@@ -72,7 +72,7 @@ function startWorker(command: unknown, requestedApplicationName?: string) {
       reject(new Error(`capacity worker exited ${code ?? signal}: ${stderr}`));
     });
   });
-  return { child, result, applicationName };
+  return { child, result, applicationName, stderr: () => stderr };
 }
 
 async function stop(child: ChildProcess) {
@@ -94,9 +94,39 @@ async function waitFor<T>(
   throw new Error("Timed out waiting for process integration handshake.");
 }
 
+async function quiesceCapacityFixture(
+  db: ReturnType<typeof createPrismaClient>,
+  userId: string,
+): Promise<void> {
+  const terminalAt = new Date();
+  await db.capacityLease.updateMany({
+    where: { userId, state: "ACTIVE" },
+    data: { state: "RELEASED", releasedAt: terminalAt, releaseReason: "test_cleanup" },
+  });
+  await db.capacityWaiter.updateMany({
+    where: { userId, state: "WAITING" },
+    data: { state: "CANCELLED", stateChangedAt: terminalAt, terminalReason: "test_cleanup" },
+  });
+  await db.admissionRequest.updateMany({
+    where: { userId, state: { in: ["WAITING", "ADMITTED"] } },
+    data: { state: "TERMINAL", terminalAt, terminalReason: "test_cleanup" },
+  });
+  expect(await db.capacityLease.count({ where: { userId, state: "ACTIVE" } })).toBe(0);
+  // Immutable lease/target history is retained until the disposable
+  // validation database is removed; only live state can affect later tests.
+}
+
 integration("capacity admission across operating-system processes", () => {
   const db = databaseUrl ? createPrismaClient(databaseUrl) : undefined;
   const children = new Set<ChildProcess>();
+  const fixtureUserIds = new Set<string>();
+  afterEach(async () => {
+    await Promise.all([...children].map(stop));
+    children.clear();
+    if (!db) return;
+    for (const userId of fixtureUserIds) await quiesceCapacityFixture(db, userId);
+    fixtureUserIds.clear();
+  });
   afterAll(async () => {
     await Promise.all([...children].map(stop));
     await db?.$disconnect();
@@ -108,6 +138,7 @@ integration("capacity admission across operating-system processes", () => {
     const owner = await db.user.create({
       data: { name: "Process capacity proof", email: `process-capacity-${suffix}@example.test` },
     });
+    fixtureUserIds.add(owner.id);
     const capacity = await db.inferenceCapacity.create({
       data: {
         userId: owner.id,
@@ -289,7 +320,7 @@ integration("capacity admission across operating-system processes", () => {
       winner: { admissionRequestId: `earlier-${suffix}` },
     });
 
-    await db.user.delete({ where: { id: owner.id } }).catch(() => undefined);
+    await quiesceCapacityFixture(db, owner.id);
   }, 30_000);
 
   it("drains a deterministic high-contention process queue without retry exhaustion", async () => {
@@ -302,6 +333,7 @@ integration("capacity admission across operating-system processes", () => {
         email: `capacity-contention-${suffix}@example.test`,
       },
     });
+    fixtureUserIds.add(owner.id);
     const capacity = await db.inferenceCapacity.create({
       data: {
         userId: owner.id,
@@ -435,7 +467,7 @@ integration("capacity admission across operating-system processes", () => {
     ).toBe(attempts.length);
     // Capacity leases intentionally retain immutable execution-target history,
     // so this disposable PostgreSQL proof is cleaned up with its container.
-    await db.user.delete({ where: { id: owner.id } }).catch(() => undefined);
+    await quiesceCapacityFixture(db, owner.id);
   }, 60_000);
 
   it("enforces one pool scope across capacities and admits one sibling on simultaneous release", async () => {
@@ -444,12 +476,14 @@ integration("capacity admission across operating-system processes", () => {
     const owner = await db.user.create({
       data: { name: "Cross-capacity proof", email: `cross-capacity-${suffix}@example.test` },
     });
+    fixtureUserIds.add(owner.id);
     const pool = await db.modelPool.create({
       data: {
         userId: owner.id,
         slug: `cross-capacity-${suffix}`,
         name: "Cross-capacity proof",
         capacityConcurrencyLimit: 1,
+        publicEgressAcknowledged: true,
       },
     });
     const account = await db.providerAccount.create({
@@ -574,7 +608,7 @@ integration("capacity admission across operating-system processes", () => {
     });
     children.add(releaser.child);
     await expect(releaser.result).resolves.toEqual({ released: true });
-    await db.user.delete({ where: { id: owner.id } }).catch(() => undefined);
+    await quiesceCapacityFixture(db, owner.id);
   }, 60_000);
 
   it("runs real Hono workers through precommit and committed stream crashes", async () => {
@@ -592,6 +626,7 @@ integration("capacity admission across operating-system processes", () => {
     const owner = await db.user.create({
       data: { name: "Hono process proof", email: `hono-process-${suffix}@example.test` },
     });
+    fixtureUserIds.add(owner.id);
     const capacity = await db.inferenceCapacity.create({
       data: {
         userId: owner.id,
@@ -691,7 +726,7 @@ integration("capacity admission across operating-system processes", () => {
         await db.$executeRaw`
           UPDATE capacity_lease SET "expiresAt" = clock_timestamp() - interval '1 millisecond'
            WHERE id = ${oldLease.id}`;
-        const reclaim = startWorker({ operation: "reclaim", limit: 10 });
+        const reclaim = startWorker({ operation: "reclaim", limit: 10_000 });
         children.add(reclaim.child);
         // Other integration files can have expired work in the same forced-PG
         // run. The global sweeper count is therefore not scoped to this lease;
@@ -748,7 +783,18 @@ integration("capacity admission across operating-system processes", () => {
         expect(await released.json()).toEqual({ released: true });
         const secondRepair = startWorker({ operation: "reclaim", limit: 10 });
         children.add(secondRepair.child);
-        await expect(secondRepair.result).resolves.toEqual({ reclaimed: 0 });
+        // Reclaim is global, so another test's expired lease may contribute to
+        // this worker's count. Idempotency is proven on both leases owned by
+        // this scenario instead of assuming an otherwise empty database.
+        await expect(secondRepair.result).resolves.toMatchObject({
+          reclaimed: expect.any(Number),
+        });
+        await expect(
+          db.capacityLease.findUniqueOrThrow({ where: { id: oldLease.id } }),
+        ).resolves.toMatchObject({ state: "RECLAIMED" });
+        await expect(
+          db.capacityLease.findUniqueOrThrow({ where: { id: replacement.lease.leaseId } }),
+        ).resolves.toMatchObject({ state: "RELEASED" });
 
         const replacementServer = startWorker({ operation: "server", upstreamUrl });
         children.add(replacementServer.child);
@@ -776,7 +822,14 @@ integration("capacity admission across operating-system processes", () => {
       ).toBe(0);
       const interruptedRepair = startWorker({ operation: "reclaim", limit: 10 });
       children.add(interruptedRepair.child);
-      await expect(interruptedRepair.result).resolves.toEqual({ reclaimed: 0 });
+      await expect(interruptedRepair.result).resolves.toMatchObject({
+        reclaimed: expect.any(Number),
+      });
+      await expect(
+        db.capacityLease.findUniqueOrThrow({
+          where: { attemptId: interruptedAttempt.attemptId },
+        }),
+      ).resolves.toMatchObject({ state: "RELEASED" });
       expect(upstreamRequests).toBe(3);
 
       await db.executionTarget.update({
@@ -814,7 +867,9 @@ integration("capacity admission across operating-system processes", () => {
         queueAttempt("wdrr-low-head", target.id),
         queueAttempt("wdrr-low-second", target.id),
       ];
-      const highAttempts = Array.from({ length: 40 }, (_value, index) =>
+      const starvationBoundRounds = 33;
+      const proofRounds = starvationBoundRounds + 3;
+      const highAttempts = Array.from({ length: proofRounds + 4 }, (_value, index) =>
         queueAttempt(`wdrr-high-${index}`, highTarget.id),
       );
       for (const [index, queued] of [...lowAttempts, ...highAttempts].entries()) {
@@ -836,15 +891,17 @@ integration("capacity admission across operating-system processes", () => {
       expect(await blockerRelease.json()).toEqual({ released: true });
 
       const winners: string[] = [];
-      for (let round = 0; round < 36; round++) {
-        const active = await waitFor(() =>
-          db.capacityLease
-            .findFirst({
-              where: { capacityId: capacity.id, state: "ACTIVE" },
-              orderBy: { createdAt: "desc" },
-            })
-            .then((row) => row ?? undefined),
-        );
+      let restartFencingToken: bigint | undefined;
+      for (let round = 0; round < proofRounds; round++) {
+        // Release commits the next admission before its HTTP response, so a
+        // direct read is a deterministic barrier rather than a polling sleep.
+        const active = await db.capacityLease.findFirstOrThrow({
+          where: { capacityId: capacity.id, state: "ACTIVE" },
+          orderBy: { createdAt: "desc" },
+        });
+        expect(
+          await db.capacityLease.count({ where: { capacityId: capacity.id, state: "ACTIVE" } }),
+        ).toBe(1);
         winners.push(active.attemptId);
         const serializable = {
           leaseId: active.id,
@@ -857,13 +914,11 @@ integration("capacity admission across operating-system processes", () => {
           reservationClass: active.reservationClass,
           borrowed: active.borrowed,
         };
-        const response = await fetch(`http://127.0.0.1:${ports[round % 2]}/release-lease`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(serializable),
-        });
-        expect(await response.json()).toEqual({ released: true });
         if (round === 10) {
+          const schedulerBeforeRestart = await db.inferenceCapacity.findUniqueOrThrow({
+            where: { id: capacity.id },
+          });
+          restartFencingToken = schedulerBeforeRestart.nextFencingToken;
           await stop(servers[0]!.child);
           children.delete(servers[0]!.child);
           const restarted = startWorker({ operation: "server", upstreamUrl });
@@ -872,12 +927,34 @@ integration("capacity admission across operating-system processes", () => {
           if (!("port" in ready)) throw new Error("Contended worker restart failed.");
           ports[0] = ready.port;
           servers[0] = restarted;
+          const schedulerAfterRestart = await db.inferenceCapacity.findUniqueOrThrow({
+            where: { id: capacity.id },
+          });
+          expect(schedulerAfterRestart.schedulerCursor).toBe(
+            schedulerBeforeRestart.schedulerCursor,
+          );
+          expect(schedulerAfterRestart.schedulerDeficits).toEqual(
+            schedulerBeforeRestart.schedulerDeficits,
+          );
+        }
+        const releasePort = round === 10 ? ports[0] : ports[round % 2];
+        const response = await fetch(`http://127.0.0.1:${releasePort}/release-lease`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(serializable),
+        });
+        expect(await response.json()).toEqual({ released: true });
+        if (round === 10) {
+          const persisted = await db.inferenceCapacity.findUniqueOrThrow({
+            where: { id: capacity.id },
+          });
+          expect(persisted.nextFencingToken).toBeGreaterThan(restartFencingToken!);
         }
       }
       expect(winners[0]).toBe(lowAttempts[0]!.attemptId);
       const secondLowRound = winners.indexOf(lowAttempts[1]!.attemptId);
       expect(secondLowRound).toBeGreaterThan(0);
-      expect(secondLowRound).toBeLessThanOrEqual(33);
+      expect(secondLowRound).toBeLessThanOrEqual(starvationBoundRounds);
       expect(winners.filter((winner) => winner.includes("wdrr-high-")).length).toBeGreaterThan(
         winners.filter((winner) => winner.includes("wdrr-low-")).length,
       );
@@ -885,12 +962,13 @@ integration("capacity admission across operating-system processes", () => {
     } finally {
       for (const server of servers) await stop(server.child);
       await new Promise<void>((resolve) => upstream.close(() => resolve()));
-      await db.user.delete({ where: { id: owner.id } }).catch(() => undefined);
+      await quiesceCapacityFixture(db, owner.id);
     }
   }, 90_000);
 
   it("boots production model routes in two processes and preserves commit semantics", async () => {
     if (!db || !databaseUrl) return;
+    process.env.BETTER_AUTH_SECRET = "w7Qp9Lm2Nx4Rv6Tk8Yc3Hu5Jd1Fs0ZaB";
     process.env.BETTER_AUTH_URL = "http://localhost:3000";
     process.env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = "true";
     process.env.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS = "true";
@@ -920,6 +998,7 @@ integration("capacity admission across operating-system processes", () => {
         slug: `production-process-${suffix}`,
       },
     });
+    fixtureUserIds.add(owner.id);
     const capacity = await db.inferenceCapacity.create({
       data: {
         userId: owner.id,
@@ -1125,7 +1204,7 @@ integration("capacity admission across operating-system processes", () => {
               throw outcome.error ?? new Error("Production route failed without an error.");
             const body = await outcome.response.text();
             throw new Error(
-              `Production route returned before upstream dispatch: ${outcome.response.status} ${body}`,
+              `Production route returned before upstream dispatch: ${outcome.response.status} ${body}; worker stderr: ${workers[0]?.stderr() ?? ""}`,
             );
           }),
         ]);
@@ -1315,7 +1394,10 @@ integration("capacity admission across operating-system processes", () => {
     } finally {
       for (const worker of workers) await stop(worker.child);
       await new Promise<void>((resolve) => upstream.close(() => resolve()));
-      await db.user.delete({ where: { id: owner.id } }).catch(() => undefined);
+      await quiesceCapacityFixture(db, owner.id);
+      // Provider attempt/audit rows are append-only and deliberately retain
+      // their owner. Quiescing capacity state prevents fixture rows from
+      // affecting global sweepers while preserving that production invariant.
     }
   }, 120_000);
 });

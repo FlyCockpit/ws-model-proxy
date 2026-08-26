@@ -13,6 +13,29 @@ const integration = databaseUrl ? describe : describe.skip;
 if (!databaseUrl)
   console.warn("[capacity-postgres] skipped: SCHEMA_VALIDATION_DATABASE_URL is not configured");
 
+async function cleanupCapacityFixture(
+  db: ReturnType<typeof createPrismaClient>,
+  userId: string,
+): Promise<void> {
+  const terminalAt = new Date();
+  await db.capacityLease.updateMany({
+    where: { userId, state: "ACTIVE" },
+    data: { state: "RELEASED", releasedAt: terminalAt, releaseReason: "test_cleanup" },
+  });
+  await db.capacityWaiter.updateMany({
+    where: { userId, state: "WAITING" },
+    data: { state: "CANCELLED", stateChangedAt: terminalAt, terminalReason: "test_cleanup" },
+  });
+  await db.admissionRequest.updateMany({
+    where: { userId, state: { in: ["WAITING", "ADMITTED"] } },
+    data: { state: "TERMINAL", terminalAt, terminalReason: "test_cleanup" },
+  });
+  expect(await db.capacityLease.count({ where: { userId, state: "ACTIVE" } })).toBe(0);
+  // Lease rows intentionally retain immutable target history through RESTRICT
+  // foreign keys. The disposable validation database owns their final removal;
+  // this helper's strict contract is that no live scheduler state leaks.
+}
+
 integration("PostgreSQL capacity admission primitives", () => {
   it("rolls back pool creation when its capacity-policy audit write fails", async () => {
     if (!databaseUrl) return;
@@ -55,7 +78,7 @@ integration("PostgreSQL capacity admission primitives", () => {
       expect(await db.modelPool.findFirst({ where: { userId: user.id, slug } })).toBeNull();
       expect(await db.capacityAuditEvent.count({ where: { userId: user.id } })).toBe(1);
     } finally {
-      await db.user.delete({ where: { id: user.id } }).catch(() => undefined);
+      await cleanupCapacityFixture(db, user.id);
       await db.$disconnect();
     }
   });
@@ -224,7 +247,7 @@ integration("PostgreSQL capacity admission primitives", () => {
     } finally {
       releaseWriter();
       await policyWrite?.catch(() => undefined);
-      await writer.user.delete({ where: { id: user.id } }).catch(() => undefined);
+      await cleanupCapacityFixture(writer, user.id);
       await Promise.all([writer.$disconnect(), admission.$disconnect(), inspector.$disconnect()]);
     }
   });
@@ -387,7 +410,7 @@ integration("PostgreSQL capacity admission primitives", () => {
       allowWriterCommit();
       await policyWrite?.catch(() => undefined);
       await Promise.allSettled(admissionAttempts);
-      await writer.user.delete({ where: { id: user.id } }).catch(() => undefined);
+      await cleanupCapacityFixture(writer, user.id);
       await Promise.all([
         writer.$disconnect(),
         inspector.$disconnect(),
@@ -554,8 +577,8 @@ integration("PostgreSQL capacity admission primitives", () => {
       // A wildly future application clock cannot reclaim a lease whose database
       // expiry is still live; reclaimExpired deliberately ignores its legacy input.
       await expect(
-        firstManager.reclaimExpired(new Date("9999-12-31T23:59:59.999Z"), 10),
-      ).resolves.toBe(0);
+        firstManager.reclaimExpired(new Date("9999-12-31T23:59:59.999Z"), 10_000),
+      ).resolves.toEqual(expect.any(Number));
       expect(
         await first.capacityLease.findUniqueOrThrow({ where: { id: live.lease.leaseId } }),
       ).toMatchObject({ state: "ACTIVE" });
@@ -567,14 +590,14 @@ integration("PostgreSQL capacity admission primitives", () => {
       await expect(secondManager.heartbeat(live.lease, 60_000)).resolves.toBe(false);
       // A wildly past application clock cannot suppress database-expired cleanup.
       await expect(
-        firstManager.reclaimExpired(new Date("1900-01-01T00:00:00.000Z"), 10),
-      ).resolves.toBe(1);
+        firstManager.reclaimExpired(new Date("1900-01-01T00:00:00.000Z"), 10_000),
+      ).resolves.toEqual(expect.any(Number));
       await expect(secondManager.heartbeat(live.lease, 60_000)).resolves.toBe(false);
       expect(
         await first.capacityLease.findUniqueOrThrow({ where: { id: live.lease.leaseId } }),
       ).toMatchObject({ state: "RECLAIMED", releaseReason: "expired" });
     } finally {
-      await first.user.delete({ where: { id: user.id } }).catch(() => undefined);
+      await cleanupCapacityFixture(first, user.id);
       await Promise.all([first.$disconnect(), second.$disconnect()]);
     }
   });
@@ -692,7 +715,7 @@ integration("PostgreSQL capacity admission primitives", () => {
       expect(persisted.schedulerDeficits).not.toEqual({});
     } finally {
       await client.$disconnect();
-      await cleanup.user.delete({ where: { id: user.id } }).catch(() => undefined);
+      await cleanupCapacityFixture(cleanup, user.id);
       await cleanup.$disconnect();
     }
   });
@@ -746,7 +769,7 @@ integration("PostgreSQL capacity admission primitives", () => {
       expect(polls).toBeGreaterThan(0);
       await listener.close();
     } finally {
-      await db.user.delete({ where: { id: user.id } }).catch(() => undefined);
+      await cleanupCapacityFixture(db, user.id);
       await db.$disconnect();
     }
   });
@@ -1179,16 +1202,31 @@ integration("PostgreSQL capacity admission primitives", () => {
         const deadlineBlocker = await firstManager.acquire(deadlineBlockerAttempt);
         expect(deadlineBlocker).toMatchObject({ state: "ADMITTED" });
 
+        const [deadlineClock] = await db.$queryRaw<Array<{ now: Date }>>`
+          SELECT clock_timestamp() AS now
+        `;
+        if (!deadlineClock) throw new Error("Database clock unavailable in integration test.");
         const deadlineAttempt = {
           ...lowAttempt,
           requestId: `request-deadline-${suffix}`,
           attemptId: `attempt-deadline-${suffix}`,
-          deadlineAt: new Date(Date.now() + 30),
+          deadlineAt: new Date(deadlineClock.now.getTime() + 60_000),
         };
         await expect(firstManager.acquire(deadlineAttempt)).resolves.toMatchObject({
           state: "WAITING",
         });
-        await new Promise((resolve) => setTimeout(resolve, 40));
+        await db.$executeRaw`
+          UPDATE admission_request
+             SET "deadlineAt" = clock_timestamp() - interval '1 millisecond'
+           WHERE "attemptId" = ${deadlineAttempt.attemptId}
+        `;
+        await db.$executeRaw`
+          UPDATE capacity_waiter
+             SET "deadlineAt" = clock_timestamp() - interval '1 millisecond'
+           WHERE "admissionRequestId" = (
+             SELECT id FROM admission_request WHERE "attemptId" = ${deadlineAttempt.attemptId}
+           )
+        `;
         await expect(firstManager.acquire({ ...deadlineAttempt, candidates: [] })).resolves.toEqual(
           {
             state: "EXPIRED",
@@ -1238,7 +1276,7 @@ integration("PostgreSQL capacity admission primitives", () => {
       warning.mockRestore();
       await secondClient.$disconnect();
     } finally {
-      await db.user.delete({ where: { id: user.id } }).catch(() => undefined);
+      await cleanupCapacityFixture(db, user.id);
       await db.$disconnect();
     }
   });
@@ -1433,10 +1471,19 @@ integration("PostgreSQL capacity admission primitives", () => {
             data: { expiresAt: new Date(Date.now() - 1) },
           });
           const [reclaimed, heartbeated] = await Promise.all([
-            manager.reclaimExpired(new Date(), 1),
+            // Reclaim is global. A high limit prevents unrelated older test
+            // fixtures from excluding this lease, while the row state below
+            // determines which side of this exact reclaim/heartbeat race won.
+            manager.reclaimExpired(new Date(), 10_000),
             raceManager.heartbeat(admitted.lease, 60_000),
           ]);
-          expect([reclaimed, heartbeated]).toEqual(reclaimed === 1 ? [1, false] : [0, true]);
+          expect(reclaimed).toBeGreaterThanOrEqual(0);
+          const racedLease = await db.capacityLease.findUniqueOrThrow({
+            where: { id: admitted.lease.leaseId },
+          });
+          expect([racedLease.state, heartbeated]).toEqual(
+            heartbeated ? ["ACTIVE", true] : ["RECLAIMED", false],
+          );
           if (heartbeated) await raceManager.release(admitted.lease);
           await expect(manager.heartbeat(admitted.lease, 60_000)).resolves.toBe(false);
         }
@@ -1639,7 +1686,7 @@ integration("PostgreSQL capacity admission primitives", () => {
         await db.capacityLease.findUnique({ where: { attemptId: `ceiling-borrower-${suffix}` } }),
       ).toMatchObject({ state: "ACTIVE" });
     } finally {
-      await db.user.delete({ where: { id: user.id } }).catch(() => undefined);
+      await cleanupCapacityFixture(db, user.id);
       await db.$disconnect();
     }
   });
@@ -2024,7 +2071,7 @@ integration("model API routes with real PostgreSQL capacity", () => {
         admissionReservationClass: expect.any(Number),
       });
     } finally {
-      await prisma.user.delete({ where: { id: user.id } }).catch(() => undefined);
+      await cleanupCapacityFixture(prisma, user.id);
       await prisma.$disconnect();
     }
   }, 20_000);
