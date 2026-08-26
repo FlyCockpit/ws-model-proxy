@@ -17,7 +17,8 @@ LOCK TABLE discovered_model, execution_target, model_pool, model_api_token,
   capacity_lease, provider_account, provider_model, provider_credential,
   provider_budget_policy, provider_budget_rule, provider_attempt, provider_budget_reservation,
   provider_usage_ledger, provider_pricing_version, provider_budget_settlement,
-  provider_audit_event, public_provider_attempt_event, cache_affinity_record IN SHARE ROW EXCLUSIVE MODE;
+  provider_audit_event, public_provider_attempt_event, relay_execution_event,
+  cache_affinity_record IN SHARE ROW EXCLUSIVE MODE;
 
 -- Capacity policy bounds are database invariants because admission correctness
 -- must not depend on every rolling-deploy writer running the same validator.
@@ -394,6 +395,20 @@ ALTER TABLE relay_request ADD CONSTRAINT relay_request_execution_telemetry_check
   AND ("adapterVersion" IS NULL OR ("adapterMode" = 'ADAPTED' AND length("adapterVersion") <= 32))
   AND ("localAttemptId" IS NULL OR length("localAttemptId") BETWEEN 1 AND 128)
   AND ("firstClientByteAt" IS NULL OR "streamCommitted")
+);
+
+ALTER TABLE relay_execution_event DROP CONSTRAINT IF EXISTS relay_execution_event_shape_check;
+ALTER TABLE relay_execution_event ADD CONSTRAINT relay_execution_event_shape_check CHECK (
+  "eventType" IN ('ATTEMPT_STARTED', 'FIRST_CLIENT_BYTE', 'TERMINAL', 'CRASH_RECOVERED')
+  AND "requestedSurface" IN (
+    'OPENAI_CHAT_COMPLETIONS', 'OPENAI_COMPLETIONS', 'OPENAI_EMBEDDINGS',
+    'OPENAI_RESPONSES', 'ANTHROPIC_MESSAGES', 'OPENAI_AUDIO'
+  )
+  AND ("adapterMode" IS NULL OR "adapterMode" IN ('NATIVE', 'ADAPTED'))
+  AND ("adapterVersion" IS NULL OR ("adapterMode" = 'ADAPTED' AND length("adapterVersion") <= 32))
+  AND ("admissionFencingToken" IS NULL OR "admissionFencingToken" > 0)
+  AND ("waitDurationMs" IS NULL OR "waitDurationMs" >= 0)
+  AND ("contextTokens" IS NULL OR "contextTokens" >= 0)
 );
 
 -- Partial indexes document and enforce the live-winner invariant even if a
@@ -1802,6 +1817,9 @@ FOR EACH ROW EXECUTE FUNCTION enforce_provider_attempt_transition();
 
 DROP TRIGGER IF EXISTS public_provider_attempt_event_immutable ON public_provider_attempt_event;
 CREATE TRIGGER public_provider_attempt_event_immutable BEFORE UPDATE OR DELETE ON public_provider_attempt_event
+FOR EACH ROW EXECUTE FUNCTION reject_immutable_provider_history_mutation();
+DROP TRIGGER IF EXISTS relay_execution_event_immutable ON relay_execution_event;
+CREATE TRIGGER relay_execution_event_immutable BEFORE UPDATE OR DELETE ON relay_execution_event
 FOR EACH ROW EXECUTE FUNCTION reject_immutable_provider_history_mutation();
 CREATE OR REPLACE FUNCTION enforce_provider_budget_reservation_transition()
 RETURNS trigger LANGUAGE plpgsql AS $provider_budget_reservation_transition$

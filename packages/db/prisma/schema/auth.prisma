@@ -37,6 +37,7 @@ model User {
   modelApiTokens             ModelApiToken[]              @relation("ModelApiTokenOwner")
   responseStickinessRecords  ResponseStickinessRecord[]   @relation("ResponseStickinessOwner")
   relayRequests              RelayRequest[]               @relation("RelayRequestOwner")
+  relayExecutionEvents       RelayExecutionEvent[]        @relation("RelayExecutionEventOwner")
   mediaAssets                MediaAsset[]                 @relation("MediaAssetOwner")
   providerAccounts           ProviderAccount[]            @relation("ProviderAccountOwner")
   providerModels             ProviderModel[]              @relation("ProviderModelOwner")

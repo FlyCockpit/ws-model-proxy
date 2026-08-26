@@ -103,6 +103,7 @@ const db = prisma as unknown as {
     update: MockInstance;
     updateMany: MockInstance;
   };
+  relayExecutionEvent: { create: MockInstance };
   responseStickinessRecord: {
     findUnique: MockInstance;
     upsert: MockInstance;
@@ -621,6 +622,7 @@ describe("model API routes", () => {
     db.appSetting.findUnique.mockResolvedValue(null);
     db.relayRequest.update.mockResolvedValue({ id: "relay-request-id" });
     db.relayRequest.updateMany.mockResolvedValue({ count: 1 });
+    db.relayExecutionEvent.create.mockResolvedValue({ id: "relay-event-id" });
     db.responseStickinessRecord.findUnique.mockResolvedValue(null);
     db.responseStickinessRecord.upsert.mockResolvedValue({ id: "stickiness-id" });
     affinity.rank.mockImplementation(async ({ targets }) => ({
@@ -851,6 +853,7 @@ describe("model API routes", () => {
     const persisted = stringifyPersistenceCalls([
       db.relayRequest.create.mock.calls,
       db.relayRequest.update.mock.calls,
+      db.relayExecutionEvent.create.mock.calls,
     ]);
     expect(persisted).not.toContain("hello");
     expect(persisted).not.toContain("upstream-responses");

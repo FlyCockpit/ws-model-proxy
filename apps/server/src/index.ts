@@ -58,6 +58,7 @@ import {
 } from "./model-api/provider-attempt-lifecycle.js";
 import { repairExpiredProviderBudgets } from "./model-api/provider-budget.js";
 import { startProviderBudgetRepair } from "./model-api/provider-budget-runtime.js";
+import { startRelayTelemetryRecovery } from "./model-api/relay-telemetry-recovery.js";
 import { createModelApiRoutes } from "./model-api/routes.js";
 import { transcriptionContentLengthGuard } from "./model-api/transcription-body-guard.js";
 import {
@@ -616,6 +617,7 @@ const server = serve(
 // delete-on-GET in media/routes.ts.
 const stopMediaCleanup = startMediaCleanup();
 const stopCacheAffinityCleanup = startCacheAffinityCleanup();
+const stopRelayTelemetryRecovery = startRelayTelemetryRecovery();
 const stopProviderBudgetRepair = startProviderBudgetRepair();
 const stopProviderAttemptExpiry = providerAttemptExpiryEnabled(
   env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
@@ -637,6 +639,7 @@ async function shutdown(signal: string) {
   // Stop the media cleanup timer so it can't fire mid-shutdown.
   stopMediaCleanup?.();
   stopCacheAffinityCleanup();
+  stopRelayTelemetryRecovery();
   stopProviderBudgetRepair();
   stopProviderAttemptExpiry?.();
   await capacityLifecycle?.close();

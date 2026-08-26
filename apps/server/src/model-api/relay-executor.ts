@@ -130,6 +130,7 @@ function failureForHttpStatus(status: number): RelayFailure | null {
 }
 
 export function startRelayAttempt({
+  requestId = crypto.randomUUID(),
   manager,
   cliDeviceId,
   endpointSlug,
@@ -143,6 +144,8 @@ export function startRelayAttempt({
   abortSignal,
   onResponseBodyChunk,
 }: {
+  /** Caller-supplied only when durable telemetry must exist before dispatch. */
+  requestId?: string;
   manager: RelayManager;
   cliDeviceId: string;
   endpointSlug: string;
@@ -156,7 +159,6 @@ export function startRelayAttempt({
   abortSignal?: AbortSignal;
   onResponseBodyChunk?: (chunk: Uint8Array) => void;
 }): RelayAttempt {
-  const requestId = crypto.randomUUID();
   const started = deferred<RelayAttemptStarted>();
   const terminal = deferred<RelayAttemptTerminal>();
   let responseController: ReadableStreamDefaultController<Uint8Array> | null = null;
