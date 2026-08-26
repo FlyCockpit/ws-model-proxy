@@ -255,6 +255,7 @@ describe("cache affinity", () => {
       data: expect.objectContaining({
         prefixDigest: null,
         prefixDepth: 0,
+        digestVersion: 4,
         conversationDigest: expect.any(String),
       }),
     });
@@ -531,6 +532,90 @@ describe("cache affinity", () => {
     expect(db.cacheAffinityRecord.deleteMany).toHaveBeenCalledWith({
       where: { id: { in: ["old"] } },
     });
+  });
+
+  it("persists instruction prefixes for system-only Chat and writes digestVersion 4 on create only", async () => {
+    await rememberAffinity({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      policy,
+      surface: "openai-chat",
+      payload: { messages: [{ role: "system", content: "secret instructions" }] },
+      target: target("target", "runtime"),
+    });
+    expect(db.cacheAffinityRecord.upsert).toHaveBeenCalled();
+    const creates = db.cacheAffinityRecord.upsert.mock.calls.map(([input]) => input.create);
+    const updates = db.cacheAffinityRecord.upsert.mock.calls.map(([input]) => input.update);
+    expect(creates.length).toBeGreaterThan(0);
+    for (const create of creates) {
+      expect(create.digestVersion).toBe(4);
+      expect(create.prefixDigest).toEqual(expect.any(String));
+      expect(create.conversationDigest).toBeNull();
+      expect(create.prefixDepth).toBeGreaterThan(0);
+    }
+    for (const update of updates) {
+      expect(update).not.toHaveProperty("digestVersion");
+    }
+    expect(JSON.stringify(creates)).not.toContain("secret instructions");
+    expect(JSON.stringify(db.cacheAffinityRecord.upsert.mock.calls)).not.toContain(
+      "secret instructions",
+    );
+  });
+
+  it("writes digestVersion 4 on conversation-prefix and session creates and omits it on updates", async () => {
+    const requestPayload = {
+      conversation: "conversation-secret",
+      input: "turn one",
+      instructions: "secret instructions",
+    };
+    await rememberAffinity({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      policy,
+      surface: "openai-responses",
+      payload: requestPayload,
+      target: target("target", "runtime"),
+    });
+    const prefixCreates = db.cacheAffinityRecord.upsert.mock.calls.map(([input]) => input.create);
+    const prefixUpdates = db.cacheAffinityRecord.upsert.mock.calls.map(([input]) => input.update);
+    expect(prefixCreates.length).toBeGreaterThan(1);
+    for (const create of prefixCreates) {
+      expect(create.digestVersion).toBe(4);
+    }
+    for (const update of prefixUpdates) {
+      expect(update).not.toHaveProperty("digestVersion");
+    }
+    expect(db.cacheAffinityRecord.create.mock.calls[0]?.[0].data.digestVersion).toBe(4);
+    expect(JSON.stringify(db.cacheAffinityRecord.upsert.mock.calls)).not.toContain(
+      "secret instructions",
+    );
+    expect(JSON.stringify(db.cacheAffinityRecord.create.mock.calls)).not.toContain(
+      "conversation-secret",
+    );
+
+    db.cacheAffinityRecord.findFirst.mockResolvedValue({ id: "existing-session" });
+    db.cacheAffinityRecord.upsert.mockClear();
+    db.cacheAffinityRecord.create.mockClear();
+    db.cacheAffinityRecord.update.mockClear();
+    await rememberAffinity({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      policy,
+      surface: "openai-responses",
+      payload: requestPayload,
+      target: target("target", "runtime"),
+    });
+    expect(db.cacheAffinityRecord.create).not.toHaveBeenCalled();
+    expect(db.cacheAffinityRecord.update).toHaveBeenCalledWith({
+      where: { id: "existing-session" },
+      data: expect.not.objectContaining({ digestVersion: expect.anything() }),
+    });
+    expect(db.cacheAffinityRecord.update.mock.calls[0]?.[0].data).not.toHaveProperty(
+      "digestVersion",
+    );
   });
 
   it("deduplicates the exact prefix while storing distinct conversation identities", async () => {

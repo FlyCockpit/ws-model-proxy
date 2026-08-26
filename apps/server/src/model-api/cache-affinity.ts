@@ -468,7 +468,13 @@ export async function rememberAffinity({
     payload,
     runtimeIdentity: target.targetIdentity,
   });
-  if (material.digests.length === 0 && !material.conversationDigest) return;
+  if (
+    material.instructionDigests.length === 0 &&
+    material.digests.length === 0 &&
+    !material.conversationDigest
+  ) {
+    return;
+  }
   const expiresAt = new Date(now.getTime() + policy.ttlSeconds * 1000);
   await prisma.$transaction(async (tx) => {
     // Serialize retention enforcement per owner/pool so concurrent successful
@@ -487,7 +493,7 @@ export async function rememberAffinity({
         expiresAt: { lte: now },
       },
     });
-    for (const [index, prefixDigest] of material.digests.entries()) {
+    const upsertPrefix = async (prefixDigest: string, prefixDepth: number) => {
       await tx.cacheAffinityRecord.upsert({
         where: {
           tenantUserId_poolId_executionTargetId_targetIdentity_bindingDigest_prefixDigest: {
@@ -508,7 +514,8 @@ export async function rememberAffinity({
           bindingDigest: material.bindingDigest,
           prefixDigest,
           conversationDigest: null,
-          prefixDepth: index + 1,
+          prefixDepth,
+          digestVersion: DIGEST_VERSION,
           estimatedTokens,
           engineCacheConfirmed,
           expiresAt,
@@ -520,6 +527,12 @@ export async function rememberAffinity({
           engineCacheConfirmed,
         },
       });
+    };
+    for (const [index, prefixDigest] of material.instructionDigests.entries()) {
+      await upsertPrefix(prefixDigest, index + 1);
+    }
+    for (const [index, prefixDigest] of material.digests.entries()) {
+      await upsertPrefix(prefixDigest, index + 1);
     }
     if (material.conversationDigest) {
       const identity = {
@@ -546,6 +559,7 @@ export async function rememberAffinity({
             userId: resourceOwnerId,
             ...identity,
             prefixDepth: 0,
+            digestVersion: DIGEST_VERSION,
             estimatedTokens,
             engineCacheConfirmed,
             expiresAt,
