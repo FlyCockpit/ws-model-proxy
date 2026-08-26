@@ -899,6 +899,15 @@ describe("model API routes", () => {
         }),
       }),
     );
+    expect(db.relayRequest.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: "SUCCEEDED",
+          completedAt: new Date("2026-08-26T00:00:00.000Z"),
+          durationMs: 0,
+        }),
+      }),
+    );
   });
 
   it("rejects strict fields that cannot be adapted before relay dispatch", async () => {

@@ -1973,7 +1973,11 @@ async function updateRelayMetadata(relayRequestId: string, update: RelayMetadata
       });
       await tx.relayRequest.update({
         where: { id: relayRequestId },
-        data: relayData,
+        data: {
+          ...relayData,
+          completedAt: clock.now,
+          durationMs: Math.max(0, clock.now.getTime() - update.startedAt.getTime()),
+        },
         select: { id: true },
       });
     });
