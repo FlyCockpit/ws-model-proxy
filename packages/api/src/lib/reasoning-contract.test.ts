@@ -294,9 +294,14 @@ describe("reasoningSelectorState", () => {
       reasoningSelectorState({
         surface: "ANTHROPIC_MESSAGES",
         routingMode: "PREFER_NATIVE",
-        reasoning: { supported: true, config: { supportedLevels: ["none", "medium"] } },
+        reasoning: { supported: true, supportedLevels: ["none", "medium"], defaultLevel: "medium" },
       }),
-    ).toEqual({ hidden: false, options: ["unset", "none", "medium"], levelsUnknown: false });
+    ).toEqual({
+      hidden: false,
+      options: ["unset", "none", "medium"],
+      levelsUnknown: false,
+      defaultLevel: "medium",
+    });
     expect(
       reasoningSelectorState({
         surface: "OPENAI_RESPONSES",

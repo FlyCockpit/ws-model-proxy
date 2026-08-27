@@ -195,7 +195,16 @@ export function reasoningSelectorState({
 }: {
   surface: ChatTestReasoningSurface;
   routingMode: string;
-  reasoning: { supported?: boolean; config?: ReasoningConfig };
+  /**
+   * `config` is the inventory shape. The flattened fields are the public
+   * visible-model payload shape consumed by Chat Test.
+   */
+  reasoning: {
+    supported?: boolean;
+    config?: ReasoningConfig;
+    supportedLevels?: readonly ReasoningLevel[];
+    defaultLevel?: ReasoningLevel;
+  };
 }): ReasoningSelectorState {
   if (
     surface === "OPENAI_CHAT_COMPLETIONS" ||
@@ -203,12 +212,13 @@ export function reasoningSelectorState({
     surface === "ANTHROPIC_MESSAGES"
   ) {
     if (routingMode === "REQUIRE_ADAPTED" || reasoning.supported !== true) return { hidden: true };
-    const levels = reasoning.config?.supportedLevels;
+    const levels = reasoning.config?.supportedLevels ?? reasoning.supportedLevels;
+    const defaultLevel = reasoning.config?.defaultLevel ?? reasoning.defaultLevel;
     return {
       hidden: false,
       options: ["unset", ...(levels ?? reasoningLevels)],
       levelsUnknown: levels === undefined,
-      ...(reasoning.config?.defaultLevel ? { defaultLevel: reasoning.config.defaultLevel } : {}),
+      ...(defaultLevel ? { defaultLevel } : {}),
     };
   }
   return { hidden: true };

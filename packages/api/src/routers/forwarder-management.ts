@@ -43,6 +43,7 @@ import {
   surfaceAvailabilityMatrix,
 } from "../lib/surface-capabilities";
 import { visibleModelAttachmentModalities } from "../lib/visible-model-modalities";
+import { visibleModelReasoning } from "../lib/visible-model-reasoning";
 
 const CLI_HEARTBEAT_STALE_AFTER_MS = 60_000;
 
@@ -424,8 +425,9 @@ async function userSlugChangePreview({ userId, nextSlug }: { userId: string; nex
 }
 
 async function serializeVisibleTargets(targets: VisibleModelTargets) {
-  const [modalities, poolRows] = await Promise.all([
+  const [modalities, reasoning, poolRows] = await Promise.all([
     visibleModelAttachmentModalities(targets),
+    visibleModelReasoning(targets),
     targets.modelPools.length
       ? prisma.modelPool.findMany({
           where: { id: { in: targets.modelPools.map((pool) => pool.id) } },
@@ -456,6 +458,7 @@ async function serializeVisibleTargets(targets: VisibleModelTargets) {
         audio: false,
         video: false,
       },
+      reasoning: reasoning.directById.get(model.id) ?? {},
     })),
     modelPools: targets.modelPools.map((pool) => ({
       target: pool.target,
@@ -475,6 +478,7 @@ async function serializeVisibleTargets(targets: VisibleModelTargets) {
         audio: false,
         video: false,
       },
+      reasoning: reasoning.poolById.get(pool.id) ?? {},
     })),
   };
 }
