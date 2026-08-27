@@ -121,6 +121,14 @@ connection timeout, a 30-second response-body idle timeout (reset after every
 received chunk), and the operation timeout sent by the WMP server. Pool retries
 share one server-side operation deadline; adding members does not multiply it.
 
+### Reasoning capability metadata
+
+Capability inventories at version 3 or 4 may declare `reasoningConfig` on a
+surface when its native reasoning ladder and encoding are known. Omit it when
+they are unknown; `reasoning: true` remains the routing gate. Upgrade the WMP
+server before publishing this optional field, because older servers reject it
+as an unknown capability property.
+
 Only URLs whose origin matches the connected WMP server (derived from
 `serverUrl`) and whose path is `/media/{id}` are fetched — arbitrary URLs from
 request bodies are never followed (SSRF guard). Add extra trusted origins with

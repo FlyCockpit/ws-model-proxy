@@ -9,6 +9,7 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
@@ -18,6 +19,11 @@ use nix::fcntl::{Flock, FlockArg};
 use crate::slug::validate_slug;
 
 pub const CONFIG_VERSION: u8 = 1;
+
+/// Largest Anthropic thinking budget that remains exactly representable after
+/// the TypeScript encoder reserves 1,024 visible-output tokens.
+/// Keep this synchronized with the TypeScript reasoning contract.
+pub const ANTHROPIC_THINKING_BUDGET_MAX: u64 = 9_007_199_254_739_967;
 
 fn deserialize_capability_version<'de, D>(deserializer: D) -> Result<u8, D::Error>
 where
@@ -249,7 +255,7 @@ pub enum ProbeStatus {
     Offline,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, rename_all = "camelCase", try_from = "RawCapabilities")]
 pub struct OpenAiCompatibleCapabilities {
     #[serde(deserialize_with = "deserialize_capability_version")]
@@ -274,6 +280,50 @@ pub struct OpenAiCompatibleCapabilities {
     pub responses: Option<ResponsesCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio: Option<AudioCapabilities>,
+}
+
+// v1/v2 capability inventories never had a `surfaces` member.  Keep that
+// wire invariant even if a caller constructs this public Rust type directly.
+// Deserialization has the matching rejection in `TryFrom<RawCapabilities>`.
+impl Serialize for OpenAiCompatibleCapabilities {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("OpenAiCompatibleCapabilities", 11)?;
+        state.serialize_field("version", &self.version)?;
+        state.serialize_field("protocol", &self.protocol)?;
+        if self.version >= 3 {
+            if let Some(value) = &self.surfaces {
+                state.serialize_field("surfaces", value)?;
+            }
+        }
+        if let Some(value) = &self.source {
+            state.serialize_field("source", value)?;
+        }
+        if let Some(value) = &self.confidence {
+            state.serialize_field("confidence", value)?;
+        }
+        if let Some(value) = &self.models {
+            state.serialize_field("models", value)?;
+        }
+        if let Some(value) = &self.chat_completions {
+            state.serialize_field("chatCompletions", value)?;
+        }
+        if let Some(value) = &self.completions {
+            state.serialize_field("completions", value)?;
+        }
+        if let Some(value) = &self.embeddings {
+            state.serialize_field("embeddings", value)?;
+        }
+        if let Some(value) = &self.responses {
+            state.serialize_field("responses", value)?;
+        }
+        if let Some(value) = &self.audio {
+            state.serialize_field("audio", value)?;
+        }
+        state.end()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -322,6 +372,12 @@ impl TryFrom<RawCapabilities> for OpenAiCompatibleCapabilities {
                     .to_string(),
             );
         }
+        if value.version < 3 && value.surfaces.is_some() {
+            return Err(format!(
+                "version {} capabilities cannot use `surfaces`",
+                value.version
+            ));
+        }
         if value.version >= 3 && value.surfaces.is_none() {
             return Err(format!(
                 "version {} capabilities require `surfaces`",
@@ -335,6 +391,13 @@ impl TryFrom<RawCapabilities> for OpenAiCompatibleCapabilities {
                 .is_some_and(SurfaceInventory::has_v4_fields)
         {
             return Err("version 3 capabilities cannot use version 4 operation fields".to_string());
+        }
+        if value.version >= 3 {
+            value
+                .surfaces
+                .as_ref()
+                .expect("checked above")
+                .validate_reasoning_configs()?;
         }
         if value.version == 4 {
             if value.models.is_some()
@@ -633,6 +696,37 @@ impl SurfaceInventory {
         }
         Ok(())
     }
+
+    fn validate_reasoning_configs(&self) -> std::result::Result<(), String> {
+        fn validate(
+            name: &str,
+            surface: &SurfaceCapabilities,
+            anthropic: bool,
+        ) -> std::result::Result<(), String> {
+            let Some(config) = &surface.reasoning_config else {
+                return Ok(());
+            };
+            if surface.reasoning != Some(true) {
+                return Err(format!(
+                    "surface `{name}` reasoningConfig requires reasoning: true"
+                ));
+            }
+            config.validate(name, anthropic)
+        }
+        if let Some(surface) = &self.openai_chat_completions {
+            validate("openaiChatCompletions", surface, false)?;
+        }
+        if let Some(surface) = &self.openai_completions {
+            validate("openaiCompletions", surface, false)?;
+        }
+        if let Some(surface) = &self.openai_responses {
+            validate("openaiResponses", &surface.common, false)?;
+        }
+        if let Some(surface) = &self.anthropic_messages {
+            validate("anthropicMessages", &surface.common, true)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -669,11 +763,115 @@ pub struct SurfaceCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_config: Option<ReasoningConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hosted_tools: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub beta_features: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReasoningConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supported_levels: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<ReasoningEncoding>,
+}
+
+impl ReasoningConfig {
+    fn validate(&self, surface: &str, anthropic: bool) -> std::result::Result<(), String> {
+        const LEVELS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+        if self.supported_levels.is_none()
+            && self.default_level.is_none()
+            && self.encoding.is_none()
+        {
+            return Err(format!(
+                "surface `{surface}` reasoningConfig cannot be empty"
+            ));
+        }
+        if let Some(levels) = &self.supported_levels {
+            if levels.is_empty() || levels.len() > LEVELS.len() {
+                return Err(format!(
+                    "surface `{surface}` reasoningConfig supportedLevels must contain 1 to 7 levels"
+                ));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for level in levels {
+                if !LEVELS.contains(&level.as_str()) || !seen.insert(level) {
+                    return Err(format!(
+                        "surface `{surface}` has invalid or duplicate reasoning level `{level}`"
+                    ));
+                }
+            }
+            if let Some(default_level) = &self.default_level {
+                if !levels.contains(default_level) {
+                    return Err(format!(
+                        "surface `{surface}` defaultLevel must be in supportedLevels"
+                    ));
+                }
+            }
+        } else if let Some(default_level) = &self.default_level {
+            if !LEVELS.contains(&default_level.as_str()) {
+                return Err(format!(
+                    "surface `{surface}` has invalid reasoning defaultLevel `{default_level}`"
+                ));
+            }
+        }
+        if let Some(encoding) = &self.encoding {
+            if encoding.is_anthropic() != anthropic {
+                return Err(format!(
+                    "surface `{surface}` has an encoding for the wrong protocol family"
+                ));
+            }
+            if let ReasoningEncoding::AnthropicThinking {
+                budget_by_level: Some(budgets),
+            } = encoding
+            {
+                for (level, budget) in budgets {
+                    if !LEVELS.contains(&level.as_str())
+                        || *budget < 1024
+                        || *budget > ANTHROPIC_THINKING_BUDGET_MAX
+                    {
+                        return Err(format!(
+                            "surface `{surface}` has invalid thinking budget for `{level}`"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReasoningEncoding {
+    OpenaiReasoningEffort,
+    OpenaiReasoningObject,
+    OpenaiOutputConfigEffort,
+    OpenaiTopLevelEffort,
+    AnthropicThinking {
+        #[serde(rename = "budgetByLevel", skip_serializing_if = "Option::is_none")]
+        budget_by_level: Option<std::collections::BTreeMap<String, u64>>,
+    },
+    AnthropicAdaptiveThinking,
+    AnthropicOutputConfigEffort,
+}
+
+impl ReasoningEncoding {
+    fn is_anthropic(&self) -> bool {
+        matches!(
+            self,
+            Self::AnthropicThinking { .. }
+                | Self::AnthropicAdaptiveThinking
+                | Self::AnthropicOutputConfigEffort
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1152,6 +1350,151 @@ fn sync_parent_dir(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validates_and_round_trips_reasoning_config() {
+        let valid = serde_json::json!({
+            "version": 4,
+            "protocol": "openai-compatible",
+            "surfaces": {
+                "openaiChatCompletions": {
+                    "source": "provider",
+                    "confidence": "exact",
+                    "operations": ["create"],
+                    "reasoning": true,
+                    "reasoningConfig": {
+                        "supportedLevels": ["none", "low"],
+                        "defaultLevel": "low",
+                        "encoding": { "kind": "openai_reasoning_effort" }
+                    }
+                }
+            }
+        });
+        let parsed: OpenAiCompatibleCapabilities =
+            serde_json::from_value(valid).expect("valid reasoning config");
+        let serialized = serde_json::to_value(parsed).expect("serialize reasoning config");
+        assert_eq!(
+            serialized["surfaces"]["openaiChatCompletions"]["reasoningConfig"]["defaultLevel"],
+            "low"
+        );
+
+        for invalid in [
+            serde_json::json!({
+                "version": 4, "protocol": "openai-compatible", "surfaces": {
+                    "openaiChatCompletions": {
+                        "source": "provider", "confidence": "exact", "operations": ["create"],
+                        "reasoning": true, "reasoningConfig": { "encoding": { "kind": "anthropic_thinking" } }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "version": 4, "protocol": "openai-compatible", "surfaces": {
+                    "openaiChatCompletions": {
+                        "source": "provider", "confidence": "exact", "operations": ["create"],
+                        "reasoning": true, "reasoningConfig": { "extra": true }
+                    }
+                }
+            }),
+        ] {
+            assert!(serde_json::from_value::<OpenAiCompatibleCapabilities>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn mirrors_reasoning_contract_validation_across_versions_and_families() {
+        for valid in [
+            serde_json::json!({ "version": 3, "protocol": "openai-compatible", "surfaces": {
+                "openaiChatCompletions": {
+                    "source": "provider", "confidence": "exact", "supported": true, "reasoning": true,
+                    "reasoningConfig": { "encoding": { "kind": "openai_reasoning_effort" } }
+                }
+            }}),
+            serde_json::json!({ "version": 4, "protocol": "openai-compatible", "surfaces": {
+                "openaiChatCompletions": {
+                    "source": "provider", "confidence": "exact", "operations": ["create"], "reasoning": true,
+                    "reasoningConfig": { "encoding": { "kind": "openai_reasoning_effort" } }
+                }
+            }}),
+            serde_json::json!({ "version": 3, "protocol": "anthropic-compatible", "surfaces": {
+                "anthropicMessages": {
+                    "source": "provider", "confidence": "exact", "supported": true, "reasoning": true,
+                    "reasoningConfig": { "encoding": { "kind": "anthropic_thinking", "budgetByLevel": { "low": 2048 } } }
+                }
+            }}),
+            serde_json::json!({ "version": 4, "protocol": "anthropic-compatible", "surfaces": {
+                "anthropicMessages": {
+                    "source": "provider", "confidence": "exact", "operations": ["create"],
+                    "protocolVersions": [{ "version": "2023-06-01" }], "reasoning": true,
+                    "reasoningConfig": { "encoding": { "kind": "anthropic_thinking", "budgetByLevel": { "low": 2048 } } }
+                }
+            }}),
+        ] {
+            let parsed = serde_json::from_value::<OpenAiCompatibleCapabilities>(valid)
+                .expect("valid cross-language reasoning contract");
+            let serialized = serde_json::to_value(parsed).expect("serialize reasoning config");
+            if let Some(anthropic) = serialized.pointer("/surfaces/anthropicMessages") {
+                assert_eq!(
+                    anthropic.pointer("/reasoningConfig/encoding/budgetByLevel"),
+                    Some(&serde_json::json!({ "low": 2048 })),
+                );
+            }
+        }
+
+        let max_budget = serde_json::json!({ "version": 4, "protocol": "anthropic-compatible", "surfaces": {
+            "anthropicMessages": {
+                "source": "provider", "confidence": "exact", "operations": ["create"],
+                "protocolVersions": [{ "version": "2023-06-01" }], "reasoning": true,
+                "reasoningConfig": { "encoding": { "kind": "anthropic_thinking", "budgetByLevel": { "max": ANTHROPIC_THINKING_BUDGET_MAX } } }
+            }
+        }});
+        assert!(serde_json::from_value::<OpenAiCompatibleCapabilities>(max_budget).is_ok());
+
+        let invalids = [
+            // Both encoding-family directions, for v3 and v4 surface shapes.
+            serde_json::json!({ "version": 3, "protocol": "openai-compatible", "surfaces": {
+                "openaiChatCompletions": { "source": "provider", "confidence": "exact", "supported": true, "reasoning": true, "reasoningConfig": { "encoding": { "kind": "anthropic_thinking" } } }
+            }}),
+            serde_json::json!({ "version": 4, "protocol": "anthropic-compatible", "surfaces": {
+                "anthropicMessages": { "source": "provider", "confidence": "exact", "operations": ["create"], "protocolVersions": [{ "version": "2023-06-01" }], "reasoning": true, "reasoningConfig": { "encoding": { "kind": "openai_reasoning_effort" } } }
+            }}),
+            serde_json::json!({ "version": 3, "protocol": "openai-compatible", "surfaces": {
+                "openaiChatCompletions": { "source": "provider", "confidence": "exact", "supported": true, "reasoningConfig": { "supportedLevels": ["low"] } }
+            }}),
+            serde_json::json!({ "version": 4, "protocol": "openai-compatible", "surfaces": {
+                "openaiChatCompletions": { "source": "provider", "confidence": "exact", "operations": ["create"], "reasoning": true, "reasoningConfig": { "supportedLevels": ["low", "low"] } }
+            }}),
+            serde_json::json!({ "version": 3, "protocol": "anthropic-compatible", "surfaces": {
+                "anthropicMessages": { "source": "provider", "confidence": "exact", "supported": true, "reasoning": true, "reasoningConfig": { "supportedLevels": ["low"], "defaultLevel": "high" } }
+            }}),
+            serde_json::json!({ "version": 4, "protocol": "anthropic-compatible", "surfaces": {
+                "anthropicMessages": { "source": "provider", "confidence": "exact", "operations": ["create"], "protocolVersions": [{ "version": "2023-06-01" }], "reasoning": true, "reasoningConfig": { "encoding": { "kind": "anthropic_thinking", "budgetByLevel": { "low": 1 } } } }
+            }}),
+            serde_json::json!({ "version": 4, "protocol": "anthropic-compatible", "surfaces": {
+                "anthropicMessages": { "source": "provider", "confidence": "exact", "operations": ["create"], "protocolVersions": [{ "version": "2023-06-01" }], "reasoning": true, "reasoningConfig": { "encoding": { "kind": "anthropic_thinking", "budgetByLevel": { "low": ANTHROPIC_THINKING_BUDGET_MAX + 1 } } } }
+            }}),
+        ];
+        for invalid in invalids {
+            assert!(serde_json::from_value::<OpenAiCompatibleCapabilities>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_v1_v2_surfaces_and_never_serializes_them() {
+        for version in [1, 2] {
+            assert!(
+                serde_json::from_value::<OpenAiCompatibleCapabilities>(serde_json::json!({
+                    "version": version, "protocol": "openai-compatible", "surfaces": {}
+                }))
+                .is_err()
+            );
+        }
+        let legacy = OpenAiCompatibleCapabilities {
+            surfaces: Some(SurfaceInventory::default()),
+            ..OpenAiCompatibleCapabilities::default()
+        };
+        let serialized = serde_json::to_value(legacy).expect("serialize legacy inventory");
+        assert!(serialized.get("surfaces").is_none());
+    }
 
     #[test]
     fn round_trips_json_config() {
