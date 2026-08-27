@@ -70,6 +70,7 @@ import {
   signupRecipientLimiter,
 } from "./rate-limit.js";
 import { RELAY_SUBPROTOCOL } from "./relay/protocol.js";
+import { relaySessionManager } from "./relay/session-manager.js";
 import { createRelayWebsocketMiddleware, relayUpgradeHandler } from "./relay/websocket.js";
 import { mountSecurityHeaders } from "./security-headers.js";
 import { registerSeoRoutes } from "./seo.js";
@@ -642,6 +643,7 @@ async function shutdown(signal: string) {
   stopRelayTelemetryRecovery();
   stopProviderBudgetRepair();
   stopProviderAttemptExpiry?.();
+  relaySessionManager.dispose();
   await capacityLifecycle?.close();
 
   // 1. Stop accepting new connections and drain in-flight requests.

@@ -25,6 +25,7 @@ import {
   listVisibleModelTargetsForUser,
   type VisibleModelTargets,
 } from "../lib/model-api-token-access";
+import { suggestedConnectionSurface } from "../lib/model-connection-type";
 import { poolMemberRoutingStatuses } from "../lib/model-pool-routing";
 import {
   audioOperationSupported,
@@ -555,6 +556,17 @@ function serializeCliDevice(row: CliDeviceRow, now: Date) {
         optimisticBasicTranscription: model.optimisticBasicTranscription,
         probeSuggestions: model.probeSuggestions,
         effectiveCapabilities: effectiveCapabilities(endpoint, model),
+        suggestedConnectionType: (() => {
+          const effective = effectiveCapabilities(endpoint, model);
+          return suggestedConnectionSurface({
+            // Match pool semantics: structured capability metadata takes
+            // precedence, with the historical coarse inventory as a safe
+            // fallback for older CLI connections.
+            capabilities:
+              parseOpenAiCompatibleCapabilities(effective.metadata) ??
+              openAiCapabilitiesFromCoarse(effective.coarse),
+          });
+        })(),
         lastSeenAt: model.lastSeenAt,
         published: model.published,
         unpublishedAt: model.unpublishedAt,
@@ -568,12 +580,6 @@ function serializeCliDevice(row: CliDeviceRow, now: Date) {
 
 function serializePool(row: ModelPoolRow) {
   const recommendedSurfaceOverride = parseModelApiSurface(row.recommendedSurfaceOverride);
-  const recommendationOrder: readonly ModelApiSurface[] = [
-    "OPENAI_RESPONSES",
-    "OPENAI_CHAT_COMPLETIONS",
-    "ANTHROPIC_MESSAGES",
-    "OPENAI_COMPLETIONS",
-  ];
   const memberCapabilities = (model: PoolMemberModelRow) =>
     resolveEffectiveCapabilityMetadata({
       capabilityOverrideMode: model.capabilityOverrideMode,
@@ -683,11 +689,18 @@ function serializePool(row: ModelPoolRow) {
       publicOverflow: { native: number; adapted: number; unavailable: number };
     }
   >;
-  const recommendedSurface =
-    recommendedSurfaceOverride ??
-    recommendationOrder.find((surface) => surfaces[surface].primary.native > 0) ??
-    recommendationOrder.find((surface) => surfaces[surface].primary.adapted > 0) ??
-    null;
+  const suggestedSurface = suggestedConnectionSurface({
+    surfaces: Object.fromEntries(
+      ["OPENAI_RESPONSES", "OPENAI_CHAT_COMPLETIONS", "ANTHROPIC_MESSAGES"].map((surface) => [
+        surface,
+        {
+          native: surfaces[surface as ModelApiSurface].primary.native,
+          adapted: surfaces[surface as ModelApiSurface].primary.adapted,
+        },
+      ]),
+    ),
+  });
+  const recommendedSurface = recommendedSurfaceOverride ?? suggestedSurface;
   const transformerModel = row.TransformerDiscoveredModel
     ? {
         id: row.TransformerDiscoveredModel.id,
@@ -735,6 +748,7 @@ function serializePool(row: ModelPoolRow) {
     },
     compatibility: {
       recommendedSurface,
+      suggestedConnectionType: suggestedSurface,
       surfaces,
       warnings: [
         ...(row.protocolAdaptationEnabled ? ["adaptation_strict_subset"] : []),

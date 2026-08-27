@@ -4825,6 +4825,10 @@ async function relayPool({
       try {
         claimed = await markPoolMemberHalfOpenTrial({
           poolMemberId: candidate.poolMemberId,
+          // `buildPoolRouteSequence` emits this only when the full configured
+          // pool contains one member. Passing explicit authority keeps a
+          // degraded row from being claimed by other half-open callers.
+          allowSingleDegradedFallback: candidate.singleMemberDegradedFallback,
         });
       } catch {
         await settleRelayCleanup([() => cliLease.release()]);

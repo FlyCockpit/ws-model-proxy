@@ -2,8 +2,17 @@
   "appSettingsLoadFailed": "Failed to load app settings.",
   "actions": {
     "copyConfirm": "Copy confirmation text",
+    "copyModelId": "Copy model ID",
     "copySecret": "Copy secret",
+    "hideSecret": "Hide secret",
+    "showSecret": "Show secret",
     "header": "Actions"
+  },
+  "connectionTypes": {
+    "OPENAI_RESPONSES": "Responses",
+    "OPENAI_CHAT_COMPLETIONS": "Chat Completions",
+    "ANTHROPIC_MESSAGES": "Anthropic Messages",
+    "OPENAI_COMPLETIONS": "Completions"
   },
   "clis": {
     "description": "Inspect connected CLI devices, endpoints, and directly discovered models.",
@@ -181,6 +190,7 @@
     "immutable": "Discovered model IDs are immutable.",
     "lastSeen": "Last seen",
     "modelId": "Model ID",
+    "suggestedConnectionType": "Suggested connection: {{type}}",
     "upstream": "Upstream",
     "vision": "Images",
     "audio": "Chat audio input",

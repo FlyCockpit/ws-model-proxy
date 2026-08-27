@@ -2,6 +2,9 @@ import prisma from "@ws-model-proxy/db";
 
 export const POOL_MEMBER_UNHEALTHY_AFTER_RETRYABLE_FAILURES = 3;
 export const POOL_MEMBER_HEALTH_COOLDOWN_MS = 60_000;
+export const POOL_MEMBER_RECOVERY_BACKOFF_MS = [
+  1_000, 3_000, 5_000, 10_000, 15_000, 20_000, 30_000,
+] as const;
 
 export const poolMemberHealthStatuses = [
   "UNKNOWN",
@@ -84,6 +87,8 @@ export type PoolRouteCandidate = {
   lastFailureClass: PoolMemberFailureClass | null;
   lastFailureAt: Date | null;
   nextRetryAt: Date | null;
+  /** True only for the one-configured-member degraded fallback path. */
+  singleMemberDegradedFallback?: boolean;
 };
 
 export type PoolRouteSequenceResult =
@@ -153,6 +158,12 @@ export function resetPoolMemberHealth(): PoolMemberHealthUpdate {
   };
 }
 
+export function poolMemberRecoveryDelayMs(consecutiveFailures: number): number {
+  return POOL_MEMBER_RECOVERY_BACKOFF_MS[
+    Math.min(Math.max(consecutiveFailures - 1, 0), POOL_MEMBER_RECOVERY_BACKOFF_MS.length - 1)
+  ]!;
+}
+
 export function transitionPoolMemberHealthAfterRetryableFailure({
   member,
   failureClass,
@@ -163,7 +174,9 @@ export function transitionPoolMemberHealthAfterRetryableFailure({
   now: Date;
 }): PoolMemberHealthUpdate {
   const consecutiveRetryableFailures = member.consecutiveRetryableFailures + 1;
-  const cooldownUntil = new Date(now.getTime() + POOL_MEMBER_HEALTH_COOLDOWN_MS);
+  const cooldownUntil = new Date(
+    now.getTime() + poolMemberRecoveryDelayMs(consecutiveRetryableFailures),
+  );
   const failedHalfOpenTrial =
     member.healthStatus === "HALF_OPEN" ||
     (member.healthStatus === "UNHEALTHY" &&
@@ -185,11 +198,11 @@ export function transitionPoolMemberHealthAfterRetryableFailure({
   }
 
   return {
-    healthStatus: member.healthStatus === "UNKNOWN" ? "UNKNOWN" : "HEALTHY",
+    healthStatus: "DEGRADED",
     lastFailureClass: failureClass,
     consecutiveRetryableFailures,
     lastFailureAt: now,
-    nextRetryAt: null,
+    nextRetryAt: cooldownUntil,
     halfOpenTrialStartedAt: null,
   };
 }
@@ -223,6 +236,7 @@ export function beginPoolMemberHalfOpenTrial(
 function effectiveHealthStatusForRouting(
   member: Pick<PoolMemberRouteRow, "healthStatus" | "nextRetryAt" | "halfOpenTrialStartedAt">,
   now: Date,
+  allowDegraded: boolean,
 ): "HEALTHY" | "HALF_OPEN" | null {
   if (member.healthStatus === "HEALTHY" || member.healthStatus === "UNKNOWN") {
     return "HEALTHY";
@@ -230,6 +244,20 @@ function effectiveHealthStatusForRouting(
   if (member.healthStatus === "HALF_OPEN") {
     return member.halfOpenTrialStartedAt === null ? "HALF_OPEN" : null;
   }
+  // A one-member pool has no alternative. Permit its normal execution path to
+  // decide availability/compatibility rather than making health state alone a
+  // permanent outage. Multi-member pools continue to fail over.
+  // The sole configured member is allowed a *due* half-open request.  It is
+  // intentionally not based on the compatible subset: a pool with another
+  // configured (but currently incompatible or disabled) member still has an
+  // alternative configuration and must not bypass this member's cooldown.
+  if (
+    member.healthStatus === "DEGRADED" &&
+    allowDegraded &&
+    member.nextRetryAt !== null &&
+    member.nextRetryAt.getTime() <= now.getTime()
+  )
+    return "HALF_OPEN";
   if (
     member.healthStatus === "UNHEALTHY" &&
     member.nextRetryAt !== null &&
@@ -278,7 +306,8 @@ export function routablePoolMembers({
 
   for (const member of members) {
     const endpoint = member.DiscoveredModel.Endpoint;
-    const healthStatus = effectiveHealthStatusForRouting(member, now);
+    const singleMemberDegradedFallback = members.length === 1 && member.healthStatus === "DEGRADED";
+    const healthStatus = effectiveHealthStatusForRouting(member, now, singleMemberDegradedFallback);
     if (healthStatus === null) continue;
     if (
       !isPublishedEndpointExecutable({
@@ -307,6 +336,7 @@ export function routablePoolMembers({
       lastFailureClass: member.lastFailureClass,
       lastFailureAt: member.lastFailureAt,
       nextRetryAt: member.nextRetryAt,
+      singleMemberDegradedFallback,
     });
   }
 
@@ -537,11 +567,80 @@ export async function markPoolMemberRelaySuccess(poolMemberId: string): Promise<
   });
 }
 
-export async function markPoolMemberHalfOpenTrial({
+/**
+ * Claims a due member for a single recovery probe.  The timestamp is a small
+ * durable lease/fence: only its owner may later settle the probe result.
+ */
+export async function claimPoolMemberRecoveryTrial({
   poolMemberId,
   now = new Date(),
 }: {
   poolMemberId: string;
+  now?: Date;
+}): Promise<Date | null> {
+  const result = await prisma.poolMember.updateMany({
+    where: {
+      id: poolMemberId,
+      routingStatus: "ACTIVE",
+      weight: { gt: 0 },
+      healthStatus: { in: ["DEGRADED", "UNHEALTHY"] },
+      nextRetryAt: { lte: now },
+    },
+    data: beginPoolMemberHalfOpenTrial(now),
+  });
+  return result.count === 1 ? now : null;
+}
+
+/** Settle only the recovery lease we claimed, never a newer foreground write. */
+export async function settlePoolMemberRecoveryTrial({
+  poolMemberId,
+  trialStartedAt,
+  healthy,
+  now = new Date(),
+}: {
+  poolMemberId: string;
+  trialStartedAt: Date;
+  healthy: boolean;
+  now?: Date;
+}): Promise<boolean> {
+  const member = (await prisma.poolMember.findUnique({
+    where: { id: poolMemberId },
+    select: {
+      healthStatus: true,
+      lastFailureClass: true,
+      consecutiveRetryableFailures: true,
+      lastFailureAt: true,
+      nextRetryAt: true,
+      halfOpenTrialStartedAt: true,
+    },
+  })) as PoolMemberHealthSnapshot | null;
+  if (
+    member?.healthStatus !== "HALF_OPEN" ||
+    member.halfOpenTrialStartedAt?.getTime() !== trialStartedAt.getTime()
+  )
+    return false;
+  const data = healthy
+    ? resetPoolMemberHealth()
+    : transitionPoolMemberHealthAfterRetryableFailure({
+        member,
+        failureClass: "TRANSPORT",
+        now,
+      });
+  const result = await prisma.poolMember.updateMany({
+    where: { id: poolMemberId, healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: trialStartedAt },
+    data,
+  });
+  return result.count === 1;
+}
+
+export async function markPoolMemberHalfOpenTrial({
+  poolMemberId,
+  allowSingleDegradedFallback = false,
+  now = new Date(),
+}: {
+  poolMemberId: string;
+  /** Only the routing path for one configured pool member may enable this. */
+  allowSingleDegradedFallback?: boolean;
   now?: Date;
 }): Promise<number> {
   const result = await prisma.poolMember.updateMany({
@@ -550,7 +649,20 @@ export async function markPoolMemberHalfOpenTrial({
       OR: [
         { healthStatus: "UNHEALTHY", nextRetryAt: { lte: now } },
         { healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: null },
+        ...(allowSingleDegradedFallback
+          ? [{ healthStatus: "DEGRADED" as const, nextRetryAt: { lte: now } }]
+          : []),
       ],
+      routingStatus: "ACTIVE",
+      weight: { gt: 0 },
+      ...(allowSingleDegradedFallback
+        ? {
+            // Recheck the complete configured pool atomically with the
+            // claim. A protocol-compatible subset must never turn a
+            // multi-member pool into a single-member degraded fallback.
+            ModelPool: { PoolMembers: { none: { id: { not: poolMemberId } } } },
+          }
+        : {}),
     },
     data: beginPoolMemberHalfOpenTrial(now),
   });

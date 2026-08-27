@@ -7,9 +7,9 @@ vi.mock("@ws-model-proxy/db", async () => {
 });
 
 const {
-  POOL_MEMBER_HEALTH_COOLDOWN_MS,
   buildPoolRouteSequence,
   isRetryablePoolMemberRelayFailure,
+  markPoolMemberHalfOpenTrial,
   markPoolMemberRelaySuccess,
   markPoolMembersForCliUnavailable,
   poolMemberFailureClassForRelayFailure,
@@ -122,19 +122,46 @@ describe("modelPoolRouting", () => {
     });
   });
 
-  it("does not treat reserved DEGRADED members as routable", () => {
+  it("uses the bounded autonomous recovery backoff schedule", async () => {
+    const { poolMemberRecoveryDelayMs } = await import("./model-pool-routing");
+    expect([1, 2, 3, 4, 5, 6, 7, 8, 9, 20].map(poolMemberRecoveryDelayMs)).toEqual([
+      1_000, 3_000, 5_000, 10_000, 15_000, 20_000, 30_000, 30_000, 30_000, 30_000,
+    ]);
+  });
+
+  it("allows a single degraded member through the normal availability gates once due", () => {
     const result = buildPoolRouteSequence({
-      members: [memberRow({ id: "degraded-member", healthStatus: "DEGRADED" })],
+      members: [
+        memberRow({
+          id: "degraded-member",
+          healthStatus: "DEGRADED",
+          nextRetryAt: new Date(now.getTime() - 1),
+        }),
+      ],
       activeCliDeviceIds: ["cli-1"],
       now,
     });
 
-    expect(result).toEqual({
-      ok: false,
-      reason: "NO_ROUTABLE_POOL_MEMBERS",
-      failureClass: "no_routable_member",
-      retryable: true,
+    expect(result).toMatchObject({
+      ok: true,
+      candidates: [{ poolMemberId: "degraded-member", healthStatus: "HALF_OPEN" }],
     });
+  });
+
+  it("does not bypass the degraded backoff, even when it is the only configured member", () => {
+    const result = buildPoolRouteSequence({
+      members: [
+        memberRow({
+          id: "degraded-member",
+          healthStatus: "DEGRADED",
+          nextRetryAt: new Date(now.getTime() + 1),
+        }),
+      ],
+      activeCliDeviceIds: ["cli-1"],
+      now,
+    });
+
+    expect(result.ok).toBe(false);
   });
 
   it("uses smooth weighted round-robin with injected deterministic state", () => {
@@ -300,14 +327,14 @@ describe("modelPoolRouting", () => {
       now,
     });
 
-    expect(first).toMatchObject({ healthStatus: "HEALTHY", consecutiveRetryableFailures: 1 });
-    expect(second).toMatchObject({ healthStatus: "HEALTHY", consecutiveRetryableFailures: 2 });
+    expect(first).toMatchObject({ healthStatus: "DEGRADED", consecutiveRetryableFailures: 1 });
+    expect(second).toMatchObject({ healthStatus: "DEGRADED", consecutiveRetryableFailures: 2 });
     expect(third).toEqual({
       healthStatus: "UNHEALTHY",
       lastFailureClass: "UPSTREAM_5XX",
       consecutiveRetryableFailures: 3,
       lastFailureAt: now,
-      nextRetryAt: new Date(now.getTime() + POOL_MEMBER_HEALTH_COOLDOWN_MS),
+      nextRetryAt: new Date(now.getTime() + 5_000),
       halfOpenTrialStartedAt: null,
     });
 
@@ -315,10 +342,10 @@ describe("modelPoolRouting", () => {
       member: {
         ...third,
         healthStatus: "HALF_OPEN",
-        halfOpenTrialStartedAt: new Date(now.getTime() + POOL_MEMBER_HEALTH_COOLDOWN_MS),
+        halfOpenTrialStartedAt: new Date(now.getTime() + 5_000),
       },
       failureClass: "TRANSPORT",
-      now: new Date(now.getTime() + POOL_MEMBER_HEALTH_COOLDOWN_MS),
+      now: new Date(now.getTime() + 5_000),
     });
 
     expect(failedHalfOpen).toMatchObject({
@@ -326,7 +353,7 @@ describe("modelPoolRouting", () => {
       consecutiveRetryableFailures: 4,
       lastFailureClass: "TRANSPORT",
     });
-    expect(failedHalfOpen.nextRetryAt?.toISOString()).toBe("2026-01-01T00:02:00.000Z");
+    expect(failedHalfOpen.nextRetryAt?.toISOString()).toBe("2026-01-01T00:00:15.000Z");
   });
 
   it("resets health on success and fresh inventory without changing routing status", async () => {
@@ -409,6 +436,29 @@ describe("modelPoolRouting", () => {
         healthStatus: "UNHEALTHY",
         lastFailureClass: "WEBSOCKET_DISCONNECTED",
       }),
+    });
+  });
+
+  it("atomically claims a due degraded fallback only when it is the sole configured member", async () => {
+    db.poolMember.updateMany.mockResolvedValue({ count: 1 });
+
+    await expect(
+      markPoolMemberHalfOpenTrial({
+        poolMemberId: "member-id",
+        allowSingleDegradedFallback: true,
+        now,
+      }),
+    ).resolves.toBe(1);
+
+    expect(db.poolMember.updateMany).toHaveBeenCalledWith({
+      where: expect.objectContaining({
+        id: "member-id",
+        routingStatus: "ACTIVE",
+        weight: { gt: 0 },
+        ModelPool: { PoolMembers: { none: { id: { not: "member-id" } } } },
+        OR: expect.arrayContaining([{ healthStatus: "DEGRADED", nextRetryAt: { lte: now } }]),
+      }),
+      data: { healthStatus: "HALF_OPEN", halfOpenTrialStartedAt: now },
     });
   });
 });

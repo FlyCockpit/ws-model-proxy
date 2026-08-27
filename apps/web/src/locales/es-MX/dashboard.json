@@ -1,8 +1,17 @@
 {
   "actions": {
     "copyConfirm": "Copiar texto de confirmación",
+    "copyModelId": "Copiar ID de modelo",
     "copySecret": "Copiar secreto",
+    "hideSecret": "Ocultar secreto",
+    "showSecret": "Mostrar secreto",
     "header": "Acciones"
+  },
+  "connectionTypes": {
+    "OPENAI_RESPONSES": "Responses",
+    "OPENAI_CHAT_COMPLETIONS": "Chat Completions",
+    "ANTHROPIC_MESSAGES": "Anthropic Messages",
+    "OPENAI_COMPLETIONS": "Completions"
   },
   "appSettingsLoadFailed": "No se pudieron cargar las configuraciones de la aplicación.",
   "chatTest": {
@@ -181,6 +190,7 @@
     "immutable": "Los IDs de modelos descubiertos son inmutables.",
     "lastSeen": "Visto por última vez",
     "modelId": "ID de modelo",
+    "suggestedConnectionType": "Conexión sugerida: {{type}}",
     "upstream": "Origen",
     "vision": "Imágenes",
     "audio": "Entrada de audio en chat",

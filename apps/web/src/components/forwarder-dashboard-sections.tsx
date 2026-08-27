@@ -36,6 +36,8 @@ import {
   ArrowLeft,
   ArrowRight,
   Copy,
+  Eye,
+  EyeOff,
   Gauge,
   MoveDown,
   MoveUp,
@@ -251,14 +253,15 @@ function EmptyState({ children }: { children: ReactNode }) {
 
 function SecretDisplay({ secret, label }: { secret: string; label: string }) {
   const { t } = useTranslation(["common", "dashboard"]);
+  const [visible, setVisible] = useState(false);
 
   return (
     <div className="space-y-2 rounded-md border bg-muted/40 p-3">
       <p className="text-sm font-medium">{label}</p>
-      <div className="flex items-center gap-2">
-        <WideContent className="flex-1">
-          <code className="block border bg-background px-2 py-2 font-mono text-xs">{secret}</code>
-        </WideContent>
+      <div className="flex min-w-0 items-center gap-2">
+        <code className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap border bg-background px-3 py-3 font-mono text-xs tracking-wide">
+          {visible ? secret : "••••••••••••••••••••••••"}
+        </code>
         <Button
           type="button"
           size="icon-touch"
@@ -268,8 +271,39 @@ function SecretDisplay({ secret, label }: { secret: string; label: string }) {
         >
           <Copy className="size-4" />
         </Button>
+        <Button
+          type="button"
+          size="icon-touch"
+          variant="outline"
+          onClick={() => setVisible((current) => !current)}
+          aria-label={
+            visible ? t("dashboard:actions.hideSecret") : t("dashboard:actions.showSecret")
+          }
+          aria-pressed={visible}
+        >
+          {visible ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+        </Button>
       </div>
       <p className="text-xs text-muted-foreground">{t("dashboard:tokens.oneTimeSecretHelp")}</p>
+    </div>
+  );
+}
+
+function CopyableModelId({ modelId }: { modelId: string }) {
+  const { t } = useTranslation(["common", "dashboard"]);
+  return (
+    <div className="flex min-w-0 items-center gap-1">
+      <code className="min-w-0 flex-1 break-all font-mono text-xs">{modelId}</code>
+      <Button
+        type="button"
+        size="icon-touch"
+        variant="ghost"
+        className="shrink-0"
+        onClick={() => copyToClipboard(modelId, t("common:actions.copied"))}
+        aria-label={t("dashboard:actions.copyModelId")}
+      >
+        <Copy className="size-4" />
+      </Button>
     </div>
   );
 }
@@ -849,9 +883,16 @@ export function CliEndpointsModelsSection() {
                             {endpoint.models.map((model) => (
                               <tr key={model.id}>
                                 <td className="py-2 pr-3 align-top">
-                                  <code className="font-mono text-xs">
-                                    {model.canonicalModelId}
-                                  </code>
+                                  <CopyableModelId modelId={model.canonicalModelId} />
+                                  {model.suggestedConnectionType ? (
+                                    <p className="mt-1 text-xs text-muted-foreground">
+                                      {t("dashboard:models.suggestedConnectionType", {
+                                        type: t(
+                                          `dashboard:connectionTypes.${model.suggestedConnectionType}`,
+                                        ),
+                                      })}
+                                    </p>
+                                  ) : null}
                                   {!model.published ? (
                                     <StatusPill muted>
                                       {t("dashboard:publication.unpublished")}
@@ -1866,16 +1907,27 @@ export function PoolsSection() {
                       {pool.grants.length} {t("dashboard:pools.grantsLabel")}
                     </StatusPill>
                   </div>
-                  <code className="mt-2 block break-all font-mono text-xs">
-                    {pool.canonicalModelId}
-                  </code>
+                  <div className="mt-2 max-w-2xl">
+                    <CopyableModelId modelId={pool.canonicalModelId} />
+                  </div>
                   {pool.description ? (
                     <p className="mt-2 text-sm text-muted-foreground">{pool.description}</p>
                   ) : null}
                   <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                    {pool.compatibility.suggestedConnectionType ? (
+                      <StatusPill muted>
+                        {t("dashboard:models.suggestedConnectionType", {
+                          type: t(
+                            `dashboard:connectionTypes.${pool.compatibility.suggestedConnectionType}`,
+                          ),
+                        })}
+                      </StatusPill>
+                    ) : null}
                     <StatusPill muted>
                       {t("dashboard:pools.recommendedSurface")}:{" "}
-                      {pool.compatibility.recommendedSurface ?? t("dashboard:pools.noneAvailable")}
+                      {pool.compatibility.recommendedSurface
+                        ? t(`dashboard:connectionTypes.${pool.compatibility.recommendedSurface}`)
+                        : t("dashboard:pools.noneAvailable")}
                     </StatusPill>
                     {pool.compatibility.warnings.map((warning) => (
                       <StatusPill key={warning} muted>

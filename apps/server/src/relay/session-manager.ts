@@ -1,10 +1,19 @@
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
+import { suggestedConnectionSurface } from "@ws-model-proxy/api/lib/model-connection-type";
 import {
   markPoolMembersForCliUnavailable,
   type PoolMemberFailureClass,
 } from "@ws-model-proxy/api/lib/model-pool-routing";
+import type { OpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import prisma from "@ws-model-proxy/db";
+import { startRelayAttempt } from "../model-api/relay-executor.js";
 import { sanitizeRelayRequestHeaders } from "./headers.js";
+import {
+  listDueOwnedPoolMemberRecoveries,
+  type OwnedRecoveryMember,
+  POOL_MEMBER_RECOVERY_PROBE_TIMEOUT_MS,
+  PoolMemberRecoveryScheduler,
+} from "./pool-member-recovery.js";
 import {
   encodeRelayBinaryFrame,
   encodeRelayServerControlMessage,
@@ -98,6 +107,11 @@ export class RelaySessionManager {
   private sessionsBySocket = new Map<RelaySocket, SessionState>();
   private sessionsByCliDeviceId = new Map<string, SessionState>();
   private activeRelayRequests = new Map<string, ActiveRelayRequest>();
+  private readonly poolMemberRecovery = new PoolMemberRecoveryScheduler({
+    getOwnedCliDeviceIds: () => this.getActiveCliDeviceIds(),
+    listDueMembers: listDueOwnedPoolMemberRecoveries,
+    probe: (member) => this.probeOwnedPoolMember(member),
+  });
 
   acceptAuthenticatedSocket({
     socket,
@@ -169,6 +183,7 @@ export class RelaySessionManager {
         session.lastHeartbeatAt = now;
         clearTimeout(session.unauthenticatedTimer);
         this.replaceDuplicateSession(session);
+        this.poolMemberRecovery.wake();
         socket.send(
           encodeRelayServerControlMessage({
             type: "hello.ok",
@@ -312,6 +327,11 @@ export class RelaySessionManager {
     });
   }
 
+  /** Stops background recovery in controlled shutdowns and unit tests. */
+  dispose() {
+    this.poolMemberRecovery.stop();
+  }
+
   private async removeSessionWithStatus(
     socket: RelaySocket,
     {
@@ -341,6 +361,7 @@ export class RelaySessionManager {
         failureClass,
         now,
       });
+      this.poolMemberRecovery.wake();
     }
   }
 
@@ -594,6 +615,67 @@ export class RelaySessionManager {
         failure: "disconnected",
         message: "CLI session disconnected.",
       });
+    }
+  }
+
+  private async probeOwnedPoolMember(member: OwnedRecoveryMember): Promise<boolean> {
+    const surface = suggestedConnectionSurface({
+      capabilities: member.capabilities as OpenAiCompatibleCapabilities | null,
+    });
+    if (!surface) return false;
+    const request =
+      surface === "OPENAI_RESPONSES"
+        ? {
+            family: "responses" as const,
+            path: "/v1/responses",
+            body: {
+              model: member.upstreamModelId,
+              input: "Reply with pong.",
+              max_output_tokens: 8,
+            },
+          }
+        : surface === "ANTHROPIC_MESSAGES"
+          ? {
+              family: "messages" as const,
+              path: "/v1/messages",
+              body: {
+                model: member.upstreamModelId,
+                max_tokens: 8,
+                messages: [{ role: "user", content: "Reply with pong." }],
+              },
+            }
+          : {
+              family: "chat.completions" as const,
+              path: "/v1/chat/completions",
+              body: {
+                model: member.upstreamModelId,
+                stream: false,
+                max_tokens: 8,
+                messages: [{ role: "user", content: "Reply with pong." }],
+              },
+            };
+    const headers = new Headers({ "content-type": "application/json" });
+    if (surface === "ANTHROPIC_MESSAGES") headers.set("anthropic-version", "2023-06-01");
+    const attempt = startRelayAttempt({
+      manager: this,
+      cliDeviceId: member.cliDeviceId,
+      endpointSlug: member.endpointSlug,
+      family: request.family,
+      method: "POST",
+      path: request.path,
+      headers,
+      body: new TextEncoder().encode(JSON.stringify(request.body)),
+      timeoutMs: POOL_MEMBER_RECOVERY_PROBE_TIMEOUT_MS,
+    });
+    try {
+      const started = await attempt.started;
+      // Drain the bounded probe reply so a relay can complete normally. Probe
+      // semantics are transport health, not a provider-specific text contract.
+      await started.body.pipeTo(new WritableStream<Uint8Array>({ write() {} }));
+      const terminal = await attempt.terminal;
+      return started.status >= 200 && started.status < 300 && terminal.ok;
+    } catch {
+      return false;
     }
   }
 }

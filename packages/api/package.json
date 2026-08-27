@@ -14,6 +14,9 @@
     "./lib/model-pool-routing": {
       "default": "./src/lib/model-pool-routing.ts"
     },
+    "./lib/model-connection-type": {
+      "default": "./src/lib/model-connection-type.ts"
+    },
     "./lib/model-api-token-access": {
       "default": "./src/lib/model-api-token-access.ts"
     },
