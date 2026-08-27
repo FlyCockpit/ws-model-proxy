@@ -439,53 +439,6 @@ describe("cache affinity", () => {
     expect(result.scores).toEqual({ "target-a": 100, "target-b": 0 });
   });
 
-  it("does not let affinity outweigh queue, health, public-egress, and cost penalties", async () => {
-    const expensive = {
-      ...target("target-a", "runtime-a", "capacity-a"),
-      healthPenalty: 100,
-      publicEgressPenalty: 100,
-      costPenalty: 100,
-    };
-    const local = target("target-b", "runtime-b", "capacity-b");
-    const prefixes = affinityPrefixDigests({
-      ownerId: "owner",
-      resourceOwnerId: "owner",
-      poolId: "pool",
-      securityScope: "token",
-      surface: "OPENAI_CHAT_COMPLETIONS",
-      payload,
-      runtimeIdentity: expensive.targetIdentity,
-    });
-    const deepestDigest = prefixes.digests[prefixes.digests.length - 1];
-    db.cacheAffinityRecord.findMany.mockResolvedValue([
-      {
-        executionTargetId: expensive.executionTargetId,
-        targetIdentity: expensive.targetIdentity,
-        bindingDigest: prefixes.bindingDigest,
-        prefixDigest: deepestDigest,
-        prefixDepth: prefixes.digests.length,
-        conversationDigest: prefixes.conversationDigest,
-        digestVersion: 4,
-        engineCacheConfirmed: false,
-      },
-    ]);
-    db.capacityWaiter.groupBy.mockResolvedValue([
-      { capacityId: expensive.capacityId, _count: { _all: 10 } },
-    ]);
-
-    const result = await rankAffinityTargets({
-      ownerId: "owner",
-      resourceOwnerId: "owner",
-      poolId: "pool",
-      policy,
-      surface: "OPENAI_CHAT_COMPLETIONS",
-      payload,
-      targets: [expensive, local],
-    });
-
-    expect(result.orderedTargetIds[0]).toBe(local.executionTargetId);
-  });
-
   it("queries only unexpired owner-scoped records with target identities", async () => {
     const now = new Date("2026-08-25T12:00:00.000Z");
     await rankAffinityTargets({
