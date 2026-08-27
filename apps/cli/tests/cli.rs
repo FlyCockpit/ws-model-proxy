@@ -474,6 +474,67 @@ fn endpoints_probe_success_applies_model_suggestions_and_uses_secret_env_header(
 }
 
 #[test]
+fn endpoints_probe_stores_reasoning_metadata_as_an_advisory_v4_suggestion() {
+    let server = TestServer::start(vec![(
+        "/v1/models",
+        200,
+        json!({
+            "data": [{
+                "id": "provider/reasoner",
+                "supported_parameters": ["reasoning_effort"],
+                "reasoning": {
+                    "supported_efforts": ["high", "medium", "unknown"]
+                }
+            }]
+        }),
+    )]);
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({
+            "version": 1,
+            "endpoints": [{
+                "slug": "local",
+                "label": "Local",
+                "baseUrl": server.base_url,
+                "enabled": true,
+                "models": [{
+                    "upstreamModelId": "provider/reasoner",
+                    "capabilityOverrideMode": "override",
+                    "capabilities": {
+                        "version": 1,
+                        "protocol": "openai-compatible",
+                        "chatCompletions": { "supported": true, "streaming": true }
+                    }
+                }]
+            }]
+        }),
+    );
+
+    cli(&config, &state)
+        .args(["endpoints", "probe", "local", "--apply"])
+        .assert()
+        .success();
+
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    let model = &cfg["endpoints"][0]["models"][0];
+    assert_eq!(model["capabilityOverrideMode"], "override");
+    assert_eq!(model["capabilities"]["version"], 1);
+    assert_eq!(model["probeSuggestions"]["version"], 4);
+    assert_eq!(
+        model["probeSuggestions"]["surfaces"]["openaiChatCompletions"]["reasoning"],
+        true
+    );
+    assert_eq!(
+        model["probeSuggestions"]["surfaces"]["openaiChatCompletions"]["reasoningConfig"]["supportedLevels"],
+        json!(["medium", "high"])
+    );
+    server.join();
+}
+
+#[test]
 fn endpoints_probe_failure_reports_without_panic() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");

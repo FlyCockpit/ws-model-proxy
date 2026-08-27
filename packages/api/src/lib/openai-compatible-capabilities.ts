@@ -4,6 +4,7 @@
  * cannot drift.
  */
 import { z } from "zod";
+import { reasoningConfigSchema, validateSurfaceReasoningConfig } from "./reasoning-contract";
 
 const booleanSupportSchema = z.boolean().optional();
 
@@ -105,7 +106,7 @@ const v2CapabilitiesSchema = z
   })
   .strict();
 
-const surfaceFeatureSchema = z
+const baseSurfaceFeatureSchema = z
   .object({
     source: z.enum(["declared", "probe", "dashboard", "provider"]),
     confidence: z.enum(["exact", "high", "estimated", "unknown"]),
@@ -122,30 +123,45 @@ const surfaceFeatureSchema = z
     parallelTools: booleanSupportSchema,
     structuredOutput: booleanSupportSchema,
     reasoning: booleanSupportSchema,
+    reasoningConfig: reasoningConfigSchema.optional(),
     hostedTools: booleanSupportSchema,
     protocolVersion: z.string().trim().min(1).max(64).optional(),
     betaFeatures: z.array(z.string().trim().min(1).max(128)).max(64).optional(),
   })
   .strict();
 
-const anthropicSurfaceFeatureSchema = surfaceFeatureSchema.extend({
-  countTokens: booleanSupportSchema,
-});
+const surfaceFeatureSchema = baseSurfaceFeatureSchema.superRefine((value, context) =>
+  validateSurfaceReasoningConfig(value, "openaiChatCompletions", context),
+);
 
-const responsesSurfaceFeatureSchema = surfaceFeatureSchema.extend({
-  responsesLifecycle: z
-    .object({
-      statefulFollowUps: booleanSupportSchema,
-      retrieve: booleanSupportSchema,
-      delete: booleanSupportSchema,
-      cancel: booleanSupportSchema,
-      listInputItems: booleanSupportSchema,
-      countTokens: booleanSupportSchema,
-      compact: booleanSupportSchema,
-    })
-    .strict()
-    .optional(),
-});
+const completionsSurfaceFeatureSchema = baseSurfaceFeatureSchema.superRefine((value, context) =>
+  validateSurfaceReasoningConfig(value, "openaiCompletions", context),
+);
+
+const anthropicSurfaceFeatureSchema = baseSurfaceFeatureSchema
+  .extend({ countTokens: booleanSupportSchema })
+  .superRefine((value, context) =>
+    validateSurfaceReasoningConfig(value, "anthropicMessages", context),
+  );
+
+const responsesSurfaceFeatureSchema = baseSurfaceFeatureSchema
+  .extend({
+    responsesLifecycle: z
+      .object({
+        statefulFollowUps: booleanSupportSchema,
+        retrieve: booleanSupportSchema,
+        delete: booleanSupportSchema,
+        cancel: booleanSupportSchema,
+        listInputItems: booleanSupportSchema,
+        countTokens: booleanSupportSchema,
+        compact: booleanSupportSchema,
+      })
+      .strict()
+      .optional(),
+  })
+  .superRefine((value, context) =>
+    validateSurfaceReasoningConfig(value, "openaiResponses", context),
+  );
 
 const capabilityOperationSchema = {
   openaiChatCompletions: z.enum(["create"]),
@@ -188,6 +204,7 @@ const v4SurfaceFeatureShape = {
   parallelTools: booleanSupportSchema,
   structuredOutput: booleanSupportSchema,
   reasoning: booleanSupportSchema,
+  reasoningConfig: reasoningConfigSchema.optional(),
   hostedTools: booleanSupportSchema,
 } as const;
 
@@ -222,6 +239,9 @@ const v4CapabilitiesSchema = z
             operations: uniqueOperations(capabilityOperationSchema.openaiChatCompletions),
           })
           .strict()
+          .superRefine((value, context) =>
+            validateSurfaceReasoningConfig(value, "openaiChatCompletions", context),
+          )
           .optional(),
         openaiResponses: z
           .object({
@@ -229,6 +249,9 @@ const v4CapabilitiesSchema = z
             operations: uniqueOperations(capabilityOperationSchema.openaiResponses),
           })
           .strict()
+          .superRefine((value, context) =>
+            validateSurfaceReasoningConfig(value, "openaiResponses", context),
+          )
           .optional(),
         anthropicMessages: z
           .object({
@@ -245,6 +268,9 @@ const v4CapabilitiesSchema = z
               ),
           })
           .strict()
+          .superRefine((value, context) =>
+            validateSurfaceReasoningConfig(value, "anthropicMessages", context),
+          )
           .optional(),
         openaiCompletions: z
           .object({
@@ -252,6 +278,9 @@ const v4CapabilitiesSchema = z
             operations: uniqueOperations(capabilityOperationSchema.openaiCompletions),
           })
           .strict()
+          .superRefine((value, context) =>
+            validateSurfaceReasoningConfig(value, "openaiCompletions", context),
+          )
           .optional(),
       })
       .strict(),
@@ -294,7 +323,7 @@ const v3CapabilitiesSchema = z
         openaiChatCompletions: surfaceFeatureSchema.optional(),
         openaiResponses: responsesSurfaceFeatureSchema.optional(),
         anthropicMessages: anthropicSurfaceFeatureSchema.optional(),
-        openaiCompletions: surfaceFeatureSchema.optional(),
+        openaiCompletions: completionsSurfaceFeatureSchema.optional(),
       })
       .strict(),
     source: z.enum(["declared", "probe", "dashboard", "provider"]).optional(),

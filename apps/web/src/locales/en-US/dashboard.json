@@ -98,6 +98,24 @@
       "help": "Native mode rejects adapted members; adapted mode rejects native members. Unsupported modes fail without silently changing the route.",
       "directHelp": "Direct models always use their native Chat API."
     },
+    "reasoning": {
+      "label": "Reasoning level",
+      "help": "Sent only to the selected native API surface.",
+      "unknownLevels": "This model supports reasoning, but its accepted levels are unknown. Unsupported choices may fail upstream.",
+      "anthropicNoneHelp": "With Native preferred, Anthropic sends thinking: {type: \"disabled\"} for explicit None but does not mark reasoning as required, so the pool is not narrowed in this release. Unlike the OpenAI context, this is expected.",
+      "default": "default",
+      "thinkingSummary": "Thinking transcript",
+      "levels": {
+        "unset": "Model default",
+        "none": "None",
+        "minimal": "Minimal",
+        "low": "Low",
+        "medium": "Medium",
+        "high": "High",
+        "xhigh": "Extra high",
+        "max": "Maximum"
+      }
+    },
     "surface": {
       "label": "API surface",
       "PREFERRED": "Preferred API",
@@ -150,9 +168,9 @@
     "editCapabilityProfile": "Edit full profile",
     "capabilityProfile": "OpenAI-compatible capability profile",
     "capabilityProfileHint": "Current source: {{source}}. This profile keeps chat audio separate from dedicated transcription and translation endpoints.",
-    "capabilityUnknownHint": "Omit a field for unknown support; use false for known unsupported and true for known supported. Version 2 enables timestamps, diarization, languages, formats, MIME types, streaming, and upload limits.",
+    "capabilityUnknownHint": "Omit a field for unknown support; use false for known unsupported and true for known supported. Versions 3 and 4 surfaces may declare reasoning and optional reasoningConfig; omit reasoningConfig when the level contract is unknown.",
     "inheritCapabilities": "Inherit endpoint profile",
-    "invalidCapabilityProfile": "Enter a valid version 1 or version 2 OpenAI-compatible capability profile.",
+    "invalidCapabilityProfile": "Enter a valid version 1 through version 4 OpenAI-compatible capability profile.",
     "saveCapabilityProfile": "Save override",
     "optimisticBasicTranscription": "Allow basic transcription when capability support is unknown",
     "attachmentLimit": "Attachment limit (MiB)",
@@ -727,7 +745,7 @@
     "noAttempts": "No provider attempt events in this window.",
     "noAudit": "No audit events for this account.",
     "noCapabilities": "No validated native capability inventory",
-    "capabilityInventoryHint": "Optional exact v4 JSON inventory. Use this to declare multiple surfaces and their operations, Anthropic versions/betas, streaming, modalities, tools, parallel tools, structured output, reasoning, hosted tools, context limits, source, and confidence.",
+    "capabilityInventoryHint": "Optional exact v4 JSON inventory. Use this to declare multiple surfaces and their operations, Anthropic versions/betas, streaming, modalities, tools, parallel tools, structured output, reasoning and optional reasoningConfig, hosted tools, context limits, source, and confidence.",
     "visibilityDisclosure": "Anyone with a model API token or pool grant that can see a public-egress pool may cause requests to leave your deployment and consume the attached provider budgets.",
     "fields": {
       "label": "Account label",

@@ -10,6 +10,12 @@
           "confidence": "exact",
           "supported": true,
           "streaming": true,
+          "reasoning": true,
+          "reasoningConfig": {
+            "supportedLevels": ["none", "low", "medium", "high"],
+            "defaultLevel": "medium",
+            "encoding": { "kind": "anthropic_thinking" }
+          },
           "inputImages": true,
           "outputImages": false,
           "inputAudio": false,

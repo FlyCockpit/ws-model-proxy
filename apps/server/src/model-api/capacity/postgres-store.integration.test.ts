@@ -2040,6 +2040,14 @@ integration("model API routes with real PostgreSQL capacity", () => {
       expect(await (await poolPromise).json()).toMatchObject({ id: "pool-ok" });
 
       await waitFor(async () => {
+        const retryRelay = await prisma.relayRequest.findFirst({
+          where: { userId: user.id, requestedModelPoolId: pool.id },
+        });
+        return retryRelay?.status === "SUCCEEDED" && retryRelay.attemptCount === 2
+          ? retryRelay
+          : undefined;
+      });
+      await waitFor(async () => {
         const active = await prisma.capacityLease.count({
           where: { userId: user.id, state: "ACTIVE" },
         });
@@ -2065,8 +2073,9 @@ integration("model API routes with real PostgreSQL capacity", () => {
       expect(relays.every((relay) => relay.admissionWaitDurationMs !== null)).toBe(true);
       expect(relays.every((relay) => relay.admissionFencingToken !== null)).toBe(true);
       expect(relays.some((relay) => relay.status === "CANCELED")).toBe(true);
-      expect(relays.find((relay) => relay.attemptCount === 2)).toMatchObject({
+      expect(relays.find((relay) => relay.requestedModelPoolId === pool.id)).toMatchObject({
         status: "SUCCEEDED",
+        attemptCount: 2,
         admissionBorrowed: expect.any(Boolean),
         admissionReservationClass: expect.any(Number),
       });

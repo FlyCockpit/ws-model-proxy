@@ -54,4 +54,11 @@ describe("profileSurfaceRequest", () => {
       outputAudio: true,
     });
   });
+
+  it("keeps established reasoning routing semantics for effort and disabled thinking", () => {
+    expect(profileSurfaceRequest({ reasoning_effort: "none" })).toEqual({ reasoning: true });
+    expect(profileSurfaceRequest({ thinking: { type: "disabled" } })).toEqual({});
+    expect(profileSurfaceRequest({ output_config: { effort: "high" } })).toEqual({});
+    expect(profileSurfaceRequest({ effort: "high" })).toEqual({});
+  });
 });

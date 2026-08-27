@@ -1943,6 +1943,20 @@ describe("forwarderManagementRouter", () => {
             },
           },
         },
+      ])
+      .mockResolvedValueOnce([
+        {
+          id: "model-id",
+          capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+          capabilityOverrideMetadata: null,
+          Endpoint: {
+            capabilityMetadata: {
+              version: 1,
+              protocol: "openai-compatible",
+              chatCompletions: { supported: true },
+            },
+          },
+        },
       ]);
     db.modelPool.findMany
       .mockResolvedValueOnce([
@@ -2000,6 +2014,7 @@ describe("forwarderManagementRouter", () => {
           endpointSlug: "local",
           cliDeviceSlug: "desk",
           attachmentModalities: { image: true, audio: true, video: true },
+          reasoning: { OPENAI_CHAT_COMPLETIONS: { supported: false, levelsUnknown: false } },
         },
       ],
       modelPools: [
@@ -2013,6 +2028,7 @@ describe("forwarderManagementRouter", () => {
           ownerUserSlug: "owner",
           poolSlug: "general",
           attachmentModalities: { image: false, audio: false, video: false },
+          reasoning: {},
         },
         {
           target: "MODEL_POOL",
@@ -2024,9 +2040,61 @@ describe("forwarderManagementRouter", () => {
           ownerUserSlug: "friend",
           poolSlug: "shared",
           attachmentModalities: { image: false, audio: false, video: false },
+          reasoning: {},
         },
       ],
     });
+  });
+
+  it("preserves v4 reasoningConfig when a dashboard vision toggle updates capabilities", async () => {
+    const capabilities = {
+      version: 4 as const,
+      protocol: "openai-compatible" as const,
+      surfaces: {
+        openaiChatCompletions: {
+          source: "declared" as const,
+          confidence: "exact" as const,
+          operations: ["create"] as const,
+          reasoning: true,
+          reasoningConfig: {
+            supportedLevels: ["low", "high"] as const,
+            defaultLevel: "high" as const,
+            encoding: { kind: "openai_reasoning_effort" as const },
+          },
+        },
+      },
+    };
+    db.discoveredModel.findUnique.mockResolvedValue({
+      id: "model-id",
+      userId: "user-id",
+      capabilityOverrideMode: "OVERRIDE",
+      capabilityOverrideMetadata: capabilities,
+      capabilityOverrides: ["TEXT_GENERATION"],
+      Endpoint: { capabilityMetadata: null, defaultCapabilities: [] },
+    });
+    db.discoveredModel.update.mockImplementation(async ({ data }: { data: unknown }) => data);
+
+    await client().updateDiscoveredModelCapabilities({
+      id: "model-id",
+      vision: true,
+      audio: false,
+      video: false,
+    });
+
+    expect(db.discoveredModel.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          capabilityOverrideMetadata: expect.objectContaining({
+            surfaces: expect.objectContaining({
+              openaiChatCompletions: expect.objectContaining({
+                inputImages: true,
+                reasoningConfig: capabilities.surfaces.openaiChatCompletions.reasoningConfig,
+              }),
+            }),
+          }),
+        }),
+      }),
+    );
   });
 
   it("stores a complete v2 model override without collapsing false and unknown fields", async () => {

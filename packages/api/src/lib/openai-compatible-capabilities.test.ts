@@ -137,6 +137,86 @@ describe("capability inventory v4", () => {
   });
 });
 
+describe("reasoning capability contract", () => {
+  const chat = {
+    source: "provider",
+    confidence: "exact",
+    operations: ["create"],
+    reasoning: true,
+    reasoningConfig: { supportedLevels: ["none", "low"], defaultLevel: "low" },
+  };
+
+  it("accepts v3 and v4 reasoning config while retaining boolean-only inventories", () => {
+    expect(
+      parseOpenAiCompatibleCapabilities({
+        version: 3,
+        protocol: "openai-compatible",
+        surfaces: {
+          openaiChatCompletions: {
+            source: "provider",
+            confidence: "exact",
+            supported: true,
+            reasoning: true,
+            reasoningConfig: chat.reasoningConfig,
+          },
+        },
+      }),
+    ).not.toBeNull();
+    expect(
+      parseOpenAiCompatibleCapabilities({
+        version: 4,
+        protocol: "openai-compatible",
+        surfaces: { openaiChatCompletions: chat },
+      }),
+    ).not.toBeNull();
+    expect(
+      parseOpenAiCompatibleCapabilities({
+        version: 4,
+        protocol: "openai-compatible",
+        surfaces: {
+          openaiChatCompletions: {
+            source: "provider",
+            confidence: "exact",
+            operations: ["create"],
+            reasoning: true,
+          },
+        },
+      }),
+    ).not.toBeNull();
+  });
+
+  it("rejects incoherent and cross-family reasoning config", () => {
+    const inventory = {
+      version: 4,
+      protocol: "openai-compatible",
+      surfaces: { openaiChatCompletions: chat },
+    };
+    expect(
+      parseOpenAiCompatibleCapabilities({
+        ...inventory,
+        surfaces: { openaiChatCompletions: { ...chat, reasoning: false } },
+      }),
+    ).toBeNull();
+    expect(
+      parseOpenAiCompatibleCapabilities({
+        ...inventory,
+        surfaces: { openaiChatCompletions: { ...chat, reasoningConfig: {} } },
+      }),
+    ).toBeNull();
+    expect(
+      parseOpenAiCompatibleCapabilities({
+        ...inventory,
+        surfaces: {
+          openaiChatCompletions: {
+            ...chat,
+            reasoningConfig: { encoding: { kind: "anthropic_thinking" } },
+          },
+        },
+      }),
+    ).toBeNull();
+  });
+});
+
 describe("openAiCapabilitiesFromCoarse", () => {
   it("preserves embeddings and responses while enabling vision", () => {
     const caps = openAiCapabilitiesFromCoarse([

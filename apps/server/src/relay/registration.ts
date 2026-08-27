@@ -1,19 +1,10 @@
 import { createHash } from "node:crypto";
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
 import { resetPoolMemberHealth } from "@ws-model-proxy/api/lib/model-pool-routing";
-import { audioOperationSupported } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import { coarseCapabilitiesFromOpenAi } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { directModelId, validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma from "@ws-model-proxy/db";
 import type { EndpointInventory, OpenAiCompatibleCapabilities } from "./protocol.js";
-
-type ModelCapability =
-  | "TEXT_GENERATION"
-  | "VISION_INPUT"
-  | "VIDEO_INPUT"
-  | "EMBEDDING"
-  | "AUDIO_INPUT"
-  | "AUDIO_OUTPUT"
-  | "RESPONSES_API";
 
 type JsonValue = string | number | boolean | { [key: string]: JsonValue } | JsonValue[];
 
@@ -53,34 +44,6 @@ function endpointStatus(status: EndpointInventory["status"]) {
   if (status === "degraded") return "DEGRADED";
   if (status === "offline") return "OFFLINE";
   return "UNKNOWN";
-}
-
-function coarseModelCapabilities(
-  capabilities: OpenAiCompatibleCapabilities | undefined,
-): ModelCapability[] {
-  if (!capabilities) return [];
-  const values = new Set<ModelCapability>();
-  if (
-    capabilities.chatCompletions?.supported ||
-    capabilities.completions?.supported ||
-    capabilities.responses?.supported
-  ) {
-    values.add("TEXT_GENERATION");
-  }
-  if (capabilities.chatCompletions?.vision) values.add("VISION_INPUT");
-  if (capabilities.chatCompletions?.video) values.add("VIDEO_INPUT");
-  if (capabilities.embeddings?.supported) values.add("EMBEDDING");
-  // Dedicated /v1/audio/* endpoints *or* chat `input_audio` content parts.
-  if (
-    capabilities.chatCompletions?.audio ||
-    audioOperationSupported(capabilities.audio?.transcriptions) ||
-    audioOperationSupported(capabilities.audio?.translations)
-  ) {
-    values.add("AUDIO_INPUT");
-  }
-  if (capabilities.audio?.speech) values.add("AUDIO_OUTPUT");
-  if (capabilities.responses?.supported) values.add("RESPONSES_API");
-  return [...values];
 }
 
 export function shouldPreserveDashboardCapabilityOverride(
@@ -238,7 +201,9 @@ export async function persistRelayRegistration({
           const publishedEndpointSlugs = endpoints.map((endpoint) => endpoint.slug);
 
           for (const endpoint of endpoints) {
-            const coarseCapabilities = coarseModelCapabilities(endpoint.defaultCapabilities);
+            const coarseCapabilities = endpoint.defaultCapabilities
+              ? coarseCapabilitiesFromOpenAi(endpoint.defaultCapabilities)
+              : [];
             const existingEndpoint = await tx.endpoint.findUnique({
               where: { userId_slug: { userId: identity.userId, slug: endpoint.slug } },
               select: { cliDeviceId: true, status: true },
@@ -296,7 +261,9 @@ export async function persistRelayRegistration({
               const modelSlug = model.slug ? assertSlug(model.slug, "Model slug") : null;
               const overrideCapabilities =
                 model.capabilityOverrideMode === "override"
-                  ? coarseModelCapabilities(model.capabilities)
+                  ? model.capabilities
+                    ? coarseCapabilitiesFromOpenAi(model.capabilities)
+                    : []
                   : [];
               const existingModel = await tx.discoveredModel.findUnique({
                 where: {

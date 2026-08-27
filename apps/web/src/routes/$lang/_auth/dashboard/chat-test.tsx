@@ -1,5 +1,10 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
+import {
+  type ChatTestReasoningSelection,
+  encodeReasoning,
+  reasoningSelectorState,
+} from "@ws-model-proxy/api/lib/reasoning-contract";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { env } from "@ws-model-proxy/env/web";
 import { Button } from "@ws-model-proxy/ui/components/button";
@@ -51,6 +56,12 @@ import { InlineRetry } from "@/components/inline-retry";
 import { useAbortOnUnmount } from "@/hooks/use-abort-on-unmount";
 import { useChatScrollEngine } from "@/hooks/use-chat-scroll-engine";
 import {
+  anthropicTranscript,
+  completionDeltas,
+  requireChatTestOutput,
+  responsesTranscript,
+} from "@/lib/chat-test-reasoning";
+import {
   type AttachmentModalities,
   type AttachmentModality,
   acceptedAttachmentAcceptAttr,
@@ -77,6 +88,7 @@ type ModelOption = {
   kind: "DIRECT_MODEL" | "MODEL_POOL";
   attachmentModalities: AttachmentModalities;
   maxAttachmentBytes: number | null;
+  reasoning: VisibleModels["directModels"][number]["reasoning"];
   compatibility?: VisibleModels["modelPools"][number]["compatibility"];
 };
 type ChatTestRoutingMode = "PREFER_NATIVE" | "REQUIRE_NATIVE" | "REQUIRE_ADAPTED";
@@ -197,6 +209,7 @@ type ChatMessage = {
   attachments?: ChatAttachment[];
   metrics?: ChatTimingMetrics;
   transformDebug?: TransformDebug;
+  thinking?: string;
 };
 // OpenAI-shaped content parts used when a message carries media.
 type RelayContentPart =
@@ -225,6 +238,7 @@ function modelOptions(visibleModels: VisibleModels | undefined): ModelOption[] {
       kind: model.target,
       attachmentModalities: model.attachmentModalities,
       maxAttachmentBytes: model.maxAttachmentBytes,
+      reasoning: model.reasoning,
     })),
     ...visibleModels.modelPools.map((pool) => ({
       id: pool.id,
@@ -233,6 +247,7 @@ function modelOptions(visibleModels: VisibleModels | undefined): ModelOption[] {
       kind: pool.target,
       attachmentModalities: pool.attachmentModalities,
       maxAttachmentBytes: pool.maxAttachmentBytes,
+      reasoning: pool.reasoning,
       compatibility: pool.compatibility,
     })),
   ];
@@ -410,23 +425,6 @@ function estimateRequestBytes(model: string, messages: RelayChatMessage[]): numb
   return new Blob([body]).size;
 }
 
-function contentDelta(value: unknown): string {
-  if (typeof value !== "object" || value === null) return "";
-  const choices = "choices" in value ? value.choices : null;
-  if (!Array.isArray(choices)) return "";
-  return choices
-    .map((choice) => {
-      if (typeof choice !== "object" || choice === null) return "";
-      const delta = "delta" in choice ? choice.delta : null;
-      if (typeof delta === "object" && delta !== null && "content" in delta) {
-        return typeof delta.content === "string" ? delta.content : "";
-      }
-      if ("text" in choice) return typeof choice.text === "string" ? choice.text : "";
-      return "";
-    })
-    .join("");
-}
-
 function standardizedCompletionTokens(value: unknown): number | undefined {
   if (typeof value !== "object" || value === null || !("wsmp_metrics" in value)) {
     return undefined;
@@ -566,8 +564,10 @@ async function streamChatCompletion({
   messages,
   routingMode,
   surface,
+  reasoning,
   signal,
   onDelta,
+  onThinkingDelta,
   onTransformDebug,
   fallbackErrorMessage,
 }: {
@@ -575,8 +575,10 @@ async function streamChatCompletion({
   messages: RelayChatMessage[];
   routingMode: ChatTestRoutingMode;
   surface: ChatTestSurface;
+  reasoning: Record<string, unknown>;
   signal: AbortSignal;
   onDelta: (delta: string) => void;
+  onThinkingDelta: (delta: string) => void;
   onTransformDebug?: (debug: TransformDebug) => void;
   fallbackErrorMessage: string;
 }): Promise<ChatTimingMetrics> {
@@ -595,13 +597,14 @@ async function streamChatCompletion({
         },
         body: JSON.stringify(
           isResponses
-            ? { model, input: messages, stream: false, store: false }
+            ? { model, input: messages, stream: false, store: false, ...reasoning }
             : {
                 model,
                 messages: messages.filter((message) => message.role !== "system"),
                 system: messages.find((message) => message.role === "system")?.content,
                 max_tokens: 1024,
                 stream: false,
+                ...reasoning,
               },
         ),
         signal,
@@ -609,26 +612,10 @@ async function streamChatCompletion({
     );
     if (!response.ok) throw new Error(await readErrorMessage(response, fallbackErrorMessage));
     const payload = (await response.json()) as Record<string, unknown>;
-    const text = isResponses
-      ? Array.isArray(payload.output)
-        ? payload.output
-            .flatMap((item) =>
-              item &&
-              typeof item === "object" &&
-              Array.isArray((item as { content?: unknown }).content)
-                ? (item as { content: Array<{ text?: unknown }> }).content
-                : [],
-            )
-            .flatMap((item) => (typeof item.text === "string" ? [item.text] : []))
-            .join("")
-        : ""
-      : Array.isArray(payload.content)
-        ? (payload.content as Array<{ text?: unknown }>)
-            .flatMap((item) => (typeof item.text === "string" ? [item.text] : []))
-            .join("")
-        : "";
-    if (!text) throw new Error(fallbackErrorMessage);
-    onDelta(text);
+    const transcript = isResponses ? responsesTranscript(payload) : anthropicTranscript(payload);
+    requireChatTestOutput(transcript, fallbackErrorMessage);
+    if (transcript.content) onDelta(transcript.content);
+    if (transcript.thinking) onThinkingDelta(transcript.thinking);
     return { ttftMs: performance.now() - startedAt };
   }
   const response = await fetch(`${env.VITE_SERVER_URL}/api/internal/chat-test/chat/completions`, {
@@ -642,6 +629,7 @@ async function streamChatCompletion({
       model,
       messages,
       stream: true,
+      ...reasoning,
     }),
     signal,
   });
@@ -656,8 +644,10 @@ async function streamChatCompletion({
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  let firstVisibleDeltaAt: number | undefined;
+  let firstTokenAt: number | undefined;
   let reportedSharedCompletionTokens: number | undefined;
+  let content = "";
+  let thinking = "";
 
   const processEvent = (event: string) => {
     const eventName = event
@@ -684,10 +674,15 @@ async function streamChatCompletion({
     }
     const metrics = standardizedCompletionTokens(parsed);
     if (metrics !== undefined) reportedSharedCompletionTokens = metrics;
-    const delta = contentDelta(parsed);
-    if (delta) {
-      firstVisibleDeltaAt ??= performance.now();
-      onDelta(delta);
+    const delta = completionDeltas(parsed);
+    if (delta.content || delta.thinking) firstTokenAt ??= performance.now();
+    if (delta.content) {
+      content += delta.content;
+      onDelta(delta.content);
+    }
+    if (delta.thinking) {
+      thinking += delta.thinking;
+      onThinkingDelta(delta.thinking);
     }
   };
 
@@ -703,14 +698,16 @@ async function streamChatCompletion({
   buffer += decoder.decode();
   if (buffer.trim()) processEvent(buffer);
 
+  requireChatTestOutput({ content, thinking }, fallbackErrorMessage);
+
   const completedAt = performance.now();
-  const ttftMs = firstVisibleDeltaAt === undefined ? undefined : firstVisibleDeltaAt - startedAt;
+  const ttftMs = firstTokenAt === undefined ? undefined : firstTokenAt - startedAt;
   const tokensPerSecond =
     reportedSharedCompletionTokens === undefined ||
-    firstVisibleDeltaAt === undefined ||
-    completedAt <= firstVisibleDeltaAt
+    firstTokenAt === undefined ||
+    completedAt <= firstTokenAt
       ? undefined
-      : reportedSharedCompletionTokens / ((completedAt - firstVisibleDeltaAt) / 1000);
+      : reportedSharedCompletionTokens / ((completedAt - firstTokenAt) / 1000);
   return {
     ttftMs,
     completionTokens: reportedSharedCompletionTokens,
@@ -746,6 +743,7 @@ function ChatTestPage() {
   const [selectedModelId, setSelectedModelId] = useState("");
   const [routingMode, setRoutingMode] = useState<ChatTestRoutingMode>("PREFER_NATIVE");
   const [surfaceSelection, setSurfaceSelection] = useState<ChatTestSurfaceSelection>("PREFERRED");
+  const [reasoningSelection, setReasoningSelection] = useState<ChatTestReasoningSelection>("unset");
   const [draft, setDraft] = useState("");
   const [systemPrompt, setSystemPrompt] = useState("");
   // Collapsed by default so the mobile transcript keeps most of the viewport;
@@ -772,9 +770,15 @@ function ChatTestPage() {
   const isMountedRef = useAbortOnUnmount(videoCompressionAbortRef);
   const scroll = useChatScrollEngine();
   const options = useMemo(() => modelOptions(visibleModelsData), [visibleModelsData]);
-  const effectiveModelId = options.some((option) => option.modelId === selectedModelId)
-    ? selectedModelId
-    : (options[0]?.modelId ?? "");
+  // Select the first visible model only for a new Chat Test. If a previously
+  // selected model disappears, leave the control unset rather than silently
+  // sending with its former surface/routing controls against a different model.
+  const effectiveModelId =
+    selectedModelId === ""
+      ? (options[0]?.modelId ?? "")
+      : options.some((option) => option.modelId === selectedModelId)
+        ? selectedModelId
+        : "";
   const selectedModel = options.find((option) => option.modelId === effectiveModelId);
   const recommendedSurface = selectedModel?.compatibility?.recommendedSurface;
   const effectiveSurface: ChatTestSurface | null =
@@ -787,6 +791,50 @@ function ChatTestPage() {
           ? recommendedSurface
           : null
         : surfaceSelection;
+  const surfaceReasoning = effectiveSurface
+    ? selectedModel?.reasoning[effectiveSurface]
+    : undefined;
+  const selectorState = reasoningSelectorState({
+    surface: effectiveSurface ?? "OPENAI_CHAT_COMPLETIONS",
+    routingMode,
+    reasoning: surfaceReasoning ?? {},
+  });
+  const effectiveReasoningSelection =
+    !selectorState.hidden && selectorState.options.includes(reasoningSelection)
+      ? reasoningSelection
+      : "unset";
+  const reasoningHelp = !selectorState.hidden
+    ? [
+        selectorState.levelsUnknown
+          ? t("dashboard:chatTest.reasoning.unknownLevels")
+          : t("dashboard:chatTest.reasoning.help"),
+        effectiveSurface === "ANTHROPIC_MESSAGES" &&
+        routingMode === "PREFER_NATIVE" &&
+        effectiveReasoningSelection === "none"
+          ? t("dashboard:chatTest.reasoning.anthropicNoneHelp")
+          : null,
+      ]
+        .filter((message): message is string => message !== null)
+        .join(" ")
+    : "";
+  const encodedReasoning =
+    effectiveSurface && routingMode !== "REQUIRE_ADAPTED"
+      ? encodeReasoning({
+          surface: effectiveSurface,
+          selection: effectiveReasoningSelection,
+          config: surfaceReasoning
+            ? {
+                ...(surfaceReasoning.supportedLevels
+                  ? { supportedLevels: surfaceReasoning.supportedLevels }
+                  : {}),
+                ...(surfaceReasoning.defaultLevel
+                  ? { defaultLevel: surfaceReasoning.defaultLevel }
+                  : {}),
+                ...(surfaceReasoning.encoding ? { encoding: surfaceReasoning.encoding } : {}),
+              }
+            : undefined,
+        })
+      : {};
   const attachmentMaxBytes = Math.min(
     mediaConfig && mediaConfig.maxAttachmentBytes > 0
       ? mediaConfig.maxAttachmentBytes
@@ -831,6 +879,7 @@ function ChatTestPage() {
         nextModel?.maxAttachmentBytes ?? Number.POSITIVE_INFINITY,
       );
       setSelectedModelId(modelId);
+      setReasoningSelection("unset");
       if (nextModel?.kind === "DIRECT_MODEL") {
         setSurfaceSelection("PREFERRED");
         setRoutingMode("PREFER_NATIVE");
@@ -1195,6 +1244,7 @@ function ChatTestPage() {
           messages: relayInput,
           routingMode,
           surface: effectiveSurface ?? "OPENAI_CHAT_COMPLETIONS",
+          reasoning: encodedReasoning,
           signal: controller.signal,
           fallbackErrorMessage: t("dashboard:chatTest.errors.streamFailed"),
           onDelta: (delta) => {
@@ -1202,6 +1252,20 @@ function ChatTestPage() {
               current.map((message) =>
                 message.id === assistantId
                   ? { ...message, content: message.content + delta, status: "streaming" }
+                  : message,
+              ),
+            );
+            scroll.markContentChanged();
+          },
+          onThinkingDelta: (thinking) => {
+            setMessages((current) =>
+              current.map((message) =>
+                message.id === assistantId
+                  ? {
+                      ...message,
+                      thinking: (message.thinking ?? "") + thinking,
+                      status: "streaming",
+                    }
                   : message,
               ),
             );
@@ -1236,7 +1300,7 @@ function ChatTestPage() {
         scroll.markContentChanged();
       }
     },
-    [effectiveSurface, routingMode, scroll, t, updateAssistant],
+    [effectiveSurface, encodedReasoning, routingMode, scroll, t, updateAssistant],
   );
 
   // Flag attachments whose media id came back invalid/expired from /sign, both
@@ -1364,6 +1428,11 @@ function ChatTestPage() {
 
         setDraft("");
         setAttachments([]);
+        // The empty selection displays the first model only as a new-chat
+        // convenience. Once that implicit choice is actually used, persist it
+        // so a visible-model query refresh or reorder cannot change the model
+        // for later turns in this chat.
+        setSelectedModelId((current) => current || effectiveModelId);
         setMessages(nextMessages);
         scroll.positionTurnNearTop(userMessage.id);
         void runRelay({
@@ -1423,7 +1492,13 @@ function ChatTestPage() {
         setMessages((current) =>
           current.map((message) =>
             message.id === assistant.id
-              ? { ...message, content: "", status: "streaming", errorMessage: undefined }
+              ? {
+                  ...message,
+                  content: "",
+                  thinking: undefined,
+                  status: "streaming",
+                  errorMessage: undefined,
+                }
               : message,
           ),
         );
@@ -1486,6 +1561,7 @@ function ChatTestPage() {
     setSystemPromptOpen(false);
     setAttachments([]);
     setAttachmentNotice("");
+    setReasoningSelection("unset");
     setAnnouncement(t("dashboard:chatTest.announcements.fresh"));
   }, [isPreparingSend, isStreaming, scroll, t]);
 
@@ -1536,9 +1612,10 @@ function ChatTestPage() {
               value={surfaceSelection}
               disabled={isStreaming || isPreparingSend || selectedModel?.kind !== "MODEL_POOL"}
               aria-invalid={surfaceSelection === "PREFERRED" && effectiveSurface === null}
-              onChange={(event) =>
-                setSurfaceSelection(event.target.value as ChatTestSurfaceSelection)
-              }
+              onChange={(event) => {
+                setSurfaceSelection(event.target.value as ChatTestSurfaceSelection);
+                setReasoningSelection("unset");
+              }}
             >
               <option value="PREFERRED">{t("dashboard:chatTest.surface.PREFERRED")}</option>
               <option value="OPENAI_CHAT_COMPLETIONS">
@@ -1566,7 +1643,10 @@ function ChatTestPage() {
               className="h-11 w-full rounded-md border bg-background px-3 text-sm"
               value={routingMode}
               disabled={isStreaming || isPreparingSend || selectedModel?.kind !== "MODEL_POOL"}
-              onChange={(event) => setRoutingMode(event.target.value as ChatTestRoutingMode)}
+              onChange={(event) => {
+                setRoutingMode(event.target.value as ChatTestRoutingMode);
+                if (event.target.value === "REQUIRE_ADAPTED") setReasoningSelection("unset");
+              }}
             >
               <option value="PREFER_NATIVE">
                 {t("dashboard:chatTest.routingMode.PREFER_NATIVE")}
@@ -1584,6 +1664,32 @@ function ChatTestPage() {
                 : t("dashboard:chatTest.routingMode.directHelp")}
             </p>
           </div>
+          {!selectorState.hidden ? (
+            <div className="min-w-[13rem] max-w-full space-y-1">
+              <Label htmlFor="chat-test-reasoning" className="sr-only">
+                {t("dashboard:chatTest.reasoning.label")}
+              </Label>
+              <select
+                id="chat-test-reasoning"
+                className="h-11 w-full rounded-md border bg-background px-3 text-sm"
+                value={effectiveReasoningSelection}
+                disabled={isStreaming || isPreparingSend}
+                onChange={(event) =>
+                  setReasoningSelection(event.target.value as ChatTestReasoningSelection)
+                }
+              >
+                {selectorState.options.map((level) => (
+                  <option key={level} value={level}>
+                    {t(`dashboard:chatTest.reasoning.levels.${level}`)}
+                    {level !== "unset" && selectorState.defaultLevel === level
+                      ? ` (${t("dashboard:chatTest.reasoning.default")})`
+                      : ""}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-muted-foreground">{reasoningHelp}</p>
+            </div>
+          ) : null}
           <Button
             type="button"
             variant="outline"
@@ -1944,9 +2050,19 @@ function MessageBubble({
       ) : null}
       {message.content ? (
         <MessageContent content={message.content} />
-      ) : message.attachments && message.attachments.length > 0 ? null : (
+      ) : message.thinking || (message.attachments && message.attachments.length > 0) ? null : (
         <p className="text-sm text-muted-foreground">{t("dashboard:chatTest.status.waiting")}</p>
       )}
+      {isAssistant && message.thinking ? (
+        <details className="mt-3 rounded-md border border-border/70 bg-muted/30 p-2 text-sm">
+          <summary className="flex min-h-11 cursor-pointer items-center font-medium">
+            {t("dashboard:chatTest.reasoning.thinkingSummary")}
+          </summary>
+          <div className="mt-2 whitespace-pre-wrap break-words text-muted-foreground">
+            {message.thinking}
+          </div>
+        </details>
+      ) : null}
       {isAssistant && message.metrics?.ttftMs !== undefined ? (
         <p className="mt-3 text-xs tabular-nums text-muted-foreground">
           {t("dashboard:chatTest.metrics.ttft", {
