@@ -478,6 +478,60 @@ describe("RelaySessionManager", () => {
     expect(socket.closes).toEqual([{ code: 1002, reason: "protocol_error" }]);
   });
 
+  it("logs schema rejection details and closes with a generic protocol error", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity, now });
+
+    const frame = JSON.stringify({
+      type: "hello",
+      id: "hello-id",
+      protocolVersion: "2.1",
+      cli: {
+        slug: "desktop",
+        label: "Desktop",
+        capabilities: {
+          protocolVersion: "2.1",
+          inventoryAck: true,
+          inventoryReplace: true,
+          endpointTargeting: true,
+          binaryFrames: true,
+          cancellation: true,
+          maxBinaryChunkBytes: 1024 * 1024,
+          requestBodyStreaming: true,
+          requestBodyWindowChunks: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+        },
+      },
+      endpoints: [
+        {
+          slug: "local-openai",
+          label: "Local OpenAI",
+          kind: "openai-compatible",
+          status: "online",
+          defaultCapabilities: {
+            version: 5,
+            protocol: "openai-compatible",
+          },
+          models: [],
+        },
+      ],
+    });
+
+    await manager.handleTextFrame(socket, frame, now);
+
+    expect(consoleError).toHaveBeenCalledWith(
+      "[relay] control frame schema rejected",
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: expect.stringContaining("version"),
+        }),
+      ]),
+    );
+    expect(socket.closes).toEqual([{ code: 1002, reason: "protocol_error" }]);
+    consoleError.mockRestore();
+  });
+
   it("replaces older sockets for the same registered CLI device", async () => {
     const manager = new RelaySessionManager();
     const first = new FakeSocket();

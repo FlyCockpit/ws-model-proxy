@@ -353,6 +353,43 @@ export function parseRelayClientControlFrame(frame: string): RelayClientControlM
   return relayClientControlMessageSchema.parse(parsed);
 }
 
+const RELAY_CONTROL_PARSE_ISSUE_LIMIT = 20;
+
+export type RelayControlParseErrorDescription =
+  | { kind: "oversize" }
+  | { kind: "json" }
+  | {
+      kind: "schema";
+      issues: Array<{ path: string; code: string; message: string }>;
+    }
+  | { kind: "unknown"; name: string };
+
+export function describeRelayControlParseError(error: unknown): RelayControlParseErrorDescription {
+  if (error instanceof RelayProtocolError) {
+    if (error.message === "JSON control frame exceeds 64 KiB.") {
+      return { kind: "oversize" };
+    }
+    return { kind: "unknown", name: error.name };
+  }
+  if (error instanceof SyntaxError) {
+    return { kind: "json" };
+  }
+  if (error instanceof z.ZodError) {
+    return {
+      kind: "schema",
+      issues: error.issues.slice(0, RELAY_CONTROL_PARSE_ISSUE_LIMIT).map((issue) => ({
+        path: issue.path.join("."),
+        code: issue.code,
+        message: issue.message,
+      })),
+    };
+  }
+  if (error instanceof Error) {
+    return { kind: "unknown", name: error.name };
+  }
+  return { kind: "unknown", name: "Error" };
+}
+
 class RelayProtocolError extends Error {
   constructor(message: string) {
     super(message);

@@ -125,74 +125,82 @@ type SlugPreviewPoolRow = {
   name: string;
 };
 
-type CliDeviceRow = {
-  id: string;
-  createdAt: Date;
-  updatedAt: Date;
-  slug: string;
-  label: string;
-  status: string;
-  lastConnectedAt: Date | null;
-  lastDisconnectedAt: Date | null;
-  lastHeartbeatAt: Date | null;
-  connectionCount: number;
-  inventorySeq: number;
-  inventoryDigest: string | null;
-  inventoryAcknowledgedAt: Date | null;
-  inventoryConfirmed: boolean;
-  endpointTargeting: boolean;
-  User: { slug: string };
-  Endpoints: EndpointRow[];
-};
+const listCliDevicesSelect = {
+  id: true,
+  createdAt: true,
+  updatedAt: true,
+  slug: true,
+  label: true,
+  status: true,
+  lastConnectedAt: true,
+  lastDisconnectedAt: true,
+  lastHeartbeatAt: true,
+  connectionCount: true,
+  inventorySeq: true,
+  inventoryDigest: true,
+  inventoryAcknowledgedAt: true,
+  inventoryConfirmed: true,
+  endpointTargeting: true,
+  User: { select: { slug: true } },
+  Endpoints: {
+    orderBy: { createdAt: "asc" as const },
+    select: {
+      id: true,
+      createdAt: true,
+      updatedAt: true,
+      slug: true,
+      label: true,
+      kind: true,
+      status: true,
+      defaultCapabilities: true,
+      capabilityMetadata: true,
+      probeSuggestions: true,
+      lastSeenAt: true,
+      lastHealthCheckAt: true,
+      statusChangedAt: true,
+      failureReasonCode: true,
+      published: true,
+      unpublishedAt: true,
+      DiscoveredModels: {
+        orderBy: { createdAt: "asc" as const },
+        select: {
+          id: true,
+          createdAt: true,
+          updatedAt: true,
+          slug: true,
+          upstreamModelId: true,
+          encodedModelId: true,
+          capabilityOverrideMode: true,
+          capabilityOverrides: true,
+          capabilityOverrideMetadata: true,
+          optimisticBasicTranscription: true,
+          probeSuggestions: true,
+          lastSeenAt: true,
+          published: true,
+          unpublishedAt: true,
+          maxAttachmentBytes: true,
+          ExecutionTarget: {
+            select: {
+              id: true,
+              inferenceCapacityId: true,
+              directPriority: true,
+              directConcurrencyLimit: true,
+              directReservedSlots: true,
+              directBorrowPolicy: true,
+              directWaitBudgetMs: true,
+              directContextCeiling: true,
+              directContextMargin: true,
+            },
+          },
+        },
+      },
+    },
+  },
+} satisfies Prisma.CliDeviceSelect;
 
-type EndpointRow = {
-  id: string;
-  createdAt: Date;
-  updatedAt: Date;
-  slug: string;
-  label: string;
-  kind: string;
-  status: string;
-  defaultCapabilities: string[];
-  capabilityMetadata: unknown | null;
-  probeSuggestions: unknown | null;
-  lastSeenAt: Date | null;
-  lastHealthCheckAt: Date | null;
-  statusChangedAt: Date | null;
-  failureReasonCode: string | null;
-  published: boolean;
-  unpublishedAt: Date | null;
-  DiscoveredModels: DiscoveredModelRow[];
-};
-
-type DiscoveredModelRow = {
-  id: string;
-  createdAt: Date;
-  updatedAt: Date;
-  slug: string | null;
-  upstreamModelId: string;
-  encodedModelId: string;
-  capabilityOverrideMode: string;
-  capabilityOverrides: string[];
-  capabilityOverrideMetadata: unknown | null;
-  optimisticBasicTranscription: boolean;
-  probeSuggestions: unknown | null;
-  lastSeenAt: Date | null;
-  published: boolean;
-  unpublishedAt: Date | null;
-  maxAttachmentBytes: number | null;
-  ExecutionTargets: Array<{
-    id: string;
-    inferenceCapacityId: string | null;
-    directPriority: number;
-    directConcurrencyLimit: number | null;
-    directReservedSlots: number;
-    directBorrowPolicy: string;
-    directWaitBudgetMs: number | null;
-    directContextCeiling: number | null;
-    directContextMargin: number;
-  }>;
-};
+type CliDeviceRow = Prisma.CliDeviceGetPayload<{ select: typeof listCliDevicesSelect }>;
+type EndpointRow = CliDeviceRow["Endpoints"][number];
+type DiscoveredModelRow = EndpointRow["DiscoveredModels"][number];
 
 type ModelPoolRow = {
   id: string;
@@ -571,8 +579,7 @@ function serializeCliDevice(row: CliDeviceRow, now: Date) {
         published: model.published,
         unpublishedAt: model.unpublishedAt,
         maxAttachmentBytes: model.maxAttachmentBytes,
-        // Older mocked/serialized inventory rows predate execution targets.
-        executionTarget: model.ExecutionTargets?.[0] ?? null,
+        executionTarget: model.ExecutionTarget ?? null,
       })),
     })),
   };
@@ -1868,83 +1875,11 @@ export const forwarderManagementRouter = {
   listCliDevices: protectedProcedure
     .input(z.object({ includeModels: z.boolean().default(true) }).optional())
     .handler(async ({ context }) => {
-      const rows = (await prisma.cliDevice.findMany({
+      const rows = await prisma.cliDevice.findMany({
         where: { userId: context.session.user.id },
         orderBy: { createdAt: "desc" },
-        select: {
-          id: true,
-          createdAt: true,
-          updatedAt: true,
-          slug: true,
-          label: true,
-          status: true,
-          lastConnectedAt: true,
-          lastDisconnectedAt: true,
-          lastHeartbeatAt: true,
-          connectionCount: true,
-          inventorySeq: true,
-          inventoryDigest: true,
-          inventoryAcknowledgedAt: true,
-          inventoryConfirmed: true,
-          endpointTargeting: true,
-          User: { select: { slug: true } },
-          Endpoints: {
-            orderBy: { createdAt: "asc" },
-            select: {
-              id: true,
-              createdAt: true,
-              updatedAt: true,
-              slug: true,
-              label: true,
-              kind: true,
-              status: true,
-              defaultCapabilities: true,
-              capabilityMetadata: true,
-              probeSuggestions: true,
-              lastSeenAt: true,
-              lastHealthCheckAt: true,
-              statusChangedAt: true,
-              failureReasonCode: true,
-              published: true,
-              unpublishedAt: true,
-              DiscoveredModels: {
-                orderBy: { createdAt: "asc" },
-                select: {
-                  id: true,
-                  createdAt: true,
-                  updatedAt: true,
-                  slug: true,
-                  upstreamModelId: true,
-                  encodedModelId: true,
-                  capabilityOverrideMode: true,
-                  capabilityOverrides: true,
-                  capabilityOverrideMetadata: true,
-                  optimisticBasicTranscription: true,
-                  probeSuggestions: true,
-                  lastSeenAt: true,
-                  published: true,
-                  unpublishedAt: true,
-                  maxAttachmentBytes: true,
-                  ExecutionTargets: {
-                    take: 1,
-                    select: {
-                      id: true,
-                      inferenceCapacityId: true,
-                      directPriority: true,
-                      directConcurrencyLimit: true,
-                      directReservedSlots: true,
-                      directBorrowPolicy: true,
-                      directWaitBudgetMs: true,
-                      directContextCeiling: true,
-                      directContextMargin: true,
-                    },
-                  },
-                },
-              },
-            },
-          },
-        },
-      })) as CliDeviceRow[];
+        select: listCliDevicesSelect,
+      });
 
       const now = new Date();
       return rows.map((row) => serializeCliDevice(row, now));

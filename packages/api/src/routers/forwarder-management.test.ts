@@ -920,6 +920,7 @@ describe("forwarderManagementRouter", () => {
                 capabilityOverrideMetadata: { chatCompletions: { vision: true } },
                 probeSuggestions: null,
                 lastSeenAt: new Date("2026-01-01T00:00:30Z"),
+                ExecutionTarget: null,
               },
             ],
           },
@@ -937,9 +938,89 @@ describe("forwarderManagementRouter", () => {
     expect(result[0]?.endpoints[0]?.models[0]?.canonicalModelId).toBe(
       "renamed-owner/desk/local/llama",
     );
+    expect(result[0]?.endpoints[0]?.models[0]?.executionTarget).toBeNull();
     const serialized = JSON.stringify(result);
     expect(serialized).not.toContain("127.0.0.1");
     expect(serialized).not.toContain("endpoint-secret");
+
+    const findManySelect = db.cliDevice.findMany.mock.calls[0]?.[0]?.select;
+    expect(
+      findManySelect?.Endpoints?.select?.DiscoveredModels?.select?.ExecutionTarget,
+    ).toBeDefined();
+    expect(findManySelect?.Endpoints?.select?.DiscoveredModels?.select).not.toHaveProperty(
+      "ExecutionTargets",
+    );
+  });
+
+  it("lists execution targets on discovered models when present", async () => {
+    const executionTarget = {
+      id: "target-id",
+      inferenceCapacityId: "capacity-id",
+      directPriority: 0,
+      directConcurrencyLimit: 2,
+      directReservedSlots: 1,
+      directBorrowPolicy: "ALLOW",
+      directWaitBudgetMs: 5000,
+      directContextCeiling: 8192,
+      directContextMargin: 256,
+    };
+    db.cliDevice.findMany.mockResolvedValue([
+      {
+        id: "cli-id",
+        createdAt: new Date("2026-01-01"),
+        updatedAt: new Date("2026-01-02"),
+        slug: "desk",
+        label: "Desk",
+        status: "CONNECTED",
+        lastConnectedAt: new Date("2026-01-01T00:00:00Z"),
+        lastDisconnectedAt: null,
+        lastHeartbeatAt: new Date("2026-01-01T00:00:30Z"),
+        connectionCount: 3,
+        User: { slug: "owner" },
+        Endpoints: [
+          {
+            id: "endpoint-id",
+            createdAt: new Date("2026-01-01"),
+            updatedAt: new Date("2026-01-02"),
+            slug: "local",
+            label: "Local",
+            kind: "OPENAI_COMPATIBLE",
+            status: "ONLINE",
+            defaultCapabilities: ["TEXT_GENERATION"],
+            capabilityMetadata: null,
+            probeSuggestions: null,
+            lastSeenAt: new Date("2026-01-01T00:00:30Z"),
+            lastHealthCheckAt: null,
+            statusChangedAt: null,
+            failureReasonCode: null,
+            DiscoveredModels: [
+              {
+                id: "model-id",
+                createdAt: new Date("2026-01-01"),
+                updatedAt: new Date("2026-01-02"),
+                slug: null,
+                upstreamModelId: "llama",
+                encodedModelId: "owner/desk/local/llama",
+                capabilityOverrideMode: "INHERIT",
+                capabilityOverrides: [],
+                capabilityOverrideMetadata: null,
+                optimisticBasicTranscription: false,
+                probeSuggestions: null,
+                lastSeenAt: new Date("2026-01-01T00:00:30Z"),
+                published: true,
+                unpublishedAt: null,
+                maxAttachmentBytes: null,
+                ExecutionTarget: executionTarget,
+              },
+            ],
+          },
+        ],
+      },
+    ]);
+
+    const result = await client().listCliDevices();
+
+    expect(result[0]?.endpoints[0]?.models[0]?.executionTarget).toEqual(executionTarget);
   });
 
   it("removes metadata only when the row belongs to the current user", async () => {

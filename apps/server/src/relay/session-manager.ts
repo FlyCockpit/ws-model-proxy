@@ -15,6 +15,7 @@ import {
   PoolMemberRecoveryScheduler,
 } from "./pool-member-recovery.js";
 import {
+  describeRelayControlParseError,
   encodeRelayBinaryFrame,
   encodeRelayServerControlMessage,
   parseRelayBinaryFrame,
@@ -150,7 +151,17 @@ export class RelaySessionManager {
     let message: RelayClientControlMessage;
     try {
       message = parseRelayClientControlFrame(frame);
-    } catch {
+    } catch (error) {
+      const description = describeRelayControlParseError(error);
+      if (description.kind === "oversize") {
+        console.error("[relay] control frame exceeds 64 KiB");
+      } else if (description.kind === "json") {
+        console.error("[relay] control frame is not JSON");
+      } else if (description.kind === "schema") {
+        console.error("[relay] control frame schema rejected", description.issues);
+      } else {
+        console.error("[relay] control frame parse failed", description.name);
+      }
       closeWithProtocolError(socket, "Malformed relay protocol message.");
       await this.removeSession(socket, now);
       return;

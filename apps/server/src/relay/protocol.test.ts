@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { sanitizeRelayRequestHeaders } from "./headers.js";
 import {
+  describeRelayControlParseError,
   encodeRelayBinaryFrame,
   parseRelayBinaryFrame,
   parseRelayClientControlFrame,
@@ -82,6 +83,117 @@ describe("relayProtocol", () => {
       usage: { completionTokens: 42 },
       metrics: { completionTokens: 40, tokenizer: "cl100k_base" },
     });
+  });
+
+  it("rejects capability blobs with unsupported versions", () => {
+    try {
+      parseRelayClientControlFrame(
+        JSON.stringify({
+          type: "hello",
+          id: "hello-id",
+          protocolVersion: "2.1",
+          cli: {
+            slug: "desktop",
+            label: "Desktop",
+            capabilities: {
+              protocolVersion: "2.1",
+              inventoryAck: true,
+              inventoryReplace: true,
+              endpointTargeting: true,
+              binaryFrames: true,
+              cancellation: true,
+              maxBinaryChunkBytes: 1024 * 1024,
+              requestBodyStreaming: true,
+              requestBodyWindowChunks: 16,
+            },
+          },
+          endpoints: [
+            {
+              slug: "local-openai",
+              label: "Local OpenAI",
+              kind: "openai-compatible",
+              status: "online",
+              defaultCapabilities: {
+                version: 5,
+                protocol: "openai-compatible",
+              },
+              models: [],
+            },
+          ],
+        }),
+      );
+      throw new Error("expected parse failure");
+    } catch (error) {
+      const description = describeRelayControlParseError(error);
+      expect(description.kind).toBe("schema");
+      if (description.kind !== "schema") throw new Error("expected schema rejection");
+      expect(description.issues.some((issue) => issue.path.includes("version"))).toBe(true);
+    }
+  });
+
+  it("rejects extra keys on v4 capability surfaces", () => {
+    try {
+      parseRelayClientControlFrame(
+        JSON.stringify({
+          type: "hello",
+          id: "hello-id",
+          protocolVersion: "2.1",
+          cli: {
+            slug: "desktop",
+            label: "Desktop",
+            capabilities: {
+              protocolVersion: "2.1",
+              inventoryAck: true,
+              inventoryReplace: true,
+              endpointTargeting: true,
+              binaryFrames: true,
+              cancellation: true,
+              maxBinaryChunkBytes: 1024 * 1024,
+              requestBodyStreaming: true,
+              requestBodyWindowChunks: 16,
+            },
+          },
+          endpoints: [
+            {
+              slug: "local-openai",
+              label: "Local OpenAI",
+              kind: "openai-compatible",
+              status: "online",
+              defaultCapabilities: {
+                version: 4,
+                protocol: "openai-compatible",
+                surfaces: {
+                  openaiChatCompletions: {
+                    supported: true,
+                    unknownField: true,
+                  },
+                },
+              },
+              models: [],
+            },
+          ],
+        }),
+      );
+      throw new Error("expected parse failure");
+    } catch (error) {
+      const description = describeRelayControlParseError(error);
+      expect(description.kind).toBe("schema");
+      if (description.kind !== "schema") throw new Error("expected schema rejection");
+      expect(
+        description.issues.some(
+          (issue) => issue.path.includes("unknownField") || issue.message.includes("unknownField"),
+        ),
+      ).toBe(true);
+    }
+  });
+
+  it("classifies oversize control frames before schema validation", () => {
+    try {
+      parseRelayClientControlFrame("x".repeat(RELAY_JSON_CONTROL_MAX_BYTES + 1));
+      throw new Error("expected parse failure");
+    } catch (error) {
+      expect(describeRelayControlParseError(error)).toEqual({ kind: "oversize" });
+    }
   });
 });
 

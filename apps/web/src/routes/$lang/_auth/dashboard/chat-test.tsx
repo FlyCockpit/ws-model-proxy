@@ -781,6 +781,7 @@ function ChatTestPage() {
         : "";
   const selectedModel = options.find((option) => option.modelId === effectiveModelId);
   const recommendedSurface = selectedModel?.compatibility?.recommendedSurface;
+  const isPool = selectedModel?.kind === "MODEL_POOL";
   const effectiveSurface: ChatTestSurface | null =
     selectedModel?.kind === "DIRECT_MODEL"
       ? "OPENAI_CHAT_COMPLETIONS"
@@ -1602,68 +1603,75 @@ function ChatTestPage() {
             onValueChange={handleModelChange}
             disabled={isStreaming || isPreparingSend}
           />
-          <div className="min-w-[13rem] max-w-full space-y-1">
-            <Label htmlFor="chat-test-surface" className="sr-only">
-              {t("dashboard:chatTest.surface.label")}
-            </Label>
-            <select
-              id="chat-test-surface"
-              className="h-11 w-full rounded-md border bg-background px-3 text-sm"
-              value={surfaceSelection}
-              disabled={isStreaming || isPreparingSend || selectedModel?.kind !== "MODEL_POOL"}
-              aria-invalid={surfaceSelection === "PREFERRED" && effectiveSurface === null}
-              onChange={(event) => {
-                setSurfaceSelection(event.target.value as ChatTestSurfaceSelection);
-                setReasoningSelection("unset");
-              }}
-            >
-              <option value="PREFERRED">{t("dashboard:chatTest.surface.PREFERRED")}</option>
-              <option value="OPENAI_CHAT_COMPLETIONS">
-                {t("dashboard:chatTest.surface.OPENAI_CHAT_COMPLETIONS")}
-              </option>
-              <option value="OPENAI_RESPONSES">
-                {t("dashboard:chatTest.surface.OPENAI_RESPONSES")}
-              </option>
-              <option value="ANTHROPIC_MESSAGES">
-                {t("dashboard:chatTest.surface.ANTHROPIC_MESSAGES")}
-              </option>
-            </select>
-            <p className="text-xs text-muted-foreground">
-              {surfaceSelection === "PREFERRED" && recommendedSurface
-                ? t("dashboard:chatTest.surface.preferredHelp", { surface: recommendedSurface })
-                : t("dashboard:chatTest.surface.explicitHelp")}
+          {isPool ? (
+            <div className="min-w-[13rem] max-w-full space-y-1">
+              <Label htmlFor="chat-test-surface" className="sr-only">
+                {t("dashboard:chatTest.surface.label")}
+              </Label>
+              <select
+                id="chat-test-surface"
+                className="h-11 w-full rounded-md border bg-background px-3 text-sm"
+                value={surfaceSelection}
+                disabled={isStreaming || isPreparingSend}
+                aria-invalid={surfaceSelection === "PREFERRED" && effectiveSurface === null}
+                onChange={(event) => {
+                  setSurfaceSelection(event.target.value as ChatTestSurfaceSelection);
+                  setReasoningSelection("unset");
+                }}
+              >
+                <option value="PREFERRED">{t("dashboard:chatTest.surface.PREFERRED")}</option>
+                <option value="OPENAI_CHAT_COMPLETIONS">
+                  {t("dashboard:chatTest.surface.OPENAI_CHAT_COMPLETIONS")}
+                </option>
+                <option value="OPENAI_RESPONSES">
+                  {t("dashboard:chatTest.surface.OPENAI_RESPONSES")}
+                </option>
+                <option value="ANTHROPIC_MESSAGES">
+                  {t("dashboard:chatTest.surface.ANTHROPIC_MESSAGES")}
+                </option>
+              </select>
+              <p className="text-xs text-muted-foreground">
+                {surfaceSelection === "PREFERRED" && recommendedSurface
+                  ? t("dashboard:chatTest.surface.preferredHelp", { surface: recommendedSurface })
+                  : t("dashboard:chatTest.surface.explicitHelp")}
+              </p>
+            </div>
+          ) : null}
+          {isPool ? (
+            <div className="min-w-[13rem] max-w-full space-y-1">
+              <Label htmlFor="chat-test-routing-mode" className="sr-only">
+                {t("dashboard:chatTest.routingMode.label")}
+              </Label>
+              <select
+                id="chat-test-routing-mode"
+                className="h-11 w-full rounded-md border bg-background px-3 text-sm"
+                value={routingMode}
+                disabled={isStreaming || isPreparingSend}
+                onChange={(event) => {
+                  setRoutingMode(event.target.value as ChatTestRoutingMode);
+                  if (event.target.value === "REQUIRE_ADAPTED") setReasoningSelection("unset");
+                }}
+              >
+                <option value="PREFER_NATIVE">
+                  {t("dashboard:chatTest.routingMode.PREFER_NATIVE")}
+                </option>
+                <option value="REQUIRE_NATIVE">
+                  {t("dashboard:chatTest.routingMode.REQUIRE_NATIVE")}
+                </option>
+                <option value="REQUIRE_ADAPTED">
+                  {t("dashboard:chatTest.routingMode.REQUIRE_ADAPTED")}
+                </option>
+              </select>
+              <p className="text-xs text-muted-foreground">
+                {t("dashboard:chatTest.routingMode.help")}
+              </p>
+            </div>
+          ) : null}
+          {selectedModel && !isPool ? (
+            <p className="min-w-[13rem] max-w-full text-xs text-muted-foreground">
+              {t("dashboard:chatTest.routingMode.directHelp")}
             </p>
-          </div>
-          <div className="min-w-[13rem] max-w-full space-y-1">
-            <Label htmlFor="chat-test-routing-mode" className="sr-only">
-              {t("dashboard:chatTest.routingMode.label")}
-            </Label>
-            <select
-              id="chat-test-routing-mode"
-              className="h-11 w-full rounded-md border bg-background px-3 text-sm"
-              value={routingMode}
-              disabled={isStreaming || isPreparingSend || selectedModel?.kind !== "MODEL_POOL"}
-              onChange={(event) => {
-                setRoutingMode(event.target.value as ChatTestRoutingMode);
-                if (event.target.value === "REQUIRE_ADAPTED") setReasoningSelection("unset");
-              }}
-            >
-              <option value="PREFER_NATIVE">
-                {t("dashboard:chatTest.routingMode.PREFER_NATIVE")}
-              </option>
-              <option value="REQUIRE_NATIVE">
-                {t("dashboard:chatTest.routingMode.REQUIRE_NATIVE")}
-              </option>
-              <option value="REQUIRE_ADAPTED">
-                {t("dashboard:chatTest.routingMode.REQUIRE_ADAPTED")}
-              </option>
-            </select>
-            <p className="text-xs text-muted-foreground">
-              {selectedModel?.kind === "MODEL_POOL"
-                ? t("dashboard:chatTest.routingMode.help")
-                : t("dashboard:chatTest.routingMode.directHelp")}
-            </p>
-          </div>
+          ) : null}
           {!selectorState.hidden ? (
             <div className="min-w-[13rem] max-w-full space-y-1">
               <Label htmlFor="chat-test-reasoning" className="sr-only">
