@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { shouldShowCapacitySection } from "./forwarder-dashboard-sections";
+import {
+  shouldShowCapacitySection,
+  shouldShowProviderOperationsSection,
+} from "./forwarder-dashboard-sections";
 
 describe("shouldShowCapacitySection", () => {
   it("hides disabled capacity UI when a skipped query is pending without data", () => {
@@ -11,5 +14,16 @@ describe("shouldShowCapacitySection", () => {
   it("shows enabled capacity UI while fetching and after data resolves", () => {
     expect(shouldShowCapacitySection(true, true, undefined)).toBe(true);
     expect(shouldShowCapacitySection(true, false, [])).toBe(true);
+  });
+});
+
+describe("shouldShowProviderOperationsSection", () => {
+  it("does not mount provider management until the server capability is enabled", () => {
+    expect(shouldShowProviderOperationsSection(undefined)).toBe(false);
+    expect(shouldShowProviderOperationsSection(false)).toBe(false);
+  });
+
+  it("mounts provider management when the server capability is enabled", () => {
+    expect(shouldShowProviderOperationsSection(true)).toBe(true);
   });
 });

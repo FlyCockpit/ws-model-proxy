@@ -1668,6 +1668,10 @@ export function shouldShowCapacitySection(
   return enabled && (isLoading || data !== undefined);
 }
 
+export function shouldShowProviderOperationsSection(providerEgressEnabled: boolean | undefined) {
+  return providerEgressEnabled === true;
+}
+
 export function PoolsSection() {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
@@ -2603,7 +2607,9 @@ export function PoolsSection() {
           }
         }}
       />
-      <ProviderOperationsSection />
+      {shouldShowProviderOperationsSection(appConfig?.providerEgressEnabled) ? (
+        <ProviderOperationsSection />
+      ) : null}
     </section>
   );
 }

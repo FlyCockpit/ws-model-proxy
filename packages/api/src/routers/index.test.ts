@@ -9,6 +9,7 @@ const envMock = {
   SMTP_HOST: undefined as string | undefined,
   SIGNUP_ENABLED: true,
   MODEL_API_GLOBAL_CAPACITY_ENABLED: false,
+  WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: false,
 };
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: envMock,
@@ -49,6 +50,7 @@ describe("appConfig", () => {
   beforeEach(() => {
     envMock.SMTP_HOST = undefined;
     envMock.SIGNUP_ENABLED = true;
+    envMock.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = false;
     db.appSetting.findUnique.mockResolvedValue(null);
     db.user.count.mockResolvedValue(1);
   });
@@ -82,8 +84,19 @@ describe("appConfig", () => {
       signupEnabled: false,
       adminBootstrapSignupEnabled: false,
       capacityEnabled: false,
+      providerEgressEnabled: false,
       emailEnabled: true,
     });
+  });
+
+  it("reports the non-sensitive provider egress capability", async () => {
+    const client = createRouterClient(appRouter, { context: publicContext });
+
+    await expect(client.appConfig()).resolves.toMatchObject({ providerEgressEnabled: false });
+
+    envMock.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
+
+    await expect(client.appConfig()).resolves.toMatchObject({ providerEgressEnabled: true });
   });
 
   it("lets a runtime false setting override SIGNUP_ENABLED=true", async () => {
