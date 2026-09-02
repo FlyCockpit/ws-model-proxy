@@ -619,6 +619,7 @@ function modelSupportsTransformerModalities(
 export function CliEndpointsModelsSection() {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
+  const { data: appConfig } = useQuery(orpc.appConfig.queryOptions());
   const {
     data: devicesData,
     isPending: devicesIsPending,
@@ -630,6 +631,7 @@ export function CliEndpointsModelsSection() {
   const { data: capacitiesData } = useQuery({
     ...orpc.capacityManagement.list.queryOptions(),
     retry: false,
+    enabled: appConfig?.capacityEnabled === true,
   });
   const [policyModel, setPolicyModel] = useState<DirectModelOption | null>(null);
   const [search, setSearch] = useState("");
@@ -1658,9 +1660,18 @@ function _PoolSetupWizard({
   );
 }
 
+export function shouldShowCapacitySection(
+  enabled: boolean,
+  isLoading: boolean,
+  data: CapacityRow[] | undefined,
+): boolean {
+  return enabled && (isLoading || data !== undefined);
+}
+
 export function PoolsSection() {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
+  const { data: appConfig } = useQuery(orpc.appConfig.queryOptions());
   const {
     data: poolsData,
     isPending: poolsIsPending,
@@ -1673,9 +1684,11 @@ export function PoolsSection() {
     isError: devicesIsError,
     refetch: refetchDevices,
   } = useQuery(orpc.forwarderManagement.listCliDevices.queryOptions());
-  const { data: capacitiesData, isPending: capacitiesPending } = useQuery({
+  const capacityEnabled = appConfig?.capacityEnabled === true;
+  const { data: capacitiesData, isLoading: capacitiesLoading } = useQuery({
     ...orpc.capacityManagement.list.queryOptions(),
     retry: false,
+    enabled: capacityEnabled,
   });
   const [createOpen, setCreateOpen] = useState(false);
   const [wizardOpen, setWizardOpen] = useState(false);
@@ -1798,7 +1811,7 @@ export function PoolsSection() {
         directModels={directModels}
       />
 
-      {capacitiesData || capacitiesPending ? (
+      {shouldShowCapacitySection(capacityEnabled, capacitiesLoading, capacitiesData) ? (
         <div className="mb-6 border-y bg-muted/30 py-4">
           <div className="flex min-w-0 flex-col gap-4 px-4 sm:flex-row sm:items-start sm:justify-between">
             <div className="min-w-0">
@@ -1831,7 +1844,7 @@ export function PoolsSection() {
             </Dialog>
           </div>
           <div className="mt-4 px-4">
-            {capacitiesPending ? (
+            {capacitiesLoading ? (
               <div className="grid gap-3 sm:grid-cols-2">
                 <Skeleton className="h-20" />
                 <Skeleton className="h-20" />

@@ -125,6 +125,7 @@ export function GuardedPoolSetupWizard({
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
+  const { data: appConfig } = useQuery(orpc.appConfig.queryOptions());
   const formRef = useRef<HTMLFormElement>(null);
   const contextCeilingCustomized = useRef(false);
   const contextMarginCustomized = useRef(false);
@@ -139,7 +140,7 @@ export function GuardedPoolSetupWizard({
   const capacities = useQuery({
     ...orpc.capacityManagement.list.queryOptions(),
     retry: false,
-    enabled: open,
+    enabled: open && appConfig?.capacityEnabled === true,
   });
   const create = useMutation(
     orpc.forwarderManagement.createGuardedModelPool.mutationOptions({
