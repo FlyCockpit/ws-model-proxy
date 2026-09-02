@@ -1345,6 +1345,27 @@ describe("forwarderManagementRouter", () => {
     });
   });
 
+  it("rejects legacy Completions as a recommended pool API", async () => {
+    await expect(
+      client().createModelPool({
+        slug: "legacy-completions",
+        name: "Legacy Completions",
+        // @ts-expect-error OPENAI_COMPLETIONS is a native protocol, not a pool recommendation.
+        recommendedSurfaceOverride: "OPENAI_COMPLETIONS",
+      }),
+    ).rejects.toThrow();
+    await expect(
+      client().updateModelPool({
+        id: "pool-id",
+        // @ts-expect-error OPENAI_COMPLETIONS is a native protocol, not a pool recommendation.
+        recommendedSurfaceOverride: "OPENAI_COMPLETIONS",
+      }),
+    ).rejects.toThrow();
+
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+    expect(db.modelPool.update).not.toHaveBeenCalled();
+  });
+
   it("defensively clears an invalid stored recommended surface", async () => {
     db.modelPool.findMany.mockResolvedValue([
       poolRow({ recommendedSurfaceOverride: "UNSUPPORTED_FUTURE_SURFACE" }),

@@ -79,6 +79,11 @@ const poolNameSchema = z.string().trim().min(1).max(120);
 const poolDescriptionSchema = z.string().trim().max(1000).nullable().optional();
 const idSchema = z.string().min(1);
 const routingStatusSchema = z.enum(poolMemberRoutingStatuses);
+const poolRecommendedSurfaceSchema = z.enum([
+  "OPENAI_CHAT_COMPLETIONS",
+  "OPENAI_RESPONSES",
+  "ANTHROPIC_MESSAGES",
+]);
 const attachmentLimitSchema = z
   .number()
   .int()
@@ -1985,7 +1990,7 @@ export const forwarderManagementRouter = {
         publicEgressEnabled: z.boolean().optional(),
         publicEgressAcknowledged: z.literal(true).optional(),
         allowLossyDeveloperRoleCollapse: z.boolean().optional(),
-        recommendedSurfaceOverride: z.enum(modelApiSurfaces).nullable().optional(),
+        recommendedSurfaceOverride: poolRecommendedSurfaceSchema.nullable().optional(),
         capacityPriority: z.number().int().min(0).max(31).optional(),
         capacityConcurrencyLimit: z.number().int().positive().max(10_000).nullable().optional(),
         capacityReservedSlots: z.number().int().min(0).max(10_000).optional(),
@@ -2098,7 +2103,7 @@ export const forwarderManagementRouter = {
         publicEgressEnabled: z.boolean().optional(),
         publicEgressAcknowledged: z.literal(true).optional(),
         allowLossyDeveloperRoleCollapse: z.boolean().optional(),
-        recommendedSurfaceOverride: z.enum(modelApiSurfaces).nullable().optional(),
+        recommendedSurfaceOverride: poolRecommendedSurfaceSchema.nullable().optional(),
         affinityEnabled: z.boolean().optional(),
         affinityTtlSeconds: z.number().int().min(60).max(604_800).optional(),
         affinityMaxRecords: z.number().int().min(100).max(100_000).optional(),
