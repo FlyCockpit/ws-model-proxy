@@ -20,6 +20,7 @@
     "@types/ws": "catalog:",
     "@ws-model-proxy/api": "workspace:*",
     "@ws-model-proxy/auth": "workspace:*",
+    "@ws-model-proxy/config": "workspace:*",
     "@ws-model-proxy/db": "workspace:*",
     "@ws-model-proxy/env": "workspace:*",
     "better-auth": "catalog:",
@@ -30,7 +31,6 @@
   },
   "devDependencies": {
     "@types/node": "catalog:",
-    "@ws-model-proxy/config": "workspace:*",
     "tsdown": "catalog:",
     "tsx": "catalog:",
     "typescript": "catalog:",

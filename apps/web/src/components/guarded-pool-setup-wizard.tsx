@@ -125,6 +125,7 @@ export function GuardedPoolSetupWizard({
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
+  const { data: appConfig } = useQuery(orpc.appConfig.queryOptions());
   const formRef = useRef<HTMLFormElement>(null);
   const contextCeilingCustomized = useRef(false);
   const contextMarginCustomized = useRef(false);
@@ -132,12 +133,14 @@ export function GuardedPoolSetupWizard({
   const [stepErrors, setStepErrors] = useState<Record<string, string>>({});
   const [memberOverrides, setMemberOverrides] = useState<Record<string, MemberOverride>>({});
   const [enabledMemberOverrides, setEnabledMemberOverrides] = useState<Record<string, boolean>>({});
-  const candidates = useQuery(
-    orpc.forwarderManagement.listGuardedOverflowCandidates.queryOptions(),
-  );
+  const candidates = useQuery({
+    ...orpc.forwarderManagement.listGuardedOverflowCandidates.queryOptions(),
+    enabled: open,
+  });
   const capacities = useQuery({
     ...orpc.capacityManagement.list.queryOptions(),
     retry: false,
+    enabled: open && appConfig?.capacityEnabled === true,
   });
   const create = useMutation(
     orpc.forwarderManagement.createGuardedModelPool.mutationOptions({

@@ -118,6 +118,12 @@ const poolSurfaceValues = [
   "ANTHROPIC_MESSAGES",
 ] as const;
 
+type PoolSurface = (typeof poolSurfaceValues)[number];
+
+function poolSurfaceOverrideValue(value: string | null | undefined): PoolSurface | "" {
+  return value && poolSurfaceValues.includes(value as PoolSurface) ? (value as PoolSurface) : "";
+}
+
 async function testPoolMemberThroughResolver({
   poolModel,
   memberId,
@@ -613,6 +619,7 @@ function modelSupportsTransformerModalities(
 export function CliEndpointsModelsSection() {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
+  const { data: appConfig } = useQuery(orpc.appConfig.queryOptions());
   const {
     data: devicesData,
     isPending: devicesIsPending,
@@ -624,6 +631,7 @@ export function CliEndpointsModelsSection() {
   const { data: capacitiesData } = useQuery({
     ...orpc.capacityManagement.list.queryOptions(),
     retry: false,
+    enabled: appConfig?.capacityEnabled === true,
   });
   const [policyModel, setPolicyModel] = useState<DirectModelOption | null>(null);
   const [search, setSearch] = useState("");
@@ -1652,9 +1660,18 @@ function _PoolSetupWizard({
   );
 }
 
+export function shouldShowCapacitySection(
+  enabled: boolean,
+  isLoading: boolean,
+  data: CapacityRow[] | undefined,
+): boolean {
+  return enabled && (isLoading || data !== undefined);
+}
+
 export function PoolsSection() {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
+  const { data: appConfig } = useQuery(orpc.appConfig.queryOptions());
   const {
     data: poolsData,
     isPending: poolsIsPending,
@@ -1667,9 +1684,11 @@ export function PoolsSection() {
     isError: devicesIsError,
     refetch: refetchDevices,
   } = useQuery(orpc.forwarderManagement.listCliDevices.queryOptions());
-  const { data: capacitiesData, isPending: capacitiesPending } = useQuery({
+  const capacityEnabled = appConfig?.capacityEnabled === true;
+  const { data: capacitiesData, isLoading: capacitiesLoading } = useQuery({
     ...orpc.capacityManagement.list.queryOptions(),
     retry: false,
+    enabled: capacityEnabled,
   });
   const [createOpen, setCreateOpen] = useState(false);
   const [wizardOpen, setWizardOpen] = useState(false);
@@ -1792,7 +1811,7 @@ export function PoolsSection() {
         directModels={directModels}
       />
 
-      {capacitiesData || capacitiesPending ? (
+      {shouldShowCapacitySection(capacityEnabled, capacitiesLoading, capacitiesData) ? (
         <div className="mb-6 border-y bg-muted/30 py-4">
           <div className="flex min-w-0 flex-col gap-4 px-4 sm:flex-row sm:items-start sm:justify-between">
             <div className="min-w-0">
@@ -1825,7 +1844,7 @@ export function PoolsSection() {
             </Dialog>
           </div>
           <div className="mt-4 px-4">
-            {capacitiesPending ? (
+            {capacitiesLoading ? (
               <div className="grid gap-3 sm:grid-cols-2">
                 <Skeleton className="h-20" />
                 <Skeleton className="h-20" />
@@ -2863,13 +2882,7 @@ function PoolForm({
     optimisticBasicTranscription: z.boolean(),
     protocolAdaptationEnabled: z.boolean(),
     allowLossyDeveloperRoleCollapse: z.boolean(),
-    recommendedSurfaceOverride: z.enum([
-      "",
-      "OPENAI_CHAT_COMPLETIONS",
-      "OPENAI_RESPONSES",
-      "ANTHROPIC_MESSAGES",
-      "OPENAI_COMPLETIONS",
-    ]),
+    recommendedSurfaceOverride: z.enum(["", ...poolSurfaceValues]),
     capacityPriority: z.number().int().min(0).max(31),
     capacityConcurrencyMode: z.enum(["LIMITED", "UNLIMITED"]),
     capacityConcurrencyLimit: z.number().int().min(1).max(10_000),
@@ -2946,7 +2959,7 @@ function PoolForm({
       optimisticBasicTranscription: pool?.optimisticBasicTranscription ?? false,
       protocolAdaptationEnabled: pool?.protocolAdaptationEnabled ?? false,
       allowLossyDeveloperRoleCollapse: pool?.allowLossyDeveloperRoleCollapse ?? false,
-      recommendedSurfaceOverride: pool?.recommendedSurfaceOverride ?? "",
+      recommendedSurfaceOverride: poolSurfaceOverrideValue(pool?.recommendedSurfaceOverride),
       capacityPriority: pool?.capacityPriority ?? 16,
       capacityConcurrencyMode: (pool?.capacityConcurrencyLimit === null
         ? "UNLIMITED"
@@ -2986,13 +2999,7 @@ function PoolForm({
           protocolAdaptationEnabled: value.protocolAdaptationEnabled,
           allowLossyDeveloperRoleCollapse: value.allowLossyDeveloperRoleCollapse,
           recommendedSurfaceOverride:
-            value.recommendedSurfaceOverride === ""
-              ? null
-              : (value.recommendedSurfaceOverride as
-                  | "OPENAI_CHAT_COMPLETIONS"
-                  | "OPENAI_RESPONSES"
-                  | "ANTHROPIC_MESSAGES"
-                  | "OPENAI_COMPLETIONS"),
+            value.recommendedSurfaceOverride === "" ? null : value.recommendedSurfaceOverride,
           capacityPriority: value.capacityPriority,
           capacityConcurrencyLimit:
             value.capacityConcurrencyMode === "UNLIMITED" ? null : value.capacityConcurrencyLimit,
@@ -3042,13 +3049,7 @@ function PoolForm({
           protocolAdaptationEnabled: value.protocolAdaptationEnabled,
           allowLossyDeveloperRoleCollapse: value.allowLossyDeveloperRoleCollapse,
           recommendedSurfaceOverride:
-            value.recommendedSurfaceOverride === ""
-              ? null
-              : (value.recommendedSurfaceOverride as
-                  | "OPENAI_CHAT_COMPLETIONS"
-                  | "OPENAI_RESPONSES"
-                  | "ANTHROPIC_MESSAGES"
-                  | "OPENAI_COMPLETIONS"),
+            value.recommendedSurfaceOverride === "" ? null : value.recommendedSurfaceOverride,
           affinityEnabled: value.affinityEnabled,
           affinityTtlSeconds: value.affinityTtlSeconds,
           affinityMaxRecords: value.affinityMaxRecords,
@@ -3145,10 +3146,11 @@ function PoolForm({
                 }
               >
                 <option value="">{t("dashboard:pools.recommendedAutomatic")}</option>
-                <option value="OPENAI_RESPONSES">OpenAI Responses</option>
-                <option value="OPENAI_CHAT_COMPLETIONS">OpenAI Chat Completions</option>
-                <option value="ANTHROPIC_MESSAGES">Anthropic Messages</option>
-                <option value="OPENAI_COMPLETIONS">OpenAI Completions</option>
+                {poolSurfaceValues.map((surface) => (
+                  <option key={surface} value={surface}>
+                    {t(`dashboard:pools.wizard.surfaces.${surface}`)}
+                  </option>
+                ))}
               </select>
             </div>
           )}

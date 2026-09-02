@@ -11,6 +11,7 @@ import i18n from "./i18n";
 import { routeTree } from "./routeTree.gen";
 import { friendly } from "./utils/friendly-error";
 import { orpc } from "./utils/orpc";
+import { shouldRetryQuery } from "./utils/query-retry";
 
 // Read the per-request CSP nonce forwarded by the API server on the
 // `x-csp-nonce` request header (set in apps/server/src/index.ts). Server-only:
@@ -23,7 +24,7 @@ const getCspNonce = createIsomorphicFn()
 export function getRouter() {
   const queryClient = new QueryClient({
     defaultOptions: {
-      queries: { staleTime: 1000 * 60 * 5 },
+      queries: { retry: shouldRetryQuery, staleTime: 1000 * 60 * 5 },
     },
     queryCache: new QueryCache({
       onError: (error, query) => {

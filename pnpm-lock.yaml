@@ -262,6 +262,9 @@ importers:
       '@ws-model-proxy/auth':
         specifier: workspace:*
         version: link:../../packages/auth
+      '@ws-model-proxy/config':
+        specifier: workspace:*
+        version: link:../../packages/config
       '@ws-model-proxy/db':
         specifier: workspace:*
         version: link:../../packages/db
@@ -287,9 +290,6 @@ importers:
       '@types/node':
         specifier: 'catalog:'
         version: 26.2.0
-      '@ws-model-proxy/config':
-        specifier: workspace:*
-        version: link:../../packages/config
       tsdown:
         specifier: 'catalog:'
         version: 0.22.14(oxc-resolver@11.24.2)(tsx@4.23.12)(typescript@7.0.2)

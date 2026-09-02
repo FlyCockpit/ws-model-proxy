@@ -152,7 +152,7 @@ const memberPolicy = z
 
 export const capacityManagementRouter = {
   list: protectedProcedure.handler(async ({ context }) => {
-    enabled();
+    if (!env.MODEL_API_GLOBAL_CAPACITY_ENABLED) return [];
     const userId = context.session.user.id;
     return prisma.inferenceCapacity.findMany({
       where: { userId },

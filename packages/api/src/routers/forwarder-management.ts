@@ -79,6 +79,11 @@ const poolNameSchema = z.string().trim().min(1).max(120);
 const poolDescriptionSchema = z.string().trim().max(1000).nullable().optional();
 const idSchema = z.string().min(1);
 const routingStatusSchema = z.enum(poolMemberRoutingStatuses);
+const poolRecommendedSurfaceSchema = z.enum([
+  "OPENAI_CHAT_COMPLETIONS",
+  "OPENAI_RESPONSES",
+  "ANTHROPIC_MESSAGES",
+]);
 const attachmentLimitSchema = z
   .number()
   .int()
@@ -92,6 +97,24 @@ function assertProviderEgressReleaseGate(): void {
     throw new ORPCError("NOT_FOUND", {
       message: "Provider egress is not enabled for this deployment.",
     });
+}
+
+function isPrismaUniqueViolation(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "P2002";
+}
+
+async function createPoolMember<T>(create: () => Promise<T>): Promise<T> {
+  try {
+    return await create();
+  } catch (error) {
+    if (isPrismaUniqueViolation(error)) {
+      throw new ORPCError("CONFLICT", {
+        message: "That model is already a member of this pool.",
+        cause: error,
+      });
+    }
+    throw error;
+  }
 }
 
 function assertConcurrencyPolicyWithinHardLimit(input: {
@@ -1985,7 +2008,7 @@ export const forwarderManagementRouter = {
         publicEgressEnabled: z.boolean().optional(),
         publicEgressAcknowledged: z.literal(true).optional(),
         allowLossyDeveloperRoleCollapse: z.boolean().optional(),
-        recommendedSurfaceOverride: z.enum(modelApiSurfaces).nullable().optional(),
+        recommendedSurfaceOverride: poolRecommendedSurfaceSchema.nullable().optional(),
         capacityPriority: z.number().int().min(0).max(31).optional(),
         capacityConcurrencyLimit: z.number().int().positive().max(10_000).nullable().optional(),
         capacityReservedSlots: z.number().int().min(0).max(10_000).optional(),
@@ -2098,7 +2121,7 @@ export const forwarderManagementRouter = {
         publicEgressEnabled: z.boolean().optional(),
         publicEgressAcknowledged: z.literal(true).optional(),
         allowLossyDeveloperRoleCollapse: z.boolean().optional(),
-        recommendedSurfaceOverride: z.enum(modelApiSurfaces).nullable().optional(),
+        recommendedSurfaceOverride: poolRecommendedSurfaceSchema.nullable().optional(),
         affinityEnabled: z.boolean().optional(),
         affinityTtlSeconds: z.number().int().min(60).max(604_800).optional(),
         affinityMaxRecords: z.number().int().min(100).max(100_000).optional(),
@@ -2423,16 +2446,18 @@ export const forwarderManagementRouter = {
           poolCeiling: pool.capacityContextCeiling,
           poolMargin: pool.capacityContextMargin,
         });
-        const member = await tx.poolMember.create({
-          data: {
-            poolId: input.poolId,
-            discoveredModelId: input.discoveredModelId,
-            executionTargetId: target.id,
-            weight: input.weight,
-            routingStatus: input.routingStatus,
-          },
-          select: { id: true },
-        });
+        const member = await createPoolMember(() =>
+          tx.poolMember.create({
+            data: {
+              poolId: input.poolId,
+              discoveredModelId: input.discoveredModelId,
+              executionTargetId: target.id,
+              weight: input.weight,
+              routingStatus: input.routingStatus,
+            },
+            select: { id: true },
+          }),
+        );
         return { id: member.id, executionTargetId: lockedTarget.id };
       });
     }),
@@ -2641,16 +2666,18 @@ export const forwarderManagementRouter = {
           poolCeiling: lockedPool.capacityContextCeiling,
           poolMargin: lockedPool.capacityContextMargin,
         });
-        const member = await tx.poolMember.create({
-          data: {
-            poolId: input.poolId,
-            executionTargetId: target.id,
-            tier: input.tier,
-            publicOrder: input.tier === "PUBLIC_OVERFLOW" ? input.publicOrder : null,
-            weight: input.tier === "PRIMARY" ? input.weight : 0,
-          },
-          select: { id: true },
-        });
+        const member = await createPoolMember(() =>
+          tx.poolMember.create({
+            data: {
+              poolId: input.poolId,
+              executionTargetId: target.id,
+              tier: input.tier,
+              publicOrder: input.tier === "PUBLIC_OVERFLOW" ? input.publicOrder : null,
+              weight: input.tier === "PRIMARY" ? input.weight : 0,
+            },
+            select: { id: true },
+          }),
+        );
         if (input.tier === "PUBLIC_OVERFLOW") {
           const ordered = await tx.poolMember.findMany({
             where: { poolId: input.poolId, tier: "PUBLIC_OVERFLOW", id: { not: member.id } },

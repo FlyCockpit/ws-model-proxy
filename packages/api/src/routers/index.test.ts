@@ -8,6 +8,7 @@ import type { Context } from "../context";
 const envMock = {
   SMTP_HOST: undefined as string | undefined,
   SIGNUP_ENABLED: true,
+  MODEL_API_GLOBAL_CAPACITY_ENABLED: false,
 };
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: envMock,
@@ -80,6 +81,7 @@ describe("appConfig", () => {
       ssoProviderName: "SSO",
       signupEnabled: false,
       adminBootstrapSignupEnabled: false,
+      capacityEnabled: false,
       emailEnabled: true,
     });
   });

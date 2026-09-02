@@ -13,6 +13,13 @@ vi.mock("react-i18next", () => ({
 }));
 vi.mock("@/utils/orpc", () => ({
   orpc: {
+    appConfig: {
+      queryOptions: () => ({
+        queryKey: ["appConfig"],
+        queryFn: async () => ({ capacityEnabled: true }),
+        initialData: { capacityEnabled: true },
+      }),
+    },
     forwarderManagement: {
       key: () => ["forwarderManagement"],
       listGuardedOverflowCandidates: {

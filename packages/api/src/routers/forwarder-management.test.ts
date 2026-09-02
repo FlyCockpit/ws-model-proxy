@@ -1345,6 +1345,27 @@ describe("forwarderManagementRouter", () => {
     });
   });
 
+  it("rejects legacy Completions as a recommended pool API", async () => {
+    await expect(
+      client().createModelPool({
+        slug: "legacy-completions",
+        name: "Legacy Completions",
+        // @ts-expect-error OPENAI_COMPLETIONS is a native protocol, not a pool recommendation.
+        recommendedSurfaceOverride: "OPENAI_COMPLETIONS",
+      }),
+    ).rejects.toThrow();
+    await expect(
+      client().updateModelPool({
+        id: "pool-id",
+        // @ts-expect-error OPENAI_COMPLETIONS is a native protocol, not a pool recommendation.
+        recommendedSurfaceOverride: "OPENAI_COMPLETIONS",
+      }),
+    ).rejects.toThrow();
+
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+    expect(db.modelPool.update).not.toHaveBeenCalled();
+  });
+
   it("defensively clears an invalid stored recommended surface", async () => {
     db.modelPool.findMany.mockResolvedValue([
       poolRow({ recommendedSurfaceOverride: "UNSUPPORTED_FUTURE_SURFACE" }),
@@ -1510,6 +1531,30 @@ describe("forwarderManagementRouter", () => {
       weight: 0,
       routingStatus: "DISABLED",
     });
+  });
+
+  it("maps duplicate local pool members to CONFLICT without swallowing other errors", async () => {
+    db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+    db.modelPool.findFirst.mockResolvedValue({
+      capacityConcurrencyLimit: null,
+      capacityReservedSlots: 0,
+    });
+    db.discoveredModel.findUnique.mockResolvedValue({ id: "model-id", userId: "user-id" });
+    const duplicate = Object.assign(new Error("unique"), { code: "P2002" });
+    db.poolMember.create.mockRejectedValueOnce(duplicate);
+
+    await expect(
+      client().addPoolMember({ poolId: "pool-id", discoveredModelId: "model-id" }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      message: "That model is already a member of this pool.",
+    });
+
+    const other = Object.assign(new Error("database unavailable"), { code: "P1001" });
+    db.poolMember.create.mockRejectedValueOnce(other);
+    await expect(
+      client().addPoolMember({ poolId: "pool-id", discoveredModelId: "model-id" }),
+    ).rejects.toBe(other);
   });
 
   it("rejects attaching a local target when inherited pool capacity exceeds its hard limit", async () => {

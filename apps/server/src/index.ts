@@ -8,7 +8,7 @@ import { OpenAPIHandler } from "@orpc/openapi/fetch";
 import { OpenAPIReferencePlugin } from "@orpc/openapi/plugins";
 import { ORPCError, onError } from "@orpc/server";
 import { RPCHandler } from "@orpc/server/fetch";
-import { BatchHandlerPlugin, SimpleCsrfProtectionHandlerPlugin } from "@orpc/server/plugins";
+import { SimpleCsrfProtectionHandlerPlugin } from "@orpc/server/plugins";
 import { ZodToJsonSchemaConverter } from "@orpc/zod/zod4";
 import { createContext } from "@ws-model-proxy/api/context";
 import { appRouter } from "@ws-model-proxy/api/routers/index";
@@ -72,6 +72,7 @@ import {
 import { RELAY_SUBPROTOCOL } from "./relay/protocol.js";
 import { relaySessionManager } from "./relay/session-manager.js";
 import { createRelayWebsocketMiddleware, relayUpgradeHandler } from "./relay/websocket.js";
+import { createRpcBatchHandlerPlugin } from "./rpc-batch-plugin.js";
 import { mountSecurityHeaders } from "./security-headers.js";
 import { registerSeoRoutes } from "./seo.js";
 import { sessionMiddleware } from "./session-middleware.js";
@@ -466,12 +467,11 @@ export const apiHandler = new OpenAPIHandler(appRouter, {
   interceptors: [onError(logOrpcError)],
 });
 
-// `BatchHandlerPlugin` matches the client's `BatchLinkPlugin` (see
-// `apps/web/src/utils/orpc.ts`). Without it, any time the SPA fires multiple
-// concurrent queries with a shared router prefix the client wraps them into
-// a single `/rpc/<prefix>/__batch__` POST that the server otherwise 404s.
+// `maxSize` is an operation-count protocol contract shared with the client via
+// `@ws-model-proxy/config/rpc-policy`, not a request-body byte limit. Changing
+// it requires updating and passing the transport boundary tests.
 export const rpcHandler = new RPCHandler(appRouter, {
-  plugins: [new BatchHandlerPlugin({ maxSize: 3 }), ...csrfPlugins],
+  plugins: [createRpcBatchHandlerPlugin(), ...csrfPlugins],
   interceptors: [onError(logOrpcError)],
 });
 
