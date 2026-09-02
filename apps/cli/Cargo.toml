@@ -56,7 +56,7 @@ tempfile = "3"
 # HTTP calls to the self-hosted app and OpenAI-compatible local endpoints.
 ureq = { version = "3", features = ["json"] }
 # SHA-256 inventory identity must match the server's acknowledged revision.
-sha2 = "0.10"
+sha2 = "0.11"
 # Async HTTP transport permits cancellation to interrupt connect, upload, and
 # response reads instead of merely setting a flag beside a blocking request.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
