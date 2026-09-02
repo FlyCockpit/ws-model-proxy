@@ -328,8 +328,8 @@ function AdminObservability() {
     isPending: cliIsPending,
     isError: cliIsError,
     refetch: refetchClis,
-  } = useQuery(
-    orpc.adminObservability.listCliDevices.queryOptions({
+  } = useQuery({
+    ...orpc.adminObservability.listCliDevices.queryOptions({
       input: {
         page,
         pageSize,
@@ -337,14 +337,15 @@ function AdminObservability() {
         status: cliStatus === "all" ? undefined : cliStatus,
       },
     }),
-  );
+    enabled: tab === "clis",
+  });
   const {
     data: endpointData,
     isPending: endpointIsPending,
     isError: endpointIsError,
     refetch: refetchEndpoints,
-  } = useQuery(
-    orpc.adminObservability.listEndpoints.queryOptions({
+  } = useQuery({
+    ...orpc.adminObservability.listEndpoints.queryOptions({
       input: {
         page,
         pageSize,
@@ -352,14 +353,15 @@ function AdminObservability() {
         status: endpointStatus === "all" ? undefined : endpointStatus,
       },
     }),
-  );
+    enabled: tab === "endpoints",
+  });
   const {
     data: modelData,
     isPending: modelIsPending,
     isError: modelIsError,
     refetch: refetchModels,
-  } = useQuery(
-    orpc.adminObservability.listModels.queryOptions({
+  } = useQuery({
+    ...orpc.adminObservability.listModels.queryOptions({
       input: {
         page,
         pageSize,
@@ -367,14 +369,15 @@ function AdminObservability() {
         capabilityFamily: capability === "all" ? undefined : capability,
       },
     }),
-  );
+    enabled: tab === "models",
+  });
   const {
     data: poolData,
     isPending: poolIsPending,
     isError: poolIsError,
     refetch: refetchPools,
-  } = useQuery(
-    orpc.adminObservability.listPools.queryOptions({
+  } = useQuery({
+    ...orpc.adminObservability.listPools.queryOptions({
       input: {
         page,
         pageSize,
@@ -382,14 +385,15 @@ function AdminObservability() {
         memberHealth: poolHealth === "all" ? undefined : poolHealth,
       },
     }),
-  );
+    enabled: tab === "pools",
+  });
   const {
     data: relayData,
     isPending: relayIsPending,
     isError: relayIsError,
     refetch: refetchRelays,
-  } = useQuery(
-    orpc.adminObservability.listRelayMetadataSummaries.queryOptions({
+  } = useQuery({
+    ...orpc.adminObservability.listRelayMetadataSummaries.queryOptions({
       input: {
         page,
         pageSize,
@@ -399,7 +403,8 @@ function AdminObservability() {
         ...relayDateInput,
       },
     }),
-  );
+    enabled: tab === "relays",
+  });
 
   const changeTab = (next: ObservabilityTab) => {
     patchFilters({ tab: next });

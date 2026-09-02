@@ -8,6 +8,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
   capacityPromise: Promise.resolve([] as Array<Record<string, unknown>>),
+  capacityCalls: 0,
+  candidateCalls: 0,
   submitted: undefined as Record<string, unknown> | undefined,
 }));
 
@@ -24,15 +26,18 @@ vi.mock("@/utils/orpc", () => ({
       listGuardedOverflowCandidates: {
         queryOptions: () => ({
           queryKey: ["providers"],
-          queryFn: async () => [
-            {
-              id: "provider-a",
-              upstreamModelId: "public-model",
-              displayName: "Public provider",
-              providerAccount: { label: "OpenAI" },
-              pricing: { currency: "USD" },
-            },
-          ],
+          queryFn: async () => {
+            state.candidateCalls += 1;
+            return [
+              {
+                id: "provider-a",
+                upstreamModelId: "public-model",
+                displayName: "Public provider",
+                providerAccount: { label: "OpenAI" },
+                pricing: { currency: "USD" },
+              },
+            ];
+          },
         }),
       },
       createGuardedModelPool: {
@@ -49,7 +54,10 @@ vi.mock("@/utils/orpc", () => ({
       list: {
         queryOptions: () => ({
           queryKey: ["capacities"],
-          queryFn: () => state.capacityPromise,
+          queryFn: () => {
+            state.capacityCalls += 1;
+            return state.capacityPromise;
+          },
         }),
       },
     },
@@ -96,21 +104,52 @@ const models = [
   },
 ];
 
-function mount() {
+function mount(open = true) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  const view = render(
     <QueryClientProvider client={client}>
-      <GuardedPoolSetupWizard open onOpenChange={() => undefined} directModels={models} />
+      <GuardedPoolSetupWizard open={open} onOpenChange={() => undefined} directModels={models} />
     </QueryClientProvider>,
   );
+  return { ...view, client };
 }
 
 afterEach(() => {
   cleanup();
+  state.capacityCalls = 0;
+  state.candidateCalls = 0;
+  state.capacityPromise = Promise.resolve([]);
   state.submitted = undefined;
 });
 
 describe("GuardedPoolSetupWizard mounted workflow", () => {
+  it("does not fetch candidates or capacities while closed", async () => {
+    mount(false);
+
+    await Promise.resolve();
+
+    expect(state.candidateCalls).toBe(0);
+    expect(state.capacityCalls).toBe(0);
+  });
+
+  it("fetches candidates and capacities when opened after mounting", async () => {
+    const view = mount(false);
+
+    expect(state.candidateCalls).toBe(0);
+    expect(state.capacityCalls).toBe(0);
+
+    view.rerender(
+      <QueryClientProvider client={view.client}>
+        <GuardedPoolSetupWizard open onOpenChange={() => undefined} directModels={models} />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => {
+      expect(state.candidateCalls).toBe(1);
+      expect(state.capacityCalls).toBe(1);
+    });
+  });
+
   it("navigates, applies delayed capacities, opts into adaptation, configures overrides and budgets, and submits", async () => {
     let resolveCapacities!: (value: Array<Record<string, unknown>>) => void;
     state.capacityPromise = new Promise((resolve) => {

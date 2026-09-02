@@ -132,12 +132,14 @@ export function GuardedPoolSetupWizard({
   const [stepErrors, setStepErrors] = useState<Record<string, string>>({});
   const [memberOverrides, setMemberOverrides] = useState<Record<string, MemberOverride>>({});
   const [enabledMemberOverrides, setEnabledMemberOverrides] = useState<Record<string, boolean>>({});
-  const candidates = useQuery(
-    orpc.forwarderManagement.listGuardedOverflowCandidates.queryOptions(),
-  );
+  const candidates = useQuery({
+    ...orpc.forwarderManagement.listGuardedOverflowCandidates.queryOptions(),
+    enabled: open,
+  });
   const capacities = useQuery({
     ...orpc.capacityManagement.list.queryOptions(),
     retry: false,
+    enabled: open,
   });
   const create = useMutation(
     orpc.forwarderManagement.createGuardedModelPool.mutationOptions({
