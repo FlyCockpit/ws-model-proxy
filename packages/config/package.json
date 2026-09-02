@@ -18,6 +18,9 @@
     },
     "./media-policy": {
       "default": "./src/media-policy.ts"
+    },
+    "./rpc-policy": {
+      "default": "./src/rpc-policy.ts"
     }
   },
   "files": [
