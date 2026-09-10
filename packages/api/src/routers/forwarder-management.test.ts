@@ -15,6 +15,7 @@ import { forwarderManagementRouter } from "./forwarder-management";
 const testEnv = vi.hoisted(() => ({
   WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
   MODEL_API_PROTOCOL_ADAPTATION_ENABLED: true,
+  MODEL_API_GLOBAL_CAPACITY_ENABLED: true,
 }));
 
 vi.mock("@ws-model-proxy/db", async () => {
@@ -226,6 +227,7 @@ describe("forwarderManagementRouter", () => {
     vi.clearAllMocks();
     testEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
     testEnv.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = true;
+    testEnv.MODEL_API_GLOBAL_CAPACITY_ENABLED = true;
     db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
       callback(db),
     );
@@ -1363,6 +1365,25 @@ describe("forwarderManagementRouter", () => {
     expect(db.modelPool.update).not.toHaveBeenCalled();
   });
 
+  it("only applies the capacity deployment gate when a pool capacity field is supplied", async () => {
+    testEnv.MODEL_API_GLOBAL_CAPACITY_ENABLED = false;
+    const existing = poolRow({ id: "pool-id", userId: "user-id" });
+    db.modelPool.findUnique.mockResolvedValue(existing);
+    db.modelPool.update.mockResolvedValue(existing);
+
+    await expect(
+      client().updateModelPool({ id: "pool-id", name: "Renamed" }),
+    ).resolves.toMatchObject({
+      id: "pool-id",
+    });
+    await expect(
+      client().updateModelPool({ id: "pool-id", capacityPriority: 17 }),
+    ).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      message: "Capacity management is disabled for this deployment.",
+    });
+  });
+
   it.each([
     ["inactive", { mode: "LIMITED", limitValue: "2" }, null],
     ["LIMITED without a positive limit", { mode: "LIMITED", limitValue: null }, new Date()],
@@ -1535,6 +1556,131 @@ describe("forwarderManagementRouter", () => {
     expect(db.modelPool.create.mock.invocationCallOrder[0]).toBeLessThan(
       db.capacityAuditEvent.create.mock.invocationCallOrder[0] ?? 0,
     );
+  });
+
+  it("persists identical transformer settings through pool create and update", async () => {
+    const transformer = {
+      id: "transformer-id",
+      userId: "user-id",
+      published: true,
+      capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+      capabilityOverrideMetadata: null,
+      Endpoint: {
+        published: true,
+        capabilityMetadata: {
+          version: 1,
+          protocol: "openai-compatible",
+          chatCompletions: { supported: true, vision: true, audio: false, video: false },
+        },
+      },
+    };
+    const input = {
+      transformerDiscoveredModelId: "transformer-id",
+      transformerSystemPrompt: "Describe the image.",
+      transformerImages: true,
+      transformerAudio: false,
+      transformerVideo: false,
+      transformerCacheMode: "MEMORY" as const,
+      transformerIncludePrimaryTools: true,
+      transformerMaxTools: 8,
+      transformerMaxToolChars: 1024,
+      transformerTimeoutMs: 30_000,
+      transformerMaxAssets: 4,
+    };
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findUnique.mockResolvedValue(transformer);
+    db.modelPool.create.mockResolvedValue(poolRow());
+
+    await client().createModelPool({ slug: "general", name: "General", ...input });
+    const createData = db.modelPool.create.mock.calls[0]?.[0].data;
+
+    db.modelPool.findUnique.mockResolvedValue(
+      poolRow({ id: "pool-id", userId: "user-id", ...input }),
+    );
+    db.modelPool.update.mockResolvedValue(poolRow());
+    await client().updateModelPool({ id: "pool-id", ...input });
+    const updateData = db.modelPool.update.mock.calls[0]?.[0].data;
+
+    for (const [key, value] of Object.entries(input)) {
+      expect(createData).toHaveProperty(key, value);
+      expect(updateData).toHaveProperty(key, value);
+    }
+  });
+
+  it("rejects a cross-owner transformer model when creating a pool", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findUnique.mockResolvedValue({
+      id: "other-transformer",
+      userId: "other-user-id",
+      published: true,
+      capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+      capabilityOverrideMetadata: null,
+      Endpoint: { published: true, capabilityMetadata: null },
+    });
+
+    await expect(
+      client().createModelPool({
+        slug: "general",
+        name: "General",
+        transformerDiscoveredModelId: "other-transformer",
+      }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND", message: "Discovered model not found." });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "reserved slots above the limit",
+      { capacityConcurrencyLimit: 2, capacityReservedSlots: 3 },
+      "Reserved slots exceed the pool concurrency limit.",
+    ],
+    [
+      "a context margin equal to the ceiling",
+      { capacityContextCeiling: 100, capacityContextMargin: 100 },
+      "Pool context margin must be smaller than the context ceiling.",
+    ],
+    [
+      "a context ceiling plus margin above physical capacity",
+      { capacityContextCeiling: 90, capacityContextMargin: 20 },
+      "Effective context policy exceeds physical capacity.",
+    ],
+  ])("enforces pool capacity policy invariants for %s", async (_name, policy, message) => {
+    db.modelPool.findUnique.mockResolvedValue({
+      id: "pool-id",
+      userId: "user-id",
+      transformerDiscoveredModelId: null,
+      transformerImages: true,
+      transformerAudio: false,
+      transformerVideo: false,
+      publicEgressEnabled: false,
+      publicEgressAcknowledged: false,
+      protocolAdaptationEnabled: false,
+      allowLossyDeveloperRoleCollapse: false,
+      capacityConcurrencyLimit: 2,
+      capacityReservedSlots: 0,
+      capacityContextCeiling: 80,
+      capacityContextMargin: 0,
+      PoolMembers: [
+        {
+          executionTargetId: "target-id",
+          capacityConcurrencyMode: "INHERIT",
+          capacityConcurrencyLimit: null,
+          capacityReservedSlots: null,
+          capacityContextCeilingMode: "INHERIT",
+          capacityContextCeiling: null,
+          capacityContextMargin: null,
+          ExecutionTarget: {
+            InferenceCapacity: { hardConcurrencyLimit: 4, physicalMaxContext: 100 },
+          },
+        },
+      ],
+    });
+
+    await expect(client().updateModelPool({ id: "pool-id", ...policy })).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      message,
+    });
+    expect(db.modelPool.update).not.toHaveBeenCalled();
   });
 
   it("fails pool creation when the atomic capacity-policy audit cannot be persisted", async () => {

@@ -11,10 +11,14 @@ import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
 import {
+  assertCapacityManagementEnabled,
   assertEffectiveConcurrencyPolicy,
   assertEffectiveContextPolicy,
+  assertModelPoolCapacityPolicy,
+  lockAndValidateModelPoolCapacityPolicy,
   lockExecutionTargetIdentities,
   lockExecutionTargetPolicies,
+  modelPoolCapacityPolicyFields,
 } from "../lib/capacity-policy-safety";
 import {
   type ContextWindowSeedDependent,
@@ -96,6 +100,30 @@ const attachmentLimitSchema = z
   .max(MEDIA_ATTACHMENT_MAX_BYTES_MAX)
   .nullable()
   .optional();
+const poolTransformerFields = {
+  transformerDiscoveredModelId: z.string().min(1).nullable().optional(),
+  transformerSystemPrompt: z.string().max(16_000).nullable().optional(),
+  transformerImages: z.boolean().optional(),
+  transformerAudio: z.boolean().optional(),
+  transformerVideo: z.boolean().optional(),
+  transformerCacheMode: z.enum(["OFF", "MEMORY"]).optional(),
+  transformerIncludePrimaryTools: z.boolean().optional(),
+  transformerMaxTools: z.number().int().min(1).max(128).optional(),
+  transformerMaxToolChars: z.number().int().min(256).max(32_000).optional(),
+  transformerTimeoutMs: z.number().int().min(1_000).max(600_000).nullable().optional(),
+  transformerMaxAssets: z.number().int().min(1).max(64).nullable().optional(),
+};
+function hasModelPoolCapacityPolicy(input: Record<string, unknown>): boolean {
+  return (
+    input.capacityPriority !== undefined ||
+    input.capacityConcurrencyLimit !== undefined ||
+    input.capacityReservedSlots !== undefined ||
+    input.capacityBorrowPolicy !== undefined ||
+    input.capacityWaitBudgetMs !== undefined ||
+    input.capacityContextCeiling !== undefined ||
+    input.capacityContextMargin !== undefined
+  );
+}
 
 function assertLossyDeveloperRoleCollapseRequiresAdaptation({
   protocolAdaptationEnabled,
@@ -1072,6 +1100,35 @@ function assertTransformerMatchesModalities({
   }
 }
 
+async function assertPoolTransformerIsValid(
+  input: {
+    transformerDiscoveredModelId?: string | null;
+    transformerImages?: boolean;
+    transformerAudio?: boolean;
+    transformerVideo?: boolean;
+  },
+  current: {
+    transformerDiscoveredModelId: string | null;
+    transformerImages: boolean;
+    transformerAudio: boolean;
+    transformerVideo: boolean;
+  },
+  userId: string,
+): Promise<void> {
+  const discoveredModelId =
+    input.transformerDiscoveredModelId !== undefined
+      ? input.transformerDiscoveredModelId
+      : current.transformerDiscoveredModelId;
+  if (!discoveredModelId) return;
+  const caps = await transformerCapabilitiesForOwnedModel(discoveredModelId, userId);
+  assertTransformerMatchesModalities({
+    caps,
+    images: input.transformerImages ?? current.transformerImages,
+    audio: input.transformerAudio ?? current.transformerAudio,
+    video: input.transformerVideo ?? current.transformerVideo,
+  });
+}
+
 async function assertPoolSlugAvailable(slug: string, userId: string, currentPoolId?: string) {
   const validation = validateForwarderPoolSlug(slug);
   if (!validation.ok) {
@@ -1516,6 +1573,12 @@ export const forwarderManagementRouter = {
       assertLossyDeveloperRoleCollapseRequiresAdaptation({
         protocolAdaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
         allowLossyDeveloperRoleCollapse: input.advanced?.allowLossyDeveloperRoleCollapse ?? false,
+      });
+      assertModelPoolCapacityPolicy({
+        concurrencyLimit: input.memberConcurrencyLimit,
+        reservedSlots: input.reservedSlots,
+        contextCeiling: input.memberContextCeiling,
+        contextMargin: input.advanced?.contextMargin,
       });
       const userId = context.session.user.id;
       await assertPoolSlugAvailable(input.slug, userId);
@@ -2209,13 +2272,8 @@ export const forwarderManagementRouter = {
         publicEgressAcknowledged: z.literal(true).optional(),
         allowLossyDeveloperRoleCollapse: z.boolean().optional(),
         recommendedSurfaceOverride: poolRecommendedSurfaceSchema.nullable().optional(),
-        capacityPriority: z.number().int().min(0).max(31).optional(),
-        capacityConcurrencyLimit: z.number().int().positive().max(10_000).nullable().optional(),
-        capacityReservedSlots: z.number().int().min(0).max(10_000).optional(),
-        capacityWaitBudgetMs: z.number().int().min(0).max(600_000).nullable().optional(),
-        capacityContextCeiling: z.number().int().positive().max(100_000_000).nullable().optional(),
-        capacityContextMargin: z.number().int().min(0).max(100_000_000).optional(),
-        capacityBorrowPolicy: z.enum(["NEVER", "WHEN_IDLE"]).optional(),
+        ...poolTransformerFields,
+        ...modelPoolCapacityPolicyFields,
         affinityEnabled: z.boolean().optional(),
         affinityTtlSeconds: z.number().int().min(60).max(604_800).optional(),
         affinityMaxRecords: z.number().int().min(100).max(100_000).optional(),
@@ -2232,16 +2290,25 @@ export const forwarderManagementRouter = {
         protocolAdaptationEnabled: input.protocolAdaptationEnabled ?? false,
         allowLossyDeveloperRoleCollapse: input.allowLossyDeveloperRoleCollapse ?? false,
       });
-      if (
-        input.capacityConcurrencyLimit != null &&
-        (input.capacityReservedSlots ?? 0) > input.capacityConcurrencyLimit
-      )
-        throw new ORPCError("BAD_REQUEST", {
-          message: "Reserved slots exceed the pool concurrency limit.",
-        });
+      assertModelPoolCapacityPolicy({
+        concurrencyLimit: input.capacityConcurrencyLimit,
+        reservedSlots: input.capacityReservedSlots,
+        contextCeiling: input.capacityContextCeiling,
+        contextMargin: input.capacityContextMargin,
+      });
       await assertPoolSlugAvailable(input.slug, context.session.user.id);
       await assertAttachmentLimitWithinGlobal(input.maxAttachmentBytes);
       const userId = context.session.user.id;
+      await assertPoolTransformerIsValid(
+        input,
+        {
+          transformerDiscoveredModelId: null,
+          transformerImages: true,
+          transformerAudio: false,
+          transformerVideo: false,
+        },
+        userId,
+      );
       const data = {
         userId,
         slug: input.slug,
@@ -2256,6 +2323,17 @@ export const forwarderManagementRouter = {
         publicEgressAcknowledged: input.publicEgressAcknowledged ?? false,
         allowLossyDeveloperRoleCollapse: input.allowLossyDeveloperRoleCollapse ?? false,
         recommendedSurfaceOverride: input.recommendedSurfaceOverride ?? null,
+        transformerDiscoveredModelId: input.transformerDiscoveredModelId ?? null,
+        transformerSystemPrompt: input.transformerSystemPrompt ?? null,
+        transformerImages: input.transformerImages ?? true,
+        transformerAudio: input.transformerAudio ?? false,
+        transformerVideo: input.transformerVideo ?? false,
+        transformerCacheMode: input.transformerCacheMode ?? "OFF",
+        transformerIncludePrimaryTools: input.transformerIncludePrimaryTools ?? false,
+        transformerMaxTools: input.transformerMaxTools ?? 32,
+        transformerMaxToolChars: input.transformerMaxToolChars ?? 8000,
+        transformerTimeoutMs: input.transformerTimeoutMs ?? null,
+        transformerMaxAssets: input.transformerMaxAssets ?? null,
         capacityPriority: input.capacityPriority ?? 16,
         capacityConcurrencyLimit: input.capacityConcurrencyLimit ?? null,
         capacityReservedSlots: input.capacityReservedSlots ?? 0,
@@ -2308,17 +2386,7 @@ export const forwarderManagementRouter = {
         name: poolNameSchema.optional(),
         description: poolDescriptionSchema,
         /** Set to a discovered model id owned by the user, or null to clear. */
-        transformerDiscoveredModelId: z.string().min(1).nullable().optional(),
-        transformerSystemPrompt: z.string().max(16_000).nullable().optional(),
-        transformerImages: z.boolean().optional(),
-        transformerAudio: z.boolean().optional(),
-        transformerVideo: z.boolean().optional(),
-        transformerCacheMode: z.enum(["OFF", "MEMORY"]).optional(),
-        transformerIncludePrimaryTools: z.boolean().optional(),
-        transformerMaxTools: z.number().int().min(1).max(128).optional(),
-        transformerMaxToolChars: z.number().int().min(256).max(32_000).optional(),
-        transformerTimeoutMs: z.number().int().min(1_000).max(600_000).nullable().optional(),
-        transformerMaxAssets: z.number().int().min(1).max(64).nullable().optional(),
+        ...poolTransformerFields,
         maxAttachmentBytes: attachmentLimitSchema,
         optimisticBasicTranscription: z.boolean().optional(),
         protocolAdaptationEnabled: z.boolean().optional(),
@@ -2333,6 +2401,7 @@ export const forwarderManagementRouter = {
         affinityConversationWeight: z.number().int().min(0).max(10_000).optional(),
         affinityConfirmedCacheWeight: z.number().int().min(0).max(10_000).optional(),
         affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000).optional(),
+        ...modelPoolCapacityPolicyFields,
       }),
     )
     .handler(async ({ input, context }) => {
@@ -2367,6 +2436,8 @@ export const forwarderManagementRouter = {
       if (!existing || existing.userId !== context.session.user.id) {
         throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
       }
+      const hasCapacityPolicy = hasModelPoolCapacityPolicy(input);
+      if (hasCapacityPolicy) assertCapacityManagementEnabled(env.MODEL_API_GLOBAL_CAPACITY_ENABLED);
       if (input.slug) {
         await assertPoolSlugAvailable(input.slug, context.session.user.id, input.id);
       }
@@ -2470,35 +2541,18 @@ export const forwarderManagementRouter = {
         }
       }
 
-      const nextTransformerId =
-        input.transformerDiscoveredModelId !== undefined
-          ? input.transformerDiscoveredModelId
-          : existing.transformerDiscoveredModelId;
-      const nextImages =
-        input.transformerImages !== undefined
-          ? input.transformerImages
-          : existing.transformerImages;
-      const nextAudio =
-        input.transformerAudio !== undefined ? input.transformerAudio : existing.transformerAudio;
-      const nextVideo =
-        input.transformerVideo !== undefined ? input.transformerVideo : existing.transformerVideo;
-
-      if (nextTransformerId) {
-        const caps = await transformerCapabilitiesForOwnedModel(
-          nextTransformerId,
-          context.session.user.id,
-        );
-        assertTransformerMatchesModalities({
-          caps,
-          images: nextImages,
-          audio: nextAudio,
-          video: nextVideo,
-        });
-      } else if (input.transformerDiscoveredModelId === null) {
-        // clearing transformer — ok
-      }
+      await assertPoolTransformerIsValid(input, existing, context.session.user.id);
 
       const row = (await runSerializableTransaction(async (tx) => {
+        if (hasCapacityPolicy)
+          await lockAndValidateModelPoolCapacityPolicy(tx, {
+            modelPoolId: input.id,
+            userId: context.session.user.id,
+            policy: input,
+            notFound: () => {
+              throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+            },
+          });
         const current = await tx.modelPool.findUnique({
           where: { id: input.id },
           select: {
@@ -2601,6 +2655,27 @@ export const forwarderManagementRouter = {
               : {}),
             ...(input.affinityLoadPenaltyWeight !== undefined
               ? { affinityLoadPenaltyWeight: input.affinityLoadPenaltyWeight }
+              : {}),
+            ...(input.capacityPriority !== undefined
+              ? { capacityPriority: input.capacityPriority }
+              : {}),
+            ...(input.capacityConcurrencyLimit !== undefined
+              ? { capacityConcurrencyLimit: input.capacityConcurrencyLimit }
+              : {}),
+            ...(input.capacityReservedSlots !== undefined
+              ? { capacityReservedSlots: input.capacityReservedSlots }
+              : {}),
+            ...(input.capacityBorrowPolicy !== undefined
+              ? { capacityBorrowPolicy: input.capacityBorrowPolicy }
+              : {}),
+            ...(input.capacityWaitBudgetMs !== undefined
+              ? { capacityWaitBudgetMs: input.capacityWaitBudgetMs }
+              : {}),
+            ...(input.capacityContextCeiling !== undefined
+              ? { capacityContextCeiling: input.capacityContextCeiling }
+              : {}),
+            ...(input.capacityContextMargin !== undefined
+              ? { capacityContextMargin: input.capacityContextMargin }
               : {}),
           },
           select: poolSelect,

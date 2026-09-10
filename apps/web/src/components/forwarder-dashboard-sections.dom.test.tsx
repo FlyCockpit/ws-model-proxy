@@ -11,6 +11,7 @@ const state = vi.hoisted(() => ({
   protocolAdaptationAvailable: true,
   rejectMutation: null as string | null,
   mutationCalls: [] as string[],
+  mutationPayloads: [] as Array<{ name: string; input: unknown }>,
   devices: [] as Array<Record<string, unknown>>,
   pools: [] as Array<Record<string, unknown>>,
 }));
@@ -42,8 +43,9 @@ vi.mock("@/utils/orpc", () => {
   });
   const mutation = (name: string) => ({
     mutationOptions: (options?: { onSuccess?: () => void }) => ({
-      mutationFn: async () => {
+      mutationFn: async (input: unknown) => {
         state.mutationCalls.push(name);
+        state.mutationPayloads.push({ name, input });
         if (state.rejectMutation === name) throw new Error(`${name} failed`);
         return name === "addPoolMember"
           ? { id: "new-member", executionTargetId: "target-id" }
@@ -153,6 +155,7 @@ afterEach(() => {
   state.protocolAdaptationAvailable = true;
   state.rejectMutation = null;
   state.mutationCalls = [];
+  state.mutationPayloads = [];
   state.devices = [];
   state.pools = [];
   toastState.success.mockReset();
@@ -160,6 +163,43 @@ afterEach(() => {
 });
 
 describe("PoolsSection protocol adaptation controls", () => {
+  it("lists eligible transformer models in advanced create", () => {
+    state.devices = [
+      {
+        slug: "cli",
+        endpoints: [
+          {
+            slug: "endpoint",
+            label: "Endpoint",
+            published: true,
+            capabilityMetadata: {
+              version: 1,
+              protocol: "openai-compatible",
+              chatCompletions: { supported: true, streaming: true, vision: true },
+            },
+            models: [
+              {
+                id: "transformer-model-id",
+                canonicalModelId: "owner/cli/vision-model",
+                published: true,
+              },
+            ],
+          },
+        ],
+      },
+    ];
+    mount();
+
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.advancedCreate" }));
+
+    const transformerModel = screen.getByLabelText("dashboard:pools.transformerModel");
+    expect(
+      within(transformerModel)
+        .getByRole("option", { name: "owner/cli/vision-model" })
+        .getAttribute("value"),
+    ).toBe("transformer-model-id");
+  });
+
   it("enables lossy collapse after adaptation is selected", () => {
     state.protocolAdaptationAvailable = true;
     mount();
@@ -305,9 +345,9 @@ describe("PoolsSection member capacity gate", () => {
     expect(screen.getByText("dashboard:pools.editMemberTitle")).toBeTruthy();
   });
 
-  it("keeps the pool editor open without success feedback when its capacity leg fails", async () => {
+  it("keeps the pool editor open without success feedback when its single save fails", async () => {
     state.capacityEnabled = true;
-    state.rejectMutation = "updatePoolPolicy";
+    state.rejectMutation = "updateModelPool";
     state.pools = [memberPool];
     mount();
 
@@ -318,10 +358,61 @@ describe("PoolsSection member capacity gate", () => {
     if (!sheet) throw new Error("pool editor sheet not found");
     fireEvent.click(within(sheet).getByRole("button", { name: "common:actions.save" }));
 
-    await waitFor(() => expect(state.mutationCalls).toContain("updatePoolPolicy"));
+    await waitFor(() => expect(state.mutationCalls).toContain("updateModelPool"));
 
     expect(toastState.success).not.toHaveBeenCalled();
     expect(screen.getByText("dashboard:pools.editTitle")).toBeTruthy();
+    expect(state.mutationCalls).not.toContain("updatePoolPolicy");
+  });
+
+  it("saves a pool once when capacity management is unavailable", async () => {
+    state.capacityEnabled = false;
+    state.pools = [memberPool];
+    mount();
+
+    const poolCard = screen.getByRole("region", { name: "Pool" });
+    fireEvent.click(within(poolCard).getByRole("button", { name: "dashboard:pools.editPool" }));
+    const title = await screen.findByText("dashboard:pools.editTitle");
+    const sheet = title.closest<HTMLElement>('[role="dialog"]');
+    if (!sheet) throw new Error("pool editor sheet not found");
+    fireEvent.click(within(sheet).getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toContain("updateModelPool"));
+
+    expect(state.mutationCalls).toEqual(["updateModelPool"]);
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("capacityPriority");
+    expect(toastState.success).toHaveBeenCalledWith("dashboard:pools.updated");
+  });
+
+  it("saves a capacity-enabled pool through updateModelPool only", async () => {
+    state.capacityEnabled = true;
+    state.pools = [memberPool];
+    mount();
+
+    const poolCard = screen.getByRole("region", { name: "Pool" });
+    fireEvent.click(within(poolCard).getByRole("button", { name: "dashboard:pools.editPool" }));
+    const title = await screen.findByText("dashboard:pools.editTitle");
+    const sheet = title.closest<HTMLElement>('[role="dialog"]');
+    if (!sheet) throw new Error("pool editor sheet not found");
+    fireEvent.click(within(sheet).getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+
+    expect(state.mutationPayloads).toEqual([
+      {
+        name: "updateModelPool",
+        input: expect.objectContaining({
+          capacityPriority: 16,
+          capacityConcurrencyLimit: 1,
+          capacityReservedSlots: 0,
+          capacityWaitBudgetMs: 30_000,
+          capacityContextCeiling: 32_768,
+          capacityContextMargin: 1_024,
+          capacityBorrowPolicy: "WHEN_IDLE",
+        }),
+      },
+    ]);
+    expect(toastState.success).toHaveBeenCalledWith("dashboard:pools.updated");
   });
 
   it("does not report success when member creation cannot attach its capacity policy", async () => {

@@ -1871,6 +1871,7 @@ export function PoolsSection() {
                 </DialogHeader>
                 <PoolForm
                   mode="create"
+                  directModels={directModels}
                   capacities={capacitiesData ?? []}
                   capacityAvailability={capacityAvailability}
                   protocolAdaptationAvailable={appConfig?.protocolAdaptationAvailable ?? false}
@@ -2957,7 +2958,7 @@ function PoolForm({
   mode,
   pool,
   onSuccess,
-  directModels = [],
+  directModels,
   capacities = [],
   capacityAvailability,
   protocolAdaptationAvailable,
@@ -2965,7 +2966,7 @@ function PoolForm({
   mode: "create" | "edit";
   pool?: ModelPool;
   onSuccess: () => void;
-  directModels?: ReturnType<typeof allDirectModels>;
+  directModels: ReturnType<typeof allDirectModels>;
   capacities?: CapacityRow[];
   capacityAvailability: CapacityAvailability;
   protocolAdaptationAvailable: boolean;
@@ -3043,7 +3044,6 @@ function PoolForm({
       },
     }),
   );
-  const updatePoolPolicy = useMutation(orpc.capacityManagement.updatePoolPolicy.mutationOptions());
   const affinityStats = useQuery({
     ...orpc.forwarderManagement.cacheAffinityStats.queryOptions({
       input: { poolId: pool?.id ?? "disabled" },
@@ -3113,6 +3113,41 @@ function PoolForm({
     },
     validators: { onSubmit: poolSchema },
     onSubmit: async ({ value }) => {
+      const transformer = {
+        transformerDiscoveredModelId: value.transformerDiscoveredModelId.trim()
+          ? value.transformerDiscoveredModelId.trim()
+          : null,
+        transformerImages: value.transformerImages,
+        transformerAudio: value.transformerAudio,
+        transformerVideo: value.transformerVideo,
+        transformerCacheMode: value.transformerCacheMode as "OFF" | "MEMORY",
+        transformerSystemPrompt: value.transformerSystemPrompt.trim()
+          ? value.transformerSystemPrompt.trim()
+          : null,
+        transformerIncludePrimaryTools: value.transformerIncludePrimaryTools,
+        transformerMaxTools: value.transformerMaxTools,
+        transformerMaxToolChars: value.transformerMaxToolChars,
+        transformerTimeoutMs: value.transformerTimeoutMs.trim()
+          ? Number(value.transformerTimeoutMs)
+          : null,
+        transformerMaxAssets: value.transformerMaxAssets.trim()
+          ? Number(value.transformerMaxAssets)
+          : null,
+      };
+      const capacityPolicy = capacityEnabled
+        ? {
+            capacityPriority: value.capacityPriority,
+            capacityConcurrencyLimit:
+              value.capacityConcurrencyMode === "LIMITED" ? value.capacityConcurrencyLimit : null,
+            capacityReservedSlots: value.capacityReservedSlots,
+            capacityWaitBudgetMs:
+              value.capacityWaitBudgetMode === "LIMITED" ? value.capacityWaitBudgetMs : null,
+            capacityContextCeiling:
+              value.capacityContextCeilingMode === "LIMITED" ? value.capacityContextCeiling : null,
+            capacityContextMargin: value.capacityContextMargin,
+            capacityBorrowPolicy: value.capacityBorrowPolicy,
+          }
+        : {};
       if (mode === "create") {
         await createPool.mutateAsync({
           slug: value.slug.trim(),
@@ -3126,16 +3161,8 @@ function PoolForm({
           allowLossyDeveloperRoleCollapse: value.allowLossyDeveloperRoleCollapse,
           recommendedSurfaceOverride:
             value.recommendedSurfaceOverride === "" ? null : value.recommendedSurfaceOverride,
-          capacityPriority: value.capacityPriority,
-          capacityConcurrencyLimit:
-            value.capacityConcurrencyMode === "UNLIMITED" ? null : value.capacityConcurrencyLimit,
-          capacityReservedSlots: value.capacityReservedSlots,
-          capacityWaitBudgetMs:
-            value.capacityWaitBudgetMode === "UNLIMITED" ? null : value.capacityWaitBudgetMs,
-          capacityContextCeiling:
-            value.capacityContextCeilingMode === "UNLIMITED" ? null : value.capacityContextCeiling,
-          capacityContextMargin: value.capacityContextMargin,
-          capacityBorrowPolicy: value.capacityBorrowPolicy,
+          ...transformer,
+          ...capacityPolicy,
           affinityEnabled: value.affinityEnabled,
           affinityTtlSeconds: value.affinityTtlSeconds,
           affinityMaxRecords: value.affinityMaxRecords,
@@ -3151,25 +3178,7 @@ function PoolForm({
           slug: value.slug.trim(),
           name: value.name.trim(),
           description: value.description.trim() || null,
-          transformerDiscoveredModelId: value.transformerDiscoveredModelId.trim()
-            ? value.transformerDiscoveredModelId.trim()
-            : null,
-          transformerImages: value.transformerImages,
-          transformerAudio: value.transformerAudio,
-          transformerVideo: value.transformerVideo,
-          transformerCacheMode: value.transformerCacheMode as "OFF" | "MEMORY",
-          transformerSystemPrompt: value.transformerSystemPrompt.trim()
-            ? value.transformerSystemPrompt.trim()
-            : null,
-          transformerIncludePrimaryTools: value.transformerIncludePrimaryTools,
-          transformerMaxTools: value.transformerMaxTools,
-          transformerMaxToolChars: value.transformerMaxToolChars,
-          transformerTimeoutMs: value.transformerTimeoutMs.trim()
-            ? Number(value.transformerTimeoutMs)
-            : null,
-          transformerMaxAssets: value.transformerMaxAssets.trim()
-            ? Number(value.transformerMaxAssets)
-            : null,
+          ...transformer,
           maxAttachmentBytes: value.maxAttachmentMiB.trim()
             ? Number(value.maxAttachmentMiB) * MEBIBYTE
             : null,
@@ -3184,23 +3193,8 @@ function PoolForm({
           affinityPrefixWeight: value.affinityPrefixWeight,
           affinityConversationWeight: value.affinityConversationWeight,
           affinityLoadPenaltyWeight: value.affinityLoadPenaltyWeight,
+          ...capacityPolicy,
         });
-        if (capacityEnabled)
-          await updatePoolPolicy.mutateAsync({
-            modelPoolId: pool.id,
-            capacityPriority: value.capacityPriority,
-            capacityConcurrencyLimit:
-              value.capacityConcurrencyMode === "LIMITED" ? value.capacityConcurrencyLimit : null,
-            capacityReservedSlots: value.capacityReservedSlots,
-            capacityWaitBudgetMs:
-              value.capacityWaitBudgetMode === "LIMITED" ? value.capacityWaitBudgetMs : null,
-            capacityContextCeiling:
-              value.capacityContextCeilingMode === "LIMITED" ? value.capacityContextCeiling : null,
-            capacityContextMargin: value.capacityContextMargin,
-            capacityBorrowPolicy: value.capacityBorrowPolicy,
-            protocolAdaptationEnabled: value.protocolAdaptationEnabled,
-            allowLossyDeveloperRoleCollapse: value.allowLossyDeveloperRoleCollapse,
-          });
         toast.success(t("dashboard:pools.updated"));
         onSuccess();
       }
@@ -3415,24 +3409,22 @@ function PoolForm({
         ) : null}
       </details>
 
-      {mode === "edit" ? (
-        <details className="rounded-md border p-3">
-          <summary className="min-h-11 cursor-pointer py-2 text-sm font-medium">
-            {t("dashboard:pools.capacity.poolPolicy")}
-          </summary>
-          <p className="mb-3 text-xs text-muted-foreground">
-            {t("dashboard:pools.capacity.poolPolicyHint", { count: capacities.length })}
+      <details className="rounded-md border p-3">
+        <summary className="min-h-11 cursor-pointer py-2 text-sm font-medium">
+          {t("dashboard:pools.capacity.poolPolicy")}
+        </summary>
+        <p className="mb-3 text-xs text-muted-foreground">
+          {t("dashboard:pools.capacity.poolPolicyHint", { count: capacities.length })}
+        </p>
+        {!capacityEnabled ? (
+          <p className="mb-3 rounded-md bg-muted/40 p-3 text-sm text-muted-foreground">
+            {t(capacityUnavailableReasonKey(capacityAvailability))}
           </p>
-          {!capacityEnabled ? (
-            <p className="mb-3 rounded-md bg-muted/40 p-3 text-sm text-muted-foreground">
-              {t(capacityUnavailableReasonKey(capacityAvailability))}
-            </p>
-          ) : null}
-          <fieldset disabled={!capacityEnabled} className="min-w-0 disabled:opacity-60">
-            <div className="grid gap-4 sm:grid-cols-2">
-              {(
-                ["capacityPriority", "capacityReservedSlots", "capacityContextMargin"] as const
-              ).map((name) => (
+        ) : null}
+        <fieldset disabled={!capacityEnabled} className="min-w-0 disabled:opacity-60">
+          <div className="grid gap-4 sm:grid-cols-2">
+            {(["capacityPriority", "capacityReservedSlots", "capacityContextMargin"] as const).map(
+              (name) => (
                 <form.Field key={name} name={name}>
                   {(field) => (
                     <div className="space-y-2">
@@ -3449,95 +3441,93 @@ function PoolForm({
                     </div>
                   )}
                 </form.Field>
-              ))}
-              {(
-                [
-                  ["capacityConcurrencyMode", "capacityConcurrencyLimit"],
-                  ["capacityWaitBudgetMode", "capacityWaitBudgetMs"],
-                  ["capacityContextCeilingMode", "capacityContextCeiling"],
-                ] as const
-              ).map(([modeName, valueName]) => (
-                <form.Field key={modeName} name={modeName}>
-                  {(modeField) => (
-                    <div className="min-w-0 space-y-2">
-                      <Label htmlFor={modeName}>
-                        {t(`dashboard:pools.capacity.fields.${valueName}`)}
-                      </Label>
-                      <select
-                        id={modeName}
-                        className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
-                        value={modeField.state.value}
-                        onChange={(event) =>
-                          modeField.handleChange(event.target.value as FiniteLimitMode)
-                        }
-                      >
-                        <option value="LIMITED">
-                          {t("dashboard:pools.capacity.modes.limited")}
-                        </option>
-                        <option value="UNLIMITED">
-                          {t("dashboard:pools.capacity.modes.unlimited")}
-                        </option>
-                      </select>
-                      {modeField.state.value === "LIMITED" ? (
-                        <form.Field name={valueName}>
-                          {(field) => (
-                            <Input
-                              className="min-h-11"
-                              type="number"
-                              min={valueName === "capacityWaitBudgetMs" ? 0 : 1}
-                              value={field.state.value}
-                              onChange={(event) => field.handleChange(Number(event.target.value))}
-                              aria-label={t("dashboard:pools.capacity.limitValue")}
-                            />
-                          )}
-                        </form.Field>
-                      ) : null}
-                    </div>
-                  )}
-                </form.Field>
-              ))}
-              <form.Field name="capacityBorrowPolicy">
-                {(field) => (
-                  <div className="space-y-2">
-                    <Label htmlFor="capacityBorrowPolicy">
-                      {t("dashboard:pools.capacity.fields.capacityBorrowPolicy")}
+              ),
+            )}
+            {(
+              [
+                ["capacityConcurrencyMode", "capacityConcurrencyLimit"],
+                ["capacityWaitBudgetMode", "capacityWaitBudgetMs"],
+                ["capacityContextCeilingMode", "capacityContextCeiling"],
+              ] as const
+            ).map(([modeName, valueName]) => (
+              <form.Field key={modeName} name={modeName}>
+                {(modeField) => (
+                  <div className="min-w-0 space-y-2">
+                    <Label htmlFor={modeName}>
+                      {t(`dashboard:pools.capacity.fields.${valueName}`)}
                     </Label>
                     <select
-                      id="capacityBorrowPolicy"
+                      id={modeName}
                       className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
-                      value={field.state.value}
+                      value={modeField.state.value}
                       onChange={(event) =>
-                        field.handleChange(event.target.value as "NEVER" | "WHEN_IDLE")
+                        modeField.handleChange(event.target.value as FiniteLimitMode)
                       }
                     >
-                      <option value="WHEN_IDLE">{t("dashboard:pools.capacity.borrowIdle")}</option>
-                      <option value="NEVER">{t("dashboard:pools.capacity.borrowNever")}</option>
+                      <option value="LIMITED">{t("dashboard:pools.capacity.modes.limited")}</option>
+                      <option value="UNLIMITED">
+                        {t("dashboard:pools.capacity.modes.unlimited")}
+                      </option>
                     </select>
+                    {modeField.state.value === "LIMITED" ? (
+                      <form.Field name={valueName}>
+                        {(field) => (
+                          <Input
+                            className="min-h-11"
+                            type="number"
+                            min={valueName === "capacityWaitBudgetMs" ? 0 : 1}
+                            value={field.state.value}
+                            onChange={(event) => field.handleChange(Number(event.target.value))}
+                            aria-label={t("dashboard:pools.capacity.limitValue")}
+                          />
+                        )}
+                      </form.Field>
+                    ) : null}
                   </div>
                 )}
               </form.Field>
-            </div>
-            <form.Subscribe
-              selector={(state) =>
-                state.values.capacityConcurrencyMode === "UNLIMITED" ||
-                state.values.capacityWaitBudgetMode === "UNLIMITED" ||
-                state.values.capacityContextCeilingMode === "UNLIMITED"
-              }
-            >
-              {(hasUnlimited) =>
-                hasUnlimited ? (
-                  <p
-                    className="mt-3 rounded-md bg-amber-500/10 p-3 text-sm text-amber-900 dark:text-amber-100"
-                    role="alert"
+            ))}
+            <form.Field name="capacityBorrowPolicy">
+              {(field) => (
+                <div className="space-y-2">
+                  <Label htmlFor="capacityBorrowPolicy">
+                    {t("dashboard:pools.capacity.fields.capacityBorrowPolicy")}
+                  </Label>
+                  <select
+                    id="capacityBorrowPolicy"
+                    className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+                    value={field.state.value}
+                    onChange={(event) =>
+                      field.handleChange(event.target.value as "NEVER" | "WHEN_IDLE")
+                    }
                   >
-                    {t("dashboard:pools.capacity.unlimitedWarning")}
-                  </p>
-                ) : null
-              }
-            </form.Subscribe>
-          </fieldset>
-        </details>
-      ) : null}
+                    <option value="WHEN_IDLE">{t("dashboard:pools.capacity.borrowIdle")}</option>
+                    <option value="NEVER">{t("dashboard:pools.capacity.borrowNever")}</option>
+                  </select>
+                </div>
+              )}
+            </form.Field>
+          </div>
+          <form.Subscribe
+            selector={(state) =>
+              state.values.capacityConcurrencyMode === "UNLIMITED" ||
+              state.values.capacityWaitBudgetMode === "UNLIMITED" ||
+              state.values.capacityContextCeilingMode === "UNLIMITED"
+            }
+          >
+            {(hasUnlimited) =>
+              hasUnlimited ? (
+                <p
+                  className="mt-3 rounded-md bg-amber-500/10 p-3 text-sm text-amber-900 dark:text-amber-100"
+                  role="alert"
+                >
+                  {t("dashboard:pools.capacity.unlimitedWarning")}
+                </p>
+              ) : null
+            }
+          </form.Subscribe>
+        </fieldset>
+      </details>
 
       <form.Field name="name">
         {(field) => (
@@ -3611,220 +3601,218 @@ function PoolForm({
         )}
       </form.Field>
 
-      {mode === "edit" ? (
-        <div className="space-y-4 rounded-md border p-3">
-          <div>
-            <h4 className="text-sm font-medium">{t("dashboard:pools.transformerTitle")}</h4>
-            <p className="mt-1 text-xs text-muted-foreground">
-              {t("dashboard:pools.transformerDescription")}
-            </p>
-          </div>
-          <form.Subscribe
-            selector={(state) => ({
-              images: state.values.transformerImages,
-              audio: state.values.transformerAudio,
-              video: state.values.transformerVideo,
-            })}
-          >
-            {({ images, audio, video }) => (
-              <form.Field name="transformerDiscoveredModelId">
-                {(field) => {
-                  const eligible = directModels.filter((model) =>
-                    modelSupportsTransformerModalities(model, { images, audio, video }),
-                  );
-                  return (
-                    <div className="space-y-2">
-                      <Label htmlFor={field.name}>{t("dashboard:pools.transformerModel")}</Label>
-                      <select
-                        id={field.name}
-                        name={field.name}
-                        className="flex h-11 w-full min-h-11 rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
-                        value={field.state.value}
-                        onBlur={field.handleBlur}
-                        onChange={(event) => field.handleChange(event.target.value)}
-                      >
-                        <option value="">{t("dashboard:pools.transformerNone")}</option>
-                        {eligible.map((model) => (
-                          <option key={model.id} value={model.id}>
-                            {model.canonicalModelId}
-                          </option>
-                        ))}
-                      </select>
-                      {field.state.value &&
-                      !eligible.some((model) => model.id === field.state.value) ? (
-                        <p className="text-sm text-destructive">
-                          {t("dashboard:pools.transformerIncompatible")}
-                        </p>
-                      ) : null}
-                      {eligible.length === 0 ? (
-                        <p className="text-xs text-muted-foreground">
-                          {t("dashboard:pools.transformerNoEligible")}
-                        </p>
-                      ) : null}
-                    </div>
-                  );
-                }}
-              </form.Field>
-            )}
-          </form.Subscribe>
-          <form.Field name="transformerImages">
-            {(field) => (
-              <label className="flex min-h-11 items-center gap-3 text-sm">
-                <input
-                  type="checkbox"
-                  className="size-4"
-                  checked={field.state.value}
-                  onBlur={field.handleBlur}
-                  onChange={(event) => field.handleChange(event.target.checked)}
-                />
-                {t("dashboard:pools.transformerImages")}
-              </label>
-            )}
-          </form.Field>
-          <form.Field name="transformerAudio">
-            {(field) => (
-              <label className="flex min-h-11 items-center gap-3 text-sm">
-                <input
-                  type="checkbox"
-                  className="size-4"
-                  checked={field.state.value}
-                  onBlur={field.handleBlur}
-                  onChange={(event) => field.handleChange(event.target.checked)}
-                />
-                {t("dashboard:pools.transformerAudio")}
-              </label>
-            )}
-          </form.Field>
-          <form.Field name="transformerVideo">
-            {(field) => (
-              <label className="flex min-h-11 items-center gap-3 text-sm">
-                <input
-                  type="checkbox"
-                  className="size-4"
-                  checked={field.state.value}
-                  onBlur={field.handleBlur}
-                  onChange={(event) => field.handleChange(event.target.checked)}
-                />
-                {t("dashboard:pools.transformerVideo")}
-              </label>
-            )}
-          </form.Field>
-          <form.Field name="transformerCacheMode">
+      <div className="space-y-4 rounded-md border p-3">
+        <div>
+          <h4 className="text-sm font-medium">{t("dashboard:pools.transformerTitle")}</h4>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {t("dashboard:pools.transformerDescription")}
+          </p>
+        </div>
+        <form.Subscribe
+          selector={(state) => ({
+            images: state.values.transformerImages,
+            audio: state.values.transformerAudio,
+            video: state.values.transformerVideo,
+          })}
+        >
+          {({ images, audio, video }) => (
+            <form.Field name="transformerDiscoveredModelId">
+              {(field) => {
+                const eligible = directModels.filter((model) =>
+                  modelSupportsTransformerModalities(model, { images, audio, video }),
+                );
+                return (
+                  <div className="space-y-2">
+                    <Label htmlFor={field.name}>{t("dashboard:pools.transformerModel")}</Label>
+                    <select
+                      id={field.name}
+                      name={field.name}
+                      className="flex h-11 w-full min-h-11 rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                      value={field.state.value}
+                      onBlur={field.handleBlur}
+                      onChange={(event) => field.handleChange(event.target.value)}
+                    >
+                      <option value="">{t("dashboard:pools.transformerNone")}</option>
+                      {eligible.map((model) => (
+                        <option key={model.id} value={model.id}>
+                          {model.canonicalModelId}
+                        </option>
+                      ))}
+                    </select>
+                    {field.state.value &&
+                    !eligible.some((model) => model.id === field.state.value) ? (
+                      <p className="text-sm text-destructive">
+                        {t("dashboard:pools.transformerIncompatible")}
+                      </p>
+                    ) : null}
+                    {eligible.length === 0 ? (
+                      <p className="text-xs text-muted-foreground">
+                        {t("dashboard:pools.transformerNoEligible")}
+                      </p>
+                    ) : null}
+                  </div>
+                );
+              }}
+            </form.Field>
+          )}
+        </form.Subscribe>
+        <form.Field name="transformerImages">
+          {(field) => (
+            <label className="flex min-h-11 items-center gap-3 text-sm">
+              <input
+                type="checkbox"
+                className="size-4"
+                checked={field.state.value}
+                onBlur={field.handleBlur}
+                onChange={(event) => field.handleChange(event.target.checked)}
+              />
+              {t("dashboard:pools.transformerImages")}
+            </label>
+          )}
+        </form.Field>
+        <form.Field name="transformerAudio">
+          {(field) => (
+            <label className="flex min-h-11 items-center gap-3 text-sm">
+              <input
+                type="checkbox"
+                className="size-4"
+                checked={field.state.value}
+                onBlur={field.handleBlur}
+                onChange={(event) => field.handleChange(event.target.checked)}
+              />
+              {t("dashboard:pools.transformerAudio")}
+            </label>
+          )}
+        </form.Field>
+        <form.Field name="transformerVideo">
+          {(field) => (
+            <label className="flex min-h-11 items-center gap-3 text-sm">
+              <input
+                type="checkbox"
+                className="size-4"
+                checked={field.state.value}
+                onBlur={field.handleBlur}
+                onChange={(event) => field.handleChange(event.target.checked)}
+              />
+              {t("dashboard:pools.transformerVideo")}
+            </label>
+          )}
+        </form.Field>
+        <form.Field name="transformerCacheMode">
+          {(field) => (
+            <div className="space-y-2">
+              <Label htmlFor={field.name}>{t("dashboard:pools.transformerCacheMode")}</Label>
+              <select
+                id={field.name}
+                name={field.name}
+                className="flex h-11 w-full min-h-11 rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                value={field.state.value}
+                onBlur={field.handleBlur}
+                onChange={(event) => field.handleChange(event.target.value as "OFF" | "MEMORY")}
+              >
+                <option value="OFF">{t("dashboard:pools.transformerCacheOff")}</option>
+                <option value="MEMORY">{t("dashboard:pools.transformerCacheMemory")}</option>
+              </select>
+              <p className="text-xs text-muted-foreground">
+                {t("dashboard:pools.transformerCacheHint")}
+              </p>
+            </div>
+          )}
+        </form.Field>
+        <form.Field name="transformerIncludePrimaryTools">
+          {(field) => (
+            <label className="flex min-h-11 items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                className="size-4"
+                checked={field.state.value}
+                onChange={(event) => field.handleChange(event.target.checked)}
+              />
+              {t("dashboard:pools.transformerIncludeTools")}
+            </label>
+          )}
+        </form.Field>
+        <p className="-mt-2 text-xs text-muted-foreground">
+          {t("dashboard:pools.transformerIncludeToolsHint")}
+        </p>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <form.Field name="transformerMaxTools">
             {(field) => (
               <div className="space-y-2">
-                <Label htmlFor={field.name}>{t("dashboard:pools.transformerCacheMode")}</Label>
-                <select
+                <Label htmlFor={field.name}>{t("dashboard:pools.transformerMaxTools")}</Label>
+                <Input
                   id={field.name}
-                  name={field.name}
-                  className="flex h-11 w-full min-h-11 rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+                  type="number"
+                  min={1}
+                  max={128}
                   value={field.state.value}
-                  onBlur={field.handleBlur}
-                  onChange={(event) => field.handleChange(event.target.value as "OFF" | "MEMORY")}
-                >
-                  <option value="OFF">{t("dashboard:pools.transformerCacheOff")}</option>
-                  <option value="MEMORY">{t("dashboard:pools.transformerCacheMemory")}</option>
-                </select>
-                <p className="text-xs text-muted-foreground">
-                  {t("dashboard:pools.transformerCacheHint")}
-                </p>
+                  onChange={(event) => field.handleChange(Number(event.target.value))}
+                />
               </div>
             )}
           </form.Field>
-          <form.Field name="transformerIncludePrimaryTools">
-            {(field) => (
-              <label className="flex min-h-11 items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  className="size-4"
-                  checked={field.state.value}
-                  onChange={(event) => field.handleChange(event.target.checked)}
-                />
-                {t("dashboard:pools.transformerIncludeTools")}
-              </label>
-            )}
-          </form.Field>
-          <p className="-mt-2 text-xs text-muted-foreground">
-            {t("dashboard:pools.transformerIncludeToolsHint")}
-          </p>
-          <div className="grid gap-3 sm:grid-cols-2">
-            <form.Field name="transformerMaxTools">
-              {(field) => (
-                <div className="space-y-2">
-                  <Label htmlFor={field.name}>{t("dashboard:pools.transformerMaxTools")}</Label>
-                  <Input
-                    id={field.name}
-                    type="number"
-                    min={1}
-                    max={128}
-                    value={field.state.value}
-                    onChange={(event) => field.handleChange(Number(event.target.value))}
-                  />
-                </div>
-              )}
-            </form.Field>
-            <form.Field name="transformerMaxToolChars">
-              {(field) => (
-                <div className="space-y-2">
-                  <Label htmlFor={field.name}>{t("dashboard:pools.transformerMaxToolChars")}</Label>
-                  <Input
-                    id={field.name}
-                    type="number"
-                    min={256}
-                    max={32000}
-                    value={field.state.value}
-                    onChange={(event) => field.handleChange(Number(event.target.value))}
-                  />
-                </div>
-              )}
-            </form.Field>
-            <form.Field name="transformerTimeoutMs">
-              {(field) => (
-                <div className="space-y-2">
-                  <Label htmlFor={field.name}>{t("dashboard:pools.transformerTimeoutMs")}</Label>
-                  <Input
-                    id={field.name}
-                    inputMode="numeric"
-                    value={field.state.value}
-                    onChange={(event) => field.handleChange(event.target.value)}
-                    placeholder="120000"
-                  />
-                </div>
-              )}
-            </form.Field>
-            <form.Field name="transformerMaxAssets">
-              {(field) => (
-                <div className="space-y-2">
-                  <Label htmlFor={field.name}>{t("dashboard:pools.transformerMaxAssets")}</Label>
-                  <Input
-                    id={field.name}
-                    inputMode="numeric"
-                    value={field.state.value}
-                    onChange={(event) => field.handleChange(event.target.value)}
-                    placeholder="16"
-                  />
-                </div>
-              )}
-            </form.Field>
-          </div>
-          <form.Field name="transformerSystemPrompt">
+          <form.Field name="transformerMaxToolChars">
             {(field) => (
               <div className="space-y-2">
-                <Label htmlFor={field.name}>{t("dashboard:pools.transformerPrompt")}</Label>
-                <Textarea
+                <Label htmlFor={field.name}>{t("dashboard:pools.transformerMaxToolChars")}</Label>
+                <Input
                   id={field.name}
-                  name={field.name}
+                  type="number"
+                  min={256}
+                  max={32000}
                   value={field.state.value}
-                  onBlur={field.handleBlur}
+                  onChange={(event) => field.handleChange(Number(event.target.value))}
+                />
+              </div>
+            )}
+          </form.Field>
+          <form.Field name="transformerTimeoutMs">
+            {(field) => (
+              <div className="space-y-2">
+                <Label htmlFor={field.name}>{t("dashboard:pools.transformerTimeoutMs")}</Label>
+                <Input
+                  id={field.name}
+                  inputMode="numeric"
+                  value={field.state.value}
                   onChange={(event) => field.handleChange(event.target.value)}
-                  autoComplete="off"
-                  rows={3}
-                  placeholder={t("dashboard:pools.transformerPromptPlaceholder")}
+                  placeholder="120000"
+                />
+              </div>
+            )}
+          </form.Field>
+          <form.Field name="transformerMaxAssets">
+            {(field) => (
+              <div className="space-y-2">
+                <Label htmlFor={field.name}>{t("dashboard:pools.transformerMaxAssets")}</Label>
+                <Input
+                  id={field.name}
+                  inputMode="numeric"
+                  value={field.state.value}
+                  onChange={(event) => field.handleChange(event.target.value)}
+                  placeholder="16"
                 />
               </div>
             )}
           </form.Field>
         </div>
-      ) : null}
+        <form.Field name="transformerSystemPrompt">
+          {(field) => (
+            <div className="space-y-2">
+              <Label htmlFor={field.name}>{t("dashboard:pools.transformerPrompt")}</Label>
+              <Textarea
+                id={field.name}
+                name={field.name}
+                value={field.state.value}
+                onBlur={field.handleBlur}
+                onChange={(event) => field.handleChange(event.target.value)}
+                autoComplete="off"
+                rows={3}
+                placeholder={t("dashboard:pools.transformerPromptPlaceholder")}
+              />
+            </div>
+          )}
+        </form.Field>
+      </div>
 
       <form.Subscribe
         selector={(state) => ({ canSubmit: state.canSubmit, isSubmitting: state.isSubmitting })}
