@@ -5,6 +5,7 @@ import {
   Braces,
   Cable,
   DatabaseZap,
+  Gauge,
   KeyRound,
   LayoutDashboard,
   MessageSquareText,
@@ -33,6 +34,12 @@ const dashboardSections = [
     to: "/$lang/dashboard/pools",
     labelKey: "dashboard:nav.pools",
     icon: Network,
+    exact: false,
+  },
+  {
+    to: "/$lang/dashboard/capacity",
+    labelKey: "dashboard:nav.capacity",
+    icon: Gauge,
     exact: false,
   },
   {

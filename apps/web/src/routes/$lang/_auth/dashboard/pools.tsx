@@ -1,11 +1,9 @@
-import { createFileRoute } from "@tanstack/react-router";
-
-import { PoolsSection } from "@/components/forwarder-dashboard-sections";
+import { createFileRoute, Outlet } from "@tanstack/react-router";
 
 export const Route = createFileRoute("/$lang/_auth/dashboard/pools")({
-  component: PoolsPage,
+  component: PoolsLayout,
 });
 
-function PoolsPage() {
-  return <PoolsSection />;
+function PoolsLayout() {
+  return <Outlet />;
 }

@@ -199,6 +199,7 @@
   "nav": {
     "ariaLabel": "Secciones del panel",
     "chatTest": "Prueba de chat",
+    "capacity": "Capacidad",
     "cliTokens": "Tokens CLI",
     "clis": "CLIs",
     "modelApiTokens": "Tokens API de modelo",
@@ -207,6 +208,7 @@
     "relayMetadata": "Metadatos de relay"
   },
   "pools": {
+    "notFound": "No se encontró este grupo o ya no está disponible para ti.",
     "affinity": {
       "title": "Enrutamiento según caché",
       "description": "Las sesiones nuevas van al miembro con la mejor puntuación de disponibilidad (carga, salud, salida pública y costo). Cuando esas puntuaciones empatan, se prefiere un entorno que quizá conserve un prefijo de instrucción coincidente. Después de un turno de asistente o de herramienta, se prefiere el miembro que sirvió la conversación hasta ahora. Una conversación larga puede superar una carga moderada o un miembro medio abierto; una cola grande igual desborda la solicitud.",

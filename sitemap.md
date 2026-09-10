@@ -27,7 +27,10 @@ All require an active session, enforced by the `_auth` layout.
 | `/{lang}/dashboard/clis` | Own CLI devices and discovered endpoint/model metadata. |
 | `/{lang}/dashboard/cli-tokens` | Own manually created CLI tokens. |
 | `/{lang}/dashboard/model-api-tokens` | Own OpenAI-compatible model API tokens. |
-| `/{lang}/dashboard/pools` | Own model pools, pool members, and pool grants. |
+| `/{lang}/dashboard/pools` | Own model pools and provider operations; pool cards lead to their dedicated detail pages. |
+| `/{lang}/dashboard/pools/new` | Guided model-pool creation. |
+| `/{lang}/dashboard/pools/{poolId}` | Owner-only model-pool detail and editing. |
+| `/{lang}/dashboard/capacity` | Owner-scoped shared inference capacity for direct models and pools. |
 | `/{lang}/dashboard/relay-metadata` | Own relay request metadata cleanup. |
 | `/{lang}/settings` | Profile settings. |
 | `/{lang}/settings/security` | Two-factor authentication enable/disable. |

@@ -70,14 +70,25 @@ vi.mock("@/utils/orpc", () => ({
     },
   },
 }));
-vi.mock("@ws-model-proxy/ui/components/dialog", () => ({
-  Dialog: ({ open, children }: { open: boolean; children: ReactNode }) => (open ? children : null),
-  DialogContent: ({ children }: { children: ReactNode }) => <section>{children}</section>,
-  DialogDescription: ({ children }: { children: ReactNode }) => <p>{children}</p>,
-  DialogFooter: ({ children }: { children: ReactNode }) => <footer>{children}</footer>,
-  DialogHeader: ({ children }: { children: ReactNode }) => <header>{children}</header>,
-  DialogTitle: ({ children }: { children: ReactNode }) => <h1>{children}</h1>,
-}));
+vi.mock("@ws-model-proxy/ui/components/dialog", async () => {
+  const { createContext, useContext } = await import("react");
+  const DialogRootContext = createContext(false);
+  return {
+    Dialog: ({ open, children }: { open: boolean; children: ReactNode }) =>
+      open ? <DialogRootContext.Provider value>{children}</DialogRootContext.Provider> : null,
+    DialogContent: ({ children }: { children: ReactNode }) => <section>{children}</section>,
+    DialogDescription: ({ children }: { children: ReactNode }) => {
+      if (!useContext(DialogRootContext)) throw new Error("Dialog.Root context is required");
+      return <p>{children}</p>;
+    },
+    DialogFooter: ({ children }: { children: ReactNode }) => <footer>{children}</footer>,
+    DialogHeader: ({ children }: { children: ReactNode }) => <header>{children}</header>,
+    DialogTitle: ({ children }: { children: ReactNode }) => {
+      if (!useContext(DialogRootContext)) throw new Error("Dialog.Root context is required");
+      return <h1>{children}</h1>;
+    },
+  };
+});
 vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
   toast: { success: vi.fn(), error: vi.fn() },
 }));
@@ -137,6 +148,25 @@ afterEach(() => {
 });
 
 describe("GuardedPoolSetupWizard mounted workflow", () => {
+  it("renders page mode without Dialog.Root-dependent primitives", () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <GuardedPoolSetupWizard
+          open
+          page
+          onOpenChange={() => undefined}
+          directModels={models}
+          capacityEnabled
+          protocolAdaptationAvailable
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByText("dashboard:pools.wizard.title")).toBeTruthy();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
   it("keeps affinity available when protocol adaptation is disabled by deployment", () => {
     mount(true, false, 1);
 

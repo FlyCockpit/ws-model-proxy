@@ -17,6 +17,7 @@ import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ShieldCheck } from "lucide-react";
+import type { ReactNode } from "react";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
@@ -115,6 +116,8 @@ export const budgetSpendRule = (mode: LimitMode, value: string) =>
 export function GuardedPoolSetupWizard({
   open,
   onOpenChange,
+  page = false,
+  onSuccess,
   directModels,
   initialStep = 0,
   initialProviderModelIds = [],
@@ -123,6 +126,9 @@ export function GuardedPoolSetupWizard({
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** Render directly in a route instead of inside a dialog. */
+  page?: boolean;
+  onSuccess?: (poolId: string | undefined) => void;
   directModels: LocalModel[];
   initialStep?: 0 | 1 | 2 | 3;
   initialProviderModelIds?: string[];
@@ -148,11 +154,12 @@ export function GuardedPoolSetupWizard({
   });
   const create = useMutation(
     orpc.forwarderManagement.createGuardedModelPool.mutationOptions({
-      onSuccess: async () => {
+      onSuccess: async (pool) => {
         await queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:pools.created"));
         setStep(0);
-        onOpenChange(false);
+        onSuccess?.(pool?.id);
+        if (!page) onOpenChange(false);
       },
       onError: () => toast.error(t("dashboard:pools.wizard.atomicFailure")),
     }),
@@ -466,12 +473,21 @@ export function GuardedPoolSetupWizard({
   });
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[min(92vh,56rem)] overflow-x-hidden overflow-y-auto sm:max-w-2xl">
-        <DialogHeader>
-          <DialogTitle>{t("dashboard:pools.wizard.title")}</DialogTitle>
-          <DialogDescription>{t("dashboard:pools.wizard.description")}</DialogDescription>
-        </DialogHeader>
+    <WizardSurface page={page} open={open} onOpenChange={onOpenChange}>
+      <WizardContent page={page}>
+        {page ? (
+          <div>
+            <h1 className="text-xl font-semibold">{t("dashboard:pools.wizard.title")}</h1>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {t("dashboard:pools.wizard.description")}
+            </p>
+          </div>
+        ) : (
+          <DialogHeader>
+            <DialogTitle>{t("dashboard:pools.wizard.title")}</DialogTitle>
+            <DialogDescription>{t("dashboard:pools.wizard.description")}</DialogDescription>
+          </DialogHeader>
+        )}
         <p className="text-sm font-medium" aria-live="polite">
           {t("dashboard:pools.wizard.step", { current: step + 1, total: 4 })}
         </p>
@@ -1223,8 +1239,38 @@ export function GuardedPoolSetupWizard({
             </Button>
           </DialogFooter>
         </form>
-      </DialogContent>
+      </WizardContent>
+    </WizardSurface>
+  );
+}
+
+function WizardSurface({
+  children,
+  open,
+  onOpenChange,
+  page,
+}: {
+  children: ReactNode;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  page: boolean;
+}) {
+  if (page) return <>{children}</>;
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      {children}
     </Dialog>
+  );
+}
+
+function WizardContent({ children, page }: { children: ReactNode; page: boolean }) {
+  if (page) return <section className="min-w-0 space-y-5">{children}</section>;
+
+  return (
+    <DialogContent className="max-h-[min(92vh,56rem)] overflow-x-hidden overflow-y-auto sm:max-w-2xl">
+      {children}
+    </DialogContent>
   );
 }
 

@@ -199,6 +199,7 @@
   "nav": {
     "ariaLabel": "Dashboard sections",
     "chatTest": "Chat test",
+    "capacity": "Capacity",
     "cliTokens": "CLI tokens",
     "clis": "CLIs",
     "modelApiTokens": "Model API tokens",
@@ -207,6 +208,7 @@
     "relayMetadata": "Relay metadata"
   },
   "pools": {
+    "notFound": "This pool was not found or is no longer available to you.",
     "affinity": {
       "title": "Cache-aware routing",
       "description": "New sessions go to the member with the best availability score (load, health, public-egress, and cost). When those scores tie, prefer a runtime that may still hold a matching instruction prefix. After an assistant or tool turn, prefer the member that served the conversation so far. A long conversation can outweigh modest load or a half-open member; a large queue still spills the request.",
