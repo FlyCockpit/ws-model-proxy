@@ -28,7 +28,10 @@ const countStrategy = z.enum([
 ]);
 
 function enabled() {
-  if (!env.MODEL_API_GLOBAL_CAPACITY_ENABLED) throw new ORPCError("NOT_FOUND");
+  if (!env.MODEL_API_GLOBAL_CAPACITY_ENABLED)
+    throw new ORPCError("NOT_FOUND", {
+      message: "Capacity management is disabled for this deployment.",
+    });
 }
 
 function notFound(): never {

@@ -116,16 +116,18 @@ export function GuardedPoolSetupWizard({
   directModels,
   initialStep = 0,
   initialProviderModelIds = [],
+  capacityEnabled,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   directModels: LocalModel[];
   initialStep?: 0 | 1 | 2 | 3;
   initialProviderModelIds?: string[];
+  capacityEnabled: boolean;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
-  const { data: appConfig } = useQuery(orpc.appConfig.queryOptions());
+  const capacityIsEnabled = capacityEnabled;
   const formRef = useRef<HTMLFormElement>(null);
   const contextCeilingCustomized = useRef(false);
   const contextMarginCustomized = useRef(false);
@@ -140,7 +142,7 @@ export function GuardedPoolSetupWizard({
   const capacities = useQuery({
     ...orpc.capacityManagement.list.queryOptions(),
     retry: false,
-    enabled: open && appConfig?.capacityEnabled === true,
+    enabled: open && capacityIsEnabled,
   });
   const create = useMutation(
     orpc.forwarderManagement.createGuardedModelPool.mutationOptions({

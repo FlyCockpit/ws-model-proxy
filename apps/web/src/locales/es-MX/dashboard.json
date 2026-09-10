@@ -225,6 +225,9 @@
     "capacity": {
       "title": "Capacidad local compartida",
       "description": "Mantén los pools dentro de los límites reales de concurrencia y contexto del runtime que comparten.",
+      "disabledReason": "La administración de capacidad está deshabilitada para esta implementación. Estos controles no están disponibles.",
+      "settingsLoading": "La configuración de la implementación aún se está cargando. Los controles de capacidad no estarán disponibles hasta que termine.",
+      "settingsFailed": "No se pudo cargar la configuración de la implementación. Los controles de capacidad no estarán disponibles hasta que se pueda cargar.",
       "create": "Agregar capacidad",
       "createTitle": "Configurar capacidad compartida",
       "createDescription": "Identifica un runtime local y establece límites físicos conservadores. Podrás conectar modelos después de guardar.",
@@ -483,6 +486,7 @@
     "editDescription": "Actualiza el slug, nombre visible, descripción o transformador de medios del pool.",
     "editMemberDescription": "Cambia los controles de enrutamiento del miembro.",
     "editMemberTitle": "Editar miembro del pool",
+    "editPool": "Editar {{pool}}",
     "editTitle": "Editar pool",
     "email": "Correo",
     "empty": "Todavía no hay pools de modelos.",

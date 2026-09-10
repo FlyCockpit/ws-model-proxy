@@ -115,7 +115,12 @@ function mount(open = true) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const view = render(
     <QueryClientProvider client={client}>
-      <GuardedPoolSetupWizard open={open} onOpenChange={() => undefined} directModels={models} />
+      <GuardedPoolSetupWizard
+        open={open}
+        onOpenChange={() => undefined}
+        directModels={models}
+        capacityEnabled
+      />
     </QueryClientProvider>,
   );
   return { ...view, client };
@@ -147,7 +152,12 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
 
     view.rerender(
       <QueryClientProvider client={view.client}>
-        <GuardedPoolSetupWizard open onOpenChange={() => undefined} directModels={models} />
+        <GuardedPoolSetupWizard
+          open
+          onOpenChange={() => undefined}
+          directModels={models}
+          capacityEnabled
+        />
       </QueryClientProvider>,
     );
 

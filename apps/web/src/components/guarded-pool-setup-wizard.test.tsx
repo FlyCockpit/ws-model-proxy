@@ -108,6 +108,7 @@ function renderStep(initialStep: 0 | 1 | 2 | 3, initialProviderModelIds: string[
         directModels={[localModel]}
         initialStep={initialStep}
         initialProviderModelIds={initialProviderModelIds}
+        capacityEnabled
       />
     </QueryClientProvider>,
   );

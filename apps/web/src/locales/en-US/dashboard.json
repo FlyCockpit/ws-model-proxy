@@ -225,6 +225,9 @@
     "capacity": {
       "title": "Shared local capacity",
       "description": "Keep pools within the real concurrency and context limits of the runtime they share.",
+      "disabledReason": "Capacity management is disabled for this deployment. These controls are unavailable.",
+      "settingsLoading": "Deployment settings are still loading. Capacity controls are unavailable until they finish.",
+      "settingsFailed": "Could not load deployment settings. Capacity controls are unavailable until settings can be loaded.",
       "create": "Add capacity",
       "createTitle": "Configure shared capacity",
       "createDescription": "Identify one local runtime and set conservative physical limits. You can attach models after saving.",
@@ -483,6 +486,7 @@
     "editDescription": "Update the pool slug, display name, description, or media transformer.",
     "editMemberDescription": "Change member routing controls.",
     "editMemberTitle": "Edit pool member",
+    "editPool": "Edit {{pool}}",
     "editTitle": "Edit pool",
     "email": "Email",
     "empty": "No model pools yet.",

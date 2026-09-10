@@ -12,6 +12,7 @@ import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Context } from "../context";
+import { buildModelApiTokenAllowlistEntries } from "../lib/model-api-token-allowlist";
 
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
@@ -294,15 +295,10 @@ describe("modelApiTokensRouter", () => {
         }),
       ).toBe(true);
       expect(createCall.data.AllowlistEntries.create).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            target: "DIRECT_MODEL",
-            discoveredModelId: "direct-model-id",
-            ExecutionTarget: { connect: { discoveredModelId: "direct-model-id" } },
-          }),
-          { target: "MODEL_POOL", modelPoolId: "owned-pool-id" },
-          { target: "MODEL_POOL", modelPoolId: "granted-pool-id" },
-        ]),
+        buildModelApiTokenAllowlistEntries({
+          directModels: [{ id: "direct-model-id" }],
+          modelPools: [{ id: "owned-pool-id" }, { id: "granted-pool-id" }],
+        }),
       );
     });
 
