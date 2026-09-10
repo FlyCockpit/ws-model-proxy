@@ -119,6 +119,7 @@ export function GuardedPoolSetupWizard({
   initialStep = 0,
   initialProviderModelIds = [],
   capacityEnabled,
+  protocolAdaptationAvailable,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -126,6 +127,7 @@ export function GuardedPoolSetupWizard({
   initialStep?: 0 | 1 | 2 | 3;
   initialProviderModelIds?: string[];
   capacityEnabled: boolean;
+  protocolAdaptationAvailable: boolean;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
@@ -221,7 +223,7 @@ export function GuardedPoolSetupWizard({
           value.providerModelIds,
           candidates.data ?? [],
           value.providerTier,
-          value.protocolAdaptationEnabled,
+          protocolAdaptationAvailable && value.protocolAdaptationEnabled,
         )
       )
         ctx.addIssue({ code: "custom", path: ["recommendedSurface"] });
@@ -316,8 +318,11 @@ export function GuardedPoolSetupWizard({
           physicalCountStrategy: value.physicalCountStrategy,
           contextMargin: value.contextMargin,
           borrowPolicy: value.borrowPolicy,
-          protocolAdaptationEnabled: value.protocolAdaptationEnabled,
-          allowLossyDeveloperRoleCollapse: value.allowLossyDeveloperRoleCollapse,
+          protocolAdaptationEnabled: protocolAdaptationAvailable && value.protocolAdaptationEnabled,
+          allowLossyDeveloperRoleCollapse:
+            protocolAdaptationAvailable &&
+            value.protocolAdaptationEnabled &&
+            value.allowLossyDeveloperRoleCollapse,
           affinity: {
             enabled: value.affinityEnabled,
             ttlSeconds: value.affinityTtlSeconds,
@@ -536,7 +541,8 @@ export function GuardedPoolSetupWizard({
                                 const recommended = recommendedPrimarySurface(
                                   next,
                                   directModels,
-                                  form.state.values.protocolAdaptationEnabled,
+                                  protocolAdaptationAvailable &&
+                                    form.state.values.protocolAdaptationEnabled,
                                 );
                                 if (recommended)
                                   form.setFieldValue("recommendedSurface", recommended);
@@ -717,49 +723,82 @@ export function GuardedPoolSetupWizard({
                   ))}
                 </div>
                 <div className="mt-4 space-y-3">
-                  {(
-                    [
-                      "protocolAdaptationEnabled",
-                      "allowLossyDeveloperRoleCollapse",
-                      "affinityEnabled",
-                    ] as const
-                  ).map((name) => (
-                    <form.Field key={name} name={name}>
-                      {(field) => (
-                        <label className="flex min-h-11 items-start gap-3 py-2">
-                          <Checkbox
-                            id={`guarded-${name}`}
-                            checked={field.state.value}
-                            onCheckedChange={(checked) => {
-                              const enabled = checked === true;
-                              field.handleChange(enabled);
-                              if (name === "protocolAdaptationEnabled") {
-                                const recommended = recommendedPrimarySurface(
-                                  form.state.values.localModelIds,
-                                  directModels,
-                                  enabled,
+                  <form.Field name="protocolAdaptationEnabled">
+                    {(field) => (
+                      <label className="flex min-h-11 items-start gap-3 py-2">
+                        <Checkbox
+                          id="guarded-protocolAdaptationEnabled"
+                          checked={field.state.value}
+                          disabled={!protocolAdaptationAvailable}
+                          onCheckedChange={(checked) => {
+                            const enabled = checked === true;
+                            field.handleChange(enabled);
+                            if (!enabled)
+                              form.setFieldValue("allowLossyDeveloperRoleCollapse", false);
+                            const recommended = recommendedPrimarySurface(
+                              form.state.values.localModelIds,
+                              directModels,
+                              protocolAdaptationAvailable && enabled,
+                            );
+                            if (recommended) form.setFieldValue("recommendedSurface", recommended);
+                            setStepErrors((current) => {
+                              const next = { ...current };
+                              if (recommended) delete next.recommendedSurface;
+                              else
+                                next.recommendedSurface = t(
+                                  "dashboard:pools.wizard.errors.recommendedSurface",
                                 );
-                                if (recommended)
-                                  form.setFieldValue("recommendedSurface", recommended);
-                                setStepErrors((current) => {
-                                  const next = { ...current };
-                                  if (recommended) delete next.recommendedSurface;
-                                  else
-                                    next.recommendedSurface = t(
-                                      "dashboard:pools.wizard.errors.recommendedSurface",
-                                    );
-                                  return next;
-                                });
-                              }
-                            }}
-                          />
-                          <span className="text-sm" id={`guarded-${name}-label`}>
-                            {t(`dashboard:pools.wizard.fields.${name}`)}
-                          </span>
-                        </label>
-                      )}
-                    </form.Field>
-                  ))}
+                              return next;
+                            });
+                          }}
+                        />
+                        <span className="text-sm" id="guarded-protocolAdaptationEnabled-label">
+                          {t("dashboard:pools.wizard.fields.protocolAdaptationEnabled")}
+                        </span>
+                      </label>
+                    )}
+                  </form.Field>
+                  {!protocolAdaptationAvailable ? (
+                    <p className="text-xs text-muted-foreground">
+                      {t("dashboard:pools.protocolAdaptationDisabledReason")}
+                    </p>
+                  ) : null}
+                  <form.Subscribe selector={(state) => state.values.protocolAdaptationEnabled}>
+                    {(protocolAdaptationEnabled) => (
+                      <form.Field name="allowLossyDeveloperRoleCollapse">
+                        {(field) => (
+                          <label className="flex min-h-11 items-start gap-3 py-2">
+                            <Checkbox
+                              id="guarded-allowLossyDeveloperRoleCollapse"
+                              checked={field.state.value}
+                              disabled={!protocolAdaptationAvailable || !protocolAdaptationEnabled}
+                              onCheckedChange={(checked) => field.handleChange(checked === true)}
+                            />
+                            <span
+                              className="text-sm"
+                              id="guarded-allowLossyDeveloperRoleCollapse-label"
+                            >
+                              {t("dashboard:pools.wizard.fields.allowLossyDeveloperRoleCollapse")}
+                            </span>
+                          </label>
+                        )}
+                      </form.Field>
+                    )}
+                  </form.Subscribe>
+                  <form.Field name="affinityEnabled">
+                    {(field) => (
+                      <label className="flex min-h-11 items-start gap-3 py-2">
+                        <Checkbox
+                          id="guarded-affinityEnabled"
+                          checked={field.state.value}
+                          onCheckedChange={(checked) => field.handleChange(checked === true)}
+                        />
+                        <span className="text-sm" id="guarded-affinityEnabled-label">
+                          {t("dashboard:pools.wizard.fields.affinityEnabled")}
+                        </span>
+                      </label>
+                    )}
+                  </form.Field>
                 </div>
                 <div
                   className="mt-5 min-w-0 space-y-4"
@@ -885,7 +924,8 @@ export function GuardedPoolSetupWizard({
                                   next,
                                   candidates.data ?? [],
                                   form.state.values.providerTier,
-                                  form.state.values.protocolAdaptationEnabled,
+                                  protocolAdaptationAvailable &&
+                                    form.state.values.protocolAdaptationEnabled,
                                 );
                                 if (recommended)
                                   form.setFieldValue("recommendedSurface", recommended);
@@ -973,7 +1013,8 @@ export function GuardedPoolSetupWizard({
                           form.state.values.providerModelIds,
                           candidates.data ?? [],
                           tier,
-                          form.state.values.protocolAdaptationEnabled,
+                          protocolAdaptationAvailable &&
+                            form.state.values.protocolAdaptationEnabled,
                         );
                         if (recommended) form.setFieldValue("recommendedSurface", recommended);
                       }}

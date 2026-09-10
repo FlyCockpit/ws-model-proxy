@@ -111,7 +111,7 @@ const models = [
   },
 ];
 
-function mount(open = true) {
+function mount(open = true, protocolAdaptationAvailable = true, initialStep: 0 | 1 | 2 | 3 = 0) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const view = render(
     <QueryClientProvider client={client}>
@@ -120,6 +120,8 @@ function mount(open = true) {
         onOpenChange={() => undefined}
         directModels={models}
         capacityEnabled
+        protocolAdaptationAvailable={protocolAdaptationAvailable}
+        initialStep={initialStep}
       />
     </QueryClientProvider>,
   );
@@ -135,6 +137,41 @@ afterEach(() => {
 });
 
 describe("GuardedPoolSetupWizard mounted workflow", () => {
+  it("keeps affinity available when protocol adaptation is disabled by deployment", () => {
+    mount(true, false, 1);
+
+    const adaptation = screen.getByRole("checkbox", {
+      name: "dashboard:pools.wizard.fields.protocolAdaptationEnabled",
+    });
+    const lossy = screen.getByRole("checkbox", {
+      name: "dashboard:pools.wizard.fields.allowLossyDeveloperRoleCollapse",
+    });
+    const affinity = screen.getByRole("checkbox", {
+      name: "dashboard:pools.wizard.fields.affinityEnabled",
+    });
+    expect(adaptation.getAttribute("aria-disabled")).toBe("true");
+    expect(lossy.getAttribute("aria-disabled")).toBe("true");
+    expect(affinity.getAttribute("aria-disabled")).toBeNull();
+    expect(screen.getByText("dashboard:pools.protocolAdaptationDisabledReason")).toBeTruthy();
+  });
+
+  it("enables lossy collapse after protocol adaptation is selected", async () => {
+    const user = userEvent.setup();
+    mount(true, true, 1);
+
+    const adaptation = screen.getByRole("checkbox", {
+      name: "dashboard:pools.wizard.fields.protocolAdaptationEnabled",
+    });
+    const lossy = screen.getByRole("checkbox", {
+      name: "dashboard:pools.wizard.fields.allowLossyDeveloperRoleCollapse",
+    });
+    expect(lossy.getAttribute("aria-disabled")).toBe("true");
+
+    await user.click(adaptation);
+
+    expect(lossy.getAttribute("aria-disabled")).toBeNull();
+  });
+
   it("does not fetch candidates or capacities while closed", async () => {
     mount(false);
 
@@ -157,6 +194,7 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
           onOpenChange={() => undefined}
           directModels={models}
           capacityEnabled
+          protocolAdaptationAvailable
         />
       </QueryClientProvider>,
     );

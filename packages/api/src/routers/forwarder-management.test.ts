@@ -12,7 +12,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Context } from "../context";
 import { forwarderManagementRouter } from "./forwarder-management";
 
-const testEnv = vi.hoisted(() => ({ WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true }));
+const testEnv = vi.hoisted(() => ({
+  WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
+  MODEL_API_PROTOCOL_ADAPTATION_ENABLED: true,
+}));
 
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
@@ -222,6 +225,7 @@ describe("forwarderManagementRouter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     testEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
+    testEnv.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = true;
     db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
       callback(db),
     );
@@ -351,6 +355,41 @@ describe("forwarderManagementRouter", () => {
       }),
     ).rejects.toBeDefined();
     expect(db.$transaction).not.toHaveBeenCalled();
+  });
+
+  it("rejects guarded lossy collapse when protocol adaptation is disabled", async () => {
+    await expect(
+      client().createGuardedModelPool({
+        slug: "guarded-invalid-protocol-policy",
+        name: "Guarded invalid protocol policy",
+        localModelIds: ["local-id"],
+        recommendedSurface: "OPENAI_RESPONSES",
+        memberConcurrencyLimit: 1,
+        memberContextCeiling: null,
+        reservedSlots: 0,
+        localWaitBudgetMs: 30_000,
+        publicEgressAcknowledged: false,
+        providerModels: [],
+        advanced: {
+          physicalCountStrategy: "ENGINE_REPORTED",
+          contextMargin: 0,
+          borrowPolicy: "WHEN_IDLE",
+          protocolAdaptationEnabled: false,
+          allowLossyDeveloperRoleCollapse: true,
+          affinity: {
+            enabled: false,
+            ttlSeconds: 3_600,
+            maxRecords: 10_000,
+            prefixWeight: 100,
+            conversationWeight: 150,
+            confirmedCacheWeight: 250,
+            loadPenaltyWeight: 100,
+          },
+          memberOverrides: [],
+        },
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.modelPool.findUnique).not.toHaveBeenCalled();
   });
 
   it("creates a guarded local pool without an implicit context ceiling or member override", async () => {
@@ -607,7 +646,7 @@ describe("forwarderManagementRouter", () => {
         physicalCountStrategy: "TEMPLATE_AWARE",
         contextMargin: 2_048,
         borrowPolicy: "NEVER",
-        protocolAdaptationEnabled: false,
+        protocolAdaptationEnabled: true,
         allowLossyDeveloperRoleCollapse: true,
         affinity: {
           enabled: true,
@@ -651,7 +690,7 @@ describe("forwarderManagementRouter", () => {
 
     expect(db.modelPool.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
-        protocolAdaptationEnabled: false,
+        protocolAdaptationEnabled: true,
         allowLossyDeveloperRoleCollapse: true,
         capacityContextMargin: 2_048,
         capacityBorrowPolicy: "NEVER",
@@ -1246,10 +1285,11 @@ describe("forwarderManagementRouter", () => {
   });
 
   it("creates and updates owned model pools without touching grant ids", async () => {
-    db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce({
-      id: "pool-id",
-      userId: "user-id",
-    });
+    db.modelPool.findUnique
+      .mockResolvedValueOnce(null)
+      .mockResolvedValue(
+        poolRow({ userId: "user-id", publicEgressEnabled: false, publicEgressAcknowledged: false }),
+      );
     db.modelPool.create.mockResolvedValue(poolRow());
     db.modelPool.update.mockResolvedValue(poolRow({ slug: "new-general" }));
 
@@ -1268,6 +1308,48 @@ describe("forwarderManagementRouter", () => {
       }),
     );
     expect(db.poolGrant.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("rejects lossy collapse without adaptation and resolves partial updates from the stored pool", async () => {
+    await expect(
+      client().createModelPool({
+        slug: "invalid-protocol-policy",
+        name: "Invalid protocol policy",
+        protocolAdaptationEnabled: false,
+        allowLossyDeveloperRoleCollapse: true,
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+
+    db.modelPool.findUnique.mockResolvedValue(
+      poolRow({
+        userId: "user-id",
+        publicEgressEnabled: false,
+        publicEgressAcknowledged: false,
+        protocolAdaptationEnabled: false,
+        allowLossyDeveloperRoleCollapse: false,
+      }),
+    );
+    await expect(
+      client().updateModelPool({ id: "pool-id", allowLossyDeveloperRoleCollapse: true }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.modelPool.update).not.toHaveBeenCalled();
+
+    db.modelPool.findUnique.mockResolvedValue(
+      poolRow({
+        userId: "user-id",
+        publicEgressEnabled: false,
+        publicEgressAcknowledged: false,
+        protocolAdaptationEnabled: true,
+        allowLossyDeveloperRoleCollapse: false,
+      }),
+    );
+    db.modelPool.update.mockResolvedValue(
+      poolRow({ protocolAdaptationEnabled: true, allowLossyDeveloperRoleCollapse: true }),
+    );
+    await expect(
+      client().updateModelPool({ id: "pool-id", allowLossyDeveloperRoleCollapse: true }),
+    ).resolves.toMatchObject({ allowLossyDeveloperRoleCollapse: true });
   });
 
   it("fails closed when enabling public egress without acknowledgement", async () => {
@@ -1550,6 +1632,51 @@ describe("forwarderManagementRouter", () => {
     });
   });
 
+  it("uses the deployment protocol gate for compatibility serialization", async () => {
+    testEnv.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = false;
+    db.modelPool.findMany.mockResolvedValue([
+      poolRow({
+        protocolAdaptationEnabled: true,
+        allowLossyDeveloperRoleCollapse: true,
+        PoolMembers: [
+          {
+            id: "member-id",
+            tier: "PRIMARY",
+            ExecutionTarget: null,
+            DiscoveredModel: {
+              id: "model-id",
+              upstreamModelId: "gpt-local",
+              capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+              capabilityOverrides: [],
+              capabilityOverrideMetadata: null,
+              User: { slug: "owner" },
+              Endpoint: {
+                id: "endpoint-id",
+                slug: "local",
+                capabilityMetadata: {
+                  version: 1,
+                  protocol: "openai-compatible",
+                  chatCompletions: { supported: true, streaming: true },
+                },
+                defaultCapabilities: [],
+                CliDevice: { slug: "desktop" },
+              },
+            },
+          },
+        ],
+      }),
+    ]);
+
+    const [result] = await client().listModelPools();
+
+    expect(result?.protocolAdaptationAvailable).toBe(false);
+    expect(result?.compatibility.surfaces.OPENAI_RESPONSES).toMatchObject({
+      adapted: 0,
+      unavailable: 1,
+    });
+    expect(result?.compatibility.warnings).not.toContain("developer_role_collapse_lossy");
+  });
+
   it("rejects legacy Completions as a recommended pool API", async () => {
     await expect(
       client().createModelPool({
@@ -1634,7 +1761,12 @@ describe("forwarderManagementRouter", () => {
     db.modelPool.findUnique
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce({ id: "pool-id", userId: "user-id" })
-      .mockResolvedValueOnce(null);
+      .mockResolvedValueOnce(
+        poolRow({ userId: "user-id", publicEgressEnabled: false, publicEgressAcknowledged: false }),
+      )
+      .mockResolvedValueOnce(
+        poolRow({ userId: "user-id", publicEgressEnabled: false, publicEgressAcknowledged: false }),
+      );
     db.modelPool.create.mockResolvedValue(poolRow({ slug: "gpt-4.1-mini" }));
     db.modelPool.update.mockResolvedValue(poolRow({ slug: "local.mixtral" }));
 

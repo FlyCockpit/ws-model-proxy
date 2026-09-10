@@ -299,6 +299,7 @@
     "allowLossyDeveloperRoleCollapse": "Allow lossy developer-role collapse",
     "compatibilityDetails": "Protocol compatibility matrix",
     "enableProtocolAdaptation": "Enable strict-subset protocol adaptation",
+    "protocolAdaptationDisabledReason": "Protocol translation is turned off for this deployment.",
     "lossyDeveloperRoleWarning": "Warning: developer instructions may be merged into the system role. Requests containing both roles remain rejected unless this is enabled.",
     "limitations": {
       "native_extensions_unavailable": "native extensions unavailable",
@@ -315,6 +316,8 @@
     "streaming": "streaming",
     "surfaceCounts": "{{native}} native · {{adapted}} adapted · {{unavailable}} unavailable",
     "surfaceTierCounts": "{{tier}}: {{native}} native · {{adapted}} adapted · {{unavailable}} unavailable",
+    "unavailableSurfaces_one": "{{count}} surface unavailable",
+    "unavailableSurfaces_other": "{{count}} surfaces unavailable",
     "warnings": {
       "adaptation_strict_subset": "Adaptation uses a strict subset",
       "developer_role_collapse_lossy": "Lossy developer-role collapse enabled",
@@ -771,6 +774,7 @@
       "replacementSecret": "Replacement secret",
       "upstreamModel": "Upstream model ID",
       "nativeSurface": "Native API surface",
+      "legacySurfaceGroup": "Legacy",
       "streaming": "Supports streaming",
       "anthropicVersion": "Anthropic protocol version",
       "anthropicBetas": "Allowed Anthropic betas (comma-separated)",

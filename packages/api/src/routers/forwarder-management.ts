@@ -97,6 +97,20 @@ const attachmentLimitSchema = z
   .nullable()
   .optional();
 
+function assertLossyDeveloperRoleCollapseRequiresAdaptation({
+  protocolAdaptationEnabled,
+  allowLossyDeveloperRoleCollapse,
+}: {
+  protocolAdaptationEnabled: boolean;
+  allowLossyDeveloperRoleCollapse: boolean;
+}): void {
+  if (allowLossyDeveloperRoleCollapse && !protocolAdaptationEnabled) {
+    throw new ORPCError("BAD_REQUEST", {
+      message: "Lossy developer-role collapse requires protocol adaptation to be enabled.",
+    });
+  }
+}
+
 function assertProviderEgressReleaseGate(): void {
   if (!env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED)
     throw new ORPCError("NOT_FOUND", {
@@ -699,6 +713,8 @@ function serializeCliDevice(row: CliDeviceRow, now: Date) {
 }
 
 function serializePool(row: ModelPoolRow) {
+  const protocolAdaptationAvailable = env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED;
+  const adaptationEnabled = row.protocolAdaptationEnabled && protocolAdaptationAvailable;
   const recommendedSurfaceOverride = parseModelApiSurface(row.recommendedSurfaceOverride);
   const memberCapabilities = (model: PoolMemberModelRow) =>
     resolveEffectiveCapabilityMetadata({
@@ -718,7 +734,7 @@ function serializePool(row: ModelPoolRow) {
         tier: member.tier,
         matrix: surfaceAvailabilityMatrix({
           capabilities: memberCapabilities(model),
-          adaptationEnabled: row.protocolAdaptationEnabled,
+          adaptationEnabled,
         }),
       };
     const provider = member.ExecutionTarget?.ProviderModel;
@@ -728,7 +744,7 @@ function serializePool(row: ModelPoolRow) {
         tier: member.tier,
         matrix: surfaceAvailabilityMatrix({
           capabilities: providerInventory,
-          adaptationEnabled: row.protocolAdaptationEnabled,
+          adaptationEnabled,
         }),
       };
     const native =
@@ -755,10 +771,7 @@ function serializePool(row: ModelPoolRow) {
         modelApiSurfaces.map((surface) => {
           const nativeSurface = nativeSurfaces.has(surfaceNames[surface]);
           const adapted =
-            !nativeSurface &&
-            row.protocolAdaptationEnabled &&
-            surface !== "OPENAI_COMPLETIONS" &&
-            adaptable;
+            !nativeSurface && adaptationEnabled && surface !== "OPENAI_COMPLETIONS" && adaptable;
           return [
             surface,
             {
@@ -846,6 +859,7 @@ function serializePool(row: ModelPoolRow) {
     maxAttachmentBytes: row.maxAttachmentBytes,
     optimisticBasicTranscription: row.optimisticBasicTranscription,
     protocolAdaptationEnabled: row.protocolAdaptationEnabled,
+    protocolAdaptationAvailable,
     publicEgressEnabled: row.publicEgressEnabled,
     publicEgressAcknowledged: row.publicEgressAcknowledged,
     allowLossyDeveloperRoleCollapse: row.allowLossyDeveloperRoleCollapse,
@@ -871,8 +885,10 @@ function serializePool(row: ModelPoolRow) {
       suggestedConnectionType: suggestedSurface,
       surfaces,
       warnings: [
-        ...(row.protocolAdaptationEnabled ? ["adaptation_strict_subset"] : []),
-        ...(row.allowLossyDeveloperRoleCollapse ? ["developer_role_collapse_lossy"] : []),
+        ...(adaptationEnabled ? ["adaptation_strict_subset"] : []),
+        ...(adaptationEnabled && row.allowLossyDeveloperRoleCollapse
+          ? ["developer_role_collapse_lossy"]
+          : []),
         ...(recommendedSurfaceOverride &&
         surfaces[recommendedSurfaceOverride].unavailable === row.PoolMembers.length
           ? ["recommended_surface_unavailable"]
@@ -939,7 +955,7 @@ function serializePool(row: ModelPoolRow) {
               declaredContextWindow: declaredContextWindow(memberCapabilities(model)),
               surfaces: surfaceAvailabilityMatrix({
                 capabilities: memberCapabilities(model),
-                adaptationEnabled: row.protocolAdaptationEnabled,
+                adaptationEnabled,
               }),
             }
           : null,
@@ -1497,6 +1513,10 @@ export const forwarderManagementRouter = {
     )
     .handler(async ({ input, context }) => {
       if (input.providerModels.length > 0) assertProviderEgressReleaseGate();
+      assertLossyDeveloperRoleCollapseRequiresAdaptation({
+        protocolAdaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
+        allowLossyDeveloperRoleCollapse: input.advanced?.allowLossyDeveloperRoleCollapse ?? false,
+      });
       const userId = context.session.user.id;
       await assertPoolSlugAvailable(input.slug, userId);
       const now = new Date();
@@ -1582,7 +1602,9 @@ export const forwarderManagementRouter = {
                     ? model.capabilityOverrides
                     : model.Endpoint.defaultCapabilities,
                 ),
-              adaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
+              adaptationEnabled:
+                (input.advanced?.protocolAdaptationEnabled ?? false) &&
+                env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
             }),
           ),
           ...providers
@@ -1590,7 +1612,9 @@ export const forwarderManagementRouter = {
             .map((provider) =>
               surfaceAvailabilityMatrix({
                 capabilities: parseOpenAiCompatibleCapabilities(provider.nativeCapabilities),
-                adaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
+                adaptationEnabled:
+                  (input.advanced?.protocolAdaptationEnabled ?? false) &&
+                  env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
               }),
             ),
         ];
@@ -2204,6 +2228,10 @@ export const forwarderManagementRouter = {
     .handler(async ({ input, context }) => {
       if (input.publicEgressEnabled === true || input.publicEgressAcknowledged === true)
         assertProviderEgressReleaseGate();
+      assertLossyDeveloperRoleCollapseRequiresAdaptation({
+        protocolAdaptationEnabled: input.protocolAdaptationEnabled ?? false,
+        allowLossyDeveloperRoleCollapse: input.allowLossyDeveloperRoleCollapse ?? false,
+      });
       if (
         input.capacityConcurrencyLimit != null &&
         (input.capacityReservedSlots ?? 0) > input.capacityConcurrencyLimit
@@ -2320,6 +2348,8 @@ export const forwarderManagementRouter = {
           transformerCacheMode: true,
           publicEgressEnabled: true,
           publicEgressAcknowledged: true,
+          protocolAdaptationEnabled: true,
+          allowLossyDeveloperRoleCollapse: true,
         },
       })) as {
         id: string;
@@ -2331,6 +2361,8 @@ export const forwarderManagementRouter = {
         transformerCacheMode: string;
         publicEgressEnabled: boolean;
         publicEgressAcknowledged: boolean;
+        protocolAdaptationEnabled: boolean;
+        allowLossyDeveloperRoleCollapse: boolean;
       } | null;
       if (!existing || existing.userId !== context.session.user.id) {
         throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
@@ -2466,89 +2498,113 @@ export const forwarderManagementRouter = {
         // clearing transformer — ok
       }
 
-      const row = (await prisma.modelPool.update({
-        where: { id: input.id },
-        data: {
-          ...(input.slug ? { slug: input.slug } : {}),
-          ...(input.name ? { name: input.name } : {}),
-          ...(input.description !== undefined ? { description: input.description } : {}),
-          ...(input.transformerDiscoveredModelId !== undefined
-            ? { transformerDiscoveredModelId: input.transformerDiscoveredModelId }
-            : {}),
-          ...(input.transformerSystemPrompt !== undefined
-            ? { transformerSystemPrompt: input.transformerSystemPrompt }
-            : {}),
-          ...(input.transformerImages !== undefined
-            ? { transformerImages: input.transformerImages }
-            : {}),
-          ...(input.transformerAudio !== undefined
-            ? { transformerAudio: input.transformerAudio }
-            : {}),
-          ...(input.transformerVideo !== undefined
-            ? { transformerVideo: input.transformerVideo }
-            : {}),
-          ...(input.transformerCacheMode !== undefined
-            ? { transformerCacheMode: input.transformerCacheMode }
-            : {}),
-          ...(input.transformerIncludePrimaryTools !== undefined
-            ? { transformerIncludePrimaryTools: input.transformerIncludePrimaryTools }
-            : {}),
-          ...(input.transformerMaxTools !== undefined
-            ? { transformerMaxTools: input.transformerMaxTools }
-            : {}),
-          ...(input.transformerMaxToolChars !== undefined
-            ? { transformerMaxToolChars: input.transformerMaxToolChars }
-            : {}),
-          ...(input.transformerTimeoutMs !== undefined
-            ? { transformerTimeoutMs: input.transformerTimeoutMs }
-            : {}),
-          ...(input.transformerMaxAssets !== undefined
-            ? { transformerMaxAssets: input.transformerMaxAssets }
-            : {}),
-          ...(input.maxAttachmentBytes !== undefined
-            ? { maxAttachmentBytes: input.maxAttachmentBytes }
-            : {}),
-          ...(input.optimisticBasicTranscription !== undefined
-            ? { optimisticBasicTranscription: input.optimisticBasicTranscription }
-            : {}),
-          ...(input.protocolAdaptationEnabled !== undefined
-            ? { protocolAdaptationEnabled: input.protocolAdaptationEnabled }
-            : {}),
-          ...(input.publicEgressEnabled !== undefined
-            ? { publicEgressEnabled: input.publicEgressEnabled }
-            : {}),
-          ...(input.publicEgressAcknowledged !== undefined
-            ? { publicEgressAcknowledged: input.publicEgressAcknowledged }
-            : {}),
-          ...(input.allowLossyDeveloperRoleCollapse !== undefined
-            ? { allowLossyDeveloperRoleCollapse: input.allowLossyDeveloperRoleCollapse }
-            : {}),
-          ...(input.recommendedSurfaceOverride !== undefined
-            ? { recommendedSurfaceOverride: input.recommendedSurfaceOverride }
-            : {}),
-          ...(input.affinityEnabled !== undefined
-            ? { affinityEnabled: input.affinityEnabled }
-            : {}),
-          ...(input.affinityTtlSeconds !== undefined
-            ? { affinityTtlSeconds: input.affinityTtlSeconds }
-            : {}),
-          ...(input.affinityMaxRecords !== undefined
-            ? { affinityMaxRecords: input.affinityMaxRecords }
-            : {}),
-          ...(input.affinityPrefixWeight !== undefined
-            ? { affinityPrefixWeight: input.affinityPrefixWeight }
-            : {}),
-          ...(input.affinityConversationWeight !== undefined
-            ? { affinityConversationWeight: input.affinityConversationWeight }
-            : {}),
-          ...(input.affinityConfirmedCacheWeight !== undefined
-            ? { affinityConfirmedCacheWeight: input.affinityConfirmedCacheWeight }
-            : {}),
-          ...(input.affinityLoadPenaltyWeight !== undefined
-            ? { affinityLoadPenaltyWeight: input.affinityLoadPenaltyWeight }
-            : {}),
-        },
-        select: poolSelect,
+      const row = (await runSerializableTransaction(async (tx) => {
+        const current = await tx.modelPool.findUnique({
+          where: { id: input.id },
+          select: {
+            userId: true,
+            protocolAdaptationEnabled: true,
+            allowLossyDeveloperRoleCollapse: true,
+          },
+        });
+        if (!current || current.userId !== context.session.user.id) {
+          throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+        }
+        if (
+          input.protocolAdaptationEnabled !== undefined ||
+          input.allowLossyDeveloperRoleCollapse !== undefined
+        ) {
+          assertLossyDeveloperRoleCollapseRequiresAdaptation({
+            protocolAdaptationEnabled:
+              input.protocolAdaptationEnabled ?? current.protocolAdaptationEnabled,
+            allowLossyDeveloperRoleCollapse:
+              input.allowLossyDeveloperRoleCollapse ?? current.allowLossyDeveloperRoleCollapse,
+          });
+        }
+        return tx.modelPool.update({
+          where: { id: input.id },
+          data: {
+            ...(input.slug ? { slug: input.slug } : {}),
+            ...(input.name ? { name: input.name } : {}),
+            ...(input.description !== undefined ? { description: input.description } : {}),
+            ...(input.transformerDiscoveredModelId !== undefined
+              ? { transformerDiscoveredModelId: input.transformerDiscoveredModelId }
+              : {}),
+            ...(input.transformerSystemPrompt !== undefined
+              ? { transformerSystemPrompt: input.transformerSystemPrompt }
+              : {}),
+            ...(input.transformerImages !== undefined
+              ? { transformerImages: input.transformerImages }
+              : {}),
+            ...(input.transformerAudio !== undefined
+              ? { transformerAudio: input.transformerAudio }
+              : {}),
+            ...(input.transformerVideo !== undefined
+              ? { transformerVideo: input.transformerVideo }
+              : {}),
+            ...(input.transformerCacheMode !== undefined
+              ? { transformerCacheMode: input.transformerCacheMode }
+              : {}),
+            ...(input.transformerIncludePrimaryTools !== undefined
+              ? { transformerIncludePrimaryTools: input.transformerIncludePrimaryTools }
+              : {}),
+            ...(input.transformerMaxTools !== undefined
+              ? { transformerMaxTools: input.transformerMaxTools }
+              : {}),
+            ...(input.transformerMaxToolChars !== undefined
+              ? { transformerMaxToolChars: input.transformerMaxToolChars }
+              : {}),
+            ...(input.transformerTimeoutMs !== undefined
+              ? { transformerTimeoutMs: input.transformerTimeoutMs }
+              : {}),
+            ...(input.transformerMaxAssets !== undefined
+              ? { transformerMaxAssets: input.transformerMaxAssets }
+              : {}),
+            ...(input.maxAttachmentBytes !== undefined
+              ? { maxAttachmentBytes: input.maxAttachmentBytes }
+              : {}),
+            ...(input.optimisticBasicTranscription !== undefined
+              ? { optimisticBasicTranscription: input.optimisticBasicTranscription }
+              : {}),
+            ...(input.protocolAdaptationEnabled !== undefined
+              ? { protocolAdaptationEnabled: input.protocolAdaptationEnabled }
+              : {}),
+            ...(input.publicEgressEnabled !== undefined
+              ? { publicEgressEnabled: input.publicEgressEnabled }
+              : {}),
+            ...(input.publicEgressAcknowledged !== undefined
+              ? { publicEgressAcknowledged: input.publicEgressAcknowledged }
+              : {}),
+            ...(input.allowLossyDeveloperRoleCollapse !== undefined
+              ? { allowLossyDeveloperRoleCollapse: input.allowLossyDeveloperRoleCollapse }
+              : {}),
+            ...(input.recommendedSurfaceOverride !== undefined
+              ? { recommendedSurfaceOverride: input.recommendedSurfaceOverride }
+              : {}),
+            ...(input.affinityEnabled !== undefined
+              ? { affinityEnabled: input.affinityEnabled }
+              : {}),
+            ...(input.affinityTtlSeconds !== undefined
+              ? { affinityTtlSeconds: input.affinityTtlSeconds }
+              : {}),
+            ...(input.affinityMaxRecords !== undefined
+              ? { affinityMaxRecords: input.affinityMaxRecords }
+              : {}),
+            ...(input.affinityPrefixWeight !== undefined
+              ? { affinityPrefixWeight: input.affinityPrefixWeight }
+              : {}),
+            ...(input.affinityConversationWeight !== undefined
+              ? { affinityConversationWeight: input.affinityConversationWeight }
+              : {}),
+            ...(input.affinityConfirmedCacheWeight !== undefined
+              ? { affinityConfirmedCacheWeight: input.affinityConfirmedCacheWeight }
+              : {}),
+            ...(input.affinityLoadPenaltyWeight !== undefined
+              ? { affinityLoadPenaltyWeight: input.affinityLoadPenaltyWeight }
+              : {}),
+          },
+          select: poolSelect,
+        });
       })) as ModelPoolRow;
       return serializePool(row);
     }),

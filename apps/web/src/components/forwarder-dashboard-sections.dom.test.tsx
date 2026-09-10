@@ -8,6 +8,7 @@ const state = vi.hoisted(() => ({
   providerEgressEnabled: false,
   providerOperationsMounts: 0,
   capacityEnabled: false as boolean | undefined,
+  protocolAdaptationAvailable: true,
   rejectMutation: null as string | null,
   mutationCalls: [] as string[],
   devices: [] as Array<Record<string, unknown>>,
@@ -56,6 +57,7 @@ vi.mock("@/utils/orpc", () => {
       appConfig: query("appConfig", () => ({
         capacityEnabled: state.capacityEnabled,
         providerEgressEnabled: state.providerEgressEnabled,
+        protocolAdaptationAvailable: state.protocolAdaptationAvailable,
       })),
       forwarderManagement: {
         key: () => ["forwarderManagement"],
@@ -88,7 +90,11 @@ vi.mock("@/utils/orpc", () => {
   };
 });
 
-import { PoolsSection } from "./forwarder-dashboard-sections";
+import {
+  PoolsSection,
+  unavailablePoolCompatibilitySurfaceCount,
+  visiblePoolCompatibilitySurfaces,
+} from "./forwarder-dashboard-sections";
 
 function mount() {
   return render(
@@ -120,15 +126,71 @@ describe("PoolsSection provider egress capability", () => {
   });
 });
 
+describe("pool compatibility display", () => {
+  const surfaces = {
+    OPENAI_CHAT_COMPLETIONS: { native: 1, adapted: 0 },
+    OPENAI_RESPONSES: { native: 0, adapted: 1 },
+    ANTHROPIC_MESSAGES: { native: 0, adapted: 0 },
+    OPENAI_COMPLETIONS: { native: 0, adapted: 0 },
+  };
+
+  it("hides unavailable legacy Completions while summarizing other unavailable surfaces", () => {
+    expect(visiblePoolCompatibilitySurfaces(surfaces, null).map(([surface]) => surface)).toEqual([
+      "OPENAI_CHAT_COMPLETIONS",
+      "OPENAI_RESPONSES",
+    ]);
+    expect(unavailablePoolCompatibilitySurfaceCount(surfaces, null)).toBe(1);
+  });
+
+  it("keeps legacy Completions visible for a stored legacy recommendation", () => {
+    expect(unavailablePoolCompatibilitySurfaceCount(surfaces, "OPENAI_COMPLETIONS")).toBe(2);
+  });
+});
+
 afterEach(() => {
   cleanup();
   state.capacityEnabled = false;
+  state.protocolAdaptationAvailable = true;
   state.rejectMutation = null;
   state.mutationCalls = [];
   state.devices = [];
   state.pools = [];
   toastState.success.mockReset();
   toastState.error.mockReset();
+});
+
+describe("PoolsSection protocol adaptation controls", () => {
+  it("enables lossy collapse after adaptation is selected", () => {
+    state.protocolAdaptationAvailable = true;
+    mount();
+
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.advancedCreate" }));
+
+    const adaptation = screen.getByLabelText("dashboard:pools.enableProtocolAdaptation");
+    const lossy = screen.getByLabelText("dashboard:pools.allowLossyDeveloperRoleCollapse");
+    expect((lossy as HTMLInputElement).disabled).toBe(true);
+
+    fireEvent.click(adaptation);
+
+    expect((lossy as HTMLInputElement).disabled).toBe(false);
+  });
+
+  it("disables protocol controls and explains the deployment setting", () => {
+    state.protocolAdaptationAvailable = false;
+    mount();
+
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.advancedCreate" }));
+
+    expect(
+      (screen.getByLabelText("dashboard:pools.enableProtocolAdaptation") as HTMLInputElement)
+        .disabled,
+    ).toBe(true);
+    expect(
+      (screen.getByLabelText("dashboard:pools.allowLossyDeveloperRoleCollapse") as HTMLInputElement)
+        .disabled,
+    ).toBe(true);
+    expect(screen.getByText("dashboard:pools.protocolAdaptationDisabledReason")).toBeTruthy();
+  });
 });
 
 const memberPool = {

@@ -38,6 +38,20 @@ function notFound(): never {
   throw new ORPCError("NOT_FOUND", { message: "Capacity resource not found." });
 }
 
+function assertLossyDeveloperRoleCollapseRequiresAdaptation({
+  protocolAdaptationEnabled,
+  allowLossyDeveloperRoleCollapse,
+}: {
+  protocolAdaptationEnabled: boolean;
+  allowLossyDeveloperRoleCollapse: boolean;
+}): void {
+  if (allowLossyDeveloperRoleCollapse && !protocolAdaptationEnabled) {
+    throw new ORPCError("BAD_REQUEST", {
+      message: "Lossy developer-role collapse requires protocol adaptation to be enabled.",
+    });
+  }
+}
+
 async function capacityTransaction<T>(
   work: (tx: Prisma.TransactionClient) => Promise<T>,
   _options?: { isolationLevel: "Serializable" },
@@ -541,6 +555,17 @@ export const capacityManagementRouter = {
             },
           });
           if (!pool || pool.userId !== userId) return notFound();
+          if (
+            input.protocolAdaptationEnabled !== undefined ||
+            input.allowLossyDeveloperRoleCollapse !== undefined
+          ) {
+            assertLossyDeveloperRoleCollapseRequiresAdaptation({
+              protocolAdaptationEnabled:
+                input.protocolAdaptationEnabled ?? pool.protocolAdaptationEnabled,
+              allowLossyDeveloperRoleCollapse:
+                input.allowLossyDeveloperRoleCollapse ?? pool.allowLossyDeveloperRoleCollapse,
+            });
+          }
           for (const member of pool.PoolMembers ?? []) {
             assertEffectiveConcurrencyPolicy({
               hardLimit: member.ExecutionTarget?.InferenceCapacity?.hardConcurrencyLimit,

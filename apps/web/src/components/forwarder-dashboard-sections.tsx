@@ -103,6 +103,32 @@ export function resolveCapacityAvailability(
   return "loading";
 }
 
+export function visiblePoolCompatibilitySurfaces<
+  Availability extends { native: number; adapted: number },
+>(surfaces: Record<string, Availability>, recommendedSurfaceOverride: string | null) {
+  return Object.entries(surfaces).filter(
+    ([surface, availability]) =>
+      (surface !== "OPENAI_COMPLETIONS" ||
+        availability.native > 0 ||
+        recommendedSurfaceOverride === "OPENAI_COMPLETIONS") &&
+      (availability.native > 0 || availability.adapted > 0),
+  ) as Array<[string, Availability]>;
+}
+
+export function unavailablePoolCompatibilitySurfaceCount(
+  surfaces: Record<string, { native: number; adapted: number }>,
+  recommendedSurfaceOverride: string | null,
+) {
+  return Object.entries(surfaces).filter(
+    ([surface, availability]) =>
+      (surface !== "OPENAI_COMPLETIONS" ||
+        availability.native > 0 ||
+        recommendedSurfaceOverride === "OPENAI_COMPLETIONS") &&
+      availability.native === 0 &&
+      availability.adapted === 0,
+  ).length;
+}
+
 function capacityUnavailableReasonKey(availability: CapacityAvailability) {
   if (availability === "loading") return "dashboard:pools.capacity.settingsLoading";
   if (availability === "error") return "dashboard:pools.capacity.settingsFailed";
@@ -1847,6 +1873,7 @@ export function PoolsSection() {
                   mode="create"
                   capacities={capacitiesData ?? []}
                   capacityAvailability={capacityAvailability}
+                  protocolAdaptationAvailable={appConfig?.protocolAdaptationAvailable ?? false}
                   onSuccess={() => setCreateOpen(false)}
                 />
               </DialogContent>
@@ -1859,6 +1886,7 @@ export function PoolsSection() {
         onOpenChange={setWizardOpen}
         directModels={directModels}
         capacityEnabled={capacityEnabled}
+        protocolAdaptationAvailable={appConfig?.protocolAdaptationAvailable ?? false}
       />
 
       {shouldShowCapacitySection(capacityEnabled, capacitiesLoading, capacitiesData) ? (
@@ -2018,39 +2046,55 @@ export function PoolsSection() {
                       {t("dashboard:pools.compatibilityDetails")}
                     </summary>
                     <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                      {Object.entries(pool.compatibility.surfaces).map(
-                        ([surface, availability]) => (
-                          <div key={surface} className="rounded border p-2">
-                            <div className="font-medium">{surface}</div>
-                            <div className="mt-1 text-muted-foreground">
-                              {t("dashboard:pools.surfaceCounts", availability)}
-                              {availability.streaming ? ` · ${t("dashboard:pools.streaming")}` : ""}
-                            </div>
-                            <div className="mt-1 text-muted-foreground">
-                              {t("dashboard:pools.surfaceTierCounts", {
-                                tier: t("dashboard:pools.memberTiers.PRIMARY"),
-                                ...availability.primary,
-                              })}
-                            </div>
+                      {visiblePoolCompatibilitySurfaces(
+                        pool.compatibility.surfaces,
+                        pool.recommendedSurfaceOverride,
+                      ).map(([surface, availability]) => (
+                        <div key={surface} className="rounded border p-2">
+                          <div className="font-medium">
+                            {t(`dashboard:connectionTypes.${surface}`)}
+                          </div>
+                          <div className="mt-1 text-muted-foreground">
+                            {t("dashboard:pools.surfaceCounts", availability)}
+                            {availability.streaming ? ` · ${t("dashboard:pools.streaming")}` : ""}
+                          </div>
+                          <div className="mt-1 text-muted-foreground">
+                            {t("dashboard:pools.surfaceTierCounts", {
+                              tier: t("dashboard:pools.memberTiers.PRIMARY"),
+                              ...availability.primary,
+                            })}
+                          </div>
+                          {pool.members.some((member) => member.tier === "PUBLIC_OVERFLOW") ? (
                             <div className="text-muted-foreground">
                               {t("dashboard:pools.surfaceTierCounts", {
                                 tier: t("dashboard:pools.memberTiers.PUBLIC_OVERFLOW"),
                                 ...availability.publicOverflow,
                               })}
                             </div>
-                            {availability.limitations.length > 0 ? (
-                              <div className="mt-1 break-words text-muted-foreground">
-                                {availability.limitations
-                                  .map((limitation) =>
-                                    t(`dashboard:pools.limitations.${limitation}`),
-                                  )
-                                  .join(", ")}
-                              </div>
-                            ) : null}
-                          </div>
-                        ),
-                      )}
+                          ) : null}
+                          {availability.limitations.length > 0 ? (
+                            <div className="mt-1 break-words text-muted-foreground">
+                              {availability.limitations
+                                .map((limitation) => t(`dashboard:pools.limitations.${limitation}`))
+                                .join(", ")}
+                            </div>
+                          ) : null}
+                        </div>
+                      ))}
                     </div>
+                    {unavailablePoolCompatibilitySurfaceCount(
+                      pool.compatibility.surfaces,
+                      pool.recommendedSurfaceOverride,
+                    ) > 0 ? (
+                      <p className="mt-2 text-muted-foreground">
+                        {t("dashboard:pools.unavailableSurfaces", {
+                          count: unavailablePoolCompatibilitySurfaceCount(
+                            pool.compatibility.surfaces,
+                            pool.recommendedSurfaceOverride,
+                          ),
+                        })}
+                      </p>
+                    ) : null}
                   </details>
                   {pool.transformer.model ? (
                     <p className="mt-2 text-sm text-muted-foreground">
@@ -2209,8 +2253,10 @@ export function PoolsSection() {
                                         member.model?.surfaces ?? member.providerModel!.surfaces,
                                       ).map(([surface, availability]) => (
                                         <p key={surface} className="break-words">
-                                          <span className="font-medium">{surface}</span>:{" "}
-                                          {availability.mode}
+                                          <span className="font-medium">
+                                            {t(`dashboard:connectionTypes.${surface}`)}
+                                          </span>
+                                          : {availability.mode}
                                           {availability.limitations.length
                                             ? ` · ${availability.limitations.map((item) => t(`dashboard:pools.limitations.${item}`)).join(", ")}`
                                             : ""}
@@ -2530,6 +2576,7 @@ export function PoolsSection() {
                 directModels={directModels}
                 capacities={capacitiesData ?? []}
                 capacityAvailability={capacityAvailability}
+                protocolAdaptationAvailable={appConfig?.protocolAdaptationAvailable ?? false}
                 onSuccess={() => setEditingPool(null)}
               />
             ) : null}
@@ -2913,6 +2960,7 @@ function PoolForm({
   directModels = [],
   capacities = [],
   capacityAvailability,
+  protocolAdaptationAvailable,
 }: {
   mode: "create" | "edit";
   pool?: ModelPool;
@@ -2920,6 +2968,7 @@ function PoolForm({
   directModels?: ReturnType<typeof allDirectModels>;
   capacities?: CapacityRow[];
   capacityAvailability: CapacityAvailability;
+  protocolAdaptationAvailable: boolean;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
   const capacityEnabled = capacityAvailability === "enabled";
@@ -3034,7 +3083,8 @@ function PoolForm({
           : "",
       optimisticBasicTranscription: pool?.optimisticBasicTranscription ?? false,
       protocolAdaptationEnabled: pool?.protocolAdaptationEnabled ?? false,
-      allowLossyDeveloperRoleCollapse: pool?.allowLossyDeveloperRoleCollapse ?? false,
+      allowLossyDeveloperRoleCollapse:
+        pool?.protocolAdaptationEnabled === true ? pool.allowLossyDeveloperRoleCollapse : false,
       recommendedSurfaceOverride: poolSurfaceOverrideValue(pool?.recommendedSurfaceOverride),
       capacityPriority: pool?.capacityPriority ?? 16,
       capacityConcurrencyMode: (pool?.capacityConcurrencyLimit === null
@@ -3238,35 +3288,50 @@ function PoolForm({
         </form.Field>
         <form.Field name="protocolAdaptationEnabled">
           {(field) => (
-            <label className="flex min-h-11 items-center gap-3 text-sm">
+            <label className="flex min-h-11 items-center gap-3 text-sm disabled:cursor-not-allowed">
               <input
                 type="checkbox"
                 className="size-4"
                 checked={field.state.value}
-                onChange={(event) => field.handleChange(event.target.checked)}
+                disabled={!protocolAdaptationAvailable}
+                onChange={(event) => {
+                  const enabled = event.target.checked;
+                  field.handleChange(enabled);
+                  if (!enabled) form.setFieldValue("allowLossyDeveloperRoleCollapse", false);
+                }}
               />
               {t("dashboard:pools.enableProtocolAdaptation")}
             </label>
           )}
         </form.Field>
-        <form.Field name="allowLossyDeveloperRoleCollapse">
-          {(field) => (
-            <div>
-              <label className="flex min-h-11 items-center gap-3 text-sm">
-                <input
-                  type="checkbox"
-                  className="size-4"
-                  checked={field.state.value}
-                  onChange={(event) => field.handleChange(event.target.checked)}
-                />
-                {t("dashboard:pools.allowLossyDeveloperRoleCollapse")}
-              </label>
-              <p className="text-xs text-destructive">
-                {t("dashboard:pools.lossyDeveloperRoleWarning")}
-              </p>
-            </div>
+        {!protocolAdaptationAvailable ? (
+          <p className="text-xs text-muted-foreground">
+            {t("dashboard:pools.protocolAdaptationDisabledReason")}
+          </p>
+        ) : null}
+        <form.Subscribe selector={(state) => state.values.protocolAdaptationEnabled}>
+          {(protocolAdaptationEnabled) => (
+            <form.Field name="allowLossyDeveloperRoleCollapse">
+              {(field) => (
+                <div>
+                  <label className="flex min-h-11 items-center gap-3 text-sm disabled:cursor-not-allowed">
+                    <input
+                      type="checkbox"
+                      className="size-4"
+                      checked={field.state.value}
+                      disabled={!protocolAdaptationAvailable || !protocolAdaptationEnabled}
+                      onChange={(event) => field.handleChange(event.target.checked)}
+                    />
+                    {t("dashboard:pools.allowLossyDeveloperRoleCollapse")}
+                  </label>
+                  <p className="text-xs text-destructive">
+                    {t("dashboard:pools.lossyDeveloperRoleWarning")}
+                  </p>
+                </div>
+              )}
+            </form.Field>
           )}
-        </form.Field>
+        </form.Subscribe>
       </div>
 
       <details className="rounded-md border p-3">

@@ -105,6 +105,7 @@ function renderStep(initialStep: 0 | 1 | 2 | 3, initialProviderModelIds: string[
         onOpenChange={() => undefined}
         directModels={[localModel]}
         initialStep={initialStep}
+        protocolAdaptationAvailable
         initialProviderModelIds={initialProviderModelIds}
         capacityEnabled
       />
