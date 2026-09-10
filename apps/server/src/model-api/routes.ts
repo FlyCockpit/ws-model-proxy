@@ -301,9 +301,24 @@ function operationFailureResponse(
   );
 }
 
-function contextExceededResponse(operation: Pick<RelayOperation, "family">, message: string) {
+type ContextExceededDetails = {
+  estimatedInputTokens: number;
+  estimateMethod: ContextCountTelemetry["method"];
+  contextMarginTokens: number;
+  effectiveContextCeilingTokens: number;
+};
+
+function contextExceededResponse(
+  operation: Pick<RelayOperation, "family">,
+  message: string,
+  details: ContextExceededDetails,
+) {
   if (operation.family === "messages") {
-    return anthropicErrorResponse(400, message, "invalid_request_error");
+    return anthropicErrorResponse(
+      400,
+      `${message} Estimated input tokens: ${details.estimatedInputTokens}; estimate method: ${details.estimateMethod}; context margin: ${details.contextMarginTokens}; effective context ceiling: ${details.effectiveContextCeilingTokens}.`,
+      "invalid_request_error",
+    );
   }
   return new Response(
     JSON.stringify({
@@ -312,10 +327,21 @@ function contextExceededResponse(operation: Pick<RelayOperation, "family">, mess
         type: "invalid_request_error",
         param: null,
         code: "context_exceeded",
+        details,
       },
     }),
     { status: 400, headers: { "content-type": "application/json; charset=utf-8" } },
   );
+}
+
+function effectiveContextCeilingTokens(
+  physicalMaxContext: number | null | undefined,
+  configuredContextCeiling: number | null | undefined,
+): number | null {
+  const ceilings = [physicalMaxContext, configuredContextCeiling].filter(
+    (ceiling): ceiling is number => ceiling !== null && ceiling !== undefined,
+  );
+  return ceilings.length === 0 ? null : Math.min(...ceilings);
 }
 
 function responseBodyForOperation({
@@ -3366,6 +3392,15 @@ async function relayDirect({
       return contextExceededResponse(
         operation,
         "Request context exceeds the configured execution capacity ceiling.",
+        {
+          estimatedInputTokens: operation.contextCount.tokens,
+          estimateMethod: operation.contextCount.method,
+          contextMarginTokens: identity.directContextMargin ?? 0,
+          effectiveContextCeilingTokens: effectiveContextCeilingTokens(
+            identity.InferenceCapacity?.physicalMaxContext,
+            identity.directContextCeiling,
+          )!,
+        },
       );
     }
     try {
@@ -4189,21 +4224,22 @@ async function relayPool({
       }),
     );
   }
+  const configuredContextCeilingForMember = (member: PoolMemberRelayRow) =>
+    member.capacityContextCeilingMode === "UNLIMITED"
+      ? null
+      : member.capacityContextCeilingMode === "LIMITED" ||
+          (member.capacityContextCeilingMode === undefined && member.capacityContextCeiling != null)
+        ? member.capacityContextCeiling
+        : member.ModelPool?.capacityContextCeiling;
+  const contextMarginForMember = (member: PoolMemberRelayRow) =>
+    member.capacityContextMargin ?? member.ModelPool?.capacityContextMargin ?? 0;
   const contextEligibleMembers = operation.contextCount
     ? members.filter((member) =>
         contextFitsLimits({
           count: nativeCounts.get(member.id) ?? operation.contextCount!,
           physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
-          effectiveContextCeiling:
-            member.capacityContextCeilingMode === "UNLIMITED"
-              ? null
-              : member.capacityContextCeilingMode === "LIMITED" ||
-                  (member.capacityContextCeilingMode === undefined &&
-                    member.capacityContextCeiling != null)
-                ? member.capacityContextCeiling
-                : member.ModelPool?.capacityContextCeiling,
-          contextMargin:
-            member.capacityContextMargin ?? member.ModelPool?.capacityContextMargin ?? 0,
+          effectiveContextCeiling: configuredContextCeilingForMember(member),
+          contextMargin: contextMarginForMember(member),
         }),
       )
     : members;
@@ -4386,6 +4422,36 @@ async function relayPool({
     return contextExceededResponse(
       operation,
       "Request context exceeds every compatible pool member ceiling.",
+      (() => {
+        const reportedMember = members
+          .map((member) => ({
+            ceiling: effectiveContextCeilingTokens(
+              member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+              configuredContextCeilingForMember(member),
+            ),
+            margin: contextMarginForMember(member),
+            count: nativeCounts.get(member.id) ?? operation.contextCount!,
+          }))
+          .filter(
+            (
+              candidate,
+            ): candidate is {
+              ceiling: number;
+              margin: number;
+              count: ContextCountTelemetry;
+            } => candidate.ceiling !== null,
+          )
+          .sort((left, right) => right.ceiling - right.margin - (left.ceiling - left.margin))[0];
+        if (!reportedMember) {
+          throw new Error("A context-rejected pool member must have a finite context ceiling.");
+        }
+        return {
+          estimatedInputTokens: reportedMember.count.tokens,
+          estimateMethod: reportedMember.count.method,
+          contextMarginTokens: reportedMember.margin,
+          effectiveContextCeilingTokens: reportedMember.ceiling,
+        };
+      })(),
     );
   }
   if (eligibleMembers.length === 0 && providerPrimaryTargets.length === 0) {

@@ -67,6 +67,7 @@ vi.mock("@ws-model-proxy/api/lib/model-api-token-access", () => ({
 }));
 
 const { captureProviderResponseBinding, createModelApiRoutes } = await import("./routes.js");
+const { contextCounterRegistry } = await import("./capacity/counter-registry.js");
 const { MODEL_API_MAX_REQUEST_BODY_BYTES, ModelApiConcurrencyLimiter } = await import(
   "./limits.js"
 );
@@ -269,9 +270,9 @@ function directRow({
   endpointCapabilityMetadata,
   optimisticBasicTranscription = false,
   physicalMaxContext,
+  countStrategy,
   directContextCeiling,
   directContextMargin = 0,
-  countStrategy,
 }: {
   id?: string;
   upstreamModelId?: string;
@@ -287,9 +288,9 @@ function directRow({
   endpointCapabilityMetadata?: Record<string, unknown> | null;
   optimisticBasicTranscription?: boolean;
   physicalMaxContext?: number;
+  countStrategy?: "TOKENIZER" | "TEMPLATE_AWARE" | "ENGINE_REPORTED" | "CONSERVATIVE_ESTIMATE";
   directContextCeiling?: number;
   directContextMargin?: number;
-  countStrategy?: "TOKENIZER" | "TEMPLATE_AWARE" | "ENGINE_REPORTED" | "CONSERVATIVE_ESTIMATE";
 } = {}) {
   return {
     id,
@@ -368,11 +369,15 @@ function poolMemberRow({
   connected = true,
   capabilityOverrideMetadata = null,
   physicalMaxContext,
+  capacityContextCeilingMode,
   capacityContextCeiling,
   capacityContextMargin = 0,
+  poolContextCeiling = null,
+  poolContextMargin = 0,
   capacityWaitBudgetMode,
   capacityWaitBudgetMs,
   affinityEnabled = false,
+  countStrategy,
 }: {
   id: string;
   discoveredModelId: string;
@@ -384,11 +389,15 @@ function poolMemberRow({
   connected?: boolean;
   capabilityOverrideMetadata?: Record<string, unknown> | null;
   physicalMaxContext?: number;
+  capacityContextCeilingMode?: "INHERIT" | "LIMITED" | "UNLIMITED";
   capacityContextCeiling?: number;
-  capacityContextMargin?: number;
+  capacityContextMargin?: number | null;
+  poolContextCeiling?: number | null;
+  poolContextMargin?: number;
   capacityWaitBudgetMode?: "INHERIT" | "LIMITED" | "UNLIMITED";
   capacityWaitBudgetMs?: number | null;
   affinityEnabled?: boolean;
+  countStrategy?: "TOKENIZER" | "TEMPLATE_AWARE" | "ENGINE_REPORTED" | "CONSERVATIVE_ESTIMATE";
 }) {
   return {
     id,
@@ -403,10 +412,13 @@ function poolMemberRow({
     nextRetryAt: null,
     halfOpenTrialStartedAt: null,
     capacityContextCeiling,
+    capacityContextCeilingMode,
     capacityContextMargin,
     capacityWaitBudgetMode,
     capacityWaitBudgetMs,
     ModelPool: {
+      capacityContextCeiling: poolContextCeiling,
+      capacityContextMargin: poolContextMargin,
       capacityWaitBudgetMs: 30_000,
       affinityEnabled,
       affinityTtlSeconds: 3600,
@@ -420,13 +432,13 @@ function poolMemberRow({
       id: `${id}-target`,
       inferenceCapacityId: `${id}-capacity`,
       InferenceCapacity:
-        physicalMaxContext === undefined && !affinityEnabled
+        physicalMaxContext === undefined && !affinityEnabled && countStrategy === undefined
           ? null
           : {
               id: `${id}-capacity`,
               hardConcurrencyLimit: 4,
               physicalMaxContext: physicalMaxContext ?? null,
-              countStrategy: "CONSERVATIVE_ESTIMATE",
+              countStrategy: countStrategy ?? "CONSERVATIVE_ESTIMATE",
               runtimeIdentityKey: `${id}-runtime-key`,
               runtimeModel: upstreamModelId,
               runtimeRevision: "revision",
@@ -4372,6 +4384,12 @@ describe("model API routes", () => {
       error: {
         code: "context_exceeded",
         message: expect.stringContaining("context exceeds"),
+        details: {
+          estimatedInputTokens: expect.any(Number),
+          estimateMethod: "TOKEN_ESTIMATE",
+          contextMarginTokens: 0,
+          effectiveContextCeilingTokens: 1,
+        },
       },
     });
     expect(capacityRuntime.acquire).not.toHaveBeenCalled();
@@ -4388,6 +4406,216 @@ describe("model API routes", () => {
         }),
       }),
     );
+  });
+
+  it("appends context accounting numbers to Anthropic context-exceeded messages", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({
+        directContextCeiling: 1,
+        countStrategy: "CONSERVATIVE_ESTIMATE",
+        endpointCapabilityMetadata: {
+          version: 3,
+          protocol: "anthropic-compatible",
+          surfaces: {
+            anthropicMessages: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+              countTokens: true,
+              protocolVersion: "2023-06-01",
+            },
+          },
+        },
+      }),
+    );
+    const response = await appWith(
+      new FakeRelayManager(),
+      true,
+      false,
+      admittingCapacityRuntime(),
+    ).request("/messages", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: directTarget.modelId,
+        max_tokens: 8,
+        messages: [{ role: "user", content: "context" }],
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      type: "error",
+      error: {
+        type: "invalid_request_error",
+        message: expect.stringContaining("Estimated input tokens:"),
+      },
+    });
+  });
+
+  it("reports context accounting for a pool ceiling", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "primary",
+        discoveredModelId: "primary-model",
+        upstreamModelId: "primary-upstream",
+        cliDeviceId: "cli-device-id",
+        capacityContextCeilingMode: "INHERIT",
+        capacityContextMargin: null,
+        poolContextCeiling: 31_744,
+        poolContextMargin: 1_024,
+      }),
+    ]);
+    const body = JSON.stringify({
+      model: poolTarget.modelId,
+      messages: [{ role: "user", content: "x".repeat(77 * 1024) }],
+    });
+    const expectedTokens = Math.ceil((new TextEncoder().encode(body).byteLength / 3) * 1.2);
+    const manager = new FakeRelayManager();
+    const rejected = await appWith(manager).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body,
+    });
+
+    expect(rejected.status).toBe(400);
+    await expect(rejected.json()).resolves.toMatchObject({
+      error: {
+        code: "context_exceeded",
+        type: "invalid_request_error",
+        details: {
+          estimatedInputTokens: expectedTokens,
+          estimateMethod: "TOKEN_ESTIMATE",
+          contextMarginTokens: 1_024,
+          effectiveContextCeilingTokens: 31_744,
+        },
+      },
+    });
+    expect(manager.sent).toHaveLength(0);
+  });
+
+  it("reports the native count and method that rejected the most permissive pool member", async () => {
+    const unregisterTight = contextCounterRegistry.register(
+      {
+        runtimeIdentityKey: "primary-tight-runtime-key",
+        runtimeModel: "primary-tight-upstream",
+        runtimeRevision: "revision",
+        tokenizer: "tokenizer",
+        tokenizerVersion: "1",
+        template: "chat",
+        templateVersion: "1",
+      },
+      {
+        count: vi.fn().mockResolvedValue({ tokens: 5_000, method: "NATIVE", exact: true }),
+      },
+    );
+    const unregisterMostPermissive = contextCounterRegistry.register(
+      {
+        runtimeIdentityKey: "primary-runtime-key",
+        runtimeModel: "primary-upstream",
+        runtimeRevision: "revision",
+        tokenizer: "tokenizer",
+        tokenizerVersion: "1",
+        template: "chat",
+        templateVersion: "1",
+      },
+      {
+        count: vi.fn().mockResolvedValue({ tokens: 5_000, method: "NATIVE", exact: true }),
+      },
+    );
+    try {
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "primary-tight",
+          discoveredModelId: "primary-tight-model",
+          upstreamModelId: "primary-tight-upstream",
+          cliDeviceId: "cli-device-id",
+          capacityContextCeilingMode: "INHERIT",
+          capacityContextMargin: null,
+          poolContextCeiling: 5_000,
+          poolContextMargin: 1_000,
+          countStrategy: "TOKENIZER",
+        }),
+        poolMemberRow({
+          id: "primary",
+          discoveredModelId: "primary-model",
+          upstreamModelId: "primary-upstream",
+          cliDeviceId: "cli-device-id",
+          capacityContextCeilingMode: "INHERIT",
+          capacityContextMargin: null,
+          poolContextCeiling: 4_500,
+          poolContextMargin: 100,
+          countStrategy: "TOKENIZER",
+        }),
+      ]);
+      const response = await appWith(
+        new FakeRelayManager(),
+        true,
+        false,
+        admittingCapacityRuntime(),
+      ).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+      });
+
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toMatchObject({
+        error: {
+          code: "context_exceeded",
+          details: {
+            estimatedInputTokens: 5_000,
+            estimateMethod: "NATIVE",
+            contextMarginTokens: 100,
+            effectiveContextCeilingTokens: 4_500,
+          },
+        },
+      });
+    } finally {
+      unregisterTight();
+      unregisterMostPermissive();
+    }
+  });
+
+  it("allows the same large pool request when context limits are unlimited", async () => {
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "primary",
+        discoveredModelId: "primary-model",
+        upstreamModelId: "primary-upstream",
+        cliDeviceId: "cli-device-id",
+        capacityContextCeilingMode: "UNLIMITED",
+        poolContextCeiling: null,
+        poolContextMargin: 0,
+      }),
+    ]);
+    const body = JSON.stringify({
+      model: poolTarget.modelId,
+      messages: [{ role: "user", content: "x".repeat(77 * 1024) }],
+    });
+    const manager = new FakeRelayManager();
+    const successPromise = appWith(manager).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body,
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+    manager.body(sent.requestId, JSON.stringify({ id: "chatcmpl", choices: [] }));
+    manager.complete(sent.requestId);
+    const success = await successPromise;
+    expect(success.status).toBe(200);
+    await success.text();
   });
 
   it("uses a bounded native Responses count before direct admission", async () => {

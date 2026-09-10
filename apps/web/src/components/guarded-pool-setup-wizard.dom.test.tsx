@@ -197,7 +197,7 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
             "dashboard:pools.wizard.fields.memberContextCeiling",
           ) as HTMLInputElement
         ).value,
-      ).toBe("3072"),
+      ).toBe(""),
     );
 
     await user.click(screen.getByText("dashboard:pools.wizard.advanced.title"));
@@ -258,6 +258,7 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
     expect(state.submitted).toMatchObject({
       slug: "guarded-pool",
       recommendedSurface: "OPENAI_RESPONSES",
+      memberContextCeiling: null,
       publicEgressAcknowledged: true,
       providerModels: [
         {
@@ -275,7 +276,15 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
       ],
       advanced: {
         protocolAdaptationEnabled: true,
-        memberOverrides: [{ discoveredModelId: "chat", concurrency: { limitValue: 2 } }],
+        contextMargin: 0,
+        memberOverrides: [
+          {
+            discoveredModelId: "chat",
+            concurrency: { limitValue: 2 },
+            contextCeiling: { mode: "INHERIT", limitValue: null },
+            contextMargin: 0,
+          },
+        ],
       },
     });
   });

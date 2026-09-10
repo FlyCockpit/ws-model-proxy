@@ -112,6 +112,8 @@ const baseSurfaceFeatureSchema = z
     confidence: z.enum(["exact", "high", "estimated", "unknown"]),
     supported: booleanSupportSchema,
     streaming: booleanSupportSchema,
+    // Relay inventory is accepted as a whole; out-of-range declarations are
+    // ignored by declaredContextWindow rather than rejecting registration.
     maxContextTokens: z.number().int().positive().optional(),
     inputImages: booleanSupportSchema,
     outputImages: booleanSupportSchema,
@@ -193,6 +195,7 @@ const v4SurfaceFeatureShape = {
   source: z.enum(["declared", "probe", "dashboard", "provider"]),
   confidence: z.enum(["exact", "high", "estimated", "unknown"]),
   streaming: booleanSupportSchema,
+  // See the v3 surface equivalent above.
   maxContextTokens: z.number().int().positive().optional(),
   inputImages: booleanSupportSchema,
   outputImages: booleanSupportSchema,

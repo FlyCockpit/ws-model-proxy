@@ -1,7 +1,17 @@
 import { createHash } from "node:crypto";
+import { lockExecutionTargetPolicies } from "@ws-model-proxy/api/lib/capacity-policy-safety";
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
+import {
+  type ContextWindowSeedDependent,
+  declaredContextWindow,
+  isContextWindowSeedAdmissible,
+} from "@ws-model-proxy/api/lib/declared-context-window";
 import { resetPoolMemberHealth } from "@ws-model-proxy/api/lib/model-pool-routing";
-import { coarseCapabilitiesFromOpenAi } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import {
+  coarseCapabilitiesFromOpenAi,
+  resolveEffectiveCapabilityMetadata,
+} from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import { retryableSerializableTransactionCode } from "@ws-model-proxy/api/lib/serializable-transaction";
 import { directModelId, validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma from "@ws-model-proxy/db";
 import type { EndpointInventory, OpenAiCompatibleCapabilities } from "./protocol.js";
@@ -11,7 +21,7 @@ type JsonValue = string | number | boolean | { [key: string]: JsonValue } | Json
 const INVENTORY_TRANSACTION_MAX_ATTEMPTS = 3;
 
 function isSerializationConflict(error: unknown): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === "P2034";
+  return retryableSerializableTransactionCode(error) !== undefined;
 }
 
 export type DesiredModelCapability = {
@@ -198,6 +208,8 @@ export async function persistRelayRegistration({
 
           const inventoryChanged = cliDevice.inventoryDigest !== inventoryDigest;
           const refreshedDiscoveredModelIds: string[] = [];
+          const declaredContextByCapacityId = new Map<string, number>();
+          const upsertedTargetIds = new Set<string>();
           const publishedEndpointSlugs = endpoints.map((endpoint) => endpoint.slug);
 
           for (const endpoint of endpoints) {
@@ -272,7 +284,11 @@ export async function persistRelayRegistration({
                     upstreamModelId: model.upstreamModelId,
                   },
                 },
-                select: { capabilityOverrideMode: true, capabilityOverrideOrigin: true },
+                select: {
+                  capabilityOverrideMode: true,
+                  capabilityOverrideOrigin: true,
+                  capabilityOverrideMetadata: true,
+                },
               });
               const incomingOverride = model.capabilityOverrideMode === "override";
               // A model override explicitly present in the local CLI config is
@@ -343,7 +359,7 @@ export async function persistRelayRegistration({
                 },
                 select: { id: true },
               });
-              await tx.executionTarget.upsert({
+              const target = await tx.executionTarget.upsert({
                 where: { discoveredModelId: discoveredModel.id },
                 update: { userId: identity.userId, kind: "DISCOVERED_MODEL" },
                 create: {
@@ -351,8 +367,33 @@ export async function persistRelayRegistration({
                   kind: "DISCOVERED_MODEL",
                   discoveredModelId: discoveredModel.id,
                 },
-                select: { id: true },
+                select: { id: true, inferenceCapacityId: true },
               });
+              upsertedTargetIds.add(target.id);
+              const declared = declaredContextWindow(
+                resolveEffectiveCapabilityMetadata({
+                  capabilityOverrideMode: keepDashboardOverride
+                    ? (existingModel?.capabilityOverrideMode ?? "INHERIT_ENDPOINT_DEFAULTS")
+                    : incomingOverride
+                      ? "OVERRIDE"
+                      : "INHERIT_ENDPOINT_DEFAULTS",
+                  capabilityOverrideMetadata: keepDashboardOverride
+                    ? existingModel?.capabilityOverrideMetadata
+                    : incomingOverride
+                      ? model.capabilities
+                      : null,
+                  endpointCapabilityMetadata: endpoint.defaultCapabilities,
+                }),
+              );
+              if (declared != null && target.inferenceCapacityId) {
+                declaredContextByCapacityId.set(
+                  target.inferenceCapacityId,
+                  Math.max(
+                    declaredContextByCapacityId.get(target.inferenceCapacityId) ?? 0,
+                    declared,
+                  ),
+                );
+              }
               refreshedDiscoveredModelIds.push(discoveredModel.id);
             }
 
@@ -363,6 +404,78 @@ export async function persistRelayRegistration({
               },
               data: { published: false, unpublishedAt: now },
             });
+          }
+
+          if (declaredContextByCapacityId.size > 0) {
+            // The target upserts above already hold their row locks. The policy
+            // fence deliberately equals that upserted set: registration never
+            // locks targets belonging to a different device or endpoint.
+            const lockedExecutionTargetIds = new Set(upsertedTargetIds);
+            await lockExecutionTargetPolicies(tx, [...lockedExecutionTargetIds]);
+            const capacityIds = [...declaredContextByCapacityId.keys()];
+            const capacities = await tx.inferenceCapacity.findMany({
+              where: { userId: identity.userId, id: { in: capacityIds } },
+              select: {
+                id: true,
+                physicalMaxContext: true,
+                ExecutionTargets: {
+                  select: {
+                    id: true,
+                    directContextCeiling: true,
+                    directContextMargin: true,
+                    PoolMembers: {
+                      select: {
+                        capacityContextCeilingMode: true,
+                        capacityContextCeiling: true,
+                        capacityContextMargin: true,
+                        ModelPool: {
+                          select: { capacityContextCeiling: true, capacityContextMargin: true },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            });
+            for (const capacity of capacities) {
+              // Dashboard flows own shared capacities. Registration may seed
+              // only the 1:1 topology whose every target was upserted above.
+              if (
+                capacity.ExecutionTargets.some((target) => !lockedExecutionTargetIds.has(target.id))
+              ) {
+                continue;
+              }
+              const dependents: ContextWindowSeedDependent[] = capacity.ExecutionTargets.flatMap(
+                (target) => [
+                  {
+                    kind: "direct" as const,
+                    contextCeiling: target.directContextCeiling,
+                    contextMargin: target.directContextMargin,
+                  },
+                  ...target.PoolMembers.map(
+                    (member): ContextWindowSeedDependent => ({
+                      kind: "member",
+                      contextCeilingMode: member.capacityContextCeilingMode,
+                      contextCeiling: member.capacityContextCeiling,
+                      contextMargin: member.capacityContextMargin,
+                      poolContextCeiling: member.ModelPool.capacityContextCeiling,
+                      poolContextMargin: member.ModelPool.capacityContextMargin,
+                    }),
+                  ),
+                ],
+              );
+              const declared = declaredContextByCapacityId.get(capacity.id);
+              if (declared === undefined) continue;
+              if (
+                capacity.physicalMaxContext === null &&
+                isContextWindowSeedAdmissible(declared, dependents)
+              ) {
+                await tx.inferenceCapacity.updateMany({
+                  where: { id: capacity.id, userId: identity.userId, physicalMaxContext: null },
+                  data: { physicalMaxContext: declared },
+                });
+              }
+            }
           }
 
           await tx.endpoint.updateMany({

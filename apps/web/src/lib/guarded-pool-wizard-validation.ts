@@ -146,15 +146,6 @@ export function primarySurfaceIsSelectable(
   return matrices.length > 0 && matrices.every((matrix) => matrix[surface].mode !== "unavailable");
 }
 
-export function safeContextControls(physicalMaxContext: number | null | undefined) {
-  if (physicalMaxContext == null) return { contextCeiling: 31_744, contextMargin: 1_024 } as const;
-  const contextMargin = Math.min(1_024, Math.max(0, physicalMaxContext - 1));
-  return {
-    contextCeiling: Math.max(1, physicalMaxContext - contextMargin),
-    contextMargin,
-  };
-}
-
 export function minimumSelectedPhysicalContext(
   selectedIds: readonly string[],
   models: readonly GuardedWizardLocalModel[],
