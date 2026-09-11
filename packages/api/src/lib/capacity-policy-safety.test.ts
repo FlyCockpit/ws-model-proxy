@@ -4,6 +4,7 @@ import {
   assertDirectCapacityPolicy,
   assertEffectiveConcurrencyPolicy,
   assertEffectiveContextPolicy,
+  assertModelPoolCapacityPolicy,
   lockExecutionTargetPolicies,
 } from "./capacity-policy-safety";
 
@@ -226,9 +227,48 @@ describe("capacity policy safety", () => {
     });
   });
 
+  it("reports the caller-supplied reason for each pool policy branch", () => {
+    expect(
+      thrownBy(() =>
+        assertModelPoolCapacityPolicy(
+          { concurrencyLimit: 2, reservedSlots: 3, contextCeiling: null, contextMargin: 0 },
+          "POOL_POLICY_INVALID",
+        ),
+      ).data,
+    ).toMatchObject({ reason: "POOL_POLICY_INVALID" });
+    expect(
+      thrownBy(() =>
+        assertModelPoolCapacityPolicy(
+          { concurrencyLimit: null, reservedSlots: 0, contextCeiling: 100, contextMargin: 100 },
+          "POOL_POLICY_INVALID",
+        ),
+      ).data,
+    ).toMatchObject({ reason: "POOL_POLICY_INVALID" });
+  });
+
   it("keeps the prior error envelope for callers that omit reasons", () => {
     // Every other caller of these shared helpers passes no reasons; their
     // thrown ORPCError must carry no `data` field, byte-for-byte as before.
+    expect(
+      thrownBy(() =>
+        assertModelPoolCapacityPolicy({
+          concurrencyLimit: 2,
+          reservedSlots: 3,
+          contextCeiling: null,
+          contextMargin: 0,
+        }),
+      ).data,
+    ).toBeUndefined();
+    expect(
+      thrownBy(() =>
+        assertModelPoolCapacityPolicy({
+          concurrencyLimit: null,
+          reservedSlots: 0,
+          contextCeiling: 100,
+          contextMargin: 100,
+        }),
+      ).data,
+    ).toBeUndefined();
     expect(
       thrownBy(() =>
         assertEffectiveConcurrencyPolicy({

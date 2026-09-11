@@ -1139,7 +1139,7 @@ async function assertPoolTransformerIsValid(
   });
 }
 
-async function assertPoolSlugAvailable(
+export async function assertPoolSlugAvailable(
   slug: string,
   userId: string,
   currentPoolId?: string,

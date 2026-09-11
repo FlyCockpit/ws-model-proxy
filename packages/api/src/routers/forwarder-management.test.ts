@@ -10,7 +10,7 @@ import {
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Context } from "../context";
-import { forwarderManagementRouter } from "./forwarder-management";
+import { assertPoolSlugAvailable, forwarderManagementRouter } from "./forwarder-management";
 
 const testEnv = vi.hoisted(() => ({
   WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
@@ -2341,6 +2341,42 @@ describe("forwarderManagementRouter", () => {
     expect(updateError?.code).toBe("CONFLICT");
     expect(updateError?.data).toBeUndefined();
     expect(db.modelPool.update).not.toHaveBeenCalled();
+  });
+
+  it("attaches slug reasons only when the caller opts in", async () => {
+    // SLUG_INVALID is unreachable through createGuardedModelPool (input zod
+    // runs the same slug check first), so the branch is pinned here directly:
+    // opt-in reasons attach data.reason per branch; omitted reasons keep the
+    // pre-reason envelope with no data field at all.
+    const reasons = { invalid: "SLUG_INVALID", taken: "SLUG_TAKEN" } as const;
+
+    await expect(
+      assertPoolSlugAvailable("Invalid Slug!", "user-id", undefined, reasons),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST", data: { reason: "SLUG_INVALID" } });
+    expect(db.modelPool.findUnique).not.toHaveBeenCalled();
+
+    let invalidError: ORPCError | undefined;
+    await assertPoolSlugAvailable("Invalid Slug!", "user-id").catch((error: ORPCError) => {
+      invalidError = error;
+    });
+    expect(invalidError).toBeInstanceOf(ORPCError);
+    expect(invalidError?.code).toBe("BAD_REQUEST");
+    expect(invalidError?.data).toBeUndefined();
+    expect(db.modelPool.findUnique).not.toHaveBeenCalled();
+
+    db.modelPool.findUnique.mockResolvedValueOnce({ id: "other-pool-id" });
+    await expect(
+      assertPoolSlugAvailable("gpt-4.1-mini", "user-id", undefined, reasons),
+    ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "SLUG_TAKEN" } });
+
+    db.modelPool.findUnique.mockResolvedValueOnce({ id: "other-pool-id" });
+    let takenError: ORPCError | undefined;
+    await assertPoolSlugAvailable("gpt-4.1-mini", "user-id").catch((error: ORPCError) => {
+      takenError = error;
+    });
+    expect(takenError).toBeInstanceOf(ORPCError);
+    expect(takenError?.code).toBe("CONFLICT");
+    expect(takenError?.data).toBeUndefined();
   });
 
   it("keeps direct model id parsing and non-pool slugs strict", () => {
