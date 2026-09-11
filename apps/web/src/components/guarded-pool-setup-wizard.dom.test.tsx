@@ -7,10 +7,12 @@ import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
+  appConfig: { capacityEnabled: true } as Record<string, unknown>,
   capacityPromise: Promise.resolve([] as Array<Record<string, unknown>>),
   capacityCalls: 0,
   candidateCalls: 0,
   createRejection: undefined as unknown,
+  devices: [] as Array<Record<string, unknown>>,
   submitted: undefined as Record<string, unknown> | undefined,
 }));
 
@@ -20,17 +22,31 @@ vi.mock("react-i18next", () => ({
       values?.current ? `${key}:${values.current}` : values?.name ? `${key}:${values.name}` : key,
   }),
 }));
+vi.mock("@tanstack/react-router", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@tanstack/react-router")>();
+  return {
+    ...actual,
+    useParams: () => ({ lang: "en-US" }),
+    useNavigate: () => () => undefined,
+  };
+});
 vi.mock("@/utils/orpc", () => ({
   orpc: {
     appConfig: {
       queryOptions: () => ({
         queryKey: ["appConfig"],
-        queryFn: async () => ({ capacityEnabled: true }),
-        initialData: { capacityEnabled: true },
+        queryFn: async () => state.appConfig,
+        initialData: state.appConfig,
       }),
     },
     forwarderManagement: {
       key: () => ["forwarderManagement"],
+      listCliDevices: {
+        queryOptions: () => ({
+          queryKey: ["devices"],
+          queryFn: async () => state.devices,
+        }),
+      },
       listGuardedOverflowCandidates: {
         queryOptions: () => ({
           queryKey: ["providers"],
@@ -95,6 +111,7 @@ vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
   toast: { success: vi.fn(), error: vi.fn() },
 }));
 
+import { NewPoolPage } from "./guarded-pool-new-page";
 import { GuardedPoolSetupWizard } from "./guarded-pool-setup-wizard";
 
 const surface = (name: "openaiChatCompletions" | "openaiResponses") => ({
@@ -124,7 +141,12 @@ const models = [
   },
 ];
 
-function mount(open = true, protocolAdaptationAvailable = true, initialStep: 0 | 1 | 2 | 3 = 0) {
+function mount(
+  open = true,
+  protocolAdaptationAvailable = true,
+  initialStep: 0 | 1 | 2 | 3 = 0,
+  options: { providerEgressEnabled?: boolean; initialProviderModelIds?: string[] } = {},
+) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const view = render(
     <QueryClientProvider client={client}>
@@ -134,7 +156,9 @@ function mount(open = true, protocolAdaptationAvailable = true, initialStep: 0 |
         directModels={models}
         capacityEnabled
         protocolAdaptationAvailable={protocolAdaptationAvailable}
+        providerEgressEnabled={options.providerEgressEnabled ?? true}
         initialStep={initialStep}
+        initialProviderModelIds={options.initialProviderModelIds ?? []}
       />
     </QueryClientProvider>,
   );
@@ -143,10 +167,12 @@ function mount(open = true, protocolAdaptationAvailable = true, initialStep: 0 |
 
 afterEach(() => {
   cleanup();
+  state.appConfig = { capacityEnabled: true };
   state.capacityCalls = 0;
   state.candidateCalls = 0;
   state.capacityPromise = Promise.resolve([]);
   state.createRejection = undefined;
+  state.devices = [];
   state.submitted = undefined;
 });
 
@@ -162,6 +188,7 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
           directModels={models}
           capacityEnabled
           protocolAdaptationAvailable
+          providerEgressEnabled
         />
       </QueryClientProvider>,
     );
@@ -222,6 +249,7 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
           directModels={models}
           capacityEnabled
           protocolAdaptationAvailable
+          providerEgressEnabled
         />
       </QueryClientProvider>,
     );
@@ -230,6 +258,152 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
       expect(state.candidateCalls).toBe(1);
       expect(state.capacityCalls).toBe(1);
     });
+  });
+
+  it("disables provider selection and shows the deployment notice when egress is disabled", async () => {
+    const user = userEvent.setup();
+    mount(true, true, 2, { providerEgressEnabled: false });
+
+    const checkbox = await screen.findByLabelText(
+      "dashboard:pools.wizard.selectProvider:Public provider",
+    );
+    expect(checkbox.getAttribute("aria-disabled")).toBe("true");
+    expect(screen.getByText("dashboard:pools.wizard.providerEgressDisabled")).toBeTruthy();
+    expect(screen.queryByText("dashboard:pools.wizard.egressWarning")).toBeNull();
+
+    await user.click(checkbox);
+    expect(checkbox.getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("ignores initial provider selections when egress is disabled", async () => {
+    mount(true, true, 2, {
+      providerEgressEnabled: false,
+      initialProviderModelIds: ["provider-a"],
+    });
+
+    const checkbox = await screen.findByLabelText(
+      "dashboard:pools.wizard.selectProvider:Public provider",
+    );
+    expect(checkbox.getAttribute("aria-checked")).toBe("false");
+    expect(screen.queryByText("dashboard:pools.wizard.egressWarning")).toBeNull();
+  });
+
+  it("submits an empty providerModels payload when egress is disabled from the start", async () => {
+    const user = userEvent.setup();
+    mount(true, true, 0, { providerEgressEnabled: false });
+
+    await driveToReviewStep(user);
+    await user.click(screen.getByRole("button", { name: "dashboard:pools.wizard.create" }));
+
+    await waitFor(() => expect(state.submitted).toBeDefined());
+    // Gate-blocked flow must reach the server with no provider attachments;
+    // tier/order defaults stay inert because no provider rows are emitted.
+    expect(state.submitted?.providerModels).toEqual([]);
+  });
+
+  it("blocks advancing from the provider step when the gate flips off with a live selection", async () => {
+    const user = userEvent.setup();
+    // Dialog-mode callers have no page-level remount key, so a mid-session
+    // gate flip must be caught by step validation (belt-and-braces alongside
+    // the server-side PROVIDER_EGRESS_DISABLED rejection).
+    const view = mount(true, true, 2);
+
+    const provider = await screen.findByLabelText(
+      "dashboard:pools.wizard.selectProvider:Public provider",
+    );
+    await user.click(provider);
+    expect(provider.getAttribute("aria-checked")).toBe("true");
+
+    view.rerender(
+      <QueryClientProvider client={view.client}>
+        <GuardedPoolSetupWizard
+          open
+          onOpenChange={() => undefined}
+          directModels={models}
+          capacityEnabled
+          protocolAdaptationAvailable
+          providerEgressEnabled={false}
+          initialStep={2}
+        />
+      </QueryClientProvider>,
+    );
+
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+
+    expect(screen.getByText("dashboard:pools.wizard.errors.providerEgressBlocked")).toBeTruthy();
+    // Advance was blocked: still on the provider step, not the review step.
+    expect(screen.getByText("dashboard:pools.wizard.providerOrderExact")).toBeTruthy();
+    expect(screen.queryByText("dashboard:pools.wizard.atomicRollback")).toBeNull();
+  });
+
+  it("remounts with no provider selection when the settled egress gate flips off", async () => {
+    const user = userEvent.setup();
+    state.appConfig = { capacityEnabled: true, providerEgressEnabled: true };
+    state.devices = [
+      {
+        id: "device",
+        slug: "cli",
+        endpoints: [
+          {
+            slug: "endpoint",
+            label: "Endpoint",
+            published: true,
+            capabilityMetadata: null,
+            models: [models[1]],
+          },
+        ],
+      },
+    ];
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const routeElement = (
+      <QueryClientProvider client={client}>
+        <NewPoolPage />
+      </QueryClientProvider>
+    );
+    const view = render(routeElement);
+
+    // Drive to the provider step and preselect the provider while gate=true.
+    await user.type(await screen.findByLabelText("dashboard:pools.slug"), "guarded-pool");
+    await user.type(screen.getByLabelText("dashboard:pools.name"), "Guarded pool");
+    await user.click(
+      screen.getByLabelText("dashboard:pools.wizard.selectLocalModel:owner/cli/responses"),
+    );
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+
+    const provider = await screen.findByLabelText(
+      "dashboard:pools.wizard.selectProvider:Public provider",
+    );
+    await user.click(provider);
+    expect(provider.getAttribute("aria-checked")).toBe("true");
+
+    // Simulate the settled appConfig snapshot flipping the gate to disabled.
+    client.setQueryData(["appConfig"], {
+      capacityEnabled: true,
+      providerEgressEnabled: false,
+    });
+    view.rerender(routeElement);
+
+    // The remount reset the form: the slug input is empty again (fresh state).
+    await waitFor(() =>
+      expect((screen.getByLabelText("dashboard:pools.slug") as HTMLInputElement).value).toBe(""),
+    );
+
+    // Re-drive to the provider step: the remounted wizard starts over.
+    await user.type(screen.getByLabelText("dashboard:pools.slug"), "guarded-pool-2");
+    await user.type(screen.getByLabelText("dashboard:pools.name"), "Guarded pool");
+    await user.click(
+      screen.getByLabelText("dashboard:pools.wizard.selectLocalModel:owner/cli/responses"),
+    );
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+
+    const after = await screen.findByLabelText(
+      "dashboard:pools.wizard.selectProvider:Public provider",
+    );
+    expect(after.getAttribute("aria-checked")).toBe("false");
+    expect(after.getAttribute("aria-disabled")).toBe("true");
+    expect(screen.getByText("dashboard:pools.wizard.providerEgressDisabled")).toBeTruthy();
   });
 
   it("navigates, applies delayed capacities, opts into adaptation, configures overrides and budgets, and submits", async () => {

@@ -6,7 +6,6 @@ import {
   isGuardedPoolCreateFailureReason,
 } from "@ws-model-proxy/api/lib/guarded-pool-create-reasons";
 import { parseOpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
-import { validateForwarderPoolSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
 import {
@@ -24,12 +23,11 @@ import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ShieldCheck } from "lucide-r
 import type { ReactNode } from "react";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { z } from "zod";
 import { ProtocolCompatibilityRadio } from "@/components/forwarder-dashboard-sections";
 import {
-  combinedPrimarySurfaceIsSelectable,
+  buildGuardedPoolWizardSchema,
   type GuardedWizardLocalModel,
-  minimumSelectedPhysicalContext,
+  guardedWizardSurfaces,
   providerOrderAfterMove,
   providerOrderAfterToggle,
   recommendedCombinedPrimarySurface,
@@ -40,7 +38,6 @@ import { orpc } from "@/utils/orpc";
 type LocalModel = GuardedWizardLocalModel & {
   canonicalModelId: string;
 };
-const surfaces = ["OPENAI_CHAT_COMPLETIONS", "OPENAI_RESPONSES", "ANTHROPIC_MESSAGES"] as const;
 export type LimitMode = "LIMITED" | "UNLIMITED";
 export type MemberOverride = {
   concurrencyMode: LimitMode;
@@ -142,6 +139,7 @@ export function GuardedPoolSetupWizard({
   initialProviderModelIds = [],
   capacityEnabled,
   protocolAdaptationAvailable,
+  providerEgressEnabled,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -153,6 +151,8 @@ export function GuardedPoolSetupWizard({
   initialProviderModelIds?: string[];
   capacityEnabled: boolean;
   protocolAdaptationAvailable: boolean;
+  /** Deployment gate from WMP_PUBLIC_PROVIDER_EGRESS_ENABLED; false blocks provider selection. */
+  providerEgressEnabled: boolean;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
@@ -192,107 +192,15 @@ export function GuardedPoolSetupWizard({
     }),
     meta: { skipGlobalErrorToast: true },
   });
-  const schema = z
-    .object({
-      slug: z
-        .string()
-        .trim()
-        .refine((value) => validateForwarderPoolSlug(value).ok),
-      name: z.string().trim().min(1).max(120),
-      localModelIds: z.array(z.string()),
-      memberConcurrencyLimit: z.number().int().min(1).max(10_000),
-      memberContextCeiling: z.number().int().min(1).max(100_000_000).nullable(),
-      reservedSlots: z.number().int().min(0).max(10_000),
-      localWaitBudgetMs: z.number().int().min(0).max(600_000),
-      recommendedSurface: z.enum(surfaces),
-      providerModelIds: z.array(z.string()).max(32),
-      providerTier: z.enum(["PRIMARY", "PUBLIC_OVERFLOW"]),
-      providerConcurrencyLimit: z.number().int().min(1).max(10_000),
-      dailySpendLimit: z.string(),
-      publicEgressAcknowledged: z.boolean(),
-      physicalCountStrategy: z.enum([
-        "TOKENIZER",
-        "TEMPLATE_AWARE",
-        "ENGINE_REPORTED",
-        "CONSERVATIVE_ESTIMATE",
-      ]),
-      contextMargin: z.number().int().min(0).max(10_000_000),
-      borrowPolicy: z.enum(["NEVER", "WHEN_IDLE"]),
-      protocolAdaptationEnabled: z.boolean(),
-      allowLossyDeveloperRoleCollapse: z.boolean(),
-      affinityEnabled: z.boolean(),
-      affinityTtlSeconds: z.number().int().min(60).max(604_800),
-      affinityMaxRecords: z.number().int().min(100).max(100_000),
-      affinityPrefixWeight: z.number().int().min(0).max(10_000),
-      affinityConversationWeight: z.number().int().min(0).max(10_000),
-      affinityConfirmedCacheWeight: z.number().int().min(0).max(10_000),
-      affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000),
-      providerConcurrencyMode: z.enum(["LIMITED", "UNLIMITED"]),
-      tokenAttemptMode: z.enum(["LIMITED", "UNLIMITED"]),
-      tokenAttemptLimit: z.string(),
-      tokenDayMode: z.enum(["LIMITED", "UNLIMITED"]),
-      tokenDayLimit: z.string(),
-      tokenMonthMode: z.enum(["LIMITED", "UNLIMITED"]),
-      tokenMonthLimit: z.string(),
-      tokenLifetimeMode: z.enum(["LIMITED", "UNLIMITED"]),
-      tokenLifetimeLimit: z.string(),
-      spendDayMode: z.enum(["LIMITED", "UNLIMITED"]),
-      spendMonthMode: z.enum(["LIMITED", "UNLIMITED"]),
-      spendMonthLimit: z.string(),
-    })
-    .superRefine((value, ctx) => {
-      if (value.localModelIds.length + value.providerModelIds.length === 0)
-        ctx.addIssue({ code: "custom", path: ["providerModelIds"] });
-      if (value.reservedSlots > value.memberConcurrencyLimit)
-        ctx.addIssue({ code: "custom", path: ["reservedSlots"] });
-      if (value.providerModelIds.length > 0 && !value.publicEgressAcknowledged)
-        ctx.addIssue({ code: "custom", path: ["publicEgressAcknowledged"] });
-      if (
-        value.localModelIds.length +
-          (value.providerTier === "PRIMARY" ? value.providerModelIds.length : 0) >
-          0 &&
-        !combinedPrimarySurfaceIsSelectable(
-          value.recommendedSurface,
-          value.localModelIds,
-          directModels,
-          value.providerModelIds,
-          candidates.data ?? [],
-          value.providerTier,
-          protocolAdaptationAvailable && value.protocolAdaptationEnabled,
-        )
-      )
-        ctx.addIssue({ code: "custom", path: ["recommendedSurface"] });
-      const physicalMaximum = minimumSelectedPhysicalContext(
-        value.localModelIds,
-        directModels,
-        capacities.data ?? [],
-      );
-      if (
-        physicalMaximum != null &&
-        value.memberContextCeiling != null &&
-        value.memberContextCeiling + value.contextMargin > physicalMaximum
-      )
-        ctx.addIssue({ code: "custom", path: ["memberContextCeiling"] });
-      for (const [mode, limit, path] of [
-        [value.tokenAttemptMode, value.tokenAttemptLimit, "tokenAttemptLimit"],
-        [value.tokenDayMode, value.tokenDayLimit, "tokenDayLimit"],
-        [value.tokenMonthMode, value.tokenMonthLimit, "tokenMonthLimit"],
-        [value.tokenLifetimeMode, value.tokenLifetimeLimit, "tokenLifetimeLimit"],
-      ] as const) {
-        if (mode === "LIMITED" && !/^[1-9]\d*$/.test(limit))
-          ctx.addIssue({ code: "custom", path: [path] });
-      }
-      for (const [mode, limit, path] of [
-        [value.spendDayMode, value.dailySpendLimit, "dailySpendLimit"],
-        [value.spendMonthMode, value.spendMonthLimit, "spendMonthLimit"],
-      ] as const) {
-        if (
-          mode === "LIMITED" &&
-          (!/^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/.test(limit) || Number(limit) <= 0)
-        )
-          ctx.addIssue({ code: "custom", path: [path] });
-      }
-    });
+  // Rebuilt each render from the current query snapshots so validation always
+  // reflects the live egress gate, candidates, and capacities.
+  const schema = buildGuardedPoolWizardSchema({
+    providerEgressEnabled,
+    protocolAdaptationAvailable,
+    directModels,
+    providerModels: candidates.data ?? [],
+    capacities: capacities.data ?? [],
+  });
   const form = useForm({
     defaultValues: {
       slug: "",
@@ -302,8 +210,8 @@ export function GuardedPoolSetupWizard({
       memberContextCeiling: null as number | null,
       reservedSlots: 0,
       localWaitBudgetMs: 30_000,
-      recommendedSurface: "OPENAI_RESPONSES" as (typeof surfaces)[number],
-      providerModelIds: initialProviderModelIds,
+      recommendedSurface: "OPENAI_RESPONSES" as (typeof guardedWizardSurfaces)[number],
+      providerModelIds: providerEgressEnabled ? initialProviderModelIds : [],
       providerTier: "PUBLIC_OVERFLOW" as "PRIMARY" | "PUBLIC_OVERFLOW",
       providerConcurrencyLimit: 1,
       dailySpendLimit: "10.00",
@@ -445,6 +353,7 @@ export function GuardedPoolSetupWizard({
     [
       "recommendedSurface",
       "providerModelIds",
+      "providerEgressBlocked",
       "providerTier",
       "providerConcurrencyLimit",
       "dailySpendLimit",
@@ -902,7 +811,7 @@ export function GuardedPoolSetupWizard({
                       }
                       {...errorProps("recommendedSurface")}
                     >
-                      {surfaces.map((surface) => (
+                      {guardedWizardSurfaces.map((surface) => (
                         <option key={surface} value={surface}>
                           {t(`dashboard:pools.wizard.surfaces.${surface}`)}
                         </option>
@@ -920,8 +829,21 @@ export function GuardedPoolSetupWizard({
                 {(field) => (
                   <fieldset
                     className="space-y-2"
-                    {...errorProps("providerModelIds")}
-                    tabIndex={stepErrors.providerModelIds ? -1 : undefined}
+                    aria-invalid={Boolean(
+                      stepErrors.providerModelIds || stepErrors.providerEgressBlocked,
+                    )}
+                    aria-describedby={
+                      stepErrors.providerModelIds
+                        ? "wizard-providerModelIds-error"
+                        : stepErrors.providerEgressBlocked
+                          ? "wizard-providerEgressBlocked-error"
+                          : undefined
+                    }
+                    tabIndex={
+                      stepErrors.providerModelIds || stepErrors.providerEgressBlocked
+                        ? -1
+                        : undefined
+                    }
                   >
                     <legend className="text-sm font-medium">
                       {t("dashboard:pools.wizard.providerOrder")}
@@ -929,6 +851,11 @@ export function GuardedPoolSetupWizard({
                     <p className="text-sm text-muted-foreground">
                       {t("dashboard:pools.wizard.providerOrderExact")}
                     </p>
+                    {!providerEgressEnabled ? (
+                      <p className="rounded-md border bg-muted/40 p-3 text-sm text-muted-foreground">
+                        {t("dashboard:pools.wizard.providerEgressDisabled")}
+                      </p>
+                    ) : null}
                     <div className="divide-y rounded-md border">
                       {candidates.data?.map((candidate) => {
                         const order = field.state.value.indexOf(candidate.id);
@@ -939,6 +866,7 @@ export function GuardedPoolSetupWizard({
                               aria-label={t("dashboard:pools.wizard.selectProvider", {
                                 name: candidate.displayName ?? candidate.upstreamModelId,
                               })}
+                              disabled={!providerEgressEnabled}
                               checked={order >= 0}
                               onCheckedChange={(checked) => {
                                 const next = providerOrderAfterToggle(
@@ -1018,6 +946,14 @@ export function GuardedPoolSetupWizard({
                     {stepErrors.providerModelIds ? (
                       <p id="wizard-providerModelIds-error" className="text-sm text-destructive">
                         {stepErrors.providerModelIds}
+                      </p>
+                    ) : null}
+                    {stepErrors.providerEgressBlocked ? (
+                      <p
+                        id="wizard-providerEgressBlocked-error"
+                        className="text-sm text-destructive"
+                      >
+                        {stepErrors.providerEgressBlocked}
                       </p>
                     ) : null}
                   </fieldset>

@@ -52,11 +52,14 @@ vi.mock("@ws-model-proxy/ui/components/dialog", () => ({
 }));
 
 import {
+  buildGuardedPoolWizardSchema,
   combinedPrimarySurfaceIsSelectable,
   minimumSelectedPhysicalContext,
   primarySurfaceIsSelectable,
+  providerEgressFromAppConfig,
   providerOrderAfterMove,
   providerOrderAfterToggle,
+  providerSelectionBlockedByEgress,
   recommendedCombinedPrimarySurface,
   recommendedPrimarySurface,
 } from "../lib/guarded-pool-wizard-validation";
@@ -97,7 +100,11 @@ const localModel = {
   executionTarget: { inferenceCapacityId: "capacity" },
 };
 
-function renderStep(initialStep: 0 | 1 | 2 | 3, initialProviderModelIds: string[] = []) {
+function renderStep(
+  initialStep: 0 | 1 | 2 | 3,
+  initialProviderModelIds: string[] = [],
+  providerEgressEnabled = true,
+) {
   return renderToStaticMarkup(
     <QueryClientProvider client={new QueryClient()}>
       <GuardedPoolSetupWizard
@@ -108,6 +115,7 @@ function renderStep(initialStep: 0 | 1 | 2 | 3, initialProviderModelIds: string[
         protocolAdaptationAvailable
         initialProviderModelIds={initialProviderModelIds}
         capacityEnabled
+        providerEgressEnabled={providerEgressEnabled}
       />
     </QueryClientProvider>,
   );
@@ -196,6 +204,116 @@ describe("GuardedPoolSetupWizard", () => {
     const withProvider = renderStep(2, ["provider"]);
     expect(withProvider).toContain("dashboard:pools.wizard.egressWarning");
     expect(withProvider).toContain("dashboard:pools.wizard.fields.publicEgressAcknowledged");
+  });
+
+  it("disables provider checkboxes and explains why when deployment egress is off", () => {
+    queryData.providers = [
+      {
+        id: "provider-a",
+        upstreamModelId: "gpt-example",
+        displayName: "Primary provider",
+        providerAccount: { label: "OpenAI" },
+        pricing: { currency: "USD" },
+      },
+    ];
+    const markup = renderStep(2, [], false);
+    expect(markup).toContain('id="guarded-provider-provider-a"');
+    expect(markup).toContain('data-disabled=""');
+    expect(markup).toContain("dashboard:pools.wizard.providerEgressDisabled");
+    // Enabled deployments keep the checkbox interactive and show no notice.
+    const enabled = renderStep(2);
+    expect(enabled).not.toContain("dashboard:pools.wizard.providerEgressDisabled");
+    queryData.providers = [];
+  });
+
+  it("does not pre-select initial providers when deployment egress is off", () => {
+    const markup = renderStep(2, ["provider-a"], false);
+    expect(markup).not.toContain('data-checked="true"');
+    expect(markup).not.toContain("dashboard:pools.wizard.egressWarning");
+  });
+
+  it("flags provider selections as blocked only when egress is disabled", () => {
+    expect(providerSelectionBlockedByEgress(false, ["provider-a"])).toBe(true);
+    expect(providerSelectionBlockedByEgress(false, [])).toBe(false);
+    expect(providerSelectionBlockedByEgress(true, ["provider-a"])).toBe(false);
+  });
+
+  it("reads the egress gate fail-closed from an appConfig snapshot", () => {
+    expect(providerEgressFromAppConfig(undefined)).toBe(false);
+    expect(providerEgressFromAppConfig(null)).toBe(false);
+    expect(providerEgressFromAppConfig("junk")).toBe(false);
+    expect(providerEgressFromAppConfig({})).toBe(false);
+    expect(providerEgressFromAppConfig({ capacityEnabled: true })).toBe(false);
+    expect(providerEgressFromAppConfig({ providerEgressEnabled: false })).toBe(false);
+    expect(providerEgressFromAppConfig({ providerEgressEnabled: true })).toBe(true);
+    expect(
+      providerEgressFromAppConfig({ capacityEnabled: true, providerEgressEnabled: true }),
+    ).toBe(true);
+  });
+
+  const validWizardValues = {
+    slug: "guarded-pool",
+    name: "Guarded pool",
+    localModelIds: ["local"],
+    memberConcurrencyLimit: 1,
+    memberContextCeiling: null as number | null,
+    reservedSlots: 0,
+    localWaitBudgetMs: 30_000,
+    recommendedSurface: "OPENAI_CHAT_COMPLETIONS" as const,
+    providerModelIds: ["provider-a"],
+    providerTier: "PUBLIC_OVERFLOW" as const,
+    providerConcurrencyLimit: 1,
+    dailySpendLimit: "10.00",
+    publicEgressAcknowledged: true,
+    physicalCountStrategy: "CONSERVATIVE_ESTIMATE" as const,
+    contextMargin: 0,
+    borrowPolicy: "WHEN_IDLE" as const,
+    protocolAdaptationEnabled: false,
+    allowLossyDeveloperRoleCollapse: false,
+    affinityEnabled: false,
+    affinityTtlSeconds: 3_600,
+    affinityMaxRecords: 10_000,
+    affinityPrefixWeight: 100,
+    affinityConversationWeight: 150,
+    affinityConfirmedCacheWeight: 250,
+    affinityLoadPenaltyWeight: 100,
+    providerConcurrencyMode: "LIMITED" as const,
+    tokenAttemptMode: "LIMITED" as const,
+    tokenAttemptLimit: "100000",
+    tokenDayMode: "LIMITED" as const,
+    tokenDayLimit: "1000000",
+    tokenMonthMode: "LIMITED" as const,
+    tokenMonthLimit: "10000000",
+    tokenLifetimeMode: "UNLIMITED" as const,
+    tokenLifetimeLimit: "",
+    spendDayMode: "LIMITED" as const,
+    spendMonthMode: "LIMITED" as const,
+    spendMonthLimit: "100",
+  };
+
+  it("schema rejects provider selections under its own path when egress is disabled", () => {
+    const result = buildGuardedPoolWizardSchema({
+      providerEgressEnabled: false,
+      protocolAdaptationAvailable: false,
+      directModels: [localModel],
+      providerModels: [],
+      capacities: [],
+    }).safeParse(validWizardValues);
+    // Isolated from every other validation: the gate issue is the only one.
+    expect(result.success).toBe(false);
+    if (result.success) throw new Error("expected parse failure");
+    expect(result.error.issues.map((issue) => issue.path)).toEqual([["providerEgressBlocked"]]);
+  });
+
+  it("schema accepts the same provider selection when egress is enabled", () => {
+    const result = buildGuardedPoolWizardSchema({
+      providerEgressEnabled: true,
+      protocolAdaptationAvailable: false,
+      directModels: [localModel],
+      providerModels: [],
+      capacities: [],
+    }).safeParse(validWizardValues);
+    expect(result.success).toBe(true);
   });
 
   it("gives provider selection controls stable accessible names", () => {
