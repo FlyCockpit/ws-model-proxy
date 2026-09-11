@@ -72,6 +72,7 @@
     },
     "emptyModels": "No visible models are available.",
     "emptyTranscript": "No messages yet.",
+    "createPool": "Create a pool",
     "errors": {
       "modelsFailed": "Failed to load visible models.",
       "streamFailed": "Failed to stream the response."
@@ -91,14 +92,21 @@
     "loadFixture": "Load {{count}}",
     "metrics": {
       "ttft": "TTFT {{value}} s",
-      "tokensPerSecond": "{{value}} tok/s after first token ({{count}} completion tokens)",
       "tokensPerSecondShared": "{{value}} shared-tokenizer tok/s after first token ({{count}} completion tokens)",
       "throughputUnavailable": "Throughput unavailable — shared tokenizer could not count the completion"
     },
     "modelFilterEmpty": "No models match",
     "modelFilterPlaceholder": "Filter models…",
     "modelPicker": "Model",
+    "modelKinds": {
+      "direct": "Direct",
+      "pool": "Pool"
+    },
     "regenerate": "Regenerate",
+    "requestSettings": "Request settings",
+    "requestSettingsHelp": "Choose the API surface, routing preference, and reasoning level for the next request.",
+    "samplePromptOne": "Explain this model's capabilities.",
+    "samplePromptTwo": "Give me a concise test plan.",
     "routingMode": {
       "label": "Pool route mode",
       "PREFER_NATIVE": "Preferred API (native first)",

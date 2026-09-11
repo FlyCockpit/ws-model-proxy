@@ -53,6 +53,7 @@
     },
     "emptyModels": "No hay modelos visibles disponibles.",
     "emptyTranscript": "Todavía no hay mensajes.",
+    "createPool": "Crear un grupo",
     "errors": {
       "modelsFailed": "No se pudieron cargar los modelos visibles.",
       "streamFailed": "No se pudo transmitir la respuesta."
@@ -72,14 +73,21 @@
     "loadFixture": "Cargar {{count}}",
     "metrics": {
       "ttft": "TTFT {{value}} s",
-      "tokensPerSecond": "{{value}} tok/s después del primer token ({{count}} tokens de finalización)",
       "tokensPerSecondShared": "{{value}} tok/s con tokenizador compartido después del primer token ({{count}} tokens de finalización)",
       "throughputUnavailable": "Rendimiento no disponible: el tokenizador compartido no pudo contar la finalización"
     },
     "modelFilterEmpty": "Ningún modelo coincide",
     "modelFilterPlaceholder": "Filtrar modelos…",
     "modelPicker": "Modelo",
+    "modelKinds": {
+      "direct": "Directo",
+      "pool": "Grupo"
+    },
     "regenerate": "Regenerar",
+    "requestSettings": "Configuración de la solicitud",
+    "requestSettingsHelp": "Elige la superficie de API, la preferencia de ruta y el nivel de razonamiento para la próxima solicitud.",
+    "samplePromptOne": "Explica las capacidades de este modelo.",
+    "samplePromptTwo": "Dame un plan de pruebas conciso.",
     "routingMode": {
       "label": "Modo de ruta del pool",
       "PREFER_NATIVE": "API preferida (nativa primero)",

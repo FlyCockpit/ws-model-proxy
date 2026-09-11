@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, Link } from "@tanstack/react-router";
 import {
   type ChatTestReasoningSelection,
   encodeReasoning,
@@ -16,8 +16,16 @@ import {
   CommandItem,
   CommandList,
 } from "@ws-model-proxy/ui/components/command";
+import {
+  Drawer,
+  DrawerContent,
+  DrawerDescription,
+  DrawerHeader,
+  DrawerTitle,
+} from "@ws-model-proxy/ui/components/drawer";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { Popover, PopoverContent, PopoverTrigger } from "@ws-model-proxy/ui/components/popover";
+import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { Textarea } from "@ws-model-proxy/ui/components/textarea";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
@@ -26,13 +34,16 @@ import {
   AudioLines,
   ChevronDown,
   ChevronsUpDown,
+  Copy,
   FlaskConical,
+  Image,
   ImagePlus,
   Loader2,
   MessageSquarePlus,
   RefreshCw,
   RotateCcw,
   Send,
+  Settings2,
   Square,
   Video,
   X,
@@ -54,7 +65,9 @@ import { useTranslation } from "react-i18next";
 import { ChatMarkdown } from "@/components/chat-markdown";
 import { InlineRetry } from "@/components/inline-retry";
 import { useAbortOnUnmount } from "@/hooks/use-abort-on-unmount";
+import { useAutosizeTextarea } from "@/hooks/use-autosize-textarea";
 import { useChatScrollEngine } from "@/hooks/use-chat-scroll-engine";
+import { useIsDesktop } from "@/hooks/use-media-query";
 import {
   anthropicTranscript,
   completionDeltas,
@@ -228,6 +241,10 @@ function newId(prefix: string) {
   return `${prefix}_${crypto.randomUUID().replaceAll("-", "_")}`;
 }
 
+function copyToClipboard(value: string, message: string) {
+  void navigator.clipboard.writeText(value).then(() => toast.success(message));
+}
+
 function modelOptions(visibleModels: VisibleModels | undefined): ModelOption[] {
   if (!visibleModels) return [];
   return [
@@ -259,6 +276,23 @@ function filterModelOptions(options: ModelOption[], query: string): ModelOption[
   return options.filter(
     (option) =>
       option.modelId.toLowerCase().includes(needle) || option.label.toLowerCase().includes(needle),
+  );
+}
+
+function ModelModalityIcons({ modalities }: { modalities: AttachmentModalities }) {
+  const { t } = useTranslation(["common", "dashboard"]);
+  const icons = [
+    { enabled: modalities.image, Icon: Image, label: t("dashboard:models.vision") },
+    { enabled: modalities.audio, Icon: AudioLines, label: t("dashboard:models.audio") },
+    { enabled: modalities.video, Icon: Video, label: t("dashboard:models.video") },
+  ];
+
+  return (
+    <span className="flex shrink-0 items-center gap-1 text-muted-foreground">
+      {icons.map(({ enabled, Icon, label }) =>
+        enabled ? <Icon key={label} className="size-3.5" aria-label={label} /> : null,
+      )}
+    </span>
   );
 }
 
@@ -336,7 +370,22 @@ function ModelPicker({
                         setQuery("");
                       }}
                     >
-                      <span className="min-w-0 flex-1 break-all">{option.modelId}</span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate font-medium" title={option.label}>
+                          {option.label}
+                        </span>
+                        <span className="block break-all font-mono text-[11px] text-muted-foreground">
+                          {option.modelId}
+                        </span>
+                      </span>
+                      <span className="inline-flex shrink-0 items-center gap-2">
+                        <span className="rounded-full border bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
+                          {option.kind === "MODEL_POOL"
+                            ? t("dashboard:chatTest.modelKinds.pool")
+                            : t("dashboard:chatTest.modelKinds.direct")}
+                        </span>
+                        <ModelModalityIcons modalities={option.attachmentModalities} />
+                      </span>
                     </CommandItem>
                   );
                 })}
@@ -346,6 +395,129 @@ function ModelPicker({
         </Command>
       </PopoverContent>
     </Popover>
+  );
+}
+
+function RequestSettingsFields({
+  idPrefix,
+  isPool,
+  selectedModel,
+  surfaceSelection,
+  effectiveSurface,
+  recommendedSurface,
+  routingMode,
+  selectorState,
+  effectiveReasoningSelection,
+  reasoningHelp,
+  disabled,
+  onSurfaceChange,
+  onRoutingModeChange,
+  onReasoningChange,
+}: {
+  idPrefix: string;
+  isPool: boolean;
+  selectedModel: ModelOption | undefined;
+  surfaceSelection: ChatTestSurfaceSelection;
+  effectiveSurface: ChatTestSurface | null;
+  recommendedSurface: string | null | undefined;
+  routingMode: ChatTestRoutingMode;
+  selectorState: ReturnType<typeof reasoningSelectorState>;
+  effectiveReasoningSelection: ChatTestReasoningSelection;
+  reasoningHelp: string;
+  disabled: boolean;
+  onSurfaceChange: (value: ChatTestSurfaceSelection) => void;
+  onRoutingModeChange: (value: ChatTestRoutingMode) => void;
+  onReasoningChange: (value: ChatTestReasoningSelection) => void;
+}) {
+  const { t } = useTranslation(["dashboard"]);
+
+  return (
+    <div className="space-y-4">
+      {isPool ? (
+        <div className="space-y-1.5">
+          <Label htmlFor={`${idPrefix}-surface`}>{t("dashboard:chatTest.surface.label")}</Label>
+          <select
+            id={`${idPrefix}-surface`}
+            className="min-h-11 w-full rounded-md border bg-background px-3 text-sm"
+            value={surfaceSelection}
+            disabled={disabled}
+            aria-invalid={surfaceSelection === "PREFERRED" && effectiveSurface === null}
+            onChange={(event) => onSurfaceChange(event.target.value as ChatTestSurfaceSelection)}
+          >
+            <option value="PREFERRED">{t("dashboard:chatTest.surface.PREFERRED")}</option>
+            <option value="OPENAI_CHAT_COMPLETIONS">
+              {t("dashboard:chatTest.surface.OPENAI_CHAT_COMPLETIONS")}
+            </option>
+            <option value="OPENAI_RESPONSES">
+              {t("dashboard:chatTest.surface.OPENAI_RESPONSES")}
+            </option>
+            <option value="ANTHROPIC_MESSAGES">
+              {t("dashboard:chatTest.surface.ANTHROPIC_MESSAGES")}
+            </option>
+          </select>
+          <p className="text-xs text-muted-foreground">
+            {surfaceSelection === "PREFERRED" && recommendedSurface
+              ? t("dashboard:chatTest.surface.preferredHelp", { surface: recommendedSurface })
+              : t("dashboard:chatTest.surface.explicitHelp")}
+          </p>
+        </div>
+      ) : null}
+      {isPool ? (
+        <div className="space-y-1.5">
+          <Label htmlFor={`${idPrefix}-routing-mode`}>
+            {t("dashboard:chatTest.routingMode.label")}
+          </Label>
+          <select
+            id={`${idPrefix}-routing-mode`}
+            className="min-h-11 w-full rounded-md border bg-background px-3 text-sm"
+            value={routingMode}
+            disabled={disabled}
+            onChange={(event) => onRoutingModeChange(event.target.value as ChatTestRoutingMode)}
+          >
+            <option value="PREFER_NATIVE">
+              {t("dashboard:chatTest.routingMode.PREFER_NATIVE")}
+            </option>
+            <option value="REQUIRE_NATIVE">
+              {t("dashboard:chatTest.routingMode.REQUIRE_NATIVE")}
+            </option>
+            <option value="REQUIRE_ADAPTED">
+              {t("dashboard:chatTest.routingMode.REQUIRE_ADAPTED")}
+            </option>
+          </select>
+          <p className="text-xs text-muted-foreground">
+            {t("dashboard:chatTest.routingMode.help")}
+          </p>
+        </div>
+      ) : selectedModel ? (
+        <p className="text-xs text-muted-foreground">
+          {t("dashboard:chatTest.routingMode.directHelp")}
+        </p>
+      ) : null}
+      {!selectorState.hidden ? (
+        <div className="space-y-1.5">
+          <Label htmlFor={`${idPrefix}-reasoning`}>{t("dashboard:chatTest.reasoning.label")}</Label>
+          <select
+            id={`${idPrefix}-reasoning`}
+            className="min-h-11 w-full rounded-md border bg-background px-3 text-sm"
+            value={effectiveReasoningSelection}
+            disabled={disabled}
+            onChange={(event) =>
+              onReasoningChange(event.target.value as ChatTestReasoningSelection)
+            }
+          >
+            {selectorState.options.map((level) => (
+              <option key={level} value={level}>
+                {t(`dashboard:chatTest.reasoning.levels.${level}`)}
+                {level !== "unset" && selectorState.defaultLevel === level
+                  ? ` (${t("dashboard:chatTest.reasoning.default")})`
+                  : ""}
+              </option>
+            ))}
+          </select>
+          <p className="text-xs text-muted-foreground">{reasoningHelp}</p>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -726,6 +898,7 @@ function formatBytes(bytes: number): string {
 
 function ChatTestPage() {
   const { t } = useTranslation(["common", "dashboard"]);
+  const { lang } = Route.useParams();
   const {
     data: visibleModelsData,
     isPending: visibleModelsIsPending,
@@ -744,6 +917,7 @@ function ChatTestPage() {
   const [routingMode, setRoutingMode] = useState<ChatTestRoutingMode>("PREFER_NATIVE");
   const [surfaceSelection, setSurfaceSelection] = useState<ChatTestSurfaceSelection>("PREFERRED");
   const [reasoningSelection, setReasoningSelection] = useState<ChatTestReasoningSelection>("unset");
+  const [requestSettingsOpen, setRequestSettingsOpen] = useState(false);
   const [draft, setDraft] = useState("");
   const [systemPrompt, setSystemPrompt] = useState("");
   // Collapsed by default so the mobile transcript keeps most of the viewport;
@@ -756,6 +930,7 @@ function ChatTestPage() {
   const [announcement, setAnnouncement] = useState("");
   const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
   const [attachmentNotice, setAttachmentNotice] = useState("");
+  const [attachmentNoticeIsError, setAttachmentNoticeIsError] = useState(false);
   const [isProcessingImages, setIsProcessingImages] = useState(false);
   const [videoCompressionProgress, setVideoCompressionProgress] = useState<number | null>(null);
   const [isPreparingSend, setIsPreparingSend] = useState(false);
@@ -766,6 +941,8 @@ function ChatTestPage() {
   const activeAssistantIdRef = useRef<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const videoFileInputRef = useRef<HTMLInputElement | null>(null);
+  const draftTextareaRef = useAutosizeTextarea(draft);
+  const isDesktop = useIsDesktop();
   const isAddingAttachmentsRef = useRef(false);
   const isMountedRef = useAbortOnUnmount(videoCompressionAbortRef);
   const scroll = useChatScrollEngine();
@@ -865,6 +1042,27 @@ function ChatTestPage() {
     !isProcessingImages &&
     !isPreparingSend;
 
+  const clearAttachmentNotice = useCallback(() => {
+    setAttachmentNotice("");
+    setAttachmentNoticeIsError(false);
+  }, []);
+
+  const showAttachmentFailure = useCallback((message: string) => {
+    setAttachmentNotice(message);
+    setAttachmentNoticeIsError(true);
+    toast.error(message);
+  }, []);
+
+  const handleSurfaceChange = useCallback((value: ChatTestSurfaceSelection) => {
+    setSurfaceSelection(value);
+    setReasoningSelection("unset");
+  }, []);
+
+  const handleRoutingModeChange = useCallback((value: ChatTestRoutingMode) => {
+    setRoutingMode(value);
+    if (value === "REQUIRE_ADAPTED") setReasoningSelection("unset");
+  }, []);
+
   const handleModelChange = useCallback(
     (modelId: string) => {
       const nextModel = options.find((option) => option.modelId === modelId);
@@ -901,6 +1099,7 @@ function ChatTestPage() {
         }
         setAttachments(retained);
         setAttachmentNotice(t("dashboard:chatTest.attachments.removedForModelLimit"));
+        setAttachmentNoticeIsError(false);
       }
     },
     [attachments, mediaConfig, options, t],
@@ -920,12 +1119,13 @@ function ChatTestPage() {
         return info && attachmentModalities[info.modality] ? [{ file, ...info }] : [];
       });
       if (supportedFiles.length === 0) {
-        if (files.length > 0) setAttachmentNotice(t("dashboard:chatTest.attachments.unsupported"));
+        if (files.length > 0)
+          showAttachmentFailure(t("dashboard:chatTest.attachments.unsupported"));
         return;
       }
       const remaining = MAX_ATTACHMENTS_PER_MESSAGE - attachments.length;
       if (remaining <= 0) {
-        setAttachmentNotice(
+        showAttachmentFailure(
           t("dashboard:chatTest.attachments.maxReached", { count: MAX_ATTACHMENTS_PER_MESSAGE }),
         );
         return;
@@ -934,7 +1134,7 @@ function ChatTestPage() {
       const truncated = supportedFiles.length > remaining;
       isAddingAttachmentsRef.current = true;
       setIsProcessingImages(true);
-      setAttachmentNotice("");
+      clearAttachmentNotice();
       // Media may be disabled mid-batch if an upload reports 501; track locally
       // and mirror into the query cache so later attachments skip the round trip.
       let uploadEnabled = mediaEnabled;
@@ -1140,7 +1340,20 @@ function ChatTestPage() {
             t("dashboard:chatTest.attachments.maxReached", { count: MAX_ATTACHMENTS_PER_MESSAGE }),
           );
         }
-        setAttachmentNotice(notices.join(" "));
+        const notice = notices.join(" ");
+        if (notice) {
+          const hasHardFailure =
+            quotaHit ||
+            mediaStoreRequired ||
+            uploadTooLargeMaxBytes !== undefined ||
+            rejectedCount > 0 ||
+            compressionNotice.length > 0;
+          if (hasHardFailure) showAttachmentFailure(notice);
+          else {
+            setAttachmentNotice(notice);
+            setAttachmentNoticeIsError(false);
+          }
+        }
       } finally {
         isAddingAttachmentsRef.current = false;
         if (isMountedRef.current) setIsProcessingImages(false);
@@ -1155,6 +1368,8 @@ function ChatTestPage() {
       queryClient,
       t,
       isMountedRef,
+      clearAttachmentNotice,
+      showAttachmentFailure,
     ],
   );
 
@@ -1403,7 +1618,7 @@ function ChatTestPage() {
       );
       const estimatedBytes = estimateRequestBytes(effectiveModelId, estimateInput);
       if (estimatedBytes > TOTAL_REQUEST_HARD_MAX_BYTES) {
-        setAttachmentNotice(t("dashboard:chatTest.attachments.requestTooLarge"));
+        showAttachmentFailure(t("dashboard:chatTest.attachments.requestTooLarge"));
         return;
       }
 
@@ -1413,7 +1628,7 @@ function ChatTestPage() {
         // Mint fresh signed URLs for uploaded attachments right before sending.
         const prepared = await buildSignedRelayInput(nextMessages, userMessage.id);
         if (!prepared.ok) {
-          setAttachmentNotice(
+          showAttachmentFailure(
             prepared.reason === "expired"
               ? t("dashboard:chatTest.attachments.expired")
               : t("dashboard:chatTest.attachments.signFailed"),
@@ -1423,8 +1638,9 @@ function ChatTestPage() {
 
         if (estimatedBytes > TOTAL_REQUEST_SOFT_WARN_BYTES) {
           setAttachmentNotice(t("dashboard:chatTest.attachments.requestLargeWarning"));
+          setAttachmentNoticeIsError(false);
         } else {
-          setAttachmentNotice("");
+          clearAttachmentNotice();
         }
 
         setDraft("");
@@ -1457,6 +1673,8 @@ function ChatTestPage() {
       messages,
       runRelay,
       scroll,
+      clearAttachmentNotice,
+      showAttachmentFailure,
       t,
     ],
   );
@@ -1480,10 +1698,16 @@ function ChatTestPage() {
       setIsPreparingSend(true);
       try {
         scroll.markUserIntent();
+        // A regenerate replays the thread through this assistant turn. Remove
+        // subsequent turns first so the transcript remains an exact view of
+        // the conversation sent to the relay.
+        const assistantIndex = messages.findIndex((message) => message.id === assistant.id);
+        if (assistantIndex < 0) return;
+        const replayedMessages = messages.slice(0, assistantIndex + 1);
         // Re-sign any uploaded attachments in the replayed thread before relaying.
-        const prepared = await buildSignedRelayInput(messages, sourceUserMessageId);
+        const prepared = await buildSignedRelayInput(replayedMessages, sourceUserMessageId);
         if (!prepared.ok) {
-          setAttachmentNotice(
+          showAttachmentFailure(
             prepared.reason === "expired"
               ? t("dashboard:chatTest.attachments.expired")
               : t("dashboard:chatTest.attachments.signFailed"),
@@ -1491,7 +1715,7 @@ function ChatTestPage() {
           return;
         }
         setMessages((current) =>
-          current.map((message) =>
+          current.slice(0, assistantIndex + 1).map((message) =>
             message.id === assistant.id
               ? {
                   ...message,
@@ -1513,7 +1737,16 @@ function ChatTestPage() {
         setIsPreparingSend(false);
       }
     },
-    [buildSignedRelayInput, effectiveModelId, isStreaming, messages, runRelay, scroll, t],
+    [
+      buildSignedRelayInput,
+      effectiveModelId,
+      isStreaming,
+      messages,
+      runRelay,
+      scroll,
+      showAttachmentFailure,
+      t,
+    ],
   );
 
   const handleKeyDown = useCallback(
@@ -1561,10 +1794,10 @@ function ChatTestPage() {
     setSystemPrompt("");
     setSystemPromptOpen(false);
     setAttachments([]);
-    setAttachmentNotice("");
+    clearAttachmentNotice();
     setReasoningSelection("unset");
     setAnnouncement(t("dashboard:chatTest.announcements.fresh"));
-  }, [isPreparingSend, isStreaming, scroll, t]);
+  }, [clearAttachmentNotice, isPreparingSend, isStreaming, scroll, t]);
 
   if (visibleModelsIsPending) {
     return <ChatTestSkeleton />;
@@ -1603,101 +1836,67 @@ function ChatTestPage() {
             onValueChange={handleModelChange}
             disabled={isStreaming || isPreparingSend}
           />
-          {isPool ? (
-            <div className="min-w-[13rem] max-w-full space-y-1">
-              <Label htmlFor="chat-test-surface" className="sr-only">
-                {t("dashboard:chatTest.surface.label")}
-              </Label>
-              <select
-                id="chat-test-surface"
-                className="h-11 w-full rounded-md border bg-background px-3 text-sm"
-                value={surfaceSelection}
-                disabled={isStreaming || isPreparingSend}
-                aria-invalid={surfaceSelection === "PREFERRED" && effectiveSurface === null}
-                onChange={(event) => {
-                  setSurfaceSelection(event.target.value as ChatTestSurfaceSelection);
-                  setReasoningSelection("unset");
-                }}
-              >
-                <option value="PREFERRED">{t("dashboard:chatTest.surface.PREFERRED")}</option>
-                <option value="OPENAI_CHAT_COMPLETIONS">
-                  {t("dashboard:chatTest.surface.OPENAI_CHAT_COMPLETIONS")}
-                </option>
-                <option value="OPENAI_RESPONSES">
-                  {t("dashboard:chatTest.surface.OPENAI_RESPONSES")}
-                </option>
-                <option value="ANTHROPIC_MESSAGES">
-                  {t("dashboard:chatTest.surface.ANTHROPIC_MESSAGES")}
-                </option>
-              </select>
-              <p className="text-xs text-muted-foreground">
-                {surfaceSelection === "PREFERRED" && recommendedSurface
-                  ? t("dashboard:chatTest.surface.preferredHelp", { surface: recommendedSurface })
-                  : t("dashboard:chatTest.surface.explicitHelp")}
-              </p>
-            </div>
+          {effectiveSurface ? (
+            <span className="inline-flex min-h-11 max-w-full items-center rounded-full border bg-muted px-3 text-xs text-muted-foreground">
+              {t(`dashboard:chatTest.surface.${effectiveSurface}`)}
+            </span>
           ) : null}
           {isPool ? (
-            <div className="min-w-[13rem] max-w-full space-y-1">
-              <Label htmlFor="chat-test-routing-mode" className="sr-only">
-                {t("dashboard:chatTest.routingMode.label")}
-              </Label>
-              <select
-                id="chat-test-routing-mode"
-                className="h-11 w-full rounded-md border bg-background px-3 text-sm"
-                value={routingMode}
-                disabled={isStreaming || isPreparingSend}
-                onChange={(event) => {
-                  setRoutingMode(event.target.value as ChatTestRoutingMode);
-                  if (event.target.value === "REQUIRE_ADAPTED") setReasoningSelection("unset");
-                }}
-              >
-                <option value="PREFER_NATIVE">
-                  {t("dashboard:chatTest.routingMode.PREFER_NATIVE")}
-                </option>
-                <option value="REQUIRE_NATIVE">
-                  {t("dashboard:chatTest.routingMode.REQUIRE_NATIVE")}
-                </option>
-                <option value="REQUIRE_ADAPTED">
-                  {t("dashboard:chatTest.routingMode.REQUIRE_ADAPTED")}
-                </option>
-              </select>
-              <p className="text-xs text-muted-foreground">
-                {t("dashboard:chatTest.routingMode.help")}
-              </p>
-            </div>
-          ) : null}
-          {selectedModel && !isPool ? (
-            <p className="min-w-[13rem] max-w-full text-xs text-muted-foreground">
-              {t("dashboard:chatTest.routingMode.directHelp")}
-            </p>
+            <span className="inline-flex min-h-11 max-w-full items-center rounded-full border bg-muted px-3 text-xs text-muted-foreground">
+              {t(`dashboard:chatTest.routingMode.${routingMode}`)}
+            </span>
           ) : null}
           {!selectorState.hidden ? (
-            <div className="min-w-[13rem] max-w-full space-y-1">
-              <Label htmlFor="chat-test-reasoning" className="sr-only">
-                {t("dashboard:chatTest.reasoning.label")}
-              </Label>
-              <select
-                id="chat-test-reasoning"
-                className="h-11 w-full rounded-md border bg-background px-3 text-sm"
-                value={effectiveReasoningSelection}
-                disabled={isStreaming || isPreparingSend}
-                onChange={(event) =>
-                  setReasoningSelection(event.target.value as ChatTestReasoningSelection)
+            <span className="inline-flex min-h-11 max-w-full items-center rounded-full border bg-muted px-3 text-xs text-muted-foreground">
+              {t(`dashboard:chatTest.reasoning.levels.${effectiveReasoningSelection}`)}
+            </span>
+          ) : null}
+          {isDesktop ? (
+            <Popover>
+              <PopoverTrigger
+                render={
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="touch"
+                    disabled={isStreaming || isPreparingSend}
+                  />
                 }
               >
-                {selectorState.options.map((level) => (
-                  <option key={level} value={level}>
-                    {t(`dashboard:chatTest.reasoning.levels.${level}`)}
-                    {level !== "unset" && selectorState.defaultLevel === level
-                      ? ` (${t("dashboard:chatTest.reasoning.default")})`
-                      : ""}
-                  </option>
-                ))}
-              </select>
-              <p className="text-xs text-muted-foreground">{reasoningHelp}</p>
-            </div>
-          ) : null}
+                <Settings2 className="size-4" />
+                {t("dashboard:chatTest.requestSettings")}
+              </PopoverTrigger>
+              <PopoverContent className="w-80 p-4" align="end">
+                <RequestSettingsFields
+                  idPrefix="chat-test-desktop"
+                  isPool={Boolean(isPool)}
+                  selectedModel={selectedModel}
+                  surfaceSelection={surfaceSelection}
+                  effectiveSurface={effectiveSurface}
+                  recommendedSurface={recommendedSurface}
+                  routingMode={routingMode}
+                  selectorState={selectorState}
+                  effectiveReasoningSelection={effectiveReasoningSelection}
+                  reasoningHelp={reasoningHelp}
+                  disabled={isStreaming || isPreparingSend}
+                  onSurfaceChange={handleSurfaceChange}
+                  onRoutingModeChange={handleRoutingModeChange}
+                  onReasoningChange={setReasoningSelection}
+                />
+              </PopoverContent>
+            </Popover>
+          ) : (
+            <Button
+              type="button"
+              variant="outline"
+              size="touch"
+              disabled={isStreaming || isPreparingSend}
+              onClick={() => setRequestSettingsOpen(true)}
+            >
+              <Settings2 className="size-4" />
+              {t("dashboard:chatTest.requestSettings")}
+            </Button>
+          )}
           <Button
             type="button"
             variant="outline"
@@ -1725,6 +1924,37 @@ function ChatTestPage() {
           ) : null}
         </div>
       </div>
+      {!isDesktop ? (
+        <Drawer open={requestSettingsOpen} onOpenChange={setRequestSettingsOpen}>
+          <DrawerContent
+            overlayClassName="md:hidden"
+            style={{ paddingBottom: "var(--safe-area-bottom)" }}
+          >
+            <DrawerHeader>
+              <DrawerTitle>{t("dashboard:chatTest.requestSettings")}</DrawerTitle>
+              <DrawerDescription>{t("dashboard:chatTest.requestSettingsHelp")}</DrawerDescription>
+            </DrawerHeader>
+            <div className="overflow-y-auto overflow-x-hidden overscroll-contain px-4 pb-4">
+              <RequestSettingsFields
+                idPrefix="chat-test-mobile"
+                isPool={Boolean(isPool)}
+                selectedModel={selectedModel}
+                surfaceSelection={surfaceSelection}
+                effectiveSurface={effectiveSurface}
+                recommendedSurface={recommendedSurface}
+                routingMode={routingMode}
+                selectorState={selectorState}
+                effectiveReasoningSelection={effectiveReasoningSelection}
+                reasoningHelp={reasoningHelp}
+                disabled={isStreaming || isPreparingSend}
+                onSurfaceChange={handleSurfaceChange}
+                onRoutingModeChange={handleRoutingModeChange}
+                onReasoningChange={setReasoningSelection}
+              />
+            </div>
+          </DrawerContent>
+        </Drawer>
+      ) : null}
 
       <div className="relative min-h-0">
         <div
@@ -1732,13 +1962,41 @@ function ChatTestPage() {
           onScroll={scroll.markUserIntent}
           className="h-full min-h-0 overflow-y-auto overflow-x-clip overscroll-y-contain p-2 scrollbar-gutter-stable focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring/50 sm:p-3"
           aria-label={t("dashboard:chatTest.transcript")}
+          role="log"
+          tabIndex={0}
         >
           <div ref={scroll.contentRef} className="mx-auto max-w-4xl space-y-3 sm:space-y-4">
             {messages.length === 0 ? (
               <div className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground sm:p-8">
-                {options.length === 0
-                  ? t("dashboard:chatTest.emptyModels")
-                  : t("dashboard:chatTest.emptyTranscript")}
+                {options.length === 0 ? (
+                  <div className="space-y-3">
+                    <p>{t("dashboard:chatTest.emptyModels")}</p>
+                    <Link
+                      to="/$lang/dashboard/pools/new"
+                      params={{ lang }}
+                      className="inline-flex h-11 items-center justify-center rounded-none border border-border bg-background px-3.5 text-xs font-medium text-foreground hover:bg-muted"
+                    >
+                      {t("dashboard:chatTest.createPool")}
+                    </Link>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    <p>{t("dashboard:chatTest.emptyTranscript")}</p>
+                    <div className="flex flex-wrap justify-center gap-2">
+                      {["samplePromptOne", "samplePromptTwo"].map((key) => (
+                        <Button
+                          key={key}
+                          type="button"
+                          variant="outline"
+                          size="touch"
+                          onClick={() => setDraft(t(`dashboard:chatTest.${key}`))}
+                        >
+                          {t(`dashboard:chatTest.${key}`)}
+                        </Button>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             ) : (
               messages.map((message) => (
@@ -1850,7 +2108,7 @@ function ChatTestPage() {
                     aria-label={t("dashboard:chatTest.attachments.remove", {
                       name: attachment.name,
                     })}
-                    className="absolute -right-2 -top-2 flex size-7 items-center justify-center rounded-full border bg-background text-muted-foreground shadow-sm hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring sm:size-6"
+                    className="absolute -right-2 -top-2 flex size-11 items-center justify-center rounded-full border bg-background text-muted-foreground shadow-sm hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                   >
                     <X className="size-3.5" />
                   </button>
@@ -1859,7 +2117,13 @@ function ChatTestPage() {
             </ul>
           ) : null}
           {attachmentNotice ? (
-            <p className="text-xs text-muted-foreground" role="status">
+            <p
+              className={cn(
+                "text-xs",
+                attachmentNoticeIsError ? "font-medium text-destructive" : "text-muted-foreground",
+              )}
+              role={attachmentNoticeIsError ? "alert" : "status"}
+            >
               {attachmentNotice}
             </p>
           ) : null}
@@ -1933,6 +2197,7 @@ function ChatTestPage() {
               </Button>
             ) : null}
             <Textarea
+              ref={draftTextareaRef}
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
               onKeyDown={handleKeyDown}
@@ -2009,7 +2274,7 @@ function MessageBubble({
   onRegenerate: (message: ChatMessage) => void;
   canRegenerate: boolean;
 }) {
-  const { t } = useTranslation(["dashboard"]);
+  const { t } = useTranslation(["common", "dashboard"]);
   const isAssistant = message.role === "assistant";
   const showRegenerate =
     isAssistant &&
@@ -2031,6 +2296,9 @@ function MessageBubble({
         {message.status === "streaming" ? (
           <span className="text-xs text-muted-foreground">
             {t("dashboard:chatTest.status.streaming")}
+            <span className="ml-0.5 inline-block animate-pulse" aria-hidden="true">
+              ▍
+            </span>
           </span>
         ) : null}
         {message.status === "stopped" ? (
@@ -2062,7 +2330,10 @@ function MessageBubble({
         <p className="text-sm text-muted-foreground">{t("dashboard:chatTest.status.waiting")}</p>
       )}
       {isAssistant && message.thinking ? (
-        <details className="mt-3 rounded-md border border-border/70 bg-muted/30 p-2 text-sm">
+        <details
+          open={message.status === "streaming" || undefined}
+          className="mt-3 rounded-md border border-border/70 bg-muted/30 p-2 text-sm"
+        >
           <summary className="flex min-h-11 cursor-pointer items-center font-medium">
             {t("dashboard:chatTest.reasoning.thinkingSummary")}
           </summary>
@@ -2087,7 +2358,7 @@ function MessageBubble({
       ) : null}
       {isAssistant && message.transformDebug ? (
         <details className="mt-3 rounded-md border border-border/70 bg-muted/30 p-2 text-xs">
-          <summary className="cursor-pointer font-medium">
+          <summary className="flex min-h-11 cursor-pointer items-center font-medium">
             {t("dashboard:chatTest.transform.title")}
           </summary>
           <p className="mt-2 text-muted-foreground">
@@ -2110,9 +2381,32 @@ function MessageBubble({
         </details>
       ) : null}
       {message.status === "error" && message.errorMessage ? (
-        <p className="mt-3 rounded-md border border-destructive/30 bg-destructive/10 p-2 text-sm text-destructive">
-          {message.errorMessage}
-        </p>
+        <div className="mt-3 flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 p-2 text-sm text-destructive">
+          <p className="min-w-0 flex-1 break-words">{message.errorMessage}</p>
+          <Button
+            type="button"
+            variant="destructive"
+            size="icon"
+            onClick={() => copyToClipboard(message.errorMessage ?? "", t("common:actions.copied"))}
+            aria-label={t("common:actions.copy")}
+            title={t("common:actions.copy")}
+          >
+            <Copy className="size-3.5" />
+          </Button>
+        </div>
+      ) : null}
+      {isAssistant && message.content ? (
+        <div className="mt-3 flex justify-end">
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={() => copyToClipboard(message.content, t("common:actions.copied"))}
+          >
+            <Copy className="size-3.5" />
+            {t("common:actions.copy")}
+          </Button>
+        </div>
       ) : null}
       {showRegenerate ? (
         <div className="mt-3 flex justify-end">
