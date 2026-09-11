@@ -1700,7 +1700,10 @@ export function PoolForm({
       capacityBorrowPolicy: (pool?.capacityBorrowPolicy === "NEVER" ? "NEVER" : "WHEN_IDLE") as
         | "NEVER"
         | "WHEN_IDLE",
-      affinityEnabled: pool?.affinity.enabled ?? false,
+      // Create mode (no existing pool) defaults affinity ON, matching the
+      // guarded wizard; edit mode always receives the stored value from the
+      // pool detail query, so the fallback never masks it.
+      affinityEnabled: pool?.affinity.enabled ?? true,
       affinityTtlSeconds: pool?.affinity.ttlSeconds ?? 3600,
       affinityMaxRecords: pool?.affinity.maxRecords ?? 10_000,
       affinityPrefixWeight: pool?.affinity.prefixWeight ?? 100,

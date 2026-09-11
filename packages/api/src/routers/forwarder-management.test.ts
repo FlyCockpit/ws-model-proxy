@@ -1967,6 +1967,39 @@ describe("forwarderManagementRouter", () => {
     expect(db.poolGrant.deleteMany).not.toHaveBeenCalled();
   });
 
+  it("defaults cache-affinity routing on for legacy creates while honoring an explicit opt-out", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.modelPool.create.mockResolvedValue(poolRow());
+
+    // Affinity input omitted: defaults ON with the shared fallback tuple.
+    await client().createModelPool({ slug: "affinity-default", name: "Affinity default" });
+    expect(db.modelPool.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          affinityEnabled: true,
+          affinityTtlSeconds: 3600,
+          affinityMaxRecords: 10_000,
+          affinityPrefixWeight: 100,
+          affinityConversationWeight: 150,
+          affinityConfirmedCacheWeight: 250,
+          affinityLoadPenaltyWeight: 100,
+        }),
+      }),
+    );
+
+    // Explicit opt-out persists false.
+    await client().createModelPool({
+      slug: "affinity-opt-out",
+      name: "Affinity opt out",
+      affinityEnabled: false,
+    });
+    expect(db.modelPool.create).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ affinityEnabled: false }),
+      }),
+    );
+  });
+
   it("rejects lossy collapse without adaptation and resolves partial updates from the stored pool", async () => {
     await expect(
       client().createModelPool({

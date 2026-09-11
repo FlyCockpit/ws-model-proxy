@@ -2385,7 +2385,9 @@ export const forwarderManagementRouter = {
         capacityContextCeiling: input.capacityContextCeiling ?? null,
         capacityContextMargin: input.capacityContextMargin ?? 0,
         capacityBorrowPolicy: input.capacityBorrowPolicy ?? "WHEN_IDLE",
-        affinityEnabled: input.affinityEnabled ?? false,
+        // Cache-affinity routing defaults ON for legacy creates too, matching
+        // the guarded wizard path; explicit opt-out is honored below.
+        affinityEnabled: input.affinityEnabled ?? true,
         affinityTtlSeconds: input.affinityTtlSeconds ?? 3600,
         affinityMaxRecords: input.affinityMaxRecords ?? 10_000,
         affinityPrefixWeight: input.affinityPrefixWeight ?? 100,

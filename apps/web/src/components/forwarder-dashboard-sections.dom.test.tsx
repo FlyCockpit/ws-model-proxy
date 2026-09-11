@@ -299,6 +299,52 @@ describe("PoolForm protocol adaptation controls", () => {
   });
 });
 
+describe("PoolForm affinity defaults", () => {
+  it("initializes the affinity toggle checked in create mode and submits true", async () => {
+    mount();
+
+    const toggle = screen.getByLabelText("dashboard:pools.affinity.enabled");
+    expect((toggle as HTMLInputElement).checked).toBe(true);
+
+    fireEvent.change(screen.getByLabelText("dashboard:pools.slug"), {
+      target: { value: "primary" },
+    });
+    fireEvent.change(screen.getByLabelText("dashboard:pools.name"), {
+      target: { value: "Primary" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["createModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({ affinityEnabled: true });
+  });
+
+  it("submits an explicit opt-out when the create-mode toggle is unchecked", async () => {
+    mount();
+
+    fireEvent.click(screen.getByLabelText("dashboard:pools.affinity.enabled"));
+    fireEvent.change(screen.getByLabelText("dashboard:pools.slug"), {
+      target: { value: "primary" },
+    });
+    fireEvent.change(screen.getByLabelText("dashboard:pools.name"), {
+      target: { value: "Primary" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["createModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({ affinityEnabled: false });
+  });
+
+  it("loads the stored affinity value in edit mode", () => {
+    // editablePool stores affinity disabled; the edit form must keep it off
+    // instead of falling back to the create-mode ON default.
+    mount(true, { mode: "edit" });
+
+    expect(
+      (screen.getByLabelText("dashboard:pools.affinity.enabled") as HTMLInputElement).checked,
+    ).toBe(false);
+  });
+});
+
 const localMember = {
   id: "member-1",
   createdAt: new Date(),
