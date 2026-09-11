@@ -211,7 +211,7 @@
     "notFound": "No se encontró este grupo o ya no está disponible para ti.",
     "affinity": {
       "title": "Enrutamiento según caché",
-      "description": "Las sesiones nuevas van al miembro con la mejor puntuación de disponibilidad (carga, salud, salida pública y costo). Cuando esas puntuaciones empatan, se prefiere un entorno que quizá conserve un prefijo de instrucción coincidente. Después de un turno de asistente o de herramienta, se prefiere el miembro que sirvió la conversación hasta ahora. Una conversación larga puede superar una carga moderada o un miembro medio abierto; una cola grande igual desborda la solicitud.",
+      "description": "Las sesiones nuevas van al miembro con la mejor puntuación de disponibilidad (carga, salud, salida pública y costo). Cuando esas puntuaciones empatan, se prefiere un entorno que quizá conserve un prefijo de instrucción coincidente. El enrutamiento consciente del prompt de sistema es parte de este interruptor. Después de un turno de asistente o de herramienta, se prefiere el miembro que sirvió la conversación hasta ahora. Una conversación larga puede superar una carga moderada o un miembro medio abierto; una cola grande igual desborda la solicitud.",
       "enabled": "Activar afinidad de caché opcional",
       "stats": "{{records}} registros activos en {{targets}} destinos",
       "clear": "Borrar registros de afinidad",
@@ -312,9 +312,45 @@
     "noneAvailable": "Ninguna disponible",
     "protocolCompatibility": "Compatibilidad de protocolos",
     "protocolCompatibilityHint": "La adaptación es opcional y rechaza funciones fuera del subconjunto común documentado.",
+    "protocolOptions": {
+      "native": {
+        "label": "Solo nativo (recomendado)",
+        "help": "Los miembros responden solo los formatos de API que implementan; los demás devuelven 400."
+      },
+      "lossless": {
+        "label": "Traducción sin pérdida",
+        "help": "Traduce entre Chat Completions, Responses y Anthropic Messages cuando la solicitud se puede representar exactamente."
+      },
+      "lossy": {
+        "label": "Sin pérdida, más combinación de instrucciones",
+        "help": "También combina las instrucciones system y developer para el único canal de instrucciones de Anthropic; se pierde su distinción de prioridad."
+      }
+    },
+    "protocolRejectedTitle": "Qué se rechaza",
+    "protocolRejectedHelp": "La traducción aún rechaza razonamiento, salida estructurada, herramientas alojadas o paralelas, Responses con estado, audio, video, betas y otras funciones que no pueden representarse exactamente.",
     "recommendedAutomatic": "Recomendación automática",
     "recommendedSurface": "API recomendada",
-    "recommendedSurfaceOverride": "Anulación de API recomendada",
+    "recommendedSurfaceOverride": "API recomendada (orientativa)",
+    "detailNavAriaLabel": "Secciones del pool",
+    "tabs": {
+      "overview": "Resumen",
+      "fallback": "Respaldo y desbordamiento",
+      "routing": "Enrutamiento",
+      "capacity": "Capacidad",
+      "media": "Medios",
+      "access": "Acceso"
+    },
+    "fallbackDescription": "El desbordamiento público se intenta solo cuando los miembros locales están a capacidad máxima o no son saludables.",
+    "fallbackDisabledDeployment": "Los proveedores de respaldo están desactivados para esta implementación.",
+    "fallbackEmpty": "No hay proveedores de respaldo. Cuando los miembros locales están a capacidad máxima o no son saludables, las solicitudes fallan en lugar de desbordarse.",
+    "fallbackSteps": {
+      "account": "Agrega una cuenta y credencial de proveedor",
+      "model": "Agrega un modelo y sus precios",
+      "ceiling": "Establece un límite de gasto",
+      "acknowledge": "Reconoce que las solicitudes salen de esta implementación"
+    },
+    "addFallbackProvider": "Agregar proveedor de respaldo",
+    "accessEgressHint": "Dar acceso a un pool con proveedores requiere reconocer la salida de datos.",
     "streaming": "streaming",
     "surfaceCounts": "{{native}} nativos · {{adapted}} adaptados · {{unavailable}} no disponibles",
     "surfaceTierCounts": "{{tier}}: {{native}} nativos · {{adapted}} adaptados · {{unavailable}} no disponibles",
@@ -551,8 +587,8 @@
     "noDirectModels": "No hay modelos directos disponibles para agregar.",
     "noGrants": "Todavía no hay permisos.",
     "noMembers": "Todavía no hay miembros.",
-    "optimisticBasicTranscription": "Permitir miembros desconocidos para transcripción básica",
-    "optimisticBasicTranscriptionHint": "Los miembros compatibles confirmados siempre se intentan primero. Los desconocidos solo son respaldo y nunca reciben solicitudes de streaming, marcas de tiempo, diarización, formatos especiales o idioma restringido.",
+    "optimisticBasicTranscription": "Probar modelos de audio que no han informado soporte de transcripción",
+    "optimisticBasicTranscriptionHint": "Cuando ningún miembro confirma soporte para /v1/audio/transcriptions, usa como respaldo miembros cuyas capacidades no se informaron, pero solo para transcripción JSON simple, sin streaming y sin idioma, marcas de tiempo ni diarización.",
     "removeMember": "Eliminar miembro",
     "removeMemberDescription": "Este modelo dejará de recibir tráfico mediante el pool.",
     "removeMemberTitle": "Eliminar miembro del pool",

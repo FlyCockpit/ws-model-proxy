@@ -29,7 +29,12 @@ All require an active session, enforced by the `_auth` layout.
 | `/{lang}/dashboard/model-api-tokens` | Own OpenAI-compatible model API tokens. |
 | `/{lang}/dashboard/pools` | Own model pools and provider operations; pool cards lead to their dedicated detail pages. |
 | `/{lang}/dashboard/pools/new` | Guided model-pool creation. |
-| `/{lang}/dashboard/pools/{poolId}` | Owner-only model-pool detail and editing. |
+| `/{lang}/dashboard/pools/{poolId}` | Owner-only model-pool overview, identity editor, and local members. |
+| `/{lang}/dashboard/pools/{poolId}/fallback` | Owner-only public fallback and overflow providers. |
+| `/{lang}/dashboard/pools/{poolId}/routing` | Owner-only protocol compatibility and cache-affinity settings. |
+| `/{lang}/dashboard/pools/{poolId}/capacity` | Owner-only pool admission and capacity policy. |
+| `/{lang}/dashboard/pools/{poolId}/media` | Owner-only media transformer, transcription fallback, and attachment settings. |
+| `/{lang}/dashboard/pools/{poolId}/access` | Owner-only pool grants and egress access controls. |
 | `/{lang}/dashboard/capacity` | Owner-scoped shared inference capacity for direct models and pools. |
 | `/{lang}/dashboard/relay-metadata` | Own relay request metadata cleanup. |
 | `/{lang}/settings` | Profile settings. |

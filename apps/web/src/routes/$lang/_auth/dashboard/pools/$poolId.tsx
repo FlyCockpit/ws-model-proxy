@@ -7,6 +7,6 @@ export const Route = createFileRoute("/$lang/_auth/dashboard/pools/$poolId")({
 });
 
 function PoolDetailRoute() {
-  const { poolId } = Route.useParams();
-  return <PoolDetailPage poolId={poolId} />;
+  const { lang, poolId } = Route.useParams();
+  return <PoolDetailPage lang={lang} poolId={poolId} />;
 }

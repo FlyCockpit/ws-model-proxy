@@ -1,12 +1,19 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
   capacityEnabled: true,
+  providerEgressEnabled: false,
+  tab: "overview" as "overview" | "fallback" | "routing" | "capacity" | "media" | "access",
+  detailTab: null as
+    | null
+    | ((props: {
+        tab: "overview" | "fallback" | "routing" | "capacity" | "media" | "access";
+      }) => ReactNode),
   pools: [] as Array<Record<string, unknown>>,
   capacities: [] as Array<Record<string, unknown>>,
 }));
@@ -19,13 +26,27 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
   const original = await importOriginal<typeof import("@tanstack/react-router")>();
   return {
     ...original,
+    Outlet: () => {
+      const DetailTab = state.detailTab;
+      return DetailTab ? <DetailTab tab={state.tab} /> : null;
+    },
     Link: ({
       children,
+      to,
       params,
     }: {
       children: ReactNode;
+      to: string;
       params?: { lang?: string; poolId?: string };
-    }) => <a href={`/${params?.lang}/dashboard/pools/${params?.poolId ?? "new"}`}>{children}</a>,
+    }) => (
+      <a
+        href={to
+          .replace("$lang", params?.lang ?? "en-US")
+          .replace("$poolId", params?.poolId ?? "new")}
+      >
+        {children}
+      </a>
+    ),
   };
 });
 
@@ -64,7 +85,7 @@ vi.mock("@/utils/orpc", () => {
     orpc: {
       appConfig: query("appConfig", () => ({
         capacityEnabled: state.capacityEnabled,
-        providerEgressEnabled: false,
+        providerEgressEnabled: state.providerEgressEnabled,
         protocolAdaptationAvailable: true,
       })),
       forwarderManagement: {
@@ -86,7 +107,14 @@ vi.mock("@/utils/orpc", () => {
   };
 });
 
-import { InferenceCapacityPage, PoolDetailPage, PoolsListPage } from "./pool-route-pages";
+import {
+  InferenceCapacityPage,
+  PoolDetailPage,
+  PoolDetailTab,
+  PoolsListPage,
+} from "./pool-route-pages";
+
+state.detailTab = PoolDetailTab;
 
 function mount(children: ReactNode) {
   return render(
@@ -101,6 +129,8 @@ function mount(children: ReactNode) {
 afterEach(() => {
   cleanup();
   state.capacityEnabled = true;
+  state.providerEgressEnabled = false;
+  state.tab = "overview";
   state.pools = [];
   state.capacities = [];
 });
@@ -160,6 +190,118 @@ describe("dedicated pool pages", () => {
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
     fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.grant" }));
     expect(screen.getByText("grant-pool-dialog")).toBeTruthy();
+  });
+
+  it("renders all detail tab URLs and the fallback empty checklist", () => {
+    state.capacityEnabled = true;
+    state.providerEgressEnabled = true;
+    state.tab = "fallback";
+    state.pools = [
+      {
+        id: "pool-1",
+        slug: "primary",
+        name: "Primary",
+        description: null,
+        canonicalModelId: "owner/pool/primary",
+        members: [],
+        grants: [],
+        compatibility: { recommendedSurface: null },
+        transformer: { model: null },
+      },
+    ];
+
+    mount(<PoolDetailPage poolId="pool-1" />);
+
+    expect(
+      within(screen.getByRole("navigation", { name: "dashboard:pools.detailNavAriaLabel" }))
+        .getAllByRole("link")
+        .map((link) => link.getAttribute("href")),
+    ).toEqual([
+      "/en-US/dashboard/pools/pool-1",
+      "/en-US/dashboard/pools/pool-1/fallback",
+      "/en-US/dashboard/pools/pool-1/routing",
+      "/en-US/dashboard/pools/pool-1/capacity",
+      "/en-US/dashboard/pools/pool-1/media",
+      "/en-US/dashboard/pools/pool-1/access",
+    ]);
+    expect(screen.getByText("dashboard:pools.fallbackEmpty")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.fallbackSteps.account")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.fallbackSteps.model")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.fallbackSteps.ceiling")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.fallbackSteps.acknowledge")).toBeTruthy();
+  });
+
+  it("renders the disabled deployment copy in the fallback tab", () => {
+    state.capacityEnabled = false;
+    state.providerEgressEnabled = true;
+    state.tab = "fallback";
+    state.pools = [
+      {
+        id: "pool-1",
+        slug: "primary",
+        name: "Primary",
+        description: null,
+        canonicalModelId: "owner/pool/primary",
+        members: [],
+        grants: [],
+        compatibility: { recommendedSurface: null },
+        transformer: { model: null },
+      },
+    ];
+
+    mount(<PoolDetailPage poolId="pool-1" />);
+
+    expect(screen.getByText("dashboard:pools.fallbackDisabledDeployment")).toBeTruthy();
+  });
+
+  it("shows stored member policy values and does not mark an override as inherited", () => {
+    state.tab = "overview";
+    state.pools = [
+      {
+        id: "pool-1",
+        slug: "primary",
+        name: "Primary",
+        description: null,
+        canonicalModelId: "owner/pool/primary",
+        grants: [],
+        compatibility: { recommendedSurface: null },
+        transformer: { model: null },
+        capacityPriority: 16,
+        capacityConcurrencyLimit: 4,
+        capacityReservedSlots: 1,
+        capacityWaitBudgetMs: 30000,
+        capacityContextCeiling: 32768,
+        capacityContextMargin: 1024,
+        capacityBorrowPolicy: "WHEN_IDLE",
+        members: [
+          {
+            id: "member-1",
+            discoveredModelId: "model-1",
+            model: { canonicalModelId: "owner/cli/model" },
+            tier: "PRIMARY",
+            weight: 1,
+            routingStatus: "ACTIVE",
+            capacityPriority: 9,
+            capacityConcurrencyMode: "LIMITED",
+            capacityConcurrencyLimit: 2,
+            capacityReservedSlots: 1,
+            capacityBorrowPolicy: "NEVER",
+            capacityWaitBudgetMode: "LIMITED",
+            capacityWaitBudgetMs: 15000,
+            capacityContextCeilingMode: "LIMITED",
+            capacityContextCeiling: 16000,
+            capacityContextMargin: 512,
+          },
+        ],
+      },
+    ];
+
+    mount(<PoolDetailPage poolId="pool-1" />);
+
+    const policy = screen.getByText(/dashboard:pools.capacity.modes.override/);
+    expect(policy.textContent).toContain("9");
+    expect(policy.textContent).toContain("16000");
+    expect(policy.textContent).not.toContain("dashboard:pools.inherited");
   });
 
   it("renders the disabled capacity reason instead of a skipped-query skeleton", async () => {

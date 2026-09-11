@@ -21,6 +21,7 @@ import type { ReactNode } from "react";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
+import { ProtocolCompatibilityRadio } from "@/components/forwarder-dashboard-sections";
 import {
   combinedPrimarySurfaceIsSelectable,
   type GuardedWizardLocalModel,
@@ -739,66 +740,32 @@ export function GuardedPoolSetupWizard({
                   ))}
                 </div>
                 <div className="mt-4 space-y-3">
-                  <form.Field name="protocolAdaptationEnabled">
-                    {(field) => (
-                      <label className="flex min-h-11 items-start gap-3 py-2">
-                        <Checkbox
-                          id="guarded-protocolAdaptationEnabled"
-                          checked={field.state.value}
-                          disabled={!protocolAdaptationAvailable}
-                          onCheckedChange={(checked) => {
-                            const enabled = checked === true;
-                            field.handleChange(enabled);
-                            if (!enabled)
-                              form.setFieldValue("allowLossyDeveloperRoleCollapse", false);
-                            const recommended = recommendedPrimarySurface(
-                              form.state.values.localModelIds,
-                              directModels,
-                              protocolAdaptationAvailable && enabled,
-                            );
-                            if (recommended) form.setFieldValue("recommendedSurface", recommended);
-                            setStepErrors((current) => {
-                              const next = { ...current };
-                              if (recommended) delete next.recommendedSurface;
-                              else
-                                next.recommendedSurface = t(
-                                  "dashboard:pools.wizard.errors.recommendedSurface",
-                                );
-                              return next;
-                            });
-                          }}
-                        />
-                        <span className="text-sm" id="guarded-protocolAdaptationEnabled-label">
-                          {t("dashboard:pools.wizard.fields.protocolAdaptationEnabled")}
-                        </span>
-                      </label>
-                    )}
-                  </form.Field>
-                  {!protocolAdaptationAvailable ? (
-                    <p className="text-xs text-muted-foreground">
-                      {t("dashboard:pools.protocolAdaptationDisabledReason")}
-                    </p>
-                  ) : null}
-                  <form.Subscribe selector={(state) => state.values.protocolAdaptationEnabled}>
-                    {(protocolAdaptationEnabled) => (
-                      <form.Field name="allowLossyDeveloperRoleCollapse">
-                        {(field) => (
-                          <label className="flex min-h-11 items-start gap-3 py-2">
-                            <Checkbox
-                              id="guarded-allowLossyDeveloperRoleCollapse"
-                              checked={field.state.value}
-                              disabled={!protocolAdaptationAvailable || !protocolAdaptationEnabled}
-                              onCheckedChange={(checked) => field.handleChange(checked === true)}
-                            />
-                            <span
-                              className="text-sm"
-                              id="guarded-allowLossyDeveloperRoleCollapse-label"
-                            >
-                              {t("dashboard:pools.wizard.fields.allowLossyDeveloperRoleCollapse")}
-                            </span>
-                          </label>
-                        )}
-                      </form.Field>
+                  <form.Subscribe
+                    selector={(state) => ({
+                      adaptation: state.values.protocolAdaptationEnabled,
+                      lossy: state.values.allowLossyDeveloperRoleCollapse,
+                    })}
+                  >
+                    {({ adaptation, lossy }) => (
+                      <ProtocolCompatibilityRadio
+                        adaptationEnabled={adaptation}
+                        allowLossyDeveloperRoleCollapse={lossy}
+                        protocolAdaptationAvailable={protocolAdaptationAvailable}
+                        idPrefix="guarded"
+                        onChange={(value) => {
+                          form.setFieldValue("protocolAdaptationEnabled", value.adaptationEnabled);
+                          form.setFieldValue(
+                            "allowLossyDeveloperRoleCollapse",
+                            value.allowLossyDeveloperRoleCollapse,
+                          );
+                          const recommended = recommendedPrimarySurface(
+                            form.state.values.localModelIds,
+                            directModels,
+                            protocolAdaptationAvailable && value.adaptationEnabled,
+                          );
+                          if (recommended) form.setFieldValue("recommendedSurface", recommended);
+                        }}
+                      />
                     )}
                   </form.Subscribe>
                   <form.Field name="affinityEnabled">

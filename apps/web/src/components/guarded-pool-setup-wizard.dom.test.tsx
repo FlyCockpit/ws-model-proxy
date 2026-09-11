@@ -170,36 +170,30 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
   it("keeps affinity available when protocol adaptation is disabled by deployment", () => {
     mount(true, false, 1);
 
-    const adaptation = screen.getByRole("checkbox", {
-      name: "dashboard:pools.wizard.fields.protocolAdaptationEnabled",
+    const adaptation = screen.getByRole("radio", {
+      name: "dashboard:pools.protocolOptions.lossless.label",
     });
-    const lossy = screen.getByRole("checkbox", {
-      name: "dashboard:pools.wizard.fields.allowLossyDeveloperRoleCollapse",
+    const lossy = screen.getByRole("radio", {
+      name: "dashboard:pools.protocolOptions.lossy.label",
     });
     const affinity = screen.getByRole("checkbox", {
       name: "dashboard:pools.wizard.fields.affinityEnabled",
     });
-    expect(adaptation.getAttribute("aria-disabled")).toBe("true");
-    expect(lossy.getAttribute("aria-disabled")).toBe("true");
+    expect((adaptation as HTMLInputElement).disabled).toBe(true);
+    expect((lossy as HTMLInputElement).disabled).toBe(true);
     expect(affinity.getAttribute("aria-disabled")).toBeNull();
     expect(screen.getByText("dashboard:pools.protocolAdaptationDisabledReason")).toBeTruthy();
   });
 
-  it("enables lossy collapse after protocol adaptation is selected", async () => {
+  it("selects lossless instruction merge from the protocol radio", async () => {
     const user = userEvent.setup();
     mount(true, true, 1);
 
-    const adaptation = screen.getByRole("checkbox", {
-      name: "dashboard:pools.wizard.fields.protocolAdaptationEnabled",
+    const lossy = screen.getByRole("radio", {
+      name: "dashboard:pools.protocolOptions.lossy.label",
     });
-    const lossy = screen.getByRole("checkbox", {
-      name: "dashboard:pools.wizard.fields.allowLossyDeveloperRoleCollapse",
-    });
-    expect(lossy.getAttribute("aria-disabled")).toBe("true");
-
-    await user.click(adaptation);
-
-    expect(lossy.getAttribute("aria-disabled")).toBeNull();
+    await user.click(lossy);
+    expect((lossy as HTMLInputElement).checked).toBe(true);
   });
 
   it("does not fetch candidates or capacities while closed", async () => {
@@ -269,7 +263,7 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
     );
 
     await user.click(screen.getByText("dashboard:pools.wizard.advanced.title"));
-    await user.click(screen.getByText("dashboard:pools.wizard.fields.protocolAdaptationEnabled"));
+    await user.click(screen.getByText("dashboard:pools.protocolOptions.lossless.label"));
     const memberEditor = screen.getByRole("group", { name: "owner/cli/chat" });
     await user.click(within(memberEditor).getByText("owner/cli/chat"));
     await user.click(within(memberEditor).getByText("pools.wizard.fields.enableMemberOverride"));

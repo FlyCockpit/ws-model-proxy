@@ -170,7 +170,9 @@ describe("GuardedPoolSetupWizard", () => {
     const capacity = renderStep(1);
     expect(capacity).toContain("dashboard:pools.wizard.advanced.title");
     expect(capacity).toContain("dashboard:pools.wizard.fields.physicalCountStrategy");
-    expect(capacity).toContain("dashboard:pools.wizard.fields.protocolAdaptationEnabled");
+    expect(capacity).toContain("dashboard:pools.protocolCompatibility");
+    for (const option of ["native", "lossless", "lossy"])
+      expect(capacity).toContain(`dashboard:pools.protocolOptions.${option}.label`);
     expect(capacity).toContain("dashboard:pools.wizard.fields.affinityEnabled");
     expect(capacity).toContain("dashboard:pools.wizard.advanced.memberOverrides");
     expect(capacity).toContain("sm:grid-cols-2");

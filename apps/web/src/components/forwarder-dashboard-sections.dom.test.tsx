@@ -156,7 +156,12 @@ const editablePool = {
 
 function mount(
   protocolAdaptationAvailable = true,
-  options: { mode?: "create" | "edit"; capacityAvailability?: "enabled" | "disabled" } = {},
+  options: {
+    mode?: "create" | "edit";
+    capacityAvailability?: "enabled" | "disabled";
+    pool?: typeof editablePool;
+    sections?: Array<"identity" | "routing" | "capacity" | "media">;
+  } = {},
 ) {
   const mode = options.mode ?? "create";
   return render(
@@ -165,11 +170,12 @@ function mount(
     >
       <PoolForm
         mode={mode}
-        pool={mode === "edit" ? editablePool : undefined}
+        pool={mode === "edit" ? (options.pool ?? editablePool) : undefined}
         directModels={[]}
         capacities={[]}
         capacityAvailability={options.capacityAvailability ?? "disabled"}
         protocolAdaptationAvailable={protocolAdaptationAvailable}
+        sections={options.sections}
         onSuccess={() => undefined}
       />
     </QueryClientProvider>,
@@ -183,16 +189,72 @@ afterEach(() => {
 });
 
 describe("PoolForm protocol adaptation controls", () => {
-  it("keeps the lossy option disabled until adaptation is selected", () => {
+  it("maps the protocol radio options to the two stored booleans", () => {
     mount();
 
-    const adaptation = screen.getByLabelText("dashboard:pools.enableProtocolAdaptation");
-    const lossy = screen.getByLabelText("dashboard:pools.allowLossyDeveloperRoleCollapse");
-    expect((lossy as HTMLInputElement).disabled).toBe(true);
+    const lossless = screen.getByLabelText("dashboard:pools.protocolOptions.lossless.label");
+    const lossy = screen.getByLabelText("dashboard:pools.protocolOptions.lossy.label");
+    expect((lossless as HTMLInputElement).checked).toBe(false);
 
-    fireEvent.click(adaptation);
+    fireEvent.click(lossless);
+    expect((lossless as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(lossy);
 
-    expect((lossy as HTMLInputElement).disabled).toBe(false);
+    expect((lossy as HTMLInputElement).checked).toBe(true);
+  });
+
+  it("shows an invalid stored lossy pair as lossless translation", () => {
+    mount(true, {
+      mode: "edit",
+      pool: {
+        ...editablePool,
+        allowLossyDeveloperRoleCollapse: true,
+        protocolAdaptationEnabled: false,
+      },
+    });
+
+    expect(
+      (screen.getByLabelText("dashboard:pools.protocolOptions.lossless.label") as HTMLInputElement)
+        .checked,
+    ).toBe(true);
+  });
+
+  it("does not migrate an invalid protocol pair when saving a non-routing section", async () => {
+    mount(true, {
+      mode: "edit",
+      pool: {
+        ...editablePool,
+        allowLossyDeveloperRoleCollapse: true,
+        protocolAdaptationEnabled: false,
+      },
+      sections: ["identity"],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("protocolAdaptationEnabled");
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("allowLossyDeveloperRoleCollapse");
+  });
+
+  it("repairs an untouched invalid routing pair without enabling adaptation", async () => {
+    mount(true, {
+      mode: "edit",
+      pool: {
+        ...editablePool,
+        allowLossyDeveloperRoleCollapse: true,
+        protocolAdaptationEnabled: false,
+      },
+      sections: ["routing"],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({
+      protocolAdaptationEnabled: false,
+      allowLossyDeveloperRoleCollapse: false,
+    });
   });
 
   it("saves exactly one pool mutation without a sheet", async () => {

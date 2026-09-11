@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link } from "@tanstack/react-router";
+import { Link, Outlet } from "@tanstack/react-router";
+import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
   Dialog,
@@ -12,7 +13,7 @@ import {
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { Gauge, Plus, Trash2 } from "lucide-react";
 import type { ReactNode } from "react";
-import { useState } from "react";
+import { createContext, useContext, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
@@ -39,6 +40,13 @@ function PageSkeleton() {
   );
 }
 
+type PoolDetailModel = Awaited<
+  ReturnType<AppRouterClient["forwarderManagement"]["listModelPools"]>
+>[number];
+type PoolDetailCapacity = Awaited<
+  ReturnType<AppRouterClient["capacityManagement"]["list"]>
+>[number];
+
 function PageHeader({
   title,
   description,
@@ -57,6 +65,29 @@ function PageHeader({
       {action ? <div className="shrink-0">{action}</div> : null}
     </div>
   );
+}
+
+type PoolDetailContextValue = {
+  pool: PoolDetailModel;
+  directModels: ReturnType<typeof allDirectModels>;
+  capacities: PoolDetailCapacity[];
+  capacityAvailability: ReturnType<typeof resolveCapacityAvailability>;
+  protocolAdaptationAvailable: boolean;
+  providerEgressEnabled: boolean;
+  capacityEnabled: boolean;
+  openMember: (member: "create" | string | null) => void;
+  openGrant: () => void;
+  openDelete: () => void;
+  removeMember: (id: string | null) => void;
+  revokeGrant: (email: string | null) => void;
+};
+
+const PoolDetailContext = createContext<PoolDetailContextValue | null>(null);
+
+function usePoolDetail() {
+  const detail = useContext(PoolDetailContext);
+  if (!detail) throw new Error("Pool detail tabs must be rendered under PoolDetailPage");
+  return detail;
 }
 
 export function PoolsListPage({ lang }: { lang: string }) {
@@ -214,7 +245,7 @@ export function PoolsListPage({ lang }: { lang: string }) {
   );
 }
 
-export function PoolDetailPage({ poolId }: { poolId: string }) {
+export function PoolDetailPage({ poolId, lang = "en-US" }: { poolId: string; lang?: string }) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
   const pools = useQuery(orpc.forwarderManagement.listModelPools.queryOptions());
@@ -289,83 +320,312 @@ export function PoolDetailPage({ poolId }: { poolId: string }) {
   const deletingMember = pool.members.find((member) => member.id === deleteMemberId);
   const revokingGrant = pool.grants.find((grant) => grant.granteeEmail === revokeEmail);
 
+  const detail = {
+    pool,
+    directModels: allDirectModels(devices.data ?? []),
+    capacities: capacities.data ?? [],
+    capacityAvailability,
+    protocolAdaptationAvailable: appConfig.data?.protocolAdaptationAvailable ?? false,
+    providerEgressEnabled: appConfig.data?.providerEgressEnabled ?? false,
+    capacityEnabled: appConfig.data?.capacityEnabled ?? false,
+    openMember: setMemberDialog,
+    openGrant: () => setGrantOpen(true),
+    openDelete: () => setDeletePoolOpen(true),
+    removeMember: setDeleteMemberId,
+    revokeGrant: setRevokeEmail,
+  };
+
   return (
-    <section className="min-w-0 max-w-full space-y-6">
-      <PageHeader
-        title={pool.name}
-        description={pool.description || pool.slug}
-        action={
-          <div className="flex flex-wrap gap-2">
-            <Button size="touch" variant="outline" onClick={() => setGrantOpen(true)}>
-              <Plus className="size-4" />
-              {t("dashboard:pools.grant")}
-            </Button>
-            <Button size="touch" variant="outline" onClick={() => setMemberDialog("create")}>
-              <Plus className="size-4" />
-              {t("dashboard:pools.addMember")}
-            </Button>
-            <Button size="touch" variant="destructive" onClick={() => setDeletePoolOpen(true)}>
-              <Trash2 className="size-4" />
-              {t("common:actions.delete")}
-            </Button>
-          </div>
-        }
-      />
-      <div className="min-w-0">
+    <PoolDetailContext.Provider value={detail}>
+      <section className="min-w-0 max-w-full space-y-6">
+        <PageHeader
+          title={pool.name}
+          description={pool.description || pool.slug}
+          action={
+            <div className="flex flex-wrap gap-2">
+              <Button size="touch" variant="outline" onClick={() => setGrantOpen(true)}>
+                <Plus className="size-4" />
+                {t("dashboard:pools.grant")}
+              </Button>
+              <Button size="touch" variant="outline" onClick={() => setMemberDialog("create")}>
+                <Plus className="size-4" />
+                {t("dashboard:pools.addMember")}
+              </Button>
+              <Button size="touch" variant="destructive" onClick={() => setDeletePoolOpen(true)}>
+                <Trash2 className="size-4" />
+                {t("common:actions.delete")}
+              </Button>
+            </div>
+          }
+        />
+        <div className="min-w-0 shrink-0 overflow-x-auto overflow-y-hidden overscroll-x-contain no-scrollbar">
+          <nav
+            className="flex w-max items-center gap-1"
+            aria-label={t("dashboard:pools.detailNavAriaLabel")}
+          >
+            {(
+              [
+                ["overview", "/$lang/dashboard/pools/$poolId"],
+                ["fallback", "/$lang/dashboard/pools/$poolId/fallback"],
+                ["routing", "/$lang/dashboard/pools/$poolId/routing"],
+                ["capacity", "/$lang/dashboard/pools/$poolId/capacity"],
+                ["media", "/$lang/dashboard/pools/$poolId/media"],
+                ["access", "/$lang/dashboard/pools/$poolId/access"],
+              ] as const
+            ).map(([tab, to]) => (
+              <Link
+                key={tab}
+                to={to}
+                params={{ lang, poolId: pool.id }}
+                className="min-h-11 shrink-0 rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-muted"
+                activeProps={{ className: "bg-muted text-foreground" }}
+                activeOptions={{ exact: tab === "overview" }}
+              >
+                {t(`dashboard:pools.tabs.${tab}`)}
+              </Link>
+            ))}
+          </nav>
+        </div>
+        <Outlet />
+        <Dialog
+          open={Boolean(memberDialog)}
+          onOpenChange={(open) => !open && setMemberDialog(null)}
+        >
+          <DialogContent className="max-h-[min(92vh,56rem)] overflow-x-hidden overflow-y-auto sm:max-w-2xl">
+            <DialogHeader>
+              <DialogTitle>
+                {memberDialog === "create"
+                  ? t("dashboard:pools.addMember")
+                  : t("dashboard:pools.editMemberTitle")}
+              </DialogTitle>
+              <DialogDescription>
+                {memberDialog === "create"
+                  ? t("dashboard:pools.noDirectModels")
+                  : t("dashboard:pools.editMemberDescription")}
+              </DialogDescription>
+            </DialogHeader>
+            {memberDialog === "create" ? (
+              <PoolMemberForm
+                mode="create"
+                poolId={pool.id}
+                directModels={detail.directModels}
+                capacities={capacities.data ?? []}
+                capacityAvailability={capacityAvailability}
+                onSuccess={() => setMemberDialog(null)}
+              />
+            ) : editingMember ? (
+              <PoolMemberForm
+                mode="edit"
+                member={editingMember}
+                directModels={detail.directModels}
+                capacities={capacities.data ?? []}
+                capacityAvailability={capacityAvailability}
+                onSuccess={() => setMemberDialog(null)}
+              />
+            ) : null}
+          </DialogContent>
+        </Dialog>
+        <GrantPoolDialog pool={grantOpen ? pool : null} onOpenChange={setGrantOpen} />
+        <ConfirmDeleteDialog
+          open={deletePoolOpen}
+          onOpenChange={setDeletePoolOpen}
+          title={t("dashboard:pools.deleteTitle")}
+          description={t("dashboard:pools.deleteDescription")}
+          confirmToken={pool.name}
+          typePrompt={t("dashboard:pools.name")}
+          copyAriaLabel={t("dashboard:actions.copyConfirm")}
+          isPending={deletePool.isPending}
+          onConfirm={() => deletePool.mutate({ id: pool.id })}
+        />
+        <ConfirmDeleteDialog
+          open={Boolean(deletingMember)}
+          onOpenChange={(open) => !open && setDeleteMemberId(null)}
+          title={t("dashboard:pools.removeMemberTitle")}
+          description={t("dashboard:pools.removeMemberDescription")}
+          confirmToken={deletingMember?.model?.canonicalModelId ?? deletingMember?.id ?? ""}
+          typePrompt={t("dashboard:pools.memberTarget")}
+          copyAriaLabel={t("dashboard:actions.copyConfirm")}
+          isPending={removeMember.isPending}
+          onConfirm={() => deletingMember && removeMember.mutate({ id: deletingMember.id })}
+        />
+        <ConfirmDeleteDialog
+          open={Boolean(revokingGrant)}
+          onOpenChange={(open) => !open && setRevokeEmail(null)}
+          title={t("dashboard:pools.revokeGrantTitle")}
+          description={t("dashboard:pools.revokeGrantDescription")}
+          confirmToken={revokingGrant?.granteeEmail ?? ""}
+          typePrompt={t("dashboard:pools.email")}
+          copyAriaLabel={t("dashboard:actions.copyConfirm")}
+          inputMode="email"
+          confirmLabel={t("dashboard:pools.revoke")}
+          pendingLabel={t("dashboard:pools.revoking")}
+          isPending={revokeGrant.isPending}
+          onConfirm={() =>
+            revokingGrant &&
+            revokeGrant.mutate({ poolId: pool.id, email: revokingGrant.granteeEmail })
+          }
+        />
+      </section>
+    </PoolDetailContext.Provider>
+  );
+}
+
+export function PoolDetailTab({
+  tab,
+}: {
+  tab: "overview" | "fallback" | "routing" | "capacity" | "media" | "access";
+}) {
+  const { t } = useTranslation(["common", "dashboard"]);
+  const detail = usePoolDetail();
+  const { pool } = detail;
+
+  if (tab === "overview") {
+    return (
+      <div className="space-y-6">
         <PoolForm
-          key={pool.id}
+          key={`${pool.id}-identity`}
           mode="edit"
           pool={pool}
-          directModels={allDirectModels(devices.data ?? [])}
-          capacities={capacities.data ?? []}
-          capacityAvailability={capacityAvailability}
-          protocolAdaptationAvailable={appConfig.data?.protocolAdaptationAvailable ?? false}
+          directModels={detail.directModels}
+          capacities={detail.capacities}
+          capacityAvailability={detail.capacityAvailability}
+          protocolAdaptationAvailable={detail.protocolAdaptationAvailable}
+          sections={["identity"]}
           stickySave
           onSuccess={() => undefined}
         />
-      </div>
-      <section className="space-y-3 border-t pt-6" aria-labelledby="pool-members-title">
-        <h3 id="pool-members-title" className="text-base font-semibold">
-          {t("dashboard:pools.membersTitle")}
-        </h3>
-        {pool.members.length === 0 ? (
-          <p className="text-sm text-muted-foreground">{t("dashboard:pools.noMembers")}</p>
-        ) : (
-          <ul className="space-y-2">
-            {pool.members.map((member) => (
-              <li
-                key={member.id}
-                className="flex min-w-0 flex-wrap items-center justify-between gap-3 border p-3"
-              >
-                <div className="min-w-0">
-                  <code className="block break-all font-mono text-xs">
-                    {member.model?.canonicalModelId ?? member.discoveredModelId ?? member.id}
-                  </code>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    {member.routingStatus} · {t("dashboard:pools.weight")}: {member.weight}
-                  </p>
-                </div>
-                <div className="flex shrink-0 flex-wrap gap-2">
-                  <Button size="touch" variant="outline" onClick={() => setMemberDialog(member.id)}>
-                    {t("common:actions.edit")}
-                  </Button>
-                  <Button
-                    size="touch"
-                    variant="destructive"
-                    onClick={() => setDeleteMemberId(member.id)}
+        <section className="space-y-3 border-t pt-6" aria-labelledby="pool-members-title">
+          <h3 id="pool-members-title" className="text-base font-semibold">
+            {t("dashboard:pools.membersTitle")}
+          </h3>
+          {pool.members.length === 0 ? (
+            <p className="text-sm text-muted-foreground">{t("dashboard:pools.noMembers")}</p>
+          ) : (
+            <ul className="space-y-2">
+              {pool.members.map((member) => {
+                const hasOverride =
+                  member.capacityPriority !== null ||
+                  member.capacityConcurrencyMode !== "INHERIT" ||
+                  member.capacityReservedSlots !== null ||
+                  member.capacityBorrowPolicy !== null ||
+                  member.capacityWaitBudgetMode !== "INHERIT" ||
+                  member.capacityContextCeilingMode !== "INHERIT" ||
+                  member.capacityContextMargin !== null;
+                const concurrencyLimit =
+                  member.capacityConcurrencyMode === "INHERIT"
+                    ? pool.capacityConcurrencyLimit
+                    : member.capacityConcurrencyMode === "UNLIMITED"
+                      ? null
+                      : member.capacityConcurrencyLimit;
+                const waitBudget =
+                  member.capacityWaitBudgetMode === "INHERIT"
+                    ? pool.capacityWaitBudgetMs
+                    : member.capacityWaitBudgetMode === "UNLIMITED"
+                      ? null
+                      : member.capacityWaitBudgetMs;
+                const contextCeiling =
+                  member.capacityContextCeilingMode === "INHERIT"
+                    ? pool.capacityContextCeiling
+                    : member.capacityContextCeilingMode === "UNLIMITED"
+                      ? null
+                      : member.capacityContextCeiling;
+                const borrowPolicy = member.capacityBorrowPolicy ?? pool.capacityBorrowPolicy;
+                return (
+                  <li
+                    key={member.id}
+                    className="flex min-w-0 flex-wrap items-center justify-between gap-3 border p-3"
                   >
-                    {t("dashboard:pools.removeMember")}
-                  </Button>
-                </div>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
-      <section className="space-y-3 border-t pt-6" aria-labelledby="pool-grants-title">
-        <h3 id="pool-grants-title" className="text-base font-semibold">
-          {t("dashboard:pools.grantsTitle")}
-        </h3>
+                    <div className="min-w-0">
+                      <code className="block break-all font-mono text-xs">
+                        {member.model?.canonicalModelId ?? member.discoveredModelId ?? member.id}
+                      </code>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        {member.routingStatus} ·{" "}
+                        {member.tier === "PUBLIC_OVERFLOW"
+                          ? t("dashboard:pools.memberTiers.PUBLIC_OVERFLOW")
+                          : `${t("dashboard:pools.weight")}: ${member.weight}`}
+                      </p>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        {hasOverride
+                          ? t("dashboard:pools.capacity.modes.override")
+                          : t("dashboard:pools.inherited")}
+                        : {t("dashboard:pools.capacity.fields.capacityPriority")}{" "}
+                        {member.capacityPriority ?? pool.capacityPriority}
+                        {" · "}
+                        {t("dashboard:pools.capacity.fields.capacityConcurrencyLimit")}{" "}
+                        {concurrencyLimit ?? t("dashboard:pools.capacity.modes.unlimited")}
+                        {" · "}
+                        {t("dashboard:pools.capacity.fields.capacityReservedSlots")}{" "}
+                        {member.capacityReservedSlots ?? pool.capacityReservedSlots}
+                        {" · "}
+                        {t("dashboard:pools.capacity.fields.capacityWaitBudgetMs")}{" "}
+                        {waitBudget ?? t("dashboard:pools.capacity.modes.unlimited")}
+                        {" · "}
+                        {t("dashboard:pools.capacity.fields.capacityContextCeiling")}{" "}
+                        {contextCeiling ?? t("dashboard:pools.capacity.modes.unlimited")}
+                        {" · "}
+                        {t("dashboard:pools.capacity.fields.capacityContextMargin")}{" "}
+                        {member.capacityContextMargin ?? pool.capacityContextMargin}
+                        {" · "}
+                        {t("dashboard:pools.capacity.fields.capacityBorrowPolicy")}{" "}
+                        {borrowPolicy === "NEVER"
+                          ? t("dashboard:pools.capacity.borrowNever")
+                          : t("dashboard:pools.capacity.borrowIdle")}
+                      </p>
+                    </div>
+                    <div className="flex shrink-0 flex-wrap gap-2">
+                      <Button
+                        size="touch"
+                        variant="outline"
+                        onClick={() => detail.openMember(member.id)}
+                      >
+                        {t("common:actions.edit")}
+                      </Button>
+                      <Button
+                        size="touch"
+                        variant="destructive"
+                        onClick={() => detail.removeMember(member.id)}
+                      >
+                        {t("dashboard:pools.removeMember")}
+                      </Button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </section>
+      </div>
+    );
+  }
+  if (tab === "routing" || tab === "capacity" || tab === "media") {
+    return (
+      <PoolForm
+        key={`${pool.id}-${tab}`}
+        mode="edit"
+        pool={pool}
+        directModels={detail.directModels}
+        capacities={detail.capacities}
+        capacityAvailability={detail.capacityAvailability}
+        protocolAdaptationAvailable={detail.protocolAdaptationAvailable}
+        sections={[tab]}
+        stickySave
+        onSuccess={() => undefined}
+      />
+    );
+  }
+  if (tab === "access") {
+    return (
+      <section className="space-y-3" aria-labelledby="pool-grants-title">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h3 id="pool-grants-title" className="text-base font-semibold">
+            {t("dashboard:pools.grantsTitle")}
+          </h3>
+          <Button size="touch" onClick={detail.openGrant}>
+            <Plus className="size-4" />
+            {t("dashboard:pools.grant")}
+          </Button>
+        </div>
         {pool.grants.length === 0 ? (
           <p className="text-sm text-muted-foreground">{t("dashboard:pools.noGrants")}</p>
         ) : (
@@ -379,7 +639,7 @@ export function PoolDetailPage({ poolId }: { poolId: string }) {
                 <Button
                   size="touch"
                   variant="destructive"
-                  onClick={() => setRevokeEmail(grant.granteeEmail)}
+                  onClick={() => detail.revokeGrant(grant.granteeEmail)}
                 >
                   {t("dashboard:pools.revokeGrant")}
                 </Button>
@@ -387,82 +647,71 @@ export function PoolDetailPage({ poolId }: { poolId: string }) {
             ))}
           </ul>
         )}
+        <p className="rounded-md border bg-muted/40 p-3 text-sm text-muted-foreground">
+          {t("dashboard:pools.accessEgressHint")}
+        </p>
       </section>
-      <Dialog open={Boolean(memberDialog)} onOpenChange={(open) => !open && setMemberDialog(null)}>
-        <DialogContent className="max-h-[min(92vh,56rem)] overflow-x-hidden overflow-y-auto sm:max-w-2xl">
-          <DialogHeader>
-            <DialogTitle>
-              {memberDialog === "create"
-                ? t("dashboard:pools.addMember")
-                : t("dashboard:pools.editMemberTitle")}
-            </DialogTitle>
-            <DialogDescription>
-              {memberDialog === "create"
-                ? t("dashboard:pools.noDirectModels")
-                : t("dashboard:pools.editMemberDescription")}
-            </DialogDescription>
-          </DialogHeader>
-          {memberDialog === "create" ? (
-            <PoolMemberForm
-              mode="create"
-              poolId={pool.id}
-              directModels={allDirectModels(devices.data ?? [])}
-              capacities={capacities.data ?? []}
-              capacityAvailability={capacityAvailability}
-              onSuccess={() => setMemberDialog(null)}
-            />
-          ) : editingMember ? (
-            <PoolMemberForm
-              mode="edit"
-              member={editingMember}
-              directModels={allDirectModels(devices.data ?? [])}
-              capacities={capacities.data ?? []}
-              capacityAvailability={capacityAvailability}
-              onSuccess={() => setMemberDialog(null)}
-            />
+    );
+  }
+  const overflowMembers = pool.members
+    .filter((member) => member.tier === "PUBLIC_OVERFLOW")
+    .sort(
+      (left, right) =>
+        (left.publicOrder ?? Number.MAX_SAFE_INTEGER) -
+        (right.publicOrder ?? Number.MAX_SAFE_INTEGER),
+    );
+  const fallbackEnabled = detail.providerEgressEnabled && detail.capacityEnabled;
+  return (
+    <section className="space-y-4" aria-labelledby="pool-fallback-title">
+      <div>
+        <h3 id="pool-fallback-title" className="text-base font-semibold">
+          {t("dashboard:pools.tabs.fallback")}
+        </h3>
+        <p className="mt-1 text-sm text-muted-foreground">
+          {t("dashboard:pools.fallbackDescription")}
+        </p>
+      </div>
+      {!fallbackEnabled ? (
+        <p className="rounded-md border bg-muted/40 p-3 text-sm text-muted-foreground">
+          {t("dashboard:pools.fallbackDisabledDeployment")}
+        </p>
+      ) : null}
+      {overflowMembers.length ? (
+        <ol className="space-y-2">
+          {overflowMembers.map((member, index) => (
+            <li key={member.id} className="min-w-0 border p-3">
+              <code className="break-all text-xs">
+                {member.providerModel?.upstreamModelId ??
+                  member.model?.canonicalModelId ??
+                  member.id}
+              </code>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {t("dashboard:pools.publicOrder", { order: member.publicOrder ?? index + 1 })}
+              </p>
+            </li>
+          ))}
+        </ol>
+      ) : (
+        <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
+          <p>{t("dashboard:pools.fallbackEmpty")}</p>
+          <ol className="mt-3 list-decimal space-y-1 pl-5">
+            <li>{t("dashboard:pools.fallbackSteps.account")}</li>
+            <li>{t("dashboard:pools.fallbackSteps.model")}</li>
+            <li>{t("dashboard:pools.fallbackSteps.ceiling")}</li>
+            <li>{t("dashboard:pools.fallbackSteps.acknowledge")}</li>
+          </ol>
+          {fallbackEnabled ? (
+            <Button className="mt-4" size="touch" render={<a href="#provider-operations" />}>
+              {t("dashboard:pools.addFallbackProvider")}
+            </Button>
           ) : null}
-        </DialogContent>
-      </Dialog>
-      <GrantPoolDialog pool={grantOpen ? pool : null} onOpenChange={setGrantOpen} />
-      <ConfirmDeleteDialog
-        open={deletePoolOpen}
-        onOpenChange={setDeletePoolOpen}
-        title={t("dashboard:pools.deleteTitle")}
-        description={t("dashboard:pools.deleteDescription")}
-        confirmToken={pool.name}
-        typePrompt={t("dashboard:pools.name")}
-        copyAriaLabel={t("dashboard:actions.copyConfirm")}
-        isPending={deletePool.isPending}
-        onConfirm={() => deletePool.mutate({ id: pool.id })}
-      />
-      <ConfirmDeleteDialog
-        open={Boolean(deletingMember)}
-        onOpenChange={(open) => !open && setDeleteMemberId(null)}
-        title={t("dashboard:pools.removeMemberTitle")}
-        description={t("dashboard:pools.removeMemberDescription")}
-        confirmToken={deletingMember?.model?.canonicalModelId ?? deletingMember?.id ?? ""}
-        typePrompt={t("dashboard:pools.memberTarget")}
-        copyAriaLabel={t("dashboard:actions.copyConfirm")}
-        isPending={removeMember.isPending}
-        onConfirm={() => deletingMember && removeMember.mutate({ id: deletingMember.id })}
-      />
-      <ConfirmDeleteDialog
-        open={Boolean(revokingGrant)}
-        onOpenChange={(open) => !open && setRevokeEmail(null)}
-        title={t("dashboard:pools.revokeGrantTitle")}
-        description={t("dashboard:pools.revokeGrantDescription")}
-        confirmToken={revokingGrant?.granteeEmail ?? ""}
-        typePrompt={t("dashboard:pools.email")}
-        copyAriaLabel={t("dashboard:actions.copyConfirm")}
-        inputMode="email"
-        confirmLabel={t("dashboard:pools.revoke")}
-        pendingLabel={t("dashboard:pools.revoking")}
-        isPending={revokeGrant.isPending}
-        onConfirm={() =>
-          revokingGrant &&
-          revokeGrant.mutate({ poolId: pool.id, email: revokingGrant.granteeEmail })
-        }
-      />
+        </div>
+      )}
+      {detail.providerEgressEnabled ? (
+        <div id="provider-operations">
+          <ProviderOperationsSection />
+        </div>
+      ) : null}
     </section>
   );
 }
