@@ -86,6 +86,10 @@
     "regenerate": "Regenerar",
     "requestSettings": "Configuración de la solicitud",
     "requestSettingsHelp": "Elige la superficie de API, la preferencia de ruta y el nivel de razonamiento para la próxima solicitud.",
+    "maxTokens": {
+      "label": "Máximo de tokens de salida",
+      "help": "Se usa para solicitudes de Anthropic Messages. El razonamiento puede requerir un mínimo mayor."
+    },
     "samplePromptOne": "Explica las capacidades de este modelo.",
     "samplePromptTwo": "Dame un plan de pruebas conciso.",
     "routingMode": {

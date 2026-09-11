@@ -105,6 +105,10 @@
     "regenerate": "Regenerate",
     "requestSettings": "Request settings",
     "requestSettingsHelp": "Choose the API surface, routing preference, and reasoning level for the next request.",
+    "maxTokens": {
+      "label": "Maximum output tokens",
+      "help": "Used for Anthropic Messages requests. Thinking may require a higher minimum."
+    },
     "samplePromptOne": "Explain this model's capabilities.",
     "samplePromptTwo": "Give me a concise test plan.",
     "routingMode": {
