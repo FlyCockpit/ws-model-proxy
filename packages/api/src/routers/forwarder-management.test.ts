@@ -440,6 +440,79 @@ describe("forwarderManagementRouter", () => {
     );
   });
 
+  it("defaults cache-affinity routing on for new guarded pools while honoring an explicit opt-out", async () => {
+    db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(poolRow());
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel()]);
+    db.executionTarget.findMany.mockResolvedValue([
+      {
+        id: "existing-target",
+        discoveredModelId: "local-id",
+        inferenceCapacityId: "shared-capacity",
+        InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: null },
+      },
+    ]);
+    db.providerModel.findMany.mockResolvedValue([]);
+    db.modelPool.create.mockResolvedValue({ id: "pool-id" });
+    db.poolMember.create.mockResolvedValue({ id: "member-id" });
+
+    const base = {
+      slug: "affinity-default",
+      name: "Affinity default",
+      localModelIds: ["local-id"],
+      recommendedSurface: "OPENAI_RESPONSES" as const,
+      memberConcurrencyLimit: 1,
+      reservedSlots: 0,
+      localWaitBudgetMs: 30_000,
+      providerModels: [],
+      publicEgressAcknowledged: false,
+    };
+
+    // `advanced` omitted entirely: affinity defaults ON with standard fallbacks.
+    await client().createGuardedModelPool(base);
+    expect(db.modelPool.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          affinityEnabled: true,
+          affinityTtlSeconds: 3600,
+          affinityMaxRecords: 10_000,
+          affinityPrefixWeight: 100,
+          affinityConversationWeight: 150,
+          affinityConfirmedCacheWeight: 250,
+          affinityLoadPenaltyWeight: 100,
+        }),
+      }),
+    );
+
+    // Explicit opt-out through the full advanced envelope persists false.
+    db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(poolRow());
+    await client().createGuardedModelPool({
+      ...base,
+      slug: "affinity-opt-out",
+      advanced: {
+        physicalCountStrategy: "CONSERVATIVE_ESTIMATE",
+        contextMargin: 0,
+        borrowPolicy: "WHEN_IDLE",
+        protocolAdaptationEnabled: false,
+        allowLossyDeveloperRoleCollapse: false,
+        affinity: {
+          enabled: false,
+          ttlSeconds: 3_600,
+          maxRecords: 10_000,
+          prefixWeight: 100,
+          conversationWeight: 150,
+          confirmedCacheWeight: 250,
+          loadPenaltyWeight: 100,
+        },
+        memberOverrides: [],
+      },
+    });
+    expect(db.modelPool.create).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ affinityEnabled: false }),
+      }),
+    );
+  });
+
   it("skips a declared seed that the pending guarded-pool member policy would exceed", async () => {
     db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(poolRow());
     db.discoveredModel.findMany.mockResolvedValue([

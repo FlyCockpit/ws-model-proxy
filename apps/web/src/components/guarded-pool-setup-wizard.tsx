@@ -232,7 +232,7 @@ export function GuardedPoolSetupWizard({
       borrowPolicy: "WHEN_IDLE" as "NEVER" | "WHEN_IDLE",
       protocolAdaptationEnabled: false,
       allowLossyDeveloperRoleCollapse: false,
-      affinityEnabled: false,
+      affinityEnabled: true,
       affinityTtlSeconds: 3_600,
       affinityMaxRecords: 10_000,
       affinityPrefixWeight: 100,

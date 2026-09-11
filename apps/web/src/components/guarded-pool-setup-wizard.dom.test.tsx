@@ -355,6 +355,56 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
     expect(state.submitted?.providerModels).toEqual([]);
   });
 
+  it("defaults the cache-affinity toggle on and submits affinity enabled", async () => {
+    const user = userEvent.setup();
+    mount(true, true, 0);
+
+    await user.type(await screen.findByLabelText("dashboard:pools.slug"), "guarded-pool");
+    await user.type(screen.getByLabelText("dashboard:pools.name"), "Guarded pool");
+    await user.click(
+      screen.getByLabelText("dashboard:pools.wizard.selectLocalModel:owner/cli/responses"),
+    );
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+
+    const affinity = screen.getByRole("checkbox", {
+      name: "dashboard:pools.wizard.fields.affinityEnabled",
+    });
+    expect(affinity.getAttribute("aria-checked")).toBe("true");
+
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    await user.click(screen.getByRole("button", { name: "dashboard:pools.wizard.create" }));
+
+    await waitFor(() => expect(state.submitted).toBeDefined());
+    expect(state.submitted?.advanced).toMatchObject({ affinity: { enabled: true } });
+  });
+
+  it("submits affinity disabled after unchecking the default-on toggle", async () => {
+    const user = userEvent.setup();
+    mount(true, true, 0);
+
+    await user.type(await screen.findByLabelText("dashboard:pools.slug"), "guarded-pool");
+    await user.type(screen.getByLabelText("dashboard:pools.name"), "Guarded pool");
+    await user.click(
+      screen.getByLabelText("dashboard:pools.wizard.selectLocalModel:owner/cli/responses"),
+    );
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+
+    const affinity = screen.getByRole("checkbox", {
+      name: "dashboard:pools.wizard.fields.affinityEnabled",
+    });
+    expect(affinity.getAttribute("aria-checked")).toBe("true");
+    await user.click(affinity);
+    expect(affinity.getAttribute("aria-checked")).toBe("false");
+
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    await user.click(screen.getByRole("button", { name: "dashboard:pools.wizard.create" }));
+
+    await waitFor(() => expect(state.submitted).toBeDefined());
+    expect(state.submitted?.advanced).toMatchObject({ affinity: { enabled: false } });
+  });
+
   it("blocks advancing from the provider step when the gate flips off with a live selection", async () => {
     const user = userEvent.setup();
     // Dialog-mode callers have no page-level remount key, so a mid-session

@@ -1976,7 +1976,9 @@ export const forwarderManagementRouter = {
             capacityContextCeiling: input.memberContextCeiling,
             capacityContextMargin: input.advanced?.contextMargin ?? 0,
             capacityBorrowPolicy: input.advanced?.borrowPolicy ?? "WHEN_IDLE",
-            affinityEnabled: input.advanced?.affinity.enabled ?? false,
+            // Cache-affinity routing is ON by default for new guarded pools so
+            // identical follow-up requests stick to the warm member.
+            affinityEnabled: input.advanced?.affinity.enabled ?? true,
             affinityTtlSeconds: input.advanced?.affinity.ttlSeconds ?? 3600,
             affinityMaxRecords: input.advanced?.affinity.maxRecords ?? 10_000,
             affinityPrefixWeight: input.advanced?.affinity.prefixWeight ?? 100,
