@@ -8,6 +8,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
   appConfig: { capacityEnabled: true } as Record<string, unknown>,
+  // When false, the page's appConfig observer starts cold (no initialData).
+  appConfigInitialData: true,
+  // The promise settled by each appConfig fetch; tests can swap in a pending
+  // or rejecting promise to pin pending/error gate behavior.
+  appConfigPromise: Promise.resolve({ capacityEnabled: true } as Record<string, unknown>),
   capacityPromise: Promise.resolve([] as Array<Record<string, unknown>>),
   capacityCalls: 0,
   candidateCalls: 0,
@@ -35,8 +40,13 @@ vi.mock("@/utils/orpc", () => ({
     appConfig: {
       queryOptions: () => ({
         queryKey: ["appConfig"],
-        queryFn: async () => state.appConfig,
-        initialData: state.appConfig,
+        // state.appConfigPromise only gates settle timing (pending/rejected);
+        // the resolved value is always the current state.appConfig snapshot.
+        queryFn: async () => {
+          await state.appConfigPromise;
+          return state.appConfig;
+        },
+        ...(state.appConfigInitialData ? { initialData: state.appConfig } : {}),
       }),
     },
     forwarderManagement: {
@@ -59,6 +69,20 @@ vi.mock("@/utils/orpc", () => ({
                 displayName: "Public provider",
                 providerAccount: { label: "OpenAI" },
                 pricing: { currency: "USD" },
+                // Chat-native provider so provider-first PRIMARY selections
+                // have a real best-ranked native surface to auto-set.
+                nativeCapabilities: {
+                  version: 3,
+                  protocol: "openai-compatible",
+                  surfaces: {
+                    openaiChatCompletions: {
+                      source: "provider",
+                      confidence: "exact",
+                      supported: true,
+                      streaming: true,
+                    },
+                  },
+                },
               },
             ];
           },
@@ -141,6 +165,34 @@ const models = [
   },
 ];
 
+// Device fixture exposing one published direct model so /pools/new can reach
+// the provider step; mirrors the shape of listCliDevices output.
+const devicesWithModels = [
+  {
+    id: "device",
+    slug: "cli",
+    endpoints: [
+      {
+        slug: "endpoint",
+        label: "Endpoint",
+        published: true,
+        capabilityMetadata: null,
+        models: [models[1]],
+      },
+    ],
+  },
+];
+
+function mountPage() {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const view = render(
+    <QueryClientProvider client={client}>
+      <NewPoolPage />
+    </QueryClientProvider>,
+  );
+  return { ...view, client };
+}
+
 function mount(
   open = true,
   protocolAdaptationAvailable = true,
@@ -168,6 +220,8 @@ function mount(
 afterEach(() => {
   cleanup();
   state.appConfig = { capacityEnabled: true };
+  state.appConfigInitialData = true;
+  state.appConfigPromise = Promise.resolve(state.appConfig);
   state.capacityCalls = 0;
   state.candidateCalls = 0;
   state.capacityPromise = Promise.resolve([]);
@@ -406,6 +460,68 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
     expect(screen.getByText("dashboard:pools.wizard.providerEgressDisabled")).toBeTruthy();
   });
 
+  it("fails the egress gate closed while the cold appConfig fetch is pending", async () => {
+    const user = userEvent.setup();
+    state.devices = devicesWithModels;
+    // Cold observer: no initialData and a fetch that never settles, so the
+    // page stays isPending with undefined data for the whole test.
+    state.appConfigInitialData = false;
+    state.appConfigPromise = new Promise(() => {});
+    mountPage();
+
+    const provider = await drivePageToProviderStep(user);
+    expect(provider.getAttribute("aria-disabled")).toBe("true");
+    expect(screen.getByText("dashboard:pools.wizard.providerEgressDisabled")).toBeTruthy();
+    await user.click(provider);
+    expect(provider.getAttribute("aria-checked")).toBe("false");
+    expect(screen.queryByText("dashboard:pools.wizard.egressWarning")).toBeNull();
+  });
+
+  it("fails the egress gate closed after a failed appConfig refetch retains a stale-true snapshot", async () => {
+    let rejectAppConfig!: (reason: unknown) => void;
+    const user = userEvent.setup();
+    state.devices = devicesWithModels;
+    state.appConfig = { capacityEnabled: true, providerEgressEnabled: true };
+    state.appConfigInitialData = true;
+    state.appConfigPromise = new Promise((_, reject) => {
+      rejectAppConfig = reject;
+    });
+    mountPage();
+
+    const provider = await drivePageToProviderStep(user);
+    // During the in-flight refetch RTT the warm snapshot still serves the gate.
+    expect(provider.getAttribute("aria-disabled")).toBeNull();
+    await user.click(provider);
+    expect(provider.getAttribute("aria-checked")).toBe("true");
+
+    // The refetchOnMount fetch fails; React Query sets status "error" while
+    // retaining the stale providerEgressEnabled:true data.
+    rejectAppConfig(new Error("appConfig unavailable"));
+
+    // Gate flips to closed and the settled key change remounts the wizard,
+    // clearing the live provider selection and all entered form state.
+    await waitFor(() =>
+      expect((screen.getByLabelText("dashboard:pools.slug") as HTMLInputElement).value).toBe(""),
+    );
+
+    const after = await drivePageToProviderStep(user);
+    expect(after.getAttribute("aria-checked")).toBe("false");
+    expect(after.getAttribute("aria-disabled")).toBe("true");
+    expect(screen.getByText("dashboard:pools.wizard.providerEgressDisabled")).toBeTruthy();
+  });
+
+  it("registers the page's appConfig observer with refetchOnMount always", () => {
+    const { client } = mountPage();
+
+    const query = client.getQueryCache().find({ queryKey: ["appConfig"] });
+    expect(query).toBeDefined();
+    if (!query) throw new Error("appConfig query not registered");
+    expect(query.observers.length).toBeGreaterThan(0);
+    // Structural pin: the page must opt its own observer out of the shared
+    // warm-cache defaults so the gate tracks a fresh snapshot per visit.
+    expect(query.observers[0]?.options.refetchOnMount).toBe("always");
+  });
+
   it("navigates, applies delayed capacities, opts into adaptation, configures overrides and budgets, and submits", async () => {
     let resolveCapacities!: (value: Array<Record<string, unknown>>) => void;
     state.capacityPromise = new Promise((resolve) => {
@@ -451,13 +567,16 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
     await user.type(override, "2");
 
     await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    // Auto-set-once: the first selected member (chat) pinned
+    // OPENAI_CHAT_COMPLETIONS; adding the responses member and enabling
+    // adaptation must not recompute it away while it stays selectable.
     expect(
       (
         screen.getByLabelText(
           "dashboard:pools.wizard.fields.recommendedSurface",
         ) as HTMLSelectElement
       ).value,
-    ).toBe("OPENAI_RESPONSES");
+    ).toBe("OPENAI_CHAT_COMPLETIONS");
     await user.click(
       await screen.findByLabelText("dashboard:pools.wizard.selectProvider:Public provider"),
     );
@@ -496,7 +615,7 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
     await waitFor(() => expect(state.submitted).toBeDefined());
     expect(state.submitted).toMatchObject({
       slug: "guarded-pool",
-      recommendedSurface: "OPENAI_RESPONSES",
+      recommendedSurface: "OPENAI_CHAT_COMPLETIONS",
       memberContextCeiling: null,
       publicEgressAcknowledged: true,
       providerModels: [
@@ -528,6 +647,17 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
     });
   });
 
+  async function drivePageToProviderStep(user: ReturnType<typeof userEvent.setup>) {
+    await user.type(await screen.findByLabelText("dashboard:pools.slug"), "guarded-pool");
+    await user.type(screen.getByLabelText("dashboard:pools.name"), "Guarded pool");
+    await user.click(
+      screen.getByLabelText("dashboard:pools.wizard.selectLocalModel:owner/cli/responses"),
+    );
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    return await screen.findByLabelText("dashboard:pools.wizard.selectProvider:Public provider");
+  }
+
   async function driveToReviewStep(user: ReturnType<typeof userEvent.setup>) {
     await user.type(screen.getByLabelText("dashboard:pools.slug"), "guarded-pool");
     await user.type(screen.getByLabelText("dashboard:pools.name"), "Guarded pool");
@@ -539,6 +669,150 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
     await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
     expect(screen.getByText("dashboard:pools.wizard.atomicRollback")).toBeTruthy();
   }
+
+  it("defaults the recommended API to the first member, keeps selectable manual choices, and auto-repairs unselectable ones", async () => {
+    const user = userEvent.setup();
+    mount();
+    const surfaceSelect = () =>
+      screen.getByLabelText(
+        "dashboard:pools.wizard.fields.recommendedSurface",
+      ) as HTMLSelectElement;
+
+    await user.type(await screen.findByLabelText("dashboard:pools.slug"), "guarded-pool");
+    await user.type(screen.getByLabelText("dashboard:pools.name"), "Guarded pool");
+    await user.click(
+      screen.getByLabelText("dashboard:pools.wizard.selectLocalModel:owner/cli/chat"),
+    );
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    // Enable adaptation BEFORE the manual choice so the OPENAI_RESPONSES
+    // override is genuinely selectable for the chat-only member at selection
+    // time — the persistence assertion below then rides the selectable-keep
+    // path, not the stranded-keep path.
+    await user.click(
+      screen.getByRole("radio", { name: "dashboard:pools.protocolOptions.lossless.label" }),
+    );
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    // First selected member (chat-native) pinned its best native API.
+    expect(surfaceSelect().value).toBe("OPENAI_CHAT_COMPLETIONS");
+
+    // The manual override is selectable (chat serves it via adaptation).
+    await user.selectOptions(surfaceSelect(), "OPENAI_RESPONSES");
+    expect(surfaceSelect().value).toBe("OPENAI_RESPONSES");
+
+    // Adding a member that keeps the manual choice selectable must persist it
+    // (not recompute it to a ranked default).
+    await user.click(screen.getByRole("button", { name: "dashboard:pools.wizard.back" }));
+    await user.click(screen.getByRole("button", { name: "dashboard:pools.wizard.back" }));
+    await user.click(
+      screen.getByLabelText("dashboard:pools.wizard.selectLocalModel:owner/cli/responses"),
+    );
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    expect(surfaceSelect().value).toBe("OPENAI_RESPONSES");
+
+    // Disabling adaptation and dropping the responses member strands the
+    // manual choice for the chat-only member: auto-repair falls back to the
+    // best-ranked selectable surface.
+    await user.click(screen.getByRole("button", { name: "dashboard:pools.wizard.back" }));
+    await user.click(
+      screen.getByRole("radio", { name: "dashboard:pools.protocolOptions.native.label" }),
+    );
+    await user.click(screen.getByRole("button", { name: "dashboard:pools.wizard.back" }));
+    await user.click(
+      screen.getByLabelText("dashboard:pools.wizard.selectLocalModel:owner/cli/responses"),
+    );
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    expect(surfaceSelect().value).toBe("OPENAI_CHAT_COMPLETIONS");
+  });
+
+  it("auto-sets the recommended API from a provider-first PRIMARY selection and never overwrites it with a later local", async () => {
+    const user = userEvent.setup();
+    mount();
+    const surfaceSelect = () =>
+      screen.getByLabelText(
+        "dashboard:pools.wizard.fields.recommendedSurface",
+      ) as HTMLSelectElement;
+
+    await user.type(await screen.findByLabelText("dashboard:pools.slug"), "guarded-pool");
+    await user.type(screen.getByLabelText("dashboard:pools.name"), "Guarded pool");
+    // Provider-first: step 0 permits zero locals (the empty-member schema
+    // issue targets providerModelIds, a step-2 field), so leave them all off.
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    // Adaptation keeps the OPENAI_RESPONSES default selectable for the
+    // chat-native provider, so only the first-PRIMARY-member branch (not
+    // repair) can explain the auto-set below. Under the old locals-only
+    // policy the provider selection never triggered an auto-set and the
+    // field silently kept OPENAI_RESPONSES — this test fails there.
+    await user.click(
+      screen.getByRole("radio", { name: "dashboard:pools.protocolOptions.lossless.label" }),
+    );
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    expect(surfaceSelect().value).toBe("OPENAI_RESPONSES");
+
+    // Tier flip with no providers selected: the primary set stays empty.
+    await user.selectOptions(
+      screen.getByLabelText("dashboard:pools.wizard.fields.providerTier"),
+      "PRIMARY",
+    );
+    expect(surfaceSelect().value).toBe("OPENAI_RESPONSES");
+
+    // (a) The first PRIMARY member (the chat-native provider) auto-sets its
+    // best-ranked native surface exactly once.
+    await user.click(
+      await screen.findByLabelText("dashboard:pools.wizard.selectProvider:Public provider"),
+    );
+    expect(surfaceSelect().value).toBe("OPENAI_CHAT_COMPLETIONS");
+
+    // (b) Back-nav: adding the first local later must NOT overwrite the
+    // provider-era surface even though the locals-only set transitions
+    // empty → non-empty. Under the old locals-only trigger the first branch
+    // re-ranked to the responses local's native OPENAI_RESPONSES — this
+    // assertion fails there.
+    await user.click(screen.getByRole("button", { name: "dashboard:pools.wizard.back" }));
+    await user.click(screen.getByRole("button", { name: "dashboard:pools.wizard.back" }));
+    await user.click(
+      screen.getByLabelText("dashboard:pools.wizard.selectLocalModel:owner/cli/responses"),
+    );
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    expect(surfaceSelect().value).toBe("OPENAI_CHAT_COMPLETIONS");
+  });
+
+  it("does not auto-set on PUBLIC_OVERFLOW provider selection but does on the tier flip to PRIMARY", async () => {
+    const user = userEvent.setup();
+    mount();
+    const surfaceSelect = () =>
+      screen.getByLabelText(
+        "dashboard:pools.wizard.fields.recommendedSurface",
+      ) as HTMLSelectElement;
+
+    await user.type(await screen.findByLabelText("dashboard:pools.slug"), "guarded-pool");
+    await user.type(screen.getByLabelText("dashboard:pools.name"), "Guarded pool");
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    await user.click(
+      screen.getByRole("radio", { name: "dashboard:pools.protocolOptions.lossless.label" }),
+    );
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+
+    // (c) A PUBLIC_OVERFLOW-tier provider is not a primary member: selecting
+    // it must not trigger the member-driven auto-set.
+    await user.click(
+      await screen.findByLabelText("dashboard:pools.wizard.selectProvider:Public provider"),
+    );
+    expect(surfaceSelect().value).toBe("OPENAI_RESPONSES");
+
+    // (d) Flipping the tier to PRIMARY makes the provider the first primary
+    // member (combined primary set empty → non-empty) and auto-sets its
+    // native surface. Under the old policy the tier change never fired the
+    // first branch and the still-selectable default was kept — this
+    // assertion fails there.
+    await user.selectOptions(
+      screen.getByLabelText("dashboard:pools.wizard.fields.providerTier"),
+      "PRIMARY",
+    );
+    expect(surfaceSelect().value).toBe("OPENAI_CHAT_COMPLETIONS");
+  });
 
   it("renders the specific create failure reason inline on the review step", async () => {
     const user = userEvent.setup();

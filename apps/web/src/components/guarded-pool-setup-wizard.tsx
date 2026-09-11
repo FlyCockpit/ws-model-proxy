@@ -26,12 +26,13 @@ import { useTranslation } from "react-i18next";
 import { ProtocolCompatibilityRadio } from "@/components/forwarder-dashboard-sections";
 import {
   buildGuardedPoolWizardSchema,
+  combinedPrimaryMemberCount,
   type GuardedWizardLocalModel,
   guardedWizardSurfaces,
+  nextRecommendedSurface,
   providerOrderAfterMove,
   providerOrderAfterToggle,
-  recommendedCombinedPrimarySurface,
-  recommendedPrimarySurface,
+  type RecommendedSurfaceFlags,
 } from "@/lib/guarded-pool-wizard-validation";
 import { orpc } from "@/utils/orpc";
 
@@ -158,6 +159,12 @@ export function GuardedPoolSetupWizard({
   const queryClient = useQueryClient();
   const capacityIsEnabled = capacityEnabled;
   const formRef = useRef<HTMLFormElement>(null);
+  // Tracks whether the recommended API was chosen by the user vs derived from
+  // members. Lives across step navigation for the lifetime of the wizard.
+  const recommendedSurfaceFlags = useRef<RecommendedSurfaceFlags>({
+    manuallyChosen: false,
+    autoSetByMember: false,
+  });
   const [step, setStep] = useState<number>(initialStep);
   const [stepErrors, setStepErrors] = useState<Record<string, string>>({});
   const [memberOverrides, setMemberOverrides] = useState<Record<string, MemberOverride>>({});
@@ -334,6 +341,33 @@ export function GuardedPoolSetupWizard({
       }
     },
   });
+  // Auto-set-once / auto-repair policy (see nextRecommendedSurface): invoked
+  // from member, provider, tier, and adaptation change handlers — never
+  // recompute a still-valid surface, and never overwrite a manual choice
+  // unless it has become unselectable for the primary set.
+  const applyRecommendedSurfacePolicy = (
+    selection: {
+      localIds: readonly string[];
+      providerIds: readonly string[];
+      providerTier: "PRIMARY" | "PUBLIC_OVERFLOW";
+      protocolAdaptationEnabled: boolean;
+    },
+    firstMemberSelection = false,
+  ) => {
+    const decision = nextRecommendedSurface(
+      form.state.values.recommendedSurface,
+      recommendedSurfaceFlags.current,
+      {
+        ...selection,
+        localModels: directModels,
+        providerModels: candidates.data ?? [],
+      },
+      firstMemberSelection,
+    );
+    recommendedSurfaceFlags.current = decision.flags;
+    if (decision.surface !== form.state.values.recommendedSurface)
+      form.setFieldValue("recommendedSurface", decision.surface);
+  };
   const stepFields = [
     ["slug", "name", "localModelIds"],
     [
@@ -505,19 +539,39 @@ export function GuardedPoolSetupWizard({
                             checked={field.state.value.includes(model.id)}
                             onCheckedChange={(checked) =>
                               (() => {
+                                const previous = field.state.value;
                                 const next =
                                   checked === true
-                                    ? [...field.state.value, model.id]
-                                    : field.state.value.filter((id) => id !== model.id);
+                                    ? [...previous, model.id]
+                                    : previous.filter((id) => id !== model.id);
                                 field.handleChange(next);
-                                const recommended = recommendedPrimarySurface(
-                                  next,
-                                  directModels,
-                                  protocolAdaptationAvailable &&
-                                    form.state.values.protocolAdaptationEnabled,
+                                applyRecommendedSurfacePolicy(
+                                  {
+                                    localIds: next,
+                                    providerIds: form.state.values.providerModelIds,
+                                    providerTier: form.state.values.providerTier,
+                                    protocolAdaptationEnabled:
+                                      protocolAdaptationAvailable &&
+                                      form.state.values.protocolAdaptationEnabled,
+                                  },
+                                  // First-PRIMARY-member trigger: the combined
+                                  // primary set (locals + PRIMARY-tier
+                                  // providers), not just locals, must transition
+                                  // empty → non-empty. A provider-first
+                                  // selection already claimed the auto-set, so
+                                  // adding the first local later must not
+                                  // overwrite it.
+                                  combinedPrimaryMemberCount(
+                                    previous,
+                                    form.state.values.providerModelIds,
+                                    form.state.values.providerTier,
+                                  ) === 0 &&
+                                    combinedPrimaryMemberCount(
+                                      next,
+                                      form.state.values.providerModelIds,
+                                      form.state.values.providerTier,
+                                    ) > 0,
                                 );
-                                if (recommended)
-                                  form.setFieldValue("recommendedSurface", recommended);
                               })()
                             }
                           />
@@ -713,12 +767,13 @@ export function GuardedPoolSetupWizard({
                             "allowLossyDeveloperRoleCollapse",
                             value.allowLossyDeveloperRoleCollapse,
                           );
-                          const recommended = recommendedPrimarySurface(
-                            form.state.values.localModelIds,
-                            directModels,
-                            protocolAdaptationAvailable && value.adaptationEnabled,
-                          );
-                          if (recommended) form.setFieldValue("recommendedSurface", recommended);
+                          applyRecommendedSurfacePolicy({
+                            localIds: form.state.values.localModelIds,
+                            providerIds: form.state.values.providerModelIds,
+                            providerTier: form.state.values.providerTier,
+                            protocolAdaptationEnabled:
+                              protocolAdaptationAvailable && value.adaptationEnabled,
+                          });
                         }}
                       />
                     )}
@@ -806,9 +861,13 @@ export function GuardedPoolSetupWizard({
                       id="guarded-surface"
                       className="h-11 w-full rounded-md border bg-background px-3 text-sm"
                       value={field.state.value}
-                      onChange={(event) =>
-                        field.handleChange(event.target.value as typeof field.state.value)
-                      }
+                      onChange={(event) => {
+                        field.handleChange(event.target.value as typeof field.state.value);
+                        recommendedSurfaceFlags.current = {
+                          ...recommendedSurfaceFlags.current,
+                          manuallyChosen: true,
+                        };
+                      }}
                       {...errorProps("recommendedSurface")}
                     >
                       {guardedWizardSurfaces.map((surface) => (
@@ -869,23 +928,38 @@ export function GuardedPoolSetupWizard({
                               disabled={!providerEgressEnabled}
                               checked={order >= 0}
                               onCheckedChange={(checked) => {
+                                const tier = form.state.values.providerTier;
+                                const previousProviderIds = field.state.value;
                                 const next = providerOrderAfterToggle(
-                                  field.state.value,
+                                  previousProviderIds,
                                   candidate.id,
                                   checked === true,
                                 );
                                 field.handleChange(next);
-                                const recommended = recommendedCombinedPrimarySurface(
-                                  form.state.values.localModelIds,
-                                  directModels,
-                                  next,
-                                  candidates.data ?? [],
-                                  form.state.values.providerTier,
-                                  protocolAdaptationAvailable &&
-                                    form.state.values.protocolAdaptationEnabled,
+                                applyRecommendedSurfacePolicy(
+                                  {
+                                    localIds: form.state.values.localModelIds,
+                                    providerIds: next,
+                                    providerTier: tier,
+                                    protocolAdaptationEnabled:
+                                      protocolAdaptationAvailable &&
+                                      form.state.values.protocolAdaptationEnabled,
+                                  },
+                                  // Only a PRIMARY-tier provider can be the
+                                  // first primary member; PUBLIC_OVERFLOW
+                                  // selections never trigger the auto-set.
+                                  tier === "PRIMARY" &&
+                                    combinedPrimaryMemberCount(
+                                      form.state.values.localModelIds,
+                                      previousProviderIds,
+                                      tier,
+                                    ) === 0 &&
+                                    combinedPrimaryMemberCount(
+                                      form.state.values.localModelIds,
+                                      next,
+                                      tier,
+                                    ) > 0,
                                 );
-                                if (recommended)
-                                  form.setFieldValue("recommendedSurface", recommended);
                               }}
                             />
                             <span className="min-w-0 flex-1">
@@ -970,18 +1044,33 @@ export function GuardedPoolSetupWizard({
                       className="h-11 w-full rounded-md border bg-background px-3 text-sm"
                       value={field.state.value}
                       onChange={(event) => {
+                        const previousTier = field.state.value;
                         const tier = event.target.value as typeof field.state.value;
                         field.handleChange(tier);
-                        const recommended = recommendedCombinedPrimarySurface(
-                          form.state.values.localModelIds,
-                          directModels,
-                          form.state.values.providerModelIds,
-                          candidates.data ?? [],
-                          tier,
-                          protocolAdaptationAvailable &&
-                            form.state.values.protocolAdaptationEnabled,
+                        const providerIds = form.state.values.providerModelIds;
+                        applyRecommendedSurfacePolicy(
+                          {
+                            localIds: form.state.values.localModelIds,
+                            providerIds,
+                            providerTier: tier,
+                            protocolAdaptationEnabled:
+                              protocolAdaptationAvailable &&
+                              form.state.values.protocolAdaptationEnabled,
+                          },
+                          // Compare the combined primary count under the
+                          // previous vs next tier: covers a provider selected
+                          // while PUBLIC_OVERFLOW, then flipped to PRIMARY.
+                          combinedPrimaryMemberCount(
+                            form.state.values.localModelIds,
+                            providerIds,
+                            previousTier,
+                          ) === 0 &&
+                            combinedPrimaryMemberCount(
+                              form.state.values.localModelIds,
+                              providerIds,
+                              tier,
+                            ) > 0,
                         );
-                        if (recommended) form.setFieldValue("recommendedSurface", recommended);
                       }}
                     >
                       <option value="PRIMARY">{t("dashboard:pools.memberTiers.PRIMARY")}</option>

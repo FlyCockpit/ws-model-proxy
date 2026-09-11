@@ -1719,42 +1719,16 @@ export const forwarderManagementRouter = {
               }),
             ),
         ];
-        const recommendedSurface = [
-          "OPENAI_RESPONSES",
-          "OPENAI_CHAT_COMPLETIONS",
-          "ANTHROPIC_MESSAGES",
-        ]
-          .map((surface, orderIndex) => {
-            const typedSurface = surface as Exclude<
-              (typeof modelApiSurfaces)[number],
-              "OPENAI_COMPLETIONS"
-            >;
-            return {
-              surface: typedSurface,
-              orderIndex,
-              nativeCount: primaryMatrices.filter(
-                (matrix) => matrix[typedSurface].mode === "native",
-              ).length,
-              limitations: primaryMatrices.reduce(
-                (count, matrix) => count + matrix[typedSurface].limitations.length,
-                0,
-              ),
-              available: primaryMatrices.every(
-                (matrix) => matrix[typedSurface].mode !== "unavailable",
-              ),
-            };
-          })
-          .filter((candidate) => candidate.available)
-          .sort(
-            (left, right) =>
-              right.nativeCount - left.nativeCount ||
-              left.limitations - right.limitations ||
-              left.orderIndex - right.orderIndex,
-          )[0]?.surface;
-        if (!recommendedSurface || input.recommendedSurface !== recommendedSurface) {
+        // The recommended API is an operator choice: any surface that every
+        // primary member can serve — natively or via protocol adaptation — is
+        // accepted, not only the top-ranked one. An empty primary set (a
+        // provider-only PUBLIC_OVERFLOW pool) accepts any surface.
+        if (
+          primaryMatrices.some((matrix) => matrix[input.recommendedSurface].mode === "unavailable")
+        ) {
           throw new ORPCError("BAD_REQUEST", {
             message:
-              "Recommended API must be the best API supported by every selected primary model.",
+              "Every selected primary member must serve the recommended API natively or via protocol adaptation.",
             data: { reason: "SURFACE_NOT_SUPPORTED" },
           });
         }

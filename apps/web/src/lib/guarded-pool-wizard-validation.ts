@@ -148,6 +148,96 @@ export function primarySurfaceIsSelectable(
   return matrices.length > 0 && matrices.every((matrix) => matrix[surface].mode !== "unavailable");
 }
 
+export type RecommendedSurfaceFlags = {
+  /** Set when the user changes the recommended API select directly. */
+  manuallyChosen: boolean;
+  /** Set once any member-driven auto-set (first default or repair) ran. */
+  autoSetByMember: boolean;
+};
+
+export type RecommendedSurfaceSelection = {
+  localIds: readonly string[];
+  localModels: readonly GuardedWizardLocalModel[];
+  providerIds: readonly string[];
+  providerModels: readonly GuardedWizardProviderModel[];
+  providerTier: "PRIMARY" | "PUBLIC_OVERFLOW";
+  protocolAdaptationEnabled: boolean;
+};
+
+/**
+ * Number of PRIMARY members under the given tier: locals plus providers when
+ * the provider tier is PRIMARY. PUBLIC_OVERFLOW providers are not primary
+ * members and never count toward first-member or repair decisions.
+ */
+export function combinedPrimaryMemberCount(
+  localIds: readonly string[],
+  providerIds: readonly string[],
+  providerTier: "PRIMARY" | "PUBLIC_OVERFLOW",
+): number {
+  return localIds.length + (providerTier === "PRIMARY" ? providerIds.length : 0);
+}
+
+/**
+ * Auto-set-once policy for the wizard's recommended API:
+ * - When the pool's PRIMARY member set (locals + PRIMARY-tier providers)
+ *   transitions empty → non-empty and the surface was neither manually chosen
+ *   nor previously set by a member, default to the best-ranked surface of the
+ *   COMBINED primary set at that moment. If that combined ranking returns
+ *   null (no common selectable surface), nothing is written and a later
+ *   addition may still fire this branch.
+ * - Never recompute on later member additions/removals, provider selection,
+ *   tier changes, or adaptation toggles — except auto-repair: when the current
+ *   surface is no longer selectable for the primary set, fall back to the
+ *   best-ranked selectable surface so the form stays valid.
+ */
+export function nextRecommendedSurface(
+  current: Exclude<ModelApiSurface, "OPENAI_COMPLETIONS">,
+  flags: RecommendedSurfaceFlags,
+  selection: RecommendedSurfaceSelection,
+  firstMemberSelection: boolean,
+): { surface: Exclude<ModelApiSurface, "OPENAI_COMPLETIONS">; flags: RecommendedSurfaceFlags } {
+  if (firstMemberSelection && !flags.manuallyChosen && !flags.autoSetByMember) {
+    const first = recommendedCombinedPrimarySurface(
+      selection.localIds,
+      selection.localModels,
+      selection.providerIds,
+      selection.providerModels,
+      selection.providerTier,
+      selection.protocolAdaptationEnabled,
+    );
+    if (first) return { surface: first, flags: { manuallyChosen: false, autoSetByMember: true } };
+  }
+  const primaryCount = combinedPrimaryMemberCount(
+    selection.localIds,
+    selection.providerIds,
+    selection.providerTier,
+  );
+  if (
+    primaryCount > 0 &&
+    !combinedPrimarySurfaceIsSelectable(
+      current,
+      selection.localIds,
+      selection.localModels,
+      selection.providerIds,
+      selection.providerModels,
+      selection.providerTier,
+      selection.protocolAdaptationEnabled,
+    )
+  ) {
+    const fallback = recommendedCombinedPrimarySurface(
+      selection.localIds,
+      selection.localModels,
+      selection.providerIds,
+      selection.providerModels,
+      selection.providerTier,
+      selection.protocolAdaptationEnabled,
+    );
+    if (fallback)
+      return { surface: fallback, flags: { manuallyChosen: false, autoSetByMember: true } };
+  }
+  return { surface: current, flags };
+}
+
 export function minimumSelectedPhysicalContext(
   selectedIds: readonly string[],
   models: readonly GuardedWizardLocalModel[],

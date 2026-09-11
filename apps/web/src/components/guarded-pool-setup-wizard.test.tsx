@@ -53,8 +53,10 @@ vi.mock("@ws-model-proxy/ui/components/dialog", () => ({
 
 import {
   buildGuardedPoolWizardSchema,
+  combinedPrimaryMemberCount,
   combinedPrimarySurfaceIsSelectable,
   minimumSelectedPhysicalContext,
+  nextRecommendedSurface,
   primarySurfaceIsSelectable,
   providerEgressFromAppConfig,
   providerOrderAfterMove,
@@ -98,6 +100,42 @@ const localModel = {
   canonicalModelId: "owner/cli/local/model",
   effectiveCapabilities: { metadata: chatCapabilities },
   executionTarget: { inferenceCapacityId: "capacity" },
+};
+
+// Single-surface model factory shared by the recommended-surface policy tests.
+const policySurfaceModel = (id: string, surface: "openaiChatCompletions" | "openaiResponses") => ({
+  ...localModel,
+  id,
+  effectiveCapabilities: {
+    metadata: {
+      version: 3 as const,
+      protocol: "openai-compatible" as const,
+      surfaces: {
+        [surface]: {
+          source: "declared" as const,
+          confidence: "exact" as const,
+          supported: true,
+          streaming: true,
+        },
+      },
+    },
+  },
+});
+// Chat-native provider whose only native surface is OPENAI_CHAT_COMPLETIONS.
+const chatOnlyProvider = {
+  id: "provider",
+  nativeCapabilities: {
+    version: 3 as const,
+    protocol: "openai-compatible" as const,
+    surfaces: {
+      openaiChatCompletions: {
+        source: "provider" as const,
+        confidence: "exact" as const,
+        supported: true,
+        streaming: true,
+      },
+    },
+  },
 };
 
 function renderStep(
@@ -531,6 +569,228 @@ describe("GuardedPoolSetupWizard", () => {
     expect(primarySurfaceIsSelectable("OPENAI_RESPONSES", selected, heterogeneous, true)).toBe(
       true,
     );
+  });
+
+  it("applies the auto-set-once and auto-repair recommended-surface policy", () => {
+    const surfaceModel = (id: string, surface: "openaiChatCompletions" | "openaiResponses") => ({
+      ...localModel,
+      id,
+      effectiveCapabilities: {
+        metadata: {
+          version: 3 as const,
+          protocol: "openai-compatible" as const,
+          surfaces: {
+            [surface]: {
+              source: "declared" as const,
+              confidence: "exact" as const,
+              supported: true,
+              streaming: true,
+            },
+          },
+        },
+      },
+    });
+    const chat = surfaceModel("chat", "openaiChatCompletions");
+    const responses = surfaceModel("responses", "openaiResponses");
+    const fresh = { manuallyChosen: false, autoSetByMember: false };
+    const selectionOf = (
+      localIds: readonly string[],
+      protocolAdaptationEnabled = false,
+      providerTier: "PRIMARY" | "PUBLIC_OVERFLOW" = "PRIMARY",
+    ) => ({
+      localIds,
+      localModels: [chat, responses],
+      providerIds: [] as readonly string[],
+      providerModels: [] as never[],
+      providerTier,
+      protocolAdaptationEnabled,
+    });
+
+    // First selection defaults to that single member's best native API.
+    const first = nextRecommendedSurface("OPENAI_RESPONSES", fresh, selectionOf(["chat"]), true);
+    expect(first).toEqual({
+      surface: "OPENAI_CHAT_COMPLETIONS",
+      flags: { manuallyChosen: false, autoSetByMember: true },
+    });
+
+    // No recompute when a second member joins while the value stays valid.
+    expect(
+      nextRecommendedSurface(
+        first.surface,
+        first.flags,
+        selectionOf(["chat", "responses"], true),
+        false,
+      ).surface,
+    ).toBe("OPENAI_CHAT_COMPLETIONS");
+
+    // No re-default on a later "first" transition once a member already set it.
+    expect(
+      nextRecommendedSurface("OPENAI_RESPONSES", first.flags, selectionOf(["chat"], true), true)
+        .surface,
+    ).toBe("OPENAI_RESPONSES");
+
+    // A manual choice persists while it remains selectable.
+    const manual = { manuallyChosen: true, autoSetByMember: true };
+    const keptManual = nextRecommendedSurface(
+      "OPENAI_RESPONSES",
+      manual,
+      selectionOf(["chat", "responses"], true),
+      false,
+    );
+    expect(keptManual.surface).toBe("OPENAI_RESPONSES");
+    expect(keptManual.flags).toEqual(manual);
+
+    // Auto-repair replaces a manual choice that became unselectable (the
+    // chat-only member cannot serve OPENAI_RESPONSES without adaptation).
+    const repaired = nextRecommendedSurface(
+      "OPENAI_RESPONSES",
+      manual,
+      selectionOf(["chat"]),
+      false,
+    );
+    expect(repaired).toEqual({
+      surface: "OPENAI_CHAT_COMPLETIONS",
+      flags: { manuallyChosen: false, autoSetByMember: true },
+    });
+
+    // Unselectable with no selectable fallback keeps the value (the schema
+    // flags it inline; the user must adjust members or enable adaptation).
+    expect(
+      nextRecommendedSurface("OPENAI_RESPONSES", fresh, selectionOf(["chat", "responses"]), false)
+        .surface,
+    ).toBe("OPENAI_RESPONSES");
+
+    // A zero-primary selection (PUBLIC_OVERFLOW-only providers) never repairs.
+    expect(
+      nextRecommendedSurface(
+        "OPENAI_RESPONSES",
+        fresh,
+        selectionOf([], false, "PUBLIC_OVERFLOW"),
+        false,
+      ).surface,
+    ).toBe("OPENAI_RESPONSES");
+  });
+
+  it("keeps a selectable manual choice that is not the ranked winner across member changes", () => {
+    const chat = policySurfaceModel("chat", "openaiChatCompletions");
+    const responses = policySurfaceModel("responses", "openaiResponses");
+    const manual = { manuallyChosen: true, autoSetByMember: true };
+    // Mixed members with adaptation: the combined ranking returns
+    // OPENAI_RESPONSES (see "requires explicit adaptation..."), but the manual
+    // OPENAI_CHAT_COMPLETIONS is selectable and must survive the member set
+    // that would re-rank it. Under the OLD always-recompute policy this member
+    // change rewrote the surface to the ranked winner OPENAI_RESPONSES, so
+    // this test fails there.
+    const kept = nextRecommendedSurface(
+      "OPENAI_CHAT_COMPLETIONS",
+      manual,
+      {
+        localIds: ["chat", "responses"],
+        localModels: [chat, responses],
+        providerIds: [],
+        providerModels: [],
+        providerTier: "PRIMARY",
+        protocolAdaptationEnabled: true,
+      },
+      false,
+    );
+    expect(kept.surface).toBe("OPENAI_CHAT_COMPLETIONS");
+    expect(kept.flags).toEqual(manual);
+  });
+
+  it("auto-sets from the combined primary set on a provider-first PRIMARY selection", () => {
+    // Adaptation keeps the OPENAI_RESPONSES default selectable for the
+    // chat-native provider, so only the first-PRIMARY-member branch can write.
+    // Under the OLD locals-only first branch the ranking returned null (no
+    // locals selected) and repair stayed silent (still selectable), leaving
+    // OPENAI_RESPONSES with fresh flags — this test fails there.
+    const decision = nextRecommendedSurface(
+      "OPENAI_RESPONSES",
+      { manuallyChosen: false, autoSetByMember: false },
+      {
+        localIds: [],
+        localModels: [policySurfaceModel("chat", "openaiChatCompletions")],
+        providerIds: [chatOnlyProvider.id],
+        providerModels: [chatOnlyProvider],
+        providerTier: "PRIMARY",
+        protocolAdaptationEnabled: true,
+      },
+      true,
+    );
+    expect(decision).toEqual({
+      surface: "OPENAI_CHAT_COMPLETIONS",
+      flags: { manuallyChosen: false, autoSetByMember: true },
+    });
+  });
+
+  it("never auto-sets from PUBLIC_OVERFLOW provider selections", () => {
+    // Robustness pin: even a caller that mislabels a PUBLIC_OVERFLOW provider
+    // toggle as a first-member selection must not trigger a write, because the
+    // combined primary set excludes overflow-tier providers.
+    const decision = nextRecommendedSurface(
+      "OPENAI_RESPONSES",
+      { manuallyChosen: false, autoSetByMember: false },
+      {
+        localIds: [],
+        localModels: [policySurfaceModel("chat", "openaiChatCompletions")],
+        providerIds: [chatOnlyProvider.id],
+        providerModels: [chatOnlyProvider],
+        providerTier: "PUBLIC_OVERFLOW",
+        protocolAdaptationEnabled: true,
+      },
+      true,
+    );
+    expect(decision.surface).toBe("OPENAI_RESPONSES");
+    expect(decision.flags).toEqual({ manuallyChosen: false, autoSetByMember: false });
+  });
+
+  it("writes nothing when the combined primary ranking is null and lets a later member fire the first branch", () => {
+    const chat = policySurfaceModel("chat", "openaiChatCompletions");
+    const responses = policySurfaceModel("responses", "openaiResponses");
+    const noSurfacesProvider = { id: "opaque", nativeCapabilities: { version: 1 } };
+    const fresh = { manuallyChosen: false, autoSetByMember: false };
+    // The opaque provider shares no selectable surface with the chat local, so
+    // the first-PRIMARY-member ranking is null: no write, flags untouched.
+    const unwritten = nextRecommendedSurface(
+      "OPENAI_RESPONSES",
+      fresh,
+      {
+        localIds: [chat.id],
+        localModels: [chat, responses],
+        providerIds: [noSurfacesProvider.id],
+        providerModels: [noSurfacesProvider],
+        providerTier: "PRIMARY",
+        protocolAdaptationEnabled: false,
+      },
+      true,
+    );
+    expect(unwritten.surface).toBe("OPENAI_RESPONSES");
+    expect(unwritten.flags).toEqual(fresh);
+    // A later legitimate empty → non-empty transition (repair here, since the
+    // current surface is unselectable for the chat local) may still write.
+    const later = nextRecommendedSurface(
+      "OPENAI_RESPONSES",
+      unwritten.flags,
+      {
+        localIds: [chat.id],
+        localModels: [chat, responses],
+        providerIds: [],
+        providerModels: [],
+        providerTier: "PRIMARY",
+        protocolAdaptationEnabled: false,
+      },
+      true,
+    );
+    expect(later).toEqual({
+      surface: "OPENAI_CHAT_COMPLETIONS",
+      flags: { manuallyChosen: false, autoSetByMember: true },
+    });
+  });
+
+  it("counts primary members across locals and PRIMARY-tier providers only", () => {
+    expect(combinedPrimaryMemberCount([], [], "PRIMARY")).toBe(0);
+    expect(combinedPrimaryMemberCount(["a"], ["p1", "p2"], "PRIMARY")).toBe(3);
+    expect(combinedPrimaryMemberCount(["a"], ["p1", "p2"], "PUBLIC_OVERFLOW")).toBe(1);
   });
 
   it("uses the smallest selected physical context for inline validation", () => {
