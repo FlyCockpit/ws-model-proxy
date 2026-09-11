@@ -54,12 +54,7 @@ vi.mock("@/utils/orpc", () => {
   };
 });
 
-import {
-  PoolForm,
-  PoolMemberForm,
-  unavailablePoolCompatibilitySurfaceCount,
-  visiblePoolCompatibilitySurfaces,
-} from "./forwarder-dashboard-sections";
+import { PoolForm, PoolMemberForm } from "./forwarder-dashboard-sections";
 
 const editablePool = {
   id: "pool-1",
@@ -392,22 +387,5 @@ describe("PoolMemberForm capacity save gate", () => {
     fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
 
     await waitFor(() => expect(state.mutationCalls).toEqual(["updatePoolMember"]));
-  });
-});
-
-describe("pool compatibility display", () => {
-  const surfaces = {
-    OPENAI_CHAT_COMPLETIONS: { native: 1, adapted: 0 },
-    OPENAI_RESPONSES: { native: 0, adapted: 1 },
-    ANTHROPIC_MESSAGES: { native: 0, adapted: 0 },
-    OPENAI_COMPLETIONS: { native: 0, adapted: 0 },
-  };
-
-  it("hides unavailable legacy Completions while summarizing other unavailable surfaces", () => {
-    expect(visiblePoolCompatibilitySurfaces(surfaces, null).map(([surface]) => surface)).toEqual([
-      "OPENAI_CHAT_COMPLETIONS",
-      "OPENAI_RESPONSES",
-    ]);
-    expect(unavailablePoolCompatibilitySurfaceCount(surfaces, null)).toBe(1);
   });
 });

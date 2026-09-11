@@ -219,16 +219,22 @@ export async function streamChatCompletion({
       onThinkingDelta(delta.thinking);
     }
   };
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const events = buffer.split("\n\n");
-    buffer = events.pop() ?? "";
-    for (const event of events) processEvent(event);
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split("\n\n");
+      buffer = events.pop() ?? "";
+      for (const event of events) processEvent(event);
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) processEvent(buffer);
+  } catch (error) {
+    // A malformed chunk must not strand the response body mid-stream.
+    void reader.cancel().catch(() => undefined);
+    throw error;
   }
-  buffer += decoder.decode();
-  if (buffer.trim()) processEvent(buffer);
   requireChatTestOutput({ content, thinking }, fallbackErrorMessage);
   const completedAt = performance.now();
   const ttftMs = firstTokenAt === undefined ? undefined : firstTokenAt - startedAt;

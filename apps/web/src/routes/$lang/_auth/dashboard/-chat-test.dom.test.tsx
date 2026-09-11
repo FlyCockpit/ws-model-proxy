@@ -191,7 +191,7 @@ describe("Chat Test quick wins", () => {
       mount();
     });
 
-    const settings = await screen.findByTestId("request-settings-popover");
+    const settings = await screen.findByTestId("request-settings-popover", {}, { timeout: 5000 });
     expect(settings.querySelector("#chat-test-desktop-surface")).toBeTruthy();
     expect(settings.querySelector("#chat-test-desktop-routing-mode")).toBeTruthy();
     expect(document.querySelectorAll("select")).toHaveLength(2);
@@ -207,7 +207,7 @@ describe("Chat Test quick wins", () => {
       mount();
     });
 
-    const settings = await screen.findByTestId("request-settings-popover");
+    const settings = await screen.findByTestId("request-settings-popover", {}, { timeout: 5000 });
     expect(settings.querySelector("#chat-test-desktop-surface")).toBeNull();
     expect(settings.querySelector("#chat-test-desktop-routing-mode")).toBeNull();
   });

@@ -51,7 +51,13 @@ import { useChatRelaySettings } from "@/hooks/use-chat-relay-settings";
 import { useChatScrollEngine } from "@/hooks/use-chat-scroll-engine";
 import { useChatThread } from "@/hooks/use-chat-thread";
 import { useIsDesktop } from "@/hooks/use-media-query";
-import { signMediaUrls, uploadMediaFile } from "@/lib/chat-test-media";
+import { useRevokeAttachmentsOnUnmount } from "@/hooks/use-revoke-attachments-on-unmount";
+import {
+  revokeDiscardedAttachments,
+  revokeDiscardedMessageAttachments,
+  signMediaUrls,
+  uploadMediaFile,
+} from "@/lib/chat-test-media";
 import {
   relayMessages as buildRelayMessages,
   collectMediaIds as collectRelayMediaIds,
@@ -182,6 +188,7 @@ export function ChatTestPage({ lang }: { lang: string }) {
   const scroll = useChatScrollEngine();
   const { messages, setMessages, sendingRef, abortControllerRef, activeAssistantIdRef } =
     useChatThread<ChatMessage>();
+  useRevokeAttachmentsOnUnmount(messages, attachments);
   const options = useMemo(() => modelOptions(visibleModelsData), [visibleModelsData]);
   // Select the first visible model only for a new Chat Test. If a previously
   // selected model disappears, leave the control unset rather than silently
@@ -960,6 +967,8 @@ export function ChatTestPage({ lang }: { lang: string }) {
           );
           return;
         }
+        // The discarded tail may hold blob preview URLs for uploaded media.
+        revokeDiscardedMessageAttachments(messages.slice(assistantIndex + 1));
         setMessages((current) =>
           current.slice(0, assistantIndex + 1).map((message) =>
             message.id === assistant.id
@@ -1010,6 +1019,7 @@ export function ChatTestPage({ lang }: { lang: string }) {
 
   const loadFixture = useCallback(() => {
     scroll.markUserIntent();
+    revokeDiscardedMessageAttachments(messages);
     setMessages(
       Array.from({ length: LONG_THREAD_FIXTURE_COUNT }, (_, index) => {
         const role: ChatRole = index % 2 === 0 ? "user" : "assistant";
@@ -1030,11 +1040,13 @@ export function ChatTestPage({ lang }: { lang: string }) {
         count: LONG_THREAD_FIXTURE_COUNT,
       }),
     );
-  }, [scroll, t]);
+  }, [messages, scroll, t]);
 
   const startFreshChat = useCallback(() => {
     if (isStreaming || isPreparingSend) return;
     scroll.markUserIntent();
+    revokeDiscardedMessageAttachments(messages);
+    revokeDiscardedAttachments(attachments);
     setMessages([]);
     setDraft("");
     setSystemPrompt("");
@@ -1043,7 +1055,7 @@ export function ChatTestPage({ lang }: { lang: string }) {
     clearAttachmentNotice();
     setReasoningSelection("unset");
     setAnnouncement(t("dashboard:chatTest.announcements.fresh"));
-  }, [clearAttachmentNotice, isPreparingSend, isStreaming, scroll, t]);
+  }, [attachments, clearAttachmentNotice, isPreparingSend, isStreaming, messages, scroll, t]);
 
   if (visibleModelsIsPending) {
     return <ChatTestSkeletonView />;

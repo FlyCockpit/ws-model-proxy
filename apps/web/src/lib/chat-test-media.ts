@@ -1,5 +1,19 @@
 import { env } from "@ws-model-proxy/env/web";
 
+import type { ChatAttachment, ChatMessage } from "@/components/chat-test/chat-test-types";
+
+/** Releases blob preview URLs of attachments that are about to leave the UI. */
+export function revokeDiscardedAttachments(attachments: readonly ChatAttachment[]): void {
+  for (const attachment of attachments) {
+    if (attachment.kind === "media") URL.revokeObjectURL(attachment.previewUrl);
+  }
+}
+
+/** Message-level convenience for thread-wide attachment disposal. */
+export function revokeDiscardedMessageAttachments(messages: readonly ChatMessage[]): void {
+  for (const message of messages) revokeDiscardedAttachments(message.attachments ?? []);
+}
+
 export type UploadMediaResult =
   | { status: "ok"; id: string }
   | { status: "disabled" }

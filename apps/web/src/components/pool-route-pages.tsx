@@ -400,7 +400,7 @@ export function PoolDetailPage({ poolId, lang = "en-US" }: { poolId: string; lan
               </DialogTitle>
               <DialogDescription>
                 {memberDialog === "create"
-                  ? t("dashboard:pools.noDirectModels")
+                  ? t("dashboard:pools.addMemberDescription")
                   : t("dashboard:pools.editMemberDescription")}
               </DialogDescription>
             </DialogHeader>

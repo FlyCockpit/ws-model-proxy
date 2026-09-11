@@ -84,32 +84,6 @@ export function resolveCapacityAvailability(
   return "loading";
 }
 
-export function visiblePoolCompatibilitySurfaces<
-  Availability extends { native: number; adapted: number },
->(surfaces: Record<string, Availability>, recommendedSurfaceOverride: string | null) {
-  return Object.entries(surfaces).filter(
-    ([surface, availability]) =>
-      (surface !== "OPENAI_COMPLETIONS" ||
-        availability.native > 0 ||
-        recommendedSurfaceOverride === "OPENAI_COMPLETIONS") &&
-      (availability.native > 0 || availability.adapted > 0),
-  ) as Array<[string, Availability]>;
-}
-
-export function unavailablePoolCompatibilitySurfaceCount(
-  surfaces: Record<string, { native: number; adapted: number }>,
-  recommendedSurfaceOverride: string | null,
-) {
-  return Object.entries(surfaces).filter(
-    ([surface, availability]) =>
-      (surface !== "OPENAI_COMPLETIONS" ||
-        availability.native > 0 ||
-        recommendedSurfaceOverride === "OPENAI_COMPLETIONS") &&
-      availability.native === 0 &&
-      availability.adapted === 0,
-  ).length;
-}
-
 function capacityUnavailableReasonKey(availability: CapacityAvailability) {
   if (availability === "loading") return "dashboard:pools.capacity.settingsLoading";
   if (availability === "error") return "dashboard:pools.capacity.settingsFailed";

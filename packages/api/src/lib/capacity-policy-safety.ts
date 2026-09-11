@@ -17,11 +17,11 @@ export type ModelPoolCapacityPolicyInput = {
 /** Input shape shared by every public ModelPool capacity-policy writer. */
 export const modelPoolCapacityPolicyFields = {
   capacityPriority: z.number().int().min(0).max(31).optional(),
-  capacityConcurrencyLimit: z.number().int().positive().nullable().optional(),
-  capacityReservedSlots: z.number().int().min(0).optional(),
+  capacityConcurrencyLimit: z.number().int().positive().max(10_000).nullable().optional(),
+  capacityReservedSlots: z.number().int().min(0).max(10_000).optional(),
   capacityBorrowPolicy: z.enum(["NEVER", "WHEN_IDLE"]).optional(),
   capacityWaitBudgetMs: z.number().int().min(0).max(600_000).nullable().optional(),
-  capacityContextCeiling: z.number().int().positive().nullable().optional(),
+  capacityContextCeiling: z.number().int().positive().max(100_000_000).nullable().optional(),
   capacityContextMargin: z.number().int().min(0).max(10_000_000).optional(),
 };
 

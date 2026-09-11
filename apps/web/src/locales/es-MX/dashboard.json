@@ -366,8 +366,6 @@
     "streaming": "streaming",
     "surfaceCounts": "{{native}} nativos · {{adapted}} adaptados · {{unavailable}} no disponibles",
     "surfaceTierCounts": "{{tier}}: {{native}} nativos · {{adapted}} adaptados · {{unavailable}} no disponibles",
-    "unavailableSurfaces_one": "{{count}} superficie no disponible",
-    "unavailableSurfaces_other": "{{count}} superficies no disponibles",
     "warnings": {
       "adaptation_strict_subset": "La adaptación usa un subconjunto estricto",
       "developer_role_collapse_lossy": "Conversión con pérdida del rol developer habilitada",
