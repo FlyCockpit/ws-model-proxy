@@ -13,6 +13,7 @@ import {
   resolveAllowlistedModelTargets,
   type VisibleModelTargets,
 } from "../lib/model-api-token-access";
+import { buildModelApiTokenAllowlistEntries } from "../lib/model-api-token-allowlist";
 
 const tokenNameSchema = z.string().trim().min(1).max(120);
 const modelIdSchema = z.string().trim().min(1).max(512);
@@ -203,17 +204,7 @@ export const modelApiTokensRouter = {
           secretDigest: digestModelApiTokenSecret(rawSecret),
           expiresAt: input.expiresAt ?? null,
           AllowlistEntries: {
-            create: [
-              ...allowlistTargets.directModels.map((model) => ({
-                target: "DIRECT_MODEL" as const,
-                discoveredModelId: model.id,
-                ExecutionTarget: { connect: { discoveredModelId: model.id } },
-              })),
-              ...allowlistTargets.modelPools.map((pool) => ({
-                target: "MODEL_POOL" as const,
-                modelPoolId: pool.id,
-              })),
-            ],
+            create: buildModelApiTokenAllowlistEntries(allowlistTargets),
           },
         },
         select: tokenSelection,

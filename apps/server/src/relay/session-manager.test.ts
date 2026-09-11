@@ -57,6 +57,12 @@ const db = prisma as unknown as {
   poolMember: {
     updateMany: MockInstance;
   };
+  executionTarget: {
+    upsert: MockInstance;
+  };
+  inferenceCapacity: {
+    findMany: MockInstance;
+  };
 };
 
 class FakeSocket {
@@ -159,6 +165,11 @@ function seedRegistrationMocks() {
   db.discoveredModel.upsert.mockResolvedValue({ id: "model-id" });
   db.discoveredModel.updateMany.mockResolvedValue({ count: 0 });
   db.poolMember.updateMany.mockResolvedValue({ count: 1 });
+  db.executionTarget.upsert.mockResolvedValue({
+    id: "execution-target-id",
+    inferenceCapacityId: "capacity-id",
+  });
+  db.inferenceCapacity.findMany.mockResolvedValue([]);
 }
 
 describe("RelaySessionManager", () => {

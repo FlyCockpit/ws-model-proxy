@@ -35,6 +35,7 @@ export const appRouter = {
       signupEnabled: signupAccess.signupEnabled,
       adminBootstrapSignupEnabled: signupAccess.adminBootstrapSignupEnabled,
       capacityEnabled: env.MODEL_API_GLOBAL_CAPACITY_ENABLED,
+      protocolAdaptationAvailable: env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
       providerEgressEnabled: env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
       // Gates the login challenge's "email me a code" affordance. The delivery
       // unreliability of Better-Auth's send-otp endpoint (it swallows SMTP

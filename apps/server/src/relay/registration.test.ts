@@ -14,6 +14,8 @@ const { default: prisma } = await import("@ws-model-proxy/db");
 
 const db = prisma as unknown as {
   $transaction: MockInstance;
+  $queryRaw: MockInstance;
+  $executeRaw: MockInstance;
   user: { findUnique: MockInstance };
   cliDevice: { upsert: MockInstance; update: MockInstance };
   cliToken: { update: MockInstance };
@@ -25,7 +27,8 @@ const db = prisma as unknown as {
     updateMany: MockInstance;
   };
   poolMember: { updateMany: MockInstance };
-  executionTarget: { upsert: MockInstance };
+  executionTarget: { findMany: MockInstance; upsert: MockInstance };
+  inferenceCapacity: { findMany: MockInstance; updateMany: MockInstance };
 };
 
 const identity: CliWebsocketIdentity = {
@@ -94,13 +97,202 @@ describe("capability override origin", () => {
     db.discoveredModel.upsert.mockResolvedValue({ id: "model-id" });
     db.discoveredModel.updateMany.mockResolvedValue({ count: 0 });
     db.poolMember.updateMany.mockResolvedValue({ count: 0 });
-    db.executionTarget.upsert.mockResolvedValue({ id: "execution-target-id" });
+    db.executionTarget.upsert.mockResolvedValue({
+      id: "execution-target-id",
+      inferenceCapacityId: "capacity-id",
+    });
+    db.executionTarget.findMany.mockResolvedValue([{ id: "execution-target-id" }]);
+    db.inferenceCapacity.findMany.mockResolvedValue([]);
+    db.inferenceCapacity.updateMany.mockResolvedValue({ count: 0 });
   });
 
   it("treats only dashboard origin as protected", () => {
     expect(shouldPreserveDashboardCapabilityOverride("DASHBOARD")).toBe(true);
     expect(shouldPreserveDashboardCapabilityOverride("CLI")).toBe(false);
     expect(shouldPreserveDashboardCapabilityOverride(null)).toBe(false);
+  });
+
+  it("seeds an empty local physical context from declared v4 inventory metadata", async () => {
+    db.inferenceCapacity.findMany.mockResolvedValue([
+      {
+        id: "capacity-id",
+        physicalMaxContext: null,
+        ExecutionTargets: [
+          {
+            id: "execution-target-id",
+            directContextCeiling: null,
+            directContextMargin: 0,
+            PoolMembers: [],
+          },
+        ],
+      },
+    ]);
+    await persistRelayRegistration({
+      identity,
+      cli: { slug: "desktop", label: "Desktop" },
+      endpoints: [
+        {
+          slug: "local-openai",
+          label: "Local OpenAI",
+          kind: "openai-compatible",
+          status: "online",
+          defaultCapabilities: {
+            version: 4,
+            protocol: "openai-compatible",
+            surfaces: {
+              openaiChatCompletions: {
+                source: "declared",
+                confidence: "exact",
+                streaming: true,
+                maxContextTokens: 1_000_000,
+                operations: ["create"],
+              },
+            },
+          },
+          models: [{ upstreamModelId: "large-local", capabilityOverrideMode: "inherit" }],
+        },
+      ],
+      inventoryConfirmed: true,
+      endpointTargeting: true,
+      now,
+    });
+
+    expect(db.inferenceCapacity.updateMany).toHaveBeenCalledWith({
+      where: { id: "capacity-id", userId: "user-id", physicalMaxContext: null },
+      data: { physicalMaxContext: 1_000_000 },
+    });
+  });
+
+  it("retries a raw policy-lock deadlock and then persists the registration", async () => {
+    db.$queryRaw.mockRejectedValueOnce({ code: "P2010", meta: { code: "40P01" } });
+    const [endpoint] = inventoryEndpoints({ modelOverride: false });
+    if (!endpoint) throw new Error("expected inventory endpoint");
+
+    await expect(
+      persistRelayRegistration({
+        identity,
+        cli: { slug: "desktop", label: "Desktop" },
+        endpoints: [
+          {
+            ...endpoint,
+            defaultCapabilities: {
+              version: 4,
+              protocol: "openai-compatible",
+              surfaces: {
+                openaiChatCompletions: {
+                  source: "declared",
+                  confidence: "exact",
+                  streaming: true,
+                  maxContextTokens: 8_192,
+                  operations: ["create"],
+                },
+              },
+            },
+          },
+        ],
+        inventoryConfirmed: true,
+        endpointTargeting: true,
+        now,
+      }),
+    ).resolves.toMatchObject({ userId: "user-id" });
+
+    expect(db.$transaction).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not overwrite a non-null local physical context during registration", async () => {
+    db.inferenceCapacity.findMany.mockResolvedValue([
+      {
+        id: "capacity-id",
+        physicalMaxContext: 32_768,
+        ExecutionTargets: [],
+      },
+    ]);
+    await persistRelayRegistration({
+      identity,
+      cli: { slug: "desktop", label: "Desktop" },
+      endpoints: [
+        {
+          slug: "local-openai",
+          label: "Local OpenAI",
+          kind: "openai-compatible",
+          status: "online",
+          defaultCapabilities: {
+            version: 4,
+            protocol: "openai-compatible",
+            surfaces: {
+              openaiChatCompletions: {
+                source: "declared",
+                confidence: "exact",
+                streaming: true,
+                maxContextTokens: 1_000_000,
+                operations: ["create"],
+              },
+            },
+          },
+          models: [{ upstreamModelId: "large-local", capabilityOverrideMode: "inherit" }],
+        },
+      ],
+      inventoryConfirmed: true,
+      endpointTargeting: true,
+      now,
+    });
+
+    expect(db.inferenceCapacity.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("does not seed a capacity shared with a target outside this registration", async () => {
+    db.inferenceCapacity.findMany.mockResolvedValue([
+      {
+        id: "capacity-id",
+        physicalMaxContext: null,
+        ExecutionTargets: [
+          {
+            id: "execution-target-id",
+            directContextCeiling: null,
+            directContextMargin: null,
+            PoolMembers: [],
+          },
+          {
+            id: "other-device-target",
+            directContextCeiling: null,
+            directContextMargin: null,
+            PoolMembers: [],
+          },
+        ],
+      },
+    ]);
+
+    await persistRelayRegistration({
+      identity,
+      cli: { slug: "desktop", label: "Desktop" },
+      endpoints: [
+        {
+          slug: "local-openai",
+          label: "Local OpenAI",
+          kind: "openai-compatible",
+          status: "online",
+          defaultCapabilities: {
+            version: 4,
+            protocol: "openai-compatible",
+            surfaces: {
+              openaiChatCompletions: {
+                source: "declared",
+                confidence: "exact",
+                streaming: true,
+                maxContextTokens: 128_000,
+                operations: ["create"],
+              },
+            },
+          },
+          models: [{ upstreamModelId: "large-local", capabilityOverrideMode: "inherit" }],
+        },
+      ],
+      inventoryConfirmed: true,
+      endpointTargeting: true,
+      now,
+    });
+
+    expect(db.inferenceCapacity.updateMany).not.toHaveBeenCalled();
   });
 
   it("applies a CLI override when the existing row is CLI-owned or untagged", async () => {
@@ -135,7 +327,7 @@ describe("capability override origin", () => {
         kind: "DISCOVERED_MODEL",
         discoveredModelId: "model-id",
       },
-      select: { id: true },
+      select: { id: true, inferenceCapacityId: true },
     });
   });
 

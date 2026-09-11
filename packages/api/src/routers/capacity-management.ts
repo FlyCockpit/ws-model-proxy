@@ -4,10 +4,13 @@ import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
 import {
+  assertCapacityManagementEnabled,
   assertDirectCapacityPolicy,
   assertEffectiveConcurrencyPolicy,
   assertEffectiveContextPolicy,
+  lockAndValidateModelPoolCapacityPolicy,
   lockExecutionTargetPolicies,
+  modelPoolCapacityPolicyFields,
 } from "../lib/capacity-policy-safety";
 import { runSerializableTransaction } from "../lib/serializable-transaction";
 
@@ -28,11 +31,25 @@ const countStrategy = z.enum([
 ]);
 
 function enabled() {
-  if (!env.MODEL_API_GLOBAL_CAPACITY_ENABLED) throw new ORPCError("NOT_FOUND");
+  assertCapacityManagementEnabled(env.MODEL_API_GLOBAL_CAPACITY_ENABLED);
 }
 
 function notFound(): never {
   throw new ORPCError("NOT_FOUND", { message: "Capacity resource not found." });
+}
+
+function assertLossyDeveloperRoleCollapseRequiresAdaptation({
+  protocolAdaptationEnabled,
+  allowLossyDeveloperRoleCollapse,
+}: {
+  protocolAdaptationEnabled: boolean;
+  allowLossyDeveloperRoleCollapse: boolean;
+}): void {
+  if (allowLossyDeveloperRoleCollapse && !protocolAdaptationEnabled) {
+    throw new ORPCError("BAD_REQUEST", {
+      message: "Lossy developer-role collapse requires protocol adaptation to be enabled.",
+    });
+  }
 }
 
 async function capacityTransaction<T>(
@@ -99,16 +116,6 @@ const directPolicy = z.object({
   directContextCeiling: optionalLimit.optional(),
   directContextMargin: contextMargin.optional(),
 });
-
-const sharedPolicyFields = {
-  capacityPriority: priority.optional(),
-  capacityConcurrencyLimit: optionalLimit.optional(),
-  capacityReservedSlots: reservedSlots.optional(),
-  capacityBorrowPolicy: borrowPolicy.optional(),
-  capacityWaitBudgetMs: waitBudget.optional(),
-  capacityContextCeiling: optionalLimit.optional(),
-  capacityContextMargin: contextMargin.optional(),
-};
 
 const memberPolicy = z
   .object({
@@ -479,7 +486,7 @@ export const capacityManagementRouter = {
     .input(
       z.object({
         modelPoolId: id,
-        ...sharedPolicyFields,
+        ...modelPoolCapacityPolicyFields,
         protocolAdaptationEnabled: z.boolean().optional(),
         allowLossyDeveloperRoleCollapse: z.boolean().optional(),
       }),
@@ -489,21 +496,12 @@ export const capacityManagementRouter = {
       const userId = context.session.user.id;
       return capacityTransaction(
         async (tx) => {
-          const candidate = await tx.modelPool.findUnique({
-            where: { id: input.modelPoolId },
-            select: {
-              userId: true,
-              PoolMembers: { select: { executionTargetId: true } },
-            },
+          await lockAndValidateModelPoolCapacityPolicy(tx, {
+            modelPoolId: input.modelPoolId,
+            userId,
+            policy: input,
+            notFound,
           });
-          if (!candidate || candidate.userId !== userId) return notFound();
-          await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${input.modelPoolId} AND "userId" = ${userId} FOR UPDATE`;
-          await lockExecutionTargetPolicies(
-            tx,
-            candidate.PoolMembers.flatMap((member) =>
-              member.executionTargetId ? [member.executionTargetId] : [],
-            ),
-          );
           const pool = await tx.modelPool.findUnique({
             where: { id: input.modelPoolId },
             select: {
@@ -538,28 +536,15 @@ export const capacityManagementRouter = {
             },
           });
           if (!pool || pool.userId !== userId) return notFound();
-          for (const member of pool.PoolMembers ?? []) {
-            assertEffectiveConcurrencyPolicy({
-              hardLimit: member.ExecutionTarget?.InferenceCapacity?.hardConcurrencyLimit,
-              poolLimit:
-                input.capacityConcurrencyLimit !== undefined
-                  ? input.capacityConcurrencyLimit
-                  : pool.capacityConcurrencyLimit,
-              poolReserved: input.capacityReservedSlots ?? pool.capacityReservedSlots,
-              memberMode: member.capacityConcurrencyMode,
-              memberLimit: member.capacityConcurrencyLimit,
-              memberReserved: member.capacityReservedSlots,
-            });
-            assertEffectiveContextPolicy({
-              physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
-              poolCeiling:
-                input.capacityContextCeiling !== undefined
-                  ? input.capacityContextCeiling
-                  : pool.capacityContextCeiling,
-              poolMargin: input.capacityContextMargin ?? pool.capacityContextMargin,
-              memberMode: member.capacityContextCeilingMode,
-              memberCeiling: member.capacityContextCeiling,
-              memberMargin: member.capacityContextMargin,
+          if (
+            input.protocolAdaptationEnabled !== undefined ||
+            input.allowLossyDeveloperRoleCollapse !== undefined
+          ) {
+            assertLossyDeveloperRoleCollapseRequiresAdaptation({
+              protocolAdaptationEnabled:
+                input.protocolAdaptationEnabled ?? pool.protocolAdaptationEnabled,
+              allowLossyDeveloperRoleCollapse:
+                input.allowLossyDeveloperRoleCollapse ?? pool.allowLossyDeveloperRoleCollapse,
             });
           }
           const { modelPoolId, ...data } = input;

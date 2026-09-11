@@ -135,6 +135,20 @@ describe("capability inventory v4", () => {
       }),
     ).toBeNull();
   });
+
+  it("keeps an oversized inventory parseable so registration can safely ignore its window", () => {
+    const withWindow = (maxContextTokens: number) => ({
+      ...v4,
+      surfaces: {
+        openaiChatCompletions: {
+          ...v4.surfaces.openaiChatCompletions,
+          maxContextTokens,
+        },
+      },
+    });
+    expect(parseOpenAiCompatibleCapabilities(withWindow(2 ** 31 - 1))).not.toBeNull();
+    expect(parseOpenAiCompatibleCapabilities(withWindow(2 ** 31))).not.toBeNull();
+  });
 });
 
 describe("reasoning capability contract", () => {

@@ -7,7 +7,6 @@ import {
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { validateForwarderPoolSlug } from "@ws-model-proxy/config/forwarder-identifiers";
-import { env } from "@ws-model-proxy/env/web";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
 import {
@@ -32,29 +31,14 @@ import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { Textarea } from "@ws-model-proxy/ui/components/textarea";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import {
-  ArrowLeft,
-  ArrowRight,
-  Copy,
-  Eye,
-  EyeOff,
-  Gauge,
-  MoveDown,
-  MoveUp,
-  Pencil,
-  Plus,
-  ShieldCheck,
-  Trash2,
-} from "lucide-react";
+import { Copy, Eye, EyeOff, Gauge, Plus, Trash2 } from "lucide-react";
 import type { ReactNode } from "react";
 import { useId, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
-import { GuardedPoolSetupWizard } from "@/components/guarded-pool-setup-wizard";
 import { InlineRetry } from "@/components/inline-retry";
-import { ProviderOperationsSection } from "@/components/provider-operations-section";
 import { SegmentedControl } from "@/components/segmented-control";
 import { WideContent } from "@/components/wide-content";
 import {
@@ -76,22 +60,35 @@ type ModelPool = Awaited<
   ReturnType<AppRouterClient["forwarderManagement"]["listModelPools"]>
 >[number];
 type PoolMember = ModelPool["members"][number];
-type PoolGrant = ModelPool["grants"][number];
 type CliToken = Awaited<ReturnType<AppRouterClient["cliCredentials"]["listTokens"]>>[number];
 type ModelApiToken = Awaited<ReturnType<AppRouterClient["modelApiTokens"]["list"]>>[number];
 type VisibleModels = Awaited<ReturnType<AppRouterClient["forwarderManagement"]["visibleModels"]>>;
 type TokenPreview = Awaited<ReturnType<AppRouterClient["modelApiTokens"]["preview"]>>;
 type RelayRow = Awaited<ReturnType<AppRouterClient["relayMetadata"]["listOwn"]>>[number];
 type CapacityRow = Awaited<ReturnType<AppRouterClient["capacityManagement"]["list"]>>[number];
+type CapacityAvailability = "enabled" | "disabled" | "loading" | "error";
 type ScopeMode = "ALL_VISIBLE" | "ALLOWLIST";
 type RoutingStatus = "ACTIVE" | "DRAINING" | "DISABLED";
-type MemberTestSurface = "OPENAI_CHAT_COMPLETIONS" | "OPENAI_RESPONSES" | "ANTHROPIC_MESSAGES";
-type MemberTestMode = "PREFER_NATIVE" | "REQUIRE_NATIVE" | "REQUIRE_ADAPTED";
 type EndpointHealthFilter = "all" | "online" | "offline" | "stale";
 type DeleteTarget =
   | { kind: "cli"; id: string; label: string }
   | { kind: "endpoint"; id: string; label: string }
   | { kind: "model"; id: string; label: string };
+
+export function resolveCapacityAvailability(
+  capacityEnabled: boolean | undefined,
+  isConfigError: boolean,
+): CapacityAvailability {
+  if (capacityEnabled !== undefined) return capacityEnabled ? "enabled" : "disabled";
+  if (isConfigError) return "error";
+  return "loading";
+}
+
+function capacityUnavailableReasonKey(availability: CapacityAvailability) {
+  if (availability === "loading") return "dashboard:pools.capacity.settingsLoading";
+  if (availability === "error") return "dashboard:pools.capacity.settingsFailed";
+  return "dashboard:pools.capacity.disabledReason";
+}
 
 const dateTimeFormatter = new Intl.DateTimeFormat(undefined, {
   dateStyle: "medium",
@@ -122,61 +119,6 @@ type PoolSurface = (typeof poolSurfaceValues)[number];
 
 function poolSurfaceOverrideValue(value: string | null | undefined): PoolSurface | "" {
   return value && poolSurfaceValues.includes(value as PoolSurface) ? (value as PoolSurface) : "";
-}
-
-async function testPoolMemberThroughResolver({
-  poolModel,
-  memberId,
-  surface,
-  mode,
-}: {
-  poolModel: string;
-  memberId: string;
-  surface: MemberTestSurface;
-  mode: MemberTestMode;
-}) {
-  const endpoint =
-    surface === "OPENAI_RESPONSES"
-      ? "responses"
-      : surface === "ANTHROPIC_MESSAGES"
-        ? "messages"
-        : "chat/completions";
-  const body =
-    surface === "OPENAI_RESPONSES"
-      ? { model: poolModel, input: "Reply with the single word pong.", stream: false }
-      : surface === "ANTHROPIC_MESSAGES"
-        ? {
-            model: poolModel,
-            messages: [{ role: "user", content: "Reply with the single word pong." }],
-            max_tokens: 8,
-            stream: false,
-          }
-        : {
-            model: poolModel,
-            messages: [{ role: "user", content: "Reply with the single word pong." }],
-            max_tokens: 8,
-            stream: false,
-          };
-  const response = await fetch(`${env.VITE_SERVER_URL}/api/internal/chat-test/${endpoint}`, {
-    method: "POST",
-    credentials: "include",
-    headers: {
-      "content-type": "application/json",
-      "x-wsmp-chat-test-routing-mode": mode,
-      "x-wsmp-chat-test-member-id": memberId,
-      ...(surface === "ANTHROPIC_MESSAGES" ? { "anthropic-version": "2023-06-01" } : {}),
-    },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) {
-    const payload = (await response.json().catch(() => null)) as {
-      error?: { message?: string } | string;
-    } | null;
-    const error = payload?.error;
-    throw new Error(
-      (typeof error === "string" ? error : error?.message) ?? `HTTP ${response.status}`,
-    );
-  }
 }
 
 function copyToClipboard(value: string, message: string) {
@@ -295,7 +237,7 @@ function SecretDisplay({ secret, label }: { secret: string; label: string }) {
   );
 }
 
-function CopyableModelId({ modelId }: { modelId: string }) {
+export function CopyableModelId({ modelId }: { modelId: string }) {
   const { t } = useTranslation(["common", "dashboard"]);
   return (
     <div className="flex min-w-0 items-center gap-1">
@@ -314,7 +256,7 @@ function CopyableModelId({ modelId }: { modelId: string }) {
   );
 }
 
-function allDirectModels(devices: CliDevice[]) {
+export function allDirectModels(devices: CliDevice[]) {
   return devices.flatMap((device) =>
     device.endpoints.flatMap((endpoint) =>
       endpoint.models.map((model) => ({
@@ -619,7 +561,13 @@ function modelSupportsTransformerModalities(
 export function CliEndpointsModelsSection() {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
-  const { data: appConfig } = useQuery(orpc.appConfig.queryOptions());
+  const appConfigQuery = useQuery(orpc.appConfig.queryOptions());
+  const appConfig = appConfigQuery.data;
+  const capacityAvailability = resolveCapacityAvailability(
+    appConfig?.capacityEnabled,
+    appConfigQuery.isError,
+  );
+  const capacityEnabled = capacityAvailability === "enabled";
   const {
     data: devicesData,
     isPending: devicesIsPending,
@@ -631,7 +579,7 @@ export function CliEndpointsModelsSection() {
   const { data: capacitiesData } = useQuery({
     ...orpc.capacityManagement.list.queryOptions(),
     retry: false,
-    enabled: appConfig?.capacityEnabled === true,
+    enabled: capacityEnabled,
   });
   const [policyModel, setPolicyModel] = useState<DirectModelOption | null>(null);
   const [search, setSearch] = useState("");
@@ -1045,6 +993,7 @@ export function CliEndpointsModelsSection() {
               <DirectCapacityPolicyForm
                 target={policyModel.executionTarget}
                 capacities={capacitiesData ?? []}
+                capacityAvailability={capacityAvailability}
                 onSuccess={() => setPolicyModel(null)}
               />
             ) : null}
@@ -1077,13 +1026,16 @@ export function CliEndpointsModelsSection() {
 function DirectCapacityPolicyForm({
   target,
   capacities,
+  capacityAvailability,
   onSuccess,
 }: {
   target: NonNullable<DirectModelOption["executionTarget"]>;
   capacities: CapacityRow[];
+  capacityAvailability: CapacityAvailability;
   onSuccess: () => void;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
+  const capacityEnabled = capacityAvailability === "enabled";
   const queryClient = useQueryClient();
   const [capacityId, setCapacityId] = useState(target.inferenceCapacityId ?? "");
   const [priority, setPriority] = useState(String(target.directPriority));
@@ -1133,7 +1085,7 @@ function DirectCapacityPolicyForm({
       className="space-y-4"
       onSubmit={(event) => {
         event.preventDefault();
-        if (!valid) return;
+        if (!capacityEnabled || !valid) return;
         mutation.mutate(
           directPolicyPayload({
             executionTargetId: target.id,
@@ -1152,511 +1104,125 @@ function DirectCapacityPolicyForm({
         );
       }}
     >
-      <p className="text-sm text-muted-foreground">
-        {t("dashboard:pools.capacity.directGlobalEffect")}
-      </p>
-      <div className="space-y-2">
-        <Label htmlFor="direct-capacity">{t("dashboard:pools.capacity.attachment")}</Label>
-        <select
-          id="direct-capacity"
-          className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
-          value={capacityId}
-          onChange={(event) => setCapacityId(event.target.value)}
-        >
-          <option value="">{t("dashboard:pools.capacity.unattached")}</option>
-          {capacities.map((capacity) => (
-            <option key={capacity.id} value={capacity.id}>
-              {capacity.label}
-            </option>
-          ))}
-        </select>
-      </div>
-      {[
-        ["direct-priority", "capacityPriority", priority, setPriority, 0, 31],
-        ["direct-reserved", "capacityReservedSlots", reserved, setReserved, 0],
-        ["direct-margin", "capacityContextMargin", margin, setMargin, 0],
-      ].map(([id, label, value, setter, min, max]) => (
-        <div key={String(id)} className="space-y-2">
-          <Label htmlFor={String(id)}>{t(`dashboard:pools.capacity.fields.${label}`)}</Label>
-          <Input
-            id={String(id)}
-            className="min-h-11"
-            type="number"
-            min={Number(min)}
-            max={max == null ? undefined : Number(max)}
-            value={String(value)}
-            onChange={(event) =>
-              (setter as React.Dispatch<React.SetStateAction<string>>)(event.target.value)
-            }
-          />
-        </div>
-      ))}
-      {(
-        [
-          [
-            "direct-concurrency",
-            "hardConcurrencyLimit",
-            concurrencyMode,
-            setConcurrencyMode,
-            concurrency,
-            setConcurrency,
-            1,
-          ],
-          ["direct-wait", "capacityWaitBudgetMs", waitMode, setWaitMode, wait, setWait, 0],
-          [
-            "direct-ceiling",
-            "capacityContextCeiling",
-            ceilingMode,
-            setCeilingMode,
-            ceiling,
-            setCeiling,
-            1,
-          ],
-        ] as const
-      ).map(([id, label, mode, setMode, value, setValue, min]) => (
-        <div key={id} className="grid min-w-0 gap-2 sm:grid-cols-[minmax(0,0.7fr)_minmax(0,1fr)]">
-          <div className="space-y-2">
-            <Label htmlFor={`${id}-mode`}>{t(`dashboard:pools.capacity.fields.${label}`)}</Label>
-            <select
-              id={`${id}-mode`}
-              className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
-              value={mode}
-              onChange={(event) => setMode(event.target.value as FiniteLimitMode)}
-            >
-              <option value="LIMITED">{t("dashboard:pools.capacity.modes.limited")}</option>
-              <option value="UNLIMITED">{t("dashboard:pools.capacity.modes.unlimited")}</option>
-            </select>
-          </div>
-          {mode === "LIMITED" ? (
-            <div className="space-y-2">
-              <Label htmlFor={id}>{t("dashboard:pools.capacity.limitValue")}</Label>
-              <Input
-                id={id}
-                className="min-h-11"
-                type="number"
-                min={min}
-                value={value}
-                onChange={(event) => setValue(event.target.value)}
-              />
-            </div>
-          ) : null}
-        </div>
-      ))}
-      <div className="space-y-2">
-        <Label htmlFor="direct-borrow">
-          {t("dashboard:pools.capacity.fields.capacityBorrowPolicy")}
-        </Label>
-        <select
-          id="direct-borrow"
-          className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
-          value={borrow}
-          onChange={(event) => setBorrow(event.target.value as "NEVER" | "WHEN_IDLE")}
-        >
-          <option value="WHEN_IDLE">{t("dashboard:pools.capacity.borrowIdle")}</option>
-          <option value="NEVER">{t("dashboard:pools.capacity.borrowNever")}</option>
-        </select>
-      </div>
-      <Button type="submit" size="touch" disabled={!valid || mutation.isPending}>
-        {mutation.isPending ? t("common:actions.saving") : t("common:actions.save")}
-      </Button>
-    </form>
-  );
-}
-
-function _PoolSetupWizard({
-  open,
-  onOpenChange,
-  directModels,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  directModels: ReturnType<typeof allDirectModels>;
-}) {
-  const { t } = useTranslation(["common", "dashboard"]);
-  const queryClient = useQueryClient();
-  const [step, setStep] = useState(0);
-  const createPool = useMutation(orpc.forwarderManagement.createModelPool.mutationOptions());
-  const addMember = useMutation(orpc.forwarderManagement.addPoolMember.mutationOptions());
-  const schema = z
-    .object({
-      slug: z
-        .string()
-        .trim()
-        .superRefine((value, ctx) => {
-          const result = validateForwarderPoolSlug(value);
-          if (!result.ok)
-            ctx.addIssue({ code: "custom", message: t("dashboard:pools.invalidSlug") });
-        }),
-      name: z.string().trim().min(1).max(120),
-      localModelIds: z.array(z.string()).min(1, t("dashboard:pools.wizard.localRequired")),
-      publicEgress: z.boolean(),
-      publicEgressAcknowledged: z.boolean(),
-      finiteSpendProtection: z.boolean(),
-      concurrency: z.number().int().min(1).max(10_000),
-      contextCeiling: z.number().int().min(1).max(100_000_000),
-      reservedSlots: z.number().int().min(0).max(10_000),
-      waitMs: z.number().int().min(0).max(600_000),
-      recommendedSurface: z.enum(poolSurfaceValues),
-    })
-    .superRefine((value, ctx) => {
-      if (value.reservedSlots > value.concurrency) {
-        ctx.addIssue({
-          code: "custom",
-          path: ["reservedSlots"],
-          message: t("dashboard:pools.wizard.reservationInvalid"),
-        });
-      }
-      if (value.publicEgress && !value.publicEgressAcknowledged) {
-        ctx.addIssue({
-          code: "custom",
-          path: ["publicEgressAcknowledged"],
-          message: t("dashboard:pools.wizard.egressRequired"),
-        });
-      }
-      if (value.publicEgress && !value.finiteSpendProtection) {
-        ctx.addIssue({
-          code: "custom",
-          path: ["finiteSpendProtection"],
-          message: t("dashboard:pools.wizard.spendRequired"),
-        });
-      }
-    });
-  const form = useForm({
-    defaultValues: {
-      slug: "",
-      name: "",
-      localModelIds: [] as string[],
-      publicEgress: false,
-      publicEgressAcknowledged: false,
-      finiteSpendProtection: true,
-      concurrency: 1,
-      contextCeiling: 32_768,
-      reservedSlots: 0,
-      waitMs: 30_000,
-      recommendedSurface: "OPENAI_RESPONSES" as (typeof poolSurfaceValues)[number],
-    },
-    validators: { onSubmit: schema },
-    onSubmit: async ({ value }) => {
-      const created = await createPool.mutateAsync({
-        slug: value.slug.trim(),
-        name: value.name.trim(),
-        description: null,
-        maxAttachmentBytes: null,
-        protocolAdaptationEnabled: true,
-        publicEgressEnabled: value.publicEgress,
-        ...(value.publicEgress ? { publicEgressAcknowledged: true as const } : {}),
-        recommendedSurfaceOverride: value.recommendedSurface,
-        capacityPriority: 16,
-        capacityConcurrencyLimit: value.concurrency,
-        capacityReservedSlots: value.reservedSlots,
-        capacityWaitBudgetMs: value.waitMs,
-        capacityContextCeiling: value.contextCeiling,
-        capacityContextMargin: Math.min(1024, Math.max(0, value.contextCeiling - 1)),
-        capacityBorrowPolicy: "WHEN_IDLE",
-      });
-      for (const discoveredModelId of value.localModelIds) {
-        await addMember.mutateAsync({
-          poolId: created.id,
-          discoveredModelId,
-          weight: 1,
-          routingStatus: "ACTIVE",
-        });
-      }
-      await queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
-      toast.success(t("dashboard:pools.created"));
-      setStep(0);
-      onOpenChange(false);
-    },
-  });
-  const steps = ["models", "capacity", "egress", "review"] as const;
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[min(92vh,54rem)] overflow-x-hidden overflow-y-auto sm:max-w-2xl">
-        <DialogHeader>
-          <DialogTitle>{t("dashboard:pools.wizard.title")}</DialogTitle>
-          <DialogDescription>{t("dashboard:pools.wizard.description")}</DialogDescription>
-        </DialogHeader>
-        <div className="flex gap-1" aria-label={t("dashboard:pools.wizard.progress")}>
-          {steps.map((item, index) => (
-            <div
-              key={item}
-              className={cn("h-1.5 flex-1 rounded-full", index <= step ? "bg-primary" : "bg-muted")}
-              aria-current={index === step ? "step" : undefined}
-            />
-          ))}
-        </div>
-        <p className="text-sm font-medium">
-          {t("dashboard:pools.wizard.step", { current: step + 1, total: steps.length })}:{" "}
-          {t(`dashboard:pools.wizard.steps.${steps[step]}`)}
+      {!capacityEnabled ? (
+        <p className="rounded-md border bg-muted/40 p-3 text-sm text-muted-foreground">
+          {t(capacityUnavailableReasonKey(capacityAvailability))}
         </p>
-        <form
-          className="space-y-5"
-          onSubmit={(event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            if (step < steps.length - 1) setStep((current) => current + 1);
-            else form.handleSubmit();
-          }}
-        >
-          {step === 0 ? (
-            <div className="space-y-4">
-              <div className="grid gap-4 sm:grid-cols-2">
-                {(["slug", "name"] as const).map((name) => (
-                  <form.Field key={name} name={name}>
-                    {(field) => (
-                      <div className="space-y-2">
-                        <Label htmlFor={`wizard-${name}`}>{t(`dashboard:pools.${name}`)}</Label>
-                        <Input
-                          id={`wizard-${name}`}
-                          className="min-h-11"
-                          value={field.state.value}
-                          onBlur={field.handleBlur}
-                          onChange={(event) => field.handleChange(event.target.value)}
-                        />
-                        {field.state.meta.errors.map((error) => (
-                          <p key={error?.message} className="text-sm text-destructive">
-                            {error?.message}
-                          </p>
-                        ))}
-                      </div>
-                    )}
-                  </form.Field>
-                ))}
-              </div>
-              <form.Field name="localModelIds">
-                {(field) => (
-                  <fieldset className="space-y-2">
-                    <legend className="text-sm font-medium">
-                      {t("dashboard:pools.wizard.localModels")}
-                    </legend>
-                    <p className="text-sm text-muted-foreground">
-                      {t("dashboard:pools.wizard.localModelsHint")}
-                    </p>
-                    <div className="max-h-56 divide-y overflow-x-clip overflow-y-auto overscroll-contain rounded-md border">
-                      {directModels.length ? (
-                        directModels.map((model) => {
-                          const checked = field.state.value.includes(model.id);
-                          return (
-                            <label key={model.id} className="flex min-h-11 items-center gap-3 p-3">
-                              <Checkbox
-                                checked={checked}
-                                onCheckedChange={(next) =>
-                                  field.handleChange(
-                                    next === true
-                                      ? [...field.state.value, model.id]
-                                      : field.state.value.filter((id) => id !== model.id),
-                                  )
-                                }
-                              />
-                              <code className="min-w-0 break-all font-mono text-xs">
-                                {model.canonicalModelId}
-                              </code>
-                            </label>
-                          );
-                        })
-                      ) : (
-                        <p className="p-4 text-sm text-muted-foreground">
-                          {t("dashboard:pools.noDirectModels")}
-                        </p>
-                      )}
-                    </div>
-                  </fieldset>
-                )}
-              </form.Field>
-            </div>
-          ) : null}
-          {step === 1 ? (
-            <div className="space-y-4">
-              <div className="rounded-md bg-muted p-4 text-sm text-muted-foreground">
-                {t("dashboard:pools.wizard.capacityHint")}
-              </div>
-              <div className="grid gap-4 sm:grid-cols-2">
-                {(["concurrency", "contextCeiling", "reservedSlots", "waitMs"] as const).map(
-                  (name) => (
-                    <form.Field key={name} name={name}>
-                      {(field) => (
-                        <div className="space-y-2">
-                          <Label htmlFor={`wizard-${name}`}>
-                            {t(`dashboard:pools.wizard.fields.${name}`)}
-                          </Label>
-                          <Input
-                            id={`wizard-${name}`}
-                            className="min-h-11"
-                            type="number"
-                            min={name === "reservedSlots" || name === "waitMs" ? 0 : 1}
-                            value={field.state.value}
-                            onChange={(event) => field.handleChange(Number(event.target.value))}
-                          />
-                          {field.state.meta.errors.map((error) => (
-                            <p key={error?.message} className="text-sm text-destructive">
-                              {error?.message}
-                            </p>
-                          ))}
-                        </div>
-                      )}
-                    </form.Field>
-                  ),
-                )}
-              </div>
-            </div>
-          ) : null}
-          {step === 2 ? (
-            <div className="space-y-4">
-              <form.Field name="recommendedSurface">
-                {(field) => (
-                  <div className="space-y-2">
-                    <Label htmlFor="wizard-surface">
-                      {t("dashboard:pools.wizard.fields.recommendedSurface")}
-                    </Label>
-                    <select
-                      id="wizard-surface"
-                      className="h-11 w-full rounded-md border bg-background px-3 text-sm"
-                      value={field.state.value}
-                      onChange={(event) =>
-                        field.handleChange(event.target.value as typeof field.state.value)
-                      }
-                    >
-                      {poolSurfaceValues.map((surface) => (
-                        <option key={surface} value={surface}>
-                          {t(`dashboard:pools.wizard.surfaces.${surface}`)}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                )}
-              </form.Field>
-              <form.Field name="publicEgress">
-                {(field) => (
-                  <label className="flex min-h-11 items-start gap-3 rounded-md border p-3">
-                    <Checkbox
-                      checked={field.state.value}
-                      onCheckedChange={(next) => field.handleChange(next === true)}
-                    />
-                    <span>
-                      <span className="block text-sm font-medium">
-                        {t("dashboard:pools.wizard.publicEgress")}
-                      </span>
-                      <span className="block text-sm text-muted-foreground">
-                        {t("dashboard:pools.wizard.publicEgressHint")}
-                      </span>
-                    </span>
-                  </label>
-                )}
-              </form.Field>
-              <form.Subscribe selector={(state) => state.values.publicEgress}>
-                {(publicEgress) =>
-                  publicEgress ? (
-                    <div className="space-y-3 rounded-md bg-amber-500/10 p-4 text-amber-900 dark:text-amber-100">
-                      <p className="text-sm font-medium">
-                        {t("dashboard:pools.wizard.egressWarning")}
-                      </p>
-                      {(["publicEgressAcknowledged", "finiteSpendProtection"] as const).map(
-                        (name) => (
-                          <form.Field key={name} name={name}>
-                            {(field) => (
-                              <label className="flex min-h-11 items-start gap-3 text-sm">
-                                <Checkbox
-                                  checked={field.state.value}
-                                  onCheckedChange={(next) => field.handleChange(next === true)}
-                                />
-                                <span>{t(`dashboard:pools.wizard.fields.${name}`)}</span>
-                              </label>
-                            )}
-                          </form.Field>
-                        ),
-                      )}
-                      <p className="text-xs">{t("dashboard:pools.wizard.providerOrderHint")}</p>
-                    </div>
-                  ) : null
-                }
-              </form.Subscribe>
-            </div>
-          ) : null}
-          {step === 3 ? (
-            <form.Subscribe selector={(state) => state.values}>
-              {(values) => (
-                <div className="space-y-4">
-                  <div className="flex items-start gap-3 rounded-md bg-primary/10 p-4 text-sm">
-                    <ShieldCheck className="mt-0.5 size-5 shrink-0 text-primary" />
-                    <p>{t("dashboard:pools.wizard.reviewSafe")}</p>
-                  </div>
-                  <dl className="grid gap-3 text-sm sm:grid-cols-2">
-                    <div>
-                      <dt className="text-muted-foreground">
-                        {t("dashboard:pools.wizard.localModels")}
-                      </dt>
-                      <dd className="font-medium tabular-nums">{values.localModelIds.length}</dd>
-                    </div>
-                    <div>
-                      <dt className="text-muted-foreground">
-                        {t("dashboard:pools.wizard.fields.concurrency")}
-                      </dt>
-                      <dd className="font-medium tabular-nums">{values.concurrency}</dd>
-                    </div>
-                    <div>
-                      <dt className="text-muted-foreground">
-                        {t("dashboard:pools.wizard.fields.contextCeiling")}
-                      </dt>
-                      <dd className="font-medium tabular-nums">
-                        {values.contextCeiling.toLocaleString()}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt className="text-muted-foreground">
-                        {t("dashboard:pools.wizard.publicEgress")}
-                      </dt>
-                      <dd className="font-medium">
-                        {values.publicEgress
-                          ? t("dashboard:pools.wizard.enabled")
-                          : t("dashboard:pools.wizard.disabled")}
-                      </dd>
-                    </div>
-                  </dl>
-                  <p className="text-sm text-muted-foreground">
-                    {t("dashboard:pools.wizard.advancedHint")}
-                  </p>
-                </div>
-              )}
-            </form.Subscribe>
-          ) : null}
-          <DialogFooter className="gap-2 sm:justify-between">
-            <Button
-              type="button"
-              variant="ghost"
-              size="touch"
-              disabled={step === 0}
-              onClick={() => setStep((current) => Math.max(0, current - 1))}
-            >
-              <ArrowLeft className="size-4" />
-              {t("dashboard:pools.wizard.back")}
-            </Button>
-            <Button
-              type="submit"
-              size="touch"
-              disabled={
-                createPool.isPending ||
-                addMember.isPending ||
-                (step === 0 && directModels.length === 0)
+      ) : null}
+      <fieldset disabled={!capacityEnabled} className="min-w-0 space-y-4 disabled:opacity-60">
+        <p className="text-sm text-muted-foreground">
+          {t("dashboard:pools.capacity.directGlobalEffect")}
+        </p>
+        <div className="space-y-2">
+          <Label htmlFor="direct-capacity">{t("dashboard:pools.capacity.attachment")}</Label>
+          <select
+            id="direct-capacity"
+            className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+            value={capacityId}
+            onChange={(event) => setCapacityId(event.target.value)}
+          >
+            <option value="">{t("dashboard:pools.capacity.unattached")}</option>
+            {capacities.map((capacity) => (
+              <option key={capacity.id} value={capacity.id}>
+                {capacity.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        {[
+          ["direct-priority", "capacityPriority", priority, setPriority, 0, 31],
+          ["direct-reserved", "capacityReservedSlots", reserved, setReserved, 0],
+          ["direct-margin", "capacityContextMargin", margin, setMargin, 0],
+        ].map(([id, label, value, setter, min, max]) => (
+          <div key={String(id)} className="space-y-2">
+            <Label htmlFor={String(id)}>{t(`dashboard:pools.capacity.fields.${label}`)}</Label>
+            <Input
+              id={String(id)}
+              className="min-h-11"
+              type="number"
+              min={Number(min)}
+              max={max == null ? undefined : Number(max)}
+              value={String(value)}
+              onChange={(event) =>
+                (setter as React.Dispatch<React.SetStateAction<string>>)(event.target.value)
               }
-            >
-              {step === steps.length - 1 ? (
-                createPool.isPending || addMember.isPending ? (
-                  t("common:actions.saving")
-                ) : (
-                  t("dashboard:pools.wizard.create")
-                )
-              ) : (
-                <>
-                  {t("dashboard:pools.wizard.next")}
-                  <ArrowRight className="size-4" />
-                </>
-              )}
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
+            />
+          </div>
+        ))}
+        {(
+          [
+            [
+              "direct-concurrency",
+              "hardConcurrencyLimit",
+              concurrencyMode,
+              setConcurrencyMode,
+              concurrency,
+              setConcurrency,
+              1,
+            ],
+            ["direct-wait", "capacityWaitBudgetMs", waitMode, setWaitMode, wait, setWait, 0],
+            [
+              "direct-ceiling",
+              "capacityContextCeiling",
+              ceilingMode,
+              setCeilingMode,
+              ceiling,
+              setCeiling,
+              1,
+            ],
+          ] as const
+        ).map(([id, label, mode, setMode, value, setValue, min]) => (
+          <div key={id} className="grid min-w-0 gap-2 sm:grid-cols-[minmax(0,0.7fr)_minmax(0,1fr)]">
+            <div className="space-y-2">
+              <Label htmlFor={`${id}-mode`}>{t(`dashboard:pools.capacity.fields.${label}`)}</Label>
+              <select
+                id={`${id}-mode`}
+                className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+                value={mode}
+                onChange={(event) => setMode(event.target.value as FiniteLimitMode)}
+              >
+                <option value="LIMITED">{t("dashboard:pools.capacity.modes.limited")}</option>
+                <option value="UNLIMITED">{t("dashboard:pools.capacity.modes.unlimited")}</option>
+              </select>
+            </div>
+            {mode === "LIMITED" ? (
+              <div className="space-y-2">
+                <Label htmlFor={id}>{t("dashboard:pools.capacity.limitValue")}</Label>
+                <Input
+                  id={id}
+                  className="min-h-11"
+                  type="number"
+                  min={min}
+                  value={value}
+                  onChange={(event) => setValue(event.target.value)}
+                />
+              </div>
+            ) : null}
+          </div>
+        ))}
+        <div className="space-y-2">
+          <Label htmlFor="direct-borrow">
+            {t("dashboard:pools.capacity.fields.capacityBorrowPolicy")}
+          </Label>
+          <select
+            id="direct-borrow"
+            className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+            value={borrow}
+            onChange={(event) => setBorrow(event.target.value as "NEVER" | "WHEN_IDLE")}
+          >
+            <option value="WHEN_IDLE">{t("dashboard:pools.capacity.borrowIdle")}</option>
+            <option value="NEVER">{t("dashboard:pools.capacity.borrowNever")}</option>
+          </select>
+        </div>
+        <Button
+          type="submit"
+          size="touch"
+          disabled={!capacityEnabled || !valid || mutation.isPending}
+        >
+          {mutation.isPending ? t("common:actions.saving") : t("common:actions.save")}
+        </Button>
+      </fieldset>
+    </form>
   );
 }
 
@@ -1672,956 +1238,17 @@ export function shouldShowProviderOperationsSection(providerEgressEnabled: boole
   return providerEgressEnabled === true;
 }
 
-export function PoolsSection() {
-  const { t } = useTranslation(["common", "dashboard"]);
-  const queryClient = useQueryClient();
-  const { data: appConfig } = useQuery(orpc.appConfig.queryOptions());
-  const {
-    data: poolsData,
-    isPending: poolsIsPending,
-    isError: poolsIsError,
-    refetch: refetchPools,
-  } = useQuery(orpc.forwarderManagement.listModelPools.queryOptions());
-  const {
-    data: devicesData,
-    isPending: devicesIsPending,
-    isError: devicesIsError,
-    refetch: refetchDevices,
-  } = useQuery(orpc.forwarderManagement.listCliDevices.queryOptions());
-  const capacityEnabled = appConfig?.capacityEnabled === true;
-  const { data: capacitiesData, isLoading: capacitiesLoading } = useQuery({
-    ...orpc.capacityManagement.list.queryOptions(),
-    retry: false,
-    enabled: capacityEnabled,
-  });
-  const [createOpen, setCreateOpen] = useState(false);
-  const [wizardOpen, setWizardOpen] = useState(false);
-  const [capacityOpen, setCapacityOpen] = useState(false);
-  const [editingCapacity, setEditingCapacity] = useState<CapacityRow | null>(null);
-  const [deleteCapacity, setDeleteCapacity] = useState<CapacityRow | null>(null);
-  const [editingPool, setEditingPool] = useState<ModelPool | null>(null);
-  const [deletePool, setDeletePool] = useState<ModelPool | null>(null);
-  const [memberPool, setMemberPool] = useState<ModelPool | null>(null);
-  const [editingMember, setEditingMember] = useState<PoolMember | null>(null);
-  const [deleteMember, setDeleteMember] = useState<PoolMember | null>(null);
-  const [grantPool, setGrantPool] = useState<ModelPool | null>(null);
-  const [revokeGrant, setRevokeGrant] = useState<{ pool: ModelPool; grant: PoolGrant } | null>(
-    null,
-  );
-  const [testingMemberId, setTestingMemberId] = useState<string | null>(null);
-  const [memberTestSurface, setMemberTestSurface] = useState<MemberTestSurface>("OPENAI_RESPONSES");
-  const [memberTestMode, setMemberTestMode] = useState<MemberTestMode>("PREFER_NATIVE");
-  const directModels = useMemo(() => allDirectModels(devicesData ?? []), [devicesData]);
-
-  const onChanged = () => {
-    queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
-  };
-
-  const deletePoolMutation = useMutation(
-    orpc.forwarderManagement.deleteModelPool.mutationOptions({
-      onSuccess: () => {
-        onChanged();
-        toast.success(t("dashboard:pools.deleted"));
-        setDeletePool(null);
-      },
-    }),
-  );
-  const removeMember = useMutation(
-    orpc.forwarderManagement.removePoolMember.mutationOptions({
-      onSuccess: () => {
-        onChanged();
-        toast.success(t("dashboard:pools.memberRemoved"));
-        setDeleteMember(null);
-      },
-    }),
-  );
-  const reorderOverflowMember = useMutation(
-    orpc.forwarderManagement.reorderProviderPoolMember.mutationOptions({
-      onSuccess: () => onChanged(),
-      onError: () => toast.error(t("dashboard:pools.reorderFailed")),
-    }),
-  );
-  const revokeGrantMutation = useMutation(
-    orpc.forwarderManagement.revokePoolAccessByEmail.mutationOptions({
-      onSuccess: () => {
-        onChanged();
-        toast.success(t("dashboard:pools.grantRevoked"));
-        setRevokeGrant(null);
-      },
-    }),
-  );
-  const deleteCapacityMutation = useMutation(
-    orpc.capacityManagement.remove.mutationOptions({
-      onSuccess: () => {
-        queryClient.invalidateQueries({ queryKey: orpc.capacityManagement.key() });
-        toast.success(t("dashboard:pools.capacity.deleted"));
-        setDeleteCapacity(null);
-      },
-      onError: () => toast.error(t("dashboard:pools.capacity.deleteConflict")),
-    }),
-  );
-
-  if (poolsIsPending || devicesIsPending) return <ListSkeleton />;
-  if (poolsIsError || devicesIsError) {
-    return (
-      <InlineRetry
-        message={t("dashboard:pools.loadFailed")}
-        onRetry={() => {
-          refetchPools();
-          refetchDevices();
-        }}
-      />
-    );
-  }
-
-  return (
-    <section className="min-w-0 max-w-full">
-      <SectionHeader
-        title={t("dashboard:pools.title")}
-        description={t("dashboard:pools.description")}
-        action={
-          <div className="flex flex-wrap gap-2">
-            <Button size="touch" onClick={() => setWizardOpen(true)}>
-              <Plus className="size-4" />
-              {t("dashboard:pools.wizard.open")}
-            </Button>
-            <Dialog open={createOpen} onOpenChange={setCreateOpen}>
-              <DialogTrigger
-                render={
-                  <Button size="touch">
-                    <Plus className="size-4" />
-                    {t("dashboard:pools.advancedCreate")}
-                  </Button>
-                }
-              />
-              <DialogContent className="sm:max-w-lg">
-                <DialogHeader>
-                  <DialogTitle>{t("dashboard:pools.createTitle")}</DialogTitle>
-                  <DialogDescription>{t("dashboard:pools.createDescription")}</DialogDescription>
-                </DialogHeader>
-                <PoolForm
-                  mode="create"
-                  capacities={capacitiesData ?? []}
-                  onSuccess={() => setCreateOpen(false)}
-                />
-              </DialogContent>
-            </Dialog>
-          </div>
-        }
-      />
-      <GuardedPoolSetupWizard
-        open={wizardOpen}
-        onOpenChange={setWizardOpen}
-        directModels={directModels}
-      />
-
-      {shouldShowCapacitySection(capacityEnabled, capacitiesLoading, capacitiesData) ? (
-        <div className="mb-6 border-y bg-muted/30 py-4">
-          <div className="flex min-w-0 flex-col gap-4 px-4 sm:flex-row sm:items-start sm:justify-between">
-            <div className="min-w-0">
-              <div className="flex items-center gap-2">
-                <Gauge className="size-4 text-primary" />
-                <h3 className="font-medium">{t("dashboard:pools.capacity.title")}</h3>
-              </div>
-              <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-                {t("dashboard:pools.capacity.description")}
-              </p>
-            </div>
-            <Dialog open={capacityOpen} onOpenChange={setCapacityOpen}>
-              <DialogTrigger
-                render={
-                  <Button type="button" variant="outline" size="touch">
-                    <Plus className="size-4" />
-                    {t("dashboard:pools.capacity.create")}
-                  </Button>
-                }
-              />
-              <DialogContent className="max-h-[min(90vh,52rem)] overflow-x-hidden overflow-y-auto sm:max-w-xl">
-                <DialogHeader>
-                  <DialogTitle>{t("dashboard:pools.capacity.createTitle")}</DialogTitle>
-                  <DialogDescription>
-                    {t("dashboard:pools.capacity.createDescription")}
-                  </DialogDescription>
-                </DialogHeader>
-                <CapacitySetupForm onSuccess={() => setCapacityOpen(false)} />
-              </DialogContent>
-            </Dialog>
-          </div>
-          <div className="mt-4 px-4">
-            {capacitiesLoading ? (
-              <div className="grid gap-3 sm:grid-cols-2">
-                <Skeleton className="h-20" />
-                <Skeleton className="h-20" />
-              </div>
-            ) : capacitiesData?.length ? (
-              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-                {capacitiesData.map((capacity: CapacityRow) => (
-                  <div key={capacity.id} className="min-w-0 rounded-md border bg-background p-3">
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <div className="truncate text-sm font-medium">{capacity.label}</div>
-                        <div className="mt-1 truncate text-xs text-muted-foreground">
-                          {capacity.runtimeModel}
-                        </div>
-                      </div>
-                      <div className="flex shrink-0 items-center gap-1">
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon-touch"
-                          aria-label={t("dashboard:pools.capacity.edit")}
-                          onClick={() => setEditingCapacity(capacity)}
-                        >
-                          <Pencil className="size-4" />
-                        </Button>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon-touch"
-                          aria-label={t("dashboard:pools.capacity.delete")}
-                          onClick={() => setDeleteCapacity(capacity)}
-                        >
-                          <Trash2 className="size-4" />
-                        </Button>
-                      </div>
-                    </div>
-                    <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                      <span>
-                        {t("dashboard:pools.capacity.active", {
-                          count: capacity._count.CapacityLeases,
-                          limit: capacity.hardConcurrencyLimit ?? "∞",
-                        })}
-                      </span>
-                      <span>
-                        {t("dashboard:pools.capacity.waiting", {
-                          count: capacity._count.CapacityWaiters,
-                        })}
-                      </span>
-                      <span>
-                        {t("dashboard:pools.capacity.targets", {
-                          count: capacity._count.ExecutionTargets,
-                        })}
-                      </span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <p className="text-sm text-muted-foreground">{t("dashboard:pools.capacity.empty")}</p>
-            )}
-          </div>
-        </div>
-      ) : null}
-
-      {poolsData.length === 0 ? (
-        <EmptyState>{t("dashboard:pools.empty")}</EmptyState>
-      ) : (
-        <div className="space-y-4">
-          {poolsData.map((pool) => (
-            <div key={pool.id} className="rounded-md border">
-              <div className="flex flex-col gap-3 border-b p-4 lg:flex-row lg:items-start lg:justify-between">
-                <div className="min-w-0">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <h3 className="font-medium">{pool.name}</h3>
-                    <StatusPill muted>
-                      {pool.members.length} {t("dashboard:pools.membersLabel")}
-                    </StatusPill>
-                    <StatusPill muted>
-                      {pool.grants.length} {t("dashboard:pools.grantsLabel")}
-                    </StatusPill>
-                  </div>
-                  <div className="mt-2 max-w-2xl">
-                    <CopyableModelId modelId={pool.canonicalModelId} />
-                  </div>
-                  {pool.description ? (
-                    <p className="mt-2 text-sm text-muted-foreground">{pool.description}</p>
-                  ) : null}
-                  <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
-                    {pool.compatibility.suggestedConnectionType ? (
-                      <StatusPill muted>
-                        {t("dashboard:models.suggestedConnectionType", {
-                          type: t(
-                            `dashboard:connectionTypes.${pool.compatibility.suggestedConnectionType}`,
-                          ),
-                        })}
-                      </StatusPill>
-                    ) : null}
-                    <StatusPill muted>
-                      {t("dashboard:pools.recommendedSurface")}:{" "}
-                      {pool.compatibility.recommendedSurface
-                        ? t(`dashboard:connectionTypes.${pool.compatibility.recommendedSurface}`)
-                        : t("dashboard:pools.noneAvailable")}
-                    </StatusPill>
-                    {pool.compatibility.warnings.map((warning) => (
-                      <StatusPill key={warning} muted>
-                        {t(`dashboard:pools.warnings.${warning}`)}
-                      </StatusPill>
-                    ))}
-                  </div>
-                  <details className="mt-3 text-xs">
-                    <summary className="cursor-pointer text-muted-foreground">
-                      {t("dashboard:pools.compatibilityDetails")}
-                    </summary>
-                    <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                      {Object.entries(pool.compatibility.surfaces).map(
-                        ([surface, availability]) => (
-                          <div key={surface} className="rounded border p-2">
-                            <div className="font-medium">{surface}</div>
-                            <div className="mt-1 text-muted-foreground">
-                              {t("dashboard:pools.surfaceCounts", availability)}
-                              {availability.streaming ? ` · ${t("dashboard:pools.streaming")}` : ""}
-                            </div>
-                            <div className="mt-1 text-muted-foreground">
-                              {t("dashboard:pools.surfaceTierCounts", {
-                                tier: t("dashboard:pools.memberTiers.PRIMARY"),
-                                ...availability.primary,
-                              })}
-                            </div>
-                            <div className="text-muted-foreground">
-                              {t("dashboard:pools.surfaceTierCounts", {
-                                tier: t("dashboard:pools.memberTiers.PUBLIC_OVERFLOW"),
-                                ...availability.publicOverflow,
-                              })}
-                            </div>
-                            {availability.limitations.length > 0 ? (
-                              <div className="mt-1 break-words text-muted-foreground">
-                                {availability.limitations
-                                  .map((limitation) =>
-                                    t(`dashboard:pools.limitations.${limitation}`),
-                                  )
-                                  .join(", ")}
-                              </div>
-                            ) : null}
-                          </div>
-                        ),
-                      )}
-                    </div>
-                  </details>
-                  {pool.transformer.model ? (
-                    <p className="mt-2 text-sm text-muted-foreground">
-                      {t("dashboard:pools.transformerActive")}:{" "}
-                      <code className="font-mono text-xs">
-                        {pool.transformer.model.canonicalModelId}
-                      </code>
-                    </p>
-                  ) : (
-                    <p className="mt-2 text-sm text-muted-foreground">
-                      {t("dashboard:pools.transformerOff")}
-                    </p>
-                  )}
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="touch"
-                    onClick={() => setGrantPool(pool)}
-                  >
-                    <Plus className="size-4" />
-                    {t("dashboard:pools.grant")}
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="touch"
-                    onClick={() => setMemberPool(pool)}
-                  >
-                    <Plus className="size-4" />
-                    {t("dashboard:pools.addMember")}
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="touch"
-                    onClick={() => setEditingPool(pool)}
-                  >
-                    {t("common:actions.edit")}
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="destructive"
-                    size="touch"
-                    onClick={() => setDeletePool(pool)}
-                  >
-                    <Trash2 className="size-4" />
-                    {t("common:actions.delete")}
-                  </Button>
-                </div>
-              </div>
-
-              <div className="grid min-w-0 gap-0 divide-y lg:grid-cols-[1fr_22rem] lg:divide-x lg:divide-y-0">
-                <div className="min-w-0 p-4">
-                  <div className="mb-3 flex flex-wrap items-end justify-between gap-2">
-                    <h4 className="text-sm font-medium">{t("dashboard:pools.membersTitle")}</h4>
-                    <div className="flex flex-wrap gap-2">
-                      <Label className="sr-only" htmlFor={`member-test-surface-${pool.id}`}>
-                        {t("dashboard:pools.memberTestSurface")}
-                      </Label>
-                      <select
-                        id={`member-test-surface-${pool.id}`}
-                        className="h-11 rounded-md border bg-background px-3 text-xs"
-                        value={memberTestSurface}
-                        onChange={(event) =>
-                          setMemberTestSurface(event.target.value as MemberTestSurface)
-                        }
-                      >
-                        <option value="OPENAI_CHAT_COMPLETIONS">
-                          {t("dashboard:pools.memberTestSurfaces.OPENAI_CHAT_COMPLETIONS")}
-                        </option>
-                        <option value="OPENAI_RESPONSES">
-                          {t("dashboard:pools.memberTestSurfaces.OPENAI_RESPONSES")}
-                        </option>
-                        <option value="ANTHROPIC_MESSAGES">
-                          {t("dashboard:pools.memberTestSurfaces.ANTHROPIC_MESSAGES")}
-                        </option>
-                      </select>
-                      <Label className="sr-only" htmlFor={`member-test-mode-${pool.id}`}>
-                        {t("dashboard:pools.memberTestMode")}
-                      </Label>
-                      <select
-                        id={`member-test-mode-${pool.id}`}
-                        className="h-11 rounded-md border bg-background px-3 text-xs"
-                        value={memberTestMode}
-                        onChange={(event) =>
-                          setMemberTestMode(event.target.value as MemberTestMode)
-                        }
-                      >
-                        <option value="PREFER_NATIVE">
-                          {t("dashboard:pools.memberTestPreferred")}
-                        </option>
-                        <option value="REQUIRE_NATIVE">
-                          {t("dashboard:pools.memberTestNative")}
-                        </option>
-                        <option value="REQUIRE_ADAPTED">
-                          {t("dashboard:pools.memberTestAdapted")}
-                        </option>
-                      </select>
-                    </div>
-                  </div>
-                  {pool.members.length === 0 ? (
-                    <p className="text-sm text-muted-foreground">
-                      {t("dashboard:pools.noMembers")}
-                    </p>
-                  ) : (
-                    <WideContent>
-                      <table className="w-full min-w-[620px] text-left text-xs">
-                        <thead className="border-b text-muted-foreground">
-                          <tr>
-                            <th className="py-2 pr-3 font-medium">
-                              {t("dashboard:models.modelId")}
-                            </th>
-                            <th className="py-2 pr-3 font-medium">{t("dashboard:pools.weight")}</th>
-                            <th className="py-2 pr-3 font-medium">
-                              {t("dashboard:pools.routing")}
-                            </th>
-                            <th className="py-2 pr-3 font-medium">{t("dashboard:pools.health")}</th>
-                            <th className="py-2 pl-3 text-right font-medium">
-                              {t("dashboard:actions.header")}
-                            </th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y">
-                          {pool.members.map((member) => (
-                            <tr key={member.id}>
-                              <td className="py-2 pr-3 align-top">
-                                <code className="font-mono">
-                                  {member.model?.canonicalModelId ??
-                                    member.providerModel?.displayName ??
-                                    member.providerModel?.upstreamModelId ??
-                                    member.discoveredModelId ??
-                                    member.id}
-                                </code>
-                                <div className="mt-1 flex flex-wrap gap-1">
-                                  <StatusPill muted>
-                                    {t(`dashboard:pools.memberTiers.${member.tier}`)}
-                                  </StatusPill>
-                                  {member.publicOrder != null ? (
-                                    <StatusPill muted>
-                                      {t("dashboard:pools.publicOrder", {
-                                        order: member.publicOrder + 1,
-                                      })}
-                                    </StatusPill>
-                                  ) : null}
-                                </div>
-                                {member.model || member.providerModel ? (
-                                  <details className="mt-2">
-                                    <summary className="min-h-11 cursor-pointer py-2 text-muted-foreground">
-                                      {t("dashboard:pools.memberCapabilities")}
-                                    </summary>
-                                    <div className="space-y-1">
-                                      {Object.entries(
-                                        member.model?.surfaces ?? member.providerModel!.surfaces,
-                                      ).map(([surface, availability]) => (
-                                        <p key={surface} className="break-words">
-                                          <span className="font-medium">{surface}</span>:{" "}
-                                          {availability.mode}
-                                          {availability.limitations.length
-                                            ? ` · ${availability.limitations.map((item) => t(`dashboard:pools.limitations.${item}`)).join(", ")}`
-                                            : ""}
-                                        </p>
-                                      ))}
-                                    </div>
-                                  </details>
-                                ) : null}
-                              </td>
-                              <td className="py-2 pr-3 align-top tabular-nums">{member.weight}</td>
-                              <td className="py-2 pr-3 align-top">
-                                <div>{member.routingStatus}</div>
-                                <details className="mt-1">
-                                  <summary className="min-h-11 cursor-pointer py-2 text-muted-foreground">
-                                    {t("dashboard:pools.memberPolicyDetails")}
-                                  </summary>
-                                  <dl className="space-y-1 text-muted-foreground">
-                                    <div>
-                                      <dt className="inline">
-                                        {t(
-                                          "dashboard:pools.capacity.fields.capacityConcurrencyLimit",
-                                        )}
-                                        :{" "}
-                                      </dt>
-                                      <dd className="inline">
-                                        {member.capacityConcurrencyMode}
-                                        {member.capacityConcurrencyLimit != null
-                                          ? ` ${member.capacityConcurrencyLimit}`
-                                          : ""}
-                                      </dd>
-                                    </div>
-                                    <div>
-                                      <dt className="inline">
-                                        {t(
-                                          "dashboard:pools.capacity.fields.capacityContextCeiling",
-                                        )}
-                                        :{" "}
-                                      </dt>
-                                      <dd className="inline">
-                                        {member.capacityContextCeilingMode}
-                                        {member.capacityContextCeiling != null
-                                          ? ` ${member.capacityContextCeiling.toLocaleString()}`
-                                          : ""}
-                                      </dd>
-                                    </div>
-                                    <div>
-                                      <dt className="inline">
-                                        {t("dashboard:pools.capacity.fields.capacityPriority")}:{" "}
-                                      </dt>
-                                      <dd className="inline">
-                                        {member.capacityPriority ?? t("dashboard:pools.inherited")}
-                                      </dd>
-                                    </div>
-                                    <div>
-                                      <dt className="inline">
-                                        {t("dashboard:pools.capacity.fields.capacityReservedSlots")}
-                                        :{" "}
-                                      </dt>
-                                      <dd className="inline">
-                                        {member.capacityReservedSlots ??
-                                          t("dashboard:pools.inherited")}
-                                      </dd>
-                                    </div>
-                                    <div>
-                                      <dt className="inline">
-                                        {t("dashboard:pools.capacity.fields.capacityBorrowPolicy")}:{" "}
-                                      </dt>
-                                      <dd className="inline">
-                                        {member.capacityBorrowPolicy ??
-                                          t("dashboard:pools.inherited")}
-                                      </dd>
-                                    </div>
-                                    <div>
-                                      <dt className="inline">
-                                        {t("dashboard:pools.capacity.fields.capacityWaitBudgetMs")}:{" "}
-                                      </dt>
-                                      <dd className="inline">
-                                        {member.capacityWaitBudgetMode}
-                                        {member.capacityWaitBudgetMs != null
-                                          ? ` ${member.capacityWaitBudgetMs} ms`
-                                          : ""}
-                                      </dd>
-                                    </div>
-                                    <div>
-                                      <dt className="inline">
-                                        {t("dashboard:pools.capacity.fields.capacityContextMargin")}
-                                        :{" "}
-                                      </dt>
-                                      <dd className="inline">
-                                        {member.capacityContextMargin ??
-                                          t("dashboard:pools.inherited")}
-                                      </dd>
-                                    </div>
-                                    <div>
-                                      <dt className="inline">
-                                        {t("dashboard:pools.memberPhysicalCapacity")}:{" "}
-                                      </dt>
-                                      <dd className="inline">
-                                        {member.inferenceCapacityId
-                                          ? t("dashboard:pools.memberLoad", {
-                                              active:
-                                                capacitiesData?.find(
-                                                  (capacity) =>
-                                                    capacity.id === member.inferenceCapacityId,
-                                                )?._count.CapacityLeases ?? 0,
-                                              waiting:
-                                                capacitiesData?.find(
-                                                  (capacity) =>
-                                                    capacity.id === member.inferenceCapacityId,
-                                                )?._count.CapacityWaiters ?? 0,
-                                              limit:
-                                                capacitiesData?.find(
-                                                  (capacity) =>
-                                                    capacity.id === member.inferenceCapacityId,
-                                                )?.hardConcurrencyLimit ?? "∞",
-                                            })
-                                          : t("dashboard:pools.capacity.unattached")}
-                                      </dd>
-                                    </div>
-                                    {member.inferenceCapacityId ? (
-                                      <div>
-                                        <dt className="inline">
-                                          {t("dashboard:pools.memberPhysicalContext")}:{" "}
-                                        </dt>
-                                        <dd className="inline">
-                                          {t("dashboard:pools.memberPhysicalContextValue", {
-                                            context: String(
-                                              capacitiesData?.find(
-                                                (capacity) =>
-                                                  capacity.id === member.inferenceCapacityId,
-                                              )?.physicalMaxContext ?? "∞",
-                                            ),
-                                            strategy: String(
-                                              capacitiesData?.find(
-                                                (capacity) =>
-                                                  capacity.id === member.inferenceCapacityId,
-                                              )?.countStrategy ?? "—",
-                                            ),
-                                          })}
-                                        </dd>
-                                      </div>
-                                    ) : null}
-                                  </dl>
-                                </details>
-                              </td>
-                              <td className="py-2 pr-3 align-top">
-                                <StatusPill status={member.healthStatus}>
-                                  {member.healthStatus}
-                                </StatusPill>
-                                {member.lastFailureClass ? (
-                                  <p className="mt-2 text-muted-foreground">
-                                    {member.lastFailureClass} ·{" "}
-                                    {member.consecutiveRetryableFailures}
-                                  </p>
-                                ) : null}
-                                {member.providerModel ? (
-                                  <p className="mt-2 text-muted-foreground">
-                                    {member.providerModel.ProviderAccount.label} ·{" "}
-                                    {member.providerModel.pricingVersion
-                                      ? t("dashboard:pools.memberCost", {
-                                          version: member.providerModel.pricingVersion,
-                                          currency: member.providerModel.pricingCurrency,
-                                        })
-                                      : t("dashboard:pools.costUnavailable")}
-                                  </p>
-                                ) : null}
-                              </td>
-                              <td className="py-2 pl-3 align-top">
-                                <div className="flex justify-end gap-1">
-                                  {member.tier === "PUBLIC_OVERFLOW" ? (
-                                    <>
-                                      <Button
-                                        type="button"
-                                        variant="ghost"
-                                        size="icon-touch"
-                                        disabled={reorderOverflowMember.isPending}
-                                        onClick={() =>
-                                          reorderOverflowMember.mutate({
-                                            id: member.id,
-                                            direction: "EARLIER",
-                                          })
-                                        }
-                                        aria-label={t("dashboard:pools.moveOverflowEarlier")}
-                                      >
-                                        <MoveUp className="size-4" />
-                                      </Button>
-                                      <Button
-                                        type="button"
-                                        variant="ghost"
-                                        size="icon-touch"
-                                        disabled={reorderOverflowMember.isPending}
-                                        onClick={() =>
-                                          reorderOverflowMember.mutate({
-                                            id: member.id,
-                                            direction: "LATER",
-                                          })
-                                        }
-                                        aria-label={t("dashboard:pools.moveOverflowLater")}
-                                      >
-                                        <MoveDown className="size-4" />
-                                      </Button>
-                                    </>
-                                  ) : null}
-                                  <Button
-                                    type="button"
-                                    variant="ghost"
-                                    size="touch"
-                                    disabled={testingMemberId === member.id}
-                                    onClick={async () => {
-                                      setTestingMemberId(member.id);
-                                      try {
-                                        await testPoolMemberThroughResolver({
-                                          poolModel: pool.canonicalModelId,
-                                          memberId: member.id,
-                                          surface: memberTestSurface,
-                                          mode: memberTestMode,
-                                        });
-                                        onChanged();
-                                        toast.success(t("dashboard:pools.testMemberSuccess"));
-                                      } catch (error) {
-                                        toast.error(
-                                          t("dashboard:pools.testMemberFailed", {
-                                            error:
-                                              error instanceof Error
-                                                ? error.message
-                                                : String(error),
-                                          }),
-                                        );
-                                      } finally {
-                                        setTestingMemberId(null);
-                                      }
-                                    }}
-                                  >
-                                    {t("dashboard:pools.testMember")}
-                                  </Button>
-                                  <Button
-                                    type="button"
-                                    variant="ghost"
-                                    size="touch"
-                                    onClick={() => setEditingMember(member)}
-                                  >
-                                    {t("common:actions.edit")}
-                                  </Button>
-                                  <Button
-                                    type="button"
-                                    variant="ghost"
-                                    size="icon-touch"
-                                    onClick={() => setDeleteMember(member)}
-                                    aria-label={t("dashboard:pools.removeMember")}
-                                  >
-                                    <Trash2 className="size-4" />
-                                  </Button>
-                                </div>
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </WideContent>
-                  )}
-                </div>
-
-                <div className="min-w-0 p-4">
-                  <h4 className="mb-2 text-sm font-medium">{t("dashboard:pools.grantsTitle")}</h4>
-                  {pool.grants.length === 0 ? (
-                    <p className="text-sm text-muted-foreground">{t("dashboard:pools.noGrants")}</p>
-                  ) : (
-                    <div className="divide-y">
-                      {pool.grants.map((grant) => (
-                        <div
-                          key={grant.id}
-                          className="flex items-center justify-between gap-3 py-2"
-                        >
-                          <div className="min-w-0">
-                            <p className="truncate text-sm">{grant.granteeName}</p>
-                            <p className="truncate text-xs text-muted-foreground">
-                              {grant.granteeEmail}
-                            </p>
-                            {pool.members.some((member) => member.providerModel) ? (
-                              <p className="mt-1 text-xs text-amber-700 dark:text-amber-300">
-                                {t("dashboard:pools.grantEgressWarning")}
-                              </p>
-                            ) : null}
-                          </div>
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon-touch"
-                            onClick={() => setRevokeGrant({ pool, grant })}
-                            aria-label={t("dashboard:pools.revokeGrant")}
-                          >
-                            <Trash2 className="size-4" />
-                          </Button>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      <Sheet open={Boolean(editingPool)} onOpenChange={(open) => !open && setEditingPool(null)}>
-        <SheetContent className="w-full overflow-hidden sm:max-w-md">
-          <SheetHeader className="shrink-0">
-            <SheetTitle>{t("dashboard:pools.editTitle")}</SheetTitle>
-            <SheetDescription>{t("dashboard:pools.editDescription")}</SheetDescription>
-          </SheetHeader>
-          <div className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-clip overscroll-y-contain px-4 pb-[max(1rem,var(--safe-area-bottom))]">
-            {editingPool ? (
-              <PoolForm
-                key={editingPool.id}
-                mode="edit"
-                pool={editingPool}
-                directModels={directModels}
-                capacities={capacitiesData ?? []}
-                onSuccess={() => setEditingPool(null)}
-              />
-            ) : null}
-          </div>
-        </SheetContent>
-      </Sheet>
-
-      <Sheet
-        open={Boolean(editingCapacity)}
-        onOpenChange={(open) => !open && setEditingCapacity(null)}
-      >
-        <SheetContent className="w-full overflow-hidden sm:max-w-xl">
-          <SheetHeader className="shrink-0">
-            <SheetTitle>{t("dashboard:pools.capacity.editTitle")}</SheetTitle>
-            <SheetDescription>{t("dashboard:pools.capacity.editDescription")}</SheetDescription>
-          </SheetHeader>
-          <div className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-clip overscroll-y-contain px-4 pb-[max(1rem,var(--safe-area-bottom))]">
-            {editingCapacity ? (
-              <CapacitySetupForm
-                key={editingCapacity.id}
-                capacity={editingCapacity}
-                onSuccess={() => setEditingCapacity(null)}
-              />
-            ) : null}
-          </div>
-        </SheetContent>
-      </Sheet>
-
-      <ConfirmDeleteDialog
-        open={Boolean(deleteCapacity)}
-        onOpenChange={(open) => !open && setDeleteCapacity(null)}
-        title={t("dashboard:pools.capacity.deleteTitle")}
-        description={t("dashboard:pools.capacity.deleteDescription")}
-        confirmToken={deleteCapacity?.label ?? ""}
-        typePrompt={t("dashboard:pools.capacity.typeName")}
-        copyAriaLabel={t("dashboard:actions.copyConfirm")}
-        isPending={deleteCapacityMutation.isPending}
-        onConfirm={() => {
-          if (deleteCapacity) deleteCapacityMutation.mutate({ id: deleteCapacity.id });
-        }}
-      />
-
-      <Dialog open={Boolean(memberPool)} onOpenChange={(open) => !open && setMemberPool(null)}>
-        <DialogContent className="sm:max-w-lg">
-          <DialogHeader>
-            <DialogTitle>{t("dashboard:pools.addMemberTitle")}</DialogTitle>
-            <DialogDescription>{t("dashboard:pools.addMemberDescription")}</DialogDescription>
-          </DialogHeader>
-          {memberPool ? (
-            <PoolMemberForm
-              mode="create"
-              poolId={memberPool.id}
-              directModels={directModels}
-              capacities={capacitiesData ?? []}
-              onSuccess={() => setMemberPool(null)}
-            />
-          ) : null}
-        </DialogContent>
-      </Dialog>
-
-      <Sheet open={Boolean(editingMember)} onOpenChange={(open) => !open && setEditingMember(null)}>
-        <SheetContent className="w-full overflow-hidden sm:max-w-md">
-          <SheetHeader className="shrink-0">
-            <SheetTitle>{t("dashboard:pools.editMemberTitle")}</SheetTitle>
-            <SheetDescription>{t("dashboard:pools.editMemberDescription")}</SheetDescription>
-          </SheetHeader>
-          <div className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-clip overscroll-y-contain px-4 pb-[max(1rem,var(--safe-area-bottom))]">
-            {editingMember ? (
-              <PoolMemberForm
-                key={editingMember.id}
-                mode="edit"
-                member={editingMember}
-                directModels={directModels}
-                capacities={capacitiesData ?? []}
-                onSuccess={() => setEditingMember(null)}
-              />
-            ) : null}
-          </div>
-        </SheetContent>
-      </Sheet>
-
-      <GrantPoolDialog pool={grantPool} onOpenChange={(open) => !open && setGrantPool(null)} />
-
-      <ConfirmDeleteDialog
-        open={Boolean(deletePool)}
-        onOpenChange={(open) => !open && setDeletePool(null)}
-        title={t("dashboard:pools.deleteTitle")}
-        description={t("dashboard:pools.deleteDescription")}
-        confirmToken={deletePool?.name ?? ""}
-        typePrompt={t("dashboard:pools.typePoolName")}
-        copyAriaLabel={t("dashboard:actions.copyConfirm")}
-        isPending={deletePoolMutation.isPending}
-        onConfirm={() => {
-          if (deletePool) deletePoolMutation.mutate({ id: deletePool.id });
-        }}
-      />
-
-      <ConfirmDeleteDialog
-        open={Boolean(deleteMember)}
-        onOpenChange={(open) => !open && setDeleteMember(null)}
-        title={t("dashboard:pools.removeMemberTitle")}
-        description={t("dashboard:pools.removeMemberDescription")}
-        confirmToken={
-          deleteMember?.model?.canonicalModelId ?? deleteMember?.discoveredModelId ?? ""
-        }
-        typePrompt={t("dashboard:pools.typeModelId")}
-        copyAriaLabel={t("dashboard:actions.copyConfirm")}
-        isPending={removeMember.isPending}
-        onConfirm={() => {
-          if (deleteMember) removeMember.mutate({ id: deleteMember.id });
-        }}
-      />
-
-      <ConfirmDeleteDialog
-        open={Boolean(revokeGrant)}
-        onOpenChange={(open) => !open && setRevokeGrant(null)}
-        title={t("dashboard:pools.revokeGrantTitle")}
-        description={t("dashboard:pools.revokeGrantDescription")}
-        confirmToken={revokeGrant?.grant.granteeEmail ?? ""}
-        typePrompt={t("dashboard:pools.typeEmail")}
-        copyAriaLabel={t("dashboard:actions.copyConfirm")}
-        inputMode="email"
-        confirmLabel={t("dashboard:pools.revoke")}
-        pendingLabel={t("dashboard:pools.revoking")}
-        isPending={revokeGrantMutation.isPending}
-        onConfirm={() => {
-          if (revokeGrant) {
-            revokeGrantMutation.mutate({
-              poolId: revokeGrant.pool.id,
-              email: revokeGrant.grant.granteeEmail,
-            });
-          }
-        }}
-      />
-      {shouldShowProviderOperationsSection(appConfig?.providerEgressEnabled) ? (
-        <ProviderOperationsSection />
-      ) : null}
-    </section>
-  );
-}
-
-function CapacitySetupForm({
+export function CapacitySetupForm({
   onSuccess,
   capacity,
+  capacityAvailability,
 }: {
   onSuccess: () => void;
   capacity?: CapacityRow;
+  capacityAvailability: CapacityAvailability;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
+  const capacityEnabled = capacityAvailability === "enabled";
   const queryClient = useQueryClient();
   const createCapacity = useMutation(
     orpc.capacityManagement.create.mutationOptions({
@@ -2671,11 +1298,18 @@ function CapacitySetupForm({
     },
     validators: { onSubmit: capacityFormSchema },
     onSubmit: async ({ value }) => {
+      if (!capacityEnabled) return;
       const data = capacityMutationPayload(value);
       if (capacity) await updateCapacity.mutateAsync({ id: capacity.id, ...data });
       else await createCapacity.mutateAsync(data);
     },
   });
+  if (!capacityEnabled)
+    return (
+      <p className="rounded-md border bg-muted/40 p-3 text-sm text-muted-foreground">
+        {t(capacityUnavailableReasonKey(capacityAvailability))}
+      </p>
+    );
   const textField = (name: "label" | "runtimeModel" | "runtimeIdentityKey") => (
     <form.Field name={name}>
       {(field) => (
@@ -2835,20 +1469,107 @@ function CapacitySetupForm({
   );
 }
 
-function PoolForm({
+export function ProtocolCompatibilityRadio({
+  adaptationEnabled,
+  allowLossyDeveloperRoleCollapse,
+  protocolAdaptationAvailable,
+  idPrefix,
+  onChange,
+}: {
+  adaptationEnabled: boolean;
+  allowLossyDeveloperRoleCollapse: boolean;
+  protocolAdaptationAvailable: boolean;
+  idPrefix: string;
+  onChange: (value: {
+    adaptationEnabled: boolean;
+    allowLossyDeveloperRoleCollapse: boolean;
+  }) => void;
+}) {
+  const { t } = useTranslation("dashboard");
+  // Historical rows can have lossy enabled while adaptation is off. Present that
+  // invalid pair as lossless, but leave the stored values untouched until the
+  // routing form is deliberately saved.
+  const selected = !adaptationEnabled
+    ? allowLossyDeveloperRoleCollapse
+      ? "lossless"
+      : "native"
+    : allowLossyDeveloperRoleCollapse
+      ? "lossy"
+      : "lossless";
+  const options = [
+    ["native", false, false],
+    ["lossless", true, false],
+    ["lossy", true, true],
+  ] as const;
+  return (
+    <fieldset className="space-y-3" aria-describedby={`${idPrefix}-reason`}>
+      <legend className="text-sm font-medium">{t("dashboard:pools.protocolCompatibility")}</legend>
+      {options.map(([value, adaptation, lossy]) => (
+        <label
+          key={value}
+          className="flex min-h-11 items-start gap-3 rounded-md border p-3 text-sm"
+        >
+          <input
+            type="radio"
+            name={`${idPrefix}-protocol`}
+            value={value}
+            aria-label={t(`dashboard:pools.protocolOptions.${value}.label`)}
+            checked={selected === value}
+            disabled={value !== "native" && !protocolAdaptationAvailable}
+            onChange={() =>
+              onChange({ adaptationEnabled: adaptation, allowLossyDeveloperRoleCollapse: lossy })
+            }
+          />
+          <span>
+            <span className="font-medium">
+              {t(`dashboard:pools.protocolOptions.${value}.label`)}
+            </span>
+            <span className="mt-1 block text-xs text-muted-foreground">
+              {t(`dashboard:pools.protocolOptions.${value}.help`)}
+            </span>
+          </span>
+        </label>
+      ))}
+      {!protocolAdaptationAvailable ? (
+        <p id={`${idPrefix}-reason`} className="text-xs text-muted-foreground">
+          {t("dashboard:pools.protocolAdaptationDisabledReason")}
+        </p>
+      ) : null}
+      <details className="rounded-md border p-3 text-sm">
+        <summary className="min-h-11 cursor-pointer py-2">
+          {t("dashboard:pools.protocolRejectedTitle")}
+        </summary>
+        <p className="text-xs text-muted-foreground">{t("dashboard:pools.protocolRejectedHelp")}</p>
+      </details>
+    </fieldset>
+  );
+}
+
+export function PoolForm({
   mode,
   pool,
   onSuccess,
-  directModels = [],
+  stickySave = false,
+  directModels,
   capacities = [],
+  capacityAvailability,
+  protocolAdaptationAvailable,
+  sections = ["identity", "routing", "capacity", "media"],
 }: {
   mode: "create" | "edit";
   pool?: ModelPool;
   onSuccess: () => void;
-  directModels?: ReturnType<typeof allDirectModels>;
+  stickySave?: boolean;
+  directModels: ReturnType<typeof allDirectModels>;
   capacities?: CapacityRow[];
+  capacityAvailability: CapacityAvailability;
+  protocolAdaptationAvailable: boolean;
+  sections?: Array<"identity" | "routing" | "capacity" | "media">;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
+  const capacityEnabled = capacityAvailability === "enabled";
+  const show = (section: "identity" | "routing" | "capacity" | "media") =>
+    sections.includes(section);
   const queryClient = useQueryClient();
   const poolSchema = z.object({
     slug: z
@@ -2910,8 +1631,6 @@ function PoolForm({
     orpc.forwarderManagement.createModelPool.mutationOptions({
       onSuccess: () => {
         queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
-        toast.success(t("dashboard:pools.created"));
-        onSuccess();
       },
     }),
   );
@@ -2919,12 +1638,9 @@ function PoolForm({
     orpc.forwarderManagement.updateModelPool.mutationOptions({
       onSuccess: () => {
         queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
-        toast.success(t("dashboard:pools.updated"));
-        onSuccess();
       },
     }),
   );
-  const updatePoolPolicy = useMutation(orpc.capacityManagement.updatePoolPolicy.mutationOptions());
   const affinityStats = useQuery({
     ...orpc.forwarderManagement.cacheAffinityStats.queryOptions({
       input: { poolId: pool?.id ?? "disabled" },
@@ -2993,11 +1709,83 @@ function PoolForm({
     },
     validators: { onSubmit: poolSchema },
     onSubmit: async ({ value }) => {
+      const transformer = {
+        transformerDiscoveredModelId: value.transformerDiscoveredModelId.trim()
+          ? value.transformerDiscoveredModelId.trim()
+          : null,
+        transformerImages: value.transformerImages,
+        transformerAudio: value.transformerAudio,
+        transformerVideo: value.transformerVideo,
+        transformerCacheMode: value.transformerCacheMode as "OFF" | "MEMORY",
+        transformerSystemPrompt: value.transformerSystemPrompt.trim()
+          ? value.transformerSystemPrompt.trim()
+          : null,
+        transformerIncludePrimaryTools: value.transformerIncludePrimaryTools,
+        transformerMaxTools: value.transformerMaxTools,
+        transformerMaxToolChars: value.transformerMaxToolChars,
+        transformerTimeoutMs: value.transformerTimeoutMs.trim()
+          ? Number(value.transformerTimeoutMs)
+          : null,
+        transformerMaxAssets: value.transformerMaxAssets.trim()
+          ? Number(value.transformerMaxAssets)
+          : null,
+      };
+      const capacityPolicy =
+        show("capacity") && capacityEnabled
+          ? {
+              capacityPriority: value.capacityPriority,
+              capacityConcurrencyLimit:
+                value.capacityConcurrencyMode === "LIMITED" ? value.capacityConcurrencyLimit : null,
+              capacityReservedSlots: value.capacityReservedSlots,
+              capacityWaitBudgetMs:
+                value.capacityWaitBudgetMode === "LIMITED" ? value.capacityWaitBudgetMs : null,
+              capacityContextCeiling:
+                value.capacityContextCeilingMode === "LIMITED"
+                  ? value.capacityContextCeiling
+                  : null,
+              capacityContextMargin: value.capacityContextMargin,
+              capacityBorrowPolicy: value.capacityBorrowPolicy,
+            }
+          : {};
+      const identity = show("identity")
+        ? {
+            slug: value.slug.trim(),
+            name: value.name.trim(),
+            description: value.description.trim() || null,
+          }
+        : {};
+      const media = show("media")
+        ? {
+            ...transformer,
+            maxAttachmentBytes: value.maxAttachmentMiB.trim()
+              ? Number(value.maxAttachmentMiB) * MEBIBYTE
+              : null,
+            optimisticBasicTranscription: value.optimisticBasicTranscription,
+          }
+        : {};
+      const routing = show("routing")
+        ? {
+            protocolAdaptationEnabled: value.protocolAdaptationEnabled,
+            // A persisted lossy bit without adaptation is invalid. Saving the
+            // routing tab repairs only that bit and never enables adaptation.
+            allowLossyDeveloperRoleCollapse:
+              value.protocolAdaptationEnabled && value.allowLossyDeveloperRoleCollapse,
+            recommendedSurfaceOverride:
+              value.recommendedSurfaceOverride === "" ? null : value.recommendedSurfaceOverride,
+            affinityEnabled: value.affinityEnabled,
+            affinityTtlSeconds: value.affinityTtlSeconds,
+            affinityMaxRecords: value.affinityMaxRecords,
+            affinityPrefixWeight: value.affinityPrefixWeight,
+            affinityConversationWeight: value.affinityConversationWeight,
+            affinityLoadPenaltyWeight: value.affinityLoadPenaltyWeight,
+          }
+        : {};
       if (mode === "create") {
         await createPool.mutateAsync({
           slug: value.slug.trim(),
           name: value.name.trim(),
           description: value.description.trim() || null,
+          ...transformer,
           maxAttachmentBytes: value.maxAttachmentMiB.trim()
             ? Number(value.maxAttachmentMiB) * MEBIBYTE
             : null,
@@ -3006,16 +1794,7 @@ function PoolForm({
           allowLossyDeveloperRoleCollapse: value.allowLossyDeveloperRoleCollapse,
           recommendedSurfaceOverride:
             value.recommendedSurfaceOverride === "" ? null : value.recommendedSurfaceOverride,
-          capacityPriority: value.capacityPriority,
-          capacityConcurrencyLimit:
-            value.capacityConcurrencyMode === "UNLIMITED" ? null : value.capacityConcurrencyLimit,
-          capacityReservedSlots: value.capacityReservedSlots,
-          capacityWaitBudgetMs:
-            value.capacityWaitBudgetMode === "UNLIMITED" ? null : value.capacityWaitBudgetMs,
-          capacityContextCeiling:
-            value.capacityContextCeilingMode === "UNLIMITED" ? null : value.capacityContextCeiling,
-          capacityContextMargin: value.capacityContextMargin,
-          capacityBorrowPolicy: value.capacityBorrowPolicy,
+          ...capacityPolicy,
           affinityEnabled: value.affinityEnabled,
           affinityTtlSeconds: value.affinityTtlSeconds,
           affinityMaxRecords: value.affinityMaxRecords,
@@ -3023,61 +1802,14 @@ function PoolForm({
           affinityConversationWeight: value.affinityConversationWeight,
           affinityLoadPenaltyWeight: value.affinityLoadPenaltyWeight,
         });
+        toast.success(t("dashboard:pools.created"));
+        onSuccess();
       } else if (pool) {
-        await updatePool.mutateAsync({
-          id: pool.id,
-          slug: value.slug.trim(),
-          name: value.name.trim(),
-          description: value.description.trim() || null,
-          transformerDiscoveredModelId: value.transformerDiscoveredModelId.trim()
-            ? value.transformerDiscoveredModelId.trim()
-            : null,
-          transformerImages: value.transformerImages,
-          transformerAudio: value.transformerAudio,
-          transformerVideo: value.transformerVideo,
-          transformerCacheMode: value.transformerCacheMode as "OFF" | "MEMORY",
-          transformerSystemPrompt: value.transformerSystemPrompt.trim()
-            ? value.transformerSystemPrompt.trim()
-            : null,
-          transformerIncludePrimaryTools: value.transformerIncludePrimaryTools,
-          transformerMaxTools: value.transformerMaxTools,
-          transformerMaxToolChars: value.transformerMaxToolChars,
-          transformerTimeoutMs: value.transformerTimeoutMs.trim()
-            ? Number(value.transformerTimeoutMs)
-            : null,
-          transformerMaxAssets: value.transformerMaxAssets.trim()
-            ? Number(value.transformerMaxAssets)
-            : null,
-          maxAttachmentBytes: value.maxAttachmentMiB.trim()
-            ? Number(value.maxAttachmentMiB) * MEBIBYTE
-            : null,
-          optimisticBasicTranscription: value.optimisticBasicTranscription,
-          protocolAdaptationEnabled: value.protocolAdaptationEnabled,
-          allowLossyDeveloperRoleCollapse: value.allowLossyDeveloperRoleCollapse,
-          recommendedSurfaceOverride:
-            value.recommendedSurfaceOverride === "" ? null : value.recommendedSurfaceOverride,
-          affinityEnabled: value.affinityEnabled,
-          affinityTtlSeconds: value.affinityTtlSeconds,
-          affinityMaxRecords: value.affinityMaxRecords,
-          affinityPrefixWeight: value.affinityPrefixWeight,
-          affinityConversationWeight: value.affinityConversationWeight,
-          affinityLoadPenaltyWeight: value.affinityLoadPenaltyWeight,
-        });
-        await updatePoolPolicy.mutateAsync({
-          modelPoolId: pool.id,
-          capacityPriority: value.capacityPriority,
-          capacityConcurrencyLimit:
-            value.capacityConcurrencyMode === "LIMITED" ? value.capacityConcurrencyLimit : null,
-          capacityReservedSlots: value.capacityReservedSlots,
-          capacityWaitBudgetMs:
-            value.capacityWaitBudgetMode === "LIMITED" ? value.capacityWaitBudgetMs : null,
-          capacityContextCeiling:
-            value.capacityContextCeilingMode === "LIMITED" ? value.capacityContextCeiling : null,
-          capacityContextMargin: value.capacityContextMargin,
-          capacityBorrowPolicy: value.capacityBorrowPolicy,
-          protocolAdaptationEnabled: value.protocolAdaptationEnabled,
-          allowLossyDeveloperRoleCollapse: value.allowLossyDeveloperRoleCollapse,
-        });
+        const updateInput: Parameters<typeof updatePool.mutateAsync>[0] = { id: pool.id };
+        Object.assign(updateInput, identity, media, routing, capacityPolicy);
+        await updatePool.mutateAsync(updateInput);
+        toast.success(t("dashboard:pools.updated"));
+        onSuccess();
       }
     },
   });
@@ -3088,93 +1820,34 @@ function PoolForm({
       onSubmit={(event) => {
         event.preventDefault();
         event.stopPropagation();
-        form.handleSubmit();
+        void form.handleSubmit().catch(() => undefined);
       }}
     >
-      <form.Field name="slug">
-        {(field) => (
-          <div className="space-y-2">
-            <Label htmlFor={field.name}>{t("dashboard:pools.slug")}</Label>
-            <Input
-              id={field.name}
-              name={field.name}
-              value={field.state.value}
-              onBlur={field.handleBlur}
-              onChange={(event) => field.handleChange(event.target.value)}
-              inputMode="text"
-              autoComplete="off"
-            />
-            {field.state.meta.errors.map((error) => (
-              <p key={error?.message} className="text-sm text-destructive">
-                {error?.message}
-              </p>
-            ))}
-          </div>
-        )}
-      </form.Field>
-      <form.Field name="optimisticBasicTranscription">
-        {(field) => (
-          <div>
-            <label className="flex min-h-11 items-center gap-3 text-sm">
-              <input
-                type="checkbox"
-                className="size-4"
-                checked={field.state.value}
-                onBlur={field.handleBlur}
-                onChange={(event) => field.handleChange(event.target.checked)}
-              />
-              {t("dashboard:pools.optimisticBasicTranscription")}
-            </label>
-            <p className="text-xs text-muted-foreground">
-              {t("dashboard:pools.optimisticBasicTranscriptionHint")}
-            </p>
-          </div>
-        )}
-      </form.Field>
-
-      <div className="space-y-3 rounded-md border p-3">
-        <div>
-          <h4 className="text-sm font-medium">{t("dashboard:pools.protocolCompatibility")}</h4>
-          <p className="mt-1 text-xs text-muted-foreground">
-            {t("dashboard:pools.protocolCompatibilityHint")}
-          </p>
-        </div>
-        <form.Field name="recommendedSurfaceOverride">
+      {show("identity") ? (
+        <form.Field name="slug">
           {(field) => (
             <div className="space-y-2">
-              <Label htmlFor={field.name}>{t("dashboard:pools.recommendedSurfaceOverride")}</Label>
-              <select
+              <Label htmlFor={field.name}>{t("dashboard:pools.slug")}</Label>
+              <Input
                 id={field.name}
-                className="flex h-11 w-full rounded-md border border-input bg-transparent px-3 text-sm"
+                name={field.name}
                 value={field.state.value}
-                onChange={(event) =>
-                  field.handleChange(event.target.value as typeof field.state.value)
-                }
-              >
-                <option value="">{t("dashboard:pools.recommendedAutomatic")}</option>
-                {poolSurfaceValues.map((surface) => (
-                  <option key={surface} value={surface}>
-                    {t(`dashboard:pools.wizard.surfaces.${surface}`)}
-                  </option>
-                ))}
-              </select>
+                onBlur={field.handleBlur}
+                onChange={(event) => field.handleChange(event.target.value)}
+                inputMode="text"
+                autoComplete="off"
+              />
+              {field.state.meta.errors.map((error) => (
+                <p key={error?.message} className="text-sm text-destructive">
+                  {error?.message}
+                </p>
+              ))}
             </div>
           )}
         </form.Field>
-        <form.Field name="protocolAdaptationEnabled">
-          {(field) => (
-            <label className="flex min-h-11 items-center gap-3 text-sm">
-              <input
-                type="checkbox"
-                className="size-4"
-                checked={field.state.value}
-                onChange={(event) => field.handleChange(event.target.checked)}
-              />
-              {t("dashboard:pools.enableProtocolAdaptation")}
-            </label>
-          )}
-        </form.Field>
-        <form.Field name="allowLossyDeveloperRoleCollapse">
+      ) : null}
+      {show("media") ? (
+        <form.Field name="optimisticBasicTranscription">
           {(field) => (
             <div>
               <label className="flex min-h-11 items-center gap-3 text-sm">
@@ -3182,110 +1855,177 @@ function PoolForm({
                   type="checkbox"
                   className="size-4"
                   checked={field.state.value}
+                  onBlur={field.handleBlur}
                   onChange={(event) => field.handleChange(event.target.checked)}
                 />
-                {t("dashboard:pools.allowLossyDeveloperRoleCollapse")}
+                {t("dashboard:pools.optimisticBasicTranscription")}
               </label>
-              <p className="text-xs text-destructive">
-                {t("dashboard:pools.lossyDeveloperRoleWarning")}
+              <p className="text-xs text-muted-foreground">
+                {t("dashboard:pools.optimisticBasicTranscriptionHint")}
               </p>
             </div>
           )}
         </form.Field>
-      </div>
+      ) : null}
 
-      <details className="rounded-md border p-3">
-        <summary className="min-h-11 cursor-pointer py-2 text-sm font-medium">
-          {t("dashboard:pools.affinity.title")}
-        </summary>
-        <p className="mb-3 text-xs text-muted-foreground">
-          {t("dashboard:pools.affinity.description")}
-        </p>
-        <form.Field name="affinityEnabled">
-          {(field) => (
-            <label className="flex min-h-11 items-center gap-3 text-sm">
-              <input
-                type="checkbox"
-                className="size-4"
-                checked={field.state.value}
-                onChange={(event) => field.handleChange(event.target.checked)}
-              />
-              {t("dashboard:pools.affinity.enabled")}
-            </label>
-          )}
-        </form.Field>
-        <div className="mt-3 grid gap-4 sm:grid-cols-2">
-          {(
-            [
-              "affinityTtlSeconds",
-              "affinityMaxRecords",
-              "affinityPrefixWeight",
-              "affinityConversationWeight",
-              "affinityLoadPenaltyWeight",
-            ] as const
-          ).map((name) => (
-            <form.Field key={name} name={name}>
-              {(field) => (
-                <div className="min-w-0 space-y-2">
-                  <Label htmlFor={name}>{t(`dashboard:pools.affinity.fields.${name}`)}</Label>
-                  <Input
-                    id={name}
-                    className="min-h-11"
-                    type="number"
-                    value={field.state.value}
-                    min={
-                      name === "affinityTtlSeconds" ? 60 : name === "affinityMaxRecords" ? 100 : 0
-                    }
-                    max={
-                      name === "affinityTtlSeconds"
-                        ? 604800
-                        : name === "affinityMaxRecords"
-                          ? 100000
-                          : 10000
-                    }
-                    onChange={(event) => field.handleChange(Number(event.target.value))}
-                  />
-                </div>
-              )}
-            </form.Field>
-          ))}
-        </div>
-        <p className="mt-3 text-xs text-muted-foreground">
-          {t("dashboard:pools.affinity.privacy")}
-        </p>
-        {pool ? (
-          <div className="mt-3 flex min-w-0 flex-wrap items-center justify-between gap-3 border-t pt-3 text-xs text-muted-foreground">
-            <span>
-              {t("dashboard:pools.affinity.stats", {
-                records: affinityStats.data?.activeRecords ?? 0,
-                targets: affinityStats.data?.targets.length ?? 0,
-              })}
-            </span>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="min-h-11"
-              disabled={clearAffinity.isPending || !affinityStats.data?.activeRecords}
-              onClick={() => clearAffinity.mutate({ poolId: pool.id })}
-            >
-              {t("dashboard:pools.affinity.clear")}
-            </Button>
+      {show("routing") ? (
+        <div className="space-y-3 rounded-md border p-3">
+          <div>
+            <h4 className="text-sm font-medium">{t("dashboard:pools.protocolCompatibility")}</h4>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {t("dashboard:pools.protocolCompatibilityHint")}
+            </p>
           </div>
-        ) : null}
-      </details>
+          <form.Field name="recommendedSurfaceOverride">
+            {(field) => (
+              <div className="space-y-2">
+                <Label htmlFor={field.name}>
+                  {t("dashboard:pools.recommendedSurfaceOverride")}
+                </Label>
+                <select
+                  id={field.name}
+                  className="flex h-11 w-full rounded-md border border-input bg-transparent px-3 text-sm"
+                  value={field.state.value}
+                  onChange={(event) =>
+                    field.handleChange(event.target.value as typeof field.state.value)
+                  }
+                >
+                  <option value="">{t("dashboard:pools.recommendedAutomatic")}</option>
+                  {poolSurfaceValues.map((surface) => (
+                    <option key={surface} value={surface}>
+                      {t(`dashboard:pools.wizard.surfaces.${surface}`)}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+          </form.Field>
+          <form.Subscribe
+            selector={(state) => ({
+              adaptation: state.values.protocolAdaptationEnabled,
+              lossy: state.values.allowLossyDeveloperRoleCollapse,
+            })}
+          >
+            {({ adaptation, lossy }) => (
+              <ProtocolCompatibilityRadio
+                adaptationEnabled={adaptation}
+                allowLossyDeveloperRoleCollapse={lossy}
+                protocolAdaptationAvailable={protocolAdaptationAvailable}
+                idPrefix="pool"
+                onChange={(value) => {
+                  form.setFieldValue("protocolAdaptationEnabled", value.adaptationEnabled);
+                  form.setFieldValue(
+                    "allowLossyDeveloperRoleCollapse",
+                    value.allowLossyDeveloperRoleCollapse,
+                  );
+                }}
+              />
+            )}
+          </form.Subscribe>
+        </div>
+      ) : null}
 
-      {mode === "edit" ? (
+      {show("routing") ? (
         <details className="rounded-md border p-3">
+          <summary className="min-h-11 cursor-pointer py-2 text-sm font-medium">
+            {t("dashboard:pools.affinity.title")}
+          </summary>
+          <p className="mb-3 text-xs text-muted-foreground">
+            {t("dashboard:pools.affinity.description")}
+          </p>
+          <form.Field name="affinityEnabled">
+            {(field) => (
+              <label className="flex min-h-11 items-center gap-3 text-sm">
+                <input
+                  type="checkbox"
+                  className="size-4"
+                  checked={field.state.value}
+                  onChange={(event) => field.handleChange(event.target.checked)}
+                />
+                {t("dashboard:pools.affinity.enabled")}
+              </label>
+            )}
+          </form.Field>
+          <div className="mt-3 grid gap-4 sm:grid-cols-2">
+            {(
+              [
+                "affinityTtlSeconds",
+                "affinityMaxRecords",
+                "affinityPrefixWeight",
+                "affinityConversationWeight",
+                "affinityLoadPenaltyWeight",
+              ] as const
+            ).map((name) => (
+              <form.Field key={name} name={name}>
+                {(field) => (
+                  <div className="min-w-0 space-y-2">
+                    <Label htmlFor={name}>{t(`dashboard:pools.affinity.fields.${name}`)}</Label>
+                    <Input
+                      id={name}
+                      className="min-h-11"
+                      type="number"
+                      value={field.state.value}
+                      min={
+                        name === "affinityTtlSeconds" ? 60 : name === "affinityMaxRecords" ? 100 : 0
+                      }
+                      max={
+                        name === "affinityTtlSeconds"
+                          ? 604800
+                          : name === "affinityMaxRecords"
+                            ? 100000
+                            : 10000
+                      }
+                      onChange={(event) => field.handleChange(Number(event.target.value))}
+                    />
+                  </div>
+                )}
+              </form.Field>
+            ))}
+          </div>
+          <p className="mt-3 text-xs text-muted-foreground">
+            {t("dashboard:pools.affinity.privacy")}
+          </p>
+          {pool ? (
+            <div className="mt-3 flex min-w-0 flex-wrap items-center justify-between gap-3 border-t pt-3 text-xs text-muted-foreground">
+              <span>
+                {t("dashboard:pools.affinity.stats", {
+                  records: affinityStats.data?.activeRecords ?? 0,
+                  targets: affinityStats.data?.targets.length ?? 0,
+                })}
+              </span>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="min-h-11"
+                disabled={clearAffinity.isPending || !affinityStats.data?.activeRecords}
+                onClick={() => clearAffinity.mutate({ poolId: pool.id })}
+              >
+                {t("dashboard:pools.affinity.clear")}
+              </Button>
+            </div>
+          ) : null}
+        </details>
+      ) : null}
+
+      {show("capacity") ? (
+        <details className="rounded-md border p-3" open>
           <summary className="min-h-11 cursor-pointer py-2 text-sm font-medium">
             {t("dashboard:pools.capacity.poolPolicy")}
           </summary>
           <p className="mb-3 text-xs text-muted-foreground">
             {t("dashboard:pools.capacity.poolPolicyHint", { count: capacities.length })}
           </p>
-          <div className="grid gap-4 sm:grid-cols-2">
-            {(["capacityPriority", "capacityReservedSlots", "capacityContextMargin"] as const).map(
-              (name) => (
+          {!capacityEnabled ? (
+            <p className="mb-3 rounded-md bg-muted/40 p-3 text-sm text-muted-foreground">
+              {t(capacityUnavailableReasonKey(capacityAvailability))}
+            </p>
+          ) : null}
+          <fieldset disabled={!capacityEnabled} className="min-w-0 disabled:opacity-60">
+            <div className="grid gap-4 sm:grid-cols-2">
+              {(
+                ["capacityPriority", "capacityReservedSlots", "capacityContextMargin"] as const
+              ).map((name) => (
                 <form.Field key={name} name={name}>
                   {(field) => (
                     <div className="space-y-2">
@@ -3302,167 +2042,175 @@ function PoolForm({
                     </div>
                   )}
                 </form.Field>
-              ),
-            )}
-            {(
-              [
-                ["capacityConcurrencyMode", "capacityConcurrencyLimit"],
-                ["capacityWaitBudgetMode", "capacityWaitBudgetMs"],
-                ["capacityContextCeilingMode", "capacityContextCeiling"],
-              ] as const
-            ).map(([modeName, valueName]) => (
-              <form.Field key={modeName} name={modeName}>
-                {(modeField) => (
-                  <div className="min-w-0 space-y-2">
-                    <Label htmlFor={modeName}>
-                      {t(`dashboard:pools.capacity.fields.${valueName}`)}
+              ))}
+              {(
+                [
+                  ["capacityConcurrencyMode", "capacityConcurrencyLimit"],
+                  ["capacityWaitBudgetMode", "capacityWaitBudgetMs"],
+                  ["capacityContextCeilingMode", "capacityContextCeiling"],
+                ] as const
+              ).map(([modeName, valueName]) => (
+                <form.Field key={modeName} name={modeName}>
+                  {(modeField) => (
+                    <div className="min-w-0 space-y-2">
+                      <Label htmlFor={modeName}>
+                        {t(`dashboard:pools.capacity.fields.${valueName}`)}
+                      </Label>
+                      <select
+                        id={modeName}
+                        className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+                        value={modeField.state.value}
+                        onChange={(event) =>
+                          modeField.handleChange(event.target.value as FiniteLimitMode)
+                        }
+                      >
+                        <option value="LIMITED">
+                          {t("dashboard:pools.capacity.modes.limited")}
+                        </option>
+                        <option value="UNLIMITED">
+                          {t("dashboard:pools.capacity.modes.unlimited")}
+                        </option>
+                      </select>
+                      {modeField.state.value === "LIMITED" ? (
+                        <form.Field name={valueName}>
+                          {(field) => (
+                            <Input
+                              className="min-h-11"
+                              type="number"
+                              min={valueName === "capacityWaitBudgetMs" ? 0 : 1}
+                              value={field.state.value}
+                              onChange={(event) => field.handleChange(Number(event.target.value))}
+                              aria-label={t("dashboard:pools.capacity.limitValue")}
+                            />
+                          )}
+                        </form.Field>
+                      ) : null}
+                    </div>
+                  )}
+                </form.Field>
+              ))}
+              <form.Field name="capacityBorrowPolicy">
+                {(field) => (
+                  <div className="space-y-2">
+                    <Label htmlFor="capacityBorrowPolicy">
+                      {t("dashboard:pools.capacity.fields.capacityBorrowPolicy")}
                     </Label>
                     <select
-                      id={modeName}
+                      id="capacityBorrowPolicy"
                       className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
-                      value={modeField.state.value}
+                      value={field.state.value}
                       onChange={(event) =>
-                        modeField.handleChange(event.target.value as FiniteLimitMode)
+                        field.handleChange(event.target.value as "NEVER" | "WHEN_IDLE")
                       }
                     >
-                      <option value="LIMITED">{t("dashboard:pools.capacity.modes.limited")}</option>
-                      <option value="UNLIMITED">
-                        {t("dashboard:pools.capacity.modes.unlimited")}
-                      </option>
+                      <option value="WHEN_IDLE">{t("dashboard:pools.capacity.borrowIdle")}</option>
+                      <option value="NEVER">{t("dashboard:pools.capacity.borrowNever")}</option>
                     </select>
-                    {modeField.state.value === "LIMITED" ? (
-                      <form.Field name={valueName}>
-                        {(field) => (
-                          <Input
-                            className="min-h-11"
-                            type="number"
-                            min={valueName === "capacityWaitBudgetMs" ? 0 : 1}
-                            value={field.state.value}
-                            onChange={(event) => field.handleChange(Number(event.target.value))}
-                            aria-label={t("dashboard:pools.capacity.limitValue")}
-                          />
-                        )}
-                      </form.Field>
-                    ) : null}
                   </div>
                 )}
               </form.Field>
-            ))}
-            <form.Field name="capacityBorrowPolicy">
-              {(field) => (
-                <div className="space-y-2">
-                  <Label htmlFor="capacityBorrowPolicy">
-                    {t("dashboard:pools.capacity.fields.capacityBorrowPolicy")}
-                  </Label>
-                  <select
-                    id="capacityBorrowPolicy"
-                    className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
-                    value={field.state.value}
-                    onChange={(event) =>
-                      field.handleChange(event.target.value as "NEVER" | "WHEN_IDLE")
-                    }
+            </div>
+            <form.Subscribe
+              selector={(state) =>
+                state.values.capacityConcurrencyMode === "UNLIMITED" ||
+                state.values.capacityWaitBudgetMode === "UNLIMITED" ||
+                state.values.capacityContextCeilingMode === "UNLIMITED"
+              }
+            >
+              {(hasUnlimited) =>
+                hasUnlimited ? (
+                  <p
+                    className="mt-3 rounded-md bg-amber-500/10 p-3 text-sm text-amber-900 dark:text-amber-100"
+                    role="alert"
                   >
-                    <option value="WHEN_IDLE">{t("dashboard:pools.capacity.borrowIdle")}</option>
-                    <option value="NEVER">{t("dashboard:pools.capacity.borrowNever")}</option>
-                  </select>
-                </div>
-              )}
-            </form.Field>
-          </div>
-          <form.Subscribe
-            selector={(state) =>
-              state.values.capacityConcurrencyMode === "UNLIMITED" ||
-              state.values.capacityWaitBudgetMode === "UNLIMITED" ||
-              state.values.capacityContextCeilingMode === "UNLIMITED"
-            }
-          >
-            {(hasUnlimited) =>
-              hasUnlimited ? (
-                <p
-                  className="mt-3 rounded-md bg-amber-500/10 p-3 text-sm text-amber-900 dark:text-amber-100"
-                  role="alert"
-                >
-                  {t("dashboard:pools.capacity.unlimitedWarning")}
-                </p>
-              ) : null
-            }
-          </form.Subscribe>
+                    {t("dashboard:pools.capacity.unlimitedWarning")}
+                  </p>
+                ) : null
+              }
+            </form.Subscribe>
+          </fieldset>
         </details>
       ) : null}
 
-      <form.Field name="name">
-        {(field) => (
-          <div className="space-y-2">
-            <Label htmlFor={field.name}>{t("dashboard:pools.name")}</Label>
-            <Input
-              id={field.name}
-              name={field.name}
-              value={field.state.value}
-              onBlur={field.handleBlur}
-              onChange={(event) => field.handleChange(event.target.value)}
-              inputMode="text"
-              autoComplete="off"
-            />
-            {field.state.meta.errors.map((error) => (
-              <p key={error?.message} className="text-sm text-destructive">
-                {error?.message}
-              </p>
-            ))}
-          </div>
-        )}
-      </form.Field>
+      {show("identity") ? (
+        <form.Field name="name">
+          {(field) => (
+            <div className="space-y-2">
+              <Label htmlFor={field.name}>{t("dashboard:pools.name")}</Label>
+              <Input
+                id={field.name}
+                name={field.name}
+                value={field.state.value}
+                onBlur={field.handleBlur}
+                onChange={(event) => field.handleChange(event.target.value)}
+                inputMode="text"
+                autoComplete="off"
+              />
+              {field.state.meta.errors.map((error) => (
+                <p key={error?.message} className="text-sm text-destructive">
+                  {error?.message}
+                </p>
+              ))}
+            </div>
+          )}
+        </form.Field>
+      ) : null}
 
-      <form.Field name="description">
-        {(field) => (
-          <div className="space-y-2">
-            <Label htmlFor={field.name}>{t("dashboard:pools.descriptionField")}</Label>
-            <Textarea
-              id={field.name}
-              name={field.name}
-              value={field.state.value}
-              onBlur={field.handleBlur}
-              onChange={(event) => field.handleChange(event.target.value)}
-              autoComplete="off"
-              rows={4}
-            />
-            {field.state.meta.errors.map((error) => (
-              <p key={error?.message} className="text-sm text-destructive">
-                {error?.message}
-              </p>
-            ))}
-          </div>
-        )}
-      </form.Field>
+      {show("identity") ? (
+        <form.Field name="description">
+          {(field) => (
+            <div className="space-y-2">
+              <Label htmlFor={field.name}>{t("dashboard:pools.descriptionField")}</Label>
+              <Textarea
+                id={field.name}
+                name={field.name}
+                value={field.state.value}
+                onBlur={field.handleBlur}
+                onChange={(event) => field.handleChange(event.target.value)}
+                autoComplete="off"
+                rows={4}
+              />
+              {field.state.meta.errors.map((error) => (
+                <p key={error?.message} className="text-sm text-destructive">
+                  {error?.message}
+                </p>
+              ))}
+            </div>
+          )}
+        </form.Field>
+      ) : null}
 
-      <form.Field name="maxAttachmentMiB">
-        {(field) => (
-          <div className="space-y-2">
-            <Label htmlFor={field.name}>{t("dashboard:pools.attachmentLimit")}</Label>
-            <Input
-              id={field.name}
-              name={field.name}
-              className="min-h-11 max-w-48"
-              type="number"
-              min={1}
-              inputMode="numeric"
-              placeholder={t("dashboard:pools.attachmentLimitInherit")}
-              value={field.state.value}
-              onBlur={field.handleBlur}
-              onChange={(event) => field.handleChange(event.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">
-              {t("dashboard:pools.attachmentLimitHint")}
-            </p>
-            {field.state.meta.errors.map((error) => (
-              <p key={error?.message} className="text-sm text-destructive">
-                {error?.message}
+      {show("media") ? (
+        <form.Field name="maxAttachmentMiB">
+          {(field) => (
+            <div className="space-y-2">
+              <Label htmlFor={field.name}>{t("dashboard:pools.attachmentLimit")}</Label>
+              <Input
+                id={field.name}
+                name={field.name}
+                className="min-h-11 max-w-48"
+                type="number"
+                min={1}
+                inputMode="numeric"
+                placeholder={t("dashboard:pools.attachmentLimitInherit")}
+                value={field.state.value}
+                onBlur={field.handleBlur}
+                onChange={(event) => field.handleChange(event.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">
+                {t("dashboard:pools.attachmentLimitHint")}
               </p>
-            ))}
-          </div>
-        )}
-      </form.Field>
+              {field.state.meta.errors.map((error) => (
+                <p key={error?.message} className="text-sm text-destructive">
+                  {error?.message}
+                </p>
+              ))}
+            </div>
+          )}
+        </form.Field>
+      ) : null}
 
-      {mode === "edit" ? (
+      {show("media") ? (
         <div className="space-y-4 rounded-md border p-3">
           <div>
             <h4 className="text-sm font-medium">{t("dashboard:pools.transformerTitle")}</h4>
@@ -3681,15 +2429,26 @@ function PoolForm({
         selector={(state) => ({ canSubmit: state.canSubmit, isSubmitting: state.isSubmitting })}
       >
         {({ canSubmit, isSubmitting }) => (
-          <Button type="submit" size="touch" disabled={!canSubmit || isSubmitting}>
-            {isSubmitting ? t("common:actions.saving") : t("common:actions.save")}
-          </Button>
+          <div
+            className={cn(
+              stickySave &&
+                "sticky bottom-0 z-10 -mx-1 border-t bg-background/95 px-1 py-[max(0.75rem,var(--safe-area-bottom))]",
+            )}
+          >
+            <Button type="submit" size="touch" disabled={!canSubmit || isSubmitting}>
+              {isSubmitting ? t("common:actions.saving") : t("common:actions.save")}
+            </Button>
+          </div>
         )}
       </form.Subscribe>
     </form>
   );
 }
 
+/**
+ * Existing-pool member editor. This deliberately remains separate from PoolForm:
+ * members are lifecycle records, while PoolForm owns pool metadata and policy.
+ */
 function CapacityPolicyModeField({
   id,
   label,
@@ -3743,12 +2502,13 @@ function CapacityPolicyModeField({
   );
 }
 
-function PoolMemberForm({
+export function PoolMemberForm({
   mode,
   poolId,
   member,
   directModels,
   capacities,
+  capacityAvailability,
   onSuccess,
 }: {
   mode: "create" | "edit";
@@ -3756,10 +2516,13 @@ function PoolMemberForm({
   member?: PoolMember;
   directModels: ReturnType<typeof allDirectModels>;
   capacities: CapacityRow[];
+  capacityAvailability: CapacityAvailability;
   onSuccess: () => void;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
+  const capacityEnabled = capacityAvailability === "enabled";
   const queryClient = useQueryClient();
+  const selectId = useId();
   const [discoveredModelId, setDiscoveredModelId] = useState(directModels[0]?.id ?? "");
   const [weight, setWeight] = useState(String(member?.weight ?? 1));
   const [routingStatus, setRoutingStatus] = useState<RoutingStatus>(() =>
@@ -3801,20 +2564,17 @@ function PoolMemberForm({
   const [borrow, setBorrow] = useState<"NEVER" | "WHEN_IDLE">(
     member?.capacityBorrowPolicy === "NEVER" ? "NEVER" : "WHEN_IDLE",
   );
-  const selectId = useId();
   const createMember = useMutation(
     orpc.forwarderManagement.addPoolMember.mutationOptions({
       onSuccess: () => {
-        queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
-        toast.success(t("dashboard:pools.memberAdded"));
+        void queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
       },
     }),
   );
   const updateMember = useMutation(
     orpc.forwarderManagement.updatePoolMember.mutationOptions({
       onSuccess: () => {
-        queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
-        toast.success(t("dashboard:pools.memberUpdated"));
+        void queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
       },
     }),
   );
@@ -3822,7 +2582,6 @@ function PoolMemberForm({
     orpc.capacityManagement.updateMemberPolicy.mutationOptions(),
   );
   const attachCapacity = useMutation(orpc.capacityManagement.updateDirectPolicy.mutationOptions());
-  const isPending = createMember.isPending || updateMember.isPending;
   const parsedWeight = Number.parseInt(weight, 10);
   const hardLimit = capacityId
     ? (capacities.find((capacity) => capacity.id === capacityId)?.hardConcurrencyLimit ?? null)
@@ -3849,7 +2608,18 @@ function PoolMemberForm({
     parsedWeight <= 10_000 &&
     !(memberTier === "PRIMARY" && routingStatus === "ACTIVE" && parsedWeight === 0) &&
     (mode === "edit" || discoveredModelId.length > 0) &&
-    memberPolicyValid;
+    (!capacityEnabled || memberPolicyValid);
+  const isPending = createMember.isPending || updateMember.isPending;
+
+  class MutationFailure extends Error {}
+
+  async function runMutation<T>(mutation: () => Promise<T>): Promise<T> {
+    try {
+      return await mutation();
+    } catch {
+      throw new MutationFailure();
+    }
+  }
 
   return (
     <form
@@ -3857,87 +2627,125 @@ function PoolMemberForm({
       onSubmit={async (event) => {
         event.preventDefault();
         if (!canSubmit) return;
-        if (mode === "create" && poolId) {
-          const created = await createMember.mutateAsync({
-            poolId,
-            discoveredModelId,
-            weight: parsedWeight,
-            routingStatus,
-          });
-          await updateMemberPolicy.mutateAsync(
-            memberPolicyPayload({
-              poolMemberId: created.id,
-              priority,
-              concurrency,
-              reserved: reservedSlots,
-              wait: waitBudget,
-              ceiling: contextCeiling,
-              margin: contextMargin,
-              borrow,
-              priorityMode,
-              concurrencyMode,
-              reservedMode,
-              waitMode,
-              ceilingMode,
-              marginMode,
-              borrowMode,
-            }),
-          );
-          await attachCapacity.mutateAsync({
-            executionTargetId: created.executionTargetId,
-            inferenceCapacityId: capacityId || null,
-          });
-          queryClient.invalidateQueries({ queryKey: orpc.capacityManagement.key() });
-          onSuccess();
-        }
-        if (mode === "edit" && member) {
-          if (member.providerModel) {
-            await updateMember.mutateAsync({
-              id: member.id,
-              tier: memberTier,
-              weight: parsedWeight,
-              routingStatus,
-              capacityPriority: priorityMode === "INHERIT" ? null : Number(priority),
-              capacityConcurrencyMode: concurrencyMode,
-              capacityConcurrencyLimit: concurrencyMode === "LIMITED" ? Number(concurrency) : null,
-              capacityReservedSlots: reservedMode === "INHERIT" ? null : Number(reservedSlots),
-              capacityBorrowPolicy: borrowMode === "INHERIT" ? null : borrow,
-              capacityWaitBudgetMode: waitMode,
-              capacityWaitBudgetMs: waitMode === "LIMITED" ? Number(waitBudget) : null,
-              capacityContextCeilingMode: ceilingMode,
-              capacityContextCeiling: ceilingMode === "LIMITED" ? Number(contextCeiling) : null,
-              capacityContextMargin: marginMode === "INHERIT" ? null : Number(contextMargin),
-            });
-          } else {
-            await updateMember.mutateAsync({ id: member.id, weight: parsedWeight, routingStatus });
-            await updateMemberPolicy.mutateAsync(
-              memberPolicyPayload({
-                poolMemberId: member.id,
-                priority,
-                concurrency,
-                reserved: reservedSlots,
-                wait: waitBudget,
-                ceiling: contextCeiling,
-                margin: contextMargin,
-                borrow,
-                priorityMode,
-                concurrencyMode,
-                reservedMode,
-                waitMode,
-                ceilingMode,
-                marginMode,
-                borrowMode,
+        try {
+          if (mode === "create" && poolId) {
+            const created = await runMutation(() =>
+              createMember.mutateAsync({
+                poolId,
+                discoveredModelId,
+                weight: parsedWeight,
+                routingStatus,
               }),
             );
+            if (capacityEnabled) {
+              await runMutation(() =>
+                updateMemberPolicy.mutateAsync(
+                  memberPolicyPayload({
+                    poolMemberId: created.id,
+                    priority,
+                    concurrency,
+                    reserved: reservedSlots,
+                    wait: waitBudget,
+                    ceiling: contextCeiling,
+                    margin: contextMargin,
+                    borrow,
+                    priorityMode,
+                    concurrencyMode,
+                    reservedMode,
+                    waitMode,
+                    ceilingMode,
+                    marginMode,
+                    borrowMode,
+                  }),
+                ),
+              );
+              const createdExecutionTargetId = created.executionTargetId;
+              if (createdExecutionTargetId) {
+                await runMutation(() =>
+                  attachCapacity.mutateAsync({
+                    executionTargetId: createdExecutionTargetId,
+                    inferenceCapacityId: capacityId || null,
+                  }),
+                );
+              }
+              await queryClient.invalidateQueries({ queryKey: orpc.capacityManagement.key() });
+            }
+            toast.success(t("dashboard:pools.memberAdded"));
+            onSuccess();
           }
-          if (member.executionTargetId && !member.providerModel) {
-            await attachCapacity.mutateAsync({
-              executionTargetId: member.executionTargetId,
-              inferenceCapacityId: capacityId || null,
-            });
+          if (mode === "edit" && member) {
+            if (member.providerModel) {
+              await runMutation(() =>
+                updateMember.mutateAsync({
+                  id: member.id,
+                  tier: memberTier,
+                  weight: parsedWeight,
+                  routingStatus,
+                  ...(capacityEnabled
+                    ? {
+                        capacityPriority: priorityMode === "INHERIT" ? null : Number(priority),
+                        capacityConcurrencyMode: concurrencyMode,
+                        capacityConcurrencyLimit:
+                          concurrencyMode === "LIMITED" ? Number(concurrency) : null,
+                        capacityReservedSlots:
+                          reservedMode === "INHERIT" ? null : Number(reservedSlots),
+                        capacityBorrowPolicy: borrowMode === "INHERIT" ? null : borrow,
+                        capacityWaitBudgetMode: waitMode,
+                        capacityWaitBudgetMs: waitMode === "LIMITED" ? Number(waitBudget) : null,
+                        capacityContextCeilingMode: ceilingMode,
+                        capacityContextCeiling:
+                          ceilingMode === "LIMITED" ? Number(contextCeiling) : null,
+                        capacityContextMargin:
+                          marginMode === "INHERIT" ? null : Number(contextMargin),
+                      }
+                    : {}),
+                }),
+              );
+            } else {
+              await runMutation(() =>
+                updateMember.mutateAsync({ id: member.id, weight: parsedWeight, routingStatus }),
+              );
+              if (capacityEnabled) {
+                await runMutation(() =>
+                  updateMemberPolicy.mutateAsync(
+                    memberPolicyPayload({
+                      poolMemberId: member.id,
+                      priority,
+                      concurrency,
+                      reserved: reservedSlots,
+                      wait: waitBudget,
+                      ceiling: contextCeiling,
+                      margin: contextMargin,
+                      borrow,
+                      priorityMode,
+                      concurrencyMode,
+                      reservedMode,
+                      waitMode,
+                      ceilingMode,
+                      marginMode,
+                      borrowMode,
+                    }),
+                  ),
+                );
+              }
+            }
+            if (capacityEnabled && member.executionTargetId && !member.providerModel) {
+              const memberExecutionTargetId = member.executionTargetId;
+              await runMutation(() =>
+                attachCapacity.mutateAsync({
+                  executionTargetId: memberExecutionTargetId,
+                  inferenceCapacityId: capacityId || null,
+                }),
+              );
+            }
+            if (capacityEnabled) {
+              await queryClient.invalidateQueries({ queryKey: orpc.capacityManagement.key() });
+            }
+            toast.success(t("dashboard:pools.memberUpdated"));
+            onSuccess();
           }
-          queryClient.invalidateQueries({ queryKey: orpc.capacityManagement.key() });
-          onSuccess();
+        } catch (error) {
+          if (!(error instanceof MutationFailure)) toast.error(t("common:somethingWentWrong"));
         }
       }}
     >
@@ -3946,7 +2754,7 @@ function PoolMemberForm({
           <Label htmlFor={selectId}>{t("dashboard:pools.directModel")}</Label>
           <select
             id={selectId}
-            className="h-11 w-full border bg-background px-2 text-xs"
+            className="h-11 w-full rounded-md border bg-background px-3 text-sm"
             value={discoveredModelId}
             onChange={(event) => setDiscoveredModelId(event.target.value)}
           >
@@ -3968,7 +2776,6 @@ function PoolMemberForm({
           </code>
         </div>
       )}
-
       {mode === "edit" && member?.providerModel ? (
         <div className="space-y-2">
           <Label htmlFor="member-tier">{t("dashboard:pools.memberTier")}</Label>
@@ -3976,7 +2783,7 @@ function PoolMemberForm({
             id="member-tier"
             className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
             value={memberTier}
-            onChange={(event) => setMemberTier(event.target.value as "PRIMARY" | "PUBLIC_OVERFLOW")}
+            onChange={(event) => setMemberTier(event.target.value as typeof memberTier)}
           >
             <option value="PRIMARY">{t("dashboard:pools.memberTiers.PRIMARY")}</option>
             <option value="PUBLIC_OVERFLOW">
@@ -3988,22 +2795,30 @@ function PoolMemberForm({
           </p>
         </div>
       ) : null}
-
-      <div className="space-y-2">
-        <Label htmlFor="member-weight">{t("dashboard:pools.weight")}</Label>
-        <Input
-          id="member-weight"
-          value={weight}
-          onChange={(event) => setWeight(event.target.value)}
-          inputMode="numeric"
-          autoComplete="off"
-        />
-      </div>
+      {memberTier !== "PUBLIC_OVERFLOW" ? (
+        <div className="space-y-2">
+          <Label htmlFor="member-weight">{t("dashboard:pools.weight")}</Label>
+          <Input
+            id="member-weight"
+            inputMode="numeric"
+            value={weight}
+            onChange={(event) => setWeight(event.target.value)}
+          />
+        </div>
+      ) : null}
       <details className="rounded-md border p-3">
         <summary className="min-h-11 cursor-pointer py-2 text-sm font-medium">
           {t("dashboard:pools.capacity.memberPolicy")}
         </summary>
-        <div className="grid gap-4 pt-3 sm:grid-cols-2">
+        {!capacityEnabled ? (
+          <p className="pt-3 text-sm text-muted-foreground">
+            {t(capacityUnavailableReasonKey(capacityAvailability))}
+          </p>
+        ) : null}
+        <fieldset
+          disabled={!capacityEnabled}
+          className="grid min-w-0 gap-4 pt-3 disabled:opacity-60 sm:grid-cols-2"
+        >
           <div className="space-y-2 sm:col-span-2">
             <Label htmlFor="member-capacity">{t("dashboard:pools.capacity.attachment")}</Label>
             <select
@@ -4127,20 +2942,20 @@ function PoolMemberForm({
               </select>
             ) : null}
           </div>
-        </div>
+        </fieldset>
       </details>
       <div className="space-y-2">
-        <Label>{t("dashboard:pools.routing")}</Label>
-        <SegmentedControl
+        <Label htmlFor="member-routing">{t("dashboard:pools.routing")}</Label>
+        <select
+          id="member-routing"
+          className="h-11 w-full rounded-md border bg-background px-3 text-sm"
           value={routingStatus}
-          onChange={setRoutingStatus}
-          ariaLabel={t("dashboard:pools.routing")}
-          items={[
-            { value: "ACTIVE", label: t("dashboard:pools.routingActive") },
-            { value: "DRAINING", label: t("dashboard:pools.routingDraining") },
-            { value: "DISABLED", label: t("dashboard:pools.routingDisabled") },
-          ]}
-        />
+          onChange={(event) => setRoutingStatus(event.target.value as RoutingStatus)}
+        >
+          <option value="ACTIVE">{t("dashboard:pools.routingActive")}</option>
+          <option value="DRAINING">{t("dashboard:pools.routingDraining")}</option>
+          <option value="DISABLED">{t("dashboard:pools.routingDisabled")}</option>
+        </select>
       </div>
       <Button type="submit" size="touch" disabled={!canSubmit || isPending}>
         {isPending ? t("common:actions.saving") : t("common:actions.save")}
@@ -4149,7 +2964,7 @@ function PoolMemberForm({
   );
 }
 
-function GrantPoolDialog({
+export function GrantPoolDialog({
   pool,
   onOpenChange,
 }: {
@@ -4158,39 +2973,22 @@ function GrantPoolDialog({
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
+  const [email, setEmail] = useState("");
+  const [publicEgressAcknowledged, setPublicEgressAcknowledged] = useState(false);
   const providerEgress = pool?.members.some((member) => member.providerModel) ?? false;
   const grant = useMutation(
     orpc.forwarderManagement.grantPoolAccessByEmail.mutationOptions({
       onSuccess: () => {
-        queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
+        void queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:pools.grantAdded"));
-        form.reset();
+        setEmail("");
+        setPublicEgressAcknowledged(false);
         onOpenChange(false);
       },
     }),
   );
-  const schema = z
-    .object({
-      email: z.string().trim().email(),
-      publicEgressAcknowledged: z.boolean(),
-    })
-    .superRefine((value, ctx) => {
-      if (providerEgress && !value.publicEgressAcknowledged) {
-        ctx.addIssue({ code: "custom", path: ["publicEgressAcknowledged"] });
-      }
-    });
-  const form = useForm({
-    defaultValues: { email: "", publicEgressAcknowledged: false },
-    validators: { onSubmit: schema },
-    onSubmit: ({ value }) =>
-      pool
-        ? grant.mutateAsync({
-            poolId: pool.id,
-            email: value.email,
-            publicEgressAcknowledged: value.publicEgressAcknowledged,
-          })
-        : Promise.resolve(),
-  });
+  const validEmail =
+    /^\S+@\S+\.\S+$/.test(email.trim()) && (!providerEgress || publicEgressAcknowledged);
 
   return (
     <Dialog open={Boolean(pool)} onOpenChange={onOpenChange}>
@@ -4203,60 +3001,39 @@ function GrantPoolDialog({
           className="space-y-4"
           onSubmit={(event) => {
             event.preventDefault();
-            form.handleSubmit();
+            if (!pool || !validEmail) return;
+            grant.mutate({
+              poolId: pool.id,
+              email: email.trim(),
+              publicEgressAcknowledged,
+            });
           }}
         >
-          <form.Field name="email">
-            {(field) => (
-              <div className="space-y-2">
-                <Label htmlFor="grant-email">{t("dashboard:pools.email")}</Label>
-                <Input
-                  id="grant-email"
-                  type="email"
-                  inputMode="email"
-                  autoComplete="email"
-                  value={field.state.value}
-                  onBlur={field.handleBlur}
-                  onChange={(event) => field.handleChange(event.target.value)}
-                  placeholder="user@example.com"
-                  aria-invalid={field.state.meta.errors.length > 0}
-                />
-                <p className="text-xs text-muted-foreground">
-                  {t("dashboard:pools.exactEmailOnly")}
-                </p>
-              </div>
-            )}
-          </form.Field>
+          <div className="space-y-2">
+            <Label htmlFor="grant-email">{t("dashboard:pools.email")}</Label>
+            <Input
+              id="grant-email"
+              type="email"
+              inputMode="email"
+              autoComplete="email"
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">{t("dashboard:pools.exactEmailOnly")}</p>
+          </div>
           {providerEgress ? (
-            <form.Field name="publicEgressAcknowledged">
-              {(field) => (
-                <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3">
-                  <p className="text-sm font-medium">
-                    {t("dashboard:pools.grantEgressWarningTitle")}
-                  </p>
-                  <p className="mt-1 text-sm text-muted-foreground">
-                    {t("dashboard:pools.grantEgressWarning", { pool: pool?.name ?? "" })}
-                  </p>
-                  <label className="mt-3 flex min-h-11 cursor-pointer items-center gap-3 text-sm">
-                    <Checkbox
-                      checked={field.state.value}
-                      onCheckedChange={(checked) => field.handleChange(checked === true)}
-                      aria-invalid={field.state.meta.errors.length > 0}
-                    />
-                    <span>{t("dashboard:pools.grantEgressAcknowledge")}</span>
-                  </label>
-                </div>
-              )}
-            </form.Field>
+            <label className="flex min-h-11 items-center gap-3 rounded-md border p-3 text-sm">
+              <Checkbox
+                checked={publicEgressAcknowledged}
+                onCheckedChange={(checked) => setPublicEgressAcknowledged(checked === true)}
+              />
+              <span>{t("dashboard:pools.grantEgressAcknowledge")}</span>
+            </label>
           ) : null}
           <DialogFooter>
-            <form.Subscribe selector={(state) => [state.canSubmit, state.isSubmitting]}>
-              {([canSubmit, isSubmitting]) => (
-                <Button type="submit" size="touch" disabled={!canSubmit || isSubmitting}>
-                  {isSubmitting ? t("dashboard:pools.granting") : t("dashboard:pools.grant")}
-                </Button>
-              )}
-            </form.Subscribe>
+            <Button type="submit" size="touch" disabled={!validEmail || grant.isPending}>
+              {grant.isPending ? t("dashboard:pools.granting") : t("dashboard:pools.grant")}
+            </Button>
           </DialogFooter>
         </form>
       </DialogContent>

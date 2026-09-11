@@ -11,11 +11,20 @@ import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
 import {
+  assertCapacityManagementEnabled,
   assertEffectiveConcurrencyPolicy,
   assertEffectiveContextPolicy,
+  assertModelPoolCapacityPolicy,
+  lockAndValidateModelPoolCapacityPolicy,
   lockExecutionTargetIdentities,
   lockExecutionTargetPolicies,
+  modelPoolCapacityPolicyFields,
 } from "../lib/capacity-policy-safety";
+import {
+  type ContextWindowSeedDependent,
+  declaredContextWindow,
+  isContextWindowSeedAdmissible,
+} from "../lib/declared-context-window";
 import {
   getConfiguredMediaAttachmentMaxBytes,
   resolveAttachmentLimit,
@@ -91,6 +100,44 @@ const attachmentLimitSchema = z
   .max(MEDIA_ATTACHMENT_MAX_BYTES_MAX)
   .nullable()
   .optional();
+const poolTransformerFields = {
+  transformerDiscoveredModelId: z.string().min(1).nullable().optional(),
+  transformerSystemPrompt: z.string().max(16_000).nullable().optional(),
+  transformerImages: z.boolean().optional(),
+  transformerAudio: z.boolean().optional(),
+  transformerVideo: z.boolean().optional(),
+  transformerCacheMode: z.enum(["OFF", "MEMORY"]).optional(),
+  transformerIncludePrimaryTools: z.boolean().optional(),
+  transformerMaxTools: z.number().int().min(1).max(128).optional(),
+  transformerMaxToolChars: z.number().int().min(256).max(32_000).optional(),
+  transformerTimeoutMs: z.number().int().min(1_000).max(600_000).nullable().optional(),
+  transformerMaxAssets: z.number().int().min(1).max(64).nullable().optional(),
+};
+function hasModelPoolCapacityPolicy(input: Record<string, unknown>): boolean {
+  return (
+    input.capacityPriority !== undefined ||
+    input.capacityConcurrencyLimit !== undefined ||
+    input.capacityReservedSlots !== undefined ||
+    input.capacityBorrowPolicy !== undefined ||
+    input.capacityWaitBudgetMs !== undefined ||
+    input.capacityContextCeiling !== undefined ||
+    input.capacityContextMargin !== undefined
+  );
+}
+
+function assertLossyDeveloperRoleCollapseRequiresAdaptation({
+  protocolAdaptationEnabled,
+  allowLossyDeveloperRoleCollapse,
+}: {
+  protocolAdaptationEnabled: boolean;
+  allowLossyDeveloperRoleCollapse: boolean;
+}): void {
+  if (allowLossyDeveloperRoleCollapse && !protocolAdaptationEnabled) {
+    throw new ORPCError("BAD_REQUEST", {
+      message: "Lossy developer-role collapse requires protocol adaptation to be enabled.",
+    });
+  }
+}
 
 function assertProviderEgressReleaseGate(): void {
   if (!env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED)
@@ -126,6 +173,91 @@ function assertConcurrencyPolicyWithinHardLimit(input: {
   memberReserved?: number | null;
 }): void {
   assertEffectiveConcurrencyPolicy(input);
+}
+
+/**
+ * Seeds only capacities whose already-locked, fresh policies admit the
+ * declared window. Callers acquire pool row locks first, then one sorted
+ * union of target policy locks, then invoke this helper to read and write.
+ */
+async function seedDeclaredContextWindows({
+  tx,
+  userId,
+  candidates,
+  lockedExecutionTargetIds,
+  additionalDependentsByCapacityId = new Map(),
+}: {
+  tx: Prisma.TransactionClient;
+  userId: string;
+  candidates: ReadonlyMap<string, number>;
+  lockedExecutionTargetIds: ReadonlySet<string>;
+  additionalDependentsByCapacityId?: ReadonlyMap<string, readonly ContextWindowSeedDependent[]>;
+}): Promise<Map<string, number | null>> {
+  if (candidates.size === 0) return new Map();
+  const capacityIds = [...candidates.keys()];
+  const capacities = await tx.inferenceCapacity.findMany({
+    where: { userId, id: { in: capacityIds } },
+    select: {
+      id: true,
+      physicalMaxContext: true,
+      ExecutionTargets: {
+        select: {
+          id: true,
+          directContextCeiling: true,
+          directContextMargin: true,
+          PoolMembers: {
+            select: {
+              capacityContextCeilingMode: true,
+              capacityContextCeiling: true,
+              capacityContextMargin: true,
+              ModelPool: {
+                select: { capacityContextCeiling: true, capacityContextMargin: true },
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+  const physicalByCapacityId = new Map<string, number | null>();
+  for (const capacity of capacities) {
+    if (capacity.ExecutionTargets.some((target) => !lockedExecutionTargetIds.has(target.id))) {
+      throw new Error("A declared context seed was evaluated without every target policy lock.");
+    }
+    const declared = candidates.get(capacity.id);
+    if (declared === undefined) continue;
+    const dependents: ContextWindowSeedDependent[] = capacity.ExecutionTargets.flatMap((target) => [
+      {
+        kind: "direct" as const,
+        contextCeiling: target.directContextCeiling,
+        contextMargin: target.directContextMargin,
+      },
+      ...target.PoolMembers.map(
+        (member): ContextWindowSeedDependent => ({
+          kind: "member",
+          contextCeilingMode: member.capacityContextCeilingMode,
+          contextCeiling: member.capacityContextCeiling,
+          contextMargin: member.capacityContextMargin,
+          poolContextCeiling: member.ModelPool.capacityContextCeiling,
+          poolContextMargin: member.ModelPool.capacityContextMargin,
+        }),
+      ),
+    ]);
+    dependents.push(...(additionalDependentsByCapacityId.get(capacity.id) ?? []));
+    if (
+      capacity.physicalMaxContext === null &&
+      isContextWindowSeedAdmissible(declared, dependents)
+    ) {
+      await tx.inferenceCapacity.updateMany({
+        where: { id: capacity.id, userId, physicalMaxContext: null },
+        data: { physicalMaxContext: declared },
+      });
+      physicalByCapacityId.set(capacity.id, declared);
+    } else {
+      physicalByCapacityId.set(capacity.id, capacity.physicalMaxContext);
+    }
+  }
+  return physicalByCapacityId;
 }
 
 type UserSlugRow = {
@@ -609,6 +741,8 @@ function serializeCliDevice(row: CliDeviceRow, now: Date) {
 }
 
 function serializePool(row: ModelPoolRow) {
+  const protocolAdaptationAvailable = env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED;
+  const adaptationEnabled = row.protocolAdaptationEnabled && protocolAdaptationAvailable;
   const recommendedSurfaceOverride = parseModelApiSurface(row.recommendedSurfaceOverride);
   const memberCapabilities = (model: PoolMemberModelRow) =>
     resolveEffectiveCapabilityMetadata({
@@ -628,7 +762,7 @@ function serializePool(row: ModelPoolRow) {
         tier: member.tier,
         matrix: surfaceAvailabilityMatrix({
           capabilities: memberCapabilities(model),
-          adaptationEnabled: row.protocolAdaptationEnabled,
+          adaptationEnabled,
         }),
       };
     const provider = member.ExecutionTarget?.ProviderModel;
@@ -638,7 +772,7 @@ function serializePool(row: ModelPoolRow) {
         tier: member.tier,
         matrix: surfaceAvailabilityMatrix({
           capabilities: providerInventory,
-          adaptationEnabled: row.protocolAdaptationEnabled,
+          adaptationEnabled,
         }),
       };
     const native =
@@ -665,10 +799,7 @@ function serializePool(row: ModelPoolRow) {
         modelApiSurfaces.map((surface) => {
           const nativeSurface = nativeSurfaces.has(surfaceNames[surface]);
           const adapted =
-            !nativeSurface &&
-            row.protocolAdaptationEnabled &&
-            surface !== "OPENAI_COMPLETIONS" &&
-            adaptable;
+            !nativeSurface && adaptationEnabled && surface !== "OPENAI_COMPLETIONS" && adaptable;
           return [
             surface,
             {
@@ -756,6 +887,7 @@ function serializePool(row: ModelPoolRow) {
     maxAttachmentBytes: row.maxAttachmentBytes,
     optimisticBasicTranscription: row.optimisticBasicTranscription,
     protocolAdaptationEnabled: row.protocolAdaptationEnabled,
+    protocolAdaptationAvailable,
     publicEgressEnabled: row.publicEgressEnabled,
     publicEgressAcknowledged: row.publicEgressAcknowledged,
     allowLossyDeveloperRoleCollapse: row.allowLossyDeveloperRoleCollapse,
@@ -781,8 +913,10 @@ function serializePool(row: ModelPoolRow) {
       suggestedConnectionType: suggestedSurface,
       surfaces,
       warnings: [
-        ...(row.protocolAdaptationEnabled ? ["adaptation_strict_subset"] : []),
-        ...(row.allowLossyDeveloperRoleCollapse ? ["developer_role_collapse_lossy"] : []),
+        ...(adaptationEnabled ? ["adaptation_strict_subset"] : []),
+        ...(adaptationEnabled && row.allowLossyDeveloperRoleCollapse
+          ? ["developer_role_collapse_lossy"]
+          : []),
         ...(recommendedSurfaceOverride &&
         surfaces[recommendedSurfaceOverride].unavailable === row.PoolMembers.length
           ? ["recommended_surface_unavailable"]
@@ -846,9 +980,10 @@ function serializePool(row: ModelPoolRow) {
               endpointId: model.Endpoint.id,
               endpointSlug: model.Endpoint.slug,
               cliDeviceSlug: model.Endpoint.CliDevice.slug,
+              declaredContextWindow: declaredContextWindow(memberCapabilities(model)),
               surfaces: surfaceAvailabilityMatrix({
                 capabilities: memberCapabilities(model),
-                adaptationEnabled: row.protocolAdaptationEnabled,
+                adaptationEnabled,
               }),
             }
           : null,
@@ -893,7 +1028,13 @@ async function ownedPool(poolId: string, userId: string) {
 async function ownedDiscoveredModel(discoveredModelId: string, userId: string) {
   const model = await prisma.discoveredModel.findUnique({
     where: { id: discoveredModelId },
-    select: { id: true, userId: true },
+    select: {
+      id: true,
+      userId: true,
+      capabilityOverrideMode: true,
+      capabilityOverrideMetadata: true,
+      Endpoint: { select: { capabilityMetadata: true } },
+    },
   });
   if (!model || model.userId !== userId) {
     throw new ORPCError("NOT_FOUND", { message: "Discovered model not found." });
@@ -957,6 +1098,35 @@ function assertTransformerMatchesModalities({
   if (errors.length > 0) {
     throw new ORPCError("BAD_REQUEST", { message: errors.join(" ") });
   }
+}
+
+async function assertPoolTransformerIsValid(
+  input: {
+    transformerDiscoveredModelId?: string | null;
+    transformerImages?: boolean;
+    transformerAudio?: boolean;
+    transformerVideo?: boolean;
+  },
+  current: {
+    transformerDiscoveredModelId: string | null;
+    transformerImages: boolean;
+    transformerAudio: boolean;
+    transformerVideo: boolean;
+  },
+  userId: string,
+): Promise<void> {
+  const discoveredModelId =
+    input.transformerDiscoveredModelId !== undefined
+      ? input.transformerDiscoveredModelId
+      : current.transformerDiscoveredModelId;
+  if (!discoveredModelId) return;
+  const caps = await transformerCapabilitiesForOwnedModel(discoveredModelId, userId);
+  assertTransformerMatchesModalities({
+    caps,
+    images: input.transformerImages ?? current.transformerImages,
+    audio: input.transformerAudio ?? current.transformerAudio,
+    video: input.transformerVideo ?? current.transformerVideo,
+  });
 }
 
 async function assertPoolSlugAvailable(slug: string, userId: string, currentPoolId?: string) {
@@ -1269,7 +1439,7 @@ export const forwarderManagementRouter = {
             localModelIds: z.array(idSchema).max(64),
             recommendedSurface: z.enum(modelApiSurfaces),
             memberConcurrencyLimit: z.number().int().min(1).max(10_000),
-            memberContextCeiling: z.number().int().min(1).max(100_000_000),
+            memberContextCeiling: z.number().int().min(1).max(100_000_000).nullable().default(null),
             reservedSlots: z.number().int().min(0).max(10_000),
             localWaitBudgetMs: z.number().int().min(0).max(600_000),
             publicEgressAcknowledged: z.boolean(),
@@ -1302,7 +1472,10 @@ export const forwarderManagementRouter = {
                       reservedSlots: z.number().int().min(0).max(10_000),
                       borrowPolicy: z.enum(["NEVER", "WHEN_IDLE"]),
                       waitBudget: integerRule(600_000),
-                      contextCeiling: integerRule(100_000_000),
+                      contextCeiling: z.union([
+                        z.object({ mode: z.literal("INHERIT"), limitValue: z.null() }),
+                        integerRule(100_000_000),
+                      ]),
                       contextMargin: z.number().int().min(0).max(10_000_000),
                     }),
                   )
@@ -1397,6 +1570,16 @@ export const forwarderManagementRouter = {
     )
     .handler(async ({ input, context }) => {
       if (input.providerModels.length > 0) assertProviderEgressReleaseGate();
+      assertLossyDeveloperRoleCollapseRequiresAdaptation({
+        protocolAdaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
+        allowLossyDeveloperRoleCollapse: input.advanced?.allowLossyDeveloperRoleCollapse ?? false,
+      });
+      assertModelPoolCapacityPolicy({
+        concurrencyLimit: input.memberConcurrencyLimit,
+        reservedSlots: input.reservedSlots,
+        contextCeiling: input.memberContextCeiling,
+        contextMargin: input.advanced?.contextMargin,
+      });
       const userId = context.session.user.id;
       await assertPoolSlugAvailable(input.slug, userId);
       const now = new Date();
@@ -1482,7 +1665,9 @@ export const forwarderManagementRouter = {
                     ? model.capabilityOverrides
                     : model.Endpoint.defaultCapabilities,
                 ),
-              adaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
+              adaptationEnabled:
+                (input.advanced?.protocolAdaptationEnabled ?? false) &&
+                env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
             }),
           ),
           ...providers
@@ -1490,7 +1675,9 @@ export const forwarderManagementRouter = {
             .map((provider) =>
               surfaceAvailabilityMatrix({
                 capabilities: parseOpenAiCompatibleCapabilities(provider.nativeCapabilities),
-                adaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
+                adaptationEnabled:
+                  (input.advanced?.protocolAdaptationEnabled ?? false) &&
+                  env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
               }),
             ),
         ];
@@ -1552,6 +1739,18 @@ export const forwarderManagementRouter = {
               "Every selected local model must already have an explicitly assigned physical capacity.",
           });
         }
+        const declaredContextByModelId = new Map(
+          localModels.map((model) => [
+            model.id,
+            declaredContextWindow(
+              resolveEffectiveCapabilityMetadata({
+                capabilityOverrideMode: model.capabilityOverrideMode,
+                capabilityOverrideMetadata: model.capabilityOverrideMetadata,
+                endpointCapabilityMetadata: model.Endpoint.capabilityMetadata,
+              }),
+            ),
+          ]),
+        );
         const memberOverrideByModelId = new Map(
           input.advanced?.memberOverrides.map((override) => [
             override.discoveredModelId,
@@ -1590,49 +1789,6 @@ export const forwarderManagementRouter = {
               message: "Reserved slots exceed a member concurrency override.",
             });
           }
-          const physicalMaximum = target.InferenceCapacity?.physicalMaxContext;
-          if (
-            override.contextCeiling.mode === "LIMITED" &&
-            physicalMaximum != null &&
-            override.contextCeiling.limitValue + override.contextMargin > physicalMaximum
-          ) {
-            throw new ORPCError("BAD_REQUEST", {
-              message: "A member context override exceeds physical capacity after margin.",
-            });
-          }
-        }
-        if (
-          localTargets.some((target) => {
-            const maximum = target.InferenceCapacity?.physicalMaxContext;
-            return (
-              maximum != null &&
-              input.memberContextCeiling + (input.advanced?.contextMargin ?? 0) > maximum
-            );
-          })
-        ) {
-          throw new ORPCError("BAD_REQUEST", {
-            message: "Member context exceeds a selected model's physical capacity.",
-          });
-        }
-        if (
-          providers.some(
-            (provider) =>
-              primaryProviderIds.has(provider.id) &&
-              provider.contextWindow != null &&
-              input.memberContextCeiling + (input.advanced?.contextMargin ?? 0) >
-                provider.contextWindow,
-          )
-        ) {
-          throw new ORPCError("BAD_REQUEST", {
-            message: "Member context exceeds a selected provider's context window.",
-          });
-        }
-        for (const provider of providers) {
-          assertConcurrencyPolicyWithinHardLimit({
-            hardLimit: provider.concurrencyLimit,
-            poolLimit: input.memberConcurrencyLimit,
-            poolReserved: input.reservedSlots,
-          });
         }
         // Stable mutation order for mixed local/provider setup:
         // identity fences -> target rows (sorted policy locks) -> capacities.
@@ -1657,10 +1813,114 @@ export const forwarderManagementRouter = {
             }),
           ),
         );
-        await lockExecutionTargetPolicies(tx, [
+        const seedCandidates = new Map<string, number>();
+        for (const target of localTargets) {
+          const declared = target.discoveredModelId
+            ? declaredContextByModelId.get(target.discoveredModelId)
+            : null;
+          if (target.inferenceCapacityId && declared != null) {
+            // A shared runtime can be declared by several models. The largest
+            // declared window is the only candidate that cannot tighten one
+            // model relative to another; policy admissibility is checked below.
+            seedCandidates.set(
+              target.inferenceCapacityId,
+              Math.max(seedCandidates.get(target.inferenceCapacityId) ?? 0, declared),
+            );
+          }
+        }
+        const targetsSharingCandidateCapacity =
+          seedCandidates.size > 0
+            ? await tx.executionTarget.findMany({
+                where: {
+                  userId,
+                  inferenceCapacityId: { in: [...seedCandidates.keys()] },
+                },
+                select: { id: true },
+              })
+            : [];
+        // Pool row locks (where applicable) precede this one sorted policy-lock
+        // union: operated targets plus every target sharing a seed candidate.
+        const policyLockTargetIds = new Set([
           ...localTargets.map((target) => target.id),
           ...providerTargets.map((target) => target.id),
+          ...targetsSharingCandidateCapacity.map((target) => target.id),
         ]);
+        await lockExecutionTargetPolicies(tx, [...policyLockTargetIds]);
+        const additionalDependentsByCapacityId = new Map<string, ContextWindowSeedDependent[]>();
+        for (const target of localTargets) {
+          if (!target.inferenceCapacityId) continue;
+          const override = target.discoveredModelId
+            ? memberOverrideByModelId.get(target.discoveredModelId)
+            : undefined;
+          const dependent: ContextWindowSeedDependent = {
+            kind: "member",
+            contextCeilingMode: override?.contextCeiling.mode ?? "INHERIT",
+            contextCeiling:
+              override?.contextCeiling.mode === "LIMITED"
+                ? override.contextCeiling.limitValue
+                : null,
+            contextMargin:
+              override && override.contextCeiling.mode !== "INHERIT"
+                ? override.contextMargin
+                : null,
+            poolContextCeiling: input.memberContextCeiling,
+            poolContextMargin: input.advanced?.contextMargin ?? 0,
+          };
+          const dependents = additionalDependentsByCapacityId.get(target.inferenceCapacityId);
+          if (dependents) dependents.push(dependent);
+          else additionalDependentsByCapacityId.set(target.inferenceCapacityId, [dependent]);
+        }
+        const seededPhysicalByCapacityId = await seedDeclaredContextWindows({
+          tx,
+          userId,
+          candidates: seedCandidates,
+          lockedExecutionTargetIds: policyLockTargetIds,
+          additionalDependentsByCapacityId,
+        });
+        for (const target of localTargets) {
+          const override = target.discoveredModelId
+            ? memberOverrideByModelId.get(target.discoveredModelId)
+            : undefined;
+          const physicalMaximum =
+            target.inferenceCapacityId && seededPhysicalByCapacityId.has(target.inferenceCapacityId)
+              ? seededPhysicalByCapacityId.get(target.inferenceCapacityId)
+              : target.InferenceCapacity?.physicalMaxContext;
+          assertEffectiveContextPolicy({
+            physicalMaxContext: physicalMaximum,
+            poolCeiling: input.memberContextCeiling,
+            poolMargin: input.advanced?.contextMargin ?? 0,
+            memberMode: override?.contextCeiling.mode,
+            memberCeiling:
+              override?.contextCeiling.mode === "LIMITED"
+                ? override.contextCeiling.limitValue
+                : null,
+            memberMargin:
+              override && override.contextCeiling.mode !== "INHERIT"
+                ? override.contextMargin
+                : null,
+          });
+        }
+        if (
+          providers.some(
+            (provider) =>
+              primaryProviderIds.has(provider.id) &&
+              provider.contextWindow != null &&
+              input.memberContextCeiling != null &&
+              input.memberContextCeiling + (input.advanced?.contextMargin ?? 0) >
+                provider.contextWindow,
+          )
+        ) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: "Member context exceeds a selected provider's context window.",
+          });
+        }
+        for (const provider of providers) {
+          assertConcurrencyPolicyWithinHardLimit({
+            hardLimit: provider.concurrencyLimit,
+            poolLimit: input.memberConcurrencyLimit,
+            poolReserved: input.reservedSlots,
+          });
+        }
         const pool = await tx.modelPool.create({
           data: {
             userId,
@@ -1677,9 +1937,7 @@ export const forwarderManagementRouter = {
             capacityReservedSlots: input.reservedSlots,
             capacityWaitBudgetMs: input.localWaitBudgetMs,
             capacityContextCeiling: input.memberContextCeiling,
-            capacityContextMargin:
-              input.advanced?.contextMargin ??
-              Math.min(1024, Math.max(0, input.memberContextCeiling - 1)),
+            capacityContextMargin: input.advanced?.contextMargin ?? 0,
             capacityBorrowPolicy: input.advanced?.borrowPolicy ?? "WHEN_IDLE",
             affinityEnabled: input.advanced?.affinity.enabled ?? false,
             affinityTtlSeconds: input.advanced?.affinity.ttlSeconds ?? 3600,
@@ -1736,9 +1994,14 @@ export const forwarderManagementRouter = {
                       override.contextCeiling.mode === "LIMITED"
                         ? override.contextCeiling.limitValue
                         : null,
-                    capacityContextMargin: override.contextMargin,
+                    capacityContextMargin:
+                      override.contextCeiling.mode === "INHERIT" ? null : override.contextMargin,
                   }
-                : {}),
+                : {
+                    capacityContextCeilingMode: "INHERIT",
+                    capacityContextCeiling: null,
+                    capacityContextMargin: null,
+                  }),
             },
           });
         }
@@ -2009,13 +2272,8 @@ export const forwarderManagementRouter = {
         publicEgressAcknowledged: z.literal(true).optional(),
         allowLossyDeveloperRoleCollapse: z.boolean().optional(),
         recommendedSurfaceOverride: poolRecommendedSurfaceSchema.nullable().optional(),
-        capacityPriority: z.number().int().min(0).max(31).optional(),
-        capacityConcurrencyLimit: z.number().int().positive().max(10_000).nullable().optional(),
-        capacityReservedSlots: z.number().int().min(0).max(10_000).optional(),
-        capacityWaitBudgetMs: z.number().int().min(0).max(600_000).nullable().optional(),
-        capacityContextCeiling: z.number().int().positive().max(100_000_000).nullable().optional(),
-        capacityContextMargin: z.number().int().min(0).max(100_000_000).optional(),
-        capacityBorrowPolicy: z.enum(["NEVER", "WHEN_IDLE"]).optional(),
+        ...poolTransformerFields,
+        ...modelPoolCapacityPolicyFields,
         affinityEnabled: z.boolean().optional(),
         affinityTtlSeconds: z.number().int().min(60).max(604_800).optional(),
         affinityMaxRecords: z.number().int().min(100).max(100_000).optional(),
@@ -2028,16 +2286,29 @@ export const forwarderManagementRouter = {
     .handler(async ({ input, context }) => {
       if (input.publicEgressEnabled === true || input.publicEgressAcknowledged === true)
         assertProviderEgressReleaseGate();
-      if (
-        input.capacityConcurrencyLimit != null &&
-        (input.capacityReservedSlots ?? 0) > input.capacityConcurrencyLimit
-      )
-        throw new ORPCError("BAD_REQUEST", {
-          message: "Reserved slots exceed the pool concurrency limit.",
-        });
+      assertLossyDeveloperRoleCollapseRequiresAdaptation({
+        protocolAdaptationEnabled: input.protocolAdaptationEnabled ?? false,
+        allowLossyDeveloperRoleCollapse: input.allowLossyDeveloperRoleCollapse ?? false,
+      });
+      assertModelPoolCapacityPolicy({
+        concurrencyLimit: input.capacityConcurrencyLimit,
+        reservedSlots: input.capacityReservedSlots,
+        contextCeiling: input.capacityContextCeiling,
+        contextMargin: input.capacityContextMargin,
+      });
       await assertPoolSlugAvailable(input.slug, context.session.user.id);
       await assertAttachmentLimitWithinGlobal(input.maxAttachmentBytes);
       const userId = context.session.user.id;
+      await assertPoolTransformerIsValid(
+        input,
+        {
+          transformerDiscoveredModelId: null,
+          transformerImages: true,
+          transformerAudio: false,
+          transformerVideo: false,
+        },
+        userId,
+      );
       const data = {
         userId,
         slug: input.slug,
@@ -2052,6 +2323,17 @@ export const forwarderManagementRouter = {
         publicEgressAcknowledged: input.publicEgressAcknowledged ?? false,
         allowLossyDeveloperRoleCollapse: input.allowLossyDeveloperRoleCollapse ?? false,
         recommendedSurfaceOverride: input.recommendedSurfaceOverride ?? null,
+        transformerDiscoveredModelId: input.transformerDiscoveredModelId ?? null,
+        transformerSystemPrompt: input.transformerSystemPrompt ?? null,
+        transformerImages: input.transformerImages ?? true,
+        transformerAudio: input.transformerAudio ?? false,
+        transformerVideo: input.transformerVideo ?? false,
+        transformerCacheMode: input.transformerCacheMode ?? "OFF",
+        transformerIncludePrimaryTools: input.transformerIncludePrimaryTools ?? false,
+        transformerMaxTools: input.transformerMaxTools ?? 32,
+        transformerMaxToolChars: input.transformerMaxToolChars ?? 8000,
+        transformerTimeoutMs: input.transformerTimeoutMs ?? null,
+        transformerMaxAssets: input.transformerMaxAssets ?? null,
         capacityPriority: input.capacityPriority ?? 16,
         capacityConcurrencyLimit: input.capacityConcurrencyLimit ?? null,
         capacityReservedSlots: input.capacityReservedSlots ?? 0,
@@ -2104,17 +2386,7 @@ export const forwarderManagementRouter = {
         name: poolNameSchema.optional(),
         description: poolDescriptionSchema,
         /** Set to a discovered model id owned by the user, or null to clear. */
-        transformerDiscoveredModelId: z.string().min(1).nullable().optional(),
-        transformerSystemPrompt: z.string().max(16_000).nullable().optional(),
-        transformerImages: z.boolean().optional(),
-        transformerAudio: z.boolean().optional(),
-        transformerVideo: z.boolean().optional(),
-        transformerCacheMode: z.enum(["OFF", "MEMORY"]).optional(),
-        transformerIncludePrimaryTools: z.boolean().optional(),
-        transformerMaxTools: z.number().int().min(1).max(128).optional(),
-        transformerMaxToolChars: z.number().int().min(256).max(32_000).optional(),
-        transformerTimeoutMs: z.number().int().min(1_000).max(600_000).nullable().optional(),
-        transformerMaxAssets: z.number().int().min(1).max(64).nullable().optional(),
+        ...poolTransformerFields,
         maxAttachmentBytes: attachmentLimitSchema,
         optimisticBasicTranscription: z.boolean().optional(),
         protocolAdaptationEnabled: z.boolean().optional(),
@@ -2129,6 +2401,7 @@ export const forwarderManagementRouter = {
         affinityConversationWeight: z.number().int().min(0).max(10_000).optional(),
         affinityConfirmedCacheWeight: z.number().int().min(0).max(10_000).optional(),
         affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000).optional(),
+        ...modelPoolCapacityPolicyFields,
       }),
     )
     .handler(async ({ input, context }) => {
@@ -2144,6 +2417,8 @@ export const forwarderManagementRouter = {
           transformerCacheMode: true,
           publicEgressEnabled: true,
           publicEgressAcknowledged: true,
+          protocolAdaptationEnabled: true,
+          allowLossyDeveloperRoleCollapse: true,
         },
       })) as {
         id: string;
@@ -2155,10 +2430,14 @@ export const forwarderManagementRouter = {
         transformerCacheMode: string;
         publicEgressEnabled: boolean;
         publicEgressAcknowledged: boolean;
+        protocolAdaptationEnabled: boolean;
+        allowLossyDeveloperRoleCollapse: boolean;
       } | null;
       if (!existing || existing.userId !== context.session.user.id) {
         throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
       }
+      const hasCapacityPolicy = hasModelPoolCapacityPolicy(input);
+      if (hasCapacityPolicy) assertCapacityManagementEnabled(env.MODEL_API_GLOBAL_CAPACITY_ENABLED);
       if (input.slug) {
         await assertPoolSlugAvailable(input.slug, context.session.user.id, input.id);
       }
@@ -2262,117 +2541,145 @@ export const forwarderManagementRouter = {
         }
       }
 
-      const nextTransformerId =
-        input.transformerDiscoveredModelId !== undefined
-          ? input.transformerDiscoveredModelId
-          : existing.transformerDiscoveredModelId;
-      const nextImages =
-        input.transformerImages !== undefined
-          ? input.transformerImages
-          : existing.transformerImages;
-      const nextAudio =
-        input.transformerAudio !== undefined ? input.transformerAudio : existing.transformerAudio;
-      const nextVideo =
-        input.transformerVideo !== undefined ? input.transformerVideo : existing.transformerVideo;
+      await assertPoolTransformerIsValid(input, existing, context.session.user.id);
 
-      if (nextTransformerId) {
-        const caps = await transformerCapabilitiesForOwnedModel(
-          nextTransformerId,
-          context.session.user.id,
-        );
-        assertTransformerMatchesModalities({
-          caps,
-          images: nextImages,
-          audio: nextAudio,
-          video: nextVideo,
+      const row = (await runSerializableTransaction(async (tx) => {
+        if (hasCapacityPolicy)
+          await lockAndValidateModelPoolCapacityPolicy(tx, {
+            modelPoolId: input.id,
+            userId: context.session.user.id,
+            policy: input,
+            notFound: () => {
+              throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+            },
+          });
+        const current = await tx.modelPool.findUnique({
+          where: { id: input.id },
+          select: {
+            userId: true,
+            protocolAdaptationEnabled: true,
+            allowLossyDeveloperRoleCollapse: true,
+          },
         });
-      } else if (input.transformerDiscoveredModelId === null) {
-        // clearing transformer — ok
-      }
-
-      const row = (await prisma.modelPool.update({
-        where: { id: input.id },
-        data: {
-          ...(input.slug ? { slug: input.slug } : {}),
-          ...(input.name ? { name: input.name } : {}),
-          ...(input.description !== undefined ? { description: input.description } : {}),
-          ...(input.transformerDiscoveredModelId !== undefined
-            ? { transformerDiscoveredModelId: input.transformerDiscoveredModelId }
-            : {}),
-          ...(input.transformerSystemPrompt !== undefined
-            ? { transformerSystemPrompt: input.transformerSystemPrompt }
-            : {}),
-          ...(input.transformerImages !== undefined
-            ? { transformerImages: input.transformerImages }
-            : {}),
-          ...(input.transformerAudio !== undefined
-            ? { transformerAudio: input.transformerAudio }
-            : {}),
-          ...(input.transformerVideo !== undefined
-            ? { transformerVideo: input.transformerVideo }
-            : {}),
-          ...(input.transformerCacheMode !== undefined
-            ? { transformerCacheMode: input.transformerCacheMode }
-            : {}),
-          ...(input.transformerIncludePrimaryTools !== undefined
-            ? { transformerIncludePrimaryTools: input.transformerIncludePrimaryTools }
-            : {}),
-          ...(input.transformerMaxTools !== undefined
-            ? { transformerMaxTools: input.transformerMaxTools }
-            : {}),
-          ...(input.transformerMaxToolChars !== undefined
-            ? { transformerMaxToolChars: input.transformerMaxToolChars }
-            : {}),
-          ...(input.transformerTimeoutMs !== undefined
-            ? { transformerTimeoutMs: input.transformerTimeoutMs }
-            : {}),
-          ...(input.transformerMaxAssets !== undefined
-            ? { transformerMaxAssets: input.transformerMaxAssets }
-            : {}),
-          ...(input.maxAttachmentBytes !== undefined
-            ? { maxAttachmentBytes: input.maxAttachmentBytes }
-            : {}),
-          ...(input.optimisticBasicTranscription !== undefined
-            ? { optimisticBasicTranscription: input.optimisticBasicTranscription }
-            : {}),
-          ...(input.protocolAdaptationEnabled !== undefined
-            ? { protocolAdaptationEnabled: input.protocolAdaptationEnabled }
-            : {}),
-          ...(input.publicEgressEnabled !== undefined
-            ? { publicEgressEnabled: input.publicEgressEnabled }
-            : {}),
-          ...(input.publicEgressAcknowledged !== undefined
-            ? { publicEgressAcknowledged: input.publicEgressAcknowledged }
-            : {}),
-          ...(input.allowLossyDeveloperRoleCollapse !== undefined
-            ? { allowLossyDeveloperRoleCollapse: input.allowLossyDeveloperRoleCollapse }
-            : {}),
-          ...(input.recommendedSurfaceOverride !== undefined
-            ? { recommendedSurfaceOverride: input.recommendedSurfaceOverride }
-            : {}),
-          ...(input.affinityEnabled !== undefined
-            ? { affinityEnabled: input.affinityEnabled }
-            : {}),
-          ...(input.affinityTtlSeconds !== undefined
-            ? { affinityTtlSeconds: input.affinityTtlSeconds }
-            : {}),
-          ...(input.affinityMaxRecords !== undefined
-            ? { affinityMaxRecords: input.affinityMaxRecords }
-            : {}),
-          ...(input.affinityPrefixWeight !== undefined
-            ? { affinityPrefixWeight: input.affinityPrefixWeight }
-            : {}),
-          ...(input.affinityConversationWeight !== undefined
-            ? { affinityConversationWeight: input.affinityConversationWeight }
-            : {}),
-          ...(input.affinityConfirmedCacheWeight !== undefined
-            ? { affinityConfirmedCacheWeight: input.affinityConfirmedCacheWeight }
-            : {}),
-          ...(input.affinityLoadPenaltyWeight !== undefined
-            ? { affinityLoadPenaltyWeight: input.affinityLoadPenaltyWeight }
-            : {}),
-        },
-        select: poolSelect,
+        if (!current || current.userId !== context.session.user.id) {
+          throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+        }
+        if (
+          input.protocolAdaptationEnabled !== undefined ||
+          input.allowLossyDeveloperRoleCollapse !== undefined
+        ) {
+          assertLossyDeveloperRoleCollapseRequiresAdaptation({
+            protocolAdaptationEnabled:
+              input.protocolAdaptationEnabled ?? current.protocolAdaptationEnabled,
+            allowLossyDeveloperRoleCollapse:
+              input.allowLossyDeveloperRoleCollapse ?? current.allowLossyDeveloperRoleCollapse,
+          });
+        }
+        return tx.modelPool.update({
+          where: { id: input.id },
+          data: {
+            ...(input.slug ? { slug: input.slug } : {}),
+            ...(input.name ? { name: input.name } : {}),
+            ...(input.description !== undefined ? { description: input.description } : {}),
+            ...(input.transformerDiscoveredModelId !== undefined
+              ? { transformerDiscoveredModelId: input.transformerDiscoveredModelId }
+              : {}),
+            ...(input.transformerSystemPrompt !== undefined
+              ? { transformerSystemPrompt: input.transformerSystemPrompt }
+              : {}),
+            ...(input.transformerImages !== undefined
+              ? { transformerImages: input.transformerImages }
+              : {}),
+            ...(input.transformerAudio !== undefined
+              ? { transformerAudio: input.transformerAudio }
+              : {}),
+            ...(input.transformerVideo !== undefined
+              ? { transformerVideo: input.transformerVideo }
+              : {}),
+            ...(input.transformerCacheMode !== undefined
+              ? { transformerCacheMode: input.transformerCacheMode }
+              : {}),
+            ...(input.transformerIncludePrimaryTools !== undefined
+              ? { transformerIncludePrimaryTools: input.transformerIncludePrimaryTools }
+              : {}),
+            ...(input.transformerMaxTools !== undefined
+              ? { transformerMaxTools: input.transformerMaxTools }
+              : {}),
+            ...(input.transformerMaxToolChars !== undefined
+              ? { transformerMaxToolChars: input.transformerMaxToolChars }
+              : {}),
+            ...(input.transformerTimeoutMs !== undefined
+              ? { transformerTimeoutMs: input.transformerTimeoutMs }
+              : {}),
+            ...(input.transformerMaxAssets !== undefined
+              ? { transformerMaxAssets: input.transformerMaxAssets }
+              : {}),
+            ...(input.maxAttachmentBytes !== undefined
+              ? { maxAttachmentBytes: input.maxAttachmentBytes }
+              : {}),
+            ...(input.optimisticBasicTranscription !== undefined
+              ? { optimisticBasicTranscription: input.optimisticBasicTranscription }
+              : {}),
+            ...(input.protocolAdaptationEnabled !== undefined
+              ? { protocolAdaptationEnabled: input.protocolAdaptationEnabled }
+              : {}),
+            ...(input.publicEgressEnabled !== undefined
+              ? { publicEgressEnabled: input.publicEgressEnabled }
+              : {}),
+            ...(input.publicEgressAcknowledged !== undefined
+              ? { publicEgressAcknowledged: input.publicEgressAcknowledged }
+              : {}),
+            ...(input.allowLossyDeveloperRoleCollapse !== undefined
+              ? { allowLossyDeveloperRoleCollapse: input.allowLossyDeveloperRoleCollapse }
+              : {}),
+            ...(input.recommendedSurfaceOverride !== undefined
+              ? { recommendedSurfaceOverride: input.recommendedSurfaceOverride }
+              : {}),
+            ...(input.affinityEnabled !== undefined
+              ? { affinityEnabled: input.affinityEnabled }
+              : {}),
+            ...(input.affinityTtlSeconds !== undefined
+              ? { affinityTtlSeconds: input.affinityTtlSeconds }
+              : {}),
+            ...(input.affinityMaxRecords !== undefined
+              ? { affinityMaxRecords: input.affinityMaxRecords }
+              : {}),
+            ...(input.affinityPrefixWeight !== undefined
+              ? { affinityPrefixWeight: input.affinityPrefixWeight }
+              : {}),
+            ...(input.affinityConversationWeight !== undefined
+              ? { affinityConversationWeight: input.affinityConversationWeight }
+              : {}),
+            ...(input.affinityConfirmedCacheWeight !== undefined
+              ? { affinityConfirmedCacheWeight: input.affinityConfirmedCacheWeight }
+              : {}),
+            ...(input.affinityLoadPenaltyWeight !== undefined
+              ? { affinityLoadPenaltyWeight: input.affinityLoadPenaltyWeight }
+              : {}),
+            ...(input.capacityPriority !== undefined
+              ? { capacityPriority: input.capacityPriority }
+              : {}),
+            ...(input.capacityConcurrencyLimit !== undefined
+              ? { capacityConcurrencyLimit: input.capacityConcurrencyLimit }
+              : {}),
+            ...(input.capacityReservedSlots !== undefined
+              ? { capacityReservedSlots: input.capacityReservedSlots }
+              : {}),
+            ...(input.capacityBorrowPolicy !== undefined
+              ? { capacityBorrowPolicy: input.capacityBorrowPolicy }
+              : {}),
+            ...(input.capacityWaitBudgetMs !== undefined
+              ? { capacityWaitBudgetMs: input.capacityWaitBudgetMs }
+              : {}),
+            ...(input.capacityContextCeiling !== undefined
+              ? { capacityContextCeiling: input.capacityContextCeiling }
+              : {}),
+            ...(input.capacityContextMargin !== undefined
+              ? { capacityContextMargin: input.capacityContextMargin }
+              : {}),
+          },
+          select: poolSelect,
+        });
       })) as ModelPoolRow;
       return serializePool(row);
     }),
@@ -2396,7 +2703,14 @@ export const forwarderManagementRouter = {
     )
     .handler(async ({ input, context }) => {
       await ownedPool(input.poolId, context.session.user.id);
-      await ownedDiscoveredModel(input.discoveredModelId, context.session.user.id);
+      const model = await ownedDiscoveredModel(input.discoveredModelId, context.session.user.id);
+      const declaredContext = declaredContextWindow(
+        resolveEffectiveCapabilityMetadata({
+          capabilityOverrideMode: model.capabilityOverrideMode,
+          capabilityOverrideMetadata: model.capabilityOverrideMetadata,
+          endpointCapabilityMetadata: model.Endpoint?.capabilityMetadata ?? null,
+        }),
+      );
       return runSerializableTransaction(async (tx) => {
         const userId = context.session.user.id;
         await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${input.poolId} AND "userId" = ${userId} FOR UPDATE`;
@@ -2410,16 +2724,40 @@ export const forwarderManagementRouter = {
           },
           select: {
             id: true,
+            inferenceCapacityId: true,
             InferenceCapacity: {
               select: { hardConcurrencyLimit: true, physicalMaxContext: true },
             },
           },
         });
-        await lockExecutionTargetPolicies(tx, [target.id]);
+        const seedCandidates = new Map(
+          declaredContext != null && target.inferenceCapacityId
+            ? [[target.inferenceCapacityId, declaredContext]]
+            : [],
+        );
+        const targetsSharingCandidateCapacity =
+          seedCandidates.size > 0
+            ? await tx.executionTarget.findMany({
+                where: {
+                  userId,
+                  inferenceCapacityId: { in: [...seedCandidates.keys()] },
+                },
+                select: { id: true },
+              })
+            : [];
+        // The pool row is locked above. Take one sorted union of the operated
+        // target and every target sharing its candidate capacity before the
+        // fresh policy read and null-only seed.
+        const policyLockTargetIds = new Set([
+          target.id,
+          ...targetsSharingCandidateCapacity.map((sharedTarget) => sharedTarget.id),
+        ]);
+        await lockExecutionTargetPolicies(tx, [...policyLockTargetIds]);
         const reloadedTarget = await tx.executionTarget.findUnique({
           where: { id: target.id },
           select: {
             id: true,
+            inferenceCapacityId: true,
             InferenceCapacity: {
               select: { hardConcurrencyLimit: true, physicalMaxContext: true },
             },
@@ -2436,13 +2774,43 @@ export const forwarderManagementRouter = {
           },
         });
         if (!pool) throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+        const seededPhysicalByCapacityId = await seedDeclaredContextWindows({
+          tx,
+          userId,
+          candidates: seedCandidates,
+          lockedExecutionTargetIds: policyLockTargetIds,
+          additionalDependentsByCapacityId: new Map(
+            lockedTarget.inferenceCapacityId
+              ? [
+                  [
+                    lockedTarget.inferenceCapacityId,
+                    [
+                      {
+                        kind: "member" as const,
+                        contextCeilingMode: "INHERIT" as const,
+                        contextCeiling: null,
+                        contextMargin: null,
+                        poolContextCeiling: pool.capacityContextCeiling,
+                        poolContextMargin: pool.capacityContextMargin,
+                      },
+                    ],
+                  ],
+                ]
+              : [],
+          ),
+        });
+        const physicalMaxContext =
+          lockedTarget.inferenceCapacityId &&
+          seededPhysicalByCapacityId.has(lockedTarget.inferenceCapacityId)
+            ? seededPhysicalByCapacityId.get(lockedTarget.inferenceCapacityId)
+            : lockedTarget.InferenceCapacity?.physicalMaxContext;
         assertConcurrencyPolicyWithinHardLimit({
           hardLimit: lockedTarget.InferenceCapacity?.hardConcurrencyLimit,
           poolLimit: pool.capacityConcurrencyLimit,
           poolReserved: pool.capacityReservedSlots,
         });
         assertEffectiveContextPolicy({
-          physicalMaxContext: lockedTarget.InferenceCapacity?.physicalMaxContext,
+          physicalMaxContext,
           poolCeiling: pool.capacityContextCeiling,
           poolMargin: pool.capacityContextMargin,
         });

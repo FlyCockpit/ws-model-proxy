@@ -245,6 +245,29 @@ describe("capacityManagementRouter", () => {
     expect(db.inferenceCapacity.delete).not.toHaveBeenCalled();
   });
 
+  it("rejects lossy collapse through the pool-policy path when adaptation is disabled", async () => {
+    db.modelPool.findUnique.mockResolvedValue({
+      id: "pool",
+      userId: "owner",
+      PoolMembers: [],
+      capacityPriority: 16,
+      capacityConcurrencyLimit: null,
+      capacityReservedSlots: 0,
+      capacityBorrowPolicy: "WHEN_IDLE",
+      capacityWaitBudgetMs: null,
+      capacityContextCeiling: null,
+      capacityContextMargin: 0,
+      protocolAdaptationEnabled: false,
+      allowLossyDeveloperRoleCollapse: false,
+    });
+    const client = createRouterClient(capacityManagementRouter, { context });
+
+    await expect(
+      client.updatePoolPolicy({ modelPoolId: "pool", allowLossyDeveloperRoleCollapse: true }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.modelPool.update).not.toHaveBeenCalled();
+  });
+
   it("denies cross-owner capacity substitution and reserved overcommit", async () => {
     db.executionTarget.findUnique.mockResolvedValue({ userId: "owner" });
     db.inferenceCapacity.findUnique

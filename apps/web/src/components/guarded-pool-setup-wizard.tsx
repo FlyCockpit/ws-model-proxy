@@ -1,5 +1,7 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { declaredContextWindow } from "@ws-model-proxy/api/lib/declared-context-window";
+import { parseOpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { validateForwarderPoolSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
@@ -15,10 +17,11 @@ import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ShieldCheck } from "lucide-react";
+import type { ReactNode } from "react";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
-import { useCapacityDerivedDefaults } from "@/hooks/use-capacity-derived-defaults";
+import { ProtocolCompatibilityRadio } from "@/components/forwarder-dashboard-sections";
 import {
   combinedPrimarySurfaceIsSelectable,
   type GuardedWizardLocalModel,
@@ -27,7 +30,6 @@ import {
   providerOrderAfterToggle,
   recommendedCombinedPrimarySurface,
   recommendedPrimarySurface,
-  safeContextControls,
 } from "@/lib/guarded-pool-wizard-validation";
 import { orpc } from "@/utils/orpc";
 
@@ -43,8 +45,8 @@ export type MemberOverride = {
   borrowPolicy: "NEVER" | "WHEN_IDLE";
   waitBudgetMode: LimitMode;
   waitBudgetMs: number;
-  contextCeilingMode: LimitMode;
-  contextCeiling: number;
+  contextCeilingMode: LimitMode | "INHERIT";
+  contextCeiling: number | null;
   contextMargin: number;
 };
 
@@ -55,9 +57,9 @@ const defaultMemberOverride = (): MemberOverride => ({
   borrowPolicy: "WHEN_IDLE",
   waitBudgetMode: "LIMITED",
   waitBudgetMs: 30_000,
-  contextCeilingMode: "LIMITED",
-  contextCeiling: 31_744,
-  contextMargin: 1_024,
+  contextCeilingMode: "INHERIT",
+  contextCeiling: null,
+  contextMargin: 0,
 });
 export function deriveMemberOverride(
   values: {
@@ -65,20 +67,15 @@ export function deriveMemberOverride(
     reservedSlots: number;
     borrowPolicy: "NEVER" | "WHEN_IDLE";
     localWaitBudgetMs: number;
-    memberContextCeiling: number;
+    memberContextCeiling: number | null;
     contextMargin: number;
   },
+  declaredWindow?: number | null,
   physicalMaxContext?: number | null,
 ): MemberOverride {
-  const safeContext = safeContextControls(physicalMaxContext);
-  const contextMargin =
-    physicalMaxContext == null
-      ? values.contextMargin
-      : Math.min(values.contextMargin, safeContext.contextMargin);
+  const contextMargin = values.contextMargin;
   const contextCeiling =
-    physicalMaxContext == null
-      ? values.memberContextCeiling
-      : Math.max(1, Math.min(values.memberContextCeiling, physicalMaxContext - contextMargin));
+    values.memberContextCeiling ?? declaredWindow ?? physicalMaxContext ?? null;
   return {
     concurrencyMode: "LIMITED",
     concurrencyLimit: values.memberConcurrencyLimit,
@@ -86,7 +83,7 @@ export function deriveMemberOverride(
     borrowPolicy: values.borrowPolicy,
     waitBudgetMode: "LIMITED",
     waitBudgetMs: values.localWaitBudgetMs,
-    contextCeilingMode: "LIMITED",
+    contextCeilingMode: "INHERIT",
     contextCeiling,
     contextMargin,
   };
@@ -96,9 +93,16 @@ export function memberContextFitsPhysical(
   physicalMaxContext: number | null | undefined,
 ) {
   return (
-    override.contextCeilingMode === "UNLIMITED" ||
+    override.contextCeilingMode !== "LIMITED" ||
     physicalMaxContext == null ||
-    override.contextCeiling + override.contextMargin <= physicalMaxContext
+    (override.contextCeiling != null &&
+      override.contextCeiling + override.contextMargin <= physicalMaxContext)
+  );
+}
+
+function modelDeclaredContextWindow(model: LocalModel | undefined): number | null {
+  return declaredContextWindow(
+    parseOpenAiCompatibleCapabilities(model?.effectiveCapabilities?.metadata),
   );
 }
 export const budgetIntegerRule = (mode: LimitMode, value: string) =>
@@ -113,22 +117,29 @@ export const budgetSpendRule = (mode: LimitMode, value: string) =>
 export function GuardedPoolSetupWizard({
   open,
   onOpenChange,
+  page = false,
+  onSuccess,
   directModels,
   initialStep = 0,
   initialProviderModelIds = [],
+  capacityEnabled,
+  protocolAdaptationAvailable,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** Render directly in a route instead of inside a dialog. */
+  page?: boolean;
+  onSuccess?: (poolId: string | undefined) => void;
   directModels: LocalModel[];
   initialStep?: 0 | 1 | 2 | 3;
   initialProviderModelIds?: string[];
+  capacityEnabled: boolean;
+  protocolAdaptationAvailable: boolean;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
-  const { data: appConfig } = useQuery(orpc.appConfig.queryOptions());
+  const capacityIsEnabled = capacityEnabled;
   const formRef = useRef<HTMLFormElement>(null);
-  const contextCeilingCustomized = useRef(false);
-  const contextMarginCustomized = useRef(false);
   const [step, setStep] = useState<number>(initialStep);
   const [stepErrors, setStepErrors] = useState<Record<string, string>>({});
   const [memberOverrides, setMemberOverrides] = useState<Record<string, MemberOverride>>({});
@@ -140,15 +151,16 @@ export function GuardedPoolSetupWizard({
   const capacities = useQuery({
     ...orpc.capacityManagement.list.queryOptions(),
     retry: false,
-    enabled: open && appConfig?.capacityEnabled === true,
+    enabled: open && capacityIsEnabled,
   });
   const create = useMutation(
     orpc.forwarderManagement.createGuardedModelPool.mutationOptions({
-      onSuccess: async () => {
+      onSuccess: async (pool) => {
         await queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:pools.created"));
         setStep(0);
-        onOpenChange(false);
+        onSuccess?.(pool?.id);
+        if (!page) onOpenChange(false);
       },
       onError: () => toast.error(t("dashboard:pools.wizard.atomicFailure")),
     }),
@@ -162,7 +174,7 @@ export function GuardedPoolSetupWizard({
       name: z.string().trim().min(1).max(120),
       localModelIds: z.array(z.string()),
       memberConcurrencyLimit: z.number().int().min(1).max(10_000),
-      memberContextCeiling: z.number().int().min(1).max(100_000_000),
+      memberContextCeiling: z.number().int().min(1).max(100_000_000).nullable(),
       reservedSlots: z.number().int().min(0).max(10_000),
       localWaitBudgetMs: z.number().int().min(0).max(600_000),
       recommendedSurface: z.enum(surfaces),
@@ -219,7 +231,7 @@ export function GuardedPoolSetupWizard({
           value.providerModelIds,
           candidates.data ?? [],
           value.providerTier,
-          value.protocolAdaptationEnabled,
+          protocolAdaptationAvailable && value.protocolAdaptationEnabled,
         )
       )
         ctx.addIssue({ code: "custom", path: ["recommendedSurface"] });
@@ -230,6 +242,7 @@ export function GuardedPoolSetupWizard({
       );
       if (
         physicalMaximum != null &&
+        value.memberContextCeiling != null &&
         value.memberContextCeiling + value.contextMargin > physicalMaximum
       )
         ctx.addIssue({ code: "custom", path: ["memberContextCeiling"] });
@@ -259,7 +272,7 @@ export function GuardedPoolSetupWizard({
       name: "",
       localModelIds: [] as string[],
       memberConcurrencyLimit: 1,
-      memberContextCeiling: 31_744,
+      memberContextCeiling: null as number | null,
       reservedSlots: 0,
       localWaitBudgetMs: 30_000,
       recommendedSurface: "OPENAI_RESPONSES" as (typeof surfaces)[number],
@@ -273,7 +286,7 @@ export function GuardedPoolSetupWizard({
         | "TEMPLATE_AWARE"
         | "ENGINE_REPORTED"
         | "CONSERVATIVE_ESTIMATE",
-      contextMargin: 1_024,
+      contextMargin: 0,
       borrowPolicy: "WHEN_IDLE" as "NEVER" | "WHEN_IDLE",
       protocolAdaptationEnabled: false,
       allowLossyDeveloperRoleCollapse: false,
@@ -313,8 +326,11 @@ export function GuardedPoolSetupWizard({
           physicalCountStrategy: value.physicalCountStrategy,
           contextMargin: value.contextMargin,
           borrowPolicy: value.borrowPolicy,
-          protocolAdaptationEnabled: value.protocolAdaptationEnabled,
-          allowLossyDeveloperRoleCollapse: value.allowLossyDeveloperRoleCollapse,
+          protocolAdaptationEnabled: protocolAdaptationAvailable && value.protocolAdaptationEnabled,
+          allowLossyDeveloperRoleCollapse:
+            protocolAdaptationAvailable &&
+            value.protocolAdaptationEnabled &&
+            value.allowLossyDeveloperRoleCollapse,
           affinity: {
             enabled: value.affinityEnabled,
             ttlSeconds: value.affinityTtlSeconds,
@@ -331,7 +347,8 @@ export function GuardedPoolSetupWizard({
               (capacity) => capacity.id === model?.executionTarget?.inferenceCapacityId,
             )?.physicalMaxContext;
             const override =
-              memberOverrides[discoveredModelId] ?? deriveMemberOverride(value, physicalMaxContext);
+              memberOverrides[discoveredModelId] ??
+              deriveMemberOverride(value, modelDeclaredContextWindow(model), physicalMaxContext);
             const rule = (mode: LimitMode, limitValue: number) =>
               mode === "LIMITED"
                 ? ({ mode, limitValue } as const)
@@ -343,8 +360,12 @@ export function GuardedPoolSetupWizard({
                 reservedSlots: override.reservedSlots,
                 borrowPolicy: override.borrowPolicy,
                 waitBudget: rule(override.waitBudgetMode, override.waitBudgetMs),
-                contextCeiling: rule(override.contextCeilingMode, override.contextCeiling),
-                contextMargin: override.contextMargin,
+                contextCeiling:
+                  override.contextCeilingMode === "INHERIT"
+                    ? ({ mode: "INHERIT", limitValue: null } as const)
+                    : rule(override.contextCeilingMode, override.contextCeiling ?? 0),
+                contextMargin:
+                  override.contextCeilingMode === "INHERIT" ? 0 : override.contextMargin,
               },
             ];
           }),
@@ -368,19 +389,6 @@ export function GuardedPoolSetupWizard({
           },
         })),
       }),
-  });
-  useCapacityDerivedDefaults({
-    selectedIds: form.state.values.localModelIds,
-    models: directModels,
-    capacities: capacities.data ?? [],
-    contextCeilingCustomized: contextCeilingCustomized.current,
-    contextMarginCustomized: contextMarginCustomized.current,
-    apply: (defaults) => {
-      if (defaults.contextCeiling != null)
-        form.setFieldValue("memberContextCeiling", defaults.contextCeiling);
-      if (defaults.contextMargin != null)
-        form.setFieldValue("contextMargin", defaults.contextMargin);
-    },
   });
   const stepFields = [
     ["slug", "name", "localModelIds"],
@@ -430,7 +438,8 @@ export function GuardedPoolSetupWizard({
         return (
           (override.concurrencyMode === "LIMITED" && override.concurrencyLimit < 1) ||
           (override.waitBudgetMode === "LIMITED" && override.waitBudgetMs < 1) ||
-          (override.contextCeilingMode === "LIMITED" && override.contextCeiling < 1) ||
+          (override.contextCeilingMode === "LIMITED" &&
+            (override.contextCeiling == null || override.contextCeiling < 1)) ||
           override.reservedSlots < 0 ||
           (override.concurrencyMode === "LIMITED" &&
             override.reservedSlots > override.concurrencyLimit) ||
@@ -465,12 +474,21 @@ export function GuardedPoolSetupWizard({
   });
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[min(92vh,56rem)] overflow-x-hidden overflow-y-auto sm:max-w-2xl">
-        <DialogHeader>
-          <DialogTitle>{t("dashboard:pools.wizard.title")}</DialogTitle>
-          <DialogDescription>{t("dashboard:pools.wizard.description")}</DialogDescription>
-        </DialogHeader>
+    <WizardSurface page={page} open={open} onOpenChange={onOpenChange}>
+      <WizardContent page={page}>
+        {page ? (
+          <div>
+            <h1 className="text-xl font-semibold">{t("dashboard:pools.wizard.title")}</h1>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {t("dashboard:pools.wizard.description")}
+            </p>
+          </div>
+        ) : (
+          <DialogHeader>
+            <DialogTitle>{t("dashboard:pools.wizard.title")}</DialogTitle>
+            <DialogDescription>{t("dashboard:pools.wizard.description")}</DialogDescription>
+          </DialogHeader>
+        )}
         <p className="text-sm font-medium" aria-live="polite">
           {t("dashboard:pools.wizard.step", { current: step + 1, total: 4 })}
         </p>
@@ -496,7 +514,7 @@ export function GuardedPoolSetupWizard({
                         <Input
                           id={`guarded-${name}`}
                           className="min-h-11"
-                          value={field.state.value}
+                          value={String(field.state.value ?? "")}
                           onChange={(event) => field.handleChange(event.target.value)}
                           {...errorProps(name)}
                         />
@@ -540,22 +558,11 @@ export function GuardedPoolSetupWizard({
                                 const recommended = recommendedPrimarySurface(
                                   next,
                                   directModels,
-                                  form.state.values.protocolAdaptationEnabled,
+                                  protocolAdaptationAvailable &&
+                                    form.state.values.protocolAdaptationEnabled,
                                 );
                                 if (recommended)
                                   form.setFieldValue("recommendedSurface", recommended);
-                                const physicalMaximum = minimumSelectedPhysicalContext(
-                                  next,
-                                  directModels,
-                                  capacities.data ?? [],
-                                );
-                                if (physicalMaximum != null) {
-                                  const safe = safeContextControls(physicalMaximum);
-                                  if (!contextCeilingCustomized.current)
-                                    form.setFieldValue("memberContextCeiling", safe.contextCeiling);
-                                  if (!contextMarginCustomized.current)
-                                    form.setFieldValue("contextMargin", safe.contextMargin);
-                                }
                               })()
                             }
                           />
@@ -616,11 +623,13 @@ export function GuardedPoolSetupWizard({
                           className="min-h-11"
                           type="number"
                           min={name === "reservedSlots" || name === "localWaitBudgetMs" ? 0 : 1}
-                          value={field.state.value}
+                          value={String(field.state.value ?? "")}
                           onChange={(event) => {
-                            if (name === "memberContextCeiling")
-                              contextCeilingCustomized.current = true;
-                            field.handleChange(Number(event.target.value));
+                            field.handleChange(
+                              name === "memberContextCeiling" && event.target.value === ""
+                                ? null
+                                : Number(event.target.value),
+                            );
                           }}
                           {...errorProps(name)}
                         />
@@ -716,7 +725,6 @@ export function GuardedPoolSetupWizard({
                             min={name === "affinityTtlSeconds" ? 60 : 0}
                             value={field.state.value}
                             onChange={(event) => {
-                              if (name === "contextMargin") contextMarginCustomized.current = true;
                               field.handleChange(Number(event.target.value));
                             }}
                             {...errorProps(name)}
@@ -732,49 +740,48 @@ export function GuardedPoolSetupWizard({
                   ))}
                 </div>
                 <div className="mt-4 space-y-3">
-                  {(
-                    [
-                      "protocolAdaptationEnabled",
-                      "allowLossyDeveloperRoleCollapse",
-                      "affinityEnabled",
-                    ] as const
-                  ).map((name) => (
-                    <form.Field key={name} name={name}>
-                      {(field) => (
-                        <label className="flex min-h-11 items-start gap-3 py-2">
-                          <Checkbox
-                            id={`guarded-${name}`}
-                            checked={field.state.value}
-                            onCheckedChange={(checked) => {
-                              const enabled = checked === true;
-                              field.handleChange(enabled);
-                              if (name === "protocolAdaptationEnabled") {
-                                const recommended = recommendedPrimarySurface(
-                                  form.state.values.localModelIds,
-                                  directModels,
-                                  enabled,
-                                );
-                                if (recommended)
-                                  form.setFieldValue("recommendedSurface", recommended);
-                                setStepErrors((current) => {
-                                  const next = { ...current };
-                                  if (recommended) delete next.recommendedSurface;
-                                  else
-                                    next.recommendedSurface = t(
-                                      "dashboard:pools.wizard.errors.recommendedSurface",
-                                    );
-                                  return next;
-                                });
-                              }
-                            }}
-                          />
-                          <span className="text-sm" id={`guarded-${name}-label`}>
-                            {t(`dashboard:pools.wizard.fields.${name}`)}
-                          </span>
-                        </label>
-                      )}
-                    </form.Field>
-                  ))}
+                  <form.Subscribe
+                    selector={(state) => ({
+                      adaptation: state.values.protocolAdaptationEnabled,
+                      lossy: state.values.allowLossyDeveloperRoleCollapse,
+                    })}
+                  >
+                    {({ adaptation, lossy }) => (
+                      <ProtocolCompatibilityRadio
+                        adaptationEnabled={adaptation}
+                        allowLossyDeveloperRoleCollapse={lossy}
+                        protocolAdaptationAvailable={protocolAdaptationAvailable}
+                        idPrefix="guarded"
+                        onChange={(value) => {
+                          form.setFieldValue("protocolAdaptationEnabled", value.adaptationEnabled);
+                          form.setFieldValue(
+                            "allowLossyDeveloperRoleCollapse",
+                            value.allowLossyDeveloperRoleCollapse,
+                          );
+                          const recommended = recommendedPrimarySurface(
+                            form.state.values.localModelIds,
+                            directModels,
+                            protocolAdaptationAvailable && value.adaptationEnabled,
+                          );
+                          if (recommended) form.setFieldValue("recommendedSurface", recommended);
+                        }}
+                      />
+                    )}
+                  </form.Subscribe>
+                  <form.Field name="affinityEnabled">
+                    {(field) => (
+                      <label className="flex min-h-11 items-start gap-3 py-2">
+                        <Checkbox
+                          id="guarded-affinityEnabled"
+                          checked={field.state.value}
+                          onCheckedChange={(checked) => field.handleChange(checked === true)}
+                        />
+                        <span className="text-sm" id="guarded-affinityEnabled-label">
+                          {t("dashboard:pools.wizard.fields.affinityEnabled")}
+                        </span>
+                      </label>
+                    )}
+                  </form.Field>
                 </div>
                 <div
                   className="mt-5 min-w-0 space-y-4"
@@ -793,6 +800,7 @@ export function GuardedPoolSetupWizard({
                       memberOverrides[modelId] ??
                       deriveMemberOverride(
                         form.state.values,
+                        modelDeclaredContextWindow(model),
                         capacities.data?.find(
                           (capacity) => capacity.id === model?.executionTarget?.inferenceCapacityId,
                         )?.physicalMaxContext,
@@ -899,7 +907,8 @@ export function GuardedPoolSetupWizard({
                                   next,
                                   candidates.data ?? [],
                                   form.state.values.providerTier,
-                                  form.state.values.protocolAdaptationEnabled,
+                                  protocolAdaptationAvailable &&
+                                    form.state.values.protocolAdaptationEnabled,
                                 );
                                 if (recommended)
                                   form.setFieldValue("recommendedSurface", recommended);
@@ -987,7 +996,8 @@ export function GuardedPoolSetupWizard({
                           form.state.values.providerModelIds,
                           candidates.data ?? [],
                           tier,
-                          form.state.values.protocolAdaptationEnabled,
+                          protocolAdaptationAvailable &&
+                            form.state.values.protocolAdaptationEnabled,
                         );
                         if (recommended) form.setFieldValue("recommendedSurface", recommended);
                       }}
@@ -1196,8 +1206,38 @@ export function GuardedPoolSetupWizard({
             </Button>
           </DialogFooter>
         </form>
-      </DialogContent>
+      </WizardContent>
+    </WizardSurface>
+  );
+}
+
+function WizardSurface({
+  children,
+  open,
+  onOpenChange,
+  page,
+}: {
+  children: ReactNode;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  page: boolean;
+}) {
+  if (page) return <>{children}</>;
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      {children}
     </Dialog>
+  );
+}
+
+function WizardContent({ children, page }: { children: ReactNode; page: boolean }) {
+  if (page) return <section className="min-w-0 space-y-5">{children}</section>;
+
+  return (
+    <DialogContent className="max-h-[min(92vh,56rem)] overflow-x-hidden overflow-y-auto sm:max-w-2xl">
+      {children}
+    </DialogContent>
   );
 }
 
@@ -1244,7 +1284,7 @@ export function MemberOverrideEditor({
             mode={value.concurrencyMode}
             value={value.concurrencyLimit}
             onMode={(mode) => onChange({ ...value, concurrencyMode: mode })}
-            onValue={(limit) => onChange({ ...value, concurrencyLimit: limit })}
+            onValue={(limit) => onChange({ ...value, concurrencyLimit: limit ?? 0 })}
           />
           <MemberLimitControl
             id={`${safeId}-wait`}
@@ -1252,7 +1292,7 @@ export function MemberOverrideEditor({
             mode={value.waitBudgetMode}
             value={value.waitBudgetMs}
             onMode={(mode) => onChange({ ...value, waitBudgetMode: mode })}
-            onValue={(limit) => onChange({ ...value, waitBudgetMs: limit })}
+            onValue={(limit) => onChange({ ...value, waitBudgetMs: limit ?? 0 })}
           />
           <MemberLimitControl
             id={`${safeId}-context`}
@@ -1260,6 +1300,8 @@ export function MemberOverrideEditor({
             mode={value.contextCeilingMode}
             value={value.contextCeiling}
             error={contextError}
+            allowInherit
+            inheritHint={t("pools.wizard.fields.memberContextInheritHint")}
             onMode={(mode) => onChange({ ...value, contextCeilingMode: mode })}
             onValue={(limit) => onChange({ ...value, contextCeiling: limit })}
           />
@@ -1302,24 +1344,38 @@ export function MemberOverrideEditor({
   );
 }
 
-function MemberLimitControl({
-  id,
-  label,
-  mode,
-  value,
-  onMode,
-  onValue,
-  error,
-}: {
+type MemberLimitControlProps = {
   id: string;
   label: string;
-  mode: LimitMode;
-  value: number;
-  onMode: (mode: LimitMode) => void;
-  onValue: (value: number) => void;
+  value: number | null;
+  onValue: (value: number | null) => void;
   error?: string;
-}) {
+} & (
+  | {
+      mode: LimitMode;
+      onMode: (mode: LimitMode) => void;
+      allowInherit?: false;
+      inheritHint?: never;
+    }
+  | {
+      mode: LimitMode | "INHERIT";
+      onMode: (mode: LimitMode | "INHERIT") => void;
+      allowInherit: true;
+      inheritHint?: string;
+    }
+);
+
+function limitedMode(value: string): LimitMode | null {
+  return value === "LIMITED" || value === "UNLIMITED" ? value : null;
+}
+
+function memberLimitMode(value: string): LimitMode | "INHERIT" | null {
+  return value === "INHERIT" ? value : limitedMode(value);
+}
+
+function MemberLimitControl(props: MemberLimitControlProps) {
   const { t } = useTranslation("dashboard");
+  const { id, label, mode, value, onValue, error, inheritHint } = props;
   return (
     <div className="min-w-0 space-y-2">
       <Label htmlFor={`${id}-mode`}>{label}</Label>
@@ -1327,34 +1383,47 @@ function MemberLimitControl({
         id={`${id}-mode`}
         className="h-11 w-full rounded-md border bg-background px-3 text-base sm:text-sm"
         value={mode}
-        onChange={(event) => onMode(event.target.value as LimitMode)}
+        onChange={(event) => {
+          if (props.allowInherit) {
+            const nextMode = memberLimitMode(event.target.value);
+            if (nextMode) props.onMode(nextMode);
+            return;
+          }
+          const nextMode = limitedMode(event.target.value);
+          if (nextMode) props.onMode(nextMode);
+        }}
       >
+        {props.allowInherit ? (
+          <option value="INHERIT">{t("pools.capacity.modes.inherit")}</option>
+        ) : null}
         <option value="LIMITED">{t("pools.wizard.enums.LIMITED")}</option>
         <option value="UNLIMITED">{t("pools.wizard.enums.UNLIMITED")}</option>
       </select>
       {mode === "LIMITED" ? (
-        <>
-          <Input
-            id={`${id}-value`}
-            aria-label={`${label} ${t("pools.wizard.fields.limitValue")}`}
-            type="number"
-            min={1}
-            value={value}
-            onChange={(event) => onValue(Number(event.target.value))}
-            aria-invalid={Boolean(error)}
-            aria-describedby={error ? `${id}-error` : undefined}
-          />
-          {error ? (
-            <p id={`${id}-error`} className="text-sm text-destructive">
-              {error}
-            </p>
-          ) : null}
-        </>
-      ) : (
+        <Input
+          id={`${id}-value`}
+          aria-label={`${label} ${t("pools.wizard.fields.limitValue")}`}
+          type="number"
+          min={1}
+          value={value ?? ""}
+          onChange={(event) =>
+            onValue(event.target.value === "" ? null : Number(event.target.value))
+          }
+          aria-invalid={Boolean(error)}
+          aria-describedby={error ? `${id}-error` : undefined}
+        />
+      ) : mode === "UNLIMITED" ? (
         <p className="text-xs text-amber-700 dark:text-amber-300">
           {t("pools.wizard.advanced.unlimitedWarning")}
         </p>
-      )}
+      ) : inheritHint ? (
+        <p className="text-xs text-muted-foreground">{inheritHint}</p>
+      ) : null}
+      {mode === "LIMITED" && error ? (
+        <p id={`${id}-error`} className="text-sm text-destructive">
+          {error}
+        </p>
+      ) : null}
     </div>
   );
 }

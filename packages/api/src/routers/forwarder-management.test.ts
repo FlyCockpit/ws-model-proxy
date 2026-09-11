@@ -12,7 +12,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Context } from "../context";
 import { forwarderManagementRouter } from "./forwarder-management";
 
-const testEnv = vi.hoisted(() => ({ WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true }));
+const testEnv = vi.hoisted(() => ({
+  WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
+  MODEL_API_PROTOCOL_ADAPTATION_ENABLED: true,
+  MODEL_API_GLOBAL_CAPACITY_ENABLED: true,
+}));
 
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
@@ -85,7 +89,7 @@ const db = prisma as unknown as {
     delete: MockInstance;
   };
   executionTarget: { findMany: MockInstance; findUnique: MockInstance; upsert: MockInstance };
-  inferenceCapacity: { updateMany: MockInstance; upsert: MockInstance };
+  inferenceCapacity: { findMany: MockInstance; updateMany: MockInstance; upsert: MockInstance };
   providerModel: { findFirst: MockInstance; findMany: MockInstance };
   providerBudgetPolicy: { create: MockInstance; findFirst: MockInstance; findMany: MockInstance };
   providerAuditEvent: { create: MockInstance; findFirst: MockInstance };
@@ -222,11 +226,15 @@ describe("forwarderManagementRouter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     testEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
+    testEnv.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = true;
+    testEnv.MODEL_API_GLOBAL_CAPACITY_ENABLED = true;
     db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
       callback(db),
     );
     db.executionTarget.upsert.mockResolvedValue({ id: "target-id" });
     db.executionTarget.findUnique.mockResolvedValue(null);
+    db.executionTarget.findMany.mockResolvedValue([]);
+    db.inferenceCapacity.findMany.mockResolvedValue([]);
     db.inferenceCapacity.upsert.mockResolvedValue({ id: "provider-capacity-id" });
     db.capacityAuditEvent.create.mockResolvedValue({ id: "audit-id" });
     db.appSetting.findUnique.mockResolvedValue(null);
@@ -245,7 +253,7 @@ describe("forwarderManagementRouter", () => {
   });
 
   it("denies guessed provider attachments and public-egress mutations over HTTP", async () => {
-    db.modelPool.findUnique.mockResolvedValue(null);
+    db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(poolRow());
     db.modelPool.findFirst.mockResolvedValue(null);
     db.poolMember.findUnique.mockResolvedValue(null);
     db.providerModel.findFirst.mockResolvedValue(null);
@@ -351,6 +359,244 @@ describe("forwarderManagementRouter", () => {
     expect(db.$transaction).not.toHaveBeenCalled();
   });
 
+  it("rejects guarded lossy collapse when protocol adaptation is disabled", async () => {
+    await expect(
+      client().createGuardedModelPool({
+        slug: "guarded-invalid-protocol-policy",
+        name: "Guarded invalid protocol policy",
+        localModelIds: ["local-id"],
+        recommendedSurface: "OPENAI_RESPONSES",
+        memberConcurrencyLimit: 1,
+        memberContextCeiling: null,
+        reservedSlots: 0,
+        localWaitBudgetMs: 30_000,
+        publicEgressAcknowledged: false,
+        providerModels: [],
+        advanced: {
+          physicalCountStrategy: "ENGINE_REPORTED",
+          contextMargin: 0,
+          borrowPolicy: "WHEN_IDLE",
+          protocolAdaptationEnabled: false,
+          allowLossyDeveloperRoleCollapse: true,
+          affinity: {
+            enabled: false,
+            ttlSeconds: 3_600,
+            maxRecords: 10_000,
+            prefixWeight: 100,
+            conversationWeight: 150,
+            confirmedCacheWeight: 250,
+            loadPenaltyWeight: 100,
+          },
+          memberOverrides: [],
+        },
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.modelPool.findUnique).not.toHaveBeenCalled();
+  });
+
+  it("creates a guarded local pool without an implicit context ceiling or member override", async () => {
+    db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(poolRow());
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel()]);
+    db.executionTarget.findMany.mockResolvedValue([
+      {
+        id: "existing-target",
+        discoveredModelId: "local-id",
+        inferenceCapacityId: "shared-capacity",
+        InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: null },
+      },
+    ]);
+    db.providerModel.findMany.mockResolvedValue([]);
+    db.modelPool.create.mockResolvedValue({ id: "pool-id" });
+    db.poolMember.create.mockResolvedValue({ id: "member-id" });
+
+    await client().createGuardedModelPool({
+      slug: "default-context",
+      name: "Default context",
+      localModelIds: ["local-id"],
+      recommendedSurface: "OPENAI_RESPONSES",
+      memberConcurrencyLimit: 1,
+      reservedSlots: 0,
+      localWaitBudgetMs: 30_000,
+      providerModels: [],
+      publicEgressAcknowledged: false,
+    });
+
+    expect(db.modelPool.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ capacityContextCeiling: null, capacityContextMargin: 0 }),
+      }),
+    );
+    expect(db.poolMember.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          capacityContextCeilingMode: "INHERIT",
+          capacityContextCeiling: null,
+          capacityContextMargin: null,
+        }),
+      }),
+    );
+  });
+
+  it("skips a declared seed that the pending guarded-pool member policy would exceed", async () => {
+    db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(poolRow());
+    db.discoveredModel.findMany.mockResolvedValue([
+      guardedLocalModel({
+        capabilityOverrideMode: "OVERRIDE",
+        capabilityOverrideMetadata: {
+          version: 4,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiResponses: {
+              source: "declared",
+              confidence: "exact",
+              streaming: true,
+              maxContextTokens: 8_192,
+              operations: ["create"],
+            },
+          },
+        },
+      }),
+    ]);
+    db.executionTarget.findMany.mockResolvedValue([
+      {
+        id: "local-target",
+        discoveredModelId: "local-id",
+        inferenceCapacityId: "capacity-id",
+        InferenceCapacity: { physicalMaxContext: null, hardConcurrencyLimit: null },
+      },
+    ]);
+    db.providerModel.findMany.mockResolvedValue([]);
+    db.inferenceCapacity.findMany.mockResolvedValue([
+      {
+        id: "capacity-id",
+        physicalMaxContext: null,
+        ExecutionTargets: [
+          {
+            id: "local-target",
+            directContextCeiling: null,
+            directContextMargin: null,
+            PoolMembers: [],
+          },
+        ],
+      },
+    ]);
+    db.modelPool.create.mockResolvedValue({ id: "pool-id" });
+    db.poolMember.create.mockResolvedValue({ id: "member-id" });
+
+    await expect(
+      client().createGuardedModelPool({
+        slug: "seed-guard",
+        name: "Seed guard",
+        localModelIds: ["local-id"],
+        recommendedSurface: "OPENAI_RESPONSES",
+        memberConcurrencyLimit: 1,
+        memberContextCeiling: 31_744,
+        reservedSlots: 0,
+        localWaitBudgetMs: 30_000,
+        providerModels: [],
+        publicEgressAcknowledged: false,
+      }),
+    ).resolves.toMatchObject({ id: "pool-id" });
+
+    expect(db.inferenceCapacity.updateMany).not.toHaveBeenCalled();
+    expect(db.modelPool.create).toHaveBeenCalled();
+  });
+
+  it("seeds a declared context window for an unlimited pending member override", async () => {
+    db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(poolRow());
+    db.discoveredModel.findMany.mockResolvedValue([
+      guardedLocalModel({
+        capabilityOverrideMode: "OVERRIDE",
+        capabilityOverrideMetadata: {
+          version: 4,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiResponses: {
+              source: "declared",
+              confidence: "exact",
+              streaming: true,
+              maxContextTokens: 8_192,
+              operations: ["create"],
+            },
+          },
+        },
+      }),
+    ]);
+    db.executionTarget.findMany.mockResolvedValue([
+      {
+        id: "local-target",
+        discoveredModelId: "local-id",
+        inferenceCapacityId: "capacity-id",
+        InferenceCapacity: { physicalMaxContext: null, hardConcurrencyLimit: null },
+      },
+    ]);
+    db.providerModel.findMany.mockResolvedValue([]);
+    db.inferenceCapacity.findMany.mockResolvedValue([
+      {
+        id: "capacity-id",
+        physicalMaxContext: null,
+        ExecutionTargets: [
+          {
+            id: "local-target",
+            directContextCeiling: null,
+            directContextMargin: null,
+            PoolMembers: [],
+          },
+        ],
+      },
+    ]);
+    db.modelPool.create.mockResolvedValue({ id: "pool-id" });
+    db.poolMember.create.mockResolvedValue({ id: "member-id" });
+
+    await expect(
+      client().createGuardedModelPool({
+        slug: "seed-unlimited-override",
+        name: "Seed unlimited override",
+        localModelIds: ["local-id"],
+        recommendedSurface: "OPENAI_RESPONSES",
+        memberConcurrencyLimit: 1,
+        memberContextCeiling: 31_744,
+        reservedSlots: 0,
+        localWaitBudgetMs: 30_000,
+        providerModels: [],
+        publicEgressAcknowledged: false,
+        advanced: {
+          physicalCountStrategy: "ENGINE_REPORTED",
+          contextMargin: 0,
+          borrowPolicy: "WHEN_IDLE",
+          protocolAdaptationEnabled: false,
+          allowLossyDeveloperRoleCollapse: false,
+          affinity: {
+            enabled: false,
+            ttlSeconds: 3_600,
+            maxRecords: 10_000,
+            prefixWeight: 100,
+            conversationWeight: 150,
+            confirmedCacheWeight: 250,
+            loadPenaltyWeight: 100,
+          },
+          memberOverrides: [
+            {
+              discoveredModelId: "local-id",
+              concurrency: { mode: "UNLIMITED", limitValue: null },
+              reservedSlots: 0,
+              borrowPolicy: "WHEN_IDLE",
+              waitBudget: { mode: "UNLIMITED", limitValue: null },
+              contextCeiling: { mode: "UNLIMITED", limitValue: null },
+              contextMargin: 0,
+            },
+          ],
+        },
+      }),
+    ).resolves.toMatchObject({ id: "pool-id" });
+
+    expect(db.inferenceCapacity.updateMany).toHaveBeenCalledWith({
+      where: { id: "capacity-id", userId: "user-id", physicalMaxContext: null },
+      data: { physicalMaxContext: 8_192 },
+    });
+    expect(db.modelPool.create).toHaveBeenCalled();
+  });
+
   it("atomically persists guarded local capacity reuse, ordered providers, budgets, and audits", async () => {
     db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(
       poolRow({
@@ -402,7 +648,7 @@ describe("forwarderManagementRouter", () => {
         physicalCountStrategy: "TEMPLATE_AWARE",
         contextMargin: 2_048,
         borrowPolicy: "NEVER",
-        protocolAdaptationEnabled: false,
+        protocolAdaptationEnabled: true,
         allowLossyDeveloperRoleCollapse: true,
         affinity: {
           enabled: true,
@@ -446,7 +692,7 @@ describe("forwarderManagementRouter", () => {
 
     expect(db.modelPool.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
-        protocolAdaptationEnabled: false,
+        protocolAdaptationEnabled: true,
         allowLossyDeveloperRoleCollapse: true,
         capacityContextMargin: 2_048,
         capacityBorrowPolicy: "NEVER",
@@ -1041,10 +1287,11 @@ describe("forwarderManagementRouter", () => {
   });
 
   it("creates and updates owned model pools without touching grant ids", async () => {
-    db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce({
-      id: "pool-id",
-      userId: "user-id",
-    });
+    db.modelPool.findUnique
+      .mockResolvedValueOnce(null)
+      .mockResolvedValue(
+        poolRow({ userId: "user-id", publicEgressEnabled: false, publicEgressAcknowledged: false }),
+      );
     db.modelPool.create.mockResolvedValue(poolRow());
     db.modelPool.update.mockResolvedValue(poolRow({ slug: "new-general" }));
 
@@ -1065,6 +1312,48 @@ describe("forwarderManagementRouter", () => {
     expect(db.poolGrant.deleteMany).not.toHaveBeenCalled();
   });
 
+  it("rejects lossy collapse without adaptation and resolves partial updates from the stored pool", async () => {
+    await expect(
+      client().createModelPool({
+        slug: "invalid-protocol-policy",
+        name: "Invalid protocol policy",
+        protocolAdaptationEnabled: false,
+        allowLossyDeveloperRoleCollapse: true,
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+
+    db.modelPool.findUnique.mockResolvedValue(
+      poolRow({
+        userId: "user-id",
+        publicEgressEnabled: false,
+        publicEgressAcknowledged: false,
+        protocolAdaptationEnabled: false,
+        allowLossyDeveloperRoleCollapse: false,
+      }),
+    );
+    await expect(
+      client().updateModelPool({ id: "pool-id", allowLossyDeveloperRoleCollapse: true }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.modelPool.update).not.toHaveBeenCalled();
+
+    db.modelPool.findUnique.mockResolvedValue(
+      poolRow({
+        userId: "user-id",
+        publicEgressEnabled: false,
+        publicEgressAcknowledged: false,
+        protocolAdaptationEnabled: true,
+        allowLossyDeveloperRoleCollapse: false,
+      }),
+    );
+    db.modelPool.update.mockResolvedValue(
+      poolRow({ protocolAdaptationEnabled: true, allowLossyDeveloperRoleCollapse: true }),
+    );
+    await expect(
+      client().updateModelPool({ id: "pool-id", allowLossyDeveloperRoleCollapse: true }),
+    ).resolves.toMatchObject({ allowLossyDeveloperRoleCollapse: true });
+  });
+
   it("fails closed when enabling public egress without acknowledgement", async () => {
     db.modelPool.findUnique.mockResolvedValue(
       poolRow({ userId: "user-id", publicEgressEnabled: false, publicEgressAcknowledged: false }),
@@ -1074,6 +1363,25 @@ describe("forwarderManagementRouter", () => {
       client().updateModelPool({ id: "pool-id", publicEgressEnabled: true }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect(db.modelPool.update).not.toHaveBeenCalled();
+  });
+
+  it("only applies the capacity deployment gate when a pool capacity field is supplied", async () => {
+    testEnv.MODEL_API_GLOBAL_CAPACITY_ENABLED = false;
+    const existing = poolRow({ id: "pool-id", userId: "user-id" });
+    db.modelPool.findUnique.mockResolvedValue(existing);
+    db.modelPool.update.mockResolvedValue(existing);
+
+    await expect(
+      client().updateModelPool({ id: "pool-id", name: "Renamed" }),
+    ).resolves.toMatchObject({
+      id: "pool-id",
+    });
+    await expect(
+      client().updateModelPool({ id: "pool-id", capacityPriority: 17 }),
+    ).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      message: "Capacity management is disabled for this deployment.",
+    });
   });
 
   it.each([
@@ -1250,6 +1558,131 @@ describe("forwarderManagementRouter", () => {
     );
   });
 
+  it("persists identical transformer settings through pool create and update", async () => {
+    const transformer = {
+      id: "transformer-id",
+      userId: "user-id",
+      published: true,
+      capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+      capabilityOverrideMetadata: null,
+      Endpoint: {
+        published: true,
+        capabilityMetadata: {
+          version: 1,
+          protocol: "openai-compatible",
+          chatCompletions: { supported: true, vision: true, audio: false, video: false },
+        },
+      },
+    };
+    const input = {
+      transformerDiscoveredModelId: "transformer-id",
+      transformerSystemPrompt: "Describe the image.",
+      transformerImages: true,
+      transformerAudio: false,
+      transformerVideo: false,
+      transformerCacheMode: "MEMORY" as const,
+      transformerIncludePrimaryTools: true,
+      transformerMaxTools: 8,
+      transformerMaxToolChars: 1024,
+      transformerTimeoutMs: 30_000,
+      transformerMaxAssets: 4,
+    };
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findUnique.mockResolvedValue(transformer);
+    db.modelPool.create.mockResolvedValue(poolRow());
+
+    await client().createModelPool({ slug: "general", name: "General", ...input });
+    const createData = db.modelPool.create.mock.calls[0]?.[0].data;
+
+    db.modelPool.findUnique.mockResolvedValue(
+      poolRow({ id: "pool-id", userId: "user-id", ...input }),
+    );
+    db.modelPool.update.mockResolvedValue(poolRow());
+    await client().updateModelPool({ id: "pool-id", ...input });
+    const updateData = db.modelPool.update.mock.calls[0]?.[0].data;
+
+    for (const [key, value] of Object.entries(input)) {
+      expect(createData).toHaveProperty(key, value);
+      expect(updateData).toHaveProperty(key, value);
+    }
+  });
+
+  it("rejects a cross-owner transformer model when creating a pool", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findUnique.mockResolvedValue({
+      id: "other-transformer",
+      userId: "other-user-id",
+      published: true,
+      capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+      capabilityOverrideMetadata: null,
+      Endpoint: { published: true, capabilityMetadata: null },
+    });
+
+    await expect(
+      client().createModelPool({
+        slug: "general",
+        name: "General",
+        transformerDiscoveredModelId: "other-transformer",
+      }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND", message: "Discovered model not found." });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "reserved slots above the limit",
+      { capacityConcurrencyLimit: 2, capacityReservedSlots: 3 },
+      "Reserved slots exceed the pool concurrency limit.",
+    ],
+    [
+      "a context margin equal to the ceiling",
+      { capacityContextCeiling: 100, capacityContextMargin: 100 },
+      "Pool context margin must be smaller than the context ceiling.",
+    ],
+    [
+      "a context ceiling plus margin above physical capacity",
+      { capacityContextCeiling: 90, capacityContextMargin: 20 },
+      "Effective context policy exceeds physical capacity.",
+    ],
+  ])("enforces pool capacity policy invariants for %s", async (_name, policy, message) => {
+    db.modelPool.findUnique.mockResolvedValue({
+      id: "pool-id",
+      userId: "user-id",
+      transformerDiscoveredModelId: null,
+      transformerImages: true,
+      transformerAudio: false,
+      transformerVideo: false,
+      publicEgressEnabled: false,
+      publicEgressAcknowledged: false,
+      protocolAdaptationEnabled: false,
+      allowLossyDeveloperRoleCollapse: false,
+      capacityConcurrencyLimit: 2,
+      capacityReservedSlots: 0,
+      capacityContextCeiling: 80,
+      capacityContextMargin: 0,
+      PoolMembers: [
+        {
+          executionTargetId: "target-id",
+          capacityConcurrencyMode: "INHERIT",
+          capacityConcurrencyLimit: null,
+          capacityReservedSlots: null,
+          capacityContextCeilingMode: "INHERIT",
+          capacityContextCeiling: null,
+          capacityContextMargin: null,
+          ExecutionTarget: {
+            InferenceCapacity: { hardConcurrencyLimit: 4, physicalMaxContext: 100 },
+          },
+        },
+      ],
+    });
+
+    await expect(client().updateModelPool({ id: "pool-id", ...policy })).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      message,
+    });
+    expect(db.modelPool.update).not.toHaveBeenCalled();
+  });
+
   it("fails pool creation when the atomic capacity-policy audit cannot be persisted", async () => {
     db.modelPool.findUnique.mockResolvedValue(null);
     db.modelPool.create.mockResolvedValue(poolRow());
@@ -1345,6 +1778,51 @@ describe("forwarderManagementRouter", () => {
     });
   });
 
+  it("uses the deployment protocol gate for compatibility serialization", async () => {
+    testEnv.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = false;
+    db.modelPool.findMany.mockResolvedValue([
+      poolRow({
+        protocolAdaptationEnabled: true,
+        allowLossyDeveloperRoleCollapse: true,
+        PoolMembers: [
+          {
+            id: "member-id",
+            tier: "PRIMARY",
+            ExecutionTarget: null,
+            DiscoveredModel: {
+              id: "model-id",
+              upstreamModelId: "gpt-local",
+              capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+              capabilityOverrides: [],
+              capabilityOverrideMetadata: null,
+              User: { slug: "owner" },
+              Endpoint: {
+                id: "endpoint-id",
+                slug: "local",
+                capabilityMetadata: {
+                  version: 1,
+                  protocol: "openai-compatible",
+                  chatCompletions: { supported: true, streaming: true },
+                },
+                defaultCapabilities: [],
+                CliDevice: { slug: "desktop" },
+              },
+            },
+          },
+        ],
+      }),
+    ]);
+
+    const [result] = await client().listModelPools();
+
+    expect(result?.protocolAdaptationAvailable).toBe(false);
+    expect(result?.compatibility.surfaces.OPENAI_RESPONSES).toMatchObject({
+      adapted: 0,
+      unavailable: 1,
+    });
+    expect(result?.compatibility.warnings).not.toContain("developer_role_collapse_lossy");
+  });
+
   it("rejects legacy Completions as a recommended pool API", async () => {
     await expect(
       client().createModelPool({
@@ -1429,7 +1907,12 @@ describe("forwarderManagementRouter", () => {
     db.modelPool.findUnique
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce({ id: "pool-id", userId: "user-id" })
-      .mockResolvedValueOnce(null);
+      .mockResolvedValueOnce(
+        poolRow({ userId: "user-id", publicEgressEnabled: false, publicEgressAcknowledged: false }),
+      )
+      .mockResolvedValueOnce(
+        poolRow({ userId: "user-id", publicEgressEnabled: false, publicEgressAcknowledged: false }),
+      );
     db.modelPool.create.mockResolvedValue(poolRow({ slug: "gpt-4.1-mini" }));
     db.modelPool.update.mockResolvedValue(poolRow({ slug: "local.mixtral" }));
 
@@ -1530,6 +2013,124 @@ describe("forwarderManagementRouter", () => {
       id: "member-id",
       weight: 0,
       routingStatus: "DISABLED",
+    });
+  });
+
+  it("uses a fresh-null seed result when the pending inherited member would exceed", async () => {
+    db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+    db.modelPool.findFirst.mockResolvedValue({
+      capacityConcurrencyLimit: null,
+      capacityReservedSlots: 0,
+      capacityContextCeiling: 31_744,
+      capacityContextMargin: 1_024,
+    });
+    db.discoveredModel.findUnique.mockResolvedValue({
+      id: "model-id",
+      userId: "user-id",
+      capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+      capabilityOverrideMetadata: null,
+      Endpoint: {
+        capabilityMetadata: {
+          version: 4,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiChatCompletions: {
+              source: "declared",
+              confidence: "exact",
+              streaming: true,
+              maxContextTokens: 8_192,
+              operations: ["create"],
+            },
+          },
+        },
+      },
+    });
+    db.executionTarget.upsert.mockResolvedValue({
+      id: "target-id",
+      inferenceCapacityId: "capacity-id",
+      InferenceCapacity: { hardConcurrencyLimit: null, physicalMaxContext: null },
+    });
+    db.executionTarget.findMany.mockResolvedValue([{ id: "target-id" }]);
+    db.inferenceCapacity.findMany.mockResolvedValue([
+      {
+        id: "capacity-id",
+        physicalMaxContext: null,
+        ExecutionTargets: [
+          {
+            id: "target-id",
+            directContextCeiling: null,
+            directContextMargin: 0,
+            PoolMembers: [],
+          },
+        ],
+      },
+    ]);
+    db.poolMember.create.mockResolvedValue({ id: "member-id" });
+
+    await expect(
+      client().addPoolMember({ poolId: "pool-id", discoveredModelId: "model-id" }),
+    ).resolves.toMatchObject({ id: "member-id" });
+
+    expect(db.inferenceCapacity.updateMany).not.toHaveBeenCalled();
+    expect(db.poolMember.create).toHaveBeenCalled();
+  });
+
+  it("seeds a default-topology member capacity from its declared context window", async () => {
+    db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+    db.modelPool.findFirst.mockResolvedValue({
+      capacityConcurrencyLimit: null,
+      capacityReservedSlots: 0,
+      capacityContextCeiling: null,
+      capacityContextMargin: 0,
+    });
+    db.discoveredModel.findUnique.mockResolvedValue({
+      id: "model-id",
+      userId: "user-id",
+      capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+      capabilityOverrideMetadata: null,
+      Endpoint: {
+        capabilityMetadata: {
+          version: 4,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiChatCompletions: {
+              source: "declared",
+              confidence: "exact",
+              streaming: true,
+              maxContextTokens: 128_000,
+              operations: ["create"],
+            },
+          },
+        },
+      },
+    });
+    db.executionTarget.upsert.mockResolvedValue({
+      id: "target-id",
+      inferenceCapacityId: "capacity-id",
+      InferenceCapacity: { hardConcurrencyLimit: null, physicalMaxContext: null },
+    });
+    db.executionTarget.findMany.mockResolvedValue([{ id: "target-id" }]);
+    db.inferenceCapacity.findMany.mockResolvedValue([
+      {
+        id: "capacity-id",
+        physicalMaxContext: null,
+        ExecutionTargets: [
+          {
+            id: "target-id",
+            directContextCeiling: null,
+            directContextMargin: null,
+            PoolMembers: [],
+          },
+        ],
+      },
+    ]);
+    db.poolMember.create.mockResolvedValue({ id: "member-id" });
+
+    await client().addPoolMember({ poolId: "pool-id", discoveredModelId: "model-id" });
+
+    expect(db.inferenceCapacity.updateMany).toHaveBeenCalledWith({
+      where: { id: "capacity-id", userId: "user-id", physicalMaxContext: null },
+      data: { physicalMaxContext: 128_000 },
     });
   });
 

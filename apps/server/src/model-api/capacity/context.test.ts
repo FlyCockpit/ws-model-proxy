@@ -79,6 +79,18 @@ describe("context counting hierarchy", () => {
     });
   });
 
+  it("does not reserve requested output tokens in the local estimate", async () => {
+    const input = {
+      messages: [{ role: "user", content: "hello" }],
+      max_tokens: 8_192,
+    };
+    const bytes = new TextEncoder().encode(JSON.stringify(input)).byteLength;
+    await expect(countSerializedRequestContext({ input })).resolves.toMatchObject({
+      tokens: Math.ceil((bytes / 3) * 1.2),
+      method: "TOKEN_ESTIMATE",
+    });
+  });
+
   it("applies the strictest physical/member ceiling and reserved margin", () => {
     expect(
       contextFitsLimits({

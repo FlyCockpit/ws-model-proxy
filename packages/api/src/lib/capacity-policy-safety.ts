@@ -1,7 +1,54 @@
 import { ORPCError } from "@orpc/server";
 import type { Prisma } from "@ws-model-proxy/db";
+import { z } from "zod";
 
 export type CapacityLimitMode = "INHERIT" | "LIMITED" | "UNLIMITED";
+
+export type ModelPoolCapacityPolicyInput = {
+  capacityPriority?: number;
+  capacityConcurrencyLimit?: number | null;
+  capacityReservedSlots?: number;
+  capacityBorrowPolicy?: "NEVER" | "WHEN_IDLE";
+  capacityWaitBudgetMs?: number | null;
+  capacityContextCeiling?: number | null;
+  capacityContextMargin?: number;
+};
+
+/** Input shape shared by every public ModelPool capacity-policy writer. */
+export const modelPoolCapacityPolicyFields = {
+  capacityPriority: z.number().int().min(0).max(31).optional(),
+  capacityConcurrencyLimit: z.number().int().positive().max(10_000).nullable().optional(),
+  capacityReservedSlots: z.number().int().min(0).max(10_000).optional(),
+  capacityBorrowPolicy: z.enum(["NEVER", "WHEN_IDLE"]).optional(),
+  capacityWaitBudgetMs: z.number().int().min(0).max(600_000).nullable().optional(),
+  capacityContextCeiling: z.number().int().positive().max(100_000_000).nullable().optional(),
+  capacityContextMargin: z.number().int().min(0).max(10_000_000).optional(),
+};
+
+export function assertCapacityManagementEnabled(capacityEnabled: boolean): void {
+  if (!capacityEnabled)
+    throw new ORPCError("NOT_FOUND", {
+      message: "Capacity management is disabled for this deployment.",
+    });
+}
+
+export function assertModelPoolCapacityPolicy(input: {
+  concurrencyLimit: number | null | undefined;
+  reservedSlots: number | undefined;
+  contextCeiling: number | null | undefined;
+  contextMargin: number | undefined;
+}): void {
+  const reserved = input.reservedSlots ?? 0;
+  const margin = input.contextMargin ?? 0;
+  if (input.concurrencyLimit != null && reserved > input.concurrencyLimit)
+    throw new ORPCError("BAD_REQUEST", {
+      message: "Reserved slots exceed the pool concurrency limit.",
+    });
+  if (input.contextCeiling != null && margin >= input.contextCeiling)
+    throw new ORPCError("BAD_REQUEST", {
+      message: "Pool context margin must be smaller than the context ceiling.",
+    });
+}
 
 /**
  * Serializes physical-capacity changes with every policy mutation for a target.
@@ -129,4 +176,106 @@ export function assertEffectiveContextPolicy(input: {
     throw new ORPCError("BAD_REQUEST", {
       message: "Effective context policy exceeds physical capacity.",
     });
+}
+
+/**
+ * Acquires model-pool then execution-target policy locks and validates every
+ * member's effective policy against the proposed pool policy. This is the
+ * shared path for writes to an existing ModelPool; callers perform their
+ * write in this transaction after this function returns.
+ */
+export async function lockAndValidateModelPoolCapacityPolicy(
+  tx: Prisma.TransactionClient,
+  input: {
+    modelPoolId: string;
+    userId: string;
+    policy: ModelPoolCapacityPolicyInput;
+    notFound: () => never;
+  },
+): Promise<void> {
+  const candidate = await tx.modelPool.findUnique({
+    where: { id: input.modelPoolId },
+    select: {
+      userId: true,
+      PoolMembers: { select: { executionTargetId: true } },
+    },
+  });
+  if (!candidate || candidate.userId !== input.userId) return input.notFound();
+
+  // Lock order is model pool, then sorted execution targets. Keep this before
+  // re-reading the policy and members so concurrent attachments cannot bypass
+  // the effective-policy checks below.
+  await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${input.modelPoolId} AND "userId" = ${input.userId} FOR UPDATE`;
+  await lockExecutionTargetPolicies(
+    tx,
+    candidate.PoolMembers.flatMap((member) =>
+      member.executionTargetId ? [member.executionTargetId] : [],
+    ),
+  );
+  const pool = await tx.modelPool.findUnique({
+    where: { id: input.modelPoolId },
+    select: {
+      userId: true,
+      capacityConcurrencyLimit: true,
+      capacityReservedSlots: true,
+      capacityContextCeiling: true,
+      capacityContextMargin: true,
+      PoolMembers: {
+        select: {
+          capacityConcurrencyMode: true,
+          capacityConcurrencyLimit: true,
+          capacityReservedSlots: true,
+          capacityContextCeilingMode: true,
+          capacityContextCeiling: true,
+          capacityContextMargin: true,
+          ExecutionTarget: {
+            select: {
+              InferenceCapacity: {
+                select: { hardConcurrencyLimit: true, physicalMaxContext: true },
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+  if (!pool || pool.userId !== input.userId) return input.notFound();
+
+  assertModelPoolCapacityPolicy({
+    concurrencyLimit:
+      input.policy.capacityConcurrencyLimit !== undefined
+        ? input.policy.capacityConcurrencyLimit
+        : pool.capacityConcurrencyLimit,
+    reservedSlots: input.policy.capacityReservedSlots ?? pool.capacityReservedSlots,
+    contextCeiling:
+      input.policy.capacityContextCeiling !== undefined
+        ? input.policy.capacityContextCeiling
+        : pool.capacityContextCeiling,
+    contextMargin: input.policy.capacityContextMargin ?? pool.capacityContextMargin,
+  });
+
+  for (const member of pool.PoolMembers) {
+    assertEffectiveConcurrencyPolicy({
+      hardLimit: member.ExecutionTarget?.InferenceCapacity?.hardConcurrencyLimit,
+      poolLimit:
+        input.policy.capacityConcurrencyLimit !== undefined
+          ? input.policy.capacityConcurrencyLimit
+          : pool.capacityConcurrencyLimit,
+      poolReserved: input.policy.capacityReservedSlots ?? pool.capacityReservedSlots,
+      memberMode: member.capacityConcurrencyMode,
+      memberLimit: member.capacityConcurrencyLimit,
+      memberReserved: member.capacityReservedSlots,
+    });
+    assertEffectiveContextPolicy({
+      physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+      poolCeiling:
+        input.policy.capacityContextCeiling !== undefined
+          ? input.policy.capacityContextCeiling
+          : pool.capacityContextCeiling,
+      poolMargin: input.policy.capacityContextMargin ?? pool.capacityContextMargin,
+      memberMode: member.capacityContextCeilingMode,
+      memberCeiling: member.capacityContextCeiling,
+      memberMargin: member.capacityContextMargin,
+    });
+  }
 }

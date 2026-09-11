@@ -53,6 +53,7 @@
     },
     "emptyModels": "No hay modelos visibles disponibles.",
     "emptyTranscript": "Todavía no hay mensajes.",
+    "createPool": "Crear un grupo",
     "errors": {
       "modelsFailed": "No se pudieron cargar los modelos visibles.",
       "streamFailed": "No se pudo transmitir la respuesta."
@@ -72,14 +73,25 @@
     "loadFixture": "Cargar {{count}}",
     "metrics": {
       "ttft": "TTFT {{value}} s",
-      "tokensPerSecond": "{{value}} tok/s después del primer token ({{count}} tokens de finalización)",
       "tokensPerSecondShared": "{{value}} tok/s con tokenizador compartido después del primer token ({{count}} tokens de finalización)",
       "throughputUnavailable": "Rendimiento no disponible: el tokenizador compartido no pudo contar la finalización"
     },
     "modelFilterEmpty": "Ningún modelo coincide",
     "modelFilterPlaceholder": "Filtrar modelos…",
     "modelPicker": "Modelo",
+    "modelKinds": {
+      "direct": "Directo",
+      "pool": "Grupo"
+    },
     "regenerate": "Regenerar",
+    "requestSettings": "Configuración de la solicitud",
+    "requestSettingsHelp": "Elige la superficie de API, la preferencia de ruta y el nivel de razonamiento para la próxima solicitud.",
+    "maxTokens": {
+      "label": "Máximo de tokens de salida",
+      "help": "Se usa para solicitudes de Anthropic Messages. El razonamiento puede requerir un mínimo mayor."
+    },
+    "samplePromptOne": "Explica las capacidades de este modelo.",
+    "samplePromptTwo": "Dame un plan de pruebas conciso.",
     "routingMode": {
       "label": "Modo de ruta del pool",
       "PREFER_NATIVE": "API preferida (nativa primero)",
@@ -199,6 +211,7 @@
   "nav": {
     "ariaLabel": "Secciones del panel",
     "chatTest": "Prueba de chat",
+    "capacity": "Capacidad",
     "cliTokens": "Tokens CLI",
     "clis": "CLIs",
     "modelApiTokens": "Tokens API de modelo",
@@ -207,9 +220,10 @@
     "relayMetadata": "Metadatos de relay"
   },
   "pools": {
+    "notFound": "No se encontró este grupo o ya no está disponible para ti.",
     "affinity": {
       "title": "Enrutamiento según caché",
-      "description": "Las sesiones nuevas van al miembro con la mejor puntuación de disponibilidad (carga, salud, salida pública y costo). Cuando esas puntuaciones empatan, se prefiere un entorno que quizá conserve un prefijo de instrucción coincidente. Después de un turno de asistente o de herramienta, se prefiere el miembro que sirvió la conversación hasta ahora. Una conversación larga puede superar una carga moderada o un miembro medio abierto; una cola grande igual desborda la solicitud.",
+      "description": "Las sesiones nuevas van al miembro con la mejor puntuación de disponibilidad (carga, salud, salida pública y costo). Cuando esas puntuaciones empatan, se prefiere un entorno que quizá conserve un prefijo de instrucción coincidente. El enrutamiento consciente del prompt de sistema es parte de este interruptor. Después de un turno de asistente o de herramienta, se prefiere el miembro que sirvió la conversación hasta ahora. Una conversación larga puede superar una carga moderada o un miembro medio abierto; una cola grande igual desborda la solicitud.",
       "enabled": "Activar afinidad de caché opcional",
       "stats": "{{records}} registros activos en {{targets}} destinos",
       "clear": "Borrar registros de afinidad",
@@ -225,6 +239,9 @@
     "capacity": {
       "title": "Capacidad local compartida",
       "description": "Mantén los pools dentro de los límites reales de concurrencia y contexto del runtime que comparten.",
+      "disabledReason": "La administración de capacidad está deshabilitada para esta implementación. Estos controles no están disponibles.",
+      "settingsLoading": "La configuración de la implementación aún se está cargando. Los controles de capacidad no estarán disponibles hasta que termine.",
+      "settingsFailed": "No se pudo cargar la configuración de la implementación. Los controles de capacidad no estarán disponibles hasta que se pueda cargar.",
       "create": "Agregar capacidad",
       "createTitle": "Configurar capacidad compartida",
       "createDescription": "Identifica un runtime local y establece límites físicos conservadores. Podrás conectar modelos después de guardar.",
@@ -296,6 +313,7 @@
     "allowLossyDeveloperRoleCollapse": "Permitir la conversión con pérdida del rol developer",
     "compatibilityDetails": "Matriz de compatibilidad de protocolos",
     "enableProtocolAdaptation": "Habilitar adaptación de protocolos del subconjunto estricto",
+    "protocolAdaptationDisabledReason": "La traducción de protocolos está desactivada para esta implementación.",
     "lossyDeveloperRoleWarning": "Advertencia: las instrucciones developer pueden combinarse con el rol system. Las solicitudes con ambos roles se rechazan salvo que se habilite esta opción.",
     "limitations": {
       "native_extensions_unavailable": "extensiones nativas no disponibles",
@@ -306,9 +324,45 @@
     "noneAvailable": "Ninguna disponible",
     "protocolCompatibility": "Compatibilidad de protocolos",
     "protocolCompatibilityHint": "La adaptación es opcional y rechaza funciones fuera del subconjunto común documentado.",
+    "protocolOptions": {
+      "native": {
+        "label": "Solo nativo (recomendado)",
+        "help": "Los miembros responden solo los formatos de API que implementan; los demás devuelven 400."
+      },
+      "lossless": {
+        "label": "Traducción sin pérdida",
+        "help": "Traduce entre Chat Completions, Responses y Anthropic Messages cuando la solicitud se puede representar exactamente."
+      },
+      "lossy": {
+        "label": "Sin pérdida, más combinación de instrucciones",
+        "help": "También combina las instrucciones system y developer para el único canal de instrucciones de Anthropic; se pierde su distinción de prioridad."
+      }
+    },
+    "protocolRejectedTitle": "Qué se rechaza",
+    "protocolRejectedHelp": "La traducción aún rechaza razonamiento, salida estructurada, herramientas alojadas o paralelas, Responses con estado, audio, video, betas y otras funciones que no pueden representarse exactamente.",
     "recommendedAutomatic": "Recomendación automática",
     "recommendedSurface": "API recomendada",
-    "recommendedSurfaceOverride": "Anulación de API recomendada",
+    "recommendedSurfaceOverride": "API recomendada (orientativa)",
+    "detailNavAriaLabel": "Secciones del pool",
+    "tabs": {
+      "overview": "Resumen",
+      "fallback": "Respaldo y desbordamiento",
+      "routing": "Enrutamiento",
+      "capacity": "Capacidad",
+      "media": "Medios",
+      "access": "Acceso"
+    },
+    "fallbackDescription": "El desbordamiento público se intenta solo cuando los miembros locales están a capacidad máxima o no son saludables.",
+    "fallbackDisabledDeployment": "Los proveedores de respaldo están desactivados para esta implementación.",
+    "fallbackEmpty": "No hay proveedores de respaldo. Cuando los miembros locales están a capacidad máxima o no son saludables, las solicitudes fallan en lugar de desbordarse.",
+    "fallbackSteps": {
+      "account": "Agrega una cuenta y credencial de proveedor",
+      "model": "Agrega un modelo y sus precios",
+      "ceiling": "Establece un límite de gasto",
+      "acknowledge": "Reconoce que las solicitudes salen de esta implementación"
+    },
+    "addFallbackProvider": "Agregar proveedor de respaldo",
+    "accessEgressHint": "Dar acceso a un pool con proveedores requiere reconocer la salida de datos.",
     "streaming": "streaming",
     "surfaceCounts": "{{native}} nativos · {{adapted}} adaptados · {{unavailable}} no disponibles",
     "surfaceTierCounts": "{{tier}}: {{native}} nativos · {{adapted}} adaptados · {{unavailable}} no disponibles",
@@ -356,7 +410,7 @@
         "dailySpendLimit": "Límite de gasto diario",
         "localWaitBudgetMs": "Espera local antes del proveedor (ms)",
         "memberConcurrencyLimit": "Límite de concurrencia del miembro del pool",
-        "memberContextCeiling": "Límite de contexto del miembro del pool",
+        "memberContextCeiling": "Límite de contexto del pool (opcional)",
         "physicalConcurrencyLimit": "Límite de concurrencia del runtime físico",
         "physicalMaxContext": "Contexto máximo del runtime físico",
         "providerConcurrencyLimit": "Límite de concurrencia del proveedor",
@@ -367,7 +421,8 @@
         "reservedSlots": "Espacios privados reservados",
         "waitMs": "Espera local antes del desbordamiento (ms)",
         "physicalCountStrategy": "Estrategia de conteo físico de tokens",
-        "contextMargin": "Margen de seguridad de contexto del pool",
+        "contextMargin": "Margen de seguridad de contexto del pool (predeterminado: 0)",
+        "memberContextInheritHint": "Hereda el límite opcional del pool; no se establece un límite por miembro.",
         "borrowPolicy": "Política de préstamo del pool",
         "protocolAdaptationEnabled": "Permitir adaptación estricta de protocolo si no hay una superficie nativa",
         "allowLossyDeveloperRoleCollapse": "Permitir colapso con pérdidas del rol de desarrollador/instrucción",
@@ -428,7 +483,7 @@
         "localModelIds": "Selecciona al menos un modelo local.",
         "localWaitBudgetMs": "Ingresa una espera local finita de 0 a 600000 ms.",
         "memberConcurrencyLimit": "Ingresa un límite de concurrencia del miembro de 1 a 10000.",
-        "memberContextCeiling": "El contexto del miembro debe ser positivo y no superar el contexto físico.",
+        "memberContextCeiling": "Cuando se establece, el límite de contexto debe ser positivo y no superar el contexto físico.",
         "name": "Ingresa un nombre para el pool.",
         "providerConcurrencyLimit": "Ingresa un límite entero de concurrencia del proveedor de 1 a 10000.",
         "providerModelIds": "Selecciona como máximo 32 modelos de proveedor.",
@@ -483,6 +538,7 @@
     "editDescription": "Actualiza el slug, nombre visible, descripción o transformador de medios del pool.",
     "editMemberDescription": "Cambia los controles de enrutamiento del miembro.",
     "editMemberTitle": "Editar miembro del pool",
+    "editPool": "Editar {{pool}}",
     "editTitle": "Editar pool",
     "email": "Correo",
     "empty": "Todavía no hay pools de modelos.",
@@ -541,8 +597,8 @@
     "noDirectModels": "No hay modelos directos disponibles para agregar.",
     "noGrants": "Todavía no hay permisos.",
     "noMembers": "Todavía no hay miembros.",
-    "optimisticBasicTranscription": "Permitir miembros desconocidos para transcripción básica",
-    "optimisticBasicTranscriptionHint": "Los miembros compatibles confirmados siempre se intentan primero. Los desconocidos solo son respaldo y nunca reciben solicitudes de streaming, marcas de tiempo, diarización, formatos especiales o idioma restringido.",
+    "optimisticBasicTranscription": "Probar modelos de audio que no han informado soporte de transcripción",
+    "optimisticBasicTranscriptionHint": "Cuando ningún miembro confirma soporte para /v1/audio/transcriptions, usa como respaldo miembros cuyas capacidades no se informaron, pero solo para transcripción JSON simple, sin streaming y sin idioma, marcas de tiempo ni diarización.",
     "removeMember": "Eliminar miembro",
     "removeMemberDescription": "Este modelo dejará de recibir tráfico mediante el pool.",
     "removeMemberTitle": "Eliminar miembro del pool",
@@ -689,6 +745,7 @@
       "replacementSecret": "Secreto de reemplazo",
       "upstreamModel": "ID de modelo ascendente",
       "nativeSurface": "Superficie de API nativa",
+      "legacySurfaceGroup": "Heredado",
       "streaming": "Admite streaming",
       "anthropicVersion": "Versión del protocolo Anthropic",
       "anthropicBetas": "Betas de Anthropic permitidas (separadas por comas)",

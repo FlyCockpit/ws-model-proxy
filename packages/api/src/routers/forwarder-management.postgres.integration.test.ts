@@ -186,7 +186,7 @@ integration("guarded pool setup with real PostgreSQL", () => {
           physicalCountStrategy: "ENGINE_REPORTED",
           contextMargin: 1_024,
           borrowPolicy: "NEVER",
-          protocolAdaptationEnabled: false,
+          protocolAdaptationEnabled: true,
           allowLossyDeveloperRoleCollapse: true,
           affinity: {
             enabled: true,
@@ -266,7 +266,7 @@ integration("guarded pool setup with real PostgreSQL", () => {
         physicalCountStrategy: "ENGINE_REPORTED",
         contextMargin: 1_024,
         borrowPolicy: "NEVER",
-        protocolAdaptationEnabled: false,
+        protocolAdaptationEnabled: true,
         allowLossyDeveloperRoleCollapse: true,
         affinity: {
           enabled: true,
@@ -314,7 +314,7 @@ integration("guarded pool setup with real PostgreSQL", () => {
       },
     });
     expect(persisted).toMatchObject({
-      protocolAdaptationEnabled: false,
+      protocolAdaptationEnabled: true,
       allowLossyDeveloperRoleCollapse: true,
       capacityContextMargin: 1_024,
       capacityBorrowPolicy: "NEVER",

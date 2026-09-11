@@ -51,7 +51,6 @@ vi.mock("@ws-model-proxy/ui/components/dialog", () => ({
   DialogTitle: ({ children }: { children: React.ReactNode }) => <h1>{children}</h1>,
 }));
 
-import { capacityDerivedDefaults } from "../hooks/use-capacity-derived-defaults";
 import {
   combinedPrimarySurfaceIsSelectable,
   minimumSelectedPhysicalContext,
@@ -60,7 +59,6 @@ import {
   providerOrderAfterToggle,
   recommendedCombinedPrimarySurface,
   recommendedPrimarySurface,
-  safeContextControls,
 } from "../lib/guarded-pool-wizard-validation";
 import {
   budgetIntegerRule,
@@ -107,7 +105,9 @@ function renderStep(initialStep: 0 | 1 | 2 | 3, initialProviderModelIds: string[
         onOpenChange={() => undefined}
         directModels={[localModel]}
         initialStep={initialStep}
+        protocolAdaptationAvailable
         initialProviderModelIds={initialProviderModelIds}
+        capacityEnabled
       />
     </QueryClientProvider>,
   );
@@ -170,7 +170,9 @@ describe("GuardedPoolSetupWizard", () => {
     const capacity = renderStep(1);
     expect(capacity).toContain("dashboard:pools.wizard.advanced.title");
     expect(capacity).toContain("dashboard:pools.wizard.fields.physicalCountStrategy");
-    expect(capacity).toContain("dashboard:pools.wizard.fields.protocolAdaptationEnabled");
+    expect(capacity).toContain("dashboard:pools.protocolCompatibility");
+    for (const option of ["native", "lossless", "lossy"])
+      expect(capacity).toContain(`dashboard:pools.protocolOptions.${option}.label`);
     expect(capacity).toContain("dashboard:pools.wizard.fields.affinityEnabled");
     expect(capacity).toContain("dashboard:pools.wizard.advanced.memberOverrides");
     expect(capacity).toContain("sm:grid-cols-2");
@@ -225,7 +227,7 @@ describe("GuardedPoolSetupWizard", () => {
     expect(focused).toBe(true);
   });
 
-  it("derives safe member defaults only when customization is enabled by the caller", () => {
+  it("defaults member context controls to inherit without a synthetic margin", () => {
     expect(
       deriveMemberOverride({
         memberConcurrencyLimit: 3,
@@ -242,10 +244,23 @@ describe("GuardedPoolSetupWizard", () => {
       borrowPolicy: "NEVER",
       waitBudgetMode: "LIMITED",
       waitBudgetMs: 12_000,
-      contextCeilingMode: "LIMITED",
+      contextCeilingMode: "INHERIT",
       contextCeiling: 30_000,
       contextMargin: 2_000,
     });
+  });
+
+  it("uses the model declaration before physical capacity and leaves an unknown LIMITED value empty", () => {
+    const values = {
+      memberConcurrencyLimit: 1,
+      reservedSlots: 0,
+      borrowPolicy: "WHEN_IDLE" as const,
+      localWaitBudgetMs: 30_000,
+      memberContextCeiling: null,
+      contextMargin: 0,
+    };
+    expect(deriveMemberOverride(values, 128_000, 8_192).contextCeiling).toBe(128_000);
+    expect(deriveMemberOverride(values).contextCeiling).toBeNull();
   });
 
   it("enables a member editor through its keyboard-operable checkbox callback", () => {
@@ -278,14 +293,18 @@ describe("GuardedPoolSetupWizard", () => {
   });
 
   it("renders and detects a model-specific physical context error", () => {
-    const value = deriveMemberOverride({
-      memberConcurrencyLimit: 1,
-      reservedSlots: 0,
-      borrowPolicy: "WHEN_IDLE",
-      localWaitBudgetMs: 30_000,
-      memberContextCeiling: 32_000,
+    const value = {
+      ...deriveMemberOverride({
+        memberConcurrencyLimit: 1,
+        reservedSlots: 0,
+        borrowPolicy: "WHEN_IDLE",
+        localWaitBudgetMs: 30_000,
+        memberContextCeiling: 32_000,
+        contextMargin: 1_000,
+      }),
+      contextCeilingMode: "LIMITED" as const,
       contextMargin: 1_000,
-    });
+    };
     expect(memberContextFitsPhysical(value, 32_768)).toBe(false);
     const markup = renderToStaticMarkup(
       MemberOverrideEditor({
@@ -300,6 +319,8 @@ describe("GuardedPoolSetupWizard", () => {
     );
     expect(markup).toContain('aria-invalid="true"');
     expect(markup).toContain("localized context error");
+    expect(markup).toContain('<option value="INHERIT">');
+    expect((markup.match(/value="INHERIT"/g) ?? []).length).toBe(1);
   });
 
   it("serializes independent LIMITED and UNLIMITED budget transitions", () => {
@@ -410,33 +431,7 @@ describe("GuardedPoolSetupWizard", () => {
     ).toBe(32_768);
   });
 
-  it("applies delayed capacity defaults without replacing explicit stricter edits", () => {
-    expect(
-      capacityDerivedDefaults({
-        selectedIds: ["local"],
-        models: [localModel],
-        capacities: [],
-        contextCeilingCustomized: false,
-        contextMarginCustomized: false,
-      }),
-    ).toBeNull();
-    expect(
-      capacityDerivedDefaults({
-        selectedIds: ["local"],
-        models: [localModel],
-        capacities: [{ id: "capacity", physicalMaxContext: 8_192 }],
-        contextCeilingCustomized: true,
-        contextMarginCustomized: false,
-      }),
-    ).toEqual({ contextCeiling: undefined, contextMargin: 1_024 });
-  });
-
-  it("derives a positive global ceiling and heterogeneous per-member defaults", () => {
-    expect(safeContextControls(8_192)).toEqual({
-      contextCeiling: 7_168,
-      contextMargin: 1_024,
-    });
-    expect(safeContextControls(512)).toEqual({ contextCeiling: 1, contextMargin: 511 });
+  it("keeps inherited defaults and carries a configured margin into an explicit override", () => {
     expect(
       deriveMemberOverride(
         {
@@ -448,7 +443,8 @@ describe("GuardedPoolSetupWizard", () => {
           contextMargin: 1_024,
         },
         8_192,
+        4_096,
       ),
-    ).toMatchObject({ contextCeiling: 7_168, contextMargin: 1_024 });
+    ).toMatchObject({ contextCeilingMode: "INHERIT", contextMargin: 1_024 });
   });
 });

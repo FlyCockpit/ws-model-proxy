@@ -72,6 +72,7 @@
     },
     "emptyModels": "No visible models are available.",
     "emptyTranscript": "No messages yet.",
+    "createPool": "Create a pool",
     "errors": {
       "modelsFailed": "Failed to load visible models.",
       "streamFailed": "Failed to stream the response."
@@ -91,14 +92,25 @@
     "loadFixture": "Load {{count}}",
     "metrics": {
       "ttft": "TTFT {{value}} s",
-      "tokensPerSecond": "{{value}} tok/s after first token ({{count}} completion tokens)",
       "tokensPerSecondShared": "{{value}} shared-tokenizer tok/s after first token ({{count}} completion tokens)",
       "throughputUnavailable": "Throughput unavailable — shared tokenizer could not count the completion"
     },
     "modelFilterEmpty": "No models match",
     "modelFilterPlaceholder": "Filter models…",
     "modelPicker": "Model",
+    "modelKinds": {
+      "direct": "Direct",
+      "pool": "Pool"
+    },
     "regenerate": "Regenerate",
+    "requestSettings": "Request settings",
+    "requestSettingsHelp": "Choose the API surface, routing preference, and reasoning level for the next request.",
+    "maxTokens": {
+      "label": "Maximum output tokens",
+      "help": "Used for Anthropic Messages requests. Thinking may require a higher minimum."
+    },
+    "samplePromptOne": "Explain this model's capabilities.",
+    "samplePromptTwo": "Give me a concise test plan.",
     "routingMode": {
       "label": "Pool route mode",
       "PREFER_NATIVE": "Preferred API (native first)",
@@ -199,6 +211,7 @@
   "nav": {
     "ariaLabel": "Dashboard sections",
     "chatTest": "Chat test",
+    "capacity": "Capacity",
     "cliTokens": "CLI tokens",
     "clis": "CLIs",
     "modelApiTokens": "Model API tokens",
@@ -207,9 +220,10 @@
     "relayMetadata": "Relay metadata"
   },
   "pools": {
+    "notFound": "This pool was not found or is no longer available to you.",
     "affinity": {
       "title": "Cache-aware routing",
-      "description": "New sessions go to the member with the best availability score (load, health, public-egress, and cost). When those scores tie, prefer a runtime that may still hold a matching instruction prefix. After an assistant or tool turn, prefer the member that served the conversation so far. A long conversation can outweigh modest load or a half-open member; a large queue still spills the request.",
+      "description": "New sessions go to the member with the best availability score (load, health, public-egress, and cost). When those scores tie, prefer a runtime that may still hold a matching instruction prefix. System-prompt-aware routing is part of this switch. After an assistant or tool turn, prefer the member that served the conversation so far. A long conversation can outweigh modest load or a half-open member; a large queue still spills the request.",
       "enabled": "Enable optional cache affinity",
       "stats": "{{records}} active records across {{targets}} targets",
       "clear": "Clear affinity records",
@@ -225,6 +239,9 @@
     "capacity": {
       "title": "Shared local capacity",
       "description": "Keep pools within the real concurrency and context limits of the runtime they share.",
+      "disabledReason": "Capacity management is disabled for this deployment. These controls are unavailable.",
+      "settingsLoading": "Deployment settings are still loading. Capacity controls are unavailable until they finish.",
+      "settingsFailed": "Could not load deployment settings. Capacity controls are unavailable until settings can be loaded.",
       "create": "Add capacity",
       "createTitle": "Configure shared capacity",
       "createDescription": "Identify one local runtime and set conservative physical limits. You can attach models after saving.",
@@ -296,6 +313,7 @@
     "allowLossyDeveloperRoleCollapse": "Allow lossy developer-role collapse",
     "compatibilityDetails": "Protocol compatibility matrix",
     "enableProtocolAdaptation": "Enable strict-subset protocol adaptation",
+    "protocolAdaptationDisabledReason": "Protocol translation is turned off for this deployment.",
     "lossyDeveloperRoleWarning": "Warning: developer instructions may be merged into the system role. Requests containing both roles remain rejected unless this is enabled.",
     "limitations": {
       "native_extensions_unavailable": "native extensions unavailable",
@@ -306,9 +324,45 @@
     "noneAvailable": "None available",
     "protocolCompatibility": "Protocol compatibility",
     "protocolCompatibilityHint": "Adaptation is opt-in and rejects features outside the documented strict common subset.",
+    "protocolOptions": {
+      "native": {
+        "label": "Native only (recommended)",
+        "help": "Members answer only API formats they implement; other formats return 400."
+      },
+      "lossless": {
+        "label": "Lossless translation",
+        "help": "Translate between Chat Completions, Responses, and Anthropic Messages when the request can be represented exactly."
+      },
+      "lossy": {
+        "label": "Lossless, plus allow instruction merge",
+        "help": "Also merge system and developer instructions for Anthropic's single instruction channel; their priority distinction is lost."
+      }
+    },
+    "protocolRejectedTitle": "What gets rejected",
+    "protocolRejectedHelp": "Translation still rejects reasoning, structured output, hosted or parallel tools, stateful Responses, audio, video, betas, and other features that cannot be represented exactly.",
     "recommendedAutomatic": "Automatic recommendation",
     "recommendedSurface": "Recommended API",
-    "recommendedSurfaceOverride": "Recommended API override",
+    "recommendedSurfaceOverride": "Recommended API (advisory)",
+    "detailNavAriaLabel": "Pool sections",
+    "tabs": {
+      "overview": "Overview",
+      "fallback": "Fallback & overflow",
+      "routing": "Routing",
+      "capacity": "Capacity",
+      "media": "Media",
+      "access": "Access"
+    },
+    "fallbackDescription": "Public overflow is tried only after local members are at capacity or unhealthy.",
+    "fallbackDisabledDeployment": "Fallback providers are turned off for this deployment.",
+    "fallbackEmpty": "No fallback providers. When your local members are at capacity or unhealthy, requests fail instead of overflowing.",
+    "fallbackSteps": {
+      "account": "Add a provider account and credential",
+      "model": "Add a model and its pricing",
+      "ceiling": "Set a spend ceiling",
+      "acknowledge": "Acknowledge that requests leave this deployment"
+    },
+    "addFallbackProvider": "Add fallback provider",
+    "accessEgressHint": "Granting access to a pool with providers requires an egress acknowledgement.",
     "streaming": "streaming",
     "surfaceCounts": "{{native}} native · {{adapted}} adapted · {{unavailable}} unavailable",
     "surfaceTierCounts": "{{tier}}: {{native}} native · {{adapted}} adapted · {{unavailable}} unavailable",
@@ -356,7 +410,7 @@
         "dailySpendLimit": "Daily spend ceiling",
         "localWaitBudgetMs": "Local wait before provider overflow (ms)",
         "memberConcurrencyLimit": "Pool member concurrency ceiling",
-        "memberContextCeiling": "Pool member context ceiling",
+        "memberContextCeiling": "Pool context ceiling (optional)",
         "physicalConcurrencyLimit": "Physical runtime concurrency ceiling",
         "physicalMaxContext": "Physical runtime maximum context",
         "providerConcurrencyLimit": "Provider concurrency ceiling",
@@ -367,7 +421,8 @@
         "reservedSlots": "Private reserved slots",
         "waitMs": "Local wait before overflow (ms)",
         "physicalCountStrategy": "Physical token count strategy",
-        "contextMargin": "Pool context safety margin",
+        "contextMargin": "Pool context safety margin (defaults to 0)",
+        "memberContextInheritHint": "Inherits the optional pool ceiling; no member ceiling is set.",
         "borrowPolicy": "Pool borrowing policy",
         "protocolAdaptationEnabled": "Allow strict protocol adaptation when a native surface is unavailable",
         "allowLossyDeveloperRoleCollapse": "Allow lossy developer/instruction role collapse",
@@ -428,7 +483,7 @@
         "localModelIds": "Select at least one local model.",
         "localWaitBudgetMs": "Enter a finite local wait from 0 to 600000 ms.",
         "memberConcurrencyLimit": "Enter a member concurrency limit from 1 to 10000.",
-        "memberContextCeiling": "Member context must be positive and no larger than physical context.",
+        "memberContextCeiling": "When set, the context ceiling must be positive and no larger than physical context.",
         "name": "Enter a pool name.",
         "providerConcurrencyLimit": "Enter a whole-number provider concurrency ceiling from 1 to 10000.",
         "providerModelIds": "Select no more than 32 provider models.",
@@ -483,6 +538,7 @@
     "editDescription": "Update the pool slug, display name, description, or media transformer.",
     "editMemberDescription": "Change member routing controls.",
     "editMemberTitle": "Edit pool member",
+    "editPool": "Edit {{pool}}",
     "editTitle": "Edit pool",
     "email": "Email",
     "empty": "No model pools yet.",
@@ -541,8 +597,8 @@
     "noDirectModels": "No direct models are available to add.",
     "noGrants": "No grants yet.",
     "noMembers": "No members yet.",
-    "optimisticBasicTranscription": "Allow unknown members for basic transcription",
-    "optimisticBasicTranscriptionHint": "Confirmed-compatible members are always tried first. Unknown members are fallback-only and never receive streaming, timestamps, diarization, special formats, or language-constrained requests.",
+    "optimisticBasicTranscription": "Try audio models that haven't reported transcription support",
+    "optimisticBasicTranscriptionHint": "When no member is confirmed to support /v1/audio/transcriptions, fall back to members whose capabilities are simply unreported, but only for plain JSON, non-streaming transcription with no language, timestamps, or diarization.",
     "removeMember": "Remove member",
     "removeMemberDescription": "This model will no longer receive traffic through the pool.",
     "removeMemberTitle": "Remove pool member",
@@ -766,6 +822,7 @@
       "replacementSecret": "Replacement secret",
       "upstreamModel": "Upstream model ID",
       "nativeSurface": "Native API surface",
+      "legacySurfaceGroup": "Legacy",
       "streaming": "Supports streaming",
       "anthropicVersion": "Anthropic protocol version",
       "anthropicBetas": "Allowed Anthropic betas (comma-separated)",

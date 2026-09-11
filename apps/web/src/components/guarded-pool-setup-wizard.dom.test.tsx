@@ -70,14 +70,25 @@ vi.mock("@/utils/orpc", () => ({
     },
   },
 }));
-vi.mock("@ws-model-proxy/ui/components/dialog", () => ({
-  Dialog: ({ open, children }: { open: boolean; children: ReactNode }) => (open ? children : null),
-  DialogContent: ({ children }: { children: ReactNode }) => <section>{children}</section>,
-  DialogDescription: ({ children }: { children: ReactNode }) => <p>{children}</p>,
-  DialogFooter: ({ children }: { children: ReactNode }) => <footer>{children}</footer>,
-  DialogHeader: ({ children }: { children: ReactNode }) => <header>{children}</header>,
-  DialogTitle: ({ children }: { children: ReactNode }) => <h1>{children}</h1>,
-}));
+vi.mock("@ws-model-proxy/ui/components/dialog", async () => {
+  const { createContext, useContext } = await import("react");
+  const DialogRootContext = createContext(false);
+  return {
+    Dialog: ({ open, children }: { open: boolean; children: ReactNode }) =>
+      open ? <DialogRootContext.Provider value>{children}</DialogRootContext.Provider> : null,
+    DialogContent: ({ children }: { children: ReactNode }) => <section>{children}</section>,
+    DialogDescription: ({ children }: { children: ReactNode }) => {
+      if (!useContext(DialogRootContext)) throw new Error("Dialog.Root context is required");
+      return <p>{children}</p>;
+    },
+    DialogFooter: ({ children }: { children: ReactNode }) => <footer>{children}</footer>,
+    DialogHeader: ({ children }: { children: ReactNode }) => <header>{children}</header>,
+    DialogTitle: ({ children }: { children: ReactNode }) => {
+      if (!useContext(DialogRootContext)) throw new Error("Dialog.Root context is required");
+      return <h1>{children}</h1>;
+    },
+  };
+});
 vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
   toast: { success: vi.fn(), error: vi.fn() },
 }));
@@ -111,11 +122,18 @@ const models = [
   },
 ];
 
-function mount(open = true) {
+function mount(open = true, protocolAdaptationAvailable = true, initialStep: 0 | 1 | 2 | 3 = 0) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const view = render(
     <QueryClientProvider client={client}>
-      <GuardedPoolSetupWizard open={open} onOpenChange={() => undefined} directModels={models} />
+      <GuardedPoolSetupWizard
+        open={open}
+        onOpenChange={() => undefined}
+        directModels={models}
+        capacityEnabled
+        protocolAdaptationAvailable={protocolAdaptationAvailable}
+        initialStep={initialStep}
+      />
     </QueryClientProvider>,
   );
   return { ...view, client };
@@ -130,6 +148,54 @@ afterEach(() => {
 });
 
 describe("GuardedPoolSetupWizard mounted workflow", () => {
+  it("renders page mode without Dialog.Root-dependent primitives", () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <GuardedPoolSetupWizard
+          open
+          page
+          onOpenChange={() => undefined}
+          directModels={models}
+          capacityEnabled
+          protocolAdaptationAvailable
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByText("dashboard:pools.wizard.title")).toBeTruthy();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("keeps affinity available when protocol adaptation is disabled by deployment", () => {
+    mount(true, false, 1);
+
+    const adaptation = screen.getByRole("radio", {
+      name: "dashboard:pools.protocolOptions.lossless.label",
+    });
+    const lossy = screen.getByRole("radio", {
+      name: "dashboard:pools.protocolOptions.lossy.label",
+    });
+    const affinity = screen.getByRole("checkbox", {
+      name: "dashboard:pools.wizard.fields.affinityEnabled",
+    });
+    expect((adaptation as HTMLInputElement).disabled).toBe(true);
+    expect((lossy as HTMLInputElement).disabled).toBe(true);
+    expect(affinity.getAttribute("aria-disabled")).toBeNull();
+    expect(screen.getByText("dashboard:pools.protocolAdaptationDisabledReason")).toBeTruthy();
+  });
+
+  it("selects lossless instruction merge from the protocol radio", async () => {
+    const user = userEvent.setup();
+    mount(true, true, 1);
+
+    const lossy = screen.getByRole("radio", {
+      name: "dashboard:pools.protocolOptions.lossy.label",
+    });
+    await user.click(lossy);
+    expect((lossy as HTMLInputElement).checked).toBe(true);
+  });
+
   it("does not fetch candidates or capacities while closed", async () => {
     mount(false);
 
@@ -147,7 +213,13 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
 
     view.rerender(
       <QueryClientProvider client={view.client}>
-        <GuardedPoolSetupWizard open onOpenChange={() => undefined} directModels={models} />
+        <GuardedPoolSetupWizard
+          open
+          onOpenChange={() => undefined}
+          directModels={models}
+          capacityEnabled
+          protocolAdaptationAvailable
+        />
       </QueryClientProvider>,
     );
 
@@ -187,11 +259,11 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
             "dashboard:pools.wizard.fields.memberContextCeiling",
           ) as HTMLInputElement
         ).value,
-      ).toBe("3072"),
+      ).toBe(""),
     );
 
     await user.click(screen.getByText("dashboard:pools.wizard.advanced.title"));
-    await user.click(screen.getByText("dashboard:pools.wizard.fields.protocolAdaptationEnabled"));
+    await user.click(screen.getByText("dashboard:pools.protocolOptions.lossless.label"));
     const memberEditor = screen.getByRole("group", { name: "owner/cli/chat" });
     await user.click(within(memberEditor).getByText("owner/cli/chat"));
     await user.click(within(memberEditor).getByText("pools.wizard.fields.enableMemberOverride"));
@@ -248,6 +320,7 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
     expect(state.submitted).toMatchObject({
       slug: "guarded-pool",
       recommendedSurface: "OPENAI_RESPONSES",
+      memberContextCeiling: null,
       publicEgressAcknowledged: true,
       providerModels: [
         {
@@ -265,7 +338,15 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
       ],
       advanced: {
         protocolAdaptationEnabled: true,
-        memberOverrides: [{ discoveredModelId: "chat", concurrency: { limitValue: 2 } }],
+        contextMargin: 0,
+        memberOverrides: [
+          {
+            discoveredModelId: "chat",
+            concurrency: { limitValue: 2 },
+            contextCeiling: { mode: "INHERIT", limitValue: null },
+            contextMargin: 0,
+          },
+        ],
       },
     });
   });

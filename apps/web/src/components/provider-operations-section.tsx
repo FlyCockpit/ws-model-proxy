@@ -981,12 +981,16 @@ export function ProviderOperationsSection() {
                             "OPENAI_CHAT_COMPLETIONS",
                             "OPENAI_RESPONSES",
                             "ANTHROPIC_MESSAGES",
-                            "OPENAI_COMPLETIONS",
                           ].map((surface) => (
                             <option key={surface} value={surface}>
                               {t(`dashboard:models.surfaces.${surface}`)}
                             </option>
                           ))}
+                          <optgroup label={t("dashboard:providers.fields.legacySurfaceGroup")}>
+                            <option value="OPENAI_COMPLETIONS">
+                              {t("dashboard:models.surfaces.OPENAI_COMPLETIONS")}
+                            </option>
+                          </optgroup>
                         </select>
                       </Field>
                     )}
