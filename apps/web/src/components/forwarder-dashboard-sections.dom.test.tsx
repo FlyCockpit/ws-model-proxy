@@ -8,6 +8,7 @@ const state = vi.hoisted(() => ({
   mutationCalls: [] as string[],
   mutationPayloads: [] as Array<{ name: string; input: unknown }>,
   protocolAdaptationAvailable: true,
+  nextReject: null as { name: string; error: unknown } | null,
 }));
 
 vi.mock("react-i18next", () => ({
@@ -27,6 +28,11 @@ vi.mock("@/utils/orpc", () => {
       mutationFn: async (input: unknown) => {
         state.mutationCalls.push(name);
         state.mutationPayloads.push({ name, input });
+        if (state.nextReject?.name === name) {
+          const error = state.nextReject.error;
+          state.nextReject = null;
+          throw error;
+        }
         return name === "addPoolMember"
           ? { id: "member-1", executionTargetId: "target-1" }
           : { id: "pool-1" };
@@ -181,6 +187,7 @@ afterEach(() => {
   cleanup();
   state.mutationCalls = [];
   state.mutationPayloads = [];
+  state.nextReject = null;
 });
 
 describe("PoolForm protocol adaptation controls", () => {
@@ -296,6 +303,72 @@ describe("PoolForm protocol adaptation controls", () => {
 
     await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
     expect(state.mutationPayloads[0]?.input).not.toHaveProperty("capacityPriority");
+  });
+
+  it("maps a SURFACE_NOT_SUPPORTED update rejection onto the recommended-API field", async () => {
+    state.nextReject = {
+      name: "updateModelPool",
+      error: Object.assign(new Error("surface mismatch"), {
+        code: "BAD_REQUEST",
+        data: { reason: "SURFACE_NOT_SUPPORTED" },
+      }),
+    };
+    mount(true, { mode: "edit", sections: ["routing"] });
+
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(
+      screen.getByText("dashboard:pools.wizard.createErrors.SURFACE_NOT_SUPPORTED"),
+    ).toBeTruthy();
+
+    // Changing the recommended-API choice clears the inline rejection.
+    fireEvent.change(screen.getByLabelText("dashboard:pools.recommendedSurfaceOverride"), {
+      target: { value: "OPENAI_RESPONSES" },
+    });
+    expect(
+      screen.queryByText("dashboard:pools.wizard.createErrors.SURFACE_NOT_SUPPORTED"),
+    ).toBeNull();
+
+    // Changing the protocol adaptation choice clears it too.
+    state.nextReject = {
+      name: "updateModelPool",
+      error: Object.assign(new Error("surface mismatch"), {
+        code: "BAD_REQUEST",
+        data: { reason: "SURFACE_NOT_SUPPORTED" },
+      }),
+    };
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+    await waitFor(() =>
+      expect(
+        screen.getByText("dashboard:pools.wizard.createErrors.SURFACE_NOT_SUPPORTED"),
+      ).toBeTruthy(),
+    );
+    fireEvent.click(screen.getByLabelText("dashboard:pools.protocolOptions.lossless.label"));
+    expect(
+      screen.queryByText("dashboard:pools.wizard.createErrors.SURFACE_NOT_SUPPORTED"),
+    ).toBeNull();
+  });
+
+  it("lets non-surface update rejections propagate untouched", async () => {
+    const other = Object.assign(new Error("unrelated"), {
+      code: "BAD_REQUEST",
+      data: { reason: "PROVIDER_NOT_READY" },
+    });
+    state.nextReject = { name: "updateModelPool", error: other };
+    mount(true, { mode: "edit", sections: ["routing"] });
+
+    const save = screen.getByRole("button", { name: "common:actions.save" });
+    fireEvent.click(save);
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    // The rejection is not mapped to the recommended-API field: the promise
+    // chain propagates it (unhandled in this harness) and no inline copy is
+    // rendered.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(
+      screen.queryByText("dashboard:pools.wizard.createErrors.SURFACE_NOT_SUPPORTED"),
+    ).toBeNull();
   });
 });
 

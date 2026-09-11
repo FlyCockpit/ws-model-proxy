@@ -1,6 +1,10 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  type GuardedPoolCreateFailureReason,
+  isGuardedPoolCreateFailureReason,
+} from "@ws-model-proxy/api/lib/guarded-pool-create-reasons";
+import {
   parseOpenAiCompatibleCapabilities,
   resolveEffectiveCapabilityMetadata,
   transformerSupportedModalities,
@@ -119,6 +123,19 @@ type PoolSurface = (typeof poolSurfaceValues)[number];
 
 function poolSurfaceOverrideValue(value: string | null | undefined): PoolSurface | "" {
   return value && poolSurfaceValues.includes(value as PoolSurface) ? (value as PoolSurface) : "";
+}
+
+/**
+ * Extracts the machine-readable failure reason from a pool mutation error,
+ * mirroring the wizard's create-path extraction: never trust the envelope
+ * shape and never surface `error.message` directly.
+ */
+function poolMutationFailureReason(error: unknown): GuardedPoolCreateFailureReason | null {
+  if (!error || typeof error !== "object") return null;
+  const { data } = error as { data?: unknown };
+  if (!data || typeof data !== "object") return null;
+  const { reason } = data as { reason?: unknown };
+  return isGuardedPoolCreateFailureReason(reason) ? reason : null;
 }
 
 function copyToClipboard(value: string, message: string) {
@@ -1571,6 +1588,9 @@ export function PoolForm({
   const show = (section: "identity" | "routing" | "capacity" | "media") =>
     sections.includes(section);
   const queryClient = useQueryClient();
+  // Inline server rejection on the recommended-API field (update path only;
+  // the guarded wizard owns its own create-failure surface).
+  const [surfaceUnsupported, setSurfaceUnsupported] = useState(false);
   const poolSchema = z.object({
     slug: z
       .string()
@@ -1712,6 +1732,7 @@ export function PoolForm({
     },
     validators: { onSubmit: poolSchema },
     onSubmit: async ({ value }) => {
+      setSurfaceUnsupported(false);
       const transformer = {
         transformerDiscoveredModelId: value.transformerDiscoveredModelId.trim()
           ? value.transformerDiscoveredModelId.trim()
@@ -1810,7 +1831,18 @@ export function PoolForm({
       } else if (pool) {
         const updateInput: Parameters<typeof updatePool.mutateAsync>[0] = { id: pool.id };
         Object.assign(updateInput, identity, media, routing, capacityPolicy);
-        await updatePool.mutateAsync(updateInput);
+        try {
+          await updatePool.mutateAsync(updateInput);
+        } catch (error) {
+          // The server revalidates recommended-surface selectability on
+          // input-touching updates; map that rejection onto the field instead
+          // of letting it surface as a generic failure.
+          if (poolMutationFailureReason(error) === "SURFACE_NOT_SUPPORTED") {
+            setSurfaceUnsupported(true);
+            return;
+          }
+          throw error;
+        }
         toast.success(t("dashboard:pools.updated"));
         onSuccess();
       }
@@ -1889,9 +1921,10 @@ export function PoolForm({
                   id={field.name}
                   className="flex h-11 w-full rounded-md border border-input bg-transparent px-3 text-sm"
                   value={field.state.value}
-                  onChange={(event) =>
-                    field.handleChange(event.target.value as typeof field.state.value)
-                  }
+                  onChange={(event) => {
+                    setSurfaceUnsupported(false);
+                    field.handleChange(event.target.value as typeof field.state.value);
+                  }}
                 >
                   <option value="">{t("dashboard:pools.recommendedAutomatic")}</option>
                   {poolSurfaceValues.map((surface) => (
@@ -1900,6 +1933,11 @@ export function PoolForm({
                     </option>
                   ))}
                 </select>
+                {surfaceUnsupported ? (
+                  <p className="text-sm text-destructive">
+                    {t("dashboard:pools.wizard.createErrors.SURFACE_NOT_SUPPORTED")}
+                  </p>
+                ) : null}
               </div>
             )}
           </form.Field>
@@ -1916,6 +1954,10 @@ export function PoolForm({
                 protocolAdaptationAvailable={protocolAdaptationAvailable}
                 idPrefix="pool"
                 onChange={(value) => {
+                  // Mirrors the override select: changing the adaptation
+                  // choice invalidates a pending SURFACE_NOT_SUPPORTED
+                  // rejection, so clear the inline error.
+                  setSurfaceUnsupported(false);
                   form.setFieldValue("protocolAdaptationEnabled", value.adaptationEnabled);
                   form.setFieldValue(
                     "allowLossyDeveloperRoleCollapse",

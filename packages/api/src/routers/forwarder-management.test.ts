@@ -3224,6 +3224,9 @@ describe("forwarderManagementRouter", () => {
     db.providerAuditEvent.findFirst.mockResolvedValue({ id: "audit" });
     db.executionTarget.upsert.mockResolvedValue({ id: "provider-target" });
     db.poolMember.create.mockResolvedValue({ id: "primary-provider-member" });
+    // The PRIMARY surface fence reads the existing members; the pool has none,
+    // so the attachment stays valid and no overflow reorder write happens.
+    db.poolMember.findMany.mockResolvedValue([]);
 
     await expect(
       client().addProviderPoolMember({
@@ -3246,7 +3249,7 @@ describe("forwarderManagementRouter", () => {
       },
       select: { id: true },
     });
-    expect(db.poolMember.findMany).not.toHaveBeenCalled();
+    expect(db.poolMember.update).not.toHaveBeenCalled();
   });
 
   it("makes missing and cross-owner nested pool-member ids indistinguishable", async () => {
@@ -3672,5 +3675,674 @@ describe("forwarderManagementRouter", () => {
     });
     expect(db.cacheAffinityRecord.count).not.toHaveBeenCalled();
     expect(db.cacheAffinityRecord.deleteMany).not.toHaveBeenCalled();
+  });
+
+  describe("update-path recommended-surface revalidation", () => {
+    const chatNativeCapabilities = {
+      version: 3,
+      protocol: "openai-compatible",
+      surfaces: {
+        openaiChatCompletions: {
+          source: "provider",
+          confidence: "exact",
+          supported: true,
+          streaming: true,
+        },
+      },
+    };
+    const responsesNativeCapabilities = {
+      version: 3,
+      protocol: "openai-compatible",
+      surfaces: {
+        openaiResponses: {
+          source: "provider",
+          confidence: "exact",
+          supported: true,
+          streaming: true,
+        },
+      },
+    };
+
+    function surfaceMemberRow(
+      id: string,
+      native: "chat" | "responses",
+      tier: "PRIMARY" | "PUBLIC_OVERFLOW" = "PRIMARY",
+    ) {
+      return {
+        id,
+        tier,
+        discoveredModelId: null,
+        DiscoveredModel: null,
+        ExecutionTarget: {
+          DiscoveredModel: guardedLocalModel({}, native),
+          ProviderModel: null,
+        },
+      };
+    }
+
+    function surfacePoolRow(overrides: Record<string, unknown> = {}) {
+      return poolRow({
+        userId: "user-id",
+        recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        protocolAdaptationEnabled: false,
+        ...overrides,
+      });
+    }
+
+    it("keeps unrelated updates non-retroactive on a legacy-invalid stored override", async () => {
+      const stored = surfacePoolRow();
+      db.modelPool.findUnique.mockResolvedValue(stored);
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "chat")]);
+      db.modelPool.update.mockResolvedValue(surfacePoolRow({ name: "Renamed" }));
+
+      // The stored override is already unservable, but a rename touches no
+      // selectability input and must keep succeeding.
+      await expect(
+        client().updateModelPool({ id: "pool-id", name: "Renamed" }),
+      ).resolves.toMatchObject({ id: "pool-id" });
+      expect(db.modelPool.update).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects re-setting an unservable override with the create-path envelope", async () => {
+      db.modelPool.findUnique.mockResolvedValue(surfacePoolRow());
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "chat")]);
+
+      await expect(
+        client().updateModelPool({ id: "pool-id", recommendedSurfaceOverride: "OPENAI_RESPONSES" }),
+      ).rejects.toMatchObject({
+        code: "BAD_REQUEST",
+        message:
+          "Every selected primary member must serve the recommended API natively or via protocol adaptation.",
+        data: { reason: "SURFACE_NOT_SUPPORTED" },
+      });
+      expect(db.modelPool.update).not.toHaveBeenCalled();
+    });
+
+    it("accepts an input-touching update when the post-state serves the override", async () => {
+      db.modelPool.findUnique.mockResolvedValue(surfacePoolRow());
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "responses")]);
+      db.modelPool.update.mockResolvedValue(surfacePoolRow());
+
+      await expect(
+        client().updateModelPool({
+          id: "pool-id",
+          recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        }),
+      ).resolves.toMatchObject({ id: "pool-id" });
+      expect(db.modelPool.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ recommendedSurfaceOverride: "OPENAI_RESPONSES" }),
+        }),
+      );
+    });
+
+    it("repairs a stored unservable override with a servable input override", async () => {
+      // Stored state is invalid (responses override, chat-only primary). The
+      // update sends a servable chat override: the gate must validate the
+      // INPUT override, not the stored one, so the repair succeeds and
+      // persists the new value.
+      db.modelPool.findUnique.mockResolvedValue(surfacePoolRow());
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "chat")]);
+      db.modelPool.update.mockResolvedValue(
+        surfacePoolRow({ recommendedSurfaceOverride: "OPENAI_CHAT_COMPLETIONS" }),
+      );
+
+      await expect(
+        client().updateModelPool({
+          id: "pool-id",
+          recommendedSurfaceOverride: "OPENAI_CHAT_COMPLETIONS",
+        }),
+      ).resolves.toMatchObject({ id: "pool-id" });
+      expect(db.modelPool.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ recommendedSurfaceOverride: "OPENAI_CHAT_COMPLETIONS" }),
+        }),
+      );
+    });
+
+    it("resolves legacy provider inventories identically across the gate and the dashboard display", async () => {
+      const legacyProviderNative = { surfaces: ["openai-chat"], streaming: true };
+      const legacyProviderSurfaceRow = {
+        id: "provider-member",
+        tier: "PRIMARY",
+        discoveredModelId: null,
+        DiscoveredModel: null,
+        ExecutionTarget: {
+          DiscoveredModel: null,
+          ProviderModel: { nativeCapabilities: legacyProviderNative },
+        },
+      };
+
+      // Gated update path: the loader resolves the legacy inventory through
+      // the shared provider-capability path, so the chat override (which
+      // serializePool renders as natively available) must be accepted.
+      db.modelPool.findUnique.mockResolvedValue(surfacePoolRow());
+      db.poolMember.findMany.mockResolvedValue([legacyProviderSurfaceRow]);
+      db.modelPool.update.mockResolvedValue(
+        surfacePoolRow({ recommendedSurfaceOverride: "OPENAI_CHAT_COMPLETIONS" }),
+      );
+      await expect(
+        client().updateModelPool({
+          id: "pool-id",
+          recommendedSurfaceOverride: "OPENAI_CHAT_COMPLETIONS",
+        }),
+      ).resolves.toMatchObject({ id: "pool-id" });
+      expect(db.modelPool.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ recommendedSurfaceOverride: "OPENAI_CHAT_COMPLETIONS" }),
+        }),
+      );
+
+      // Dashboard display: the same legacy inventory serializes as a
+      // chat-native provider member, consistent with the accepted gate.
+      db.modelPool.findMany.mockResolvedValue([
+        poolRow({
+          recommendedSurfaceOverride: "OPENAI_CHAT_COMPLETIONS",
+          PoolMembers: [
+            {
+              id: "provider-member",
+              createdAt: new Date("2026-01-01"),
+              updatedAt: new Date("2026-01-01"),
+              discoveredModelId: null,
+              tier: "PRIMARY",
+              publicOrder: null,
+              weight: 1,
+              healthStatus: "HEALTHY",
+              routingStatus: "ACTIVE",
+              lastFailureClass: null,
+              consecutiveRetryableFailures: 0,
+              lastFailureAt: null,
+              nextRetryAt: null,
+              halfOpenTrialStartedAt: null,
+              ExecutionTarget: {
+                id: "provider-target",
+                kind: "PROVIDER_MODEL",
+                inferenceCapacityId: "provider-capacity",
+                DiscoveredModel: null,
+                ProviderModel: {
+                  id: "provider-model",
+                  upstreamModelId: "provider/model",
+                  displayName: "Provider Model",
+                  nativeCapabilities: legacyProviderNative,
+                  contextWindow: 65_536,
+                  concurrencyLimit: 4,
+                  healthStatus: "HEALTHY",
+                  enabled: true,
+                  PricingVersions: [],
+                  ProviderAccount: {
+                    id: "provider-account",
+                    label: "Account",
+                    providerType: "OPENAI",
+                    enabled: true,
+                  },
+                },
+              },
+              DiscoveredModel: null,
+            },
+          ],
+        }),
+      ]);
+      const [pool] = await client().listModelPools();
+      expect(pool?.compatibility.surfaces.OPENAI_CHAT_COMPLETIONS).toMatchObject({
+        native: 1,
+        unavailable: 0,
+      });
+      expect(pool?.members[0]?.providerModel?.surfaces.OPENAI_CHAT_COMPLETIONS).toMatchObject({
+        mode: "native",
+        streaming: true,
+      });
+      expect(pool?.compatibility.recommendedSurface).toBe("OPENAI_CHAT_COMPLETIONS");
+    });
+
+    it("rejects disabling adaptation when the override only stays servable through it", async () => {
+      // Stored state is valid: adaptation on lets the chat-native member serve
+      // the responses override. Turning the flag off strands the surface.
+      db.modelPool.findUnique.mockResolvedValue(
+        surfacePoolRow({ protocolAdaptationEnabled: true }),
+      );
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "chat")]);
+
+      await expect(
+        client().updateModelPool({ id: "pool-id", protocolAdaptationEnabled: false }),
+      ).rejects.toMatchObject({
+        code: "BAD_REQUEST",
+        data: { reason: "SURFACE_NOT_SUPPORTED" },
+      });
+      expect(db.modelPool.update).not.toHaveBeenCalled();
+
+      // Keeping adaptation on touches the same input but leaves a servable
+      // post-state, so it must succeed.
+      db.modelPool.update.mockResolvedValue(surfacePoolRow({ protocolAdaptationEnabled: true }));
+      await expect(
+        client().updateModelPool({ id: "pool-id", protocolAdaptationEnabled: true }),
+      ).resolves.toMatchObject({ id: "pool-id" });
+      expect(db.modelPool.update).toHaveBeenCalledTimes(1);
+    });
+
+    it("ignores the pool adaptation flag on update when the deployment gate is disabled", async () => {
+      testEnv.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = false;
+      db.modelPool.findUnique.mockResolvedValue(
+        surfacePoolRow({ protocolAdaptationEnabled: true }),
+      );
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "chat")]);
+
+      // The pool flag stays on, but the deployment gate is off: the
+      // adaptation-only override must still be rejected on revalidation.
+      await expect(
+        client().updateModelPool({ id: "pool-id", recommendedSurfaceOverride: "OPENAI_RESPONSES" }),
+      ).rejects.toMatchObject({
+        code: "BAD_REQUEST",
+        data: { reason: "SURFACE_NOT_SUPPORTED" },
+      });
+      expect(db.modelPool.update).not.toHaveBeenCalled();
+    });
+
+    it("accepts any override on update for a pool with no primary members", async () => {
+      db.modelPool.findUnique.mockResolvedValue(surfacePoolRow());
+      db.poolMember.findMany.mockResolvedValue([
+        surfaceMemberRow("overflow-a", "chat", "PUBLIC_OVERFLOW"),
+      ]);
+      db.modelPool.update.mockResolvedValue(surfacePoolRow());
+
+      await expect(
+        client().updateModelPool({
+          id: "pool-id",
+          recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        }),
+      ).resolves.toMatchObject({ id: "pool-id" });
+      expect(db.modelPool.update).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects attaching a local primary that cannot serve the stored override", async () => {
+      db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+      db.modelPool.findFirst.mockResolvedValue({
+        recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        protocolAdaptationEnabled: false,
+        capacityConcurrencyLimit: null,
+        capacityReservedSlots: 0,
+        capacityContextCeiling: null,
+        capacityContextMargin: 0,
+      });
+      db.discoveredModel.findUnique.mockResolvedValue(
+        guardedLocalModel({ id: "model-id", userId: "user-id" }, "chat"),
+      );
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "responses")]);
+
+      await expect(
+        client().addPoolMember({ poolId: "pool-id", discoveredModelId: "model-id" }),
+      ).rejects.toMatchObject({
+        code: "BAD_REQUEST",
+        data: { reason: "SURFACE_NOT_SUPPORTED" },
+      });
+      expect(db.executionTarget.upsert).not.toHaveBeenCalled();
+      expect(db.poolMember.create).not.toHaveBeenCalled();
+    });
+
+    it("accepts attaching a local primary that serves the stored override", async () => {
+      db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+      db.modelPool.findFirst.mockResolvedValue({
+        recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        protocolAdaptationEnabled: false,
+        capacityConcurrencyLimit: null,
+        capacityReservedSlots: 0,
+        capacityContextCeiling: null,
+        capacityContextMargin: 0,
+      });
+      db.discoveredModel.findUnique.mockResolvedValue(
+        guardedLocalModel({ id: "model-id", userId: "user-id" }, "responses"),
+      );
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "responses")]);
+      db.poolMember.create.mockResolvedValue({ id: "member-id" });
+
+      await expect(
+        client().addPoolMember({ poolId: "pool-id", discoveredModelId: "model-id" }),
+      ).resolves.toMatchObject({ id: "member-id" });
+      expect(db.poolMember.create).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects a provider primary attach that cannot serve the stored override", async () => {
+      db.modelPool.findFirst.mockResolvedValue({
+        id: "pool-id",
+        publicEgressEnabled: false,
+        publicEgressAcknowledged: true,
+        recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        protocolAdaptationEnabled: false,
+        capacityConcurrencyLimit: null,
+        capacityReservedSlots: 0,
+        capacityContextCeiling: null,
+        capacityContextMargin: 0,
+      });
+      db.providerModel.findFirst.mockResolvedValue({
+        id: "provider-model",
+        providerAccountId: "provider-account",
+        contextWindow: 8_192,
+        concurrencyLimit: 4,
+        nativeCapabilities: chatNativeCapabilities,
+        enabled: true,
+      });
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "responses")]);
+
+      await expect(
+        client().addProviderPoolMember({
+          poolId: "pool-id",
+          providerModelId: "provider-model",
+          tier: "PRIMARY",
+        }),
+      ).rejects.toMatchObject({
+        code: "BAD_REQUEST",
+        data: { reason: "SURFACE_NOT_SUPPORTED" },
+      });
+      expect(db.executionTarget.upsert).not.toHaveBeenCalled();
+      expect(db.poolMember.create).not.toHaveBeenCalled();
+    });
+
+    it("skips the surface fence for provider overflow attaches", async () => {
+      db.modelPool.findFirst.mockResolvedValue({
+        id: "pool-id",
+        publicEgressEnabled: true,
+        publicEgressAcknowledged: true,
+        recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        protocolAdaptationEnabled: false,
+        capacityConcurrencyLimit: null,
+        capacityReservedSlots: 0,
+        capacityContextCeiling: null,
+        capacityContextMargin: 0,
+      });
+      db.providerModel.findFirst.mockResolvedValue({
+        id: "provider-model",
+        providerAccountId: "provider-account",
+        contextWindow: 8_192,
+        concurrencyLimit: 4,
+        nativeCapabilities: chatNativeCapabilities,
+        enabled: true,
+      });
+      db.providerBudgetPolicy.findFirst.mockResolvedValue({
+        id: "policy",
+        activatedAt: new Date(),
+        Rules: [{ id: "rule", mode: "UNLIMITED", limitValue: null }],
+      });
+      db.providerAuditEvent.findFirst.mockResolvedValue({ id: "audit" });
+      db.executionTarget.upsert.mockResolvedValue({ id: "provider-target" });
+      db.poolMember.create.mockResolvedValue({ id: "member-id" });
+      // Overflow attaches never change the primary set. Pin the skip with a
+      // real unservable primary post-state: the chat-native primary cannot
+      // serve the stored responses override, so an always-on fence (or a fence
+      // that wrongly included overflow tiers) would reject this attach.
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("primary-a", "chat")]);
+
+      await expect(
+        client().addProviderPoolMember({
+          poolId: "pool-id",
+          providerModelId: "provider-model",
+          publicOrder: 0,
+        }),
+      ).resolves.toMatchObject({ id: "member-id" });
+      expect(db.poolMember.create).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects demoting the only primary serving the stored override", async () => {
+      const memberModelPool = {
+        userId: "user-id",
+        publicEgressEnabled: true,
+        publicEgressAcknowledged: true,
+        recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        protocolAdaptationEnabled: false,
+        capacityConcurrencyLimit: null,
+        capacityReservedSlots: 0,
+        capacityContextCeiling: null,
+        capacityContextMargin: 0,
+      };
+      db.poolMember.findUnique
+        .mockResolvedValueOnce({
+          id: "member-id",
+          poolId: "pool-id",
+          executionTargetId: "target-id",
+          ModelPool: { userId: "user-id" },
+        })
+        .mockResolvedValueOnce({
+          id: "member-id",
+          poolId: "pool-id",
+          tier: "PRIMARY",
+          publicOrder: null,
+          weight: 1,
+          routingStatus: "ACTIVE",
+          capacityConcurrencyMode: "INHERIT",
+          capacityConcurrencyLimit: null,
+          capacityReservedSlots: null,
+          capacityContextCeilingMode: "INHERIT",
+          capacityContextCeiling: null,
+          capacityContextMargin: null,
+          ExecutionTarget: {
+            ProviderModel: {
+              id: "provider-model",
+              providerAccountId: "provider-account",
+              nativeCapabilities: responsesNativeCapabilities,
+            },
+            InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: 4 },
+          },
+          ModelPool: memberModelPool,
+        });
+      db.providerBudgetPolicy.findFirst.mockResolvedValue({
+        id: "policy",
+        activatedAt: new Date(),
+        Rules: [{ id: "rule", mode: "UNLIMITED", limitValue: null }],
+      });
+      db.providerAuditEvent.findFirst.mockResolvedValue({ id: "audit" });
+      // The exclusion-free member set includes the transitioning member
+      // (member-id, responses-native). The in-place re-tag demotes it, so the
+      // remaining primary is chat-native and cannot serve the responses
+      // override once member-id leaves the primary tier.
+      db.poolMember.findMany.mockResolvedValue([
+        surfaceMemberRow("member-id", "responses"),
+        surfaceMemberRow("member-a", "chat"),
+      ]);
+
+      await expect(
+        client().updatePoolMember({ id: "member-id", tier: "PUBLIC_OVERFLOW", publicOrder: 0 }),
+      ).rejects.toMatchObject({
+        code: "BAD_REQUEST",
+        data: { reason: "SURFACE_NOT_SUPPORTED" },
+      });
+      expect(db.poolMember.update).not.toHaveBeenCalled();
+      expect(db.poolMember.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("rejects promoting an overflow member that strands the stored override", async () => {
+      const memberModelPool = {
+        userId: "user-id",
+        publicEgressEnabled: true,
+        publicEgressAcknowledged: true,
+        recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        protocolAdaptationEnabled: false,
+        capacityConcurrencyLimit: null,
+        capacityReservedSlots: 0,
+        capacityContextCeiling: null,
+        capacityContextMargin: 0,
+      };
+      db.poolMember.findUnique
+        .mockResolvedValueOnce({
+          id: "member-id",
+          poolId: "pool-id",
+          executionTargetId: "target-id",
+          ModelPool: { userId: "user-id" },
+        })
+        .mockResolvedValueOnce({
+          id: "member-id",
+          poolId: "pool-id",
+          tier: "PUBLIC_OVERFLOW",
+          publicOrder: 0,
+          weight: 1,
+          routingStatus: "ACTIVE",
+          capacityConcurrencyMode: "INHERIT",
+          capacityConcurrencyLimit: null,
+          capacityReservedSlots: null,
+          capacityContextCeilingMode: "INHERIT",
+          capacityContextCeiling: null,
+          capacityContextMargin: null,
+          ExecutionTarget: {
+            ProviderModel: {
+              id: "provider-model",
+              providerAccountId: "provider-account",
+              nativeCapabilities: chatNativeCapabilities,
+            },
+            InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: 4 },
+          },
+          ModelPool: memberModelPool,
+        });
+      // The promotion re-tags member-id (chat-native) to PRIMARY in place:
+      // the post-state primaries include a member that cannot serve the
+      // responses override, so the promotion must be fenced.
+      db.poolMember.findMany.mockResolvedValue([
+        surfaceMemberRow("member-id", "chat", "PUBLIC_OVERFLOW"),
+        surfaceMemberRow("member-a", "responses"),
+      ]);
+
+      await expect(
+        client().updatePoolMember({ id: "member-id", tier: "PRIMARY" }),
+      ).rejects.toMatchObject({
+        code: "BAD_REQUEST",
+        data: { reason: "SURFACE_NOT_SUPPORTED" },
+      });
+      expect(db.poolMember.update).not.toHaveBeenCalled();
+      expect(db.poolMember.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("accepts a tier transition that keeps the override servable", async () => {
+      db.poolMember.findUnique
+        .mockResolvedValueOnce({
+          id: "member-id",
+          poolId: "pool-id",
+          executionTargetId: "target-id",
+          ModelPool: { userId: "user-id" },
+        })
+        .mockResolvedValueOnce({
+          id: "member-id",
+          poolId: "pool-id",
+          tier: "PRIMARY",
+          publicOrder: null,
+          weight: 1,
+          routingStatus: "ACTIVE",
+          capacityConcurrencyMode: "INHERIT",
+          capacityConcurrencyLimit: null,
+          capacityReservedSlots: null,
+          capacityContextCeilingMode: "INHERIT",
+          capacityContextCeiling: null,
+          capacityContextMargin: null,
+          ExecutionTarget: {
+            ProviderModel: {
+              id: "provider-model",
+              providerAccountId: "provider-account",
+              nativeCapabilities: chatNativeCapabilities,
+            },
+            InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: 4 },
+          },
+          ModelPool: {
+            userId: "user-id",
+            publicEgressEnabled: true,
+            publicEgressAcknowledged: true,
+            recommendedSurfaceOverride: "OPENAI_RESPONSES",
+            protocolAdaptationEnabled: true,
+            capacityConcurrencyLimit: null,
+            capacityReservedSlots: 0,
+            capacityContextCeiling: null,
+            capacityContextMargin: 0,
+          },
+        });
+      db.providerBudgetPolicy.findFirst.mockResolvedValue({
+        id: "policy",
+        activatedAt: new Date(),
+        Rules: [{ id: "rule", mode: "UNLIMITED", limitValue: null }],
+      });
+      db.providerAuditEvent.findFirst.mockResolvedValue({ id: "audit" });
+      // Demoting the chat-only member leaves a responses-native primary that
+      // serves the override natively, so the transition must proceed.
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "responses")]);
+      db.poolMember.update.mockResolvedValue({
+        id: "member-id",
+        weight: 0,
+        routingStatus: "ACTIVE",
+        tier: "PUBLIC_OVERFLOW",
+        publicOrder: null,
+      });
+
+      await expect(
+        client().updatePoolMember({ id: "member-id", tier: "PUBLIC_OVERFLOW", publicOrder: 0 }),
+      ).resolves.toMatchObject({ id: "member-id", tier: "PUBLIC_OVERFLOW" });
+      expect(db.poolMember.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "member-id" },
+          data: expect.objectContaining({ tier: "PUBLIC_OVERFLOW" }),
+        }),
+      );
+    });
+
+    it("rejects detaching the primary that serves the stored override", async () => {
+      db.poolMember.findUnique.mockResolvedValue({
+        id: "member-a",
+        poolId: "pool-id",
+        tier: "PRIMARY",
+        ModelPool: {
+          userId: "user-id",
+          recommendedSurfaceOverride: "OPENAI_RESPONSES",
+          protocolAdaptationEnabled: false,
+        },
+      });
+      // Only the detached member serves the override; the survivor cannot.
+      // (The mock models the exclusion query: members other than member-a.)
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-b", "chat")]);
+
+      await expect(client().removePoolMember({ id: "member-a" })).rejects.toMatchObject({
+        code: "BAD_REQUEST",
+        data: { reason: "SURFACE_NOT_SUPPORTED" },
+      });
+      expect(db.poolMember.delete).not.toHaveBeenCalled();
+    });
+
+    it("accepts detaching a primary when the survivors serve the override", async () => {
+      db.poolMember.findUnique.mockResolvedValue({
+        id: "member-a",
+        poolId: "pool-id",
+        tier: "PRIMARY",
+        ModelPool: {
+          userId: "user-id",
+          recommendedSurfaceOverride: "OPENAI_RESPONSES",
+          protocolAdaptationEnabled: false,
+        },
+      });
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-b", "responses")]);
+
+      await expect(client().removePoolMember({ id: "member-a" })).resolves.toEqual({
+        deleted: true,
+      });
+      expect(db.poolMember.delete).toHaveBeenCalledWith({
+        where: { id: "member-a" },
+      });
+      expect(db.poolMember.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { poolId: "pool-id", id: { not: "member-a" } } }),
+      );
+    });
+
+    it("accepts detaching the last primary, leaving an empty primary set", async () => {
+      db.poolMember.findUnique.mockResolvedValue({
+        id: "member-a",
+        poolId: "pool-id",
+        tier: "PRIMARY",
+        ModelPool: {
+          userId: "user-id",
+          recommendedSurfaceOverride: "OPENAI_RESPONSES",
+          protocolAdaptationEnabled: false,
+        },
+      });
+      // The surviving overflow member cannot serve the override, but an empty
+      // primary set accepts any surface (create-path parity).
+      db.poolMember.findMany.mockResolvedValue([
+        surfaceMemberRow("overflow-b", "chat", "PUBLIC_OVERFLOW"),
+      ]);
+
+      await expect(client().removePoolMember({ id: "member-a" })).resolves.toEqual({
+        deleted: true,
+      });
+      expect(db.poolMember.delete).toHaveBeenCalledTimes(1);
+    });
   });
 });
