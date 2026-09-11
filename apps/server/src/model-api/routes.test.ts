@@ -772,6 +772,186 @@ describe("model API routes", () => {
     expect(publicOverflow.dispatch).not.toHaveBeenCalled();
   });
 
+  it.each([
+    [
+      "cache hit",
+      {
+        id: "chatcmpl-cache",
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: 3,
+          prompt_tokens_details: { cached_tokens: 5 },
+        },
+      },
+      true,
+    ],
+    [
+      "reported-zero cache read",
+      {
+        id: "chatcmpl-miss",
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: 3,
+          prompt_tokens_details: { cached_tokens: 0 },
+        },
+      },
+      false,
+    ],
+    [
+      "usage without cache fields",
+      { id: "chatcmpl-plain", usage: { prompt_tokens: 10, completion_tokens: 3 } },
+      undefined,
+    ],
+  ] as const)(
+    "records engine cache confirmation from relayed usage evidence on %s",
+    async (_label, responseBody, engineCacheConfirmed) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+          affinityEnabled: true,
+        }),
+        poolMemberRow({
+          id: "member-b",
+          discoveredModelId: "model-b",
+          upstreamModelId: "upstream-b",
+          cliDeviceId: "cli-b",
+          affinityEnabled: true,
+        }),
+      ]);
+      affinity.rank.mockResolvedValue({
+        orderedTargetIds: ["member-b-target", "member-a-target"],
+        scores: { "member-b-target": 200 },
+        prefixDepths: { "member-b-target": 2 },
+        conversationMatches: { "member-b-target": false },
+        reasons: { "member-b-target": "prefix:2;active:0;waiting:0" },
+        matchedPrefixDepth: 2,
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a", "cli-b"];
+      const responsePromise = appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+      manager.body(sent.requestId, JSON.stringify(responseBody));
+      manager.complete(sent.requestId);
+      const response = await responsePromise;
+      await response.text();
+      await vi.waitFor(() => expect(affinity.remember).toHaveBeenCalledTimes(1));
+      expect(affinity.remember.mock.calls[0]?.[0]).toMatchObject({
+        target: expect.objectContaining({ executionTargetId: "member-b-target" }),
+        engineCacheConfirmed,
+      });
+    },
+  );
+
+  it.each([
+    ["cache hit reported in message_start", 7, true],
+    ["reported-zero cache read in message_start", 0, false],
+  ] as const)(
+    "records engine cache confirmation from early Anthropic usage on %s in a >1MB relay stream",
+    async (_label, cacheReadInputTokens, engineCacheConfirmed) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      const anthropicCapabilities = {
+        version: 3,
+        protocol: "anthropic-compatible",
+        surfaces: {
+          anthropicMessages: {
+            source: "declared",
+            confidence: "exact",
+            supported: true,
+            streaming: true,
+            protocolVersion: "2023-06-01",
+          },
+        },
+      };
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+          affinityEnabled: true,
+          capabilityOverrideMetadata: anthropicCapabilities,
+        }),
+        poolMemberRow({
+          id: "member-b",
+          discoveredModelId: "model-b",
+          upstreamModelId: "upstream-b",
+          cliDeviceId: "cli-b",
+          affinityEnabled: true,
+          capabilityOverrideMetadata: anthropicCapabilities,
+        }),
+      ]);
+      affinity.rank.mockResolvedValue({
+        orderedTargetIds: ["member-b-target", "member-a-target"],
+        scores: { "member-b-target": 200 },
+        prefixDepths: { "member-b-target": 2 },
+        conversationMatches: { "member-b-target": false },
+        reasons: { "member-b-target": "prefix:2;active:0;waiting:0" },
+        matchedPrefixDepth: 2,
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a", "cli-b"];
+      const responsePromise = appWith(manager).request("/messages", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: poolTarget.modelId,
+          max_tokens: 32,
+          messages: [{ role: "user", content: "secret prompt" }],
+        }),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      manager.headers(sent.requestId, 200, { "content-type": "text/event-stream" });
+      // The early message_start event carries the cache evidence, then more
+      // than 1MB of content deltas pushes it out of the bounded tail window
+      // so only the retained prefix can still witness it.
+      const padding = "x".repeat(64 * 1024);
+      manager.body(
+        sent.requestId,
+        `event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":12,"cache_read_input_tokens":${cacheReadInputTokens}}}}\n\n`,
+      );
+      for (let index = 0; index < 20; index += 1) {
+        manager.body(
+          sent.requestId,
+          `event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"${padding}"}}\n\n`,
+        );
+      }
+      manager.body(
+        sent.requestId,
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
+      );
+      manager.complete(sent.requestId);
+      const response = await responsePromise;
+      await response.text();
+      await vi.waitFor(() => expect(affinity.remember).toHaveBeenCalledTimes(1));
+      expect(affinity.remember.mock.calls[0]?.[0]).toMatchObject({
+        target: expect.objectContaining({ executionTargetId: "member-b-target" }),
+        // Tail-only capture would drop message_start and derive undefined.
+        engineCacheConfirmed,
+      });
+    },
+  );
+
   it("does not rank Completions traffic even when a two-member pool has affinity enabled", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
