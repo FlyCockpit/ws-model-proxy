@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { isValidElement, type ReactElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
+import enDashboard from "../locales/en-US/dashboard.json";
 
 const queryData = vi.hoisted(() => ({ providers: [] as Array<Record<string, unknown>> }));
 
@@ -210,6 +211,29 @@ describe("GuardedPoolSetupWizard", () => {
     expect(renderStep(1)).toContain("dashboard:pools.wizard.capacityDistinctHint");
     expect(renderStep(2)).toContain("dashboard:pools.wizard.providerOrder");
     expect(renderStep(3)).toContain("dashboard:pools.wizard.atomicRollback");
+  });
+
+  it("renders only wizard field hint keys that exist in the en-US bundle", () => {
+    // The identity-mocked t() hides missing keys (raw key paths render as
+    // text), so pin every rendered *Hint key against the real bundle.
+    const markup = ([0, 1, 2, 3] as const).map((step) => renderStep(step)).join("");
+    const renderedHintKeys = [
+      ...new Set(markup.match(/dashboard:pools\.wizard\.fields\.[A-Za-z0-9]+Hint\b/g) ?? []),
+    ];
+    expect(renderedHintKeys.length).toBeGreaterThan(0);
+    const fields = (
+      enDashboard as {
+        pools: {
+          wizard: {
+            fields: Record<string, unknown>;
+          };
+        };
+      }
+    ).pools.wizard.fields;
+    const missing = renderedHintKeys.filter(
+      (key) => typeof fields[key.replace("dashboard:pools.wizard.fields.", "")] !== "string",
+    );
+    expect(missing).toEqual([]);
   });
 
   it("renders optional advanced capacity, member, affinity, adaptation, and budget controls", () => {

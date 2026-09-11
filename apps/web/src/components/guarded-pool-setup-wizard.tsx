@@ -507,6 +507,9 @@ export function GuardedPoolSetupWizard({
                           onChange={(event) => field.handleChange(event.target.value)}
                           {...errorProps(name)}
                         />
+                        <p className="text-xs text-muted-foreground">
+                          {t(`dashboard:pools.wizard.fields.${name}Hint`)}
+                        </p>
                         {stepErrors[name] ? (
                           <p id={`wizard-${name}-error`} className="text-sm text-destructive">
                             {stepErrors[name]}
@@ -642,6 +645,9 @@ export function GuardedPoolSetupWizard({
                           }}
                           {...errorProps(name)}
                         />
+                        <p className="text-xs text-muted-foreground">
+                          {t(`dashboard:pools.wizard.fields.${name}Hint`)}
+                        </p>
                         {stepErrors[name] ? (
                           <p id={`wizard-${name}-error`} className="text-sm text-destructive">
                             {stepErrors[name]}
@@ -685,6 +691,9 @@ export function GuardedPoolSetupWizard({
                             </option>
                           ))}
                         </select>
+                        <p className="text-xs text-muted-foreground">
+                          {t("dashboard:pools.wizard.fields.physicalCountStrategyHint")}
+                        </p>
                       </div>
                     )}
                   </form.Field>
@@ -707,6 +716,9 @@ export function GuardedPoolSetupWizard({
                             {t("dashboard:pools.wizard.enums.WHEN_IDLE")}
                           </option>
                         </select>
+                        <p className="text-xs text-muted-foreground">
+                          {t("dashboard:pools.wizard.fields.borrowPolicyHint")}
+                        </p>
                       </div>
                     )}
                   </form.Field>
@@ -738,6 +750,9 @@ export function GuardedPoolSetupWizard({
                             }}
                             {...errorProps(name)}
                           />
+                          <p className="text-xs text-muted-foreground">
+                            {t(`dashboard:pools.wizard.fields.${name}Hint`)}
+                          </p>
                           {stepErrors[name] ? (
                             <p id={`wizard-${name}-error`} className="text-sm text-destructive">
                               {stepErrors[name]}
@@ -778,11 +793,15 @@ export function GuardedPoolSetupWizard({
                       />
                     )}
                   </form.Subscribe>
+                  <p className="text-xs text-muted-foreground">
+                    {t("dashboard:pools.wizard.fields.protocolAdaptationHint")}
+                  </p>
                   <form.Field name="affinityEnabled">
                     {(field) => (
                       <label className="flex min-h-11 items-start gap-3 py-2">
                         <Checkbox
                           id="guarded-affinityEnabled"
+                          aria-describedby="guarded-affinityEnabled-hint"
                           checked={field.state.value}
                           onCheckedChange={(checked) => field.handleChange(checked === true)}
                         />
@@ -792,6 +811,9 @@ export function GuardedPoolSetupWizard({
                       </label>
                     )}
                   </form.Field>
+                  <p id="guarded-affinityEnabled-hint" className="text-xs text-muted-foreground">
+                    {t("dashboard:pools.wizard.fields.affinityEnabledHint")}
+                  </p>
                 </div>
                 <div
                   className="mt-5 min-w-0 space-y-4"
@@ -876,6 +898,9 @@ export function GuardedPoolSetupWizard({
                         </option>
                       ))}
                     </select>
+                    <p className="text-xs text-muted-foreground">
+                      {t("dashboard:pools.wizard.fields.recommendedSurfaceHint")}
+                    </p>
                     {stepErrors.recommendedSurface ? (
                       <p id="wizard-recommendedSurface-error" className="text-sm text-destructive">
                         {stepErrors.recommendedSurface}
