@@ -390,7 +390,10 @@ describe("forwarderManagementRouter", () => {
           memberOverrides: [],
         },
       }),
-    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "LOSSY_COLLAPSE_REQUIRES_ADAPTATION" },
+    });
     expect(db.modelPool.findUnique).not.toHaveBeenCalled();
   });
 
@@ -880,6 +883,358 @@ describe("forwarderManagementRouter", () => {
         providerModels: [],
       }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
+  const guardedCreateBase = {
+    slug: "guarded-reasons",
+    name: "Guarded reasons",
+    localModelIds: ["local-id"],
+    recommendedSurface: "OPENAI_RESPONSES" as const,
+    memberConcurrencyLimit: 1,
+    memberContextCeiling: null,
+    reservedSlots: 0,
+    localWaitBudgetMs: 30_000,
+    publicEgressAcknowledged: false,
+    providerModels: [] as Array<Record<string, unknown>>,
+  };
+
+  it("reports the egress-gate failure reason for guarded pool create", async () => {
+    testEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = false;
+
+    await expect(
+      client().createGuardedModelPool({
+        ...guardedCreateBase,
+        publicEgressAcknowledged: true,
+        providerModels: [
+          { providerModelId: "provider-id", concurrencyLimit: 1, dailySpendLimit: "10.00" },
+        ],
+      }),
+    ).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      data: { reason: "PROVIDER_EGRESS_DISABLED" },
+    });
+  });
+
+  it("reports the slug-taken failure reason for guarded pool create", async () => {
+    db.modelPool.findUnique.mockResolvedValue(poolRow());
+
+    await expect(client().createGuardedModelPool(guardedCreateBase)).rejects.toMatchObject({
+      code: "CONFLICT",
+      data: { reason: "SLUG_TAKEN" },
+    });
+  });
+
+  it("reports the provider-not-ready failure reason for guarded pool create", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel()]);
+    db.providerModel.findMany.mockResolvedValue([]);
+
+    await expect(
+      client().createGuardedModelPool({
+        ...guardedCreateBase,
+        publicEgressAcknowledged: true,
+        providerModels: [
+          { providerModelId: "provider-id", concurrencyLimit: 1, dailySpendLimit: "10.00" },
+        ],
+      }),
+    ).rejects.toMatchObject({
+      code: "PRECONDITION_FAILED",
+      data: { reason: "PROVIDER_NOT_READY" },
+    });
+  });
+
+  it("reports the surface-mismatch failure reason for guarded pool create", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel({}, "chat")]);
+
+    await expect(client().createGuardedModelPool(guardedCreateBase)).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "SURFACE_NOT_SUPPORTED" },
+    });
+  });
+
+  it("reports the local-capacity-required failure reason for guarded pool create", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel()]);
+    db.executionTarget.findMany.mockResolvedValue([
+      {
+        id: "existing-target",
+        discoveredModelId: "local-id",
+        inferenceCapacityId: null,
+        InferenceCapacity: null,
+      },
+    ]);
+
+    await expect(client().createGuardedModelPool(guardedCreateBase)).rejects.toMatchObject({
+      code: "PRECONDITION_FAILED",
+      data: { reason: "LOCAL_CAPACITY_REQUIRED" },
+    });
+  });
+
+  it("reports the concurrency-physical failure reason for guarded pool create", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel()]);
+    db.executionTarget.findMany.mockResolvedValue([
+      {
+        id: "existing-target",
+        discoveredModelId: "local-id",
+        inferenceCapacityId: "capacity-id",
+        InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: 2 },
+      },
+    ]);
+
+    await expect(
+      client().createGuardedModelPool({ ...guardedCreateBase, memberConcurrencyLimit: 3 }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "CONCURRENCY_EXCEEDS_PHYSICAL" },
+    });
+  });
+
+  const guardedAdvancedBase = (overrides: Record<string, unknown> = {}) => ({
+    physicalCountStrategy: "CONSERVATIVE_ESTIMATE",
+    contextMargin: 0,
+    borrowPolicy: "WHEN_IDLE",
+    protocolAdaptationEnabled: false,
+    allowLossyDeveloperRoleCollapse: false,
+    affinity: {
+      enabled: false,
+      ttlSeconds: 3_600,
+      maxRecords: 10_000,
+      prefixWeight: 100,
+      conversationWeight: 150,
+      confirmedCacheWeight: 250,
+      loadPenaltyWeight: 100,
+    },
+    memberOverrides: [] as Array<Record<string, unknown>>,
+    ...overrides,
+  });
+
+  const guardedMemberOverride = (overrides: Record<string, unknown> = {}) => ({
+    discoveredModelId: "local-id",
+    concurrency: { mode: "LIMITED", limitValue: 1 },
+    reservedSlots: 0,
+    borrowPolicy: "WHEN_IDLE",
+    waitBudget: { mode: "LIMITED", limitValue: 30_000 },
+    contextCeiling: { mode: "INHERIT", limitValue: null },
+    contextMargin: 0,
+    ...overrides,
+  });
+
+  const guardedLocalTarget = (
+    capacity: { physicalMaxContext?: number; hardConcurrencyLimit?: number } = {},
+  ) => ({
+    id: "existing-target",
+    discoveredModelId: "local-id",
+    inferenceCapacityId: "capacity-id",
+    InferenceCapacity: {
+      physicalMaxContext: capacity.physicalMaxContext ?? 65_536,
+      hardConcurrencyLimit: capacity.hardConcurrencyLimit ?? 2,
+    },
+  });
+
+  function mockGuardedLocalSetup(capacity?: {
+    physicalMaxContext?: number;
+    hardConcurrencyLimit?: number;
+  }) {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel()]);
+    db.executionTarget.findMany.mockResolvedValue([guardedLocalTarget(capacity)]);
+  }
+
+  it("reports the pool-policy-invalid failure reason for guarded pool create", async () => {
+    await expect(
+      client().createGuardedModelPool({
+        ...guardedCreateBase,
+        memberContextCeiling: 8_192,
+        advanced: guardedAdvancedBase({ contextMargin: 8_192 }),
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "POOL_POLICY_INVALID" },
+    });
+    expect(db.modelPool.findUnique).not.toHaveBeenCalled();
+  });
+
+  it("rejects guarded create slugs at input validation before the slug helper", async () => {
+    // The SLUG_INVALID reason branch in assertPoolSlugAvailable is defensively
+    // unreachable through the typed contract: poolSlugSchema runs the same
+    // validateForwarderPoolSlug check during input parsing, so an invalid slug
+    // must fail before the handler runs. Pin that structural bound: the
+    // rejection carries the oRPC input-parse envelope (zod issues on slug),
+    // not the handler's SLUG_INVALID reason envelope.
+    let inputError: ORPCError | undefined;
+    await client()
+      .createGuardedModelPool({ ...guardedCreateBase, slug: "Invalid Slug!" })
+      .catch((error: ORPCError) => {
+        inputError = error;
+      });
+    expect(inputError).toBeInstanceOf(ORPCError);
+    expect(inputError?.code).toBe("BAD_REQUEST");
+    expect(inputError?.message).toBe("Input validation failed");
+    const data = inputError?.data as
+      | { issues?: Array<{ message?: string; path?: string[] }>; reason?: unknown }
+      | undefined;
+    expect(data?.issues).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ message: "forwarderSlug.format", path: ["slug"] }),
+      ]),
+    );
+    expect(data?.reason).toBeUndefined();
+    expect(db.modelPool.findUnique).not.toHaveBeenCalled();
+  });
+
+  it("reports the local-model-unavailable failure reason for guarded pool create", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([]);
+
+    await expect(client().createGuardedModelPool(guardedCreateBase)).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      data: { reason: "LOCAL_MODEL_UNAVAILABLE" },
+    });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
+  it("reports the member-override-mismatch failure reason for guarded pool create", async () => {
+    mockGuardedLocalSetup();
+
+    await expect(
+      client().createGuardedModelPool({
+        ...guardedCreateBase,
+        advanced: guardedAdvancedBase({
+          memberOverrides: [guardedMemberOverride({ discoveredModelId: "other-model" })],
+        }),
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "MEMBER_OVERRIDE_MISMATCH" },
+    });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
+  it("reports the reserved-exceeds-concurrency failure reason for guarded pool create", async () => {
+    mockGuardedLocalSetup({ hardConcurrencyLimit: 20 });
+
+    await expect(
+      client().createGuardedModelPool({
+        ...guardedCreateBase,
+        memberConcurrencyLimit: 10,
+        advanced: guardedAdvancedBase({
+          memberOverrides: [
+            guardedMemberOverride({
+              concurrency: { mode: "LIMITED", limitValue: 2 },
+              reservedSlots: 3,
+            }),
+          ],
+        }),
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "RESERVED_EXCEEDS_CONCURRENCY" },
+    });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
+  it("reports the reserved-exceeds-physical failure reason for guarded pool create", async () => {
+    mockGuardedLocalSetup({ hardConcurrencyLimit: 2 });
+
+    await expect(
+      client().createGuardedModelPool({
+        ...guardedCreateBase,
+        advanced: guardedAdvancedBase({
+          memberOverrides: [
+            guardedMemberOverride({
+              concurrency: { mode: "UNLIMITED", limitValue: null },
+              reservedSlots: 3,
+            }),
+          ],
+        }),
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "RESERVED_EXCEEDS_PHYSICAL" },
+    });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
+  it("reports the context-exceeds-physical failure reason for guarded pool create", async () => {
+    mockGuardedLocalSetup({ physicalMaxContext: 65_536 });
+
+    await expect(
+      client().createGuardedModelPool({ ...guardedCreateBase, memberContextCeiling: 70_000 }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "CONTEXT_EXCEEDS_PHYSICAL" },
+    });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
+  it("reports the context-margin-exceeds-ceiling failure reason for guarded pool create", async () => {
+    mockGuardedLocalSetup({ physicalMaxContext: 65_536, hardConcurrencyLimit: 2 });
+
+    await expect(
+      client().createGuardedModelPool({
+        ...guardedCreateBase,
+        advanced: guardedAdvancedBase({
+          memberOverrides: [
+            guardedMemberOverride({
+              contextCeiling: { mode: "LIMITED", limitValue: 100 },
+              contextMargin: 100,
+            }),
+          ],
+        }),
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "CONTEXT_MARGIN_EXCEEDS_CEILING" },
+    });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
+  it("reports the provider-context-exceeded failure reason for guarded pool create", async () => {
+    mockGuardedLocalSetup({ physicalMaxContext: 65_536, hardConcurrencyLimit: 2 });
+    db.providerModel.findMany.mockResolvedValue([
+      {
+        id: "provider-primary",
+        providerAccountId: "account-primary",
+        upstreamModelId: "provider-upstream",
+        contextWindow: 8_192,
+        concurrencyLimit: 4,
+        nativeCapabilities: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiResponses: {
+              source: "provider",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+            },
+          },
+        },
+        PricingVersions: [{ id: "price-primary", currency: "USD" }],
+      },
+    ]);
+
+    await expect(
+      client().createGuardedModelPool({
+        ...guardedCreateBase,
+        memberContextCeiling: 16_384,
+        publicEgressAcknowledged: true,
+        providerModels: [
+          {
+            providerModelId: "provider-primary",
+            tier: "PRIMARY",
+            concurrencyLimit: 1,
+            dailySpendLimit: "10.00",
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "PROVIDER_CONTEXT_EXCEEDED" },
+    });
     expect(db.modelPool.create).not.toHaveBeenCalled();
   });
 
@@ -1956,6 +2311,36 @@ describe("forwarderManagementRouter", () => {
       return true;
     });
     expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
+  it("keeps sibling pool create and update slug errors free of reason data", async () => {
+    // createModelPool and updateModelPool share assertPoolSlugAvailable with
+    // guarded create but omit reasons; their error envelope must stay exactly
+    // as before, with no `data` field attached.
+    let createError: ORPCError | undefined;
+    db.modelPool.findUnique.mockResolvedValueOnce({ id: "other-pool-id" });
+    await client()
+      .createModelPool({ slug: "gpt-4.1-mini", name: "Duplicate" })
+      .catch((error: ORPCError) => {
+        createError = error;
+      });
+    expect(createError).toBeInstanceOf(ORPCError);
+    expect(createError?.code).toBe("CONFLICT");
+    expect(createError?.data).toBeUndefined();
+
+    let updateError: ORPCError | undefined;
+    db.modelPool.findUnique
+      .mockResolvedValueOnce({ id: "pool-id", userId: "user-id" })
+      .mockResolvedValueOnce({ id: "other-pool-id" });
+    await client()
+      .updateModelPool({ id: "pool-id", slug: "gpt-4.1-mini" })
+      .catch((error: ORPCError) => {
+        updateError = error;
+      });
+    expect(updateError).toBeInstanceOf(ORPCError);
+    expect(updateError?.code).toBe("CONFLICT");
+    expect(updateError?.data).toBeUndefined();
+    expect(db.modelPool.update).not.toHaveBeenCalled();
   });
 
   it("keeps direct model id parsing and non-pool slugs strict", () => {

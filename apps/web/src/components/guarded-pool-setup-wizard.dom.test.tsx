@@ -10,6 +10,7 @@ const state = vi.hoisted(() => ({
   capacityPromise: Promise.resolve([] as Array<Record<string, unknown>>),
   capacityCalls: 0,
   candidateCalls: 0,
+  createRejection: undefined as unknown,
   submitted: undefined as Record<string, unknown> | undefined,
 }));
 
@@ -51,6 +52,7 @@ vi.mock("@/utils/orpc", () => ({
         mutationOptions: (options: Record<string, unknown>) => ({
           ...options,
           mutationFn: async (input: Record<string, unknown>) => {
+            if (state.createRejection !== undefined) throw state.createRejection;
             state.submitted = input;
             return {};
           },
@@ -144,6 +146,7 @@ afterEach(() => {
   state.capacityCalls = 0;
   state.candidateCalls = 0;
   state.capacityPromise = Promise.resolve([]);
+  state.createRejection = undefined;
   state.submitted = undefined;
 });
 
@@ -349,5 +352,116 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
         ],
       },
     });
+  });
+
+  async function driveToReviewStep(user: ReturnType<typeof userEvent.setup>) {
+    await user.type(screen.getByLabelText("dashboard:pools.slug"), "guarded-pool");
+    await user.type(screen.getByLabelText("dashboard:pools.name"), "Guarded pool");
+    await user.click(
+      screen.getByLabelText("dashboard:pools.wizard.selectLocalModel:owner/cli/responses"),
+    );
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    expect(screen.getByText("dashboard:pools.wizard.atomicRollback")).toBeTruthy();
+  }
+
+  it("renders the specific create failure reason inline on the review step", async () => {
+    const user = userEvent.setup();
+    mount();
+    await driveToReviewStep(user);
+
+    state.createRejection = Object.assign(new Error("conflict"), {
+      data: { reason: "SLUG_TAKEN" },
+    });
+    await user.click(screen.getByRole("button", { name: "dashboard:pools.wizard.create" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByText("dashboard:pools.wizard.createErrors.SLUG_TAKEN")).toBeTruthy();
+    expect(within(alert).getByText("dashboard:pools.wizard.atomicFailure")).toBeTruthy();
+    expect(screen.queryByText("conflict")).toBeNull();
+  });
+
+  it("falls back to the generic rollback copy for an unknown failure reason", async () => {
+    const user = userEvent.setup();
+    mount();
+    await driveToReviewStep(user);
+
+    state.createRejection = Object.assign(new Error("boom"), {
+      data: { reason: "NOT_A_REAL_REASON" },
+    });
+    await user.click(screen.getByRole("button", { name: "dashboard:pools.wizard.create" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getAllByText("dashboard:pools.wizard.atomicFailure")).toHaveLength(1);
+    expect(screen.queryByText(/createErrors/)).toBeNull();
+    expect(screen.queryByText("boom")).toBeNull();
+  });
+
+  it("falls back to the generic rollback copy when the error carries no data", async () => {
+    const user = userEvent.setup();
+    mount();
+    await driveToReviewStep(user);
+
+    state.createRejection = new Error("boom");
+    await user.click(screen.getByRole("button", { name: "dashboard:pools.wizard.create" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getAllByText("dashboard:pools.wizard.atomicFailure")).toHaveLength(1);
+    expect(screen.queryByText(/createErrors/)).toBeNull();
+    expect(screen.queryByText("boom")).toBeNull();
+  });
+
+  it("clears the inline failure when a new submit starts", async () => {
+    const user = userEvent.setup();
+    mount();
+    await driveToReviewStep(user);
+
+    state.createRejection = Object.assign(new Error("conflict"), {
+      data: { reason: "SLUG_TAKEN" },
+    });
+    await user.click(screen.getByRole("button", { name: "dashboard:pools.wizard.create" }));
+    await screen.findByRole("alert");
+
+    state.createRejection = undefined;
+    state.submitted = undefined;
+    await user.click(screen.getByRole("button", { name: "dashboard:pools.wizard.create" }));
+
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+    expect(state.submitted).toBeDefined();
+  });
+
+  it("clears the inline failure when navigating back and re-entering the review step", async () => {
+    const user = userEvent.setup();
+    mount();
+    await driveToReviewStep(user);
+
+    state.createRejection = Object.assign(new Error("conflict"), {
+      data: { reason: "SLUG_TAKEN" },
+    });
+    await user.click(screen.getByRole("button", { name: "dashboard:pools.wizard.create" }));
+    await screen.findByRole("alert");
+
+    // Back leaves the review step; the stale failure must be cleared...
+    await user.click(screen.getByRole("button", { name: "dashboard:pools.wizard.back" }));
+    expect(screen.getByText("dashboard:pools.wizard.providerOrder")).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText("dashboard:pools.wizard.createErrors.SLUG_TAKEN")).toBeNull();
+
+    // ...and must not resurface when re-entering the review step via Next,
+    // before any new submit could occur there.
+    await user.click(screen.getByRole("button", { name: /dashboard:pools\.wizard\.next/ }));
+    expect(screen.getByText("dashboard:pools.wizard.atomicRollback")).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByText("dashboard:pools.wizard.createErrors.SLUG_TAKEN")).toBeNull();
+    expect(screen.queryByText("conflict")).toBeNull();
+
+    // A new failing submit shows the failure again on the review step.
+    state.createRejection = Object.assign(new Error("conflict"), {
+      data: { reason: "SLUG_TAKEN" },
+    });
+    await user.click(screen.getByRole("button", { name: "dashboard:pools.wizard.create" }));
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByText("dashboard:pools.wizard.createErrors.SLUG_TAKEN")).toBeTruthy();
   });
 });

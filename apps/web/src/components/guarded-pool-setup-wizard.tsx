@@ -1,6 +1,10 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { declaredContextWindow } from "@ws-model-proxy/api/lib/declared-context-window";
+import {
+  type GuardedPoolCreateFailureReason,
+  isGuardedPoolCreateFailureReason,
+} from "@ws-model-proxy/api/lib/guarded-pool-create-reasons";
 import { parseOpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { validateForwarderPoolSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import { Button } from "@ws-model-proxy/ui/components/button";
@@ -105,6 +109,20 @@ function modelDeclaredContextWindow(model: LocalModel | undefined): number | nul
     parseOpenAiCompatibleCapabilities(model?.effectiveCapabilities?.metadata),
   );
 }
+
+/**
+ * Extracts the machine-readable guarded-pool create failure reason from an
+ * oRPC mutation error. The server attaches `data.reason` to every curated
+ * create failure; this never trusts the shape (absent or malformed data falls
+ * back to the generic rollback copy) and never surfaces `error.message`.
+ */
+function guardedPoolCreateFailureReason(error: unknown): GuardedPoolCreateFailureReason | null {
+  if (!error || typeof error !== "object") return null;
+  const { data } = error as { data?: unknown };
+  if (!data || typeof data !== "object") return null;
+  const { reason } = data as { reason?: unknown };
+  return isGuardedPoolCreateFailureReason(reason) ? reason : null;
+}
 export const budgetIntegerRule = (mode: LimitMode, value: string) =>
   mode === "LIMITED"
     ? ({ mode, limitValue: Number(value) } as const)
@@ -144,6 +162,9 @@ export function GuardedPoolSetupWizard({
   const [stepErrors, setStepErrors] = useState<Record<string, string>>({});
   const [memberOverrides, setMemberOverrides] = useState<Record<string, MemberOverride>>({});
   const [enabledMemberOverrides, setEnabledMemberOverrides] = useState<Record<string, boolean>>({});
+  const [createFailure, setCreateFailure] = useState<{
+    reason: GuardedPoolCreateFailureReason | null;
+  } | null>(null);
   const candidates = useQuery({
     ...orpc.forwarderManagement.listGuardedOverflowCandidates.queryOptions(),
     enabled: open,
@@ -153,18 +174,24 @@ export function GuardedPoolSetupWizard({
     retry: false,
     enabled: open && capacityIsEnabled,
   });
-  const create = useMutation(
-    orpc.forwarderManagement.createGuardedModelPool.mutationOptions({
+  const create = useMutation({
+    ...orpc.forwarderManagement.createGuardedModelPool.mutationOptions({
       onSuccess: async (pool) => {
         await queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:pools.created"));
+        setCreateFailure(null);
         setStep(0);
         onSuccess?.(pool?.id);
         if (!page) onOpenChange(false);
       },
-      onError: () => toast.error(t("dashboard:pools.wizard.atomicFailure")),
+      onError: (error) => {
+        // Surfaced inline on the review step; the global mutation toast is
+        // suppressed so the user sees the specific reason, not generic copy.
+        setCreateFailure({ reason: guardedPoolCreateFailureReason(error) });
+      },
     }),
-  );
+    meta: { skipGlobalErrorToast: true },
+  });
   const schema = z
     .object({
       slug: z
@@ -311,84 +338,93 @@ export function GuardedPoolSetupWizard({
       spendMonthLimit: "100",
     },
     validators: { onSubmit: schema },
-    onSubmit: ({ value }) =>
-      create.mutateAsync({
-        slug: value.slug.trim(),
-        name: value.name.trim(),
-        localModelIds: value.localModelIds,
-        recommendedSurface: value.recommendedSurface,
-        memberConcurrencyLimit: value.memberConcurrencyLimit,
-        memberContextCeiling: value.memberContextCeiling,
-        reservedSlots: value.reservedSlots,
-        localWaitBudgetMs: value.localWaitBudgetMs,
-        publicEgressAcknowledged: value.publicEgressAcknowledged,
-        advanced: {
-          physicalCountStrategy: value.physicalCountStrategy,
-          contextMargin: value.contextMargin,
-          borrowPolicy: value.borrowPolicy,
-          protocolAdaptationEnabled: protocolAdaptationAvailable && value.protocolAdaptationEnabled,
-          allowLossyDeveloperRoleCollapse:
-            protocolAdaptationAvailable &&
-            value.protocolAdaptationEnabled &&
-            value.allowLossyDeveloperRoleCollapse,
-          affinity: {
-            enabled: value.affinityEnabled,
-            ttlSeconds: value.affinityTtlSeconds,
-            maxRecords: value.affinityMaxRecords,
-            prefixWeight: value.affinityPrefixWeight,
-            conversationWeight: value.affinityConversationWeight,
-            confirmedCacheWeight: value.affinityConfirmedCacheWeight,
-            loadPenaltyWeight: value.affinityLoadPenaltyWeight,
+    onSubmit: async ({ value }) => {
+      // A fresh submit clears the previous inline failure before it starts.
+      setCreateFailure(null);
+      try {
+        await create.mutateAsync({
+          slug: value.slug.trim(),
+          name: value.name.trim(),
+          localModelIds: value.localModelIds,
+          recommendedSurface: value.recommendedSurface,
+          memberConcurrencyLimit: value.memberConcurrencyLimit,
+          memberContextCeiling: value.memberContextCeiling,
+          reservedSlots: value.reservedSlots,
+          localWaitBudgetMs: value.localWaitBudgetMs,
+          publicEgressAcknowledged: value.publicEgressAcknowledged,
+          advanced: {
+            physicalCountStrategy: value.physicalCountStrategy,
+            contextMargin: value.contextMargin,
+            borrowPolicy: value.borrowPolicy,
+            protocolAdaptationEnabled:
+              protocolAdaptationAvailable && value.protocolAdaptationEnabled,
+            allowLossyDeveloperRoleCollapse:
+              protocolAdaptationAvailable &&
+              value.protocolAdaptationEnabled &&
+              value.allowLossyDeveloperRoleCollapse,
+            affinity: {
+              enabled: value.affinityEnabled,
+              ttlSeconds: value.affinityTtlSeconds,
+              maxRecords: value.affinityMaxRecords,
+              prefixWeight: value.affinityPrefixWeight,
+              conversationWeight: value.affinityConversationWeight,
+              confirmedCacheWeight: value.affinityConfirmedCacheWeight,
+              loadPenaltyWeight: value.affinityLoadPenaltyWeight,
+            },
+            memberOverrides: value.localModelIds.flatMap((discoveredModelId) => {
+              if (!enabledMemberOverrides[discoveredModelId]) return [];
+              const model = directModels.find((candidate) => candidate.id === discoveredModelId);
+              const physicalMaxContext = capacities.data?.find(
+                (capacity) => capacity.id === model?.executionTarget?.inferenceCapacityId,
+              )?.physicalMaxContext;
+              const override =
+                memberOverrides[discoveredModelId] ??
+                deriveMemberOverride(value, modelDeclaredContextWindow(model), physicalMaxContext);
+              const rule = (mode: LimitMode, limitValue: number) =>
+                mode === "LIMITED"
+                  ? ({ mode, limitValue } as const)
+                  : ({ mode, limitValue: null } as const);
+              return [
+                {
+                  discoveredModelId,
+                  concurrency: rule(override.concurrencyMode, override.concurrencyLimit),
+                  reservedSlots: override.reservedSlots,
+                  borrowPolicy: override.borrowPolicy,
+                  waitBudget: rule(override.waitBudgetMode, override.waitBudgetMs),
+                  contextCeiling:
+                    override.contextCeilingMode === "INHERIT"
+                      ? ({ mode: "INHERIT", limitValue: null } as const)
+                      : rule(override.contextCeilingMode, override.contextCeiling ?? 0),
+                  contextMargin:
+                    override.contextCeilingMode === "INHERIT" ? 0 : override.contextMargin,
+                },
+              ];
+            }),
           },
-          memberOverrides: value.localModelIds.flatMap((discoveredModelId) => {
-            if (!enabledMemberOverrides[discoveredModelId]) return [];
-            const model = directModels.find((candidate) => candidate.id === discoveredModelId);
-            const physicalMaxContext = capacities.data?.find(
-              (capacity) => capacity.id === model?.executionTarget?.inferenceCapacityId,
-            )?.physicalMaxContext;
-            const override =
-              memberOverrides[discoveredModelId] ??
-              deriveMemberOverride(value, modelDeclaredContextWindow(model), physicalMaxContext);
-            const rule = (mode: LimitMode, limitValue: number) =>
-              mode === "LIMITED"
-                ? ({ mode, limitValue } as const)
-                : ({ mode, limitValue: null } as const);
-            return [
-              {
-                discoveredModelId,
-                concurrency: rule(override.concurrencyMode, override.concurrencyLimit),
-                reservedSlots: override.reservedSlots,
-                borrowPolicy: override.borrowPolicy,
-                waitBudget: rule(override.waitBudgetMode, override.waitBudgetMs),
-                contextCeiling:
-                  override.contextCeilingMode === "INHERIT"
-                    ? ({ mode: "INHERIT", limitValue: null } as const)
-                    : rule(override.contextCeilingMode, override.contextCeiling ?? 0),
-                contextMargin:
-                  override.contextCeilingMode === "INHERIT" ? 0 : override.contextMargin,
-              },
-            ];
-          }),
-        },
-        providerModels: value.providerModelIds.map((providerModelId) => ({
-          providerModelId,
-          tier: value.providerTier,
-          concurrencyLimit: value.providerConcurrencyLimit,
-          dailySpendLimit: value.dailySpendLimit,
-          budgetRules: {
-            concurrency:
-              value.providerConcurrencyMode === "LIMITED"
-                ? ({ mode: "LIMITED", limitValue: value.providerConcurrencyLimit } as const)
-                : ({ mode: "UNLIMITED", limitValue: null } as const),
-            tokensPerAttempt: budgetIntegerRule(value.tokenAttemptMode, value.tokenAttemptLimit),
-            tokensPerDay: budgetIntegerRule(value.tokenDayMode, value.tokenDayLimit),
-            tokensPerMonth: budgetIntegerRule(value.tokenMonthMode, value.tokenMonthLimit),
-            tokensLifetime: budgetIntegerRule(value.tokenLifetimeMode, value.tokenLifetimeLimit),
-            spendPerDay: budgetSpendRule(value.spendDayMode, value.dailySpendLimit),
-            spendPerMonth: budgetSpendRule(value.spendMonthMode, value.spendMonthLimit),
-          },
-        })),
-      }),
+          providerModels: value.providerModelIds.map((providerModelId) => ({
+            providerModelId,
+            tier: value.providerTier,
+            concurrencyLimit: value.providerConcurrencyLimit,
+            dailySpendLimit: value.dailySpendLimit,
+            budgetRules: {
+              concurrency:
+                value.providerConcurrencyMode === "LIMITED"
+                  ? ({ mode: "LIMITED", limitValue: value.providerConcurrencyLimit } as const)
+                  : ({ mode: "UNLIMITED", limitValue: null } as const),
+              tokensPerAttempt: budgetIntegerRule(value.tokenAttemptMode, value.tokenAttemptLimit),
+              tokensPerDay: budgetIntegerRule(value.tokenDayMode, value.tokenDayLimit),
+              tokensPerMonth: budgetIntegerRule(value.tokenMonthMode, value.tokenMonthLimit),
+              tokensLifetime: budgetIntegerRule(value.tokenLifetimeMode, value.tokenLifetimeLimit),
+              spendPerDay: budgetSpendRule(value.spendDayMode, value.dailySpendLimit),
+              spendPerMonth: budgetSpendRule(value.spendMonthMode, value.spendMonthLimit),
+            },
+          })),
+        });
+      } catch {
+        // Failure reasons are captured in the mutation's onError and shown
+        // inline on the review step.
+      }
+    },
   });
   const stepFields = [
     ["slug", "name", "localModelIds"],
@@ -472,6 +508,16 @@ export function GuardedPoolSetupWizard({
     "aria-invalid": Boolean(stepErrors[name]),
     "aria-describedby": stepErrors[name] ? `wizard-${name}-error` : undefined,
   });
+  const goToStep = (target: number) => {
+    if (target !== step && (step === 3 || target === 3)) {
+      // Leaving the review step (Back) or re-entering it (Next, before any
+      // submit could occur there) invalidates a stale create failure so old
+      // reason copy cannot resurface ahead of a fresh submission. A pending
+      // submission never navigates, so an in-flight error is never hidden.
+      setCreateFailure(null);
+    }
+    setStep(target);
+  };
 
   return (
     <WizardSurface page={page} open={open} onOpenChange={onOpenChange}>
@@ -499,7 +545,7 @@ export function GuardedPoolSetupWizard({
           onSubmit={(event) => {
             event.preventDefault();
             if (step < 3) {
-              if (validateStep()) setStep((current) => current + 1);
+              if (validateStep()) goToStep(step + 1);
             } else void form.handleSubmit();
           }}
         >
@@ -1168,6 +1214,20 @@ export function GuardedPoolSetupWizard({
                   <p className="text-sm text-muted-foreground">
                     {t("dashboard:pools.wizard.atomicRollback")}
                   </p>
+                  {createFailure ? (
+                    <div role="alert" className="space-y-1 rounded-md bg-destructive/10 p-4">
+                      <p className="text-sm font-medium text-destructive">
+                        {createFailure.reason
+                          ? t(`dashboard:pools.wizard.createErrors.${createFailure.reason}`)
+                          : t("dashboard:pools.wizard.atomicFailure")}
+                      </p>
+                      {createFailure.reason ? (
+                        <p className="text-sm text-muted-foreground">
+                          {t("dashboard:pools.wizard.atomicFailure")}
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : null}
                 </div>
               )}
             </form.Subscribe>
@@ -1180,7 +1240,7 @@ export function GuardedPoolSetupWizard({
               disabled={step === 0 || create.isPending}
               onClick={() => {
                 setStepErrors({});
-                setStep((current) => Math.max(0, current - 1));
+                goToStep(Math.max(0, step - 1));
               }}
             >
               <ArrowLeft className="size-4" />

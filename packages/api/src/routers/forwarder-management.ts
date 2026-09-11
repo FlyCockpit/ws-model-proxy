@@ -15,6 +15,7 @@ import {
   assertEffectiveConcurrencyPolicy,
   assertEffectiveContextPolicy,
   assertModelPoolCapacityPolicy,
+  type CapacityPolicyFailureReasons,
   lockAndValidateModelPoolCapacityPolicy,
   lockExecutionTargetIdentities,
   lockExecutionTargetPolicies,
@@ -25,6 +26,7 @@ import {
   declaredContextWindow,
   isContextWindowSeedAdmissible,
 } from "../lib/declared-context-window";
+import type { GuardedPoolCreateFailureReason } from "../lib/guarded-pool-create-reasons";
 import {
   getConfiguredMediaAttachmentMaxBytes,
   resolveAttachmentLimit,
@@ -125,24 +127,29 @@ function hasModelPoolCapacityPolicy(input: Record<string, unknown>): boolean {
   );
 }
 
-function assertLossyDeveloperRoleCollapseRequiresAdaptation({
-  protocolAdaptationEnabled,
-  allowLossyDeveloperRoleCollapse,
-}: {
-  protocolAdaptationEnabled: boolean;
-  allowLossyDeveloperRoleCollapse: boolean;
-}): void {
+function assertLossyDeveloperRoleCollapseRequiresAdaptation(
+  {
+    protocolAdaptationEnabled,
+    allowLossyDeveloperRoleCollapse,
+  }: {
+    protocolAdaptationEnabled: boolean;
+    allowLossyDeveloperRoleCollapse: boolean;
+  },
+  reason?: GuardedPoolCreateFailureReason,
+): void {
   if (allowLossyDeveloperRoleCollapse && !protocolAdaptationEnabled) {
     throw new ORPCError("BAD_REQUEST", {
       message: "Lossy developer-role collapse requires protocol adaptation to be enabled.",
+      ...(reason !== undefined ? { data: { reason } } : {}),
     });
   }
 }
 
-function assertProviderEgressReleaseGate(): void {
+function assertProviderEgressReleaseGate(reason?: GuardedPoolCreateFailureReason): void {
   if (!env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED)
     throw new ORPCError("NOT_FOUND", {
       message: "Provider egress is not enabled for this deployment.",
+      ...(reason !== undefined ? { data: { reason } } : {}),
     });
 }
 
@@ -164,15 +171,18 @@ async function createPoolMember<T>(create: () => Promise<T>): Promise<T> {
   }
 }
 
-function assertConcurrencyPolicyWithinHardLimit(input: {
-  hardLimit: number | null | undefined;
-  poolLimit: number | null;
-  poolReserved: number;
-  memberMode?: "INHERIT" | "LIMITED" | "UNLIMITED";
-  memberLimit?: number | null;
-  memberReserved?: number | null;
-}): void {
-  assertEffectiveConcurrencyPolicy(input);
+function assertConcurrencyPolicyWithinHardLimit(
+  input: {
+    hardLimit: number | null | undefined;
+    poolLimit: number | null;
+    poolReserved: number;
+    memberMode?: "INHERIT" | "LIMITED" | "UNLIMITED";
+    memberLimit?: number | null;
+    memberReserved?: number | null;
+  },
+  reasons?: CapacityPolicyFailureReasons,
+): void {
+  assertEffectiveConcurrencyPolicy(input, reasons);
 }
 
 /**
@@ -1129,10 +1139,21 @@ async function assertPoolTransformerIsValid(
   });
 }
 
-async function assertPoolSlugAvailable(slug: string, userId: string, currentPoolId?: string) {
+async function assertPoolSlugAvailable(
+  slug: string,
+  userId: string,
+  currentPoolId?: string,
+  reasons?: {
+    invalid?: GuardedPoolCreateFailureReason;
+    taken?: GuardedPoolCreateFailureReason;
+  },
+) {
   const validation = validateForwarderPoolSlug(slug);
   if (!validation.ok) {
-    throw new ORPCError("BAD_REQUEST", { message: "forwarderSlug." + validation.reason });
+    throw new ORPCError("BAD_REQUEST", {
+      message: "forwarderSlug." + validation.reason,
+      ...(reasons?.invalid !== undefined ? { data: { reason: reasons.invalid } } : {}),
+    });
   }
 
   const existing = await prisma.modelPool.findUnique({
@@ -1140,7 +1161,10 @@ async function assertPoolSlugAvailable(slug: string, userId: string, currentPool
     select: { id: true },
   });
   if (existing && existing.id !== currentPoolId) {
-    throw new ORPCError("CONFLICT", { message: "Model pool slug already exists." });
+    throw new ORPCError("CONFLICT", {
+      message: "Model pool slug already exists.",
+      ...(reasons?.taken !== undefined ? { data: { reason: reasons.taken } } : {}),
+    });
   }
 }
 
@@ -1569,19 +1593,29 @@ export const forwarderManagementRouter = {
       })(),
     )
     .handler(async ({ input, context }) => {
-      if (input.providerModels.length > 0) assertProviderEgressReleaseGate();
-      assertLossyDeveloperRoleCollapseRequiresAdaptation({
-        protocolAdaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
-        allowLossyDeveloperRoleCollapse: input.advanced?.allowLossyDeveloperRoleCollapse ?? false,
-      });
-      assertModelPoolCapacityPolicy({
-        concurrencyLimit: input.memberConcurrencyLimit,
-        reservedSlots: input.reservedSlots,
-        contextCeiling: input.memberContextCeiling,
-        contextMargin: input.advanced?.contextMargin,
-      });
+      if (input.providerModels.length > 0)
+        assertProviderEgressReleaseGate("PROVIDER_EGRESS_DISABLED");
+      assertLossyDeveloperRoleCollapseRequiresAdaptation(
+        {
+          protocolAdaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
+          allowLossyDeveloperRoleCollapse: input.advanced?.allowLossyDeveloperRoleCollapse ?? false,
+        },
+        "LOSSY_COLLAPSE_REQUIRES_ADAPTATION",
+      );
+      assertModelPoolCapacityPolicy(
+        {
+          concurrencyLimit: input.memberConcurrencyLimit,
+          reservedSlots: input.reservedSlots,
+          contextCeiling: input.memberContextCeiling,
+          contextMargin: input.advanced?.contextMargin,
+        },
+        "POOL_POLICY_INVALID",
+      );
       const userId = context.session.user.id;
-      await assertPoolSlugAvailable(input.slug, userId);
+      await assertPoolSlugAvailable(input.slug, userId, undefined, {
+        invalid: "SLUG_INVALID",
+        taken: "SLUG_TAKEN",
+      });
       const now = new Date();
       return runSerializableTransaction(async (tx) => {
         const localModels = await tx.discoveredModel.findMany({
@@ -1603,7 +1637,10 @@ export const forwarderManagementRouter = {
           },
         });
         if (localModels.length !== input.localModelIds.length) {
-          throw new ORPCError("NOT_FOUND", { message: "A selected local model is unavailable" });
+          throw new ORPCError("NOT_FOUND", {
+            message: "A selected local model is unavailable",
+            data: { reason: "LOCAL_MODEL_UNAVAILABLE" },
+          });
         }
         const providerIds = input.providerModels.map((item) => item.providerModelId);
         const hasPublicOverflow = input.providerModels.some(
@@ -1644,6 +1681,7 @@ export const forwarderManagementRouter = {
         ) {
           throw new ORPCError("PRECONDITION_FAILED", {
             message: "A selected provider is not ready for guarded routing",
+            data: { reason: "PROVIDER_NOT_READY" },
           });
         }
         const primaryProviderIds = new Set(
@@ -1717,6 +1755,7 @@ export const forwarderManagementRouter = {
           throw new ORPCError("BAD_REQUEST", {
             message:
               "Recommended API must be the best API supported by every selected primary model.",
+            data: { reason: "SURFACE_NOT_SUPPORTED" },
           });
         }
         const localTargets = await tx.executionTarget.findMany({
@@ -1737,6 +1776,7 @@ export const forwarderManagementRouter = {
           throw new ORPCError("PRECONDITION_FAILED", {
             message:
               "Every selected local model must already have an explicitly assigned physical capacity.",
+            data: { reason: "LOCAL_CAPACITY_REQUIRED" },
           });
         }
         const declaredContextByModelId = new Map(
@@ -1765,21 +1805,29 @@ export const forwarderManagementRouter = {
         ) {
           throw new ORPCError("BAD_REQUEST", {
             message: "A member override does not belong to a selected local model.",
+            data: { reason: "MEMBER_OVERRIDE_MISMATCH" },
           });
         }
         for (const target of localTargets) {
           const override = target.discoveredModelId
             ? memberOverrideByModelId.get(target.discoveredModelId)
             : undefined;
-          assertConcurrencyPolicyWithinHardLimit({
-            hardLimit: target.InferenceCapacity?.hardConcurrencyLimit,
-            poolLimit: input.memberConcurrencyLimit,
-            poolReserved: input.reservedSlots,
-            memberMode: override?.concurrency.mode,
-            memberLimit:
-              override?.concurrency.mode === "LIMITED" ? override.concurrency.limitValue : null,
-            memberReserved: override?.reservedSlots,
-          });
+          assertConcurrencyPolicyWithinHardLimit(
+            {
+              hardLimit: target.InferenceCapacity?.hardConcurrencyLimit,
+              poolLimit: input.memberConcurrencyLimit,
+              poolReserved: input.reservedSlots,
+              memberMode: override?.concurrency.mode,
+              memberLimit:
+                override?.concurrency.mode === "LIMITED" ? override.concurrency.limitValue : null,
+              memberReserved: override?.reservedSlots,
+            },
+            {
+              reservedExceeds: "RESERVED_EXCEEDS_CONCURRENCY",
+              reservedExceedsPhysical: "RESERVED_EXCEEDS_PHYSICAL",
+              concurrencyExceedsPhysical: "CONCURRENCY_EXCEEDS_PHYSICAL",
+            },
+          );
           if (!override) continue;
           if (
             override.concurrency.mode === "LIMITED" &&
@@ -1787,6 +1835,7 @@ export const forwarderManagementRouter = {
           ) {
             throw new ORPCError("BAD_REQUEST", {
               message: "Reserved slots exceed a member concurrency override.",
+              data: { reason: "RESERVED_EXCEEDS_CONCURRENCY" },
             });
           }
         }
@@ -1885,20 +1934,26 @@ export const forwarderManagementRouter = {
             target.inferenceCapacityId && seededPhysicalByCapacityId.has(target.inferenceCapacityId)
               ? seededPhysicalByCapacityId.get(target.inferenceCapacityId)
               : target.InferenceCapacity?.physicalMaxContext;
-          assertEffectiveContextPolicy({
-            physicalMaxContext: physicalMaximum,
-            poolCeiling: input.memberContextCeiling,
-            poolMargin: input.advanced?.contextMargin ?? 0,
-            memberMode: override?.contextCeiling.mode,
-            memberCeiling:
-              override?.contextCeiling.mode === "LIMITED"
-                ? override.contextCeiling.limitValue
-                : null,
-            memberMargin:
-              override && override.contextCeiling.mode !== "INHERIT"
-                ? override.contextMargin
-                : null,
-          });
+          assertEffectiveContextPolicy(
+            {
+              physicalMaxContext: physicalMaximum,
+              poolCeiling: input.memberContextCeiling,
+              poolMargin: input.advanced?.contextMargin ?? 0,
+              memberMode: override?.contextCeiling.mode,
+              memberCeiling:
+                override?.contextCeiling.mode === "LIMITED"
+                  ? override.contextCeiling.limitValue
+                  : null,
+              memberMargin:
+                override && override.contextCeiling.mode !== "INHERIT"
+                  ? override.contextMargin
+                  : null,
+            },
+            {
+              marginExceedsCeiling: "CONTEXT_MARGIN_EXCEEDS_CEILING",
+              exceedsPhysical: "CONTEXT_EXCEEDS_PHYSICAL",
+            },
+          );
         }
         if (
           providers.some(
@@ -1912,14 +1967,22 @@ export const forwarderManagementRouter = {
         ) {
           throw new ORPCError("BAD_REQUEST", {
             message: "Member context exceeds a selected provider's context window.",
+            data: { reason: "PROVIDER_CONTEXT_EXCEEDED" },
           });
         }
         for (const provider of providers) {
-          assertConcurrencyPolicyWithinHardLimit({
-            hardLimit: provider.concurrencyLimit,
-            poolLimit: input.memberConcurrencyLimit,
-            poolReserved: input.reservedSlots,
-          });
+          assertConcurrencyPolicyWithinHardLimit(
+            {
+              hardLimit: provider.concurrencyLimit,
+              poolLimit: input.memberConcurrencyLimit,
+              poolReserved: input.reservedSlots,
+            },
+            {
+              reservedExceeds: "RESERVED_EXCEEDS_CONCURRENCY",
+              reservedExceedsPhysical: "RESERVED_EXCEEDS_PHYSICAL",
+              concurrencyExceedsPhysical: "CONCURRENCY_EXCEEDS_PHYSICAL",
+            },
+          );
         }
         const pool = await tx.modelPool.create({
           data: {
@@ -2128,6 +2191,11 @@ export const forwarderManagementRouter = {
           where: { id: pool.id },
           select: poolSelect,
         })) as ModelPoolRow | null;
+        // Documented, accepted exception: no `data.reason` is attached here.
+        // This is an internal invariant violation (the pool row vanished after
+        // a successful create inside the same transaction); it is not a user
+        // correctable guarded-create failure, so the client's generic rollback
+        // copy applies. Do not add a reason code for this branch.
         if (!created) throw new ORPCError("INTERNAL_SERVER_ERROR");
         return serializePool(created);
       });

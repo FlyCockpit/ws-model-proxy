@@ -29,6 +29,9 @@
     "./lib/declared-context-window": {
       "default": "./src/lib/declared-context-window.ts"
     },
+    "./lib/guarded-pool-create-reasons": {
+      "default": "./src/lib/guarded-pool-create-reasons.ts"
+    },
     "./lib/serializable-transaction": {
       "default": "./src/lib/serializable-transaction.ts"
     },

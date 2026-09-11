@@ -1,3 +1,4 @@
+import { ORPCError } from "@orpc/server";
 import { describe, expect, it, vi } from "vitest";
 import {
   assertDirectCapacityPolicy,
@@ -5,6 +6,16 @@ import {
   assertEffectiveContextPolicy,
   lockExecutionTargetPolicies,
 } from "./capacity-policy-safety";
+
+function thrownBy(action: () => void): ORPCError {
+  try {
+    action();
+  } catch (error) {
+    expect(error).toBeInstanceOf(ORPCError);
+    return error as ORPCError;
+  }
+  throw new Error("expected an ORPCError to be thrown");
+}
 
 describe("capacity policy safety", () => {
   it("enforces direct relational invariants without physical caps", () => {
@@ -121,6 +132,155 @@ describe("capacity policy safety", () => {
         memberMargin: 512,
       }),
     ).toThrow(/physical capacity/i);
+  });
+
+  it("reports a distinct caller-supplied reason per concurrency branch", () => {
+    const reasons = {
+      reservedExceeds: "RESERVED_EXCEEDS_CONCURRENCY",
+      reservedExceedsPhysical: "RESERVED_EXCEEDS_PHYSICAL",
+      concurrencyExceedsPhysical: "CONCURRENCY_EXCEEDS_PHYSICAL",
+    } as const;
+
+    const reservedAboveLimit = thrownBy(() =>
+      assertEffectiveConcurrencyPolicy(
+        {
+          hardLimit: 8,
+          poolLimit: 2,
+          poolReserved: 3,
+          memberMode: "INHERIT",
+        },
+        reasons,
+      ),
+    );
+    expect(reservedAboveLimit.data).toMatchObject({
+      reason: "RESERVED_EXCEEDS_CONCURRENCY",
+    });
+
+    const limitAbovePhysical = thrownBy(() =>
+      assertEffectiveConcurrencyPolicy(
+        {
+          hardLimit: 2,
+          poolLimit: 4,
+          poolReserved: 0,
+          memberMode: "INHERIT",
+        },
+        reasons,
+      ),
+    );
+    expect(limitAbovePhysical.data).toMatchObject({
+      reason: "CONCURRENCY_EXCEEDS_PHYSICAL",
+    });
+
+    const reservedAbovePhysical = thrownBy(() =>
+      assertEffectiveConcurrencyPolicy(
+        {
+          hardLimit: 2,
+          poolLimit: null,
+          poolReserved: 3,
+          memberMode: "UNLIMITED",
+        },
+        reasons,
+      ),
+    );
+    expect(reservedAbovePhysical.data).toMatchObject({
+      reason: "RESERVED_EXCEEDS_PHYSICAL",
+    });
+  });
+
+  it("reports a distinct caller-supplied reason per context branch", () => {
+    const reasons = {
+      marginExceedsCeiling: "CONTEXT_MARGIN_EXCEEDS_CEILING",
+      exceedsPhysical: "CONTEXT_EXCEEDS_PHYSICAL",
+    } as const;
+
+    const marginAboveCeiling = thrownBy(() =>
+      assertEffectiveContextPolicy(
+        {
+          physicalMaxContext: 10_000,
+          poolCeiling: null,
+          poolMargin: 0,
+          memberMode: "LIMITED",
+          memberCeiling: 100,
+          memberMargin: 100,
+        },
+        reasons,
+      ),
+    );
+    expect(marginAboveCeiling.data).toMatchObject({
+      reason: "CONTEXT_MARGIN_EXCEEDS_CEILING",
+    });
+
+    const policyAbovePhysical = thrownBy(() =>
+      assertEffectiveContextPolicy(
+        {
+          physicalMaxContext: 8_192,
+          poolCeiling: 8_000,
+          poolMargin: 512,
+          memberMode: "INHERIT",
+        },
+        reasons,
+      ),
+    );
+    expect(policyAbovePhysical.data).toMatchObject({
+      reason: "CONTEXT_EXCEEDS_PHYSICAL",
+    });
+  });
+
+  it("keeps the prior error envelope for callers that omit reasons", () => {
+    // Every other caller of these shared helpers passes no reasons; their
+    // thrown ORPCError must carry no `data` field, byte-for-byte as before.
+    expect(
+      thrownBy(() =>
+        assertEffectiveConcurrencyPolicy({
+          hardLimit: 8,
+          poolLimit: 2,
+          poolReserved: 3,
+          memberMode: "INHERIT",
+        }),
+      ).data,
+    ).toBeUndefined();
+    expect(
+      thrownBy(() =>
+        assertEffectiveConcurrencyPolicy({
+          hardLimit: 2,
+          poolLimit: 4,
+          poolReserved: 0,
+          memberMode: "INHERIT",
+        }),
+      ).data,
+    ).toBeUndefined();
+    expect(
+      thrownBy(() =>
+        assertEffectiveConcurrencyPolicy({
+          hardLimit: 2,
+          poolLimit: null,
+          poolReserved: 3,
+          memberMode: "UNLIMITED",
+        }),
+      ).data,
+    ).toBeUndefined();
+    expect(
+      thrownBy(() =>
+        assertEffectiveContextPolicy({
+          physicalMaxContext: 10_000,
+          poolCeiling: null,
+          poolMargin: 0,
+          memberMode: "LIMITED",
+          memberCeiling: 100,
+          memberMargin: 100,
+        }),
+      ).data,
+    ).toBeUndefined();
+    expect(
+      thrownBy(() =>
+        assertEffectiveContextPolicy({
+          physicalMaxContext: 8_192,
+          poolCeiling: 8_000,
+          poolMargin: 512,
+          memberMode: "INHERIT",
+        }),
+      ).data,
+    ).toBeUndefined();
   });
 
   it("locks unique execution targets in stable lexical order", async () => {
