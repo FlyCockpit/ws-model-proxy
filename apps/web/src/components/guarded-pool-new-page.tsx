@@ -15,6 +15,12 @@ import { orpc } from "@/utils/orpc";
  * Page body for /pools/new. Lives outside the route file (which the TanStack
  * router plugin split-wraps) so the gate-flip remount behavior is testable;
  * the route file is a thin registration wrapper.
+ *
+ * The egress gate fails closed while appConfig is pending or errored: an
+ * absent or loading snapshot yields no gate, and React Query RETAINS the last
+ * successful data after setting status "error" on a failed refetch, so the
+ * stale snapshot alone must not keep the gate open. Error-settled renders
+ * treat the gate as disabled until a refetch succeeds.
  */
 export function NewPoolPage() {
   const { lang } = useParams({ from: "/$lang/_auth/dashboard/pools/new" });
@@ -28,8 +34,13 @@ export function NewPoolPage() {
     ...orpc.appConfig.queryOptions(),
     refetchOnMount: "always",
   });
-  // Fail-closed: an absent or loading appConfig behaves like egress disabled.
-  const providerEgressEnabled = providerEgressFromAppConfig(appConfig.data);
+  // Fail-closed: an absent, loading, or ERRORED appConfig behaves like egress
+  // disabled. A failed refetch retains its stale snapshot (e.g. a stale
+  // providerEgressEnabled:true), so the snapshot alone must not hold the gate
+  // open for the rest of the session. A warm-cache refetch still in flight
+  // keeps serving the snapshot (accepted RTT residual; submits in that window
+  // are rejected server-side with PROVIDER_EGRESS_DISABLED).
+  const providerEgressEnabled = providerEgressFromAppConfig(appConfig.data) && !appConfig.isError;
   const capacityAvailability = resolveCapacityAvailability(
     appConfig.data?.capacityEnabled,
     appConfig.isError,
