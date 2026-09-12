@@ -1787,15 +1787,33 @@ export function PoolForm({
             optimisticBasicTranscription: value.optimisticBasicTranscription,
           }
         : {};
+      // Selectability-gated fields ride along only when the user actually
+      // changed them: the server revalidates recommended-surface selectability
+      // whenever these are present in an update, so always sending them would
+      // block unrelated routing saves on pools with legacy-invalid overrides.
+      // In create mode `pool` is undefined and this object is unused.
+      const surfaceOverrideChanged =
+        value.recommendedSurfaceOverride !==
+        poolSurfaceOverrideValue(pool?.recommendedSurfaceOverride);
+      const adaptationChanged =
+        value.protocolAdaptationEnabled !== (pool?.protocolAdaptationEnabled ?? false);
       const routing = show("routing")
         ? {
-            protocolAdaptationEnabled: value.protocolAdaptationEnabled,
+            ...(adaptationChanged
+              ? { protocolAdaptationEnabled: value.protocolAdaptationEnabled }
+              : {}),
             // A persisted lossy bit without adaptation is invalid. Saving the
             // routing tab repairs only that bit and never enables adaptation.
             allowLossyDeveloperRoleCollapse:
               value.protocolAdaptationEnabled && value.allowLossyDeveloperRoleCollapse,
-            recommendedSurfaceOverride:
-              value.recommendedSurfaceOverride === "" ? null : value.recommendedSurfaceOverride,
+            ...(surfaceOverrideChanged
+              ? {
+                  recommendedSurfaceOverride:
+                    value.recommendedSurfaceOverride === ""
+                      ? null
+                      : value.recommendedSurfaceOverride,
+                }
+              : {}),
             affinityEnabled: value.affinityEnabled,
             affinityTtlSeconds: value.affinityTtlSeconds,
             affinityMaxRecords: value.affinityMaxRecords,

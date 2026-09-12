@@ -136,7 +136,12 @@ const editablePool = {
   allowLossyDeveloperRoleCollapse: false,
   publicEgressEnabled: false,
   publicEgressAcknowledged: false,
-  recommendedSurfaceOverride: null,
+  recommendedSurfaceOverride: null as
+    | "ANTHROPIC_MESSAGES"
+    | "OPENAI_CHAT_COMPLETIONS"
+    | "OPENAI_COMPLETIONS"
+    | "OPENAI_RESPONSES"
+    | null,
   capacityPriority: 16,
   capacityConcurrencyLimit: 1,
   capacityReservedSlots: 0,
@@ -253,10 +258,118 @@ describe("PoolForm protocol adaptation controls", () => {
     fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
 
     await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    // The repair still rides on the always-sent lossy bit; the unchanged
+    // adaptation flag and override stay omitted (dirty-field sends).
     expect(state.mutationPayloads[0]?.input).toMatchObject({
-      protocolAdaptationEnabled: false,
       allowLossyDeveloperRoleCollapse: false,
     });
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("protocolAdaptationEnabled");
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("recommendedSurfaceOverride");
+  });
+
+  it("omits unchanged selectability-gated routing fields on edit (W5)", async () => {
+    mount(true, { mode: "edit", sections: ["routing"] });
+
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("protocolAdaptationEnabled");
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("recommendedSurfaceOverride");
+    // Unrelated routing fields keep their always-send semantics.
+    expect(state.mutationPayloads[0]?.input).toHaveProperty("allowLossyDeveloperRoleCollapse");
+    expect(state.mutationPayloads[0]?.input).toHaveProperty("affinityEnabled");
+  });
+
+  it("sends the override when the user clears a stored surface", async () => {
+    mount(true, {
+      mode: "edit",
+      sections: ["routing"],
+      pool: { ...editablePool, recommendedSurfaceOverride: "OPENAI_RESPONSES" },
+    });
+
+    fireEvent.change(screen.getByLabelText("dashboard:pools.recommendedSurfaceOverride"), {
+      target: { value: "" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({
+      recommendedSurfaceOverride: null,
+    });
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("protocolAdaptationEnabled");
+  });
+
+  it("sends the override when the user sets a surface on an automatic pool", async () => {
+    mount(true, { mode: "edit", sections: ["routing"] });
+
+    fireEvent.change(screen.getByLabelText("dashboard:pools.recommendedSurfaceOverride"), {
+      target: { value: "OPENAI_RESPONSES" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({
+      recommendedSurfaceOverride: "OPENAI_RESPONSES",
+    });
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("protocolAdaptationEnabled");
+  });
+
+  it("sends adaptation when changed and the override when unchanged separately", async () => {
+    mount(true, { mode: "edit", sections: ["routing"] });
+
+    fireEvent.click(screen.getByLabelText("dashboard:pools.protocolOptions.lossless.label"));
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({
+      protocolAdaptationEnabled: true,
+    });
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("recommendedSurfaceOverride");
+  });
+
+  it("omits the stored override on routing save when the control is untouched", async () => {
+    mount(true, {
+      mode: "edit",
+      sections: ["routing"],
+      pool: { ...editablePool, recommendedSurfaceOverride: "OPENAI_RESPONSES" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("recommendedSurfaceOverride");
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("protocolAdaptationEnabled");
+  });
+
+  it("omits a stored enabled adaptation on routing save when the control is untouched", async () => {
+    mount(true, {
+      mode: "edit",
+      sections: ["routing"],
+      pool: { ...editablePool, protocolAdaptationEnabled: true },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("protocolAdaptationEnabled");
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("recommendedSurfaceOverride");
+  });
+
+  it("sends protocolAdaptationEnabled false when the user disables a stored adaptation", async () => {
+    mount(true, {
+      mode: "edit",
+      sections: ["routing"],
+      pool: { ...editablePool, protocolAdaptationEnabled: true },
+    });
+
+    fireEvent.click(screen.getByLabelText("dashboard:pools.protocolOptions.native.label"));
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({
+      protocolAdaptationEnabled: false,
+    });
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("recommendedSurfaceOverride");
   });
 
   it("saves exactly one pool mutation without a sheet", async () => {
