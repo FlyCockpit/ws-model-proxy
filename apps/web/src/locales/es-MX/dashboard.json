@@ -179,6 +179,7 @@
     "deleteModel": "Eliminar metadatos del modelo descubierto",
     "deleteTitle": "Eliminar metadatos",
     "deleted": "Metadatos eliminados",
+    "deletionImpact": "Metadatos del modelo eliminados. Pools cuya API recomendada podría quedar sin servicio: {{slugs}}.",
     "typePrompt": "Escribe el valor mostrado para confirmar"
   },
   "models": {
@@ -186,6 +187,7 @@
     "capabilityHint": "Tipos de entrada anunciados. El sondeo no infiere esto del ID del modelo.",
     "capabilitySaved": "Capacidades guardadas. La elección del panel se conserva mientras el CLI hereda; una anulación explícita del CLI sigue siendo autoritativa.",
     "capabilitySaveFailed": "No se pudo guardar el perfil de capacidades del modelo. Inténtalo de nuevo.",
+    "capabilityImpact": "Guardado. La API recomendada de estos pools podría quedar sin servicio: {{slugs}}. Revisa la API recomendada de esos pools.",
     "editCapabilityProfile": "Editar perfil completo",
     "capabilityProfile": "Perfil de capacidades compatible con OpenAI",
     "capabilityProfileHint": "Fuente actual: {{source}}. Este perfil mantiene separado el audio del chat de los endpoints de transcripción y traducción.",
@@ -695,6 +697,8 @@
     "credentials": "Ciclo de vida de credenciales",
     "authTypeImmutable": "El tipo de autenticación queda fijo después de la primera credencial. Crea otra cuenta para cambiarlo.",
     "models": "Agregar modelo del proveedor",
+    "modelCapabilityImpact": "Guardado. La API recomendada de estos pools podría quedar sin servicio: {{slugs}}. Revisa la API recomendada de esos pools.",
+    "modelSaved": "Modelo guardado.",
     "configuredModels": "Modelos configurados",
     "pricing": "Versiones de precios inmutables",
     "budgets": "Política protectora de presupuesto",

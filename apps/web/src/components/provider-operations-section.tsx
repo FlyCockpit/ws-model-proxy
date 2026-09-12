@@ -2085,16 +2085,40 @@ function UpdateModelForm({
     validators: { onSubmit: updateModelFormSchema },
     onSubmit: async ({ value }) => {
       const numberOrNull = (raw: string) => (raw ? Number(raw) : null);
-      await updateModel.mutateAsync({
+      // Dirty-send: the inventory only travels when the textarea diverges
+      // from the loaded model's inventory, so an untouched edit form cannot
+      // rewrite (or clear) native capabilities as a side effect.
+      const loadedInventory = model.nativeCapabilities
+        ? JSON.stringify(model.nativeCapabilities, null, 2)
+        : "";
+      const inventoryEdited = value.capabilityInventory.trim() !== loadedInventory.trim();
+      const result = await updateModel.mutateAsync({
         id: model.id,
         displayName: value.displayName || null,
         contextWindow: numberOrNull(value.contextWindow),
         maxOutputTokens: numberOrNull(value.maxOutputTokens),
         concurrencyLimit: numberOrNull(value.concurrencyLimit),
-        nativeCapabilities: value.capabilityInventory.trim()
-          ? parseProviderCapabilityInventory(value.capabilityInventory)
-          : null,
+        ...(inventoryEdited
+          ? {
+              nativeCapabilities: value.capabilityInventory.trim()
+                ? parseProviderCapabilityInventory(value.capabilityInventory)
+                : null,
+            }
+          : {}),
       });
+      toast.success(t("dashboard:providers.modelSaved"));
+      // updateModel only carries the advisory when nativeCapabilities was edited.
+      const impacted =
+        result && typeof result === "object" && "impactedPools" in result
+          ? (result.impactedPools ?? [])
+          : [];
+      if (impacted.length > 0) {
+        toast.warning(
+          t("dashboard:providers.modelCapabilityImpact", {
+            slugs: impacted.map((pool) => pool.slug).join(", "),
+          }),
+        );
+      }
     },
   });
   return (

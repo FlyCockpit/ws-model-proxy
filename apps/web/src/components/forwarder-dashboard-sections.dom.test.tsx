@@ -9,14 +9,21 @@ const state = vi.hoisted(() => ({
   mutationPayloads: [] as Array<{ name: string; input: unknown }>,
   protocolAdaptationAvailable: true,
   nextReject: null as { name: string; error: unknown } | null,
+  cliDevices: [] as Array<Record<string, unknown>>,
+  capabilityImpact: [] as Array<{ id: string; slug: string; surface: string }>,
 }));
 
 vi.mock("react-i18next", () => ({
-  useTranslation: () => ({ t: (key: string) => key }),
+  useTranslation: () => ({
+    // Forward interpolation options so toast assertions can verify exactly
+    // which variables (slugs, not count) reach the translated message.
+    t: (key: string, options?: Record<string, unknown>) =>
+      options ? `${key}|${JSON.stringify(options)}` : key,
+  }),
 }));
 
 vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
-  toast: { success: vi.fn(), error: vi.fn() },
+  toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() },
 }));
 
 vi.mock("@/utils/orpc", () => {
@@ -33,26 +40,46 @@ vi.mock("@/utils/orpc", () => {
           state.nextReject = null;
           throw error;
         }
-        return name === "addPoolMember"
-          ? { id: "member-1", executionTargetId: "target-1" }
-          : { id: "pool-1" };
+        if (name === "addPoolMember") return { id: "member-1", executionTargetId: "target-1" };
+        if (name === "updateDiscoveredModelCapabilities")
+          return { impactedPools: state.capabilityImpact };
+        if (name === "setDiscoveredModelCapabilityProfile")
+          return { impactedPools: state.capabilityImpact };
+        if (name === "removeDiscoveredModelMetadata")
+          return { deleted: true, impactedPools: state.capabilityImpact };
+        return { id: "pool-1" };
       },
       ...options,
     }),
   });
   return {
     orpc: {
+      appConfig: query("appConfig", { capacityEnabled: false }),
       forwarderManagement: {
         key: () => ["forwarderManagement"],
+        listCliDevices: {
+          queryOptions: () => ({
+            queryKey: ["cliDevices"],
+            queryFn: async () => state.cliDevices,
+            initialData: state.cliDevices,
+          }),
+        },
         createModelPool: mutation("createModelPool"),
         updateModelPool: mutation("updateModelPool"),
         addPoolMember: mutation("addPoolMember"),
         updatePoolMember: mutation("updatePoolMember"),
+        removeCliDeviceMetadata: mutation("removeCliDeviceMetadata"),
+        removeEndpointMetadata: mutation("removeEndpointMetadata"),
+        removeDiscoveredModelMetadata: mutation("removeDiscoveredModelMetadata"),
+        updateDiscoveredModelCapabilities: mutation("updateDiscoveredModelCapabilities"),
+        setDiscoveredModelCapabilityProfile: mutation("setDiscoveredModelCapabilityProfile"),
+        updateDiscoveredModelAttachmentLimit: mutation("updateDiscoveredModelAttachmentLimit"),
         cacheAffinityStats: query("affinity", { activeRecords: 0, targets: [] }),
         clearCacheAffinity: mutation("clearCacheAffinity"),
       },
       capacityManagement: {
         key: () => ["capacityManagement"],
+        list: query("capacities", []),
         updateMemberPolicy: mutation("updateMemberPolicy"),
         updateDirectPolicy: mutation("updateDirectPolicy"),
       },
@@ -60,7 +87,51 @@ vi.mock("@/utils/orpc", () => {
   };
 });
 
-import { PoolForm, PoolMemberForm } from "./forwarder-dashboard-sections";
+import { toast } from "@ws-model-proxy/ui/components/sileo";
+import {
+  CliEndpointsModelsSection,
+  PoolForm,
+  PoolMemberForm,
+} from "./forwarder-dashboard-sections";
+
+const cliDeviceWithModel = {
+  id: "cli-1",
+  slug: "desk",
+  label: "Desk",
+  status: "ONLINE",
+  isStale: false,
+  inventoryConfirmed: true,
+  inventoryAcknowledgedAt: new Date("2026-01-01"),
+  inventorySeq: 1,
+  endpoints: [
+    {
+      id: "endpoint-1",
+      slug: "local",
+      label: "Local",
+      status: "ONLINE",
+      kind: "OPENAI",
+      published: true,
+      lastSeenAt: new Date("2026-01-01"),
+      capabilityMetadata: null,
+      failureReasonCode: null,
+      models: [
+        {
+          id: "model-1",
+          canonicalModelId: "owner/desk/local/example",
+          upstreamModelId: "example",
+          lastSeenAt: new Date("2026-01-01"),
+          published: true,
+          suggestedConnectionType: null,
+          capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+          capabilityOverrideMetadata: null,
+          capabilityOverrides: [],
+          effectiveCapabilities: { coarse: [] },
+          maxAttachmentBytes: null,
+        },
+      ],
+    },
+  ],
+};
 
 const editablePool = {
   id: "pool-1",
@@ -193,6 +264,11 @@ afterEach(() => {
   state.mutationCalls = [];
   state.mutationPayloads = [];
   state.nextReject = null;
+  state.cliDevices = [];
+  state.capabilityImpact = [];
+  vi.mocked(toast.success).mockClear();
+  vi.mocked(toast.error).mockClear();
+  vi.mocked(toast.warning).mockClear();
 });
 
 describe("PoolForm protocol adaptation controls", () => {
@@ -619,5 +695,50 @@ describe("PoolMemberForm capacity save gate", () => {
     fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
 
     await waitFor(() => expect(state.mutationCalls).toEqual(["updatePoolMember"]));
+  });
+});
+
+describe("CliEndpointsModelsSection capability-impact advisory", () => {
+  function mountModelsSection() {
+    return render(
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+      >
+        <CliEndpointsModelsSection />
+      </QueryClientProvider>,
+    );
+  }
+
+  it("fires the save success toast and the impact warning with slugs (no count) after a capability edit", async () => {
+    state.cliDevices = [cliDeviceWithModel];
+    state.capabilityImpact = [{ id: "pool-1", slug: "alpha", surface: "OPENAI_RESPONSES" }];
+    mountModelsSection();
+
+    fireEvent.click(screen.getByLabelText("dashboard:models.vision"));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateDiscoveredModelCapabilities"]));
+    await waitFor(() =>
+      expect(toast.success).toHaveBeenCalledWith("dashboard:models.capabilitySaved"),
+    );
+    // The warning interpolates slugs only; the reworded key has no count.
+    await waitFor(() =>
+      expect(toast.warning).toHaveBeenCalledWith(
+        `dashboard:models.capabilityImpact|${JSON.stringify({ slugs: "alpha" })}`,
+      ),
+    );
+  });
+
+  it("keeps the plain success toast on clean responses", async () => {
+    state.cliDevices = [cliDeviceWithModel];
+    state.capabilityImpact = [];
+    mountModelsSection();
+
+    fireEvent.click(screen.getByLabelText("dashboard:models.vision"));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateDiscoveredModelCapabilities"]));
+    await waitFor(() =>
+      expect(toast.success).toHaveBeenCalledWith("dashboard:models.capabilitySaved"),
+    );
+    expect(toast.warning).not.toHaveBeenCalled();
   });
 });

@@ -179,6 +179,7 @@
     "deleteModel": "Delete discovered model metadata",
     "deleteTitle": "Delete metadata",
     "deleted": "Metadata deleted",
+    "deletionImpact": "Model metadata deleted. Pools whose recommended API may now be unservable: {{slugs}}.",
     "typePrompt": "Type the shown value to confirm"
   },
   "models": {
@@ -186,6 +187,7 @@
     "capabilityHint": "Advertised input types. Probe never infers these from the model id.",
     "capabilitySaved": "Model capabilities saved. The dashboard choice is retained while the CLI inherits; an explicit CLI override remains authoritative.",
     "capabilitySaveFailed": "Couldn't save the model capability profile. Try again.",
+    "capabilityImpact": "Saved. Pools whose recommended API may now be unservable: {{slugs}}. Review those pools' recommended API.",
     "editCapabilityProfile": "Edit full profile",
     "capabilityProfile": "OpenAI-compatible capability profile",
     "capabilityProfileHint": "Current source: {{source}}. This profile keeps chat audio separate from dedicated transcription and translation endpoints.",
@@ -772,6 +774,8 @@
     "credentials": "Credential lifecycle",
     "authTypeImmutable": "Authentication type is fixed after the first credential. Create a separate account to change it.",
     "models": "Add provider model",
+    "modelCapabilityImpact": "Saved. Pools whose recommended API may now be unservable: {{slugs}}. Review those pools' recommended API.",
+    "modelSaved": "Model saved.",
     "configuredModels": "Configured models",
     "pricing": "Immutable pricing versions",
     "budgets": "Protective budget policy",

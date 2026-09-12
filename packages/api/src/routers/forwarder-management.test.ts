@@ -4345,4 +4345,185 @@ describe("forwarderManagementRouter", () => {
       expect(db.poolMember.delete).toHaveBeenCalledTimes(1);
     });
   });
+
+  describe("capability-edit impact advisory (non-blocking)", () => {
+    function impactMemberRow(
+      id: string,
+      poolId: string,
+      native: "chat" | "responses",
+      tier: "PRIMARY" | "PUBLIC_OVERFLOW" = "PRIMARY",
+    ) {
+      return {
+        id,
+        poolId,
+        tier,
+        discoveredModelId: null,
+        DiscoveredModel: null,
+        ExecutionTarget: { DiscoveredModel: guardedLocalModel({}, native), ProviderModel: null },
+      };
+    }
+
+    /**
+     * The impact helper issues two member queries: a poolId lookup for the
+     * affected pools (no `where.poolId`) and the post-edit surface-member load
+     * (`where.poolId.in`). Dispatch on that.
+     */
+    function mockImpactQueries(options: {
+      affectedPoolIds: string[];
+      memberRows: ReturnType<typeof impactMemberRow>[];
+      pools: Array<Record<string, unknown>>;
+    }) {
+      db.poolMember.findMany.mockImplementation(
+        async ({ where }: { where?: { poolId?: { in?: string[] } } } = {}) =>
+          where?.poolId
+            ? options.memberRows.filter((row) => where.poolId?.in?.includes(row.poolId))
+            : options.affectedPoolIds.map((poolId) => ({ poolId })),
+      );
+      db.modelPool.findMany.mockResolvedValue(options.pools);
+    }
+
+    const impactPools = [
+      {
+        id: "pool-a",
+        slug: "alpha",
+        userId: "user-id",
+        recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        protocolAdaptationEnabled: false,
+      },
+      {
+        id: "pool-b",
+        slug: "beta",
+        userId: "user-id",
+        recommendedSurfaceOverride: null,
+        protocolAdaptationEnabled: false,
+      },
+    ];
+
+    it("updateDiscoveredModelCapabilities succeeds and reports only the unservable pool", async () => {
+      db.discoveredModel.findUnique.mockResolvedValue({
+        id: "model-id",
+        userId: "user-id",
+        capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+        capabilityOverrideMetadata: null,
+        capabilityOverrides: [],
+        Endpoint: { capabilityMetadata: null, defaultCapabilities: [] },
+      });
+      db.discoveredModel.update.mockImplementation(async ({ data }) => data);
+      // Post-edit: pool-a's only primary is chat-only under a responses
+      // override (unservable); pool-b suggests from its chat primary.
+      mockImpactQueries({
+        affectedPoolIds: ["pool-a", "pool-b"],
+        memberRows: [
+          impactMemberRow("m-a", "pool-a", "chat"),
+          impactMemberRow("m-b", "pool-b", "chat"),
+        ],
+        pools: impactPools,
+      });
+
+      const result = await client().updateDiscoveredModelCapabilities({
+        id: "model-id",
+        vision: true,
+        audio: false,
+        video: false,
+      });
+      // The edit itself succeeded (non-blocking) and the advisory is exact.
+      expect(db.discoveredModel.update).toHaveBeenCalledTimes(1);
+      expect(result.impactedPools).toEqual([
+        { id: "pool-a", slug: "alpha", surface: "OPENAI_RESPONSES" },
+      ]);
+    });
+
+    it("updateDiscoveredModelCapabilities reports impacted pools on the v4 metadata branch", async () => {
+      db.discoveredModel.findUnique.mockResolvedValue({
+        id: "model-id",
+        userId: "user-id",
+        capabilityOverrideMode: "OVERRIDE",
+        capabilityOverrideMetadata: {
+          version: 4,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiChatCompletions: {
+              source: "dashboard",
+              confidence: "exact",
+              streaming: true,
+              operations: ["create"],
+            },
+          },
+        },
+        capabilityOverrides: [],
+        Endpoint: { capabilityMetadata: null, defaultCapabilities: [] },
+      });
+      db.discoveredModel.update.mockImplementation(async ({ data }) => data);
+      mockImpactQueries({
+        affectedPoolIds: ["pool-a"],
+        memberRows: [impactMemberRow("m-a", "pool-a", "chat")],
+        pools: [impactPools[0]],
+      });
+
+      const result = await client().updateDiscoveredModelCapabilities({
+        id: "model-id",
+        vision: true,
+        audio: false,
+        video: false,
+      });
+      // The v4 branch preserved the structured surface and flipped the media
+      // input flags, and the advisory still reports the unservable pool.
+      expect(result.capabilityOverrideMetadata).toMatchObject({
+        version: 4,
+        surfaces: {
+          openaiChatCompletions: { inputImages: true, inputAudio: false, inputVideo: false },
+        },
+      });
+      expect(result.impactedPools).toEqual([
+        { id: "pool-a", slug: "alpha", surface: "OPENAI_RESPONSES" },
+      ]);
+    });
+
+    it("setDiscoveredModelCapabilityProfile returns an empty advisory when nothing is impacted", async () => {
+      db.discoveredModel.findUnique.mockResolvedValue({ id: "model-id", userId: "user-id" });
+      db.discoveredModel.update.mockImplementation(async ({ data }) => data);
+      mockImpactQueries({
+        affectedPoolIds: ["pool-b"],
+        memberRows: [impactMemberRow("m-b", "pool-b", "chat")],
+        pools: [impactPools[1]],
+      });
+
+      const result = await client().setDiscoveredModelCapabilityProfile({
+        id: "model-id",
+        mode: "override",
+        capabilities: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiChatCompletions: { source: "dashboard", confidence: "exact", supported: true },
+          },
+        },
+        optimisticBasicTranscription: false,
+      });
+      expect(result.impactedPools).toEqual([]);
+    });
+
+    it("removeDiscoveredModelMetadata computes the post-deletion surface after capturing affected pools", async () => {
+      db.discoveredModel.findUnique.mockResolvedValue({
+        id: "model-id",
+        userId: "user-id",
+        lastSeenAt: null,
+      });
+      db.discoveredModel.delete.mockResolvedValue({ id: "model-id" });
+      // The responses-native member cascades away with the deleted model, so
+      // the post-deletion primary set of pool-a is chat-only under a stored
+      // responses override: unservable.
+      mockImpactQueries({
+        affectedPoolIds: ["pool-a"],
+        memberRows: [impactMemberRow("m-a", "pool-a", "chat")],
+        pools: [impactPools[0]],
+      });
+
+      await expect(client().removeDiscoveredModelMetadata({ id: "model-id" })).resolves.toEqual({
+        deleted: true,
+        impactedPools: [{ id: "pool-a", slug: "alpha", surface: "OPENAI_RESPONSES" }],
+      });
+      expect(db.discoveredModel.delete).toHaveBeenCalledWith({ where: { id: "model-id" } });
+    });
+  });
 });

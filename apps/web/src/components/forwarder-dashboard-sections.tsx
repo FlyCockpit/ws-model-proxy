@@ -658,26 +658,53 @@ export function CliEndpointsModelsSection() {
   );
   const removeModel = useMutation(
     orpc.forwarderManagement.removeDiscoveredModelMetadata.mutationOptions({
-      onSuccess: () => {
+      onSuccess: (data) => {
         queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
-        toast.success(t("dashboard:metadata.deleted"));
+        const impacted = data?.impactedPools ?? [];
+        if (impacted.length > 0) {
+          toast.warning(
+            t("dashboard:metadata.deletionImpact", {
+              slugs: impacted.map((pool) => pool.slug).join(", "),
+            }),
+          );
+        } else {
+          toast.success(t("dashboard:metadata.deleted"));
+        }
         setDeleteTarget(null);
       },
     }),
   );
   const updateModelCapabilities = useMutation(
     orpc.forwarderManagement.updateDiscoveredModelCapabilities.mutationOptions({
-      onSuccess: () => {
+      onSuccess: (data) => {
         queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
+        // The save always succeeded; the warning is additive so operators
+        // still see the impact advisory.
         toast.success(t("dashboard:models.capabilitySaved"));
+        const impacted = data?.impactedPools ?? [];
+        if (impacted.length > 0) {
+          toast.warning(
+            t("dashboard:models.capabilityImpact", {
+              slugs: impacted.map((pool) => pool.slug).join(", "),
+            }),
+          );
+        }
       },
     }),
   );
   const setModelCapabilityProfile = useMutation(
     orpc.forwarderManagement.setDiscoveredModelCapabilityProfile.mutationOptions({
-      onSuccess: () => {
+      onSuccess: (data) => {
         queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:models.capabilitySaved"));
+        const impacted = data?.impactedPools ?? [];
+        if (impacted.length > 0) {
+          toast.warning(
+            t("dashboard:models.capabilityImpact", {
+              slugs: impacted.map((pool) => pool.slug).join(", "),
+            }),
+          );
+        }
       },
       onError: () => toast.error(t("dashboard:models.capabilitySaveFailed")),
     }),

@@ -49,6 +49,11 @@ import {
   transformerSupportedModalities,
 } from "../lib/openai-compatible-capabilities";
 import {
+  capabilityEditImpactedPools,
+  discoveredModelPoolMemberWhere,
+  poolIdsWithMembers,
+} from "../lib/pool-capability-impact";
+import {
   assertRecommendedSurfaceServable,
   discoveredModelSurfaceCapabilities,
   providerModelSurfaceCapabilities,
@@ -1132,6 +1137,22 @@ export async function assertPoolSlugAvailable(
   }
 }
 
+/**
+ * Advisory (non-blocking) impact report for a discovered-model edit: which
+ * pools' effective recommended surface is now unservable after the write.
+ * Computed from the post-edit member state; never throws.
+ */
+async function discoveredModelEditImpact(discoveredModelId: string, userId: string) {
+  return capabilityEditImpactedPools(prisma, {
+    userId,
+    poolIds: await poolIdsWithMembers(
+      prisma,
+      userId,
+      discoveredModelPoolMemberWhere(discoveredModelId),
+    ),
+  });
+}
+
 async function removeOwnedRow({
   kind,
   id,
@@ -2182,14 +2203,29 @@ export const forwarderManagementRouter = {
 
   removeDiscoveredModelMetadata: protectedProcedure
     .input(z.object({ id: idSchema, staleBefore: z.date().optional() }))
-    .handler(({ input, context }) =>
-      removeOwnedRow({
+    .handler(async ({ input, context }) => {
+      // Pool membership cascades away with the model, so capture the affected
+      // pools before the delete; the impact itself is computed from the
+      // post-delete member state.
+      const poolIds = await poolIdsWithMembers(
+        prisma,
+        context.session.user.id,
+        discoveredModelPoolMemberWhere(input.id),
+      );
+      const removed = await removeOwnedRow({
         kind: "discoveredModel",
         id: input.id,
         userId: context.session.user.id,
         staleBefore: input.staleBefore,
-      }),
-    ),
+      });
+      return {
+        ...removed,
+        impactedPools: await capabilityEditImpactedPools(prisma, {
+          userId: context.session.user.id,
+          poolIds,
+        }),
+      };
+    }),
 
   listModelPools: protectedProcedure.handler(async ({ context }) => {
     const rows = (await prisma.modelPool.findMany({
@@ -3612,13 +3648,14 @@ export const forwarderManagementRouter = {
         ) {
           nextCoarse.push("TEXT_GENERATION");
         }
-        return prisma.discoveredModel.update({
+        const metadata = openAiCapabilitiesFromCoarse(nextCoarse);
+        await prisma.discoveredModel.update({
           where: { id: input.id },
           data: {
             capabilityOverrideMode: "OVERRIDE",
             capabilityOverrideOrigin: "DASHBOARD",
             capabilityOverrides: { set: nextCoarse },
-            capabilityOverrideMetadata: openAiCapabilitiesFromCoarse(nextCoarse),
+            capabilityOverrideMetadata: metadata,
           },
           select: {
             id: true,
@@ -3627,6 +3664,13 @@ export const forwarderManagementRouter = {
             capabilityOverrideMetadata: true,
           },
         });
+        return {
+          id: input.id,
+          capabilityOverrideMode: "OVERRIDE" as const,
+          capabilityOverrides: nextCoarse,
+          capabilityOverrideMetadata: metadata,
+          impactedPools: await discoveredModelEditImpact(input.id, context.session.user.id),
+        };
       }
       if (parsed.version === 4) {
         const current = parsed.surfaces.openaiChatCompletions;
@@ -3644,7 +3688,7 @@ export const forwarderManagementRouter = {
               : current,
           },
         };
-        return prisma.discoveredModel.update({
+        const updated = await prisma.discoveredModel.update({
           where: { id: input.id },
           data: {
             capabilityOverrideMode: "OVERRIDE",
@@ -3659,6 +3703,10 @@ export const forwarderManagementRouter = {
             capabilityOverrideMetadata: true,
           },
         });
+        return {
+          ...updated,
+          impactedPools: await discoveredModelEditImpact(input.id, context.session.user.id),
+        };
       }
       const base = parsed;
       const chatExisted = Boolean(base.chatCompletions);
@@ -3703,7 +3751,7 @@ export const forwarderManagementRouter = {
       if (metadata.audio?.speech) coarse.push("AUDIO_OUTPUT");
       if (metadata.embeddings?.supported) coarse.push("EMBEDDING");
       if (metadata.responses?.supported) coarse.push("RESPONSES_API");
-      return prisma.discoveredModel.update({
+      const updated = await prisma.discoveredModel.update({
         where: { id: input.id },
         data: {
           capabilityOverrideMode: "OVERRIDE",
@@ -3718,6 +3766,10 @@ export const forwarderManagementRouter = {
           capabilityOverrideMetadata: true,
         },
       });
+      return {
+        ...updated,
+        impactedPools: await discoveredModelEditImpact(input.id, context.session.user.id),
+      };
     }),
 
   /**
@@ -3751,7 +3803,7 @@ export const forwarderManagementRouter = {
         throw new ORPCError("NOT_FOUND", { message: "Discovered model not found." });
       }
       const override = input.mode === "override";
-      return prisma.discoveredModel.update({
+      const updated = await prisma.discoveredModel.update({
         where: { id: input.id },
         data: {
           capabilityOverrideMode: override ? "OVERRIDE" : "INHERIT_ENDPOINT_DEFAULTS",
@@ -3773,6 +3825,10 @@ export const forwarderManagementRouter = {
           capabilityOverrideMetadata: true,
         },
       });
+      return {
+        ...updated,
+        impactedPools: await discoveredModelEditImpact(input.id, context.session.user.id),
+      };
     }),
 
   updateDiscoveredModelAttachmentLimit: protectedProcedure

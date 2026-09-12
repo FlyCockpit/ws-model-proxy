@@ -16,6 +16,11 @@ import {
   parseOpenAiCompatibleCapabilities,
 } from "../lib/openai-compatible-capabilities";
 import {
+  capabilityEditImpactedPools,
+  poolIdsWithMembers,
+  providerModelPoolMemberWhere,
+} from "../lib/pool-capability-impact";
+import {
   decryptProviderCredential,
   encryptProviderCredential,
   parseProviderCredentialKeyring,
@@ -658,7 +663,7 @@ export const providerManagementRouter = {
       enabled();
       const userId = context.session.user.id;
       const { id: modelId, ...data } = input;
-      return runSerializableTransaction(async (tx) => {
+      const { row, advisoryRequested } = await runSerializableTransaction(async (tx) => {
         // This pre-row identity fence is always first, matching provider
         // attachment/setup paths even when the execution target does not yet
         // exist.
@@ -775,8 +780,20 @@ export const providerManagementRouter = {
                 : undefined,
           },
         });
-        return row;
+        return { row, advisoryRequested: data.nativeCapabilities !== undefined };
       });
+      // Capability inventory edits stay non-blocking, but their blast radius
+      // is reported: which pools' recommended surface the post-edit native
+      // inventory can no longer serve. The advisory is computed with the
+      // shared client AFTER the transaction commits so the reporting reads
+      // can never extend the serializable write window, and only when the
+      // inventory was among the edited fields.
+      if (!advisoryRequested) return row;
+      const impactedPools = await capabilityEditImpactedPools(prisma, {
+        userId,
+        poolIds: await poolIdsWithMembers(prisma, userId, providerModelPoolMemberWhere(modelId)),
+      });
+      return impactedPools ? { ...row, impactedPools } : row;
     }),
   deleteModel: protectedProcedure.input(z.object({ id })).handler(async ({ input, context }) => {
     enabled();
