@@ -26,6 +26,12 @@
     "./lib/openai-compatible-capabilities": {
       "default": "./src/lib/openai-compatible-capabilities.ts"
     },
+    "./lib/pool-model-capabilities": {
+      "default": "./src/lib/pool-model-capabilities.ts"
+    },
+    "./lib/pool-recommended-surface": {
+      "default": "./src/lib/pool-recommended-surface.ts"
+    },
     "./lib/declared-context-window": {
       "default": "./src/lib/declared-context-window.ts"
     },

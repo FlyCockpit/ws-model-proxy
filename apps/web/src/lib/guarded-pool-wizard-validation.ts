@@ -1,7 +1,8 @@
 import {
-  openAiCapabilitiesFromCoarse,
-  parseOpenAiCompatibleCapabilities,
-} from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+  discoveredModelSurfaceCapabilities,
+  type OpenAiCompatibleCapabilities,
+  providerModelSurfaceCapabilities,
+} from "@ws-model-proxy/api/lib/pool-model-capabilities";
 import {
   type ModelApiSurface,
   surfaceAvailabilityMatrix,
@@ -9,9 +10,20 @@ import {
 import { validateForwarderPoolSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import { z } from "zod";
 
+/**
+ * Discovered/local model view for capability resolution. Carries exactly the
+ * fields the server's canonical resolver (discoveredModelSurfaceCapabilities)
+ * needs, flattened from the listCliDevices model + endpoint projection: the
+ * model's override fields plus the owning endpoint's metadata and default
+ * coarse inventory.
+ */
 export type GuardedWizardLocalModel = {
   id: string;
-  effectiveCapabilities?: { metadata?: unknown; coarse?: string[] } | null;
+  capabilityOverrideMode?: string | null;
+  capabilityOverrideMetadata?: unknown;
+  capabilityOverrides?: unknown;
+  endpointCapabilityMetadata?: unknown;
+  endpointDefaultCapabilities?: unknown;
   executionTarget?: { inferenceCapacityId: string | null } | null;
 };
 
@@ -25,24 +37,58 @@ export type GuardedWizardProviderModel = {
   nativeCapabilities?: unknown;
 };
 
-function combinedPrimarySelection(
-  localIds: readonly string[],
+/**
+ * Wizard-side capability resolution for a discovered/local model: the server's
+ * canonical discoveredModelSurfaceCapabilities over the flattened
+ * override + endpoint fields. Exported so the wizard component derives the
+ * declared context window from the same effective capabilities.
+ */
+export function localModelSurfaceCapabilities(
+  model: GuardedWizardLocalModel,
+): OpenAiCompatibleCapabilities | null {
+  return discoveredModelSurfaceCapabilities({
+    capabilityOverrideMode: model.capabilityOverrideMode,
+    capabilityOverrideMetadata: model.capabilityOverrideMetadata,
+    capabilityOverrides: model.capabilityOverrides,
+    Endpoint: {
+      capabilityMetadata: model.endpointCapabilityMetadata,
+      defaultCapabilities: model.endpointDefaultCapabilities,
+    },
+  });
+}
+
+/** A primary-member candidate with canonically resolved capabilities. */
+type SurfaceCandidate = {
+  id: string;
+  capabilities: OpenAiCompatibleCapabilities | null;
+};
+
+function localCandidates(models: readonly GuardedWizardLocalModel[]): SurfaceCandidate[] {
+  return models.map((model) => ({
+    id: model.id,
+    capabilities: localModelSurfaceCapabilities(model),
+  }));
+}
+
+function providerCandidates(models: readonly GuardedWizardProviderModel[]): SurfaceCandidate[] {
+  return models.map((provider) => ({
+    id: provider.id,
+    capabilities: providerModelSurfaceCapabilities(provider.nativeCapabilities),
+  }));
+}
+
+/**
+ * The combined PRIMARY member set: locals always, plus provider models only
+ * when the provider tier is PRIMARY. PUBLIC_OVERFLOW providers are not
+ * primary members.
+ */
+function combinedPrimaryCandidates(
   localModels: readonly GuardedWizardLocalModel[],
-  providerIds: readonly string[],
   providerModels: readonly GuardedWizardProviderModel[],
   providerTier: "PRIMARY" | "PUBLIC_OVERFLOW",
-) {
-  if (providerTier !== "PRIMARY") return { ids: [...localIds], models: [...localModels] };
-  return {
-    ids: [...localIds, ...providerIds],
-    models: [
-      ...localModels,
-      ...providerModels.map((provider) => ({
-        id: provider.id,
-        effectiveCapabilities: { metadata: provider.nativeCapabilities },
-      })),
-    ],
-  };
+): SurfaceCandidate[] {
+  if (providerTier !== "PRIMARY") return localCandidates(localModels);
+  return [...localCandidates(localModels), ...providerCandidates(providerModels)];
 }
 
 export function recommendedCombinedPrimarySurface(
@@ -53,14 +99,12 @@ export function recommendedCombinedPrimarySurface(
   providerTier: "PRIMARY" | "PUBLIC_OVERFLOW",
   protocolAdaptationEnabled = false,
 ) {
-  const combined = combinedPrimarySelection(
-    localIds,
-    localModels,
-    providerIds,
-    providerModels,
-    providerTier,
+  const combined = combinedPrimaryCandidates(localModels, providerModels, providerTier);
+  return recommendedSurfaceFromCandidates(
+    combined,
+    [...localIds, ...providerIds],
+    protocolAdaptationEnabled,
   );
-  return recommendedPrimarySurface(combined.ids, combined.models, protocolAdaptationEnabled);
 }
 
 export function combinedPrimarySurfaceIsSelectable(
@@ -72,33 +116,25 @@ export function combinedPrimarySurfaceIsSelectable(
   providerTier: "PRIMARY" | "PUBLIC_OVERFLOW",
   protocolAdaptationEnabled = false,
 ) {
-  const combined = combinedPrimarySelection(
-    localIds,
-    localModels,
-    providerIds,
-    providerModels,
-    providerTier,
-  );
-  return primarySurfaceIsSelectable(
+  const combined = combinedPrimaryCandidates(localModels, providerModels, providerTier);
+  return surfaceIsSelectableFromCandidates(
     surface,
-    combined.ids,
-    combined.models,
+    combined,
+    [...localIds, ...providerIds],
     protocolAdaptationEnabled,
   );
 }
 
-export function recommendedPrimarySurface(
+function recommendedSurfaceFromCandidates(
+  candidates: readonly SurfaceCandidate[],
   selectedIds: readonly string[],
-  models: readonly GuardedWizardLocalModel[],
-  protocolAdaptationEnabled = false,
+  protocolAdaptationEnabled: boolean,
 ): Exclude<ModelApiSurface, "OPENAI_COMPLETIONS"> | null {
-  const matrices = models
-    .filter((model) => selectedIds.includes(model.id))
-    .map((model) =>
+  const matrices = candidates
+    .filter((candidate) => selectedIds.includes(candidate.id))
+    .map((candidate) =>
       surfaceAvailabilityMatrix({
-        capabilities:
-          parseOpenAiCompatibleCapabilities(model.effectiveCapabilities?.metadata) ??
-          openAiCapabilitiesFromCoarse(model.effectiveCapabilities?.coarse ?? []),
+        capabilities: candidate.capabilities,
         adaptationEnabled: protocolAdaptationEnabled,
       }),
     );
@@ -129,23 +165,47 @@ export function recommendedPrimarySurface(
   );
 }
 
+function surfaceIsSelectableFromCandidates(
+  surface: ModelApiSurface,
+  candidates: readonly SurfaceCandidate[],
+  selectedIds: readonly string[],
+  protocolAdaptationEnabled: boolean,
+) {
+  const matrices = candidates
+    .filter((candidate) => selectedIds.includes(candidate.id))
+    .map((candidate) =>
+      surfaceAvailabilityMatrix({
+        capabilities: candidate.capabilities,
+        adaptationEnabled: protocolAdaptationEnabled,
+      }),
+    );
+  return matrices.length > 0 && matrices.every((matrix) => matrix[surface].mode !== "unavailable");
+}
+
+export function recommendedPrimarySurface(
+  selectedIds: readonly string[],
+  models: readonly GuardedWizardLocalModel[],
+  protocolAdaptationEnabled = false,
+): Exclude<ModelApiSurface, "OPENAI_COMPLETIONS"> | null {
+  return recommendedSurfaceFromCandidates(
+    localCandidates(models),
+    selectedIds,
+    protocolAdaptationEnabled,
+  );
+}
+
 export function primarySurfaceIsSelectable(
   surface: ModelApiSurface,
   selectedIds: readonly string[],
   models: readonly GuardedWizardLocalModel[],
   protocolAdaptationEnabled = false,
 ) {
-  const matrices = models
-    .filter((model) => selectedIds.includes(model.id))
-    .map((model) =>
-      surfaceAvailabilityMatrix({
-        capabilities:
-          parseOpenAiCompatibleCapabilities(model.effectiveCapabilities?.metadata) ??
-          openAiCapabilitiesFromCoarse(model.effectiveCapabilities?.coarse ?? []),
-        adaptationEnabled: protocolAdaptationEnabled,
-      }),
-    );
-  return matrices.length > 0 && matrices.every((matrix) => matrix[surface].mode !== "unavailable");
+  return surfaceIsSelectableFromCandidates(
+    surface,
+    localCandidates(models),
+    selectedIds,
+    protocolAdaptationEnabled,
+  );
 }
 
 export type RecommendedSurfaceFlags = {

@@ -5,7 +5,6 @@ import {
   type GuardedPoolCreateFailureReason,
   isGuardedPoolCreateFailureReason,
 } from "@ws-model-proxy/api/lib/guarded-pool-create-reasons";
-import { parseOpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
 import {
@@ -29,6 +28,7 @@ import {
   combinedPrimaryMemberCount,
   type GuardedWizardLocalModel,
   guardedWizardSurfaces,
+  localModelSurfaceCapabilities,
   nextRecommendedSurface,
   providerOrderAfterMove,
   providerOrderAfterToggle,
@@ -103,9 +103,9 @@ export function memberContextFitsPhysical(
 }
 
 function modelDeclaredContextWindow(model: LocalModel | undefined): number | null {
-  return declaredContextWindow(
-    parseOpenAiCompatibleCapabilities(model?.effectiveCapabilities?.metadata),
-  );
+  // Same canonical resolution as the surface checks: the model's effective
+  // metadata (override-mode aware, endpoint defaults as fallback).
+  return model ? declaredContextWindow(localModelSurfaceCapabilities(model)) : null;
 }
 
 /**

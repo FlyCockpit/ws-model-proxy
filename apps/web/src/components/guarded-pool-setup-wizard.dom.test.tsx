@@ -154,13 +154,15 @@ const models = [
   {
     id: "chat",
     canonicalModelId: "owner/cli/chat",
-    effectiveCapabilities: { metadata: surface("openaiChatCompletions") },
+    capabilityOverrideMode: "OVERRIDE",
+    capabilityOverrideMetadata: surface("openaiChatCompletions"),
     executionTarget: { inferenceCapacityId: "chat-capacity" },
   },
   {
     id: "responses",
     canonicalModelId: "owner/cli/responses",
-    effectiveCapabilities: { metadata: surface("openaiResponses") },
+    capabilityOverrideMode: "OVERRIDE",
+    capabilityOverrideMetadata: surface("openaiResponses"),
     executionTarget: { inferenceCapacityId: "responses-capacity" },
   },
 ];

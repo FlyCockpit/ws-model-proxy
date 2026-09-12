@@ -282,8 +282,10 @@ export function allDirectModels(devices: CliDevice[]) {
         endpointSlug: endpoint.slug,
         endpointLabel: endpoint.label,
         endpointPublished: endpoint.published,
-        // Needed for OVERRIDE→endpoint fallback (same as pool management).
+        // Needed for OVERRIDE→endpoint fallback (same as pool management) and
+        // for the guarded wizard's canonical capability resolution.
         endpointCapabilityMetadata: endpoint.capabilityMetadata,
+        endpointDefaultCapabilities: endpoint.defaultCapabilities,
       })),
     ),
   );
@@ -916,6 +918,7 @@ export function CliEndpointsModelsSection() {
                                         endpointSlug: endpoint.slug,
                                         endpointLabel: endpoint.label,
                                         endpointCapabilityMetadata: endpoint.capabilityMetadata,
+                                        endpointDefaultCapabilities: endpoint.defaultCapabilities,
                                       }).images
                                     }
                                     audio={
@@ -926,6 +929,7 @@ export function CliEndpointsModelsSection() {
                                         endpointSlug: endpoint.slug,
                                         endpointLabel: endpoint.label,
                                         endpointCapabilityMetadata: endpoint.capabilityMetadata,
+                                        endpointDefaultCapabilities: endpoint.defaultCapabilities,
                                       }).audio
                                     }
                                     video={
@@ -936,6 +940,7 @@ export function CliEndpointsModelsSection() {
                                         endpointSlug: endpoint.slug,
                                         endpointLabel: endpoint.label,
                                         endpointCapabilityMetadata: endpoint.capabilityMetadata,
+                                        endpointDefaultCapabilities: endpoint.defaultCapabilities,
                                       }).video
                                     }
                                     disabled={updateModelCapabilities.isPending}
@@ -951,6 +956,7 @@ export function CliEndpointsModelsSection() {
                                       endpointSlug: endpoint.slug,
                                       endpointLabel: endpoint.label,
                                       endpointCapabilityMetadata: endpoint.capabilityMetadata,
+                                      endpointDefaultCapabilities: endpoint.defaultCapabilities,
                                     }}
                                     endpointCapabilityMetadata={endpoint.capabilityMetadata}
                                     disabled={setModelCapabilityProfile.isPending}
@@ -989,6 +995,7 @@ export function CliEndpointsModelsSection() {
                                           endpointSlug: endpoint.slug,
                                           endpointLabel: endpoint.label,
                                           endpointCapabilityMetadata: endpoint.capabilityMetadata,
+                                          endpointDefaultCapabilities: endpoint.defaultCapabilities,
                                         })
                                       }
                                       aria-label={t("dashboard:pools.capacity.directPolicy")}

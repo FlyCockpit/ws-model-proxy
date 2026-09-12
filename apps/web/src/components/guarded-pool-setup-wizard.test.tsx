@@ -99,7 +99,8 @@ const chatCapabilities = {
 const localModel = {
   id: "local",
   canonicalModelId: "owner/cli/local/model",
-  effectiveCapabilities: { metadata: chatCapabilities },
+  capabilityOverrideMode: "OVERRIDE",
+  capabilityOverrideMetadata: chatCapabilities,
   executionTarget: { inferenceCapacityId: "capacity" },
 };
 
@@ -107,17 +108,15 @@ const localModel = {
 const policySurfaceModel = (id: string, surface: "openaiChatCompletions" | "openaiResponses") => ({
   ...localModel,
   id,
-  effectiveCapabilities: {
-    metadata: {
-      version: 3 as const,
-      protocol: "openai-compatible" as const,
-      surfaces: {
-        [surface]: {
-          source: "declared" as const,
-          confidence: "exact" as const,
-          supported: true,
-          streaming: true,
-        },
+  capabilityOverrideMetadata: {
+    version: 3 as const,
+    protocol: "openai-compatible" as const,
+    surfaces: {
+      [surface]: {
+        source: "declared" as const,
+        confidence: "exact" as const,
+        supported: true,
+        streaming: true,
       },
     },
   },
@@ -532,23 +531,21 @@ describe("GuardedPoolSetupWizard", () => {
     const multiNative = [
       {
         ...localModel,
-        effectiveCapabilities: {
-          metadata: {
-            version: 3 as const,
-            protocol: "openai-compatible" as const,
-            surfaces: {
-              openaiChatCompletions: {
-                source: "declared" as const,
-                confidence: "exact" as const,
-                supported: true,
-                streaming: true,
-              },
-              anthropicMessages: {
-                source: "declared" as const,
-                confidence: "exact" as const,
-                supported: true,
-                streaming: true,
-              },
+        capabilityOverrideMetadata: {
+          version: 3 as const,
+          protocol: "openai-compatible" as const,
+          surfaces: {
+            openaiChatCompletions: {
+              source: "declared" as const,
+              confidence: "exact" as const,
+              supported: true,
+              streaming: true,
+            },
+            anthropicMessages: {
+              source: "declared" as const,
+              confidence: "exact" as const,
+              supported: true,
+              streaming: true,
             },
           },
         },
@@ -566,17 +563,15 @@ describe("GuardedPoolSetupWizard", () => {
     const surfaceModel = (id: string, surface: "openaiChatCompletions" | "openaiResponses") => ({
       ...localModel,
       id,
-      effectiveCapabilities: {
-        metadata: {
-          version: 3 as const,
-          protocol: "openai-compatible" as const,
-          surfaces: {
-            [surface]: {
-              source: "declared" as const,
-              confidence: "exact" as const,
-              supported: true,
-              streaming: true,
-            },
+      capabilityOverrideMetadata: {
+        version: 3 as const,
+        protocol: "openai-compatible" as const,
+        surfaces: {
+          [surface]: {
+            source: "declared" as const,
+            confidence: "exact" as const,
+            supported: true,
+            streaming: true,
           },
         },
       },
@@ -599,17 +594,15 @@ describe("GuardedPoolSetupWizard", () => {
     const surfaceModel = (id: string, surface: "openaiChatCompletions" | "openaiResponses") => ({
       ...localModel,
       id,
-      effectiveCapabilities: {
-        metadata: {
-          version: 3 as const,
-          protocol: "openai-compatible" as const,
-          surfaces: {
-            [surface]: {
-              source: "declared" as const,
-              confidence: "exact" as const,
-              supported: true,
-              streaming: true,
-            },
+      capabilityOverrideMetadata: {
+        version: 3 as const,
+        protocol: "openai-compatible" as const,
+        surfaces: {
+          [surface]: {
+            source: "declared" as const,
+            confidence: "exact" as const,
+            supported: true,
+            streaming: true,
           },
         },
       },
