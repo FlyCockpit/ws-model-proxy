@@ -16,6 +16,7 @@ import { betterAuth } from "better-auth";
 import { prismaAdapter } from "better-auth/adapters/prisma";
 import { admin, deviceAuthorization, twoFactor } from "better-auth/plugins";
 import { z } from "zod";
+import { resolveMcpPlugins } from "./mcp-plugins";
 import { resolveSignupLocale } from "./signup-locale";
 import { getSignupAccessState } from "./signup-policy";
 import { resolveUserCreatePolicy, toUserCreatePolicyInput } from "./user-create-policy";
@@ -243,6 +244,13 @@ export const auth = betterAuth({
       // and the options-schema parser marks `schema` as nonoptional, so pass
       // the Prisma model mapping explicitly.
       schema: { deviceCode: { modelName: "deviceCode" } },
+    }),
+    // Dormant MCP/OAuth surface (Phase 0b): empty while WMP_MCP_ENABLED is
+    // false (the default), so the plugin list above is exactly what ships
+    // today. When enabled, adds jwt/mcp/cimd from Better Auth 1.7.3.
+    ...resolveMcpPlugins({
+      enabled: env.WMP_MCP_ENABLED,
+      baseUrl: env.BETTER_AUTH_URL,
     }),
   ],
   databaseHooks: {

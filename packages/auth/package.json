@@ -19,6 +19,7 @@
     }
   },
   "scripts": {
+    "check-types": "tsc -p tsconfig.check-types.json --noEmit",
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
@@ -27,6 +28,9 @@
     "@ws-model-proxy/env": "workspace:*",
     "@ws-model-proxy/mailer": "workspace:*",
     "better-auth": "catalog:",
+    "@better-auth/mcp": "catalog:",
+    "@better-auth/cimd": "catalog:",
+    "@better-auth/oauth-provider": "catalog:",
     "zod": "catalog:"
   },
   "devDependencies": {

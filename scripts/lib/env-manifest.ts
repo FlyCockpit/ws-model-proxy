@@ -334,6 +334,17 @@ export const ENV_VARS: EnvVar[] = [
     ],
   },
   {
+    key: "WMP_MCP_ENABLED",
+    group: "runtime",
+    source: "default",
+    default: "false",
+    comment: [
+      "Release gate for the MCP server and OAuth provider surface (jwt/mcp/cimd",
+      "plugins, /mcp, discovery, MCP login/consent). Keep false until the MCP plan",
+      "phases land. Human grant listing/revocation stays available while disabled.",
+    ],
+  },
+  {
     key: "WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS",
     group: "runtime",
     source: "default",

@@ -135,6 +135,12 @@ export const env = createEnv({
     // Provider egress remains disabled until the full overflow admission and
     // settlement path is enabled. The keyring is optional while that gate is off.
     WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: strictBooleanFlag(),
+    // MCP server + OAuth provider surface (MCP plan Phase 0b). Dormant by
+    // default: while false, the jwt/mcp/cimd auth plugins are not installed,
+    // no OAuth/JWKS routes exist, and the runtime Better Auth schema check
+    // does not expect the OAuth/JWKS tables. Human grant listing/revocation
+    // stays available when disabled (emergency kill switch), per the plan.
+    WMP_MCP_ENABLED: strictBooleanFlag(),
     WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: strictBooleanFlag(),
     WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS: z
       .string()
