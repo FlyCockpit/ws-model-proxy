@@ -16,6 +16,9 @@
     },
     "./force-two-factor-policy": {
       "default": "./src/force-two-factor-policy.ts"
+    },
+    "./mcp-config": {
+      "default": "./src/mcp-config.ts"
     }
   },
   "scripts": {

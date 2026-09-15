@@ -45,6 +45,14 @@ export const env = createEnv({
     // Same idea for signup (also mails a caller-supplied address). Higher
     // budget so shared-NAT offices still work.
     RATE_LIMIT_SIGNUP_RECIPIENT_POINTS: z.coerce.number().int().min(0).default(6),
+    // MCP endpoint limiters (MCP plan Phase 1; enforced when the Phase 3
+    // routing lands). Unconditional IP-keyed /mcp quota and a tighter
+    // session-keyed budget for the human login/consent forms. Durations are
+    // seconds.
+    RATE_LIMIT_MCP_POINTS: z.coerce.number().int().positive().default(120),
+    RATE_LIMIT_MCP_DURATION: z.coerce.number().int().positive().default(60),
+    RATE_LIMIT_MCP_CONSENT_POINTS: z.coerce.number().int().positive().default(30),
+    RATE_LIMIT_MCP_CONSENT_DURATION: z.coerce.number().int().positive().default(60),
     SSR_CACHE_TTL_SECONDS: z.coerce.number().int().min(0).default(60),
     // Number of reverse-proxy hops in front of the app, for deriving the real
     // client IP used as the anonymous rate-limit key.

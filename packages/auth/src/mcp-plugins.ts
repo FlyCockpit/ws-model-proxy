@@ -2,6 +2,12 @@ import { cimd } from "@better-auth/cimd";
 import { fetchClientMetadataResource } from "@better-auth/cimd/node";
 import { mcp } from "@better-auth/mcp";
 import { jwt } from "better-auth/plugins";
+import {
+  canonicalMcpResource,
+  MCP_CIMD_REGISTRATION_POLICY,
+  MCP_CONSENT_PAGE_PATH_DEFAULT,
+  MCP_LOGIN_PAGE_PATH_DEFAULT,
+} from "./mcp-config";
 
 /**
  * Dormant, `WMP_MCP_ENABLED`-gated Better Auth 1.7 MCP plugin set (MCP plan
@@ -12,26 +18,29 @@ import { jwt } from "better-auth/plugins";
  *
  * The option set here is deliberately MINIMAL but valid: enough for the auth
  * instance to initialize and for the Better Auth schema generator to emit the
- * full OAuth/JWKS model set. Full option tuning (scopes, lifetimes, grant
- * types, privileges, DCR-off controls, localized login/consent) is Phase 2 of
- * the MCP plan; the login/consent routes these paths point at are Phase 6.
+ * full OAuth/JWKS model set. Resource and login/consent paths come from
+ * mcp-config (Phase 1) so there is one canonical derivation; full option
+ * tuning (scopes, lifetimes, grant types, privileges, DCR-off controls) is
+ * Phase 2 of the MCP plan; the login/consent routes these paths point at are
+ * Phase 6.
  */
 export function resolveMcpPlugins({ enabled, baseUrl }: { enabled: boolean; baseUrl: string }) {
   if (!enabled) return [];
 
   // RFC 8707 resource identifier for this MCP server: the canonical public
-  // origin plus /mcp. `mcp()` validates it (HTTPS, no query/fragment; HTTP is
-  // accepted only on loopback hosts, which covers local dev origins).
-  const resource = new URL("/mcp", baseUrl).toString();
+  // origin plus /mcp (mcp-config, MCP plan invariant 1). `mcp()` validates it
+  // (HTTPS, no query/fragment; HTTP is accepted only on loopback hosts, which
+  // covers local dev origins).
+  const resource = canonicalMcpResource(baseUrl);
 
   return [
     jwt(),
     mcp({
       resource,
-      // Phase 2 replaces these placeholder paths with the localized MCP
-      // login/consent routes built in Phase 6 of the MCP plan.
-      loginPage: "/mcp-login",
-      consentPage: "/mcp-consent",
+      // Locale-prefixed MCP login/consent paths derived in mcp-config from
+      // DEFAULT_LOCALE; the routes themselves are built in Phase 6.
+      loginPage: MCP_LOGIN_PAGE_PATH_DEFAULT,
+      consentPage: MCP_CONSENT_PAGE_PATH_DEFAULT,
     }),
     cimd({
       // Upstream hardened Node transport: resolve-once DNS validation,
@@ -39,7 +48,7 @@ export function resolveMcpPlugins({ enabled, baseUrl }: { enabled: boolean; base
       // validation, byte/time limits, and redirect refusal
       // (@better-auth/cimd/node at 1.7.3).
       fetchClientMetadataResource,
-      metadataProfile: "mcp-2026-07-28",
+      metadataProfile: MCP_CIMD_REGISTRATION_POLICY.metadataProfile,
     }),
   ];
 }

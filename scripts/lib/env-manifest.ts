@@ -656,6 +656,35 @@ export const ENV_VARS: EnvVar[] = [
     default: "6",
     comment: ["Per-recipient cap on /api/auth/sign-up/email (separate from reset/resend)."],
   },
+  {
+    key: "RATE_LIMIT_MCP_POINTS",
+    group: "ratelimit",
+    source: "default",
+    default: "120",
+    comment: [
+      "MCP /mcp endpoint quota (IP-keyed, pre-auth). Durations are seconds.",
+      "Inert while WMP_MCP_ENABLED=false; enforced by the Phase 3 routing.",
+    ],
+  },
+  {
+    key: "RATE_LIMIT_MCP_DURATION",
+    group: "ratelimit",
+    source: "default",
+    default: "60",
+  },
+  {
+    key: "RATE_LIMIT_MCP_CONSENT_POINTS",
+    group: "ratelimit",
+    source: "default",
+    default: "30",
+    comment: ["Tighter budget for the human MCP login/consent form submissions."],
+  },
+  {
+    key: "RATE_LIMIT_MCP_CONSENT_DURATION",
+    group: "ratelimit",
+    source: "default",
+    default: "60",
+  },
 
   // --- ssr -----------------------------------------------------------------
   {
