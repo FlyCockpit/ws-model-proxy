@@ -44,7 +44,7 @@ clap = { version = "4", features = ["derive", "wrap_help"] }
 clap_complete = "4"
 # Cross-platform config/data directories (XDG on Linux, the right spots
 # on macOS and Windows).
-dirs = "6"
+dirs = "7"
 # Serialization. serde_json powers `--json` output; toml powers the human-edited
 # config file.
 serde = { version = "1", features = ["derive"] }
