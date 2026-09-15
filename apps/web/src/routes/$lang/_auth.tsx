@@ -17,6 +17,7 @@ import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
 import { TwoFactorSetupDetails } from "@/components/two-factor-setup-details";
+import { useTotpEnrollment } from "@/hooks/use-totp-enrollment";
 import { authClient } from "@/lib/auth-client";
 import { decideProtectedRouteAccess } from "@/lib/route-session-access";
 import { getRouteSession } from "@/server/auth-session";
@@ -80,37 +81,18 @@ function AuthLayout() {
 
 function TwoFactorSetupRequired() {
   const [step, setStep] = useState<"intro" | "setup" | "verify">("intro");
-  const [totpURI, setTotpURI] = useState("");
-  const [backupCodes, setBackupCodes] = useState<string[]>([]);
   const [verifyCode, setVerifyCode] = useState("");
-  const [password, setPassword] = useState("");
-  const [isLoading, setIsLoading] = useState(false);
+  const [isVerifying, setIsVerifying] = useState(false);
   const { t } = useTranslation("auth");
 
-  const handleEnable = async () => {
-    setIsLoading(true);
-    try {
-      const result = await authClient.twoFactor.enable({
-        password,
-      });
-      if (result.error) {
-        console.error("[_auth.twoFactor.enable]", result.error);
-        toast.error(t("twoFactor.couldNotStartSetup"));
-        return;
-      }
-      setTotpURI(result.data?.totpURI || "");
-      setBackupCodes(result.data?.backupCodes || []);
-      setStep("verify");
-    } catch (err) {
-      console.error("[_auth.twoFactor.enable]", err);
-      toast.error(t("twoFactor.couldNotStartSetup"));
-    } finally {
-      setIsLoading(false);
-    }
-  };
+  const { password, setPassword, totpURI, backupCodes, isLoading, enable } = useTotpEnrollment({
+    couldNotStartSetupMessage: t("twoFactor.couldNotStartSetup"),
+    logLabel: "_auth.twoFactor.enable",
+    onEnabled: () => setStep("verify"),
+  });
 
   const handleVerify = async () => {
-    setIsLoading(true);
+    setIsVerifying(true);
     try {
       const result = await authClient.twoFactor.verifyTotp({
         code: verifyCode,
@@ -126,7 +108,7 @@ function TwoFactorSetupRequired() {
       console.error("[_auth.twoFactor.verifyTotp]", err);
       toast.error(t("errors.invalidTotp"));
     } finally {
-      setIsLoading(false);
+      setIsVerifying(false);
     }
   };
 
@@ -159,13 +141,13 @@ function TwoFactorSetupRequired() {
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter") handleEnable();
+                    if (e.key === "Enter") enable();
                   }}
                 />
               </div>
               <Button
                 className="min-h-[44px] w-full"
-                onClick={handleEnable}
+                onClick={enable}
                 disabled={!password || isLoading}
               >
                 {isLoading ? t("twoFactor.settingUp") : t("twoFactor.continue")}
@@ -202,9 +184,9 @@ function TwoFactorSetupRequired() {
               <Button
                 className="min-h-[44px] w-full"
                 onClick={handleVerify}
-                disabled={verifyCode.length !== 6 || isLoading}
+                disabled={verifyCode.length !== 6 || isVerifying}
               >
-                {isLoading ? t("twoFactor.verifying") : t("twoFactor.verifyAndEnable")}
+                {isVerifying ? t("twoFactor.verifying") : t("twoFactor.verifyAndEnable")}
               </Button>
             </>
           )}
