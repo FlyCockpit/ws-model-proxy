@@ -136,13 +136,37 @@ function setRateLimitHeaders(c: Context, limiter: RateLimiter, res: RateLimiterR
 }
 
 /**
+ * Optional per-middleware overrides for `createRateLimiterMiddleware`.
+ * All fields are optional; omitting the options object entirely keeps the
+ * default key resolution (session user id → client IP) for every existing
+ * caller, byte-identically.
+ */
+export interface RateLimiterMiddlewareOptions {
+  /**
+   * Custom rate-limit key resolver for this middleware instance.
+   *
+   * Use when a limiter needs a different key domain than the default
+   * session/IP keying (e.g. the MCP OAuth limiters key on prefixed IP or
+   * prefixed verified-identity keys). SECURITY: never build a PRE-AUTH
+   * bucket key from request-supplied token bytes or any digest of them —
+   * an attacker choosing the token chooses the bucket. Post-auth buckets
+   * may key on verified claims only (e.g. `sub` + `client_id`).
+   */
+  resolveKey?: (c: Context) => string;
+}
+
+/**
  * Create a Hono middleware that enforces a `rate-limiter-flexible` limiter.
  *
  * On rejection → 429 JSON with rate-limit + Retry-After headers.
  */
-export function createRateLimiterMiddleware(limiter: RateLimiter) {
+export function createRateLimiterMiddleware(
+  limiter: RateLimiter,
+  options: RateLimiterMiddlewareOptions = {},
+) {
+  const resolveRequestKey = options.resolveKey ?? resolveKey;
   return async (c: Context, next: Next) => {
-    const key = resolveKey(c);
+    const key = resolveRequestKey(c);
 
     try {
       const res = await limiter.consume(key);

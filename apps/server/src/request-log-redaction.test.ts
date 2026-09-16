@@ -4,6 +4,7 @@ import {
 } from "@ws-model-proxy/auth/mcp-config";
 import { Hono } from "hono";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MCP_WELL_KNOWN_PATHS } from "./mcp-discovery";
 import {
   authRouteLogPath,
   isAuthRoutePath,
@@ -157,6 +158,44 @@ describe("request-log redaction (OAuth query stripping)", () => {
     const lines = logSpy.mock.calls.flat().map(String);
     expect(lines.some((l) => l.includes("q=v"))).toBe(true);
   });
+
+  // ------------------------------------------------------------------
+  // L20 reopen (Part E pass 2): the three ROOT discovery aliases join the
+  // query-stripping set; the fourth stays under the isAuthRoutePath branch.
+  // ------------------------------------------------------------------
+
+  it("strips the three ROOT discovery aliases (exact + exact-with-trailing-slash)", () => {
+    for (const path of MCP_WELL_KNOWN_PATHS) {
+      if (path.startsWith("/api/auth")) continue;
+      expect(stripsOAuthQuery(path)).toBe(true);
+      expect(stripsOAuthQuery(`${path}/`)).toBe(true);
+    }
+    expect(stripsOAuthQuery("/.well-known/oauth-protected-resource")).toBe(true);
+    expect(stripsOAuthQuery("/.well-known/oauth-protected-resource/mcp")).toBe(true);
+    expect(stripsOAuthQuery("/.well-known/oauth-authorization-server/api/auth")).toBe(true);
+  });
+
+  it("near-miss well-known spellings keep the stock logger", () => {
+    expect(stripsOAuthQuery("/.well-known/oauth-protected-resourceish")).toBe(false);
+    expect(stripsOAuthQuery("/.well-known/oauth-protected-resource/mcp/extra")).toBe(false);
+    expect(stripsOAuthQuery("/.well-known/oauth-authorization-server/api/authx")).toBe(false);
+    expect(stripsOAuthQuery("/.well-known")).toBe(false);
+    expect(stripsOAuthQuery("/.well-known/")).toBe(false);
+  });
+
+  it("the FOURTH alias stays covered by the /api/auth truncation branch (which runs first)", () => {
+    const fourth = MCP_WELL_KNOWN_PATHS.find((p) => p.startsWith("/api/auth"));
+    if (!fourth) throw new Error("fourth alias missing from MCP_WELL_KNOWN_PATHS");
+    expect(fourth).toBe("/api/auth/.well-known/oauth-authorization-server");
+    expect(isAuthRoutePath(fourth)).toBe(true);
+    // Truncated to the first three segments with the query ALWAYS dropped —
+    // `state`/`code` can never reach the log line on this path either.
+    expect(authRouteLogPath(`${fourth}?state=SECRET&code=SECRET`)).toBe("/api/auth/.well-known");
+  });
+
+  // The root-alias (and fourth-alias) WRAPPER redaction is verified against
+  // the REAL production request-log middleware — mounted by createApp() —
+  // in app-order.test.ts (L24), not against a hand-built wrapper fixture.
 });
 
 describe("auth-route path truncation (pass 13 / R42)", () => {

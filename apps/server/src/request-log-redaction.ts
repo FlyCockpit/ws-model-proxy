@@ -2,6 +2,7 @@ import {
   MCP_CONSENT_PAGE_PATH_DEFAULT,
   MCP_LOGIN_PAGE_PATH_DEFAULT,
 } from "@ws-model-proxy/auth/mcp-config";
+import { MCP_WELL_KNOWN_PATHS } from "./mcp-discovery.js";
 
 /**
  * OAuth request-log redaction (MCP plan invariant 10).
@@ -29,10 +30,26 @@ import {
 
 export const OAUTH_LOG_PATH_PREFIX = "/api/auth/oauth2/";
 
+/**
+ * Root MCP discovery aliases (L20 reopen, Part E pass 2): the three
+ * `/.well-known/*` well-known paths served outside `/api/auth`. Their
+ * queries can carry OAuth protocol values (`state`, `code`, …) via redirect
+ * or probe URLs, so their log lines strip the query like the oauth2 family.
+ * Matched by EXACT pathname equality (plus the exact-with-trailing-slash
+ * spelling); near-misses like `/.well-known/oauth-protected-resourceish`
+ * keep the stock logger. The FOURTH alias lives under `/api/auth/…` and is
+ * already covered by the `isAuthRoutePath` truncation branch, which runs
+ * first in the production logger wrapper.
+ */
+const ROOT_DISCOVERY_LOG_PATHS = new Set(
+  MCP_WELL_KNOWN_PATHS.flatMap((path) => (path.startsWith("/api/auth") ? [] : [path, `${path}/`])),
+);
+
 /** true when the request-log line for this pathname must strip the query. */
 export function stripsOAuthQuery(pathname: string): boolean {
   return (
     pathname.startsWith(OAUTH_LOG_PATH_PREFIX) ||
+    ROOT_DISCOVERY_LOG_PATHS.has(pathname) ||
     pathname === MCP_LOGIN_PAGE_PATH_DEFAULT ||
     pathname === MCP_CONSENT_PAGE_PATH_DEFAULT
   );
