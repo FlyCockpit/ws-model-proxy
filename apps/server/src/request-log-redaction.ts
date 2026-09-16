@@ -45,11 +45,25 @@ const ROOT_DISCOVERY_LOG_PATHS = new Set(
   MCP_WELL_KNOWN_PATHS.flatMap((path) => (path.startsWith("/api/auth") ? [] : [path, `${path}/`])),
 );
 
+/**
+ * The /mcp endpoint (L20 reopen, Part F pass 2): probes can carry
+ * `access_token`/`state` sentinels in the query of the JSON-RPC endpoint
+ * itself, and the request-log wrapper runs BEFORE the /mcp feature gate —
+ * so the query reaches the logs with the flag BOTH on and off. Matched by
+ * EXACT pathname equality (plus the exact-with-trailing-slash spelling,
+ * matching the root-alias pattern); near-misses like `/mcpish` keep the
+ * stock logger. Deliberately a local literal (this module must not pull the
+ * limiter module graph); pinned equal to MCP_ENDPOINT_PATH by tests.
+ */
+const MCP_ENDPOINT_LOG_PATH = "/mcp";
+const MCP_ENDPOINT_LOG_PATHS = new Set([MCP_ENDPOINT_LOG_PATH, `${MCP_ENDPOINT_LOG_PATH}/`]);
+
 /** true when the request-log line for this pathname must strip the query. */
 export function stripsOAuthQuery(pathname: string): boolean {
   return (
     pathname.startsWith(OAUTH_LOG_PATH_PREFIX) ||
     ROOT_DISCOVERY_LOG_PATHS.has(pathname) ||
+    MCP_ENDPOINT_LOG_PATHS.has(pathname) ||
     pathname === MCP_LOGIN_PAGE_PATH_DEFAULT ||
     pathname === MCP_CONSENT_PAGE_PATH_DEFAULT
   );

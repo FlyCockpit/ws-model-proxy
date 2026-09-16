@@ -181,7 +181,13 @@ export function createRateLimiterMiddleware(
         return c.json({ error: "Too many attempts. Please wait a moment and try again." }, 429);
       }
 
-      console.error("[rate-limit] Unexpected limiter error, failing open:", rlResult);
+      // Sanitized (L19): constructor name / typeof only — limiter rejections
+      // can be arbitrary objects; the fail-open policy is unchanged.
+      console.error(
+        `[rate-limit] Unexpected limiter error, failing open: (${
+          rlResult instanceof Error ? (rlResult.constructor?.name ?? "Error") : typeof rlResult
+        })`,
+      );
       await next();
     }
   };

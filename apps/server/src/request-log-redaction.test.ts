@@ -5,6 +5,7 @@ import {
 import { Hono } from "hono";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MCP_WELL_KNOWN_PATHS } from "./mcp-discovery";
+import { MCP_ENDPOINT_PATH } from "./mcp-rate-limit";
 import {
   authRouteLogPath,
   isAuthRoutePath,
@@ -18,6 +19,8 @@ vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
     BETTER_AUTH_URL: "https://proxy.example.com",
     CORS_ORIGIN: undefined,
+    RATE_LIMIT_MCP_POINTS: 120,
+    RATE_LIMIT_MCP_DURATION: 60,
   },
 }));
 
@@ -42,6 +45,17 @@ describe("request-log redaction (OAuth query stripping)", () => {
     expect(stripsOAuthQuery("/en-US/mcp-login/extra")).toBe(false);
     expect(stripsOAuthQuery("/en-US/mcp-consent-page")).toBe(false);
     expect(stripsOAuthQuery("/en-US/mcp-login/..")).toBe(false);
+  });
+
+  it("strips the /mcp endpoint (L20 reopen, F2: exact + trailing-slash; near-misses keep stock)", () => {
+    // Drift pin: the redaction set must track the mounted endpoint path.
+    expect(MCP_ENDPOINT_PATH).toBe("/mcp");
+    expect(stripsOAuthQuery(MCP_ENDPOINT_PATH)).toBe(true);
+    expect(stripsOAuthQuery(`${MCP_ENDPOINT_PATH}/`)).toBe(true);
+    expect(stripsOAuthQuery("/mcpish")).toBe(false);
+    expect(stripsOAuthQuery("/mcp/extra")).toBe(false);
+    expect(stripsOAuthQuery("/some/mcp")).toBe(false);
+    expect(stripsOAuthQuery("/")).toBe(false);
   });
 
   it("emits a line with method + pathname + status + elapsed and NO query, even for a URL with state", () => {

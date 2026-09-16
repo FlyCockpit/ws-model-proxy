@@ -34,6 +34,12 @@ import { createMcpDiscoveryForwarder, MCP_WELL_KNOWN_PATHS } from "./mcp-discove
 const BASE = "https://proxy.example.com";
 const ISSUER = `${BASE}/api/auth`;
 const CANONICAL = `${BASE}/mcp`;
+/**
+ * Direct Host header for alias requests — hand-built undici Requests carry
+ * none, and the canonical-authority boundary (Part F pass 2) requires one,
+ * as real wire requests always do.
+ */
+const HOST = { host: "proxy.example.com" } as const;
 
 beforeEach(() => {
   grants.findUnique.mockReset().mockResolvedValue(null);
@@ -131,7 +137,7 @@ describe("MCP discovery aliases against the real installed handler", () => {
   describe.each(AUTH_SERVER_ALIASES)("authorization-server metadata %s", (alias) => {
     it("GET returns the REAL provider metadata (issuer, endpoints, scopes; no DCR)", async () => {
       const { app, wasSpaReached } = buildApp({ mcpEnabled: true });
-      const res = await app.request(`${BASE}${alias}`);
+      const res = await app.request(`${BASE}${alias}`, { headers: HOST });
       expect(res.status).toBe(200);
       expect(wasSpaReached()).toBe(false);
       const doc = (await res.json()) as Record<string, unknown>;
@@ -151,8 +157,8 @@ describe("MCP discovery aliases against the real installed handler", () => {
 
     it("HEAD matches the GET status and headers with an EMPTY body", async () => {
       const { app } = buildApp({ mcpEnabled: true });
-      const getRes = await app.request(`${BASE}${alias}`);
-      const headRes = await app.request(`${BASE}${alias}`, { method: "HEAD" });
+      const getRes = await app.request(`${BASE}${alias}`, { headers: HOST });
+      const headRes = await app.request(`${BASE}${alias}`, { method: "HEAD", headers: HOST });
       expect(headRes.status).toBe(getRes.status);
       expect(headRes.headers.get("content-type")).toBe(getRes.headers.get("content-type"));
       expect(headRes.headers.get("cache-control")).toBe(getRes.headers.get("cache-control"));
@@ -163,7 +169,7 @@ describe("MCP discovery aliases against the real installed handler", () => {
       "%s → 405 with Allow: GET, HEAD (never reaches the handler for judging)",
       async (method) => {
         const { app } = buildApp({ mcpEnabled: true });
-        const res = await app.request(`${BASE}${alias}`, { method });
+        const res = await app.request(`${BASE}${alias}`, { method, headers: HOST });
         expect(res.status).toBe(405);
         expect(res.headers.get("allow")).toBe("GET, HEAD");
       },
@@ -172,7 +178,7 @@ describe("MCP discovery aliases against the real installed handler", () => {
     it("flag OFF → 404 for every method; never falls through to the SPA/SSR catch-all", async () => {
       const { app, wasSpaReached } = buildApp({ mcpEnabled: false });
       for (const method of ["GET", "HEAD", "PUT", "POST", "DELETE"] as const) {
-        const res = await app.request(`${BASE}${alias}`, { method });
+        const res = await app.request(`${BASE}${alias}`, { method, headers: HOST });
         expect(res.status, `${method} ${alias}`).toBe(404);
       }
       expect(wasSpaReached()).toBe(false);
@@ -182,7 +188,7 @@ describe("MCP discovery aliases against the real installed handler", () => {
   describe.each(PROTECTED_RESOURCE_ALIASES)("protected-resource metadata %s", (alias) => {
     it("GET returns the REAL RFC 9728 resource document (canonical resource, issuer)", async () => {
       const { app, wasSpaReached } = buildApp({ mcpEnabled: true });
-      const res = await app.request(`${BASE}${alias}`);
+      const res = await app.request(`${BASE}${alias}`, { headers: HOST });
       expect(res.status).toBe(200);
       expect(wasSpaReached()).toBe(false);
       const doc = (await res.json()) as Record<string, unknown>;
@@ -194,8 +200,8 @@ describe("MCP discovery aliases against the real installed handler", () => {
 
     it("HEAD matches the GET status and content-type with an EMPTY body", async () => {
       const { app } = buildApp({ mcpEnabled: true });
-      const getRes = await app.request(`${BASE}${alias}`);
-      const headRes = await app.request(`${BASE}${alias}`, { method: "HEAD" });
+      const getRes = await app.request(`${BASE}${alias}`, { headers: HOST });
+      const headRes = await app.request(`${BASE}${alias}`, { method: "HEAD", headers: HOST });
       expect(headRes.status).toBe(getRes.status);
       expect(headRes.headers.get("content-type")).toBe(getRes.headers.get("content-type"));
       expect(await headRes.text()).toBe("");
@@ -205,7 +211,7 @@ describe("MCP discovery aliases against the real installed handler", () => {
       "%s → 405 with Allow: GET, HEAD",
       async (method) => {
         const { app } = buildApp({ mcpEnabled: true });
-        const res = await app.request(`${BASE}${alias}`, { method });
+        const res = await app.request(`${BASE}${alias}`, { method, headers: HOST });
         expect(res.status).toBe(405);
         expect(res.headers.get("allow")).toBe("GET, HEAD");
       },
@@ -214,7 +220,7 @@ describe("MCP discovery aliases against the real installed handler", () => {
     it("flag OFF → 404 for every method; never falls through to the SPA/SSR catch-all", async () => {
       const { app, wasSpaReached } = buildApp({ mcpEnabled: false });
       for (const method of ["GET", "HEAD", "PUT", "POST", "DELETE"] as const) {
-        const res = await app.request(`${BASE}${alias}`, { method });
+        const res = await app.request(`${BASE}${alias}`, { method, headers: HOST });
         expect(res.status, `${method} ${alias}`).toBe(404);
       }
       expect(wasSpaReached()).toBe(false);

@@ -20,6 +20,15 @@
     "./mcp-config": {
       "default": "./src/mcp-config.ts"
     },
+    "./is-user-banned": {
+      "default": "./src/is-user-banned.ts"
+    },
+    "./auth-logger-bridge": {
+      "default": "./src/auth-logger-bridge.ts"
+    },
+    "./auth-db-shutdown-fence": {
+      "default": "./src/auth-db-shutdown-fence.ts"
+    },
     "./mcp-grant": {
       "default": "./src/mcp-grant.ts"
     }

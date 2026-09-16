@@ -9,6 +9,8 @@ import { createContext } from "@ws-model-proxy/api/context";
 import { appRouter } from "@ws-model-proxy/api/routers/index";
 import type { Session } from "@ws-model-proxy/auth";
 import { auth as defaultAuth } from "@ws-model-proxy/auth";
+import { armAuthDbShutdownFence } from "@ws-model-proxy/auth/auth-db-shutdown-fence";
+import { isForceTwoFactorRequired } from "@ws-model-proxy/auth/force-two-factor-policy";
 import { THEME_INIT_SCRIPT } from "@ws-model-proxy/config/theme-init";
 import prismaDefault from "@ws-model-proxy/db";
 import { env as defaultEnv } from "@ws-model-proxy/env/server";
@@ -25,6 +27,9 @@ import {
   SIGNUP_MEDIA_TYPES,
   SIGNUP_RECIPIENT_PATH,
 } from "./email-recipient-limit.js";
+import { createMcpAdmissionGate } from "./mcp/admission.js";
+import { createMcpRequestHandler, type McpAuthInstance } from "./mcp/auth.js";
+import { createMcpTransport } from "./mcp/handler.js";
 import { mcpAuthorizeScopeGuard } from "./mcp-authorize-scope-guard.js";
 import { createMcpDiscoveryForwarder, MCP_WELL_KNOWN_PATHS } from "./mcp-discovery.js";
 import {
@@ -42,6 +47,14 @@ import {
   MCP_OAUTH_TOKEN_PATH,
   onMcpOauthRoute,
 } from "./mcp-oauth-route-match.js";
+import {
+  createMcpFeatureGate,
+  MCP_ENDPOINT_PATH,
+  mcpBodyCap,
+  mcpIpKey,
+  mcpIpLimiter,
+  mcpMethodGate,
+} from "./mcp-rate-limit.js";
 import { mediaAdminGate } from "./media/admin-gate.js";
 import { createSameOriginGuard } from "./media/csrf-guard.js";
 import {
@@ -144,6 +157,14 @@ export interface CreateAppOptions {
    * Tests inject a memory-adapter instance; production uses the shared one.
    */
   auth?: AuthHandler;
+  /**
+   * Better Auth instance used for MCP token verification (upstream
+   * `requireMcpAuth` needs `$context` for the DPoP replay store). Defaults
+   * to the shared real instance; tests inject the memory-adapter parity
+   * instance. Distinct from `auth` (only `.handler` is used there) so the
+   * /api/auth surface keeps its narrow contract.
+   */
+  mcpAuth?: McpAuthInstance;
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
@@ -159,9 +180,10 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 /**
  * Build the complete Hono app. Async because the production branch
  * dynamically imports the static file server and the TanStack Start SSR
- * bundle (which only exists after apps/web builds). Returns the app plus
- * the production capacity lifecycle so the caller can close it on
- * graceful shutdown.
+ * bundle (which only exists after apps/web builds). Returns the app, the
+ * production capacity lifecycle (closed on graceful shutdown), the
+ * module-lifetime MCP transport, and the /mcp admission gate (both closed
+ * by the shutdown sequence after the HTTP drain).
  */
 export async function createApp(options: CreateAppOptions = {}) {
   // Shared validated env — the SAME module-level source every mounted
@@ -385,6 +407,61 @@ export async function createApp(options: CreateAppOptions = {}) {
       }),
     );
   }
+
+  // /mcp — the MCP JSON-RPC transport (Phase 4), mounted in the SAME
+  // pre-CORS/pre-global-body-limit block as the discovery aliases so the
+  // chain owns every method on its reserved path and an oversized body gets
+  // the MCP 1 MB cap (never the global 10 MB answer). ORDER (pinned by the
+  // chain-order tests; mirrors mcp-rate-limit.ts's documented sequence):
+  //   1. feature gate — flag-off 404 for EVERY method (reserved path);
+  //   2. method gate — 405 `Allow: POST` for non-POST BEFORE auth, so the
+  //      method policy is visible without credentials;
+  //   3. unconditional mcp:ip: limiter (PRE-auth, IP-keyed only);
+  //   4. 1 MB request-body cap;
+  //   5. requireMcpAuth + live user/ban/2FA checks (mcp/auth.ts);
+  //      the mcp:identity: quota (verified sub+client_id) is consumed inside
+  //      the authenticated handler, immediately after the claims are
+  //      verified and BEFORE the transport runs;
+  //   6. the MCP handler (fresh McpServer per request, SDK-owned teardown).
+  // The ADMISSION GATE (F8) is created here and shared with the shutdown
+  // sequence: every admitted /mcp exchange is owned from route entry until
+  // its promise SETTLES (with stage fences on an owned abort signal —
+  // covering the pre-factory body-parse window the SDK does not track);
+  // close() aborts outstanding admitted controllers (bounded shutdown) and
+  // new admissions get 503. The gate's closed flag also arms the transport
+  // FACTORY FENCE (mcp/handler.ts) so no admitted request can create a
+  // server, register tools, or touch the DB after shutdown began. The
+  // gate's onClosed hook arms the AUTH DB-SEAM FENCE (F8 pass 5,
+  // @ws-model-proxy/auth/auth-db-shutdown-fence): the installed
+  // requireMcpAuth continuation chain drops the abort signal, so its stray
+  // continuations (DPoP replay reservations through the auth instance's
+  // internal adapter) would otherwise START database operations after gate
+  // drain and the Prisma disconnect — from close() onward every NEW
+  // better-auth adapter DB operation rejects immediately (transparent
+  // while the gate is open; normal /api/auth traffic is gone by then —
+  // HTTP drain and connection termination run first).
+  const mcpAdmissionGate = createMcpAdmissionGate({ onClosed: armAuthDbShutdownFence });
+  const mcpHandler = createMcpTransport({ isShuttingDown: () => mcpAdmissionGate.closed });
+  app.use(MCP_ENDPOINT_PATH, createMcpFeatureGate({ enabled: env.WMP_MCP_ENABLED }));
+  app.use(MCP_ENDPOINT_PATH, mcpMethodGate);
+  app.use(
+    MCP_ENDPOINT_PATH,
+    createRateLimiterMiddleware(mcpIpLimiter, { resolveKey: (c) => mcpIpKey(c) }),
+  );
+  app.use(MCP_ENDPOINT_PATH, mcpBodyCap);
+  app.post(
+    MCP_ENDPOINT_PATH,
+    createMcpRequestHandler({
+      authInstance: options.mcpAuth ?? defaultAuth,
+      transport: mcpHandler,
+      prisma,
+      isForceTwoFactorRequired,
+      admissionGate: mcpAdmissionGate,
+      services: {
+        repairExpiredProviderBudgets: (scope) => repairExpiredProviderBudgets(new Date(), scope),
+      },
+    }),
+  );
 
   // Body-limit — reject oversized payloads early (before JSON parsing) to
   // prevent memory exhaustion. 10 MB covers image uploads and large form
@@ -742,5 +819,5 @@ export async function createApp(options: CreateAppOptions = {}) {
     });
   }
 
-  return { app, capacityLifecycle };
+  return { app, capacityLifecycle, mcpHandler, mcpAdmissionGate };
 }

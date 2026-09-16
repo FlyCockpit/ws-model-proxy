@@ -9,6 +9,7 @@ import { env } from "@ws-model-proxy/env/server";
 import { WebSocketServer } from "ws";
 import { createApp } from "./app.js";
 import { installBetterCallErrorLogShim } from "./better-call-error-log-shim.js";
+import { runGracefulShutdownSequence } from "./graceful-shutdown.js";
 import { startMediaCleanup } from "./media/cleanup.js";
 import { startCacheAffinityCleanup } from "./model-api/cache-affinity-runtime.js";
 import {
@@ -44,7 +45,10 @@ if (env.CORS_ORIGIN === "*") {
 // App construction (middleware + routes live in ./app.ts — createApp)
 // ---------------------------------------------------------------------------
 
-const { app, capacityLifecycle } = await createApp({ prisma, auth });
+const { app, capacityLifecycle, mcpHandler, mcpAdmissionGate } = await createApp({
+  prisma,
+  auth,
+});
 
 // ---------------------------------------------------------------------------
 // Startup retry — wait for Postgres before accepting traffic
@@ -65,9 +69,12 @@ async function waitForDependencies() {
         process.exit(1);
       }
       const delay = BASE_DELAY_MS * 2 ** (attempt - 1);
+      // Sanitized (L19): constructor name / typeof only — connection errors
+      // can carry host strings and driver internals in their messages.
       console.warn(
-        `[server] Postgres not ready (attempt ${attempt}/${MAX_RETRIES}), retrying in ${delay}ms…`,
-        err instanceof Error ? err.message : err,
+        `[server] Postgres not ready (attempt ${attempt}/${MAX_RETRIES}), retrying in ${delay}ms… (${
+          err instanceof Error ? (err.constructor?.name ?? "Error") : typeof err
+        })`,
       );
       await new Promise((r) => setTimeout(r, delay));
     }
@@ -125,38 +132,82 @@ async function shutdown(signal: string) {
   isShuttingDown = true;
   console.log(`[server] Received ${signal} — starting graceful shutdown…`);
 
-  // Stop the media cleanup timer so it can't fire mid-shutdown.
-  stopMediaCleanup?.();
-  stopCacheAffinityCleanup();
-  stopRelayTelemetryRecovery();
-  stopProviderBudgetRepair();
-  stopProviderAttemptExpiry?.();
-  relaySessionManager.dispose();
-  await capacityLifecycle?.close();
+  await runGracefulShutdownSequence({
+    // Stop the periodic jobs so they can't fire mid-shutdown.
+    stopPeriodicJobs: async () => {
+      stopMediaCleanup?.();
+      stopCacheAffinityCleanup();
+      stopRelayTelemetryRecovery();
+      stopProviderBudgetRepair();
+      stopProviderAttemptExpiry?.();
+      relaySessionManager.dispose();
+      await capacityLifecycle?.close();
+    },
+    // 1. Stop accepting new connections and drain in-flight requests.
+    //    NORMAL drain: graceful — server.close waits for in-flight requests
+    //    to finish. DRAIN TIMEOUT (F8): forcibly terminate every lingering
+    //    connection so requests that are still reading their bodies ABORT
+    //    (their request signals fire, their body streams error) — the MCP
+    //    admission gate below then settles and the teardown sequence is
+    //    never held hostage by a stalled body. Without this, a request that
+    //    passed the body cap but never finished sending could proceed to
+    //    the MCP factory DURING/AFTER the Prisma disconnect.
+    drainHttp: () =>
+      new Promise<void>((resolve) => {
+        const timeout = setTimeout(() => {
+          console.warn("[server] Drain timeout reached, forcing close.");
+          // Feature-detect for TYPE reasons, not runtime availability:
+          // serve() uses Node's default HTTP constructor here, so the
+          // runtime server always implements closeAllConnections() /
+          // closeIdleConnections() (Node >= 18.2) — but @hono/node-server's
+          // ServerType UNION (http | http2 | https variants) does not
+          // declare these methods on every member, so the cast stays.
+          const nodeServer = server as {
+            closeAllConnections?: () => void;
+            closeIdleConnections?: () => void;
+          };
+          nodeServer.closeAllConnections?.();
+          nodeServer.closeIdleConnections?.();
+          resolve();
+        }, DRAIN_TIMEOUT_MS);
 
-  // 1. Stop accepting new connections and drain in-flight requests.
-  await new Promise<void>((resolve) => {
-    const timeout = setTimeout(() => {
-      console.warn("[server] Drain timeout reached, forcing close.");
-      resolve();
-    }, DRAIN_TIMEOUT_MS);
-
-    server.close((err) => {
-      clearTimeout(timeout);
-      if (err) {
-        console.error("[server] Error closing HTTP server:", err.message);
-      }
-      resolve();
-    });
+        server.close((err) => {
+          clearTimeout(timeout);
+          if (err) {
+            // Sanitized (L19): constructor name only — close errors can
+            // carry arbitrary message content.
+            console.error(
+              `[server] Error closing HTTP server: (${err.constructor?.name ?? "Error"})`,
+            );
+          }
+          resolve();
+        });
+      }),
+    // 2. Close the admission gate AND the module-lifetime MCP handler —
+    //    AFTER the HTTP drain (normal-drain requests finished; nothing
+    //    admitted loses its exchange prematurely) and BEFORE the Prisma
+    //    disconnect. The SDK owns closing each request-created server; the
+    //    gate (F8 pass 4/5) additionally owns every ADMITTED exchange the
+    //    SDK does not track (including requests still awaiting body parse):
+    //    close() flips the gate closed — arming the AUTH DB-SEAM FENCE
+    //    synchronously (every NEW better-auth adapter DB operation rejects
+    //    from that instant: the installed requireMcpAuth continuation chain
+    //    drops the abort signal, so its stray verifier continuations would
+    //    otherwise open DB operations after teardown began) — then ABORTS
+    //    every outstanding admitted controller. The handler's abort race
+    //    settles it, its stage fences stop every continuation at its
+    //    current await, and (pass 5) the permit release SHADOW-AWAITS the
+    //    admitted promise (bounded by a 10s cap) so close() resolves only
+    //    when every admitted exchange has genuinely settled or the cap is
+    //    reached. New admissions get 503 from the moment close begins.
+    //    This is the ONLY application-side close() call site
+    //    (graceful-shutdown.ts order is unit-tested).
+    closeMcpHandler: async () => {
+      await Promise.all([mcpAdmissionGate.close(), mcpHandler?.close()]);
+    },
+    // 3. Close database connections last.
+    disconnectPrisma: () => prisma.$disconnect(),
   });
-
-  // 2. Close database connections.
-  try {
-    await prisma.$disconnect();
-    console.log("[server] Prisma disconnected.");
-  } catch (err) {
-    console.error("[server] Error disconnecting Prisma:", err);
-  }
   console.log("[server] Shutdown complete.");
   process.exit(0);
 }

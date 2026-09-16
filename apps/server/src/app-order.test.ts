@@ -99,6 +99,12 @@ import { MCP_OAUTH_RATE_LIMITED_ROUTES } from "./mcp-oauth-route-match";
 const BASE = "https://proxy.example.com";
 const ISSUER = `${BASE}/api/auth`;
 const CANONICAL = `${BASE}/mcp`;
+/**
+ * Direct Host header for GET requests through the alias forwarders —
+ * hand-built undici Requests carry none, and the canonical-authority
+ * boundary (Part F pass 2) requires one, as real wire requests always do.
+ */
+const HOST = { host: "proxy.example.com" } as const;
 const OVERSIZED_BODY = "x".repeat(11 * 1024 * 1024); // > the global 10 MB cap
 const CORS_HEADERS = {
   origin: "https://app.example.com",
@@ -222,7 +228,7 @@ describe("createApp registration contract — discovery gates own every method (
       "/.well-known/oauth-authorization-server/api/auth",
       "/api/auth/.well-known/oauth-authorization-server",
     ] as const) {
-      const res = await app.request(`${BASE}${alias}`);
+      const res = await app.request(`${BASE}${alias}`, { headers: HOST });
       expect(res.status, alias).toBe(200);
       const doc = (await res.json()) as Record<string, unknown>;
       expect(doc.issuer, alias).toBe(ISSUER);
@@ -233,7 +239,7 @@ describe("createApp registration contract — discovery gates own every method (
       "/.well-known/oauth-protected-resource",
       "/.well-known/oauth-protected-resource/mcp",
     ] as const) {
-      const res = await app.request(`${BASE}${alias}`);
+      const res = await app.request(`${BASE}${alias}`, { headers: HOST });
       expect(res.status, alias).toBe(200);
       const doc = (await res.json()) as Record<string, unknown>;
       expect(doc.resource, alias).toBe(CANONICAL);
@@ -280,7 +286,7 @@ describe("createApp registration contract — root-alias request-log redaction (
     if (!rootAlias) throw new Error("root alias missing from MCP_WELL_KNOWN_PATHS");
     const app = await buildApp(flag);
     const QUERY = `?state=st-SECRET-state&code_challenge=cc-SECRET-challenge&code=SECRET-code`;
-    const res = await app.request(`${BASE}${rootAlias}${QUERY}`);
+    const res = await app.request(`${BASE}${rootAlias}${QUERY}`, { headers: HOST });
     expect(res.status).toBe(status);
     const lines: string[] = logSpy.mock.calls.flat().map(String);
     expect(lines.some((l) => l.includes(rootAlias))).toBe(true);
@@ -295,7 +301,7 @@ describe("createApp registration contract — root-alias request-log redaction (
   it("the FOURTH alias (under /api/auth) logs the TRUNCATED auth path — never the query", async () => {
     const app = await buildApp(true);
     const fourth = "/api/auth/.well-known/oauth-authorization-server";
-    const res = await app.request(`${BASE}${fourth}?state=st-SECRET-state`);
+    const res = await app.request(`${BASE}${fourth}?state=st-SECRET-state`, { headers: HOST });
     expect(res.status).toBe(200);
     const lines: string[] = logSpy.mock.calls.flat().map(String);
     expect(lines.some((l) => l.includes("/api/auth/.well-known"))).toBe(true);
@@ -323,7 +329,9 @@ describe("createApp configuration consistency — ONE shared env source for ever
     const app = await buildApp(true);
 
     // Alias gates: flag-on GET forwards to the installed handler (served).
-    const metadata = await app.request(`${BASE}/.well-known/oauth-protected-resource`);
+    const metadata = await app.request(`${BASE}/.well-known/oauth-protected-resource`, {
+      headers: HOST,
+    });
     expect(metadata.status).toBe(200);
 
     // Authorize guard + MCP protocol bucket in ONE request: the guard's

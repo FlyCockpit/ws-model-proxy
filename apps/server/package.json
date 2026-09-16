@@ -14,6 +14,7 @@
   "dependencies": {
     "@fastify/busboy": "catalog:",
     "@hono/node-server": "^2.1.0",
+    "@modelcontextprotocol/server": "catalog:",
     "@orpc/openapi": "catalog:",
     "@orpc/server": "catalog:",
     "@orpc/zod": "catalog:",
@@ -23,6 +24,7 @@
     "@ws-model-proxy/config": "workspace:*",
     "@ws-model-proxy/db": "workspace:*",
     "@ws-model-proxy/env": "workspace:*",
+    "@better-auth/mcp": "catalog:",
     "better-auth": "catalog:",
     "hono": "catalog:",
     "rate-limiter-flexible": "catalog:",

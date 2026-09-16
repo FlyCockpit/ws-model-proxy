@@ -17,6 +17,7 @@ import { prismaAdapter } from "better-auth/adapters/prisma";
 import { admin, deviceAuthorization, twoFactor } from "better-auth/plugins";
 import { z } from "zod";
 import { sanitizedApiErrorLogLine } from "./api-error-logging";
+import { withAuthDbShutdownFence } from "./auth-db-shutdown-fence";
 import { resolveAuthLogCall } from "./auth-logger-bridge";
 import { resolveMcpPlugins } from "./mcp-plugins";
 import { resolveSignupLocale } from "./signup-locale";
@@ -85,9 +86,20 @@ async function resolveUniqueUserSlug({
 }
 
 export const auth = betterAuth({
-  database: prismaAdapter(prisma, {
-    provider: "postgresql",
-  }),
+  database: prismaAdapter(
+    // DB-seam shutdown fence (Part F pass 5, F8 reopened): transparent
+    // wrapper — while INACTIVE every operation passes through unchanged;
+    // once the MCP shutdown gate closes (apps/server/src/app.ts wires the
+    // gate's onClosed into armAuthDbShutdownFence), any NEW database
+    // operation initiated by any continuation of this auth instance
+    // (including the un-cancellable requireMcpAuth verifier continuations
+    // doing DPoP replay reservations) rejects immediately. See
+    // ./auth-db-shutdown-fence.ts for the full rationale.
+    withAuthDbShutdownFence(prisma),
+    {
+      provider: "postgresql",
+    },
+  ),
 
   logger: {
     // Sanitizing bridge choke point (invariant 10 / L19, pass 9 —

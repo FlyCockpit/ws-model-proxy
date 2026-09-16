@@ -94,6 +94,33 @@ describe("resolvePublicRequest — authority validation", () => {
     const result = resolvePublicRequest(makeRequest("/mcp", { host: "proxy.example.com:8443" }));
     expect(result).toEqual({ ok: false, reason: "host-not-allowed" });
   });
+
+  it("L15: rejects an NBSP-padded canonical Host (Unicode whitespace no longer launders a match)", () => {
+    // `\u00a0proxy.example.com\u00a0` — Unicode `.trim()` strips the NBSP
+    // and used to pass the direct-Host comparison; the ASCII-OWS-only trim
+    // leaves it in place, so the exact match fails. (URL stays canonical —
+    // only the direct Host header carries the padding.)
+    const leading = new Request(`${CANONICAL}/mcp`);
+    leading.headers.set("host", "\u00a0proxy.example.com");
+    expect(resolvePublicRequest(leading)).toEqual({ ok: false, reason: "host-not-allowed" });
+
+    const trailing = new Request(`${CANONICAL}/mcp`);
+    trailing.headers.set("host", "proxy.example.com\u00a0");
+    expect(resolvePublicRequest(trailing)).toEqual({ ok: false, reason: "host-not-allowed" });
+  });
+
+  it("L15: a single-space-padded canonical Host still accepts (ASCII OWS is trimmed)", () => {
+    const request = new Request(`${CANONICAL}/mcp`);
+    request.headers.set("host", " proxy.example.com ");
+    expect(resolvePublicRequest(request)).toMatchObject({ ok: true });
+  });
+
+  it("L15: an NBSP-only Host is rejected (nothing usable — missing/allowed host alike)", () => {
+    const request = new Request(`${CANONICAL}/mcp`);
+    request.headers.set("host", "\u00a0");
+    const result = resolvePublicRequest(request);
+    expect(result.ok).toBe(false);
+  });
 });
 
 describe("resolvePublicRequest — raw URL form (authority-escape prevention)", () => {
@@ -516,6 +543,28 @@ describe("cloneRequestOntoPublicOrigin", () => {
     const cloned = cloneRequestOntoPublicOrigin(original);
     expect(cloned.signal.aborted).toBe(false);
     controller.abort();
+    expect(cloned.signal.aborted).toBe(true);
+  });
+  it("options.signal REPLACES the clone's signal with the caller-owned one (F8 pass 4)", () => {
+    const clientController = new AbortController();
+    const ownedController = new AbortController();
+    const original = makeRequest("/mcp", {
+      host: "proxy.example.com",
+      method: "POST",
+      body: "payload",
+      signal: clientController.signal,
+    });
+    const cloned = cloneRequestOntoPublicOrigin(original, {
+      signal: ownedController.signal,
+    });
+    // undici composes a NEW signal object for a constructed Request (never
+    // the init.signal identity), so assert FOLLOW semantics: the clone's
+    // signal tracks the OWNED controller (what gate.close() aborts), not
+    // the raw client signal.
+    expect(cloned.signal.aborted).toBe(false);
+    clientController.abort();
+    expect(cloned.signal.aborted).toBe(false);
+    ownedController.abort();
     expect(cloned.signal.aborted).toBe(true);
   });
 

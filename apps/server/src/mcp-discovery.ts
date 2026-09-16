@@ -1,4 +1,5 @@
 import type { MiddlewareHandler } from "hono";
+import { cloneRequestOntoPublicOrigin, PublicRequestError } from "./public-request-url.js";
 
 /**
  * MCP discovery alias forwarding (MCP plan Phase 3).
@@ -73,16 +74,33 @@ export function createMcpDiscoveryForwarder(options: {
       return c.newResponse(null, 405, { Allow: ALLOW_GET_HEAD });
     }
 
+    // Canonical-authority boundary (invariant 2, F1 sibling site): validate
+    // the raw Host/Origin BEFORE the installed handler sees the request and
+    // forward the CANONICAL CLONE (configured public origin, safe header
+    // set) — issuer/discovery URLs are then derived from configuration even
+    // if an upstream bump ever starts reading the request authority. A
+    // rejected authority gets a static 400 with no reason detail.
+    let canonical: Request;
+    try {
+      canonical = cloneRequestOntoPublicOrigin(c.req.raw);
+    } catch (error) {
+      if (error instanceof PublicRequestError) {
+        console.error(`[mcp-discovery] rejected: untrusted request authority (${error.reason})`);
+        return c.newResponse("Bad Request", 400);
+      }
+      throw error;
+    }
+
     if (method === "HEAD") {
       // Bodyless HEAD adapter: run the real GET (the provider's metadata
       // documents are side-effect-free reads) and rebuild the response with
       // the same status + headers and a null body. Never forwards a HEAD
       // (upstream HEAD handling exists but is not relied upon).
-      const getRequest = new Request(c.req.raw, { method: "GET" });
+      const getRequest = new Request(canonical, { method: "GET" });
       const response = await handler(getRequest);
       return new Response(null, { status: response.status, headers: response.headers });
     }
 
-    return handler(c.req.raw);
+    return handler(canonical);
   };
 }

@@ -109,6 +109,17 @@ export type PublicRequestOptions = {
   webOrigin?: string;
   /** Overrides TRUSTED_INGRESS_HOSTS (tests / explicit call sites). */
   trustedIngressHosts?: readonly string[];
+  /**
+   * Replacement abort signal for the materialized clone (F8 pass 4):
+   * defaults to `request.signal`, but the /mcp route passes its OWNED
+   * admission-controller signal so the transport factory's fence
+   * (`ctx.requestInfo.signal`) and the SDK's closed-flag check at fetch
+   * entry observe shutdown/client aborts for THIS request. NOTE (F8 pass
+   * 5): the SDK's body reads of this clone are NOT cancellable through
+   * the signal — the factory fence (mcp/handler.ts) and the auth DB-seam
+   * fence are the enforcement.
+   */
+  signal?: AbortSignal;
 };
 
 /** Thrown by {@link cloneRequestOntoPublicOrigin} when validation rejects. */
@@ -187,6 +198,18 @@ function parseStrictOrigin(raw: string): string | null {
 }
 
 /**
+ * ASCII-OWS-only trim (L15, Part F pass 2): `.trim()` would also strip
+ * Unicode whitespace (e.g. NBSP \u00a0), laundering a padded Host into an
+ * exact canonical/allowlist match. Strip only tab/space before the
+ * case-insensitive comparisons; any OTHER malformed spelling (NBSP padding,
+ * inner whitespace, control characters) simply fails the exact comparison
+ * and is rejected as host-not-allowed.
+ */
+function asciiOwsTrim(value: string): string {
+  return value.replace(/^[\t ]+|[\t ]+$/g, "");
+}
+
+/**
  * Validate the raw request authority and derive the canonical request info.
  * Pure with respect to the request: the body is never touched, and no header
  * of the input is modified.
@@ -204,17 +227,16 @@ export function resolvePublicRequest(
 
   // Rule 1: exactly one Host header (Headers folds duplicates with ", ").
   const host = request.headers.get("host");
-  if (host === null || host.trim().length === 0) {
+  if (host === null || asciiOwsTrim(host).length === 0) {
     return { ok: false, reason: "missing-host" };
   }
   if (host.includes(",")) {
     return { ok: false, reason: "ambiguous-host" };
   }
 
-  const isCanonicalHost = host.trim().toLowerCase() === canonicalHost.toLowerCase();
-  const isTrustedIngress = trustedHosts.some(
-    (allowed) => allowed.toLowerCase() === host.trim().toLowerCase(),
-  );
+  const directHost = asciiOwsTrim(host).toLowerCase();
+  const isCanonicalHost = directHost === canonicalHost.toLowerCase();
+  const isTrustedIngress = trustedHosts.some((allowed) => allowed.toLowerCase() === directHost);
   if (!isCanonicalHost && !isTrustedIngress) {
     return { ok: false, reason: "host-not-allowed" };
   }
@@ -255,7 +277,7 @@ export function resolvePublicRequest(
   // re-derived from config below — tolerating `http://` under TLS
   // termination); a non-empty raw host that differs from the validated
   // direct Host is an authority conflict.
-  if (raw.host !== "" && raw.host.toLowerCase() !== host.trim().toLowerCase()) {
+  if (raw.host !== "" && raw.host.toLowerCase() !== directHost) {
     return { ok: false, reason: "host-not-allowed" };
   }
 
@@ -304,7 +326,7 @@ export function cloneRequestOntoPublicOrigin(
   const init: RequestInit & { duplex?: "half" } = {
     method: result.method,
     headers: result.headers,
-    signal: request.signal,
+    signal: options.signal ?? request.signal,
   };
   if (request.body !== null) {
     init.body = request.body;
