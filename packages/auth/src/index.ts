@@ -16,6 +16,8 @@ import { betterAuth } from "better-auth";
 import { prismaAdapter } from "better-auth/adapters/prisma";
 import { admin, deviceAuthorization, twoFactor } from "better-auth/plugins";
 import { z } from "zod";
+import { sanitizedApiErrorLogLine } from "./api-error-logging";
+import { resolveAuthLogCall } from "./auth-logger-bridge";
 import { resolveMcpPlugins } from "./mcp-plugins";
 import { resolveSignupLocale } from "./signup-locale";
 import { getSignupAccessState } from "./signup-policy";
@@ -25,13 +27,6 @@ import { withVerificationCallback } from "./verification-callback";
 const isCrossOrigin = !!env.CORS_ORIGIN;
 /** Email/SMTP is optional; when configured, verification is required. */
 const emailConfigured = isEmailConfigured();
-
-// Better-Auth emits "user input failed validation" cases (wrong password, unknown
-// email, unverified email, etc.) at level=error. Those are normal end-user mistakes,
-// not server faults — downgrade them to warn so production error dashboards stay
-// signal-y. Anything we don't recognize keeps its original level.
-const USER_INPUT_ERROR_PATTERN =
-  /invalid (password|email|credentials|token|otp|two[- ]?factor)|user not found|email not verified|password is incorrect|account not found|failed to verify|already exists|too many (requests|attempts)/i;
 
 const userSlugInputSchema = z
   .string()
@@ -95,12 +90,29 @@ export const auth = betterAuth({
   }),
 
   logger: {
+    // Sanitizing bridge choke point (invariant 10 / L19, pass 9 —
+    // TERMINAL policy v3: structure-triggered WHOLE-MESSAGE redaction):
+    // non-string first args emit only `[auth] <level> (<ctor|typeof>)`;
+    // string firsts containing ANY structural character (`://`, `//`,
+    // `\`, `=`, control chars) emit exactly
+    // `[auth] <level> [message-redacted: untrusted structure]` — the
+    // message NEVER appears; clean static messages pass verbatim
+    // (200-char final-safety truncation) with `(Error: <ctor>)` markers
+    // at error/warn only. info drops rest args; debug logs nothing.
+    // Decision table + rationale in ./auth-logger-bridge.ts.
     log(level, message, ...args) {
-      const effective =
-        level === "error" && USER_INPUT_ERROR_PATTERN.test(message) ? "warn" : level;
-      if (effective === "error") console.error(`[auth] ${message}`, ...args);
-      else if (effective === "warn") console.warn(`[auth] ${message}`, ...args);
-      else if (effective === "info") console.info(`[auth] ${message}`, ...args);
+      const call = resolveAuthLogCall(level, message, args);
+      if (call) console[call.method](...call.args);
+    },
+  },
+
+  // Sanitized API-error sink (invariant 10 / L19): providing onError
+  // REPLACES Better Auth's default error logging (which logs e.message
+  // wholesale for Prisma-shaped errors). See api-error-logging.ts.
+  onAPIError: {
+    onError: (error: unknown) => {
+      const line = sanitizedApiErrorLogLine(error);
+      if (line !== null) console.error(line);
     },
   },
 
@@ -181,6 +193,18 @@ export const auth = betterAuth({
     updateAge: 60 * 60 * 24,
   },
   advanced: {
+    // Native joins (bucket C of the L19 TERMINAL log policy, pass 6): the
+    // installed @better-auth/prisma-adapter implements native joins when
+    // this flag is set (core factory.mjs passes the join clause through to
+    // findOne/findMany at :561/:609 and transformOutput reads the joined
+    // key from the adapter row instead of triggering handleFallbackJoin),
+    // which removes the session→user fallback-join (a separate user query
+    // whose rejection used to reach the console as a raw Error) at the
+    // root. The console shim (bucket B, apps/server better-call-error-log-
+    // shim) remains the terminal guarantee: factory.mjs:191-195 still
+    // reaches handleFallbackJoin whenever a joined key is absent from the
+    // returned row.
+    database: { joins: true },
     defaultCookieAttributes: isCrossOrigin
       ? { sameSite: "none", secure: true, httpOnly: true }
       : { httpOnly: true, secure: env.NODE_ENV === "production" },

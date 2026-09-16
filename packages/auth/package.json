@@ -19,6 +19,9 @@
     },
     "./mcp-config": {
       "default": "./src/mcp-config.ts"
+    },
+    "./mcp-grant": {
+      "default": "./src/mcp-grant.ts"
     }
   },
   "scripts": {

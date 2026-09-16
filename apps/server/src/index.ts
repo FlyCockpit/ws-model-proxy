@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { serve } from "@hono/node-server";
 import { OpenAPIHandler } from "@orpc/openapi/fetch";
 import { OpenAPIReferencePlugin } from "@orpc/openapi/plugins";
-import { ORPCError, onError } from "@orpc/server";
+import { onError } from "@orpc/server";
 import { RPCHandler } from "@orpc/server/fetch";
 import { SimpleCsrfProtectionHandlerPlugin } from "@orpc/server/plugins";
 import { ZodToJsonSchemaConverter } from "@orpc/zod/zod4";
@@ -22,6 +22,7 @@ import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { WebSocketServer } from "ws";
 import { betterAuthAdminGate } from "./better-auth-admin-gate.js";
+import { installBetterCallErrorLogShim } from "./better-call-error-log-shim.js";
 import { CORS_ALLOW_HEADERS } from "./cors-headers.js";
 import { deviceAdminGate } from "./device-admin-gate.js";
 import {
@@ -30,6 +31,7 @@ import {
   SIGNUP_MEDIA_TYPES,
   SIGNUP_RECIPIENT_PATH,
 } from "./email-recipient-limit.js";
+import { mcpAuthorizeScopeGuard } from "./mcp-authorize-scope-guard.js";
 import { mediaAdminGate } from "./media/admin-gate.js";
 import { startMediaCleanup } from "./media/cleanup.js";
 import { createSameOriginGuard } from "./media/csrf-guard.js";
@@ -61,6 +63,7 @@ import { startProviderBudgetRepair } from "./model-api/provider-budget-runtime.j
 import { startRelayTelemetryRecovery } from "./model-api/relay-telemetry-recovery.js";
 import { createModelApiRoutes } from "./model-api/routes.js";
 import { transcriptionContentLengthGuard } from "./model-api/transcription-body-guard.js";
+import { logOrpcError } from "./orpc-error-log.js";
 import {
   authLimiter,
   createRateLimiterMiddleware,
@@ -72,16 +75,29 @@ import {
 import { RELAY_SUBPROTOCOL } from "./relay/protocol.js";
 import { relaySessionManager } from "./relay/session-manager.js";
 import { createRelayWebsocketMiddleware, relayUpgradeHandler } from "./relay/websocket.js";
+import {
+  authRouteLogPath,
+  isAuthRoutePath,
+  oauthRequestLogLine,
+  stripsOAuthQuery,
+} from "./request-log-redaction.js";
 import { createRpcBatchHandlerPlugin } from "./rpc-batch-plugin.js";
 import { mountSecurityHeaders } from "./security-headers.js";
 import { registerSeoRoutes } from "./seo.js";
 import { sessionMiddleware } from "./session-middleware.js";
 import { signupAccessGate } from "./signup-access-gate.js";
 import { getOrSetSsrCache } from "./ssr-cache.js";
+import { unhandledErrorLogArgs } from "./unhandled-error-log.js";
 
 // ---------------------------------------------------------------------------
 // Startup guards
 // ---------------------------------------------------------------------------
+
+// Sanitize better-call's unconditional `console.error('# SERVER_ERROR: ',
+// error)` fallback (raw error objects would hit the logs verbatim). Must run
+// before ANY request handling; see better-call-error-log-shim.ts for the
+// removal condition (TEMPORARY shim).
+installBetterCallErrorLogShim();
 
 // Reject wildcard CORS origin — it disables credential support and effectively
 // opens the API to any website. Fail hard at startup so the misconfiguration
@@ -256,41 +272,70 @@ app.use("/*", async (c, next) => {
 });
 
 // Logger — custom print function that prepends the request ID for correlation.
+// Better Auth route paths can carry LIVE credentials in deeper path segments
+// and queries (`/api/auth/reset-password/<token>`; oauth2 `state`/PKCE), so
+// EVERY `/api/auth` path logs a TRUNCATED pair of lines — first three path
+// segments only, query dropped, incoming (`<--`) and outgoing (`-->`) — via
+// `authRouteLogPath`. The two MCP login/consent PAGES (signed OAuth query
+// carriers) keep the query-stripped outgoing line from `oauthRequestLogLine`.
+// Correlation uses the per-request requestId, never the URL. All other paths
+// keep the stock behavior.
 app.use("/*", async (c, next) => {
+  const reqId = c.get("requestId") ?? "-";
+  if (isAuthRoutePath(c.req.path)) {
+    const logPath = authRouteLogPath(c.req.path);
+    const start = Date.now();
+    console.log(`[${reqId}] <-- ${c.req.method} ${logPath}`);
+    await next();
+    console.log(
+      oauthRequestLogLine({
+        requestId: reqId,
+        method: c.req.method,
+        path: logPath,
+        status: c.res.status,
+        elapsedMs: Date.now() - start,
+      }),
+    );
+    return;
+  }
+  if (stripsOAuthQuery(c.req.path)) {
+    const start = Date.now();
+    await next();
+    console.log(
+      oauthRequestLogLine({
+        requestId: reqId,
+        method: c.req.method,
+        path: c.req.path,
+        status: c.res.status,
+        elapsedMs: Date.now() - start,
+      }),
+    );
+    return;
+  }
   const logFn = (message: string, ...rest: string[]) => {
-    const reqId = c.get("requestId") ?? "-";
     console.log(`[${reqId}] ${message}`, ...rest);
   };
   return logger(logFn)(c, next);
 });
 
-// Catch any uncaught error from a route/middleware so admins get a stack
-// trace + request context in the logs instead of an opaque 500 in the client.
+// Catch any uncaught error from a route/middleware so admins get a log
+// line + request context instead of an opaque 500 in the client. EVERY
+// path — including the pre-dispatch createContext failure in the catch-all
+// below and non-auth application routes — logs the SANITIZED line (error
+// constructor name only): better-auth/Prisma failures carry SQL messages
+// and raw stacks, which must never reach the logs on any path (see
+// unhandled-error-log.ts, pass-10 ruling).
 app.onError((err, c) => {
-  const reqId = c.get("requestId") ?? "-";
-  console.error(
-    `[server] [${reqId}] Unhandled error on ${c.req.method} ${c.req.path}:`,
-    err instanceof Error ? (err.stack ?? err.message) : err,
-  );
+  console.error(...unhandledErrorLogArgs(err, c.req.method, c.req.path, c.get("requestId") ?? "-"));
   return c.json({ error: "Something didn't work on our end. Try again in a moment." }, 500);
 });
 
-// Shared oRPC error logger. Skips expected client errors (4xx ORPCErrors like
-// UNAUTHORIZED / NOT_FOUND / METHOD_NOT_SUPPORTED) so logs only contain real
-// problems. Transient 5xx codes (502/503/504 — usually upstream infra blipping)
-// log at warn so they don't pollute error dashboards alongside genuine bugs.
-function logOrpcError(error: unknown) {
-  if (error instanceof ORPCError && error.status < 500) {
-    return;
-  }
-  const isTransient5xx = error instanceof ORPCError && error.status > 500;
-  const log = isTransient5xx ? console.warn : console.error;
-  if (error instanceof Error) {
-    log(`[orpc] ${error.name}: ${error.message}`, error.stack);
-  } else {
-    log("[orpc] Unknown error:", error);
-  }
-}
+// Shared oRPC error logger (sanitized — see orpc-error-log.ts, pass 11):
+// skips expected client errors (4xx ORPCErrors), warns transient 5xx,
+// logs ORPCError message+ctor only (no stack) and unknown-Error ctor
+// names only (no message/stack — Prisma messages embed SQL + params).
+// Installed on BOTH handlers below; these are HANDLED errors that never
+// reach app.onError, so this sink must sanitize itself (R37 finding 2).
 if (env.CORS_ORIGIN) {
   app.use(
     "/*",
@@ -394,6 +439,14 @@ app.use("/api/auth/device/deny", deviceAdminGate);
 // users, and remove users, so they must also honor this app's verified-admin
 // and forced-2FA policy before the Better-Auth handler sees the request.
 app.use("/api/auth/admin/*", betterAuthAdminGate);
+
+// MCP authorization scope boundary (Phase 2): while WMP_MCP_ENABLED is on,
+// reject missing/blank `scope` on GET/form-POST /api/auth/oauth2/authorize
+// locally and non-redirecting (Better Auth 1.7 has no defaultScope); forward
+// every present scope unchanged so Better Auth validates client/redirect
+// before any redirected protocol error. Flag-off: untouched pass-through.
+// Mounted immediately before the auth handler.
+app.use("/api/auth/oauth2/authorize", mcpAuthorizeScopeGuard);
 
 app.on(["POST", "GET"], "/api/auth/*", (c) => auth.handler(c.req.raw));
 
