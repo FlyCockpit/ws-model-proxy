@@ -1,4 +1,5 @@
 import prisma, { Prisma } from "@ws-model-proxy/db";
+import { isDbShutdownFenceArmed, runWithDbShutdownPermit } from "@ws-model-proxy/db/shutdown-fence";
 import { SCHEDULER_VERSION, scheduleWeightedDeficitRoundRobin } from "./scheduler.js";
 import type {
   AdmissionAttempt,
@@ -634,6 +635,15 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       include: { Lease: true },
     });
     if (winningRequest?.state !== "WAITING" || winningRequest.Lease) return true;
+    // G2n pass 5: the shutdown fence can arm DURING any await of this loop
+    // (release/reclamation run under the durable-cleanup permit, so their
+    // operations keep flowing after the fence arms). The durable admission
+    // sequence starts HERE — fencing-token/scheduler update, lease create,
+    // WAITING→ADMITTED — so this is the per-iteration stop point: once the
+    // fence is armed, no NEW admission may start. A sequence that already
+    // started (the check passed) is allowed to complete — its partial work
+    // is committed durable state, not a new admission.
+    if (isDbShutdownFenceArmed()) return false;
     const updatedCapacity = await tx.inferenceCapacity.update({
       where: { id: capacityId },
       data: {
@@ -679,7 +689,24 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
   }
 
   async #fillAvailable(tx: Prisma.TransactionClient, capacityId: string, now: Date) {
-    while (await this.#admitOne(tx, capacityId, now)) {
+    // G2n permit-scope (pass 4): admission scheduling during teardown is NEW
+    // work, never durable cleanup. release() runs inside the shutdown
+    // permit (its ACTIVE→RELEASED transitions must complete), and this fill
+    // previously inherited that permit — authorizing capacityLease.create
+    // and WAITING→ADMITTED for OTHER requests while the process is tearing
+    // down. When the global shutdown fence is armed, skip the fill: queued
+    // waiters remain WAITING and are admitted by the next boot (or their
+    // own deadlines) — the correct teardown semantic. Normal-operation
+    // aborts (fence NOT armed) keep filling: one request going away and
+    // admitting the next waiter is ordinary capacity behavior.
+    //
+    // G2n pass 5: the fence can arm DURING the loop's awaits, so the check
+    // is PER ITERATION (loop entry AND inside #admitOne immediately before
+    // the durable admission sequence), not once at entry — a fence that
+    // arms mid-fill stops the very next admission instead of authorizing
+    // the whole remaining queue. Both callers (release and reclamation)
+    // run through this same loop.
+    while (!isDbShutdownFenceArmed() && (await this.#admitOne(tx, capacityId, now))) {
       // Each iteration consumes one durable waiter and rechecks physical/member
       // limits, so this terminates without relying on a caller-provided bound.
     }
@@ -765,34 +792,43 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
   }
 
   async release(lease: CapacityLeaseHandle): Promise<boolean> {
-    const released = await this.db.$transaction(async (tx) => {
-      await this.#lockAdmissionResources(tx, [lease.capacityId]);
-      const clockRows = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
-      const now = clockRows[0]?.now;
-      if (!now) throw new Error("Database clock unavailable.");
-      const result = await tx.capacityLease.updateMany({
-        where: { id: lease.leaseId, fencingToken: lease.fencingToken, state: "ACTIVE" },
-        data: { state: "RELEASED", releasedAt: now, releaseReason: "released" },
-      });
-      if (result.count)
-        await tx.admissionRequest.updateMany({
-          where: { attemptId: lease.attemptId, state: "ADMITTED" },
-          data: { state: "TERMINAL", terminalAt: now },
+    // G2n (durable-cleanup permit): release runs AFTER the caller's abort
+    // BY DESIGN (response-lease cleanup fires on abort/EOF/cancel), and the
+    // MCP shutdown gate arms the global DB fence BEFORE aborting. The
+    // permit exempts ONLY this release from the fences — the ACTIVE→
+    // RELEASED lease transition and ADMITTED→TERMINAL request transition
+    // are durable cleanup intent that must complete during teardown, while
+    // every NEW (non-cleanup) operation stays fenced.
+    const released = await runWithDbShutdownPermit(() =>
+      this.db.$transaction(async (tx) => {
+        await this.#lockAdmissionResources(tx, [lease.capacityId]);
+        const clockRows = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
+        const now = clockRows[0]?.now;
+        if (!now) throw new Error("Database clock unavailable.");
+        const result = await tx.capacityLease.updateMany({
+          where: { id: lease.leaseId, fencingToken: lease.fencingToken, state: "ACTIVE" },
+          data: { state: "RELEASED", releasedAt: now, releaseReason: "released" },
         });
-      if (result.count) {
-        const admission = await tx.admissionRequest.findUnique({
-          where: { attemptId: lease.attemptId },
-          select: { relayRequestId: true },
-        });
-        if (admission?.relayRequestId)
-          await tx.relayRequest.updateMany({
-            where: { id: admission.relayRequestId, admissionAttemptId: lease.attemptId },
-            data: { admissionTerminalState: "TERMINAL" },
+        if (result.count)
+          await tx.admissionRequest.updateMany({
+            where: { attemptId: lease.attemptId, state: "ADMITTED" },
+            data: { state: "TERMINAL", terminalAt: now },
           });
-      }
-      if (result.count) await this.#fillAvailable(tx, lease.capacityId, now);
-      return result.count === 1;
-    });
+        if (result.count) {
+          const admission = await tx.admissionRequest.findUnique({
+            where: { attemptId: lease.attemptId },
+            select: { relayRequestId: true },
+          });
+          if (admission?.relayRequestId)
+            await tx.relayRequest.updateMany({
+              where: { id: admission.relayRequestId, admissionAttemptId: lease.attemptId },
+              data: { admissionTerminalState: "TERMINAL" },
+            });
+        }
+        if (result.count) await this.#fillAvailable(tx, lease.capacityId, now);
+        return result.count === 1;
+      }),
+    );
     if (released) await this.#notifyBestEffort([lease.capacityId]);
     return released;
   }
@@ -802,69 +838,74 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     state: "CANCELLED" | "EXPIRED",
   ): Promise<AdmissionTerminalizationResult> {
     const reason = state === "CANCELLED" ? "cancelled" : "deadline";
-    const cancelled = await this.#serializable(async (tx) => {
-      const request = await tx.admissionRequest.findUnique({
-        where: { attemptId },
-        include: { Waiters: true, Lease: true },
-      });
-      if (!request) return { result: { state: "MISSING" } as const, capacities: [] as string[] };
-      const capacities = [...new Set(request.Waiters.map((waiter) => waiter.capacityId))].sort();
-      if (request.Lease?.capacityId) capacities.push(request.Lease.capacityId);
-      const lockedCapacities = [...new Set(capacities)].sort();
-      await this.#lockAdmissionResources(tx, lockedCapacities);
-      const clockRows = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
-      const now = clockRows[0]?.now;
-      if (!now) throw new Error("Database clock unavailable.");
-      const current = await tx.admissionRequest.findUniqueOrThrow({
-        where: { id: request.id },
-        include: { Lease: true },
-      });
-      if (current.state === "ADMITTED" && current.Lease?.state === "ACTIVE")
-        return {
-          result: { state: "ADMITTED", lease: leaseHandle(current.Lease) } as const,
-          capacities: lockedCapacities,
-        };
-      if (current.state !== "WAITING")
-        return {
-          result: {
-            state:
-              current.state === "CANCELLED" || current.state === "EXPIRED"
-                ? current.state
-                : "TERMINAL",
-          } as AdmissionTerminalizationResult,
-          capacities: lockedCapacities,
-        };
-      // Process clocks are only polling hints. A caller may ask to expire an
-      // attempt before PostgreSQL's authoritative clock reaches the durable
-      // deadline, so preserve the waiter and tell it to keep polling.
-      if (state === "EXPIRED" && (!current.deadlineAt || current.deadlineAt > now))
-        return {
-          result: { state: "WAITING", requestId: current.id } as const,
-          capacities: lockedCapacities,
-        };
-      const result = await tx.admissionRequest.updateMany({
-        where: {
-          id: request.id,
-          state: "WAITING",
-          ...(state === "EXPIRED" ? { deadlineAt: { lte: now } } : {}),
-        },
-        data: { state, terminalAt: now, terminalReason: reason },
-      });
-      if (result.count)
-        await tx.capacityWaiter.updateMany({
-          where: { admissionRequestId: request.id, state: "WAITING" },
-          data: { state, stateChangedAt: now, terminalReason: reason },
+    // G2n (durable-cleanup permit): the WAITING→CANCELLED/EXPIRED waiter
+    // transition is abort-triggered durable cleanup — it must execute even
+    // after the shutdown fence armed and the request's signal aborted.
+    const cancelled = await runWithDbShutdownPermit(() =>
+      this.#serializable(async (tx) => {
+        const request = await tx.admissionRequest.findUnique({
+          where: { attemptId },
+          include: { Waiters: true, Lease: true },
         });
-      if (result.count && request.relayRequestId)
-        await tx.relayRequest.updateMany({
-          where: { id: request.relayRequestId, admissionAttemptId: attemptId },
-          data: { admissionTerminalState: state },
+        if (!request) return { result: { state: "MISSING" } as const, capacities: [] as string[] };
+        const capacities = [...new Set(request.Waiters.map((waiter) => waiter.capacityId))].sort();
+        if (request.Lease?.capacityId) capacities.push(request.Lease.capacityId);
+        const lockedCapacities = [...new Set(capacities)].sort();
+        await this.#lockAdmissionResources(tx, lockedCapacities);
+        const clockRows = await tx.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
+        const now = clockRows[0]?.now;
+        if (!now) throw new Error("Database clock unavailable.");
+        const current = await tx.admissionRequest.findUniqueOrThrow({
+          where: { id: request.id },
+          include: { Lease: true },
         });
-      return {
-        result: { state: result.count ? state : "MISSING" } as AdmissionTerminalizationResult,
-        capacities: lockedCapacities,
-      };
-    });
+        if (current.state === "ADMITTED" && current.Lease?.state === "ACTIVE")
+          return {
+            result: { state: "ADMITTED", lease: leaseHandle(current.Lease) } as const,
+            capacities: lockedCapacities,
+          };
+        if (current.state !== "WAITING")
+          return {
+            result: {
+              state:
+                current.state === "CANCELLED" || current.state === "EXPIRED"
+                  ? current.state
+                  : "TERMINAL",
+            } as AdmissionTerminalizationResult,
+            capacities: lockedCapacities,
+          };
+        // Process clocks are only polling hints. A caller may ask to expire an
+        // attempt before PostgreSQL's authoritative clock reaches the durable
+        // deadline, so preserve the waiter and tell it to keep polling.
+        if (state === "EXPIRED" && (!current.deadlineAt || current.deadlineAt > now))
+          return {
+            result: { state: "WAITING", requestId: current.id } as const,
+            capacities: lockedCapacities,
+          };
+        const result = await tx.admissionRequest.updateMany({
+          where: {
+            id: request.id,
+            state: "WAITING",
+            ...(state === "EXPIRED" ? { deadlineAt: { lte: now } } : {}),
+          },
+          data: { state, terminalAt: now, terminalReason: reason },
+        });
+        if (result.count)
+          await tx.capacityWaiter.updateMany({
+            where: { admissionRequestId: request.id, state: "WAITING" },
+            data: { state, stateChangedAt: now, terminalReason: reason },
+          });
+        if (result.count && request.relayRequestId)
+          await tx.relayRequest.updateMany({
+            where: { id: request.relayRequestId, admissionAttemptId: attemptId },
+            data: { admissionTerminalState: state },
+          });
+        return {
+          result: { state: result.count ? state : "MISSING" } as AdmissionTerminalizationResult,
+          capacities: lockedCapacities,
+        };
+      }),
+    );
     if (cancelled.result.state === state) await this.#notifyBestEffort(cancelled.capacities);
     return cancelled.result;
   }

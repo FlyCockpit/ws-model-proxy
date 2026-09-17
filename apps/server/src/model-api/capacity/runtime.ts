@@ -57,7 +57,46 @@ export class StoreCapacityAdmissionRuntime implements CapacityAdmissionRuntime {
   }
 
   async acquire(attempt: AdmissionAttempt, signal?: AbortSignal): Promise<AdmissionResult> {
-    await this.maintain();
+    // G2n pass 5: maintain() is part of the acquisition flow, so it lives
+    // INSIDE the failure boundary — any throw there (fence rejection,
+    // connection loss) terminalizes an already-persisted attempt exactly
+    // like a poll failure.
+    try {
+      await this.maintain();
+      return await this.#acquireUntilTerminal(attempt, signal);
+    } catch (error) {
+      // G2n exception/cleanup boundary (pass 4): a poll or acquisition
+      // failure (a DB abort/shutdown fence rejection, connection loss, or
+      // any other throw) must not strand an ALREADY-PERSISTED WAITING
+      // request — terminalize it durably (terminalizeAttempt carries its
+      // own durable-cleanup permit) before surfacing the failure. When the
+      // signal aborted the terminal state is CANCELLED; otherwise EXPIRED,
+      // which commits only once the durable deadline has passed (a request
+      // whose deadline has not arrived stays WAITING and is expired by its
+      // own deadline or the abandonment sweep — the correct teardown
+      // semantic for a failure without a client cancellation).
+      const terminal: "CANCELLED" | "EXPIRED" = signal?.aborted ? "CANCELLED" : "EXPIRED";
+      try {
+        const finalized = await this.store.terminalizeAttempt(attempt.attemptId, terminal);
+        // G2n pass 5: admission can win the race against the failing
+        // acquisition — terminalizeAttempt serializes under the same
+        // capacity locks and returns ADMITTED with an ACTIVE lease. The
+        // normal branches release such a raced lease; this failure boundary
+        // must too (store.release carries its own durable-cleanup permit),
+        // or the slot leaks until reclamation.
+        if (finalized.state === "ADMITTED") await this.store.release(finalized.lease);
+      } catch {
+        // Best-effort cleanup: the ORIGINAL failure is the outcome; the
+        // durable deadline/sweep remains the backstop if this also fails.
+      }
+      throw error;
+    }
+  }
+
+  async #acquireUntilTerminal(
+    attempt: AdmissionAttempt,
+    signal?: AbortSignal,
+  ): Promise<AdmissionResult> {
     let result = await this.store.acquire(attempt, signal);
     let localDeadlineReached = false;
     while (result.state === "WAITING") {

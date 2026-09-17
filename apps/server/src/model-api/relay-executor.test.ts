@@ -165,3 +165,43 @@ describe("relay response backpressure", () => {
     expect(manager.cancelRelayRequest).not.toHaveBeenCalled();
   });
 });
+
+describe("G1 — an ALREADY-aborted signal starts nothing (synchronous entry check)", () => {
+  it("startRelayAttempt is a no-op: no registration, no dispatch, no listener, settled cancelled", async () => {
+    const manager = {
+      registerRelayResponseHandlers: vi.fn(),
+      sendRelayRequest: vi.fn(),
+      cancelRelayRequest: vi.fn(),
+      completeRelayRequest: vi.fn(),
+    };
+    const controller = new AbortController();
+    controller.abort();
+    const attempt = startRelayAttempt({
+      manager,
+      cliDeviceId: "cli-1",
+      endpointSlug: "neutral-upstream",
+      family: "chat.completions",
+      method: "POST",
+      path: "/v1/chat/completions",
+      headers: new Headers(),
+      body: new Uint8Array([1]),
+      timeoutMs: 30_000,
+      abortSignal: controller.signal,
+    });
+    expect(manager.registerRelayResponseHandlers).not.toHaveBeenCalled();
+    expect(manager.sendRelayRequest).not.toHaveBeenCalled();
+    expect(manager.cancelRelayRequest).not.toHaveBeenCalled();
+    expect(manager.completeRelayRequest).not.toHaveBeenCalled();
+    await expect(attempt.started).rejects.toThrow("cancelled");
+    await expect(attempt.terminal).resolves.toMatchObject({
+      ok: false,
+      failure: "cancelled",
+      httpStatusCode: 499,
+      responseBytes: 0,
+      requestBytes: 0,
+    });
+    // cancel() on the no-op attempt does not reach the manager either.
+    attempt.cancel("cancelled");
+    expect(manager.cancelRelayRequest).not.toHaveBeenCalled();
+  });
+});

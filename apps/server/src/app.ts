@@ -30,6 +30,7 @@ import {
 import { createMcpAdmissionGate } from "./mcp/admission.js";
 import { createMcpRequestHandler, type McpAuthInstance } from "./mcp/auth.js";
 import { createMcpTransport } from "./mcp/handler.js";
+import { bindMcpToolDispatch } from "./mcp/tool-dispatch.js";
 import { mcpAuthorizeScopeGuard } from "./mcp-authorize-scope-guard.js";
 import { createMcpDiscoveryForwarder, MCP_WELL_KNOWN_PATHS } from "./mcp-discovery.js";
 import {
@@ -440,6 +441,18 @@ export async function createApp(options: CreateAppOptions = {}) {
   // better-auth adapter DB operation rejects immediately (transparent
   // while the gate is open; normal /api/auth traffic is gone by then —
   // HTTP drain and connection termination run first).
+  // The gate's onClosed hook arms the DB-SEAM FENCE (Part G pass 2, G1:
+  // @ws-model-proxy/db/shutdown-fence — the ONE shared Prisma client
+  // packages/db exports is wrapped there at construction, so the fence
+  // covers BOTH better-auth's adapter operations AND the direct procedure
+  // and diagnostic calls the MCP tool dispatch makes; the Part F
+  // armAuthDbShutdownFence import is a thin delegation to that single
+  // arming seam): the installed requireMcpAuth continuation chain drops
+  // the abort signal, and a tool continuation parked on an in-flight
+  // procedure await can resume after the permit released — from close()
+  // onward every NEW database operation through the shared client rejects
+  // immediately (transparent while the gate is open; normal traffic is
+  // gone by then — HTTP drain and connection termination run first).
   const mcpAdmissionGate = createMcpAdmissionGate({ onClosed: armAuthDbShutdownFence });
   const mcpHandler = createMcpTransport({ isShuttingDown: () => mcpAdmissionGate.closed });
   app.use(MCP_ENDPOINT_PATH, createMcpFeatureGate({ enabled: env.WMP_MCP_ENABLED }));
@@ -460,6 +473,17 @@ export async function createApp(options: CreateAppOptions = {}) {
       services: {
         repairExpiredProviderBudgets: (scope) => repairExpiredProviderBudgets(new Date(), scope),
       },
+      // Phase 5 tool dispatch binding: after every admission check passes,
+      // the verified AuthInfo (passed VERBATIM by the SDK into the transport
+      // factory's request context) is bound to the per-request oRPC context,
+      // the route request id, and the OWNED admission signal (G1: tool
+      // dispatch races/fences procedure calls and diagnostic cores on it, so
+      // a client abort or gate.close() tears down the tool's network work
+      // and never STARTS the next pipeline stage), so the manifest tools
+      // registered for THIS request resolve their router client
+      // (mcp/tool-dispatch.ts).
+      onVerified: ({ authInfo, orpcContext, requestId, signal }) =>
+        bindMcpToolDispatch(authInfo, { orpcContext, requestId, signal }),
     }),
   );
 

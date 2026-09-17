@@ -26,6 +26,30 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createMcpTransport, MCP_TRANSPORT_OPTIONS } from "./handler";
 
+// Phase 5: the default registration imports the tool manifest → appRouter →
+// Prisma client and env validation chains. Mock both so no real environment
+// or database is touched by the transport-contract tests below.
+vi.mock("@ws-model-proxy/env/server", () => ({
+  env: {
+    BETTER_AUTH_SECRET: "test-better-auth-secret",
+    BETTER_AUTH_URL: "https://proxy.example.com",
+    NODE_ENV: "test",
+  },
+}));
+
+vi.mock("@ws-model-proxy/env/shared", () => ({
+  env: {
+    BETTER_AUTH_SECRET: "test-better-auth-secret",
+    DATABASE_URL: "postgresql://handler-test",
+    NODE_ENV: "test",
+  },
+}));
+
+vi.mock("@ws-model-proxy/db", async () => {
+  const { mockDeep } = await import("vitest-mock-extended");
+  return { default: mockDeep() };
+});
+
 /** Minimal well-typed CallToolResult for the probe tool. */
 type ProbeToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
 
@@ -113,15 +137,21 @@ describe("createMcpTransport — pinned configuration", () => {
     });
   });
 
-  it("the Phase 4 tool manifest is empty and registerMcpTools registers nothing", () => {
-    expect(MCP_TOOL_MANIFEST).toEqual([]);
+  it("the Phase 5 tool manifest backs the default registration: tools/list advertises every catalog entry", () => {
+    expect(MCP_TOOL_MANIFEST.length).toBeGreaterThan(0);
     const server = new McpServer({ name: "t", version: "1" });
     registerMcpTools(server);
     const handler = createMcpTransport();
     return handler.fetch(modernRequest("tools/list", 1), undefined).then(async (res) => {
-      // tools/list on a server with no registered tools answers 404
-      // method-not-found (lazy handler init) — proves nothing registered.
-      expect(res.status).toBe(404);
+      // With the Phase 5 manifest registered, tools/list answers 200 and
+      // carries exactly the manifest's tool names (catalog parity between
+      // the transport default and the checked manifest).
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        result?: { tools?: { name: string }[] };
+      };
+      const names = body.result?.tools?.map((tool) => tool.name).sort();
+      expect(names).toEqual([...MCP_TOOL_MANIFEST.map((tool) => tool.name)].sort());
     });
   });
 });

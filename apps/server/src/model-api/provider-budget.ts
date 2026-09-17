@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import prisma, { Prisma } from "@ws-model-proxy/db";
+import { runWithDbShutdownPermit } from "@ws-model-proxy/db/shutdown-fence";
 import {
   budgetWindow,
   type ProviderTokenUsage,
@@ -726,295 +727,309 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
     terminal.usageSource ?? (terminal.reason === "CRASH_RECOVERY" ? "crash-repair" : "terminal"),
     "usageSource",
   );
-  await serializedByAdvisoryLocks(async (tx) => {
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-attempt:${terminal.attemptId}`}, 0))`;
-    await tx.$queryRaw`SELECT id FROM provider_attempt WHERE "attemptId" = ${terminal.attemptId} AND "fencingToken" = ${terminal.fencingToken} FOR UPDATE`;
-    const anchor = await tx.providerAttempt.findUnique({
-      where: {
-        attemptId_fencingToken: {
-          attemptId: terminal.attemptId,
-          fencingToken: terminal.fencingToken,
-        },
-      },
-    });
-    if (!anchor) throw new ProviderBudgetConfigurationError("No admitted provider attempt exists");
-    if (
-      terminal.reason === "CRASH_RECOVERY" &&
-      terminal.crashExpiredAt &&
-      anchor.expiresAt > terminal.crashExpiredAt
-    )
-      return;
-    if (
-      anchor.userId !== terminal.userId ||
-      anchor.providerAccountId !== terminal.providerAccountId ||
-      anchor.providerModelId !== terminal.providerModelId ||
-      anchor.poolId !== (terminal.poolId ?? null) ||
-      anchor.credentialId !== (terminal.credentialId ?? null) ||
-      anchor.requestId !== terminal.requestId
-    )
-      throw new ProviderBudgetConfigurationError("Terminal attempt identity conflict");
-
-    const expireCrashAnchor = async () => {
-      if (terminal.reason !== "CRASH_RECOVERY") return;
-      const terminalAt = new Date();
-      await tx.providerAttempt.updateMany({
-        where: { id: anchor.id, state: "ACTIVE" },
-        data: {
-          state: "EXPIRED",
-          terminalAt,
-          terminalReason: "CRASH_RECOVERY",
-          heartbeatAt: terminalAt,
+  // G2n (durable-cleanup permit, pass 4): cancellation-path reconciliation
+  // runs AFTER the request's abort (public-overflow cancellation cleanup).
+  // Reservation settlement and attempt terminalization are REQUIRED durable
+  // transitions and must execute even when the abort/shutdown fences are
+  // active. The permit is scoped to this settlement transaction only;
+  // surrounding new work stays fenced.
+  await runWithDbShutdownPermit(() =>
+    serializedByAdvisoryLocks(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget-attempt:${terminal.attemptId}`}, 0))`;
+      await tx.$queryRaw`SELECT id FROM provider_attempt WHERE "attemptId" = ${terminal.attemptId} AND "fencingToken" = ${terminal.fencingToken} FOR UPDATE`;
+      const anchor = await tx.providerAttempt.findUnique({
+        where: {
+          attemptId_fencingToken: {
+            attemptId: terminal.attemptId,
+            fencingToken: terminal.fencingToken,
+          },
         },
       });
-    };
-    const finalizeNonCrashAnchor = async () => {
-      if (terminal.reason === "CRASH_RECOVERY" || anchor.state !== "ACTIVE") return;
-      const terminalAt = new Date();
-      const finalized = await tx.providerAttempt.updateMany({
-        where: { id: anchor.id, state: "ACTIVE" },
-        data: {
-          state:
-            terminal.reason === "COMPLETED"
-              ? "COMPLETED"
-              : terminal.reason === "CANCELLED"
-                ? "CANCELLED"
-                : "FAILED",
-          terminalReason: terminal.reason,
-          terminalAt,
-          heartbeatAt: terminalAt,
-        },
-      });
-      if (finalized.count !== 1)
-        throw new ProviderBudgetConfigurationError(
-          "Provider attempt was not active at terminal settlement",
-        );
-    };
-
-    const usage = terminal.usage;
-    const observationComplete = normalizedObservationComplete;
-    const sourceUsageAccountingVersion = usage
-      ? normalizedVersion(usage.accountingVersion, "accountingVersion")
-      : undefined;
-    const billableTotal = usage && providerBillableTokens(usage);
-    const accountingMatches = usage?.accountingVersion.trim() === anchor.accountingVersion;
-    const payloadHash = terminalPayloadHash(
-      terminal,
-      sourceVersion,
-      usageSource,
-      accountingMatches,
-      observationComplete,
-    );
-    const priorRevision = await tx.providerUsageLedger.findUnique({
-      where: {
-        attemptId_fencingToken_sourceVersion: {
-          attemptId: terminal.attemptId,
-          fencingToken: terminal.fencingToken,
-          sourceVersion,
-        },
-      },
-      select: { payloadHash: true, revisionSequence: true, revisionKind: true },
-    });
-    if (priorRevision) {
+      if (!anchor)
+        throw new ProviderBudgetConfigurationError("No admitted provider attempt exists");
       if (
-        priorRevision.payloadHash !== payloadHash ||
-        priorRevision.revisionSequence !== terminal.revisionSequence ||
-        priorRevision.revisionKind !== terminal.revisionKind
+        terminal.reason === "CRASH_RECOVERY" &&
+        terminal.crashExpiredAt &&
+        anchor.expiresAt > terminal.crashExpiredAt
       )
-        throw new ProviderBudgetConfigurationError("Accounting source revision conflict");
-      await finalizeNonCrashAnchor();
-      await expireCrashAnchor();
-      return;
-    }
-    const previousLedgers = await tx.providerUsageLedger.findMany({
-      where: { attemptId: terminal.attemptId, fencingToken: terminal.fencingToken },
-      orderBy: { revisionSequence: "desc" },
-      select: { revisionSequence: true },
-    });
-    // A completed terminal observation always wins a crash sweep that selected
-    // the row just before the terminal transaction committed.
-    if (terminal.reason === "CRASH_RECOVERY" && previousLedgers.length > 0) return;
-    if (previousLedgers[0] && terminal.revisionSequence <= previousLedgers[0].revisionSequence)
-      throw new ProviderBudgetConfigurationError("Stale accounting revision");
+        return;
+      if (
+        anchor.userId !== terminal.userId ||
+        anchor.providerAccountId !== terminal.providerAccountId ||
+        anchor.providerModelId !== terminal.providerModelId ||
+        anchor.poolId !== (terminal.poolId ?? null) ||
+        anchor.credentialId !== (terminal.credentialId ?? null) ||
+        anchor.requestId !== terminal.requestId
+      )
+        throw new ProviderBudgetConfigurationError("Terminal attempt identity conflict");
 
-    const reservations = await tx.providerBudgetReservation.findMany({
-      where: {
-        userId: terminal.userId,
-        attemptId: terminal.attemptId,
-        fencingToken: terminal.fencingToken,
-      },
-      orderBy: { id: "asc" },
-    });
-    for (const reservation of reservations)
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget:${reservation.policyId}`}, 0))`;
+      const expireCrashAnchor = async () => {
+        if (terminal.reason !== "CRASH_RECOVERY") return;
+        const terminalAt = new Date();
+        await tx.providerAttempt.updateMany({
+          where: { id: anchor.id, state: "ACTIVE" },
+          data: {
+            state: "EXPIRED",
+            terminalAt,
+            terminalReason: "CRASH_RECOVERY",
+            heartbeatAt: terminalAt,
+          },
+        });
+      };
+      const finalizeNonCrashAnchor = async () => {
+        if (terminal.reason === "CRASH_RECOVERY" || anchor.state !== "ACTIVE") return;
+        const terminalAt = new Date();
+        const finalized = await tx.providerAttempt.updateMany({
+          where: { id: anchor.id, state: "ACTIVE" },
+          data: {
+            state:
+              terminal.reason === "COMPLETED"
+                ? "COMPLETED"
+                : terminal.reason === "CANCELLED"
+                  ? "CANCELLED"
+                  : "FAILED",
+            terminalReason: terminal.reason,
+            terminalAt,
+            heartbeatAt: terminalAt,
+          },
+        });
+        if (finalized.count !== 1)
+          throw new ProviderBudgetConfigurationError(
+            "Provider attempt was not active at terminal settlement",
+          );
+      };
 
-    const reportedCurrency = normalizedCurrency(usage?.reportedCostCurrency ?? usage?.currency);
-    const reportedPricingVersion =
-      usage?.reportedCostPricingVersion?.trim() ?? usage?.pricingVersion?.trim();
-    const calculatedCurrency = normalizedCurrency(usage?.calculatedCostCurrency ?? usage?.currency);
-    const calculatedPricingVersion =
-      usage?.calculatedCostPricingVersion?.trim() ?? usage?.pricingVersion?.trim();
-    const reportedMatches = Boolean(
-      usage?.reportedCost !== undefined &&
-        anchor.pricingVersion &&
-        anchor.liabilityCurrency &&
-        reportedPricingVersion === anchor.pricingVersion &&
-        reportedCurrency === anchor.liabilityCurrency,
-    );
-    const calculatedMatches = Boolean(
-      usage?.calculatedCost !== undefined &&
-        anchor.pricingVersion &&
-        anchor.liabilityCurrency &&
-        calculatedPricingVersion === anchor.pricingVersion &&
-        calculatedCurrency === anchor.liabilityCurrency,
-    );
-    const suppliedCost = reportedMatches
-      ? usage?.reportedCost
-      : calculatedMatches
-        ? usage?.calculatedCost
+      const usage = terminal.usage;
+      const observationComplete = normalizedObservationComplete;
+      const sourceUsageAccountingVersion = usage
+        ? normalizedVersion(usage.accountingVersion, "accountingVersion")
         : undefined;
-    // Cost and token observations from an incomplete stream remain useful
-    // evidence, but cannot safely reduce the admitted liability.
-    // Cost provenance is independent when completeness is unspecified: some
-    // non-streaming providers report an authoritative charge without a full
-    // token-category breakdown. An explicit false, however, marks a truncated
-    // observation and must retain the conservative admitted liability.
-    const costKnown = suppliedCost !== undefined && observationComplete === true;
-    const suppliedCostConfidence: UsageConfidence = reportedMatches
-      ? "REPORTED"
-      : calculatedMatches
-        ? (usage?.calculatedCostConfidence ?? "CALCULATED")
-        : "ESTIMATED";
-    const settledCost = costKnown ? decimal(suppliedCost) : null;
-
-    for (const reservation of reservations) {
-      const trustworthy =
-        reservation.metric === "CONCURRENCY" ||
-        (reservation.metric === "TOKENS" &&
-          accountingMatches &&
-          observationComplete === true &&
-          billableTotal !== undefined) ||
-        (reservation.metric === "SPEND" && costKnown);
-      const prior = await tx.providerBudgetSettlement.aggregate({
-        where: { reservationId: reservation.id },
-        _sum: { settledValue: true },
+      const billableTotal = usage && providerBillableTokens(usage);
+      const accountingMatches = usage?.accountingVersion.trim() === anchor.accountingVersion;
+      const payloadHash = terminalPayloadHash(
+        terminal,
+        sourceVersion,
+        usageSource,
+        accountingMatches,
+        observationComplete,
+      );
+      const priorRevision = await tx.providerUsageLedger.findUnique({
+        where: {
+          attemptId_fencingToken_sourceVersion: {
+            attemptId: terminal.attemptId,
+            fencingToken: terminal.fencingToken,
+            sourceVersion,
+          },
+        },
+        select: { payloadHash: true, revisionSequence: true, revisionKind: true },
       });
-      const priorTotal = prior._sum.settledValue ?? new Prisma.Decimal(0);
-      const observation = trustworthy
-        ? reservation.metric === "SPEND" && settledCost
-          ? settledCost
-          : terminalValue(reservation.metric, usage)
-        : reservation.reservedValue;
-      const delta =
-        terminal.revisionKind === "SNAPSHOT"
-          ? observation.minus(priorTotal)
-          : trustworthy
-            ? observation
-            : priorTotal.lessThan(reservation.reservedValue)
-              ? reservation.reservedValue.minus(priorTotal)
-              : new Prisma.Decimal(0);
-      const desiredTotal = priorTotal.plus(delta);
-      if (desiredTotal.isNegative())
-        throw new ProviderBudgetConfigurationError("Accounting correction underflows zero");
-      await tx.providerBudgetSettlement.create({
+      if (priorRevision) {
+        if (
+          priorRevision.payloadHash !== payloadHash ||
+          priorRevision.revisionSequence !== terminal.revisionSequence ||
+          priorRevision.revisionKind !== terminal.revisionKind
+        )
+          throw new ProviderBudgetConfigurationError("Accounting source revision conflict");
+        await finalizeNonCrashAnchor();
+        await expireCrashAnchor();
+        return;
+      }
+      const previousLedgers = await tx.providerUsageLedger.findMany({
+        where: { attemptId: terminal.attemptId, fencingToken: terminal.fencingToken },
+        orderBy: { revisionSequence: "desc" },
+        select: { revisionSequence: true },
+      });
+      // A completed terminal observation always wins a crash sweep that selected
+      // the row just before the terminal transaction committed.
+      if (terminal.reason === "CRASH_RECOVERY" && previousLedgers.length > 0) return;
+      if (previousLedgers[0] && terminal.revisionSequence <= previousLedgers[0].revisionSequence)
+        throw new ProviderBudgetConfigurationError("Stale accounting revision");
+
+      const reservations = await tx.providerBudgetReservation.findMany({
+        where: {
+          userId: terminal.userId,
+          attemptId: terminal.attemptId,
+          fencingToken: terminal.fencingToken,
+        },
+        orderBy: { id: "asc" },
+      });
+      for (const reservation of reservations)
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`provider-budget:${reservation.policyId}`}, 0))`;
+
+      const reportedCurrency = normalizedCurrency(usage?.reportedCostCurrency ?? usage?.currency);
+      const reportedPricingVersion =
+        usage?.reportedCostPricingVersion?.trim() ?? usage?.pricingVersion?.trim();
+      const calculatedCurrency = normalizedCurrency(
+        usage?.calculatedCostCurrency ?? usage?.currency,
+      );
+      const calculatedPricingVersion =
+        usage?.calculatedCostPricingVersion?.trim() ?? usage?.pricingVersion?.trim();
+      const reportedMatches = Boolean(
+        usage?.reportedCost !== undefined &&
+          anchor.pricingVersion &&
+          anchor.liabilityCurrency &&
+          reportedPricingVersion === anchor.pricingVersion &&
+          reportedCurrency === anchor.liabilityCurrency,
+      );
+      const calculatedMatches = Boolean(
+        usage?.calculatedCost !== undefined &&
+          anchor.pricingVersion &&
+          anchor.liabilityCurrency &&
+          calculatedPricingVersion === anchor.pricingVersion &&
+          calculatedCurrency === anchor.liabilityCurrency,
+      );
+      const suppliedCost = reportedMatches
+        ? usage?.reportedCost
+        : calculatedMatches
+          ? usage?.calculatedCost
+          : undefined;
+      // Cost and token observations from an incomplete stream remain useful
+      // evidence, but cannot safely reduce the admitted liability.
+      // Cost provenance is independent when completeness is unspecified: some
+      // non-streaming providers report an authoritative charge without a full
+      // token-category breakdown. An explicit false, however, marks a truncated
+      // observation and must retain the conservative admitted liability.
+      const costKnown = suppliedCost !== undefined && observationComplete === true;
+      const suppliedCostConfidence: UsageConfidence = reportedMatches
+        ? "REPORTED"
+        : calculatedMatches
+          ? (usage?.calculatedCostConfidence ?? "CALCULATED")
+          : "ESTIMATED";
+      const settledCost = costKnown ? decimal(suppliedCost) : null;
+
+      for (const reservation of reservations) {
+        const trustworthy =
+          reservation.metric === "CONCURRENCY" ||
+          (reservation.metric === "TOKENS" &&
+            accountingMatches &&
+            observationComplete === true &&
+            billableTotal !== undefined) ||
+          (reservation.metric === "SPEND" && costKnown);
+        const prior = await tx.providerBudgetSettlement.aggregate({
+          where: { reservationId: reservation.id },
+          _sum: { settledValue: true },
+        });
+        const priorTotal = prior._sum.settledValue ?? new Prisma.Decimal(0);
+        const observation = trustworthy
+          ? reservation.metric === "SPEND" && settledCost
+            ? settledCost
+            : terminalValue(reservation.metric, usage)
+          : reservation.reservedValue;
+        const delta =
+          terminal.revisionKind === "SNAPSHOT"
+            ? observation.minus(priorTotal)
+            : trustworthy
+              ? observation
+              : priorTotal.lessThan(reservation.reservedValue)
+                ? reservation.reservedValue.minus(priorTotal)
+                : new Prisma.Decimal(0);
+        const desiredTotal = priorTotal.plus(delta);
+        if (desiredTotal.isNegative())
+          throw new ProviderBudgetConfigurationError("Accounting correction underflows zero");
+        await tx.providerBudgetSettlement.create({
+          data: {
+            userId: terminal.userId,
+            providerAccountId: anchor.providerAccountId,
+            providerModelId: anchor.providerModelId,
+            credentialId: anchor.credentialId,
+            poolId: anchor.poolId,
+            requestId: anchor.requestId,
+            reservationId: reservation.id,
+            attemptId: terminal.attemptId,
+            fencingToken: terminal.fencingToken,
+            sourceVersion,
+            revisionSequence: terminal.revisionSequence,
+            revisionKind: terminal.revisionKind,
+            payloadHash,
+            sourceUsageAccountingVersion,
+            accountingVersion: anchor.accountingVersion,
+            pricingVersion: anchor.pricingVersion,
+            settledValue: delta,
+            currency: reservation.metric === "SPEND" ? reservation.currency : null,
+            confidence:
+              trustworthy && reservation.metric === "SPEND"
+                ? suppliedCostConfidence
+                : trustworthy
+                  ? (usage?.confidence ?? "ESTIMATED")
+                  : "ESTIMATED",
+            reason: terminal.reason,
+          },
+        });
+        if (reservation.state === "RESERVED")
+          await tx.providerBudgetReservation.update({
+            where: { id: reservation.id },
+            data: { state: "SETTLED", settledValue: desiredTotal, settledAt: new Date() },
+          });
+      }
+
+      await tx.providerUsageLedger.create({
         data: {
           userId: terminal.userId,
           providerAccountId: anchor.providerAccountId,
           providerModelId: anchor.providerModelId,
           credentialId: anchor.credentialId,
+          reservationId: reservations[0]?.id,
           poolId: anchor.poolId,
           requestId: anchor.requestId,
-          reservationId: reservation.id,
           attemptId: terminal.attemptId,
           fencingToken: terminal.fencingToken,
+          inputTokens: usage?.inputTokens,
+          outputTokens: usage?.outputTokens,
+          cacheReadTokens: usage?.cacheReadTokens,
+          cacheWriteTokens: usage?.cacheWriteTokens,
+          reasoningTokens: usage?.reasoningTokens,
+          toolTokens: usage?.toolTokens,
+          additionalBillableTokens: usage?.additionalBillableTokens,
+          authoritativeBillableTokens: usage?.authoritativeBillableTokens,
+          reportedTotalTokens: usage?.reportedTotalTokens,
+          billableTotal: accountingMatches ? billableTotal : undefined,
+          categoriesComplete: usage?.categoriesComplete,
+          observationComplete,
+          rawUsage: usage?.rawUsage,
+          reportedCost: usage?.reportedCost,
+          reportedCostCurrency: reportedCurrency,
+          reportedCostPricingVersion: reportedPricingVersion,
+          reportedCostSource:
+            usage?.reportedCost === undefined
+              ? undefined
+              : normalizedVersion(usage.reportedCostSource ?? usageSource, "reportedCostSource"),
+          calculatedCost: usage?.calculatedCost,
+          calculatedCostCurrency: calculatedCurrency,
+          calculatedCostPricingVersion: calculatedPricingVersion,
+          calculatedCostSource:
+            usage?.calculatedCost === undefined
+              ? undefined
+              : normalizedVersion(
+                  usage.calculatedCostSource ?? usageSource,
+                  "calculatedCostSource",
+                ),
+          settledCost,
+          currency: anchor.liabilityCurrency,
+          pricingVersion: anchor.pricingVersion,
+          sourceUsageAccountingVersion,
+          accountingVersion: anchor.accountingVersion,
           sourceVersion,
           revisionSequence: terminal.revisionSequence,
           revisionKind: terminal.revisionKind,
           payloadHash,
-          sourceUsageAccountingVersion,
-          accountingVersion: anchor.accountingVersion,
-          pricingVersion: anchor.pricingVersion,
-          settledValue: delta,
-          currency: reservation.metric === "SPEND" ? reservation.currency : null,
-          confidence:
-            trustworthy && reservation.metric === "SPEND"
-              ? suppliedCostConfidence
-              : trustworthy
-                ? (usage?.confidence ?? "ESTIMATED")
-                : "ESTIMATED",
-          reason: terminal.reason,
+          usageSource,
+          usageKnown: Boolean(
+            accountingMatches && observationComplete === true && billableTotal !== undefined,
+          ),
+          costKnown,
+          terminalReason: terminal.reason,
+          confidence: costKnown
+            ? suppliedCostConfidence
+            : accountingMatches
+              ? (usage?.confidence ?? "ESTIMATED")
+              : "ESTIMATED",
         },
       });
-      if (reservation.state === "RESERVED")
-        await tx.providerBudgetReservation.update({
-          where: { id: reservation.id },
-          data: { state: "SETTLED", settledValue: desiredTotal, settledAt: new Date() },
-        });
-    }
-
-    await tx.providerUsageLedger.create({
-      data: {
-        userId: terminal.userId,
-        providerAccountId: anchor.providerAccountId,
-        providerModelId: anchor.providerModelId,
-        credentialId: anchor.credentialId,
-        reservationId: reservations[0]?.id,
-        poolId: anchor.poolId,
-        requestId: anchor.requestId,
-        attemptId: terminal.attemptId,
-        fencingToken: terminal.fencingToken,
-        inputTokens: usage?.inputTokens,
-        outputTokens: usage?.outputTokens,
-        cacheReadTokens: usage?.cacheReadTokens,
-        cacheWriteTokens: usage?.cacheWriteTokens,
-        reasoningTokens: usage?.reasoningTokens,
-        toolTokens: usage?.toolTokens,
-        additionalBillableTokens: usage?.additionalBillableTokens,
-        authoritativeBillableTokens: usage?.authoritativeBillableTokens,
-        reportedTotalTokens: usage?.reportedTotalTokens,
-        billableTotal: accountingMatches ? billableTotal : undefined,
-        categoriesComplete: usage?.categoriesComplete,
-        observationComplete,
-        rawUsage: usage?.rawUsage,
-        reportedCost: usage?.reportedCost,
-        reportedCostCurrency: reportedCurrency,
-        reportedCostPricingVersion: reportedPricingVersion,
-        reportedCostSource:
-          usage?.reportedCost === undefined
-            ? undefined
-            : normalizedVersion(usage.reportedCostSource ?? usageSource, "reportedCostSource"),
-        calculatedCost: usage?.calculatedCost,
-        calculatedCostCurrency: calculatedCurrency,
-        calculatedCostPricingVersion: calculatedPricingVersion,
-        calculatedCostSource:
-          usage?.calculatedCost === undefined
-            ? undefined
-            : normalizedVersion(usage.calculatedCostSource ?? usageSource, "calculatedCostSource"),
-        settledCost,
-        currency: anchor.liabilityCurrency,
-        pricingVersion: anchor.pricingVersion,
-        sourceUsageAccountingVersion,
-        accountingVersion: anchor.accountingVersion,
-        sourceVersion,
-        revisionSequence: terminal.revisionSequence,
-        revisionKind: terminal.revisionKind,
-        payloadHash,
-        usageSource,
-        usageKnown: Boolean(
-          accountingMatches && observationComplete === true && billableTotal !== undefined,
-        ),
-        costKnown,
-        terminalReason: terminal.reason,
-        confidence: costKnown
-          ? suppliedCostConfidence
-          : accountingMatches
-            ? (usage?.confidence ?? "ESTIMATED")
-            : "ESTIMATED",
-      },
-    });
-    if (terminalPersistenceTestFailure?.() === "SIMULATE_LEGACY_SPLIT") return;
-    await finalizeNonCrashAnchor();
-    await expireCrashAnchor();
-  });
+      if (terminalPersistenceTestFailure?.() === "SIMULATE_LEGACY_SPLIT") return;
+      await finalizeNonCrashAnchor();
+      await expireCrashAnchor();
+    }),
+  );
 }
 
 /** Crash repair is conservative: expired liability is settled, never silently refunded. */

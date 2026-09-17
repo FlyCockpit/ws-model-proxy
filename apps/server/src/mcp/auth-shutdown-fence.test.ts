@@ -12,8 +12,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * verification, real DPoP binding, and the REAL Better Auth
  * `reserveVerificationValue` implementation — backed by a FENCED prisma
  * adapter around a mocked client (the exact production seam: the shared
- * auth instance's database is `prismaAdapter(withAuthDbShutdownFence(...))`
- * and the admission gate's onClosed arms the fence). No real database,
+ * client from @ws-model-proxy/db is wrapped by withDbShutdownFence at
+ * construction — packages/db/src/index.ts — and the admission gate's
+ * onClosed arms that ONE fence; this test wraps the mocked client with the
+ * SAME wrapper). No real database,
  * network issuer, or production credential is used; the JWKS fetch is an
  * injected in-process response. This mirrors the R59/R60 probes that
  * demonstrated `jwks:start → gate:drained → prisma:disconnect →
@@ -53,13 +55,17 @@ vi.mock("@ws-model-proxy/db", async () => {
 });
 
 import {
-  AuthDbShutdownFenceError,
   armAuthDbShutdownFence,
   disarmAuthDbShutdownFence,
-  isAuthDbShutdownFenceArmed,
-  withAuthDbShutdownFence,
 } from "@ws-model-proxy/auth/auth-db-shutdown-fence";
 import prismaDefault from "@ws-model-proxy/db";
+import {
+  armDbShutdownFence,
+  DbShutdownFenceError,
+  disarmDbShutdownFence,
+  isDbShutdownFenceArmed,
+  withDbShutdownFence,
+} from "@ws-model-proxy/db/shutdown-fence";
 import type { DeepMockProxy } from "vitest-mock-extended";
 import { createMcpAdmissionGate } from "./admission";
 import { createMcpRequestHandler, type McpAuthPrisma, type McpTransport } from "./auth";
@@ -87,7 +93,7 @@ function buildFencedAuthInstance() {
   return betterAuth({
     baseURL: BASE,
     secret: "fence-test-secret-at-least-thirty-two-characters",
-    database: prismaAdapter(withAuthDbShutdownFence(prisma), { provider: "postgresql" }),
+    database: prismaAdapter(withDbShutdownFence(prisma), { provider: "postgresql" }),
     logger: { disabled: true },
   });
 }
@@ -176,7 +182,7 @@ function mountHandler(
 let errorSpy: ReturnType<typeof vi.spyOn>;
 
 beforeEach(() => {
-  disarmAuthDbShutdownFence();
+  disarmDbShutdownFence();
   errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
   // Grant lookup misses (post-verification admission denial → 403) — the
   // verifier-side replay reservation is what these tests observe.
@@ -187,6 +193,8 @@ afterEach(() => {
   errorSpy.mockRestore();
   vi.unstubAllGlobals();
   vi.clearAllMocks();
+  // The PART F compatibility surface (packages/auth delegation) drives the
+  // same seam — using it here pins that the delegation still disarms.
   disarmAuthDbShutdownFence();
 });
 
@@ -197,12 +205,12 @@ describe("F8 pass 5 — DB-seam fence + shadow-awaited release (real requireMcpA
       "fetch",
       vi.fn(async () => jwksResponse()),
     );
-    const gate = createMcpAdmissionGate({ onClosed: armAuthDbShutdownFence });
+    const gate = createMcpAdmissionGate({ onClosed: armDbShutdownFence });
     const { request } = mountHandler(buildFencedAuthInstance(), gate);
     const res = await request(token, proof);
     // The fence never armed and the verification insert EXECUTED (mocked
     // client observed it) — the fence is transparent in normal operation.
-    expect(isAuthDbShutdownFenceArmed()).toBe(false);
+    expect(isDbShutdownFenceArmed()).toBe(false);
     expect(prisma.verification.create).toHaveBeenCalled();
     expect(res.status).toBe(403); // mocked grant lookup misses post-verification
     expect(gate.outstanding).toBe(0);
@@ -217,6 +225,8 @@ describe("F8 pass 5 — DB-seam fence + shadow-awaited release (real requireMcpA
     const fetchMock = vi.fn(async () => jwksPending);
     vi.stubGlobal("fetch", fetchMock);
     const events: string[] = [];
+    // The PART F compatibility arm (packages/auth delegation → the ONE
+    // db-seam fence state): production app.ts wiring, exercised here.
     const gate = createMcpAdmissionGate({ onClosed: armAuthDbShutdownFence });
     const { request } = mountHandler(buildFencedAuthInstance(), gate, {
       abortShadowAwaitMs: 60_000,
@@ -231,7 +241,7 @@ describe("F8 pass 5 — DB-seam fence + shadow-awaited release (real requireMcpA
     const res = await pending;
     expect(res.status).toBe(499);
     expect(res.headers.get("x-ratelimit-limit")).toBe("120");
-    expect(isAuthDbShutdownFenceArmed()).toBe(true);
+    expect(isDbShutdownFenceArmed()).toBe(true);
     expect(gate.outstanding).toBe(1);
     events.push("prisma:disconnect");
     // The JWKS fetch resolves: the stray verifier continuation resumes,
@@ -247,7 +257,7 @@ describe("F8 pass 5 — DB-seam fence + shadow-awaited release (real requireMcpA
     const fenceLines = errorSpy.mock.calls
       .flat()
       .map(String)
-      .filter((line: string) => line.includes("shutdown fence rejected database operation"));
+      .filter((line: string) => line.includes("fence rejected database operation"));
     expect(fenceLines.length).toBeGreaterThanOrEqual(1);
     // Release happened AFTER the disconnect marker (the permit was held
     // across the entire stray-continuation lifetime).
@@ -275,7 +285,7 @@ describe("F8 pass 5 — DB-seam fence + shadow-awaited release (real requireMcpA
       events.push("verification:create-start");
       return insertPending;
     });
-    const gate = createMcpAdmissionGate({ onClosed: armAuthDbShutdownFence });
+    const gate = createMcpAdmissionGate({ onClosed: armDbShutdownFence });
     const { request } = mountHandler(buildFencedAuthInstance(), gate, {
       abortShadowAwaitMs: 60_000,
     });
@@ -297,7 +307,7 @@ describe("F8 pass 5 — DB-seam fence + shadow-awaited release (real requireMcpA
       errorSpy.mock.calls
         .flat()
         .map(String)
-        .some((line: string) => line.includes("shutdown fence rejected database operation")),
+        .some((line: string) => line.includes("fence rejected database operation")),
     ).toBe(true);
   });
 
@@ -305,7 +315,7 @@ describe("F8 pass 5 — DB-seam fence + shadow-awaited release (real requireMcpA
     const { token, proof } = signedCredentials("hung-jwks");
     const fetchMock = vi.fn(async () => new Promise<Response>(() => {}));
     vi.stubGlobal("fetch", fetchMock);
-    const gate = createMcpAdmissionGate({ onClosed: armAuthDbShutdownFence });
+    const gate = createMcpAdmissionGate({ onClosed: armDbShutdownFence });
     const { request } = mountHandler(buildFencedAuthInstance(), gate, {
       abortShadowAwaitMs: 40,
     });
@@ -325,14 +335,14 @@ describe("F8 pass 5 — DB-seam fence + shadow-awaited release (real requireMcpA
     ).toBe(true);
     // The DB fence stays armed: the residual hanging continuation can never
     // touch the database if the fetch ever does settle later.
-    expect(isAuthDbShutdownFenceArmed()).toBe(true);
+    expect(isDbShutdownFenceArmed()).toBe(true);
   });
 
   it("the fence error is the dedicated sentinel (distinguishable in upstream catch paths)", () => {
     const client = { row: { findFirst: vi.fn(async (_args: unknown) => null) } };
-    const wrapped = withAuthDbShutdownFence(client);
-    armAuthDbShutdownFence();
-    expect(() => wrapped.row.findFirst({})).toThrow(AuthDbShutdownFenceError);
+    const wrapped = withDbShutdownFence(client);
+    armDbShutdownFence();
+    expect(() => wrapped.row.findFirst({})).toThrow(DbShutdownFenceError);
     expect(client.row.findFirst).not.toHaveBeenCalled();
   });
 });

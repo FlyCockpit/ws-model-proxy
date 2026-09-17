@@ -161,6 +161,34 @@ export function startRelayAttempt({
 }): RelayAttempt {
   const started = deferred<RelayAttemptStarted>();
   const terminal = deferred<RelayAttemptTerminal>();
+
+  // G1: synchronous entry check. An ALREADY-aborted signal must start NO
+  // work — no handler registration, no relay dispatch, no abort listener
+  // (registering one on an aborted signal never fires, leaking it), no
+  // timeout. The attempt settles immediately as cancelled; callers that
+  // await `started` observe the rejection through their own catch paths.
+  if (abortSignal?.aborted) {
+    started.reject(new Error("cancelled"));
+    terminal.resolve({
+      ok: false,
+      failure: "cancelled",
+      httpStatusCode: 499,
+      upstreamStatusCode: null,
+      usage: null,
+      metrics: null,
+      responseBytes: 0,
+      requestBytes: 0,
+    });
+    return {
+      requestId,
+      started: started.promise,
+      terminal: terminal.promise,
+      cancel() {
+        // Nothing was dispatched; nothing to cancel.
+      },
+    };
+  }
+
   let responseController: ReadableStreamDefaultController<Uint8Array> | null = null;
   let upstreamStatusCode: number | null = null;
   let terminalSettled = false;

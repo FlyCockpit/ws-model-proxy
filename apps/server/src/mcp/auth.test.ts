@@ -54,6 +54,17 @@ vi.mock("@ws-model-proxy/db", async () => {
   return { default: mockDeep() };
 });
 
+// Phase 5: createMcpRequestHandler's graph (via handler.ts's default tool
+// registration) reaches the API routers, whose mailer chain validates
+// @ws-model-proxy/env/shared. Mock it like the other suites do.
+vi.mock("@ws-model-proxy/env/shared", () => ({
+  env: {
+    BETTER_AUTH_SECRET: "decision-test-secret-at-least-thirty-two-characters",
+    DATABASE_URL: "postgresql://auth-decision-test",
+    NODE_ENV: "test",
+  },
+}));
+
 const upstreamState = vi.hoisted(() => ({
   claims: {} as Record<string, unknown>,
   capturedOpts: null as Record<string, unknown> | null,
@@ -64,26 +75,35 @@ const upstreamState = vi.hoisted(() => ({
     | null,
 }));
 
-vi.mock("@better-auth/mcp", () => ({
-  requireMcpAuth: vi.fn(
-    (
-      _auth: unknown,
-      handler: (request: Request, claims: Record<string, unknown>) => Promise<Response>,
-      opts: Record<string, unknown>,
-    ) => {
-      upstreamState.handler = handler;
-      upstreamState.capturedOpts = opts;
-      return async (req: Request) => {
-        if (!upstreamState.handler) throw new Error("handler not captured");
-        if (upstreamState.failWrapper !== null) {
-          throw upstreamState.failWrapper;
-        }
-        upstreamState.receivedRequest = req;
-        return upstreamState.handler(req, upstreamState.claims);
-      };
-    },
-  ),
-}));
+vi.mock("@better-auth/mcp", async (importOriginal) => {
+  // Phase 5: the tool manifest's router graph reaches
+  // @ws-model-proxy/auth's plugin chain, which imports the REAL `mcp`
+  // plugin factory at module scope (it registers the OAuth provider plugin
+  // the auth instance requires). Keep the real factory; only the request
+  // verifier is replaced below.
+  const actual = await importOriginal<typeof import("@better-auth/mcp")>();
+  return {
+    ...actual,
+    requireMcpAuth: vi.fn(
+      (
+        _auth: unknown,
+        handler: (request: Request, claims: Record<string, unknown>) => Promise<Response>,
+        opts: Record<string, unknown>,
+      ) => {
+        upstreamState.handler = handler;
+        upstreamState.capturedOpts = opts;
+        return async (req: Request) => {
+          if (!upstreamState.handler) throw new Error("handler not captured");
+          if (upstreamState.failWrapper !== null) {
+            throw upstreamState.failWrapper;
+          }
+          upstreamState.receivedRequest = req;
+          return upstreamState.handler(req, upstreamState.claims);
+        };
+      },
+    ),
+  };
+});
 
 import { createMcpAdmissionGate } from "./admission";
 import {

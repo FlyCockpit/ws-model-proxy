@@ -182,6 +182,14 @@ export function extractPresentedCredential(
 export interface McpVerifiedRequest {
   authInfo: AuthInfo;
   orpcContext: McpContext;
+  /** Route request id for correlation (Phase 5: tool dispatch binding + logs). */
+  requestId: string;
+  /**
+   * The OWNED admission signal (Part G pass 2, G1): tool dispatch races and
+   * fences procedure calls and diagnostic cores on it, so client aborts and
+   * gate.close() tear down a running tool's work.
+   */
+  signal: AbortSignal;
 }
 
 /**
@@ -814,13 +822,19 @@ async function handleVerifiedRequest({
     user,
     expiresAt: new Date((expiresAt ?? Math.floor(now().getTime() / 1000) + 60) * 1000),
     now: now(),
-    services: options.services,
+    // G1: thread the request's OWNED admission signal into the services so
+    // procedures with external side effects (the credential test's HTTPS
+    // probe) can refuse to START work once the caller aborted. The signal
+    // is the permit controller's own — never the presented token.
+    services: { ...options.services, signal },
   });
 
-  // Verified-request seam: Phase 5's tool wrappers consume the oRPC context
-  // here (createRouterClient per request). The synthetic session NEVER
-  // carries the access token (pinned by tests).
-  options.onVerified?.({ authInfo, orpcContext });
+  // Verified-request seam (Phase 5): the tool dispatch binding consumes the
+  // oRPC context here (app.ts wires bindMcpToolDispatch — one router client
+  // per request is created from it when the transport factory registers
+  // tools). The synthetic session NEVER carries the access token (pinned by
+  // tests).
+  options.onVerified?.({ authInfo, orpcContext, requestId, signal });
 
   return options.transport.fetch(request, { authInfo });
 }

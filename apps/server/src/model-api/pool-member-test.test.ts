@@ -8,6 +8,15 @@ vi.mock("@ws-model-proxy/db", async () => {
   return { default: mockDeep() };
 });
 
+// pool-member-test.ts now delegates to the extracted diagnostics core, whose
+// module graph includes routes.ts (the chat-test completions handler). That
+// chain reads env.BETTER_AUTH_SECRET via @ws-model-proxy/db/forwarder-security
+// and pulls @ws-model-proxy/env/server validation. Mock env so no real
+// validation runs (same pattern as chat-test.test.ts).
+vi.mock("@ws-model-proxy/env/server", () => ({
+  env: { BETTER_AUTH_SECRET: "test-better-auth-secret-value-32chars!" },
+}));
+
 const { createPoolMemberTestRoutes, isSuccessfulChatProbeReply } = await import(
   "./pool-member-test.js"
 );

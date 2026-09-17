@@ -284,30 +284,42 @@ describe("capacity admission runtime", () => {
     expect(acquire).toHaveBeenCalledTimes(2);
   });
 
-  it("cancels immediately when aborted during a database-clock retry delay", async () => {
-    vi.useFakeTimers();
-    try {
-      const controller = new AbortController();
-      const terminalizeAttempt = vi
-        .fn()
-        .mockResolvedValueOnce({ state: "WAITING", requestId: "request" })
-        .mockResolvedValueOnce({ state: "CANCELLED" });
-      const deadlineAt = new Date(Date.now() + 60_000);
-      const runtime = new StoreCapacityAdmissionRuntime(
-        {
-          acquire: vi.fn().mockResolvedValue({ state: "WAITING", requestId: "request" }),
-          release: vi.fn(),
-          heartbeat: vi.fn(),
-          terminalizeAttempt,
-          reclaimExpired: vi.fn(),
-        },
-        10_000,
-        5_000,
-        undefined,
-        () => deadlineAt.getTime() + 60_000,
-      );
-
-      const result = runtime.acquire(
+  it("releases a raced-and-won lease when the acquisition throws (catch boundary, G2n pass 5)", async () => {
+    // The R69/R70 probe: initial WAITING, the poll aborts and throws, and
+    // terminalizeAttempt returns ADMITTED with an ACTIVE lease (admission
+    // won the race under the same capacity locks). The catch boundary must
+    // RELEASE that lease before rethrowing — mirroring the normal branches
+    // — or the slot leaks until reclamation.
+    const controller = new AbortController();
+    const lease = {
+      leaseId: "raced-lease",
+      attemptId: "attempt",
+      capacityId: "capacity",
+      executionTargetId: "target",
+      fencingToken: 3n,
+      expiresAt: new Date(Date.now() + 30_000),
+    };
+    const pollFailure = new Error("poll aborted");
+    const release = vi.fn().mockResolvedValue(true);
+    const terminalizeAttempt = vi.fn().mockResolvedValue({ state: "ADMITTED", lease });
+    const runtime = new StoreCapacityAdmissionRuntime(
+      {
+        acquire: vi
+          .fn()
+          .mockResolvedValueOnce({ state: "WAITING", requestId: "request" })
+          .mockImplementationOnce(async () => {
+            controller.abort();
+            throw pollFailure;
+          }),
+        release,
+        heartbeat: vi.fn(),
+        terminalizeAttempt,
+        reclaimExpired: vi.fn(),
+      },
+      1,
+    );
+    await expect(
+      runtime.acquire(
         {
           requestId: "request",
           attemptId: "attempt",
@@ -315,20 +327,47 @@ describe("capacity admission runtime", () => {
           sourceKind: "DIRECT",
           basePriority: 16,
           connectionOwner: "server",
-          deadlineAt,
+          deadlineAt: new Date(Date.now() + 60_000),
           candidates: [{ capacityId: "capacity", executionTargetId: "target", candidateOrder: 0 }],
         },
         controller.signal,
-      );
-      await vi.advanceTimersByTimeAsync(0);
-      expect(terminalizeAttempt).toHaveBeenCalledWith("attempt", "EXPIRED");
+      ),
+    ).rejects.toBe(pollFailure);
+    expect(terminalizeAttempt).toHaveBeenCalledWith("attempt", "CANCELLED");
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(release).toHaveBeenCalledWith(lease);
+  });
 
-      controller.abort();
-      await expect(result).resolves.toEqual({ state: "CANCELLED" });
-      expect(terminalizeAttempt).toHaveBeenLastCalledWith("attempt", "CANCELLED");
-      expect(vi.getTimerCount()).toBe(0);
-    } finally {
-      vi.useRealTimers();
-    }
+  it("a maintain() failure is inside the acquisition-failure boundary: the attempt still terminalizes (G2n pass 5)", async () => {
+    // maintain() previously sat OUTSIDE the try — a sweep failure escaped
+    // without terminalizing a persisted WAITING attempt. The boundary is
+    // now unconditional over the acquisition flow (maintain + poll).
+    const maintainFailure = new Error("sweep failed");
+    const terminalizeAttempt = vi.fn().mockResolvedValue({ state: "EXPIRED" });
+    const runtime = new StoreCapacityAdmissionRuntime(
+      {
+        acquire: vi.fn().mockResolvedValue({ state: "WAITING", requestId: "request" }),
+        release: vi.fn(),
+        heartbeat: vi.fn(),
+        terminalizeAttempt,
+        reclaimExpired: vi.fn(),
+        sweepAbandoned: vi.fn().mockRejectedValue(maintainFailure),
+      },
+      1,
+    );
+    await expect(
+      runtime.acquire({
+        requestId: "request",
+        attemptId: "attempt",
+        ownerId: "owner",
+        sourceKind: "DIRECT",
+        basePriority: 16,
+        connectionOwner: "server",
+        deadlineAt: new Date(Date.now() + 60_000),
+        candidates: [{ capacityId: "capacity", executionTargetId: "target", candidateOrder: 0 }],
+      }),
+    ).rejects.toBe(maintainFailure);
+    // No signal abort → the catch terminal state is EXPIRED.
+    expect(terminalizeAttempt).toHaveBeenCalledWith("attempt", "EXPIRED");
   });
 });

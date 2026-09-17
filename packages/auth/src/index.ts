@@ -17,7 +17,6 @@ import { prismaAdapter } from "better-auth/adapters/prisma";
 import { admin, deviceAuthorization, twoFactor } from "better-auth/plugins";
 import { z } from "zod";
 import { sanitizedApiErrorLogLine } from "./api-error-logging";
-import { withAuthDbShutdownFence } from "./auth-db-shutdown-fence";
 import { resolveAuthLogCall } from "./auth-logger-bridge";
 import { resolveMcpPlugins } from "./mcp-plugins";
 import { resolveSignupLocale } from "./signup-locale";
@@ -87,15 +86,19 @@ async function resolveUniqueUserSlug({
 
 export const auth = betterAuth({
   database: prismaAdapter(
-    // DB-seam shutdown fence (Part F pass 5, F8 reopened): transparent
-    // wrapper — while INACTIVE every operation passes through unchanged;
-    // once the MCP shutdown gate closes (apps/server/src/app.ts wires the
-    // gate's onClosed into armAuthDbShutdownFence), any NEW database
-    // operation initiated by any continuation of this auth instance
-    // (including the un-cancellable requireMcpAuth verifier continuations
-    // doing DPoP replay reservations) rejects immediately. See
-    // ./auth-db-shutdown-fence.ts for the full rationale.
-    withAuthDbShutdownFence(prisma),
+    // The shared client from @ws-model-proxy/db is ALREADY wrapped by the
+    // db-seam shutdown fence (Part G pass 2, G1): the fence now covers BOTH
+    // better-auth's adapter operations AND the direct procedure/diagnostic
+    // calls every other consumer of the ONE shared client makes. Once the
+    // MCP shutdown gate closes (apps/server/src/app.ts wires the gate's
+    // onClosed into armAuthDbShutdownFence — a thin delegation to
+    // armDbShutdownFence), any NEW database operation initiated by any
+    // continuation of this auth instance (including the un-cancellable
+    // requireMcpAuth verifier continuations doing DPoP replay
+    // reservations) rejects immediately. See
+    // @ws-model-proxy/db/shutdown-fence for the full rationale. There is
+    // deliberately NO second wrapper here (no double-wrapping).
+    prisma,
     {
       provider: "postgresql",
     },
