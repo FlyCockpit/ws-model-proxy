@@ -56,6 +56,7 @@ import {
   mcpIpLimiter,
   mcpMethodGate,
 } from "./mcp-rate-limit.js";
+import { createMcpWebPageGate } from "./mcp-web-page-gate.js";
 import { mediaAdminGate } from "./media/admin-gate.js";
 import { createSameOriginGuard } from "./media/csrf-guard.js";
 import {
@@ -408,6 +409,21 @@ export async function createApp(options: CreateAppOptions = {}) {
       }),
     );
   }
+
+  // MCP web login/consent pages (Phase 6): while WMP_MCP_ENABLED is off, the
+  // valid-locale forms of /:lang/mcp-login and /:lang/mcp-consent return a
+  // REAL 404 here — mounted in the SAME pre-CORS/pre-global-body-limit block
+  // as the discovery aliases (the L23 ordering lesson: later blocks answer
+  // OPTIONS with 204 and oversized POSTs with 413, so the gate must own every
+  // method itself) and far ahead of the oRPC catch-all, static assets, and
+  // SSR, so a flag-off request can never fall through to the SPA shell. The
+  // gate matches EXACT raw pathnames of supported locales only
+  // (mcp-web-page-gate.ts): near-miss locale forms keep the normal
+  // redirect-to-default-locale handling. While enabled it is a pass-through;
+  // the routes' own beforeLoad ALSO throws notFound() from the server-runtime
+  // flag (apps/web/src/server/mcp-availability.ts), so both the HTTP and the
+  // router boundary stay gated.
+  app.use("/*", createMcpWebPageGate({ enabled: () => env.WMP_MCP_ENABLED === true }));
 
   // /mcp — the MCP JSON-RPC transport (Phase 4), mounted in the SAME
   // pre-CORS/pre-global-body-limit block as the discovery aliases so the

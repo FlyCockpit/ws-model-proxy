@@ -16,6 +16,8 @@ import { Route as LangAuthRouteImport } from './routes/$lang/_auth'
 import { Route as LangAdminRouteImport } from './routes/$lang/admin'
 import { Route as LangDeviceRouteImport } from './routes/$lang/device'
 import { Route as LangLoginRouteImport } from './routes/$lang/login'
+import { Route as LangMcpConsentRouteImport } from './routes/$lang/mcp-consent'
+import { Route as LangMcpLoginRouteImport } from './routes/$lang/mcp-login'
 import { Route as LangSignupRouteImport } from './routes/$lang/signup'
 import { Route as LangVerifyEmailRouteImport } from './routes/$lang/verify-email'
 import { Route as LangAuthDashboardRouteImport } from './routes/$lang/_auth/dashboard'
@@ -77,6 +79,16 @@ const LangDeviceRoute = LangDeviceRouteImport.update({
 const LangLoginRoute = LangLoginRouteImport.update({
   id: '/login',
   path: '/login',
+  getParentRoute: () => LangRoute,
+} as any)
+const LangMcpConsentRoute = LangMcpConsentRouteImport.update({
+  id: '/mcp-consent',
+  path: '/mcp-consent',
+  getParentRoute: () => LangRoute,
+} as any)
+const LangMcpLoginRoute = LangMcpLoginRouteImport.update({
+  id: '/mcp-login',
+  path: '/mcp-login',
   getParentRoute: () => LangRoute,
 } as any)
 const LangSignupRoute = LangSignupRouteImport.update({
@@ -241,6 +253,8 @@ export interface FileRoutesByFullPath {
   '/$lang/admin': typeof LangAdminRouteWithChildren
   '/$lang/device': typeof LangDeviceRoute
   '/$lang/login': typeof LangLoginRoute
+  '/$lang/mcp-consent': typeof LangMcpConsentRoute
+  '/$lang/mcp-login': typeof LangMcpLoginRoute
   '/$lang/signup': typeof LangSignupRoute
   '/$lang/verify-email': typeof LangVerifyEmailRoute
   '/$lang/': typeof LangIndexRoute
@@ -276,6 +290,8 @@ export interface FileRoutesByTo {
   '/$lang': typeof LangIndexRoute
   '/$lang/device': typeof LangDeviceRoute
   '/$lang/login': typeof LangLoginRoute
+  '/$lang/mcp-consent': typeof LangMcpConsentRoute
+  '/$lang/mcp-login': typeof LangMcpLoginRoute
   '/$lang/signup': typeof LangSignupRoute
   '/$lang/verify-email': typeof LangVerifyEmailRoute
   '/$lang/admin/devices': typeof LangAdminDevicesRoute
@@ -309,6 +325,8 @@ export interface FileRoutesById {
   '/$lang/admin': typeof LangAdminRouteWithChildren
   '/$lang/device': typeof LangDeviceRoute
   '/$lang/login': typeof LangLoginRoute
+  '/$lang/mcp-consent': typeof LangMcpConsentRoute
+  '/$lang/mcp-login': typeof LangMcpLoginRoute
   '/$lang/signup': typeof LangSignupRoute
   '/$lang/verify-email': typeof LangVerifyEmailRoute
   '/$lang/': typeof LangIndexRoute
@@ -347,6 +365,8 @@ export interface FileRouteTypes {
     | '/$lang/admin'
     | '/$lang/device'
     | '/$lang/login'
+    | '/$lang/mcp-consent'
+    | '/$lang/mcp-login'
     | '/$lang/signup'
     | '/$lang/verify-email'
     | '/$lang/'
@@ -382,6 +402,8 @@ export interface FileRouteTypes {
     | '/$lang'
     | '/$lang/device'
     | '/$lang/login'
+    | '/$lang/mcp-consent'
+    | '/$lang/mcp-login'
     | '/$lang/signup'
     | '/$lang/verify-email'
     | '/$lang/admin/devices'
@@ -414,6 +436,8 @@ export interface FileRouteTypes {
     | '/$lang/admin'
     | '/$lang/device'
     | '/$lang/login'
+    | '/$lang/mcp-consent'
+    | '/$lang/mcp-login'
     | '/$lang/signup'
     | '/$lang/verify-email'
     | '/$lang/'
@@ -499,6 +523,20 @@ declare module '@tanstack/react-router' {
       path: '/login'
       fullPath: '/$lang/login'
       preLoaderRoute: typeof LangLoginRouteImport
+      parentRoute: typeof LangRoute
+    }
+    '/$lang/mcp-consent': {
+      id: '/$lang/mcp-consent'
+      path: '/mcp-consent'
+      fullPath: '/$lang/mcp-consent'
+      preLoaderRoute: typeof LangMcpConsentRouteImport
+      parentRoute: typeof LangRoute
+    }
+    '/$lang/mcp-login': {
+      id: '/$lang/mcp-login'
+      path: '/mcp-login'
+      fullPath: '/$lang/mcp-login'
+      preLoaderRoute: typeof LangMcpLoginRouteImport
       parentRoute: typeof LangRoute
     }
     '/$lang/signup': {
@@ -826,6 +864,8 @@ interface LangRouteChildren {
   LangAdminRoute: typeof LangAdminRouteWithChildren
   LangDeviceRoute: typeof LangDeviceRoute
   LangLoginRoute: typeof LangLoginRoute
+  LangMcpConsentRoute: typeof LangMcpConsentRoute
+  LangMcpLoginRoute: typeof LangMcpLoginRoute
   LangSignupRoute: typeof LangSignupRoute
   LangVerifyEmailRoute: typeof LangVerifyEmailRoute
   LangIndexRoute: typeof LangIndexRoute
@@ -836,6 +876,8 @@ const LangRouteChildren: LangRouteChildren = {
   LangAdminRoute: LangAdminRouteWithChildren,
   LangDeviceRoute: LangDeviceRoute,
   LangLoginRoute: LangLoginRoute,
+  LangMcpConsentRoute: LangMcpConsentRoute,
+  LangMcpLoginRoute: LangMcpLoginRoute,
   LangSignupRoute: LangSignupRoute,
   LangVerifyEmailRoute: LangVerifyEmailRoute,
   LangIndexRoute: LangIndexRoute,

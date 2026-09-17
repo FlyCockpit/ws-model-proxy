@@ -1,11 +1,8 @@
-import {
-  MCP_CONSENT_PAGE_PATH_DEFAULT,
-  MCP_LOGIN_PAGE_PATH_DEFAULT,
-} from "@ws-model-proxy/auth/mcp-config";
 import { Hono } from "hono";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MCP_WELL_KNOWN_PATHS } from "./mcp-discovery";
 import { MCP_ENDPOINT_PATH } from "./mcp-rate-limit";
+import { MCP_WEB_PAGE_PATHS } from "./mcp-web-page-gate";
 import {
   authRouteLogPath,
   isAuthRoutePath,
@@ -37,14 +34,72 @@ describe("request-log redaction (OAuth query stripping)", () => {
     expect(stripsOAuthQuery("/")).toBe(false);
   });
 
-  it("strips the MCP login/consent PAGES (EXACT equality — signed query carriers)", () => {
-    expect(stripsOAuthQuery(MCP_LOGIN_PAGE_PATH_DEFAULT)).toBe(true);
-    expect(stripsOAuthQuery(MCP_CONSENT_PAGE_PATH_DEFAULT)).toBe(true);
+  it("strips the MCP login/consent PAGES for EVERY supported locale (EXACT equality — signed query carriers)", () => {
+    // Part H pass 2 (R83/R84 F2): the pages exist under every supported
+    // locale, and each spelling carries the signed OAuth query. The set is
+    // SHARED with the web-page gate (single source — the two modules cannot
+    // drift): whatever the gate admits, the logger strips.
+    expect(MCP_WEB_PAGE_PATHS.length).toBeGreaterThanOrEqual(4);
+    for (const path of MCP_WEB_PAGE_PATHS) {
+      expect(stripsOAuthQuery(path)).toBe(true);
+    }
+    // Spot-check both pages in both shipped locales.
+    expect(stripsOAuthQuery("/en-US/mcp-login")).toBe(true);
+    expect(stripsOAuthQuery("/en-US/mcp-consent")).toBe(true);
+    expect(stripsOAuthQuery("/es-MX/mcp-login")).toBe(true);
+    expect(stripsOAuthQuery("/es-MX/mcp-consent")).toBe(true);
     // Near-miss paths keep the stock behavior: exact equality, not prefix.
     expect(stripsOAuthQuery("/en-US/mcp-loginish")).toBe(false);
-    expect(stripsOAuthQuery("/en-US/mcp-login/extra")).toBe(false);
+    expect(stripsOAuthQuery("/es-MX/mcp-login/extra")).toBe(false);
     expect(stripsOAuthQuery("/en-US/mcp-consent-page")).toBe(false);
     expect(stripsOAuthQuery("/en-US/mcp-login/..")).toBe(false);
+    expect(stripsOAuthQuery("/fr-FR/mcp-login")).toBe(false); // unsupported locale
+  });
+
+  it("logger wrapper: EVERY-locale page redirect (es-MX) logs pathname only — redaction is flag-independent", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    // Same wrapper shape as the production request-log middleware: the
+    // stripsOAuthQuery branch runs BEFORE any feature gate, so the query is
+    // stripped with WMP_MCP_ENABLED both on and off (the Spanish sibling of
+    // the en-US regression below).
+    const app = new Hono<{ Variables: { requestId: string } }>();
+    app.use("/*", async (c, next) => {
+      c.set("requestId", "ff001122");
+      await next();
+    });
+    app.use("/*", async (c, next) => {
+      if (stripsOAuthQuery(c.req.path)) {
+        const start = Date.now();
+        await next();
+        console.log(
+          oauthRequestLogLine({
+            requestId: c.get("requestId"),
+            method: c.req.method,
+            path: c.req.path,
+            status: c.res.status,
+            elapsedMs: Date.now() - start,
+          }),
+        );
+        return;
+      }
+      await next();
+      console.log(`[${c.get("requestId")}] stock ${c.req.url}`);
+    });
+    for (const page of ["/es-MX/mcp-login", "/es-MX/mcp-consent"]) {
+      const query = `?client_id=c&state=${encodeURIComponent("st-SECRET-state")}&code_challenge=cc-SECRET&sig=SECRET-sig&ba_param=client_id&ba_param=scope`;
+      // No route handler is mounted for the page itself — any status (404
+      // here) is fine; the request-log wrapper already ran.
+      await app.request(page + query);
+      const lines = logSpy.mock.calls.flat().map(String);
+      expect(lines.some((l) => l.includes(page))).toBe(true);
+      for (const line of lines) {
+        expect(line).not.toContain("?");
+        expect(line).not.toContain("state=");
+        expect(line).not.toContain("sig=");
+        expect(line).not.toContain("SECRET");
+      }
+      logSpy.mockClear();
+    }
   });
 
   it("strips the /mcp endpoint (L20 reopen, F2: exact + trailing-slash; near-misses keep stock)", () => {

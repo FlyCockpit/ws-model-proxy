@@ -67,6 +67,14 @@ export function resolveMcpPlugins({ enabled, baseUrl }: { enabled: boolean; base
       consentPage: MCP_CONSENT_PAGE_PATH_DEFAULT,
       postLogin,
 
+      // Phase 6: allow POST /oauth2/public-client-prelogin to run BEFORE
+      // authentication so the MCP login page can show display-safe client
+      // data. The endpoint still requires a VALID signed `oauth_query`
+      // (publicSessionMiddleware: 400 when the flag is off, 401
+      // invalid_signature when the query fails verification) — the flag only
+      // admits the endpoint, it never validates the caller.
+      allowPublicClientPrelogin: true,
+
       // Scopes this server can mint; registration ceilings below cap what a
       // CIMD client can register as capabilities (defaults + allowed extras).
       // Registration ceilings do NOT replace authorization-request scope

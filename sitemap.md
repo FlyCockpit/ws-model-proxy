@@ -15,6 +15,8 @@ Only indexable content pages belong in `apps/server/src/seo.ts` `PUBLIC_PATHS` f
 | `/{lang}/signup` | Email/password public account creation. The first account can bootstrap even when signup is disabled and becomes admin automatically; later public signups follow the admin-controlled signup setting. Admins can still invite users when public signup is closed. When SMTP is configured, shows a post-signup verification prompt. |
 | `/{lang}/verify-email` | Landing page after Better-Auth validates an email verification token (`?ok=1` / `?error=`). Also offers resend when email delivery is configured. |
 | `/{lang}/device` | OAuth 2.0 device-authorization grant verification for CLI/device login. Reads `?user_code=...`, redirects unauthenticated visitors to login, and requires an explicit approve/deny click. |
+| `/{lang}/mcp-login` | MCP OAuth sign-in page (feature-gated by `WMP_MCP_ENABLED`; real 404 while disabled, and intentionally excluded from SEO discovery). Shares the standard sign-in component and shows display-safe requesting-client data from the signed OAuth transaction; the authenticated branch handles reauthorization after a grant revocation. |
+| `/{lang}/mcp-consent` | MCP OAuth consent page (feature-gated by `WMP_MCP_ENABLED`; real 404 while disabled, and intentionally excluded from SEO discovery). Requires a session, explains requested scopes (read/write and background renewal with 72-hour inactivity expiry, revocable in Settings), and submits accept/deny through the signed OAuth transaction. |
 
 ## Authenticated Routes
 

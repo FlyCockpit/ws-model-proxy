@@ -1,8 +1,5 @@
-import {
-  MCP_CONSENT_PAGE_PATH_DEFAULT,
-  MCP_LOGIN_PAGE_PATH_DEFAULT,
-} from "@ws-model-proxy/auth/mcp-config";
 import { MCP_WELL_KNOWN_PATHS } from "./mcp-discovery.js";
+import { MCP_WEB_PAGE_PATHS } from "./mcp-web-page-gate.js";
 
 /**
  * OAuth request-log redaction (MCP plan invariant 10).
@@ -58,14 +55,26 @@ const ROOT_DISCOVERY_LOG_PATHS = new Set(
 const MCP_ENDPOINT_LOG_PATH = "/mcp";
 const MCP_ENDPOINT_LOG_PATHS = new Set([MCP_ENDPOINT_LOG_PATH, `${MCP_ENDPOINT_LOG_PATH}/`]);
 
+/**
+ * The MCP login/consent PAGES (L20, reopened Part H pass 2 — R83/R84 F2):
+ * the pages exist under EVERY supported locale (`/en-US/mcp-login`,
+ * `/es-MX/mcp-login`, … — the exact set the web-page gate admits, imported
+ * from mcp-web-page-gate.ts so the two modules can never drift), and every
+ * locale spelling carries the SIGNED authorization query in its redirect
+ * URLs. Matched by EXACT pathname equality; near-miss paths like
+ * `/en-US/mcp-loginish` keep the stock logger behavior. This runs in the
+ * request-log wrapper BEFORE any feature gate, so the query stays stripped
+ * with WMP_MCP_ENABLED both on and off.
+ */
+const MCP_WEB_PAGE_LOG_PATHS = new Set(MCP_WEB_PAGE_PATHS);
+
 /** true when the request-log line for this pathname must strip the query. */
 export function stripsOAuthQuery(pathname: string): boolean {
   return (
     pathname.startsWith(OAUTH_LOG_PATH_PREFIX) ||
     ROOT_DISCOVERY_LOG_PATHS.has(pathname) ||
     MCP_ENDPOINT_LOG_PATHS.has(pathname) ||
-    pathname === MCP_LOGIN_PAGE_PATH_DEFAULT ||
-    pathname === MCP_CONSENT_PAGE_PATH_DEFAULT
+    MCP_WEB_PAGE_LOG_PATHS.has(pathname)
   );
 }
 

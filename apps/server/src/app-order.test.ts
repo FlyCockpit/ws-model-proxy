@@ -298,6 +298,34 @@ describe("createApp registration contract — root-alias request-log redaction (
     }
   });
 
+  it.each([
+    ["flag ON", true, "/es-MX/mcp-login"],
+    ["flag OFF (gate 404 — the log wrapper still runs first)", false, "/es-MX/mcp-login"],
+    ["flag ON", true, "/es-MX/mcp-consent"],
+    ["flag OFF (gate 404 — the log wrapper still runs first)", false, "/es-MX/mcp-consent"],
+  ])(
+    "MCP login/consent PAGES: non-default-locale signed query never reaches a log line (%s %s)",
+    async (_label, flag, page) => {
+      // Part H pass 2 (R83/R84 F2): /es-MX/mcp-login and /es-MX/mcp-consent
+      // carry the SIGNED OAuth query; the request-log wrapper runs BEFORE
+      // the availability gate, so the query is stripped in BOTH flag states.
+      const app = await buildApp(flag);
+      const QUERY = `?client_id=c-1&state=st-SECRET-state&code_challenge=cc-SECRET-challenge&sig=SECRET-sig&ba_param=client_id&ba_param=scope`;
+      const res = await app.request(`${BASE}${page}${QUERY}`, { headers: HOST });
+      // flag-on reaches the SSR handler (any status is fine for the log
+      // assertion); flag-off is the gate's 404.
+      if (!flag) expect(res.status).toBe(404);
+      const lines: string[] = logSpy.mock.calls.flat().map(String);
+      expect(lines.some((l) => l.includes(page))).toBe(true);
+      for (const line of lines) {
+        expect(line).not.toContain("?");
+        expect(line).not.toContain("state=");
+        expect(line).not.toContain("code_challenge");
+        expect(line).not.toContain("sig=");
+        expect(line).not.toContain("SECRET");
+      }
+    },
+  );
   it("the FOURTH alias (under /api/auth) logs the TRUNCATED auth path — never the query", async () => {
     const app = await buildApp(true);
     const fourth = "/api/auth/.well-known/oauth-authorization-server";

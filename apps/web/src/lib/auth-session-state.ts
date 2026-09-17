@@ -8,6 +8,18 @@ export type AuthSessionData = {
     twoFactorEnabled?: boolean | null;
     locale?: string | null;
   };
+  /**
+   * The Better Auth session record. `authClient.useSession()`'s data carries
+   * BOTH `user` and `session` at runtime; the id is load-bearing for MCP
+   * grant-generation identity (the reference is HMAC(sessionId, clientId)),
+   * so it is part of the typed surface (Part H pass 3). Optional because the
+   * narrow projection historically omitted it — absent means type drift, and
+   * consumers must fail closed rather than substitute the user id.
+   */
+  session?: {
+    id: string;
+    expiresAt?: string | Date;
+  };
 };
 
 type AuthSessionActions = {
