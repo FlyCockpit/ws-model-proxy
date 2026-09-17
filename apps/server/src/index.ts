@@ -10,6 +10,7 @@ import { WebSocketServer } from "ws";
 import { createApp } from "./app.js";
 import { installBetterCallErrorLogShim } from "./better-call-error-log-shim.js";
 import { runGracefulShutdownSequence } from "./graceful-shutdown.js";
+import { startOauthCleanup } from "./mcp/oauth-cleanup.js";
 import { startMediaCleanup } from "./media/cleanup.js";
 import { startCacheAffinityCleanup } from "./model-api/cache-affinity-runtime.js";
 import {
@@ -120,6 +121,11 @@ const stopProviderAttemptExpiry = providerAttemptExpiryEnabled(
 )
   ? startProviderAttemptExpiry()
   : undefined;
+// OAuth/MCP retention cleanup (Phase 8) — same periodic lifecycle as the
+// jobs above; null when WMP_MCP_ENABLED is off (rollback stops token-data
+// deletion). In-flight runs abort cleanly between batches via the shared DB
+// shutdown fence (see mcp/oauth-cleanup.ts).
+const stopOauthCleanup = startOauthCleanup();
 
 // ---------------------------------------------------------------------------
 // Graceful shutdown — drain in-flight requests, then close dependencies
@@ -140,6 +146,7 @@ async function shutdown(signal: string) {
       stopRelayTelemetryRecovery();
       stopProviderBudgetRepair();
       stopProviderAttemptExpiry?.();
+      stopOauthCleanup?.();
       relaySessionManager.dispose();
       await capacityLifecycle?.close();
     },
