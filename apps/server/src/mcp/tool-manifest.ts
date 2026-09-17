@@ -1179,4 +1179,14 @@ export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
     target: "adminObservability.listRelayMetadataSummaries",
     reason: "Admin-only observability.",
   },
+  {
+    target: "mcpGrants.listMine",
+    reason:
+      "Human-only MCP grant management (Phase 7): a connected MCP client must not enumerate the user's other authorizations.",
+  },
+  {
+    target: "mcpGrants.revokeMine",
+    reason:
+      "Human-only MCP grant revocation (Phase 7): only the browser session may kill grant generations.",
+  },
 ];

@@ -36,6 +36,7 @@ import { Route as LangAuthDashboardModelApiTokensRouteImport } from './routes/$l
 import { Route as LangAuthDashboardPoolsRouteImport } from './routes/$lang/_auth/dashboard/pools'
 import { Route as LangAuthDashboardRelayMetadataRouteImport } from './routes/$lang/_auth/dashboard/relay-metadata'
 import { Route as LangAuthSettingsIndexRouteImport } from './routes/$lang/_auth/settings/index'
+import { Route as LangAuthSettingsMcpRouteImport } from './routes/$lang/_auth/settings/mcp'
 import { Route as LangAuthSettingsSecurityRouteImport } from './routes/$lang/_auth/settings/security'
 import { Route as LangAuthDashboardPoolsIndexRouteImport } from './routes/$lang/_auth/dashboard/pools/index'
 import { Route as LangAuthDashboardPoolsPoolIdRouteImport } from './routes/$lang/_auth/dashboard/pools/$poolId'
@@ -186,6 +187,11 @@ const LangAuthSettingsIndexRoute = LangAuthSettingsIndexRouteImport.update({
   path: '/',
   getParentRoute: () => LangAuthSettingsRoute,
 } as any)
+const LangAuthSettingsMcpRoute = LangAuthSettingsMcpRouteImport.update({
+  id: '/mcp',
+  path: '/mcp',
+  getParentRoute: () => LangAuthSettingsRoute,
+} as any)
 const LangAuthSettingsSecurityRoute =
   LangAuthSettingsSecurityRouteImport.update({
     id: '/security',
@@ -272,6 +278,7 @@ export interface FileRoutesByFullPath {
   '/$lang/dashboard/model-api-tokens': typeof LangAuthDashboardModelApiTokensRoute
   '/$lang/dashboard/pools': typeof LangAuthDashboardPoolsRouteWithChildren
   '/$lang/dashboard/relay-metadata': typeof LangAuthDashboardRelayMetadataRoute
+  '/$lang/settings/mcp': typeof LangAuthSettingsMcpRoute
   '/$lang/settings/security': typeof LangAuthSettingsSecurityRoute
   '/$lang/dashboard/': typeof LangAuthDashboardIndexRoute
   '/$lang/settings/': typeof LangAuthSettingsIndexRoute
@@ -305,6 +312,7 @@ export interface FileRoutesByTo {
   '/$lang/dashboard/clis': typeof LangAuthDashboardClisRoute
   '/$lang/dashboard/model-api-tokens': typeof LangAuthDashboardModelApiTokensRoute
   '/$lang/dashboard/relay-metadata': typeof LangAuthDashboardRelayMetadataRoute
+  '/$lang/settings/mcp': typeof LangAuthSettingsMcpRoute
   '/$lang/settings/security': typeof LangAuthSettingsSecurityRoute
   '/$lang/dashboard': typeof LangAuthDashboardIndexRoute
   '/$lang/settings': typeof LangAuthSettingsIndexRoute
@@ -344,6 +352,7 @@ export interface FileRoutesById {
   '/$lang/_auth/dashboard/model-api-tokens': typeof LangAuthDashboardModelApiTokensRoute
   '/$lang/_auth/dashboard/pools': typeof LangAuthDashboardPoolsRouteWithChildren
   '/$lang/_auth/dashboard/relay-metadata': typeof LangAuthDashboardRelayMetadataRoute
+  '/$lang/_auth/settings/mcp': typeof LangAuthSettingsMcpRoute
   '/$lang/_auth/settings/security': typeof LangAuthSettingsSecurityRoute
   '/$lang/_auth/dashboard/': typeof LangAuthDashboardIndexRoute
   '/$lang/_auth/settings/': typeof LangAuthSettingsIndexRoute
@@ -384,6 +393,7 @@ export interface FileRouteTypes {
     | '/$lang/dashboard/model-api-tokens'
     | '/$lang/dashboard/pools'
     | '/$lang/dashboard/relay-metadata'
+    | '/$lang/settings/mcp'
     | '/$lang/settings/security'
     | '/$lang/dashboard/'
     | '/$lang/settings/'
@@ -417,6 +427,7 @@ export interface FileRouteTypes {
     | '/$lang/dashboard/clis'
     | '/$lang/dashboard/model-api-tokens'
     | '/$lang/dashboard/relay-metadata'
+    | '/$lang/settings/mcp'
     | '/$lang/settings/security'
     | '/$lang/dashboard'
     | '/$lang/settings'
@@ -455,6 +466,7 @@ export interface FileRouteTypes {
     | '/$lang/_auth/dashboard/model-api-tokens'
     | '/$lang/_auth/dashboard/pools'
     | '/$lang/_auth/dashboard/relay-metadata'
+    | '/$lang/_auth/settings/mcp'
     | '/$lang/_auth/settings/security'
     | '/$lang/_auth/dashboard/'
     | '/$lang/_auth/settings/'
@@ -665,6 +677,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LangAuthSettingsIndexRouteImport
       parentRoute: typeof LangAuthSettingsRoute
     }
+    '/$lang/_auth/settings/mcp': {
+      id: '/$lang/_auth/settings/mcp'
+      path: '/mcp'
+      fullPath: '/$lang/settings/mcp'
+      preLoaderRoute: typeof LangAuthSettingsMcpRouteImport
+      parentRoute: typeof LangAuthSettingsRoute
+    }
     '/$lang/_auth/settings/security': {
       id: '/$lang/_auth/settings/security'
       path: '/security'
@@ -813,11 +832,13 @@ const LangAuthDashboardRouteWithChildren =
   LangAuthDashboardRoute._addFileChildren(LangAuthDashboardRouteChildren)
 
 interface LangAuthSettingsRouteChildren {
+  LangAuthSettingsMcpRoute: typeof LangAuthSettingsMcpRoute
   LangAuthSettingsSecurityRoute: typeof LangAuthSettingsSecurityRoute
   LangAuthSettingsIndexRoute: typeof LangAuthSettingsIndexRoute
 }
 
 const LangAuthSettingsRouteChildren: LangAuthSettingsRouteChildren = {
+  LangAuthSettingsMcpRoute: LangAuthSettingsMcpRoute,
   LangAuthSettingsSecurityRoute: LangAuthSettingsSecurityRoute,
   LangAuthSettingsIndexRoute: LangAuthSettingsIndexRoute,
 }

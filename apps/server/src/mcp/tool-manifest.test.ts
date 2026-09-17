@@ -323,6 +323,8 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
       "relayMetadata.deleteOwn",
       "relayMetadata.prune",
       "settings.update",
+      "mcpGrants.listMine",
+      "mcpGrants.revokeMine",
     ]) {
       expect(excluded.has(required)).toBe(true);
     }
@@ -341,6 +343,78 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
     for (const exclusion of MCP_TOOL_EXCLUSIONS) {
       expect(toolTargets).not.toContain(exclusion.target);
     }
+  });
+
+  it("human grant management (Phase 7) stays human-only — provably absent from the tool catalog AND from every dispatch", async () => {
+    // The mcpGrants router is browser-session-only: a connected MCP client
+    // must never enumerate or revoke the user's authorizations. Pin BOTH the
+    // explicit exclusions and an EXECUTABLE dispatch proof: the old
+    // invokeProcedure.toString() inspection could not see the selector
+    // captured inside procedureInvoker's closure (tool-manifest.ts returns
+    // `(client, input) => select(client)(input)`), so swapping a selector to
+    // client.mcpGrants.listMine would have passed it.
+    const toolNames = MCP_TOOL_MANIFEST.map((tool) => tool.name);
+    const toolTargets = MCP_TOOL_MANIFEST.map((tool) => tool.target);
+    for (const leaf of ["mcpGrants.listMine", "mcpGrants.revokeMine"]) {
+      expect(toolTargets).not.toContain(leaf);
+      expect(toolNames).not.toContain(leaf);
+      expect(MCP_TOOL_EXCLUSIONS.map((entry) => entry.target)).toContain(leaf);
+    }
+
+    // Recording client: every property access records its full path; every
+    // invocation records the exact leaf path dispatched to.
+    type ToolClient = Parameters<
+      NonNullable<(typeof MCP_TOOL_MANIFEST)[number]["invokeProcedure"]>
+    >[0];
+    const accessed = new Set<string>();
+    const invoked: string[] = [];
+    const callable = (path: string): unknown =>
+      new Proxy(
+        (..._args: unknown[]) => {
+          invoked.push(path);
+          return Promise.resolve(undefined);
+        },
+        {
+          get(_target, prop) {
+            if (typeof prop !== "string") return undefined;
+            const nested = `${path}.${prop}`;
+            accessed.add(nested);
+            return callable(nested);
+          },
+        },
+      );
+    const recordingClient = new Proxy({} as Record<string, unknown>, {
+      get(_target, prop) {
+        if (typeof prop !== "string") return undefined;
+        accessed.add(prop);
+        return callable(prop);
+      },
+    }) as unknown as ToolClient;
+
+    // Drive EVERY procedure-backed tool through the real dispatch path.
+    let dispatched = 0;
+    for (const tool of MCP_TOOL_MANIFEST) {
+      if (!tool.invokeProcedure) continue; // the 2 extracted-core diagnostics
+      const before = invoked.length;
+      await tool.invokeProcedure(recordingClient, {});
+      dispatched += 1;
+      // The recorder itself is proven to work: each tool dispatched to
+      // EXACTLY its declared target leaf — a selector change fails here.
+      expect(`${tool.name}: ${invoked.slice(before).join(",")}`).toBe(
+        `${tool.name}: ${PLAN_TARGETS[tool.name]}`,
+      );
+    }
+    // 69 catalog entries − 2 core diagnostics = 67 procedure dispatches.
+    expect(dispatched).toBe(67);
+    expect(invoked).toHaveLength(67);
+
+    // Human-only proof: ZERO mcpGrants access (property or invocation)
+    // across every dispatch.
+    const grantAccesses = [...accessed].filter(
+      (path) => path === "mcpGrants" || path.startsWith("mcpGrants."),
+    );
+    expect(grantAccesses).toEqual([]);
+    expect(invoked.filter((path) => path.startsWith("mcpGrants"))).toEqual([]);
   });
 });
 

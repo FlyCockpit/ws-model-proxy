@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { getNavDirection, getNavItems, stripLangPrefix, toLangRoute } from "./nav-items";
+import {
+  getNavDirection,
+  getNavItems,
+  settingsNavItems,
+  stripLangPrefix,
+  toLangRoute,
+} from "./nav-items";
 
 describe("nav-items", () => {
   it("returns no desktop app nav items for signed-out visitors", () => {
@@ -91,6 +97,17 @@ describe("nav-items", () => {
 
   it("returns forward for off-nav child routes", () => {
     expect(getNavDirection("/settings", "/settings/security")).toBe("forward");
+  });
+
+  it("lists the settings sub-nav in visual order incl. the MCP grants tab", () => {
+    expect(settingsNavItems.map((item) => item.path)).toEqual([
+      "/settings",
+      "/settings/security",
+      "/settings/mcp",
+    ]);
+    expect(getNavDirection("/settings/security", "/settings/mcp")).toBe("forward");
+    expect(getNavDirection("/settings/mcp", "/settings/security")).toBe("back");
+    expect(toLangRoute("/settings/mcp")).toBe("/$lang/settings/mcp");
   });
 
   it("returns back from child routes to their parent", () => {

@@ -1,6 +1,32 @@
 {
   "navProfile": "Profile",
   "navSecurity": "Security",
+  "navMcp": "MCP access",
+  "mcp": {
+    "title": "MCP connections",
+    "description": "Applications you authorized through the Model Context Protocol.",
+    "empty": "No applications are connected. Authorize an MCP client to see it here.",
+    "loadFailed": "Failed to load your MCP connections.",
+    "scopes": "Scopes",
+    "noScopes": "No scopes",
+    "firstAuthorized": "First authorized",
+    "lastAuthorized": "Last active",
+    "rollingExpiry": "Refresh expires",
+    "noActiveRefresh": "No active renewals",
+    "activeRefreshCount": "Active renewals ({{count}})",
+    "dpop": {
+      "all": "All tokens sender-bound (DPoP)",
+      "some": "Some tokens sender-bound (DPoP)",
+      "none": "No sender binding"
+    },
+    "revoke": "Revoke access",
+    "revokeTitle": "Revoke this connection?",
+    "revokeDescription": "This revokes every authorization for “{{client}}”. Its refresh tokens stop working immediately and it must ask for consent again. You can sign in again later to reauthorize.",
+    "revokeConfirm": "Revoke",
+    "revoking": "Revoking…",
+    "revoked": "Access revoked",
+    "revokeFailed": "Couldn't revoke this connection. Try again."
+  },
   "title": "Settings",
   "profile": {
     "title": "Profile",

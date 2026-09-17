@@ -1,17 +1,24 @@
 import { isAdminRole } from "@ws-model-proxy/auth/roles";
 import type { LucideIcon } from "lucide-react";
-import { LayoutDashboard, Settings, Shield } from "lucide-react";
+import { Cable, LayoutDashboard, Settings, Shield } from "lucide-react";
 
 export type NavDirection = "forward" | "back" | "none";
 type NavAudience = "public" | "authenticated" | "admin";
 type NavPlacement = "desktop" | "mobile" | "userMenu";
-export type AppNavPath = "/" | "/dashboard" | "/settings" | "/admin" | "/settings/security";
+export type AppNavPath =
+  | "/"
+  | "/dashboard"
+  | "/settings"
+  | "/admin"
+  | "/settings/security"
+  | "/settings/mcp";
 export type LangNavRoute =
   | "/$lang"
   | "/$lang/dashboard"
   | "/$lang/settings"
   | "/$lang/admin"
-  | "/$lang/settings/security";
+  | "/$lang/settings/security"
+  | "/$lang/settings/mcp";
 
 export type RouteNavItem = {
   /** Path WITHOUT the `/$lang/` prefix, starts with "/". Use "/" for root. */
@@ -101,6 +108,12 @@ export const settingsNavItems: RouteNavItem[] = [
     labelKey: "settings:navSecurity",
     icon: Shield,
     exact: false,
+  },
+  {
+    path: "/settings/mcp",
+    labelKey: "settings:navMcp",
+    icon: Cable,
+    exact: true,
   },
 ];
 
