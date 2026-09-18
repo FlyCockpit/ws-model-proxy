@@ -41,6 +41,7 @@ import {
   mcpOauthRateLimits,
 } from "./mcp-oauth-rate-limit.js";
 import {
+  createMcpOauthFlagGate,
   isMcpOauthRateLimitedRequest,
   MCP_OAUTH_AUTHORIZE_PATH,
   MCP_OAUTH_CONSENT_PATH,
@@ -410,6 +411,24 @@ export async function createApp(options: CreateAppOptions = {}) {
     );
   }
 
+  // MCP OAuth flag-off 404 gate (Phase 9 / invariant 13): while
+  // WMP_MCP_ENABLED is off, EVERY /api/auth/oauth2/* raw path and the JWKS
+  // path return a REAL 404 for EVERY method — authorization remains
+  // flag-gated even when the installed provider is present (a flag flip
+  // without a rebuilt plugin list, or a parity instance that always carries
+  // the plugins: previously flag-off authorize answered the provider's own
+  // 302 redirected error). Mounted in the SAME pre-CORS/pre-global-body-limit
+  // block as the discovery aliases (the L23 lesson: the gate owns every
+  // method incl. OPTIONS before CORS answers 204) and BEFORE the MCP OAuth
+  // limiters and the general auth limiter, so a gated 404 consumes no limiter
+  // budget. Flag ON: pure pass-through — the scope guard, limiters, body
+  // caps, session mounts, and the provider handler below are untouched.
+  // Near-miss raw spellings (`/api/%61uth/oauth2/...`) keep stock handling
+  // per L18 (the provider's better-call router 404s them itself). Predicate
+  // + gate live in mcp-oauth-route-match.ts, the ONE shared module every
+  // MCP OAuth control consumes.
+  app.use("/*", createMcpOauthFlagGate({ enabled: () => env.WMP_MCP_ENABLED === true }));
+
   // MCP web login/consent pages (Phase 6): while WMP_MCP_ENABLED is off, the
   // valid-locale forms of /:lang/mcp-login and /:lang/mcp-consent return a
   // REAL 404 here — mounted in the SAME pre-CORS/pre-global-body-limit block
@@ -617,9 +636,10 @@ export async function createApp(options: CreateAppOptions = {}) {
   // continue, POST authorize, POST token. The session mount is the one
   // deliberate exception to "not mounted on /api/auth/*" — solely to resolve
   // the rate-limit key (its result is otherwise unused; Better Auth still does
-  // its own session lookup). Flag-off: nothing below is mounted and the
-  // exemption in the general limiter is not honored, so behavior is
-  // byte-identical to pre-Phase-3.
+  // its own session lookup). Flag-off: nothing below is mounted, the exemption
+  // in the general limiter is not honored, and the flag-off 404 gate mounted
+  // in the pre-CORS block above answers every MCP OAuth path before any of
+  // this can run.
   if (env.WMP_MCP_ENABLED) {
     app.use(
       MCP_OAUTH_CONSENT_PATH,

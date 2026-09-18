@@ -215,6 +215,44 @@ describe("createApp /mcp chain — order pins (flag on)", () => {
     });
     expect([401, 403]).toContain(res.status);
   });
+
+  it("POST with a VALID session cookie but NO Authorization header → 401 challenge (never cookie-authenticated)", async () => {
+    // Invariant 3: /mcp is a Bearer/DPoP surface ONLY. A browser session
+    // cookie must never authenticate an MCP exchange — the upstream
+    // requireMcpAuth wrapper reads the Authorization header, so a
+    // cookie-only request is indistinguishable from a no-credential one and
+    // must get the same 401 challenge (never 200, never a session-flavored
+    // response). Drives a REAL signUpEmail session on the injected
+    // memory-adapter instance.
+    const app = await buildApp(true);
+    const signup = await memoryAuth.api.signUpEmail({
+      body: {
+        name: "Cookie Only",
+        email: "cookie-only@example.test",
+        password: "chain-test-password-123",
+      },
+      asResponse: true,
+    });
+    expect(signup.status).toBe(200);
+    const cookie = signup.headers
+      .getSetCookie()
+      .map((v) => v.split(";")[0])
+      .join("; ");
+    expect(cookie).toContain("better-auth.session_token");
+    const res = await app.request(MCP, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, ...HOST },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping", params: {} }),
+    });
+    expect(res.status).toBe(401);
+    const challenge = res.headers.get("www-authenticate") ?? "";
+    expect(challenge).toContain("Bearer");
+    expect(challenge).toContain(
+      'resource_metadata="https://proxy.example.com/.well-known/oauth-protected-resource/mcp"',
+    );
+    const body = (await res.json()) as { jsonrpc?: string; error?: { code?: number } };
+    expect(body.error?.code).toBe(-32000); // the no-credential JSON-RPC challenge body
+  });
 });
 
 describe("createApp /mcp chain — canonical-authority boundary (F1, invariant 2)", () => {

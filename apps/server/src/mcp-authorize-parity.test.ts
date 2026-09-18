@@ -524,4 +524,171 @@ describe("MCP authorize boundary parity with the installed handler", () => {
     ) as Record<string, unknown>;
     expect(claims.mcp_grant_id).toBe("parity-grant-row");
   });
+
+  // ------------------------------------------------------------------
+  // Phase 9 (Part K1) — consent-memory contract rows against the REAL
+  // installed handler (authorize-9whjxVLJ.mjs consent skip logic): a
+  // remembered consent (oauthConsent row found by clientId+userId+
+  // referenceId, requested scopes ⊆ consent.scopes, resources covered)
+  // SKIPS the consent page; a scope STEP-UP (any scope outside the
+  // remembered set) forces a re-prompt; a DENIAL (accept: false) redirects
+  // to the validated redirect_uri with error=access_denied and never mints
+  // a code or a grant.
+  // ------------------------------------------------------------------
+
+  /** signUpEmail on a consent-enabled fixture and return the session cookie. */
+  async function consentFixtureUser(
+    app: Hono,
+    auth: ReturnType<typeof buildApp>["auth"],
+    email: string,
+  ): Promise<string> {
+    void app;
+    const signup = await auth.api.signUpEmail({
+      body: { name: "Consent Memory", email, password: "parity-test-password-123" },
+      asResponse: true,
+    });
+    expect(signup.status).toBe(200);
+    return signup.headers
+      .getSetCookie()
+      .map((v) => v.split(";")[0])
+      .join("; ");
+  }
+
+  /** authorize → expect the consent-page redirect → accept → return the code URL. */
+  async function authorizeExpectConsent(app: Hono, cookie: string, scope: string): Promise<URL> {
+    const authorize = await app.request(`${BASE}${AUTHORIZE}`, {
+      method: "POST",
+      headers: { "content-type": FORM, cookie, origin: BASE },
+      body: formBody({ scope, resource: CANONICAL }),
+    });
+    expect(authorize.status).toBe(302);
+    const location = new URL(authorize.headers.get("location")!, BASE);
+    expect(location.pathname).toContain("/mcp-consent");
+    const consent = await app.request(`${BASE}/api/auth/oauth2/consent`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, origin: BASE },
+      body: JSON.stringify({ accept: true, oauth_query: location.search.slice(1) }),
+    });
+    expect(consent.status).toBe(200);
+    const consentJson = (await consent.json()) as { redirect: boolean; url: string };
+    expect(consentJson.redirect).toBe(true);
+    return new URL(consentJson.url, BASE);
+  }
+
+  it("REMEMBERED CONSENT: second authorize with the SAME scopes skips the consent page and issues a code directly", async () => {
+    const { app, auth, memory } = buildApp({ skipConsent: false });
+    const cookie = await consentFixtureUser(app, auth, "remembered@example.test");
+
+    const firstUrl = await authorizeExpectConsent(app, cookie, "mcp:read offline_access");
+    expect(firstUrl.searchParams.get("code")).toBeTruthy();
+    expect(memory.oauthConsent ?? []).toHaveLength(1);
+
+    // Second authorize, SAME session + SAME scope set: the installed
+    // provider finds the remembered oauthConsent row (scopes ⊆ consent
+    // scopes, resource covered) and redirects STRAIGHT to the callback with
+    // a code — no consent page, no new consent row.
+    const second = await app.request(`${BASE}${AUTHORIZE}`, {
+      method: "POST",
+      headers: { "content-type": FORM, cookie, origin: BASE },
+      body: formBody({ scope: "mcp:read offline_access", resource: CANONICAL }),
+    });
+    expect(second.status).toBe(302);
+    const location = new URL(second.headers.get("location")!, BASE);
+    expect(location.origin + location.pathname).toBe(CALLBACK);
+    expect(location.searchParams.get("code")).toBeTruthy();
+    expect(memory.oauthConsent ?? []).toHaveLength(1);
+  });
+
+  it("SCOPE STEP-UP: remembered consent with FEWER scopes + an authorize with an ADDITIONAL scope forces a consent re-prompt", async () => {
+    const { app, auth, memory } = buildApp({ skipConsent: false });
+    const cookie = await consentFixtureUser(app, auth, "stepup@example.test");
+
+    // Remember a consent for mcp:read only.
+    await authorizeExpectConsent(app, cookie, "mcp:read");
+    expect(memory.oauthConsent ?? []).toHaveLength(1);
+
+    // Step-up request adds mcp:write: the remembered row does NOT cover the
+    // requested scope set (`!requestedScopes.every((s) => consent.scopes
+    // .includes(s))` in the installed authorize), so the consent page
+    // re-prompts — for the FULL requested scope set (mcp:read mcp:write),
+    // NOT just the delta: the installed provider signs and persists the
+    // whole authorization query (authorize-9whjxVLJ.mjs:5660-5684 signs the
+    // full query; :55-117 persists the accepted full scope set).
+    //
+    // Coverage qualification (review round 1): these same-session,
+    // same-client fixtures detect loss of remembered-consent reuse, a
+    // missing step-up prompt, and denial returning a code. They do NOT
+    // independently pin consent-lookup isolation across different clients,
+    // users, referenceIds, or resources (dropping those lookup predicates
+    // could leave these tests green), nor subset-reuse semantics. New-
+    // session consent isolation is explicitly deferred to K2.
+    const stepUp = await app.request(`${BASE}${AUTHORIZE}`, {
+      method: "POST",
+      headers: { "content-type": FORM, cookie, origin: BASE },
+      body: formBody({ scope: "mcp:read mcp:write", resource: CANONICAL }),
+    });
+    expect(stepUp.status).toBe(302);
+    const location = new URL(stepUp.headers.get("location")!, BASE);
+    expect(location.pathname).toContain("/mcp-consent");
+
+    // Accepting the step-up stores the EXPANDED scope set and issues a code.
+    const consent = await app.request(`${BASE}/api/auth/oauth2/consent`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, origin: BASE },
+      body: JSON.stringify({ accept: true, oauth_query: location.search.slice(1) }),
+    });
+    expect(consent.status).toBe(200);
+    const consentJson = (await consent.json()) as { redirect: boolean; url: string };
+    expect(consentJson.redirect).toBe(true);
+    const codeUrl = new URL(consentJson.url, BASE);
+    expect(codeUrl.searchParams.get("code")).toBeTruthy();
+    const rows = memory.oauthConsent ?? [];
+    const scopeSets = rows.map((row) => (row.scopes as string[]) ?? []);
+    expect(scopeSets.some((scopes) => scopes.includes("mcp:write"))).toBe(true);
+
+    // A subsequent FULL-SET authorize now skips the prompt (the remembered
+    // set covers it).
+    const after = await app.request(`${BASE}${AUTHORIZE}`, {
+      method: "POST",
+      headers: { "content-type": FORM, cookie, origin: BASE },
+      body: formBody({ scope: "mcp:read mcp:write", resource: CANONICAL }),
+    });
+    expect(after.status).toBe(302);
+    const afterLocation = new URL(after.headers.get("location")!, BASE);
+    expect(afterLocation.origin + afterLocation.pathname).toBe(CALLBACK);
+    expect(afterLocation.searchParams.get("code")).toBeTruthy();
+  });
+
+  it("CONSENT DENIAL: accept:false redirects to the validated redirect_uri with access_denied — no code, no grant, no consent row", async () => {
+    const { app, auth, memory } = buildApp({ skipConsent: false });
+    grants.create.mockClear();
+    const cookie = await consentFixtureUser(app, auth, "denial@example.test");
+
+    const authorize = await app.request(`${BASE}${AUTHORIZE}`, {
+      method: "POST",
+      headers: { "content-type": FORM, cookie, origin: BASE },
+      body: formBody({ scope: "mcp:read offline_access", resource: CANONICAL }),
+    });
+    expect(authorize.status).toBe(302);
+    const location = new URL(authorize.headers.get("location")!, BASE);
+    expect(location.pathname).toContain("/mcp-consent");
+
+    const denial = await app.request(`${BASE}/api/auth/oauth2/consent`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie, origin: BASE },
+      body: JSON.stringify({ accept: false, oauth_query: location.search.slice(1) }),
+    });
+    expect(denial.status).toBe(200);
+    const denialJson = (await denial.json()) as { redirect: boolean; url: string };
+    expect(denialJson.redirect).toBe(true);
+    // The installed denial contract: formatErrorURL over the VALIDATED
+    // client redirect_uri with error=access_denied — never a code.
+    const denialUrl = new URL(denialJson.url, BASE);
+    expect(denialUrl.origin + denialUrl.pathname).toBe(CALLBACK);
+    expect(denialUrl.searchParams.get("error")).toBe("access_denied");
+    expect(denialUrl.searchParams.get("code")).toBeNull();
+    // No grant was minted and no consent was remembered.
+    expect(grants.create).not.toHaveBeenCalled();
+    expect(memory.oauthConsent ?? []).toHaveLength(0);
+  });
 });

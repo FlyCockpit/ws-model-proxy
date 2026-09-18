@@ -33,6 +33,21 @@ export const MCP_OAUTH_RATE_LIMITED_ROUTES = [
   ["GET", "/api/auth/jwks"],
 ] as const;
 
+/**
+ * The server's ENTIRE OAuth surface while WMP_MCP_ENABLED is on: the oauth2
+ * namespace (`mcp()` IS the OAuth provider — the only OAuth surface this app
+ * registers; the provider's installed 1.7.3 dist serves authorize, token,
+ * consent, continue, revoke, introspect, public-client,
+ * public-client-prelogin, delete-consent, register (DCR — refused 403 by our
+ * config), userinfo, and the client/resource CRUD family under /oauth2/*)
+ * plus the jwt() plugin's JWKS endpoint. There is no non-MCP OAuth provider
+ * in this app (ssoEnabled: false, no separate oauthProvider plugin), so the
+ * flag-off gate below may own the whole namespace: while the flag is off NO
+ * /api/auth/oauth2/* path and no JWKS path may answer on any method.
+ */
+export const MCP_OAUTH_PATH_PREFIX = "/api/auth/oauth2/";
+export const MCP_OAUTH_JWKS_PATH = "/api/auth/jwks";
+
 export const MCP_OAUTH_AUTHORIZE_PATH = "/api/auth/oauth2/authorize";
 export const MCP_OAUTH_TOKEN_PATH = "/api/auth/oauth2/token";
 export const MCP_OAUTH_CONSENT_PATH = "/api/auth/oauth2/consent";
@@ -84,5 +99,38 @@ export function onMcpOauthRoute(
   return (c, next) => {
     if (!isMcpOauthRoute(c, method, path)) return next();
     return handler(c, next);
+  };
+}
+
+/**
+ * Flag-off applicability test for the OAuth 404 gate: the RAW, still-encoded
+ * pathname is the JWKS path exactly, or lies under the raw /api/auth/oauth2/
+ * prefix. RAW comparison mirrors better-call's routing (L18): a
+ * percent-encoded spelling like `/api/%61uth/oauth2/token` does NOT match and
+ * keeps stock handling (general limiter + the provider's own 404).
+ */
+export function isMcpOauthRawPath(rawPathname: string): boolean {
+  return rawPathname === MCP_OAUTH_JWKS_PATH || rawPathname.startsWith(MCP_OAUTH_PATH_PREFIX);
+}
+
+/**
+ * MCP OAuth flag-off 404 gate (MCP plan Phase 9 / invariant 13: while
+ * WMP_MCP_ENABLED is off, MCP OAuth routes return REAL 404s — authorization
+ * remains flag-gated even when the installed provider is present, e.g. a
+ * flag flip without a rebuilt plugin list or a test instance that always
+ * carries the plugins). Mounted in the SAME pre-CORS/pre-global-body-limit
+ * block as the discovery aliases and the web-page gate (the L23 lesson: the
+ * gate must own EVERY method — OPTIONS included — before CORS can answer
+ * 204) and before the MCP OAuth limiters / general auth limiter, so a gated
+ * 404 never consumes limiter budget. While the flag is ON this is a pure
+ * pass-through: scope guard, limiters, body caps, session middleware, and
+ * the provider handler all run exactly as before.
+ */
+export function createMcpOauthFlagGate({ enabled }: { enabled: () => boolean }): MiddlewareHandler {
+  return async (c, next) => {
+    if (!enabled() && isMcpOauthRawPath(mcpOauthRawPath(c))) {
+      return c.notFound();
+    }
+    return next();
   };
 }

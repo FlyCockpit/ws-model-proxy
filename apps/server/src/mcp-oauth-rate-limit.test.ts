@@ -64,6 +64,7 @@ import {
   mcpOauthIpKey,
   mcpOauthRateLimits,
 } from "./mcp-oauth-rate-limit";
+import { isMcpOauthRawPath } from "./mcp-oauth-route-match";
 
 const BASE = "https://proxy.example.com";
 
@@ -342,5 +343,30 @@ describe("upstream endpoint-specific rate limits are retained (config probe)", (
         (rule.pathMatcher as (p: string) => boolean)("/oauth2/token"),
     );
     expect(tokenRule).toMatchObject({ window: 60, max: 20 });
+  });
+});
+
+describe("isMcpOauthRawPath — flag-off 404 gate applicability (Phase 9, invariant 13)", () => {
+  it("matches the JWKS path exactly and every raw /api/auth/oauth2/ spelling", () => {
+    expect(isMcpOauthRawPath("/api/auth/jwks")).toBe(true);
+    expect(isMcpOauthRawPath("/api/auth/oauth2/authorize")).toBe(true);
+    expect(isMcpOauthRawPath("/api/auth/oauth2/token")).toBe(true);
+    expect(isMcpOauthRawPath("/api/auth/oauth2/client/rotate-secret")).toBe(true);
+    expect(isMcpOauthRawPath("/api/auth/oauth2/end-session/confirm")).toBe(true);
+  });
+
+  it("does NOT match near-miss raw spellings (L18: encoded or prefix-adjacent paths keep stock handling)", () => {
+    for (const path of [
+      "/api/%61uth/oauth2/token",
+      "/api/auth/oauth2%2Ftoken",
+      "/api/auth/oauth2x/token",
+      "/api/auth/oauth2", // the bare prefix WITHOUT the trailing slash
+      "/api/auth/jwks/",
+      "/api/auth/jwksx",
+      "/api/auth/sign-in",
+      "/api/auth/get-session",
+    ]) {
+      expect(isMcpOauthRawPath(path), path).toBe(false);
+    }
   });
 });

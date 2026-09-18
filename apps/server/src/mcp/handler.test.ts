@@ -164,6 +164,9 @@ describe("createMcpTransport — modern POST exchanges", () => {
     const res = await handler.fetch(toolCallRequest(1, "probe"));
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toContain("application/json");
+    // Stateless transport: no session header is ever issued (config pin
+    // already forbids sessions; this is the wire-level proof).
+    expect(res.headers.get("mcp-session-id")).toBeNull();
     const body = (await res.json()) as { result?: { content?: unknown[] } };
     expect(body.result?.content).toEqual([{ type: "text", text: "ok" }]);
     expect(events).toContain("factory");

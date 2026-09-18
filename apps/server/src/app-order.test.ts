@@ -391,27 +391,133 @@ describe("createApp configuration consistency — ONE shared env source for ever
     });
     expect(metadata.status).toBe(404);
 
-    // Guard inactive: no local invalid_scope rejection, and the request is
-    // retained by the GENERAL limiter (mocked RATE_LIMIT_AUTH_POINTS 500 —
-    // flag-off does not honor the MCP exemption).
-    // Guard inactive: no local invalid_scope 400 — the request falls through
-    // to the downstream provider, which answers its own redirected protocol
-    // error (302, parity-pinned installed behavior) — AND the request is
-    // retained by the GENERAL limiter (mocked RATE_LIMIT_AUTH_POINTS 500;
-    // flag-off does not honor the MCP exemption).
+    // MCP OAuth flag-off 404 gate (Phase 9 / invariant 13): authorization
+    // stays flag-gated even though this parity instance carries the FULL
+    // plugin set (the pre-Phase-9 behavior was the provider's own 302
+    // redirected error). The gate owns the path BEFORE the general limiter,
+    // so the 404 carries NO x-ratelimit-limit header (contrast the near-miss
+    // rows in the flag-off OAuth gate describe below, which keep the general
+    // limiter's 500).
     const authorize = await app.request(`${BASE}/api/auth/oauth2/authorize`);
-    expect(authorize.status).toBe(302);
-    expect(authorize.headers.get("x-ratelimit-limit")).toBe("500");
+    expect(authorize.status).toBe(404);
+    expect(authorize.headers.get("location")).toBeNull();
+    expect(authorize.headers.get("x-ratelimit-limit")).toBeNull();
 
-    // MCP buckets NOT consulted flag-off: jwks (protocol) and consent both
-    // answer from the general bucket instead of the MCP values (2).
+    // JWKS + consent are gated the same way (MCP buckets NOT consulted
+    // flag-off; the gate answers before the general limiter too).
     const jwks = await app.request(`${BASE}/api/auth/jwks`);
-    expect(jwks.headers.get("x-ratelimit-limit")).toBe("500");
+    expect(jwks.status).toBe(404);
+    expect(jwks.headers.get("x-ratelimit-limit")).toBeNull();
     const consent = await app.request(`${BASE}/api/auth/oauth2/consent`, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: "a=1",
     });
-    expect(consent.headers.get("x-ratelimit-limit")).toBe("500");
+    expect(consent.status).toBe(404);
+    expect(consent.headers.get("x-ratelimit-limit")).toBeNull();
+  });
+});
+
+describe("createApp registration contract — MCP OAuth flag-off 404 gate (Phase 9, invariant 13)", () => {
+  // The full registered OAuth family of the installed provider (verified
+  // against @better-auth/oauth-provider@1.7.3 + @better-auth/mcp@1.7.3 dists)
+  // plus the jwt() JWKS endpoint. The gate matches the raw /api/auth/oauth2/
+  // PREFIX + exact JWKS path, so every present and future provider endpoint
+  // is covered while the flag is off.
+  const OAUTH_FAMILY_PATHS = [
+    "/api/auth/oauth2/authorize",
+    "/api/auth/oauth2/token",
+    "/api/auth/oauth2/consent",
+    "/api/auth/oauth2/continue",
+    "/api/auth/oauth2/revoke",
+    "/api/auth/oauth2/introspect",
+    "/api/auth/oauth2/public-client",
+    "/api/auth/oauth2/public-client-prelogin",
+    "/api/auth/oauth2/delete-consent",
+    "/api/auth/oauth2/register",
+    "/api/auth/oauth2/userinfo",
+    "/api/auth/oauth2/create-client",
+    "/api/auth/oauth2/get-client",
+    "/api/auth/oauth2/get-clients",
+    "/api/auth/oauth2/update-client",
+    "/api/auth/oauth2/delete-client",
+    "/api/auth/oauth2/client/rotate-secret",
+    "/api/auth/oauth2/get-consent",
+    "/api/auth/oauth2/get-consents",
+    "/api/auth/oauth2/update-consent",
+    "/api/auth/oauth2/end-session",
+    "/api/auth/oauth2/end-session/confirm",
+    "/api/auth/jwks",
+  ] as const;
+
+  it("flag OFF: EVERY registered MCP OAuth family path returns a REAL 404 for every method, before the general limiter", async () => {
+    const app = await buildApp(false);
+    for (const path of OAUTH_FAMILY_PATHS) {
+      for (const method of ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"] as const) {
+        const res = await app.request(`${BASE}${path}`, {
+          method,
+          ...(method === "POST" || method === "PUT" || method === "PATCH"
+            ? {
+                headers: { "content-type": "application/x-www-form-urlencoded" },
+                body: "a=1",
+              }
+            : {}),
+        });
+        expect(res.status, `${method} ${path}`).toBe(404);
+        // The gate owns the path BEFORE the general auth limiter: a gated 404
+        // never consumes or exposes limiter budget.
+        expect(res.headers.get("x-ratelimit-limit"), `${method} ${path}`).toBeNull();
+        expect(res.headers.get("location"), `${method} ${path}`).toBeNull();
+      }
+    }
+  });
+
+  it("flag OFF: oversized POSTs on family paths get the gate's 404 (the global 10 MB body limiter never answers 413)", async () => {
+    const app = await buildApp(false);
+    for (const path of ["/api/auth/oauth2/authorize", "/api/auth/oauth2/token", "/api/auth/jwks"]) {
+      const res = await app.request(`${BASE}${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: OVERSIZED_BODY,
+      });
+      expect(res.status, path).toBe(404);
+    }
+  });
+
+  it("flag OFF: near-miss raw spellings keep stock behavior (general limiter header present; downstream better-call 404, never the gate)", async () => {
+    const app = await buildApp(false);
+    for (const path of [
+      "/api/%61uth/oauth2/token",
+      "/api/auth/oauth2%2Ftoken",
+      "/api/auth/oauth2x/token",
+    ]) {
+      const res = await app.request(`${BASE}${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: "a=1",
+      });
+      // L18: the gate compares RAW pathnames only — encoded spellings and
+      // prefix near-misses fall through to the general limiter (header 500 =
+      // mocked RATE_LIMIT_AUTH_POINTS) and the provider's own routing.
+      expect(res.headers.get("x-ratelimit-limit"), path).toBe("500");
+    }
+  });
+
+  it("flag ON: the gate is a pure pass-through — CORS preflight on authorize answers 204, jwks serves 200 from the MCP bucket", async () => {
+    // Bucket hygiene: the MCP protocol limiter is a module singleton — give
+    // this test a unique connection IP so earlier jwks consumption in the
+    // file cannot 429 the control.
+    mockGetConnInfo.mockReturnValue({ remote: { address: "203.0.113.99" } });
+    const app = await buildApp(true);
+    const preflight = await app.request(`${BASE}/api/auth/oauth2/authorize`, {
+      method: "OPTIONS",
+      headers: CORS_HEADERS,
+    });
+    // Flag-on the gate never answers; CORS handles the preflight (contrast
+    // the flag-off 404 on the identical request above).
+    expect(preflight.status).toBe(204);
+    const jwks = await app.request(`${BASE}/api/auth/jwks`);
+    expect(jwks.status).toBe(200);
+    expect(jwks.headers.get("x-ratelimit-limit")).toBe("2");
   });
 });
