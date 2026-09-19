@@ -38,6 +38,26 @@ export type DeviceRouteDecision =
   | { kind: "redirect-to-dashboard" }
   | { kind: "error" };
 
+export type McpConsentRouteDecision =
+  | { kind: "allow"; session: RouteSession }
+  | { kind: "redirect-to-mcp-login" }
+  | { kind: "error" };
+
+/**
+ * Gate for `/$lang/mcp-consent` (MCP plan Phase 6): the consent page REQUIRES
+ * a browser session — an unauthenticated visitor is sent to the MCP login
+ * page (with the signed oauth_query preserved by the route's redirect), NOT
+ * to the generic login, so the OAuth transaction continues. A session lookup
+ * failure is an `error` decision like every other route gate.
+ */
+export function decideMcpConsentRouteAccess(
+  resolution: RouteSessionResolution,
+): McpConsentRouteDecision {
+  if (resolution.status === "error") return { kind: "error" };
+  if (!resolution.session) return { kind: "redirect-to-mcp-login" };
+  return { kind: "allow", session: resolution.session };
+}
+
 export function resolvedRouteSession(session: RouteSession | null): RouteSessionResolution {
   return { status: "resolved", session };
 }

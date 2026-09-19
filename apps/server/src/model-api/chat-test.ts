@@ -1,13 +1,9 @@
 import type { Session } from "@ws-model-proxy/auth";
 import { env } from "@ws-model-proxy/env/server";
 import { Hono } from "hono";
-import { type RelaySessionManager, relaySessionManager } from "../relay/session-manager.js";
-import { PostgresCapacityAdmissionStore } from "./capacity/postgres-store.js";
-import {
-  type CapacityAdmissionRuntime,
-  StoreCapacityAdmissionRuntime,
-} from "./capacity/runtime.js";
-import { type ModelApiConcurrencyLimiter, modelApiConcurrencyLimiter } from "./limits.js";
+import { relaySessionManager } from "../relay/session-manager.js";
+import { type DiagnosticCoreDependencies, diagnosticsCapacityRuntime } from "./diagnostics.js";
+import { modelApiConcurrencyLimiter } from "./limits.js";
 import { openAiFailureJsonResponse } from "./openai-errors.js";
 import {
   anthropicMessagesHandler,
@@ -15,18 +11,8 @@ import {
   responsesCreateHandler,
 } from "./routes.js";
 
-type ChatTestRouteDependencies = {
-  manager?: Pick<
-    RelaySessionManager,
-    | "getActiveCliDeviceIds"
-    | "registerRelayResponseHandlers"
-    | "sendRelayRequest"
-    | "cancelRelayRequest"
-    | "completeRelayRequest"
-  >;
-  concurrencyLimiter?: ModelApiConcurrencyLimiter;
+type ChatTestRouteDependencies = DiagnosticCoreDependencies & {
   capacityEnabled?: boolean;
-  capacityRuntime?: CapacityAdmissionRuntime;
 };
 
 type ChatTestVariables = {
@@ -40,8 +26,11 @@ export function createChatTestRoutes({
   capacityRuntime,
 }: ChatTestRouteDependencies = {}) {
   const app = new Hono<{ Variables: ChatTestVariables }>();
+  // Phase 5: the ONE module-lifetime diagnostics capacity runtime, shared
+  // with the MCP chat completion test tool (model-api/diagnostics.ts). An
+  // injected runtime still wins (tests); the flag-off case stays undefined.
   const admissionRuntime = capacityEnabled
-    ? (capacityRuntime ?? new StoreCapacityAdmissionRuntime(new PostgresCapacityAdmissionStore()))
+    ? (capacityRuntime ?? diagnosticsCapacityRuntime())
     : undefined;
 
   app.post("/chat/completions", async (c) => {

@@ -1,4 +1,5 @@
 import prisma from "@ws-model-proxy/db";
+import { runWithDbShutdownPermit } from "@ws-model-proxy/db/shutdown-fence";
 
 // The product spec requires bounded cooldown/half-open recovery but does not
 // prescribe a duration. Cap both local backoff and untrusted Retry-After at
@@ -370,51 +371,58 @@ export async function releaseProviderHealthTrial(input: {
   attemptId: string;
   fencingToken: bigint;
 }): Promise<boolean> {
-  return prisma.$transaction(async (tx) => {
-    await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.providerAccountId} AND "userId" = ${input.userId} FOR UPDATE`;
-    await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${input.providerModelId} AND "userId" = ${input.userId} FOR UPDATE`;
-    const owner = {
-      healthHalfOpenAttemptId: input.attemptId,
-      healthHalfOpenFencingToken: input.fencingToken,
-    };
-    const [accountOwner, modelOwner] = await Promise.all([
-      tx.providerAccount.findUniqueOrThrow({
-        where: { id: input.providerAccountId, userId: input.userId },
-        select: { healthHalfOpenAttemptId: true, healthHalfOpenFencingToken: true },
-      }),
-      tx.providerModel.findUniqueOrThrow({
+  // G2n (durable-cleanup permit, pass 4): this release runs on the
+  // cancellation path AFTER the request's abort — the half-open trial
+  // release is a REQUIRED durable transition and must execute even when
+  // the abort/shutdown fences are active. The permit is scoped to this
+  // transaction only; surrounding new work stays fenced.
+  return runWithDbShutdownPermit(() =>
+    prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.providerAccountId} AND "userId" = ${input.userId} FOR UPDATE`;
+      await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${input.providerModelId} AND "userId" = ${input.userId} FOR UPDATE`;
+      const owner = {
+        healthHalfOpenAttemptId: input.attemptId,
+        healthHalfOpenFencingToken: input.fencingToken,
+      };
+      const [accountOwner, modelOwner] = await Promise.all([
+        tx.providerAccount.findUniqueOrThrow({
+          where: { id: input.providerAccountId, userId: input.userId },
+          select: { healthHalfOpenAttemptId: true, healthHalfOpenFencingToken: true },
+        }),
+        tx.providerModel.findUniqueOrThrow({
+          where: {
+            id: input.providerModelId,
+            userId: input.userId,
+            providerAccountId: input.providerAccountId,
+          },
+          select: { healthHalfOpenAttemptId: true, healthHalfOpenFencingToken: true },
+        }),
+      ]);
+      const owns = (health: typeof accountOwner) =>
+        health.healthHalfOpenAttemptId === input.attemptId &&
+        health.healthHalfOpenFencingToken === input.fencingToken;
+      if (!owns(accountOwner) || !owns(modelOwner)) return false;
+      const cleared = {
+        healthHalfOpenAt: null,
+        healthHalfOpenAttemptId: null,
+        healthHalfOpenFencingToken: null,
+      };
+      const account = await tx.providerAccount.updateMany({
+        where: { id: input.providerAccountId, userId: input.userId, ...owner },
+        data: cleared,
+      });
+      const model = await tx.providerModel.updateMany({
         where: {
           id: input.providerModelId,
           userId: input.userId,
           providerAccountId: input.providerAccountId,
+          ...owner,
         },
-        select: { healthHalfOpenAttemptId: true, healthHalfOpenFencingToken: true },
-      }),
-    ]);
-    const owns = (health: typeof accountOwner) =>
-      health.healthHalfOpenAttemptId === input.attemptId &&
-      health.healthHalfOpenFencingToken === input.fencingToken;
-    if (!owns(accountOwner) || !owns(modelOwner)) return false;
-    const cleared = {
-      healthHalfOpenAt: null,
-      healthHalfOpenAttemptId: null,
-      healthHalfOpenFencingToken: null,
-    };
-    const account = await tx.providerAccount.updateMany({
-      where: { id: input.providerAccountId, userId: input.userId, ...owner },
-      data: cleared,
-    });
-    const model = await tx.providerModel.updateMany({
-      where: {
-        id: input.providerModelId,
-        userId: input.userId,
-        providerAccountId: input.providerAccountId,
-        ...owner,
-      },
-      data: cleared,
-    });
-    return account.count === 1 && model.count === 1;
-  });
+        data: cleared,
+      });
+      return account.count === 1 && model.count === 1;
+    }),
+  );
 }
 
 export async function recordProviderAttemptEvent(input: {

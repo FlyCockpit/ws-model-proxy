@@ -334,6 +334,17 @@ export const ENV_VARS: EnvVar[] = [
     ],
   },
   {
+    key: "WMP_MCP_ENABLED",
+    group: "runtime",
+    source: "default",
+    default: "false",
+    comment: [
+      "Release gate for the MCP server and OAuth provider surface (jwt/mcp/cimd",
+      "plugins, /mcp, discovery, MCP login/consent). Keep false until the MCP plan",
+      "phases land. Human grant listing/revocation stays available while disabled.",
+    ],
+  },
+  {
     key: "WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS",
     group: "runtime",
     source: "default",
@@ -644,6 +655,35 @@ export const ENV_VARS: EnvVar[] = [
     source: "default",
     default: "6",
     comment: ["Per-recipient cap on /api/auth/sign-up/email (separate from reset/resend)."],
+  },
+  {
+    key: "RATE_LIMIT_MCP_POINTS",
+    group: "ratelimit",
+    source: "default",
+    default: "120",
+    comment: [
+      "MCP /mcp endpoint quota (IP-keyed, pre-auth). Durations are seconds.",
+      "Inert while WMP_MCP_ENABLED=false; enforced by the Phase 3 routing.",
+    ],
+  },
+  {
+    key: "RATE_LIMIT_MCP_DURATION",
+    group: "ratelimit",
+    source: "default",
+    default: "60",
+  },
+  {
+    key: "RATE_LIMIT_MCP_CONSENT_POINTS",
+    group: "ratelimit",
+    source: "default",
+    default: "30",
+    comment: ["Tighter budget for the human MCP login/consent form submissions."],
+  },
+  {
+    key: "RATE_LIMIT_MCP_CONSENT_DURATION",
+    group: "ratelimit",
+    source: "default",
+    default: "60",
   },
 
   // --- ssr -----------------------------------------------------------------

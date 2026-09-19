@@ -16,6 +16,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { TwoFactorSetupDetails } from "@/components/two-factor-setup-details";
+import { useTotpEnrollment } from "@/hooks/use-totp-enrollment";
 import { authClient } from "@/lib/auth-client";
 import { orpc } from "@/utils/orpc";
 
@@ -144,37 +145,18 @@ function ChangePasswordCard() {
 
 function Enable2FASection() {
   const [step, setStep] = useState<"idle" | "password" | "setup" | "verify">("idle");
-  const [password, setPassword] = useState("");
-  const [totpURI, setTotpURI] = useState("");
-  const [backupCodes, setBackupCodes] = useState<string[]>([]);
   const [verifyCode, setVerifyCode] = useState("");
-  const [isLoading, setIsLoading] = useState(false);
+  const [isVerifying, setIsVerifying] = useState(false);
   const { t } = useTranslation(["settings", "auth", "common"]);
 
-  const handleEnable = async () => {
-    setIsLoading(true);
-    try {
-      const result = await authClient.twoFactor.enable({
-        password,
-      });
-      if (result.error) {
-        console.error("[settings.security.twoFactor.enable]", result.error);
-        toast.error(t("settings:security.couldNotStartSetup"));
-        return;
-      }
-      setTotpURI(result.data?.totpURI || "");
-      setBackupCodes(result.data?.backupCodes || []);
-      setStep("setup");
-    } catch (err) {
-      console.error("[settings.security.twoFactor.enable]", err);
-      toast.error(t("settings:security.couldNotStartSetup"));
-    } finally {
-      setIsLoading(false);
-    }
-  };
+  const { password, setPassword, totpURI, backupCodes, isLoading, enable } = useTotpEnrollment({
+    couldNotStartSetupMessage: t("settings:security.couldNotStartSetup"),
+    logLabel: "settings.security.twoFactor.enable",
+    onEnabled: () => setStep("setup"),
+  });
 
   const handleVerify = async () => {
-    setIsLoading(true);
+    setIsVerifying(true);
     try {
       const result = await authClient.twoFactor.verifyTotp({
         code: verifyCode,
@@ -190,7 +172,7 @@ function Enable2FASection() {
       console.error("[settings.security.twoFactor.verifyTotp]", err);
       toast.error(t("auth:errors.invalidTotp"));
     } finally {
-      setIsLoading(false);
+      setIsVerifying(false);
     }
   };
 
@@ -217,12 +199,12 @@ function Enable2FASection() {
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter") handleEnable();
+              if (e.key === "Enter") enable();
             }}
           />
         </div>
         <div className="flex gap-2">
-          <Button className="min-h-[44px]" onClick={handleEnable} disabled={!password || isLoading}>
+          <Button className="min-h-[44px]" onClick={enable} disabled={!password || isLoading}>
             {isLoading ? t("auth:twoFactor.settingUp") : t("auth:twoFactor.continue")}
           </Button>
           <Button className="min-h-[44px]" variant="ghost" onClick={() => setStep("idle")}>
@@ -273,9 +255,9 @@ function Enable2FASection() {
       <Button
         className="min-h-[44px]"
         onClick={handleVerify}
-        disabled={verifyCode.length !== 6 || isLoading}
+        disabled={verifyCode.length !== 6 || isVerifying}
       >
-        {isLoading ? t("auth:twoFactor.verifying") : t("settings:security.verifyAndEnable")}
+        {isVerifying ? t("auth:twoFactor.verifying") : t("settings:security.verifyAndEnable")}
       </Button>
     </div>
   );

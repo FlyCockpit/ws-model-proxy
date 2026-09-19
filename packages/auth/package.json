@@ -16,9 +16,25 @@
     },
     "./force-two-factor-policy": {
       "default": "./src/force-two-factor-policy.ts"
+    },
+    "./mcp-config": {
+      "default": "./src/mcp-config.ts"
+    },
+    "./is-user-banned": {
+      "default": "./src/is-user-banned.ts"
+    },
+    "./auth-logger-bridge": {
+      "default": "./src/auth-logger-bridge.ts"
+    },
+    "./auth-db-shutdown-fence": {
+      "default": "./src/auth-db-shutdown-fence.ts"
+    },
+    "./mcp-grant": {
+      "default": "./src/mcp-grant.ts"
     }
   },
   "scripts": {
+    "check-types": "tsc -p tsconfig.check-types.json --noEmit",
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
@@ -27,6 +43,9 @@
     "@ws-model-proxy/env": "workspace:*",
     "@ws-model-proxy/mailer": "workspace:*",
     "better-auth": "catalog:",
+    "@better-auth/mcp": "catalog:",
+    "@better-auth/cimd": "catalog:",
+    "@better-auth/oauth-provider": "catalog:",
     "zod": "catalog:"
   },
   "devDependencies": {

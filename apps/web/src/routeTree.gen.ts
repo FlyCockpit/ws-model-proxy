@@ -16,6 +16,8 @@ import { Route as LangAuthRouteImport } from './routes/$lang/_auth'
 import { Route as LangAdminRouteImport } from './routes/$lang/admin'
 import { Route as LangDeviceRouteImport } from './routes/$lang/device'
 import { Route as LangLoginRouteImport } from './routes/$lang/login'
+import { Route as LangMcpConsentRouteImport } from './routes/$lang/mcp-consent'
+import { Route as LangMcpLoginRouteImport } from './routes/$lang/mcp-login'
 import { Route as LangSignupRouteImport } from './routes/$lang/signup'
 import { Route as LangVerifyEmailRouteImport } from './routes/$lang/verify-email'
 import { Route as LangAuthDashboardRouteImport } from './routes/$lang/_auth/dashboard'
@@ -34,6 +36,7 @@ import { Route as LangAuthDashboardModelApiTokensRouteImport } from './routes/$l
 import { Route as LangAuthDashboardPoolsRouteImport } from './routes/$lang/_auth/dashboard/pools'
 import { Route as LangAuthDashboardRelayMetadataRouteImport } from './routes/$lang/_auth/dashboard/relay-metadata'
 import { Route as LangAuthSettingsIndexRouteImport } from './routes/$lang/_auth/settings/index'
+import { Route as LangAuthSettingsMcpRouteImport } from './routes/$lang/_auth/settings/mcp'
 import { Route as LangAuthSettingsSecurityRouteImport } from './routes/$lang/_auth/settings/security'
 import { Route as LangAuthDashboardPoolsIndexRouteImport } from './routes/$lang/_auth/dashboard/pools/index'
 import { Route as LangAuthDashboardPoolsPoolIdRouteImport } from './routes/$lang/_auth/dashboard/pools/$poolId'
@@ -77,6 +80,16 @@ const LangDeviceRoute = LangDeviceRouteImport.update({
 const LangLoginRoute = LangLoginRouteImport.update({
   id: '/login',
   path: '/login',
+  getParentRoute: () => LangRoute,
+} as any)
+const LangMcpConsentRoute = LangMcpConsentRouteImport.update({
+  id: '/mcp-consent',
+  path: '/mcp-consent',
+  getParentRoute: () => LangRoute,
+} as any)
+const LangMcpLoginRoute = LangMcpLoginRouteImport.update({
+  id: '/mcp-login',
+  path: '/mcp-login',
   getParentRoute: () => LangRoute,
 } as any)
 const LangSignupRoute = LangSignupRouteImport.update({
@@ -174,6 +187,11 @@ const LangAuthSettingsIndexRoute = LangAuthSettingsIndexRouteImport.update({
   path: '/',
   getParentRoute: () => LangAuthSettingsRoute,
 } as any)
+const LangAuthSettingsMcpRoute = LangAuthSettingsMcpRouteImport.update({
+  id: '/mcp',
+  path: '/mcp',
+  getParentRoute: () => LangAuthSettingsRoute,
+} as any)
 const LangAuthSettingsSecurityRoute =
   LangAuthSettingsSecurityRouteImport.update({
     id: '/security',
@@ -241,6 +259,8 @@ export interface FileRoutesByFullPath {
   '/$lang/admin': typeof LangAdminRouteWithChildren
   '/$lang/device': typeof LangDeviceRoute
   '/$lang/login': typeof LangLoginRoute
+  '/$lang/mcp-consent': typeof LangMcpConsentRoute
+  '/$lang/mcp-login': typeof LangMcpLoginRoute
   '/$lang/signup': typeof LangSignupRoute
   '/$lang/verify-email': typeof LangVerifyEmailRoute
   '/$lang/': typeof LangIndexRoute
@@ -258,6 +278,7 @@ export interface FileRoutesByFullPath {
   '/$lang/dashboard/model-api-tokens': typeof LangAuthDashboardModelApiTokensRoute
   '/$lang/dashboard/pools': typeof LangAuthDashboardPoolsRouteWithChildren
   '/$lang/dashboard/relay-metadata': typeof LangAuthDashboardRelayMetadataRoute
+  '/$lang/settings/mcp': typeof LangAuthSettingsMcpRoute
   '/$lang/settings/security': typeof LangAuthSettingsSecurityRoute
   '/$lang/dashboard/': typeof LangAuthDashboardIndexRoute
   '/$lang/settings/': typeof LangAuthSettingsIndexRoute
@@ -276,6 +297,8 @@ export interface FileRoutesByTo {
   '/$lang': typeof LangIndexRoute
   '/$lang/device': typeof LangDeviceRoute
   '/$lang/login': typeof LangLoginRoute
+  '/$lang/mcp-consent': typeof LangMcpConsentRoute
+  '/$lang/mcp-login': typeof LangMcpLoginRoute
   '/$lang/signup': typeof LangSignupRoute
   '/$lang/verify-email': typeof LangVerifyEmailRoute
   '/$lang/admin/devices': typeof LangAdminDevicesRoute
@@ -289,6 +312,7 @@ export interface FileRoutesByTo {
   '/$lang/dashboard/clis': typeof LangAuthDashboardClisRoute
   '/$lang/dashboard/model-api-tokens': typeof LangAuthDashboardModelApiTokensRoute
   '/$lang/dashboard/relay-metadata': typeof LangAuthDashboardRelayMetadataRoute
+  '/$lang/settings/mcp': typeof LangAuthSettingsMcpRoute
   '/$lang/settings/security': typeof LangAuthSettingsSecurityRoute
   '/$lang/dashboard': typeof LangAuthDashboardIndexRoute
   '/$lang/settings': typeof LangAuthSettingsIndexRoute
@@ -309,6 +333,8 @@ export interface FileRoutesById {
   '/$lang/admin': typeof LangAdminRouteWithChildren
   '/$lang/device': typeof LangDeviceRoute
   '/$lang/login': typeof LangLoginRoute
+  '/$lang/mcp-consent': typeof LangMcpConsentRoute
+  '/$lang/mcp-login': typeof LangMcpLoginRoute
   '/$lang/signup': typeof LangSignupRoute
   '/$lang/verify-email': typeof LangVerifyEmailRoute
   '/$lang/': typeof LangIndexRoute
@@ -326,6 +352,7 @@ export interface FileRoutesById {
   '/$lang/_auth/dashboard/model-api-tokens': typeof LangAuthDashboardModelApiTokensRoute
   '/$lang/_auth/dashboard/pools': typeof LangAuthDashboardPoolsRouteWithChildren
   '/$lang/_auth/dashboard/relay-metadata': typeof LangAuthDashboardRelayMetadataRoute
+  '/$lang/_auth/settings/mcp': typeof LangAuthSettingsMcpRoute
   '/$lang/_auth/settings/security': typeof LangAuthSettingsSecurityRoute
   '/$lang/_auth/dashboard/': typeof LangAuthDashboardIndexRoute
   '/$lang/_auth/settings/': typeof LangAuthSettingsIndexRoute
@@ -347,6 +374,8 @@ export interface FileRouteTypes {
     | '/$lang/admin'
     | '/$lang/device'
     | '/$lang/login'
+    | '/$lang/mcp-consent'
+    | '/$lang/mcp-login'
     | '/$lang/signup'
     | '/$lang/verify-email'
     | '/$lang/'
@@ -364,6 +393,7 @@ export interface FileRouteTypes {
     | '/$lang/dashboard/model-api-tokens'
     | '/$lang/dashboard/pools'
     | '/$lang/dashboard/relay-metadata'
+    | '/$lang/settings/mcp'
     | '/$lang/settings/security'
     | '/$lang/dashboard/'
     | '/$lang/settings/'
@@ -382,6 +412,8 @@ export interface FileRouteTypes {
     | '/$lang'
     | '/$lang/device'
     | '/$lang/login'
+    | '/$lang/mcp-consent'
+    | '/$lang/mcp-login'
     | '/$lang/signup'
     | '/$lang/verify-email'
     | '/$lang/admin/devices'
@@ -395,6 +427,7 @@ export interface FileRouteTypes {
     | '/$lang/dashboard/clis'
     | '/$lang/dashboard/model-api-tokens'
     | '/$lang/dashboard/relay-metadata'
+    | '/$lang/settings/mcp'
     | '/$lang/settings/security'
     | '/$lang/dashboard'
     | '/$lang/settings'
@@ -414,6 +447,8 @@ export interface FileRouteTypes {
     | '/$lang/admin'
     | '/$lang/device'
     | '/$lang/login'
+    | '/$lang/mcp-consent'
+    | '/$lang/mcp-login'
     | '/$lang/signup'
     | '/$lang/verify-email'
     | '/$lang/'
@@ -431,6 +466,7 @@ export interface FileRouteTypes {
     | '/$lang/_auth/dashboard/model-api-tokens'
     | '/$lang/_auth/dashboard/pools'
     | '/$lang/_auth/dashboard/relay-metadata'
+    | '/$lang/_auth/settings/mcp'
     | '/$lang/_auth/settings/security'
     | '/$lang/_auth/dashboard/'
     | '/$lang/_auth/settings/'
@@ -499,6 +535,20 @@ declare module '@tanstack/react-router' {
       path: '/login'
       fullPath: '/$lang/login'
       preLoaderRoute: typeof LangLoginRouteImport
+      parentRoute: typeof LangRoute
+    }
+    '/$lang/mcp-consent': {
+      id: '/$lang/mcp-consent'
+      path: '/mcp-consent'
+      fullPath: '/$lang/mcp-consent'
+      preLoaderRoute: typeof LangMcpConsentRouteImport
+      parentRoute: typeof LangRoute
+    }
+    '/$lang/mcp-login': {
+      id: '/$lang/mcp-login'
+      path: '/mcp-login'
+      fullPath: '/$lang/mcp-login'
+      preLoaderRoute: typeof LangMcpLoginRouteImport
       parentRoute: typeof LangRoute
     }
     '/$lang/signup': {
@@ -625,6 +675,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/$lang/settings/'
       preLoaderRoute: typeof LangAuthSettingsIndexRouteImport
+      parentRoute: typeof LangAuthSettingsRoute
+    }
+    '/$lang/_auth/settings/mcp': {
+      id: '/$lang/_auth/settings/mcp'
+      path: '/mcp'
+      fullPath: '/$lang/settings/mcp'
+      preLoaderRoute: typeof LangAuthSettingsMcpRouteImport
       parentRoute: typeof LangAuthSettingsRoute
     }
     '/$lang/_auth/settings/security': {
@@ -775,11 +832,13 @@ const LangAuthDashboardRouteWithChildren =
   LangAuthDashboardRoute._addFileChildren(LangAuthDashboardRouteChildren)
 
 interface LangAuthSettingsRouteChildren {
+  LangAuthSettingsMcpRoute: typeof LangAuthSettingsMcpRoute
   LangAuthSettingsSecurityRoute: typeof LangAuthSettingsSecurityRoute
   LangAuthSettingsIndexRoute: typeof LangAuthSettingsIndexRoute
 }
 
 const LangAuthSettingsRouteChildren: LangAuthSettingsRouteChildren = {
+  LangAuthSettingsMcpRoute: LangAuthSettingsMcpRoute,
   LangAuthSettingsSecurityRoute: LangAuthSettingsSecurityRoute,
   LangAuthSettingsIndexRoute: LangAuthSettingsIndexRoute,
 }
@@ -826,6 +885,8 @@ interface LangRouteChildren {
   LangAdminRoute: typeof LangAdminRouteWithChildren
   LangDeviceRoute: typeof LangDeviceRoute
   LangLoginRoute: typeof LangLoginRoute
+  LangMcpConsentRoute: typeof LangMcpConsentRoute
+  LangMcpLoginRoute: typeof LangMcpLoginRoute
   LangSignupRoute: typeof LangSignupRoute
   LangVerifyEmailRoute: typeof LangVerifyEmailRoute
   LangIndexRoute: typeof LangIndexRoute
@@ -836,6 +897,8 @@ const LangRouteChildren: LangRouteChildren = {
   LangAdminRoute: LangAdminRouteWithChildren,
   LangDeviceRoute: LangDeviceRoute,
   LangLoginRoute: LangLoginRoute,
+  LangMcpConsentRoute: LangMcpConsentRoute,
+  LangMcpLoginRoute: LangMcpLoginRoute,
   LangSignupRoute: LangSignupRoute,
   LangVerifyEmailRoute: LangVerifyEmailRoute,
   LangIndexRoute: LangIndexRoute,
