@@ -5,7 +5,7 @@ import { MCP_REAUTH_STATUS_QUERY_KEY } from "@/lib/mcp-oauth-search";
 
 /**
  * Sign-out for the MCP login page's tombstone-reauthorization branch
- * (MCP plan Phase 6).
+ * (Phase 6).
  *
  * `disableRedirect: true` and NO navigation: the signed `oauth_query` lives
  * in the CURRENT page URL, and keeping it there is what lets Better Auth's

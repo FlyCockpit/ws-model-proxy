@@ -2,7 +2,7 @@ import type { MiddlewareHandler } from "hono";
 import { cloneRequestOntoPublicOrigin, PublicRequestError } from "./public-request-url.js";
 
 /**
- * MCP discovery alias forwarding (MCP plan Phase 3).
+ * MCP discovery alias forwarding (Phase 3).
  *
  * Probe results (2026-09-16, installed better-auth@1.7.3 family, real
  * `auth.handler` driven with a memory adapter and `resolveMcpPlugins`):
@@ -52,7 +52,7 @@ const ALLOW_GET_HEAD = "GET, HEAD";
 /**
  * Create the forwarding middleware for one well-known alias.
  *
- * Contract (per MCP plan Phase 3):
+ * Contract (per Phase 3):
  * - flag OFF → 404 for EVERY method (path still reserved);
  * - GET → provider metadata from the installed Better Auth handler;
  * - HEAD → same status + headers as GET, NO body (explicit adapter);

@@ -340,8 +340,8 @@ export const ENV_VARS: EnvVar[] = [
     default: "false",
     comment: [
       "Release gate for the MCP server and OAuth provider surface (jwt/mcp/cimd",
-      "plugins, /mcp, discovery, MCP login/consent). Keep false until the MCP plan",
-      "phases land. Human grant listing/revocation stays available while disabled.",
+      "plugins, /mcp, discovery, MCP login/consent). Keep false until the feature is",
+      "ready for release. Human grant listing/revocation stays available while disabled.",
     ],
   },
   {

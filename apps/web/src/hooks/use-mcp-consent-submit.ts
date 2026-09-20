@@ -4,7 +4,7 @@ import { resolveOauthRedirectUrl } from "@/lib/mcp-oauth-search";
 
 /**
  * Consent submission with transaction/page lifetime ownership
- * (MCP plan Phase 6, Part H pass 3 — R85 N2).
+ * (Phase 6, Part H pass 3 — R85 N2).
  *
  * The terminal phase belongs to ONE transaction rendering. The consent page
  * remounts this hook (`key={fingerprint}` on the transaction-scoped inner

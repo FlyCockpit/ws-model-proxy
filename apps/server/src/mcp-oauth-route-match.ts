@@ -114,7 +114,7 @@ export function isMcpOauthRawPath(rawPathname: string): boolean {
 }
 
 /**
- * MCP OAuth flag-off 404 gate (MCP plan Phase 9 / invariant 13: while
+ * MCP OAuth flag-off 404 gate (Phase 9 / invariant 13: while
  * WMP_MCP_ENABLED is off, MCP OAuth routes return REAL 404s — authorization
  * remains flag-gated even when the installed provider is present, e.g. a
  * flag flip without a rebuilt plugin list or a test instance that always

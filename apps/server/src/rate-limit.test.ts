@@ -184,7 +184,7 @@ describe("createRateLimiterMiddleware", () => {
 });
 
 // ---------------------------------------------------------------------------
-// resolveKey extension (MCP plan Phase 3): typed, optional, and existing
+// resolveKey extension (Phase 3): typed, optional, and existing
 // callers' default keying is byte-identical.
 // ---------------------------------------------------------------------------
 

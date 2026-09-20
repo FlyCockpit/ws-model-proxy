@@ -5,7 +5,7 @@ import { protectedProcedure } from "../index";
 import { runSerializableTransaction } from "../lib/serializable-transaction";
 
 /**
- * Human MCP grant management (MCP plan Phase 7).
+ * Human MCP grant management (Phase 7).
  *
  * Both procedures are HUMAN-ONLY browser-session surfaces: they never accept
  * a caller-supplied user id (identity is always the protected procedure's

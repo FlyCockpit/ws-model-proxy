@@ -1,5 +1,5 @@
 /**
- * OAuth retention and cleanup (MCP plan Phase 8, Part J).
+ * OAuth retention and cleanup (Phase 8, Part J).
  *
  * A periodic, idempotent, predicate-bounded sweep of EXPIRED Better Auth OAuth
  * artifacts: opaque access-token rows, refresh-token rows, client
@@ -84,7 +84,7 @@
  * because it must prove enumeration completeness for a security decision;
  * this sweep has no such completeness obligation — deleting an
  * uninspectable row could destroy an unrelated verification record (the one
- * harm the plan forbids), while retaining it costs only storage and is
+ * harm that deletion would cause), while retaining it costs only storage and is
  * observable (the retained-row count). Retained rows consume only the scan
  * budget — the scan advances past them via strict id-gt pagination, so they
  * never block collection of valid rows behind them within the scan cap (see
@@ -94,7 +94,7 @@
  * not to be an authorization code and is likewise left untouched — it is
  * another subsystem's record (email/OTP), never this sweep's business.
  *
- * DEFERRALS (plan-mandated — do NOT implement without separate review):
+ * DEFERRED ITEMS (do not implement without separate review):
  *  - AUTOMATIC CIMD-CLIENT DELETION: deferred until a separately reviewed
  *    policy can require `clientDiscoveryId === "cimd"`, a fixed inactivity
  *    cutoff, and absence of EVERY live consent, token, authorization code,
@@ -107,7 +107,7 @@
  *    resource (`OauthResource.signingKeyId`).
  *
  * Rollback note: the job is gated on `WMP_MCP_ENABLED` (null when off), so
- * the plan's emergency rollback (`WMP_MCP_ENABLED=false` + restart) also
+ * the emergency rollback (`WMP_MCP_ENABLED=false` + restart) also
  * stops token-data deletion ("do not delete token data during rollback").
  */
 
@@ -122,7 +122,7 @@ type OAuthCleanupPrisma = Pick<
 >;
 
 // ---------------------------------------------------------------------------
-// Cutoffs — CODE CONSTANTS per the plan (no env vars; `pnpm env:check` must
+// Cutoffs — code constants, not environment variables; `pnpm env:check` must
 // stay unchanged). Every value below is a deliberate, documented choice.
 // ---------------------------------------------------------------------------
 

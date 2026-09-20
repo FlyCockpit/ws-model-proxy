@@ -18,7 +18,7 @@ import {
 import { getMcpWebAvailability } from "@/server/mcp-availability";
 
 /**
- * MCP OAuth login page (MCP plan Phase 6) — the same localized route Better
+ * MCP OAuth login page (Phase 6) — the same localized route Better
  * Auth's `postLogin.page` points at (`packages/auth/src/mcp-config.ts`,
  * `MCP_LOGIN_PAGE_PATH_DEFAULT`).
  *

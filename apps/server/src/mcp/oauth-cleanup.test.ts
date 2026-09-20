@@ -1,5 +1,5 @@
 /**
- * OAuth retention and cleanup tests (MCP plan Phase 8, Part J).
+ * OAuth retention and cleanup tests (Phase 8, Part J).
  *
  * Prisma is mocked with mockDeep (`vi.mock("@ws-model-proxy/db")`) and
  * surface-typed via the repo's established `as unknown as {...MockInstance}`

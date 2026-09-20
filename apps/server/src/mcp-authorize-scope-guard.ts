@@ -3,7 +3,7 @@ import { env } from "@ws-model-proxy/env/server";
 import type { MiddlewareHandler } from "hono";
 
 /**
- * Server-side authorization request boundary (MCP plan Phase 2).
+ * Server-side authorization request boundary (Phase 2).
  *
  * Better Auth 1.7 has no `defaultScope` option: a missing/blank `scope` on
  * `/api/auth/oauth2/authorize` must be rejected HERE, locally and

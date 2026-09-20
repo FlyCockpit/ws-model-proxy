@@ -2,13 +2,12 @@ import { DEFAULT_LOCALE, type Locale } from "@ws-model-proxy/config/locales";
 import { env } from "@ws-model-proxy/env/server";
 
 /**
- * Pure MCP configuration (MCP plan Phase 1).
+ * Pure MCP configuration.
  *
  * Everything here is derived from `BETTER_AUTH_URL` / `CORS_ORIGIN` and named
  * code constants — deliberately NO new env vars. Security invariant 1: one
  * canonical public MCP resource URL derived from `BETTER_AUTH_URL`, ending in
- * `/mcp`. Token lifetimes stay named constants (the plan reserves them for
- * code, not operator tuning).
+ * `/mcp`. Token lifetimes stay named constants in code, not operator tuning.
  *
  * The `*` derivation functions are pure (explicit inputs) so tests and later
  * phases can compute canonical values for any origin; the module-level
@@ -16,7 +15,7 @@ import { env } from "@ws-model-proxy/env/server";
  */
 
 // ---------------------------------------------------------------------------
-// Token lifetimes — named constants, NOT env vars (plan: "Resolved defaults").
+// Token lifetimes — named constants, not environment variables.
 // ---------------------------------------------------------------------------
 
 /** Resource-bound MCP access JWT lifetime: 10 minutes. */

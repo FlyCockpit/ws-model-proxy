@@ -27,7 +27,7 @@ import {
 } from "./errors";
 
 /**
- * MCP request authentication (MCP plan Phase 4 items 1-9).
+ * MCP request authentication (Phase 4 items 1-9).
  *
  * The INSTALLED upstream verification API is `requireMcpAuth(auth, handler,
  * opts)` from `@better-auth/mcp@1.7.3` (dist/index.d.mts,

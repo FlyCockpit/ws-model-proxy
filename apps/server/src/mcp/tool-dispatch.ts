@@ -1,5 +1,5 @@
 /**
- * Per-request MCP tool dispatch binding (MCP plan Phase 5).
+ * Per-request MCP tool dispatch binding (Phase 5).
  *
  * The Phase 4 `onVerified` seam (mcp/auth.ts) runs after EVERY admission
  * check and receives `{ authInfo, orpcContext }`. The transport factory

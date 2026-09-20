@@ -2,7 +2,7 @@ import { MCP_WELL_KNOWN_PATHS } from "./mcp-discovery.js";
 import { MCP_WEB_PAGE_PATHS } from "./mcp-web-page-gate.js";
 
 /**
- * OAuth request-log redaction (MCP plan invariant 10).
+ * OAuth request-log redaction (invariant 10).
  *
  * The stock hono `logger()` prints the full request URL INCLUDING the query
  * string; OAuth authorization URLs carry `state`, `code_challenge`,

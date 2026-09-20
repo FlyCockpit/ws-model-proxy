@@ -1,5 +1,5 @@
 /**
- * Central MCP tool wrappers (MCP plan Phase 5).
+ * Central MCP tool wrappers (Phase 5).
  *
  * `registerMcpTools` is the production `registerTools` seam the transport
  * factory calls once per request (mcp/handler.ts). For every manifest

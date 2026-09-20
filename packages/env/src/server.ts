@@ -64,7 +64,7 @@ export const env = createEnv({
     // Same idea for signup (also mails a caller-supplied address). Higher
     // budget so shared-NAT offices still work.
     RATE_LIMIT_SIGNUP_RECIPIENT_POINTS: z.coerce.number().int().min(0).default(6),
-    // MCP endpoint limiters (MCP plan Phase 1; enforced when the Phase 3
+    // MCP endpoint limiters (Phase 1; enforced when the Phase 3
     // routing lands). Unconditional IP-keyed /mcp quota and a tighter
     // session-keyed budget for the human login/consent forms. Durations are
     // seconds.
@@ -162,11 +162,11 @@ export const env = createEnv({
     // Provider egress remains disabled until the full overflow admission and
     // settlement path is enabled. The keyring is optional while that gate is off.
     WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: strictBooleanFlag(),
-    // MCP server + OAuth provider surface (MCP plan Phase 0b). Dormant by
+    // MCP server + OAuth provider surface (Phase 0b). Dormant by
     // default: while false, the jwt/mcp/cimd auth plugins are not installed,
     // no OAuth/JWKS routes exist, and the runtime Better Auth schema check
     // does not expect the OAuth/JWKS tables. Human grant listing/revocation
-    // stays available when disabled (emergency kill switch), per the plan.
+    // stays available when disabled (emergency kill switch), by design.
     WMP_MCP_ENABLED: strictBooleanFlag(),
     WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: strictBooleanFlag(),
     WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS: z

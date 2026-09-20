@@ -1,5 +1,5 @@
 /**
- * Extracted graceful-shutdown ordering (MCP plan Phase 4 item 4).
+ * Extracted graceful-shutdown ordering (Phase 4 item 4).
  *
  * The load-bearing ORDER (unit-tested here):
  *

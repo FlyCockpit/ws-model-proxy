@@ -7,7 +7,7 @@ import type { ReactNode } from "react";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 /**
- * Shared-login parity tests (MCP plan Phase 6): the ONE SignInCard serves the
+ * Shared-login parity tests (Phase 6): the ONE SignInCard serves the
  * ordinary login route (mode "standard") and the MCP login route (mode
  * "mcp") without behavior drift — email/password, SSO, email-OTP, and
  * TOTP/2FA branches are the same component, and mcp mode only changes the

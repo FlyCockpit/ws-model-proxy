@@ -1,5 +1,5 @@
 /**
- * Pure helpers for the MCP login/consent pages (MCP plan Phase 6).
+ * Pure helpers for the MCP login/consent pages (Phase 6).
  *
  * The signed OAuth transaction lives in the page URL as individual query
  * parameters (client_id, scope, resource, state, code_challenge, … plus the

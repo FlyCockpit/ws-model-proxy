@@ -2,7 +2,7 @@ import { createServerFn } from "@tanstack/react-start";
 
 /**
  * RAW (never re-serialized) request query string for the MCP page routes
- * (MCP plan Phase 6, Part H pass 2 — R83/R84 F1).
+ * (Phase 6, Part H pass 2 — R83/R84 F1).
  *
  * TanStack Router round-trips search through parseSearch → stringifySearch on
  * every navigation and even when deriving `location.searchStr`, which

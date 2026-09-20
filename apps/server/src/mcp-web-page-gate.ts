@@ -2,7 +2,7 @@ import { SUPPORTED_LOCALES } from "@ws-model-proxy/config/locales";
 import type { Context, MiddlewareHandler } from "hono";
 
 /**
- * MCP web login/consent page gate (MCP plan Phase 6; invariant 13: while
+ * MCP web login/consent page gate (Phase 6; invariant 13: while
  * `WMP_MCP_ENABLED` is off, MCP login/consent routes return REAL 404s).
  *
  * Gate scope — EXACT valid-locale forms ONLY:

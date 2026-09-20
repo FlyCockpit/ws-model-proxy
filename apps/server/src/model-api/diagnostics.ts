@@ -1,5 +1,5 @@
 /**
- * Extracted diagnostic cores (MCP plan Phase 5 — "Extracted diagnostic cores").
+ * Extracted diagnostic cores (Phase 5 — "Extracted diagnostic cores").
  *
  * Typed, USER-ID-BOUND application functions shared by the internal Hono
  * routes and the MCP tools. The Hono routes (chat-test.ts / pool-member-test.ts)
@@ -30,7 +30,7 @@
  * `chatTestCompletionsHandler` core (routes.ts): it builds a synthetic
  * chat-completions Request, dispatches it through the SAME singletons, and
  * projects the response to a bounded, provider-safe summary — the raw
- * provider response NEVER crosses this boundary (MCP plan invariant 10).
+ * provider response NEVER crosses this boundary (invariant 10).
  */
 
 import { markPoolMemberRelaySuccess } from "@ws-model-proxy/api/lib/model-pool-routing";
