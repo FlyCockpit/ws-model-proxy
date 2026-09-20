@@ -76,7 +76,8 @@ export function resolveMcpPlugins({ enabled, baseUrl }: { enabled: boolean; base
       allowPublicClientPrelogin: true,
 
       // Scopes this server can mint; registration ceilings below cap what a
-      // CIMD client can register as capabilities (defaults + allowed extras).
+      // CIMD or dynamically registered client can register as capabilities
+      // (defaults + allowed extras).
       // Registration ceilings do NOT replace authorization-request scope
       // validation — Better Auth validates every requested scope at authorize
       // time, and the server-side authorize scope boundary (apps/server)
@@ -89,12 +90,11 @@ export function resolveMcpPlugins({ enabled, baseUrl }: { enabled: boolean; base
       // registration requests cannot relax it).
       clientRegistrationRequirePKCE: true,
 
-      // DCR disabled through BOTH registration controls: the RFC 7591 endpoint
-      // is off (allowDynamicClientRegistration) and open/unauthenticated
-      // registration is off too. CIMD first-use discovery (cimd() below) is
-      // the only client-registration path.
-      allowDynamicClientRegistration: false,
-      allowUnauthenticatedClientRegistration: false,
+      // RFC 7591 DCR is advertised. rmcp/Grok registers without an initial
+      // client credential, so unauthenticated registration is enabled too.
+      // Registration ceilings and forced PKCE above still apply.
+      allowDynamicClientRegistration: true,
+      allowUnauthenticatedClientRegistration: true,
 
       // User-bound tools only: authorization code + rotating refresh. Never
       // client_credentials.

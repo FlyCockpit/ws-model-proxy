@@ -38,8 +38,8 @@ export const MCP_OAUTH_RATE_LIMITED_ROUTES = [
  * namespace (`mcp()` IS the OAuth provider — the only OAuth surface this app
  * registers; the provider's installed 1.7.3 dist serves authorize, token,
  * consent, continue, revoke, introspect, public-client,
- * public-client-prelogin, delete-consent, register (DCR — refused 403 by our
- * config), userinfo, and the client/resource CRUD family under /oauth2/*)
+ * public-client-prelogin, delete-consent, register (DCR), userinfo, and the
+ * client/resource CRUD family under /oauth2/*)
  * plus the jwt() plugin's JWKS endpoint. There is no non-MCP OAuth provider
  * in this app (ssoEnabled: false, no separate oauthProvider plugin), so the
  * flag-off gate below may own the whole namespace: while the flag is off NO

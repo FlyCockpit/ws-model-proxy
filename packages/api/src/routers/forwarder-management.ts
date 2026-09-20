@@ -265,21 +265,6 @@ type UserSlugRow = {
   slug: string;
 };
 
-type SlugPreviewDirectModelRow = {
-  id: string;
-  upstreamModelId: string;
-  Endpoint: {
-    slug: string;
-    CliDevice: { slug: string };
-  };
-};
-
-type SlugPreviewPoolRow = {
-  id: string;
-  slug: string;
-  name: string;
-};
-
 const listCliDevicesSelect = {
   id: true,
   createdAt: true,
@@ -357,131 +342,8 @@ type CliDeviceRow = Prisma.CliDeviceGetPayload<{ select: typeof listCliDevicesSe
 type EndpointRow = CliDeviceRow["Endpoints"][number];
 type DiscoveredModelRow = EndpointRow["DiscoveredModels"][number];
 
-type ModelPoolRow = {
-  id: string;
-  createdAt: Date;
-  updatedAt: Date;
-  slug: string;
-  name: string;
-  description: string | null;
-  maxAttachmentBytes: number | null;
-  optimisticBasicTranscription: boolean;
-  protocolAdaptationEnabled: boolean;
-  publicEgressEnabled: boolean;
-  publicEgressAcknowledged: boolean;
-  allowLossyDeveloperRoleCollapse: boolean;
-  recommendedSurfaceOverride: string | null;
-  capacityPriority: number;
-  capacityConcurrencyLimit: number | null;
-  capacityReservedSlots: number;
-  capacityBorrowPolicy: string;
-  capacityWaitBudgetMs: number | null;
-  capacityContextCeiling: number | null;
-  capacityContextMargin: number;
-  affinityEnabled: boolean;
-  affinityTtlSeconds: number;
-  affinityMaxRecords: number;
-  affinityPrefixWeight: number;
-  affinityConversationWeight: number;
-  affinityConfirmedCacheWeight: number;
-  affinityLoadPenaltyWeight: number;
-  transformerDiscoveredModelId: string | null;
-  transformerSystemPrompt: string | null;
-  transformerImages: boolean;
-  transformerAudio: boolean;
-  transformerVideo: boolean;
-  transformerCacheMode: string;
-  transformerIncludePrimaryTools: boolean;
-  transformerMaxTools: number;
-  transformerMaxToolChars: number;
-  transformerTimeoutMs: number | null;
-  transformerMaxAssets: number | null;
-  User: { slug: string };
-  TransformerDiscoveredModel: {
-    id: string;
-    upstreamModelId: string;
-    User: { slug: string };
-    Endpoint: {
-      id: string;
-      slug: string;
-      CliDevice: { slug: string };
-    };
-  } | null;
-  PoolMembers: PoolMemberRow[];
-  PoolGrants: PoolGrantRow[];
-};
-
-type PoolMemberRow = {
-  id: string;
-  createdAt: Date;
-  updatedAt: Date;
-  discoveredModelId: string | null;
-  tier: "PRIMARY" | "PUBLIC_OVERFLOW";
-  publicOrder: number | null;
-  weight: number;
-  healthStatus: string;
-  routingStatus: string;
-  lastFailureClass: string | null;
-  consecutiveRetryableFailures: number;
-  lastFailureAt: Date | null;
-  nextRetryAt: Date | null;
-  halfOpenTrialStartedAt: Date | null;
-  capacityPriority: number | null;
-  capacityConcurrencyMode: "INHERIT" | "LIMITED" | "UNLIMITED";
-  capacityConcurrencyLimit: number | null;
-  capacityReservedSlots: number | null;
-  capacityBorrowPolicy: string | null;
-  capacityWaitBudgetMode: "INHERIT" | "LIMITED" | "UNLIMITED";
-  capacityWaitBudgetMs: number | null;
-  capacityContextCeilingMode: "INHERIT" | "LIMITED" | "UNLIMITED";
-  capacityContextCeiling: number | null;
-  capacityContextMargin: number | null;
-  DiscoveredModel: PoolMemberModelRow | null;
-  ExecutionTarget: {
-    id: string;
-    kind: string;
-    inferenceCapacityId: string | null;
-    DiscoveredModel: PoolMemberModelRow | null;
-    ProviderModel: {
-      id: string;
-      upstreamModelId: string;
-      displayName: string | null;
-      nativeCapabilities: unknown | null;
-      contextWindow: number | null;
-      concurrencyLimit: number | null;
-      healthStatus: string;
-      enabled: boolean;
-      PricingVersions: Array<{ version: string; currency: string }>;
-      ProviderAccount: { id: string; label: string; providerType: string; enabled: boolean };
-    } | null;
-  } | null;
-};
-
-type PoolMemberModelRow = {
-  id: string;
-  upstreamModelId: string;
-  capabilityOverrideMode: string;
-  capabilityOverrides: string[];
-  capabilityOverrideMetadata: unknown | null;
-  User: { slug: string };
-  Endpoint: {
-    id: string;
-    slug: string;
-    capabilityMetadata: unknown | null;
-    defaultCapabilities: string[];
-    CliDevice: { slug: string };
-  };
-};
-
-type PoolGrantRow = {
-  id: string;
-  createdAt: Date;
-  granteeUserId: string;
-  Grantee: {
-    email: string;
-    name: string;
-  };
-};
+type ModelPoolRow = Prisma.ModelPoolGetPayload<{ select: typeof poolSelect }>;
+type PoolMemberModelRow = NonNullable<ModelPoolRow["PoolMembers"][number]["DiscoveredModel"]>;
 
 async function assertAttachmentLimitWithinGlobal(maxAttachmentBytes: number | null | undefined) {
   if (maxAttachmentBytes === undefined || maxAttachmentBytes === null) return;
@@ -503,10 +365,10 @@ function slugValidationError(slug: string) {
 }
 
 async function currentUserSlug(userId: string): Promise<UserSlugRow> {
-  const user = (await prisma.user.findUnique({
+  const user = await prisma.user.findUnique({
     where: { id: userId },
     select: { id: true, slug: true },
-  })) as UserSlugRow | null;
+  });
   if (!user) throw new ORPCError("NOT_FOUND", { message: "User not found." });
   return user;
 }
@@ -554,7 +416,7 @@ async function userSlugChangePreview({ userId, nextSlug }: { userId: string; nex
     }),
   ]);
 
-  const directModels = (directRows as SlugPreviewDirectModelRow[]).map((model) => ({
+  const directModels = directRows.map((model) => ({
     kind: "DIRECT_MODEL" as const,
     id: model.id,
     upstreamModelId: model.upstreamModelId,
@@ -572,7 +434,7 @@ async function userSlugChangePreview({ userId, nextSlug }: { userId: string; nex
     }),
   }));
 
-  const modelPools = (poolRows as SlugPreviewPoolRow[]).map((pool) => ({
+  const modelPools = poolRows.map((pool) => ({
     kind: "MODEL_POOL" as const,
     id: pool.id,
     name: pool.name,
@@ -600,7 +462,7 @@ async function serializeVisibleTargets(targets: VisibleModelTargets) {
       : [],
   ]);
   const poolCompatibility = new Map(
-    (poolRows as ModelPoolRow[]).map((row) => {
+    poolRows.map((row) => {
       const serialized = serializePool(row);
       return [row.id, serialized.compatibility] as const;
     }),
@@ -1046,7 +908,7 @@ async function transformerCapabilitiesForOwnedModel(
   discoveredModelId: string,
   userId: string,
 ): Promise<ReturnType<typeof transformerSupportedModalities>> {
-  const model = (await prisma.discoveredModel.findUnique({
+  const model = await prisma.discoveredModel.findUnique({
     where: { id: discoveredModelId },
     select: {
       id: true,
@@ -1056,14 +918,7 @@ async function transformerCapabilitiesForOwnedModel(
       capabilityOverrideMetadata: true,
       Endpoint: { select: { published: true, capabilityMetadata: true } },
     },
-  })) as {
-    id: string;
-    userId: string;
-    published: boolean;
-    capabilityOverrideMode: string;
-    capabilityOverrideMetadata: unknown | null;
-    Endpoint: { published: boolean; capabilityMetadata: unknown | null };
-  } | null;
+  });
   if (!model || model.userId !== userId) {
     throw new ORPCError("NOT_FOUND", { message: "Discovered model not found." });
   }
@@ -1357,7 +1212,7 @@ const poolSelect = {
       Grantee: { select: { email: true, name: true } },
     },
   },
-} as const;
+} satisfies Prisma.ModelPoolSelect;
 
 export const forwarderManagementRouter = {
   listGuardedOverflowCandidates: protectedProcedure.handler(async ({ context }) => {
@@ -2124,10 +1979,10 @@ export const forwarderManagementRouter = {
           },
         });
         guardedSetupTestFailure?.();
-        const created = (await tx.modelPool.findUnique({
+        const created = await tx.modelPool.findUnique({
           where: { id: pool.id },
           select: poolSelect,
-        })) as ModelPoolRow | null;
+        });
         if (!created) throw new ORPCError("INTERNAL_SERVER_ERROR");
         return serializePool(created);
       });
@@ -2205,11 +2060,11 @@ export const forwarderManagementRouter = {
     ),
 
   listModelPools: protectedProcedure.handler(async ({ context }) => {
-    const rows = (await prisma.modelPool.findMany({
+    const rows = await prisma.modelPool.findMany({
       where: { userId: context.session.user.id },
       orderBy: { createdAt: "desc" },
       select: poolSelect,
-    })) as ModelPoolRow[];
+    });
     return rows.map(serializePool);
   }),
 
@@ -2359,10 +2214,10 @@ export const forwarderManagementRouter = {
         capacityBorrowPolicy: data.capacityBorrowPolicy,
       } as const;
       const row = await prisma.$transaction(async (tx) => {
-        const created = (await tx.modelPool.create({
+        const created = await tx.modelPool.create({
           data,
           select: poolSelect,
-        })) as ModelPoolRow;
+        });
         await tx.capacityAuditEvent.create({
           data: {
             userId,
@@ -2405,7 +2260,7 @@ export const forwarderManagementRouter = {
       }),
     )
     .handler(async ({ input, context }) => {
-      const existing = (await prisma.modelPool.findUnique({
+      const existing = await prisma.modelPool.findUnique({
         where: { id: input.id },
         select: {
           id: true,
@@ -2420,19 +2275,7 @@ export const forwarderManagementRouter = {
           protocolAdaptationEnabled: true,
           allowLossyDeveloperRoleCollapse: true,
         },
-      })) as {
-        id: string;
-        userId: string;
-        transformerDiscoveredModelId: string | null;
-        transformerImages: boolean;
-        transformerAudio: boolean;
-        transformerVideo: boolean;
-        transformerCacheMode: string;
-        publicEgressEnabled: boolean;
-        publicEgressAcknowledged: boolean;
-        protocolAdaptationEnabled: boolean;
-        allowLossyDeveloperRoleCollapse: boolean;
-      } | null;
+      });
       if (!existing || existing.userId !== context.session.user.id) {
         throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
       }
@@ -2543,7 +2386,7 @@ export const forwarderManagementRouter = {
 
       await assertPoolTransformerIsValid(input, existing, context.session.user.id);
 
-      const row = (await runSerializableTransaction(async (tx) => {
+      const row = await runSerializableTransaction(async (tx) => {
         if (hasCapacityPolicy)
           await lockAndValidateModelPoolCapacityPolicy(tx, {
             modelPoolId: input.id,
@@ -2680,7 +2523,7 @@ export const forwarderManagementRouter = {
           },
           select: poolSelect,
         });
-      })) as ModelPoolRow;
+      });
       return serializePool(row);
     }),
 

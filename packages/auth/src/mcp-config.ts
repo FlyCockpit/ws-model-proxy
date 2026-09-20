@@ -32,13 +32,13 @@ export const MCP_REFRESH_RETRY_WINDOW_SECONDS = 30;
 // Registration + protocol policy.
 // ---------------------------------------------------------------------------
 
-/** CIMD-only client registration, pinned to the MCP 2026-07-28 profile. */
+/** MCP client registration, pinned to the MCP 2026-07-28 profile. */
 export const MCP_METADATA_PROFILE = "mcp-2026-07-28";
 
 export const MCP_CIMD_REGISTRATION_POLICY = {
   metadataProfile: MCP_METADATA_PROFILE,
-  /** DCR stays disabled and unadvertised; only CIMD first-use registration. */
-  dynamicClientRegistration: false,
+  /** Advertise RFC 7591 dynamic client registration alongside CIMD. */
+  dynamicClientRegistration: true,
 } as const;
 
 /** DPoP: advertised and validated when a client opts in, never mandatory. */

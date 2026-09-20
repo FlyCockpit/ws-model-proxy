@@ -26,11 +26,30 @@ export const env = createEnv({
     BETTER_AUTH_URL: originUrl("BETTER_AUTH_URL"),
     CORS_ORIGIN: originUrl("CORS_ORIGIN").optional(),
     SIGNUP_ENABLED: strictBooleanFlag(),
+    // On a fresh production database with public signup disabled, this is the
+    // sole address that may create the bootstrap administrator. Transform it
+    // into the exact database identity used by the auth hook, so case and
+    // surrounding whitespace cannot create a second bootstrap account.
+    ADMIN_EMAIL: z.string().trim().email().toLowerCase().optional(),
     RATE_LIMIT_RPC_POINTS: z.coerce.number().int().positive().default(100),
     RATE_LIMIT_RPC_DURATION: z.coerce.number().int().positive().default(60),
     RATE_LIMIT_AUTH_POINTS: z.coerce.number().int().positive().default(10),
     RATE_LIMIT_AUTH_DURATION: z.coerce.number().int().positive().default(60),
     RATE_LIMIT_AUTH_BLOCK_DURATION: z.coerce.number().int().positive().default(900),
+    // Per-account failed password checks. This complements the IP-keyed auth
+    // limiter: IP rotation must not multiply password guesses against one
+    // account. It is intentionally non-zero; disabling it reopens that gap.
+    RATE_LIMIT_SIGNIN_FAILURE_POINTS: z.coerce.number().int().positive().default(10),
+    RATE_LIMIT_SIGNIN_FAILURE_DURATION: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(15 * 60),
+    RATE_LIMIT_SIGNIN_FAILURE_BLOCK_DURATION: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(10 * 60),
     RATE_LIMIT_SIGNUP_POINTS: z.coerce.number().int().positive().default(3),
     RATE_LIMIT_SIGNUP_DURATION: z.coerce.number().int().positive().default(3600),
     RATE_LIMIT_SIGNUP_BLOCK_DURATION: z.coerce.number().int().positive().default(3600),
@@ -171,6 +190,12 @@ export const env = createEnv({
 });
 
 export const SIGNUP_ENABLED: boolean = env.SIGNUP_ENABLED;
+
+/**
+ * Canonical production bootstrap identity. The auth create hook persists this
+ * exact value for an admitted bootstrap, before Prisma enforces @@unique(email).
+ */
+export const ADMIN_EMAIL: string | undefined = env.ADMIN_EMAIL;
 
 // ---------------------------------------------------------------------------
 // Media store guard — MEDIA_ROOT is required, and must be absolute, when the

@@ -78,11 +78,50 @@ describe("resolveUserCreatePolicy", () => {
     ).toEqual({ role: "user", emailVerified: true });
   });
 
-  it("allows the first user on an empty DB even when signup is disabled", () => {
+  it("allows an authorized first user when signup is disabled", () => {
     expect(
       resolveUserCreatePolicy({
         signupEnabled: false,
         userCount: 0,
+        adminBootstrapAllowed: true,
+        emailConfigured: false,
+        requestedRole: "user",
+        contextPath: "/sign-up/email",
+      }),
+    ).toEqual({ role: "admin", emailVerified: true });
+  });
+
+  it("rejects an unlisted production bootstrap before it can receive the admin role", () => {
+    expect(() =>
+      resolveUserCreatePolicy({
+        signupEnabled: false,
+        userCount: 0,
+        adminBootstrapAllowed: false,
+        emailConfigured: false,
+        requestedRole: "admin",
+        contextPath: "/sign-up/email",
+      }),
+    ).toThrow(SIGNUP_DISABLED_MESSAGE);
+  });
+
+  it("fails closed when a creation path omits bootstrap authorization", () => {
+    expect(() =>
+      resolveUserCreatePolicy({
+        signupEnabled: false,
+        userCount: 0,
+        emailConfigured: false,
+        requestedRole: "admin",
+        contextPath: "/sign-up/email",
+      }),
+    ).toThrow(SIGNUP_DISABLED_MESSAGE);
+  });
+
+  it("allows a listed production bootstrap and assigns its first user admin", () => {
+    expect(
+      resolveUserCreatePolicy({
+        signupEnabled: false,
+        userCount: 0,
+        adminBootstrapAllowed: true,
         emailConfigured: false,
         requestedRole: "user",
         contextPath: "/sign-up/email",
@@ -95,6 +134,7 @@ describe("resolveUserCreatePolicy", () => {
       resolveUserCreatePolicy({
         signupEnabled: false,
         userCount: 0,
+        adminBootstrapAllowed: true,
         emailConfigured: true,
         requestedRole: "user",
         contextPath: "/admin/create-user",

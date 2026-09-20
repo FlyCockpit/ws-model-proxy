@@ -16,7 +16,7 @@ vi.mock("@ws-model-proxy/db", async () => {
 
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: { BETTER_AUTH_URL: "http://localhost:3000" },
-  ADMIN_EMAILS: new Set<string>(),
+  ADMIN_EMAIL: undefined,
 }));
 
 // Mock @ws-model-proxy/auth so the router's `auth.api.createUser` call hits a stub

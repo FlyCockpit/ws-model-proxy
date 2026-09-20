@@ -24,8 +24,8 @@ import { cloneRequestOntoPublicOrigin, PublicRequestError } from "./public-reque
  *   these two metadata path spellings; serves the RFC 8414 authorization
  *   server metadata (issuer, authorization/token/jwks/introspection/
  *   revocation endpoints, scopes, DPoP algorithms, CIMD advertisement via
- *   `client_id_metadata_document_supported`). No `registration_endpoint` is
- *   advertised (DCR disabled in resolveMcpPlugins), and no OpenID discovery
+ *   `client_id_metadata_document_supported`, and the RFC 7591
+ *   `registration_endpoint`). No OpenID discovery
  *   document is served while `openid` is not among the configured scopes.
  *
  * Upstream also natively answers HEAD with the GET status+headers and no

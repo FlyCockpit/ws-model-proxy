@@ -1,5 +1,5 @@
 import { ORPCError } from "@orpc/server";
-import prisma from "@ws-model-proxy/db";
+import prisma, { Prisma } from "@ws-model-proxy/db";
 import {
   credentialLookupPrefix,
   generateProductCredentialSecret,
@@ -38,26 +38,9 @@ const tokenSelection = {
       modelPoolId: true,
     },
   },
-} as const;
+} satisfies Prisma.ModelApiTokenSelect;
 
-type TokenListRow = {
-  id: string;
-  createdAt: Date;
-  updatedAt: Date;
-  userId: string;
-  name: string;
-  scopeMode: string;
-  lookupPrefix: string;
-  lastUsedAt: Date | null;
-  revokedAt: Date | null;
-  expiresAt: Date | null;
-  AllowlistEntries: {
-    target: string;
-    discoveredModelId: string | null;
-    ExecutionTarget?: { discoveredModelId: string | null } | null;
-    modelPoolId: string | null;
-  }[];
-};
+type TokenListRow = Prisma.ModelApiTokenGetPayload<{ select: typeof tokenSelection }>;
 
 function serializeToken(row: TokenListRow) {
   return {
@@ -148,7 +131,7 @@ export const modelApiTokensRouter = {
     .handler(async ({ input, context }) => {
       const includeRevoked = input?.includeRevoked ?? false;
       const limit = input?.limit ?? 50;
-      const rows = (await prisma.modelApiToken.findMany({
+      const rows = await prisma.modelApiToken.findMany({
         where: {
           userId: context.session.user.id,
           ...(includeRevoked ? {} : { revokedAt: null }),
@@ -156,7 +139,7 @@ export const modelApiTokensRouter = {
         orderBy: { createdAt: "desc" },
         take: limit,
         select: tokenSelection,
-      })) as TokenListRow[];
+      });
 
       return rows.map(serializeToken);
     }),
@@ -195,7 +178,7 @@ export const modelApiTokensRouter = {
       const allowlistTargets =
         input.scopeMode === "ALLOWLIST" ? targets : { directModels: [], modelPools: [] };
       const rawSecret = generateProductCredentialSecret("modelApiToken");
-      const created = (await prisma.modelApiToken.create({
+      const created = await prisma.modelApiToken.create({
         data: {
           userId: context.session.user.id,
           name: input.name,
@@ -208,7 +191,7 @@ export const modelApiTokensRouter = {
           },
         },
         select: tokenSelection,
-      })) as TokenListRow;
+      });
 
       return {
         token: serializeToken(created),
@@ -229,11 +212,11 @@ export const modelApiTokensRouter = {
       }
 
       const revokedAt = existing.revokedAt ?? new Date();
-      const updated = (await prisma.modelApiToken.update({
+      const updated = await prisma.modelApiToken.update({
         where: { id: input.id },
         data: { revokedAt },
         select: tokenSelection,
-      })) as TokenListRow;
+      });
 
       return serializeToken(updated);
     }),
