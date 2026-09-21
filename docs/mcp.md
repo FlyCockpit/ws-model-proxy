@@ -103,26 +103,30 @@ Deployments behind a proxy must preserve `Host` (or configure the ingress so
 the direct host is allowlisted and `X-Forwarded-Host` is exactly the canonical
 public host).
 
-## Client registration: CIMD only
+## Client registration (CIMD + dynamic registration)
 
-Client registration is **CIMD-only** (CIMD = **Client ID Metadata
-Document**), pinned to the MCP `2026-07-28` metadata profile:
+Two registration paths are enabled, both pinned to the MCP `2026-07-28`
+metadata profile (CIMD = **Client ID Metadata Document**):
 
-- A client publishes its metadata document over HTTPS; on first use the server
-  fetches it through Better Auth's hardened transport (resolve-once DNS
-  validation, public-address checks, connection pinning, TLS hostname
-  validation, byte/time limits, redirect refusal) and registers the client.
-- Dynamic Client Registration (RFC 7591) is disabled through both registration
-  controls and is **not advertised** in discovery metadata. User-facing OAuth
-  client/resource CRUD is denied entirely.
+- **CIMD first-use registration**: a client publishes its metadata document
+  over HTTPS; on first use the server fetches it through Better Auth's
+  hardened transport (resolve-once DNS validation, public-address checks,
+  connection pinning, TLS hostname validation, byte/time limits, redirect
+  refusal) and registers the client.
+- **Dynamic Client Registration (RFC 7591)**: advertised in discovery
+  metadata via `registration_endpoint` (`…/oauth2/register`). Unauthenticated
+  initial registration is enabled as well — clients such as rmcp/Grok
+  register without an initial client credential. PKCE is still required for
+  public clients (`clientRegistrationRequirePKCE`), registration scope
+  ceilings still cap what a registered client may declare, and user-facing
+  OAuth client/resource CRUD is denied entirely.
 - Registration scope ceiling: clients are registered with
-  `mcp:read offline_access` by default and may add `mcp:write`. PKCE is
-  required for public clients.
+  `mcp:read offline_access` by default and may add `mcp:write`.
 - Grant types are limited to `authorization_code` and `refresh_token`.
   `client_credentials` is never enabled (tools are user-bound).
 
-CIMD-only registration is not a client allowlist; a production cohort would be
-a separate policy change.
+Registration is not a client allowlist; a production cohort would be a
+separate policy change.
 
 ## Protocol and transport
 
@@ -365,9 +369,9 @@ There are **two distinct metadata documents**, each served at two paths:
   `/.well-known/oauth-authorization-server/api/auth` and
   `/api/auth/.well-known/oauth-authorization-server`. Fields: `issuer`,
   `authorization_endpoint`, `token_endpoint`, `jwks_uri`, scopes (including
-  `offline_access`), DPoP algorithms, and the CIMD advertisement
-  (`client_id_metadata_document_supported`). No `registration_endpoint` is
-  advertised (DCR is disabled).
+  `offline_access`), DPoP algorithms, the CIMD advertisement
+  (`client_id_metadata_document_supported`), and the RFC 7591
+  `registration_endpoint` (`…/oauth2/register`).
 
 These are different documents, not aliases of each other. GET returns the
 metadata; HEAD returns the same status/headers without a body; other methods
@@ -397,9 +401,10 @@ public HTTPS.)
 ```
 
 On first use the server fetches this document through Better Auth's hardened
-transport (see [Client registration](#client-registration-cimd-only)) and
-registers the client; `client_id` in every OAuth request below is the metadata
-URL itself.
+transport (see [Client registration](#client-registration-cimd--dynamic-registration))
+and registers the client; `client_id` in every OAuth request below is the
+metadata URL itself. (A client that prefers RFC 7591 dynamic registration can
+instead POST its metadata to the advertised `registration_endpoint`.)
 
 ### Wire sequence (Bearer or DPoP client)
 
@@ -523,7 +528,7 @@ When bumping the Better Auth family (`better-auth`, `@better-auth/mcp`,
    `legacy: "reject"` / JSON / `maxSubscriptions: 0` options; handler-owned
    teardown.
 4. **Discovery aliases** — the four well-known paths still served natively by
-   the plugins; no DCR endpoint advertised.
+   the plugins; the RFC 7591 `registration_endpoint` still advertised.
 5. **`oauthProviderClient` signed state** — `oauth_query` still carries the
    signed transaction through sign-in, 2FA, consent, and continuation.
 6. **Consent behavior** — first-use and expanded-scope (full-set re-prompt)
@@ -550,8 +555,8 @@ When bumping the Better Auth family (`better-auth`, `@better-auth/mcp`,
 
 Run once against staging with the flag enabled before enabling in production:
 
-1. Discovery — all four well-known aliases return metadata; no DCR endpoint
-   advertised.
+1. Discovery — all four well-known aliases return metadata; the RFC 7591
+   `registration_endpoint` is advertised.
 2. CIMD — first-use client registration from a published metadata URL.
 3. Login with 2FA.
 4. Consent including `offline_access`.

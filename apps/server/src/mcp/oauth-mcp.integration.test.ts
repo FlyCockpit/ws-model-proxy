@@ -943,8 +943,9 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
       expect(metadata.jwks_uri, alias).toBe(`${ISSUER}/jwks`);
       const scopes = metadata.scopes_supported as string[];
       expect(scopes, alias).toContain("offline_access");
-      // DCR stays unadvertised (CIMD-only registration).
-      expect(metadata.registration_endpoint, alias).toBeUndefined();
+      // RFC 7591 DCR is advertised (dynamicClientRegistration enabled in
+      // resolveMcpPlugins; matches the mcp-discovery unit contract).
+      expect(metadata.registration_endpoint, alias).toBe(`${ISSUER}/oauth2/register`);
       expect(metadata.dpop_signing_alg_values_supported, alias).toContain("ES256");
       // CIMD advertisement.
       expect((metadata.client_id_metadata_document_supported as boolean) ?? false, alias).toBe(
