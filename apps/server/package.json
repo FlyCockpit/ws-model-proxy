@@ -12,8 +12,9 @@
     "test:postgres": "vitest run --maxWorkers=1 --no-file-parallelism src/model-api/capacity/postgres-store.integration.test.ts src/model-api/capacity/postgres-process.integration.test.ts src/model-api/provider-route.integration.test.ts src/model-api/provider-budget.integration.test.ts"
   },
   "dependencies": {
+    "@better-auth/mcp": "catalog:",
     "@fastify/busboy": "catalog:",
-    "@hono/node-server": "^2.1.0",
+    "@hono/node-server": "^2.1.1",
     "@modelcontextprotocol/server": "catalog:",
     "@orpc/openapi": "catalog:",
     "@orpc/server": "catalog:",
@@ -24,7 +25,6 @@
     "@ws-model-proxy/config": "workspace:*",
     "@ws-model-proxy/db": "workspace:*",
     "@ws-model-proxy/env": "workspace:*",
-    "@better-auth/mcp": "catalog:",
     "better-auth": "catalog:",
     "hono": "catalog:",
     "rate-limiter-flexible": "catalog:",
