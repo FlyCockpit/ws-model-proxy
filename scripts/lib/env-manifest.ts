@@ -717,6 +717,21 @@ export const ENV_VARS: EnvVar[] = [
     source: "default",
     default: "60",
   },
+  {
+    key: "RATE_LIMIT_MCP_REGISTRATION_POINTS",
+    group: "ratelimit",
+    source: "default",
+    default: "60",
+    comment: [
+      "Whole-service cap on unauthenticated MCP dynamic client registrations; limits durable client rows across rotating IPs.",
+    ],
+  },
+  {
+    key: "RATE_LIMIT_MCP_REGISTRATION_DURATION",
+    group: "ratelimit",
+    source: "default",
+    default: "3600",
+  },
 
   // --- ssr -----------------------------------------------------------------
   {

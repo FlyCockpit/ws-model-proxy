@@ -46,6 +46,7 @@ import {
   MCP_OAUTH_AUTHORIZE_PATH,
   MCP_OAUTH_CONSENT_PATH,
   MCP_OAUTH_CONTINUE_PATH,
+  MCP_OAUTH_REGISTER_PATH,
   MCP_OAUTH_TOKEN_PATH,
   onMcpOauthRoute,
 } from "./mcp-oauth-route-match.js";
@@ -86,6 +87,7 @@ import {
   authLimiter,
   createRateLimiterMiddleware,
   emailRecipientLimiter,
+  mcpClientRegistrationLimiter,
   rpcLimiter,
   signinFailureLimiter,
   signupLimiter,
@@ -673,6 +675,20 @@ export async function createApp(options: CreateAppOptions = {}) {
         "POST",
         MCP_OAUTH_CONSENT_PATH,
         mcpOauthBodyCap(MCP_OAUTH_CONSENT_MAX_BODY_BYTES),
+      ),
+    );
+    // DCR is intentionally unauthenticated for MCP clients such as Grok, but
+    // every accepted request persists an OAuth client. Use a whole-service
+    // bucket rather than an IP key so rotating source addresses cannot turn
+    // that public write endpoint into unbounded database growth.
+    app.use(
+      MCP_OAUTH_REGISTER_PATH,
+      onMcpOauthRoute(
+        "POST",
+        MCP_OAUTH_REGISTER_PATH,
+        createRateLimiterMiddleware(mcpClientRegistrationLimiter, {
+          resolveKey: () => "mcp:oauth:registration:global",
+        }),
       ),
     );
     app.use("/api/auth/*", mcpOauthRateLimits);

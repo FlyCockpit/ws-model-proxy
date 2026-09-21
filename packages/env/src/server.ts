@@ -72,6 +72,10 @@ export const env = createEnv({
     RATE_LIMIT_MCP_DURATION: z.coerce.number().int().positive().default(60),
     RATE_LIMIT_MCP_CONSENT_POINTS: z.coerce.number().int().positive().default(30),
     RATE_LIMIT_MCP_CONSENT_DURATION: z.coerce.number().int().positive().default(60),
+    // Public RFC 7591 registration creates a durable OAuth client row. This
+    // whole-service budget remains effective when an attacker rotates IPs.
+    RATE_LIMIT_MCP_REGISTRATION_POINTS: z.coerce.number().int().positive().default(60),
+    RATE_LIMIT_MCP_REGISTRATION_DURATION: z.coerce.number().int().positive().default(3600),
     SSR_CACHE_TTL_SECONDS: z.coerce.number().int().min(0).default(60),
     // Number of reverse-proxy hops in front of the app, for deriving the real
     // client IP used as the anonymous rate-limit key.

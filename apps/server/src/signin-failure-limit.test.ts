@@ -150,13 +150,20 @@ describe("signinFailureLimit", () => {
   });
 
   it("fails open when this additive limiter is unavailable", async () => {
-    const consume = vi.fn().mockRejectedValue(new Error("store unavailable"));
+    const error = new Error("store unavailable");
+    const consume = vi.fn().mockRejectedValue(error);
     const reward = vi.fn();
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const app = new Hono();
     app.use(SIGNIN_FAILURE_PATH, signinFailureLimit({ points: 3, consume, reward }));
     app.post(SIGNIN_FAILURE_PATH, (c) => c.json({ code: "INVALID_EMAIL_OR_PASSWORD" }, 401));
 
     expect((await signIn(app, "victim@example.com")).status).toBe(401);
     expect(reward).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(
+      "[rate-limit] signin-failure limiter error, failing open: (Error)",
+    );
+    expect(log).not.toHaveBeenCalledWith(expect.anything(), error);
+    log.mockRestore();
   });
 });

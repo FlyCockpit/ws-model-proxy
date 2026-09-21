@@ -59,6 +59,8 @@ const envMock = vi.hoisted(() => ({
   RATE_LIMIT_MCP_DURATION: 60,
   RATE_LIMIT_MCP_CONSENT_POINTS: 2,
   RATE_LIMIT_MCP_CONSENT_DURATION: 60,
+  RATE_LIMIT_MCP_REGISTRATION_POINTS: 2,
+  RATE_LIMIT_MCP_REGISTRATION_DURATION: 60,
   TRUST_PROXY_HOPS: undefined,
   MEDIA_MAX_UPLOAD_BYTES: 5 * 1024 * 1024,
   MODEL_API_TRANSCRIPTION_MAX_MULTIPART_BYTES: 1024 * 1024,
@@ -98,6 +100,7 @@ import { resolveMcpPlugins } from "../../../packages/auth/src/mcp-plugins";
 import { createApp } from "./app";
 import { MCP_WELL_KNOWN_PATHS } from "./mcp-discovery";
 import { MCP_OAUTH_RATE_LIMITED_ROUTES } from "./mcp-oauth-route-match";
+import { mcpClientRegistrationLimiter } from "./rate-limit";
 
 const BASE = "https://proxy.example.com";
 const ISSUER = `${BASE}/api/auth`;
@@ -158,6 +161,7 @@ beforeEach(() => {
 
 afterEach(() => {
   logSpy.mockRestore();
+  mcpClientRegistrationLimiter.delete("mcp:oauth:registration:global");
 });
 
 const ROOT_ALIASES = MCP_WELL_KNOWN_PATHS.filter((p) => !p.startsWith("/api/auth"));
@@ -236,7 +240,7 @@ describe("createApp registration contract — discovery gates own every method (
       const doc = (await res.json()) as Record<string, unknown>;
       expect(doc.issuer, alias).toBe(ISSUER);
       expect(doc.token_endpoint, alias).toBe(`${ISSUER}/oauth2/token`);
-      expect(doc.registration_endpoint, alias).toBeUndefined();
+      expect(doc.registration_endpoint, alias).toBe(`${ISSUER}/oauth2/register`);
     }
     for (const alias of [
       "/.well-known/oauth-protected-resource",
@@ -277,6 +281,28 @@ describe("createApp registration contract — MCP OAuth limiter selection (L24)"
     const res = await app.request(`${BASE}/api/auth/jwks`);
     expect(res.status).toBe(200);
     expect(res.headers.get("x-ratelimit-limit")).toBe("2");
+  });
+
+  it("DCR has a whole-service budget, so rotating client IPs cannot multiply persistent registrations", async () => {
+    const app = await buildApp(true);
+    const register = (suffix: number, ip: string) =>
+      app.request(`${BASE}/api/auth/oauth2/register`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-forwarded-for": ip,
+        },
+        body: JSON.stringify({
+          client_name: `dcr-${suffix}`,
+          redirect_uris: [`https://client-${suffix}.example.com/callback`],
+        }),
+      });
+
+    expect((await register(1, "198.51.100.1")).status).toBe(201);
+    expect((await register(2, "198.51.100.2")).status).toBe(201);
+    const blocked = await register(3, "198.51.100.3");
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers.get("x-ratelimit-limit")).toBe("2");
   });
 });
 

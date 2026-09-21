@@ -118,7 +118,7 @@ import { env } from "@ws-model-proxy/env/server";
 /** The one shared fenced client's delegates this sweep touches. */
 type OAuthCleanupPrisma = Pick<
   typeof prisma,
-  "oauthAccessToken" | "oauthRefreshToken" | "oauthClientAssertion" | "verification"
+  "oauthAccessToken" | "oauthRefreshToken" | "oauthClient" | "oauthClientAssertion" | "verification"
 >;
 
 // ---------------------------------------------------------------------------
@@ -140,6 +140,14 @@ export const OAUTH_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
  * of any token TTL.
  */
 export const OAUTH_CLEANUP_AUDIT_GRACE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Public DCR creates ownerless client records before a user has consented.
+ * Retain an incomplete registration for one day so an interrupted legitimate
+ * authorization can resume, then delete only rows that never acquired a
+ * consent or token. This excludes CIMD and user-owned registrations.
+ */
+export const OAUTH_UNCLAIMED_DYNAMIC_CLIENT_RETENTION_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Read/delete batch size for token + assertion loops. Bounds each
@@ -309,6 +317,7 @@ export interface OAuthCleanupCounts {
   accessTokens: number;
   refreshTokens: number;
   clientAssertions: number;
+  unclaimedDynamicClients: number;
   dpopVerifications: number;
   authorizationCodes: number;
   /** Expired candidates retained because they could not be validated. */
@@ -396,6 +405,9 @@ export async function sweepExpiredOAuthArtifacts({
   // AT the cutoff is deletable (lte — inclusive boundary, pinned by test);
   // anything newer is inside the grace window and retained.
   const graceCutoff = new Date(now.getTime() - OAUTH_CLEANUP_AUDIT_GRACE_MS);
+  const unclaimedDynamicClientCutoff = new Date(
+    now.getTime() - OAUTH_UNCLAIMED_DYNAMIC_CLIENT_RETENTION_MS,
+  );
 
   const accessTokens = await deleteBatched(
     (where, take) => client.oauthAccessToken.findMany({ where, select: { id: true }, take }),
@@ -432,6 +444,24 @@ export async function sweepExpiredOAuthArtifacts({
     (where, ids) =>
       client.oauthClientAssertion.deleteMany({ where: { ...where, id: { in: ids } } }),
     { expiresAt: { lte: graceCutoff } },
+  );
+
+  // DCR rows with no user/reference owner and no authorization artifacts are
+  // abandoned registrations. Deleting them bounds the persistent residue of
+  // the public endpoint while preserving every client that reached consent or
+  // token issuance. `clientDiscoveryId: null` deliberately excludes CIMD.
+  const unclaimedDynamicClients = await deleteBatched(
+    (where, take) => client.oauthClient.findMany({ where, select: { id: true }, take }),
+    (where, ids) => client.oauthClient.deleteMany({ where: { ...where, id: { in: ids } } }),
+    {
+      clientDiscoveryId: null,
+      userId: null,
+      referenceId: null,
+      createdAt: { lte: unclaimedDynamicClientCutoff },
+      oauthConsents: { none: {} },
+      oauthRefreshTokens: { none: {} },
+      oauthAccessTokens: { none: {} },
+    },
   );
 
   // DPoP replay reservations: EXACT prefix + their own expiry shifted by
@@ -527,6 +557,7 @@ export async function sweepExpiredOAuthArtifacts({
     accessTokens,
     refreshTokens,
     clientAssertions,
+    unclaimedDynamicClients,
     dpopVerifications,
     authorizationCodes,
     retainedUnvalidated,
@@ -581,6 +612,9 @@ export function startOauthCleanup({
         counts.accessTokens +
         counts.refreshTokens +
         counts.clientAssertions +
+        // Injectable sweep functions in lifecycle tests from before this
+        // count existed may omit it; production sweeps always return a number.
+        (counts.unclaimedDynamicClients ?? 0) +
         counts.dpopVerifications +
         counts.authorizationCodes;
       if (

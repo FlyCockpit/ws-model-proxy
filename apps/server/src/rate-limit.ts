@@ -54,6 +54,18 @@ export const signinFailureLimiter = new RateLimiterMemory({
 });
 
 /**
+ * Whole-service budget for unauthenticated RFC 7591 registrations. Unlike an
+ * IP bucket, this still bounds durable client-row creation when callers rotate
+ * addresses. The supported deployment is one web-service process; introduce
+ * a shared store before operating multiple replicas.
+ */
+export const mcpClientRegistrationLimiter = new RateLimiterMemory({
+  keyPrefix: "rl:mcp-registration",
+  points: env.RATE_LIMIT_MCP_REGISTRATION_POINTS ?? 60,
+  duration: env.RATE_LIMIT_MCP_REGISTRATION_DURATION ?? 60 * 60,
+});
+
+/**
  * Signup limiter — very strict, applied to /api/auth/sign-up/* to prevent
  * account-creation spam. 3 requests / 3600 s per key with a 1-hour block.
  *

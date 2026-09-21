@@ -52,6 +52,8 @@ export const MCP_OAUTH_AUTHORIZE_PATH = "/api/auth/oauth2/authorize";
 export const MCP_OAUTH_TOKEN_PATH = "/api/auth/oauth2/token";
 export const MCP_OAUTH_CONSENT_PATH = "/api/auth/oauth2/consent";
 export const MCP_OAUTH_CONTINUE_PATH = "/api/auth/oauth2/continue";
+/** Exact RFC 7591 endpoint exposed only while the MCP provider is enabled. */
+export const MCP_OAUTH_REGISTER_PATH = "/api/auth/oauth2/register";
 
 const MCP_OAUTH_RATE_LIMITED_ROUTE_KEYS = new Set<string>(
   MCP_OAUTH_RATE_LIMITED_ROUTES.map(([method, path]) => `${method} ${path}`),

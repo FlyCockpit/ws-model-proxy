@@ -69,7 +69,9 @@ export function signinFailureLimit(
         c.header("Retry-After", String(Math.ceil(result.msBeforeNext / 1000)));
         return c.json({ error: "Too many attempts. Please wait a moment and try again." }, 429);
       }
-      console.error("[rate-limit] signin-failure limiter error, failing open:", result);
+      console.error(
+        `[rate-limit] signin-failure limiter error, failing open: (${errorKind(result)})`,
+      );
     }
 
     let failed = false;
@@ -83,9 +85,14 @@ export function signinFailureLimit(
         } catch (error: unknown) {
           // A failed refund expires with the ordinary window. Do not replace a
           // downstream exception or transform a valid auth response here.
-          console.error("[rate-limit] signin-failure limiter refund error:", error);
+          console.error(`[rate-limit] signin-failure limiter refund error: (${errorKind(error)})`);
         }
       }
     }
   };
+}
+
+/** Limiter/storage errors can contain request or database details; never log them verbatim. */
+function errorKind(error: unknown): string {
+  return error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error;
 }
