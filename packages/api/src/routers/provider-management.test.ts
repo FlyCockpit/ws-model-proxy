@@ -1733,4 +1733,51 @@ describe("providerManagementRouter security boundary", () => {
       expect(result).toEqual({ id: "model" });
     });
   });
+
+  it("G1: an aborted caller signal prevents the external HTTPS probe and the audit transaction", async () => {
+    envMock.enabled = true;
+    const { encryptProviderCredential, parseProviderCredentialKeyring } = await import(
+      "../lib/provider-credential-crypto"
+    );
+    const encrypted = encryptProviderCredential(
+      "aborted-caller-secret",
+      {
+        userId: "owner",
+        providerAccountId: "account",
+        credentialId: "credential",
+        credentialType: "BEARER",
+        aadVersion: 1,
+      },
+      parseProviderCredentialKeyring("v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+    );
+    db.providerAccount.findFirst.mockResolvedValue({
+      id: "account",
+      userId: "owner",
+      deletedAt: null,
+      currentCredentialId: "credential",
+      providerType: "openai",
+      baseUrl: "https://provider.example/v1",
+    });
+    db.providerCredential.findFirst.mockResolvedValue({
+      id: "credential",
+      providerAccountId: "account",
+      credentialType: "BEARER",
+      aadVersion: 1,
+      status: "ACTIVE",
+      ...encrypted,
+    });
+    const controller = new AbortController();
+    controller.abort();
+    const client = createRouterClient(providerManagementRouter, {
+      context: { ...context, services: { signal: controller.signal } },
+    });
+    await expect(client.testCredential({ providerAccountId: "account" })).rejects.toMatchObject({
+      code: "CLIENT_CLOSED_REQUEST",
+    });
+    // The cost-incurring external request NEVER started, and neither did
+    // the audit write transaction.
+    expect(egressMock.request).not.toHaveBeenCalled();
+    expect(db.$transaction).not.toHaveBeenCalled();
+    expect(db.providerAuditEvent.create).not.toHaveBeenCalled();
+  });
 });

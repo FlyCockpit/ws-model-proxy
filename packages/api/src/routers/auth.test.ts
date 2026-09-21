@@ -13,7 +13,7 @@ vi.mock("@ws-model-proxy/db", async () => {
 
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {},
-  ADMIN_EMAILS: new Set<string>(),
+  ADMIN_EMAIL: undefined,
 }));
 
 // authRouter imports verifyTransport for the email-OTP delivery preflight.

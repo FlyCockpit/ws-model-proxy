@@ -1,6 +1,32 @@
 {
   "navProfile": "Perfil",
   "navSecurity": "Seguridad",
+  "navMcp": "Acceso MCP",
+  "mcp": {
+    "title": "Conexiones MCP",
+    "description": "Aplicaciones que autorizaste mediante el Model Context Protocol.",
+    "empty": "No hay aplicaciones conectadas. Autoriza un cliente MCP para verlo aquí.",
+    "loadFailed": "No se pudieron cargar tus conexiones MCP.",
+    "scopes": "Permisos",
+    "noScopes": "Sin permisos",
+    "firstAuthorized": "Primera autorización",
+    "lastAuthorized": "Última actividad",
+    "rollingExpiry": "Expiración de renovación",
+    "noActiveRefresh": "Sin renovaciones activas",
+    "activeRefreshCount": "Renovaciones activas ({{count}})",
+    "dpop": {
+      "all": "Todos los tokens con vinculación de remitente (DPoP)",
+      "some": "Algunos tokens con vinculación de remitente (DPoP)",
+      "none": "Sin vinculación de remitente"
+    },
+    "revoke": "Revocar acceso",
+    "revokeTitle": "¿Revocar esta conexión?",
+    "revokeDescription": "Esto revoca cada autorización de “{{client}}”. Sus tokens de renovación dejan de funcionar inmediatamente y deberá pedir consentimiento de nuevo. Puedes iniciar sesión más tarde para reautorizar.",
+    "revokeConfirm": "Revocar",
+    "revoking": "Revocando…",
+    "revoked": "Acceso revocado",
+    "revokeFailed": "No se pudo revocar esta conexión. Intenta de nuevo."
+  },
   "profile": {
     "title": "Perfil",
     "description": "Administra tu información de perfil",

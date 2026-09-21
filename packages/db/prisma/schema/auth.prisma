@@ -26,6 +26,12 @@ model User {
   accounts                   Account[]
   twoFactors                 TwoFactor[]
   deviceCodes                DeviceCode[]
+  // Better Auth 1.7 OAuth Provider back-relations (Phase 0b).
+  oauthClients               OauthClient[]
+  oauthRefreshTokens         OauthRefreshToken[]
+  oauthAccessTokens          OauthAccessToken[]
+  oauthConsents              OauthConsent[]
+  mcpGrants                  McpGrant[]
   cliDevices                 CliDevice[]                  @relation("CliDeviceOwner")
   cliTokens                  CliToken[]                   @relation("CliTokenOwner")
   cliDeviceCredentials       CliDeviceCredential[]        @relation("CliDeviceCredentialOwner")
@@ -62,20 +68,24 @@ model User {
 }
 
 model Session {
-  id                   String   @id @default(cuid(2))
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @default(now()) @updatedAt
+  id                   String              @id @default(cuid(2))
+  createdAt            DateTime            @default(now())
+  updatedAt            DateTime            @default(now()) @updatedAt
   expiresAt            DateTime
   token                String
   ipAddress            String?
   userAgent            String?
   userId               String
-  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user                 User                @relation(fields: [userId], references: [id], onDelete: Cascade)
   impersonatedBy       String?
   activeOrganizationId String?
+  // Better Auth 1.7 OAuth Provider back-relations (Phase 0b).
+  oauthRefreshTokens   OauthRefreshToken[]
+  oauthAccessTokens    OauthAccessToken[]
 
   @@unique([token])
   @@index([userId])
+  @@index([expiresAt])
   @@map("session")
 }
 
@@ -114,17 +124,265 @@ model Verification {
 }
 
 model TwoFactor {
-  id          String   @id @default(cuid(2))
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @default(now()) @updatedAt
-  secret      String
-  backupCodes String
-  verified    Boolean  @default(true)
-  userId      String
-  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id                      String    @id @default(cuid(2))
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @default(now()) @updatedAt
+  secret                  String
+  backupCodes             String
+  verified                Boolean   @default(true)
+  userId                  String
+  user                    User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // Better Auth 1.7 lockout columns (two-factor plugin schema, generated as
+  // nullable with a 0 default for failedVerificationCount).
+  failedVerificationCount Int?      @default(0)
+  lockedUntil             DateTime?
 
+  // The 1.7 generator only indexes userId; this unique constraint is an
+  // intentional repo strengthening. Better Auth's 2FA flow reads and writes
+  // the twoFactor row keyed by userId (one row per user), so uniqueness both
+  // matches the runtime contract and makes concurrent first-time enrollments
+  // fail atomically instead of creating orphan rows. The one-row-per-user
+  // assumption is asserted in packages/auth/src/auth-schema.test.ts.
   @@unique([userId])
+  // Generated secret lookup index (two-factor plugin marks `secret`
+  // index: true in 1.7).
+  @@index([secret])
   @@map("two_factor")
+}
+
+// ---------------------------------------------------------------------------
+// Better Auth 1.7 OAuth Provider / JWT / MCP models (Phase 0b).
+//
+// Field shapes follow the installed @better-auth 1.7.3 family plugin schemas
+// (oauth-provider schema.ts, jwt plugin schema, two-factor plugin schema) —
+// the same source the Better Auth CLI generator consumes. Model keys must not
+// be renamed: the prisma adapter addresses these tables by these model names
+// and the 1.7.3 runtime schema check compares them on every startup. All
+// tables are additive so an application rollback can leave them in place.
+// ---------------------------------------------------------------------------
+
+model OauthClient {
+  id                               String                @id @default(cuid(2))
+  clientId                         String                @unique
+  clientSecret                     String?
+  clientDiscoveryId                String?
+  disabled                         Boolean?              @default(false)
+  skipConsent                      Boolean?
+  enableEndSession                 Boolean?
+  subjectType                      String?
+  scopes                           String[]
+  clientCredentialsScopes          String[]              @default([])
+  userId                           String?
+  user                             User?                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt                        DateTime?             @default(now())
+  updatedAt                        DateTime?             @default(now()) @updatedAt
+  name                             String?
+  uri                              String?
+  icon                             String?
+  contacts                         String[]
+  tos                              String?
+  policy                           String?
+  softwareId                       String?
+  softwareVersion                  String?
+  softwareStatement                String?
+  redirectUris                     String[]
+  postLogoutRedirectUris           String[]
+  backchannelLogoutUri             String?
+  backchannelLogoutSessionRequired Boolean?
+  tokenEndpointAuthMethod          String?
+  applicationType                  String?
+  jwks                             String?
+  jwksUri                          String?
+  grantTypes                       String[]
+  responseTypes                    String[]
+  requirePKCE                      Boolean?
+  dpopBoundAccessTokens            Boolean?              @default(false)
+  referenceId                      String?
+  metadata                         Json?
+  clientResources                  OauthClientResource[]
+  oauthRefreshTokens               OauthRefreshToken[]
+  oauthAccessTokens                OauthAccessToken[]
+  oauthConsents                    OauthConsent[]
+
+  @@index([userId])
+  @@map("oauth_client")
+}
+
+model OauthResource {
+  id                            String                @id @default(cuid(2))
+  identifier                    String                @unique
+  name                          String
+  accessTokenTtl                Int?
+  refreshTokenTtl               Int?
+  signingAlgorithm              String?
+  signingKeyId                  String?
+  // Deliberate deviation from the Better Auth v1.7.3 Prisma generator output
+  // (which emits `allowedScopes String[]` for the optional string[] plugin
+  // field). The oauth-provider@1.7.3 RUNTIME seeds null into this column in
+  // three code paths — fresh-resource seeding (introspect buildSeedRow
+  // `input.allowedScopes ?? null`), overwrite-mode reseed updates
+  // (buildSeedUpdate spreads buildSeedRow, so an omitted value writes null),
+  // and admin resource creation (authorize buildResourceRow
+  // `input.allowedScopes ?? null`) — an upstream generator/runtime
+  // inconsistency. Prisma cannot express a nullable native list (`String[]?`
+  // is invalid and `String?[]` still rejects a null list), so a non-nullable
+  // String[] crashes client validation on those null writes. Json? accepts
+  // both null and string arrays; the plugin's read path explicitly handles
+  // null/undefined before constructing a Set, and the 1.7.3 prisma-adapter
+  // runtime schema check compares only column presence + unexpected-column
+  // nullability (never types), so the deviation is invisible to it. This is
+  // the ONLY list field with null writers — every other list column the
+  // plugins write is populated via toResourceList()/fallbacks from non-null
+  // columns. Asserted in packages/auth/src/auth-schema.test.ts.
+  allowedScopes                 Json?
+  customClaims                  Json?
+  dpopBoundAccessTokensRequired Boolean?              @default(false)
+  disabled                      Boolean?              @default(false)
+  createdAt                     DateTime?             @default(now())
+  updatedAt                     DateTime?             @default(now()) @updatedAt
+  policyVersion                 Int?                  @default(1)
+  metadata                      Json?
+  clientResources               OauthClientResource[]
+
+  @@map("oauth_resource")
+}
+
+model OauthClientResource {
+  id         String        @id @default(cuid(2))
+  clientId   String
+  client     OauthClient   @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
+  resourceId String
+  resource   OauthResource @relation(fields: [resourceId], references: [identifier], onDelete: Cascade)
+  metadata   Json?
+  createdAt  DateTime?     @default(now())
+
+  // Load-bearing per the oauth-provider schema: the per-client resource
+  // linkage check assumes one row per (client, resource) pair.
+  @@unique([clientId, resourceId])
+  @@index([clientId])
+  @@index([resourceId])
+  @@map("oauth_client_resource")
+}
+
+model OauthRefreshToken {
+  id                      String             @id @default(cuid(2))
+  token                   String             @unique
+  clientId                String
+  client                  OauthClient        @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
+  sessionId               String?
+  session                 Session?           @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  userId                  String
+  user                    User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  referenceId             String?
+  authorizationCodeId     String?
+  resources               String[]
+  requestedUserInfoClaims String[]
+  expiresAt               DateTime
+  createdAt               DateTime           @default(now())
+  revoked                 DateTime?
+  rotatedAt               DateTime?
+  rotationReplayResponse  String?
+  rotationReplayExpiresAt DateTime?
+  authTime                DateTime?
+  confirmation            Json?
+  scopes                  String[]
+  oauthAccessTokens       OauthAccessToken[]
+
+  @@index([clientId])
+  @@index([sessionId])
+  @@index([userId])
+  @@index([authorizationCodeId])
+  @@map("oauth_refresh_token")
+}
+
+model OauthAccessToken {
+  id                      String             @id @default(cuid(2))
+  token                   String             @unique
+  clientId                String
+  client                  OauthClient        @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
+  sessionId               String?
+  session                 Session?           @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  userId                  String?
+  user                    User?              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  referenceId             String?
+  authorizationCodeId     String?
+  resources               String[]
+  requestedUserInfoClaims String[]
+  refreshId               String?
+  refresh                 OauthRefreshToken? @relation(fields: [refreshId], references: [id], onDelete: Cascade)
+  expiresAt               DateTime
+  createdAt               DateTime           @default(now())
+  revoked                 DateTime?
+  confirmation            Json?
+  scopes                  String[]
+
+  @@index([clientId])
+  @@index([sessionId])
+  @@index([userId])
+  @@index([authorizationCodeId])
+  @@index([refreshId])
+  @@map("oauth_access_token")
+}
+
+model OauthConsent {
+  id                      String      @id @default(cuid(2))
+  clientId                String
+  client                  OauthClient @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
+  userId                  String?
+  user                    User?       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  referenceId             String?
+  resources               String[]
+  requestedUserInfoClaims String[]
+  scopes                  String[]
+  createdAt               DateTime    @default(now())
+  updatedAt               DateTime    @default(now()) @updatedAt
+
+  @@index([clientId])
+  @@index([userId])
+  @@map("oauth_consent")
+}
+
+model OauthClientAssertion {
+  id        String   @id @default(cuid(2))
+  expiresAt DateTime
+
+  @@map("oauth_client_assertion")
+}
+
+model Jwks {
+  id         String    @id @default(cuid(2))
+  publicKey  String
+  privateKey String
+  createdAt  DateTime  @default(now())
+  expiresAt  DateTime?
+  alg        String?
+  crv        String?
+
+  @@map("jwks")
+}
+
+// Application-owned MCP grant generation record (Phase 0b). This is
+// NOT a Better Auth model: `clientId` is the verified OAuth client identifier
+// (string), deliberately without a relation to OauthClient so a client-row
+// deletion (e.g. deferred CIMD cleanup) can never cascade away a revocation
+// tombstone. Tombstones must outlive every authorization code, access JWT,
+// refresh token, cached refresh response, and in-flight issuance that
+// references them; rows are retained (never deleted on revoke — only
+// `revokedAt` is set) and cascade only on user deletion, matching how
+// Better Auth-owned rows (session/account) behave for this User relation.
+model McpGrant {
+  id          String    @id @default(cuid(2))
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @default(now()) @updatedAt
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  clientId    String
+  referenceId String
+  revokedAt   DateTime?
+
+  @@unique([userId, clientId, referenceId])
+  @@index([userId, clientId])
+  @@map("mcp_grant")
 }
 
 model AppSetting {

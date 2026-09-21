@@ -12,7 +12,7 @@ vi.mock("@ws-model-proxy/db", async () => {
 
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {},
-  ADMIN_EMAILS: new Set<string>(),
+  ADMIN_EMAIL: undefined,
 }));
 
 const { default: prisma } = await import("@ws-model-proxy/db");

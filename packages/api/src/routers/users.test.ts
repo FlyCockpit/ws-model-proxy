@@ -1,5 +1,6 @@
 import { createRouterClient, ORPCError } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
+import { invalidateForceTwoFactorPolicyCache } from "@ws-model-proxy/auth/force-two-factor-policy";
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -15,7 +16,7 @@ vi.mock("@ws-model-proxy/db", async () => {
 
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: { BETTER_AUTH_URL: "http://localhost:3000" },
-  ADMIN_EMAILS: new Set<string>(),
+  ADMIN_EMAIL: undefined,
 }));
 
 // Mock @ws-model-proxy/auth so the router's `auth.api.createUser` call hits a stub
@@ -42,7 +43,7 @@ vi.mock("@ws-model-proxy/mailer", () => ({
 
 const { default: prisma } = await import("@ws-model-proxy/db");
 const { auth } = await import("@ws-model-proxy/auth");
-const { sendEmail } = await import("@ws-model-proxy/mailer");
+const { renderInviteUser, sendEmail } = await import("@ws-model-proxy/mailer");
 
 const db = prisma as unknown as {
   user: {
@@ -53,6 +54,7 @@ const db = prisma as unknown as {
     delete: MockInstance;
   };
   session: { deleteMany: MockInstance };
+  appSetting: { findUnique: MockInstance };
   $transaction: MockInstance;
 };
 
@@ -100,9 +102,46 @@ function buildContext(
   };
 }
 
+/** Sentinels that must NEVER reach the captured console output. */
+const SENTINEL = "SECRET-TOKEN-VALUE";
+
+function sentinelError(label: string): Error {
+  const err = new Error(
+    `Invalid \`prisma.user.create()\` invocation: ${label} client_secret=${SENTINEL} SELECT "x"`,
+  );
+  err.stack = `Error: ${SENTINEL}\n    at create (introspect-CbhhXT0E.mjs:2542:15)`;
+  return err;
+}
+
+/**
+ * Capture console.error/warn output while `fn` runs. `fn` must contain
+ * the PRODUCTION call ONLY — never assertions: a failed assertion thrown
+ * inside this helper's await would otherwise need to (and does) propagate
+ * unchanged. Assertions run outside, on the returned output (pass-11 fix
+ * for the assertion-swallowing capture helper, R37/R38 finding 4).
+ */
+async function captureConsoleDuring(fn: () => Promise<unknown>): Promise<string> {
+  const chunks: string[] = [];
+  const toLine = (...args: unknown[]) => {
+    chunks.push(args.map((a) => String(a)).join(" "));
+  };
+  const errorSpy = vi.spyOn(console, "error").mockImplementation(toLine);
+  const warnSpy = vi.spyOn(console, "warn").mockImplementation(toLine);
+  try {
+    await fn();
+  } finally {
+    errorSpy.mockRestore();
+    warnSpy.mockRestore();
+  }
+  return chunks.join("\n");
+}
+
 describe("usersRouter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    invalidateForceTwoFactorPolicyCache();
+    // Current users.ts reads the signup-access gate via appSetting.
+    db.appSetting.findUnique.mockResolvedValue(null);
   });
 
   describe("auth gates", () => {
@@ -370,6 +409,104 @@ describe("usersRouter", () => {
         expect(e.message).toMatch(/archive/i);
         return true;
       });
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // Pass-10 logging-sink regressions (L19 invariant 10) — kept ADDITIVELY
+  // alongside the restored behavioral regressions above. Assertions run
+  // OUTSIDE the console-capture helper so a wrong error kind FAILS the
+  // test (pass-11 fix for the assertion-swallowing helper, R37/R38).
+  // ---------------------------------------------------------------------
+
+  describe("users.invite — auth.api.createUser failure sink (pass 10)", () => {
+    it("logs the constructor name ONLY — sentinel message/stack never reach console.error, error kind INTERNAL_SERVER_ERROR enforced", async () => {
+      vi.mocked(auth.api.createUser).mockRejectedValue(sentinelError("invite"));
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+
+      let caught: unknown;
+      const output = await captureConsoleDuring(async () => {
+        try {
+          await client.invite({ email: "new@example.com", name: "New User" });
+        } catch (err) {
+          caught = err;
+        }
+      });
+
+      // Mutation-sensitive error-kind pin — runs OUTSIDE the capture.
+      expect(caught).toBeInstanceOf(ORPCError);
+      expect((caught as ORPCError).code).toBe("INTERNAL_SERVER_ERROR");
+
+      expect(output).toContain("[users.invite] auth.api.createUser failed: Error");
+      expect(output).not.toContain(SENTINEL);
+      expect(output).not.toContain("client_secret");
+      expect(output).not.toContain("SELECT");
+    });
+
+    it("logs only ONE string argument (no raw error object appended)", async () => {
+      vi.mocked(auth.api.createUser).mockRejectedValue(sentinelError("invite-arity"));
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+
+      const calls: unknown[][] = [];
+      const spy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+        calls.push(args);
+      });
+      try {
+        await client.invite({ email: "new@example.com", name: "New User" }).catch(() => {});
+      } finally {
+        spy.mockRestore();
+      }
+      expect(calls).toEqual([["[users.invite] auth.api.createUser failed: Error"]]);
+    });
+
+    it("invite-email failure sink logs the constructor name only (same class)", async () => {
+      vi.mocked(auth.api.createUser).mockResolvedValue({ user: { id: "u1" } } as never);
+      db.user.findUnique.mockResolvedValue({ locale: "en-US" });
+      // renderInviteUser is invoked synchronously in users.ts — inject the
+      // sentinel via a sync throw so the catch arm actually runs.
+      vi.mocked(renderInviteUser).mockImplementation(() => {
+        throw sentinelError("mailer");
+      });
+      vi.mocked(sendEmail).mockResolvedValue(undefined);
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+
+      let result: { emailSent: boolean; userId: string } | undefined;
+      const output = await captureConsoleDuring(async () => {
+        result = await client.invite({ email: "new@example.com", name: "New User" });
+      });
+      // Restore the default render stub for later tests.
+      vi.mocked(renderInviteUser).mockReset();
+
+      expect(output).toContain("[users.invite] failed to send invite email: Error");
+      expect(output).not.toContain(SENTINEL);
+      expect(output).not.toContain("client_secret");
+      expect(result?.emailSent).toBe(false);
+      expect(result?.userId).toBe("u1");
+    });
+  });
+
+  describe("users.remove — prisma delete failure sink (pass 10 sibling)", () => {
+    it("logs the constructor name ONLY — Prisma SQL sentinel never reaches console.error, error kind INTERNAL_SERVER_ERROR enforced", async () => {
+      db.user.findUnique.mockResolvedValue({ id: "target-id" });
+      db.user.delete.mockRejectedValue(sentinelError("remove"));
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+
+      let caught: unknown;
+      const output = await captureConsoleDuring(async () => {
+        try {
+          await client.remove({ userId: "target-id" });
+        } catch (err) {
+          caught = err;
+        }
+      });
+
+      expect(caught).toBeInstanceOf(ORPCError);
+      expect((caught as ORPCError).code).toBe("INTERNAL_SERVER_ERROR");
+
+      expect(output).toContain("[users.remove] prisma delete failed: Error");
+      expect(output).not.toContain(SENTINEL);
+      expect(output).not.toContain("client_secret");
+      expect(output).not.toContain("SELECT");
     });
   });
 });

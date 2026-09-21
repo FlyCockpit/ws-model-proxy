@@ -19,7 +19,8 @@ Self-hosted web app plus CLI for exposing locally hosted OpenAI-compatible model
 ## Current Direction
 
 - Deploy one Docker web app on a VPS.
-- The first signed-up user becomes admin automatically.
+- In local development and tests, the first signed-up user becomes admin automatically.
+- On a fresh production database with public signup disabled, only `ADMIN_EMAIL` may bootstrap the first admin.
 - Later users are regular users unless promoted by an admin.
 - Admins can enable or disable open signup. Admin invites still work when open signup is closed.
 - Auth works with email/password even when SMTP is not configured. When SMTP
@@ -41,6 +42,8 @@ Self-hosted web app plus CLI for exposing locally hosted OpenAI-compatible model
 - `packages/ui`: shared UI components.
 
 The runtime is intentionally reduced to the product web service, CLI, Postgres, Better Auth, i18n, and the PWA shell.
+
+An optional MCP (Model Context Protocol) server exposes dashboard operations to OAuth-authenticated clients behind `WMP_MCP_ENABLED` — see [docs/mcp.md](docs/mcp.md).
 
 ## Local Development
 
@@ -132,7 +135,11 @@ For example:
 docker pull ghcr.io/flycockpit/ws-model-proxy:latest
 ```
 
-The runtime is a single web service container plus Postgres. No Redis, S3/R2 object storage, VAPID push service, CMS/MCP service, video pipeline, docs app, or separate queue process is required in v1.
+The supported v1 runtime is exactly one web service container plus Postgres. The
+auth and per-account failed-sign-in rate limits are process-local, so do not
+run multiple web replicas until they are moved to a shared durable limiter.
+No Redis, S3/R2 object storage, VAPID push service, CMS/MCP service, video
+pipeline, docs app, or separate queue process is required in v1.
 
 Required production values:
 
@@ -141,14 +148,14 @@ Required production values:
 - `BETTER_AUTH_URL`: public HTTPS app URL.
 - `NODE_ENV=production`.
 
-Optional values include SMTP settings (enables verification, password reset, and email 2FA delivery), `SIGNUP_ENABLED`, rate-limit settings (including per-recipient email caps), and display/build values such as `VITE_APP_NAME`, `VITE_SERVER_URL`, and `BUILD_VERSION`. Prefer `pnpm generate:secrets` over hand-editing production env.
+Optional values include SMTP settings (enables verification, password reset, and email 2FA delivery), rate-limit settings (including per-recipient email caps and failed-password caps), and display/build values such as `VITE_APP_NAME`, `VITE_SERVER_URL`, and `BUILD_VERSION`. If `SIGNUP_ENABLED=false` on a fresh production database, set `ADMIN_EMAIL` to the sole operator address allowed to bootstrap its first admin. Case and surrounding whitespace are canonicalized before account creation. Prefer `pnpm generate:secrets` over hand-editing production env.
 
 Schema sync is handled by the server container entrypoint with `APPLY_SCHEMA=off|safe|dangerous`; keep it `off` for normal deploys and use `safe` for additive schema deploys.
 
 CLI operator flow:
 
 1. Deploy the web service and Postgres.
-2. Create the first admin user, or configure admin emails before inviting operators.
+2. With public signup disabled, configure `ADMIN_EMAIL` before first use, then create the first admin from that address.
 3. Install `wsmp` with `brew install flycockpit/tap/wsmp`.
 4. Create a device login or CLI token from the dashboard.
 5. Configure the CLI's local JSON endpoint inventory.

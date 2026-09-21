@@ -1,10 +1,11 @@
+import { createHash } from "node:crypto";
 import type { Session } from "@ws-model-proxy/auth";
 import { env } from "@ws-model-proxy/env/server";
 import type { Context, Next } from "hono";
 import { RateLimiterMemory, RateLimiterRes } from "rate-limiter-flexible";
 import { resolveClientIp } from "./client-ip.js";
 
-type RateLimiter = Pick<RateLimiterMemory, "consume" | "points">;
+export type RateLimiter = Pick<RateLimiterMemory, "consume" | "points">;
 
 // ---------------------------------------------------------------------------
 // Rate limiters
@@ -14,9 +15,11 @@ type RateLimiter = Pick<RateLimiterMemory, "consume" | "points">;
 // with partial-overlap weighting. Good enough for abuse prevention; don't
 // replace it thinking the name is wrong.
 //
-// This self-hosted app runs as one server process by default, so an in-process
-// limiter keeps the deployment free of Redis. If the app later scales to
-// multiple replicas, swap these back to a shared store.
+// The supported v1 topology is exactly one web-service container and Postgres,
+// so these process-local buckets protect that one server process. Multiple app
+// replicas are unsupported while the limiters remain in memory: no limiter,
+// including the per-account sign-in bucket, claims a cross-replica budget.
+// Introduce a shared durable store before supporting horizontal scaling.
 // ---------------------------------------------------------------------------
 
 /**
@@ -30,6 +33,36 @@ export const authLimiter = new RateLimiterMemory({
   points: env.RATE_LIMIT_AUTH_POINTS,
   duration: env.RATE_LIMIT_AUTH_DURATION,
   blockDuration: env.RATE_LIMIT_AUTH_BLOCK_DURATION,
+});
+
+/**
+ * Per-account failed password sign-ins for the supported single-server
+ * deployment. The general auth limiter is keyed by IP, so it cannot bound a
+ * password-stuffing campaign that rotates source addresses. This counter is
+ * reserved before the credential check and kept only for Better Auth's
+ * `INVALID_EMAIL_OR_PASSWORD` response; successes, session-creation failures,
+ * and pre-credential failures refund it to avoid a lockout lever.
+ */
+export const signinFailureLimiter = new RateLimiterMemory({
+  keyPrefix: "rl:signin-fail",
+  // `env` validates these defaults in real processes. Keep the same concrete
+  // defaults here as a defensive construction boundary for focused test
+  // module mocks that predate this limiter and omit the new optional fields.
+  points: env.RATE_LIMIT_SIGNIN_FAILURE_POINTS ?? 10,
+  duration: env.RATE_LIMIT_SIGNIN_FAILURE_DURATION ?? 15 * 60,
+  blockDuration: env.RATE_LIMIT_SIGNIN_FAILURE_BLOCK_DURATION ?? 10 * 60,
+});
+
+/**
+ * Whole-service budget for unauthenticated RFC 7591 registrations. Unlike an
+ * IP bucket, this still bounds durable client-row creation when callers rotate
+ * addresses. The supported deployment is one web-service process; introduce
+ * a shared store before operating multiple replicas.
+ */
+export const mcpClientRegistrationLimiter = new RateLimiterMemory({
+  keyPrefix: "rl:mcp-registration",
+  points: env.RATE_LIMIT_MCP_REGISTRATION_POINTS ?? 60,
+  duration: env.RATE_LIMIT_MCP_REGISTRATION_DURATION ?? 60 * 60,
 });
 
 /**
@@ -99,6 +132,11 @@ export function emailRateLimitKey(email: string): string {
   return email.trim().toLowerCase();
 }
 
+/** Hash the normalized address so limiter storage never contains raw email. */
+export function signinFailureKey(email: string): string {
+  return `em:${createHash("sha256").update(emailRateLimitKey(email)).digest("base64url")}`;
+}
+
 // ---------------------------------------------------------------------------
 // Middleware factory
 // ---------------------------------------------------------------------------
@@ -124,7 +162,7 @@ function resolveKey(c: Context): string {
   return resolveClientIp(c);
 }
 
-function setRateLimitHeaders(c: Context, limiter: RateLimiter, res: RateLimiterRes) {
+export function setRateLimitHeaders(c: Context, limiter: RateLimiter, res: RateLimiterRes) {
   const limit = limiter.points;
   const remaining = Math.max(0, res.remainingPoints);
   // msBeforeNext is ms until the current window resets
@@ -136,13 +174,37 @@ function setRateLimitHeaders(c: Context, limiter: RateLimiter, res: RateLimiterR
 }
 
 /**
+ * Optional per-middleware overrides for `createRateLimiterMiddleware`.
+ * All fields are optional; omitting the options object entirely keeps the
+ * default key resolution (session user id → client IP) for every existing
+ * caller, byte-identically.
+ */
+export interface RateLimiterMiddlewareOptions {
+  /**
+   * Custom rate-limit key resolver for this middleware instance.
+   *
+   * Use when a limiter needs a different key domain than the default
+   * session/IP keying (e.g. the MCP OAuth limiters key on prefixed IP or
+   * prefixed verified-identity keys). SECURITY: never build a PRE-AUTH
+   * bucket key from request-supplied token bytes or any digest of them —
+   * an attacker choosing the token chooses the bucket. Post-auth buckets
+   * may key on verified claims only (e.g. `sub` + `client_id`).
+   */
+  resolveKey?: (c: Context) => string;
+}
+
+/**
  * Create a Hono middleware that enforces a `rate-limiter-flexible` limiter.
  *
  * On rejection → 429 JSON with rate-limit + Retry-After headers.
  */
-export function createRateLimiterMiddleware(limiter: RateLimiter) {
+export function createRateLimiterMiddleware(
+  limiter: RateLimiter,
+  options: RateLimiterMiddlewareOptions = {},
+) {
+  const resolveRequestKey = options.resolveKey ?? resolveKey;
   return async (c: Context, next: Next) => {
-    const key = resolveKey(c);
+    const key = resolveRequestKey(c);
 
     try {
       const res = await limiter.consume(key);
@@ -157,7 +219,13 @@ export function createRateLimiterMiddleware(limiter: RateLimiter) {
         return c.json({ error: "Too many attempts. Please wait a moment and try again." }, 429);
       }
 
-      console.error("[rate-limit] Unexpected limiter error, failing open:", rlResult);
+      // Sanitized (L19): constructor name / typeof only — limiter rejections
+      // can be arbitrary objects; the fail-open policy is unchanged.
+      console.error(
+        `[rate-limit] Unexpected limiter error, failing open: (${
+          rlResult instanceof Error ? (rlResult.constructor?.name ?? "Error") : typeof rlResult
+        })`,
+      );
       await next();
     }
   };

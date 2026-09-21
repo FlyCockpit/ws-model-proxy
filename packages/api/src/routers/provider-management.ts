@@ -1680,7 +1680,17 @@ export const providerManagementRouter = {
     .handler(async ({ input, context }) => {
       enabled();
       const userId = context.session.user.id;
+      // G1: caller-owned cancellation. The MCP transport threads the
+      // verified request's admission signal through services; the ordinary
+      // HTTP path leaves it unset (unchanged behavior). The external HTTPS
+      // probe is a cost-incurring side effect — it must not START once the
+      // caller aborted, and neither may the audit write afterwards.
+      const callerSignal = context.services?.signal;
+      const throwIfCallerAborted = () => {
+        if (callerSignal?.aborted) throw new ORPCError("CLIENT_CLOSED_REQUEST");
+      };
       const account = await accountFor(userId, input.providerAccountId);
+      throwIfCallerAborted();
       const protocol = providerProtocolForType(account.providerType);
       if (!protocol) throw new ORPCError("BAD_REQUEST");
       const row = account.currentCredentialId
@@ -1688,6 +1698,7 @@ export const providerManagementRouter = {
             where: { id: account.currentCredentialId, userId, status: "ACTIVE" },
           })
         : null;
+      throwIfCallerAborted();
       if (!row) throw missing();
       const secret = decryptProviderCredential(
         {
@@ -1708,6 +1719,9 @@ export const providerManagementRouter = {
       );
       let statusCode: number | null = null;
       let requestError: unknown;
+      // G1: never START the external (cost-incurring) HTTPS probe for an
+      // already-aborted caller.
+      throwIfCallerAborted();
       try {
         const providerAuth =
           row.credentialType === "BEARER"
@@ -1726,6 +1740,11 @@ export const providerManagementRouter = {
         requestError = error;
       }
       const ok = requestError === undefined && (statusCode ?? 500) < 400;
+      // G1: a caller that aborted while the HTTPS probe was in flight must
+      // not trigger the audit write transaction either (the MCP per-request
+      // abort fence would reject it anyway — this check keeps the intent
+      // explicit and covers non-DB side effects of the transaction).
+      throwIfCallerAborted();
       await prisma.$transaction(async (tx) => {
         // Match every credential lifecycle mutation's account-then-credential
         // lock order. The credential may have been revoked (or removed) while

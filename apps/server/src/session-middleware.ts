@@ -17,7 +17,14 @@ export async function sessionMiddleware(c: Context, next: Next) {
       headers: cookieSessionHeaders(c.req.raw.headers),
     })) as Session | null;
   } catch (err) {
-    console.warn("[session-middleware] getSession failed, treating as anonymous:", err);
+    // Constructor name only — better-auth/Prisma rejections embed SQL,
+    // tokens, and credential material in messages and stacks. Never log
+    // the raw error here (invariant 10; string-first + raw-Error shape
+    // escapes the better-call console shim).
+    console.warn(
+      "[session-middleware] getSession failed, treating as anonymous:",
+      err instanceof Error ? `(Error: ${err.constructor.name})` : typeof err,
+    );
     session = null;
   }
   c.set("session", session ?? null);

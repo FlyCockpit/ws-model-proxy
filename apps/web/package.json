@@ -28,6 +28,7 @@
     "@ws-model-proxy/config": "workspace:*",
     "@ws-model-proxy/env": "workspace:*",
     "@ws-model-proxy/ui": "workspace:*",
+    "@better-auth/oauth-provider": "catalog:",
     "better-auth": "catalog:",
     "crossws": "^0.4.10",
     "highlight.js": "catalog:",

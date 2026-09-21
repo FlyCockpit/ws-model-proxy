@@ -191,7 +191,7 @@ const editablePool = {
     images: true,
     audio: false,
     video: false,
-    cacheMode: "OFF",
+    cacheMode: "OFF" as const,
     systemPrompt: null,
     includePrimaryTools: false,
     maxTools: 32,
@@ -219,7 +219,7 @@ const editablePool = {
   capacityWaitBudgetMs: 30_000,
   capacityContextCeiling: 32_768,
   capacityContextMargin: 1_024,
-  capacityBorrowPolicy: "WHEN_IDLE",
+  capacityBorrowPolicy: "WHEN_IDLE" as const,
   affinity: {
     enabled: false,
     ttlSeconds: 3600,

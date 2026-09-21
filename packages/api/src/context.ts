@@ -13,6 +13,15 @@ export type ContextServices = {
     userId: string;
     providerAccountId: string;
   }) => Promise<number>;
+  /**
+   * Caller-owned cancellation (Part G/G1): the OWNING request's abort
+   * signal. Optional — the MCP transport threads the verified request's
+   * admission signal so long-running procedures (e.g. the external
+   * credential test) can refuse to START network work after the caller is
+   * gone; the ordinary HTTP path may leave it unset, preserving the
+   * pre-existing behavior.
+   */
+  signal?: AbortSignal;
 };
 
 export async function createContext({ context, services }: CreateContextOptions) {

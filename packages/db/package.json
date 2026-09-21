@@ -8,6 +8,9 @@
     "./forwarder-security": {
       "default": "./src/forwarder-security.ts"
     },
+    "./shutdown-fence": {
+      "default": "./src/shutdown-fence.ts"
+    },
     "./client-factory": {
       "default": "./src/client-factory.ts"
     },

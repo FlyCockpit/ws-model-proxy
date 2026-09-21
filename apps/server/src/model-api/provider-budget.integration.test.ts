@@ -14,11 +14,13 @@ if (!databaseUrl)
 integration("provider budget admission and reconciliation", () => {
   const db = databaseUrl ? createPrismaClient(databaseUrl) : undefined;
   let service: typeof import("./provider-budget.js");
+  let accounting: typeof import("./provider-budget-accounting.js");
 
   beforeAll(async () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
     service = await import("./provider-budget.js");
+    accounting = await import("./provider-budget-accounting.js");
   });
 
   afterAll(async () => {
@@ -900,7 +902,7 @@ integration("provider budget admission and reconciliation", () => {
       const clock = await db.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`;
       const now = clock[0]?.now;
       if (!now) throw new Error("database clock unavailable");
-      const expected = service.budgetWindow(period, new Date(0), now);
+      const expected = accounting.budgetWindow(period, new Date(0), now);
       const previousStart =
         period === "UTC_DAY"
           ? new Date(expected.windowStart!.getTime() - 86_400_000)
@@ -958,7 +960,7 @@ integration("provider budget admission and reconciliation", () => {
       const reservation = await db.providerBudgetReservation.findFirstOrThrow({
         where: { userId: row.user.id, attemptId: { startsWith: `${period}-after-` } },
       });
-      const admissionExpected = service.budgetWindow(period, new Date(0), reservation.createdAt);
+      const admissionExpected = accounting.budgetWindow(period, new Date(0), reservation.createdAt);
       expect(reservation.utcBasis).toBe("UTC");
       expect(reservation.windowStart).toEqual(admissionExpected.windowStart);
       expect(reservation.windowEnd).toEqual(admissionExpected.windowEnd);

@@ -10,6 +10,7 @@ import { capacityManagementRouter } from "./capacity-management";
 import { cliCredentialsRouter } from "./cli-credentials";
 import { devicesRouter } from "./devices";
 import { forwarderManagementRouter } from "./forwarder-management";
+import { mcpGrantsRouter } from "./mcp-grants";
 import { modelApiTokensRouter } from "./model-api-tokens";
 import { providerManagementRouter } from "./provider-management";
 import { relayMetadataRouter } from "./relay-metadata";
@@ -61,6 +62,9 @@ export const appRouter = {
   providerManagement: providerManagementRouter,
   relayMetadata: relayMetadataRouter,
   users: usersRouter,
+  // Human-only MCP grant management (Phase 7): never exposed as MCP tools —
+  // see MCP_TOOL_EXCLUSIONS in apps/server/src/mcp/tool-manifest.ts.
+  mcpGrants: mcpGrantsRouter,
 };
 export type AppRouter = typeof appRouter;
 export type AppRouterClient = RouterClient<typeof appRouter>;

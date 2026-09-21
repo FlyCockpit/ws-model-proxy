@@ -1,52 +1,25 @@
-import { markPoolMemberRelaySuccess } from "@ws-model-proxy/api/lib/model-pool-routing";
-import {
-  resolveEffectiveCapabilityMetadata,
-  supportsChatCompletions,
-} from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import type { Session } from "@ws-model-proxy/auth";
-import prisma from "@ws-model-proxy/db";
 import { Hono } from "hono";
-import { type RelaySessionManager, relaySessionManager } from "../relay/session-manager.js";
-import {
-  type ModelApiConcurrencyLimiter,
-  ModelApiLimitError,
-  type ModelApiLimitLease,
-  modelApiConcurrencyLimiter,
-} from "./limits.js";
-import { extractAssistantTextFromChatCompletion, readResponseUtf8 } from "./media-transform.js";
-import { startRelayAttempt } from "./relay-executor.js";
+import { runPoolMemberTest } from "./diagnostics.js";
+import type { ModelApiConcurrencyLimiter } from "./limits.js";
 
 type Variables = { session: Session | null };
 
-const TEST_TIMEOUT_MS = 20_000;
-const EXPECTED_PROBE_WORD = /\bpong\b/i;
-
-export function isSuccessfulChatProbeReply(status: number, rawText: string): boolean {
-  if (status !== 200) return false;
-  try {
-    const parsed: unknown = JSON.parse(rawText);
-    const text = extractAssistantTextFromChatCompletion(parsed);
-    return Boolean(text && EXPECTED_PROBE_WORD.test(text));
-  } catch {
-    return false;
-  }
-}
-
-type PoolMemberTestDependencies = {
-  manager?: Pick<
-    RelaySessionManager,
-    | "getActiveCliDeviceIds"
-    | "registerRelayResponseHandlers"
-    | "sendRelayRequest"
-    | "cancelRelayRequest"
-    | "completeRelayRequest"
-  >;
+export type PoolMemberTestDependencies = {
+  manager?: Parameters<typeof runPoolMemberTest>[0]["manager"];
   concurrencyLimiter?: ModelApiConcurrencyLimiter;
 };
 
+/**
+ * Hono routes for pool member diagnostics (Phase 5: a thin HTTP
+ * adapter over the EXTRACTED core in model-api/diagnostics.ts — the same
+ * typed, user-id-bound function the MCP `forwarder_pool_member_test` tool
+ * calls). Response bodies and status codes are byte-identical to the
+ * pre-extraction route (pinned by pool-member-test.test.ts).
+ */
 export function createPoolMemberTestRoutes({
-  manager = relaySessionManager,
-  concurrencyLimiter = modelApiConcurrencyLimiter,
+  manager,
+  concurrencyLimiter,
 }: PoolMemberTestDependencies = {}) {
   const app = new Hono<{ Variables: Variables }>();
 
@@ -55,153 +28,46 @@ export function createPoolMemberTestRoutes({
     if (!session?.user) {
       return c.json({ ok: false, error: "Authentication is required." }, 401);
     }
-    const memberId = c.req.param("memberId");
-    const member = await prisma.poolMember.findUnique({
-      where: { id: memberId },
-      select: {
-        id: true,
-        ModelPool: { select: { userId: true } },
-        ExecutionTarget: {
-          select: {
-            DiscoveredModel: {
-              select: {
-                id: true,
-                published: true,
-                upstreamModelId: true,
-                capabilityOverrideMode: true,
-                capabilityOverrides: true,
-                capabilityOverrideMetadata: true,
-                Endpoint: {
-                  select: {
-                    published: true,
-                    slug: true,
-                    cliDeviceId: true,
-                    capabilityMetadata: true,
-                    defaultCapabilities: true,
-                    CliDevice: { select: { status: true } },
-                  },
-                },
-              },
-            },
-          },
-        },
-        DiscoveredModel: {
-          select: {
-            id: true,
-            published: true,
-            upstreamModelId: true,
-            capabilityOverrideMode: true,
-            capabilityOverrides: true,
-            capabilityOverrideMetadata: true,
-            Endpoint: {
-              select: {
-                published: true,
-                slug: true,
-                cliDeviceId: true,
-                capabilityMetadata: true,
-                defaultCapabilities: true,
-                CliDevice: { select: { status: true } },
-              },
-            },
-          },
-        },
-      },
+    const result = await runPoolMemberTest({
+      userId: session.user.id,
+      memberId: c.req.param("memberId"),
+      // G1: the HTTP request's own signal cancels the relay attempt on
+      // client disconnect (same threading the MCP wrapper applies).
+      signal: c.req.raw.signal,
+      ...(manager !== undefined ? { manager } : {}),
+      ...(concurrencyLimiter !== undefined ? { concurrencyLimiter } : {}),
     });
-    if (!member || member.ModelPool.userId !== session.user.id) {
-      return c.json({ ok: false, error: "Pool member not found." }, 404);
-    }
-    const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
-    if (!model) {
-      return c.json({ ok: false, error: "Member execution target is not relay-capable." }, 409);
-    }
-    if (!model.published || !model.Endpoint.published) {
-      return c.json({ ok: false, error: "Member model is unpublished." }, 409);
-    }
-    const supportsChat = supportsChatCompletions({
-      capabilities: resolveEffectiveCapabilityMetadata({
-        capabilityOverrideMode: model.capabilityOverrideMode,
-        capabilityOverrideMetadata: model.capabilityOverrideMetadata,
-        endpointCapabilityMetadata: model.Endpoint.capabilityMetadata,
-      }),
-      coarse:
-        model.capabilityOverrideMode === "OVERRIDE"
-          ? model.capabilityOverrides
-          : model.Endpoint.defaultCapabilities,
-    });
-    if (!supportsChat) {
-      return c.json(
-        { ok: false, error: "This test only probes chat completions for chat-capable members." },
-        409,
-      );
-    }
-    if (!manager.getActiveCliDeviceIds().includes(model.Endpoint.cliDeviceId)) {
-      return c.json({ ok: false, error: "Member CLI is disconnected." }, 503);
-    }
-
-    const startedAt = Date.now();
-    let globalLease: ModelApiLimitLease | null = null;
-    let cliLease: ModelApiLimitLease | null = null;
-    try {
-      globalLease = concurrencyLimiter.acquireGlobal({
-        tokenId: `pool-member-test:${session.user.id}`,
-        userId: session.user.id,
-      });
-      cliLease = concurrencyLimiter.acquireCli(model.Endpoint.cliDeviceId);
-    } catch (error) {
-      globalLease?.release();
-      cliLease?.release();
-      if (error instanceof ModelApiLimitError) {
-        return c.json({ ok: false, error: error.message }, 429);
-      }
-      throw error;
-    }
-
-    const body = new TextEncoder().encode(
-      JSON.stringify({
-        model: model.upstreamModelId,
-        stream: false,
-        max_tokens: 8,
-        messages: [{ role: "user", content: "Reply with the single word pong." }],
-      }),
-    );
-    const attempt = startRelayAttempt({
-      manager,
-      cliDeviceId: model.Endpoint.cliDeviceId,
-      endpointSlug: model.Endpoint.slug,
-      family: "chat.completions",
-      method: "POST",
-      path: "/v1/chat/completions",
-      headers: new Headers({ "content-type": "application/json" }),
-      body,
-      timeoutMs: TEST_TIMEOUT_MS,
-    });
-
-    try {
-      const started = await attempt.started;
-      const rawText = await readResponseUtf8(started.body);
-      const terminal = await attempt.terminal;
-      const latencyMs = Date.now() - startedAt;
-      if (!terminal.ok || !isSuccessfulChatProbeReply(started.status, rawText)) {
+    switch (result.outcome) {
+      case "not-found":
+        return c.json({ ok: false, error: "Pool member not found." }, 404);
+      case "not-relay-capable":
+        return c.json({ ok: false, error: "Member execution target is not relay-capable." }, 409);
+      case "unpublished":
+        return c.json({ ok: false, error: "Member model is unpublished." }, 409);
+      case "not-chat-capable":
+        return c.json(
+          { ok: false, error: "This test only probes chat completions for chat-capable members." },
+          409,
+        );
+      case "cli-disconnected":
+        return c.json({ ok: false, error: "Member CLI is disconnected." }, 503);
+      case "rate-limited":
+        return c.json({ ok: false, error: "Too many active model API requests." }, 429);
+      case "ok":
+        return c.json({ ok: true, status: result.status, latencyMs: result.latencyMs });
+      case "probe-failed":
         return c.json({
           ok: false,
-          status: started.status,
-          latencyMs,
-          error: terminal.failure
-            ? `Member test failed (${terminal.failure}).`
-            : "Member did not return a valid chat completion containing pong.",
+          status: result.status,
+          latencyMs: result.latencyMs,
+          error: result.reason,
         });
-      }
-      await markPoolMemberRelaySuccess(member.id);
-      return c.json({ ok: true, status: started.status, latencyMs });
-    } catch (error) {
-      return c.json({
-        ok: false,
-        latencyMs: Date.now() - startedAt,
-        error: error instanceof Error ? error.message : "Member test failed.",
-      });
-    } finally {
-      cliLease.release();
-      globalLease.release();
+      case "probe-error":
+        return c.json({
+          ok: false,
+          latencyMs: result.latencyMs,
+          error: result.reason,
+        });
     }
   });
 

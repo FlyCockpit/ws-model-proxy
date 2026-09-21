@@ -16,21 +16,17 @@ import { betterAuth } from "better-auth";
 import { prismaAdapter } from "better-auth/adapters/prisma";
 import { admin, deviceAuthorization, twoFactor } from "better-auth/plugins";
 import { z } from "zod";
+import { sanitizedApiErrorLogLine } from "./api-error-logging";
+import { resolveAuthLogCall } from "./auth-logger-bridge";
+import { resolveMcpPlugins } from "./mcp-plugins";
 import { resolveSignupLocale } from "./signup-locale";
-import { getSignupAccessState } from "./signup-policy";
+import { getSignupAccessState, resolveBootstrapAdminIdentity } from "./signup-policy";
 import { resolveUserCreatePolicy, toUserCreatePolicyInput } from "./user-create-policy";
 import { withVerificationCallback } from "./verification-callback";
 
 const isCrossOrigin = !!env.CORS_ORIGIN;
 /** Email/SMTP is optional; when configured, verification is required. */
 const emailConfigured = isEmailConfigured();
-
-// Better-Auth emits "user input failed validation" cases (wrong password, unknown
-// email, unverified email, etc.) at level=error. Those are normal end-user mistakes,
-// not server faults — downgrade them to warn so production error dashboards stay
-// signal-y. Anything we don't recognize keeps its original level.
-const USER_INPUT_ERROR_PATTERN =
-  /invalid (password|email|credentials|token|otp|two[- ]?factor)|user not found|email not verified|password is incorrect|account not found|failed to verify|already exists|too many (requests|attempts)/i;
 
 const userSlugInputSchema = z
   .string()
@@ -89,17 +85,49 @@ async function resolveUniqueUserSlug({
 }
 
 export const auth = betterAuth({
-  database: prismaAdapter(prisma, {
-    provider: "postgresql",
-  }),
+  database: prismaAdapter(
+    // The shared client from @ws-model-proxy/db is ALREADY wrapped by the
+    // db-seam shutdown fence (Part G pass 2, G1): the fence now covers BOTH
+    // better-auth's adapter operations AND the direct procedure/diagnostic
+    // calls every other consumer of the ONE shared client makes. Once the
+    // MCP shutdown gate closes (apps/server/src/app.ts wires the gate's
+    // onClosed into armAuthDbShutdownFence — a thin delegation to
+    // armDbShutdownFence), any NEW database operation initiated by any
+    // continuation of this auth instance (including the un-cancellable
+    // requireMcpAuth verifier continuations doing DPoP replay
+    // reservations) rejects immediately. See
+    // @ws-model-proxy/db/shutdown-fence for the full rationale. There is
+    // deliberately NO second wrapper here (no double-wrapping).
+    prisma,
+    {
+      provider: "postgresql",
+    },
+  ),
 
   logger: {
+    // Sanitizing bridge choke point (invariant 10 / L19, pass 9 —
+    // TERMINAL policy v3: structure-triggered WHOLE-MESSAGE redaction):
+    // non-string first args emit only `[auth] <level> (<ctor|typeof>)`;
+    // string firsts containing ANY structural character (`://`, `//`,
+    // `\`, `=`, control chars) emit exactly
+    // `[auth] <level> [message-redacted: untrusted structure]` — the
+    // message NEVER appears; clean static messages pass verbatim
+    // (200-char final-safety truncation) with `(Error: <ctor>)` markers
+    // at error/warn only. info drops rest args; debug logs nothing.
+    // Decision table + rationale in ./auth-logger-bridge.ts.
     log(level, message, ...args) {
-      const effective =
-        level === "error" && USER_INPUT_ERROR_PATTERN.test(message) ? "warn" : level;
-      if (effective === "error") console.error(`[auth] ${message}`, ...args);
-      else if (effective === "warn") console.warn(`[auth] ${message}`, ...args);
-      else if (effective === "info") console.info(`[auth] ${message}`, ...args);
+      const call = resolveAuthLogCall(level, message, args);
+      if (call) console[call.method](...call.args);
+    },
+  },
+
+  // Sanitized API-error sink (invariant 10 / L19): providing onError
+  // REPLACES Better Auth's default error logging (which logs e.message
+  // wholesale for Prisma-shaped errors). See api-error-logging.ts.
+  onAPIError: {
+    onError: (error: unknown) => {
+      const line = sanitizedApiErrorLogLine(error);
+      if (line !== null) console.error(line);
     },
   },
 
@@ -180,6 +208,18 @@ export const auth = betterAuth({
     updateAge: 60 * 60 * 24,
   },
   advanced: {
+    // Native joins (bucket C of the L19 TERMINAL log policy, pass 6): the
+    // installed @better-auth/prisma-adapter implements native joins when
+    // this flag is set (core factory.mjs passes the join clause through to
+    // findOne/findMany at :561/:609 and transformOutput reads the joined
+    // key from the adapter row instead of triggering handleFallbackJoin),
+    // which removes the session→user fallback-join (a separate user query
+    // whose rejection used to reach the console as a raw Error) at the
+    // root. The console shim (bucket B, apps/server better-call-error-log-
+    // shim) remains the terminal guarantee: factory.mjs:191-195 still
+    // reaches handleFallbackJoin whenever a joined key is absent from the
+    // returned row.
+    database: { joins: true },
     defaultCookieAttributes: isCrossOrigin
       ? { sameSite: "none", secure: true, httpOnly: true }
       : { httpOnly: true, secure: env.NODE_ENV === "production" },
@@ -244,16 +284,25 @@ export const auth = betterAuth({
       // the Prisma model mapping explicitly.
       schema: { deviceCode: { modelName: "deviceCode" } },
     }),
+    // Dormant MCP/OAuth surface (Phase 0b): empty while WMP_MCP_ENABLED is
+    // false (the default), so the plugin list above is exactly what ships
+    // today. When enabled, adds jwt/mcp/cimd from Better Auth 1.7.3.
+    ...resolveMcpPlugins({
+      enabled: env.WMP_MCP_ENABLED,
+      baseUrl: env.BETTER_AUTH_URL,
+    }),
   ],
   databaseHooks: {
     user: {
       create: {
         before: async (user, context) => {
           const { signupEnabled, userCount } = await getSignupAccessState();
+          const bootstrapAdminIdentity = resolveBootstrapAdminIdentity(user.email);
           const policy = resolveUserCreatePolicy(
             toUserCreatePolicyInput({
               signupEnabled,
               userCount,
+              adminBootstrapAllowed: bootstrapAdminIdentity.allowed,
               emailConfigured,
               user,
               context,
@@ -268,6 +317,11 @@ export const auth = betterAuth({
           return {
             data: {
               ...user,
+              // The create hook runs before the adapter's Prisma insert. For
+              // production bootstrap requests, write the configured canonical
+              // identity so concurrent case/whitespace variants collide on
+              // User.@@unique([email]) and only one request can win.
+              email: bootstrapAdminIdentity.canonicalEmail ?? user.email,
               slug,
               locale,
               ...(policy.emailVerified ? { emailVerified: true } : {}),

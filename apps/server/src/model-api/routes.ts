@@ -16,7 +16,6 @@ import {
   isRetryablePoolMemberRelayFailure,
   markPoolMemberHalfOpenTrial,
   markPoolMemberRelaySuccess,
-  type PoolMemberRouteRow,
   type RelayFailureClass,
   recordPoolMemberRelayFailure,
   relayFailureClasses,
@@ -30,7 +29,7 @@ import {
   resolveExecutionPath,
   type SurfaceRequestRequirements,
 } from "@ws-model-proxy/api/lib/surface-capabilities";
-import prisma from "@ws-model-proxy/db";
+import prisma, { Prisma } from "@ws-model-proxy/db";
 import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
 import { env } from "@ws-model-proxy/env/server";
 import { Hono } from "hono";
@@ -444,7 +443,7 @@ async function nativeContextCount({
   pool,
 }: {
   request: Request;
-  selected: DirectModelRelayRow;
+  selected: ContextCountModelRow;
   operation: RelayOperation;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   relayRequestId: string;
@@ -602,33 +601,6 @@ type ResponseStickinessCapture = {
   targetModelPoolId?: string;
 };
 
-type ResponseStickinessRecordRow = {
-  routingVersion?: number;
-  userId: string;
-  modelApiTokenId: string | null;
-  targetDiscoveredModelId: string | null;
-  targetModelPoolId: string | null;
-  selectedDiscoveredModelId: string | null;
-  TargetExecutionTarget: { discoveredModelId: string | null } | null;
-  SelectedExecutionTarget: { discoveredModelId: string | null } | null;
-  selectedExecutionTargetId?: string | null;
-  providerAccountId?: string | null;
-  providerModelId?: string | null;
-  providerEndpointIdentity?: string | null;
-  providerEndpointVersion?: number | null;
-  providerUpstreamModelId?: string | null;
-  nativeSurface?: string | null;
-  upstreamResponseIdDigest?: string | null;
-  poolGrantId?: string | null;
-  PoolGrant?: {
-    id: string;
-    poolId: string;
-    ownerUserId: string;
-    granteeUserId: string;
-  } | null;
-  expiresAt: Date | null;
-};
-
 type StickyRoute =
   | {
       target: "DIRECT_MODEL";
@@ -653,102 +625,125 @@ type StickyRoute =
       };
     };
 
-type DirectModelRelayRow = {
-  id: string;
-  published: boolean;
-  userId: string;
-  upstreamModelId: string;
-  capabilityOverrideMode: string;
-  capabilityOverrideMetadata: unknown | null;
-  optimisticBasicTranscription: boolean;
-  ExecutionTarget: {
-    id: string;
-    inferenceCapacityId: string | null;
-    directContextCeiling?: number | null;
-    directContextMargin?: number;
-    directWaitBudgetMs?: number | null;
-    InferenceCapacity?: {
-      id: string;
-      hardConcurrencyLimit: number | null;
-      physicalMaxContext: number | null;
-      countStrategy: "TOKENIZER" | "TEMPLATE_AWARE" | "ENGINE_REPORTED" | "CONSERVATIVE_ESTIMATE";
-      runtimeIdentityKey: string;
-      runtimeModel: string;
-      runtimeRevision: string | null;
-      tokenizer: string | null;
-      tokenizerVersion: string | null;
-      template: string | null;
-      templateVersion: string | null;
-      engine: string | null;
-      cacheNamespace: string | null;
-    } | null;
-  } | null;
-  Endpoint: {
-    id: string;
-    slug: string;
-    published: boolean;
-    cliDeviceId: string;
-    status: string | null;
-    capabilityMetadata: unknown | null;
-    CliDevice: { status: string } | null;
-  };
-};
+const inferenceCapacityRelaySelect = {
+  id: true,
+  hardConcurrencyLimit: true,
+  physicalMaxContext: true,
+  countStrategy: true,
+  runtimeIdentityKey: true,
+  runtimeModel: true,
+  runtimeRevision: true,
+  tokenizer: true,
+  tokenizerVersion: true,
+  template: true,
+  templateVersion: true,
+  engine: true,
+  cacheNamespace: true,
+} satisfies Prisma.InferenceCapacitySelect;
 
-type PoolMemberRelayRow = PoolMemberRouteRow & {
+const relayEndpointSelect = {
+  id: true,
+  slug: true,
+  published: true,
+  cliDeviceId: true,
+  status: true,
+  capabilityMetadata: true,
+  CliDevice: { select: { status: true } },
+} satisfies Prisma.EndpointSelect;
+
+const poolDiscoveredModelRelaySelect = {
+  id: true,
+  userId: true,
+  published: true,
+  upstreamModelId: true,
+  capabilityOverrideMode: true,
+  capabilityOverrideMetadata: true,
+  Endpoint: { select: relayEndpointSelect },
+} satisfies Prisma.DiscoveredModelSelect;
+
+const contextCountModelRelaySelect = {
+  ...poolDiscoveredModelRelaySelect,
+  optimisticBasicTranscription: true,
   ExecutionTarget: {
-    id: string;
-    inferenceCapacityId: string | null;
-    InferenceCapacity?: {
-      id: string;
-      hardConcurrencyLimit: number | null;
-      physicalMaxContext: number | null;
-      countStrategy: "TOKENIZER" | "TEMPLATE_AWARE" | "ENGINE_REPORTED" | "CONSERVATIVE_ESTIMATE";
-      runtimeIdentityKey: string;
-      runtimeModel: string;
-      runtimeRevision: string | null;
-      tokenizer: string | null;
-      tokenizerVersion: string | null;
-      template: string | null;
-      templateVersion: string | null;
-      engine: string | null;
-      cacheNamespace: string | null;
-    } | null;
-    DiscoveredModel: PoolMemberRouteRow["DiscoveredModel"] & {
-      id: string;
-      userId: string;
-      capabilityOverrideMode: string;
-      capabilityOverrideMetadata: unknown | null;
-      Endpoint: PoolMemberRouteRow["DiscoveredModel"]["Endpoint"] & {
-        capabilityMetadata: unknown | null;
-      };
-    };
-  } | null;
-  capacityContextCeiling?: number | null;
-  capacityContextCeilingMode?: "INHERIT" | "LIMITED" | "UNLIMITED";
-  capacityContextMargin?: number | null;
-  capacityWaitBudgetMs?: number | null;
-  capacityWaitBudgetMode?: "INHERIT" | "LIMITED" | "UNLIMITED";
-  ModelPool?: {
-    capacityContextCeiling: number | null;
-    capacityContextMargin: number;
-    capacityWaitBudgetMs: number | null;
-    affinityEnabled: boolean;
-    affinityTtlSeconds: number;
-    affinityMaxRecords: number;
-    affinityPrefixWeight: number;
-    affinityConversationWeight: number;
-    affinityConfirmedCacheWeight: number;
-    affinityLoadPenaltyWeight: number;
-  };
-  DiscoveredModel: PoolMemberRouteRow["DiscoveredModel"] & {
-    id: string;
-    userId: string;
-    capabilityOverrideMode: string;
-    capabilityOverrideMetadata: unknown | null;
-    Endpoint: PoolMemberRouteRow["DiscoveredModel"]["Endpoint"] & {
-      capabilityMetadata: unknown | null;
-    };
-  };
+    select: {
+      id: true,
+      inferenceCapacityId: true,
+      InferenceCapacity: { select: inferenceCapacityRelaySelect },
+    },
+  },
+} satisfies Prisma.DiscoveredModelSelect;
+
+const directModelRelaySelect = {
+  ...poolDiscoveredModelRelaySelect,
+  optimisticBasicTranscription: true,
+  ExecutionTarget: {
+    select: {
+      id: true,
+      inferenceCapacityId: true,
+      directContextCeiling: true,
+      directContextMargin: true,
+      directWaitBudgetMs: true,
+      InferenceCapacity: { select: inferenceCapacityRelaySelect },
+    },
+  },
+} satisfies Prisma.DiscoveredModelSelect;
+
+type DirectModelRelayRow = Prisma.DiscoveredModelGetPayload<{
+  select: typeof directModelRelaySelect;
+}>;
+type ContextCountModelRow = Prisma.DiscoveredModelGetPayload<{
+  select: typeof contextCountModelRelaySelect;
+}>;
+
+const poolMemberRelaySelect = {
+  id: true,
+  poolId: true,
+  discoveredModelId: true,
+  capacityContextCeiling: true,
+  capacityContextCeilingMode: true,
+  capacityContextMargin: true,
+  capacityWaitBudgetMs: true,
+  capacityWaitBudgetMode: true,
+  ModelPool: {
+    select: {
+      capacityContextCeiling: true,
+      capacityContextMargin: true,
+      capacityWaitBudgetMs: true,
+      affinityEnabled: true,
+      affinityTtlSeconds: true,
+      affinityMaxRecords: true,
+      affinityPrefixWeight: true,
+      affinityConversationWeight: true,
+      affinityConfirmedCacheWeight: true,
+      affinityLoadPenaltyWeight: true,
+    },
+  },
+  ExecutionTarget: {
+    select: {
+      id: true,
+      inferenceCapacityId: true,
+      InferenceCapacity: { select: inferenceCapacityRelaySelect },
+      DiscoveredModel: { select: poolDiscoveredModelRelaySelect },
+    },
+  },
+  weight: true,
+  healthStatus: true,
+  routingStatus: true,
+  lastFailureClass: true,
+  consecutiveRetryableFailures: true,
+  lastFailureAt: true,
+  nextRetryAt: true,
+  halfOpenTrialStartedAt: true,
+  DiscoveredModel: { select: poolDiscoveredModelRelaySelect },
+} satisfies Prisma.PoolMemberSelect;
+
+type PoolMemberRelayQueryRow = Prisma.PoolMemberGetPayload<{
+  select: typeof poolMemberRelaySelect;
+}>;
+type PoolMemberRelayRow = Omit<PoolMemberRelayQueryRow, "discoveredModelId" | "DiscoveredModel"> & {
+  /** Normalized after the query from the modern execution target or the legacy relation. */
+  discoveredModelId: string;
+  DiscoveredModel: NonNullable<PoolMemberRelayQueryRow["DiscoveredModel"]>;
 };
 
 type RelayMetadataCreate = {
@@ -1131,7 +1126,7 @@ function effectiveCapabilitiesFrom({
 }
 
 function effectiveDirectCapabilities(
-  row: DirectModelRelayRow,
+  row: ContextCountModelRow,
 ): OpenAiCompatibleCapabilities | null {
   return effectiveCapabilitiesFrom({
     capabilityOverrideMode: row.capabilityOverrideMode,
@@ -1733,7 +1728,7 @@ function canonicalRequestRequirements(
   };
 }
 
-function isEndpointConnected(row: DirectModelRelayRow, activeCliDeviceIds: Set<string>): boolean {
+function isEndpointConnected(row: ContextCountModelRow, activeCliDeviceIds: Set<string>): boolean {
   return isPublishedEndpointExecutable({
     modelPublished: row.published,
     endpointPublished: row.Endpoint.published,
@@ -2736,7 +2731,7 @@ async function resolveStickyRoute({
   };
 }): Promise<StickyRoute | Response> {
   const routingKeyDigest = responseStickinessDigest({ requester, responseId });
-  const record = (await prisma.responseStickinessRecord.findUnique({
+  const record = await prisma.responseStickinessRecord.findUnique({
     where: {
       userId_routingKeyDigest: {
         userId: requester.userId,
@@ -2766,7 +2761,7 @@ async function resolveStickyRoute({
       SelectedExecutionTarget: { select: { discoveredModelId: true } },
       expiresAt: true,
     },
-  })) as ResponseStickinessRecordRow | null;
+  });
 
   if ((record?.routingVersion ?? 1) >= 3) {
     const validRequester =
@@ -2883,55 +2878,10 @@ async function resolveStickyRoute({
 }
 
 async function directModelRow(discoveredModelId: string): Promise<DirectModelRelayRow | null> {
-  return (await prisma.discoveredModel.findUnique({
+  return prisma.discoveredModel.findUnique({
     where: { id: discoveredModelId },
-    select: {
-      id: true,
-      published: true,
-      userId: true,
-      upstreamModelId: true,
-      capabilityOverrideMode: true,
-      capabilityOverrideMetadata: true,
-      optimisticBasicTranscription: true,
-      ExecutionTarget: {
-        select: {
-          id: true,
-          inferenceCapacityId: true,
-          directContextCeiling: true,
-          directContextMargin: true,
-          directWaitBudgetMs: true,
-          InferenceCapacity: {
-            select: {
-              id: true,
-              hardConcurrencyLimit: true,
-              physicalMaxContext: true,
-              countStrategy: true,
-              runtimeIdentityKey: true,
-              runtimeModel: true,
-              runtimeRevision: true,
-              tokenizer: true,
-              tokenizerVersion: true,
-              template: true,
-              templateVersion: true,
-              engine: true,
-              cacheNamespace: true,
-            },
-          },
-        },
-      },
-      Endpoint: {
-        select: {
-          id: true,
-          slug: true,
-          published: true,
-          cliDeviceId: true,
-          status: true,
-          capabilityMetadata: true,
-          CliDevice: { select: { status: true } },
-        },
-      },
-    },
-  })) as DirectModelRelayRow | null;
+    select: directModelRelaySelect,
+  });
 }
 
 async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
@@ -2947,109 +2897,13 @@ async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
       ExecutionTarget: { DiscoveredModel: { isNot: null } },
     },
     orderBy: { id: "asc" },
-    select: {
-      id: true,
-      poolId: true,
-      discoveredModelId: true,
-      capacityContextCeiling: true,
-      capacityContextCeilingMode: true,
-      capacityContextMargin: true,
-      capacityWaitBudgetMs: true,
-      capacityWaitBudgetMode: true,
-      ModelPool: {
-        select: {
-          capacityContextCeiling: true,
-          capacityContextMargin: true,
-          capacityWaitBudgetMs: true,
-          affinityEnabled: true,
-          affinityTtlSeconds: true,
-          affinityMaxRecords: true,
-          affinityPrefixWeight: true,
-          affinityConversationWeight: true,
-          affinityConfirmedCacheWeight: true,
-          affinityLoadPenaltyWeight: true,
-        },
-      },
-      ExecutionTarget: {
-        select: {
-          id: true,
-          inferenceCapacityId: true,
-          InferenceCapacity: {
-            select: {
-              id: true,
-              hardConcurrencyLimit: true,
-              physicalMaxContext: true,
-              countStrategy: true,
-              runtimeIdentityKey: true,
-              runtimeModel: true,
-              runtimeRevision: true,
-              tokenizer: true,
-              tokenizerVersion: true,
-              template: true,
-              templateVersion: true,
-              engine: true,
-              cacheNamespace: true,
-            },
-          },
-          DiscoveredModel: {
-            select: {
-              id: true,
-              userId: true,
-              published: true,
-              upstreamModelId: true,
-              capabilityOverrideMode: true,
-              capabilityOverrideMetadata: true,
-              Endpoint: {
-                select: {
-                  id: true,
-                  slug: true,
-                  published: true,
-                  cliDeviceId: true,
-                  status: true,
-                  capabilityMetadata: true,
-                  CliDevice: { select: { status: true } },
-                },
-              },
-            },
-          },
-        },
-      },
-      weight: true,
-      healthStatus: true,
-      routingStatus: true,
-      lastFailureClass: true,
-      consecutiveRetryableFailures: true,
-      lastFailureAt: true,
-      nextRetryAt: true,
-      halfOpenTrialStartedAt: true,
-      DiscoveredModel: {
-        select: {
-          id: true,
-          userId: true,
-          published: true,
-          upstreamModelId: true,
-          capabilityOverrideMode: true,
-          capabilityOverrideMetadata: true,
-          Endpoint: {
-            select: {
-              id: true,
-              slug: true,
-              published: true,
-              cliDeviceId: true,
-              status: true,
-              capabilityMetadata: true,
-              CliDevice: { select: { status: true } },
-            },
-          },
-        },
-      },
-    },
+    select: poolMemberRelaySelect,
   });
-  return rows.flatMap((row) => {
+  return rows.flatMap<PoolMemberRelayRow>((row) => {
     const discoveredModel = row.ExecutionTarget?.DiscoveredModel ?? row.DiscoveredModel;
     if (!discoveredModel) return [];
     return [{ ...row, discoveredModelId: discoveredModel.id, DiscoveredModel: discoveredModel }];
-  }) as PoolMemberRelayRow[];
+  });
 }
 
 function directTargetByModelId(targets: VisibleDirectModelTarget[], modelId: string) {
@@ -4207,7 +4061,7 @@ async function relayPool({
             status: member.DiscoveredModel.Endpoint.status ?? null,
             CliDevice: member.DiscoveredModel.Endpoint.CliDevice ?? null,
           },
-        } satisfies DirectModelRelayRow;
+        } satisfies ContextCountModelRow;
         if (!isEndpointConnected(selected, new Set(manager.getActiveCliDeviceIds()))) return;
         try {
           const count = await nativeContextCount({
@@ -5838,7 +5692,7 @@ async function maybeApplyPoolMediaTransformer({
   if (operationFamily !== "chat.completions") return prepared;
   if (!prepared.payload || !Array.isArray(prepared.payload.messages)) return prepared;
 
-  const pool = (await prisma.modelPool.findUnique({
+  const pool = await prisma.modelPool.findUnique({
     where: { id: poolId },
     select: {
       transformerDiscoveredModelId: true,
@@ -5853,19 +5707,7 @@ async function maybeApplyPoolMediaTransformer({
       transformerTimeoutMs: true,
       transformerMaxAssets: true,
     },
-  })) as {
-    transformerDiscoveredModelId: string | null;
-    transformerSystemPrompt: string | null;
-    transformerImages: boolean;
-    transformerAudio: boolean;
-    transformerVideo: boolean;
-    transformerCacheMode: string;
-    transformerIncludePrimaryTools: boolean;
-    transformerMaxTools: number;
-    transformerMaxToolChars: number;
-    transformerTimeoutMs: number | null;
-    transformerMaxAssets: number | null;
-  } | null;
+  });
 
   if (!pool?.transformerDiscoveredModelId) return prepared;
 

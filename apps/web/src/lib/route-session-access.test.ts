@@ -4,6 +4,7 @@ import {
   decideAdminRouteAccess,
   decideAnonymousOnlyRouteAccess,
   decideDeviceRouteAccess,
+  decideMcpConsentRouteAccess,
   decideProtectedRouteAccess,
   failedRouteSessionResolution,
   type RouteSession,
@@ -108,6 +109,27 @@ describe("route session access decisions", () => {
     expect(decideDeviceRouteAccess(resolvedRouteSession(adminSession))).toEqual({
       kind: "allow",
       session: adminSession,
+    });
+  });
+
+  describe("decideMcpConsentRouteAccess", () => {
+    it("requires a session and sends anonymous visitors to the MCP login page", () => {
+      expect(decideMcpConsentRouteAccess(resolvedRouteSession(null))).toEqual({
+        kind: "redirect-to-mcp-login",
+      });
+    });
+
+    it("allows any signed-in user (verification gates are not consent gates)", () => {
+      expect(decideMcpConsentRouteAccess(resolvedRouteSession(session))).toEqual({
+        kind: "allow",
+        session,
+      });
+    });
+
+    it("treats a session lookup failure as an error, never a silent redirect", () => {
+      expect(decideMcpConsentRouteAccess(failedRouteSessionResolution())).toEqual({
+        kind: "error",
+      });
     });
   });
 });

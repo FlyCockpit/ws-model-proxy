@@ -138,12 +138,13 @@ export const usersRouter = {
               "Account creation is disabled by the auth configuration. Ask an admin to check the invite setup.",
           });
         }
-        // Log only name+message — the generated temp password was just
-        // passed to auth.api.createUser, so we don't dump the raw error
-        // object in case a future better-auth release attaches request
-        // context to thrown errors.
-        const errLabel = err instanceof Error ? `${err.name}: ${err.message}` : "unknown error";
-        console.error("[users.invite] auth.api.createUser failed:", errLabel);
+        // Log the error's constructor name ONLY. The generated temp
+        // password (and, in future better-auth releases, request context
+        // like client_secret=… strings) was just handed to
+        // auth.api.createUser — the raw message/stack must never reach
+        // the console (invariant 10; probe evidence in R35/R36).
+        const errLabel = err instanceof Error ? (err.constructor?.name ?? "Error") : typeof err;
+        console.error(`[users.invite] auth.api.createUser failed: ${errLabel}`);
         throw new ORPCError("INTERNAL_SERVER_ERROR", {
           message:
             "Couldn't create that account. Try again, or contact an admin if it keeps happening.",
@@ -167,7 +168,10 @@ export const usersRouter = {
         await sendEmail({ to: input.email, subject, html });
         emailSent = true;
       } catch (err) {
-        console.warn("[users.invite] failed to send invite email", err);
+        // Constructor name only — SMTP/transport rejections can embed
+        // recipient addresses and auth material in their messages.
+        const errLabel = err instanceof Error ? (err.constructor?.name ?? "Error") : typeof err;
+        console.warn(`[users.invite] failed to send invite email: ${errLabel}`);
       }
 
       return { userId, tempPassword, emailSent };
@@ -278,7 +282,9 @@ export const usersRouter = {
             "This user has authored content and cannot be deleted. Archive them instead, or reassign their content first.",
         });
       }
-      console.error("[users.remove] prisma delete failed", err);
+      // Constructor name only — Prisma rejections embed SQL + params.
+      const errLabel = err instanceof Error ? (err.constructor?.name ?? "Error") : typeof err;
+      console.error(`[users.remove] prisma delete failed: ${errLabel}`);
       throw new ORPCError("INTERNAL_SERVER_ERROR", {
         message:
           "Couldn't delete that account. Try again, or contact an admin if it keeps happening.",

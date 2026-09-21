@@ -8,6 +8,8 @@ const ADMIN_CREATE_USER_PATH = "/admin/create-user";
 export type UserCreatePolicyInput = {
   signupEnabled: boolean;
   userCount: number;
+  /** Whether this submitted address is authorized for a production bootstrap. */
+  adminBootstrapAllowed?: boolean;
   emailConfigured: boolean;
   requestedRole?: unknown;
   contextPath?: string | null;
@@ -22,6 +24,7 @@ export type UserCreatePolicyResult = {
 export type UserCreateHookMappingInput = {
   signupEnabled: boolean;
   userCount: number;
+  adminBootstrapAllowed?: boolean;
   emailConfigured: boolean;
   user: object;
   context?: { path?: unknown } | null;
@@ -45,6 +48,7 @@ export function toUserCreatePolicyInput(input: UserCreateHookMappingInput): User
   return {
     signupEnabled: input.signupEnabled,
     userCount: input.userCount,
+    adminBootstrapAllowed: input.adminBootstrapAllowed,
     emailConfigured: input.emailConfigured,
     requestedRole: "role" in input.user ? input.user.role : undefined,
     contextPath: typeof input.context?.path === "string" ? input.context.path : undefined,
@@ -54,14 +58,19 @@ export function toUserCreatePolicyInput(input: UserCreateHookMappingInput): User
 export function resolveUserCreatePolicy(input: UserCreatePolicyInput): UserCreatePolicyResult {
   const isFirstUser = input.userCount === 0;
   const isAdminCreate = isAdminCreateUserPath(input.contextPath);
+  // The hook must explicitly attest the address. An omitted value is a
+  // denial, so a future creation path cannot accidentally recreate the public
+  // production bootstrap bypass by forgetting this field.
+  const mayBootstrapAdmin = isFirstUser && input.adminBootstrapAllowed === true;
 
-  if (!input.signupEnabled && !isFirstUser && !isAdminCreate) {
+  if (!input.signupEnabled && !mayBootstrapAdmin && !isAdminCreate) {
     throw new Error(SIGNUP_DISABLED_MESSAGE);
   }
 
   return {
     role: resolveCreateRole({
       isFirstUser,
+      mayBootstrapAdmin,
       isAdminCreate,
       requestedRole: input.requestedRole,
     }),
@@ -73,14 +82,16 @@ export function resolveUserCreatePolicy(input: UserCreatePolicyInput): UserCreat
 
 function resolveCreateRole({
   isFirstUser,
+  mayBootstrapAdmin,
   isAdminCreate,
   requestedRole,
 }: {
   isFirstUser: boolean;
+  mayBootstrapAdmin: boolean;
   isAdminCreate: boolean;
   requestedRole: unknown;
 }): string {
-  if (isFirstUser) return FIRST_USER_ROLE;
+  if (isFirstUser && mayBootstrapAdmin) return FIRST_USER_ROLE;
   if (isAdminCreate) return preserveRequestedRole(requestedRole);
   return DEFAULT_ROLE;
 }
