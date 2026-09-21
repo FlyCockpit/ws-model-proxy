@@ -329,7 +329,7 @@ describe("upstream endpoint-specific rate limits are retained (config probe)", (
           typeof rule.pathMatcher === "function" &&
           (rule.pathMatcher as (p: string) => boolean)(path),
       );
-    // The plan's retained set: token, authorize, introspect, revoke, userinfo.
+    // The configured retained set: token, authorize, introspect, revoke, userinfo.
     expect(matches("/oauth2/token")).toBe(true);
     expect(matches("/oauth2/authorize")).toBe(true);
     expect(matches("/oauth2/introspect")).toBe(true);

@@ -20,7 +20,7 @@ import { sanitizedApiErrorLogLine } from "./api-error-logging";
 import { resolveAuthLogCall } from "./auth-logger-bridge";
 import { resolveMcpPlugins } from "./mcp-plugins";
 import { resolveSignupLocale } from "./signup-locale";
-import { getSignupAccessState } from "./signup-policy";
+import { getSignupAccessState, resolveBootstrapAdminIdentity } from "./signup-policy";
 import { resolveUserCreatePolicy, toUserCreatePolicyInput } from "./user-create-policy";
 import { withVerificationCallback } from "./verification-callback";
 
@@ -297,10 +297,12 @@ export const auth = betterAuth({
       create: {
         before: async (user, context) => {
           const { signupEnabled, userCount } = await getSignupAccessState();
+          const bootstrapAdminIdentity = resolveBootstrapAdminIdentity(user.email);
           const policy = resolveUserCreatePolicy(
             toUserCreatePolicyInput({
               signupEnabled,
               userCount,
+              adminBootstrapAllowed: bootstrapAdminIdentity.allowed,
               emailConfigured,
               user,
               context,
@@ -315,6 +317,11 @@ export const auth = betterAuth({
           return {
             data: {
               ...user,
+              // The create hook runs before the adapter's Prisma insert. For
+              // production bootstrap requests, write the configured canonical
+              // identity so concurrent case/whitespace variants collide on
+              // User.@@unique([email]) and only one request can win.
+              email: bootstrapAdminIdentity.canonicalEmail ?? user.email,
               slug,
               locale,
               ...(policy.emailVerified ? { emailVerified: true } : {}),

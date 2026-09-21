@@ -46,6 +46,7 @@ import {
   MCP_OAUTH_AUTHORIZE_PATH,
   MCP_OAUTH_CONSENT_PATH,
   MCP_OAUTH_CONTINUE_PATH,
+  MCP_OAUTH_REGISTER_PATH,
   MCP_OAUTH_TOKEN_PATH,
   onMcpOauthRoute,
 } from "./mcp-oauth-route-match.js";
@@ -86,7 +87,9 @@ import {
   authLimiter,
   createRateLimiterMiddleware,
   emailRecipientLimiter,
+  mcpClientRegistrationLimiter,
   rpcLimiter,
+  signinFailureLimiter,
   signupLimiter,
   signupRecipientLimiter,
 } from "./rate-limit.js";
@@ -101,6 +104,7 @@ import { createRpcBatchHandlerPlugin } from "./rpc-batch-plugin.js";
 import { mountSecurityHeaders } from "./security-headers.js";
 import { registerSeoRoutes } from "./seo.js";
 import { sessionMiddleware } from "./session-middleware.js";
+import { SIGNIN_FAILURE_PATH, signinFailureLimit } from "./signin-failure-limit.js";
 import { signupAccessGate } from "./signup-access-gate.js";
 import { getOrSetSsrCache } from "./ssr-cache.js";
 import { unhandledErrorLogArgs } from "./unhandled-error-log.js";
@@ -599,9 +603,9 @@ export async function createApp(options: CreateAppOptions = {}) {
   app.get("/api/cli/ws", relayUpgradeHandler());
 
   // Signup kill-switch — reject email/password signup before it reaches
-  // Better-Auth when runtime signup is disabled, except for the first account on
-  // an empty instance. The auth database hook also enforces this and promotes
-  // that first user to admin.
+  // Better-Auth when runtime signup is disabled. Production bootstrap requires
+  // the configured canonical ADMIN_EMAIL; local and test retain first-user
+  // bootstrap. The auth database hook repeats the authorization boundary.
   app.use("/api/auth/sign-up/*", signupAccessGate);
 
   // Signup-specific rate limiter — stricter than the general auth limiter.
@@ -673,6 +677,20 @@ export async function createApp(options: CreateAppOptions = {}) {
         mcpOauthBodyCap(MCP_OAUTH_CONSENT_MAX_BODY_BYTES),
       ),
     );
+    // DCR is intentionally unauthenticated for MCP clients such as Grok, but
+    // every accepted request persists an OAuth client. Use a whole-service
+    // bucket rather than an IP key so rotating source addresses cannot turn
+    // that public write endpoint into unbounded database growth.
+    app.use(
+      MCP_OAUTH_REGISTER_PATH,
+      onMcpOauthRoute(
+        "POST",
+        MCP_OAUTH_REGISTER_PATH,
+        createRateLimiterMiddleware(mcpClientRegistrationLimiter, {
+          resolveKey: () => "mcp:oauth:registration:global",
+        }),
+      ),
+    );
     app.use("/api/auth/*", mcpOauthRateLimits);
   }
 
@@ -693,6 +711,11 @@ export async function createApp(options: CreateAppOptions = {}) {
     app.use(path, emailRecipientLimit(emailRecipientLimiter));
   }
   app.use(SIGNUP_RECIPIENT_PATH, emailRecipientLimit(signupRecipientLimiter, SIGNUP_MEDIA_TYPES));
+
+  // The general auth limiter above is IP-keyed. Retain one hashed-email
+  // reservation only after a 401 password failure here, so rotating IPs cannot
+  // multiply guesses against a single account.
+  app.use(SIGNIN_FAILURE_PATH, signinFailureLimit(signinFailureLimiter));
 
   // Verified-admin gate for the deviceAuthorization plugin's approve/deny
   // endpoints. The plugin only checks "is this user signed in" — without this

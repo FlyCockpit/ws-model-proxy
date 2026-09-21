@@ -26,7 +26,7 @@ model User {
   accounts                   Account[]
   twoFactors                 TwoFactor[]
   deviceCodes                DeviceCode[]
-  // Better Auth 1.7 OAuth Provider back-relations (MCP plan Phase 0b).
+  // Better Auth 1.7 OAuth Provider back-relations (Phase 0b).
   oauthClients               OauthClient[]
   oauthRefreshTokens         OauthRefreshToken[]
   oauthAccessTokens          OauthAccessToken[]
@@ -79,12 +79,13 @@ model Session {
   user                 User                @relation(fields: [userId], references: [id], onDelete: Cascade)
   impersonatedBy       String?
   activeOrganizationId String?
-  // Better Auth 1.7 OAuth Provider back-relations (MCP plan Phase 0b).
+  // Better Auth 1.7 OAuth Provider back-relations (Phase 0b).
   oauthRefreshTokens   OauthRefreshToken[]
   oauthAccessTokens    OauthAccessToken[]
 
   @@unique([token])
   @@index([userId])
+  @@index([expiresAt])
   @@map("session")
 }
 
@@ -150,7 +151,7 @@ model TwoFactor {
 }
 
 // ---------------------------------------------------------------------------
-// Better Auth 1.7 OAuth Provider / JWT / MCP models (MCP plan Phase 0b).
+// Better Auth 1.7 OAuth Provider / JWT / MCP models (Phase 0b).
 //
 // Field shapes follow the installed @better-auth 1.7.3 family plugin schemas
 // (oauth-provider schema.ts, jwt plugin schema, two-factor plugin schema) —
@@ -360,7 +361,7 @@ model Jwks {
   @@map("jwks")
 }
 
-// Application-owned MCP grant generation record (MCP plan Phase 0b). This is
+// Application-owned MCP grant generation record (Phase 0b). This is
 // NOT a Better Auth model: `clientId` is the verified OAuth client identifier
 // (string), deliberately without a relation to OauthClient so a client-row
 // deletion (e.g. deferred CIMD cleanup) can never cascade away a revocation

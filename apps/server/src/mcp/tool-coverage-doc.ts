@@ -2,7 +2,7 @@ import { MCP_TOOL_EXCLUSIONS, MCP_TOOL_MANIFEST } from "./tool-manifest";
 
 /**
  * Generator for the pinned tool-coverage artifact
- * (`docs/mcp-tool-coverage.md`, MCP plan Phase 9: "checked coverage artifact
+ * (`docs/mcp-tool-coverage.md`, Phase 9: "checked coverage artifact
  * ... generated/validated from the manifest, fails on drift").
  *
  * The markdown below is FULLY GENERATED from `MCP_TOOL_MANIFEST` +
@@ -55,7 +55,7 @@ Enforcement (all pinned by \`apps/server/src/mcp/tool-manifest.test.ts\`):
 
 Unlike authorization, discovery, MCP login/consent, and \`/mcp\`, the
 \`mcpGrants\` procedures and the settings page are deliberately NOT gated on
-\`WMP_MCP_ENABLED\` (MCP plan invariant 13): humans must be able to kill
+\`WMP_MCP_ENABLED\` (invariant 13): humans must be able to kill
 outstanding authorization during an emergency MCP shutdown. Normal browser
 authentication still applies.`;
 

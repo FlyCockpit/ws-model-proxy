@@ -25,7 +25,7 @@ import { orpc } from "@/utils/orpc";
 import { safeRedirectTo } from "@/utils/safe-redirect";
 
 /**
- * Shared sign-in card (MCP plan Phase 6).
+ * Shared sign-in card (Phase 6).
  *
  * ONE component serves BOTH the ordinary `/$lang/login` route (mode
  * "standard": anonymous-only, signup hint, redirectTo-based post-auth

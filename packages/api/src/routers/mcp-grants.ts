@@ -1,11 +1,11 @@
 import { ORPCError } from "@orpc/server";
-import prisma from "@ws-model-proxy/db";
+import prisma, { Prisma } from "@ws-model-proxy/db";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
 import { runSerializableTransaction } from "../lib/serializable-transaction";
 
 /**
- * Human MCP grant management (MCP plan Phase 7).
+ * Human MCP grant management (Phase 7).
  *
  * Both procedures are HUMAN-ONLY browser-session surfaces: they never accept
  * a caller-supplied user id (identity is always the protected procedure's
@@ -245,58 +245,29 @@ const grantSelection = {
   referenceId: true,
   revokedAt: true,
   createdAt: true,
-} as const;
+} satisfies Prisma.McpGrantSelect;
 
 const clientDisplaySelection = {
   id: true,
   clientId: true,
   name: true,
   uri: true,
-} as const;
+} satisfies Prisma.OauthClientSelect;
 
 const consentSelection = {
   clientId: true,
   scopes: true,
   referenceId: true,
-} as const;
+} satisfies Prisma.OauthConsentSelect;
 
 const refreshSelection = {
   clientId: true,
   scopes: true,
   expiresAt: true,
   confirmation: true,
-} as const;
+} satisfies Prisma.OauthRefreshTokenSelect;
 
-const referenceIdSelection = { referenceId: true } as const;
-
-type GrantRow = {
-  clientId: string;
-  referenceId: string;
-  revokedAt: Date | null;
-  createdAt: Date;
-};
-
-type ClientDisplayRow = {
-  id: string;
-  clientId: string;
-  name: string | null;
-  uri: string | null;
-};
-
-type ConsentRow = {
-  clientId: string;
-  scopes: string[];
-  referenceId: string | null;
-};
-
-type RefreshRow = {
-  clientId: string;
-  scopes: string[];
-  expiresAt: Date;
-  confirmation: unknown;
-};
-
-type ReferenceIdRow = { referenceId: string | null };
+const referenceIdSelection = { referenceId: true } satisfies Prisma.McpGrantSelect;
 
 /** One current-connection card in the settings page. */
 export type McpGrantConnection = {
@@ -422,10 +393,10 @@ export const mcpGrantsRouter = {
     // only by expired tokens are not displayed.
     const now = new Date();
 
-    const grants = (await prisma.mcpGrant.findMany({
+    const grants = await prisma.mcpGrant.findMany({
       where: { userId },
       select: grantSelection,
-    })) as GrantRow[];
+    });
 
     const activeClientIds = new Set(
       grants.filter((grant) => grant.revokedAt === null).map((grant) => grant.clientId),
@@ -433,18 +404,18 @@ export const mcpGrantsRouter = {
     if (activeClientIds.size === 0) return [];
 
     const clientIdFilter = { clientId: { in: [...activeClientIds] } };
-    const clients = (await prisma.oauthClient.findMany({
+    const clients = await prisma.oauthClient.findMany({
       where: clientIdFilter,
       select: clientDisplaySelection,
-    })) as ClientDisplayRow[];
-    const consents = (await prisma.oauthConsent.findMany({
+    });
+    const consents = await prisma.oauthConsent.findMany({
       where: { userId, ...clientIdFilter },
       select: consentSelection,
-    })) as ConsentRow[];
-    const refreshes = (await prisma.oauthRefreshToken.findMany({
+    });
+    const refreshes = await prisma.oauthRefreshToken.findMany({
       where: { userId, ...clientIdFilter, revoked: null, expiresAt: { gt: now } },
       select: refreshSelection,
-    })) as RefreshRow[];
+    });
 
     const connections: McpGrantConnection[] = [];
     for (const client of clients) {
@@ -542,16 +513,16 @@ export const mcpGrantsRouter = {
 
       // Ownership resolves BEFORE any mutation; a foreign or missing
       // connection is indistinguishable (ownership-hiding NOT_FOUND).
-      const client = (await prisma.oauthClient.findUnique({
+      const client = await prisma.oauthClient.findUnique({
         where: { id: input.clientRecordId },
         select: clientDisplaySelection,
-      })) as ClientDisplayRow | null;
+      });
       if (!client) throw ownershipHidingNotFound();
 
-      const ownedGrants = (await prisma.mcpGrant.findMany({
+      const ownedGrants = await prisma.mcpGrant.findMany({
         where: { userId, clientId: client.clientId },
         select: referenceIdSelection,
-      })) as ReferenceIdRow[];
+      });
       if (ownedGrants.length === 0) throw ownershipHidingNotFound();
 
       // ORDINARY FENCED WORK — no shutdown permit (see the module header:
@@ -564,22 +535,22 @@ export const mcpGrantsRouter = {
 
         // Collect reference generations for the exact user/client from
         // every artifact table, re-read INSIDE the transaction.
-        const grants = (await tx.mcpGrant.findMany({
+        const grants = await tx.mcpGrant.findMany({
           where: { userId, clientId },
           select: referenceIdSelection,
-        })) as ReferenceIdRow[];
-        const consents = (await tx.oauthConsent.findMany({
+        });
+        const consents = await tx.oauthConsent.findMany({
           where: { userId, clientId },
           select: referenceIdSelection,
-        })) as ReferenceIdRow[];
-        const refreshes = (await tx.oauthRefreshToken.findMany({
+        });
+        const refreshes = await tx.oauthRefreshToken.findMany({
           where: { userId, clientId },
           select: referenceIdSelection,
-        })) as ReferenceIdRow[];
-        const accesses = (await tx.oauthAccessToken.findMany({
+        });
+        const accesses = await tx.oauthAccessToken.findMany({
           where: { userId, clientId },
           select: referenceIdSelection,
-        })) as ReferenceIdRow[];
+        });
 
         const generations = new Set<string>();
         for (const row of [...grants, ...consents, ...refreshes, ...accesses]) {
@@ -620,7 +591,7 @@ export const mcpGrantsRouter = {
         let scanned = 0;
         let enumerationIncomplete = false;
         while (scanned < VERIFICATION_CANDIDATE_TOTAL_CAP) {
-          const candidates = (await tx.verification.findMany({
+          const candidates = await tx.verification.findMany({
             where: {
               expiresAt: { gt: now },
               AND: [{ value: { contains: typeMarker } }, { value: { contains: userMarker } }],
@@ -629,7 +600,7 @@ export const mcpGrantsRouter = {
             take: VERIFICATION_CANDIDATE_BATCH,
             ...(cursorId === undefined ? {} : { cursor: { id: cursorId }, skip: 1 }),
             select: { id: true, value: true },
-          })) as { id: string; value: string }[];
+          });
           if (candidates.length === 0) break;
           for (const candidate of candidates) {
             const inspection = inspectAuthorizationCodeVerification(

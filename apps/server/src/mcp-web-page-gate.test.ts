@@ -3,7 +3,7 @@ import { memoryAdapter } from "better-auth/adapters/memory";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
- * MCP web login/consent page gate tests (MCP plan Phase 6; invariant 13).
+ * MCP web login/consent page gate tests (Phase 6; invariant 13).
  *
  * Two layers:
  *  1. PURE matcher tests for the exact valid-locale raw-path set — near-miss

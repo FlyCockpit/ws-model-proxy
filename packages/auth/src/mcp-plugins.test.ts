@@ -131,9 +131,9 @@ describe("resolveMcpPlugins (WMP_MCP_ENABLED decision)", () => {
     // Grant types: user-bound only, never client_credentials.
     expect(options?.grantTypes).toEqual(["authorization_code", "refresh_token"]);
 
-    // DCR disabled through BOTH registration controls.
-    expect(options?.allowDynamicClientRegistration).toBe(false);
-    expect(options?.allowUnauthenticatedClientRegistration).toBe(false);
+    // RFC 7591 DCR is available to unauthenticated clients such as rmcp/Grok.
+    expect(options?.allowDynamicClientRegistration).toBe(true);
+    expect(options?.allowUnauthenticatedClientRegistration).toBe(true);
 
     // PKCE policy + per-client resource enforcement.
     expect(options?.clientRegistrationRequirePKCE).toBe(true);

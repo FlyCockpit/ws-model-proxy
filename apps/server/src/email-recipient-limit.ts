@@ -77,10 +77,12 @@ type RecipientLimiter = {
  * Note multipart is accepted by NO route here, which is why we never parse it.
  */
 const JSON_ONLY = ["application/json"] as const;
-export const SIGNUP_MEDIA_TYPES = [
+/** `/api/auth/sign-in/email` and sign-up accept both encodings. */
+export const FORM_OR_JSON_MEDIA_TYPES = [
   "application/x-www-form-urlencoded",
   "application/json",
 ] as const;
+export const SIGNUP_MEDIA_TYPES = [...FORM_OR_JSON_MEDIA_TYPES] as const;
 
 export function emailRecipientLimit(
   limiter: RecipientLimiter = emailRecipientLimiter,
@@ -156,7 +158,7 @@ const JSON_CONTENT_TYPE_RE = /^application\/([a-z0-9.+-]*\+)?json/i;
  * whole header — a loose `includes("application/json")` reopens a bypass via
  * charset parameters.
  */
-async function readEmail(
+export async function readEmail(
   c: Context,
   allowedMediaTypes: readonly string[],
 ): Promise<ParsedRecipient> {

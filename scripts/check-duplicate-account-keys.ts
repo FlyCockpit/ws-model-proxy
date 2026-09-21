@@ -1,5 +1,5 @@
 /**
- * Duplicate account-key preflight (MCP plan Phase 0b).
+ * Duplicate account-key preflight (Phase 0b).
  *
  * Better Auth's account table enforces one row per (providerId, accountId).
  * Deployments that ran Better Auth 1.7.0–1.7.2 used a temporary `issuer` field

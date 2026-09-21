@@ -21,6 +21,8 @@ import { startProviderBudgetRepair } from "./model-api/provider-budget-runtime.j
 import { startRelayTelemetryRecovery } from "./model-api/relay-telemetry-recovery.js";
 import { RELAY_SUBPROTOCOL } from "./relay/protocol.js";
 import { relaySessionManager } from "./relay/session-manager.js";
+import { configureHttpServerTimeouts } from "./server-timeouts.js";
+import { startSessionCleanup } from "./session-cleanup.js";
 
 // ---------------------------------------------------------------------------
 // Startup guards
@@ -109,6 +111,12 @@ const server = serve(
   },
 );
 
+// Keep the application-side idle timeout slightly longer than the common
+// reverse-proxy idle window. This prevents a proxy from selecting a socket
+// Node has already closed, which otherwise surfaces as an avoidable reset.
+// headersTimeout must remain greater than keepAliveTimeout (Node invariant).
+configureHttpServerTimeouts(server as { keepAliveTimeout: number; headersTimeout: number });
+
 // Ephemeral media cleanup — hourly in-process sweep of expired assets (rows +
 // bytes). No-op when media storage is not configured. Complements the lazy
 // delete-on-GET in media/routes.ts.
@@ -126,6 +134,9 @@ const stopProviderAttemptExpiry = providerAttemptExpiryEnabled(
 // deletion). In-flight runs abort cleanly between batches via the shared DB
 // shutdown fence (see mcp/oauth-cleanup.ts).
 const stopOauthCleanup = startOauthCleanup();
+// Better Auth does not remove expired browser sessions eagerly. This bounded,
+// idempotent sweep uses the same shutdown-fenced lifecycle as OAuth cleanup.
+const stopSessionCleanup = startSessionCleanup();
 
 // ---------------------------------------------------------------------------
 // Graceful shutdown — drain in-flight requests, then close dependencies
@@ -147,6 +158,7 @@ async function shutdown(signal: string) {
       stopProviderBudgetRepair();
       stopProviderAttemptExpiry?.();
       stopOauthCleanup?.();
+      stopSessionCleanup();
       relaySessionManager.dispose();
       await capacityLifecycle?.close();
     },

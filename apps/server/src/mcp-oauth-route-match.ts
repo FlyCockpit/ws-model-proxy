@@ -38,8 +38,8 @@ export const MCP_OAUTH_RATE_LIMITED_ROUTES = [
  * namespace (`mcp()` IS the OAuth provider — the only OAuth surface this app
  * registers; the provider's installed 1.7.3 dist serves authorize, token,
  * consent, continue, revoke, introspect, public-client,
- * public-client-prelogin, delete-consent, register (DCR — refused 403 by our
- * config), userinfo, and the client/resource CRUD family under /oauth2/*)
+ * public-client-prelogin, delete-consent, register (DCR), userinfo, and the
+ * client/resource CRUD family under /oauth2/*)
  * plus the jwt() plugin's JWKS endpoint. There is no non-MCP OAuth provider
  * in this app (ssoEnabled: false, no separate oauthProvider plugin), so the
  * flag-off gate below may own the whole namespace: while the flag is off NO
@@ -52,6 +52,8 @@ export const MCP_OAUTH_AUTHORIZE_PATH = "/api/auth/oauth2/authorize";
 export const MCP_OAUTH_TOKEN_PATH = "/api/auth/oauth2/token";
 export const MCP_OAUTH_CONSENT_PATH = "/api/auth/oauth2/consent";
 export const MCP_OAUTH_CONTINUE_PATH = "/api/auth/oauth2/continue";
+/** Exact RFC 7591 endpoint exposed only while the MCP provider is enabled. */
+export const MCP_OAUTH_REGISTER_PATH = "/api/auth/oauth2/register";
 
 const MCP_OAUTH_RATE_LIMITED_ROUTE_KEYS = new Set<string>(
   MCP_OAUTH_RATE_LIMITED_ROUTES.map(([method, path]) => `${method} ${path}`),
@@ -114,7 +116,7 @@ export function isMcpOauthRawPath(rawPathname: string): boolean {
 }
 
 /**
- * MCP OAuth flag-off 404 gate (MCP plan Phase 9 / invariant 13: while
+ * MCP OAuth flag-off 404 gate (Phase 9 / invariant 13: while
  * WMP_MCP_ENABLED is off, MCP OAuth routes return REAL 404s — authorization
  * remains flag-gated even when the installed provider is present, e.g. a
  * flag flip without a rebuilt plugin list or a test instance that always

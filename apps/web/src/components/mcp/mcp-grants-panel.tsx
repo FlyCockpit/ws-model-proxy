@@ -26,7 +26,7 @@ import { InlineRetry } from "@/components/inline-retry";
 import { orpc } from "@/utils/orpc";
 
 /**
- * Human MCP grant management panel (MCP plan Phase 7): one card per
+ * Human MCP grant management panel (Phase 7): one card per
  * authorized client, with a ceremonial AlertDialog revoke. Human-only by
  * construction — the backing procedures take no caller-supplied user id and
  * are excluded from the MCP tool catalog. The panel deliberately does NOT

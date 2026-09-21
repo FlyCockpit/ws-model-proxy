@@ -1,6 +1,6 @@
 /**
- * JSON-safe serialization for MCP tool output (MCP plan Phase 4 module seam;
- * completed in Phase 5 per the plan's "Serialization and errors" contract).
+ * JSON-safe serialization for MCP tool output (Phase 4 module seam;
+ * completed in the tool-output implementation).
  *
  * Stable structural conversions applied AFTER descriptor-specific projections
  * and the defense-in-depth secret redactor:
@@ -8,8 +8,8 @@
  * - `bigint` → decimal string;
  * - Prisma `Decimal` (decimal.js) → decimal string (structural detection —
  *   see {@link isPrismaDecimalLike});
- * - byte arrays (`Uint8Array`, `Buffer`) → a fixed elision marker. The plan
- *   requires bytes to cross the wire ONLY through explicit safe projections;
+ * - byte arrays (`Uint8Array`, `Buffer`) → a fixed elision marker. Bytes may
+ *   cross the wire ONLY through explicit safe projections;
  *   this arm is the fail-safe that silently-encoded bytes never leak, and a
  *   projection that wants bytes must decode them itself BEFORE this pass;
  * - functions → a fixed marker (a closure would capture server scope);

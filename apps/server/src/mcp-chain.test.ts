@@ -3,7 +3,7 @@ import { memoryAdapter } from "better-auth/adapters/memory";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
- * /mcp CHAIN-ORDER contract tests (MCP plan Phase 4 items 6-7) — the REAL
+ * /mcp CHAIN-ORDER contract tests (Phase 4 items 6-7) — the REAL
  * output of `createApp()` with only process dependencies mocked (the
  * app-order.test.ts pattern), plus a REAL memory-adapter Better Auth
  * instance injected as `mcpAuth` so the upstream `requireMcpAuth` wrapper

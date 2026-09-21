@@ -26,11 +26,30 @@ export const env = createEnv({
     BETTER_AUTH_URL: originUrl("BETTER_AUTH_URL"),
     CORS_ORIGIN: originUrl("CORS_ORIGIN").optional(),
     SIGNUP_ENABLED: strictBooleanFlag(),
+    // On a fresh production database with public signup disabled, this is the
+    // sole address that may create the bootstrap administrator. Transform it
+    // into the exact database identity used by the auth hook, so case and
+    // surrounding whitespace cannot create a second bootstrap account.
+    ADMIN_EMAIL: z.string().trim().email().toLowerCase().optional(),
     RATE_LIMIT_RPC_POINTS: z.coerce.number().int().positive().default(100),
     RATE_LIMIT_RPC_DURATION: z.coerce.number().int().positive().default(60),
     RATE_LIMIT_AUTH_POINTS: z.coerce.number().int().positive().default(10),
     RATE_LIMIT_AUTH_DURATION: z.coerce.number().int().positive().default(60),
     RATE_LIMIT_AUTH_BLOCK_DURATION: z.coerce.number().int().positive().default(900),
+    // Per-account failed password checks. This complements the IP-keyed auth
+    // limiter: IP rotation must not multiply password guesses against one
+    // account. It is intentionally non-zero; disabling it reopens that gap.
+    RATE_LIMIT_SIGNIN_FAILURE_POINTS: z.coerce.number().int().positive().default(10),
+    RATE_LIMIT_SIGNIN_FAILURE_DURATION: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(15 * 60),
+    RATE_LIMIT_SIGNIN_FAILURE_BLOCK_DURATION: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(10 * 60),
     RATE_LIMIT_SIGNUP_POINTS: z.coerce.number().int().positive().default(3),
     RATE_LIMIT_SIGNUP_DURATION: z.coerce.number().int().positive().default(3600),
     RATE_LIMIT_SIGNUP_BLOCK_DURATION: z.coerce.number().int().positive().default(3600),
@@ -45,7 +64,7 @@ export const env = createEnv({
     // Same idea for signup (also mails a caller-supplied address). Higher
     // budget so shared-NAT offices still work.
     RATE_LIMIT_SIGNUP_RECIPIENT_POINTS: z.coerce.number().int().min(0).default(6),
-    // MCP endpoint limiters (MCP plan Phase 1; enforced when the Phase 3
+    // MCP endpoint limiters (Phase 1; enforced when the Phase 3
     // routing lands). Unconditional IP-keyed /mcp quota and a tighter
     // session-keyed budget for the human login/consent forms. Durations are
     // seconds.
@@ -53,6 +72,10 @@ export const env = createEnv({
     RATE_LIMIT_MCP_DURATION: z.coerce.number().int().positive().default(60),
     RATE_LIMIT_MCP_CONSENT_POINTS: z.coerce.number().int().positive().default(30),
     RATE_LIMIT_MCP_CONSENT_DURATION: z.coerce.number().int().positive().default(60),
+    // Public RFC 7591 registration creates a durable OAuth client row. This
+    // whole-service budget remains effective when an attacker rotates IPs.
+    RATE_LIMIT_MCP_REGISTRATION_POINTS: z.coerce.number().int().positive().default(60),
+    RATE_LIMIT_MCP_REGISTRATION_DURATION: z.coerce.number().int().positive().default(3600),
     SSR_CACHE_TTL_SECONDS: z.coerce.number().int().min(0).default(60),
     // Number of reverse-proxy hops in front of the app, for deriving the real
     // client IP used as the anonymous rate-limit key.
@@ -143,11 +166,11 @@ export const env = createEnv({
     // Provider egress remains disabled until the full overflow admission and
     // settlement path is enabled. The keyring is optional while that gate is off.
     WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: strictBooleanFlag(),
-    // MCP server + OAuth provider surface (MCP plan Phase 0b). Dormant by
+    // MCP server + OAuth provider surface (Phase 0b). Dormant by
     // default: while false, the jwt/mcp/cimd auth plugins are not installed,
     // no OAuth/JWKS routes exist, and the runtime Better Auth schema check
     // does not expect the OAuth/JWKS tables. Human grant listing/revocation
-    // stays available when disabled (emergency kill switch), per the plan.
+    // stays available when disabled (emergency kill switch), by design.
     WMP_MCP_ENABLED: strictBooleanFlag(),
     WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: strictBooleanFlag(),
     WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS: z
@@ -171,6 +194,12 @@ export const env = createEnv({
 });
 
 export const SIGNUP_ENABLED: boolean = env.SIGNUP_ENABLED;
+
+/**
+ * Canonical production bootstrap identity. The auth create hook persists this
+ * exact value for an admitted bootstrap, before Prisma enforces @@unique(email).
+ */
+export const ADMIN_EMAIL: string | undefined = env.ADMIN_EMAIL;
 
 // ---------------------------------------------------------------------------
 // Media store guard — MEDIA_ROOT is required, and must be absolute, when the

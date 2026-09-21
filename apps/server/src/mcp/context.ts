@@ -2,7 +2,7 @@ import type { ContextServices, Context as ProductionContext } from "@ws-model-pr
 import type { Session } from "@ws-model-proxy/auth";
 
 /**
- * Synthetic oRPC context for MCP requests (MCP plan Phase 4 item 8).
+ * Synthetic oRPC context for MCP requests (Phase 4 item 8).
  *
  * MCP requests arrive with a VERIFIED access JWT, not a Better Auth cookie
  * session. The tools (Phase 5) call oRPC procedures through

@@ -1,5 +1,5 @@
 import { directModelId, poolModelId } from "@ws-model-proxy/config/forwarder-identifiers";
-import prisma from "@ws-model-proxy/db";
+import prisma, { Prisma } from "@ws-model-proxy/db";
 import { z } from "zod";
 import { adminProcedure } from "../index";
 
@@ -40,196 +40,15 @@ const dateRangeInput = z
     },
   );
 
-type OwnerRow = {
-  id: string;
-  email: string;
-  name: string;
-  slug: string;
-};
-
-type CliDeviceRow = {
-  id: string;
-  createdAt: Date;
-  updatedAt: Date;
-  slug: string;
-  label: string;
-  status: string;
-  lastConnectedAt: Date | null;
-  lastDisconnectedAt: Date | null;
-  lastHeartbeatAt: Date | null;
-  connectionCount: number;
-  User: OwnerRow;
-  _count: {
-    Endpoints: number;
-    CliTokens: number;
-    CliDeviceCredentials: number;
-  };
-};
-
-type EndpointRow = {
-  id: string;
-  createdAt: Date;
-  updatedAt: Date;
-  slug: string;
-  label: string;
-  kind: string;
-  status: string;
-  defaultCapabilities: string[];
-  capabilityMetadata: unknown | null;
-  probeSuggestions: unknown | null;
-  lastSeenAt: Date | null;
-  lastHealthCheckAt: Date | null;
-  statusChangedAt: Date | null;
-  failureReasonCode: string | null;
-  User: OwnerRow;
-  CliDevice: {
-    id: string;
-    slug: string;
-    label: string;
-    status: string;
-    lastHeartbeatAt: Date | null;
-  };
-  _count: { DiscoveredModels: number };
-};
-
-type DiscoveredModelRow = {
-  id: string;
-  createdAt: Date;
-  updatedAt: Date;
-  slug: string | null;
-  upstreamModelId: string;
-  encodedModelId: string;
-  capabilityOverrideMode: string;
-  capabilityOverrides: string[];
-  capabilityOverrideMetadata: unknown | null;
-  probeSuggestions: unknown | null;
-  lastSeenAt: Date | null;
-  User: OwnerRow;
-  Endpoint: {
-    id: string;
-    slug: string;
-    label: string;
-    status: string;
-    defaultCapabilities: string[];
-    capabilityMetadata: unknown | null;
-    CliDevice: {
-      id: string;
-      slug: string;
-      label: string;
-      status: string;
-      lastHeartbeatAt: Date | null;
-    };
-  };
-  _count: { PoolMembers: number };
-};
-
-type ModelPoolRow = {
-  id: string;
-  createdAt: Date;
-  updatedAt: Date;
-  slug: string;
-  name: string;
-  description: string | null;
-  User: OwnerRow;
-  PoolMembers: PoolMemberRow[];
-  _count: { PoolGrants: number; ModelApiTokenAllowlistEntries: number };
-};
-
-type PoolMemberRow = {
-  id: string;
-  createdAt: Date;
-  updatedAt: Date;
-  discoveredModelId: string | null;
-  weight: number;
-  healthStatus: string;
-  routingStatus: string;
-  lastFailureClass: string | null;
-  consecutiveRetryableFailures: number;
-  lastFailureAt: Date | null;
-  nextRetryAt: Date | null;
-  halfOpenTrialStartedAt: Date | null;
-  lastRoutedAt: Date | null;
-  DiscoveredModel: PoolMemberModelRow | null;
-  ExecutionTarget: { kind: string; DiscoveredModel: PoolMemberModelRow | null } | null;
-};
-
-type PoolMemberModelRow = {
-  id: string;
-  upstreamModelId: string;
-  User: { slug: string };
-  Endpoint: {
-    id: string;
-    slug: string;
-    label: string;
-    status: string;
-    CliDevice: {
-      id: string;
-      slug: string;
-      label: string;
-      status: string;
-      lastHeartbeatAt: Date | null;
-    };
-  };
-};
-
-type RelayRequestRow = {
-  id: string;
-  createdAt: Date;
-  updatedAt: Date;
-  modelApiTokenId: string | null;
-  modelApiTokenLookupPrefix: string | null;
-  status: string;
-  startedAt: Date;
-  completedAt: Date | null;
-  durationMs: number | null;
-  promptTokens: number | null;
-  completionTokens: number | null;
-  totalTokens: number | null;
-  httpStatusCode: number | null;
-  upstreamStatusCode: number | null;
-  errorClass: string | null;
-  operation: string | null;
-  requestBytes: bigint | null;
-  responseBytes: bigint | null;
-  attemptCount: number;
-  auxiliaryAttemptCount: number;
-  auxiliaryRequestBytes: bigint;
-  auxiliaryResponseBytes: bigint;
-  requestedSurface: string | null;
-  selectedNativeSurface: string | null;
-  adapterMode: string | null;
-  adapterVersion: string | null;
-  selectedPoolMemberId: string | null;
-  selectedPoolMemberTier: string | null;
-  localAttemptId: string | null;
-  firstClientByteAt: Date | null;
-  streamCommitted: boolean;
-  User: OwnerRow;
-  ModelApiToken: { id: string; name: string; lookupPrefix: string } | null;
-  RequestedDiscoveredModel: RelayModelRow | null;
-  RequestedModelPool: { id: string; slug: string; name: string; User: { slug: string } } | null;
-  SelectedDiscoveredModel: RelayModelRow | null;
-};
-
-type RelayModelRow = {
-  id: string;
-  upstreamModelId: string;
-  User: { slug: string };
-  Endpoint: { slug: string; CliDevice: { slug: string } };
-};
-
-type StatusGroupRow = { status: string; _count: { _all: number } };
-type ErrorClassGroupRow = { errorClass: string | null; _count: { _all: number } };
-type RelayAggregateRow = {
-  _avg: { durationMs: number | null };
-  _min: { durationMs: number | null };
-  _max: { durationMs: number | null };
-  _sum: {
-    promptTokens: number | null;
-    completionTokens: number | null;
-    totalTokens: number | null;
-  };
-};
+type OwnerRow = Prisma.UserGetPayload<{ select: typeof ownerSelect }>;
+type CliDeviceRow = Prisma.CliDeviceGetPayload<{ select: typeof cliDeviceSelect }>;
+type EndpointRow = Prisma.EndpointGetPayload<{ select: typeof endpointSelect }>;
+type DiscoveredModelRow = Prisma.DiscoveredModelGetPayload<{
+  select: typeof discoveredModelSelect;
+}>;
+type ModelPoolRow = Prisma.ModelPoolGetPayload<{ select: typeof modelPoolSelect }>;
+type RelayRequestRow = Prisma.RelayRequestGetPayload<{ select: typeof relayRequestSelect }>;
+type RelayModelRow = Prisma.DiscoveredModelGetPayload<{ select: typeof relayModelSelect }>;
 
 type ModelCapabilityValue =
   | "TEXT_GENERATION"
@@ -580,7 +399,92 @@ const ownerSelect = {
   email: true,
   name: true,
   slug: true,
-} as const;
+} satisfies Prisma.UserSelect;
+
+const cliDeviceSummarySelect = {
+  id: true,
+  slug: true,
+  label: true,
+  status: true,
+  lastHeartbeatAt: true,
+} satisfies Prisma.CliDeviceSelect;
+
+const cliDeviceSelect = {
+  id: true,
+  createdAt: true,
+  updatedAt: true,
+  slug: true,
+  label: true,
+  status: true,
+  lastConnectedAt: true,
+  lastDisconnectedAt: true,
+  lastHeartbeatAt: true,
+  connectionCount: true,
+  User: { select: ownerSelect },
+  _count: { select: { Endpoints: true, CliTokens: true, CliDeviceCredentials: true } },
+} satisfies Prisma.CliDeviceSelect;
+
+const endpointSelect = {
+  id: true,
+  createdAt: true,
+  updatedAt: true,
+  slug: true,
+  label: true,
+  kind: true,
+  status: true,
+  defaultCapabilities: true,
+  capabilityMetadata: true,
+  probeSuggestions: true,
+  lastSeenAt: true,
+  lastHealthCheckAt: true,
+  statusChangedAt: true,
+  failureReasonCode: true,
+  User: { select: ownerSelect },
+  CliDevice: { select: cliDeviceSummarySelect },
+  _count: { select: { DiscoveredModels: true } },
+} satisfies Prisma.EndpointSelect;
+
+const discoveredModelSelect = {
+  id: true,
+  createdAt: true,
+  updatedAt: true,
+  slug: true,
+  upstreamModelId: true,
+  encodedModelId: true,
+  capabilityOverrideMode: true,
+  capabilityOverrides: true,
+  capabilityOverrideMetadata: true,
+  probeSuggestions: true,
+  lastSeenAt: true,
+  User: { select: ownerSelect },
+  Endpoint: {
+    select: {
+      id: true,
+      slug: true,
+      label: true,
+      status: true,
+      defaultCapabilities: true,
+      capabilityMetadata: true,
+      CliDevice: { select: cliDeviceSummarySelect },
+    },
+  },
+  _count: { select: { PoolMembers: true } },
+} satisfies Prisma.DiscoveredModelSelect;
+
+const poolMemberModelSelect = {
+  id: true,
+  upstreamModelId: true,
+  User: { select: { slug: true } },
+  Endpoint: {
+    select: {
+      id: true,
+      slug: true,
+      label: true,
+      status: true,
+      CliDevice: { select: cliDeviceSummarySelect },
+    },
+  },
+} satisfies Prisma.DiscoveredModelSelect;
 
 const poolMemberSelect = {
   id: true,
@@ -591,22 +495,7 @@ const poolMemberSelect = {
     select: {
       kind: true,
       DiscoveredModel: {
-        select: {
-          id: true,
-          upstreamModelId: true,
-          User: { select: { slug: true } },
-          Endpoint: {
-            select: {
-              id: true,
-              slug: true,
-              label: true,
-              status: true,
-              CliDevice: {
-                select: { id: true, slug: true, label: true, status: true, lastHeartbeatAt: true },
-              },
-            },
-          },
-        },
+        select: poolMemberModelSelect,
       },
     },
   },
@@ -620,30 +509,24 @@ const poolMemberSelect = {
   halfOpenTrialStartedAt: true,
   lastRoutedAt: true,
   DiscoveredModel: {
-    select: {
-      id: true,
-      upstreamModelId: true,
-      User: { select: { slug: true } },
-      Endpoint: {
-        select: {
-          id: true,
-          slug: true,
-          label: true,
-          status: true,
-          CliDevice: {
-            select: {
-              id: true,
-              slug: true,
-              label: true,
-              status: true,
-              lastHeartbeatAt: true,
-            },
-          },
-        },
-      },
-    },
+    select: poolMemberModelSelect,
   },
-} as const;
+} satisfies Prisma.PoolMemberSelect;
+
+const modelPoolSelect = {
+  id: true,
+  createdAt: true,
+  updatedAt: true,
+  slug: true,
+  name: true,
+  description: true,
+  User: { select: ownerSelect },
+  PoolMembers: {
+    orderBy: { createdAt: "asc" },
+    select: poolMemberSelect,
+  },
+  _count: { select: { PoolGrants: true, ModelApiTokenAllowlistEntries: true } },
+} satisfies Prisma.ModelPoolSelect;
 
 const relayModelSelect = {
   id: true,
@@ -655,7 +538,53 @@ const relayModelSelect = {
       CliDevice: { select: { slug: true } },
     },
   },
-} as const;
+} satisfies Prisma.DiscoveredModelSelect;
+
+const relayRequestSelect = {
+  id: true,
+  createdAt: true,
+  updatedAt: true,
+  modelApiTokenId: true,
+  modelApiTokenLookupPrefix: true,
+  status: true,
+  startedAt: true,
+  completedAt: true,
+  durationMs: true,
+  promptTokens: true,
+  completionTokens: true,
+  totalTokens: true,
+  httpStatusCode: true,
+  upstreamStatusCode: true,
+  errorClass: true,
+  operation: true,
+  requestBytes: true,
+  responseBytes: true,
+  attemptCount: true,
+  auxiliaryAttemptCount: true,
+  auxiliaryRequestBytes: true,
+  auxiliaryResponseBytes: true,
+  requestedSurface: true,
+  selectedNativeSurface: true,
+  adapterMode: true,
+  adapterVersion: true,
+  selectedPoolMemberId: true,
+  selectedPoolMemberTier: true,
+  localAttemptId: true,
+  firstClientByteAt: true,
+  streamCommitted: true,
+  User: { select: ownerSelect },
+  ModelApiToken: { select: { id: true, name: true, lookupPrefix: true } },
+  RequestedDiscoveredModel: { select: relayModelSelect },
+  RequestedModelPool: {
+    select: {
+      id: true,
+      slug: true,
+      name: true,
+      User: { select: { slug: true } },
+    },
+  },
+  SelectedDiscoveredModel: { select: relayModelSelect },
+} satisfies Prisma.RelayRequestSelect;
 
 export const adminObservabilityRouter = {
   listCliDevices: adminProcedure
@@ -681,25 +610,12 @@ export const adminObservabilityRouter = {
           where,
           orderBy: { updatedAt: "desc" },
           ...pagination(page, pageSize),
-          select: {
-            id: true,
-            createdAt: true,
-            updatedAt: true,
-            slug: true,
-            label: true,
-            status: true,
-            lastConnectedAt: true,
-            lastDisconnectedAt: true,
-            lastHeartbeatAt: true,
-            connectionCount: true,
-            User: { select: ownerSelect },
-            _count: { select: { Endpoints: true, CliTokens: true, CliDeviceCredentials: true } },
-          },
+          select: cliDeviceSelect,
         }),
       ]);
       const now = new Date();
       return paginatedResult({
-        items: (rows as CliDeviceRow[]).map((row) => serializeCli(row, now)),
+        items: rows.map((row) => serializeCli(row, now)),
         total,
         page,
         pageSize,
@@ -729,38 +645,12 @@ export const adminObservabilityRouter = {
           where,
           orderBy: { updatedAt: "desc" },
           ...pagination(page, pageSize),
-          select: {
-            id: true,
-            createdAt: true,
-            updatedAt: true,
-            slug: true,
-            label: true,
-            kind: true,
-            status: true,
-            defaultCapabilities: true,
-            capabilityMetadata: true,
-            probeSuggestions: true,
-            lastSeenAt: true,
-            lastHealthCheckAt: true,
-            statusChangedAt: true,
-            failureReasonCode: true,
-            User: { select: ownerSelect },
-            CliDevice: {
-              select: {
-                id: true,
-                slug: true,
-                label: true,
-                status: true,
-                lastHeartbeatAt: true,
-              },
-            },
-            _count: { select: { DiscoveredModels: true } },
-          },
+          select: endpointSelect,
         }),
       ]);
       const now = new Date();
       return paginatedResult({
-        items: (rows as EndpointRow[]).map((row) => serializeEndpoint(row, now)),
+        items: rows.map((row) => serializeEndpoint(row, now)),
         total,
         page,
         pageSize,
@@ -808,45 +698,12 @@ export const adminObservabilityRouter = {
           where,
           orderBy: { updatedAt: "desc" },
           ...pagination(page, pageSize),
-          select: {
-            id: true,
-            createdAt: true,
-            updatedAt: true,
-            slug: true,
-            upstreamModelId: true,
-            encodedModelId: true,
-            capabilityOverrideMode: true,
-            capabilityOverrides: true,
-            capabilityOverrideMetadata: true,
-            probeSuggestions: true,
-            lastSeenAt: true,
-            User: { select: ownerSelect },
-            Endpoint: {
-              select: {
-                id: true,
-                slug: true,
-                label: true,
-                status: true,
-                defaultCapabilities: true,
-                capabilityMetadata: true,
-                CliDevice: {
-                  select: {
-                    id: true,
-                    slug: true,
-                    label: true,
-                    status: true,
-                    lastHeartbeatAt: true,
-                  },
-                },
-              },
-            },
-            _count: { select: { PoolMembers: true } },
-          },
+          select: discoveredModelSelect,
         }),
       ]);
       const now = new Date();
       return paginatedResult({
-        items: (rows as unknown as DiscoveredModelRow[]).map((row) => serializeModel(row, now)),
+        items: rows.map((row) => serializeModel(row, now)),
         total,
         page,
         pageSize,
@@ -878,25 +735,12 @@ export const adminObservabilityRouter = {
           where,
           orderBy: { updatedAt: "desc" },
           ...pagination(page, pageSize),
-          select: {
-            id: true,
-            createdAt: true,
-            updatedAt: true,
-            slug: true,
-            name: true,
-            description: true,
-            User: { select: ownerSelect },
-            PoolMembers: {
-              orderBy: { createdAt: "asc" },
-              select: poolMemberSelect,
-            },
-            _count: { select: { PoolGrants: true, ModelApiTokenAllowlistEntries: true } },
-          },
+          select: modelPoolSelect,
         }),
       ]);
       const now = new Date();
       return paginatedResult({
-        items: (rows as ModelPoolRow[]).map((row) => serializePool(row, now)),
+        items: rows.map((row) => serializePool(row, now)),
         total,
         page,
         pageSize,
@@ -932,51 +776,7 @@ export const adminObservabilityRouter = {
           where,
           orderBy: { createdAt: "desc" },
           ...pagination(page, pageSize),
-          select: {
-            id: true,
-            createdAt: true,
-            updatedAt: true,
-            modelApiTokenId: true,
-            modelApiTokenLookupPrefix: true,
-            status: true,
-            startedAt: true,
-            completedAt: true,
-            durationMs: true,
-            promptTokens: true,
-            completionTokens: true,
-            totalTokens: true,
-            httpStatusCode: true,
-            upstreamStatusCode: true,
-            errorClass: true,
-            operation: true,
-            requestBytes: true,
-            responseBytes: true,
-            attemptCount: true,
-            auxiliaryAttemptCount: true,
-            auxiliaryRequestBytes: true,
-            auxiliaryResponseBytes: true,
-            requestedSurface: true,
-            selectedNativeSurface: true,
-            adapterMode: true,
-            adapterVersion: true,
-            selectedPoolMemberId: true,
-            selectedPoolMemberTier: true,
-            localAttemptId: true,
-            firstClientByteAt: true,
-            streamCommitted: true,
-            User: { select: ownerSelect },
-            ModelApiToken: { select: { id: true, name: true, lookupPrefix: true } },
-            RequestedDiscoveredModel: { select: relayModelSelect },
-            RequestedModelPool: {
-              select: {
-                id: true,
-                slug: true,
-                name: true,
-                User: { select: { slug: true } },
-              },
-            },
-            SelectedDiscoveredModel: { select: relayModelSelect },
-          },
+          select: relayRequestSelect,
         }),
         prisma.relayRequest.groupBy({
           by: ["status"],
@@ -1003,29 +803,29 @@ export const adminObservabilityRouter = {
 
       return {
         ...paginatedResult({
-          items: (rows as RelayRequestRow[]).map(serializeRelay),
+          items: rows.map(serializeRelay),
           total,
           page,
           pageSize,
         }),
         summary: {
-          statusCounts: (statusGroups as StatusGroupRow[]).map((row) => ({
+          statusCounts: statusGroups.map((row) => ({
             status: String(row.status),
             count: row._count._all,
           })),
-          errorClassCounts: (errorClassGroups as ErrorClassGroupRow[]).map((row) => ({
+          errorClassCounts: errorClassGroups.map((row) => ({
             errorClass: row.errorClass,
             count: row._count._all,
           })),
           durationMs: {
-            average: (aggregate as RelayAggregateRow)._avg.durationMs,
-            minimum: (aggregate as RelayAggregateRow)._min.durationMs,
-            maximum: (aggregate as RelayAggregateRow)._max.durationMs,
+            average: aggregate._avg.durationMs,
+            minimum: aggregate._min.durationMs,
+            maximum: aggregate._max.durationMs,
           },
           tokens: {
-            prompt: (aggregate as RelayAggregateRow)._sum.promptTokens,
-            completion: (aggregate as RelayAggregateRow)._sum.completionTokens,
-            total: (aggregate as RelayAggregateRow)._sum.totalTokens,
+            prompt: aggregate._sum.promptTokens,
+            completion: aggregate._sum.completionTokens,
+            total: aggregate._sum.totalTokens,
           },
         },
       };

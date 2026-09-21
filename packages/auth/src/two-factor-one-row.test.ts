@@ -5,8 +5,8 @@ import { twoFactor } from "better-auth/plugins";
 import { describe, expect, it } from "vitest";
 
 /**
- * Behavioral proof of the TwoFactor one-row-per-user contract (MCP plan
- * Phase 0b review finding): the installed better-auth 1.7.3 two-factor
+ * Behavioral proof of the TwoFactor one-row-per-user contract: the installed
+ * better-auth 1.7.3 two-factor
  * enrollment path (`auth.api.enableTwoFactor`) performs a
  * findOne-by-userId → update-by-id-or-create sequence. Our Prisma
  * `@@unique([userId])` is what makes that sequence safe — a concurrent or

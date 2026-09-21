@@ -228,7 +228,7 @@ EXPOSE 3000
 
 # Container platforms can use this healthcheck for rolling updates.
 # Use Node's built-in fetch; node:slim does not ship curl or wget.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=480s \
   CMD node -e "const port=process.env.SERVER_PORT||process.env.PORT||3000;fetch('http://localhost:'+port+'/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 # Start the server. Schema sync (gated on APPLY_SCHEMA) runs inside the

@@ -1,7 +1,7 @@
 import { isAPIError } from "better-auth/api";
 
 /**
- * Sanitized Better Auth API-error logging (MCP plan invariant 10, L19).
+ * Sanitized Better Auth API-error logging (invariant 10, L19).
  *
  * Better Auth 1.7.3 exposes a top-level `onAPIError: { onError? }` option
  * (consumed in better-auth dist/api/index.mjs: when `onError` is provided it

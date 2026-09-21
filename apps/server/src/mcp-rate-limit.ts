@@ -5,7 +5,7 @@ import { RateLimiterMemory } from "rate-limiter-flexible";
 import { resolveClientIp } from "./client-ip.js";
 
 /**
- * /mcp chain PIECES (MCP plan Phase 3, item 3) — prepared here, NOT MOUNTED
+ * /mcp chain PIECES (Phase 3, item 3) — prepared here, NOT MOUNTED
  * anywhere in this part. Phase 4 mounts them, in this order, ahead of the
  * MCP handler:
  *

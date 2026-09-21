@@ -7,7 +7,7 @@ import { StrictMode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 /**
- * Consent failure-state tests (MCP plan Phase 6, Part H pass 2 — R83/R84 F4):
+ * Consent failure-state tests (Phase 6, Part H pass 2 — R83/R84 F4):
  * the "invalid" phase (consent API error, thrown failure, approval response
  * without a redirect) must render the LOCALIZED terminal invalid-request
  * card — the approval buttons may never reappear for a transaction that can

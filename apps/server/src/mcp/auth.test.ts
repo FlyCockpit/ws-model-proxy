@@ -9,7 +9,7 @@ import { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
- * requireMcpAuth DECISION tests (MCP plan Phase 4 item 7). The upstream
+ * requireMcpAuth DECISION tests (Phase 4 item 7). The upstream
  * verifier (`requireMcpAuth` from @better-auth/mcp) is MOCKED: the mock
  * captures the wrapped handler + options and invokes the handler directly
  * with fabricated VERIFIED claims — exactly the seam the real wrapper

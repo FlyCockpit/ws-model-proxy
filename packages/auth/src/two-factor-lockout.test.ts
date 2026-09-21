@@ -6,7 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 
 /**
  * Behavioral lockout tests for the installed better-auth@1.7.3 two-factor
- * plugin (MCP plan Phase 9 / gap-analysis Section 1: the schema pins
+ * plugin (Phase 9 / gap-analysis Section 1: the schema pins
  * failedVerificationCount/lockedUntil structurally, but no test drove the
  * behavior). Pins the installed verify-two-factor.mjs contract against a
  * real `betterAuth` instance over an in-memory adapter (the

@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { isUserBanned } from "./is-user-banned";
 
-/** Full decision matrix (MCP plan Phase 4 item 3; F5 equality flip, pass 2). */
+/** Full decision matrix (Phase 4 item 3; F5 equality flip, pass 2). */
 describe("isUserBanned — Better Auth admin ban semantics", () => {
   const NOW = new Date("2026-01-15T12:00:00Z");
 

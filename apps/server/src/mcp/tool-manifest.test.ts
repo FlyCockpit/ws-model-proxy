@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
- * Manifest completeness contract (MCP plan Phase 5): the catalog contains
- * EXACTLY the plan's read/write tables — no extras, no missing, no
+ * Manifest completeness contract (Phase 5): the catalog contains
+ * EXACTLY the checked read/write catalog — no extras, no missing, no
  * duplicates — every target resolves against the REAL `appRouter`, and every
  * `appRouter` leaf is either a tool target or an explicit exclusion
  * (invariant 12: a new unclassified procedure fails this suite).
@@ -34,7 +34,7 @@ vi.mock("@ws-model-proxy/db", async () => {
 const { MCP_TOOL_MANIFEST, MCP_TOOL_EXCLUSIONS } = await import("./tool-manifest");
 const { appRouter } = await import("@ws-model-proxy/api/routers/index");
 
-/** The plan's Phase 5 read table — exact names, verbatim. */
+/** Read catalog — exact names, verbatim. */
 const PLAN_READ_TOOLS: readonly string[] = [
   "app_config_get",
   "forwarder_guarded_candidates_list",
@@ -61,7 +61,7 @@ const PLAN_READ_TOOLS: readonly string[] = [
   "relay_requests_list",
 ];
 
-/** The plan's Phase 5 write table — exact names, verbatim. */
+/** Write catalog — exact names, verbatim. */
 const PLAN_WRITE_TOOLS: readonly string[] = [
   "forwarder_guarded_pool_create",
   "forwarder_cli_metadata_remove",
@@ -111,7 +111,7 @@ const PLAN_WRITE_TOOLS: readonly string[] = [
   "forwarder_chat_completion_test",
 ];
 
-/** Confirmation literals per the plan's write table. */
+/** Confirmation literals for the write catalog. */
 const PLAN_CONFIRMATIONS: Readonly<Record<string, "DELETE" | "RUN" | null>> = Object.freeze({
   forwarder_cli_metadata_remove: "DELETE",
   forwarder_endpoint_metadata_remove: "DELETE",
@@ -135,7 +135,7 @@ const PLAN_CONFIRMATIONS: Readonly<Record<string, "DELETE" | "RUN" | null>> = Ob
   forwarder_chat_completion_test: "RUN",
 });
 
-/** The plan's exact targets (name → target) for drift detection. */
+/** Exact catalog targets (name → target) for drift detection. */
 const PLAN_TARGETS: Readonly<Record<string, string>> = Object.freeze({
   app_config_get: "appConfig",
   forwarder_guarded_candidates_list: "forwarderManagement.listGuardedOverflowCandidates",
@@ -234,8 +234,8 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
-describe("MCP tool manifest — exact plan catalog", () => {
-  it("contains exactly the plan's 23 read + 46 write names (no extras, no missing, no duplicates)", () => {
+describe("MCP tool manifest — exact catalog", () => {
+  it("contains exactly 23 read + 46 write names (no extras, no missing, no duplicates)", () => {
     const names = MCP_TOOL_MANIFEST.map((tool) => tool.name);
     expect(new Set(names).size).toBe(names.length);
     expect([...names].sort()).toEqual([...PLAN_READ_TOOLS, ...PLAN_WRITE_TOOLS].sort());
@@ -244,7 +244,7 @@ describe("MCP tool manifest — exact plan catalog", () => {
     expect(MCP_TOOL_MANIFEST).toHaveLength(69);
   });
 
-  it("every descriptor carries the plan's exact target", () => {
+  it("every descriptor carries its catalog target", () => {
     for (const tool of MCP_TOOL_MANIFEST) {
       expect(PLAN_TARGETS[tool.name]).toBe(tool.target);
     }
@@ -257,7 +257,7 @@ describe("MCP tool manifest — exact plan catalog", () => {
     }
   });
 
-  it("confirmation policies match the plan table exactly", () => {
+  it("confirmation policies match the catalog exactly", () => {
     for (const tool of MCP_TOOL_MANIFEST) {
       const expected = PLAN_CONFIRMATIONS[tool.name] ?? null;
       expect(`${tool.name}: ${tool.confirmation}`).toBe(`${tool.name}: ${expected}`);

@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runGracefulShutdownSequence } from "./graceful-shutdown";
 
 /**
- * Graceful-shutdown ORDERING tests (MCP plan Phase 4 item 4): the MCP
+ * Graceful-shutdown ORDERING tests (Phase 4 item 4): the MCP
  * handler close() runs AFTER the HTTP drain and BEFORE the Prisma
  * disconnect; step failures are logged and swallowed so later steps still
  * run.

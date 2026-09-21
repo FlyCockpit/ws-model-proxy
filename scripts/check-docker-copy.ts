@@ -48,6 +48,7 @@
  * CI `lint` job alongside `pnpm env:check`.
  */
 
+import { deepStrictEqual } from "node:assert/strict";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -65,6 +66,12 @@ const RUNNER = "runner";
 
 // Single production image — no worker Dockerfile in this repo.
 const DOCKERFILES = ["Dockerfile"];
+
+// A follower may wait up to the entrypoint's advisory-lock timeout before the
+// schema leader's `prisma db push` and hardening run. Reserve an additional two
+// minutes for that bounded apply phase and application boot before failed
+// health probes count toward an unhealthy rollout.
+const SCHEMA_APPLY_AND_BOOT_SLACK_SECONDS = 120;
 
 // Runtime artifacts invoked by the production entrypoint. Unlike workspace
 // manifests, these are deliberately copied one-by-one into the minimal runner
@@ -127,6 +134,59 @@ function* logicalLines(text: string): Generator<{ line: string; lineNo: number }
   }
   // A file ending on a dangling continuation still yields what it accumulated.
   if (buffer !== "") yield { line: buffer, lineNo: startLine };
+}
+
+/** Return a HEALTHCHECK start-period in seconds, or null when it is absent. */
+function healthcheckStartPeriodSeconds(text: string): number | null {
+  for (const { line } of logicalLines(text)) {
+    if (!/^HEALTHCHECK\s/i.test(line)) continue;
+    const seconds = line.match(/--start-period=(\d+)s/i)?.[1];
+    return seconds === undefined ? null : Number(seconds);
+  }
+  return null;
+}
+
+/**
+ * Parse the entrypoint's bounded Postgres advisory-lock wait. This is sourced
+ * from the actual command rather than duplicated, so extending the wait cannot
+ * silently leave the health-check budget too short.
+ */
+function schemaLockTimeoutSeconds(text: string): number | null {
+  const seconds = text.match(/SET\s+lock_timeout\s*=\s*'(\d+)s'/i)?.[1];
+  return seconds === undefined ? null : Number(seconds);
+}
+
+function healthcheckSchemaBudgetErrors(
+  dockerfile: string,
+  text: string,
+  schemaLockTimeoutSeconds: number,
+): string[] {
+  const startPeriod = healthcheckStartPeriodSeconds(text);
+  if (startPeriod === null) {
+    return [
+      `${dockerfile}: missing HEALTHCHECK --start-period=<N>s; the schema-sync startup budget cannot be verified.`,
+    ];
+  }
+  const required = schemaLockTimeoutSeconds + SCHEMA_APPLY_AND_BOOT_SLACK_SECONDS;
+  if (startPeriod > required) return [];
+  return [
+    `${dockerfile}: HEALTHCHECK --start-period=${startPeriod}s must exceed the schema startup budget ` +
+      `(${schemaLockTimeoutSeconds}s advisory-lock wait + ${SCHEMA_APPLY_AND_BOOT_SLACK_SECONDS}s apply/boot slack = ${required}s).`,
+  ];
+}
+
+if (process.argv.includes("--self-test")) {
+  const healthcheckFixture = (startPeriod: number) => `FROM base AS runner
+HEALTHCHECK --interval=30s --timeout=5s --start-period=${startPeriod}s \\
+  CMD node -e "process.exit(0)"
+`;
+  deepStrictEqual(schemaLockTimeoutSeconds("SET lock_timeout = '300s';"), 300);
+  deepStrictEqual(healthcheckSchemaBudgetErrors("Dockerfile", healthcheckFixture(480), 300), []);
+  deepStrictEqual(healthcheckSchemaBudgetErrors("Dockerfile", healthcheckFixture(420), 300), [
+    "Dockerfile: HEALTHCHECK --start-period=420s must exceed the schema startup budget (300s advisory-lock wait + 120s apply/boot slack = 420s).",
+  ]);
+  console.log("Docker runtime regression checks passed.");
+  process.exit(0);
 }
 
 /**
@@ -200,6 +260,29 @@ function parseStages(dockerfile: string): Map<string, Set<string>> {
 }
 
 const errors: string[] = [];
+
+// The application CMD does not exist until docker-entrypoint.sh has acquired
+// the schema lock and, when requested, completed Prisma plus hardening. Docker
+// counts failed health probes after --start-period, so keep that period beyond
+// the entrypoint's own lock wait and the reserved apply/boot window.
+const schemaLockTimeout = schemaLockTimeoutSeconds(
+  readFileSync(resolve(ROOT, "scripts/docker-entrypoint.sh"), "utf8"),
+);
+if (schemaLockTimeout === null) {
+  errors.push(
+    "scripts/docker-entrypoint.sh: cannot parse the schema advisory lock timeout — update schemaLockTimeoutSeconds() to match the source shape.",
+  );
+} else {
+  for (const dockerfile of DOCKERFILES) {
+    errors.push(
+      ...healthcheckSchemaBudgetErrors(
+        dockerfile,
+        readFileSync(resolve(ROOT, dockerfile), "utf8"),
+        schemaLockTimeout,
+      ),
+    );
+  }
+}
 
 const members = discoverMembers();
 const expectedBuilder = new Set([...members].filter((m) => !ALLOWLIST.has(m)).sort());

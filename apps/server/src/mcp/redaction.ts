@@ -1,6 +1,6 @@
 /**
  * Recursive defense-in-depth secret-key redactor for MCP tool output
- * (MCP plan Phase 5 — "Serialization and errors").
+ * (Phase 5 — "Serialization and errors").
  *
  * Layering contract (order matters):
  *   1. descriptor-specific safe projections (tool-manifest.ts) run FIRST and
