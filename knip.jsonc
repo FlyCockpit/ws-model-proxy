@@ -10,7 +10,39 @@
     "apps/server/src/ssr-cache.ts": ["exports"],
     // Dynamically imported by the PostgreSQL integration test to verify that
     // guarded setup rolls back atomically after an injected failure.
-    "packages/api/src/routers/forwarder-management.ts": ["exports"]
+    "packages/api/src/routers/forwarder-management.ts": ["exports"],
+    // The exports below are consumed only by their colocated *.test.ts suites
+    // (knip --production excludes test files, so they surface there). They are
+    // deliberate test seams / contract constants, not dead code.
+    //
+    // Test-only failure injector for terminal-persistence rollback coverage;
+    // throws outside NODE_ENV=test.
+    "apps/server/src/model-api/provider-budget.ts": ["exports"],
+    // Contract constant: every appRouter leaf is a tool or an explicit
+    // exclusion — asserted by tool-manifest.test.ts and rendered by the
+    // tool-coverage-doc generator.
+    "apps/server/src/mcp/tool-manifest.ts": ["exports"],
+    // Pure unit-test seams (eligibility predicate, envelope extractor, cache
+    // reset between tests, capability extension builder, SSE transform
+    // factory, transcription profile parser).
+    "apps/server/src/model-api/capacity/scheduler.ts": ["exports"],
+    "apps/server/src/model-api/media-transform.ts": ["exports"],
+    "apps/server/src/model-api/model-list-modalities.ts": ["exports"],
+    "apps/server/src/model-api/protocols/streams.ts": ["exports"],
+    "apps/server/src/model-api/transcription-request.ts": ["exports"],
+    // Colocated unit-test helpers (section visibility, form view-state
+    // builders, attachment modality mapping, nav prefix/direction helpers).
+    "apps/web/src/components/forwarder-dashboard-sections.tsx": ["exports"],
+    "apps/web/src/lib/capacity-forms.ts": ["exports"],
+    "apps/web/src/lib/image-attachments.ts": ["exports"],
+    "apps/web/src/lib/nav-items.ts": ["exports"],
+    // resolveRouteSession is @deprecated (prefer resolveRouteSessionFromAuth);
+    // kept only for the projection-assertion tests documented on it.
+    "apps/web/src/server/auth-session.ts": ["exports"],
+    // Type-level contract assertion (F4): McpContext must satisfy the
+    // production oRPC Context. No value-space consumer by design; the
+    // constraint is checked at declaration time.
+    "apps/server/src/mcp/context.ts": ["types"]
   },
   "workspaces": {
     ".": {

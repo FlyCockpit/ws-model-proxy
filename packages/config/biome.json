@@ -5,6 +5,7 @@
     "includes": [
       "**",
       "!!**/node_modules/**",
+      "!!**/.review-loop/**",
       "!!**/dist/**",
       "!!**/dev-dist/**",
       "!!**/.pnpm-store/**",

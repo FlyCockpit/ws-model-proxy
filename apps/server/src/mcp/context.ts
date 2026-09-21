@@ -111,4 +111,8 @@ export function createMcpContext({
 // ---------------------------------------------------------------------------
 
 type AssertAssignable<Base, Derived extends Base> = Derived;
+// Exported only so the assertion lives in the module's compiled surface; it
+// has no value-space consumer by design. The generic constraint is checked
+// at declaration time, so `pnpm check-types` fails the moment `McpContext`
+// drifts from the production oRPC `Context`.
 export type McpContextSatisfiesProductionContext = AssertAssignable<ProductionContext, McpContext>;

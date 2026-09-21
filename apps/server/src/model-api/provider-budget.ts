@@ -7,8 +7,6 @@ import {
   providerBillableTokens,
 } from "./provider-budget-accounting.js";
 
-export { budgetWindow, providerBillableTokens } from "./provider-budget-accounting.js";
-
 const RETRYABLE_TRANSACTION_CODES = new Set(["P2034", "40001", "40P01"]);
 const MAX_TRANSACTION_ATTEMPTS = 5;
 
@@ -21,7 +19,6 @@ export function setTerminalPersistenceTestFailureInjector(injector: (() => unkno
 }
 
 export type BudgetMetric = "CONCURRENCY" | "TOKENS" | "SPEND";
-export type { BudgetPeriod } from "./provider-budget-accounting.js";
 export type UsageConfidence = "REPORTED" | "CALCULATED" | "ESTIMATED";
 
 export interface ProviderLiability {
