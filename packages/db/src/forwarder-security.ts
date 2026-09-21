@@ -7,12 +7,14 @@ export const PRODUCT_CREDENTIAL_PREFIXES = {
   modelApiToken: "wsmp_model_",
   cliToken: "wsmp_cli_",
   deviceCredential: "wsmp_device_",
+  mcpToken: "wsmp_mcp_",
 } as const;
 
 export const FORWARDER_HMAC_CONTEXTS = {
   modelApiToken: "ws-model-proxy:model-api-token:v1",
   cliToken: "ws-model-proxy:cli-token:v1",
   deviceCredential: "ws-model-proxy:device-credential:v1",
+  mcpToken: "ws-model-proxy:mcp-token:v1",
   responsesStickiness: "ws-model-proxy:responses-stickiness:v1",
   responsesStickinessUpstreamId: "ws-model-proxy:responses-stickiness-upstream-id:v1",
   cacheAffinity: "ws-model-proxy:cache-affinity:v1",

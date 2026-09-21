@@ -52,6 +52,16 @@ export function isRateLimit(error: unknown): boolean {
   return e.status === 429 || e.code === "TOO_MANY_REQUESTS";
 }
 
+/**
+ * True if the error looks like a 409 / CONFLICT response from oRPC — e.g. an
+ * active-token cap or a duplicate record.
+ */
+export function isConflict(error: unknown): boolean {
+  const e = asErrorShape(error);
+  if (!e) return false;
+  return e.status === 409 || e.code === "CONFLICT";
+}
+
 type ErrorShape = {
   status?: number;
   code?: string;

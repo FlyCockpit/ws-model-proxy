@@ -1189,4 +1189,18 @@ export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
     reason:
       "Human-only MCP grant revocation (Phase 7): only the browser session may kill grant generations.",
   },
+  {
+    target: "mcpTokens.listMine",
+    reason:
+      "Human-only MCP personal-token management: a connected MCP client must not enumerate the user's other credentials.",
+  },
+  {
+    target: "mcpTokens.create",
+    reason: "Returns the one-time raw MCP personal-token secret; human-only browser session.",
+  },
+  {
+    target: "mcpTokens.revokeMine",
+    reason:
+      "Human-only MCP personal-token revocation: only the browser session may kill PAT generations.",
+  },
 ];

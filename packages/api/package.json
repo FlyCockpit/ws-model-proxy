@@ -11,6 +11,9 @@
     "./lib/cli-credential-access": {
       "default": "./src/lib/cli-credential-access.ts"
     },
+    "./lib/mcp-token-access": {
+      "default": "./src/lib/mcp-token-access.ts"
+    },
     "./lib/model-pool-routing": {
       "default": "./src/lib/model-pool-routing.ts"
     },
@@ -57,7 +60,7 @@
   "scripts": {
     "check-types": "tsc -p tsconfig.check-types.json --noEmit",
     "test": "vitest run --passWithNoTests",
-    "test:postgres": "vitest run --maxWorkers=1 --no-file-parallelism src/lib/capacity-policy-races.postgres.integration.test.ts src/routers/forwarder-management.postgres.integration.test.ts src/routers/model-api-tokens.postgres.integration.test.ts"
+    "test:postgres": "vitest run --maxWorkers=1 --no-file-parallelism src/lib/capacity-policy-races.postgres.integration.test.ts src/routers/forwarder-management.postgres.integration.test.ts src/routers/model-api-tokens.postgres.integration.test.ts src/routers/mcp-tokens.postgres.integration.test.ts"
   },
   "dependencies": {
     "@orpc/client": "catalog:",

@@ -1,10 +1,16 @@
 import { requireMcpAuth } from "@better-auth/mcp";
 import type { AuthInfo } from "@modelcontextprotocol/server";
 import type { ContextServices } from "@ws-model-proxy/api/context";
+import {
+  authenticateMcpPersonalToken,
+  isMcpPersonalTokenSecret,
+  type McpPersonalTokenIdentity,
+} from "@ws-model-proxy/api/lib/mcp-token-access";
 import { isUserBanned } from "@ws-model-proxy/auth/is-user-banned";
 import {
   MCP_ISSUER,
   MCP_RESOURCE_URL,
+  mcpPatClientId,
   mcpScopesAllow,
   parseMcpScopes,
 } from "@ws-model-proxy/auth/mcp-config";
@@ -129,6 +135,15 @@ export interface CreateMcpRequestHandlerOptions {
    * synthetic-session oRPC context.
    */
   onVerified?: (verified: McpVerifiedRequest) => void;
+  /**
+   * MCP personal-token verifier. Default looks up hashed `wsmp_mcp_` secrets.
+   * Injectable so unit tests can exercise the PAT admission branch without a
+   * real credential table.
+   */
+  authenticatePersonalToken?: (
+    rawSecret: string,
+    now: Date,
+  ) => Promise<McpPersonalTokenIdentity | null>;
 }
 
 /** Hono context variables the /mcp route reads (requestId from the wrapper). */
@@ -469,6 +484,10 @@ async function handleAdmittedRequest(
     throw error;
   }
 
+  const presented = extractPresentedCredential(canonicalRequest.headers.get("authorization"));
+  const isPersonalToken =
+    presented?.scheme === "Bearer" && isMcpPersonalTokenSecret(presented.token);
+
   // Built per request (a cheap closure) so the request ID threads into the
   // admission sequence's error responses and sanitized logs.
   const wrapped = requireMcpAuth(
@@ -492,7 +511,54 @@ async function handleAdmittedRequest(
     },
   );
   try {
-    const response = await wrapped(canonicalRequest);
+    let response: Response;
+    if (isPersonalToken && presented) {
+      const authenticatePersonalToken =
+        options.authenticatePersonalToken ?? authenticateMcpPersonalToken;
+      let identity: McpPersonalTokenIdentity | null;
+      try {
+        identity = await authenticatePersonalToken(presented.token, now());
+      } catch (error) {
+        mcpSanitizedLog(
+          `personal token lookup failed (${
+            error instanceof Error ? error.constructor.name : typeof error
+          })`,
+          { requestId: c.get("requestId") },
+        );
+        return finalizeMcpEarlyExitResponse(
+          c,
+          mcpInternalErrorResponse({ requestId: c.get("requestId") }),
+        );
+      }
+      if (signal.aborted) return mcpRequestAbortedResponse();
+      if (identity === null) {
+        return finalizeMcpEarlyExitResponse(
+          c,
+          mcpUnauthorizedResponse({
+            description: "Invalid MCP personal token",
+            resourceUrl,
+          }),
+        );
+      }
+      response = await handleVerifiedRequest({
+        request: canonicalRequest,
+        claims: {
+          sub: identity.userId,
+          client_id: mcpPatClientId(identity.id),
+          scope: identity.scopes.join(" "),
+          [MCP_GRANT_ID_CLAIM]: identity.grantId,
+          ...(identity.expiresAt ? { exp: Math.floor(identity.expiresAt.getTime() / 1000) } : {}),
+        },
+        requestId: c.get("requestId"),
+        options,
+        resourceUrl,
+        consumeIdentityQuota,
+        now,
+        signal,
+      });
+    } else {
+      response = await wrapped(canonicalRequest);
+    }
     // Fence after the verifier/factory/dispatch await (F8): an abort that
     // landed mid-exchange skips response augmentation entirely.
     if (signal.aborted) return mcpRequestAbortedResponse();

@@ -144,6 +144,7 @@ describe("OAuth/JWKS model set (dormant until WMP_MCP_ENABLED)", () => {
     expect(user).toMatch(/oauthAccessTokens\s+OauthAccessToken\[\]/);
     expect(user).toMatch(/oauthConsents\s+OauthConsent\[\]/);
     expect(user).toMatch(/mcpGrants\s+McpGrant\[\]/);
+    expect(user).toMatch(/mcpPersonalTokens\s+McpPersonalToken\[\]/);
     const session = modelBlock("Session");
     expect(session).toMatch(/oauthRefreshTokens\s+OauthRefreshToken\[\]/);
     expect(session).toMatch(/oauthAccessTokens\s+OauthAccessToken\[\]/);
@@ -307,6 +308,7 @@ describe("intentional generator deviations are pinned", () => {
     OauthClientAssertion: [],
     Jwks: ["createdAt"],
     McpGrant: ["createdAt", "updatedAt"],
+    McpPersonalToken: ["createdAt", "updatedAt"],
     AppSetting: ["createdAt", "updatedAt"],
     DeviceCode: ["createdAt", "updatedAt"],
   };
@@ -326,6 +328,7 @@ describe("intentional generator deviations are pinned", () => {
     OauthClientAssertion: [],
     Jwks: [],
     McpGrant: ["updatedAt"],
+    McpPersonalToken: ["updatedAt"],
     AppSetting: ["updatedAt"],
     DeviceCode: ["updatedAt"],
   };

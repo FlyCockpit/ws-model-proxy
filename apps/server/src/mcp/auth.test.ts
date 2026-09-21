@@ -1570,3 +1570,44 @@ describe("createMcpRequestHandler — F10 pass 5: losing continuation cannot mis
     }
   });
 });
+
+describe("createMcpRequestHandler — personal token admission", () => {
+  const PAT = `wsmp_mcp_${"a".repeat(43)}`;
+  const PAT_ID = "token-pat-1";
+
+  it("admits a live personal token without invoking the JWT verifier", async () => {
+    const authenticatePersonalToken = vi.fn(async () => ({
+      id: PAT_ID,
+      userId: SUB,
+      grantId: GRANT_ID,
+      scopes: ["mcp:read"],
+      expiresAt: null,
+      lookupPrefix: "wsmp_mcp_aaaaaaaaaaaa",
+    }));
+    const { handler, transport, quota, verified } = buildHandler({
+      authenticatePersonalToken,
+      prisma: buildPrisma({
+        grant: { id: GRANT_ID, userId: SUB, clientId: `pat:${PAT_ID}`, revokedAt: null },
+      }),
+    });
+    const res = await callHandler(handler, mcpRequest({ authorization: `Bearer ${PAT}` }));
+    expect(res.status).toBe(200);
+    expect(authenticatePersonalToken).toHaveBeenCalledWith(PAT, new Date("2026-06-01T00:00:00Z"));
+    expect(upstreamState.receivedRequest).toBeNull();
+    expect(transport.calls[0]?.authInfo?.clientId).toBe(`pat:${PAT_ID}`);
+    expect(transport.calls[0]?.authInfo?.scopes).toEqual(["mcp:read"]);
+    expect(quota).toHaveBeenCalledWith(SUB, `pat:${PAT_ID}`);
+    expect(verified[0]?.orpcContext.session.user.id).toBe(SUB);
+  });
+
+  it("an invalid personal token is 401 and never reaches the transport", async () => {
+    const { handler, transport } = buildHandler({
+      authenticatePersonalToken: async () => null,
+    });
+    const res = await callHandler(handler, mcpRequest({ authorization: `Bearer ${PAT}` }));
+    expect(res.status).toBe(401);
+    expect(res.headers.get("www-authenticate") ?? "").toContain("invalid_token");
+    expect(transport.calls).toHaveLength(0);
+    expect(upstreamState.receivedRequest).toBeNull();
+  });
+});

@@ -11,6 +11,7 @@ import { cliCredentialsRouter } from "./cli-credentials";
 import { devicesRouter } from "./devices";
 import { forwarderManagementRouter } from "./forwarder-management";
 import { mcpGrantsRouter } from "./mcp-grants";
+import { mcpTokensRouter } from "./mcp-tokens";
 import { modelApiTokensRouter } from "./model-api-tokens";
 import { providerManagementRouter } from "./provider-management";
 import { relayMetadataRouter } from "./relay-metadata";
@@ -65,6 +66,9 @@ export const appRouter = {
   // Human-only MCP grant management (Phase 7): never exposed as MCP tools —
   // see MCP_TOOL_EXCLUSIONS in apps/server/src/mcp/tool-manifest.ts.
   mcpGrants: mcpGrantsRouter,
+  // Human-only MCP personal tokens: hashed Bearer credentials for headless
+  // clients. Never exposed as MCP tools (same exclusion invariant as mcpGrants).
+  mcpTokens: mcpTokensRouter,
 };
 export type AppRouter = typeof appRouter;
 export type AppRouterClient = RouterClient<typeof appRouter>;

@@ -124,6 +124,19 @@ describe("policy constants (Resolved defaults)", () => {
     expect(mcpConfig.MCP_DPOP_POLICY).toEqual({ enabled: true, required: false });
   });
 
+  it("pins the personal-token grant client-id prefix", () => {
+    expect(mcpConfig.MCP_PAT_CLIENT_ID_PREFIX).toBe("pat:");
+    expect(mcpConfig.MCP_PAT_GRANT_REFERENCE).toBe("pat");
+    expect(mcpConfig.mcpPatClientId("token-1")).toBe("pat:token-1");
+    expect(mcpConfig.isMcpPatClientId("pat:token-1")).toBe(true);
+    expect(mcpConfig.isMcpPatClientId("oauth-client")).toBe(false);
+  });
+
+  it("pins the personal-token active cap and last-used touch interval", () => {
+    expect(mcpConfig.MCP_PAT_MAX_ACTIVE_PER_USER).toBe(10);
+    expect(mcpConfig.MCP_PAT_LAST_USED_TOUCH_INTERVAL_MS).toBe(900000);
+  });
+
   it("lists the enabled scopes and registration ceilings", () => {
     expect(mcpConfig.MCP_SCOPES).toEqual(["mcp:read", "mcp:write", "offline_access"]);
     expect(mcpConfig.MCP_CLIENT_REGISTRATION_DEFAULT_SCOPES).toEqual([

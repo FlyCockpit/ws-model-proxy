@@ -61,6 +61,34 @@ export const MCP_CLIENT_REGISTRATION_DEFAULT_SCOPES = ["mcp:read", "offline_acce
 /** CIMD client-registration ceiling: extra scopes a client may add. */
 export const MCP_CLIENT_REGISTRATION_ALLOWED_EXTRA_SCOPES = ["mcp:write"] as const;
 
+/** Synthetic OAuth client-id prefix for MCP personal access tokens. */
+export const MCP_PAT_CLIENT_ID_PREFIX = "pat:" as const;
+
+/** Grant referenceId for every PAT generation (clientId already includes the token id). */
+export const MCP_PAT_GRANT_REFERENCE = "pat" as const;
+
+/** Build the grant `clientId` for one personal token. */
+export function mcpPatClientId(tokenId: string): string {
+  return `${MCP_PAT_CLIENT_ID_PREFIX}${tokenId}`;
+}
+
+export function isMcpPatClientId(clientId: string): boolean {
+  return clientId.startsWith(MCP_PAT_CLIENT_ID_PREFIX);
+}
+
+/**
+ * Ceiling on a user's simultaneously ACTIVE personal tokens (active =
+ * unrevoked, live grant, unexpired). Enforced inside the create transaction
+ * so a compromised session cannot spray unlimited long-lived tokens.
+ */
+export const MCP_PAT_MAX_ACTIVE_PER_USER = 10;
+
+/**
+ * Minimum age before the admission path rewrites `lastUsedAt`, so hot MCP
+ * traffic does not write the token row on every request.
+ */
+export const MCP_PAT_LAST_USED_TOUCH_INTERVAL_MS = 15 * 60 * 1000;
+
 // ---------------------------------------------------------------------------
 // Canonical URL derivation (pure functions).
 // ---------------------------------------------------------------------------
