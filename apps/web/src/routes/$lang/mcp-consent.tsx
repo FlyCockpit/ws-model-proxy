@@ -7,7 +7,7 @@ import { getMcpWebAvailability } from "@/server/mcp-availability";
 import { getRawRequestSearch } from "@/server/raw-request-search";
 
 /**
- * MCP OAuth consent page (MCP plan Phase 6) — `packages/auth/src/mcp-config.ts`
+ * MCP OAuth consent page (Phase 6) — `packages/auth/src/mcp-config.ts`
  * `MCP_CONSENT_PAGE_PATH_DEFAULT`.
  *
  * Requires a browser session (unauthenticated visitors are sent to the MCP

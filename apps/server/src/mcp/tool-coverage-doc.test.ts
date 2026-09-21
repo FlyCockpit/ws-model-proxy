@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 
 /**
- * Docs-drift gate (MCP plan Phase 9 "checked coverage artifact"): the
+ * Docs-drift gate (Phase 9 "checked coverage artifact"): the
  * committed artifact docs/mcp-tool-coverage.md must be BYTE-IDENTICAL to
  * renderMcpToolCoverageDoc() output. A manifest/exclusion change without
  * regenerating the doc fails here. Regeneration (documented in the artifact

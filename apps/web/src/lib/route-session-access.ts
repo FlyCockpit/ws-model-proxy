@@ -44,7 +44,7 @@ export type McpConsentRouteDecision =
   | { kind: "error" };
 
 /**
- * Gate for `/$lang/mcp-consent` (MCP plan Phase 6): the consent page REQUIRES
+ * Gate for `/$lang/mcp-consent` (Phase 6): the consent page REQUIRES
  * a browser session — an unauthenticated visitor is sent to the MCP login
  * page (with the signed oauth_query preserved by the route's redirect), NOT
  * to the generic login, so the OAuth transaction continues. A session lookup

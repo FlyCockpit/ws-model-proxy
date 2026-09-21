@@ -1,7 +1,7 @@
 import { hasUntrustedStructure } from "@ws-model-proxy/auth/auth-logger-bridge";
 
 /**
- * Standards-compliant safe MCP error responses (MCP plan Phase 4 item 5).
+ * Standards-compliant safe MCP error responses (Phase 4 item 5).
  *
  * Header shapes MIRROR the installed upstream challenge builder
  * (`createResourceServerChallenge` in @better-auth/oauth-provider@1.7.3,

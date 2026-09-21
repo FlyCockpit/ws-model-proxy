@@ -16,7 +16,7 @@ import { mcpReauthStatusQueryKey } from "@/lib/mcp-oauth-search";
 import { getMcpReauthStatus } from "@/server/mcp-reauth";
 
 /**
- * Tombstone-reauthorization branch of the MCP login page (MCP plan Phase 6).
+ * Tombstone-reauthorization branch of the MCP login page (Phase 6).
  * Extracted from `routes/$lang/mcp-login.tsx` for DOM testability (same
  * precedent as McpConsentPage) — the route supplies the session, transaction
  * fingerprint, and parsed search; this component owns the reauth DECISION.

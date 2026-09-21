@@ -1,7 +1,7 @@
 import { env } from "@ws-model-proxy/env/server";
 
 /**
- * Canonical public request URL handling (MCP plan Phase 1, security
+ * Canonical public request URL handling (Phase 1, security
  * invariant 2).
  *
  * OAuth issuer, discovery, JWKS, token, MCP resource, and DPoP `htu`

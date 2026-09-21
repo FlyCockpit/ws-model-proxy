@@ -1,6 +1,6 @@
 import { ORPCError } from "@orpc/server";
 import { validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
-import prisma from "@ws-model-proxy/db";
+import prisma, { Prisma } from "@ws-model-proxy/db";
 import {
   credentialLookupPrefix,
   generateProductCredentialSecret,
@@ -31,19 +31,9 @@ const cliTokenSelection = {
   revokedAt: true,
   expiresAt: true,
   cliDeviceId: true,
-} as const;
+} satisfies Prisma.CliTokenSelect;
 
-type CliTokenRow = {
-  id: string;
-  createdAt: Date;
-  updatedAt: Date;
-  name: string;
-  lookupPrefix: string;
-  lastUsedAt: Date | null;
-  revokedAt: Date | null;
-  expiresAt: Date | null;
-  cliDeviceId: string | null;
-};
+type CliTokenRow = Prisma.CliTokenGetPayload<{ select: typeof cliTokenSelection }>;
 
 function serializeCliToken(row: CliTokenRow) {
   return {
@@ -71,7 +61,7 @@ export const cliCredentialsRouter = {
     )
     .handler(async ({ input, context }) => {
       const includeRevoked = input?.includeRevoked ?? false;
-      const rows = (await prisma.cliToken.findMany({
+      const rows = await prisma.cliToken.findMany({
         where: {
           userId: context.session.user.id,
           ...(includeRevoked ? {} : { revokedAt: null }),
@@ -79,7 +69,7 @@ export const cliCredentialsRouter = {
         orderBy: { createdAt: "desc" },
         take: input?.limit ?? 50,
         select: cliTokenSelection,
-      })) as CliTokenRow[];
+      });
 
       return rows.map(serializeCliToken);
     }),
@@ -93,7 +83,7 @@ export const cliCredentialsRouter = {
     )
     .handler(async ({ input, context }) => {
       const secret = generateProductCredentialSecret("cliToken");
-      const token = (await prisma.cliToken.create({
+      const token = await prisma.cliToken.create({
         data: {
           userId: context.session.user.id,
           name: input.name,
@@ -102,7 +92,7 @@ export const cliCredentialsRouter = {
           expiresAt: input.expiresAt ?? null,
         },
         select: cliTokenSelection,
-      })) as CliTokenRow;
+      });
 
       return {
         token: serializeCliToken(token),
@@ -121,11 +111,11 @@ export const cliCredentialsRouter = {
         throw new ORPCError("NOT_FOUND", { message: "CLI token not found." });
       }
 
-      const row = (await prisma.cliToken.update({
+      const row = await prisma.cliToken.update({
         where: { id: input.id },
         data: { revokedAt: existing.revokedAt ?? new Date() },
         select: cliTokenSelection,
-      })) as CliTokenRow;
+      });
       return serializeCliToken(row);
     }),
 

@@ -1,6 +1,6 @@
 import { ORPCError } from "@orpc/server";
 import { directModelId, poolModelId } from "@ws-model-proxy/config/forwarder-identifiers";
-import prisma from "@ws-model-proxy/db";
+import prisma, { Prisma } from "@ws-model-proxy/db";
 import {
   credentialLookupPrefix,
   hmacDigestForForwarderPurpose,
@@ -66,47 +66,50 @@ export type ModelApiTokenIdentity = {
   lastUsedAt: Date | null;
 };
 
-type DirectModelRow = {
-  id: string;
-  userId: string;
-  upstreamModelId: string;
-  maxAttachmentBytes: number | null;
-  User: { slug: string };
+const directModelSelect = {
+  id: true,
+  userId: true,
+  upstreamModelId: true,
+  maxAttachmentBytes: true,
+  optimisticBasicTranscription: true,
+  User: { select: { slug: true } },
   Endpoint: {
-    id: string;
-    slug: string;
-    CliDevice: { slug: string };
-  };
-};
+    select: {
+      id: true,
+      slug: true,
+      CliDevice: { select: { slug: true } },
+    },
+  },
+} satisfies Prisma.DiscoveredModelSelect;
 
-type ModelPoolRow = {
-  id: string;
-  userId: string;
-  slug: string;
-  name: string;
-  description: string | null;
-  maxAttachmentBytes: number | null;
-  optimisticBasicTranscription: boolean;
-  protocolAdaptationEnabled: boolean;
-  publicEgressEnabled: boolean;
-  publicEgressAcknowledged: boolean;
-  allowLossyDeveloperRoleCollapse: boolean;
-  recommendedSurfaceOverride: string | null;
-  PoolMembers?: Array<{ id: string }>;
-  User: { slug: string };
-};
+const modelPoolSelect = {
+  id: true,
+  userId: true,
+  slug: true,
+  name: true,
+  description: true,
+  maxAttachmentBytes: true,
+  optimisticBasicTranscription: true,
+  protocolAdaptationEnabled: true,
+  publicEgressEnabled: true,
+  publicEgressAcknowledged: true,
+  allowLossyDeveloperRoleCollapse: true,
+  recommendedSurfaceOverride: true,
+  PoolMembers: {
+    where: {
+      tier: "PRIMARY",
+      routingStatus: "ACTIVE",
+      ExecutionTarget: { ProviderModel: { isNot: null } },
+    },
+    select: { id: true },
+  },
+  User: { select: { slug: true } },
+} satisfies Prisma.ModelPoolSelect;
 
-type PoolGrantRow = {
-  id: string;
-  ModelPool: ModelPoolRow;
-};
-
-type AllowlistEntryRow = {
-  target: ModelApiTokenAllowlistTarget;
-  discoveredModelId: string | null;
-  ExecutionTarget?: { discoveredModelId: string | null } | null;
-  modelPoolId: string | null;
-};
+type DirectModelRow = Prisma.DiscoveredModelGetPayload<{
+  select: typeof directModelSelect;
+}>;
+type ModelPoolRow = Prisma.ModelPoolGetPayload<{ select: typeof modelPoolSelect }>;
 
 function serializeDirectModel(row: DirectModelRow): VisibleDirectModelTarget {
   return {
@@ -170,86 +173,26 @@ export async function listVisibleModelTargetsForUser(userId: string): Promise<Vi
     prisma.discoveredModel.findMany({
       where: { userId, published: true, Endpoint: { published: true } },
       orderBy: { createdAt: "desc" },
-      select: {
-        id: true,
-        userId: true,
-        upstreamModelId: true,
-        maxAttachmentBytes: true,
-        optimisticBasicTranscription: true,
-        User: { select: { slug: true } },
-        Endpoint: {
-          select: {
-            id: true,
-            slug: true,
-            CliDevice: { select: { slug: true } },
-          },
-        },
-      },
+      select: directModelSelect,
     }),
     prisma.modelPool.findMany({
       where: { userId },
       orderBy: { createdAt: "desc" },
-      select: {
-        id: true,
-        userId: true,
-        slug: true,
-        name: true,
-        description: true,
-        maxAttachmentBytes: true,
-        optimisticBasicTranscription: true,
-        protocolAdaptationEnabled: true,
-        publicEgressEnabled: true,
-        publicEgressAcknowledged: true,
-        allowLossyDeveloperRoleCollapse: true,
-        recommendedSurfaceOverride: true,
-        PoolMembers: {
-          where: {
-            tier: "PRIMARY",
-            routingStatus: "ACTIVE",
-            ExecutionTarget: { ProviderModel: { isNot: null } },
-          },
-          select: { id: true },
-        },
-        User: { select: { slug: true } },
-      },
+      select: modelPoolSelect,
     }),
     prisma.poolGrant.findMany({
       where: { granteeUserId: userId },
       orderBy: { createdAt: "desc" },
       select: {
         id: true,
-        ModelPool: {
-          select: {
-            id: true,
-            userId: true,
-            slug: true,
-            name: true,
-            description: true,
-            maxAttachmentBytes: true,
-            optimisticBasicTranscription: true,
-            protocolAdaptationEnabled: true,
-            publicEgressEnabled: true,
-            publicEgressAcknowledged: true,
-            allowLossyDeveloperRoleCollapse: true,
-            recommendedSurfaceOverride: true,
-            PoolMembers: {
-              where: {
-                tier: "PRIMARY",
-                routingStatus: "ACTIVE",
-                ExecutionTarget: { ProviderModel: { isNot: null } },
-              },
-              select: { id: true },
-            },
-            User: { select: { slug: true } },
-          },
-        },
+        ModelPool: { select: modelPoolSelect },
       },
     }),
   ]);
 
-  const directModels = (directModelRows as DirectModelRow[]).map(serializeDirectModel);
-  const ownedPools = (ownedPoolRows as ModelPoolRow[]).map((row) => serializeModelPool(row));
-  const grantedPools = (grantedPoolRows as PoolGrantRow[]).map((grant) =>
+  const directModels = directModelRows.map(serializeDirectModel);
+  const ownedPools = ownedPoolRows.map((row) => serializeModelPool(row));
+  const grantedPools = grantedPoolRows.map((grant) =>
     serializeModelPool(grant.ModelPool, grant.id),
   );
 
@@ -309,7 +252,7 @@ export async function listVisibleModelTargetsForToken(
     return visibleTargets;
   }
 
-  const entries = (await prisma.modelApiTokenAllowlistEntry.findMany({
+  const entries = await prisma.modelApiTokenAllowlistEntry.findMany({
     where: { modelApiTokenId: token.id },
     select: {
       target: true,
@@ -317,7 +260,7 @@ export async function listVisibleModelTargetsForToken(
       ExecutionTarget: { select: { discoveredModelId: true } },
       modelPoolId: true,
     },
-  })) as AllowlistEntryRow[];
+  });
 
   const allowedDirectIds = new Set(
     entries

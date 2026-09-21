@@ -135,7 +135,7 @@ const PROTECTED_RESOURCE_ALIASES = [
 
 describe("MCP discovery aliases against the real installed handler", () => {
   describe.each(AUTH_SERVER_ALIASES)("authorization-server metadata %s", (alias) => {
-    it("GET returns the REAL provider metadata (issuer, endpoints, scopes; no DCR)", async () => {
+    it("GET returns the REAL provider metadata (issuer, endpoints, scopes, DCR)", async () => {
       const { app, wasSpaReached } = buildApp({ mcpEnabled: true });
       const res = await app.request(`${BASE}${alias}`, { headers: HOST });
       expect(res.status).toBe(200);
@@ -149,10 +149,9 @@ describe("MCP discovery aliases against the real installed handler", () => {
       expect(doc.scopes_supported).toEqual(
         expect.arrayContaining(["mcp:read", "mcp:write", "offline_access"]),
       );
-      // CIMD advertisement present; RFC 7591 DCR registration endpoint absent.
+      // CIMD and RFC 7591 DCR are both advertised.
       expect(doc.client_id_metadata_document_supported).toBe(true);
-      expect(doc.registration_endpoint).toBeUndefined();
-      expect(JSON.stringify(doc)).not.toContain("registration_endpoint");
+      expect(doc.registration_endpoint).toBe(`${ISSUER}/oauth2/register`);
     });
 
     it("HEAD matches the GET status and headers with an EMPTY body", async () => {
@@ -233,7 +232,7 @@ describe("MCP discovery aliases against the real installed handler", () => {
     expect(res.status).toBe(404);
   });
 
-  it("DCR registration is refused: POST /api/auth/oauth2/register → 403 access_denied", async () => {
+  it("DCR registration accepts unauthenticated clients within the configured scope ceiling", async () => {
     const { app } = buildApp({ mcpEnabled: true });
     const res = await app.request(`${BASE}/api/auth/oauth2/register`, {
       method: "POST",
@@ -243,8 +242,16 @@ describe("MCP discovery aliases against the real installed handler", () => {
         redirect_uris: ["https://client.example.com/callback"],
       }),
     });
-    expect(res.status).toBe(403);
-    expect(await res.json()).toMatchObject({ error: "access_denied" });
+    expect(res.status).toBe(201);
+    const registration = (await res.json()) as Record<string, unknown>;
+    expect(registration).toMatchObject({
+      client_name: "dcr-attempt",
+      redirect_uris: ["https://client.example.com/callback"],
+    });
+    expect(typeof registration.client_id).toBe("string");
+    expect(String(registration.scope).split(" ").sort()).toEqual(
+      ["mcp:read", "mcp:write", "offline_access"].sort(),
+    );
   });
 
   it("JWKS stays GET-only: HEAD /api/auth/jwks is NOT given a HEAD adapter (upstream 404)", async () => {

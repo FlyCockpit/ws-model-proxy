@@ -5,7 +5,7 @@ import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 /**
- * MCP tombstone-reauth sign-out hook (MCP plan Phase 6, Part H pass 2):
+ * MCP tombstone-reauth sign-out hook (Phase 6, Part H pass 2):
  * exact signOut args, no navigation, failure surfacing (R83/R84 F4),
  * single-flight re-entry guard (R83/R84 F8), and tombstone-probe cache
  * invalidation on sign-out (R83/R84 F5).

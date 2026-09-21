@@ -2,7 +2,7 @@ import { createServerFn } from "@tanstack/react-start";
 
 /**
  * SERVER RUNTIME MCP availability for the web MCP login/consent routes
- * (MCP plan Phase 6).
+ * (Phase 6).
  *
  * Deliberately NOT a Vite build-time flag: this server function reads the
  * same validated `@ws-model-proxy/env/server` module the Hono surface reads

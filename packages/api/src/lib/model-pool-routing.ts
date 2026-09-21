@@ -515,7 +515,7 @@ export async function selectPoolRouteSequence({
     const discoveredModel = row.ExecutionTarget?.DiscoveredModel ?? row.DiscoveredModel;
     if (!discoveredModel) return [];
     return [{ ...row, discoveredModelId: discoveredModel.id, DiscoveredModel: discoveredModel }];
-  }) as PoolMemberRouteRow[];
+  });
 
   return buildPoolRouteSequence({ members, activeCliDeviceIds, now, state });
 }
@@ -532,7 +532,7 @@ export async function recordPoolMemberRelayFailure({
   const failureClass = poolMemberFailureClassForRelayFailure(failure);
   if (!failureClass) return { retryable: false, update: null };
 
-  const member = (await prisma.poolMember.findUnique({
+  const member = await prisma.poolMember.findUnique({
     where: { id: poolMemberId },
     select: {
       healthStatus: true,
@@ -542,7 +542,7 @@ export async function recordPoolMemberRelayFailure({
       nextRetryAt: true,
       halfOpenTrialStartedAt: true,
     },
-  })) as PoolMemberHealthSnapshot | null;
+  });
   if (!member) return { retryable: true, update: null };
 
   const update = transitionPoolMemberHealthAfterRetryableFailure({
@@ -603,7 +603,7 @@ export async function settlePoolMemberRecoveryTrial({
   healthy: boolean;
   now?: Date;
 }): Promise<boolean> {
-  const member = (await prisma.poolMember.findUnique({
+  const member = await prisma.poolMember.findUnique({
     where: { id: poolMemberId },
     select: {
       healthStatus: true,
@@ -613,7 +613,7 @@ export async function settlePoolMemberRecoveryTrial({
       nextRetryAt: true,
       halfOpenTrialStartedAt: true,
     },
-  })) as PoolMemberHealthSnapshot | null;
+  });
   if (
     member?.healthStatus !== "HALF_OPEN" ||
     member.halfOpenTrialStartedAt?.getTime() !== trialStartedAt.getTime()

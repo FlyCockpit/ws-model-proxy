@@ -11,7 +11,7 @@ import { useMcpPageContinue } from "@/hooks/use-mcp-page-continue";
 import { mcpPageHref } from "./mcp-oauth-search";
 
 /**
- * Signed-query preservation probes (MCP plan Phase 6, Part H pass 2 —
+ * Signed-query preservation probes (Phase 6, Part H pass 2 —
  * R83/R84 F1): transitions between the MCP login and consent pages must keep
  * the RAW query string byte-identical, because the signed OAuth transaction
  * (repeated `ba_param` keys + `sig`) IS the URL. The probes run the INSTALLED

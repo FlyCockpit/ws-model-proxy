@@ -112,11 +112,11 @@ describe("policy constants (Resolved defaults)", () => {
     expect(mcpConfig.MCP_REFRESH_RETRY_WINDOW_SECONDS).toBe(30);
   });
 
-  it("pins CIMD-only registration to the 2026-07-28 profile with DCR off", () => {
+  it("pins CIMD and DCR registration to the 2026-07-28 profile", () => {
     expect(mcpConfig.MCP_METADATA_PROFILE).toBe("mcp-2026-07-28");
     expect(mcpConfig.MCP_CIMD_REGISTRATION_POLICY).toEqual({
       metadataProfile: "mcp-2026-07-28",
-      dynamicClientRegistration: false,
+      dynamicClientRegistration: true,
     });
   });
 

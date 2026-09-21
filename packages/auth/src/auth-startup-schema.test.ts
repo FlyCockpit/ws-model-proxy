@@ -3,7 +3,7 @@ import { getAuthTables } from "better-auth";
 import { describe, expect, it, vi } from "vitest";
 
 /**
- * Automated startup schema validation (MCP plan Phase 9; gap-analysis
+ * Automated startup schema validation (Phase 9; gap-analysis
  * Section 1 "Better Auth startup schema validation — manual evidence only").
  *
  * The deploy-time guarantee the 1.7.3 prisma-adapter schema check gives us

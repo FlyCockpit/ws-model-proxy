@@ -17,7 +17,7 @@ import { createRateLimiterMiddleware } from "./rate-limit.js";
 export { isMcpOauthRateLimited, MCP_OAUTH_RATE_LIMITED_ROUTES } from "./mcp-oauth-route-match.js";
 
 /**
- * MCP OAuth endpoint rate limits (MCP plan Phase 3).
+ * MCP OAuth endpoint rate limits (Phase 3).
  *
  * Replaces the broad `/api/auth/*` strict-limiter coverage for an EXACT
  * method+path allowlist of the MCP OAuth endpoints (paths derived from the

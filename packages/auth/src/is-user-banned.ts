@@ -1,5 +1,5 @@
 /**
- * Pure Better Auth admin-plugin ban semantics (MCP plan Phase 4).
+ * Pure Better Auth admin-plugin ban semantics (Phase 4).
  *
  * Better Auth's admin plugin stores bans as `banned: boolean` plus an
  * optional `banExpires: Date` (temporary ban). The upstream session-side

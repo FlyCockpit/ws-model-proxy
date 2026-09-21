@@ -13,7 +13,7 @@ export type PoolMemberTestDependencies = {
 };
 
 /**
- * Hono routes for pool member diagnostics (MCP plan Phase 5: a thin HTTP
+ * Hono routes for pool member diagnostics (Phase 5: a thin HTTP
  * adapter over the EXTRACTED core in model-api/diagnostics.ts — the same
  * typed, user-id-bound function the MCP `forwarder_pool_member_test` tool
  * calls). Response bodies and status codes are byte-identical to the

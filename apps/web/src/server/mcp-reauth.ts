@@ -2,8 +2,8 @@ import { createServerFn } from "@tanstack/react-start";
 import { getRequestHeaders } from "@tanstack/react-start/server";
 
 /**
- * Tombstone probe for the MCP login route's authenticated branch (MCP plan
- * Phase 6). When Better Auth's `postLogin.shouldRedirect` detects that the
+ * Tombstone probe for the MCP login route's authenticated branch. When Better
+ * Auth's `postLogin.shouldRedirect` detects that the
  * current session/client grant generation is tombstoned, it redirects the
  * browser to the MCP login page with the signed `oauth_query` preserved.
  * This server function answers the page's follow-up question — "is THIS

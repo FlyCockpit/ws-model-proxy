@@ -19,6 +19,9 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     RATE_LIMIT_AUTH_POINTS: 3,
     RATE_LIMIT_AUTH_DURATION: 60,
     RATE_LIMIT_AUTH_BLOCK_DURATION: 120,
+    RATE_LIMIT_SIGNIN_FAILURE_POINTS: 10,
+    RATE_LIMIT_SIGNIN_FAILURE_DURATION: 900,
+    RATE_LIMIT_SIGNIN_FAILURE_BLOCK_DURATION: 600,
     RATE_LIMIT_SIGNUP_POINTS: 3,
     RATE_LIMIT_SIGNUP_DURATION: 3600,
     RATE_LIMIT_SIGNUP_BLOCK_DURATION: 3600,
@@ -181,7 +184,7 @@ describe("createRateLimiterMiddleware", () => {
 });
 
 // ---------------------------------------------------------------------------
-// resolveKey extension (MCP plan Phase 3): typed, optional, and existing
+// resolveKey extension (Phase 3): typed, optional, and existing
 // callers' default keying is byte-identical.
 // ---------------------------------------------------------------------------
 

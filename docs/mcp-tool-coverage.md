@@ -148,6 +148,6 @@ Enforcement (all pinned by `apps/server/src/mcp/tool-manifest.test.ts`):
 
 Unlike authorization, discovery, MCP login/consent, and `/mcp`, the
 `mcpGrants` procedures and the settings page are deliberately NOT gated on
-`WMP_MCP_ENABLED` (MCP plan invariant 13): humans must be able to kill
+`WMP_MCP_ENABLED` (invariant 13): humans must be able to kill
 outstanding authorization during an emergency MCP shutdown. Normal browser
 authentication still applies.

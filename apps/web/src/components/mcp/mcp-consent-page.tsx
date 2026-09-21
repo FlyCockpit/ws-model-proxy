@@ -20,7 +20,7 @@ import {
 } from "@/lib/mcp-oauth-search";
 
 /**
- * MCP OAuth consent page UI (MCP plan Phase 6) — rendered by the
+ * MCP OAuth consent page UI (Phase 6) — rendered by the
  * `/$lang/mcp-consent` route, which owns availability + session gating.
  *
  * Requires a usable signed OAuth transaction in the URL. Canonical client

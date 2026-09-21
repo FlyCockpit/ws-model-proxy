@@ -1,12 +1,12 @@
 /**
- * Typed MCP tool manifest (MCP plan Phase 5).
+ * Typed MCP tool manifest (Phase 5).
  *
  * EVERY descriptor here is the checked wire contract for one MCP tool:
  * the exact public name, the exact oRPC procedure (or extracted diagnostic
  * core) it invokes, its scope requirement, confirmation policy, feature
  * dependency, side-effect classification, input adapter, and safe output
  * projector. The completeness test (tool-manifest.test.ts) fails when:
- *   - the manifest's names differ from the plan's read/write tables in ANY
+ *   - the manifest's names differ from the checked read/write catalog in ANY
  *     way (extra, missing, or duplicated);
  *   - an `appRouter` leaf is neither a tool target nor an explicit exclusion;
  *   - a write tool lacks literal `mcp:write`, a destructive tool lacks
@@ -322,7 +322,7 @@ const CAPACITY_FEATURE = "MODEL_API_GLOBAL_CAPACITY_ENABLED";
 
 // ---------------------------------------------------------------------------
 // The checked catalog — every entry's name/target pair is pinned against the
-// plan's Phase 5 read/write tables by tool-manifest.test.ts.
+// checked read/write catalog by tool-manifest.test.ts.
 // ---------------------------------------------------------------------------
 
 const READ_TOOLS: readonly McpToolDescriptor[] = [
@@ -1077,13 +1077,13 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
 ];
 
 /**
- * The checked catalog: exactly the plan's 23 read tools and 46 write tools
+ * The checked catalog: exactly 23 read tools and 46 write tools
  * (44 procedure-backed + the 2 extracted diagnostic cores).
  */
 export const MCP_TOOL_MANIFEST: readonly McpToolDescriptor[] = [...READ_TOOLS, ...WRITE_TOOLS];
 
 // ---------------------------------------------------------------------------
-// Explicit first-release exclusions (MCP plan Phase 5). Every `appRouter`
+// Explicit first-release exclusions (Phase 5). Every `appRouter`
 // leaf that is not a tool target above MUST appear here; the completeness
 // test fails otherwise (a new unclassified procedure cannot ship silently).
 // ---------------------------------------------------------------------------

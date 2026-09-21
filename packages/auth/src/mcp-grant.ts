@@ -3,7 +3,7 @@ import { getOAuthProviderState } from "@better-auth/oauth-provider";
 import prisma from "@ws-model-proxy/db";
 
 /**
- * Application-owned MCP grant generation integration (MCP plan Phase 2).
+ * Application-owned MCP grant generation integration (Phase 2).
  *
  * Better Auth owns the OAuth protocol; this module owns the application-side
  * grant generation record (`McpGrant`):

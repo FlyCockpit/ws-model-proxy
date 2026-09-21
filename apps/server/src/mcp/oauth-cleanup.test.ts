@@ -1,5 +1,5 @@
 /**
- * OAuth retention and cleanup tests (MCP plan Phase 8, Part J).
+ * OAuth retention and cleanup tests (Phase 8, Part J).
  *
  * Prisma is mocked with mockDeep (`vi.mock("@ws-model-proxy/db")`) and
  * surface-typed via the repo's established `as unknown as {...MockInstance}`
@@ -39,6 +39,7 @@ import {
   OAUTH_CLEANUP_VERIFICATION_BATCH,
   OAUTH_CLEANUP_VERIFICATION_SCAN_CAP,
   OAUTH_CLEANUP_VERIFICATION_TOTAL_CAP,
+  OAUTH_UNCLAIMED_DYNAMIC_CLIENT_RETENTION_MS,
   startOauthCleanup,
   sweepExpiredOAuthArtifacts,
 } from "./oauth-cleanup";
@@ -46,6 +47,7 @@ import {
 const db = prisma as unknown as {
   oauthAccessToken: { findMany: MockInstance; deleteMany: MockInstance };
   oauthRefreshToken: { findMany: MockInstance; deleteMany: MockInstance };
+  oauthClient: { findMany: MockInstance; deleteMany: MockInstance };
   oauthClientAssertion: { findMany: MockInstance; deleteMany: MockInstance };
   verification: { findMany: MockInstance; deleteMany: MockInstance };
 };
@@ -63,6 +65,9 @@ function codeValue(overrides: Record<string, unknown> = {}): string {
 
 const NOW = new Date("2026-09-18T12:00:00.000Z");
 const GRACE_CUTOFF = new Date(NOW.getTime() - OAUTH_CLEANUP_AUDIT_GRACE_MS);
+const UNCLAIMED_DYNAMIC_CLIENT_CUTOFF = new Date(
+  NOW.getTime() - OAUTH_UNCLAIMED_DYNAMIC_CLIENT_RETENTION_MS,
+);
 
 describe("inspectExpiredAuthorizationCode", () => {
   it("matches only a parsed object with type authorization_code", () => {
@@ -110,6 +115,7 @@ describe("sweepExpiredOAuthArtifacts", () => {
   function seedEmpty() {
     db.oauthAccessToken.findMany.mockResolvedValue([]);
     db.oauthRefreshToken.findMany.mockResolvedValue([]);
+    db.oauthClient.findMany.mockResolvedValue([]);
     db.oauthClientAssertion.findMany.mockResolvedValue([]);
     db.verification.findMany.mockResolvedValue([]);
   }
@@ -120,6 +126,7 @@ describe("sweepExpiredOAuthArtifacts", () => {
     await sweepExpiredOAuthArtifacts({ now: NOW });
     expect(db.oauthAccessToken.deleteMany).not.toHaveBeenCalled();
     expect(db.oauthRefreshToken.deleteMany).not.toHaveBeenCalled();
+    expect(db.oauthClient.deleteMany).not.toHaveBeenCalled();
     expect(db.oauthClientAssertion.deleteMany).not.toHaveBeenCalled();
     expect(db.verification.deleteMany).not.toHaveBeenCalled();
   });
@@ -170,6 +177,35 @@ describe("sweepExpiredOAuthArtifacts", () => {
       where: { expiresAt: { lte: GRACE_CUTOFF }, id: { in: ["c1"] } },
     });
     expect(counts.clientAssertions).toBe(1);
+  });
+
+  it("removes only abandoned, ownerless dynamic registrations after their retention window", async () => {
+    seedEmpty();
+    db.oauthClient.findMany.mockResolvedValue([{ id: "dcr-1" }]);
+    db.oauthClient.deleteMany.mockResolvedValue({ count: 1 });
+
+    const counts = await sweepExpiredOAuthArtifacts({ now: NOW });
+    const expectedWhere = {
+      clientDiscoveryId: null,
+      userId: null,
+      referenceId: null,
+      createdAt: { lte: UNCLAIMED_DYNAMIC_CLIENT_CUTOFF },
+      oauthConsents: { none: {} },
+      oauthRefreshTokens: { none: {} },
+      oauthAccessTokens: { none: {} },
+    };
+
+    expect(db.oauthClient.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expectedWhere,
+        select: { id: true },
+        take: OAUTH_CLEANUP_BATCH,
+      }),
+    );
+    expect(db.oauthClient.deleteMany).toHaveBeenCalledWith({
+      where: { ...expectedWhere, id: { in: ["dcr-1"] } },
+    });
+    expect(counts.unclaimedDynamicClients).toBe(1);
   });
 
   it("deletes access rows BEFORE refresh rows (dependency order)", async () => {

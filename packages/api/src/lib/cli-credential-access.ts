@@ -1,6 +1,6 @@
 import { ORPCError } from "@orpc/server";
 import { validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
-import prisma from "@ws-model-proxy/db";
+import prisma, { Prisma } from "@ws-model-proxy/db";
 import {
   credentialLookupPrefix,
   generateProductCredentialSecret,
@@ -19,15 +19,31 @@ export type CliWebsocketIdentity = {
   lookupPrefix: string;
 };
 
-type CliCredentialRow = {
-  id: string;
-  userId: string;
-  cliDeviceId: string | null;
-  lookupPrefix: string;
-  secretDigest: string;
-  revokedAt: Date | null;
-  expiresAt?: Date | null;
-};
+const cliTokenCredentialSelect = {
+  id: true,
+  userId: true,
+  cliDeviceId: true,
+  lookupPrefix: true,
+  secretDigest: true,
+  revokedAt: true,
+  expiresAt: true,
+} satisfies Prisma.CliTokenSelect;
+
+const cliDeviceCredentialSelect = {
+  id: true,
+  userId: true,
+  cliDeviceId: true,
+  lookupPrefix: true,
+  secretDigest: true,
+  revokedAt: true,
+} satisfies Prisma.CliDeviceCredentialSelect;
+
+type CliTokenCredentialRow = Prisma.CliTokenGetPayload<{
+  select: typeof cliTokenCredentialSelect;
+}>;
+type CliDeviceCredentialRow = Prisma.CliDeviceCredentialGetPayload<{
+  select: typeof cliDeviceCredentialSelect;
+}>;
 
 export function digestCliTokenSecret(rawSecret: string): string {
   return hmacDigestForForwarderPurpose({ purpose: "cliToken", value: rawSecret });
@@ -46,18 +62,10 @@ async function authenticateCliToken(
   now: Date,
 ): Promise<CliWebsocketIdentity | null> {
   const lookupPrefix = credentialLookupPrefix(rawSecret);
-  const token = (await prisma.cliToken.findUnique({
+  const token: CliTokenCredentialRow | null = await prisma.cliToken.findUnique({
     where: { lookupPrefix },
-    select: {
-      id: true,
-      userId: true,
-      cliDeviceId: true,
-      lookupPrefix: true,
-      secretDigest: true,
-      revokedAt: true,
-      expiresAt: true,
-    },
-  })) as CliCredentialRow | null;
+    select: cliTokenCredentialSelect,
+  });
 
   if (!token || token.revokedAt || isExpired(token.expiresAt, now)) return null;
   if (
@@ -90,17 +98,10 @@ async function authenticateDeviceCredential(
   now: Date,
 ): Promise<CliWebsocketIdentity | null> {
   const lookupPrefix = credentialLookupPrefix(rawSecret);
-  const credential = (await prisma.cliDeviceCredential.findUnique({
+  const credential: CliDeviceCredentialRow | null = await prisma.cliDeviceCredential.findUnique({
     where: { lookupPrefix },
-    select: {
-      id: true,
-      userId: true,
-      cliDeviceId: true,
-      lookupPrefix: true,
-      secretDigest: true,
-      revokedAt: true,
-    },
-  })) as CliCredentialRow | null;
+    select: cliDeviceCredentialSelect,
+  });
 
   if (!credential || credential.revokedAt) return null;
   if (

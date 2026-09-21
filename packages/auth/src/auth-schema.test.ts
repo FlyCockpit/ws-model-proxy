@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 
 /**
  * Structural schema-shape assertions for the Better Auth 1.7.3 reconciliation
- * (MCP plan Phase 0b). packages/db has no vitest setup, so this reads the
+ * (Phase 0b). packages/db has no vitest setup, so this reads the
  * Prisma schema file directly; `pnpm db:validate` + `pnpm db:generate` cover
  * syntax/client generation, and the runtime prisma-adapter schema check
  * (registered by better-auth 1.7.3 and awaited before HTTP dispatch) covers

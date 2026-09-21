@@ -1,5 +1,5 @@
 /**
- * Extracted diagnostic cores (MCP plan Phase 5 — "Extracted diagnostic cores").
+ * Extracted diagnostic cores (Phase 5 — "Extracted diagnostic cores").
  *
  * Typed, USER-ID-BOUND application functions shared by the internal Hono
  * routes and the MCP tools. The Hono routes (chat-test.ts / pool-member-test.ts)
@@ -30,7 +30,7 @@
  * `chatTestCompletionsHandler` core (routes.ts): it builds a synthetic
  * chat-completions Request, dispatches it through the SAME singletons, and
  * projects the response to a bounded, provider-safe summary — the raw
- * provider response NEVER crosses this boundary (MCP plan invariant 10).
+ * provider response NEVER crosses this boundary (invariant 10).
  */
 
 import { markPoolMemberRelaySuccess } from "@ws-model-proxy/api/lib/model-pool-routing";
@@ -38,7 +38,7 @@ import {
   resolveEffectiveCapabilityMetadata,
   supportsChatCompletions,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
-import prisma from "@ws-model-proxy/db";
+import prisma, { Prisma } from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
 import { type RelaySessionManager, relaySessionManager } from "../relay/session-manager.js";
 import { PostgresCapacityAdmissionStore } from "./capacity/postgres-store.js";
@@ -137,7 +137,7 @@ const poolMemberModelSelect = {
       CliDevice: { select: { status: true } },
     },
   },
-} as const;
+} satisfies Prisma.DiscoveredModelSelect;
 
 /** EXACT select from the original Hono route (ownership + capability views). */
 const poolMemberTestSelect = {
@@ -149,30 +149,9 @@ const poolMemberTestSelect = {
     },
   },
   DiscoveredModel: { select: poolMemberModelSelect },
-} as const;
+} satisfies Prisma.PoolMemberSelect;
 
-type PoolMemberTestModel = {
-  id: string;
-  published: boolean;
-  upstreamModelId: string;
-  capabilityOverrideMode: string;
-  capabilityOverrides: string[];
-  capabilityOverrideMetadata: unknown;
-  Endpoint: {
-    published: boolean;
-    slug: string;
-    cliDeviceId: string;
-    capabilityMetadata: unknown;
-    defaultCapabilities: string[];
-  };
-};
-
-type PoolMemberTestRow = {
-  id: string;
-  ModelPool: { userId: string };
-  ExecutionTarget?: { DiscoveredModel?: PoolMemberTestModel | null } | null;
-  DiscoveredModel?: PoolMemberTestModel | null;
-};
+type PoolMemberTestRow = Prisma.PoolMemberGetPayload<{ select: typeof poolMemberTestSelect }>;
 
 /**
  * Run the chat-completions probe against one pool member, owned by `userId`.
@@ -198,10 +177,10 @@ export async function runPoolMemberTest({
    */
   signal?: AbortSignal;
 } & DiagnosticCoreDependencies): Promise<PoolMemberTestResult> {
-  const member = (await prisma.poolMember.findUnique({
+  const member: PoolMemberTestRow | null = await prisma.poolMember.findUnique({
     where: { id: memberId },
     select: poolMemberTestSelect,
-  })) as PoolMemberTestRow | null;
+  });
   // G1: post-lookup cancellation check. The ownership lookup is the core's
   // first await — a caller (or the shutdown gate) that aborted while it was
   // parked must not let the resumed continuation proceed to capability

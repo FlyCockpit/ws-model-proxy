@@ -9,7 +9,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
- * Transport contract tests (MCP plan Phase 4 item 4) against the REAL
+ * Transport contract tests (Phase 4 item 4) against the REAL
  * installed `@modelcontextprotocol/server@2.0.0` handler — no mocks on the
  * SDK itself. The modern (2026-07-28) wire shape used here was verified
  * against the installed entry: a request is modern iff `params._meta`

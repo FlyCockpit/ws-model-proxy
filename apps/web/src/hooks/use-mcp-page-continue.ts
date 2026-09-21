@@ -3,7 +3,7 @@ import { mcpPageHref } from "@/lib/mcp-oauth-search";
 
 /**
  * Derived-state navigation for the MCP login page's authenticated "continue"
- * branch (MCP plan Phase 6).
+ * branch (Phase 6).
  *
  * The transition to the consent page must preserve the RAW signed OAuth
  * query (client_id, scope, resource, state, code_challenge, sig, …)
