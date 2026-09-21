@@ -42,7 +42,10 @@ Optional:
   the standard sign-in flow.
 - Rate-limit tuning: `RATE_LIMIT_MCP_POINTS` (default 120),
   `RATE_LIMIT_MCP_DURATION` (default 60 s), `RATE_LIMIT_MCP_CONSENT_POINTS`
-  (default 30), `RATE_LIMIT_MCP_CONSENT_DURATION` (default 60 s). See
+  (default 30), `RATE_LIMIT_MCP_CONSENT_DURATION` (default 60 s), and the
+  whole-service registration bucket
+  `RATE_LIMIT_MCP_REGISTRATION_POINTS`/`RATE_LIMIT_MCP_REGISTRATION_DURATION`
+  (default 60 requests / 3600 s). See
   [Rate limits](#rate-limits-process-local).
 
 The generated `.env.example` files track these keys
@@ -105,14 +108,14 @@ public host).
 
 ## Client registration (CIMD + dynamic registration)
 
-Two registration paths are enabled, both pinned to the MCP `2026-07-28`
-metadata profile (CIMD = **Client ID Metadata Document**):
+Two registration paths are enabled (CIMD = **Client ID Metadata Document**):
 
 - **CIMD first-use registration**: a client publishes its metadata document
   over HTTPS; on first use the server fetches it through Better Auth's
   hardened transport (resolve-once DNS validation, public-address checks,
   connection pinning, TLS hostname validation, byte/time limits, redirect
-  refusal) and registers the client.
+  refusal) and registers the client. The CIMD path is pinned to the MCP
+  `2026-07-28` metadata profile.
 - **Dynamic Client Registration (RFC 7591)**: advertised in discovery
   metadata via `registration_endpoint` (`…/oauth2/register`). Unauthenticated
   initial registration is enabled as well — clients such as rmcp/Grok
@@ -120,10 +123,17 @@ metadata profile (CIMD = **Client ID Metadata Document**):
   public clients (`clientRegistrationRequirePKCE`), registration scope
   ceilings still cap what a registered client may declare, and user-facing
   OAuth client/resource CRUD is denied entirely.
-- Registration scope ceiling: clients are registered with
-  `mcp:read offline_access` by default and may add `mcp:write`.
+- Registration scope ceiling: the ceiling is `mcp:read mcp:write
+  offline_access`, and the provider persists that FULL set as the client's
+  registered capabilities even when the registration request omits `scope`.
+  Registered capabilities are not authorization: every requested scope is
+  still validated and consented to at authorize time.
 - Grant types are limited to `authorization_code` and `refresh_token`.
   `client_credentials` is never enabled (tools are user-bound).
+
+The two paths differ in client identity: a CIMD client's `client_id` IS its
+metadata URL; a DCR response returns a GENERATED `client_id` that the client
+must use in every subsequent OAuth request (see the client examples).
 
 Registration is not a client allowlist; a production cohort would be a
 separate policy change.
@@ -306,6 +316,13 @@ starts an immediate sweep that will remove artifacts already past eligibility
 
 - Rotated refresh-token family rows are retained until expiry so replay and
   family-invalidation evidence is not removed early.
+- **Unclaimed dynamic registrations are deleted 24 hours after CREATION**
+  (this clock runs from creation, unlike the token grace below, which runs
+  from expiry): an RFC 7591 registration with no user/reference owner and no
+  consent, access-token, or refresh rows is an abandoned registration and is
+  removed by the sweep. CIMD clients (`clientDiscoveryId` set) are exempt.
+  An unused DCR-only registration can therefore disappear a day after it was
+  created — re-register if that happens.
 - The 24-hour audit grace runs **from artifact expiry** (a row becomes
   eligible 24 hours after it expired — not from rollback or revocation).
   After grace, expired access/refresh rows are removed in dependency order,
@@ -343,6 +360,12 @@ starts an immediate sweep that will remove artifacts already past eligibility
   of that user's sessions; consent/continue consume only this tighter bucket,
   not both). Small form-body caps run before the limiters. Everything else
   under `/api/auth/*` keeps the general auth limiter.
+- The RFC 7591 register endpoint has its own **whole-service** bucket
+  (`RATE_LIMIT_MCP_REGISTRATION_POINTS`/`RATE_LIMIT_MCP_REGISTRATION_DURATION`,
+  default 60 requests / 3600 s) keyed globally rather than by IP — DCR is
+  intentionally unauthenticated, so an IP key would let rotating source
+  addresses persist unbounded OAuth client rows. It runs before the general
+  auth limiter on that path.
 - **All limits are process-local and in-memory**: counters reset on process
   restart, and clients exceeding a bucket get `429` with a `Retry-After`
   header. Statelessness removes session affinity, not the need for
@@ -403,8 +426,17 @@ public HTTPS.)
 On first use the server fetches this document through Better Auth's hardened
 transport (see [Client registration](#client-registration-cimd--dynamic-registration))
 and registers the client; `client_id` in every OAuth request below is the
-metadata URL itself. (A client that prefers RFC 7591 dynamic registration can
-instead POST its metadata to the advertised `registration_endpoint`.)
+metadata URL itself.
+
+A client that prefers RFC 7591 dynamic registration instead POSTs to the
+advertised `registration_endpoint` (`POST /api/auth/oauth2/register`). The
+DCR request is NOT the CIMD document above posted as-is — that returns
+`400 invalid_redirect_uri` for a loopback public client. Adapt it: add
+`"application_type": "native"` and `"token_endpoint_auth_method": "none"`
+(keep the same `redirect_uris`, grant types, scope, and
+`dpop_bound_access_tokens`), and expect a `201` response whose `client_id`
+is a GENERATED identifier — use THAT `client_id` (not any URL) in every
+OAuth request below.
 
 ### Wire sequence (Bearer or DPoP client)
 
