@@ -501,9 +501,6 @@ importers:
 
   packages/api:
     dependencies:
-      '@orpc/client':
-        specifier: 'catalog:'
-        version: 1.15.0(@opentelemetry/api@1.9.1)
       '@orpc/openapi':
         specifier: 'catalog:'
         version: 1.15.0(@opentelemetry/api@1.9.1)(crossws@0.4.10(srvx@0.11.22))(ws@8.21.3)
@@ -532,6 +529,9 @@ importers:
         specifier: 'catalog:'
         version: 4.4.3
     devDependencies:
+      '@orpc/client':
+        specifier: 'catalog:'
+        version: 1.15.0(@opentelemetry/api@1.9.1)
       hono:
         specifier: 'catalog:'
         version: 4.13.1

@@ -154,7 +154,12 @@ const defaultConsumeIdentityQuota = async (
  * Only `mcp:read` is configured as a required scope; the matcher applies
  * `mcpScopesAllow` semantics verbatim (never widens granted scopes).
  */
-function mcpReadBaselineMatcher(requiredScope: string, grantedScopes: ReadonlySet<string>) {
+/**
+ * Read-baseline scope matcher (mcp:write implies mcp:read). Exported for the
+ * scope-predicate tests; production consumes it directly at the
+ * `isScopeSatisfied` seam below.
+ */
+export function mcpReadBaselineMatcher(requiredScope: string, grantedScopes: ReadonlySet<string>) {
   return mcpScopesAllow([...grantedScopes], requiredScope === "mcp:read" ? "read" : "write");
 }
 
@@ -838,6 +843,3 @@ async function handleVerifiedRequest({
 
   return options.transport.fetch(request, { authInfo });
 }
-
-/** Exposed for tests: the endpoint scope predicate (read baseline semantics). */
-export const MCP_ENDPOINT_SCOPE_PREDICATE = mcpReadBaselineMatcher;

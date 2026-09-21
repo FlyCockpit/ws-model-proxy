@@ -12,10 +12,6 @@ import {
 } from "./mcp-oauth-route-match.js";
 import { createRateLimiterMiddleware } from "./rate-limit.js";
 
-// Shared raw method+path boundary (L18): re-exported for existing tests and
-// any future consumer; the single source of truth is mcp-oauth-route-match.
-export { isMcpOauthRateLimited, MCP_OAUTH_RATE_LIMITED_ROUTES } from "./mcp-oauth-route-match.js";
-
 /**
  * MCP OAuth endpoint rate limits (MCP plan Phase 3).
  *

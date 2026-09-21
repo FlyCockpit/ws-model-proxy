@@ -89,37 +89,6 @@ export function mcpUnauthorizedResponse({
 }
 
 /**
- * 403 insufficient_scope challenge (a token valid for the read baseline but
- * not for a write action — Phase 5 tool dispatch; exported now so the
- * challenge contract is pinned by tests).
- */
-export function mcpInsufficientScopeResponse({
-  requiredScopes,
-  resourceUrl,
-  description,
-}: {
-  requiredScopes: readonly string[];
-  resourceUrl: string;
-  description: string;
-}): Response {
-  const safeDescription = description.slice(0, MAX_DESCRIPTION_LENGTH);
-  const scopes = [...new Set(requiredScopes)].join(" ");
-  const challenge = [
-    'error="insufficient_scope"',
-    `scope="${quoteAuthParam(scopes)}"`,
-    `resource_metadata="${quoteAuthParam(mcpResourceMetadataUrl(resourceUrl))}"`,
-    `error_description="${quoteAuthParam(safeDescription)}"`,
-  ].join(", ");
-  return new Response(authorizationErrorBody("Forbidden"), {
-    status: 403,
-    headers: {
-      "Content-Type": "application/json",
-      "WWW-Authenticate": `Bearer ${challenge}`,
-    },
-  });
-}
-
-/**
  * 403 NON-fixable denial (revoked/tombstoned/mismatched grant, banned
  * user, forced-2FA not satisfied). NO WWW-Authenticate header and a generic
  * body: the denial reason is deliberately not disclosed (ownership-hiding

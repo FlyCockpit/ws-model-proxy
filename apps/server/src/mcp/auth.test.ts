@@ -109,11 +109,11 @@ import { createMcpAdmissionGate } from "./admission";
 import {
   createMcpRequestHandler,
   extractPresentedCredential,
-  MCP_ENDPOINT_SCOPE_PREDICATE,
   type McpAuthPrisma,
   type McpQuotaResult,
   type McpTransport,
   type McpVerifiedRequest,
+  mcpReadBaselineMatcher,
 } from "./auth";
 import { MCP_SYNTHETIC_SESSION_TOKEN, type McpSessionUser } from "./context";
 import { createMcpTransport } from "./handler";
@@ -271,13 +271,13 @@ describe("createMcpRequestHandler — upstream wrapper wiring", () => {
     const write = new Set(["mcp:write"]);
     const both = new Set(["mcp:read", "mcp:write"]);
     const neither = new Set(["offline_access"]);
-    expect(MCP_ENDPOINT_SCOPE_PREDICATE("mcp:read", read)).toBe(true);
-    expect(MCP_ENDPOINT_SCOPE_PREDICATE("mcp:read", write)).toBe(true);
-    expect(MCP_ENDPOINT_SCOPE_PREDICATE("mcp:read", both)).toBe(true);
-    expect(MCP_ENDPOINT_SCOPE_PREDICATE("mcp:read", neither)).toBe(false);
-    expect(MCP_ENDPOINT_SCOPE_PREDICATE("mcp:write", write)).toBe(true);
-    expect(MCP_ENDPOINT_SCOPE_PREDICATE("mcp:write", read)).toBe(false);
-    expect(MCP_ENDPOINT_SCOPE_PREDICATE("mcp:write", both)).toBe(true);
+    expect(mcpReadBaselineMatcher("mcp:read", read)).toBe(true);
+    expect(mcpReadBaselineMatcher("mcp:read", write)).toBe(true);
+    expect(mcpReadBaselineMatcher("mcp:read", both)).toBe(true);
+    expect(mcpReadBaselineMatcher("mcp:read", neither)).toBe(false);
+    expect(mcpReadBaselineMatcher("mcp:write", write)).toBe(true);
+    expect(mcpReadBaselineMatcher("mcp:write", read)).toBe(false);
+    expect(mcpReadBaselineMatcher("mcp:write", both)).toBe(true);
   });
 });
 

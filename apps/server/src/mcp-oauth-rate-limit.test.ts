@@ -55,7 +55,6 @@ vi.mock("@hono/node-server/conninfo", () => ({ getConnInfo: mockGetConnInfo }));
 
 import { resolveMcpPlugins } from "../../../packages/auth/src/mcp-plugins";
 import {
-  isMcpOauthRateLimited,
   MCP_OAUTH_AUTHORIZE_MAX_BODY_BYTES,
   MCP_OAUTH_CONSENT_MAX_BODY_BYTES,
   MCP_OAUTH_TOKEN_MAX_BODY_BYTES,
@@ -64,7 +63,7 @@ import {
   mcpOauthIpKey,
   mcpOauthRateLimits,
 } from "./mcp-oauth-rate-limit";
-import { isMcpOauthRawPath } from "./mcp-oauth-route-match";
+import { isMcpOauthRateLimited, isMcpOauthRawPath } from "./mcp-oauth-route-match";
 
 const BASE = "https://proxy.example.com";
 

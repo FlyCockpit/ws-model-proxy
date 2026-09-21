@@ -3,8 +3,6 @@ import { Hono } from "hono";
 import { runPoolMemberTest } from "./diagnostics.js";
 import type { ModelApiConcurrencyLimiter } from "./limits.js";
 
-export { isSuccessfulChatProbeReply } from "./diagnostics.js";
-
 type Variables = { session: Session | null };
 
 export type PoolMemberTestDependencies = {

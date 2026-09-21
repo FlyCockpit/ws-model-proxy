@@ -17,9 +17,8 @@ vi.mock("@ws-model-proxy/env/server", () => ({
   env: { BETTER_AUTH_SECRET: "test-better-auth-secret-value-32chars!" },
 }));
 
-const { createPoolMemberTestRoutes, isSuccessfulChatProbeReply } = await import(
-  "./pool-member-test.js"
-);
+const { createPoolMemberTestRoutes } = await import("./pool-member-test.js");
+const { isSuccessfulChatProbeReply } = await import("./diagnostics.js");
 const { ModelApiConcurrencyLimiter } = await import("./limits.js");
 const { default: prisma } = await import("@ws-model-proxy/db");
 
