@@ -10,7 +10,7 @@ import {
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Context } from "../context";
-import { forwarderManagementRouter } from "./forwarder-management";
+import { assertPoolSlugAvailable, forwarderManagementRouter } from "./forwarder-management";
 
 const testEnv = vi.hoisted(() => ({
   WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
@@ -390,7 +390,10 @@ describe("forwarderManagementRouter", () => {
           memberOverrides: [],
         },
       }),
-    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "LOSSY_COLLAPSE_REQUIRES_ADAPTATION" },
+    });
     expect(db.modelPool.findUnique).not.toHaveBeenCalled();
   });
 
@@ -433,6 +436,79 @@ describe("forwarderManagementRouter", () => {
           capacityContextCeiling: null,
           capacityContextMargin: null,
         }),
+      }),
+    );
+  });
+
+  it("defaults cache-affinity routing on for new guarded pools while honoring an explicit opt-out", async () => {
+    db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(poolRow());
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel()]);
+    db.executionTarget.findMany.mockResolvedValue([
+      {
+        id: "existing-target",
+        discoveredModelId: "local-id",
+        inferenceCapacityId: "shared-capacity",
+        InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: null },
+      },
+    ]);
+    db.providerModel.findMany.mockResolvedValue([]);
+    db.modelPool.create.mockResolvedValue({ id: "pool-id" });
+    db.poolMember.create.mockResolvedValue({ id: "member-id" });
+
+    const base = {
+      slug: "affinity-default",
+      name: "Affinity default",
+      localModelIds: ["local-id"],
+      recommendedSurface: "OPENAI_RESPONSES" as const,
+      memberConcurrencyLimit: 1,
+      reservedSlots: 0,
+      localWaitBudgetMs: 30_000,
+      providerModels: [],
+      publicEgressAcknowledged: false,
+    };
+
+    // `advanced` omitted entirely: affinity defaults ON with standard fallbacks.
+    await client().createGuardedModelPool(base);
+    expect(db.modelPool.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          affinityEnabled: true,
+          affinityTtlSeconds: 3600,
+          affinityMaxRecords: 10_000,
+          affinityPrefixWeight: 100,
+          affinityConversationWeight: 150,
+          affinityConfirmedCacheWeight: 250,
+          affinityLoadPenaltyWeight: 100,
+        }),
+      }),
+    );
+
+    // Explicit opt-out through the full advanced envelope persists false.
+    db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(poolRow());
+    await client().createGuardedModelPool({
+      ...base,
+      slug: "affinity-opt-out",
+      advanced: {
+        physicalCountStrategy: "CONSERVATIVE_ESTIMATE",
+        contextMargin: 0,
+        borrowPolicy: "WHEN_IDLE",
+        protocolAdaptationEnabled: false,
+        allowLossyDeveloperRoleCollapse: false,
+        affinity: {
+          enabled: false,
+          ttlSeconds: 3_600,
+          maxRecords: 10_000,
+          prefixWeight: 100,
+          conversationWeight: 150,
+          confirmedCacheWeight: 250,
+          loadPenaltyWeight: 100,
+        },
+        memberOverrides: [],
+      },
+    });
+    expect(db.modelPool.create).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ affinityEnabled: false }),
       }),
     );
   });
@@ -883,10 +959,362 @@ describe("forwarderManagementRouter", () => {
     expect(db.modelPool.create).not.toHaveBeenCalled();
   });
 
+  const guardedCreateBase = {
+    slug: "guarded-reasons",
+    name: "Guarded reasons",
+    localModelIds: ["local-id"],
+    recommendedSurface: "OPENAI_RESPONSES" as const,
+    memberConcurrencyLimit: 1,
+    memberContextCeiling: null,
+    reservedSlots: 0,
+    localWaitBudgetMs: 30_000,
+    publicEgressAcknowledged: false,
+    providerModels: [] as Array<Record<string, unknown>>,
+  };
+
+  it("reports the egress-gate failure reason for guarded pool create", async () => {
+    testEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = false;
+
+    await expect(
+      client().createGuardedModelPool({
+        ...guardedCreateBase,
+        publicEgressAcknowledged: true,
+        providerModels: [
+          { providerModelId: "provider-id", concurrencyLimit: 1, dailySpendLimit: "10.00" },
+        ],
+      }),
+    ).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      data: { reason: "PROVIDER_EGRESS_DISABLED" },
+    });
+  });
+
+  it("reports the slug-taken failure reason for guarded pool create", async () => {
+    db.modelPool.findUnique.mockResolvedValue(poolRow());
+
+    await expect(client().createGuardedModelPool(guardedCreateBase)).rejects.toMatchObject({
+      code: "CONFLICT",
+      data: { reason: "SLUG_TAKEN" },
+    });
+  });
+
+  it("reports the provider-not-ready failure reason for guarded pool create", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel()]);
+    db.providerModel.findMany.mockResolvedValue([]);
+
+    await expect(
+      client().createGuardedModelPool({
+        ...guardedCreateBase,
+        publicEgressAcknowledged: true,
+        providerModels: [
+          { providerModelId: "provider-id", concurrencyLimit: 1, dailySpendLimit: "10.00" },
+        ],
+      }),
+    ).rejects.toMatchObject({
+      code: "PRECONDITION_FAILED",
+      data: { reason: "PROVIDER_NOT_READY" },
+    });
+  });
+
+  it("reports the surface-mismatch failure reason for guarded pool create", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel({}, "chat")]);
+
+    await expect(client().createGuardedModelPool(guardedCreateBase)).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "SURFACE_NOT_SUPPORTED" },
+    });
+  });
+
+  it("reports the local-capacity-required failure reason for guarded pool create", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel()]);
+    db.executionTarget.findMany.mockResolvedValue([
+      {
+        id: "existing-target",
+        discoveredModelId: "local-id",
+        inferenceCapacityId: null,
+        InferenceCapacity: null,
+      },
+    ]);
+
+    await expect(client().createGuardedModelPool(guardedCreateBase)).rejects.toMatchObject({
+      code: "PRECONDITION_FAILED",
+      data: { reason: "LOCAL_CAPACITY_REQUIRED" },
+    });
+  });
+
+  it("reports the concurrency-physical failure reason for guarded pool create", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel()]);
+    db.executionTarget.findMany.mockResolvedValue([
+      {
+        id: "existing-target",
+        discoveredModelId: "local-id",
+        inferenceCapacityId: "capacity-id",
+        InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: 2 },
+      },
+    ]);
+
+    await expect(
+      client().createGuardedModelPool({ ...guardedCreateBase, memberConcurrencyLimit: 3 }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "CONCURRENCY_EXCEEDS_PHYSICAL" },
+    });
+  });
+
+  const guardedAdvancedBase = (overrides: Record<string, unknown> = {}) => ({
+    physicalCountStrategy: "CONSERVATIVE_ESTIMATE",
+    contextMargin: 0,
+    borrowPolicy: "WHEN_IDLE",
+    protocolAdaptationEnabled: false,
+    allowLossyDeveloperRoleCollapse: false,
+    affinity: {
+      enabled: false,
+      ttlSeconds: 3_600,
+      maxRecords: 10_000,
+      prefixWeight: 100,
+      conversationWeight: 150,
+      confirmedCacheWeight: 250,
+      loadPenaltyWeight: 100,
+    },
+    memberOverrides: [] as Array<Record<string, unknown>>,
+    ...overrides,
+  });
+
+  const guardedMemberOverride = (overrides: Record<string, unknown> = {}) => ({
+    discoveredModelId: "local-id",
+    concurrency: { mode: "LIMITED", limitValue: 1 },
+    reservedSlots: 0,
+    borrowPolicy: "WHEN_IDLE",
+    waitBudget: { mode: "LIMITED", limitValue: 30_000 },
+    contextCeiling: { mode: "INHERIT", limitValue: null },
+    contextMargin: 0,
+    ...overrides,
+  });
+
+  const guardedLocalTarget = (
+    capacity: { physicalMaxContext?: number; hardConcurrencyLimit?: number } = {},
+  ) => ({
+    id: "existing-target",
+    discoveredModelId: "local-id",
+    inferenceCapacityId: "capacity-id",
+    InferenceCapacity: {
+      physicalMaxContext: capacity.physicalMaxContext ?? 65_536,
+      hardConcurrencyLimit: capacity.hardConcurrencyLimit ?? 2,
+    },
+  });
+
+  function mockGuardedLocalSetup(capacity?: {
+    physicalMaxContext?: number;
+    hardConcurrencyLimit?: number;
+  }) {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel()]);
+    db.executionTarget.findMany.mockResolvedValue([guardedLocalTarget(capacity)]);
+  }
+
+  it("reports the pool-policy-invalid failure reason for guarded pool create", async () => {
+    await expect(
+      client().createGuardedModelPool({
+        ...guardedCreateBase,
+        memberContextCeiling: 8_192,
+        advanced: guardedAdvancedBase({ contextMargin: 8_192 }),
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "POOL_POLICY_INVALID" },
+    });
+    expect(db.modelPool.findUnique).not.toHaveBeenCalled();
+  });
+
+  it("rejects guarded create slugs at input validation before the slug helper", async () => {
+    // The SLUG_INVALID reason branch in assertPoolSlugAvailable is defensively
+    // unreachable through the typed contract: poolSlugSchema runs the same
+    // validateForwarderPoolSlug check during input parsing, so an invalid slug
+    // must fail before the handler runs. Pin that structural bound: the
+    // rejection carries the oRPC input-parse envelope (zod issues on slug),
+    // not the handler's SLUG_INVALID reason envelope.
+    let inputError: ORPCError | undefined;
+    await client()
+      .createGuardedModelPool({ ...guardedCreateBase, slug: "Invalid Slug!" })
+      .catch((error: ORPCError) => {
+        inputError = error;
+      });
+    expect(inputError).toBeInstanceOf(ORPCError);
+    expect(inputError?.code).toBe("BAD_REQUEST");
+    expect(inputError?.message).toBe("Input validation failed");
+    const data = inputError?.data as
+      | { issues?: Array<{ message?: string; path?: string[] }>; reason?: unknown }
+      | undefined;
+    expect(data?.issues).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ message: "forwarderSlug.format", path: ["slug"] }),
+      ]),
+    );
+    expect(data?.reason).toBeUndefined();
+    expect(db.modelPool.findUnique).not.toHaveBeenCalled();
+  });
+
+  it("reports the local-model-unavailable failure reason for guarded pool create", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([]);
+
+    await expect(client().createGuardedModelPool(guardedCreateBase)).rejects.toMatchObject({
+      code: "NOT_FOUND",
+      data: { reason: "LOCAL_MODEL_UNAVAILABLE" },
+    });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
+  it("reports the member-override-mismatch failure reason for guarded pool create", async () => {
+    mockGuardedLocalSetup();
+
+    await expect(
+      client().createGuardedModelPool({
+        ...guardedCreateBase,
+        advanced: guardedAdvancedBase({
+          memberOverrides: [guardedMemberOverride({ discoveredModelId: "other-model" })],
+        }),
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "MEMBER_OVERRIDE_MISMATCH" },
+    });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
+  it("reports the reserved-exceeds-concurrency failure reason for guarded pool create", async () => {
+    mockGuardedLocalSetup({ hardConcurrencyLimit: 20 });
+
+    await expect(
+      client().createGuardedModelPool({
+        ...guardedCreateBase,
+        memberConcurrencyLimit: 10,
+        advanced: guardedAdvancedBase({
+          memberOverrides: [
+            guardedMemberOverride({
+              concurrency: { mode: "LIMITED", limitValue: 2 },
+              reservedSlots: 3,
+            }),
+          ],
+        }),
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "RESERVED_EXCEEDS_CONCURRENCY" },
+    });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
+  it("reports the reserved-exceeds-physical failure reason for guarded pool create", async () => {
+    mockGuardedLocalSetup({ hardConcurrencyLimit: 2 });
+
+    await expect(
+      client().createGuardedModelPool({
+        ...guardedCreateBase,
+        advanced: guardedAdvancedBase({
+          memberOverrides: [
+            guardedMemberOverride({
+              concurrency: { mode: "UNLIMITED", limitValue: null },
+              reservedSlots: 3,
+            }),
+          ],
+        }),
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "RESERVED_EXCEEDS_PHYSICAL" },
+    });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
+  it("reports the context-exceeds-physical failure reason for guarded pool create", async () => {
+    mockGuardedLocalSetup({ physicalMaxContext: 65_536 });
+
+    await expect(
+      client().createGuardedModelPool({ ...guardedCreateBase, memberContextCeiling: 70_000 }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "CONTEXT_EXCEEDS_PHYSICAL" },
+    });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
+  it("reports the context-margin-exceeds-ceiling failure reason for guarded pool create", async () => {
+    mockGuardedLocalSetup({ physicalMaxContext: 65_536, hardConcurrencyLimit: 2 });
+
+    await expect(
+      client().createGuardedModelPool({
+        ...guardedCreateBase,
+        advanced: guardedAdvancedBase({
+          memberOverrides: [
+            guardedMemberOverride({
+              contextCeiling: { mode: "LIMITED", limitValue: 100 },
+              contextMargin: 100,
+            }),
+          ],
+        }),
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "CONTEXT_MARGIN_EXCEEDS_CEILING" },
+    });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
+  it("reports the provider-context-exceeded failure reason for guarded pool create", async () => {
+    mockGuardedLocalSetup({ physicalMaxContext: 65_536, hardConcurrencyLimit: 2 });
+    db.providerModel.findMany.mockResolvedValue([
+      {
+        id: "provider-primary",
+        providerAccountId: "account-primary",
+        upstreamModelId: "provider-upstream",
+        contextWindow: 8_192,
+        concurrencyLimit: 4,
+        nativeCapabilities: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiResponses: {
+              source: "provider",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+            },
+          },
+        },
+        PricingVersions: [{ id: "price-primary", currency: "USD" }],
+      },
+    ]);
+
+    await expect(
+      client().createGuardedModelPool({
+        ...guardedCreateBase,
+        memberContextCeiling: 16_384,
+        publicEgressAcknowledged: true,
+        providerModels: [
+          {
+            providerModelId: "provider-primary",
+            tier: "PRIMARY",
+            concurrencyLimit: 1,
+            dailySpendLimit: "10.00",
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "PROVIDER_CONTEXT_EXCEEDED" },
+    });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
   it.each([
-    ["OPENAI_RESPONSES", "adapted recommendation when a native primary API exists"],
-    ["OPENAI_COMPLETIONS", "unavailable primary recommendation"],
-  ] as const)("rejects %s as an %s", async (recommendedSurface) => {
+    ["OPENAI_RESPONSES", "a surface a chat-native primary cannot serve without adaptation"],
+    ["OPENAI_COMPLETIONS", "a surface no primary can ever serve"],
+  ] as const)("rejects %s as %s", async (recommendedSurface) => {
     db.modelPool.findUnique.mockResolvedValue(null);
     db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel({}, "chat")]);
 
@@ -903,8 +1331,235 @@ describe("forwarderManagementRouter", () => {
         publicEgressAcknowledged: false,
         providerModels: [],
       }),
-    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "SURFACE_NOT_SUPPORTED" },
+    });
     expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
+  it("accepts a valid-but-not-top-ranked recommended API across mixed primary members", async () => {
+    db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(poolRow());
+    db.discoveredModel.findMany.mockResolvedValue([
+      guardedLocalModel(),
+      guardedLocalModel({ id: "local-id-2", upstreamModelId: "local-model-2" }, "chat"),
+    ]);
+    db.executionTarget.findMany.mockResolvedValue([
+      {
+        id: "target-1",
+        discoveredModelId: "local-id",
+        inferenceCapacityId: "capacity-1",
+        InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: null },
+      },
+      {
+        id: "target-2",
+        discoveredModelId: "local-id-2",
+        inferenceCapacityId: "capacity-2",
+        InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: null },
+      },
+    ]);
+    db.providerModel.findMany.mockResolvedValue([]);
+    db.modelPool.create.mockResolvedValue({ id: "pool-id" });
+    db.poolMember.create.mockResolvedValue({ id: "member-id" });
+
+    // The mixed responses/chat primary set ranks OPENAI_RESPONSES first, but
+    // every member can serve OPENAI_CHAT_COMPLETIONS (natively or adapted),
+    // so the operator's non-top-ranked choice must be accepted and stored.
+    await client().createGuardedModelPool({
+      slug: "guarded-ranked-choice",
+      name: "Guarded ranked choice",
+      localModelIds: ["local-id", "local-id-2"],
+      recommendedSurface: "OPENAI_CHAT_COMPLETIONS",
+      memberConcurrencyLimit: 1,
+      memberContextCeiling: null,
+      reservedSlots: 0,
+      localWaitBudgetMs: 30_000,
+      publicEgressAcknowledged: false,
+      providerModels: [],
+      advanced: guardedAdvancedBase({ protocolAdaptationEnabled: true }),
+    });
+
+    expect(db.modelPool.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ recommendedSurfaceOverride: "OPENAI_CHAT_COMPLETIONS" }),
+      }),
+    );
+  });
+
+  it("rejects the recommended API when a primary member cannot serve it natively or via adaptation", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([
+      guardedLocalModel(),
+      guardedLocalModel({ id: "local-id-2", upstreamModelId: "local-model-2" }, "chat"),
+    ]);
+
+    // Without adaptation the chat-native member cannot serve OPENAI_RESPONSES.
+    await expect(
+      client().createGuardedModelPool({
+        ...guardedCreateBase,
+        slug: "guarded-unservable",
+        name: "Guarded unservable",
+        localModelIds: ["local-id", "local-id-2"],
+        recommendedSurface: "OPENAI_RESPONSES",
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "SURFACE_NOT_SUPPORTED" },
+    });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
+  it("ignores the pool adaptation flag when the deployment adaptation gate is disabled", async () => {
+    // The pool opts into adaptation, but the deployment gate is off: an
+    // adapted-only surface for the selection must still be rejected, while a
+    // natively-served surface stays acceptable under the same env.
+    testEnv.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = false;
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel({}, "chat")]);
+
+    await expect(
+      client().createGuardedModelPool({
+        ...guardedCreateBase,
+        advanced: guardedAdvancedBase({ protocolAdaptationEnabled: true }),
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "SURFACE_NOT_SUPPORTED" },
+    });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+  });
+
+  it("accepts a natively-served recommended API while the deployment adaptation gate is disabled", async () => {
+    testEnv.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = false;
+    db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(poolRow());
+    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel({}, "chat")]);
+    db.executionTarget.findMany.mockResolvedValue([guardedLocalTarget()]);
+    db.providerModel.findMany.mockResolvedValue([]);
+    db.modelPool.create.mockResolvedValue({ id: "pool-id" });
+    db.poolMember.create.mockResolvedValue({ id: "member-id" });
+
+    // The chat-native member serves OPENAI_CHAT_COMPLETIONS natively, so the
+    // disabled adaptation gate must not block the create even though the pool
+    // payload carries protocolAdaptationEnabled: true.
+    await expect(
+      client().createGuardedModelPool({
+        ...guardedCreateBase,
+        recommendedSurface: "OPENAI_CHAT_COMPLETIONS",
+        advanced: guardedAdvancedBase({ protocolAdaptationEnabled: true }),
+      }),
+    ).resolves.toBeDefined();
+    expect(db.modelPool.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ recommendedSurfaceOverride: "OPENAI_CHAT_COMPLETIONS" }),
+      }),
+    );
+  });
+
+  it("rejects the recommended API when a PRIMARY provider cannot serve it natively or via adaptation", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.discoveredModel.findMany.mockResolvedValue([]);
+    db.providerModel.findMany.mockResolvedValue([
+      {
+        id: "provider-primary",
+        providerAccountId: "account-primary",
+        upstreamModelId: "provider-upstream",
+        contextWindow: 65_536,
+        concurrencyLimit: 4,
+        nativeCapabilities: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiChatCompletions: {
+              source: "provider",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+            },
+          },
+        },
+        PricingVersions: [{ id: "price-primary", currency: "USD" }],
+      },
+    ]);
+
+    // The chat-native PRIMARY provider cannot serve OPENAI_RESPONSES without
+    // adaptation; the surface fence must hold for provider members too, not
+    // just locals.
+    await expect(
+      client().createGuardedModelPool({
+        ...guardedCreateBase,
+        slug: "guarded-provider-unservable",
+        name: "Guarded provider unservable",
+        localModelIds: [],
+        publicEgressAcknowledged: true,
+        providerModels: [
+          {
+            providerModelId: "provider-primary",
+            tier: "PRIMARY",
+            concurrencyLimit: 1,
+            dailySpendLimit: "10.00",
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "SURFACE_NOT_SUPPORTED" },
+    });
+    expect(db.modelPool.create).not.toHaveBeenCalled();
+    expect(db.executionTarget.upsert).not.toHaveBeenCalled();
+  });
+
+  it("accepts any recommended API when the pool has no primary members", async () => {
+    db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(poolRow());
+    db.discoveredModel.findMany.mockResolvedValue([]);
+    db.executionTarget.findMany.mockResolvedValue([]);
+    db.providerModel.findMany.mockResolvedValue([
+      {
+        id: "provider-overflow",
+        providerAccountId: "account-id",
+        upstreamModelId: "provider-upstream",
+        contextWindow: 8_192,
+        concurrencyLimit: 4,
+        nativeCapabilities: null,
+        PricingVersions: [{ id: "price-id", currency: "USD" }],
+      },
+    ]);
+    db.executionTarget.upsert.mockResolvedValue({
+      id: "provider-target",
+      providerModelId: "provider-overflow",
+      inferenceCapacityId: null,
+    });
+    db.inferenceCapacity.upsert.mockResolvedValue({ id: "provider-capacity" });
+    db.modelPool.create.mockResolvedValue({ id: "pool-id" });
+    db.poolMember.create.mockResolvedValue({ id: "member-id" });
+    db.providerBudgetPolicy.create.mockResolvedValue({ id: "budget-id" });
+
+    // A PUBLIC_OVERFLOW-only pool has an empty primary matrix: even
+    // OPENAI_COMPLETIONS (never adaptable) is accepted as the override.
+    await client().createGuardedModelPool({
+      slug: "guarded-overflow-only",
+      name: "Guarded overflow only",
+      localModelIds: [],
+      recommendedSurface: "OPENAI_COMPLETIONS",
+      memberConcurrencyLimit: 1,
+      memberContextCeiling: null,
+      reservedSlots: 0,
+      localWaitBudgetMs: 30_000,
+      publicEgressAcknowledged: true,
+      providerModels: [
+        {
+          providerModelId: "provider-overflow",
+          tier: "PUBLIC_OVERFLOW",
+          concurrencyLimit: 1,
+          dailySpendLimit: "10.00",
+        },
+      ],
+    });
+
+    expect(db.modelPool.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ recommendedSurfaceOverride: "OPENAI_COMPLETIONS" }),
+      }),
+    );
   });
 
   it("rolls back guarded setup when a mid-transaction provider budget write fails", async () => {
@@ -1310,6 +1965,39 @@ describe("forwarderManagementRouter", () => {
       }),
     );
     expect(db.poolGrant.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it("defaults cache-affinity routing on for legacy creates while honoring an explicit opt-out", async () => {
+    db.modelPool.findUnique.mockResolvedValue(null);
+    db.modelPool.create.mockResolvedValue(poolRow());
+
+    // Affinity input omitted: defaults ON with the shared fallback tuple.
+    await client().createModelPool({ slug: "affinity-default", name: "Affinity default" });
+    expect(db.modelPool.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          affinityEnabled: true,
+          affinityTtlSeconds: 3600,
+          affinityMaxRecords: 10_000,
+          affinityPrefixWeight: 100,
+          affinityConversationWeight: 150,
+          affinityConfirmedCacheWeight: 250,
+          affinityLoadPenaltyWeight: 100,
+        }),
+      }),
+    );
+
+    // Explicit opt-out persists false.
+    await client().createModelPool({
+      slug: "affinity-opt-out",
+      name: "Affinity opt out",
+      affinityEnabled: false,
+    });
+    expect(db.modelPool.create).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ affinityEnabled: false }),
+      }),
+    );
   });
 
   it("rejects lossy collapse without adaptation and resolves partial updates from the stored pool", async () => {
@@ -1958,6 +2646,72 @@ describe("forwarderManagementRouter", () => {
     expect(db.modelPool.create).not.toHaveBeenCalled();
   });
 
+  it("keeps sibling pool create and update slug errors free of reason data", async () => {
+    // createModelPool and updateModelPool share assertPoolSlugAvailable with
+    // guarded create but omit reasons; their error envelope must stay exactly
+    // as before, with no `data` field attached.
+    let createError: ORPCError | undefined;
+    db.modelPool.findUnique.mockResolvedValueOnce({ id: "other-pool-id" });
+    await client()
+      .createModelPool({ slug: "gpt-4.1-mini", name: "Duplicate" })
+      .catch((error: ORPCError) => {
+        createError = error;
+      });
+    expect(createError).toBeInstanceOf(ORPCError);
+    expect(createError?.code).toBe("CONFLICT");
+    expect(createError?.data).toBeUndefined();
+
+    let updateError: ORPCError | undefined;
+    db.modelPool.findUnique
+      .mockResolvedValueOnce({ id: "pool-id", userId: "user-id" })
+      .mockResolvedValueOnce({ id: "other-pool-id" });
+    await client()
+      .updateModelPool({ id: "pool-id", slug: "gpt-4.1-mini" })
+      .catch((error: ORPCError) => {
+        updateError = error;
+      });
+    expect(updateError).toBeInstanceOf(ORPCError);
+    expect(updateError?.code).toBe("CONFLICT");
+    expect(updateError?.data).toBeUndefined();
+    expect(db.modelPool.update).not.toHaveBeenCalled();
+  });
+
+  it("attaches slug reasons only when the caller opts in", async () => {
+    // SLUG_INVALID is unreachable through createGuardedModelPool (input zod
+    // runs the same slug check first), so the branch is pinned here directly:
+    // opt-in reasons attach data.reason per branch; omitted reasons keep the
+    // pre-reason envelope with no data field at all.
+    const reasons = { invalid: "SLUG_INVALID", taken: "SLUG_TAKEN" } as const;
+
+    await expect(
+      assertPoolSlugAvailable("Invalid Slug!", "user-id", undefined, reasons),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST", data: { reason: "SLUG_INVALID" } });
+    expect(db.modelPool.findUnique).not.toHaveBeenCalled();
+
+    let invalidError: ORPCError | undefined;
+    await assertPoolSlugAvailable("Invalid Slug!", "user-id").catch((error: ORPCError) => {
+      invalidError = error;
+    });
+    expect(invalidError).toBeInstanceOf(ORPCError);
+    expect(invalidError?.code).toBe("BAD_REQUEST");
+    expect(invalidError?.data).toBeUndefined();
+    expect(db.modelPool.findUnique).not.toHaveBeenCalled();
+
+    db.modelPool.findUnique.mockResolvedValueOnce({ id: "other-pool-id" });
+    await expect(
+      assertPoolSlugAvailable("gpt-4.1-mini", "user-id", undefined, reasons),
+    ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "SLUG_TAKEN" } });
+
+    db.modelPool.findUnique.mockResolvedValueOnce({ id: "other-pool-id" });
+    let takenError: ORPCError | undefined;
+    await assertPoolSlugAvailable("gpt-4.1-mini", "user-id").catch((error: ORPCError) => {
+      takenError = error;
+    });
+    expect(takenError).toBeInstanceOf(ORPCError);
+    expect(takenError?.code).toBe("CONFLICT");
+    expect(takenError?.data).toBeUndefined();
+  });
+
   it("keeps direct model id parsing and non-pool slugs strict", () => {
     expect(validateForwarderSlug("gpt-4.1-mini").ok).toBe(false);
     expect(validateForwarderSlug("openai/gpt-4.1").ok).toBe(false);
@@ -2470,6 +3224,9 @@ describe("forwarderManagementRouter", () => {
     db.providerAuditEvent.findFirst.mockResolvedValue({ id: "audit" });
     db.executionTarget.upsert.mockResolvedValue({ id: "provider-target" });
     db.poolMember.create.mockResolvedValue({ id: "primary-provider-member" });
+    // The PRIMARY surface fence reads the existing members; the pool has none,
+    // so the attachment stays valid and no overflow reorder write happens.
+    db.poolMember.findMany.mockResolvedValue([]);
 
     await expect(
       client().addProviderPoolMember({
@@ -2492,7 +3249,7 @@ describe("forwarderManagementRouter", () => {
       },
       select: { id: true },
     });
-    expect(db.poolMember.findMany).not.toHaveBeenCalled();
+    expect(db.poolMember.update).not.toHaveBeenCalled();
   });
 
   it("makes missing and cross-owner nested pool-member ids indistinguishable", async () => {
@@ -2918,5 +3675,855 @@ describe("forwarderManagementRouter", () => {
     });
     expect(db.cacheAffinityRecord.count).not.toHaveBeenCalled();
     expect(db.cacheAffinityRecord.deleteMany).not.toHaveBeenCalled();
+  });
+
+  describe("update-path recommended-surface revalidation", () => {
+    const chatNativeCapabilities = {
+      version: 3,
+      protocol: "openai-compatible",
+      surfaces: {
+        openaiChatCompletions: {
+          source: "provider",
+          confidence: "exact",
+          supported: true,
+          streaming: true,
+        },
+      },
+    };
+    const responsesNativeCapabilities = {
+      version: 3,
+      protocol: "openai-compatible",
+      surfaces: {
+        openaiResponses: {
+          source: "provider",
+          confidence: "exact",
+          supported: true,
+          streaming: true,
+        },
+      },
+    };
+
+    function surfaceMemberRow(
+      id: string,
+      native: "chat" | "responses",
+      tier: "PRIMARY" | "PUBLIC_OVERFLOW" = "PRIMARY",
+    ) {
+      return {
+        id,
+        tier,
+        discoveredModelId: null,
+        DiscoveredModel: null,
+        ExecutionTarget: {
+          DiscoveredModel: guardedLocalModel({}, native),
+          ProviderModel: null,
+        },
+      };
+    }
+
+    function surfacePoolRow(overrides: Record<string, unknown> = {}) {
+      return poolRow({
+        userId: "user-id",
+        recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        protocolAdaptationEnabled: false,
+        ...overrides,
+      });
+    }
+
+    it("keeps unrelated updates non-retroactive on a legacy-invalid stored override", async () => {
+      const stored = surfacePoolRow();
+      db.modelPool.findUnique.mockResolvedValue(stored);
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "chat")]);
+      db.modelPool.update.mockResolvedValue(surfacePoolRow({ name: "Renamed" }));
+
+      // The stored override is already unservable, but a rename touches no
+      // selectability input and must keep succeeding.
+      await expect(
+        client().updateModelPool({ id: "pool-id", name: "Renamed" }),
+      ).resolves.toMatchObject({ id: "pool-id" });
+      expect(db.modelPool.update).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects re-setting an unservable override with the create-path envelope", async () => {
+      db.modelPool.findUnique.mockResolvedValue(surfacePoolRow());
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "chat")]);
+
+      await expect(
+        client().updateModelPool({ id: "pool-id", recommendedSurfaceOverride: "OPENAI_RESPONSES" }),
+      ).rejects.toMatchObject({
+        code: "BAD_REQUEST",
+        message:
+          "Every selected primary member must serve the recommended API natively or via protocol adaptation.",
+        data: { reason: "SURFACE_NOT_SUPPORTED" },
+      });
+      expect(db.modelPool.update).not.toHaveBeenCalled();
+    });
+
+    it("accepts an input-touching update when the post-state serves the override", async () => {
+      db.modelPool.findUnique.mockResolvedValue(surfacePoolRow());
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "responses")]);
+      db.modelPool.update.mockResolvedValue(surfacePoolRow());
+
+      await expect(
+        client().updateModelPool({
+          id: "pool-id",
+          recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        }),
+      ).resolves.toMatchObject({ id: "pool-id" });
+      expect(db.modelPool.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ recommendedSurfaceOverride: "OPENAI_RESPONSES" }),
+        }),
+      );
+    });
+
+    it("repairs a stored unservable override with a servable input override", async () => {
+      // Stored state is invalid (responses override, chat-only primary). The
+      // update sends a servable chat override: the gate must validate the
+      // INPUT override, not the stored one, so the repair succeeds and
+      // persists the new value.
+      db.modelPool.findUnique.mockResolvedValue(surfacePoolRow());
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "chat")]);
+      db.modelPool.update.mockResolvedValue(
+        surfacePoolRow({ recommendedSurfaceOverride: "OPENAI_CHAT_COMPLETIONS" }),
+      );
+
+      await expect(
+        client().updateModelPool({
+          id: "pool-id",
+          recommendedSurfaceOverride: "OPENAI_CHAT_COMPLETIONS",
+        }),
+      ).resolves.toMatchObject({ id: "pool-id" });
+      expect(db.modelPool.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ recommendedSurfaceOverride: "OPENAI_CHAT_COMPLETIONS" }),
+        }),
+      );
+    });
+
+    it("resolves legacy provider inventories identically across the gate and the dashboard display", async () => {
+      const legacyProviderNative = { surfaces: ["openai-chat"], streaming: true };
+      const legacyProviderSurfaceRow = {
+        id: "provider-member",
+        tier: "PRIMARY",
+        discoveredModelId: null,
+        DiscoveredModel: null,
+        ExecutionTarget: {
+          DiscoveredModel: null,
+          ProviderModel: { nativeCapabilities: legacyProviderNative },
+        },
+      };
+
+      // Gated update path: the loader resolves the legacy inventory through
+      // the shared provider-capability path, so the chat override (which
+      // serializePool renders as natively available) must be accepted.
+      db.modelPool.findUnique.mockResolvedValue(surfacePoolRow());
+      db.poolMember.findMany.mockResolvedValue([legacyProviderSurfaceRow]);
+      db.modelPool.update.mockResolvedValue(
+        surfacePoolRow({ recommendedSurfaceOverride: "OPENAI_CHAT_COMPLETIONS" }),
+      );
+      await expect(
+        client().updateModelPool({
+          id: "pool-id",
+          recommendedSurfaceOverride: "OPENAI_CHAT_COMPLETIONS",
+        }),
+      ).resolves.toMatchObject({ id: "pool-id" });
+      expect(db.modelPool.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ recommendedSurfaceOverride: "OPENAI_CHAT_COMPLETIONS" }),
+        }),
+      );
+
+      // Dashboard display: the same legacy inventory serializes as a
+      // chat-native provider member, consistent with the accepted gate.
+      db.modelPool.findMany.mockResolvedValue([
+        poolRow({
+          recommendedSurfaceOverride: "OPENAI_CHAT_COMPLETIONS",
+          PoolMembers: [
+            {
+              id: "provider-member",
+              createdAt: new Date("2026-01-01"),
+              updatedAt: new Date("2026-01-01"),
+              discoveredModelId: null,
+              tier: "PRIMARY",
+              publicOrder: null,
+              weight: 1,
+              healthStatus: "HEALTHY",
+              routingStatus: "ACTIVE",
+              lastFailureClass: null,
+              consecutiveRetryableFailures: 0,
+              lastFailureAt: null,
+              nextRetryAt: null,
+              halfOpenTrialStartedAt: null,
+              ExecutionTarget: {
+                id: "provider-target",
+                kind: "PROVIDER_MODEL",
+                inferenceCapacityId: "provider-capacity",
+                DiscoveredModel: null,
+                ProviderModel: {
+                  id: "provider-model",
+                  upstreamModelId: "provider/model",
+                  displayName: "Provider Model",
+                  nativeCapabilities: legacyProviderNative,
+                  contextWindow: 65_536,
+                  concurrencyLimit: 4,
+                  healthStatus: "HEALTHY",
+                  enabled: true,
+                  PricingVersions: [],
+                  ProviderAccount: {
+                    id: "provider-account",
+                    label: "Account",
+                    providerType: "OPENAI",
+                    enabled: true,
+                  },
+                },
+              },
+              DiscoveredModel: null,
+            },
+          ],
+        }),
+      ]);
+      const [pool] = await client().listModelPools();
+      expect(pool?.compatibility.surfaces.OPENAI_CHAT_COMPLETIONS).toMatchObject({
+        native: 1,
+        unavailable: 0,
+      });
+      expect(pool?.members[0]?.providerModel?.surfaces.OPENAI_CHAT_COMPLETIONS).toMatchObject({
+        mode: "native",
+        streaming: true,
+      });
+      expect(pool?.compatibility.recommendedSurface).toBe("OPENAI_CHAT_COMPLETIONS");
+    });
+
+    it("rejects disabling adaptation when the override only stays servable through it", async () => {
+      // Stored state is valid: adaptation on lets the chat-native member serve
+      // the responses override. Turning the flag off strands the surface.
+      db.modelPool.findUnique.mockResolvedValue(
+        surfacePoolRow({ protocolAdaptationEnabled: true }),
+      );
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "chat")]);
+
+      await expect(
+        client().updateModelPool({ id: "pool-id", protocolAdaptationEnabled: false }),
+      ).rejects.toMatchObject({
+        code: "BAD_REQUEST",
+        data: { reason: "SURFACE_NOT_SUPPORTED" },
+      });
+      expect(db.modelPool.update).not.toHaveBeenCalled();
+
+      // Keeping adaptation on touches the same input but leaves a servable
+      // post-state, so it must succeed.
+      db.modelPool.update.mockResolvedValue(surfacePoolRow({ protocolAdaptationEnabled: true }));
+      await expect(
+        client().updateModelPool({ id: "pool-id", protocolAdaptationEnabled: true }),
+      ).resolves.toMatchObject({ id: "pool-id" });
+      expect(db.modelPool.update).toHaveBeenCalledTimes(1);
+    });
+
+    it("ignores the pool adaptation flag on update when the deployment gate is disabled", async () => {
+      testEnv.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = false;
+      db.modelPool.findUnique.mockResolvedValue(
+        surfacePoolRow({ protocolAdaptationEnabled: true }),
+      );
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "chat")]);
+
+      // The pool flag stays on, but the deployment gate is off: the
+      // adaptation-only override must still be rejected on revalidation.
+      await expect(
+        client().updateModelPool({ id: "pool-id", recommendedSurfaceOverride: "OPENAI_RESPONSES" }),
+      ).rejects.toMatchObject({
+        code: "BAD_REQUEST",
+        data: { reason: "SURFACE_NOT_SUPPORTED" },
+      });
+      expect(db.modelPool.update).not.toHaveBeenCalled();
+    });
+
+    it("accepts any override on update for a pool with no primary members", async () => {
+      db.modelPool.findUnique.mockResolvedValue(surfacePoolRow());
+      db.poolMember.findMany.mockResolvedValue([
+        surfaceMemberRow("overflow-a", "chat", "PUBLIC_OVERFLOW"),
+      ]);
+      db.modelPool.update.mockResolvedValue(surfacePoolRow());
+
+      await expect(
+        client().updateModelPool({
+          id: "pool-id",
+          recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        }),
+      ).resolves.toMatchObject({ id: "pool-id" });
+      expect(db.modelPool.update).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects attaching a local primary that cannot serve the stored override", async () => {
+      db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+      db.modelPool.findFirst.mockResolvedValue({
+        recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        protocolAdaptationEnabled: false,
+        capacityConcurrencyLimit: null,
+        capacityReservedSlots: 0,
+        capacityContextCeiling: null,
+        capacityContextMargin: 0,
+      });
+      db.discoveredModel.findUnique.mockResolvedValue(
+        guardedLocalModel({ id: "model-id", userId: "user-id" }, "chat"),
+      );
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "responses")]);
+
+      await expect(
+        client().addPoolMember({ poolId: "pool-id", discoveredModelId: "model-id" }),
+      ).rejects.toMatchObject({
+        code: "BAD_REQUEST",
+        data: { reason: "SURFACE_NOT_SUPPORTED" },
+      });
+      expect(db.executionTarget.upsert).not.toHaveBeenCalled();
+      expect(db.poolMember.create).not.toHaveBeenCalled();
+    });
+
+    it("accepts attaching a local primary that serves the stored override", async () => {
+      db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+      db.modelPool.findFirst.mockResolvedValue({
+        recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        protocolAdaptationEnabled: false,
+        capacityConcurrencyLimit: null,
+        capacityReservedSlots: 0,
+        capacityContextCeiling: null,
+        capacityContextMargin: 0,
+      });
+      db.discoveredModel.findUnique.mockResolvedValue(
+        guardedLocalModel({ id: "model-id", userId: "user-id" }, "responses"),
+      );
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "responses")]);
+      db.poolMember.create.mockResolvedValue({ id: "member-id" });
+
+      await expect(
+        client().addPoolMember({ poolId: "pool-id", discoveredModelId: "model-id" }),
+      ).resolves.toMatchObject({ id: "member-id" });
+      expect(db.poolMember.create).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects a provider primary attach that cannot serve the stored override", async () => {
+      db.modelPool.findFirst.mockResolvedValue({
+        id: "pool-id",
+        publicEgressEnabled: false,
+        publicEgressAcknowledged: true,
+        recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        protocolAdaptationEnabled: false,
+        capacityConcurrencyLimit: null,
+        capacityReservedSlots: 0,
+        capacityContextCeiling: null,
+        capacityContextMargin: 0,
+      });
+      db.providerModel.findFirst.mockResolvedValue({
+        id: "provider-model",
+        providerAccountId: "provider-account",
+        contextWindow: 8_192,
+        concurrencyLimit: 4,
+        nativeCapabilities: chatNativeCapabilities,
+        enabled: true,
+      });
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "responses")]);
+
+      await expect(
+        client().addProviderPoolMember({
+          poolId: "pool-id",
+          providerModelId: "provider-model",
+          tier: "PRIMARY",
+        }),
+      ).rejects.toMatchObject({
+        code: "BAD_REQUEST",
+        data: { reason: "SURFACE_NOT_SUPPORTED" },
+      });
+      expect(db.executionTarget.upsert).not.toHaveBeenCalled();
+      expect(db.poolMember.create).not.toHaveBeenCalled();
+    });
+
+    it("skips the surface fence for provider overflow attaches", async () => {
+      db.modelPool.findFirst.mockResolvedValue({
+        id: "pool-id",
+        publicEgressEnabled: true,
+        publicEgressAcknowledged: true,
+        recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        protocolAdaptationEnabled: false,
+        capacityConcurrencyLimit: null,
+        capacityReservedSlots: 0,
+        capacityContextCeiling: null,
+        capacityContextMargin: 0,
+      });
+      db.providerModel.findFirst.mockResolvedValue({
+        id: "provider-model",
+        providerAccountId: "provider-account",
+        contextWindow: 8_192,
+        concurrencyLimit: 4,
+        nativeCapabilities: chatNativeCapabilities,
+        enabled: true,
+      });
+      db.providerBudgetPolicy.findFirst.mockResolvedValue({
+        id: "policy",
+        activatedAt: new Date(),
+        Rules: [{ id: "rule", mode: "UNLIMITED", limitValue: null }],
+      });
+      db.providerAuditEvent.findFirst.mockResolvedValue({ id: "audit" });
+      db.executionTarget.upsert.mockResolvedValue({ id: "provider-target" });
+      db.poolMember.create.mockResolvedValue({ id: "member-id" });
+      // Overflow attaches never change the primary set. Pin the skip with a
+      // real unservable primary post-state: the chat-native primary cannot
+      // serve the stored responses override, so an always-on fence (or a fence
+      // that wrongly included overflow tiers) would reject this attach.
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("primary-a", "chat")]);
+
+      await expect(
+        client().addProviderPoolMember({
+          poolId: "pool-id",
+          providerModelId: "provider-model",
+          publicOrder: 0,
+        }),
+      ).resolves.toMatchObject({ id: "member-id" });
+      expect(db.poolMember.create).toHaveBeenCalledTimes(1);
+    });
+
+    it("rejects demoting the only primary serving the stored override", async () => {
+      const memberModelPool = {
+        userId: "user-id",
+        publicEgressEnabled: true,
+        publicEgressAcknowledged: true,
+        recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        protocolAdaptationEnabled: false,
+        capacityConcurrencyLimit: null,
+        capacityReservedSlots: 0,
+        capacityContextCeiling: null,
+        capacityContextMargin: 0,
+      };
+      db.poolMember.findUnique
+        .mockResolvedValueOnce({
+          id: "member-id",
+          poolId: "pool-id",
+          executionTargetId: "target-id",
+          ModelPool: { userId: "user-id" },
+        })
+        .mockResolvedValueOnce({
+          id: "member-id",
+          poolId: "pool-id",
+          tier: "PRIMARY",
+          publicOrder: null,
+          weight: 1,
+          routingStatus: "ACTIVE",
+          capacityConcurrencyMode: "INHERIT",
+          capacityConcurrencyLimit: null,
+          capacityReservedSlots: null,
+          capacityContextCeilingMode: "INHERIT",
+          capacityContextCeiling: null,
+          capacityContextMargin: null,
+          ExecutionTarget: {
+            ProviderModel: {
+              id: "provider-model",
+              providerAccountId: "provider-account",
+              nativeCapabilities: responsesNativeCapabilities,
+            },
+            InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: 4 },
+          },
+          ModelPool: memberModelPool,
+        });
+      db.providerBudgetPolicy.findFirst.mockResolvedValue({
+        id: "policy",
+        activatedAt: new Date(),
+        Rules: [{ id: "rule", mode: "UNLIMITED", limitValue: null }],
+      });
+      db.providerAuditEvent.findFirst.mockResolvedValue({ id: "audit" });
+      // The exclusion-free member set includes the transitioning member
+      // (member-id, responses-native). The in-place re-tag demotes it, so the
+      // remaining primary is chat-native and cannot serve the responses
+      // override once member-id leaves the primary tier.
+      db.poolMember.findMany.mockResolvedValue([
+        surfaceMemberRow("member-id", "responses"),
+        surfaceMemberRow("member-a", "chat"),
+      ]);
+
+      await expect(
+        client().updatePoolMember({ id: "member-id", tier: "PUBLIC_OVERFLOW", publicOrder: 0 }),
+      ).rejects.toMatchObject({
+        code: "BAD_REQUEST",
+        data: { reason: "SURFACE_NOT_SUPPORTED" },
+      });
+      expect(db.poolMember.update).not.toHaveBeenCalled();
+      expect(db.poolMember.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("rejects promoting an overflow member that strands the stored override", async () => {
+      const memberModelPool = {
+        userId: "user-id",
+        publicEgressEnabled: true,
+        publicEgressAcknowledged: true,
+        recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        protocolAdaptationEnabled: false,
+        capacityConcurrencyLimit: null,
+        capacityReservedSlots: 0,
+        capacityContextCeiling: null,
+        capacityContextMargin: 0,
+      };
+      db.poolMember.findUnique
+        .mockResolvedValueOnce({
+          id: "member-id",
+          poolId: "pool-id",
+          executionTargetId: "target-id",
+          ModelPool: { userId: "user-id" },
+        })
+        .mockResolvedValueOnce({
+          id: "member-id",
+          poolId: "pool-id",
+          tier: "PUBLIC_OVERFLOW",
+          publicOrder: 0,
+          weight: 1,
+          routingStatus: "ACTIVE",
+          capacityConcurrencyMode: "INHERIT",
+          capacityConcurrencyLimit: null,
+          capacityReservedSlots: null,
+          capacityContextCeilingMode: "INHERIT",
+          capacityContextCeiling: null,
+          capacityContextMargin: null,
+          ExecutionTarget: {
+            ProviderModel: {
+              id: "provider-model",
+              providerAccountId: "provider-account",
+              nativeCapabilities: chatNativeCapabilities,
+            },
+            InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: 4 },
+          },
+          ModelPool: memberModelPool,
+        });
+      // The promotion re-tags member-id (chat-native) to PRIMARY in place:
+      // the post-state primaries include a member that cannot serve the
+      // responses override, so the promotion must be fenced.
+      db.poolMember.findMany.mockResolvedValue([
+        surfaceMemberRow("member-id", "chat", "PUBLIC_OVERFLOW"),
+        surfaceMemberRow("member-a", "responses"),
+      ]);
+
+      await expect(
+        client().updatePoolMember({ id: "member-id", tier: "PRIMARY" }),
+      ).rejects.toMatchObject({
+        code: "BAD_REQUEST",
+        data: { reason: "SURFACE_NOT_SUPPORTED" },
+      });
+      expect(db.poolMember.update).not.toHaveBeenCalled();
+      expect(db.poolMember.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("accepts a tier transition that keeps the override servable", async () => {
+      db.poolMember.findUnique
+        .mockResolvedValueOnce({
+          id: "member-id",
+          poolId: "pool-id",
+          executionTargetId: "target-id",
+          ModelPool: { userId: "user-id" },
+        })
+        .mockResolvedValueOnce({
+          id: "member-id",
+          poolId: "pool-id",
+          tier: "PRIMARY",
+          publicOrder: null,
+          weight: 1,
+          routingStatus: "ACTIVE",
+          capacityConcurrencyMode: "INHERIT",
+          capacityConcurrencyLimit: null,
+          capacityReservedSlots: null,
+          capacityContextCeilingMode: "INHERIT",
+          capacityContextCeiling: null,
+          capacityContextMargin: null,
+          ExecutionTarget: {
+            ProviderModel: {
+              id: "provider-model",
+              providerAccountId: "provider-account",
+              nativeCapabilities: chatNativeCapabilities,
+            },
+            InferenceCapacity: { physicalMaxContext: 65_536, hardConcurrencyLimit: 4 },
+          },
+          ModelPool: {
+            userId: "user-id",
+            publicEgressEnabled: true,
+            publicEgressAcknowledged: true,
+            recommendedSurfaceOverride: "OPENAI_RESPONSES",
+            protocolAdaptationEnabled: true,
+            capacityConcurrencyLimit: null,
+            capacityReservedSlots: 0,
+            capacityContextCeiling: null,
+            capacityContextMargin: 0,
+          },
+        });
+      db.providerBudgetPolicy.findFirst.mockResolvedValue({
+        id: "policy",
+        activatedAt: new Date(),
+        Rules: [{ id: "rule", mode: "UNLIMITED", limitValue: null }],
+      });
+      db.providerAuditEvent.findFirst.mockResolvedValue({ id: "audit" });
+      // Demoting the chat-only member leaves a responses-native primary that
+      // serves the override natively, so the transition must proceed.
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "responses")]);
+      db.poolMember.update.mockResolvedValue({
+        id: "member-id",
+        weight: 0,
+        routingStatus: "ACTIVE",
+        tier: "PUBLIC_OVERFLOW",
+        publicOrder: null,
+      });
+
+      await expect(
+        client().updatePoolMember({ id: "member-id", tier: "PUBLIC_OVERFLOW", publicOrder: 0 }),
+      ).resolves.toMatchObject({ id: "member-id", tier: "PUBLIC_OVERFLOW" });
+      expect(db.poolMember.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "member-id" },
+          data: expect.objectContaining({ tier: "PUBLIC_OVERFLOW" }),
+        }),
+      );
+    });
+
+    it("rejects detaching the primary that serves the stored override", async () => {
+      db.poolMember.findUnique.mockResolvedValue({
+        id: "member-a",
+        poolId: "pool-id",
+        tier: "PRIMARY",
+        ModelPool: {
+          userId: "user-id",
+          recommendedSurfaceOverride: "OPENAI_RESPONSES",
+          protocolAdaptationEnabled: false,
+        },
+      });
+      // Only the detached member serves the override; the survivor cannot.
+      // (The mock models the exclusion query: members other than member-a.)
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-b", "chat")]);
+
+      await expect(client().removePoolMember({ id: "member-a" })).rejects.toMatchObject({
+        code: "BAD_REQUEST",
+        data: { reason: "SURFACE_NOT_SUPPORTED" },
+      });
+      expect(db.poolMember.delete).not.toHaveBeenCalled();
+    });
+
+    it("accepts detaching a primary when the survivors serve the override", async () => {
+      db.poolMember.findUnique.mockResolvedValue({
+        id: "member-a",
+        poolId: "pool-id",
+        tier: "PRIMARY",
+        ModelPool: {
+          userId: "user-id",
+          recommendedSurfaceOverride: "OPENAI_RESPONSES",
+          protocolAdaptationEnabled: false,
+        },
+      });
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-b", "responses")]);
+
+      await expect(client().removePoolMember({ id: "member-a" })).resolves.toEqual({
+        deleted: true,
+      });
+      expect(db.poolMember.delete).toHaveBeenCalledWith({
+        where: { id: "member-a" },
+      });
+      expect(db.poolMember.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { poolId: "pool-id", id: { not: "member-a" } } }),
+      );
+    });
+
+    it("accepts detaching the last primary, leaving an empty primary set", async () => {
+      db.poolMember.findUnique.mockResolvedValue({
+        id: "member-a",
+        poolId: "pool-id",
+        tier: "PRIMARY",
+        ModelPool: {
+          userId: "user-id",
+          recommendedSurfaceOverride: "OPENAI_RESPONSES",
+          protocolAdaptationEnabled: false,
+        },
+      });
+      // The surviving overflow member cannot serve the override, but an empty
+      // primary set accepts any surface (create-path parity).
+      db.poolMember.findMany.mockResolvedValue([
+        surfaceMemberRow("overflow-b", "chat", "PUBLIC_OVERFLOW"),
+      ]);
+
+      await expect(client().removePoolMember({ id: "member-a" })).resolves.toEqual({
+        deleted: true,
+      });
+      expect(db.poolMember.delete).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("capability-edit impact advisory (non-blocking)", () => {
+    function impactMemberRow(
+      id: string,
+      poolId: string,
+      native: "chat" | "responses",
+      tier: "PRIMARY" | "PUBLIC_OVERFLOW" = "PRIMARY",
+    ) {
+      return {
+        id,
+        poolId,
+        tier,
+        discoveredModelId: null,
+        DiscoveredModel: null,
+        ExecutionTarget: { DiscoveredModel: guardedLocalModel({}, native), ProviderModel: null },
+      };
+    }
+
+    /**
+     * The impact helper issues two member queries: a poolId lookup for the
+     * affected pools (no `where.poolId`) and the post-edit surface-member load
+     * (`where.poolId.in`). Dispatch on that.
+     */
+    function mockImpactQueries(options: {
+      affectedPoolIds: string[];
+      memberRows: ReturnType<typeof impactMemberRow>[];
+      pools: Array<Record<string, unknown>>;
+    }) {
+      db.poolMember.findMany.mockImplementation(
+        async ({ where }: { where?: { poolId?: { in?: string[] } } } = {}) =>
+          where?.poolId
+            ? options.memberRows.filter((row) => where.poolId?.in?.includes(row.poolId))
+            : options.affectedPoolIds.map((poolId) => ({ poolId })),
+      );
+      db.modelPool.findMany.mockResolvedValue(options.pools);
+    }
+
+    const impactPools = [
+      {
+        id: "pool-a",
+        slug: "alpha",
+        userId: "user-id",
+        recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        protocolAdaptationEnabled: false,
+      },
+      {
+        id: "pool-b",
+        slug: "beta",
+        userId: "user-id",
+        recommendedSurfaceOverride: null,
+        protocolAdaptationEnabled: false,
+      },
+    ];
+
+    it("updateDiscoveredModelCapabilities succeeds and reports only the unservable pool", async () => {
+      db.discoveredModel.findUnique.mockResolvedValue({
+        id: "model-id",
+        userId: "user-id",
+        capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+        capabilityOverrideMetadata: null,
+        capabilityOverrides: [],
+        Endpoint: { capabilityMetadata: null, defaultCapabilities: [] },
+      });
+      db.discoveredModel.update.mockImplementation(async ({ data }) => data);
+      // Post-edit: pool-a's only primary is chat-only under a responses
+      // override (unservable); pool-b suggests from its chat primary.
+      mockImpactQueries({
+        affectedPoolIds: ["pool-a", "pool-b"],
+        memberRows: [
+          impactMemberRow("m-a", "pool-a", "chat"),
+          impactMemberRow("m-b", "pool-b", "chat"),
+        ],
+        pools: impactPools,
+      });
+
+      const result = await client().updateDiscoveredModelCapabilities({
+        id: "model-id",
+        vision: true,
+        audio: false,
+        video: false,
+      });
+      // The edit itself succeeded (non-blocking) and the advisory is exact.
+      expect(db.discoveredModel.update).toHaveBeenCalledTimes(1);
+      expect(result.impactedPools).toEqual([
+        { id: "pool-a", slug: "alpha", surface: "OPENAI_RESPONSES" },
+      ]);
+    });
+
+    it("updateDiscoveredModelCapabilities reports impacted pools on the v4 metadata branch", async () => {
+      db.discoveredModel.findUnique.mockResolvedValue({
+        id: "model-id",
+        userId: "user-id",
+        capabilityOverrideMode: "OVERRIDE",
+        capabilityOverrideMetadata: {
+          version: 4,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiChatCompletions: {
+              source: "dashboard",
+              confidence: "exact",
+              streaming: true,
+              operations: ["create"],
+            },
+          },
+        },
+        capabilityOverrides: [],
+        Endpoint: { capabilityMetadata: null, defaultCapabilities: [] },
+      });
+      db.discoveredModel.update.mockImplementation(async ({ data }) => data);
+      mockImpactQueries({
+        affectedPoolIds: ["pool-a"],
+        memberRows: [impactMemberRow("m-a", "pool-a", "chat")],
+        pools: [impactPools[0]],
+      });
+
+      const result = await client().updateDiscoveredModelCapabilities({
+        id: "model-id",
+        vision: true,
+        audio: false,
+        video: false,
+      });
+      // The v4 branch preserved the structured surface and flipped the media
+      // input flags, and the advisory still reports the unservable pool.
+      expect(result.capabilityOverrideMetadata).toMatchObject({
+        version: 4,
+        surfaces: {
+          openaiChatCompletions: { inputImages: true, inputAudio: false, inputVideo: false },
+        },
+      });
+      expect(result.impactedPools).toEqual([
+        { id: "pool-a", slug: "alpha", surface: "OPENAI_RESPONSES" },
+      ]);
+    });
+
+    it("setDiscoveredModelCapabilityProfile returns an empty advisory when nothing is impacted", async () => {
+      db.discoveredModel.findUnique.mockResolvedValue({ id: "model-id", userId: "user-id" });
+      db.discoveredModel.update.mockImplementation(async ({ data }) => data);
+      mockImpactQueries({
+        affectedPoolIds: ["pool-b"],
+        memberRows: [impactMemberRow("m-b", "pool-b", "chat")],
+        pools: [impactPools[1]],
+      });
+
+      const result = await client().setDiscoveredModelCapabilityProfile({
+        id: "model-id",
+        mode: "override",
+        capabilities: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiChatCompletions: { source: "dashboard", confidence: "exact", supported: true },
+          },
+        },
+        optimisticBasicTranscription: false,
+      });
+      expect(result.impactedPools).toEqual([]);
+    });
+
+    it("removeDiscoveredModelMetadata computes the post-deletion surface after capturing affected pools", async () => {
+      db.discoveredModel.findUnique.mockResolvedValue({
+        id: "model-id",
+        userId: "user-id",
+        lastSeenAt: null,
+      });
+      db.discoveredModel.delete.mockResolvedValue({ id: "model-id" });
+      // The responses-native member cascades away with the deleted model, so
+      // the post-deletion primary set of pool-a is chat-only under a stored
+      // responses override: unservable.
+      mockImpactQueries({
+        affectedPoolIds: ["pool-a"],
+        memberRows: [impactMemberRow("m-a", "pool-a", "chat")],
+        pools: [impactPools[0]],
+      });
+
+      await expect(client().removeDiscoveredModelMetadata({ id: "model-id" })).resolves.toEqual({
+        deleted: true,
+        impactedPools: [{ id: "pool-a", slug: "alpha", surface: "OPENAI_RESPONSES" }],
+      });
+      expect(db.discoveredModel.delete).toHaveBeenCalledWith({ where: { id: "model-id" } });
+    });
   });
 });

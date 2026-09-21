@@ -1,8 +1,10 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { declaredContextWindow } from "@ws-model-proxy/api/lib/declared-context-window";
-import { parseOpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
-import { validateForwarderPoolSlug } from "@ws-model-proxy/config/forwarder-identifiers";
+import {
+  type GuardedPoolCreateFailureReason,
+  isGuardedPoolCreateFailureReason,
+} from "@ws-model-proxy/api/lib/guarded-pool-create-reasons";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
 import {
@@ -20,23 +22,23 @@ import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ShieldCheck } from "lucide-r
 import type { ReactNode } from "react";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { z } from "zod";
 import { ProtocolCompatibilityRadio } from "@/components/forwarder-dashboard-sections";
 import {
-  combinedPrimarySurfaceIsSelectable,
+  buildGuardedPoolWizardSchema,
+  combinedPrimaryMemberCount,
   type GuardedWizardLocalModel,
-  minimumSelectedPhysicalContext,
+  guardedWizardSurfaces,
+  localModelSurfaceCapabilities,
+  nextRecommendedSurface,
   providerOrderAfterMove,
   providerOrderAfterToggle,
-  recommendedCombinedPrimarySurface,
-  recommendedPrimarySurface,
+  type RecommendedSurfaceFlags,
 } from "@/lib/guarded-pool-wizard-validation";
 import { orpc } from "@/utils/orpc";
 
 type LocalModel = GuardedWizardLocalModel & {
   canonicalModelId: string;
 };
-const surfaces = ["OPENAI_CHAT_COMPLETIONS", "OPENAI_RESPONSES", "ANTHROPIC_MESSAGES"] as const;
 export type LimitMode = "LIMITED" | "UNLIMITED";
 export type MemberOverride = {
   concurrencyMode: LimitMode;
@@ -101,9 +103,23 @@ export function memberContextFitsPhysical(
 }
 
 function modelDeclaredContextWindow(model: LocalModel | undefined): number | null {
-  return declaredContextWindow(
-    parseOpenAiCompatibleCapabilities(model?.effectiveCapabilities?.metadata),
-  );
+  // Same canonical resolution as the surface checks: the model's effective
+  // metadata (override-mode aware, endpoint defaults as fallback).
+  return model ? declaredContextWindow(localModelSurfaceCapabilities(model)) : null;
+}
+
+/**
+ * Extracts the machine-readable guarded-pool create failure reason from an
+ * oRPC mutation error. The server attaches `data.reason` to every curated
+ * create failure; this never trusts the shape (absent or malformed data falls
+ * back to the generic rollback copy) and never surfaces `error.message`.
+ */
+function guardedPoolCreateFailureReason(error: unknown): GuardedPoolCreateFailureReason | null {
+  if (!error || typeof error !== "object") return null;
+  const { data } = error as { data?: unknown };
+  if (!data || typeof data !== "object") return null;
+  const { reason } = data as { reason?: unknown };
+  return isGuardedPoolCreateFailureReason(reason) ? reason : null;
 }
 export const budgetIntegerRule = (mode: LimitMode, value: string) =>
   mode === "LIMITED"
@@ -124,6 +140,7 @@ export function GuardedPoolSetupWizard({
   initialProviderModelIds = [],
   capacityEnabled,
   protocolAdaptationAvailable,
+  providerEgressEnabled,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -135,15 +152,26 @@ export function GuardedPoolSetupWizard({
   initialProviderModelIds?: string[];
   capacityEnabled: boolean;
   protocolAdaptationAvailable: boolean;
+  /** Deployment gate from WMP_PUBLIC_PROVIDER_EGRESS_ENABLED; false blocks provider selection. */
+  providerEgressEnabled: boolean;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
   const capacityIsEnabled = capacityEnabled;
   const formRef = useRef<HTMLFormElement>(null);
+  // Tracks whether the recommended API was chosen by the user vs derived from
+  // members. Lives across step navigation for the lifetime of the wizard.
+  const recommendedSurfaceFlags = useRef<RecommendedSurfaceFlags>({
+    manuallyChosen: false,
+    autoSetByMember: false,
+  });
   const [step, setStep] = useState<number>(initialStep);
   const [stepErrors, setStepErrors] = useState<Record<string, string>>({});
   const [memberOverrides, setMemberOverrides] = useState<Record<string, MemberOverride>>({});
   const [enabledMemberOverrides, setEnabledMemberOverrides] = useState<Record<string, boolean>>({});
+  const [createFailure, setCreateFailure] = useState<{
+    reason: GuardedPoolCreateFailureReason | null;
+  } | null>(null);
   const candidates = useQuery({
     ...orpc.forwarderManagement.listGuardedOverflowCandidates.queryOptions(),
     enabled: open,
@@ -153,119 +181,33 @@ export function GuardedPoolSetupWizard({
     retry: false,
     enabled: open && capacityIsEnabled,
   });
-  const create = useMutation(
-    orpc.forwarderManagement.createGuardedModelPool.mutationOptions({
+  const create = useMutation({
+    ...orpc.forwarderManagement.createGuardedModelPool.mutationOptions({
       onSuccess: async (pool) => {
         await queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:pools.created"));
+        setCreateFailure(null);
         setStep(0);
         onSuccess?.(pool?.id);
         if (!page) onOpenChange(false);
       },
-      onError: () => toast.error(t("dashboard:pools.wizard.atomicFailure")),
+      onError: (error) => {
+        // Surfaced inline on the review step; the global mutation toast is
+        // suppressed so the user sees the specific reason, not generic copy.
+        setCreateFailure({ reason: guardedPoolCreateFailureReason(error) });
+      },
     }),
-  );
-  const schema = z
-    .object({
-      slug: z
-        .string()
-        .trim()
-        .refine((value) => validateForwarderPoolSlug(value).ok),
-      name: z.string().trim().min(1).max(120),
-      localModelIds: z.array(z.string()),
-      memberConcurrencyLimit: z.number().int().min(1).max(10_000),
-      memberContextCeiling: z.number().int().min(1).max(100_000_000).nullable(),
-      reservedSlots: z.number().int().min(0).max(10_000),
-      localWaitBudgetMs: z.number().int().min(0).max(600_000),
-      recommendedSurface: z.enum(surfaces),
-      providerModelIds: z.array(z.string()).max(32),
-      providerTier: z.enum(["PRIMARY", "PUBLIC_OVERFLOW"]),
-      providerConcurrencyLimit: z.number().int().min(1).max(10_000),
-      dailySpendLimit: z.string(),
-      publicEgressAcknowledged: z.boolean(),
-      physicalCountStrategy: z.enum([
-        "TOKENIZER",
-        "TEMPLATE_AWARE",
-        "ENGINE_REPORTED",
-        "CONSERVATIVE_ESTIMATE",
-      ]),
-      contextMargin: z.number().int().min(0).max(10_000_000),
-      borrowPolicy: z.enum(["NEVER", "WHEN_IDLE"]),
-      protocolAdaptationEnabled: z.boolean(),
-      allowLossyDeveloperRoleCollapse: z.boolean(),
-      affinityEnabled: z.boolean(),
-      affinityTtlSeconds: z.number().int().min(60).max(604_800),
-      affinityMaxRecords: z.number().int().min(100).max(100_000),
-      affinityPrefixWeight: z.number().int().min(0).max(10_000),
-      affinityConversationWeight: z.number().int().min(0).max(10_000),
-      affinityConfirmedCacheWeight: z.number().int().min(0).max(10_000),
-      affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000),
-      providerConcurrencyMode: z.enum(["LIMITED", "UNLIMITED"]),
-      tokenAttemptMode: z.enum(["LIMITED", "UNLIMITED"]),
-      tokenAttemptLimit: z.string(),
-      tokenDayMode: z.enum(["LIMITED", "UNLIMITED"]),
-      tokenDayLimit: z.string(),
-      tokenMonthMode: z.enum(["LIMITED", "UNLIMITED"]),
-      tokenMonthLimit: z.string(),
-      tokenLifetimeMode: z.enum(["LIMITED", "UNLIMITED"]),
-      tokenLifetimeLimit: z.string(),
-      spendDayMode: z.enum(["LIMITED", "UNLIMITED"]),
-      spendMonthMode: z.enum(["LIMITED", "UNLIMITED"]),
-      spendMonthLimit: z.string(),
-    })
-    .superRefine((value, ctx) => {
-      if (value.localModelIds.length + value.providerModelIds.length === 0)
-        ctx.addIssue({ code: "custom", path: ["providerModelIds"] });
-      if (value.reservedSlots > value.memberConcurrencyLimit)
-        ctx.addIssue({ code: "custom", path: ["reservedSlots"] });
-      if (value.providerModelIds.length > 0 && !value.publicEgressAcknowledged)
-        ctx.addIssue({ code: "custom", path: ["publicEgressAcknowledged"] });
-      if (
-        value.localModelIds.length +
-          (value.providerTier === "PRIMARY" ? value.providerModelIds.length : 0) >
-          0 &&
-        !combinedPrimarySurfaceIsSelectable(
-          value.recommendedSurface,
-          value.localModelIds,
-          directModels,
-          value.providerModelIds,
-          candidates.data ?? [],
-          value.providerTier,
-          protocolAdaptationAvailable && value.protocolAdaptationEnabled,
-        )
-      )
-        ctx.addIssue({ code: "custom", path: ["recommendedSurface"] });
-      const physicalMaximum = minimumSelectedPhysicalContext(
-        value.localModelIds,
-        directModels,
-        capacities.data ?? [],
-      );
-      if (
-        physicalMaximum != null &&
-        value.memberContextCeiling != null &&
-        value.memberContextCeiling + value.contextMargin > physicalMaximum
-      )
-        ctx.addIssue({ code: "custom", path: ["memberContextCeiling"] });
-      for (const [mode, limit, path] of [
-        [value.tokenAttemptMode, value.tokenAttemptLimit, "tokenAttemptLimit"],
-        [value.tokenDayMode, value.tokenDayLimit, "tokenDayLimit"],
-        [value.tokenMonthMode, value.tokenMonthLimit, "tokenMonthLimit"],
-        [value.tokenLifetimeMode, value.tokenLifetimeLimit, "tokenLifetimeLimit"],
-      ] as const) {
-        if (mode === "LIMITED" && !/^[1-9]\d*$/.test(limit))
-          ctx.addIssue({ code: "custom", path: [path] });
-      }
-      for (const [mode, limit, path] of [
-        [value.spendDayMode, value.dailySpendLimit, "dailySpendLimit"],
-        [value.spendMonthMode, value.spendMonthLimit, "spendMonthLimit"],
-      ] as const) {
-        if (
-          mode === "LIMITED" &&
-          (!/^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/.test(limit) || Number(limit) <= 0)
-        )
-          ctx.addIssue({ code: "custom", path: [path] });
-      }
-    });
+    meta: { skipGlobalErrorToast: true },
+  });
+  // Rebuilt each render from the current query snapshots so validation always
+  // reflects the live egress gate, candidates, and capacities.
+  const schema = buildGuardedPoolWizardSchema({
+    providerEgressEnabled,
+    protocolAdaptationAvailable,
+    directModels,
+    providerModels: candidates.data ?? [],
+    capacities: capacities.data ?? [],
+  });
   const form = useForm({
     defaultValues: {
       slug: "",
@@ -275,8 +217,8 @@ export function GuardedPoolSetupWizard({
       memberContextCeiling: null as number | null,
       reservedSlots: 0,
       localWaitBudgetMs: 30_000,
-      recommendedSurface: "OPENAI_RESPONSES" as (typeof surfaces)[number],
-      providerModelIds: initialProviderModelIds,
+      recommendedSurface: "OPENAI_RESPONSES" as (typeof guardedWizardSurfaces)[number],
+      providerModelIds: providerEgressEnabled ? initialProviderModelIds : [],
       providerTier: "PUBLIC_OVERFLOW" as "PRIMARY" | "PUBLIC_OVERFLOW",
       providerConcurrencyLimit: 1,
       dailySpendLimit: "10.00",
@@ -290,7 +232,7 @@ export function GuardedPoolSetupWizard({
       borrowPolicy: "WHEN_IDLE" as "NEVER" | "WHEN_IDLE",
       protocolAdaptationEnabled: false,
       allowLossyDeveloperRoleCollapse: false,
-      affinityEnabled: false,
+      affinityEnabled: true,
       affinityTtlSeconds: 3_600,
       affinityMaxRecords: 10_000,
       affinityPrefixWeight: 100,
@@ -311,85 +253,121 @@ export function GuardedPoolSetupWizard({
       spendMonthLimit: "100",
     },
     validators: { onSubmit: schema },
-    onSubmit: ({ value }) =>
-      create.mutateAsync({
-        slug: value.slug.trim(),
-        name: value.name.trim(),
-        localModelIds: value.localModelIds,
-        recommendedSurface: value.recommendedSurface,
-        memberConcurrencyLimit: value.memberConcurrencyLimit,
-        memberContextCeiling: value.memberContextCeiling,
-        reservedSlots: value.reservedSlots,
-        localWaitBudgetMs: value.localWaitBudgetMs,
-        publicEgressAcknowledged: value.publicEgressAcknowledged,
-        advanced: {
-          physicalCountStrategy: value.physicalCountStrategy,
-          contextMargin: value.contextMargin,
-          borrowPolicy: value.borrowPolicy,
-          protocolAdaptationEnabled: protocolAdaptationAvailable && value.protocolAdaptationEnabled,
-          allowLossyDeveloperRoleCollapse:
-            protocolAdaptationAvailable &&
-            value.protocolAdaptationEnabled &&
-            value.allowLossyDeveloperRoleCollapse,
-          affinity: {
-            enabled: value.affinityEnabled,
-            ttlSeconds: value.affinityTtlSeconds,
-            maxRecords: value.affinityMaxRecords,
-            prefixWeight: value.affinityPrefixWeight,
-            conversationWeight: value.affinityConversationWeight,
-            confirmedCacheWeight: value.affinityConfirmedCacheWeight,
-            loadPenaltyWeight: value.affinityLoadPenaltyWeight,
+    onSubmit: async ({ value }) => {
+      // A fresh submit clears the previous inline failure before it starts.
+      setCreateFailure(null);
+      try {
+        await create.mutateAsync({
+          slug: value.slug.trim(),
+          name: value.name.trim(),
+          localModelIds: value.localModelIds,
+          recommendedSurface: value.recommendedSurface,
+          memberConcurrencyLimit: value.memberConcurrencyLimit,
+          memberContextCeiling: value.memberContextCeiling,
+          reservedSlots: value.reservedSlots,
+          localWaitBudgetMs: value.localWaitBudgetMs,
+          publicEgressAcknowledged: value.publicEgressAcknowledged,
+          advanced: {
+            physicalCountStrategy: value.physicalCountStrategy,
+            contextMargin: value.contextMargin,
+            borrowPolicy: value.borrowPolicy,
+            protocolAdaptationEnabled:
+              protocolAdaptationAvailable && value.protocolAdaptationEnabled,
+            allowLossyDeveloperRoleCollapse:
+              protocolAdaptationAvailable &&
+              value.protocolAdaptationEnabled &&
+              value.allowLossyDeveloperRoleCollapse,
+            affinity: {
+              enabled: value.affinityEnabled,
+              ttlSeconds: value.affinityTtlSeconds,
+              maxRecords: value.affinityMaxRecords,
+              prefixWeight: value.affinityPrefixWeight,
+              conversationWeight: value.affinityConversationWeight,
+              confirmedCacheWeight: value.affinityConfirmedCacheWeight,
+              loadPenaltyWeight: value.affinityLoadPenaltyWeight,
+            },
+            memberOverrides: value.localModelIds.flatMap((discoveredModelId) => {
+              if (!enabledMemberOverrides[discoveredModelId]) return [];
+              const model = directModels.find((candidate) => candidate.id === discoveredModelId);
+              const physicalMaxContext = capacities.data?.find(
+                (capacity) => capacity.id === model?.executionTarget?.inferenceCapacityId,
+              )?.physicalMaxContext;
+              const override =
+                memberOverrides[discoveredModelId] ??
+                deriveMemberOverride(value, modelDeclaredContextWindow(model), physicalMaxContext);
+              const rule = (mode: LimitMode, limitValue: number) =>
+                mode === "LIMITED"
+                  ? ({ mode, limitValue } as const)
+                  : ({ mode, limitValue: null } as const);
+              return [
+                {
+                  discoveredModelId,
+                  concurrency: rule(override.concurrencyMode, override.concurrencyLimit),
+                  reservedSlots: override.reservedSlots,
+                  borrowPolicy: override.borrowPolicy,
+                  waitBudget: rule(override.waitBudgetMode, override.waitBudgetMs),
+                  contextCeiling:
+                    override.contextCeilingMode === "INHERIT"
+                      ? ({ mode: "INHERIT", limitValue: null } as const)
+                      : rule(override.contextCeilingMode, override.contextCeiling ?? 0),
+                  contextMargin:
+                    override.contextCeilingMode === "INHERIT" ? 0 : override.contextMargin,
+                },
+              ];
+            }),
           },
-          memberOverrides: value.localModelIds.flatMap((discoveredModelId) => {
-            if (!enabledMemberOverrides[discoveredModelId]) return [];
-            const model = directModels.find((candidate) => candidate.id === discoveredModelId);
-            const physicalMaxContext = capacities.data?.find(
-              (capacity) => capacity.id === model?.executionTarget?.inferenceCapacityId,
-            )?.physicalMaxContext;
-            const override =
-              memberOverrides[discoveredModelId] ??
-              deriveMemberOverride(value, modelDeclaredContextWindow(model), physicalMaxContext);
-            const rule = (mode: LimitMode, limitValue: number) =>
-              mode === "LIMITED"
-                ? ({ mode, limitValue } as const)
-                : ({ mode, limitValue: null } as const);
-            return [
-              {
-                discoveredModelId,
-                concurrency: rule(override.concurrencyMode, override.concurrencyLimit),
-                reservedSlots: override.reservedSlots,
-                borrowPolicy: override.borrowPolicy,
-                waitBudget: rule(override.waitBudgetMode, override.waitBudgetMs),
-                contextCeiling:
-                  override.contextCeilingMode === "INHERIT"
-                    ? ({ mode: "INHERIT", limitValue: null } as const)
-                    : rule(override.contextCeilingMode, override.contextCeiling ?? 0),
-                contextMargin:
-                  override.contextCeilingMode === "INHERIT" ? 0 : override.contextMargin,
-              },
-            ];
-          }),
-        },
-        providerModels: value.providerModelIds.map((providerModelId) => ({
-          providerModelId,
-          tier: value.providerTier,
-          concurrencyLimit: value.providerConcurrencyLimit,
-          dailySpendLimit: value.dailySpendLimit,
-          budgetRules: {
-            concurrency:
-              value.providerConcurrencyMode === "LIMITED"
-                ? ({ mode: "LIMITED", limitValue: value.providerConcurrencyLimit } as const)
-                : ({ mode: "UNLIMITED", limitValue: null } as const),
-            tokensPerAttempt: budgetIntegerRule(value.tokenAttemptMode, value.tokenAttemptLimit),
-            tokensPerDay: budgetIntegerRule(value.tokenDayMode, value.tokenDayLimit),
-            tokensPerMonth: budgetIntegerRule(value.tokenMonthMode, value.tokenMonthLimit),
-            tokensLifetime: budgetIntegerRule(value.tokenLifetimeMode, value.tokenLifetimeLimit),
-            spendPerDay: budgetSpendRule(value.spendDayMode, value.dailySpendLimit),
-            spendPerMonth: budgetSpendRule(value.spendMonthMode, value.spendMonthLimit),
-          },
-        })),
-      }),
+          providerModels: value.providerModelIds.map((providerModelId) => ({
+            providerModelId,
+            tier: value.providerTier,
+            concurrencyLimit: value.providerConcurrencyLimit,
+            dailySpendLimit: value.dailySpendLimit,
+            budgetRules: {
+              concurrency:
+                value.providerConcurrencyMode === "LIMITED"
+                  ? ({ mode: "LIMITED", limitValue: value.providerConcurrencyLimit } as const)
+                  : ({ mode: "UNLIMITED", limitValue: null } as const),
+              tokensPerAttempt: budgetIntegerRule(value.tokenAttemptMode, value.tokenAttemptLimit),
+              tokensPerDay: budgetIntegerRule(value.tokenDayMode, value.tokenDayLimit),
+              tokensPerMonth: budgetIntegerRule(value.tokenMonthMode, value.tokenMonthLimit),
+              tokensLifetime: budgetIntegerRule(value.tokenLifetimeMode, value.tokenLifetimeLimit),
+              spendPerDay: budgetSpendRule(value.spendDayMode, value.dailySpendLimit),
+              spendPerMonth: budgetSpendRule(value.spendMonthMode, value.spendMonthLimit),
+            },
+          })),
+        });
+      } catch {
+        // Failure reasons are captured in the mutation's onError and shown
+        // inline on the review step.
+      }
+    },
   });
+  // Auto-set-once / auto-repair policy (see nextRecommendedSurface): invoked
+  // from member, provider, tier, and adaptation change handlers — never
+  // recompute a still-valid surface, and never overwrite a manual choice
+  // unless it has become unselectable for the primary set.
+  const applyRecommendedSurfacePolicy = (
+    selection: {
+      localIds: readonly string[];
+      providerIds: readonly string[];
+      providerTier: "PRIMARY" | "PUBLIC_OVERFLOW";
+      protocolAdaptationEnabled: boolean;
+    },
+    firstMemberSelection = false,
+  ) => {
+    const decision = nextRecommendedSurface(
+      form.state.values.recommendedSurface,
+      recommendedSurfaceFlags.current,
+      {
+        ...selection,
+        localModels: directModels,
+        providerModels: candidates.data ?? [],
+      },
+      firstMemberSelection,
+    );
+    recommendedSurfaceFlags.current = decision.flags;
+    if (decision.surface !== form.state.values.recommendedSurface)
+      form.setFieldValue("recommendedSurface", decision.surface);
+  };
   const stepFields = [
     ["slug", "name", "localModelIds"],
     [
@@ -409,6 +387,7 @@ export function GuardedPoolSetupWizard({
     [
       "recommendedSurface",
       "providerModelIds",
+      "providerEgressBlocked",
       "providerTier",
       "providerConcurrencyLimit",
       "dailySpendLimit",
@@ -472,6 +451,16 @@ export function GuardedPoolSetupWizard({
     "aria-invalid": Boolean(stepErrors[name]),
     "aria-describedby": stepErrors[name] ? `wizard-${name}-error` : undefined,
   });
+  const goToStep = (target: number) => {
+    if (target !== step && (step === 3 || target === 3)) {
+      // Leaving the review step (Back) or re-entering it (Next, before any
+      // submit could occur there) invalidates a stale create failure so old
+      // reason copy cannot resurface ahead of a fresh submission. A pending
+      // submission never navigates, so an in-flight error is never hidden.
+      setCreateFailure(null);
+    }
+    setStep(target);
+  };
 
   return (
     <WizardSurface page={page} open={open} onOpenChange={onOpenChange}>
@@ -499,7 +488,7 @@ export function GuardedPoolSetupWizard({
           onSubmit={(event) => {
             event.preventDefault();
             if (step < 3) {
-              if (validateStep()) setStep((current) => current + 1);
+              if (validateStep()) goToStep(step + 1);
             } else void form.handleSubmit();
           }}
         >
@@ -518,6 +507,9 @@ export function GuardedPoolSetupWizard({
                           onChange={(event) => field.handleChange(event.target.value)}
                           {...errorProps(name)}
                         />
+                        <p className="text-xs text-muted-foreground">
+                          {t(`dashboard:pools.wizard.fields.${name}Hint`)}
+                        </p>
                         {stepErrors[name] ? (
                           <p id={`wizard-${name}-error`} className="text-sm text-destructive">
                             {stepErrors[name]}
@@ -550,19 +542,39 @@ export function GuardedPoolSetupWizard({
                             checked={field.state.value.includes(model.id)}
                             onCheckedChange={(checked) =>
                               (() => {
+                                const previous = field.state.value;
                                 const next =
                                   checked === true
-                                    ? [...field.state.value, model.id]
-                                    : field.state.value.filter((id) => id !== model.id);
+                                    ? [...previous, model.id]
+                                    : previous.filter((id) => id !== model.id);
                                 field.handleChange(next);
-                                const recommended = recommendedPrimarySurface(
-                                  next,
-                                  directModels,
-                                  protocolAdaptationAvailable &&
-                                    form.state.values.protocolAdaptationEnabled,
+                                applyRecommendedSurfacePolicy(
+                                  {
+                                    localIds: next,
+                                    providerIds: form.state.values.providerModelIds,
+                                    providerTier: form.state.values.providerTier,
+                                    protocolAdaptationEnabled:
+                                      protocolAdaptationAvailable &&
+                                      form.state.values.protocolAdaptationEnabled,
+                                  },
+                                  // First-PRIMARY-member trigger: the combined
+                                  // primary set (locals + PRIMARY-tier
+                                  // providers), not just locals, must transition
+                                  // empty → non-empty. A provider-first
+                                  // selection already claimed the auto-set, so
+                                  // adding the first local later must not
+                                  // overwrite it.
+                                  combinedPrimaryMemberCount(
+                                    previous,
+                                    form.state.values.providerModelIds,
+                                    form.state.values.providerTier,
+                                  ) === 0 &&
+                                    combinedPrimaryMemberCount(
+                                      next,
+                                      form.state.values.providerModelIds,
+                                      form.state.values.providerTier,
+                                    ) > 0,
                                 );
-                                if (recommended)
-                                  form.setFieldValue("recommendedSurface", recommended);
                               })()
                             }
                           />
@@ -633,6 +645,9 @@ export function GuardedPoolSetupWizard({
                           }}
                           {...errorProps(name)}
                         />
+                        <p className="text-xs text-muted-foreground">
+                          {t(`dashboard:pools.wizard.fields.${name}Hint`)}
+                        </p>
                         {stepErrors[name] ? (
                           <p id={`wizard-${name}-error`} className="text-sm text-destructive">
                             {stepErrors[name]}
@@ -676,6 +691,9 @@ export function GuardedPoolSetupWizard({
                             </option>
                           ))}
                         </select>
+                        <p className="text-xs text-muted-foreground">
+                          {t("dashboard:pools.wizard.fields.physicalCountStrategyHint")}
+                        </p>
                       </div>
                     )}
                   </form.Field>
@@ -698,6 +716,9 @@ export function GuardedPoolSetupWizard({
                             {t("dashboard:pools.wizard.enums.WHEN_IDLE")}
                           </option>
                         </select>
+                        <p className="text-xs text-muted-foreground">
+                          {t("dashboard:pools.wizard.fields.borrowPolicyHint")}
+                        </p>
                       </div>
                     )}
                   </form.Field>
@@ -729,6 +750,9 @@ export function GuardedPoolSetupWizard({
                             }}
                             {...errorProps(name)}
                           />
+                          <p className="text-xs text-muted-foreground">
+                            {t(`dashboard:pools.wizard.fields.${name}Hint`)}
+                          </p>
                           {stepErrors[name] ? (
                             <p id={`wizard-${name}-error`} className="text-sm text-destructive">
                               {stepErrors[name]}
@@ -758,21 +782,26 @@ export function GuardedPoolSetupWizard({
                             "allowLossyDeveloperRoleCollapse",
                             value.allowLossyDeveloperRoleCollapse,
                           );
-                          const recommended = recommendedPrimarySurface(
-                            form.state.values.localModelIds,
-                            directModels,
-                            protocolAdaptationAvailable && value.adaptationEnabled,
-                          );
-                          if (recommended) form.setFieldValue("recommendedSurface", recommended);
+                          applyRecommendedSurfacePolicy({
+                            localIds: form.state.values.localModelIds,
+                            providerIds: form.state.values.providerModelIds,
+                            providerTier: form.state.values.providerTier,
+                            protocolAdaptationEnabled:
+                              protocolAdaptationAvailable && value.adaptationEnabled,
+                          });
                         }}
                       />
                     )}
                   </form.Subscribe>
+                  <p className="text-xs text-muted-foreground">
+                    {t("dashboard:pools.wizard.fields.protocolAdaptationHint")}
+                  </p>
                   <form.Field name="affinityEnabled">
                     {(field) => (
                       <label className="flex min-h-11 items-start gap-3 py-2">
                         <Checkbox
                           id="guarded-affinityEnabled"
+                          aria-describedby="guarded-affinityEnabled-hint"
                           checked={field.state.value}
                           onCheckedChange={(checked) => field.handleChange(checked === true)}
                         />
@@ -782,6 +811,9 @@ export function GuardedPoolSetupWizard({
                       </label>
                     )}
                   </form.Field>
+                  <p id="guarded-affinityEnabled-hint" className="text-xs text-muted-foreground">
+                    {t("dashboard:pools.wizard.fields.affinityEnabledHint")}
+                  </p>
                 </div>
                 <div
                   className="mt-5 min-w-0 space-y-4"
@@ -851,17 +883,24 @@ export function GuardedPoolSetupWizard({
                       id="guarded-surface"
                       className="h-11 w-full rounded-md border bg-background px-3 text-sm"
                       value={field.state.value}
-                      onChange={(event) =>
-                        field.handleChange(event.target.value as typeof field.state.value)
-                      }
+                      onChange={(event) => {
+                        field.handleChange(event.target.value as typeof field.state.value);
+                        recommendedSurfaceFlags.current = {
+                          ...recommendedSurfaceFlags.current,
+                          manuallyChosen: true,
+                        };
+                      }}
                       {...errorProps("recommendedSurface")}
                     >
-                      {surfaces.map((surface) => (
+                      {guardedWizardSurfaces.map((surface) => (
                         <option key={surface} value={surface}>
                           {t(`dashboard:pools.wizard.surfaces.${surface}`)}
                         </option>
                       ))}
                     </select>
+                    <p className="text-xs text-muted-foreground">
+                      {t("dashboard:pools.wizard.fields.recommendedSurfaceHint")}
+                    </p>
                     {stepErrors.recommendedSurface ? (
                       <p id="wizard-recommendedSurface-error" className="text-sm text-destructive">
                         {stepErrors.recommendedSurface}
@@ -874,8 +913,21 @@ export function GuardedPoolSetupWizard({
                 {(field) => (
                   <fieldset
                     className="space-y-2"
-                    {...errorProps("providerModelIds")}
-                    tabIndex={stepErrors.providerModelIds ? -1 : undefined}
+                    aria-invalid={Boolean(
+                      stepErrors.providerModelIds || stepErrors.providerEgressBlocked,
+                    )}
+                    aria-describedby={
+                      stepErrors.providerModelIds
+                        ? "wizard-providerModelIds-error"
+                        : stepErrors.providerEgressBlocked
+                          ? "wizard-providerEgressBlocked-error"
+                          : undefined
+                    }
+                    tabIndex={
+                      stepErrors.providerModelIds || stepErrors.providerEgressBlocked
+                        ? -1
+                        : undefined
+                    }
                   >
                     <legend className="text-sm font-medium">
                       {t("dashboard:pools.wizard.providerOrder")}
@@ -883,6 +935,11 @@ export function GuardedPoolSetupWizard({
                     <p className="text-sm text-muted-foreground">
                       {t("dashboard:pools.wizard.providerOrderExact")}
                     </p>
+                    {!providerEgressEnabled ? (
+                      <p className="rounded-md border bg-muted/40 p-3 text-sm text-muted-foreground">
+                        {t("dashboard:pools.wizard.providerEgressDisabled")}
+                      </p>
+                    ) : null}
                     <div className="divide-y rounded-md border">
                       {candidates.data?.map((candidate) => {
                         const order = field.state.value.indexOf(candidate.id);
@@ -893,25 +950,41 @@ export function GuardedPoolSetupWizard({
                               aria-label={t("dashboard:pools.wizard.selectProvider", {
                                 name: candidate.displayName ?? candidate.upstreamModelId,
                               })}
+                              disabled={!providerEgressEnabled}
                               checked={order >= 0}
                               onCheckedChange={(checked) => {
+                                const tier = form.state.values.providerTier;
+                                const previousProviderIds = field.state.value;
                                 const next = providerOrderAfterToggle(
-                                  field.state.value,
+                                  previousProviderIds,
                                   candidate.id,
                                   checked === true,
                                 );
                                 field.handleChange(next);
-                                const recommended = recommendedCombinedPrimarySurface(
-                                  form.state.values.localModelIds,
-                                  directModels,
-                                  next,
-                                  candidates.data ?? [],
-                                  form.state.values.providerTier,
-                                  protocolAdaptationAvailable &&
-                                    form.state.values.protocolAdaptationEnabled,
+                                applyRecommendedSurfacePolicy(
+                                  {
+                                    localIds: form.state.values.localModelIds,
+                                    providerIds: next,
+                                    providerTier: tier,
+                                    protocolAdaptationEnabled:
+                                      protocolAdaptationAvailable &&
+                                      form.state.values.protocolAdaptationEnabled,
+                                  },
+                                  // Only a PRIMARY-tier provider can be the
+                                  // first primary member; PUBLIC_OVERFLOW
+                                  // selections never trigger the auto-set.
+                                  tier === "PRIMARY" &&
+                                    combinedPrimaryMemberCount(
+                                      form.state.values.localModelIds,
+                                      previousProviderIds,
+                                      tier,
+                                    ) === 0 &&
+                                    combinedPrimaryMemberCount(
+                                      form.state.values.localModelIds,
+                                      next,
+                                      tier,
+                                    ) > 0,
                                 );
-                                if (recommended)
-                                  form.setFieldValue("recommendedSurface", recommended);
                               }}
                             />
                             <span className="min-w-0 flex-1">
@@ -974,6 +1047,14 @@ export function GuardedPoolSetupWizard({
                         {stepErrors.providerModelIds}
                       </p>
                     ) : null}
+                    {stepErrors.providerEgressBlocked ? (
+                      <p
+                        id="wizard-providerEgressBlocked-error"
+                        className="text-sm text-destructive"
+                      >
+                        {stepErrors.providerEgressBlocked}
+                      </p>
+                    ) : null}
                   </fieldset>
                 )}
               </form.Field>
@@ -988,18 +1069,33 @@ export function GuardedPoolSetupWizard({
                       className="h-11 w-full rounded-md border bg-background px-3 text-sm"
                       value={field.state.value}
                       onChange={(event) => {
+                        const previousTier = field.state.value;
                         const tier = event.target.value as typeof field.state.value;
                         field.handleChange(tier);
-                        const recommended = recommendedCombinedPrimarySurface(
-                          form.state.values.localModelIds,
-                          directModels,
-                          form.state.values.providerModelIds,
-                          candidates.data ?? [],
-                          tier,
-                          protocolAdaptationAvailable &&
-                            form.state.values.protocolAdaptationEnabled,
+                        const providerIds = form.state.values.providerModelIds;
+                        applyRecommendedSurfacePolicy(
+                          {
+                            localIds: form.state.values.localModelIds,
+                            providerIds,
+                            providerTier: tier,
+                            protocolAdaptationEnabled:
+                              protocolAdaptationAvailable &&
+                              form.state.values.protocolAdaptationEnabled,
+                          },
+                          // Compare the combined primary count under the
+                          // previous vs next tier: covers a provider selected
+                          // while PUBLIC_OVERFLOW, then flipped to PRIMARY.
+                          combinedPrimaryMemberCount(
+                            form.state.values.localModelIds,
+                            providerIds,
+                            previousTier,
+                          ) === 0 &&
+                            combinedPrimaryMemberCount(
+                              form.state.values.localModelIds,
+                              providerIds,
+                              tier,
+                            ) > 0,
                         );
-                        if (recommended) form.setFieldValue("recommendedSurface", recommended);
                       }}
                     >
                       <option value="PRIMARY">{t("dashboard:pools.memberTiers.PRIMARY")}</option>
@@ -1168,6 +1264,20 @@ export function GuardedPoolSetupWizard({
                   <p className="text-sm text-muted-foreground">
                     {t("dashboard:pools.wizard.atomicRollback")}
                   </p>
+                  {createFailure ? (
+                    <div role="alert" className="space-y-1 rounded-md bg-destructive/10 p-4">
+                      <p className="text-sm font-medium text-destructive">
+                        {createFailure.reason
+                          ? t(`dashboard:pools.wizard.createErrors.${createFailure.reason}`)
+                          : t("dashboard:pools.wizard.atomicFailure")}
+                      </p>
+                      {createFailure.reason ? (
+                        <p className="text-sm text-muted-foreground">
+                          {t("dashboard:pools.wizard.atomicFailure")}
+                        </p>
+                      ) : null}
+                    </div>
+                  ) : null}
                 </div>
               )}
             </form.Subscribe>
@@ -1180,7 +1290,7 @@ export function GuardedPoolSetupWizard({
               disabled={step === 0 || create.isPending}
               onClick={() => {
                 setStepErrors({});
-                setStep((current) => Math.max(0, current - 1));
+                goToStep(Math.max(0, step - 1));
               }}
             >
               <ArrowLeft className="size-4" />

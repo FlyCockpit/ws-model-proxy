@@ -1,6 +1,10 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  type GuardedPoolCreateFailureReason,
+  isGuardedPoolCreateFailureReason,
+} from "@ws-model-proxy/api/lib/guarded-pool-create-reasons";
+import {
   parseOpenAiCompatibleCapabilities,
   resolveEffectiveCapabilityMetadata,
   transformerSupportedModalities,
@@ -119,6 +123,19 @@ type PoolSurface = (typeof poolSurfaceValues)[number];
 
 function poolSurfaceOverrideValue(value: string | null | undefined): PoolSurface | "" {
   return value && poolSurfaceValues.includes(value as PoolSurface) ? (value as PoolSurface) : "";
+}
+
+/**
+ * Extracts the machine-readable failure reason from a pool mutation error,
+ * mirroring the wizard's create-path extraction: never trust the envelope
+ * shape and never surface `error.message` directly.
+ */
+function poolMutationFailureReason(error: unknown): GuardedPoolCreateFailureReason | null {
+  if (!error || typeof error !== "object") return null;
+  const { data } = error as { data?: unknown };
+  if (!data || typeof data !== "object") return null;
+  const { reason } = data as { reason?: unknown };
+  return isGuardedPoolCreateFailureReason(reason) ? reason : null;
 }
 
 function copyToClipboard(value: string, message: string) {
@@ -265,8 +282,10 @@ export function allDirectModels(devices: CliDevice[]) {
         endpointSlug: endpoint.slug,
         endpointLabel: endpoint.label,
         endpointPublished: endpoint.published,
-        // Needed for OVERRIDE→endpoint fallback (same as pool management).
+        // Needed for OVERRIDE→endpoint fallback (same as pool management) and
+        // for the guarded wizard's canonical capability resolution.
         endpointCapabilityMetadata: endpoint.capabilityMetadata,
+        endpointDefaultCapabilities: endpoint.defaultCapabilities,
       })),
     ),
   );
@@ -641,26 +660,53 @@ export function CliEndpointsModelsSection() {
   );
   const removeModel = useMutation(
     orpc.forwarderManagement.removeDiscoveredModelMetadata.mutationOptions({
-      onSuccess: () => {
+      onSuccess: (data) => {
         queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
-        toast.success(t("dashboard:metadata.deleted"));
+        const impacted = data?.impactedPools ?? [];
+        if (impacted.length > 0) {
+          toast.warning(
+            t("dashboard:metadata.deletionImpact", {
+              slugs: impacted.map((pool) => pool.slug).join(", "),
+            }),
+          );
+        } else {
+          toast.success(t("dashboard:metadata.deleted"));
+        }
         setDeleteTarget(null);
       },
     }),
   );
   const updateModelCapabilities = useMutation(
     orpc.forwarderManagement.updateDiscoveredModelCapabilities.mutationOptions({
-      onSuccess: () => {
+      onSuccess: (data) => {
         queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
+        // The save always succeeded; the warning is additive so operators
+        // still see the impact advisory.
         toast.success(t("dashboard:models.capabilitySaved"));
+        const impacted = data?.impactedPools ?? [];
+        if (impacted.length > 0) {
+          toast.warning(
+            t("dashboard:models.capabilityImpact", {
+              slugs: impacted.map((pool) => pool.slug).join(", "),
+            }),
+          );
+        }
       },
     }),
   );
   const setModelCapabilityProfile = useMutation(
     orpc.forwarderManagement.setDiscoveredModelCapabilityProfile.mutationOptions({
-      onSuccess: () => {
+      onSuccess: (data) => {
         queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:models.capabilitySaved"));
+        const impacted = data?.impactedPools ?? [];
+        if (impacted.length > 0) {
+          toast.warning(
+            t("dashboard:models.capabilityImpact", {
+              slugs: impacted.map((pool) => pool.slug).join(", "),
+            }),
+          );
+        }
       },
       onError: () => toast.error(t("dashboard:models.capabilitySaveFailed")),
     }),
@@ -872,6 +918,7 @@ export function CliEndpointsModelsSection() {
                                         endpointSlug: endpoint.slug,
                                         endpointLabel: endpoint.label,
                                         endpointCapabilityMetadata: endpoint.capabilityMetadata,
+                                        endpointDefaultCapabilities: endpoint.defaultCapabilities,
                                       }).images
                                     }
                                     audio={
@@ -882,6 +929,7 @@ export function CliEndpointsModelsSection() {
                                         endpointSlug: endpoint.slug,
                                         endpointLabel: endpoint.label,
                                         endpointCapabilityMetadata: endpoint.capabilityMetadata,
+                                        endpointDefaultCapabilities: endpoint.defaultCapabilities,
                                       }).audio
                                     }
                                     video={
@@ -892,6 +940,7 @@ export function CliEndpointsModelsSection() {
                                         endpointSlug: endpoint.slug,
                                         endpointLabel: endpoint.label,
                                         endpointCapabilityMetadata: endpoint.capabilityMetadata,
+                                        endpointDefaultCapabilities: endpoint.defaultCapabilities,
                                       }).video
                                     }
                                     disabled={updateModelCapabilities.isPending}
@@ -907,6 +956,7 @@ export function CliEndpointsModelsSection() {
                                       endpointSlug: endpoint.slug,
                                       endpointLabel: endpoint.label,
                                       endpointCapabilityMetadata: endpoint.capabilityMetadata,
+                                      endpointDefaultCapabilities: endpoint.defaultCapabilities,
                                     }}
                                     endpointCapabilityMetadata={endpoint.capabilityMetadata}
                                     disabled={setModelCapabilityProfile.isPending}
@@ -945,6 +995,7 @@ export function CliEndpointsModelsSection() {
                                           endpointSlug: endpoint.slug,
                                           endpointLabel: endpoint.label,
                                           endpointCapabilityMetadata: endpoint.capabilityMetadata,
+                                          endpointDefaultCapabilities: endpoint.defaultCapabilities,
                                         })
                                       }
                                       aria-label={t("dashboard:pools.capacity.directPolicy")}
@@ -1571,6 +1622,9 @@ export function PoolForm({
   const show = (section: "identity" | "routing" | "capacity" | "media") =>
     sections.includes(section);
   const queryClient = useQueryClient();
+  // Inline server rejection on the recommended-API field (update path only;
+  // the guarded wizard owns its own create-failure surface).
+  const [surfaceUnsupported, setSurfaceUnsupported] = useState(false);
   const poolSchema = z.object({
     slug: z
       .string()
@@ -1700,7 +1754,10 @@ export function PoolForm({
       capacityBorrowPolicy: (pool?.capacityBorrowPolicy === "NEVER" ? "NEVER" : "WHEN_IDLE") as
         | "NEVER"
         | "WHEN_IDLE",
-      affinityEnabled: pool?.affinity.enabled ?? false,
+      // Create mode (no existing pool) defaults affinity ON, matching the
+      // guarded wizard; edit mode always receives the stored value from the
+      // pool detail query, so the fallback never masks it.
+      affinityEnabled: pool?.affinity.enabled ?? true,
       affinityTtlSeconds: pool?.affinity.ttlSeconds ?? 3600,
       affinityMaxRecords: pool?.affinity.maxRecords ?? 10_000,
       affinityPrefixWeight: pool?.affinity.prefixWeight ?? 100,
@@ -1709,6 +1766,7 @@ export function PoolForm({
     },
     validators: { onSubmit: poolSchema },
     onSubmit: async ({ value }) => {
+      setSurfaceUnsupported(false);
       const transformer = {
         transformerDiscoveredModelId: value.transformerDiscoveredModelId.trim()
           ? value.transformerDiscoveredModelId.trim()
@@ -1763,15 +1821,33 @@ export function PoolForm({
             optimisticBasicTranscription: value.optimisticBasicTranscription,
           }
         : {};
+      // Selectability-gated fields ride along only when the user actually
+      // changed them: the server revalidates recommended-surface selectability
+      // whenever these are present in an update, so always sending them would
+      // block unrelated routing saves on pools with legacy-invalid overrides.
+      // In create mode `pool` is undefined and this object is unused.
+      const surfaceOverrideChanged =
+        value.recommendedSurfaceOverride !==
+        poolSurfaceOverrideValue(pool?.recommendedSurfaceOverride);
+      const adaptationChanged =
+        value.protocolAdaptationEnabled !== (pool?.protocolAdaptationEnabled ?? false);
       const routing = show("routing")
         ? {
-            protocolAdaptationEnabled: value.protocolAdaptationEnabled,
+            ...(adaptationChanged
+              ? { protocolAdaptationEnabled: value.protocolAdaptationEnabled }
+              : {}),
             // A persisted lossy bit without adaptation is invalid. Saving the
             // routing tab repairs only that bit and never enables adaptation.
             allowLossyDeveloperRoleCollapse:
               value.protocolAdaptationEnabled && value.allowLossyDeveloperRoleCollapse,
-            recommendedSurfaceOverride:
-              value.recommendedSurfaceOverride === "" ? null : value.recommendedSurfaceOverride,
+            ...(surfaceOverrideChanged
+              ? {
+                  recommendedSurfaceOverride:
+                    value.recommendedSurfaceOverride === ""
+                      ? null
+                      : value.recommendedSurfaceOverride,
+                }
+              : {}),
             affinityEnabled: value.affinityEnabled,
             affinityTtlSeconds: value.affinityTtlSeconds,
             affinityMaxRecords: value.affinityMaxRecords,
@@ -1807,7 +1883,18 @@ export function PoolForm({
       } else if (pool) {
         const updateInput: Parameters<typeof updatePool.mutateAsync>[0] = { id: pool.id };
         Object.assign(updateInput, identity, media, routing, capacityPolicy);
-        await updatePool.mutateAsync(updateInput);
+        try {
+          await updatePool.mutateAsync(updateInput);
+        } catch (error) {
+          // The server revalidates recommended-surface selectability on
+          // input-touching updates; map that rejection onto the field instead
+          // of letting it surface as a generic failure.
+          if (poolMutationFailureReason(error) === "SURFACE_NOT_SUPPORTED") {
+            setSurfaceUnsupported(true);
+            return;
+          }
+          throw error;
+        }
         toast.success(t("dashboard:pools.updated"));
         onSuccess();
       }
@@ -1886,9 +1973,10 @@ export function PoolForm({
                   id={field.name}
                   className="flex h-11 w-full rounded-md border border-input bg-transparent px-3 text-sm"
                   value={field.state.value}
-                  onChange={(event) =>
-                    field.handleChange(event.target.value as typeof field.state.value)
-                  }
+                  onChange={(event) => {
+                    setSurfaceUnsupported(false);
+                    field.handleChange(event.target.value as typeof field.state.value);
+                  }}
                 >
                   <option value="">{t("dashboard:pools.recommendedAutomatic")}</option>
                   {poolSurfaceValues.map((surface) => (
@@ -1897,6 +1985,11 @@ export function PoolForm({
                     </option>
                   ))}
                 </select>
+                {surfaceUnsupported ? (
+                  <p className="text-sm text-destructive">
+                    {t("dashboard:pools.wizard.createErrors.SURFACE_NOT_SUPPORTED")}
+                  </p>
+                ) : null}
               </div>
             )}
           </form.Field>
@@ -1913,6 +2006,10 @@ export function PoolForm({
                 protocolAdaptationAvailable={protocolAdaptationAvailable}
                 idPrefix="pool"
                 onChange={(value) => {
+                  // Mirrors the override select: changing the adaptation
+                  // choice invalidates a pending SURFACE_NOT_SUPPORTED
+                  // rejection, so clear the inline error.
+                  setSurfaceUnsupported(false);
                   form.setFieldValue("protocolAdaptationEnabled", value.adaptationEnabled);
                   form.setFieldValue(
                     "allowLossyDeveloperRoleCollapse",

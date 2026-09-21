@@ -18,6 +18,9 @@ import {
   conservativeProviderLiability,
   conservativeSerializedInputTokens,
   dispatchPublicOverflow,
+  engineCacheConfirmedFromResponseChunks,
+  engineCacheConfirmedFromRetainedResponse,
+  engineCacheConfirmedFromUsage,
   exactResponsesNativeSurface,
   matchesExactResponsesBinding,
   parseProviderUsage,
@@ -829,5 +832,117 @@ describe("public overflow compatibility", () => {
     });
     expect(usage?.inputTokens).toBeUndefined();
     expect(usage?.outputTokens).toBeUndefined();
+  });
+});
+
+describe("engine cache confirmation evidence", () => {
+  const encode = (value: string) => new TextEncoder().encode(value);
+
+  it("confirms on every reported cache-hit wire shape", () => {
+    // OpenAI Chat nonstream usage details.
+    expect(
+      engineCacheConfirmedFromResponseChunks([
+        encode(
+          '{"id":"chatcmpl-1","usage":{"prompt_tokens":10,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":5}}}',
+        ),
+      ]),
+    ).toBe(true);
+    // OpenAI Responses terminal event nests usage under response.usage.
+    expect(
+      engineCacheConfirmedFromResponseChunks([
+        encode(
+          '{"type":"response.completed","response":{"usage":{"input_tokens":7,"output_tokens":4,"input_tokens_details":{"cached_tokens":2}}}}',
+        ),
+      ]),
+    ).toBe(true);
+    // Anthropic reports the cache read directly on the usage object.
+    expect(
+      engineCacheConfirmedFromResponseChunks([
+        encode(
+          'event: message_start\ndata: {"message":{"usage":{"input_tokens":12,"cache_read_input_tokens":3}}}\n\n',
+        ),
+        encode('event: message_delta\ndata: {"usage":{"output_tokens":7}}\n\n'),
+      ]),
+    ).toBe(true);
+  });
+
+  it("resets on reported-zero cache reads", () => {
+    expect(
+      engineCacheConfirmedFromResponseChunks([
+        encode(
+          '{"id":"chatcmpl-1","usage":{"prompt_tokens":10,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":0}}}',
+        ),
+      ]),
+    ).toBe(false);
+    expect(
+      engineCacheConfirmedFromResponseChunks([
+        encode(
+          'event: message_start\ndata: {"message":{"usage":{"input_tokens":12,"cache_read_input_tokens":0}}}\n\n',
+        ),
+      ]),
+    ).toBe(false);
+    // OpenAI Responses terminal event nests the zero under response.usage.
+    expect(
+      engineCacheConfirmedFromResponseChunks([
+        encode(
+          '{"type":"response.completed","response":{"usage":{"input_tokens":7,"output_tokens":4,"input_tokens_details":{"cached_tokens":0}}}}',
+        ),
+      ]),
+    ).toBe(false);
+  });
+
+  it("leaves the flag untouched when the provider does not report cache usage", () => {
+    // Usage is present but carries no cache fields on any known shape.
+    expect(
+      engineCacheConfirmedFromResponseChunks([
+        encode('{"id":"chatcmpl-1","usage":{"prompt_tokens":10,"completion_tokens":3}}'),
+      ]),
+    ).toBeUndefined();
+    expect(
+      engineCacheConfirmedFromResponseChunks([
+        encode('event: message_start\ndata: {"message":{"usage":{"input_tokens":12}}}\n\n'),
+      ]),
+    ).toBeUndefined();
+    // Bodies without any usage object and absent usage entirely.
+    expect(engineCacheConfirmedFromResponseChunks([encode('{"id":"chatcmpl-1"}')])).toBeUndefined();
+    expect(engineCacheConfirmedFromResponseChunks([])).toBeUndefined();
+    expect(engineCacheConfirmedFromUsage(undefined)).toBeUndefined();
+    expect(engineCacheConfirmedFromUsage(parseProviderUsage([]))).toBeUndefined();
+  });
+
+  it("merges retained prefix evidence once the response exceeds the tail window", () => {
+    const hitPrefix = [
+      encode(
+        'event: message_start\ndata: {"message":{"usage":{"input_tokens":12,"cache_read_input_tokens":3}}}\n\n',
+      ),
+    ];
+    const zeroPrefix = [
+      encode(
+        'event: message_start\ndata: {"message":{"usage":{"input_tokens":12,"cache_read_input_tokens":0}}}\n\n',
+      ),
+    ];
+    const tailWithoutCache = [
+      encode('event: message_delta\ndata: {"usage":{"output_tokens":7}}\n\n'),
+    ];
+    const zeroTail = [
+      encode(
+        '{"id":"chatcmpl-1","usage":{"prompt_tokens":10,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":0}}}',
+      ),
+    ];
+    // Within the tail window the tail alone is authoritative and the prefix
+    // is never consulted.
+    expect(engineCacheConfirmedFromRetainedResponse(hitPrefix, tailWithoutCache, 32, 64)).toBe(
+      undefined,
+    );
+    // Beyond the window the early message_start evidence survives via the
+    // prefix for both polarities — this is what tail-only capture loses.
+    expect(engineCacheConfirmedFromRetainedResponse(hitPrefix, tailWithoutCache, 128, 64)).toBe(
+      true,
+    );
+    expect(engineCacheConfirmedFromRetainedResponse(zeroPrefix, tailWithoutCache, 128, 64)).toBe(
+      false,
+    );
+    // Tail-defined categories still take precedence over the prefix.
+    expect(engineCacheConfirmedFromRetainedResponse(hitPrefix, zeroTail, 128, 64)).toBe(false);
   });
 });

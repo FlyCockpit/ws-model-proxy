@@ -7,7 +7,10 @@ import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Context } from "../context";
 
-const envMock = vi.hoisted(() => ({ MODEL_API_GLOBAL_CAPACITY_ENABLED: true }));
+const envMock = vi.hoisted(() => ({
+  MODEL_API_GLOBAL_CAPACITY_ENABLED: true,
+  MODEL_API_PROTOCOL_ADAPTATION_ENABLED: true,
+}));
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: envMock,
 }));
@@ -30,7 +33,7 @@ const db = prisma as unknown as {
   };
   executionTarget: { findUnique: MockInstance; update: MockInstance };
   modelPool: { findUnique: MockInstance; update: MockInstance };
-  poolMember: { findUnique: MockInstance; update: MockInstance };
+  poolMember: { findUnique: MockInstance; findMany: MockInstance; update: MockInstance };
   capacityAuditEvent: { create: MockInstance; findMany: MockInstance };
 };
 
@@ -90,6 +93,7 @@ describe("capacityManagementRouter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     envMock.MODEL_API_GLOBAL_CAPACITY_ENABLED = true;
+    envMock.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = true;
     db.appSetting.findUnique.mockResolvedValue(null);
     db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
       callback(db),
@@ -266,6 +270,114 @@ describe("capacityManagementRouter", () => {
       client.updatePoolPolicy({ modelPoolId: "pool", allowLossyDeveloperRoleCollapse: true }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect(db.modelPool.update).not.toHaveBeenCalled();
+  });
+
+  describe("updatePoolPolicy recommended-surface gate", () => {
+    const surfaceMemberRow = (native: "chat" | "responses") => ({
+      id: `member-${native}`,
+      tier: "PRIMARY",
+      discoveredModelId: null,
+      DiscoveredModel: null,
+      ExecutionTarget: {
+        DiscoveredModel: {
+          capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+          capabilityOverrides: [],
+          capabilityOverrideMetadata: null,
+          Endpoint: {
+            capabilityMetadata: {
+              version: 1,
+              protocol: "openai-compatible",
+              ...(native === "chat"
+                ? { chatCompletions: { supported: true, streaming: true } }
+                : { responses: { supported: true, streaming: true } }),
+            },
+            defaultCapabilities: [],
+          },
+        },
+        ProviderModel: null,
+      },
+    });
+
+    function surfacePoolRow(overrides: Record<string, unknown> = {}) {
+      return {
+        id: "pool",
+        userId: "owner",
+        PoolMembers: [],
+        capacityPriority: 16,
+        capacityConcurrencyLimit: null,
+        capacityReservedSlots: 0,
+        capacityBorrowPolicy: "WHEN_IDLE",
+        capacityWaitBudgetMs: null,
+        capacityContextCeiling: null,
+        capacityContextMargin: 0,
+        protocolAdaptationEnabled: false,
+        allowLossyDeveloperRoleCollapse: false,
+        recommendedSurfaceOverride: "OPENAI_RESPONSES",
+        ...overrides,
+      };
+    }
+
+    it("rejects disabling adaptation when the override only stays servable through it", async () => {
+      db.modelPool.findUnique.mockResolvedValue(
+        surfacePoolRow({ protocolAdaptationEnabled: true }),
+      );
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("chat")]);
+      const client = createRouterClient(capacityManagementRouter, { context });
+
+      await expect(
+        client.updatePoolPolicy({ modelPoolId: "pool", protocolAdaptationEnabled: false }),
+      ).rejects.toMatchObject({
+        code: "BAD_REQUEST",
+        data: { reason: "SURFACE_NOT_SUPPORTED" },
+      });
+      expect(db.modelPool.update).not.toHaveBeenCalled();
+    });
+
+    it("keeps adaptation-flag updates non-retroactive for unchanged or absent input", async () => {
+      // Stored state is valid (adaptation on lets the chat primary serve the
+      // responses override): re-asserting the same flag must still succeed.
+      db.modelPool.findUnique.mockResolvedValue(
+        surfacePoolRow({ protocolAdaptationEnabled: true }),
+      );
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("chat")]);
+      db.modelPool.update.mockResolvedValue(surfacePoolRow({ protocolAdaptationEnabled: true }));
+      const client = createRouterClient(capacityManagementRouter, { context });
+      await expect(
+        client.updatePoolPolicy({ modelPoolId: "pool", protocolAdaptationEnabled: true }),
+      ).resolves.toBeTruthy();
+      expect(db.modelPool.update).toHaveBeenCalledTimes(1);
+
+      // Absent adaptation input never triggers the gate: even a stranded
+      // stored override (adapt off, responses override, chat-only primary)
+      // still allows unrelated capacity-policy edits.
+      vi.clearAllMocks();
+      db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
+        callback(db),
+      );
+      db.modelPool.findUnique.mockResolvedValue(surfacePoolRow());
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("chat")]);
+      db.modelPool.update.mockResolvedValue(surfacePoolRow({ capacityPriority: 8 }));
+      await expect(
+        client.updatePoolPolicy({ modelPoolId: "pool", capacityPriority: 8 }),
+      ).resolves.toBeTruthy();
+      expect(db.modelPool.update).toHaveBeenCalledTimes(1);
+      expect(db.poolMember.findMany).not.toHaveBeenCalled();
+    });
+
+    it("accepts enabling adaptation when the post-state serves the override", async () => {
+      db.modelPool.findUnique.mockResolvedValue(surfacePoolRow());
+      db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("chat")]);
+      db.modelPool.update.mockResolvedValue(surfacePoolRow({ protocolAdaptationEnabled: true }));
+      const client = createRouterClient(capacityManagementRouter, { context });
+
+      await expect(
+        client.updatePoolPolicy({ modelPoolId: "pool", protocolAdaptationEnabled: true }),
+      ).resolves.toBeTruthy();
+      expect(db.modelPool.update).toHaveBeenCalledWith({
+        where: { id: "pool" },
+        data: expect.objectContaining({ protocolAdaptationEnabled: true }),
+      });
+    });
   });
 
   it("denies cross-owner capacity substitution and reserved overcommit", async () => {

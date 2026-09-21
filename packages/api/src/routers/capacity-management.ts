@@ -12,6 +12,9 @@ import {
   lockExecutionTargetPolicies,
   modelPoolCapacityPolicyFields,
 } from "../lib/capacity-policy-safety";
+import { parseModelApiSurface } from "../lib/model-api-surface";
+import { assertRecommendedSurfaceServable } from "../lib/pool-recommended-surface";
+import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
 import { runSerializableTransaction } from "../lib/serializable-transaction";
 
 const id = z.string().min(1);
@@ -516,6 +519,7 @@ export const capacityManagementRouter = {
               capacityContextMargin: true,
               protocolAdaptationEnabled: true,
               allowLossyDeveloperRoleCollapse: true,
+              recommendedSurfaceOverride: true,
               PoolMembers: {
                 select: {
                   capacityConcurrencyMode: true,
@@ -545,6 +549,20 @@ export const capacityManagementRouter = {
                 input.protocolAdaptationEnabled ?? pool.protocolAdaptationEnabled,
               allowLossyDeveloperRoleCollapse:
                 input.allowLossyDeveloperRoleCollapse ?? pool.allowLossyDeveloperRoleCollapse,
+            });
+          }
+          // Non-retroactive selectability gate, matching updateModelPool: only
+          // updates that touch the adaptation flag validate the post-state, so
+          // a pool already holding a legacy-invalid override can still have
+          // unrelated capacity policy fields edited.
+          if (input.protocolAdaptationEnabled !== undefined) {
+            const members = await loadPoolSurfaceMembers(tx, input.modelPoolId);
+            assertRecommendedSurfaceServable({
+              override: parseModelApiSurface(pool.recommendedSurfaceOverride),
+              members,
+              adaptationEnabled:
+                (input.protocolAdaptationEnabled ?? pool.protocolAdaptationEnabled) &&
+                env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
             });
           }
           const { modelPoolId, ...data } = input;

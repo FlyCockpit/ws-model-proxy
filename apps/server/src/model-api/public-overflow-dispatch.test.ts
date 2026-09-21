@@ -67,6 +67,11 @@ vi.mock("./provider-budget.js", () => ({
   }),
   reconcileProviderBudget,
 }));
+const rememberAffinity = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+vi.mock("./cache-affinity.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./cache-affinity.js")>();
+  return { ...actual, rememberAffinity };
+});
 vi.mock("./provider-attempt-runtime.js", () => ({
   allocateProviderFence: vi.fn().mockResolvedValue(1n),
   claimProviderHealthTrial: vi.fn().mockResolvedValue("READY"),
@@ -960,6 +965,189 @@ describe("public overflow terminal response dispatch", () => {
         retryAfterMs: 37_000,
       }),
     );
+  });
+
+  it.each([
+    {
+      label: "cached hit",
+      chunk:
+        '{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":5}}}',
+      engineCacheConfirmed: true,
+      cacheReadTokens: 5n,
+    },
+    {
+      label: "reported zero",
+      chunk:
+        '{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":0}}}',
+      engineCacheConfirmed: false,
+      cacheReadTokens: 0n,
+    },
+    {
+      label: "cache fields absent",
+      chunk: '{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":3}}',
+      engineCacheConfirmed: undefined,
+      cacheReadTokens: undefined,
+    },
+  ])(
+    "forwards $label usage polarity to rememberAffinity consistently with reconcile",
+    async (fixture) => {
+      rememberAffinity.mockClear();
+      reconcileProviderBudget.mockClear();
+      const pool = dispatchPoolFixture();
+      Object.assign(pool, {
+        affinityEnabled: true,
+        affinityTtlSeconds: 600,
+        affinityMaxRecords: 100,
+        affinityPrefixWeight: 100,
+        affinityConversationWeight: 150,
+        affinityConfirmedCacheWeight: 250,
+        affinityLoadPenaltyWeight: 100,
+      });
+      db.modelPool.findFirst.mockResolvedValue(pool);
+      db.providerAttempt.groupBy.mockResolvedValue([]);
+      db.providerPricingVersion.findFirst.mockResolvedValue(null);
+      const tx = {
+        $queryRaw: vi.fn().mockResolvedValue([]),
+        providerCredential: {
+          findFirst: vi.fn().mockResolvedValue({
+            id: "credential-heartbeat",
+            credentialType: "BEARER",
+            aadVersion: 1,
+            algorithm: "AES-256-GCM",
+            keyVersion: "v1",
+            ciphertext: new Uint8Array(),
+            nonce: new Uint8Array(),
+            authTag: new Uint8Array(),
+          }),
+          update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+        },
+      };
+      db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+        callback(tx),
+      );
+      const upstream = Readable.from([Buffer.from(fixture.chunk)]);
+      Object.assign(upstream, {
+        statusCode: 200,
+        headers: { "content-type": "application/json" },
+        complete: true,
+      });
+      providerHttpsRequest.mockResolvedValueOnce(upstream);
+
+      const result = await dispatchPublicOverflow({
+        userId: "owner",
+        poolId: "pool",
+        requestId: `request-affinity-${fixture.label.replace(/\s+/g, "-")}`,
+        reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+        requestedProtocol: "openai",
+        requestedSurface: "openai-chat",
+        stream: false,
+        requiredFeatures: [],
+        path: "/v1/chat/completions",
+        headers: new Headers({ "content-type": "application/json" }),
+        body: new TextEncoder().encode(
+          '{"model":"pool","messages":[{"role":"user","content":"affinity evidence"}]}',
+        ),
+        signal: new AbortController().signal,
+        liability: { accountingVersion: "provider-billable-v1" },
+        requestedOutputTokens: 1n,
+        releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+        adaptationEnabled: false,
+        retrySafe: false,
+      });
+
+      expect(result.dispatched).toBe(true);
+      if (!result.dispatched) throw new Error("expected dispatch");
+      await result.response.text();
+      await result.terminal;
+      // The affinity write is best-effort and errors are swallowed, so the
+      // spy must witness the call itself rather than its downstream effects.
+      await vi.waitFor(() => expect(rememberAffinity).toHaveBeenCalledTimes(1));
+      expect(rememberAffinity.mock.calls[0]?.[0]).toMatchObject({
+        engineCacheConfirmed: fixture.engineCacheConfirmed,
+      });
+      // Both the affinity write and the usage reconcile read the same settled
+      // usage, so the observed flag must agree with the reconciled category.
+      const reconciled = reconcileProviderBudget.mock.calls.at(-1)?.[0]?.usage;
+      expect(reconciled?.cacheReadTokens).toEqual(fixture.cacheReadTokens);
+    },
+  );
+
+  it("swallows rememberAffinity failures without failing the overflow terminal", async () => {
+    rememberAffinity.mockClear();
+    rememberAffinity.mockRejectedValueOnce(new Error("affinity store unavailable"));
+    const pool = dispatchPoolFixture();
+    Object.assign(pool, {
+      affinityEnabled: true,
+      affinityTtlSeconds: 600,
+      affinityMaxRecords: 100,
+      affinityPrefixWeight: 100,
+      affinityConversationWeight: 150,
+      affinityConfirmedCacheWeight: 250,
+      affinityLoadPenaltyWeight: 100,
+    });
+    db.modelPool.findFirst.mockResolvedValue(pool);
+    db.providerAttempt.groupBy.mockResolvedValue([]);
+    db.providerPricingVersion.findFirst.mockResolvedValue(null);
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
+      providerCredential: {
+        findFirst: vi.fn().mockResolvedValue({
+          id: "credential-heartbeat",
+          credentialType: "BEARER",
+          aadVersion: 1,
+          algorithm: "AES-256-GCM",
+          keyVersion: "v1",
+          ciphertext: new Uint8Array(),
+          nonce: new Uint8Array(),
+          authTag: new Uint8Array(),
+        }),
+        update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+      },
+    };
+    db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+    const upstream = Readable.from([
+      Buffer.from(
+        '{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":5}}}',
+      ),
+    ]);
+    Object.assign(upstream, {
+      statusCode: 200,
+      headers: { "content-type": "application/json" },
+      complete: true,
+    });
+    providerHttpsRequest.mockResolvedValueOnce(upstream);
+
+    const result = await dispatchPublicOverflow({
+      userId: "owner",
+      poolId: "pool",
+      requestId: "request-affinity-swallowed",
+      reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+      requestedProtocol: "openai",
+      requestedSurface: "openai-chat",
+      stream: false,
+      requiredFeatures: [],
+      path: "/v1/chat/completions",
+      headers: new Headers({ "content-type": "application/json" }),
+      body: new TextEncoder().encode(
+        '{"model":"pool","messages":[{"role":"user","content":"swallowed write"}]}',
+      ),
+      signal: new AbortController().signal,
+      liability: { accountingVersion: "provider-billable-v1" },
+      requestedOutputTokens: 1n,
+      releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+      adaptationEnabled: false,
+      retrySafe: false,
+    });
+
+    expect(result.dispatched).toBe(true);
+    if (!result.dispatched) throw new Error("expected dispatch");
+    await result.response.text();
+    await expect(result.terminal).resolves.toMatchObject({ ok: true });
+    await vi.waitFor(() => expect(rememberAffinity).toHaveBeenCalledTimes(1));
+    rememberAffinity.mockClear();
+    rememberAffinity.mockResolvedValue(undefined);
   });
 
   it("does not record client cancellation before response as a provider transport failure", async () => {

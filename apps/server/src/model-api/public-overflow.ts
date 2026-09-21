@@ -1214,6 +1214,34 @@ export function parseProviderUsage(
     : normalized;
 }
 
+/**
+ * Derives the latest engine cache-affinity evidence from a normalized usage
+ * observation. Cached prompt tokens > 0 confirm a warm engine prefix;
+ * cache fields reported with zero reset a prior confirmation; a provider that
+ * does not report cache usage yields `undefined` so callers can leave the
+ * stored affinity flag untouched.
+ */
+export function engineCacheConfirmedFromUsage(
+  usage: Pick<RawProviderUsage, "cacheReadTokens"> | undefined,
+): boolean | undefined {
+  return usage?.cacheReadTokens === undefined ? undefined : usage.cacheReadTokens > 0n;
+}
+
+/**
+ * Derives engine cache-affinity evidence directly from retained response-body
+ * chunks (SSE or JSON) using the shared provider usage normalizer. Never
+ * throws: affinity is a best-effort routing hint.
+ */
+export function engineCacheConfirmedFromResponseChunks(
+  chunks: readonly Uint8Array[],
+): boolean | undefined {
+  try {
+    return engineCacheConfirmedFromUsage(parseProviderUsage(chunks));
+  } catch {
+    return undefined;
+  }
+}
+
 function classifyTerminalRecord(
   record: SseRecord,
   surface: ProtocolSurface,
@@ -1274,6 +1302,78 @@ export function extractTailUsageObject(text: string): Record<string, unknown> | 
     }
   }
   return undefined;
+}
+
+/**
+ * Retains the first `maxBytes` of response bytes. Streaming APIs report some
+ * usage categories in early events (Anthropic `message_start` carries
+ * `cache_read_input_tokens`), which fall out of the bounded tail window once
+ * a stream grows beyond it. Mirrored by relay attempts for affinity evidence.
+ */
+export function retainProviderUsagePrefix(
+  chunks: Uint8Array[],
+  currentBytes: number,
+  chunk: Uint8Array,
+  maxBytes = 64 * 1024,
+): number {
+  if (currentBytes >= maxBytes) return currentBytes;
+  const prefix = chunk.subarray(0, maxBytes - currentBytes);
+  if (prefix.byteLength === 0) return currentBytes;
+  chunks.push(prefix);
+  return currentBytes + prefix.byteLength;
+}
+
+/**
+ * Overlays tail-window usage onto prefix-window usage with tail precedence:
+ * categories defined in the tail win, and categories only reported early
+ * (before the response exceeded the tail window) are preserved from the
+ * prefix. Undefined in both windows stays undefined.
+ */
+export function mergeProviderUsage(
+  initial: RawProviderUsage | undefined,
+  tail: RawProviderUsage | undefined,
+  surface?: ProtocolSurface,
+): RawProviderUsage | undefined {
+  if (!initial || !tail) return tail ?? initial;
+  return {
+    ...initial,
+    ...Object.fromEntries(Object.entries(tail).filter(([, value]) => value !== undefined)),
+    inputTokens: tail.inputTokens ?? initial.inputTokens,
+    outputTokens: tail.outputTokens ?? initial.outputTokens,
+    categoriesComplete:
+      initial.categoriesComplete === false || tail.categoriesComplete === false
+        ? false
+        : surface === "anthropic-messages" &&
+            (tail.inputTokens ?? initial.inputTokens) !== undefined &&
+            (tail.outputTokens ?? initial.outputTokens) !== undefined
+          ? true
+          : (tail.categoriesComplete ?? initial.categoriesComplete),
+    rawUsage: [initial.rawUsage, tail.rawUsage],
+  } as RawProviderUsage;
+}
+
+/**
+ * Derives engine cache-affinity evidence from retained prefix+tail response
+ * chunks. When the response exceeded the tail window, early usage events only
+ * survive in the prefix, so both windows are parsed and merged with the same
+ * tail-precedence semantics the usage reconcile applies. Never throws.
+ */
+export function engineCacheConfirmedFromRetainedResponse(
+  prefixChunks: readonly Uint8Array[],
+  tailChunks: readonly Uint8Array[],
+  responseBytes: number,
+  tailWindowBytes = 1024 * 1024,
+): boolean | undefined {
+  try {
+    if (responseBytes <= tailWindowBytes) {
+      return engineCacheConfirmedFromUsage(parseProviderUsage(tailChunks));
+    }
+    return engineCacheConfirmedFromUsage(
+      mergeProviderUsage(parseProviderUsage(prefixChunks), parseProviderUsage(tailChunks)),
+    );
+  } catch {
+    return undefined;
+  }
 }
 
 export function retainProviderUsageTail(
@@ -2044,6 +2144,7 @@ export async function dispatchPublicOverflow(
       let firstClientByteAt: Date | undefined;
       let firstClientBytePersistence: Promise<void> | undefined;
       const usageChunks: Uint8Array[] = [];
+      let settledUsage: RawProviderUsage | undefined;
       const initialUsageChunks: Uint8Array[] = [];
       let initialUsageBytes = 0;
       const nonstreamChunks: Uint8Array[] = [];
@@ -2126,27 +2227,7 @@ export async function dispatchPublicOverflow(
             responseBytes > 1024 * 1024
               ? parseProviderUsage(initialUsageChunks, pricing)
               : undefined;
-          const combinedUsage =
-            initialUsage && tailUsage
-              ? ({
-                  ...initialUsage,
-                  ...Object.fromEntries(
-                    Object.entries(tailUsage).filter(([, value]) => value !== undefined),
-                  ),
-                  inputTokens: tailUsage.inputTokens ?? initialUsage.inputTokens,
-                  outputTokens: tailUsage.outputTokens ?? initialUsage.outputTokens,
-                  categoriesComplete:
-                    initialUsage.categoriesComplete === false ||
-                    tailUsage.categoriesComplete === false
-                      ? false
-                      : surface === "anthropic-messages" &&
-                          (tailUsage.inputTokens ?? initialUsage.inputTokens) !== undefined &&
-                          (tailUsage.outputTokens ?? initialUsage.outputTokens) !== undefined
-                        ? true
-                        : (tailUsage.categoriesComplete ?? initialUsage.categoriesComplete),
-                  rawUsage: [initialUsage.rawUsage, tailUsage.rawUsage],
-                } as RawProviderUsage)
-              : (tailUsage ?? initialUsage);
+          const combinedUsage = mergeProviderUsage(initialUsage, tailUsage, surface);
           const combinedCost =
             combinedUsage && pricing ? calculatedCostForUsage(combinedUsage, pricing) : undefined;
           const observedUsage: RawProviderUsage | undefined = combinedCost
@@ -2174,6 +2255,9 @@ export async function dispatchPublicOverflow(
                 observationComplete,
               }
             : undefined;
+          // Publish the settled usage before the terminal resolves so the
+          // best-effort affinity write observes the same evidence as billing.
+          settledUsage = usage;
           await reconcileProviderBudget({
             userId: request.userId,
             providerAccountId: target.providerAccountId,
@@ -2275,13 +2359,11 @@ export async function dispatchPublicOverflow(
                   nonstreamChunks.length = 0;
                 }
               }
-              if (initialUsageBytes < 64 * 1024) {
-                const prefix = chunk.value.subarray(0, 64 * 1024 - initialUsageBytes);
-                if (prefix.byteLength > 0) {
-                  initialUsageChunks.push(prefix);
-                  initialUsageBytes += prefix.byteLength;
-                }
-              }
+              initialUsageBytes = retainProviderUsagePrefix(
+                initialUsageChunks,
+                initialUsageBytes,
+                chunk.value,
+              );
               // Retain the bounded tail, not merely the prefix. Streaming APIs
               // report authoritative usage in terminal events, which may occur
               // after arbitrarily large content deltas.
@@ -2392,6 +2474,7 @@ export async function dispatchPublicOverflow(
                   surface: request.requestedSurface,
                   payload: parsed as Record<string, unknown>,
                   target: target.affinityTarget,
+                  engineCacheConfirmed: engineCacheConfirmedFromUsage(settledUsage),
                   estimatedTokens:
                     request.estimatedInputTokens === undefined
                       ? undefined

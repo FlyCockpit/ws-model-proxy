@@ -147,6 +147,7 @@ import {
   conservativeProviderLiability,
   conservativeSerializedInputTokens,
   dispatchPublicOverflow,
+  engineCacheConfirmedFromRetainedResponse,
   listPublicOverflowTargets,
   matchesChatTestProviderMode,
   orderChatTestProviderTargets,
@@ -155,6 +156,8 @@ import {
   type PublicProviderTarget,
   publicTargetCompatibility,
   resolvePublicProviderExecution,
+  retainProviderUsagePrefix,
+  retainProviderUsageTail,
 } from "./public-overflow.js";
 import { type RelayAttemptTerminal, startRelayAttempt } from "./relay-executor.js";
 import { shouldRetryRelayOperation } from "./relay-retry-policy.js";
@@ -4838,6 +4841,16 @@ async function relayPool({
       operation.responseStickiness && operation.family === "responses"
         ? createResponseIdCapture()
         : null;
+    // Retain both the bounded response prefix and tail so cache-affinity
+    // evidence survives early usage events (Anthropic message_start) on
+    // streams larger than the tail window. Buffers are per-attempt: they are
+    // declared inside the candidate loop so retries cannot contaminate each
+    // other's evidence.
+    const usagePrefixChunks: Uint8Array[] = [];
+    let usagePrefixBytes = 0;
+    const usageTailChunks: Uint8Array[] = [];
+    let usageTailBytes = 0;
+    let usageResponseBytes = 0;
     const attemptTimeoutMs = remainingRelayBudgetMs(relayDeadlineMs);
     if (attemptTimeoutMs === 0) {
       await settleRelayCleanup([
@@ -4883,9 +4896,12 @@ async function relayPool({
         ...relayAttemptBody(builtRequest.body),
         timeoutMs: attemptTimeoutMs,
         abortSignal: request.signal,
-        onResponseBodyChunk: responseIdCapture
-          ? (chunk) => responseIdCapture.push(chunk, operation.stream)
-          : undefined,
+        onResponseBodyChunk: (chunk) => {
+          usageResponseBytes += chunk.byteLength;
+          usagePrefixBytes = retainProviderUsagePrefix(usagePrefixChunks, usagePrefixBytes, chunk);
+          usageTailBytes = retainProviderUsageTail(usageTailChunks, usageTailBytes, chunk);
+          responseIdCapture?.push(chunk, operation.stream);
+        },
       });
     } catch {
       attempt?.cancel("unknown");
@@ -5076,6 +5092,11 @@ async function relayPool({
           ]);
           reportCleanupFailures(cleanup);
           const responseId = responseIdCapture?.finish(operation.stream) ?? null;
+          const engineCacheConfirmed = engineCacheConfirmedFromRetainedResponse(
+            usagePrefixChunks,
+            usageTailChunks,
+            usageResponseBytes,
+          );
           const affinityTarget = requestedSurface
             ? affinityTargetForMember(
                 member,
@@ -5145,6 +5166,7 @@ async function relayPool({
                   surface: requestedSurface,
                   payload: affinityPayload,
                   target: affinityTarget,
+                  engineCacheConfirmed,
                   estimatedTokens: operation.contextCount?.tokens,
                 })
               : Promise.resolve(),

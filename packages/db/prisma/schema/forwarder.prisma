@@ -927,7 +927,7 @@ model ModelPool {
   capacityContextMargin           Int                           @default(0)
   /// Cache affinity is a routing hint only and never overrides compatibility,
   /// capacity, health, privacy, or provider-budget constraints.
-  affinityEnabled                 Boolean                       @default(false)
+  affinityEnabled                 Boolean                       @default(true)
   affinityTtlSeconds              Int                           @default(3600)
   affinityMaxRecords              Int                           @default(10000)
   affinityPrefixWeight            Int                           @default(100)
