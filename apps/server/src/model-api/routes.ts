@@ -125,6 +125,7 @@ import {
   openAiErrorBody,
   openAiFailureJsonResponse,
   relayFailureHttpStatus,
+  relayFailureMessage,
 } from "./openai-errors.js";
 import {
   ADAPTER_VERSION,
@@ -208,7 +209,6 @@ type JsonObject = Record<string, unknown>;
 
 type ModelApiEndpointFamily =
   | "chat.completions"
-  | "completions"
   | "embeddings"
   | "responses"
   | "messages"
@@ -216,7 +216,6 @@ type ModelApiEndpointFamily =
 
 type ModelApiCapability =
   | "chat.completions"
-  | "completions"
   | "embeddings"
   | "audio.transcriptions"
   | "audio.translations"
@@ -270,6 +269,20 @@ type RelayOperation = {
   };
 };
 
+function adaptedStreamingRefusalMessage(
+  operation: Pick<RelayOperation, "family" | "stream">,
+  executions: Iterable<{ mode: string; limitations: readonly string[] } | null | undefined>,
+): string | undefined {
+  if (operation.family !== "messages" || !operation.stream) return undefined;
+  const blockedOnlyByInitialUsage = [...executions].some(
+    (execution) =>
+      execution?.mode === "unavailable" &&
+      execution.limitations.length === 1 &&
+      execution.limitations[0] === "anthropic_initial_usage_unavailable",
+  );
+  return blockedOnlyByInitialUsage ? "Streaming is unavailable for this target." : undefined;
+}
+
 function operationFailureResponse(
   operation: Pick<RelayOperation, "family">,
   failure: RelayFailure,
@@ -279,16 +292,7 @@ function operationFailureResponse(
   const status = relayFailureHttpStatus(failure);
   return anthropicErrorResponse(
     status,
-    message ??
-      (failure === "request_too_large"
-        ? "Request body is too large."
-        : failure === "unsupported_capability"
-          ? "The requested Anthropic operation is not supported by this target."
-          : failure === "not_found"
-            ? "The requested model was not found."
-            : failure === "access_denied"
-              ? "Access denied."
-              : "The request could not be completed."),
+    message ?? relayFailureMessage(failure),
     status === 404
       ? "not_found_error"
       : status === 401 || status === 403
@@ -1168,16 +1172,6 @@ function supportsCapability({
     );
   }
 
-  if (capability === "completions") {
-    return (
-      resolveExecutionPath({
-        capabilities,
-        requestedSurface: "OPENAI_COMPLETIONS",
-        request: { stream },
-      }).mode === "native"
-    );
-  }
-
   if (capability === "embeddings") {
     return capabilities?.embeddings?.supported === true;
   }
@@ -1350,7 +1344,6 @@ function requestedSurfaceForOperation(operation: RelayOperation): ProtocolSurfac
 
 function telemetrySurfaceForOperation(operation: RelayOperation): string {
   if (operation.family === "chat.completions") return "OPENAI_CHAT_COMPLETIONS";
-  if (operation.family === "completions") return "OPENAI_COMPLETIONS";
   if (operation.family === "embeddings") return "OPENAI_EMBEDDINGS";
   if (operation.family === "responses") return "OPENAI_RESPONSES";
   if (operation.family === "messages") return "ANTHROPIC_MESSAGES";
@@ -4325,7 +4318,11 @@ async function relayPool({
       startedAt,
       failure: "unsupported_capability",
     });
-    return operationFailureResponse(operation, "unsupported_capability");
+    return operationFailureResponse(
+      operation,
+      "unsupported_capability",
+      adaptedStreamingRefusalMessage(operation, executionByMember.values()),
+    );
   }
 
   const activeCliDeviceIds = manager.getActiveCliDeviceIds();
@@ -6442,7 +6439,7 @@ async function completionsHandler({
   capacityRuntime,
 }: {
   request: Request;
-  family: "chat.completions" | "completions";
+  family: "chat.completions";
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
   adaptationFeatureEnabled?: boolean;
@@ -6453,7 +6450,7 @@ async function completionsHandler({
     operation: {
       family,
       method: "POST",
-      path: family === "chat.completions" ? "/v1/chat/completions" : "/v1/completions",
+      path: "/v1/chat/completions",
       capability: family,
     },
     prepare: prepareJsonModeledRequest,
@@ -6958,7 +6955,11 @@ async function prepareAnthropicModeledRequest(
 ): Promise<PreparedModeledRequest | Response> {
   const body = await readModelApiBody(request);
   if (body instanceof Response) {
-    return anthropicErrorResponse(413, "Request body is too large.", "request_too_large");
+    return anthropicErrorResponse(
+      413,
+      relayFailureMessage("request_too_large"),
+      "request_too_large",
+    );
   }
   let payload: JsonObject;
   try {
@@ -7065,17 +7066,6 @@ export function createModelApiRoutes({
     completionsHandler({
       request: c.req.raw,
       family: "chat.completions",
-      manager,
-      limiter: concurrencyLimiter,
-      adaptationFeatureEnabled: protocolAdaptationEnabled,
-      capacityRuntime: admissionRuntime,
-    }),
-  );
-
-  app.post("/completions", async (c) =>
-    completionsHandler({
-      request: c.req.raw,
-      family: "completions",
       manager,
       limiter: concurrencyLimiter,
       adaptationFeatureEnabled: protocolAdaptationEnabled,

@@ -141,7 +141,6 @@ describe("surface capability resolution", () => {
       mode: "adapted",
       nativeSurface: "ANTHROPIC_MESSAGES",
     });
-    expect(matrix.OPENAI_COMPLETIONS.mode).toBe("unavailable");
     expect(
       resolveExecutionPath({
         capabilities: anthropic,
@@ -251,7 +250,7 @@ describe("surface capability resolution", () => {
     ).toBe("OPENAI_CHAT_COMPLETIONS");
   });
 
-  it("keeps stateful Responses and legacy Completions native-only", () => {
+  it("keeps stateful Responses native-only", () => {
     expect(
       resolveExecutionPath({
         capabilities: anthropic,
@@ -260,13 +259,6 @@ describe("surface capability resolution", () => {
         adaptationEnabled: true,
       }).limitations,
     ).toContain("native_only_operation");
-    expect(
-      resolveExecutionPath({
-        capabilities: anthropic,
-        requestedSurface: "OPENAI_COMPLETIONS",
-        adaptationEnabled: true,
-      }).mode,
-    ).toBe("unavailable");
   });
 
   it("resolves every Responses operation's selection, method, path, and retry safety", () => {

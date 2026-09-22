@@ -24,6 +24,112 @@ export function rejectUnknown(
     unsupported(`${path}.${unknown}`, "has unknown semantics and is not safely adaptable");
 }
 
+const chatEnvelopeNullFields = [
+  "prompt_logprobs",
+  "prompt_token_ids",
+  "prompt_text",
+  "kv_transfer_params",
+  "ec_transfer_params",
+  "metrics",
+] as const;
+
+const chatChoiceNullFields = ["token_ids", "routed_experts"] as const;
+
+function acceptNullOnly(value: Record<string, unknown>, path: string, fields: readonly string[]) {
+  for (const field of fields) if (value[field] != null) unsupported(`${path}.${field}`);
+}
+
+/** Chat envelope fields that carry no cross-protocol answer. Null means absent. */
+export function acceptChatEnvelopeExtras(
+  body: Record<string, unknown>,
+  path: string,
+  mode: "final" | "chunk",
+) {
+  rejectUnknown(
+    body,
+    [
+      "id",
+      "object",
+      "created",
+      "model",
+      "choices",
+      "usage",
+      "system_fingerprint",
+      ...(mode === "final" ? (["service_tier"] as const) : []),
+      ...chatEnvelopeNullFields,
+    ],
+    path,
+  );
+  acceptNullOnly(body, path, chatEnvelopeNullFields);
+}
+
+/**
+ * `stop_reason` on a chat choice is an internal token id, not a protocol stop
+ * reason, so any value is ignored. `token_ids` and `routed_experts` are absent
+ * only when null.
+ */
+export function acceptChatChoiceExtras(
+  choice: Record<string, unknown>,
+  path: string,
+  contentKey: "message" | "delta",
+) {
+  rejectUnknown(
+    choice,
+    ["index", contentKey, "finish_reason", "logprobs", "stop_reason", ...chatChoiceNullFields],
+    path,
+  );
+  acceptNullOnly(choice, path, chatChoiceNullFields);
+}
+
+const chatMessageFields = [
+  "role",
+  "content",
+  "refusal",
+  "tool_calls",
+  "annotations",
+  "audio",
+  "function_call",
+  "reasoning",
+] as const;
+
+// Null audio, a null function_call, and empty annotations are absence.
+// Reasoning text is omitted. A final message or completed stream that contains only reasoning still fails.
+export function acceptChatMessageExtras(
+  message: Record<string, unknown>,
+  path: string,
+  mode: "final" | "delta",
+): { droppedReasoningText: boolean } {
+  rejectUnknown(message, chatMessageFields, path);
+  if (message.audio !== undefined && message.audio !== null) unsupported(`${path}.audio`);
+  if (message.function_call !== undefined && message.function_call !== null)
+    unsupported(`${path}.function_call`);
+  if (message.annotations !== undefined && message.annotations !== null) {
+    if (!Array.isArray(message.annotations))
+      invalid(`${path}.annotations`, "must be an array or null");
+    if (message.annotations.length)
+      unsupported(`${path}.annotations`, "citations are not safely adaptable");
+  }
+  const reasoning = message.reasoning;
+  if (reasoning === undefined || reasoning === null || reasoning === "")
+    return { droppedReasoningText: false };
+  if (typeof reasoning !== "string") invalid(`${path}.reasoning`, "must be text or null");
+  const hasContent = typeof message.content === "string" && message.content.length > 0;
+  const hasRefusal = typeof message.refusal === "string" && message.refusal.length > 0;
+  const hasTools = Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
+  if (mode === "final" && !hasContent && !hasRefusal && !hasTools)
+    unsupported(`${path}.reasoning`, "is the only visible text");
+  return { droppedReasoningText: true };
+}
+
+export function acceptTokenCountDetails(value: unknown, path: string, allowed: readonly string[]) {
+  if (value == null) return;
+  const details = object(value, path);
+  rejectUnknown(details, allowed, path);
+  for (const [name, count] of Object.entries(details))
+    if (!Number.isInteger(count) || (count as number) < 0)
+      invalid(`${path}.${name}`, "must be a non-negative integer");
+}
+
 export function texts(value: unknown, parameter: string): CanonicalText[] {
   if (typeof value === "string") return [{ type: "text", text: value }];
   if (!Array.isArray(value)) invalid(parameter, "must be text or an array of text blocks");

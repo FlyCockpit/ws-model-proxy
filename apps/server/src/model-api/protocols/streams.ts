@@ -1,7 +1,14 @@
 import type { CanonicalEvent, ProtocolSurface } from "./canonical.js";
 import { AdapterError, unsupported } from "./errors.js";
 import { renderProtocolError } from "./nonstream.js";
-import { object, rejectUnknown } from "./parse-utils.js";
+import {
+  acceptChatChoiceExtras,
+  acceptChatEnvelopeExtras,
+  acceptChatMessageExtras,
+  acceptTokenCountDetails,
+  object,
+  rejectUnknown,
+} from "./parse-utils.js";
 import { SseDecoder, type SseRecord } from "./sse.js";
 
 export class CanonicalStreamParser {
@@ -46,6 +53,7 @@ export class CanonicalStreamParser {
   #aggregateBytes = 0;
   #pendingChatStop?: ReturnType<typeof stopReason>;
   #chatUsageSeen = false;
+  #droppedReasoningText = false;
   #messageId?: string;
   #messageModel?: string;
 
@@ -245,6 +253,14 @@ export class CanonicalStreamParser {
       );
     if (!this.#stopped)
       throw new AdapterError("terminal_before_stop", "Terminal event arrived before a stop event.");
+    if (
+      this.#surface === "openai-chat" &&
+      this.#droppedReasoningText &&
+      ![...this.#itemTypes.values()].some(
+        (type) => type === "text" || type === "refusal" || type === "tool_call",
+      )
+    )
+      throw new AdapterError("unsupported_stream_event", "Reasoning is the only visible text.");
     this.#assertItemsComplete();
     this.#terminal = true;
     return [{ type: "complete" }];
@@ -293,11 +309,7 @@ export class CanonicalStreamParser {
     }
     if (this.#pendingChatStop && Array.isArray(value.choices) && value.choices.length > 0)
       throw new AdapterError("event_after_stop", "Chat candidate event followed finish_reason.");
-    rejectUnknown(
-      value,
-      ["id", "object", "created", "model", "system_fingerprint", "choices", "usage"],
-      "stream.data",
-    );
+    acceptChatEnvelopeExtras(value, "stream.data", "chunk");
     if (!Number.isSafeInteger(value.created) || (value.created as number) < 0)
       throw new AdapterError("invalid_stream_event", "Chat created must be a timestamp integer.");
     if (typeof value.model !== "string" || value.model.length === 0)
@@ -321,10 +333,11 @@ export class CanonicalStreamParser {
     if (!choice) return events;
     if (choice.index !== undefined && choice.index !== 0)
       throw new AdapterError("multiple_candidates", "Only candidate zero is adaptable.");
-    rejectUnknown(choice, ["index", "delta", "finish_reason", "logprobs"], "choices[0]");
+    acceptChatChoiceExtras(choice, "choices[0]", "delta");
     if (choice.logprobs != null) unsupported("choices[0].logprobs");
     const delta = object(choice.delta ?? {}, "choices[0].delta");
-    rejectUnknown(delta, ["role", "content", "refusal", "tool_calls"], "choices[0].delta");
+    const extras = acceptChatMessageExtras(delta, "choices[0].delta", "delta");
+    if (extras.droppedReasoningText) this.#droppedReasoningText = true;
     if (delta.role !== undefined && delta.role !== "assistant")
       throw new AdapterError("invalid_stream_event", "Stream delta role must be assistant.");
     if (
@@ -997,6 +1010,9 @@ function usageEvent(
     ],
     "stream.usage",
   );
+  acceptTokenCountDetails(usage.prompt_tokens_details, "stream.usage.prompt_tokens_details", [
+    "cached_tokens",
+  ]);
   const input = usage.input_tokens ?? usage.prompt_tokens;
   const output = usage.output_tokens ?? usage.completion_tokens;
   if (

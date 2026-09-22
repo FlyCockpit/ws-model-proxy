@@ -4,7 +4,6 @@ export const modelApiSurfaces = [
   "OPENAI_CHAT_COMPLETIONS",
   "OPENAI_RESPONSES",
   "ANTHROPIC_MESSAGES",
-  "OPENAI_COMPLETIONS",
 ] as const;
 export type ModelApiSurface = (typeof modelApiSurfaces)[number];
 export type SurfaceMode = "native" | "adapted" | "unavailable";
@@ -88,7 +87,6 @@ function nativeFeatures(
       OPENAI_CHAT_COMPLETIONS: "openaiChatCompletions",
       OPENAI_RESPONSES: "openaiResponses",
       ANTHROPIC_MESSAGES: "anthropicMessages",
-      OPENAI_COMPLETIONS: "openaiCompletions",
     }[surface] as keyof typeof capabilities.surfaces;
     const inventorySurface = capabilities.surfaces[key];
     if (!inventorySurface) return undefined;
@@ -130,14 +128,12 @@ function nativeFeatures(
       : undefined;
   }
   if (surface === "OPENAI_RESPONSES") return capabilities.responses;
-  if (surface === "OPENAI_COMPLETIONS") return capabilities.completions;
   return undefined;
 }
 
 function operationFor(surface: ModelApiSurface, request: SurfaceRequestRequirements) {
   if (surface === "OPENAI_CHAT_COMPLETIONS")
     return { method: "POST" as const, path: "/v1/chat/completions" };
-  if (surface === "OPENAI_COMPLETIONS") return { method: "POST" as const, path: "/v1/completions" };
   if (surface === "ANTHROPIC_MESSAGES")
     return {
       method: "POST" as const,
@@ -294,13 +290,8 @@ export function surfaceAvailabilityMatrix({
       };
       continue;
     }
-    // Legacy Completions and stateful Responses are deliberately never adapted.
-    const adaptationSources =
-      requested === "OPENAI_COMPLETIONS"
-        ? []
-        : modelApiSurfaces.filter(
-            (surface) => surface !== requested && surface !== "OPENAI_COMPLETIONS",
-          );
+    // Stateful Responses operations are deliberately never adapted.
+    const adaptationSources = modelApiSurfaces.filter((surface) => surface !== requested);
     const source =
       adaptationEnabled && capabilities
         ? adaptationSources.find(
@@ -361,7 +352,6 @@ export function resolveExecutionPath({
     });
 
   const nativeOnly =
-    requestedSurface === "OPENAI_COMPLETIONS" ||
     (requestedSurface === "OPENAI_RESPONSES" && responsesOperationFor(request) !== "create") ||
     (requestedSurface === "ANTHROPIC_MESSAGES" && request.countTokens === true);
   const evaluate = (nativeSurface: ModelApiSurface, mode: "native" | "adapted") => {
@@ -423,7 +413,7 @@ export function resolveExecutionPath({
     // Stable order is intentional and makes equal candidates deterministic.
     let firstCandidateFailure: { nativeSurface: ModelApiSurface; failures: string[] } | undefined;
     for (const source of modelApiSurfaces) {
-      if (source === requestedSurface || source === "OPENAI_COMPLETIONS") continue;
+      if (source === requestedSurface) continue;
       const candidate = evaluate(source, "adapted");
       if (candidate && !firstCandidateFailure)
         firstCandidateFailure = { nativeSurface: source, failures: candidate.failures };

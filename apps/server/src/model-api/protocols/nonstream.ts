@@ -6,7 +6,15 @@ import type {
   ProtocolSurface,
 } from "./canonical.js";
 import { AdapterError, invalid, unsupported } from "./errors.js";
-import { object, rejectUnknown, string } from "./parse-utils.js";
+import {
+  acceptChatChoiceExtras,
+  acceptChatEnvelopeExtras,
+  acceptChatMessageExtras,
+  acceptTokenCountDetails,
+  object,
+  rejectUnknown,
+  string,
+} from "./parse-utils.js";
 
 export function parseProtocolResponse({
   surface,
@@ -135,25 +143,17 @@ export function safeProviderRateReset(
 
 function parseChatSuccess(value: unknown): CanonicalResponse {
   const body = object(value);
-  rejectUnknown(
-    body,
-    ["id", "object", "created", "model", "choices", "usage", "system_fingerprint", "service_tier"],
-    "response",
-  );
+  acceptChatEnvelopeExtras(body, "response", "final");
   if (body.object !== "chat.completion") invalid("response.object", "must be chat.completion");
   if (!Array.isArray(body.choices) || body.choices.length !== 1)
     unsupported("response.choices", "must contain exactly one candidate");
   const choice = object(body.choices[0], "response.choices[0]");
-  rejectUnknown(choice, ["index", "message", "finish_reason", "logprobs"], "response.choices[0]");
+  acceptChatChoiceExtras(choice, "response.choices[0]", "message");
   if (choice.index !== 0) invalid("response.choices[0].index", "must be zero");
   if (choice.logprobs !== undefined && choice.logprobs !== null)
     unsupported("response.choices[0].logprobs");
   const message = object(choice.message, "response.choices[0].message");
-  rejectUnknown(
-    message,
-    ["role", "content", "refusal", "tool_calls"],
-    "response.choices[0].message",
-  );
+  acceptChatMessageExtras(message, "response.choices[0].message", "final");
   if (message.role !== "assistant")
     invalid("response.choices[0].message.role", "must be assistant");
   const items: CanonicalResponse["items"] = [];
@@ -386,6 +386,7 @@ function parseUsage(value: unknown) {
     "cache_read_input_tokens",
     "input_tokens_details",
     "output_tokens_details",
+    "prompt_tokens_details",
   ];
   rejectUnknown(usage, allowed, "usage");
   const input = usage.input_tokens ?? usage.prompt_tokens;
@@ -404,18 +405,15 @@ function parseUsage(value: unknown) {
     (!Number.isInteger(usage.total_tokens) || usage.total_tokens !== input + output)
   )
     invalid("usage.total_tokens", "must equal input plus output tokens");
-  for (const key of ["input_tokens_details", "output_tokens_details"] as const) {
-    if (usage[key] === undefined) continue;
-    const details = object(usage[key], `usage.${key}`);
-    rejectUnknown(
-      details,
-      key === "input_tokens_details" ? ["cached_tokens"] : ["reasoning_tokens"],
-      `usage.${key}`,
-    );
-    for (const [name, count] of Object.entries(details))
-      if (!Number.isInteger(count) || (count as number) < 0)
-        invalid(`usage.${key}.${name}`, "must be a non-negative integer");
-  }
+  acceptTokenCountDetails(usage.input_tokens_details, "usage.input_tokens_details", [
+    "cached_tokens",
+  ]);
+  acceptTokenCountDetails(usage.prompt_tokens_details, "usage.prompt_tokens_details", [
+    "cached_tokens",
+  ]);
+  acceptTokenCountDetails(usage.output_tokens_details, "usage.output_tokens_details", [
+    "reasoning_tokens",
+  ]);
   return {
     ...(typeof input === "number" ? { inputTokens: input } : {}),
     ...(typeof output === "number" ? { outputTokens: output } : {}),

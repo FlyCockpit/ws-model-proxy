@@ -410,7 +410,6 @@ export class RelaySessionManager {
     requestId: string;
     family:
       | "chat.completions"
-      | "completions"
       | "embeddings"
       | "responses"
       | "messages"

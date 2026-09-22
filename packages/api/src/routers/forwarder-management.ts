@@ -3575,11 +3575,7 @@ export const forwarderManagementRouter = {
         | "EMBEDDING"
         | "RESPONSES_API"
       > = [];
-      if (
-        metadata.chatCompletions?.supported ||
-        metadata.completions?.supported ||
-        metadata.responses?.supported
-      ) {
+      if (metadata.chatCompletions?.supported || metadata.responses?.supported) {
         coarse.push("TEXT_GENERATION");
       }
       if (input.vision) coarse.push("VISION_INPUT");

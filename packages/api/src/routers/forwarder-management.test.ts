@@ -1313,7 +1313,6 @@ describe("forwarderManagementRouter", () => {
 
   it.each([
     ["OPENAI_RESPONSES", "a surface a chat-native primary cannot serve without adaptation"],
-    ["OPENAI_COMPLETIONS", "a surface no primary can ever serve"],
   ] as const)("rejects %s as %s", async (recommendedSurface) => {
     db.modelPool.findUnique.mockResolvedValue(null);
     db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel({}, "chat")]);
@@ -1533,13 +1532,13 @@ describe("forwarderManagementRouter", () => {
     db.poolMember.create.mockResolvedValue({ id: "member-id" });
     db.providerBudgetPolicy.create.mockResolvedValue({ id: "budget-id" });
 
-    // A PUBLIC_OVERFLOW-only pool has an empty primary matrix: even
-    // OPENAI_COMPLETIONS (never adaptable) is accepted as the override.
+    // A PUBLIC_OVERFLOW-only pool has an empty primary matrix, so any
+    // recommended API is accepted as the override.
     await client().createGuardedModelPool({
       slug: "guarded-overflow-only",
       name: "Guarded overflow only",
       localModelIds: [],
-      recommendedSurface: "OPENAI_COMPLETIONS",
+      recommendedSurface: "ANTHROPIC_MESSAGES",
       memberConcurrencyLimit: 1,
       memberContextCeiling: null,
       reservedSlots: 0,
@@ -1557,7 +1556,7 @@ describe("forwarderManagementRouter", () => {
 
     expect(db.modelPool.create).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ recommendedSurfaceOverride: "OPENAI_COMPLETIONS" }),
+        data: expect.objectContaining({ recommendedSurfaceOverride: "ANTHROPIC_MESSAGES" }),
       }),
     );
   });
@@ -2455,7 +2454,6 @@ describe("forwarderManagementRouter", () => {
       OPENAI_CHAT_COMPLETIONS: { mode: "native", streaming: true },
       OPENAI_RESPONSES: { mode: "adapted" },
       ANTHROPIC_MESSAGES: { mode: "adapted" },
-      OPENAI_COMPLETIONS: { mode: "unavailable" },
     });
     expect(result.compatibility).toMatchObject({
       recommendedSurface: "ANTHROPIC_MESSAGES",
@@ -2516,14 +2514,14 @@ describe("forwarderManagementRouter", () => {
       client().createModelPool({
         slug: "legacy-completions",
         name: "Legacy Completions",
-        // @ts-expect-error OPENAI_COMPLETIONS is a native protocol, not a pool recommendation.
+        // @ts-expect-error Legacy completions is not a pool recommendation.
         recommendedSurfaceOverride: "OPENAI_COMPLETIONS",
       }),
     ).rejects.toThrow();
     await expect(
       client().updateModelPool({
         id: "pool-id",
-        // @ts-expect-error OPENAI_COMPLETIONS is a native protocol, not a pool recommendation.
+        // @ts-expect-error Legacy completions is not a pool recommendation.
         recommendedSurfaceOverride: "OPENAI_COMPLETIONS",
       }),
     ).rejects.toThrow();

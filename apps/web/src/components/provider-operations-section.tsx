@@ -60,12 +60,7 @@ const credentialFormSchema = z.object({
 export const createModelFormSchema = z.object({
   upstreamModelId: z.string().trim().min(1, "required").max(255, "tooLong"),
   displayName: z.string().trim().max(255, "tooLong"),
-  nativeSurface: z.enum([
-    "OPENAI_CHAT_COMPLETIONS",
-    "OPENAI_RESPONSES",
-    "ANTHROPIC_MESSAGES",
-    "OPENAI_COMPLETIONS",
-  ]),
+  nativeSurface: z.enum(["OPENAI_CHAT_COMPLETIONS", "OPENAI_RESPONSES", "ANTHROPIC_MESSAGES"]),
   streaming: z.boolean(),
   anthropicVersion: z.string().trim().min(1, "required").max(64, "tooLong"),
   betaFeatures: z.string().max(4096, "tooLong"),
@@ -123,9 +118,7 @@ export function providerCapabilityInventory(input: {
     surfaces:
       input.nativeSurface === "OPENAI_RESPONSES"
         ? { openaiResponses: surface }
-        : input.nativeSurface === "OPENAI_COMPLETIONS"
-          ? { openaiCompletions: surface }
-          : { openaiChatCompletions: surface },
+        : { openaiChatCompletions: surface },
   };
   const parsed = parseOpenAiCompatibleCapabilities(inventory);
   if (!parsed) throw new Error("Invalid provider capability inventory");
@@ -986,11 +979,6 @@ export function ProviderOperationsSection() {
                               {t(`dashboard:models.surfaces.${surface}`)}
                             </option>
                           ))}
-                          <optgroup label={t("dashboard:providers.fields.legacySurfaceGroup")}>
-                            <option value="OPENAI_COMPLETIONS">
-                              {t("dashboard:models.surfaces.OPENAI_COMPLETIONS")}
-                            </option>
-                          </optgroup>
                         </select>
                       </Field>
                     )}

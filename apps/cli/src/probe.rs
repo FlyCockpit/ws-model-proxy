@@ -406,7 +406,6 @@ fn reasoning_capabilities(
         confidence: None,
         models: None,
         chat_completions: None,
-        completions: None,
         embeddings: None,
         responses: None,
         audio: None,

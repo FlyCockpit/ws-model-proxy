@@ -260,7 +260,6 @@ function directRow({
   upstreamModelId = "gpt-4o-mini",
   cliDeviceId = "cli-device-id",
   connected = true,
-  completions = true,
   embeddings = true,
   audioTranscriptions = true,
   audioTranslations = true,
@@ -278,7 +277,6 @@ function directRow({
   upstreamModelId?: string;
   cliDeviceId?: string;
   connected?: boolean;
-  completions?: boolean;
   embeddings?: boolean;
   audioTranscriptions?: boolean;
   audioTranslations?: boolean;
@@ -333,7 +331,6 @@ function directRow({
               version: 1,
               protocol: "openai-compatible",
               chatCompletions: { supported: true, streaming: true, vision: true },
-              completions: { supported: completions, streaming: true },
               embeddings: { supported: embeddings },
               audio: {
                 transcriptions: audioTranscriptions,
@@ -952,39 +949,66 @@ describe("model API routes", () => {
     },
   );
 
-  it("does not rank Completions traffic even when a two-member pool has affinity enabled", async () => {
-    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
-      directModels: [],
-      modelPools: [poolTarget],
-    });
-    db.poolMember.findMany.mockResolvedValue([
-      poolMemberRow({
-        id: "member-a",
-        discoveredModelId: "model-a",
-        upstreamModelId: "upstream-a",
-        cliDeviceId: "cli-a",
-        affinityEnabled: true,
-      }),
-      poolMemberRow({
-        id: "member-b",
-        discoveredModelId: "model-b",
-        upstreamModelId: "upstream-b",
-        cliDeviceId: "cli-b",
-        affinityEnabled: true,
-      }),
-    ]);
-    const manager = new FakeRelayManager();
-    manager.activeCliDeviceIds = ["cli-a", "cli-b"];
-    const responsePromise = appWith(manager).request("/completions", {
+  it("does not serve the legacy completions route", async () => {
+    const response = await appWith(new FakeRelayManager()).request("/completions", {
       method: "POST",
       headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
       body: JSON.stringify({ model: poolTarget.modelId, prompt: "secret prompt" }),
     });
-    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
-    const sent = requireSent(manager);
-    await completeJsonRelay({ manager, requestId: sent.requestId, body: { id: "cmpl-unranked" } });
-    expect((await responsePromise).status).toBe(200);
-    expect(affinity.rank).not.toHaveBeenCalled();
+    expect(response.status).toBe(404);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "not_found" } });
+  });
+
+  it("names streaming when an adapted Anthropic stream has no initial usage", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "chat-member",
+        discoveredModelId: "chat-model",
+        upstreamModelId: "upstream-chat",
+        cliDeviceId: "cli-chat",
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiChatCompletions: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+            },
+          },
+        },
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-chat"];
+    const response = await appWith(manager, true, true).request("/messages", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        max_tokens: 8,
+        stream: true,
+        messages: [{ role: "user", content: "ping" }],
+      }),
+    });
+    expect(response.status).toBe(400);
+    expect(manager.sent).toHaveLength(0);
+    await expect(response.json()).resolves.toEqual({
+      type: "error",
+      error: {
+        type: "invalid_request_error",
+        message: "Streaming is unavailable for this target.",
+      },
+    });
   });
 
   it("adapts an opted-in Chat pool request through a Responses-only member", async () => {
@@ -2462,7 +2486,7 @@ describe("model API routes", () => {
     expect((await pending).status).toBe(200);
   });
 
-  it("routes v3 OpenAI Chat, Responses, and native-only Completions surfaces", async () => {
+  it("routes v3 OpenAI Chat and Responses surfaces", async () => {
     const v3OnlyRow = directRow({
       endpointCapabilityMetadata: null,
       capabilityOverrideMetadata: {
@@ -2481,12 +2505,6 @@ describe("model API routes", () => {
             supported: true,
             streaming: true,
           },
-          openaiCompletions: {
-            source: "declared",
-            confidence: "exact",
-            supported: true,
-            streaming: true,
-          },
         },
       },
     });
@@ -2498,7 +2516,6 @@ describe("model API routes", () => {
         { messages: [{ role: "user", content: "hi" }] },
       ],
       ["/responses", "/v1/responses", { input: "hi" }],
-      ["/completions", "/v1/completions", { prompt: "hi" }],
     ] as const) {
       const manager = new FakeRelayManager();
       const pending = appWith(manager).request(route, {
@@ -2666,7 +2683,7 @@ describe("model API routes", () => {
     expect(response.status).toBe(413);
     await expect(response.json()).resolves.toEqual({
       type: "error",
-      error: { type: "request_too_large", message: "Request body is too large." },
+      error: { type: "request_too_large", message: "Model API request body is too large." },
     });
     expect(db.relayRequest.create).not.toHaveBeenCalled();
   });
@@ -2705,7 +2722,7 @@ describe("model API routes", () => {
     expect(response.status).toBe(413);
     await expect(response.json()).resolves.toEqual({
       type: "error",
-      error: { type: "request_too_large", message: "Request body is too large." },
+      error: { type: "request_too_large", message: "Model API request body is too large." },
     });
   });
 
@@ -3007,7 +3024,7 @@ describe("model API routes", () => {
         type: "error",
         error: {
           type: "rate_limit_error",
-          message: "The request could not be completed.",
+          message: "Too many active model API requests.",
         },
       });
     } finally {
@@ -3036,32 +3053,6 @@ describe("model API routes", () => {
         data: expect.objectContaining({
           status: "FAILED",
           errorClass: "disconnected",
-        }),
-      }),
-    );
-  });
-
-  it("returns a clear OpenAI error when completions are unsupported", async () => {
-    db.discoveredModel.findUnique.mockResolvedValue(directRow({ completions: false }));
-
-    const response = await appWith(new FakeRelayManager()).request("/completions", {
-      method: "POST",
-      headers: {
-        authorization: "Bearer wsmp_model_test",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ model: directTarget.modelId, prompt: "secret prompt" }),
-    });
-
-    expect(response.status).toBe(400);
-    await expect(response.json()).resolves.toMatchObject({
-      error: { code: "unsupported_capability" },
-    });
-    expect(db.relayRequest.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        data: expect.objectContaining({
-          status: "FAILED",
-          errorClass: "unsupported_capability",
         }),
       }),
     );
@@ -3176,7 +3167,6 @@ describe("model API routes", () => {
       version: 1,
       protocol: "openai-compatible",
       chatCompletions: { supported: true, streaming: true },
-      completions: { supported: false, streaming: false },
       embeddings: { supported: true },
       audio: {
         transcriptions: false,
@@ -3197,7 +3187,6 @@ describe("model API routes", () => {
     };
     db.discoveredModel.findUnique.mockResolvedValue(
       directRow({
-        completions: true,
         embeddings: false,
         audioTranslations: false,
         audioSpeech: false,
@@ -3205,19 +3194,6 @@ describe("model API routes", () => {
         capabilityOverrideMetadata: overrideCapabilities,
       }),
     );
-
-    const rejectedCompletion = await appWith(new FakeRelayManager()).request("/completions", {
-      method: "POST",
-      headers: {
-        authorization: "Bearer wsmp_model_test",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ model: directTarget.modelId, prompt: "secret prompt" }),
-    });
-    expect(rejectedCompletion.status).toBe(400);
-    await expect(rejectedCompletion.json()).resolves.toMatchObject({
-      error: { code: "unsupported_capability" },
-    });
 
     const embeddingsManager = new FakeRelayManager();
     const embeddingsResponsePromise = appWith(embeddingsManager).request("/embeddings", {

@@ -423,12 +423,14 @@ export function resolvePublicProviderExecution(
     adaptationEnabled: request.adaptationEnabled,
   });
   if (resolved.mode === "unavailable" || !resolved.nativeSurface) return undefined;
-  const nativeSurface: ProtocolSurface | undefined = {
-    OPENAI_CHAT_COMPLETIONS: "openai-chat",
-    OPENAI_RESPONSES: "openai-responses",
-    ANTHROPIC_MESSAGES: "anthropic-messages",
-    OPENAI_COMPLETIONS: undefined,
-  }[resolved.nativeSurface] as ProtocolSurface | undefined;
+  const nativeSurface =
+    resolved.nativeSurface === "OPENAI_CHAT_COMPLETIONS"
+      ? "openai-chat"
+      : resolved.nativeSurface === "OPENAI_RESPONSES"
+        ? "openai-responses"
+        : resolved.nativeSurface === "ANTHROPIC_MESSAGES"
+          ? "anthropic-messages"
+          : undefined;
   return nativeSurface
     ? { mode: resolved.mode, nativeSurface, limitations: resolved.limitations }
     : undefined;

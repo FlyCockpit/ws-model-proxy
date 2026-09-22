@@ -39,7 +39,7 @@ export function relayFailureHttpStatus(failure: RelayFailure): number {
   return 500;
 }
 
-function relayFailureMessage(failure: RelayFailure): string {
+export function relayFailureMessage(failure: RelayFailure): string {
   if (failure === "access_denied") return "Access denied.";
   if (failure === "cancelled") return "Request was cancelled.";
   if (failure === "disconnected") return "The selected model endpoint is disconnected.";
