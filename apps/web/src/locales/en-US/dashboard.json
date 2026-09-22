@@ -206,7 +206,13 @@
     "upstream": "Upstream",
     "vision": "Images",
     "audio": "Chat audio input",
-    "video": "Video"
+    "video": "Video",
+    "surfaces": {
+      "ANTHROPIC_MESSAGES": "Anthropic Messages",
+      "OPENAI_CHAT_COMPLETIONS": "OpenAI Chat Completions",
+      "OPENAI_COMPLETIONS": "OpenAI Completions",
+      "OPENAI_RESPONSES": "OpenAI Responses"
+    }
   },
   "nav": {
     "ariaLabel": "Dashboard sections",
@@ -931,6 +937,8 @@
       "DRAFT": "Draft",
       "RETIRED": "Retired",
       "DISPATCH": "Dispatch",
+      "ATTEMPT_STARTED": "Attempt started",
+      "CRASH_RECOVERED": "Crash recovered",
       "FIRST_CLIENT_BYTE": "First client byte",
       "SKIP": "Skipped",
       "TERMINAL": "Terminal",

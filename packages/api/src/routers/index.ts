@@ -1,9 +1,8 @@
 import type { RouterClient } from "@orpc/server";
 import { getSignupAccessState } from "@ws-model-proxy/auth/signup-policy";
-import prisma from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
 
-import { protectedProcedure, publicProcedure } from "../index";
+import { publicProcedure } from "../index";
 import { adminObservabilityRouter } from "./admin-observability";
 import { authRouter } from "./auth";
 import { capacityManagementRouter } from "./capacity-management";
@@ -19,15 +18,6 @@ import { settingsRouter } from "./settings";
 import { usersRouter } from "./users";
 
 export const appRouter = {
-  health: {
-    check: publicProcedure.handler(() => {
-      return "OK";
-    }),
-    ready: publicProcedure.handler(async () => {
-      await prisma.$queryRaw`SELECT 1`;
-      return "OK";
-    }),
-  },
   appConfig: publicProcedure.handler(async () => {
     const signupAccess = await getSignupAccessState();
     return {
@@ -44,12 +34,6 @@ export const appRouter = {
       // failures) is handled separately by the `auth.verifyEmailTransport`
       // preflight; this flag only reflects whether email is configured at all.
       emailEnabled: Boolean(env.SMTP_HOST),
-    };
-  }),
-  privateData: protectedProcedure.handler(({ context }) => {
-    return {
-      message: "This is private",
-      user: context.session?.user,
     };
   }),
   auth: authRouter,

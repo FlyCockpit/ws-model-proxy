@@ -15,17 +15,27 @@ import { createServerFn } from "@tanstack/react-start";
  * Route usage: both `/$lang/mcp-login` and `/$lang/mcp-consent` call this in
  * `beforeLoad` and throw `notFound()` BEFORE any session/client work when
  * disabled (invariant 13: flag-off MCP login/consent routes are real 404s).
+ *
+ * `allowNoExpiry` mirrors the mint-time WMP_MCP_PAT_ALLOW_NO_EXPIRY contract
+ * (packages/api/src/routers/mcp-tokens.ts) for the settings token panel: the
+ * create dialog only offers the "No expiry" default while the deployment
+ * allows it. The procedure still re-validates at mint time — the flag here is
+ * UX pre-loading, not authorization.
  */
 export const getMcpWebAvailability = createServerFn({ method: "GET" }).handler(
-  async (): Promise<{ enabled: boolean }> => {
+  async (): Promise<{ enabled: boolean; allowNoExpiry: boolean }> => {
     // Initialization failures (including the dynamic import itself —
-    // R83/R84 F7) resolve to enabled: false — the fail-closed direction.
-    // The serverFn never leaks error internals to the client.
+    // R83/R84 F7) resolve to enabled: false / allowNoExpiry: false — the
+    // fail-closed direction. The serverFn never leaks error internals to the
+    // client.
     try {
       const { env } = await import("@ws-model-proxy/env/server");
-      return { enabled: env.WMP_MCP_ENABLED === true };
+      return {
+        enabled: env.WMP_MCP_ENABLED === true,
+        allowNoExpiry: env.WMP_MCP_PAT_ALLOW_NO_EXPIRY === true,
+      };
     } catch {
-      return { enabled: false };
+      return { enabled: false, allowNoExpiry: false };
     }
   },
 );

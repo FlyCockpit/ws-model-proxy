@@ -40,12 +40,6 @@ export const MCP_CIMD_REGISTRATION_POLICY = {
   dynamicClientRegistration: true,
 } as const;
 
-/** DPoP: advertised and validated when a client opts in, never mandatory. */
-export const MCP_DPOP_POLICY = {
-  enabled: true,
-  required: false,
-} as const;
-
 // ---------------------------------------------------------------------------
 // Scopes / resource policy.
 // ---------------------------------------------------------------------------
@@ -82,6 +76,8 @@ export function isMcpPatClientId(clientId: string): boolean {
  * so a compromised session cannot spray unlimited long-lived tokens.
  */
 export const MCP_PAT_MAX_ACTIVE_PER_USER = 10;
+
+export { MCP_PAT_MAX_TTL_DAYS } from "./mcp-pat-limits";
 
 /**
  * Minimum age before the admission path rewrites `lastUsedAt`, so hot MCP
@@ -130,28 +126,12 @@ export function mcpConsentPagePath(locale: Locale = DEFAULT_LOCALE): string {
   return `/${locale}/mcp-consent`;
 }
 
-/** Absolute login page URL on the configured web origin. */
-export function mcpLoginUrl(webOrigin: string, locale: Locale = DEFAULT_LOCALE): string {
-  return new URL(mcpLoginPagePath(locale), webOrigin).toString();
-}
-
-/** Absolute consent page URL on the configured web origin. */
-export function mcpConsentUrl(webOrigin: string, locale: Locale = DEFAULT_LOCALE): string {
-  return new URL(mcpConsentPagePath(locale), webOrigin).toString();
-}
-
 // ---------------------------------------------------------------------------
 // Env-bound canonical values (single source of truth for the server surface).
 // ---------------------------------------------------------------------------
 
 export const MCP_ISSUER: string = canonicalMcpIssuer(env.BETTER_AUTH_URL);
 export const MCP_RESOURCE_URL: string = canonicalMcpResource(env.BETTER_AUTH_URL);
-export const MCP_WEB_ORIGIN: string = resolveMcpWebOrigin({
-  corsOrigin: env.CORS_ORIGIN,
-  baseUrl: env.BETTER_AUTH_URL,
-});
-export const MCP_LOGIN_PAGE_URL: string = mcpLoginUrl(MCP_WEB_ORIGIN);
-export const MCP_CONSENT_PAGE_URL: string = mcpConsentUrl(MCP_WEB_ORIGIN);
 /** Default-locale login path (what the auth plugin's `loginPage` points at). */
 export const MCP_LOGIN_PAGE_PATH_DEFAULT: string = mcpLoginPagePath();
 /** Default-locale consent path (what the auth plugin's `consentPage` points at). */

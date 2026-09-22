@@ -177,6 +177,32 @@ describe("McpGrant (application-owned)", () => {
   });
 });
 
+describe("McpPersonalToken (application-owned)", () => {
+  const token = modelBlock("McpPersonalToken");
+
+  it("enforces unique lookup prefix and secret digest", () => {
+    expect(token).toContain("@@unique([lookupPrefix])");
+    expect(token).toContain("@@unique([secretDigest])");
+  });
+
+  it("keeps the one-token-per-grant relation unique and cascading", () => {
+    // Field-level @unique on grantId (not a block-level @@unique) is the
+    // 1:1 pin: one token owns exactly one grant generation.
+    expect(token).toMatch(/grantId\s+String\s+@unique/);
+    expect(token).toMatch(
+      /grant\s+McpGrant\s+@relation\(fields: \[grantId\], references: \[id\], onDelete: Cascade\)/,
+    );
+  });
+
+  it("indexes owner/revocation lookup and expiry sweeps, cascading on user deletion", () => {
+    expect(token).toContain("@@index([userId, revokedAt])");
+    expect(token).toContain("@@index([expiresAt])");
+    expect(token).toMatch(
+      /user\s+User\s+@relation\("McpPersonalTokenOwner", fields: \[userId\], references: \[id\], onDelete: Cascade\)/,
+    );
+  });
+});
+
 describe("field inventory derived from the installed 1.7.3 plugin schemas", () => {
   // Plugin schema table key -> Prisma model. The prisma models carry extra
   // columns (id, relation scalars like sessionId/refreshId are plugin fields,

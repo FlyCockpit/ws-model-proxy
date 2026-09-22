@@ -5,9 +5,8 @@ import { RateLimiterMemory } from "rate-limiter-flexible";
 import { resolveClientIp } from "./client-ip.js";
 
 /**
- * /mcp chain PIECES (Phase 3, item 3) — prepared here, NOT MOUNTED
- * anywhere in this part. Phase 4 mounts them, in this order, ahead of the
- * MCP handler:
+ * /mcp chain PIECES — prepared here and mounted by the /mcp route
+ * (apps/server/src/app.ts), in this order, ahead of the MCP handler:
  *
  *   1. feature gate (createMcpFeatureGate — WMP_MCP_ENABLED);
  *   2. method gate (mcpMethodGate — 405 `Allow: POST` for non-POST,
@@ -16,7 +15,7 @@ import { resolveClientIp } from "./client-ip.js";
  *   3. unconditional IP-keyed limiter (mcpIpLimiter via mcpIpKey —
  *      runs BEFORE authentication: it must not depend on token validity);
  *   4. request-body cap (MCP_MAX_REQUEST_BODY_BYTES);
- *   5. requireMcpAuth (Phase 4) and live user/ban/2FA checks;
+ *   5. requireMcpAuth and live user/ban/2FA checks;
  *   6. identity-keyed quota (mcpIdentityQuotaLimiter via mcpIdentityKey —
  *      keyed by VERIFIED `sub` + `client_id` claims only);
  *   7. the MCP handler.

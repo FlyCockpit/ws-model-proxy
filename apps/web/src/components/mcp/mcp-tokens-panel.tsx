@@ -1,5 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  endOfLocalDay,
+  latestMcpPatCustomDate,
+  MCP_PAT_NAME_MAX_LENGTH,
+  MCP_PAT_NO_EXPIRY_DISABLED_REASON,
+  mcpPatClientExpiryCapMs,
+} from "@ws-model-proxy/auth/mcp-pat-limits";
+import {
   AlertDialog,
   AlertDialogAction,
   AlertDialogCancel,
@@ -29,27 +36,111 @@ import {
 } from "@ws-model-proxy/ui/components/dialog";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@ws-model-proxy/ui/components/select";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { Copy, Eye, EyeOff, Plus } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
-import { isConflict } from "@/utils/friendly-error";
+import { isBadRequest, isConflict, isForbidden } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 
 function copyToClipboard(value: string, message: string) {
   void navigator.clipboard.writeText(value).then(() => toast.success(message));
 }
 
-export function McpTokensPanel({ createEnabled }: { createEnabled: boolean }) {
+// Preset values are the day counts themselves so the Select value maps 1:1 to
+// the wire math in resolveExpiresAtIso.
+const EXPIRY_NONE = "none";
+const EXPIRY_CUSTOM = "custom";
+const EXPIRY_PRESET_DAYS = { "30": 30, "90": 90, "180": 180, "365": 365 } as const;
+
+type ExpiryChoice = typeof EXPIRY_NONE | keyof typeof EXPIRY_PRESET_DAYS | typeof EXPIRY_CUSTOM;
+
+function toLocalDateInput(date: Date): string {
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${date.getFullYear()}-${month}-${day}`;
+}
+
+// ISO strings on the wire: the procedure's z.coerce.date() accepts them and
+// they survive the JSON codec untouched. null = no expiry.
+function resolveExpiresAtIso(
+  choice: ExpiryChoice,
+  customDate: string,
+  now = new Date(),
+): string | null {
+  if (choice === EXPIRY_NONE) return null;
+  const capMs = mcpPatClientExpiryCapMs(now.getTime());
+  if (choice === EXPIRY_CUSTOM) {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(customDate);
+    if (!match) return null;
+    // End of a local day can sit past the exact 365×24h cap.
+    const end = endOfLocalDay(new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+    return new Date(Math.min(end.getTime(), capMs)).toISOString();
+  }
+  const days = EXPIRY_PRESET_DAYS[choice];
+  return new Date(Math.min(now.getTime() + days * 24 * 60 * 60 * 1000, capMs)).toISOString();
+}
+
+function errorRecord(error: unknown): Record<string, unknown> | null {
+  if (!error || typeof error !== "object") return null;
+  return error as Record<string, unknown>;
+}
+
+function mentionsExpiryIssue(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  if (Array.isArray(value)) return value.some(mentionsExpiryIssue);
+  const record = value as Record<string, unknown>;
+  if (Array.isArray(record.path) && record.path.includes("expiresAt")) return true;
+  return Object.values(record).some(mentionsExpiryIssue);
+}
+
+function createErrorMessageKey(error: unknown): string {
+  if (isConflict(error)) return "settings:mcp.tokens.capReached";
+  const record = errorRecord(error);
+  const data = record?.data;
+  if (
+    isForbidden(error) &&
+    data &&
+    typeof data === "object" &&
+    "reason" in data &&
+    (data as { reason?: unknown }).reason === MCP_PAT_NO_EXPIRY_DISABLED_REASON
+  ) {
+    return "settings:mcp.tokens.noExpiryDisabled";
+  }
+  if (isBadRequest(error) && mentionsExpiryIssue(data)) {
+    return "settings:mcp.tokens.expiryInvalid";
+  }
+  return "settings:mcp.tokens.createFailed";
+}
+
+export function McpTokensPanel({
+  createEnabled,
+  allowNoExpiry,
+}: {
+  createEnabled: boolean;
+  allowNoExpiry: boolean;
+}) {
   const { t } = useTranslation(["settings", "common"]);
   const queryClient = useQueryClient();
   const [createOpen, setCreateOpen] = useState(false);
   const [name, setName] = useState("");
   const [allowWrite, setAllowWrite] = useState(false);
+  const defaultExpiryChoice: ExpiryChoice = allowNoExpiry ? EXPIRY_NONE : "90";
+  const [expiryChoice, setExpiryChoice] = useState<ExpiryChoice>(defaultExpiryChoice);
+  const [customDate, setCustomDate] = useState("");
   const [secret, setSecret] = useState("");
+  const [showRevoked, setShowRevoked] = useState(false);
   const [pendingRevokeId, setPendingRevokeId] = useState<string | null>(null);
 
   const {
@@ -57,7 +148,7 @@ export function McpTokensPanel({ createEnabled }: { createEnabled: boolean }) {
     isPending,
     isError,
     refetch,
-  } = useQuery(orpc.mcpTokens.listMine.queryOptions());
+  } = useQuery(orpc.mcpTokens.listMine.queryOptions({ input: { includeRevoked: showRevoked } }));
 
   const create = useMutation(
     orpc.mcpTokens.create.mutationOptions({
@@ -67,11 +158,7 @@ export function McpTokensPanel({ createEnabled }: { createEnabled: boolean }) {
         toast.success(t("settings:mcp.tokens.created"));
       },
       onError: (error) => {
-        toast.error(
-          isConflict(error)
-            ? t("settings:mcp.tokens.capReached")
-            : t("settings:mcp.tokens.createFailed"),
-        );
+        toast.error(t(createErrorMessageKey(error)));
       },
     }),
   );
@@ -91,6 +178,29 @@ export function McpTokensPanel({ createEnabled }: { createEnabled: boolean }) {
 
   const pendingToken = tokens?.find((token) => token.id === pendingRevokeId);
   const origin = typeof window === "undefined" ? "" : window.location.origin;
+  // Single source for both the trigger's label lookup (Root `items`) and the
+  // popup entries, so the No-expiry option appears/disappears in lockstep.
+  const expiryItems = [
+    ...(allowNoExpiry
+      ? [{ value: EXPIRY_NONE, label: t("settings:mcp.tokens.noExpiryOption") }]
+      : []),
+    { value: "30", label: t("settings:mcp.tokens.days30") },
+    { value: "90", label: t("settings:mcp.tokens.days90") },
+    { value: "180", label: t("settings:mcp.tokens.days180") },
+    { value: "365", label: t("settings:mcp.tokens.days365") },
+    { value: EXPIRY_CUSTOM, label: t("settings:mcp.tokens.customOption") },
+  ] as const;
+  const now = new Date();
+  const minCustomDate = toLocalDateInput(
+    new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1),
+  );
+  // End of local today+365 is past the exact 365×24h server cap for most of the day.
+  const maxCustomDate = toLocalDateInput(latestMcpPatCustomDate(now));
+  const trimmedName = name.trim();
+  const nameIsValid = trimmedName.length >= 1 && trimmedName.length <= MCP_PAT_NAME_MAX_LENGTH;
+  const nameInvalid = name.length > 0 && !nameIsValid;
+  const customDateBlocked =
+    expiryChoice === EXPIRY_CUSTOM && (customDate < minCustomDate || customDate > maxCustomDate);
 
   if (isPending) {
     return (
@@ -128,6 +238,8 @@ export function McpTokensPanel({ createEnabled }: { createEnabled: boolean }) {
                 if (!open) {
                   setName("");
                   setAllowWrite(false);
+                  setExpiryChoice(defaultExpiryChoice);
+                  setCustomDate("");
                   setSecret("");
                 }
               }}
@@ -151,7 +263,14 @@ export function McpTokensPanel({ createEnabled }: { createEnabled: boolean }) {
                   className="space-y-4"
                   onSubmit={(event) => {
                     event.preventDefault();
-                    if (name && !secret) create.mutate({ name, allowWrite });
+                    if (!nameIsValid || customDateBlocked || secret) return;
+                    const expiresAt = resolveExpiresAtIso(expiryChoice, customDate);
+                    if (expiryChoice !== EXPIRY_NONE && expiresAt === null) return;
+                    create.mutate({
+                      name: trimmedName,
+                      allowWrite,
+                      expiresAt,
+                    });
                   }}
                 >
                   {secret ? (
@@ -165,9 +284,17 @@ export function McpTokensPanel({ createEnabled }: { createEnabled: boolean }) {
                         <Input
                           id="mcp-token-name"
                           value={name}
+                          maxLength={MCP_PAT_NAME_MAX_LENGTH}
                           onChange={(event) => setName(event.target.value)}
                           autoComplete="off"
+                          aria-invalid={nameInvalid || undefined}
+                          aria-describedby={nameInvalid ? "mcp-token-name-error" : undefined}
                         />
+                        {nameInvalid ? (
+                          <p id="mcp-token-name-error" className="text-sm text-destructive">
+                            {t("settings:mcp.tokens.nameInvalid")}
+                          </p>
+                        ) : null}
                       </div>
                       <div className="flex min-h-[44px] items-start gap-3">
                         <Checkbox
@@ -184,6 +311,52 @@ export function McpTokensPanel({ createEnabled }: { createEnabled: boolean }) {
                           </p>
                         </div>
                       </div>
+                      <div className="space-y-2">
+                        <Label htmlFor="mcp-token-expiry">
+                          {t("settings:mcp.tokens.expiryLabel")}
+                        </Label>
+                        <Select
+                          items={expiryItems}
+                          value={expiryChoice}
+                          onValueChange={(value) => {
+                            if (value !== null) setExpiryChoice(value as ExpiryChoice);
+                          }}
+                        >
+                          <SelectTrigger id="mcp-token-expiry" className="w-full min-h-[44px]">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {expiryItems.map((item) => (
+                              <SelectItem
+                                key={item.value}
+                                value={item.value}
+                                className="min-h-[44px]"
+                              >
+                                {item.label}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                        <p className="text-sm text-muted-foreground">
+                          {t("settings:mcp.tokens.expiryHelp")}
+                        </p>
+                      </div>
+                      {expiryChoice === EXPIRY_CUSTOM ? (
+                        <div className="space-y-2">
+                          <Label htmlFor="mcp-token-expiry-date">
+                            {t("settings:mcp.tokens.customDateLabel")}
+                          </Label>
+                          <Input
+                            id="mcp-token-expiry-date"
+                            type="date"
+                            value={customDate}
+                            min={minCustomDate}
+                            max={maxCustomDate}
+                            className="min-h-[44px]"
+                            onChange={(event) => setCustomDate(event.target.value)}
+                          />
+                        </div>
+                      ) : null}
                     </>
                   )}
                   {secret ? (
@@ -220,7 +393,7 @@ export function McpTokensPanel({ createEnabled }: { createEnabled: boolean }) {
                       <Button
                         type="submit"
                         className="min-h-[44px]"
-                        disabled={!name || create.isPending}
+                        disabled={create.isPending || !nameIsValid || customDateBlocked}
                       >
                         {create.isPending
                           ? t("settings:mcp.tokens.creating")
@@ -239,53 +412,85 @@ export function McpTokensPanel({ createEnabled }: { createEnabled: boolean }) {
         </div>
       </CardHeader>
       <CardContent className="space-y-4">
+        <div className="flex min-h-[44px] items-start gap-3">
+          <Checkbox
+            id="mcp-tokens-show-revoked"
+            checked={showRevoked}
+            onCheckedChange={(checked) => setShowRevoked(checked === true)}
+          />
+          <div className="space-y-1">
+            <Label htmlFor="mcp-tokens-show-revoked">{t("settings:mcp.tokens.showRevoked")}</Label>
+          </div>
+        </div>
         {tokens.length === 0 ? (
           <p className="text-sm text-muted-foreground">{t("settings:mcp.tokens.empty")}</p>
         ) : (
           <ul className="space-y-3">
-            {tokens.map((token) => (
-              <li key={token.id} className="min-w-0 space-y-2 rounded-md border p-3">
-                <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-                  <div className="min-w-0">
-                    <p className="font-medium break-words">{token.name}</p>
-                    <code className="mt-1 block font-mono text-xs break-all text-muted-foreground">
-                      {token.lookupPrefix}…
-                    </code>
-                  </div>
-                  <Button
-                    type="button"
-                    variant="destructive"
-                    className="min-h-[44px] shrink-0"
-                    disabled={revoke.isPending}
-                    onClick={() => setPendingRevokeId(token.id)}
-                  >
-                    {t("settings:mcp.tokens.revoke")}
-                  </Button>
-                </div>
-                <ul className="flex flex-wrap gap-1.5">
-                  {token.scopes.map((scope) => (
-                    <li
-                      key={scope}
-                      className="min-w-0 break-all rounded bg-muted px-2 py-0.5 font-mono text-xs"
+            {tokens.map((token) => {
+              const revoked = token.revokedAt !== null;
+              const expired =
+                token.expiresAt !== null && new Date(token.expiresAt).getTime() <= Date.now();
+              return (
+                <li
+                  key={token.id}
+                  className={cn(
+                    "min-w-0 space-y-2 rounded-md border p-3",
+                    (revoked || expired) && "opacity-60",
+                  )}
+                >
+                  <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                    <div className="min-w-0">
+                      <div className="flex min-w-0 flex-wrap items-center gap-2">
+                        <p className="font-medium break-words">{token.name}</p>
+                        {revoked ? (
+                          <span className="shrink-0 rounded bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                            {t("settings:mcp.tokens.revokedBadge")}
+                          </span>
+                        ) : expired ? (
+                          <span className="shrink-0 rounded bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                            {t("settings:mcp.tokens.expiredBadge")}
+                          </span>
+                        ) : null}
+                      </div>
+                      <code className="mt-1 block font-mono text-xs break-all text-muted-foreground">
+                        {token.lookupPrefix}…
+                      </code>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="destructive"
+                      className="min-h-[44px] shrink-0"
+                      disabled={revoke.isPending || revoked}
+                      onClick={() => setPendingRevokeId(token.id)}
                     >
-                      {scope}
-                    </li>
-                  ))}
-                </ul>
-                <p className="text-xs text-muted-foreground">
-                  {token.lastUsedAt
-                    ? t("settings:mcp.tokens.lastUsed", {
-                        date: new Date(token.lastUsedAt).toLocaleString(),
-                      })
-                    : t("settings:mcp.tokens.neverUsed")}
-                  {token.expiresAt
-                    ? ` · ${t("settings:mcp.tokens.expires", {
-                        date: new Date(token.expiresAt).toLocaleDateString(),
-                      })}`
-                    : ` · ${t("settings:mcp.tokens.noExpiry")}`}
-                </p>
-              </li>
-            ))}
+                      {t("settings:mcp.tokens.revoke")}
+                    </Button>
+                  </div>
+                  <ul className="flex flex-wrap gap-1.5">
+                    {token.scopes.map((scope) => (
+                      <li
+                        key={scope}
+                        className="min-w-0 break-all rounded bg-muted px-2 py-0.5 font-mono text-xs"
+                      >
+                        {scope}
+                      </li>
+                    ))}
+                  </ul>
+                  <p className="text-xs text-muted-foreground">
+                    {token.lastUsedAt
+                      ? t("settings:mcp.tokens.lastUsed", {
+                          date: new Date(token.lastUsedAt).toLocaleString(),
+                        })
+                      : t("settings:mcp.tokens.neverUsed")}
+                    {token.expiresAt
+                      ? ` · ${t("settings:mcp.tokens.expires", {
+                          date: new Date(token.expiresAt).toLocaleDateString(),
+                        })}`
+                      : ` · ${t("settings:mcp.tokens.noExpiry")}`}
+                  </p>
+                </li>
+              );
+            })}
           </ul>
         )}
       </CardContent>

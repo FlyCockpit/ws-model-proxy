@@ -1096,9 +1096,6 @@ export interface McpToolExclusion {
 }
 
 export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
-  { target: "health.check", reason: "Health/readiness is not a model-proxy operation." },
-  { target: "health.ready", reason: "Health/readiness is not a model-proxy operation." },
-  { target: "privateData", reason: "Demo/diagnostic procedure." },
   {
     target: "auth.verifyEmailTransport",
     reason: "Auth-router surface; not a model-proxy operation.",

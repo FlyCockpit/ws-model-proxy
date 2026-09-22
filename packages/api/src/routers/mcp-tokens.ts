@@ -5,6 +5,12 @@ import {
   MCP_PAT_MAX_ACTIVE_PER_USER,
   mcpPatClientId,
 } from "@ws-model-proxy/auth/mcp-config";
+import {
+  MCP_PAT_MAX_TTL_DAYS,
+  MCP_PAT_NAME_MAX_LENGTH,
+  MCP_PAT_NO_EXPIRY_DISABLED_REASON,
+  mcpPatExpiryRejection,
+} from "@ws-model-proxy/auth/mcp-pat-limits";
 import prisma from "@ws-model-proxy/db";
 import {
   credentialLookupPrefix,
@@ -28,12 +34,40 @@ import { runSerializableTransaction } from "../lib/serializable-transaction";
  * MCP_TOOL_EXCLUSIONS). Create is gated on WMP_MCP_ENABLED and capped at
  * MCP_PAT_MAX_ACTIVE_PER_USER active tokens per user; list/revoke stay
  * available during an emergency MCP shutdown so outstanding tokens can be
- * killed (invariant 13). listMine defaults to active tokens only — token and
- * grant both unrevoked and not yet expired; includeRevoked returns the full
- * history.
+ * killed (invariant 13). Tokens default to NO expiry (unlimited lifetime);
+ * a client-chosen expiresAt is allowed under the MCP_PAT_MAX_TTL_DAYS cap,
+ * and the no-expiry default requires WMP_MCP_PAT_ALLOW_NO_EXPIRY at mint
+ * time (existing tokens are unaffected by the flag). listMine defaults to
+ * active tokens only — token and grant both unrevoked and not yet expired;
+ * includeRevoked returns the full history.
  */
 
-const tokenNameSchema = z.string().trim().min(1).max(120);
+const tokenNameSchema = z.string().trim().min(1).max(MCP_PAT_NAME_MAX_LENGTH);
+
+// The RPC wire is JSON: oRPC round-trips Date objects through its codec, and
+// form-driven clients may equally send ISO date strings. z.coerce.date()
+// accepts both, while null/undefined bypass coercion (.nullable().optional()).
+const tokenExpiresAtSchema = z.coerce.date().nullable().optional();
+
+function validateTokenExpiry(expiresAt: Date | null | undefined, ctx: z.RefinementCtx): void {
+  if (expiresAt == null) return;
+  const rejection = mcpPatExpiryRejection(expiresAt.getTime(), Date.now());
+  if (rejection === "past") {
+    ctx.addIssue({
+      code: "custom",
+      path: ["expiresAt"],
+      message: "Expiry must be in the future.",
+    });
+    return;
+  }
+  if (rejection === "too_far") {
+    ctx.addIssue({
+      code: "custom",
+      path: ["expiresAt"],
+      message: `Expiry must be at most ${MCP_PAT_MAX_TTL_DAYS} days from now.`,
+    });
+  }
+}
 
 function serializeToken(row: McpPersonalTokenRow) {
   return {
@@ -83,15 +117,24 @@ export const mcpTokensRouter = {
 
   create: protectedProcedure
     .input(
-      z.object({
-        name: tokenNameSchema,
-        allowWrite: z.boolean().default(false),
-      }),
+      z
+        .object({
+          name: tokenNameSchema,
+          allowWrite: z.boolean().default(false),
+          expiresAt: tokenExpiresAtSchema,
+        })
+        .superRefine((value, ctx) => validateTokenExpiry(value.expiresAt, ctx)),
     )
     .handler(async ({ input, context }) => {
       if (env.WMP_MCP_ENABLED !== true) {
         throw new ORPCError("FORBIDDEN", {
           message: "MCP personal tokens cannot be created while MCP is disabled.",
+        });
+      }
+      if (input.expiresAt == null && env.WMP_MCP_PAT_ALLOW_NO_EXPIRY !== true) {
+        throw new ORPCError("FORBIDDEN", {
+          message: "No-expiry MCP tokens are disabled on this deployment. Choose an expiry date.",
+          data: { reason: MCP_PAT_NO_EXPIRY_DISABLED_REASON },
         });
       }
 
@@ -129,8 +172,9 @@ export const mcpTokensRouter = {
             lookupPrefix: credentialLookupPrefix(secret),
             secretDigest: digestMcpPersonalTokenSecret(secret),
             scopes,
-            // Expiry is not client-selectable; tokens live until revoked.
-            expiresAt: null,
+            // Client-chosen expiry within MCP_PAT_MAX_TTL_DAYS, or null (no
+            // expiry) while WMP_MCP_PAT_ALLOW_NO_EXPIRY allows minting one.
+            expiresAt: input.expiresAt ?? null,
             grantId: grant.id,
           },
           select: mcpPersonalTokenSelection,

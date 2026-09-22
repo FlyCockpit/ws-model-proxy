@@ -69,8 +69,6 @@ fails the suite when a leaf is unclassified.
 | `forwarderManagement.updatePoolMember` | `forwarder_pool_member_update` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `forwarderManagement.updateProfileSlug` | — (excluded) | — | — | — | — | — | Profile-slug procedures are account identity management. |
 | `forwarderManagement.visibleModels` | `forwarder_models_visible_list` | read | — | pure | — | — | — |
-| `health.check` | — (excluded) | — | — | — | — | — | Health/readiness is not a model-proxy operation. |
-| `health.ready` | — (excluded) | — | — | — | — | — | Health/readiness is not a model-proxy operation. |
 | `mcpGrants.listMine` | — (excluded) | — | — | — | — | — | Human-only MCP grant management (Phase 7): a connected MCP client must not enumerate the user's other authorizations. |
 | `mcpGrants.revokeMine` | — (excluded) | — | — | — | — | — | Human-only MCP grant revocation (Phase 7): only the browser session may kill grant generations. |
 | `mcpTokens.create` | — (excluded) | — | — | — | — | — | Returns the one-time raw MCP personal-token secret; human-only browser session. |
@@ -80,7 +78,6 @@ fails the suite when a leaf is unclassified.
 | `modelApiTokens.list` | `model_api_tokens_list` | read | — | pure | — | — | — |
 | `modelApiTokens.preview` | `model_api_tokens_preview` | read | — | pure | — | — | — |
 | `modelApiTokens.revoke` | `model_api_token_revoke` | write | DELETE | destructive | — | — | — |
-| `privateData` | — (excluded) | — | — | — | — | — | Demo/diagnostic procedure. |
 | `providerManagement.activatePricingVersion` | `provider_pricing_version_activate` | write | RUN | external | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `providerManagement.createAccount` | `provider_account_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `providerManagement.createBudgetPolicy` | `provider_budget_policy_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |

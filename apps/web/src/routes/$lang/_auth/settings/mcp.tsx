@@ -14,16 +14,16 @@ import { getMcpWebAvailability } from "@/server/mcp-availability";
 export const Route = createFileRoute("/$lang/_auth/settings/mcp")({
   beforeLoad: async () => {
     const availability = await getMcpWebAvailability();
-    return { mcpEnabled: availability.enabled };
+    return { mcpEnabled: availability.enabled, mcpPatAllowNoExpiry: availability.allowNoExpiry };
   },
   component: McpSettingsPage,
 });
 
 function McpSettingsPage() {
-  const { mcpEnabled } = Route.useRouteContext();
+  const { mcpEnabled, mcpPatAllowNoExpiry } = Route.useRouteContext();
   return (
     <div className="space-y-6">
-      <McpTokensPanel createEnabled={mcpEnabled} />
+      <McpTokensPanel createEnabled={mcpEnabled} allowNoExpiry={mcpPatAllowNoExpiry} />
       <McpGrantsPanel />
     </div>
   );

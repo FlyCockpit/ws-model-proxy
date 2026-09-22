@@ -5,6 +5,7 @@ import {
   McpServer,
   PROTOCOL_VERSION_META_KEY,
 } from "@modelcontextprotocol/server";
+import type { McpPersonalTokenIdentity } from "@ws-model-proxy/api/lib/mcp-token-access";
 import { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -1574,6 +1575,25 @@ describe("createMcpRequestHandler — F10 pass 5: losing continuation cannot mis
 describe("createMcpRequestHandler — personal token admission", () => {
   const PAT = `wsmp_mcp_${"a".repeat(43)}`;
   const PAT_ID = "token-pat-1";
+  const PAT_CLIENT_ID = `pat:${PAT_ID}`;
+
+  /** Verified-identity fixture for the PAT branch (matching grant via patGrant). */
+  function patIdentity(overrides: Partial<McpPersonalTokenIdentity> = {}) {
+    return {
+      id: PAT_ID,
+      userId: SUB,
+      grantId: GRANT_ID,
+      scopes: ["mcp:read"],
+      expiresAt: null,
+      lookupPrefix: "wsmp_mcp_aaaaaaaaaaaa",
+      ...overrides,
+    };
+  }
+
+  /** The McpGrant row the PAT claims must bind to (synthetic pat: clientId). */
+  function patGrant(overrides: Partial<GrantRow> = {}): GrantRow {
+    return { id: GRANT_ID, userId: SUB, clientId: PAT_CLIENT_ID, revokedAt: null, ...overrides };
+  }
 
   it("admits a live personal token without invoking the JWT verifier", async () => {
     const authenticatePersonalToken = vi.fn(async () => ({
@@ -1609,5 +1629,130 @@ describe("createMcpRequestHandler — personal token admission", () => {
     expect(res.headers.get("www-authenticate") ?? "").toContain("invalid_token");
     expect(transport.calls).toHaveLength(0);
     expect(upstreamState.receivedRequest).toBeNull();
+  });
+
+  it.each([
+    ["grant row missing", () => buildPrisma({ grant: null })],
+    [
+      "grant belongs to a different user",
+      () => buildPrisma({ grant: patGrant({ userId: "other-user" }) }),
+    ],
+    [
+      "grant belongs to a different client",
+      () => buildPrisma({ grant: patGrant({ clientId: "pat:other-token" }) }),
+    ],
+    [
+      "grant revoked (tombstoned)",
+      () => buildPrisma({ grant: patGrant({ revokedAt: new Date("2026-05-01T00:00:00Z") }) }),
+    ],
+  ])("PAT with %s → 403 with NO challenge and no transport call", async (_label, makePrisma) => {
+    const prisma = makePrisma();
+    const { handler, transport } = buildHandler({
+      authenticatePersonalToken: async () => patIdentity(),
+      prisma,
+    });
+    const res = await callHandler(handler, mcpRequest({ authorization: `Bearer ${PAT}` }));
+    expect(res.status).toBe(403);
+    expect(res.headers.get("www-authenticate")).toBeNull();
+    expect(transport.calls).toHaveLength(0);
+    expect(upstreamState.receivedRequest).toBeNull();
+  });
+
+  it("token owner no longer exists → 401 invalid_token (stale subject)", async () => {
+    const { handler, transport } = buildHandler({
+      authenticatePersonalToken: async () => patIdentity(),
+      prisma: buildPrisma({ grant: patGrant(), user: null }),
+    });
+    const res = await callHandler(handler, mcpRequest({ authorization: `Bearer ${PAT}` }));
+    expect(res.status).toBe(401);
+    expect(res.headers.get("www-authenticate") ?? "").toContain("invalid_token");
+    expect(transport.calls).toHaveLength(0);
+  });
+
+  it("actively banned token owner → 403; expired ban → admitted", async () => {
+    const banned: McpSessionUser = { ...healthyUser, banned: true, banExpires: null };
+    const expiredBan: McpSessionUser = {
+      ...healthyUser,
+      banned: true,
+      banExpires: new Date("2026-05-01T00:00:00Z"),
+    };
+
+    const denied = buildHandler({
+      authenticatePersonalToken: async () => patIdentity(),
+      prisma: buildPrisma({ grant: patGrant(), user: banned }),
+    });
+    const deniedRes = await callHandler(
+      denied.handler,
+      mcpRequest({ authorization: `Bearer ${PAT}` }),
+    );
+    expect(deniedRes.status).toBe(403);
+    expect(denied.transport.calls).toHaveLength(0);
+
+    const admitted = buildHandler({
+      authenticatePersonalToken: async () => patIdentity(),
+      prisma: buildPrisma({ grant: patGrant(), user: expiredBan }),
+    });
+    expect(
+      (await callHandler(admitted.handler, mcpRequest({ authorization: `Bearer ${PAT}` }))).status,
+    ).toBe(200);
+  });
+
+  it("force-2FA policy on + owner without 2FA → 403; policy off → admitted", async () => {
+    const noTwoFactor: McpSessionUser = { ...healthyUser, twoFactorEnabled: false };
+    const enforced = buildHandler({
+      authenticatePersonalToken: async () => patIdentity(),
+      prisma: buildPrisma({ grant: patGrant(), user: noTwoFactor }),
+      isForceTwoFactorRequired: async () => true,
+    });
+    const enforcedRes = await callHandler(
+      enforced.handler,
+      mcpRequest({ authorization: `Bearer ${PAT}` }),
+    );
+    expect(enforcedRes.status).toBe(403);
+    expect(enforced.transport.calls).toHaveLength(0);
+
+    const policyOff = buildHandler({
+      authenticatePersonalToken: async () => patIdentity(),
+      prisma: buildPrisma({ grant: patGrant(), user: noTwoFactor }),
+      isForceTwoFactorRequired: async () => false,
+    });
+    expect(
+      (await callHandler(policyOff.handler, mcpRequest({ authorization: `Bearer ${PAT}` }))).status,
+    ).toBe(200);
+  });
+
+  it("identity quota exhausted → 429 with Retry-After, transport NOT reached", async () => {
+    const { handler, transport } = buildHandler({
+      authenticatePersonalToken: async () => patIdentity(),
+      prisma: buildPrisma({ grant: patGrant() }),
+      consumeIdentityQuota: async () => ({ ok: false, retryAfterSeconds: 42 }),
+    });
+    const res = await callHandler(handler, mcpRequest({ authorization: `Bearer ${PAT}` }));
+    expect(res.status).toBe(429);
+    expect(res.headers.get("retry-after")).toBe("42");
+    expect(transport.calls).toHaveLength(0);
+  });
+
+  it("identity quota is keyed by the token owner sub + pat:<tokenId> (pinned by the consume call)", async () => {
+    const { handler, quota } = buildHandler({
+      authenticatePersonalToken: async () => patIdentity(),
+      prisma: buildPrisma({ grant: patGrant() }),
+    });
+    await callHandler(handler, mcpRequest({ authorization: `Bearer ${PAT}` }));
+    expect(quota.mock.calls).toEqual([[SUB, PAT_CLIENT_ID]]);
+  });
+
+  it("identity.expiresAt synthesizes the exp claim — observed on AuthInfo exactly like a JWT exp", async () => {
+    const expiresAt = new Date("2026-12-01T00:00:00Z");
+    const exp = Math.floor(expiresAt.getTime() / 1000);
+    const { handler, transport } = buildHandler({
+      authenticatePersonalToken: async () => patIdentity({ expiresAt }),
+      prisma: buildPrisma({ grant: patGrant() }),
+    });
+    const res = await callHandler(handler, mcpRequest({ authorization: `Bearer ${PAT}` }));
+    expect(res.status).toBe(200);
+    const authInfo = transport.calls[0]?.authInfo;
+    expect(authInfo?.expiresAt).toBe(exp);
+    expect(authInfo?.extra).toMatchObject({ exp });
   });
 });

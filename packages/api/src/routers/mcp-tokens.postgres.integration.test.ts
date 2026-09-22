@@ -173,6 +173,31 @@ integration("MCP personal tokens with real PostgreSQL", () => {
     expect(afterSecondUse.lastUsedAt?.toISOString()).toBe(t0.toISOString());
   });
 
+  it("create with an expiry authenticates before expiry and is rejected after", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const user = await createFixtureUser("expiry");
+    const client = buildClient(sessionFor(user));
+
+    const now = new Date();
+    const created = await client.create({
+      name: "Expiring",
+      allowWrite: false,
+      // ISO string on purpose: proves the coerce.date() input survives the
+      // RPC wire shape the browser actually sends.
+      expiresAt: new Date(now.getTime() + 60 * 60 * 1000).toISOString(),
+    });
+
+    const identity = await modules.access.authenticateMcpPersonalToken(created.secret, now);
+    expect(identity).not.toBeNull();
+    expect(identity).toMatchObject({ userId: user.id });
+
+    const afterExpiry = await modules.access.authenticateMcpPersonalToken(
+      created.secret,
+      new Date(now.getTime() + 2 * 60 * 60 * 1000),
+    );
+    expect(afterExpiry).toBeNull();
+  });
+
   it("revoke kills authentication, tombstones the grant, and stays idempotent", async () => {
     if (!modules) throw new Error("modules unavailable");
     const user = await createFixtureUser("revoke");

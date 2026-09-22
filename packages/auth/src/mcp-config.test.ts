@@ -62,21 +62,12 @@ describe("web origin resolution", () => {
   });
 });
 
-describe("login/consent URLs", () => {
+describe("login/consent paths", () => {
   it("builds locale-prefixed paths", () => {
     expect(mcpConfig.mcpLoginPagePath()).toBe("/en-US/mcp-login");
     expect(mcpConfig.mcpConsentPagePath()).toBe("/en-US/mcp-consent");
     expect(mcpConfig.mcpLoginPagePath("es-MX")).toBe("/es-MX/mcp-login");
     expect(mcpConfig.mcpConsentPagePath("es-MX")).toBe("/es-MX/mcp-consent");
-  });
-
-  it("builds absolute URLs on the configured web origin", () => {
-    expect(mcpConfig.mcpLoginUrl("https://app.example.com")).toBe(
-      "https://app.example.com/en-US/mcp-login",
-    );
-    expect(mcpConfig.mcpConsentUrl("https://app.example.com", "es-MX")).toBe(
-      "https://app.example.com/es-MX/mcp-consent",
-    );
   });
 });
 
@@ -86,22 +77,13 @@ describe("env-bound constants", () => {
     mockEnv.CORS_ORIGIN = undefined;
   });
 
-  it("binds issuer/resource/web origin from BETTER_AUTH_URL (no CORS_ORIGIN)", async () => {
+  it("binds issuer/resource from BETTER_AUTH_URL", async () => {
     vi.resetModules();
     const fresh = await import("./mcp-config");
     expect(fresh.MCP_ISSUER).toBe("https://proxy.example.com/api/auth");
     expect(fresh.MCP_RESOURCE_URL).toBe("https://proxy.example.com/mcp");
-    expect(fresh.MCP_WEB_ORIGIN).toBe("https://proxy.example.com");
-    expect(fresh.MCP_LOGIN_PAGE_URL).toBe("https://proxy.example.com/en-US/mcp-login");
-    expect(fresh.MCP_CONSENT_PAGE_URL).toBe("https://proxy.example.com/en-US/mcp-consent");
-  });
-
-  it("binds the web origin to CORS_ORIGIN when set", async () => {
-    mockEnv.CORS_ORIGIN = "https://app.example.com";
-    vi.resetModules();
-    const fresh = await import("./mcp-config");
-    expect(fresh.MCP_WEB_ORIGIN).toBe("https://app.example.com");
-    expect(fresh.MCP_LOGIN_PAGE_URL).toBe("https://app.example.com/en-US/mcp-login");
+    expect(fresh.MCP_LOGIN_PAGE_PATH_DEFAULT).toBe("/en-US/mcp-login");
+    expect(fresh.MCP_CONSENT_PAGE_PATH_DEFAULT).toBe("/en-US/mcp-consent");
   });
 });
 
@@ -120,10 +102,6 @@ describe("policy constants (Resolved defaults)", () => {
     });
   });
 
-  it("keeps DPoP enabled but not required", () => {
-    expect(mcpConfig.MCP_DPOP_POLICY).toEqual({ enabled: true, required: false });
-  });
-
   it("pins the personal-token grant client-id prefix", () => {
     expect(mcpConfig.MCP_PAT_CLIENT_ID_PREFIX).toBe("pat:");
     expect(mcpConfig.MCP_PAT_GRANT_REFERENCE).toBe("pat");
@@ -135,6 +113,10 @@ describe("policy constants (Resolved defaults)", () => {
   it("pins the personal-token active cap and last-used touch interval", () => {
     expect(mcpConfig.MCP_PAT_MAX_ACTIVE_PER_USER).toBe(10);
     expect(mcpConfig.MCP_PAT_LAST_USED_TOUCH_INTERVAL_MS).toBe(900000);
+  });
+
+  it("pins the personal-token chosen-expiry TTL cap", () => {
+    expect(mcpConfig.MCP_PAT_MAX_TTL_DAYS).toBe(365);
   });
 
   it("lists the enabled scopes and registration ceilings", () => {
