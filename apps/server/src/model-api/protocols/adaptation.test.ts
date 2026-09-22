@@ -8,7 +8,7 @@ import {
 import { CanonicalStreamParser } from "./streams.js";
 
 const vendorMessage = {
-  annotations: [] as unknown[],
+  annotations: null,
   audio: null,
   content: "pong",
   function_call: null,
@@ -22,6 +22,9 @@ const vendorChoice = {
   message: vendorMessage,
   finish_reason: "stop" as const,
   logprobs: null,
+  stop_reason: 154827,
+  token_ids: null,
+  routed_experts: null,
 };
 
 const vendorChatCompletion = {
@@ -36,6 +39,12 @@ const vendorChatCompletion = {
     total_tokens: 51,
     prompt_tokens_details: null,
   },
+  prompt_logprobs: null,
+  prompt_token_ids: null,
+  prompt_text: null,
+  kv_transfer_params: null,
+  ec_transfer_params: null,
+  metrics: null,
 };
 
 describe("protocol adaptation orchestration", () => {
@@ -107,6 +116,28 @@ describe("protocol adaptation orchestration", () => {
     expect(() => withDetails({ cached_tokens: 4, audio_tokens: 0 })).toThrow(/audio_tokens/u);
   });
 
+  it("rejects a non-null chat envelope or choice field outside the ignorable null set", () => {
+    expect(() =>
+      adaptNonstreamResponse({
+        source: "openai-chat",
+        target: "openai-responses",
+        status: 200,
+        body: { ...vendorChatCompletion, prompt_logprobs: [{ token: "x" }] },
+      }),
+    ).toThrow(/prompt_logprobs/u);
+    expect(() =>
+      adaptNonstreamResponse({
+        source: "openai-chat",
+        target: "anthropic-messages",
+        status: 200,
+        body: {
+          ...vendorChatCompletion,
+          choices: [{ ...vendorChoice, token_ids: [1, 2] }],
+        },
+      }),
+    ).toThrow(/token_ids/u);
+  });
+
   it("still rejects a present non-null Chat Completions field outside the ignorable set", () => {
     expect(() =>
       adaptNonstreamResponse({
@@ -174,7 +205,30 @@ describe("protocol adaptation orchestration", () => {
         choices: [{ index: 0, delta, finish_reason: finish }],
       });
     const events = [
-      ...parser.push(chunk({ role: "assistant", reasoning: "hidden", audio: null })),
+      ...parser.push(
+        encode({
+          id: "c",
+          object: "chat.completion.chunk",
+          created: 0,
+          model: "gpt",
+          prompt_logprobs: null,
+          prompt_token_ids: null,
+          prompt_text: null,
+          kv_transfer_params: null,
+          ec_transfer_params: null,
+          metrics: null,
+          choices: [
+            {
+              index: 0,
+              delta: { role: "assistant", reasoning: "hidden", audio: null, annotations: null },
+              finish_reason: null,
+              stop_reason: 154827,
+              token_ids: null,
+              routed_experts: null,
+            },
+          ],
+        }),
+      ),
       ...parser.push(chunk({ content: "pong" })),
       ...parser.push(
         encode({

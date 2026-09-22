@@ -24,6 +24,63 @@ export function rejectUnknown(
     unsupported(`${path}.${unknown}`, "has unknown semantics and is not safely adaptable");
 }
 
+const chatEnvelopeNullFields = [
+  "prompt_logprobs",
+  "prompt_token_ids",
+  "prompt_text",
+  "kv_transfer_params",
+  "ec_transfer_params",
+  "metrics",
+] as const;
+
+const chatChoiceNullFields = ["token_ids", "routed_experts"] as const;
+
+function acceptNullOnly(value: Record<string, unknown>, path: string, fields: readonly string[]) {
+  for (const field of fields) if (value[field] != null) unsupported(`${path}.${field}`);
+}
+
+/** Chat envelope fields that carry no cross-protocol answer. Null means absent. */
+export function acceptChatEnvelopeExtras(
+  body: Record<string, unknown>,
+  path: string,
+  mode: "final" | "chunk",
+) {
+  rejectUnknown(
+    body,
+    [
+      "id",
+      "object",
+      "created",
+      "model",
+      "choices",
+      "usage",
+      "system_fingerprint",
+      ...(mode === "final" ? (["service_tier"] as const) : []),
+      ...chatEnvelopeNullFields,
+    ],
+    path,
+  );
+  acceptNullOnly(body, path, chatEnvelopeNullFields);
+}
+
+/**
+ * `stop_reason` on a chat choice is an internal token id, not a protocol stop
+ * reason, so any value is ignored. `token_ids` and `routed_experts` are absent
+ * only when null.
+ */
+export function acceptChatChoiceExtras(
+  choice: Record<string, unknown>,
+  path: string,
+  contentKey: "message" | "delta",
+) {
+  rejectUnknown(
+    choice,
+    ["index", contentKey, "finish_reason", "logprobs", "stop_reason", ...chatChoiceNullFields],
+    path,
+  );
+  acceptNullOnly(choice, path, chatChoiceNullFields);
+}
+
 const chatMessageFields = [
   "role",
   "content",

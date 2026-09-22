@@ -2,6 +2,8 @@ import type { CanonicalEvent, ProtocolSurface } from "./canonical.js";
 import { AdapterError, unsupported } from "./errors.js";
 import { renderProtocolError } from "./nonstream.js";
 import {
+  acceptChatChoiceExtras,
+  acceptChatEnvelopeExtras,
   acceptChatMessageExtras,
   acceptTokenCountDetails,
   object,
@@ -307,11 +309,7 @@ export class CanonicalStreamParser {
     }
     if (this.#pendingChatStop && Array.isArray(value.choices) && value.choices.length > 0)
       throw new AdapterError("event_after_stop", "Chat candidate event followed finish_reason.");
-    rejectUnknown(
-      value,
-      ["id", "object", "created", "model", "system_fingerprint", "choices", "usage"],
-      "stream.data",
-    );
+    acceptChatEnvelopeExtras(value, "stream.data", "chunk");
     if (!Number.isSafeInteger(value.created) || (value.created as number) < 0)
       throw new AdapterError("invalid_stream_event", "Chat created must be a timestamp integer.");
     if (typeof value.model !== "string" || value.model.length === 0)
@@ -335,7 +333,7 @@ export class CanonicalStreamParser {
     if (!choice) return events;
     if (choice.index !== undefined && choice.index !== 0)
       throw new AdapterError("multiple_candidates", "Only candidate zero is adaptable.");
-    rejectUnknown(choice, ["index", "delta", "finish_reason", "logprobs"], "choices[0]");
+    acceptChatChoiceExtras(choice, "choices[0]", "delta");
     if (choice.logprobs != null) unsupported("choices[0].logprobs");
     const delta = object(choice.delta ?? {}, "choices[0].delta");
     const extras = acceptChatMessageExtras(delta, "choices[0].delta", "delta");

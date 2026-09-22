@@ -7,6 +7,8 @@ import type {
 } from "./canonical.js";
 import { AdapterError, invalid, unsupported } from "./errors.js";
 import {
+  acceptChatChoiceExtras,
+  acceptChatEnvelopeExtras,
   acceptChatMessageExtras,
   acceptTokenCountDetails,
   object,
@@ -141,16 +143,12 @@ export function safeProviderRateReset(
 
 function parseChatSuccess(value: unknown): CanonicalResponse {
   const body = object(value);
-  rejectUnknown(
-    body,
-    ["id", "object", "created", "model", "choices", "usage", "system_fingerprint", "service_tier"],
-    "response",
-  );
+  acceptChatEnvelopeExtras(body, "response", "final");
   if (body.object !== "chat.completion") invalid("response.object", "must be chat.completion");
   if (!Array.isArray(body.choices) || body.choices.length !== 1)
     unsupported("response.choices", "must contain exactly one candidate");
   const choice = object(body.choices[0], "response.choices[0]");
-  rejectUnknown(choice, ["index", "message", "finish_reason", "logprobs"], "response.choices[0]");
+  acceptChatChoiceExtras(choice, "response.choices[0]", "message");
   if (choice.index !== 0) invalid("response.choices[0].index", "must be zero");
   if (choice.logprobs !== undefined && choice.logprobs !== null)
     unsupported("response.choices[0].logprobs");
