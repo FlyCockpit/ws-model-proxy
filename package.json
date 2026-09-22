@@ -72,7 +72,7 @@
     "lefthook": "^2.1.14",
     "react-doctor": "^0.9.14",
     "tsx": "catalog:",
-    "turbo": "^2.10.12",
+    "turbo": "^2.10.13",
     "typescript": "catalog:",
     "vitest": "catalog:"
   },
