@@ -293,10 +293,10 @@ impl Serialize for OpenAiCompatibleCapabilities {
         let mut state = serializer.serialize_struct("OpenAiCompatibleCapabilities", 11)?;
         state.serialize_field("version", &self.version)?;
         state.serialize_field("protocol", &self.protocol)?;
-        if self.version >= 3 {
-            if let Some(value) = &self.surfaces {
-                state.serialize_field("surfaces", value)?;
-            }
+        if self.version >= 3
+            && let Some(value) = &self.surfaces
+        {
+            state.serialize_field("surfaces", value)?;
         }
         if let Some(value) = &self.source {
             state.serialize_field("source", value)?;
@@ -808,19 +808,19 @@ impl ReasoningConfig {
                     ));
                 }
             }
-            if let Some(default_level) = &self.default_level {
-                if !levels.contains(default_level) {
-                    return Err(format!(
-                        "surface `{surface}` defaultLevel must be in supportedLevels"
-                    ));
-                }
-            }
-        } else if let Some(default_level) = &self.default_level {
-            if !LEVELS.contains(&default_level.as_str()) {
+            if let Some(default_level) = &self.default_level
+                && !levels.contains(default_level)
+            {
                 return Err(format!(
-                    "surface `{surface}` has invalid reasoning defaultLevel `{default_level}`"
+                    "surface `{surface}` defaultLevel must be in supportedLevels"
                 ));
             }
+        } else if let Some(default_level) = &self.default_level
+            && !LEVELS.contains(&default_level.as_str())
+        {
+            return Err(format!(
+                "surface `{surface}` has invalid reasoning defaultLevel `{default_level}`"
+            ));
         }
         if let Some(encoding) = &self.encoding {
             if encoding.is_anthropic() != anthropic {

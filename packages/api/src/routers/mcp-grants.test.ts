@@ -760,7 +760,12 @@ function codeValue(overrides: Record<string, unknown> = {}) {
  * the mock cannot silently mask the error class if a future pattern shape
  * reaches it.
  */
+const likePatternCache = new Map<string, RegExp>();
+
 function likeMatches(value: string, pattern: string): boolean {
+  const cached = likePatternCache.get(pattern);
+  if (cached) return cached.test(value);
+
   const literal = (c: string) => c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   let source = "^";
   for (let i = 0; i < pattern.length; i += 1) {
@@ -794,7 +799,9 @@ function likeMatches(value: string, pattern: string): boolean {
       source += literal(c);
     }
   }
-  return new RegExp(`${source}$`, "u").test(value);
+  const expression = new RegExp(`${source}$`, "u");
+  likePatternCache.set(pattern, expression);
+  return expression.test(value);
 }
 
 /** Prisma `contains` under real PostgreSQL: LIKE '%'+pattern+'%'. */

@@ -147,10 +147,10 @@ pub fn exchange_device_code(
 
 fn rpc_status_error(status: u16, mut response: ureq::http::Response<ureq::Body>) -> anyhow::Error {
     let body = response.body_mut().read_to_string().unwrap_or_default();
-    if let Ok(parsed) = serde_json::from_str::<RpcErrorEnvelope>(&body) {
-        if let Some(message) = parsed.json.message {
-            return anyhow::anyhow!("{message}");
-        }
+    if let Ok(parsed) = serde_json::from_str::<RpcErrorEnvelope>(&body)
+        && let Some(message) = parsed.json.message
+    {
+        return anyhow::anyhow!("{message}");
     }
     anyhow::anyhow!("device credential exchange failed with HTTP status {status}")
 }
