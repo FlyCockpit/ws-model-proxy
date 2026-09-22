@@ -139,7 +139,7 @@ function parseStrictRfc3339Utc(value: string): Date | null {
   const maxDay = month === 2 && isLeapYear(year) ? 29 : (DAYS_IN_MONTH[month - 1] ?? 30);
   if (day < 1 || day > maxDay) return null;
   if (hour > 23 || minute > 59 || second > 59) return null;
-  // Fractional seconds: TRUNCATE to milliseconds — never round (G3 pass 4).
+  // Fractional seconds: cut to milliseconds — never round (G3 pass 4).
   // Rounding a fraction like .9999 to 1000 ms increments the Date.UTC
   // second/minute/hour/day/year BEFORE `setUTCFullYear(year)` below
   // overwrites the rolled-over year, corrupting 2026-12-31T23:59:59.9999Z
