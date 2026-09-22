@@ -402,6 +402,20 @@ fn endpoints_add_list_remove_json() {
 }
 
 #[test]
+fn endpoints_remove_unknown_slug_exits_3_not_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(&config, json!({ "version": 1, "endpoints": [] }));
+    cli(&config, &state)
+        .args(["endpoints", "remove", "missing"])
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::contains("endpoint `missing` not found"));
+}
+
+#[test]
 fn endpoints_probe_success_applies_model_suggestions_and_uses_secret_env_header() {
     let server = TestServer::start(vec![(
         "/v1/models",

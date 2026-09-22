@@ -15,6 +15,7 @@ import {
   assertEffectiveConcurrencyPolicy,
   assertEffectiveContextPolicy,
   assertModelPoolCapacityPolicy,
+  type CapacityPolicyFailureReasons,
   lockAndValidateModelPoolCapacityPolicy,
   lockExecutionTargetIdentities,
   lockExecutionTargetPolicies,
@@ -25,6 +26,7 @@ import {
   declaredContextWindow,
   isContextWindowSeedAdmissible,
 } from "../lib/declared-context-window";
+import type { GuardedPoolCreateFailureReason } from "../lib/guarded-pool-create-reasons";
 import {
   getConfiguredMediaAttachmentMaxBytes,
   resolveAttachmentLimit,
@@ -46,6 +48,17 @@ import {
   transformerModalityMismatchErrors,
   transformerSupportedModalities,
 } from "../lib/openai-compatible-capabilities";
+import {
+  capabilityEditImpactedPools,
+  discoveredModelPoolMemberWhere,
+  poolIdsWithMembers,
+} from "../lib/pool-capability-impact";
+import {
+  assertRecommendedSurfaceServable,
+  discoveredModelSurfaceCapabilities,
+  providerModelSurfaceCapabilities,
+} from "../lib/pool-recommended-surface";
+import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
 import { runSerializableTransaction } from "../lib/serializable-transaction";
 import {
   type ModelApiSurface,
@@ -125,24 +138,29 @@ function hasModelPoolCapacityPolicy(input: Record<string, unknown>): boolean {
   );
 }
 
-function assertLossyDeveloperRoleCollapseRequiresAdaptation({
-  protocolAdaptationEnabled,
-  allowLossyDeveloperRoleCollapse,
-}: {
-  protocolAdaptationEnabled: boolean;
-  allowLossyDeveloperRoleCollapse: boolean;
-}): void {
+function assertLossyDeveloperRoleCollapseRequiresAdaptation(
+  {
+    protocolAdaptationEnabled,
+    allowLossyDeveloperRoleCollapse,
+  }: {
+    protocolAdaptationEnabled: boolean;
+    allowLossyDeveloperRoleCollapse: boolean;
+  },
+  reason?: GuardedPoolCreateFailureReason,
+): void {
   if (allowLossyDeveloperRoleCollapse && !protocolAdaptationEnabled) {
     throw new ORPCError("BAD_REQUEST", {
       message: "Lossy developer-role collapse requires protocol adaptation to be enabled.",
+      ...(reason !== undefined ? { data: { reason } } : {}),
     });
   }
 }
 
-function assertProviderEgressReleaseGate(): void {
+function assertProviderEgressReleaseGate(reason?: GuardedPoolCreateFailureReason): void {
   if (!env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED)
     throw new ORPCError("NOT_FOUND", {
       message: "Provider egress is not enabled for this deployment.",
+      ...(reason !== undefined ? { data: { reason } } : {}),
     });
 }
 
@@ -164,15 +182,18 @@ async function createPoolMember<T>(create: () => Promise<T>): Promise<T> {
   }
 }
 
-function assertConcurrencyPolicyWithinHardLimit(input: {
-  hardLimit: number | null | undefined;
-  poolLimit: number | null;
-  poolReserved: number;
-  memberMode?: "INHERIT" | "LIMITED" | "UNLIMITED";
-  memberLimit?: number | null;
-  memberReserved?: number | null;
-}): void {
-  assertEffectiveConcurrencyPolicy(input);
+function assertConcurrencyPolicyWithinHardLimit(
+  input: {
+    hardLimit: number | null | undefined;
+    poolLimit: number | null;
+    poolReserved: number;
+    memberMode?: "INHERIT" | "LIMITED" | "UNLIMITED";
+    memberLimit?: number | null;
+    memberReserved?: number | null;
+  },
+  reasons?: CapacityPolicyFailureReasons,
+): void {
+  assertEffectiveConcurrencyPolicy(input, reasons);
 }
 
 /**
@@ -607,16 +628,7 @@ function serializePool(row: ModelPoolRow) {
   const adaptationEnabled = row.protocolAdaptationEnabled && protocolAdaptationAvailable;
   const recommendedSurfaceOverride = parseModelApiSurface(row.recommendedSurfaceOverride);
   const memberCapabilities = (model: PoolMemberModelRow) =>
-    resolveEffectiveCapabilityMetadata({
-      capabilityOverrideMode: model.capabilityOverrideMode,
-      capabilityOverrideMetadata: model.capabilityOverrideMetadata,
-      endpointCapabilityMetadata: model.Endpoint.capabilityMetadata,
-    }) ??
-    openAiCapabilitiesFromCoarse(
-      model.capabilityOverrideMode === "OVERRIDE"
-        ? model.capabilityOverrides
-        : model.Endpoint.defaultCapabilities,
-    );
+    discoveredModelSurfaceCapabilities(model);
   const memberMatrices = row.PoolMembers.map((member) => {
     const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
     if (model)
@@ -628,50 +640,16 @@ function serializePool(row: ModelPoolRow) {
         }),
       };
     const provider = member.ExecutionTarget?.ProviderModel;
-    const providerInventory = parseOpenAiCompatibleCapabilities(provider?.nativeCapabilities);
-    if (providerInventory)
-      return {
-        tier: member.tier,
-        matrix: surfaceAvailabilityMatrix({
-          capabilities: providerInventory,
-          adaptationEnabled,
-        }),
-      };
-    const native =
-      provider?.nativeCapabilities && typeof provider.nativeCapabilities === "object"
-        ? (provider.nativeCapabilities as { surfaces?: unknown; streaming?: unknown })
-        : null;
-    const nativeSurfaces = new Set(
-      Array.isArray(native?.surfaces)
-        ? native.surfaces.filter((value): value is string => typeof value === "string")
-        : [],
-    );
-    const surfaceNames: Record<ModelApiSurface, string> = {
-      OPENAI_CHAT_COMPLETIONS: "openai-chat",
-      OPENAI_RESPONSES: "openai-responses",
-      ANTHROPIC_MESSAGES: "anthropic-messages",
-      OPENAI_COMPLETIONS: "openai-completions",
-    };
-    const adaptable = [...nativeSurfaces].some((surface) =>
-      ["openai-chat", "openai-responses", "anthropic-messages"].includes(surface),
-    );
+    // Single shared provider-capability resolution: structured inventories
+    // parse directly, while legacy raw-surface shapes are normalized, so the
+    // dashboard matrix and the selectability gates can never drift.
+    const providerInventory = providerModelSurfaceCapabilities(provider?.nativeCapabilities);
     return {
       tier: member.tier,
-      matrix: Object.fromEntries(
-        modelApiSurfaces.map((surface) => {
-          const nativeSurface = nativeSurfaces.has(surfaceNames[surface]);
-          const adapted =
-            !nativeSurface && adaptationEnabled && surface !== "OPENAI_COMPLETIONS" && adaptable;
-          return [
-            surface,
-            {
-              mode: nativeSurface ? "native" : adapted ? "adapted" : "unavailable",
-              streaming: Boolean(native?.streaming) && (nativeSurface || adapted),
-              limitations: adapted ? ["strict_common_subset"] : [],
-            },
-          ];
-        }),
-      ) as ReturnType<typeof surfaceAvailabilityMatrix>,
+      matrix: surfaceAvailabilityMatrix({
+        capabilities: providerInventory,
+        adaptationEnabled,
+      }),
     };
   });
   const surfaces = Object.fromEntries(
@@ -895,7 +873,8 @@ async function ownedDiscoveredModel(discoveredModelId: string, userId: string) {
       userId: true,
       capabilityOverrideMode: true,
       capabilityOverrideMetadata: true,
-      Endpoint: { select: { capabilityMetadata: true } },
+      capabilityOverrides: true,
+      Endpoint: { select: { capabilityMetadata: true, defaultCapabilities: true } },
     },
   });
   if (!model || model.userId !== userId) {
@@ -984,10 +963,21 @@ async function assertPoolTransformerIsValid(
   });
 }
 
-async function assertPoolSlugAvailable(slug: string, userId: string, currentPoolId?: string) {
+export async function assertPoolSlugAvailable(
+  slug: string,
+  userId: string,
+  currentPoolId?: string,
+  reasons?: {
+    invalid?: GuardedPoolCreateFailureReason;
+    taken?: GuardedPoolCreateFailureReason;
+  },
+) {
   const validation = validateForwarderPoolSlug(slug);
   if (!validation.ok) {
-    throw new ORPCError("BAD_REQUEST", { message: "forwarderSlug." + validation.reason });
+    throw new ORPCError("BAD_REQUEST", {
+      message: "forwarderSlug." + validation.reason,
+      ...(reasons?.invalid !== undefined ? { data: { reason: reasons.invalid } } : {}),
+    });
   }
 
   const existing = await prisma.modelPool.findUnique({
@@ -995,8 +985,27 @@ async function assertPoolSlugAvailable(slug: string, userId: string, currentPool
     select: { id: true },
   });
   if (existing && existing.id !== currentPoolId) {
-    throw new ORPCError("CONFLICT", { message: "Model pool slug already exists." });
+    throw new ORPCError("CONFLICT", {
+      message: "Model pool slug already exists.",
+      ...(reasons?.taken !== undefined ? { data: { reason: reasons.taken } } : {}),
+    });
   }
+}
+
+/**
+ * Advisory (non-blocking) impact report for a discovered-model edit: which
+ * pools' effective recommended surface is now unservable after the write.
+ * Computed from the post-edit member state; never throws.
+ */
+async function discoveredModelEditImpact(discoveredModelId: string, userId: string) {
+  return capabilityEditImpactedPools(prisma, {
+    userId,
+    poolIds: await poolIdsWithMembers(
+      prisma,
+      userId,
+      discoveredModelPoolMemberWhere(discoveredModelId),
+    ),
+  });
 }
 
 async function removeOwnedRow({
@@ -1424,19 +1433,29 @@ export const forwarderManagementRouter = {
       })(),
     )
     .handler(async ({ input, context }) => {
-      if (input.providerModels.length > 0) assertProviderEgressReleaseGate();
-      assertLossyDeveloperRoleCollapseRequiresAdaptation({
-        protocolAdaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
-        allowLossyDeveloperRoleCollapse: input.advanced?.allowLossyDeveloperRoleCollapse ?? false,
-      });
-      assertModelPoolCapacityPolicy({
-        concurrencyLimit: input.memberConcurrencyLimit,
-        reservedSlots: input.reservedSlots,
-        contextCeiling: input.memberContextCeiling,
-        contextMargin: input.advanced?.contextMargin,
-      });
+      if (input.providerModels.length > 0)
+        assertProviderEgressReleaseGate("PROVIDER_EGRESS_DISABLED");
+      assertLossyDeveloperRoleCollapseRequiresAdaptation(
+        {
+          protocolAdaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
+          allowLossyDeveloperRoleCollapse: input.advanced?.allowLossyDeveloperRoleCollapse ?? false,
+        },
+        "LOSSY_COLLAPSE_REQUIRES_ADAPTATION",
+      );
+      assertModelPoolCapacityPolicy(
+        {
+          concurrencyLimit: input.memberConcurrencyLimit,
+          reservedSlots: input.reservedSlots,
+          contextCeiling: input.memberContextCeiling,
+          contextMargin: input.advanced?.contextMargin,
+        },
+        "POOL_POLICY_INVALID",
+      );
       const userId = context.session.user.id;
-      await assertPoolSlugAvailable(input.slug, userId);
+      await assertPoolSlugAvailable(input.slug, userId, undefined, {
+        invalid: "SLUG_INVALID",
+        taken: "SLUG_TAKEN",
+      });
       const now = new Date();
       return runSerializableTransaction(async (tx) => {
         const localModels = await tx.discoveredModel.findMany({
@@ -1458,7 +1477,10 @@ export const forwarderManagementRouter = {
           },
         });
         if (localModels.length !== input.localModelIds.length) {
-          throw new ORPCError("NOT_FOUND", { message: "A selected local model is unavailable" });
+          throw new ORPCError("NOT_FOUND", {
+            message: "A selected local model is unavailable",
+            data: { reason: "LOCAL_MODEL_UNAVAILABLE" },
+          });
         }
         const providerIds = input.providerModels.map((item) => item.providerModelId);
         const hasPublicOverflow = input.providerModels.some(
@@ -1499,6 +1521,7 @@ export const forwarderManagementRouter = {
         ) {
           throw new ORPCError("PRECONDITION_FAILED", {
             message: "A selected provider is not ready for guarded routing",
+            data: { reason: "PROVIDER_NOT_READY" },
           });
         }
         const primaryProviderIds = new Set(
@@ -1506,74 +1529,28 @@ export const forwarderManagementRouter = {
             .filter((item) => item.tier === "PRIMARY")
             .map((item) => item.providerModelId),
         );
-        const primaryMatrices = [
-          ...localModels.map((model) =>
-            surfaceAvailabilityMatrix({
-              capabilities:
-                resolveEffectiveCapabilityMetadata({
-                  capabilityOverrideMode: model.capabilityOverrideMode,
-                  capabilityOverrideMetadata: model.capabilityOverrideMetadata,
-                  endpointCapabilityMetadata: model.Endpoint.capabilityMetadata,
-                }) ??
-                openAiCapabilitiesFromCoarse(
-                  model.capabilityOverrideMode === "OVERRIDE"
-                    ? model.capabilityOverrides
-                    : model.Endpoint.defaultCapabilities,
-                ),
-              adaptationEnabled:
-                (input.advanced?.protocolAdaptationEnabled ?? false) &&
-                env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
-            }),
-          ),
-          ...providers
-            .filter((provider) => primaryProviderIds.has(provider.id))
-            .map((provider) =>
-              surfaceAvailabilityMatrix({
-                capabilities: parseOpenAiCompatibleCapabilities(provider.nativeCapabilities),
-                adaptationEnabled:
-                  (input.advanced?.protocolAdaptationEnabled ?? false) &&
-                  env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
-              }),
-            ),
-        ];
-        const recommendedSurface = [
-          "OPENAI_RESPONSES",
-          "OPENAI_CHAT_COMPLETIONS",
-          "ANTHROPIC_MESSAGES",
-        ]
-          .map((surface, orderIndex) => {
-            const typedSurface = surface as Exclude<
-              (typeof modelApiSurfaces)[number],
-              "OPENAI_COMPLETIONS"
-            >;
-            return {
-              surface: typedSurface,
-              orderIndex,
-              nativeCount: primaryMatrices.filter(
-                (matrix) => matrix[typedSurface].mode === "native",
-              ).length,
-              limitations: primaryMatrices.reduce(
-                (count, matrix) => count + matrix[typedSurface].limitations.length,
-                0,
-              ),
-              available: primaryMatrices.every(
-                (matrix) => matrix[typedSurface].mode !== "unavailable",
-              ),
-            };
-          })
-          .filter((candidate) => candidate.available)
-          .sort(
-            (left, right) =>
-              right.nativeCount - left.nativeCount ||
-              left.limitations - right.limitations ||
-              left.orderIndex - right.orderIndex,
-          )[0]?.surface;
-        if (!recommendedSurface || input.recommendedSurface !== recommendedSurface) {
-          throw new ORPCError("BAD_REQUEST", {
-            message:
-              "Recommended API must be the best API supported by every selected primary model.",
-          });
-        }
+        // The recommended API is an operator choice: any surface that every
+        // primary member can serve — natively or via protocol adaptation — is
+        // accepted, not only the top-ranked one. An empty primary set (a
+        // provider-only PUBLIC_OVERFLOW pool) accepts any surface. The
+        // selectability contract is shared with the update path via
+        // assertRecommendedSurfaceServable.
+        assertRecommendedSurfaceServable({
+          override: input.recommendedSurface,
+          members: [
+            ...localModels.map((model) => ({
+              tier: "PRIMARY" as const,
+              capabilities: discoveredModelSurfaceCapabilities(model),
+            })),
+            ...providers.map((provider) => ({
+              tier: primaryProviderIds.has(provider.id) ? ("PRIMARY" as const) : "PUBLIC_OVERFLOW",
+              capabilities: providerModelSurfaceCapabilities(provider.nativeCapabilities),
+            })),
+          ],
+          adaptationEnabled:
+            (input.advanced?.protocolAdaptationEnabled ?? false) &&
+            env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
+        });
         const localTargets = await tx.executionTarget.findMany({
           where: { userId, discoveredModelId: { in: input.localModelIds } },
           select: {
@@ -1592,6 +1569,7 @@ export const forwarderManagementRouter = {
           throw new ORPCError("PRECONDITION_FAILED", {
             message:
               "Every selected local model must already have an explicitly assigned physical capacity.",
+            data: { reason: "LOCAL_CAPACITY_REQUIRED" },
           });
         }
         const declaredContextByModelId = new Map(
@@ -1620,21 +1598,29 @@ export const forwarderManagementRouter = {
         ) {
           throw new ORPCError("BAD_REQUEST", {
             message: "A member override does not belong to a selected local model.",
+            data: { reason: "MEMBER_OVERRIDE_MISMATCH" },
           });
         }
         for (const target of localTargets) {
           const override = target.discoveredModelId
             ? memberOverrideByModelId.get(target.discoveredModelId)
             : undefined;
-          assertConcurrencyPolicyWithinHardLimit({
-            hardLimit: target.InferenceCapacity?.hardConcurrencyLimit,
-            poolLimit: input.memberConcurrencyLimit,
-            poolReserved: input.reservedSlots,
-            memberMode: override?.concurrency.mode,
-            memberLimit:
-              override?.concurrency.mode === "LIMITED" ? override.concurrency.limitValue : null,
-            memberReserved: override?.reservedSlots,
-          });
+          assertConcurrencyPolicyWithinHardLimit(
+            {
+              hardLimit: target.InferenceCapacity?.hardConcurrencyLimit,
+              poolLimit: input.memberConcurrencyLimit,
+              poolReserved: input.reservedSlots,
+              memberMode: override?.concurrency.mode,
+              memberLimit:
+                override?.concurrency.mode === "LIMITED" ? override.concurrency.limitValue : null,
+              memberReserved: override?.reservedSlots,
+            },
+            {
+              reservedExceeds: "RESERVED_EXCEEDS_CONCURRENCY",
+              reservedExceedsPhysical: "RESERVED_EXCEEDS_PHYSICAL",
+              concurrencyExceedsPhysical: "CONCURRENCY_EXCEEDS_PHYSICAL",
+            },
+          );
           if (!override) continue;
           if (
             override.concurrency.mode === "LIMITED" &&
@@ -1642,6 +1628,7 @@ export const forwarderManagementRouter = {
           ) {
             throw new ORPCError("BAD_REQUEST", {
               message: "Reserved slots exceed a member concurrency override.",
+              data: { reason: "RESERVED_EXCEEDS_CONCURRENCY" },
             });
           }
         }
@@ -1740,20 +1727,26 @@ export const forwarderManagementRouter = {
             target.inferenceCapacityId && seededPhysicalByCapacityId.has(target.inferenceCapacityId)
               ? seededPhysicalByCapacityId.get(target.inferenceCapacityId)
               : target.InferenceCapacity?.physicalMaxContext;
-          assertEffectiveContextPolicy({
-            physicalMaxContext: physicalMaximum,
-            poolCeiling: input.memberContextCeiling,
-            poolMargin: input.advanced?.contextMargin ?? 0,
-            memberMode: override?.contextCeiling.mode,
-            memberCeiling:
-              override?.contextCeiling.mode === "LIMITED"
-                ? override.contextCeiling.limitValue
-                : null,
-            memberMargin:
-              override && override.contextCeiling.mode !== "INHERIT"
-                ? override.contextMargin
-                : null,
-          });
+          assertEffectiveContextPolicy(
+            {
+              physicalMaxContext: physicalMaximum,
+              poolCeiling: input.memberContextCeiling,
+              poolMargin: input.advanced?.contextMargin ?? 0,
+              memberMode: override?.contextCeiling.mode,
+              memberCeiling:
+                override?.contextCeiling.mode === "LIMITED"
+                  ? override.contextCeiling.limitValue
+                  : null,
+              memberMargin:
+                override && override.contextCeiling.mode !== "INHERIT"
+                  ? override.contextMargin
+                  : null,
+            },
+            {
+              marginExceedsCeiling: "CONTEXT_MARGIN_EXCEEDS_CEILING",
+              exceedsPhysical: "CONTEXT_EXCEEDS_PHYSICAL",
+            },
+          );
         }
         if (
           providers.some(
@@ -1767,14 +1760,22 @@ export const forwarderManagementRouter = {
         ) {
           throw new ORPCError("BAD_REQUEST", {
             message: "Member context exceeds a selected provider's context window.",
+            data: { reason: "PROVIDER_CONTEXT_EXCEEDED" },
           });
         }
         for (const provider of providers) {
-          assertConcurrencyPolicyWithinHardLimit({
-            hardLimit: provider.concurrencyLimit,
-            poolLimit: input.memberConcurrencyLimit,
-            poolReserved: input.reservedSlots,
-          });
+          assertConcurrencyPolicyWithinHardLimit(
+            {
+              hardLimit: provider.concurrencyLimit,
+              poolLimit: input.memberConcurrencyLimit,
+              poolReserved: input.reservedSlots,
+            },
+            {
+              reservedExceeds: "RESERVED_EXCEEDS_CONCURRENCY",
+              reservedExceedsPhysical: "RESERVED_EXCEEDS_PHYSICAL",
+              concurrencyExceedsPhysical: "CONCURRENCY_EXCEEDS_PHYSICAL",
+            },
+          );
         }
         const pool = await tx.modelPool.create({
           data: {
@@ -1794,7 +1795,9 @@ export const forwarderManagementRouter = {
             capacityContextCeiling: input.memberContextCeiling,
             capacityContextMargin: input.advanced?.contextMargin ?? 0,
             capacityBorrowPolicy: input.advanced?.borrowPolicy ?? "WHEN_IDLE",
-            affinityEnabled: input.advanced?.affinity.enabled ?? false,
+            // Cache-affinity routing is ON by default for new guarded pools so
+            // identical follow-up requests stick to the warm member.
+            affinityEnabled: input.advanced?.affinity.enabled ?? true,
             affinityTtlSeconds: input.advanced?.affinity.ttlSeconds ?? 3600,
             affinityMaxRecords: input.advanced?.affinity.maxRecords ?? 10_000,
             affinityPrefixWeight: input.advanced?.affinity.prefixWeight ?? 100,
@@ -1983,6 +1986,11 @@ export const forwarderManagementRouter = {
           where: { id: pool.id },
           select: poolSelect,
         });
+        // Documented, accepted exception: no `data.reason` is attached here.
+        // This is an internal invariant violation (the pool row vanished after
+        // a successful create inside the same transaction); it is not a user
+        // correctable guarded-create failure, so the client's generic rollback
+        // copy applies. Do not add a reason code for this branch.
         if (!created) throw new ORPCError("INTERNAL_SERVER_ERROR");
         return serializePool(created);
       });
@@ -2050,14 +2058,29 @@ export const forwarderManagementRouter = {
 
   removeDiscoveredModelMetadata: protectedProcedure
     .input(z.object({ id: idSchema, staleBefore: z.date().optional() }))
-    .handler(({ input, context }) =>
-      removeOwnedRow({
+    .handler(async ({ input, context }) => {
+      // Pool membership cascades away with the model, so capture the affected
+      // pools before the delete; the impact itself is computed from the
+      // post-delete member state.
+      const poolIds = await poolIdsWithMembers(
+        prisma,
+        context.session.user.id,
+        discoveredModelPoolMemberWhere(input.id),
+      );
+      const removed = await removeOwnedRow({
         kind: "discoveredModel",
         id: input.id,
         userId: context.session.user.id,
         staleBefore: input.staleBefore,
-      }),
-    ),
+      });
+      return {
+        ...removed,
+        impactedPools: await capabilityEditImpactedPools(prisma, {
+          userId: context.session.user.id,
+          poolIds,
+        }),
+      };
+    }),
 
   listModelPools: protectedProcedure.handler(async ({ context }) => {
     const rows = await prisma.modelPool.findMany({
@@ -2196,7 +2219,9 @@ export const forwarderManagementRouter = {
         capacityContextCeiling: input.capacityContextCeiling ?? null,
         capacityContextMargin: input.capacityContextMargin ?? 0,
         capacityBorrowPolicy: input.capacityBorrowPolicy ?? "WHEN_IDLE",
-        affinityEnabled: input.affinityEnabled ?? false,
+        // Cache-affinity routing defaults ON for legacy creates too, matching
+        // the guarded wizard path; explicit opt-out is honored below.
+        affinityEnabled: input.affinityEnabled ?? true,
         affinityTtlSeconds: input.affinityTtlSeconds ?? 3600,
         affinityMaxRecords: input.affinityMaxRecords ?? 10_000,
         affinityPrefixWeight: input.affinityPrefixWeight ?? 100,
@@ -2402,6 +2427,7 @@ export const forwarderManagementRouter = {
             userId: true,
             protocolAdaptationEnabled: true,
             allowLossyDeveloperRoleCollapse: true,
+            recommendedSurfaceOverride: true,
           },
         });
         if (!current || current.userId !== context.session.user.id) {
@@ -2416,6 +2442,27 @@ export const forwarderManagementRouter = {
               input.protocolAdaptationEnabled ?? current.protocolAdaptationEnabled,
             allowLossyDeveloperRoleCollapse:
               input.allowLossyDeveloperRoleCollapse ?? current.allowLossyDeveloperRoleCollapse,
+          });
+        }
+        // Non-retroactive selectability gate: only updates that touch the
+        // override or the adaptation flag validate the post-state, so a pool
+        // already holding a legacy-invalid override can still be renamed or
+        // have unrelated policy fields edited.
+        if (
+          input.recommendedSurfaceOverride !== undefined ||
+          input.protocolAdaptationEnabled !== undefined
+        ) {
+          const members = await loadPoolSurfaceMembers(tx, input.id);
+          assertRecommendedSurfaceServable({
+            override: parseModelApiSurface(
+              input.recommendedSurfaceOverride !== undefined
+                ? input.recommendedSurfaceOverride
+                : current.recommendedSurfaceOverride,
+            ),
+            members,
+            adaptationEnabled:
+              (input.protocolAdaptationEnabled ?? current.protocolAdaptationEnabled) &&
+              env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
           });
         }
         return tx.modelPool.update({
@@ -2557,6 +2604,29 @@ export const forwarderManagementRouter = {
       return runSerializableTransaction(async (tx) => {
         const userId = context.session.user.id;
         await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${input.poolId} AND "userId" = ${userId} FOR UPDATE`;
+        // Local members always join at PRIMARY tier, so every attach changes
+        // the primary member set and must keep the effective recommended
+        // surface servable before any write lands.
+        const surfacePool = await tx.modelPool.findFirst({
+          where: { id: input.poolId, userId },
+          select: {
+            recommendedSurfaceOverride: true,
+            protocolAdaptationEnabled: true,
+          },
+        });
+        if (!surfacePool) throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+        const surfaceMembers = await loadPoolSurfaceMembers(tx, input.poolId);
+        surfaceMembers.push({
+          id: input.discoveredModelId,
+          tier: "PRIMARY",
+          capabilities: discoveredModelSurfaceCapabilities(model),
+        });
+        assertRecommendedSurfaceServable({
+          override: parseModelApiSurface(surfacePool.recommendedSurfaceOverride),
+          members: surfaceMembers,
+          adaptationEnabled:
+            surfacePool.protocolAdaptationEnabled && env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
+        });
         const target = await tx.executionTarget.upsert({
           where: { discoveredModelId: input.discoveredModelId },
           update: {},
@@ -2699,6 +2769,8 @@ export const forwarderManagementRouter = {
             id: true,
             publicEgressEnabled: true,
             publicEgressAcknowledged: true,
+            recommendedSurfaceOverride: true,
+            protocolAdaptationEnabled: true,
             capacityConcurrencyLimit: true,
             capacityReservedSlots: true,
             capacityContextCeiling: true,
@@ -2729,6 +2801,7 @@ export const forwarderManagementRouter = {
             upstreamModelId: true,
             contextWindow: true,
             concurrencyLimit: true,
+            nativeCapabilities: true,
             enabled: true,
           },
         });
@@ -2737,6 +2810,22 @@ export const forwarderManagementRouter = {
         }
         if (!providerModel.enabled) {
           throw new ORPCError("BAD_REQUEST", { message: "Enable the provider model first." });
+        }
+        // Attaching at PRIMARY tier changes the primary member set: the
+        // effective recommended surface must stay servable before any write.
+        if (input.tier === "PRIMARY") {
+          const surfaceMembers = await loadPoolSurfaceMembers(tx, input.poolId);
+          surfaceMembers.push({
+            id: providerModel.id,
+            tier: "PRIMARY",
+            capabilities: providerModelSurfaceCapabilities(providerModel.nativeCapabilities),
+          });
+          assertRecommendedSurfaceServable({
+            override: parseModelApiSurface(pool.recommendedSurfaceOverride),
+            members: surfaceMembers,
+            adaptationEnabled:
+              pool.protocolAdaptationEnabled && env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
+          });
         }
         await lockExecutionTargetIdentities(tx, [`provider-model:${providerModel.id}`]);
         // Fast rejection; the same invariant is checked again after the target
@@ -3018,6 +3107,8 @@ export const forwarderManagementRouter = {
                   userId: true,
                   publicEgressEnabled: true,
                   publicEgressAcknowledged: true,
+                  recommendedSurfaceOverride: true,
+                  protocolAdaptationEnabled: true,
                   capacityConcurrencyLimit: true,
                   capacityReservedSlots: true,
                   capacityContextCeiling: true,
@@ -3157,6 +3248,25 @@ export const forwarderManagementRouter = {
           );
           if (nextTier === "PUBLIC_OVERFLOW") overflow.splice(desiredOrder, 0, { id: member.id });
 
+          // A tier transition re-shapes the primary member set, so the
+          // effective recommended surface must stay servable in the
+          // post-transition state before any write lands. Tier-preserving
+          // updates (weight, policy fields, order) leave the selectability
+          // inputs untouched and stay non-retroactive.
+          if (input.tier !== undefined && input.tier !== member.tier) {
+            const surfaceMembers = await loadPoolSurfaceMembers(tx, member.poolId);
+            for (const surfaceMember of surfaceMembers) {
+              if (surfaceMember.id === member.id) surfaceMember.tier = input.tier;
+            }
+            assertRecommendedSurfaceServable({
+              override: parseModelApiSurface(member.ModelPool.recommendedSurfaceOverride),
+              members: surfaceMembers,
+              adaptationEnabled:
+                member.ModelPool.protocolAdaptationEnabled &&
+                env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
+            });
+          }
+
           // Move existing rows out of the unique public-order range before
           // assigning the normalized contiguous order.
           if (overflow.length > 0)
@@ -3284,15 +3394,52 @@ export const forwarderManagementRouter = {
   removePoolMember: protectedProcedure
     .input(z.object({ id: idSchema }))
     .handler(async ({ input, context }) => {
-      const member = await prisma.poolMember.findUnique({
-        where: { id: input.id },
-        select: { id: true, ModelPool: { select: { userId: true } } },
+      const userId = context.session.user.id;
+      return runSerializableTransaction(async (tx) => {
+        const candidate = await tx.poolMember.findUnique({
+          where: { id: input.id },
+          select: { id: true, poolId: true, ModelPool: { select: { userId: true } } },
+        });
+        if (!candidate || candidate.ModelPool.userId !== userId) {
+          throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
+        }
+        // Lock the pool row first (matching addPoolMember) so the member set
+        // this decision is made against cannot change concurrently.
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidate.poolId} AND "userId" = ${userId} FOR UPDATE`;
+        const member = await tx.poolMember.findUnique({
+          where: { id: input.id },
+          select: {
+            id: true,
+            poolId: true,
+            tier: true,
+            ModelPool: {
+              select: {
+                userId: true,
+                recommendedSurfaceOverride: true,
+                protocolAdaptationEnabled: true,
+              },
+            },
+          },
+        });
+        if (!member || member.ModelPool.userId !== userId) {
+          throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
+        }
+        // Detaching a PRIMARY member re-shapes the primary member set: the
+        // effective recommended surface must stay servable across the remaining
+        // members. Detaching an overflow member leaves selectability untouched.
+        if (member.tier === "PRIMARY") {
+          const surfaceMembers = await loadPoolSurfaceMembers(tx, member.poolId, member.id);
+          assertRecommendedSurfaceServable({
+            override: parseModelApiSurface(member.ModelPool.recommendedSurfaceOverride),
+            members: surfaceMembers,
+            adaptationEnabled:
+              member.ModelPool.protocolAdaptationEnabled &&
+              env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
+          });
+        }
+        await tx.poolMember.delete({ where: { id: input.id } });
+        return { deleted: true };
       });
-      if (!member || member.ModelPool.userId !== context.session.user.id) {
-        throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
-      }
-      await prisma.poolMember.delete({ where: { id: input.id } });
-      return { deleted: true };
     }),
 
   updateDiscoveredModelCapabilities: protectedProcedure
@@ -3344,13 +3491,14 @@ export const forwarderManagementRouter = {
         ) {
           nextCoarse.push("TEXT_GENERATION");
         }
-        return prisma.discoveredModel.update({
+        const metadata = openAiCapabilitiesFromCoarse(nextCoarse);
+        await prisma.discoveredModel.update({
           where: { id: input.id },
           data: {
             capabilityOverrideMode: "OVERRIDE",
             capabilityOverrideOrigin: "DASHBOARD",
             capabilityOverrides: { set: nextCoarse },
-            capabilityOverrideMetadata: openAiCapabilitiesFromCoarse(nextCoarse),
+            capabilityOverrideMetadata: metadata,
           },
           select: {
             id: true,
@@ -3359,6 +3507,13 @@ export const forwarderManagementRouter = {
             capabilityOverrideMetadata: true,
           },
         });
+        return {
+          id: input.id,
+          capabilityOverrideMode: "OVERRIDE" as const,
+          capabilityOverrides: nextCoarse,
+          capabilityOverrideMetadata: metadata,
+          impactedPools: await discoveredModelEditImpact(input.id, context.session.user.id),
+        };
       }
       if (parsed.version === 4) {
         const current = parsed.surfaces.openaiChatCompletions;
@@ -3376,7 +3531,7 @@ export const forwarderManagementRouter = {
               : current,
           },
         };
-        return prisma.discoveredModel.update({
+        const updated = await prisma.discoveredModel.update({
           where: { id: input.id },
           data: {
             capabilityOverrideMode: "OVERRIDE",
@@ -3391,6 +3546,10 @@ export const forwarderManagementRouter = {
             capabilityOverrideMetadata: true,
           },
         });
+        return {
+          ...updated,
+          impactedPools: await discoveredModelEditImpact(input.id, context.session.user.id),
+        };
       }
       const base = parsed;
       const chatExisted = Boolean(base.chatCompletions);
@@ -3435,7 +3594,7 @@ export const forwarderManagementRouter = {
       if (metadata.audio?.speech) coarse.push("AUDIO_OUTPUT");
       if (metadata.embeddings?.supported) coarse.push("EMBEDDING");
       if (metadata.responses?.supported) coarse.push("RESPONSES_API");
-      return prisma.discoveredModel.update({
+      const updated = await prisma.discoveredModel.update({
         where: { id: input.id },
         data: {
           capabilityOverrideMode: "OVERRIDE",
@@ -3450,6 +3609,10 @@ export const forwarderManagementRouter = {
           capabilityOverrideMetadata: true,
         },
       });
+      return {
+        ...updated,
+        impactedPools: await discoveredModelEditImpact(input.id, context.session.user.id),
+      };
     }),
 
   /**
@@ -3483,7 +3646,7 @@ export const forwarderManagementRouter = {
         throw new ORPCError("NOT_FOUND", { message: "Discovered model not found." });
       }
       const override = input.mode === "override";
-      return prisma.discoveredModel.update({
+      const updated = await prisma.discoveredModel.update({
         where: { id: input.id },
         data: {
           capabilityOverrideMode: override ? "OVERRIDE" : "INHERIT_ENDPOINT_DEFAULTS",
@@ -3505,6 +3668,10 @@ export const forwarderManagementRouter = {
           capabilityOverrideMetadata: true,
         },
       });
+      return {
+        ...updated,
+        impactedPools: await discoveredModelEditImpact(input.id, context.session.user.id),
+      };
     }),
 
   updateDiscoveredModelAttachmentLimit: protectedProcedure

@@ -8,14 +8,22 @@ const state = vi.hoisted(() => ({
   mutationCalls: [] as string[],
   mutationPayloads: [] as Array<{ name: string; input: unknown }>,
   protocolAdaptationAvailable: true,
+  nextReject: null as { name: string; error: unknown } | null,
+  cliDevices: [] as Array<Record<string, unknown>>,
+  capabilityImpact: [] as Array<{ id: string; slug: string; surface: string }>,
 }));
 
 vi.mock("react-i18next", () => ({
-  useTranslation: () => ({ t: (key: string) => key }),
+  useTranslation: () => ({
+    // Forward interpolation options so toast assertions can verify exactly
+    // which variables (slugs, not count) reach the translated message.
+    t: (key: string, options?: Record<string, unknown>) =>
+      options ? `${key}|${JSON.stringify(options)}` : key,
+  }),
 }));
 
 vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
-  toast: { success: vi.fn(), error: vi.fn() },
+  toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() },
 }));
 
 vi.mock("@/utils/orpc", () => {
@@ -27,26 +35,51 @@ vi.mock("@/utils/orpc", () => {
       mutationFn: async (input: unknown) => {
         state.mutationCalls.push(name);
         state.mutationPayloads.push({ name, input });
-        return name === "addPoolMember"
-          ? { id: "member-1", executionTargetId: "target-1" }
-          : { id: "pool-1" };
+        if (state.nextReject?.name === name) {
+          const error = state.nextReject.error;
+          state.nextReject = null;
+          throw error;
+        }
+        if (name === "addPoolMember") return { id: "member-1", executionTargetId: "target-1" };
+        if (name === "updateDiscoveredModelCapabilities")
+          return { impactedPools: state.capabilityImpact };
+        if (name === "setDiscoveredModelCapabilityProfile")
+          return { impactedPools: state.capabilityImpact };
+        if (name === "removeDiscoveredModelMetadata")
+          return { deleted: true, impactedPools: state.capabilityImpact };
+        return { id: "pool-1" };
       },
       ...options,
     }),
   });
   return {
     orpc: {
+      appConfig: query("appConfig", { capacityEnabled: false }),
       forwarderManagement: {
         key: () => ["forwarderManagement"],
+        listCliDevices: {
+          queryOptions: () => ({
+            queryKey: ["cliDevices"],
+            queryFn: async () => state.cliDevices,
+            initialData: state.cliDevices,
+          }),
+        },
         createModelPool: mutation("createModelPool"),
         updateModelPool: mutation("updateModelPool"),
         addPoolMember: mutation("addPoolMember"),
         updatePoolMember: mutation("updatePoolMember"),
+        removeCliDeviceMetadata: mutation("removeCliDeviceMetadata"),
+        removeEndpointMetadata: mutation("removeEndpointMetadata"),
+        removeDiscoveredModelMetadata: mutation("removeDiscoveredModelMetadata"),
+        updateDiscoveredModelCapabilities: mutation("updateDiscoveredModelCapabilities"),
+        setDiscoveredModelCapabilityProfile: mutation("setDiscoveredModelCapabilityProfile"),
+        updateDiscoveredModelAttachmentLimit: mutation("updateDiscoveredModelAttachmentLimit"),
         cacheAffinityStats: query("affinity", { activeRecords: 0, targets: [] }),
         clearCacheAffinity: mutation("clearCacheAffinity"),
       },
       capacityManagement: {
         key: () => ["capacityManagement"],
+        list: query("capacities", []),
         updateMemberPolicy: mutation("updateMemberPolicy"),
         updateDirectPolicy: mutation("updateDirectPolicy"),
       },
@@ -54,7 +87,51 @@ vi.mock("@/utils/orpc", () => {
   };
 });
 
-import { PoolForm, PoolMemberForm } from "./forwarder-dashboard-sections";
+import { toast } from "@ws-model-proxy/ui/components/sileo";
+import {
+  CliEndpointsModelsSection,
+  PoolForm,
+  PoolMemberForm,
+} from "./forwarder-dashboard-sections";
+
+const cliDeviceWithModel = {
+  id: "cli-1",
+  slug: "desk",
+  label: "Desk",
+  status: "ONLINE",
+  isStale: false,
+  inventoryConfirmed: true,
+  inventoryAcknowledgedAt: new Date("2026-01-01"),
+  inventorySeq: 1,
+  endpoints: [
+    {
+      id: "endpoint-1",
+      slug: "local",
+      label: "Local",
+      status: "ONLINE",
+      kind: "OPENAI",
+      published: true,
+      lastSeenAt: new Date("2026-01-01"),
+      capabilityMetadata: null,
+      failureReasonCode: null,
+      models: [
+        {
+          id: "model-1",
+          canonicalModelId: "owner/desk/local/example",
+          upstreamModelId: "example",
+          lastSeenAt: new Date("2026-01-01"),
+          published: true,
+          suggestedConnectionType: null,
+          capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+          capabilityOverrideMetadata: null,
+          capabilityOverrides: [],
+          effectiveCapabilities: { coarse: [] },
+          maxAttachmentBytes: null,
+        },
+      ],
+    },
+  ],
+};
 
 const editablePool = {
   id: "pool-1",
@@ -130,7 +207,12 @@ const editablePool = {
   allowLossyDeveloperRoleCollapse: false,
   publicEgressEnabled: false,
   publicEgressAcknowledged: false,
-  recommendedSurfaceOverride: null,
+  recommendedSurfaceOverride: null as
+    | "ANTHROPIC_MESSAGES"
+    | "OPENAI_CHAT_COMPLETIONS"
+    | "OPENAI_COMPLETIONS"
+    | "OPENAI_RESPONSES"
+    | null,
   capacityPriority: 16,
   capacityConcurrencyLimit: 1,
   capacityReservedSlots: 0,
@@ -181,6 +263,12 @@ afterEach(() => {
   cleanup();
   state.mutationCalls = [];
   state.mutationPayloads = [];
+  state.nextReject = null;
+  state.cliDevices = [];
+  state.capabilityImpact = [];
+  vi.mocked(toast.success).mockClear();
+  vi.mocked(toast.error).mockClear();
+  vi.mocked(toast.warning).mockClear();
 });
 
 describe("PoolForm protocol adaptation controls", () => {
@@ -246,10 +334,118 @@ describe("PoolForm protocol adaptation controls", () => {
     fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
 
     await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    // The repair still rides on the always-sent lossy bit; the unchanged
+    // adaptation flag and override stay omitted (dirty-field sends).
     expect(state.mutationPayloads[0]?.input).toMatchObject({
-      protocolAdaptationEnabled: false,
       allowLossyDeveloperRoleCollapse: false,
     });
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("protocolAdaptationEnabled");
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("recommendedSurfaceOverride");
+  });
+
+  it("omits unchanged selectability-gated routing fields on edit (W5)", async () => {
+    mount(true, { mode: "edit", sections: ["routing"] });
+
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("protocolAdaptationEnabled");
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("recommendedSurfaceOverride");
+    // Unrelated routing fields keep their always-send semantics.
+    expect(state.mutationPayloads[0]?.input).toHaveProperty("allowLossyDeveloperRoleCollapse");
+    expect(state.mutationPayloads[0]?.input).toHaveProperty("affinityEnabled");
+  });
+
+  it("sends the override when the user clears a stored surface", async () => {
+    mount(true, {
+      mode: "edit",
+      sections: ["routing"],
+      pool: { ...editablePool, recommendedSurfaceOverride: "OPENAI_RESPONSES" },
+    });
+
+    fireEvent.change(screen.getByLabelText("dashboard:pools.recommendedSurfaceOverride"), {
+      target: { value: "" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({
+      recommendedSurfaceOverride: null,
+    });
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("protocolAdaptationEnabled");
+  });
+
+  it("sends the override when the user sets a surface on an automatic pool", async () => {
+    mount(true, { mode: "edit", sections: ["routing"] });
+
+    fireEvent.change(screen.getByLabelText("dashboard:pools.recommendedSurfaceOverride"), {
+      target: { value: "OPENAI_RESPONSES" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({
+      recommendedSurfaceOverride: "OPENAI_RESPONSES",
+    });
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("protocolAdaptationEnabled");
+  });
+
+  it("sends adaptation when changed and the override when unchanged separately", async () => {
+    mount(true, { mode: "edit", sections: ["routing"] });
+
+    fireEvent.click(screen.getByLabelText("dashboard:pools.protocolOptions.lossless.label"));
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({
+      protocolAdaptationEnabled: true,
+    });
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("recommendedSurfaceOverride");
+  });
+
+  it("omits the stored override on routing save when the control is untouched", async () => {
+    mount(true, {
+      mode: "edit",
+      sections: ["routing"],
+      pool: { ...editablePool, recommendedSurfaceOverride: "OPENAI_RESPONSES" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("recommendedSurfaceOverride");
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("protocolAdaptationEnabled");
+  });
+
+  it("omits a stored enabled adaptation on routing save when the control is untouched", async () => {
+    mount(true, {
+      mode: "edit",
+      sections: ["routing"],
+      pool: { ...editablePool, protocolAdaptationEnabled: true },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("protocolAdaptationEnabled");
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("recommendedSurfaceOverride");
+  });
+
+  it("sends protocolAdaptationEnabled false when the user disables a stored adaptation", async () => {
+    mount(true, {
+      mode: "edit",
+      sections: ["routing"],
+      pool: { ...editablePool, protocolAdaptationEnabled: true },
+    });
+
+    fireEvent.click(screen.getByLabelText("dashboard:pools.protocolOptions.native.label"));
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({
+      protocolAdaptationEnabled: false,
+    });
+    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("recommendedSurfaceOverride");
   });
 
   it("saves exactly one pool mutation without a sheet", async () => {
@@ -296,6 +492,118 @@ describe("PoolForm protocol adaptation controls", () => {
 
     await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
     expect(state.mutationPayloads[0]?.input).not.toHaveProperty("capacityPriority");
+  });
+
+  it("maps a SURFACE_NOT_SUPPORTED update rejection onto the recommended-API field", async () => {
+    state.nextReject = {
+      name: "updateModelPool",
+      error: Object.assign(new Error("surface mismatch"), {
+        code: "BAD_REQUEST",
+        data: { reason: "SURFACE_NOT_SUPPORTED" },
+      }),
+    };
+    mount(true, { mode: "edit", sections: ["routing"] });
+
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(
+      screen.getByText("dashboard:pools.wizard.createErrors.SURFACE_NOT_SUPPORTED"),
+    ).toBeTruthy();
+
+    // Changing the recommended-API choice clears the inline rejection.
+    fireEvent.change(screen.getByLabelText("dashboard:pools.recommendedSurfaceOverride"), {
+      target: { value: "OPENAI_RESPONSES" },
+    });
+    expect(
+      screen.queryByText("dashboard:pools.wizard.createErrors.SURFACE_NOT_SUPPORTED"),
+    ).toBeNull();
+
+    // Changing the protocol adaptation choice clears it too.
+    state.nextReject = {
+      name: "updateModelPool",
+      error: Object.assign(new Error("surface mismatch"), {
+        code: "BAD_REQUEST",
+        data: { reason: "SURFACE_NOT_SUPPORTED" },
+      }),
+    };
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+    await waitFor(() =>
+      expect(
+        screen.getByText("dashboard:pools.wizard.createErrors.SURFACE_NOT_SUPPORTED"),
+      ).toBeTruthy(),
+    );
+    fireEvent.click(screen.getByLabelText("dashboard:pools.protocolOptions.lossless.label"));
+    expect(
+      screen.queryByText("dashboard:pools.wizard.createErrors.SURFACE_NOT_SUPPORTED"),
+    ).toBeNull();
+  });
+
+  it("lets non-surface update rejections propagate untouched", async () => {
+    const other = Object.assign(new Error("unrelated"), {
+      code: "BAD_REQUEST",
+      data: { reason: "PROVIDER_NOT_READY" },
+    });
+    state.nextReject = { name: "updateModelPool", error: other };
+    mount(true, { mode: "edit", sections: ["routing"] });
+
+    const save = screen.getByRole("button", { name: "common:actions.save" });
+    fireEvent.click(save);
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    // The rejection is not mapped to the recommended-API field: the promise
+    // chain propagates it (unhandled in this harness) and no inline copy is
+    // rendered.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(
+      screen.queryByText("dashboard:pools.wizard.createErrors.SURFACE_NOT_SUPPORTED"),
+    ).toBeNull();
+  });
+});
+
+describe("PoolForm affinity defaults", () => {
+  it("initializes the affinity toggle checked in create mode and submits true", async () => {
+    mount();
+
+    const toggle = screen.getByLabelText("dashboard:pools.affinity.enabled");
+    expect((toggle as HTMLInputElement).checked).toBe(true);
+
+    fireEvent.change(screen.getByLabelText("dashboard:pools.slug"), {
+      target: { value: "primary" },
+    });
+    fireEvent.change(screen.getByLabelText("dashboard:pools.name"), {
+      target: { value: "Primary" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["createModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({ affinityEnabled: true });
+  });
+
+  it("submits an explicit opt-out when the create-mode toggle is unchecked", async () => {
+    mount();
+
+    fireEvent.click(screen.getByLabelText("dashboard:pools.affinity.enabled"));
+    fireEvent.change(screen.getByLabelText("dashboard:pools.slug"), {
+      target: { value: "primary" },
+    });
+    fireEvent.change(screen.getByLabelText("dashboard:pools.name"), {
+      target: { value: "Primary" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["createModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({ affinityEnabled: false });
+  });
+
+  it("loads the stored affinity value in edit mode", () => {
+    // editablePool stores affinity disabled; the edit form must keep it off
+    // instead of falling back to the create-mode ON default.
+    mount(true, { mode: "edit" });
+
+    expect(
+      (screen.getByLabelText("dashboard:pools.affinity.enabled") as HTMLInputElement).checked,
+    ).toBe(false);
   });
 });
 
@@ -387,5 +695,50 @@ describe("PoolMemberForm capacity save gate", () => {
     fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
 
     await waitFor(() => expect(state.mutationCalls).toEqual(["updatePoolMember"]));
+  });
+});
+
+describe("CliEndpointsModelsSection capability-impact advisory", () => {
+  function mountModelsSection() {
+    return render(
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+      >
+        <CliEndpointsModelsSection />
+      </QueryClientProvider>,
+    );
+  }
+
+  it("fires the save success toast and the impact warning with slugs (no count) after a capability edit", async () => {
+    state.cliDevices = [cliDeviceWithModel];
+    state.capabilityImpact = [{ id: "pool-1", slug: "alpha", surface: "OPENAI_RESPONSES" }];
+    mountModelsSection();
+
+    fireEvent.click(screen.getByLabelText("dashboard:models.vision"));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateDiscoveredModelCapabilities"]));
+    await waitFor(() =>
+      expect(toast.success).toHaveBeenCalledWith("dashboard:models.capabilitySaved"),
+    );
+    // The warning interpolates slugs only; the reworded key has no count.
+    await waitFor(() =>
+      expect(toast.warning).toHaveBeenCalledWith(
+        `dashboard:models.capabilityImpact|${JSON.stringify({ slugs: "alpha" })}`,
+      ),
+    );
+  });
+
+  it("keeps the plain success toast on clean responses", async () => {
+    state.cliDevices = [cliDeviceWithModel];
+    state.capabilityImpact = [];
+    mountModelsSection();
+
+    fireEvent.click(screen.getByLabelText("dashboard:models.vision"));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateDiscoveredModelCapabilities"]));
+    await waitFor(() =>
+      expect(toast.success).toHaveBeenCalledWith("dashboard:models.capabilitySaved"),
+    );
+    expect(toast.warning).not.toHaveBeenCalled();
   });
 });

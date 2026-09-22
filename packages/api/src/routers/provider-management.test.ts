@@ -61,7 +61,8 @@ const db = prisma as unknown as {
   };
   executionTarget: { create: MockInstance; findUnique: MockInstance };
   inferenceCapacity: { updateMany: MockInstance };
-  modelPool: { findFirst: MockInstance };
+  modelPool: { findFirst: MockInstance; findMany: MockInstance };
+  poolMember: { findMany: MockInstance };
   providerCredential: {
     count: MockInstance;
     create: MockInstance;
@@ -1587,6 +1588,149 @@ describe("providerManagementRouter security boundary", () => {
       isolationLevel: "Serializable",
       maxWait: 5_000,
       timeout: 10_000,
+    });
+  });
+
+  describe("updateModel capability impact advisory", () => {
+    // The advisory is computed with the shared prisma client AFTER the
+    // updateModel transaction commits (the tx mock passes `db` as the
+    // client), so these mocks target bare-prisma reads, not tx-scoped ones.
+    const chatInventory = {
+      version: 3 as const,
+      protocol: "openai-compatible" as const,
+      surfaces: {
+        openaiChatCompletions: {
+          source: "dashboard" as const,
+          confidence: "exact" as const,
+          supported: true,
+          streaming: true,
+        },
+      },
+    };
+
+    function primeUpdateModel() {
+      db.$queryRaw.mockResolvedValue([]);
+      db.providerModel.findFirst.mockResolvedValue({ id: "model", providerAccountId: "account" });
+      db.providerAccount.findFirst.mockResolvedValue({ id: "account", providerType: "openai" });
+      db.providerModel.update.mockResolvedValue({ id: "model" });
+      db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
+    }
+
+    function mockImpactMembers(rows: Array<Record<string, unknown>>) {
+      db.poolMember.findMany.mockImplementation(
+        async ({ where }: { where?: { poolId?: { in?: string[] } } } = {}) =>
+          where?.poolId ? rows : [{ poolId: "pool-p" }],
+      );
+    }
+
+    it("succeeds non-blocking and reports pools the post-edit inventory cannot serve", async () => {
+      envMock.enabled = true;
+      primeUpdateModel();
+      db.modelPool.findMany.mockResolvedValue([
+        {
+          id: "pool-p",
+          slug: "prov",
+          recommendedSurfaceOverride: "OPENAI_RESPONSES",
+          protocolAdaptationEnabled: false,
+        },
+      ]);
+      // Post-edit member state: the provider member serves chat only.
+      mockImpactMembers([
+        {
+          id: "m-p",
+          poolId: "pool-p",
+          tier: "PRIMARY",
+          discoveredModelId: null,
+          DiscoveredModel: null,
+          ExecutionTarget: {
+            DiscoveredModel: null,
+            ProviderModel: { nativeCapabilities: chatInventory },
+          },
+        },
+      ]);
+      const client = createRouterClient(providerManagementRouter, { context });
+
+      const result = await client.updateModel({ id: "model", nativeCapabilities: chatInventory });
+      expect(db.providerModel.update).toHaveBeenCalledTimes(1);
+      expect(result).toMatchObject({
+        id: "model",
+        impactedPools: [{ id: "pool-p", slug: "prov", surface: "OPENAI_RESPONSES" }],
+      });
+    });
+
+    it("reports a non-responses violated surface such as ANTHROPIC_MESSAGES", async () => {
+      envMock.enabled = true;
+      primeUpdateModel();
+      db.modelPool.findMany.mockResolvedValue([
+        {
+          id: "pool-c",
+          slug: "anthro",
+          recommendedSurfaceOverride: "ANTHROPIC_MESSAGES",
+          protocolAdaptationEnabled: false,
+        },
+      ]);
+      // Post-edit member state: the provider member serves chat only, and a
+      // stored anthropic-messages override with adaptation off is unservable.
+      mockImpactMembers([
+        {
+          id: "m-c",
+          poolId: "pool-c",
+          tier: "PRIMARY",
+          discoveredModelId: null,
+          DiscoveredModel: null,
+          ExecutionTarget: {
+            DiscoveredModel: null,
+            ProviderModel: { nativeCapabilities: chatInventory },
+          },
+        },
+      ]);
+      const client = createRouterClient(providerManagementRouter, { context });
+
+      const result = await client.updateModel({ id: "model", nativeCapabilities: chatInventory });
+      expect(result).toMatchObject({
+        impactedPools: [{ id: "pool-c", slug: "anthro", surface: "ANTHROPIC_MESSAGES" }],
+      });
+    });
+
+    it("returns an empty advisory when the impacted pool stays servable", async () => {
+      envMock.enabled = true;
+      primeUpdateModel();
+      db.modelPool.findMany.mockResolvedValue([
+        {
+          id: "pool-p",
+          slug: "prov",
+          recommendedSurfaceOverride: "OPENAI_CHAT_COMPLETIONS",
+          protocolAdaptationEnabled: false,
+        },
+      ]);
+      mockImpactMembers([
+        {
+          id: "m-p",
+          poolId: "pool-p",
+          tier: "PRIMARY",
+          discoveredModelId: null,
+          DiscoveredModel: null,
+          ExecutionTarget: {
+            DiscoveredModel: null,
+            ProviderModel: { nativeCapabilities: chatInventory },
+          },
+        },
+      ]);
+      const client = createRouterClient(providerManagementRouter, { context });
+
+      await expect(
+        client.updateModel({ id: "model", nativeCapabilities: chatInventory }),
+      ).resolves.toMatchObject({ impactedPools: [] });
+    });
+
+    it("omits the advisory entirely when nativeCapabilities is not edited", async () => {
+      envMock.enabled = true;
+      primeUpdateModel();
+      const client = createRouterClient(providerManagementRouter, { context });
+
+      const result = await client.updateModel({ id: "model", enabled: true });
+      expect(db.poolMember.findMany).not.toHaveBeenCalled();
+      expect(result).toEqual({ id: "model" });
     });
   });
 

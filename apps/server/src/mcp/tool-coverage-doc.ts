@@ -34,30 +34,33 @@ fails the suite when a leaf is unclassified.`;
 
 const FOOTER = `## Human-only procedures (Phase 7)
 
-The \`mcpGrants\` router (\`packages/api/src/routers/mcp-grants.ts\`) is
-HUMAN-ONLY: it is mounted on \`appRouter\` for the browser-session settings
-page (\`/{lang}/settings/mcp\`) and is excluded from the MCP tool catalog in
-\`MCP_TOOL_EXCLUSIONS\`. Neither procedure may ever appear as an MCP tool: a
-connected MCP client must not be able to enumerate or revoke the human's
-other authorizations.
+The \`mcpGrants\` router (\`packages/api/src/routers/mcp-grants.ts\`) and the
+\`mcpTokens\` router (\`packages/api/src/routers/mcp-tokens.ts\`) are
+HUMAN-ONLY: they are mounted on \`appRouter\` for the browser-session settings
+page (\`/{lang}/settings/mcp\`) and are excluded from the MCP tool catalog in
+\`MCP_TOOL_EXCLUSIONS\`. None of these procedures may ever appear as an MCP
+tool: a connected MCP client must not be able to enumerate, mint, or revoke
+the human's other authorizations or personal tokens.
 
 Enforcement (all pinned by \`apps/server/src/mcp/tool-manifest.test.ts\`):
 
 - the invariant-12 completeness check walks every \`appRouter\` leaf and fails
   unless each leaf is a tool target or an explicit \`MCP_TOOL_EXCLUSIONS\`
-  entry — adding \`mcpGrants\` without an exclusion fails the suite;
-- the pinned exclusion list asserts both \`mcpGrants\` leaves verbatim;
-- a dedicated Phase 7 assertion proves both leaves are absent from the tool
+  entry — adding \`mcpGrants\` or \`mcpTokens\` without an exclusion fails the
+  suite;
+- the pinned exclusion list asserts the \`mcpGrants\` and \`mcpTokens\` leaves
+  verbatim;
+- a dedicated Phase 7 assertion proves those leaves are absent from the tool
   catalog under any name, and drives EVERY procedure-backed tool's real
   invoker through a recording proxy client: each tool must dispatch to
   exactly its declared target leaf (so a selector swap fails the suite) and
-  no dispatch may touch any \`mcpGrants\` path.
+  no dispatch may touch any \`mcpGrants\` or \`mcpTokens\` path.
 
-Unlike authorization, discovery, MCP login/consent, and \`/mcp\`, the
-\`mcpGrants\` procedures and the settings page are deliberately NOT gated on
-\`WMP_MCP_ENABLED\` (invariant 13): humans must be able to kill
-outstanding authorization during an emergency MCP shutdown. Normal browser
-authentication still applies.`;
+Unlike authorization, discovery, MCP login/consent, and \`/mcp\`, grant and
+token *revocation* and the settings page are deliberately NOT gated on
+\`WMP_MCP_ENABLED\` (invariant 13): humans must be able to kill outstanding
+authorization during an emergency MCP shutdown. Personal-token *creation*
+is gated on the flag. Normal browser authentication still applies.`;
 
 interface CoverageRow {
   readonly target: string;

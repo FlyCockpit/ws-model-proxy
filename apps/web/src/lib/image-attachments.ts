@@ -68,7 +68,7 @@ export const TOTAL_REQUEST_HARD_MAX_BYTES = 9.5 * 1024 * 1024; // ~9.5 MB
 // Post-compression size at/below which we keep the Phase 0 base64 path even when
 // media upload is available. Small images stay embedded (offline-friendly,
 // fewer round trips); anything larger is uploaded so history stops re-sending
-// multi-hundred-KB base64 each turn. (Phase 1 / decision 3B of asset-plan.md.)
+// multi-hundred-KB base64 each turn. (Phase 1 / decision 3B.)
 export type ProcessedImage = {
   id: string;
   dataUrl: string;

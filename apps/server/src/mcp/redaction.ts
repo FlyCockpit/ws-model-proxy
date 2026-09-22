@@ -23,7 +23,7 @@
  *   `displaySuffix`, `keyVersion`, `lookupPrefix`) deliberately do NOT
  *   match any rule and remain visible.
  * - STRING VALUES that carry a live product credential by prefix
- *   (`wsmp_model_…`, `wsmp_cli_…`, `wsmp_device_…` — the shared
+ *   (`wsmp_model_…`, `wsmp_cli_…`, `wsmp_device_…`, `wsmp_mcp_…` — the shared
  *   `PRODUCT_CREDENTIAL_PREFIXES` constants) under ANY key, so a raw token
  *   that reached an unexpected field never reaches tool output.
  *
@@ -78,11 +78,7 @@ function isSecretBearingKey(key: string): boolean {
 }
 
 function carriesProductCredential(value: string): boolean {
-  return (
-    value.startsWith(PRODUCT_CREDENTIAL_PREFIXES.modelApiToken) ||
-    value.startsWith(PRODUCT_CREDENTIAL_PREFIXES.cliToken) ||
-    value.startsWith(PRODUCT_CREDENTIAL_PREFIXES.deviceCredential)
-  );
+  return Object.values(PRODUCT_CREDENTIAL_PREFIXES).some((prefix) => value.startsWith(prefix));
 }
 
 /** Depth bound: mirrors the serialization bound; deeper nests redact whole. */

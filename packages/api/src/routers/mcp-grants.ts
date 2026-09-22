@@ -1,4 +1,5 @@
 import { ORPCError } from "@orpc/server";
+import { isMcpPatClientId } from "@ws-model-proxy/auth/mcp-config";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
@@ -393,10 +394,16 @@ export const mcpGrantsRouter = {
     // only by expired tokens are not displayed.
     const now = new Date();
 
-    const grants = await prisma.mcpGrant.findMany({
+    const allGrants = await prisma.mcpGrant.findMany({
       where: { userId },
       select: grantSelection,
     });
+    // Personal-token grants carry the synthetic `pat:<tokenId>` clientId (no
+    // OauthClient row exists): they are surfaced by the mcpTokens router as
+    // tokens, never here as OAuth connections. Filtered EXPLICITLY (and not
+    // only implicitly via the oauthClient join finding no row) so the
+    // exclusion holds even if a client row with such an id ever existed.
+    const grants = allGrants.filter((grant) => !isMcpPatClientId(grant.clientId));
 
     const activeClientIds = new Set(
       grants.filter((grant) => grant.revokedAt === null).map((grant) => grant.clientId),

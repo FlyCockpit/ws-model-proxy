@@ -20,6 +20,9 @@
     "./mcp-config": {
       "default": "./src/mcp-config.ts"
     },
+    "./mcp-pat-limits": {
+      "default": "./src/mcp-pat-limits.ts"
+    },
     "./is-user-banned": {
       "default": "./src/is-user-banned.ts"
     },

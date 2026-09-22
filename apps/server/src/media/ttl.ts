@@ -16,9 +16,9 @@ export {
 
 /**
  * Reads the configured asset TTL in hours (default 24, clamped 1-168). A
- * missing/blank/invalid setting falls back to the default. Phase 2 adds the
- * admin UI that writes it (through the oRPC settings router); this reads it with
- * a default + clamp, following the `signupEnabled` read pattern in
+ * missing/blank/invalid setting falls back to the default. The admin UI
+ * writes it through the oRPC settings router; this reads it with a default +
+ * clamp, following the `signupEnabled` read pattern in
  * @ws-model-proxy/auth/signup-policy.
  */
 export async function getMediaAssetTtlHours(): Promise<number> {

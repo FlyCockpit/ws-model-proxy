@@ -11,6 +11,9 @@
     "./lib/cli-credential-access": {
       "default": "./src/lib/cli-credential-access.ts"
     },
+    "./lib/mcp-token-access": {
+      "default": "./src/lib/mcp-token-access.ts"
+    },
     "./lib/model-pool-routing": {
       "default": "./src/lib/model-pool-routing.ts"
     },
@@ -26,8 +29,17 @@
     "./lib/openai-compatible-capabilities": {
       "default": "./src/lib/openai-compatible-capabilities.ts"
     },
+    "./lib/pool-model-capabilities": {
+      "default": "./src/lib/pool-model-capabilities.ts"
+    },
+    "./lib/pool-recommended-surface": {
+      "default": "./src/lib/pool-recommended-surface.ts"
+    },
     "./lib/declared-context-window": {
       "default": "./src/lib/declared-context-window.ts"
+    },
+    "./lib/guarded-pool-create-reasons": {
+      "default": "./src/lib/guarded-pool-create-reasons.ts"
     },
     "./lib/serializable-transaction": {
       "default": "./src/lib/serializable-transaction.ts"
@@ -57,7 +69,7 @@
   "scripts": {
     "check-types": "tsc -p tsconfig.check-types.json --noEmit",
     "test": "vitest run --passWithNoTests",
-    "test:postgres": "vitest run --maxWorkers=1 --no-file-parallelism src/lib/capacity-policy-races.postgres.integration.test.ts src/routers/forwarder-management.postgres.integration.test.ts src/routers/model-api-tokens.postgres.integration.test.ts"
+    "test:postgres": "vitest run --maxWorkers=1 --no-file-parallelism src/lib/capacity-policy-races.postgres.integration.test.ts src/routers/forwarder-management.postgres.integration.test.ts src/routers/model-api-tokens.postgres.integration.test.ts src/routers/mcp-tokens.postgres.integration.test.ts"
   },
   "dependencies": {
     "@orpc/openapi": "catalog:",

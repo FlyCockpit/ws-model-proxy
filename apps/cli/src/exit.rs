@@ -24,10 +24,7 @@ pub enum ExitCode {
     Failure = 1,
     #[allow(dead_code)] // emitted by clap, listed here for documentation.
     Usage = 2,
-    /// Example domain-specific code. Construct it via
-    /// `CodedError::new(ExitCode::NotFound)`; remove the
-    /// `allow` once you do.
-    #[allow(dead_code)]
+    /// The requested resource (e.g. an endpoint slug) was not found.
     NotFound = 3,
 }
 
@@ -44,7 +41,6 @@ pub struct CodedError {
 
 impl CodedError {
     /// Create an exit-code marker.
-    #[allow(dead_code)] // Template helper: used once commands add domain-specific exit codes.
     pub fn new(code: ExitCode) -> Self {
         Self { code }
     }

@@ -441,7 +441,7 @@ export async function rememberAffinity({
   payload,
   target,
   estimatedTokens,
-  engineCacheConfirmed = false,
+  engineCacheConfirmed,
   now = new Date(),
 }: {
   ownerId: string;
@@ -454,6 +454,12 @@ export async function rememberAffinity({
   payload: Record<string, unknown>;
   target: AffinityTarget;
   estimatedTokens?: number;
+  /**
+   * Latest engine cache evidence from the served response. `true` (cached
+   * prompt tokens reported) and `false` (cache fields reported with zero)
+   * overwrite the stored flag; `undefined` (provider does not report cache
+   * usage) leaves any previously stored value untouched.
+   */
   engineCacheConfirmed?: boolean;
   now?: Date;
 }): Promise<void> {
@@ -517,14 +523,14 @@ export async function rememberAffinity({
           prefixDepth,
           digestVersion: DIGEST_VERSION,
           estimatedTokens,
-          engineCacheConfirmed,
+          engineCacheConfirmed: engineCacheConfirmed ?? false,
           expiresAt,
         },
         update: {
           lastUsedAt: now,
           expiresAt,
           estimatedTokens,
-          engineCacheConfirmed,
+          ...(engineCacheConfirmed === undefined ? {} : { engineCacheConfirmed }),
         },
       });
     };
@@ -551,7 +557,12 @@ export async function rememberAffinity({
       if (existing) {
         await tx.cacheAffinityRecord.update({
           where: { id: existing.id },
-          data: { lastUsedAt: now, expiresAt, estimatedTokens, engineCacheConfirmed },
+          data: {
+            lastUsedAt: now,
+            expiresAt,
+            estimatedTokens,
+            ...(engineCacheConfirmed === undefined ? {} : { engineCacheConfirmed }),
+          },
         });
       } else {
         await tx.cacheAffinityRecord.create({
@@ -561,7 +572,7 @@ export async function rememberAffinity({
             prefixDepth: 0,
             digestVersion: DIGEST_VERSION,
             estimatedTokens,
-            engineCacheConfirmed,
+            engineCacheConfirmed: engineCacheConfirmed ?? false,
             expiresAt,
           },
         });

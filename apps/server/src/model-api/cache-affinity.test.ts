@@ -1454,4 +1454,124 @@ describe("cache affinity", () => {
       expect.objectContaining({ take: 2, where: { expiresAt: { lte: now } } }),
     );
   });
+
+  it("merges engine cache confirmation with latest-evidence semantics", async () => {
+    const rememberArgs = {
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      policy,
+      surface: "openai-chat",
+      payload,
+      target: target("target", "runtime"),
+    };
+
+    // Hit: cached prompt tokens reported -> flag recorded true everywhere.
+    await rememberAffinity({ ...rememberArgs, engineCacheConfirmed: true });
+    expect(db.cacheAffinityRecord.upsert.mock.calls.length).toBeGreaterThan(0);
+    for (const [input] of db.cacheAffinityRecord.upsert.mock.calls) {
+      expect(input.create.engineCacheConfirmed).toBe(true);
+      expect(input.update.engineCacheConfirmed).toBe(true);
+    }
+
+    // Reported-zero: a later miss resets the stored confirmation to false.
+    db.cacheAffinityRecord.upsert.mockClear();
+    await rememberAffinity({ ...rememberArgs, engineCacheConfirmed: false });
+    for (const [input] of db.cacheAffinityRecord.upsert.mock.calls) {
+      expect(input.update.engineCacheConfirmed).toBe(false);
+    }
+
+    // Unreported: no cache evidence must leave the stored flag untouched.
+    db.cacheAffinityRecord.upsert.mockClear();
+    await rememberAffinity(rememberArgs);
+    for (const [input] of db.cacheAffinityRecord.upsert.mock.calls) {
+      expect(input.create.engineCacheConfirmed).toBe(false);
+      expect(input.update).not.toHaveProperty("engineCacheConfirmed");
+    }
+  });
+
+  it("applies latest-evidence merge semantics to explicit conversation records", async () => {
+    const conversationArgs = {
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      policy,
+      surface: "openai-responses",
+      payload: { conversation: "conversation", input: "turn" },
+      target: target("target", "runtime"),
+    };
+
+    // Create path: unreported evidence defaults the stored flag to false.
+    await rememberAffinity(conversationArgs);
+    expect(db.cacheAffinityRecord.create.mock.calls[0]?.[0].data.engineCacheConfirmed).toBe(false);
+
+    // Update path: unreported evidence leaves the stored flag untouched.
+    db.cacheAffinityRecord.findFirst.mockResolvedValue({ id: "existing-session" });
+    db.cacheAffinityRecord.update.mockClear();
+    await rememberAffinity(conversationArgs);
+    expect(db.cacheAffinityRecord.update.mock.calls[0]?.[0].data).not.toHaveProperty(
+      "engineCacheConfirmed",
+    );
+
+    // Update path: reported evidence (either polarity) overwrites the flag.
+    db.cacheAffinityRecord.update.mockClear();
+    await rememberAffinity({ ...conversationArgs, engineCacheConfirmed: true });
+    expect(db.cacheAffinityRecord.update.mock.calls[0]?.[0].data.engineCacheConfirmed).toBe(true);
+
+    // Update path: a reported zero must carry an explicit false — a
+    // conditional-spread regression that only forwards truthy values would
+    // drop the key and leave a stale confirmation behind.
+    db.cacheAffinityRecord.update.mockClear();
+    await rememberAffinity({ ...conversationArgs, engineCacheConfirmed: false });
+    expect(db.cacheAffinityRecord.update.mock.calls[0]?.[0].data.engineCacheConfirmed).toBe(false);
+  });
+
+  it("prefers an engine-confirmed continuation over an equal-depth unconfirmed one", async () => {
+    const warm = cap8(target("target-a", "runtime-a", "capacity-a"));
+    const idle = cap8(target("target-b", "runtime-b", "capacity-b"));
+    const rankPayload = {
+      messages: [
+        { role: "system", content: "S" },
+        { role: "user", content: "U" },
+        { role: "assistant", content: "A" },
+        { role: "user", content: "next" },
+      ],
+    };
+    const warmMaterial = affinityPrefixDigests(digestArgs(warm.targetIdentity, rankPayload));
+    const idleMaterial = affinityPrefixDigests(digestArgs(idle.targetIdentity, rankPayload));
+    db.cacheAffinityRecord.findMany.mockResolvedValue([
+      affinityRow({
+        target: warm,
+        material: warmMaterial,
+        prefixDigest: warmMaterial.digests[1],
+        prefixDepth: 2,
+        engineCacheConfirmed: true,
+      }),
+      affinityRow({
+        target: idle,
+        material: idleMaterial,
+        prefixDigest: idleMaterial.digests[1],
+        prefixDepth: 2,
+        engineCacheConfirmed: false,
+      }),
+    ]);
+    // Both continuations score identically at depth 2; without the confirmed
+    // bonus the original-order tie-break would keep idle first. Only the
+    // engineCacheConfirmed flag differentiates the two records.
+    const result = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [idle, warm],
+    });
+    expect(result.orderedTargetIds[0]).toBe("target-a");
+    expect(result.scores["target-a"]).toBe(450);
+    expect(result.scores["target-b"]).toBe(200);
+    expect(result.reasons["target-a"]).toContain("confirmed:true");
+    expect(result.reasons["target-b"]).toContain("confirmed:false");
+  });
 });

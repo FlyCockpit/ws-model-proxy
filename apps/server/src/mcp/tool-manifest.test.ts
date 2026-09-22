@@ -325,6 +325,9 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
       "settings.update",
       "mcpGrants.listMine",
       "mcpGrants.revokeMine",
+      "mcpTokens.listMine",
+      "mcpTokens.create",
+      "mcpTokens.revokeMine",
     ]) {
       expect(excluded.has(required)).toBe(true);
     }
@@ -355,7 +358,13 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
     // client.mcpGrants.listMine would have passed it.
     const toolNames = MCP_TOOL_MANIFEST.map((tool) => tool.name);
     const toolTargets = MCP_TOOL_MANIFEST.map((tool) => tool.target);
-    for (const leaf of ["mcpGrants.listMine", "mcpGrants.revokeMine"]) {
+    for (const leaf of [
+      "mcpGrants.listMine",
+      "mcpGrants.revokeMine",
+      "mcpTokens.listMine",
+      "mcpTokens.create",
+      "mcpTokens.revokeMine",
+    ]) {
       expect(toolTargets).not.toContain(leaf);
       expect(toolNames).not.toContain(leaf);
       expect(MCP_TOOL_EXCLUSIONS.map((entry) => entry.target)).toContain(leaf);
@@ -415,6 +424,11 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
     );
     expect(grantAccesses).toEqual([]);
     expect(invoked.filter((path) => path.startsWith("mcpGrants"))).toEqual([]);
+    const tokenAccesses = [...accessed].filter(
+      (path) => path === "mcpTokens" || path.startsWith("mcpTokens."),
+    );
+    expect(tokenAccesses).toEqual([]);
+    expect(invoked.filter((path) => path.startsWith("mcpTokens"))).toEqual([]);
   });
 });
 
