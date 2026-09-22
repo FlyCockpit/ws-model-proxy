@@ -1,9 +1,8 @@
 import type { RouterClient } from "@orpc/server";
 import { getSignupAccessState } from "@ws-model-proxy/auth/signup-policy";
-import prisma from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
 
-import { protectedProcedure, publicProcedure } from "../index";
+import { publicProcedure } from "../index";
 import { adminObservabilityRouter } from "./admin-observability";
 import { authRouter } from "./auth";
 import { capacityManagementRouter } from "./capacity-management";
@@ -11,6 +10,7 @@ import { cliCredentialsRouter } from "./cli-credentials";
 import { devicesRouter } from "./devices";
 import { forwarderManagementRouter } from "./forwarder-management";
 import { mcpGrantsRouter } from "./mcp-grants";
+import { mcpTokensRouter } from "./mcp-tokens";
 import { modelApiTokensRouter } from "./model-api-tokens";
 import { providerManagementRouter } from "./provider-management";
 import { relayMetadataRouter } from "./relay-metadata";
@@ -18,15 +18,6 @@ import { settingsRouter } from "./settings";
 import { usersRouter } from "./users";
 
 export const appRouter = {
-  health: {
-    check: publicProcedure.handler(() => {
-      return "OK";
-    }),
-    ready: publicProcedure.handler(async () => {
-      await prisma.$queryRaw`SELECT 1`;
-      return "OK";
-    }),
-  },
   appConfig: publicProcedure.handler(async () => {
     const signupAccess = await getSignupAccessState();
     return {
@@ -45,12 +36,6 @@ export const appRouter = {
       emailEnabled: Boolean(env.SMTP_HOST),
     };
   }),
-  privateData: protectedProcedure.handler(({ context }) => {
-    return {
-      message: "This is private",
-      user: context.session?.user,
-    };
-  }),
   auth: authRouter,
   adminObservability: adminObservabilityRouter,
   settings: settingsRouter,
@@ -65,6 +50,9 @@ export const appRouter = {
   // Human-only MCP grant management (Phase 7): never exposed as MCP tools —
   // see MCP_TOOL_EXCLUSIONS in apps/server/src/mcp/tool-manifest.ts.
   mcpGrants: mcpGrantsRouter,
+  // Human-only MCP personal tokens: hashed Bearer credentials for headless
+  // clients. Never exposed as MCP tools (same exclusion invariant as mcpGrants).
+  mcpTokens: mcpTokensRouter,
 };
 export type AppRouter = typeof appRouter;
 export type AppRouterClient = RouterClient<typeof appRouter>;

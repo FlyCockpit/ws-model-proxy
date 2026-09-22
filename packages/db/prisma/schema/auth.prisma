@@ -32,6 +32,7 @@ model User {
   oauthAccessTokens          OauthAccessToken[]
   oauthConsents              OauthConsent[]
   mcpGrants                  McpGrant[]
+  mcpPersonalTokens          McpPersonalToken[]           @relation("McpPersonalTokenOwner")
   cliDevices                 CliDevice[]                  @relation("CliDeviceOwner")
   cliTokens                  CliToken[]                   @relation("CliTokenOwner")
   cliDeviceCredentials       CliDeviceCredential[]        @relation("CliDeviceCredentialOwner")
@@ -380,9 +381,38 @@ model McpGrant {
   referenceId String
   revokedAt   DateTime?
 
+  personalToken McpPersonalToken?
+
   @@unique([userId, clientId, referenceId])
   @@index([userId, clientId])
   @@map("mcp_grant")
+}
+
+// Human-minted MCP personal access token (hashed product credential). Each
+// token owns exactly one McpGrant generation so /mcp admission and Settings
+// revocation use the same tombstone path as OAuth grants. clientId on the
+// grant is the synthetic `pat:<tokenId>` identifier, not an OauthClient row.
+model McpPersonalToken {
+  id           String    @id
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @default(now()) @updatedAt
+  userId       String
+  name         String
+  lookupPrefix String
+  secretDigest String
+  scopes       String[]
+  lastUsedAt   DateTime?
+  revokedAt    DateTime?
+  expiresAt    DateTime?
+  grantId      String    @unique
+  user         User      @relation("McpPersonalTokenOwner", fields: [userId], references: [id], onDelete: Cascade)
+  grant        McpGrant  @relation(fields: [grantId], references: [id], onDelete: Cascade)
+
+  @@unique([lookupPrefix])
+  @@unique([secretDigest])
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+  @@map("mcp_personal_token")
 }
 
 model AppSetting {

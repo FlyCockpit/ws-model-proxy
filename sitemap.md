@@ -41,7 +41,7 @@ All require an active session, enforced by the `_auth` layout.
 | `/{lang}/dashboard/relay-metadata` | Own relay request metadata cleanup. |
 | `/{lang}/settings` | Profile settings. |
 | `/{lang}/settings/security` | Two-factor authentication enable/disable. |
-| `/{lang}/settings/mcp` | Own MCP (Model Context Protocol) authorizations: per-client grant list and revocation. Stays available while MCP is disabled so outstanding access can be killed during an emergency shutdown. |
+| `/{lang}/settings/mcp` | Own MCP (Model Context Protocol) authorizations: personal access tokens plus per-client OAuth grant list and revocation. Stays available while MCP is disabled so outstanding access can be killed during an emergency shutdown. Token creation is disabled while MCP is off. |
 
 ## Admin Routes
 

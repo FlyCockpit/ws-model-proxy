@@ -50,7 +50,7 @@ export const MCP_TRANSPORT_OPTIONS = {
 /**
  * Build the module-lifetime MCP HTTP handler. `registerTools` is injectable
  * so tests can observe per-request server construction; production uses the
- * {@link registerMcpTools} seam (empty manifest until Phase 5).
+ * {@link registerMcpTools} seam.
  * `isShuttingDown` is the FACTORY FENCE's shutdown half (F8 pass 4):
  * production passes the admission gate's closed flag.
  */

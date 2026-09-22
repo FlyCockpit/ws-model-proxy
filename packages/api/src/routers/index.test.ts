@@ -11,6 +11,8 @@ const envMock = {
   MODEL_API_GLOBAL_CAPACITY_ENABLED: false,
   MODEL_API_PROTOCOL_ADAPTATION_ENABLED: false,
   WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: false,
+  BETTER_AUTH_URL: "https://proxy.example.com",
+  WMP_MCP_ENABLED: true,
 };
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: envMock,

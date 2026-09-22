@@ -69,15 +69,15 @@ fails the suite when a leaf is unclassified.
 | `forwarderManagement.updatePoolMember` | `forwarder_pool_member_update` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `forwarderManagement.updateProfileSlug` | — (excluded) | — | — | — | — | — | Profile-slug procedures are account identity management. |
 | `forwarderManagement.visibleModels` | `forwarder_models_visible_list` | read | — | pure | — | — | — |
-| `health.check` | — (excluded) | — | — | — | — | — | Health/readiness is not a model-proxy operation. |
-| `health.ready` | — (excluded) | — | — | — | — | — | Health/readiness is not a model-proxy operation. |
 | `mcpGrants.listMine` | — (excluded) | — | — | — | — | — | Human-only MCP grant management (Phase 7): a connected MCP client must not enumerate the user's other authorizations. |
 | `mcpGrants.revokeMine` | — (excluded) | — | — | — | — | — | Human-only MCP grant revocation (Phase 7): only the browser session may kill grant generations. |
+| `mcpTokens.create` | — (excluded) | — | — | — | — | — | Returns the one-time raw MCP personal-token secret; human-only browser session. |
+| `mcpTokens.listMine` | — (excluded) | — | — | — | — | — | Human-only MCP personal-token management: a connected MCP client must not enumerate the user's other credentials. |
+| `mcpTokens.revokeMine` | — (excluded) | — | — | — | — | — | Human-only MCP personal-token revocation: only the browser session may kill PAT generations. |
 | `modelApiTokens.create` | — (excluded) | — | — | — | — | — | Returns the one-time raw token secret. |
 | `modelApiTokens.list` | `model_api_tokens_list` | read | — | pure | — | — | — |
 | `modelApiTokens.preview` | `model_api_tokens_preview` | read | — | pure | — | — | — |
 | `modelApiTokens.revoke` | `model_api_token_revoke` | write | DELETE | destructive | — | — | — |
-| `privateData` | — (excluded) | — | — | — | — | — | Demo/diagnostic procedure. |
 | `providerManagement.activatePricingVersion` | `provider_pricing_version_activate` | write | RUN | external | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `providerManagement.createAccount` | `provider_account_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `providerManagement.createBudgetPolicy` | `provider_budget_policy_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
@@ -127,27 +127,30 @@ fails the suite when a leaf is unclassified.
 
 ## Human-only procedures (Phase 7)
 
-The `mcpGrants` router (`packages/api/src/routers/mcp-grants.ts`) is
-HUMAN-ONLY: it is mounted on `appRouter` for the browser-session settings
-page (`/{lang}/settings/mcp`) and is excluded from the MCP tool catalog in
-`MCP_TOOL_EXCLUSIONS`. Neither procedure may ever appear as an MCP tool: a
-connected MCP client must not be able to enumerate or revoke the human's
-other authorizations.
+The `mcpGrants` router (`packages/api/src/routers/mcp-grants.ts`) and the
+`mcpTokens` router (`packages/api/src/routers/mcp-tokens.ts`) are
+HUMAN-ONLY: they are mounted on `appRouter` for the browser-session settings
+page (`/{lang}/settings/mcp`) and are excluded from the MCP tool catalog in
+`MCP_TOOL_EXCLUSIONS`. None of these procedures may ever appear as an MCP
+tool: a connected MCP client must not be able to enumerate, mint, or revoke
+the human's other authorizations or personal tokens.
 
 Enforcement (all pinned by `apps/server/src/mcp/tool-manifest.test.ts`):
 
 - the invariant-12 completeness check walks every `appRouter` leaf and fails
   unless each leaf is a tool target or an explicit `MCP_TOOL_EXCLUSIONS`
-  entry — adding `mcpGrants` without an exclusion fails the suite;
-- the pinned exclusion list asserts both `mcpGrants` leaves verbatim;
-- a dedicated Phase 7 assertion proves both leaves are absent from the tool
+  entry — adding `mcpGrants` or `mcpTokens` without an exclusion fails the
+  suite;
+- the pinned exclusion list asserts the `mcpGrants` and `mcpTokens` leaves
+  verbatim;
+- a dedicated Phase 7 assertion proves those leaves are absent from the tool
   catalog under any name, and drives EVERY procedure-backed tool's real
   invoker through a recording proxy client: each tool must dispatch to
   exactly its declared target leaf (so a selector swap fails the suite) and
-  no dispatch may touch any `mcpGrants` path.
+  no dispatch may touch any `mcpGrants` or `mcpTokens` path.
 
-Unlike authorization, discovery, MCP login/consent, and `/mcp`, the
-`mcpGrants` procedures and the settings page are deliberately NOT gated on
-`WMP_MCP_ENABLED` (invariant 13): humans must be able to kill
-outstanding authorization during an emergency MCP shutdown. Normal browser
-authentication still applies.
+Unlike authorization, discovery, MCP login/consent, and `/mcp`, grant and
+token *revocation* and the settings page are deliberately NOT gated on
+`WMP_MCP_ENABLED` (invariant 13): humans must be able to kill outstanding
+authorization during an emergency MCP shutdown. Personal-token *creation*
+is gated on the flag. Normal browser authentication still applies.

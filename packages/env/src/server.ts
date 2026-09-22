@@ -64,10 +64,10 @@ export const env = createEnv({
     // Same idea for signup (also mails a caller-supplied address). Higher
     // budget so shared-NAT offices still work.
     RATE_LIMIT_SIGNUP_RECIPIENT_POINTS: z.coerce.number().int().min(0).default(6),
-    // MCP endpoint limiters (Phase 1; enforced when the Phase 3
-    // routing lands). Unconditional IP-keyed /mcp quota and a tighter
-    // session-keyed budget for the human login/consent forms. Durations are
-    // seconds.
+    // MCP endpoint limiters, enforced by the mounted /mcp request chain
+    // (apps/server/src/app.ts). Unconditional IP-keyed /mcp quota and a
+    // tighter session-keyed budget for the human login/consent forms.
+    // Durations are seconds.
     RATE_LIMIT_MCP_POINTS: z.coerce.number().int().positive().default(120),
     RATE_LIMIT_MCP_DURATION: z.coerce.number().int().positive().default(60),
     RATE_LIMIT_MCP_CONSENT_POINTS: z.coerce.number().int().positive().default(30),
@@ -172,6 +172,11 @@ export const env = createEnv({
     // does not expect the OAuth/JWKS tables. Human grant listing/revocation
     // stays available when disabled (emergency kill switch), by design.
     WMP_MCP_ENABLED: strictBooleanFlag(),
+    // MCP personal tokens (PAT) default to NO expiry (unlimited lifetime).
+    // Turn this off to require an explicit expiry within
+    // MCP_PAT_MAX_TTL_DAYS (see packages/auth/src/mcp-config.ts) at mint
+    // time. Applies at mint time only; existing tokens are unaffected.
+    WMP_MCP_PAT_ALLOW_NO_EXPIRY: strictBooleanFlag(true),
     WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: strictBooleanFlag(),
     WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS: z
       .string()

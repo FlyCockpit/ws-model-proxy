@@ -254,6 +254,18 @@ export const ENV_VARS: EnvVar[] = [
     ],
   },
   {
+    key: "BUILD_VERSION",
+    group: "runtime",
+    source: "manual",
+    inSchema: false,
+    comment: [
+      "Build identifier (e.g. the git SHA) baked into the web bundle as",
+      "`__APP_VERSION__`. Read at build time by apps/web/vite.config.ts and the",
+      "Dockerfile ARG — not by the Zod schemas. Unset falls back to `git rev-parse`,",
+      "then to a random per-build id.",
+    ],
+  },
+  {
     key: "MODEL_API_TRANSCRIPTION_SPOOL_DIR",
     group: "runtime",
     source: "default",
@@ -342,6 +354,16 @@ export const ENV_VARS: EnvVar[] = [
       "Release gate for the MCP server and OAuth provider surface (jwt/mcp/cimd",
       "plugins, /mcp, discovery, MCP login/consent). Keep false until the feature is",
       "ready for release. Human grant listing/revocation stays available while disabled.",
+    ],
+  },
+  {
+    key: "WMP_MCP_PAT_ALLOW_NO_EXPIRY",
+    group: "runtime",
+    source: "default",
+    default: "true",
+    comment: [
+      "Allow minting no-expiry (unlimited-lifetime) MCP personal tokens; the default token carries no expiry.",
+      "Turn off to require an expiry within MCP_PAT_MAX_TTL_DAYS (365 days) when creating a token.",
     ],
   },
   {
@@ -695,7 +717,7 @@ export const ENV_VARS: EnvVar[] = [
     default: "120",
     comment: [
       "MCP /mcp endpoint quota (IP-keyed, pre-auth). Durations are seconds.",
-      "Inert while WMP_MCP_ENABLED=false; enforced by the Phase 3 routing.",
+      "Inert while WMP_MCP_ENABLED=false; enforced by the mounted /mcp request chain.",
     ],
   },
   {

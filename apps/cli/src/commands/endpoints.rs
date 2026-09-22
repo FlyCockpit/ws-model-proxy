@@ -6,6 +6,7 @@ use serde::Serialize;
 use crate::config::{
     Config, EndpointConfig, HeaderEnvRef, OpenAiCompatibleCapabilities, validate_env_name,
 };
+use crate::exit::{CodedError, ExitCode};
 use crate::output;
 use crate::probe::{ProbeReport, apply_probe_report, probe_endpoint};
 use crate::slug::validate_slug;
@@ -112,7 +113,10 @@ fn remove_endpoint(json: bool, slug: &str) -> Result<()> {
         cfg.endpoints.retain(|endpoint| endpoint.slug != slug);
         let removed = before != cfg.endpoints.len();
         if !removed {
-            anyhow::bail!("endpoint `{slug}` not found");
+            // The caller named a specific endpoint that does not exist —
+            // exit code 3 per the stable exit-code contract (README.md).
+            return Err(anyhow::Error::msg(format!("endpoint `{slug}` not found"))
+                .context(CodedError::new(ExitCode::NotFound)));
         }
         Ok(removed)
     })?;

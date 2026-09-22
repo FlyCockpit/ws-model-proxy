@@ -83,6 +83,7 @@ describe("redactSecrets — key-fragment matrix", () => {
         name: "wsmp_model_AAAA.BBBB",
         note: "wsmp_cli_CCCC",
         other: "wsmp_device_DDDD",
+        pat: "wsmp_mcp_EEEE",
         // The prefix must appear at the START of the value: a value that
         // merely mentions it is not a credential.
         harmless: "mentions-wsmp_model_midstring",
@@ -92,6 +93,7 @@ describe("redactSecrets — key-fragment matrix", () => {
       name: MCP_REDACTED_VALUE,
       note: MCP_REDACTED_VALUE,
       other: MCP_REDACTED_VALUE,
+      pat: MCP_REDACTED_VALUE,
       harmless: "mentions-wsmp_model_midstring",
       plain: "ordinary string",
     });

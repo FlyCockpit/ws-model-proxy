@@ -8,6 +8,9 @@ import type { Context } from "../context";
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
     BETTER_AUTH_SECRET: "test-better-auth-secret",
+    // mcp-grants imports @ws-model-proxy/auth/mcp-config, which binds
+    // MCP_ISSUER/MCP_RESOURCE_URL from BETTER_AUTH_URL at module load.
+    BETTER_AUTH_URL: "https://proxy.example.com",
   },
 }));
 
@@ -635,6 +638,30 @@ describe("mcpGrants.listMine", () => {
     await client().listMine();
     const grantWhere = db.mcpGrant.findMany.mock.calls[0]?.[0] as { where?: { userId?: string } };
     expect(grantWhere.where).toEqual({ userId: "user-id" });
+  });
+
+  it("a `pat:` grant never surfaces as a connection (explicit personal-token exclusion)", async () => {
+    db.mcpGrant.findMany.mockResolvedValue([
+      { clientId: "pat:token-1", referenceId: "ref-pat", revokedAt: null, createdAt },
+      { clientId: "client-a", referenceId: "ref-a1", revokedAt: null, createdAt },
+    ]);
+    // Even a stray OauthClient row carrying a `pat:` id must not resurrect
+    // the grant as a connection: the exclusion is early and explicit, not an
+    // artifact of the oauthClient join finding no row.
+    db.oauthClient.findMany.mockResolvedValue([
+      { id: "record-pat", clientId: "pat:token-1", name: "Stray", uri: null },
+      { id: "record-a", clientId: "client-a", name: null, uri: null },
+    ]);
+    db.oauthConsent.findMany.mockResolvedValue([]);
+    db.oauthRefreshToken.findMany.mockResolvedValue([]);
+
+    const result = await client().listMine();
+
+    const clientWhere = db.oauthClient.findMany.mock.calls[0]?.[0] as {
+      where?: { clientId?: { in?: string[] } };
+    };
+    expect(clientWhere.where?.clientId?.in).toEqual(["client-a"]);
+    expect(result.map((connection) => connection.clientId)).toEqual(["client-a"]);
   });
 
   it("runs reads OUTSIDE the durable-cleanup permit (no transaction, no permit)", async () => {
