@@ -129,7 +129,7 @@ function recommendedSurfaceFromCandidates(
   candidates: readonly SurfaceCandidate[],
   selectedIds: readonly string[],
   protocolAdaptationEnabled: boolean,
-): Exclude<ModelApiSurface, "OPENAI_COMPLETIONS"> | null {
+): ModelApiSurface | null {
   const matrices = candidates
     .filter((candidate) => selectedIds.includes(candidate.id))
     .map((candidate) =>
@@ -138,7 +138,7 @@ function recommendedSurfaceFromCandidates(
         adaptationEnabled: protocolAdaptationEnabled,
       }),
     );
-  const order: readonly Exclude<ModelApiSurface, "OPENAI_COMPLETIONS">[] = [
+  const order: readonly ModelApiSurface[] = [
     "OPENAI_RESPONSES",
     "OPENAI_CHAT_COMPLETIONS",
     "ANTHROPIC_MESSAGES",
@@ -186,7 +186,7 @@ export function recommendedPrimarySurface(
   selectedIds: readonly string[],
   models: readonly GuardedWizardLocalModel[],
   protocolAdaptationEnabled = false,
-): Exclude<ModelApiSurface, "OPENAI_COMPLETIONS"> | null {
+): ModelApiSurface | null {
   return recommendedSurfaceFromCandidates(
     localCandidates(models),
     selectedIds,
@@ -251,11 +251,11 @@ export function combinedPrimaryMemberCount(
  *   best-ranked selectable surface so the form stays valid.
  */
 export function nextRecommendedSurface(
-  current: Exclude<ModelApiSurface, "OPENAI_COMPLETIONS">,
+  current: ModelApiSurface,
   flags: RecommendedSurfaceFlags,
   selection: RecommendedSurfaceSelection,
   firstMemberSelection: boolean,
-): { surface: Exclude<ModelApiSurface, "OPENAI_COMPLETIONS">; flags: RecommendedSurfaceFlags } {
+): { surface: ModelApiSurface; flags: RecommendedSurfaceFlags } {
   if (firstMemberSelection && !flags.manuallyChosen && !flags.autoSetByMember) {
     const first = recommendedCombinedPrimarySurface(
       selection.localIds,

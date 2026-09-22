@@ -20,6 +20,70 @@ const overrideVisionFalse = {
   chatCompletions: { supported: true, streaming: true, vision: false },
 };
 
+describe("legacy completions fields", () => {
+  it("strips v1 completions and keeps chat completions", () => {
+    const parsed = parseOpenAiCompatibleCapabilities({
+      version: 1,
+      protocol: "openai-compatible",
+      chatCompletions: { supported: true, streaming: true },
+      completions: { supported: true, streaming: true },
+    });
+    expect(parsed).toMatchObject({
+      version: 1,
+      chatCompletions: { supported: true, streaming: true },
+    });
+    expect(parsed).not.toHaveProperty("completions");
+  });
+
+  it("parses a completions-only v1 inventory without that field", () => {
+    const parsed = parseOpenAiCompatibleCapabilities({
+      version: 1,
+      protocol: "openai-compatible",
+      completions: { supported: true, streaming: false },
+    });
+    expect(parsed).toEqual({ version: 1, protocol: "openai-compatible" });
+  });
+
+  it("strips v3 and v4 openaiCompletions and keeps the chat surface", () => {
+    const chat = {
+      source: "declared" as const,
+      confidence: "exact" as const,
+      supported: true,
+      streaming: true,
+    };
+    const v3 = parseOpenAiCompatibleCapabilities({
+      version: 3,
+      protocol: "openai-compatible",
+      surfaces: {
+        openaiChatCompletions: chat,
+        openaiCompletions: chat,
+      },
+    });
+    expect(v3?.version).toBe(3);
+    expect(v3 && "surfaces" in v3 ? v3.surfaces : null).toEqual({
+      openaiChatCompletions: chat,
+    });
+
+    const v4Chat = {
+      source: "declared" as const,
+      confidence: "exact" as const,
+      operations: ["create" as const],
+      streaming: true,
+    };
+    const v4 = parseOpenAiCompatibleCapabilities({
+      version: 4,
+      protocol: "openai-compatible",
+      surfaces: {
+        openaiChatCompletions: v4Chat,
+        openaiCompletions: v4Chat,
+      },
+    });
+    expect(v4 && "surfaces" in v4 ? v4.surfaces : null).toEqual({
+      openaiChatCompletions: v4Chat,
+    });
+  });
+});
+
 describe("resolveEffectiveCapabilityMetadata", () => {
   it("uses parseable OVERRIDE metadata when present", () => {
     const caps = resolveEffectiveCapabilityMetadata({

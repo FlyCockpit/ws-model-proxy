@@ -11,8 +11,7 @@
   "connectionTypes": {
     "OPENAI_RESPONSES": "Responses",
     "OPENAI_CHAT_COMPLETIONS": "Chat Completions",
-    "ANTHROPIC_MESSAGES": "Anthropic Messages",
-    "OPENAI_COMPLETIONS": "Completions"
+    "ANTHROPIC_MESSAGES": "Anthropic Messages"
   },
   "clis": {
     "description": "Inspect connected CLI devices, endpoints, and directly discovered models.",
@@ -212,7 +211,6 @@
     "surfaces": {
       "ANTHROPIC_MESSAGES": "Anthropic Messages",
       "OPENAI_CHAT_COMPLETIONS": "OpenAI Chat Completions",
-      "OPENAI_COMPLETIONS": "OpenAI Completions",
       "OPENAI_RESPONSES": "OpenAI Responses"
     }
   },
@@ -870,7 +868,6 @@
       "replacementSecret": "Replacement secret",
       "upstreamModel": "Upstream model ID",
       "nativeSurface": "Native API surface",
-      "legacySurfaceGroup": "Legacy",
       "streaming": "Supports streaming",
       "anthropicVersion": "Anthropic protocol version",
       "anthropicBetas": "Allowed Anthropic betas (comma-separated)",

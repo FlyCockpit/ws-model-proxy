@@ -82,13 +82,11 @@ export type ReasoningConfig = z.infer<typeof reasoningConfigSchema>;
 export type ReasoningContractSurface =
   | "openaiChatCompletions"
   | "openaiResponses"
-  | "anthropicMessages"
-  | "openaiCompletions";
+  | "anthropicMessages";
 
 const openAiSurfaces = new Set<ReasoningContractSurface>([
   "openaiChatCompletions",
   "openaiResponses",
-  "openaiCompletions",
 ]);
 
 export function validateSurfaceReasoningConfig(

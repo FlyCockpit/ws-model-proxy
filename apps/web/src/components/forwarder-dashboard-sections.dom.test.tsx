@@ -166,15 +166,6 @@ const editablePool = {
         primary: { native: 0, adapted: 0, unavailable: 0 },
         publicOverflow: { native: 0, adapted: 0, unavailable: 0 },
       },
-      OPENAI_COMPLETIONS: {
-        native: 0,
-        adapted: 0,
-        unavailable: 0,
-        streaming: false,
-        limitations: [],
-        primary: { native: 0, adapted: 0, unavailable: 0 },
-        publicOverflow: { native: 0, adapted: 0, unavailable: 0 },
-      },
       OPENAI_RESPONSES: {
         native: 0,
         adapted: 0,
@@ -210,7 +201,6 @@ const editablePool = {
   recommendedSurfaceOverride: null as
     | "ANTHROPIC_MESSAGES"
     | "OPENAI_CHAT_COMPLETIONS"
-    | "OPENAI_COMPLETIONS"
     | "OPENAI_RESPONSES"
     | null,
   capacityPriority: 16,
@@ -628,7 +618,6 @@ const localMember = {
         streaming: false,
         limitations: [],
       },
-      OPENAI_COMPLETIONS: { mode: "unavailable" as const, streaming: false, limitations: [] },
       OPENAI_RESPONSES: { mode: "unavailable" as const, streaming: false, limitations: [] },
     },
   },

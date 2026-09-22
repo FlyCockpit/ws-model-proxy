@@ -56,6 +56,14 @@ where
     }
 }
 
+fn ignore_legacy_field<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::de::IgnoredAny::deserialize(deserializer)?;
+    Ok(None)
+}
+
 /// A short-lived advisory lock shared by every local config mutation.  The
 /// daemon still owns the future control-plane mutation API; this is the
 /// transitional guard that prevents a standalone command from overwriting a
@@ -273,8 +281,6 @@ pub struct OpenAiCompatibleCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_completions: Option<ChatCompletionsCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub completions: Option<CompletionsCapabilities>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub embeddings: Option<EmbeddingsCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub responses: Option<ResponsesCapabilities>,
@@ -290,7 +296,7 @@ impl Serialize for OpenAiCompatibleCapabilities {
     where
         S: serde::Serializer,
     {
-        let mut state = serializer.serialize_struct("OpenAiCompatibleCapabilities", 11)?;
+        let mut state = serializer.serialize_struct("OpenAiCompatibleCapabilities", 10)?;
         state.serialize_field("version", &self.version)?;
         state.serialize_field("protocol", &self.protocol)?;
         if self.version >= 3
@@ -309,9 +315,6 @@ impl Serialize for OpenAiCompatibleCapabilities {
         }
         if let Some(value) = &self.chat_completions {
             state.serialize_field("chatCompletions", value)?;
-        }
-        if let Some(value) = &self.completions {
-            state.serialize_field("completions", value)?;
         }
         if let Some(value) = &self.embeddings {
             state.serialize_field("embeddings", value)?;
@@ -338,7 +341,13 @@ struct RawCapabilities {
     confidence: Option<CapabilityConfidence>,
     models: Option<ModelListCapabilities>,
     chat_completions: Option<ChatCompletionsCapabilities>,
-    completions: Option<CompletionsCapabilities>,
+    #[allow(dead_code)]
+    #[serde(
+        default,
+        rename = "completions",
+        deserialize_with = "ignore_legacy_field"
+    )]
+    _completions: Option<bool>,
     embeddings: Option<EmbeddingsCapabilities>,
     responses: Option<ResponsesCapabilities>,
     audio: Option<AudioCapabilities>,
@@ -354,7 +363,7 @@ impl Default for RawCapabilities {
             confidence: None,
             models: None,
             chat_completions: None,
-            completions: None,
+            _completions: None,
             embeddings: None,
             responses: None,
             audio: None,
@@ -402,7 +411,6 @@ impl TryFrom<RawCapabilities> for OpenAiCompatibleCapabilities {
         if value.version == 4 {
             if value.models.is_some()
                 || value.chat_completions.is_some()
-                || value.completions.is_some()
                 || value.embeddings.is_some()
                 || value.responses.is_some()
                 || value.audio.is_some()
@@ -423,7 +431,6 @@ impl TryFrom<RawCapabilities> for OpenAiCompatibleCapabilities {
             confidence: value.confidence,
             models: value.models,
             chat_completions: value.chat_completions,
-            completions: value.completions,
             embeddings: value.embeddings,
             responses: value.responses,
             audio: value.audio,
@@ -471,7 +478,6 @@ impl OpenAiCompatibleCapabilities {
                 video: None,
                 audio: None,
             }),
-            completions: None,
             embeddings: None,
             responses: None,
             audio: None,
@@ -487,7 +493,6 @@ impl OpenAiCompatibleCapabilities {
             confidence: None,
             models: Some(ModelListCapabilities { list: Some(true) }),
             chat_completions: None,
-            completions: None,
             embeddings: Some(EmbeddingsCapabilities {
                 supported: Some(true),
             }),
@@ -568,8 +573,14 @@ pub struct SurfaceInventory {
     pub openai_responses: Option<ResponsesSurfaceCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anthropic_messages: Option<AnthropicSurfaceCapabilities>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub openai_completions: Option<SurfaceCapabilities>,
+    #[allow(dead_code)]
+    #[serde(
+        default,
+        rename = "openaiCompletions",
+        skip_serializing,
+        deserialize_with = "ignore_legacy_field"
+    )]
+    pub(crate) _openai_completions: Option<bool>,
 }
 
 impl SurfaceInventory {
@@ -577,10 +588,6 @@ impl SurfaceInventory {
         self.openai_chat_completions
             .as_ref()
             .is_some_and(|surface| !surface.operations.is_empty())
-            || self
-                .openai_completions
-                .as_ref()
-                .is_some_and(|surface| !surface.operations.is_empty())
             || self
                 .openai_responses
                 .as_ref()
@@ -625,9 +632,6 @@ impl SurfaceInventory {
 
         if let Some(surface) = &self.openai_chat_completions {
             validate_common("openaiChatCompletions", surface, &["create"])?;
-        }
-        if let Some(surface) = &self.openai_completions {
-            validate_common("openaiCompletions", surface, &["create"])?;
         }
         if let Some(surface) = &self.openai_responses {
             validate_common(
@@ -679,9 +683,7 @@ impl SurfaceInventory {
                 }
             }
         }
-        let has_openai = self.openai_chat_completions.is_some()
-            || self.openai_responses.is_some()
-            || self.openai_completions.is_some();
+        let has_openai = self.openai_chat_completions.is_some() || self.openai_responses.is_some();
         if protocol == "openai-compatible" && self.anthropic_messages.is_some() {
             return Err(
                 "openai-compatible version 4 capabilities cannot declare anthropicMessages"
@@ -715,9 +717,6 @@ impl SurfaceInventory {
         }
         if let Some(surface) = &self.openai_chat_completions {
             validate("openaiChatCompletions", surface, false)?;
-        }
-        if let Some(surface) = &self.openai_completions {
-            validate("openaiCompletions", surface, false)?;
         }
         if let Some(surface) = &self.openai_responses {
             validate("openaiResponses", &surface.common, false)?;
@@ -950,15 +949,6 @@ pub struct ChatCompletionsCapabilities {
     /// `input_audio` content parts in chat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio: Option<bool>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(default, rename_all = "camelCase")]
-pub struct CompletionsCapabilities {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub supported: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub streaming: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1476,6 +1466,82 @@ mod tests {
         for invalid in invalids {
             assert!(serde_json::from_value::<OpenAiCompatibleCapabilities>(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn deserializes_legacy_completions_fields_without_writing_them_back() {
+        let v1: OpenAiCompatibleCapabilities = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "protocol": "openai-compatible",
+            "chatCompletions": { "supported": true, "streaming": true },
+            "completions": { "supported": true, "streaming": true }
+        }))
+        .expect("v1 inventory with legacy completions");
+        let v1_serialized = serde_json::to_value(&v1).expect("serialize v1");
+        assert!(v1_serialized.get("completions").is_none());
+        assert_eq!(v1_serialized["chatCompletions"]["supported"], true);
+
+        let v3: OpenAiCompatibleCapabilities = serde_json::from_value(serde_json::json!({
+            "version": 3,
+            "protocol": "openai-compatible",
+            "surfaces": {
+                "openaiChatCompletions": {
+                    "source": "declared",
+                    "confidence": "exact",
+                    "supported": true,
+                    "streaming": true
+                },
+                "openaiCompletions": {
+                    "source": "declared",
+                    "confidence": "exact",
+                    "supported": true,
+                    "streaming": true
+                }
+            }
+        }))
+        .expect("v3 inventory with legacy completions");
+        let v3_serialized = serde_json::to_value(&v3).expect("serialize v3");
+        assert!(v3_serialized["surfaces"].get("openaiCompletions").is_none());
+        assert_eq!(
+            v3_serialized["surfaces"]["openaiChatCompletions"]["supported"],
+            true
+        );
+
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "endpoints": [{
+                "slug": "local",
+                "label": "Local",
+                "kind": "openai-compatible",
+                "baseUrl": "http://127.0.0.1:11434/v1",
+                "defaultCapabilities": {
+                    "version": 4,
+                    "protocol": "openai-compatible",
+                    "surfaces": {
+                        "openaiChatCompletions": {
+                            "source": "declared",
+                            "confidence": "exact",
+                            "operations": ["create"],
+                            "streaming": true
+                        },
+                        "openaiCompletions": {
+                            "source": "declared",
+                            "confidence": "exact",
+                            "operations": ["create"],
+                            "streaming": true
+                        }
+                    }
+                }
+            }]
+        }))
+        .expect("config with legacy completions");
+        let written = serde_json::to_value(&config).expect("serialize config");
+        let capabilities = &written["endpoints"][0]["defaultCapabilities"];
+        assert!(capabilities["surfaces"].get("openaiCompletions").is_none());
+        assert_eq!(
+            capabilities["surfaces"]["openaiChatCompletions"]["operations"][0],
+            "create"
+        );
     }
 
     #[test]

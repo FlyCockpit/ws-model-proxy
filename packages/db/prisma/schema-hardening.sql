@@ -672,8 +672,7 @@ UPDATE model_pool
    AND "recommendedSurfaceOverride" NOT IN (
      'OPENAI_CHAT_COMPLETIONS',
      'OPENAI_RESPONSES',
-     'ANTHROPIC_MESSAGES',
-     'OPENAI_COMPLETIONS'
+     'ANTHROPIC_MESSAGES'
    );
 
 ALTER TABLE model_pool
@@ -684,8 +683,7 @@ ALTER TABLE model_pool
     OR "recommendedSurfaceOverride" IN (
       'OPENAI_CHAT_COMPLETIONS',
       'OPENAI_RESPONSES',
-      'ANTHROPIC_MESSAGES',
-      'OPENAI_COMPLETIONS'
+      'ANTHROPIC_MESSAGES'
     )
   );
 

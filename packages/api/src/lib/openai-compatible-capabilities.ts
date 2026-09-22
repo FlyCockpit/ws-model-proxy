@@ -47,13 +47,6 @@ const commonCapabilityShape = {
     })
     .strict()
     .optional(),
-  completions: z
-    .object({
-      supported: booleanSupportSchema,
-      streaming: booleanSupportSchema,
-    })
-    .strict()
-    .optional(),
   embeddings: z
     .object({
       supported: booleanSupportSchema,
@@ -136,10 +129,6 @@ const surfaceFeatureSchema = baseSurfaceFeatureSchema.superRefine((value, contex
   validateSurfaceReasoningConfig(value, "openaiChatCompletions", context),
 );
 
-const completionsSurfaceFeatureSchema = baseSurfaceFeatureSchema.superRefine((value, context) =>
-  validateSurfaceReasoningConfig(value, "openaiCompletions", context),
-);
-
 const anthropicSurfaceFeatureSchema = baseSurfaceFeatureSchema
   .extend({ countTokens: booleanSupportSchema })
   .superRefine((value, context) =>
@@ -178,7 +167,6 @@ const capabilityOperationSchema = {
     "compact",
   ]),
   anthropicMessages: z.enum(["create", "countTokens"]),
-  openaiCompletions: z.enum(["create"]),
 } as const;
 
 function uniqueOperations<T extends z.ZodTypeAny>(operation: T) {
@@ -230,7 +218,6 @@ const v4CapabilitiesSchema = z
     protocol: z.enum(["openai-compatible", "anthropic-compatible"]),
     models: z.never().optional(),
     chatCompletions: z.never().optional(),
-    completions: z.never().optional(),
     embeddings: z.never().optional(),
     responses: z.never().optional(),
     audio: z.never().optional(),
@@ -275,16 +262,6 @@ const v4CapabilitiesSchema = z
             validateSurfaceReasoningConfig(value, "anthropicMessages", context),
           )
           .optional(),
-        openaiCompletions: z
-          .object({
-            ...v4SurfaceFeatureShape,
-            operations: uniqueOperations(capabilityOperationSchema.openaiCompletions),
-          })
-          .strict()
-          .superRefine((value, context) =>
-            validateSurfaceReasoningConfig(value, "openaiCompletions", context),
-          )
-          .optional(),
       })
       .strict(),
     source: z.enum(["declared", "probe", "dashboard", "provider"]).optional(),
@@ -295,8 +272,7 @@ const v4CapabilitiesSchema = z
     const hasAnthropic = inventory.surfaces.anthropicMessages !== undefined;
     const hasOpenAi =
       inventory.surfaces.openaiChatCompletions !== undefined ||
-      inventory.surfaces.openaiResponses !== undefined ||
-      inventory.surfaces.openaiCompletions !== undefined;
+      inventory.surfaces.openaiResponses !== undefined;
     if (inventory.protocol === "openai-compatible" && hasAnthropic)
       context.addIssue({
         code: "custom",
@@ -326,7 +302,6 @@ const v3CapabilitiesSchema = z
         openaiChatCompletions: surfaceFeatureSchema.optional(),
         openaiResponses: responsesSurfaceFeatureSchema.optional(),
         anthropicMessages: anthropicSurfaceFeatureSchema.optional(),
-        openaiCompletions: completionsSurfaceFeatureSchema.optional(),
       })
       .strict(),
     source: z.enum(["declared", "probe", "dashboard", "provider"]).optional(),
@@ -342,12 +317,27 @@ const v3CapabilitiesSchema = z
   })
   .strict();
 
-export const openAiCompatibleCapabilitiesSchema = z.discriminatedUnion("version", [
-  v1CapabilitiesSchema,
-  v2CapabilitiesSchema,
-  v3CapabilitiesSchema,
-  v4CapabilitiesSchema,
-]);
+function omitLegacyCompletions(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const record = { ...(value as Record<string, unknown>) };
+  delete record.completions;
+  if (record.surfaces && typeof record.surfaces === "object" && !Array.isArray(record.surfaces)) {
+    const surfaces = { ...(record.surfaces as Record<string, unknown>) };
+    delete surfaces.openaiCompletions;
+    record.surfaces = surfaces;
+  }
+  return record;
+}
+
+export const openAiCompatibleCapabilitiesSchema = z.preprocess(
+  omitLegacyCompletions,
+  z.discriminatedUnion("version", [
+    v1CapabilitiesSchema,
+    v2CapabilitiesSchema,
+    v3CapabilitiesSchema,
+    v4CapabilitiesSchema,
+  ]),
+);
 
 export type OpenAiCompatibleCapabilities = z.infer<typeof openAiCompatibleCapabilitiesSchema>;
 
@@ -454,7 +444,6 @@ export function coarseCapabilitiesFromOpenAi(
     const surfaces = capabilities.surfaces;
     if (
       surfaces.openaiChatCompletions?.operations.includes("create") ||
-      surfaces.openaiCompletions?.operations.includes("create") ||
       surfaces.openaiResponses?.operations.includes("create") ||
       surfaces.anthropicMessages?.operations.includes("create")
     )
@@ -468,7 +457,6 @@ export function coarseCapabilitiesFromOpenAi(
   }
   if (
     capabilities.chatCompletions?.supported === true ||
-    capabilities.completions?.supported === true ||
     capabilities.responses?.supported === true
   )
     coarse.push("TEXT_GENERATION");

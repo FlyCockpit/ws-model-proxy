@@ -284,7 +284,6 @@ export type RelayServerControlMessage =
       requestId: string;
       family:
         | "chat.completions"
-        | "completions"
         | "embeddings"
         | "responses"
         | "messages"

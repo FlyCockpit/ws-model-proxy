@@ -22,12 +22,7 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
   });
 
   it("contains the full models surfaces key set in both bundles", () => {
-    const expected = [
-      "ANTHROPIC_MESSAGES",
-      "OPENAI_CHAT_COMPLETIONS",
-      "OPENAI_COMPLETIONS",
-      "OPENAI_RESPONSES",
-    ].sort();
+    const expected = ["ANTHROPIC_MESSAGES", "OPENAI_CHAT_COMPLETIONS", "OPENAI_RESPONSES"].sort();
     expect(keyTree(enDashboard.models.surfaces).sort()).toEqual(expected);
     expect(keyTree(esDashboard.models.surfaces).sort()).toEqual(expected);
   });

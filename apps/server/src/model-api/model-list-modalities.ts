@@ -88,9 +88,7 @@ export function multimodalFlagsFromCapabilities(
   }
 
   const chat = capabilities.chatCompletions;
-  const text = Boolean(
-    chat?.supported || capabilities.completions?.supported || capabilities.responses?.supported,
-  );
+  const text = Boolean(chat?.supported || capabilities.responses?.supported);
   const vision = chat?.vision === true;
   const video = chat?.video === true;
   const audioInput = chat?.audio === true;

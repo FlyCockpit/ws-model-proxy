@@ -70,16 +70,17 @@ export function providerModelSurfaceCapabilities(
     supported: true,
     streaming: native?.streaming === true,
   };
+  const normalized = {
+    ...(surfaces.includes("openai-chat") ? { openaiChatCompletions: { ...feature } } : {}),
+    ...(surfaces.includes("openai-responses") ? { openaiResponses: { ...feature } } : {}),
+    ...(surfaces.includes("anthropic-messages")
+      ? { anthropicMessages: { ...feature, countTokens: false } }
+      : {}),
+  };
+  if (Object.keys(normalized).length === 0) return null;
   return {
     version: 3,
     protocol: "openai-compatible",
-    surfaces: {
-      ...(surfaces.includes("openai-chat") ? { openaiChatCompletions: { ...feature } } : {}),
-      ...(surfaces.includes("openai-responses") ? { openaiResponses: { ...feature } } : {}),
-      ...(surfaces.includes("anthropic-messages")
-        ? { anthropicMessages: { ...feature, countTokens: false } }
-        : {}),
-      ...(surfaces.includes("openai-completions") ? { openaiCompletions: { ...feature } } : {}),
-    },
+    surfaces: normalized,
   };
 }

@@ -189,7 +189,7 @@ const providerCases: ReadonlyArray<[name: string, native: unknown]> = [
     { surfaces: ["openai-chat", "openai-responses"], streaming: true },
   ],
   [
-    "legacy provider inventory completions-only surface",
+    "legacy provider inventory completions-only surface is unparseable",
     { surfaces: ["openai-completions"], streaming: false },
   ],
   [
@@ -272,6 +272,20 @@ describe("guarded wizard / server capability-resolution parity", () => {
         }
       }
     }
+  });
+
+  it("treats a completions-only legacy provider inventory as unparseable", () => {
+    expect(
+      providerModelSurfaceCapabilities({ surfaces: ["openai-completions"], streaming: false }),
+    ).toBeNull();
+    expect(
+      providerModelSurfaceCapabilities({
+        surfaces: ["openai-chat", "openai-completions"],
+        streaming: true,
+      }),
+    ).toMatchObject({
+      surfaces: { openaiChatCompletions: { supported: true, streaming: true } },
+    });
   });
 
   it("auto-sets a surface the server gate would keep servable for every shape", () => {
