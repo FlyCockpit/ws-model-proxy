@@ -353,7 +353,11 @@ function twoFactorRow(stub: EnrolledUser["stub"]): Row {
  */
 const FROZEN_NOW = Date.parse("2025-06-01T12:00:00.000Z");
 
-describe("two-factor account lockout behavior (installed 1.7.3 plugin, in-memory adapter)", () => {
+// Each case drives the installed plugin through many real sign-in rounds.
+// On CI those sit against Vitest's 5s default (neighbors finish around 4.5–5s).
+describe("two-factor account lockout behavior (installed 1.7.3 plugin, in-memory adapter)", {
+  timeout: 20_000,
+}, () => {
   it("failed sign-in verifications count up, lock at the default 10 attempts / 900 s window, and reject a CORRECT code while locked", async () => {
     const email = "lockout@example.test";
     const { auth, stub, secretBytes } = await enrollVerifiedUser(email);

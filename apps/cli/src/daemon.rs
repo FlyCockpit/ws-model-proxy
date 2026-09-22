@@ -268,10 +268,10 @@ impl RecentlyFinished {
     fn record(&mut self, request_id: &str) {
         if self.ids.insert(request_id.to_string()) {
             self.order.push_back(request_id.to_string());
-            if self.order.len() > RECENT_FINISHED_CAPACITY {
-                if let Some(evicted) = self.order.pop_front() {
-                    self.ids.remove(&evicted);
-                }
+            if self.order.len() > RECENT_FINISHED_CAPACITY
+                && let Some(evicted) = self.order.pop_front()
+            {
+                self.ids.remove(&evicted);
             }
         }
     }
@@ -788,35 +788,34 @@ fn run_relay_session(
         if pending_reload
             .as_ref()
             .is_some_and(|(_, _, _, _, deadline)| Instant::now() >= *deadline)
+            && let Some((id, candidate, previous, pending, _)) = pending_reload.take()
         {
-            if let Some((id, candidate, previous, pending, _)) = pending_reload.take() {
-                if let Some(pending) = pending {
-                    let _ = control::respond(
-                        pending,
-                        &ControlResponse {
-                            ok: false,
-                            state: "publish_uncertain",
-                            message: Some("timed out waiting for inventory acknowledgement"),
-                            endpoints: None,
-                            inventory_seq: None,
-                            connection: Some("connected"),
-                            desired_inventory_digest: None,
-                            config_modified_at_ms: None,
-                            desired_endpoints: None,
-                            inventory_digest: None,
-                            inventory_acknowledged_at: None,
-                        },
-                    );
-                }
-                // `published` means durably acknowledged. A timeout therefore
-                // restores the previous acknowledged routes immediately rather
-                // than leaving removed slugs executable indefinitely. Keep only
-                // a bounded correlation record: a late `inventory.ok` can make
-                // the exact candidate live, while a late rejection confirms the
-                // already-restored previous map.
-                restore_previous_routing_after_timeout(config, &previous);
-                timed_out_reload_candidates.insert(id, (candidate, previous));
+            if let Some(pending) = pending {
+                let _ = control::respond(
+                    pending,
+                    &ControlResponse {
+                        ok: false,
+                        state: "publish_uncertain",
+                        message: Some("timed out waiting for inventory acknowledgement"),
+                        endpoints: None,
+                        inventory_seq: None,
+                        connection: Some("connected"),
+                        desired_inventory_digest: None,
+                        config_modified_at_ms: None,
+                        desired_endpoints: None,
+                        inventory_digest: None,
+                        inventory_acknowledged_at: None,
+                    },
+                );
             }
+            // `published` means durably acknowledged. A timeout therefore
+            // restores the previous acknowledged routes immediately rather
+            // than leaving removed slugs executable indefinitely. Keep only
+            // a bounded correlation record: a late `inventory.ok` can make
+            // the exact candidate live, while a late rejection confirms the
+            // already-restored previous map.
+            restore_previous_routing_after_timeout(config, &previous);
+            timed_out_reload_candidates.insert(id, (candidate, previous));
         }
 
         #[cfg(unix)]
@@ -1370,39 +1369,36 @@ where
             if pending_reload
                 .as_ref()
                 .is_some_and(|(pending_id, _, _, _, _)| pending_id == &id)
+                && let Some((_, candidate, _, pending, _)) = pending_reload.take()
             {
-                if let Some((_, candidate, _, pending, _)) = pending_reload.take() {
-                    *last_inventory_revision = Some(revision.clone());
-                    *rejected_inventory_digest = None;
-                    tracing::info!(id, inventory_seq = revision.inventory_seq, inventory_digest = %revision.inventory_digest, acknowledged_at = %revision.inventory_acknowledged_at, "relay inventory acknowledged");
-                    let endpoints = candidate
-                        .endpoints
-                        .iter()
-                        .filter(|endpoint| endpoint.enabled)
-                        .count();
-                    *config = candidate;
-                    if let Some(pending) = pending {
-                        let _ = control::respond(
-                            pending,
-                            &ControlResponse {
-                                ok: true,
-                                state: "published",
-                                message: None,
-                                endpoints: Some(endpoints),
-                                inventory_seq: Some(revision.inventory_seq),
-                                connection: Some("connected"),
-                                desired_inventory_digest: None,
-                                config_modified_at_ms: None,
-                                desired_endpoints: None,
-                                inventory_digest: Some(&revision.inventory_digest),
-                                inventory_acknowledged_at: Some(
-                                    &revision.inventory_acknowledged_at,
-                                ),
-                            },
-                        );
-                    }
-                    return Ok(());
+                *last_inventory_revision = Some(revision.clone());
+                *rejected_inventory_digest = None;
+                tracing::info!(id, inventory_seq = revision.inventory_seq, inventory_digest = %revision.inventory_digest, acknowledged_at = %revision.inventory_acknowledged_at, "relay inventory acknowledged");
+                let endpoints = candidate
+                    .endpoints
+                    .iter()
+                    .filter(|endpoint| endpoint.enabled)
+                    .count();
+                *config = candidate;
+                if let Some(pending) = pending {
+                    let _ = control::respond(
+                        pending,
+                        &ControlResponse {
+                            ok: true,
+                            state: "published",
+                            message: None,
+                            endpoints: Some(endpoints),
+                            inventory_seq: Some(revision.inventory_seq),
+                            connection: Some("connected"),
+                            desired_inventory_digest: None,
+                            config_modified_at_ms: None,
+                            desired_endpoints: None,
+                            inventory_digest: Some(&revision.inventory_digest),
+                            inventory_acknowledged_at: Some(&revision.inventory_acknowledged_at),
+                        },
+                    );
                 }
+                return Ok(());
             }
             #[cfg(unix)]
             if adopt_timed_out_reload_ack(
@@ -1436,28 +1432,27 @@ where
             if pending_reload
                 .as_ref()
                 .is_some_and(|(pending_id, _, _, _, _)| pending_id == &id)
+                && let Some((_, candidate, previous, pending, _)) = pending_reload.take()
             {
-                if let Some((_, candidate, previous, pending, _)) = pending_reload.take() {
-                    *config = previous;
-                    *rejected_inventory_digest = Some(inventory_digest_for_config(&candidate));
-                    if let Some(pending) = pending {
-                        let _ = control::respond(
-                            pending,
-                            &ControlResponse {
-                                ok: false,
-                                state: "rejected",
-                                message: Some(&message),
-                                endpoints: None,
-                                inventory_seq: None,
-                                connection: Some("connected"),
-                                desired_inventory_digest: None,
-                                config_modified_at_ms: None,
-                                desired_endpoints: None,
-                                inventory_digest: None,
-                                inventory_acknowledged_at: None,
-                            },
-                        );
-                    }
+                *config = previous;
+                *rejected_inventory_digest = Some(inventory_digest_for_config(&candidate));
+                if let Some(pending) = pending {
+                    let _ = control::respond(
+                        pending,
+                        &ControlResponse {
+                            ok: false,
+                            state: "rejected",
+                            message: Some(&message),
+                            endpoints: None,
+                            inventory_seq: None,
+                            connection: Some("connected"),
+                            desired_inventory_digest: None,
+                            config_modified_at_ms: None,
+                            desired_endpoints: None,
+                            inventory_digest: None,
+                            inventory_acknowledged_at: None,
+                        },
+                    );
                 }
             }
             #[cfg(unix)]
@@ -1736,19 +1731,19 @@ fn run_upstream_worker(
     let result = upstream_runtime().and_then(|runtime| {
         runtime.block_on(execute_upstream(spec, body_rx, &tx, cancellation_rx))
     });
-    if !cancellation.cancelled.load(Ordering::SeqCst) {
-        if let Err(error) = result {
-            tracing::warn!(error = %error, "relay upstream request failed");
-            let _ = worker_send_control(
-                &tx,
-                &ClientControlMessage::RelayError {
-                    request_id: request_id.clone(),
-                    failure: RelayFailure::Transport,
-                    message: Some("upstream request failed".to_string()),
-                    upstream_status_code: None,
-                },
-            );
-        }
+    if !cancellation.cancelled.load(Ordering::SeqCst)
+        && let Err(error) = result
+    {
+        tracing::warn!(error = %error, "relay upstream request failed");
+        let _ = worker_send_control(
+            &tx,
+            &ClientControlMessage::RelayError {
+                request_id: request_id.clone(),
+                failure: RelayFailure::Transport,
+                message: Some("upstream request failed".to_string()),
+                upstream_status_code: None,
+            },
+        );
     }
     let _ = tx.send(FromWorker::Finished(request_id));
 }
@@ -2431,10 +2426,10 @@ fn set_socket_read_timeout(
         tungstenite::stream::MaybeTlsStream::Rustls(stream) => Some(&mut stream.sock),
         _ => None,
     };
-    if let Some(tcp) = tcp {
-        if let Err(error) = tcp.set_read_timeout(Some(timeout)) {
-            tracing::warn!(error = %error, "failed to set websocket read timeout");
-        }
+    if let Some(tcp) = tcp
+        && let Err(error) = tcp.set_read_timeout(Some(timeout))
+    {
+        tracing::warn!(error = %error, "failed to set websocket read timeout");
     }
 }
 

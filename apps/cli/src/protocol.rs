@@ -352,7 +352,13 @@ pub fn inventory_digest(endpoints: &[EndpointInventory]) -> String {
         .collect::<Vec<_>>();
     identity.sort_by(|left, right| left["slug"].as_str().cmp(&right["slug"].as_str()));
     let canonical = stable_json(&Value::Array(identity));
-    format!("{:x}", Sha256::digest(canonical.as_bytes()))
+    // digest 0.11 returns `hybrid_array::Array`, which (unlike the old
+    // `generic_array::GenericArray`) does not implement `LowerHex`, so encode
+    // the bytes ourselves rather than pull in a hex crate.
+    Sha256::digest(canonical.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn stable_json(value: &Value) -> String {

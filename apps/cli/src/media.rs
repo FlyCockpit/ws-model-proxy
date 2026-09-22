@@ -149,12 +149,12 @@ impl TrustedOrigins {
 }
 
 fn push_origin(origins: &mut Vec<Origin>, raw: &str) {
-    if let Ok(url) = Url::parse(raw) {
-        if matches!(url.scheme(), "http" | "https") {
-            let origin = url.origin();
-            if origin.is_tuple() && !origins.contains(&origin) {
-                origins.push(origin);
-            }
+    if let Ok(url) = Url::parse(raw)
+        && matches!(url.scheme(), "http" | "https")
+    {
+        let origin = url.origin();
+        if origin.is_tuple() && !origins.contains(&origin) {
+            origins.push(origin);
         }
     }
 }

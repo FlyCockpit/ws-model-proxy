@@ -127,10 +127,10 @@ pub fn required_service_env_names(config: &Config) -> Vec<String> {
                 names.push(header.env.clone());
             }
         }
-        if let Some(auth) = &endpoint.auth {
-            if !names.iter().any(|existing| existing == &auth.env) {
-                names.push(auth.env.clone());
-            }
+        if let Some(auth) = &endpoint.auth
+            && !names.iter().any(|existing| existing == &auth.env)
+        {
+            names.push(auth.env.clone());
         }
     }
     names
