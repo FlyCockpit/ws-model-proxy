@@ -151,6 +151,7 @@ export type TerminalLifecycleEvent =
     }
   /** 2.4 only: another tab took the terminal. */
   | { type: "detached"; terminalId: string; connId: string }
+  | { type: "input_dropped"; terminalId: string; connId: string }
   | {
       type: "viewers";
       terminalId: string;
@@ -631,6 +632,7 @@ export class RelaySessionManager {
       message.type === "term.attached" ||
       message.type === "term.rejected" ||
       message.type === "term.writer" ||
+      message.type === "term.input_dropped" ||
       message.type === "term.exit"
     ) {
       this.handleTerminalControl(session, message);
@@ -1679,12 +1681,28 @@ export class RelaySessionManager {
           | "term.attached"
           | "term.rejected"
           | "term.writer"
+          | "term.input_dropped"
           | "term.exit";
       }
     >,
   ) {
     const terminal = session.terminalsById.get(message.terminalId);
     if (!terminal) return;
+    if (message.type === "term.input_dropped") {
+      // Only a notice: viewers, the writer and the phase stay as they are.
+      const viewer = terminal.multiViewer
+        ? message.viewerId
+          ? terminal.viewers.get(message.viewerId)
+          : undefined
+        : firstEntry(terminal.viewers)?.[1];
+      if (!viewer) return;
+      terminalBridge?.onTerminalEvent({
+        type: "input_dropped",
+        terminalId: terminal.terminalId,
+        connId: viewer.connId,
+      });
+      return;
+    }
     if (message.type === "term.exit") {
       session.terminalsById.delete(terminal.terminalId);
       terminalBridge?.onTerminalEvent({

@@ -414,6 +414,15 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({
+      /** The CLI's input queue for this viewer was full. Sent once per run of drops. */
+      type: z.literal("term.input_dropped"),
+      terminalId: base64Url16ByteSchema,
+      /** Omitted on 2.4 terminals. */
+      viewerId: viewerIdSchema.optional(),
+    })
+    .strict(),
+  z
+    .object({
       type: z.literal("term.exit"),
       terminalId: base64Url16ByteSchema,
       exitCode: z.number().int().min(0).max(255).optional(),

@@ -500,6 +500,11 @@ export class TerminalBrowserHub {
     }
     const conn = this.byId.get(event.connId);
     if (!conn) return;
+    if (event.type === "input_dropped") {
+      // The CLI already sends this once per run of drops.
+      this.sendError(conn, "input_dropped", event.terminalId);
+      return;
+    }
     if (event.type === "pending") {
       this.send(conn, {
         type: "pending",

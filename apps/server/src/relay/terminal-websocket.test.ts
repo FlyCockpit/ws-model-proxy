@@ -875,6 +875,25 @@ describe("terminal browser hub", () => {
       expect(b.jsonSends().filter((message) => message.code === "invalid")).toHaveLength(2);
     });
 
+    it("reports CLI input drops to that viewer only and keeps the terminal", async () => {
+      const { cli, a, terminalId } = await openShared();
+      const { browser: b, viewerId: bViewer } = await join(cli, terminalId);
+      await cliSays(cli, { type: "term.input_dropped", terminalId, viewerId: bViewer });
+      await cliSays(cli, {
+        type: "term.input_dropped",
+        terminalId,
+        viewerId: Buffer.alloc(16, 1).toString("base64url"),
+      });
+      const dropped = (socket: typeof a) =>
+        socket.jsonSends().filter((message) => message.code === "input_dropped");
+      expect(dropped(b)).toEqual([expect.objectContaining({ type: "error", terminalId })]);
+      expect(dropped(a)).toEqual([]);
+      expect(cli.jsonSends().some((message) => message.type === "term.close")).toBe(false);
+      expect(relaySessionManager.listTerminalsForUser("user-id")).toEqual([
+        expect.objectContaining({ terminalId, viewerCount: 2 }),
+      ]);
+    });
+
     it("detaches one tab on X, reports it, and forwards writer changes", async () => {
       const { cli, a, terminalId, aViewer } = await openShared();
       const { browser: b, viewerId: bViewer } = await join(cli, terminalId);
