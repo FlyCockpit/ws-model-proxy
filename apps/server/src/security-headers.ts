@@ -8,6 +8,29 @@ type SecurityHeadersOptions = {
   themeInitCspHash: string;
 };
 
+/** Add explicit ws/wss forms of http(s) origins. `'self'` does not cover a split-origin API. */
+export function withWebsocketConnectSources(sources: readonly string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (value: string) => {
+    if (seen.has(value)) return;
+    seen.add(value);
+    out.push(value);
+  };
+  for (const source of sources) {
+    add(source);
+    if (source === "'self'" || source.startsWith("ws://") || source.startsWith("wss://")) continue;
+    try {
+      const url = new URL(source);
+      if (url.protocol === "https:") add(`wss://${url.host}`);
+      else if (url.protocol === "http:") add(`ws://${url.host}`);
+    } catch {
+      // Non-URL source keywords stay as given.
+    }
+  }
+  return out;
+}
+
 /** Registers the global security headers. */
 export function mountSecurityHeaders<E extends Env>(
   app: Hono<E>,
@@ -32,7 +55,7 @@ export function mountSecurityHeaders<E extends Env>(
         // MediaBunny uses same-origin blob workers when compressing an oversized
         // Chat Test video in the browser. Keep workers constrained to this app.
         workerSrc: ["'self'", "blob:"],
-        connectSrc: cspConnectSrc,
+        connectSrc: withWebsocketConnectSources(cspConnectSrc),
         fontSrc: ["'self'", "data:"],
         objectSrc: ["'none'"],
         baseUri: ["'self'"],

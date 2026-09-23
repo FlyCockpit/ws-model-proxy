@@ -4,13 +4,17 @@
  * The load-bearing ORDER (unit-tested here):
  *
  *   1. stop periodic jobs (timers must not fire mid-shutdown);
- *   2. drain HTTP (stop accepting connections, let in-flight requests
- *      finish) — nothing may serve NEW /mcp work after this point;
- *   3. close the module-lifetime MCP handler — aborts in-flight modern MCP
+ *   2. close browser terminal sockets so they do not hold the HTTP drain;
+ *   3. drain HTTP. The drain closes idle CLI relay sockets first, then
+ *      waits for in-flight requests. Nothing may serve NEW /mcp work after
+ *      this point;
+ *   4. close relay sessions after the drain, while Prisma is still up, so
+ *      in-flight model requests can finish;
+ *   5. close the module-lifetime MCP handler — aborts in-flight modern MCP
  *      exchanges and closes their per-request servers. AFTER the HTTP drain
  *      so no live request loses its server mid-flight, and BEFORE Prisma
  *      disconnect so an in-flight tool teardown can still touch the DB;
- *   4. disconnect Prisma last.
+ *   6. disconnect Prisma last.
  *
  * Each step's failure is logged and swallowed: a failed earlier step must
  * not prevent the later steps from running (otherwise a stuck MCP close
@@ -19,7 +23,11 @@
 
 export interface ShutdownSequenceDeps {
   stopPeriodicJobs: () => void | Promise<void>;
+  /** Close browser terminal sockets before the HTTP drain so they cannot hold it. */
+  closeBrowserSockets: () => void | Promise<void>;
   drainHttp: () => Promise<void>;
+  /** Cancel terminals and commands, close CLI sockets, mark devices disconnected. */
+  closeRelaySessions: () => void | Promise<void>;
   /** Close the module-lifetime MCP handler (`McpHttpHandler.close()`). */
   closeMcpHandler: () => Promise<void>;
   disconnectPrisma: () => Promise<void>;
@@ -53,10 +61,24 @@ export async function runGracefulShutdownSequence(deps: ShutdownSequenceDeps): P
   }
 
   try {
+    await deps.closeBrowserSockets();
+    log("[server] Browser terminal sockets closed.");
+  } catch (error) {
+    logError("[server] Error closing browser terminal sockets:", error);
+  }
+
+  try {
     await deps.drainHttp();
     log("[server] HTTP drained.");
   } catch (error) {
     logError("[server] Error draining HTTP server:", error);
+  }
+
+  try {
+    await deps.closeRelaySessions();
+    log("[server] Relay sessions closed.");
+  } catch (error) {
+    logError("[server] Error closing relay sessions:", error);
   }
 
   // After HTTP drain, BEFORE Prisma disconnect (see module doc).

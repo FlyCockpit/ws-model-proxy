@@ -80,6 +80,7 @@ function serializeToken(row: McpPersonalTokenRow) {
     lastUsedAt: row.lastUsedAt,
     revokedAt: row.revokedAt,
     expiresAt: row.expiresAt,
+    allowCliCommands: row.allowCliCommands,
   };
 }
 
@@ -121,9 +122,20 @@ export const mcpTokensRouter = {
         .object({
           name: tokenNameSchema,
           allowWrite: z.boolean().default(false),
+          allowCliCommands: z.boolean().default(false),
           expiresAt: tokenExpiresAtSchema,
         })
-        .superRefine((value, ctx) => validateTokenExpiry(value.expiresAt, ctx)),
+        .superRefine((value, ctx) => {
+          validateTokenExpiry(value.expiresAt, ctx);
+          // CLI commands can change a device, so a read-only token cannot opt in.
+          if (value.allowCliCommands && !value.allowWrite) {
+            ctx.addIssue({
+              code: "custom",
+              path: ["allowCliCommands"],
+              message: "CLI commands require write access.",
+            });
+          }
+        }),
     )
     .handler(async ({ input, context }) => {
       if (env.WMP_MCP_ENABLED !== true) {
@@ -175,6 +187,7 @@ export const mcpTokensRouter = {
             // Client-chosen expiry within MCP_PAT_MAX_TTL_DAYS, or null (no
             // expiry) while WMP_MCP_PAT_ALLOW_NO_EXPIRY allows minting one.
             expiresAt: input.expiresAt ?? null,
+            allowCliCommands: input.allowCliCommands,
             grantId: grant.id,
           },
           select: mcpPersonalTokenSelection,
@@ -194,6 +207,7 @@ export const mcpTokensRouter = {
       const row = await runSerializableTransaction((tx) =>
         revokeMcpPersonalTokenById(tx, { userId, tokenId: input.id, now: new Date() }),
       );
+      context.services?.cancelMcpTokenCommands?.(row.id);
       return serializeToken(row);
     }),
 };

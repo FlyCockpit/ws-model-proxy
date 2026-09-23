@@ -574,14 +574,98 @@ fn endpoints_probe_failure_reports_without_panic() {
 
 #[test]
 fn protocol_helpers_reject_oversized_binary_chunk() {
-    let metadata = wsmp::protocol::RelayBinaryFrameMetadata {
-        r#type: wsmp::protocol::RelayBinaryFrameType::ResponseBody,
+    let metadata = wsmp::protocol::RelayBinaryFrameMetadata::ResponseBody {
         request_id: "request-1".to_string(),
         chunk_id: "0".to_string(),
         final_chunk: Some(true),
     };
     let body = vec![0_u8; wsmp::protocol::RELAY_BINARY_CHUNK_MAX_BYTES + 1];
     assert!(wsmp::protocol::encode_binary_frame(&metadata, &body).is_err());
+}
+
+#[test]
+fn config_terminal_flags_persist_and_ask_for_a_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args(["config", "set-human-terminal", "on"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Restart wsmp to apply."));
+    cli(&config, &state)
+        .args(["config", "--json", "set-mcp-commands", "on"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("allowMcpCommands"));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["allowHumanTerminal"], true);
+    assert_eq!(cfg["allowMcpCommands"], true);
+    assert!(cfg.get("requireTerminalApproval").is_none());
+
+    cli(&config, &state)
+        .args(["config", "set-terminal-approval", "off"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Restart wsmp to apply."));
+}
+
+#[test]
+fn approve_and_daemon_status_use_the_state_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    let decoy = tmp.path().join("decoy");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir_all(&decoy).unwrap();
+    fs::write(
+        state.join("terminal-approval-pending.json"),
+        "{\n  \"entries\": {\n    \"QSOWJSS6\": \"AQ\"\n  }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        decoy.join("terminal-approval-pending.json"),
+        "{\n  \"entries\": {\n    \"QSOWJSS6\": \"AQ\"\n  }\n}\n",
+    )
+    .unwrap();
+    let pid = "version=1\npid=2147483646\ntoken=state-dir-token\n";
+    fs::write(state.join("relay.pid"), pid).unwrap();
+    fs::write(decoy.join("relay.pid"), pid).unwrap();
+
+    cli(&config, &state)
+        .args(["terminal", "--json", "approve", "QSOWJSS6"])
+        .assert()
+        .success();
+    assert!(state.join("terminal-approvals.json").is_file());
+    assert!(!decoy.join("terminal-approvals.json").exists());
+
+    cli(&config, &state)
+        .args(["daemon", "status"])
+        .assert()
+        .failure();
+    assert!(
+        !state.join("relay.pid").exists(),
+        "daemon status did not read the PID file in WSMP_STATE_DIR"
+    );
+    assert!(
+        decoy.join("relay.pid").is_file(),
+        "daemon status touched a state dir other than WSMP_STATE_DIR"
+    );
+}
+
+#[test]
+fn terminal_approve_unknown_code_exits_3_not_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args(["terminal", "approve", "QSOWJSS6"])
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "terminal approval `QSOWJSS6` not found",
+        ));
 }
 
 #[test]

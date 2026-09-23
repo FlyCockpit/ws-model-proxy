@@ -105,6 +105,16 @@ export function inventoryDigestFor(endpoints: EndpointInventory[]): string {
   return createHash("sha256").update(stableJson(identity)).digest("hex");
 }
 
+export type ReportedRelayFeatures = {
+  cliVersion: string | null;
+  relayProtocolVersion: string;
+  reportedHumanTerminal: boolean | null;
+  reportedMcpCommands: boolean | null;
+  reportedTerminalApproval: boolean | null;
+  reportedTerminalSupported: boolean | null;
+  featuresReportedAt: Date | null;
+};
+
 export async function persistRelayRegistration({
   identity,
   cli,
@@ -112,6 +122,7 @@ export async function persistRelayRegistration({
   inventoryConfirmed,
   endpointTargeting,
   connection = false,
+  reported,
   now = new Date(),
 }: {
   identity: CliWebsocketIdentity;
@@ -120,10 +131,14 @@ export async function persistRelayRegistration({
   inventoryConfirmed: boolean;
   endpointTargeting: boolean;
   connection?: boolean;
+  /** Hello only. inventory.update must omit this so reported columns stay put. */
+  reported?: ReportedRelayFeatures;
   now?: Date;
 }): Promise<{
   cliDeviceId: string;
   userId: string;
+  allowHumanTerminal: boolean;
+  allowMcpCommands: boolean;
   revision: { inventorySeq: number; inventoryDigest: string; inventoryAcknowledgedAt: string };
   desiredCapabilities: DesiredModelCapability[];
 }> {
@@ -133,6 +148,20 @@ export async function persistRelayRegistration({
   }
 
   const inventoryDigest = inventoryDigestFor(endpoints);
+  // Grants (allowHumanTerminal / allowMcpCommands) are server-owned and are
+  // never written here. Reported columns are hello-only.
+  const reportedData =
+    connection && reported
+      ? {
+          cliVersion: reported.cliVersion,
+          relayProtocolVersion: reported.relayProtocolVersion,
+          reportedHumanTerminal: reported.reportedHumanTerminal,
+          reportedMcpCommands: reported.reportedMcpCommands,
+          reportedTerminalApproval: reported.reportedTerminalApproval,
+          reportedTerminalSupported: reported.reportedTerminalSupported,
+          featuresReportedAt: reported.featuresReportedAt,
+        }
+      : {};
 
   for (let attempt = 1; attempt <= INVENTORY_TRANSACTION_MAX_ATTEMPTS; attempt += 1) {
     try {
@@ -160,6 +189,7 @@ export async function persistRelayRegistration({
                     connectionCount: { increment: 1 },
                   }
                 : {}),
+              ...reportedData,
             },
             create: {
               userId: identity.userId,
@@ -171,6 +201,7 @@ export async function persistRelayRegistration({
               lastConnectedAt: now,
               lastHeartbeatAt: now,
               connectionCount: 1,
+              ...reportedData,
             },
             select: {
               id: true,
@@ -180,6 +211,8 @@ export async function persistRelayRegistration({
               inventoryDigest: true,
               inventoryAcknowledgedAt: true,
               inventoryConfirmed: true,
+              allowHumanTerminal: true,
+              allowMcpCommands: true,
             },
           });
 
@@ -536,6 +569,8 @@ export async function persistRelayRegistration({
           return {
             cliDeviceId: cliDevice.id,
             userId: cliDevice.userId,
+            allowHumanTerminal: cliDevice.allowHumanTerminal === true,
+            allowMcpCommands: cliDevice.allowMcpCommands === true,
             revision: {
               inventorySeq: acknowledged.inventorySeq,
               inventoryDigest: acknowledged.inventoryDigest ?? inventoryDigest,

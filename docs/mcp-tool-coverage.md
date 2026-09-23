@@ -39,6 +39,8 @@ fails the suite when a leaf is unclassified.
 | `cliCredentials.exchangeDeviceCode` | — (excluded) | — | — | — | — | — | Public device-flow credential exchange; not an MCP surface. |
 | `cliCredentials.listTokens` | `cli_tokens_list` | read | — | pure | — | — | — |
 | `cliCredentials.revokeToken` | `cli_token_revoke` | write | DELETE | destructive | — | — | — |
+| `core:forwarderCliCommandResult` | `forwarder_cli_command_result` | write | — | pure | — | — | — |
+| `core:forwarderCliCommandRun` | `forwarder_cli_command_run` | write | RUN | external | — | — | — |
 | `core:model-api/runChatCompletionDiagnostic` | `forwarder_chat_completion_test` | write | RUN | cost | — | — | — |
 | `core:model-api/runPoolMemberTest` | `forwarder_pool_member_test` | write | RUN | cost | — | — | — |
 | `devices.list` | — (excluded) | — | — | — | — | — | Admin-only device administration. |
@@ -62,6 +64,7 @@ fails the suite when a leaf is unclassified.
 | `forwarderManagement.removePoolMember` | `forwarder_pool_member_remove` | write | DELETE | destructive | — | — | — |
 | `forwarderManagement.reorderProviderPoolMember` | `forwarder_provider_member_reorder` | write | — | pure | — | — | — |
 | `forwarderManagement.revokePoolAccessByEmail` | `forwarder_pool_grant_revoke` | write | DELETE | destructive | — | — | — |
+| `forwarderManagement.setCliDeviceFeatureGrants` | — (excluded) | — | — | — | — | — | human-only device grant |
 | `forwarderManagement.setDiscoveredModelCapabilityProfile` | `forwarder_model_capability_profile_set` | write | — | pure | — | — | — |
 | `forwarderManagement.updateDiscoveredModelAttachmentLimit` | `forwarder_model_attachment_limit_update` | write | — | pure | — | — | — |
 | `forwarderManagement.updateDiscoveredModelCapabilities` | `forwarder_model_capabilities_update` | write | — | pure | — | — | — |

@@ -4,11 +4,16 @@ import {
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { z } from "zod";
 
-export const RELAY_PROTOCOL_VERSION = "2.3";
+export const RELAY_PROTOCOL_VERSIONS = ["2.0", "2.1", "2.2", "2.3", "2.4"] as const;
+export type RelayProtocolVersion = (typeof RELAY_PROTOCOL_VERSIONS)[number];
+export const RELAY_PROTOCOL_VERSION = "2.4" satisfies RelayProtocolVersion;
 export const RELAY_SUBPROTOCOL = "ws-model-proxy.relay.v2";
 
 const RELAY_JSON_CONTROL_MAX_BYTES = 64 * 1024;
 export const RELAY_BINARY_CHUNK_MAX_BYTES = 1024 * 1024;
+/** 4-byte metadata length + 64 KiB metadata + 1 MiB body. Shared by both sockets. */
+export const RELAY_WS_MAX_PAYLOAD_BYTES =
+  4 + RELAY_JSON_CONTROL_MAX_BYTES + RELAY_BINARY_CHUNK_MAX_BYTES;
 // Request-body flow control window. The server may have at most this many
 // request-body chunks in flight toward a CLI before it must wait for the CLI to
 // acknowledge consumed chunks (`relay.request.body.ack`). It bounds CLI-side
@@ -44,9 +49,63 @@ const orderedHeadersSchema = z.array(z.tuple([headerNameSchema, headerValueSchem
 
 export { type OpenAiCompatibleCapabilities, openAiCompatibleCapabilitiesSchema };
 
-const cliCapabilitiesSchema = z
+/** 16 raw bytes, unpadded base64url (22 characters). */
+export const base64Url16ByteSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9_-]{22}$/)
+  .refine((value) => Buffer.from(value, "base64url").length === 16, {
+    message: "Expected 16 bytes of base64url.",
+  });
+
+/** Uncompressed P-256 point: 65 bytes, leading 0x04, unpadded base64url (87 characters). */
+export const uncompressedP256PublicKeySchema = z
+  .string()
+  .regex(/^[A-Za-z0-9_-]{87}$/)
+  .refine((value) => {
+    const bytes = Buffer.from(value, "base64url");
+    return bytes.length === 65 && bytes[0] === 0x04;
+  }, "Expected a 65-byte uncompressed P-256 public key.");
+
+const base64UrlTextSchema = z.string().regex(/^[A-Za-z0-9_-]{1,512}$/);
+const terminalIdentitySchema = z
   .object({
-    protocolVersion: z.literal(RELAY_PROTOCOL_VERSION),
+    publicKey: base64UrlTextSchema,
+    signature: base64UrlTextSchema.optional(),
+  })
+  .strict();
+
+const v24FeatureSchema = z
+  .object({
+    humanTerminal: z.boolean(),
+    mcpCommands: z.boolean(),
+    terminalApproval: z.boolean(),
+    terminalSupported: z.boolean(),
+  })
+  .strict();
+
+const v24CliCapabilitiesSchema = z
+  .object({
+    protocolVersion: z.literal("2.4"),
+    inventoryAck: z.literal(true),
+    inventoryReplace: z.literal(true),
+    endpointTargeting: z.literal(true),
+    binaryFrames: z.literal(true),
+    cancellation: z.literal(true),
+    maxBinaryChunkBytes: z.literal(RELAY_BINARY_CHUNK_MAX_BYTES),
+    requestBodyStreaming: z.literal(true),
+    requestBodyWindowChunks: z.literal(RELAY_REQUEST_BODY_WINDOW_CHUNKS),
+    sharedTokenizerTps: z.literal(true),
+    standardizedMetrics: z.literal(true),
+    terminal: z.literal(true),
+    exec: z.literal(true),
+    features: v24FeatureSchema,
+    terminalPublicKey: uncompressedP256PublicKeySchema,
+  })
+  .strict();
+
+const v23CliCapabilitiesSchema = z
+  .object({
+    protocolVersion: z.literal("2.3"),
     inventoryAck: z.literal(true),
     inventoryReplace: z.literal(true),
     endpointTargeting: z.literal(true),
@@ -101,7 +160,8 @@ const legacyCliCapabilitiesSchema = z
   .strict();
 
 const acceptedCliCapabilitiesSchema = z.union([
-  cliCapabilitiesSchema,
+  v24CliCapabilitiesSchema,
+  v23CliCapabilitiesSchema,
   v22CliCapabilitiesSchema,
   v21CliCapabilitiesSchema,
   legacyCliCapabilitiesSchema,
@@ -163,7 +223,8 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
       type: z.literal("hello"),
       id: requestIdSchema,
       protocolVersion: z.union([
-        z.literal(RELAY_PROTOCOL_VERSION),
+        z.literal("2.4"),
+        z.literal("2.3"),
         z.literal("2.2"),
         z.literal("2.1"),
         z.literal("2.0"),
@@ -247,6 +308,72 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
       requestId: requestIdSchema,
     })
     .strict(),
+  z
+    .object({
+      type: z.literal("term.pending"),
+      terminalId: base64Url16ByteSchema,
+      cliNonce: base64Url16ByteSchema,
+      approvalCode: z
+        .string()
+        .regex(/^[A-Z2-7]{8}$/)
+        .optional(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("term.opened"),
+      terminalId: base64Url16ByteSchema,
+      cliNonce: base64Url16ByteSchema,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("term.attached"),
+      terminalId: base64Url16ByteSchema,
+      cliNonce: base64Url16ByteSchema,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("term.rejected"),
+      terminalId: base64Url16ByteSchema,
+      reason: z.string().min(1).max(64),
+      approvalCode: z
+        .string()
+        .regex(/^[A-Z2-7]{8}$/)
+        .optional(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("term.exit"),
+      terminalId: base64Url16ByteSchema,
+      exitCode: z.number().int().min(0).max(255).optional(),
+      signal: z.string().min(1).max(32).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("exec.started"),
+      commandId: base64Url16ByteSchema,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("exec.rejected"),
+      commandId: base64Url16ByteSchema,
+      reason: z.string().min(1).max(64),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("exec.done"),
+      commandId: base64Url16ByteSchema,
+      exitCode: z.number().int().min(0).max(255).optional(),
+      signal: z.string().min(1).max(32).optional(),
+      timedOut: z.boolean(),
+    })
+    .strict(),
 ]);
 export type RelayClientControlMessage = z.infer<typeof relayClientControlMessageSchema>;
 
@@ -263,11 +390,13 @@ export type DesiredModelCapability = {
   capabilities: OpenAiCompatibleCapabilities;
 };
 
+export type TerminalHandshakeIdentity = z.infer<typeof terminalIdentitySchema>;
+
 export type RelayServerControlMessage =
   | {
       type: "hello.ok";
       id: string;
-      protocolVersion: typeof RELAY_PROTOCOL_VERSION;
+      protocolVersion: RelayProtocolVersion;
       revision: InventoryRevision;
       desiredCapabilities?: DesiredModelCapability[];
     }
@@ -301,23 +430,67 @@ export type RelayServerControlMessage =
       expectBody: boolean;
     }
   | { type: "relay.cancel"; requestId: string; reason: RelayFailure }
-  | { type: "protocol.error"; failure: "protocol_error"; message: string; requestId?: string };
+  | { type: "protocol.error"; failure: "protocol_error"; message: string; requestId?: string }
+  | {
+      type: "term.open";
+      terminalId: string;
+      cols: number;
+      rows: number;
+      browserPublicKey: string;
+      browserNonce: string;
+      identity?: TerminalHandshakeIdentity;
+    }
+  | {
+      type: "term.attach";
+      terminalId: string;
+      browserPublicKey: string;
+      browserNonce: string;
+      identity?: TerminalHandshakeIdentity;
+    }
+  | { type: "term.detach"; terminalId: string }
+  | { type: "term.close"; terminalId: string }
+  | { type: "term.auth"; terminalId: string; signature: string }
+  | { type: "exec.start"; commandId: string; command: string; cwd?: string }
+  | { type: "exec.cancel"; commandId: string };
 
-export type RelayBinaryFrameMetadata = {
-  type: "relay.request.body" | "relay.response.body";
-  requestId: string;
-  chunkId: string;
-  final?: boolean;
+const relayBodyMetadataFields = {
+  requestId: requestIdSchema,
+  chunkId: z.string().trim().min(1).max(128),
+  final: z.boolean().optional(),
 };
+const sealedSeqSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 
-const relayBinaryFrameMetadataSchema = z
-  .object({
-    type: z.enum(["relay.request.body", "relay.response.body"]),
-    requestId: requestIdSchema,
-    chunkId: z.string().trim().min(1).max(128),
-    final: z.boolean().optional(),
-  })
-  .strict();
+const relayBinaryFrameMetadataSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("relay.request.body"), ...relayBodyMetadataFields }).strict(),
+  z.object({ type: z.literal("relay.response.body"), ...relayBodyMetadataFields }).strict(),
+  z
+    .object({
+      type: z.literal("term.sealed"),
+      terminalId: base64Url16ByteSchema,
+      seq: sealedSeqSchema,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("exec.stdout"),
+      commandId: base64Url16ByteSchema,
+      seq: sealedSeqSchema,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("exec.stderr"),
+      commandId: base64Url16ByteSchema,
+      seq: sealedSeqSchema,
+    })
+    .strict(),
+]);
+
+export type RelayBinaryFrameMetadata = z.infer<typeof relayBinaryFrameMetadataSchema>;
+export type RelayResponseBodyMetadata = Extract<
+  RelayBinaryFrameMetadata,
+  { type: "relay.response.body" }
+>;
 
 export function parseRelaySubprotocolHeader(header: string | undefined): {
   ok: boolean;

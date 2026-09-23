@@ -50,6 +50,12 @@ vi.mock("@ws-model-proxy/db", async () => {
   return { default: mockDeep() };
 });
 
+vi.mock("../relay/cli-commands.js", () => ({
+  startCliCommand: vi.fn(),
+  waitCliCommand: vi.fn(),
+  snapshotCliCommand: vi.fn(),
+}));
+
 /** Minimal well-typed CallToolResult for the probe tool. */
 type ProbeToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
 
@@ -137,21 +143,27 @@ describe("createMcpTransport — pinned configuration", () => {
     });
   });
 
-  it("the Phase 5 tool manifest backs the default registration: tools/list advertises every catalog entry", () => {
+  it("the Phase 5 tool manifest backs the default registration: tools/list advertises the catalog except credential-gated CLI commands", () => {
     expect(MCP_TOOL_MANIFEST.length).toBeGreaterThan(0);
     const server = new McpServer({ name: "t", version: "1" });
     registerMcpTools(server);
     const handler = createMcpTransport();
     return handler.fetch(modernRequest("tools/list", 1), undefined).then(async (res) => {
-      // With the Phase 5 manifest registered, tools/list answers 200 and
-      // carries exactly the manifest's tool names (catalog parity between
-      // the transport default and the checked manifest).
+      // No authInfo is bound, so the two CLI command tools are not
+      // registered. Every other catalog name is advertised.
       expect(res.status).toBe(200);
       const body = (await res.json()) as {
         result?: { tools?: { name: string }[] };
       };
       const names = body.result?.tools?.map((tool) => tool.name).sort();
-      expect(names).toEqual([...MCP_TOOL_MANIFEST.map((tool) => tool.name)].sort());
+      expect(names).toEqual(
+        MCP_TOOL_MANIFEST.map((tool) => tool.name)
+          .filter(
+            (name) =>
+              name !== "forwarder_cli_command_run" && name !== "forwarder_cli_command_result",
+          )
+          .sort(),
+      );
     });
   });
 });

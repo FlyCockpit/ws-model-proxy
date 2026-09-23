@@ -96,6 +96,7 @@ function tokenRow(overrides: Record<string, unknown> = {}) {
     lastUsedAt: null,
     revokedAt: null,
     expiresAt: null,
+    allowCliCommands: false,
     ...overrides,
   };
 }
@@ -137,6 +138,7 @@ describe("mcpTokensRouter", () => {
         lastUsedAt: null,
         revokedAt: null,
         expiresAt: null,
+        allowCliCommands: false,
       },
     ]);
     expect(db.mcpPersonalToken.findMany).toHaveBeenCalledWith(
@@ -165,6 +167,7 @@ describe("mcpTokensRouter", () => {
         lastUsedAt: null,
         revokedAt: createdAt,
         expiresAt: null,
+        allowCliCommands: false,
       },
     ]);
     expect(db.mcpPersonalToken.findMany).toHaveBeenCalledWith(
@@ -419,6 +422,107 @@ describe("mcpTokensRouter", () => {
     });
     expect(db.mcpPersonalToken.update).not.toHaveBeenCalled();
     expect(db.mcpGrant.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("rejects allowCliCommands without write access", async () => {
+    const client = createRouterClient(mcpTokensRouter, { context: buildContext() });
+    await expect(
+      client.create({ name: "Laptop", allowWrite: false, allowCliCommands: true }),
+    ).rejects.toSatisfy((error: ORPCError) => {
+      expect(error).toBeInstanceOf(ORPCError);
+      expect(error.code).toBe("BAD_REQUEST");
+      expect(JSON.stringify(error.data)).toContain("CLI commands require write access.");
+      return true;
+    });
+    expect(db.$transaction).not.toHaveBeenCalled();
+  });
+
+  it("round-trips allowCliCommands on create and list", async () => {
+    db.mcpGrant.create.mockResolvedValue({ id: "grant-1" });
+    db.mcpPersonalToken.create.mockResolvedValue(
+      tokenRow({ scopes: ["mcp:read", "mcp:write"], allowCliCommands: true }),
+    );
+    const client = createRouterClient(mcpTokensRouter, { context: buildContext() });
+    const created = await client.create({
+      name: "Laptop Grok",
+      allowWrite: true,
+      allowCliCommands: true,
+    });
+    expect(created.token.allowCliCommands).toBe(true);
+    expect(db.mcpPersonalToken.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          allowCliCommands: true,
+          scopes: ["mcp:read", "mcp:write"],
+        }),
+      }),
+    );
+
+    db.mcpPersonalToken.findMany.mockResolvedValue([
+      tokenRow({ scopes: ["mcp:read", "mcp:write"], allowCliCommands: true }),
+    ]);
+    await expect(client.listMine()).resolves.toEqual([
+      expect.objectContaining({ id: "token-1", allowCliCommands: true }),
+    ]);
+  });
+
+  it("still refuses a no-expiry token while WMP_MCP_PAT_ALLOW_NO_EXPIRY is off when CLI commands are requested", async () => {
+    envMock.WMP_MCP_PAT_ALLOW_NO_EXPIRY = false;
+    const client = createRouterClient(mcpTokensRouter, { context: buildContext() });
+    await expect(
+      client.create({ name: "Laptop", allowWrite: true, allowCliCommands: true }),
+    ).rejects.toSatisfy((error: ORPCError) => {
+      expect(error).toBeInstanceOf(ORPCError);
+      expect(error.code).toBe("FORBIDDEN");
+      expect(error.data).toEqual({ reason: MCP_PAT_NO_EXPIRY_DISABLED_REASON });
+      return true;
+    });
+    expect(db.$transaction).not.toHaveBeenCalled();
+  });
+
+  it("cancels CLI commands after the revoke transaction commits", async () => {
+    const events: string[] = [];
+    db.$transaction.mockImplementation(async (work: unknown) => {
+      events.push("begin");
+      const result = await (work as (tx: unknown) => Promise<unknown>)(prisma);
+      events.push("commit");
+      return result;
+    });
+    db.mcpPersonalToken.findUnique.mockResolvedValue({
+      id: "token-1",
+      userId: "user-1",
+      grantId: "grant-1",
+      revokedAt: null,
+    });
+    db.mcpPersonalToken.update.mockResolvedValue(tokenRow({ revokedAt: createdAt }));
+    db.mcpGrant.updateMany.mockResolvedValue({ count: 1 });
+    const cancelMcpTokenCommands = vi.fn(() => {
+      events.push("cancel");
+    });
+    const client = createRouterClient(mcpTokensRouter, {
+      context: { ...buildContext(), services: { cancelMcpTokenCommands } },
+    });
+
+    await expect(client.revokeMine({ id: "token-1" })).resolves.toMatchObject({
+      id: "token-1",
+      revokedAt: createdAt,
+    });
+    expect(cancelMcpTokenCommands).toHaveBeenCalledTimes(1);
+    expect(cancelMcpTokenCommands).toHaveBeenCalledWith("token-1");
+    expect(events).toEqual(["begin", "commit", "cancel"]);
+  });
+
+  it("does not cancel CLI commands when revoke does not commit", async () => {
+    const cancelMcpTokenCommands = vi.fn();
+    const client = createRouterClient(mcpTokensRouter, {
+      context: { ...buildContext(), services: { cancelMcpTokenCommands } },
+    });
+    await expect(client.revokeMine({ id: "missing" })).rejects.toSatisfy((error: ORPCError) => {
+      expect(error).toBeInstanceOf(ORPCError);
+      expect(error.code).toBe("NOT_FOUND");
+      return true;
+    });
+    expect(cancelMcpTokenCommands).not.toHaveBeenCalled();
   });
 
   it("hides unknown tokens as not found without writing anything", async () => {

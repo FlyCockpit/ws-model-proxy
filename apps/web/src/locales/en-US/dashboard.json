@@ -30,7 +30,16 @@
     },
     "searchPlaceholder": "Search model ID, upstream ID, endpoint, or label",
     "noSearchResults": "No endpoints or models match that search.",
-    "title": "CLIs, Endpoints, and Models"
+    "title": "CLIs, Endpoints, and Models",
+    "features": {
+      "terminal": "Browser terminal",
+      "commands": "MCP commands",
+      "saved": "CLI feature access updated",
+      "saveFailed": "Couldn't update CLI feature access. Try again.",
+      "windows": "Not supported on Windows yet",
+      "configDisabled": "Disabled in this CLI's wsmp config — edit and restart wsmp",
+      "updateWsmp": "Update wsmp to use this"
+    }
   },
   "chatTest": {
     "announcements": {
@@ -214,16 +223,61 @@
       "OPENAI_RESPONSES": "OpenAI Responses"
     }
   },
+  "terminals": {
+    "title": "Terminals",
+    "description": "Open a shell on one of your CLIs. Keystrokes stay encrypted between this browser and the CLI.",
+    "empty": "No terminals open. Start one from a CLI that allows browser terminals.",
+    "emptyClis": "No CLI devices have registered yet.",
+    "loading": "Loading terminals",
+    "add": "New terminal",
+    "close": "Close terminal",
+    "cliList": "Choose a CLI",
+    "reconnecting": "Reconnecting to the terminal service…",
+    "exited": "The shell exited.",
+    "rejected": "The CLI rejected this terminal ({{reason}}).",
+    "error": "The terminal connection hit an error.",
+    "approvalTitle": "This CLI needs approval",
+    "approvalInstructions": "Run this command on that machine, then open the terminal again.",
+    "approvalCodeLabel": "Approval code",
+    "copyCommand": "Copy command",
+    "copied": "Command copied",
+    "reasons": {
+      "notGranted": "Not granted for this CLI",
+      "offline": "CLI is offline",
+      "unavailable": "Terminal is unavailable"
+    },
+    "rejection": {
+      "disabled": "Disabled in the CLI config",
+      "unsupported": "Not supported on this machine",
+      "limit": "Too many terminals are already open",
+      "approval_required": "This browser is not approved yet",
+      "bad_signature": "The approval signature was rejected",
+      "bad_handshake": "The terminal handshake was invalid",
+      "bad_cwd": "The CLI home directory is not usable",
+      "spawn_failed": "The shell could not be started",
+      "not_found": "Terminal not found",
+      "already_open": "That terminal is already open",
+      "expired": "The approval request expired",
+      "not_granted": "Not granted for this CLI",
+      "device_disabled": "Disabled in the CLI config",
+      "cli_too_old": "Update wsmp to use terminals",
+      "offline": "CLI is offline",
+      "invalid": "That terminal request was invalid"
+    }
+  },
   "nav": {
     "ariaLabel": "Dashboard sections",
     "chatTest": "Chat test",
     "capacity": "Capacity",
     "cliTokens": "CLI tokens",
     "clis": "CLIs",
+    "collapseSidebar": "Collapse sidebar",
+    "expandSidebar": "Expand sidebar",
     "modelApiTokens": "Model API tokens",
     "overview": "Overview",
     "pools": "Pools",
-    "relayMetadata": "Relay metadata"
+    "relayMetadata": "Relay metadata",
+    "terminals": "Terminals"
   },
   "pools": {
     "notFound": "This pool was not found or is no longer available to you.",

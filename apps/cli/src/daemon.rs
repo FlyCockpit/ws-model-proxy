@@ -90,14 +90,21 @@ use crate::media::{
     TrustedOrigins, expand_media_in_body, trusted_media_urls_in_body,
 };
 use crate::probe::{ProbeReport, apply_probe_report, probe_endpoint};
+#[cfg(test)]
+use crate::protocol::parse_binary_frame;
 use crate::protocol::{
-    CliCapabilities, CliInventory, ClientControlMessage, EndpointInventory, EndpointStatus,
+    CliInventory, ClientControlMessage, EndpointInventory, EndpointStatus, FrameFault,
     RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS, RELAY_PROTOCOL_VERSION, RELAY_REQUEST_BODY_WINDOW_CHUNKS,
-    RELAY_SUBPROTOCOL, RelayBinaryFrameMetadata, RelayBinaryFrameType, RelayFailure,
-    ServerControlMessage, encode_binary_frame, encode_control, endpoint_inventory,
-    parse_binary_frame, parse_server_control,
+    RELAY_SUBPROTOCOL, RelayBinaryFrameMetadata, RelayFailure, ServerControlMessage,
+    binary_frame_fault, control_frame_fault, encode_binary_frame, encode_control,
+    endpoint_inventory, parse_server_control,
+};
+use crate::relay_bus::{FromWorker, WsFrame};
+use crate::sessions::{
+    DEFAULT_EXEC_TIMEOUT, ExecRegistry, OutboundFrame, TermHandshake, TerminalRegistry,
 };
 use crate::slug::generated_slug;
+use crate::startup::{self, TerminalStartup};
 use crate::tokens::{CompletionTextCollector, standardized_completion_metrics};
 
 const RELAY_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
@@ -169,29 +176,6 @@ fn upstream_http_client() -> Result<&'static reqwest::Client> {
     UPSTREAM_HTTP_CLIENT
         .get()
         .context("initializing shared cancellable upstream client")
-}
-
-/// A frame produced by a worker for the main loop to write to the websocket.
-enum WsFrame {
-    Text(String),
-    Binary(Vec<u8>),
-}
-
-/// Message from a request worker to the main loop.
-enum FromWorker {
-    Send {
-        request_id: String,
-        frame: WsFrame,
-    },
-    Finished(String),
-    #[cfg(unix)]
-    InventoryPrepared {
-        candidate: Config,
-    },
-    #[cfg(unix)]
-    InventoryPreparationFailed {
-        message: String,
-    },
 }
 
 /// A request-body chunk delivered to a worker's upstream request reader.
@@ -445,6 +429,7 @@ pub fn connect_foreground() -> Result<()> {
     let mut config = Config::load_required()?;
     config.validate()?;
     let mut control = ControlServer::bind()?;
+    let startup = TerminalStartup::capture(&config)?;
     let mut last_inventory_revision = None;
     // The mtime accompanies the last server-acknowledged local snapshot. It
     // prevents an edit-and-revert from being treated as an unchanged desired
@@ -495,6 +480,7 @@ pub fn connect_foreground() -> Result<()> {
         tracing::info!(url = %ws_url, "connecting relay websocket");
         match run_relay_session(
             &mut config,
+            &startup,
             &cli_slug,
             &ws_url,
             auth_value,
@@ -693,8 +679,10 @@ fn wait_for_reconnect(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_relay_session(
     config: &mut Config,
+    startup: &TerminalStartup,
     cli_slug: &str,
     ws_url: &Url,
     auth_value: HeaderValue,
@@ -728,6 +716,11 @@ fn run_relay_session(
     }
     set_socket_read_timeout(socket.get_mut(), RELAY_SOCKET_POLL_INTERVAL);
 
+    // Created before hello so an early `?` still drops (and kills) every child.
+    let (worker_tx, worker_rx) = mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
+    let mut terminals = TerminalRegistry::new(worker_tx.clone());
+    let mut execs = ExecRegistry::new(worker_tx.clone(), DEFAULT_EXEC_TIMEOUT);
+
     let hello = ClientControlMessage::Hello {
         id: next_id("hello"),
         protocol_version: RELAY_PROTOCOL_VERSION.to_string(),
@@ -738,7 +731,7 @@ fn run_relay_session(
                 .clone()
                 .unwrap_or_else(|| "CLI device".to_string()),
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
-            capabilities: CliCapabilities::default(),
+            capabilities: startup::hello_capabilities(startup, config),
         },
         endpoints,
     };
@@ -747,7 +740,6 @@ fn run_relay_session(
         .send(Message::Text(hello.into()))
         .map_err(|error| websocket_session_error(error, "sending relay hello", false))?;
 
-    let (worker_tx, worker_rx) = mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
     let mut workers = BTreeMap::<String, WorkerHandle>::new();
     let mut recent_finished = RecentlyFinished::new();
     #[cfg(unix)]
@@ -774,6 +766,8 @@ fn run_relay_session(
             &worker_rx,
             &mut workers,
             &mut recent_finished,
+            &mut terminals,
+            &mut execs,
             #[cfg(unix)]
             &mut reload_preparing,
             #[cfg(unix)]
@@ -781,6 +775,13 @@ fn run_relay_session(
             #[cfg(unix)]
             &mut pending_reload,
         ) {
+            break Err(error);
+        }
+        let now = Instant::now();
+        if let Err(error) = send_outbound_frames(&mut socket, terminals.poll(now)) {
+            break Err(error);
+        }
+        if let Err(error) = send_outbound_frames(&mut socket, execs.poll(now)) {
             break Err(error);
         }
 
@@ -850,6 +851,7 @@ fn run_relay_session(
             Ok(Message::Text(text)) => handle_text(
                 &mut socket,
                 config,
+                startup,
                 last_inventory_revision,
                 #[cfg(unix)]
                 &mut pending_reload,
@@ -861,10 +863,17 @@ fn run_relay_session(
                 &worker_tx,
                 &mut workers,
                 &mut recent_finished,
+                &mut terminals,
+                &mut execs,
             ),
-            Ok(Message::Binary(bytes)) => {
-                handle_binary(&mut socket, &bytes, &mut workers, &mut recent_finished)
-            }
+            Ok(Message::Binary(bytes)) => handle_binary(
+                &mut socket,
+                &bytes,
+                &mut workers,
+                &mut recent_finished,
+                &mut terminals,
+                &mut execs,
+            ),
             Ok(Message::Close(frame)) => {
                 tracing::warn!(?frame, "relay websocket closed by server");
                 Err(RelaySessionError::Reconnectable {
@@ -932,6 +941,8 @@ fn run_relay_session(
             },
         );
     }
+    let _ = send_outbound_frames(&mut socket, terminals.kill_all());
+    let _ = send_outbound_frames(&mut socket, execs.kill_all());
     abort_all_workers(workers);
     result
 }
@@ -960,6 +971,8 @@ fn drain_worker_output<S>(
     worker_rx: &Receiver<FromWorker>,
     workers: &mut BTreeMap<String, WorkerHandle>,
     recent_finished: &mut RecentlyFinished,
+    terminals: &mut TerminalRegistry,
+    execs: &mut ExecRegistry,
     #[cfg(unix)] reload_preparing: &mut bool,
     #[cfg(unix)] pending_preparation: &mut Option<PendingRequest>,
     #[cfg(unix)] pending_reload: &mut Option<PendingReload>,
@@ -990,6 +1003,22 @@ where
                 if let Some(worker) = workers.remove(&request_id) {
                     let _ = worker.join.join();
                 }
+            }
+            Ok(FromWorker::TerminalBytes { terminal_id, bytes }) => {
+                send_outbound_frames(socket, terminals.on_bytes(&terminal_id, &bytes))?;
+            }
+            Ok(FromWorker::TerminalEof { terminal_id }) => {
+                send_outbound_frames(socket, terminals.on_eof(&terminal_id))?;
+            }
+            Ok(FromWorker::ExecBytes {
+                command_id,
+                stderr,
+                bytes,
+            }) => {
+                send_outbound_frames(socket, execs.on_bytes(&command_id, stderr, &bytes))?;
+            }
+            Ok(FromWorker::ExecEof { command_id, stderr }) => {
+                send_outbound_frames(socket, execs.on_eof(&command_id, stderr))?;
             }
             #[cfg(unix)]
             Ok(FromWorker::InventoryPrepared { candidate }) => {
@@ -1337,6 +1366,7 @@ where
 fn handle_text<S>(
     socket: &mut tungstenite::WebSocket<S>,
     config: &mut Config,
+    startup: &TerminalStartup,
     last_inventory_revision: &mut Option<crate::protocol::InventoryRevision>,
     #[cfg(unix)] pending_reload: &mut Option<PendingReload>,
     #[cfg(unix)] timed_out_reload_candidates: &mut TimedOutReloads,
@@ -1345,11 +1375,19 @@ fn handle_text<S>(
     worker_tx: &SyncSender<FromWorker>,
     workers: &mut BTreeMap<String, WorkerHandle>,
     recent_finished: &mut RecentlyFinished,
+    terminals: &mut TerminalRegistry,
+    execs: &mut ExecRegistry,
 ) -> RelaySessionResult<()>
 where
     S: std::io::Read + std::io::Write,
 {
-    let message = parse_server_control(text).map_err(RelaySessionError::Fatal)?;
+    let message = match parse_server_control(text) {
+        Ok(message) => message,
+        Err(error) => {
+            return apply_frame_fault(socket, control_frame_fault(text), terminals, execs, &error);
+        }
+    };
+    let state_dir = crate::paths::state_dir().ok();
     match message {
         ServerControlMessage::HelloOk { id, revision, .. } => {
             *last_inventory_revision = Some(revision);
@@ -1517,6 +1555,91 @@ where
                 expect_body,
             )?;
         }
+        ServerControlMessage::Unknown { type_name } => {
+            tracing::warn!(
+                frame_type = type_name,
+                "ignoring unknown relay server frame"
+            );
+        }
+        ServerControlMessage::TermOpen {
+            terminal_id,
+            cols,
+            rows,
+            browser_public_key,
+            browser_nonce,
+            identity,
+        } => {
+            send_outbound_frames(
+                socket,
+                terminals.open(
+                    startup,
+                    config,
+                    state_dir.as_deref(),
+                    TermHandshake {
+                        terminal_id: &terminal_id,
+                        cols,
+                        rows,
+                        browser_public_key: &browser_public_key,
+                        browser_nonce: &browser_nonce,
+                        identity: identity.as_ref(),
+                    },
+                ),
+            )?;
+        }
+        ServerControlMessage::TermAttach {
+            terminal_id,
+            browser_public_key,
+            browser_nonce,
+            identity,
+        } => {
+            send_outbound_frames(
+                socket,
+                terminals.attach(
+                    startup,
+                    state_dir.as_deref(),
+                    TermHandshake {
+                        terminal_id: &terminal_id,
+                        cols: 0,
+                        rows: 0,
+                        browser_public_key: &browser_public_key,
+                        browser_nonce: &browser_nonce,
+                        identity: identity.as_ref(),
+                    },
+                ),
+            )?;
+        }
+        ServerControlMessage::TermDetach { terminal_id } => terminals.detach(&terminal_id),
+        ServerControlMessage::TermClose { terminal_id } => {
+            send_outbound_frames(socket, terminals.close(&terminal_id))?;
+        }
+        ServerControlMessage::TermAuth {
+            terminal_id,
+            signature,
+        } => {
+            send_outbound_frames(
+                socket,
+                terminals.auth(
+                    startup,
+                    config,
+                    state_dir.as_deref(),
+                    &terminal_id,
+                    &signature,
+                ),
+            )?;
+        }
+        ServerControlMessage::ExecStart {
+            command_id,
+            command,
+            cwd,
+        } => {
+            send_outbound_frames(
+                socket,
+                execs.start(startup, config, &command_id, &command, cwd.as_deref()),
+            )?;
+        }
+        ServerControlMessage::ExecCancel { command_id } => {
+            send_outbound_frames(socket, execs.cancel(&command_id))?;
+        }
     }
     Ok(())
 }
@@ -1631,24 +1754,90 @@ where
     Ok(())
 }
 
+fn apply_frame_fault<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    fault: FrameFault,
+    terminals: &mut TerminalRegistry,
+    execs: &mut ExecRegistry,
+    error: &anyhow::Error,
+) -> RelaySessionResult<()>
+where
+    S: std::io::Read + std::io::Write,
+{
+    match fault {
+        FrameFault::Fatal => {
+            let _ = error;
+            Err(RelaySessionError::Fatal(anyhow::anyhow!(
+                "malformed relay frame"
+            )))
+        }
+        FrameFault::Ignore => {
+            tracing::warn!("ignoring a malformed or unknown relay frame");
+            Ok(())
+        }
+        FrameFault::CloseTerminal { terminal_id } => {
+            tracing::warn!(terminal_id, "closing a terminal after a malformed frame");
+            send_outbound_frames(socket, terminals.close(&terminal_id))
+        }
+        FrameFault::CloseCommand { command_id } => {
+            tracing::warn!(command_id, "closing a command after a malformed frame");
+            send_outbound_frames(socket, execs.cancel(&command_id))
+        }
+    }
+}
+
 fn handle_binary<S>(
     socket: &mut tungstenite::WebSocket<S>,
     bytes: &[u8],
     workers: &mut BTreeMap<String, WorkerHandle>,
     recent_finished: &mut RecentlyFinished,
+    terminals: &mut TerminalRegistry,
+    execs: &mut ExecRegistry,
 ) -> RelaySessionResult<()>
 where
     S: std::io::Read + std::io::Write,
 {
-    let (metadata, body) = parse_binary_frame(bytes).map_err(RelaySessionError::Fatal)?;
-    if metadata.r#type != RelayBinaryFrameType::RequestBody {
-        return Err(RelaySessionError::Fatal(anyhow::anyhow!(
-            "unexpected relay binary frame type"
-        )));
-    }
+    let (metadata, body) = match binary_frame_fault(bytes) {
+        Ok(parsed) => parsed,
+        Err(fault) => {
+            return apply_frame_fault(
+                socket,
+                fault,
+                terminals,
+                execs,
+                &anyhow::anyhow!("malformed relay binary frame"),
+            );
+        }
+    };
+    let RelayBinaryFrameMetadata::RequestBody {
+        request_id,
+        final_chunk,
+        ..
+    } = metadata
+    else {
+        return match metadata {
+            RelayBinaryFrameMetadata::TermSealed { terminal_id, seq } => {
+                send_outbound_frames(socket, terminals.handle_sealed(&terminal_id, seq, &body))?;
+                Ok(())
+            }
+            RelayBinaryFrameMetadata::ExecStdout { command_id, .. }
+            | RelayBinaryFrameMetadata::ExecStderr { command_id, .. } => {
+                tracing::warn!(
+                    command_id,
+                    "closing a command after an unexpected exec frame"
+                );
+                send_outbound_frames(socket, execs.cancel(&command_id))?;
+                Ok(())
+            }
+            RelayBinaryFrameMetadata::ResponseBody { .. } => {
+                tracing::warn!("ignoring an unexpected relay response body");
+                Ok(())
+            }
+            RelayBinaryFrameMetadata::RequestBody { .. } => Ok(()),
+        };
+    };
 
-    let last = metadata.final_chunk == Some(true);
-    let request_id = metadata.request_id.clone();
+    let last = final_chunk == Some(true);
 
     let Some(worker) = workers.get(&request_id) else {
         // The worker is gone. Distinguish "already finished" (a fast upstream
@@ -1913,8 +2102,7 @@ async fn relay_response_back(
         completion_text.feed(&bytes);
         relay_response_chunk(tx, &spec.request_id, &bytes, &mut index)?;
     }
-    let metadata = RelayBinaryFrameMetadata {
-        r#type: RelayBinaryFrameType::ResponseBody,
+    let metadata = RelayBinaryFrameMetadata::ResponseBody {
         request_id: spec.request_id.clone(),
         chunk_id: index.to_string(),
         final_chunk: Some(true),
@@ -2244,7 +2432,15 @@ fn worker_send_control(tx: &SyncSender<FromWorker>, message: &ClientControlMessa
         | ClientControlMessage::RelayCancelled { request_id } => request_id.clone(),
         ClientControlMessage::Hello { .. }
         | ClientControlMessage::InventoryUpdate { .. }
-        | ClientControlMessage::Heartbeat { .. } => {
+        | ClientControlMessage::Heartbeat { .. }
+        | ClientControlMessage::TermPending { .. }
+        | ClientControlMessage::TermOpened { .. }
+        | ClientControlMessage::TermAttached { .. }
+        | ClientControlMessage::TermRejected { .. }
+        | ClientControlMessage::TermExit { .. }
+        | ClientControlMessage::ExecStarted { .. }
+        | ClientControlMessage::ExecRejected { .. }
+        | ClientControlMessage::ExecDone { .. } => {
             anyhow::bail!("worker emitted non-request relay control")
         }
     };
@@ -2261,7 +2457,7 @@ fn worker_send_binary(
     metadata: &RelayBinaryFrameMetadata,
     body: &[u8],
 ) -> Result<()> {
-    let request_id = metadata.request_id.clone();
+    let request_id = metadata.routing_id().to_string();
     let frame = encode_binary_frame(metadata, body)?;
     tx.send(FromWorker::Send {
         request_id,
@@ -2280,8 +2476,7 @@ fn relay_response_chunk(
     // A reqwest chunk is not bounded by the relay frame limit. Preserve the
     // response while splitting it into protocol-valid binary frames.
     for chunk in bytes.chunks(crate::protocol::RELAY_BINARY_CHUNK_MAX_BYTES) {
-        let metadata = RelayBinaryFrameMetadata {
-            r#type: RelayBinaryFrameType::ResponseBody,
+        let metadata = RelayBinaryFrameMetadata::ResponseBody {
             request_id: request_id.to_string(),
             chunk_id: index.to_string(),
             final_chunk: None,
@@ -2312,6 +2507,32 @@ where
         },
         "sending relay error",
     )?;
+    Ok(())
+}
+
+fn send_outbound_frames<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    frames: Vec<OutboundFrame>,
+) -> RelaySessionResult<()>
+where
+    S: std::io::Read + std::io::Write,
+{
+    for frame in frames {
+        match frame {
+            OutboundFrame::Control(message) => {
+                send_control(socket, &message, "sending terminal or exec frame")?;
+            }
+            OutboundFrame::Binary(metadata, body) => {
+                let encoded =
+                    encode_binary_frame(&metadata, &body).map_err(RelaySessionError::Fatal)?;
+                socket
+                    .send(Message::Binary(encoded.into()))
+                    .map_err(|error| {
+                        websocket_session_error(error, "sending terminal or exec frame", true)
+                    })?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2709,7 +2930,10 @@ mod tests {
                 panic!("expected binary response frame");
             };
             let (metadata, body) = parse_binary_frame(&encoded).expect("parse bounded frame");
-            assert_eq!(metadata.chunk_id, expected_index.to_string());
+            let RelayBinaryFrameMetadata::ResponseBody { chunk_id, .. } = metadata else {
+                panic!("expected a response body frame");
+            };
+            assert_eq!(chunk_id, expected_index.to_string());
             assert!(body.len() <= crate::protocol::RELAY_BINARY_CHUNK_MAX_BYTES);
             rebuilt.extend(body);
         }

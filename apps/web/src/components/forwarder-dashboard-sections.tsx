@@ -41,6 +41,7 @@ import { useId, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
+import { CliDeviceFeatureSwitches } from "@/components/cli-device-feature-switches";
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
 import { InlineRetry } from "@/components/inline-retry";
 import { SegmentedControl } from "@/components/segmented-control";
@@ -806,6 +807,8 @@ export function CliEndpointsModelsSection() {
                   {t("dashboard:metadata.delete")}
                 </Button>
               </div>
+
+              <CliDeviceFeatureSwitches cliDeviceId={device.id} device={device} />
 
               <div className="divide-y">
                 {device.endpoints.length === 0 ? (

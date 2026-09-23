@@ -119,6 +119,12 @@ import {
 import { MCP_SYNTHETIC_SESSION_TOKEN, type McpSessionUser } from "./context";
 import { createMcpTransport } from "./handler";
 
+vi.mock("../relay/cli-commands.js", () => ({
+  startCliCommand: vi.fn(),
+  waitCliCommand: vi.fn(),
+  snapshotCliCommand: vi.fn(),
+}));
+
 const BASE = "https://proxy.example.com";
 const RESOURCE = `${BASE}/mcp`;
 const TOKEN = "verified-access-token-value";
@@ -305,6 +311,7 @@ describe("createMcpRequestHandler — admission decisions", () => {
     expect(verified[0]?.orpcContext.session.user.id).toBe(SUB);
     expect(verified[0]?.orpcContext.session.session.token).toBe(MCP_SYNTHETIC_SESSION_TOKEN);
     expect(JSON.stringify(verified[0]?.orpcContext)).not.toContain(TOKEN);
+    expect(verified[0]?.credential).toEqual({ kind: "oauth" });
   });
 
   it("DPoP-presented credential is carried with the same AuthInfo shape", async () => {
@@ -1586,6 +1593,7 @@ describe("createMcpRequestHandler — personal token admission", () => {
       scopes: ["mcp:read"],
       expiresAt: null,
       lookupPrefix: "wsmp_mcp_aaaaaaaaaaaa",
+      allowCliCommands: false,
       ...overrides,
     };
   }
@@ -1603,6 +1611,7 @@ describe("createMcpRequestHandler — personal token admission", () => {
       scopes: ["mcp:read"],
       expiresAt: null,
       lookupPrefix: "wsmp_mcp_aaaaaaaaaaaa",
+      allowCliCommands: false,
     }));
     const { handler, transport, quota, verified } = buildHandler({
       authenticatePersonalToken,
@@ -1618,6 +1627,12 @@ describe("createMcpRequestHandler — personal token admission", () => {
     expect(transport.calls[0]?.authInfo?.scopes).toEqual(["mcp:read"]);
     expect(quota).toHaveBeenCalledWith(SUB, `pat:${PAT_ID}`);
     expect(verified[0]?.orpcContext.session.user.id).toBe(SUB);
+    expect(verified[0]?.credential).toEqual({
+      kind: "pat",
+      tokenId: PAT_ID,
+      allowCliCommands: false,
+      expiresAt: null,
+    });
   });
 
   it("an invalid personal token is 401 and never reaches the transport", async () => {
@@ -1745,8 +1760,8 @@ describe("createMcpRequestHandler — personal token admission", () => {
   it("identity.expiresAt synthesizes the exp claim — observed on AuthInfo exactly like a JWT exp", async () => {
     const expiresAt = new Date("2026-12-01T00:00:00Z");
     const exp = Math.floor(expiresAt.getTime() / 1000);
-    const { handler, transport } = buildHandler({
-      authenticatePersonalToken: async () => patIdentity({ expiresAt }),
+    const { handler, transport, verified } = buildHandler({
+      authenticatePersonalToken: async () => patIdentity({ expiresAt, allowCliCommands: true }),
       prisma: buildPrisma({ grant: patGrant() }),
     });
     const res = await callHandler(handler, mcpRequest({ authorization: `Bearer ${PAT}` }));
@@ -1754,5 +1769,11 @@ describe("createMcpRequestHandler — personal token admission", () => {
     const authInfo = transport.calls[0]?.authInfo;
     expect(authInfo?.expiresAt).toBe(exp);
     expect(authInfo?.extra).toMatchObject({ exp });
+    expect(verified[0]?.credential).toEqual({
+      kind: "pat",
+      tokenId: PAT_ID,
+      allowCliCommands: true,
+      expiresAt,
+    });
   });
 });

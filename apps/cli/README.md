@@ -60,7 +60,7 @@ wsmp service env-sync               # copy required env vars into the private se
 wsmp completions zsh                # shell completions
 ```
 
-Configuration is stored in a JSON file. `wsmp config path` prints the resolved path for the current platform. Logs go to stderr; pass `-v`/`-vv` for more, `--quiet` for less, or set `WSMP_LOG`.
+Configuration is stored in a JSON file. `wsmp config path` prints the resolved path for the current platform. `WSMP_CONFIG` selects that file. `WSMP_STATE_DIR` selects the state directory used by the daemon (PID file and control socket) and by `wsmp terminal approve` (pending and approved browser identities). When it is unset, the CLI uses `$XDG_STATE_HOME/ws-model-proxy` or `~/.local/state/ws-model-proxy`. Logs go to stderr; pass `-v`/`-vv` for more, `--quiet` for less, or set `WSMP_LOG`.
 
 ### Background daemon and user services
 

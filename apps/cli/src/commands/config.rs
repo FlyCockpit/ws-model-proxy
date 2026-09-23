@@ -31,6 +31,24 @@ enum Sub {
     SetServer { url: String },
     /// Set this CLI connection's slug.
     SetSlug { slug: String },
+    /// Allow browser terminals. Takes effect the next time wsmp starts.
+    SetHumanTerminal { state: Switch },
+    /// Allow MCP commands. Takes effect the next time wsmp starts.
+    SetMcpCommands { state: Switch },
+    /// Require approval before a browser can open a terminal.
+    SetTerminalApproval { state: Switch },
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum Switch {
+    On,
+    Off,
+}
+
+impl Switch {
+    fn enabled(self) -> bool {
+        matches!(self, Self::On)
+    }
 }
 
 pub fn run(args: &Args) -> Result<()> {
@@ -95,6 +113,48 @@ pub fn run(args: &Args) -> Result<()> {
                 output::line(format!("set CLI slug to `{slug}`"))?;
             }
         }
+        Sub::SetHumanTerminal { state } => {
+            set_flag(args.json, "allowHumanTerminal", state.enabled(), |cfg| {
+                cfg.allow_human_terminal = state.enabled();
+            })?;
+        }
+        Sub::SetMcpCommands { state } => {
+            set_flag(args.json, "allowMcpCommands", state.enabled(), |cfg| {
+                cfg.allow_mcp_commands = state.enabled();
+            })?;
+        }
+        Sub::SetTerminalApproval { state } => {
+            set_flag(
+                args.json,
+                "requireTerminalApproval",
+                state.enabled(),
+                |cfg| {
+                    cfg.require_terminal_approval = state.enabled();
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn set_flag(
+    json: bool,
+    key: &'static str,
+    value: bool,
+    mutate: impl FnOnce(&mut Config),
+) -> Result<()> {
+    Config::update(false, |cfg| {
+        mutate(cfg);
+        Ok(())
+    })?;
+    if json {
+        output::json(&SetFlag { key, value })?;
+    } else {
+        output::line(format!(
+            "set `{key}` to `{}`",
+            if value { "on" } else { "off" }
+        ))?;
+        output::line("Restart wsmp to apply.")?;
     }
     Ok(())
 }
@@ -131,4 +191,10 @@ impl ConfigInit {
 struct SetValue<'a> {
     key: &'static str,
     value: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct SetFlag {
+    key: &'static str,
+    value: bool,
 }

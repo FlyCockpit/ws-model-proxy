@@ -35,6 +35,7 @@ import { Route as LangAuthDashboardClisRouteImport } from './routes/$lang/_auth/
 import { Route as LangAuthDashboardModelApiTokensRouteImport } from './routes/$lang/_auth/dashboard/model-api-tokens'
 import { Route as LangAuthDashboardPoolsRouteImport } from './routes/$lang/_auth/dashboard/pools'
 import { Route as LangAuthDashboardRelayMetadataRouteImport } from './routes/$lang/_auth/dashboard/relay-metadata'
+import { Route as LangAuthDashboardTerminalsRouteImport } from './routes/$lang/_auth/dashboard/terminals'
 import { Route as LangAuthSettingsIndexRouteImport } from './routes/$lang/_auth/settings/index'
 import { Route as LangAuthSettingsMcpRouteImport } from './routes/$lang/_auth/settings/mcp'
 import { Route as LangAuthSettingsSecurityRouteImport } from './routes/$lang/_auth/settings/security'
@@ -182,6 +183,12 @@ const LangAuthDashboardRelayMetadataRoute =
     path: '/relay-metadata',
     getParentRoute: () => LangAuthDashboardRoute,
   } as any)
+const LangAuthDashboardTerminalsRoute =
+  LangAuthDashboardTerminalsRouteImport.update({
+    id: '/terminals',
+    path: '/terminals',
+    getParentRoute: () => LangAuthDashboardRoute,
+  } as any)
 const LangAuthSettingsIndexRoute = LangAuthSettingsIndexRouteImport.update({
   id: '/',
   path: '/',
@@ -278,6 +285,7 @@ export interface FileRoutesByFullPath {
   '/$lang/dashboard/model-api-tokens': typeof LangAuthDashboardModelApiTokensRoute
   '/$lang/dashboard/pools': typeof LangAuthDashboardPoolsRouteWithChildren
   '/$lang/dashboard/relay-metadata': typeof LangAuthDashboardRelayMetadataRoute
+  '/$lang/dashboard/terminals': typeof LangAuthDashboardTerminalsRoute
   '/$lang/settings/mcp': typeof LangAuthSettingsMcpRoute
   '/$lang/settings/security': typeof LangAuthSettingsSecurityRoute
   '/$lang/dashboard/': typeof LangAuthDashboardIndexRoute
@@ -312,6 +320,7 @@ export interface FileRoutesByTo {
   '/$lang/dashboard/clis': typeof LangAuthDashboardClisRoute
   '/$lang/dashboard/model-api-tokens': typeof LangAuthDashboardModelApiTokensRoute
   '/$lang/dashboard/relay-metadata': typeof LangAuthDashboardRelayMetadataRoute
+  '/$lang/dashboard/terminals': typeof LangAuthDashboardTerminalsRoute
   '/$lang/settings/mcp': typeof LangAuthSettingsMcpRoute
   '/$lang/settings/security': typeof LangAuthSettingsSecurityRoute
   '/$lang/dashboard': typeof LangAuthDashboardIndexRoute
@@ -352,6 +361,7 @@ export interface FileRoutesById {
   '/$lang/_auth/dashboard/model-api-tokens': typeof LangAuthDashboardModelApiTokensRoute
   '/$lang/_auth/dashboard/pools': typeof LangAuthDashboardPoolsRouteWithChildren
   '/$lang/_auth/dashboard/relay-metadata': typeof LangAuthDashboardRelayMetadataRoute
+  '/$lang/_auth/dashboard/terminals': typeof LangAuthDashboardTerminalsRoute
   '/$lang/_auth/settings/mcp': typeof LangAuthSettingsMcpRoute
   '/$lang/_auth/settings/security': typeof LangAuthSettingsSecurityRoute
   '/$lang/_auth/dashboard/': typeof LangAuthDashboardIndexRoute
@@ -393,6 +403,7 @@ export interface FileRouteTypes {
     | '/$lang/dashboard/model-api-tokens'
     | '/$lang/dashboard/pools'
     | '/$lang/dashboard/relay-metadata'
+    | '/$lang/dashboard/terminals'
     | '/$lang/settings/mcp'
     | '/$lang/settings/security'
     | '/$lang/dashboard/'
@@ -427,6 +438,7 @@ export interface FileRouteTypes {
     | '/$lang/dashboard/clis'
     | '/$lang/dashboard/model-api-tokens'
     | '/$lang/dashboard/relay-metadata'
+    | '/$lang/dashboard/terminals'
     | '/$lang/settings/mcp'
     | '/$lang/settings/security'
     | '/$lang/dashboard'
@@ -466,6 +478,7 @@ export interface FileRouteTypes {
     | '/$lang/_auth/dashboard/model-api-tokens'
     | '/$lang/_auth/dashboard/pools'
     | '/$lang/_auth/dashboard/relay-metadata'
+    | '/$lang/_auth/dashboard/terminals'
     | '/$lang/_auth/settings/mcp'
     | '/$lang/_auth/settings/security'
     | '/$lang/_auth/dashboard/'
@@ -670,6 +683,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LangAuthDashboardRelayMetadataRouteImport
       parentRoute: typeof LangAuthDashboardRoute
     }
+    '/$lang/_auth/dashboard/terminals': {
+      id: '/$lang/_auth/dashboard/terminals'
+      path: '/terminals'
+      fullPath: '/$lang/dashboard/terminals'
+      preLoaderRoute: typeof LangAuthDashboardTerminalsRouteImport
+      parentRoute: typeof LangAuthDashboardRoute
+    }
     '/$lang/_auth/settings/': {
       id: '/$lang/_auth/settings/'
       path: '/'
@@ -814,6 +834,7 @@ interface LangAuthDashboardRouteChildren {
   LangAuthDashboardModelApiTokensRoute: typeof LangAuthDashboardModelApiTokensRoute
   LangAuthDashboardPoolsRoute: typeof LangAuthDashboardPoolsRouteWithChildren
   LangAuthDashboardRelayMetadataRoute: typeof LangAuthDashboardRelayMetadataRoute
+  LangAuthDashboardTerminalsRoute: typeof LangAuthDashboardTerminalsRoute
   LangAuthDashboardIndexRoute: typeof LangAuthDashboardIndexRoute
 }
 
@@ -825,6 +846,7 @@ const LangAuthDashboardRouteChildren: LangAuthDashboardRouteChildren = {
   LangAuthDashboardModelApiTokensRoute: LangAuthDashboardModelApiTokensRoute,
   LangAuthDashboardPoolsRoute: LangAuthDashboardPoolsRouteWithChildren,
   LangAuthDashboardRelayMetadataRoute: LangAuthDashboardRelayMetadataRoute,
+  LangAuthDashboardTerminalsRoute: LangAuthDashboardTerminalsRoute,
   LangAuthDashboardIndexRoute: LangAuthDashboardIndexRoute,
 }
 

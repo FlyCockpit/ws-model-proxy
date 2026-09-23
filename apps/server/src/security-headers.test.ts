@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { describe, expect, it } from "vitest";
 
-import { mountSecurityHeaders } from "./security-headers";
+import { mountSecurityHeaders, withWebsocketConnectSources } from "./security-headers";
 
 function buildApp() {
   const app = new Hono();
@@ -29,6 +29,25 @@ describe("mountSecurityHeaders", () => {
     const res = await buildApp().request("/some-page");
     const csp = res.headers.get("content-security-policy") ?? "";
     expect(csp).toMatch(/form-action[^;]*'self'/);
+  });
+
+  it("adds explicit websocket forms of http and https origins", () => {
+    expect(
+      withWebsocketConnectSources([
+        "'self'",
+        "https://app.example.com",
+        "https://api.example.com",
+        "http://localhost:3001",
+      ]),
+    ).toEqual([
+      "'self'",
+      "https://app.example.com",
+      "wss://app.example.com",
+      "https://api.example.com",
+      "wss://api.example.com",
+      "http://localhost:3001",
+      "ws://localhost:3001",
+    ]);
   });
 
   it("allows same-origin blob workers for browser-side video compression", async () => {

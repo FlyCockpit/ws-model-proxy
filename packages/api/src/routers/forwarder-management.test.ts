@@ -75,6 +75,7 @@ const db = prisma as unknown as {
   cliDevice: {
     findMany: MockInstance;
     findUnique: MockInstance;
+    update: MockInstance;
     delete: MockInstance;
   };
   endpoint: {
@@ -3375,7 +3376,7 @@ describe("forwarderManagementRouter", () => {
       where: {
         poolId: "pool-id",
         tier: "PRIMARY",
-        ExecutionTarget: { ProviderModel: { isNot: null } },
+        ExecutionTarget: { providerModelId: { not: null } },
       },
       select: { id: true },
     });
@@ -4523,5 +4524,207 @@ describe("forwarderManagementRouter", () => {
       });
       expect(db.discoveredModel.delete).toHaveBeenCalledWith({ where: { id: "model-id" } });
     });
+  });
+});
+
+describe("setCliDeviceFeatureGrants", () => {
+  function grantsClient(userId = "user-id", hook?: (cliDeviceId: string) => void) {
+    return createRouterClient(forwarderManagementRouter, {
+      context: {
+        ...buildContext({ user: { id: userId } }),
+        services: hook ? { onCliFeatureGrantsChanged: hook } : undefined,
+      },
+    });
+  }
+
+  function deviceRow(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "cli-id",
+      userId: "user-id",
+      reportedHumanTerminal: true,
+      reportedMcpCommands: true,
+      reportedTerminalSupported: true,
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    db.cliDevice.update.mockResolvedValue({
+      id: "cli-id",
+      allowHumanTerminal: true,
+      allowMcpCommands: false,
+    });
+  });
+
+  it("uses the same not-found error for an unknown device and another user's device", async () => {
+    db.cliDevice.findUnique
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(deviceRow({ userId: "other-user" }));
+    const unknown = grantsClient()
+      .setCliDeviceFeatureGrants({ cliDeviceId: "missing", humanTerminal: false })
+      .catch((error: ORPCError) => error);
+    const foreign = grantsClient()
+      .setCliDeviceFeatureGrants({ cliDeviceId: "cli-id", humanTerminal: false })
+      .catch((error: ORPCError) => error);
+    const [unknownError, foreignError] = await Promise.all([unknown, foreign]);
+    expect(unknownError).toBeInstanceOf(ORPCError);
+    expect(foreignError).toBeInstanceOf(ORPCError);
+    if (!(unknownError instanceof ORPCError) || !(foreignError instanceof ORPCError)) return;
+    expect(unknownError.code).toBe("NOT_FOUND");
+    expect(foreignError.code).toBe("NOT_FOUND");
+    expect(unknownError.message).toBe(foreignError.message);
+    expect(db.cliDevice.update).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { reportedHumanTerminal: false, reportedTerminalSupported: true },
+    { reportedHumanTerminal: null, reportedTerminalSupported: true },
+    { reportedHumanTerminal: true, reportedTerminalSupported: false },
+    { reportedHumanTerminal: true, reportedTerminalSupported: null },
+  ])("rejects enabling the browser terminal when the CLI reports %j", async (reported) => {
+    db.cliDevice.findUnique.mockResolvedValue(deviceRow(reported));
+    await expect(
+      grantsClient().setCliDeviceFeatureGrants({ cliDeviceId: "cli-id", humanTerminal: true }),
+    ).rejects.toSatisfy((error: ORPCError) => error.code === "BAD_REQUEST");
+    expect(db.cliDevice.update).not.toHaveBeenCalled();
+  });
+
+  it.each([false, null])(
+    "rejects enabling MCP commands when the CLI reports %s",
+    async (reported) => {
+      db.cliDevice.findUnique.mockResolvedValue(deviceRow({ reportedMcpCommands: reported }));
+      await expect(
+        grantsClient().setCliDeviceFeatureGrants({ cliDeviceId: "cli-id", mcpCommands: true }),
+      ).rejects.toSatisfy((error: ORPCError) => error.code === "BAD_REQUEST");
+      expect(db.cliDevice.update).not.toHaveBeenCalled();
+    },
+  );
+
+  it("enables a reported terminal, allows disabling without a report, and fires the hook", async () => {
+    const hook = vi.fn();
+    db.cliDevice.findUnique.mockResolvedValue(deviceRow());
+    db.cliDevice.update.mockResolvedValue({
+      id: "cli-id",
+      allowHumanTerminal: true,
+      allowMcpCommands: false,
+    });
+    await expect(
+      grantsClient("user-id", hook).setCliDeviceFeatureGrants({
+        cliDeviceId: "cli-id",
+        humanTerminal: true,
+        mcpCommands: false,
+      }),
+    ).resolves.toEqual({
+      cliDeviceId: "cli-id",
+      humanTerminal: true,
+      mcpCommands: false,
+    });
+    expect(db.cliDevice.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "cli-id" },
+        data: { allowHumanTerminal: true, allowMcpCommands: false },
+      }),
+    );
+    expect(hook).toHaveBeenCalledWith("cli-id");
+
+    db.cliDevice.findUnique.mockResolvedValue(
+      deviceRow({
+        reportedHumanTerminal: null,
+        reportedMcpCommands: null,
+        reportedTerminalSupported: null,
+      }),
+    );
+    db.cliDevice.update.mockResolvedValue({
+      id: "cli-id",
+      allowHumanTerminal: false,
+      allowMcpCommands: false,
+    });
+    await expect(
+      grantsClient("user-id", hook).setCliDeviceFeatureGrants({
+        cliDeviceId: "cli-id",
+        humanTerminal: false,
+      }),
+    ).resolves.toMatchObject({ humanTerminal: false });
+    expect(hook).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not fire the hook when enabling is rejected", async () => {
+    const hook = vi.fn();
+    db.cliDevice.findUnique.mockResolvedValue(deviceRow({ reportedMcpCommands: null }));
+    await expect(
+      grantsClient("user-id", hook).setCliDeviceFeatureGrants({
+        cliDeviceId: "cli-id",
+        mcpCommands: true,
+      }),
+    ).rejects.toBeInstanceOf(ORPCError);
+    expect(hook).not.toHaveBeenCalled();
+  });
+
+  it("reports live terminal availability from the session snapshot and stored columns when offline", async () => {
+    db.cliDevice.findMany.mockResolvedValue([
+      {
+        id: "cli-id",
+        createdAt: new Date("2026-01-01"),
+        updatedAt: new Date("2026-01-02"),
+        slug: "desk",
+        label: "Desk",
+        status: "DISCONNECTED",
+        allowHumanTerminal: true,
+        allowMcpCommands: false,
+        cliVersion: "1.2.0",
+        relayProtocolVersion: "2.4",
+        reportedHumanTerminal: true,
+        reportedMcpCommands: false,
+        reportedTerminalSupported: true,
+        User: { slug: "owner" },
+        Endpoints: [],
+      },
+    ]);
+    const offline = await createRouterClient(forwarderManagementRouter, {
+      context: buildContext(),
+    }).listCliDevices();
+    expect(offline[0]?.features).toEqual({
+      terminal: {
+        granted: true,
+        deviceAllows: true,
+        supported: true,
+        live: false,
+        available: false,
+      },
+      commands: {
+        granted: false,
+        deviceAllows: false,
+        live: false,
+        available: false,
+      },
+    });
+    expect(offline[0]?.cliVersion).toBe("1.2.0");
+    expect(offline[0]?.relayProtocolVersion).toBe("2.4");
+
+    const live = await createRouterClient(forwarderManagementRouter, {
+      context: {
+        ...buildContext(),
+        services: {
+          getLiveCliFeatures: () =>
+            new Map([
+              [
+                "cli-id",
+                {
+                  protocolVersion: "2.4",
+                  cliVersion: "1.2.0",
+                  humanTerminal: true,
+                  mcpCommands: false,
+                  terminalSupported: true,
+                  terminalApproval: false,
+                  terminalPublicKey: "key",
+                },
+              ],
+            ]),
+        },
+      },
+    }).listCliDevices();
+    expect(live[0]?.features.terminal).toMatchObject({ live: true, available: true });
+    expect(live[0]?.features.commands).toMatchObject({ live: false, available: false });
   });
 });

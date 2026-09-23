@@ -2,6 +2,12 @@ import { betterAuth } from "better-auth";
 import { memoryAdapter } from "better-auth/adapters/memory";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+vi.mock("./relay/cli-commands.js", () => ({
+  startCliCommand: vi.fn(),
+  waitCliCommand: vi.fn(),
+  snapshotCliCommand: vi.fn(),
+}));
+
 /**
  * /mcp CHAIN-ORDER contract tests (Phase 4 items 6-7) — the REAL
  * output of `createApp()` with only process dependencies mocked (the

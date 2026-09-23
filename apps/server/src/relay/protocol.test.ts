@@ -197,6 +197,188 @@ describe("relayProtocol", () => {
   });
 });
 
+function endpoint() {
+  return {
+    slug: "local-openai",
+    label: "Local OpenAI",
+    kind: "openai-compatible",
+    status: "online",
+    defaultCapabilities: {
+      version: 1,
+      protocol: "openai-compatible",
+      chatCompletions: { supported: true },
+    },
+    models: [],
+  };
+}
+
+function uncompressedKey(prefix = 0x04): string {
+  const bytes = Buffer.alloc(65, 9);
+  bytes[0] = prefix;
+  return bytes.toString("base64url");
+}
+
+function bytes16(): string {
+  return Buffer.alloc(16, 7).toString("base64url");
+}
+
+function hello(protocolVersion: "2.0" | "2.1" | "2.2" | "2.3" | "2.4", capabilities: unknown) {
+  return JSON.stringify({
+    type: "hello",
+    id: "hello-id",
+    protocolVersion,
+    cli: { slug: "desktop", label: "Desktop", version: "1.8.0", capabilities },
+    endpoints: [endpoint()],
+  });
+}
+
+describe("relay protocol 2.4", () => {
+  const shared = {
+    inventoryAck: true,
+    inventoryReplace: true,
+    endpointTargeting: true,
+    binaryFrames: true,
+    cancellation: true,
+    maxBinaryChunkBytes: 1024 * 1024,
+    requestBodyStreaming: true,
+    requestBodyWindowChunks: 16,
+  };
+
+  it("accepts 2.0 through 2.3 hellos unchanged", () => {
+    expect(
+      parseRelayClientControlFrame(
+        hello("2.0", {
+          protocolVersion: "2.0",
+          binaryFrames: true,
+          cancellation: true,
+          maxBinaryChunkBytes: 1024 * 1024,
+          requestBodyStreaming: true,
+          requestBodyWindowChunks: 16,
+        }),
+      ).type,
+    ).toBe("hello");
+    expect(
+      parseRelayClientControlFrame(hello("2.1", { protocolVersion: "2.1", ...shared })).type,
+    ).toBe("hello");
+    expect(
+      parseRelayClientControlFrame(
+        hello("2.2", { protocolVersion: "2.2", ...shared, sharedTokenizerTps: true }),
+      ).type,
+    ).toBe("hello");
+    expect(
+      parseRelayClientControlFrame(
+        hello("2.3", {
+          protocolVersion: "2.3",
+          ...shared,
+          sharedTokenizerTps: true,
+          standardizedMetrics: true,
+        }),
+      ).type,
+    ).toBe("hello");
+  });
+
+  it("parses a 2.4 hello and rejects a mismatched capability version", () => {
+    const parsed = parseRelayClientControlFrame(
+      hello("2.4", {
+        protocolVersion: "2.4",
+        ...shared,
+        sharedTokenizerTps: true,
+        standardizedMetrics: true,
+        terminal: true,
+        exec: true,
+        features: {
+          humanTerminal: true,
+          mcpCommands: false,
+          terminalApproval: true,
+          terminalSupported: true,
+        },
+        terminalPublicKey: uncompressedKey(),
+      }),
+    );
+    expect(parsed).toMatchObject({ type: "hello", protocolVersion: "2.4" });
+
+    expect(() =>
+      parseRelayClientControlFrame(
+        hello("2.4", {
+          protocolVersion: "2.3",
+          ...shared,
+          sharedTokenizerTps: true,
+          standardizedMetrics: true,
+        }),
+      ),
+    ).toThrow();
+    expect(() =>
+      parseRelayClientControlFrame(
+        hello("2.4", {
+          protocolVersion: "2.4",
+          ...shared,
+          sharedTokenizerTps: true,
+          standardizedMetrics: true,
+          terminal: true,
+          exec: true,
+          features: {
+            humanTerminal: true,
+            mcpCommands: true,
+            terminalApproval: false,
+            terminalSupported: true,
+          },
+          terminalPublicKey: uncompressedKey(0x02),
+        }),
+      ),
+    ).toThrow();
+  });
+
+  it("rejects unknown keys on terminal and exec frames", () => {
+    const opened = parseRelayClientControlFrame(
+      JSON.stringify({ type: "term.opened", terminalId: bytes16(), cliNonce: bytes16() }),
+    );
+    expect(opened).toMatchObject({ type: "term.opened" });
+    expect(() =>
+      parseRelayClientControlFrame(
+        JSON.stringify({
+          type: "term.opened",
+          terminalId: bytes16(),
+          cliNonce: bytes16(),
+          extra: true,
+        }),
+      ),
+    ).toThrow();
+    expect(() =>
+      parseRelayClientControlFrame(
+        JSON.stringify({
+          type: "exec.done",
+          commandId: bytes16(),
+          timedOut: false,
+          unexpected: 1,
+        }),
+      ),
+    ).toThrow();
+    const done = parseRelayClientControlFrame(
+      JSON.stringify({ type: "exec.done", commandId: bytes16(), timedOut: true, exitCode: 0 }),
+    );
+    expect(done).toMatchObject({ type: "exec.done", timedOut: true });
+  });
+
+  it("round-trips sealed terminal and exec output metadata", () => {
+    const body = new Uint8Array([9, 8, 7]);
+    const sealed = parseRelayBinaryFrame(
+      encodeRelayBinaryFrame({ type: "term.sealed", terminalId: bytes16(), seq: 4 }, body),
+    );
+    expect(sealed.metadata).toEqual({ type: "term.sealed", terminalId: bytes16(), seq: 4 });
+    const stdout = parseRelayBinaryFrame(
+      encodeRelayBinaryFrame({ type: "exec.stdout", commandId: bytes16(), seq: 1 }, body),
+    );
+    expect(stdout.metadata.type).toBe("exec.stdout");
+    const metadataBytes = new TextEncoder().encode(
+      JSON.stringify({ type: "term.sealed", terminalId: bytes16(), seq: 1, extra: true }),
+    );
+    const extra = new Uint8Array(4 + metadataBytes.byteLength);
+    new DataView(extra.buffer).setUint32(0, metadataBytes.byteLength, false);
+    extra.set(metadataBytes, 4);
+    expect(() => parseRelayBinaryFrame(extra.buffer)).toThrow();
+  });
+});
+
 describe("sanitizeRelayRequestHeaders", () => {
   it("strips bearer credentials, cookies, hop-by-hop headers, and token material", () => {
     const headers = sanitizeRelayRequestHeaders({

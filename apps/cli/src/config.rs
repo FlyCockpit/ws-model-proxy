@@ -128,6 +128,15 @@ pub struct Config {
     /// own origin is always trusted; these are additive.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub media_trusted_origins: Vec<String>,
+    /// Browser terminal master switch. Read once when the relay starts.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_human_terminal: bool,
+    /// MCP command master switch. Read once when the relay starts.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_mcp_commands: bool,
+    /// Require a locally approved browser identity before opening a terminal.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub require_terminal_approval: bool,
 }
 
 impl Default for Config {
@@ -140,6 +149,9 @@ impl Default for Config {
             cli_token_env: None,
             endpoints: Vec::new(),
             media_trusted_origins: Vec::new(),
+            allow_human_terminal: false,
+            allow_mcp_commands: false,
+            require_terminal_approval: false,
         }
     }
 }

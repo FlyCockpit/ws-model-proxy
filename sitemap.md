@@ -27,6 +27,7 @@ All require an active session, enforced by the `_auth` layout.
 | `/{lang}/dashboard` | Main dashboard landing page. |
 | `/{lang}/dashboard/chat-test` | Authenticated model chat test surface. |
 | `/{lang}/dashboard/clis` | Own CLI devices and discovered endpoint/model metadata. |
+| `/{lang}/dashboard/terminals` | Browser terminals on the user's own CLIs. |
 | `/{lang}/dashboard/cli-tokens` | Own manually created CLI tokens. |
 | `/{lang}/dashboard/model-api-tokens` | Own OpenAI-compatible model API tokens. |
 | `/{lang}/dashboard/pools` | Own model pools and provider operations; pool cards lead to their dedicated detail pages. |

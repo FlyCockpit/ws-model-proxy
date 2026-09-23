@@ -1,3 +1,4 @@
+import type { LiveCliFeatureSnapshot } from "@ws-model-proxy/api/context";
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
 import { suggestedConnectionSurface } from "@ws-model-proxy/api/lib/model-connection-type";
 import {
@@ -20,16 +21,22 @@ import {
   encodeRelayServerControlMessage,
   parseRelayBinaryFrame,
   parseRelayClientControlFrame,
-  RELAY_PROTOCOL_VERSION,
   RELAY_REQUEST_BODY_WINDOW_CHUNKS,
   RELAY_STALE_AFTER_MS,
   RELAY_UNREGISTERED_STALE_AFTER_MS,
   type RelayBinaryFrameMetadata,
   type RelayClientControlMessage,
   type RelayFailure,
+  type RelayProtocolVersion,
+  type RelayResponseBodyMetadata,
   type RelayServerControlMessage,
+  type TerminalHandshakeIdentity,
 } from "./protocol.js";
-import { persistRelayRegistration, RelayRegistrationError } from "./registration.js";
+import {
+  persistRelayRegistration,
+  RelayRegistrationError,
+  type ReportedRelayFeatures,
+} from "./registration.js";
 
 const WS_READY_STATE_OPEN = 1;
 
@@ -63,6 +70,79 @@ async function closeBodyStream(stream: OutboundBodyStream | undefined) {
   }
 }
 
+export type CliReportedFeatures = {
+  humanTerminal: boolean;
+  mcpCommands: boolean;
+  terminalApproval: boolean;
+  terminalSupported: boolean;
+};
+
+export type TrackedCliCommand = {
+  commandId: string;
+  cliDeviceId: string;
+  status: "running" | "exited" | "cancelled" | "rejected";
+  markCancelled(): void;
+  markStarted(): void;
+  markRejected(reason: string): void;
+  markDone(result: { exitCode?: number; signal?: string; timedOut: boolean }): void;
+  appendOutput(stream: "stdout" | "stderr", body: Uint8Array): void;
+};
+
+export type TerminalRecord = {
+  terminalId: string;
+  userId: string;
+  cliDeviceId: string;
+  label: string;
+  cols: number;
+  rows: number;
+  viewerId: string | null;
+  /** Set while a replacement viewer is waiting for approval. The current viewer stays. */
+  pendingViewerId: string | null;
+  phase: "pending" | "opening" | "open";
+  createdAt: number;
+};
+
+export type TerminalLifecycleEvent =
+  | {
+      type: "opened" | "attached" | "pending";
+      terminalId: string;
+      viewerId: string | null;
+      cliPublicKey: string;
+      cliNonce: string;
+      approvalCode?: string;
+    }
+  | {
+      type: "rejected";
+      terminalId: string;
+      viewerId: string | null;
+      reason: string;
+      approvalCode?: string;
+    }
+  | {
+      type: "exit";
+      terminalId: string;
+      viewerId: string | null;
+      exitCode?: number;
+      signal?: string;
+    }
+  | { type: "detached"; terminalId: string; viewerId: string }
+  | { type: "sealed"; terminalId: string; viewerId: string | null; seq: number; body: Uint8Array };
+
+type TerminalBridge = {
+  onTerminalEvent(event: TerminalLifecycleEvent): void;
+};
+
+let terminalBridge: TerminalBridge | null = null;
+
+export function registerTerminalBridge(bridge: TerminalBridge) {
+  terminalBridge = bridge;
+}
+
+const TERMINAL_USER_LIMIT = 4;
+const TERMINAL_CLI_LIMIT = 2;
+const TERMINAL_PENDING_TTL_MS = 2 * 60 * 1000;
+const RELAY_JSON_CONTROL_MAX_BYTES = 64 * 1024;
+
 type SessionState = {
   socket: RelaySocket;
   identity: CliWebsocketIdentity;
@@ -73,6 +153,14 @@ type SessionState = {
   registered: boolean;
   inventoryConfirmed: boolean;
   endpointTargeting: boolean;
+  protocolVersion: RelayProtocolVersion | null;
+  cliVersion: string | null;
+  features: CliReportedFeatures | null;
+  terminalPublicKey: string | null;
+  allowHumanTerminal: boolean;
+  allowMcpCommands: boolean;
+  terminalsById: Map<string, TerminalRecord>;
+  commandsById: Map<string, TrackedCliCommand>;
   unauthenticatedTimer: ReturnType<typeof setTimeout>;
   bodyStreamsByRequest: Map<string, OutboundBodyStream>;
 };
@@ -81,7 +169,7 @@ export type ActiveRelayResponseHandlers = {
   /** Called only after request-body bytes have been accepted by the relay socket. */
   onRequestBodySent?(byteLength: number): void;
   onHeaders(message: Extract<RelayClientControlMessage, { type: "relay.response.headers" }>): void;
-  onBody(chunk: Uint8Array, metadata: RelayBinaryFrameMetadata): void;
+  onBody(chunk: Uint8Array, metadata: RelayResponseBodyMetadata): void;
   onComplete(message: Extract<RelayClientControlMessage, { type: "relay.complete" }>): void;
   onError(message: Extract<RelayClientControlMessage, { type: "relay.error" }>): void;
   onCancelled(message: Extract<RelayClientControlMessage, { type: "relay.cancelled" }>): void;
@@ -90,6 +178,62 @@ export type ActiveRelayResponseHandlers = {
 type ActiveRelayRequest = ActiveRelayResponseHandlers & {
   cliDeviceId: string;
 };
+
+function reportedFeaturesFromHello(
+  message: Extract<RelayClientControlMessage, { type: "hello" }>,
+  now: Date,
+): ReportedRelayFeatures {
+  const cliVersion = message.cli.version ?? null;
+  if (message.protocolVersion === "2.4" && message.cli.capabilities.protocolVersion === "2.4") {
+    const features = message.cli.capabilities.features;
+    return {
+      cliVersion,
+      relayProtocolVersion: "2.4",
+      reportedHumanTerminal: features.humanTerminal,
+      reportedMcpCommands: features.mcpCommands,
+      reportedTerminalApproval: features.terminalApproval,
+      reportedTerminalSupported: features.terminalSupported,
+      featuresReportedAt: now,
+    };
+  }
+  return {
+    cliVersion,
+    relayProtocolVersion: message.protocolVersion,
+    reportedHumanTerminal: null,
+    reportedMcpCommands: null,
+    reportedTerminalApproval: null,
+    reportedTerminalSupported: null,
+    featuresReportedAt: null,
+  };
+}
+
+function interactiveTargetFromBinary(
+  frame: ArrayBuffer,
+): { kind: "terminal" | "command"; id: string } | null {
+  if (frame.byteLength < 4) return null;
+  const metadataLength = new DataView(frame).getUint32(0, false);
+  if (metadataLength > RELAY_JSON_CONTROL_MAX_BYTES || frame.byteLength < 4 + metadataLength) {
+    return null;
+  }
+  try {
+    const text = new TextDecoder().decode(new Uint8Array(frame, 4, metadataLength));
+    const parsed: unknown = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object") return null;
+    const record = parsed as Record<string, unknown>;
+    if (record.type === "term.sealed" && typeof record.terminalId === "string") {
+      return { kind: "terminal", id: record.terminalId };
+    }
+    if (
+      (record.type === "exec.stdout" || record.type === "exec.stderr") &&
+      typeof record.commandId === "string"
+    ) {
+      return { kind: "command", id: record.commandId };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 function closeWithProtocolError(socket: RelaySocket, message: string) {
   if (socket.readyState === WS_READY_STATE_OPEN) {
@@ -108,6 +252,8 @@ export class RelaySessionManager {
   private sessionsBySocket = new Map<RelaySocket, SessionState>();
   private sessionsByCliDeviceId = new Map<string, SessionState>();
   private activeRelayRequests = new Map<string, ActiveRelayRequest>();
+  /** True once shutdown has started refusing new relay work and closing idle sockets. */
+  private relayDrain = false;
   private readonly poolMemberRecovery = new PoolMemberRecoveryScheduler({
     getOwnedCliDeviceIds: () => this.getActiveCliDeviceIds(),
     listDueMembers: listDueOwnedPoolMemberRecoveries,
@@ -141,6 +287,14 @@ export class RelaySessionManager {
       registered: false,
       inventoryConfirmed: false,
       endpointTargeting: false,
+      protocolVersion: null,
+      cliVersion: null,
+      features: null,
+      terminalPublicKey: null,
+      allowHumanTerminal: false,
+      allowMcpCommands: false,
+      terminalsById: new Map(),
+      commandsById: new Map(),
       unauthenticatedTimer,
       bodyStreamsByRequest: new Map(),
     });
@@ -152,6 +306,7 @@ export class RelaySessionManager {
     try {
       message = parseRelayClientControlFrame(frame);
     } catch (error) {
+      if (this.isolateMalformedInteractiveFrame(session, frame)) return;
       const description = describeRelayControlParseError(error);
       if (description.kind === "oversize") {
         console.error("[relay] control frame exceeds 64 KiB");
@@ -184,6 +339,7 @@ export class RelaySessionManager {
           inventoryConfirmed: message.protocolVersion !== "2.0",
           endpointTargeting: message.protocolVersion !== "2.0",
           connection: true,
+          reported: reportedFeaturesFromHello(message, now),
           now,
         });
         session.cliDeviceId = registration.cliDeviceId;
@@ -191,15 +347,30 @@ export class RelaySessionManager {
         session.registered = true;
         session.inventoryConfirmed = message.protocolVersion !== "2.0";
         session.endpointTargeting = message.protocolVersion !== "2.0";
+        session.protocolVersion = message.protocolVersion;
+        session.cliVersion = message.cli.version ?? null;
+        session.allowHumanTerminal = registration.allowHumanTerminal;
+        session.allowMcpCommands = registration.allowMcpCommands;
+        if (
+          message.protocolVersion === "2.4" &&
+          message.cli.capabilities.protocolVersion === "2.4"
+        ) {
+          session.features = message.cli.capabilities.features;
+          session.terminalPublicKey = message.cli.capabilities.terminalPublicKey;
+        } else {
+          session.features = null;
+          session.terminalPublicKey = null;
+        }
         session.lastHeartbeatAt = now;
         clearTimeout(session.unauthenticatedTimer);
+        this.reconcileInteractiveGrants(session);
         this.replaceDuplicateSession(session);
         this.poolMemberRecovery.wake();
         socket.send(
           encodeRelayServerControlMessage({
             type: "hello.ok",
             id: message.id,
-            protocolVersion: RELAY_PROTOCOL_VERSION,
+            protocolVersion: message.protocolVersion,
             revision: registration.revision,
             desiredCapabilities: registration.desiredCapabilities,
           }),
@@ -300,34 +471,94 @@ export class RelaySessionManager {
     }
 
     if (message.type === "relay.complete") {
-      const activeRequest = this.activeRelayRequests.get(message.requestId);
+      const activeRequest = this.takeActiveRelayRequest(message.requestId);
       if (!activeRequest) return;
-      this.activeRelayRequests.delete(message.requestId);
       activeRequest.onComplete(message);
+      this.considerDrainClose(activeRequest.cliDeviceId);
       return;
     }
 
     if (message.type === "relay.error") {
-      const activeRequest = this.activeRelayRequests.get(message.requestId);
+      const activeRequest = this.takeActiveRelayRequest(message.requestId);
       if (!activeRequest) return;
-      this.activeRelayRequests.delete(message.requestId);
       activeRequest.onError(message);
+      this.considerDrainClose(activeRequest.cliDeviceId);
       return;
     }
 
     if (message.type === "relay.cancelled") {
-      const activeRequest = this.activeRelayRequests.get(message.requestId);
+      const activeRequest = this.takeActiveRelayRequest(message.requestId);
       if (!activeRequest) return;
-      this.activeRelayRequests.delete(message.requestId);
       activeRequest.onCancelled(message);
+      this.considerDrainClose(activeRequest.cliDeviceId);
+      return;
+    }
+
+    if (
+      message.type === "term.pending" ||
+      message.type === "term.opened" ||
+      message.type === "term.attached" ||
+      message.type === "term.rejected" ||
+      message.type === "term.exit"
+    ) {
+      this.handleTerminalControl(session, message);
+      return;
+    }
+
+    if (
+      message.type === "exec.started" ||
+      message.type === "exec.rejected" ||
+      message.type === "exec.done"
+    ) {
+      this.handleExecControl(session, message);
     }
   }
 
   handleBinaryFrame(socket: RelaySocket, frame: ArrayBuffer) {
-    this.requireSession(socket);
-    const parsed = parseRelayBinaryFrame(frame);
-    if (parsed.metadata.type !== "relay.response.body") return;
-    this.activeRelayRequests.get(parsed.metadata.requestId)?.onBody(parsed.body, parsed.metadata);
+    try {
+      const session = this.sessionsBySocket.get(socket);
+      if (!session) return;
+      const parsed = parseRelayBinaryFrame(frame);
+      if (parsed.metadata.type === "relay.response.body") {
+        this.activeRelayRequests
+          .get(parsed.metadata.requestId)
+          ?.onBody(parsed.body, parsed.metadata);
+        return;
+      }
+      if (parsed.metadata.type === "term.sealed") {
+        this.forwardSealedToBrowser(
+          session,
+          parsed.metadata.terminalId,
+          parsed.metadata.seq,
+          parsed.body,
+        );
+        return;
+      }
+      if (parsed.metadata.type === "exec.stdout" || parsed.metadata.type === "exec.stderr") {
+        const command = session.commandsById.get(parsed.metadata.commandId);
+        if (!command) return;
+        if (command.status !== "running") return;
+        command.appendOutput(
+          parsed.metadata.type === "exec.stdout" ? "stdout" : "stderr",
+          parsed.body,
+        );
+      }
+    } catch (error) {
+      const target = interactiveTargetFromBinary(frame);
+      if (target?.kind === "terminal") {
+        const session = this.sessionsBySocket.get(socket);
+        const terminal = session?.terminalsById.get(target.id);
+        if (session && terminal) this.closeTerminal(session, terminal, false);
+      } else if (target?.kind === "command") {
+        const session = this.sessionsBySocket.get(socket);
+        const command = session?.commandsById.get(target.id);
+        if (session && command?.status === "running") this.cancelTrackedCommand(session, command);
+      }
+      console.error(
+        "[relay] binary frame rejected",
+        error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+      );
+    }
   }
 
   async removeSession(socket: RelaySocket, now = new Date()) {
@@ -357,11 +588,12 @@ export class RelaySessionManager {
   ) {
     const session = this.sessionsBySocket.get(socket);
     if (!session) return;
+    this.teardownInteractiveWork(session);
     clearTimeout(session.unauthenticatedTimer);
     this.sessionsBySocket.delete(socket);
+    this.failActiveRequestsForSession(session);
     if (session.cliDeviceId && this.sessionsByCliDeviceId.get(session.cliDeviceId) === session) {
       this.sessionsByCliDeviceId.delete(session.cliDeviceId);
-      this.failActiveRequestsForCli(session.cliDeviceId);
       await prisma.cliDevice.update({
         where: { id: session.cliDeviceId },
         data: { status: cliStatus, lastDisconnectedAt: now },
@@ -384,6 +616,7 @@ export class RelaySessionManager {
         now.getTime() - session.lastHeartbeatAt.getTime() > RELAY_STALE_AFTER_MS,
     );
     for (const session of staleSessions) {
+      this.teardownInteractiveWork(session);
       session.socket.close(1001, "stale");
       await this.removeSessionWithStatus(session.socket, {
         now,
@@ -391,6 +624,333 @@ export class RelaySessionManager {
         failureClass: "STALE_SESSION",
       });
     }
+  }
+
+  /**
+   * Start of HTTP drain. New relay work is refused. Sockets with no in-flight
+   * model request are closed now so they cannot hold `server.close()`. A socket
+   * that still has a request stays up until that request finishes or the drain
+   * timeout force-closes every connection.
+   */
+  async closeIdleRelaySessions(now = new Date()) {
+    this.relayDrain = true;
+    await this.shutdownRelaySessions(
+      [...this.sessionsBySocket.values()].filter(
+        (session) => !this.sessionHasActiveRelayWork(session),
+      ),
+      now,
+    );
+  }
+
+  /** Shutdown step: cancel interactive work, close remaining CLI sockets, mark devices disconnected. */
+  async closeRelaySessions(now = new Date()) {
+    this.relayDrain = true;
+    await this.shutdownRelaySessions([...this.sessionsBySocket.values()], now);
+  }
+
+  private async shutdownRelaySessions(sessions: SessionState[], now: Date) {
+    let failure: unknown;
+    for (const session of sessions) {
+      try {
+        await this.shutdownRelaySession(session, now);
+      } catch (error) {
+        failure = error;
+        console.error(
+          "[relay] closeRelaySessions failed",
+          error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+        );
+      }
+    }
+    if (failure) throw failure instanceof Error ? failure : new Error("closeRelaySessions failed");
+  }
+
+  private async shutdownRelaySession(session: SessionState, now: Date) {
+    if (!this.sessionsBySocket.has(session.socket)) return;
+    this.teardownInteractiveWork(session);
+    if (session.socket.readyState === WS_READY_STATE_OPEN) {
+      session.socket.close(1001, "shutdown");
+    }
+    await this.removeSessionWithStatus(session.socket, {
+      now,
+      cliStatus: "DISCONNECTED",
+      failureClass: "WEBSOCKET_DISCONNECTED",
+    });
+  }
+
+  private sessionHasActiveRelayWork(session: SessionState): boolean {
+    if (session.bodyStreamsByRequest.size > 0) return true;
+    if (!session.cliDeviceId) return false;
+    for (const active of this.activeRelayRequests.values()) {
+      if (active.cliDeviceId === session.cliDeviceId) return true;
+    }
+    return false;
+  }
+
+  private takeActiveRelayRequest(requestId: string): ActiveRelayRequest | undefined {
+    const active = this.activeRelayRequests.get(requestId);
+    if (!active) return undefined;
+    this.activeRelayRequests.delete(requestId);
+    return active;
+  }
+
+  /** During drain, close a CLI socket once its last model request has finished. */
+  private considerDrainClose(cliDeviceId: string | null | undefined) {
+    if (!this.relayDrain || !cliDeviceId) return;
+    const session = this.sessionsByCliDeviceId.get(cliDeviceId);
+    if (!session || this.sessionHasActiveRelayWork(session)) return;
+    void this.shutdownRelaySession(session, new Date()).catch((error: unknown) => {
+      console.error(
+        "[relay] idle session close failed",
+        error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+      );
+    });
+  }
+
+  async onCliFeatureGrantsChanged(cliDeviceId: string) {
+    const device = await prisma.cliDevice.findUnique({
+      where: { id: cliDeviceId },
+      select: { allowHumanTerminal: true, allowMcpCommands: true },
+    });
+    this.applyFeatureGrants(cliDeviceId, {
+      allowHumanTerminal: device?.allowHumanTerminal === true,
+      allowMcpCommands: device?.allowMcpCommands === true,
+    });
+  }
+
+  applyFeatureGrants(
+    cliDeviceId: string,
+    grants: { allowHumanTerminal: boolean; allowMcpCommands: boolean },
+  ) {
+    const session = this.sessionsByCliDeviceId.get(cliDeviceId);
+    if (!session) return;
+    session.allowHumanTerminal = grants.allowHumanTerminal;
+    session.allowMcpCommands = grants.allowMcpCommands;
+    this.reconcileInteractiveGrants(session);
+  }
+
+  getLiveCliFeatures(cliDeviceIds: readonly string[]): Map<string, LiveCliFeatureSnapshot> {
+    const snapshots = new Map<string, LiveCliFeatureSnapshot>();
+    for (const cliDeviceId of cliDeviceIds) {
+      const session = this.sessionsByCliDeviceId.get(cliDeviceId);
+      if (!session?.registered || !session.protocolVersion) continue;
+      snapshots.set(cliDeviceId, {
+        protocolVersion: session.protocolVersion,
+        cliVersion: session.cliVersion,
+        humanTerminal: session.features?.humanTerminal ?? false,
+        mcpCommands: session.features?.mcpCommands ?? false,
+        terminalSupported: session.features?.terminalSupported ?? false,
+        terminalApproval: session.features?.terminalApproval ?? false,
+        terminalPublicKey: session.protocolVersion === "2.4" ? session.terminalPublicKey : null,
+      });
+    }
+    return snapshots;
+  }
+
+  terminalCounts(userId: string, cliDeviceId: string): { user: number; cli: number } {
+    let user = 0;
+    let cli = 0;
+    for (const session of this.sessionsByCliDeviceId.values()) {
+      for (const terminal of session.terminalsById.values()) {
+        if (terminal.phase === "pending") continue;
+        if (terminal.userId === userId) user += 1;
+        if (terminal.cliDeviceId === cliDeviceId) cli += 1;
+      }
+    }
+    return { user, cli };
+  }
+
+  hasTerminal(terminalId: string): boolean {
+    for (const session of this.sessionsByCliDeviceId.values()) {
+      if (session.terminalsById.has(terminalId)) return true;
+    }
+    return false;
+  }
+
+  listTerminalsForUser(userId: string): Array<{
+    terminalId: string;
+    cliDeviceId: string;
+    label: string;
+    viewerAttached: boolean;
+  }> {
+    const terminals: Array<{
+      terminalId: string;
+      cliDeviceId: string;
+      label: string;
+      viewerAttached: boolean;
+    }> = [];
+    for (const session of this.sessionsByCliDeviceId.values()) {
+      for (const terminal of session.terminalsById.values()) {
+        if (terminal.userId !== userId) continue;
+        terminals.push({
+          terminalId: terminal.terminalId,
+          cliDeviceId: terminal.cliDeviceId,
+          label: terminal.label,
+          viewerAttached: terminal.viewerId !== null,
+        });
+      }
+    }
+    return terminals;
+  }
+
+  /**
+   * Open a terminal on a 2.4 session that already passed eligibility.
+   * Returns false without sending when the CLI cannot accept term.open.
+   */
+  startTerminal(input: {
+    terminalId: string;
+    userId: string;
+    cliDeviceId: string;
+    label: string;
+    cols: number;
+    rows: number;
+    browserPublicKey: string;
+    browserNonce: string;
+    identity?: TerminalHandshakeIdentity;
+    viewerId: string;
+  }): boolean {
+    const session = this.sessionsByCliDeviceId.get(input.cliDeviceId);
+    if (!session || !this.canStartTerminal(session)) return false;
+    if (this.hasTerminal(input.terminalId)) return false;
+    const approvalRequired = session.features?.terminalApproval === true;
+    const counts = this.terminalCounts(input.userId, input.cliDeviceId);
+    if (
+      !approvalRequired &&
+      (counts.user >= TERMINAL_USER_LIMIT || counts.cli >= TERMINAL_CLI_LIMIT)
+    ) {
+      return false;
+    }
+    const terminal: TerminalRecord = {
+      terminalId: input.terminalId,
+      userId: input.userId,
+      cliDeviceId: input.cliDeviceId,
+      label: input.label,
+      cols: input.cols,
+      rows: input.rows,
+      viewerId: input.viewerId,
+      pendingViewerId: null,
+      phase: approvalRequired ? "pending" : "opening",
+      createdAt: Date.now(),
+    };
+    session.terminalsById.set(terminal.terminalId, terminal);
+    this.sendControl(session, {
+      type: "term.open",
+      terminalId: input.terminalId,
+      cols: input.cols,
+      rows: input.rows,
+      browserPublicKey: input.browserPublicKey,
+      browserNonce: input.browserNonce,
+      ...(input.identity ? { identity: input.identity } : {}),
+    });
+    return true;
+  }
+
+  attachTerminal(input: {
+    terminalId: string;
+    userId: string;
+    viewerId: string;
+    browserPublicKey: string;
+    browserNonce: string;
+    identity?: TerminalHandshakeIdentity;
+  }): { ok: true } | { ok: false; error: "not_found" | "offline" } {
+    const located = this.terminalForUser(input.terminalId, input.userId);
+    if (!located) return { ok: false, error: "not_found" };
+    const { session, terminal } = located;
+    if (!this.canStartTerminal(session)) return { ok: false, error: "offline" };
+    const approvalRequired = session.features?.terminalApproval === true;
+    if (approvalRequired) {
+      // Keep the current viewer until the CLI accepts term.auth.
+      terminal.pendingViewerId = input.viewerId;
+    } else {
+      if (terminal.viewerId && terminal.viewerId !== input.viewerId) {
+        const previous = terminal.viewerId;
+        terminal.viewerId = null;
+        terminalBridge?.onTerminalEvent({
+          type: "detached",
+          terminalId: terminal.terminalId,
+          viewerId: previous,
+        });
+      }
+      terminal.viewerId = input.viewerId;
+    }
+    this.sendControl(session, {
+      type: "term.attach",
+      terminalId: terminal.terminalId,
+      browserPublicKey: input.browserPublicKey,
+      browserNonce: input.browserNonce,
+      ...(input.identity ? { identity: input.identity } : {}),
+    });
+    return { ok: true };
+  }
+
+  detachTerminalViewer(terminalId: string, userId: string, viewerId: string): boolean {
+    const located = this.terminalForUser(terminalId, userId);
+    if (!located) return false;
+    if (located.terminal.viewerId !== viewerId) return false;
+    located.terminal.viewerId = null;
+    if (this.canSignalTerminal(located.session)) {
+      this.sendControl(located.session, { type: "term.detach", terminalId });
+    }
+    return true;
+  }
+
+  closeTerminalFromBrowser(terminalId: string, userId: string): boolean {
+    const located = this.terminalForUser(terminalId, userId);
+    if (!located) return false;
+    this.closeTerminal(located.session, located.terminal, true);
+    return true;
+  }
+
+  forwardTerminalAuth(terminalId: string, userId: string, signature: string): boolean {
+    const located = this.terminalForUser(terminalId, userId);
+    if (!located || !this.canSignalTerminal(located.session)) return false;
+    this.sendControl(located.session, { type: "term.auth", terminalId, signature });
+    return true;
+  }
+
+  forwardBrowserSealed(
+    terminalId: string,
+    userId: string,
+    viewerId: string,
+    seq: number,
+    body: Uint8Array,
+  ): boolean {
+    const located = this.terminalForUser(terminalId, userId);
+    if (!located || located.terminal.viewerId !== viewerId) return false;
+    if (!this.canSignalTerminal(located.session)) return false;
+    if (located.session.socket.readyState !== WS_READY_STATE_OPEN) return false;
+    located.session.socket.send(
+      encodeRelayBinaryFrame({ type: "term.sealed", terminalId, seq }, body),
+    );
+    return true;
+  }
+
+  /**
+   * Store a running command and send exec.start. False means no frame was sent
+   * and the command was not stored.
+   */
+  dispatchExecStart(command: TrackedCliCommand, start: { command: string; cwd?: string }): boolean {
+    const session = this.sessionsByCliDeviceId.get(command.cliDeviceId);
+    if (!session || !this.canStartExec(session)) return false;
+    if (session.socket.readyState !== WS_READY_STATE_OPEN) return false;
+    session.commandsById.set(command.commandId, command);
+    this.sendControl(session, {
+      type: "exec.start",
+      commandId: command.commandId,
+      command: start.command,
+      ...(start.cwd !== undefined ? { cwd: start.cwd } : {}),
+    });
+    return true;
+  }
+
+  forgetCommand(cliDeviceId: string, commandId: string) {
+    this.sessionsByCliDeviceId.get(cliDeviceId)?.commandsById.delete(commandId);
+  }
+
+  dispatchExecCancel(cliDeviceId: string, commandId: string) {
+    const session = this.sessionsByCliDeviceId.get(cliDeviceId);
+    const command = session?.commandsById.get(commandId);
+    if (!session || !command || command.status !== "running") return;
+    this.cancelTrackedCommand(session, command);
   }
 
   sendRelayRequest({
@@ -423,6 +983,7 @@ export class RelaySessionManager {
     bodySource?: { size: number; open(): AsyncIterable<Uint8Array> };
     timeoutMs: number;
   }) {
+    if (this.relayDrain) throw new Error("CLI session is disconnected.");
     const session = this.sessionsByCliDeviceId.get(cliDeviceId);
     if (!session) throw new Error("CLI session is disconnected.");
     if (session.socket.readyState !== WS_READY_STATE_OPEN) {
@@ -560,12 +1121,17 @@ export class RelaySessionManager {
   }
 
   completeRelayRequest(requestId: string) {
-    this.activeRelayRequests.delete(requestId);
+    const active = this.takeActiveRelayRequest(requestId);
+    const cliDeviceIds = new Set<string>();
+    if (active) cliDeviceIds.add(active.cliDeviceId);
     for (const session of this.sessionsBySocket.values()) {
       const stream = session.bodyStreamsByRequest.get(requestId);
+      if (!stream) continue;
       session.bodyStreamsByRequest.delete(requestId);
       void closeBodyStream(stream);
+      if (session.cliDeviceId) cliDeviceIds.add(session.cliDeviceId);
     }
+    for (const cliDeviceId of cliDeviceIds) this.considerDrainClose(cliDeviceId);
   }
 
   cancelRelayRequest({
@@ -577,12 +1143,13 @@ export class RelaySessionManager {
     requestId: string;
     reason: RelayFailure;
   }) {
-    this.activeRelayRequests.delete(requestId);
+    this.takeActiveRelayRequest(requestId);
     const session = this.sessionsByCliDeviceId.get(cliDeviceId);
     if (!session) return;
     const stream = session.bodyStreamsByRequest.get(requestId);
     session.bodyStreamsByRequest.delete(requestId);
     void closeBodyStream(stream);
+    this.considerDrainClose(cliDeviceId);
     if (session.socket.readyState !== WS_READY_STATE_OPEN) return;
     session.socket.send(
       encodeRelayServerControlMessage({ type: "relay.cancel", requestId, reason }),
@@ -597,6 +1164,12 @@ export class RelaySessionManager {
     if (!newSession.cliDeviceId) return;
     const existing = this.sessionsByCliDeviceId.get(newSession.cliDeviceId);
     if (existing && existing !== newSession) {
+      // The new session is taking over. Tear the old socket down here — once it
+      // leaves sessionsBySocket, removeSessionWithStatus returns without failing
+      // its terminals, commands, or relay requests, and must not mark the device
+      // DISCONNECTED.
+      this.teardownInteractiveWork(existing);
+      this.failActiveRequestsForSession(existing);
       existing.socket.close(1000, "replaced");
       this.sessionsBySocket.delete(existing.socket);
       clearTimeout(existing.unauthenticatedTimer);
@@ -610,14 +1183,12 @@ export class RelaySessionManager {
     return session;
   }
 
-  private failActiveRequestsForCli(cliDeviceId: string) {
-    const session = this.sessionsByCliDeviceId.get(cliDeviceId);
-    if (session) {
-      for (const stream of session.bodyStreamsByRequest.values()) void closeBodyStream(stream);
-      session.bodyStreamsByRequest.clear();
-    }
+  private failActiveRequestsForSession(session: SessionState) {
+    for (const stream of session.bodyStreamsByRequest.values()) void closeBodyStream(stream);
+    session.bodyStreamsByRequest.clear();
+    if (!session.cliDeviceId) return;
     for (const [requestId, activeRequest] of this.activeRelayRequests) {
-      if (activeRequest.cliDeviceId !== cliDeviceId) continue;
+      if (activeRequest.cliDeviceId !== session.cliDeviceId) continue;
       this.activeRelayRequests.delete(requestId);
       activeRequest.onError({
         type: "relay.error",
@@ -626,6 +1197,318 @@ export class RelaySessionManager {
         message: "CLI session disconnected.",
       });
     }
+  }
+
+  private canStartTerminal(session: SessionState): boolean {
+    return (
+      session.protocolVersion === "2.4" &&
+      session.allowHumanTerminal &&
+      session.features?.humanTerminal === true &&
+      session.features.terminalSupported === true &&
+      session.terminalPublicKey !== null &&
+      session.socket.readyState === WS_READY_STATE_OPEN
+    );
+  }
+
+  private canSignalTerminal(session: SessionState): boolean {
+    return (
+      session.protocolVersion === "2.4" &&
+      session.features?.humanTerminal === true &&
+      session.socket.readyState === WS_READY_STATE_OPEN
+    );
+  }
+
+  private canStartExec(session: SessionState): boolean {
+    return (
+      session.protocolVersion === "2.4" &&
+      session.allowMcpCommands &&
+      session.features?.mcpCommands === true &&
+      session.socket.readyState === WS_READY_STATE_OPEN
+    );
+  }
+
+  private canSignalExec(session: SessionState): boolean {
+    return (
+      session.protocolVersion === "2.4" &&
+      session.features?.mcpCommands === true &&
+      session.socket.readyState === WS_READY_STATE_OPEN
+    );
+  }
+
+  private sendControl(session: SessionState, message: RelayServerControlMessage) {
+    if (session.socket.readyState !== WS_READY_STATE_OPEN) return;
+    session.socket.send(encodeRelayServerControlMessage(message));
+  }
+
+  private reconcileInteractiveGrants(session: SessionState) {
+    const terminalOk =
+      session.protocolVersion === "2.4" &&
+      session.allowHumanTerminal &&
+      session.features?.humanTerminal === true &&
+      session.features.terminalSupported === true;
+    if (!terminalOk) {
+      const signal =
+        session.protocolVersion === "2.4" &&
+        session.features?.humanTerminal === true &&
+        session.socket.readyState === WS_READY_STATE_OPEN;
+      this.closeAllTerminals(session, signal);
+    }
+    const execOk =
+      session.protocolVersion === "2.4" &&
+      session.allowMcpCommands &&
+      session.features?.mcpCommands === true;
+    if (!execOk) this.cancelAllCommands(session);
+  }
+
+  private teardownInteractiveWork(session: SessionState) {
+    const signalTerminals =
+      session.protocolVersion === "2.4" &&
+      session.features?.humanTerminal === true &&
+      session.socket.readyState === WS_READY_STATE_OPEN;
+    this.closeAllTerminals(session, signalTerminals);
+    this.cancelAllCommands(session);
+  }
+
+  private closeAllTerminals(session: SessionState, signalCli: boolean) {
+    for (const terminal of [...session.terminalsById.values()]) {
+      this.closeTerminal(session, terminal, signalCli);
+    }
+  }
+
+  private closeTerminal(session: SessionState, terminal: TerminalRecord, signalCli: boolean) {
+    session.terminalsById.delete(terminal.terminalId);
+    if (signalCli && session.socket.readyState === WS_READY_STATE_OPEN) {
+      this.sendControl(session, { type: "term.close", terminalId: terminal.terminalId });
+    }
+    terminalBridge?.onTerminalEvent({
+      type: "exit",
+      terminalId: terminal.terminalId,
+      viewerId: terminal.viewerId,
+    });
+  }
+
+  private cancelAllCommands(session: SessionState) {
+    for (const command of [...session.commandsById.values()]) {
+      if (command.status !== "running") continue;
+      this.cancelTrackedCommand(session, command);
+    }
+  }
+
+  private cancelTrackedCommand(session: SessionState, command: TrackedCliCommand) {
+    if (command.status !== "running") return;
+    // Cancellation asks the CLI to stop. The slot stays until exec.done,
+    // exec.rejected, or the server deadline in the command registry.
+    if (this.canSignalExec(session)) {
+      this.sendControl(session, { type: "exec.cancel", commandId: command.commandId });
+    }
+  }
+
+  /** Drop approval handshakes that never spawned. Pending slots do not count toward the cap. */
+  sweepExpiredPendingTerminals(now = Date.now()) {
+    for (const session of this.sessionsByCliDeviceId.values()) {
+      for (const terminal of [...session.terminalsById.values()]) {
+        if (terminal.phase !== "pending") continue;
+        if (now - terminal.createdAt < TERMINAL_PENDING_TTL_MS) continue;
+        const viewerId = terminal.viewerId;
+        session.terminalsById.delete(terminal.terminalId);
+        terminalBridge?.onTerminalEvent({
+          type: "rejected",
+          terminalId: terminal.terminalId,
+          viewerId,
+          reason: "expired",
+        });
+      }
+    }
+  }
+
+  /** Clear every viewer this socket held, including terminals still opening. */
+  releaseBrowserViewer(userId: string, viewerId: string) {
+    for (const session of this.sessionsByCliDeviceId.values()) {
+      for (const terminal of session.terminalsById.values()) {
+        if (terminal.userId !== userId) continue;
+        if (terminal.pendingViewerId === viewerId) terminal.pendingViewerId = null;
+        if (terminal.viewerId !== viewerId) continue;
+        terminal.viewerId = null;
+        if (this.canSignalTerminal(session)) {
+          this.sendControl(session, { type: "term.detach", terminalId: terminal.terminalId });
+        }
+      }
+    }
+  }
+
+  private terminalForUser(
+    terminalId: string,
+    userId: string,
+  ): { session: SessionState; terminal: TerminalRecord } | null {
+    for (const session of this.sessionsByCliDeviceId.values()) {
+      const terminal = session.terminalsById.get(terminalId);
+      if (!terminal) continue;
+      if (terminal.userId !== userId) return null;
+      return { session, terminal };
+    }
+    return null;
+  }
+
+  private forwardSealedToBrowser(
+    session: SessionState,
+    terminalId: string,
+    seq: number,
+    body: Uint8Array,
+  ) {
+    const terminal = session.terminalsById.get(terminalId);
+    if (!terminal) return;
+    terminalBridge?.onTerminalEvent({
+      type: "sealed",
+      terminalId,
+      viewerId: terminal.viewerId,
+      seq,
+      body,
+    });
+  }
+
+  private handleTerminalControl(
+    session: SessionState,
+    message: Extract<
+      RelayClientControlMessage,
+      { type: "term.pending" | "term.opened" | "term.attached" | "term.rejected" | "term.exit" }
+    >,
+  ) {
+    const terminal = session.terminalsById.get(message.terminalId);
+    if (!terminal) return;
+    if (message.type === "term.pending") {
+      const cliPublicKey = session.terminalPublicKey;
+      if (!cliPublicKey) return;
+      terminalBridge?.onTerminalEvent({
+        type: "pending",
+        terminalId: terminal.terminalId,
+        viewerId: terminal.pendingViewerId ?? terminal.viewerId,
+        cliPublicKey,
+        cliNonce: message.cliNonce,
+        ...(message.approvalCode ? { approvalCode: message.approvalCode } : {}),
+      });
+      return;
+    }
+    if (message.type === "term.opened" || message.type === "term.attached") {
+      if (terminal.pendingViewerId && terminal.pendingViewerId !== terminal.viewerId) {
+        const previous = terminal.viewerId;
+        const next = terminal.pendingViewerId;
+        terminal.pendingViewerId = null;
+        terminal.viewerId = next;
+        if (previous) {
+          terminalBridge?.onTerminalEvent({
+            type: "detached",
+            terminalId: terminal.terminalId,
+            viewerId: previous,
+          });
+        }
+      }
+      terminal.phase = "open";
+      const cliPublicKey = session.terminalPublicKey;
+      if (!cliPublicKey) {
+        this.closeTerminal(session, terminal, true);
+        return;
+      }
+      terminalBridge?.onTerminalEvent({
+        type: message.type === "term.opened" ? "opened" : "attached",
+        terminalId: terminal.terminalId,
+        viewerId: terminal.viewerId,
+        cliPublicKey,
+        cliNonce: message.cliNonce,
+      });
+      return;
+    }
+    if (message.type === "term.rejected") {
+      const replacement = terminal.pendingViewerId;
+      if (replacement && terminal.phase === "open") {
+        terminal.pendingViewerId = null;
+        terminalBridge?.onTerminalEvent({
+          type: "rejected",
+          terminalId: terminal.terminalId,
+          viewerId: replacement,
+          reason: message.reason,
+          ...(message.approvalCode ? { approvalCode: message.approvalCode } : {}),
+        });
+        return;
+      }
+      const viewerId = terminal.viewerId;
+      const unspawned = terminal.phase === "opening" || terminal.phase === "pending";
+      terminal.viewerId = null;
+      if (unspawned) session.terminalsById.delete(terminal.terminalId);
+      terminalBridge?.onTerminalEvent({
+        type: "rejected",
+        terminalId: terminal.terminalId,
+        viewerId,
+        reason: message.reason,
+        ...(message.approvalCode ? { approvalCode: message.approvalCode } : {}),
+      });
+      return;
+    }
+    const viewerId = terminal.viewerId;
+    session.terminalsById.delete(terminal.terminalId);
+    terminalBridge?.onTerminalEvent({
+      type: "exit",
+      terminalId: terminal.terminalId,
+      viewerId,
+      ...(message.exitCode !== undefined ? { exitCode: message.exitCode } : {}),
+      ...(message.signal !== undefined ? { signal: message.signal } : {}),
+    });
+  }
+
+  private handleExecControl(
+    session: SessionState,
+    message: Extract<
+      RelayClientControlMessage,
+      { type: "exec.started" | "exec.rejected" | "exec.done" }
+    >,
+  ) {
+    const command = session.commandsById.get(message.commandId);
+    if (!command) return;
+    if (message.type === "exec.started") {
+      command.markStarted();
+      return;
+    }
+    if (message.type === "exec.rejected") {
+      command.markRejected(message.reason);
+      return;
+    }
+    command.markDone({
+      ...(message.exitCode !== undefined ? { exitCode: message.exitCode } : {}),
+      ...(message.signal !== undefined ? { signal: message.signal } : {}),
+      timedOut: message.timedOut,
+    });
+  }
+
+  /**
+   * A term.* / exec.* frame that fails schema validation closes that terminal
+   * or command only. Other malformed frames return false so the relay socket
+   * still takes the protocol-error path.
+   */
+  private isolateMalformedInteractiveFrame(session: SessionState, frame: string): boolean {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(frame);
+    } catch {
+      return false;
+    }
+    if (!parsed || typeof parsed !== "object") return false;
+    const record = parsed as Record<string, unknown>;
+    const type = record.type;
+    if (typeof type !== "string") return false;
+    if (type.startsWith("term.")) {
+      const terminalId = typeof record.terminalId === "string" ? record.terminalId : null;
+      const terminal = terminalId ? session.terminalsById.get(terminalId) : undefined;
+      if (terminal) this.closeTerminal(session, terminal, this.canSignalTerminal(session));
+      console.error("[relay] malformed terminal frame");
+      return true;
+    }
+    if (type.startsWith("exec.")) {
+      const commandId = typeof record.commandId === "string" ? record.commandId : null;
+      const command = commandId ? session.commandsById.get(commandId) : undefined;
+      if (command?.status === "running") this.cancelTrackedCommand(session, command);
+      console.error("[relay] malformed exec frame");
+      return true;
+    }
+    return false;
   }
 
   private async probeOwnedPoolMember(member: OwnedRecoveryMember): Promise<boolean> {

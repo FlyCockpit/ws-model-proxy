@@ -33,6 +33,12 @@ vi.mock("@ws-model-proxy/env/shared", () => ({
     NODE_ENV: "test",
   },
 }));
+vi.mock("../relay/cli-commands.js", () => ({
+  startCliCommand: vi.fn(),
+  waitCliCommand: vi.fn(),
+  snapshotCliCommand: vi.fn(),
+}));
+
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
   const { withDbShutdownFence } = await import("@ws-model-proxy/db/shutdown-fence");

@@ -9,6 +9,7 @@ import { MEDIA_ATTACHMENT_MAX_BYTES_MAX } from "@ws-model-proxy/config/media-pol
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
+import type { LiveCliFeatureSnapshot } from "../context";
 import { protectedProcedure } from "../index";
 import {
   assertCapacityManagementEnabled,
@@ -302,6 +303,14 @@ const listCliDevicesSelect = {
   inventoryAcknowledgedAt: true,
   inventoryConfirmed: true,
   endpointTargeting: true,
+  allowHumanTerminal: true,
+  allowMcpCommands: true,
+  cliVersion: true,
+  relayProtocolVersion: true,
+  reportedHumanTerminal: true,
+  reportedMcpCommands: true,
+  reportedTerminalApproval: true,
+  reportedTerminalSupported: true,
   User: { select: { slug: true } },
   Endpoints: {
     orderBy: { createdAt: "asc" as const },
@@ -545,7 +554,24 @@ function effectiveCapabilities(endpoint: EndpointRow, model: DiscoveredModelRow)
   };
 }
 
-function serializeCliDevice(row: CliDeviceRow, now: Date) {
+function liveTerminalFeature(snapshot: LiveCliFeatureSnapshot | null): boolean {
+  return (
+    snapshot?.protocolVersion === "2.4" &&
+    snapshot.humanTerminal === true &&
+    snapshot.terminalSupported === true
+  );
+}
+
+function liveCommandFeature(snapshot: LiveCliFeatureSnapshot | null): boolean {
+  return snapshot?.protocolVersion === "2.4" && snapshot.mcpCommands === true;
+}
+
+function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSnapshot | null) {
+  const terminalLive = liveTerminalFeature(live);
+  const commandsLive = liveCommandFeature(live);
+  const terminalDeviceAllows = row.reportedHumanTerminal ?? null;
+  const terminalSupported = row.reportedTerminalSupported ?? null;
+  const commandsDeviceAllows = row.reportedMcpCommands ?? null;
   const staleAt = row.lastHeartbeatAt
     ? new Date(row.lastHeartbeatAt.getTime() + CLI_HEARTBEAT_STALE_AFTER_MS)
     : null;
@@ -567,6 +593,27 @@ function serializeCliDevice(row: CliDeviceRow, now: Date) {
     inventoryAcknowledgedAt: row.inventoryAcknowledgedAt,
     inventoryConfirmed: row.inventoryConfirmed,
     endpointTargeting: row.endpointTargeting,
+    cliVersion: row.cliVersion ?? null,
+    relayProtocolVersion: row.relayProtocolVersion ?? null,
+    features: {
+      terminal: {
+        granted: row.allowHumanTerminal === true,
+        deviceAllows: terminalDeviceAllows,
+        supported: terminalSupported,
+        live: terminalLive,
+        available:
+          row.allowHumanTerminal === true &&
+          terminalDeviceAllows === true &&
+          terminalLive &&
+          terminalSupported === true,
+      },
+      commands: {
+        granted: row.allowMcpCommands === true,
+        deviceAllows: commandsDeviceAllows,
+        live: commandsLive,
+        available: row.allowMcpCommands === true && commandsDeviceAllows === true && commandsLive,
+      },
+    },
     endpoints: row.Endpoints.map((endpoint) => ({
       id: endpoint.id,
       createdAt: endpoint.createdAt,
@@ -2031,7 +2078,63 @@ export const forwarderManagementRouter = {
       });
 
       const now = new Date();
-      return rows.map((row) => serializeCliDevice(row, now));
+      const live = await context.services?.getLiveCliFeatures?.(rows.map((row) => row.id));
+      return rows.map((row) => serializeCliDevice(row, now, live?.get(row.id) ?? null));
+    }),
+
+  setCliDeviceFeatureGrants: protectedProcedure
+    .input(
+      z
+        .object({
+          cliDeviceId: idSchema,
+          humanTerminal: z.boolean().optional(),
+          mcpCommands: z.boolean().optional(),
+        })
+        .refine((value) => value.humanTerminal !== undefined || value.mcpCommands !== undefined, {
+          message: "At least one feature grant is required.",
+        }),
+    )
+    .handler(async ({ input, context }) => {
+      const row = await prisma.cliDevice.findUnique({
+        where: { id: input.cliDeviceId },
+        select: {
+          id: true,
+          userId: true,
+          reportedHumanTerminal: true,
+          reportedMcpCommands: true,
+          reportedTerminalSupported: true,
+        },
+      });
+      if (!row || row.userId !== context.session.user.id) {
+        throw new ORPCError("NOT_FOUND", { message: "CLI device not found." });
+      }
+      if (
+        input.humanTerminal === true &&
+        (row.reportedHumanTerminal !== true || row.reportedTerminalSupported !== true)
+      ) {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Browser terminal cannot be enabled until this CLI reports support.",
+        });
+      }
+      if (input.mcpCommands === true && row.reportedMcpCommands !== true) {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "MCP commands cannot be enabled until this CLI reports support.",
+        });
+      }
+      const updated = await prisma.cliDevice.update({
+        where: { id: row.id },
+        data: {
+          ...(input.humanTerminal !== undefined ? { allowHumanTerminal: input.humanTerminal } : {}),
+          ...(input.mcpCommands !== undefined ? { allowMcpCommands: input.mcpCommands } : {}),
+        },
+        select: { id: true, allowHumanTerminal: true, allowMcpCommands: true },
+      });
+      await context.services?.onCliFeatureGrantsChanged?.(updated.id);
+      return {
+        cliDeviceId: updated.id,
+        humanTerminal: updated.allowHumanTerminal,
+        mcpCommands: updated.allowMcpCommands,
+      };
     }),
 
   removeCliDeviceMetadata: protectedProcedure
@@ -3705,7 +3808,9 @@ export const forwarderManagementRouter = {
               where: {
                 poolId: pool.id,
                 tier: "PRIMARY",
-                ExecutionTarget: { ProviderModel: { isNot: null } },
+                // The provider relation also includes userId, which is never
+                // null, so a relation null-check matches every execution target.
+                ExecutionTarget: { providerModelId: { not: null } },
               },
               select: { id: true },
             }),

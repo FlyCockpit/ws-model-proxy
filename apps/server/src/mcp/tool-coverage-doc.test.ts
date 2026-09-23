@@ -36,6 +36,12 @@ vi.mock("@ws-model-proxy/db", async () => {
   return { default: mockDeep() };
 });
 
+vi.mock("../relay/cli-commands.js", () => ({
+  startCliCommand: vi.fn(),
+  waitCliCommand: vi.fn(),
+  snapshotCliCommand: vi.fn(),
+}));
+
 const DOC_URL = new URL("../../../../docs/mcp-tool-coverage.md", import.meta.url);
 
 const { renderMcpToolCoverageDoc } = await import("./tool-coverage-doc");

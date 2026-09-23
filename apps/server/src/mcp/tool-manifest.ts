@@ -28,6 +28,14 @@ import type { StandardSchemaWithJSON } from "@modelcontextprotocol/server";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { z } from "zod";
 import { runChatCompletionDiagnostic, runPoolMemberTest } from "../model-api/diagnostics.js";
+import type { McpRequestCredential } from "./cli-command-access.js";
+import {
+  adaptCliCommandResultInput,
+  adaptCliCommandRunInput,
+  CLI_COMMAND_OUTPUT_NOTICE,
+  runForwarderCliCommand,
+  runForwarderCliCommandResult,
+} from "./cli-command-tools.js";
 
 /** Endpoint-wide scope requirement. Write tools require literal `mcp:write`. */
 export type McpToolScope = "read" | "write";
@@ -50,9 +58,15 @@ export interface McpToolRunDeps {
   /**
    * The verified request's OWNED admission signal (G1): diagnostic cores
    * thread it into their network work (relay attempts, the synthetic chat
-   * Request) so client aborts / shutdown tear them down.
+   * Request) so client aborts / shutdown tear them down. CLI command run
+   * passes it to the wait; an abort ends the wait, not the command.
    */
   signal?: AbortSignal;
+  /**
+   * Admission credential. OAuth and PATs without `allowCliCommands` cannot
+   * run the CLI command tools. Missing bindings are treated as OAuth.
+   */
+  credential: McpRequestCredential;
 }
 
 /** One checked tool descriptor. */
@@ -83,6 +97,16 @@ export interface McpToolDescriptor {
   invokeProcedure?: (client: AppRouterClient, input: unknown) => Promise<unknown>;
   /** Extracted-core tools: user-ID-bound application function invocation. */
   invokeCore?: (input: unknown, deps: McpToolRunDeps) => Promise<unknown>;
+  /**
+   * Extra sentence appended to the generated tool description.
+   */
+  descriptionNote?: string;
+  /**
+   * Deliver the core's result even if the admission signal aborts. CLI
+   * command run uses this: abort ends the wait, not the command, and the
+   * result must still carry `commandId`.
+   */
+  deliverDespiteAbort?: boolean;
 }
 
 /**
@@ -1074,11 +1098,47 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
         signal: deps.signal,
       }),
   },
+  {
+    name: "forwarder_cli_command_run",
+    target: "core:forwarderCliCommandRun",
+    scope: "write",
+    confirmation: "RUN",
+    classification: "external",
+    descriptionNote: CLI_COMMAND_OUTPUT_NOTICE,
+    deliverDespiteAbort: true,
+    inputSchema: withInputSizeBound(
+      z.looseObject({
+        cliDeviceId: z.string(),
+        command: z.string(),
+        cwd: z.string().optional(),
+        waitMs: z.number().optional(),
+        confirm: z.literal("RUN"),
+      }),
+    ),
+    inputAdapter: adaptCliCommandRunInput,
+    invokeCore: (input, deps) => runForwarderCliCommand(input, deps),
+  },
+  {
+    name: "forwarder_cli_command_result",
+    target: "core:forwarderCliCommandResult",
+    scope: "write",
+    confirmation: null,
+    classification: "pure",
+    descriptionNote: CLI_COMMAND_OUTPUT_NOTICE,
+    inputSchema: withInputSizeBound(
+      z.looseObject({
+        commandId: z.string(),
+        progress: z.boolean().optional(),
+      }),
+    ),
+    inputAdapter: adaptCliCommandResultInput,
+    invokeCore: (input, deps) => runForwarderCliCommandResult(input, deps),
+  },
 ];
 
 /**
- * The checked catalog: exactly 23 read tools and 46 write tools
- * (44 procedure-backed + the 2 extracted diagnostic cores).
+ * The checked catalog: exactly 23 read tools and 48 write tools
+ * (44 procedure-backed + 4 extracted cores: 2 diagnostics and 2 CLI commands).
  */
 export const MCP_TOOL_MANIFEST: readonly McpToolDescriptor[] = [...READ_TOOLS, ...WRITE_TOOLS];
 
@@ -1194,6 +1254,10 @@ export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
   {
     target: "mcpTokens.create",
     reason: "Returns the one-time raw MCP personal-token secret; human-only browser session.",
+  },
+  {
+    target: "forwarderManagement.setCliDeviceFeatureGrants",
+    reason: "human-only device grant",
   },
   {
     target: "mcpTokens.revokeMine",

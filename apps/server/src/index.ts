@@ -19,8 +19,10 @@ import {
 } from "./model-api/provider-attempt-lifecycle.js";
 import { startProviderBudgetRepair } from "./model-api/provider-budget-runtime.js";
 import { startRelayTelemetryRecovery } from "./model-api/relay-telemetry-recovery.js";
-import { RELAY_SUBPROTOCOL } from "./relay/protocol.js";
+import { sweepExpiredTokenCommands } from "./relay/cli-commands.js";
+import { RELAY_SUBPROTOCOL, RELAY_WS_MAX_PAYLOAD_BYTES } from "./relay/protocol.js";
 import { relaySessionManager } from "./relay/session-manager.js";
+import { terminalBrowserHub } from "./relay/terminal-websocket.js";
 import { configureHttpServerTimeouts } from "./server-timeouts.js";
 import { startSessionCleanup } from "./session-cleanup.js";
 
@@ -100,6 +102,7 @@ const server = serve(
     websocket: {
       server: new WebSocketServer({
         noServer: true,
+        maxPayload: RELAY_WS_MAX_PAYLOAD_BYTES,
         handleProtocols(protocols) {
           return protocols.has(RELAY_SUBPROTOCOL) ? RELAY_SUBPROTOCOL : false;
         },
@@ -138,6 +141,47 @@ const stopOauthCleanup = startOauthCleanup();
 // idempotent sweep uses the same shutdown-fenced lifecycle as OAuth cleanup.
 const stopSessionCleanup = startSessionCleanup();
 
+function startUnrefInterval(tick: () => void, intervalMs: number): () => void {
+  const timer = setInterval(tick, intervalMs);
+  timer.unref();
+  return () => clearInterval(timer);
+}
+
+const stopStaleRelaySessions = startUnrefInterval(() => {
+  void relaySessionManager.checkStaleSessions().catch((error: unknown) => {
+    console.error(
+      "[server] stale relay session sweep failed",
+      error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+    );
+  });
+  try {
+    relaySessionManager.sweepExpiredPendingTerminals();
+  } catch (error) {
+    console.error(
+      "[server] pending terminal sweep failed",
+      error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+    );
+  }
+}, 15_000);
+const stopCliCommandSweep = startUnrefInterval(() => {
+  try {
+    sweepExpiredTokenCommands();
+  } catch (error) {
+    console.error(
+      "[server] CLI command sweep failed",
+      error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+    );
+  }
+}, 60_000);
+const stopTerminalSessionRecheck = startUnrefInterval(() => {
+  void terminalBrowserHub.recheckSessions().catch((error: unknown) => {
+    console.error(
+      "[server] terminal session recheck failed",
+      error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+    );
+  });
+}, 60_000);
+
 // ---------------------------------------------------------------------------
 // Graceful shutdown — drain in-flight requests, then close dependencies
 // ---------------------------------------------------------------------------
@@ -159,9 +203,16 @@ async function shutdown(signal: string) {
       stopProviderAttemptExpiry?.();
       stopOauthCleanup?.();
       stopSessionCleanup();
+      stopStaleRelaySessions();
+      stopCliCommandSweep();
+      stopTerminalSessionRecheck();
       relaySessionManager.dispose();
       await capacityLifecycle?.close();
     },
+    closeBrowserSockets: () => {
+      terminalBrowserHub.closeAll();
+    },
+    closeRelaySessions: () => relaySessionManager.closeRelaySessions(),
     // 1. Stop accepting new connections and drain in-flight requests.
     //    NORMAL drain: graceful — server.close waits for in-flight requests
     //    to finish. DRAIN TIMEOUT (F8): forcibly terminate every lingering
@@ -171,8 +222,11 @@ async function shutdown(signal: string) {
     //    never held hostage by a stalled body. Without this, a request that
     //    passed the body cap but never finished sending could proceed to
     //    the MCP factory DURING/AFTER the Prisma disconnect.
-    drainHttp: () =>
-      new Promise<void>((resolve) => {
+    drainHttp: async () => {
+      // Drop CLI sockets that are not carrying a model request. Busy sockets
+      // stay until that request finishes or the drain timeout below.
+      await relaySessionManager.closeIdleRelaySessions();
+      return new Promise<void>((resolve) => {
         const timeout = setTimeout(() => {
           console.warn("[server] Drain timeout reached, forcing close.");
           // Feature-detect for TYPE reasons, not runtime availability:
@@ -201,7 +255,8 @@ async function shutdown(signal: string) {
           }
           resolve();
         });
-      }),
+      });
+    },
     // 2. Close the admission gate AND the module-lifetime MCP handler —
     //    AFTER the HTTP drain (normal-drain requests finished; nothing
     //    admitted loses its exchange prematurely) and BEFORE the Prisma

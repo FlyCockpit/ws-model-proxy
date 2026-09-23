@@ -93,6 +93,12 @@ import {
   signupLimiter,
   signupRecipientLimiter,
 } from "./rate-limit.js";
+import { cancelCommandsForToken } from "./relay/cli-commands.js";
+import { relaySessionManager } from "./relay/session-manager.js";
+import {
+  createTerminalWebsocketMiddleware,
+  terminalUpgradeHandler,
+} from "./relay/terminal-websocket.js";
 import { createRelayWebsocketMiddleware, relayUpgradeHandler } from "./relay/websocket.js";
 import {
   authRouteLogPath,
@@ -101,7 +107,7 @@ import {
   stripsOAuthQuery,
 } from "./request-log-redaction.js";
 import { createRpcBatchHandlerPlugin } from "./rpc-batch-plugin.js";
-import { mountSecurityHeaders } from "./security-headers.js";
+import { mountSecurityHeaders, withWebsocketConnectSources } from "./security-headers.js";
 import { registerSeoRoutes } from "./seo.js";
 import { sessionMiddleware } from "./session-middleware.js";
 import { SIGNIN_FAILURE_PATH, signinFailureLimit } from "./signin-failure-limit.js";
@@ -192,6 +198,18 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
  * module-lifetime MCP transport, and the /mcp admission gate (both closed
  * by the shutdown sequence after the HTTP drain).
  */
+function cliContextServices() {
+  return {
+    repairExpiredProviderBudgets: (scope: { userId: string; providerAccountId: string }) =>
+      repairExpiredProviderBudgets(new Date(), scope),
+    onCliFeatureGrantsChanged: (cliDeviceId: string) =>
+      relaySessionManager.onCliFeatureGrantsChanged(cliDeviceId),
+    cancelMcpTokenCommands: (tokenId: string) => cancelCommandsForToken(tokenId),
+    getLiveCliFeatures: (cliDeviceIds: readonly string[]) =>
+      relaySessionManager.getLiveCliFeatures(cliDeviceIds),
+  };
+}
+
 export async function createApp(options: CreateAppOptions = {}) {
   // Shared validated env — the SAME module-level source every mounted
   // consumer reads (guard, limiters, alias gates). Never overridden here
@@ -215,7 +233,11 @@ export async function createApp(options: CreateAppOptions = {}) {
   // the raw-asset `sandbox` CSP override. Ordering between the two is load-bearing and
   // lives in mountSecurityHeaders (see its doc comment + security-headers.test.ts).
   // CSP: tighten per route if third-party scripts/analytics are needed.
-  const cspConnectSrc = ["'self'", ...(env.CORS_ORIGIN ? [env.CORS_ORIGIN] : [])];
+  const cspConnectSrc = withWebsocketConnectSources([
+    "'self'",
+    env.BETTER_AUTH_URL,
+    ...(env.CORS_ORIGIN ? [env.CORS_ORIGIN] : []),
+  ]);
 
   // CSP hash authorizing the inlined anti-FOUC theme bootstrap (THEME_INIT_SCRIPT,
   // injected into <head> by apps/web/src/routes/__root.tsx). Computed from the
@@ -509,9 +531,7 @@ export async function createApp(options: CreateAppOptions = {}) {
       prisma,
       isForceTwoFactorRequired,
       admissionGate: mcpAdmissionGate,
-      services: {
-        repairExpiredProviderBudgets: (scope) => repairExpiredProviderBudgets(new Date(), scope),
-      },
+      services: cliContextServices(),
       // Phase 5 tool dispatch binding: after every admission check passes,
       // the verified AuthInfo (passed VERBATIM by the SDK into the transport
       // factory's request context) is bound to the per-request oRPC context,
@@ -521,8 +541,8 @@ export async function createApp(options: CreateAppOptions = {}) {
       // and never STARTS the next pipeline stage), so the manifest tools
       // registered for THIS request resolve their router client
       // (mcp/tool-dispatch.ts).
-      onVerified: ({ authInfo, orpcContext, requestId, signal }) =>
-        bindMcpToolDispatch(authInfo, { orpcContext, requestId, signal }),
+      onVerified: ({ authInfo, orpcContext, requestId, signal, credential }) =>
+        bindMcpToolDispatch(authInfo, { orpcContext, requestId, signal, credential }),
     }),
   );
 
@@ -601,6 +621,10 @@ export async function createApp(options: CreateAppOptions = {}) {
 
   app.use("/api/cli/ws", createRelayWebsocketMiddleware());
   app.get("/api/cli/ws", relayUpgradeHandler());
+  // Browser terminal socket. No subprotocol; the shared upgrade server already
+  // returns false when the client offers none. maxPayload is set on that server.
+  app.use("/api/dashboard/terminal/ws", createTerminalWebsocketMiddleware());
+  app.get("/api/dashboard/terminal/ws", terminalUpgradeHandler());
 
   // Signup kill-switch — reject email/password signup before it reaches
   // Better-Auth when runtime signup is disabled. Production bootstrap requires
@@ -822,9 +846,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   app.use("/*", async (c, next) => {
     const context = await createContext({
       context: c,
-      services: {
-        repairExpiredProviderBudgets: (scope) => repairExpiredProviderBudgets(new Date(), scope),
-      },
+      services: cliContextServices(),
     });
 
     const rpcResult = await rpcHandler.handle(c.req.raw, {

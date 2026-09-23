@@ -83,4 +83,7 @@ pub enum Command {
 
     /// Generate shell completion scripts.
     Completions(crate::commands::completions::Args),
+
+    /// Approve browser identities for the local terminal.
+    Terminal(crate::commands::terminal::Args),
 }

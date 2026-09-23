@@ -163,7 +163,16 @@
     },
     "searchPlaceholder": "Buscar ID de modelo, ID de origen, endpoint o etiqueta",
     "noSearchResults": "Ningún endpoint o modelo coincide con la búsqueda.",
-    "title": "CLIs, endpoints y modelos"
+    "title": "CLIs, endpoints y modelos",
+    "features": {
+      "terminal": "Terminal del navegador",
+      "commands": "Comandos MCP",
+      "saved": "Se actualizó el acceso a funciones del CLI",
+      "saveFailed": "No se pudo actualizar el acceso a funciones del CLI. Intenta de nuevo.",
+      "windows": "Aún no es compatible con Windows",
+      "configDisabled": "Desactivado en la configuración wsmp de este CLI — edítala y reinicia wsmp",
+      "updateWsmp": "Actualiza wsmp para usar esto"
+    }
   },
   "description": "Opera CLIs conectados, pools de modelos, credenciales y metadatos de relay.",
   "endpoints": {
@@ -214,16 +223,61 @@
       "OPENAI_RESPONSES": "OpenAI Responses"
     }
   },
+  "terminals": {
+    "title": "Terminales",
+    "description": "Abre un shell en uno de tus CLIs. Las pulsaciones van cifradas entre este navegador y el CLI.",
+    "empty": "No hay terminales abiertas. Inicia una desde un CLI que permita terminales del navegador.",
+    "emptyClis": "Todavía no se ha registrado ningún dispositivo CLI.",
+    "loading": "Cargando terminales",
+    "add": "Nueva terminal",
+    "close": "Cerrar terminal",
+    "cliList": "Elige un CLI",
+    "reconnecting": "Reconectando con el servicio de terminal…",
+    "exited": "El shell terminó.",
+    "rejected": "El CLI rechazó esta terminal ({{reason}}).",
+    "error": "La conexión de la terminal encontró un error.",
+    "approvalTitle": "Este CLI necesita aprobación",
+    "approvalInstructions": "Ejecuta este comando en esa máquina y luego abre la terminal de nuevo.",
+    "approvalCodeLabel": "Código de aprobación",
+    "copyCommand": "Copiar comando",
+    "copied": "Comando copiado",
+    "reasons": {
+      "notGranted": "No concedido para este CLI",
+      "offline": "El CLI está desconectado",
+      "unavailable": "La terminal no está disponible"
+    },
+    "rejection": {
+      "disabled": "Desactivado en la configuración del CLI",
+      "unsupported": "No es compatible en esta máquina",
+      "limit": "Ya hay demasiadas terminales abiertas",
+      "approval_required": "Este navegador todavía no está aprobado",
+      "bad_signature": "La firma de aprobación fue rechazada",
+      "bad_handshake": "El saludo de la terminal no es válido",
+      "bad_cwd": "El directorio de inicio del CLI no se puede usar",
+      "spawn_failed": "No se pudo iniciar el shell",
+      "not_found": "Terminal no encontrada",
+      "already_open": "Esa terminal ya está abierta",
+      "expired": "La solicitud de aprobación expiró",
+      "not_granted": "No concedido para este CLI",
+      "device_disabled": "Desactivado en la configuración del CLI",
+      "cli_too_old": "Actualiza wsmp para usar terminales",
+      "offline": "El CLI está desconectado",
+      "invalid": "Esa solicitud de terminal no es válida"
+    }
+  },
   "nav": {
     "ariaLabel": "Secciones del panel",
     "chatTest": "Prueba de chat",
     "capacity": "Capacidad",
     "cliTokens": "Tokens CLI",
     "clis": "CLIs",
+    "collapseSidebar": "Contraer barra lateral",
+    "expandSidebar": "Expandir barra lateral",
     "modelApiTokens": "Tokens API de modelo",
     "overview": "Resumen",
     "pools": "Grupos",
-    "relayMetadata": "Metadatos de relay"
+    "relayMetadata": "Metadatos de relay",
+    "terminals": "Terminales"
   },
   "pools": {
     "notFound": "No se encontró este grupo o ya no está disponible para ti.",

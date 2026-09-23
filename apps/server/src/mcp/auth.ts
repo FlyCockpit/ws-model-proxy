@@ -21,6 +21,7 @@ import { RateLimiterRes } from "rate-limiter-flexible";
 import { mcpIdentityKey, mcpIdentityQuotaLimiter } from "../mcp-rate-limit";
 import { cloneRequestOntoPublicOrigin, PublicRequestError } from "../public-request-url";
 import { createMcpAdmissionGate, type McpAdmission, type McpAdmissionGate } from "./admission";
+import type { McpRequestCredential } from "./cli-command-access";
 import { createMcpContext, type McpContext, type McpSessionUser } from "./context";
 import {
   mcpForbiddenResponse,
@@ -210,6 +211,12 @@ export interface McpVerifiedRequest {
    * gate.close() tear down a running tool's work.
    */
   signal: AbortSignal;
+  /**
+   * How this request was admitted. The personal-token branch sets `pat`
+   * from the token row; the OAuth verifier path sets `oauth`. Never inferred
+   * from `clientId`.
+   */
+  credential: McpRequestCredential;
 }
 
 /**
@@ -507,6 +514,7 @@ async function handleAdmittedRequest(
         consumeIdentityQuota,
         now,
         signal,
+        mcpCredential: { kind: "oauth" },
       }),
     {
       issuer: issuerUrl,
@@ -560,6 +568,12 @@ async function handleAdmittedRequest(
         consumeIdentityQuota,
         now,
         signal,
+        mcpCredential: {
+          kind: "pat",
+          tokenId: identity.id,
+          allowCliCommands: identity.allowCliCommands === true,
+          expiresAt: identity.expiresAt,
+        },
       });
     } else {
       response = await wrapped(canonicalRequest);
@@ -720,6 +734,7 @@ async function handleVerifiedRequest({
   consumeIdentityQuota,
   now,
   signal,
+  mcpCredential,
 }: {
   request: Request;
   claims: Record<string, unknown>;
@@ -730,6 +745,8 @@ async function handleVerifiedRequest({
   now: () => Date;
   /** Owned admission signal — every stage below is fenced on it (F8). */
   signal: AbortSignal;
+  /** Admission branch credential. Not derived from clientId. */
+  mcpCredential: McpRequestCredential;
 }): Promise<Response> {
   // STAGE FENCES (F8 piece 2): after EVERY awaited stage, an aborted signal
   // stops the sequence HERE — the next stage (especially the user lookup,
@@ -905,7 +922,13 @@ async function handleVerifiedRequest({
   // per request is created from it when the transport factory registers
   // tools). The synthetic session NEVER carries the access token (pinned by
   // tests).
-  options.onVerified?.({ authInfo, orpcContext, requestId, signal });
+  options.onVerified?.({
+    authInfo,
+    orpcContext,
+    requestId,
+    signal,
+    credential: mcpCredential,
+  });
 
   return options.transport.fetch(request, { authInfo });
 }

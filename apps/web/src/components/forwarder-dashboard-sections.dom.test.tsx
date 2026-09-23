@@ -74,6 +74,7 @@ vi.mock("@/utils/orpc", () => {
         updateDiscoveredModelCapabilities: mutation("updateDiscoveredModelCapabilities"),
         setDiscoveredModelCapabilityProfile: mutation("setDiscoveredModelCapabilityProfile"),
         updateDiscoveredModelAttachmentLimit: mutation("updateDiscoveredModelAttachmentLimit"),
+        setCliDeviceFeatureGrants: mutation("setCliDeviceFeatureGrants"),
         cacheAffinityStats: query("affinity", { activeRecords: 0, targets: [] }),
         clearCacheAffinity: mutation("clearCacheAffinity"),
       },
