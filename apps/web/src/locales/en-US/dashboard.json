@@ -120,12 +120,12 @@
     "samplePromptOne": "Explain this model's capabilities.",
     "samplePromptTwo": "Give me a concise test plan.",
     "routingMode": {
-      "label": "Pool route mode",
-      "PREFER_NATIVE": "Preferred API (native first)",
-      "REQUIRE_NATIVE": "Require native Chat API",
-      "REQUIRE_ADAPTED": "Require adapted Chat API",
-      "help": "Native mode rejects adapted members; adapted mode rejects native members. Unsupported modes fail without silently changing the route.",
-      "directHelp": "Direct models always use their native Chat API."
+      "label": "Chat test route",
+      "PREFER_NATIVE": "Try members that speak this API first",
+      "REQUIRE_NATIVE": "Only members that speak this API",
+      "REQUIRE_ADAPTED": "Only members that need translation",
+      "help": "Affects this chat test only. API clients such as OpenCode always try members that speak the requested API first, then translated members.",
+      "directHelp": "Direct models always use their own API. This control applies to pools."
     },
     "reasoning": {
       "label": "Reasoning level",

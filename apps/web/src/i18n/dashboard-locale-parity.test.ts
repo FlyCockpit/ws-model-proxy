@@ -91,6 +91,29 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
     expect(esDashboard.nav.expandSidebar).toBeTruthy();
   });
 
+  it("labels chat-test routing without a Chat-only API and as this test only", () => {
+    expect(keyTree(esDashboard.chatTest.routingMode)).toEqual(
+      keyTree(enDashboard.chatTest.routingMode),
+    );
+    expect(enDashboard.chatTest.routingMode).toEqual({
+      label: "Chat test route",
+      PREFER_NATIVE: "Try members that speak this API first",
+      REQUIRE_NATIVE: "Only members that speak this API",
+      REQUIRE_ADAPTED: "Only members that need translation",
+      help: "Affects this chat test only. API clients such as OpenCode always try members that speak the requested API first, then translated members.",
+      directHelp: "Direct models always use their own API. This control applies to pools.",
+    });
+    expect(esDashboard.chatTest.routingMode).toEqual({
+      label: "Ruta de la prueba de chat",
+      PREFER_NATIVE: "Probar primero los miembros que hablan esta API",
+      REQUIRE_NATIVE: "Solo miembros que hablan esta API",
+      REQUIRE_ADAPTED: "Solo miembros que necesitan traducción",
+      help: "Afecta solo esta prueba de chat. Los clientes de API, como OpenCode, siempre prueban primero los miembros que hablan la API solicitada y después los miembros traducidos.",
+      directHelp:
+        "Los modelos directos siempre usan su propia API. Este control aplica a los pools.",
+    });
+  });
+
   it("labels every surface the ModelApiSurface union allows", () => {
     for (const surface of modelApiSurfaces) {
       expect(enDashboard.models.surfaces, `en-US missing label for ${surface}`).toHaveProperty(

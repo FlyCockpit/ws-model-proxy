@@ -92,12 +92,12 @@
     "samplePromptOne": "Explica las capacidades de este modelo.",
     "samplePromptTwo": "Dame un plan de pruebas conciso.",
     "routingMode": {
-      "label": "Modo de ruta del pool",
-      "PREFER_NATIVE": "API preferida (nativa primero)",
-      "REQUIRE_NATIVE": "Requerir API de Chat nativa",
-      "REQUIRE_ADAPTED": "Requerir API de Chat adaptada",
-      "help": "El modo nativo rechaza miembros adaptados; el modo adaptado rechaza miembros nativos. Los modos no compatibles fallan sin cambiar la ruta silenciosamente.",
-      "directHelp": "Los modelos directos siempre usan su API de Chat nativa."
+      "label": "Ruta de la prueba de chat",
+      "PREFER_NATIVE": "Probar primero los miembros que hablan esta API",
+      "REQUIRE_NATIVE": "Solo miembros que hablan esta API",
+      "REQUIRE_ADAPTED": "Solo miembros que necesitan traducción",
+      "help": "Afecta solo esta prueba de chat. Los clientes de API, como OpenCode, siempre prueban primero los miembros que hablan la API solicitada y después los miembros traducidos.",
+      "directHelp": "Los modelos directos siempre usan su propia API. Este control aplica a los pools."
     },
     "surface": {
       "label": "Superficie de API",
