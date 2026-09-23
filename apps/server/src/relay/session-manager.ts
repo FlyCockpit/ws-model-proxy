@@ -1622,6 +1622,11 @@ export class RelaySessionManager {
         if (terminal.phase === "pending") {
           if (now - terminal.createdAt < TERMINAL_PENDING_TTL_MS) continue;
           session.terminalsById.delete(terminal.terminalId);
+          // The CLI may have spawned the shell just before the deadline; a
+          // close for a terminal it never opened is a no-op there.
+          if (this.canSignalTerminal(session)) {
+            this.sendControl(session, { type: "term.close", terminalId: terminal.terminalId });
+          }
           for (const connId of terminalConnIds(terminal)) {
             terminalBridge?.onTerminalEvent({
               type: "rejected",
@@ -1725,7 +1730,21 @@ export class RelaySessionManager {
     >,
   ) {
     const terminal = session.terminalsById.get(message.terminalId);
-    if (!terminal) return;
+    if (!terminal) {
+      // A late open/attach/pending for a terminal we no longer track (for
+      // example one whose handshake expired) would otherwise leave a shell
+      // with no server-side owner. Ask the CLI to close it; the CLI treats a
+      // close for an unknown terminal as a no-op, so this cannot loop.
+      if (
+        (message.type === "term.opened" ||
+          message.type === "term.attached" ||
+          message.type === "term.pending") &&
+        this.canSignalTerminal(session)
+      ) {
+        this.sendControl(session, { type: "term.close", terminalId: message.terminalId });
+      }
+      return;
+    }
     if (message.type === "term.input_dropped") {
       // Only a notice: viewers, the writer and the phase stay as they are.
       const viewer = terminal.multiViewer

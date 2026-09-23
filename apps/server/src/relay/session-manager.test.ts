@@ -1710,6 +1710,68 @@ describe("relay protocol 2.5 terminal viewers", () => {
     expect(events).toEqual([]);
   });
 
+  it.each([
+    ["2.4", hello24({ terminalApproval: true })],
+    ["2.5", hello25({ terminalApproval: true })],
+  ])(
+    "closes an expired approval handshake on the %s CLI and a late term.opened",
+    async (_, frame) => {
+      const { manager, socket } = await setup(frame);
+      const terminalId = id16(20);
+      expect(
+        manager.startTerminal({
+          terminalId,
+          userId: "user-id",
+          cliDeviceId: "cli-device-id",
+          label: "Desktop",
+          cols: 80,
+          rows: 24,
+          browserPublicKey: uncompressedKey(),
+          browserNonce: id16(4),
+          connId: "a",
+        }),
+      ).toBe(true);
+      const open = control(socket).find((message) => message.type === "term.open");
+      const viewerId = open?.viewerId as string;
+      manager.sweepExpiredPendingTerminals(Date.now() + 2 * 60 * 1000 + 1);
+      expect(eventsFor("a").at(-1)).toMatchObject({ type: "rejected", reason: "expired" });
+      expect(control(socket).at(-1)).toEqual({ type: "term.close", terminalId });
+      expect(manager.listTerminalsForUser("user-id")).toEqual([]);
+
+      // The CLI spawned the shell just before the deadline: the late answer gets a close.
+      socket.sends.length = 0;
+      events = [];
+      await manager.handleTextFrame(
+        socket,
+        JSON.stringify({ type: "term.opened", terminalId, viewerId, cliNonce: id16(5) }),
+        now,
+      );
+      expect(control(socket)).toEqual([{ type: "term.close", terminalId }]);
+      expect(events).toEqual([]);
+    },
+  );
+
+  it("closes an unknown term.attached but ignores an unknown term.exit", async () => {
+    const { manager, socket } = await setup();
+    const terminalId = id16(22);
+    socket.sends.length = 0;
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "term.attached", terminalId, viewerId: id16(7), cliNonce: id16(6) }),
+      now,
+    );
+    expect(control(socket)).toEqual([{ type: "term.close", terminalId }]);
+
+    socket.sends.length = 0;
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "term.exit", terminalId, exitCode: 0 }),
+      now,
+    );
+    expect(control(socket)).toEqual([]);
+    expect(events).toEqual([]);
+  });
+
   it("sends exit to every viewer and pending tab, and drops all viewers on CLI disconnect", async () => {
     const { manager, socket } = await setup(hello25({ terminalApproval: true }));
     const terminalId = id16(20);
