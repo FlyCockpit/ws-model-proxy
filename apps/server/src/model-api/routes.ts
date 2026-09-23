@@ -134,8 +134,10 @@ import {
   type CanonicalRequest,
   CanonicalStreamRenderer,
   createProtocolAdaptationTransform,
+  executionTargetAcceptsTopK,
   type ProtocolSurface,
   parseCanonicalRequest,
+  reasoningControlForSurface,
   renderCanonicalRequest,
   renderProtocolError,
   renderProtocolErrorMetadata,
@@ -1645,6 +1647,31 @@ function targetStreamTerminal(target: ProtocolSurface, chunk: Uint8Array): boole
   if (target === "openai-responses")
     return /event: (?:response\.(?:completed|incomplete|failed)|error)\r?\n/.test(text);
   return /event: (?:message_stop|error)\r?\n/.test(text);
+}
+
+function renderForExecutionTarget({
+  request,
+  target,
+  model,
+  allowLossyDeveloperRoleCollapse,
+  kind,
+  capabilities,
+}: {
+  request: CanonicalRequest;
+  target: ProtocolSurface;
+  model: string;
+  allowLossyDeveloperRoleCollapse?: boolean;
+  kind: "cli" | "hosted-provider";
+  capabilities: OpenAiCompatibleCapabilities | null | undefined;
+}) {
+  return renderCanonicalRequest({
+    request,
+    target,
+    model,
+    allowLossyDeveloperRoleCollapse,
+    acceptsTopK: executionTargetAcceptsTopK({ kind, capabilityInventory: capabilities }),
+    reasoning: reasoningControlForSurface(capabilities ?? null, target),
+  });
 }
 
 function executionPathForPoolMember(
@@ -3655,12 +3682,14 @@ async function relayPool({
       contextCountConfidence: operation.contextCount?.confidence,
       renderForTarget: canonical
         ? async (providerTarget, targetSurface) => {
-            const payload = renderCanonicalRequest({
+            const payload = renderForExecutionTarget({
               request: canonical,
               target: targetSurface,
               model: providerTarget.upstreamModelId,
               allowLossyDeveloperRoleCollapse:
                 operation.adaptation?.allowLossyDeveloperRoleCollapse,
+              kind: "hosted-provider",
+              capabilities: providerTarget.capabilityInventory,
             });
             const headers = new Headers({ "content-type": "application/json" });
             if (providerTarget.protocol === "anthropic")
@@ -4117,11 +4146,13 @@ async function relayPool({
     const source = execution.nativeSurface ? protocolSurface(execution.nativeSurface) : null;
     if (!source || !canonicalAdaptationRequest) return false;
     try {
-      renderCanonicalRequest({
+      renderForExecutionTarget({
         request: canonicalAdaptationRequest,
         target: source,
         model: member.DiscoveredModel.upstreamModelId,
         allowLossyDeveloperRoleCollapse: operation.adaptation?.allowLossyDeveloperRoleCollapse,
+        kind: "cli",
+        capabilities: effectivePoolMemberCapabilities(member),
       });
       return true;
     } catch {
@@ -4763,11 +4794,13 @@ async function relayPool({
             "unsupported_adaptation",
             "Request is outside the strict adapted subset.",
           );
-        const rendered = renderCanonicalRequest({
+        const rendered = renderForExecutionTarget({
           request: canonicalAdaptationRequest,
           target: adaptedSource,
           model: candidate.upstreamModelId,
           allowLossyDeveloperRoleCollapse: operation.adaptation.allowLossyDeveloperRoleCollapse,
+          kind: "cli",
+          capabilities: effectivePoolMemberCapabilities(member),
         });
         if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
         const adaptedHeaders = new Headers(builtRequest.headers);

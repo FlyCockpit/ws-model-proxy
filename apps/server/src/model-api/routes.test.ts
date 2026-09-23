@@ -1044,6 +1044,202 @@ describe("model API routes", () => {
     );
   });
 
+  it("adapts Claude Code top_k onto a CLI Chat member and drops cache metadata", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "chat-member",
+        discoveredModelId: "chat-model",
+        upstreamModelId: "upstream-chat",
+        cliDeviceId: "cli-chat",
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiChatCompletions: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+              tools: true,
+            },
+          },
+        },
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-chat"];
+    const responsePromise = appWith(manager, true, true).request("/messages", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        max_tokens: 32,
+        top_k: 40,
+        metadata: { user_id: "placeholder-metadata" },
+        thinking: { type: "disabled" },
+        tools: [
+          {
+            name: "placeholder_tool",
+            cache_control: { type: "ephemeral" },
+            input_schema: { type: "object" },
+          },
+        ],
+        tool_choice: { type: "auto", disable_parallel_tool_use: true },
+        messages: [
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "tool_use",
+                id: "toolu_placeholder",
+                name: "placeholder_tool",
+                input: {},
+                cache_control: { type: "ephemeral" },
+              },
+            ],
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu_placeholder",
+                content: [
+                  { type: "text", text: "placeholder-result-a" },
+                  { type: "text", text: "placeholder-result-b" },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    expect(sent.family).toBe("chat.completions");
+    const upstream = JSON.parse(await relayBodyText(sent)) as {
+      top_k?: number;
+      messages?: Array<{ role?: string; content?: string }>;
+    };
+    expect(upstream.top_k).toBe(40);
+    expect(JSON.stringify(upstream)).not.toContain("cache_control");
+    expect(JSON.stringify(upstream)).not.toContain("placeholder-metadata");
+    expect(upstream.messages?.some((message) => message.role === "tool")).toBe(true);
+    expect(upstream.messages?.find((message) => message.role === "tool")?.content).toBe(
+      "placeholder-result-a\nplaceholder-result-b",
+    );
+    await completeJsonRelay({
+      manager,
+      requestId: sent.requestId,
+      body: {
+        id: "chat_1",
+        object: "chat.completion",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: "ok" },
+            finish_reason: "stop",
+          },
+        ],
+      },
+    });
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
+    await response.text();
+  });
+
+  it("does not dispatch top_k to a Responses-only member or enabled thinking without reasoning", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "responses-member",
+        discoveredModelId: "responses-model",
+        upstreamModelId: "upstream-responses",
+        cliDeviceId: "cli-responses",
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiResponses: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              tools: true,
+            },
+          },
+        },
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-responses"];
+    const responses = await appWith(manager, true, true).request("/messages", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        max_tokens: 16,
+        top_k: 40,
+        thinking: { type: "disabled" },
+        messages: [{ role: "user", content: "placeholder-user" }],
+      }),
+    });
+    expect(responses.status).toBe(400);
+    expect(manager.sent).toEqual([]);
+    await responses.text();
+
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "chat-member",
+        discoveredModelId: "chat-model",
+        upstreamModelId: "upstream-chat",
+        cliDeviceId: "cli-chat",
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "openai-compatible",
+          surfaces: {
+            openaiChatCompletions: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+            },
+          },
+        },
+      }),
+    ]);
+    const thinking = await appWith(manager, true, true).request("/messages", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        max_tokens: 64,
+        thinking: { type: "enabled", budget_tokens: 1024 },
+        messages: [{ role: "user", content: "placeholder-user" }],
+      }),
+    });
+    expect(thinking.status).toBe(400);
+    expect(manager.sent).toEqual([]);
+    await thinking.text();
+  });
+
   it("adapts an opted-in Chat pool request through a Responses-only member", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],

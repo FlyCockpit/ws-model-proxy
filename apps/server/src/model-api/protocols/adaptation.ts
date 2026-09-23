@@ -6,6 +6,7 @@ import type { CanonicalEvent, CanonicalRequest, ProtocolSurface } from "./canoni
 import { parseProtocolResponse, renderProtocolResponse } from "./nonstream.js";
 import { parseOpenAiChatRequest, renderOpenAiChatRequest } from "./openai-chat.js";
 import { parseOpenAiResponsesRequest, renderOpenAiResponsesRequest } from "./openai-responses.js";
+import type { ReasoningRenderControl } from "./request-controls.js";
 import { CanonicalStreamParser, CanonicalStreamRenderer } from "./streams.js";
 
 export function parseCanonicalRequest(surface: ProtocolSurface, body: unknown): CanonicalRequest {
@@ -19,16 +20,24 @@ export function renderCanonicalRequest({
   target,
   model,
   allowLossyDeveloperRoleCollapse = false,
+  acceptsTopK = false,
+  reasoning,
 }: {
   request: CanonicalRequest;
   target: ProtocolSurface;
   model: string;
   allowLossyDeveloperRoleCollapse?: boolean;
+  /** Chat targets that accept a top-level `top_k`. Default rejects. */
+  acceptsTopK?: boolean;
+  reasoning?: ReasoningRenderControl;
 }): Record<string, unknown> {
-  if (target === "openai-chat") return renderOpenAiChatRequest(request, model);
-  if (target === "openai-responses") return renderOpenAiResponsesRequest(request, model);
+  if (target === "openai-chat")
+    return renderOpenAiChatRequest(request, model, { acceptsTopK, reasoning });
+  if (target === "openai-responses")
+    return renderOpenAiResponsesRequest(request, model, { reasoning });
   return renderAnthropicMessagesRequest(request, model, {
     allowLossyInstructionRoleCollapse: allowLossyDeveloperRoleCollapse,
+    reasoning,
   });
 }
 

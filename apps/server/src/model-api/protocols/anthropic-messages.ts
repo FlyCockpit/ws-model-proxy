@@ -1,4 +1,9 @@
-import { ADAPTER_VERSION, type CanonicalMessage, type CanonicalRequest } from "./canonical.js";
+import {
+  ADAPTER_VERSION,
+  type CanonicalMessage,
+  type CanonicalRequest,
+  type CanonicalThinking,
+} from "./canonical.js";
 import { invalid, unsupported } from "./errors.js";
 import {
   boolean,
@@ -12,14 +17,28 @@ import {
   validateBase64,
   validateToolChoice,
 } from "./parse-utils.js";
+import { type ReasoningRenderControl, reasoningWireFieldsForRequest } from "./request-controls.js";
 
 const MEDIA_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"] as const);
+
+function withoutCacheControl(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  if (!("cache_control" in value)) return value;
+  const copy = { ...(value as Record<string, unknown>) };
+  delete copy.cache_control;
+  return copy;
+}
+
+function withoutCacheControlEntries(value: unknown): unknown {
+  if (typeof value === "string" || !Array.isArray(value)) return value;
+  return value.map(withoutCacheControl);
+}
 
 function blocks(value: unknown, parameter: string): CanonicalMessage["content"] {
   if (typeof value === "string") return [{ type: "text", text: value }];
   if (!Array.isArray(value)) invalid(parameter, "must be text or an array");
   return value.map((entry, index) => {
-    const block = object(entry, `${parameter}[${index}]`);
+    const block = object(withoutCacheControl(entry), `${parameter}[${index}]`);
     if (block.type === "text") {
       rejectUnknown(block, ["type", "text"], `${parameter}[${index}]`);
       return { type: "text", text: string(block.text, `${parameter}[${index}].text`) };
@@ -56,15 +75,13 @@ function blocks(value: unknown, parameter: string): CanonicalMessage["content"] 
       );
       if (block.is_error !== undefined && typeof block.is_error !== "boolean")
         invalid(`${parameter}[${index}].is_error`, "must be a boolean");
-      if (Array.isArray(block.content) && block.content.length > 1)
-        unsupported(
-          `${parameter}[${index}].content`,
-          "multiple tool-result blocks cannot be losslessly adapted",
-        );
       return {
         type: "tool_result",
         toolCallId: string(block.tool_use_id, `${parameter}[${index}].tool_use_id`),
-        content: texts(block.content ?? "", `${parameter}[${index}].content`),
+        content: texts(
+          withoutCacheControlEntries(block.content ?? ""),
+          `${parameter}[${index}].content`,
+        ),
         ...(block.is_error === true ? { isError: true } : {}),
       };
     }
@@ -85,8 +102,11 @@ export function parseAnthropicMessagesRequest(input: unknown): CanonicalRequest 
       "stream",
       "temperature",
       "top_p",
+      "top_k",
       "stop_sequences",
       "max_tokens",
+      "metadata",
+      "thinking",
     ],
     "body",
   );
@@ -118,12 +138,18 @@ export function parseAnthropicMessagesRequest(input: unknown): CanonicalRequest 
       boundary: { sourceIndex },
     };
   });
-  const tools = parseTools(body.tools, "tools", "anthropic");
+  const tools = parseTools(
+    Array.isArray(body.tools) ? body.tools.map(withoutCacheControl) : body.tools,
+    "tools",
+    "anthropic",
+  );
   if (tools.length && body.tool_choice === undefined)
     invalid("tool_choice", "must explicitly disable parallel tool use when tools are adapted");
   const toolChoice = parseAnthropicToolChoice(body.tool_choice);
   validateToolChoice(toolChoice, tools);
   validateMessageToolIds(messages);
+  const topK = parseTopK(body.top_k);
+  const thinking = parseThinking(body.thinking);
   return {
     adapterVersion: ADAPTER_VERSION,
     source: "anthropic-messages",
@@ -134,7 +160,7 @@ export function parseAnthropicMessagesRequest(input: unknown): CanonicalRequest 
         : [
             {
               role: "system",
-              content: texts(body.system, "system"),
+              content: texts(withoutCacheControlEntries(body.system), "system"),
               boundary: { sourceIndex: -1 },
             },
           ],
@@ -143,9 +169,38 @@ export function parseAnthropicMessagesRequest(input: unknown): CanonicalRequest 
     toolChoice,
     parallelToolCalls: "single",
     stream: boolean(body.stream, "stream"),
-    sampling: sampling(body, "max_tokens"),
+    sampling: { ...sampling(body, "max_tokens"), ...(topK !== undefined ? { topK } : {}) },
+    ...(thinking ? { thinking } : {}),
     limitations: [],
   };
+}
+
+function parseTopK(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1)
+    invalid("top_k", "must be a positive integer");
+  return value;
+}
+
+function parseThinking(value: unknown): CanonicalThinking | undefined {
+  if (value === undefined) return undefined;
+  const thinking = object(value, "thinking");
+  if (thinking.type === "disabled") {
+    rejectUnknown(thinking, ["type"], "thinking");
+    return { type: "disabled" };
+  }
+  if (thinking.type === "enabled") {
+    rejectUnknown(thinking, ["type", "budget_tokens"], "thinking");
+    if (!Number.isSafeInteger(thinking.budget_tokens) || (thinking.budget_tokens as number) < 1)
+      invalid("thinking.budget_tokens", "must be a positive integer");
+    return { type: "enabled", budgetTokens: thinking.budget_tokens as number };
+  }
+  // `anthropic_adaptive_thinking` already encodes `{ type: "adaptive" }`.
+  if (thinking.type === "adaptive") {
+    rejectUnknown(thinking, ["type"], "thinking");
+    return { type: "adaptive" };
+  }
+  unsupported("thinking.type");
 }
 
 function validateMessageToolIds(messages: readonly CanonicalMessage[]) {
@@ -170,7 +225,7 @@ function validateMessageToolIds(messages: readonly CanonicalMessage[]) {
 export function renderAnthropicMessagesRequest(
   request: CanonicalRequest,
   model: string,
-  options: { allowLossyInstructionRoleCollapse?: boolean } = {},
+  options: { allowLossyInstructionRoleCollapse?: boolean; reasoning?: ReasoningRenderControl } = {},
 ): Record<string, unknown> {
   const firstMessageIndex = request.messages.reduce(
     (first, message) =>
@@ -200,6 +255,11 @@ export function renderAnthropicMessagesRequest(
       "mix system and developer roles; enable lossy instruction-role collapse explicitly",
     );
   }
+  const reasoningFields = reasoningWireFieldsForRequest(
+    request,
+    "anthropic-messages",
+    options.reasoning,
+  );
   const system = request.instructions.flatMap((instruction) =>
     instruction.content.map((part) => ({ type: "text", text: part.text })),
   );
@@ -262,8 +322,10 @@ export function renderAnthropicMessagesRequest(
       ? { temperature: request.sampling.temperature }
       : {}),
     ...(request.sampling.topP !== undefined ? { top_p: request.sampling.topP } : {}),
+    ...(request.sampling.topK !== undefined ? { top_k: request.sampling.topK } : {}),
     ...(request.sampling.stop ? { stop_sequences: request.sampling.stop } : {}),
     max_tokens: request.sampling.maxOutputTokens ?? 1024,
+    ...reasoningFields,
   };
 }
 

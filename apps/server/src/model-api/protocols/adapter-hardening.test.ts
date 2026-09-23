@@ -1,9 +1,15 @@
+import { readFile } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
 import {
   CanonicalStreamParser,
+  capabilityInventoryAcceptsTopK,
+  executionTargetAcceptsTopK,
   parseAnthropicMessagesRequest,
   parseOpenAiChatRequest,
+  type ReasoningRenderControl,
   renderAnthropicMessagesRequest,
+  renderCanonicalRequest,
+  renderOpenAiChatRequest,
   renderOpenAiResponsesRequest,
   renderProtocolResponse,
 } from "./index.js";
@@ -411,5 +417,251 @@ describe("upstream reply stream envelopes", () => {
     ];
     expect(events.some((item) => item.type === "text_delta")).toBe(false);
     expect(events.at(-1)?.type).toBe("complete");
+  });
+});
+
+const chatReasoning = {
+  supported: true,
+  config: {
+    encoding: { kind: "openai_reasoning_effort" },
+    supportedLevels: ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+    defaultLevel: "high",
+  },
+} satisfies ReasoningRenderControl;
+
+describe("Claude Code Anthropic request adaptation", () => {
+  async function claudeCodeRequest() {
+    return JSON.parse(
+      await readFile(new URL("./fixtures/claude-code-messages-v1.json", import.meta.url), "utf8"),
+    ) as Record<string, unknown>;
+  }
+
+  it("drops cache metadata, joins tool-result text, and keeps top_k for a CLI Chat target", async () => {
+    const request = await claudeCodeRequest();
+    const canonical = parseAnthropicMessagesRequest(request);
+    expect(canonical.sampling.topK).toBe(40);
+    expect(canonical.thinking).toEqual({ type: "disabled" });
+    expect(JSON.stringify(canonical)).not.toContain("cache_control");
+    expect(JSON.stringify(canonical)).not.toContain("placeholder-metadata");
+    const rendered = renderCanonicalRequest({
+      request: canonical,
+      target: "openai-chat",
+      model: "cli-chat",
+      acceptsTopK: executionTargetAcceptsTopK({ kind: "cli" }),
+    });
+    expect(rendered.top_k).toBe(40);
+    expect(rendered).not.toHaveProperty("reasoning_effort");
+    expect(rendered).not.toHaveProperty("metadata");
+    expect(rendered).not.toHaveProperty("thinking");
+    const wire = JSON.stringify(rendered);
+    expect(wire).not.toContain("cache_control");
+    expect(wire).not.toContain("placeholder-metadata");
+    expect(wire).toContain("placeholder-system");
+    expect(wire).toContain("placeholder-result-a\\nplaceholder-result-b");
+    expect(executionTargetAcceptsTopK({ kind: "cli", capabilityInventory: { version: 3 } })).toBe(
+      true,
+    );
+  });
+
+  it("rejects the same request for a hosted Chat target that has no top_k sampling extension", async () => {
+    const canonical = parseAnthropicMessagesRequest(await claudeCodeRequest());
+    const inventory = {
+      version: 3,
+      protocol: "openai-compatible",
+      surfaces: {
+        openaiChatCompletions: { source: "declared", confidence: "exact", supported: true },
+      },
+    };
+    expect(capabilityInventoryAcceptsTopK(inventory)).toBe(false);
+    expect(
+      executionTargetAcceptsTopK({ kind: "hosted-provider", capabilityInventory: inventory }),
+    ).toBe(false);
+    expect(() =>
+      renderCanonicalRequest({
+        request: canonical,
+        target: "openai-chat",
+        model: "hosted-chat",
+        acceptsTopK: false,
+        reasoning: { supported: true },
+      }),
+    ).toThrow(/top_k/u);
+  });
+
+  it("accepts top_k only when a hosted inventory already lists it on a sampling extension", () => {
+    expect(
+      capabilityInventoryAcceptsTopK({
+        sampling: { parameters: ["temperature", "top_k"] },
+      }),
+    ).toBe(true);
+    expect(
+      capabilityInventoryAcceptsTopK({
+        surfaces: { openaiChatCompletions: { sampling: { parameters: ["top_p"] } } },
+      }),
+    ).toBe(false);
+  });
+
+  it("fails a Responses target instead of dropping top_k", async () => {
+    const canonical = parseAnthropicMessagesRequest(await claudeCodeRequest());
+    expect(() =>
+      renderCanonicalRequest({
+        request: canonical,
+        target: "openai-responses",
+        model: "responses-only",
+        acceptsTopK: true,
+      }),
+    ).toThrow(/top_k/u);
+  });
+
+  it("drops disabled thinking when reasoning is unsupported and maps enabled thinking when it is", () => {
+    const base = { model: "placeholder-model", max_tokens: 64, messages: [] };
+    const disabled = parseAnthropicMessagesRequest({
+      ...base,
+      thinking: { type: "disabled" },
+    });
+    expect(renderOpenAiChatRequest(disabled, "cli-chat", { acceptsTopK: true })).not.toHaveProperty(
+      "reasoning_effort",
+    );
+    expect(
+      renderOpenAiChatRequest(disabled, "cli-chat", { reasoning: chatReasoning }),
+    ).toMatchObject({ reasoning_effort: "none" });
+    expect(() =>
+      parseAnthropicMessagesRequest({
+        ...base,
+        thinking: { type: "enabled", budget_tokens: 1024 },
+      }),
+    ).not.toThrow();
+    const enabled = parseAnthropicMessagesRequest({
+      ...base,
+      thinking: { type: "enabled", budget_tokens: 1024 },
+    });
+    expect(() => renderOpenAiChatRequest(enabled, "cli-chat")).toThrow(/thinking/u);
+    expect(
+      renderOpenAiChatRequest(enabled, "cli-chat", { reasoning: chatReasoning }),
+    ).toMatchObject({ reasoning_effort: "minimal" });
+    const high = parseAnthropicMessagesRequest({
+      ...base,
+      thinking: { type: "enabled", budget_tokens: 16384 },
+    });
+    expect(
+      renderOpenAiChatRequest(high, "cli-chat", {
+        reasoning: {
+          supported: true,
+          config: { encoding: { kind: "openai_reasoning_object" } },
+        },
+      }),
+    ).toEqual(expect.objectContaining({ reasoning: { effort: "high" } }));
+    const anthropic = renderAnthropicMessagesRequest(high, "claude", {
+      reasoning: { supported: true },
+    });
+    expect(anthropic.max_tokens).toBe(64);
+    expect(anthropic.thinking).toEqual({ type: "enabled", budget_tokens: 16384 });
+  });
+
+  it("accepts adaptive thinking because the reasoning contract already encodes it", () => {
+    const adaptive = parseAnthropicMessagesRequest({
+      model: "placeholder-model",
+      max_tokens: 32,
+      messages: [],
+      thinking: { type: "adaptive" },
+    });
+    expect(adaptive.thinking).toEqual({ type: "adaptive" });
+    expect(() => renderOpenAiChatRequest(adaptive, "cli-chat")).toThrow(/thinking/u);
+    expect(
+      renderOpenAiChatRequest(adaptive, "cli-chat", { reasoning: chatReasoning }),
+    ).toMatchObject({ reasoning_effort: "high" });
+    expect(() =>
+      renderOpenAiChatRequest(adaptive, "cli-chat", {
+        reasoning: { supported: true, config: { encoding: { kind: "openai_reasoning_effort" } } },
+      }),
+    ).toThrow(/thinking/u);
+  });
+
+  it("rejects invalid top_k, document blocks, URL images, and non-text tool results", () => {
+    const base = { model: "placeholder-model", max_tokens: 8, messages: [] };
+    expect(() => parseAnthropicMessagesRequest({ ...base, top_k: 0 })).toThrow(/top_k/u);
+    expect(() => parseAnthropicMessagesRequest({ ...base, top_k: 1.5 })).toThrow(/top_k/u);
+    expect(() => parseAnthropicMessagesRequest({ ...base, top_k: "40" })).toThrow(/top_k/u);
+    expect(() => parseOpenAiChatRequest({ model: "m", messages: [], top_k: 40 })).toThrow(/top_k/u);
+    expect(() =>
+      parseAnthropicMessagesRequest({
+        ...base,
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "document", source: { type: "text", data: "placeholder" } }],
+          },
+        ],
+      }),
+    ).toThrow(/type/u);
+    expect(() =>
+      parseAnthropicMessagesRequest({
+        ...base,
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "image",
+                source: { type: "url", url: "https://example.test/placeholder.png" },
+              },
+            ],
+          },
+        ],
+      }),
+    ).toThrow(/source/u);
+    expect(
+      parseAnthropicMessagesRequest({
+        ...base,
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "image",
+                source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" },
+              },
+            ],
+          },
+        ],
+      }).messages[0]?.content[0],
+    ).toMatchObject({ type: "image", source: { kind: "base64", mediaType: "image/png" } });
+    expect(() =>
+      parseAnthropicMessagesRequest({
+        ...base,
+        messages: [
+          {
+            role: "assistant",
+            content: [{ type: "tool_use", id: "call", name: "lookup", input: {} }],
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "call",
+                content: [
+                  { type: "text", text: "placeholder" },
+                  {
+                    type: "image",
+                    source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" },
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    ).toThrow(/content/u);
+  });
+
+  it("still rejects an unknown Anthropic request field", () => {
+    expect(() =>
+      parseAnthropicMessagesRequest({
+        model: "placeholder-model",
+        max_tokens: 8,
+        messages: [],
+        service_tier: "auto",
+      }),
+    ).toThrow(/service_tier/u);
   });
 });
