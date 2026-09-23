@@ -285,8 +285,20 @@
     "relayMetadata": "Relay metadata",
     "terminals": "Terminals"
   },
+  "notices": {
+    "region": "Notices",
+    "dismiss": "Dismiss",
+    "poolExternalProvider": "{{pool}} may send requests to an external provider."
+  },
   "pools": {
     "notFound": "This pool was not found or is no longer available to you.",
+    "privacyBadge": {
+      "private": "Private",
+      "external": "May use external providers"
+    },
+    "granteePrivacyConfirmTitle": "This pool may send data to an external provider",
+    "granteePrivacyConfirmDescription": "{{pool}} is already shared. Requests from these people may leave this deployment. They will be notified. Their access is not paused.",
+    "granteePrivacyConfirmAction": "Confirm and continue",
     "affinity": {
       "title": "Cache-aware routing",
       "description": "New sessions go to the member with the best availability score (load, health, public-egress, and cost). When those scores tie, prefer a runtime that may still hold a matching instruction prefix. System-prompt-aware routing is part of this switch. After an assistant or tool turn, prefer the member that served the conversation so far. A long conversation can outweigh modest load or a half-open member; a large queue still spills the request.",
@@ -824,8 +836,9 @@
     "scopeMode": "Scope mode",
     "typeTokenName": "Type the token name to confirm",
     "visiblePreview": "{{count}} models visible to this token",
-    "publicEgressWarningTitle": "Some resources can use external providers",
-    "publicEgressWarning": "This token can access {{pools}}. Requests to these pools may send prompts, attachments, tools, and output to configured providers used as primary targets or public overflow."
+    "publicEgressWarningTitle": "Some pools may send data outside this deployment",
+    "publicEgressWarning": "Requests to {{pools}} may leave this deployment. Prompts, attachments, tools, and output can be sent to an external provider.",
+    "publicEgressWarningNamed": "Requests to {{pools}} may leave this deployment. Prompts, attachments, tools, and output can be sent to {{providers}}."
   },
   "providers": {
     "title": "Public provider operations",

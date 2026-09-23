@@ -7,7 +7,11 @@ import {
   PRODUCT_CREDENTIAL_PREFIXES,
   verifyForwarderHmacDigest,
 } from "@ws-model-proxy/db/forwarder-security";
-import { effectiveProviderEgress, providerPrimaryMemberWhere } from "./effective-provider-egress";
+import {
+  effectiveProviderEgress,
+  egressProviderAccountLabels,
+  providerPrimaryMemberWhere,
+} from "./effective-provider-egress";
 import { parseModelApiSurface } from "./model-api-surface";
 import type { ModelApiSurface } from "./surface-capabilities";
 
@@ -61,6 +65,8 @@ export type VisibleModelPoolTarget = {
    */
   effectiveProviderEgress: boolean;
   providerPrimaryMemberCount: number;
+  /** Display names of provider accounts that can receive traffic. Never credentials. */
+  providerAccountLabels: string[];
   allowLossyDeveloperRoleCollapse: boolean;
   recommendedSurfaceOverride: ModelApiSurface | null;
 };
@@ -110,7 +116,16 @@ const modelPoolSelect = {
   recommendedSurfaceOverride: true,
   PoolMembers: {
     where: providerPrimaryMemberWhere,
-    select: { id: true },
+    select: {
+      id: true,
+      ExecutionTarget: {
+        select: {
+          ProviderModel: {
+            select: { ProviderAccount: { select: { label: true } } },
+          },
+        },
+      },
+    },
   },
   User: { select: { slug: true } },
 } satisfies Prisma.ModelPoolSelect;
@@ -164,6 +179,13 @@ function serializeModelPool(
       providerPrimaryMemberCount: row.PoolMembers?.length ?? 0,
     }),
     providerPrimaryMemberCount: row.PoolMembers?.length ?? 0,
+    providerAccountLabels: egressProviderAccountLabels({
+      publicEgressEnabled: row.publicEgressEnabled,
+      members: (row.PoolMembers ?? []).map((member) => ({
+        tier: "PRIMARY",
+        accountLabel: member.ExecutionTarget?.ProviderModel?.ProviderAccount.label ?? null,
+      })),
+    }),
     allowLossyDeveloperRoleCollapse: row.allowLossyDeveloperRoleCollapse,
     recommendedSurfaceOverride: parseModelApiSurface(row.recommendedSurfaceOverride),
   };

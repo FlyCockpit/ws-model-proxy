@@ -13,6 +13,7 @@ import { AudioLines, ChevronsUpDown, Image, Video } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { PoolPrivacyBadge } from "@/components/pool-privacy-badge";
 import type { AttachmentModalities } from "@/lib/image-attachments";
 
 import type { ModelOption } from "./chat-test-types";
@@ -84,8 +85,13 @@ export function ModelPicker({
           />
         }
       >
-        <span className="min-w-0 flex-1 break-all text-left">
-          {selected?.modelId ?? t("dashboard:chatTest.modelPicker")}
+        <span className="flex min-w-0 flex-1 flex-wrap items-center gap-2 text-left">
+          <span className="min-w-0 break-all">
+            {selected?.modelId ?? t("dashboard:chatTest.modelPicker")}
+          </span>
+          {selected?.kind === "MODEL_POOL" ? (
+            <PoolPrivacyBadge external={selected.effectiveProviderEgress === true} />
+          ) : null}
         </span>
         <ChevronsUpDown className="size-4 shrink-0 opacity-50" />
       </PopoverTrigger>
@@ -124,6 +130,9 @@ export function ModelPicker({
                       </span>
                     </span>
                     <span className="inline-flex shrink-0 items-center gap-2">
+                      {option.kind === "MODEL_POOL" ? (
+                        <PoolPrivacyBadge external={option.effectiveProviderEgress === true} />
+                      ) : null}
                       <span className="rounded-full border bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
                         {option.kind === "MODEL_POOL"
                           ? t("dashboard:chatTest.modelKinds.pool")

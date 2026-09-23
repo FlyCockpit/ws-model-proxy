@@ -140,6 +140,44 @@ afterEach(() => {
 });
 
 describe("dedicated pool pages", () => {
+  it("shows private and external-provider badges on the pool list and detail", () => {
+    state.pools = [
+      {
+        id: "pool-private",
+        slug: "local",
+        name: "Local",
+        description: null,
+        canonicalModelId: "owner/pool/local",
+        effectiveProviderEgress: false,
+        members: [],
+        grants: [],
+        compatibility: { recommendedSurface: null },
+        transformer: { model: null },
+      },
+      {
+        id: "pool-external",
+        slug: "shared",
+        name: "Shared",
+        description: null,
+        canonicalModelId: "owner/pool/shared",
+        effectiveProviderEgress: true,
+        members: [],
+        grants: [],
+        compatibility: { recommendedSurface: null },
+        transformer: { model: null },
+      },
+    ];
+
+    mount(<PoolsListPage lang="en-US" />);
+
+    expect(screen.getByText("dashboard:pools.privacyBadge.private")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.privacyBadge.external")).toBeTruthy();
+
+    cleanup();
+    mount(<PoolDetailPage poolId="pool-external" />);
+    expect(screen.getByText("dashboard:pools.privacyBadge.external")).toBeTruthy();
+  });
+
   it("links the list edit action to the pool detail route instead of opening a sheet", () => {
     state.pools = [
       {

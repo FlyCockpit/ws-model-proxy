@@ -115,6 +115,7 @@ function modelOptions(visibleModels: VisibleModels | undefined): ModelOption[] {
       maxAttachmentBytes: pool.maxAttachmentBytes,
       reasoning: pool.reasoning,
       compatibility: pool.compatibility,
+      effectiveProviderEgress: pool.effectiveProviderEgress,
     })),
   ];
 }

@@ -213,6 +213,26 @@ describe("Chat Test quick wins", () => {
     expect(screen.getByText("dashboard:chatTest.modelKinds.pool")).toBeTruthy();
   });
 
+  it("shows the external-provider badge for a non-private pool and not for a direct model", async () => {
+    state.models = [directModel];
+    state.pools = [{ ...poolModel, effectiveProviderEgress: true }];
+    await act(async () => {
+      mount();
+    });
+
+    expect(screen.getAllByText("dashboard:pools.privacyBadge.external").length).toBeGreaterThan(0);
+    expect(screen.queryByText("dashboard:pools.privacyBadge.private")).toBeNull();
+  });
+
+  it("shows the private badge when a pool does not use an external provider", async () => {
+    state.pools = [{ ...poolModel, effectiveProviderEgress: false }];
+    await act(async () => {
+      mount();
+    });
+
+    expect(screen.getAllByText("dashboard:pools.privacyBadge.private").length).toBeGreaterThan(0);
+  });
+
   it("keeps direct-model surface controls out of request settings", async () => {
     state.models = [directModel];
     state.isDesktop = true;

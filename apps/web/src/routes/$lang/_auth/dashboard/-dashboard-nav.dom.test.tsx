@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen } from "@testing-library/react";
 import type { ComponentType, ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -35,10 +36,34 @@ vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
 
+vi.mock("@/utils/orpc", () => ({
+  orpc: {
+    forwarderManagement: {
+      listDashboardNotices: {
+        queryOptions: () => ({
+          queryKey: ["dashboard-notices"],
+          queryFn: async () => [],
+          initialData: [],
+        }),
+        key: () => ["dashboard-notices"],
+      },
+      dismissDashboardNotice: {
+        mutationOptions: () => ({ mutationFn: async () => ({ dismissed: true }) }),
+      },
+    },
+  },
+}));
+
 import { DashboardFrame } from "@/components/dashboard-frame";
 
 function renderLayout() {
-  return render(<DashboardFrame lang="en-US" />);
+  return render(
+    <QueryClientProvider
+      client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+    >
+      <DashboardFrame lang="en-US" />
+    </QueryClientProvider>,
+  );
 }
 
 afterEach(() => {

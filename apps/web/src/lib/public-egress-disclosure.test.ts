@@ -1,19 +1,25 @@
 import { describe, expect, it } from "vitest";
 
-import { publicEgressResourceNames } from "./public-egress-disclosure";
+import { egressProviderAccountLabels, publicEgressResourceNames } from "./public-egress-disclosure";
 
 describe("publicEgressResourceNames", () => {
-  it("names only resources whose effective configuration permits public egress", () => {
+  it("names only resources the server marks as using an external provider", () => {
     expect(
       publicEgressResourceNames([
-        { name: "Local only", publicEgressEnabled: false },
-        {
-          name: "Provider primary",
-          publicEgressEnabled: false,
-          effectiveProviderEgress: true,
-        },
-        { name: "Guarded overflow", publicEgressEnabled: true },
+        { name: "Local only", effectiveProviderEgress: false },
+        { name: "Provider primary", effectiveProviderEgress: true },
+        { name: "Missing flag" },
       ]),
-    ).toEqual(["Provider primary", "Guarded overflow"]);
+    ).toEqual(["Provider primary"]);
+  });
+
+  it("collects provider account labels already present on the payload", () => {
+    expect(
+      egressProviderAccountLabels([
+        { providerAccountLabels: ["Ada's OpenAI", "Ada's OpenAI"] },
+        { providerAccountLabels: ["Backup"] },
+        {},
+      ]),
+    ).toEqual(["Ada's OpenAI", "Backup"]);
   });
 });

@@ -35,10 +35,15 @@ import {
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
+import { GranteePrivacyConfirmDialog } from "@/components/grantee-privacy-confirm-dialog";
 import { InlineRetry } from "@/components/inline-retry";
 import { WideContent } from "@/components/wide-content";
 import { useDeploymentAudience } from "@/hooks/use-deployment-audience";
 import { privateNetworksAllowedFromConfig } from "@/lib/deployment-feature-gate";
+import {
+  type GranteePrivacyConfirm,
+  granteePrivacyConfirmationFromError,
+} from "@/lib/grantee-privacy-confirmation";
 import { orpc } from "@/utils/orpc";
 
 const showValue = (value: unknown) => (value === null || value === undefined ? "—" : String(value));
@@ -411,6 +416,9 @@ export function ProviderOperationsSection() {
     tier: "PRIMARY" as "PRIMARY" | "PUBLIC_OVERFLOW",
     publicOrder: "0",
   });
+  const [privacyConfirm, setPrivacyConfirm] = useState<
+    (GranteePrivacyConfirm & { retry: () => void }) | null
+  >(null);
   const budgetDefaults = {
     concurrencyMode: "LIMITED" as "LIMITED" | "UNLIMITED",
     concurrency: "1",
@@ -595,14 +603,40 @@ export function ProviderOperationsSection() {
   );
   const updatePool = useMutation(
     orpc.forwarderManagement.updateModelPool.mutationOptions({
-      onSuccess: () => invalidate(),
-      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+      onSuccess: () => {
+        setPrivacyConfirm(null);
+        invalidate();
+      },
+      onError: (error, variables) => {
+        const confirmation = granteePrivacyConfirmationFromError(error);
+        if (confirmation) {
+          setPrivacyConfirm({
+            ...confirmation,
+            retry: () => updatePool.mutate({ ...variables, confirmGranteePrivacyChange: true }),
+          });
+          return;
+        }
+        toast.error(t("dashboard:providers.feedback.failed"));
+      },
     }),
   );
   const addPoolMember = useMutation(
     orpc.forwarderManagement.addProviderPoolMember.mutationOptions({
-      onSuccess: () => invalidate(),
-      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+      onSuccess: () => {
+        setPrivacyConfirm(null);
+        invalidate();
+      },
+      onError: (error, variables) => {
+        const confirmation = granteePrivacyConfirmationFromError(error);
+        if (confirmation) {
+          setPrivacyConfirm({
+            ...confirmation,
+            retry: () => addPoolMember.mutate({ ...variables, confirmGranteePrivacyChange: true }),
+          });
+          return;
+        }
+        toast.error(t("dashboard:providers.feedback.failed"));
+      },
     }),
   );
   const reorderPoolMember = useMutation(
@@ -1967,6 +2001,14 @@ export function ProviderOperationsSection() {
           ) : null}
         </div>
       )}
+      <GranteePrivacyConfirmDialog
+        confirmation={privacyConfirm}
+        pending={updatePool.isPending || addPoolMember.isPending}
+        onOpenChange={(open) => {
+          if (!open) setPrivacyConfirm(null);
+        }}
+        onConfirm={() => privacyConfirm?.retry()}
+      />
     </section>
   );
 }

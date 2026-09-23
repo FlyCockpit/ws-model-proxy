@@ -33,10 +33,17 @@ import {
 } from "../lib/discovered-inference-capacity";
 import {
   effectiveProviderEgress,
+  egressProviderAccountLabels,
   grantPoolAccessServerMessages,
   providerPrimaryMemberCount,
   providerPrimaryMemberWhere,
 } from "../lib/effective-provider-egress";
+import {
+  countProviderPrimaryMembers,
+  deliverGranteePrivacyEmails,
+  gateSharedPoolPrivacyChange,
+  recordGranteePrivacyNotices,
+} from "../lib/grantee-privacy";
 import type { GuardedPoolCreateFailureReason } from "../lib/guarded-pool-create-reasons";
 import {
   getConfiguredMediaAttachmentMaxBytes,
@@ -501,10 +508,10 @@ async function serializeVisibleTargets(targets: VisibleModelTargets) {
         })
       : [],
   ]);
-  const poolCompatibility = new Map(
+  const serializedPools = new Map(
     poolRows.map((row) => {
       const serialized = serializePool(row);
-      return [row.id, serialized.compatibility] as const;
+      return [row.id, serialized] as const;
     }),
   );
   return {
@@ -538,7 +545,16 @@ async function serializeVisibleTargets(targets: VisibleModelTargets) {
       maxAttachmentBytes: pool.maxAttachmentBytes,
       publicEgressEnabled: pool.publicEgressEnabled,
       publicEgressAcknowledged: pool.publicEgressAcknowledged,
-      compatibility: poolCompatibility.get(pool.id) ?? null,
+      effectiveProviderEgress: pool.effectiveProviderEgress,
+      providerAccountLabels: egressProviderAccountLabels({
+        publicEgressEnabled:
+          serializedPools.get(pool.id)?.publicEgressEnabled ?? pool.publicEgressEnabled,
+        members: (serializedPools.get(pool.id)?.members ?? []).map((member) => ({
+          tier: member.tier,
+          accountLabel: member.providerModel?.ProviderAccount.label ?? null,
+        })),
+      }),
+      compatibility: serializedPools.get(pool.id)?.compatibility ?? null,
       attachmentModalities: modalities.poolById.get(pool.id) ?? {
         image: false,
         audio: false,
@@ -2391,6 +2407,7 @@ export const forwarderManagementRouter = {
         protocolAdaptationEnabled: z.boolean().optional(),
         publicEgressEnabled: z.boolean().optional(),
         publicEgressAcknowledged: z.literal(true).optional(),
+        confirmGranteePrivacyChange: z.boolean().optional(),
         allowLossyDeveloperRoleCollapse: z.boolean().optional(),
         recommendedSurfaceOverride: poolRecommendedSurfaceSchema.nullable().optional(),
         affinityEnabled: z.boolean().optional(),
@@ -2530,11 +2547,13 @@ export const forwarderManagementRouter = {
 
       await assertPoolTransformerIsValid(input, existing, context.session.user.id);
 
-      const row = await runSerializableTransaction(async (tx) => {
+      const updated = await runSerializableTransaction(async (tx) => {
+        const userId = context.session.user.id;
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${input.id} AND "userId" = ${userId} FOR UPDATE`;
         if (hasCapacityPolicy)
           await lockAndValidateModelPoolCapacityPolicy(tx, {
             modelPoolId: input.id,
-            userId: context.session.user.id,
+            userId,
             policy: input,
             notFound: () => {
               throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
@@ -2544,14 +2563,31 @@ export const forwarderManagementRouter = {
           where: { id: input.id },
           select: {
             userId: true,
+            name: true,
+            publicEgressEnabled: true,
             protocolAdaptationEnabled: true,
             allowLossyDeveloperRoleCollapse: true,
             recommendedSurfaceOverride: true,
           },
         });
-        if (!current || current.userId !== context.session.user.id) {
+        if (!current || current.userId !== userId) {
           throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
         }
+        const providerPrimaryCount = await countProviderPrimaryMembers(tx, input.id);
+        const lockedPublicEgressEnabled = input.publicEgressEnabled ?? current.publicEgressEnabled;
+        const privacyGrantees = await gateSharedPoolPrivacyChange(tx, {
+          poolId: input.id,
+          poolName: current.name,
+          currentlyNonPrivate: effectiveProviderEgress({
+            publicEgressEnabled: current.publicEgressEnabled,
+            providerPrimaryMemberCount: providerPrimaryCount,
+          }),
+          nextNonPrivate: effectiveProviderEgress({
+            publicEgressEnabled: lockedPublicEgressEnabled,
+            providerPrimaryMemberCount: providerPrimaryCount,
+          }),
+          confirmed: input.confirmGranteePrivacyChange === true,
+        });
         if (
           input.protocolAdaptationEnabled !== undefined ||
           input.allowLossyDeveloperRoleCollapse !== undefined
@@ -2584,7 +2620,7 @@ export const forwarderManagementRouter = {
               env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
           });
         }
-        return tx.modelPool.update({
+        const row = await tx.modelPool.update({
           where: { id: input.id },
           data: {
             ...(input.slug ? { slug: input.slug } : {}),
@@ -2689,8 +2725,21 @@ export const forwarderManagementRouter = {
           },
           select: poolSelect,
         });
+        await recordGranteePrivacyNotices(tx, {
+          poolId: input.id,
+          poolName: current.name,
+          grantees: privacyGrantees,
+        });
+        return {
+          row,
+          notice:
+            privacyGrantees.length > 0
+              ? { poolName: current.name, grantees: privacyGrantees }
+              : null,
+        };
       });
-      return serializePool(row);
+      await deliverGranteePrivacyEmails(updated.notice);
+      return serializePool(updated.row);
     }),
 
   deleteModelPool: protectedProcedure
@@ -2886,12 +2935,13 @@ export const forwarderManagementRouter = {
         tier: z.enum(["PRIMARY", "PUBLIC_OVERFLOW"]).default("PUBLIC_OVERFLOW"),
         publicOrder: z.number().int().min(0).max(10_000).optional(),
         weight: z.number().int().min(0).max(10_000).default(1),
+        confirmGranteePrivacyChange: z.boolean().optional(),
       }),
     )
     .handler(async ({ input, context }) => {
       assertProviderEgressReleaseGate();
       const userId = context.session.user.id;
-      return runSerializableTransaction(async (tx) => {
+      const attached = await runSerializableTransaction(async (tx) => {
         const candidatePool = await tx.modelPool.findFirst({
           where: { id: input.poolId, userId },
           select: { id: true },
@@ -2902,6 +2952,7 @@ export const forwarderManagementRouter = {
           where: { id: candidatePool.id, userId },
           select: {
             id: true,
+            name: true,
             publicEgressEnabled: true,
             publicEgressAcknowledged: true,
             recommendedSurfaceOverride: true,
@@ -3022,6 +3073,18 @@ export const forwarderManagementRouter = {
             message: "The attachment protection policy must have an activation audit trail.",
           });
         }
+        const providerPrimaryCount = await countProviderPrimaryMembers(tx, pool.id);
+        const currentlyNonPrivate = effectiveProviderEgress({
+          publicEgressEnabled: pool.publicEgressEnabled,
+          providerPrimaryMemberCount: providerPrimaryCount,
+        });
+        const privacyGrantees = await gateSharedPoolPrivacyChange(tx, {
+          poolId: pool.id,
+          poolName: pool.name,
+          currentlyNonPrivate,
+          nextNonPrivate: input.tier === "PRIMARY" || currentlyNonPrivate,
+          confirmed: input.confirmGranteePrivacyChange === true,
+        });
         const existingTarget = await tx.executionTarget.findUnique({
           where: { providerModelId: input.providerModelId },
           select: { id: true, inferenceCapacityId: true },
@@ -3127,8 +3190,20 @@ export const forwarderManagementRouter = {
             });
           }
         }
-        return { id: member.id, executionTargetId: target.id };
+        await recordGranteePrivacyNotices(tx, {
+          poolId: pool.id,
+          poolName: pool.name,
+          grantees: privacyGrantees,
+        });
+        return {
+          id: member.id,
+          executionTargetId: target.id,
+          notice:
+            privacyGrantees.length > 0 ? { poolName: pool.name, grantees: privacyGrantees } : null,
+        };
       });
+      await deliverGranteePrivacyEmails(attached.notice);
+      return { id: attached.id, executionTargetId: attached.executionTargetId };
     }),
 
   updatePoolMember: protectedProcedure
@@ -3140,6 +3215,7 @@ export const forwarderManagementRouter = {
           routingStatus: routingStatusSchema.optional(),
           tier: z.enum(["PRIMARY", "PUBLIC_OVERFLOW"]).optional(),
           publicOrder: z.number().int().min(0).max(10_000).optional(),
+          confirmGranteePrivacyChange: z.boolean().optional(),
           capacityPriority: z.number().int().min(0).max(31).nullable().optional(),
           capacityConcurrencyMode: z.enum(["INHERIT", "LIMITED", "UNLIMITED"]).optional(),
           capacityConcurrencyLimit: z.number().int().min(1).max(10_000).nullable().optional(),
@@ -3195,7 +3271,7 @@ export const forwarderManagementRouter = {
     )
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
-      return prisma.$transaction(
+      const updatedMember = await prisma.$transaction(
         async (tx) => {
           const candidate = await tx.poolMember.findUnique({
             where: { id: input.id },
@@ -3240,6 +3316,7 @@ export const forwarderManagementRouter = {
               ModelPool: {
                 select: {
                   userId: true,
+                  name: true,
                   publicEgressEnabled: true,
                   publicEgressAcknowledged: true,
                   recommendedSurfaceOverride: true,
@@ -3402,6 +3479,25 @@ export const forwarderManagementRouter = {
             });
           }
 
+          const promotingProviderPrimary =
+            Boolean(providerModel) && member.tier !== "PRIMARY" && nextTier === "PRIMARY";
+          const privacyGrantees = promotingProviderPrimary
+            ? await gateSharedPoolPrivacyChange(tx, {
+                poolId: member.poolId,
+                poolName: member.ModelPool.name,
+                currentlyNonPrivate: effectiveProviderEgress({
+                  publicEgressEnabled: member.ModelPool.publicEgressEnabled,
+                  providerPrimaryMemberCount: await countProviderPrimaryMembers(
+                    tx,
+                    member.poolId,
+                    member.id,
+                  ),
+                }),
+                nextNonPrivate: true,
+                confirmed: input.confirmGranteePrivacyChange === true,
+              })
+            : [];
+
           // Move existing rows out of the unique public-order range before
           // assigning the normalized contiguous order.
           if (overflow.length > 0)
@@ -3481,12 +3577,26 @@ export const forwarderManagementRouter = {
                 },
               },
             });
-          return Object.hasOwn(updated, "tier")
+          const memberResult = Object.hasOwn(updated, "tier")
             ? { ...updated, publicOrder: nextTier === "PUBLIC_OVERFLOW" ? desiredOrder : null }
             : updated;
+          await recordGranteePrivacyNotices(tx, {
+            poolId: member.poolId,
+            poolName: member.ModelPool.name,
+            grantees: privacyGrantees,
+          });
+          return {
+            member: memberResult,
+            notice:
+              privacyGrantees.length > 0
+                ? { poolName: member.ModelPool.name, grantees: privacyGrantees }
+                : null,
+          };
         },
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
       );
+      await deliverGranteePrivacyEmails(updatedMember.notice);
+      return updatedMember.member;
     }),
 
   reorderProviderPoolMember: protectedProcedure
@@ -3833,51 +3943,64 @@ export const forwarderManagementRouter = {
     )
     .handler(async ({ input, context }) => {
       const pool = await ownedPool(input.poolId, context.session.user.id);
-      // Skip the member lookup when overflow is already on; the shared rule
-      // still requires acknowledgement from publicEgressEnabled alone.
-      const providerPrimary = pool.publicEgressEnabled
-        ? null
-        : await prisma.poolMember.findFirst({
-            where: { poolId: pool.id, ...providerPrimaryMemberWhere },
-            select: { id: true },
+      const userId = context.session.user.id;
+      // Lock the pool row before re-reading egress so a privacy transition
+      // cannot commit between this check and the grant insert.
+      return runSerializableTransaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${pool.id} AND "userId" = ${userId} FOR UPDATE`;
+        const locked = await tx.modelPool.findUnique({
+          where: { id: pool.id },
+          select: { id: true, userId: true, publicEgressEnabled: true },
+        });
+        if (!locked || locked.userId !== userId) {
+          throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+        }
+        // Skip the member lookup when overflow is already on; the shared rule
+        // still requires acknowledgement from publicEgressEnabled alone.
+        const providerPrimary = locked.publicEgressEnabled
+          ? null
+          : await tx.poolMember.findFirst({
+              where: { poolId: locked.id, ...providerPrimaryMemberWhere },
+              select: { id: true },
+            });
+        if (
+          effectiveProviderEgress({
+            publicEgressEnabled: locked.publicEgressEnabled,
+            providerPrimaryMemberCount: providerPrimary ? 1 : 0,
+          }) &&
+          !input.publicEgressAcknowledged
+        ) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: grantPoolAccessServerMessages.egressAcknowledgementRequired,
           });
-      if (
-        effectiveProviderEgress({
-          publicEgressEnabled: pool.publicEgressEnabled,
-          providerPrimaryMemberCount: providerPrimary ? 1 : 0,
-        }) &&
-        !input.publicEgressAcknowledged
-      ) {
-        throw new ORPCError("BAD_REQUEST", {
-          message: grantPoolAccessServerMessages.egressAcknowledgementRequired,
+        }
+        const grantee = await tx.user.findFirst({
+          where: { email: { equals: input.email, mode: "insensitive" } },
+          select: { id: true },
         });
-      }
-      const grantee = await prisma.user.findFirst({
-        where: { email: { equals: input.email, mode: "insensitive" } },
-        select: { id: true },
-      });
-      if (!grantee) {
-        throw new ORPCError("NOT_FOUND", { message: grantPoolAccessServerMessages.userNotFound });
-      }
-      if (grantee.id === context.session.user.id) {
-        throw new ORPCError("BAD_REQUEST", {
-          message: grantPoolAccessServerMessages.cannotGrantToSelf,
-        });
-      }
-      return prisma.poolGrant.upsert({
-        where: {
-          poolId_granteeUserId: {
+        if (!grantee) {
+          throw new ORPCError("NOT_FOUND", { message: grantPoolAccessServerMessages.userNotFound });
+        }
+        if (grantee.id === userId) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: grantPoolAccessServerMessages.cannotGrantToSelf,
+          });
+        }
+        return tx.poolGrant.upsert({
+          where: {
+            poolId_granteeUserId: {
+              poolId: input.poolId,
+              granteeUserId: grantee.id,
+            },
+          },
+          update: {},
+          create: {
             poolId: input.poolId,
+            ownerUserId: userId,
             granteeUserId: grantee.id,
           },
-        },
-        update: {},
-        create: {
-          poolId: input.poolId,
-          ownerUserId: context.session.user.id,
-          granteeUserId: grantee.id,
-        },
-        select: { id: true, poolId: true, granteeUserId: true },
+          select: { id: true, poolId: true, granteeUserId: true },
+        });
       });
     }),
 
@@ -3905,4 +4028,23 @@ export const forwarderManagementRouter = {
   visibleModels: protectedProcedure.handler(async ({ context }) =>
     serializeVisibleTargets(await listVisibleModelTargetsForUser(context.session.user.id)),
   ),
+
+  listDashboardNotices: protectedProcedure.handler(async ({ context }) => {
+    return prisma.dashboardNotice.findMany({
+      where: { userId: context.session.user.id, readAt: null },
+      orderBy: { createdAt: "desc" },
+      take: 20,
+      select: { id: true, createdAt: true, kind: true, poolId: true, poolName: true },
+    });
+  }),
+
+  dismissDashboardNotice: protectedProcedure
+    .input(z.object({ id: idSchema }))
+    .handler(async ({ input, context }) => {
+      const result = await prisma.dashboardNotice.updateMany({
+        where: { id: input.id, userId: context.session.user.id, readAt: null },
+        data: { readAt: new Date() },
+      });
+      return { dismissed: result.count > 0 };
+    }),
 };

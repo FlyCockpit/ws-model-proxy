@@ -6,7 +6,7 @@
  * leaf workspace), so we duplicate the small list here. When you add a locale
  * to the central `SUPPORTED_LOCALES`, add it here AND drop matching JSON
  * bundles into
- * `packages/mailer/src/locales/<tag>/{verify-email,invite-user,two-factor-otp}.json`.
+ * `packages/mailer/src/locales/<tag>/{verify-email,invite-user,two-factor-otp,pool-external-provider}.json`.
  *
  * If a caller passes an unsupported locale, the renderers fall back to en-US.
  */

@@ -18,6 +18,15 @@ const testEnv = vi.hoisted(() => ({
   MODEL_API_GLOBAL_CAPACITY_ENABLED: true,
 }));
 
+const mailerState = vi.hoisted(() => ({
+  configured: false,
+  sendEmail: vi.fn(async () => undefined),
+  renderPoolExternalProviderNotice: vi.fn(() => ({
+    subject: "Pool may send requests to an external provider",
+    html: "<p>external provider</p>",
+  })),
+}));
+
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
   class TestDecimal {
@@ -44,6 +53,12 @@ vi.mock("@ws-model-proxy/db", async () => {
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: testEnv,
   ADMIN_EMAIL: undefined,
+}));
+
+vi.mock("@ws-model-proxy/mailer", () => ({
+  isEmailConfigured: () => mailerState.configured,
+  sendEmail: mailerState.sendEmail,
+  renderPoolExternalProviderNotice: mailerState.renderPoolExternalProviderNotice,
 }));
 
 const { default: prisma } = await import("@ws-model-proxy/db");
@@ -84,10 +99,16 @@ const db = prisma as unknown as {
   };
   poolMember: {
     create: MockInstance;
+    count: MockInstance;
     findMany: MockInstance;
     findUnique: MockInstance;
     update: MockInstance;
     delete: MockInstance;
+  };
+  dashboardNotice: {
+    createMany: MockInstance;
+    findMany: MockInstance;
+    updateMany: MockInstance;
   };
   executionTarget: { findMany: MockInstance; findUnique: MockInstance; upsert: MockInstance };
   inferenceCapacity: { findMany: MockInstance; updateMany: MockInstance; upsert: MockInstance };
@@ -232,6 +253,10 @@ describe("forwarderManagementRouter", () => {
     db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
       callback(db),
     );
+    mailerState.configured = false;
+    db.poolMember.count.mockResolvedValue(0);
+    db.poolGrant.findMany.mockResolvedValue([]);
+    db.dashboardNotice.createMany.mockResolvedValue({ count: 0 });
     db.executionTarget.upsert.mockResolvedValue({ id: "target-id" });
     db.executionTarget.findUnique.mockResolvedValue(null);
     db.executionTarget.findMany.mockResolvedValue([]);
@@ -2191,6 +2216,280 @@ describe("forwarderManagementRouter", () => {
         publicEgressAcknowledged: true,
       }),
     ).resolves.toMatchObject({ publicEgressEnabled: true, publicEgressAcknowledged: true });
+  });
+
+  describe("grantee privacy confirmation", () => {
+    const grantee = {
+      granteeUserId: "grantee-id",
+      Grantee: { email: "ada@example.com", name: "Ada", locale: "en-US" },
+    };
+
+    function privateSharedPool() {
+      db.modelPool.findUnique.mockResolvedValue(
+        poolRow({
+          userId: "user-id",
+          name: "Shared",
+          publicEgressEnabled: false,
+          publicEgressAcknowledged: true,
+        }),
+      );
+      db.poolMember.findMany.mockResolvedValue([]);
+      db.providerBudgetPolicy.findMany.mockResolvedValue([]);
+      db.poolMember.count.mockResolvedValue(0);
+      db.poolGrant.findMany.mockResolvedValue([grantee]);
+      db.modelPool.update.mockResolvedValue(
+        poolRow({
+          name: "Shared",
+          publicEgressEnabled: true,
+          publicEgressAcknowledged: true,
+        }),
+      );
+    }
+
+    it("names grantees and does not apply a private-to-external change without confirmation", async () => {
+      privateSharedPool();
+
+      await expect(
+        client().updateModelPool({
+          id: "pool-id",
+          publicEgressEnabled: true,
+          publicEgressAcknowledged: true,
+        }),
+      ).rejects.toMatchObject({
+        code: "CONFLICT",
+        message: expect.stringContaining("ada@example.com"),
+        data: {
+          reason: "GRANTEE_PRIVACY_CONFIRMATION_REQUIRED",
+          poolName: "Shared",
+          grantees: [{ email: "ada@example.com", name: "Ada" }],
+        },
+      });
+      expect(db.modelPool.update).not.toHaveBeenCalled();
+      expect(db.dashboardNotice.createMany).not.toHaveBeenCalled();
+      expect(mailerState.sendEmail).not.toHaveBeenCalled();
+    });
+
+    it("applies the change and records notices when the owner confirms", async () => {
+      privateSharedPool();
+
+      await expect(
+        client().updateModelPool({
+          id: "pool-id",
+          publicEgressEnabled: true,
+          publicEgressAcknowledged: true,
+          confirmGranteePrivacyChange: true,
+        }),
+      ).resolves.toMatchObject({ publicEgressEnabled: true });
+      expect(db.dashboardNotice.createMany).toHaveBeenCalledWith({
+        data: [
+          {
+            userId: "grantee-id",
+            kind: "POOL_EXTERNAL_PROVIDER",
+            poolId: "pool-id",
+            poolName: "Shared",
+          },
+        ],
+      });
+      expect(mailerState.sendEmail).not.toHaveBeenCalled();
+    });
+
+    it("emails grantees only after the notice is stored when SMTP is configured", async () => {
+      privateSharedPool();
+      mailerState.configured = true;
+
+      await client().updateModelPool({
+        id: "pool-id",
+        publicEgressEnabled: true,
+        publicEgressAcknowledged: true,
+        confirmGranteePrivacyChange: true,
+      });
+
+      expect(db.dashboardNotice.createMany).toHaveBeenCalled();
+      expect(mailerState.sendEmail).toHaveBeenCalledWith(
+        expect.objectContaining({
+          to: "ada@example.com",
+          subject: "Pool may send requests to an external provider",
+        }),
+      );
+      expect(db.dashboardNotice.createMany.mock.invocationCallOrder[0]).toBeLessThan(
+        mailerState.sendEmail.mock.invocationCallOrder[0] ?? 0,
+      );
+      expect(JSON.stringify(db.dashboardNotice.createMany.mock.calls)).not.toContain("sk-");
+    });
+
+    it("does not require confirmation when the shared pool has no grantees", async () => {
+      privateSharedPool();
+      db.poolGrant.findMany.mockResolvedValue([]);
+
+      await expect(
+        client().updateModelPool({
+          id: "pool-id",
+          publicEgressEnabled: true,
+          publicEgressAcknowledged: true,
+        }),
+      ).resolves.toMatchObject({ publicEgressEnabled: true });
+      expect(db.dashboardNotice.createMany).not.toHaveBeenCalled();
+    });
+
+    it("does not require confirmation when the pool is already non-private", async () => {
+      privateSharedPool();
+      db.modelPool.findUnique.mockResolvedValue(
+        poolRow({
+          userId: "user-id",
+          name: "Shared",
+          publicEgressEnabled: true,
+          publicEgressAcknowledged: true,
+        }),
+      );
+      db.poolMember.count.mockResolvedValue(1);
+
+      await expect(
+        client().updateModelPool({
+          id: "pool-id",
+          publicEgressEnabled: true,
+          publicEgressAcknowledged: true,
+        }),
+      ).resolves.toMatchObject({ publicEgressEnabled: true });
+      expect(db.dashboardNotice.createMany).not.toHaveBeenCalled();
+    });
+
+    it("requires confirmation before a provider primary is added to a private shared pool", async () => {
+      db.modelPool.findFirst.mockResolvedValue({
+        id: "pool-id",
+        name: "Shared",
+        publicEgressEnabled: false,
+        publicEgressAcknowledged: true,
+      });
+      db.providerModel.findFirst.mockResolvedValue({
+        id: "provider-model",
+        providerAccountId: "provider-account",
+        enabled: true,
+      });
+      db.providerBudgetPolicy.findFirst.mockResolvedValue({
+        id: "policy",
+        activatedAt: new Date(),
+        Rules: [{ id: "rule", mode: "LIMITED", limitValue: 2 }],
+      });
+      db.providerAuditEvent.findFirst.mockResolvedValue({ id: "audit" });
+      db.poolMember.findMany.mockResolvedValue([]);
+      db.poolMember.count.mockResolvedValue(0);
+      db.poolGrant.findMany.mockResolvedValue([grantee]);
+      db.executionTarget.upsert.mockResolvedValue({ id: "provider-target" });
+      db.poolMember.create.mockResolvedValue({ id: "primary-provider-member" });
+
+      await expect(
+        client().addProviderPoolMember({
+          poolId: "pool-id",
+          providerModelId: "provider-model",
+          tier: "PRIMARY",
+          weight: 1,
+        }),
+      ).rejects.toMatchObject({
+        code: "CONFLICT",
+        message: expect.stringContaining("ada@example.com"),
+      });
+      expect(db.poolMember.create).not.toHaveBeenCalled();
+      expect(db.executionTarget.upsert).not.toHaveBeenCalled();
+
+      await expect(
+        client().addProviderPoolMember({
+          poolId: "pool-id",
+          providerModelId: "provider-model",
+          tier: "PRIMARY",
+          weight: 1,
+          confirmGranteePrivacyChange: true,
+        }),
+      ).resolves.toEqual({
+        id: "primary-provider-member",
+        executionTargetId: "provider-target",
+      });
+      expect(db.dashboardNotice.createMany).toHaveBeenCalledWith({
+        data: [
+          expect.objectContaining({
+            userId: "grantee-id",
+            poolName: "Shared",
+            kind: "POOL_EXTERNAL_PROVIDER",
+          }),
+        ],
+      });
+    });
+
+    it("requires confirmation before promoting a provider member to primary", async () => {
+      const member = {
+        id: "member-id",
+        poolId: "pool-id",
+        tier: "PUBLIC_OVERFLOW",
+        publicOrder: 0,
+        weight: 1,
+        routingStatus: "ACTIVE",
+        capacityConcurrencyMode: "INHERIT",
+        capacityConcurrencyLimit: null,
+        capacityReservedSlots: null,
+        capacityContextCeilingMode: "INHERIT",
+        capacityContextCeiling: null,
+        capacityContextMargin: null,
+        ExecutionTarget: {
+          ProviderModel: { id: "provider-model", providerAccountId: "provider-account" },
+          InferenceCapacity: { physicalMaxContext: null, hardConcurrencyLimit: null },
+        },
+        ModelPool: {
+          userId: "user-id",
+          name: "Shared",
+          publicEgressEnabled: false,
+          publicEgressAcknowledged: true,
+          recommendedSurfaceOverride: null,
+          protocolAdaptationEnabled: false,
+          capacityConcurrencyLimit: null,
+          capacityReservedSlots: 0,
+          capacityContextCeiling: null,
+          capacityContextMargin: 0,
+        },
+      };
+      db.poolMember.findUnique
+        .mockResolvedValueOnce({
+          id: "member-id",
+          poolId: "pool-id",
+          executionTargetId: null,
+          ModelPool: { userId: "user-id" },
+        })
+        .mockResolvedValueOnce(member);
+      db.poolMember.findMany.mockResolvedValue([]);
+      db.poolMember.count.mockResolvedValue(0);
+      db.poolGrant.findMany.mockResolvedValue([grantee]);
+
+      await expect(
+        client().updatePoolMember({ id: "member-id", tier: "PRIMARY" }),
+      ).rejects.toMatchObject({
+        code: "CONFLICT",
+        message: expect.stringContaining("ada@example.com"),
+      });
+      expect(db.poolMember.update).not.toHaveBeenCalled();
+
+      db.poolMember.findUnique
+        .mockResolvedValueOnce({
+          id: "member-id",
+          poolId: "pool-id",
+          executionTargetId: null,
+          ModelPool: { userId: "user-id" },
+        })
+        .mockResolvedValueOnce(member);
+      db.poolMember.update.mockResolvedValue({
+        id: "member-id",
+        weight: 1,
+        routingStatus: "ACTIVE",
+        tier: "PRIMARY",
+        publicOrder: null,
+      });
+
+      await expect(
+        client().updatePoolMember({
+          id: "member-id",
+          tier: "PRIMARY",
+          confirmGranteePrivacyChange: true,
+        }),
+      ).resolves.toMatchObject({ id: "member-id", tier: "PRIMARY" });
+      expect(db.dashboardNotice.createMany).toHaveBeenCalled();
+    });
   });
 
   it("atomically creates a pool and its capacity-policy audit record", async () => {

@@ -285,8 +285,20 @@
     "relayMetadata": "Metadatos de relay",
     "terminals": "Terminales"
   },
+  "notices": {
+    "region": "Avisos",
+    "dismiss": "Descartar",
+    "poolExternalProvider": "{{pool}} puede enviar solicitudes a un proveedor externo."
+  },
   "pools": {
     "notFound": "No se encontró este grupo o ya no está disponible para ti.",
+    "privacyBadge": {
+      "private": "Privado",
+      "external": "Puede usar proveedores externos"
+    },
+    "granteePrivacyConfirmTitle": "Este grupo puede enviar datos a un proveedor externo",
+    "granteePrivacyConfirmDescription": "{{pool}} ya está compartido. Las solicitudes de estas personas pueden salir de esta instalación. Se les avisará. Su acceso no se pausa.",
+    "granteePrivacyConfirmAction": "Confirmar y continuar",
     "affinity": {
       "title": "Enrutamiento según caché",
       "description": "Las sesiones nuevas van al miembro con la mejor puntuación de disponibilidad (carga, salud, salida pública y costo). Cuando esas puntuaciones empatan, se prefiere un entorno que quizá conserve un prefijo de instrucción coincidente. El enrutamiento consciente del prompt de sistema es parte de este interruptor. Después de un turno de asistente o de herramienta, se prefiere el miembro que sirvió la conversación hasta ahora. Una conversación larga puede superar una carga moderada o un miembro medio abierto; una cola grande igual desborda la solicitud.",
@@ -1068,8 +1080,9 @@
     "scopeMode": "Modo de alcance",
     "typeTokenName": "Escribe el nombre del token para confirmar",
     "visiblePreview": "{{count}} modelos visibles para este token",
-    "publicEgressWarningTitle": "Algunos recursos pueden usar proveedores externos",
-    "publicEgressWarning": "Este token puede acceder a {{pools}}. Las solicitudes a estos pools pueden enviar instrucciones, adjuntos, herramientas y resultados a proveedores configurados usados como destinos principales o desbordamiento público."
+    "publicEgressWarningTitle": "Algunos grupos pueden enviar datos fuera de esta instalación",
+    "publicEgressWarning": "Las solicitudes a {{pools}} pueden salir de esta instalación. Las instrucciones, los adjuntos, las herramientas y los resultados pueden enviarse a un proveedor externo.",
+    "publicEgressWarningNamed": "Las solicitudes a {{pools}} pueden salir de esta instalación. Las instrucciones, los adjuntos, las herramientas y los resultados pueden enviarse a {{providers}}."
   },
   "welcomeBack": "Bienvenido de vuelta, {{name}}"
 }

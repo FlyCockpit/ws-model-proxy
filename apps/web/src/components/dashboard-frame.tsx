@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
+import { DashboardNotices } from "@/components/dashboard-notices";
 import { useUiPreferences } from "@/stores/ui-preferences";
 
 const dashboardSections = [
@@ -173,6 +174,7 @@ export function DashboardFrame({ lang }: { lang: string }) {
         </div>
 
         <div className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col">
+          <DashboardNotices />
           <Outlet />
         </div>
       </div>

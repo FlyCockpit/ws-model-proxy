@@ -41,6 +41,7 @@ model User {
   modelPools                 ModelPool[]                  @relation("ModelPoolOwner")
   ownedPoolGrants            PoolGrant[]                  @relation("PoolGrantOwner")
   receivedPoolGrants         PoolGrant[]                  @relation("PoolGrantGrantee")
+  dashboardNotices           DashboardNotice[]
   modelApiTokens             ModelApiToken[]              @relation("ModelApiTokenOwner")
   responseStickinessRecords  ResponseStickinessRecord[]   @relation("ResponseStickinessOwner")
   relayRequests              RelayRequest[]               @relation("RelayRequestOwner")

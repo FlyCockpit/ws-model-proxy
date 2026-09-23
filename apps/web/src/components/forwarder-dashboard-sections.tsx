@@ -44,7 +44,9 @@ import { z } from "zod";
 
 import { CliDeviceFeatureSwitches } from "@/components/cli-device-feature-switches";
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
+import { GranteePrivacyConfirmDialog } from "@/components/grantee-privacy-confirm-dialog";
 import { InlineRetry } from "@/components/inline-retry";
+import { PoolPrivacyBadge } from "@/components/pool-privacy-badge";
 import { SegmentedControl } from "@/components/segmented-control";
 import { WideContent } from "@/components/wide-content";
 import {
@@ -57,7 +59,14 @@ import {
   newCapacityDefaults,
 } from "@/lib/capacity-forms";
 import { ANTHROPIC_MESSAGES_ENV } from "@/lib/deployment-feature-gate";
-import { publicEgressResourceNames } from "@/lib/public-egress-disclosure";
+import {
+  type GranteePrivacyConfirm,
+  granteePrivacyConfirmationFromError,
+} from "@/lib/grantee-privacy-confirmation";
+import {
+  egressProviderAccountLabels,
+  publicEgressResourceNames,
+} from "@/lib/public-egress-disclosure";
 import { orpc } from "@/utils/orpc";
 
 type CliDevice = Awaited<
@@ -2688,6 +2697,9 @@ export function PoolMemberForm({
   const [borrow, setBorrow] = useState<"NEVER" | "WHEN_IDLE">(
     member?.capacityBorrowPolicy === "NEVER" ? "NEVER" : "WHEN_IDLE",
   );
+  const [privacyConfirm, setPrivacyConfirm] = useState<
+    (GranteePrivacyConfirm & { retry: () => Promise<void> }) | null
+  >(null);
   const createMember = useMutation(
     orpc.forwarderManagement.addPoolMember.mutationOptions({
       onSuccess: () => {
@@ -2799,32 +2811,56 @@ export function PoolMemberForm({
           }
           if (mode === "edit" && member) {
             if (member.providerModel) {
-              await runMutation(() =>
-                updateMember.mutateAsync({
-                  id: member.id,
-                  tier: memberTier,
-                  weight: parsedWeight,
-                  routingStatus,
-                  ...(capacityEnabled
-                    ? {
-                        capacityPriority: priorityMode === "INHERIT" ? null : Number(priority),
-                        capacityConcurrencyMode: concurrencyMode,
-                        capacityConcurrencyLimit:
-                          concurrencyMode === "LIMITED" ? Number(concurrency) : null,
-                        capacityReservedSlots:
-                          reservedMode === "INHERIT" ? null : Number(reservedSlots),
-                        capacityBorrowPolicy: borrowMode === "INHERIT" ? null : borrow,
-                        capacityWaitBudgetMode: waitMode,
-                        capacityWaitBudgetMs: waitMode === "LIMITED" ? Number(waitBudget) : null,
-                        capacityContextCeilingMode: ceilingMode,
-                        capacityContextCeiling:
-                          ceilingMode === "LIMITED" ? Number(contextCeiling) : null,
-                        capacityContextMargin:
-                          marginMode === "INHERIT" ? null : Number(contextMargin),
+              const providerMemberUpdate = {
+                id: member.id,
+                tier: memberTier,
+                weight: parsedWeight,
+                routingStatus,
+                ...(capacityEnabled
+                  ? {
+                      capacityPriority: priorityMode === "INHERIT" ? null : Number(priority),
+                      capacityConcurrencyMode: concurrencyMode,
+                      capacityConcurrencyLimit:
+                        concurrencyMode === "LIMITED" ? Number(concurrency) : null,
+                      capacityReservedSlots:
+                        reservedMode === "INHERIT" ? null : Number(reservedSlots),
+                      capacityBorrowPolicy: borrowMode === "INHERIT" ? null : borrow,
+                      capacityWaitBudgetMode: waitMode,
+                      capacityWaitBudgetMs: waitMode === "LIMITED" ? Number(waitBudget) : null,
+                      capacityContextCeilingMode: ceilingMode,
+                      capacityContextCeiling:
+                        ceilingMode === "LIMITED" ? Number(contextCeiling) : null,
+                      capacityContextMargin:
+                        marginMode === "INHERIT" ? null : Number(contextMargin),
+                    }
+                  : {}),
+              };
+              try {
+                await updateMember.mutateAsync(providerMemberUpdate);
+              } catch (error) {
+                const confirmation = granteePrivacyConfirmationFromError(error);
+                if (confirmation) {
+                  setPrivacyConfirm({
+                    ...confirmation,
+                    retry: async () => {
+                      await updateMember.mutateAsync({
+                        ...providerMemberUpdate,
+                        confirmGranteePrivacyChange: true,
+                      });
+                      if (capacityEnabled) {
+                        await queryClient.invalidateQueries({
+                          queryKey: orpc.capacityManagement.key(),
+                        });
                       }
-                    : {}),
-                }),
-              );
+                      toast.success(t("dashboard:pools.memberUpdated"));
+                      setPrivacyConfirm(null);
+                      onSuccess();
+                    },
+                  });
+                  return;
+                }
+                throw new MutationFailure();
+              }
             } else {
               await runMutation(() =>
                 updateMember.mutateAsync({ id: member.id, weight: parsedWeight, routingStatus }),
@@ -3084,6 +3120,18 @@ export function PoolMemberForm({
       <Button type="submit" size="touch" disabled={!canSubmit || isPending}>
         {isPending ? t("common:actions.saving") : t("common:actions.save")}
       </Button>
+      <GranteePrivacyConfirmDialog
+        confirmation={privacyConfirm}
+        pending={updateMember.isPending}
+        onOpenChange={(open) => {
+          if (!open) setPrivacyConfirm(null);
+        }}
+        onConfirm={() => {
+          void privacyConfirm?.retry().catch(() => {
+            toast.error(t("common:somethingWentWrong"));
+          });
+        }}
+      />
     </form>
   );
 }
@@ -3613,6 +3661,7 @@ function VisibleModelChecklist({
       id: pool.modelId,
       label: pool.modelId,
       kind: t("tokens.pool"),
+      external: pool.effectiveProviderEgress,
     })),
   ];
 
@@ -3638,7 +3687,12 @@ function VisibleModelChecklist({
                   }}
                 />
                 <span className="min-w-0">
-                  <span className="block text-xs font-medium">{row.kind}</span>
+                  <span className="flex flex-wrap items-center gap-2 text-xs font-medium">
+                    {row.kind}
+                    {"external" in row ? (
+                      <PoolPrivacyBadge external={row.external === true} />
+                    ) : null}
+                  </span>
                   <code className="block break-all font-mono text-xs text-muted-foreground">
                     {row.label}
                   </code>
@@ -3660,11 +3714,19 @@ function VisibleModelPreview({ preview }: { preview: TokenPreview }) {
     <div className="rounded-md border p-3">
       <p className="text-sm font-medium">{t("tokens.visiblePreview", { count })}</p>
       <TokenEgressWarnings pools={preview.modelPools} compact />
-      <div className="mt-2 max-h-40 overflow-y-auto overflow-x-clip space-y-1">
-        {[...preview.directModels, ...preview.modelPools].map((model) => (
+      <div className="mt-2 max-h-40 space-y-1 overflow-x-clip overflow-y-auto">
+        {preview.directModels.map((model) => (
           <code key={model.id} className="block break-all font-mono text-xs text-muted-foreground">
             {model.id}
           </code>
+        ))}
+        {preview.modelPools.map((pool) => (
+          <div key={pool.id} className="flex min-w-0 flex-wrap items-center gap-2">
+            <PoolPrivacyBadge external={pool.effectiveProviderEgress === true} />
+            <code className="min-w-0 break-all font-mono text-xs text-muted-foreground">
+              {pool.id}
+            </code>
+          </div>
         ))}
       </div>
     </div>
@@ -3678,15 +3740,15 @@ function TokenEgressWarnings({
   pools: Array<{
     id: string;
     name: string;
-    publicEgressEnabled: boolean;
-    publicEgressAcknowledged: boolean;
     effectiveProviderEgress?: boolean;
-    providerPrimaryMemberCount?: number;
+    providerAccountLabels?: readonly string[];
   }>;
   compact?: boolean;
 }) {
   const { t } = useTranslation("dashboard");
-  const egressPoolNames = publicEgressResourceNames(pools);
+  const egressPools = pools.filter((pool) => pool.effectiveProviderEgress === true);
+  const egressPoolNames = publicEgressResourceNames(egressPools);
+  const accountLabels = egressProviderAccountLabels(egressPools);
   if (egressPoolNames.length === 0) return null;
   return (
     <div
@@ -3698,7 +3760,12 @@ function TokenEgressWarnings({
     >
       <p className="font-medium">{t("tokens.publicEgressWarningTitle")}</p>
       <p className="mt-1">
-        {t("tokens.publicEgressWarning", { pools: egressPoolNames.join(", ") })}
+        {accountLabels.length > 0
+          ? t("tokens.publicEgressWarningNamed", {
+              pools: egressPoolNames.join(", "),
+              providers: accountLabels.join(", "),
+            })
+          : t("tokens.publicEgressWarning", { pools: egressPoolNames.join(", ") })}
       </p>
     </div>
   );

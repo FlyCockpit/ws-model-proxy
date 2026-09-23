@@ -957,6 +957,7 @@ model ModelPool {
   CapacityWaiters                 CapacityWaiter[]
   CapacityLeases                  CapacityLease[]
   CacheAffinityRecords            CacheAffinityRecord[]
+  DashboardNotices                DashboardNotice[]
 
   @@unique([userId, slug])
   @@unique([id, userId])
@@ -1210,6 +1211,29 @@ model PoolGrant {
   @@index([ownerUserId])
   @@index([granteeUserId])
   @@map("pool_grant")
+}
+
+enum DashboardNoticeKind {
+  POOL_EXTERNAL_PROVIDER
+}
+
+/// Durable in-app notice. Written in the same transaction as the pool change
+/// that requires it, before any email attempt.
+model DashboardNotice {
+  id        String              @id @default(cuid(2))
+  createdAt DateTime            @default(now())
+  userId    String
+  kind      DashboardNoticeKind
+  poolId    String?
+  /// Pool display name at notice time. Not a credential.
+  poolName  String
+  readAt    DateTime?
+  User      User                @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ModelPool ModelPool?          @relation(fields: [poolId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@index([userId, readAt, createdAt])
+  @@index([poolId])
+  @@map("dashboard_notice")
 }
 
 model ModelApiToken {

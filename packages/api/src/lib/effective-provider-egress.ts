@@ -31,6 +31,26 @@ export function effectiveProviderEgress(input: {
   return input.publicEgressEnabled || input.providerPrimaryMemberCount > 0;
 }
 
+/**
+ * Account labels that can receive pool traffic. Overflow members count only
+ * when public overflow is on. Labels are display names, never credentials.
+ */
+export function egressProviderAccountLabels(input: {
+  publicEgressEnabled: boolean;
+  members: ReadonlyArray<{ tier: string; accountLabel?: string | null }>;
+}): string[] {
+  const labels = new Set<string>();
+  for (const member of input.members) {
+    const label = member.accountLabel;
+    if (!label) continue;
+    if (member.tier === "PRIMARY" || input.publicEgressEnabled) labels.add(label);
+  }
+  return [...labels].sort((left, right) => left.localeCompare(right));
+}
+
+/** Owner must resubmit with the confirm flag before a shared pool becomes non-private. */
+export const GRANTEE_PRIVACY_CONFIRMATION_REQUIRED = "GRANTEE_PRIVACY_CONFIRMATION_REQUIRED";
+
 export const grantPoolAccessServerMessages = {
   userNotFound: "User not found.",
   cannotGrantToSelf: "Cannot grant a pool to yourself.",

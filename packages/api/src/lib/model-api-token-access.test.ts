@@ -274,7 +274,16 @@ describe("modelApiTokenAccess", () => {
                 tier: "PRIMARY",
                 ExecutionTarget: { providerModelId: { not: null } },
               },
-              select: { id: true },
+              select: {
+                id: true,
+                ExecutionTarget: {
+                  select: {
+                    ProviderModel: {
+                      select: { ProviderAccount: { select: { label: true } } },
+                    },
+                  },
+                },
+              },
             },
           }),
         }),
