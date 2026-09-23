@@ -17,6 +17,7 @@ import {
   PoolMemberRecoveryScheduler,
 } from "./pool-member-recovery.js";
 import {
+  type CliTerminalIdentity,
   describeRelayControlParseError,
   encodeRelayBinaryFrame,
   encodeRelayServerControlMessage,
@@ -200,6 +201,8 @@ type SessionState = {
   terminalPublicKey: string | null;
   /** 2.5 multi-viewer terminals. */
   terminalViewers: boolean;
+  /** 2.5 CLI identity proof, relayed to browsers as is. */
+  terminalIdentity: CliTerminalIdentity | null;
   allowHumanTerminal: boolean;
   allowMcpCommands: boolean;
   terminalsById: Map<string, TerminalRecord>;
@@ -229,6 +232,7 @@ function interactiveCapabilities(capabilities: HelloMessage["cli"]["capabilities
   features: CliReportedFeatures;
   terminalPublicKey: string;
   terminalViewers: boolean;
+  terminalIdentity: CliTerminalIdentity | null;
 } | null {
   if (!relayProtocolAtLeast(capabilities.protocolVersion, "2.4")) return null;
   if (!("features" in capabilities)) return null;
@@ -239,6 +243,10 @@ function interactiveCapabilities(capabilities: HelloMessage["cli"]["capabilities
       relayProtocolAtLeast(capabilities.protocolVersion, "2.5") &&
       "terminalViewers" in capabilities &&
       capabilities.terminalViewers === true,
+    terminalIdentity:
+      "terminalIdentity" in capabilities && capabilities.terminalIdentity
+        ? capabilities.terminalIdentity
+        : null,
   };
 }
 
@@ -411,6 +419,7 @@ export class RelaySessionManager {
       features: null,
       terminalPublicKey: null,
       terminalViewers: false,
+      terminalIdentity: null,
       allowHumanTerminal: false,
       allowMcpCommands: false,
       terminalsById: new Map(),
@@ -476,10 +485,12 @@ export class RelaySessionManager {
           session.features = interactive.features;
           session.terminalPublicKey = interactive.terminalPublicKey;
           session.terminalViewers = interactive.terminalViewers;
+          session.terminalIdentity = interactive.terminalIdentity;
         } else {
           session.features = null;
           session.terminalPublicKey = null;
           session.terminalViewers = false;
+          session.terminalIdentity = null;
         }
         session.lastHeartbeatAt = now;
         clearTimeout(session.unauthenticatedTimer);
@@ -863,6 +874,7 @@ export class RelaySessionManager {
         terminalPublicKey: relayProtocolAtLeast(session.protocolVersion, "2.4")
           ? session.terminalPublicKey
           : null,
+        terminalIdentity: session.terminalViewers ? session.terminalIdentity : null,
       });
     }
     return snapshots;

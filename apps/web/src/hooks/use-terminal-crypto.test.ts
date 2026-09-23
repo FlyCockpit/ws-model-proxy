@@ -4,8 +4,10 @@ import {
   assertIncreasingTerminalSeq,
   buildApprovalTranscript,
   buildApprovalTranscriptV2,
+  buildCliIdentityStatement,
   bytesToBase64Url,
   bytesToHex,
+  cliIdentityFingerprint,
   concatBytes,
   DIRECTION_BROWSER_TO_CLI,
   DIRECTION_CLI_TO_BROWSER,
@@ -33,6 +35,7 @@ import {
   uncompressedPublicKey,
   verifyApprovalTranscript,
   verifyApprovalTranscriptV2,
+  verifyCliIdentitySignature,
 } from "./use-terminal-crypto";
 
 const CLI_X = "DAD0B65394221CF9B051E1FECA5787D098DFE637FC90B9EF945D0C3772581180";
@@ -438,5 +441,66 @@ describe("terminal crypto v2 vectors", () => {
     await expect(
       verifyApprovalTranscriptV2(publicKey, approvalV2Input(VIEWER_B), signature),
     ).resolves.toBe(false);
+  });
+});
+
+// CLI identity vectors. Mirrored in `apps/cli/src/terminal_crypto.rs`.
+const CLI_ID_SLUG = "desk-01";
+const CLI_ID_STATEMENT =
+  "001377736d702d7465726d2d636c692d69642d763100076465736b2d303104dad0b65394221cf9b051e1feca5787d098dfe637fc90b9ef945d0c37725811805271a0461cdb8252d61f1c456fa3e59ab1f45b33accf5f58389e0577b8990bb3";
+// Deterministic (RFC 6979) signature from the CLI's p256 crate.
+const CLI_ID_SIGNATURE_RUST =
+  "605fffa5e3271aa6dcbf5a23e57a843c2e7c94399eea50331446c8183e5dfeedeac15186cde27a792ed704df722d2474a7902fc9a9ade88cba5f56c04f5a5624";
+// One randomized WebCrypto signature, verified by the CLI tests.
+const CLI_ID_SIGNATURE_WEB =
+  "41d228ec04946ee19927954be52b2367823c911e99a9abac37cab3d7367ff82bdab3492d700e3976ca96ad5bc991a9948a1e38077d44f2136c2113da71b899c3";
+const CLI_ID_FINGERPRINT = "EHI6 GLCX HTTU Q3DC VR2L P6WK K5PF OMMO";
+
+describe("terminal CLI identity vectors", () => {
+  const identityRaw = uncompressedPublicKey(hexToBytes(IDENTITY_X), hexToBytes(IDENTITY_Y));
+  const cliRaw = uncompressedPublicKey(hexToBytes(CLI_X), hexToBytes(CLI_Y));
+
+  it("builds the exact identity statement", () => {
+    expect(bytesToHex(buildCliIdentityStatement(CLI_ID_SLUG, cliRaw))).toBe(CLI_ID_STATEMENT);
+    expect(() => buildCliIdentityStatement(CLI_ID_SLUG, cliRaw.slice(1))).toThrow();
+  });
+
+  it("verifies the CLI and WebCrypto signatures and rejects other bindings", async () => {
+    const verify = (signature: Uint8Array, cliSlug = CLI_ID_SLUG, ecdh = cliRaw) =>
+      verifyCliIdentitySignature({
+        identityPublicKey: identityRaw,
+        signature,
+        cliSlug,
+        ecdhPublicKey: ecdh,
+      });
+    await expect(verify(hexToBytes(CLI_ID_SIGNATURE_RUST))).resolves.toBe(true);
+    await expect(verify(hexToBytes(CLI_ID_SIGNATURE_WEB))).resolves.toBe(true);
+    await expect(verify(hexToBytes(CLI_ID_SIGNATURE_RUST), "desk-02")).resolves.toBe(false);
+    const browserRaw = uncompressedPublicKey(hexToBytes(BROWSER_X), hexToBytes(BROWSER_Y));
+    await expect(verify(hexToBytes(CLI_ID_SIGNATURE_RUST), CLI_ID_SLUG, browserRaw)).resolves.toBe(
+      false,
+    );
+    await expect(verify(hexToBytes(CLI_ID_SIGNATURE_RUST).slice(1))).resolves.toBe(false);
+
+    const privateKey = await crypto.subtle.importKey(
+      "jwk",
+      ecPrivateJwk(hexToBytes(IDENTITY_SCALAR), hexToBytes(IDENTITY_X), hexToBytes(IDENTITY_Y)),
+      { name: "ECDSA", namedCurve: "P-256" },
+      false,
+      ["sign"],
+    );
+    const signature = new Uint8Array(
+      await crypto.subtle.sign(
+        { name: "ECDSA", hash: "SHA-256" },
+        privateKey,
+        Uint8Array.from(buildCliIdentityStatement(CLI_ID_SLUG, cliRaw)),
+      ),
+    );
+    expect(signature.byteLength).toBe(64);
+    await expect(verify(signature)).resolves.toBe(true);
+  });
+
+  it("formats the fingerprint as base32 groups of 4", async () => {
+    await expect(cliIdentityFingerprint(identityRaw)).resolves.toBe(CLI_ID_FINGERPRINT);
   });
 });

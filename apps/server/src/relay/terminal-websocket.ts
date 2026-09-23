@@ -144,6 +144,18 @@ export function terminalAllowedOrigins(): Set<string> {
   return origins;
 }
 
+/** Identity only travels with the terminal key it signs. */
+function identityFields(
+  publicKey: string | null,
+  live: LiveCliFeatureSnapshot | null,
+): { identityPublicKey: string | null; identitySignature: string | null } {
+  const identity = publicKey ? (live?.terminalIdentity ?? null) : null;
+  return {
+    identityPublicKey: identity?.publicKey ?? null,
+    identitySignature: identity?.signature ?? null,
+  };
+}
+
 export function classifyTerminalAvailability(input: {
   status: string;
   allowHumanTerminal: boolean;
@@ -548,6 +560,9 @@ export class TerminalBrowserHub {
           reason: availability.reason,
           // 2.5 CLIs: several tabs can view one terminal (v2 terminal crypto).
           terminalViewers: relayProtocolAtLeast(live.get(row.id)?.protocolVersion, "2.5"),
+          // 2.5 CLI identity, relayed unverified. Browsers check the signature
+          // over `publicKey` and this slug, then pin the key per cliDeviceId.
+          ...identityFields(availability.publicKey, live.get(row.id) ?? null),
         };
       }),
       terminals: relaySessionManager.listTerminalsForUser(conn.userId, conn.id),

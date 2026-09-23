@@ -157,40 +157,58 @@ fn write_file(path: &Path, entries: &BTreeMap<String, String>) -> Result<()> {
 }
 
 fn write_approval(path: &Path, file: &ApprovalFile) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)
-            .with_context(|| format!("creating terminal approval directory `{}`", dir.display()))?;
-        #[cfg(unix)]
-        set_mode(dir, 0o700)?;
-    }
-    let text = serde_json::to_vec_pretty(file).context("serializing terminal approvals")?;
-    let mut bytes = text;
+    let mut bytes = serde_json::to_vec_pretty(file).context("serializing terminal approvals")?;
     bytes.push(b'\n');
+    write_private_atomic(path, &bytes, "terminal approval", false).map(|_| ())
+}
+
+/// Write `bytes` to `path` through a synced temp file: mode 0600 in a 0700
+/// directory. With `no_clobber`, an existing file is kept and `Ok(false)` is
+/// returned, so two processes creating the same file agree on one winner.
+pub(crate) fn write_private_atomic(
+    path: &Path,
+    bytes: &[u8],
+    what: &str,
+    no_clobber: bool,
+) -> Result<bool> {
     let dir = path
         .parent()
-        .context("terminal approval path has no parent directory")?;
-    let mut temp = tempfile::NamedTempFile::new_in(dir).with_context(|| {
-        format!(
-            "creating a temporary terminal approval file in `{}`",
-            dir.display()
-        )
-    })?;
+        .with_context(|| format!("{what} path has no parent directory"))?;
+    fs::create_dir_all(dir)
+        .with_context(|| format!("creating {what} directory `{}`", dir.display()))?;
+    #[cfg(unix)]
+    set_mode(dir, 0o700)?;
+    let mut temp = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("creating a temporary {what} file in `{}`", dir.display()))?;
     {
         use std::io::Write;
-        temp.write_all(&bytes)
-            .with_context(|| format!("writing terminal approval file `{}`", path.display()))?;
+        temp.write_all(bytes)
+            .with_context(|| format!("writing {what} file `{}`", path.display()))?;
         temp.as_file()
             .sync_all()
-            .with_context(|| format!("syncing terminal approval file `{}`", path.display()))?;
+            .with_context(|| format!("syncing {what} file `{}`", path.display()))?;
     }
     #[cfg(unix)]
     set_mode(temp.path(), 0o600)?;
-    temp.persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("replacing terminal approval file `{}`", path.display()))?;
+    if no_clobber {
+        match temp.persist_noclobber(path) {
+            Ok(_) => {}
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(error.error)
+                    .with_context(|| format!("creating {what} file `{}`", path.display()));
+            }
+        }
+    } else {
+        temp.persist(path)
+            .map_err(|error| error.error)
+            .with_context(|| format!("replacing {what} file `{}`", path.display()))?;
+    }
     #[cfg(unix)]
     set_mode(path, 0o600)?;
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(unix)]

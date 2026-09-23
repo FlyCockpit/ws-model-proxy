@@ -6,7 +6,9 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import {
   base64UrlToBytes,
+  buildCliIdentityStatement,
   bytesToBase64Url,
+  cliIdentityFingerprint,
   DIRECTION_BROWSER_TO_CLI,
   DIRECTION_CLI_TO_BROWSER,
   decodeTerminalPlaintext,
@@ -26,7 +28,12 @@ import {
   type TerminalSessionKeys,
 } from "@/hooks/use-terminal-crypto";
 import type { TerminalSocketHandlers } from "@/hooks/use-terminal-socket";
-import { decodeSealedFrame, type TerminalClientMessage } from "@/lib/terminal-protocol";
+import { createMemoryCliPinStore } from "@/lib/terminal-cli-identity";
+import {
+  decodeSealedFrame,
+  type ListedCli,
+  type TerminalClientMessage,
+} from "@/lib/terminal-protocol";
 
 import { type TerminalOutputEvent, useTerminalSessions } from "./use-terminal-sessions";
 
@@ -57,6 +64,7 @@ vi.mock("@/hooks/use-terminal-crypto", async (importOriginal) => {
 const TERMINAL_ID = "dGVybWluYWwtaWQtMDAwMQ";
 const VIEWER_ID = "dmlld2VyLWlkLTAwMDAwMQ";
 const CLI_ID = "cli-1";
+const CLI_SLUG = "desk-01";
 const decoder = new TextDecoder();
 
 beforeAll(() => {
@@ -66,6 +74,7 @@ beforeAll(() => {
 
 afterEach(() => {
   cleanup();
+  currentCli = null;
   socket.handlers = null;
   socket.send.mockReset();
   socket.sendFrame.mockReset();
@@ -96,15 +105,84 @@ type Cli = {
   viewerId: string | null;
 };
 
+type CliKey = Awaited<ReturnType<typeof generateEphemeralHandshake>>;
+
+/** The fake CLI's daemon-lifetime ECDH key, and its identity signing key. */
+type FakeCli = {
+  ecdh: CliKey;
+  identityPublicKey: string;
+  sign: (ecdhPublicRaw: Uint8Array, slug?: string) => Promise<string>;
+};
+
+async function fakeCli(): Promise<FakeCli> {
+  const ecdh = await generateEphemeralHandshake();
+  const identity = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, [
+    "sign",
+    "verify",
+  ]);
+  const identityRaw = new Uint8Array(await crypto.subtle.exportKey("raw", identity.publicKey));
+  return {
+    ecdh,
+    identityPublicKey: bytesToBase64Url(identityRaw),
+    sign: async (ecdhPublicRaw, slug = CLI_SLUG) =>
+      bytesToBase64Url(
+        new Uint8Array(
+          await crypto.subtle.sign(
+            { name: "ECDSA", hash: "SHA-256" },
+            identity.privateKey,
+            Uint8Array.from(buildCliIdentityStatement(slug, ecdhPublicRaw)),
+          ),
+        ),
+      ),
+  };
+}
+
+let currentCli: FakeCli | null = null;
+
+function requireCli(): FakeCli {
+  if (!currentCli) throw new Error("no fake CLI");
+  return currentCli;
+}
+
+/** The relay's `clis` entry for the fake CLI: signed on 2.5, bare on 2.4. */
+async function listedCli(cli: FakeCli, multiViewer: boolean): Promise<ListedCli> {
+  const publicKey = bytesToBase64Url(cli.ecdh.publicKeyRaw);
+  return {
+    cliDeviceId: CLI_ID,
+    slug: CLI_SLUG,
+    publicKey,
+    terminalViewers: multiViewer,
+    identityPublicKey: multiViewer ? cli.identityPublicKey : null,
+    identitySignature: multiViewer ? await cli.sign(cli.ecdh.publicKeyRaw) : null,
+  };
+}
+
+function listedTerminal(viewerAttached: boolean) {
+  return {
+    terminalId: TERMINAL_ID,
+    cliDeviceId: CLI_ID,
+    cols: 80,
+    rows: 24,
+    viewerCount: 1,
+    attachedHere: false,
+    writerHere: false,
+    viewerAttached,
+  };
+}
+
 /** Plays the CLI side of an attach: derive keys, then `attaching` / `attached`. */
-async function attachAsCli(viewerId: string | null, attachIndex = 0): Promise<Cli> {
+async function attachAsCli(
+  viewerId: string | null,
+  attachIndex = 0,
+  answerWith?: CliKey,
+): Promise<Cli> {
   const attach = await waitFor(() => {
     const entry = sentOfType("attach")[attachIndex];
     expect(entry).toBeTruthy();
     if (!entry) throw new Error("no attach");
     return entry;
   });
-  const cli = await generateEphemeralHandshake();
+  const cli = answerWith ?? requireCli().ecdh;
   const cliNonce = crypto.getRandomValues(new Uint8Array(16));
   const browserPublicRaw = base64UrlToBytes(attach.publicKey);
   const args = {
@@ -202,23 +280,13 @@ function outputText(events: TerminalOutputEvent[]): string {
     .join("");
 }
 
-async function setup(multiViewer: boolean) {
-  const view = renderHook(() => useTerminalSessions());
+async function setup(multiViewer: boolean, pinStore = createMemoryCliPinStore()) {
+  currentCli = await fakeCli();
+  const view = renderHook(() => useTerminalSessions({ pinStore }));
   message({
     type: "terminals",
-    clis: [{ cliDeviceId: CLI_ID, publicKey: null, terminalViewers: multiViewer }],
-    terminals: [
-      {
-        terminalId: TERMINAL_ID,
-        cliDeviceId: CLI_ID,
-        cols: 80,
-        rows: 24,
-        viewerCount: 1,
-        attachedHere: false,
-        writerHere: false,
-        viewerAttached: multiViewer,
-      },
-    ],
+    clis: [await listedCli(currentCli, multiViewer)],
+    terminals: [listedTerminal(multiViewer)],
   });
   const cli = await attachAsCli(multiViewer ? VIEWER_ID : null);
   await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
@@ -228,7 +296,7 @@ async function setup(multiViewer: boolean) {
   act(() => {
     view.result.current.subscribeOutput(tab.localId, (event) => events.push(event));
   });
-  return { view, cli, localId: tab.localId, events };
+  return { view, cli, localId: tab.localId, events, pinStore };
 }
 
 async function setupV2() {
@@ -364,22 +432,12 @@ describe("useTerminalSessions (protocol 2.4)", () => {
   });
 
   it("does not steal a 2.4 terminal another tab is viewing until selected", async () => {
-    const view = renderHook(() => useTerminalSessions());
+    currentCli = await fakeCli();
+    const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
     message({
       type: "terminals",
-      clis: [{ cliDeviceId: CLI_ID, publicKey: null, terminalViewers: false }],
-      terminals: [
-        {
-          terminalId: TERMINAL_ID,
-          cliDeviceId: CLI_ID,
-          cols: 80,
-          rows: 24,
-          viewerCount: 1,
-          attachedHere: false,
-          writerHere: false,
-          viewerAttached: true,
-        },
-      ],
+      clis: [await listedCli(currentCli, false)],
+      terminals: [listedTerminal(true)],
     });
     await sleep(50);
     expect(sentOfType("attach")).toEqual([]);
@@ -387,5 +445,121 @@ describe("useTerminalSessions (protocol 2.4)", () => {
     expect(tab?.error).toBe("detached");
     act(() => view.result.current.selectTab(tab?.localId ?? ""));
     await waitFor(() => expect(sentOfType("attach")).toHaveLength(1));
+  });
+});
+
+describe("useTerminalSessions CLI identity pinning", () => {
+  it("allows a 2.4 CLI as unverified, without pinning anything", async () => {
+    const { view, pinStore } = await setup(false);
+    expect(view.result.current.cliTrust[CLI_ID]).toEqual({ status: "unverified" });
+    expect(pinStore.pins.size).toBe(0);
+  });
+
+  it("verifies and pins a 2.5 CLI identity on first use", async () => {
+    const { view, pinStore } = await setup(true);
+    const cli = requireCli();
+    expect(pinStore.pins.get(CLI_ID)).toBe(cli.identityPublicKey);
+    const fingerprint = await cliIdentityFingerprint(base64UrlToBytes(cli.identityPublicKey));
+    expect(fingerprint).toMatch(/^([A-Z2-7]{4} ){7}[A-Z2-7]{4}$/);
+    await waitFor(() =>
+      expect(view.result.current.cliTrust[CLI_ID]).toMatchObject({
+        status: "trusted",
+        fingerprint,
+        firstUse: true,
+      }),
+    );
+  });
+
+  it("refuses a changed identity, then attaches after Trust new key", async () => {
+    const previous = await fakeCli();
+    const pinStore = createMemoryCliPinStore({ [CLI_ID]: previous.identityPublicKey });
+    currentCli = await fakeCli();
+    const view = renderHook(() => useTerminalSessions({ pinStore }));
+    message({
+      type: "terminals",
+      clis: [await listedCli(currentCli, true)],
+      terminals: [listedTerminal(true)],
+    });
+    await waitFor(() =>
+      expect(view.result.current.tabs[0]).toMatchObject({
+        phase: "rejected",
+        rejectionReason: "identity_changed",
+      }),
+    );
+    expect(sentOfType("attach")).toEqual([]);
+    const trust = view.result.current.cliTrust[CLI_ID];
+    expect(trust).toMatchObject({
+      status: "changed",
+      pinnedFingerprint: await cliIdentityFingerprint(base64UrlToBytes(previous.identityPublicKey)),
+      fingerprint: await cliIdentityFingerprint(base64UrlToBytes(currentCli.identityPublicKey)),
+    });
+    expect(pinStore.pins.get(CLI_ID)).toBe(previous.identityPublicKey);
+
+    await act(() => view.result.current.trustNewKey(CLI_ID));
+    expect(pinStore.pins.get(CLI_ID)).toBe(currentCli.identityPublicKey);
+    expect(view.result.current.cliTrust[CLI_ID]).toMatchObject({ status: "trusted" });
+    await attachAsCli(VIEWER_ID);
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+  });
+
+  it("refuses a 2.5 CLI whose signature does not cover its terminal key", async () => {
+    currentCli = await fakeCli();
+    const pinStore = createMemoryCliPinStore();
+    const view = renderHook(() => useTerminalSessions({ pinStore }));
+    const listed = await listedCli(currentCli, true);
+    message({
+      type: "terminals",
+      // Signed for another slug: the relay cannot re-bind a statement.
+      clis: [
+        {
+          ...listed,
+          identitySignature: await currentCli.sign(currentCli.ecdh.publicKeyRaw, "other"),
+        },
+      ],
+      terminals: [listedTerminal(true)],
+    });
+    await waitFor(() =>
+      expect(view.result.current.tabs[0]).toMatchObject({
+        phase: "rejected",
+        rejectionReason: "identity_invalid",
+      }),
+    );
+    expect(view.result.current.cliTrust[CLI_ID]).toEqual({ status: "invalid" });
+    expect(sentOfType("attach")).toEqual([]);
+    expect(pinStore.pins.size).toBe(0);
+  });
+
+  it("refuses a 2.5 CLI that lists no identity", async () => {
+    currentCli = await fakeCli();
+    const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
+    const listed = await listedCli(currentCli, true);
+    message({
+      type: "terminals",
+      clis: [{ ...listed, identityPublicKey: null, identitySignature: null }],
+      terminals: [listedTerminal(true)],
+    });
+    await waitFor(() =>
+      expect(view.result.current.cliTrust[CLI_ID]).toEqual({ status: "invalid" }),
+    );
+    expect(sentOfType("attach")).toEqual([]);
+  });
+
+  it("drops a handshake answered with an ECDH key the identity did not sign", async () => {
+    currentCli = await fakeCli();
+    const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
+    message({
+      type: "terminals",
+      clis: [await listedCli(currentCli, true)],
+      terminals: [listedTerminal(true)],
+    });
+    await attachAsCli(VIEWER_ID, 0, await generateEphemeralHandshake());
+    await waitFor(() =>
+      expect(view.result.current.tabs[0]).toMatchObject({
+        phase: "rejected",
+        rejectionReason: "identity_mismatch",
+      }),
+    );
+    expect(sentOfType("detach")).toEqual([{ type: "detach", terminalId: TERMINAL_ID }]);
+    expect(sentOfType("list")).toHaveLength(1);
   });
 });

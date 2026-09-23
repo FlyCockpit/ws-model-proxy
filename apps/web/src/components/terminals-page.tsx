@@ -24,6 +24,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
+import { TerminalCliIdentities } from "@/components/terminal-cli-identities";
 import { TerminalPane } from "@/components/terminal-pane";
 import { WideContent } from "@/components/wide-content";
 import { type TerminalTab, useTerminalSessions } from "@/hooks/use-terminal-sessions";
@@ -84,6 +85,17 @@ export function TerminalsPage() {
   const devices = devicesQuery.data ?? [];
   const active = sessions.tabs.find((tab) => tab.localId === sessions.activeLocalId) ?? null;
   const showSkeleton = devicesQuery.isPending && sessions.tabs.length === 0;
+  const labelFor = (cliDeviceId: string) => {
+    const device = devices.find((entry) => deviceId(entry) === cliDeviceId);
+    const listed = sessions.clis.find((cli) => cli.cliDeviceId === cliDeviceId);
+    return (
+      (device ? (deviceText(device, "label") ?? deviceText(device, "slug")) : null) ??
+      listed?.slug ??
+      cliDeviceId
+    );
+  };
+  const activeUnverified =
+    active !== null && sessions.cliTrust[active.cliDeviceId]?.status === "unverified";
 
   return (
     <section className="flex h-full min-h-0 min-w-0 flex-col overflow-x-hidden">
@@ -119,14 +131,21 @@ export function TerminalsPage() {
                 if (!id) return null;
                 const features = readCliDeviceFeatures(device);
                 const block = terminalOpenBlockReason(features.features.terminal);
+                const trust = sessions.cliTrust[id]?.status;
+                const identityBlock =
+                  trust === "changed"
+                    ? "dashboard:terminals.rejection.identity_changed"
+                    : trust === "invalid"
+                      ? "dashboard:terminals.rejection.identity_invalid"
+                      : null;
                 const label = deviceText(device, "label") ?? deviceText(device, "slug") ?? id;
                 return (
                   <DropdownMenuItem
                     key={id}
-                    disabled={block !== null}
+                    disabled={block !== null || identityBlock !== null}
                     className="min-h-11 items-start"
                     onClick={() => {
-                      if (block) return;
+                      if (block || identityBlock) return;
                       sessions.openCli(id);
                       setMenuOpen(false);
                     }}
@@ -137,6 +156,8 @@ export function TerminalsPage() {
                         <span className="text-xs text-muted-foreground">
                           {t(featureReasonKey(block))}
                         </span>
+                      ) : identityBlock ? (
+                        <span className="text-xs text-destructive">{t(identityBlock)}</span>
                       ) : null}
                     </span>
                   </DropdownMenuItem>
@@ -152,6 +173,13 @@ export function TerminalsPage() {
           {t("dashboard:terminals.reconnecting")}
         </p>
       ) : null}
+
+      <TerminalCliIdentities
+        clis={sessions.clis}
+        trust={sessions.cliTrust}
+        labelFor={labelFor}
+        onTrustNewKey={sessions.trustNewKey}
+      />
 
       {showSkeleton ? (
         <div className="flex min-h-0 flex-1 flex-col gap-3" aria-busy="true">
@@ -249,6 +277,11 @@ export function TerminalsPage() {
               {t("dashboard:terminals.rejected", {
                 reason: terminalRejectionLabel(t, active.rejectionReason),
               })}
+            </p>
+          ) : null}
+          {activeUnverified && active?.phase !== "rejected" ? (
+            <p className="mb-2 text-sm text-muted-foreground">
+              {t("dashboard:terminals.identity.activeUnverified")}
             </p>
           ) : null}
           {active?.phase === "exited" ? (

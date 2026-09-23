@@ -745,7 +745,7 @@ fn run_relay_session(
                 .clone()
                 .unwrap_or_else(|| "CLI device".to_string()),
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
-            capabilities: startup::hello_capabilities(startup, config, mode),
+            capabilities: startup::hello_capabilities(startup, config, mode, cli_slug),
         },
         endpoints,
     };

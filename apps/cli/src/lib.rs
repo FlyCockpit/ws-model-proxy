@@ -25,4 +25,5 @@ pub mod slug;
 pub mod startup;
 pub mod state;
 pub mod terminal_crypto;
+pub mod terminal_identity;
 pub mod tokens;

@@ -179,11 +179,21 @@ function hello(slug: string, protocol: "2.5" | "2.4" | "2.1", features?: CliFeat
           terminalSupported: features?.terminalSupported ?? true,
         },
         terminalPublicKey: uncompressedKey(),
-        ...(protocol === "2.5" ? { terminalViewers: true } : {}),
+        ...(protocol === "2.5" ? { terminalViewers: true, terminalIdentity: cliIdentity() } : {}),
       },
     },
     endpoints: [],
   });
+}
+
+/** Opaque to the relay: it stores and lists these without verifying them. */
+function cliIdentity() {
+  const publicKey = Buffer.alloc(65, 3);
+  publicKey[0] = 0x04;
+  return {
+    publicKey: publicKey.toString("base64url"),
+    signature: Buffer.alloc(64, 7).toString("base64url"),
+  };
 }
 
 function device(id: string, overrides: Record<string, unknown> = {}) {
@@ -717,7 +727,15 @@ describe("terminal browser hub", () => {
       db.cliDevice.findMany.mockResolvedValue([device("one")]);
       await send(b, { type: "list" });
       const listed = b.jsonSends().find((message) => message.type === "terminals");
-      expect(listed?.clis).toEqual([expect.objectContaining({ terminalViewers: true })]);
+      expect(listed?.clis).toEqual([
+        expect.objectContaining({
+          terminalViewers: true,
+          slug: "one",
+          publicKey: uncompressedKey(),
+          identityPublicKey: cliIdentity().publicKey,
+          identitySignature: cliIdentity().signature,
+        }),
+      ]);
       expect(listed?.terminals).toEqual([
         expect.objectContaining({
           terminalId,
@@ -950,7 +968,13 @@ describe("terminal browser hub", () => {
     db.cliDevice.findMany.mockResolvedValue([device("one")]);
     await terminalBrowserHub.handleText(b, JSON.stringify({ type: "list" }));
     const listed = b.jsonSends().find((message) => message.type === "terminals");
-    expect(listed?.clis).toEqual([expect.objectContaining({ terminalViewers: false })]);
+    expect(listed?.clis).toEqual([
+      expect.objectContaining({
+        terminalViewers: false,
+        identityPublicKey: null,
+        identitySignature: null,
+      }),
+    ]);
     expect(listed?.terminals).toEqual([
       expect.objectContaining({ viewerCount: 1, attachedHere: true, writerHere: true }),
     ]);

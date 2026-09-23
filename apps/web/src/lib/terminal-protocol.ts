@@ -20,9 +20,16 @@ export type ListedTerminal = {
 
 export type ListedCli = {
   cliDeviceId: string;
+  /** The slug the CLI reported. Its identity signature binds it. */
+  slug: string | null;
+  /** The CLI's per-start ECDH terminal key. */
   publicKey: string | null;
   /** Protocol 2.5 CLI: several tabs can view one terminal (v2 crypto). */
   terminalViewers: boolean;
+  /** 2.5: the CLI's long-lived identity key, relayed unverified. */
+  identityPublicKey: string | null;
+  /** 2.5: identity signature over the slug and `publicKey`. */
+  identitySignature: string | null;
 };
 
 export type TerminalIdentityMessage = {
@@ -132,8 +139,11 @@ function readListedCli(value: unknown): ListedCli | null {
   if (!cliDeviceId) return null;
   return {
     cliDeviceId,
+    slug: readString(value, "slug"),
     publicKey: typeof value.publicKey === "string" ? value.publicKey : null,
     terminalViewers: value.terminalViewers === true,
+    identityPublicKey: readString(value, "identityPublicKey"),
+    identitySignature: readString(value, "identitySignature"),
   };
 }
 

@@ -23,10 +23,21 @@ import {
   useTerminalIdentity,
 } from "@/hooks/use-terminal-crypto";
 import { type TerminalSocketStatus, useTerminalSocket } from "@/hooks/use-terminal-socket";
+import {
+  type CliPinStore,
+  type CliTrust,
+  cliTrustInputKey,
+  evaluateCliTrust,
+  indexedDbCliPinStore,
+  trustAllowsHandshake,
+  trustNewCliKey,
+  trustRejectionReason,
+} from "@/lib/terminal-cli-identity";
 import { takePendingByTerminalId } from "@/lib/terminal-pending";
 import {
   clampTerminalAxis,
   encodeSealedFrame,
+  type ListedCli,
   type SealedTerminalFrame,
   type TerminalClientMessage,
   type TerminalServerMessage,
@@ -57,6 +68,8 @@ const INPUT_DROPPED_NOTICE_MS = 5_000;
 /** Frames that arrive before the handshake finishes. Covers a full scrollback replay. */
 const EARLY_FRAME_QUEUE = 64;
 const OUTPUT_BUFFER_EVENTS = 256;
+/** Refusals that "Trust new key" can lift. A key swapped mid-handshake cannot. */
+const IDENTITY_RETRY_REASONS = new Set(["identity_changed", "identity_invalid"]);
 
 type InputBatch = {
   pending: string;
@@ -101,6 +114,8 @@ type PendingHandshake = {
   privateKey: CryptoKey;
   browserPublicRaw: Uint8Array;
   browserNonce: Uint8Array;
+  /** 2.5: the ECDH key the pinned identity signed. The CLI must answer with it. */
+  expectedCliPublicKey: string | null;
 };
 
 type OutputKeyState = {
@@ -125,6 +140,16 @@ type LiveSession = {
   /** v2: broadcast frames for an epoch whose key has not arrived yet. */
   future: SealedTerminalFrame[];
 };
+
+type Deferred = { promise: Promise<void>; resolve: () => void };
+
+function deferred(): Deferred {
+  let resolve: () => void = () => undefined;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
 
 function newId(prefix: string): string {
   return `${prefix}_${bytesToBase64Url(crypto.getRandomValues(new Uint8Array(12)))}`;
@@ -173,9 +198,20 @@ function newTab(input: {
   };
 }
 
-export function useTerminalSessions(): {
+export type UseTerminalSessionsOptions = {
+  /** Pinned CLI identity keys. Defaults to IndexedDB. */
+  pinStore?: CliPinStore;
+};
+
+export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   status: TerminalSocketStatus;
   identityReady: boolean;
+  /** CLIs from the relay's list, in its order. */
+  clis: ListedCli[];
+  /** Identity trust per `cliDeviceId`; missing while it is being checked. */
+  cliTrust: Record<string, CliTrust>;
+  /** After an in-page confirmation: pin the new identity key shown for a CLI. */
+  trustNewKey: (cliDeviceId: string) => Promise<void>;
   tabs: TerminalTab[];
   activeLocalId: string | null;
   selectTab: (localId: string) => void;
@@ -193,6 +229,15 @@ export function useTerminalSessions(): {
   sendResize: (localId: string, cols: number, rows: number) => void;
 } {
   const identity = useTerminalIdentity();
+  const pinStoreRef = useRef(options.pinStore ?? indexedDbCliPinStore);
+  pinStoreRef.current = options.pinStore ?? indexedDbCliPinStore;
+  const [clis, setClis] = useState<ListedCli[]>([]);
+  const [cliTrust, setCliTrust] = useState<Record<string, CliTrust>>({});
+  const cliListRef = useRef(new Map<string, ListedCli>());
+  const cliTrustRef = useRef(new Map<string, CliTrust>());
+  const trustRef = useRef(new Map<string, { key: string; promise: Promise<CliTrust> }>());
+  const listReadyRef = useRef<Deferred | null>(null);
+  listReadyRef.current ??= deferred();
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   const [activeLocalId, setActiveLocalId] = useState<string | null>(null);
   const tabsRef = useRef(tabs);
@@ -354,6 +399,63 @@ export function useTerminalSessions(): {
     [clearTimer, flushInput, sendPlaintext, viewOf],
   );
 
+  const publishTrust = useCallback((cliDeviceId: string, trust: CliTrust) => {
+    cliTrustRef.current.set(cliDeviceId, trust);
+    setCliTrust((current) =>
+      current[cliDeviceId] === trust ? current : { ...current, [cliDeviceId]: trust },
+    );
+  }, []);
+
+  /** Verify the CLI identity for the listed terminal key, once per list entry. */
+  const ensureTrust = useCallback(
+    async (cliDeviceId: string): Promise<CliTrust> => {
+      await listReadyRef.current?.promise;
+      const cli = cliListRef.current.get(cliDeviceId);
+      if (!cli) return { status: "offline" };
+      const key = cliTrustInputKey(cli);
+      const cached = trustRef.current.get(cliDeviceId);
+      if (cached && cached.key === key) return cached.promise;
+      const promise = evaluateCliTrust(cli, pinStoreRef.current).catch(
+        (): CliTrust => ({ status: "invalid" }),
+      );
+      trustRef.current.set(cliDeviceId, { key, promise });
+      const trust = await promise;
+      if (trustRef.current.get(cliDeviceId)?.promise === promise) {
+        publishTrust(cliDeviceId, trust);
+      }
+      return trust;
+    },
+    [publishTrust],
+  );
+
+  /** Refuse a tab before any handshake message goes out. */
+  const refuseTab = useCallback((localId: string, reason: string) => {
+    setTabs((current) =>
+      patchTab(current, localId, {
+        phase: "rejected",
+        approvalCode: null,
+        rejectionReason: reason,
+        error: null,
+      }),
+    );
+  }, []);
+
+  /**
+   * The CLI answered with an ECDH key its pinned identity did not sign. Drop
+   * the handshake, leave the terminal, and refresh the list: a CLI restart
+   * lists a new signed key, a relay substitution does not.
+   */
+  const refuseSubstitutedKey = useCallback(
+    (pending: PendingHandshake, terminalId: string) => {
+      attachingRef.current.delete(terminalId);
+      const tab = tabsRef.current.find((item) => item.localId === pending.localId);
+      sendRef.current({ type: tab?.opener ? "close" : "detach", terminalId });
+      refuseTab(pending.localId, "identity_mismatch");
+      sendRef.current({ type: "list" });
+    },
+    [refuseTab],
+  );
+
   const establish = useCallback(
     async (
       pending: PendingHandshake,
@@ -372,6 +474,13 @@ export function useTerminalSessions(): {
         setTabs((current) =>
           patchTab(current, pending.localId, { phase: "rejected", error: "bad_handshake" }),
         );
+        return;
+      }
+      if (
+        pending.expectedCliPublicKey !== null &&
+        message.cliPublicKey !== pending.expectedCliPublicKey
+      ) {
+        refuseSubstitutedKey(pending, message.terminalId);
         return;
       }
       const cliPublicRaw = base64UrlToBytes(message.cliPublicKey);
@@ -432,7 +541,7 @@ export function useTerminalSessions(): {
       }
       flushResize(pending.localId);
     },
-    [flushResize, setView, viewOf],
+    [flushResize, refuseSubstitutedKey, setView, viewOf],
   );
 
   const beginHandshake = useCallback(
@@ -445,6 +554,24 @@ export function useTerminalSessions(): {
       mode: "open" | "attach";
       version: 1 | 2;
     }) => {
+      // Verify (and pin on first use) the CLI identity before any key leaves.
+      const trust = await ensureTrust(input.cliDeviceId);
+      if (!tabsRef.current.some((tab) => tab.localId === input.localId)) return;
+      const gate = trustAllowsHandshake(trust);
+      if (!gate.ok) {
+        if (input.mode === "attach") attachingRef.current.delete(input.terminalId);
+        refuseTab(input.localId, trustRejectionReason(trust));
+        return;
+      }
+      let version = input.version;
+      if (input.mode === "open") {
+        // An open can start before the first list arrives; use the listed version.
+        const multiViewer = cliViewersRef.current.get(input.cliDeviceId) ?? false;
+        version = multiViewer ? 2 : 1;
+        if (viewOf(input.localId).multiViewer !== multiViewer) {
+          setView(input.localId, { multiViewer }, { multiViewer });
+        }
+      }
       const handshake = await generateEphemeralHandshake();
       if (!tabsRef.current.some((tab) => tab.localId === input.localId)) return;
       const publicKey = publicKeyRef.current();
@@ -452,11 +579,12 @@ export function useTerminalSessions(): {
       pendingRef.current.set(input.mode === "open" ? input.localId : input.terminalId, {
         localId: input.localId,
         terminalId: input.mode === "open" ? "" : input.terminalId,
-        version: input.version,
+        version,
         viewerId: null,
         privateKey: handshake.privateKey,
         browserPublicRaw: handshake.publicKeyRaw,
         browserNonce: handshake.nonce,
+        expectedCliPublicKey: gate.expectedCliPublicKey,
       });
       const shared = {
         publicKey: handshake.publicKeyB64,
@@ -478,7 +606,7 @@ export function useTerminalSessions(): {
       }
       sendRef.current({ type: "attach", terminalId: input.terminalId, ...shared });
     },
-    [],
+    [ensureTrust, refuseTab, setView, viewOf],
   );
 
   const attach = useCallback(
@@ -503,6 +631,8 @@ export function useTerminalSessions(): {
   const canAttach = useCallback((tab: TerminalTab) => {
     if (!tab.terminalId || tab.phase === "exited" || tab.phase === "rejected") return false;
     if (sessionsRef.current.has(tab.terminalId)) return false;
+    // An attach may still be checking the CLI identity before its handshake.
+    if (attachingRef.current.has(tab.terminalId)) return false;
     return !pendingFor(pendingRef.current, tab.localId, tab.terminalId);
   }, []);
 
@@ -522,10 +652,15 @@ export function useTerminalSessions(): {
   const onMessage = useCallback(
     (message: TerminalServerMessage) => {
       if (message.type === "terminals") {
+        cliListRef.current = new Map(message.clis.map((cli) => [cli.cliDeviceId, cli]));
+        setClis(message.clis);
         for (const cli of message.clis) {
           cliKeysRef.current.set(cli.cliDeviceId, cli.publicKey);
           cliViewersRef.current.set(cli.cliDeviceId, cli.terminalViewers);
         }
+        listReadyRef.current?.resolve();
+        // Check every CLI now, so the page can show fingerprints and refusals.
+        for (const cli of message.clis) void ensureTrust(cli.cliDeviceId);
         const additions: TerminalTab[] = [];
         const toAttach: TerminalTab[] = [];
         for (const remote of message.terminals) {
@@ -616,6 +751,15 @@ export function useTerminalSessions(): {
             phase: "opening",
           }),
         );
+        // Never sign a transcript for an ECDH key the pinned identity did not sign.
+        if (
+          pending.expectedCliPublicKey !== null &&
+          message.cliPublicKey !== pending.expectedCliPublicKey
+        ) {
+          takePendingByTerminalId(pendingRef.current, message.terminalId);
+          refuseSubstitutedKey(pending, message.terminalId);
+          return;
+        }
         // v2 signs the viewer id too. Without one the CLI would reject it.
         if (pending.version === 2 && !pending.viewerId) return;
         void signRef
@@ -757,7 +901,18 @@ export function useTerminalSessions(): {
         ),
       );
     },
-    [attach, canAttach, clearTimer, dropSession, establish, setView, tabByTerminal, viewOf],
+    [
+      attach,
+      canAttach,
+      clearTimer,
+      dropSession,
+      ensureTrust,
+      establish,
+      refuseSubstitutedKey,
+      setView,
+      tabByTerminal,
+      viewOf,
+    ],
   );
 
   const onDisconnect = useCallback(() => {
@@ -1119,9 +1274,51 @@ export function useTerminalSessions(): {
     [clearTimer, flushResize, viewOf],
   );
 
+  const trustNewKey = useCallback(
+    async (cliDeviceId: string) => {
+      const cli = cliListRef.current.get(cliDeviceId);
+      const shown = cliTrustRef.current.get(cliDeviceId);
+      if (!cli || shown?.status !== "changed") return;
+      const promise = trustNewCliKey(cli, shown, pinStoreRef.current).catch(
+        (): CliTrust => ({ status: "invalid" }),
+      );
+      trustRef.current.set(cliDeviceId, { key: cliTrustInputKey(cli), promise });
+      const trust = await promise;
+      if (trustRef.current.get(cliDeviceId)?.promise !== promise) return;
+      publishTrust(cliDeviceId, trust);
+      if (!trustAllowsHandshake(trust).ok) return;
+      // Retry the tabs this CLI's identity blocked before they sent anything.
+      for (const tab of tabsRef.current) {
+        if (tab.cliDeviceId !== cliDeviceId || tab.phase !== "rejected") continue;
+        if (!IDENTITY_RETRY_REASONS.has(tab.rejectionReason ?? "")) continue;
+        const retry: TerminalTab = { ...tab, phase: "opening", rejectionReason: null };
+        setTabs((current) =>
+          patchTab(current, tab.localId, { phase: "opening", rejectionReason: null }),
+        );
+        if (tab.terminalId) {
+          attach(retry);
+        } else if (tab.opener) {
+          void beginHandshake({
+            mode: "open",
+            localId: tab.localId,
+            cliDeviceId,
+            terminalId: "",
+            cols: tab.cols,
+            rows: tab.rows,
+            version: tab.multiViewer ? 2 : 1,
+          });
+        }
+      }
+    },
+    [attach, beginHandshake, publishTrust],
+  );
+
   return {
     status: socket.status,
     identityReady: identity.ready,
+    clis,
+    cliTrust,
+    trustNewKey,
     tabs,
     activeLocalId,
     selectTab,

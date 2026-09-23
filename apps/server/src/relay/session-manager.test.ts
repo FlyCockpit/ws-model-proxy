@@ -1398,6 +1398,29 @@ describe("relay protocol 2.5 terminal viewers", () => {
     expect(manager.dispatchExecStart(command, { command: "pwd" })).toBe(true);
   });
 
+  it("keeps a 2.5 CLI identity proof for the terminal list", async () => {
+    const identityKey = Buffer.alloc(65, 3);
+    identityKey[0] = 0x04;
+    const terminalIdentity = {
+      publicKey: identityKey.toString("base64url"),
+      signature: Buffer.alloc(64, 7).toString("base64url"),
+    };
+    const frame = JSON.parse(hello25()) as { cli: { capabilities: Record<string, unknown> } };
+    frame.cli.capabilities.terminalIdentity = terminalIdentity;
+    const { manager } = await setup(JSON.stringify(frame));
+    expect(manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")).toMatchObject({
+      terminalPublicKey: uncompressedKey(),
+      terminalIdentity,
+    });
+  });
+
+  it("reports no identity for a 2.5 CLI that sent none", async () => {
+    const { manager } = await setup();
+    expect(
+      manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")?.terminalIdentity,
+    ).toBeNull();
+  });
+
   it("lets two 2.5 viewers coexist without a detached event", async () => {
     const { manager, socket } = await setup();
     const terminalId = id16(20);

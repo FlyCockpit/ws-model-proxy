@@ -1,13 +1,14 @@
-//! `wsmp terminal` approval commands.
+//! `wsmp terminal` approval and identity commands.
 //!
 //! Approvals are re-read on each terminal open, so these commands do not need a
-//! daemon restart.
+//! daemon restart. `fingerprint` prints the CLI identity key that browsers pin.
 
 use anyhow::Result;
 use serde::Serialize;
 
 use crate::approvals::{self, ApprovalEntry};
 use crate::output;
+use crate::terminal_identity;
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -28,6 +29,10 @@ enum Sub {
         #[command(subcommand)]
         command: Approvals,
     },
+    /// Print this CLI's terminal identity fingerprint, as browsers show it.
+    ///
+    /// Creates the identity key on first use.
+    Fingerprint,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -79,8 +84,31 @@ pub fn run(args: &Args) -> Result<()> {
                 output::line(format!("revoked terminal approval `{code}`"))?;
             }
         }
+        Sub::Fingerprint => {
+            let identity = terminal_identity::load_or_create(&state_dir)?;
+            let fingerprint = identity.fingerprint();
+            if args.json {
+                output::json(&FingerprintResult {
+                    fingerprint: &fingerprint,
+                    public_key: identity.public_b64url(),
+                    path: terminal_identity::identity_path(&state_dir)
+                        .display()
+                        .to_string(),
+                })?;
+            } else {
+                output::line(fingerprint)?;
+            }
+        }
     }
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FingerprintResult<'a> {
+    fingerprint: &'a str,
+    public_key: String,
+    path: String,
 }
 
 #[derive(Debug, Serialize)]

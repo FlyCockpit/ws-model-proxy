@@ -17,6 +17,11 @@ export type LiveCliFeatureSnapshot = {
   terminalApproval: boolean;
   /** Uncompressed P-256 public key, base64url, when the live session is 2.4. */
   terminalPublicKey: string | null;
+  /**
+   * 2.5: the CLI identity key and its signature over the terminal key. Relayed
+   * to browsers unverified; they verify and pin it.
+   */
+  terminalIdentity?: { publicKey: string; signature: string } | null;
 };
 
 export type ContextServices = {

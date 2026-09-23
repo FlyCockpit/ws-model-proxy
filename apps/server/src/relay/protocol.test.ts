@@ -467,6 +467,34 @@ describe("relay protocol 2.5", () => {
     return frame.buffer;
   }
 
+  it("accepts an optional, strict 2.5 terminalIdentity and keeps it off 2.4", () => {
+    const identityKey = Buffer.alloc(65, 3);
+    identityKey[0] = 0x04;
+    const terminalIdentity = {
+      publicKey: identityKey.toString("base64url"),
+      signature: Buffer.alloc(64, 7).toString("base64url"),
+    };
+    const v25 = { protocolVersion: "2.5", ...capabilities24, terminalViewers: true };
+    expect(parseRelayClientControlFrame(hello("2.5", { ...v25, terminalIdentity }))).toMatchObject({
+      cli: { capabilities: { terminalIdentity } },
+    });
+    for (const bad of [
+      { publicKey: terminalIdentity.publicKey },
+      { ...terminalIdentity, signature: Buffer.alloc(63, 7).toString("base64url") },
+      { ...terminalIdentity, publicKey: Buffer.alloc(65, 3).toString("base64url") },
+      { ...terminalIdentity, extra: true },
+    ]) {
+      expect(() =>
+        parseRelayClientControlFrame(hello("2.5", { ...v25, terminalIdentity: bad })),
+      ).toThrow();
+    }
+    expect(() =>
+      parseRelayClientControlFrame(
+        hello("2.4", { protocolVersion: "2.4", ...capabilities24, terminalIdentity }),
+      ),
+    ).toThrow();
+  });
+
   it("accepts a 2.5 hello only with terminalViewers and keeps 2.4 strict", () => {
     expect(RELAY_PROTOCOL_VERSIONS).toContain("2.5");
     expect(

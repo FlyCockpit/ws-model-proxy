@@ -10,7 +10,9 @@ export const TERMINAL_HKDF_LABEL_V2 = "wsmp-term-v2";
 export const TERMINAL_BROADCAST_LABEL = "wsmp-term-v2-out";
 export const TERMINAL_APPROVAL_LABEL_V2 = "wsmp-term-approve-v2";
 export const PLAINTEXT_OUTPUT_KEY = 0x03;
+export const TERMINAL_CLI_IDENTITY_LABEL = "wsmp-term-cli-id-v1";
 const OUTPUT_KEY_PLAINTEXT_LENGTH = 1 + 4 + 32;
+const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
 const ECDH_PARAMS = { name: "ECDH", namedCurve: "P-256" } as const;
 const ECDSA_PARAMS = { name: "ECDSA", namedCurve: "P-256" } as const;
@@ -630,6 +632,77 @@ export async function verifyApprovalTranscriptV2(
     toArrayBuffer(signature),
     toArrayBuffer(buildApprovalTranscriptV2(input)),
   );
+}
+
+// CLI identity pinning (protocol 2.5). The CLI's long-lived ECDSA identity key
+// signs its per-start ECDH terminal key, bound to the CLI slug.
+
+/** `lp16("wsmp-term-cli-id-v1") ‖ lp16(cliSlug) ‖ ecdhPub(65)`. */
+export function buildCliIdentityStatement(cliSlug: string, ecdhPublicRaw: Uint8Array): Uint8Array {
+  if (ecdhPublicRaw.byteLength !== 65 || ecdhPublicRaw[0] !== 0x04) {
+    throw new Error("expected an uncompressed P-256 public key");
+  }
+  return concatBytes([
+    lengthPrefix(textEncoder.encode(TERMINAL_CLI_IDENTITY_LABEL)),
+    lengthPrefix(textEncoder.encode(cliSlug)),
+    ecdhPublicRaw,
+  ]);
+}
+
+/** `false` for a malformed key or signature as well as a bad signature. */
+export async function verifyCliIdentitySignature(input: {
+  identityPublicKey: Uint8Array;
+  signature: Uint8Array;
+  cliSlug: string;
+  ecdhPublicKey: Uint8Array;
+}): Promise<boolean> {
+  if (input.identityPublicKey.byteLength !== 65 || input.identityPublicKey[0] !== 0x04) {
+    return false;
+  }
+  if (input.signature.byteLength !== 64) return false;
+  try {
+    const publicKey = await crypto.subtle.importKey(
+      "raw",
+      toArrayBuffer(input.identityPublicKey),
+      ECDSA_PARAMS,
+      false,
+      ["verify"],
+    );
+    return await crypto.subtle.verify(
+      { name: "ECDSA", hash: "SHA-256" },
+      publicKey,
+      toArrayBuffer(input.signature),
+      toArrayBuffer(buildCliIdentityStatement(input.cliSlug, input.ecdhPublicKey)),
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** RFC 4648 base32, no padding. Matches the CLI's `base32_nopad`. */
+export function base32NoPad(bytes: Uint8Array): string {
+  let out = "";
+  let buffer = 0;
+  let bits = 0;
+  for (let index = 0; index < bytes.byteLength; index += 1) {
+    buffer = ((buffer << 8) | (bytes[index] ?? 0)) & 0xffff;
+    bits += 8;
+    while (bits >= 5) {
+      bits -= 5;
+      out += BASE32_ALPHABET[(buffer >> bits) & 0x1f];
+    }
+  }
+  if (bits > 0) out += BASE32_ALPHABET[(buffer << (5 - bits)) & 0x1f];
+  return out;
+}
+
+/** Base32 of the first 20 bytes of SHA-256(identity key), in groups of 4. */
+export async function cliIdentityFingerprint(identityPublicKey: Uint8Array): Promise<string> {
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", toArrayBuffer(identityPublicKey)),
+  );
+  const encoded = base32NoPad(digest.slice(0, 20));
+  return encoded.match(/.{1,4}/g)?.join(" ") ?? encoded;
 }
 
 function requestToPromise<T>(request: IDBRequest<T>): Promise<T> {

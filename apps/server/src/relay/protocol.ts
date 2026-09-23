@@ -78,6 +78,28 @@ export const uncompressedP256PublicKeySchema = z
     return bytes.length === 65 && bytes[0] === 0x04;
   }, "Expected a 65-byte uncompressed P-256 public key.");
 
+/** IEEE P1363 P-256 signature: 64 bytes, unpadded base64url (86 characters). */
+export const p256SignatureSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9_-]{86}$/)
+  .refine((value) => Buffer.from(value, "base64url").length === 64, {
+    message: "Expected a 64-byte P-256 signature.",
+  });
+
+/**
+ * 2.5: the CLI's long-lived identity key and its signature over
+ * `lp16("wsmp-term-cli-id-v1") ‖ lp16(cliSlug) ‖ terminalPublicKey`. The relay
+ * does not verify it; browsers do, and pin the key per CLI device.
+ */
+export const cliTerminalIdentitySchema = z
+  .object({
+    publicKey: uncompressedP256PublicKeySchema,
+    signature: p256SignatureSchema,
+  })
+  .strict();
+
+export type CliTerminalIdentity = z.infer<typeof cliTerminalIdentitySchema>;
+
 /** Server-minted per attachment (2.5). Same shape as a terminal id. */
 export const viewerIdSchema = base64Url16ByteSchema;
 
@@ -121,6 +143,8 @@ const v25CliCapabilitiesSchema = z
     protocolVersion: z.literal("2.5"),
     ...v24CliCapabilityFields,
     terminalViewers: z.literal(true),
+    /** Absent when the CLI could not load its identity; browsers then refuse it. */
+    terminalIdentity: cliTerminalIdentitySchema.optional(),
   })
   .strict();
 

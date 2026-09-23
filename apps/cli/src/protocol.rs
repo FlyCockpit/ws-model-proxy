@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::config::{
     CapabilityOverrideMode, EndpointConfig, EndpointKind, OpenAiCompatibleCapabilities,
 };
+pub use crate::terminal_identity::TerminalIdentityProof;
 
 pub const RELAY_PROTOCOL_VERSION: &str = "2.5";
 /// Spoken after an old server rejects the first 2.5 hello. Single-viewer terminals.
@@ -254,6 +255,9 @@ pub struct TerminalFeatureSnapshot {
     pub require_terminal_approval: bool,
     /// 65-byte uncompressed SEC1, base64url without padding.
     pub terminal_public_key_b64url: String,
+    /// 2.5 only: the persistent identity key and its signature over the ECDH
+    /// key above. `None` when the identity file could not be loaded.
+    pub terminal_identity: Option<TerminalIdentityProof>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -286,6 +290,10 @@ pub struct CliCapabilities {
     /// 2.5 only; the 2.4 schema is strict and must not see this key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_viewers: Option<bool>,
+    /// 2.5 only. The browser pins this key and checks the signature before any
+    /// terminal handshake.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_identity: Option<TerminalIdentityProof>,
 }
 
 impl CliCapabilities {
@@ -312,6 +320,11 @@ impl CliCapabilities {
             },
             terminal_public_key: snapshot.terminal_public_key_b64url.clone(),
             terminal_viewers: mode.terminal_viewers().then_some(true),
+            terminal_identity: if mode.terminal_viewers() {
+                snapshot.terminal_identity.clone()
+            } else {
+                None
+            },
         }
     }
 }
@@ -1218,6 +1231,10 @@ mod tests {
                         allow_mcp_commands: true,
                         require_terminal_approval: false,
                         terminal_public_key_b64url: "AQID".to_string(),
+                        terminal_identity: Some(TerminalIdentityProof {
+                            public_key: "BAQE".to_string(),
+                            signature: "Sig".to_string(),
+                        }),
                     },
                     RelayProtocolMode::V25,
                 ),
@@ -1237,6 +1254,7 @@ mod tests {
 
         assert!(encoded.contains(r#""protocolVersion":"2.5""#));
         assert!(encoded.contains(r#""terminalViewers":true"#));
+        assert!(encoded.contains(r#""terminalIdentity":{"publicKey":"BAQE","signature":"Sig"}"#));
         assert!(encoded.contains(r#""sharedTokenizerTps":true"#));
         assert!(encoded.contains(r#""standardizedMetrics":true"#));
         assert!(encoded.contains(r#""terminal":true"#));
@@ -1390,6 +1408,10 @@ mod tests {
             allow_mcp_commands: true,
             require_terminal_approval: false,
             terminal_public_key_b64url: "AQID".to_string(),
+            terminal_identity: Some(TerminalIdentityProof {
+                public_key: "BAQE".to_string(),
+                signature: "Sig".to_string(),
+            }),
         };
         let legacy = serde_json::to_value(CliCapabilities::from_snapshot(
             &snapshot,
@@ -1398,6 +1420,7 @@ mod tests {
         .expect("encode");
         assert_eq!(legacy["protocolVersion"], "2.4");
         assert!(legacy.get("terminalViewers").is_none());
+        assert!(legacy.get("terminalIdentity").is_none());
         let current = serde_json::to_value(CliCapabilities::from_snapshot(
             &snapshot,
             RelayProtocolMode::V25,
@@ -1405,6 +1428,7 @@ mod tests {
         .expect("encode");
         assert_eq!(current["protocolVersion"], "2.5");
         assert_eq!(current["terminalViewers"], true);
+        assert_eq!(current["terminalIdentity"]["publicKey"], "BAQE");
         let mut legacy_keys = legacy
             .as_object()
             .expect("object")
@@ -1412,6 +1436,7 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>();
         legacy_keys.push("terminalViewers".to_string());
+        legacy_keys.push("terminalIdentity".to_string());
         legacy_keys.sort();
         let mut current_keys = current
             .as_object()

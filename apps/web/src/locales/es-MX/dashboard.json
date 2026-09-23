@@ -284,7 +284,30 @@
       "offline": "El CLI está desconectado",
       "invalid": "Esa solicitud de terminal no es válida",
       "viewer_limit": "Ya hay demasiadas pestañas viendo esta terminal",
-      "bad_frame": "El CLI desconectó esta pestaña por un marco inválido"
+      "bad_frame": "El CLI desconectó esta pestaña por un marco inválido",
+      "identity_changed": "La clave de identidad de esta CLI cambió",
+      "identity_invalid": "Esta CLI no demostró su identidad",
+      "identity_mismatch": "La CLI respondió con una clave que su identidad no firmó"
+    },
+    "identity": {
+      "title": "Identidades de CLI",
+      "description": "El navegador fija la clave de identidad de cada CLI la primera vez que la ve. Compara una huella con `wsmp terminal fingerprint` en esa máquina.",
+      "fingerprint": "Huella",
+      "checking": "Verificando identidad…",
+      "offline": "Sin conexión",
+      "unpinned": "Este navegador no pudo guardar la clave. Compara la huella antes de escribir algo sensible.",
+      "unverified": "Sin verificar. Actualiza la CLI para verificar su identidad.",
+      "invalid": "Esta CLI no demostró su identidad. Sus terminales están bloqueadas.",
+      "changed": "La clave de identidad de esta CLI cambió. Sus terminales están bloqueadas hasta que confíes en la nueva clave.",
+      "downgraded": "Esta CLI ya no demuestra su identidad. Sus terminales están bloqueadas hasta que la permitas.",
+      "pinned": "Fijada",
+      "new": "Nueva",
+      "trustNew": "Confiar en la nueva clave",
+      "allowUnverified": "Permitir sin verificar",
+      "trustTitle": "¿Confiar en la nueva clave de {{label}}?",
+      "trustDescription": "Continúa solo si ejecutaste `wsmp terminal fingerprint` en esa máquina y coincide. De lo contrario, alguien podría estar interceptando tu terminal.",
+      "trustFailed": "No se pudo confiar en la clave. Recarga e inténtalo de nuevo.",
+      "activeUnverified": "La identidad de esta CLI no está verificada. Actualiza la CLI para verificarla."
     }
   },
   "nav": {

@@ -23,6 +23,7 @@ const APPROVAL_LABEL: &[u8] = b"wsmp-term-approve-v1";
 const HKDF_INFO_LABEL_V2: &[u8] = b"wsmp-term-v2";
 const BROADCAST_LABEL: &[u8] = b"wsmp-term-v2-out";
 const APPROVAL_LABEL_V2: &[u8] = b"wsmp-term-approve-v2";
+const CLI_IDENTITY_LABEL: &[u8] = b"wsmp-term-cli-id-v1";
 pub const PLAINTEXT_OUTPUT_KEY: u8 = 0x03;
 const OUTPUT_KEY_PLAINTEXT_LEN: usize = 1 + 4 + 32;
 const BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
@@ -666,6 +667,74 @@ pub fn sign_approval_v2(
     Ok(signature.to_bytes().to_vec())
 }
 
+// CLI identity pinning (protocol 2.5). A long-lived P-256 ECDSA key signs the
+// per-start ECDH terminal key, so a relay cannot swap in its own ECDH key
+// without the browser seeing a new identity.
+
+/// `lp16("wsmp-term-cli-id-v1") ‖ lp16(cliId) ‖ ecdhPub(65)`. `cli_id` is the
+/// CLI slug the hello reports (see `apps/cli/src/terminal_identity.rs`).
+pub fn cli_identity_statement(cli_id: &str, ecdh_public_raw: &[u8; 65]) -> Result<Vec<u8>> {
+    let mut statement = Vec::with_capacity(2 + CLI_IDENTITY_LABEL.len() + 2 + cli_id.len() + 65);
+    push_length_prefixed(&mut statement, CLI_IDENTITY_LABEL)?;
+    push_length_prefixed(&mut statement, cli_id.as_bytes())?;
+    statement.extend_from_slice(ecdh_public_raw);
+    Ok(statement)
+}
+
+/// A 64-byte IEEE P1363 (`r ‖ s`) signature over the identity statement.
+pub fn sign_cli_identity(
+    signing_key: &SigningKey,
+    cli_id: &str,
+    ecdh_public_raw: &[u8; 65],
+) -> Result<Vec<u8>> {
+    let statement = cli_identity_statement(cli_id, ecdh_public_raw)?;
+    let signature: Signature = signing_key.sign(&statement);
+    Ok(signature.to_bytes().to_vec())
+}
+
+pub fn verify_cli_identity(
+    identity_public_raw: &[u8; 65],
+    signature: &[u8],
+    cli_id: &str,
+    ecdh_public_raw: &[u8; 65],
+) -> bool {
+    let Ok(statement) = cli_identity_statement(cli_id, ecdh_public_raw) else {
+        return false;
+    };
+    let Ok(verifying) = VerifyingKey::from_sec1_bytes(identity_public_raw) else {
+        return false;
+    };
+    let Ok(signature) = Signature::from_slice(signature) else {
+        return false;
+    };
+    verifying.verify(&statement, &signature).is_ok()
+}
+
+/// Base32 (RFC 4648, no padding) of the first 20 bytes of SHA-256(identity
+/// public key), in space-separated groups of 4. 20 bytes give 32 characters.
+pub fn identity_fingerprint(identity_public_raw: &[u8; 65]) -> String {
+    let digest = Sha256::digest(identity_public_raw);
+    let encoded = base32_nopad(&digest[..20]);
+    encoded
+        .as_bytes()
+        .chunks(4)
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 65-byte uncompressed SEC1 point for an identity signing key.
+pub fn identity_public_raw(signing_key: &SigningKey) -> Result<[u8; 65]> {
+    let raw = copy_exact::<65>(
+        signing_key.verifying_key().to_sec1_point(false).as_bytes(),
+        "identity public key",
+    )?;
+    if raw[0] != 0x04 {
+        anyhow::bail!("identity public key is not uncompressed");
+    }
+    Ok(raw)
+}
+
 fn copy_exact<const N: usize>(bytes: &[u8], what: &str) -> Result<[u8; N]> {
     bytes
         .try_into()
@@ -1173,6 +1242,60 @@ mod tests {
         )
         .expect("v1 sign");
         assert!(!verify(&hex::encode_like(&v1), VIEWER_A));
+    }
+
+    // CLI identity vectors. Mirrored in `apps/web/src/hooks/use-terminal-crypto.test.ts`.
+    const CLI_ID_SLUG: &str = "desk-01";
+    const CLI_ID_PUBLIC: &str =
+        "BKY-mMGIyQrkQbdHpLC2Bkwv4JZwX7l3KzA4_gtn942ZrFQaA2B35fNmWvCS964gZtG7NjDNIbDwES_GuVhy6hY";
+    const CLI_ID_STATEMENT: &str = "001377736d702d7465726d2d636c692d69642d763100076465736b2d303104dad0b65394221cf9b051e1feca5787d098dfe637fc90b9ef945d0c37725811805271a0461cdb8252d61f1c456fa3e59ab1f45b33accf5f58389e0577b8990bb3";
+    // Deterministic (RFC 6979) p256 signature, verified by the web tests.
+    const CLI_ID_SIGNATURE_RUST: &str = "605fffa5e3271aa6dcbf5a23e57a843c2e7c94399eea50331446c8183e5dfeedeac15186cde27a792ed704df722d2474a7902fc9a9ade88cba5f56c04f5a5624";
+    // One randomized WebCrypto signature from the web tests.
+    const CLI_ID_SIGNATURE_WEB: &str = "41d228ec04946ee19927954be52b2367823c911e99a9abac37cab3d7367ff82bdab3492d700e3976ca96ad5bc991a9948a1e38077d44f2136c2113da71b899c3";
+    const CLI_ID_FINGERPRINT: &str = "EHI6 GLCX HTTU Q3DC VR2L P6WK K5PF OMMO";
+
+    #[test]
+    fn cli_identity_statement_signature_and_fingerprint_match_the_browser() {
+        let vector = vector_v2();
+        let cli_raw = vector.cli.public_raw();
+        let identity = SigningKey::from_slice(&hex(IDENTITY_SCALAR)).expect("identity");
+        let identity_raw = identity_public_raw(&identity).expect("identity raw");
+        assert_eq!(encode_b64url(&identity_raw), CLI_ID_PUBLIC);
+
+        let statement = cli_identity_statement(CLI_ID_SLUG, cli_raw).expect("statement");
+        assert_eq!(hex::encode_like(&statement), CLI_ID_STATEMENT);
+
+        let signature = sign_cli_identity(&identity, CLI_ID_SLUG, cli_raw).expect("sign");
+        assert_eq!(hex::encode_like(&signature), CLI_ID_SIGNATURE_RUST);
+        for signature in [CLI_ID_SIGNATURE_RUST, CLI_ID_SIGNATURE_WEB] {
+            let signature = hex(signature);
+            assert!(verify_cli_identity(
+                &identity_raw,
+                &signature,
+                CLI_ID_SLUG,
+                cli_raw
+            ));
+            assert!(!verify_cli_identity(
+                &identity_raw,
+                &signature,
+                "desk-02",
+                cli_raw
+            ));
+            assert!(!verify_cli_identity(
+                &identity_raw,
+                &signature,
+                CLI_ID_SLUG,
+                vector.browser.public_raw()
+            ));
+        }
+        assert!(!verify_cli_identity(
+            &identity_raw,
+            &hex(CLI_ID_SIGNATURE_RUST)[1..],
+            CLI_ID_SLUG,
+            cli_raw
+        ));
+        assert_eq!(identity_fingerprint(&identity_raw), CLI_ID_FINGERPRINT);
     }
 
     mod hex {

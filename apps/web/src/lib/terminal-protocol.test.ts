@@ -61,7 +61,14 @@ describe("parseTerminalServerMessage", () => {
     const parsed = parseTerminalServerMessage({
       type: "terminals",
       clis: [
-        { cliDeviceId: "c1", publicKey: "pk", terminalViewers: true },
+        {
+          cliDeviceId: "c1",
+          slug: "desk-01",
+          publicKey: "pk",
+          terminalViewers: true,
+          identityPublicKey: "ik",
+          identitySignature: "sig",
+        },
         { cliDeviceId: "c2", publicKey: null },
       ],
       terminals: [
@@ -80,8 +87,22 @@ describe("parseTerminalServerMessage", () => {
     expect(parsed).toEqual({
       type: "terminals",
       clis: [
-        { cliDeviceId: "c1", publicKey: "pk", terminalViewers: true },
-        { cliDeviceId: "c2", publicKey: null, terminalViewers: false },
+        {
+          cliDeviceId: "c1",
+          slug: "desk-01",
+          publicKey: "pk",
+          terminalViewers: true,
+          identityPublicKey: "ik",
+          identitySignature: "sig",
+        },
+        {
+          cliDeviceId: "c2",
+          slug: null,
+          publicKey: null,
+          terminalViewers: false,
+          identityPublicKey: null,
+          identitySignature: null,
+        },
       ],
       terminals: [
         {

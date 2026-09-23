@@ -831,3 +831,47 @@ fn completions_generates_shell_script() {
         .success()
         .stdout(predicate::str::contains("_wsmp"));
 }
+
+#[test]
+fn terminal_fingerprint_creates_the_identity_once_in_the_state_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    let first = cli(&config, &state)
+        .args(["terminal", "fingerprint"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let fingerprint = String::from_utf8(first).unwrap().trim().to_string();
+    let groups: Vec<&str> = fingerprint.split(' ').collect();
+    assert_eq!(groups.len(), 8, "{fingerprint}");
+    assert!(groups.iter().all(|group| {
+        group.len() == 4
+            && group
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || (b'2'..=b'7').contains(&byte))
+    }));
+    let identity = state.join("terminal-identity.json");
+    assert!(identity.is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&identity).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    let json = cli(&config, &state)
+        .args(["terminal", "--json", "fingerprint"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&json).unwrap();
+    assert_eq!(value["fingerprint"], fingerprint);
+    assert_eq!(value["publicKey"].as_str().unwrap().len(), 87);
+}

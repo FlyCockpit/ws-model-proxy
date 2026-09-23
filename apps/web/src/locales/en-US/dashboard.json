@@ -284,7 +284,30 @@
       "offline": "CLI is offline",
       "invalid": "That terminal request was invalid",
       "viewer_limit": "Too many tabs are already viewing this terminal",
-      "bad_frame": "The CLI dropped this tab after a bad frame"
+      "bad_frame": "The CLI dropped this tab after a bad frame",
+      "identity_changed": "This CLI's identity key changed",
+      "identity_invalid": "This CLI did not prove its identity",
+      "identity_mismatch": "The CLI answered with a key its identity did not sign"
+    },
+    "identity": {
+      "title": "CLI identities",
+      "description": "Browsers pin each CLI's identity key the first time they see it. Compare a fingerprint with `wsmp terminal fingerprint` on that machine.",
+      "fingerprint": "Fingerprint",
+      "checking": "Checking identity…",
+      "offline": "Offline",
+      "unpinned": "This browser could not save the key. Compare the fingerprint before you type anything sensitive.",
+      "unverified": "Unverified. Update the CLI to verify its identity.",
+      "invalid": "This CLI did not prove its identity. Its terminals are blocked.",
+      "changed": "This CLI's identity key changed. Its terminals are blocked until you trust the new key.",
+      "downgraded": "This CLI no longer proves its identity. Its terminals are blocked until you allow it.",
+      "pinned": "Pinned",
+      "new": "New",
+      "trustNew": "Trust new key",
+      "allowUnverified": "Allow unverified",
+      "trustTitle": "Trust the new key for {{label}}?",
+      "trustDescription": "Only continue if you ran `wsmp terminal fingerprint` on that machine and it matches. Otherwise someone may be intercepting your terminal.",
+      "trustFailed": "The key could not be trusted. Reload and try again.",
+      "activeUnverified": "This CLI's identity is unverified. Update the CLI to verify it."
     }
   },
   "nav": {
