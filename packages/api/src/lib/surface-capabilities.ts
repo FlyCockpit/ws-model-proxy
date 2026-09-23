@@ -300,19 +300,12 @@ export function surfaceAvailabilityMatrix({
         : undefined;
     const sourceFeatures =
       source && capabilities ? nativeFeatures(capabilities, source) : undefined;
-    const lacksAnthropicInitialUsage =
-      requested === "ANTHROPIC_MESSAGES" &&
-      (source === "OPENAI_CHAT_COMPLETIONS" || source === "OPENAI_RESPONSES");
     result[requested] = source
       ? {
           mode: "adapted",
           nativeSurface: source,
-          streaming: sourceFeatures?.streaming === true && !lacksAnthropicInitialUsage,
-          limitations: [
-            "strict_common_subset",
-            "native_extensions_unavailable",
-            ...(lacksAnthropicInitialUsage ? ["anthropic_initial_usage_unavailable"] : []),
-          ],
+          streaming: sourceFeatures?.streaming === true,
+          limitations: ["strict_common_subset", "native_extensions_unavailable"],
           ...(lifecycleOperations?.length ? { lifecycleOperations } : {}),
         }
       : {
@@ -379,12 +372,6 @@ export function resolveExecutionPath({
     const failures = [
       ...incompatibilities(features, normalizedRequest),
       ...(mode === "adapted" ? adaptedSubsetFailures(request) : []),
-      ...(mode === "adapted" &&
-      requestedSurface === "ANTHROPIC_MESSAGES" &&
-      request.stream === true &&
-      (nativeSurface === "OPENAI_CHAT_COMPLETIONS" || nativeSurface === "OPENAI_RESPONSES")
-        ? ["anthropic_initial_usage_unavailable"]
-        : []),
     ];
     if (failures.length) return { failures, features };
     return { failures: [], features };

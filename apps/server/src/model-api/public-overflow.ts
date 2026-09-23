@@ -504,15 +504,6 @@ export function publicTargetCompatibility(
     return resolvePublicProviderExecution(target, request) ? "COMPATIBLE" : "PROTOCOL_UNAVAILABLE";
   }
   if (target.nativeSurfaces.includes(request.requestedSurface)) return "COMPATIBLE";
-  // OpenAI streams cannot provide Anthropic's required initial input usage.
-  // Reject before provider commitment instead of failing the adapter after a
-  // successful upstream stream has begun.
-  if (
-    request.stream &&
-    request.requestedSurface === "anthropic-messages" &&
-    target.protocol === "openai"
-  )
-    return "PROTOCOL_UNAVAILABLE";
   return request.adaptationEnabled &&
     request.renderForTarget !== undefined &&
     target.nativeProtocols.includes(target.protocol) &&

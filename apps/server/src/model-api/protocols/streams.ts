@@ -1853,11 +1853,9 @@ export class CanonicalStreamRenderer {
 
   #anthropic(event: CanonicalEvent): WirePayload[] {
     if (event.type === "message_start") {
-      if (event.usage?.inputTokens === undefined || event.usage.outputTokens === undefined)
-        throw new AdapterError(
-          "unsupported_stream_adaptation",
-          "Anthropic streaming requires initial usage; sources that report usage only at completion are unavailable.",
-        );
+      const inputTokens = event.usage?.inputTokens;
+      if (inputTokens === undefined)
+        throw new AdapterError("invalid_usage", "Anthropic message_start requires input_tokens.");
       return [
         named("message_start", {
           message: {
@@ -1869,8 +1867,8 @@ export class CanonicalStreamRenderer {
             stop_reason: null,
             stop_sequence: null,
             usage: {
-              input_tokens: event.usage.inputTokens,
-              output_tokens: event.usage.outputTokens,
+              input_tokens: inputTokens,
+              output_tokens: event.usage?.outputTokens ?? 0,
             },
           },
         }),
@@ -1924,13 +1922,20 @@ export class CanonicalStreamRenderer {
     if (event.type === "item_complete")
       return [named("content_block_stop", { index: this.#wireIndex(event.index) })];
     if (event.type === "usage") return [];
-    if (event.type === "stop")
+    if (event.type === "stop") {
+      const seen = this.#usageEvent?.usage;
+      const inputTokens = seen?.inputTokens;
+      const outputTokens = seen?.outputTokens;
       return [
         named("message_delta", {
           delta: { stop_reason: anthropicStopReason(event.reason), stop_sequence: null },
-          usage: { output_tokens: this.#usageEvent?.usage.outputTokens ?? 0 },
+          usage:
+            inputTokens !== undefined && outputTokens !== undefined
+              ? { input_tokens: inputTokens, output_tokens: outputTokens }
+              : { output_tokens: 0 },
         }),
       ];
+    }
     if (event.type === "complete") return [named("message_stop", {})];
     if (event.type === "error")
       return [{ event: "error", data: renderProtocolError("anthropic-messages", event.error) }];

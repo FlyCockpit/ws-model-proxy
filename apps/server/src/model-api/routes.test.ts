@@ -986,7 +986,7 @@ describe("model API routes", () => {
     ]);
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-chat"];
-    const response = await appWith(manager, true, true).request("/messages", {
+    const responsePromise = appWith(manager, true, true).request("/messages", {
       method: "POST",
       headers: {
         authorization: "Bearer wsmp_model_test",
@@ -1000,15 +1000,48 @@ describe("model API routes", () => {
         messages: [{ role: "user", content: "ping" }],
       }),
     });
-    expect(response.status).toBe(400);
-    expect(manager.sent).toHaveLength(0);
-    await expect(response.json()).resolves.toEqual({
-      type: "error",
-      error: {
-        type: "invalid_request_error",
-        message: "Streaming is unavailable for this target.",
-      },
-    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    expect(sent.family).toBe("chat.completions");
+    expect(sent.path).toBe("/v1/chat/completions");
+    expect(JSON.parse(await relayBodyText(sent))).toMatchObject({ stream: true });
+    const chunk = (value: Record<string, unknown>) =>
+      `data: ${JSON.stringify({
+        id: "chatcmpl-ping",
+        object: "chat.completion.chunk",
+        created: 0,
+        model: "upstream-chat",
+        ...value,
+      })}\n\n`;
+    manager.headers(sent.requestId, 200, { "content-type": "text/event-stream" });
+    manager.body(
+      sent.requestId,
+      chunk({
+        choices: [{ index: 0, delta: { role: "assistant", content: "ok" }, finish_reason: null }],
+      }),
+    );
+    const response = await responsePromise;
+    manager.body(
+      sent.requestId,
+      chunk({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }),
+    );
+    manager.body(
+      sent.requestId,
+      chunk({
+        choices: [],
+        usage: { prompt_tokens: 9, completion_tokens: 3, total_tokens: 12 },
+      }),
+    );
+    manager.body(sent.requestId, "data: [DONE]\n\n");
+    manager.complete(sent.requestId);
+    expect(response.status).toBe(200);
+    const text = await response.text();
+    expect(text).not.toContain("Streaming is unavailable for this target.");
+    expect(text).toContain("event: message_start");
+    expect(text).toContain('"usage":{"input_tokens":1,"output_tokens":0}');
+    expect(text).toContain(
+      '"delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":9,"output_tokens":3}',
+    );
   });
 
   it("adapts an opted-in Chat pool request through a Responses-only member", async () => {

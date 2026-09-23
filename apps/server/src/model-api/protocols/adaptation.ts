@@ -32,6 +32,48 @@ export function renderCanonicalRequest({
   });
 }
 
+// Image URLs and base64 are omitted: an accepted underestimate.
+export function estimateInputTokens(request: CanonicalRequest): number {
+  const parts: string[] = [];
+  for (const instruction of request.instructions)
+    for (const part of instruction.content) parts.push(part.text);
+  for (const message of request.messages)
+    for (const part of message.content) if (part.type === "text") parts.push(part.text);
+  for (const message of request.messages)
+    for (const part of message.content)
+      if (part.type === "tool_call") parts.push(part.name, part.arguments);
+  for (const message of request.messages)
+    for (const part of message.content)
+      if (part.type === "tool_result")
+        for (const partText of part.content) parts.push(partText.text);
+  for (const tool of request.tools) {
+    parts.push(tool.name);
+    if (tool.description !== undefined) parts.push(tool.description);
+    parts.push(JSON.stringify(tool.inputSchema));
+  }
+  if (request.toolChoice?.type === "tool") parts.push(request.toolChoice.name);
+  const bytes = new TextEncoder().encode(parts.join("\n")).byteLength;
+  return bytes === 0 ? 0 : Math.ceil(bytes / 4);
+}
+
+function withAnthropicInitialUsage(
+  event: CanonicalEvent,
+  target: ProtocolSurface,
+  request: CanonicalRequest | undefined,
+): CanonicalEvent {
+  if (
+    target !== "anthropic-messages" ||
+    event.type !== "message_start" ||
+    event.usage?.inputTokens !== undefined ||
+    !request
+  )
+    return event;
+  return {
+    ...event,
+    usage: { inputTokens: estimateInputTokens(request), outputTokens: 0 },
+  };
+}
+
 export function adaptNonstreamResponse({
   source,
   target,
@@ -63,6 +105,7 @@ export function createProtocolAdaptationTransform({
   maxAggregateBytes,
   recoverProtocolErrors = false,
   onProtocolError,
+  request,
 }: {
   source: ProtocolSurface;
   target: ProtocolSurface;
@@ -71,6 +114,7 @@ export function createProtocolAdaptationTransform({
   maxAggregateBytes?: number;
   recoverProtocolErrors?: boolean;
   onProtocolError?: (error: unknown) => void;
+  request?: CanonicalRequest;
 }): TransformStream<Uint8Array, Uint8Array> {
   const parser = new CanonicalStreamParser(source, { signal, maxEventBytes, maxAggregateBytes });
   const renderer = new CanonicalStreamRenderer(target, { signal, maxAggregateBytes });
@@ -92,6 +136,8 @@ export function createProtocolAdaptationTransform({
     }
     return event;
   };
+  const prepare = (event: CanonicalEvent) =>
+    withAnthropicInitialUsage(withCumulativeUsage(event), target, request);
   const recover = (error: unknown, controller: TransformStreamDefaultController<Uint8Array>) => {
     if (!recoverProtocolErrors || !hasOutput) throw error;
     failed = true;
@@ -115,7 +161,7 @@ export function createProtocolAdaptationTransform({
       if (failed) return;
       try {
         for (const event of parser.push(chunk))
-          for (const output of renderer.push(withCumulativeUsage(event))) {
+          for (const output of renderer.push(prepare(event))) {
             hasOutput = true;
             controller.enqueue(output);
           }
@@ -127,7 +173,7 @@ export function createProtocolAdaptationTransform({
       if (failed) return;
       try {
         for (const event of parser.finish())
-          for (const output of renderer.push(withCumulativeUsage(event))) {
+          for (const output of renderer.push(prepare(event))) {
             hasOutput = true;
             controller.enqueue(output);
           }

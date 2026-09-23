@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { createProtocolAdaptationTransform } from "./adaptation.js";
-import type { CanonicalEvent } from "./canonical.js";
+import { ADAPTER_VERSION, type CanonicalEvent, type CanonicalRequest } from "./canonical.js";
 import { CanonicalStreamParser, CanonicalStreamRenderer } from "./streams.js";
 
 const encode = (value: string) => new TextEncoder().encode(value);
@@ -29,6 +29,44 @@ const responseEnvelope = (status: "in_progress" | "failed") => ({
   metadata: {},
   usage: null,
 });
+
+const pingRequest: CanonicalRequest = {
+  adapterVersion: ADAPTER_VERSION,
+  source: "anthropic-messages",
+  model: "claude",
+  instructions: [],
+  messages: [
+    {
+      role: "user",
+      content: [{ type: "text", text: "ping" }],
+      boundary: { sourceIndex: 0 },
+    },
+  ],
+  tools: [],
+  parallelToolCalls: "single",
+  stream: true,
+  sampling: {},
+  limitations: [],
+};
+
+async function adaptToAnthropic(
+  source: "openai-chat" | "openai-responses" | "anthropic-messages",
+  chunks: Uint8Array[],
+) {
+  const readable = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk);
+      controller.close();
+    },
+  }).pipeThrough(
+    createProtocolAdaptationTransform({
+      source,
+      target: "anthropic-messages",
+      request: pingRequest,
+    }),
+  );
+  return new Response(readable).text();
+}
 
 async function chatFixtureEvents(): Promise<CanonicalEvent[]> {
   const fixture = JSON.parse(
@@ -173,15 +211,14 @@ describe("cross-protocol streaming conformance", () => {
     expect(targetEvents).toContainEqual({ type: "item_complete", index: 0 });
   });
 
-  it("explicitly rejects actual Chat refusal wire targeting Anthropic", () => {
-    const source = new CanonicalStreamParser("openai-chat");
-    const canonical = source.push(
-      encode(
-        'data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"gpt","choices":[{"index":0,"delta":{"refusal":"no"},"finish_reason":null}]}\n\n',
-      ),
-    );
-    const renderer = new CanonicalStreamRenderer("anthropic-messages");
-    expect(() => canonical.flatMap((event) => renderer.push(event))).toThrow("initial usage");
+  it("explicitly rejects actual Chat refusal wire targeting Anthropic", async () => {
+    await expect(
+      adaptToAnthropic("openai-chat", [
+        encode(
+          'data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"gpt","choices":[{"index":0,"delta":{"refusal":"no"},"finish_reason":null}]}\n\n',
+        ),
+      ]),
+    ).rejects.toThrow(/refusal/);
   });
 
   it("pins an independent literal golden for the complete empty Responses wire", () => {
@@ -217,11 +254,87 @@ describe("cross-protocol streaming conformance", () => {
     expect(reparsed.at(-1)).toEqual({ type: "complete" });
   });
 
-  it("rejects Chat to Anthropic streaming because initial usage is unavailable", async () => {
-    const start = (await chatFixtureEvents())[0];
-    expect(start).toMatchObject({ type: "message_start" });
-    expect(() => new CanonicalStreamRenderer("anthropic-messages").push(start!)).toThrow(
-      "initial usage",
+  it("estimates Anthropic message_start usage and replaces it when Chat usage arrives", async () => {
+    const chat = (value: Record<string, unknown>) =>
+      encode(
+        `data: ${JSON.stringify({
+          id: "c",
+          object: "chat.completion.chunk",
+          created: 0,
+          model: "gpt",
+          ...value,
+        })}\n\n`,
+      );
+    const output = await adaptToAnthropic("openai-chat", [
+      chat({ choices: [{ index: 0, delta: { content: "ok" }, finish_reason: null }] }),
+      chat({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }),
+      chat({
+        choices: [],
+        usage: { prompt_tokens: 9, completion_tokens: 3, total_tokens: 12 },
+      }),
+      encode("data: [DONE]\n\n"),
+    ]);
+    expect(output).toContain('"usage":{"input_tokens":1,"output_tokens":0}');
+    expect(output).toContain(
+      '"delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":9,"output_tokens":3}',
+    );
+  });
+
+  it("does not repeat the Anthropic estimate when Chat never reports usage", async () => {
+    const output = await adaptToAnthropic("openai-chat", [
+      encode(
+        'data: {"id":"c","object":"chat.completion.chunk","created":0,"model":"gpt","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+      ),
+      encode("data: [DONE]\n\n"),
+    ]);
+    expect(output).toContain('"usage":{"input_tokens":1,"output_tokens":0}');
+    const delta = output.split("\n\n").find((event) => event.includes("event: message_delta"));
+    expect(delta).toContain('"usage":{"output_tokens":0}');
+    expect(delta).not.toContain("input_tokens");
+  });
+
+  it("estimates Anthropic message_start usage from a Responses stream and keeps the real count", async () => {
+    const completed = {
+      ...responseEnvelope("in_progress"),
+      status: "completed",
+      usage: { input_tokens: 8, output_tokens: 2, total_tokens: 10 },
+    };
+    const output = await adaptToAnthropic("openai-responses", [
+      encode(
+        `event: response.created\ndata: ${JSON.stringify({
+          type: "response.created",
+          sequence_number: 0,
+          response: responseEnvelope("in_progress"),
+        })}\n\n`,
+      ),
+      encode(
+        `event: response.completed\ndata: ${JSON.stringify({
+          type: "response.completed",
+          sequence_number: 1,
+          response: completed,
+        })}\n\n`,
+      ),
+    ]);
+    expect(output).toContain('"usage":{"input_tokens":1,"output_tokens":0}');
+    expect(output).toContain(
+      '"delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":8,"output_tokens":2}',
+    );
+  });
+
+  it("keeps a reported Anthropic message_start input count instead of the estimate", async () => {
+    const output = await adaptToAnthropic("anthropic-messages", [
+      encode(
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"m","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":0}}}\n\n',
+      ),
+      encode(
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}}\n\n',
+      ),
+      encode('event: message_stop\ndata: {"type":"message_stop"}\n\n'),
+    ]);
+    expect(output).toContain('"input_tokens":5');
+    expect(output).not.toContain('"input_tokens":1');
+    expect(output).toContain(
+      '"delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":5,"output_tokens":2}',
     );
   });
 

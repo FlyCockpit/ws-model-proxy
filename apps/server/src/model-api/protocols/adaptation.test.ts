@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   adaptNonstreamResponse,
   createProtocolAdaptationTransform,
+  estimateInputTokens,
   parseCanonicalRequest,
   renderCanonicalRequest,
 } from "./adaptation.js";
+import { ADAPTER_VERSION, type CanonicalRequest } from "./canonical.js";
 import { CanonicalStreamParser } from "./streams.js";
 
 const vendorMessage = {
@@ -362,5 +364,104 @@ describe("protocol adaptation orchestration", () => {
     await writer.close();
     await consume;
     expect(chunks.join("")).toContain("response.completed");
+  });
+});
+
+function estimatedRequest(input: {
+  instructions?: string[];
+  texts?: string[];
+  images?: boolean;
+  toolCalls?: Array<{ name: string; arguments: string }>;
+  toolResults?: string[];
+  tools?: Array<{ name: string; description?: string; inputSchema: Record<string, unknown> }>;
+  toolChoiceName?: string;
+}): CanonicalRequest {
+  return {
+    adapterVersion: ADAPTER_VERSION,
+    source: "anthropic-messages",
+    model: "ignored-model",
+    instructions: (input.instructions ?? []).map((text, sourceIndex) => ({
+      role: "system",
+      content: [{ type: "text", text }],
+      boundary: { sourceIndex },
+    })),
+    messages: [
+      {
+        role: "user",
+        boundary: { sourceIndex: 0 },
+        content: [
+          ...(input.texts ?? []).map((text) => ({ type: "text" as const, text })),
+          ...(input.images
+            ? [
+                {
+                  type: "image" as const,
+                  source: { kind: "url" as const, url: "https://example.test/huge.png" },
+                },
+              ]
+            : []),
+          ...(input.toolCalls ?? []).map((call, index) => ({
+            type: "tool_call" as const,
+            id: `call-${index}`,
+            name: call.name,
+            arguments: call.arguments,
+          })),
+          ...(input.toolResults ?? []).map((text) => ({
+            type: "tool_result" as const,
+            toolCallId: "call-0",
+            content: [{ type: "text" as const, text }],
+          })),
+        ],
+      },
+    ],
+    tools: input.tools ?? [],
+    ...(input.toolChoiceName
+      ? { toolChoice: { type: "tool" as const, name: input.toolChoiceName } }
+      : {}),
+    parallelToolCalls: "single",
+    stream: true,
+    sampling: { temperature: 0.7, maxOutputTokens: 32 },
+    limitations: [],
+  };
+}
+
+describe("estimateInputTokens", () => {
+  it("counts ping as 1, empty input as 0, and includes a tool name plus schema", () => {
+    expect(estimateInputTokens(estimatedRequest({ texts: ["ping"] }))).toBe(1);
+    expect(estimateInputTokens(estimatedRequest({}))).toBe(0);
+    const schema = { type: "object" };
+    const withTool = estimatedRequest({
+      texts: ["ping"],
+      tools: [{ name: "lookup", inputSchema: schema }],
+    });
+    const encoded = new TextEncoder().encode(["ping", "lookup", JSON.stringify(schema)].join("\n"));
+    expect(estimateInputTokens(withTool)).toBe(Math.ceil(encoded.byteLength / 4));
+    expect(estimateInputTokens(withTool)).toBeGreaterThan(1);
+  });
+
+  it("includes instructions, tool calls, tool results, descriptions, and tool choice, not images", () => {
+    const described = { type: "object", properties: { q: { type: "string" } } };
+    const request = estimatedRequest({
+      instructions: ["be brief"],
+      texts: ["ping"],
+      images: true,
+      toolCalls: [{ name: "lookup", arguments: "{}" }],
+      toolResults: ["ok"],
+      tools: [{ name: "lookup", description: "find", inputSchema: described }],
+      toolChoiceName: "lookup",
+    });
+    const parts = [
+      "be brief",
+      "ping",
+      "lookup",
+      "{}",
+      "ok",
+      "lookup",
+      "find",
+      JSON.stringify(described),
+      "lookup",
+    ];
+    const encoded = new TextEncoder().encode(parts.join("\n"));
+    expect(estimateInputTokens(request)).toBe(Math.ceil(encoded.byteLength / 4));
+    expect(estimateInputTokens(estimatedRequest({ images: true }))).toBe(0);
   });
 });

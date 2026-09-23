@@ -119,7 +119,7 @@ describe("cycle 21 streaming closure", () => {
     expect(output[0]).toContain('"usage":{"input_tokens":7,"output_tokens":0}');
     expect(output.filter((entry) => entry.includes("event: message_delta"))).toHaveLength(1);
     expect(output.join("\n")).toContain(
-      '"delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":4}',
+      '"delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":7,"output_tokens":4}',
     );
   });
 

@@ -752,29 +752,44 @@ describe("public overflow compatibility", () => {
     ).toBe("COMPATIBLE");
   });
 
-  it("rejects Anthropic streaming adaptation from OpenAI before commitment", () => {
+  it("admits an adapted Anthropic stream from OpenAI only when the adaptation gates pass", () => {
+    const target = {
+      contextWindow: 1_000,
+      maxOutputTokens: 100,
+      protocol: "openai" as const,
+      nativeProtocols: ["openai" as const],
+      nativeSurfaces: ["openai-chat" as const],
+      supportsStreaming: true,
+      supportedFeatures: [],
+    };
+    const streamingAnthropic = {
+      ...request,
+      requestedProtocol: "anthropic" as const,
+      requestedSurface: "anthropic-messages" as const,
+      stream: true,
+    };
+    const renderForTarget = async () => {
+      throw new Error("not invoked by prefilter");
+    };
     expect(
-      publicTargetCompatibility(
-        {
-          contextWindow: 1_000,
-          maxOutputTokens: 100,
-          protocol: "openai",
-          nativeProtocols: ["openai"],
-          nativeSurfaces: ["openai-chat"],
-          supportsStreaming: true,
-          supportedFeatures: [],
-        },
-        {
-          ...request,
-          requestedProtocol: "anthropic",
-          requestedSurface: "anthropic-messages",
-          stream: true,
-          adaptationEnabled: true,
-          renderForTarget: async () => {
-            throw new Error("not invoked by prefilter");
-          },
-        },
-      ),
+      publicTargetCompatibility(target, {
+        ...streamingAnthropic,
+        adaptationEnabled: true,
+        renderForTarget,
+      }),
+    ).toBe("COMPATIBLE");
+    expect(
+      publicTargetCompatibility(target, {
+        ...streamingAnthropic,
+        adaptationEnabled: false,
+        renderForTarget,
+      }),
+    ).toBe("PROTOCOL_UNAVAILABLE");
+    expect(
+      publicTargetCompatibility(target, {
+        ...streamingAnthropic,
+        adaptationEnabled: true,
+      }),
     ).toBe("PROTOCOL_UNAVAILABLE");
   });
 

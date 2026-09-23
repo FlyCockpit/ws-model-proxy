@@ -131,6 +131,7 @@ import {
   ADAPTER_VERSION,
   AdapterError,
   adaptNonstreamResponse,
+  type CanonicalRequest,
   CanonicalStreamRenderer,
   createProtocolAdaptationTransform,
   type ProtocolSurface,
@@ -268,20 +269,6 @@ type RelayOperation = {
     payload: JsonObject;
   };
 };
-
-function adaptedStreamingRefusalMessage(
-  operation: Pick<RelayOperation, "family" | "stream">,
-  executions: Iterable<{ mode: string; limitations: readonly string[] } | null | undefined>,
-): string | undefined {
-  if (operation.family !== "messages" || !operation.stream) return undefined;
-  const blockedOnlyByInitialUsage = [...executions].some(
-    (execution) =>
-      execution?.mode === "unavailable" &&
-      execution.limitations.length === 1 &&
-      execution.limitations[0] === "anthropic_initial_usage_unavailable",
-  );
-  return blockedOnlyByInitialUsage ? "Streaming is unavailable for this target." : undefined;
-}
 
 function operationFailureResponse(
   operation: Pick<RelayOperation, "family">,
@@ -1382,6 +1369,7 @@ function adaptedResponseBody({
   headers,
   signal,
   onProtocolError,
+  request,
 }: {
   body: ReadableStream<Uint8Array>;
   source: ProtocolSurface;
@@ -1391,6 +1379,7 @@ function adaptedResponseBody({
   headers: Headers;
   signal: AbortSignal;
   onProtocolError?: (error: unknown) => void;
+  request?: CanonicalRequest;
 }): ReadableStream<Uint8Array> {
   if (stream)
     return body.pipeThrough(
@@ -1398,6 +1387,7 @@ function adaptedResponseBody({
         source,
         target,
         signal,
+        request,
         recoverProtocolErrors: onProtocolError !== undefined,
         onProtocolError,
       }),
@@ -3997,6 +3987,7 @@ async function relayPool({
             status: result.response.status,
             headers: result.response.headers,
             signal: request.signal,
+            request: canonical ?? undefined,
           }),
           {
             status: result.response.status,
@@ -4318,11 +4309,7 @@ async function relayPool({
       startedAt,
       failure: "unsupported_capability",
     });
-    return operationFailureResponse(
-      operation,
-      "unsupported_capability",
-      adaptedStreamingRefusalMessage(operation, executionByMember.values()),
-    );
+    return operationFailureResponse(operation, "unsupported_capability");
   }
 
   const activeCliDeviceIds = manager.getActiveCliDeviceIds();
@@ -5024,6 +5011,7 @@ async function relayPool({
               status: started.status,
               headers: started.headers,
               signal: request.signal,
+              request: canonicalAdaptationRequest ?? undefined,
               onProtocolError: () => {
                 protocolFailureObserved = true;
               },
@@ -5228,6 +5216,7 @@ async function relayPool({
             status: started.status,
             headers: responseHeaders,
             signal: request.signal,
+            request: canonicalAdaptationRequest ?? undefined,
           });
         responseHeaders = new Headers();
         responseHeaders.set(
