@@ -31,6 +31,12 @@ import {
   ensureDiscoveredInferenceCapacity,
   linkExecutionTargetCapacity,
 } from "../lib/discovered-inference-capacity";
+import {
+  effectiveProviderEgress,
+  grantPoolAccessServerMessages,
+  providerPrimaryMemberCount,
+  providerPrimaryMemberWhere,
+} from "../lib/effective-provider-egress";
 import type { GuardedPoolCreateFailureReason } from "../lib/guarded-pool-create-reasons";
 import {
   getConfiguredMediaAttachmentMaxBytes,
@@ -781,6 +787,10 @@ function serializePool(row: ModelPoolRow) {
     protocolAdaptationAvailable,
     publicEgressEnabled: row.publicEgressEnabled,
     publicEgressAcknowledged: row.publicEgressAcknowledged,
+    effectiveProviderEgress: effectiveProviderEgress({
+      publicEgressEnabled: row.publicEgressEnabled,
+      providerPrimaryMemberCount: providerPrimaryMemberCount(row.PoolMembers),
+    }),
     allowLossyDeveloperRoleCollapse: row.allowLossyDeveloperRoleCollapse,
     recommendedSurfaceOverride,
     capacityPriority: row.capacityPriority,
@@ -1182,6 +1192,7 @@ const poolSelect = {
         select: {
           id: true,
           kind: true,
+          providerModelId: true,
           inferenceCapacityId: true,
           DiscoveredModel: {
             select: {
@@ -3822,23 +3833,23 @@ export const forwarderManagementRouter = {
     )
     .handler(async ({ input, context }) => {
       const pool = await ownedPool(input.poolId, context.session.user.id);
-      const hasProviderPrimary = pool.publicEgressEnabled
-        ? false
-        : Boolean(
-            await prisma.poolMember.findFirst({
-              where: {
-                poolId: pool.id,
-                tier: "PRIMARY",
-                // The provider relation also includes userId, which is never
-                // null, so a relation null-check matches every execution target.
-                ExecutionTarget: { providerModelId: { not: null } },
-              },
-              select: { id: true },
-            }),
-          );
-      if ((pool.publicEgressEnabled || hasProviderPrimary) && !input.publicEgressAcknowledged) {
+      // Skip the member lookup when overflow is already on; the shared rule
+      // still requires acknowledgement from publicEgressEnabled alone.
+      const providerPrimary = pool.publicEgressEnabled
+        ? null
+        : await prisma.poolMember.findFirst({
+            where: { poolId: pool.id, ...providerPrimaryMemberWhere },
+            select: { id: true },
+          });
+      if (
+        effectiveProviderEgress({
+          publicEgressEnabled: pool.publicEgressEnabled,
+          providerPrimaryMemberCount: providerPrimary ? 1 : 0,
+        }) &&
+        !input.publicEgressAcknowledged
+      ) {
         throw new ORPCError("BAD_REQUEST", {
-          message: "Provider egress acknowledgement is required for this grant.",
+          message: grantPoolAccessServerMessages.egressAcknowledgementRequired,
         });
       }
       const grantee = await prisma.user.findFirst({
@@ -3846,10 +3857,12 @@ export const forwarderManagementRouter = {
         select: { id: true },
       });
       if (!grantee) {
-        throw new ORPCError("NOT_FOUND", { message: "User not found." });
+        throw new ORPCError("NOT_FOUND", { message: grantPoolAccessServerMessages.userNotFound });
       }
       if (grantee.id === context.session.user.id) {
-        throw new ORPCError("BAD_REQUEST", { message: "Cannot grant a pool to yourself." });
+        throw new ORPCError("BAD_REQUEST", {
+          message: grantPoolAccessServerMessages.cannotGrantToSelf,
+        });
       }
       return prisma.poolGrant.upsert({
         where: {

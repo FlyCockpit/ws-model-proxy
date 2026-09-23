@@ -658,7 +658,7 @@
     "grantTitle": "Dar acceso al pool",
     "grantEgressWarning": "Dar acceso a {{pool}} permite que esta persona envíe instrucciones, adjuntos, herramientas y resultados a proveedores configurados usados como destinos principales o desbordamiento público. Pueden aplicarse cargos.",
     "grantEgressWarningTitle": "Este permiso puede usar salida a proveedores externos",
-    "grantEgressAcknowledge": "Entiendo que las solicitudes de esta persona pueden salir del despliegue local mediante los proveedores de este pool.",
+    "grantEgressAcknowledge": "Entiendo que las solicitudes de este pool pueden enviarse a un proveedor, incluso cuando el desbordamiento público está activado, y que pueden aplicarse cargos del proveedor.",
     "memberTestSurface": "Superficie de API para probar el miembro",
     "memberTestMode": "Modo de ejecución para probar el miembro",
     "memberTestSurfaces": {

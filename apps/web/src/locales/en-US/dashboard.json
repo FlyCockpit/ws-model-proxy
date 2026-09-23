@@ -658,7 +658,7 @@
     "grantTitle": "Grant pool access",
     "grantEgressWarning": "Granting {{pool}} lets this user send prompts, attachments, tools, and output to configured providers used as primary targets or public overflow. Provider charges may apply.",
     "grantEgressWarningTitle": "This grant can use external-provider egress",
-    "grantEgressAcknowledge": "I understand this user's requests can leave the local deployment through this pool's providers.",
+    "grantEgressAcknowledge": "I understand requests on this pool may be sent to a provider, including when public overflow is on, and that provider charges may apply.",
     "memberTestSurface": "Member test API surface",
     "memberTestMode": "Member test execution mode",
     "memberTestSurfaces": {

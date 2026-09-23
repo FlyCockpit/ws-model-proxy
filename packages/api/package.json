@@ -38,6 +38,9 @@
     "./lib/declared-context-window": {
       "default": "./src/lib/declared-context-window.ts"
     },
+    "./lib/effective-provider-egress": {
+      "default": "./src/lib/effective-provider-egress.ts"
+    },
     "./lib/guarded-pool-create-reasons": {
       "default": "./src/lib/guarded-pool-create-reasons.ts"
     },

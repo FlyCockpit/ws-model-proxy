@@ -7,8 +7,17 @@ import {
   PRODUCT_CREDENTIAL_PREFIXES,
   verifyForwarderHmacDigest,
 } from "@ws-model-proxy/db/forwarder-security";
+import { effectiveProviderEgress, providerPrimaryMemberWhere } from "./effective-provider-egress";
 import { parseModelApiSurface } from "./model-api-surface";
 import type { ModelApiSurface } from "./surface-capabilities";
+
+export {
+  effectiveProviderEgress,
+  grantPoolAccessServerMessage,
+  grantPoolAccessServerMessages,
+  providerPrimaryMemberCount,
+  providerPrimaryMemberWhere,
+} from "./effective-provider-egress";
 
 export const modelApiTokenScopeModes = ["ALL_VISIBLE", "ALLOWLIST"] as const;
 export type ModelApiTokenScopeMode = (typeof modelApiTokenScopeModes)[number];
@@ -45,7 +54,11 @@ export type VisibleModelPoolTarget = {
   protocolAdaptationEnabled: boolean;
   publicEgressEnabled: boolean;
   publicEgressAcknowledged: boolean;
-  /** True when this pool can send requests to any external provider, including PRIMARY. */
+  /**
+   * True when a grant must acknowledge provider egress: public overflow is on,
+   * or a PRIMARY member is a provider model. Overflow-only provider members
+   * do not count unless public overflow is on.
+   */
   effectiveProviderEgress: boolean;
   providerPrimaryMemberCount: number;
   allowLossyDeveloperRoleCollapse: boolean;
@@ -96,11 +109,7 @@ const modelPoolSelect = {
   allowLossyDeveloperRoleCollapse: true,
   recommendedSurfaceOverride: true,
   PoolMembers: {
-    where: {
-      tier: "PRIMARY",
-      routingStatus: "ACTIVE",
-      ExecutionTarget: { ProviderModel: { isNot: null } },
-    },
+    where: providerPrimaryMemberWhere,
     select: { id: true },
   },
   User: { select: { slug: true } },
@@ -150,7 +159,10 @@ function serializeModelPool(
     protocolAdaptationEnabled: row.protocolAdaptationEnabled,
     publicEgressEnabled: row.publicEgressEnabled,
     publicEgressAcknowledged: row.publicEgressAcknowledged,
-    effectiveProviderEgress: row.publicEgressEnabled || (row.PoolMembers?.length ?? 0) > 0,
+    effectiveProviderEgress: effectiveProviderEgress({
+      publicEgressEnabled: row.publicEgressEnabled,
+      providerPrimaryMemberCount: row.PoolMembers?.length ?? 0,
+    }),
     providerPrimaryMemberCount: row.PoolMembers?.length ?? 0,
     allowLossyDeveloperRoleCollapse: row.allowLossyDeveloperRoleCollapse,
     recommendedSurfaceOverride: parseModelApiSurface(row.recommendedSurfaceOverride),

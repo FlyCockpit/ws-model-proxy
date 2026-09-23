@@ -2544,6 +2544,55 @@ describe("forwarderManagementRouter", () => {
     });
   });
 
+  it("derives grant egress acknowledgement from public overflow or a primary provider", async () => {
+    const member = (
+      tier: "PRIMARY" | "PUBLIC_OVERFLOW",
+      providerModelId: string | null,
+      routingStatus = "ACTIVE",
+    ) => ({
+      id: `${tier}-${providerModelId ?? "local"}-${routingStatus}`,
+      tier,
+      routingStatus,
+      ExecutionTarget: { providerModelId, DiscoveredModel: null, ProviderModel: null },
+      DiscoveredModel: null,
+    });
+    db.modelPool.findMany.mockResolvedValue([
+      poolRow({
+        id: "overflow-local",
+        slug: "overflow-local",
+        publicEgressEnabled: true,
+        PoolMembers: [member("PRIMARY", null)],
+      }),
+      poolRow({
+        id: "provider-primary",
+        slug: "provider-primary",
+        publicEgressEnabled: false,
+        PoolMembers: [member("PRIMARY", "provider-model", "DRAINING")],
+      }),
+      poolRow({
+        id: "provider-overflow",
+        slug: "provider-overflow",
+        publicEgressEnabled: false,
+        PoolMembers: [member("PUBLIC_OVERFLOW", "overflow-model")],
+      }),
+      poolRow({
+        id: "local-only",
+        slug: "local-only",
+        publicEgressEnabled: false,
+        PoolMembers: [member("PRIMARY", null)],
+      }),
+    ]);
+
+    const pools = await client().listModelPools();
+
+    expect(pools.map((pool) => [pool.id, pool.effectiveProviderEgress])).toEqual([
+      ["overflow-local", true],
+      ["provider-primary", true],
+      ["provider-overflow", false],
+      ["local-only", false],
+    ]);
+  });
+
   it("persists an in-range pool attachment limit and rejects one above the global policy", async () => {
     db.modelPool.findUnique.mockResolvedValueOnce(null);
     db.modelPool.create.mockResolvedValue(poolRow({ maxAttachmentBytes: 2 * 1024 * 1024 }));
@@ -3352,7 +3401,11 @@ describe("forwarderManagementRouter", () => {
         email: "friend@example.com",
         publicEgressAcknowledged: false,
       }),
-    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      message: "Provider egress acknowledgement is required for this grant.",
+    });
+    expect(db.poolMember.findFirst).not.toHaveBeenCalled();
     expect(db.user.findFirst).not.toHaveBeenCalled();
     expect(db.poolGrant.upsert).not.toHaveBeenCalled();
   });
@@ -3371,7 +3424,10 @@ describe("forwarderManagementRouter", () => {
         email: "friend@example.com",
         publicEgressAcknowledged: false,
       }),
-    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      message: "Provider egress acknowledgement is required for this grant.",
+    });
     expect(db.poolMember.findFirst).toHaveBeenCalledWith({
       where: {
         poolId: "pool-id",
@@ -3380,7 +3436,38 @@ describe("forwarderManagementRouter", () => {
       },
       select: { id: true },
     });
+    expect(JSON.stringify(db.poolMember.findFirst.mock.calls)).not.toContain("isNot");
     expect(db.poolGrant.upsert).not.toHaveBeenCalled();
+  });
+
+  it("does not require acknowledgement when the only provider member is overflow", async () => {
+    db.modelPool.findUnique.mockResolvedValue({
+      id: "pool-id",
+      userId: "user-id",
+      publicEgressEnabled: false,
+    });
+    db.poolMember.findFirst.mockResolvedValue(null);
+    db.user.findFirst.mockResolvedValue({ id: "grantee-id" });
+    db.poolGrant.upsert.mockResolvedValue({
+      id: "grant-id",
+      poolId: "pool-id",
+      granteeUserId: "grantee-id",
+    });
+
+    await client().grantPoolAccessByEmail({
+      poolId: "pool-id",
+      email: "friend@example.com",
+      publicEgressAcknowledged: false,
+    });
+    expect(db.poolMember.findFirst).toHaveBeenCalledWith({
+      where: {
+        poolId: "pool-id",
+        tier: "PRIMARY",
+        ExecutionTarget: { providerModelId: { not: null } },
+      },
+      select: { id: true },
+    });
+    expect(db.poolGrant.upsert).toHaveBeenCalled();
   });
 
   it("returns a generic not-found result for unmatched grant emails", async () => {

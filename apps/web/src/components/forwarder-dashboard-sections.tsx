@@ -1,5 +1,6 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { grantPoolAccessServerMessage } from "@ws-model-proxy/api/lib/effective-provider-egress";
 import {
   type GuardedPoolCreateFailureReason,
   isGuardedPoolCreateFailureReason,
@@ -3091,30 +3092,49 @@ export function GrantPoolDialog({
   pool,
   onOpenChange,
 }: {
-  pool: ModelPool | null;
+  pool: Pick<ModelPool, "id" | "effectiveProviderEgress"> | null;
   onOpenChange: (open: boolean) => void;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
   const [email, setEmail] = useState("");
   const [publicEgressAcknowledged, setPublicEgressAcknowledged] = useState(false);
-  const providerEgress = pool?.members.some((member) => member.providerModel) ?? false;
-  const grant = useMutation(
-    orpc.forwarderManagement.grantPoolAccessByEmail.mutationOptions({
+  const [grantError, setGrantError] = useState<string | null>(null);
+  const poolId = pool?.id ?? null;
+  const [trackedPoolId, setTrackedPoolId] = useState(poolId);
+  if (trackedPoolId !== poolId) {
+    setTrackedPoolId(poolId);
+    setPublicEgressAcknowledged(false);
+    setGrantError(null);
+  }
+  const providerEgress = pool?.effectiveProviderEgress === true;
+  const grant = useMutation({
+    ...orpc.forwarderManagement.grantPoolAccessByEmail.mutationOptions({
       onSuccess: () => {
         void queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:pools.grantAdded"));
         setEmail("");
         setPublicEgressAcknowledged(false);
+        setGrantError(null);
         onOpenChange(false);
       },
+      onError: (error) => {
+        setGrantError(grantPoolAccessServerMessage(error) ?? t("common:somethingWentWrong"));
+      },
     }),
-  );
+    meta: { skipGlobalErrorToast: true },
+  });
   const validEmail =
     /^\S+@\S+\.\S+$/.test(email.trim()) && (!providerEgress || publicEgressAcknowledged);
 
   return (
-    <Dialog open={Boolean(pool)} onOpenChange={onOpenChange}>
+    <Dialog
+      open={Boolean(pool)}
+      onOpenChange={(open) => {
+        if (!open) setGrantError(null);
+        onOpenChange(open);
+      }}
+    >
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>{t("dashboard:pools.grantTitle")}</DialogTitle>
@@ -3125,6 +3145,7 @@ export function GrantPoolDialog({
           onSubmit={(event) => {
             event.preventDefault();
             if (!pool || !validEmail) return;
+            setGrantError(null);
             grant.mutate({
               poolId: pool.id,
               email: email.trim(),
@@ -3152,6 +3173,11 @@ export function GrantPoolDialog({
               />
               <span>{t("dashboard:pools.grantEgressAcknowledge")}</span>
             </label>
+          ) : null}
+          {grantError ? (
+            <p className="text-sm text-destructive" role="alert">
+              {grantError}
+            </p>
           ) : null}
           <DialogFooter>
             <Button type="submit" size="touch" disabled={!validEmail || grant.isPending}>

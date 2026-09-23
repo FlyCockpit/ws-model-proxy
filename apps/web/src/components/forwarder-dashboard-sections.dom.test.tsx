@@ -77,6 +77,7 @@ vi.mock("@/utils/orpc", () => {
         setCliDeviceFeatureGrants: mutation("setCliDeviceFeatureGrants"),
         cacheAffinityStats: query("affinity", { activeRecords: 0, targets: [] }),
         clearCacheAffinity: mutation("clearCacheAffinity"),
+        grantPoolAccessByEmail: mutation("grantPoolAccessByEmail"),
       },
       capacityManagement: {
         key: () => ["capacityManagement"],
@@ -88,9 +89,11 @@ vi.mock("@/utils/orpc", () => {
   };
 });
 
+import { grantPoolAccessServerMessages } from "@ws-model-proxy/api/lib/effective-provider-egress";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import {
   CliEndpointsModelsSection,
+  GrantPoolDialog,
   PoolForm,
   PoolMemberForm,
 } from "./forwarder-dashboard-sections";
@@ -199,6 +202,7 @@ const editablePool = {
   allowLossyDeveloperRoleCollapse: false,
   publicEgressEnabled: false,
   publicEgressAcknowledged: false,
+  effectiveProviderEgress: false,
   recommendedSurfaceOverride: null as
     | "ANTHROPIC_MESSAGES"
     | "OPENAI_CHAT_COMPLETIONS"
@@ -730,5 +734,142 @@ describe("CliEndpointsModelsSection capability-impact advisory", () => {
       expect(toast.success).toHaveBeenCalledWith("dashboard:models.capabilitySaved"),
     );
     expect(toast.warning).not.toHaveBeenCalled();
+  });
+});
+
+function mountGrantDialog(pool: {
+  id: string;
+  effectiveProviderEgress: boolean;
+  publicEgressEnabled: boolean;
+  members: Array<{ tier: string; providerModel: { id: string } | null }>;
+}) {
+  return render(
+    <QueryClientProvider
+      client={
+        new QueryClient({
+          defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+        })
+      }
+    >
+      <GrantPoolDialog pool={pool} onOpenChange={() => undefined} />
+    </QueryClientProvider>,
+  );
+}
+
+function grantEmail(value: string) {
+  fireEvent.change(screen.getByLabelText("dashboard:pools.email"), { target: { value } });
+}
+
+describe("GrantPoolDialog provider egress acknowledgement", () => {
+  it("shows the checkbox for public overflow with no provider members and submits the acknowledgement", async () => {
+    mountGrantDialog({
+      id: "pool-overflow",
+      publicEgressEnabled: true,
+      effectiveProviderEgress: true,
+      members: [{ tier: "PRIMARY", providerModel: null }],
+    });
+
+    expect(screen.getByRole("checkbox")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.grantEgressAcknowledge")).toBeTruthy();
+    grantEmail("friend@example.com");
+    expect(
+      (screen.getByRole("button", { name: "dashboard:pools.grant" }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+
+    fireEvent.click(screen.getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.grant" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["grantPoolAccessByEmail"]));
+    expect(state.mutationPayloads[0]?.input).toEqual({
+      poolId: "pool-overflow",
+      email: "friend@example.com",
+      publicEgressAcknowledged: true,
+    });
+  });
+
+  it("shows the checkbox for a primary provider member when overflow is off", () => {
+    mountGrantDialog({
+      id: "pool-primary",
+      publicEgressEnabled: false,
+      effectiveProviderEgress: true,
+      members: [{ tier: "PRIMARY", providerModel: { id: "provider-model" } }],
+    });
+
+    expect(screen.getByRole("checkbox")).toBeTruthy();
+  });
+
+  it("hides the checkbox for an overflow-only provider member when overflow is off", async () => {
+    mountGrantDialog({
+      id: "pool-overflow-member",
+      publicEgressEnabled: false,
+      effectiveProviderEgress: false,
+      members: [{ tier: "PUBLIC_OVERFLOW", providerModel: { id: "overflow-model" } }],
+    });
+
+    expect(screen.queryByRole("checkbox")).toBeNull();
+    expect(screen.queryByText("dashboard:pools.grantEgressAcknowledge")).toBeNull();
+    grantEmail("friend@example.com");
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.grant" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["grantPoolAccessByEmail"]));
+    expect(state.mutationPayloads[0]?.input).toEqual({
+      poolId: "pool-overflow-member",
+      email: "friend@example.com",
+      publicEgressAcknowledged: false,
+    });
+  });
+
+  it.each([
+    grantPoolAccessServerMessages.userNotFound,
+    grantPoolAccessServerMessages.cannotGrantToSelf,
+    grantPoolAccessServerMessages.egressAcknowledgementRequired,
+  ])("shows the server grant message %s instead of raw oRPC JSON", async (message) => {
+    state.nextReject = {
+      name: "grantPoolAccessByEmail",
+      error: {
+        code: "BAD_REQUEST",
+        status: 400,
+        message,
+        defined: false,
+        data: { secret: "nope" },
+      },
+    };
+    mountGrantDialog({
+      id: "pool-local",
+      publicEgressEnabled: false,
+      effectiveProviderEgress: false,
+      members: [],
+    });
+    grantEmail("friend@example.com");
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.grant" }));
+
+    expect(await screen.findByRole("alert")).toHaveProperty("textContent", message);
+    expect(screen.queryByText(/secret|defined|BAD_REQUEST/)).toBeNull();
+  });
+
+  it("does not render a non-allowlisted oRPC payload", async () => {
+    state.nextReject = {
+      name: "grantPoolAccessByEmail",
+      error: {
+        message: JSON.stringify({
+          code: "INTERNAL_SERVER_ERROR",
+          data: { secret: "postgres://user:pass@db/app" },
+        }),
+      },
+    };
+    mountGrantDialog({
+      id: "pool-local",
+      publicEgressEnabled: false,
+      effectiveProviderEgress: false,
+      members: [],
+    });
+    grantEmail("friend@example.com");
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.grant" }));
+
+    expect(await screen.findByRole("alert")).toHaveProperty(
+      "textContent",
+      "common:somethingWentWrong",
+    );
+    expect(screen.queryByText(/postgres:\/\//)).toBeNull();
   });
 });

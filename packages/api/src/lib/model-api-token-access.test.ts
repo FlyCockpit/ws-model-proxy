@@ -21,7 +21,9 @@ vi.mock("@ws-model-proxy/db", async () => {
 
 const {
   authenticateModelApiTokenSecret,
+  effectiveProviderEgress,
   listVisibleModelTargetsForToken,
+  providerPrimaryMemberCount,
   resolveAllowlistedModelTargets,
 } = await import("./model-api-token-access");
 const { default: prisma } = await import("@ws-model-proxy/db");
@@ -107,6 +109,31 @@ function directModelRow({
     },
   };
 }
+
+describe("effectiveProviderEgress", () => {
+  it("requires acknowledgement for public overflow or a primary provider member only", () => {
+    expect(
+      effectiveProviderEgress({ publicEgressEnabled: true, providerPrimaryMemberCount: 0 }),
+    ).toBe(true);
+    expect(
+      effectiveProviderEgress({ publicEgressEnabled: false, providerPrimaryMemberCount: 1 }),
+    ).toBe(true);
+    expect(
+      effectiveProviderEgress({ publicEgressEnabled: false, providerPrimaryMemberCount: 0 }),
+    ).toBe(false);
+  });
+
+  it("counts primary provider targets and ignores overflow-only or local members", () => {
+    expect(
+      providerPrimaryMemberCount([
+        { tier: "PRIMARY", ExecutionTarget: { providerModelId: "provider-model" } },
+        { tier: "PRIMARY", ExecutionTarget: { providerModelId: null } },
+        { tier: "PUBLIC_OVERFLOW", ExecutionTarget: { providerModelId: "overflow-model" } },
+        { tier: "PRIMARY", ExecutionTarget: null },
+      ]),
+    ).toBe(1);
+  });
+});
 
 describe("modelApiTokenAccess", () => {
   beforeEach(() => {
@@ -239,6 +266,20 @@ describe("modelApiTokenAccess", () => {
         effectiveProviderEgress: true,
         providerPrimaryMemberCount: 1,
       });
+      expect(db.modelPool.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          select: expect.objectContaining({
+            PoolMembers: {
+              where: {
+                tier: "PRIMARY",
+                ExecutionTarget: { providerModelId: { not: null } },
+              },
+              select: { id: true },
+            },
+          }),
+        }),
+      );
+      expect(JSON.stringify(db.modelPool.findMany.mock.calls)).not.toContain("isNot");
     });
 
     it("resolves ALL_VISIBLE pools from current grants on every call", async () => {
