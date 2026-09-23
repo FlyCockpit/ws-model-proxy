@@ -46,9 +46,11 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): RefCallback<HTM
     );
   }, [localId, host, handlersRef, xtermRef]);
 
+  // Focus once the pane is active and xterm exists (a new host is a new xterm).
+  const { focus } = xterm;
   useEffect(() => {
-    if (active) xterm.focus();
-  }, [active, xterm.focus]);
+    if (active && host) focus();
+  }, [active, host, focus]);
 
   return xterm.containerRef;
 }

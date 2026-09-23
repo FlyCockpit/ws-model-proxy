@@ -7,7 +7,9 @@ import type { TerminalOutputEvent } from "@/hooks/use-terminal-sessions";
 
 type Written = string | { resize: [number, number] } | "reset";
 
-const xterm = vi.hoisted(() => ({ instances: [] as { log: Written[] }[] }));
+type FakeTerminal = { log: Written[]; focused: number; parse: () => void };
+
+const xterm = vi.hoisted(() => ({ instances: [] as FakeTerminal[] }));
 
 vi.mock("@xterm/xterm", () => ({
   Terminal: class {
@@ -16,6 +18,9 @@ vi.mock("@xterm/xterm", () => ({
     modes = { mouseTrackingMode: "none" };
     textarea = null;
     log: Written[] = [];
+    focused = 0;
+    /** Writes the parser has not reached yet, as xterm queues them. */
+    queue: { data: string | Uint8Array; callback?: () => void }[] = [];
     constructor() {
       xterm.instances.push(this);
     }
@@ -24,8 +29,16 @@ vi.mock("@xterm/xterm", () => ({
     onResize() {
       return { dispose() {} };
     }
-    write(data: Uint8Array) {
-      this.log.push(new TextDecoder().decode(data));
+    write(data: string | Uint8Array, callback?: () => void) {
+      this.queue.push({ data, callback });
+    }
+    /** Run the parser over everything queued, as xterm does asynchronously. */
+    parse() {
+      for (const { data, callback } of this.queue.splice(0)) {
+        const text = typeof data === "string" ? data : new TextDecoder().decode(data);
+        if (text.length > 0) this.log.push(`${text}@${this.cols}x${this.rows}`);
+        callback?.();
+      }
     }
     resize(cols: number, rows: number) {
       this.cols = cols;
@@ -35,7 +48,9 @@ vi.mock("@xterm/xterm", () => ({
     reset() {
       this.log.push("reset");
     }
-    focus() {}
+    focus() {
+      this.focused += 1;
+    }
     dispose() {}
   },
 }));
@@ -120,14 +135,82 @@ describe("useTerminalPane", () => {
 
     act(() => result.current(document.createElement("div")));
     const [term] = xterm.instances;
+    act(() => term?.parse());
     expect(term?.log.filter((entry) => entry !== "reset")).toEqual([
       { resize: [100, 30] },
-      "before ",
-      "during ",
+      "before @100x30",
+      "during @100x30",
       { resize: [120, 40] },
-      "mount",
+      "mount@120x40",
     ]);
-    act(() => source.emit(data("!")));
-    expect(term?.log.at(-1)).toBe("!");
+    act(() => {
+      source.emit(data("!"));
+      term?.parse();
+    });
+    expect(term?.log.at(-1)).toBe("!@120x40");
+  });
+
+  it("applies a PTY size only after the output written before it is parsed", () => {
+    const source = outputSource();
+    let follow = { cols: 100, rows: 30 };
+    const { result, rerender } = renderHook(() =>
+      useTerminalPane({
+        localId: "local_1",
+        active: false,
+        follow,
+        sendInput: () => undefined,
+        sendResize: () => undefined,
+        subscribeOutput: source.subscribeOutput,
+      }),
+    );
+    act(() => result.current(document.createElement("div")));
+    const [term] = xterm.instances;
+    if (!term) throw new Error("no xterm");
+    act(() => {
+      source.emit(data("old "));
+      source.emit({ kind: "size", cols: 120, rows: 40 });
+      source.emit(data("new "));
+      source.emit({ kind: "size", cols: 90, rows: 20 });
+      source.emit(data("last"));
+    });
+    // The session state follows the newest size before the parser gets there.
+    follow = { cols: 90, rows: 20 };
+    rerender();
+    expect(term.log).toEqual([{ resize: [100, 30] }]);
+
+    act(() => term.parse());
+    expect(term.log).toEqual([
+      { resize: [100, 30] },
+      "old @100x30",
+      { resize: [120, 40] },
+      "new @120x40",
+      { resize: [90, 20] },
+      "last@90x20",
+    ]);
+  });
+
+  it("focuses an active pane once its xterm exists", () => {
+    const source = outputSource();
+    let active = false;
+    const { result, rerender } = renderHook(() =>
+      useTerminalPane({
+        localId: "local_1",
+        active,
+        follow: null,
+        sendInput: () => undefined,
+        sendResize: () => undefined,
+        subscribeOutput: source.subscribeOutput,
+      }),
+    );
+    active = true;
+    rerender();
+    act(() => result.current(document.createElement("div")));
+    const [term] = xterm.instances;
+    expect(term?.focused).toBe(1);
+    active = false;
+    rerender();
+    active = true;
+    rerender();
+    expect(term?.focused).toBe(2);
   });
 });

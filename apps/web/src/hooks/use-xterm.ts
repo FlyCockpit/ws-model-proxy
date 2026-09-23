@@ -49,7 +49,10 @@ export function useXterm(options: XtermOptions): {
   write: (data: Uint8Array) => void;
   reset: () => void;
   focus: () => void;
-  /** Apply a PTY size change in output order, while following. */
+  /**
+   * Apply a PTY size change in output order, while following: after the data
+   * written before it is parsed, and before the data written after it.
+   */
   followResize: (size: TerminalSize) => void;
 } {
   const handlersRef = useLatestRef<XtermHandlers>(options);
@@ -61,6 +64,12 @@ export function useXterm(options: XtermOptions): {
   const ownSizeRef = useRef<TerminalSize | null>(null);
   /** Set while this hook resizes xterm itself, so onResize does not echo it. */
   const suppressResizeRef = useRef(false);
+  /**
+   * PTY size events written into xterm's output queue but not yet reached by
+   * its parser. While any is queued the size is left to them, so output
+   * written before a size change still renders at the old size.
+   */
+  const queuedSizesRef = useRef(0);
   const [container, setContainer] = useState<HTMLDivElement | null>(null);
 
   const resizeQuietly = useCallback((size: TerminalSize) => {
@@ -91,7 +100,7 @@ export function useXterm(options: XtermOptions): {
         handlersRef.current.onResize(own);
       }
     }
-    resizeQuietly(follow);
+    if (queuedSizesRef.current === 0) resizeQuietly(follow);
   }, [followRef, handlersRef, resizeQuietly]);
 
   useEffect(() => {
@@ -109,6 +118,7 @@ export function useXterm(options: XtermOptions): {
     term.open(container);
     termRef.current = term;
     fitRef.current = fit;
+    queuedSizesRef.current = 0;
     const disposeCopyOut = wireTerminalCopyOut(term, gate, (data) => {
       const forward = shouldForwardTerminalData({
         following: followRef.current !== null,
@@ -188,7 +198,16 @@ export function useXterm(options: XtermOptions): {
   }, []);
   const followResize = useCallback(
     (size: TerminalSize) => {
-      if (followRef.current) resizeQuietly(size);
+      const term = termRef.current;
+      if (!term) return;
+      // xterm parses writes asynchronously. Resize once everything written so
+      // far is parsed, and before anything written after this is.
+      queuedSizesRef.current += 1;
+      term.write("", () => {
+        if (termRef.current !== term) return;
+        queuedSizesRef.current -= 1;
+        if (followRef.current) resizeQuietly(size);
+      });
     },
     [followRef, resizeQuietly],
   );

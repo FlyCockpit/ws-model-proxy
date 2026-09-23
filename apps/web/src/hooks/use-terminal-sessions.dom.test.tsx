@@ -464,6 +464,44 @@ describe("useTerminalSessions (protocol 2.5)", () => {
   });
 });
 
+describe("useTerminalSessions open closed before its acknowledgement", () => {
+  it("closes the shell when `opening` arrives for a tab already closed", async () => {
+    currentCli = await fakeCli();
+    const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
+    message({ type: "terminals", clis: [await listedCli(currentCli, true)], terminals: [] });
+    act(() => view.result.current.openCli(CLI_ID));
+    act(() => view.result.current.openCli(CLI_ID));
+    await waitFor(() => expect(sentOfType("open")).toHaveLength(2));
+    const [closed, kept] = view.result.current.tabs;
+    if (!closed || !kept) throw new Error("no tabs");
+    act(() => view.result.current.detachTab(closed.localId));
+    // No terminal id yet: nothing to close until the relay names it.
+    expect(sentOfType("close")).toEqual([]);
+
+    message({ type: "opening", terminalId: TERMINAL_ID, viewerId: VIEWER_ID });
+    expect(sentOfType("close")).toEqual([{ type: "close", terminalId: TERMINAL_ID }]);
+    // The next ack still belongs to the tab that stayed open.
+    message({ type: "opening", terminalId: "b3RoZXItdGVybWluYWwtMDI", viewerId: VIEWER_ID });
+    expect(view.result.current.tabs).toEqual([
+      expect.objectContaining({ localId: kept.localId, terminalId: "b3RoZXItdGVybWluYWwtMDI" }),
+    ]);
+
+    const cli = requireCli().ecdh;
+    message({
+      type: "opened",
+      terminalId: TERMINAL_ID,
+      cliPublicKey: bytesToBase64Url(cli.publicKeyRaw),
+      cliNonce: bytesToBase64Url(crypto.getRandomValues(new Uint8Array(16))),
+    });
+    await sleep(20);
+    expect(view.result.current.tabs).toEqual([
+      expect.objectContaining({ localId: kept.localId, phase: "opening" }),
+    ]);
+    expect(sentOfType("close")).toHaveLength(1);
+    expect(sentOfType("detach")).toEqual([]);
+  });
+});
+
 describe("useTerminalSessions shell exit", () => {
   it("delivers every frame received before exit, in order, then ends the session", async () => {
     const { view, cli, localId, events, outKey } = await setupV2();

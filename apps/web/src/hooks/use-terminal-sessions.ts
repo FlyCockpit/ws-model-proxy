@@ -300,6 +300,11 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   /** Tabs whose handshake waits for the browser identity to load. */
   const awaitingIdentityRef = useRef(new Set<string>());
   const inflightOpensRef = useRef<string[]>([]);
+  /**
+   * Opens closed locally while their `open` still waits for `opening`. The ack
+   * names the terminal the relay made, so it is closed as soon as it arrives.
+   */
+  const closedOpensRef = useRef(new Set<string>());
   const resetBeforeOutputRef = useRef(new Set<string>());
   const earlySealedRef = useRef(new Map<string, SealedTerminalFrame[]>());
   const sendChainRef = useRef(new Map<string, Promise<void>>());
@@ -834,19 +839,24 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       if (message.type === "opening") {
         const localId = inflightOpensRef.current.shift();
         if (!localId) return;
+        if (closedOpensRef.current.delete(localId)) {
+          // The tab is gone. Close the shell, or it would hold a slot unseen.
+          // Its later `pending` / `opened` find no handshake and are ignored.
+          sendRef.current({ type: "close", terminalId: message.terminalId });
+          return;
+        }
         const pending = pendingRef.current.get(localId);
         if (!pending) return;
         pending.terminalId = message.terminalId;
         pending.viewerId = message.viewerId;
         pendingRef.current.delete(localId);
         pendingRef.current.set(message.terminalId, pending);
-        setTabs((current) =>
-          patchTab(current, localId, {
-            terminalId: message.terminalId,
-            viewerId: message.viewerId,
-            error: null,
-          }),
-        );
+        // Into the ref too: a close before the next commit must name this terminal.
+        patchTabNow(localId, {
+          terminalId: message.terminalId,
+          viewerId: message.viewerId,
+          error: null,
+        });
         return;
       }
       if (message.type === "attaching") {
@@ -1076,6 +1086,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     attachingRef.current.clear();
     establishingRef.current.clear();
     inflightOpensRef.current = [];
+    closedOpensRef.current.clear();
     earlySealedRef.current.clear();
     sendChainRef.current.clear();
     recvChainRef.current.clear();
@@ -1110,6 +1121,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     pendingRef.current.clear();
     attachingRef.current.clear();
     inflightOpensRef.current = [];
+    closedOpensRef.current.clear();
     for (const tab of tabsRef.current) {
       if (tab.opener && !tab.terminalId && tab.phase === "opening") retryTab(tab);
     }
@@ -1333,6 +1345,9 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const removeTab = useCallback(
     (tab: TerminalTab) => {
       const localId = tab.localId;
+      if (!tab.terminalId && inflightOpensRef.current.includes(localId)) {
+        closedOpensRef.current.add(localId);
+      }
       pendingRef.current.delete(localId);
       establishingRef.current.delete(localId);
       if (tab.terminalId) {
