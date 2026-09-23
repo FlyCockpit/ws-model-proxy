@@ -69,6 +69,10 @@ Configuration is stored in a JSON file. `wsmp config path` prints the resolved p
 
 On relay protocol 2.5, several browser tabs can view one terminal at once (up to 8, counting tabs waiting for approval). The tab that typed most recently is the writer, and the terminal takes that tab's size; other tabs show the terminal at the writer's size until someone types in them. The CLI encrypts each output frame once under a shared output key, which it sends to each tab under that tab's own end-to-end key and replaces when a tab leaves. Input keys stay separate per tab. With `requireTerminalApproval`, every tab is approved on its own. Closing a tab only stops that tab viewing; "End session" on the terminals page ends the shell for everyone. A CLI connected to an older server falls back to protocol 2.4, which allows one viewer per terminal.
 
+Typed or pasted input goes through a per-terminal queue of up to 256 KiB, so a program that stops reading its input never stalls the relay. When that queue is full, further input is dropped and the tab shows an "input dropped" notice.
+
+Ending a terminal session (or the idle timeout, or stopping the daemon) kills every process in the shell's session, not only the shell's process group: background jobs, jobs in their own process groups, and `nohup` or disowned jobs all end with it. A process that calls `setsid()` itself (for example `setsid`, or a daemon that detaches) starts a new session and is not killed. Terminals are Unix-only.
+
 ### Terminal identity
 
 Each CLI has a long-lived terminal identity key in `terminal-identity.json` in the state directory (mode 0600). The CLI creates it the first time the daemon starts or `wsmp terminal fingerprint` runs, and never replaces it; a damaged file is an error. On relay protocol 2.5, the CLI signs its per-start terminal key and its CLI slug with this key. The browser checks that signature before any terminal handshake and pins the identity key for that CLI the first time it sees it.

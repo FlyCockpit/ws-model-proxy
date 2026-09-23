@@ -174,6 +174,16 @@ pub enum ClientControlMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         viewer_id: Option<String>,
     },
+    /// Browser input for this terminal was dropped because the CLI's
+    /// per-terminal input queue was full (the program is not reading). The
+    /// relay shows that viewer its "input dropped" notice. Sent once per run
+    /// of dropped frames per viewer; `viewerId` is omitted on a 2.4 terminal.
+    #[serde(rename = "term.input_dropped")]
+    TermInputDropped {
+        terminal_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        viewer_id: Option<String>,
+    },
     #[serde(rename = "term.exit")]
     TermExit {
         terminal_id: String,
@@ -1522,6 +1532,15 @@ mod tests {
         })
         .expect("writer");
         assert_eq!(none, r#"{"type":"term.writer","terminalId":"t"}"#);
+        let dropped = encode_control(&ClientControlMessage::TermInputDropped {
+            terminal_id: "t".to_string(),
+            viewer_id: Some("v".to_string()),
+        })
+        .expect("input dropped");
+        assert_eq!(
+            dropped,
+            r#"{"type":"term.input_dropped","terminalId":"t","viewerId":"v"}"#
+        );
 
         let key = "A".repeat(87);
         let nonce = "B".repeat(22);

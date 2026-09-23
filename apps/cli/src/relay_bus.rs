@@ -3,6 +3,7 @@
 //! The main loop owns the websocket writer. Producers share one `sync_channel(64)`
 //! so a fast PTY or exec cannot grow memory ahead of the socket.
 
+#[cfg(unix)]
 use crate::config::Config;
 
 pub(crate) enum WsFrame {
@@ -24,11 +25,19 @@ pub(crate) enum FromWorker {
     InventoryPreparationFailed {
         message: String,
     },
+    #[cfg(unix)]
     TerminalBytes {
         terminal_id: String,
         bytes: Vec<u8>,
     },
+    #[cfg(unix)]
     TerminalEof {
+        terminal_id: String,
+    },
+    /// A terminal's input writer thread hit a write error. The main loop
+    /// closes the terminal.
+    #[cfg(unix)]
+    TerminalWriteFailed {
         terminal_id: String,
     },
     ExecBytes {

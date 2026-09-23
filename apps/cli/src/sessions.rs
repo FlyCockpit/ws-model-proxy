@@ -5,9 +5,17 @@
 //! later drop is a no-op.
 //!
 //! Unix children are process-group leaders (`setsid` for a PTY, `process_group(0)`
-//! for exec) and are stopped with `SIGKILL` to the group. Windows has no
+//! for exec) and are stopped with `SIGKILL` to the group. Closing a terminal
+//! also kills every process in the shell's session, including background jobs
+//! in their own process groups and `nohup`/disowned jobs; only a process that
+//! calls `setsid()` itself leaves that session and survives. Windows has no
 //! process-group kill: only the direct child is terminated, so grandchildren of
 //! an exec may survive.
+//!
+//! Terminal input never blocks the relay loop. Each terminal has a writer
+//! thread fed by a queue of at most [`INPUT_QUEUE_LIMIT`] pending bytes; when
+//! the program is not reading and the queue is full, further input is dropped
+//! and the viewer is told with `term.input_dropped`.
 //!
 //! Protocol 2.5 terminals have many viewers. Each viewer has pairwise v2 keys
 //! for its input and for unicast frames (output-key delivery and its scrollback
@@ -18,11 +26,15 @@
 //! and attach-replaces-viewer.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(unix)]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
+#[cfg(unix)]
+use std::sync::{Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -42,6 +54,7 @@ const MAX_TERMINALS: usize = 2;
 /// Attached viewers plus pending approvals, per terminal (protocol 2.5).
 const MAX_VIEWERS: usize = 8;
 const MAX_EXECS: usize = 2;
+#[cfg(unix)]
 const SCROLLBACK_LIMIT: usize = 256 * 1024;
 const READ_CHUNK: usize = 8 * 1024;
 const SEAL_CHUNK: usize = 16 * 1024;
@@ -51,7 +64,16 @@ const PENDING_TTL: Duration = Duration::from_secs(2 * 60);
 /// How often attached 2.5 viewers are re-checked against the approvals file.
 const APPROVAL_RECHECK: Duration = Duration::from_secs(5);
 const SEND_WAIT: Duration = Duration::from_millis(200);
+#[cfg(unix)]
 const READ_POLL: Duration = Duration::from_millis(200);
+/// Pending (queued plus in-flight) input bytes per terminal. Input beyond this
+/// is dropped rather than blocking the relay loop.
+#[cfg(unix)]
+const INPUT_QUEUE_LIMIT: usize = 256 * 1024;
+/// Kill rounds on terminal close. Session members can fork while they are
+/// being killed, so the session is re-scanned until it is empty.
+#[cfg(unix)]
+const SESSION_KILL_ROUNDS: usize = 20;
 /// After the child exits, keep the exec slot until both pipes report EOF, or
 /// this long, whichever comes first. A grandchild that holds a pipe must not
 /// stall the slot; the leftover bytes are then dropped.
@@ -119,6 +141,7 @@ fn terminal_block_reason(supported: bool, allowed: bool, open: usize) -> Option<
     None
 }
 
+#[cfg(unix)]
 fn push_scrollback(buf: &mut VecDeque<u8>, bytes: &[u8]) {
     buf.extend(bytes);
     let overflow = buf.len().saturating_sub(SCROLLBACK_LIMIT);
@@ -603,11 +626,269 @@ fn status_parts(status: std::process::ExitStatus) -> (Option<i32>, Option<i32>) 
     }
 }
 
+/// Every live process whose session id is confirmed to be `sid`, via
+/// `/proc` on Linux. Zombies are skipped: they are already dead and only wait
+/// for their parent to reap them.
+#[cfg(target_os = "linux")]
+fn session_members(sid: nix::unistd::Pid) -> Vec<nix::unistd::Pid> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|raw| *raw > 1)
+        .filter(|raw| {
+            // Field 3 of `stat` (after the parenthesised command) is the state.
+            std::fs::read_to_string(format!("/proc/{raw}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    let rest = &stat[stat.rfind(')')? + 1..];
+                    rest.split_whitespace().next().map(|state| state != "Z")
+                })
+                .unwrap_or(false)
+        })
+        .map(nix::unistd::Pid::from_raw)
+        .filter(|pid| nix::unistd::getsid(Some(*pid)) == Ok(sid))
+        .collect()
+}
+
+/// Every live process whose session id is confirmed to be `sid`. macOS and
+/// the BSDs have no `/proc` and listing pids needs FFI (`unsafe` is forbidden
+/// here), so `/bin/ps` lists candidates and `getsid` confirms each one.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn session_members(sid: nix::unistd::Pid) -> Vec<nix::unistd::Pid> {
+    let Ok(output) = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,stat="])
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let raw = fields.next()?.parse::<i32>().ok()?;
+            let zombie = fields.next().is_some_and(|state| state.starts_with('Z'));
+            (raw > 1 && !zombie).then(|| nix::unistd::Pid::from_raw(raw))
+        })
+        .filter(|pid| nix::unistd::getsid(Some(*pid)) == Ok(sid))
+        .collect()
+}
+
+/// SIGKILL every process in the session led by `leader` (a PTY shell spawned
+/// with `setsid`, so its pid is the session id). This reaches background jobs
+/// in their own process groups and `nohup`/disowned jobs, which a process
+/// group kill misses. Rounds repeat because members can fork while the kill
+/// is in progress.
+///
+/// Only pids whose `getsid` matches are signalled, and never session 1 or
+/// the CLI's own session. A process that calls `setsid()` itself starts a new
+/// session and escapes this kill; that is a documented limit.
+#[cfg(unix)]
+fn kill_session(leader: u32) {
+    let Ok(raw) = i32::try_from(leader) else {
+        return;
+    };
+    if raw <= 1 {
+        return;
+    }
+    // The shell was spawned with `setsid`, so its session id is its pid. It
+    // is our unreaped child here, so the pid cannot have been reused. A
+    // zombie leader can fail `getsid` on some platforms; its session members
+    // are still confirmed one by one below.
+    let sid = nix::unistd::Pid::from_raw(raw);
+    if nix::unistd::getsid(Some(sid)).is_ok_and(|actual| actual != sid) {
+        return;
+    }
+    if nix::unistd::getsid(None).is_ok_and(|own| own == sid) {
+        return;
+    }
+    let own_pid = nix::unistd::getpid();
+    for round in 0..SESSION_KILL_ROUNDS {
+        let members = session_members(sid);
+        if members.is_empty() {
+            return;
+        }
+        for pid in members {
+            if pid != own_pid {
+                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+            }
+        }
+        // SIGKILL is asynchronous. Back off a little so a killed process can
+        // become a zombie before the next scan.
+        if round > 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        } else {
+            std::thread::yield_now();
+        }
+    }
+}
+
+/// Browser input waiting for a terminal's writer thread.
+#[cfg(unix)]
+struct InputQueue {
+    state: Mutex<InputState>,
+    ready: Condvar,
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct InputState {
+    chunks: VecDeque<Vec<u8>>,
+    /// Queued plus in-flight bytes.
+    pending: usize,
+    closed: bool,
+    failed: bool,
+}
+
+#[cfg(unix)]
+impl InputQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(InputState::default()),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, InputState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Never blocks on the PTY. `Ok(false)` means the queue is full and the
+    /// bytes were dropped. An error means the writer has failed or stopped.
+    fn push(&self, bytes: Vec<u8>) -> std::io::Result<bool> {
+        let mut state = self.lock();
+        if state.failed || state.closed {
+            return Err(std::io::Error::other("terminal input is closed"));
+        }
+        if bytes.is_empty() {
+            return Ok(true);
+        }
+        if state.pending.saturating_add(bytes.len()) > INPUT_QUEUE_LIMIT {
+            return Ok(false);
+        }
+        state.pending += bytes.len();
+        state.chunks.push_back(bytes);
+        drop(state);
+        self.ready.notify_one();
+        Ok(true)
+    }
+
+    /// The next chunk for the writer, or `None` once the terminal closes.
+    fn next(&self, stop: &AtomicBool) -> Option<Vec<u8>> {
+        let mut state = self.lock();
+        loop {
+            if state.closed || stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            if let Some(chunk) = state.chunks.pop_front() {
+                return Some(chunk);
+            }
+            state = self
+                .ready
+                .wait_timeout(state, READ_POLL)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    fn written(&self, count: usize) {
+        let mut state = self.lock();
+        state.pending = state.pending.saturating_sub(count);
+    }
+
+    fn fail(&self) {
+        self.lock().failed = true;
+    }
+
+    fn close(&self) {
+        let mut state = self.lock();
+        state.closed = true;
+        state.chunks.clear();
+        state.pending = 0;
+        drop(state);
+        self.ready.notify_all();
+    }
+}
+
+/// Write all of `bytes` to a non-blocking PTY master, waiting for room with
+/// `poll`. `Ok(false)` means `stop` was set first.
+#[cfg(unix)]
+fn write_polled(
+    writer: &mut filedescriptor::FileDescriptor,
+    bytes: &[u8],
+    stop: &AtomicBool,
+) -> std::io::Result<bool> {
+    let timeout =
+        nix::poll::PollTimeout::try_from(READ_POLL).unwrap_or(nix::poll::PollTimeout::ZERO);
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        match writer.write(&bytes[offset..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "terminal write failed",
+                ));
+            }
+            Ok(count) => offset += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let mut fds = [nix::poll::PollFd::new(
+                    std::os::fd::AsFd::as_fd(writer),
+                    nix::poll::PollFlags::POLLOUT,
+                )];
+                match nix::poll::poll(&mut fds, timeout) {
+                    Ok(_) | Err(nix::errno::Errno::EINTR) => {}
+                    Err(errno) => return Err(std::io::Error::from(errno)),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
+/// The per-terminal writer thread. A write error marks the queue failed and
+/// asks the relay loop to close the terminal; it never closes it itself.
+#[cfg(unix)]
+fn pump_input(
+    mut writer: filedescriptor::FileDescriptor,
+    input: Arc<InputQueue>,
+    tx: SyncSender<FromWorker>,
+    stop: Arc<AtomicBool>,
+    terminal_id: String,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        while let Some(chunk) = input.next(&stop) {
+            let result = write_polled(&mut writer, &chunk, &stop);
+            input.written(chunk.len());
+            match result {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(error) => {
+                    tracing::debug!(error = %error, terminal_id, "terminal input write failed");
+                    input.fail();
+                    send_note(&tx, FromWorker::TerminalWriteFailed { terminal_id }, &stop);
+                    return;
+                }
+            }
+        }
+    })
+}
+
 #[cfg(unix)]
 struct PtyRuntime {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     master: Box<dyn portable_pty::MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    input: Arc<InputQueue>,
+    writer: Option<JoinHandle<()>>,
     reader: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     pid: Option<u32>,
@@ -616,12 +897,15 @@ struct PtyRuntime {
 #[cfg(unix)]
 fn shutdown_pty(mut runtime: PtyRuntime) -> (Option<i32>, Option<i32>) {
     runtime.stop.store(true, Ordering::SeqCst);
+    runtime.input.close();
     if let Some(pid) = runtime.pid {
+        kill_session(pid);
         kill_process_group(pid, true);
     }
-    drop(runtime.writer);
-    // The reader notices `stop` on its poll timeout. Joining it would block
-    // while a background job still holds the slave.
+    // The reader and writer notice `stop` within their poll timeout. Joining
+    // either would block: the reader while a background job still holds the
+    // slave, the writer while the PTY input buffer is full.
+    drop(runtime.writer.take());
     drop(runtime.reader.take());
     let status = reap_after_signal(runtime.pid);
     drop(runtime.child);
@@ -646,6 +930,9 @@ struct Viewer {
     /// The identity approved through `term.auth`. Re-checked so a revoke
     /// removes the viewer.
     approved_identity: Option<[u8; 65]>,
+    /// Set after a `term.input_dropped` for this viewer; cleared by the next
+    /// input that is queued, so the relay hears once per run of drops.
+    input_drop_notified: bool,
 }
 
 impl Viewer {
@@ -660,6 +947,7 @@ impl Viewer {
             next_tx: 1,
             last_size,
             approved_identity,
+            input_drop_notified: false,
         }
     }
 }
@@ -829,6 +1117,7 @@ impl TerminalSession {
         }
     }
 
+    #[cfg(unix)]
     fn broadcast_data(&mut self, terminal_id: &str, data: &[u8]) -> Vec<OutboundFrame> {
         data.chunks(SEAL_CHUNK)
             .filter(|chunk| !chunk.is_empty())
@@ -971,6 +1260,7 @@ fn wire_viewer(viewer_key: &str) -> Option<&str> {
 pub(crate) struct TerminalRegistry {
     sessions: BTreeMap<String, TerminalSession>,
     pending: BTreeMap<PendingKey, PendingTerminal>,
+    #[cfg(unix)]
     tx: SyncSender<FromWorker>,
     idle_limit: Duration,
     /// Protocol 2.5 multi-viewer mode. `false` runs the 2.4 single-viewer path.
@@ -985,9 +1275,13 @@ pub(crate) struct TerminalRegistry {
 
 impl TerminalRegistry {
     pub(crate) fn new(tx: SyncSender<FromWorker>, multi: bool) -> Self {
+        // Windows spawns no PTY, so no worker thread needs the channel.
+        #[cfg(not(unix))]
+        drop(tx);
         Self {
             sessions: BTreeMap::new(),
             pending: BTreeMap::new(),
+            #[cfg(unix)]
             tx,
             idle_limit: DEFAULT_IDLE,
             multi,
@@ -1095,7 +1389,7 @@ impl TerminalRegistry {
         #[cfg(not(unix))]
         {
             let _ = (config, prepared);
-            return vec![*handshake_rejected(&handshake, REASON_UNSUPPORTED)];
+            vec![*handshake_rejected(&handshake, REASON_UNSUPPORTED)]
         }
         #[cfg(unix)]
         {
@@ -1358,7 +1652,7 @@ impl TerminalRegistry {
         #[cfg(not(unix))]
         {
             let _ = config;
-            return vec![*handshake_rejected(&handshake, REASON_UNSUPPORTED)];
+            vec![*handshake_rejected(&handshake, REASON_UNSUPPORTED)]
         }
         #[cfg(unix)]
         {
@@ -1555,14 +1849,19 @@ impl TerminalRegistry {
     }
 
     pub(crate) fn close(&mut self, terminal_id: &str) -> Vec<OutboundFrame> {
-        let Some(mut session) = self.sessions.remove(terminal_id) else {
+        let Some(session) = self.sessions.remove(terminal_id) else {
             return Vec::new();
         };
         #[cfg(unix)]
-        let (exit_code, signal) = session.pty.take().map(shutdown_pty).unwrap_or((None, None));
+        let (exit_code, signal) = {
+            let mut session = session;
+            session.pty.take().map(shutdown_pty).unwrap_or((None, None))
+        };
         #[cfg(not(unix))]
-        let (exit_code, signal) = (None, None);
-        drop(session);
+        let (exit_code, signal) = {
+            drop(session);
+            (None, None)
+        };
         vec![OutboundFrame::Control(ClientControlMessage::TermExit {
             terminal_id: terminal_id.to_string(),
             exit_code,
@@ -1608,8 +1907,9 @@ impl TerminalRegistry {
                         }
                     }
                 }
-                if self.write_terminal(terminal_id, &bytes).is_err() {
-                    frames.extend(self.close(terminal_id));
+                match self.enqueue_input(terminal_id, bytes) {
+                    Ok(queued) => frames.extend(self.note_input(terminal_id, &viewer_key, queued)),
+                    Err(_) => frames.extend(self.close(terminal_id)),
                 }
                 frames
             }
@@ -1648,6 +1948,36 @@ impl TerminalRegistry {
                 self.remove_viewer(terminal_id, &viewer_key, Some(REASON_BAD_FRAME))
             }
         }
+    }
+
+    /// Track dropped input per viewer. The first drop in a run yields one
+    /// `term.input_dropped`; a later queued frame ends the run.
+    fn note_input(
+        &mut self,
+        terminal_id: &str,
+        viewer_key: &str,
+        queued: bool,
+    ) -> Option<OutboundFrame> {
+        let viewer = self
+            .sessions
+            .get_mut(terminal_id)?
+            .viewers
+            .get_mut(viewer_key)?;
+        if queued {
+            viewer.input_drop_notified = false;
+            return None;
+        }
+        if viewer.input_drop_notified {
+            return None;
+        }
+        viewer.input_drop_notified = true;
+        tracing::warn!(terminal_id, "terminal input queue is full; dropping input");
+        Some(OutboundFrame::Control(
+            ClientControlMessage::TermInputDropped {
+                terminal_id: terminal_id.to_string(),
+                viewer_id: wire_viewer(viewer_key).map(str::to_string),
+            },
+        ))
     }
 
     /// A data frame from a non-writer makes it the writer and applies its
@@ -1701,6 +2031,7 @@ impl TerminalRegistry {
             .collect())
     }
 
+    #[cfg(unix)]
     pub(crate) fn on_bytes(&mut self, terminal_id: &str, bytes: &[u8]) -> Vec<OutboundFrame> {
         let Some(session) = self.sessions.get_mut(terminal_id) else {
             return Vec::new();
@@ -1714,6 +2045,7 @@ impl TerminalRegistry {
         }
     }
 
+    #[cfg(unix)]
     pub(crate) fn on_eof(&mut self, terminal_id: &str) -> Vec<OutboundFrame> {
         self.close(terminal_id)
     }
@@ -1789,19 +2121,21 @@ impl TerminalRegistry {
         frames
     }
 
+    /// Hand input to the terminal's writer thread without blocking.
+    /// `Ok(false)`: the input queue is full and the bytes were dropped.
     #[cfg(unix)]
-    fn write_terminal(&mut self, terminal_id: &str, bytes: &[u8]) -> std::io::Result<()> {
-        let Some(session) = self.sessions.get_mut(terminal_id) else {
+    fn enqueue_input(&mut self, terminal_id: &str, bytes: Vec<u8>) -> std::io::Result<bool> {
+        let Some(session) = self.sessions.get(terminal_id) else {
             return Err(std::io::Error::other("terminal is closed"));
         };
-        let Some(pty) = session.pty.as_mut() else {
+        let Some(pty) = session.pty.as_ref() else {
             return Err(std::io::Error::other("terminal is closed"));
         };
-        write_all(&mut pty.writer, bytes)
+        pty.input.push(bytes)
     }
 
     #[cfg(not(unix))]
-    fn write_terminal(&mut self, _terminal_id: &str, _bytes: &[u8]) -> std::io::Result<()> {
+    fn enqueue_input(&mut self, _terminal_id: &str, _bytes: Vec<u8>) -> std::io::Result<bool> {
         Err(std::io::Error::other("terminals are unsupported"))
     }
 
@@ -1842,6 +2176,7 @@ impl Drop for TerminalRegistry {
     }
 }
 
+#[cfg(unix)]
 fn terminal_env(config: &Config) -> Vec<(String, String)> {
     let mut env = scrub_parent_env(&denied_env_names(config));
     env.retain(|(name, _)| name != "TERM");
@@ -1898,10 +2233,30 @@ fn spawn_pty(
         .as_raw_fd()
         .ok_or_else(|| anyhow::anyhow!("pty master has no file descriptor"))?;
     let reader = filedescriptor::FileDescriptor::dup(&RawFdHandle(raw))?;
+    // The writer thread gets its own copy of the master and writes it
+    // non-blocking, so a full PTY input buffer never pins that thread past
+    // close. `O_NONBLOCK` is shared by every copy of the master; the reader
+    // polls before it reads and treats `WouldBlock` as "try again".
+    let writer = filedescriptor::FileDescriptor::dup(&RawFdHandle(raw))?;
+    let flags = nix::fcntl::OFlag::from_bits_truncate(nix::fcntl::fcntl(
+        &writer,
+        nix::fcntl::FcntlArg::F_GETFL,
+    )?);
+    nix::fcntl::fcntl(
+        &writer,
+        nix::fcntl::FcntlArg::F_SETFL(flags | nix::fcntl::OFlag::O_NONBLOCK),
+    )?;
     let child = pair.slave.spawn_command(command)?;
     let pid = child.process_id();
-    let writer = pair.master.take_writer()?;
     let stop = Arc::new(AtomicBool::new(false));
+    let input = Arc::new(InputQueue::new());
+    let writer_thread = pump_input(
+        writer,
+        Arc::clone(&input),
+        tx.clone(),
+        Arc::clone(&stop),
+        terminal_id.to_string(),
+    );
     let terminal_id = terminal_id.to_string();
     let eof_id = terminal_id.clone();
     let thread = pump_polled(
@@ -1919,29 +2274,12 @@ fn spawn_pty(
     Ok(PtyRuntime {
         child,
         master: pair.master,
-        writer,
+        input,
+        writer: Some(writer_thread),
         reader: Some(thread),
         stop,
         pid,
     })
-}
-
-fn write_all(writer: &mut dyn Write, bytes: &[u8]) -> std::io::Result<()> {
-    let mut offset = 0;
-    while offset < bytes.len() {
-        match writer.write(&bytes[offset..]) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "terminal write failed",
-                ));
-            }
-            Ok(count) => offset += count,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error),
-        }
-    }
-    writer.flush()
 }
 
 struct ExecSession {
@@ -2353,6 +2691,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn scrollback_keeps_the_newest_256_kib() {
         let mut buf = VecDeque::new();
@@ -3933,5 +4272,268 @@ mod tests {
         command.output().ok().is_some_and(|output| {
             String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
         })
+    }
+
+    #[cfg(unix)]
+    fn input_drops(frames: &[OutboundFrame]) -> Vec<Option<String>> {
+        controls(frames)
+            .into_iter()
+            .filter_map(|message| match message {
+                ClientControlMessage::TermInputDropped { viewer_id, .. } => Some(viewer_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_large_paste_into_a_non_reading_pty_never_blocks_and_overflow_is_signalled() {
+        let (tx, rx) = channel();
+        // Raw mode without echo: the program never reads, so the PTY input
+        // buffer fills and a blocking write would stall the caller.
+        let mut terminals = TerminalRegistry::with_shell_mode(
+            tx,
+            Duration::from_secs(60),
+            "/bin/sh",
+            &["-c", "stty raw -echo; sleep 30"],
+            true,
+        );
+        let startup = enabled_startup(false);
+        let mut a = TestViewer::new(1);
+        let opened = open_viewer(&mut terminals, &startup, &mut a);
+        a.receive(MULTI_TERMINAL, &opened);
+        std::thread::sleep(Duration::from_millis(200));
+        let a_id = a.id.clone();
+        let chunk = vec![b'x'; 16 * 1024];
+        let started = Instant::now();
+        let mut frames = Vec::new();
+        // 2 MiB: far beyond the PTY buffer plus the 256 KiB queue.
+        for _ in 0..128 {
+            frames.extend(send(
+                &mut terminals,
+                &mut a,
+                &a_id,
+                &TermPlaintextV2::Data(chunk.clone()),
+            ));
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "input handling blocked for {:?}",
+            started.elapsed()
+        );
+        // One signal per run of drops, addressed to the typing viewer.
+        assert_eq!(input_drops(&frames), vec![Some(a_id.clone())]);
+        assert!(terminals.sessions.contains_key(MULTI_TERMINAL));
+        // The registry still serves other work, such as a resize.
+        let resized = send(
+            &mut terminals,
+            &mut a,
+            &a_id,
+            &TermPlaintextV2::Resize {
+                cols: 100,
+                rows: 30,
+            },
+        );
+        assert_eq!(
+            a.receive(MULTI_TERMINAL, &resized),
+            vec![Seen::Size(100, 30)]
+        );
+        let started = Instant::now();
+        let closed = terminals.close(MULTI_TERMINAL);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "close waited on the blocked writer for {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(
+            controls(&closed)[0],
+            ClientControlMessage::TermExit { .. }
+        ));
+        drop(rx);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_legacy_overflow_signals_without_a_viewer_id() {
+        let (tx, _rx) = channel();
+        let mut terminals = TerminalRegistry::with_shell(
+            tx,
+            Duration::from_secs(60),
+            "/bin/sh",
+            &["-c", "stty raw -echo; sleep 30"],
+        );
+        let startup = enabled_startup(false);
+        let a = TestViewer::new(1);
+        let frames = terminals.open(
+            &startup,
+            &Config::default(),
+            None,
+            TermHandshake {
+                viewer_id: None,
+                ..a.handshake(MULTI_TERMINAL, 80, 24)
+            },
+        );
+        let ikm = a
+            .browser
+            .shared_x(startup.key().public_raw())
+            .expect("ecdh");
+        let cli_nonce = terminal_crypto::decode_nonce(&cli_nonce_of(&frames)).expect("nonce");
+        let keys = terminal_crypto::derive_direction_keys_from_ikm(
+            &ikm,
+            startup.key().public_raw(),
+            a.browser.public_raw(),
+            &a.nonce,
+            &cli_nonce,
+            MULTI_TERMINAL,
+        )
+        .expect("keys");
+        std::thread::sleep(Duration::from_millis(200));
+        let plaintext =
+            terminal_crypto::encode_plaintext(&TermPlaintext::Data(vec![b'y'; 16 * 1024]))
+                .expect("plaintext");
+        let mut out = Vec::new();
+        for seq in 1..=128_u64 {
+            let body = terminal_crypto::seal(
+                &keys.browser_to_cli,
+                MULTI_TERMINAL,
+                DIR_BROWSER_TO_CLI,
+                seq,
+                &plaintext,
+            )
+            .expect("seal");
+            out.extend(terminals.handle_sealed(MULTI_TERMINAL, None, seq, &body));
+        }
+        assert_eq!(input_drops(&out), vec![None]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_queue_drops_past_the_limit_and_accepts_again_once_written() {
+        let queue = InputQueue::new();
+        assert!(queue.push(vec![0; INPUT_QUEUE_LIMIT]).expect("push"));
+        assert!(!queue.push(vec![0; 1]).expect("full"));
+        let stop = AtomicBool::new(false);
+        let chunk = queue.next(&stop).expect("chunk");
+        // Still in flight: in-flight bytes count against the limit.
+        assert!(!queue.push(vec![0; 1]).expect("in flight"));
+        queue.written(chunk.len());
+        assert!(queue.push(vec![0; 1]).expect("room again"));
+        queue.close();
+        assert!(queue.push(vec![0; 1]).is_err());
+        assert!(queue.next(&stop).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_writer_error_asks_the_relay_loop_to_close_the_terminal() {
+        let pipe = filedescriptor::Pipe::new().expect("pipe");
+        drop(pipe.read);
+        let (tx, rx) = channel();
+        let input = Arc::new(InputQueue::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let _writer = pump_input(
+            pipe.write,
+            Arc::clone(&input),
+            tx,
+            Arc::clone(&stop),
+            "broken".to_string(),
+        );
+        assert!(input.push(b"hello".to_vec()).expect("queued"));
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(FromWorker::TerminalWriteFailed { terminal_id }) => {
+                assert_eq!(terminal_id, "broken");
+            }
+            _ => panic!("the writer did not report its failure"),
+        }
+        assert!(input.push(b"more".to_vec()).is_err());
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Alive and not a zombie.
+    #[cfg(target_os = "linux")]
+    fn process_running(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                let rest = &stat[stat.rfind(')')? + 1..];
+                rest.split_whitespace().next().map(|state| state != "Z")
+            })
+            .unwrap_or(false)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closing_a_terminal_kills_background_and_nohup_jobs_in_its_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bg_file = dir.path().join("bg.pid");
+        let nohup_file = dir.path().join("nohup.pid");
+        // `set -m` puts each background job in its own process group, so a
+        // process-group kill of the shell alone would miss both.
+        let script = format!(
+            "set -m; sleep 120 & echo $! > '{}'; nohup sleep 120 >/dev/null 2>&1 & echo $! > '{}'; wait",
+            bg_file.display(),
+            nohup_file.display()
+        );
+        let (tx, rx) = channel();
+        let mut terminals =
+            TerminalRegistry::with_shell(tx, Duration::from_secs(60), "/bin/sh", &["-c", &script]);
+        let startup = enabled_startup(false);
+        let browser = CliTerminalKey::generate().expect("browser");
+        let nonce = terminal_crypto::encode_b64url(&[9_u8; 16]);
+        terminals.open(
+            &startup,
+            &Config::default(),
+            None,
+            TermHandshake {
+                terminal_id: "jobs",
+                viewer_id: None,
+                cols: 80,
+                rows: 24,
+                browser_public_key: browser.public_b64url(),
+                browser_nonce: &nonce,
+                identity: None,
+            },
+        );
+        let shell = terminals
+            .sessions
+            .get("jobs")
+            .and_then(|session| session.pty.as_ref())
+            .and_then(|pty| pty.pid)
+            .expect("shell pid");
+        let read_pid = |path: &Path| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if let Ok(text) = std::fs::read_to_string(path)
+                    && let Ok(pid) = text.trim().parse::<u32>()
+                    && pid > 1
+                {
+                    return pid;
+                }
+                assert!(Instant::now() < deadline, "job pid was not written");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let bg = read_pid(&bg_file);
+        let nohup = read_pid(&nohup_file);
+        let shell_group = nix::unistd::Pid::from_raw(i32::try_from(shell).expect("pid"));
+        for job in [bg, nohup] {
+            let job_pid = nix::unistd::Pid::from_raw(i32::try_from(job).expect("pid"));
+            assert!(process_running(job), "job {job} is not running");
+            assert_eq!(nix::unistd::getsid(Some(job_pid)), Ok(shell_group));
+            assert_ne!(
+                nix::unistd::getpgid(Some(job_pid)),
+                Ok(shell_group),
+                "job {job} shares the shell's process group"
+            );
+        }
+        let _ = terminals.close("jobs");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while (process_running(bg) || process_running(nohup)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!process_running(bg), "background job {bg} survived close");
+        assert!(!process_running(nohup), "nohup job {nohup} survived close");
+        drop(terminals);
+        drop(rx);
     }
 }

@@ -16,3 +16,10 @@ wsmp = "wsmp"
 fo = "fo"
 foob = "foob"
 fooba = "fooba"
+
+[default]
+# One P-256 public key test vector (base64url) in `src/terminal_crypto.rs`
+# happens to contain `Iy`. Ignore that exact literal only.
+extend-ignore-re = [
+    "BKY-mMGIyQrkQbdHpLC2Bkwv4JZwX7l3KzA4_gtn942ZrFQaA2B35fNmWvCS964gZtG7NjDNIbDwES_GuVhy6hY",
+]

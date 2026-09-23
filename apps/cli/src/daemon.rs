@@ -781,6 +781,7 @@ fn run_relay_session(
             &worker_rx,
             &mut workers,
             &mut recent_finished,
+            #[cfg(unix)]
             &mut terminals,
             &mut execs,
             #[cfg(unix)]
@@ -988,7 +989,7 @@ fn drain_worker_output<S>(
     worker_rx: &Receiver<FromWorker>,
     workers: &mut BTreeMap<String, WorkerHandle>,
     recent_finished: &mut RecentlyFinished,
-    terminals: &mut TerminalRegistry,
+    #[cfg(unix)] terminals: &mut TerminalRegistry,
     execs: &mut ExecRegistry,
     #[cfg(unix)] reload_preparing: &mut bool,
     #[cfg(unix)] pending_preparation: &mut Option<PendingRequest>,
@@ -1021,11 +1022,21 @@ where
                     let _ = worker.join.join();
                 }
             }
+            #[cfg(unix)]
             Ok(FromWorker::TerminalBytes { terminal_id, bytes }) => {
                 send_outbound_frames(socket, terminals.on_bytes(&terminal_id, &bytes))?;
             }
+            #[cfg(unix)]
             Ok(FromWorker::TerminalEof { terminal_id }) => {
                 send_outbound_frames(socket, terminals.on_eof(&terminal_id))?;
+            }
+            #[cfg(unix)]
+            Ok(FromWorker::TerminalWriteFailed { terminal_id }) => {
+                tracing::warn!(
+                    terminal_id,
+                    "writing terminal input failed; closing the terminal"
+                );
+                send_outbound_frames(socket, terminals.close(&terminal_id))?;
             }
             Ok(FromWorker::ExecBytes {
                 command_id,
@@ -2490,6 +2501,7 @@ fn worker_send_control(tx: &SyncSender<FromWorker>, message: &ClientControlMessa
         | ClientControlMessage::TermAttached { .. }
         | ClientControlMessage::TermRejected { .. }
         | ClientControlMessage::TermWriter { .. }
+        | ClientControlMessage::TermInputDropped { .. }
         | ClientControlMessage::TermExit { .. }
         | ClientControlMessage::ExecStarted { .. }
         | ClientControlMessage::ExecRejected { .. }
