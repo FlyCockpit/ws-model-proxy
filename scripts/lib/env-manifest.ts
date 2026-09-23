@@ -362,8 +362,8 @@ export const ENV_VARS: EnvVar[] = [
     source: "default",
     default: "true",
     comment: [
-      "Allow minting no-expiry (unlimited-lifetime) MCP personal tokens; the default token carries no expiry.",
-      "Turn off to require an expiry within MCP_PAT_MAX_TTL_DAYS (365 days) when creating a token.",
+      "Allow minting no-expiry (unlimited-lifetime) MCP personal tokens. The product default is 90 days.",
+      "Turn off to refuse an explicit no-expiry token. Omitting expiry still mints a 90-day token; a chosen expiry must be within MCP_PAT_MAX_TTL_DAYS (365 days).",
     ],
   },
   {

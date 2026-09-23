@@ -10,6 +10,7 @@ import {
   MCP_PAT_NAME_MAX_LENGTH,
   MCP_PAT_NO_EXPIRY_DISABLED_REASON,
   mcpPatExpiryRejection,
+  mcpPatOmittedExpiresAt,
 } from "@ws-model-proxy/auth/mcp-pat-limits";
 import prisma from "@ws-model-proxy/db";
 import {
@@ -34,10 +35,11 @@ import { runSerializableTransaction } from "../lib/serializable-transaction";
  * MCP_TOOL_EXCLUSIONS). Create is gated on WMP_MCP_ENABLED and capped at
  * MCP_PAT_MAX_ACTIVE_PER_USER active tokens per user; list/revoke stay
  * available during an emergency MCP shutdown so outstanding tokens can be
- * killed (invariant 13). Tokens default to NO expiry (unlimited lifetime);
- * a client-chosen expiresAt is allowed under the MCP_PAT_MAX_TTL_DAYS cap,
- * and the no-expiry default requires WMP_MCP_PAT_ALLOW_NO_EXPIRY at mint
- * time (existing tokens are unaffected by the flag). listMine defaults to
+ * killed (invariant 13). An omitted expiresAt lasts 90 days
+ * (mcpPatOmittedExpiresAt). An explicit null is no expiry and requires
+ * WMP_MCP_PAT_ALLOW_NO_EXPIRY at mint time; a client-chosen timestamp is
+ * allowed under the MCP_PAT_MAX_TTL_DAYS cap. Existing tokens are unaffected
+ * by the flag or the default. listMine defaults to
  * active tokens only — token and grant both unrevoked and not yet expired;
  * includeRevoked returns the full history.
  */
@@ -143,7 +145,12 @@ export const mcpTokensRouter = {
           message: "MCP personal tokens cannot be created while MCP is disabled.",
         });
       }
-      if (input.expiresAt == null && env.WMP_MCP_PAT_ALLOW_NO_EXPIRY !== true) {
+
+      const now = new Date();
+      // undefined is omission (90 days). null is an explicit no-expiry request.
+      const expiresAt =
+        input.expiresAt === undefined ? mcpPatOmittedExpiresAt(now) : input.expiresAt;
+      if (expiresAt === null && env.WMP_MCP_PAT_ALLOW_NO_EXPIRY !== true) {
         throw new ORPCError("FORBIDDEN", {
           message: "No-expiry MCP tokens are disabled on this deployment. Choose an expiry date.",
           data: { reason: MCP_PAT_NO_EXPIRY_DISABLED_REASON },
@@ -153,7 +160,6 @@ export const mcpTokensRouter = {
       const secret = generateProductCredentialSecret("mcpToken");
       const tokenId = newPersonalTokenId();
       const scopes = resolveRequestedScopes(input.allowWrite);
-      const now = new Date();
 
       const token = await runSerializableTransaction(async (tx) => {
         // Active-token cap inside the serializable transaction: concurrent
@@ -184,9 +190,9 @@ export const mcpTokensRouter = {
             lookupPrefix: credentialLookupPrefix(secret),
             secretDigest: digestMcpPersonalTokenSecret(secret),
             scopes,
-            // Client-chosen expiry within MCP_PAT_MAX_TTL_DAYS, or null (no
-            // expiry) while WMP_MCP_PAT_ALLOW_NO_EXPIRY allows minting one.
-            expiresAt: input.expiresAt ?? null,
+            // Omission is now+90d. Explicit null is no expiry (flag-gated).
+            // Any other value is the client timestamp already validated above.
+            expiresAt,
             allowCliCommands: input.allowCliCommands,
             grantId: grant.id,
           },

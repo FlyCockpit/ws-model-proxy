@@ -172,10 +172,12 @@ export const env = createEnv({
     // does not expect the OAuth/JWKS tables. Human grant listing/revocation
     // stays available when disabled (emergency kill switch), by design.
     WMP_MCP_ENABLED: strictBooleanFlag(),
-    // MCP personal tokens (PAT) default to NO expiry (unlimited lifetime).
-    // Turn this off to require an explicit expiry within
-    // MCP_PAT_MAX_TTL_DAYS (see packages/auth/src/mcp-config.ts) at mint
-    // time. Applies at mint time only; existing tokens are unaffected.
+    // MCP personal tokens default to 90 days when expiresAt is omitted.
+    // This flag still allows an explicit no-expiry (null) mint. Turn it off
+    // to refuse that choice; an omitted expiry stays 90 days, and a chosen
+    // timestamp must still fall within MCP_PAT_MAX_TTL_DAYS (see
+    // packages/auth/src/mcp-config.ts). Mint time only; existing tokens are
+    // unaffected. The flag's own default stays true.
     WMP_MCP_PAT_ALLOW_NO_EXPIRY: strictBooleanFlag(true),
     WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: strictBooleanFlag(),
     WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS: z

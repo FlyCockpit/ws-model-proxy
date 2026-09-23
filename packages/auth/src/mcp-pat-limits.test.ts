@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   endOfLocalDay,
   latestMcpPatCustomDate,
+  MCP_PAT_DEFAULT_TTL_MS,
   MCP_PAT_EXPIRY_CLIENT_SKEW_MS,
   MCP_PAT_MAX_TTL_DAYS,
   MCP_PAT_MAX_TTL_MS,
@@ -15,6 +16,8 @@ import {
 describe("MCP personal-token expiry bounds", () => {
   it("publishes the shared name and TTL limits", () => {
     expect(MCP_PAT_NAME_MAX_LENGTH).toBe(120);
+    expect(MCP_PAT_DEFAULT_TTL_MS).toBe(90 * 86_400_000);
+    expect(viaSubpath.MCP_PAT_DEFAULT_TTL_MS).toBe(90 * 86_400_000);
     expect(MCP_PAT_MAX_TTL_DAYS).toBe(365);
     expect(MCP_PAT_MAX_TTL_MS).toBe(365 * 24 * 60 * 60 * 1000);
     expect(MCP_PAT_EXPIRY_CLIENT_SKEW_MS).toBe(60_000);

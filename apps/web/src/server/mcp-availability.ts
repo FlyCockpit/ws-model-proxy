@@ -18,9 +18,10 @@ import { createServerFn } from "@tanstack/react-start";
  *
  * `allowNoExpiry` mirrors the mint-time WMP_MCP_PAT_ALLOW_NO_EXPIRY contract
  * (packages/api/src/routers/mcp-tokens.ts) for the settings token panel: the
- * create dialog only offers the "No expiry" default while the deployment
- * allows it. The procedure still re-validates at mint time — the flag here is
- * UX pre-loading, not authorization.
+ * create dialog lists "No expiry" only while the deployment allows it. The
+ * selected default is 90 days either way. The procedure still re-validates
+ * at mint time — the flag here is UX pre-loading, not authorization. An
+ * omitted expiresAt is 90 days; only an explicit null is no expiry.
  */
 export const getMcpWebAvailability = createServerFn({ method: "GET" }).handler(
   async (): Promise<{ enabled: boolean; allowNoExpiry: boolean }> => {

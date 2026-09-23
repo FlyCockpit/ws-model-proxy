@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   endOfLocalDay,
   latestMcpPatCustomDate,
+  MCP_PAT_DEFAULT_TTL_MS,
   MCP_PAT_NAME_MAX_LENGTH,
   MCP_PAT_NO_EXPIRY_DISABLED_REASON,
   mcpPatClientExpiryCapMs,
@@ -70,6 +71,9 @@ const EXPIRY_PRESET_DAYS = { "30": 30, "90": 90, "180": 180, "365": 365 } as con
 
 type ExpiryChoice = typeof EXPIRY_NONE | keyof typeof EXPIRY_PRESET_DAYS | typeof EXPIRY_CUSTOM;
 
+// Product default, whether or not the deployment allows a no-expiry token.
+const DEFAULT_EXPIRY_CHOICE = "90" satisfies ExpiryChoice;
+
 function toLocalDateInput(date: Date): string {
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
@@ -92,8 +96,11 @@ function resolveExpiresAtIso(
     const end = endOfLocalDay(new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
     return new Date(Math.min(end.getTime(), capMs)).toISOString();
   }
-  const days = EXPIRY_PRESET_DAYS[choice];
-  return new Date(Math.min(now.getTime() + days * 24 * 60 * 60 * 1000, capMs)).toISOString();
+  const durationMs =
+    choice === DEFAULT_EXPIRY_CHOICE
+      ? MCP_PAT_DEFAULT_TTL_MS
+      : EXPIRY_PRESET_DAYS[choice] * 86_400_000;
+  return new Date(Math.min(now.getTime() + durationMs, capMs)).toISOString();
 }
 
 function errorRecord(error: unknown): Record<string, unknown> | null {
@@ -141,8 +148,7 @@ export function McpTokensPanel({
   const [name, setName] = useState("");
   const [allowWrite, setAllowWrite] = useState(false);
   const [allowCliCommands, setAllowCliCommands] = useState(false);
-  const defaultExpiryChoice: ExpiryChoice = allowNoExpiry ? EXPIRY_NONE : "90";
-  const [expiryChoice, setExpiryChoice] = useState<ExpiryChoice>(defaultExpiryChoice);
+  const [expiryChoice, setExpiryChoice] = useState<ExpiryChoice>(DEFAULT_EXPIRY_CHOICE);
   const [customDate, setCustomDate] = useState("");
   const [secret, setSecret] = useState("");
   const [showRevoked, setShowRevoked] = useState(false);
@@ -244,7 +250,7 @@ export function McpTokensPanel({
                   setName("");
                   setAllowWrite(false);
                   setAllowCliCommands(false);
-                  setExpiryChoice(defaultExpiryChoice);
+                  setExpiryChoice(DEFAULT_EXPIRY_CHOICE);
                   setCustomDate("");
                   setSecret("");
                 }
