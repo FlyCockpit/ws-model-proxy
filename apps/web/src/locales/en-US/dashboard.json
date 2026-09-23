@@ -235,13 +235,27 @@
     "emptyClis": "No CLI devices have registered yet.",
     "loading": "Loading terminals",
     "add": "New terminal",
-    "close": "Close terminal",
+    "close": "Stop viewing this terminal",
     "cliList": "Choose a CLI",
     "reconnecting": "Reconnecting to the terminal service…",
     "exited": "The shell exited.",
     "rejected": "The CLI rejected this terminal ({{reason}}).",
     "error": "The terminal connection hit an error.",
     "inputDropped": "Some input was not delivered because it arrived too fast. Check the last command before you continue.",
+    "openElsewhere": "This terminal is open in another browser tab.",
+    "viewHere": "View here",
+    "slowReconnecting": "This tab fell behind the terminal output. Reconnecting…",
+    "actions": "Terminal actions",
+    "endSession": "End session",
+    "endSessionTitle": "End this terminal session?",
+    "endSessionDescription": "The shell stops for everyone viewing it. Unsaved work in it is lost.",
+    "status": {
+      "youTyping": "You're typing",
+      "otherTyping": "Someone else is typing",
+      "viewers_one": "{{count}} viewer",
+      "viewers_other": "{{count}} viewers",
+      "following": "Viewing at {{cols}}×{{rows}}. Type here to take over."
+    },
     "approvalTitle": "This CLI needs approval",
     "approvalInstructions": "Run this command on that machine, then open the terminal again.",
     "approvalCodeLabel": "Approval code",
@@ -268,7 +282,9 @@
       "device_disabled": "Disabled in the CLI config",
       "cli_too_old": "Update wsmp to use terminals",
       "offline": "CLI is offline",
-      "invalid": "That terminal request was invalid"
+      "invalid": "That terminal request was invalid",
+      "viewer_limit": "Too many tabs are already viewing this terminal",
+      "bad_frame": "The CLI dropped this tab after a bad frame"
     }
   },
   "nav": {

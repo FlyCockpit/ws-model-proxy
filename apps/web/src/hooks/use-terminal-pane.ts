@@ -1,15 +1,19 @@
 import { type RefCallback, useEffect, useRef } from "react";
 
+import type { TerminalOutputEvent } from "@/hooks/use-terminal-sessions";
 import { useXterm } from "@/hooks/use-xterm";
+import type { TerminalSize } from "@/lib/terminal-writer";
 
 type TerminalPaneHandlers = {
   localId: string;
   active: boolean;
+  /** The PTY size to show while someone else is typing, or null to fit. */
+  follow: TerminalSize | null;
   sendInput: (localId: string, data: string) => void;
   sendResize: (localId: string, cols: number, rows: number) => void;
   subscribeOutput: (
     localId: string,
-    listener: (data: Uint8Array) => void,
+    listener: (event: TerminalOutputEvent) => void,
     reset?: () => void,
   ) => () => void;
 };
@@ -18,21 +22,23 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): RefCallback<HTM
   const handlersRef = useRef(handlers);
   handlersRef.current = handlers;
   const xterm = useXterm({
+    follow: handlers.follow,
     onData: (data) => handlersRef.current.sendInput(handlersRef.current.localId, data),
     onResize: (size) =>
       handlersRef.current.sendResize(handlersRef.current.localId, size.cols, size.rows),
   });
-  const writeRef = useRef(xterm.write);
-  writeRef.current = xterm.write;
-  const resetRef = useRef(xterm.reset);
-  resetRef.current = xterm.reset;
+  const xtermRef = useRef(xterm);
+  xtermRef.current = xterm;
   const { localId, active } = handlers;
 
   useEffect(() => {
     return handlersRef.current.subscribeOutput(
       localId,
-      (data) => writeRef.current(data),
-      () => resetRef.current(),
+      (event) => {
+        if (event.kind === "data") xtermRef.current.write(event.data);
+        else xtermRef.current.followResize({ cols: event.cols, rows: event.rows });
+      },
+      () => xtermRef.current.reset(),
     );
   }, [localId]);
 

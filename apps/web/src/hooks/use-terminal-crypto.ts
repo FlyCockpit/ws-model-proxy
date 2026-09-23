@@ -695,7 +695,10 @@ async function loadOrCreateIdentity(): Promise<{
 export function useTerminalIdentity(): {
   ready: boolean;
   publicKey: () => string | null;
-  sign: (input: ApprovalTranscriptInput) => Promise<TerminalIdentityProof | null>;
+  /** A `viewerId` signs the v2 (protocol 2.5) transcript. */
+  sign: (
+    input: ApprovalTranscriptInput & { viewerId?: string },
+  ) => Promise<TerminalIdentityProof | null>;
 } {
   const privateKeyRef = useRef<CryptoKey | null>(null);
   const publicKeyRawRef = useRef<Uint8Array | null>(null);
@@ -723,11 +726,15 @@ export function useTerminalIdentity(): {
     return raw ? bytesToBase64Url(raw) : null;
   }, []);
 
-  const sign = useCallback(async (input: ApprovalTranscriptInput) => {
+  const sign = useCallback(async (input: ApprovalTranscriptInput & { viewerId?: string }) => {
     const privateKey = privateKeyRef.current;
     const publicKeyRaw = publicKeyRawRef.current;
     if (!privateKey || !publicKeyRaw) return null;
-    const signature = await signApprovalTranscript(privateKey, input);
+    const { viewerId, ...v1 } = input;
+    const signature =
+      viewerId === undefined
+        ? await signApprovalTranscript(privateKey, v1)
+        : await signApprovalTranscriptV2(privateKey, { ...v1, viewerId });
     return {
       publicKey: bytesToBase64Url(publicKeyRaw),
       signature: bytesToBase64Url(signature),

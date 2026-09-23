@@ -235,13 +235,27 @@
     "emptyClis": "Todavía no se ha registrado ningún dispositivo CLI.",
     "loading": "Cargando terminales",
     "add": "Nueva terminal",
-    "close": "Cerrar terminal",
+    "close": "Dejar de ver esta terminal",
     "cliList": "Elige un CLI",
     "reconnecting": "Reconectando con el servicio de terminal…",
     "exited": "El shell terminó.",
     "rejected": "El CLI rechazó esta terminal ({{reason}}).",
     "error": "La conexión de la terminal encontró un error.",
     "inputDropped": "Parte de la entrada no se entregó porque llegó demasiado rápido. Revisa el último comando antes de continuar.",
+    "openElsewhere": "Esta terminal está abierta en otra pestaña del navegador.",
+    "viewHere": "Ver aquí",
+    "slowReconnecting": "Esta pestaña se quedó atrás de la salida de la terminal. Reconectando…",
+    "actions": "Acciones de la terminal",
+    "endSession": "Terminar sesión",
+    "endSessionTitle": "¿Terminar esta sesión de terminal?",
+    "endSessionDescription": "El shell se detiene para todos los que la están viendo. Se pierde el trabajo sin guardar.",
+    "status": {
+      "youTyping": "Estás escribiendo",
+      "otherTyping": "Alguien más está escribiendo",
+      "viewers_one": "{{count}} espectador",
+      "viewers_other": "{{count}} espectadores",
+      "following": "Viendo a {{cols}}×{{rows}}. Escribe aquí para tomar el control."
+    },
     "approvalTitle": "Este CLI necesita aprobación",
     "approvalInstructions": "Ejecuta este comando en esa máquina y luego abre la terminal de nuevo.",
     "approvalCodeLabel": "Código de aprobación",
@@ -268,7 +282,9 @@
       "device_disabled": "Desactivado en la configuración del CLI",
       "cli_too_old": "Actualiza wsmp para usar terminales",
       "offline": "El CLI está desconectado",
-      "invalid": "Esa solicitud de terminal no es válida"
+      "invalid": "Esa solicitud de terminal no es válida",
+      "viewer_limit": "Ya hay demasiadas pestañas viendo esta terminal",
+      "bad_frame": "El CLI desconectó esta pestaña por un marco inválido"
     }
   },
   "nav": {

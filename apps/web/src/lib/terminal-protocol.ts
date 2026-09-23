@@ -1,16 +1,28 @@
 export const TERMINAL_FRAME_BODY_MAX_BYTES = 1024 * 1024;
 const TERMINAL_FRAME_METADATA_MAX_BYTES = 64 * 1024;
 
+export type TerminalWriterLabel = "you" | "other" | "none";
+
 export type ListedTerminal = {
   terminalId: string;
   cliDeviceId: string;
   cols: number;
   rows: number;
+  /** Attached viewers across every tab. */
+  viewerCount: number;
+  /** This socket already views (or waits to view) the terminal. */
+  attachedHere: boolean;
+  /** This socket's viewer is the writer. */
+  writerHere: boolean;
+  /** Someone views the terminal. Kept by the server for one release. */
+  viewerAttached: boolean;
 };
 
 export type ListedCli = {
   cliDeviceId: string;
   publicKey: string | null;
+  /** Protocol 2.5 CLI: several tabs can view one terminal (v2 crypto). */
+  terminalViewers: boolean;
 };
 
 export type TerminalIdentityMessage = {
@@ -42,7 +54,9 @@ export type TerminalClientMessage =
 
 export type TerminalServerMessage =
   | { type: "terminals"; terminals: ListedTerminal[]; clis: ListedCli[] }
-  | { type: "opening"; terminalId: string }
+  | { type: "opening"; terminalId: string; viewerId: string | null }
+  | { type: "attaching"; terminalId: string; viewerId: string }
+  | { type: "viewers"; terminalId: string; count: number; writer: TerminalWriterLabel }
   | {
       type: "pending";
       terminalId: string;
@@ -59,14 +73,19 @@ export type TerminalServerMessage =
       approvalCode: string | null;
     }
   | { type: "exit"; terminalId: string; exitCode: number | null; signal: string | null }
-  | { type: "detached"; terminalId: string }
+  /** `self`: this tab stopped viewing. `slow`: this tab fell behind. None: 2.4 steal. */
+  | { type: "detached"; terminalId: string; reason: "self" | "slow" | null }
   | { type: "error"; message: string; code: string | null; terminalId: string | null };
 
 export type SealedTerminalFrame = {
   terminalId: string;
   seq: number;
+  /** Set on broadcast frames (shared output key). Unicast frames have none. */
+  epoch?: number;
   body: Uint8Array;
 };
+
+const EPOCH_MAX = 0xffffffff;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -81,16 +100,29 @@ function readDimension(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
+function readCount(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+function readWriter(value: unknown): TerminalWriterLabel | null {
+  return value === "you" || value === "other" || value === "none" ? value : null;
+}
+
 function readListedTerminal(value: unknown): ListedTerminal | null {
   if (!isRecord(value)) return null;
   const terminalId = readString(value, "terminalId");
   const cliDeviceId = readString(value, "cliDeviceId") ?? readString(value, "id");
   if (!terminalId || !cliDeviceId) return null;
+  const viewerAttached = value.viewerAttached === true;
   return {
     terminalId,
     cliDeviceId,
     cols: readDimension(value.cols, 80),
     rows: readDimension(value.rows, 24),
+    viewerCount: readCount(value.viewerCount) ?? (viewerAttached ? 1 : 0),
+    attachedHere: value.attachedHere === true,
+    writerHere: value.writerHere === true,
+    viewerAttached,
   };
 }
 
@@ -101,6 +133,7 @@ function readListedCli(value: unknown): ListedCli | null {
   return {
     cliDeviceId,
     publicKey: typeof value.publicKey === "string" ? value.publicKey : null,
+    terminalViewers: value.terminalViewers === true,
   };
 }
 
@@ -136,7 +169,20 @@ export function parseTerminalServerMessage(value: unknown): TerminalServerMessag
     case "opening": {
       const terminalId = readString(value, "terminalId");
       if (!terminalId) return null;
-      return { type: "opening", terminalId };
+      return { type: "opening", terminalId, viewerId: readString(value, "viewerId") };
+    }
+    case "attaching": {
+      const terminalId = readString(value, "terminalId");
+      const viewerId = readString(value, "viewerId");
+      if (!terminalId || !viewerId) return null;
+      return { type: "attaching", terminalId, viewerId };
+    }
+    case "viewers": {
+      const terminalId = readString(value, "terminalId");
+      const count = readCount(value.count);
+      const writer = readWriter(value.writer);
+      if (!terminalId || count === null || !writer) return null;
+      return { type: "viewers", terminalId, count, writer };
     }
     case "pending": {
       const terminalId = readString(value, "terminalId");
@@ -176,7 +222,8 @@ export function parseTerminalServerMessage(value: unknown): TerminalServerMessag
     case "detached": {
       const terminalId = readString(value, "terminalId");
       if (!terminalId) return null;
-      return { type: "detached", terminalId };
+      const reason = value.reason === "self" || value.reason === "slow" ? value.reason : null;
+      return { type: "detached", terminalId, reason };
     }
     case "error": {
       const message =
@@ -244,9 +291,18 @@ export function decodeSealedFrame(frame: ArrayBuffer): SealedTerminalFrame {
   if (!terminalId || typeof seq !== "number" || !Number.isSafeInteger(seq) || seq < 1) {
     throw new Error("terminal frame metadata is invalid");
   }
+  let epoch: number | undefined;
+  if (metadata.epoch !== undefined) {
+    const raw = metadata.epoch;
+    if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1 || raw > EPOCH_MAX) {
+      throw new Error("terminal frame metadata is invalid");
+    }
+    epoch = raw;
+  }
   return {
     terminalId,
     seq,
+    ...(epoch !== undefined ? { epoch } : {}),
     body: new Uint8Array(new Uint8Array(frame, 4 + metadataLength, bodyLength)),
   };
 }

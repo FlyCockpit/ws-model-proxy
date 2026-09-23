@@ -1,4 +1,14 @@
 import { useQuery } from "@tanstack/react-query";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@ws-model-proxy/ui/components/alert-dialog";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
   DropdownMenu,
@@ -9,19 +19,20 @@ import {
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { Plus, X } from "lucide-react";
+import { EllipsisVertical, Plus, X } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { InlineRetry } from "@/components/inline-retry";
 import { TerminalPane } from "@/components/terminal-pane";
 import { WideContent } from "@/components/wide-content";
-import { useTerminalSessions } from "@/hooks/use-terminal-sessions";
+import { type TerminalTab, useTerminalSessions } from "@/hooks/use-terminal-sessions";
 import {
   featureReasonKey,
   readCliDeviceFeatures,
   terminalOpenBlockReason,
 } from "@/lib/cli-device-features";
+import { followSize, writerStatusKey } from "@/lib/terminal-writer";
 import { orpc } from "@/utils/orpc";
 
 function terminalRejectionLabel(t: (key: string) => string, reason: string | null): string {
@@ -32,6 +43,27 @@ function terminalRejectionLabel(t: (key: string) => string, reason: string | nul
 }
 
 const APPROVAL_COMMAND_PREFIX = "wsmp terminal approve";
+
+/** Writer, viewer count, and the follow hint, for a live multi-viewer tab. */
+function TerminalStatus({ tab }: { tab: TerminalTab }) {
+  const { t } = useTranslation(["dashboard"]);
+  if (!tab.multiViewer || tab.phase !== "live") return <span />;
+  const writerKey = writerStatusKey(tab.writer);
+  const follow = followSize(tab);
+  return (
+    <p className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-sm text-muted-foreground">
+      {writerKey ? (
+        <span className={tab.writer === "you" ? "text-foreground" : undefined}>{t(writerKey)}</span>
+      ) : null}
+      <span>{t("dashboard:terminals.status.viewers", { count: tab.viewerCount })}</span>
+      {follow ? (
+        <span>
+          {t("dashboard:terminals.status.following", { cols: follow.cols, rows: follow.rows })}
+        </span>
+      ) : null}
+    </p>
+  );
+}
 
 function deviceId(device: object): string | null {
   const value = Object.getOwnPropertyDescriptor(device, "id")?.value;
@@ -48,6 +80,7 @@ export function TerminalsPage() {
   const devicesQuery = useQuery(orpc.forwarderManagement.listCliDevices.queryOptions());
   const sessions = useTerminalSessions();
   const [menuOpen, setMenuOpen] = useState(false);
+  const [endTarget, setEndTarget] = useState<string | null>(null);
   const devices = devicesQuery.data ?? [];
   const active = sessions.tabs.find((tab) => tab.localId === sessions.activeLocalId) ?? null;
   const showSkeleton = devicesQuery.isPending && sessions.tabs.length === 0;
@@ -169,7 +202,7 @@ export function TerminalsPage() {
                           : "invisible group-hover:visible group-focus-within:visible",
                       )}
                       aria-label={t("dashboard:terminals.close")}
-                      onClick={() => sessions.closeTab(tab.localId)}
+                      onClick={() => sessions.detachTab(tab.localId)}
                     >
                       <X className="size-4" aria-hidden="true" />
                     </button>
@@ -221,12 +254,61 @@ export function TerminalsPage() {
           {active?.phase === "exited" ? (
             <p className="mb-2 text-sm text-muted-foreground">{t("dashboard:terminals.exited")}</p>
           ) : null}
-          {active?.error ? (
+          {active?.error === "detached" ? (
+            <div className="mb-2 flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center">
+              <p className="min-w-0 text-sm text-muted-foreground">
+                {t("dashboard:terminals.openElsewhere")}
+              </p>
+              <Button
+                type="button"
+                size="touch"
+                variant="outline"
+                className="shrink-0"
+                onClick={() => sessions.selectTab(active.localId)}
+              >
+                {t("dashboard:terminals.viewHere")}
+              </Button>
+            </div>
+          ) : active?.error === "slow" ? (
+            <p className="mb-2 text-sm text-muted-foreground">
+              {t("dashboard:terminals.slowReconnecting")}
+            </p>
+          ) : active?.error ? (
             <p className="mb-2 text-sm text-destructive">
               {active.error === "input_dropped"
                 ? t("dashboard:terminals.inputDropped")
                 : t("dashboard:terminals.error")}
             </p>
+          ) : null}
+
+          {active?.terminalId && active.phase !== "exited" && active.phase !== "rejected" ? (
+            <div className="mb-2 flex min-h-11 min-w-0 items-center justify-between gap-2">
+              <TerminalStatus tab={active} />
+              <DropdownMenu>
+                <DropdownMenuTrigger
+                  render={
+                    <Button
+                      type="button"
+                      size="icon-touch"
+                      variant="ghost"
+                      className="shrink-0"
+                      aria-label={t("dashboard:terminals.actions")}
+                    />
+                  }
+                >
+                  <EllipsisVertical aria-hidden="true" />
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-56">
+                  <DropdownMenuItem
+                    variant="destructive"
+                    className="min-h-11"
+                    onClick={() => setEndTarget(active.localId)}
+                  >
+                    {t("dashboard:terminals.endSession")}
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
           ) : null}
 
           <div className="relative min-h-80 min-w-0 flex-1 overflow-x-hidden overflow-y-hidden">
@@ -235,6 +317,7 @@ export function TerminalsPage() {
                 key={tab.localId}
                 localId={tab.localId}
                 active={tab.localId === sessions.activeLocalId}
+                follow={followSize(tab)}
                 sendInput={sessions.sendInput}
                 sendResize={sessions.sendResize}
                 subscribeOutput={sessions.subscribeOutput}
@@ -243,6 +326,37 @@ export function TerminalsPage() {
           </div>
         </div>
       )}
+
+      <AlertDialog
+        open={endTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setEndTarget(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("dashboard:terminals.endSessionTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("dashboard:terminals.endSessionDescription")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="min-h-11 w-full sm:w-auto">
+              {t("common:actions.cancel")}
+            </AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              className="min-h-11 w-full sm:w-auto"
+              onClick={() => {
+                if (endTarget) sessions.endSession(endTarget);
+                setEndTarget(null);
+              }}
+            >
+              {t("dashboard:terminals.endSession")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </section>
   );
 }
