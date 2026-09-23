@@ -76,6 +76,7 @@ afterEach(() => {
   cleanup();
   currentCli = null;
   socket.handlers = null;
+  identity.ready = true;
   socket.send.mockReset();
   socket.sendFrame.mockReset();
 });
@@ -175,6 +176,8 @@ async function attachAsCli(
   viewerId: string | null,
   attachIndex = 0,
   answerWith?: CliKey,
+  /** Runs in the same act as `attached`, before the browser derives keys. */
+  afterAttached?: () => void,
 ): Promise<Cli> {
   const attach = await waitFor(() => {
     const entry = sentOfType("attach")[attachIndex];
@@ -199,11 +202,14 @@ async function attachAsCli(
     : await deriveTerminalSessionKeys(args);
   // The 2.5 server names the viewer for 2.4 terminals too; v1 crypto ignores it.
   message({ type: "attaching", terminalId: TERMINAL_ID, viewerId: viewerId ?? VIEWER_ID });
-  message({
-    type: "attached",
-    terminalId: TERMINAL_ID,
-    cliPublicKey: bytesToBase64Url(cli.publicKeyRaw),
-    cliNonce: bytesToBase64Url(cliNonce),
+  act(() => {
+    handlers().onMessage({
+      type: "attached",
+      terminalId: TERMINAL_ID,
+      cliPublicKey: bytesToBase64Url(cli.publicKeyRaw),
+      cliNonce: bytesToBase64Url(cliNonce),
+    });
+    afterAttached?.();
   });
   return { keys, unicastSeq: 0n, viewerId };
 }
@@ -561,5 +567,123 @@ describe("useTerminalSessions CLI identity pinning", () => {
     );
     expect(sentOfType("detach")).toEqual([{ type: "detach", terminalId: TERMINAL_ID }]);
     expect(sentOfType("list")).toHaveLength(1);
+  });
+});
+
+describe("useTerminalSessions browser identity readiness", () => {
+  it("holds automatic attaches until the browser identity loads", async () => {
+    identity.ready = false;
+    currentCli = await fakeCli();
+    const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
+    message({
+      type: "terminals",
+      clis: [await listedCli(currentCli, true)],
+      terminals: [listedTerminal(true)],
+    });
+    // The identity check finishes, but no handshake goes out without an identity.
+    await waitFor(() =>
+      expect(view.result.current.cliTrust[CLI_ID]).toMatchObject({ status: "trusted" }),
+    );
+    await sleep(50);
+    expect(sentOfType("attach")).toEqual([]);
+    expect(view.result.current.tabs[0]).toMatchObject({ phase: "opening", rejectionReason: null });
+
+    identity.ready = true;
+    view.rerender();
+    await attachAsCli(VIEWER_ID);
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+    expect(sentOfType("attach")).toHaveLength(1);
+  });
+
+  it("retries a tab refused for a missing browser identity once it loads", async () => {
+    currentCli = await fakeCli();
+    const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
+    message({
+      type: "terminals",
+      clis: [await listedCli(currentCli, true)],
+      terminals: [listedTerminal(true)],
+    });
+    // The mocked identity has no public key, so this attach carries none.
+    const first = await waitFor(() => {
+      const entry = sentOfType("attach")[0];
+      if (!entry) throw new Error("no attach");
+      return entry;
+    });
+    expect(first).not.toHaveProperty("identity");
+    message({
+      type: "rejected",
+      terminalId: TERMINAL_ID,
+      reason: "approval_required",
+      approvalCode: null,
+    });
+    expect(view.result.current.tabs[0]).toMatchObject({
+      phase: "rejected",
+      rejectionReason: "approval_required",
+    });
+    // The identity finishes loading.
+    identity.ready = false;
+    view.rerender();
+    identity.ready = true;
+    view.rerender();
+    await attachAsCli(VIEWER_ID, 1);
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+  });
+
+  it("does not retry other refusals when the identity loads", async () => {
+    currentCli = await fakeCli();
+    const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
+    message({
+      type: "terminals",
+      clis: [await listedCli(currentCli, true)],
+      terminals: [listedTerminal(true)],
+    });
+    await waitFor(() => expect(sentOfType("attach")).toHaveLength(1));
+    message({ type: "rejected", terminalId: TERMINAL_ID, reason: "denied", approvalCode: null });
+    identity.ready = false;
+    view.rerender();
+    identity.ready = true;
+    view.rerender();
+    await sleep(50);
+    expect(sentOfType("attach")).toHaveLength(1);
+    expect(view.result.current.tabs[0]).toMatchObject({ phase: "rejected" });
+  });
+});
+
+describe("useTerminalSessions reconnection", () => {
+  it("discards a handshake that finishes after the socket dropped", async () => {
+    currentCli = await fakeCli();
+    const listed = await listedCli(currentCli, true);
+    const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
+    message({ type: "terminals", clis: [listed], terminals: [listedTerminal(true)] });
+    // The socket drops while the browser is still deriving the session keys.
+    await attachAsCli(VIEWER_ID, 0, undefined, () => handlers().onDisconnect?.());
+    await sleep(50);
+    expect(view.result.current.tabs[0]).toMatchObject({ phase: "opening" });
+
+    // The next socket lists the terminal again, and the tab reattaches.
+    act(() => handlers().onOpen?.());
+    message({ type: "terminals", clis: [listed], terminals: [listedTerminal(true)] });
+    await attachAsCli(VIEWER_ID, 1);
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+  });
+
+  it("drops an identity check that finishes on an earlier socket", async () => {
+    currentCli = await fakeCli();
+    const listed = await listedCli(currentCli, true);
+    renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
+    act(() => {
+      handlers().onMessage({
+        type: "terminals",
+        clis: [listed],
+        terminals: [listedTerminal(true)],
+      });
+      // Disconnect before the trust check lets the attach go out.
+      handlers().onDisconnect?.();
+    });
+    await sleep(50);
+    expect(sentOfType("attach")).toEqual([]);
+    act(() => handlers().onOpen?.());
+    message({ type: "terminals", clis: [listed], terminals: [listedTerminal(true)] });
+    await waitFor(() => expect(sentOfType("attach")).toHaveLength(1));
   });
 });

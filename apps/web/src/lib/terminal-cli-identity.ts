@@ -15,7 +15,8 @@ import type { ListedCli } from "@/lib/terminal-protocol";
  * - `changed`: the identity differs from the pinned one. `fingerprint` is null
  *   when a previously pinned CLI stopped proving an identity at all.
  * - `invalid`: a 2.5 CLI without a valid identity signature.
- * - `offline`: a 2.5 CLI with no terminal key to check right now.
+ * - `offline`: no live CLI (no terminal key to check right now). The pin is
+ *   kept; nothing about the identity is known until the CLI reconnects.
  */
 export type CliTrust =
   | { status: "trusted"; fingerprint: string; terminalPublicKey: string; firstUse: boolean }
@@ -111,13 +112,22 @@ async function verifiedIdentity(
   };
 }
 
+/**
+ * A CLI is live when the relay lists its per-start terminal key: the relay
+ * only lists one for a connected CLI speaking protocol 2.4 or later. An offline
+ * CLI reports no protocol version, so `terminalViewers` says nothing about it.
+ */
+function cliIsLive(cli: ListedCli): boolean {
+  return cli.publicKey !== null;
+}
+
 /** Verify, then pin on first use. Never replaces an existing pin. */
 export async function evaluateCliTrust(cli: ListedCli, store: CliPinStore): Promise<CliTrust> {
-  if (cli.terminalViewers && !cli.publicKey) return { status: "offline" };
+  if (!cliIsLive(cli)) return { status: "offline" };
   const pinned = await readPin(store, cli.cliDeviceId);
   const pinnedFingerprint = pinned && pinned !== "error" ? await fingerprintOf(pinned) : null;
   if (!cli.terminalViewers) {
-    // A pinned CLI that now claims 2.4 no longer proves its identity.
+    // A live pinned CLI that now speaks 2.4 no longer proves its identity.
     if (pinned && pinned !== "error" && pinnedFingerprint) {
       return { status: "changed", pinnedFingerprint, fingerprint: null, identityPublicKey: null };
     }
@@ -152,7 +162,8 @@ export async function trustNewCliKey(
   store: CliPinStore,
 ): Promise<CliTrust> {
   if (shown.identityPublicKey === null) {
-    if (cli.terminalViewers) return evaluateCliTrust(cli, store);
+    // Only a live 2.4 CLI may drop the pin. An offline one keeps it.
+    if (cli.terminalViewers || !cliIsLive(cli)) return evaluateCliTrust(cli, store);
     await store.remove(cli.cliDeviceId);
     return evaluateCliTrust(cli, store);
   }

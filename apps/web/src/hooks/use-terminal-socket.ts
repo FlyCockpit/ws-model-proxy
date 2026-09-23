@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { useLatestRef } from "@/hooks/use-latest-ref";
 import {
   decodeSealedFrame,
   parseTerminalServerMessage,
@@ -14,6 +15,8 @@ const SOCKET_PATH = "/api/dashboard/terminal/ws";
 export type TerminalSocketHandlers = {
   onMessage: (message: TerminalServerMessage) => void;
   onSealed: (frame: SealedTerminalFrame) => void;
+  /** A new socket opened. Anything begun on an earlier socket is obsolete. */
+  onOpen?: () => void;
   onDisconnect?: () => void;
 };
 
@@ -21,6 +24,12 @@ function terminalSocketUrl(): string {
   const url = new URL(SOCKET_PATH, window.location.href);
   url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   return url.toString();
+}
+
+function openTerminalSocket(): WebSocket {
+  const ws = new WebSocket(terminalSocketUrl());
+  ws.binaryType = "arraybuffer";
+  return ws;
 }
 
 function reconnectDelayMs(attempt: number): number {
@@ -35,8 +44,7 @@ export function useTerminalSocket(
   send: (message: TerminalClientMessage) => void;
   sendFrame: (frame: ArrayBuffer) => void;
 } {
-  const handlersRef = useRef(handlers);
-  handlersRef.current = handlers;
+  const handlersRef = useLatestRef(handlers);
   const socketRef = useRef<WebSocket | null>(null);
   const [status, setStatus] = useState<TerminalSocketStatus>("closed");
 
@@ -55,14 +63,16 @@ export function useTerminalSocket(
     const connect = () => {
       if (disposed) return;
       setStatus("connecting");
-      const ws = new WebSocket(terminalSocketUrl());
-      ws.binaryType = "arraybuffer";
+      // The effect cleanup closes the current socket (`socket`) and clears
+      // the reconnect timer.
+      const ws = openTerminalSocket();
       socket = ws;
       socketRef.current = ws;
       ws.onopen = () => {
         if (disposed || socket !== ws) return;
         attempt = 0;
         setStatus("open");
+        handlersRef.current.onOpen?.();
         ws.send(JSON.stringify({ type: "list" }));
       };
       ws.onmessage = (event) => {
@@ -102,7 +112,7 @@ export function useTerminalSocket(
       // Closing the page detaches. Do not send close for each terminal.
       socket?.close();
     };
-  }, [enabled]);
+  }, [enabled, handlersRef]);
 
   const send = useCallback(
     (message: TerminalClientMessage) => {

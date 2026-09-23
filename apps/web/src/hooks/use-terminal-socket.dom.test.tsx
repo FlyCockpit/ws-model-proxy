@@ -31,10 +31,11 @@ class MockWebSocket {
   }
 }
 
-function SocketProbe({ onDisconnect }: { onDisconnect?: () => void }) {
+function SocketProbe({ onOpen, onDisconnect }: { onOpen?: () => void; onDisconnect?: () => void }) {
   const socket = useTerminalSocket(true, {
     onMessage: () => undefined,
     onSealed: () => undefined,
+    onOpen,
     onDisconnect,
   });
   return (
@@ -72,9 +73,11 @@ describe("useTerminalSocket", () => {
     vi.useFakeTimers();
     vi.stubGlobal("WebSocket", MockWebSocket);
     const disconnected = vi.fn();
-    const view = render(<SocketProbe onDisconnect={disconnected} />);
+    const opened = vi.fn();
+    const view = render(<SocketProbe onOpen={opened} onDisconnect={disconnected} />);
     const first = MockWebSocket.instances[0];
     first?.open();
+    expect(opened).toHaveBeenCalledTimes(1);
     expect(first?.sent).toContain(JSON.stringify({ type: "list" }));
     view.getByRole("button", { name: "send" }).click();
     expect(first?.sent.some((entry) => String(entry).includes("old-term"))).toBe(true);
@@ -86,6 +89,8 @@ describe("useTerminalSocket", () => {
     expect(next).toBeTruthy();
     expect(next).not.toBe(first);
     next?.open();
+    // Each new socket tells the sessions hook, so it can drop stale handshakes.
+    expect(opened).toHaveBeenCalledTimes(2);
     expect(next?.sent.filter((entry) => String(entry).includes("old-term"))).toEqual([]);
     expect(next?.sent).toContain(JSON.stringify({ type: "list" }));
     expect(sentBeforeClose).toBeGreaterThan(0);

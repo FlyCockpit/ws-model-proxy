@@ -32,11 +32,6 @@ export type ListedCli = {
   identitySignature: string | null;
 };
 
-export type TerminalIdentityMessage = {
-  publicKey: string;
-  signature: string;
-};
-
 export type TerminalClientMessage =
   | { type: "list" }
   | {

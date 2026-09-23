@@ -4,6 +4,7 @@ import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { type RefCallback, useCallback, useEffect, useRef, useState } from "react";
 
+import { useLatestRef } from "@/hooks/use-latest-ref";
 import {
   CopyOutGate,
   clipboardTypesIncludeImage,
@@ -45,14 +46,12 @@ export function useXterm(options: XtermOptions): {
   /** Apply a PTY size change in output order, while following. */
   followResize: (size: TerminalSize) => void;
 } {
-  const handlersRef = useRef<XtermHandlers>(options);
-  handlersRef.current = options;
-  const followRef = useRef(options.follow);
-  followRef.current = options.follow;
+  const handlersRef = useLatestRef<XtermHandlers>(options);
+  const followRef = useLatestRef(options.follow);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
-  const gateRef = useRef(new CopyOutGate());
-  const inputGateRef = useRef(new TerminalUserInputGate());
+  const [gate] = useState(() => new CopyOutGate());
+  const [inputGate] = useState(() => new TerminalUserInputGate());
   const ownSizeRef = useRef<TerminalSize | null>(null);
   /** Set while this hook resizes xterm itself, so onResize does not echo it. */
   const suppressResizeRef = useRef(false);
@@ -87,7 +86,7 @@ export function useXterm(options: XtermOptions): {
       }
     }
     resizeQuietly(follow);
-  }, [resizeQuietly]);
+  }, [followRef, handlersRef, resizeQuietly]);
 
   useEffect(() => {
     if (!container) return;
@@ -104,10 +103,10 @@ export function useXterm(options: XtermOptions): {
     term.open(container);
     termRef.current = term;
     fitRef.current = fit;
-    const disposeCopyOut = wireTerminalCopyOut(term, gateRef.current, (data) => {
+    const disposeCopyOut = wireTerminalCopyOut(term, gate, (data) => {
       const forward = shouldForwardTerminalData({
         following: followRef.current !== null,
-        userInput: inputGateRef.current.armed(performance.now()),
+        userInput: inputGate.armed(performance.now()),
         data,
       });
       if (forward) handlersRef.current.onData(data);
@@ -117,13 +116,13 @@ export function useXterm(options: XtermOptions): {
       ownSizeRef.current = { cols: size.cols, rows: size.rows };
       handlersRef.current.onResize(size);
     });
-    const armInput = () => inputGateRef.current.arm(performance.now());
+    const armInput = () => inputGate.arm(performance.now());
     // A click claims the writer only in a mouse-reporting app. The wheel never does.
     const armClick = () => {
       if (term.modes.mouseTrackingMode !== "none") armInput();
     };
     const onPaste = (event: ClipboardEvent) => {
-      gateRef.current.armFromUserGesture();
+      gate.armFromUserGesture();
       armInput();
       const types = event.clipboardData ? Array.from(event.clipboardData.types) : [];
       if (!clipboardTypesIncludeImage(types)) return;
@@ -157,7 +156,7 @@ export function useXterm(options: XtermOptions): {
       if (termRef.current === term) termRef.current = null;
       if (fitRef.current === fit) fitRef.current = null;
     };
-  }, [container, layout]);
+  }, [container, followRef, gate, handlersRef, inputGate, layout]);
 
   const followCols = options.follow?.cols ?? null;
   const followRows = options.follow?.rows ?? null;
@@ -185,7 +184,7 @@ export function useXterm(options: XtermOptions): {
     (size: TerminalSize) => {
       if (followRef.current) resizeQuietly(size);
     },
-    [resizeQuietly],
+    [followRef, resizeQuietly],
   );
 
   return { containerRef: setContainer, write, reset, focus, followResize };

@@ -1,5 +1,6 @@
-import { type RefCallback, useEffect, useRef } from "react";
+import { type RefCallback, useEffect } from "react";
 
+import { useLatestRef } from "@/hooks/use-latest-ref";
 import type { TerminalOutputEvent } from "@/hooks/use-terminal-sessions";
 import { useXterm } from "@/hooks/use-xterm";
 import type { TerminalSize } from "@/lib/terminal-writer";
@@ -19,16 +20,14 @@ type TerminalPaneHandlers = {
 };
 
 export function useTerminalPane(handlers: TerminalPaneHandlers): RefCallback<HTMLDivElement> {
-  const handlersRef = useRef(handlers);
-  handlersRef.current = handlers;
+  const handlersRef = useLatestRef(handlers);
   const xterm = useXterm({
     follow: handlers.follow,
     onData: (data) => handlersRef.current.sendInput(handlersRef.current.localId, data),
     onResize: (size) =>
       handlersRef.current.sendResize(handlersRef.current.localId, size.cols, size.rows),
   });
-  const xtermRef = useRef(xterm);
-  xtermRef.current = xterm;
+  const xtermRef = useLatestRef(xterm);
   const { localId, active } = handlers;
 
   useEffect(() => {
@@ -40,7 +39,7 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): RefCallback<HTM
       },
       () => xtermRef.current.reset(),
     );
-  }, [localId]);
+  }, [localId, handlersRef, xtermRef]);
 
   useEffect(() => {
     if (active) xterm.focus();

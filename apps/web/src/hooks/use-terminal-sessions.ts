@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   assertIncreasingTerminalSeq,
   base64UrlToBytes,
@@ -70,6 +70,8 @@ const EARLY_FRAME_QUEUE = 64;
 const OUTPUT_BUFFER_EVENTS = 256;
 /** Refusals that "Trust new key" can lift. A key swapped mid-handshake cannot. */
 const IDENTITY_RETRY_REASONS = new Set(["identity_changed", "identity_invalid"]);
+/** The CLI refuses a handshake that carries no browser identity with this reason. */
+const BROWSER_IDENTITY_REQUIRED = "approval_required";
 
 type InputBatch = {
   pending: string;
@@ -116,6 +118,18 @@ type PendingHandshake = {
   browserNonce: Uint8Array;
   /** 2.5: the ECDH key the pinned identity signed. The CLI must answer with it. */
   expectedCliPublicKey: string | null;
+  /** The handshake went out without a browser identity (it had not loaded). */
+  withoutIdentity: boolean;
+};
+
+type HandshakeInput = {
+  localId: string;
+  cliDeviceId: string;
+  terminalId: string;
+  cols: number;
+  rows: number;
+  mode: "open" | "attach";
+  version: 1 | 2;
 };
 
 type OutputKeyState = {
@@ -229,21 +243,22 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   sendResize: (localId: string, cols: number, rows: number) => void;
 } {
   const identity = useTerminalIdentity();
-  const pinStoreRef = useRef(options.pinStore ?? indexedDbCliPinStore);
-  pinStoreRef.current = options.pinStore ?? indexedDbCliPinStore;
+  const pinStore = options.pinStore ?? indexedDbCliPinStore;
+  const pinStoreRef = useRef(pinStore);
   const [clis, setClis] = useState<ListedCli[]>([]);
   const [cliTrust, setCliTrust] = useState<Record<string, CliTrust>>({});
   const cliListRef = useRef(new Map<string, ListedCli>());
   const cliTrustRef = useRef(new Map<string, CliTrust>());
   const trustRef = useRef(new Map<string, { key: string; promise: Promise<CliTrust> }>());
-  const listReadyRef = useRef<Deferred | null>(null);
-  listReadyRef.current ??= deferred();
+  const [listReady] = useState<Deferred>(deferred);
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   const [activeLocalId, setActiveLocalId] = useState<string | null>(null);
+  /**
+   * Tabs as of the last commit. Handlers that add or remove tabs also write it
+   * at once, so later messages in the same tick see the change.
+   */
   const tabsRef = useRef(tabs);
-  tabsRef.current = tabs;
   const activeRef = useRef(activeLocalId);
-  activeRef.current = activeLocalId;
   const cliKeysRef = useRef(new Map<string, string | null>());
   /** cliDeviceId -> the CLI speaks protocol 2.5 (multi-viewer, v2 crypto). */
   const cliViewersRef = useRef(new Map<string, boolean>());
@@ -264,11 +279,26 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const sendRef = useRef<(message: TerminalClientMessage) => void>(() => undefined);
   const frameRef = useRef<(frame: ArrayBuffer) => void>(() => undefined);
   const signRef = useRef(identity.sign);
-  signRef.current = identity.sign;
   const publicKeyRef = useRef(identity.publicKey);
-  publicKeyRef.current = identity.publicKey;
   const readyRef = useRef(identity.ready);
-  readyRef.current = identity.ready;
+  // Mirror the committed render into the refs the callbacks read. A layout
+  // effect runs before passive effects (the socket connects in one) and
+  // before the browser paints, so no handler sees an older value.
+  useLayoutEffect(() => {
+    pinStoreRef.current = pinStore;
+    tabsRef.current = tabs;
+    activeRef.current = activeLocalId;
+    signRef.current = identity.sign;
+    publicKeyRef.current = identity.publicKey;
+    readyRef.current = identity.ready;
+  }, [pinStore, tabs, activeLocalId, identity.sign, identity.publicKey, identity.ready]);
+  /**
+   * Bumped on every socket connect and disconnect. An async continuation that
+   * started on an earlier connection must not write session state.
+   */
+  const generationRef = useRef(0);
+  /** Tabs whose handshake waits for the browser identity to load. */
+  const awaitingIdentityRef = useRef(new Set<string>());
   const inflightOpensRef = useRef<string[]>([]);
   const resetBeforeOutputRef = useRef(new Set<string>());
   const earlySealedRef = useRef(new Map<string, SealedTerminalFrame[]>());
@@ -409,7 +439,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   /** Verify the CLI identity for the listed terminal key, once per list entry. */
   const ensureTrust = useCallback(
     async (cliDeviceId: string): Promise<CliTrust> => {
-      await listReadyRef.current?.promise;
+      await listReady.promise;
       const cli = cliListRef.current.get(cliDeviceId);
       if (!cli) return { status: "offline" };
       const key = cliTrustInputKey(cli);
@@ -425,7 +455,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       }
       return trust;
     },
-    [publishTrust],
+    [listReady, publishTrust],
   );
 
   /** Refuse a tab before any handshake message goes out. */
@@ -466,6 +496,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         cliNonce: string;
       },
     ) => {
+      const generation = generationRef.current;
       pendingRef.current.delete(pending.localId);
       if (pending.terminalId) pendingRef.current.delete(pending.terminalId);
       attachingRef.current.delete(message.terminalId);
@@ -497,6 +528,9 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         pending.version === 2 && viewerId
           ? await deriveTerminalSessionKeysV2({ ...shared, viewerId })
           : await deriveTerminalSessionKeys(shared);
+      // The socket this handshake ran on is gone; its keys are obsolete. The
+      // tab stays "opening", so the next connection attaches it again.
+      if (generationRef.current !== generation) return;
       if (!tabsRef.current.some((tab) => tab.localId === pending.localId)) return;
       sessionsRef.current.set(message.terminalId, {
         localId: pending.localId,
@@ -545,17 +579,14 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   );
 
   const beginHandshake = useCallback(
-    async (input: {
-      localId: string;
-      cliDeviceId: string;
-      terminalId: string;
-      cols: number;
-      rows: number;
-      mode: "open" | "attach";
-      version: 1 | 2;
-    }) => {
+    async (input: HandshakeInput): Promise<void> => {
+      const generation = generationRef.current;
+      // The socket changed while this ran. A new socket restarts opens and
+      // lists terminals to attach again, so this attempt just stops.
+      const stale = () => generationRef.current !== generation;
       // Verify (and pin on first use) the CLI identity before any key leaves.
       const trust = await ensureTrust(input.cliDeviceId);
+      if (stale()) return;
       if (!tabsRef.current.some((tab) => tab.localId === input.localId)) return;
       const gate = trustAllowsHandshake(trust);
       if (!gate.ok) {
@@ -573,7 +604,16 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         }
       }
       const handshake = await generateEphemeralHandshake();
+      if (stale()) return;
       if (!tabsRef.current.some((tab) => tab.localId === input.localId)) return;
+      if (!readyRef.current) {
+        // An approval-enabled CLI refuses a handshake without the browser
+        // identity. Wait for it to load; the identity effect retries this tab.
+        if (input.mode === "attach") attachingRef.current.delete(input.terminalId);
+        awaitingIdentityRef.current.add(input.localId);
+        return;
+      }
+      awaitingIdentityRef.current.delete(input.localId);
       const publicKey = publicKeyRef.current();
       const identity = publicKey ? { publicKey } : undefined;
       pendingRef.current.set(input.mode === "open" ? input.localId : input.terminalId, {
@@ -585,6 +625,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         browserPublicRaw: handshake.publicKeyRaw,
         browserNonce: handshake.nonce,
         expectedCliPublicKey: gate.expectedCliPublicKey,
+        withoutIdentity: identity === undefined,
       });
       const shared = {
         publicKey: handshake.publicKeyB64,
@@ -636,6 +677,31 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     return !pendingFor(pendingRef.current, tab.localId, tab.terminalId);
   }, []);
 
+  /** Start a tab's handshake again, after whatever blocked it has cleared. */
+  const retryTab = useCallback(
+    (tab: TerminalTab) => {
+      awaitingIdentityRef.current.delete(tab.localId);
+      const retry: TerminalTab = { ...tab, phase: "opening", rejectionReason: null };
+      setTabs((current) =>
+        patchTab(current, tab.localId, { phase: "opening", rejectionReason: null }),
+      );
+      if (tab.terminalId) {
+        if (canAttach(retry)) attach(retry);
+      } else if (tab.opener) {
+        void beginHandshake({
+          mode: "open",
+          localId: tab.localId,
+          cliDeviceId: tab.cliDeviceId,
+          terminalId: "",
+          cols: tab.cols,
+          rows: tab.rows,
+          version: tab.multiViewer ? 2 : 1,
+        });
+      }
+    },
+    [attach, beginHandshake, canAttach],
+  );
+
   /** A viewer left this tab (slow, stolen, or the socket dropped). */
   const dropSession = useCallback(
     (localId: string, terminalId: string) => {
@@ -658,7 +724,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
           cliKeysRef.current.set(cli.cliDeviceId, cli.publicKey);
           cliViewersRef.current.set(cli.cliDeviceId, cli.terminalViewers);
         }
-        listReadyRef.current?.resolve();
+        listReady.resolve();
         // Check every CLI now, so the page can show fingerprints and refusals.
         for (const cli of message.clis) void ensureTrust(cli.cliDeviceId);
         const additions: TerminalTab[] = [];
@@ -762,6 +828,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         }
         // v2 signs the viewer id too. Without one the CLI would reject it.
         if (pending.version === 2 && !pending.viewerId) return;
+        const generation = generationRef.current;
         void signRef
           .current({
             terminalId: message.terminalId,
@@ -772,7 +839,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
             ...(pending.version === 2 && pending.viewerId ? { viewerId: pending.viewerId } : {}),
           })
           .then((proof) => {
-            if (!proof) return;
+            // A proof for a socket that has since closed answers nothing.
+            if (!proof || generationRef.current !== generation) return;
             sendRef.current({
               type: "auth",
               terminalId: message.terminalId,
@@ -786,7 +854,9 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         const pending = takePendingByTerminalId(pendingRef.current, message.terminalId);
         if (!pending) return;
         if (message.type === "attached") resetBeforeOutputRef.current.add(pending.localId);
+        const generation = generationRef.current;
         void establish(pending, message).catch(() => {
+          if (generationRef.current !== generation) return;
           setTabs((current) =>
             patchTab(current, pending.localId, { phase: "rejected", error: "bad_handshake" }),
           );
@@ -817,6 +887,11 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
             rejectionReason: message.reason,
           }),
         );
+        // Refused only because the browser identity had not loaded: retry
+        // once it has.
+        if (pending?.withoutIdentity && message.reason === BROWSER_IDENTITY_REQUIRED) {
+          awaitingIdentityRef.current.add(localId);
+        }
         return;
       }
       if (message.type === "exit") {
@@ -908,6 +983,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       dropSession,
       ensureTrust,
       establish,
+      listReady,
       refuseSubstitutedKey,
       setView,
       tabByTerminal,
@@ -916,6 +992,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   );
 
   const onDisconnect = useCallback(() => {
+    generationRef.current += 1;
     for (const batch of inputRef.current.values()) {
       if (batch.timer) clearTimeout(batch.timer);
     }
@@ -952,6 +1029,21 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       }),
     );
   }, []);
+
+  /**
+   * A new socket: nothing sent before it opened reached the relay. Drop those
+   * handshakes and start pending opens again. The list this socket asks for
+   * attaches the rest.
+   */
+  const onOpen = useCallback(() => {
+    generationRef.current += 1;
+    pendingRef.current.clear();
+    attachingRef.current.clear();
+    inflightOpensRef.current = [];
+    for (const tab of tabsRef.current) {
+      if (tab.opener && !tab.terminalId && tab.phase === "opening") retryTab(tab);
+    }
+  }, [retryTab]);
 
   const applyPlaintext = useCallback(
     (session: LiveSession, decoded: TerminalPlaintextV2) => {
@@ -1101,11 +1193,29 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     },
     [receiveV1, receiveV2],
   );
-  acceptSealedRef.current = onSealed;
+  const socket = useTerminalSocket(true, { onMessage, onSealed, onOpen, onDisconnect });
+  // Layout effects run before the socket's passive connect effect, so these
+  // are in place before any message arrives.
+  useLayoutEffect(() => {
+    acceptSealedRef.current = onSealed;
+    sendRef.current = socket.send;
+    frameRef.current = socket.sendFrame;
+  }, [onSealed, socket.send, socket.sendFrame]);
 
-  const socket = useTerminalSocket(true, { onMessage, onSealed, onDisconnect });
-  sendRef.current = socket.send;
-  frameRef.current = socket.sendFrame;
+  // Handshakes held back until the browser identity loaded go out now.
+  useEffect(() => {
+    if (!identity.ready) return;
+    if (awaitingIdentityRef.current.size === 0) return;
+    const waiting = new Set(awaitingIdentityRef.current);
+    awaitingIdentityRef.current.clear();
+    for (const tab of tabsRef.current) {
+      if (!waiting.has(tab.localId)) continue;
+      const blocked =
+        tab.phase === "opening" ||
+        (tab.phase === "rejected" && tab.rejectionReason === BROWSER_IDENTITY_REQUIRED);
+      if (blocked) retryTab(tab);
+    }
+  }, [identity.ready, retryTab]);
 
   const selectTab = useCallback(
     (localId: string) => {
@@ -1291,26 +1401,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       for (const tab of tabsRef.current) {
         if (tab.cliDeviceId !== cliDeviceId || tab.phase !== "rejected") continue;
         if (!IDENTITY_RETRY_REASONS.has(tab.rejectionReason ?? "")) continue;
-        const retry: TerminalTab = { ...tab, phase: "opening", rejectionReason: null };
-        setTabs((current) =>
-          patchTab(current, tab.localId, { phase: "opening", rejectionReason: null }),
-        );
-        if (tab.terminalId) {
-          attach(retry);
-        } else if (tab.opener) {
-          void beginHandshake({
-            mode: "open",
-            localId: tab.localId,
-            cliDeviceId,
-            terminalId: "",
-            cols: tab.cols,
-            rows: tab.rows,
-            version: tab.multiViewer ? 2 : 1,
-          });
-        }
+        retryTab(tab);
       }
     },
-    [attach, beginHandshake, publishTrust],
+    [publishTrust, retryTab],
   );
 
   return {

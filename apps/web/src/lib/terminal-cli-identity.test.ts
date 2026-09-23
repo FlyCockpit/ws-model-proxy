@@ -108,6 +108,49 @@ describe("CLI identity trust", () => {
     expect(store.pins.size).toBe(0);
   });
 
+  it("treats a disconnected pinned CLI as offline and keeps its pin", async () => {
+    const cli = await signedCli();
+    const store = createMemoryCliPinStore();
+    await evaluateCliTrust(cli, store);
+    // An offline CLI has no live protocol version and no terminal key.
+    const offline: ListedCli = {
+      ...cli,
+      publicKey: null,
+      terminalViewers: false,
+      identityPublicKey: null,
+      identitySignature: null,
+    };
+    const trust = await evaluateCliTrust(offline, store);
+    expect(trust).toEqual({ status: "offline" });
+    expect(trustAllowsHandshake(trust)).toEqual({ ok: false });
+    expect(store.pins.get("cli-1")).toBe(cli.identityPublicKey);
+  });
+
+  it("never drops a pin for a CLI that went offline after the warning", async () => {
+    const cli = await signedCli();
+    const store = createMemoryCliPinStore();
+    await evaluateCliTrust(cli, store);
+    const legacy = {
+      ...cli,
+      terminalViewers: false,
+      identityPublicKey: null,
+      identitySignature: null,
+    };
+    const shown = await evaluateCliTrust(legacy, store);
+    if (shown.status !== "changed") throw new Error("expected a changed identity");
+    const offline = { ...legacy, publicKey: null };
+    expect(await trustNewCliKey(offline, shown, store)).toEqual({ status: "offline" });
+    expect(store.pins.get("cli-1")).toBe(cli.identityPublicKey);
+  });
+
+  it("treats an offline CLI without a pin as offline, not unverified", async () => {
+    const cli = await signedCli();
+    const offline = { ...cli, publicKey: null, terminalViewers: false };
+    expect(await evaluateCliTrust(offline, createMemoryCliPinStore())).toEqual({
+      status: "offline",
+    });
+  });
+
   it("allows a verified CLI without a pin when storage fails", async () => {
     const cli = await signedCli();
     expect(await evaluateCliTrust(cli, brokenStore)).toMatchObject({ status: "unpinned" });

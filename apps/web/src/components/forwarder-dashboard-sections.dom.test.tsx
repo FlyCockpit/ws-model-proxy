@@ -841,7 +841,7 @@ describe("GrantPoolDialog provider egress acknowledgement", () => {
       error: {
         message: JSON.stringify({
           code: "INTERNAL_SERVER_ERROR",
-          data: { secret: "postgres://user:pass@db/app" },
+          data: { secret: "postgres://db.invalid/leaked_app_db" },
         }),
       },
     };
@@ -858,6 +858,6 @@ describe("GrantPoolDialog provider egress acknowledgement", () => {
       "textContent",
       "common:somethingWentWrong",
     );
-    expect(screen.queryByText(/postgres:\/\//)).toBeNull();
+    expect(screen.queryByText(/postgres:\/\/|leaked_app_db/)).toBeNull();
   });
 });
