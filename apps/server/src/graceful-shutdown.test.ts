@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { runGracefulShutdownSequence } from "./graceful-shutdown";
+import {
+  drainHttpWithDeadline,
+  runGracefulShutdownSequence,
+  runWithDeadline,
+} from "./graceful-shutdown";
 
 /**
  * Graceful-shutdown ORDERING tests (Phase 4 item 4): the MCP
@@ -203,5 +207,164 @@ describe("runGracefulShutdownSequence — default-logger sanitization (L19, F3)"
       disconnectPrisma: async () => {},
     });
     expect(logSpy.mock.calls.flat().map(String).join("\n")).toContain("Prisma disconnected.");
+  });
+});
+
+describe("drainHttpWithDeadline", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const never = () => new Promise<void>(() => {});
+
+  it("stops admission before relay persistence starts", async () => {
+    const order: string[] = [];
+    await drainHttpWithDeadline({
+      timeoutMs: 10_000,
+      stopAdmission: async () => {
+        order.push("stopAdmission");
+      },
+      closeIdleRelaySessions: async () => {
+        order.push("closeIdleRelaySessions");
+      },
+      forceCloseConnections: () => order.push("forceClose"),
+      warn: () => {},
+      logError: () => {},
+    });
+    expect(order).toEqual(["stopAdmission", "closeIdleRelaySessions"]);
+  });
+
+  it("finishes by the deadline when a relay DB write never resolves, and forces connections closed", async () => {
+    const warnings: string[] = [];
+    const forceClose = vi.fn();
+    let admissionStopped = false;
+    let persistenceSawAdmissionStopped: boolean | undefined;
+    let done = false;
+    const drain = drainHttpWithDeadline({
+      timeoutMs: 10_000,
+      stopAdmission: () => {
+        admissionStopped = true;
+        // The HTTP server would close once the stalled socket is gone.
+        return never();
+      },
+      closeIdleRelaySessions: () => {
+        persistenceSawAdmissionStopped = admissionStopped;
+        return never();
+      },
+      forceCloseConnections: forceClose,
+      warn: (message) => warnings.push(message),
+      logError: () => {},
+    }).then(() => {
+      done = true;
+    });
+
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(done).toBe(false);
+    expect(forceClose).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await drain;
+    expect(done).toBe(true);
+    expect(persistenceSawAdmissionStopped).toBe(true);
+    expect(forceClose).toHaveBeenCalledTimes(1);
+    expect(warnings.join("\n")).toContain("Drain timeout reached");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not wait for the deadline when the DB and HTTP drain are healthy", async () => {
+    const forceClose = vi.fn();
+    await drainHttpWithDeadline({
+      timeoutMs: 10_000,
+      stopAdmission: async () => {},
+      closeIdleRelaySessions: async () => {},
+      forceCloseConnections: forceClose,
+      warn: () => {},
+      logError: () => {},
+    });
+    expect(forceClose).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("logs a failed relay close with a sanitized label and still drains", async () => {
+    const errors: string[] = [];
+    await drainHttpWithDeadline({
+      timeoutMs: 10_000,
+      stopAdmission: async () => {},
+      closeIdleRelaySessions: async () => {
+        throw new Error("SELECT secret");
+      },
+      forceCloseConnections: () => {},
+      warn: () => {},
+      logError: (message, error) =>
+        errors.push(`${message} ${error instanceof Error ? error.constructor.name : ""}`),
+    });
+    expect(errors).toEqual(["[server] Error closing idle relay sessions: Error"]);
+  });
+});
+
+describe("runWithDeadline", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("gives up on a DB write that never resolves at the deadline", async () => {
+    const warnings: string[] = [];
+    let done = false;
+    const run = runWithDeadline(() => new Promise<void>(() => {}), 5_000, "relay session close", {
+      warn: (message) => warnings.push(message),
+    }).then(() => {
+      done = true;
+    });
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(done).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await run;
+    expect(done).toBe(true);
+    expect(warnings).toEqual(["[server] relay session close did not finish before its deadline."]);
+  });
+
+  it("lets a whole shutdown sequence finish while relay persistence hangs", async () => {
+    const order: string[] = [];
+    const hang = () => new Promise<void>(() => {});
+    const sequence = runGracefulShutdownSequence({
+      stopPeriodicJobs: () => {},
+      closeBrowserSockets: () => {},
+      drainHttp: () =>
+        drainHttpWithDeadline({
+          timeoutMs: 10_000,
+          stopAdmission: async () => {
+            order.push("stopAdmission");
+          },
+          closeIdleRelaySessions: () => {
+            order.push("closeIdleRelaySessions");
+            return hang();
+          },
+          forceCloseConnections: () => {},
+          warn: () => {},
+        }),
+      closeRelaySessions: () =>
+        runWithDeadline(hang, 5_000, "relay session close", { warn: () => {} }),
+      closeMcpHandler: async () => {},
+      disconnectPrisma: async () => {
+        order.push("disconnectPrisma");
+      },
+      log: () => {},
+      logError: () => {},
+    });
+    await vi.advanceTimersByTimeAsync(15_000);
+    await sequence;
+    expect(order).toEqual(["stopAdmission", "closeIdleRelaySessions", "disconnectPrisma"]);
+  });
+
+  it("returns as soon as the work finishes", async () => {
+    await runWithDeadline(async () => {}, 5_000, "relay session close", { warn: () => {} });
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

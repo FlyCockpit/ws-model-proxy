@@ -715,26 +715,44 @@ export class RelaySessionManager {
       failureClass: Extract<PoolMemberFailureClass, "WEBSOCKET_DISCONNECTED" | "STALE_SESSION">;
     },
   ) {
+    await this.detachSession(socket, { now, cliStatus, failureClass })?.();
+  }
+
+  /**
+   * Drops the session from memory right away and returns its database write,
+   * if any. Shutdown detaches every socket before it awaits a single write, so
+   * a slow database cannot keep later sockets open.
+   */
+  private detachSession(
+    socket: RelaySocket,
+    {
+      now,
+      cliStatus,
+      failureClass,
+    }: {
+      now: Date;
+      cliStatus: "DISCONNECTED" | "STALE";
+      failureClass: Extract<PoolMemberFailureClass, "WEBSOCKET_DISCONNECTED" | "STALE_SESSION">;
+    },
+  ): (() => Promise<void>) | null {
     const session = this.sessionsBySocket.get(socket);
-    if (!session) return;
+    if (!session) return null;
     this.teardownInteractiveWork(session);
     clearTimeout(session.unauthenticatedTimer);
     this.sessionsBySocket.delete(socket);
     this.failActiveRequestsForSession(session);
-    if (session.cliDeviceId && this.sessionsByCliDeviceId.get(session.cliDeviceId) === session) {
-      this.sessionsByCliDeviceId.delete(session.cliDeviceId);
+    const cliDeviceId = session.cliDeviceId;
+    if (!cliDeviceId || this.sessionsByCliDeviceId.get(cliDeviceId) !== session) return null;
+    this.sessionsByCliDeviceId.delete(cliDeviceId);
+    return async () => {
       await prisma.cliDevice.update({
-        where: { id: session.cliDeviceId },
+        where: { id: cliDeviceId },
         data: { status: cliStatus, lastDisconnectedAt: now },
         select: { id: true },
       });
-      await markPoolMembersForCliUnavailable({
-        cliDeviceId: session.cliDeviceId,
-        failureClass,
-        now,
-      });
+      await markPoolMembersForCliUnavailable({ cliDeviceId, failureClass, now });
       this.poolMemberRecovery.wake();
-    }
+    };
   }
 
   async checkStaleSessions(now = new Date()) {
@@ -762,7 +780,7 @@ export class RelaySessionManager {
    * timeout force-closes every connection.
    */
   async closeIdleRelaySessions(now = new Date()) {
-    this.relayDrain = true;
+    this.beginDrain();
     await this.shutdownRelaySessions(
       [...this.sessionsBySocket.values()].filter(
         (session) => !this.sessionHasActiveRelayWork(session),
@@ -771,39 +789,57 @@ export class RelaySessionManager {
     );
   }
 
+  /** Refuse new relay and terminal sockets. Synchronous so shutdown can stop admission first. */
+  beginDrain() {
+    this.relayDrain = true;
+  }
+
   isDraining(): boolean {
     return this.relayDrain;
   }
 
   /** Shutdown step: cancel interactive work, close remaining CLI sockets, mark devices disconnected. */
   async closeRelaySessions(now = new Date()) {
-    this.relayDrain = true;
+    this.beginDrain();
     await this.shutdownRelaySessions([...this.sessionsBySocket.values()], now);
   }
 
   private async shutdownRelaySessions(sessions: SessionState[], now: Date) {
+    // Close every socket first. Only then touch the database.
     let failure: unknown;
+    const recordFailure = (error: unknown) => {
+      failure = error;
+      console.error(
+        "[relay] closeRelaySessions failed",
+        error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+      );
+    };
+    const writes: Array<() => Promise<void>> = [];
     for (const session of sessions) {
       try {
-        await this.shutdownRelaySession(session, now);
+        const write = this.shutdownRelaySession(session, now);
+        if (write) writes.push(write);
       } catch (error) {
-        failure = error;
-        console.error(
-          "[relay] closeRelaySessions failed",
-          error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
-        );
+        recordFailure(error);
+      }
+    }
+    for (const write of writes) {
+      try {
+        await write();
+      } catch (error) {
+        recordFailure(error);
       }
     }
     if (failure) throw failure instanceof Error ? failure : new Error("closeRelaySessions failed");
   }
 
-  private async shutdownRelaySession(session: SessionState, now: Date) {
-    if (!this.sessionsBySocket.has(session.socket)) return;
+  private shutdownRelaySession(session: SessionState, now: Date): (() => Promise<void>) | null {
+    if (!this.sessionsBySocket.has(session.socket)) return null;
     this.teardownInteractiveWork(session);
     if (session.socket.readyState === WS_READY_STATE_OPEN) {
       session.socket.close(1001, "shutdown");
     }
-    await this.removeSessionWithStatus(session.socket, {
+    return this.detachSession(session.socket, {
       now,
       cliStatus: "DISCONNECTED",
       failureClass: "WEBSOCKET_DISCONNECTED",
@@ -831,7 +867,9 @@ export class RelaySessionManager {
     if (!this.relayDrain || !cliDeviceId) return;
     const session = this.sessionsByCliDeviceId.get(cliDeviceId);
     if (!session || this.sessionHasActiveRelayWork(session)) return;
-    void this.shutdownRelaySession(session, new Date()).catch((error: unknown) => {
+    void (async () => {
+      await this.shutdownRelaySession(session, new Date())?.();
+    })().catch((error: unknown) => {
       console.error(
         "[relay] idle session close failed",
         error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,

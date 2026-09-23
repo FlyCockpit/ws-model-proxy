@@ -179,6 +179,41 @@ describe("relay drain", () => {
     seedRegistrationMocks();
   });
 
+  it("closes every CLI socket before a stalled disconnect write can block the rest", async () => {
+    const manager = new RelaySessionManager();
+    const first = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: first, identity, now });
+    await manager.handleTextFrame(first, helloFrame(), now);
+    db.cliDevice.upsert.mockResolvedValueOnce({
+      id: "second-device",
+      userId: "user-id",
+      slug: "laptop",
+    });
+    const second = new FakeSocket();
+    manager.acceptAuthenticatedSocket({
+      socket: second,
+      identity: { ...identity, id: "token-2" },
+      now,
+    });
+    await manager.handleTextFrame(second, helloFrame(), now);
+    expect(manager.getActiveCliDeviceIds()).toHaveLength(2);
+
+    db.cliDevice.update.mockImplementation(() => new Promise(() => {}));
+    const closing = manager.closeRelaySessions(now);
+    let settled = false;
+    void closing.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+
+    expect(manager.isDraining()).toBe(true);
+    expect(first.closes).toEqual([{ code: 1001, reason: "shutdown" }]);
+    expect(second.closes).toEqual([{ code: 1001, reason: "shutdown" }]);
+    expect(manager.getActiveCliDeviceIds()).toEqual([]);
+    expect(settled).toBe(false);
+    manager.dispose();
+  });
+
   it("closes idle CLI sockets and keeps a socket until its model request finishes", async () => {
     const manager = new RelaySessionManager();
     const idle = new FakeSocket();

@@ -725,6 +725,74 @@ describe("terminal browser hub", () => {
     errorSpy.mockRestore();
   });
 
+  it("rejects an oversized text frame on receipt without queueing it behind a stalled lookup", async () => {
+    const browser = attachBrowser();
+    let releaseList: (() => void) | undefined;
+    db.cliDevice.findMany.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseList = () => resolve([]);
+        }),
+    );
+    const stalled = terminalBrowserHub.handleText(browser, '{"type":"list"}');
+    const oversized = `{"type":"list","pad":"${"x".repeat(64 * 1024)}"}`;
+    const multiByte = `{"type":"list","pad":"${"\u00e9".repeat(33 * 1024)}"}`;
+    await terminalBrowserHub.handleText(browser, oversized);
+    await terminalBrowserHub.handleText(browser, multiByte);
+    // Both errors arrive while the first frame is still waiting on the database.
+    expect(browser.jsonSends()).toEqual([
+      expect.objectContaining({ type: "error", code: "invalid" }),
+      expect.objectContaining({ type: "error", code: "invalid" }),
+    ]);
+    releaseList?.();
+    await stalled;
+    expect(browser.jsonSends().map((message) => message.type)).toEqual([
+      "error",
+      "error",
+      "terminals",
+    ]);
+    expect(db.cliDevice.findMany).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes a socket whose queued text frames pass the cap during a stalled lookup", async () => {
+    const browser = attachBrowser();
+    let releaseList: (() => void) | undefined;
+    const lookupStarted = new Promise<void>((started) => {
+      db.cliDevice.findMany.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseList = () => resolve([]);
+            started();
+          }),
+      );
+    });
+    const accepted = [terminalBrowserHub.handleText(browser, '{"type":"list"}')];
+    await lookupStarted;
+    for (let index = 1; index < 8; index += 1) {
+      accepted.push(terminalBrowserHub.handleText(browser, '{"type":"list"}'));
+    }
+    expect(browser.closes).toEqual([]);
+    await terminalBrowserHub.handleText(browser, '{"type":"list"}');
+    expect(browser.closes).toEqual([{ code: 1008, reason: "too_many_pending" }]);
+    // Further frames on the closed socket are dropped outright.
+    await terminalBrowserHub.handleText(browser, '{"type":"list"}');
+    releaseList?.();
+    await Promise.all(accepted);
+    // Only the frame already running reached the database.
+    expect(db.cliDevice.findMany).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps order for accepted frames and frees queue slots as they finish", async () => {
+    const browser = attachBrowser();
+    for (let round = 0; round < 2; round += 1) {
+      await Promise.all(
+        Array.from({ length: 8 }, () => terminalBrowserHub.handleText(browser, '{"type":"list"}')),
+      );
+    }
+    expect(browser.closes).toEqual([]);
+    expect(browser.jsonSends().filter((message) => message.type === "terminals")).toHaveLength(16);
+  });
+
   describe("protocol 2.5 viewers", () => {
     type Json = Record<string, unknown>;
 

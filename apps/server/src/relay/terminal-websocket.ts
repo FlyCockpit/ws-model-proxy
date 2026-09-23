@@ -32,6 +32,12 @@ const BROWSER_BUFFER_DETACH_BYTES = 4 * 1024 * 1024;
 const BROWSER_JSON_MAX_BYTES = 64 * 1024;
 const BROWSER_JSON_LIMIT = 20;
 const BROWSER_JSON_WINDOW_MS = 10_000;
+/**
+ * Accepted text frames a browser may have waiting or running at once. A slow
+ * database lookup must not let one socket pile up work; past this the socket
+ * is closed with 1008.
+ */
+const BROWSER_TEXT_QUEUE_LIMIT = 8;
 /** Per terminal tab. Key repeat runs at about 30 frames per second. */
 const BROWSER_BINARY_LIMIT = 300;
 /** Per terminal, across every viewer, so many tabs cannot multiply the CLI's input load. */
@@ -103,6 +109,8 @@ type BrowserConn = {
   socket: RelaySocket;
   userId: string;
   sessionId: string;
+  /** Accepted text frames not yet finished. Bounded by BROWSER_TEXT_QUEUE_LIMIT. */
+  pendingText: number;
 };
 
 type CliListRow = {
@@ -213,6 +221,14 @@ function availabilityFor(row: CliListRow, live: LiveCliFeatureSnapshot | null) {
   });
 }
 
+/** UTF-8 size check without encoding the frame. */
+function utf8ByteLengthExceeds(frame: string, maxBytes: number): boolean {
+  // Each UTF-16 unit encodes to 1..3 UTF-8 bytes.
+  if (frame.length > maxBytes) return true;
+  if (frame.length * 3 <= maxBytes) return false;
+  return Buffer.byteLength(frame, "utf8") > maxBytes;
+}
+
 export class TerminalBrowserHub {
   private bySocket = new Map<RelaySocket, BrowserConn>();
   private byId = new Map<string, BrowserConn>();
@@ -225,14 +241,40 @@ export class TerminalBrowserHub {
   private dropNotified = new Set<string>();
 
   accept(input: { socket: RelaySocket; userId: string; sessionId: string }) {
-    const conn: BrowserConn = { id: randomUUID(), ...input };
+    const conn: BrowserConn = { id: randomUUID(), pendingText: 0, ...input };
     this.bySocket.set(input.socket, conn);
     this.byId.set(conn.id, conn);
   }
 
+  /**
+   * Rate, size, and queue checks run synchronously on receipt, so a rejected
+   * frame is never held. Accepted frames run one at a time, in order.
+   */
   handleText(socket: RelaySocket, frame: string): Promise<void> {
+    const conn = this.bySocket.get(socket);
+    if (!conn) return Promise.resolve();
+    if (!this.allowJson(conn)) {
+      this.sendError(conn, "invalid");
+      return Promise.resolve();
+    }
+    if (utf8ByteLengthExceeds(frame, BROWSER_JSON_MAX_BYTES)) {
+      this.sendError(conn, "invalid");
+      return Promise.resolve();
+    }
+    if (conn.pendingText >= BROWSER_TEXT_QUEUE_LIMIT) {
+      this.detachAll(conn);
+      if (conn.socket.readyState === 1) conn.socket.close(1008, "too_many_pending");
+      this.forgetConn(conn);
+      return Promise.resolve();
+    }
+    conn.pendingText += 1;
     const previous = this.textChain.get(socket) ?? Promise.resolve();
-    const run = previous.catch(() => undefined).then(() => this.handleTextExclusive(socket, frame));
+    const run = previous
+      .catch(() => undefined)
+      .then(() => this.handleTextExclusive(conn, frame))
+      .finally(() => {
+        conn.pendingText -= 1;
+      });
     this.textChain.set(socket, run);
     return run;
   }
@@ -298,18 +340,10 @@ export class TerminalBrowserHub {
     this.byId.delete(conn.id);
   }
 
-  private async handleTextExclusive(socket: RelaySocket, frame: string) {
-    const conn = this.bySocket.get(socket);
-    if (!conn) return;
-    if (!this.allowJson(conn)) {
-      this.sendError(conn, "invalid");
-      return;
-    }
-    const bytes = new TextEncoder().encode(frame).byteLength;
-    if (bytes > BROWSER_JSON_MAX_BYTES) {
-      this.sendError(conn, "invalid");
-      return;
-    }
+  /** Frames already passed the rate and size checks in `handleText`. */
+  private async handleTextExclusive(conn: BrowserConn, frame: string) {
+    // The socket may have closed while this frame waited its turn.
+    if (this.bySocket.get(conn.socket) !== conn) return;
     let parsed: unknown;
     try {
       parsed = JSON.parse(frame);

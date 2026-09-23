@@ -10,7 +10,11 @@ import { env } from "@ws-model-proxy/env/server";
 import { WebSocketServer } from "ws";
 import { createApp } from "./app.js";
 import { installBetterCallErrorLogShim } from "./better-call-error-log-shim.js";
-import { runGracefulShutdownSequence } from "./graceful-shutdown.js";
+import {
+  drainHttpWithDeadline,
+  runGracefulShutdownSequence,
+  runWithDeadline,
+} from "./graceful-shutdown.js";
 import { startOauthCleanup } from "./mcp/oauth-cleanup.js";
 import { startMediaCleanup } from "./media/cleanup.js";
 import { startCacheAffinityCleanup } from "./model-api/cache-affinity-runtime.js";
@@ -113,6 +117,8 @@ try {
 // ---------------------------------------------------------------------------
 
 const DRAIN_TIMEOUT_MS = 10_000;
+/** Bound on the final relay close (DB writes for CLIs still busy at drain end). */
+const RELAY_CLOSE_TIMEOUT_MS = 5_000;
 const serverPort = env.SERVER_PORT ?? env.PORT ?? 3000;
 
 const server = serve(
@@ -232,23 +238,48 @@ async function shutdown(signal: string) {
     closeBrowserSockets: () => {
       terminalBrowserHub.closeAll();
     },
-    closeRelaySessions: () => relaySessionManager.closeRelaySessions(),
+    closeRelaySessions: () =>
+      runWithDeadline(
+        () => relaySessionManager.closeRelaySessions(),
+        RELAY_CLOSE_TIMEOUT_MS,
+        "relay session close",
+      ),
     // 1. Stop accepting new connections and drain in-flight requests.
+    //    ORDER: admission stops first (relay drain flag makes terminal and
+    //    CLI upgrades return 503; server.close stops new connections), THEN
+    //    the drain deadline starts, THEN idle CLI sockets close and their DB
+    //    writes run inside that deadline. A locked device row can use up the
+    //    deadline but never extend it.
     //    NORMAL drain: graceful — server.close waits for in-flight requests
-    //    to finish. DRAIN TIMEOUT (F8): forcibly terminate every lingering
+    //    to finish; busy CLI sockets stay until their request finishes.
+    //    DRAIN TIMEOUT (F8): forcibly terminate every lingering
     //    connection so requests that are still reading their bodies ABORT
     //    (their request signals fire, their body streams error) — the MCP
     //    admission gate below then settles and the teardown sequence is
     //    never held hostage by a stalled body. Without this, a request that
     //    passed the body cap but never finished sending could proceed to
     //    the MCP factory DURING/AFTER the Prisma disconnect.
-    drainHttp: async () => {
-      // Drop CLI sockets that are not carrying a model request. Busy sockets
-      // stay until that request finishes or the drain timeout below.
-      await relaySessionManager.closeIdleRelaySessions();
-      return new Promise<void>((resolve) => {
-        const timeout = setTimeout(() => {
-          console.warn("[server] Drain timeout reached, forcing close.");
+    drainHttp: () =>
+      drainHttpWithDeadline({
+        timeoutMs: DRAIN_TIMEOUT_MS,
+        stopAdmission: () => {
+          relaySessionManager.beginDrain();
+          return new Promise<void>((resolve) => {
+            server.close((err) => {
+              if (err) {
+                // Sanitized (L19): constructor name only — close errors can
+                // carry arbitrary message content.
+                console.error(
+                  `[server] Error closing HTTP server: (${err.constructor?.name ?? "Error"})`,
+                );
+              }
+              resolve();
+            });
+          });
+        },
+        // Drop CLI sockets that are not carrying a model request.
+        closeIdleRelaySessions: () => relaySessionManager.closeIdleRelaySessions(),
+        forceCloseConnections: () => {
           // Feature-detect for TYPE reasons, not runtime availability:
           // serve() uses Node's default HTTP constructor here, so the
           // runtime server always implements closeAllConnections() /
@@ -261,22 +292,8 @@ async function shutdown(signal: string) {
           };
           nodeServer.closeAllConnections?.();
           nodeServer.closeIdleConnections?.();
-          resolve();
-        }, DRAIN_TIMEOUT_MS);
-
-        server.close((err) => {
-          clearTimeout(timeout);
-          if (err) {
-            // Sanitized (L19): constructor name only — close errors can
-            // carry arbitrary message content.
-            console.error(
-              `[server] Error closing HTTP server: (${err.constructor?.name ?? "Error"})`,
-            );
-          }
-          resolve();
-        });
-      });
-    },
+        },
+      }),
     // 2. Close the admission gate AND the module-lifetime MCP handler —
     //    AFTER the HTTP drain (normal-drain requests finished; nothing
     //    admitted loses its exchange prematurely) and BEFORE the Prisma
