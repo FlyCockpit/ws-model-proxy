@@ -125,30 +125,39 @@ function StatusIcon({ trust }: { trust: CliTrust | undefined }) {
   return <ShieldQuestion className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />;
 }
 
+/** Offline CLIs have no key to show, unless a pinned key needs attention. */
+export function cliIdentitiesToShow(
+  clis: ListedCli[],
+  trust: Record<string, CliTrust>,
+): ListedCli[] {
+  return clis.filter(
+    (cli) => cli.publicKey !== null || trust[cli.cliDeviceId]?.status === "changed",
+  );
+}
+
+/** Whether any shown CLI identity blocks its terminals until the user acts. */
+export function cliIdentitiesNeedAttention(
+  clis: ListedCli[],
+  trust: Record<string, CliTrust>,
+): boolean {
+  return cliIdentitiesToShow(clis, trust).some((cli) => {
+    const status = trust[cli.cliDeviceId]?.status;
+    return status === "changed" || status === "invalid";
+  });
+}
+
 /** Each live CLI's identity fingerprint, and the "Trust new key" flow. */
 export function TerminalCliIdentities({ clis, trust, labelFor, onTrustNewKey }: Props) {
   const { t } = useTranslation(["dashboard", "common"]);
   const [confirm, setConfirm] = useState<Confirmation | null>(null);
-  // Offline CLIs have no key to show, unless a pinned key needs attention.
-  const shown = clis.filter(
-    (cli) => cli.publicKey !== null || trust[cli.cliDeviceId]?.status === "changed",
-  );
+  const shown = cliIdentitiesToShow(clis, trust);
   if (shown.length === 0) return null;
   const confirmTrust = confirm?.trust;
   const downgrade = confirmTrust !== undefined && confirmTrust.fingerprint === null;
 
   return (
-    <section
-      className="mb-3 min-w-0 rounded-md border p-3"
-      aria-labelledby="terminal-cli-identities"
-    >
-      <h3 id="terminal-cli-identities" className="text-sm font-medium">
-        {t("dashboard:terminals.identity.title")}
-      </h3>
-      <p className="mt-1 text-xs text-muted-foreground">
-        {t("dashboard:terminals.identity.description")}
-      </p>
-      <ul className="mt-2 flex min-w-0 flex-col gap-2">
+    <div className="min-w-0">
+      <ul className="flex min-w-0 flex-col gap-3">
         {shown.map((cli) => (
           <li key={cli.cliDeviceId} className="flex min-w-0 items-start gap-2">
             <StatusIcon trust={trust[cli.cliDeviceId]} />
@@ -224,6 +233,6 @@ export function TerminalCliIdentities({ clis, trust, labelFor, onTrustNewKey }: 
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </section>
+    </div>
   );
 }

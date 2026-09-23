@@ -24,8 +24,12 @@ vi.mock("@xterm/xterm", () => ({
     constructor() {
       xterm.instances.push(this);
     }
+    element: HTMLElement | null = null;
     loadAddon() {}
-    open() {}
+    open(container: HTMLElement) {
+      this.element = document.createElement("div");
+      container.appendChild(this.element);
+    }
     onResize() {
       return { dispose() {} };
     }
@@ -212,5 +216,32 @@ describe("useTerminalPane", () => {
     active = true;
     rerender();
     expect(term?.focused).toBe(2);
+  });
+
+  it("reports its own size only while the workspace is shown", () => {
+    const render = (hidden: boolean) => {
+      const sendResize = vi.fn();
+      const { result } = renderHook(() =>
+        useTerminalPane({
+          localId: "local_1",
+          active: !hidden,
+          follow: { cols: 100, rows: 30 },
+          sendInput: () => undefined,
+          sendResize,
+          subscribeOutput: outputSource().subscribeOutput,
+        }),
+      );
+      const workspace = document.createElement("div");
+      workspace.hidden = hidden;
+      const container = document.createElement("div");
+      workspace.appendChild(container);
+      document.body.appendChild(workspace);
+      act(() => result.current(container));
+      workspace.remove();
+      return sendResize;
+    };
+    // Hidden (another dashboard page shows): a 0x0 box must not resize the PTY.
+    expect(render(true)).not.toHaveBeenCalled();
+    expect(render(false)).toHaveBeenCalledWith("local_1", 80, 24);
   });
 });

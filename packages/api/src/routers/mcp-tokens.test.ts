@@ -32,6 +32,7 @@ const db = prisma as unknown as {
   mcpPersonalToken: {
     findMany: MockInstance;
     findUnique: MockInstance;
+    findFirst: MockInstance;
     count: MockInstance;
     create: MockInstance;
     update: MockInstance;
@@ -118,6 +119,7 @@ describe("mcpTokensRouter", () => {
     db.appSetting.findUnique.mockResolvedValue(null);
     db.mcpPersonalToken.findMany.mockResolvedValue([]);
     db.mcpPersonalToken.findUnique.mockResolvedValue(null);
+    db.mcpPersonalToken.findFirst.mockResolvedValue(null);
     db.mcpPersonalToken.count.mockResolvedValue(0);
     db.$transaction.mockImplementation(async (work: unknown) =>
       (work as (tx: unknown) => Promise<unknown>)(prisma),
@@ -620,5 +622,190 @@ describe("mcpTokensRouter", () => {
     });
     expect(db.mcpPersonalToken.update).not.toHaveBeenCalled();
     expect(db.mcpGrant.updateMany).not.toHaveBeenCalled();
+  });
+  describe("updateMine", () => {
+    function existing(overrides: Record<string, unknown> = {}) {
+      return { id: "token-1", scopes: ["mcp:read"], allowCliCommands: false, ...overrides };
+    }
+
+    function mockUpdateEcho() {
+      db.mcpPersonalToken.update.mockImplementation(
+        async (args: { data: { scopes: string[]; allowCliCommands: boolean } }) =>
+          tokenRow({ scopes: args.data.scopes, allowCliCommands: args.data.allowCliCommands }),
+      );
+    }
+
+    it("widens a read-only token to write + CLI commands inside the ownership-checked transaction", async () => {
+      db.mcpPersonalToken.findFirst.mockResolvedValue(existing());
+      mockUpdateEcho();
+      const cancelMcpTokenCommands = vi.fn();
+      const client = createRouterClient(mcpTokensRouter, {
+        context: { ...buildContext(), services: { cancelMcpTokenCommands } },
+      });
+
+      await expect(
+        client.updateMine({ id: "token-1", allowWrite: true, allowCliCommands: true }),
+      ).resolves.toEqual({
+        id: "token-1",
+        createdAt,
+        updatedAt: createdAt,
+        name: "Laptop Grok",
+        lookupPrefix: "wsmp_mcp_abcdefghijkl",
+        scopes: ["mcp:read", "mcp:write"],
+        lastUsedAt: null,
+        revokedAt: null,
+        expiresAt: null,
+        allowCliCommands: true,
+      });
+      expect(db.$transaction).toHaveBeenCalledTimes(1);
+      expect(db.mcpPersonalToken.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            id: "token-1",
+            userId: "user-1",
+            revokedAt: null,
+            grant: { revokedAt: null },
+            OR: [{ expiresAt: null }, { expiresAt: { gt: expect.any(Date) } }],
+          },
+        }),
+      );
+      expect(db.mcpPersonalToken.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: "token-1" },
+          data: { scopes: ["mcp:read", "mcp:write"], allowCliCommands: true },
+        }),
+      );
+      expect(cancelMcpTokenCommands).not.toHaveBeenCalled();
+    });
+
+    it("cancels running CLI commands after commit when CLI commands are removed", async () => {
+      const events: string[] = [];
+      db.$transaction.mockImplementation(async (work: unknown) => {
+        events.push("begin");
+        const result = await (work as (tx: unknown) => Promise<unknown>)(prisma);
+        events.push("commit");
+        return result;
+      });
+      db.mcpPersonalToken.findFirst.mockResolvedValue(
+        existing({ scopes: ["mcp:read", "mcp:write"], allowCliCommands: true }),
+      );
+      mockUpdateEcho();
+      const cancelMcpTokenCommands = vi.fn(() => {
+        events.push("cancel");
+      });
+      const client = createRouterClient(mcpTokensRouter, {
+        context: { ...buildContext(), services: { cancelMcpTokenCommands } },
+      });
+
+      await expect(
+        client.updateMine({ id: "token-1", allowWrite: true, allowCliCommands: false }),
+      ).resolves.toMatchObject({ scopes: ["mcp:read", "mcp:write"], allowCliCommands: false });
+      expect(cancelMcpTokenCommands).toHaveBeenCalledTimes(1);
+      expect(cancelMcpTokenCommands).toHaveBeenCalledWith("token-1");
+      expect(events).toEqual(["begin", "commit", "cancel"]);
+    });
+
+    it("cancels running CLI commands when write access is removed", async () => {
+      db.mcpPersonalToken.findFirst.mockResolvedValue(
+        existing({ scopes: ["mcp:read", "mcp:write"] }),
+      );
+      mockUpdateEcho();
+      const cancelMcpTokenCommands = vi.fn();
+      const client = createRouterClient(mcpTokensRouter, {
+        context: { ...buildContext(), services: { cancelMcpTokenCommands } },
+      });
+
+      await expect(
+        client.updateMine({ id: "token-1", allowWrite: false, allowCliCommands: false }),
+      ).resolves.toMatchObject({ scopes: ["mcp:read"], allowCliCommands: false });
+      expect(cancelMcpTokenCommands).toHaveBeenCalledWith("token-1");
+    });
+
+    it("does not cancel commands for an unchanged save", async () => {
+      db.mcpPersonalToken.findFirst.mockResolvedValue(
+        existing({ scopes: ["mcp:read", "mcp:write"], allowCliCommands: true }),
+      );
+      mockUpdateEcho();
+      const cancelMcpTokenCommands = vi.fn();
+      const client = createRouterClient(mcpTokensRouter, {
+        context: { ...buildContext(), services: { cancelMcpTokenCommands } },
+      });
+      await client.updateMine({ id: "token-1", allowWrite: true, allowCliCommands: true });
+      expect(cancelMcpTokenCommands).not.toHaveBeenCalled();
+    });
+
+    it("hides unknown, foreign, revoked, expired, and grant-revoked tokens as not found", async () => {
+      // The active-token where clause filters every one of those cases, so the
+      // in-transaction lookup returns null for all of them.
+      db.mcpPersonalToken.findFirst.mockResolvedValue(null);
+      const cancelMcpTokenCommands = vi.fn();
+      const client = createRouterClient(mcpTokensRouter, {
+        context: { ...buildContext(), services: { cancelMcpTokenCommands } },
+      });
+      await expect(
+        client.updateMine({ id: "token-1", allowWrite: false, allowCliCommands: false }),
+      ).rejects.toSatisfy((error: ORPCError) => {
+        expect(error).toBeInstanceOf(ORPCError);
+        expect(error.code).toBe("NOT_FOUND");
+        return true;
+      });
+      expect(db.mcpPersonalToken.update).not.toHaveBeenCalled();
+      expect(cancelMcpTokenCommands).not.toHaveBeenCalled();
+    });
+
+    it("refuses to widen capabilities while MCP is disabled", async () => {
+      envMock.WMP_MCP_ENABLED = false;
+      db.mcpPersonalToken.findFirst.mockResolvedValue(
+        existing({ scopes: ["mcp:read", "mcp:write"] }),
+      );
+      const client = createRouterClient(mcpTokensRouter, { context: buildContext() });
+      await expect(
+        client.updateMine({ id: "token-1", allowWrite: true, allowCliCommands: true }),
+      ).rejects.toSatisfy((error: ORPCError) => {
+        expect(error).toBeInstanceOf(ORPCError);
+        expect(error.code).toBe("FORBIDDEN");
+        return true;
+      });
+      expect(db.mcpPersonalToken.update).not.toHaveBeenCalled();
+    });
+
+    it("still allows narrowing while MCP is disabled", async () => {
+      envMock.WMP_MCP_ENABLED = false;
+      db.mcpPersonalToken.findFirst.mockResolvedValue(
+        existing({ scopes: ["mcp:read", "mcp:write"], allowCliCommands: true }),
+      );
+      mockUpdateEcho();
+      const cancelMcpTokenCommands = vi.fn();
+      const client = createRouterClient(mcpTokensRouter, {
+        context: { ...buildContext(), services: { cancelMcpTokenCommands } },
+      });
+      await expect(
+        client.updateMine({ id: "token-1", allowWrite: false, allowCliCommands: false }),
+      ).resolves.toMatchObject({ scopes: ["mcp:read"], allowCliCommands: false });
+      expect(cancelMcpTokenCommands).toHaveBeenCalledWith("token-1");
+    });
+
+    it("rejects CLI commands without write access before touching the database", async () => {
+      const client = createRouterClient(mcpTokensRouter, { context: buildContext() });
+      await expect(
+        client.updateMine({ id: "token-1", allowWrite: false, allowCliCommands: true }),
+      ).rejects.toSatisfy((error: ORPCError) => {
+        expect(error).toBeInstanceOf(ORPCError);
+        expect(error.code).toBe("BAD_REQUEST");
+        expect(JSON.stringify(error.data)).toContain("CLI commands require write access.");
+        return true;
+      });
+      expect(db.$transaction).not.toHaveBeenCalled();
+    });
+
+    it("requires authentication", async () => {
+      const client = createRouterClient(mcpTokensRouter, { context: buildContext(null) });
+      await expect(
+        client.updateMine({ id: "token-1", allowWrite: false, allowCliCommands: false }),
+      ).rejects.toSatisfy((error: ORPCError) => {
+        expect(error.code).toBe("UNAUTHORIZED");
+        return true;
+      });
+    });
   });
 });

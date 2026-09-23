@@ -10,6 +10,7 @@ import {
   clipboardTypesIncludeImage,
   wireTerminalCopyOut,
 } from "@/lib/terminal-copy-out";
+import { TERMINAL_FONT_FAMILY, TERMINAL_THEME } from "@/lib/terminal-theme";
 import {
   sameSize,
   shouldForwardTerminalData,
@@ -27,16 +28,6 @@ type XtermOptions = XtermHandlers & {
   /** Render at this PTY size (someone else is typing), or null to fit the box. */
   follow: TerminalSize | null;
 };
-
-function readTheme(element: HTMLElement): { foreground: string; background: string } {
-  // The pane around the scroll box carries the terminal colors. The box itself
-  // shades the area a smaller PTY leaves unused.
-  const style = getComputedStyle(element.parentElement ?? element);
-  return {
-    foreground: style.color || "#e7e7e7",
-    background: style.backgroundColor || "#101113",
-  };
-}
 
 export function useXterm(options: XtermOptions): {
   containerRef: RefCallback<HTMLDivElement>;
@@ -87,6 +78,9 @@ export function useXterm(options: XtermOptions): {
   const layout = useCallback(() => {
     const fit = fitRef.current;
     if (!fit) return;
+    // The dashboard hides the workspace (display: none) on other pages. Its
+    // box then has no size, and fitting it would resize the PTY for everyone.
+    if (termRef.current?.element?.closest("[hidden]")) return;
     const follow = followRef.current;
     if (!follow) {
       fit.fit();
@@ -107,10 +101,11 @@ export function useXterm(options: XtermOptions): {
     if (!container) return;
     const term = new Terminal({
       cursorBlink: true,
-      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-      fontSize: 14,
+      fontFamily: TERMINAL_FONT_FAMILY,
+      fontSize: 13,
+      lineHeight: 1.2,
       scrollback: 5000,
-      theme: readTheme(container),
+      theme: TERMINAL_THEME,
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
@@ -176,14 +171,10 @@ export function useXterm(options: XtermOptions): {
 
   const followCols = options.follow?.cols ?? null;
   const followRows = options.follow?.rows ?? null;
-  // Entering or leaving follow mode, or a new PTY size: lay out again.
+  // Entering or leaving follow mode, or a new PTY size: lay out again. Leaving
+  // follow mode fits the box; the fitted size then goes to the CLI.
   useEffect(() => {
-    if (!container) return;
-    if (followCols === null || followRows === null) {
-      // Leaving follow mode fits the box; the fitted size then goes to the CLI.
-      fitRef.current?.fit();
-      return;
-    }
+    if (!container || (followCols === null) !== (followRows === null)) return;
     layout();
   }, [container, followCols, followRows, layout]);
 

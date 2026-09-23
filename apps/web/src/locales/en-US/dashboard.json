@@ -231,7 +231,7 @@
   "terminals": {
     "title": "Terminals",
     "description": "Open a shell on one of your CLIs. Keystrokes stay encrypted between this browser and the CLI.",
-    "empty": "No terminals open. Start one from a CLI that allows browser terminals.",
+    "empty": "No terminals open",
     "emptyClis": "No CLI devices have registered yet.",
     "loading": "Loading terminals",
     "add": "New terminal",
@@ -255,7 +255,8 @@
       "otherTyping": "Someone else is typing",
       "viewers_one": "{{count}} viewer",
       "viewers_other": "{{count}} viewers",
-      "following": "Viewing at {{cols}}×{{rows}}. Type here to take over."
+      "following": "Viewing at {{cols}}×{{rows}}. Type here to take over.",
+      "size": "{{cols}}×{{rows}}"
     },
     "approvalTitle": "This CLI needs approval",
     "approvalInstructions": "Run this command on that machine, then open the terminal again.",
@@ -309,7 +310,15 @@
       "trustDescription": "Only continue if you ran `wsmp terminal fingerprint` on that machine and it matches. Otherwise someone may be intercepting your terminal.",
       "trustFailed": "The key could not be trusted. Reload and try again.",
       "keyChangedAgain": "The key changed again before it could be trusted. Nothing was pinned. Compare the new fingerprint and try again.",
-      "activeUnverified": "This CLI's identity is unverified. Update the CLI to verify it."
+      "activeUnverified": "This CLI's identity is unverified. Update the CLI to verify it.",
+      "attention": "A CLI's identity key needs review. Its terminals are blocked until you check it.",
+      "review": "Review"
+    },
+    "phase": {
+      "opening": "Connecting",
+      "live": "Connected",
+      "rejected": "Rejected",
+      "exited": "Ended"
     }
   },
   "nav": {
@@ -324,7 +333,10 @@
     "overview": "Overview",
     "pools": "Pools",
     "relayMetadata": "Relay metadata",
-    "terminals": "Terminals"
+    "terminals": "Terminals",
+    "openTerminals": "Open terminals",
+    "showTerminals": "Show open terminals",
+    "hideTerminals": "Hide open terminals"
   },
   "notices": {
     "region": "Notices",

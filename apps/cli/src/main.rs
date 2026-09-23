@@ -12,10 +12,11 @@ use clap::Parser;
 
 use wsmp::cli::{Cli, Command};
 use wsmp::exit::ExitCode;
-use wsmp::{commands, exit, logging, output, shutdown};
+use wsmp::{commands, exit, logging, output, shutdown, tls};
 
 fn main() {
     let cli = Cli::parse();
+    tls::install_crypto_provider();
     logging::init(cli.log_format, cli.verbose, cli.quiet);
 
     let code = match run(&cli) {

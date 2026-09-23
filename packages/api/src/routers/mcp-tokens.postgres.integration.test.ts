@@ -231,6 +231,41 @@ integration("MCP personal tokens with real PostgreSQL", () => {
     expect(revokedAgain.revokedAt?.toISOString()).toBe(revoked.revokedAt?.toISOString());
   });
 
+  it("updateMine edits capabilities for the next authentication and refuses revoked tokens", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const user = await createFixtureUser("update");
+    const other = await createFixtureUser("update-other");
+    const client = buildClient(sessionFor(user));
+    const otherClient = buildClient(sessionFor(other));
+
+    const created = await client.create({ name: "Laptop", allowWrite: false });
+    const widened = await client.updateMine({
+      id: created.token.id,
+      allowWrite: true,
+      allowCliCommands: true,
+    });
+    expect(widened).toMatchObject({ scopes: ["mcp:read", "mcp:write"], allowCliCommands: true });
+    expect(
+      await modules.access.authenticateMcpPersonalToken(created.secret, new Date()),
+    ).toMatchObject({ scopes: ["mcp:read", "mcp:write"], allowCliCommands: true });
+
+    await expect(
+      otherClient.updateMine({ id: created.token.id, allowWrite: false, allowCliCommands: false }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+
+    const narrowed = await client.updateMine({
+      id: created.token.id,
+      allowWrite: false,
+      allowCliCommands: false,
+    });
+    expect(narrowed).toMatchObject({ scopes: ["mcp:read"], allowCliCommands: false });
+
+    await client.revokeMine({ id: created.token.id });
+    await expect(
+      client.updateMine({ id: created.token.id, allowWrite: true, allowCliCommands: false }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
   it("a grant-only tombstone hides the token from the active list", async () => {
     if (!modules) throw new Error("modules unavailable");
     const user = await createFixtureUser("grant-tombstone");

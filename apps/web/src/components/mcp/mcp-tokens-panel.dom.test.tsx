@@ -21,6 +21,8 @@ const state = vi.hoisted(() => ({
   revokeCalls: [] as unknown[],
   createCalls: [] as unknown[],
   createError: null as Error | null,
+  updateCalls: [] as unknown[],
+  updateError: null as Error | null,
 }));
 
 vi.mock("react-i18next", () => ({
@@ -70,6 +72,16 @@ vi.mock("@/utils/orpc", () => {
                 token: { id: "token-1" },
                 secret: "wsmp_mcp_secret",
               };
+            },
+            ...options,
+          }),
+        },
+        updateMine: {
+          mutationOptions: (options?: Record<string, unknown>) => ({
+            mutationFn: async (input: unknown) => {
+              state.updateCalls.push(input);
+              if (state.updateError) throw state.updateError;
+              return { id: "token-1" };
             },
             ...options,
           }),
@@ -169,6 +181,8 @@ afterEach(() => {
   state.revokeCalls = [];
   state.createCalls = [];
   state.createError = null;
+  state.updateCalls = [];
+  state.updateError = null;
 });
 
 describe("McpTokensPanel CLI commands", () => {
@@ -263,6 +277,134 @@ describe("McpTokensPanel CLI commands", () => {
     expect(input.allowWrite).toBe(true);
     expect(input.allowCliCommands).toBe(true);
     expectAboutNinetyDays(input.expiresAt);
+  });
+});
+
+describe("McpTokensPanel edit capabilities", () => {
+  async function openEdit(user: ReturnType<typeof userEvent.setup>) {
+    await user.click(await screen.findByRole("button", { name: "settings:mcp.tokens.edit" }));
+    return screen.getByRole("dialog");
+  }
+
+  it("offers edit only on active rows, prefilled from the token", async () => {
+    state.listPending = false;
+    state.listResult = [
+      { ...token, scopes: ["mcp:read", "mcp:write"], allowCliCommands: true },
+      { ...expiredToken, allowCliCommands: false },
+      { ...revokedToken, allowCliCommands: false },
+    ];
+    const user = userEvent.setup();
+    renderPanel(true, true);
+    await screen.findByText("Laptop Grok");
+    expect(screen.getAllByRole("button", { name: "settings:mcp.tokens.edit" })).toHaveLength(1);
+    const dialog = await openEdit(user);
+    expect(
+      within(dialog).getByText("settings:mcp.tokens.editDescription:Laptop Grok"),
+    ).toBeTruthy();
+    const write = within(dialog).getByRole("checkbox", { name: "settings:mcp.tokens.allowWrite" });
+    const cli = within(dialog).getByRole("checkbox", {
+      name: "settings:mcp.tokens.allowCliCommands",
+    });
+    expect(write.getAttribute("aria-checked")).toBe("true");
+    expect(cli.getAttribute("aria-checked")).toBe("true");
+    // Never-expiring token with CLI commands keeps the create-dialog warning.
+    expect(
+      within(dialog).getByText("settings:mcp.tokens.allowCliCommandsNoExpiryWarning"),
+    ).toBeTruthy();
+    expect(within(dialog).queryByText("settings:mcp.tokens.editNarrowOnly")).not.toBeTruthy();
+  });
+
+  it("widens a read-only token and saves through updateMine", async () => {
+    state.listPending = false;
+    state.listResult = [{ ...expiringToken, allowCliCommands: false }];
+    const user = userEvent.setup();
+    renderPanel();
+    const dialog = await openEdit(user);
+    const write = within(dialog).getByRole("checkbox", { name: "settings:mcp.tokens.allowWrite" });
+    expect(write.getAttribute("aria-checked")).not.toBe("true");
+    expect(
+      within(dialog).queryByRole("checkbox", { name: "settings:mcp.tokens.allowCliCommands" }),
+    ).not.toBeTruthy();
+    await user.click(write);
+    await user.click(
+      within(dialog).getByRole("checkbox", { name: "settings:mcp.tokens.allowCliCommands" }),
+    );
+    // Expiring token: no no-expiry warning.
+    expect(
+      within(dialog).queryByText("settings:mcp.tokens.allowCliCommandsNoExpiryWarning"),
+    ).not.toBeTruthy();
+    const save = within(dialog).getByRole("button", { name: "settings:mcp.tokens.save" });
+    expect(save.className).toContain("min-h-[44px]");
+    await user.click(save);
+    await waitFor(() => {
+      expect(state.updateCalls).toEqual([
+        { id: "token-3", allowWrite: true, allowCliCommands: true },
+      ]);
+    });
+    await waitFor(() => {
+      expect(toast.success).toHaveBeenCalledWith("settings:mcp.tokens.updated");
+    });
+  });
+
+  it("clears CLI commands when write is removed before saving", async () => {
+    state.listPending = false;
+    state.listResult = [{ ...token, scopes: ["mcp:read", "mcp:write"], allowCliCommands: true }];
+    const user = userEvent.setup();
+    renderPanel();
+    const dialog = await openEdit(user);
+    await user.click(
+      within(dialog).getByRole("checkbox", { name: "settings:mcp.tokens.allowWrite" }),
+    );
+    await user.click(within(dialog).getByRole("button", { name: "settings:mcp.tokens.save" }));
+    await waitFor(() => {
+      expect(state.updateCalls).toEqual([
+        { id: "token-1", allowWrite: false, allowCliCommands: false },
+      ]);
+    });
+  });
+
+  it("allows only narrowing while MCP is disabled", async () => {
+    state.listPending = false;
+    state.listResult = [{ ...token, scopes: ["mcp:read", "mcp:write"], allowCliCommands: false }];
+    const user = userEvent.setup();
+    renderPanel(false);
+    const dialog = await openEdit(user);
+    expect(within(dialog).getByText("settings:mcp.tokens.editNarrowOnly")).toBeTruthy();
+    const write = within(dialog).getByRole("checkbox", { name: "settings:mcp.tokens.allowWrite" });
+    const cli = within(dialog).getByRole("checkbox", {
+      name: "settings:mcp.tokens.allowCliCommands",
+    });
+    // Existing write stays removable; CLI commands the token never had cannot be added.
+    expect(write.hasAttribute("data-disabled")).toBe(false);
+    expect(cli.hasAttribute("data-disabled")).toBe(true);
+    await user.click(write);
+    // Re-adding a capability the token already had is not a widening.
+    await user.click(write);
+    expect(write.getAttribute("aria-checked")).toBe("true");
+    await user.click(write);
+    await user.click(within(dialog).getByRole("button", { name: "settings:mcp.tokens.save" }));
+    await waitFor(() => {
+      expect(state.updateCalls).toEqual([
+        { id: "token-1", allowWrite: false, allowCliCommands: false },
+      ]);
+    });
+  });
+
+  it("maps a FORBIDDEN update to the expand-refused toast and keeps the dialog open", async () => {
+    state.listPending = false;
+    state.listResult = [{ ...token, allowCliCommands: false }];
+    state.updateError = Object.assign(new Error("forbidden"), { code: "FORBIDDEN", status: 403 });
+    const user = userEvent.setup();
+    renderPanel();
+    const dialog = await openEdit(user);
+    await user.click(
+      within(dialog).getByRole("checkbox", { name: "settings:mcp.tokens.allowWrite" }),
+    );
+    await user.click(within(dialog).getByRole("button", { name: "settings:mcp.tokens.save" }));
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalledWith("settings:mcp.tokens.updateForbidden");
+    });
+    expect(screen.getByRole("dialog")).toBeTruthy();
   });
 });
 

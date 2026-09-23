@@ -337,6 +337,7 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
       "mcpGrants.revokeMine",
       "mcpTokens.listMine",
       "mcpTokens.create",
+      "mcpTokens.updateMine",
       "mcpTokens.revokeMine",
       "forwarderManagement.setCliDeviceFeatureGrants",
     ]) {
@@ -374,6 +375,7 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
       "mcpGrants.revokeMine",
       "mcpTokens.listMine",
       "mcpTokens.create",
+      "mcpTokens.updateMine",
       "mcpTokens.revokeMine",
     ]) {
       expect(toolTargets).not.toContain(leaf);

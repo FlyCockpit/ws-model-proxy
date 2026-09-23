@@ -231,7 +231,7 @@
   "terminals": {
     "title": "Terminales",
     "description": "Abre un shell en uno de tus CLIs. Las pulsaciones van cifradas entre este navegador y el CLI.",
-    "empty": "No hay terminales abiertas. Inicia una desde un CLI que permita terminales del navegador.",
+    "empty": "No hay terminales abiertas",
     "emptyClis": "Todavía no se ha registrado ningún dispositivo CLI.",
     "loading": "Cargando terminales",
     "add": "Nueva terminal",
@@ -255,7 +255,8 @@
       "otherTyping": "Alguien más está escribiendo",
       "viewers_one": "{{count}} espectador",
       "viewers_other": "{{count}} espectadores",
-      "following": "Viendo a {{cols}}×{{rows}}. Escribe aquí para tomar el control."
+      "following": "Viendo a {{cols}}×{{rows}}. Escribe aquí para tomar el control.",
+      "size": "{{cols}}×{{rows}}"
     },
     "approvalTitle": "Este CLI necesita aprobación",
     "approvalInstructions": "Ejecuta este comando en esa máquina y luego abre la terminal de nuevo.",
@@ -309,7 +310,15 @@
       "trustDescription": "Continúa solo si ejecutaste `wsmp terminal fingerprint` en esa máquina y coincide. De lo contrario, alguien podría estar interceptando tu terminal.",
       "trustFailed": "No se pudo confiar en la clave. Recarga e inténtalo de nuevo.",
       "keyChangedAgain": "La clave volvió a cambiar antes de poder confiar en ella. No se fijó nada. Compara la nueva huella e inténtalo de nuevo.",
-      "activeUnverified": "La identidad de esta CLI no está verificada. Actualiza la CLI para verificarla."
+      "activeUnverified": "La identidad de esta CLI no está verificada. Actualiza la CLI para verificarla.",
+      "attention": "La clave de identidad de una CLI necesita revisión. Sus terminales están bloqueadas hasta que la verifiques.",
+      "review": "Revisar"
+    },
+    "phase": {
+      "opening": "Conectando",
+      "live": "Conectada",
+      "rejected": "Rechazada",
+      "exited": "Finalizada"
     }
   },
   "nav": {
@@ -324,7 +333,10 @@
     "overview": "Resumen",
     "pools": "Grupos",
     "relayMetadata": "Metadatos de relay",
-    "terminals": "Terminales"
+    "terminals": "Terminales",
+    "openTerminals": "Terminales abiertas",
+    "showTerminals": "Mostrar terminales abiertas",
+    "hideTerminals": "Ocultar terminales abiertas"
   },
   "notices": {
     "region": "Avisos",

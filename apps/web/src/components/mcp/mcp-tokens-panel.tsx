@@ -47,7 +47,7 @@ import {
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { Copy, Eye, EyeOff, Plus } from "lucide-react";
+import { Copy, Eye, EyeOff, Pencil, Plus } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -58,6 +58,18 @@ import { orpc } from "@/utils/orpc";
 function tokenAllowsCliCommands(token: object): boolean {
   return Object.getOwnPropertyDescriptor(token, "allowCliCommands")?.value === true;
 }
+
+function tokenAllowsWrite(token: { scopes: readonly string[] }): boolean {
+  return token.scopes.includes("mcp:write");
+}
+
+type EditTarget = {
+  id: string;
+  name: string;
+  expiresAt: Date | string | null;
+  allowWrite: boolean;
+  allowCliCommands: boolean;
+};
 
 function copyToClipboard(value: string, message: string) {
   void navigator.clipboard.writeText(value).then(() => toast.success(message));
@@ -153,6 +165,12 @@ export function McpTokensPanel({
   const [secret, setSecret] = useState("");
   const [showRevoked, setShowRevoked] = useState(false);
   const [pendingRevokeId, setPendingRevokeId] = useState<string | null>(null);
+  // Snapshot of the token's capabilities when the edit dialog opened: the
+  // baseline for "is this a widening?" while MCP is disabled.
+  const [editTarget, setEditTarget] = useState<EditTarget | null>(null);
+  const [editOpen, setEditOpen] = useState(false);
+  const [editAllowWrite, setEditAllowWrite] = useState(false);
+  const [editAllowCliCommands, setEditAllowCliCommands] = useState(false);
 
   const {
     data: tokens,
@@ -183,6 +201,25 @@ export function McpTokensPanel({
       },
       onError: () => {
         toast.error(t("settings:mcp.tokens.revokeFailed"));
+      },
+    }),
+  );
+
+  const update = useMutation(
+    orpc.mcpTokens.updateMine.mutationOptions({
+      onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: orpc.mcpTokens.listMine.queryKey() });
+        toast.success(t("settings:mcp.tokens.updated"));
+        setEditOpen(false);
+      },
+      onError: (error) => {
+        toast.error(
+          t(
+            isForbidden(error)
+              ? "settings:mcp.tokens.updateForbidden"
+              : "settings:mcp.tokens.updateFailed",
+          ),
+        );
       },
     }),
   );
@@ -310,42 +347,16 @@ export function McpTokensPanel({
                           </p>
                         ) : null}
                       </div>
-                      <div className="flex min-h-[44px] items-start gap-3">
-                        <Checkbox
-                          id="mcp-token-write"
-                          checked={allowWrite}
-                          onCheckedChange={(checked) => {
-                            const next = checked === true;
-                            setAllowWrite(next);
-                            if (!next) setAllowCliCommands(false);
-                          }}
-                        />
-                        <div className="space-y-1">
-                          <Label htmlFor="mcp-token-write">
-                            {t("settings:mcp.tokens.allowWrite")}
-                          </Label>
-                          <p className="text-sm text-muted-foreground">
-                            {t("settings:mcp.tokens.allowWriteHelp")}
-                          </p>
-                        </div>
-                      </div>
-                      {allowWrite ? (
-                        <div className="flex min-h-[44px] items-start gap-3">
-                          <Checkbox
-                            id="mcp-token-cli-commands"
-                            checked={allowCliCommands}
-                            onCheckedChange={(checked) => setAllowCliCommands(checked === true)}
-                          />
-                          <div className="space-y-1">
-                            <Label htmlFor="mcp-token-cli-commands">
-                              {t("settings:mcp.tokens.allowCliCommands")}
-                            </Label>
-                            <p className="text-sm text-muted-foreground">
-                              {t("settings:mcp.tokens.allowCliCommandsHelp")}
-                            </p>
-                          </div>
-                        </div>
-                      ) : null}
+                      <TokenCapabilityFields
+                        idPrefix="mcp-token"
+                        allowWrite={allowWrite}
+                        allowCliCommands={allowCliCommands}
+                        onAllowWriteChange={(next) => {
+                          setAllowWrite(next);
+                          if (!next) setAllowCliCommands(false);
+                        }}
+                        onAllowCliCommandsChange={setAllowCliCommands}
+                      />
                       <div className="space-y-2">
                         <Label htmlFor="mcp-token-expiry">
                           {t("settings:mcp.tokens.expiryLabel")}
@@ -501,15 +512,41 @@ export function McpTokensPanel({
                         {token.lookupPrefix}…
                       </code>
                     </div>
-                    <Button
-                      type="button"
-                      variant="destructive"
-                      className="min-h-[44px] shrink-0"
-                      disabled={revoke.isPending || revoked}
-                      onClick={() => setPendingRevokeId(token.id)}
-                    >
-                      {t("settings:mcp.tokens.revoke")}
-                    </Button>
+                    <div className="flex shrink-0 flex-wrap gap-2">
+                      {revoked || expired ? null : (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          className="min-h-[44px]"
+                          onClick={() => {
+                            const tokenWrite = tokenAllowsWrite(token);
+                            const tokenCli = tokenWrite && tokenAllowsCliCommands(token);
+                            setEditTarget({
+                              id: token.id,
+                              name: token.name,
+                              expiresAt: token.expiresAt,
+                              allowWrite: tokenWrite,
+                              allowCliCommands: tokenCli,
+                            });
+                            setEditAllowWrite(tokenWrite);
+                            setEditAllowCliCommands(tokenCli);
+                            setEditOpen(true);
+                          }}
+                        >
+                          <Pencil className="size-4" />
+                          {t("settings:mcp.tokens.edit")}
+                        </Button>
+                      )}
+                      <Button
+                        type="button"
+                        variant="destructive"
+                        className="min-h-[44px]"
+                        disabled={revoke.isPending || revoked}
+                        onClick={() => setPendingRevokeId(token.id)}
+                      >
+                        {t("settings:mcp.tokens.revoke")}
+                      </Button>
+                    </div>
                   </div>
                   <ul className="flex flex-wrap gap-1.5">
                     {token.scopes.map((scope) => (
@@ -539,6 +576,78 @@ export function McpTokensPanel({
           </ul>
         )}
       </CardContent>
+
+      <Dialog
+        open={editOpen}
+        onOpenChange={(open) => {
+          if (!open && update.isPending) return;
+          setEditOpen(open);
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{t("settings:mcp.tokens.editTitle")}</DialogTitle>
+            <DialogDescription className="min-w-0 max-w-full break-words">
+              {t("settings:mcp.tokens.editDescription", { name: editTarget?.name ?? "" })}
+            </DialogDescription>
+          </DialogHeader>
+          <form
+            className="space-y-4"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (!editTarget || update.isPending) return;
+              update.mutate({
+                id: editTarget.id,
+                allowWrite: editAllowWrite,
+                allowCliCommands: editAllowWrite && editAllowCliCommands,
+              });
+            }}
+          >
+            {createEnabled ? null : (
+              <p className="text-sm text-muted-foreground" role="note">
+                {t("settings:mcp.tokens.editNarrowOnly")}
+              </p>
+            )}
+            <TokenCapabilityFields
+              idPrefix="mcp-token-edit"
+              allowWrite={editAllowWrite}
+              allowCliCommands={editAllowCliCommands}
+              // While MCP is disabled only the capabilities the token already
+              // had may stay on; the server refuses any widening.
+              canEnableWrite={createEnabled || editTarget?.allowWrite === true}
+              canEnableCliCommands={createEnabled || editTarget?.allowCliCommands === true}
+              onAllowWriteChange={(next) => {
+                setEditAllowWrite(next);
+                if (!next) setEditAllowCliCommands(false);
+              }}
+              onAllowCliCommandsChange={setEditAllowCliCommands}
+            />
+            {editTarget?.expiresAt === null && editAllowWrite && editAllowCliCommands ? (
+              <p className="text-sm text-destructive" role="status">
+                {t("settings:mcp.tokens.allowCliCommandsNoExpiryWarning")}
+              </p>
+            ) : null}
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                className="min-h-[44px]"
+                disabled={update.isPending}
+                onClick={() => setEditOpen(false)}
+              >
+                {t("common:actions.cancel")}
+              </Button>
+              <Button
+                type="submit"
+                className="min-h-[44px]"
+                disabled={update.isPending || editTarget === null}
+              >
+                {update.isPending ? t("settings:mcp.tokens.saving") : t("settings:mcp.tokens.save")}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
 
       <AlertDialog
         open={pendingRevokeId !== null}
@@ -579,6 +688,62 @@ export function McpTokensPanel({
         </AlertDialogContent>
       </AlertDialog>
     </Card>
+  );
+}
+
+function TokenCapabilityFields({
+  idPrefix,
+  allowWrite,
+  allowCliCommands,
+  canEnableWrite = true,
+  canEnableCliCommands = true,
+  onAllowWriteChange,
+  onAllowCliCommandsChange,
+}: {
+  idPrefix: string;
+  allowWrite: boolean;
+  allowCliCommands: boolean;
+  canEnableWrite?: boolean;
+  canEnableCliCommands?: boolean;
+  onAllowWriteChange: (next: boolean) => void;
+  onAllowCliCommandsChange: (next: boolean) => void;
+}) {
+  const { t } = useTranslation(["settings"]);
+  const writeId = `${idPrefix}-write`;
+  const cliId = `${idPrefix}-cli-commands`;
+
+  return (
+    <>
+      <div className="flex min-h-[44px] items-start gap-3">
+        <Checkbox
+          id={writeId}
+          checked={allowWrite}
+          // A checked box stays uncheckable so narrowing is always possible.
+          disabled={!allowWrite && !canEnableWrite}
+          onCheckedChange={(checked) => onAllowWriteChange(checked === true)}
+        />
+        <div className="space-y-1">
+          <Label htmlFor={writeId}>{t("settings:mcp.tokens.allowWrite")}</Label>
+          <p className="text-sm text-muted-foreground">{t("settings:mcp.tokens.allowWriteHelp")}</p>
+        </div>
+      </div>
+      {allowWrite ? (
+        <div className="flex min-h-[44px] items-start gap-3">
+          <Checkbox
+            id={cliId}
+            checked={allowCliCommands}
+            disabled={!allowCliCommands && !canEnableCliCommands}
+            onCheckedChange={(checked) => onAllowCliCommandsChange(checked === true)}
+          />
+          <div className="space-y-1">
+            <Label htmlFor={cliId}>{t("settings:mcp.tokens.allowCliCommands")}</Label>
+            <p className="text-sm text-muted-foreground">
+              {t("settings:mcp.tokens.allowCliCommandsHelp")}
+            </p>
+          </div>
+        </div>
+      ) : null}
+    </>
   );
 }
 

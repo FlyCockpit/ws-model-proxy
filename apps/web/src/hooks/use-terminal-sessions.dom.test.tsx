@@ -101,6 +101,14 @@ function sentOfType<T extends TerminalClientMessage["type"]>(type: T) {
     .filter((entry): entry is Extract<TerminalClientMessage, { type: T }> => entry.type === type);
 }
 
+/** `openCli` first asks for a fresh CLI list; answer it as the relay would. */
+async function openAfterList(open: () => void, clis: ListedCli[]) {
+  const before = sentOfType("list").length;
+  act(open);
+  await waitFor(() => expect(sentOfType("list")).toHaveLength(before + 1));
+  message({ type: "terminals", clis, terminals: [] });
+}
+
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -472,12 +480,13 @@ describe("useTerminalSessions open closed before its acknowledgement", () => {
   it("closes the shell when `opening` arrives for a tab already closed", async () => {
     currentCli = await fakeCli();
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
-    message({ type: "terminals", clis: [await listedCli(currentCli, true)], terminals: [] });
+    const listed = await listedCli(currentCli, true);
+    message({ type: "terminals", clis: [listed], terminals: [] });
     // Acks match opens in send order, and key generation can finish in either
     // order, so send the first open before starting the second.
-    act(() => view.result.current.openCli(CLI_ID));
+    await openAfterList(() => view.result.current.openCli(CLI_ID), [listed]);
     await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
-    act(() => view.result.current.openCli(CLI_ID));
+    await openAfterList(() => view.result.current.openCli(CLI_ID), [listed]);
     await waitFor(() => expect(sentOfType("open")).toHaveLength(2));
     const [closed, kept] = view.result.current.tabs;
     if (!closed || !kept) throw new Error("no tabs");
@@ -992,7 +1001,7 @@ describe("useTerminalSessions terminals gone while disconnected", () => {
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
     act(() => handlers().onOpen?.());
     message({ type: "terminals", clis: [listed], terminals: [] });
-    act(() => view.result.current.openCli(CLI_ID));
+    await openAfterList(() => view.result.current.openCli(CLI_ID), [listed]);
     await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
 
     // A new socket asks for the list, then the relay acknowledges the open.
@@ -1006,5 +1015,56 @@ describe("useTerminalSessions terminals gone while disconnected", () => {
       phase: "opening",
       error: null,
     });
+  });
+});
+
+describe("useTerminalSessions CLI list refresh", () => {
+  it("opens a CLI that came online after the last list", async () => {
+    currentCli = await fakeCli();
+    const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
+    // Connected before the CLI came online: the relay listed no CLIs.
+    message({ type: "terminals", clis: [], terminals: [] });
+
+    act(() => view.result.current.openCli(CLI_ID));
+    await waitFor(() => expect(sentOfType("list")).toHaveLength(1));
+    // Nothing opens until the fresh list arrives.
+    expect(sentOfType("open")).toEqual([]);
+    expect(view.result.current.tabs).toEqual([]);
+
+    message({ type: "terminals", clis: [await listedCli(currentCli, true)], terminals: [] });
+    await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
+    expect(view.result.current.tabs).toEqual([
+      expect.objectContaining({ cliDeviceId: CLI_ID, phase: "opening", rejectionReason: null }),
+    ]);
+  });
+
+  it("keeps a terminal closed with X out of later lists", async () => {
+    const { view, localId } = await setupV2();
+    const listed = await listedCli(requireCli(), true);
+    act(() => view.result.current.detachTab(localId));
+    expect(sentOfType("detach")).toEqual([{ type: "detach", terminalId: TERMINAL_ID }]);
+    expect(view.result.current.tabs).toEqual([]);
+
+    // Opening the picker refreshes the list. The shell still runs, so the
+    // relay names it; it must not come back as a tab or take a viewer slot.
+    const attaches = sentOfType("attach").length;
+    await act(async () => {
+      const refreshed = view.result.current.refreshClis();
+      handlers().onMessage({
+        type: "terminals",
+        clis: [listed],
+        terminals: [listedTerminal(true)],
+      });
+      await refreshed;
+    });
+    expect(view.result.current.tabs).toEqual([]);
+    expect(sentOfType("attach")).toHaveLength(attaches);
+
+    // Once it ends (no longer listed), a new terminal with that id is shown.
+    message({ type: "terminals", clis: [listed], terminals: [] });
+    message({ type: "terminals", clis: [listed], terminals: [listedTerminal(true)] });
+    expect(view.result.current.tabs).toEqual([
+      expect.objectContaining({ terminalId: TERMINAL_ID }),
+    ]);
   });
 });

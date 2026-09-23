@@ -60,7 +60,13 @@ ureq = { version = "3", features = ["json"] }
 sha2 = "0.11"
 # Async HTTP transport permits cancellation to interrupt connect, upload, and
 # response reads instead of merely setting a flag beside a blocking request.
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+# `rustls-no-provider`: ureq already compiles in rustls's `ring` provider, and a
+# second provider (reqwest's `rustls` feature pulls in aws-lc-rs) stops rustls
+# from choosing one, so `wss://` connects panic. `wsmp::tls` installs ring.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
+# Named directly only to install the process-wide `ring` crypto provider (see
+# `wsmp::tls`); default features would add aws-lc-rs back.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "net", "io-util"] }
 # The `Stream` trait lets a request body remain credit-paced while reqwest owns
 # the cancellable connection future.

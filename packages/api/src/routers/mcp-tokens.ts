@@ -35,8 +35,9 @@ import { runSerializableTransaction } from "../lib/serializable-transaction";
  * MCP_TOOL_EXCLUSIONS). Create is gated on WMP_MCP_ENABLED and capped at
  * MCP_PAT_MAX_ACTIVE_PER_USER active tokens per user; list/revoke stay
  * available during an emergency MCP shutdown so outstanding tokens can be
- * killed (invariant 13). An omitted expiresAt lasts 90 days
- * (mcpPatOmittedExpiresAt). An explicit null is no expiry and requires
+ * killed (invariant 13). updateMine edits an active token's capabilities:
+ * narrowing is always allowed, widening is gated on WMP_MCP_ENABLED. An
+ * omitted expiresAt lasts 90 days (mcpPatOmittedExpiresAt). An explicit null is no expiry and requires
  * WMP_MCP_PAT_ALLOW_NO_EXPIRY at mint time; a client-chosen timestamp is
  * allowed under the MCP_PAT_MAX_TTL_DAYS cap. Existing tokens are unaffected
  * by the flag or the default. listMine defaults to
@@ -90,6 +91,20 @@ function resolveRequestedScopes(allowWrite: boolean): string[] {
   return allowWrite ? ["mcp:read", "mcp:write"] : ["mcp:read"];
 }
 
+// CLI commands can change a device, so a read-only token cannot opt in.
+function requireWriteForCliCommands(
+  value: { allowWrite: boolean; allowCliCommands: boolean },
+  ctx: z.RefinementCtx,
+): void {
+  if (value.allowCliCommands && !value.allowWrite) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["allowCliCommands"],
+      message: "CLI commands require write access.",
+    });
+  }
+}
+
 function newPersonalTokenId(): string {
   return randomBytes(16).toString("hex");
 }
@@ -129,14 +144,7 @@ export const mcpTokensRouter = {
         })
         .superRefine((value, ctx) => {
           validateTokenExpiry(value.expiresAt, ctx);
-          // CLI commands can change a device, so a read-only token cannot opt in.
-          if (value.allowCliCommands && !value.allowWrite) {
-            ctx.addIssue({
-              code: "custom",
-              path: ["allowCliCommands"],
-              message: "CLI commands require write access.",
-            });
-          }
+          requireWriteForCliCommands(value, ctx);
         }),
     )
     .handler(async ({ input, context }) => {
@@ -204,6 +212,66 @@ export const mcpTokensRouter = {
         token: serializeToken(token),
         secret,
       };
+    }),
+
+  /**
+   * Edits the capabilities of an ACTIVE token (scopes + allowCliCommands).
+   * The secret, name, and expiry are immutable. Narrowing is always allowed —
+   * including during an emergency MCP shutdown — while widening (adding write
+   * or CLI commands) requires WMP_MCP_ENABLED like create. Admission reads the
+   * row on every request, so edits apply from the next request; running CLI
+   * commands started under the old capabilities are cancelled after commit
+   * when the edit narrows.
+   */
+  updateMine: protectedProcedure
+    .input(
+      z
+        .object({
+          id: z.string().min(1),
+          allowWrite: z.boolean(),
+          allowCliCommands: z.boolean(),
+        })
+        .superRefine(requireWriteForCliCommands),
+    )
+    .handler(async ({ input, context }) => {
+      const userId = context.session.user.id;
+      const nextScopes = resolveRequestedScopes(input.allowWrite);
+
+      const { row, narrowed } = await runSerializableTransaction(async (tx) => {
+        // Ownership + liveness in one in-transaction read: unknown, foreign,
+        // revoked, expired, and grant-revoked tokens are all NOT_FOUND.
+        const existing = await tx.mcpPersonalToken.findFirst({
+          where: { id: input.id, ...activeMcpPersonalTokenWhere(userId, new Date()) },
+          select: { id: true, scopes: true, allowCliCommands: true },
+        });
+        if (!existing) {
+          throw new ORPCError("NOT_FOUND", { message: "MCP token not found." });
+        }
+
+        const hadWrite = existing.scopes.includes("mcp:write");
+        const widened =
+          (input.allowWrite && !hadWrite) || (input.allowCliCommands && !existing.allowCliCommands);
+        if (widened && env.WMP_MCP_ENABLED !== true) {
+          throw new ORPCError("FORBIDDEN", {
+            message: "MCP token capabilities cannot be expanded while MCP is disabled.",
+          });
+        }
+
+        const updated = await tx.mcpPersonalToken.update({
+          where: { id: existing.id },
+          data: { scopes: nextScopes, allowCliCommands: input.allowCliCommands },
+          select: mcpPersonalTokenSelection,
+        });
+        return {
+          row: updated,
+          narrowed:
+            (hadWrite && !input.allowWrite) ||
+            (existing.allowCliCommands && !input.allowCliCommands),
+        };
+      });
+
+      if (narrowed) context.services?.cancelMcpTokenCommands?.(row.id);
+      return serializeToken(row);
     }),
 
   revokeMine: protectedProcedure

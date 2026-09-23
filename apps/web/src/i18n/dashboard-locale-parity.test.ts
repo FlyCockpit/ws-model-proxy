@@ -61,6 +61,11 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
       "status.viewers_one",
       "status.viewers_other",
       "status.following",
+      "status.size",
+      "phase.opening",
+      "phase.live",
+      "phase.rejected",
+      "phase.exited",
       "approvalTitle",
       "approvalInstructions",
       "approvalCodeLabel",
@@ -109,6 +114,8 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
       "identity.trustFailed",
       "identity.keyChangedAgain",
       "identity.activeUnverified",
+      "identity.attention",
+      "identity.review",
     ].sort();
     const featureKeys = [
       "terminal",
@@ -127,6 +134,8 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
     expect(esDashboard.nav.terminals).toBeTruthy();
     expect(enDashboard.nav.collapseSidebar).toBeTruthy();
     expect(esDashboard.nav.expandSidebar).toBeTruthy();
+    expect(enDashboard.nav.openTerminals).toBeTruthy();
+    expect(esDashboard.nav.showTerminals).toBeTruthy();
   });
 
   it("labels chat-test routing without a Chat-only API and as this test only", () => {

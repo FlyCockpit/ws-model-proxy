@@ -164,6 +164,7 @@ fn upstream_http_client() -> Result<&'static reqwest::Client> {
     if let Some(client) = UPSTREAM_HTTP_CLIENT.get() {
         return Ok(client);
     }
+    crate::tls::install_crypto_provider();
     let client = reqwest::Client::builder()
         .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
         // Redirects are an execution boundary: replaying configured credentials
@@ -2425,6 +2426,7 @@ fn send_media_error(
 /// 3xx response visible to `fetch_media` as a `Status` error rather than chasing
 /// its `Location` header.
 fn build_media_fetch_client() -> Result<reqwest::Client> {
+    crate::tls::install_crypto_provider();
     reqwest::Client::builder()
         .timeout(RELAY_MEDIA_FETCH_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())

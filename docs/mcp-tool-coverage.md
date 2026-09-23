@@ -81,6 +81,7 @@ fails the suite when a leaf is unclassified.
 | `mcpTokens.create` | — (excluded) | — | — | — | — | — | Returns the one-time raw MCP personal-token secret; human-only browser session. |
 | `mcpTokens.listMine` | — (excluded) | — | — | — | — | — | Human-only MCP personal-token management: a connected MCP client must not enumerate the user's other credentials. |
 | `mcpTokens.revokeMine` | — (excluded) | — | — | — | — | — | Human-only MCP personal-token revocation: only the browser session may kill PAT generations. |
+| `mcpTokens.updateMine` | — (excluded) | — | — | — | — | — | Human-only MCP personal-token capability edits: a connected MCP client must not widen or narrow its own or other credentials. |
 | `modelApiTokens.create` | — (excluded) | — | — | — | — | — | Returns the one-time raw token secret. |
 | `modelApiTokens.list` | `model_api_tokens_list` | read | — | pure | — | — | — |
 | `modelApiTokens.preview` | `model_api_tokens_preview` | read | — | pure | — | — | — |

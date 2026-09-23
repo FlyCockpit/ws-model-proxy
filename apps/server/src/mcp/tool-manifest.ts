@@ -1267,6 +1267,11 @@ export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
     reason: "human-only dashboard notices",
   },
   {
+    target: "mcpTokens.updateMine",
+    reason:
+      "Human-only MCP personal-token capability edits: a connected MCP client must not widen or narrow its own or other credentials.",
+  },
+  {
     target: "mcpTokens.revokeMine",
     reason:
       "Human-only MCP personal-token revocation: only the browser session may kill PAT generations.",

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useLatestRef } from "@/hooks/use-latest-ref";
 import {
   assertIncreasingTerminalSeq,
   base64UrlToBytes,
@@ -70,6 +71,8 @@ const INPUT_DROPPED_NOTICE_MS = 5_000;
 /** Frames that arrive before the handshake finishes. Covers a full scrollback replay. */
 const EARLY_FRAME_QUEUE = 64;
 const OUTPUT_BUFFER_EVENTS = 256;
+/** Open a terminal anyway if the relay does not answer a CLI list request. */
+const CLI_LIST_REFRESH_TIMEOUT_MS = 5_000;
 /** Refusals that "Trust new key" can lift. A key swapped mid-handshake cannot. */
 const IDENTITY_RETRY_REASONS = new Set(["identity_changed", "identity_invalid"]);
 /** The CLI refuses a handshake that carries no browser identity with this reason. */
@@ -222,6 +225,12 @@ function newTab(input: {
 export type UseTerminalSessionsOptions = {
   /** Pinned CLI identity keys. Defaults to IndexedDB. */
   pinStore?: CliPinStore;
+  /**
+   * Connect to the relay. Connecting attaches every listed terminal, taking a
+   * viewer slot on each, so wait until terminals are actually wanted.
+   * Defaults to true.
+   */
+  enabled?: boolean;
 };
 
 export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
@@ -240,7 +249,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   tabs: TerminalTab[];
   activeLocalId: string | null;
   selectTab: (localId: string) => void;
+  /** Refreshes the CLI list first, so a CLI that just came online can open. */
   openCli: (cliDeviceId: string) => void;
+  /** Ask the relay for the current CLI list; resolves when it arrives (or times out). */
+  refreshClis: () => Promise<void>;
   /** X button: stop viewing. The shell keeps running for other viewers. */
   detachTab: (localId: string) => void;
   /** End session: close the shell for everyone. */
@@ -333,6 +345,14 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const listSeqRef = useRef(0);
   /** `list` requests on this socket whose `terminals` answer has not arrived. */
   const listRequestsRef = useRef<number[]>([]);
+  /**
+   * Terminals this page stopped viewing with X. Their shells keep running, so
+   * every later list names them; they must not come back as tabs (and take a
+   * viewer slot) until the page reloads.
+   */
+  const detachedRef = useRef(new Set<string>());
+  /** Callers of `refreshClis` waiting for the next terminal and CLI list. */
+  const listWaitersRef = useRef<(() => void)[]>([]);
   /**
    * terminalId -> `listSeqRef` when this page learned it. A list answers for a
    * terminal only when the terminal was known before that list was requested;
@@ -860,7 +880,12 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const onMessage = useCallback(
     (message: TerminalServerMessage) => {
       if (message.type === "terminals") {
-        reconcileListedTerminals(new Set(message.terminals.map((remote) => remote.terminalId)));
+        const listedIds = new Set(message.terminals.map((remote) => remote.terminalId));
+        reconcileListedTerminals(listedIds);
+        // A detached terminal that is no longer listed has ended; forget it.
+        for (const terminalId of detachedRef.current) {
+          if (!listedIds.has(terminalId)) detachedRef.current.delete(terminalId);
+        }
         cliListRef.current = new Map(message.clis.map((cli) => [cli.cliDeviceId, cli]));
         setClis(message.clis);
         for (const cli of message.clis) {
@@ -868,6 +893,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
           cliViewersRef.current.set(cli.cliDeviceId, cli.terminalViewers);
         }
         listReady.resolve();
+        for (const resolve of listWaitersRef.current.splice(0)) resolve();
         // Check every CLI now, so the page can show fingerprints and refusals.
         for (const cli of message.clis) void ensureTrust(cli.cliDeviceId);
         const additions: TerminalTab[] = [];
@@ -890,6 +916,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
             continue;
           }
           if (additions.some((tab) => tab.terminalId === remote.terminalId)) continue;
+          if (detachedRef.current.has(remote.terminalId)) continue;
           const tab = newTab({
             localId: newId("local"),
             terminalId: remote.terminalId,
@@ -1163,6 +1190,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
 
   const onDisconnect = useCallback(() => {
     generationRef.current += 1;
+    for (const resolve of listWaitersRef.current.splice(0)) resolve();
     for (const batch of inputRef.current.values()) {
       if (batch.timer) clearTimeout(batch.timer);
     }
@@ -1373,7 +1401,12 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     },
     [receiveV1, receiveV2, tabByTerminal],
   );
-  const socket = useTerminalSocket(true, { onMessage, onSealed, onOpen, onDisconnect });
+  const socket = useTerminalSocket(options.enabled ?? true, {
+    onMessage,
+    onSealed,
+    onOpen,
+    onDisconnect,
+  });
   // Layout effects run before the socket's passive connect effect, so these
   // are in place before any message arrives.
   useLayoutEffect(() => {
@@ -1407,7 +1440,25 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     [attach, canAttach],
   );
 
-  const openCli = useCallback(
+  const socketStatusRef = useLatestRef(socket.status);
+  const refreshClis = useCallback((): Promise<void> => {
+    if (socketStatusRef.current !== "open") return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(done, CLI_LIST_REFRESH_TIMEOUT_MS);
+      function done() {
+        clearTimeout(timer);
+        const waiters = listWaitersRef.current;
+        const index = waiters.indexOf(done);
+        if (index !== -1) waiters.splice(index, 1);
+        resolve();
+      }
+      listWaitersRef.current.push(done);
+      noteListRequest();
+      sendRef.current({ type: "list" });
+    });
+  }, [noteListRequest, socketStatusRef]);
+
+  const startOpen = useCallback(
     (cliDeviceId: string) => {
       if (!readyRef.current) return;
       const multiViewer = cliViewersRef.current.get(cliDeviceId) ?? false;
@@ -1436,6 +1487,16 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       });
     },
     [beginHandshake],
+  );
+
+  const openCli = useCallback(
+    (cliDeviceId: string) => {
+      if (!readyRef.current) return;
+      // The relay does not push CLI changes. A CLI that came online after the
+      // last list is missing from it, and its handshake would fail as offline.
+      void refreshClis().then(() => startOpen(cliDeviceId));
+    },
+    [refreshClis, startOpen],
   );
 
   const removeTab = useCallback(
@@ -1485,6 +1546,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         // An open that never went live has no other viewers: cancel it outright.
         const type = tab.opener && tab.phase !== "live" ? "close" : "detach";
         sendRef.current({ type, terminalId: tab.terminalId });
+        if (type === "detach") detachedRef.current.add(tab.terminalId);
       }
       removeTab(tab);
     },
@@ -1608,6 +1670,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     activeLocalId,
     selectTab,
     openCli,
+    refreshClis,
     detachTab,
     endSession,
     subscribeOutput,

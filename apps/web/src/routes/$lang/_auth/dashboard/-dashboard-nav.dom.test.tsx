@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import type { ComponentType, ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -15,16 +15,20 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
       children,
       className,
       to,
+      onClick,
     }: {
       children: ReactNode;
       className?: string;
       to: string;
+      onClick?: () => void;
     }) => (
-      <a className={className} href={to}>
+      <a className={className} href={to} onClick={onClick}>
         {children}
       </a>
     ),
     Outlet: () => <div data-testid="dashboard-outlet" />,
+    useMatchRoute: () => () => false,
+    useNavigate: () => router.navigate,
     createFileRoute: () => (options: { component?: ComponentType }) => ({
       ...options,
       useParams: () => ({ lang: "en-US" }),
@@ -54,6 +58,23 @@ vi.mock("@/utils/orpc", () => ({
   },
 }));
 
+const router = vi.hoisted(() => ({ navigate: (_options: object): void => undefined }));
+
+const workspace = vi.hoisted(() => ({
+  tabs: [] as { localId: string; phase: string; error: string | null; label: string }[],
+  selectTab: (_localId: string): void => undefined,
+}));
+
+vi.mock("@/hooks/use-terminal-workspace", () => ({
+  TerminalWorkspaceProvider: ({ children }: { children: ReactNode }) => children,
+  useTerminalWorkspace: () => ({
+    tabs: workspace.tabs,
+    activeLocalId: null,
+    selectTab: workspace.selectTab,
+    tabLabel: (tab: { label: string }) => tab.label,
+  }),
+}));
+
 import { DashboardFrame } from "@/components/dashboard-frame";
 
 function renderLayout() {
@@ -70,6 +91,7 @@ afterEach(() => {
   cleanup();
   localStorage.clear();
   useUiPreferences.setState({ sidebarCollapsed: false });
+  workspace.tabs = [];
 });
 
 describe("dashboard sidebar", () => {
@@ -96,5 +118,37 @@ describe("dashboard sidebar", () => {
     expect(aside.className).toContain("w-16");
     expect(aside.className).not.toContain("w-56");
     expect(screen.getByRole("button", { name: "dashboard:nav.expandSidebar" })).toBeTruthy();
+  });
+
+  it("lists open terminals under Terminals and selects one on click", () => {
+    const selectTab = vi.fn();
+    const navigate = vi.fn();
+    workspace.selectTab = selectTab;
+    router.navigate = navigate;
+    workspace.tabs = [
+      { localId: "a", phase: "live", error: null, label: "laptop" },
+      { localId: "b", phase: "opening", error: null, label: "build-server" },
+    ];
+    renderLayout();
+    const list = screen.getByRole("list", { name: "dashboard:nav.openTerminals" });
+    const entries = within(list).getAllByRole("button");
+    // Selection drives aria-current; nothing is selected off the Terminals page.
+    expect(entries.map((entry) => entry.getAttribute("aria-current"))).toEqual([null, null]);
+    fireEvent.click(within(list).getByRole("button", { name: "build-server" }));
+    expect(selectTab).toHaveBeenCalledWith("b");
+    expect(navigate).toHaveBeenCalledWith(
+      expect.objectContaining({ to: "/$lang/dashboard/terminals" }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:nav.hideTerminals" }));
+    expect(screen.queryByRole("list", { name: "dashboard:nav.openTerminals" })).toBeNull();
+  });
+
+  it("shows an open-terminal count on the collapsed sidebar", () => {
+    useUiPreferences.setState({ sidebarCollapsed: true });
+    workspace.tabs = [{ localId: "a", phase: "live", error: null, label: "laptop" }];
+    renderLayout();
+    expect(screen.queryByRole("list", { name: "dashboard:nav.openTerminals" })).toBeNull();
+    expect(screen.getByRole("complementary").textContent).toContain("1");
   });
 });
