@@ -7,7 +7,7 @@
 use anyhow::Result;
 
 use crate::config::Config;
-use crate::protocol::{CliCapabilities, TerminalFeatureSnapshot};
+use crate::protocol::{CliCapabilities, RelayProtocolMode, TerminalFeatureSnapshot};
 use crate::terminal_crypto::CliTerminalKey;
 
 pub struct TerminalStartup {
@@ -47,19 +47,26 @@ impl TerminalStartup {
         self.require_terminal_approval
     }
 
-    pub fn capabilities(&self) -> CliCapabilities {
-        CliCapabilities::from_snapshot(&TerminalFeatureSnapshot {
-            allow_human_terminal: self.allow_human_terminal,
-            allow_mcp_commands: self.allow_mcp_commands,
-            require_terminal_approval: self.require_terminal_approval,
-            terminal_public_key_b64url: self.key.public_b64url().to_string(),
-        })
+    pub fn capabilities(&self, mode: RelayProtocolMode) -> CliCapabilities {
+        CliCapabilities::from_snapshot(
+            &TerminalFeatureSnapshot {
+                allow_human_terminal: self.allow_human_terminal,
+                allow_mcp_commands: self.allow_mcp_commands,
+                require_terminal_approval: self.require_terminal_approval,
+                terminal_public_key_b64url: self.key.public_b64url().to_string(),
+            },
+            mode,
+        )
     }
 }
 
 /// Hello capabilities always come from the startup snapshot, never the live config.
-pub fn hello_capabilities(startup: &TerminalStartup, _live: &Config) -> CliCapabilities {
-    startup.capabilities()
+pub fn hello_capabilities(
+    startup: &TerminalStartup,
+    _live: &Config,
+    mode: RelayProtocolMode,
+) -> CliCapabilities {
+    startup.capabilities(mode)
 }
 
 #[cfg(test)]
@@ -79,7 +86,7 @@ mod tests {
         config.allow_human_terminal = false;
         config.allow_mcp_commands = false;
         config.require_terminal_approval = false;
-        let capabilities = hello_capabilities(&startup, &config);
+        let capabilities = hello_capabilities(&startup, &config, RelayProtocolMode::V25);
         assert!(capabilities.features.human_terminal);
         assert!(capabilities.features.mcp_commands);
         assert!(capabilities.features.terminal_approval);
@@ -87,5 +94,10 @@ mod tests {
         assert_eq!(capabilities.terminal_public_key, public_key);
         assert!(capabilities.terminal);
         assert!(capabilities.exec);
+        assert_eq!(capabilities.protocol_version, "2.5");
+        assert_eq!(capabilities.terminal_viewers, Some(true));
+        let legacy = hello_capabilities(&startup, &config, RelayProtocolMode::Legacy24);
+        assert_eq!(legacy.protocol_version, "2.4");
+        assert_eq!(legacy.terminal_viewers, None);
     }
 }

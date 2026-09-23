@@ -8,6 +8,14 @@
 //! for exec) and are stopped with `SIGKILL` to the group. Windows has no
 //! process-group kill: only the direct child is terminated, so grandchildren of
 //! an exec may survive.
+//!
+//! Protocol 2.5 terminals have many viewers. Each viewer has pairwise v2 keys
+//! for its input and for unicast frames (output-key delivery and its scrollback
+//! replay). Live output and PTY-size frames are sealed once under a shared
+//! per-terminal output key; the relay fans them out. The key rotates to a new
+//! epoch whenever a viewer leaves. The PTY size follows the writer, the viewer
+//! that most recently typed. Protocol 2.4 keeps one implicit viewer, v1 crypto,
+//! and attach-replaces-viewer.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
@@ -27,10 +35,12 @@ use crate::protocol::{
 use crate::relay_bus::FromWorker;
 use crate::startup::TerminalStartup;
 use crate::terminal_crypto::{
-    self, DIR_BROWSER_TO_CLI, DIR_CLI_TO_BROWSER, DirectionKeys, TermPlaintext,
+    self, DIR_BROWSER_TO_CLI, DIR_CLI_TO_BROWSER, DirectionKeys, TermPlaintext, TermPlaintextV2,
 };
 
 const MAX_TERMINALS: usize = 2;
+/// Attached viewers plus pending approvals, per terminal (protocol 2.5).
+const MAX_VIEWERS: usize = 8;
 const MAX_EXECS: usize = 2;
 const SCROLLBACK_LIMIT: usize = 256 * 1024;
 const READ_CHUNK: usize = 8 * 1024;
@@ -38,16 +48,22 @@ const SEAL_CHUNK: usize = 16 * 1024;
 const DEFAULT_IDLE: Duration = Duration::from_secs(15 * 60);
 pub(crate) const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const PENDING_TTL: Duration = Duration::from_secs(2 * 60);
+/// How often attached 2.5 viewers are re-checked against the approvals file.
+const APPROVAL_RECHECK: Duration = Duration::from_secs(5);
 const SEND_WAIT: Duration = Duration::from_millis(200);
 const READ_POLL: Duration = Duration::from_millis(200);
 /// After the child exits, keep the exec slot until both pipes report EOF, or
 /// this long, whichever comes first. A grandchild that holds a pipe must not
 /// stall the slot; the leftover bytes are then dropped.
 const EXEC_OUTPUT_DRAIN: Duration = Duration::from_millis(500);
+/// Map key for the single implicit viewer of a 2.4 (legacy) terminal. Never a
+/// valid wire viewer id, so it cannot collide with a 2.5 viewer.
+const LEGACY_VIEWER: &str = "";
 
 const REASON_DISABLED: &str = "disabled";
 const REASON_UNSUPPORTED: &str = "unsupported";
 const REASON_LIMIT: &str = "limit";
+const REASON_VIEWER_LIMIT: &str = "viewer_limit";
 const REASON_APPROVAL_REQUIRED: &str = "approval_required";
 const REASON_BAD_SIGNATURE: &str = "bad_signature";
 const REASON_BAD_COMMAND: &str = "bad_command";
@@ -56,6 +72,7 @@ const REASON_NOT_FOUND: &str = "not_found";
 const REASON_ALREADY_OPEN: &str = "already_open";
 const REASON_SPAWN_FAILED: &str = "spawn_failed";
 const REASON_BAD_HANDSHAKE: &str = "bad_handshake";
+const REASON_BAD_FRAME: &str = "bad_frame";
 const REASON_EXPIRED: &str = "expired";
 
 pub(crate) enum OutboundFrame {
@@ -63,19 +80,16 @@ pub(crate) enum OutboundFrame {
     Binary(RelayBinaryFrameMetadata, Vec<u8>),
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct TermHandshake<'a> {
     pub terminal_id: &'a str,
+    /// Minted by the server in protocol 2.5. `None` on a 2.4 relay.
+    pub viewer_id: Option<&'a str>,
     pub cols: u16,
     pub rows: u16,
     pub browser_public_key: &'a str,
     pub browser_nonce: &'a str,
     pub identity: Option<&'a TerminalIdentity>,
-}
-
-struct LiveCrypto {
-    keys: DirectionKeys,
-    last_rx: u64,
-    next_tx: u64,
 }
 
 enum Incoming {
@@ -86,7 +100,10 @@ enum Incoming {
     },
     /// Undecryptable or out-of-order sealed frames are dropped.
     Ignore,
+    /// 2.4: an authenticated frame with a bad payload closes the terminal.
     Close,
+    /// 2.5: an authenticated frame with a bad payload removes only its viewer.
+    DropViewer,
 }
 
 fn terminal_block_reason(supported: bool, allowed: bool, open: usize) -> Option<&'static str> {
@@ -309,10 +326,27 @@ fn approval_code_for_identity(state_dir: Option<&Path>, identity_raw: &[u8; 65])
     Some(code)
 }
 
+/// `false` only when the approvals file positively no longer maps this
+/// identity's code to it. A read error keeps the viewer.
+fn identity_still_approved(state_dir: &Path, identity_raw: &[u8; 65]) -> bool {
+    let code = terminal_crypto::approval_code(identity_raw);
+    match approved_public_key(state_dir, &code) {
+        Ok(Some(stored)) => stored == *identity_raw,
+        Ok(None) => false,
+        Err(error) => {
+            tracing::warn!(error = %error, "re-checking a terminal approval failed");
+            true
+        }
+    }
+}
+
+/// `viewer_id` selects the v2 transcript (protocol 2.5); `None` is v1.
+#[allow(clippy::too_many_arguments)]
 fn approval_signature_ok(
     identity_raw: &[u8; 65],
     signature: &str,
     terminal_id: &str,
+    viewer_id: Option<&str>,
     browser_public: &[u8; 65],
     browser_nonce: &[u8; 16],
     cli_public: &[u8; 65],
@@ -321,15 +355,27 @@ fn approval_signature_ok(
     let Ok(signature) = terminal_crypto::decode_exact(signature, 64) else {
         return false;
     };
-    terminal_crypto::verify_approval_signature(
-        identity_raw,
-        &signature,
-        terminal_id,
-        browser_public,
-        browser_nonce,
-        cli_public,
-        cli_nonce,
-    )
+    match viewer_id {
+        Some(viewer_id) => terminal_crypto::verify_approval_signature_v2(
+            identity_raw,
+            &signature,
+            terminal_id,
+            viewer_id,
+            browser_public,
+            browser_nonce,
+            cli_public,
+            cli_nonce,
+        ),
+        None => terminal_crypto::verify_approval_signature(
+            identity_raw,
+            &signature,
+            terminal_id,
+            browser_public,
+            browser_nonce,
+            cli_public,
+            cli_nonce,
+        ),
+    }
 }
 
 struct PreparedHandshake {
@@ -339,16 +385,25 @@ struct PreparedHandshake {
     browser_nonce: [u8; 16],
 }
 
-fn fresh_nonce(terminal_id: &str) -> Result<[u8; 16], Box<OutboundFrame>> {
+fn handshake_rejected(handshake: &TermHandshake<'_>, reason: &str) -> Box<OutboundFrame> {
+    Box::new(term_rejected(
+        handshake.terminal_id,
+        handshake.viewer_id,
+        reason,
+        None,
+    ))
+}
+
+fn fresh_nonce(handshake: &TermHandshake<'_>) -> Result<[u8; 16], Box<OutboundFrame>> {
     match terminal_crypto::random_nonce() {
         Ok(nonce) => Ok(nonce),
         Err(error) => {
-            tracing::warn!(error = %error, terminal_id, "generating a terminal nonce failed");
-            Err(Box::new(term_rejected(
-                terminal_id,
-                REASON_SPAWN_FAILED,
-                None,
-            )))
+            tracing::warn!(
+                error = %error,
+                terminal_id = handshake.terminal_id,
+                "generating a terminal nonce failed"
+            );
+            Err(handshake_rejected(handshake, REASON_SPAWN_FAILED))
         }
     }
 }
@@ -360,33 +415,16 @@ fn decode_browser_handshake(
         // Attach does not carry a size. The live pty keeps the size it has.
         (80, 24)
     } else if terminal_crypto::validate_size(handshake.cols, handshake.rows).is_err() {
-        return Err(Box::new(term_rejected(
-            handshake.terminal_id,
-            REASON_BAD_HANDSHAKE,
-            None,
-        )));
+        return Err(handshake_rejected(handshake, REASON_BAD_HANDSHAKE));
     } else {
         (handshake.cols, handshake.rows)
     };
-    let browser_public = match terminal_crypto::decode_public_key(handshake.browser_public_key) {
-        Ok(raw) => raw,
-        Err(_) => {
-            return Err(Box::new(term_rejected(
-                handshake.terminal_id,
-                REASON_BAD_HANDSHAKE,
-                None,
-            )));
-        }
+    let Ok(browser_public) = terminal_crypto::decode_public_key(handshake.browser_public_key)
+    else {
+        return Err(handshake_rejected(handshake, REASON_BAD_HANDSHAKE));
     };
-    let browser_nonce = match terminal_crypto::decode_nonce(handshake.browser_nonce) {
-        Ok(raw) => raw,
-        Err(_) => {
-            return Err(Box::new(term_rejected(
-                handshake.terminal_id,
-                REASON_BAD_HANDSHAKE,
-                None,
-            )));
-        }
+    let Ok(browser_nonce) = terminal_crypto::decode_nonce(handshake.browser_nonce) else {
+        return Err(handshake_rejected(handshake, REASON_BAD_HANDSHAKE));
     };
     Ok(PreparedHandshake {
         cols,
@@ -400,16 +438,7 @@ fn prepare_handshake(
     startup: &TerminalStartup,
     open_count: usize,
     handshake: &TermHandshake<'_>,
-    _attach: bool,
 ) -> Result<PreparedHandshake, Box<OutboundFrame>> {
-    let terminal_id = handshake.terminal_id;
-    if !valid_id(terminal_id) {
-        return Err(Box::new(term_rejected(
-            terminal_id,
-            REASON_BAD_HANDSHAKE,
-            None,
-        )));
-    }
     // A pending approval does not consume a live terminal slot.
     let counted = if startup.require_terminal_approval() {
         0
@@ -421,29 +450,62 @@ fn prepare_handshake(
         startup.allow_human_terminal(),
         counted,
     ) {
-        return Err(Box::new(term_rejected(terminal_id, reason, None)));
+        return Err(handshake_rejected(handshake, reason));
     }
     decode_browser_handshake(handshake)
 }
 
 fn term_pending(
     terminal_id: &str,
+    viewer_id: Option<&str>,
     cli_nonce: &str,
     approval_code: Option<String>,
 ) -> OutboundFrame {
     OutboundFrame::Control(ClientControlMessage::TermPending {
         terminal_id: terminal_id.to_string(),
+        viewer_id: viewer_id.map(str::to_string),
         cli_nonce: cli_nonce.to_string(),
         approval_code,
     })
 }
 
-fn term_rejected(terminal_id: &str, reason: &str, approval_code: Option<String>) -> OutboundFrame {
+fn term_rejected(
+    terminal_id: &str,
+    viewer_id: Option<&str>,
+    reason: &str,
+    approval_code: Option<String>,
+) -> OutboundFrame {
     OutboundFrame::Control(ClientControlMessage::TermRejected {
         terminal_id: terminal_id.to_string(),
+        viewer_id: viewer_id.map(str::to_string),
         reason: reason.to_string(),
         approval_code,
     })
+}
+
+fn term_writer(terminal_id: &str, writer: Option<&str>) -> OutboundFrame {
+    OutboundFrame::Control(ClientControlMessage::TermWriter {
+        terminal_id: terminal_id.to_string(),
+        viewer_id: writer.map(str::to_string),
+    })
+}
+
+fn sealed_frame(
+    terminal_id: &str,
+    seq: u64,
+    viewer_id: Option<&str>,
+    epoch: Option<u32>,
+    body: Vec<u8>,
+) -> OutboundFrame {
+    OutboundFrame::Binary(
+        RelayBinaryFrameMetadata::TermSealed {
+            terminal_id: terminal_id.to_string(),
+            seq,
+            viewer_id: viewer_id.map(str::to_string),
+            epoch,
+        },
+        body,
+    )
 }
 
 fn exec_rejected(command_id: &str, reason: &str) -> OutboundFrame {
@@ -567,18 +629,112 @@ fn shutdown_pty(mut runtime: PtyRuntime) -> (Option<i32>, Option<i32>) {
     status
 }
 
+/// Best-effort wipe of key material. No `unsafe` and no extra crates, so this
+/// is an overwrite the optimizer is discouraged (not forbidden) from removing.
+fn wipe(bytes: &mut [u8]) {
+    bytes.fill(0);
+    std::hint::black_box(&*bytes);
+}
+
+/// One browser tab. On a 2.4 terminal the single implicit viewer uses v1 keys.
+struct Viewer {
+    keys: DirectionKeys,
+    last_rx: u64,
+    next_tx: u64,
+    /// The viewer's own fitted size, from the open request or its last resize.
+    last_size: Option<(u16, u16)>,
+    /// The identity approved through `term.auth`. Re-checked so a revoke
+    /// removes the viewer.
+    approved_identity: Option<[u8; 65]>,
+}
+
+impl Viewer {
+    fn new(
+        keys: DirectionKeys,
+        last_size: Option<(u16, u16)>,
+        approved_identity: Option<[u8; 65]>,
+    ) -> Self {
+        Self {
+            keys,
+            last_rx: 0,
+            next_tx: 1,
+            last_size,
+            approved_identity,
+        }
+    }
+}
+
+impl Drop for Viewer {
+    fn drop(&mut self) {
+        wipe(&mut self.keys.browser_to_cli);
+        wipe(&mut self.keys.cli_to_browser);
+    }
+}
+
+/// The shared per-terminal output key. `(key, epoch, seq)` never repeats: a
+/// new epoch always gets a new random key and restarts `seq` at 1.
+struct OutputKey {
+    key: [u8; 32],
+    epoch: u32,
+    next_seq: u64,
+}
+
+impl OutputKey {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fn first() -> anyhow::Result<Self> {
+        Ok(Self {
+            key: terminal_crypto::random_output_key()?,
+            epoch: 1,
+            next_seq: 1,
+        })
+    }
+
+    fn rotate(&mut self) -> anyhow::Result<()> {
+        let Some(epoch) = self.epoch.checked_add(1) else {
+            anyhow::bail!("terminal output epoch is exhausted");
+        };
+        let mut key = terminal_crypto::random_output_key()?;
+        wipe(&mut self.key);
+        self.key = key;
+        wipe(&mut key);
+        self.epoch = epoch;
+        self.next_seq = 1;
+        Ok(())
+    }
+
+    fn take_seq(&mut self) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        seq
+    }
+}
+
+impl Drop for OutputKey {
+    fn drop(&mut self) {
+        wipe(&mut self.key);
+    }
+}
+
 struct TerminalSession {
-    attached: bool,
+    /// Protocol 2.5: v2 crypto, broadcast output, and writer tracking.
+    multi: bool,
+    viewers: BTreeMap<String, Viewer>,
+    /// 2.5 only. The viewer that most recently typed.
+    writer: Option<String>,
+    pty_size: (u16, u16),
+    /// 2.5 only. `None` on a 2.4 terminal.
+    out: Option<OutputKey>,
+    /// Set when the viewer set becomes empty; drives the idle close.
     detached_at: Option<Instant>,
     scrollback: VecDeque<u8>,
-    crypto: Option<LiveCrypto>,
     #[cfg(unix)]
     pty: Option<PtyRuntime>,
 }
 
 impl TerminalSession {
-    fn seal_data(&mut self, terminal_id: &str, data: &[u8]) -> Vec<OutboundFrame> {
-        let Some(crypto) = self.crypto.as_mut() else {
+    /// v1 output for the single 2.4 viewer. Nothing when it is detached.
+    fn seal_legacy_data(&mut self, terminal_id: &str, data: &[u8]) -> Vec<OutboundFrame> {
+        let Some(viewer) = self.viewers.get_mut(LEGACY_VIEWER) else {
             return Vec::new();
         };
         let mut frames = Vec::new();
@@ -591,22 +747,16 @@ impl TerminalSession {
             else {
                 continue;
             };
-            let seq = crypto.next_tx;
-            crypto.next_tx = crypto.next_tx.saturating_add(1);
+            let seq = viewer.next_tx;
+            viewer.next_tx = viewer.next_tx.saturating_add(1);
             match terminal_crypto::seal(
-                &crypto.keys.cli_to_browser,
+                &viewer.keys.cli_to_browser,
                 terminal_id,
                 DIR_CLI_TO_BROWSER,
                 seq,
                 &plaintext,
             ) {
-                Ok(body) => frames.push(OutboundFrame::Binary(
-                    RelayBinaryFrameMetadata::TermSealed {
-                        terminal_id: terminal_id.to_string(),
-                        seq,
-                    },
-                    body,
-                )),
+                Ok(body) => frames.push(sealed_frame(terminal_id, seq, None, None, body)),
                 Err(error) => {
                     tracing::warn!(error = %error, terminal_id, "sealing terminal output failed");
                     break;
@@ -616,29 +766,179 @@ impl TerminalSession {
         frames
     }
 
-    fn decode_incoming(&mut self, terminal_id: &str, seq: u64, body: &[u8]) -> Incoming {
-        let Some(crypto) = self.crypto.as_mut() else {
+    /// One v2 frame under a viewer's pairwise CLI->browser key.
+    fn seal_unicast(
+        &mut self,
+        terminal_id: &str,
+        viewer_id: &str,
+        message: &TermPlaintextV2,
+    ) -> Option<OutboundFrame> {
+        let viewer = self.viewers.get_mut(viewer_id)?;
+        let mut plaintext = match terminal_crypto::encode_plaintext_v2(message) {
+            Ok(plaintext) => plaintext,
+            Err(error) => {
+                tracing::warn!(error = %error, terminal_id, "encoding a terminal frame failed");
+                return None;
+            }
+        };
+        let seq = viewer.next_tx;
+        viewer.next_tx = viewer.next_tx.saturating_add(1);
+        let sealed = terminal_crypto::seal_v2(
+            &viewer.keys.cli_to_browser,
+            terminal_id,
+            viewer_id,
+            DIR_CLI_TO_BROWSER,
+            seq,
+            &plaintext,
+        );
+        wipe(&mut plaintext);
+        match sealed {
+            Ok(body) => Some(sealed_frame(terminal_id, seq, Some(viewer_id), None, body)),
+            Err(error) => {
+                tracing::warn!(error = %error, terminal_id, "sealing a unicast terminal frame failed");
+                None
+            }
+        }
+    }
+
+    /// One frame under the shared output key, for every attached viewer.
+    /// Nothing when no viewer is attached.
+    fn seal_broadcast(
+        &mut self,
+        terminal_id: &str,
+        message: &TermPlaintextV2,
+    ) -> Option<OutboundFrame> {
+        if self.viewers.is_empty() {
+            return None;
+        }
+        let out = self.out.as_mut()?;
+        let plaintext = match terminal_crypto::encode_plaintext_v2(message) {
+            Ok(plaintext) => plaintext,
+            Err(error) => {
+                tracing::warn!(error = %error, terminal_id, "encoding a terminal frame failed");
+                return None;
+            }
+        };
+        let seq = out.take_seq();
+        match terminal_crypto::seal_broadcast(&out.key, terminal_id, out.epoch, seq, &plaintext) {
+            Ok(body) => Some(sealed_frame(terminal_id, seq, None, Some(out.epoch), body)),
+            Err(error) => {
+                tracing::warn!(error = %error, terminal_id, "sealing terminal output failed");
+                None
+            }
+        }
+    }
+
+    fn broadcast_data(&mut self, terminal_id: &str, data: &[u8]) -> Vec<OutboundFrame> {
+        data.chunks(SEAL_CHUNK)
+            .filter(|chunk| !chunk.is_empty())
+            .filter_map(|chunk| {
+                self.seal_broadcast(terminal_id, &TermPlaintextV2::Data(chunk.to_vec()))
+            })
+            .collect()
+    }
+
+    /// The current output key, unicast to one viewer.
+    fn key_frame(&mut self, terminal_id: &str, viewer_id: &str) -> Option<OutboundFrame> {
+        let (epoch, key) = {
+            let out = self.out.as_ref()?;
+            (out.epoch, out.key)
+        };
+        let mut message = TermPlaintextV2::OutputKey { epoch, key };
+        let frame = self.seal_unicast(terminal_id, viewer_id, &message);
+        if let TermPlaintextV2::OutputKey { key, .. } = &mut message {
+            wipe(key);
+        }
+        frame
+    }
+
+    /// Join order, all unicast: output key, PTY size, then scrollback. The
+    /// epoch does not change on a join.
+    fn join_frames(&mut self, terminal_id: &str, viewer_id: &str) -> Vec<OutboundFrame> {
+        let mut frames = Vec::new();
+        frames.extend(self.key_frame(terminal_id, viewer_id));
+        let (cols, rows) = self.pty_size;
+        frames.extend(self.seal_unicast(
+            terminal_id,
+            viewer_id,
+            &TermPlaintextV2::Resize { cols, rows },
+        ));
+        let replay = self.scrollback.iter().copied().collect::<Vec<_>>();
+        for chunk in replay.chunks(SEAL_CHUNK) {
+            frames.extend(self.seal_unicast(
+                terminal_id,
+                viewer_id,
+                &TermPlaintextV2::Data(chunk.to_vec()),
+            ));
+        }
+        frames
+    }
+
+    /// Next epoch with a fresh key. Every remaining viewer gets the new key
+    /// unicast here, before any later broadcast uses it.
+    fn rotate(&mut self, terminal_id: &str) -> anyhow::Result<Vec<OutboundFrame>> {
+        let Some(out) = self.out.as_mut() else {
+            return Ok(Vec::new());
+        };
+        out.rotate()?;
+        let ids = self.viewers.keys().cloned().collect::<Vec<_>>();
+        Ok(ids
+            .iter()
+            .filter_map(|viewer_id| self.key_frame(terminal_id, viewer_id))
+            .collect())
+    }
+
+    fn decode_incoming(
+        &mut self,
+        terminal_id: &str,
+        viewer_id: &str,
+        seq: u64,
+        body: &[u8],
+    ) -> Incoming {
+        let multi = self.multi;
+        // The relay stamps the viewer id; pick that viewer's keys. Never
+        // trial-decrypt under other viewers.
+        let Some(viewer) = self.viewers.get_mut(viewer_id) else {
             return Incoming::Ignore;
         };
-        let opened = terminal_crypto::open(
-            &crypto.keys.browser_to_cli,
-            terminal_id,
-            DIR_BROWSER_TO_CLI,
-            seq,
-            body,
-        );
+        let opened = if multi {
+            terminal_crypto::open_v2(
+                &viewer.keys.browser_to_cli,
+                terminal_id,
+                viewer_id,
+                DIR_BROWSER_TO_CLI,
+                seq,
+                body,
+            )
+        } else {
+            terminal_crypto::open(
+                &viewer.keys.browser_to_cli,
+                terminal_id,
+                DIR_BROWSER_TO_CLI,
+                seq,
+                body,
+            )
+        };
         // Advance the replay cursor only after the frame authenticates.
         // A relay can rewrite the sequence in the cleartext metadata.
         let Ok(plaintext) = opened else {
             return Incoming::Ignore;
         };
-        if !terminal_crypto::accept_seq(&mut crypto.last_rx, seq) {
+        if !terminal_crypto::accept_seq(&mut viewer.last_rx, seq) {
             return Incoming::Ignore;
         };
-        match terminal_crypto::decode_plaintext(&plaintext) {
-            Ok(TermPlaintext::Data(bytes)) => Incoming::Write(bytes),
-            Ok(TermPlaintext::Resize { cols, rows }) => Incoming::Resize { cols, rows },
-            Err(_) => Incoming::Close,
+        if !multi {
+            return match terminal_crypto::decode_plaintext(&plaintext) {
+                Ok(TermPlaintext::Data(bytes)) => Incoming::Write(bytes),
+                Ok(TermPlaintext::Resize { cols, rows }) => Incoming::Resize { cols, rows },
+                Err(_) => Incoming::Close,
+            };
+        }
+        match terminal_crypto::decode_plaintext_v2(&plaintext) {
+            Ok(TermPlaintextV2::Data(bytes)) => Incoming::Write(bytes),
+            Ok(TermPlaintextV2::Resize { cols, rows }) => Incoming::Resize { cols, rows },
+            // A browser never sends an output key.
+            Ok(TermPlaintextV2::OutputKey { .. }) | Err(_) => Incoming::DropViewer,
         }
     }
 }
@@ -654,29 +954,52 @@ struct PendingTerminal {
     attach: bool,
 }
 
+/// `(terminalId, viewerId)`; a 2.4 terminal uses [`LEGACY_VIEWER`].
+type PendingKey = (String, String);
+
+fn pending_key(terminal_id: &str, viewer_id: Option<&str>) -> PendingKey {
+    (
+        terminal_id.to_string(),
+        viewer_id.unwrap_or(LEGACY_VIEWER).to_string(),
+    )
+}
+
+fn wire_viewer(viewer_key: &str) -> Option<&str> {
+    (viewer_key != LEGACY_VIEWER).then_some(viewer_key)
+}
+
 pub(crate) struct TerminalRegistry {
     sessions: BTreeMap<String, TerminalSession>,
-    pending: BTreeMap<String, PendingTerminal>,
+    pending: BTreeMap<PendingKey, PendingTerminal>,
     tx: SyncSender<FromWorker>,
     idle_limit: Duration,
+    /// Protocol 2.5 multi-viewer mode. `false` runs the 2.4 single-viewer path.
+    multi: bool,
+    /// The state dir from the last successful `term.auth`, for approval re-checks.
+    state_dir: Option<PathBuf>,
+    next_approval_check: Option<Instant>,
     shut_down: bool,
     #[cfg(unix)]
     shell: Option<(String, Vec<String>)>,
 }
 
 impl TerminalRegistry {
-    pub(crate) fn new(tx: SyncSender<FromWorker>) -> Self {
+    pub(crate) fn new(tx: SyncSender<FromWorker>, multi: bool) -> Self {
         Self {
             sessions: BTreeMap::new(),
             pending: BTreeMap::new(),
             tx,
             idle_limit: DEFAULT_IDLE,
+            multi,
+            state_dir: None,
+            next_approval_check: None,
             shut_down: false,
             #[cfg(unix)]
             shell: None,
         }
     }
 
+    /// A 2.4 (single-viewer) registry with a test shell.
     #[cfg(all(unix, test))]
     fn with_shell(
         tx: SyncSender<FromWorker>,
@@ -684,17 +1007,49 @@ impl TerminalRegistry {
         program: &str,
         args: &[&str],
     ) -> Self {
-        Self {
-            sessions: BTreeMap::new(),
-            pending: BTreeMap::new(),
-            tx,
-            idle_limit,
-            shut_down: false,
-            shell: Some((
-                program.to_string(),
-                args.iter().map(|arg| (*arg).to_string()).collect(),
-            )),
+        Self::with_shell_mode(tx, idle_limit, program, args, false)
+    }
+
+    #[cfg(all(unix, test))]
+    fn with_shell_mode(
+        tx: SyncSender<FromWorker>,
+        idle_limit: Duration,
+        program: &str,
+        args: &[&str],
+        multi: bool,
+    ) -> Self {
+        let mut registry = Self::new(tx, multi);
+        registry.idle_limit = idle_limit;
+        registry.shell = Some((
+            program.to_string(),
+            args.iter().map(|arg| (*arg).to_string()).collect(),
+        ));
+        registry
+    }
+
+    /// 2.4 relays never send a viewer id; ignore one if it appears. 2.5
+    /// requires a valid one.
+    fn normalize<'a>(&self, handshake: TermHandshake<'a>) -> TermHandshake<'a> {
+        TermHandshake {
+            viewer_id: if self.multi {
+                handshake.viewer_id
+            } else {
+                None
+            },
+            ..handshake
         }
+    }
+
+    fn ids_ok(&self, handshake: &TermHandshake<'_>) -> bool {
+        valid_id(handshake.terminal_id)
+            && (!self.multi || handshake.viewer_id.is_some_and(valid_id))
+    }
+
+    fn pending_for(&self, terminal_id: &str) -> usize {
+        self.pending
+            .keys()
+            .filter(|(pending_terminal, _)| pending_terminal == terminal_id)
+            .count()
     }
 
     pub(crate) fn kill_all(&mut self) -> Vec<OutboundFrame> {
@@ -718,14 +1073,19 @@ impl TerminalRegistry {
         state_dir: Option<&Path>,
         handshake: TermHandshake<'_>,
     ) -> Vec<OutboundFrame> {
+        let handshake = self.normalize(handshake);
         if self.sessions.contains_key(handshake.terminal_id) {
-            return vec![term_rejected(
-                handshake.terminal_id,
-                REASON_ALREADY_OPEN,
-                None,
-            )];
+            return vec![*handshake_rejected(&handshake, REASON_ALREADY_OPEN)];
         }
-        let prepared = match prepare_handshake(startup, self.sessions.len(), &handshake, false) {
+        if !self.ids_ok(&handshake)
+            || (self.multi
+                && self
+                    .pending
+                    .contains_key(&pending_key(handshake.terminal_id, handshake.viewer_id)))
+        {
+            return vec![*handshake_rejected(&handshake, REASON_BAD_HANDSHAKE)];
+        }
+        let prepared = match prepare_handshake(startup, self.sessions.len(), &handshake) {
             Ok(prepared) => prepared,
             Err(reject) => return vec![*reject],
         };
@@ -735,24 +1095,19 @@ impl TerminalRegistry {
         #[cfg(not(unix))]
         {
             let _ = (config, prepared);
-            return vec![term_rejected(
-                handshake.terminal_id,
-                REASON_UNSUPPORTED,
-                None,
-            )];
+            return vec![*handshake_rejected(&handshake, REASON_UNSUPPORTED)];
         }
         #[cfg(unix)]
         {
-            let cli_nonce = match fresh_nonce(handshake.terminal_id) {
+            let cli_nonce = match fresh_nonce(&handshake) {
                 Ok(nonce) => nonce,
                 Err(frame) => return vec![*frame],
             };
-            self.open_unix(startup, config, &handshake, prepared, cli_nonce)
+            self.open_unix(startup, config, &handshake, prepared, cli_nonce, None)
         }
     }
 
     #[cfg(unix)]
-    #[allow(clippy::too_many_arguments)]
     fn open_unix(
         &mut self,
         startup: &TerminalStartup,
@@ -760,31 +1115,55 @@ impl TerminalRegistry {
         handshake: &TermHandshake<'_>,
         prepared: PreparedHandshake,
         cli_nonce: [u8; 16],
+        approved_identity: Option<[u8; 65]>,
     ) -> Vec<OutboundFrame> {
         let terminal_id = handshake.terminal_id;
+        let viewer_id = handshake.viewer_id;
         if self.sessions.len() >= MAX_TERMINALS {
-            return vec![term_rejected(terminal_id, REASON_LIMIT, None)];
+            return vec![*handshake_rejected(handshake, REASON_LIMIT)];
         }
         let home = match user_home() {
             Ok(path) => path,
-            Err(_) => return vec![term_rejected(terminal_id, REASON_BAD_CWD, None)],
+            Err(_) => return vec![*handshake_rejected(handshake, REASON_BAD_CWD)],
         };
         let cwd = match child_env::resolve_cwd(None, &home) {
             Ok(path) => path,
-            Err(_) => return vec![term_rejected(terminal_id, REASON_BAD_CWD, None)],
+            Err(_) => return vec![*handshake_rejected(handshake, REASON_BAD_CWD)],
         };
-        let keys = match terminal_crypto::derive_direction_keys(
-            startup.key(),
-            &prepared.browser_public,
-            &prepared.browser_nonce,
-            &cli_nonce,
-            terminal_id,
-        ) {
+        let keys = match viewer_id {
+            Some(viewer_id) => terminal_crypto::derive_direction_keys_v2(
+                startup.key(),
+                &prepared.browser_public,
+                &prepared.browser_nonce,
+                &cli_nonce,
+                terminal_id,
+                viewer_id,
+            ),
+            None => terminal_crypto::derive_direction_keys(
+                startup.key(),
+                &prepared.browser_public,
+                &prepared.browser_nonce,
+                &cli_nonce,
+                terminal_id,
+            ),
+        };
+        let keys = match keys {
             Ok(keys) => keys,
             Err(error) => {
                 tracing::warn!(error = %error, terminal_id, "deriving terminal keys failed");
-                return vec![term_rejected(terminal_id, REASON_BAD_HANDSHAKE, None)];
+                return vec![*handshake_rejected(handshake, REASON_BAD_HANDSHAKE)];
             }
+        };
+        let out = if self.multi {
+            match OutputKey::first() {
+                Ok(out) => Some(out),
+                Err(error) => {
+                    tracing::warn!(error = %error, terminal_id, "generating a terminal output key failed");
+                    return vec![*handshake_rejected(handshake, REASON_SPAWN_FAILED)];
+                }
+            }
+        } else {
+            None
         };
         let env = terminal_env(config);
         let (program, args) = self.shell.clone().unwrap_or_else(child_env::login_shell);
@@ -801,27 +1180,41 @@ impl TerminalRegistry {
             Ok(pty) => pty,
             Err(error) => {
                 tracing::warn!(error = %error, terminal_id, "opening a terminal failed");
-                return vec![term_rejected(terminal_id, REASON_SPAWN_FAILED, None)];
+                return vec![*handshake_rejected(handshake, REASON_SPAWN_FAILED)];
             }
         };
-        self.sessions.insert(
-            terminal_id.to_string(),
-            TerminalSession {
-                attached: true,
-                detached_at: None,
-                scrollback: VecDeque::new(),
-                crypto: Some(LiveCrypto {
-                    keys,
-                    last_rx: 0,
-                    next_tx: 1,
-                }),
-                pty: Some(pty),
-            },
+        let viewer_key = viewer_id.unwrap_or(LEGACY_VIEWER);
+        let mut viewers = BTreeMap::new();
+        viewers.insert(
+            viewer_key.to_string(),
+            Viewer::new(
+                keys,
+                Some((prepared.cols, prepared.rows)),
+                approved_identity,
+            ),
         );
-        vec![OutboundFrame::Control(ClientControlMessage::TermOpened {
+        let mut session = TerminalSession {
+            multi: self.multi,
+            viewers,
+            // The opener is the first writer.
+            writer: viewer_id.map(str::to_string),
+            pty_size: (prepared.cols, prepared.rows),
+            out,
+            detached_at: None,
+            scrollback: VecDeque::new(),
+            pty: Some(pty),
+        };
+        let mut frames = vec![OutboundFrame::Control(ClientControlMessage::TermOpened {
             terminal_id: terminal_id.to_string(),
+            viewer_id: viewer_id.map(str::to_string),
             cli_nonce: terminal_crypto::encode_b64url(&cli_nonce),
-        })]
+        })];
+        if let Some(viewer_id) = viewer_id {
+            frames.extend(session.join_frames(terminal_id, viewer_id));
+            frames.push(term_writer(terminal_id, Some(viewer_id)));
+        }
+        self.sessions.insert(terminal_id.to_string(), session);
+        frames
     }
 
     pub(crate) fn attach(
@@ -830,34 +1223,49 @@ impl TerminalRegistry {
         state_dir: Option<&Path>,
         handshake: TermHandshake<'_>,
     ) -> Vec<OutboundFrame> {
+        let handshake = self.normalize(handshake);
         let terminal_id = handshake.terminal_id;
-        if !self.sessions.contains_key(terminal_id) {
-            return vec![term_rejected(terminal_id, REASON_NOT_FOUND, None)];
-        }
+        let Some(session) = self.sessions.get(terminal_id) else {
+            return vec![*handshake_rejected(&handshake, REASON_NOT_FOUND)];
+        };
         if !startup.allow_human_terminal() || !terminal_supported() {
-            return vec![term_rejected(
-                terminal_id,
+            return vec![*handshake_rejected(
+                &handshake,
                 if terminal_supported() {
                     REASON_DISABLED
                 } else {
                     REASON_UNSUPPORTED
                 },
-                None,
             )];
+        }
+        if !self.ids_ok(&handshake) {
+            return vec![*handshake_rejected(&handshake, REASON_BAD_HANDSHAKE)];
+        }
+        if let Some(viewer_id) = handshake.viewer_id {
+            if session.viewers.contains_key(viewer_id)
+                || self
+                    .pending
+                    .contains_key(&pending_key(terminal_id, Some(viewer_id)))
+            {
+                return vec![*handshake_rejected(&handshake, REASON_BAD_HANDSHAKE)];
+            }
+            if session.viewers.len() + self.pending_for(terminal_id) >= MAX_VIEWERS {
+                return vec![*handshake_rejected(&handshake, REASON_VIEWER_LIMIT)];
+            }
         }
         let prepared = match decode_browser_handshake(&handshake) {
             Ok(prepared) => prepared,
             Err(frame) => return vec![*frame],
         };
         if startup.require_terminal_approval() {
-            // Leave the current viewer attached until `term.auth` succeeds.
+            // Current viewers stay attached; this one joins after `term.auth`.
             return self.queue_pending(state_dir, &handshake, prepared, true);
         }
-        let cli_nonce = match fresh_nonce(terminal_id) {
+        let cli_nonce = match fresh_nonce(&handshake) {
             Ok(nonce) => nonce,
             Err(frame) => return vec![*frame],
         };
-        self.finish_attach(startup, terminal_id, &prepared, cli_nonce)
+        self.finish_attach(startup, &handshake, &prepared, cli_nonce, None)
     }
 
     pub(crate) fn auth(
@@ -866,22 +1274,38 @@ impl TerminalRegistry {
         config: &Config,
         state_dir: Option<&Path>,
         terminal_id: &str,
+        viewer_id: Option<&str>,
         signature: &str,
     ) -> Vec<OutboundFrame> {
-        let Some(pending) = self.pending.get(terminal_id) else {
+        let viewer_id = if self.multi {
+            let Some(viewer_id) = viewer_id else {
+                return Vec::new();
+            };
+            Some(viewer_id)
+        } else {
+            None
+        };
+        let key = pending_key(terminal_id, viewer_id);
+        let Some(pending) = self.pending.get(&key) else {
             return Vec::new();
         };
         if !approval_signature_ok(
             &pending.identity,
             signature,
             terminal_id,
+            viewer_id,
             &pending.browser_public,
             &pending.browser_nonce,
             startup.key().public_raw(),
             &pending.cli_nonce,
         ) {
-            self.pending.remove(terminal_id);
-            return vec![term_rejected(terminal_id, REASON_BAD_SIGNATURE, None)];
+            self.pending.remove(&key);
+            return vec![term_rejected(
+                terminal_id,
+                viewer_id,
+                REASON_BAD_SIGNATURE,
+                None,
+            )];
         }
         let code = terminal_crypto::approval_code(&pending.identity);
         let approved = state_dir.is_some_and(|dir| {
@@ -893,39 +1317,59 @@ impl TerminalRegistry {
         if !approved {
             return vec![term_rejected(
                 terminal_id,
+                viewer_id,
                 REASON_APPROVAL_REQUIRED,
                 Some(code),
             )];
         }
-        let pending = self.pending.remove(terminal_id).expect("pending");
+        let Some(pending) = self.pending.remove(&key) else {
+            return Vec::new();
+        };
+        if let Some(dir) = state_dir {
+            self.state_dir = Some(dir.to_path_buf());
+        }
         let prepared = PreparedHandshake {
             cols: pending.cols,
             rows: pending.rows,
             browser_public: pending.browser_public,
             browser_nonce: pending.browser_nonce,
         };
+        let handshake = TermHandshake {
+            terminal_id,
+            viewer_id,
+            cols: prepared.cols,
+            rows: prepared.rows,
+            browser_public_key: "",
+            browser_nonce: "",
+            identity: None,
+        };
         if pending.attach {
             if !self.sessions.contains_key(terminal_id) {
-                return vec![term_rejected(terminal_id, REASON_NOT_FOUND, None)];
+                return vec![*handshake_rejected(&handshake, REASON_NOT_FOUND)];
             }
-            return self.finish_attach(startup, terminal_id, &prepared, pending.cli_nonce);
+            return self.finish_attach(
+                startup,
+                &handshake,
+                &prepared,
+                pending.cli_nonce,
+                Some(pending.identity),
+            );
         }
         #[cfg(not(unix))]
         {
             let _ = config;
-            return vec![term_rejected(terminal_id, REASON_UNSUPPORTED, None)];
+            return vec![*handshake_rejected(&handshake, REASON_UNSUPPORTED)];
         }
         #[cfg(unix)]
         {
-            let handshake = TermHandshake {
-                terminal_id,
-                cols: prepared.cols,
-                rows: prepared.rows,
-                browser_public_key: "",
-                browser_nonce: "",
-                identity: None,
-            };
-            self.open_unix(startup, config, &handshake, prepared, pending.cli_nonce)
+            self.open_unix(
+                startup,
+                config,
+                &handshake,
+                prepared,
+                pending.cli_nonce,
+                Some(pending.identity),
+            )
         }
     }
 
@@ -936,18 +1380,17 @@ impl TerminalRegistry {
         prepared: PreparedHandshake,
         attach: bool,
     ) -> Vec<OutboundFrame> {
-        let terminal_id = handshake.terminal_id;
         let identity = match identity_public(handshake.identity) {
             Ok(raw) => raw,
-            Err(reason) => return vec![term_rejected(terminal_id, reason, None)],
+            Err(reason) => return vec![*handshake_rejected(handshake, reason)],
         };
         let approval_code = approval_code_for_identity(state_dir, &identity);
-        let cli_nonce = match fresh_nonce(terminal_id) {
+        let cli_nonce = match fresh_nonce(handshake) {
             Ok(nonce) => nonce,
             Err(frame) => return vec![*frame],
         };
         self.pending.insert(
-            terminal_id.to_string(),
+            pending_key(handshake.terminal_id, handshake.viewer_id),
             PendingTerminal {
                 cols: prepared.cols,
                 rows: prepared.rows,
@@ -960,7 +1403,8 @@ impl TerminalRegistry {
             },
         );
         vec![term_pending(
-            terminal_id,
+            handshake.terminal_id,
+            handshake.viewer_id,
             &terminal_crypto::encode_b64url(&cli_nonce),
             approval_code,
         )]
@@ -969,46 +1413,145 @@ impl TerminalRegistry {
     fn finish_attach(
         &mut self,
         startup: &TerminalStartup,
-        terminal_id: &str,
+        handshake: &TermHandshake<'_>,
         prepared: &PreparedHandshake,
         cli_nonce: [u8; 16],
+        approved_identity: Option<[u8; 65]>,
     ) -> Vec<OutboundFrame> {
-        let keys = match terminal_crypto::derive_direction_keys(
-            startup.key(),
-            &prepared.browser_public,
-            &prepared.browser_nonce,
-            &cli_nonce,
-            terminal_id,
-        ) {
-            Ok(keys) => keys,
-            Err(_) => return vec![term_rejected(terminal_id, REASON_BAD_HANDSHAKE, None)],
+        let terminal_id = handshake.terminal_id;
+        let viewer_id = handshake.viewer_id;
+        let keys = match viewer_id {
+            Some(viewer_id) => terminal_crypto::derive_direction_keys_v2(
+                startup.key(),
+                &prepared.browser_public,
+                &prepared.browser_nonce,
+                &cli_nonce,
+                terminal_id,
+                viewer_id,
+            ),
+            None => terminal_crypto::derive_direction_keys(
+                startup.key(),
+                &prepared.browser_public,
+                &prepared.browser_nonce,
+                &cli_nonce,
+                terminal_id,
+            ),
         };
+        let Ok(keys) = keys else {
+            return vec![*handshake_rejected(handshake, REASON_BAD_HANDSHAKE)];
+        };
+        let multi = self.multi;
         let Some(session) = self.sessions.get_mut(terminal_id) else {
-            return vec![term_rejected(terminal_id, REASON_NOT_FOUND, None)];
+            return vec![*handshake_rejected(handshake, REASON_NOT_FOUND)];
         };
-        session.crypto = Some(LiveCrypto {
-            keys,
-            last_rx: 0,
-            next_tx: 1,
-        });
-        session.attached = true;
+        let viewer_key = viewer_id.unwrap_or(LEGACY_VIEWER);
+        if multi {
+            if session.viewers.contains_key(viewer_key) {
+                return vec![*handshake_rejected(handshake, REASON_BAD_HANDSHAKE)];
+            }
+        } else {
+            // 2.4: attach replaces the single viewer.
+            session.viewers.clear();
+        }
+        session.viewers.insert(
+            viewer_key.to_string(),
+            Viewer::new(keys, None, approved_identity),
+        );
         session.detached_at = None;
-        let replay = session.scrollback.iter().copied().collect::<Vec<_>>();
         let mut frames = vec![OutboundFrame::Control(ClientControlMessage::TermAttached {
             terminal_id: terminal_id.to_string(),
+            viewer_id: viewer_id.map(str::to_string),
             cli_nonce: terminal_crypto::encode_b64url(&cli_nonce),
         })];
-        frames.extend(session.seal_data(terminal_id, &replay));
+        if multi {
+            frames.extend(session.join_frames(terminal_id, viewer_key));
+        } else {
+            let replay = session.scrollback.iter().copied().collect::<Vec<_>>();
+            frames.extend(session.seal_legacy_data(terminal_id, &replay));
+        }
         frames
     }
 
-    pub(crate) fn detach(&mut self, terminal_id: &str) {
-        if let Some(session) = self.sessions.get_mut(terminal_id)
-            && session.attached
+    /// 2.5: stop viewing (the tab's X, or the tab went away). A pending
+    /// approval for that viewer is dropped too. 2.4: the single viewer leaves.
+    pub(crate) fn detach(
+        &mut self,
+        terminal_id: &str,
+        viewer_id: Option<&str>,
+    ) -> Vec<OutboundFrame> {
+        if !self.multi {
+            if let Some(session) = self.sessions.get_mut(terminal_id)
+                && !session.viewers.is_empty()
+            {
+                session.viewers.clear();
+                session.detached_at = Some(Instant::now());
+            }
+            return Vec::new();
+        }
+        let Some(viewer_id) = viewer_id else {
+            return Vec::new();
+        };
+        self.pending
+            .remove(&pending_key(terminal_id, Some(viewer_id)));
+        self.remove_viewer(terminal_id, viewer_id, None)
+    }
+
+    /// A malformed relay frame that names a viewer. 2.5 removes only that
+    /// viewer (or its pending approval); 2.4 closes the terminal as before.
+    pub(crate) fn drop_viewer(&mut self, terminal_id: &str, viewer_id: &str) -> Vec<OutboundFrame> {
+        if !self.multi {
+            return self.close(terminal_id);
+        }
+        if self
+            .pending
+            .remove(&pending_key(terminal_id, Some(viewer_id)))
+            .is_some()
         {
-            session.attached = false;
+            return vec![term_rejected(
+                terminal_id,
+                Some(viewer_id),
+                REASON_BAD_FRAME,
+                None,
+            )];
+        }
+        self.remove_viewer(terminal_id, viewer_id, Some(REASON_BAD_FRAME))
+    }
+
+    /// Leave: detach, per-viewer fault, or approval revoked. The writer
+    /// becomes none if it left (the PTY keeps its size), and the output key
+    /// rotates so the leaver cannot read later frames. `notify` tells the
+    /// relay why the CLI removed the viewer on its own.
+    fn remove_viewer(
+        &mut self,
+        terminal_id: &str,
+        viewer_id: &str,
+        notify: Option<&str>,
+    ) -> Vec<OutboundFrame> {
+        let Some(session) = self.sessions.get_mut(terminal_id) else {
+            return Vec::new();
+        };
+        if session.viewers.remove(viewer_id).is_none() {
+            return Vec::new();
+        }
+        let mut frames = Vec::new();
+        if let Some(reason) = notify {
+            frames.push(term_rejected(terminal_id, Some(viewer_id), reason, None));
+        }
+        if session.writer.as_deref() == Some(viewer_id) {
+            session.writer = None;
+            frames.push(term_writer(terminal_id, None));
+        }
+        if session.viewers.is_empty() {
             session.detached_at = Some(Instant::now());
         }
+        match session.rotate(terminal_id) {
+            Ok(key_frames) => frames.extend(key_frames),
+            Err(error) => {
+                tracing::warn!(error = %error, terminal_id, "rotating the terminal output key failed");
+                frames.extend(self.close(terminal_id));
+            }
+        }
+        frames
     }
 
     pub(crate) fn close(&mut self, terminal_id: &str) -> Vec<OutboundFrame> {
@@ -1019,7 +1562,7 @@ impl TerminalRegistry {
         let (exit_code, signal) = session.pty.take().map(shutdown_pty).unwrap_or((None, None));
         #[cfg(not(unix))]
         let (exit_code, signal) = (None, None);
-        let _ = session;
+        drop(session);
         vec![OutboundFrame::Control(ClientControlMessage::TermExit {
             terminal_id: terminal_id.to_string(),
             exit_code,
@@ -1030,9 +1573,19 @@ impl TerminalRegistry {
     pub(crate) fn handle_sealed(
         &mut self,
         terminal_id: &str,
+        viewer_id: Option<&str>,
         seq: u64,
         body: &[u8],
     ) -> Vec<OutboundFrame> {
+        let viewer_key = if self.multi {
+            let Some(viewer_id) = viewer_id else {
+                tracing::warn!(terminal_id, "ignoring a sealed frame without a viewer id");
+                return Vec::new();
+            };
+            viewer_id.to_string()
+        } else {
+            LEGACY_VIEWER.to_string()
+        };
         let action = {
             let Some(session) = self.sessions.get_mut(terminal_id) else {
                 tracing::warn!(
@@ -1041,37 +1594,123 @@ impl TerminalRegistry {
                 );
                 return Vec::new();
             };
-            session.decode_incoming(terminal_id, seq, body)
+            session.decode_incoming(terminal_id, &viewer_key, seq, body)
         };
         match action {
             Incoming::Write(bytes) => {
-                if self.write_terminal(terminal_id, &bytes).is_err() {
-                    self.close(terminal_id)
-                } else {
-                    Vec::new()
+                let mut frames = Vec::new();
+                if self.multi {
+                    match self.claim_writer(terminal_id, &viewer_key) {
+                        Ok(claimed) => frames.extend(claimed),
+                        Err(_) => {
+                            frames.extend(self.close(terminal_id));
+                            return frames;
+                        }
+                    }
                 }
+                if self.write_terminal(terminal_id, &bytes).is_err() {
+                    frames.extend(self.close(terminal_id));
+                }
+                frames
             }
             Incoming::Resize { cols, rows } => {
-                if self.resize_terminal(terminal_id, cols, rows).is_err() {
-                    self.close(terminal_id)
-                } else {
-                    Vec::new()
+                if !self.multi {
+                    return if self.resize_terminal(terminal_id, cols, rows).is_err() {
+                        self.close(terminal_id)
+                    } else {
+                        Vec::new()
+                    };
+                }
+                let applies = {
+                    let Some(session) = self.sessions.get_mut(terminal_id) else {
+                        return Vec::new();
+                    };
+                    if let Some(viewer) = session.viewers.get_mut(&viewer_key) {
+                        viewer.last_size = Some((cols, rows));
+                    }
+                    session
+                        .writer
+                        .as_deref()
+                        .is_none_or(|writer| writer == viewer_key)
+                };
+                if !applies {
+                    return Vec::new();
+                }
+                match self.apply_size(terminal_id, cols, rows) {
+                    Ok(frames) => frames,
+                    Err(_) => self.close(terminal_id),
                 }
             }
             Incoming::Ignore => Vec::new(),
             Incoming::Close => self.close(terminal_id),
+            Incoming::DropViewer => {
+                tracing::warn!(terminal_id, "removing a viewer after a bad terminal frame");
+                self.remove_viewer(terminal_id, &viewer_key, Some(REASON_BAD_FRAME))
+            }
         }
+    }
+
+    /// A data frame from a non-writer makes it the writer and applies its
+    /// last size before the caller writes. Resize-only frames never get here.
+    fn claim_writer(
+        &mut self,
+        terminal_id: &str,
+        viewer_id: &str,
+    ) -> std::io::Result<Vec<OutboundFrame>> {
+        let size = {
+            let Some(session) = self.sessions.get_mut(terminal_id) else {
+                return Ok(Vec::new());
+            };
+            if session.writer.as_deref() == Some(viewer_id) {
+                return Ok(Vec::new());
+            }
+            session.writer = Some(viewer_id.to_string());
+            session
+                .viewers
+                .get(viewer_id)
+                .and_then(|viewer| viewer.last_size)
+        };
+        let mut frames = vec![term_writer(terminal_id, Some(viewer_id))];
+        if let Some((cols, rows)) = size {
+            frames.extend(self.apply_size(terminal_id, cols, rows)?);
+        }
+        Ok(frames)
+    }
+
+    /// Resize the PTY if the size differs, then broadcast the new size.
+    fn apply_size(
+        &mut self,
+        terminal_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> std::io::Result<Vec<OutboundFrame>> {
+        if self
+            .sessions
+            .get(terminal_id)
+            .is_some_and(|session| session.pty_size == (cols, rows))
+        {
+            return Ok(Vec::new());
+        }
+        self.resize_terminal(terminal_id, cols, rows)?;
+        let Some(session) = self.sessions.get_mut(terminal_id) else {
+            return Ok(Vec::new());
+        };
+        Ok(session
+            .seal_broadcast(terminal_id, &TermPlaintextV2::Resize { cols, rows })
+            .into_iter()
+            .collect())
     }
 
     pub(crate) fn on_bytes(&mut self, terminal_id: &str, bytes: &[u8]) -> Vec<OutboundFrame> {
         let Some(session) = self.sessions.get_mut(terminal_id) else {
             return Vec::new();
         };
+        // Scrollback is always recorded; output is sealed only for viewers.
         push_scrollback(&mut session.scrollback, bytes);
-        if session.attached {
-            session.seal_data(terminal_id, bytes)
+        if session.multi {
+            session.broadcast_data(terminal_id, bytes)
         } else {
-            Vec::new()
+            session.seal_legacy_data(terminal_id, bytes)
         }
     }
 
@@ -1084,18 +1723,25 @@ impl TerminalRegistry {
             .pending
             .iter()
             .filter(|(_, pending)| now.saturating_duration_since(pending.created) >= PENDING_TTL)
-            .map(|(id, _)| id.clone())
+            .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         let mut frames = Vec::new();
-        for id in expired_pending {
-            self.pending.remove(&id);
-            frames.push(term_rejected(&id, REASON_EXPIRED, None));
+        for key in expired_pending {
+            self.pending.remove(&key);
+            frames.push(term_rejected(
+                &key.0,
+                wire_viewer(&key.1),
+                REASON_EXPIRED,
+                None,
+            ));
         }
+        frames.extend(self.recheck_approvals(now));
+        // Pending viewers do not keep a terminal alive.
         let expired = self
             .sessions
             .iter()
             .filter(|(_, session)| {
-                !session.attached
+                session.viewers.is_empty()
                     && session.detached_at.is_some_and(|detached| {
                         now.saturating_duration_since(detached) >= self.idle_limit
                     })
@@ -1104,6 +1750,41 @@ impl TerminalRegistry {
             .collect::<Vec<_>>();
         for id in expired {
             frames.extend(self.close(&id));
+        }
+        frames
+    }
+
+    /// 2.5: a viewer whose approval was revoked leaves (and the key rotates).
+    fn recheck_approvals(&mut self, now: Instant) -> Vec<OutboundFrame> {
+        if !self.multi || self.next_approval_check.is_some_and(|next| now < next) {
+            return Vec::new();
+        }
+        self.next_approval_check = Some(now + APPROVAL_RECHECK);
+        let Some(dir) = self.state_dir.clone() else {
+            return Vec::new();
+        };
+        let revoked = self
+            .sessions
+            .iter()
+            .flat_map(|(terminal_id, session)| {
+                session
+                    .viewers
+                    .iter()
+                    .filter(|(_, viewer)| {
+                        viewer
+                            .approved_identity
+                            .is_some_and(|identity| !identity_still_approved(&dir, &identity))
+                    })
+                    .map(|(viewer_id, _)| (terminal_id.clone(), viewer_id.clone()))
+            })
+            .collect::<Vec<_>>();
+        let mut frames = Vec::new();
+        for (terminal_id, viewer_id) in revoked {
+            frames.extend(self.remove_viewer(
+                &terminal_id,
+                &viewer_id,
+                Some(REASON_APPROVAL_REQUIRED),
+            ));
         }
         frames
     }
@@ -1139,7 +1820,9 @@ impl TerminalRegistry {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|error| std::io::Error::other(error.to_string()))
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        session.pty_size = (cols, rows);
+        Ok(())
     }
 
     #[cfg(not(unix))]
@@ -1870,6 +2553,7 @@ mod tests {
             None,
             TermHandshake {
                 terminal_id: "term-1",
+                viewer_id: None,
                 cols: 80,
                 rows: 24,
                 browser_public_key: browser.public_b64url(),
@@ -1926,6 +2610,7 @@ mod tests {
                 None,
                 TermHandshake {
                     terminal_id,
+                    viewer_id: None,
                     cols: 80,
                     rows: 24,
                     browser_public_key: browser.public_b64url(),
@@ -1944,6 +2629,7 @@ mod tests {
             None,
             TermHandshake {
                 terminal_id: "t3",
+                viewer_id: None,
                 cols: 80,
                 rows: 24,
                 browser_public_key: browser.public_b64url(),
@@ -1979,6 +2665,7 @@ mod tests {
             None,
             TermHandshake {
                 terminal_id: "idle",
+                viewer_id: None,
                 cols: 40,
                 rows: 12,
                 browser_public_key: browser.public_b64url(),
@@ -1986,7 +2673,7 @@ mod tests {
                 identity: None,
             },
         );
-        terminals.detach("idle");
+        terminals.detach("idle", None);
         std::thread::sleep(Duration::from_millis(250));
         let frames = terminals.poll(Instant::now());
         assert!(matches!(
@@ -2037,6 +2724,7 @@ mod tests {
             &identity_raw,
             &encoded,
             "term-a",
+            None,
             browser.public_raw(),
             &browser_nonce,
             cli.public_raw(),
@@ -2048,6 +2736,7 @@ mod tests {
             &identity_raw,
             &encoded,
             "term-a",
+            None,
             browser.public_raw(),
             &browser_nonce,
             cli.public_raw(),
@@ -2087,6 +2776,7 @@ mod tests {
             Some(dir.path()),
             TermHandshake {
                 terminal_id: "term-a",
+                viewer_id: None,
                 cols: 80,
                 rows: 24,
                 browser_public_key: browser.public_b64url(),
@@ -2120,6 +2810,7 @@ mod tests {
             &Config::default(),
             Some(dir.path()),
             "term-a",
+            None,
             &terminal_crypto::encode_b64url(&signature),
         );
         assert!(matches!(
@@ -2267,6 +2958,7 @@ mod tests {
             None,
             TermHandshake {
                 terminal_id: "held",
+                viewer_id: None,
                 cols: 80,
                 rows: 24,
                 browser_public_key: browser.public_b64url(),
@@ -2319,6 +3011,911 @@ mod tests {
         done_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("reader did not notice the stop flag");
+    }
+
+    // Protocol 2.5 (multi-viewer) tests. `TestViewer` plays one browser tab.
+
+    #[cfg(unix)]
+    const MULTI_TERMINAL: &str = "term-multi";
+
+    #[cfg(unix)]
+    #[derive(Debug, PartialEq)]
+    enum Seen {
+        Key(u32),
+        Size(u16, u16),
+        Data(Vec<u8>),
+        Opaque,
+    }
+
+    #[cfg(unix)]
+    struct TestViewer {
+        id: String,
+        browser: CliTerminalKey,
+        nonce: [u8; 16],
+        nonce_b64: String,
+        keys: Option<DirectionKeys>,
+        tx_seq: u64,
+        out: Option<(u32, [u8; 32])>,
+    }
+
+    #[cfg(unix)]
+    impl TestViewer {
+        fn new(tag: u8) -> Self {
+            let nonce = [tag; 16];
+            Self {
+                id: terminal_crypto::encode_b64url(&[tag.wrapping_add(100); 16]),
+                browser: CliTerminalKey::generate().expect("browser"),
+                nonce,
+                nonce_b64: terminal_crypto::encode_b64url(&nonce),
+                keys: None,
+                tx_seq: 0,
+                out: None,
+            }
+        }
+
+        fn handshake<'a>(
+            &'a self,
+            terminal_id: &'a str,
+            cols: u16,
+            rows: u16,
+        ) -> TermHandshake<'a> {
+            TermHandshake {
+                terminal_id,
+                viewer_id: Some(&self.id),
+                cols,
+                rows,
+                browser_public_key: self.browser.public_b64url(),
+                browser_nonce: &self.nonce_b64,
+                identity: None,
+            }
+        }
+
+        fn bind(&mut self, startup: &TerminalStartup, terminal_id: &str, cli_nonce: &str) {
+            let ikm = self
+                .browser
+                .shared_x(startup.key().public_raw())
+                .expect("ecdh");
+            let cli_nonce = terminal_crypto::decode_nonce(cli_nonce).expect("nonce");
+            self.keys = Some(
+                terminal_crypto::derive_direction_keys_v2_from_ikm(
+                    &ikm,
+                    startup.key().public_raw(),
+                    self.browser.public_raw(),
+                    &self.nonce,
+                    &cli_nonce,
+                    terminal_id,
+                    &self.id,
+                )
+                .expect("keys"),
+            );
+        }
+
+        fn seal(&mut self, terminal_id: &str, message: &TermPlaintextV2) -> (u64, Vec<u8>) {
+            self.tx_seq += 1;
+            let keys = self.keys.as_ref().expect("bound");
+            let plaintext = terminal_crypto::encode_plaintext_v2(message).expect("encode");
+            let body = terminal_crypto::seal_v2(
+                &keys.browser_to_cli,
+                terminal_id,
+                &self.id,
+                DIR_BROWSER_TO_CLI,
+                self.tx_seq,
+                &plaintext,
+            )
+            .expect("seal");
+            (self.tx_seq, body)
+        }
+
+        /// Decode the frames the relay would deliver to this tab: unicast
+        /// frames addressed to it, and every broadcast frame.
+        fn receive(&mut self, terminal_id: &str, frames: &[OutboundFrame]) -> Vec<Seen> {
+            let mut seen = Vec::new();
+            for frame in frames {
+                let OutboundFrame::Binary(
+                    RelayBinaryFrameMetadata::TermSealed {
+                        seq,
+                        viewer_id,
+                        epoch,
+                        ..
+                    },
+                    body,
+                ) = frame
+                else {
+                    continue;
+                };
+                let plaintext = match (viewer_id, epoch) {
+                    (Some(viewer_id), None) => {
+                        if viewer_id != &self.id {
+                            continue;
+                        }
+                        let keys = self.keys.as_ref().expect("bound");
+                        terminal_crypto::open_v2(
+                            &keys.cli_to_browser,
+                            terminal_id,
+                            viewer_id,
+                            DIR_CLI_TO_BROWSER,
+                            *seq,
+                            body,
+                        )
+                        .ok()
+                    }
+                    (None, Some(epoch)) => self.out.and_then(|(known, key)| {
+                        (known == *epoch)
+                            .then(|| {
+                                terminal_crypto::open_broadcast(
+                                    &key,
+                                    terminal_id,
+                                    *epoch,
+                                    *seq,
+                                    body,
+                                )
+                                .ok()
+                            })
+                            .flatten()
+                    }),
+                    _ => panic!("a 2.5 sealed frame carries exactly one of viewerId or epoch"),
+                };
+                let Some(plaintext) = plaintext else {
+                    seen.push(Seen::Opaque);
+                    continue;
+                };
+                seen.push(
+                    match terminal_crypto::decode_plaintext_v2(&plaintext).expect("plaintext") {
+                        TermPlaintextV2::OutputKey { epoch, key } => {
+                            self.out = Some((epoch, key));
+                            Seen::Key(epoch)
+                        }
+                        TermPlaintextV2::Resize { cols, rows } => Seen::Size(cols, rows),
+                        TermPlaintextV2::Data(bytes) => Seen::Data(bytes),
+                    },
+                );
+            }
+            seen
+        }
+    }
+
+    #[cfg(unix)]
+    fn multi_registry(tx: SyncSender<FromWorker>) -> TerminalRegistry {
+        TerminalRegistry::with_shell_mode(
+            tx,
+            Duration::from_secs(60),
+            "/bin/sh",
+            &["-c", "sleep 30"],
+            true,
+        )
+    }
+
+    #[cfg(unix)]
+    fn cli_nonce_of(frames: &[OutboundFrame]) -> String {
+        frames
+            .iter()
+            .find_map(|frame| match frame {
+                OutboundFrame::Control(
+                    ClientControlMessage::TermOpened { cli_nonce, .. }
+                    | ClientControlMessage::TermAttached { cli_nonce, .. }
+                    | ClientControlMessage::TermPending { cli_nonce, .. },
+                ) => Some(cli_nonce.clone()),
+                _ => None,
+            })
+            .expect("a handshake reply")
+    }
+
+    #[cfg(unix)]
+    fn controls(frames: &[OutboundFrame]) -> Vec<&ClientControlMessage> {
+        frames
+            .iter()
+            .filter_map(|frame| match frame {
+                OutboundFrame::Control(message) => Some(message),
+                OutboundFrame::Binary(..) => None,
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn writer_changes(frames: &[OutboundFrame]) -> Vec<Option<String>> {
+        controls(frames)
+            .into_iter()
+            .filter_map(|message| match message {
+                ClientControlMessage::TermWriter { viewer_id, .. } => Some(viewer_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn rejection(frames: &[OutboundFrame]) -> Option<(Option<String>, String)> {
+        controls(frames)
+            .into_iter()
+            .find_map(|message| match message {
+                ClientControlMessage::TermRejected {
+                    viewer_id, reason, ..
+                } => Some((viewer_id.clone(), reason.clone())),
+                _ => None,
+            })
+    }
+
+    #[cfg(unix)]
+    fn open_viewer(
+        terminals: &mut TerminalRegistry,
+        startup: &TerminalStartup,
+        viewer: &mut TestViewer,
+    ) -> Vec<OutboundFrame> {
+        let frames = terminals.open(
+            startup,
+            &Config::default(),
+            None,
+            viewer.handshake(MULTI_TERMINAL, 80, 24),
+        );
+        viewer.bind(startup, MULTI_TERMINAL, &cli_nonce_of(&frames));
+        frames
+    }
+
+    #[cfg(unix)]
+    fn attach_viewer(
+        terminals: &mut TerminalRegistry,
+        startup: &TerminalStartup,
+        viewer: &mut TestViewer,
+    ) -> Vec<OutboundFrame> {
+        let frames = terminals.attach(startup, None, viewer.handshake(MULTI_TERMINAL, 0, 0));
+        viewer.bind(startup, MULTI_TERMINAL, &cli_nonce_of(&frames));
+        frames
+    }
+
+    #[cfg(unix)]
+    fn send(
+        terminals: &mut TerminalRegistry,
+        viewer: &mut TestViewer,
+        label: &str,
+        message: &TermPlaintextV2,
+    ) -> Vec<OutboundFrame> {
+        let (seq, body) = viewer.seal(MULTI_TERMINAL, message);
+        terminals.handle_sealed(MULTI_TERMINAL, Some(label), seq, &body)
+    }
+
+    #[cfg(unix)]
+    fn pty_size(terminals: &TerminalRegistry) -> (u16, u16) {
+        let session = terminals.sessions.get(MULTI_TERMINAL).expect("session");
+        let size = session
+            .pty
+            .as_ref()
+            .expect("pty")
+            .master
+            .get_size()
+            .expect("size");
+        assert_eq!(session.pty_size, (size.cols, size.rows));
+        (size.cols, size.rows)
+    }
+
+    #[cfg(unix)]
+    fn writer(terminals: &TerminalRegistry) -> Option<String> {
+        terminals
+            .sessions
+            .get(MULTI_TERMINAL)
+            .expect("session")
+            .writer
+            .clone()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opener_gets_the_key_and_size_and_is_the_first_writer() {
+        let (tx, _rx) = channel();
+        let mut terminals = multi_registry(tx);
+        let startup = enabled_startup(false);
+        let mut a = TestViewer::new(1);
+        let frames = open_viewer(&mut terminals, &startup, &mut a);
+        assert!(matches!(
+            controls(&frames)[0],
+            ClientControlMessage::TermOpened { viewer_id: Some(id), .. } if id == &a.id
+        ));
+        assert_eq!(
+            a.receive(MULTI_TERMINAL, &frames),
+            vec![Seen::Key(1), Seen::Size(80, 24)]
+        );
+        assert_eq!(writer_changes(&frames), vec![Some(a.id.clone())]);
+        assert_eq!(writer(&terminals), Some(a.id.clone()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_viewers_decrypt_the_same_broadcast() {
+        let (tx, _rx) = channel();
+        let mut terminals = multi_registry(tx);
+        let startup = enabled_startup(false);
+        let mut a = TestViewer::new(1);
+        let mut b = TestViewer::new(2);
+        let opened = open_viewer(&mut terminals, &startup, &mut a);
+        a.receive(MULTI_TERMINAL, &opened);
+        // Output before B joins is scrollback for B.
+        let early = terminals.on_bytes(MULTI_TERMINAL, b"early");
+        assert_eq!(
+            a.receive(MULTI_TERMINAL, &early),
+            vec![Seen::Data(b"early".to_vec())]
+        );
+
+        let attached = attach_viewer(&mut terminals, &startup, &mut b);
+        assert!(matches!(
+            controls(&attached)[0],
+            ClientControlMessage::TermAttached { viewer_id: Some(id), .. } if id == &b.id
+        ));
+        // Join order: key, PTY size, scrollback. The epoch does not change,
+        // and nothing in the join is visible to A.
+        assert_eq!(
+            b.receive(MULTI_TERMINAL, &attached),
+            vec![
+                Seen::Key(1),
+                Seen::Size(80, 24),
+                Seen::Data(b"early".to_vec())
+            ]
+        );
+        assert!(a.receive(MULTI_TERMINAL, &attached).is_empty());
+        assert!(writer_changes(&attached).is_empty());
+
+        let live = terminals.on_bytes(MULTI_TERMINAL, b"hello");
+        assert_eq!(live.len(), 1, "live output is sealed once");
+        assert_eq!(
+            a.receive(MULTI_TERMINAL, &live),
+            vec![Seen::Data(b"hello".to_vec())]
+        );
+        assert_eq!(
+            b.receive(MULTI_TERMINAL, &live),
+            vec![Seen::Data(b"hello".to_vec())]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_from_b_makes_b_the_writer_and_applies_b_size_first() {
+        let (tx, _rx) = channel();
+        let mut terminals = multi_registry(tx);
+        let startup = enabled_startup(false);
+        let mut a = TestViewer::new(1);
+        let mut b = TestViewer::new(2);
+        let opened = open_viewer(&mut terminals, &startup, &mut a);
+        a.receive(MULTI_TERMINAL, &opened);
+        let attached = attach_viewer(&mut terminals, &startup, &mut b);
+        b.receive(MULTI_TERMINAL, &attached);
+        assert_eq!(pty_size(&terminals), (80, 24));
+
+        // A resize from a non-writer is only recorded.
+        let b_id = b.id.clone();
+        let frames = send(
+            &mut terminals,
+            &mut b,
+            &b_id,
+            &TermPlaintextV2::Resize {
+                cols: 100,
+                rows: 40,
+            },
+        );
+        assert!(frames.is_empty());
+        assert_eq!(pty_size(&terminals), (80, 24));
+        assert_eq!(writer(&terminals), Some(a.id.clone()));
+
+        // B types: B becomes the writer, then B's size is applied and
+        // broadcast, before the write.
+        let frames = send(
+            &mut terminals,
+            &mut b,
+            &b_id,
+            &TermPlaintextV2::Data(b"x".to_vec()),
+        );
+        assert_eq!(writer_changes(&frames), vec![Some(b.id.clone())]);
+        assert!(matches!(
+            &frames[0],
+            OutboundFrame::Control(ClientControlMessage::TermWriter { .. })
+        ));
+        assert_eq!(
+            a.receive(MULTI_TERMINAL, &frames),
+            vec![Seen::Size(100, 40)]
+        );
+        assert_eq!(
+            b.receive(MULTI_TERMINAL, &frames),
+            vec![Seen::Size(100, 40)]
+        );
+        assert_eq!(pty_size(&terminals), (100, 40));
+        assert_eq!(writer(&terminals), Some(b.id.clone()));
+
+        // The writer's own resize applies at once.
+        let frames = send(
+            &mut terminals,
+            &mut b,
+            &b_id,
+            &TermPlaintextV2::Resize {
+                cols: 120,
+                rows: 50,
+            },
+        );
+        assert_eq!(
+            a.receive(MULTI_TERMINAL, &frames),
+            vec![Seen::Size(120, 50)]
+        );
+        assert_eq!(pty_size(&terminals), (120, 50));
+
+        // A types again: A's opening size comes back.
+        let a_id = a.id.clone();
+        let frames = send(
+            &mut terminals,
+            &mut a,
+            &a_id,
+            &TermPlaintextV2::Data(b"y".to_vec()),
+        );
+        assert_eq!(writer_changes(&frames), vec![Some(a.id.clone())]);
+        assert_eq!(b.receive(MULTI_TERMINAL, &frames), vec![Seen::Size(80, 24)]);
+        assert_eq!(pty_size(&terminals), (80, 24));
+
+        // Typing again as the writer changes nothing.
+        let frames = send(
+            &mut terminals,
+            &mut a,
+            &a_id,
+            &TermPlaintextV2::Data(b"z".to_vec()),
+        );
+        assert!(frames.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_frame_from_a_labelled_b_is_ignored() {
+        let (tx, _rx) = channel();
+        let mut terminals = multi_registry(tx);
+        let startup = enabled_startup(false);
+        let mut a = TestViewer::new(1);
+        let mut b = TestViewer::new(2);
+        open_viewer(&mut terminals, &startup, &mut a);
+        attach_viewer(&mut terminals, &startup, &mut b);
+        let b_id = b.id.clone();
+
+        // A's frame, stamped with B's viewer id by a hostile relay.
+        let frames = send(
+            &mut terminals,
+            &mut a,
+            &b_id,
+            &TermPlaintextV2::Data(b"forged".to_vec()),
+        );
+        assert!(frames.is_empty());
+        assert_eq!(writer(&terminals), Some(a.id.clone()));
+        // Unknown viewer ids are ignored too.
+        let frames = send(
+            &mut terminals,
+            &mut a,
+            "no-such-viewer",
+            &TermPlaintextV2::Data(b"x".to_vec()),
+        );
+        assert!(frames.is_empty());
+        assert!(terminals.sessions.contains_key(MULTI_TERMINAL));
+        // 2.5 frames without a viewer id are dropped.
+        let (seq, body) = a.seal(MULTI_TERMINAL, &TermPlaintextV2::Data(b"x".to_vec()));
+        assert!(
+            terminals
+                .handle_sealed(MULTI_TERMINAL, None, seq, &body)
+                .is_empty()
+        );
+        assert_eq!(writer(&terminals), Some(a.id.clone()));
+
+        // B's replay cursor did not move: B's own first frame still counts.
+        let frames = send(
+            &mut terminals,
+            &mut b,
+            &b_id,
+            &TermPlaintextV2::Data(b"real".to_vec()),
+        );
+        assert_eq!(writer_changes(&frames), vec![Some(b.id.clone())]);
+        assert_eq!(writer(&terminals), Some(b.id.clone()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_leave_rotates_the_epoch_and_the_leaver_cannot_open_new_frames() {
+        let (tx, _rx) = channel();
+        let mut terminals = multi_registry(tx);
+        let startup = enabled_startup(false);
+        let mut a = TestViewer::new(1);
+        let mut b = TestViewer::new(2);
+        let mut c = TestViewer::new(3);
+        let opened = open_viewer(&mut terminals, &startup, &mut a);
+        a.receive(MULTI_TERMINAL, &opened);
+        let attached = attach_viewer(&mut terminals, &startup, &mut b);
+        b.receive(MULTI_TERMINAL, &attached);
+        let attached = attach_viewer(&mut terminals, &startup, &mut c);
+        c.receive(MULTI_TERMINAL, &attached);
+        let (_, b_old_key) = b.out.expect("b key");
+
+        // B takes the writer, then stops viewing.
+        let b_id = b.id.clone();
+        send(
+            &mut terminals,
+            &mut b,
+            &b_id,
+            &TermPlaintextV2::Data(b"b".to_vec()),
+        );
+        let frames = terminals.detach(MULTI_TERMINAL, Some(&b_id));
+        assert_eq!(writer_changes(&frames), vec![None]);
+        assert_eq!(writer(&terminals), None);
+        assert!(rejection(&frames).is_none(), "a detach is not a rejection");
+        assert_eq!(a.receive(MULTI_TERMINAL, &frames), vec![Seen::Key(2)]);
+        assert_eq!(c.receive(MULTI_TERMINAL, &frames), vec![Seen::Key(2)]);
+        assert!(b.receive(MULTI_TERMINAL, &frames).is_empty());
+        assert_ne!(a.out.expect("a key").1, b_old_key);
+        assert_eq!(a.out, c.out);
+
+        let live = terminals.on_bytes(MULTI_TERMINAL, b"after");
+        assert_eq!(
+            a.receive(MULTI_TERMINAL, &live),
+            vec![Seen::Data(b"after".to_vec())]
+        );
+        assert_eq!(
+            c.receive(MULTI_TERMINAL, &live),
+            vec![Seen::Data(b"after".to_vec())]
+        );
+        let OutboundFrame::Binary(
+            RelayBinaryFrameMetadata::TermSealed {
+                seq,
+                epoch: Some(epoch),
+                ..
+            },
+            body,
+        ) = &live[0]
+        else {
+            panic!("expected a broadcast frame");
+        };
+        assert_eq!((*epoch, *seq), (2, 1), "a new epoch restarts seq at 1");
+        for try_epoch in [1, 2] {
+            assert!(
+                terminal_crypto::open_broadcast(&b_old_key, MULTI_TERMINAL, try_epoch, *seq, body)
+                    .is_err()
+            );
+        }
+        assert_eq!(b.receive(MULTI_TERMINAL, &live), vec![Seen::Opaque]);
+        // The leaver's input is no longer accepted.
+        let frames = send(
+            &mut terminals,
+            &mut b,
+            &b_id,
+            &TermPlaintextV2::Data(b"late".to_vec()),
+        );
+        assert!(frames.is_empty());
+        // With no writer, any viewer's resize applies.
+        let c_id = c.id.clone();
+        let frames = send(
+            &mut terminals,
+            &mut c,
+            &c_id,
+            &TermPlaintextV2::Resize { cols: 70, rows: 20 },
+        );
+        assert_eq!(a.receive(MULTI_TERMINAL, &frames), vec![Seen::Size(70, 20)]);
+        assert_eq!(pty_size(&terminals), (70, 20));
+        assert_eq!(writer(&terminals), None, "a resize never claims the writer");
+
+        // A per-viewer fault removes only C, and rotates again.
+        let frames = send(
+            &mut terminals,
+            &mut c,
+            &c_id,
+            &TermPlaintextV2::OutputKey {
+                epoch: 9,
+                key: [0_u8; 32],
+            },
+        );
+        assert_eq!(
+            rejection(&frames),
+            Some((Some(c.id.clone()), REASON_BAD_FRAME.to_string()))
+        );
+        assert_eq!(a.receive(MULTI_TERMINAL, &frames), vec![Seen::Key(3)]);
+        assert!(terminals.sessions.contains_key(MULTI_TERMINAL));
+        let session = terminals.sessions.get(MULTI_TERMINAL).expect("session");
+        assert_eq!(
+            session.viewers.keys().cloned().collect::<Vec<_>>(),
+            vec![a.id.clone()]
+        );
+
+        // A malformed relay frame naming A removes A as well.
+        let a_id = a.id.clone();
+        let frames = terminals.drop_viewer(MULTI_TERMINAL, &a_id);
+        assert_eq!(
+            rejection(&frames),
+            Some((Some(a.id.clone()), REASON_BAD_FRAME.to_string()))
+        );
+        let session = terminals.sessions.get(MULTI_TERMINAL).expect("session");
+        assert!(session.viewers.is_empty());
+        assert!(session.detached_at.is_some());
+        // With no viewers, output is only recorded.
+        assert!(terminals.on_bytes(MULTI_TERMINAL, b"quiet").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn viewer_cap_duplicates_and_idle_close() {
+        let (tx, _rx) = channel();
+        let mut terminals = TerminalRegistry::with_shell_mode(
+            tx,
+            Duration::from_millis(200),
+            "/bin/sh",
+            &["-c", "sleep 30"],
+            true,
+        );
+        let startup = enabled_startup(false);
+        let mut viewers = (1..=MAX_VIEWERS as u8)
+            .map(TestViewer::new)
+            .collect::<Vec<_>>();
+        open_viewer(&mut terminals, &startup, &mut viewers[0]);
+        for viewer in viewers.iter_mut().skip(1) {
+            attach_viewer(&mut terminals, &startup, viewer);
+        }
+        let extra = TestViewer::new(50);
+        let frames = terminals.attach(&startup, None, extra.handshake(MULTI_TERMINAL, 0, 0));
+        assert_eq!(
+            rejection(&frames),
+            Some((Some(extra.id.clone()), REASON_VIEWER_LIMIT.to_string()))
+        );
+        let duplicate =
+            terminals.attach(&startup, None, viewers[1].handshake(MULTI_TERMINAL, 0, 0));
+        assert_eq!(
+            rejection(&duplicate),
+            Some((
+                Some(viewers[1].id.clone()),
+                REASON_BAD_HANDSHAKE.to_string()
+            ))
+        );
+        let missing = terminals.attach(
+            &startup,
+            None,
+            TermHandshake {
+                viewer_id: None,
+                ..extra.handshake(MULTI_TERMINAL, 0, 0)
+            },
+        );
+        assert_eq!(
+            rejection(&missing),
+            Some((None, REASON_BAD_HANDSHAKE.to_string()))
+        );
+
+        // One viewer left keeps the terminal alive past the idle limit.
+        for viewer in viewers.iter().skip(1) {
+            terminals.detach(MULTI_TERMINAL, Some(&viewer.id));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(terminals.poll(Instant::now()).is_empty());
+        terminals.detach(MULTI_TERMINAL, Some(&viewers[0].id));
+        std::thread::sleep(Duration::from_millis(250));
+        let frames = terminals.poll(Instant::now());
+        assert!(matches!(
+            controls(&frames)[0],
+            ClientControlMessage::TermExit { terminal_id, .. } if terminal_id == MULTI_TERMINAL
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_pending_approvals_both_complete() {
+        use p256::elliptic_curve::Generate;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tx, _rx) = channel();
+        let mut terminals = multi_registry(tx);
+        let startup = enabled_startup(true);
+        let identity = p256::ecdsa::SigningKey::try_generate().expect("identity");
+        let identity_raw = {
+            let encoded = identity.verifying_key().to_sec1_point(false);
+            let mut raw = [0_u8; 65];
+            raw.copy_from_slice(encoded.as_bytes());
+            raw
+        };
+        let identity_message = TerminalIdentity {
+            public_key: terminal_crypto::encode_b64url(&identity_raw),
+            signature: None,
+        };
+        crate::approvals::record_pending(dir.path(), &identity_raw).expect("pending");
+        crate::approvals::approve(dir.path(), &terminal_crypto::approval_code(&identity_raw))
+            .expect("approve");
+        let sign = |viewer: &TestViewer, cli_nonce: &str| {
+            let signature = terminal_crypto::sign_approval_v2(
+                &identity,
+                MULTI_TERMINAL,
+                &viewer.id,
+                viewer.browser.public_raw(),
+                &viewer.nonce,
+                startup.key().public_raw(),
+                &terminal_crypto::decode_nonce(cli_nonce).expect("nonce"),
+            )
+            .expect("sign");
+            terminal_crypto::encode_b64url(&signature)
+        };
+
+        let mut a = TestViewer::new(1);
+        let pending = terminals.open(
+            &startup,
+            &Config::default(),
+            Some(dir.path()),
+            TermHandshake {
+                identity: Some(&identity_message),
+                ..a.handshake(MULTI_TERMINAL, 80, 24)
+            },
+        );
+        assert!(matches!(
+            controls(&pending)[0],
+            ClientControlMessage::TermPending { viewer_id: Some(id), .. } if id == &a.id
+        ));
+        let a_nonce = cli_nonce_of(&pending);
+        let a_id = a.id.clone();
+        let opened = terminals.auth(
+            &startup,
+            &Config::default(),
+            Some(dir.path()),
+            MULTI_TERMINAL,
+            Some(&a_id),
+            &sign(&a, &a_nonce),
+        );
+        assert!(matches!(
+            controls(&opened)[0],
+            ClientControlMessage::TermOpened { viewer_id: Some(id), .. } if id == &a.id
+        ));
+        a.bind(&startup, MULTI_TERMINAL, &a_nonce);
+        assert_eq!(
+            a.receive(MULTI_TERMINAL, &opened),
+            vec![Seen::Key(1), Seen::Size(80, 24)]
+        );
+
+        let mut b = TestViewer::new(2);
+        let mut c = TestViewer::new(3);
+        let mut nonces = Vec::new();
+        for viewer in [&b, &c] {
+            let pending = terminals.attach(
+                &startup,
+                Some(dir.path()),
+                TermHandshake {
+                    identity: Some(&identity_message),
+                    ..viewer.handshake(MULTI_TERMINAL, 0, 0)
+                },
+            );
+            assert!(matches!(
+                controls(&pending)[0],
+                ClientControlMessage::TermPending { viewer_id: Some(id), .. } if id == &viewer.id
+            ));
+            nonces.push(cli_nonce_of(&pending));
+        }
+        assert_eq!(terminals.pending.len(), 2);
+        // B's signature does not verify for C: the transcript binds the viewer.
+        let c_id = c.id.clone();
+        let wrong = terminals.auth(
+            &startup,
+            &Config::default(),
+            Some(dir.path()),
+            MULTI_TERMINAL,
+            Some(&c_id),
+            &sign(&b, &nonces[0]),
+        );
+        assert_eq!(
+            rejection(&wrong),
+            Some((Some(c.id.clone()), REASON_BAD_SIGNATURE.to_string()))
+        );
+        // Re-queue C, then complete C before B.
+        let pending = terminals.attach(
+            &startup,
+            Some(dir.path()),
+            TermHandshake {
+                identity: Some(&identity_message),
+                ..c.handshake(MULTI_TERMINAL, 0, 0)
+            },
+        );
+        nonces[1] = cli_nonce_of(&pending);
+        let attached_c = terminals.auth(
+            &startup,
+            &Config::default(),
+            Some(dir.path()),
+            MULTI_TERMINAL,
+            Some(&c_id),
+            &sign(&c, &nonces[1]),
+        );
+        let b_id = b.id.clone();
+        let attached_b = terminals.auth(
+            &startup,
+            &Config::default(),
+            Some(dir.path()),
+            MULTI_TERMINAL,
+            Some(&b_id),
+            &sign(&b, &nonces[0]),
+        );
+        for (viewer, frames, nonce) in [
+            (&mut c, &attached_c, &nonces[1]),
+            (&mut b, &attached_b, &nonces[0]),
+        ] {
+            assert!(matches!(
+                controls(frames)[0],
+                ClientControlMessage::TermAttached { viewer_id: Some(id), .. } if id == &viewer.id
+            ));
+            viewer.bind(&startup, MULTI_TERMINAL, nonce);
+            assert_eq!(
+                viewer.receive(MULTI_TERMINAL, frames),
+                vec![Seen::Key(1), Seen::Size(80, 24)]
+            );
+        }
+        assert!(terminals.pending.is_empty());
+        let live = terminals.on_bytes(MULTI_TERMINAL, b"all");
+        for viewer in [&mut a, &mut b, &mut c] {
+            assert_eq!(
+                viewer.receive(MULTI_TERMINAL, &live),
+                vec![Seen::Data(b"all".to_vec())]
+            );
+        }
+
+        // Revoking the identity removes every viewer it approved.
+        crate::approvals::revoke(dir.path(), &terminal_crypto::approval_code(&identity_raw))
+            .expect("revoke");
+        let frames = terminals.poll(Instant::now());
+        let rejected = controls(&frames)
+            .into_iter()
+            .filter(|message| {
+                matches!(
+                    message,
+                    ClientControlMessage::TermRejected { reason, .. }
+                        if reason == REASON_APPROVAL_REQUIRED
+                )
+            })
+            .count();
+        assert_eq!(rejected, 3);
+        assert!(
+            terminals
+                .sessions
+                .get(MULTI_TERMINAL)
+                .expect("session")
+                .viewers
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_mode_sends_no_viewer_ids_writer_or_broadcast() {
+        let (tx, _rx) = channel();
+        let mut terminals = TerminalRegistry::with_shell(
+            tx,
+            Duration::from_secs(60),
+            "/bin/sh",
+            &["-c", "sleep 30"],
+        );
+        let startup = enabled_startup(false);
+        let a = TestViewer::new(1);
+        // A viewer id from a 2.4 relay is ignored.
+        let frames = terminals.open(
+            &startup,
+            &Config::default(),
+            None,
+            a.handshake(MULTI_TERMINAL, 80, 24),
+        );
+        assert_eq!(frames.len(), 1);
+        assert!(matches!(
+            controls(&frames)[0],
+            ClientControlMessage::TermOpened {
+                viewer_id: None,
+                ..
+            }
+        ));
+        let output = terminals.on_bytes(MULTI_TERMINAL, b"x");
+        assert!(matches!(
+            &output[0],
+            OutboundFrame::Binary(
+                RelayBinaryFrameMetadata::TermSealed {
+                    viewer_id: None,
+                    epoch: None,
+                    ..
+                },
+                _
+            )
+        ));
+        // Attach replaces the viewer without a writer message.
+        let b = TestViewer::new(2);
+        let frames = terminals.attach(&startup, None, b.handshake(MULTI_TERMINAL, 0, 0));
+        assert!(matches!(
+            controls(&frames)[0],
+            ClientControlMessage::TermAttached {
+                viewer_id: None,
+                ..
+            }
+        ));
+        assert!(writer_changes(&frames).is_empty());
+        let session = terminals.sessions.get(MULTI_TERMINAL).expect("session");
+        assert_eq!(session.viewers.len(), 1);
+        assert!(session.out.is_none());
     }
 
     #[cfg(unix)]

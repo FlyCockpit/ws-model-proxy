@@ -94,7 +94,7 @@ use crate::probe::{ProbeReport, apply_probe_report, probe_endpoint};
 use crate::protocol::parse_binary_frame;
 use crate::protocol::{
     CliInventory, ClientControlMessage, EndpointInventory, EndpointStatus, FrameFault,
-    RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS, RELAY_PROTOCOL_VERSION, RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+    ProtocolNegotiation, RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS, RELAY_REQUEST_BODY_WINDOW_CHUNKS,
     RELAY_SUBPROTOCOL, RelayBinaryFrameMetadata, RelayFailure, ServerControlMessage,
     binary_frame_fault, control_frame_fault, encode_binary_frame, encode_control,
     endpoint_inventory, parse_server_control,
@@ -399,6 +399,8 @@ enum RelaySessionError {
         reset_backoff: bool,
     },
     Fatal(anyhow::Error),
+    /// The server rejected the first 2.5 hello; reconnect now with 2.4.
+    ProtocolDowngrade,
 }
 
 type RelaySessionResult<T> = std::result::Result<T, RelaySessionError>;
@@ -436,6 +438,8 @@ pub fn connect_foreground() -> Result<()> {
     // inventory on reconnect.
     let mut acknowledged_config_modified_at = None;
     let mut reconnect_delay = RELAY_RECONNECT_INITIAL_DELAY;
+    // Sticky for the process: at most one 2.5 -> 2.4 downgrade.
+    let mut negotiation = ProtocolNegotiation::new();
     loop {
         // Reuse only a locally unchanged snapshot that the server has already
         // acknowledged. Reconnect registration still replaces the server
@@ -487,7 +491,15 @@ pub fn connect_foreground() -> Result<()> {
             endpoints,
             &mut control,
             &mut last_inventory_revision,
+            &mut negotiation,
         ) {
+            Err(RelaySessionError::ProtocolDowngrade) => {
+                tracing::warn!(
+                    protocol_version = negotiation.mode().version(),
+                    "relay server does not accept protocol 2.5; reconnecting with the single-viewer protocol"
+                );
+                continue;
+            }
             Ok(()) => {
                 tracing::warn!(
                     retry_delay_secs = reconnect_delay.as_secs(),
@@ -689,7 +701,9 @@ fn run_relay_session(
     endpoints: Vec<EndpointInventory>,
     _control: &mut ControlServer,
     last_inventory_revision: &mut Option<crate::protocol::InventoryRevision>,
+    negotiation: &mut ProtocolNegotiation,
 ) -> RelaySessionResult<()> {
+    let mode = negotiation.mode();
     let mut request = ws_url
         .as_str()
         .into_client_request()
@@ -718,12 +732,12 @@ fn run_relay_session(
 
     // Created before hello so an early `?` still drops (and kills) every child.
     let (worker_tx, worker_rx) = mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
-    let mut terminals = TerminalRegistry::new(worker_tx.clone());
+    let mut terminals = TerminalRegistry::new(worker_tx.clone(), mode.terminal_viewers());
     let mut execs = ExecRegistry::new(worker_tx.clone(), DEFAULT_EXEC_TIMEOUT);
 
     let hello = ClientControlMessage::Hello {
         id: next_id("hello"),
-        protocol_version: RELAY_PROTOCOL_VERSION.to_string(),
+        protocol_version: mode.version().to_string(),
         cli: CliInventory {
             slug: cli_slug.to_string(),
             label: config
@@ -731,7 +745,7 @@ fn run_relay_session(
                 .clone()
                 .unwrap_or_else(|| "CLI device".to_string()),
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
-            capabilities: startup::hello_capabilities(startup, config),
+            capabilities: startup::hello_capabilities(startup, config, mode),
         },
         endpoints,
     };
@@ -757,6 +771,7 @@ fn run_relay_session(
     #[cfg(unix)]
     let mut reload_preparing = false;
 
+    let mut registered = false;
     let mut next_heartbeat =
         Instant::now() + Duration::from_secs(RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS);
     let result = loop {
@@ -865,6 +880,8 @@ fn run_relay_session(
                 &mut recent_finished,
                 &mut terminals,
                 &mut execs,
+                negotiation,
+                &mut registered,
             ),
             Ok(Message::Binary(bytes)) => handle_binary(
                 &mut socket,
@@ -1377,6 +1394,8 @@ fn handle_text<S>(
     recent_finished: &mut RecentlyFinished,
     terminals: &mut TerminalRegistry,
     execs: &mut ExecRegistry,
+    negotiation: &mut ProtocolNegotiation,
+    registered: &mut bool,
 ) -> RelaySessionResult<()>
 where
     S: std::io::Read + std::io::Write,
@@ -1390,6 +1409,7 @@ where
     let state_dir = crate::paths::state_dir().ok();
     match message {
         ServerControlMessage::HelloOk { id, revision, .. } => {
+            *registered = true;
             *last_inventory_revision = Some(revision);
             tracing::info!(id, "relay registration accepted");
         }
@@ -1509,6 +1529,9 @@ where
             }
         }
         ServerControlMessage::ProtocolError { message, .. } => {
+            if negotiation.downgrade_on_protocol_error(*registered, &message) {
+                return Err(RelaySessionError::ProtocolDowngrade);
+            }
             return Err(RelaySessionError::Fatal(anyhow::anyhow!(
                 "relay protocol error: {message}"
             )));
@@ -1568,6 +1591,7 @@ where
             browser_public_key,
             browser_nonce,
             identity,
+            viewer_id,
         } => {
             send_outbound_frames(
                 socket,
@@ -1577,6 +1601,7 @@ where
                     state_dir.as_deref(),
                     TermHandshake {
                         terminal_id: &terminal_id,
+                        viewer_id: viewer_id.as_deref(),
                         cols,
                         rows,
                         browser_public_key: &browser_public_key,
@@ -1588,6 +1613,7 @@ where
         }
         ServerControlMessage::TermAttach {
             terminal_id,
+            viewer_id,
             browser_public_key,
             browser_nonce,
             identity,
@@ -1599,6 +1625,7 @@ where
                     state_dir.as_deref(),
                     TermHandshake {
                         terminal_id: &terminal_id,
+                        viewer_id: viewer_id.as_deref(),
                         cols: 0,
                         rows: 0,
                         browser_public_key: &browser_public_key,
@@ -1608,12 +1635,18 @@ where
                 ),
             )?;
         }
-        ServerControlMessage::TermDetach { terminal_id } => terminals.detach(&terminal_id),
+        ServerControlMessage::TermDetach {
+            terminal_id,
+            viewer_id,
+        } => {
+            send_outbound_frames(socket, terminals.detach(&terminal_id, viewer_id.as_deref()))?;
+        }
         ServerControlMessage::TermClose { terminal_id } => {
             send_outbound_frames(socket, terminals.close(&terminal_id))?;
         }
         ServerControlMessage::TermAuth {
             terminal_id,
+            viewer_id,
             signature,
         } => {
             send_outbound_frames(
@@ -1623,6 +1656,7 @@ where
                     config,
                     state_dir.as_deref(),
                     &terminal_id,
+                    viewer_id.as_deref(),
                     &signature,
                 ),
             )?;
@@ -1779,6 +1813,16 @@ where
             tracing::warn!(terminal_id, "closing a terminal after a malformed frame");
             send_outbound_frames(socket, terminals.close(&terminal_id))
         }
+        FrameFault::DropViewer {
+            terminal_id,
+            viewer_id,
+        } => {
+            tracing::warn!(
+                terminal_id,
+                "removing a terminal viewer after a malformed frame"
+            );
+            send_outbound_frames(socket, terminals.drop_viewer(&terminal_id, &viewer_id))
+        }
         FrameFault::CloseCommand { command_id } => {
             tracing::warn!(command_id, "closing a command after a malformed frame");
             send_outbound_frames(socket, execs.cancel(&command_id))
@@ -1816,8 +1860,16 @@ where
     } = metadata
     else {
         return match metadata {
-            RelayBinaryFrameMetadata::TermSealed { terminal_id, seq } => {
-                send_outbound_frames(socket, terminals.handle_sealed(&terminal_id, seq, &body))?;
+            RelayBinaryFrameMetadata::TermSealed {
+                terminal_id,
+                seq,
+                viewer_id,
+                ..
+            } => {
+                send_outbound_frames(
+                    socket,
+                    terminals.handle_sealed(&terminal_id, viewer_id.as_deref(), seq, &body),
+                )?;
                 Ok(())
             }
             RelayBinaryFrameMetadata::ExecStdout { command_id, .. }
@@ -2437,6 +2489,7 @@ fn worker_send_control(tx: &SyncSender<FromWorker>, message: &ClientControlMessa
         | ClientControlMessage::TermOpened { .. }
         | ClientControlMessage::TermAttached { .. }
         | ClientControlMessage::TermRejected { .. }
+        | ClientControlMessage::TermWriter { .. }
         | ClientControlMessage::TermExit { .. }
         | ClientControlMessage::ExecStarted { .. }
         | ClientControlMessage::ExecRejected { .. }

@@ -9,7 +9,9 @@ use crate::config::{
     CapabilityOverrideMode, EndpointConfig, EndpointKind, OpenAiCompatibleCapabilities,
 };
 
-pub const RELAY_PROTOCOL_VERSION: &str = "2.4";
+pub const RELAY_PROTOCOL_VERSION: &str = "2.5";
+/// Spoken after an old server rejects the first 2.5 hello. Single-viewer terminals.
+pub const RELAY_LEGACY_PROTOCOL_VERSION: &str = "2.4";
 pub const RELAY_SUBPROTOCOL: &str = "ws-model-proxy.relay.v2";
 pub const RELAY_JSON_CONTROL_MAX_BYTES: usize = 64 * 1024;
 pub const RELAY_BINARY_CHUNK_MAX_BYTES: usize = 1024 * 1024;
@@ -19,6 +21,63 @@ pub const RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS: u64 = 20;
 /// credit (`relay.request.body.ack`) to the server for each chunk its upstream
 /// request consumes. Mirrors `RELAY_REQUEST_BODY_WINDOW_CHUNKS` on the server.
 pub const RELAY_REQUEST_BODY_WINDOW_CHUNKS: usize = 16;
+
+/// The relay protocol this process speaks. 2.5 adds multi-viewer terminals;
+/// 2.4 is the sticky fallback for servers that do not know 2.5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayProtocolMode {
+    V25,
+    Legacy24,
+}
+
+impl RelayProtocolMode {
+    pub fn version(self) -> &'static str {
+        match self {
+            Self::V25 => RELAY_PROTOCOL_VERSION,
+            Self::Legacy24 => RELAY_LEGACY_PROTOCOL_VERSION,
+        }
+    }
+
+    pub fn terminal_viewers(self) -> bool {
+        matches!(self, Self::V25)
+    }
+}
+
+/// The 2.5 -> 2.4 fallback. The first hello that gets `protocol.error` before
+/// `hello.ok` downgrades once; the downgrade is sticky for the process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtocolNegotiation {
+    mode: RelayProtocolMode,
+}
+
+impl Default for ProtocolNegotiation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProtocolNegotiation {
+    pub fn new() -> Self {
+        Self {
+            mode: RelayProtocolMode::V25,
+        }
+    }
+
+    pub fn mode(self) -> RelayProtocolMode {
+        self.mode
+    }
+
+    /// `true` when this `protocol.error` should trigger the one reconnect with
+    /// a 2.4 hello. An access denial is not a version mismatch, so it never
+    /// downgrades.
+    pub fn downgrade_on_protocol_error(&mut self, registered: bool, message: &str) -> bool {
+        if registered || self.mode != RelayProtocolMode::V25 || message == "access_denied" {
+            return false;
+        }
+        self.mode = RelayProtocolMode::Legacy24;
+        true
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(
@@ -77,6 +136,8 @@ pub enum ClientControlMessage {
     #[serde(rename = "term.pending")]
     TermPending {
         terminal_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        viewer_id: Option<String>,
         cli_nonce: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         approval_code: Option<String>,
@@ -84,19 +145,33 @@ pub enum ClientControlMessage {
     #[serde(rename = "term.opened")]
     TermOpened {
         terminal_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        viewer_id: Option<String>,
         cli_nonce: String,
     },
     #[serde(rename = "term.attached")]
     TermAttached {
         terminal_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        viewer_id: Option<String>,
         cli_nonce: String,
     },
     #[serde(rename = "term.rejected")]
     TermRejected {
         terminal_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        viewer_id: Option<String>,
         reason: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         approval_code: Option<String>,
+    },
+    /// 2.5 only. The viewer that most recently typed; omitted when there is
+    /// no writer. Carries no size.
+    #[serde(rename = "term.writer")]
+    TermWriter {
+        terminal_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        viewer_id: Option<String>,
     },
     #[serde(rename = "term.exit")]
     TermExit {
@@ -208,12 +283,15 @@ pub struct CliCapabilities {
     pub exec: bool,
     pub features: CliReportedFeatures,
     pub terminal_public_key: String,
+    /// 2.5 only; the 2.4 schema is strict and must not see this key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_viewers: Option<bool>,
 }
 
 impl CliCapabilities {
-    pub fn from_snapshot(snapshot: &TerminalFeatureSnapshot) -> Self {
+    pub fn from_snapshot(snapshot: &TerminalFeatureSnapshot, mode: RelayProtocolMode) -> Self {
         Self {
-            protocol_version: RELAY_PROTOCOL_VERSION.to_string(),
+            protocol_version: mode.version().to_string(),
             inventory_ack: true,
             inventory_replace: true,
             endpoint_targeting: true,
@@ -233,6 +311,7 @@ impl CliCapabilities {
                 terminal_supported: cfg!(unix),
             },
             terminal_public_key: snapshot.terminal_public_key_b64url.clone(),
+            terminal_viewers: mode.terminal_viewers().then_some(true),
         }
     }
 }
@@ -354,22 +433,32 @@ enum KnownServerControlMessage {
         browser_nonce: String,
         #[serde(default)]
         identity: Option<TerminalIdentity>,
+        #[serde(default)]
+        viewer_id: Option<String>,
     },
     #[serde(rename = "term.attach")]
     TermAttach {
         terminal_id: String,
+        #[serde(default)]
+        viewer_id: Option<String>,
         browser_public_key: String,
         browser_nonce: String,
         #[serde(default)]
         identity: Option<TerminalIdentity>,
     },
     #[serde(rename = "term.detach")]
-    TermDetach { terminal_id: String },
+    TermDetach {
+        terminal_id: String,
+        #[serde(default)]
+        viewer_id: Option<String>,
+    },
     #[serde(rename = "term.close")]
     TermClose { terminal_id: String },
     #[serde(rename = "term.auth")]
     TermAuth {
         terminal_id: String,
+        #[serde(default)]
+        viewer_id: Option<String>,
         signature: String,
     },
     #[serde(rename = "exec.start")]
@@ -430,21 +519,25 @@ pub enum ServerControlMessage {
         browser_public_key: String,
         browser_nonce: String,
         identity: Option<TerminalIdentity>,
+        viewer_id: Option<String>,
     },
     TermAttach {
         terminal_id: String,
+        viewer_id: Option<String>,
         browser_public_key: String,
         browser_nonce: String,
         identity: Option<TerminalIdentity>,
     },
     TermDetach {
         terminal_id: String,
+        viewer_id: Option<String>,
     },
     TermClose {
         terminal_id: String,
     },
     TermAuth {
         terminal_id: String,
+        viewer_id: Option<String>,
         signature: String,
     },
     ExecStart {
@@ -495,8 +588,19 @@ pub enum RelayBinaryFrameMetadata {
         #[serde(rename = "final", default, skip_serializing_if = "Option::is_none")]
         final_chunk: Option<bool>,
     },
+    /// 2.5 adds exactly one routing field on CLI->browser frames: `viewerId`
+    /// for unicast (pairwise keys) or `epoch` for broadcast (shared output
+    /// key). Browser->CLI frames carry the `viewerId` the server stamped.
+    /// 2.4 frames carry neither.
     #[serde(rename = "term.sealed")]
-    TermSealed { terminal_id: String, seq: u64 },
+    TermSealed {
+        terminal_id: String,
+        seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        viewer_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        epoch: Option<u32>,
+    },
     #[serde(rename = "exec.stdout")]
     ExecStdout { command_id: String, seq: u64 },
     #[serde(rename = "exec.stderr")]
@@ -744,6 +848,7 @@ impl From<KnownServerControlMessage> for ServerControlMessage {
                 browser_public_key,
                 browser_nonce,
                 identity,
+                viewer_id,
             } => Self::TermOpen {
                 terminal_id,
                 cols,
@@ -751,27 +856,36 @@ impl From<KnownServerControlMessage> for ServerControlMessage {
                 browser_public_key,
                 browser_nonce,
                 identity,
+                viewer_id,
             },
             KnownServerControlMessage::TermAttach {
                 terminal_id,
+                viewer_id,
                 browser_public_key,
                 browser_nonce,
                 identity,
             } => Self::TermAttach {
                 terminal_id,
+                viewer_id,
                 browser_public_key,
                 browser_nonce,
                 identity,
             },
-            KnownServerControlMessage::TermDetach { terminal_id } => {
-                Self::TermDetach { terminal_id }
-            }
+            KnownServerControlMessage::TermDetach {
+                terminal_id,
+                viewer_id,
+            } => Self::TermDetach {
+                terminal_id,
+                viewer_id,
+            },
             KnownServerControlMessage::TermClose { terminal_id } => Self::TermClose { terminal_id },
             KnownServerControlMessage::TermAuth {
                 terminal_id,
+                viewer_id,
                 signature,
             } => Self::TermAuth {
                 terminal_id,
+                viewer_id,
                 signature,
             },
             KnownServerControlMessage::ExecStart {
@@ -875,8 +989,17 @@ pub fn parse_binary_frame(frame: &[u8]) -> Result<(RelayBinaryFrameMetadata, Vec
 pub enum FrameFault {
     Fatal,
     Ignore,
-    CloseTerminal { terminal_id: String },
-    CloseCommand { command_id: String },
+    CloseTerminal {
+        terminal_id: String,
+    },
+    /// 2.5: a malformed frame that names a viewer removes only that viewer.
+    DropViewer {
+        terminal_id: String,
+        viewer_id: String,
+    },
+    CloseCommand {
+        command_id: String,
+    },
 }
 
 pub fn control_frame_fault(text: &str) -> FrameFault {
@@ -952,10 +1075,18 @@ fn interactive_fault(value: &Value, text_frame: bool) -> FrameFault {
         return FrameFault::Fatal;
     }
     if type_name.starts_with("term.") {
-        return match string_field(value, "terminalId") {
-            Some(terminal_id) => FrameFault::CloseTerminal { terminal_id },
-            None => FrameFault::Ignore,
+        let Some(terminal_id) = string_field(value, "terminalId") else {
+            return FrameFault::Ignore;
         };
+        if type_name != "term.close"
+            && let Some(viewer_id) = string_field(value, "viewerId")
+        {
+            return FrameFault::DropViewer {
+                terminal_id,
+                viewer_id,
+            };
+        }
+        return FrameFault::CloseTerminal { terminal_id };
     }
     if type_name.starts_with("exec.") {
         return match string_field(value, "commandId") {
@@ -1081,12 +1212,15 @@ mod tests {
                 slug: "desktop".to_string(),
                 label: "Desktop".to_string(),
                 version: None,
-                capabilities: CliCapabilities::from_snapshot(&TerminalFeatureSnapshot {
-                    allow_human_terminal: false,
-                    allow_mcp_commands: true,
-                    require_terminal_approval: false,
-                    terminal_public_key_b64url: "AQID".to_string(),
-                }),
+                capabilities: CliCapabilities::from_snapshot(
+                    &TerminalFeatureSnapshot {
+                        allow_human_terminal: false,
+                        allow_mcp_commands: true,
+                        require_terminal_approval: false,
+                        terminal_public_key_b64url: "AQID".to_string(),
+                    },
+                    RelayProtocolMode::V25,
+                ),
             },
             endpoints: vec![EndpointInventory {
                 slug: "local".to_string(),
@@ -1101,7 +1235,8 @@ mod tests {
 
         let encoded = encode_control(&message).expect("encode");
 
-        assert!(encoded.contains(r#""protocolVersion":"2.4""#));
+        assert!(encoded.contains(r#""protocolVersion":"2.5""#));
+        assert!(encoded.contains(r#""terminalViewers":true"#));
         assert!(encoded.contains(r#""sharedTokenizerTps":true"#));
         assert!(encoded.contains(r#""standardizedMetrics":true"#));
         assert!(encoded.contains(r#""terminal":true"#));
@@ -1247,5 +1382,231 @@ mod tests {
         assert!(fatal.len() > RELAY_JSON_CONTROL_MAX_BYTES);
         assert!(!fatal.is_char_boundary(256));
         assert_eq!(control_frame_fault(&fatal), FrameFault::Fatal);
+    }
+    #[test]
+    fn legacy_capabilities_match_the_strict_2_4_schema() {
+        let snapshot = TerminalFeatureSnapshot {
+            allow_human_terminal: true,
+            allow_mcp_commands: true,
+            require_terminal_approval: false,
+            terminal_public_key_b64url: "AQID".to_string(),
+        };
+        let legacy = serde_json::to_value(CliCapabilities::from_snapshot(
+            &snapshot,
+            RelayProtocolMode::Legacy24,
+        ))
+        .expect("encode");
+        assert_eq!(legacy["protocolVersion"], "2.4");
+        assert!(legacy.get("terminalViewers").is_none());
+        let current = serde_json::to_value(CliCapabilities::from_snapshot(
+            &snapshot,
+            RelayProtocolMode::V25,
+        ))
+        .expect("encode");
+        assert_eq!(current["protocolVersion"], "2.5");
+        assert_eq!(current["terminalViewers"], true);
+        let mut legacy_keys = legacy
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        legacy_keys.push("terminalViewers".to_string());
+        legacy_keys.sort();
+        let mut current_keys = current
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        current_keys.sort();
+        assert_eq!(legacy_keys, current_keys);
+    }
+
+    #[test]
+    fn protocol_fallback_happens_once() {
+        let mut negotiation = ProtocolNegotiation::new();
+        assert_eq!(negotiation.mode(), RelayProtocolMode::V25);
+        // After `hello.ok`, a protocol error is not a version mismatch.
+        assert!(!negotiation.downgrade_on_protocol_error(true, "protocol_error"));
+        assert!(!negotiation.downgrade_on_protocol_error(false, "access_denied"));
+        assert_eq!(negotiation.mode(), RelayProtocolMode::V25);
+        assert!(negotiation.downgrade_on_protocol_error(false, "protocol_error"));
+        assert_eq!(negotiation.mode(), RelayProtocolMode::Legacy24);
+        assert_eq!(negotiation.mode().version(), "2.4");
+        assert!(!negotiation.mode().terminal_viewers());
+        // Sticky, and never a second downgrade.
+        assert!(!negotiation.downgrade_on_protocol_error(false, "protocol_error"));
+        assert_eq!(negotiation.mode(), RelayProtocolMode::Legacy24);
+    }
+
+    #[test]
+    fn term_messages_carry_viewer_ids_in_camel_case() {
+        let pending = encode_control(&ClientControlMessage::TermPending {
+            terminal_id: "t".to_string(),
+            viewer_id: Some("v".to_string()),
+            cli_nonce: "n".to_string(),
+            approval_code: None,
+        })
+        .expect("pending");
+        assert!(pending.contains(r#""viewerId":"v""#));
+        for (message, viewer) in [
+            (
+                ClientControlMessage::TermOpened {
+                    terminal_id: "t".to_string(),
+                    viewer_id: Some("v".to_string()),
+                    cli_nonce: "n".to_string(),
+                },
+                true,
+            ),
+            (
+                ClientControlMessage::TermAttached {
+                    terminal_id: "t".to_string(),
+                    viewer_id: None,
+                    cli_nonce: "n".to_string(),
+                },
+                false,
+            ),
+            (
+                ClientControlMessage::TermRejected {
+                    terminal_id: "t".to_string(),
+                    viewer_id: Some("v".to_string()),
+                    reason: "viewer_limit".to_string(),
+                    approval_code: None,
+                },
+                true,
+            ),
+        ] {
+            let text = encode_control(&message).expect("encode");
+            assert_eq!(text.contains(r#""viewerId":"v""#), viewer, "{text}");
+            assert!(!text.contains("viewer_id"));
+            assert!(!text.contains(":null"));
+        }
+        let writer = encode_control(&ClientControlMessage::TermWriter {
+            terminal_id: "t".to_string(),
+            viewer_id: Some("v".to_string()),
+        })
+        .expect("writer");
+        assert_eq!(
+            writer,
+            r#"{"type":"term.writer","terminalId":"t","viewerId":"v"}"#
+        );
+        let none = encode_control(&ClientControlMessage::TermWriter {
+            terminal_id: "t".to_string(),
+            viewer_id: None,
+        })
+        .expect("writer");
+        assert_eq!(none, r#"{"type":"term.writer","terminalId":"t"}"#);
+
+        let key = "A".repeat(87);
+        let nonce = "B".repeat(22);
+        let open = parse_server_control(&format!(
+            r#"{{"type":"term.open","terminalId":"t","viewerId":"v","cols":80,"rows":24,"browserPublicKey":"{key}","browserNonce":"{nonce}"}}"#
+        ))
+        .expect("open");
+        assert!(
+            matches!(open, ServerControlMessage::TermOpen { viewer_id: Some(v), .. } if v == "v")
+        );
+        let attach = parse_server_control(&format!(
+            r#"{{"type":"term.attach","terminalId":"t","viewerId":"v","browserPublicKey":"{key}","browserNonce":"{nonce}"}}"#
+        ))
+        .expect("attach");
+        assert!(
+            matches!(attach, ServerControlMessage::TermAttach { viewer_id: Some(v), .. } if v == "v")
+        );
+        let legacy_attach = parse_server_control(&format!(
+            r#"{{"type":"term.attach","terminalId":"t","browserPublicKey":"{key}","browserNonce":"{nonce}"}}"#
+        ))
+        .expect("legacy attach");
+        assert!(matches!(
+            legacy_attach,
+            ServerControlMessage::TermAttach {
+                viewer_id: None,
+                ..
+            }
+        ));
+        let detach =
+            parse_server_control(r#"{"type":"term.detach","terminalId":"t","viewerId":"v"}"#)
+                .expect("detach");
+        assert!(
+            matches!(detach, ServerControlMessage::TermDetach { viewer_id: Some(v), .. } if v == "v")
+        );
+        let auth = parse_server_control(
+            r#"{"type":"term.auth","terminalId":"t","viewerId":"v","signature":"sig"}"#,
+        )
+        .expect("auth");
+        assert!(
+            matches!(auth, ServerControlMessage::TermAuth { viewer_id: Some(v), signature, .. } if v == "v" && signature == "sig")
+        );
+    }
+
+    #[test]
+    fn sealed_metadata_sets_viewer_or_epoch() {
+        let unicast = RelayBinaryFrameMetadata::TermSealed {
+            terminal_id: "t".to_string(),
+            seq: 1,
+            viewer_id: Some("v".to_string()),
+            epoch: None,
+        };
+        let encoded = encode_binary_frame(&unicast, b"x").expect("unicast");
+        let text = String::from_utf8_lossy(&encoded[4..encoded.len() - 1]).to_string();
+        assert_eq!(
+            text,
+            r#"{"type":"term.sealed","terminalId":"t","seq":1,"viewerId":"v"}"#
+        );
+        let broadcast = RelayBinaryFrameMetadata::TermSealed {
+            terminal_id: "t".to_string(),
+            seq: 2,
+            viewer_id: None,
+            epoch: Some(3),
+        };
+        let encoded = encode_binary_frame(&broadcast, b"x").expect("broadcast");
+        let text = String::from_utf8_lossy(&encoded[4..encoded.len() - 1]).to_string();
+        assert_eq!(
+            text,
+            r#"{"type":"term.sealed","terminalId":"t","seq":2,"epoch":3}"#
+        );
+        let (parsed, _) = parse_binary_frame(&encoded).expect("parse");
+        assert_eq!(parsed, broadcast);
+        // An incoming 2.4 frame has neither field.
+        let meta = br#"{"type":"term.sealed","terminalId":"t","seq":4}"#;
+        let mut legacy = (meta.len() as u32).to_be_bytes().to_vec();
+        legacy.extend_from_slice(meta);
+        let (parsed, _) = parse_binary_frame(&legacy).expect("legacy");
+        assert!(matches!(
+            parsed,
+            RelayBinaryFrameMetadata::TermSealed {
+                viewer_id: None,
+                epoch: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn malformed_frames_naming_a_viewer_drop_only_that_viewer() {
+        assert_eq!(
+            control_frame_fault(r#"{"type":"term.auth","terminalId":"t","viewerId":"v"}"#),
+            FrameFault::DropViewer {
+                terminal_id: "t".to_string(),
+                viewer_id: "v".to_string(),
+            }
+        );
+        assert_eq!(
+            control_frame_fault(r#"{"type":"term.close","terminalId":"t","viewerId":"v"}"#),
+            FrameFault::CloseTerminal {
+                terminal_id: "t".to_string(),
+            }
+        );
+        let meta = br#"{"type":"term.sealed","terminalId":"t","viewerId":"v"}"#;
+        let mut frame = (meta.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(meta);
+        assert_eq!(
+            binary_frame_fault(&frame).expect_err("malformed"),
+            FrameFault::DropViewer {
+                terminal_id: "t".to_string(),
+                viewer_id: "v".to_string(),
+            }
+        );
     }
 }
