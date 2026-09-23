@@ -8,9 +8,9 @@ import type { Context } from "../context";
 const envMock = {
   SMTP_HOST: undefined as string | undefined,
   SIGNUP_ENABLED: true,
-  WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: false,
+  WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
   WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS: undefined as string | undefined,
-  WMP_MCP_ENABLED: false,
+  WMP_MCP_ENABLED: true,
   WMP_MCP_PAT_ALLOW_NO_EXPIRY: true,
   WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: false,
   BETTER_AUTH_URL: "https://proxy.example.com",
@@ -54,9 +54,9 @@ describe("appConfig", () => {
   beforeEach(() => {
     envMock.SMTP_HOST = undefined;
     envMock.SIGNUP_ENABLED = true;
-    envMock.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = false;
+    envMock.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
     envMock.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS = undefined;
-    envMock.WMP_MCP_ENABLED = false;
+    envMock.WMP_MCP_ENABLED = true;
     envMock.WMP_MCP_PAT_ALLOW_NO_EXPIRY = true;
     envMock.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS = false;
     db.appSetting.findUnique.mockResolvedValue(null);
@@ -88,11 +88,11 @@ describe("appConfig", () => {
     expect(config).toEqual({
       deploymentFeatures: {
         WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: {
-          enabled: false,
+          enabled: true,
           keyringConfigured: false,
           ready: false,
         },
-        WMP_MCP_ENABLED: false,
+        WMP_MCP_ENABLED: true,
         WMP_MCP_PAT_ALLOW_NO_EXPIRY: true,
         WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: false,
         SIGNUP_ENABLED: false,
@@ -102,7 +102,7 @@ describe("appConfig", () => {
       ssoProviderName: "SSO",
       signupEnabled: false,
       adminBootstrapSignupEnabled: false,
-      providerEgressEnabled: false,
+      providerEgressEnabled: true,
       emailEnabled: true,
     });
     expect(config.signupEnabled).toBe(config.deploymentFeatures.SIGNUP_ENABLED);
@@ -145,11 +145,11 @@ describe("appConfig", () => {
   it("reports the non-sensitive provider egress capability", async () => {
     const client = createRouterClient(appRouter, { context: publicContext });
 
-    await expect(client.appConfig()).resolves.toMatchObject({ providerEgressEnabled: false });
-
-    envMock.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
-
     await expect(client.appConfig()).resolves.toMatchObject({ providerEgressEnabled: true });
+
+    envMock.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = false;
+
+    await expect(client.appConfig()).resolves.toMatchObject({ providerEgressEnabled: false });
   });
 
   it("lets a runtime false setting override SIGNUP_ENABLED=true", async () => {

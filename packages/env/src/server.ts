@@ -156,15 +156,16 @@ export const env = createEnv({
       .int()
       .positive()
       .default(15 * 60 * 1000),
-    // Provider egress remains disabled until the full overflow admission and
-    // settlement path is enabled. The keyring is optional while that gate is off.
-    WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: strictBooleanFlag(),
-    // MCP server + OAuth provider surface (Phase 0b). Dormant by
-    // default: while false, the jwt/mcp/cimd auth plugins are not installed,
-    // no OAuth/JWKS routes exist, and the runtime Better Auth schema check
-    // does not expect the OAuth/JWKS tables. Human grant listing/revocation
-    // stays available when disabled (emergency kill switch), by design.
-    WMP_MCP_ENABLED: strictBooleanFlag(),
+    // Kill switch for direct public-provider egress. On by default. Off stops
+    // provider HTTP; on does not send data by itself — a pool still needs the
+    // owner's acknowledgement and a provider member. When on with no keyring,
+    // startup warns once and does not log the key.
+    WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: strictBooleanFlag(true),
+    // Kill switch for the MCP server and OAuth provider surface (jwt/mcp/cimd
+    // plugins, /mcp, discovery, MCP login/consent). On by default. Set false
+    // to omit those plugins and answer the MCP surface with real 404s. Human
+    // grant listing/revocation stays available while disabled.
+    WMP_MCP_ENABLED: strictBooleanFlag(true),
     // MCP personal tokens default to 90 days when expiresAt is omitted.
     // This flag still allows an explicit no-expiry (null) mint. Turn it off
     // to refuse that choice; an omitted expiry stays 90 days, and a chosen

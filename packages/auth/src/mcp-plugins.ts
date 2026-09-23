@@ -18,9 +18,9 @@ import {
 import { createMcpPostLoginOptions, issueMcpGrantClaims } from "./mcp-grant";
 
 /**
- * Dormant, `WMP_MCP_ENABLED`-gated Better Auth 1.7 MCP plugin set. While
- * disabled this returns an empty array so the auth
- * instance's plugin list is exactly (admin, twoFactor, deviceAuthorization) —
+ * `WMP_MCP_ENABLED` kill switch for the Better Auth 1.7 MCP plugin set.
+ * The flag defaults to on. While disabled this returns an empty array so the
+ * auth instance's plugin list is exactly (admin, twoFactor, deviceAuthorization) —
  * no OAuth routes, no JWKS endpoint, and no OAuth/JWKS tables expected by the
  * 1.7.3 runtime prisma-adapter schema check.
  *

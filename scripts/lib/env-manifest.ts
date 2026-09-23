@@ -317,20 +317,22 @@ export const ENV_VARS: EnvVar[] = [
     key: "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED",
     group: "runtime",
     source: "default",
-    default: "false",
+    default: "true",
     comment: [
-      "Release gate for direct public-provider egress. Keep false until admission, budgets, redaction, and SSRF gates pass.",
+      "Kill switch for direct public-provider egress. On by default.",
+      "Off stops provider HTTP. On does not send data by itself: a pool still needs the owner's acknowledgement and a provider member.",
+      "When on with no keyring, startup warns once and does not log the key.",
     ],
   },
   {
     key: "WMP_MCP_ENABLED",
     group: "runtime",
     source: "default",
-    default: "false",
+    default: "true",
     comment: [
-      "Release gate for the MCP server and OAuth provider surface (jwt/mcp/cimd",
-      "plugins, /mcp, discovery, MCP login/consent). Keep false until the feature is",
-      "ready for release. Human grant listing/revocation stays available while disabled.",
+      "Kill switch for the MCP server and OAuth provider surface (jwt/mcp/cimd",
+      "plugins, /mcp, discovery, MCP login/consent). On by default. Set false to",
+      "omit those plugins. Human grant listing/revocation stays available while disabled.",
     ],
   },
   {

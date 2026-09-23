@@ -1677,9 +1677,10 @@ export async function dispatchPublicOverflow(
   request: PublicOverflowRequest,
 ): Promise<PublicOverflowResult> {
   const memberTier = request.memberTier ?? "PUBLIC_OVERFLOW";
-  // The deployment release gate covers every request that can leave WSMP,
-  // including provider-backed PRIMARY members. Existing database state must
-  // not silently bypass an operator's disabled/missing deployment setting.
+  // Kill switch: when WMP_PUBLIC_PROVIDER_EGRESS_ENABLED is false, no provider
+  // attempt leaves WSMP, including provider-backed PRIMARY members. Existing
+  // database state must not bypass an explicit disable. The flag defaults to
+  // on; on does not send data by itself.
   if (!env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED)
     return { dispatched: false, reason: "DEPLOYMENT_GATE_DISABLED" };
   const listed = await listPublicOverflowTargets(request.userId, request.poolId, memberTier);

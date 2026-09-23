@@ -1,8 +1,8 @@
 # MCP server
 
 WS Model Proxy exposes its dashboard operations to MCP (Model Context Protocol)
-clients as an OAuth-protected resource. The surface is disabled by default and
-gated by a single flag: `WMP_MCP_ENABLED`. Everything else — the canonical URL,
+clients as an OAuth-protected resource. The surface is on by default.
+`WMP_MCP_ENABLED` is the kill switch (`false` closes it). Everything else — the canonical URL,
 protocol profile, scopes, token lifetimes, and registration policy — is derived
 from configuration in code, not operator tuning.
 
@@ -29,8 +29,8 @@ Required environment:
 - `BETTER_AUTH_URL`: the canonical **public** origin of the server
   (for example `https://wmp.example.test`). The MCP resource URL, OAuth issuer,
   and DPoP `htu` validation are all derived from this value (see below).
-- `WMP_MCP_ENABLED=true`: installs the Better Auth MCP/OAuth plugins and opens
-  the MCP surface. Default `false`.
+- `WMP_MCP_ENABLED`: installs the Better Auth MCP/OAuth plugins and opens
+  the MCP surface. Default `true`. Set `false` to close it.
 
 Optional:
 
@@ -51,10 +51,11 @@ Optional:
 The generated `.env.example` files track these keys
 (`pnpm env:sync` / `pnpm env:check`); do not hand-edit them.
 
-Deploy the schema before enabling the flag: the MCP surface adds the Better
-Auth OAuth/JWKS tables plus the application-owned `McpGrant` table to the
-Prisma schema. Use the repository's safe schema workflow (`pnpm db:push`
-locally; `APPLY_SCHEMA=safe` for additive deploys).
+The MCP surface uses the Better Auth OAuth/JWKS tables plus the
+application-owned `McpGrant` table. Those models are in the Prisma schema
+whether or not the kill switch is off. Apply them with the repository's safe
+schema workflow (`pnpm db:push` locally; `APPLY_SCHEMA=safe` for additive
+deploys) before first use.
 
 ### Flag-off behavior (emergency kill switch)
 
@@ -606,7 +607,8 @@ When bumping the Better Auth family (`better-auth`, `@better-auth/mcp`,
 
 ## Manual MCP Inspector smoke checklist
 
-Run once against staging with the flag enabled before enabling in production:
+Operator procedure, not a unit test. Run against a deployment that leaves
+`WMP_MCP_ENABLED` at its default of true:
 
 1. Discovery — all four well-known aliases return metadata; the RFC 7591
    `registration_endpoint` is advertised.
