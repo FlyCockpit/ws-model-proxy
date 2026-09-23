@@ -9,7 +9,6 @@ export { relayProtocolAtLeast };
 
 export const RELAY_PROTOCOL_VERSIONS = ["2.0", "2.1", "2.2", "2.3", "2.4", "2.5"] as const;
 export type RelayProtocolVersion = (typeof RELAY_PROTOCOL_VERSIONS)[number];
-export const RELAY_PROTOCOL_VERSION = "2.5" satisfies RelayProtocolVersion;
 export const RELAY_SUBPROTOCOL = "ws-model-proxy.relay.v2";
 
 const RELAY_JSON_CONTROL_MAX_BYTES = 64 * 1024;
@@ -101,7 +100,7 @@ export const cliTerminalIdentitySchema = z
 export type CliTerminalIdentity = z.infer<typeof cliTerminalIdentitySchema>;
 
 /** Server-minted per attachment (2.5). Same shape as a terminal id. */
-export const viewerIdSchema = base64Url16ByteSchema;
+const viewerIdSchema = base64Url16ByteSchema;
 
 const base64UrlTextSchema = z.string().regex(/^[A-Za-z0-9_-]{1,512}$/);
 const terminalIdentitySchema = z

@@ -338,7 +338,6 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     requested: Surface;
     native: Surface;
     behavior: Behavior;
-    expectRejected?: boolean;
     secondBehavior?: Behavior;
     statefulResponses?: boolean;
     grantee?: boolean;
@@ -792,34 +791,6 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       body: JSON.stringify(body),
     });
     const responseText = await response.text().catch(() => "");
-    if (input.expectRejected) {
-      return {
-        rejected: true as const,
-        response,
-        responseText,
-        attemptCount: await modules.prisma.providerAttempt.count({
-          where: { providerModelId: model.id },
-        }),
-        observation: upstreamObservations[observationIndex],
-        ledger: undefined as never,
-        attempt: undefined as never,
-        reservations: [] as never[],
-        settlements: [] as never[],
-        attemptEvents: [] as never[],
-        model,
-        secondModel,
-        user,
-        requester,
-        pool,
-        account,
-        target,
-        grant,
-        credentialId,
-        rawToken,
-        app,
-        modelId,
-      };
-    }
     const ledger = await waitForLedger(model.id);
     const attempt = await waitForTerminalAttempt(model.id);
     await waitForTerminalEvent(model.id);
@@ -835,7 +806,6 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       }),
     ]);
     return {
-      rejected: false as const,
       response,
       ledger,
       attempt,
@@ -1424,27 +1394,24 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     });
   });
 
+  // OpenAI streams report usage only at completion. The Anthropic adapter
+  // sends an estimated input count in message_start and the real usage in
+  // message_delta instead of refusing the stream before egress.
   it.each([
     ["anthropic-messages", "openai-chat"],
     ["anthropic-messages", "openai-responses"],
   ] as const)(
-    "%s rejects unsupported streaming adaptation from %s before egress commitment",
+    "%s adapts a committed %s SSE stream with final usage in message_delta",
     async (requested, native) => {
-      const result = await runCase({
-        requested,
-        native,
-        behavior: "stream",
-        expectRejected: true,
-      });
-      expect(result.rejected).toBe(true);
-      if (!result.rejected) throw new Error("expected pre-dispatch rejection");
-      expect(result.response.status).toBe(400);
-      expect(JSON.parse(result.responseText)).toMatchObject({
-        type: "error",
-        error: { type: "invalid_request_error" },
-      });
-      expect(result.attemptCount).toBe(0);
-      expect(result.observation).toBeUndefined();
+      const result = await runCase({ requested, native, behavior: "stream" });
+      expect(result.response.status).toBe(200);
+      expect(result.attempt.state).toBe("COMPLETED");
+      expect(result.ledger.usageKnown).toBe(true);
+      expectEgressContract(result, native);
+      expectExactSuccessAccounting(result);
+      expectStreamEnvelope(result, requested);
+      expectAdapterTelemetry(result, "adapted", requested, native);
+      expect(result.responseText).toContain('"usage":{"input_tokens":5,"output_tokens":2}');
     },
   );
 

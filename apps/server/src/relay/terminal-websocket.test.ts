@@ -9,6 +9,7 @@ import {
 } from "./protocol.js";
 
 const limiterState = vi.hoisted(() => ({ fail: false }));
+const twoFactorPolicy = vi.hoisted(() => ({ required: vi.fn(async () => false) }));
 const sessions = vi.hoisted(() => ({
   getSession: vi.fn(),
 }));
@@ -33,6 +34,10 @@ vi.mock("@ws-model-proxy/db", async () => {
 
 vi.mock("@ws-model-proxy/auth", () => ({
   auth: { api: { getSession: sessions.getSession } },
+}));
+
+vi.mock("@ws-model-proxy/auth/force-two-factor-policy", () => ({
+  isForceTwoFactorRequired: twoFactorPolicy.required,
 }));
 
 vi.mock("../rate-limit.js", () => ({
@@ -210,9 +215,9 @@ function device(id: string, overrides: Record<string, unknown> = {}) {
   };
 }
 
-function browserSession(cookieUser = "user-id") {
+function browserSession(cookieUser = "user-id", twoFactorEnabled = false) {
   return {
-    user: { id: cookieUser },
+    user: { id: cookieUser, twoFactorEnabled },
     session: {
       id: "session-id",
       userId: cookieUser,
@@ -243,6 +248,43 @@ describe("terminal websocket admission", () => {
   beforeEach(() => {
     limiterState.fail = false;
     sessions.getSession.mockReset();
+    twoFactorPolicy.required.mockReset();
+    twoFactorPolicy.required.mockResolvedValue(false);
+  });
+
+  it("rejects an unenrolled user before upgrade when two-factor is mandatory", async () => {
+    twoFactorPolicy.required.mockResolvedValue(true);
+    sessions.getSession.mockResolvedValue(browserSession("user-id", false));
+    let continued = false;
+    const app = new Hono();
+    app.use("/api/dashboard/terminal/ws", createTerminalWebsocketMiddleware());
+    app.get("/api/dashboard/terminal/ws", (c) => {
+      continued = true;
+      return c.text("upgraded");
+    });
+    const headers = {
+      upgrade: "websocket",
+      cookie: "session=ok",
+      origin: "https://proxy.example.com",
+    };
+    const rejected = await app.request("/api/dashboard/terminal/ws", { headers });
+    expect(rejected.status).toBe(403);
+    await expect(rejected.json()).resolves.toEqual({
+      error: "Two-factor authentication setup is required.",
+    });
+    expect(continued).toBe(false);
+
+    sessions.getSession.mockResolvedValue(browserSession("user-id", true));
+    expect((await app.request("/api/dashboard/terminal/ws", { headers })).status).toBe(200);
+    expect(continued).toBe(true);
+  });
+
+  it("admits an unenrolled user when two-factor is not mandatory", async () => {
+    sessions.getSession.mockResolvedValue(browserSession("user-id", false));
+    const response = await middlewareApp().request("/api/dashboard/terminal/ws", {
+      headers: { upgrade: "websocket", cookie: "session=ok", origin: "https://proxy.example.com" },
+    });
+    expect(response.status).toBe(200);
   });
 
   it("rejects a missing upgrade, a missing session, and a bearer-only credential", async () => {
@@ -360,7 +402,10 @@ describe("terminal browser hub", () => {
     db.session.findUnique.mockResolvedValue({
       userId: "user-id",
       expiresAt: new Date("2026-02-01T00:00:00.000Z"),
+      user: { twoFactorEnabled: false },
     });
+    twoFactorPolicy.required.mockReset();
+    twoFactorPolicy.required.mockResolvedValue(false);
   });
 
   afterEach(async () => {
@@ -567,6 +612,61 @@ describe("terminal browser hub", () => {
     });
     await terminalBrowserHub.recheckSessions(Date.now());
     expect(expired.closes).toEqual([{ code: 4401, reason: "session_expired" }]);
+  });
+
+  it("closes an unenrolled viewer on recheck once two-factor becomes mandatory", async () => {
+    const cli = await connectCli("one");
+    const browser = attachBrowser();
+    await open(browser, "one");
+    expect(cli.jsonSends().some((message) => message.type === "term.open")).toBe(true);
+
+    await terminalBrowserHub.recheckSessions(now.getTime());
+    expect(browser.closes).toEqual([]);
+
+    twoFactorPolicy.required.mockResolvedValue(true);
+    await terminalBrowserHub.recheckSessions(now.getTime());
+    expect(browser.closes).toEqual([{ code: 4401, reason: "two_factor_required" }]);
+    expect(cli.jsonSends().some((message) => message.type === "term.detach")).toBe(true);
+    expect(relaySessionManager.listTerminalsForUser("user-id")).toEqual([
+      expect.objectContaining({ viewerAttached: false }),
+    ]);
+  });
+
+  it("keeps an enrolled viewer when two-factor is mandatory", async () => {
+    twoFactorPolicy.required.mockResolvedValue(true);
+    db.session.findUnique.mockResolvedValue({
+      userId: "user-id",
+      expiresAt: new Date("2026-02-01T00:00:00.000Z"),
+      user: { twoFactorEnabled: true },
+    });
+    const browser = attachBrowser();
+    await terminalBrowserHub.recheckSessions(now.getTime());
+    expect(browser.closes).toEqual([]);
+  });
+
+  it("does not start a terminal when the browser leaves during the device lookup", async () => {
+    const cli = await connectCli("one");
+    const browser = attachBrowser();
+    let releaseLookup: (() => void) | undefined;
+    const lookupStarted = new Promise<void>((started) => {
+      db.cliDevice.findFirst.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseLookup = () => resolve(device("one"));
+            started();
+          }),
+      );
+    });
+    const pending = open(browser, "one");
+    await lookupStarted;
+    browser.readyState = 3;
+    terminalBrowserHub.handleClose(browser);
+    releaseLookup?.();
+    await pending;
+
+    expect(cli.jsonSends().some((message) => message.type === "term.open")).toBe(false);
+    expect(relaySessionManager.listTerminalsForUser("user-id")).toEqual([]);
+    expect(relaySessionManager.terminalCounts("user-id", "one")).toMatchObject({ user: 0, cli: 0 });
   });
 
   it("reports offline for a disconnected CLI and not-found for a foreign terminal id", async () => {

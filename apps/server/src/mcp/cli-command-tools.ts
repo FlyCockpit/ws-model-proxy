@@ -1,5 +1,4 @@
 import {
-  type BoundedBytes,
   type CliCommandSnapshot,
   snapshotCliCommand,
   startCliCommand,
@@ -13,8 +12,6 @@ type CliCommandDeps = {
   signal?: AbortSignal;
   credential: McpRequestCredential;
 };
-
-export type { BoundedBytes, CliCommandSnapshot };
 
 /**
  * Shown on both CLI command tools. Only the wsmp_ credential substrings

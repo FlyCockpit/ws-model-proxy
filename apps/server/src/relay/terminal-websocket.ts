@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { upgradeWebSocket, type WebSocketLike } from "@hono/node-server";
 import type { LiveCliFeatureSnapshot } from "@ws-model-proxy/api/context";
 import type { Session } from "@ws-model-proxy/auth";
+import { isForceTwoFactorRequired } from "@ws-model-proxy/auth/force-two-factor-policy";
 import prisma from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
 import type { Context, MiddlewareHandler } from "hono";
@@ -183,6 +184,10 @@ export function classifyTerminalAvailability(input: {
   if (!live.humanTerminal) return { available: false, reason: "device_disabled", publicKey };
   if (!live.terminalSupported) return { available: false, reason: "unsupported", publicKey };
   return { available: true, reason: "ok", publicKey };
+}
+
+function errorKind(error: unknown): string {
+  return error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error;
 }
 
 function errorMessage(code: TerminalErrorCode): string {
@@ -426,22 +431,37 @@ export class TerminalBrowserHub {
     for (const terminalId of [...this.terminalBinaryAt.keys()]) {
       this.terminalInputAllowed(terminalId, now);
     }
-    for (const conn of [...this.bySocket.values()]) {
-      let row: { expiresAt: Date; userId: string } | null = null;
+    const conns = [...this.bySocket.values()];
+    if (conns.length === 0) return;
+    // Same force-2FA policy as protected dashboard procedures. A failed lookup
+    // skips only this sweep's 2FA check, like a failed session lookup below.
+    let twoFactorRequired: boolean | null = null;
+    try {
+      twoFactorRequired = await isForceTwoFactorRequired();
+    } catch (error) {
+      console.error("[terminal] two-factor policy recheck failed", errorKind(error));
+    }
+    for (const conn of conns) {
+      let row: {
+        expiresAt: Date;
+        userId: string;
+        user: { twoFactorEnabled: boolean | null } | null;
+      } | null = null;
       try {
         row = await prisma.session.findUnique({
           where: { id: conn.sessionId },
-          select: { expiresAt: true, userId: true },
+          select: { expiresAt: true, userId: true, user: { select: { twoFactorEnabled: true } } },
         });
       } catch (error) {
-        console.error(
-          "[terminal] session recheck failed",
-          error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
-        );
+        console.error("[terminal] session recheck failed", errorKind(error));
         continue;
       }
       if (!row || row.userId !== conn.userId || row.expiresAt.getTime() <= now) {
         this.expire(conn);
+        continue;
+      }
+      if (twoFactorRequired === true && !row.user?.twoFactorEnabled) {
+        this.expire(conn, "two_factor_required");
       }
     }
   }
@@ -594,6 +614,9 @@ export class TerminalBrowserHub {
     viewerId: string,
   ) {
     const row = await this.ownedDevice(conn.userId, message.cliDeviceId);
+    // The browser may have gone while the lookup ran. Starting now would leave
+    // a shell with a phantom viewer holding a terminal slot.
+    if (!this.isLive(conn)) return;
     if (!row) {
       this.sendError(conn, "not_found", terminalId);
       return;
@@ -633,6 +656,7 @@ export class TerminalBrowserHub {
     conn: BrowserConn,
     message: Extract<z.infer<typeof browserClientMessageSchema>, { type: "attach" }>,
   ) {
+    if (!this.isLive(conn)) return;
     const result = relaySessionManager.attachTerminal({
       terminalId: message.terminalId,
       userId: conn.userId,
@@ -663,9 +687,17 @@ export class TerminalBrowserHub {
     relaySessionManager.releaseBrowserViewer(conn.userId, conn.id);
   }
 
-  private expire(conn: BrowserConn) {
+  /** Still registered and open, so terminal work on its behalf may proceed. */
+  private isLive(conn: BrowserConn): boolean {
+    return this.bySocket.get(conn.socket) === conn && conn.socket.readyState === 1;
+  }
+
+  private expire(
+    conn: BrowserConn,
+    reason: "session_expired" | "two_factor_required" = "session_expired",
+  ) {
     this.detachAll(conn);
-    if (conn.socket.readyState === 1) conn.socket.close(4401, "session_expired");
+    if (conn.socket.readyState === 1) conn.socket.close(4401, reason);
     this.forgetConn(conn);
   }
 
@@ -752,6 +784,11 @@ export function createTerminalWebsocketMiddleware(): MiddlewareHandler<{
     const normalized = originOf(origin);
     if (!normalized || !terminalAllowedOrigins().has(normalized)) {
       return c.json({ error: "Cross-site request blocked." }, 403);
+    }
+    // Same decision as protected dashboard procedures: an unenrolled user
+    // under the force-2FA policy gets no shell.
+    if ((await isForceTwoFactorRequired()) && !session.user.twoFactorEnabled) {
+      return c.json({ error: "Two-factor authentication setup is required." }, 403);
     }
     const limited = await rateLimit(c, async () => undefined);
     if (limited instanceof Response) return limited;
