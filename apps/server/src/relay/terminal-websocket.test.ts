@@ -502,6 +502,41 @@ describe("terminal browser hub", () => {
     expect(relaySessionManager.listTerminalsForUser("user-id")).toHaveLength(1);
   });
 
+  it("rate-limits browser sealed frames per terminal tab", async () => {
+    const cli = await connectCli("one");
+    const browser = attachBrowser();
+    await open(browser, "one");
+    await open(browser, "one");
+    const terminalIds = cli
+      .jsonSends()
+      .filter((message) => message.type === "term.open")
+      .map((message) => message.terminalId as string);
+    expect(terminalIds).toHaveLength(2);
+    for (const terminalId of terminalIds) {
+      await relaySessionManager.handleTextFrame(
+        cli,
+        JSON.stringify({ type: "term.opened", terminalId, cliNonce: nonce() }),
+      );
+    }
+    const [first, second] = terminalIds as [string, string];
+    const sealed = (terminalId: string, seq: number) =>
+      encodeRelayBinaryFrame({ type: "term.sealed", terminalId, seq }, new Uint8Array([seq % 256]));
+    const binarySends = () => cli.sends.filter((send) => typeof send !== "string").length;
+
+    const dropped = () =>
+      browser
+        .jsonSends()
+        .filter((message) => message.type === "error" && message.code === "input_dropped");
+    for (let seq = 1; seq <= 305; seq += 1) {
+      terminalBrowserHub.handleBinary(browser, sealed(first, seq));
+    }
+    expect(binarySends()).toBe(300);
+    expect(dropped()).toEqual([expect.objectContaining({ terminalId: first })]);
+
+    terminalBrowserHub.handleBinary(browser, sealed(second, 1));
+    expect(binarySends()).toBe(301);
+  });
+
   it("closes with 4401 when the browser session is gone or expired", async () => {
     const browser = attachBrowser();
     db.session.findUnique.mockResolvedValueOnce(null);

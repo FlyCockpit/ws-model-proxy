@@ -29,11 +29,20 @@ export function ignoreUnknownEnvelopeFields(
   value: Record<string, unknown>,
   allowed: readonly string[],
   path: string,
+  seen?: Set<string>,
 ) {
   const set = new Set(allowed);
   const fields = Object.keys(value).filter((key) => !set.has(key));
-  if (fields.length === 0) return;
-  console.debug("[model-api] ignored upstream envelope fields", { path, fields });
+  const fresh = seen
+    ? fields.filter((field) => {
+        const key = `${path}\0${field}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+    : fields;
+  if (fresh.length === 0) return;
+  console.debug("[model-api] ignored upstream envelope fields", { path, fields: fresh });
 }
 
 const chatEnvelopeNullFields = [
@@ -59,6 +68,7 @@ export function acceptChatEnvelopeExtras(
   body: Record<string, unknown>,
   path: string,
   mode: "final" | "chunk",
+  seen?: Set<string>,
 ) {
   ignoreUnknownEnvelopeFields(
     body,
@@ -74,6 +84,7 @@ export function acceptChatEnvelopeExtras(
       ...chatEnvelopeNullFields,
     ],
     path,
+    seen,
   );
   acceptNullOnly(body, path, chatEnvelopeNullFields);
 }
@@ -87,11 +98,13 @@ export function acceptChatChoiceExtras(
   choice: Record<string, unknown>,
   path: string,
   contentKey: "message" | "delta",
+  seen?: Set<string>,
 ) {
   ignoreUnknownEnvelopeFields(
     choice,
     ["index", contentKey, "finish_reason", "logprobs", "stop_reason", ...chatChoiceNullFields],
     path,
+    seen,
   );
   acceptNullOnly(choice, path, chatChoiceNullFields);
 }

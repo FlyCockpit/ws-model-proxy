@@ -241,6 +241,7 @@
     "exited": "The shell exited.",
     "rejected": "The CLI rejected this terminal ({{reason}}).",
     "error": "The terminal connection hit an error.",
+    "inputDropped": "Some input was not delivered because it arrived too fast. Check the last command before you continue.",
     "approvalTitle": "This CLI needs approval",
     "approvalInstructions": "Run this command on that machine, then open the terminal again.",
     "approvalCodeLabel": "Approval code",

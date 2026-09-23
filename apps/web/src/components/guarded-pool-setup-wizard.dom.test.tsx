@@ -41,9 +41,9 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
 });
 vi.mock("@/utils/orpc", () => ({
   orpc: {
-    appConfig: {
+    deploymentFlags: {
       queryOptions: () => ({
-        queryKey: ["appConfig"],
+        queryKey: ["deploymentFlags"],
         // state.appConfigPromise only gates settle timing (pending/rejected);
         // the resolved value is always the current state.appConfig snapshot.
         queryFn: async () => {
@@ -483,7 +483,7 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
     expect(provider.getAttribute("aria-checked")).toBe("true");
 
     // Simulate the settled appConfig snapshot flipping the gate to disabled.
-    client.setQueryData(["appConfig"], {
+    client.setQueryData(["deploymentFlags"], {
       capacityEnabled: true,
       providerEgressEnabled: false,
     });
@@ -561,12 +561,12 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
     expect(screen.getByText("dashboard:pools.wizard.providerEgressDisabled")).toBeTruthy();
   });
 
-  it("registers the page's appConfig observer with refetchOnMount always", () => {
+  it("registers the page's deploymentFlags observer with refetchOnMount always", () => {
     const { client } = mountPage();
 
-    const query = client.getQueryCache().find({ queryKey: ["appConfig"] });
+    const query = client.getQueryCache().find({ queryKey: ["deploymentFlags"] });
     expect(query).toBeDefined();
-    if (!query) throw new Error("appConfig query not registered");
+    if (!query) throw new Error("deploymentFlags query not registered");
     expect(query.observers.length).toBeGreaterThan(0);
     // Structural pin: the page must opt its own observer out of the shared
     // warm-cache defaults so the gate tracks a fresh snapshot per visit.

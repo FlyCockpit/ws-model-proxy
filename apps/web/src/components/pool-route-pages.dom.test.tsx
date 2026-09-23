@@ -87,8 +87,7 @@ vi.mock("@/utils/orpc", () => {
   });
   return {
     orpc: {
-      appConfig: query("appConfig", () => ({
-        capacityEnabled: state.capacityEnabled,
+      deploymentFlags: query("deploymentFlags", () => ({
         providerEgressEnabled: state.providerEgressEnabled,
       })),
       forwarderManagement: {

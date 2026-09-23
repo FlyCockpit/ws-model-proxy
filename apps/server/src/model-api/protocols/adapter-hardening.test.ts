@@ -447,7 +447,9 @@ describe("Claude Code Anthropic request adaptation", () => {
       request: canonical,
       target: "openai-chat",
       model: "cli-chat",
-      acceptsTopK: executionTargetAcceptsTopK({ kind: "cli" }),
+      acceptsTopK: executionTargetAcceptsTopK({
+        capabilityInventory: { sampling: { parameters: ["top_k"] } },
+      }),
     });
     expect(rendered.top_k).toBe(40);
     expect(rendered).not.toHaveProperty("reasoning_effort");
@@ -458,9 +460,12 @@ describe("Claude Code Anthropic request adaptation", () => {
     expect(wire).not.toContain("placeholder-metadata");
     expect(wire).toContain("placeholder-system");
     expect(wire).toContain("placeholder-result-a\\nplaceholder-result-b");
-    expect(executionTargetAcceptsTopK({ kind: "cli", capabilityInventory: { version: 3 } })).toBe(
-      true,
-    );
+    expect(executionTargetAcceptsTopK({ capabilityInventory: { version: 3 } })).toBe(false);
+    expect(
+      executionTargetAcceptsTopK({
+        capabilityInventory: { sampling: { parameters: ["top_k"] } },
+      }),
+    ).toBe(true);
   });
 
   it("rejects the same request for a hosted Chat target that has no top_k sampling extension", async () => {
@@ -473,9 +478,7 @@ describe("Claude Code Anthropic request adaptation", () => {
       },
     };
     expect(capabilityInventoryAcceptsTopK(inventory)).toBe(false);
-    expect(
-      executionTargetAcceptsTopK({ kind: "hosted-provider", capabilityInventory: inventory }),
-    ).toBe(false);
+    expect(executionTargetAcceptsTopK({ capabilityInventory: inventory })).toBe(false);
     expect(() =>
       renderCanonicalRequest({
         request: canonical,

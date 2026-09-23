@@ -92,10 +92,8 @@ vi.mock("@/utils/orpc", () => {
   const providerMutations = Object.fromEntries(names.map((name) => [name, mutation(name)]));
   return {
     orpc: {
-      appConfig: query("appConfig", () => ({
-        deploymentFeatures: {
-          WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: state.allowPrivateNetworks,
-        },
+      deploymentFlags: query("deploymentFlags", () => ({
+        privateNetworksAllowed: state.allowPrivateNetworks,
       })),
       providerManagement: {
         key: () => ["providerManagement"],

@@ -247,7 +247,7 @@ describe("modelApiTokenAccess", () => {
         recommendedSurfaceOverride: "UNSUPPORTED_FUTURE_SURFACE",
         publicEgressEnabled: true,
         publicEgressAcknowledged: true,
-        PoolMembers: [{ id: "provider-primary-member" }],
+        PoolMembers: [{ id: "provider-primary-member", tier: "PRIMARY" }],
       };
       db.discoveredModel.findMany.mockResolvedValue([]);
       db.modelPool.findMany.mockResolvedValue([ownedPool]);
@@ -271,11 +271,20 @@ describe("modelApiTokenAccess", () => {
           select: expect.objectContaining({
             PoolMembers: {
               where: {
-                tier: "PRIMARY",
-                ExecutionTarget: { providerModelId: { not: null } },
+                OR: [
+                  {
+                    tier: "PRIMARY",
+                    ExecutionTarget: { providerModelId: { not: null } },
+                  },
+                  {
+                    tier: "PUBLIC_OVERFLOW",
+                    ExecutionTarget: { providerModelId: { not: null } },
+                  },
+                ],
               },
               select: {
                 id: true,
+                tier: true,
                 ExecutionTarget: {
                   select: {
                     ProviderModel: {

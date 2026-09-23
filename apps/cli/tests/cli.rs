@@ -402,6 +402,56 @@ fn endpoints_add_list_remove_json() {
 }
 
 #[test]
+fn endpoints_concurrency_and_engine_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args([
+            "endpoints",
+            "add",
+            "--slug",
+            "local",
+            "--label",
+            "Local",
+            "--base-url",
+            "http://127.0.0.1:8080/v1",
+            "--concurrency-limit",
+            "4",
+            "--engine",
+            "llama.cpp",
+        ])
+        .assert()
+        .success();
+    let mut list = cli(&config, &state);
+    list.args(["endpoints", "--json", "list"]);
+    let value = json_stdout(list);
+    assert_eq!(value["endpoints"][0]["concurrencyLimit"], 4);
+    assert_eq!(value["endpoints"][0]["engine"], "llama.cpp");
+
+    cli(&config, &state)
+        .args(["endpoints", "concurrency", "local", "--clear"])
+        .assert()
+        .success();
+    cli(&config, &state)
+        .args(["endpoints", "engine", "local", "vllm"])
+        .assert()
+        .success();
+    let mut list = cli(&config, &state);
+    list.args(["endpoints", "--json", "list"]);
+    let value = json_stdout(list);
+    assert!(value["endpoints"][0].get("concurrencyLimit").is_none());
+    assert_eq!(value["endpoints"][0]["engine"], "vllm");
+
+    cli(&config, &state)
+        .args(["endpoints", "concurrency", "missing", "2"])
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::contains("endpoint `missing` not found"));
+}
+
+#[test]
 fn endpoints_remove_unknown_slug_exits_3_not_found() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");

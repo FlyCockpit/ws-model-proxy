@@ -43,6 +43,8 @@ fails the suite when a leaf is unclassified.
 | `core:forwarderCliCommandRun` | `forwarder_cli_command_run` | write | RUN | external | — | — | — |
 | `core:model-api/runChatCompletionDiagnostic` | `forwarder_chat_completion_test` | write | RUN | cost | — | — | — |
 | `core:model-api/runPoolMemberTest` | `forwarder_pool_member_test` | write | RUN | cost | — | — | — |
+| `deploymentFeatures` | — (excluded) | — | — | — | — | — | Admin-only deployment inventory, including keyring status. |
+| `deploymentFlags` | — (excluded) | — | — | — | — | — | Signed-in product gates. The browser reads them; MCP does not. |
 | `devices.list` | — (excluded) | — | — | — | — | — | Admin-only device administration. |
 | `devices.revoke` | — (excluded) | — | — | — | — | — | Admin-only device administration. |
 | `forwarderManagement.addPoolMember` | `forwarder_pool_member_add` | write | — | pure | — | — | — |

@@ -115,9 +115,15 @@ const modelPoolSelect = {
   allowLossyDeveloperRoleCollapse: true,
   recommendedSurfaceOverride: true,
   PoolMembers: {
-    where: providerPrimaryMemberWhere,
+    where: {
+      OR: [
+        providerPrimaryMemberWhere,
+        { tier: "PUBLIC_OVERFLOW", ExecutionTarget: { providerModelId: { not: null } } },
+      ],
+    },
     select: {
       id: true,
+      tier: true,
       ExecutionTarget: {
         select: {
           ProviderModel: {
@@ -176,13 +182,17 @@ function serializeModelPool(
     publicEgressAcknowledged: row.publicEgressAcknowledged,
     effectiveProviderEgress: effectiveProviderEgress({
       publicEgressEnabled: row.publicEgressEnabled,
-      providerPrimaryMemberCount: row.PoolMembers?.length ?? 0,
+      providerPrimaryMemberCount: (row.PoolMembers ?? []).filter(
+        (member) => member.tier === "PRIMARY",
+      ).length,
     }),
-    providerPrimaryMemberCount: row.PoolMembers?.length ?? 0,
+    providerPrimaryMemberCount: (row.PoolMembers ?? []).filter(
+      (member) => member.tier === "PRIMARY",
+    ).length,
     providerAccountLabels: egressProviderAccountLabels({
       publicEgressEnabled: row.publicEgressEnabled,
       members: (row.PoolMembers ?? []).map((member) => ({
-        tier: "PRIMARY",
+        tier: member.tier,
         accountLabel: member.ExecutionTarget?.ProviderModel?.ProviderAccount.label ?? null,
       })),
     }),

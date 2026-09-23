@@ -9,7 +9,7 @@ import {
 import { Flag } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-type DeploymentFeatures = Awaited<ReturnType<AppRouterClient["appConfig"]>>["deploymentFeatures"];
+type DeploymentFeatures = Awaited<ReturnType<AppRouterClient["deploymentFeatures"]>>;
 
 function onOff(value: boolean, onLabel: string, offLabel: string): string {
   return value ? onLabel : offLabel;

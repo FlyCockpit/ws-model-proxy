@@ -55,6 +55,7 @@ export class CanonicalStreamParser {
   #pendingChatStop?: ReturnType<typeof stopReason>;
   #chatUsageSeen = false;
   #droppedReasoningText = false;
+  readonly #seenEnvelopeFields = new Set<string>();
   #messageId?: string;
   #messageModel?: string;
 
@@ -310,7 +311,7 @@ export class CanonicalStreamParser {
     }
     if (this.#pendingChatStop && Array.isArray(value.choices) && value.choices.length > 0)
       throw new AdapterError("event_after_stop", "Chat candidate event followed finish_reason.");
-    acceptChatEnvelopeExtras(value, "stream.data", "chunk");
+    acceptChatEnvelopeExtras(value, "stream.data", "chunk", this.#seenEnvelopeFields);
     if (!Number.isSafeInteger(value.created) || (value.created as number) < 0)
       throw new AdapterError("invalid_stream_event", "Chat created must be a timestamp integer.");
     if (typeof value.model !== "string" || value.model.length === 0)
@@ -334,7 +335,7 @@ export class CanonicalStreamParser {
     if (!choice) return events;
     if (choice.index !== undefined && choice.index !== 0)
       throw new AdapterError("multiple_candidates", "Only candidate zero is adaptable.");
-    acceptChatChoiceExtras(choice, "choices[0]", "delta");
+    acceptChatChoiceExtras(choice, "choices[0]", "delta", this.#seenEnvelopeFields);
     if (choice.logprobs != null) unsupported("choices[0].logprobs");
     const delta = object(choice.delta ?? {}, "choices[0].delta");
     const extras = acceptChatMessageExtras(delta, "choices[0].delta", "delta");
@@ -432,7 +433,12 @@ export class CanonicalStreamParser {
     ]);
     if (!responseEvents.has(type))
       throw new AdapterError("unsupported_stream_event", `Unsupported Responses event: ${type}.`);
-    ignoreUnknownEnvelopeFields(value, responsesFields(type), "stream.data");
+    ignoreUnknownEnvelopeFields(
+      value,
+      responsesFields(type),
+      "stream.data",
+      this.#seenEnvelopeFields,
+    );
     const sequence = value.sequence_number;
     if (!Number.isSafeInteger(sequence) || sequence !== this.#lastSequence + 1)
       throw new AdapterError(
@@ -478,6 +484,7 @@ export class CanonicalStreamParser {
           "service_tier",
         ],
         "stream.data.response",
+        this.#seenEnvelopeFields,
       );
     if (
       type === "response.created" ||
@@ -841,13 +848,19 @@ export class CanonicalStreamParser {
       throw new AdapterError("unsupported_stream_event", `Unsupported Anthropic event: ${type}.`);
     if (this.#stopped && type !== "message_stop")
       throw new AdapterError("event_after_stop", "Anthropic event followed the stop barrier.");
-    ignoreUnknownEnvelopeFields(value, anthropicFields(type), "stream.data");
+    ignoreUnknownEnvelopeFields(
+      value,
+      anthropicFields(type),
+      "stream.data",
+      this.#seenEnvelopeFields,
+    );
     const message = value.message && typeof value.message === "object" ? object(value.message) : {};
     if (type === "message_start")
       ignoreUnknownEnvelopeFields(
         message,
         ["id", "type", "role", "content", "model", "stop_reason", "stop_sequence", "usage"],
         "stream.data.message",
+        this.#seenEnvelopeFields,
       );
     if (type === "message_start") {
       if (

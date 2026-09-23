@@ -27,6 +27,9 @@ export function createRelayWebsocketMiddleware(): MiddlewareHandler<{ Variables:
     if (c.req.header("upgrade")?.toLowerCase() !== "websocket") {
       return c.json({ error: "WebSocket upgrade required." }, 426);
     }
+    if (relaySessionManager.isDraining()) {
+      return c.json({ error: "Server is shutting down." }, 503);
+    }
 
     const limited = await rateLimit(c, async () => undefined);
     if (limited instanceof Response) return limited;

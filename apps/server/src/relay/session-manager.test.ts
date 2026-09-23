@@ -1162,8 +1162,8 @@ describe("relay terminal and exec sessions", () => {
       control.some((message) => message.type === "term.close" && message.terminalId === terminalId),
     ).toBe(true);
     expect(control.some((message) => message.type === "exec.cancel")).toBe(true);
-    expect(cancelled).toBe(false);
-    expect(command.status).toBe("running");
+    expect(cancelled).toBe(true);
+    expect(command.status).toBe("cancelled");
     expect(events).toContain("exit");
     expect(manager.listTerminalsForUser("user-id")).toEqual([]);
 

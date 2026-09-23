@@ -48,9 +48,9 @@ function listsTopK(value: unknown): boolean {
 }
 
 /**
- * True only when an inventory object already lists `top_k` on a sampling
- * extension. Versions 1–4 do not declare that extension, so a parsed hosted
- * inventory returns false. This does not add a field to the wire schema.
+ * True only when an inventory object lists `top_k` on its sampling extension.
+ * CLI llama.cpp and vLLM endpoints advertise that parameter. Other inventories
+ * do not, so they reject `top_k`.
  */
 export function capabilityInventoryAcceptsTopK(inventory: unknown): boolean {
   if (!isRecord(inventory)) return false;
@@ -63,11 +63,7 @@ export function capabilityInventoryAcceptsTopK(inventory: unknown): boolean {
   return false;
 }
 
-export function executionTargetAcceptsTopK(input: {
-  kind: "cli" | "hosted-provider";
-  capabilityInventory?: unknown;
-}): boolean {
-  if (input.kind === "cli") return true;
+export function executionTargetAcceptsTopK(input: { capabilityInventory?: unknown }): boolean {
   return capabilityInventoryAcceptsTopK(input.capabilityInventory);
 }
 

@@ -202,7 +202,8 @@ export function registerMcpTools(server: McpServer, ctx?: McpRequestContext): vo
         inputSchema: descriptor.inputSchema,
         annotations: {
           readOnlyHint: descriptor.scope === "read",
-          destructiveHint: descriptor.confirmation === "DELETE",
+          destructiveHint:
+            descriptor.confirmation === "DELETE" || descriptor.name === "forwarder_cli_command_run",
           idempotentHint: descriptor.scope === "read",
           openWorldHint:
             descriptor.classification === "external" || descriptor.classification === "cost",

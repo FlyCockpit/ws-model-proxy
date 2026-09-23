@@ -46,6 +46,8 @@ wsmp config init                    # write a default config
 wsmp config set-slug desk-01        # set this CLI connection's slug
 wsmp endpoints add local http://127.0.0.1:11434
 wsmp endpoints add local http://127.0.0.1:11434 --expand-media  # inline WMP media URLs
+wsmp endpoints concurrency local 4          # register this limit for every model
+wsmp endpoints engine local llama.cpp       # advertise top_k (also: vllm, generic)
 wsmp endpoints probe local
 wsmp connect                        # open the outbound websocket relay
 wsmp daemon start --detach          # background relay (new session; owns a PID file)

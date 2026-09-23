@@ -39,7 +39,7 @@ import { GranteePrivacyConfirmDialog } from "@/components/grantee-privacy-confir
 import { InlineRetry } from "@/components/inline-retry";
 import { WideContent } from "@/components/wide-content";
 import { useDeploymentAudience } from "@/hooks/use-deployment-audience";
-import { privateNetworksAllowedFromConfig } from "@/lib/deployment-feature-gate";
+import { useDeploymentFlags } from "@/hooks/use-deployment-flags";
 import {
   type GranteePrivacyConfirm,
   granteePrivacyConfirmationFromError,
@@ -309,9 +309,8 @@ export function ProviderOperationsSection() {
   const showDate = (value: Date | string | null | undefined) =>
     value ? dateTime.format(new Date(value)) : "—";
   const queryClient = useQueryClient();
-  const appConfig = useQuery(orpc.appConfig.queryOptions());
+  const { privateNetworksAllowed: allowPrivateNetworks } = useDeploymentFlags();
   const { isAdmin: isDeploymentAdmin } = useDeploymentAudience();
-  const allowPrivateNetworks = privateNetworksAllowedFromConfig(appConfig.data, appConfig.isError);
   const privateNetworkMessage = isDeploymentAdmin
     ? t("dashboard:deploymentFeatures.privateNetworkAdmin")
     : t("dashboard:deploymentFeatures.privateNetworkUser");

@@ -140,6 +140,7 @@ export function registerTerminalBridge(bridge: TerminalBridge) {
 
 const TERMINAL_USER_LIMIT = 4;
 const TERMINAL_CLI_LIMIT = 2;
+const CLI_SEALED_BUFFER_LIMIT = 1024 * 1024;
 const TERMINAL_PENDING_TTL_MS = 2 * 60 * 1000;
 const RELAY_JSON_CONTROL_MAX_BYTES = 64 * 1024;
 
@@ -642,6 +643,10 @@ export class RelaySessionManager {
     );
   }
 
+  isDraining(): boolean {
+    return this.relayDrain;
+  }
+
   /** Shutdown step: cancel interactive work, close remaining CLI sockets, mark devices disconnected. */
   async closeRelaySessions(now = new Date()) {
     this.relayDrain = true;
@@ -913,15 +918,17 @@ export class RelaySessionManager {
     viewerId: string,
     seq: number,
     body: Uint8Array,
-  ): boolean {
+  ): "sent" | "missing" | "dropped" {
     const located = this.terminalForUser(terminalId, userId);
-    if (!located || located.terminal.viewerId !== viewerId) return false;
-    if (!this.canSignalTerminal(located.session)) return false;
-    if (located.session.socket.readyState !== WS_READY_STATE_OPEN) return false;
+    if (!located || located.terminal.viewerId !== viewerId) return "missing";
+    if (!this.canSignalTerminal(located.session)) return "missing";
+    if (located.session.socket.readyState !== WS_READY_STATE_OPEN) return "missing";
+    // A slow CLI must not grow this process without a bound.
+    if ((located.session.socket.bufferedAmount ?? 0) > CLI_SEALED_BUFFER_LIMIT) return "dropped";
     located.session.socket.send(
       encodeRelayBinaryFrame({ type: "term.sealed", terminalId, seq }, body),
     );
-    return true;
+    return "sent";
   }
 
   /**
@@ -1290,7 +1297,12 @@ export class RelaySessionManager {
   private cancelAllCommands(session: SessionState) {
     for (const command of [...session.commandsById.values()]) {
       if (command.status !== "running") continue;
-      this.cancelTrackedCommand(session, command);
+      if (this.canSignalExec(session)) {
+        this.sendControl(session, { type: "exec.cancel", commandId: command.commandId });
+      }
+      // The CLI may already be gone. Free the slot now instead of waiting
+      // out the 11-minute command deadline.
+      command.markCancelled();
     }
   }
 
@@ -1403,6 +1415,13 @@ export class RelaySessionManager {
         }
       }
       terminal.phase = "open";
+      if (message.type === "term.opened") {
+        const counts = this.terminalCounts(terminal.userId, terminal.cliDeviceId);
+        if (counts.user > TERMINAL_USER_LIMIT || counts.cli > TERMINAL_CLI_LIMIT) {
+          this.closeTerminal(session, terminal, true);
+          return;
+        }
+      }
       const cliPublicKey = session.terminalPublicKey;
       if (!cliPublicKey) {
         this.closeTerminal(session, terminal, true);

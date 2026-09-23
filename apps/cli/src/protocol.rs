@@ -104,7 +104,7 @@ pub enum ClientControlMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        signal: Option<i32>,
+        signal: Option<String>,
     },
     #[serde(rename = "exec.started")]
     ExecStarted { command_id: String },
@@ -116,7 +116,7 @@ pub enum ClientControlMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         exit_code: Option<i32>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        signal: Option<i32>,
+        signal: Option<String>,
         timed_out: bool,
     },
 }
@@ -273,6 +273,10 @@ pub struct DiscoveredModelInventory {
     pub capability_override_mode: CapabilityOverrideMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probe_suggestions: Option<OpenAiCompatibleCapabilities>,
+    /// Omitted from the inventory digest. The server stores it on create and
+    /// when an auto capacity limit is still null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency_limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -512,6 +516,10 @@ impl RelayBinaryFrameMetadata {
 }
 
 pub fn endpoint_inventory(endpoint: &EndpointConfig, status: EndpointStatus) -> EndpointInventory {
+    let mut default_capabilities = endpoint.default_capabilities.clone();
+    if endpoint.engine.accepts_top_k() {
+        default_capabilities.advertise_top_k();
+    }
     EndpointInventory {
         slug: endpoint.slug.clone(),
         label: endpoint.label.clone(),
@@ -521,7 +529,7 @@ pub fn endpoint_inventory(endpoint: &EndpointConfig, status: EndpointStatus) -> 
         }
         .to_string(),
         status,
-        default_capabilities: endpoint.default_capabilities.clone(),
+        default_capabilities,
         probe_suggestions: endpoint
             .last_probe
             .as_ref()
@@ -529,12 +537,21 @@ pub fn endpoint_inventory(endpoint: &EndpointConfig, status: EndpointStatus) -> 
         models: endpoint
             .models
             .iter()
-            .map(|model| DiscoveredModelInventory {
-                slug: model.slug.clone(),
-                upstream_model_id: model.upstream_model_id.clone(),
-                capabilities: model.capabilities.clone(),
-                capability_override_mode: model.capability_override_mode.clone(),
-                probe_suggestions: model.probe_suggestions.clone(),
+            .map(|model| {
+                let mut capabilities = model.capabilities.clone();
+                if endpoint.engine.accepts_top_k()
+                    && let Some(capabilities) = capabilities.as_mut()
+                {
+                    capabilities.advertise_top_k();
+                }
+                DiscoveredModelInventory {
+                    slug: model.slug.clone(),
+                    upstream_model_id: model.upstream_model_id.clone(),
+                    capabilities,
+                    capability_override_mode: model.capability_override_mode.clone(),
+                    probe_suggestions: model.probe_suggestions.clone(),
+                    concurrency_limit: endpoint.concurrency_limit,
+                }
             })
             .collect(),
     }
@@ -800,6 +817,7 @@ mod inventory_digest_tests {
                 capabilities: None,
                 capability_override_mode: CapabilityOverrideMode::Inherit,
                 probe_suggestions: None,
+                concurrency_limit: None,
             }],
         }];
         assert_eq!(
@@ -968,6 +986,67 @@ fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn llama_and_vllm_advertise_top_k_and_copy_concurrency() {
+        let mut endpoint = EndpointConfig {
+            slug: "local".to_string(),
+            label: "Local".to_string(),
+            engine: crate::config::EndpointEngine::LlamaCpp,
+            concurrency_limit: Some(4),
+            models: vec![crate::config::ModelConfig {
+                upstream_model_id: "llama-local".to_string(),
+                capabilities: Some(OpenAiCompatibleCapabilities::openai_defaults()),
+                ..crate::config::ModelConfig::default()
+            }],
+            ..EndpointConfig::default()
+        };
+        let inventory = endpoint_inventory(&endpoint, EndpointStatus::Unknown);
+        let sampling = inventory
+            .default_capabilities
+            .sampling
+            .as_ref()
+            .expect("default sampling");
+        assert!(
+            sampling
+                .parameters
+                .iter()
+                .any(|parameter| parameter == "top_k")
+        );
+        let model = &inventory.models[0];
+        assert_eq!(model.concurrency_limit, Some(4));
+        assert!(
+            model
+                .capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.sampling.as_ref())
+                .is_some_and(|sampling| sampling
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter == "top_k"))
+        );
+        let encoded = serde_json::to_value(&inventory).expect("encode");
+        assert!(encoded["models"][0]["concurrencyLimit"].as_u64() == Some(4));
+        assert!(!inventory_digest(std::slice::from_ref(&inventory)).is_empty());
+
+        endpoint.engine = crate::config::EndpointEngine::Generic;
+        endpoint.concurrency_limit = None;
+        let plain = endpoint_inventory(&endpoint, EndpointStatus::Unknown);
+        assert!(plain.default_capabilities.sampling.is_none());
+        assert!(plain.models[0].concurrency_limit.is_none());
+
+        endpoint.engine = crate::config::EndpointEngine::Vllm;
+        let vllm = endpoint_inventory(&endpoint, EndpointStatus::Unknown);
+        assert!(
+            vllm.default_capabilities
+                .sampling
+                .as_ref()
+                .is_some_and(|sampling| sampling
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter == "top_k"))
+        );
+    }
 
     #[test]
     fn rejects_oversized_binary_chunks() {

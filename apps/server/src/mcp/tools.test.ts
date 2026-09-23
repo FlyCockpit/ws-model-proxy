@@ -1155,6 +1155,10 @@ describe("CLI command tools", () => {
       (tool) => tool.name === "forwarder_cli_command_result",
     );
     expect(run?.description).toContain("NOT redacted");
+    expect(
+      (run as { annotations?: { destructiveHint?: boolean } } | undefined)?.annotations
+        ?.destructiveHint,
+    ).toBe(true);
     expect(resultTool?.description).toContain("NOT redacted");
     expect(run?.description).toContain('confirm: "RUN"');
     expect(resultTool?.description).not.toContain('confirm: "RUN"');

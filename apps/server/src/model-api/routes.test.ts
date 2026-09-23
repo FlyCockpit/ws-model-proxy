@@ -1062,6 +1062,7 @@ describe("model API routes", () => {
               tools: true,
             },
           },
+          sampling: { parameters: ["top_k"] },
         },
       }),
     ]);

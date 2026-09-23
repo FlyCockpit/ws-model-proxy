@@ -28,6 +28,11 @@ const BROWSER_BUFFER_DETACH_BYTES = 4 * 1024 * 1024;
 const BROWSER_JSON_MAX_BYTES = 64 * 1024;
 const BROWSER_JSON_LIMIT = 20;
 const BROWSER_JSON_WINDOW_MS = 10_000;
+/** Per terminal tab. Key repeat runs at about 30 frames per second. */
+const BROWSER_BINARY_LIMIT = 300;
+const BROWSER_BINARY_WINDOW_MS = 10_000;
+/** Limiter bucket for frames that do not name a terminal. */
+const INVALID_BINARY_KEY = "";
 
 const browserIdentitySchema = z
   .object({
@@ -80,7 +85,12 @@ export type TerminalAvailabilityReason =
   | "unsupported"
   | "offline";
 
-type TerminalErrorCode = TerminalAvailabilityReason | "not_found" | "limit" | "invalid";
+type TerminalErrorCode =
+  | TerminalAvailabilityReason
+  | "not_found"
+  | "limit"
+  | "invalid"
+  | "input_dropped";
 
 type BrowserConn = {
   id: string;
@@ -164,6 +174,7 @@ function errorMessage(code: TerminalErrorCode): string {
   if (code === "unsupported") return "Browser terminal is not supported on this CLI.";
   if (code === "offline") return "CLI is offline.";
   if (code === "limit") return "Terminal limit reached.";
+  if (code === "input_dropped") return "Terminal input was dropped.";
   return "Invalid terminal message.";
 }
 
@@ -182,7 +193,10 @@ export class TerminalBrowserHub {
   private bySocket = new Map<RelaySocket, BrowserConn>();
   private byId = new Map<string, BrowserConn>();
   private jsonAt = new Map<string, number[]>();
+  private binaryAt = new Map<string, Map<string, number[]>>();
   private textChain = new Map<RelaySocket, Promise<void>>();
+  /** `${connId}\0${terminalId}` while input is being dropped, so the browser hears about it once. */
+  private dropNotified = new Set<string>();
 
   accept(input: { socket: RelaySocket; userId: string; sessionId: string }) {
     const conn: BrowserConn = { id: randomUUID(), ...input };
@@ -208,6 +222,35 @@ export class TerminalBrowserHub {
     recent.push(now);
     this.jsonAt.set(conn.id, recent);
     return true;
+  }
+
+  private allowBinary(conn: BrowserConn, terminalId: string, now = Date.now()): boolean {
+    let byTerminal = this.binaryAt.get(conn.id);
+    if (!byTerminal) {
+      byTerminal = new Map();
+      this.binaryAt.set(conn.id, byTerminal);
+    }
+    const recent = (byTerminal.get(terminalId) ?? []).filter(
+      (stamp) => now - stamp < BROWSER_BINARY_WINDOW_MS,
+    );
+    if (recent.length >= BROWSER_BINARY_LIMIT) {
+      byTerminal.set(terminalId, recent);
+      return false;
+    }
+    recent.push(now);
+    byTerminal.set(terminalId, recent);
+    return true;
+  }
+
+  private forgetConn(conn: BrowserConn) {
+    this.jsonAt.delete(conn.id);
+    this.binaryAt.delete(conn.id);
+    for (const key of this.dropNotified) {
+      if (key.startsWith(`${conn.id}\0`)) this.dropNotified.delete(key);
+    }
+    this.textChain.delete(conn.socket);
+    this.bySocket.delete(conn.socket);
+    this.byId.delete(conn.id);
   }
 
   private async handleTextExclusive(socket: RelaySocket, frame: string) {
@@ -254,12 +297,12 @@ export class TerminalBrowserHub {
     }
     if (message.data.type === "close") {
       if (!relaySessionManager.closeTerminalFromBrowser(message.data.terminalId, conn.userId)) {
-        this.sendError(conn, "not_found");
+        this.sendError(conn, "not_found", message.data.terminalId);
       }
       return;
     }
     if (!relaySessionManager.detachTerminalViewer(message.data.terminalId, conn.userId, conn.id)) {
-      this.sendError(conn, "not_found");
+      this.sendError(conn, "not_found", message.data.terminalId);
     }
   }
 
@@ -270,41 +313,59 @@ export class TerminalBrowserHub {
     try {
       parsed = parseRelayBinaryFrame(frame);
     } catch {
-      this.sendError(conn, "invalid");
+      if (this.allowBinary(conn, INVALID_BINARY_KEY)) this.sendError(conn, "invalid");
       return;
     }
     if (parsed.metadata.type !== "term.sealed") {
-      this.sendError(conn, "invalid");
+      if (this.allowBinary(conn, INVALID_BINARY_KEY)) this.sendError(conn, "invalid");
+      return;
+    }
+    const { terminalId } = parsed.metadata;
+    const dropKey = `${conn.id}\0${terminalId}`;
+    if (!this.allowBinary(conn, terminalId)) {
+      this.notifyDropped(conn, terminalId, dropKey);
       return;
     }
     const forwarded = relaySessionManager.forwardBrowserSealed(
-      parsed.metadata.terminalId,
+      terminalId,
       conn.userId,
       conn.id,
       parsed.metadata.seq,
       parsed.body,
     );
-    if (!forwarded) this.sendError(conn, "not_found");
+    if (forwarded === "missing") {
+      // Unknown ids must not grow the per-terminal limiter map.
+      this.binaryAt.get(conn.id)?.delete(terminalId);
+      this.dropNotified.delete(dropKey);
+      this.sendError(conn, "not_found", terminalId);
+      return;
+    }
+    if (forwarded === "dropped") {
+      this.notifyDropped(conn, terminalId, dropKey);
+      return;
+    }
+    this.dropNotified.delete(dropKey);
+  }
+
+  /** Tell the browser once per run of dropped frames. The CLI tolerates seq gaps. */
+  private notifyDropped(conn: BrowserConn, terminalId: string, dropKey: string) {
+    if (this.dropNotified.has(dropKey)) return;
+    this.dropNotified.add(dropKey);
+    this.sendError(conn, "input_dropped", terminalId);
   }
 
   handleClose(socket: RelaySocket) {
     const conn = this.bySocket.get(socket);
     if (!conn) return;
     this.detachAll(conn);
-    this.jsonAt.delete(conn.id);
-    this.bySocket.delete(socket);
-    this.byId.delete(conn.id);
-    this.textChain.delete(socket);
+    this.forgetConn(conn);
   }
 
   closeAll() {
     for (const conn of [...this.bySocket.values()]) {
       this.detachAll(conn);
-      this.jsonAt.delete(conn.id);
       if (conn.socket.readyState === 1) conn.socket.close(1001, "shutdown");
-      this.bySocket.delete(conn.socket);
-      this.byId.delete(conn.id);
-      this.textChain.delete(conn.socket);
+      this.forgetConn(conn);
     }
   }
 
@@ -485,7 +546,7 @@ export class TerminalBrowserHub {
       browserNonce: message.nonce,
       ...(message.identity ? { identity: message.identity } : {}),
     });
-    if (!result.ok) this.sendError(conn, "not_found");
+    if (!result.ok) this.sendError(conn, "not_found", message.terminalId);
   }
 
   private async ownedDevice(userId: string, cliDeviceId: string): Promise<CliListRow | null> {
@@ -502,8 +563,7 @@ export class TerminalBrowserHub {
   private expire(conn: BrowserConn) {
     this.detachAll(conn);
     if (conn.socket.readyState === 1) conn.socket.close(4401, "session_expired");
-    this.bySocket.delete(conn.socket);
-    this.byId.delete(conn.id);
+    this.forgetConn(conn);
   }
 
   private sendError(conn: BrowserConn, code: TerminalErrorCode, terminalId?: string) {
@@ -573,6 +633,9 @@ export function createTerminalWebsocketMiddleware(): MiddlewareHandler<{
   return async (c, next) => {
     if (c.req.header("upgrade")?.toLowerCase() !== "websocket") {
       return c.json({ error: "WebSocket upgrade required." }, 426);
+    }
+    if (relaySessionManager.isDraining()) {
+      return c.json({ error: "Server is shutting down." }, 503);
     }
     const ipLimited = await ipLimit(c, async () => undefined);
     if (ipLimited instanceof Response) return ipLimited;

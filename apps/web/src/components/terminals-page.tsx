@@ -129,7 +129,7 @@ export function TerminalsPage() {
           </div>
           <Skeleton className="min-h-80 w-full flex-1" />
         </div>
-      ) : devicesQuery.isError ? (
+      ) : devicesQuery.isError && devices.length === 0 ? (
         <InlineRetry
           message={t("dashboard:clis.loadFailed")}
           onRetry={() => void devicesQuery.refetch()}
@@ -222,7 +222,11 @@ export function TerminalsPage() {
             <p className="mb-2 text-sm text-muted-foreground">{t("dashboard:terminals.exited")}</p>
           ) : null}
           {active?.error ? (
-            <p className="mb-2 text-sm text-destructive">{t("dashboard:terminals.error")}</p>
+            <p className="mb-2 text-sm text-destructive">
+              {active.error === "input_dropped"
+                ? t("dashboard:terminals.inputDropped")
+                : t("dashboard:terminals.error")}
+            </p>
           ) : null}
 
           <div className="relative min-h-80 min-w-0 flex-1 overflow-x-hidden overflow-y-hidden">

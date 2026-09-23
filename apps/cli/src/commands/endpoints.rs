@@ -4,7 +4,8 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::config::{
-    Config, EndpointConfig, HeaderEnvRef, OpenAiCompatibleCapabilities, validate_env_name,
+    Config, EndpointConfig, EndpointEngine, HeaderEnvRef, OpenAiCompatibleCapabilities,
+    validate_env_name,
 };
 use crate::exit::{CodedError, ExitCode};
 use crate::output;
@@ -31,6 +32,10 @@ enum Sub {
     List,
     /// Probe one endpoint or all enabled endpoints.
     Probe(ProbeArgs),
+    /// Set or clear the concurrency sent for every model on an endpoint.
+    Concurrency(ConcurrencyArgs),
+    /// Declare the upstream engine. llama.cpp and vLLM advertise `top_k`.
+    Engine(EngineArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -51,6 +56,51 @@ struct AddArgs {
     /// this endpoint. Use for local upstreams that cannot fetch remote URLs.
     #[arg(long)]
     expand_media: bool,
+    /// Hard concurrency registered for every model on this endpoint (1–10000).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=10_000))]
+    concurrency_limit: Option<u32>,
+    /// Upstream engine. `llama.cpp` and `vllm` advertise `top_k`.
+    #[arg(long, value_enum)]
+    engine: Option<EngineChoice>,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum EngineChoice {
+    Generic,
+    #[value(name = "llama.cpp")]
+    LlamaCpp,
+    Vllm,
+}
+
+impl From<EngineChoice> for EndpointEngine {
+    fn from(choice: EngineChoice) -> Self {
+        match choice {
+            EngineChoice::Generic => Self::Generic,
+            EngineChoice::LlamaCpp => Self::LlamaCpp,
+            EngineChoice::Vllm => Self::Vllm,
+        }
+    }
+}
+
+#[derive(Debug, clap::Args)]
+struct ConcurrencyArgs {
+    slug: String,
+    /// Integer from 1 to 10000.
+    #[arg(
+        value_parser = clap::value_parser!(u32).range(1..=10_000),
+        required_unless_present = "clear"
+    )]
+    limit: Option<u32>,
+    /// Omit concurrency so the server uses its fallback of 1 for a new capacity.
+    #[arg(long, conflicts_with = "limit")]
+    clear: bool,
+}
+
+#[derive(Debug, clap::Args)]
+struct EngineArgs {
+    slug: String,
+    #[arg(value_enum)]
+    engine: EngineChoice,
 }
 
 #[derive(Debug, clap::Args)]
@@ -70,6 +120,8 @@ pub fn run(args: &Args) -> Result<()> {
         Sub::Remove { slug } => remove_endpoint(args.json, slug),
         Sub::List => list_endpoints(args.json),
         Sub::Probe(probe) => probe_endpoints(args.json, probe),
+        Sub::Concurrency(concurrency) => set_concurrency(args.json, concurrency),
+        Sub::Engine(engine) => set_engine(args.json, engine),
     }
 }
 
@@ -88,6 +140,8 @@ fn add_endpoint(json: bool, args: &AddArgs) -> Result<()> {
         base_url: args.base_url.clone(),
         enabled: !args.disabled,
         expand_media: args.expand_media,
+        concurrency_limit: args.concurrency_limit,
+        engine: args.engine.map(EndpointEngine::from).unwrap_or_default(),
         headers,
         default_capabilities: OpenAiCompatibleCapabilities::default(),
         ..EndpointConfig::default()
@@ -199,6 +253,61 @@ fn probe_endpoints(json: bool, args: &ProbeArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn set_concurrency(json: bool, args: &ConcurrencyArgs) -> Result<()> {
+    let limit = if args.clear { None } else { args.limit };
+    let endpoint = update_endpoint(&args.slug, |endpoint| {
+        endpoint.concurrency_limit = limit;
+        Ok(())
+    })?;
+    if json {
+        output::json(&endpoint)?;
+    } else if let Some(limit) = limit {
+        output::line(format!(
+            "set concurrency for `{}` to {limit}",
+            endpoint.slug
+        ))?;
+    } else {
+        output::line(format!("cleared concurrency for `{}`", endpoint.slug))?;
+    }
+    Ok(())
+}
+
+fn set_engine(json: bool, args: &EngineArgs) -> Result<()> {
+    let engine = EndpointEngine::from(args.engine);
+    let endpoint = update_endpoint(&args.slug, |endpoint| {
+        endpoint.engine = engine;
+        Ok(())
+    })?;
+    if json {
+        output::json(&endpoint)?;
+    } else {
+        output::line(format!(
+            "set engine for `{}` to {}",
+            endpoint.slug,
+            engine.as_config_str()
+        ))?;
+    }
+    Ok(())
+}
+
+fn update_endpoint(
+    slug: &str,
+    mutate: impl FnOnce(&mut EndpointConfig) -> Result<()>,
+) -> Result<EndpointConfig> {
+    Config::update(true, |cfg| {
+        let endpoint = cfg
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.slug == slug)
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!("endpoint `{slug}` not found"))
+                    .context(CodedError::new(ExitCode::NotFound))
+            })?;
+        mutate(endpoint)?;
+        Ok(endpoint.clone())
+    })
 }
 
 fn parse_header_env(raw: &str) -> Result<HeaderEnvRef> {

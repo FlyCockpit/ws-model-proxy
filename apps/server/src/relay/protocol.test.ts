@@ -388,6 +388,23 @@ describe("relay protocol 2.4", () => {
       JSON.stringify({ type: "exec.done", commandId: bytes16(), timedOut: true, exitCode: 0 }),
     );
     expect(done).toMatchObject({ type: "exec.done", timedOut: true });
+    const signaled = parseRelayClientControlFrame(
+      JSON.stringify({
+        type: "exec.done",
+        commandId: bytes16(),
+        timedOut: true,
+        signal: 9,
+      }),
+    );
+    expect(signaled).toMatchObject({ type: "exec.done", signal: "9", timedOut: true });
+    const named = parseRelayClientControlFrame(
+      JSON.stringify({
+        type: "term.exit",
+        terminalId: bytes16(),
+        signal: "SIGKILL",
+      }),
+    );
+    expect(named).toMatchObject({ type: "term.exit", signal: "SIGKILL" });
   });
 
   it("round-trips sealed terminal and exec output metadata", () => {

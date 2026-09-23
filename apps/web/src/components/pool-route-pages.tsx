@@ -30,6 +30,7 @@ import { InlineRetry } from "@/components/inline-retry";
 import { PoolPrivacyBadge } from "@/components/pool-privacy-badge";
 import { ProviderOperationsSection } from "@/components/provider-operations-section";
 
+import { useDeploymentFlags } from "@/hooks/use-deployment-flags";
 import { orpc } from "@/utils/orpc";
 
 function PageSkeleton() {
@@ -100,7 +101,7 @@ export function PoolsListPage({ lang }: { lang: string }) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const pools = useQuery(orpc.forwarderManagement.listModelPools.queryOptions());
   const devices = useQuery(orpc.forwarderManagement.listCliDevices.queryOptions());
-  const appConfig = useQuery(orpc.appConfig.queryOptions());
+  const { providerEgressEnabled } = useDeploymentFlags();
   const capacityAvailability = resolveCapacityAvailability();
   const capacities = useQuery({
     ...orpc.capacityManagement.list.queryOptions(),
@@ -242,7 +243,7 @@ export function PoolsListPage({ lang }: { lang: string }) {
         </div>
       )}
 
-      {appConfig.data?.providerEgressEnabled ? <ProviderOperationsSection /> : null}
+      {providerEgressEnabled ? <ProviderOperationsSection /> : null}
     </section>
   );
 }
@@ -253,7 +254,7 @@ export function PoolDetailPage({ poolId, lang = "en-US" }: { poolId: string; lan
   const queryClient = useQueryClient();
   const pools = useQuery(orpc.forwarderManagement.listModelPools.queryOptions());
   const devices = useQuery(orpc.forwarderManagement.listCliDevices.queryOptions());
-  const appConfig = useQuery(orpc.appConfig.queryOptions());
+  const { providerEgressEnabled } = useDeploymentFlags();
   const capacityAvailability = resolveCapacityAvailability();
   const capacities = useQuery({
     ...orpc.capacityManagement.list.queryOptions(),
@@ -325,7 +326,7 @@ export function PoolDetailPage({ poolId, lang = "en-US" }: { poolId: string; lan
     directModels: allDirectModels(devices.data ?? []),
     capacities: capacities.data ?? [],
     capacityAvailability,
-    providerEgressEnabled: appConfig.data?.providerEgressEnabled ?? false,
+    providerEgressEnabled,
     openMember: setMemberDialog,
     openGrant: () => setGrantOpen(true),
     openDelete: () => setDeletePoolOpen(true),

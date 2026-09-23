@@ -1203,6 +1203,14 @@ export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
     reason: "Global application settings read; not model-proxy operation.",
   },
   {
+    target: "deploymentFlags",
+    reason: "Signed-in product gates. The browser reads them; MCP does not.",
+  },
+  {
+    target: "deploymentFeatures",
+    reason: "Admin-only deployment inventory, including keyring status.",
+  },
+  {
     target: "settings.myNotificationPreferences",
     reason: "Notification settings are excluded from MCP.",
   },

@@ -1648,14 +1648,12 @@ function renderForExecutionTarget({
   target,
   model,
   allowLossyDeveloperRoleCollapse,
-  kind,
   capabilities,
 }: {
   request: CanonicalRequest;
   target: ProtocolSurface;
   model: string;
   allowLossyDeveloperRoleCollapse?: boolean;
-  kind: "cli" | "hosted-provider";
   capabilities: OpenAiCompatibleCapabilities | null | undefined;
 }) {
   return renderCanonicalRequest({
@@ -1663,7 +1661,7 @@ function renderForExecutionTarget({
     target,
     model,
     allowLossyDeveloperRoleCollapse,
-    acceptsTopK: executionTargetAcceptsTopK({ kind, capabilityInventory: capabilities }),
+    acceptsTopK: executionTargetAcceptsTopK({ capabilityInventory: capabilities }),
     reasoning: reasoningControlForSurface(capabilities ?? null, target),
   });
 }
@@ -3680,7 +3678,6 @@ async function relayPool({
               model: providerTarget.upstreamModelId,
               allowLossyDeveloperRoleCollapse:
                 operation.adaptation?.allowLossyDeveloperRoleCollapse,
-              kind: "hosted-provider",
               capabilities: providerTarget.capabilityInventory,
             });
             const headers = new Headers({ "content-type": "application/json" });
@@ -4143,7 +4140,6 @@ async function relayPool({
         target: source,
         model: member.DiscoveredModel.upstreamModelId,
         allowLossyDeveloperRoleCollapse: operation.adaptation?.allowLossyDeveloperRoleCollapse,
-        kind: "cli",
         capabilities: effectivePoolMemberCapabilities(member),
       });
       return true;
@@ -4790,7 +4786,6 @@ async function relayPool({
           target: adaptedSource,
           model: candidate.upstreamModelId,
           allowLossyDeveloperRoleCollapse: operation.adaptation.allowLossyDeveloperRoleCollapse,
-          kind: "cli",
           capabilities: effectivePoolMemberCapabilities(member),
         });
         if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();

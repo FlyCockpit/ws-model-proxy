@@ -40,6 +40,10 @@ pub(crate) const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const PENDING_TTL: Duration = Duration::from_secs(2 * 60);
 const SEND_WAIT: Duration = Duration::from_millis(200);
 const READ_POLL: Duration = Duration::from_millis(200);
+/// After the child exits, keep the exec slot until both pipes report EOF, or
+/// this long, whichever comes first. A grandchild that holds a pipe must not
+/// stall the slot; the leftover bytes are then dropped.
+const EXEC_OUTPUT_DRAIN: Duration = Duration::from_millis(500);
 
 const REASON_DISABLED: &str = "disabled";
 const REASON_UNSUPPORTED: &str = "unsupported";
@@ -449,6 +453,10 @@ fn exec_rejected(command_id: &str, reason: &str) -> OutboundFrame {
     })
 }
 
+fn signal_token(signal: Option<i32>) -> Option<String> {
+    signal.map(|value| value.to_string())
+}
+
 fn exec_done(
     command_id: &str,
     exit_code: Option<i32>,
@@ -458,13 +466,13 @@ fn exec_done(
     OutboundFrame::Control(ClientControlMessage::ExecDone {
         command_id: command_id.to_string(),
         exit_code,
-        signal,
+        signal: signal_token(signal),
         timed_out,
     })
 }
 
 #[cfg(unix)]
-fn kill_process_group(pid: u32) {
+fn kill_process_group(pid: u32, fallback_to_pid: bool) {
     let Ok(raw) = i32::try_from(pid) else {
         return;
     };
@@ -472,7 +480,9 @@ fn kill_process_group(pid: u32) {
         return;
     }
     let id = nix::unistd::Pid::from_raw(raw);
-    if nix::sys::signal::killpg(id, nix::sys::signal::Signal::SIGKILL).is_err() {
+    // After the child has been reaped, `kill(pid)` can hit a reused pid.
+    // `killpg` still covers grandchildren that stayed in the group.
+    if nix::sys::signal::killpg(id, nix::sys::signal::Signal::SIGKILL).is_err() && fallback_to_pid {
         let _ = nix::sys::signal::kill(id, nix::sys::signal::Signal::SIGKILL);
     }
 }
@@ -545,7 +555,7 @@ struct PtyRuntime {
 fn shutdown_pty(mut runtime: PtyRuntime) -> (Option<i32>, Option<i32>) {
     runtime.stop.store(true, Ordering::SeqCst);
     if let Some(pid) = runtime.pid {
-        kill_process_group(pid);
+        kill_process_group(pid, true);
     }
     drop(runtime.writer);
     // The reader notices `stop` on its poll timeout. Joining it would block
@@ -610,9 +620,6 @@ impl TerminalSession {
         let Some(crypto) = self.crypto.as_mut() else {
             return Incoming::Ignore;
         };
-        if !terminal_crypto::accept_seq(&mut crypto.last_rx, seq) {
-            return Incoming::Ignore;
-        }
         let opened = terminal_crypto::open(
             &crypto.keys.browser_to_cli,
             terminal_id,
@@ -620,7 +627,12 @@ impl TerminalSession {
             seq,
             body,
         );
+        // Advance the replay cursor only after the frame authenticates.
+        // A relay can rewrite the sequence in the cleartext metadata.
         let Ok(plaintext) = opened else {
+            return Incoming::Ignore;
+        };
+        if !terminal_crypto::accept_seq(&mut crypto.last_rx, seq) {
             return Incoming::Ignore;
         };
         match terminal_crypto::decode_plaintext(&plaintext) {
@@ -1011,7 +1023,7 @@ impl TerminalRegistry {
         vec![OutboundFrame::Control(ClientControlMessage::TermExit {
             terminal_id: terminal_id.to_string(),
             exit_code,
-            signal,
+            signal: signal_token(signal),
         })]
     }
 
@@ -1262,6 +1274,8 @@ struct ExecSession {
     timed_out: bool,
     finished: bool,
     pid: u32,
+    /// Exit status and the instant `try_wait` reaped the direct child.
+    reaped: Option<(Option<i32>, Option<i32>, Instant)>,
 }
 
 pub(crate) struct ExecRegistry {
@@ -1421,29 +1435,33 @@ impl ExecRegistry {
                 let timed_out = now.saturating_duration_since(session.started) >= self.timeout;
                 if timed_out && !session.timed_out {
                     session.timed_out = true;
-                    session.stop.store(true, Ordering::SeqCst);
-                    kill_exec(session.pid, session.child.as_mut());
+                    kill_exec(session.pid, session.child.as_mut(), true);
                     let status = reap_child(session.child.as_mut());
                     if status.0.is_some() || status.1.is_some() {
-                        Some((status, true))
-                    } else {
-                        None
+                        session.reaped = Some((status.0, status.1, now));
                     }
-                } else {
-                    match session
+                } else if session.reaped.is_none()
+                    && let Some(Some(status)) = session
                         .child
                         .as_mut()
                         .and_then(|child| child.try_wait().ok())
-                    {
-                        Some(Some(status)) => {
-                            let parts = status_parts(status);
-                            // The direct child is already reaped. Kill grandchildren
-                            // that stayed in its process group.
-                            kill_exec(session.pid, None);
-                            Some((parts, session.timed_out))
-                        }
-                        _ => None,
-                    }
+                {
+                    let parts = status_parts(status);
+                    // The direct child is already reaped. Kill grandchildren
+                    // that stayed in its group, without signalling the pid
+                    // itself again.
+                    kill_exec(session.pid, None, false);
+                    session.reaped = Some((parts.0, parts.1, now));
+                }
+                let Some((code, signal, reaped_at)) = session.reaped else {
+                    continue;
+                };
+                let drained = session.stdout_done && session.stderr_done;
+                let waited = now.saturating_duration_since(reaped_at) >= EXEC_OUTPUT_DRAIN;
+                if drained || waited {
+                    Some(((code, signal), session.timed_out))
+                } else {
+                    None
                 }
             };
             if let Some((parts, timed_out)) = action {
@@ -1463,7 +1481,7 @@ impl ExecRegistry {
         session.timed_out = timed_out || session.timed_out;
         session.stop.store(true, Ordering::SeqCst);
         if kill {
-            kill_exec(session.pid, session.child.as_mut());
+            kill_exec(session.pid, session.child.as_mut(), true);
         }
         let status = reap_child(session.child.as_mut());
         let timed_out = session.timed_out;
@@ -1525,15 +1543,15 @@ fn reap_child(child: Option<&mut std::process::Child>) -> (Option<i32>, Option<i
     (None, None)
 }
 
-fn kill_exec(pid: u32, child: Option<&mut std::process::Child>) {
+fn kill_exec(pid: u32, child: Option<&mut std::process::Child>, fallback_to_pid: bool) {
     #[cfg(unix)]
     {
-        kill_process_group(pid);
+        kill_process_group(pid, fallback_to_pid);
         let _ = child;
     }
     #[cfg(not(unix))]
     {
-        let _ = pid;
+        let _ = (pid, fallback_to_pid);
         if let Some(child) = child {
             let _ = child.kill();
         }
@@ -1621,6 +1639,7 @@ fn spawn_exec(
         timed_out: false,
         finished: false,
         pid,
+        reaped: None,
     })
 }
 
@@ -1729,7 +1748,32 @@ mod tests {
         let startup = enabled_startup(false);
         execs.start(&startup, &Config::default(), "slow", slow_command(), None);
         std::thread::sleep(Duration::from_millis(350));
-        let frames = execs.poll(Instant::now());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let frames = loop {
+            while let Ok(message) = rx.try_recv() {
+                match message {
+                    FromWorker::ExecBytes {
+                        command_id,
+                        stderr,
+                        bytes,
+                    } => {
+                        let _ = execs.on_bytes(&command_id, stderr, &bytes);
+                    }
+                    FromWorker::ExecEof { command_id, stderr } => {
+                        let _ = execs.on_eof(&command_id, stderr);
+                    }
+                    _ => {}
+                }
+            }
+            let frames = execs.poll(Instant::now());
+            if !frames.is_empty() {
+                break frames;
+            }
+            if Instant::now() > deadline {
+                panic!("timed out command did not finish");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
         assert!(matches!(
             &frames[0],
             OutboundFrame::Control(ClientControlMessage::ExecDone { timed_out, .. }) if *timed_out

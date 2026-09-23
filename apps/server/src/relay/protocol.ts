@@ -24,6 +24,15 @@ export const RELAY_REQUEST_BODY_WINDOW_CHUNKS = 16;
 export const RELAY_STALE_AFTER_MS = 60_000;
 export const RELAY_UNREGISTERED_STALE_AFTER_MS = 10_000;
 
+/** CLI sends a numeric Unix signal. Names are accepted too. */
+const relayExitSignalSchema = z.preprocess(
+  (value) => (typeof value === "number" ? String(value) : value),
+  z
+    .string()
+    .regex(/^[A-Za-z0-9_+.-]{1,32}$/)
+    .optional(),
+);
+
 const relayFailureSchema = z.enum([
   "transport",
   "timeout",
@@ -352,7 +361,7 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
       type: z.literal("term.exit"),
       terminalId: base64Url16ByteSchema,
       exitCode: z.number().int().min(0).max(255).optional(),
-      signal: z.string().min(1).max(32).optional(),
+      signal: relayExitSignalSchema,
     })
     .strict(),
   z
@@ -373,7 +382,7 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
       type: z.literal("exec.done"),
       commandId: base64Url16ByteSchema,
       exitCode: z.number().int().min(0).max(255).optional(),
-      signal: z.string().min(1).max(32).optional(),
+      signal: relayExitSignalSchema,
       timedOut: z.boolean(),
     })
     .strict(),

@@ -409,6 +409,7 @@ fn reasoning_capabilities(
         embeddings: None,
         responses: None,
         audio: None,
+        sampling: None,
     }
 }
 
