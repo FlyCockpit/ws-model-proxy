@@ -759,6 +759,8 @@ export const providerManagementRouter = {
               where: { id: target.inferenceCapacityId, userId },
               data: {
                 hardConcurrencyLimit: nextConcurrency,
+                // Mirrors the user-edited provider model limit (null = unlimited).
+                hardConcurrencyLimitSource: "USER",
                 physicalMaxContext: nextContext,
               },
             });

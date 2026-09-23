@@ -219,6 +219,15 @@ enum CapacityLimitMode {
   UNLIMITED
 }
 
+/// Who last authored an inference capacity's hard concurrency limit. AUTO rows
+/// (created by discovery, the CLI report, or the startup backfill) may have a
+/// null limit filled in. USER rows were saved through a user-facing path; a null
+/// USER limit means explicitly unlimited and is never overwritten automatically.
+enum CapacityLimitSource {
+  AUTO
+  USER
+}
+
 enum AdmissionSourceKind {
   DIRECT
   POOL
@@ -1051,32 +1060,35 @@ model PoolMember {
 /// that points at the same runtime/cache identity. Scheduler state is durable
 /// so a restart cannot reset fairness credit.
 model InferenceCapacity {
-  id                   String                @id @default(cuid(2))
-  createdAt            DateTime              @default(now())
-  updatedAt            DateTime              @default(now()) @updatedAt
-  userId               String
-  label                String
-  hardConcurrencyLimit Int?
-  physicalMaxContext   Int?
-  countStrategy        CapacityCountStrategy @default(CONSERVATIVE_ESTIMATE)
+  id                         String                @id @default(cuid(2))
+  createdAt                  DateTime              @default(now())
+  updatedAt                  DateTime              @default(now()) @updatedAt
+  userId                     String
+  label                      String
+  hardConcurrencyLimit       Int?
+  /// AUTO limits may be filled by discovery/backfill; USER limits (including
+  /// null = unlimited) are only changed through user-facing writes.
+  hardConcurrencyLimitSource CapacityLimitSource   @default(AUTO)
+  physicalMaxContext         Int?
+  countStrategy              CapacityCountStrategy @default(CONSERVATIVE_ESTIMATE)
   /// Stable, application-computed fingerprint for the physical runtime tuple.
-  runtimeIdentityKey   String
-  runtimeModel         String
-  runtimeRevision      String?
-  tokenizer            String?
-  tokenizerVersion     String?
-  template             String?
-  templateVersion      String?
-  engine               String?
-  cacheNamespace       String?
-  schedulerCursor      Int                   @default(31)
-  schedulerDeficits    Json                  @default("[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]")
-  schedulerVersion     Int                   @default(1)
-  nextFencingToken     BigInt                @default(1)
-  User                 User                  @relation("InferenceCapacityOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ExecutionTargets     ExecutionTarget[]
-  CapacityWaiters      CapacityWaiter[]
-  CapacityLeases       CapacityLease[]
+  runtimeIdentityKey         String
+  runtimeModel               String
+  runtimeRevision            String?
+  tokenizer                  String?
+  tokenizerVersion           String?
+  template                   String?
+  templateVersion            String?
+  engine                     String?
+  cacheNamespace             String?
+  schedulerCursor            Int                   @default(31)
+  schedulerDeficits          Json                  @default("[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]")
+  schedulerVersion           Int                   @default(1)
+  nextFencingToken           BigInt                @default(1)
+  User                       User                  @relation("InferenceCapacityOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ExecutionTargets           ExecutionTarget[]
+  CapacityWaiters            CapacityWaiter[]
+  CapacityLeases             CapacityLease[]
 
   @@unique([userId, label])
   @@unique([userId, runtimeIdentityKey])

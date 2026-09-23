@@ -801,14 +801,17 @@ ON CONFLICT ("discoveredModelId") DO NOTHING;
 -- physical engine, so the backfill intentionally creates one capacity per
 -- target. Owners can explicitly consolidate them later.
 INSERT INTO inference_capacity (
-  id, "createdAt", "updatedAt", "userId", label, "runtimeIdentityKey", "runtimeModel"
+  id, "createdAt", "updatedAt", "userId", label, "runtimeIdentityKey", "runtimeModel",
+  "hardConcurrencyLimitSource"
 )
 SELECT
   'cap_' || md5(target.id), target."createdAt", NOW(), target."userId",
   COALESCE(model."upstreamModelId", provider_model."upstreamModelId", target.id)
     || ' (' || target.id || ')',
   'execution-target:' || target.id,
-  COALESCE(model."upstreamModelId", provider_model."upstreamModelId", target.id)
+  COALESCE(model."upstreamModelId", provider_model."upstreamModelId", target.id),
+  -- Auto-created with a null limit: the application fills it (AUTO only).
+  'AUTO'::"CapacityLimitSource"
 FROM execution_target target
 LEFT JOIN discovered_model model ON model.id = target."discoveredModelId"
 LEFT JOIN provider_model ON provider_model.id = target."providerModelId"
@@ -841,11 +844,12 @@ BEGIN
   model_name := COALESCE(model_name, NEW.id);
   capacity_id := 'cap_' || md5(NEW.id);
   INSERT INTO inference_capacity (
-    id, "createdAt", "updatedAt", "userId", label, "runtimeIdentityKey", "runtimeModel"
+    id, "createdAt", "updatedAt", "userId", label, "runtimeIdentityKey", "runtimeModel",
+    "hardConcurrencyLimitSource"
   ) VALUES (
     capacity_id, NEW."createdAt", NOW(), NEW."userId",
     model_name || ' (' || NEW.id || ')',
-    'execution-target:' || NEW.id, model_name
+    'execution-target:' || NEW.id, model_name, 'AUTO'::"CapacityLimitSource"
   ) ON CONFLICT ("userId", "runtimeIdentityKey") DO UPDATE
     SET "updatedAt" = EXCLUDED."updatedAt"
   RETURNING id INTO capacity_id;

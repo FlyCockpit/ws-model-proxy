@@ -192,7 +192,11 @@ export const capacityManagementRouter = {
     const userId = context.session.user.id;
     return capacityTransaction(
       async (tx) => {
-        const created = await tx.inferenceCapacity.create({ data: { userId, ...input } });
+        // A user-created capacity's limit (null = unlimited) is user-authored;
+        // discovery and startup backfill must never fill it.
+        const created = await tx.inferenceCapacity.create({
+          data: { userId, ...input, hardConcurrencyLimitSource: "USER" },
+        });
         await audit(tx, {
           userId,
           action: "CREATE",
@@ -316,7 +320,15 @@ export const capacityManagementRouter = {
                 });
             }
           }
-          const updated = await tx.inferenceCapacity.update({ where: { id: capacityId }, data });
+          // Any user write of the hard limit, including null (= unlimited),
+          // marks it USER so discovery/backfill never overwrites the choice.
+          const updated = await tx.inferenceCapacity.update({
+            where: { id: capacityId },
+            data:
+              requestedHardLimit !== undefined
+                ? { ...data, hardConcurrencyLimitSource: "USER" }
+                : data,
+          });
           await audit(tx, {
             userId,
             action: "UPDATE",

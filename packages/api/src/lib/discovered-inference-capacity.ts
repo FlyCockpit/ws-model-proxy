@@ -87,9 +87,11 @@ export function isInferenceCapacityWriteRetryable(error: unknown): boolean {
 
 /**
  * Fills a null hard limit on an auto-created discovered capacity. The null
- * predicate loses to a concurrent writer who already stored a number. A
- * different runtime key does not match. Schema-hardening inserts the row
- * without a limit because that trigger cannot see the CLI-reported number.
+ * predicate loses to a concurrent writer who already stored a number, and the
+ * AUTO source predicate loses to a user who saved the limit (a USER null means
+ * explicitly unlimited). A different runtime key does not match.
+ * Schema-hardening inserts the row without a limit because that trigger cannot
+ * see the CLI-reported number.
  */
 export async function fillNullAutoDiscoveredCapacityLimit(
   tx: Prisma.TransactionClient,
@@ -106,6 +108,7 @@ export async function fillNullAutoDiscoveredCapacityLimit(
       id: input.capacityId,
       userId: input.userId,
       hardConcurrencyLimit: null,
+      hardConcurrencyLimitSource: "AUTO",
       runtimeIdentityKey: {
         in: autoDiscoveredCapacityRuntimeKeys({
           discoveredModelId: input.discoveredModelId,
@@ -115,6 +118,7 @@ export async function fillNullAutoDiscoveredCapacityLimit(
     },
     data: {
       hardConcurrencyLimit: discoveredHardConcurrencyLimit(input.reportedConcurrency),
+      hardConcurrencyLimitSource: "AUTO",
     },
   });
   return updatedRowCount(updated);
@@ -124,8 +128,10 @@ export async function fillNullAutoDiscoveredCapacityLimit(
  * Returns the capacity id for one discovered model. An existing legacy row is
  * reused. A new row copies the provider capacity shape and stores a finite
  * hard concurrency so admission does not treat the target as unconfigured.
- * Keeping an auto row whose limit is still null fills that limit. A different
- * runtime key and a non-null limit are left unchanged. Does not set the target FK.
+ * Keeping an auto row whose limit is still null and AUTO-sourced fills that
+ * limit. A different runtime key, a non-null limit, and any USER-sourced limit
+ * (including USER null = unlimited) are left unchanged. The CLI-reported
+ * number is only ever an AUTO seed. Does not set the target FK.
  */
 export async function ensureDiscoveredInferenceCapacity(
   tx: Prisma.TransactionClient,
@@ -173,6 +179,7 @@ export async function ensureDiscoveredInferenceCapacity(
       runtimeIdentityKey,
       runtimeModel: runtimeModelName(input.upstreamModelId, input.discoveredModelId),
       hardConcurrencyLimit: discoveredHardConcurrencyLimit(input.reportedConcurrency),
+      hardConcurrencyLimitSource: "AUTO",
       countStrategy: "CONSERVATIVE_ESTIMATE",
     },
     select: { id: true },
@@ -299,10 +306,11 @@ async function withCapacityWriteRetries(work: () => Promise<number>): Promise<nu
 /**
  * Idempotent startup repair for discovered execution targets. Null foreign
  * keys are attached. An attached auto capacity (`execution-target:<id>` or
- * `discovered-model:<id>`) whose hard limit is still null is set to the
- * discovered default, because startup has no CLI report. Does not delete
- * rows, does not replace a foreign key that is already set, and does not
- * change a non-null limit or a different runtime key.
+ * `discovered-model:<id>`) whose hard limit is still null and AUTO-sourced is
+ * set to the discovered default, because startup has no CLI report. Does not
+ * delete rows, does not replace a foreign key that is already set, and does
+ * not change a non-null limit, a USER-sourced limit (a USER null is an
+ * explicit "unlimited"), or a different runtime key.
  */
 export async function backfillDiscoveredInferenceCapacities(): Promise<{
   attached: number;
@@ -353,6 +361,7 @@ async function fillNullLimitsOnAttachedAutoCapacities(): Promise<void> {
       InferenceCapacity: {
         is: {
           hardConcurrencyLimit: null,
+          hardConcurrencyLimitSource: "AUTO",
           OR: [
             { runtimeIdentityKey: { startsWith: "execution-target:" } },
             { runtimeIdentityKey: { startsWith: "discovered-model:" } },
@@ -366,7 +375,11 @@ async function fillNullLimitsOnAttachedAutoCapacities(): Promise<void> {
       discoveredModelId: true,
       inferenceCapacityId: true,
       InferenceCapacity: {
-        select: { runtimeIdentityKey: true, hardConcurrencyLimit: true },
+        select: {
+          runtimeIdentityKey: true,
+          hardConcurrencyLimit: true,
+          hardConcurrencyLimitSource: true,
+        },
       },
     },
   });
@@ -376,6 +389,7 @@ async function fillNullLimitsOnAttachedAutoCapacities(): Promise<void> {
     const capacity = target.InferenceCapacity;
     if (!discoveredModelId || !capacityId || !capacity) continue;
     if (capacity.hardConcurrencyLimit !== null) continue;
+    if (capacity.hardConcurrencyLimitSource !== "AUTO") continue;
     if (
       !isExactAutoDiscoveredRuntimeKey({
         runtimeIdentityKey: capacity.runtimeIdentityKey,

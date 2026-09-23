@@ -440,7 +440,11 @@ describe("providerManagementRouter security boundary", () => {
 
     expect(db.inferenceCapacity.updateMany).toHaveBeenCalledWith({
       where: { id: "capacity", userId: "owner" },
-      data: { hardConcurrencyLimit: 8, physicalMaxContext: 65_536 },
+      data: {
+        hardConcurrencyLimit: 8,
+        hardConcurrencyLimitSource: "USER",
+        physicalMaxContext: 65_536,
+      },
     });
     expect(db.providerAuditEvent.create).toHaveBeenCalledWith(
       expect.objectContaining({

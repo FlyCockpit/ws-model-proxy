@@ -3,6 +3,7 @@ import { RPCLink } from "@orpc/client/fetch";
 import { createRouterClient } from "@orpc/server";
 import { RPCHandler } from "@orpc/server/fetch";
 import type { Session } from "@ws-model-proxy/auth";
+import type { Prisma } from "@ws-model-proxy/db";
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Context } from "../context";
@@ -16,6 +17,9 @@ vi.mock("@ws-model-proxy/db", async () => {
 });
 
 const { capacityManagementRouter } = await import("./capacity-management");
+const { backfillDiscoveredInferenceCapacities, ensureDiscoveredInferenceCapacity } = await import(
+  "../lib/discovered-inference-capacity"
+);
 const { default: prisma } = await import("@ws-model-proxy/db");
 const db = prisma as unknown as {
   $transaction: MockInstance;
@@ -25,9 +29,16 @@ const db = prisma as unknown as {
     findUnique: MockInstance;
     create: MockInstance;
     update: MockInstance;
+    updateMany: MockInstance;
+    upsert: MockInstance;
     delete: MockInstance;
   };
-  executionTarget: { findUnique: MockInstance; update: MockInstance };
+  executionTarget: {
+    findMany: MockInstance;
+    findUnique: MockInstance;
+    update: MockInstance;
+    updateMany: MockInstance;
+  };
   modelPool: { findUnique: MockInstance; update: MockInstance };
   poolMember: { findUnique: MockInstance; findMany: MockInstance; update: MockInstance };
   capacityAuditEvent: { create: MockInstance; findMany: MockInstance };
@@ -413,6 +424,139 @@ describe("capacityManagementRouter", () => {
       }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect(db.executionTarget.update).not.toHaveBeenCalled();
+  });
+
+  it("marks every user-authored hard limit USER, including explicit unlimited", async () => {
+    db.inferenceCapacity.create.mockResolvedValue({ id: "capacity", userId: "owner" });
+    const client = createRouterClient(capacityManagementRouter, { context });
+    await client.create({
+      label: "GPU",
+      runtimeIdentityKey: "host:model",
+      runtimeModel: "model",
+      hardConcurrencyLimit: null,
+      physicalMaxContext: null,
+      countStrategy: "CONSERVATIVE_ESTIMATE",
+    });
+    expect(db.inferenceCapacity.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        hardConcurrencyLimit: null,
+        hardConcurrencyLimitSource: "USER",
+      }),
+    });
+
+    const current = {
+      id: "capacity",
+      userId: "owner",
+      hardConcurrencyLimit: 2,
+      physicalMaxContext: null,
+      ExecutionTargets: [],
+    };
+    db.inferenceCapacity.findUnique.mockResolvedValue(current);
+    db.inferenceCapacity.update.mockResolvedValue(current);
+    await client.update({ id: "capacity", hardConcurrencyLimit: 5 });
+    expect(db.inferenceCapacity.update).toHaveBeenLastCalledWith({
+      where: { id: "capacity" },
+      data: { hardConcurrencyLimit: 5, hardConcurrencyLimitSource: "USER" },
+    });
+
+    // An edit that does not touch the limit leaves its source alone.
+    await client.update({ id: "capacity", label: "Renamed" });
+    expect(db.inferenceCapacity.update).toHaveBeenLastCalledWith({
+      where: { id: "capacity" },
+      data: { label: "Renamed" },
+    });
+  });
+
+  it("keeps a saved unlimited limit through startup backfill and CLI re-registration", async () => {
+    // One stateful auto-discovered capacity row shared by every code path.
+    const row = {
+      id: "cap_auto",
+      userId: "owner",
+      label: "Discovered model dm-1",
+      runtimeIdentityKey: "execution-target:target-1",
+      hardConcurrencyLimit: 1 as number | null,
+      hardConcurrencyLimitSource: "AUTO" as "AUTO" | "USER",
+      physicalMaxContext: null,
+      ExecutionTargets: [],
+    };
+    type Where = {
+      id?: string;
+      userId?: string;
+      hardConcurrencyLimit?: number | null;
+      hardConcurrencyLimitSource?: "AUTO" | "USER";
+      runtimeIdentityKey?: { in?: readonly string[] };
+    };
+    type Data = {
+      hardConcurrencyLimit?: number | null;
+      hardConcurrencyLimitSource?: "AUTO" | "USER";
+    };
+    const matches = (where: Where) =>
+      (where.id === undefined || where.id === row.id) &&
+      (where.userId === undefined || where.userId === row.userId) &&
+      (where.hardConcurrencyLimit === undefined ||
+        where.hardConcurrencyLimit === row.hardConcurrencyLimit) &&
+      (where.hardConcurrencyLimitSource === undefined ||
+        where.hardConcurrencyLimitSource === row.hardConcurrencyLimitSource) &&
+      (where.runtimeIdentityKey?.in === undefined ||
+        where.runtimeIdentityKey.in.includes(row.runtimeIdentityKey));
+    const apply = (data: Data) => {
+      if ("hardConcurrencyLimit" in data)
+        row.hardConcurrencyLimit = data.hardConcurrencyLimit ?? null;
+      if (data.hardConcurrencyLimitSource)
+        row.hardConcurrencyLimitSource = data.hardConcurrencyLimitSource;
+    };
+    db.inferenceCapacity.findUnique.mockImplementation(async () => ({ ...row }));
+    db.inferenceCapacity.update.mockImplementation(async (args: { data: Data }) => {
+      apply(args.data);
+      return { ...row };
+    });
+    db.inferenceCapacity.updateMany.mockImplementation(
+      async (args: { where: Where; data: Data }) => {
+        if (!matches(args.where)) return { count: 0 };
+        apply(args.data);
+        return { count: 1 };
+      },
+    );
+    db.inferenceCapacity.upsert.mockResolvedValue({ id: row.id });
+
+    const client = createRouterClient(capacityManagementRouter, { context });
+    await client.update({ id: row.id, hardConcurrencyLimit: null });
+    expect(row).toMatchObject({ hardConcurrencyLimit: null, hardConcurrencyLimitSource: "USER" });
+
+    // Startup backfill: the attached-target scan filters on AUTO, so a USER
+    // row is not returned; simulate a stale scan that still lists it.
+    db.executionTarget.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce([
+      {
+        id: "target-1",
+        userId: "owner",
+        discoveredModelId: "dm-1",
+        inferenceCapacityId: row.id,
+        InferenceCapacity: {
+          runtimeIdentityKey: row.runtimeIdentityKey,
+          hardConcurrencyLimit: null,
+          hardConcurrencyLimitSource: "AUTO",
+        },
+      },
+    ]);
+    db.executionTarget.findUnique.mockResolvedValue({
+      id: "target-1",
+      userId: "owner",
+      kind: "DISCOVERED_MODEL",
+      discoveredModelId: "dm-1",
+      inferenceCapacityId: row.id,
+    });
+    await backfillDiscoveredInferenceCapacities();
+    expect(row).toMatchObject({ hardConcurrencyLimit: null, hardConcurrencyLimitSource: "USER" });
+
+    // CLI re-registration reports a finite concurrency for the same model.
+    await ensureDiscoveredInferenceCapacity(db as unknown as Prisma.TransactionClient, {
+      userId: "owner",
+      discoveredModelId: "dm-1",
+      upstreamModelId: "llama",
+      executionTargetId: "target-1",
+      reportedConcurrency: 4,
+    });
+    expect(row).toMatchObject({ hardConcurrencyLimit: null, hardConcurrencyLimitSource: "USER" });
   });
 
   it("rejects hard-limit reductions that invalidate attached direct or pool policies", async () => {

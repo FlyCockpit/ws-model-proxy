@@ -39,9 +39,10 @@ type CapacityWriteArgs = {
     id?: string;
     userId?: string;
     hardConcurrencyLimit?: number | null;
+    hardConcurrencyLimitSource?: "AUTO" | "USER";
     runtimeIdentityKey?: { in?: readonly string[] };
   };
-  data?: { hardConcurrencyLimit?: number | null };
+  data?: { hardConcurrencyLimit?: number | null; hardConcurrencyLimitSource?: "AUTO" | "USER" };
 };
 
 function applyCapacityWrite(
@@ -50,6 +51,7 @@ function applyCapacityWrite(
     userId: string;
     runtimeIdentityKey: string;
     hardConcurrencyLimit: number | null;
+    hardConcurrencyLimitSource?: "AUTO" | "USER";
   },
   args: CapacityWriteArgs,
 ): { count: number } {
@@ -62,10 +64,19 @@ function applyCapacityWrite(
   ) {
     return { count: 0 };
   }
+  if (
+    where.hardConcurrencyLimitSource !== undefined &&
+    where.hardConcurrencyLimitSource !== (row.hardConcurrencyLimitSource ?? "AUTO")
+  ) {
+    return { count: 0 };
+  }
   const keys = where.runtimeIdentityKey?.in;
   if (keys && !keys.includes(row.runtimeIdentityKey)) return { count: 0 };
   if (args.data && "hardConcurrencyLimit" in args.data) {
     row.hardConcurrencyLimit = args.data.hardConcurrencyLimit ?? null;
+  }
+  if (args.data?.hardConcurrencyLimitSource !== undefined) {
+    row.hardConcurrencyLimitSource = args.data.hardConcurrencyLimitSource;
   }
   return { count: 1 };
 }
@@ -150,6 +161,7 @@ describe("discovered inference capacity", () => {
           runtimeIdentityKey: "discovered-model:model-bare",
           runtimeModel: "llama",
           hardConcurrencyLimit: 1,
+          hardConcurrencyLimitSource: "AUTO",
           countStrategy: "CONSERVATIVE_ESTIMATE",
         }),
       }),
@@ -164,11 +176,12 @@ describe("discovered inference capacity", () => {
         id: "new-capacity",
         userId: "user-id",
         hardConcurrencyLimit: null,
+        hardConcurrencyLimitSource: "AUTO",
         runtimeIdentityKey: {
           in: ["execution-target:bare-target", "discovered-model:model-bare"],
         },
       },
-      data: { hardConcurrencyLimit: 1 },
+      data: { hardConcurrencyLimit: 1, hardConcurrencyLimitSource: "AUTO" },
     });
 
     db.executionTarget.findMany.mockResolvedValue([]);
@@ -226,11 +239,12 @@ describe("discovered inference capacity", () => {
         id: "legacy-capacity",
         userId: "user-id",
         hardConcurrencyLimit: null,
+        hardConcurrencyLimitSource: "AUTO",
         runtimeIdentityKey: {
           in: ["execution-target:bare-target", "discovered-model:model-bare"],
         },
       },
-      data: { hardConcurrencyLimit: 1 },
+      data: { hardConcurrencyLimit: 1, hardConcurrencyLimitSource: "AUTO" },
     });
   });
 
@@ -295,6 +309,7 @@ describe("discovered inference capacity", () => {
         InferenceCapacity: {
           runtimeIdentityKey: row.runtimeIdentityKey,
           hardConcurrencyLimit: null,
+          hardConcurrencyLimitSource: "AUTO",
         },
       },
     ]);
@@ -327,11 +342,12 @@ describe("discovered inference capacity", () => {
         id: "trigger-capacity",
         userId: "user-id",
         hardConcurrencyLimit: null,
+        hardConcurrencyLimitSource: "AUTO",
         runtimeIdentityKey: {
           in: ["execution-target:trigger-target", "discovered-model:model-trigger"],
         },
       },
-      data: { hardConcurrencyLimit: 1 },
+      data: { hardConcurrencyLimit: 1, hardConcurrencyLimitSource: "AUTO" },
     });
     expect(db.executionTarget.findMany).toHaveBeenCalledWith({
       where: {
@@ -341,6 +357,7 @@ describe("discovered inference capacity", () => {
         InferenceCapacity: {
           is: {
             hardConcurrencyLimit: null,
+            hardConcurrencyLimitSource: "AUTO",
             OR: [
               { runtimeIdentityKey: { startsWith: "execution-target:" } },
               { runtimeIdentityKey: { startsWith: "discovered-model:" } },
@@ -354,7 +371,11 @@ describe("discovered inference capacity", () => {
         discoveredModelId: true,
         inferenceCapacityId: true,
         InferenceCapacity: {
-          select: { runtimeIdentityKey: true, hardConcurrencyLimit: true },
+          select: {
+            runtimeIdentityKey: true,
+            hardConcurrencyLimit: true,
+            hardConcurrencyLimitSource: true,
+          },
         },
       },
     });
@@ -376,6 +397,7 @@ describe("discovered inference capacity", () => {
         InferenceCapacity: {
           runtimeIdentityKey: row.runtimeIdentityKey,
           hardConcurrencyLimit: 4,
+          hardConcurrencyLimitSource: "AUTO",
         },
       },
     ]);
@@ -416,6 +438,7 @@ describe("discovered inference capacity", () => {
         InferenceCapacity: {
           runtimeIdentityKey: row.runtimeIdentityKey,
           hardConcurrencyLimit: null,
+          hardConcurrencyLimitSource: "AUTO",
         },
       },
     ]);
@@ -446,6 +469,7 @@ describe("discovered inference capacity", () => {
         InferenceCapacity: {
           runtimeIdentityKey: row.runtimeIdentityKey,
           hardConcurrencyLimit: null,
+          hardConcurrencyLimitSource: "AUTO",
         },
       },
     ]);
@@ -465,5 +489,126 @@ describe("discovered inference capacity", () => {
     expect(row.hardConcurrencyLimit).toBeNull();
     expect(db.executionTarget.updateMany).not.toHaveBeenCalled();
     expect(db.inferenceCapacity.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("never fills a USER-sourced null (explicit unlimited) during startup backfill", async () => {
+    const row = {
+      id: "trigger-capacity",
+      userId: "user-id",
+      runtimeIdentityKey: "execution-target:trigger-target",
+      hardConcurrencyLimit: null as number | null,
+      hardConcurrencyLimitSource: "USER" as "AUTO" | "USER",
+    };
+    // Even if a stale read reported the row as AUTO, the write predicate
+    // re-checks the source against the current row.
+    db.executionTarget.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce([
+      {
+        id: "trigger-target",
+        userId: "user-id",
+        discoveredModelId: "model-trigger",
+        inferenceCapacityId: row.id,
+        InferenceCapacity: {
+          runtimeIdentityKey: row.runtimeIdentityKey,
+          hardConcurrencyLimit: null,
+          hardConcurrencyLimitSource: "AUTO",
+        },
+      },
+    ]);
+    db.executionTarget.findUnique.mockResolvedValue({
+      id: "trigger-target",
+      userId: "user-id",
+      kind: "DISCOVERED_MODEL",
+      discoveredModelId: "model-trigger",
+      inferenceCapacityId: row.id,
+    });
+    db.inferenceCapacity.updateMany.mockImplementation(async (args: CapacityWriteArgs) =>
+      applyCapacityWrite(row, args),
+    );
+
+    await backfillDiscoveredInferenceCapacities();
+
+    expect(row.hardConcurrencyLimit).toBeNull();
+    expect(row.hardConcurrencyLimitSource).toBe("USER");
+    expect(db.inferenceCapacity.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          hardConcurrencyLimit: null,
+          hardConcurrencyLimitSource: "AUTO",
+        }),
+      }),
+    );
+  });
+
+  it("skips a USER-sourced null read by the startup backfill without writing", async () => {
+    db.executionTarget.findMany.mockResolvedValueOnce([]).mockResolvedValueOnce([
+      {
+        id: "trigger-target",
+        userId: "user-id",
+        discoveredModelId: "model-trigger",
+        inferenceCapacityId: "trigger-capacity",
+        InferenceCapacity: {
+          runtimeIdentityKey: "execution-target:trigger-target",
+          hardConcurrencyLimit: null,
+          hardConcurrencyLimitSource: "USER",
+        },
+      },
+    ]);
+
+    await backfillDiscoveredInferenceCapacities();
+
+    expect(db.inferenceCapacity.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("does not let a CLI-reported limit overwrite a USER unlimited or USER number", async () => {
+    const tx = db as unknown as Prisma.TransactionClient;
+    for (const userLimit of [null, 3]) {
+      const row = {
+        id: "legacy-capacity",
+        userId: "user-id",
+        runtimeIdentityKey: "execution-target:bare-target",
+        hardConcurrencyLimit: userLimit as number | null,
+        hardConcurrencyLimitSource: "USER" as "AUTO" | "USER",
+      };
+      db.inferenceCapacity.findUnique.mockResolvedValue({ id: row.id });
+      db.inferenceCapacity.updateMany.mockImplementation(async (args: CapacityWriteArgs) =>
+        applyCapacityWrite(row, args),
+      );
+
+      await ensureDiscoveredInferenceCapacity(tx, {
+        userId: "user-id",
+        discoveredModelId: "model-bare",
+        upstreamModelId: "llama",
+        executionTargetId: "bare-target",
+        reportedConcurrency: 8,
+      });
+
+      expect(row.hardConcurrencyLimit).toBe(userLimit);
+      expect(row.hardConcurrencyLimitSource).toBe("USER");
+    }
+    expect(db.inferenceCapacity.update).not.toHaveBeenCalled();
+  });
+
+  it("still fills an AUTO null row with the CLI-reported limit and keeps it AUTO", async () => {
+    const tx = db as unknown as Prisma.TransactionClient;
+    const row = {
+      id: "new-capacity",
+      userId: "user-id",
+      runtimeIdentityKey: "discovered-model:model-bare",
+      hardConcurrencyLimit: null as number | null,
+      hardConcurrencyLimitSource: "AUTO" as "AUTO" | "USER",
+    };
+    db.inferenceCapacity.updateMany.mockImplementation(async (args: CapacityWriteArgs) =>
+      applyCapacityWrite(row, args),
+    );
+
+    await ensureDiscoveredInferenceCapacity(tx, {
+      userId: "user-id",
+      discoveredModelId: "model-bare",
+      upstreamModelId: "llama",
+      reportedConcurrency: 6,
+    });
+
+    expect(row.hardConcurrencyLimit).toBe(6);
+    expect(row.hardConcurrencyLimitSource).toBe("AUTO");
   });
 });

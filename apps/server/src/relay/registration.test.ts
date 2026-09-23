@@ -42,9 +42,10 @@ type CapacityWriteArgs = {
     id?: string;
     userId?: string;
     hardConcurrencyLimit?: number | null;
+    hardConcurrencyLimitSource?: "AUTO" | "USER";
     runtimeIdentityKey?: { in?: readonly string[] };
   };
-  data?: { hardConcurrencyLimit?: number | null };
+  data?: { hardConcurrencyLimit?: number | null; hardConcurrencyLimitSource?: "AUTO" | "USER" };
 };
 
 function applyCapacityWrite(
@@ -53,6 +54,7 @@ function applyCapacityWrite(
     userId: string;
     runtimeIdentityKey: string;
     hardConcurrencyLimit: number | null;
+    hardConcurrencyLimitSource?: "AUTO" | "USER";
   },
   args: CapacityWriteArgs,
 ): { count: number } {
@@ -65,10 +67,19 @@ function applyCapacityWrite(
   ) {
     return { count: 0 };
   }
+  if (
+    where.hardConcurrencyLimitSource !== undefined &&
+    where.hardConcurrencyLimitSource !== (row.hardConcurrencyLimitSource ?? "AUTO")
+  ) {
+    return { count: 0 };
+  }
   const keys = where.runtimeIdentityKey?.in;
   if (keys && !keys.includes(row.runtimeIdentityKey)) return { count: 0 };
   if (args.data && "hardConcurrencyLimit" in args.data) {
     row.hardConcurrencyLimit = args.data.hardConcurrencyLimit ?? null;
+  }
+  if (args.data?.hardConcurrencyLimitSource !== undefined) {
+    row.hardConcurrencyLimitSource = args.data.hardConcurrencyLimitSource;
   }
   return { count: 1 };
 }
@@ -545,6 +556,7 @@ describe("capability override origin", () => {
         runtimeIdentityKey: "discovered-model:model-id",
         runtimeModel: "llama-local",
         hardConcurrencyLimit: 1,
+        hardConcurrencyLimitSource: "AUTO",
         countStrategy: "CONSERVATIVE_ESTIMATE",
       },
       select: { id: true },
@@ -738,11 +750,12 @@ describe("capability override origin", () => {
         id: "trigger-capacity",
         userId: "user-id",
         hardConcurrencyLimit: null,
+        hardConcurrencyLimitSource: "AUTO",
         runtimeIdentityKey: {
           in: ["execution-target:execution-target-id", "discovered-model:model-id"],
         },
       },
-      data: { hardConcurrencyLimit: 4 },
+      data: { hardConcurrencyLimit: 4, hardConcurrencyLimitSource: "AUTO" },
     });
   });
 
@@ -792,8 +805,34 @@ describe("capability override origin", () => {
       const args = call[0] as CapacityWriteArgs;
       if (args.data && "hardConcurrencyLimit" in args.data) {
         expect(args.where?.hardConcurrencyLimit).toBeNull();
+        expect(args.where?.hardConcurrencyLimitSource).toBe("AUTO");
       }
     }
+  });
+
+  it("never lets a CLI-reported limit overwrite a USER limit or USER unlimited", async () => {
+    for (const userLimit of [null, 2]) {
+      const row = {
+        id: "trigger-capacity",
+        userId: "user-id",
+        runtimeIdentityKey: "execution-target:execution-target-id",
+        hardConcurrencyLimit: userLimit as number | null,
+        hardConcurrencyLimitSource: "USER" as "AUTO" | "USER",
+      };
+      db.executionTarget.upsert.mockResolvedValue({
+        id: "execution-target-id",
+        inferenceCapacityId: row.id,
+      });
+      db.inferenceCapacity.updateMany.mockImplementation(async (args: CapacityWriteArgs) =>
+        applyCapacityWrite(row, args),
+      );
+
+      await persistRelayRegistration(preAttachedRegistration(8));
+
+      expect(row.hardConcurrencyLimit).toBe(userLimit);
+      expect(row.hardConcurrencyLimitSource).toBe("USER");
+    }
+    expect(db.inferenceCapacity.update).not.toHaveBeenCalled();
   });
 
   it("does not change a pre-attached capacity with a different runtime key", async () => {

@@ -1961,6 +1961,8 @@ export const forwarderManagementRouter = {
               runtimeIdentityKey: `provider-model:${provider.id}`,
               runtimeModel: provider.upstreamModelId,
               hardConcurrencyLimit: provider.concurrencyLimit,
+              // Seeded from the user-configured provider model limit (null = unlimited).
+              hardConcurrencyLimitSource: "USER",
               physicalMaxContext: provider.contextWindow,
               countStrategy: "CONSERVATIVE_ESTIMATE",
             },
@@ -3106,6 +3108,8 @@ export const forwarderManagementRouter = {
             runtimeIdentityKey: `provider-model:${providerModel.id}`,
             runtimeModel: providerModel.upstreamModelId,
             hardConcurrencyLimit: providerModel.concurrencyLimit,
+            // Seeded from the user-configured provider model limit (null = unlimited).
+            hardConcurrencyLimitSource: "USER",
             physicalMaxContext: providerModel.contextWindow,
             countStrategy: "CONSERVATIVE_ESTIMATE",
           },
