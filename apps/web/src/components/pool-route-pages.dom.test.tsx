@@ -22,6 +22,10 @@ vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
 
+vi.mock("@/hooks/use-deployment-audience", () => ({
+  useDeploymentAudience: () => ({ isAdmin: false }),
+}));
+
 vi.mock("@tanstack/react-router", async (importOriginal) => {
   const original = await importOriginal<typeof import("@tanstack/react-router")>();
   return {

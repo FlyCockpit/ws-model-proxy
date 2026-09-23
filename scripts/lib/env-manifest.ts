@@ -83,7 +83,7 @@ export interface EnvVar {
   key: string;
   group: string;
   source: "generate" | "prompt" | "confirm" | "enable" | "default" | "manual";
-  generator?: "secret32" | "vapid-public" | "vapid-private";
+  generator?: "secret32" | "keyring" | "vapid-public" | "vapid-private";
   default?: string;
   defaultFrom?: "schema" | "app";
   choices?: Array<{ value: string; label?: string; description?: string }>;
@@ -378,9 +378,9 @@ export const ENV_VARS: EnvVar[] = [
   {
     key: "WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS",
     group: "runtime",
-    source: "manual",
+    source: "generate",
+    generator: "keyring",
     secret: true,
-    example: "v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
     comment: [
       "Provider credential AES-256-GCM keyring: active-version:base64-32-byte-key,old-version:base64-32-byte-key.",
       "The first key encrypts new/rotated records; remaining keys are decrypt-only. Never log this value.",

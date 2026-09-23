@@ -1077,6 +1077,31 @@ describe("providerManagementRouter security boundary", () => {
     expect(db.providerAuditEvent.create).toHaveBeenCalledOnce();
   });
 
+  it("rejects a literal private provider URL with a stable reason", async () => {
+    envMock.enabled = true;
+    const client = createRouterClient(providerManagementRouter, { context });
+    await expect(
+      client.createAccount({
+        providerType: "openai",
+        label: "Loopback",
+        baseUrl: "https://127.0.0.1/v1",
+        authType: "BEARER",
+      }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "PROVIDER_PRIVATE_NETWORK_REJECTED" },
+    });
+    expect(db.providerAccount.create).not.toHaveBeenCalled();
+
+    await expect(
+      client.updateAccount({ id: "account", baseUrl: "https://10.0.0.8/v1" }),
+    ).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      data: { reason: "PROVIDER_PRIVATE_NETWORK_REJECTED" },
+    });
+    expect(db.providerAccount.updateMany).not.toHaveBeenCalled();
+  });
+
   it("fails closed for unknown provider types on account create and update", async () => {
     envMock.enabled = true;
     const client = createRouterClient(providerManagementRouter, { context });

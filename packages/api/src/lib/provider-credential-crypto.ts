@@ -27,6 +27,11 @@ export interface ProviderCredentialKeyring {
   keys: ReadonlyMap<string, Buffer>;
 }
 
+/** True when a keyring string is present. Does not parse or return the key. */
+export function providerCredentialKeyringConfigured(value: string | null | undefined): boolean {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
 /**
  * Parses `version:base64key,old-version:base64key`. The first entry is the
  * active write key; remaining entries are decrypt-only rotation keys.

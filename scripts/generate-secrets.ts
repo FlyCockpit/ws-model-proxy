@@ -40,6 +40,7 @@ import {
   varsInGroup,
 } from "./lib/env-manifest.js";
 import { scanSchemaKeys } from "./lib/env-schema.js";
+import { generateProviderCredentialKeyring } from "./lib/provider-credential-keyring.js";
 
 const ROOT = resolve(import.meta.dirname!, "..");
 
@@ -336,6 +337,8 @@ function generate(v: EnvVar): string {
   switch (v.generator) {
     case "secret32":
       return secret32();
+    case "keyring":
+      return generateProviderCredentialKeyring();
     case "vapid-public":
       return vapidPair().publicKey;
     case "vapid-private":

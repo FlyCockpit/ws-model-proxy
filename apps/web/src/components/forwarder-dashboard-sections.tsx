@@ -55,6 +55,7 @@ import {
   memberPolicyPayload,
   newCapacityDefaults,
 } from "@/lib/capacity-forms";
+import { ANTHROPIC_MESSAGES_ENV } from "@/lib/deployment-feature-gate";
 import { publicEgressResourceNames } from "@/lib/public-egress-disclosure";
 import { orpc } from "@/utils/orpc";
 
@@ -1608,6 +1609,8 @@ export function PoolForm({
   capacities = [],
   capacityAvailability,
   protocolAdaptationAvailable,
+  anthropicMessagesEnabled = false,
+  isDeploymentAdmin = false,
   sections = ["identity", "routing", "capacity", "media"],
 }: {
   mode: "create" | "edit";
@@ -1618,9 +1621,13 @@ export function PoolForm({
   capacities?: CapacityRow[];
   capacityAvailability: CapacityAvailability;
   protocolAdaptationAvailable: boolean;
+  /** Deployment gate from MODEL_API_ANTHROPIC_ENABLED. Off keeps the option visible and disabled. */
+  anthropicMessagesEnabled?: boolean;
+  isDeploymentAdmin?: boolean;
   sections?: Array<"identity" | "routing" | "capacity" | "media">;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
+  const anthropicReasonId = useId();
   const capacityEnabled = capacityAvailability === "enabled";
   const show = (section: "identity" | "routing" | "capacity" | "media") =>
     sections.includes(section);
@@ -1976,18 +1983,34 @@ export function PoolForm({
                   id={field.name}
                   className="flex h-11 w-full rounded-md border border-input bg-transparent px-3 text-sm"
                   value={field.state.value}
+                  aria-describedby={anthropicMessagesEnabled ? undefined : anthropicReasonId}
                   onChange={(event) => {
+                    const next = event.target.value as typeof field.state.value;
+                    if (next === "ANTHROPIC_MESSAGES" && !anthropicMessagesEnabled) return;
                     setSurfaceUnsupported(false);
-                    field.handleChange(event.target.value as typeof field.state.value);
+                    field.handleChange(next);
                   }}
                 >
                   <option value="">{t("dashboard:pools.recommendedAutomatic")}</option>
                   {poolSurfaceValues.map((surface) => (
-                    <option key={surface} value={surface}>
+                    <option
+                      key={surface}
+                      value={surface}
+                      disabled={surface === "ANTHROPIC_MESSAGES" && !anthropicMessagesEnabled}
+                    >
                       {t(`dashboard:pools.wizard.surfaces.${surface}`)}
                     </option>
                   ))}
                 </select>
+                {anthropicMessagesEnabled ? null : (
+                  <p id={anthropicReasonId} className="text-xs text-muted-foreground">
+                    {isDeploymentAdmin
+                      ? t("dashboard:deploymentFeatures.adminEnable", {
+                          variable: ANTHROPIC_MESSAGES_ENV,
+                        })
+                      : t("dashboard:deploymentFeatures.unavailable")}
+                  </p>
+                )}
                 {surfaceUnsupported ? (
                   <p className="text-sm text-destructive">
                     {t("dashboard:pools.wizard.createErrors.SURFACE_NOT_SUPPORTED")}

@@ -20,9 +20,10 @@ import { Label } from "@ws-model-proxy/ui/components/label";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ShieldCheck } from "lucide-react";
 import type { ReactNode } from "react";
-import { useRef, useState } from "react";
+import { useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ProtocolCompatibilityRadio } from "@/components/forwarder-dashboard-sections";
+import { ANTHROPIC_MESSAGES_ENV } from "@/lib/deployment-feature-gate";
 import {
   buildGuardedPoolWizardSchema,
   combinedPrimaryMemberCount,
@@ -141,6 +142,8 @@ export function GuardedPoolSetupWizard({
   capacityEnabled,
   protocolAdaptationAvailable,
   providerEgressEnabled,
+  anthropicMessagesEnabled = false,
+  isDeploymentAdmin = false,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -154,8 +157,12 @@ export function GuardedPoolSetupWizard({
   protocolAdaptationAvailable: boolean;
   /** Deployment gate from WMP_PUBLIC_PROVIDER_EGRESS_ENABLED; false blocks provider selection. */
   providerEgressEnabled: boolean;
+  /** Deployment gate from MODEL_API_ANTHROPIC_ENABLED. Off keeps the option visible and disabled. */
+  anthropicMessagesEnabled?: boolean;
+  isDeploymentAdmin?: boolean;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
+  const anthropicReasonId = useId();
   const queryClient = useQueryClient();
   const capacityIsEnabled = capacityEnabled;
   const formRef = useRef<HTMLFormElement>(null);
@@ -364,6 +371,7 @@ export function GuardedPoolSetupWizard({
       },
       firstMemberSelection,
     );
+    if (!anthropicMessagesEnabled && decision.surface === "ANTHROPIC_MESSAGES") return;
     recommendedSurfaceFlags.current = decision.flags;
     if (decision.surface !== form.state.values.recommendedSurface)
       form.setFieldValue("recommendedSurface", decision.surface);
@@ -884,20 +892,43 @@ export function GuardedPoolSetupWizard({
                       className="h-11 w-full rounded-md border bg-background px-3 text-sm"
                       value={field.state.value}
                       onChange={(event) => {
-                        field.handleChange(event.target.value as typeof field.state.value);
+                        const next = event.target.value as typeof field.state.value;
+                        if (next === "ANTHROPIC_MESSAGES" && !anthropicMessagesEnabled) return;
+                        field.handleChange(next);
                         recommendedSurfaceFlags.current = {
                           ...recommendedSurfaceFlags.current,
                           manuallyChosen: true,
                         };
                       }}
                       {...errorProps("recommendedSurface")}
+                      aria-describedby={
+                        [
+                          anthropicMessagesEnabled ? null : anthropicReasonId,
+                          stepErrors.recommendedSurface ? "wizard-recommendedSurface-error" : null,
+                        ]
+                          .filter((id): id is string => Boolean(id))
+                          .join(" ") || undefined
+                      }
                     >
                       {guardedWizardSurfaces.map((surface) => (
-                        <option key={surface} value={surface}>
+                        <option
+                          key={surface}
+                          value={surface}
+                          disabled={surface === "ANTHROPIC_MESSAGES" && !anthropicMessagesEnabled}
+                        >
                           {t(`dashboard:pools.wizard.surfaces.${surface}`)}
                         </option>
                       ))}
                     </select>
+                    {anthropicMessagesEnabled ? null : (
+                      <p id={anthropicReasonId} className="text-xs text-muted-foreground">
+                        {isDeploymentAdmin
+                          ? t("dashboard:deploymentFeatures.adminEnable", {
+                              variable: ANTHROPIC_MESSAGES_ENV,
+                            })
+                          : t("dashboard:deploymentFeatures.unavailable")}
+                      </p>
+                    )}
                     <p className="text-xs text-muted-foreground">
                       {t("dashboard:pools.wizard.fields.recommendedSurfaceHint")}
                     </p>

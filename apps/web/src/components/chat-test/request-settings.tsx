@@ -5,6 +5,8 @@ import type {
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { useTranslation } from "react-i18next";
 
+import { ANTHROPIC_MESSAGES_ENV } from "@/lib/deployment-feature-gate";
+
 import type {
   ChatTestRoutingMode,
   ChatTestSurface,
@@ -26,6 +28,8 @@ export function RequestSettingsFields({
   anthropicMaxTokens,
   onAnthropicMaxTokensChange,
   disabled,
+  anthropicMessagesEnabled,
+  isDeploymentAdmin,
   onSurfaceChange,
   onRoutingModeChange,
   onReasoningChange,
@@ -43,6 +47,8 @@ export function RequestSettingsFields({
   anthropicMaxTokens: number;
   onAnthropicMaxTokensChange: (value: number) => void;
   disabled: boolean;
+  anthropicMessagesEnabled: boolean;
+  isDeploymentAdmin: boolean;
   onSurfaceChange: (value: ChatTestSurfaceSelection) => void;
   onRoutingModeChange: (value: ChatTestRoutingMode) => void;
   onReasoningChange: (value: ChatTestReasoningSelection) => void;
@@ -60,7 +66,14 @@ export function RequestSettingsFields({
             value={surfaceSelection}
             disabled={disabled}
             aria-invalid={surfaceSelection === "PREFERRED" && effectiveSurface === null}
-            onChange={(event) => onSurfaceChange(event.target.value as ChatTestSurfaceSelection)}
+            aria-describedby={
+              anthropicMessagesEnabled ? undefined : `${idPrefix}-anthropic-unavailable`
+            }
+            onChange={(event) => {
+              const next = event.target.value as ChatTestSurfaceSelection;
+              if (next === "ANTHROPIC_MESSAGES" && !anthropicMessagesEnabled) return;
+              onSurfaceChange(next);
+            }}
           >
             <option value="PREFERRED">{t("dashboard:chatTest.surface.PREFERRED")}</option>
             <option value="OPENAI_CHAT_COMPLETIONS">
@@ -69,10 +82,19 @@ export function RequestSettingsFields({
             <option value="OPENAI_RESPONSES">
               {t("dashboard:chatTest.surface.OPENAI_RESPONSES")}
             </option>
-            <option value="ANTHROPIC_MESSAGES">
+            <option value="ANTHROPIC_MESSAGES" disabled={!anthropicMessagesEnabled}>
               {t("dashboard:chatTest.surface.ANTHROPIC_MESSAGES")}
             </option>
           </select>
+          {anthropicMessagesEnabled ? null : (
+            <p id={`${idPrefix}-anthropic-unavailable`} className="text-xs text-muted-foreground">
+              {isDeploymentAdmin
+                ? t("dashboard:deploymentFeatures.adminEnable", {
+                    variable: ANTHROPIC_MESSAGES_ENV,
+                  })
+                : t("dashboard:deploymentFeatures.unavailable")}
+            </p>
+          )}
           <p className="text-xs text-muted-foreground">
             {surfaceSelection === "PREFERRED" && recommendedSurface
               ? t("dashboard:chatTest.surface.preferredHelp", { surface: recommendedSurface })

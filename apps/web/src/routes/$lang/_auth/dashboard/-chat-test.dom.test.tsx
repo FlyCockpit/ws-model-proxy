@@ -43,8 +43,21 @@ vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
 
+vi.mock("@/hooks/use-deployment-audience", () => ({
+  useDeploymentAudience: () => ({ isAdmin: false }),
+}));
+
 vi.mock("@/utils/orpc", () => ({
   orpc: {
+    appConfig: {
+      queryOptions: () => ({
+        queryKey: ["appConfig"],
+        queryFn: async () => ({
+          deploymentFeatures: { MODEL_API_ANTHROPIC_ENABLED: true },
+        }),
+        initialData: { deploymentFeatures: { MODEL_API_ANTHROPIC_ENABLED: true } },
+      }),
+    },
     forwarderManagement: {
       visibleModels: {
         queryOptions: () => ({

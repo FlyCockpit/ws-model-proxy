@@ -21,6 +21,10 @@ const state = vi.hoisted(() => ({
   submitted: undefined as Record<string, unknown> | undefined,
 }));
 
+vi.mock("@/hooks/use-deployment-audience", () => ({
+  useDeploymentAudience: () => ({ isAdmin: false }),
+}));
+
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
     t: (key: string, values?: { current?: number; name?: string }) =>

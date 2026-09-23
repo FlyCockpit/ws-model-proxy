@@ -20,6 +20,19 @@ export interface ProviderEgressPolicy {
   timeoutMs?: number;
 }
 
+/** Stable oRPC `data.reason` when a literal private or loopback provider URL is rejected. */
+export const PROVIDER_PRIVATE_NETWORK_REJECTED = "PROVIDER_PRIVATE_NETWORK_REJECTED";
+
+export class ProviderBaseUrlError extends Error {
+  readonly reason: typeof PROVIDER_PRIVATE_NETWORK_REJECTED;
+
+  constructor(message: string, reason: typeof PROVIDER_PRIVATE_NETWORK_REJECTED) {
+    super(message);
+    this.name = "ProviderBaseUrlError";
+    this.reason = reason;
+  }
+}
+
 export type ProviderEgressAuth =
   | { type: "API_KEY"; apiKey: string }
   | { type: "BEARER"; token: string }
@@ -204,7 +217,10 @@ export function validateProviderBaseUrl(rawUrl: string, policy: ProviderEgressPo
     !policy.allowPrivateNetworks &&
     isPrivateOrSpecialAddress(url.hostname)
   ) {
-    throw new Error("Provider base URL resolves to a private or special network");
+    throw new ProviderBaseUrlError(
+      "Provider base URL resolves to a private or special network",
+      PROVIDER_PRIVATE_NETWORK_REJECTED,
+    );
   }
   return url;
 }

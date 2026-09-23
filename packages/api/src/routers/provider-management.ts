@@ -26,6 +26,7 @@ import {
   parseProviderCredentialKeyring,
 } from "../lib/provider-credential-crypto";
 import {
+  ProviderBaseUrlError,
   providerHttpsRequest,
   redactProviderError,
   validateProviderBaseUrl,
@@ -45,6 +46,19 @@ const policy = () => ({
   allowPrivateNetworks: env.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS,
   egressEnabled: env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
 });
+function accountBaseUrl(raw: string): string {
+  try {
+    return validateProviderBaseUrl(raw, policy()).href.replace(/\/$/u, "");
+  } catch (error) {
+    if (error instanceof ProviderBaseUrlError) {
+      throw new ORPCError("BAD_REQUEST", {
+        message: "Private and loopback provider URLs are not allowed for this deployment.",
+        data: { reason: error.reason },
+      });
+    }
+    throw error;
+  }
+}
 const providerWriteTransaction = {
   isolationLevel: "Serializable" as const,
   maxWait: 5_000,
@@ -425,7 +439,7 @@ export const providerManagementRouter = {
     enabled();
     assertInventoryMatchesProviderType(input.providerType, null);
     const userId = context.session.user.id;
-    const baseUrl = validateProviderBaseUrl(input.baseUrl, policy()).href.replace(/\/$/u, "");
+    const baseUrl = accountBaseUrl(input.baseUrl);
     return prisma.$transaction(async (tx) => {
       const row = await tx.providerAccount.create({
         data: {
@@ -452,7 +466,7 @@ export const providerManagementRouter = {
       const userId = context.session.user.id;
       const { id: accountId, ...data } = input;
       if (data.baseUrl) {
-        data.baseUrl = validateProviderBaseUrl(data.baseUrl, policy()).href.replace(/\/$/u, "");
+        data.baseUrl = accountBaseUrl(data.baseUrl);
       }
       return prisma.$transaction(async (tx) => {
         await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${accountId} AND "userId" = ${userId} FOR UPDATE`;

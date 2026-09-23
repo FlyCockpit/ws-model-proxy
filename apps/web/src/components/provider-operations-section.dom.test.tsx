@@ -13,6 +13,11 @@ const state = vi.hoisted(() => ({
   budgetPayload: undefined as Record<string, unknown> | undefined,
   updateModelResult: undefined as Record<string, unknown> | undefined,
   updateModelPayloads: [] as Array<Record<string, unknown>>,
+  allowPrivateNetworks: true,
+}));
+
+vi.mock("@/hooks/use-deployment-audience", () => ({
+  useDeploymentAudience: () => ({ isAdmin: false }),
 }));
 
 vi.mock("react-i18next", () => ({
@@ -87,6 +92,11 @@ vi.mock("@/utils/orpc", () => {
   const providerMutations = Object.fromEntries(names.map((name) => [name, mutation(name)]));
   return {
     orpc: {
+      appConfig: query("appConfig", () => ({
+        deploymentFeatures: {
+          WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: state.allowPrivateNetworks,
+        },
+      })),
       providerManagement: {
         key: () => ["providerManagement"],
         ...providerQueries,
@@ -126,12 +136,20 @@ afterEach(() => {
   state.budgetPayload = undefined;
   state.updateModelResult = undefined;
   state.updateModelPayloads = [];
+  state.allowPrivateNetworks = true;
   vi.mocked(toast.success).mockClear();
   vi.mocked(toast.error).mockClear();
   vi.mocked(toast.warning).mockClear();
 });
 
 describe("ProviderOperationsSection mounted forms", () => {
+  it("says private and loopback URLs are rejected before submit when that flag is off", () => {
+    state.allowPrivateNetworks = false;
+    mount();
+    expect(screen.getByText("dashboard:deploymentFeatures.privateNetworkUser")).toBeTruthy();
+    expect(screen.getByLabelText("dashboard:providers.fields.baseUrl")).toBeTruthy();
+  });
+
   it("reactively reports and focuses account errors, then submits the actual mutation payload", async () => {
     const user = userEvent.setup();
     mount();

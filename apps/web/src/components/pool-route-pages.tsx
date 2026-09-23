@@ -28,6 +28,8 @@ import {
 } from "@/components/forwarder-dashboard-sections";
 import { InlineRetry } from "@/components/inline-retry";
 import { ProviderOperationsSection } from "@/components/provider-operations-section";
+import { useDeploymentAudience } from "@/hooks/use-deployment-audience";
+import { anthropicMessagesEnabledFromConfig } from "@/lib/deployment-feature-gate";
 import { orpc } from "@/utils/orpc";
 
 function PageSkeleton() {
@@ -73,6 +75,8 @@ type PoolDetailContextValue = {
   capacities: PoolDetailCapacity[];
   capacityAvailability: ReturnType<typeof resolveCapacityAvailability>;
   protocolAdaptationAvailable: boolean;
+  anthropicMessagesEnabled: boolean;
+  isDeploymentAdmin: boolean;
   providerEgressEnabled: boolean;
   capacityEnabled: boolean;
   openMember: (member: "create" | string | null) => void;
@@ -92,6 +96,7 @@ function usePoolDetail() {
 
 export function PoolsListPage({ lang }: { lang: string }) {
   const { t } = useTranslation(["common", "dashboard"]);
+  const { isAdmin: isDeploymentAdmin } = useDeploymentAudience();
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const pools = useQuery(orpc.forwarderManagement.listModelPools.queryOptions());
   const devices = useQuery(orpc.forwarderManagement.listCliDevices.queryOptions());
@@ -154,6 +159,11 @@ export function PoolsListPage({ lang }: { lang: string }) {
                   capacities={capacities.data ?? []}
                   capacityAvailability={capacityAvailability}
                   protocolAdaptationAvailable={appConfig.data?.protocolAdaptationAvailable ?? false}
+                  anthropicMessagesEnabled={anthropicMessagesEnabledFromConfig(
+                    appConfig.data,
+                    appConfig.isError,
+                  )}
+                  isDeploymentAdmin={isDeploymentAdmin}
                   onSuccess={() => setAdvancedOpen(false)}
                 />
               </DialogContent>
@@ -247,6 +257,7 @@ export function PoolsListPage({ lang }: { lang: string }) {
 
 export function PoolDetailPage({ poolId, lang = "en-US" }: { poolId: string; lang?: string }) {
   const { t } = useTranslation(["common", "dashboard"]);
+  const { isAdmin: isDeploymentAdmin } = useDeploymentAudience();
   const queryClient = useQueryClient();
   const pools = useQuery(orpc.forwarderManagement.listModelPools.queryOptions());
   const devices = useQuery(orpc.forwarderManagement.listCliDevices.queryOptions());
@@ -326,6 +337,8 @@ export function PoolDetailPage({ poolId, lang = "en-US" }: { poolId: string; lan
     capacities: capacities.data ?? [],
     capacityAvailability,
     protocolAdaptationAvailable: appConfig.data?.protocolAdaptationAvailable ?? false,
+    anthropicMessagesEnabled: anthropicMessagesEnabledFromConfig(appConfig.data, appConfig.isError),
+    isDeploymentAdmin,
     providerEgressEnabled: appConfig.data?.providerEgressEnabled ?? false,
     capacityEnabled: appConfig.data?.capacityEnabled ?? false,
     openMember: setMemberDialog,
@@ -490,6 +503,8 @@ export function PoolDetailTab({
           capacities={detail.capacities}
           capacityAvailability={detail.capacityAvailability}
           protocolAdaptationAvailable={detail.protocolAdaptationAvailable}
+          anthropicMessagesEnabled={detail.anthropicMessagesEnabled}
+          isDeploymentAdmin={detail.isDeploymentAdmin}
           sections={["identity"]}
           stickySave
           onSuccess={() => undefined}
@@ -608,6 +623,8 @@ export function PoolDetailTab({
         capacities={detail.capacities}
         capacityAvailability={detail.capacityAvailability}
         protocolAdaptationAvailable={detail.protocolAdaptationAvailable}
+        anthropicMessagesEnabled={detail.anthropicMessagesEnabled}
+        isDeploymentAdmin={detail.isDeploymentAdmin}
         sections={[tab]}
         stickySave
         onSuccess={() => undefined}

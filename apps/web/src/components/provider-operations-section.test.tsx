@@ -13,6 +13,10 @@ vi.mock("react-i18next", () => ({
   }),
 }));
 
+vi.mock("@/hooks/use-deployment-audience", () => ({
+  useDeploymentAudience: () => ({ isAdmin: false }),
+}));
+
 import {
   BudgetRuleField,
   CapabilityInventoryInput,

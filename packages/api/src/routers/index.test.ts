@@ -8,11 +8,15 @@ import type { Context } from "../context";
 const envMock = {
   SMTP_HOST: undefined as string | undefined,
   SIGNUP_ENABLED: true,
+  MODEL_API_ANTHROPIC_ENABLED: false,
   MODEL_API_GLOBAL_CAPACITY_ENABLED: false,
   MODEL_API_PROTOCOL_ADAPTATION_ENABLED: false,
   WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: false,
+  WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS: undefined as string | undefined,
+  WMP_MCP_ENABLED: false,
+  WMP_MCP_PAT_ALLOW_NO_EXPIRY: true,
+  WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: false,
   BETTER_AUTH_URL: "https://proxy.example.com",
-  WMP_MCP_ENABLED: true,
 };
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: envMock,
@@ -53,8 +57,14 @@ describe("appConfig", () => {
   beforeEach(() => {
     envMock.SMTP_HOST = undefined;
     envMock.SIGNUP_ENABLED = true;
+    envMock.MODEL_API_ANTHROPIC_ENABLED = false;
+    envMock.MODEL_API_GLOBAL_CAPACITY_ENABLED = false;
     envMock.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = false;
     envMock.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = false;
+    envMock.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS = undefined;
+    envMock.WMP_MCP_ENABLED = false;
+    envMock.WMP_MCP_PAT_ALLOW_NO_EXPIRY = true;
+    envMock.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS = false;
     db.appSetting.findUnique.mockResolvedValue(null);
     db.user.count.mockResolvedValue(1);
   });
@@ -82,6 +92,20 @@ describe("appConfig", () => {
     const config = await client.appConfig();
 
     expect(config).toEqual({
+      deploymentFeatures: {
+        MODEL_API_ANTHROPIC_ENABLED: false,
+        MODEL_API_PROTOCOL_ADAPTATION_ENABLED: false,
+        MODEL_API_GLOBAL_CAPACITY_ENABLED: false,
+        WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: {
+          enabled: false,
+          keyringConfigured: false,
+          ready: false,
+        },
+        WMP_MCP_ENABLED: false,
+        WMP_MCP_PAT_ALLOW_NO_EXPIRY: true,
+        WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: false,
+        SIGNUP_ENABLED: false,
+      },
       ssoEnabled: false,
       forceSso: false,
       ssoProviderName: "SSO",
@@ -92,6 +116,53 @@ describe("appConfig", () => {
       providerEgressEnabled: false,
       emailEnabled: true,
     });
+    expect(config.signupEnabled).toBe(config.deploymentFeatures.SIGNUP_ENABLED);
+    expect(config.capacityEnabled).toBe(
+      config.deploymentFeatures.MODEL_API_GLOBAL_CAPACITY_ENABLED,
+    );
+    expect(config.protocolAdaptationAvailable).toBe(
+      config.deploymentFeatures.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
+    );
+    expect(config.providerEgressEnabled).toBe(
+      config.deploymentFeatures.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED.enabled,
+    );
+  });
+
+  it("reports deployment features and keeps legacy aliases aligned", async () => {
+    envMock.MODEL_API_ANTHROPIC_ENABLED = true;
+    envMock.MODEL_API_GLOBAL_CAPACITY_ENABLED = true;
+    envMock.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = true;
+    envMock.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
+    envMock.WMP_MCP_ENABLED = true;
+    envMock.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS = true;
+    const client = createRouterClient(appRouter, { context: publicContext });
+
+    const missingKeyring = await client.appConfig();
+    expect(missingKeyring.deploymentFeatures.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED).toEqual({
+      enabled: true,
+      keyringConfigured: false,
+      ready: false,
+    });
+    expect(missingKeyring.providerEgressEnabled).toBe(true);
+    expect(missingKeyring.capacityEnabled).toBe(true);
+    expect(missingKeyring.protocolAdaptationAvailable).toBe(true);
+    expect(missingKeyring.deploymentFeatures.MODEL_API_ANTHROPIC_ENABLED).toBe(true);
+    expect(missingKeyring.deploymentFeatures.WMP_MCP_ENABLED).toBe(true);
+    expect(missingKeyring.deploymentFeatures.WMP_MCP_PAT_ALLOW_NO_EXPIRY).toBe(true);
+    expect(missingKeyring.deploymentFeatures.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS).toBe(true);
+
+    const sentinel = "zz-keyring-marker";
+    envMock.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS = sentinel;
+    const ready = await client.appConfig();
+    expect(ready.deploymentFeatures.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED).toEqual({
+      enabled: true,
+      keyringConfigured: true,
+      ready: true,
+    });
+    expect(ready.providerEgressEnabled).toBe(
+      ready.deploymentFeatures.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED.enabled,
+    );
+    expect(JSON.stringify(ready)).not.toContain(sentinel);
   });
 
   it("reports the non-sensitive provider egress capability", async () => {

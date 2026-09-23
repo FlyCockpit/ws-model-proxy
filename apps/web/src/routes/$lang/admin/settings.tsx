@@ -25,6 +25,7 @@ import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
+import { DeploymentFeaturesPanel } from "@/components/deployment-features-panel";
 import { InlineRetry } from "@/components/inline-retry";
 import { orpc } from "@/utils/orpc";
 
@@ -164,6 +165,10 @@ function AdminSettings() {
           }}
         />
       )}
+
+      {appConfig.data?.deploymentFeatures ? (
+        <DeploymentFeaturesPanel features={appConfig.data.deploymentFeatures} />
+      ) : null}
 
       {mediaStats.isPending ? (
         <MediaPolicySkeleton />

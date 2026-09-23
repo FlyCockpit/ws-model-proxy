@@ -20,6 +20,7 @@ import {
 } from "./model-api/provider-attempt-lifecycle.js";
 import { startProviderBudgetRepair } from "./model-api/provider-budget-runtime.js";
 import { startRelayTelemetryRecovery } from "./model-api/relay-telemetry-recovery.js";
+import { warnMissingProviderCredentialKeyring } from "./provider-keyring-startup.js";
 import { sweepExpiredTokenCommands } from "./relay/cli-commands.js";
 import { RELAY_SUBPROTOCOL, RELAY_WS_MAX_PAYLOAD_BYTES } from "./relay/protocol.js";
 import { relaySessionManager } from "./relay/session-manager.js";
@@ -46,6 +47,11 @@ if (env.CORS_ORIGIN === "*") {
   );
   process.exit(1);
 }
+
+warnMissingProviderCredentialKeyring({
+  egressEnabled: env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
+  keyring: env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS,
+});
 
 // ---------------------------------------------------------------------------
 // App construction (middleware + routes live in ./app.ts — createApp)
