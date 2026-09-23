@@ -31,6 +31,8 @@ export type CliTrust =
   | { status: "invalid" }
   | { status: "offline" };
 
+export type ChangedCliTrust = Extract<CliTrust, { status: "changed" }>;
+
 /** Pinned identity keys (base64url, 65-byte SEC1) per `cliDeviceId`. */
 export type CliPinStore = {
   get(cliDeviceId: string): Promise<string | null>;
@@ -151,25 +153,44 @@ export async function evaluateCliTrust(cli: ListedCli, store: CliPinStore): Prom
   return { status: "changed", pinnedFingerprint, fingerprint, identityPublicKey };
 }
 
+/** Whether the pin still has the fingerprint the user was shown. */
+async function pinStillMatches(
+  store: CliPinStore,
+  cliDeviceId: string,
+  pinnedFingerprint: string,
+): Promise<boolean> {
+  const pinned = await store.get(cliDeviceId);
+  return pinned !== null && (await fingerprintOf(pinned)) === pinnedFingerprint;
+}
+
 /**
- * The user confirmed the new key shown in a `changed` state. Pins exactly that
- * key (not whatever the relay lists later), after checking it still signs the
- * CLI's current terminal key. A CLI that stopped proving an identity loses its pin.
+ * The user confirmed the `changed` state shown in the dialog (`shown` is the
+ * snapshot taken when it opened). Pins exactly that key, and only while the
+ * relay still lists it with a valid signature over the CLI's current terminal
+ * key and the pin is still the one shown. Anything else pins nothing and
+ * returns the fresh evaluation. A CLI that stopped proving an identity loses
+ * its pin only while it is still a live 2.4 CLI.
  */
 export async function trustNewCliKey(
   cli: ListedCli,
-  shown: Extract<CliTrust, { status: "changed" }>,
+  shown: ChangedCliTrust,
   store: CliPinStore,
 ): Promise<CliTrust> {
+  if (!(await pinStillMatches(store, cli.cliDeviceId, shown.pinnedFingerprint))) {
+    return evaluateCliTrust(cli, store);
+  }
   if (shown.identityPublicKey === null) {
     // Only a live 2.4 CLI may drop the pin. An offline one keeps it.
     if (cli.terminalViewers || !cliIsLive(cli)) return evaluateCliTrust(cli, store);
     await store.remove(cli.cliDeviceId);
     return evaluateCliTrust(cli, store);
   }
-  if (cli.identityPublicKey !== shown.identityPublicKey) return evaluateCliTrust(cli, store);
+  if (!cliIsLive(cli) || cli.identityPublicKey !== shown.identityPublicKey) {
+    return evaluateCliTrust(cli, store);
+  }
   const verified = await verifiedIdentity(cli);
   if (!verified) return { status: "invalid" };
+  if (verified.fingerprint !== shown.fingerprint) return evaluateCliTrust(cli, store);
   await store.put(cli.cliDeviceId, verified.identityPublicKey);
   return {
     status: "trusted",
@@ -177,6 +198,12 @@ export async function trustNewCliKey(
     terminalPublicKey: verified.terminalPublicKey,
     firstUse: false,
   };
+}
+
+/** Whether `trustNewCliKey` applied the confirmed snapshot rather than re-evaluating. */
+export function trustAppliedSnapshot(shown: ChangedCliTrust, result: CliTrust): boolean {
+  if (shown.identityPublicKey === null) return result.status === "unverified";
+  return result.status === "trusted" && result.fingerprint === shown.fingerprint;
 }
 
 const PIN_DB = "wsmp-terminal-cli-pins";

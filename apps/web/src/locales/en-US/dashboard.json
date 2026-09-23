@@ -239,6 +239,7 @@
     "cliList": "Choose a CLI",
     "reconnecting": "Reconnecting to the terminal service…",
     "exited": "The shell exited.",
+    "gone": "This terminal ended while you were disconnected.",
     "rejected": "The CLI rejected this terminal ({{reason}}).",
     "error": "The terminal connection hit an error.",
     "inputDropped": "Some input was not delivered because it arrived too fast. Check the last command before you continue.",
@@ -307,6 +308,7 @@
       "trustTitle": "Trust the new key for {{label}}?",
       "trustDescription": "Only continue if you ran `wsmp terminal fingerprint` on that machine and it matches. Otherwise someone may be intercepting your terminal.",
       "trustFailed": "The key could not be trusted. Reload and try again.",
+      "keyChangedAgain": "The key changed again before it could be trusted. Nothing was pinned. Compare the new fingerprint and try again.",
       "activeUnverified": "This CLI's identity is unverified. Update the CLI to verify it."
     }
   },

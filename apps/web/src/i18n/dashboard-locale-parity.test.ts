@@ -45,6 +45,7 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
       "cliList",
       "reconnecting",
       "exited",
+      "gone",
       "rejected",
       "error",
       "inputDropped",
@@ -106,6 +107,7 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
       "identity.trustTitle",
       "identity.trustDescription",
       "identity.trustFailed",
+      "identity.keyChangedAgain",
       "identity.activeUnverified",
     ].sort();
     const featureKeys = [

@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { afterEach, describe, expect, it, vi } from "vitest";
-
-import type { CliTrust } from "@/lib/terminal-cli-identity";
+import type { ChangedCliTrust, CliTrust } from "@/lib/terminal-cli-identity";
 import type { ListedCli } from "@/lib/terminal-protocol";
 
 vi.mock("react-i18next", () => ({
@@ -30,9 +30,9 @@ function cli(cliDeviceId: string, terminalViewers: boolean): ListedCli {
   };
 }
 
-function renderList(clis: ListedCli[], trust: Record<string, CliTrust>) {
-  const onTrustNewKey = vi.fn(async (_cliDeviceId: string) => undefined);
-  render(
+function renderList(clis: ListedCli[], trust: Record<string, CliTrust>, applied = true) {
+  const onTrustNewKey = vi.fn(async (_cliDeviceId: string, _expected: ChangedCliTrust) => applied);
+  const view = render(
     <TerminalCliIdentities
       clis={clis}
       trust={trust}
@@ -40,7 +40,36 @@ function renderList(clis: ListedCli[], trust: Record<string, CliTrust>) {
       onTrustNewKey={onTrustNewKey}
     />,
   );
-  return { onTrustNewKey };
+  const rerender = (next: Record<string, CliTrust>) =>
+    view.rerender(
+      <TerminalCliIdentities
+        clis={clis}
+        trust={next}
+        labelFor={(id) => `label-${id}`}
+        onTrustNewKey={onTrustNewKey}
+      />,
+    );
+  return { onTrustNewKey, rerender };
+}
+
+const shownChange: ChangedCliTrust = {
+  status: "changed",
+  pinnedFingerprint: "AAAA AAAA",
+  fingerprint: "BBBB BBBB",
+  identityPublicKey: "ik",
+};
+
+async function openAndConfirm(
+  user: ReturnType<typeof userEvent.setup>,
+  beforeConfirm?: () => void,
+) {
+  await user.click(screen.getByRole("button", { name: "dashboard:terminals.identity.trustNew" }));
+  const dialog = await screen.findByRole("alertdialog");
+  beforeConfirm?.();
+  const confirm = within(dialog).getByRole("button", {
+    name: "dashboard:terminals.identity.trustNew",
+  });
+  return { dialog, confirm };
 }
 
 describe("TerminalCliIdentities", () => {
@@ -82,7 +111,40 @@ describe("TerminalCliIdentities", () => {
       .find((button) => dialog.contains(button));
     if (!confirm) throw new Error("no confirm button");
     await user.click(confirm);
-    await waitFor(() => expect(onTrustNewKey).toHaveBeenCalledWith("desk"));
+    await waitFor(() => expect(onTrustNewKey).toHaveBeenCalledWith("desk", shownChange));
+  });
+
+  it("shows the pinned and new fingerprints inside the dialog", async () => {
+    const user = userEvent.setup();
+    renderList([cli("desk", true)], { desk: shownChange });
+    const { dialog } = await openAndConfirm(user);
+    expect(within(dialog).getByText("AAAA AAAA")).toBeTruthy();
+    expect(within(dialog).getByText("BBBB BBBB")).toBeTruthy();
+    expect(within(dialog).getByText("dashboard:terminals.identity.pinned")).toBeTruthy();
+    expect(within(dialog).getByText("dashboard:terminals.identity.new")).toBeTruthy();
+  });
+
+  it("confirms the snapshot it showed, not a key that arrived while it was open", async () => {
+    const user = userEvent.setup();
+    const { onTrustNewKey, rerender } = renderList(
+      [cli("desk", true)],
+      { desk: shownChange },
+      false,
+    );
+    const swapped: ChangedCliTrust = {
+      ...shownChange,
+      fingerprint: "CCCC CCCC",
+      identityPublicKey: "ik-2",
+    };
+    const { dialog, confirm } = await openAndConfirm(user, () => rerender({ desk: swapped }));
+    // The dialog keeps showing what the user is confirming.
+    expect(within(dialog).getByText("BBBB BBBB")).toBeTruthy();
+    expect(within(dialog).queryByText("CCCC CCCC")).toBeNull();
+    await user.click(confirm);
+    await waitFor(() => expect(onTrustNewKey).toHaveBeenCalledWith("desk", shownChange));
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith("dashboard:terminals.identity.keyChangedAgain"),
+    );
   });
 
   it("blocks an invalid 2.5 CLI with a notice and no trust action", () => {

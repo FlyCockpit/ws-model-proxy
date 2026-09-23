@@ -24,12 +24,14 @@ import {
 } from "@/hooks/use-terminal-crypto";
 import { type TerminalSocketStatus, useTerminalSocket } from "@/hooks/use-terminal-socket";
 import {
+  type ChangedCliTrust,
   type CliPinStore,
   type CliTrust,
   cliTrustInputKey,
   evaluateCliTrust,
   indexedDbCliPinStore,
   trustAllowsHandshake,
+  trustAppliedSnapshot,
   trustNewCliKey,
   trustRejectionReason,
 } from "@/lib/terminal-cli-identity";
@@ -72,6 +74,11 @@ const OUTPUT_BUFFER_EVENTS = 256;
 const IDENTITY_RETRY_REASONS = new Set(["identity_changed", "identity_invalid"]);
 /** The CLI refuses a handshake that carries no browser identity with this reason. */
 const BROWSER_IDENTITY_REQUIRED = "approval_required";
+/**
+ * `error` on a tab marked exited because the relay's terminal list no longer
+ * has its terminal (it ended, or its CLI restarted, while this page was away).
+ */
+export const TERMINAL_GONE = "gone";
 
 type InputBatch = {
   pending: string;
@@ -224,8 +231,12 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   clis: ListedCli[];
   /** Identity trust per `cliDeviceId`; missing while it is being checked. */
   cliTrust: Record<string, CliTrust>;
-  /** After an in-page confirmation: pin the new identity key shown for a CLI. */
-  trustNewKey: (cliDeviceId: string) => Promise<void>;
+  /**
+   * After an in-page confirmation: pin the identity key in `expected`, the
+   * `changed` state the dialog showed. Resolves false when the listed identity
+   * no longer matches it; nothing is pinned and the new state is published.
+   */
+  trustNewKey: (cliDeviceId: string, expected: ChangedCliTrust) => Promise<boolean>;
   tabs: TerminalTab[];
   activeLocalId: string | null;
   selectTab: (localId: string) => void;
@@ -318,6 +329,16 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
    */
   const establishingRef = useRef(new Map<string, PendingHandshake>());
   const droppedNoticeRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  /** Number of `list` requests sent so far; each request takes the next number. */
+  const listSeqRef = useRef(0);
+  /** `list` requests on this socket whose `terminals` answer has not arrived. */
+  const listRequestsRef = useRef<number[]>([]);
+  /**
+   * terminalId -> `listSeqRef` when this page learned it. A list answers for a
+   * terminal only when the terminal was known before that list was requested;
+   * one the relay registered later may be missing from it.
+   */
+  const knownSinceRef = useRef(new Map<string, number>());
 
   const viewOf = useCallback((localId: string): TerminalWriterState => {
     return viewRef.current.get(localId) ?? { multiViewer: false, writer: "you" };
@@ -351,6 +372,18 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     },
     [],
   );
+
+  /** Call right before a `list` request goes out on the current socket. */
+  const noteListRequest = useCallback(() => {
+    listSeqRef.current += 1;
+    listRequestsRef.current.push(listSeqRef.current);
+  }, []);
+
+  const noteTerminalKnown = useCallback((terminalId: string) => {
+    if (!knownSinceRef.current.has(terminalId)) {
+      knownSinceRef.current.set(terminalId, listSeqRef.current);
+    }
+  }, []);
 
   const emitOutput = useCallback((localId: string, event: TerminalOutputEvent) => {
     // A frame that was mid-decryption when its tab closed has nowhere to go.
@@ -521,9 +554,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       const tab = tabsRef.current.find((item) => item.localId === pending.localId);
       sendRef.current({ type: tab?.opener ? "close" : "detach", terminalId });
       refuseTab(pending.localId, "identity_mismatch");
+      noteListRequest();
       sendRef.current({ type: "list" });
     },
-    [refuseTab],
+    [noteListRequest, refuseTab],
   );
 
   const establish = useCallback(
@@ -771,9 +805,62 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     [clearTimer],
   );
 
+  /**
+   * The relay no longer lists this tab's terminal: it ended, or its CLI
+   * restarted, while this page was not attached. End the tab like an exit.
+   */
+  const markTerminalGone = useCallback(
+    (localId: string, terminalId: string) => {
+      clearTimer(reattachTimersRef.current, localId);
+      clearTimer(resizeTimersRef.current, localId);
+      reattachRef.current.delete(localId);
+      const batch = inputRef.current.get(localId);
+      if (batch?.timer) clearTimeout(batch.timer);
+      inputRef.current.delete(localId);
+      pendingResizeRef.current.delete(localId);
+      lastSentSizeRef.current.delete(localId);
+      awaitingIdentityRef.current.delete(localId);
+      establishingRef.current.delete(localId);
+      pendingRef.current.delete(localId);
+      takePendingByTerminalId(pendingRef.current, terminalId);
+      attachingRef.current.delete(terminalId);
+      knownSinceRef.current.delete(terminalId);
+      const session = sessionsRef.current.get(terminalId);
+      if (session) retireAfterDrain(terminalId, session);
+      else earlySealedRef.current.delete(terminalId);
+      patchTabNow(localId, { phase: "exited", approvalCode: null, error: TERMINAL_GONE });
+    },
+    [clearTimer, patchTabNow, retireAfterDrain],
+  );
+
+  /**
+   * A `terminals` list is authoritative for this user's terminals. End every
+   * tab whose terminal it leaves out, but only tabs whose terminal was known
+   * before the list was requested. With several lists outstanding it is not
+   * known which request this answers, so the oldest request bounds it.
+   */
+  const reconcileListedTerminals = useCallback(
+    (listed: ReadonlySet<string>) => {
+      const outstanding = listRequestsRef.current;
+      if (outstanding.length === 0) return;
+      const requestedAt = Math.min(...outstanding);
+      outstanding.splice(outstanding.indexOf(Math.max(...outstanding)), 1);
+      for (const tab of tabsRef.current) {
+        const terminalId = tab.terminalId;
+        if (!terminalId || listed.has(terminalId)) continue;
+        if (tab.phase === "exited" || tab.phase === "rejected") continue;
+        const knownSince = knownSinceRef.current.get(terminalId);
+        if (knownSince === undefined || knownSince >= requestedAt) continue;
+        markTerminalGone(tab.localId, terminalId);
+      }
+    },
+    [markTerminalGone],
+  );
+
   const onMessage = useCallback(
     (message: TerminalServerMessage) => {
       if (message.type === "terminals") {
+        reconcileListedTerminals(new Set(message.terminals.map((remote) => remote.terminalId)));
         cliListRef.current = new Map(message.clis.map((cli) => [cli.cliDeviceId, cli]));
         setClis(message.clis);
         for (const cli of message.clis) {
@@ -814,6 +901,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
             viewerCount: remote.viewerCount,
           });
           if (heldElsewhere) tab.error = "detached";
+          noteTerminalKnown(remote.terminalId);
           viewRef.current.set(tab.localId, { multiViewer, writer: tab.writer });
           additions.push(tab);
           if (!heldElsewhere) toAttach.push(tab);
@@ -851,6 +939,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         pending.viewerId = message.viewerId;
         pendingRef.current.delete(localId);
         pendingRef.current.set(message.terminalId, pending);
+        noteTerminalKnown(message.terminalId);
         // Into the ref too: a close before the next commit must name this terminal.
         patchTabNow(localId, {
           terminalId: message.terminalId,
@@ -1061,7 +1150,9 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       ensureTrust,
       establish,
       listReady,
+      noteTerminalKnown,
       patchTabNow,
+      reconcileListedTerminals,
       refuseSubstitutedKey,
       retireAfterDrain,
       setView,
@@ -1087,6 +1178,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     establishingRef.current.clear();
     inflightOpensRef.current = [];
     closedOpensRef.current.clear();
+    // Lists asked on the closed socket are never answered.
+    listRequestsRef.current = [];
     earlySealedRef.current.clear();
     sendChainRef.current.clear();
     recvChainRef.current.clear();
@@ -1122,10 +1215,13 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     attachingRef.current.clear();
     inflightOpensRef.current = [];
     closedOpensRef.current.clear();
+    // The socket sends its `list` right after this returns.
+    listRequestsRef.current = [];
+    noteListRequest();
     for (const tab of tabsRef.current) {
       if (tab.opener && !tab.terminalId && tab.phase === "opening") retryTab(tab);
     }
-  }, [retryTab]);
+  }, [noteListRequest, retryTab]);
 
   const applyPlaintext = useCallback(
     (session: LiveSession, decoded: TerminalPlaintextV2) => {
@@ -1355,6 +1451,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         pendingRef.current.delete(tab.terminalId);
         attachingRef.current.delete(tab.terminalId);
         earlySealedRef.current.delete(tab.terminalId);
+        knownSinceRef.current.delete(tab.terminalId);
       }
       buffersRef.current.delete(localId);
       listenersRef.current.delete(localId);
@@ -1474,24 +1571,29 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   );
 
   const trustNewKey = useCallback(
-    async (cliDeviceId: string) => {
+    async (cliDeviceId: string, expected: ChangedCliTrust): Promise<boolean> => {
       const cli = cliListRef.current.get(cliDeviceId);
-      const shown = cliTrustRef.current.get(cliDeviceId);
-      if (!cli || shown?.status !== "changed") return;
-      const promise = trustNewCliKey(cli, shown, pinStoreRef.current).catch(
+      if (!cli) return false;
+      // Pin only the identity the user inspected. `trustNewCliKey` checks the
+      // relay still lists exactly that key; otherwise it pins nothing and
+      // returns a fresh evaluation, which is shown instead.
+      const promise = trustNewCliKey(cli, expected, pinStoreRef.current).catch(
         (): CliTrust => ({ status: "invalid" }),
       );
       trustRef.current.set(cliDeviceId, { key: cliTrustInputKey(cli), promise });
       const trust = await promise;
-      if (trustRef.current.get(cliDeviceId)?.promise !== promise) return;
+      const applied = trustAppliedSnapshot(expected, trust);
+      // A newer list re-evaluates this CLI; that result is the one to show.
+      if (trustRef.current.get(cliDeviceId)?.promise !== promise) return applied;
       publishTrust(cliDeviceId, trust);
-      if (!trustAllowsHandshake(trust).ok) return;
+      if (!applied || !trustAllowsHandshake(trust).ok) return applied;
       // Retry the tabs this CLI's identity blocked before they sent anything.
       for (const tab of tabsRef.current) {
         if (tab.cliDeviceId !== cliDeviceId || tab.phase !== "rejected") continue;
         if (!IDENTITY_RETRY_REASONS.has(tab.rejectionReason ?? "")) continue;
         retryTab(tab);
       }
+      return applied;
     },
     [publishTrust, retryTab],
   );

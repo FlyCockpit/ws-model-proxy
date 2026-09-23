@@ -14,15 +14,19 @@ import { ShieldAlert, ShieldCheck, ShieldQuestion } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import type { CliTrust } from "@/lib/terminal-cli-identity";
+import type { ChangedCliTrust, CliTrust } from "@/lib/terminal-cli-identity";
 import type { ListedCli } from "@/lib/terminal-protocol";
 
 type Props = {
   clis: ListedCli[];
   trust: Record<string, CliTrust>;
   labelFor: (cliDeviceId: string) => string;
-  onTrustNewKey: (cliDeviceId: string) => Promise<void>;
+  /** Resolves false when the listed key no longer matches `expected`; nothing was pinned. */
+  onTrustNewKey: (cliDeviceId: string, expected: ChangedCliTrust) => Promise<boolean>;
 };
+
+/** The exact `changed` state the dialog shows, snapshotted when it opens. */
+type Confirmation = { cliDeviceId: string; trust: ChangedCliTrust };
 
 function Fingerprint({ label, value }: { label: string; value: string }) {
   return (
@@ -33,7 +37,13 @@ function Fingerprint({ label, value }: { label: string; value: string }) {
   );
 }
 
-function IdentityStatus({ trust, onTrust }: { trust: CliTrust | undefined; onTrust: () => void }) {
+function IdentityStatus({
+  trust,
+  onTrust,
+}: {
+  trust: CliTrust | undefined;
+  onTrust: (trust: ChangedCliTrust) => void;
+}) {
   const { t } = useTranslation(["dashboard"]);
   if (!trust) {
     return (
@@ -94,7 +104,7 @@ function IdentityStatus({ trust, onTrust }: { trust: CliTrust | undefined; onTru
             size="touch"
             variant="outline"
             className="mt-1 self-start"
-            onClick={onTrust}
+            onClick={() => onTrust(trust)}
           >
             {trust.fingerprint
               ? t("dashboard:terminals.identity.trustNew")
@@ -118,14 +128,14 @@ function StatusIcon({ trust }: { trust: CliTrust | undefined }) {
 /** Each live CLI's identity fingerprint, and the "Trust new key" flow. */
 export function TerminalCliIdentities({ clis, trust, labelFor, onTrustNewKey }: Props) {
   const { t } = useTranslation(["dashboard", "common"]);
-  const [confirmId, setConfirmId] = useState<string | null>(null);
+  const [confirm, setConfirm] = useState<Confirmation | null>(null);
   // Offline CLIs have no key to show, unless a pinned key needs attention.
   const shown = clis.filter(
     (cli) => cli.publicKey !== null || trust[cli.cliDeviceId]?.status === "changed",
   );
   if (shown.length === 0) return null;
-  const confirmTrust = confirmId ? trust[confirmId] : undefined;
-  const downgrade = confirmTrust?.status === "changed" && confirmTrust.fingerprint === null;
+  const confirmTrust = confirm?.trust;
+  const downgrade = confirmTrust !== undefined && confirmTrust.fingerprint === null;
 
   return (
     <section
@@ -146,7 +156,7 @@ export function TerminalCliIdentities({ clis, trust, labelFor, onTrustNewKey }: 
               <p className="truncate text-sm">{labelFor(cli.cliDeviceId)}</p>
               <IdentityStatus
                 trust={trust[cli.cliDeviceId]}
-                onTrust={() => setConfirmId(cli.cliDeviceId)}
+                onTrust={(changed) => setConfirm({ cliDeviceId: cli.cliDeviceId, trust: changed })}
               />
             </div>
           </li>
@@ -154,22 +164,40 @@ export function TerminalCliIdentities({ clis, trust, labelFor, onTrustNewKey }: 
       </ul>
 
       <AlertDialog
-        open={confirmId !== null}
+        open={confirm !== null}
         onOpenChange={(open) => {
-          if (!open) setConfirmId(null);
+          if (!open) setConfirm(null);
         }}
       >
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>
               {t("dashboard:terminals.identity.trustTitle", {
-                label: confirmId ? labelFor(confirmId) : "",
+                label: confirm ? labelFor(confirm.cliDeviceId) : "",
               })}
             </AlertDialogTitle>
             <AlertDialogDescription>
               {t("dashboard:terminals.identity.trustDescription")}
             </AlertDialogDescription>
           </AlertDialogHeader>
+          {confirmTrust ? (
+            <div className="flex min-w-0 flex-col gap-1">
+              <Fingerprint
+                label={t("dashboard:terminals.identity.pinned")}
+                value={confirmTrust.pinnedFingerprint}
+              />
+              {confirmTrust.fingerprint ? (
+                <Fingerprint
+                  label={t("dashboard:terminals.identity.new")}
+                  value={confirmTrust.fingerprint}
+                />
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  {t("dashboard:terminals.identity.downgraded")}
+                </p>
+              )}
+            </div>
+          ) : null}
           <AlertDialogFooter>
             <AlertDialogCancel className="min-h-11 w-full sm:w-auto">
               {t("common:actions.cancel")}
@@ -178,11 +206,14 @@ export function TerminalCliIdentities({ clis, trust, labelFor, onTrustNewKey }: 
               variant="destructive"
               className="min-h-11 w-full sm:w-auto"
               onClick={() => {
-                const target = confirmId;
-                setConfirmId(null);
+                const target = confirm;
+                setConfirm(null);
                 if (!target) return;
-                void onTrustNewKey(target).catch(() =>
-                  toast.error(t("dashboard:terminals.identity.trustFailed")),
+                void onTrustNewKey(target.cliDeviceId, target.trust).then(
+                  (applied) => {
+                    if (!applied) toast.error(t("dashboard:terminals.identity.keyChangedAgain"));
+                  },
+                  () => toast.error(t("dashboard:terminals.identity.trustFailed")),
                 );
               }}
             >

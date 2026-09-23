@@ -36,7 +36,11 @@ import {
   type TerminalClientMessage,
 } from "@/lib/terminal-protocol";
 
-import { type TerminalOutputEvent, useTerminalSessions } from "./use-terminal-sessions";
+import {
+  TERMINAL_GONE,
+  type TerminalOutputEvent,
+  useTerminalSessions,
+} from "./use-terminal-sessions";
 
 const socket = vi.hoisted(() => ({
   handlers: null as TerminalSocketHandlers | null,
@@ -469,7 +473,10 @@ describe("useTerminalSessions open closed before its acknowledgement", () => {
     currentCli = await fakeCli();
     const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
     message({ type: "terminals", clis: [await listedCli(currentCli, true)], terminals: [] });
+    // Acks match opens in send order, and key generation can finish in either
+    // order, so send the first open before starting the second.
     act(() => view.result.current.openCli(CLI_ID));
+    await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
     act(() => view.result.current.openCli(CLI_ID));
     await waitFor(() => expect(sentOfType("open")).toHaveLength(2));
     const [closed, kept] = view.result.current.tabs;
@@ -693,11 +700,70 @@ describe("useTerminalSessions CLI identity pinning", () => {
     });
     expect(pinStore.pins.get(CLI_ID)).toBe(previous.identityPublicKey);
 
-    await act(() => view.result.current.trustNewKey(CLI_ID));
+    if (trust?.status !== "changed") throw new Error("expected a changed identity");
+    let applied = false;
+    await act(async () => {
+      applied = await view.result.current.trustNewKey(CLI_ID, trust);
+    });
+    expect(applied).toBe(true);
     expect(pinStore.pins.get(CLI_ID)).toBe(currentCli.identityPublicKey);
     expect(view.result.current.cliTrust[CLI_ID]).toMatchObject({ status: "trusted" });
     await attachAsCli(VIEWER_ID);
     await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+  });
+
+  it("pins nothing when the key changes again while the dialog is open", async () => {
+    const previous = await fakeCli();
+    const pinStore = createMemoryCliPinStore({ [CLI_ID]: previous.identityPublicKey });
+    currentCli = await fakeCli();
+    const view = renderHook(() => useTerminalSessions({ pinStore }));
+    message({
+      type: "terminals",
+      clis: [await listedCli(currentCli, true)],
+      terminals: [listedTerminal(true)],
+    });
+    await waitFor(() =>
+      expect(view.result.current.cliTrust[CLI_ID]).toMatchObject({ status: "changed" }),
+    );
+    // The dialog opens on this state.
+    const shown = view.result.current.cliTrust[CLI_ID];
+    if (shown?.status !== "changed") throw new Error("expected a changed identity");
+
+    // Another signed identity arrives before the user confirms.
+    const swapped = await fakeCli();
+    currentCli = swapped;
+    message({
+      type: "terminals",
+      clis: [await listedCli(swapped, true)],
+      terminals: [listedTerminal(true)],
+    });
+    const swappedFingerprint = await cliIdentityFingerprint(
+      base64UrlToBytes(swapped.identityPublicKey),
+    );
+    await waitFor(() =>
+      expect(view.result.current.cliTrust[CLI_ID]).toMatchObject({
+        status: "changed",
+        fingerprint: swappedFingerprint,
+      }),
+    );
+
+    let applied = true;
+    await act(async () => {
+      applied = await view.result.current.trustNewKey(CLI_ID, shown);
+    });
+    expect(applied).toBe(false);
+    expect(pinStore.pins.get(CLI_ID)).toBe(previous.identityPublicKey);
+    expect(view.result.current.cliTrust[CLI_ID]).toMatchObject({
+      status: "changed",
+      fingerprint: swappedFingerprint,
+      identityPublicKey: swapped.identityPublicKey,
+    });
+    expect(view.result.current.tabs[0]).toMatchObject({
+      phase: "rejected",
+      rejectionReason: "identity_changed",
+    });
+    await sleep(20);
+    expect(sentOfType("attach")).toEqual([]);
   });
 
   it("refuses a 2.5 CLI whose signature does not cover its terminal key", async () => {
@@ -877,5 +943,68 @@ describe("useTerminalSessions reconnection", () => {
     act(() => handlers().onOpen?.());
     message({ type: "terminals", clis: [listed], terminals: [listedTerminal(true)] });
     await waitFor(() => expect(sentOfType("attach")).toHaveLength(1));
+  });
+});
+
+describe("useTerminalSessions terminals gone while disconnected", () => {
+  it("marks a tab exited when the next list no longer has its terminal", async () => {
+    const { view, localId } = await setup(true);
+    expect(sentOfType("attach")).toHaveLength(1);
+    act(() => handlers().onDisconnect?.());
+    expect(view.result.current.tabs[0]).toMatchObject({ phase: "opening" });
+
+    act(() => handlers().onOpen?.());
+    message({
+      type: "terminals",
+      clis: [await listedCli(requireCli(), true)],
+      terminals: [],
+    });
+    expect(view.result.current.tabs[0]).toMatchObject({
+      localId,
+      phase: "exited",
+      error: TERMINAL_GONE,
+    });
+    await sleep(20);
+    expect(sentOfType("attach")).toHaveLength(1);
+    // Input to the ended tab goes nowhere.
+    act(() => view.result.current.sendInput(localId, "ls\r"));
+    await sleep(20);
+    expect(socket.sendFrame).not.toHaveBeenCalled();
+  });
+
+  it("reattaches a terminal the next list still has", async () => {
+    const { view } = await setup(true);
+    act(() => handlers().onDisconnect?.());
+    act(() => handlers().onOpen?.());
+    message({
+      type: "terminals",
+      clis: [await listedCli(requireCli(), true)],
+      terminals: [listedTerminal(true)],
+    });
+    expect(view.result.current.tabs[0]).toMatchObject({ phase: "opening", error: null });
+    await attachAsCli(VIEWER_ID, 1);
+    await waitFor(() => expect(view.result.current.tabs[0]?.phase).toBe("live"));
+  });
+
+  it("does not end a terminal the relay named after the list was requested", async () => {
+    currentCli = await fakeCli();
+    const listed = await listedCli(currentCli, true);
+    const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
+    act(() => handlers().onOpen?.());
+    message({ type: "terminals", clis: [listed], terminals: [] });
+    act(() => view.result.current.openCli(CLI_ID));
+    await waitFor(() => expect(sentOfType("open")).toHaveLength(1));
+
+    // A new socket asks for the list, then the relay acknowledges the open.
+    act(() => handlers().onOpen?.());
+    await waitFor(() => expect(sentOfType("open")).toHaveLength(2));
+    message({ type: "opening", terminalId: TERMINAL_ID, viewerId: VIEWER_ID });
+    // That list was built before the relay registered the terminal.
+    message({ type: "terminals", clis: [listed], terminals: [] });
+    expect(view.result.current.tabs[0]).toMatchObject({
+      terminalId: TERMINAL_ID,
+      phase: "opening",
+      error: null,
+    });
   });
 });

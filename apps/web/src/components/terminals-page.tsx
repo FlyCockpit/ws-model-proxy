@@ -27,7 +27,11 @@ import { InlineRetry } from "@/components/inline-retry";
 import { TerminalCliIdentities } from "@/components/terminal-cli-identities";
 import { TerminalPane } from "@/components/terminal-pane";
 import { WideContent } from "@/components/wide-content";
-import { type TerminalTab, useTerminalSessions } from "@/hooks/use-terminal-sessions";
+import {
+  TERMINAL_GONE,
+  type TerminalTab,
+  useTerminalSessions,
+} from "@/hooks/use-terminal-sessions";
 import {
   featureReasonKey,
   readCliDeviceFeatures,
@@ -285,7 +289,11 @@ export function TerminalsPage() {
             </p>
           ) : null}
           {active?.phase === "exited" ? (
-            <p className="mb-2 text-sm text-muted-foreground">{t("dashboard:terminals.exited")}</p>
+            <p className="mb-2 text-sm text-muted-foreground">
+              {active.error === TERMINAL_GONE
+                ? t("dashboard:terminals.gone")
+                : t("dashboard:terminals.exited")}
+            </p>
           ) : null}
           {active?.error === "detached" ? (
             <div className="mb-2 flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center">
@@ -306,7 +314,7 @@ export function TerminalsPage() {
             <p className="mb-2 text-sm text-muted-foreground">
               {t("dashboard:terminals.slowReconnecting")}
             </p>
-          ) : active?.error ? (
+          ) : active?.error && active.error !== TERMINAL_GONE ? (
             <p className="mb-2 text-sm text-destructive">
               {active.error === "input_dropped"
                 ? t("dashboard:terminals.inputDropped")

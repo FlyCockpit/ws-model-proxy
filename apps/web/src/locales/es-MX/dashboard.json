@@ -239,6 +239,7 @@
     "cliList": "Elige un CLI",
     "reconnecting": "Reconectando con el servicio de terminal…",
     "exited": "El shell terminó.",
+    "gone": "Esta terminal terminó mientras estabas desconectado.",
     "rejected": "El CLI rechazó esta terminal ({{reason}}).",
     "error": "La conexión de la terminal encontró un error.",
     "inputDropped": "Parte de la entrada no se entregó porque llegó demasiado rápido. Revisa el último comando antes de continuar.",
@@ -307,6 +308,7 @@
       "trustTitle": "¿Confiar en la nueva clave de {{label}}?",
       "trustDescription": "Continúa solo si ejecutaste `wsmp terminal fingerprint` en esa máquina y coincide. De lo contrario, alguien podría estar interceptando tu terminal.",
       "trustFailed": "No se pudo confiar en la clave. Recarga e inténtalo de nuevo.",
+      "keyChangedAgain": "La clave volvió a cambiar antes de poder confiar en ella. No se fijó nada. Compara la nueva huella e inténtalo de nuevo.",
       "activeUnverified": "La identidad de esta CLI no está verificada. Actualiza la CLI para verificarla."
     }
   },

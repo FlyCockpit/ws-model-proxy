@@ -91,6 +91,21 @@ describe("CLI identity trust", () => {
     expect(store.pins.get("cli-1")).toBe(second.identityPublicKey);
   });
 
+  it("pins nothing when the pin itself changed after the key was shown", async () => {
+    const first = await signedCli();
+    const store = createMemoryCliPinStore();
+    await evaluateCliTrust(first, store);
+    const second = await signedCli();
+    const shown = await evaluateCliTrust(second, store);
+    if (shown.status !== "changed") throw new Error("expected a changed identity");
+    // Another tab of this browser pinned a different key meanwhile.
+    const other = await signedCli();
+    if (!other.identityPublicKey) throw new Error("expected an identity");
+    store.pins.set("cli-1", other.identityPublicKey);
+    expect((await trustNewCliKey(second, shown, store)).status).toBe("changed");
+    expect(store.pins.get("cli-1")).toBe(other.identityPublicKey);
+  });
+
   it("treats a pinned CLI that falls back to 2.4 as changed until allowed", async () => {
     const cli = await signedCli();
     const store = createMemoryCliPinStore();
