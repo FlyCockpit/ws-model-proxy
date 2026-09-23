@@ -7,7 +7,9 @@ import {
   parseRelayClientControlFrame,
   parseRelaySubprotocolHeader,
   RELAY_BINARY_CHUNK_MAX_BYTES,
+  RELAY_PROTOCOL_VERSIONS,
   RELAY_SUBPROTOCOL,
+  relayProtocolAtLeast,
 } from "./protocol.js";
 
 const RELAY_JSON_CONTROL_MAX_BYTES = 64 * 1024;
@@ -222,7 +224,10 @@ function bytes16(): string {
   return Buffer.alloc(16, 7).toString("base64url");
 }
 
-function hello(protocolVersion: "2.0" | "2.1" | "2.2" | "2.3" | "2.4", capabilities: unknown) {
+function hello(
+  protocolVersion: "2.0" | "2.1" | "2.2" | "2.3" | "2.4" | "2.5",
+  capabilities: unknown,
+) {
   return JSON.stringify({
     type: "hello",
     id: "hello-id",
@@ -424,6 +429,180 @@ describe("relay protocol 2.4", () => {
     new DataView(extra.buffer).setUint32(0, metadataBytes.byteLength, false);
     extra.set(metadataBytes, 4);
     expect(() => parseRelayBinaryFrame(extra.buffer)).toThrow();
+  });
+});
+
+describe("relay protocol 2.5", () => {
+  const capabilities24 = {
+    inventoryAck: true,
+    inventoryReplace: true,
+    endpointTargeting: true,
+    binaryFrames: true,
+    cancellation: true,
+    maxBinaryChunkBytes: 1024 * 1024,
+    requestBodyStreaming: true,
+    requestBodyWindowChunks: 16,
+    sharedTokenizerTps: true,
+    standardizedMetrics: true,
+    terminal: true,
+    exec: true,
+    features: {
+      humanTerminal: true,
+      mcpCommands: true,
+      terminalApproval: false,
+      terminalSupported: true,
+    },
+    terminalPublicKey: uncompressedKey(),
+  };
+
+  function viewer(fill = 8): string {
+    return Buffer.alloc(16, fill).toString("base64url");
+  }
+
+  function sealedFrame(metadata: Record<string, unknown>): ArrayBuffer {
+    const metadataBytes = new TextEncoder().encode(JSON.stringify(metadata));
+    const frame = new Uint8Array(4 + metadataBytes.byteLength);
+    new DataView(frame.buffer).setUint32(0, metadataBytes.byteLength, false);
+    frame.set(metadataBytes, 4);
+    return frame.buffer;
+  }
+
+  it("accepts a 2.5 hello only with terminalViewers and keeps 2.4 strict", () => {
+    expect(RELAY_PROTOCOL_VERSIONS).toContain("2.5");
+    expect(
+      parseRelayClientControlFrame(
+        hello("2.5", { protocolVersion: "2.5", ...capabilities24, terminalViewers: true }),
+      ),
+    ).toMatchObject({
+      type: "hello",
+      protocolVersion: "2.5",
+      cli: { capabilities: { terminalViewers: true } },
+    });
+    expect(() =>
+      parseRelayClientControlFrame(hello("2.5", { protocolVersion: "2.5", ...capabilities24 })),
+    ).toThrow();
+    expect(() =>
+      parseRelayClientControlFrame(
+        hello("2.5", { protocolVersion: "2.5", ...capabilities24, terminalViewers: false }),
+      ),
+    ).toThrow();
+    expect(() =>
+      parseRelayClientControlFrame(
+        hello("2.5", {
+          protocolVersion: "2.5",
+          ...capabilities24,
+          terminalViewers: true,
+          extra: true,
+        }),
+      ),
+    ).toThrow();
+    expect(() =>
+      parseRelayClientControlFrame(
+        hello("2.4", { protocolVersion: "2.4", ...capabilities24, terminalViewers: true }),
+      ),
+    ).toThrow();
+    expect(() =>
+      parseRelayClientControlFrame(
+        hello("2.4", { protocolVersion: "2.5", ...capabilities24, terminalViewers: true }),
+      ),
+    ).toThrow();
+  });
+
+  it("compares versions numerically", () => {
+    expect(relayProtocolAtLeast("2.5", "2.4")).toBe(true);
+    expect(relayProtocolAtLeast("2.10", "2.5")).toBe(true);
+    expect(relayProtocolAtLeast("2.3", "2.4")).toBe(false);
+    expect(relayProtocolAtLeast(null, "2.4")).toBe(false);
+  });
+
+  it("parses viewer ids on term.* frames and the new term.writer", () => {
+    for (const type of ["term.opened", "term.attached", "term.pending"]) {
+      expect(
+        parseRelayClientControlFrame(
+          JSON.stringify({ type, terminalId: bytes16(), viewerId: viewer(), cliNonce: bytes16() }),
+        ),
+      ).toMatchObject({ type, viewerId: viewer() });
+    }
+    expect(
+      parseRelayClientControlFrame(
+        JSON.stringify({
+          type: "term.rejected",
+          terminalId: bytes16(),
+          viewerId: viewer(),
+          reason: "viewer_limit",
+        }),
+      ),
+    ).toMatchObject({ type: "term.rejected", viewerId: viewer(), reason: "viewer_limit" });
+    expect(
+      parseRelayClientControlFrame(
+        JSON.stringify({ type: "term.writer", terminalId: bytes16(), viewerId: viewer() }),
+      ),
+    ).toEqual({ type: "term.writer", terminalId: bytes16(), viewerId: viewer() });
+    expect(
+      parseRelayClientControlFrame(JSON.stringify({ type: "term.writer", terminalId: bytes16() })),
+    ).toEqual({ type: "term.writer", terminalId: bytes16() });
+    expect(() =>
+      parseRelayClientControlFrame(
+        JSON.stringify({ type: "term.writer", terminalId: bytes16(), viewerId: "short" }),
+      ),
+    ).toThrow();
+    expect(() =>
+      parseRelayClientControlFrame(
+        JSON.stringify({ type: "term.writer", terminalId: bytes16(), viewerId: null }),
+      ),
+    ).toThrow();
+    expect(() =>
+      parseRelayClientControlFrame(
+        JSON.stringify({
+          type: "term.writer",
+          terminalId: bytes16(),
+          cols: 80,
+        }),
+      ),
+    ).toThrow();
+  });
+
+  it("parses unicast and broadcast sealed metadata and refuses both at once", () => {
+    const body = new Uint8Array([1]);
+    expect(
+      parseRelayBinaryFrame(
+        encodeRelayBinaryFrame(
+          { type: "term.sealed", terminalId: bytes16(), seq: 1, viewerId: viewer() },
+          body,
+        ),
+      ).metadata,
+    ).toEqual({ type: "term.sealed", terminalId: bytes16(), seq: 1, viewerId: viewer() });
+    expect(
+      parseRelayBinaryFrame(
+        encodeRelayBinaryFrame(
+          { type: "term.sealed", terminalId: bytes16(), seq: 1, epoch: 0xffff_ffff },
+          body,
+        ),
+      ).metadata,
+    ).toEqual({ type: "term.sealed", terminalId: bytes16(), seq: 1, epoch: 0xffff_ffff });
+    expect(() =>
+      parseRelayBinaryFrame(
+        sealedFrame({
+          type: "term.sealed",
+          terminalId: bytes16(),
+          seq: 1,
+          viewerId: viewer(),
+          epoch: 1,
+        }),
+      ),
+    ).toThrow();
+    for (const epoch of [0, -1, 1.5, 0x1_0000_0000]) {
+      expect(() =>
+        parseRelayBinaryFrame(
+          sealedFrame({ type: "term.sealed", terminalId: bytes16(), seq: 1, epoch }),
+        ),
+      ).toThrow();
+    }
+    expect(() =>
+      parseRelayBinaryFrame(
+        sealedFrame({ type: "term.sealed", terminalId: bytes16(), seq: 1, viewerId: "nope" }),
+      ),
+    ).toThrow();
   });
 });
 

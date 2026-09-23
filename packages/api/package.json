@@ -68,6 +68,9 @@
     "./lib/provider-protocol": {
       "default": "./src/lib/provider-protocol.ts"
     },
+    "./lib/relay-protocol-version": {
+      "default": "./src/lib/relay-protocol-version.ts"
+    },
     "./routers/index": {
       "default": "./src/routers/index.ts"
     }

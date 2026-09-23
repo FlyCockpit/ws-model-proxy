@@ -83,17 +83,21 @@ function uncompressedKey(): string {
   return bytes.toString("base64url");
 }
 
-function hello(slug: string, features: { mcpCommands: boolean }) {
+function hello(
+  slug: string,
+  features: { mcpCommands: boolean },
+  protocolVersion: "2.4" | "2.5" = "2.4",
+) {
   return JSON.stringify({
     type: "hello",
     id: `hello-${slug}`,
-    protocolVersion: "2.4",
+    protocolVersion,
     cli: {
       slug,
       label: slug,
       version: "9.9.9",
       capabilities: {
-        protocolVersion: "2.4",
+        protocolVersion,
         inventoryAck: true,
         inventoryReplace: true,
         endpointTargeting: true,
@@ -113,16 +117,21 @@ function hello(slug: string, features: { mcpCommands: boolean }) {
           terminalSupported: false,
         },
         terminalPublicKey: uncompressedKey(),
+        ...(protocolVersion === "2.5" ? { terminalViewers: true } : {}),
       },
     },
     endpoints: [],
   });
 }
 
-async function connect(slug = "desktop", features = { mcpCommands: true }) {
+async function connect(
+  slug = "desktop",
+  features = { mcpCommands: true },
+  protocolVersion: "2.4" | "2.5" = "2.4",
+) {
   const socket = new FakeSocket();
   relaySessionManager.acceptAuthenticatedSocket({ socket, identity, now });
-  await relaySessionManager.handleTextFrame(socket, hello(slug, features), now);
+  await relaySessionManager.handleTextFrame(socket, hello(slug, features, protocolVersion), now);
   return socket;
 }
 
@@ -184,6 +193,24 @@ describe("cli commands", () => {
     });
     expect(unknown).toEqual({ ok: false, error: "not_found" });
     expect(foreign).toEqual(unknown);
+  });
+
+  it("starts commands on a 2.5 CLI through the version check", async () => {
+    const socket = await connect("desktop", { mcpCommands: true }, "2.5");
+    socket.sends.length = 0;
+    const started = await startCliCommand({
+      userId: "user-id",
+      tokenId: "token",
+      expiresAt: null,
+      cliDeviceId: "desktop",
+      command: "pwd",
+    });
+    expect(started.ok).toBe(true);
+    expect(
+      socket.sends
+        .filter((send): send is string => typeof send === "string")
+        .map((send) => JSON.parse(send).type),
+    ).toEqual(["exec.start"]);
   });
 
   it("follows grant, session, feature, limit, and command checks before exec.start", async () => {

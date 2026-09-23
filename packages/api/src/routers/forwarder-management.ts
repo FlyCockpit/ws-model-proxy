@@ -76,6 +76,7 @@ import {
   providerModelSurfaceCapabilities,
 } from "../lib/pool-recommended-surface";
 import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
+import { relayProtocolAtLeast } from "../lib/relay-protocol-version";
 import { runSerializableTransaction } from "../lib/serializable-transaction";
 import {
   type ModelApiSurface,
@@ -582,14 +583,14 @@ function effectiveCapabilities(endpoint: EndpointRow, model: DiscoveredModelRow)
 
 function liveTerminalFeature(snapshot: LiveCliFeatureSnapshot | null): boolean {
   return (
-    snapshot?.protocolVersion === "2.4" &&
-    snapshot.humanTerminal === true &&
+    relayProtocolAtLeast(snapshot?.protocolVersion, "2.4") &&
+    snapshot?.humanTerminal === true &&
     snapshot.terminalSupported === true
   );
 }
 
 function liveCommandFeature(snapshot: LiveCliFeatureSnapshot | null): boolean {
-  return snapshot?.protocolVersion === "2.4" && snapshot.mcpCommands === true;
+  return relayProtocolAtLeast(snapshot?.protocolVersion, "2.4") && snapshot?.mcpCommands === true;
 }
 
 function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSnapshot | null) {

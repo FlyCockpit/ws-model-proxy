@@ -2,11 +2,14 @@ import {
   type OpenAiCompatibleCapabilities,
   openAiCompatibleCapabilitiesSchema,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import { relayProtocolAtLeast } from "@ws-model-proxy/api/lib/relay-protocol-version";
 import { z } from "zod";
 
-export const RELAY_PROTOCOL_VERSIONS = ["2.0", "2.1", "2.2", "2.3", "2.4"] as const;
+export { relayProtocolAtLeast };
+
+export const RELAY_PROTOCOL_VERSIONS = ["2.0", "2.1", "2.2", "2.3", "2.4", "2.5"] as const;
 export type RelayProtocolVersion = (typeof RELAY_PROTOCOL_VERSIONS)[number];
-export const RELAY_PROTOCOL_VERSION = "2.4" satisfies RelayProtocolVersion;
+export const RELAY_PROTOCOL_VERSION = "2.5" satisfies RelayProtocolVersion;
 export const RELAY_SUBPROTOCOL = "ws-model-proxy.relay.v2";
 
 const RELAY_JSON_CONTROL_MAX_BYTES = 64 * 1024;
@@ -75,6 +78,9 @@ export const uncompressedP256PublicKeySchema = z
     return bytes.length === 65 && bytes[0] === 0x04;
   }, "Expected a 65-byte uncompressed P-256 public key.");
 
+/** Server-minted per attachment (2.5). Same shape as a terminal id. */
+export const viewerIdSchema = base64Url16ByteSchema;
+
 const base64UrlTextSchema = z.string().regex(/^[A-Za-z0-9_-]{1,512}$/);
 const terminalIdentitySchema = z
   .object({
@@ -92,23 +98,36 @@ const v24FeatureSchema = z
   })
   .strict();
 
+const v24CliCapabilityFields = {
+  inventoryAck: z.literal(true),
+  inventoryReplace: z.literal(true),
+  endpointTargeting: z.literal(true),
+  binaryFrames: z.literal(true),
+  cancellation: z.literal(true),
+  maxBinaryChunkBytes: z.literal(RELAY_BINARY_CHUNK_MAX_BYTES),
+  requestBodyStreaming: z.literal(true),
+  requestBodyWindowChunks: z.literal(RELAY_REQUEST_BODY_WINDOW_CHUNKS),
+  sharedTokenizerTps: z.literal(true),
+  standardizedMetrics: z.literal(true),
+  terminal: z.literal(true),
+  exec: z.literal(true),
+  features: v24FeatureSchema,
+  terminalPublicKey: uncompressedP256PublicKeySchema,
+};
+
+/** 2.5 adds multi-viewer terminals: server-minted viewer ids and broadcast output. */
+const v25CliCapabilitiesSchema = z
+  .object({
+    protocolVersion: z.literal("2.5"),
+    ...v24CliCapabilityFields,
+    terminalViewers: z.literal(true),
+  })
+  .strict();
+
 const v24CliCapabilitiesSchema = z
   .object({
     protocolVersion: z.literal("2.4"),
-    inventoryAck: z.literal(true),
-    inventoryReplace: z.literal(true),
-    endpointTargeting: z.literal(true),
-    binaryFrames: z.literal(true),
-    cancellation: z.literal(true),
-    maxBinaryChunkBytes: z.literal(RELAY_BINARY_CHUNK_MAX_BYTES),
-    requestBodyStreaming: z.literal(true),
-    requestBodyWindowChunks: z.literal(RELAY_REQUEST_BODY_WINDOW_CHUNKS),
-    sharedTokenizerTps: z.literal(true),
-    standardizedMetrics: z.literal(true),
-    terminal: z.literal(true),
-    exec: z.literal(true),
-    features: v24FeatureSchema,
-    terminalPublicKey: uncompressedP256PublicKeySchema,
+    ...v24CliCapabilityFields,
   })
   .strict();
 
@@ -169,6 +188,7 @@ const legacyCliCapabilitiesSchema = z
   .strict();
 
 const acceptedCliCapabilitiesSchema = z.union([
+  v25CliCapabilitiesSchema,
   v24CliCapabilitiesSchema,
   v23CliCapabilitiesSchema,
   v22CliCapabilitiesSchema,
@@ -235,6 +255,7 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
       type: z.literal("hello"),
       id: requestIdSchema,
       protocolVersion: z.union([
+        z.literal("2.5"),
         z.literal("2.4"),
         z.literal("2.3"),
         z.literal("2.2"),
@@ -324,6 +345,7 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
     .object({
       type: z.literal("term.pending"),
       terminalId: base64Url16ByteSchema,
+      viewerId: viewerIdSchema.optional(),
       cliNonce: base64Url16ByteSchema,
       approvalCode: z
         .string()
@@ -335,6 +357,7 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
     .object({
       type: z.literal("term.opened"),
       terminalId: base64Url16ByteSchema,
+      viewerId: viewerIdSchema.optional(),
       cliNonce: base64Url16ByteSchema,
     })
     .strict(),
@@ -342,6 +365,7 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
     .object({
       type: z.literal("term.attached"),
       terminalId: base64Url16ByteSchema,
+      viewerId: viewerIdSchema.optional(),
       cliNonce: base64Url16ByteSchema,
     })
     .strict(),
@@ -349,11 +373,20 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
     .object({
       type: z.literal("term.rejected"),
       terminalId: base64Url16ByteSchema,
+      viewerId: viewerIdSchema.optional(),
       reason: z.string().min(1).max(64),
       approvalCode: z
         .string()
         .regex(/^[A-Z2-7]{8}$/)
         .optional(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("term.writer"),
+      terminalId: base64Url16ByteSchema,
+      /** Omitted when no viewer is the writer. */
+      viewerId: viewerIdSchema.optional(),
     })
     .strict(),
   z
@@ -446,6 +479,8 @@ export type RelayServerControlMessage =
   | {
       type: "term.open";
       terminalId: string;
+      /** 2.5 only. */
+      viewerId?: string;
       cols: number;
       rows: number;
       browserPublicKey: string;
@@ -455,13 +490,15 @@ export type RelayServerControlMessage =
   | {
       type: "term.attach";
       terminalId: string;
+      /** 2.5 only. */
+      viewerId?: string;
       browserPublicKey: string;
       browserNonce: string;
       identity?: TerminalHandshakeIdentity;
     }
-  | { type: "term.detach"; terminalId: string }
+  | { type: "term.detach"; terminalId: string; viewerId?: string }
   | { type: "term.close"; terminalId: string }
-  | { type: "term.auth"; terminalId: string; signature: string }
+  | { type: "term.auth"; terminalId: string; viewerId?: string; signature: string }
   | { type: "exec.start"; commandId: string; command: string; cwd?: string }
   | { type: "exec.cancel"; commandId: string };
 
@@ -471,6 +508,7 @@ const relayBodyMetadataFields = {
   final: z.boolean().optional(),
 };
 const sealedSeqSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const sealedEpochSchema = z.number().int().min(1).max(0xffff_ffff);
 
 const relayBinaryFrameMetadataSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("relay.request.body"), ...relayBodyMetadataFields }).strict(),
@@ -480,8 +518,18 @@ const relayBinaryFrameMetadataSchema = z.discriminatedUnion("type", [
       type: z.literal("term.sealed"),
       terminalId: base64Url16ByteSchema,
       seq: sealedSeqSchema,
+      /**
+       * 2.5 only. Server to CLI: the sending attachment, stamped by the server.
+       * CLI to server: a unicast frame for this viewer.
+       */
+      viewerId: viewerIdSchema.optional(),
+      /** 2.5 only. CLI to server and server to browser: a broadcast frame under this output-key epoch. */
+      epoch: sealedEpochSchema.optional(),
     })
-    .strict(),
+    .strict()
+    .refine((metadata) => metadata.viewerId === undefined || metadata.epoch === undefined, {
+      message: "A sealed frame is either unicast or broadcast.",
+    }),
   z
     .object({
       type: z.literal("exec.stdout"),
@@ -499,6 +547,7 @@ const relayBinaryFrameMetadataSchema = z.discriminatedUnion("type", [
 ]);
 
 export type RelayBinaryFrameMetadata = z.infer<typeof relayBinaryFrameMetadataSchema>;
+export type TerminalSealedMetadata = Extract<RelayBinaryFrameMetadata, { type: "term.sealed" }>;
 export type RelayResponseBodyMetadata = Extract<
   RelayBinaryFrameMetadata,
   { type: "relay.response.body" }

@@ -3,6 +3,7 @@ import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { parseMultipartToSpool } from "../model-api/multipart-form-data.js";
 import {
+  encodeRelayBinaryFrame,
   parseRelayBinaryFrame,
   parseRelayClientControlFrame,
   RELAY_REQUEST_BODY_WINDOW_CHUNKS,
@@ -1081,7 +1082,7 @@ describe("relay terminal and exec sessions", () => {
         rows: 24,
         browserPublicKey: uncompressedKey(),
         browserNonce: id16(4),
-        viewerId: "viewer",
+        connId: "viewer",
       }),
     ).toBe(false);
     const command = {
@@ -1120,7 +1121,7 @@ describe("relay terminal and exec sessions", () => {
         rows: 24,
         browserPublicKey: uncompressedKey(),
         browserNonce: id16(4),
-        viewerId: "viewer",
+        connId: "viewer",
       }),
     ).toBe(true);
     let cancelled = false;
@@ -1186,7 +1187,7 @@ describe("relay terminal and exec sessions", () => {
       rows: 24,
       browserPublicKey: uncompressedKey(),
       browserNonce: id16(4),
-      viewerId: "viewer-2",
+      connId: "viewer-2",
     });
     const replacement = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: replacement, identity, now });
@@ -1213,7 +1214,7 @@ describe("relay terminal and exec sessions", () => {
       rows: 12,
       browserPublicKey: uncompressedKey(),
       browserNonce: id16(4),
-      viewerId: "viewer-3",
+      connId: "viewer-3",
     });
     await manager.removeSession(survivor, now);
     expect(db.cliDevice.update).toHaveBeenCalledWith(
@@ -1242,7 +1243,7 @@ describe("relay terminal and exec sessions", () => {
       rows: 24,
       browserPublicKey: uncompressedKey(),
       browserNonce: id16(4),
-      viewerId: "viewer",
+      connId: "viewer",
     });
     await manager.handleTextFrame(
       socket,
@@ -1261,5 +1262,456 @@ describe("relay terminal and exec sessions", () => {
     expect(() => manager.handleBinaryFrame(socket, new ArrayBuffer(1))).not.toThrow();
     expect(socket.closes).toEqual([]);
     expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
+  });
+});
+
+function hello25(features?: { terminalApproval?: boolean; mcpCommands?: boolean }) {
+  const frame = JSON.parse(hello24(features)) as {
+    id: string;
+    protocolVersion: string;
+    cli: { capabilities: Record<string, unknown> };
+  };
+  frame.id = "hello-25";
+  frame.protocolVersion = "2.5";
+  frame.cli.capabilities.protocolVersion = "2.5";
+  frame.cli.capabilities.terminalViewers = true;
+  return JSON.stringify(frame);
+}
+
+describe("relay protocol 2.5 terminal viewers", () => {
+  type Event = import("./session-manager.js").TerminalLifecycleEvent;
+  let events: Event[] = [];
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    seedRegistrationMocks();
+    db.cliDevice.upsert.mockResolvedValue({
+      id: "cli-device-id",
+      userId: "user-id",
+      slug: "desktop",
+      allowHumanTerminal: true,
+      allowMcpCommands: true,
+    });
+    events = [];
+    const { registerTerminalBridge } = await import("./session-manager.js");
+    registerTerminalBridge({
+      onTerminalEvent(event) {
+        events.push(event);
+      },
+    });
+  });
+
+  function control(socket: FakeSocket) {
+    return socket.sends
+      .filter((send): send is string => typeof send === "string")
+      .map((send) => JSON.parse(send) as Record<string, unknown>);
+  }
+
+  function eventsFor(connId: string) {
+    return events.filter(
+      (event) =>
+        ("connId" in event && event.connId === connId) ||
+        ("connIds" in event && event.connIds.includes(connId)) ||
+        ("recipients" in event && event.recipients.some((entry) => entry.connId === connId)),
+    );
+  }
+
+  async function setup(frame = hello25()) {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity, now });
+    await manager.handleTextFrame(socket, frame, now);
+    return { manager, socket };
+  }
+
+  /** Opens a terminal from conn "a" and completes term.opened. Returns the opener's viewer id. */
+  async function openTerminal(
+    manager: InstanceType<typeof RelaySessionManager>,
+    socket: FakeSocket,
+    terminalId = id16(20),
+  ) {
+    expect(
+      manager.startTerminal({
+        terminalId,
+        userId: "user-id",
+        cliDeviceId: "cli-device-id",
+        label: "Desktop",
+        cols: 80,
+        rows: 24,
+        browserPublicKey: uncompressedKey(),
+        browserNonce: id16(4),
+        connId: "a",
+      }),
+    ).toBe(true);
+    const open = control(socket).find((message) => message.type === "term.open");
+    const viewerId = open?.viewerId as string;
+    expect(viewerId).toMatch(/^[A-Za-z0-9_-]{22}$/);
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "term.opened", terminalId, viewerId, cliNonce: id16(5) }),
+      now,
+    );
+    return viewerId;
+  }
+
+  function attach(
+    manager: InstanceType<typeof RelaySessionManager>,
+    connId: string,
+    terminalId = id16(20),
+  ) {
+    return manager.attachTerminal({
+      terminalId,
+      userId: "user-id",
+      connId,
+      browserPublicKey: uncompressedKey(),
+      browserNonce: id16(4),
+    });
+  }
+
+  it("keeps MCP commands and terminal keys for a 2.5 CLI and persists the version", async () => {
+    const { manager } = await setup();
+    expect(db.cliDevice.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        update: expect.objectContaining({
+          relayProtocolVersion: "2.5",
+          reportedMcpCommands: true,
+          reportedHumanTerminal: true,
+        }),
+      }),
+    );
+    expect(manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")).toMatchObject({
+      protocolVersion: "2.5",
+      mcpCommands: true,
+      terminalPublicKey: uncompressedKey(),
+    });
+    const command = {
+      commandId: id16(5),
+      cliDeviceId: "cli-device-id",
+      status: "running" as const,
+      markCancelled() {},
+      markStarted() {},
+      markRejected() {},
+      markDone() {},
+      appendOutput() {},
+    };
+    expect(manager.dispatchExecStart(command, { command: "pwd" })).toBe(true);
+  });
+
+  it("lets two 2.5 viewers coexist without a detached event", async () => {
+    const { manager, socket } = await setup();
+    const terminalId = id16(20);
+    const opener = await openTerminal(manager, socket, terminalId);
+    expect(eventsFor("a")).toEqual([
+      expect.objectContaining({ type: "opened", connId: "a", viewerId: opener }),
+      expect.objectContaining({
+        type: "viewers",
+        count: 1,
+        recipients: [{ connId: "a", writer: "you" }],
+      }),
+    ]);
+
+    const attached = attach(manager, "b", terminalId);
+    expect(attached.ok).toBe(true);
+    const second = attached.ok ? attached.viewerId : "";
+    expect(second).not.toBe(opener);
+    expect(control(socket).at(-1)).toMatchObject({
+      type: "term.attach",
+      terminalId,
+      viewerId: second,
+    });
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "term.attached", terminalId, viewerId: second, cliNonce: id16(6) }),
+      now,
+    );
+    expect(events.some((event) => event.type === "detached")).toBe(false);
+    expect(events.at(-2)).toMatchObject({ type: "attached", connId: "b", viewerId: second });
+    expect(events.at(-1)).toMatchObject({
+      type: "viewers",
+      count: 2,
+      recipients: [
+        { connId: "a", writer: "you" },
+        { connId: "b", writer: "other" },
+      ],
+    });
+    expect(manager.listTerminalsForUser("user-id", "b")).toEqual([
+      expect.objectContaining({
+        viewerAttached: true,
+        viewerCount: 2,
+        attachedHere: true,
+        writerHere: false,
+      }),
+    ]);
+    expect(manager.listTerminalsForUser("user-id", "a")[0]).toMatchObject({ writerHere: true });
+    expect(manager.listTerminalsForUser("user-id", "z")[0]).toMatchObject({
+      attachedHere: false,
+      writerHere: false,
+    });
+  });
+
+  it("routes unicast to one viewer, broadcast to all, and drops unknown viewers", async () => {
+    const { manager, socket } = await setup();
+    const terminalId = id16(20);
+    const opener = await openTerminal(manager, socket, terminalId);
+    const attached = attach(manager, "b", terminalId);
+    const second = attached.ok ? attached.viewerId : "";
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "term.attached", terminalId, viewerId: second, cliNonce: id16(6) }),
+      now,
+    );
+    events = [];
+    const body = new Uint8Array([1, 2, 3]);
+    manager.handleBinaryFrame(
+      socket,
+      encodeRelayBinaryFrame({ type: "term.sealed", terminalId, seq: 1, viewerId: second }, body),
+    );
+    manager.handleBinaryFrame(
+      socket,
+      encodeRelayBinaryFrame({ type: "term.sealed", terminalId, seq: 1, epoch: 3 }, body),
+    );
+    manager.handleBinaryFrame(
+      socket,
+      encodeRelayBinaryFrame({ type: "term.sealed", terminalId, seq: 2, viewerId: id16(30) }, body),
+    );
+    manager.handleBinaryFrame(
+      socket,
+      encodeRelayBinaryFrame({ type: "term.sealed", terminalId, seq: 3 }, body),
+    );
+    expect(events).toEqual([
+      expect.objectContaining({ type: "sealed", connIds: ["b"], seq: 1 }),
+      expect.objectContaining({ type: "sealed", connIds: ["a", "b"], seq: 1, epoch: 3 }),
+    ]);
+    expect(events[0]).not.toHaveProperty("epoch");
+    expect(manager.listTerminalsForUser("user-id")).toHaveLength(1);
+    expect(opener).not.toBe(second);
+  });
+
+  it("stamps the sending viewer's id on browser input and refuses a pending tab", async () => {
+    const { manager, socket } = await setup(hello25({ terminalApproval: true }));
+    const terminalId = id16(20);
+    const opener = await openTerminal(manager, socket, terminalId);
+    const body = new Uint8Array([7]);
+    expect(manager.forwardBrowserSealed(terminalId, "user-id", "a", 1, body)).toBe("sent");
+    const frame = socket.sends.at(-1);
+    expect(frame).toBeInstanceOf(ArrayBuffer);
+    expect(parseRelayBinaryFrame(frame as ArrayBuffer).metadata).toEqual({
+      type: "term.sealed",
+      terminalId,
+      seq: 1,
+      viewerId: opener,
+    });
+    expect(attach(manager, "b", terminalId).ok).toBe(true);
+    expect(manager.forwardBrowserSealed(terminalId, "user-id", "b", 1, body)).toBe("missing");
+    expect(manager.forwardBrowserSealed(terminalId, "other-user", "a", 2, body)).toBe("missing");
+  });
+
+  it("approves pending viewers independently and tells only the requester", async () => {
+    const { manager, socket } = await setup(hello25({ terminalApproval: true }));
+    const terminalId = id16(20);
+    await openTerminal(manager, socket, terminalId);
+    const b = attach(manager, "b", terminalId);
+    const c = attach(manager, "c", terminalId);
+    const bId = b.ok ? b.viewerId : "";
+    const cId = c.ok ? c.viewerId : "";
+    for (const viewerId of [bId, cId]) {
+      await manager.handleTextFrame(
+        socket,
+        JSON.stringify({ type: "term.pending", terminalId, viewerId, cliNonce: id16(6) }),
+        now,
+      );
+    }
+    expect(eventsFor("b").filter((event) => event.type === "pending")).toHaveLength(1);
+    expect(eventsFor("c").filter((event) => event.type === "pending")).toHaveLength(1);
+
+    expect(manager.forwardTerminalAuth(terminalId, "user-id", "c", "c2lnbmF0dXJl")).toBe("sent");
+    expect(control(socket).at(-1)).toEqual({
+      type: "term.auth",
+      terminalId,
+      viewerId: cId,
+      signature: "c2lnbmF0dXJl",
+    });
+    expect(manager.forwardTerminalAuth(terminalId, "user-id", "z", "c2lnbmF0dXJl")).toBe(
+      "not_found",
+    );
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "term.attached", terminalId, viewerId: cId, cliNonce: id16(7) }),
+      now,
+    );
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "term.rejected", terminalId, viewerId: bId, reason: "denied" }),
+      now,
+    );
+    expect(eventsFor("c").some((event) => event.type === "attached")).toBe(true);
+    expect(eventsFor("b").filter((event) => event.type === "rejected")).toEqual([
+      expect.objectContaining({ connId: "b", reason: "denied" }),
+    ]);
+    expect(eventsFor("a").some((event) => event.type === "rejected")).toBe(false);
+    expect(manager.listTerminalsForUser("user-id")[0]).toMatchObject({ viewerCount: 2 });
+  });
+
+  it("detaches one viewer, reports writer changes, and clears the writer when it leaves", async () => {
+    const { manager, socket } = await setup();
+    const terminalId = id16(20);
+    const opener = await openTerminal(manager, socket, terminalId);
+    const b = attach(manager, "b", terminalId);
+    const bId = b.ok ? b.viewerId : "";
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "term.attached", terminalId, viewerId: bId, cliNonce: id16(6) }),
+      now,
+    );
+    events = [];
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "term.writer", terminalId, viewerId: bId }),
+      now,
+    );
+    expect(events).toEqual([
+      {
+        type: "viewers",
+        terminalId,
+        count: 2,
+        recipients: [
+          { connId: "a", writer: "other" },
+          { connId: "b", writer: "you" },
+        ],
+      },
+    ]);
+    // The same writer again is not news.
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "term.writer", terminalId, viewerId: bId }),
+      now,
+    );
+    expect(events).toHaveLength(1);
+
+    expect(manager.detachTerminalViewer(terminalId, "user-id", "b")).toBe(true);
+    expect(control(socket).at(-1)).toEqual({ type: "term.detach", terminalId, viewerId: bId });
+    expect(events.at(-1)).toEqual({
+      type: "viewers",
+      terminalId,
+      count: 1,
+      recipients: [{ connId: "a", writer: "none" }],
+    });
+    expect(manager.detachTerminalViewer(terminalId, "user-id", "b")).toBe(false);
+    expect(control(socket).some((message) => message.type === "term.close")).toBe(false);
+
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "term.writer", terminalId, viewerId: opener }),
+      now,
+    );
+    expect(events.at(-1)).toMatchObject({ recipients: [{ connId: "a", writer: "you" }] });
+    await manager.handleTextFrame(socket, JSON.stringify({ type: "term.writer", terminalId }), now);
+    expect(events.at(-1)).toMatchObject({ recipients: [{ connId: "a", writer: "none" }] });
+  });
+
+  it("caps viewers plus pending approvals at eight per terminal", async () => {
+    const { manager, socket } = await setup(hello25({ terminalApproval: true }));
+    const terminalId = id16(20);
+    await openTerminal(manager, socket, terminalId);
+    for (let index = 1; index < 8; index += 1) {
+      expect(attach(manager, `tab-${index}`, terminalId).ok).toBe(true);
+    }
+    expect(attach(manager, "tab-8", terminalId)).toEqual({ ok: false, error: "limit" });
+    // A tab that attaches again replaces its own slot instead of taking another.
+    expect(attach(manager, "tab-1", terminalId).ok).toBe(true);
+    expect(manager.detachTerminalViewer(terminalId, "user-id", "tab-2")).toBe(true);
+    expect(attach(manager, "tab-8", terminalId).ok).toBe(true);
+    // Attaching never counts toward the per-user and per-CLI terminal limits.
+    expect(manager.terminalCounts("user-id", "cli-device-id")).toEqual({ user: 1, cli: 1 });
+  });
+
+  it("expires pending viewers and cleans up every attachment when a tab goes away", async () => {
+    const { manager, socket } = await setup(hello25({ terminalApproval: true }));
+    const terminalId = id16(20);
+    await openTerminal(manager, socket, terminalId);
+    const b = attach(manager, "b", terminalId);
+    const bId = b.ok ? b.viewerId : "";
+    manager.sweepExpiredPendingTerminals(Date.now() + 2 * 60 * 1000 + 1);
+    expect(eventsFor("b").at(-1)).toMatchObject({ type: "rejected", reason: "expired" });
+    expect(control(socket).at(-1)).toEqual({ type: "term.detach", terminalId, viewerId: bId });
+    expect(manager.forwardTerminalAuth(terminalId, "user-id", "b", "c2ln")).toBe("not_found");
+
+    const c = attach(manager, "c", terminalId);
+    const cId = c.ok ? c.viewerId : "";
+    manager.releaseBrowserViewer("user-id", "c");
+    expect(control(socket).at(-1)).toEqual({ type: "term.detach", terminalId, viewerId: cId });
+    expect(manager.listTerminalsForUser("user-id", "c")[0]).toMatchObject({ attachedHere: false });
+    // A late CLI answer for a viewer that left is dropped.
+    events = [];
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "term.attached", terminalId, viewerId: cId, cliNonce: id16(6) }),
+      now,
+    );
+    expect(events).toEqual([]);
+  });
+
+  it("sends exit to every viewer and pending tab, and drops all viewers on CLI disconnect", async () => {
+    const { manager, socket } = await setup(hello25({ terminalApproval: true }));
+    const terminalId = id16(20);
+    await openTerminal(manager, socket, terminalId);
+    attach(manager, "b", terminalId);
+    await manager.handleTextFrame(socket, JSON.stringify({ type: "term.exit", terminalId }), now);
+    expect(events.at(-1)).toMatchObject({ type: "exit", connIds: ["a", "b"] });
+
+    const second = id16(21);
+    await openTerminal(manager, socket, second);
+    await manager.removeSession(socket, now);
+    expect(events.at(-1)).toMatchObject({ type: "exit", terminalId: second, connIds: ["a"] });
+    expect(manager.listTerminalsForUser("user-id")).toEqual([]);
+  });
+
+  it("keeps the 2.4 steal: a second attach replaces the viewer with a detached event", async () => {
+    const { manager, socket } = await setup(hello24());
+    const terminalId = id16(20);
+    manager.startTerminal({
+      terminalId,
+      userId: "user-id",
+      cliDeviceId: "cli-device-id",
+      label: "Desktop",
+      cols: 80,
+      rows: 24,
+      browserPublicKey: uncompressedKey(),
+      browserNonce: id16(4),
+      connId: "a",
+    });
+    expect(control(socket).at(-1)).not.toHaveProperty("viewerId");
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "term.opened", terminalId, cliNonce: id16(5) }),
+      now,
+    );
+    expect(attach(manager, "b", terminalId).ok).toBe(true);
+    expect(control(socket).at(-1)).toEqual({
+      type: "term.attach",
+      terminalId,
+      browserPublicKey: uncompressedKey(),
+      browserNonce: id16(4),
+    });
+    expect(events).toContainEqual({ type: "detached", terminalId, connId: "a" });
+    expect(events.some((event) => event.type === "viewers")).toBe(false);
+    events = [];
+    manager.handleBinaryFrame(
+      socket,
+      encodeRelayBinaryFrame({ type: "term.sealed", terminalId, seq: 1 }, new Uint8Array([1])),
+    );
+    expect(events).toEqual([expect.objectContaining({ type: "sealed", connIds: ["b"] })]);
+    expect(manager.forwardBrowserSealed(terminalId, "user-id", "b", 1, new Uint8Array([1]))).toBe(
+      "sent",
+    );
+    expect(parseRelayBinaryFrame(socket.sends.at(-1) as ArrayBuffer).metadata).toEqual({
+      type: "term.sealed",
+      terminalId,
+      seq: 1,
+    });
+    expect(manager.forwardBrowserSealed(terminalId, "user-id", "a", 2, new Uint8Array([1]))).toBe(
+      "missing",
+    );
   });
 });

@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import type { LiveCliFeatureSnapshot } from "@ws-model-proxy/api/context";
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
 import { suggestedConnectionSurface } from "@ws-model-proxy/api/lib/model-connection-type";
@@ -30,7 +31,9 @@ import {
   type RelayProtocolVersion,
   type RelayResponseBodyMetadata,
   type RelayServerControlMessage,
+  relayProtocolAtLeast,
   type TerminalHandshakeIdentity,
+  type TerminalSealedMetadata,
 } from "./protocol.js";
 import {
   persistRelayRegistration,
@@ -88,6 +91,10 @@ export type TrackedCliCommand = {
   appendOutput(stream: "stdout" | "stderr", body: Uint8Array): void;
 };
 
+/** One browser tab's attachment to a terminal. `connId` is the browser socket. */
+type TerminalViewer = { connId: string; attachedAt: number };
+type TerminalPendingViewer = { connId: string; requestedAt: number };
+
 export type TerminalRecord = {
   terminalId: string;
   userId: string;
@@ -95,18 +102,34 @@ export type TerminalRecord = {
   label: string;
   cols: number;
   rows: number;
-  viewerId: string | null;
-  /** Set while a replacement viewer is waiting for approval. The current viewer stays. */
-  pendingViewerId: string | null;
+  /**
+   * True when the CLI negotiated 2.5: viewer ids go on the wire and output is
+   * broadcast to every viewer. False keeps the 2.4 single-viewer model, where
+   * `viewers` and `pendingViewers` each hold at most one entry.
+   */
+  multiViewer: boolean;
+  /** Attached viewers by server-minted viewer id. */
+  viewers: Map<string, TerminalViewer>;
+  /**
+   * Viewers waiting for the CLI (approval, or term.opened / term.attached).
+   * In 2.4 this is the replacement viewer; the current viewer stays until the CLI accepts.
+   */
+  pendingViewers: Map<string, TerminalPendingViewer>;
+  /** 2.5 only. Reported by the CLI with term.writer. */
+  writerViewerId: string | null;
   phase: "pending" | "opening" | "open";
   createdAt: number;
 };
 
+export type TerminalWriterLabel = "you" | "other" | "none";
+
+/** Events for the browser hub. `connId` / `connIds` name browser sockets. */
 export type TerminalLifecycleEvent =
   | {
       type: "opened" | "attached" | "pending";
       terminalId: string;
-      viewerId: string | null;
+      connId: string;
+      viewerId: string;
       cliPublicKey: string;
       cliNonce: string;
       approvalCode?: string;
@@ -114,19 +137,34 @@ export type TerminalLifecycleEvent =
   | {
       type: "rejected";
       terminalId: string;
-      viewerId: string | null;
+      connId: string;
       reason: string;
       approvalCode?: string;
     }
   | {
       type: "exit";
       terminalId: string;
-      viewerId: string | null;
+      connIds: string[];
       exitCode?: number;
       signal?: string;
     }
-  | { type: "detached"; terminalId: string; viewerId: string }
-  | { type: "sealed"; terminalId: string; viewerId: string | null; seq: number; body: Uint8Array };
+  /** 2.4 only: another tab took the terminal. */
+  | { type: "detached"; terminalId: string; connId: string }
+  | {
+      type: "viewers";
+      terminalId: string;
+      count: number;
+      recipients: Array<{ connId: string; writer: TerminalWriterLabel }>;
+    }
+  | {
+      type: "sealed";
+      terminalId: string;
+      connIds: string[];
+      seq: number;
+      /** Set on 2.5 broadcast frames. */
+      epoch?: number;
+      body: Uint8Array;
+    };
 
 type TerminalBridge = {
   onTerminalEvent(event: TerminalLifecycleEvent): void;
@@ -138,8 +176,10 @@ export function registerTerminalBridge(bridge: TerminalBridge) {
   terminalBridge = bridge;
 }
 
-const TERMINAL_USER_LIMIT = 4;
-const TERMINAL_CLI_LIMIT = 2;
+export const TERMINAL_USER_LIMIT = 4;
+export const TERMINAL_CLI_LIMIT = 2;
+/** 2.5: attached viewers plus pending approvals per terminal. */
+export const TERMINAL_VIEWER_LIMIT = 8;
 const CLI_SEALED_BUFFER_LIMIT = 1024 * 1024;
 const TERMINAL_PENDING_TTL_MS = 2 * 60 * 1000;
 const RELAY_JSON_CONTROL_MAX_BYTES = 64 * 1024;
@@ -158,6 +198,8 @@ type SessionState = {
   cliVersion: string | null;
   features: CliReportedFeatures | null;
   terminalPublicKey: string | null;
+  /** 2.5 multi-viewer terminals. */
+  terminalViewers: boolean;
   allowHumanTerminal: boolean;
   allowMcpCommands: boolean;
   terminalsById: Map<string, TerminalRecord>;
@@ -180,16 +222,92 @@ type ActiveRelayRequest = ActiveRelayResponseHandlers & {
   cliDeviceId: string;
 };
 
-function reportedFeaturesFromHello(
-  message: Extract<RelayClientControlMessage, { type: "hello" }>,
-  now: Date,
-): ReportedRelayFeatures {
+type HelloMessage = Extract<RelayClientControlMessage, { type: "hello" }>;
+
+/** Terminal and exec capabilities, present from 2.4 on. */
+function interactiveCapabilities(capabilities: HelloMessage["cli"]["capabilities"]): {
+  features: CliReportedFeatures;
+  terminalPublicKey: string;
+  terminalViewers: boolean;
+} | null {
+  if (!relayProtocolAtLeast(capabilities.protocolVersion, "2.4")) return null;
+  if (!("features" in capabilities)) return null;
+  return {
+    features: capabilities.features,
+    terminalPublicKey: capabilities.terminalPublicKey,
+    terminalViewers:
+      relayProtocolAtLeast(capabilities.protocolVersion, "2.5") &&
+      "terminalViewers" in capabilities &&
+      capabilities.terminalViewers === true,
+  };
+}
+
+function mintViewerId(terminal?: TerminalRecord): string {
+  for (;;) {
+    const viewerId = randomBytes(16).toString("base64url");
+    if (!terminal || (!terminal.viewers.has(viewerId) && !terminal.pendingViewers.has(viewerId))) {
+      return viewerId;
+    }
+  }
+}
+
+/** Distinct browser sockets that hold or wait for this terminal. */
+function terminalConnIds(terminal: TerminalRecord): string[] {
+  const connIds = new Set<string>();
+  for (const viewer of terminal.viewers.values()) connIds.add(viewer.connId);
+  for (const pending of terminal.pendingViewers.values()) connIds.add(pending.connId);
+  return [...connIds];
+}
+
+/**
+ * The (terminal, browser socket) -> viewer id lookup. Derived from the viewer
+ * maps, so every path that removes a viewer also removes the lookup entry.
+ */
+function connViewerIds(terminal: TerminalRecord, connId: string): string[] {
+  const viewerIds: string[] = [];
+  for (const [viewerId, viewer] of terminal.viewers) {
+    if (viewer.connId === connId) viewerIds.push(viewerId);
+  }
+  for (const [viewerId, pending] of terminal.pendingViewers) {
+    if (pending.connId === connId) viewerIds.push(viewerId);
+  }
+  return viewerIds;
+}
+
+function attachedViewerIdForConn(terminal: TerminalRecord, connId: string): string | null {
+  for (const [viewerId, viewer] of terminal.viewers) {
+    if (viewer.connId === connId) return viewerId;
+  }
+  return null;
+}
+
+function pendingViewerIdForConn(terminal: TerminalRecord, connId: string): string | null {
+  for (const [viewerId, pending] of terminal.pendingViewers) {
+    if (pending.connId === connId) return viewerId;
+  }
+  return null;
+}
+
+/** 2.4 has no term.writer: its single viewer is the writer. */
+function terminalWriterViewerId(terminal: TerminalRecord): string | null {
+  if (terminal.multiViewer) return terminal.writerViewerId;
+  return terminal.viewers.keys().next().value ?? null;
+}
+
+function firstEntry<T>(map: Map<string, T>): [string, T] | null {
+  return map.entries().next().value ?? null;
+}
+
+function reportedFeaturesFromHello(message: HelloMessage, now: Date): ReportedRelayFeatures {
   const cliVersion = message.cli.version ?? null;
-  if (message.protocolVersion === "2.4" && message.cli.capabilities.protocolVersion === "2.4") {
-    const features = message.cli.capabilities.features;
+  const interactive = relayProtocolAtLeast(message.protocolVersion, "2.4")
+    ? interactiveCapabilities(message.cli.capabilities)
+    : null;
+  if (interactive) {
+    const features = interactive.features;
     return {
       cliVersion,
-      relayProtocolVersion: "2.4",
+      relayProtocolVersion: message.protocolVersion,
       reportedHumanTerminal: features.humanTerminal,
       reportedMcpCommands: features.mcpCommands,
       reportedTerminalApproval: features.terminalApproval,
@@ -292,6 +410,7 @@ export class RelaySessionManager {
       cliVersion: null,
       features: null,
       terminalPublicKey: null,
+      terminalViewers: false,
       allowHumanTerminal: false,
       allowMcpCommands: false,
       terminalsById: new Map(),
@@ -352,15 +471,15 @@ export class RelaySessionManager {
         session.cliVersion = message.cli.version ?? null;
         session.allowHumanTerminal = registration.allowHumanTerminal;
         session.allowMcpCommands = registration.allowMcpCommands;
-        if (
-          message.protocolVersion === "2.4" &&
-          message.cli.capabilities.protocolVersion === "2.4"
-        ) {
-          session.features = message.cli.capabilities.features;
-          session.terminalPublicKey = message.cli.capabilities.terminalPublicKey;
+        const interactive = interactiveCapabilities(message.cli.capabilities);
+        if (interactive) {
+          session.features = interactive.features;
+          session.terminalPublicKey = interactive.terminalPublicKey;
+          session.terminalViewers = interactive.terminalViewers;
         } else {
           session.features = null;
           session.terminalPublicKey = null;
+          session.terminalViewers = false;
         }
         session.lastHeartbeatAt = now;
         clearTimeout(session.unauthenticatedTimer);
@@ -500,6 +619,7 @@ export class RelaySessionManager {
       message.type === "term.opened" ||
       message.type === "term.attached" ||
       message.type === "term.rejected" ||
+      message.type === "term.writer" ||
       message.type === "term.exit"
     ) {
       this.handleTerminalControl(session, message);
@@ -527,12 +647,7 @@ export class RelaySessionManager {
         return;
       }
       if (parsed.metadata.type === "term.sealed") {
-        this.forwardSealedToBrowser(
-          session,
-          parsed.metadata.terminalId,
-          parsed.metadata.seq,
-          parsed.body,
-        );
+        this.forwardSealedToBrowser(session, parsed.metadata, parsed.body);
         return;
       }
       if (parsed.metadata.type === "exec.stdout" || parsed.metadata.type === "exec.stderr") {
@@ -745,7 +860,9 @@ export class RelaySessionManager {
         mcpCommands: session.features?.mcpCommands ?? false,
         terminalSupported: session.features?.terminalSupported ?? false,
         terminalApproval: session.features?.terminalApproval ?? false,
-        terminalPublicKey: session.protocolVersion === "2.4" ? session.terminalPublicKey : null,
+        terminalPublicKey: relayProtocolAtLeast(session.protocolVersion, "2.4")
+          ? session.terminalPublicKey
+          : null,
       });
     }
     return snapshots;
@@ -771,26 +888,37 @@ export class RelaySessionManager {
     return false;
   }
 
-  listTerminalsForUser(userId: string): Array<{
+  /**
+   * `connId` names the asking browser socket, so each entry can say whether
+   * that tab is attached (or waiting) and whether it is the writer.
+   */
+  listTerminalsForUser(
+    userId: string,
+    connId?: string,
+  ): Array<{
     terminalId: string;
     cliDeviceId: string;
     label: string;
+    /** Kept for one release: viewerCount > 0. */
     viewerAttached: boolean;
+    viewerCount: number;
+    attachedHere: boolean;
+    writerHere: boolean;
   }> {
-    const terminals: Array<{
-      terminalId: string;
-      cliDeviceId: string;
-      label: string;
-      viewerAttached: boolean;
-    }> = [];
+    const terminals: ReturnType<RelaySessionManager["listTerminalsForUser"]> = [];
     for (const session of this.sessionsByCliDeviceId.values()) {
       for (const terminal of session.terminalsById.values()) {
         if (terminal.userId !== userId) continue;
+        const writer = terminalWriterViewerId(terminal);
+        const writerConn = writer ? terminal.viewers.get(writer)?.connId : undefined;
         terminals.push({
           terminalId: terminal.terminalId,
           cliDeviceId: terminal.cliDeviceId,
           label: terminal.label,
-          viewerAttached: terminal.viewerId !== null,
+          viewerAttached: terminal.viewers.size > 0,
+          viewerCount: terminal.viewers.size,
+          attachedHere: connId !== undefined && connViewerIds(terminal, connId).length > 0,
+          writerHere: connId !== undefined && writerConn === connId,
         });
       }
     }
@@ -798,8 +926,10 @@ export class RelaySessionManager {
   }
 
   /**
-   * Open a terminal on a 2.4 session that already passed eligibility.
-   * Returns false without sending when the CLI cannot accept term.open.
+   * Open a terminal on a session that already passed eligibility. `connId` is
+   * the opening browser socket. The opener's viewer id is minted here unless
+   * the caller already minted one. Returns false without sending when the CLI
+   * cannot accept term.open.
    */
   startTerminal(input: {
     terminalId: string;
@@ -811,7 +941,8 @@ export class RelaySessionManager {
     browserPublicKey: string;
     browserNonce: string;
     identity?: TerminalHandshakeIdentity;
-    viewerId: string;
+    connId: string;
+    viewerId?: string;
   }): boolean {
     const session = this.sessionsByCliDeviceId.get(input.cliDeviceId);
     if (!session || !this.canStartTerminal(session)) return false;
@@ -824,6 +955,9 @@ export class RelaySessionManager {
     ) {
       return false;
     }
+    const now = Date.now();
+    const viewerId = input.viewerId ?? mintViewerId();
+    const multiViewer = session.terminalViewers;
     const terminal: TerminalRecord = {
       terminalId: input.terminalId,
       userId: input.userId,
@@ -831,15 +965,24 @@ export class RelaySessionManager {
       label: input.label,
       cols: input.cols,
       rows: input.rows,
-      viewerId: input.viewerId,
-      pendingViewerId: null,
+      multiViewer,
+      viewers: new Map(),
+      pendingViewers: new Map(),
+      writerViewerId: null,
       phase: approvalRequired ? "pending" : "opening",
-      createdAt: Date.now(),
+      createdAt: now,
     };
+    if (multiViewer) {
+      // 2.5: the opener joins the viewer set on term.opened.
+      terminal.pendingViewers.set(viewerId, { connId: input.connId, requestedAt: now });
+    } else {
+      terminal.viewers.set(viewerId, { connId: input.connId, attachedAt: now });
+    }
     session.terminalsById.set(terminal.terminalId, terminal);
     this.sendControl(session, {
       type: "term.open",
       terminalId: input.terminalId,
+      ...(multiViewer ? { viewerId } : {}),
       cols: input.cols,
       rows: input.rows,
       browserPublicKey: input.browserPublicKey,
@@ -849,52 +992,73 @@ export class RelaySessionManager {
     return true;
   }
 
+  /**
+   * Attach a browser socket to a running terminal. Each attachment gets a new
+   * server-minted viewer id. On 2.5 viewers coexist (up to the viewer cap). On
+   * 2.4 the new viewer replaces the current one.
+   */
   attachTerminal(input: {
     terminalId: string;
     userId: string;
-    viewerId: string;
+    connId: string;
     browserPublicKey: string;
     browserNonce: string;
     identity?: TerminalHandshakeIdentity;
-  }): { ok: true } | { ok: false; error: "not_found" | "offline" } {
+  }): { ok: true; viewerId: string } | { ok: false; error: "not_found" | "offline" | "limit" } {
     const located = this.terminalForUser(input.terminalId, input.userId);
     if (!located) return { ok: false, error: "not_found" };
     const { session, terminal } = located;
     if (!this.canStartTerminal(session)) return { ok: false, error: "offline" };
-    const approvalRequired = session.features?.terminalApproval === true;
-    if (approvalRequired) {
-      // Keep the current viewer until the CLI accepts term.auth.
-      terminal.pendingViewerId = input.viewerId;
-    } else {
-      if (terminal.viewerId && terminal.viewerId !== input.viewerId) {
-        const previous = terminal.viewerId;
-        terminal.viewerId = null;
-        terminalBridge?.onTerminalEvent({
-          type: "detached",
-          terminalId: terminal.terminalId,
-          viewerId: previous,
-        });
+    const now = Date.now();
+    if (!terminal.multiViewer) {
+      const viewerId = mintViewerId(terminal);
+      if (session.features?.terminalApproval === true) {
+        // Keep the current viewer until the CLI accepts term.auth.
+        terminal.pendingViewers.clear();
+        terminal.pendingViewers.set(viewerId, { connId: input.connId, requestedAt: now });
+      } else {
+        this.replaceLegacyViewer(terminal, viewerId, input.connId);
       }
-      terminal.viewerId = input.viewerId;
+      this.sendControl(session, {
+        type: "term.attach",
+        terminalId: terminal.terminalId,
+        browserPublicKey: input.browserPublicKey,
+        browserNonce: input.browserNonce,
+        ...(input.identity ? { identity: input.identity } : {}),
+      });
+      return { ok: true, viewerId };
     }
+    // 2.5 viewers join a spawned terminal. The opener joins through term.opened.
+    if (terminal.phase !== "open") return { ok: false, error: "not_found" };
+    // A second attach from the same tab replaces that tab's earlier attachment.
+    const previous = connViewerIds(terminal, input.connId);
+    const occupied = terminal.viewers.size + terminal.pendingViewers.size - previous.length;
+    if (occupied >= TERMINAL_VIEWER_LIMIT) return { ok: false, error: "limit" };
+    for (const viewerId of previous) this.removeViewer(session, terminal, viewerId);
+    const viewerId = mintViewerId(terminal);
+    terminal.pendingViewers.set(viewerId, { connId: input.connId, requestedAt: now });
     this.sendControl(session, {
       type: "term.attach",
       terminalId: terminal.terminalId,
+      viewerId,
       browserPublicKey: input.browserPublicKey,
       browserNonce: input.browserNonce,
       ...(input.identity ? { identity: input.identity } : {}),
     });
-    return { ok: true };
+    return { ok: true, viewerId };
   }
 
-  detachTerminalViewer(terminalId: string, userId: string, viewerId: string): boolean {
+  /**
+   * Stop this browser socket's viewing of one terminal (X button, or a slow
+   * browser). The terminal keeps running for everyone else.
+   */
+  detachTerminalViewer(terminalId: string, userId: string, connId: string): boolean {
     const located = this.terminalForUser(terminalId, userId);
     if (!located) return false;
-    if (located.terminal.viewerId !== viewerId) return false;
-    located.terminal.viewerId = null;
-    if (this.canSignalTerminal(located.session)) {
-      this.sendControl(located.session, { type: "term.detach", terminalId });
-    }
+    const viewerIds = connViewerIds(located.terminal, connId);
+    if (viewerIds.length === 0) return false;
+    for (const viewerId of viewerIds)
+      this.removeViewer(located.session, located.terminal, viewerId);
     return true;
   }
 
@@ -905,29 +1069,54 @@ export class RelaySessionManager {
     return true;
   }
 
-  forwardTerminalAuth(terminalId: string, userId: string, signature: string): boolean {
+  /** On 2.5 the server stamps the viewer id of this socket's pending attachment. */
+  forwardTerminalAuth(
+    terminalId: string,
+    userId: string,
+    connId: string,
+    signature: string,
+  ): "sent" | "not_found" | "offline" {
     const located = this.terminalForUser(terminalId, userId);
-    if (!located || !this.canSignalTerminal(located.session)) return false;
-    this.sendControl(located.session, { type: "term.auth", terminalId, signature });
-    return true;
+    if (!located) return "not_found";
+    const { session, terminal } = located;
+    let viewerId: string | null = null;
+    if (terminal.multiViewer) {
+      viewerId = pendingViewerIdForConn(terminal, connId);
+      if (!viewerId) return "not_found";
+    }
+    if (!this.canSignalTerminal(session)) return "offline";
+    this.sendControl(session, {
+      type: "term.auth",
+      terminalId,
+      ...(viewerId ? { viewerId } : {}),
+      signature,
+    });
+    return "sent";
   }
 
+  /**
+   * Browser input. Only an attached viewer may send it. On 2.5 the server
+   * stamps that viewer's id; the browser never supplies it.
+   */
   forwardBrowserSealed(
     terminalId: string,
     userId: string,
-    viewerId: string,
+    connId: string,
     seq: number,
     body: Uint8Array,
   ): "sent" | "missing" | "dropped" {
     const located = this.terminalForUser(terminalId, userId);
-    if (!located || located.terminal.viewerId !== viewerId) return "missing";
+    if (!located) return "missing";
+    const viewerId = attachedViewerIdForConn(located.terminal, connId);
+    if (!viewerId) return "missing";
     if (!this.canSignalTerminal(located.session)) return "missing";
     if (located.session.socket.readyState !== WS_READY_STATE_OPEN) return "missing";
     // A slow CLI must not grow this process without a bound.
     if ((located.session.socket.bufferedAmount ?? 0) > CLI_SEALED_BUFFER_LIMIT) return "dropped";
-    located.session.socket.send(
-      encodeRelayBinaryFrame({ type: "term.sealed", terminalId, seq }, body),
-    );
+    const metadata: TerminalSealedMetadata = located.terminal.multiViewer
+      ? { type: "term.sealed", terminalId, seq, viewerId }
+      : { type: "term.sealed", terminalId, seq };
+    located.session.socket.send(encodeRelayBinaryFrame(metadata, body));
     return "sent";
   }
 
@@ -1208,7 +1397,7 @@ export class RelaySessionManager {
 
   private canStartTerminal(session: SessionState): boolean {
     return (
-      session.protocolVersion === "2.4" &&
+      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
       session.allowHumanTerminal &&
       session.features?.humanTerminal === true &&
       session.features.terminalSupported === true &&
@@ -1219,7 +1408,7 @@ export class RelaySessionManager {
 
   private canSignalTerminal(session: SessionState): boolean {
     return (
-      session.protocolVersion === "2.4" &&
+      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
       session.features?.humanTerminal === true &&
       session.socket.readyState === WS_READY_STATE_OPEN
     );
@@ -1227,7 +1416,7 @@ export class RelaySessionManager {
 
   private canStartExec(session: SessionState): boolean {
     return (
-      session.protocolVersion === "2.4" &&
+      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
       session.allowMcpCommands &&
       session.features?.mcpCommands === true &&
       session.socket.readyState === WS_READY_STATE_OPEN
@@ -1236,7 +1425,7 @@ export class RelaySessionManager {
 
   private canSignalExec(session: SessionState): boolean {
     return (
-      session.protocolVersion === "2.4" &&
+      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
       session.features?.mcpCommands === true &&
       session.socket.readyState === WS_READY_STATE_OPEN
     );
@@ -1249,19 +1438,19 @@ export class RelaySessionManager {
 
   private reconcileInteractiveGrants(session: SessionState) {
     const terminalOk =
-      session.protocolVersion === "2.4" &&
+      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
       session.allowHumanTerminal &&
       session.features?.humanTerminal === true &&
       session.features.terminalSupported === true;
     if (!terminalOk) {
       const signal =
-        session.protocolVersion === "2.4" &&
+        relayProtocolAtLeast(session.protocolVersion, "2.4") &&
         session.features?.humanTerminal === true &&
         session.socket.readyState === WS_READY_STATE_OPEN;
       this.closeAllTerminals(session, signal);
     }
     const execOk =
-      session.protocolVersion === "2.4" &&
+      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
       session.allowMcpCommands &&
       session.features?.mcpCommands === true;
     if (!execOk) this.cancelAllCommands(session);
@@ -1269,7 +1458,7 @@ export class RelaySessionManager {
 
   private teardownInteractiveWork(session: SessionState) {
     const signalTerminals =
-      session.protocolVersion === "2.4" &&
+      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
       session.features?.humanTerminal === true &&
       session.socket.readyState === WS_READY_STATE_OPEN;
     this.closeAllTerminals(session, signalTerminals);
@@ -1290,7 +1479,63 @@ export class RelaySessionManager {
     terminalBridge?.onTerminalEvent({
       type: "exit",
       terminalId: terminal.terminalId,
-      viewerId: terminal.viewerId,
+      connIds: terminalConnIds(terminal),
+    });
+  }
+
+  /** 2.4: the new viewer takes the terminal and every other tab hears `detached`. */
+  private replaceLegacyViewer(terminal: TerminalRecord, viewerId: string, connId: string) {
+    const previous = [...terminal.viewers.values()];
+    terminal.viewers.clear();
+    terminal.viewers.set(viewerId, { connId, attachedAt: Date.now() });
+    for (const viewer of previous) {
+      if (viewer.connId === connId) continue;
+      terminalBridge?.onTerminalEvent({
+        type: "detached",
+        terminalId: terminal.terminalId,
+        connId: viewer.connId,
+      });
+    }
+  }
+
+  /**
+   * Drop one attachment (attached or pending) and tell the CLI. On 2.5 the
+   * remaining viewers hear the new count.
+   */
+  private removeViewer(session: SessionState, terminal: TerminalRecord, viewerId: string): boolean {
+    const wasViewer = terminal.viewers.delete(viewerId);
+    const wasPending = terminal.pendingViewers.delete(viewerId);
+    if (!wasViewer && !wasPending) return false;
+    const writerLeft = terminal.writerViewerId === viewerId;
+    if (writerLeft) terminal.writerViewerId = null;
+    if (this.canSignalTerminal(session)) {
+      if (terminal.multiViewer) {
+        this.sendControl(session, {
+          type: "term.detach",
+          terminalId: terminal.terminalId,
+          viewerId,
+        });
+      } else if (wasViewer) {
+        // 2.4 keeps its behavior: a waiting replacement leaves without a signal.
+        this.sendControl(session, { type: "term.detach", terminalId: terminal.terminalId });
+      }
+    }
+    if (wasViewer || writerLeft) this.emitViewers(terminal);
+    return true;
+  }
+
+  /** 2.5: tell every attached viewer the count and who is typing. */
+  private emitViewers(terminal: TerminalRecord) {
+    if (!terminal.multiViewer || terminal.viewers.size === 0) return;
+    const writer = terminal.writerViewerId;
+    terminalBridge?.onTerminalEvent({
+      type: "viewers",
+      terminalId: terminal.terminalId,
+      count: terminal.viewers.size,
+      recipients: [...terminal.viewers].map(([viewerId, viewer]) => ({
+        connId: viewer.connId,
+        writer: writer === null ? "none" : writer === viewerId ? "you" : "other",
+      })),
     });
   }
 
@@ -1315,34 +1560,48 @@ export class RelaySessionManager {
     }
   }
 
-  /** Drop approval handshakes that never spawned. Pending slots do not count toward the cap. */
+  /**
+   * Drop approval handshakes that never spawned, and 2.5 attachments that the
+   * CLI never answered. Pending terminals do not count toward the terminal cap.
+   */
   sweepExpiredPendingTerminals(now = Date.now()) {
     for (const session of this.sessionsByCliDeviceId.values()) {
       for (const terminal of [...session.terminalsById.values()]) {
-        if (terminal.phase !== "pending") continue;
-        if (now - terminal.createdAt < TERMINAL_PENDING_TTL_MS) continue;
-        const viewerId = terminal.viewerId;
-        session.terminalsById.delete(terminal.terminalId);
-        terminalBridge?.onTerminalEvent({
-          type: "rejected",
-          terminalId: terminal.terminalId,
-          viewerId,
-          reason: "expired",
-        });
+        if (terminal.phase === "pending") {
+          if (now - terminal.createdAt < TERMINAL_PENDING_TTL_MS) continue;
+          session.terminalsById.delete(terminal.terminalId);
+          for (const connId of terminalConnIds(terminal)) {
+            terminalBridge?.onTerminalEvent({
+              type: "rejected",
+              terminalId: terminal.terminalId,
+              connId,
+              reason: "expired",
+            });
+          }
+          continue;
+        }
+        if (!terminal.multiViewer || terminal.phase !== "open") continue;
+        for (const [viewerId, pending] of [...terminal.pendingViewers]) {
+          if (now - pending.requestedAt < TERMINAL_PENDING_TTL_MS) continue;
+          this.removeViewer(session, terminal, viewerId);
+          terminalBridge?.onTerminalEvent({
+            type: "rejected",
+            terminalId: terminal.terminalId,
+            connId: pending.connId,
+            reason: "expired",
+          });
+        }
       }
     }
   }
 
-  /** Clear every viewer this socket held, including terminals still opening. */
-  releaseBrowserViewer(userId: string, viewerId: string) {
+  /** Clear every attachment this browser socket held, including terminals still opening. */
+  releaseBrowserViewer(userId: string, connId: string) {
     for (const session of this.sessionsByCliDeviceId.values()) {
       for (const terminal of session.terminalsById.values()) {
         if (terminal.userId !== userId) continue;
-        if (terminal.pendingViewerId === viewerId) terminal.pendingViewerId = null;
-        if (terminal.viewerId !== viewerId) continue;
-        terminal.viewerId = null;
-        if (this.canSignalTerminal(session)) {
-          this.sendControl(session, { type: "term.detach", terminalId: terminal.terminalId });
+        for (const viewerId of connViewerIds(terminal, connId)) {
+          this.removeViewer(session, terminal, viewerId);
         }
       }
     }
@@ -1361,39 +1620,97 @@ export class RelaySessionManager {
     return null;
   }
 
+  /**
+   * CLI output. 2.4 frames go to the one viewer. On 2.5 a frame names either
+   * one viewer (unicast) or an output-key epoch (broadcast to every attached
+   * viewer). Frames for an unknown viewer, or with neither, are dropped.
+   */
   private forwardSealedToBrowser(
     session: SessionState,
-    terminalId: string,
-    seq: number,
+    metadata: TerminalSealedMetadata,
     body: Uint8Array,
   ) {
-    const terminal = session.terminalsById.get(terminalId);
+    const terminal = session.terminalsById.get(metadata.terminalId);
     if (!terminal) return;
-    terminalBridge?.onTerminalEvent({
-      type: "sealed",
-      terminalId,
-      viewerId: terminal.viewerId,
-      seq,
+    const base = {
+      type: "sealed" as const,
+      terminalId: terminal.terminalId,
+      seq: metadata.seq,
       body,
-    });
+    };
+    if (!terminal.multiViewer) {
+      if (metadata.viewerId !== undefined || metadata.epoch !== undefined) return;
+      const connIds = [...terminal.viewers.values()].map((viewer) => viewer.connId);
+      if (connIds.length > 0) terminalBridge?.onTerminalEvent({ ...base, connIds });
+      return;
+    }
+    if (metadata.viewerId !== undefined) {
+      const viewer = terminal.viewers.get(metadata.viewerId);
+      if (!viewer) return;
+      terminalBridge?.onTerminalEvent({ ...base, connIds: [viewer.connId] });
+      return;
+    }
+    if (metadata.epoch === undefined) return;
+    const connIds = [...terminal.viewers.values()].map((viewer) => viewer.connId);
+    if (connIds.length === 0) return;
+    terminalBridge?.onTerminalEvent({ ...base, connIds, epoch: metadata.epoch });
   }
 
   private handleTerminalControl(
     session: SessionState,
     message: Extract<
       RelayClientControlMessage,
-      { type: "term.pending" | "term.opened" | "term.attached" | "term.rejected" | "term.exit" }
+      {
+        type:
+          | "term.pending"
+          | "term.opened"
+          | "term.attached"
+          | "term.rejected"
+          | "term.writer"
+          | "term.exit";
+      }
     >,
   ) {
     const terminal = session.terminalsById.get(message.terminalId);
     if (!terminal) return;
+    if (message.type === "term.exit") {
+      session.terminalsById.delete(terminal.terminalId);
+      terminalBridge?.onTerminalEvent({
+        type: "exit",
+        terminalId: terminal.terminalId,
+        connIds: terminalConnIds(terminal),
+        ...(message.exitCode !== undefined ? { exitCode: message.exitCode } : {}),
+        ...(message.signal !== undefined ? { signal: message.signal } : {}),
+      });
+      return;
+    }
+    if (terminal.multiViewer) {
+      this.handleMultiViewerControl(session, terminal, message);
+      return;
+    }
+    if (message.type === "term.writer") return;
+    this.handleLegacyTerminalControl(session, terminal, message);
+  }
+
+  /** 2.4: one viewer, and a replacement waits in `pendingViewers` for approval. */
+  private handleLegacyTerminalControl(
+    session: SessionState,
+    terminal: TerminalRecord,
+    message: Extract<
+      RelayClientControlMessage,
+      { type: "term.pending" | "term.opened" | "term.attached" | "term.rejected" }
+    >,
+  ) {
     if (message.type === "term.pending") {
       const cliPublicKey = session.terminalPublicKey;
       if (!cliPublicKey) return;
+      const target = firstEntry(terminal.pendingViewers) ?? firstEntry(terminal.viewers);
+      if (!target) return;
       terminalBridge?.onTerminalEvent({
         type: "pending",
         terminalId: terminal.terminalId,
-        viewerId: terminal.pendingViewerId ?? terminal.viewerId,
+        connId: target[1].connId,
+        viewerId: target[0],
         cliPublicKey,
         cliNonce: message.cliNonce,
         ...(message.approvalCode ? { approvalCode: message.approvalCode } : {}),
@@ -1401,76 +1718,156 @@ export class RelaySessionManager {
       return;
     }
     if (message.type === "term.opened" || message.type === "term.attached") {
-      if (terminal.pendingViewerId && terminal.pendingViewerId !== terminal.viewerId) {
-        const previous = terminal.viewerId;
-        const next = terminal.pendingViewerId;
-        terminal.pendingViewerId = null;
-        terminal.viewerId = next;
-        if (previous) {
-          terminalBridge?.onTerminalEvent({
-            type: "detached",
-            terminalId: terminal.terminalId,
-            viewerId: previous,
-          });
-        }
+      const replacement = firstEntry(terminal.pendingViewers);
+      if (replacement) {
+        terminal.pendingViewers.delete(replacement[0]);
+        this.replaceLegacyViewer(terminal, replacement[0], replacement[1].connId);
       }
       terminal.phase = "open";
-      if (message.type === "term.opened") {
-        const counts = this.terminalCounts(terminal.userId, terminal.cliDeviceId);
-        if (counts.user > TERMINAL_USER_LIMIT || counts.cli > TERMINAL_CLI_LIMIT) {
-          this.closeTerminal(session, terminal, true);
-          return;
-        }
+      if (message.type === "term.opened" && this.terminalOverLimit(terminal)) {
+        this.closeTerminal(session, terminal, true);
+        return;
       }
       const cliPublicKey = session.terminalPublicKey;
       if (!cliPublicKey) {
         this.closeTerminal(session, terminal, true);
         return;
       }
+      const current = firstEntry(terminal.viewers);
+      if (!current) return;
       terminalBridge?.onTerminalEvent({
         type: message.type === "term.opened" ? "opened" : "attached",
         terminalId: terminal.terminalId,
-        viewerId: terminal.viewerId,
+        connId: current[1].connId,
+        viewerId: current[0],
         cliPublicKey,
         cliNonce: message.cliNonce,
       });
       return;
     }
-    if (message.type === "term.rejected") {
-      const replacement = terminal.pendingViewerId;
-      if (replacement && terminal.phase === "open") {
-        terminal.pendingViewerId = null;
-        terminalBridge?.onTerminalEvent({
-          type: "rejected",
-          terminalId: terminal.terminalId,
-          viewerId: replacement,
-          reason: message.reason,
-          ...(message.approvalCode ? { approvalCode: message.approvalCode } : {}),
-        });
-        return;
-      }
-      const viewerId = terminal.viewerId;
-      const unspawned = terminal.phase === "opening" || terminal.phase === "pending";
-      terminal.viewerId = null;
-      if (unspawned) session.terminalsById.delete(terminal.terminalId);
+    const replacement = firstEntry(terminal.pendingViewers);
+    if (replacement && terminal.phase === "open") {
+      terminal.pendingViewers.delete(replacement[0]);
       terminalBridge?.onTerminalEvent({
         type: "rejected",
         terminalId: terminal.terminalId,
-        viewerId,
+        connId: replacement[1].connId,
         reason: message.reason,
         ...(message.approvalCode ? { approvalCode: message.approvalCode } : {}),
       });
       return;
     }
-    const viewerId = terminal.viewerId;
-    session.terminalsById.delete(terminal.terminalId);
+    const current = firstEntry(terminal.viewers);
+    terminal.viewers.clear();
+    if (terminal.phase === "opening" || terminal.phase === "pending") {
+      session.terminalsById.delete(terminal.terminalId);
+    }
+    if (!current) return;
     terminalBridge?.onTerminalEvent({
-      type: "exit",
+      type: "rejected",
       terminalId: terminal.terminalId,
-      viewerId,
-      ...(message.exitCode !== undefined ? { exitCode: message.exitCode } : {}),
-      ...(message.signal !== undefined ? { signal: message.signal } : {}),
+      connId: current[1].connId,
+      reason: message.reason,
+      ...(message.approvalCode ? { approvalCode: message.approvalCode } : {}),
     });
+  }
+
+  /** 2.5: every message names the viewer it concerns. Unknown viewer ids are dropped. */
+  private handleMultiViewerControl(
+    session: SessionState,
+    terminal: TerminalRecord,
+    message: Extract<
+      RelayClientControlMessage,
+      { type: "term.pending" | "term.opened" | "term.attached" | "term.rejected" | "term.writer" }
+    >,
+  ) {
+    if (message.type === "term.writer") {
+      const writer = message.viewerId ?? null;
+      if (writer !== null && !terminal.viewers.has(writer)) return;
+      if (terminal.writerViewerId === writer) return;
+      terminal.writerViewerId = writer;
+      this.emitViewers(terminal);
+      return;
+    }
+    const viewerId = message.viewerId;
+    if (viewerId === undefined) {
+      console.error("[relay] terminal frame without a viewer id");
+      return;
+    }
+    if (message.type === "term.pending") {
+      const cliPublicKey = session.terminalPublicKey;
+      const pending = terminal.pendingViewers.get(viewerId);
+      if (!cliPublicKey || !pending) return;
+      terminalBridge?.onTerminalEvent({
+        type: "pending",
+        terminalId: terminal.terminalId,
+        connId: pending.connId,
+        viewerId,
+        cliPublicKey,
+        cliNonce: message.cliNonce,
+        ...(message.approvalCode ? { approvalCode: message.approvalCode } : {}),
+      });
+      return;
+    }
+    if (message.type === "term.opened" || message.type === "term.attached") {
+      if (message.type === "term.opened") {
+        if (terminal.phase === "open") return;
+        terminal.phase = "open";
+        if (this.terminalOverLimit(terminal)) {
+          this.closeTerminal(session, terminal, true);
+          return;
+        }
+      } else if (terminal.phase !== "open") {
+        return;
+      }
+      const cliPublicKey = session.terminalPublicKey;
+      if (!cliPublicKey) {
+        this.closeTerminal(session, terminal, true);
+        return;
+      }
+      const pending = terminal.pendingViewers.get(viewerId);
+      // The tab may have left while the CLI was spawning or approving.
+      if (!pending) return;
+      terminal.pendingViewers.delete(viewerId);
+      terminal.viewers.set(viewerId, { connId: pending.connId, attachedAt: Date.now() });
+      // The opener is the first writer. The CLI confirms with term.writer.
+      if (message.type === "term.opened" && terminal.writerViewerId === null) {
+        terminal.writerViewerId = viewerId;
+      }
+      terminalBridge?.onTerminalEvent({
+        type: message.type === "term.opened" ? "opened" : "attached",
+        terminalId: terminal.terminalId,
+        connId: pending.connId,
+        viewerId,
+        cliPublicKey,
+        cliNonce: message.cliNonce,
+      });
+      this.emitViewers(terminal);
+      return;
+    }
+    const target = terminal.pendingViewers.get(viewerId) ?? terminal.viewers.get(viewerId);
+    const wasViewer = terminal.viewers.delete(viewerId);
+    terminal.pendingViewers.delete(viewerId);
+    if (terminal.writerViewerId === viewerId) terminal.writerViewerId = null;
+    if (terminal.phase !== "open") {
+      // The open itself was refused: nothing spawned.
+      session.terminalsById.delete(terminal.terminalId);
+    } else if (wasViewer) {
+      this.emitViewers(terminal);
+    }
+    if (!target) return;
+    terminalBridge?.onTerminalEvent({
+      type: "rejected",
+      terminalId: terminal.terminalId,
+      connId: target.connId,
+      reason: message.reason,
+      ...(message.approvalCode ? { approvalCode: message.approvalCode } : {}),
+    });
+  }
+
+  private terminalOverLimit(terminal: TerminalRecord): boolean {
+    const counts = this.terminalCounts(terminal.userId, terminal.cliDeviceId);
+    return counts.user > TERMINAL_USER_LIMIT || counts.cli > TERMINAL_CLI_LIMIT;
   }
 
   private handleExecControl(

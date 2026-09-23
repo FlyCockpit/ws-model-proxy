@@ -14,12 +14,15 @@ import {
   base64Url16ByteSchema,
   encodeRelayBinaryFrame,
   parseRelayBinaryFrame,
+  relayProtocolAtLeast,
   uncompressedP256PublicKeySchema,
 } from "./protocol.js";
 import {
   type RelaySocket,
   registerTerminalBridge,
   relaySessionManager,
+  TERMINAL_CLI_LIMIT,
+  TERMINAL_USER_LIMIT,
   type TerminalLifecycleEvent,
 } from "./session-manager.js";
 import { settleSocketHandler } from "./socket-handler.js";
@@ -30,6 +33,8 @@ const BROWSER_JSON_LIMIT = 20;
 const BROWSER_JSON_WINDOW_MS = 10_000;
 /** Per terminal tab. Key repeat runs at about 30 frames per second. */
 const BROWSER_BINARY_LIMIT = 300;
+/** Per terminal, across every viewer, so many tabs cannot multiply the CLI's input load. */
+const TERMINAL_BINARY_LIMIT = 600;
 const BROWSER_BINARY_WINDOW_MS = 10_000;
 /** Limiter bucket for frames that do not name a terminal. */
 const INVALID_BINARY_KEY = "";
@@ -148,17 +153,19 @@ export function classifyTerminalAvailability(input: {
   live: LiveCliFeatureSnapshot | null;
 }): { available: boolean; reason: TerminalAvailabilityReason; publicKey: string | null } {
   const live = input.live;
-  const publicKey = live?.protocolVersion === "2.4" ? live.terminalPublicKey : null;
+  const interactive = relayProtocolAtLeast(live?.protocolVersion, "2.4");
+  const publicKey = interactive ? (live?.terminalPublicKey ?? null) : null;
   if (input.status === "REVOKED") {
     return { available: false, reason: "device_disabled", publicKey };
   }
   if (!input.allowHumanTerminal) {
     return { available: false, reason: "not_granted", publicKey };
   }
-  if (live?.protocolVersion !== "2.4") {
+  if (!live || !interactive) {
     if (live) return { available: false, reason: "cli_too_old", publicKey };
     const neverReported =
-      input.relayProtocolVersion !== "2.4" || input.reportedHumanTerminal === null;
+      !relayProtocolAtLeast(input.relayProtocolVersion, "2.4") ||
+      input.reportedHumanTerminal === null;
     return { available: false, reason: neverReported ? "cli_too_old" : "offline", publicKey };
   }
   if (!live.humanTerminal) return { available: false, reason: "device_disabled", publicKey };
@@ -194,6 +201,8 @@ export class TerminalBrowserHub {
   private byId = new Map<string, BrowserConn>();
   private jsonAt = new Map<string, number[]>();
   private binaryAt = new Map<string, Map<string, number[]>>();
+  /** Input frames forwarded per terminal across all viewers. */
+  private terminalBinaryAt = new Map<string, number[]>();
   private textChain = new Map<RelaySocket, Promise<void>>();
   /** `${connId}\0${terminalId}` while input is being dropped, so the browser hears about it once. */
   private dropNotified = new Set<string>();
@@ -242,6 +251,25 @@ export class TerminalBrowserHub {
     return true;
   }
 
+  /** Checks the per-terminal aggregate without recording, so unknown ids add no entry. */
+  private terminalInputAllowed(terminalId: string, now = Date.now()): boolean {
+    const stamps = this.terminalBinaryAt.get(terminalId);
+    if (!stamps) return true;
+    const recent = stamps.filter((stamp) => now - stamp < BROWSER_BINARY_WINDOW_MS);
+    if (recent.length === 0) {
+      this.terminalBinaryAt.delete(terminalId);
+      return true;
+    }
+    this.terminalBinaryAt.set(terminalId, recent);
+    return recent.length < TERMINAL_BINARY_LIMIT;
+  }
+
+  private recordTerminalInput(terminalId: string, now = Date.now()) {
+    const stamps = this.terminalBinaryAt.get(terminalId) ?? [];
+    stamps.push(now);
+    this.terminalBinaryAt.set(terminalId, stamps);
+  }
+
   private forgetConn(conn: BrowserConn) {
     this.jsonAt.delete(conn.id);
     this.binaryAt.delete(conn.id);
@@ -283,8 +311,10 @@ export class TerminalBrowserHub {
     }
     if (message.data.type === "open") {
       const terminalId = this.allocateTerminalId();
-      this.send(conn, { type: "opening", terminalId });
-      await this.openTerminal(conn, message.data, terminalId);
+      // A new terminal has no viewers yet, so a fresh id cannot collide.
+      const viewerId = randomBytes(16).toString("base64url");
+      this.send(conn, { type: "opening", terminalId, viewerId });
+      await this.openTerminal(conn, message.data, terminalId, viewerId);
       return;
     }
     if (message.data.type === "auth") {
@@ -301,9 +331,12 @@ export class TerminalBrowserHub {
       }
       return;
     }
+    // Stop viewing (X button). `close` above ends the session for everyone.
     if (!relaySessionManager.detachTerminalViewer(message.data.terminalId, conn.userId, conn.id)) {
       this.sendError(conn, "not_found", message.data.terminalId);
+      return;
     }
+    this.send(conn, { type: "detached", terminalId: message.data.terminalId, reason: "self" });
   }
 
   handleBinary(socket: RelaySocket, frame: ArrayBuffer) {
@@ -316,13 +349,18 @@ export class TerminalBrowserHub {
       if (this.allowBinary(conn, INVALID_BINARY_KEY)) this.sendError(conn, "invalid");
       return;
     }
-    if (parsed.metadata.type !== "term.sealed") {
+    // The server stamps the viewer id. A browser never names a viewer or an epoch.
+    if (
+      parsed.metadata.type !== "term.sealed" ||
+      parsed.metadata.viewerId !== undefined ||
+      parsed.metadata.epoch !== undefined
+    ) {
       if (this.allowBinary(conn, INVALID_BINARY_KEY)) this.sendError(conn, "invalid");
       return;
     }
     const { terminalId } = parsed.metadata;
     const dropKey = `${conn.id}\0${terminalId}`;
-    if (!this.allowBinary(conn, terminalId)) {
+    if (!this.allowBinary(conn, terminalId) || !this.terminalInputAllowed(terminalId)) {
       this.notifyDropped(conn, terminalId, dropKey);
       return;
     }
@@ -344,6 +382,7 @@ export class TerminalBrowserHub {
       this.notifyDropped(conn, terminalId, dropKey);
       return;
     }
+    this.recordTerminalInput(terminalId);
     this.dropNotified.delete(dropKey);
   }
 
@@ -370,6 +409,11 @@ export class TerminalBrowserHub {
   }
 
   async recheckSessions(now = Date.now()) {
+    // A terminal can end without an exit event reaching here (an unspawned
+    // open that was refused). Its input stamps age out on this sweep.
+    for (const terminalId of [...this.terminalBinaryAt.keys()]) {
+      this.terminalInputAllowed(terminalId, now);
+    }
     for (const conn of [...this.bySocket.values()]) {
       let row: { expiresAt: Date; userId: string } | null = null;
       try {
@@ -392,11 +436,37 @@ export class TerminalBrowserHub {
 
   onTerminalEvent(event: TerminalLifecycleEvent) {
     if (event.type === "sealed") {
-      this.forwardSealedToViewer(event);
+      this.forwardSealedToViewers(event);
       return;
     }
-    if (!event.viewerId) return;
-    const conn = this.byId.get(event.viewerId);
+    if (event.type === "exit") {
+      this.terminalBinaryAt.delete(event.terminalId);
+      for (const connId of event.connIds) {
+        const conn = this.byId.get(connId);
+        if (!conn) continue;
+        this.send(conn, {
+          type: "exit",
+          terminalId: event.terminalId,
+          ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
+          ...(event.signal !== undefined ? { signal: event.signal } : {}),
+        });
+      }
+      return;
+    }
+    if (event.type === "viewers") {
+      for (const recipient of event.recipients) {
+        const conn = this.byId.get(recipient.connId);
+        if (!conn) continue;
+        this.send(conn, {
+          type: "viewers",
+          terminalId: event.terminalId,
+          count: event.count,
+          writer: recipient.writer,
+        });
+      }
+      return;
+    }
+    const conn = this.byId.get(event.connId);
     if (!conn) return;
     if (event.type === "pending") {
       this.send(conn, {
@@ -426,34 +496,36 @@ export class TerminalBrowserHub {
       });
       return;
     }
-    if (event.type === "exit") {
-      this.send(conn, {
-        type: "exit",
-        terminalId: event.terminalId,
-        ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
-        ...(event.signal !== undefined ? { signal: event.signal } : {}),
-      });
-      return;
-    }
+    // 2.4: another tab took this terminal.
     this.send(conn, { type: "detached", terminalId: event.terminalId });
   }
 
-  private forwardSealedToViewer(event: Extract<TerminalLifecycleEvent, { type: "sealed" }>) {
-    if (!event.viewerId) return;
-    const conn = this.byId.get(event.viewerId);
-    if (!conn) return;
-    if ((conn.socket.bufferedAmount ?? 0) > BROWSER_BUFFER_DETACH_BYTES) {
-      relaySessionManager.detachTerminalViewer(event.terminalId, conn.userId, conn.id);
-      this.send(conn, { type: "detached", terminalId: event.terminalId });
-      return;
-    }
-    if (conn.socket.readyState !== 1) return;
-    conn.socket.send(
-      encodeRelayBinaryFrame(
-        { type: "term.sealed", terminalId: event.terminalId, seq: event.seq },
+  /**
+   * One CLI frame, one or many viewers. A viewer whose socket is backed up past
+   * the limit is detached alone; the others keep receiving.
+   */
+  private forwardSealedToViewers(event: Extract<TerminalLifecycleEvent, { type: "sealed" }>) {
+    let frame: ArrayBuffer | null = null;
+    for (const connId of event.connIds) {
+      const conn = this.byId.get(connId);
+      if (!conn) continue;
+      if ((conn.socket.bufferedAmount ?? 0) > BROWSER_BUFFER_DETACH_BYTES) {
+        relaySessionManager.detachTerminalViewer(event.terminalId, conn.userId, conn.id);
+        this.send(conn, { type: "detached", terminalId: event.terminalId, reason: "slow" });
+        continue;
+      }
+      if (conn.socket.readyState !== 1) continue;
+      frame ??= encodeRelayBinaryFrame(
+        {
+          type: "term.sealed",
+          terminalId: event.terminalId,
+          seq: event.seq,
+          ...(event.epoch !== undefined ? { epoch: event.epoch } : {}),
+        },
         event.body,
-      ),
-    );
+      );
+      conn.socket.send(frame);
+    }
   }
 
   private async sendTerminalList(conn: BrowserConn) {
@@ -474,9 +546,11 @@ export class TerminalBrowserHub {
           available: availability.available,
           publicKey: availability.publicKey,
           reason: availability.reason,
+          // 2.5 CLIs: several tabs can view one terminal (v2 terminal crypto).
+          terminalViewers: relayProtocolAtLeast(live.get(row.id)?.protocolVersion, "2.5"),
         };
       }),
-      terminals: relaySessionManager.listTerminalsForUser(conn.userId),
+      terminals: relaySessionManager.listTerminalsForUser(conn.userId, conn.id),
     });
   }
 
@@ -489,18 +563,20 @@ export class TerminalBrowserHub {
   }
 
   private forwardAuth(conn: BrowserConn, terminalId: string, signature: string) {
-    const located = relaySessionManager.listTerminalsForUser(conn.userId);
-    if (!located.some((terminal) => terminal.terminalId === terminalId)) {
-      this.sendError(conn, "not_found", terminalId);
-      return;
-    }
-    relaySessionManager.forwardTerminalAuth(terminalId, conn.userId, signature);
+    const result = relaySessionManager.forwardTerminalAuth(
+      terminalId,
+      conn.userId,
+      conn.id,
+      signature,
+    );
+    if (result === "not_found") this.sendError(conn, "not_found", terminalId);
   }
 
   private async openTerminal(
     conn: BrowserConn,
     message: Extract<z.infer<typeof browserClientMessageSchema>, { type: "open" }>,
     terminalId: string,
+    viewerId: string,
   ) {
     const row = await this.ownedDevice(conn.userId, message.cliDeviceId);
     if (!row) {
@@ -515,7 +591,10 @@ export class TerminalBrowserHub {
     }
     const approvalRequired = live?.terminalApproval === true;
     const counts = relaySessionManager.terminalCounts(conn.userId, row.id);
-    if (!approvalRequired && (counts.user >= 4 || counts.cli >= 2)) {
+    if (
+      !approvalRequired &&
+      (counts.user >= TERMINAL_USER_LIMIT || counts.cli >= TERMINAL_CLI_LIMIT)
+    ) {
       this.sendError(conn, "limit", terminalId);
       return;
     }
@@ -529,7 +608,8 @@ export class TerminalBrowserHub {
       browserPublicKey: message.publicKey,
       browserNonce: message.nonce,
       ...(message.identity ? { identity: message.identity } : {}),
-      viewerId: conn.id,
+      connId: conn.id,
+      viewerId,
     });
     if (!started) this.sendError(conn, "offline", terminalId);
   }
@@ -541,12 +621,20 @@ export class TerminalBrowserHub {
     const result = relaySessionManager.attachTerminal({
       terminalId: message.terminalId,
       userId: conn.userId,
-      viewerId: conn.id,
+      connId: conn.id,
       browserPublicKey: message.publicKey,
       browserNonce: message.nonce,
       ...(message.identity ? { identity: message.identity } : {}),
     });
-    if (!result.ok) this.sendError(conn, "not_found", message.terminalId);
+    if (!result.ok) {
+      this.sendError(conn, result.error === "limit" ? "limit" : "not_found", message.terminalId);
+      return;
+    }
+    this.send(conn, {
+      type: "attaching",
+      terminalId: message.terminalId,
+      viewerId: result.viewerId,
+    });
   }
 
   private async ownedDevice(userId: string, cliDeviceId: string): Promise<CliListRow | null> {

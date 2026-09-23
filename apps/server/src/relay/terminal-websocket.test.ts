@@ -2,7 +2,11 @@ import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credentia
 import { Hono } from "hono";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { encodeRelayBinaryFrame, RELAY_REQUEST_BODY_WINDOW_CHUNKS } from "./protocol.js";
+import {
+  encodeRelayBinaryFrame,
+  parseRelayBinaryFrame,
+  RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+} from "./protocol.js";
 
 const limiterState = vi.hoisted(() => ({ fail: false }));
 const sessions = vi.hoisted(() => ({
@@ -116,11 +120,13 @@ function nonce(): string {
   return Buffer.alloc(16, 5).toString("base64url");
 }
 
-function hello(
-  slug: string,
-  protocol: "2.4" | "2.1",
-  features?: { humanTerminal?: boolean; terminalSupported?: boolean },
-) {
+type CliFeatures = {
+  humanTerminal?: boolean;
+  terminalSupported?: boolean;
+  terminalApproval?: boolean;
+};
+
+function hello(slug: string, protocol: "2.5" | "2.4" | "2.1", features?: CliFeatures) {
   if (protocol === "2.1") {
     return JSON.stringify({
       type: "hello",
@@ -147,13 +153,13 @@ function hello(
   return JSON.stringify({
     type: "hello",
     id: `hello-${slug}`,
-    protocolVersion: "2.4",
+    protocolVersion: protocol,
     cli: {
       slug,
       label: slug,
       version: "9.9.9",
       capabilities: {
-        protocolVersion: "2.4",
+        protocolVersion: protocol,
         inventoryAck: true,
         inventoryReplace: true,
         endpointTargeting: true,
@@ -169,10 +175,11 @@ function hello(
         features: {
           humanTerminal: features?.humanTerminal ?? true,
           mcpCommands: false,
-          terminalApproval: false,
+          terminalApproval: features?.terminalApproval ?? false,
           terminalSupported: features?.terminalSupported ?? true,
         },
         terminalPublicKey: uncompressedKey(),
+        ...(protocol === "2.5" ? { terminalViewers: true } : {}),
       },
     },
     endpoints: [],
@@ -213,8 +220,8 @@ function middlewareApp() {
 
 async function connectCli(
   slug: string,
-  protocol: "2.4" | "2.1" = "2.4",
-  features?: { humanTerminal?: boolean; terminalSupported?: boolean },
+  protocol: "2.5" | "2.4" | "2.1" = "2.4",
+  features?: CliFeatures,
 ) {
   const socket = new FakeSocket();
   relaySessionManager.acceptAuthenticatedSocket({ socket, identity, now });
@@ -606,5 +613,346 @@ describe("terminal browser hub", () => {
     expect(JSON.stringify(errorSpy.mock.calls)).not.toContain("SECRET_DB_MESSAGE");
     expect(JSON.stringify(errorSpy.mock.calls)).toContain("Error");
     errorSpy.mockRestore();
+  });
+
+  describe("protocol 2.5 viewers", () => {
+    type Json = Record<string, unknown>;
+
+    function binaryFrames(socket: FakeSocket) {
+      return socket.sends
+        .filter((send): send is ArrayBuffer => typeof send !== "string")
+        .map((send) => parseRelayBinaryFrame(send).metadata);
+    }
+
+    async function send(browser: FakeSocket, message: Json) {
+      await terminalBrowserHub.handleText(browser, JSON.stringify(message));
+    }
+
+    async function cliSays(cli: FakeSocket, message: Json) {
+      await relaySessionManager.handleTextFrame(cli, JSON.stringify(message));
+    }
+
+    /** Browser A opens on a 2.5 CLI; the CLI spawns. */
+    async function openShared(features?: CliFeatures) {
+      const cli = await connectCli("one", "2.5", features);
+      const a = attachBrowser();
+      await open(a, "one");
+      const opening = a.jsonSends().find((message) => message.type === "opening");
+      const termOpen = cli.jsonSends().find((message) => message.type === "term.open");
+      const terminalId = termOpen?.terminalId as string;
+      expect(opening).toEqual({ type: "opening", terminalId, viewerId: termOpen?.viewerId });
+      const aViewer = termOpen?.viewerId as string;
+      await cliSays(cli, { type: "term.opened", terminalId, viewerId: aViewer, cliNonce: nonce() });
+      return { cli, a, terminalId, aViewer };
+    }
+
+    async function join(cli: FakeSocket, terminalId: string, approve = true) {
+      const browser = attachBrowser();
+      await send(browser, {
+        type: "attach",
+        terminalId,
+        publicKey: uncompressedKey(),
+        nonce: nonce(),
+      });
+      const attaching = browser.jsonSends().find((message) => message.type === "attaching");
+      const termAttach = cli.jsonSends().at(-1);
+      expect(termAttach).toMatchObject({ type: "term.attach", terminalId });
+      expect(attaching).toEqual({ type: "attaching", terminalId, viewerId: termAttach?.viewerId });
+      const viewerId = termAttach?.viewerId as string;
+      if (approve) {
+        await cliSays(cli, { type: "term.attached", terminalId, viewerId, cliNonce: nonce() });
+      }
+      return { browser, viewerId };
+    }
+
+    it("lets two tabs view one terminal, with unicast and broadcast routing", async () => {
+      const { cli, a, terminalId, aViewer } = await openShared();
+      const { browser: b, viewerId: bViewer } = await join(cli, terminalId);
+      expect(bViewer).not.toBe(aViewer);
+      expect([...a.jsonSends(), ...b.jsonSends()].some((m) => m.type === "detached")).toBe(false);
+      expect(a.jsonSends().at(-1)).toEqual({
+        type: "viewers",
+        terminalId,
+        count: 2,
+        writer: "you",
+      });
+      expect(b.jsonSends().at(-2)).toMatchObject({ type: "attached", terminalId });
+      expect(b.jsonSends().at(-1)).toEqual({
+        type: "viewers",
+        terminalId,
+        count: 2,
+        writer: "other",
+      });
+
+      const body = new Uint8Array([4, 5]);
+      relaySessionManager.handleBinaryFrame(
+        cli,
+        encodeRelayBinaryFrame(
+          { type: "term.sealed", terminalId, seq: 1, viewerId: bViewer },
+          body,
+        ),
+      );
+      relaySessionManager.handleBinaryFrame(
+        cli,
+        encodeRelayBinaryFrame({ type: "term.sealed", terminalId, seq: 7, epoch: 2 }, body),
+      );
+      relaySessionManager.handleBinaryFrame(
+        cli,
+        encodeRelayBinaryFrame(
+          {
+            type: "term.sealed",
+            terminalId,
+            seq: 8,
+            viewerId: Buffer.alloc(16, 1).toString("base64url"),
+          },
+          body,
+        ),
+      );
+      expect(binaryFrames(a)).toEqual([{ type: "term.sealed", terminalId, seq: 7, epoch: 2 }]);
+      expect(binaryFrames(b)).toEqual([
+        { type: "term.sealed", terminalId, seq: 1 },
+        { type: "term.sealed", terminalId, seq: 7, epoch: 2 },
+      ]);
+
+      db.cliDevice.findMany.mockResolvedValue([device("one")]);
+      await send(b, { type: "list" });
+      const listed = b.jsonSends().find((message) => message.type === "terminals");
+      expect(listed?.clis).toEqual([expect.objectContaining({ terminalViewers: true })]);
+      expect(listed?.terminals).toEqual([
+        expect.objectContaining({
+          terminalId,
+          viewerAttached: true,
+          viewerCount: 2,
+          attachedHere: true,
+          writerHere: false,
+        }),
+      ]);
+    });
+
+    it("stamps the viewer id on input and refuses a browser-supplied viewer id", async () => {
+      const { cli, terminalId } = await openShared();
+      const { browser: b, viewerId: bViewer } = await join(cli, terminalId);
+      terminalBrowserHub.handleBinary(
+        b,
+        encodeRelayBinaryFrame({ type: "term.sealed", terminalId, seq: 1 }, new Uint8Array([1])),
+      );
+      expect(binaryFrames(cli)).toEqual([
+        { type: "term.sealed", terminalId, seq: 1, viewerId: bViewer },
+      ]);
+      terminalBrowserHub.handleBinary(
+        b,
+        encodeRelayBinaryFrame(
+          { type: "term.sealed", terminalId, seq: 2, viewerId: bViewer },
+          new Uint8Array([1]),
+        ),
+      );
+      terminalBrowserHub.handleBinary(
+        b,
+        encodeRelayBinaryFrame(
+          { type: "term.sealed", terminalId, seq: 3, epoch: 1 },
+          new Uint8Array([1]),
+        ),
+      );
+      expect(binaryFrames(cli)).toHaveLength(1);
+      expect(b.jsonSends().filter((message) => message.code === "invalid")).toHaveLength(2);
+    });
+
+    it("detaches one tab on X, reports it, and forwards writer changes", async () => {
+      const { cli, a, terminalId, aViewer } = await openShared();
+      const { browser: b, viewerId: bViewer } = await join(cli, terminalId);
+      await cliSays(cli, { type: "term.writer", terminalId, viewerId: bViewer });
+      expect(a.jsonSends().at(-1)).toEqual({
+        type: "viewers",
+        terminalId,
+        count: 2,
+        writer: "other",
+      });
+      expect(b.jsonSends().at(-1)).toEqual({
+        type: "viewers",
+        terminalId,
+        count: 2,
+        writer: "you",
+      });
+
+      await send(b, { type: "detach", terminalId });
+      expect(b.jsonSends().at(-1)).toEqual({ type: "detached", terminalId, reason: "self" });
+      expect(cli.jsonSends().at(-1)).toEqual({
+        type: "term.detach",
+        terminalId,
+        viewerId: bViewer,
+      });
+      expect(a.jsonSends().at(-1)).toEqual({
+        type: "viewers",
+        terminalId,
+        count: 1,
+        writer: "none",
+      });
+      expect(cli.jsonSends().some((message) => message.type === "term.close")).toBe(false);
+
+      await send(b, { type: "detach", terminalId });
+      expect(b.jsonSends().at(-1)).toMatchObject({ type: "error", code: "not_found" });
+
+      // Closing the last tab leaves the shell running for a later attach.
+      terminalBrowserHub.handleClose(a);
+      expect(cli.jsonSends().at(-1)).toEqual({
+        type: "term.detach",
+        terminalId,
+        viewerId: aViewer,
+      });
+      expect(relaySessionManager.listTerminalsForUser("user-id")).toEqual([
+        expect.objectContaining({ terminalId, viewerCount: 0, viewerAttached: false }),
+      ]);
+    });
+
+    it("detaches only the slow tab when its buffer passes 4 MiB", async () => {
+      const { cli, a, terminalId, aViewer } = await openShared();
+      const { browser: b } = await join(cli, terminalId);
+      a.bufferedAmount = 4 * 1024 * 1024 + 1;
+      relaySessionManager.handleBinaryFrame(
+        cli,
+        encodeRelayBinaryFrame(
+          { type: "term.sealed", terminalId, seq: 1, epoch: 1 },
+          new Uint8Array([1]),
+        ),
+      );
+      expect(a.jsonSends().at(-1)).toEqual({ type: "detached", terminalId, reason: "slow" });
+      expect(binaryFrames(a)).toEqual([]);
+      expect(binaryFrames(b)).toEqual([{ type: "term.sealed", terminalId, seq: 1, epoch: 1 }]);
+      expect(cli.jsonSends().at(-1)).toEqual({
+        type: "term.detach",
+        terminalId,
+        viewerId: aViewer,
+      });
+      expect(b.jsonSends().at(-1)).toEqual({
+        type: "viewers",
+        terminalId,
+        count: 1,
+        writer: "none",
+      });
+
+      relaySessionManager.handleBinaryFrame(
+        cli,
+        encodeRelayBinaryFrame(
+          { type: "term.sealed", terminalId, seq: 2, epoch: 2 },
+          new Uint8Array([1]),
+        ),
+      );
+      expect(binaryFrames(b)).toHaveLength(2);
+      expect(a.jsonSends().filter((message) => message.type === "detached")).toHaveLength(1);
+    });
+
+    it("approves tabs independently and sends exit to every viewer", async () => {
+      const { cli, a, terminalId } = await openShared({ terminalApproval: true });
+      const { browser: b, viewerId: bViewer } = await join(cli, terminalId, false);
+      const { browser: c, viewerId: cViewer } = await join(cli, terminalId, false);
+      await cliSays(cli, {
+        type: "term.pending",
+        terminalId,
+        viewerId: bViewer,
+        cliNonce: nonce(),
+        approvalCode: "ABCDEFGH",
+      });
+      await cliSays(cli, {
+        type: "term.pending",
+        terminalId,
+        viewerId: cViewer,
+        cliNonce: nonce(),
+      });
+      expect(b.jsonSends().filter((message) => message.type === "pending")).toEqual([
+        expect.objectContaining({ approvalCode: "ABCDEFGH" }),
+      ]);
+      expect(c.jsonSends().filter((message) => message.type === "pending")).toHaveLength(1);
+      expect(a.jsonSends().some((message) => message.type === "pending")).toBe(false);
+
+      await send(c, { type: "auth", terminalId, signature: "c2lnbmF0dXJl" });
+      expect(cli.jsonSends().at(-1)).toEqual({
+        type: "term.auth",
+        terminalId,
+        viewerId: cViewer,
+        signature: "c2lnbmF0dXJl",
+      });
+      await cliSays(cli, {
+        type: "term.attached",
+        terminalId,
+        viewerId: cViewer,
+        cliNonce: nonce(),
+      });
+      await cliSays(cli, {
+        type: "term.rejected",
+        terminalId,
+        viewerId: bViewer,
+        reason: "denied",
+      });
+      expect(b.jsonSends().at(-1)).toEqual({ type: "rejected", terminalId, reason: "denied" });
+      expect(c.jsonSends().some((message) => message.type === "rejected")).toBe(false);
+      expect(a.jsonSends().some((message) => message.type === "rejected")).toBe(false);
+
+      await cliSays(cli, { type: "term.exit", terminalId, exitCode: 0 });
+      expect(a.jsonSends().at(-1)).toEqual({ type: "exit", terminalId, exitCode: 0 });
+      expect(c.jsonSends().at(-1)).toEqual({ type: "exit", terminalId, exitCode: 0 });
+      expect(b.jsonSends().some((message) => message.type === "exit")).toBe(false);
+    });
+
+    it("refuses a ninth viewer with limit", async () => {
+      const { cli, terminalId } = await openShared({ terminalApproval: true });
+      for (let index = 0; index < 7; index += 1) await join(cli, terminalId, false);
+      const ninth = attachBrowser();
+      await send(ninth, {
+        type: "attach",
+        terminalId,
+        publicKey: uncompressedKey(),
+        nonce: nonce(),
+      });
+      expect(ninth.jsonSends().at(-1)).toMatchObject({ type: "error", code: "limit", terminalId });
+      expect(cli.jsonSends().filter((message) => message.type === "term.attach")).toHaveLength(7);
+    });
+
+    it("caps input per terminal across every tab", async () => {
+      const { cli, a, terminalId } = await openShared();
+      const { browser: b } = await join(cli, terminalId);
+      const { browser: c } = await join(cli, terminalId);
+      let seq = 0;
+      for (const browser of [a, b, c]) {
+        for (let index = 0; index < 250; index += 1) {
+          seq += 1;
+          terminalBrowserHub.handleBinary(
+            browser,
+            encodeRelayBinaryFrame({ type: "term.sealed", terminalId, seq }, new Uint8Array([1])),
+          );
+        }
+      }
+      expect(binaryFrames(cli)).toHaveLength(600);
+      expect(a.jsonSends().some((message) => message.code === "input_dropped")).toBe(false);
+      expect(c.jsonSends().filter((message) => message.code === "input_dropped")).toHaveLength(1);
+    });
+  });
+
+  it("keeps the 2.4 steal: a second tab takes the terminal and the first hears detached", async () => {
+    const cli = await connectCli("one");
+    const a = attachBrowser();
+    await open(a, "one");
+    const termOpen = cli.jsonSends().find((message) => message.type === "term.open");
+    expect(termOpen).not.toHaveProperty("viewerId");
+    const terminalId = termOpen?.terminalId as string;
+    await relaySessionManager.handleTextFrame(
+      cli,
+      JSON.stringify({ type: "term.opened", terminalId, cliNonce: nonce() }),
+    );
+    const b = attachBrowser();
+    await terminalBrowserHub.handleText(
+      b,
+      JSON.stringify({ type: "attach", terminalId, publicKey: uncompressedKey(), nonce: nonce() }),
+    );
+    expect(a.jsonSends().at(-1)).toEqual({ type: "detached", terminalId });
+    expect(cli.jsonSends().at(-1)).not.toHaveProperty("viewerId");
+    expect(b.jsonSends().at(-1)).toMatchObject({ type: "attaching", terminalId });
+    expect([...a.jsonSends(), ...b.jsonSends()].some((m) => m.type === "viewers")).toBe(false);
+    db.cliDevice.findMany.mockResolvedValue([device("one")]);
+    await terminalBrowserHub.handleText(b, JSON.stringify({ type: "list" }));
+    const listed = b.jsonSends().find((message) => message.type === "terminals");
+    expect(listed?.clis).toEqual([expect.objectContaining({ terminalViewers: false })]);
+    expect(listed?.terminals).toEqual([
+      expect.objectContaining({ viewerCount: 1, attachedHere: true, writerHere: true }),
+    ]);
   });
 });

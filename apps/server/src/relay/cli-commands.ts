@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import prisma from "@ws-model-proxy/db";
+import { relayProtocolAtLeast } from "./protocol.js";
 import { relaySessionManager, type TrackedCliCommand } from "./session-manager.js";
 
 const HEAD_MAX_BYTES = 8192;
@@ -202,7 +203,9 @@ export async function startCliCommand(input: {
   if (!device.allowMcpCommands) return { ok: false, error: "grant_disabled" };
 
   const live = relaySessionManager.getLiveCliFeatures([input.cliDeviceId]).get(input.cliDeviceId);
-  if (live?.protocolVersion !== "2.4") return { ok: false, error: "offline" };
+  if (!live || !relayProtocolAtLeast(live.protocolVersion, "2.4")) {
+    return { ok: false, error: "offline" };
+  }
   if (!live.mcpCommands) return { ok: false, error: "feature_disabled" };
 
   const counts = runningCounts(input.userId, input.cliDeviceId);
