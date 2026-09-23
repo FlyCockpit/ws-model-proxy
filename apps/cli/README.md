@@ -108,6 +108,21 @@ The terminals page shows each CLI's fingerprint: base32 of the first 20 bytes of
   prints the file path.
 - Linux tip: `loginctl enable-linger "$USER"` keeps a user service running after
   logout.
+- **Shutdown (Unix).** SIGTERM (`wsmp daemon stop`, `systemctl stop`), SIGINT
+  (Ctrl-C), and SIGHUP stop the relay cleanly in foreground, detached, and
+  service modes: it kills every running MCP exec command (its whole process
+  group) and every terminal (every process in the shell's session), tells the
+  server they ended, closes the websocket, and removes the control socket and
+  PID file. It then exits from the same signal (status 143, 130, or 129). A
+  signal the relay inherited as ignored, such as SIGHUP under `nohup`, stays
+  ignored. Cleanup gets 5 seconds; after that, or on a second signal, the relay
+  kills the tracked process groups and sessions directly, removes its files,
+  and exits at once.
+- **SIGKILL (`kill -9`) cannot be caught.** It is the one way to stop the relay
+  that leaves exec commands and terminal processes running, untracked. Prefer
+  SIGTERM; if a relay was killed with SIGKILL, find leftovers with
+  `ps -o pid,pgid,sid,args` and end them yourself. On Windows, Ctrl-C is not
+  handled yet and uses the platform default.
 
 ### Media expansion for local upstreams
 
@@ -164,6 +179,7 @@ path (never the URL signature).
 | 1 | runtime error |
 | 2 | usage error |
 | 3 | not found |
+| 128 + signal | the relay stopped on SIGHUP (129), SIGINT (130), or SIGTERM (143); on Unix it dies from that signal after cleanup |
 
 ## Install After Release
 

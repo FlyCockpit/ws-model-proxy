@@ -401,6 +401,8 @@ enum RelaySessionError {
     Fatal(anyhow::Error),
     /// The server rejected the first 2.5 hello; reconnect now with 2.4.
     ProtocolDowngrade,
+    /// A shutdown signal arrived; the session has already cleaned up.
+    Shutdown(i32),
 }
 
 type RelaySessionResult<T> = std::result::Result<T, RelaySessionError>;
@@ -427,7 +429,19 @@ pub fn ensure_cli_slug(config: &mut Config) -> Result<String> {
     Ok(slug)
 }
 
+/// Stop the relay after a shutdown signal. `main` maps this to the signal's
+/// exit status.
+fn check_shutdown() -> Result<()> {
+    match crate::shutdown::requested() {
+        Some(signal) => Err(crate::shutdown::ShutdownRequested { signal }.into()),
+        None => Ok(()),
+    }
+}
+
 pub fn connect_foreground() -> Result<()> {
+    // First, before any thread exists, so every thread inherits the blocked
+    // shutdown signals and only the watcher thread takes them.
+    crate::shutdown::install()?;
     let mut config = Config::load_required()?;
     config.validate()?;
     let mut control = ControlServer::bind()?;
@@ -441,6 +455,7 @@ pub fn connect_foreground() -> Result<()> {
     // Sticky for the process: at most one 2.5 -> 2.4 downgrade.
     let mut negotiation = ProtocolNegotiation::new();
     loop {
+        check_shutdown()?;
         // Reuse only a locally unchanged snapshot that the server has already
         // acknowledged. Reconnect registration still replaces the server
         // inventory, but no network probe or config rewrite is needed.
@@ -520,6 +535,10 @@ pub fn connect_foreground() -> Result<()> {
                 );
             }
             Err(RelaySessionError::Fatal(error)) => return Err(error),
+            Err(RelaySessionError::Shutdown(signal)) => {
+                tracing::info!(signal, "relay stopped cleanly after a shutdown signal");
+                return Err(crate::shutdown::ShutdownRequested { signal }.into());
+            }
         }
         acknowledged_config_modified_at =
             acknowledged_inventory_matches_config(&config, last_inventory_revision.as_ref())
@@ -648,6 +667,7 @@ fn wait_for_reconnect(
 ) -> Result<()> {
     let deadline = Instant::now() + delay;
     while Instant::now() < deadline {
+        check_shutdown()?;
         for pending in control.drain()? {
             if matches!(pending.request.command, ControlCommand::Status) {
                 let desired = desired_config_snapshot().unwrap_or_else(|error| {
@@ -688,7 +708,7 @@ fn wait_for_reconnect(
     delay: Duration,
 ) -> Result<()> {
     thread::sleep(delay);
-    Ok(())
+    check_shutdown()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -775,6 +795,9 @@ fn run_relay_session(
     let mut next_heartbeat =
         Instant::now() + Duration::from_secs(RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS);
     let result = loop {
+        if let Some(signal) = crate::shutdown::requested() {
+            break Err(RelaySessionError::Shutdown(signal));
+        }
         if let Err(error) = drain_worker_output(
             &mut socket,
             config,
@@ -962,6 +985,16 @@ fn run_relay_session(
     let _ = send_outbound_frames(&mut socket, terminals.kill_all());
     let _ = send_outbound_frames(&mut socket, execs.kill_all());
     abort_all_workers(workers);
+    if matches!(result, Err(RelaySessionError::Shutdown(_))) {
+        // The connection is still open: say goodbye so the server marks the
+        // CLI offline now instead of waiting for a heartbeat timeout. The
+        // shutdown deadline bounds a peer that never answers.
+        let _ = socket.close(Some(tungstenite::protocol::CloseFrame {
+            code: tungstenite::protocol::frame::coding::CloseCode::Away,
+            reason: "cli shutting down".into(),
+        }));
+        let _ = socket.flush();
+    }
     result
 }
 

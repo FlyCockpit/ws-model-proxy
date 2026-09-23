@@ -354,6 +354,9 @@ fn spawn_detached_child(executable: &Path, token: &str) -> Result<std::process::
 }
 
 fn run_foreground(detach_token: Option<&str>) -> Result<()> {
+    // Take shutdown signals before claiming the PID file, so a stop that
+    // lands during startup still removes it.
+    crate::shutdown::install()?;
     // Only the detached child claims the shared PID file. Foreground runs and
     // OS service units leave lifecycle tracking to the terminal / service manager.
     let guard = if let Some(token) = detach_token {
@@ -373,6 +376,22 @@ fn run_foreground(detach_token: Option<&str>) -> Result<()> {
 struct PidFileGuard {
     path: PathBuf,
     record: PidRecord,
+    /// Removes the PID file if a forced shutdown skips `Drop`.
+    _exit_cleanup: crate::shutdown::ExitCleanup,
+}
+
+impl PidFileGuard {
+    fn new(path: PathBuf, record: PidRecord) -> Self {
+        let (cleanup_path, cleanup_record) = (path.clone(), record.clone());
+        let exit_cleanup = crate::shutdown::register_exit_cleanup(move || {
+            let _ = remove_pid_file_if_matches(&cleanup_path, &cleanup_record);
+        });
+        Self {
+            path,
+            record,
+            _exit_cleanup: exit_cleanup,
+        }
+    }
 }
 
 impl Drop for PidFileGuard {
@@ -396,7 +415,7 @@ fn claim_pid_file(token: String) -> Result<PidFileGuard> {
     // One retry after clearing a verified-stale (or corrupt leftover) record.
     for attempt in 0..2 {
         match write_pid_file_exclusive(&path, body.as_bytes()) {
-            Ok(()) => return Ok(PidFileGuard { path, record }),
+            Ok(()) => return Ok(PidFileGuard::new(path, record)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
                 match read_pid_record(&path) {
                     Ok(Some(existing)) => {

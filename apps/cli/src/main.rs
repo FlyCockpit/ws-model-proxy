@@ -12,7 +12,7 @@ use clap::Parser;
 
 use wsmp::cli::{Cli, Command};
 use wsmp::exit::ExitCode;
-use wsmp::{commands, exit, logging, output};
+use wsmp::{commands, exit, logging, output, shutdown};
 
 fn main() {
     let cli = Cli::parse();
@@ -22,6 +22,12 @@ fn main() {
         Ok(()) => ExitCode::Success,
         Err(err) if exit::is_broken_pipe(&err) => ExitCode::Success,
         Err(err) => {
+            // A relay stopped by SIGTERM/SIGINT/SIGHUP has already cleaned
+            // up; die from the same signal so the parent sees the usual status.
+            if let Some(signal) = shutdown::signal_of(&err) {
+                let _ = output::flush_stdout();
+                shutdown::terminate_by_signal(signal);
+            }
             // Identifiers in error messages are wrapped in `backticks`, never
             // 'single quotes' — see AGENTS.md.
             let _ = output::diagnostic(format!("error: {}", exit::message_for(&err)));

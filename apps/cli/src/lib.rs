@@ -21,6 +21,7 @@ pub mod probe;
 pub mod protocol;
 pub mod relay_bus;
 pub mod sessions;
+pub mod shutdown;
 pub mod slug;
 pub mod startup;
 pub mod state;

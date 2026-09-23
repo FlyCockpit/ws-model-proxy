@@ -8,6 +8,9 @@
 //!   2  usage error (clap emits this automatically for bad arguments)
 //!   3  the requested resource was not found
 //!
+//! A relay stopped by SIGHUP, SIGINT, or SIGTERM cleans up and then dies from
+//! that signal (shell status 128 + signal); see `crate::shutdown`.
+//!
 //! To give a specific error a non-default code, attach a [`CodedError`] via
 //! `.context(CodedError::new(ExitCode::NotFound))` and [`code_for`] will pick it
 //! up. The surrounding error should describe the concrete failure.

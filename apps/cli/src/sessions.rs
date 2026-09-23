@@ -12,6 +12,10 @@
 //! process-group kill: only the direct child is terminated, so grandchildren of
 //! an exec may survive.
 //!
+//! Every live Unix exec group and PTY session is also recorded in a global
+//! list, so a forced shutdown (`crate::shutdown`) can kill them from another
+//! thread with [`kill_tracked_children`] when the relay thread is stuck.
+//!
 //! Terminal input never blocks the relay loop. Each terminal has a writer
 //! thread fed by a queue of at most [`INPUT_QUEUE_LIMIT`] pending bytes; when
 //! the program is not reading and the queue is full, further input is dropped
@@ -728,6 +732,77 @@ fn kill_session(leader: u32) {
     }
 }
 
+/// A child the relay thread owns, recorded so a forced shutdown can kill it
+/// from another thread without the registries.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveChild {
+    /// An exec shell: the leader of its own process group.
+    ExecGroup(u32),
+    /// A PTY shell: the leader of its own session.
+    PtySession(u32),
+}
+
+#[cfg(unix)]
+static LIVE_CHILDREN: Mutex<BTreeMap<u64, LiveChild>> = Mutex::new(BTreeMap::new());
+#[cfg(unix)]
+static NEXT_LIVE_CHILD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Removes its child from [`LIVE_CHILDREN`] when the session that owns the
+/// child is dropped.
+#[cfg(unix)]
+struct LiveChildGuard(u64);
+
+#[cfg(unix)]
+impl LiveChildGuard {
+    fn track(child: LiveChild) -> Self {
+        let id = NEXT_LIVE_CHILD.fetch_add(1, Ordering::Relaxed);
+        LIVE_CHILDREN
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, child);
+        Self(id)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LiveChildGuard {
+    fn drop(&mut self) {
+        LIVE_CHILDREN
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+/// SIGKILL every exec process group and terminal session still running. Used
+/// by a forced shutdown (deadline or second signal) that cannot wait for the
+/// relay thread's registries; it does not reap and sends no frames.
+pub fn kill_tracked_children() {
+    #[cfg(unix)]
+    kill_live_children(|_| true);
+}
+
+#[cfg(unix)]
+fn kill_live_children(select: impl Fn(&LiveChild) -> bool) {
+    let children = LIVE_CHILDREN
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .values()
+        .copied()
+        .filter(|child| select(child))
+        .collect::<Vec<_>>();
+    for child in children {
+        match child {
+            LiveChild::ExecGroup(pid) => kill_process_group(pid, false),
+            LiveChild::PtySession(pid) => {
+                kill_session(pid);
+                kill_process_group(pid, false);
+            }
+        }
+    }
+}
+
 /// Browser input waiting for a terminal's writer thread.
 #[cfg(unix)]
 struct InputQueue {
@@ -892,6 +967,8 @@ struct PtyRuntime {
     reader: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     pid: Option<u32>,
+    /// Dropped after `shutdown_pty` has killed and reaped the session.
+    _tracked: Option<LiveChildGuard>,
 }
 
 #[cfg(unix)]
@@ -2248,6 +2325,7 @@ fn spawn_pty(
     )?;
     let child = pair.slave.spawn_command(command)?;
     let pid = child.process_id();
+    let tracked = pid.map(|pid| LiveChildGuard::track(LiveChild::PtySession(pid)));
     let stop = Arc::new(AtomicBool::new(false));
     let input = Arc::new(InputQueue::new());
     let writer_thread = pump_input(
@@ -2279,6 +2357,7 @@ fn spawn_pty(
         reader: Some(thread),
         stop,
         pid,
+        _tracked: tracked,
     })
 }
 
@@ -2297,6 +2376,8 @@ struct ExecSession {
     pid: u32,
     /// Exit status and the instant `try_wait` reaped the direct child.
     reaped: Option<(Option<i32>, Option<i32>, Instant)>,
+    #[cfg(unix)]
+    _tracked: LiveChildGuard,
 }
 
 pub(crate) struct ExecRegistry {
@@ -2606,6 +2687,8 @@ fn spawn_exec(
     }
     let mut child = process.spawn()?;
     let pid = child.id();
+    #[cfg(unix)]
+    let tracked = LiveChildGuard::track(LiveChild::ExecGroup(pid));
     let stdout = child
         .stdout
         .take()
@@ -2661,6 +2744,8 @@ fn spawn_exec(
         finished: false,
         pid,
         reaped: None,
+        #[cfg(unix)]
+        _tracked: tracked,
     })
 }
 
@@ -4534,6 +4619,107 @@ mod tests {
         assert!(!process_running(bg), "background job {bg} survived close");
         assert!(!process_running(nohup), "nohup job {nohup} survived close");
         drop(terminals);
+        drop(rx);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forced_shutdown_kills_tracked_terminal_sessions_and_exec_groups() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bg_file = dir.path().join("bg.pid");
+        let exec_file = dir.path().join("exec.pid");
+        let script = format!(
+            "set -m; sleep 120 & echo $! > '{}'; wait",
+            bg_file.display()
+        );
+        let (tx, rx) = channel();
+        let mut terminals = TerminalRegistry::with_shell(
+            tx.clone(),
+            Duration::from_secs(60),
+            "/bin/sh",
+            &["-c", &script],
+        );
+        let startup = enabled_startup(false);
+        let browser = CliTerminalKey::generate().expect("browser");
+        let nonce = terminal_crypto::encode_b64url(&[9_u8; 16]);
+        terminals.open(
+            &startup,
+            &Config::default(),
+            None,
+            TermHandshake {
+                terminal_id: "forced",
+                viewer_id: None,
+                cols: 80,
+                rows: 24,
+                browser_public_key: browser.public_b64url(),
+                browser_nonce: &nonce,
+                identity: None,
+            },
+        );
+        let shell = terminals
+            .sessions
+            .get("forced")
+            .and_then(|session| session.pty.as_ref())
+            .and_then(|pty| pty.pid)
+            .expect("shell pid");
+        let mut execs = ExecRegistry::new(tx, DEFAULT_EXEC_TIMEOUT);
+        execs.start(
+            &startup,
+            &Config::default(),
+            "forced",
+            &format!("sleep 120 & echo $! > '{}'; wait", exec_file.display()),
+            Some(dir.path().to_str().expect("utf8")),
+        );
+        let exec = execs.pid("forced").expect("exec pid");
+        let read_pid = |path: &Path| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if let Ok(text) = std::fs::read_to_string(path)
+                    && let Ok(pid) = text.trim().parse::<u32>()
+                    && pid > 1
+                {
+                    return pid;
+                }
+                assert!(Instant::now() < deadline, "pid was not written");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let bg = read_pid(&bg_file);
+        let exec_grandchild = read_pid(&exec_file);
+        let ours = [LiveChild::PtySession(shell), LiveChild::ExecGroup(exec)];
+        {
+            let live = LIVE_CHILDREN.lock().expect("live children");
+            assert!(ours.iter().all(|child| live.values().any(|v| v == child)));
+        }
+
+        // Only this test's children: other tests run in parallel.
+        kill_live_children(|child| ours.contains(child));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while [shell, bg, exec, exec_grandchild]
+            .iter()
+            .any(|pid| process_running(*pid))
+            && Instant::now() < deadline
+        {
+            // The direct children are ours to reap.
+            let _ = reap_pid(Some(shell));
+            let _ = reap_pid(Some(exec));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for pid in [shell, bg, exec, exec_grandchild] {
+            assert!(
+                !process_running(pid),
+                "process {pid} survived a forced shutdown"
+            );
+        }
+
+        let _ = terminals.kill_all();
+        let _ = execs.kill_all();
+        let live = LIVE_CHILDREN.lock().expect("live children");
+        assert!(
+            ours.iter().all(|child| live.values().all(|v| v != child)),
+            "closed sessions leave the forced-shutdown list"
+        );
+        drop(live);
         drop(rx);
     }
 }
