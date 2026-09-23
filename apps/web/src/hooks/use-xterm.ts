@@ -40,6 +40,12 @@ function readTheme(element: HTMLElement): { foreground: string; background: stri
 
 export function useXterm(options: XtermOptions): {
   containerRef: RefCallback<HTMLDivElement>;
+  /**
+   * The element xterm is open in, or null before the pane mounts. Effects
+   * declared after this hook see a live xterm whenever this is non-null, and a
+   * new value means a new xterm instance.
+   */
+  host: HTMLDivElement | null;
   write: (data: Uint8Array) => void;
   reset: () => void;
   focus: () => void;
@@ -187,5 +193,5 @@ export function useXterm(options: XtermOptions): {
     [followRef, resizeQuietly],
   );
 
-  return { containerRef: setContainer, write, reset, focus, followResize };
+  return { containerRef: setContainer, host: container, write, reset, focus, followResize };
 }

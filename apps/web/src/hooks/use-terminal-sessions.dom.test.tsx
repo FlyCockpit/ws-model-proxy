@@ -32,6 +32,7 @@ import { createMemoryCliPinStore } from "@/lib/terminal-cli-identity";
 import {
   decodeSealedFrame,
   type ListedCli,
+  type SealedTerminalFrame,
   type TerminalClientMessage,
 } from "@/lib/terminal-protocol";
 
@@ -177,7 +178,9 @@ async function attachAsCli(
   attachIndex = 0,
   answerWith?: CliKey,
   /** Runs in the same act as `attached`, before the browser derives keys. */
-  afterAttached?: () => void,
+  afterAttached?: (cli: Cli) => void,
+  /** Frames sealed ahead, delivered right after `attached` (before `afterAttached`). */
+  sealEarly?: (cli: Cli) => Promise<SealedTerminalFrame[]>,
 ): Promise<Cli> {
   const attach = await waitFor(() => {
     const entry = sentOfType("attach")[attachIndex];
@@ -200,6 +203,8 @@ async function attachAsCli(
   const keys = viewerId
     ? await deriveTerminalSessionKeysV2({ ...args, viewerId })
     : await deriveTerminalSessionKeys(args);
+  const state: Cli = { keys, unicastSeq: 0n, viewerId };
+  const early = sealEarly ? await sealEarly(state) : [];
   // The 2.5 server names the viewer for 2.4 terminals too; v1 crypto ignores it.
   message({ type: "attaching", terminalId: TERMINAL_ID, viewerId: viewerId ?? VIEWER_ID });
   act(() => {
@@ -209,12 +214,13 @@ async function attachAsCli(
       cliPublicKey: bytesToBase64Url(cli.publicKeyRaw),
       cliNonce: bytesToBase64Url(cliNonce),
     });
-    afterAttached?.();
+    for (const frame of early) handlers().onSealed(frame);
+    afterAttached?.(state);
   });
-  return { keys, unicastSeq: 0n, viewerId };
+  return state;
 }
 
-async function unicast(cli: Cli, plaintext: Uint8Array) {
+async function sealUnicast(cli: Cli, plaintext: Uint8Array): Promise<SealedTerminalFrame> {
   cli.unicastSeq += 1n;
   const seq = cli.unicastSeq;
   const body = cli.viewerId
@@ -233,10 +239,20 @@ async function unicast(cli: Cli, plaintext: Uint8Array) {
         seq,
         plaintext,
       });
-  act(() => handlers().onSealed({ terminalId: TERMINAL_ID, seq: Number(seq), body }));
+  return { terminalId: TERMINAL_ID, seq: Number(seq), body };
 }
 
-async function broadcast(outKey: Uint8Array, epoch: number, seq: number, text: string) {
+async function unicast(cli: Cli, plaintext: Uint8Array) {
+  const frame = await sealUnicast(cli, plaintext);
+  act(() => handlers().onSealed(frame));
+}
+
+async function sealBroadcast(
+  outKey: Uint8Array,
+  epoch: number,
+  seq: number,
+  text: string,
+): Promise<SealedTerminalFrame> {
   const body = await sealTerminalBroadcast({
     key: await importTerminalOutputKey(outKey),
     terminalId: TERMINAL_ID,
@@ -244,7 +260,34 @@ async function broadcast(outKey: Uint8Array, epoch: number, seq: number, text: s
     seq: BigInt(seq),
     plaintext: encodeTerminalData(new TextEncoder().encode(text)),
   });
-  act(() => handlers().onSealed({ terminalId: TERMINAL_ID, seq, epoch, body }));
+  return { terminalId: TERMINAL_ID, seq, epoch, body };
+}
+
+async function broadcast(outKey: Uint8Array, epoch: number, seq: number, text: string) {
+  const frame = await sealBroadcast(outKey, epoch, seq, text);
+  act(() => handlers().onSealed(frame));
+}
+
+function text(value: string): Uint8Array {
+  return encodeTerminalData(new TextEncoder().encode(value));
+}
+
+/** A tab for the listed terminal, with output collected from the start. */
+async function listAndSubscribe() {
+  currentCli = await fakeCli();
+  const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
+  message({
+    type: "terminals",
+    clis: [await listedCli(currentCli, true)],
+    terminals: [listedTerminal(true)],
+  });
+  const localId = view.result.current.tabs[0]?.localId;
+  if (!localId) throw new Error("no tab");
+  const events: TerminalOutputEvent[] = [];
+  act(() => {
+    view.result.current.subscribeOutput(localId, (event) => events.push(event));
+  });
+  return { view, localId, events };
 }
 
 /** Browser frames as the CLI would open them. */
@@ -418,6 +461,117 @@ describe("useTerminalSessions (protocol 2.5)", () => {
     act(() => view.result.current.endSession(localId));
     expect(sentOfType("close")).toEqual([{ type: "close", terminalId: TERMINAL_ID }]);
     expect(sentOfType("detach")).toEqual([]);
+  });
+});
+
+describe("useTerminalSessions shell exit", () => {
+  it("delivers every frame received before exit, in order, then ends the session", async () => {
+    const { view, cli, localId, events, outKey } = await setupV2();
+    const nextKey = crypto.getRandomValues(new Uint8Array(32));
+    const frames = [
+      await sealBroadcast(outKey, 1, 1, "a"),
+      await sealUnicast(cli, text("b")),
+      // Epoch 2 output arrives before its key; the key comes next.
+      await sealBroadcast(nextKey, 2, 1, "d"),
+      await sealUnicast(cli, encodeTerminalOutputKey(2, nextKey)),
+      await sealUnicast(cli, text("c")),
+      await sealBroadcast(nextKey, 2, 2, "e"),
+    ];
+    const late = await sealUnicast(cli, text("late"));
+    // All of it lands in one tick, still queued behind decryption, then exit.
+    act(() => {
+      for (const frame of frames) handlers().onSealed(frame);
+      handlers().onMessage({ type: "exit", terminalId: TERMINAL_ID, exitCode: 0, signal: null });
+      handlers().onSealed(late);
+    });
+    expect(view.result.current.tabs[0]?.phase).toBe("exited");
+    // The queued epoch-2 frame opens once the key that follows it is read.
+    await waitFor(() => expect(outputText(events)).toBe("hello abdce"));
+    await sleep(30);
+    expect(outputText(events)).toBe("hello abdce");
+    expect(view.result.current.tabs[0]?.phase).toBe("exited");
+    // The session is gone: input goes nowhere and later output is dropped.
+    act(() => view.result.current.sendInput(localId, "x"));
+    await unicast(cli, text("after"));
+    await sleep(30);
+    expect(socket.sendFrame).not.toHaveBeenCalled();
+    expect(outputText(events)).toBe("hello abdce");
+  });
+
+  it("delivers early frames when the shell exits while keys are derived", async () => {
+    const { view, events } = await listAndSubscribe();
+    await attachAsCli(
+      VIEWER_ID,
+      0,
+      undefined,
+      () =>
+        handlers().onMessage({ type: "exit", terminalId: TERMINAL_ID, exitCode: 0, signal: null }),
+      async (cli) => [await sealUnicast(cli, text("last ")), await sealUnicast(cli, text("words"))],
+    );
+    await waitFor(() => expect(outputText(events)).toBe("last words"));
+    await sleep(30);
+    expect(view.result.current.tabs[0]?.phase).toBe("exited");
+  });
+});
+
+describe("useTerminalSessions handshake after the tab ended", () => {
+  it("does not revive a tab whose shell exited during key derivation", async () => {
+    const { view } = await listAndSubscribe();
+    const cli = await attachAsCli(VIEWER_ID, 0, undefined, () =>
+      handlers().onMessage({ type: "exit", terminalId: TERMINAL_ID, exitCode: 0, signal: null }),
+    );
+    await sleep(50);
+    expect(view.result.current.tabs[0]?.phase).toBe("exited");
+    const localId = view.result.current.tabs[0]?.localId ?? "";
+    act(() => view.result.current.sendInput(localId, "x"));
+    await unicast(cli, text("ghost"));
+    await sleep(30);
+    expect(socket.sendFrame).not.toHaveBeenCalled();
+    expect(view.result.current.tabs[0]?.phase).toBe("exited");
+  });
+
+  it("does not revive a tab refused during key derivation", async () => {
+    const { view, events } = await listAndSubscribe();
+    const cli = await attachAsCli(VIEWER_ID, 0, undefined, () =>
+      handlers().onMessage({
+        type: "rejected",
+        terminalId: TERMINAL_ID,
+        reason: "denied",
+        approvalCode: null,
+      }),
+    );
+    await sleep(50);
+    expect(view.result.current.tabs[0]).toMatchObject({
+      phase: "rejected",
+      rejectionReason: "denied",
+    });
+    await unicast(cli, text("ghost"));
+    await sleep(30);
+    expect(events).toEqual([]);
+  });
+
+  it("does not recreate a session for a tab closed during key derivation", async () => {
+    const { view, localId, events } = await listAndSubscribe();
+    const cli = await attachAsCli(VIEWER_ID, 0, undefined, () =>
+      view.result.current.detachTab(localId),
+    );
+    await sleep(50);
+    expect(view.result.current.tabs).toEqual([]);
+    expect(sentOfType("detach")).toEqual([{ type: "detach", terminalId: TERMINAL_ID }]);
+    act(() => view.result.current.sendInput(localId, "x"));
+    await unicast(cli, text("ghost"));
+    await sleep(30);
+    expect(socket.sendFrame).not.toHaveBeenCalled();
+    expect(events).toEqual([]);
+  });
+
+  it("does not revive a tab the relay detached during key derivation", async () => {
+    const { view } = await listAndSubscribe();
+    await attachAsCli(VIEWER_ID, 0, undefined, () =>
+      handlers().onMessage({ type: "detached", terminalId: TERMINAL_ID, reason: null }),
+    );
+    await sleep(50);
+    expect(view.result.current.tabs[0]).toMatchObject({ phase: "opening", error: "detached" });
   });
 });
 

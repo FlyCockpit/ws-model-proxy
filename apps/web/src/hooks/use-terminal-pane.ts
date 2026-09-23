@@ -29,8 +29,13 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): RefCallback<HTM
   });
   const xtermRef = useLatestRef(xterm);
   const { localId, active } = handlers;
+  const { host } = xterm;
 
+  // Subscribe only once xterm exists. Until then the session hook keeps the
+  // output (data and PTY sizes, in order) and hands it over on subscribe.
+  // useXterm's own effects run first, so xterm is open when this one runs.
   useEffect(() => {
+    if (!host) return;
     return handlersRef.current.subscribeOutput(
       localId,
       (event) => {
@@ -39,7 +44,7 @@ export function useTerminalPane(handlers: TerminalPaneHandlers): RefCallback<HTM
       },
       () => xtermRef.current.reset(),
     );
-  }, [localId, handlersRef, xtermRef]);
+  }, [localId, host, handlersRef, xtermRef]);
 
   useEffect(() => {
     if (active) xterm.focus();

@@ -306,6 +306,12 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const recvChainRef = useRef(new Map<string, Promise<void>>());
   const acceptSealedRef = useRef<(frame: SealedTerminalFrame) => void>(() => undefined);
   const inputRef = useRef(new Map<string, InputBatch>());
+  /**
+   * localId -> the handshake whose keys are being derived. Anything that ends
+   * the tab's session meanwhile (exit, refusal, detach, close) removes it, so
+   * the derived keys never bring the tab back.
+   */
+  const establishingRef = useRef(new Map<string, PendingHandshake>());
   const droppedNoticeRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
 
   const viewOf = useCallback((localId: string): TerminalWriterState => {
@@ -320,6 +326,12 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     },
     [viewOf],
   );
+
+  /** Patch a tab and the ref at once, so async work in this tick sees it. */
+  const patchTabNow = useCallback((localId: string, patch: Partial<TerminalTab>) => {
+    tabsRef.current = patchTab(tabsRef.current, localId, patch);
+    setTabs((current) => patchTab(current, localId, patch));
+  }, []);
 
   const tabByTerminal = useCallback(
     (terminalId: string) => tabsRef.current.find((tab) => tab.terminalId === terminalId),
@@ -336,6 +348,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   );
 
   const emitOutput = useCallback((localId: string, event: TerminalOutputEvent) => {
+    // A frame that was mid-decryption when its tab closed has nowhere to go.
+    if (!tabsRef.current.some((tab) => tab.localId === localId)) return;
     const listener = listenersRef.current.get(localId);
     if (listener) {
       if (resetBeforeOutputRef.current.delete(localId)) resettersRef.current.get(localId)?.();
@@ -360,7 +374,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const sendPlaintext = useCallback((localId: string, plaintext: Uint8Array) => {
     const tab = tabsRef.current.find((item) => item.localId === localId);
     const terminalId = tab?.terminalId;
-    if (!terminalId) return;
+    // An exited shell reads nothing; its session only lingers to drain output.
+    if (!terminalId || tab.phase === "exited") return;
     const session = sessionsRef.current.get(terminalId);
     if (!session) {
       const resize = decodeMaybeResize(plaintext);
@@ -459,15 +474,35 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   );
 
   /** Refuse a tab before any handshake message goes out. */
-  const refuseTab = useCallback((localId: string, reason: string) => {
-    setTabs((current) =>
-      patchTab(current, localId, {
+  const refuseTab = useCallback(
+    (localId: string, reason: string) => {
+      patchTabNow(localId, {
         phase: "rejected",
         approvalCode: null,
         rejectionReason: reason,
         error: null,
-      }),
-    );
+      });
+    },
+    [patchTabNow],
+  );
+
+  /**
+   * End a session once every frame already on its receive chain is decrypted
+   * and delivered. The shell has exited, but output it sent first still counts.
+   */
+  const retireAfterDrain = useCallback((terminalId: string, session: LiveSession) => {
+    const previous = recvChainRef.current.get(terminalId) ?? Promise.resolve();
+    const run: Promise<void> = previous
+      .catch(() => undefined)
+      .then(() => {
+        if (sessionsRef.current.get(terminalId) === session) sessionsRef.current.delete(terminalId);
+        // Drop the keys and any broadcast that never got its epoch key.
+        session.output = null;
+        session.future = [];
+        earlySealedRef.current.delete(terminalId);
+        if (recvChainRef.current.get(terminalId) === run) recvChainRef.current.delete(terminalId);
+      });
+    recvChainRef.current.set(terminalId, run);
   }, []);
 
   /**
@@ -514,6 +549,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         refuseSubstitutedKey(pending, message.terminalId);
         return;
       }
+      establishingRef.current.set(pending.localId, pending);
       const cliPublicRaw = base64UrlToBytes(message.cliPublicKey);
       const shared = {
         browserPrivateKey: pending.privateKey,
@@ -531,8 +567,15 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       // The socket this handshake ran on is gone; its keys are obsolete. The
       // tab stays "opening", so the next connection attaches it again.
       if (generationRef.current !== generation) return;
-      if (!tabsRef.current.some((tab) => tab.localId === pending.localId)) return;
-      sessionsRef.current.set(message.terminalId, {
+      // A refusal, a detach, or the X button ended this handshake meanwhile.
+      if (establishingRef.current.get(pending.localId) !== pending) return;
+      establishingRef.current.delete(pending.localId);
+      const tab = tabsRef.current.find((item) => item.localId === pending.localId);
+      if (!tab || tab.phase === "rejected") {
+        earlySealedRef.current.delete(message.terminalId);
+        return;
+      }
+      const session: LiveSession = {
         localId: pending.localId,
         terminalId: message.terminalId,
         version: pending.version,
@@ -543,12 +586,19 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         recvSeq: 0n,
         output: null,
         future: [],
-      });
-      lastSentSizeRef.current.delete(pending.localId);
-      reattachTimersRef.current.delete(pending.localId);
+      };
+      sessionsRef.current.set(message.terminalId, session);
       const early = earlySealedRef.current.get(message.terminalId) ?? [];
       earlySealedRef.current.delete(message.terminalId);
       for (const frame of early) acceptSealedRef.current(frame);
+      // The shell exited while the keys were derived: deliver what it sent
+      // before exiting, then end the session. The tab stays exited.
+      if (tab.phase === "exited") {
+        retireAfterDrain(message.terminalId, session);
+        return;
+      }
+      lastSentSizeRef.current.delete(pending.localId);
+      reattachTimersRef.current.delete(pending.localId);
       const view = viewOf(pending.localId);
       const writer: TerminalWriterLabel =
         pending.version === 1 || (message.type === "opened" && view.writer === "none")
@@ -575,7 +625,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       }
       flushResize(pending.localId);
     },
-    [flushResize, refuseSubstitutedKey, setView, viewOf],
+    [flushResize, refuseSubstitutedKey, retireAfterDrain, setView, viewOf],
   );
 
   const beginHandshake = useCallback(
@@ -707,6 +757,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     (localId: string, terminalId: string) => {
       sessionsRef.current.delete(terminalId);
       attachingRef.current.delete(terminalId);
+      establishingRef.current.delete(localId);
       takePendingByTerminalId(pendingRef.current, terminalId);
       earlySealedRef.current.delete(terminalId);
       lastSentSizeRef.current.delete(localId);
@@ -857,9 +908,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         const generation = generationRef.current;
         void establish(pending, message).catch(() => {
           if (generationRef.current !== generation) return;
-          setTabs((current) =>
-            patchTab(current, pending.localId, { phase: "rejected", error: "bad_handshake" }),
-          );
+          // Only the handshake still in charge of the tab may refuse it.
+          if (establishingRef.current.get(pending.localId) !== pending) return;
+          establishingRef.current.delete(pending.localId);
+          patchTabNow(pending.localId, { phase: "rejected", error: "bad_handshake" });
         });
         return;
       }
@@ -878,15 +930,14 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         const localId = pending?.localId ?? tabByTerminal(message.terminalId)?.localId;
         if (!localId) return;
         attachingRef.current.delete(message.terminalId);
+        establishingRef.current.delete(localId);
         // A 2.5 CLI can drop one viewer (bad frame) while the shell runs on.
         sessionsRef.current.delete(message.terminalId);
-        setTabs((current) =>
-          patchTab(current, localId, {
-            phase: "rejected",
-            approvalCode: message.approvalCode,
-            rejectionReason: message.reason,
-          }),
-        );
+        patchTabNow(localId, {
+          phase: "rejected",
+          approvalCode: message.approvalCode,
+          rejectionReason: message.reason,
+        });
         // Refused only because the browser identity had not loaded: retry
         // once it has.
         if (pending?.withoutIdentity && message.reason === BROWSER_IDENTITY_REQUIRED) {
@@ -895,12 +946,27 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         return;
       }
       if (message.type === "exit") {
-        sessionsRef.current.delete(message.terminalId);
-        const localId = tabByTerminal(message.terminalId)?.localId;
-        if (!localId) return;
+        const terminalId = message.terminalId;
+        const session = sessionsRef.current.get(terminalId);
+        const localId = tabByTerminal(terminalId)?.localId;
+        if (!localId) {
+          sessionsRef.current.delete(terminalId);
+          earlySealedRef.current.delete(terminalId);
+          return;
+        }
         clearTimer(reattachTimersRef.current, localId);
         clearTimer(resizeTimersRef.current, localId);
-        setTabs((current) => patchTab(current, localId, { phase: "exited" }));
+        // Mark it exited now; frames that arrive from here on are dropped.
+        patchTabNow(localId, { phase: "exited" });
+        if (session) {
+          // Frames received before the exit may still be decrypting.
+          retireAfterDrain(terminalId, session);
+        } else if (!establishingRef.current.has(localId)) {
+          // No keys and none coming: nothing queued can be read.
+          takePendingByTerminalId(pendingRef.current, terminalId);
+          attachingRef.current.delete(terminalId);
+          earlySealedRef.current.delete(terminalId);
+        }
         return;
       }
       if (message.type === "detached") {
@@ -962,6 +1028,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       if (message.code === "not_found" && tab.phase === "live") return;
       takePendingByTerminalId(pendingRef.current, errorTerminalId);
       attachingRef.current.delete(errorTerminalId);
+      if (tab.phase === "opening") establishingRef.current.delete(localId);
       const reason = message.code ?? message.message;
       setTabs((current) =>
         current.map((item) =>
@@ -984,7 +1051,9 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       ensureTrust,
       establish,
       listReady,
+      patchTabNow,
       refuseSubstitutedKey,
+      retireAfterDrain,
       setView,
       tabByTerminal,
       viewOf,
@@ -1005,6 +1074,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     sessionsRef.current.clear();
     pendingRef.current.clear();
     attachingRef.current.clear();
+    establishingRef.current.clear();
     inflightOpensRef.current = [];
     earlySealedRef.current.clear();
     sendChainRef.current.clear();
@@ -1173,6 +1243,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     (frame: SealedTerminalFrame) => {
       const session = sessionsRef.current.get(frame.terminalId);
       if (!session) {
+        // Output sent after the shell exited is not shown.
+        if (tabByTerminal(frame.terminalId)?.phase === "exited") return;
         const queued = earlySealedRef.current.get(frame.terminalId) ?? [];
         queued.push(frame);
         if (queued.length > EARLY_FRAME_QUEUE) queued.shift();
@@ -1191,7 +1263,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         .catch(() => undefined);
       recvChainRef.current.set(frame.terminalId, run);
     },
-    [receiveV1, receiveV2],
+    [receiveV1, receiveV2, tabByTerminal],
   );
   const socket = useTerminalSocket(true, { onMessage, onSealed, onOpen, onDisconnect });
   // Layout effects run before the socket's passive connect effect, so these
@@ -1262,6 +1334,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     (tab: TerminalTab) => {
       const localId = tab.localId;
       pendingRef.current.delete(localId);
+      establishingRef.current.delete(localId);
       if (tab.terminalId) {
         sessionsRef.current.delete(tab.terminalId);
         pendingRef.current.delete(tab.terminalId);
@@ -1336,7 +1409,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const sendInput = useCallback(
     (localId: string, data: string) => {
       const tab = tabsRef.current.find((item) => item.localId === localId);
-      const live = tab?.terminalId ? sessionsRef.current.has(tab.terminalId) : false;
+      const live =
+        tab?.terminalId && tab.phase !== "exited" ? sessionsRef.current.has(tab.terminalId) : false;
       if (tab && live && needsTakeover(viewOf(localId))) {
         // Takeover: the CLI must see this tab's size before its first data
         // frame, so the PTY is resized before the keystroke lands. Both share
