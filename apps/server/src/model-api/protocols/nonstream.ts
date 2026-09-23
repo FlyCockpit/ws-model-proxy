@@ -11,6 +11,7 @@ import {
   acceptChatEnvelopeExtras,
   acceptChatMessageExtras,
   acceptTokenCountDetails,
+  ignoreUnknownEnvelopeFields,
   object,
   rejectUnknown,
   string,
@@ -214,7 +215,7 @@ function parseChatSuccess(value: unknown): CanonicalResponse {
 
 function parseResponsesSuccess(value: unknown): CanonicalResponse {
   const body = object(value);
-  rejectUnknown(
+  ignoreUnknownEnvelopeFields(
     body,
     [
       "id",
@@ -317,7 +318,7 @@ function parseResponsesSuccess(value: unknown): CanonicalResponse {
 
 function parseAnthropicSuccess(value: unknown): CanonicalResponse {
   const body = object(value);
-  rejectUnknown(
+  ignoreUnknownEnvelopeFields(
     body,
     ["id", "type", "role", "content", "model", "stop_reason", "stop_sequence", "usage"],
     "response",

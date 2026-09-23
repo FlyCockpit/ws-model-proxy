@@ -91,12 +91,21 @@ describe("protocol adaptation orchestration", () => {
         source: "openai-chat",
         target,
         status: 200,
-        body: vendorChatCompletion,
+        body: {
+          ...vendorChatCompletion,
+          choices: [
+            {
+              ...vendorChoice,
+              message: { ...vendorMessage, reasoning_content: "REASONING_CONTENT_HIDDEN" },
+            },
+          ],
+        },
       });
       expect(result.ok, target).toBe(true);
       if (result.ok) {
         expect(JSON.stringify(result.body)).toContain("pong");
         expect(JSON.stringify(result.body)).not.toContain("hidden");
+        expect(JSON.stringify(result.body)).not.toContain("REASONING_CONTENT_HIDDEN");
       }
     }
   });
@@ -117,25 +126,47 @@ describe("protocol adaptation orchestration", () => {
   });
 
   it("rejects a non-null chat envelope or choice field outside the ignorable null set", () => {
+    for (const field of [
+      "prompt_logprobs",
+      "prompt_token_ids",
+      "prompt_text",
+      "kv_transfer_params",
+      "ec_transfer_params",
+      "metrics",
+    ]) {
+      expect(() =>
+        adaptNonstreamResponse({
+          source: "openai-chat",
+          target: "openai-responses",
+          status: 200,
+          body: { ...vendorChatCompletion, [field]: [{ token: "x" }] },
+        }),
+      ).toThrow(new RegExp(field, "u"));
+    }
+    for (const field of ["token_ids", "routed_experts"]) {
+      expect(() =>
+        adaptNonstreamResponse({
+          source: "openai-chat",
+          target: "anthropic-messages",
+          status: 200,
+          body: {
+            ...vendorChatCompletion,
+            choices: [{ ...vendorChoice, [field]: [1, 2] }],
+          },
+        }),
+      ).toThrow(new RegExp(field, "u"));
+    }
     expect(() =>
       adaptNonstreamResponse({
         source: "openai-chat",
         target: "openai-responses",
         status: 200,
-        body: { ...vendorChatCompletion, prompt_logprobs: [{ token: "x" }] },
-      }),
-    ).toThrow(/prompt_logprobs/u);
-    expect(() =>
-      adaptNonstreamResponse({
-        source: "openai-chat",
-        target: "anthropic-messages",
-        status: 200,
         body: {
           ...vendorChatCompletion,
-          choices: [{ ...vendorChoice, token_ids: [1, 2] }],
+          choices: [{ ...vendorChoice, logprobs: { content: [] } }],
         },
       }),
-    ).toThrow(/token_ids/u);
+    ).toThrow(/logprobs/u);
   });
 
   it("still rejects a present non-null Chat Completions field outside the ignorable set", () => {
@@ -174,22 +205,31 @@ describe("protocol adaptation orchestration", () => {
   });
 
   it("rejects reasoning text when it is the only visible answer", () => {
-    expect(() =>
-      adaptNonstreamResponse({
-        source: "openai-chat",
-        target: "anthropic-messages",
-        status: 200,
-        body: {
-          ...vendorChatCompletion,
-          choices: [
-            {
-              ...vendorChoice,
-              message: { ...vendorMessage, content: null },
-            },
-          ],
-        },
-      }),
-    ).toThrow(/only visible text/u);
+    const onlyReasoning = (message: Record<string, unknown>) =>
+      expect(() =>
+        adaptNonstreamResponse({
+          source: "openai-chat",
+          target: "anthropic-messages",
+          status: 200,
+          body: {
+            ...vendorChatCompletion,
+            choices: [{ ...vendorChoice, message }],
+          },
+        }),
+      ).toThrow(/only visible text/u);
+    onlyReasoning({ ...vendorMessage, content: null });
+    onlyReasoning({
+      ...vendorMessage,
+      content: null,
+      reasoning: null,
+      reasoning_content: "REASONING_CONTENT_HIDDEN",
+    });
+    onlyReasoning({
+      ...vendorMessage,
+      content: null,
+      reasoning: "hidden",
+      reasoning_content: "REASONING_CONTENT_HIDDEN",
+    });
   });
 
   it("drops stream reasoning deltas when later content holds the answer", () => {
@@ -220,7 +260,13 @@ describe("protocol adaptation orchestration", () => {
           choices: [
             {
               index: 0,
-              delta: { role: "assistant", reasoning: "hidden", audio: null, annotations: null },
+              delta: {
+                role: "assistant",
+                reasoning: "hidden",
+                reasoning_content: "REASONING_CONTENT_HIDDEN",
+                audio: null,
+                annotations: null,
+              },
               finish_reason: null,
               stop_reason: 154827,
               token_ids: null,
@@ -251,33 +297,40 @@ describe("protocol adaptation orchestration", () => {
       expect.objectContaining({ delta: "pong" }),
     ]);
     expect(events.some((event) => event.type === "reasoning_delta")).toBe(false);
+    expect(JSON.stringify(events)).not.toContain("hidden");
+    expect(JSON.stringify(events)).not.toContain("REASONING_CONTENT_HIDDEN");
   });
 
   it("rejects a chat stream whose only text is reasoning", () => {
-    const parser = new CanonicalStreamParser("openai-chat");
     const encode = (value: unknown) =>
       new TextEncoder().encode(`data: ${JSON.stringify(value)}\n\n`);
-    parser.push(
-      encode({
-        id: "c",
-        object: "chat.completion.chunk",
-        created: 0,
-        model: "gpt",
-        choices: [{ index: 0, delta: { reasoning: "hidden" }, finish_reason: null }],
-      }),
-    );
-    parser.push(
-      encode({
-        id: "c",
-        object: "chat.completion.chunk",
-        created: 0,
-        model: "gpt",
-        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-      }),
-    );
-    expect(() => parser.push(new TextEncoder().encode("data: [DONE]\n\n"))).toThrow(
-      /only visible text/u,
-    );
+    const onlyReasoning = (delta: Record<string, unknown>) => {
+      const parser = new CanonicalStreamParser("openai-chat");
+      parser.push(
+        encode({
+          id: "c",
+          object: "chat.completion.chunk",
+          created: 0,
+          model: "gpt",
+          choices: [{ index: 0, delta, finish_reason: null }],
+        }),
+      );
+      parser.push(
+        encode({
+          id: "c",
+          object: "chat.completion.chunk",
+          created: 0,
+          model: "gpt",
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        }),
+      );
+      expect(() => parser.push(new TextEncoder().encode("data: [DONE]\n\n"))).toThrow(
+        /only visible text/u,
+      );
+    };
+    onlyReasoning({ reasoning: "hidden" });
+    onlyReasoning({ reasoning_content: "REASONING_CONTENT_HIDDEN" });
+    onlyReasoning({ reasoning: "hidden", reasoning_content: "REASONING_CONTENT_HIDDEN" });
   });
 
   it("streams through the bounded parser and renderer state machines", async () => {

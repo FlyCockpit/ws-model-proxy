@@ -6,6 +6,7 @@ import {
   acceptChatEnvelopeExtras,
   acceptChatMessageExtras,
   acceptTokenCountDetails,
+  ignoreUnknownEnvelopeFields,
   object,
   rejectUnknown,
 } from "./parse-utils.js";
@@ -431,7 +432,7 @@ export class CanonicalStreamParser {
     ]);
     if (!responseEvents.has(type))
       throw new AdapterError("unsupported_stream_event", `Unsupported Responses event: ${type}.`);
-    rejectUnknown(value, responsesFields(type), "stream.data");
+    ignoreUnknownEnvelopeFields(value, responsesFields(type), "stream.data");
     const sequence = value.sequence_number;
     if (!Number.isSafeInteger(sequence) || sequence !== this.#lastSequence + 1)
       throw new AdapterError(
@@ -448,7 +449,7 @@ export class CanonicalStreamParser {
       type === "response.incomplete" ||
       type === "response.failed"
     )
-      rejectUnknown(
+      ignoreUnknownEnvelopeFields(
         response,
         [
           "id",
@@ -840,10 +841,10 @@ export class CanonicalStreamParser {
       throw new AdapterError("unsupported_stream_event", `Unsupported Anthropic event: ${type}.`);
     if (this.#stopped && type !== "message_stop")
       throw new AdapterError("event_after_stop", "Anthropic event followed the stop barrier.");
-    rejectUnknown(value, anthropicFields(type), "stream.data");
+    ignoreUnknownEnvelopeFields(value, anthropicFields(type), "stream.data");
     const message = value.message && typeof value.message === "object" ? object(value.message) : {};
     if (type === "message_start")
-      rejectUnknown(
+      ignoreUnknownEnvelopeFields(
         message,
         ["id", "type", "role", "content", "model", "stop_reason", "stop_sequence", "usage"],
         "stream.data.message",
