@@ -404,10 +404,10 @@ fn uninstall() -> Result<()> {
     if file.exists() {
         fs::remove_file(&file).with_context(|| format!("removing `{}`", file.display()))?;
     }
-    if let Ok(wrapper) = macos_wrapper_path() {
-        if wrapper.exists() {
-            let _ = fs::remove_file(&wrapper);
-        }
+    if let Ok(wrapper) = macos_wrapper_path()
+        && wrapper.exists()
+    {
+        let _ = fs::remove_file(&wrapper);
     }
     output::line("uninstalled relay service")
 }
