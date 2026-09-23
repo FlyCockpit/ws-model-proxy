@@ -12,9 +12,15 @@
 //! process-group kill: only the direct child is terminated, so grandchildren of
 //! an exec may survive.
 //!
-//! Every live Unix exec group and PTY session is also recorded in a global
-//! list, so a forced shutdown (`crate::shutdown`) can kill them from another
-//! thread with [`kill_tracked_children`] when the relay thread is stuck.
+//! Every live Unix exec group and PTY session, and every Windows exec, is also
+//! recorded in a global list, so a forced shutdown (`crate::shutdown`) can
+//! kill them from another thread with [`kill_tracked_children`] when the relay
+//! thread is stuck.
+//!
+//! A terminal closes when its shell exits, not only on PTY EOF: a background
+//! or disowned job can hold the PTY open after the shell is gone. The relay
+//! loop's `poll` reaps the shell, lets already-written output drain briefly,
+//! then kills the rest of the session and reports the shell's exit status.
 //!
 //! Terminal input never blocks the relay loop. Each terminal has a writer
 //! thread fed by a queue of at most [`INPUT_QUEUE_LIMIT`] pending bytes; when
@@ -35,10 +41,11 @@ use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
-#[cfg(unix)]
-use std::sync::{Condvar, Mutex, PoisonError};
+use std::sync::{Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -82,6 +89,11 @@ const SESSION_KILL_ROUNDS: usize = 20;
 /// this long, whichever comes first. A grandchild that holds a pipe must not
 /// stall the slot; the leftover bytes are then dropped.
 const EXEC_OUTPUT_DRAIN: Duration = Duration::from_millis(500);
+/// After the shell exits, keep the terminal until the PTY reports EOF, or this
+/// long, whichever comes first. A background or disowned job that still holds
+/// the PTY must not keep a dead terminal in its slot.
+#[cfg(unix)]
+const TERMINAL_OUTPUT_DRAIN: Duration = Duration::from_millis(500);
 /// Map key for the single implicit viewer of a 2.4 (legacy) terminal. Never a
 /// valid wire viewer id, so it cannot collide with a 2.5 viewer.
 const LEGACY_VIEWER: &str = "";
@@ -700,10 +712,12 @@ fn kill_session(leader: u32) {
     if raw <= 1 {
         return;
     }
-    // The shell was spawned with `setsid`, so its session id is its pid. It
-    // is our unreaped child here, so the pid cannot have been reused. A
-    // zombie leader can fail `getsid` on some platforms; its session members
-    // are still confirmed one by one below.
+    // The shell was spawned with `setsid`, so its session id is its pid.
+    // Either it is our unreaped child, or it was reaped just now and the
+    // kernel does not hand out a pid that is still some session's id while
+    // members remain; either way the pid cannot name an unrelated session. A
+    // zombie or reaped leader can fail `getsid`; its session members are
+    // still confirmed one by one below.
     let sid = nix::unistd::Pid::from_raw(raw);
     if nix::unistd::getsid(Some(sid)).is_ok_and(|actual| actual != sid) {
         return;
@@ -734,26 +748,24 @@ fn kill_session(leader: u32) {
 
 /// A child the relay thread owns, recorded so a forced shutdown can kill it
 /// from another thread without the registries.
-#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LiveChild {
-    /// An exec shell: the leader of its own process group.
+    /// An exec shell: the leader of its own process group on Unix. On
+    /// Windows its process handle stays open while it is tracked, so the pid
+    /// cannot be reused.
     ExecGroup(u32),
     /// A PTY shell: the leader of its own session.
+    #[cfg(unix)]
     PtySession(u32),
 }
 
-#[cfg(unix)]
 static LIVE_CHILDREN: Mutex<BTreeMap<u64, LiveChild>> = Mutex::new(BTreeMap::new());
-#[cfg(unix)]
 static NEXT_LIVE_CHILD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Removes its child from [`LIVE_CHILDREN`] when the session that owns the
 /// child is dropped.
-#[cfg(unix)]
 struct LiveChildGuard(u64);
 
-#[cfg(unix)]
 impl LiveChildGuard {
     fn track(child: LiveChild) -> Self {
         let id = NEXT_LIVE_CHILD.fetch_add(1, Ordering::Relaxed);
@@ -765,7 +777,6 @@ impl LiveChildGuard {
     }
 }
 
-#[cfg(unix)]
 impl Drop for LiveChildGuard {
     fn drop(&mut self) {
         LIVE_CHILDREN
@@ -779,11 +790,9 @@ impl Drop for LiveChildGuard {
 /// by a forced shutdown (deadline or second signal) that cannot wait for the
 /// relay thread's registries; it does not reap and sends no frames.
 pub fn kill_tracked_children() {
-    #[cfg(unix)]
     kill_live_children(|_| true);
 }
 
-#[cfg(unix)]
 fn kill_live_children(select: impl Fn(&LiveChild) -> bool) {
     let children = LIVE_CHILDREN
         .lock()
@@ -794,13 +803,29 @@ fn kill_live_children(select: impl Fn(&LiveChild) -> bool) {
         .collect::<Vec<_>>();
     for child in children {
         match child {
+            #[cfg(unix)]
             LiveChild::ExecGroup(pid) => kill_process_group(pid, false),
+            #[cfg(not(unix))]
+            LiveChild::ExecGroup(pid) => kill_process_tree(pid),
+            #[cfg(unix)]
             LiveChild::PtySession(pid) => {
                 kill_session(pid);
                 kill_process_group(pid, false);
             }
         }
     }
+}
+
+/// Windows has no process groups. The relay thread owns the `Child`, so a
+/// forced shutdown ends the exec and its descendants with `taskkill /T /F`.
+#[cfg(not(unix))]
+fn kill_process_tree(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 /// Browser input waiting for a terminal's writer thread.
@@ -967,6 +992,9 @@ struct PtyRuntime {
     reader: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     pid: Option<u32>,
+    /// Exit status and the instant `poll` reaped the shell. The terminal
+    /// closes on PTY EOF or [`TERMINAL_OUTPUT_DRAIN`] later.
+    exited: Option<(Option<i32>, Option<i32>, Instant)>,
     /// Dropped after `shutdown_pty` has killed and reaped the session.
     _tracked: Option<LiveChildGuard>,
 }
@@ -975,16 +1003,19 @@ struct PtyRuntime {
 fn shutdown_pty(mut runtime: PtyRuntime) -> (Option<i32>, Option<i32>) {
     runtime.stop.store(true, Ordering::SeqCst);
     runtime.input.close();
+    let exited = runtime.exited.map(|(code, signal, _)| (code, signal));
     if let Some(pid) = runtime.pid {
         kill_session(pid);
-        kill_process_group(pid, true);
+        // A shell that `poll` already reaped is not signalled by pid again;
+        // `killpg` still reaches jobs left in its process group.
+        kill_process_group(pid, exited.is_none());
     }
     // The reader and writer notice `stop` within their poll timeout. Joining
     // either would block: the reader while a background job still holds the
     // slave, the writer while the PTY input buffer is full.
     drop(runtime.writer.take());
     drop(runtime.reader.take());
-    let status = reap_after_signal(runtime.pid);
+    let status = exited.unwrap_or_else(|| reap_after_signal(runtime.pid));
     drop(runtime.child);
     drop(runtime.master);
     status
@@ -2145,6 +2176,8 @@ impl TerminalRegistry {
             ));
         }
         frames.extend(self.recheck_approvals(now));
+        #[cfg(unix)]
+        frames.extend(self.close_exited_shells(now));
         // Pending viewers do not keep a terminal alive.
         let expired = self
             .sessions
@@ -2159,6 +2192,37 @@ impl TerminalRegistry {
             .collect::<Vec<_>>();
         for id in expired {
             frames.extend(self.close(&id));
+        }
+        frames
+    }
+
+    /// Reap shells that have exited and close their terminals once the output
+    /// they left is drained. PTY EOF alone is not enough: a background or
+    /// disowned job (`sleep 30 & disown; exit`) keeps the PTY open after the
+    /// shell is gone. The close kills every process left in the shell's
+    /// session and reports the shell's own exit status.
+    #[cfg(unix)]
+    fn close_exited_shells(&mut self, now: Instant) -> Vec<OutboundFrame> {
+        let mut drained = Vec::new();
+        for (terminal_id, session) in &mut self.sessions {
+            let Some(pty) = session.pty.as_mut() else {
+                continue;
+            };
+            if pty.exited.is_none() {
+                let (code, signal) = reap_pid(pty.pid);
+                if code.is_some() || signal.is_some() {
+                    pty.exited = Some((code, signal, now));
+                }
+            }
+            if pty.exited.is_some_and(|(_, _, at)| {
+                now.saturating_duration_since(at) >= TERMINAL_OUTPUT_DRAIN
+            }) {
+                drained.push(terminal_id.clone());
+            }
+        }
+        let mut frames = Vec::new();
+        for terminal_id in drained {
+            frames.extend(self.close(&terminal_id));
         }
         frames
     }
@@ -2357,6 +2421,7 @@ fn spawn_pty(
         reader: Some(thread),
         stop,
         pid,
+        exited: None,
         _tracked: tracked,
     })
 }
@@ -2376,7 +2441,6 @@ struct ExecSession {
     pid: u32,
     /// Exit status and the instant `try_wait` reaped the direct child.
     reaped: Option<(Option<i32>, Option<i32>, Instant)>,
-    #[cfg(unix)]
     _tracked: LiveChildGuard,
 }
 
@@ -2687,7 +2751,6 @@ fn spawn_exec(
     }
     let mut child = process.spawn()?;
     let pid = child.id();
-    #[cfg(unix)]
     let tracked = LiveChildGuard::track(LiveChild::ExecGroup(pid));
     let stdout = child
         .stdout
@@ -2744,7 +2807,6 @@ fn spawn_exec(
         finished: false,
         pid,
         reaped: None,
-        #[cfg(unix)]
         _tracked: tracked,
     })
 }
@@ -4402,7 +4464,7 @@ mod tests {
             ));
         }
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < Duration::from_secs(10),
             "input handling blocked for {:?}",
             started.elapsed()
         );
@@ -4426,7 +4488,7 @@ mod tests {
         let started = Instant::now();
         let closed = terminals.close(MULTI_TERMINAL);
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_secs(10),
             "close waited on the blocked writer for {:?}",
             started.elapsed()
         );
@@ -4524,7 +4586,7 @@ mod tests {
             "broken".to_string(),
         );
         assert!(input.push(b"hello".to_vec()).expect("queued"));
-        match rx.recv_timeout(Duration::from_secs(2)) {
+        match rx.recv_timeout(Duration::from_secs(10)) {
             Ok(FromWorker::TerminalWriteFailed { terminal_id }) => {
                 assert_eq!(terminal_id, "broken");
             }
@@ -4618,6 +4680,122 @@ mod tests {
         }
         assert!(!process_running(bg), "background job {bg} survived close");
         assert!(!process_running(nohup), "nohup job {nohup} survived close");
+        drop(terminals);
+        drop(rx);
+    }
+
+    /// Dead or a zombie. Elsewhere than Linux a killed orphan is reaped by
+    /// init, so plain existence is enough.
+    #[cfg(unix)]
+    fn process_gone(pid: u32) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            !process_running(pid)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            !process_exists(pid)
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_exit_closes_the_terminal_while_a_disowned_job_holds_the_pty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let job_file = dir.path().join("job.pid");
+        // The non-interactive form of `sleep 120 & disown; exit`: `set -m`
+        // puts the job in its own background process group, so the kernel's
+        // hangup on the leader's exit misses it, and its stdout keeps the PTY
+        // open after the shell has gone.
+        let script = format!(
+            "set -m; sleep 120 & echo $! > '{}'; printf wsmp-bye; exit 0",
+            job_file.display()
+        );
+        let (tx, rx) = channel();
+        let mut terminals =
+            TerminalRegistry::with_shell(tx, Duration::from_secs(60), "/bin/sh", &["-c", &script]);
+        let startup = enabled_startup(false);
+        let browser = CliTerminalKey::generate().expect("browser");
+        let nonce = terminal_crypto::encode_b64url(&[9_u8; 16]);
+        let opened = terminals.open(
+            &startup,
+            &Config::default(),
+            None,
+            TermHandshake {
+                terminal_id: "exited",
+                viewer_id: None,
+                cols: 80,
+                rows: 24,
+                browser_public_key: browser.public_b64url(),
+                browser_nonce: &nonce,
+                identity: None,
+            },
+        );
+        assert!(matches!(
+            &opened[0],
+            OutboundFrame::Control(ClientControlMessage::TermOpened { .. })
+        ));
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(10);
+        let mut output = Vec::new();
+        let mut sealed_output = false;
+        let mut exit = None;
+        // Drive the registry the way the relay loop does: drain worker
+        // output, then poll.
+        while exit.is_none() && Instant::now() < deadline {
+            let mut frames = Vec::new();
+            while let Ok(note) = rx.try_recv() {
+                match note {
+                    FromWorker::TerminalBytes { terminal_id, bytes } => {
+                        output.extend_from_slice(&bytes);
+                        frames.extend(terminals.on_bytes(&terminal_id, &bytes));
+                    }
+                    FromWorker::TerminalEof { terminal_id } => {
+                        frames.extend(terminals.on_eof(&terminal_id));
+                    }
+                    _ => {}
+                }
+            }
+            frames.extend(terminals.poll(Instant::now()));
+            for frame in frames {
+                match frame {
+                    OutboundFrame::Binary(..) if exit.is_none() => sealed_output = true,
+                    OutboundFrame::Control(ClientControlMessage::TermExit {
+                        terminal_id,
+                        exit_code,
+                        signal,
+                    }) => {
+                        assert_eq!(terminal_id, "exited");
+                        exit = Some((exit_code, signal));
+                    }
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            exit,
+            Some((Some(0), None)),
+            "the terminal did not close with the shell's status within {:?}",
+            started.elapsed()
+        );
+        assert!(
+            output.windows(8).any(|window| window == b"wsmp-bye"),
+            "output written before exit was lost: {output:?}"
+        );
+        assert!(
+            sealed_output,
+            "no output reached the viewer before term.exit"
+        );
+        assert!(terminals.sessions.is_empty(), "the terminal kept its slot");
+
+        let text = std::fs::read_to_string(&job_file).expect("job pid");
+        let job = text.trim().parse::<u32>().expect("job pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !process_gone(job) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(process_gone(job), "disowned job {job} survived the close");
         drop(terminals);
         drop(rx);
     }

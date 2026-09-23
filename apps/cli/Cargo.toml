@@ -97,6 +97,11 @@ portable-pty = "0.9"
 # symlink and allocates a new pty, so the reader cannot poll that path.
 filedescriptor = "0.8"
 
+[target.'cfg(windows)'.dependencies]
+# Console control events (Ctrl-C, Ctrl-Break, close, shutdown) start the same
+# bounded relay shutdown as SIGINT/SIGTERM on Unix. Unix keeps `sigwait`.
+tokio = { version = "1", features = ["signal"] }
+
 [dev-dependencies]
 # Black-box CLI testing: run the built binary and assert on stdout/stderr/exit.
 assert_cmd = "2"

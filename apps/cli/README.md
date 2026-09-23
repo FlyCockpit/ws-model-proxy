@@ -121,8 +121,14 @@ The terminals page shows each CLI's fingerprint: base32 of the first 20 bytes of
 - **SIGKILL (`kill -9`) cannot be caught.** It is the one way to stop the relay
   that leaves exec commands and terminal processes running, untracked. Prefer
   SIGTERM; if a relay was killed with SIGKILL, find leftovers with
-  `ps -o pid,pgid,sid,args` and end them yourself. On Windows, Ctrl-C is not
-  handled yet and uses the platform default.
+  `ps -o pid,pgid,sid,args` and end them yourself.
+- **Shutdown (Windows).** Ctrl-C, Ctrl-Break, closing the console window, and
+  a system shutdown start the same cleanup: running MCP exec commands are
+  ended, the server hears they finished, and the websocket closes. Cleanup
+  gets 5 seconds (Windows itself may end the process sooner after a console
+  close); after that, or on a second Ctrl-C, the relay kills the tracked
+  commands with their child processes and exits at once. The exit status is
+  130 for Ctrl-C, 149 for Ctrl-Break, and 143 otherwise.
 
 ### Media expansion for local upstreams
 

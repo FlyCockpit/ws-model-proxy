@@ -1,4 +1,5 @@
-//! Graceful relay shutdown on SIGTERM, SIGINT, and SIGHUP.
+//! Graceful relay shutdown on SIGTERM, SIGINT, and SIGHUP, and on Windows
+//! on Ctrl-C, Ctrl-Break, console close, and system shutdown.
 //!
 //! [`install`] blocks those signals in the calling thread before any other
 //! thread exists, so every later thread inherits the mask and none of them
@@ -16,6 +17,10 @@
 //!
 //! Children never inherit the blocked mask: `std::process::Command` and
 //! `portable-pty` both reset it before `exec`.
+//!
+//! Windows takes console control events through tokio's handler on its own
+//! thread and follows the same path: flag, deadline, forced kill of tracked
+//! exec commands, then exit with status `128 + n`.
 //!
 //! SIGKILL cannot be caught. It is the one way to stop the relay that can
 //! leave exec commands and terminal processes running.
@@ -56,22 +61,27 @@ pub fn terminate_by_signal(signal: i32) -> ! {
     std::process::exit(128_i32.saturating_add(signal))
 }
 
-#[cfg(unix)]
-pub use unix::{ExitCleanup, install, register_exit_cleanup, requested};
+#[cfg(any(unix, windows))]
+pub use tracked::{ExitCleanup, register_exit_cleanup, requested};
 
-#[cfg(not(unix))]
+#[cfg(unix)]
+pub use unix::install;
+
+#[cfg(windows)]
+pub use windows::install;
+
+#[cfg(not(any(unix, windows)))]
 pub use fallback::{ExitCleanup, install, register_exit_cleanup, requested};
 
-#[cfg(unix)]
-mod unix {
+/// State shared by the platform watchers: the first request, the deadline,
+/// the forced exit, and the runtime-file cleanups it runs.
+#[cfg(any(unix, windows))]
+mod tracked {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-    use std::sync::{Mutex, OnceLock, PoisonError};
+    use std::sync::{Mutex, PoisonError};
     use std::thread;
     use std::time::Instant;
-
-    use anyhow::{Context, Result};
-    use nix::sys::signal::{SigSet, Signal};
 
     use super::SHUTDOWN_DEADLINE;
 
@@ -79,9 +89,140 @@ mod unix {
 
     /// The first shutdown signal, or 0.
     static REQUESTED: AtomicI32 = AtomicI32::new(0);
-    static INSTALLED: OnceLock<()> = OnceLock::new();
     static CLEANUPS: Mutex<BTreeMap<u64, Cleanup>> = Mutex::new(BTreeMap::new());
     static NEXT_CLEANUP: AtomicU64 = AtomicU64::new(1);
+
+    /// The first shutdown signal received, if any.
+    pub fn requested() -> Option<i32> {
+        match REQUESTED.load(Ordering::SeqCst) {
+            0 => None,
+            signal => Some(signal),
+        }
+    }
+
+    /// A shutdown request arrived. The first starts graceful cleanup under
+    /// [`SHUTDOWN_DEADLINE`]; a second one exits at once.
+    pub(super) fn receive(number: i32, name: &str) {
+        if REQUESTED
+            .compare_exchange(0, number, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            tracing::info!(
+                signal = name,
+                deadline_secs = SHUTDOWN_DEADLINE.as_secs(),
+                "shutdown signal received; stopping terminals and commands"
+            );
+            start_deadline(number);
+            return;
+        }
+        tracing::warn!(
+            signal = name,
+            "second shutdown signal received; exiting now"
+        );
+        force_exit(requested().unwrap_or(number));
+    }
+
+    fn start_deadline(signal: i32) {
+        let deadline = Instant::now() + SHUTDOWN_DEADLINE;
+        let spawned = thread::Builder::new()
+            .name("wsmp-shutdown-deadline".to_string())
+            .spawn(move || {
+                // `sleep` can wake early on some platforms; loop to the instant.
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    thread::sleep(remaining);
+                }
+                tracing::warn!(
+                    deadline_secs = SHUTDOWN_DEADLINE.as_secs(),
+                    "relay cleanup did not finish before the shutdown deadline; exiting now"
+                );
+                force_exit(signal);
+            });
+        if spawned.is_err() {
+            // No deadline thread: cleanup is unbounded, so do not wait on it.
+            force_exit(signal);
+        }
+    }
+
+    /// Best-effort synchronous cleanup, then exit without unwinding.
+    pub(super) fn force_exit(signal: i32) -> ! {
+        crate::sessions::kill_tracked_children();
+        run_exit_cleanups();
+        super::terminate_by_signal(signal)
+    }
+
+    fn run_exit_cleanups() {
+        // A cleanup that panicked while registered must not stop the others.
+        let cleanups = CLEANUPS.lock().unwrap_or_else(PoisonError::into_inner);
+        for cleanup in cleanups.values() {
+            cleanup();
+        }
+    }
+
+    /// Removes its cleanup when dropped. The owner's normal `Drop` does the
+    /// real work; this is only for a forced exit that skips destructors.
+    #[must_use = "the cleanup is unregistered when this guard drops"]
+    pub struct ExitCleanup(u64);
+
+    impl Drop for ExitCleanup {
+        fn drop(&mut self) {
+            CLEANUPS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&self.0);
+        }
+    }
+
+    /// Run `cleanup` if the process is forced to exit before the returned
+    /// guard drops. Keep it short and non-blocking: it runs on the way out.
+    pub fn register_exit_cleanup(cleanup: impl Fn() + Send + 'static) -> ExitCleanup {
+        let id = NEXT_CLEANUP.fetch_add(1, Ordering::Relaxed);
+        CLEANUPS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, Box::new(cleanup));
+        ExitCleanup(id)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn exit_cleanups_run_until_their_guard_drops() {
+            use std::sync::Arc;
+            use std::sync::atomic::AtomicUsize;
+
+            let runs = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&runs);
+            let guard = register_exit_cleanup(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+            });
+            run_exit_cleanups();
+            assert_eq!(runs.load(Ordering::SeqCst), 1);
+            drop(guard);
+            run_exit_cleanups();
+            assert_eq!(
+                runs.load(Ordering::SeqCst),
+                1,
+                "a dropped guard unregisters"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+mod unix {
+    use std::sync::OnceLock;
+    use std::thread;
+
+    use anyhow::{Context, Result};
+    use nix::sys::signal::{SigSet, Signal};
+
+    static INSTALLED: OnceLock<()> = OnceLock::new();
 
     /// Start taking shutdown signals. Call from the main thread before any
     /// other thread is spawned; threads that already exist keep the default
@@ -100,14 +241,6 @@ mod unix {
             .context("starting the shutdown signal thread")?;
         let _ = INSTALLED.set(());
         Ok(())
-    }
-
-    /// The first shutdown signal received, if any.
-    pub fn requested() -> Option<i32> {
-        match REQUESTED.load(Ordering::SeqCst) {
-            0 => None,
-            signal => Some(signal),
-        }
     }
 
     /// SIGTERM, SIGINT, and SIGHUP, minus any the relay inherited as ignored
@@ -149,90 +282,8 @@ mod unix {
             let Ok(signal) = signals.wait() else {
                 continue;
             };
-            let number = signal as i32;
-            if REQUESTED
-                .compare_exchange(0, number, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                tracing::info!(
-                    signal = %signal,
-                    deadline_secs = SHUTDOWN_DEADLINE.as_secs(),
-                    "shutdown signal received; stopping terminals and commands"
-                );
-                start_deadline(number);
-                continue;
-            }
-            tracing::warn!(
-                signal = %signal,
-                "second shutdown signal received; exiting now"
-            );
-            force_exit(requested().unwrap_or(number));
+            super::tracked::receive(signal as i32, signal.as_str());
         }
-    }
-
-    fn start_deadline(signal: i32) {
-        let deadline = Instant::now() + SHUTDOWN_DEADLINE;
-        let spawned = thread::Builder::new()
-            .name("wsmp-shutdown-deadline".to_string())
-            .spawn(move || {
-                // `sleep` can wake early on some platforms; loop to the instant.
-                loop {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        break;
-                    }
-                    thread::sleep(remaining);
-                }
-                tracing::warn!(
-                    deadline_secs = SHUTDOWN_DEADLINE.as_secs(),
-                    "relay cleanup did not finish before the shutdown deadline; exiting now"
-                );
-                force_exit(signal);
-            });
-        if spawned.is_err() {
-            // No deadline thread: cleanup is unbounded, so do not wait on it.
-            force_exit(signal);
-        }
-    }
-
-    /// Best-effort synchronous cleanup, then exit without unwinding.
-    fn force_exit(signal: i32) -> ! {
-        crate::sessions::kill_tracked_children();
-        run_exit_cleanups();
-        super::terminate_by_signal(signal)
-    }
-
-    fn run_exit_cleanups() {
-        // A cleanup that panicked while registered must not stop the others.
-        let cleanups = CLEANUPS.lock().unwrap_or_else(PoisonError::into_inner);
-        for cleanup in cleanups.values() {
-            cleanup();
-        }
-    }
-
-    /// Removes its cleanup when dropped. The owner's normal `Drop` does the
-    /// real work; this is only for a forced exit that skips destructors.
-    #[must_use = "the cleanup is unregistered when this guard drops"]
-    pub struct ExitCleanup(u64);
-
-    impl Drop for ExitCleanup {
-        fn drop(&mut self) {
-            CLEANUPS
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&self.0);
-        }
-    }
-
-    /// Run `cleanup` if the process is forced to exit before the returned
-    /// guard drops. Keep it short and non-blocking: it runs on the way out.
-    pub fn register_exit_cleanup(cleanup: impl Fn() + Send + 'static) -> ExitCleanup {
-        let id = NEXT_CLEANUP.fetch_add(1, Ordering::Relaxed);
-        CLEANUPS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(id, Box::new(cleanup));
-        ExitCleanup(id)
     }
 
     /// Unblock `signal` in this thread and raise it. With the default action
@@ -253,27 +304,6 @@ mod unix {
         use super::*;
 
         #[test]
-        fn exit_cleanups_run_until_their_guard_drops() {
-            use std::sync::Arc;
-            use std::sync::atomic::AtomicUsize;
-
-            let runs = Arc::new(AtomicUsize::new(0));
-            let counted = Arc::clone(&runs);
-            let guard = register_exit_cleanup(move || {
-                counted.fetch_add(1, Ordering::SeqCst);
-            });
-            run_exit_cleanups();
-            assert_eq!(runs.load(Ordering::SeqCst), 1);
-            drop(guard);
-            run_exit_cleanups();
-            assert_eq!(
-                runs.load(Ordering::SeqCst),
-                1,
-                "a dropped guard unregisters"
-            );
-        }
-
-        #[test]
         fn shutdown_signals_skip_only_inherited_ignores() {
             let signals = shutdown_signals();
             for signal in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGHUP] {
@@ -283,8 +313,91 @@ mod unix {
     }
 }
 
-/// Signals are not handled here yet: Ctrl-C keeps the platform default.
-#[cfg(not(unix))]
+/// Console control events through tokio's handler. Ctrl-C and Ctrl-Break
+/// start the same bounded shutdown as SIGINT on Unix; closing the console
+/// window or a system shutdown does too, within the time Windows allows.
+#[cfg(windows)]
+mod windows {
+    use std::sync::OnceLock;
+    use std::thread;
+
+    use anyhow::{Context, Result};
+    use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
+
+    /// Exit statuses follow the Unix convention (`128 + n`): SIGINT for
+    /// Ctrl-C, SIGBREAK (21 in the Windows C runtime) for Ctrl-Break, and
+    /// SIGTERM for a console close or system shutdown.
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+    const SIGBREAK: i32 = 21;
+
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+
+    /// Start taking console control events. The listeners are registered
+    /// before this returns, so the platform default (immediate exit) no
+    /// longer applies. Later calls are no-ops.
+    pub fn install() -> Result<()> {
+        if INSTALLED.get().is_some() {
+            return Ok(());
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("starting the console control runtime")?;
+        let (mut interrupt, mut brk, close, shutdown) = {
+            let _entered = runtime.enter();
+            let interrupt = ctrl_c().context("listening for Ctrl-C")?;
+            let brk = ctrl_break().context("listening for Ctrl-Break")?;
+            // Best effort: without these the platform default still ends the
+            // relay when the console closes or the system shuts down.
+            let close = ctrl_close().ok();
+            let shutdown = ctrl_shutdown().ok();
+            (interrupt, brk, close, shutdown)
+        };
+        thread::Builder::new()
+            .name("wsmp-signals".to_string())
+            .spawn(move || {
+                runtime.block_on(async move {
+                    let mut close = close;
+                    let mut shutdown = shutdown;
+                    loop {
+                        tokio::select! {
+                            Some(()) = interrupt.recv() => {
+                                super::tracked::receive(SIGINT, "CTRL_C");
+                            }
+                            Some(()) = brk.recv() => {
+                                super::tracked::receive(SIGBREAK, "CTRL_BREAK");
+                            }
+                            Some(()) = recv_optional(close.as_mut().map(|c| c.recv())) => {
+                                super::tracked::receive(SIGTERM, "CTRL_CLOSE");
+                            }
+                            Some(()) = recv_optional(shutdown.as_mut().map(|s| s.recv())) => {
+                                super::tracked::receive(SIGTERM, "CTRL_SHUTDOWN");
+                            }
+                            else => break,
+                        }
+                    }
+                });
+            })
+            .context("starting the shutdown signal thread")?;
+        let _ = INSTALLED.set(());
+        Ok(())
+    }
+
+    /// A listener that failed to register never fires.
+    async fn recv_optional<F>(recv: Option<F>) -> Option<()>
+    where
+        F: std::future::Future<Output = Option<()>>,
+    {
+        match recv {
+            Some(recv) => recv.await,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+/// Signals are not handled on this platform: the default action applies.
+#[cfg(not(any(unix, windows)))]
 mod fallback {
     use anyhow::Result;
 
