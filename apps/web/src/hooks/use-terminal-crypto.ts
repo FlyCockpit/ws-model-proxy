@@ -6,6 +6,11 @@ export const DIRECTION_BROWSER_TO_CLI = 0x01;
 export const DIRECTION_CLI_TO_BROWSER = 0x02;
 export const PLAINTEXT_DATA = 0x01;
 export const PLAINTEXT_RESIZE = 0x02;
+export const TERMINAL_HKDF_LABEL_V2 = "wsmp-term-v2";
+export const TERMINAL_BROADCAST_LABEL = "wsmp-term-v2-out";
+export const TERMINAL_APPROVAL_LABEL_V2 = "wsmp-term-approve-v2";
+export const PLAINTEXT_OUTPUT_KEY = 0x03;
+const OUTPUT_KEY_PLAINTEXT_LENGTH = 1 + 4 + 32;
 
 const ECDH_PARAMS = { name: "ECDH", namedCurve: "P-256" } as const;
 const ECDSA_PARAMS = { name: "ECDSA", namedCurve: "P-256" } as const;
@@ -20,6 +25,11 @@ export type TerminalDirection = typeof DIRECTION_BROWSER_TO_CLI | typeof DIRECTI
 export type TerminalPlaintext =
   | { kind: "data"; data: Uint8Array }
   | { kind: "resize"; cols: number; rows: number };
+
+/** v2 plaintexts. `0x03` carries the shared output key and only arrives unicast. */
+export type TerminalPlaintextV2 =
+  | TerminalPlaintext
+  | { kind: "outputKey"; epoch: number; key: Uint8Array };
 
 export type TerminalSessionKeys = {
   ikm: Uint8Array;
@@ -36,6 +46,8 @@ export type ApprovalTranscriptInput = {
   cliPublicKey: Uint8Array;
   cliNonce: Uint8Array;
 };
+
+export type ApprovalTranscriptV2Input = ApprovalTranscriptInput & { viewerId: string };
 
 export type TerminalIdentityProof = {
   publicKey: string;
@@ -357,6 +369,266 @@ export async function verifyApprovalTranscript(
     publicKey,
     toArrayBuffer(signature),
     toArrayBuffer(buildApprovalTranscript(input)),
+  );
+}
+
+// Protocol 2.5 (crypto v2). Every variable-length field is lp16, so no two
+// (terminalId, viewerId) pairs share an HKDF info or an AAD. Ids enter as their
+// UTF-8 wire strings (the viewer id is base64url text).
+
+function assertEpoch(epoch: number): void {
+  if (!Number.isInteger(epoch) || epoch < 1 || epoch > 0xffffffff) {
+    throw new Error("terminal output epoch is out of range");
+  }
+}
+
+function be32(value: number): Uint8Array {
+  const out = new Uint8Array(4);
+  new DataView(out.buffer).setUint32(0, value, false);
+  return out;
+}
+
+function be64(value: bigint): Uint8Array {
+  const out = new Uint8Array(8);
+  new DataView(out.buffer).setBigUint64(0, value, false);
+  return out;
+}
+
+/**
+ * v2 pairwise keys for one viewer. Same ECDH and salt as v1; the info is
+ * `lp16("wsmp-term-v2") ‖ lp16(terminalId) ‖ lp16(viewerId) ‖ cliPub ‖ browserPub`.
+ */
+export async function deriveTerminalSessionKeysV2(input: {
+  browserPrivateKey: CryptoKey;
+  cliPublicKey: CryptoKey;
+  browserNonce: Uint8Array;
+  cliNonce: Uint8Array;
+  terminalId: string;
+  viewerId: string;
+  cliPublicRaw: Uint8Array;
+  browserPublicRaw: Uint8Array;
+}): Promise<TerminalSessionKeys> {
+  if (input.browserNonce.byteLength !== 16 || input.cliNonce.byteLength !== 16) {
+    throw new Error("terminal nonces must be 16 bytes");
+  }
+  const ikm = new Uint8Array(
+    await crypto.subtle.deriveBits(
+      { name: "ECDH", public: input.cliPublicKey },
+      input.browserPrivateKey,
+      256,
+    ),
+  );
+  if (ikm.byteLength !== 32) throw new Error("ECDH IKM must be 32 bytes");
+  const hkdfKey = await crypto.subtle.importKey("raw", toArrayBuffer(ikm), "HKDF", false, [
+    "deriveBits",
+  ]);
+  const okm = new Uint8Array(
+    await crypto.subtle.deriveBits(
+      {
+        name: "HKDF",
+        hash: "SHA-256",
+        salt: toArrayBuffer(concatBytes([input.browserNonce, input.cliNonce])),
+        info: toArrayBuffer(
+          concatBytes([
+            lengthPrefix(textEncoder.encode(TERMINAL_HKDF_LABEL_V2)),
+            lengthPrefix(textEncoder.encode(input.terminalId)),
+            lengthPrefix(textEncoder.encode(input.viewerId)),
+            input.cliPublicRaw,
+            input.browserPublicRaw,
+          ]),
+        ),
+      },
+      hkdfKey,
+      512,
+    ),
+  );
+  const browserToCliRaw = okm.slice(0, 32);
+  const cliToBrowserRaw = okm.slice(32, 64);
+  return {
+    ikm,
+    browserToCliRaw,
+    cliToBrowserRaw,
+    browserToCli: await importAesKey(browserToCliRaw),
+    cliToBrowser: await importAesKey(cliToBrowserRaw),
+  };
+}
+
+export function terminalAadV2(
+  terminalId: string,
+  viewerId: string,
+  direction: TerminalDirection,
+  seq: bigint,
+): Uint8Array {
+  return concatBytes([
+    lengthPrefix(textEncoder.encode(TERMINAL_HKDF_LABEL_V2)),
+    lengthPrefix(textEncoder.encode(terminalId)),
+    lengthPrefix(textEncoder.encode(viewerId)),
+    Uint8Array.of(direction),
+    be64(seq),
+  ]);
+}
+
+/** Nonce `be32(epoch) ‖ be64(seq)`. Epoch and seq both start at 1. */
+export function terminalBroadcastNonce(epoch: number, seq: bigint): Uint8Array {
+  assertEpoch(epoch);
+  if (seq < 1n || seq > 0xffffffffffffffffn) throw new Error("terminal seq is out of range");
+  return concatBytes([be32(epoch), be64(seq)]);
+}
+
+export function terminalBroadcastAad(terminalId: string, epoch: number, seq: bigint): Uint8Array {
+  return concatBytes([
+    lengthPrefix(textEncoder.encode(TERMINAL_BROADCAST_LABEL)),
+    lengthPrefix(textEncoder.encode(terminalId)),
+    be32(epoch),
+    be64(seq),
+  ]);
+}
+
+/** Pairwise (unicast) v2 seal. Nonce `0^4 ‖ be64(seq)`. */
+export async function sealTerminalBytesV2(input: {
+  key: CryptoKey;
+  terminalId: string;
+  viewerId: string;
+  direction: TerminalDirection;
+  seq: bigint;
+  plaintext: Uint8Array;
+}): Promise<Uint8Array> {
+  const sealed = await crypto.subtle.encrypt(
+    {
+      name: "AES-GCM",
+      iv: toArrayBuffer(terminalGcmNonce(input.seq)),
+      additionalData: toArrayBuffer(
+        terminalAadV2(input.terminalId, input.viewerId, input.direction, input.seq),
+      ),
+    },
+    input.key,
+    toArrayBuffer(input.plaintext),
+  );
+  return new Uint8Array(sealed);
+}
+
+export async function openTerminalBytesV2(input: {
+  key: CryptoKey;
+  terminalId: string;
+  viewerId: string;
+  direction: TerminalDirection;
+  seq: bigint;
+  ciphertext: Uint8Array;
+}): Promise<Uint8Array> {
+  const opened = await crypto.subtle.decrypt(
+    {
+      name: "AES-GCM",
+      iv: toArrayBuffer(terminalGcmNonce(input.seq)),
+      additionalData: toArrayBuffer(
+        terminalAadV2(input.terminalId, input.viewerId, input.direction, input.seq),
+      ),
+    },
+    input.key,
+    toArrayBuffer(input.ciphertext),
+  );
+  return new Uint8Array(opened);
+}
+
+/** Imports a 32-byte shared output key delivered in a `0x03` plaintext. */
+export async function importTerminalOutputKey(raw: Uint8Array): Promise<CryptoKey> {
+  if (raw.byteLength !== 32) throw new Error("terminal output key must be 32 bytes");
+  return importAesKey(raw);
+}
+
+/** Broadcast seal under the shared output key. The CLI seals; tests use this too. */
+export async function sealTerminalBroadcast(input: {
+  key: CryptoKey;
+  terminalId: string;
+  epoch: number;
+  seq: bigint;
+  plaintext: Uint8Array;
+}): Promise<Uint8Array> {
+  const sealed = await crypto.subtle.encrypt(
+    {
+      name: "AES-GCM",
+      iv: toArrayBuffer(terminalBroadcastNonce(input.epoch, input.seq)),
+      additionalData: toArrayBuffer(terminalBroadcastAad(input.terminalId, input.epoch, input.seq)),
+    },
+    input.key,
+    toArrayBuffer(input.plaintext),
+  );
+  return new Uint8Array(sealed);
+}
+
+export async function openTerminalBroadcast(input: {
+  key: CryptoKey;
+  terminalId: string;
+  epoch: number;
+  seq: bigint;
+  ciphertext: Uint8Array;
+}): Promise<Uint8Array> {
+  const opened = await crypto.subtle.decrypt(
+    {
+      name: "AES-GCM",
+      iv: toArrayBuffer(terminalBroadcastNonce(input.epoch, input.seq)),
+      additionalData: toArrayBuffer(terminalBroadcastAad(input.terminalId, input.epoch, input.seq)),
+    },
+    input.key,
+    toArrayBuffer(input.ciphertext),
+  );
+  return new Uint8Array(opened);
+}
+
+export function encodeTerminalOutputKey(epoch: number, key: Uint8Array): Uint8Array {
+  assertEpoch(epoch);
+  if (key.byteLength !== 32) throw new Error("terminal output key must be 32 bytes");
+  return concatBytes([Uint8Array.of(PLAINTEXT_OUTPUT_KEY), be32(epoch), key]);
+}
+
+/** v2 decoder. The v1 `decodeTerminalPlaintext` keeps rejecting `0x03`. */
+export function decodeTerminalPlaintextV2(bytes: Uint8Array): TerminalPlaintextV2 {
+  if (bytes[0] !== PLAINTEXT_OUTPUT_KEY) return decodeTerminalPlaintext(bytes);
+  if (bytes.byteLength !== OUTPUT_KEY_PLAINTEXT_LENGTH) {
+    throw new Error("output key plaintext must be 37 bytes");
+  }
+  const epoch = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(1, false);
+  assertEpoch(epoch);
+  return { kind: "outputKey", epoch, key: bytes.slice(5) };
+}
+
+/** v1 transcript with `lp16(viewerId)` after the terminal id. */
+export function buildApprovalTranscriptV2(input: ApprovalTranscriptV2Input): Uint8Array {
+  return concatBytes([
+    lengthPrefix(textEncoder.encode(TERMINAL_APPROVAL_LABEL_V2)),
+    lengthPrefix(textEncoder.encode(input.terminalId)),
+    lengthPrefix(textEncoder.encode(input.viewerId)),
+    lengthPrefix(input.browserPublicKey),
+    lengthPrefix(input.browserNonce),
+    lengthPrefix(input.cliPublicKey),
+    lengthPrefix(input.cliNonce),
+  ]);
+}
+
+export async function signApprovalTranscriptV2(
+  privateKey: CryptoKey,
+  input: ApprovalTranscriptV2Input,
+): Promise<Uint8Array> {
+  const signature = new Uint8Array(
+    await crypto.subtle.sign(
+      { name: "ECDSA", hash: "SHA-256" },
+      privateKey,
+      toArrayBuffer(buildApprovalTranscriptV2(input)),
+    ),
+  );
+  if (signature.byteLength !== 64) throw new Error("expected an IEEE P1363 signature");
+  return signature;
+}
+
+export async function verifyApprovalTranscriptV2(
+  publicKey: CryptoKey,
+  input: ApprovalTranscriptV2Input,
+  signature: Uint8Array,
+): Promise<boolean> {
+  return crypto.subtle.verify(
+    { name: "ECDSA", hash: "SHA-256" },
+    publicKey,
+    toArrayBuffer(signature),
+    toArrayBuffer(buildApprovalTranscriptV2(input)),
   );
 }
 
