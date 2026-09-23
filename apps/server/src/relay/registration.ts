@@ -6,12 +6,17 @@ import {
   declaredContextWindow,
   isContextWindowSeedAdmissible,
 } from "@ws-model-proxy/api/lib/declared-context-window";
+import {
+  ensureDiscoveredInferenceCapacity,
+  fillNullAutoDiscoveredCapacityLimit,
+  isInferenceCapacityWriteRetryable,
+  linkExecutionTargetCapacity,
+} from "@ws-model-proxy/api/lib/discovered-inference-capacity";
 import { resetPoolMemberHealth } from "@ws-model-proxy/api/lib/model-pool-routing";
 import {
   coarseCapabilitiesFromOpenAi,
   resolveEffectiveCapabilityMetadata,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
-import { retryableSerializableTransactionCode } from "@ws-model-proxy/api/lib/serializable-transaction";
 import { directModelId, validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma from "@ws-model-proxy/db";
 import type { EndpointInventory, OpenAiCompatibleCapabilities } from "./protocol.js";
@@ -19,10 +24,6 @@ import type { EndpointInventory, OpenAiCompatibleCapabilities } from "./protocol
 type JsonValue = string | number | boolean | { [key: string]: JsonValue } | JsonValue[];
 
 const INVENTORY_TRANSACTION_MAX_ATTEMPTS = 3;
-
-function isSerializationConflict(error: unknown): boolean {
-  return retryableSerializableTransactionCode(error) !== undefined;
-}
 
 export type DesiredModelCapability = {
   endpointSlug: string;
@@ -402,6 +403,33 @@ export async function persistRelayRegistration({
                 },
                 select: { id: true, inferenceCapacityId: true },
               });
+              // Keep a capacity that is already attached. Otherwise create one
+              // and set the foreign key before this transaction commits.
+              // A null limit on this target's auto key is the schema-hardening
+              // trigger, which cannot see the CLI report. Fill only that null.
+              let inferenceCapacityId = target.inferenceCapacityId;
+              if (inferenceCapacityId === null) {
+                inferenceCapacityId = await ensureDiscoveredInferenceCapacity(tx, {
+                  userId: identity.userId,
+                  discoveredModelId: discoveredModel.id,
+                  upstreamModelId: model.upstreamModelId,
+                  executionTargetId: target.id,
+                  reportedConcurrency: model.concurrencyLimit,
+                });
+                await linkExecutionTargetCapacity(tx, {
+                  executionTargetId: target.id,
+                  userId: identity.userId,
+                  inferenceCapacityId,
+                });
+              } else {
+                await fillNullAutoDiscoveredCapacityLimit(tx, {
+                  userId: identity.userId,
+                  capacityId: inferenceCapacityId,
+                  discoveredModelId: discoveredModel.id,
+                  executionTargetId: target.id,
+                  reportedConcurrency: model.concurrencyLimit,
+                });
+              }
               upsertedTargetIds.add(target.id);
               const declared = declaredContextWindow(
                 resolveEffectiveCapabilityMetadata({
@@ -418,13 +446,10 @@ export async function persistRelayRegistration({
                   endpointCapabilityMetadata: endpoint.defaultCapabilities,
                 }),
               );
-              if (declared != null && target.inferenceCapacityId) {
+              if (declared != null && inferenceCapacityId) {
                 declaredContextByCapacityId.set(
-                  target.inferenceCapacityId,
-                  Math.max(
-                    declaredContextByCapacityId.get(target.inferenceCapacityId) ?? 0,
-                    declared,
-                  ),
+                  inferenceCapacityId,
+                  Math.max(declaredContextByCapacityId.get(inferenceCapacityId) ?? 0, declared),
                 );
               }
               refreshedDiscoveredModelIds.push(discoveredModel.id);
@@ -585,7 +610,10 @@ export async function persistRelayRegistration({
         desiredCapabilities: [],
       };
     } catch (error) {
-      if (!isSerializationConflict(error) || attempt === INVENTORY_TRANSACTION_MAX_ATTEMPTS) {
+      if (
+        !isInferenceCapacityWriteRetryable(error) ||
+        attempt === INVENTORY_TRANSACTION_MAX_ATTEMPTS
+      ) {
         throw error;
       }
     }

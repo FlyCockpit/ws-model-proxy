@@ -174,6 +174,9 @@ const discoveredModelSchema = z
     capabilities: openAiCompatibleCapabilitiesSchema.optional(),
     capabilityOverrideMode: z.enum(["inherit", "override"]).default("inherit"),
     probeSuggestions: openAiCompatibleCapabilitiesSchema.optional(),
+    // Optional per-model hard concurrency. Absent means the registration
+    // default. Omitted from the inventory digest: an existing capacity is kept.
+    concurrencyLimit: z.number().int().min(1).max(10_000).optional(),
   })
   .strict();
 

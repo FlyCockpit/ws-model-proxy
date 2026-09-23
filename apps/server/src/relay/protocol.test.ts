@@ -296,6 +296,37 @@ describe("relay protocol 2.4", () => {
       }),
     );
     expect(parsed).toMatchObject({ type: "hello", protocolVersion: "2.4" });
+    const withConcurrency = JSON.parse(
+      hello("2.4", {
+        protocolVersion: "2.4",
+        ...shared,
+        sharedTokenizerTps: true,
+        standardizedMetrics: true,
+        terminal: true,
+        exec: true,
+        features: {
+          humanTerminal: true,
+          mcpCommands: false,
+          terminalApproval: true,
+          terminalSupported: true,
+        },
+        terminalPublicKey: uncompressedKey(),
+      }),
+    ) as { endpoints: Array<{ models: unknown[] }> };
+    withConcurrency.endpoints[0]?.models.push({
+      upstreamModelId: "llama-local",
+      capabilityOverrideMode: "inherit",
+      concurrencyLimit: 4,
+    });
+    expect(parseRelayClientControlFrame(JSON.stringify(withConcurrency))).toMatchObject({
+      type: "hello",
+      endpoints: [{ models: [{ upstreamModelId: "llama-local", concurrencyLimit: 4 }] }],
+    });
+    withConcurrency.endpoints[0]?.models.splice(0, 1, {
+      upstreamModelId: "llama-local",
+      concurrencyLimit: 0,
+    });
+    expect(() => parseRelayClientControlFrame(JSON.stringify(withConcurrency))).toThrow();
 
     expect(() =>
       parseRelayClientControlFrame(

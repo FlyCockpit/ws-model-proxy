@@ -8,5 +8,6 @@ describe("relay maintenance wiring", () => {
     expect(source).toContain("sweepExpiredPendingTerminals");
     expect(source).toContain("closeBrowserSockets");
     expect(source).toContain("closeIdleRelaySessions");
+    expect(source).toContain("backfillDiscoveredInferenceCapacities()");
   });
 });

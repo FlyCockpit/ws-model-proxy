@@ -3,6 +3,7 @@
 import "@ws-model-proxy/env/load-dotenv";
 
 import { serve } from "@hono/node-server";
+import { backfillDiscoveredInferenceCapacities } from "@ws-model-proxy/api/lib/discovered-inference-capacity";
 import { auth } from "@ws-model-proxy/auth";
 import prisma from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
@@ -87,6 +88,19 @@ async function waitForDependencies() {
 }
 
 await waitForDependencies();
+
+// Attach missing discovered capacities and fill a null hard limit on an
+// auto-created one. Finish before listen so admission does not fail those
+// requests or treat a trigger-created null as unlimited.
+try {
+  await backfillDiscoveredInferenceCapacities();
+} catch (error) {
+  console.error(
+    "[server] FATAL: discovered inference capacity backfill failed.",
+    error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+  );
+  process.exit(1);
+}
 
 // ---------------------------------------------------------------------------
 // Start listening

@@ -27,6 +27,10 @@ import {
   declaredContextWindow,
   isContextWindowSeedAdmissible,
 } from "../lib/declared-context-window";
+import {
+  ensureDiscoveredInferenceCapacity,
+  linkExecutionTargetCapacity,
+} from "../lib/discovered-inference-capacity";
 import type { GuardedPoolCreateFailureReason } from "../lib/guarded-pool-create-reasons";
 import {
   getConfiguredMediaAttachmentMaxBytes,
@@ -918,6 +922,7 @@ async function ownedDiscoveredModel(discoveredModelId: string, userId: string) {
     select: {
       id: true,
       userId: true,
+      upstreamModelId: true,
       capabilityOverrideMode: true,
       capabilityOverrideMetadata: true,
       capabilityOverrides: true,
@@ -2746,9 +2751,25 @@ export const forwarderManagementRouter = {
             },
           },
         });
+        let inferenceCapacityId = target.inferenceCapacityId;
+        if (inferenceCapacityId === null) {
+          inferenceCapacityId = await ensureDiscoveredInferenceCapacity(tx, {
+            userId,
+            discoveredModelId: input.discoveredModelId,
+            upstreamModelId: model.upstreamModelId,
+            executionTargetId: target.id,
+            reportedConcurrency: null,
+          });
+          await linkExecutionTargetCapacity(tx, {
+            executionTargetId: target.id,
+            userId,
+            inferenceCapacityId,
+          });
+          target.inferenceCapacityId = inferenceCapacityId;
+        }
         const seedCandidates = new Map(
-          declaredContext != null && target.inferenceCapacityId
-            ? [[target.inferenceCapacityId, declaredContext]]
+          declaredContext != null && inferenceCapacityId
+            ? [[inferenceCapacityId, declaredContext]]
             : [],
         );
         const targetsSharingCandidateCapacity =

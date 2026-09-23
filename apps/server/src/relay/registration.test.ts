@@ -27,9 +27,51 @@ const db = prisma as unknown as {
     updateMany: MockInstance;
   };
   poolMember: { updateMany: MockInstance };
-  executionTarget: { findMany: MockInstance; upsert: MockInstance };
-  inferenceCapacity: { findMany: MockInstance; updateMany: MockInstance };
+  executionTarget: { findMany: MockInstance; upsert: MockInstance; updateMany: MockInstance };
+  inferenceCapacity: {
+    findMany: MockInstance;
+    findUnique: MockInstance;
+    update: MockInstance;
+    updateMany: MockInstance;
+    upsert: MockInstance;
+  };
 };
+
+type CapacityWriteArgs = {
+  where?: {
+    id?: string;
+    userId?: string;
+    hardConcurrencyLimit?: number | null;
+    runtimeIdentityKey?: { in?: readonly string[] };
+  };
+  data?: { hardConcurrencyLimit?: number | null };
+};
+
+function applyCapacityWrite(
+  row: {
+    id: string;
+    userId: string;
+    runtimeIdentityKey: string;
+    hardConcurrencyLimit: number | null;
+  },
+  args: CapacityWriteArgs,
+): { count: number } {
+  const where = args.where ?? {};
+  if (where.id !== undefined && where.id !== row.id) return { count: 0 };
+  if (where.userId !== undefined && where.userId !== row.userId) return { count: 0 };
+  if (
+    where.hardConcurrencyLimit !== undefined &&
+    where.hardConcurrencyLimit !== row.hardConcurrencyLimit
+  ) {
+    return { count: 0 };
+  }
+  const keys = where.runtimeIdentityKey?.in;
+  if (keys && !keys.includes(row.runtimeIdentityKey)) return { count: 0 };
+  if (args.data && "hardConcurrencyLimit" in args.data) {
+    row.hardConcurrencyLimit = args.data.hardConcurrencyLimit ?? null;
+  }
+  return { count: 1 };
+}
 
 const identity: CliWebsocketIdentity = {
   kind: "cliToken",
@@ -102,8 +144,11 @@ describe("capability override origin", () => {
       inferenceCapacityId: "capacity-id",
     });
     db.executionTarget.findMany.mockResolvedValue([{ id: "execution-target-id" }]);
+    db.executionTarget.updateMany.mockResolvedValue({ count: 1 });
     db.inferenceCapacity.findMany.mockResolvedValue([]);
+    db.inferenceCapacity.findUnique.mockResolvedValue(null);
     db.inferenceCapacity.updateMany.mockResolvedValue({ count: 0 });
+    db.inferenceCapacity.upsert.mockResolvedValue({ id: "ensured-capacity" });
   });
 
   it("treats only dashboard origin as protected", () => {
@@ -237,7 +282,11 @@ describe("capability override origin", () => {
       now,
     });
 
-    expect(db.inferenceCapacity.updateMany).not.toHaveBeenCalled();
+    expect(db.inferenceCapacity.updateMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ physicalMaxContext: expect.any(Number) }),
+      }),
+    );
   });
 
   it("does not seed a capacity shared with a target outside this registration", async () => {
@@ -292,7 +341,11 @@ describe("capability override origin", () => {
       now,
     });
 
-    expect(db.inferenceCapacity.updateMany).not.toHaveBeenCalled();
+    expect(db.inferenceCapacity.updateMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ physicalMaxContext: expect.any(Number) }),
+      }),
+    );
   });
 
   it("applies a CLI override when the existing row is CLI-owned or untagged", async () => {
@@ -424,5 +477,344 @@ describe("capability override origin", () => {
     });
     expect(db.discoveredModel.findMany).not.toHaveBeenCalled();
     expect(result.desiredCapabilities).toEqual([]);
+  });
+
+  it("creates one discovered capacity, stores its id, and seeds declared context", async () => {
+    db.executionTarget.upsert.mockResolvedValue({
+      id: "execution-target-id",
+      inferenceCapacityId: null,
+    });
+    db.inferenceCapacity.upsert.mockResolvedValue({ id: "new-capacity" });
+    db.inferenceCapacity.findMany.mockResolvedValue([
+      {
+        id: "new-capacity",
+        physicalMaxContext: null,
+        ExecutionTargets: [
+          {
+            id: "execution-target-id",
+            directContextCeiling: null,
+            directContextMargin: 0,
+            PoolMembers: [],
+          },
+        ],
+      },
+    ]);
+
+    await persistRelayRegistration({
+      identity,
+      cli: { slug: "desktop", label: "Desktop" },
+      endpoints: [
+        {
+          slug: "local-openai",
+          label: "Local OpenAI",
+          kind: "openai-compatible",
+          status: "online",
+          defaultCapabilities: {
+            version: 4,
+            protocol: "openai-compatible",
+            surfaces: {
+              openaiChatCompletions: {
+                source: "declared",
+                confidence: "exact",
+                streaming: true,
+                maxContextTokens: 8_192,
+                operations: ["create"],
+              },
+            },
+          },
+          models: [{ upstreamModelId: "llama-local", capabilityOverrideMode: "inherit" }],
+        },
+      ],
+      inventoryConfirmed: true,
+      endpointTargeting: true,
+      now,
+    });
+
+    expect(db.inferenceCapacity.upsert).toHaveBeenCalledTimes(1);
+    expect(db.inferenceCapacity.upsert).toHaveBeenCalledWith({
+      where: {
+        userId_runtimeIdentityKey: {
+          userId: "user-id",
+          runtimeIdentityKey: "discovered-model:model-id",
+        },
+      },
+      update: {},
+      create: {
+        userId: "user-id",
+        label: "Discovered model model-id",
+        runtimeIdentityKey: "discovered-model:model-id",
+        runtimeModel: "llama-local",
+        hardConcurrencyLimit: 1,
+        countStrategy: "CONSERVATIVE_ESTIMATE",
+      },
+      select: { id: true },
+    });
+    expect(db.executionTarget.updateMany).toHaveBeenCalledWith({
+      where: { id: "execution-target-id", userId: "user-id", inferenceCapacityId: null },
+      data: { inferenceCapacityId: "new-capacity" },
+    });
+    expect(db.inferenceCapacity.updateMany).toHaveBeenCalledWith({
+      where: { id: "new-capacity", userId: "user-id", physicalMaxContext: null },
+      data: { physicalMaxContext: 8_192 },
+    });
+  });
+
+  it("stores the CLI-reported concurrency when the registration payload has one", async () => {
+    db.executionTarget.upsert.mockResolvedValue({
+      id: "execution-target-id",
+      inferenceCapacityId: null,
+    });
+    db.inferenceCapacity.upsert.mockResolvedValue({ id: "new-capacity" });
+
+    await persistRelayRegistration({
+      identity,
+      cli: { slug: "desktop", label: "Desktop" },
+      endpoints: [
+        {
+          slug: "local-openai",
+          label: "Local OpenAI",
+          kind: "openai-compatible",
+          status: "online",
+          defaultCapabilities: {
+            version: 1,
+            protocol: "openai-compatible",
+            chatCompletions: { supported: true },
+          },
+          models: [
+            {
+              upstreamModelId: "llama-local",
+              capabilityOverrideMode: "inherit",
+              concurrencyLimit: 4,
+            },
+          ],
+        },
+      ],
+      inventoryConfirmed: true,
+      endpointTargeting: true,
+      now,
+    });
+
+    expect(db.inferenceCapacity.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ hardConcurrencyLimit: 4 }),
+      }),
+    );
+  });
+
+  it("does not create another capacity when the same model registers again", async () => {
+    db.executionTarget.upsert
+      .mockResolvedValueOnce({ id: "execution-target-id", inferenceCapacityId: null })
+      .mockResolvedValueOnce({ id: "execution-target-id", inferenceCapacityId: "new-capacity" });
+    db.inferenceCapacity.upsert.mockResolvedValue({ id: "new-capacity" });
+
+    const registration = {
+      identity,
+      cli: { slug: "desktop", label: "Desktop" },
+      endpoints: inventoryEndpoints(),
+      inventoryConfirmed: true,
+      endpointTargeting: true,
+      now,
+    };
+    await persistRelayRegistration(registration);
+    await persistRelayRegistration(registration);
+
+    expect(db.inferenceCapacity.upsert).toHaveBeenCalledTimes(1);
+    expect(db.executionTarget.updateMany).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an execution target capacity that is already attached", async () => {
+    db.executionTarget.upsert.mockResolvedValue({
+      id: "execution-target-id",
+      inferenceCapacityId: "kept-capacity",
+    });
+    db.inferenceCapacity.findMany.mockResolvedValue([
+      {
+        id: "kept-capacity",
+        physicalMaxContext: null,
+        ExecutionTargets: [
+          {
+            id: "execution-target-id",
+            directContextCeiling: null,
+            directContextMargin: 0,
+            PoolMembers: [],
+          },
+        ],
+      },
+    ]);
+
+    await persistRelayRegistration({
+      identity,
+      cli: { slug: "desktop", label: "Desktop" },
+      endpoints: [
+        {
+          slug: "local-openai",
+          label: "Local OpenAI",
+          kind: "openai-compatible",
+          status: "online",
+          defaultCapabilities: {
+            version: 4,
+            protocol: "openai-compatible",
+            surfaces: {
+              openaiChatCompletions: {
+                source: "declared",
+                confidence: "exact",
+                streaming: true,
+                maxContextTokens: 4_096,
+                operations: ["create"],
+              },
+            },
+          },
+          models: [{ upstreamModelId: "llama-local", capabilityOverrideMode: "inherit" }],
+        },
+      ],
+      inventoryConfirmed: true,
+      endpointTargeting: true,
+      now,
+    });
+
+    expect(db.inferenceCapacity.upsert).not.toHaveBeenCalled();
+    expect(db.executionTarget.updateMany).not.toHaveBeenCalled();
+    expect(db.inferenceCapacity.updateMany).toHaveBeenCalledWith({
+      where: { id: "kept-capacity", userId: "user-id", physicalMaxContext: null },
+      data: { physicalMaxContext: 4_096 },
+    });
+  });
+
+  function preAttachedRegistration(concurrencyLimit?: number) {
+    return {
+      identity,
+      cli: { slug: "desktop", label: "Desktop" },
+      endpoints: [
+        {
+          slug: "local-openai",
+          label: "Local OpenAI",
+          kind: "openai-compatible" as const,
+          status: "online" as const,
+          defaultCapabilities: {
+            version: 1 as const,
+            protocol: "openai-compatible" as const,
+            chatCompletions: { supported: true },
+          },
+          models: [
+            {
+              upstreamModelId: "llama-local",
+              capabilityOverrideMode: "inherit" as const,
+              ...(concurrencyLimit === undefined ? {} : { concurrencyLimit }),
+            },
+          ],
+        },
+      ],
+      inventoryConfirmed: true,
+      endpointTargeting: true,
+      now,
+    };
+  }
+
+  it("fills a null limit on a pre-attached trigger capacity with the CLI report", async () => {
+    // The schema-hardening trigger was not executed. Prisma is mocked. This row
+    // is the capacity that trigger would attach, with hardConcurrencyLimit omitted.
+    const row = {
+      id: "trigger-capacity",
+      userId: "user-id",
+      runtimeIdentityKey: "execution-target:execution-target-id",
+      hardConcurrencyLimit: null as number | null,
+    };
+    db.executionTarget.upsert.mockResolvedValue({
+      id: "execution-target-id",
+      inferenceCapacityId: row.id,
+    });
+    db.inferenceCapacity.updateMany.mockImplementation(async (args: CapacityWriteArgs) =>
+      applyCapacityWrite(row, args),
+    );
+
+    await persistRelayRegistration(preAttachedRegistration(4));
+
+    expect(row.hardConcurrencyLimit).toBe(4);
+    expect(db.inferenceCapacity.upsert).not.toHaveBeenCalled();
+    expect(db.inferenceCapacity.update).not.toHaveBeenCalled();
+    expect(db.executionTarget.updateMany).not.toHaveBeenCalled();
+    expect(db.inferenceCapacity.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: "trigger-capacity",
+        userId: "user-id",
+        hardConcurrencyLimit: null,
+        runtimeIdentityKey: {
+          in: ["execution-target:execution-target-id", "discovered-model:model-id"],
+        },
+      },
+      data: { hardConcurrencyLimit: 4 },
+    });
+  });
+
+  it("fills an omitted CLI concurrency on a pre-attached trigger capacity with 1", async () => {
+    const row = {
+      id: "trigger-capacity",
+      userId: "user-id",
+      runtimeIdentityKey: "discovered-model:model-id",
+      hardConcurrencyLimit: null as number | null,
+    };
+    db.executionTarget.upsert.mockResolvedValue({
+      id: "execution-target-id",
+      inferenceCapacityId: row.id,
+    });
+    db.inferenceCapacity.updateMany.mockImplementation(async (args: CapacityWriteArgs) =>
+      applyCapacityWrite(row, args),
+    );
+
+    await persistRelayRegistration(preAttachedRegistration());
+
+    expect(row.hardConcurrencyLimit).toBe(1);
+    expect(db.executionTarget.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("does not rewrite a pre-attached capacity whose hard limit is already 4", async () => {
+    const row = {
+      id: "trigger-capacity",
+      userId: "user-id",
+      runtimeIdentityKey: "execution-target:execution-target-id",
+      hardConcurrencyLimit: 4,
+    };
+    db.executionTarget.upsert.mockResolvedValue({
+      id: "execution-target-id",
+      inferenceCapacityId: row.id,
+    });
+    db.inferenceCapacity.updateMany.mockImplementation(async (args: CapacityWriteArgs) =>
+      applyCapacityWrite(row, args),
+    );
+
+    await persistRelayRegistration(preAttachedRegistration());
+
+    expect(row.hardConcurrencyLimit).toBe(4);
+    expect(db.inferenceCapacity.upsert).not.toHaveBeenCalled();
+    expect(db.inferenceCapacity.update).not.toHaveBeenCalled();
+    expect(db.executionTarget.updateMany).not.toHaveBeenCalled();
+    for (const call of db.inferenceCapacity.updateMany.mock.calls) {
+      const args = call[0] as CapacityWriteArgs;
+      if (args.data && "hardConcurrencyLimit" in args.data) {
+        expect(args.where?.hardConcurrencyLimit).toBeNull();
+      }
+    }
+  });
+
+  it("does not change a pre-attached capacity with a different runtime key", async () => {
+    const row = {
+      id: "custom-capacity",
+      userId: "user-id",
+      runtimeIdentityKey: "execution-target:other-target",
+      hardConcurrencyLimit: null as number | null,
+    };
+    db.executionTarget.upsert.mockResolvedValue({
+      id: "execution-target-id",
+      inferenceCapacityId: row.id,
+    });
+    db.inferenceCapacity.updateMany.mockImplementation(async (args: CapacityWriteArgs) =>
+      applyCapacityWrite(row, args),
+    );
+
+    await persistRelayRegistration(preAttachedRegistration());
+
+    expect(row.hardConcurrencyLimit).toBeNull();
+    expect(db.inferenceCapacity.upsert).not.toHaveBeenCalled();
+    expect(db.executionTarget.updateMany).not.toHaveBeenCalled();
   });
 });
