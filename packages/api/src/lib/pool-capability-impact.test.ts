@@ -1,8 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("@ws-model-proxy/env/server", () => ({
-  env: { MODEL_API_PROTOCOL_ADAPTATION_ENABLED: true },
-}));
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
   return {

@@ -8,6 +8,7 @@ import type { WSContext } from "hono/ws";
 import { authLimiter, createRateLimiterMiddleware } from "../rate-limit.js";
 import { parseRelaySubprotocolHeader, RELAY_SUBPROTOCOL } from "./protocol.js";
 import { type RelaySocket, relaySessionManager } from "./session-manager.js";
+import { settleSocketHandler } from "./socket-handler.js";
 
 type RelayVariables = {
   relayIdentity: CliWebsocketIdentity;
@@ -26,9 +27,12 @@ export function createRelayWebsocketMiddleware(): MiddlewareHandler<{ Variables:
     if (c.req.header("upgrade")?.toLowerCase() !== "websocket") {
       return c.json({ error: "WebSocket upgrade required." }, 426);
     }
+    if (relaySessionManager.isDraining()) {
+      return c.json({ error: "Server is shutting down." }, 503);
+    }
 
-    await rateLimit(c, async () => undefined);
-    if (c.res.status === 429) return c.res;
+    const limited = await rateLimit(c, async () => undefined);
+    if (limited instanceof Response) return limited;
 
     const requestedProtocol = parseRelaySubprotocolHeader(c.req.header("sec-websocket-protocol"));
     if (!requestedProtocol.supported) {
@@ -105,7 +109,7 @@ export function relayUpgradeHandler() {
       onMessage(event, ws) {
         const socket = relaySocketFor(ws);
         if (typeof event.data === "string") {
-          void relaySessionManager.handleTextFrame(socket, event.data);
+          settleSocketHandler("cli text", relaySessionManager.handleTextFrame(socket, event.data));
           return;
         }
         if (event.data instanceof ArrayBuffer) {
@@ -114,15 +118,21 @@ export function relayUpgradeHandler() {
       },
       onClose(_event, ws) {
         const socket = relaySocketFor(ws);
-        void relaySessionManager.removeSession(socket).finally(() => {
-          relaySockets.delete(ws);
-        });
+        settleSocketHandler(
+          "cli close",
+          relaySessionManager.removeSession(socket).finally(() => {
+            relaySockets.delete(ws);
+          }),
+        );
       },
       onError(_event, ws) {
         const socket = relaySocketFor(ws);
-        void relaySessionManager.removeSession(socket).finally(() => {
-          relaySockets.delete(ws);
-        });
+        settleSocketHandler(
+          "cli error",
+          relaySessionManager.removeSession(socket).finally(() => {
+            relaySockets.delete(ws);
+          }),
+        );
       },
     };
   });

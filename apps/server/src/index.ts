@@ -3,13 +3,18 @@
 import "@ws-model-proxy/env/load-dotenv";
 
 import { serve } from "@hono/node-server";
+import { backfillDiscoveredInferenceCapacities } from "@ws-model-proxy/api/lib/discovered-inference-capacity";
 import { auth } from "@ws-model-proxy/auth";
 import prisma from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
 import { WebSocketServer } from "ws";
 import { createApp } from "./app.js";
 import { installBetterCallErrorLogShim } from "./better-call-error-log-shim.js";
-import { runGracefulShutdownSequence } from "./graceful-shutdown.js";
+import {
+  drainHttpWithDeadline,
+  runGracefulShutdownSequence,
+  runWithDeadline,
+} from "./graceful-shutdown.js";
 import { startOauthCleanup } from "./mcp/oauth-cleanup.js";
 import { startMediaCleanup } from "./media/cleanup.js";
 import { startCacheAffinityCleanup } from "./model-api/cache-affinity-runtime.js";
@@ -19,8 +24,11 @@ import {
 } from "./model-api/provider-attempt-lifecycle.js";
 import { startProviderBudgetRepair } from "./model-api/provider-budget-runtime.js";
 import { startRelayTelemetryRecovery } from "./model-api/relay-telemetry-recovery.js";
-import { RELAY_SUBPROTOCOL } from "./relay/protocol.js";
+import { warnMissingProviderCredentialKeyring } from "./provider-keyring-startup.js";
+import { sweepExpiredTokenCommands } from "./relay/cli-commands.js";
+import { RELAY_SUBPROTOCOL, RELAY_WS_MAX_PAYLOAD_BYTES } from "./relay/protocol.js";
 import { relaySessionManager } from "./relay/session-manager.js";
+import { terminalBrowserHub } from "./relay/terminal-websocket.js";
 import { configureHttpServerTimeouts } from "./server-timeouts.js";
 import { startSessionCleanup } from "./session-cleanup.js";
 
@@ -43,6 +51,11 @@ if (env.CORS_ORIGIN === "*") {
   );
   process.exit(1);
 }
+
+warnMissingProviderCredentialKeyring({
+  egressEnabled: env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
+  keyring: env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS,
+});
 
 // ---------------------------------------------------------------------------
 // App construction (middleware + routes live in ./app.ts — createApp)
@@ -86,11 +99,26 @@ async function waitForDependencies() {
 
 await waitForDependencies();
 
+// Attach missing discovered capacities and fill a null hard limit on an
+// auto-created one. Finish before listen so admission does not fail those
+// requests or treat a trigger-created null as unlimited.
+try {
+  await backfillDiscoveredInferenceCapacities();
+} catch (error) {
+  console.error(
+    "[server] FATAL: discovered inference capacity backfill failed.",
+    error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+  );
+  process.exit(1);
+}
+
 // ---------------------------------------------------------------------------
 // Start listening
 // ---------------------------------------------------------------------------
 
 const DRAIN_TIMEOUT_MS = 10_000;
+/** Bound on the final relay close (DB writes for CLIs still busy at drain end). */
+const RELAY_CLOSE_TIMEOUT_MS = 5_000;
 const serverPort = env.SERVER_PORT ?? env.PORT ?? 3000;
 
 const server = serve(
@@ -100,6 +128,7 @@ const server = serve(
     websocket: {
       server: new WebSocketServer({
         noServer: true,
+        maxPayload: RELAY_WS_MAX_PAYLOAD_BYTES,
         handleProtocols(protocols) {
           return protocols.has(RELAY_SUBPROTOCOL) ? RELAY_SUBPROTOCOL : false;
         },
@@ -138,6 +167,47 @@ const stopOauthCleanup = startOauthCleanup();
 // idempotent sweep uses the same shutdown-fenced lifecycle as OAuth cleanup.
 const stopSessionCleanup = startSessionCleanup();
 
+function startUnrefInterval(tick: () => void, intervalMs: number): () => void {
+  const timer = setInterval(tick, intervalMs);
+  timer.unref();
+  return () => clearInterval(timer);
+}
+
+const stopStaleRelaySessions = startUnrefInterval(() => {
+  void relaySessionManager.checkStaleSessions().catch((error: unknown) => {
+    console.error(
+      "[server] stale relay session sweep failed",
+      error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+    );
+  });
+  try {
+    relaySessionManager.sweepExpiredPendingTerminals();
+  } catch (error) {
+    console.error(
+      "[server] pending terminal sweep failed",
+      error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+    );
+  }
+}, 15_000);
+const stopCliCommandSweep = startUnrefInterval(() => {
+  try {
+    sweepExpiredTokenCommands();
+  } catch (error) {
+    console.error(
+      "[server] CLI command sweep failed",
+      error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+    );
+  }
+}, 60_000);
+const stopTerminalSessionRecheck = startUnrefInterval(() => {
+  void terminalBrowserHub.recheckSessions().catch((error: unknown) => {
+    console.error(
+      "[server] terminal session recheck failed",
+      error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+    );
+  });
+}, 60_000);
+
 // ---------------------------------------------------------------------------
 // Graceful shutdown — drain in-flight requests, then close dependencies
 // ---------------------------------------------------------------------------
@@ -159,12 +229,30 @@ async function shutdown(signal: string) {
       stopProviderAttemptExpiry?.();
       stopOauthCleanup?.();
       stopSessionCleanup();
+      stopStaleRelaySessions();
+      stopCliCommandSweep();
+      stopTerminalSessionRecheck();
       relaySessionManager.dispose();
       await capacityLifecycle?.close();
     },
+    closeBrowserSockets: () => {
+      terminalBrowserHub.closeAll();
+    },
+    closeRelaySessions: () =>
+      runWithDeadline(
+        () => relaySessionManager.closeRelaySessions(),
+        RELAY_CLOSE_TIMEOUT_MS,
+        "relay session close",
+      ),
     // 1. Stop accepting new connections and drain in-flight requests.
+    //    ORDER: admission stops first (relay drain flag makes terminal and
+    //    CLI upgrades return 503; server.close stops new connections), THEN
+    //    the drain deadline starts, THEN idle CLI sockets close and their DB
+    //    writes run inside that deadline. A locked device row can use up the
+    //    deadline but never extend it.
     //    NORMAL drain: graceful — server.close waits for in-flight requests
-    //    to finish. DRAIN TIMEOUT (F8): forcibly terminate every lingering
+    //    to finish; busy CLI sockets stay until their request finishes.
+    //    DRAIN TIMEOUT (F8): forcibly terminate every lingering
     //    connection so requests that are still reading their bodies ABORT
     //    (their request signals fire, their body streams error) — the MCP
     //    admission gate below then settles and the teardown sequence is
@@ -172,9 +260,26 @@ async function shutdown(signal: string) {
     //    passed the body cap but never finished sending could proceed to
     //    the MCP factory DURING/AFTER the Prisma disconnect.
     drainHttp: () =>
-      new Promise<void>((resolve) => {
-        const timeout = setTimeout(() => {
-          console.warn("[server] Drain timeout reached, forcing close.");
+      drainHttpWithDeadline({
+        timeoutMs: DRAIN_TIMEOUT_MS,
+        stopAdmission: () => {
+          relaySessionManager.beginDrain();
+          return new Promise<void>((resolve) => {
+            server.close((err) => {
+              if (err) {
+                // Sanitized (L19): constructor name only — close errors can
+                // carry arbitrary message content.
+                console.error(
+                  `[server] Error closing HTTP server: (${err.constructor?.name ?? "Error"})`,
+                );
+              }
+              resolve();
+            });
+          });
+        },
+        // Drop CLI sockets that are not carrying a model request.
+        closeIdleRelaySessions: () => relaySessionManager.closeIdleRelaySessions(),
+        forceCloseConnections: () => {
           // Feature-detect for TYPE reasons, not runtime availability:
           // serve() uses Node's default HTTP constructor here, so the
           // runtime server always implements closeAllConnections() /
@@ -187,20 +292,7 @@ async function shutdown(signal: string) {
           };
           nodeServer.closeAllConnections?.();
           nodeServer.closeIdleConnections?.();
-          resolve();
-        }, DRAIN_TIMEOUT_MS);
-
-        server.close((err) => {
-          clearTimeout(timeout);
-          if (err) {
-            // Sanitized (L19): constructor name only — close errors can
-            // carry arbitrary message content.
-            console.error(
-              `[server] Error closing HTTP server: (${err.constructor?.name ?? "Error"})`,
-            );
-          }
-          resolve();
-        });
+        },
       }),
     // 2. Close the admission gate AND the module-lifetime MCP handler —
     //    AFTER the HTTP drain (normal-drain requests finished; nothing

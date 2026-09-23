@@ -24,6 +24,27 @@ export function rejectUnknown(
     unsupported(`${path}.${unknown}`, "has unknown semantics and is not safely adaptable");
 }
 
+/** Drop envelope keys that are not allowlisted. Log names only, and only when one was ignored. */
+export function ignoreUnknownEnvelopeFields(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  path: string,
+  seen?: Set<string>,
+) {
+  const set = new Set(allowed);
+  const fields = Object.keys(value).filter((key) => !set.has(key));
+  const fresh = seen
+    ? fields.filter((field) => {
+        const key = `${path}\0${field}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+    : fields;
+  if (fresh.length === 0) return;
+  console.debug("[model-api] ignored upstream envelope fields", { path, fields: fresh });
+}
+
 const chatEnvelopeNullFields = [
   "prompt_logprobs",
   "prompt_token_ids",
@@ -39,13 +60,17 @@ function acceptNullOnly(value: Record<string, unknown>, path: string, fields: re
   for (const field of fields) if (value[field] != null) unsupported(`${path}.${field}`);
 }
 
-/** Chat envelope fields that carry no cross-protocol answer. Null means absent. */
+/**
+ * Chat envelope fields that carry no cross-protocol answer. Null means absent.
+ * Unknown keys are ignored.
+ */
 export function acceptChatEnvelopeExtras(
   body: Record<string, unknown>,
   path: string,
   mode: "final" | "chunk",
+  seen?: Set<string>,
 ) {
-  rejectUnknown(
+  ignoreUnknownEnvelopeFields(
     body,
     [
       "id",
@@ -59,6 +84,7 @@ export function acceptChatEnvelopeExtras(
       ...chatEnvelopeNullFields,
     ],
     path,
+    seen,
   );
   acceptNullOnly(body, path, chatEnvelopeNullFields);
 }
@@ -66,17 +92,19 @@ export function acceptChatEnvelopeExtras(
 /**
  * `stop_reason` on a chat choice is an internal token id, not a protocol stop
  * reason, so any value is ignored. `token_ids` and `routed_experts` are absent
- * only when null.
+ * only when null. Other unknown choice keys are ignored.
  */
 export function acceptChatChoiceExtras(
   choice: Record<string, unknown>,
   path: string,
   contentKey: "message" | "delta",
+  seen?: Set<string>,
 ) {
-  rejectUnknown(
+  ignoreUnknownEnvelopeFields(
     choice,
     ["index", contentKey, "finish_reason", "logprobs", "stop_reason", ...chatChoiceNullFields],
     path,
+    seen,
   );
   acceptNullOnly(choice, path, chatChoiceNullFields);
 }
@@ -90,10 +118,12 @@ const chatMessageFields = [
   "audio",
   "function_call",
   "reasoning",
+  "reasoning_content",
 ] as const;
 
 // Null audio, a null function_call, and empty annotations are absence.
-// Reasoning text is omitted. A final message or completed stream that contains only reasoning still fails.
+// `reasoning` and `reasoning_content` are omitted. A final message or completed
+// stream whose only visible text is either field still fails.
 export function acceptChatMessageExtras(
   message: Record<string, unknown>,
   path: string,
@@ -109,16 +139,22 @@ export function acceptChatMessageExtras(
     if (message.annotations.length)
       unsupported(`${path}.annotations`, "citations are not safely adaptable");
   }
-  const reasoning = message.reasoning;
-  if (reasoning === undefined || reasoning === null || reasoning === "")
-    return { droppedReasoningText: false };
-  if (typeof reasoning !== "string") invalid(`${path}.reasoning`, "must be text or null");
-  const hasContent = typeof message.content === "string" && message.content.length > 0;
-  const hasRefusal = typeof message.refusal === "string" && message.refusal.length > 0;
-  const hasTools = Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
-  if (mode === "final" && !hasContent && !hasRefusal && !hasTools)
-    unsupported(`${path}.reasoning`, "is the only visible text");
-  return { droppedReasoningText: true };
+  const dropped: Array<"reasoning" | "reasoning_content"> = [];
+  for (const field of ["reasoning", "reasoning_content"] as const) {
+    const reasoning = message[field];
+    if (reasoning === undefined || reasoning === null || reasoning === "") continue;
+    if (typeof reasoning !== "string") invalid(`${path}.${field}`, "must be text or null");
+    dropped.push(field);
+  }
+  const droppedField = dropped[0];
+  if (mode === "final" && droppedField) {
+    const hasContent = typeof message.content === "string" && message.content.length > 0;
+    const hasRefusal = typeof message.refusal === "string" && message.refusal.length > 0;
+    const hasTools = Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
+    if (!hasContent && !hasRefusal && !hasTools)
+      unsupported(`${path}.${droppedField}`, "is the only visible text");
+  }
+  return { droppedReasoningText: droppedField !== undefined };
 }
 
 export function acceptTokenCountDetails(value: unknown, path: string, allowed: readonly string[]) {

@@ -220,6 +220,13 @@ export default defineConfig(({ mode }) => {
       // so `pnpm dev` keeps its localhost-only default.
       host: process.env.VITE_DEV_HOST === "true" ? true : undefined,
       proxy: {
+        // Listed before `/api` so the terminal socket is not swallowed by the HTTP proxy.
+        "/api/dashboard/terminal/ws": {
+          target: devProxyTarget.ws,
+          ws: true,
+          changeOrigin: true,
+          secure: false,
+        },
         "/api": { target: devProxyTarget.http, changeOrigin: true, secure: false },
         "/rpc": { target: devProxyTarget.http, changeOrigin: true, secure: false },
         "/ws": { target: devProxyTarget.ws, ws: true, changeOrigin: true, secure: false },

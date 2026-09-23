@@ -131,10 +131,13 @@ import {
   ADAPTER_VERSION,
   AdapterError,
   adaptNonstreamResponse,
+  type CanonicalRequest,
   CanonicalStreamRenderer,
   createProtocolAdaptationTransform,
+  executionTargetAcceptsTopK,
   type ProtocolSurface,
   parseCanonicalRequest,
+  reasoningControlForSurface,
   renderCanonicalRequest,
   renderProtocolError,
   renderProtocolErrorMetadata,
@@ -186,11 +189,6 @@ type ModelApiRouteDependencies = {
     | "completeRelayRequest"
   >;
   concurrencyLimiter?: ModelApiConcurrencyLimiter;
-  /** Test/deployment release gate; defaults to the validated env flag. */
-  anthropicEnabled?: boolean;
-  /** Independent release gate for opt-in pool protocol adaptation. */
-  protocolAdaptationEnabled?: boolean;
-  capacityEnabled?: boolean;
   capacityRuntime?: CapacityAdmissionRuntime;
 };
 
@@ -261,27 +259,12 @@ type RelayOperation = {
   contextCount?: ContextCountTelemetry;
   contextInput?: JsonObject;
   adaptation?: {
-    featureEnabled: boolean;
     poolEnabled: boolean;
     allowLossyDeveloperRoleCollapse: boolean;
     requestedSurface: ProtocolSurface;
     payload: JsonObject;
   };
 };
-
-function adaptedStreamingRefusalMessage(
-  operation: Pick<RelayOperation, "family" | "stream">,
-  executions: Iterable<{ mode: string; limitations: readonly string[] } | null | undefined>,
-): string | undefined {
-  if (operation.family !== "messages" || !operation.stream) return undefined;
-  const blockedOnlyByInitialUsage = [...executions].some(
-    (execution) =>
-      execution?.mode === "unavailable" &&
-      execution.limitations.length === 1 &&
-      execution.limitations[0] === "anthropic_initial_usage_unavailable",
-  );
-  return blockedOnlyByInitialUsage ? "Streaming is unavailable for this target." : undefined;
-}
 
 function operationFailureResponse(
   operation: Pick<RelayOperation, "family">,
@@ -1382,6 +1365,7 @@ function adaptedResponseBody({
   headers,
   signal,
   onProtocolError,
+  request,
 }: {
   body: ReadableStream<Uint8Array>;
   source: ProtocolSurface;
@@ -1391,6 +1375,7 @@ function adaptedResponseBody({
   headers: Headers;
   signal: AbortSignal;
   onProtocolError?: (error: unknown) => void;
+  request?: CanonicalRequest;
 }): ReadableStream<Uint8Array> {
   if (stream)
     return body.pipeThrough(
@@ -1398,6 +1383,7 @@ function adaptedResponseBody({
         source,
         target,
         signal,
+        request,
         recoverProtocolErrors: onProtocolError !== undefined,
         onProtocolError,
       }),
@@ -1657,6 +1643,29 @@ function targetStreamTerminal(target: ProtocolSurface, chunk: Uint8Array): boole
   return /event: (?:message_stop|error)\r?\n/.test(text);
 }
 
+function renderForExecutionTarget({
+  request,
+  target,
+  model,
+  allowLossyDeveloperRoleCollapse,
+  capabilities,
+}: {
+  request: CanonicalRequest;
+  target: ProtocolSurface;
+  model: string;
+  allowLossyDeveloperRoleCollapse?: boolean;
+  capabilities: OpenAiCompatibleCapabilities | null | undefined;
+}) {
+  return renderCanonicalRequest({
+    request,
+    target,
+    model,
+    allowLossyDeveloperRoleCollapse,
+    acceptsTopK: executionTargetAcceptsTopK({ capabilityInventory: capabilities }),
+    reasoning: reasoningControlForSurface(capabilities ?? null, target),
+  });
+}
+
 function executionPathForPoolMember(
   capabilities: OpenAiCompatibleCapabilities | null,
   operation: RelayOperation,
@@ -1664,8 +1673,7 @@ function executionPathForPoolMember(
 ) {
   const requestedSurface = requestedSurfaceForOperation(operation);
   if (!requestedSurface) return null;
-  const adaptationEnabled =
-    operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled;
+  const adaptationEnabled = operation.adaptation?.poolEnabled === true;
   const responsesOperation = responsesOperationForRelay(operation);
   const rawRequirements = operation.adaptation
     ? profileSurfaceRequest(operation.adaptation.payload)
@@ -3643,8 +3651,7 @@ async function relayPool({
       body: built.body,
       signal: request.signal,
       releaseLocalCapacity: releaseProviderCapacity,
-      adaptationEnabled:
-        operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled,
+      adaptationEnabled: operation.adaptation?.poolEnabled === true,
       chatTestRoutingMode: testRoutingMode,
       forcedPoolMemberId: options?.forcedProviderMemberId ?? forcedPoolMemberId,
       retrySafe:
@@ -3665,12 +3672,13 @@ async function relayPool({
       contextCountConfidence: operation.contextCount?.confidence,
       renderForTarget: canonical
         ? async (providerTarget, targetSurface) => {
-            const payload = renderCanonicalRequest({
+            const payload = renderForExecutionTarget({
               request: canonical,
               target: targetSurface,
               model: providerTarget.upstreamModelId,
               allowLossyDeveloperRoleCollapse:
                 operation.adaptation?.allowLossyDeveloperRoleCollapse,
+              capabilities: providerTarget.capabilityInventory,
             });
             const headers = new Headers({ "content-type": "application/json" });
             if (providerTarget.protocol === "anthropic")
@@ -3997,6 +4005,7 @@ async function relayPool({
             status: result.response.status,
             headers: result.response.headers,
             signal: request.signal,
+            request: canonical ?? undefined,
           }),
           {
             status: result.response.status,
@@ -4094,7 +4103,7 @@ async function relayPool({
       )
     : members;
   let canonicalAdaptationRequest: ReturnType<typeof parseCanonicalRequest> | null = null;
-  if (operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled) {
+  if (operation.adaptation?.poolEnabled === true) {
     try {
       canonicalAdaptationRequest = parseCanonicalRequest(
         operation.adaptation.requestedSurface,
@@ -4126,11 +4135,12 @@ async function relayPool({
     const source = execution.nativeSurface ? protocolSurface(execution.nativeSurface) : null;
     if (!source || !canonicalAdaptationRequest) return false;
     try {
-      renderCanonicalRequest({
+      renderForExecutionTarget({
         request: canonicalAdaptationRequest,
         target: source,
         model: member.DiscoveredModel.upstreamModelId,
         allowLossyDeveloperRoleCollapse: operation.adaptation?.allowLossyDeveloperRoleCollapse,
+        capabilities: effectivePoolMemberCapabilities(member),
       });
       return true;
     } catch {
@@ -4222,8 +4232,7 @@ async function relayPool({
       stream: operation.stream,
       requiredFeatures,
       requestedOutputTokens,
-      adaptationEnabled:
-        operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled,
+      adaptationEnabled: operation.adaptation?.poolEnabled === true,
       renderForTarget: canonicalAdaptationRequest
         ? async () => {
             throw new Error("Compatibility probe only.");
@@ -4318,11 +4327,7 @@ async function relayPool({
       startedAt,
       failure: "unsupported_capability",
     });
-    return operationFailureResponse(
-      operation,
-      "unsupported_capability",
-      adaptedStreamingRefusalMessage(operation, executionByMember.values()),
-    );
+    return operationFailureResponse(operation, "unsupported_capability");
   }
 
   const activeCliDeviceIds = manager.getActiveCliDeviceIds();
@@ -4776,11 +4781,12 @@ async function relayPool({
             "unsupported_adaptation",
             "Request is outside the strict adapted subset.",
           );
-        const rendered = renderCanonicalRequest({
+        const rendered = renderForExecutionTarget({
           request: canonicalAdaptationRequest,
           target: adaptedSource,
           model: candidate.upstreamModelId,
           allowLossyDeveloperRoleCollapse: operation.adaptation.allowLossyDeveloperRoleCollapse,
+          capabilities: effectivePoolMemberCapabilities(member),
         });
         if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
         const adaptedHeaders = new Headers(builtRequest.headers);
@@ -5024,6 +5030,7 @@ async function relayPool({
               status: started.status,
               headers: started.headers,
               signal: request.signal,
+              request: canonicalAdaptationRequest ?? undefined,
               onProtocolError: () => {
                 protocolFailureObserved = true;
               },
@@ -5228,6 +5235,7 @@ async function relayPool({
             status: started.status,
             headers: responseHeaders,
             signal: request.signal,
+            request: canonicalAdaptationRequest ?? undefined,
           });
         responseHeaders = new Headers();
         responseHeaders.set(
@@ -6208,7 +6216,6 @@ async function relayPreparedModeledRequest({
   operation,
   manager,
   limiter,
-  adaptationFeatureEnabled = false,
   capacityRuntime,
 }: {
   request: Request;
@@ -6219,7 +6226,6 @@ async function relayPreparedModeledRequest({
   };
   prepared: PreparedModeledRequest;
   operation: Omit<RelayOperation, "stream" | "buildRequest">;
-  adaptationFeatureEnabled?: boolean;
   capacityRuntime?: CapacityAdmissionRuntime;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
@@ -6339,7 +6345,6 @@ async function relayPreparedModeledRequest({
         (operation.family === "messages" && operation.capability === "messages.create"))
         ? {
             adaptation: {
-              featureEnabled: adaptationFeatureEnabled,
               poolEnabled: poolTarget.protocolAdaptationEnabled,
               allowLossyDeveloperRoleCollapse: poolTarget.allowLossyDeveloperRoleCollapse,
               requestedSurface:
@@ -6379,7 +6384,6 @@ async function authenticatedModeledHandler({
   prepare,
   manager,
   limiter,
-  adaptationFeatureEnabled,
   capacityRuntime,
 }: {
   request: Request;
@@ -6387,7 +6391,6 @@ async function authenticatedModeledHandler({
   prepare: (request: Request) => Promise<PreparedModeledRequest | Response>;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
-  adaptationFeatureEnabled?: boolean;
   capacityRuntime?: CapacityAdmissionRuntime;
 }) {
   const token = await authenticateRequest(request);
@@ -6420,7 +6423,6 @@ async function authenticatedModeledHandler({
       operation,
       manager,
       limiter,
-      adaptationFeatureEnabled,
       capacityRuntime,
     });
     responseReturned = true;
@@ -6435,14 +6437,12 @@ async function completionsHandler({
   family,
   manager,
   limiter,
-  adaptationFeatureEnabled,
   capacityRuntime,
 }: {
   request: Request;
   family: "chat.completions";
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
-  adaptationFeatureEnabled?: boolean;
   capacityRuntime?: CapacityAdmissionRuntime;
 }) {
   return authenticatedModeledHandler({
@@ -6456,7 +6456,6 @@ async function completionsHandler({
     prepare: prepareJsonModeledRequest,
     manager,
     limiter,
-    adaptationFeatureEnabled,
     capacityRuntime,
   });
 }
@@ -6763,13 +6762,11 @@ export async function responsesCreateHandler({
   manager,
   limiter,
   capacityRuntime,
-  adaptationFeatureEnabled,
   chatTestUserId,
 }: {
   request: Request;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
-  adaptationFeatureEnabled?: boolean;
   capacityRuntime?: CapacityAdmissionRuntime;
   chatTestUserId?: string;
 }) {
@@ -6807,7 +6804,6 @@ export async function responsesCreateHandler({
       operation,
       manager,
       limiter,
-      adaptationFeatureEnabled,
       capacityRuntime,
     });
   }
@@ -6988,7 +6984,6 @@ export async function anthropicMessagesHandler({
   countTokens,
   manager,
   limiter,
-  adaptationFeatureEnabled,
   capacityRuntime,
   chatTestUserId,
 }: {
@@ -6996,7 +6991,6 @@ export async function anthropicMessagesHandler({
   countTokens: boolean;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
-  adaptationFeatureEnabled?: boolean;
   capacityRuntime?: CapacityAdmissionRuntime;
   chatTestUserId?: string;
 }) {
@@ -7032,7 +7026,6 @@ export async function anthropicMessagesHandler({
     },
     manager,
     limiter,
-    adaptationFeatureEnabled,
     capacityRuntime,
   });
   // Native upstream success and error bytes are intentionally opaque here.
@@ -7040,18 +7033,18 @@ export async function anthropicMessagesHandler({
   return response;
 }
 
-export function createModelApiRoutes({
-  manager = relaySessionManager,
-  concurrencyLimiter = modelApiConcurrencyLimiter,
-  anthropicEnabled = env.MODEL_API_ANTHROPIC_ENABLED,
-  protocolAdaptationEnabled = env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
-  capacityEnabled = env.MODEL_API_GLOBAL_CAPACITY_ENABLED,
-  capacityRuntime,
-}: ModelApiRouteDependencies = {}) {
+export function createModelApiRoutes(dependencies: ModelApiRouteDependencies = {}) {
+  const manager = dependencies.manager ?? relaySessionManager;
+  const concurrencyLimiter = dependencies.concurrencyLimiter ?? modelApiConcurrencyLimiter;
   const app = new Hono();
-  const admissionRuntime = capacityEnabled
-    ? (capacityRuntime ?? new StoreCapacityAdmissionRuntime(new PostgresCapacityAdmissionStore()))
-    : undefined;
+  // Durable admission is the default. Production always passes the process
+  // runtime. Omitting the property builds the Postgres store so a caller
+  // cannot silently fall back to the in-process limiter. An explicit
+  // capacityRuntime: undefined is only the unit-test double.
+  const admissionRuntime =
+    "capacityRuntime" in dependencies
+      ? dependencies.capacityRuntime
+      : new StoreCapacityAdmissionRuntime(new PostgresCapacityAdmissionStore());
 
   app.get("/models", async (c) => {
     const token = await authenticateRequest(c.req.raw);
@@ -7068,7 +7061,6 @@ export function createModelApiRoutes({
       family: "chat.completions",
       manager,
       limiter: concurrencyLimiter,
-      adaptationFeatureEnabled: protocolAdaptationEnabled,
       capacityRuntime: admissionRuntime,
     }),
   );
@@ -7086,7 +7078,6 @@ export function createModelApiRoutes({
       manager,
       limiter: concurrencyLimiter,
       capacityRuntime: admissionRuntime,
-      adaptationFeatureEnabled: protocolAdaptationEnabled,
     }),
   );
 
@@ -7141,33 +7132,29 @@ export function createModelApiRoutes({
       request: c.req.raw,
       manager,
       limiter: concurrencyLimiter,
-      adaptationFeatureEnabled: protocolAdaptationEnabled,
       capacityRuntime: admissionRuntime,
     }),
   );
 
-  if (anthropicEnabled) {
-    app.post("/messages", async (c) =>
-      anthropicMessagesHandler({
-        request: c.req.raw,
-        countTokens: false,
-        manager,
-        limiter: concurrencyLimiter,
-        adaptationFeatureEnabled: protocolAdaptationEnabled,
-        capacityRuntime: admissionRuntime,
-      }),
-    );
+  app.post("/messages", async (c) =>
+    anthropicMessagesHandler({
+      request: c.req.raw,
+      countTokens: false,
+      manager,
+      limiter: concurrencyLimiter,
+      capacityRuntime: admissionRuntime,
+    }),
+  );
 
-    app.post("/messages/count_tokens", async (c) =>
-      anthropicMessagesHandler({
-        request: c.req.raw,
-        countTokens: true,
-        manager,
-        limiter: concurrencyLimiter,
-        capacityRuntime: admissionRuntime,
-      }),
-    );
-  }
+  app.post("/messages/count_tokens", async (c) =>
+    anthropicMessagesHandler({
+      request: c.req.raw,
+      countTokens: true,
+      manager,
+      limiter: concurrencyLimiter,
+      capacityRuntime: admissionRuntime,
+    }),
+  );
 
   app.post("/responses/count_tokens", async (c) =>
     authenticatedModeledHandler({

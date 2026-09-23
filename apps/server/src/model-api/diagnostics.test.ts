@@ -6,6 +6,7 @@ import type { Session } from "@ws-model-proxy/auth";
 import { Hono } from "hono";
 import { beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import type { ActiveRelayResponseHandlers, RelaySessionManager } from "../relay/session-manager.js";
+import type { CapacityAdmissionRuntime } from "./capacity/runtime.js";
 
 /**
  * Phase 5 extracted diagnostic cores: `runPoolMemberTest` and
@@ -19,7 +20,7 @@ import type { ActiveRelayResponseHandlers, RelaySessionManager } from "../relay/
 const envState = vi.hoisted(() => ({
   values: {
     BETTER_AUTH_SECRET: "test-better-auth-secret-value-32chars!",
-    MODEL_API_GLOBAL_CAPACITY_ENABLED: false,
+    WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: false,
   },
 }));
 
@@ -39,6 +40,29 @@ vi.mock("@ws-model-proxy/api/lib/model-api-token-access", () => ({
 const { diagnosticsCapacityRuntime, runChatCompletionDiagnostic, runPoolMemberTest } = await import(
   "./diagnostics"
 );
+
+function admittingCapacityRuntime(): CapacityAdmissionRuntime {
+  return {
+    acquire: vi.fn(async (attempt) => {
+      const selected = attempt.candidates[0];
+      if (!selected) return { state: "CANCELLED" as const };
+      return {
+        state: "ADMITTED" as const,
+        lease: {
+          leaseId: `lease-${selected.poolMemberId ?? selected.executionTargetId}`,
+          attemptId: attempt.attemptId,
+          capacityId: selected.capacityId,
+          executionTargetId: selected.executionTargetId,
+          poolMemberId: selected.poolMemberId,
+          fencingToken: 1n,
+          expiresAt: new Date(Date.now() + 30_000),
+        },
+      };
+    }),
+    release: vi.fn(async () => true),
+    hold: vi.fn((response) => response),
+  };
+}
 const { createPoolMemberTestRoutes } = await import("./pool-member-test");
 const { ModelApiConcurrencyLimiter } = await import("./limits");
 const { default: prisma } = await import("@ws-model-proxy/db");
@@ -218,6 +242,7 @@ const poolTarget: VisibleModelPoolTarget = {
   publicEgressAcknowledged: false,
   effectiveProviderEgress: false,
   providerPrimaryMemberCount: 0,
+  providerAccountLabels: [],
   allowLossyDeveloperRoleCollapse: false,
   recommendedSurfaceOverride: null,
 };
@@ -242,6 +267,13 @@ function directRow() {
         chatCompletions: { supported: true, streaming: true },
       },
       CliDevice: { status: "CONNECTED" },
+    },
+    ExecutionTarget: {
+      id: "model-target",
+      inferenceCapacityId: "model-capacity",
+      directContextCeiling: null,
+      directContextMargin: 0,
+      InferenceCapacity: null,
     },
   };
 }
@@ -275,7 +307,6 @@ const session = {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  envState.values.MODEL_API_GLOBAL_CAPACITY_ENABLED = false;
   db.$transaction.mockImplementation(async (input: unknown) => {
     if (typeof input === "function") return input(db);
     return Promise.all(input as Promise<unknown>[]);
@@ -473,6 +504,7 @@ describe("runChatCompletionDiagnostic — bounded provider-safe summary", () => 
   it("projects a successful completion without ever returning the raw body", async () => {
     const manager = new FakeRelayManager();
     const diagnosticPromise = runChatCompletionDiagnostic({
+      capacityRuntime: admittingCapacityRuntime(),
       userId: "user-id",
       body: {
         model: directTarget.modelId,
@@ -512,6 +544,7 @@ describe("runChatCompletionDiagnostic — bounded provider-safe summary", () => 
     const manager = new FakeRelayManager();
     const longText = "x".repeat(5_000);
     const diagnosticPromise = runChatCompletionDiagnostic({
+      capacityRuntime: admittingCapacityRuntime(),
       userId: "user-id",
       body: {
         model: directTarget.modelId,
@@ -540,6 +573,7 @@ describe("runChatCompletionDiagnostic — bounded provider-safe summary", () => 
   it("surfaces upstream rejections as the provider error type, never the message", async () => {
     const manager = new FakeRelayManager();
     const diagnosticPromise = runChatCompletionDiagnostic({
+      capacityRuntime: admittingCapacityRuntime(),
       userId: "user-id",
       body: { model: directTarget.modelId, messages: [{ role: "user", content: "hi" }] },
       manager,
@@ -564,6 +598,7 @@ describe("runChatCompletionDiagnostic — bounded provider-safe summary", () => 
   it("maps unparseable upstream bodies and completions without assistant text", async () => {
     const manager = new FakeRelayManager();
     const first = runChatCompletionDiagnostic({
+      capacityRuntime: admittingCapacityRuntime(),
       userId: "user-id",
       body: { model: directTarget.modelId, messages: [{ role: "user", content: "hi" }] },
       manager,
@@ -576,6 +611,7 @@ describe("runChatCompletionDiagnostic — bounded provider-safe summary", () => 
     await expect(first).resolves.toEqual({ outcome: "unparseable-response", status: 200 });
 
     const second = runChatCompletionDiagnostic({
+      capacityRuntime: admittingCapacityRuntime(),
       userId: "user-id",
       body: { model: directTarget.modelId, messages: [{ role: "user", content: "hi" }] },
       manager,
@@ -591,6 +627,7 @@ describe("runChatCompletionDiagnostic — bounded provider-safe summary", () => 
   it("maps the core's own request validation failure to invalid-request", async () => {
     await expect(
       runChatCompletionDiagnostic({
+        capacityRuntime: admittingCapacityRuntime(),
         userId: "user-id",
         body: { messages: [] },
         manager: new FakeRelayManager(),
@@ -603,19 +640,10 @@ describe("runChatCompletionDiagnostic — bounded provider-safe summary", () => 
 });
 
 describe("diagnosticsCapacityRuntime — module-lifetime singleton", () => {
-  it("is undefined while the capacity flag is off", () => {
-    envState.values.MODEL_API_GLOBAL_CAPACITY_ENABLED = false;
-    expect(diagnosticsCapacityRuntime()).toBeUndefined();
-  });
-
-  it("returns the SAME instance across calls (and transports) while enabled", () => {
-    envState.values.MODEL_API_GLOBAL_CAPACITY_ENABLED = true;
+  it("returns the SAME instance across calls and transports", () => {
     const first = diagnosticsCapacityRuntime();
     const second = diagnosticsCapacityRuntime();
-    expect(first).toBeDefined();
     expect(second).toBe(first);
-    envState.values.MODEL_API_GLOBAL_CAPACITY_ENABLED = false;
-    expect(diagnosticsCapacityRuntime()).toBeUndefined();
   });
 });
 
@@ -662,6 +690,7 @@ describe("G2 — stable outcomes only (failure data never crosses the core)", ()
   it("an unknown upstream error.type maps to the generic stable kind", async () => {
     const manager = new FakeRelayManager();
     const diagnosticPromise = runChatCompletionDiagnostic({
+      capacityRuntime: admittingCapacityRuntime(),
       userId: "user-id",
       body: { model: directTarget.modelId, messages: [{ role: "user", content: "hi" }] },
       manager,
@@ -766,6 +795,7 @@ describe("G1 — caller-signal cancellation threads into the cores", () => {
     const manager = new FakeRelayManager();
     const controller = new AbortController();
     const diagnosticPromise = runChatCompletionDiagnostic({
+      capacityRuntime: admittingCapacityRuntime(),
       userId: "user-id",
       body: { model: directTarget.modelId, messages: [{ role: "user", content: "hi" }] },
       manager,

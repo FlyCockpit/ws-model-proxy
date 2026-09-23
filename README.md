@@ -43,7 +43,7 @@ Self-hosted web app plus CLI for exposing locally hosted OpenAI-compatible model
 
 The runtime is intentionally reduced to the product web service, CLI, Postgres, Better Auth, i18n, and the PWA shell.
 
-An optional MCP (Model Context Protocol) server exposes dashboard operations to OAuth-authenticated clients behind `WMP_MCP_ENABLED` — see [docs/mcp.md](docs/mcp.md).
+An MCP (Model Context Protocol) server exposes dashboard operations to OAuth-authenticated clients. It is on by default; set `WMP_MCP_ENABLED=false` to close it — see [docs/mcp.md](docs/mcp.md).
 
 ## Local Development
 

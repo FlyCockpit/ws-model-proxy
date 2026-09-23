@@ -7,17 +7,9 @@ import {
 } from "./forwarder-dashboard-sections";
 
 describe("resolveCapacityAvailability", () => {
-  it.each([
-    [true, true, "enabled"],
-    [false, true, "disabled"],
-    [undefined, true, "error"],
-    [undefined, false, "loading"],
-  ] as const)(
-    "prefers resolved capacity value %s when config error is %s",
-    (value, isError, expected) => {
-      expect(resolveCapacityAvailability(value, isError)).toBe(expected);
-    },
-  );
+  it("treats capacity admission as always enabled", () => {
+    expect(resolveCapacityAvailability()).toBe("enabled");
+  });
 });
 
 describe("shouldShowCapacitySection", () => {

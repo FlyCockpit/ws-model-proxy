@@ -6,12 +6,17 @@ import {
   declaredContextWindow,
   isContextWindowSeedAdmissible,
 } from "@ws-model-proxy/api/lib/declared-context-window";
+import {
+  ensureDiscoveredInferenceCapacity,
+  fillNullAutoDiscoveredCapacityLimit,
+  isInferenceCapacityWriteRetryable,
+  linkExecutionTargetCapacity,
+} from "@ws-model-proxy/api/lib/discovered-inference-capacity";
 import { resetPoolMemberHealth } from "@ws-model-proxy/api/lib/model-pool-routing";
 import {
   coarseCapabilitiesFromOpenAi,
   resolveEffectiveCapabilityMetadata,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
-import { retryableSerializableTransactionCode } from "@ws-model-proxy/api/lib/serializable-transaction";
 import { directModelId, validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma from "@ws-model-proxy/db";
 import type { EndpointInventory, OpenAiCompatibleCapabilities } from "./protocol.js";
@@ -19,10 +24,6 @@ import type { EndpointInventory, OpenAiCompatibleCapabilities } from "./protocol
 type JsonValue = string | number | boolean | { [key: string]: JsonValue } | JsonValue[];
 
 const INVENTORY_TRANSACTION_MAX_ATTEMPTS = 3;
-
-function isSerializationConflict(error: unknown): boolean {
-  return retryableSerializableTransactionCode(error) !== undefined;
-}
 
 export type DesiredModelCapability = {
   endpointSlug: string;
@@ -105,6 +106,16 @@ export function inventoryDigestFor(endpoints: EndpointInventory[]): string {
   return createHash("sha256").update(stableJson(identity)).digest("hex");
 }
 
+export type ReportedRelayFeatures = {
+  cliVersion: string | null;
+  relayProtocolVersion: string;
+  reportedHumanTerminal: boolean | null;
+  reportedMcpCommands: boolean | null;
+  reportedTerminalApproval: boolean | null;
+  reportedTerminalSupported: boolean | null;
+  featuresReportedAt: Date | null;
+};
+
 export async function persistRelayRegistration({
   identity,
   cli,
@@ -112,6 +123,7 @@ export async function persistRelayRegistration({
   inventoryConfirmed,
   endpointTargeting,
   connection = false,
+  reported,
   now = new Date(),
 }: {
   identity: CliWebsocketIdentity;
@@ -120,10 +132,14 @@ export async function persistRelayRegistration({
   inventoryConfirmed: boolean;
   endpointTargeting: boolean;
   connection?: boolean;
+  /** Hello only. inventory.update must omit this so reported columns stay put. */
+  reported?: ReportedRelayFeatures;
   now?: Date;
 }): Promise<{
   cliDeviceId: string;
   userId: string;
+  allowHumanTerminal: boolean;
+  allowMcpCommands: boolean;
   revision: { inventorySeq: number; inventoryDigest: string; inventoryAcknowledgedAt: string };
   desiredCapabilities: DesiredModelCapability[];
 }> {
@@ -133,6 +149,20 @@ export async function persistRelayRegistration({
   }
 
   const inventoryDigest = inventoryDigestFor(endpoints);
+  // Grants (allowHumanTerminal / allowMcpCommands) are server-owned and are
+  // never written here. Reported columns are hello-only.
+  const reportedData =
+    connection && reported
+      ? {
+          cliVersion: reported.cliVersion,
+          relayProtocolVersion: reported.relayProtocolVersion,
+          reportedHumanTerminal: reported.reportedHumanTerminal,
+          reportedMcpCommands: reported.reportedMcpCommands,
+          reportedTerminalApproval: reported.reportedTerminalApproval,
+          reportedTerminalSupported: reported.reportedTerminalSupported,
+          featuresReportedAt: reported.featuresReportedAt,
+        }
+      : {};
 
   for (let attempt = 1; attempt <= INVENTORY_TRANSACTION_MAX_ATTEMPTS; attempt += 1) {
     try {
@@ -160,6 +190,7 @@ export async function persistRelayRegistration({
                     connectionCount: { increment: 1 },
                   }
                 : {}),
+              ...reportedData,
             },
             create: {
               userId: identity.userId,
@@ -171,6 +202,7 @@ export async function persistRelayRegistration({
               lastConnectedAt: now,
               lastHeartbeatAt: now,
               connectionCount: 1,
+              ...reportedData,
             },
             select: {
               id: true,
@@ -180,6 +212,8 @@ export async function persistRelayRegistration({
               inventoryDigest: true,
               inventoryAcknowledgedAt: true,
               inventoryConfirmed: true,
+              allowHumanTerminal: true,
+              allowMcpCommands: true,
             },
           });
 
@@ -369,6 +403,33 @@ export async function persistRelayRegistration({
                 },
                 select: { id: true, inferenceCapacityId: true },
               });
+              // Keep a capacity that is already attached. Otherwise create one
+              // and set the foreign key before this transaction commits.
+              // A null limit on this target's auto key is the schema-hardening
+              // trigger, which cannot see the CLI report. Fill only that null.
+              let inferenceCapacityId = target.inferenceCapacityId;
+              if (inferenceCapacityId === null) {
+                inferenceCapacityId = await ensureDiscoveredInferenceCapacity(tx, {
+                  userId: identity.userId,
+                  discoveredModelId: discoveredModel.id,
+                  upstreamModelId: model.upstreamModelId,
+                  executionTargetId: target.id,
+                  reportedConcurrency: model.concurrencyLimit,
+                });
+                await linkExecutionTargetCapacity(tx, {
+                  executionTargetId: target.id,
+                  userId: identity.userId,
+                  inferenceCapacityId,
+                });
+              } else {
+                await fillNullAutoDiscoveredCapacityLimit(tx, {
+                  userId: identity.userId,
+                  capacityId: inferenceCapacityId,
+                  discoveredModelId: discoveredModel.id,
+                  executionTargetId: target.id,
+                  reportedConcurrency: model.concurrencyLimit,
+                });
+              }
               upsertedTargetIds.add(target.id);
               const declared = declaredContextWindow(
                 resolveEffectiveCapabilityMetadata({
@@ -385,13 +446,10 @@ export async function persistRelayRegistration({
                   endpointCapabilityMetadata: endpoint.defaultCapabilities,
                 }),
               );
-              if (declared != null && target.inferenceCapacityId) {
+              if (declared != null && inferenceCapacityId) {
                 declaredContextByCapacityId.set(
-                  target.inferenceCapacityId,
-                  Math.max(
-                    declaredContextByCapacityId.get(target.inferenceCapacityId) ?? 0,
-                    declared,
-                  ),
+                  inferenceCapacityId,
+                  Math.max(declaredContextByCapacityId.get(inferenceCapacityId) ?? 0, declared),
                 );
               }
               refreshedDiscoveredModelIds.push(discoveredModel.id);
@@ -536,6 +594,8 @@ export async function persistRelayRegistration({
           return {
             cliDeviceId: cliDevice.id,
             userId: cliDevice.userId,
+            allowHumanTerminal: cliDevice.allowHumanTerminal === true,
+            allowMcpCommands: cliDevice.allowMcpCommands === true,
             revision: {
               inventorySeq: acknowledged.inventorySeq,
               inventoryDigest: acknowledged.inventoryDigest ?? inventoryDigest,
@@ -550,7 +610,10 @@ export async function persistRelayRegistration({
         desiredCapabilities: [],
       };
     } catch (error) {
-      if (!isSerializationConflict(error) || attempt === INVENTORY_TRANSACTION_MAX_ATTEMPTS) {
+      if (
+        !isInferenceCapacityWriteRetryable(error) ||
+        attempt === INVENTORY_TRANSACTION_MAX_ATTEMPTS
+      ) {
         throw error;
       }
     }

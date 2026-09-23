@@ -9,9 +9,9 @@ import { MEDIA_ATTACHMENT_MAX_BYTES_MAX } from "@ws-model-proxy/config/media-pol
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
+import type { LiveCliFeatureSnapshot } from "../context";
 import { protectedProcedure } from "../index";
 import {
-  assertCapacityManagementEnabled,
   assertEffectiveConcurrencyPolicy,
   assertEffectiveContextPolicy,
   assertModelPoolCapacityPolicy,
@@ -26,6 +26,23 @@ import {
   declaredContextWindow,
   isContextWindowSeedAdmissible,
 } from "../lib/declared-context-window";
+import {
+  ensureDiscoveredInferenceCapacity,
+  linkExecutionTargetCapacity,
+} from "../lib/discovered-inference-capacity";
+import {
+  effectiveProviderEgress,
+  egressProviderAccountLabels,
+  grantPoolAccessServerMessages,
+  providerPrimaryMemberCount,
+  providerPrimaryMemberWhere,
+} from "../lib/effective-provider-egress";
+import {
+  countProviderPrimaryMembers,
+  deliverGranteePrivacyEmails,
+  gateSharedPoolPrivacyChange,
+  recordGranteePrivacyNotices,
+} from "../lib/grantee-privacy";
 import type { GuardedPoolCreateFailureReason } from "../lib/guarded-pool-create-reasons";
 import {
   getConfiguredMediaAttachmentMaxBytes,
@@ -59,6 +76,7 @@ import {
   providerModelSurfaceCapabilities,
 } from "../lib/pool-recommended-surface";
 import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
+import { relayProtocolAtLeast } from "../lib/relay-protocol-version";
 import { runSerializableTransaction } from "../lib/serializable-transaction";
 import {
   type ModelApiSurface,
@@ -126,6 +144,7 @@ const poolTransformerFields = {
   transformerTimeoutMs: z.number().int().min(1_000).max(600_000).nullable().optional(),
   transformerMaxAssets: z.number().int().min(1).max(64).nullable().optional(),
 };
+
 function hasModelPoolCapacityPolicy(input: Record<string, unknown>): boolean {
   return (
     input.capacityPriority !== undefined ||
@@ -302,6 +321,14 @@ const listCliDevicesSelect = {
   inventoryAcknowledgedAt: true,
   inventoryConfirmed: true,
   endpointTargeting: true,
+  allowHumanTerminal: true,
+  allowMcpCommands: true,
+  cliVersion: true,
+  relayProtocolVersion: true,
+  reportedHumanTerminal: true,
+  reportedMcpCommands: true,
+  reportedTerminalApproval: true,
+  reportedTerminalSupported: true,
   User: { select: { slug: true } },
   Endpoints: {
     orderBy: { createdAt: "asc" as const },
@@ -482,10 +509,10 @@ async function serializeVisibleTargets(targets: VisibleModelTargets) {
         })
       : [],
   ]);
-  const poolCompatibility = new Map(
+  const serializedPools = new Map(
     poolRows.map((row) => {
       const serialized = serializePool(row);
-      return [row.id, serialized.compatibility] as const;
+      return [row.id, serialized] as const;
     }),
   );
   return {
@@ -519,7 +546,16 @@ async function serializeVisibleTargets(targets: VisibleModelTargets) {
       maxAttachmentBytes: pool.maxAttachmentBytes,
       publicEgressEnabled: pool.publicEgressEnabled,
       publicEgressAcknowledged: pool.publicEgressAcknowledged,
-      compatibility: poolCompatibility.get(pool.id) ?? null,
+      effectiveProviderEgress: pool.effectiveProviderEgress,
+      providerAccountLabels: egressProviderAccountLabels({
+        publicEgressEnabled:
+          serializedPools.get(pool.id)?.publicEgressEnabled ?? pool.publicEgressEnabled,
+        members: (serializedPools.get(pool.id)?.members ?? []).map((member) => ({
+          tier: member.tier,
+          accountLabel: member.providerModel?.ProviderAccount.label ?? null,
+        })),
+      }),
+      compatibility: serializedPools.get(pool.id)?.compatibility ?? null,
       attachmentModalities: modalities.poolById.get(pool.id) ?? {
         image: false,
         audio: false,
@@ -545,7 +581,24 @@ function effectiveCapabilities(endpoint: EndpointRow, model: DiscoveredModelRow)
   };
 }
 
-function serializeCliDevice(row: CliDeviceRow, now: Date) {
+function liveTerminalFeature(snapshot: LiveCliFeatureSnapshot | null): boolean {
+  return (
+    relayProtocolAtLeast(snapshot?.protocolVersion, "2.4") &&
+    snapshot?.humanTerminal === true &&
+    snapshot.terminalSupported === true
+  );
+}
+
+function liveCommandFeature(snapshot: LiveCliFeatureSnapshot | null): boolean {
+  return relayProtocolAtLeast(snapshot?.protocolVersion, "2.4") && snapshot?.mcpCommands === true;
+}
+
+function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSnapshot | null) {
+  const terminalLive = liveTerminalFeature(live);
+  const commandsLive = liveCommandFeature(live);
+  const terminalDeviceAllows = row.reportedHumanTerminal ?? null;
+  const terminalSupported = row.reportedTerminalSupported ?? null;
+  const commandsDeviceAllows = row.reportedMcpCommands ?? null;
   const staleAt = row.lastHeartbeatAt
     ? new Date(row.lastHeartbeatAt.getTime() + CLI_HEARTBEAT_STALE_AFTER_MS)
     : null;
@@ -567,6 +620,27 @@ function serializeCliDevice(row: CliDeviceRow, now: Date) {
     inventoryAcknowledgedAt: row.inventoryAcknowledgedAt,
     inventoryConfirmed: row.inventoryConfirmed,
     endpointTargeting: row.endpointTargeting,
+    cliVersion: row.cliVersion ?? null,
+    relayProtocolVersion: row.relayProtocolVersion ?? null,
+    features: {
+      terminal: {
+        granted: row.allowHumanTerminal === true,
+        deviceAllows: terminalDeviceAllows,
+        supported: terminalSupported,
+        live: terminalLive,
+        available:
+          row.allowHumanTerminal === true &&
+          terminalDeviceAllows === true &&
+          terminalLive &&
+          terminalSupported === true,
+      },
+      commands: {
+        granted: row.allowMcpCommands === true,
+        deviceAllows: commandsDeviceAllows,
+        live: commandsLive,
+        available: row.allowMcpCommands === true && commandsDeviceAllows === true && commandsLive,
+      },
+    },
     endpoints: row.Endpoints.map((endpoint) => ({
       id: endpoint.id,
       createdAt: endpoint.createdAt,
@@ -624,8 +698,7 @@ function serializeCliDevice(row: CliDeviceRow, now: Date) {
 }
 
 function serializePool(row: ModelPoolRow) {
-  const protocolAdaptationAvailable = env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED;
-  const adaptationEnabled = row.protocolAdaptationEnabled && protocolAdaptationAvailable;
+  const adaptationEnabled = row.protocolAdaptationEnabled;
   const recommendedSurfaceOverride = parseModelApiSurface(row.recommendedSurfaceOverride);
   const memberCapabilities = (model: PoolMemberModelRow) =>
     discoveredModelSurfaceCapabilities(model);
@@ -727,9 +800,12 @@ function serializePool(row: ModelPoolRow) {
     maxAttachmentBytes: row.maxAttachmentBytes,
     optimisticBasicTranscription: row.optimisticBasicTranscription,
     protocolAdaptationEnabled: row.protocolAdaptationEnabled,
-    protocolAdaptationAvailable,
     publicEgressEnabled: row.publicEgressEnabled,
     publicEgressAcknowledged: row.publicEgressAcknowledged,
+    effectiveProviderEgress: effectiveProviderEgress({
+      publicEgressEnabled: row.publicEgressEnabled,
+      providerPrimaryMemberCount: providerPrimaryMemberCount(row.PoolMembers),
+    }),
     allowLossyDeveloperRoleCollapse: row.allowLossyDeveloperRoleCollapse,
     recommendedSurfaceOverride,
     capacityPriority: row.capacityPriority,
@@ -871,6 +947,7 @@ async function ownedDiscoveredModel(discoveredModelId: string, userId: string) {
     select: {
       id: true,
       userId: true,
+      upstreamModelId: true,
       capabilityOverrideMode: true,
       capabilityOverrideMetadata: true,
       capabilityOverrides: true,
@@ -1130,6 +1207,7 @@ const poolSelect = {
         select: {
           id: true,
           kind: true,
+          providerModelId: true,
           inferenceCapacityId: true,
           DiscoveredModel: {
             select: {
@@ -1547,9 +1625,7 @@ export const forwarderManagementRouter = {
               capabilities: providerModelSurfaceCapabilities(provider.nativeCapabilities),
             })),
           ],
-          adaptationEnabled:
-            (input.advanced?.protocolAdaptationEnabled ?? false) &&
-            env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
+          adaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
         });
         const localTargets = await tx.executionTarget.findMany({
           where: { userId, discoveredModelId: { in: input.localModelIds } },
@@ -1885,6 +1961,8 @@ export const forwarderManagementRouter = {
               runtimeIdentityKey: `provider-model:${provider.id}`,
               runtimeModel: provider.upstreamModelId,
               hardConcurrencyLimit: provider.concurrencyLimit,
+              // Seeded from the user-configured provider model limit (null = unlimited).
+              hardConcurrencyLimitSource: "USER",
               physicalMaxContext: provider.contextWindow,
               countStrategy: "CONSERVATIVE_ESTIMATE",
             },
@@ -2031,7 +2109,63 @@ export const forwarderManagementRouter = {
       });
 
       const now = new Date();
-      return rows.map((row) => serializeCliDevice(row, now));
+      const live = await context.services?.getLiveCliFeatures?.(rows.map((row) => row.id));
+      return rows.map((row) => serializeCliDevice(row, now, live?.get(row.id) ?? null));
+    }),
+
+  setCliDeviceFeatureGrants: protectedProcedure
+    .input(
+      z
+        .object({
+          cliDeviceId: idSchema,
+          humanTerminal: z.boolean().optional(),
+          mcpCommands: z.boolean().optional(),
+        })
+        .refine((value) => value.humanTerminal !== undefined || value.mcpCommands !== undefined, {
+          message: "At least one feature grant is required.",
+        }),
+    )
+    .handler(async ({ input, context }) => {
+      const row = await prisma.cliDevice.findUnique({
+        where: { id: input.cliDeviceId },
+        select: {
+          id: true,
+          userId: true,
+          reportedHumanTerminal: true,
+          reportedMcpCommands: true,
+          reportedTerminalSupported: true,
+        },
+      });
+      if (!row || row.userId !== context.session.user.id) {
+        throw new ORPCError("NOT_FOUND", { message: "CLI device not found." });
+      }
+      if (
+        input.humanTerminal === true &&
+        (row.reportedHumanTerminal !== true || row.reportedTerminalSupported !== true)
+      ) {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Browser terminal cannot be enabled until this CLI reports support.",
+        });
+      }
+      if (input.mcpCommands === true && row.reportedMcpCommands !== true) {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "MCP commands cannot be enabled until this CLI reports support.",
+        });
+      }
+      const updated = await prisma.cliDevice.update({
+        where: { id: row.id },
+        data: {
+          ...(input.humanTerminal !== undefined ? { allowHumanTerminal: input.humanTerminal } : {}),
+          ...(input.mcpCommands !== undefined ? { allowMcpCommands: input.mcpCommands } : {}),
+        },
+        select: { id: true, allowHumanTerminal: true, allowMcpCommands: true },
+      });
+      await context.services?.onCliFeatureGrantsChanged?.(updated.id);
+      return {
+        cliDeviceId: updated.id,
+        humanTerminal: updated.allowHumanTerminal,
+        mcpCommands: updated.allowMcpCommands,
+      };
     }),
 
   removeCliDeviceMetadata: protectedProcedure
@@ -2272,6 +2406,7 @@ export const forwarderManagementRouter = {
         protocolAdaptationEnabled: z.boolean().optional(),
         publicEgressEnabled: z.boolean().optional(),
         publicEgressAcknowledged: z.literal(true).optional(),
+        confirmGranteePrivacyChange: z.boolean().optional(),
         allowLossyDeveloperRoleCollapse: z.boolean().optional(),
         recommendedSurfaceOverride: poolRecommendedSurfaceSchema.nullable().optional(),
         affinityEnabled: z.boolean().optional(),
@@ -2305,7 +2440,6 @@ export const forwarderManagementRouter = {
         throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
       }
       const hasCapacityPolicy = hasModelPoolCapacityPolicy(input);
-      if (hasCapacityPolicy) assertCapacityManagementEnabled(env.MODEL_API_GLOBAL_CAPACITY_ENABLED);
       if (input.slug) {
         await assertPoolSlugAvailable(input.slug, context.session.user.id, input.id);
       }
@@ -2411,11 +2545,13 @@ export const forwarderManagementRouter = {
 
       await assertPoolTransformerIsValid(input, existing, context.session.user.id);
 
-      const row = await runSerializableTransaction(async (tx) => {
+      const updated = await runSerializableTransaction(async (tx) => {
+        const userId = context.session.user.id;
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${input.id} AND "userId" = ${userId} FOR UPDATE`;
         if (hasCapacityPolicy)
           await lockAndValidateModelPoolCapacityPolicy(tx, {
             modelPoolId: input.id,
-            userId: context.session.user.id,
+            userId,
             policy: input,
             notFound: () => {
               throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
@@ -2425,14 +2561,31 @@ export const forwarderManagementRouter = {
           where: { id: input.id },
           select: {
             userId: true,
+            name: true,
+            publicEgressEnabled: true,
             protocolAdaptationEnabled: true,
             allowLossyDeveloperRoleCollapse: true,
             recommendedSurfaceOverride: true,
           },
         });
-        if (!current || current.userId !== context.session.user.id) {
+        if (!current || current.userId !== userId) {
           throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
         }
+        const providerPrimaryCount = await countProviderPrimaryMembers(tx, input.id);
+        const lockedPublicEgressEnabled = input.publicEgressEnabled ?? current.publicEgressEnabled;
+        const privacyGrantees = await gateSharedPoolPrivacyChange(tx, {
+          poolId: input.id,
+          poolName: current.name,
+          currentlyNonPrivate: effectiveProviderEgress({
+            publicEgressEnabled: current.publicEgressEnabled,
+            providerPrimaryMemberCount: providerPrimaryCount,
+          }),
+          nextNonPrivate: effectiveProviderEgress({
+            publicEgressEnabled: lockedPublicEgressEnabled,
+            providerPrimaryMemberCount: providerPrimaryCount,
+          }),
+          confirmed: input.confirmGranteePrivacyChange === true,
+        });
         if (
           input.protocolAdaptationEnabled !== undefined ||
           input.allowLossyDeveloperRoleCollapse !== undefined
@@ -2460,12 +2613,10 @@ export const forwarderManagementRouter = {
                 : current.recommendedSurfaceOverride,
             ),
             members,
-            adaptationEnabled:
-              (input.protocolAdaptationEnabled ?? current.protocolAdaptationEnabled) &&
-              env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
+            adaptationEnabled: input.protocolAdaptationEnabled ?? current.protocolAdaptationEnabled,
           });
         }
-        return tx.modelPool.update({
+        const row = await tx.modelPool.update({
           where: { id: input.id },
           data: {
             ...(input.slug ? { slug: input.slug } : {}),
@@ -2570,8 +2721,21 @@ export const forwarderManagementRouter = {
           },
           select: poolSelect,
         });
+        await recordGranteePrivacyNotices(tx, {
+          poolId: input.id,
+          poolName: current.name,
+          grantees: privacyGrantees,
+        });
+        return {
+          row,
+          notice:
+            privacyGrantees.length > 0
+              ? { poolName: current.name, grantees: privacyGrantees }
+              : null,
+        };
       });
-      return serializePool(row);
+      await deliverGranteePrivacyEmails(updated.notice);
+      return serializePool(updated.row);
     }),
 
   deleteModelPool: protectedProcedure
@@ -2624,8 +2788,7 @@ export const forwarderManagementRouter = {
         assertRecommendedSurfaceServable({
           override: parseModelApiSurface(surfacePool.recommendedSurfaceOverride),
           members: surfaceMembers,
-          adaptationEnabled:
-            surfacePool.protocolAdaptationEnabled && env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
+          adaptationEnabled: surfacePool.protocolAdaptationEnabled,
         });
         const target = await tx.executionTarget.upsert({
           where: { discoveredModelId: input.discoveredModelId },
@@ -2643,9 +2806,25 @@ export const forwarderManagementRouter = {
             },
           },
         });
+        let inferenceCapacityId = target.inferenceCapacityId;
+        if (inferenceCapacityId === null) {
+          inferenceCapacityId = await ensureDiscoveredInferenceCapacity(tx, {
+            userId,
+            discoveredModelId: input.discoveredModelId,
+            upstreamModelId: model.upstreamModelId,
+            executionTargetId: target.id,
+            reportedConcurrency: null,
+          });
+          await linkExecutionTargetCapacity(tx, {
+            executionTargetId: target.id,
+            userId,
+            inferenceCapacityId,
+          });
+          target.inferenceCapacityId = inferenceCapacityId;
+        }
         const seedCandidates = new Map(
-          declaredContext != null && target.inferenceCapacityId
-            ? [[target.inferenceCapacityId, declaredContext]]
+          declaredContext != null && inferenceCapacityId
+            ? [[inferenceCapacityId, declaredContext]]
             : [],
         );
         const targetsSharingCandidateCapacity =
@@ -2751,12 +2930,13 @@ export const forwarderManagementRouter = {
         tier: z.enum(["PRIMARY", "PUBLIC_OVERFLOW"]).default("PUBLIC_OVERFLOW"),
         publicOrder: z.number().int().min(0).max(10_000).optional(),
         weight: z.number().int().min(0).max(10_000).default(1),
+        confirmGranteePrivacyChange: z.boolean().optional(),
       }),
     )
     .handler(async ({ input, context }) => {
       assertProviderEgressReleaseGate();
       const userId = context.session.user.id;
-      return runSerializableTransaction(async (tx) => {
+      const attached = await runSerializableTransaction(async (tx) => {
         const candidatePool = await tx.modelPool.findFirst({
           where: { id: input.poolId, userId },
           select: { id: true },
@@ -2767,6 +2947,7 @@ export const forwarderManagementRouter = {
           where: { id: candidatePool.id, userId },
           select: {
             id: true,
+            name: true,
             publicEgressEnabled: true,
             publicEgressAcknowledged: true,
             recommendedSurfaceOverride: true,
@@ -2823,8 +3004,7 @@ export const forwarderManagementRouter = {
           assertRecommendedSurfaceServable({
             override: parseModelApiSurface(pool.recommendedSurfaceOverride),
             members: surfaceMembers,
-            adaptationEnabled:
-              pool.protocolAdaptationEnabled && env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
+            adaptationEnabled: pool.protocolAdaptationEnabled,
           });
         }
         await lockExecutionTargetIdentities(tx, [`provider-model:${providerModel.id}`]);
@@ -2887,6 +3067,18 @@ export const forwarderManagementRouter = {
             message: "The attachment protection policy must have an activation audit trail.",
           });
         }
+        const providerPrimaryCount = await countProviderPrimaryMembers(tx, pool.id);
+        const currentlyNonPrivate = effectiveProviderEgress({
+          publicEgressEnabled: pool.publicEgressEnabled,
+          providerPrimaryMemberCount: providerPrimaryCount,
+        });
+        const privacyGrantees = await gateSharedPoolPrivacyChange(tx, {
+          poolId: pool.id,
+          poolName: pool.name,
+          currentlyNonPrivate,
+          nextNonPrivate: input.tier === "PRIMARY" || currentlyNonPrivate,
+          confirmed: input.confirmGranteePrivacyChange === true,
+        });
         const existingTarget = await tx.executionTarget.findUnique({
           where: { providerModelId: input.providerModelId },
           select: { id: true, inferenceCapacityId: true },
@@ -2916,6 +3108,8 @@ export const forwarderManagementRouter = {
             runtimeIdentityKey: `provider-model:${providerModel.id}`,
             runtimeModel: providerModel.upstreamModelId,
             hardConcurrencyLimit: providerModel.concurrencyLimit,
+            // Seeded from the user-configured provider model limit (null = unlimited).
+            hardConcurrencyLimitSource: "USER",
             physicalMaxContext: providerModel.contextWindow,
             countStrategy: "CONSERVATIVE_ESTIMATE",
           },
@@ -2992,8 +3186,20 @@ export const forwarderManagementRouter = {
             });
           }
         }
-        return { id: member.id, executionTargetId: target.id };
+        await recordGranteePrivacyNotices(tx, {
+          poolId: pool.id,
+          poolName: pool.name,
+          grantees: privacyGrantees,
+        });
+        return {
+          id: member.id,
+          executionTargetId: target.id,
+          notice:
+            privacyGrantees.length > 0 ? { poolName: pool.name, grantees: privacyGrantees } : null,
+        };
       });
+      await deliverGranteePrivacyEmails(attached.notice);
+      return { id: attached.id, executionTargetId: attached.executionTargetId };
     }),
 
   updatePoolMember: protectedProcedure
@@ -3005,6 +3211,7 @@ export const forwarderManagementRouter = {
           routingStatus: routingStatusSchema.optional(),
           tier: z.enum(["PRIMARY", "PUBLIC_OVERFLOW"]).optional(),
           publicOrder: z.number().int().min(0).max(10_000).optional(),
+          confirmGranteePrivacyChange: z.boolean().optional(),
           capacityPriority: z.number().int().min(0).max(31).nullable().optional(),
           capacityConcurrencyMode: z.enum(["INHERIT", "LIMITED", "UNLIMITED"]).optional(),
           capacityConcurrencyLimit: z.number().int().min(1).max(10_000).nullable().optional(),
@@ -3060,7 +3267,7 @@ export const forwarderManagementRouter = {
     )
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
-      return prisma.$transaction(
+      const updatedMember = await prisma.$transaction(
         async (tx) => {
           const candidate = await tx.poolMember.findUnique({
             where: { id: input.id },
@@ -3105,6 +3312,7 @@ export const forwarderManagementRouter = {
               ModelPool: {
                 select: {
                   userId: true,
+                  name: true,
                   publicEgressEnabled: true,
                   publicEgressAcknowledged: true,
                   recommendedSurfaceOverride: true,
@@ -3261,11 +3469,28 @@ export const forwarderManagementRouter = {
             assertRecommendedSurfaceServable({
               override: parseModelApiSurface(member.ModelPool.recommendedSurfaceOverride),
               members: surfaceMembers,
-              adaptationEnabled:
-                member.ModelPool.protocolAdaptationEnabled &&
-                env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
+              adaptationEnabled: member.ModelPool.protocolAdaptationEnabled,
             });
           }
+
+          const promotingProviderPrimary =
+            Boolean(providerModel) && member.tier !== "PRIMARY" && nextTier === "PRIMARY";
+          const privacyGrantees = promotingProviderPrimary
+            ? await gateSharedPoolPrivacyChange(tx, {
+                poolId: member.poolId,
+                poolName: member.ModelPool.name,
+                currentlyNonPrivate: effectiveProviderEgress({
+                  publicEgressEnabled: member.ModelPool.publicEgressEnabled,
+                  providerPrimaryMemberCount: await countProviderPrimaryMembers(
+                    tx,
+                    member.poolId,
+                    member.id,
+                  ),
+                }),
+                nextNonPrivate: true,
+                confirmed: input.confirmGranteePrivacyChange === true,
+              })
+            : [];
 
           // Move existing rows out of the unique public-order range before
           // assigning the normalized contiguous order.
@@ -3346,12 +3571,26 @@ export const forwarderManagementRouter = {
                 },
               },
             });
-          return Object.hasOwn(updated, "tier")
+          const memberResult = Object.hasOwn(updated, "tier")
             ? { ...updated, publicOrder: nextTier === "PUBLIC_OVERFLOW" ? desiredOrder : null }
             : updated;
+          await recordGranteePrivacyNotices(tx, {
+            poolId: member.poolId,
+            poolName: member.ModelPool.name,
+            grantees: privacyGrantees,
+          });
+          return {
+            member: memberResult,
+            notice:
+              privacyGrantees.length > 0
+                ? { poolName: member.ModelPool.name, grantees: privacyGrantees }
+                : null,
+          };
         },
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
       );
+      await deliverGranteePrivacyEmails(updatedMember.notice);
+      return updatedMember.member;
     }),
 
   reorderProviderPoolMember: protectedProcedure
@@ -3432,9 +3671,7 @@ export const forwarderManagementRouter = {
           assertRecommendedSurfaceServable({
             override: parseModelApiSurface(member.ModelPool.recommendedSurfaceOverride),
             members: surfaceMembers,
-            adaptationEnabled:
-              member.ModelPool.protocolAdaptationEnabled &&
-              env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
+            adaptationEnabled: member.ModelPool.protocolAdaptationEnabled,
           });
         }
         await tx.poolMember.delete({ where: { id: input.id } });
@@ -3698,47 +3935,64 @@ export const forwarderManagementRouter = {
     )
     .handler(async ({ input, context }) => {
       const pool = await ownedPool(input.poolId, context.session.user.id);
-      const hasProviderPrimary = pool.publicEgressEnabled
-        ? false
-        : Boolean(
-            await prisma.poolMember.findFirst({
-              where: {
-                poolId: pool.id,
-                tier: "PRIMARY",
-                ExecutionTarget: { ProviderModel: { isNot: null } },
-              },
-              select: { id: true },
-            }),
-          );
-      if ((pool.publicEgressEnabled || hasProviderPrimary) && !input.publicEgressAcknowledged) {
-        throw new ORPCError("BAD_REQUEST", {
-          message: "Provider egress acknowledgement is required for this grant.",
+      const userId = context.session.user.id;
+      // Lock the pool row before re-reading egress so a privacy transition
+      // cannot commit between this check and the grant insert.
+      return runSerializableTransaction(async (tx) => {
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${pool.id} AND "userId" = ${userId} FOR UPDATE`;
+        const locked = await tx.modelPool.findUnique({
+          where: { id: pool.id },
+          select: { id: true, userId: true, publicEgressEnabled: true },
         });
-      }
-      const grantee = await prisma.user.findFirst({
-        where: { email: { equals: input.email, mode: "insensitive" } },
-        select: { id: true },
-      });
-      if (!grantee) {
-        throw new ORPCError("NOT_FOUND", { message: "User not found." });
-      }
-      if (grantee.id === context.session.user.id) {
-        throw new ORPCError("BAD_REQUEST", { message: "Cannot grant a pool to yourself." });
-      }
-      return prisma.poolGrant.upsert({
-        where: {
-          poolId_granteeUserId: {
+        if (!locked || locked.userId !== userId) {
+          throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+        }
+        // Skip the member lookup when overflow is already on; the shared rule
+        // still requires acknowledgement from publicEgressEnabled alone.
+        const providerPrimary = locked.publicEgressEnabled
+          ? null
+          : await tx.poolMember.findFirst({
+              where: { poolId: locked.id, ...providerPrimaryMemberWhere },
+              select: { id: true },
+            });
+        if (
+          effectiveProviderEgress({
+            publicEgressEnabled: locked.publicEgressEnabled,
+            providerPrimaryMemberCount: providerPrimary ? 1 : 0,
+          }) &&
+          !input.publicEgressAcknowledged
+        ) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: grantPoolAccessServerMessages.egressAcknowledgementRequired,
+          });
+        }
+        const grantee = await tx.user.findFirst({
+          where: { email: { equals: input.email, mode: "insensitive" } },
+          select: { id: true },
+        });
+        if (!grantee) {
+          throw new ORPCError("NOT_FOUND", { message: grantPoolAccessServerMessages.userNotFound });
+        }
+        if (grantee.id === userId) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: grantPoolAccessServerMessages.cannotGrantToSelf,
+          });
+        }
+        return tx.poolGrant.upsert({
+          where: {
+            poolId_granteeUserId: {
+              poolId: input.poolId,
+              granteeUserId: grantee.id,
+            },
+          },
+          update: {},
+          create: {
             poolId: input.poolId,
+            ownerUserId: userId,
             granteeUserId: grantee.id,
           },
-        },
-        update: {},
-        create: {
-          poolId: input.poolId,
-          ownerUserId: context.session.user.id,
-          granteeUserId: grantee.id,
-        },
-        select: { id: true, poolId: true, granteeUserId: true },
+          select: { id: true, poolId: true, granteeUserId: true },
+        });
       });
     }),
 
@@ -3766,4 +4020,23 @@ export const forwarderManagementRouter = {
   visibleModels: protectedProcedure.handler(async ({ context }) =>
     serializeVisibleTargets(await listVisibleModelTargetsForUser(context.session.user.id)),
   ),
+
+  listDashboardNotices: protectedProcedure.handler(async ({ context }) => {
+    return prisma.dashboardNotice.findMany({
+      where: { userId: context.session.user.id, readAt: null },
+      orderBy: { createdAt: "desc" },
+      take: 20,
+      select: { id: true, createdAt: true, kind: true, poolId: true, poolName: true },
+    });
+  }),
+
+  dismissDashboardNotice: protectedProcedure
+    .input(z.object({ id: idSchema }))
+    .handler(async ({ input, context }) => {
+      const result = await prisma.dashboardNotice.updateMany({
+        where: { id: input.id, userId: context.session.user.id, readAt: null },
+        data: { readAt: new Date() },
+      });
+      return { dismissed: result.count > 0 };
+    }),
 };

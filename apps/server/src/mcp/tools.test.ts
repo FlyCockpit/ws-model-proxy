@@ -20,7 +20,6 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     BETTER_AUTH_SECRET: "test-better-auth-secret",
     BETTER_AUTH_URL: "https://proxy.example.com",
     WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
-    MODEL_API_GLOBAL_CAPACITY_ENABLED: true,
     NODE_ENV: "test",
     // auth.ts builds the MCP rate limiters at module scope (the full-chain
     // test below imports it).
@@ -43,6 +42,14 @@ vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
   return { default: mockDeep() };
 });
+
+const cliRuntime = vi.hoisted(() => ({
+  startCliCommand: vi.fn(),
+  waitCliCommand: vi.fn(),
+  snapshotCliCommand: vi.fn(),
+}));
+
+vi.mock("../relay/cli-commands.js", () => cliRuntime);
 
 // The full-chain test drives the Phase 4 request handler whose verifier is
 // the upstream requireMcpAuth wrapper. Mock ONLY that wrapper (keeping the
@@ -157,7 +164,18 @@ function buildAuthInfo(scopes: string[]): AuthInfo {
 }
 
 /** Bind a dispatch exactly the way the production `onVerified` wiring does. */
-function bindRequest(authInfo: AuthInfo, requestId = "req-42") {
+function bindRequest(
+  authInfo: AuthInfo,
+  requestId = "req-42",
+  credential?:
+    | { kind: "oauth" }
+    | {
+        kind: "pat";
+        tokenId: string;
+        allowCliCommands: boolean;
+        expiresAt: Date | null;
+      },
+) {
   bindMcpToolDispatch(authInfo, {
     orpcContext: createMcpContext({
       user: USER,
@@ -166,7 +184,19 @@ function bindRequest(authInfo: AuthInfo, requestId = "req-42") {
       services: undefined,
     }),
     requestId,
+    ...(credential !== undefined ? { credential } : {}),
   });
+}
+
+const CLI_COMMAND_TOOL_NAMES = new Set<string>([
+  "forwarder_cli_command_run",
+  "forwarder_cli_command_result",
+]);
+
+function catalogNames(includeCliCommands: boolean): string[] {
+  return MCP_TOOL_MANIFEST.map((tool) => tool.name)
+    .filter((name) => includeCliCommands || !CLI_COMMAND_TOOL_NAMES.has(name))
+    .sort();
 }
 
 interface WireResult {
@@ -210,7 +240,8 @@ describe("tools/list — the manifest is the advertised catalog", () => {
     expect(response.status).toBe(200);
     const body = (await response.json()) as { result?: { tools?: { name: string }[] } };
     const names = body.result?.tools?.map((tool) => tool.name).sort();
-    expect(names).toEqual([...MCP_TOOL_MANIFEST.map((tool) => tool.name)].sort());
+    // No credential is bound, so the two CLI command tools stay hidden.
+    expect(names).toEqual(catalogNames(false));
   });
 
   it("a confirmation-gated tool advertises the required literal in its input schema", async () => {
@@ -506,7 +537,7 @@ describe("registerMcpTools — direct registration", () => {
     const handler = createMcpTransport();
     const response = await handler.fetch(toolsListRequest(3), undefined);
     const body = (await response.json()) as { result?: { tools?: unknown[] } };
-    expect(body.result?.tools).toHaveLength(MCP_TOOL_MANIFEST.length);
+    expect(body.result?.tools).toHaveLength(catalogNames(false).length);
   });
 });
 
@@ -544,9 +575,9 @@ describe("full chain — createMcpRequestHandler onVerified binding → tools/ca
       consumeIdentityQuota: async () => ({ ok: true }),
       // The PRODUCTION wiring (app.ts): bind the verified AuthInfo to the
       // per-request oRPC context and request id.
-      onVerified: ({ authInfo, orpcContext, requestId }) => {
+      onVerified: ({ authInfo, orpcContext, requestId, signal, credential }) => {
         seenRequestIds.push(requestId);
-        bindMcpToolDispatch(authInfo, { orpcContext, requestId });
+        bindMcpToolDispatch(authInfo, { orpcContext, requestId, signal, credential });
       },
     });
 
@@ -1011,3 +1042,434 @@ function requireDescriptor(name: string): McpToolDescriptor {
   if (descriptor === undefined) throw new Error(`missing descriptor ${name}`);
   return descriptor;
 }
+
+const PAT_EXPIRES = new Date("2026-12-01T00:00:00.000Z");
+const PAT_WITH_CLI = {
+  kind: "pat" as const,
+  tokenId: "token-pat-1",
+  allowCliCommands: true,
+  expiresAt: PAT_EXPIRES,
+};
+const PAT_WITHOUT_CLI = { ...PAT_WITH_CLI, allowCliCommands: false };
+const OAUTH_CREDENTIAL = { kind: "oauth" as const };
+
+type ListedCredential =
+  | {
+      kind: "pat";
+      tokenId: string;
+      allowCliCommands: boolean;
+      expiresAt: Date | null;
+    }
+  | { kind: "oauth" };
+
+function cliDispatch(credential: ListedCredential, signal?: AbortSignal) {
+  return {
+    orpcContext: createMcpContext({
+      user: USER,
+      expiresAt: new Date("2026-01-01T00:00:00Z"),
+      now: new Date("2025-06-01T00:00:00Z"),
+      services: undefined,
+    }),
+    requestId: "req-cli",
+    credential,
+    ...(signal !== undefined ? { signal } : {}),
+  };
+}
+
+function streamBytes(text: string, totalBytes = text.length) {
+  const head = new TextEncoder().encode(text);
+  return { head, tail: new Uint8Array(), totalBytes };
+}
+
+function runningSnapshot(commandId = "cmd-1") {
+  return {
+    commandId,
+    status: "running",
+    exitCode: null,
+    signal: null,
+    timedOut: false,
+    stdout: streamBytes("so-far"),
+    stderr: streamBytes(""),
+  };
+}
+
+function exitedSnapshot(commandId = "cmd-1") {
+  return {
+    commandId,
+    status: "exited",
+    exitCode: 0,
+    signal: "SIGTERM",
+    timedOut: false,
+    stdout: streamBytes("done"),
+    stderr: streamBytes("err"),
+  };
+}
+
+function parsedTool(result: {
+  content?: { type: string; text?: unknown }[];
+}): Record<string, unknown> {
+  return JSON.parse(resultText(result)) as Record<string, unknown>;
+}
+
+describe("CLI command tools", () => {
+  beforeEach(() => {
+    cliRuntime.startCliCommand.mockReset();
+    cliRuntime.waitCliCommand.mockReset();
+    cliRuntime.snapshotCliCommand.mockReset();
+  });
+
+  async function listedNames(
+    credential: ListedCredential | undefined,
+    scopes: string[],
+  ): Promise<string[]> {
+    const authInfo = buildAuthInfo(scopes);
+    if (credential !== undefined) bindRequest(authInfo, "req-list", credential);
+    const handler = createMcpTransport();
+    const response = await handler.fetch(toolsListRequest(7), { authInfo });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { result?: { tools?: { name: string }[] } };
+    return body.result?.tools?.map((tool) => tool.name).sort() ?? [];
+  }
+
+  it("hides the CLI tools for OAuth write and a PAT without the flag, and lists them for a flagged PAT", async () => {
+    await expect(listedNames(OAUTH_CREDENTIAL, ["mcp:write"])).resolves.toEqual(
+      catalogNames(false),
+    );
+    await expect(listedNames(PAT_WITHOUT_CLI, ["mcp:write"])).resolves.toEqual(catalogNames(false));
+    const flagged = await listedNames(PAT_WITH_CLI, ["mcp:write"]);
+    expect(flagged).toEqual(catalogNames(true));
+    expect(flagged).toContain("forwarder_cli_command_run");
+    expect(flagged).toContain("forwarder_cli_command_result");
+  });
+
+  it("tells the model that other secrets in command output are NOT redacted", async () => {
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo, "req-list", PAT_WITH_CLI);
+    const handler = createMcpTransport();
+    const response = await handler.fetch(toolsListRequest(8), { authInfo });
+    const body = (await response.json()) as {
+      result?: { tools?: { name: string; description?: string }[] };
+    };
+    const run = body.result?.tools?.find((tool) => tool.name === "forwarder_cli_command_run");
+    const resultTool = body.result?.tools?.find(
+      (tool) => tool.name === "forwarder_cli_command_result",
+    );
+    expect(run?.description).toContain("NOT redacted");
+    expect(
+      (run as { annotations?: { destructiveHint?: boolean } } | undefined)?.annotations
+        ?.destructiveHint,
+    ).toBe(true);
+    expect(resultTool?.description).toContain("NOT redacted");
+    expect(run?.description).toContain('confirm: "RUN"');
+    expect(resultTool?.description).not.toContain('confirm: "RUN"');
+  });
+
+  it("fails closed at call time for OAuth and a PAT without the flag, even if the descriptor is invoked", async () => {
+    const run = requireDescriptor("forwarder_cli_command_run");
+    for (const credential of [OAUTH_CREDENTIAL, PAT_WITHOUT_CLI]) {
+      const result = await runManifestTool(run, {
+        dispatch: cliDispatch(credential),
+        scopes: ["mcp:write"],
+        client: undefined,
+        args: { cliDeviceId: "cli-1", command: "pwd", confirm: "RUN" },
+      });
+      expect(result.isError).toBe(true);
+      expect(resultText(result)).toBe("Tool forwarder_cli_command_run not found");
+      expect(resultText(result).toLowerCase()).not.toContain("disabled");
+      expect(cliRuntime.startCliCommand).not.toHaveBeenCalled();
+    }
+  });
+
+  it("an unregistered call on the transport is the SDK not-found error", async () => {
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo, "req-cli", OAUTH_CREDENTIAL);
+    const { body } = await callTool(authInfo, "forwarder_cli_command_run", {
+      cliDeviceId: "cli-1",
+      command: "pwd",
+      confirm: "RUN",
+    });
+    expect(JSON.stringify(body)).toContain("Tool forwarder_cli_command_run not found");
+    expect(JSON.stringify(body).toLowerCase()).not.toContain("disabled");
+    expect(cliRuntime.startCliCommand).not.toHaveBeenCalled();
+  });
+
+  it("requires RUN for the run tool and no confirmation for the result tool", async () => {
+    const run = requireDescriptor("forwarder_cli_command_run");
+    const missing = await runManifestTool(run, {
+      dispatch: cliDispatch(PAT_WITH_CLI),
+      scopes: ["mcp:write"],
+      client: undefined,
+      args: { cliDeviceId: "cli-1", command: "pwd" },
+    });
+    expect(missing.isError).toBe(true);
+    expect(resultText(missing)).toContain('confirm="RUN"');
+    expect(cliRuntime.startCliCommand).not.toHaveBeenCalled();
+
+    cliRuntime.snapshotCliCommand.mockResolvedValue(exitedSnapshot());
+    const resultTool = requireDescriptor("forwarder_cli_command_result");
+    const fetched = await runManifestTool(resultTool, {
+      dispatch: cliDispatch(PAT_WITH_CLI),
+      scopes: ["mcp:write"],
+      client: undefined,
+      args: { commandId: "cmd-1" },
+    });
+    expect(fetched.isError).toBeUndefined();
+    expect(parsedTool(fetched).commandId).toBe("cmd-1");
+    expect(cliRuntime.snapshotCliCommand).toHaveBeenCalledWith("cmd-1", USER.id, "token-pat-1");
+  });
+
+  it("still requires mcp:write when the PAT flag is set", async () => {
+    const run = requireDescriptor("forwarder_cli_command_run");
+    const result = await runManifestTool(run, {
+      dispatch: cliDispatch(PAT_WITH_CLI),
+      scopes: ["mcp:read"],
+      client: undefined,
+      args: { cliDeviceId: "cli-1", command: "pwd", confirm: "RUN" },
+    });
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain("mcp:write");
+    expect(cliRuntime.startCliCommand).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["not_found", "Not found"],
+    ["grant_disabled", "CLI commands are disabled for this device"],
+    ["offline", "CLI is offline or does not support this protocol"],
+    ["feature_disabled", "CLI has MCP commands disabled in wsmp config"],
+    ["limit", "too many commands"],
+    ["invalid_command", "command must be 1..=4096 bytes and contain no NUL"],
+  ] as const)("maps start error %s to a stable message", async (code, message) => {
+    cliRuntime.startCliCommand.mockResolvedValue({ ok: false, error: code });
+    const run = requireDescriptor("forwarder_cli_command_run");
+    const result = await runManifestTool(run, {
+      dispatch: cliDispatch(PAT_WITH_CLI),
+      scopes: ["mcp:write"],
+      client: undefined,
+      args: { cliDeviceId: "cli-1", command: "UNIQUE_COMMAND_DO_NOT_LOG", confirm: "RUN" },
+    });
+    expect(resultText(result)).toBe(message);
+    if (code === "not_found") {
+      expect(resultText(result).toLowerCase()).not.toContain("disabled");
+      expect(resultText(result).toLowerCase()).not.toContain("offline");
+    }
+    expect(cliRuntime.waitCliCommand).not.toHaveBeenCalled();
+    const logged = consoleError.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(logged).not.toContain("UNIQUE_COMMAND_DO_NOT_LOG");
+  });
+
+  it.each([
+    [undefined, 15_000],
+    [0, 0],
+    [-4, 0],
+    [15_000, 15_000],
+    [15_001, 15_000],
+    [1_000_000, 15_000],
+  ] as const)("clamps waitMs %s to %s", async (waitMs, expected) => {
+    cliRuntime.startCliCommand.mockResolvedValue({ ok: true, commandId: "cmd-1" });
+    cliRuntime.waitCliCommand.mockResolvedValue(runningSnapshot());
+    const run = requireDescriptor("forwarder_cli_command_run");
+    await runManifestTool(run, {
+      dispatch: cliDispatch(PAT_WITH_CLI),
+      scopes: ["mcp:write"],
+      client: undefined,
+      args: {
+        cliDeviceId: "cli-1",
+        command: "pwd",
+        confirm: "RUN",
+        ...(waitMs !== undefined ? { waitMs } : {}),
+      },
+    });
+    expect(cliRuntime.waitCliCommand).toHaveBeenCalledWith(
+      "cmd-1",
+      USER.id,
+      "token-pat-1",
+      expected,
+      undefined,
+    );
+  });
+
+  it("returns running output without an exit code, and the final record once the command has exited", async () => {
+    vi.useFakeTimers();
+    try {
+      cliRuntime.startCliCommand.mockResolvedValue({ ok: true, commandId: "cmd-1" });
+      cliRuntime.waitCliCommand.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            setTimeout(() => resolve(runningSnapshot()), 15_000);
+          }),
+      );
+      const run = requireDescriptor("forwarder_cli_command_run");
+      const pending = runManifestTool(run, {
+        dispatch: cliDispatch(PAT_WITH_CLI),
+        scopes: ["mcp:write"],
+        client: undefined,
+        args: { cliDeviceId: "cli-1", command: "pwd", confirm: "RUN" },
+      });
+      await vi.advanceTimersByTimeAsync(15_000);
+      const running = parsedTool(await pending);
+      expect(running.commandId).toBe("cmd-1");
+      expect(running.status).toBe("running");
+      expect(running).not.toHaveProperty("exitCode");
+      expect(running.stdout).toMatchObject({ text: "so-far", truncated: false });
+
+      cliRuntime.waitCliCommand.mockResolvedValue(exitedSnapshot());
+      const finished = parsedTool(
+        await runManifestTool(run, {
+          dispatch: cliDispatch(PAT_WITH_CLI),
+          scopes: ["mcp:write"],
+          client: undefined,
+          args: { cliDeviceId: "cli-1", command: "pwd", confirm: "RUN" },
+        }),
+      );
+      expect(finished).toMatchObject({
+        commandId: "cmd-1",
+        status: "exited",
+        exitCode: 0,
+        processSignal: "SIGTERM",
+        timedOut: false,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("an already-aborted signal ends the wait and still returns commandId", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    cliRuntime.startCliCommand.mockResolvedValue({ ok: true, commandId: "cmd-abort" });
+    cliRuntime.waitCliCommand.mockResolvedValue(runningSnapshot("cmd-abort"));
+    const run = requireDescriptor("forwarder_cli_command_run");
+    const result = await runManifestTool(run, {
+      dispatch: cliDispatch(PAT_WITH_CLI, controller.signal),
+      scopes: ["mcp:write"],
+      client: undefined,
+      args: { cliDeviceId: "cli-1", command: "pwd", confirm: "RUN" },
+    });
+    expect(result.isError).toBeUndefined();
+    expect(parsedTool(result).commandId).toBe("cmd-abort");
+    expect(parsedTool(result).status).toBe("running");
+    expect(cliRuntime.startCliCommand).toHaveBeenCalledTimes(1);
+    expect(cliRuntime.waitCliCommand).toHaveBeenCalledWith(
+      "cmd-abort",
+      USER.id,
+      "token-pat-1",
+      15_000,
+      controller.signal,
+    );
+    expect(cliRuntime.snapshotCliCommand).not.toHaveBeenCalled();
+  });
+
+  it("passes the token id and expiry into startCliCommand and does not log output", async () => {
+    cliRuntime.startCliCommand.mockResolvedValue({ ok: true, commandId: "cmd-1" });
+    cliRuntime.waitCliCommand.mockResolvedValue({
+      ...exitedSnapshot(),
+      stdout: streamBytes("UNIQUE_OUTPUT_DO_NOT_LOG"),
+    });
+    const run = requireDescriptor("forwarder_cli_command_run");
+    const result = await runManifestTool(run, {
+      dispatch: cliDispatch(PAT_WITH_CLI),
+      scopes: ["mcp:write"],
+      client: undefined,
+      args: {
+        cliDeviceId: "cli-1",
+        command: "echo hi",
+        cwd: "/tmp",
+        confirm: "RUN",
+      },
+    });
+    expect(cliRuntime.startCliCommand).toHaveBeenCalledWith({
+      userId: USER.id,
+      tokenId: "token-pat-1",
+      expiresAt: PAT_EXPIRES,
+      cliDeviceId: "cli-1",
+      command: "echo hi",
+      cwd: "/tmp",
+    });
+    expect(parsedTool(result).stdout).toMatchObject({ text: "UNIQUE_OUTPUT_DO_NOT_LOG" });
+    const logged = consoleError.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(logged).not.toContain("UNIQUE_OUTPUT_DO_NOT_LOG");
+    expect(logged).not.toContain("echo hi");
+  });
+
+  it("result progress false omits streams while running and returns the final record after exit", async () => {
+    const resultTool = requireDescriptor("forwarder_cli_command_result");
+    cliRuntime.snapshotCliCommand.mockResolvedValue(runningSnapshot());
+    const quiet = parsedTool(
+      await runManifestTool(resultTool, {
+        dispatch: cliDispatch(PAT_WITH_CLI),
+        scopes: ["mcp:write"],
+        client: undefined,
+        args: { commandId: "cmd-1", progress: false },
+      }),
+    );
+    expect(quiet).toEqual({ commandId: "cmd-1", status: "running" });
+
+    const loud = parsedTool(
+      await runManifestTool(resultTool, {
+        dispatch: cliDispatch(PAT_WITH_CLI),
+        scopes: ["mcp:write"],
+        client: undefined,
+        args: { commandId: "cmd-1", progress: true },
+      }),
+    );
+    expect(loud.stdout).toMatchObject({ text: "so-far" });
+    expect(loud).not.toHaveProperty("exitCode");
+
+    cliRuntime.snapshotCliCommand.mockResolvedValue(exitedSnapshot());
+    const finished = parsedTool(
+      await runManifestTool(resultTool, {
+        dispatch: cliDispatch(PAT_WITH_CLI),
+        scopes: ["mcp:write"],
+        client: undefined,
+        args: { commandId: "cmd-1", progress: false },
+      }),
+    );
+    expect(finished.exitCode).toBe(0);
+    expect(finished.stdout).toMatchObject({ text: "done" });
+  });
+
+  it("a null snapshot is not found for the caller and for any other user", async () => {
+    cliRuntime.snapshotCliCommand.mockResolvedValue(null);
+    const resultTool = requireDescriptor("forwarder_cli_command_result");
+    const result = await runManifestTool(resultTool, {
+      dispatch: cliDispatch(PAT_WITH_CLI),
+      scopes: ["mcp:write"],
+      client: undefined,
+      args: { commandId: "missing" },
+    });
+    expect(resultText(result)).toBe("Not found");
+    expect(resultText(result).toLowerCase()).not.toContain("disabled");
+    expect(cliRuntime.snapshotCliCommand).toHaveBeenCalledWith("missing", USER.id, "token-pat-1");
+  });
+
+  it("a max-size stream still serializes under the MCP output cap", async () => {
+    const { CLI_COMMAND_WRAPPED_OUTPUT_BUDGET } = await import("./cli-command-output");
+    expect(CLI_COMMAND_WRAPPED_OUTPUT_BUDGET).toBe(
+      MCP_TOOL_OUTPUT_MAX_BYTES - MCP_TOOL_OUTPUT_SDK_HEADROOM_BYTES,
+    );
+    const head = new Uint8Array(8192).fill(0xff);
+    const tail = new Uint8Array(40960).fill(0xff);
+    const stream = { head, tail, totalBytes: 5_000_000 };
+    cliRuntime.startCliCommand.mockResolvedValue({ ok: true, commandId: "cmd-max" });
+    cliRuntime.waitCliCommand.mockResolvedValue({
+      commandId: "cmd-max",
+      status: "exited",
+      exitCode: 1,
+      signal: "SIGKILL",
+      timedOut: true,
+      stdout: stream,
+      stderr: stream,
+    });
+    const run = requireDescriptor("forwarder_cli_command_run");
+    const result = await runManifestTool(run, {
+      dispatch: cliDispatch(PAT_WITH_CLI),
+      scopes: ["mcp:write"],
+      client: undefined,
+      args: { cliDeviceId: "cli-1", command: "yes", confirm: "RUN" },
+    });
+    expect(result.isError).toBeUndefined();
+    expect(result.structuredContent).not.toMatchObject({ error: { code: "OUTPUT_TOO_LARGE" } });
+    const bytes = new TextEncoder().encode(JSON.stringify(result)).length;
+    expect(bytes).toBeLessThanOrEqual(CLI_COMMAND_WRAPPED_OUTPUT_BUDGET);
+  });
+});

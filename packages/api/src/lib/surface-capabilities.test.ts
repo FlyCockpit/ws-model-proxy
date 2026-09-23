@@ -387,7 +387,7 @@ describe("surface capability resolution", () => {
     ).toBe("unavailable");
   });
 
-  it("pre-dispatch excludes adapted Anthropic streaming without initial usage", () => {
+  it("serves streaming Anthropic from a streaming Chat or Responses member", () => {
     const chatOnly = parseOpenAiCompatibleCapabilities({
       version: 3,
       protocol: "openai-compatible",
@@ -408,8 +408,58 @@ describe("surface capability resolution", () => {
         adaptationEnabled: true,
       }),
     ).toMatchObject({
+      mode: "adapted",
+      nativeSurface: "OPENAI_CHAT_COMPLETIONS",
+      streaming: true,
+      limitations: ["strict_common_subset", "native_extensions_unavailable"],
+    });
+    const responsesOnly = parseOpenAiCompatibleCapabilities({
+      version: 3,
+      protocol: "openai-compatible",
+      surfaces: {
+        openaiResponses: {
+          source: "declared",
+          confidence: "exact",
+          supported: true,
+          streaming: true,
+        },
+      },
+    });
+    expect(
+      resolveExecutionPath({
+        capabilities: responsesOnly,
+        requestedSurface: "ANTHROPIC_MESSAGES",
+        request: { stream: true },
+        adaptationEnabled: true,
+      }),
+    ).toMatchObject({
+      mode: "adapted",
+      nativeSurface: "OPENAI_RESPONSES",
+      streaming: true,
+      limitations: ["strict_common_subset", "native_extensions_unavailable"],
+    });
+    const chatWithoutStreaming = parseOpenAiCompatibleCapabilities({
+      version: 3,
+      protocol: "openai-compatible",
+      surfaces: {
+        openaiChatCompletions: {
+          source: "declared",
+          confidence: "exact",
+          supported: true,
+          streaming: false,
+        },
+      },
+    });
+    expect(
+      resolveExecutionPath({
+        capabilities: chatWithoutStreaming,
+        requestedSurface: "ANTHROPIC_MESSAGES",
+        request: { stream: true },
+        adaptationEnabled: true,
+      }),
+    ).toMatchObject({
       mode: "unavailable",
-      limitations: expect.arrayContaining(["anthropic_initial_usage_unavailable"]),
+      limitations: ["streaming_unavailable"],
     });
     expect(
       resolveExecutionPath({
@@ -446,8 +496,29 @@ describe("surface capability resolution", () => {
     expect(chatMatrix.ANTHROPIC_MESSAGES).toMatchObject({
       mode: "adapted",
       nativeSurface: "OPENAI_CHAT_COMPLETIONS",
-      streaming: false,
-      limitations: expect.arrayContaining(["anthropic_initial_usage_unavailable"]),
+      streaming: true,
+      limitations: ["strict_common_subset", "native_extensions_unavailable"],
+    });
+    const responsesOnly = parseOpenAiCompatibleCapabilities({
+      version: 3,
+      protocol: "openai-compatible",
+      surfaces: {
+        openaiResponses: {
+          source: "declared",
+          confidence: "exact",
+          supported: true,
+          streaming: true,
+        },
+      },
+    });
+    expect(
+      surfaceAvailabilityMatrix({ capabilities: responsesOnly, adaptationEnabled: true })
+        .ANTHROPIC_MESSAGES,
+    ).toMatchObject({
+      mode: "adapted",
+      nativeSurface: "OPENAI_RESPONSES",
+      streaming: true,
+      limitations: ["strict_common_subset", "native_extensions_unavailable"],
     });
 
     const anthropicMatrix = surfaceAvailabilityMatrix({

@@ -128,6 +128,15 @@ pub struct Config {
     /// own origin is always trusted; these are additive.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub media_trusted_origins: Vec<String>,
+    /// Browser terminal master switch. Read once when the relay starts.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_human_terminal: bool,
+    /// MCP command master switch. Read once when the relay starts.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_mcp_commands: bool,
+    /// Require a locally approved browser identity before opening a terminal.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub require_terminal_approval: bool,
 }
 
 impl Default for Config {
@@ -140,6 +149,9 @@ impl Default for Config {
             cli_token_env: None,
             endpoints: Vec::new(),
             media_trusted_origins: Vec::new(),
+            allow_human_terminal: false,
+            allow_mcp_commands: false,
+            require_terminal_approval: false,
         }
     }
 }
@@ -157,6 +169,13 @@ pub struct EndpointConfig {
     /// Off by default; opt in for local upstreams that cannot fetch remote URLs.
     #[serde(skip_serializing_if = "is_false")]
     pub expand_media: bool,
+    /// Hard concurrency sent on every model at registration. Omitted means the
+    /// server fallback of 1. An existing non-null capacity is left unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_limit: Option<u32>,
+    /// Upstream engine. llama.cpp and vLLM advertise `top_k` in the inventory.
+    #[serde(default, skip_serializing_if = "is_generic_engine")]
+    pub engine: EndpointEngine,
     pub default_capabilities: OpenAiCompatibleCapabilities,
     pub headers: Vec<HeaderEnvRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -174,6 +193,8 @@ impl Default for EndpointConfig {
             base_url: String::new(),
             enabled: true,
             expand_media: false,
+            concurrency_limit: None,
+            engine: EndpointEngine::Generic,
             default_capabilities: OpenAiCompatibleCapabilities::default(),
             headers: Vec::new(),
             auth: None,
@@ -188,6 +209,35 @@ impl Default for EndpointConfig {
 pub struct EndpointAuthConfig {
     pub mode: EndpointAuthMode,
     pub env: String,
+}
+
+fn is_generic_engine(engine: &EndpointEngine) -> bool {
+    *engine == EndpointEngine::Generic
+}
+
+/// Declared upstream engine. Only llama.cpp and vLLM advertise `top_k`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EndpointEngine {
+    #[default]
+    Generic,
+    #[serde(rename = "llama.cpp")]
+    LlamaCpp,
+    Vllm,
+}
+
+impl EndpointEngine {
+    pub fn accepts_top_k(self) -> bool {
+        matches!(self, Self::LlamaCpp | Self::Vllm)
+    }
+
+    pub fn as_config_str(self) -> &'static str {
+        match self {
+            Self::Generic => "generic",
+            Self::LlamaCpp => "llama.cpp",
+            Self::Vllm => "vllm",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,6 +336,14 @@ pub struct OpenAiCompatibleCapabilities {
     pub responses: Option<ResponsesCapabilities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio: Option<AudioCapabilities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<SamplingCapabilities>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SamplingCapabilities {
+    pub parameters: Vec<String>,
 }
 
 // v1/v2 capability inventories never had a `surfaces` member.  Keep that
@@ -325,6 +383,9 @@ impl Serialize for OpenAiCompatibleCapabilities {
         if let Some(value) = &self.audio {
             state.serialize_field("audio", value)?;
         }
+        if let Some(value) = &self.sampling {
+            state.serialize_field("sampling", value)?;
+        }
         state.end()
     }
 }
@@ -351,6 +412,8 @@ struct RawCapabilities {
     embeddings: Option<EmbeddingsCapabilities>,
     responses: Option<ResponsesCapabilities>,
     audio: Option<AudioCapabilities>,
+    #[serde(default)]
+    sampling: Option<SamplingCapabilities>,
 }
 
 impl Default for RawCapabilities {
@@ -367,6 +430,7 @@ impl Default for RawCapabilities {
             embeddings: None,
             responses: None,
             audio: None,
+            sampling: None,
         }
     }
 }
@@ -434,6 +498,7 @@ impl TryFrom<RawCapabilities> for OpenAiCompatibleCapabilities {
             embeddings: value.embeddings,
             responses: value.responses,
             audio: value.audio,
+            sampling: value.sampling,
         })
     }
 }
@@ -481,6 +546,7 @@ impl OpenAiCompatibleCapabilities {
             embeddings: None,
             responses: None,
             audio: None,
+            sampling: None,
         }
     }
 
@@ -498,6 +564,20 @@ impl OpenAiCompatibleCapabilities {
             }),
             responses: None,
             audio: None,
+            sampling: None,
+        }
+    }
+
+    pub fn advertise_top_k(&mut self) {
+        let sampling = self
+            .sampling
+            .get_or_insert_with(SamplingCapabilities::default);
+        if !sampling
+            .parameters
+            .iter()
+            .any(|parameter| parameter == "top_k")
+        {
+            sampling.parameters.push("top_k".to_string());
         }
     }
 
@@ -1140,6 +1220,14 @@ impl Config {
         for endpoint in &self.endpoints {
             validate_slug(&endpoint.slug)
                 .with_context(|| format!("validating endpoint slug `{}`", endpoint.slug))?;
+            if let Some(limit) = endpoint.concurrency_limit
+                && !(1..=10_000).contains(&limit)
+            {
+                anyhow::bail!(
+                    "endpoint `{}` concurrency limit must be an integer from 1 to 10000",
+                    endpoint.slug
+                );
+            }
             if let Some(auth) = &endpoint.auth {
                 validate_env_name(&auth.env)?;
             }

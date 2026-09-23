@@ -1,5 +1,6 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { grantPoolAccessServerMessage } from "@ws-model-proxy/api/lib/effective-provider-egress";
 import {
   type GuardedPoolCreateFailureReason,
   isGuardedPoolCreateFailureReason,
@@ -41,8 +42,11 @@ import { useId, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
+import { CliDeviceFeatureSwitches } from "@/components/cli-device-feature-switches";
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
+import { GranteePrivacyConfirmDialog } from "@/components/grantee-privacy-confirm-dialog";
 import { InlineRetry } from "@/components/inline-retry";
+import { PoolPrivacyBadge } from "@/components/pool-privacy-badge";
 import { SegmentedControl } from "@/components/segmented-control";
 import { WideContent } from "@/components/wide-content";
 import {
@@ -54,7 +58,15 @@ import {
   memberPolicyPayload,
   newCapacityDefaults,
 } from "@/lib/capacity-forms";
-import { publicEgressResourceNames } from "@/lib/public-egress-disclosure";
+
+import {
+  type GranteePrivacyConfirm,
+  granteePrivacyConfirmationFromError,
+} from "@/lib/grantee-privacy-confirmation";
+import {
+  egressProviderAccountLabels,
+  publicEgressResourceNames,
+} from "@/lib/public-egress-disclosure";
 import { orpc } from "@/utils/orpc";
 
 type CliDevice = Awaited<
@@ -79,13 +91,9 @@ type DeleteTarget =
   | { kind: "endpoint"; id: string; label: string }
   | { kind: "model"; id: string; label: string };
 
-export function resolveCapacityAvailability(
-  capacityEnabled: boolean | undefined,
-  isConfigError: boolean,
-): CapacityAvailability {
-  if (capacityEnabled !== undefined) return capacityEnabled ? "enabled" : "disabled";
-  if (isConfigError) return "error";
-  return "loading";
+/** Capacity admission is always on. The historical deployment flag is gone. */
+export function resolveCapacityAvailability(): CapacityAvailability {
+  return "enabled";
 }
 
 function capacityUnavailableReasonKey(availability: CapacityAvailability) {
@@ -580,12 +588,7 @@ function modelSupportsTransformerModalities(
 export function CliEndpointsModelsSection() {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
-  const appConfigQuery = useQuery(orpc.appConfig.queryOptions());
-  const appConfig = appConfigQuery.data;
-  const capacityAvailability = resolveCapacityAvailability(
-    appConfig?.capacityEnabled,
-    appConfigQuery.isError,
-  );
+  const capacityAvailability = resolveCapacityAvailability();
   const capacityEnabled = capacityAvailability === "enabled";
   const {
     data: devicesData,
@@ -806,6 +809,8 @@ export function CliEndpointsModelsSection() {
                   {t("dashboard:metadata.delete")}
                 </Button>
               </div>
+
+              <CliDeviceFeatureSwitches cliDeviceId={device.id} device={device} />
 
               <div className="divide-y">
                 {device.endpoints.length === 0 ? (
@@ -1523,13 +1528,11 @@ export function CapacitySetupForm({
 export function ProtocolCompatibilityRadio({
   adaptationEnabled,
   allowLossyDeveloperRoleCollapse,
-  protocolAdaptationAvailable,
   idPrefix,
   onChange,
 }: {
   adaptationEnabled: boolean;
   allowLossyDeveloperRoleCollapse: boolean;
-  protocolAdaptationAvailable: boolean;
   idPrefix: string;
   onChange: (value: {
     adaptationEnabled: boolean;
@@ -1553,7 +1556,7 @@ export function ProtocolCompatibilityRadio({
     ["lossy", true, true],
   ] as const;
   return (
-    <fieldset className="space-y-3" aria-describedby={`${idPrefix}-reason`}>
+    <fieldset className="space-y-3">
       <legend className="text-sm font-medium">{t("dashboard:pools.protocolCompatibility")}</legend>
       {options.map(([value, adaptation, lossy]) => (
         <label
@@ -1566,7 +1569,6 @@ export function ProtocolCompatibilityRadio({
             value={value}
             aria-label={t(`dashboard:pools.protocolOptions.${value}.label`)}
             checked={selected === value}
-            disabled={value !== "native" && !protocolAdaptationAvailable}
             onChange={() =>
               onChange({ adaptationEnabled: adaptation, allowLossyDeveloperRoleCollapse: lossy })
             }
@@ -1581,11 +1583,6 @@ export function ProtocolCompatibilityRadio({
           </span>
         </label>
       ))}
-      {!protocolAdaptationAvailable ? (
-        <p id={`${idPrefix}-reason`} className="text-xs text-muted-foreground">
-          {t("dashboard:pools.protocolAdaptationDisabledReason")}
-        </p>
-      ) : null}
       <details className="rounded-md border p-3 text-sm">
         <summary className="min-h-11 cursor-pointer py-2">
           {t("dashboard:pools.protocolRejectedTitle")}
@@ -1604,7 +1601,6 @@ export function PoolForm({
   directModels,
   capacities = [],
   capacityAvailability,
-  protocolAdaptationAvailable,
   sections = ["identity", "routing", "capacity", "media"],
 }: {
   mode: "create" | "edit";
@@ -1614,7 +1610,6 @@ export function PoolForm({
   directModels: ReturnType<typeof allDirectModels>;
   capacities?: CapacityRow[];
   capacityAvailability: CapacityAvailability;
-  protocolAdaptationAvailable: boolean;
   sections?: Array<"identity" | "routing" | "capacity" | "media">;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
@@ -2003,7 +1998,6 @@ export function PoolForm({
               <ProtocolCompatibilityRadio
                 adaptationEnabled={adaptation}
                 allowLossyDeveloperRoleCollapse={lossy}
-                protocolAdaptationAvailable={protocolAdaptationAvailable}
                 idPrefix="pool"
                 onChange={(value) => {
                   // Mirrors the override select: changing the adaptation
@@ -2661,6 +2655,9 @@ export function PoolMemberForm({
   const [borrow, setBorrow] = useState<"NEVER" | "WHEN_IDLE">(
     member?.capacityBorrowPolicy === "NEVER" ? "NEVER" : "WHEN_IDLE",
   );
+  const [privacyConfirm, setPrivacyConfirm] = useState<
+    (GranteePrivacyConfirm & { retry: () => Promise<void> }) | null
+  >(null);
   const createMember = useMutation(
     orpc.forwarderManagement.addPoolMember.mutationOptions({
       onSuccess: () => {
@@ -2772,32 +2769,56 @@ export function PoolMemberForm({
           }
           if (mode === "edit" && member) {
             if (member.providerModel) {
-              await runMutation(() =>
-                updateMember.mutateAsync({
-                  id: member.id,
-                  tier: memberTier,
-                  weight: parsedWeight,
-                  routingStatus,
-                  ...(capacityEnabled
-                    ? {
-                        capacityPriority: priorityMode === "INHERIT" ? null : Number(priority),
-                        capacityConcurrencyMode: concurrencyMode,
-                        capacityConcurrencyLimit:
-                          concurrencyMode === "LIMITED" ? Number(concurrency) : null,
-                        capacityReservedSlots:
-                          reservedMode === "INHERIT" ? null : Number(reservedSlots),
-                        capacityBorrowPolicy: borrowMode === "INHERIT" ? null : borrow,
-                        capacityWaitBudgetMode: waitMode,
-                        capacityWaitBudgetMs: waitMode === "LIMITED" ? Number(waitBudget) : null,
-                        capacityContextCeilingMode: ceilingMode,
-                        capacityContextCeiling:
-                          ceilingMode === "LIMITED" ? Number(contextCeiling) : null,
-                        capacityContextMargin:
-                          marginMode === "INHERIT" ? null : Number(contextMargin),
+              const providerMemberUpdate = {
+                id: member.id,
+                tier: memberTier,
+                weight: parsedWeight,
+                routingStatus,
+                ...(capacityEnabled
+                  ? {
+                      capacityPriority: priorityMode === "INHERIT" ? null : Number(priority),
+                      capacityConcurrencyMode: concurrencyMode,
+                      capacityConcurrencyLimit:
+                        concurrencyMode === "LIMITED" ? Number(concurrency) : null,
+                      capacityReservedSlots:
+                        reservedMode === "INHERIT" ? null : Number(reservedSlots),
+                      capacityBorrowPolicy: borrowMode === "INHERIT" ? null : borrow,
+                      capacityWaitBudgetMode: waitMode,
+                      capacityWaitBudgetMs: waitMode === "LIMITED" ? Number(waitBudget) : null,
+                      capacityContextCeilingMode: ceilingMode,
+                      capacityContextCeiling:
+                        ceilingMode === "LIMITED" ? Number(contextCeiling) : null,
+                      capacityContextMargin:
+                        marginMode === "INHERIT" ? null : Number(contextMargin),
+                    }
+                  : {}),
+              };
+              try {
+                await updateMember.mutateAsync(providerMemberUpdate);
+              } catch (error) {
+                const confirmation = granteePrivacyConfirmationFromError(error);
+                if (confirmation) {
+                  setPrivacyConfirm({
+                    ...confirmation,
+                    retry: async () => {
+                      await updateMember.mutateAsync({
+                        ...providerMemberUpdate,
+                        confirmGranteePrivacyChange: true,
+                      });
+                      if (capacityEnabled) {
+                        await queryClient.invalidateQueries({
+                          queryKey: orpc.capacityManagement.key(),
+                        });
                       }
-                    : {}),
-                }),
-              );
+                      toast.success(t("dashboard:pools.memberUpdated"));
+                      setPrivacyConfirm(null);
+                      onSuccess();
+                    },
+                  });
+                  return;
+                }
+                throw new MutationFailure();
+              }
             } else {
               await runMutation(() =>
                 updateMember.mutateAsync({ id: member.id, weight: parsedWeight, routingStatus }),
@@ -3057,6 +3078,18 @@ export function PoolMemberForm({
       <Button type="submit" size="touch" disabled={!canSubmit || isPending}>
         {isPending ? t("common:actions.saving") : t("common:actions.save")}
       </Button>
+      <GranteePrivacyConfirmDialog
+        confirmation={privacyConfirm}
+        pending={updateMember.isPending}
+        onOpenChange={(open) => {
+          if (!open) setPrivacyConfirm(null);
+        }}
+        onConfirm={() => {
+          void privacyConfirm?.retry().catch(() => {
+            toast.error(t("common:somethingWentWrong"));
+          });
+        }}
+      />
     </form>
   );
 }
@@ -3065,30 +3098,49 @@ export function GrantPoolDialog({
   pool,
   onOpenChange,
 }: {
-  pool: ModelPool | null;
+  pool: Pick<ModelPool, "id" | "effectiveProviderEgress"> | null;
   onOpenChange: (open: boolean) => void;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
   const [email, setEmail] = useState("");
   const [publicEgressAcknowledged, setPublicEgressAcknowledged] = useState(false);
-  const providerEgress = pool?.members.some((member) => member.providerModel) ?? false;
-  const grant = useMutation(
-    orpc.forwarderManagement.grantPoolAccessByEmail.mutationOptions({
+  const [grantError, setGrantError] = useState<string | null>(null);
+  const poolId = pool?.id ?? null;
+  const [trackedPoolId, setTrackedPoolId] = useState(poolId);
+  if (trackedPoolId !== poolId) {
+    setTrackedPoolId(poolId);
+    setPublicEgressAcknowledged(false);
+    setGrantError(null);
+  }
+  const providerEgress = pool?.effectiveProviderEgress === true;
+  const grant = useMutation({
+    ...orpc.forwarderManagement.grantPoolAccessByEmail.mutationOptions({
       onSuccess: () => {
         void queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:pools.grantAdded"));
         setEmail("");
         setPublicEgressAcknowledged(false);
+        setGrantError(null);
         onOpenChange(false);
       },
+      onError: (error) => {
+        setGrantError(grantPoolAccessServerMessage(error) ?? t("common:somethingWentWrong"));
+      },
     }),
-  );
+    meta: { skipGlobalErrorToast: true },
+  });
   const validEmail =
     /^\S+@\S+\.\S+$/.test(email.trim()) && (!providerEgress || publicEgressAcknowledged);
 
   return (
-    <Dialog open={Boolean(pool)} onOpenChange={onOpenChange}>
+    <Dialog
+      open={Boolean(pool)}
+      onOpenChange={(open) => {
+        if (!open) setGrantError(null);
+        onOpenChange(open);
+      }}
+    >
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>{t("dashboard:pools.grantTitle")}</DialogTitle>
@@ -3099,6 +3151,7 @@ export function GrantPoolDialog({
           onSubmit={(event) => {
             event.preventDefault();
             if (!pool || !validEmail) return;
+            setGrantError(null);
             grant.mutate({
               poolId: pool.id,
               email: email.trim(),
@@ -3126,6 +3179,11 @@ export function GrantPoolDialog({
               />
               <span>{t("dashboard:pools.grantEgressAcknowledge")}</span>
             </label>
+          ) : null}
+          {grantError ? (
+            <p className="text-sm text-destructive" role="alert">
+              {grantError}
+            </p>
           ) : null}
           <DialogFooter>
             <Button type="submit" size="touch" disabled={!validEmail || grant.isPending}>
@@ -3561,6 +3619,7 @@ function VisibleModelChecklist({
       id: pool.modelId,
       label: pool.modelId,
       kind: t("tokens.pool"),
+      external: pool.effectiveProviderEgress,
     })),
   ];
 
@@ -3586,7 +3645,12 @@ function VisibleModelChecklist({
                   }}
                 />
                 <span className="min-w-0">
-                  <span className="block text-xs font-medium">{row.kind}</span>
+                  <span className="flex flex-wrap items-center gap-2 text-xs font-medium">
+                    {row.kind}
+                    {"external" in row ? (
+                      <PoolPrivacyBadge external={row.external === true} />
+                    ) : null}
+                  </span>
                   <code className="block break-all font-mono text-xs text-muted-foreground">
                     {row.label}
                   </code>
@@ -3608,11 +3672,19 @@ function VisibleModelPreview({ preview }: { preview: TokenPreview }) {
     <div className="rounded-md border p-3">
       <p className="text-sm font-medium">{t("tokens.visiblePreview", { count })}</p>
       <TokenEgressWarnings pools={preview.modelPools} compact />
-      <div className="mt-2 max-h-40 overflow-y-auto overflow-x-clip space-y-1">
-        {[...preview.directModels, ...preview.modelPools].map((model) => (
+      <div className="mt-2 max-h-40 space-y-1 overflow-x-clip overflow-y-auto">
+        {preview.directModels.map((model) => (
           <code key={model.id} className="block break-all font-mono text-xs text-muted-foreground">
             {model.id}
           </code>
+        ))}
+        {preview.modelPools.map((pool) => (
+          <div key={pool.id} className="flex min-w-0 flex-wrap items-center gap-2">
+            <PoolPrivacyBadge external={pool.effectiveProviderEgress === true} />
+            <code className="min-w-0 break-all font-mono text-xs text-muted-foreground">
+              {pool.id}
+            </code>
+          </div>
         ))}
       </div>
     </div>
@@ -3626,15 +3698,15 @@ function TokenEgressWarnings({
   pools: Array<{
     id: string;
     name: string;
-    publicEgressEnabled: boolean;
-    publicEgressAcknowledged: boolean;
     effectiveProviderEgress?: boolean;
-    providerPrimaryMemberCount?: number;
+    providerAccountLabels?: readonly string[];
   }>;
   compact?: boolean;
 }) {
   const { t } = useTranslation("dashboard");
-  const egressPoolNames = publicEgressResourceNames(pools);
+  const egressPools = pools.filter((pool) => pool.effectiveProviderEgress === true);
+  const egressPoolNames = publicEgressResourceNames(egressPools);
+  const accountLabels = egressProviderAccountLabels(egressPools);
   if (egressPoolNames.length === 0) return null;
   return (
     <div
@@ -3646,7 +3718,12 @@ function TokenEgressWarnings({
     >
       <p className="font-medium">{t("tokens.publicEgressWarningTitle")}</p>
       <p className="mt-1">
-        {t("tokens.publicEgressWarning", { pools: egressPoolNames.join(", ") })}
+        {accountLabels.length > 0
+          ? t("tokens.publicEgressWarningNamed", {
+              pools: egressPoolNames.join(", "),
+              providers: accountLabels.join(", "),
+            })
+          : t("tokens.publicEgressWarning", { pools: egressPoolNames.join(", ") })}
       </p>
     </div>
   );

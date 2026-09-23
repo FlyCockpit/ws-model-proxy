@@ -1,5 +1,5 @@
 import { readFile } from "node:fs/promises";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   parseAnthropicMessagesRequest,
   parseOpenAiChatRequest,
@@ -334,5 +334,325 @@ describe("adapter golden execution", () => {
       (renderAnthropicMessagesRequest(canonical, "claude").tool_choice as Record<string, unknown>)
         .disable_parallel_tool_use,
     ).toBe(golden.anthropic.disableParallelToolUse);
+  });
+});
+
+const ignoredEnvelopeLog = "[model-api] ignored upstream envelope fields";
+
+function withDebug(run: () => void) {
+  const debug = vi.spyOn(console, "debug").mockImplementation(() => undefined);
+  try {
+    run();
+    return debug.mock.calls.map((call) => [...call]);
+  } finally {
+    debug.mockRestore();
+  }
+}
+
+function expectIgnored(calls: unknown[][], path: string, fields: string[], secret: string) {
+  expect(JSON.stringify(calls)).not.toContain(secret);
+  expect(calls).toContainEqual([ignoredEnvelopeLog, { path, fields }]);
+}
+
+describe("upstream reply envelopes ignore unknown fields", () => {
+  it("adapts a llama.cpp chat reply with timings and reasoning_content", () => {
+    const timingsSecret = "DO_NOT_LOG_timings_value";
+    const choiceSecret = "DO_NOT_LOG_choice_value";
+    let items: unknown;
+    const debug = withDebug(() => {
+      const parsed = parseProtocolResponse({
+        surface: "openai-chat",
+        status: 200,
+        body: {
+          id: "llama",
+          object: "chat.completion",
+          created: 0,
+          model: "local",
+          timings: { predicted_n: 1, prompt_per_second: timingsSecret },
+          choices: [
+            {
+              index: 0,
+              llama_choice: choiceSecret,
+              message: {
+                role: "assistant",
+                content: "pong",
+                reasoning_content: "REASONING_CONTENT_HIDDEN",
+              },
+              finish_reason: "stop",
+            },
+          ],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        },
+      });
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) throw new Error("expected success");
+      items = parsed.response.items;
+    });
+    expect(items).toEqual([{ type: "text", text: "pong" }]);
+    expect(JSON.stringify(items)).not.toContain("REASONING_CONTENT_HIDDEN");
+    expectIgnored(debug, "response", ["timings"], timingsSecret);
+    expectIgnored(debug, "response.choices[0]", ["llama_choice"], choiceSecret);
+  });
+
+  it("drops both reasoning spellings when real content is present", () => {
+    const debug = withDebug(() => {
+      const parsed = parseProtocolResponse({
+        surface: "openai-chat",
+        status: 200,
+        body: {
+          id: "c",
+          object: "chat.completion",
+          choices: [
+            {
+              index: 0,
+              message: {
+                role: "assistant",
+                content: "pong",
+                reasoning: "hidden",
+                reasoning_content: "REASONING_CONTENT_HIDDEN",
+              },
+              finish_reason: "stop",
+            },
+          ],
+        },
+      });
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) throw new Error("expected success");
+      expect(parsed.response.items).toEqual([{ type: "text", text: "pong" }]);
+    });
+    expect(debug).toEqual([]);
+  });
+
+  it("treats empty or null reasoning spellings as absent", () => {
+    const parsed = parseProtocolResponse({
+      surface: "openai-chat",
+      status: 200,
+      body: {
+        id: "c",
+        object: "chat.completion",
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: "pong",
+              reasoning: "",
+              reasoning_content: null,
+            },
+            finish_reason: "stop",
+          },
+        ],
+      },
+    });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error("expected success");
+    expect(parsed.response.items).toEqual([{ type: "text", text: "pong" }]);
+  });
+
+  it("rejects a final answer whose only text is reasoning_content", () => {
+    const only = (message: Record<string, unknown>) =>
+      expect(() =>
+        parseProtocolResponse({
+          surface: "openai-chat",
+          status: 200,
+          body: {
+            id: "c",
+            object: "chat.completion",
+            choices: [{ index: 0, message, finish_reason: "stop" }],
+          },
+        }),
+      ).toThrow(/only visible text/u);
+    only({ role: "assistant", content: null, reasoning_content: "REASONING_CONTENT_HIDDEN" });
+    only({
+      role: "assistant",
+      content: null,
+      reasoning: "hidden",
+      reasoning_content: "REASONING_CONTENT_HIDDEN",
+    });
+  });
+
+  it("rejects a non-string reasoning_content value", () => {
+    const body = (message: Record<string, unknown>) => ({
+      id: "c",
+      object: "chat.completion",
+      choices: [{ index: 0, message, finish_reason: "stop" }],
+    });
+    expect(() =>
+      parseProtocolResponse({
+        surface: "openai-chat",
+        status: 200,
+        body: body({ role: "assistant", content: "pong", reasoning_content: 1 }),
+      }),
+    ).toThrow(/\.reasoning_content must be text/u);
+    expect(() =>
+      parseProtocolResponse({
+        surface: "openai-chat",
+        status: 200,
+        body: body({
+          role: "assistant",
+          content: "pong",
+          reasoning: { text: "hidden" },
+          reasoning_content: "REASONING_CONTENT_HIDDEN",
+        }),
+      }),
+    ).toThrow(/\.reasoning must be text/u);
+  });
+
+  it("ignores an unknown Responses envelope field and logs the name only", () => {
+    const secret = "DO_NOT_LOG_response_value";
+    const debug = withDebug(() => {
+      const parsed = parseProtocolResponse({
+        surface: "openai-responses",
+        status: 200,
+        body: {
+          id: "r",
+          object: "response",
+          status: "completed",
+          background: secret,
+          output: [
+            {
+              id: "i",
+              type: "message",
+              status: "completed",
+              role: "assistant",
+              content: [{ type: "output_text", text: "ok", annotations: [] }],
+            },
+          ],
+        },
+      });
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) throw new Error("expected success");
+      expect(parsed.response.items).toEqual([{ type: "text", text: "ok" }]);
+    });
+    expectIgnored(debug, "response", ["background"], secret);
+  });
+
+  it("ignores an unknown Anthropic envelope field and logs the name only", () => {
+    const secret = "DO_NOT_LOG_container_value";
+    const debug = withDebug(() => {
+      const parsed = parseProtocolResponse({
+        surface: "anthropic-messages",
+        status: 200,
+        body: {
+          id: "m",
+          type: "message",
+          role: "assistant",
+          model: "claude",
+          content: [{ type: "text", text: "ok" }],
+          stop_reason: "end_turn",
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 },
+          container: secret,
+        },
+      });
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) throw new Error("expected success");
+      expect(parsed.response.items).toEqual([{ type: "text", text: "ok" }]);
+    });
+    expectIgnored(debug, "response", ["container"], secret);
+  });
+
+  it("still rejects unknown message, tool-call, and function fields", () => {
+    const chat = (message: Record<string, unknown>) =>
+      parseProtocolResponse({
+        surface: "openai-chat",
+        status: 200,
+        body: {
+          id: "c",
+          object: "chat.completion",
+          choices: [{ index: 0, message, finish_reason: "stop" }],
+        },
+      });
+    const debug = withDebug(() => {
+      expect(() => chat({ role: "assistant", content: "pong", extra_vendor_field: true })).toThrow(
+        /extra_vendor_field/u,
+      );
+      expect(() =>
+        chat({
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "call",
+              type: "function",
+              vendor_call: true,
+              function: { name: "lookup", arguments: "{}" },
+            },
+          ],
+        }),
+      ).toThrow(/vendor_call/u);
+      expect(() =>
+        chat({
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "call",
+              type: "function",
+              function: { name: "lookup", arguments: "{}", vendor_fn: true },
+            },
+          ],
+        }),
+      ).toThrow(/vendor_fn/u);
+    });
+    expect(debug).toEqual([]);
+  });
+
+  it("still rejects unknown output items, content blocks, and usage fields", () => {
+    const debug = withDebug(() => {
+      expect(() =>
+        parseProtocolResponse({
+          surface: "openai-responses",
+          status: 200,
+          body: {
+            id: "r",
+            object: "response",
+            status: "completed",
+            output: [
+              {
+                id: "i",
+                type: "message",
+                status: "completed",
+                role: "assistant",
+                phase: "nope",
+                content: [{ type: "output_text", text: "ok", annotations: [] }],
+              },
+            ],
+          },
+        }),
+      ).toThrow(/phase/u);
+      expect(() =>
+        parseProtocolResponse({
+          surface: "anthropic-messages",
+          status: 200,
+          body: {
+            id: "m",
+            type: "message",
+            role: "assistant",
+            content: [{ type: "text", text: "ok", cache_control: { type: "ephemeral" } }],
+            stop_reason: "end_turn",
+          },
+        }),
+      ).toThrow(/cache_control/u);
+      expect(() =>
+        parseProtocolResponse({
+          surface: "openai-chat",
+          status: 200,
+          body: {
+            id: "c",
+            object: "chat.completion",
+            choices: [
+              {
+                index: 0,
+                message: { role: "assistant", content: "ok" },
+                finish_reason: "stop",
+              },
+            ],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, extra_usage: 1 },
+          },
+        }),
+      ).toThrow(/extra_usage/u);
+    });
+    expect(debug).toEqual([]);
   });
 });

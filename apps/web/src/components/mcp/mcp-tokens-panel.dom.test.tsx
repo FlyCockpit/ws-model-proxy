@@ -142,6 +142,17 @@ function renderPanel(createEnabled = true, allowNoExpiry = true) {
   );
 }
 
+async function chooseExpiryOption(user: ReturnType<typeof userEvent.setup>, optionName: string) {
+  await user.click(screen.getByRole("combobox"));
+  await user.click(await screen.findByRole("option", { name: optionName }));
+}
+
+function expectAboutNinetyDays(expiresAt: string | null) {
+  expect(typeof expiresAt).toBe("string");
+  const delta = new Date(expiresAt as string).getTime() - Date.now();
+  expect(Math.abs(delta - 90 * 86_400_000)).toBeLessThan(5_000);
+}
+
 function localDateInput(date: Date): string {
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
@@ -158,6 +169,101 @@ afterEach(() => {
   state.revokeCalls = [];
   state.createCalls = [];
   state.createError = null;
+});
+
+describe("McpTokensPanel CLI commands", () => {
+  it("shows the CLI commands checkbox only while write is checked and clears it with write", async () => {
+    state.listPending = false;
+    state.listResult = [];
+    const user = userEvent.setup();
+    renderPanel();
+    await screen.findByText("settings:mcp.tokens.empty");
+    await user.click(screen.getByRole("button", { name: "settings:mcp.tokens.create" }));
+    const dialog = screen.getByRole("dialog");
+    expect(
+      within(dialog).queryByRole("checkbox", { name: "settings:mcp.tokens.allowCliCommands" }),
+    ).not.toBeTruthy();
+    await user.click(
+      within(dialog).getByRole("checkbox", { name: "settings:mcp.tokens.allowWrite" }),
+    );
+    const cliCommands = within(dialog).getByRole("checkbox", {
+      name: "settings:mcp.tokens.allowCliCommands",
+    });
+    await user.click(cliCommands);
+    expect(cliCommands.getAttribute("aria-checked")).toBe("true");
+    await user.click(
+      within(dialog).getByRole("checkbox", { name: "settings:mcp.tokens.allowWrite" }),
+    );
+    expect(
+      within(dialog).queryByRole("checkbox", { name: "settings:mcp.tokens.allowCliCommands" }),
+    ).not.toBeTruthy();
+    await user.click(
+      within(dialog).getByRole("checkbox", { name: "settings:mcp.tokens.allowWrite" }),
+    );
+    const restored = within(dialog).getByRole("checkbox", {
+      name: "settings:mcp.tokens.allowCliCommands",
+    });
+    expect(restored.getAttribute("aria-checked")).not.toBe("true");
+  });
+
+  it("warns when a never-expiring token also allows CLI commands", async () => {
+    state.listPending = false;
+    state.listResult = [];
+    const user = userEvent.setup();
+    renderPanel();
+    await screen.findByText("settings:mcp.tokens.empty");
+    await user.click(screen.getByRole("button", { name: "settings:mcp.tokens.create" }));
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).queryByRole("status")).not.toBeTruthy();
+    await user.click(
+      within(dialog).getByRole("checkbox", { name: "settings:mcp.tokens.allowWrite" }),
+    );
+    await user.click(
+      within(dialog).getByRole("checkbox", { name: "settings:mcp.tokens.allowCliCommands" }),
+    );
+    expect(
+      within(dialog).queryByText("settings:mcp.tokens.allowCliCommandsNoExpiryWarning"),
+    ).not.toBeTruthy();
+    await chooseExpiryOption(user, "settings:mcp.tokens.noExpiryOption");
+    expect(
+      within(dialog).getByText("settings:mcp.tokens.allowCliCommandsNoExpiryWarning"),
+    ).toBeTruthy();
+    await chooseExpiryOption(user, "settings:mcp.tokens.days90");
+    expect(
+      within(dialog).queryByText("settings:mcp.tokens.allowCliCommandsNoExpiryWarning"),
+    ).not.toBeTruthy();
+  });
+
+  it("sends allowCliCommands only with write and badges tokens that have it", async () => {
+    state.listPending = false;
+    state.listResult = [{ ...token, allowCliCommands: true }];
+    const user = userEvent.setup();
+    renderPanel();
+    expect(await screen.findByText("settings:mcp.tokens.allowCliCommandsBadge")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "settings:mcp.tokens.create" }));
+    const dialog = screen.getByRole("dialog");
+    await user.type(within(dialog).getByLabelText("settings:mcp.tokens.name"), "Grok laptop");
+    await user.click(
+      within(dialog).getByRole("checkbox", { name: "settings:mcp.tokens.allowWrite" }),
+    );
+    await user.click(
+      within(dialog).getByRole("checkbox", { name: "settings:mcp.tokens.allowCliCommands" }),
+    );
+    await user.click(within(dialog).getByRole("button", { name: "settings:mcp.tokens.create" }));
+    await waitFor(() => {
+      expect(state.createCalls).toHaveLength(1);
+    });
+    const input = state.createCalls[0] as {
+      name: string;
+      allowWrite: boolean;
+      allowCliCommands: boolean;
+      expiresAt: string | null;
+    };
+    expect(input.name).toBe("Grok laptop");
+    expect(input.allowWrite).toBe(true);
+    expect(input.allowCliCommands).toBe(true);
+    expectAboutNinetyDays(input.expiresAt);
+  });
 });
 
 describe("McpTokensPanel", () => {
@@ -203,12 +309,21 @@ describe("McpTokensPanel", () => {
     renderPanel();
     await screen.findByText("settings:mcp.tokens.empty");
     await openDialogTypeAndSubmit(user);
-    // Default No-expiry choice sends a null expiresAt.
     await waitFor(() => {
-      expect(state.createCalls).toEqual([
-        { name: "Grok laptop", allowWrite: false, expiresAt: null },
-      ]);
+      expect(state.createCalls).toHaveLength(1);
     });
+    const input = state.createCalls[0] as {
+      name: string;
+      allowWrite: boolean;
+      allowCliCommands: boolean;
+      expiresAt: string | null;
+    };
+    expect(input).toMatchObject({
+      name: "Grok laptop",
+      allowWrite: false,
+      allowCliCommands: false,
+    });
+    expectAboutNinetyDays(input.expiresAt);
     expect(await screen.findByText("settings:mcp.tokens.secret")).toBeTruthy();
     expect(screen.getByText(`${window.location.origin}/mcp`)).toBeTruthy();
     expect(screen.getByText("settings:mcp.tokens.mcpUrl")).toBeTruthy();
@@ -319,12 +434,7 @@ describe("McpTokensPanel", () => {
     expect(state.createCalls).toEqual([]);
   });
 
-  async function chooseExpiryOption(user: ReturnType<typeof userEvent.setup>, optionName: string) {
-    await user.click(screen.getByRole("combobox"));
-    await user.click(await screen.findByRole("option", { name: optionName }));
-  }
-
-  it("defaults the expiry selector to No expiry and sends a 90-day expiresAt when switched", async () => {
+  it("defaults the expiry selector to 90 days while No expiry is still offered", async () => {
     state.listPending = false;
     state.listResult = [];
     const user = userEvent.setup();
@@ -334,11 +444,13 @@ describe("McpTokensPanel", () => {
     const dialog = screen.getByRole("dialog");
     await user.type(await screen.findByLabelText("settings:mcp.tokens.name"), "Grok laptop");
     const trigger = within(dialog).getByRole("combobox");
-    expect(trigger.textContent).toContain("settings:mcp.tokens.noExpiryOption");
-    await chooseExpiryOption(user, "settings:mcp.tokens.days90");
-    expect(within(dialog).getByRole("combobox").textContent).toContain(
-      "settings:mcp.tokens.days90",
-    );
+    expect(trigger.textContent).toContain("settings:mcp.tokens.days90");
+    expect(trigger.textContent).not.toContain("settings:mcp.tokens.noExpiryOption");
+    await user.click(trigger);
+    expect(
+      await screen.findByRole("option", { name: "settings:mcp.tokens.noExpiryOption" }),
+    ).toBeTruthy();
+    await user.click(await screen.findByRole("option", { name: "settings:mcp.tokens.days90" }));
     await user.click(within(dialog).getByRole("button", { name: "settings:mcp.tokens.create" }));
     await waitFor(() => {
       expect(state.createCalls).toHaveLength(1);
@@ -349,13 +461,25 @@ describe("McpTokensPanel", () => {
       expiresAt: string | null;
     };
     expect(input.name).toBe("Grok laptop");
-    expect(input.expiresAt).toBeTruthy();
-    // Roughly now + 90 days — Date-ness, not exact ms.
-    const expiresAt = new Date(input.expiresAt as string);
-    expect(Number.isNaN(expiresAt.getTime())).toBe(false);
-    const deltaMs = expiresAt.getTime() - Date.now();
-    expect(deltaMs).toBeGreaterThan(89 * 24 * 60 * 60 * 1000);
-    expect(deltaMs).toBeLessThan(91 * 24 * 60 * 60 * 1000);
+    expectAboutNinetyDays(input.expiresAt);
+  });
+
+  it("sends a null expiresAt when No expiry is selected", async () => {
+    state.listPending = false;
+    state.listResult = [];
+    const user = userEvent.setup();
+    renderPanel();
+    await screen.findByText("settings:mcp.tokens.empty");
+    await user.click(screen.getByRole("button", { name: "settings:mcp.tokens.create" }));
+    const dialog = screen.getByRole("dialog");
+    await user.type(await screen.findByLabelText("settings:mcp.tokens.name"), "Grok laptop");
+    await chooseExpiryOption(user, "settings:mcp.tokens.noExpiryOption");
+    await user.click(within(dialog).getByRole("button", { name: "settings:mcp.tokens.create" }));
+    await waitFor(() => {
+      expect(state.createCalls).toHaveLength(1);
+    });
+    const input = state.createCalls[0] as { expiresAt: string | null };
+    expect(input.expiresAt).toBeNull();
   });
 
   it("hides the No-expiry option and defaults to 90 days when allowNoExpiry is false", async () => {

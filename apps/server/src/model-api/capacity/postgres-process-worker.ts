@@ -238,9 +238,6 @@ try {
       "/v1",
       createModelApiRoutes({
         manager,
-        anthropicEnabled: true,
-        protocolAdaptationEnabled: true,
-        capacityEnabled: true,
       }),
     );
     const server = serve({ fetch: app.fetch, port: 0 }, (info) => write({ port: info.port }));

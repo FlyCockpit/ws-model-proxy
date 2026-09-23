@@ -83,7 +83,7 @@ export interface EnvVar {
   key: string;
   group: string;
   source: "generate" | "prompt" | "confirm" | "enable" | "default" | "manual";
-  generator?: "secret32" | "vapid-public" | "vapid-private";
+  generator?: "secret32" | "keyring" | "vapid-public" | "vapid-private";
   default?: string;
   defaultFrom?: "schema" | "app";
   choices?: Array<{ value: string; label?: string; description?: string }>;
@@ -314,46 +314,25 @@ export const ENV_VARS: EnvVar[] = [
     default: "900000",
   },
   {
-    key: "MODEL_API_ANTHROPIC_ENABLED",
-    group: "runtime",
-    source: "default",
-    default: "false",
-    comment: [
-      "Release gate for the incomplete native Anthropic Messages surface. Keep false by default.",
-    ],
-  },
-  {
-    key: "MODEL_API_PROTOCOL_ADAPTATION_ENABLED",
-    group: "runtime",
-    source: "default",
-    default: "false",
-    comment: ["Release gate for opt-in model-pool cross-protocol adaptation."],
-  },
-  {
-    key: "MODEL_API_GLOBAL_CAPACITY_ENABLED",
-    group: "runtime",
-    source: "default",
-    default: "false",
-    comment: ["Release gate for durable global capacity admission. Keep false until proven."],
-  },
-  {
     key: "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED",
     group: "runtime",
     source: "default",
-    default: "false",
+    default: "true",
     comment: [
-      "Release gate for direct public-provider egress. Keep false until admission, budgets, redaction, and SSRF gates pass.",
+      "Kill switch for direct public-provider egress. On by default.",
+      "Off stops provider HTTP. On does not send data by itself: a pool still needs the owner's acknowledgement and a provider member.",
+      "When on with no keyring, startup warns once and does not log the key.",
     ],
   },
   {
     key: "WMP_MCP_ENABLED",
     group: "runtime",
     source: "default",
-    default: "false",
+    default: "true",
     comment: [
-      "Release gate for the MCP server and OAuth provider surface (jwt/mcp/cimd",
-      "plugins, /mcp, discovery, MCP login/consent). Keep false until the feature is",
-      "ready for release. Human grant listing/revocation stays available while disabled.",
+      "Kill switch for the MCP server and OAuth provider surface (jwt/mcp/cimd",
+      "plugins, /mcp, discovery, MCP login/consent). On by default. Set false to",
+      "omit those plugins. Human grant listing/revocation stays available while disabled.",
     ],
   },
   {
@@ -362,8 +341,8 @@ export const ENV_VARS: EnvVar[] = [
     source: "default",
     default: "true",
     comment: [
-      "Allow minting no-expiry (unlimited-lifetime) MCP personal tokens; the default token carries no expiry.",
-      "Turn off to require an expiry within MCP_PAT_MAX_TTL_DAYS (365 days) when creating a token.",
+      "Allow minting no-expiry (unlimited-lifetime) MCP personal tokens. The product default is 90 days.",
+      "Turn off to refuse an explicit no-expiry token. Omitting expiry still mints a 90-day token; a chosen expiry must be within MCP_PAT_MAX_TTL_DAYS (365 days).",
     ],
   },
   {
@@ -378,9 +357,9 @@ export const ENV_VARS: EnvVar[] = [
   {
     key: "WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS",
     group: "runtime",
-    source: "manual",
+    source: "generate",
+    generator: "keyring",
     secret: true,
-    example: "v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
     comment: [
       "Provider credential AES-256-GCM keyring: active-version:base64-32-byte-key,old-version:base64-32-byte-key.",
       "The first key encrypts new/rotated records; remaining keys are decrypt-only. Never log this value.",

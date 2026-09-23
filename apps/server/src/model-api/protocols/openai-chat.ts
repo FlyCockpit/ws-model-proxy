@@ -17,6 +17,7 @@ import {
   texts,
   validateToolChoice,
 } from "./parse-utils.js";
+import { type ReasoningRenderControl, reasoningWireFieldsForRequest } from "./request-controls.js";
 
 const ROOT_KEYS = [
   "model",
@@ -201,7 +202,10 @@ function validateMessageToolIds(messages: readonly CanonicalMessage[]) {
 export function renderOpenAiChatRequest(
   request: CanonicalRequest,
   model: string,
+  options: { acceptsTopK?: boolean; reasoning?: ReasoningRenderControl } = {},
 ): Record<string, unknown> {
+  if (request.sampling.topK !== undefined && options.acceptsTopK !== true) unsupported("top_k");
+  const reasoningFields = reasoningWireFieldsForRequest(request, "openai-chat", options.reasoning);
   const messages: Record<string, unknown>[] = request.instructions.map((instruction) => ({
     role: instruction.role,
     content: instruction.content.length === 1 ? instruction.content[0]?.text : instruction.content,
@@ -280,10 +284,12 @@ export function renderOpenAiChatRequest(
       ? { temperature: request.sampling.temperature }
       : {}),
     ...(request.sampling.topP !== undefined ? { top_p: request.sampling.topP } : {}),
+    ...(request.sampling.topK !== undefined ? { top_k: request.sampling.topK } : {}),
     ...(request.sampling.stop ? { stop: request.sampling.stop } : {}),
     ...(request.sampling.maxOutputTokens !== undefined
       ? { max_completion_tokens: request.sampling.maxOutputTokens }
       : {}),
+    ...reasoningFields,
     n: 1,
   };
 }

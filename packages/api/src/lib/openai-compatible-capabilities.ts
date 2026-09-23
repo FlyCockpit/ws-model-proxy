@@ -8,6 +8,13 @@ import { reasoningConfigSchema, validateSurfaceReasoningConfig } from "./reasoni
 
 const booleanSupportSchema = z.boolean().optional();
 
+/** Sampling parameters a target already accepts. `top_k` is the adapted field. */
+const samplingExtensionSchema = z
+  .object({
+    parameters: z.array(z.string().trim().min(1).max(64)).max(32),
+  })
+  .strict();
+
 export const transcriptionCapabilitiesSchema = z
   .object({
     supported: booleanSupportSchema,
@@ -73,6 +80,7 @@ const v1CapabilitiesSchema = z
   .object({
     version: z.literal(1),
     ...commonCapabilityShape,
+    sampling: samplingExtensionSchema.optional(),
     audio: z
       .object({
         transcriptions: booleanSupportSchema,
@@ -88,6 +96,7 @@ const v2CapabilitiesSchema = z
   .object({
     version: z.literal(2),
     ...commonCapabilityShape,
+    sampling: samplingExtensionSchema.optional(),
     audio: z
       .object({
         transcriptions: transcriptionCapabilitiesSchema.optional(),
@@ -221,6 +230,7 @@ const v4CapabilitiesSchema = z
     embeddings: z.never().optional(),
     responses: z.never().optional(),
     audio: z.never().optional(),
+    sampling: samplingExtensionSchema.optional(),
     surfaces: z
       .object({
         openaiChatCompletions: z
@@ -306,6 +316,7 @@ const v3CapabilitiesSchema = z
       .strict(),
     source: z.enum(["declared", "probe", "dashboard", "provider"]).optional(),
     confidence: z.enum(["exact", "high", "estimated", "unknown"]).optional(),
+    sampling: samplingExtensionSchema.optional(),
     audio: z
       .object({
         transcriptions: transcriptionCapabilitiesSchema.optional(),

@@ -101,6 +101,11 @@ export {
   renderInviteUser,
 } from "./templates/invite-user.js";
 export {
+  type RenderPoolExternalProviderNoticeArgs,
+  type RenderPoolExternalProviderNoticeResult,
+  renderPoolExternalProviderNotice,
+} from "./templates/pool-external-provider.js";
+export {
   type RenderTwoFactorOtpArgs,
   type RenderTwoFactorOtpResult,
   renderTwoFactorOtp,

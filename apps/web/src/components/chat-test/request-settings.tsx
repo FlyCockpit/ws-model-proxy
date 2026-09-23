@@ -60,7 +60,9 @@ export function RequestSettingsFields({
             value={surfaceSelection}
             disabled={disabled}
             aria-invalid={surfaceSelection === "PREFERRED" && effectiveSurface === null}
-            onChange={(event) => onSurfaceChange(event.target.value as ChatTestSurfaceSelection)}
+            onChange={(event) => {
+              onSurfaceChange(event.target.value as ChatTestSurfaceSelection);
+            }}
           >
             <option value="PREFERRED">{t("dashboard:chatTest.surface.PREFERRED")}</option>
             <option value="OPENAI_CHAT_COMPLETIONS">

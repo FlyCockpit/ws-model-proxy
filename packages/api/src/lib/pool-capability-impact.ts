@@ -1,5 +1,4 @@
 import type { Prisma } from "@ws-model-proxy/db";
-import { env } from "@ws-model-proxy/env/server";
 import { parseModelApiSurface } from "./model-api-surface";
 import { type PoolSurfaceMember, recommendedSurfaceViolation } from "./pool-recommended-surface";
 import { poolMemberSurfaceSelect, poolSurfaceMemberFromRow } from "./pool-surface-members";
@@ -91,13 +90,12 @@ export async function capabilityEditImpactedPools(
       list.push(poolSurfaceMemberFromRow(row));
       membersByPool.set(row.poolId, list);
     }
-    const adaptationAvailable = env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED;
     const impacted: ImpactedPoolAdvisory[] = [];
     for (const pool of pools) {
       const violation = recommendedSurfaceViolation({
         override: parseModelApiSurface(pool.recommendedSurfaceOverride),
         members: membersByPool.get(pool.id) ?? [],
-        adaptationEnabled: pool.protocolAdaptationEnabled && adaptationAvailable,
+        adaptationEnabled: pool.protocolAdaptationEnabled,
       });
       if (violation) impacted.push({ id: pool.id, slug: pool.slug, surface: violation });
     }

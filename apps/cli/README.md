@@ -46,6 +46,8 @@ wsmp config init                    # write a default config
 wsmp config set-slug desk-01        # set this CLI connection's slug
 wsmp endpoints add local http://127.0.0.1:11434
 wsmp endpoints add local http://127.0.0.1:11434 --expand-media  # inline WMP media URLs
+wsmp endpoints concurrency local 4          # register this limit for every model
+wsmp endpoints engine local llama.cpp       # advertise top_k (also: vllm, generic)
 wsmp endpoints probe local
 wsmp connect                        # open the outbound websocket relay
 wsmp daemon start --detach          # background relay (new session; owns a PID file)
@@ -57,10 +59,25 @@ wsmp daemon stop                    # stop a detached relay
 wsmp service install                # install, enable, and start a Linux/macOS user service
 wsmp service status                 # inspect the installed user service
 wsmp service env-sync               # copy required env vars into the private service env file
+wsmp terminal fingerprint           # print this CLI's terminal identity fingerprint
 wsmp completions zsh                # shell completions
 ```
 
-Configuration is stored in a JSON file. `wsmp config path` prints the resolved path for the current platform. Logs go to stderr; pass `-v`/`-vv` for more, `--quiet` for less, or set `WSMP_LOG`.
+Configuration is stored in a JSON file. `wsmp config path` prints the resolved path for the current platform. `WSMP_CONFIG` selects that file. `WSMP_STATE_DIR` selects the state directory used by the daemon (PID file and control socket) and by `wsmp terminal approve` (pending and approved browser identities). When it is unset, the CLI uses `$XDG_STATE_HOME/ws-model-proxy` or `~/.local/state/ws-model-proxy`. Logs go to stderr; pass `-v`/`-vv` for more, `--quiet` for less, or set `WSMP_LOG`.
+
+### Browser terminal viewers
+
+On relay protocol 2.5, several browser tabs can view one terminal at once (up to 8, counting tabs waiting for approval). The tab that typed most recently is the writer, and the terminal takes that tab's size; other tabs show the terminal at the writer's size until someone types in them. The CLI encrypts each output frame once under a shared output key, which it sends to each tab under that tab's own end-to-end key and replaces when a tab leaves. Input keys stay separate per tab. With `requireTerminalApproval`, every tab is approved on its own. Closing a tab only stops that tab viewing; "End session" on the terminals page ends the shell for everyone. A CLI connected to an older server falls back to protocol 2.4, which allows one viewer per terminal.
+
+Typed or pasted input goes through a per-terminal queue of up to 256 KiB, so a program that stops reading its input never stalls the relay. When that queue is full, further input is dropped and the tab shows an "input dropped" notice.
+
+Ending a terminal session (or the idle timeout, or stopping the daemon) kills every process in the shell's session, not only the shell's process group: background jobs, jobs in their own process groups, and `nohup` or disowned jobs all end with it. A process that calls `setsid()` itself (for example `setsid`, or a daemon that detaches) starts a new session and is not killed. Terminals are Unix-only.
+
+### Terminal identity
+
+Each CLI has a long-lived terminal identity key in `terminal-identity.json` in the state directory (mode 0600). The CLI creates it the first time the daemon starts or `wsmp terminal fingerprint` runs, and never replaces it; a damaged file is an error. On relay protocol 2.5, the CLI signs its per-start terminal key and its CLI slug with this key. The browser checks that signature before any terminal handshake and pins the identity key for that CLI the first time it sees it.
+
+The terminals page shows each CLI's fingerprint: base32 of the first 20 bytes of SHA-256 of the identity public key, in groups of 4. `wsmp terminal fingerprint` prints the same value (`--json` adds the public key and file path). If the page reports that a CLI's identity key changed, compare the new fingerprint with this command on that machine before you choose "Trust new key". Deleting `terminal-identity.json` creates a new key, and every browser that pinned the old one will ask again. A CLI on protocol 2.4 cannot prove an identity; the page marks it unverified.
 
 ### Background daemon and user services
 
@@ -91,6 +108,27 @@ Configuration is stored in a JSON file. `wsmp config path` prints the resolved p
   prints the file path.
 - Linux tip: `loginctl enable-linger "$USER"` keeps a user service running after
   logout.
+- **Shutdown (Unix).** SIGTERM (`wsmp daemon stop`, `systemctl stop`), SIGINT
+  (Ctrl-C), and SIGHUP stop the relay cleanly in foreground, detached, and
+  service modes: it kills every running MCP exec command (its whole process
+  group) and every terminal (every process in the shell's session), tells the
+  server they ended, closes the websocket, and removes the control socket and
+  PID file. It then exits from the same signal (status 143, 130, or 129). A
+  signal the relay inherited as ignored, such as SIGHUP under `nohup`, stays
+  ignored. Cleanup gets 5 seconds; after that, or on a second signal, the relay
+  kills the tracked process groups and sessions directly, removes its files,
+  and exits at once.
+- **SIGKILL (`kill -9`) cannot be caught.** It is the one way to stop the relay
+  that leaves exec commands and terminal processes running, untracked. Prefer
+  SIGTERM; if a relay was killed with SIGKILL, find leftovers with
+  `ps -o pid,pgid,sid,args` and end them yourself.
+- **Shutdown (Windows).** Ctrl-C, Ctrl-Break, closing the console window, and
+  a system shutdown start the same cleanup: running MCP exec commands are
+  ended, the server hears they finished, and the websocket closes. Cleanup
+  gets 5 seconds (Windows itself may end the process sooner after a console
+  close); after that, or on a second Ctrl-C, the relay kills the tracked
+  commands with their child processes and exits at once. The exit status is
+  130 for Ctrl-C, 149 for Ctrl-Break, and 143 otherwise.
 
 ### Media expansion for local upstreams
 
@@ -147,6 +185,7 @@ path (never the URL signature).
 | 1 | runtime error |
 | 2 | usage error |
 | 3 | not found |
+| 128 + signal | the relay stopped on SIGHUP (129), SIGINT (130), or SIGTERM (143); on Unix it dies from that signal after cleanup |
 
 ## Install After Release
 

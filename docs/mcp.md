@@ -1,8 +1,8 @@
 # MCP server
 
 WS Model Proxy exposes its dashboard operations to MCP (Model Context Protocol)
-clients as an OAuth-protected resource. The surface is disabled by default and
-gated by a single flag: `WMP_MCP_ENABLED`. Everything else — the canonical URL,
+clients as an OAuth-protected resource. The surface is on by default.
+`WMP_MCP_ENABLED` is the kill switch (`false` closes it). Everything else — the canonical URL,
 protocol profile, scopes, token lifetimes, and registration policy — is derived
 from configuration in code, not operator tuning.
 
@@ -29,8 +29,8 @@ Required environment:
 - `BETTER_AUTH_URL`: the canonical **public** origin of the server
   (for example `https://wmp.example.test`). The MCP resource URL, OAuth issuer,
   and DPoP `htu` validation are all derived from this value (see below).
-- `WMP_MCP_ENABLED=true`: installs the Better Auth MCP/OAuth plugins and opens
-  the MCP surface. Default `false`.
+- `WMP_MCP_ENABLED`: installs the Better Auth MCP/OAuth plugins and opens
+  the MCP surface. Default `true`. Set `false` to close it.
 
 Optional:
 
@@ -51,10 +51,11 @@ Optional:
 The generated `.env.example` files track these keys
 (`pnpm env:sync` / `pnpm env:check`); do not hand-edit them.
 
-Deploy the schema before enabling the flag: the MCP surface adds the Better
-Auth OAuth/JWKS tables plus the application-owned `McpGrant` table to the
-Prisma schema. Use the repository's safe schema workflow (`pnpm db:push`
-locally; `APPLY_SCHEMA=safe` for additive deploys).
+The MCP surface uses the Better Auth OAuth/JWKS tables plus the
+application-owned `McpGrant` table. Those models are in the Prisma schema
+whether or not the kill switch is off. Apply them with the repository's safe
+schema workflow (`pnpm db:push` locally; `APPLY_SCHEMA=safe` for additive
+deploys) before first use.
 
 ### Flag-off behavior (emergency kill switch)
 
@@ -290,6 +291,27 @@ the list. Revocation uses an `AlertDialog` with the `REVOKE` confirmation
 literal and returns only `{ revoked: true }`. Token hashes, reference IDs,
 session IDs, redirect URIs, and key material are never returned. The CIMD
 client cache row is preserved because other users may share the client.
+
+## Personal access tokens
+
+`Settings → MCP` can also mint a personal access token (`wsmp_mcp_…`) for a
+headless client. The secret is shown once, creation requires a browser
+session, and `mcpTokens.create` is not an MCP tool. This is separate from the
+10-minute OAuth access JWTs above.
+
+- Omitting `expiresAt` mints a token that expires **90 days** later, measured
+  as exactly 90 × 24 hours (`90 * 86_400_000` ms) from the server clock at
+  creation. That is the product default, including the settings form, whether
+  or not no-expiry is allowed.
+- An explicit `null` means no expiry. That choice is allowed only while
+  `WMP_MCP_PAT_ALLOW_NO_EXPIRY` is on (the flag's default stays `true`).
+  Turning the flag off refuses explicit no-expiry mints; omission still means
+  90 days. The form keeps the "No expiry" option only while the flag is on.
+- An explicit timestamp is stored as given when it is strictly in the future
+  and at most 365 days (`MCP_PAT_MAX_TTL_DAYS`) from now.
+- Changing the flag or the default does not rewrite tokens that already
+  exist. List and revoke stay available while MCP is disabled; create does
+  not.
 
 ## DPoP (optional, preferred)
 
@@ -585,7 +607,8 @@ When bumping the Better Auth family (`better-auth`, `@better-auth/mcp`,
 
 ## Manual MCP Inspector smoke checklist
 
-Run once against staging with the flag enabled before enabling in production:
+Operator procedure, not a unit test. Run against a deployment that leaves
+`WMP_MCP_ENABLED` at its default of true:
 
 1. Discovery — all four well-known aliases return metadata; the RFC 7591
    `registration_endpoint` is advertised.

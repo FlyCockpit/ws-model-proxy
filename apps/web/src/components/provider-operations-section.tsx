@@ -4,6 +4,7 @@ import {
   type OpenAiCompatibleCapabilities,
   parseOpenAiCompatibleCapabilities,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import { PROVIDER_PRIVATE_NETWORK_REJECTED } from "@ws-model-proxy/api/lib/provider-egress";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
@@ -34,11 +35,26 @@ import {
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
+import { GranteePrivacyConfirmDialog } from "@/components/grantee-privacy-confirm-dialog";
 import { InlineRetry } from "@/components/inline-retry";
 import { WideContent } from "@/components/wide-content";
+import { useDeploymentAudience } from "@/hooks/use-deployment-audience";
+import { useDeploymentFlags } from "@/hooks/use-deployment-flags";
+import {
+  type GranteePrivacyConfirm,
+  granteePrivacyConfirmationFromError,
+} from "@/lib/grantee-privacy-confirmation";
 import { orpc } from "@/utils/orpc";
 
 const showValue = (value: unknown) => (value === null || value === undefined ? "—" : String(value));
+
+function orpcDataReason(error: unknown): string | null {
+  if (!error || typeof error !== "object" || !("data" in error)) return null;
+  const data = (error as { data?: unknown }).data;
+  if (!data || typeof data !== "object" || !("reason" in data)) return null;
+  const reason = (data as { reason?: unknown }).reason;
+  return typeof reason === "string" ? reason : null;
+}
 
 export const providerAccountFormSchema = z.object({
   providerType: z
@@ -293,6 +309,12 @@ export function ProviderOperationsSection() {
   const showDate = (value: Date | string | null | undefined) =>
     value ? dateTime.format(new Date(value)) : "—";
   const queryClient = useQueryClient();
+  const { privateNetworksAllowed: allowPrivateNetworks } = useDeploymentFlags();
+  const { isAdmin: isDeploymentAdmin } = useDeploymentAudience();
+  const privateNetworkMessage = isDeploymentAdmin
+    ? t("dashboard:deploymentFeatures.privateNetworkAdmin")
+    : t("dashboard:deploymentFeatures.privateNetworkUser");
+  const privateNetworkHint = allowPrivateNetworks ? undefined : privateNetworkMessage;
   const accountFormRef = useRef<HTMLFormElement>(null);
   const credentialFormRef = useRef<HTMLFormElement>(null);
   const createModelFormRef = useRef<HTMLFormElement>(null);
@@ -393,6 +415,9 @@ export function ProviderOperationsSection() {
     tier: "PRIMARY" as "PRIMARY" | "PUBLIC_OVERFLOW",
     publicOrder: "0",
   });
+  const [privacyConfirm, setPrivacyConfirm] = useState<
+    (GranteePrivacyConfirm & { retry: () => void }) | null
+  >(null);
   const budgetDefaults = {
     concurrencyMode: "LIMITED" as "LIMITED" | "UNLIMITED",
     concurrency: "1",
@@ -425,7 +450,12 @@ export function ProviderOperationsSection() {
         invalidate();
         toast.success(t("dashboard:providers.feedback.accountCreated"));
       },
-      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+      onError: (error) =>
+        toast.error(
+          orpcDataReason(error) === PROVIDER_PRIVATE_NETWORK_REJECTED
+            ? privateNetworkMessage
+            : t("dashboard:providers.feedback.failed"),
+        ),
     }),
   );
   const saveCredential = useMutation(
@@ -572,14 +602,40 @@ export function ProviderOperationsSection() {
   );
   const updatePool = useMutation(
     orpc.forwarderManagement.updateModelPool.mutationOptions({
-      onSuccess: () => invalidate(),
-      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+      onSuccess: () => {
+        setPrivacyConfirm(null);
+        invalidate();
+      },
+      onError: (error, variables) => {
+        const confirmation = granteePrivacyConfirmationFromError(error);
+        if (confirmation) {
+          setPrivacyConfirm({
+            ...confirmation,
+            retry: () => updatePool.mutate({ ...variables, confirmGranteePrivacyChange: true }),
+          });
+          return;
+        }
+        toast.error(t("dashboard:providers.feedback.failed"));
+      },
     }),
   );
   const addPoolMember = useMutation(
     orpc.forwarderManagement.addProviderPoolMember.mutationOptions({
-      onSuccess: () => invalidate(),
-      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+      onSuccess: () => {
+        setPrivacyConfirm(null);
+        invalidate();
+      },
+      onError: (error, variables) => {
+        const confirmation = granteePrivacyConfirmationFromError(error);
+        if (confirmation) {
+          setPrivacyConfirm({
+            ...confirmation,
+            retry: () => addPoolMember.mutate({ ...variables, confirmGranteePrivacyChange: true }),
+          });
+          return;
+        }
+        toast.error(t("dashboard:providers.feedback.failed"));
+      },
     }),
   );
   const reorderPoolMember = useMutation(
@@ -728,6 +784,7 @@ export function ProviderOperationsSection() {
                 errors={field.state.meta.errors}
                 label={t(`dashboard:providers.fields.${name === "providerType" ? "type" : name}`)}
                 className={name === "baseUrl" ? "md:col-span-2" : undefined}
+                hint={name === "baseUrl" ? privateNetworkHint : undefined}
               >
                 <Input
                   type={name === "baseUrl" ? "url" : "text"}
@@ -852,6 +909,8 @@ export function ProviderOperationsSection() {
                 key={`account-${selected.id}-${selected.updatedAt.toString()}`}
                 account={selected}
                 authTypeLocked={Boolean(credentials.data?.length)}
+                privateNetworkHint={privateNetworkHint}
+                privateNetworkMessage={privateNetworkMessage}
               />
 
               <div className="grid gap-6 lg:grid-cols-2">
@@ -1941,6 +2000,14 @@ export function ProviderOperationsSection() {
           ) : null}
         </div>
       )}
+      <GranteePrivacyConfirmDialog
+        confirmation={privacyConfirm}
+        pending={updatePool.isPending || addPoolMember.isPending}
+        onOpenChange={(open) => {
+          if (!open) setPrivacyConfirm(null);
+        }}
+        onConfirm={() => privacyConfirm?.retry()}
+      />
     </section>
   );
 }
@@ -1948,6 +2015,8 @@ export function ProviderOperationsSection() {
 function UpdateAccountForm({
   account,
   authTypeLocked,
+  privateNetworkHint,
+  privateNetworkMessage,
 }: {
   account: {
     id: string;
@@ -1957,6 +2026,8 @@ function UpdateAccountForm({
     authType: "API_KEY" | "BEARER";
   };
   authTypeLocked: boolean;
+  privateNetworkHint: string | undefined;
+  privateNetworkMessage: string;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
   const formRef = useRef<HTMLFormElement>(null);
@@ -1964,7 +2035,12 @@ function UpdateAccountForm({
   const updateAccount = useMutation(
     orpc.providerManagement.updateAccount.mutationOptions({
       onSuccess: () => queryClient.invalidateQueries({ queryKey: orpc.providerManagement.key() }),
-      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
+      onError: (error) =>
+        toast.error(
+          orpcDataReason(error) === PROVIDER_PRIVATE_NETWORK_REJECTED
+            ? privateNetworkMessage
+            : t("dashboard:providers.feedback.failed"),
+        ),
     }),
   );
   const form = useForm({
@@ -1992,6 +2068,7 @@ function UpdateAccountForm({
               errors={field.state.meta.errors}
               label={t(`dashboard:providers.fields.${name === "providerType" ? "type" : name}`)}
               className={name === "baseUrl" ? "xl:col-span-2" : undefined}
+              hint={name === "baseUrl" ? privateNetworkHint : undefined}
             >
               <Input
                 type={name === "baseUrl" ? "url" : "text"}
@@ -2167,17 +2244,20 @@ function Field({
   className = "",
   errors = [],
   id,
+  hint,
 }: {
   label: string;
   children: ReactNode;
   className?: string;
   errors?: unknown[];
   id?: string;
+  hint?: string;
 }) {
   const { t } = useTranslation("dashboard");
   const generatedId = useId();
   const fieldId = id ?? generatedId;
   const errorId = `${fieldId}-error`;
+  const hintId = `${fieldId}-hint`;
   const firstError = errors[0];
   const errorCode =
     typeof firstError === "string"
@@ -2186,6 +2266,10 @@ function Field({
         ? String(firstError.message)
         : "invalid";
   const hasError = errors.length > 0;
+  const describedBy =
+    [hasError ? errorId : null, hint ? hintId : null]
+      .filter((value): value is string => Boolean(value))
+      .join(" ") || undefined;
   const child = isValidElement(children)
     ? cloneElement(
         children as ReactElement<{
@@ -2196,7 +2280,7 @@ function Field({
         {
           id: (children.props as { id?: string }).id ?? fieldId,
           "aria-invalid": hasError,
-          "aria-describedby": hasError ? errorId : undefined,
+          "aria-describedby": describedBy,
         },
       )
     : children;
@@ -2210,6 +2294,11 @@ function Field({
           {t(`providers.validation.${errorCode}`, {
             defaultValue: t("providers.validation.invalid"),
           })}
+        </p>
+      ) : null}
+      {hint ? (
+        <p id={hintId} className="text-xs text-muted-foreground">
+          {hint}
         </p>
       ) : null}
     </div>

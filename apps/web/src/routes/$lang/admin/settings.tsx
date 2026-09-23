@@ -25,6 +25,7 @@ import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
+import { DeploymentFeaturesPanel } from "@/components/deployment-features-panel";
 import { InlineRetry } from "@/components/inline-retry";
 import { orpc } from "@/utils/orpc";
 
@@ -85,6 +86,7 @@ function AdminSettings() {
   const queryClient = useQueryClient();
   const appSettings = useQuery(orpc.settings.getAll.queryOptions());
   const appConfig = useQuery(orpc.appConfig.queryOptions());
+  const deploymentFeatures = useQuery(orpc.deploymentFeatures.queryOptions());
   const mediaStats = useQuery({
     queryKey: MEDIA_STATS_QUERY_KEY,
     queryFn: ({ signal }) => fetchMediaAdminStats(signal),
@@ -97,6 +99,7 @@ function AdminSettings() {
       onSuccess: () => {
         queryClient.invalidateQueries({ queryKey: orpc.settings.key() });
         queryClient.invalidateQueries({ queryKey: orpc.appConfig.queryKey() });
+        queryClient.invalidateQueries({ queryKey: orpc.deploymentFeatures.queryKey() });
       },
     }),
     meta: { errorFallbackKey: "admin:settings.updateFailed" },
@@ -109,9 +112,9 @@ function AdminSettings() {
         <p className="mt-2 text-muted-foreground">{t("admin:settings.description")}</p>
       </div>
 
-      {appSettings.isPending || appConfig.isPending ? (
+      {appSettings.isPending || appConfig.isPending || deploymentFeatures.isPending ? (
         <SettingsSkeleton />
-      ) : appSettings.isError || appConfig.isError ? (
+      ) : appSettings.isError || appConfig.isError || deploymentFeatures.isError ? (
         <Card>
           <CardContent>
             <InlineRetry
@@ -120,6 +123,7 @@ function AdminSettings() {
               onRetry={() => {
                 appSettings.refetch();
                 appConfig.refetch();
+                deploymentFeatures.refetch();
               }}
             />
           </CardContent>
@@ -164,6 +168,10 @@ function AdminSettings() {
           }}
         />
       )}
+
+      {deploymentFeatures.data ? (
+        <DeploymentFeaturesPanel features={deploymentFeatures.data} />
+      ) : null}
 
       {mediaStats.isPending ? (
         <MediaPolicySkeleton />

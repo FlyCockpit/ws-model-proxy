@@ -284,9 +284,10 @@ export const auth = betterAuth({
       // the Prisma model mapping explicitly.
       schema: { deviceCode: { modelName: "deviceCode" } },
     }),
-    // Dormant MCP/OAuth surface (Phase 0b): empty while WMP_MCP_ENABLED is
-    // false (the default), so the plugin list above is exactly what ships
-    // today. When enabled, adds jwt/mcp/cimd from Better Auth 1.7.3.
+    // MCP/OAuth surface. Installed while WMP_MCP_ENABLED is true (the default):
+    // jwt/mcp/cimd from Better Auth 1.7.3. The kill switch leaves this spread
+    // empty, so the plugin list above is exactly admin, twoFactor, and
+    // deviceAuthorization.
     ...resolveMcpPlugins({
       enabled: env.WMP_MCP_ENABLED,
       baseUrl: env.BETTER_AUTH_URL,

@@ -402,6 +402,56 @@ fn endpoints_add_list_remove_json() {
 }
 
 #[test]
+fn endpoints_concurrency_and_engine_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args([
+            "endpoints",
+            "add",
+            "--slug",
+            "local",
+            "--label",
+            "Local",
+            "--base-url",
+            "http://127.0.0.1:8080/v1",
+            "--concurrency-limit",
+            "4",
+            "--engine",
+            "llama.cpp",
+        ])
+        .assert()
+        .success();
+    let mut list = cli(&config, &state);
+    list.args(["endpoints", "--json", "list"]);
+    let value = json_stdout(list);
+    assert_eq!(value["endpoints"][0]["concurrencyLimit"], 4);
+    assert_eq!(value["endpoints"][0]["engine"], "llama.cpp");
+
+    cli(&config, &state)
+        .args(["endpoints", "concurrency", "local", "--clear"])
+        .assert()
+        .success();
+    cli(&config, &state)
+        .args(["endpoints", "engine", "local", "vllm"])
+        .assert()
+        .success();
+    let mut list = cli(&config, &state);
+    list.args(["endpoints", "--json", "list"]);
+    let value = json_stdout(list);
+    assert!(value["endpoints"][0].get("concurrencyLimit").is_none());
+    assert_eq!(value["endpoints"][0]["engine"], "vllm");
+
+    cli(&config, &state)
+        .args(["endpoints", "concurrency", "missing", "2"])
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::contains("endpoint `missing` not found"));
+}
+
+#[test]
 fn endpoints_remove_unknown_slug_exits_3_not_found() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
@@ -574,14 +624,98 @@ fn endpoints_probe_failure_reports_without_panic() {
 
 #[test]
 fn protocol_helpers_reject_oversized_binary_chunk() {
-    let metadata = wsmp::protocol::RelayBinaryFrameMetadata {
-        r#type: wsmp::protocol::RelayBinaryFrameType::ResponseBody,
+    let metadata = wsmp::protocol::RelayBinaryFrameMetadata::ResponseBody {
         request_id: "request-1".to_string(),
         chunk_id: "0".to_string(),
         final_chunk: Some(true),
     };
     let body = vec![0_u8; wsmp::protocol::RELAY_BINARY_CHUNK_MAX_BYTES + 1];
     assert!(wsmp::protocol::encode_binary_frame(&metadata, &body).is_err());
+}
+
+#[test]
+fn config_terminal_flags_persist_and_ask_for_a_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args(["config", "set-human-terminal", "on"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Restart wsmp to apply."));
+    cli(&config, &state)
+        .args(["config", "--json", "set-mcp-commands", "on"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("allowMcpCommands"));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["allowHumanTerminal"], true);
+    assert_eq!(cfg["allowMcpCommands"], true);
+    assert!(cfg.get("requireTerminalApproval").is_none());
+
+    cli(&config, &state)
+        .args(["config", "set-terminal-approval", "off"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Restart wsmp to apply."));
+}
+
+#[test]
+fn approve_and_daemon_status_use_the_state_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    let decoy = tmp.path().join("decoy");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir_all(&decoy).unwrap();
+    fs::write(
+        state.join("terminal-approval-pending.json"),
+        "{\n  \"entries\": {\n    \"QSOWJSS6\": \"AQ\"\n  }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        decoy.join("terminal-approval-pending.json"),
+        "{\n  \"entries\": {\n    \"QSOWJSS6\": \"AQ\"\n  }\n}\n",
+    )
+    .unwrap();
+    let pid = "version=1\npid=2147483646\ntoken=state-dir-token\n";
+    fs::write(state.join("relay.pid"), pid).unwrap();
+    fs::write(decoy.join("relay.pid"), pid).unwrap();
+
+    cli(&config, &state)
+        .args(["terminal", "--json", "approve", "QSOWJSS6"])
+        .assert()
+        .success();
+    assert!(state.join("terminal-approvals.json").is_file());
+    assert!(!decoy.join("terminal-approvals.json").exists());
+
+    cli(&config, &state)
+        .args(["daemon", "status"])
+        .assert()
+        .failure();
+    assert!(
+        !state.join("relay.pid").exists(),
+        "daemon status did not read the PID file in WSMP_STATE_DIR"
+    );
+    assert!(
+        decoy.join("relay.pid").is_file(),
+        "daemon status touched a state dir other than WSMP_STATE_DIR"
+    );
+}
+
+#[test]
+fn terminal_approve_unknown_code_exits_3_not_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args(["terminal", "approve", "QSOWJSS6"])
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "terminal approval `QSOWJSS6` not found",
+        ));
 }
 
 #[test]
@@ -696,4 +830,522 @@ fn completions_generates_shell_script() {
         .assert()
         .success()
         .stdout(predicate::str::contains("_wsmp"));
+}
+
+#[test]
+fn terminal_fingerprint_creates_the_identity_once_in_the_state_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    let first = cli(&config, &state)
+        .args(["terminal", "fingerprint"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let fingerprint = String::from_utf8(first).unwrap().trim().to_string();
+    let groups: Vec<&str> = fingerprint.split(' ').collect();
+    assert_eq!(groups.len(), 8, "{fingerprint}");
+    assert!(groups.iter().all(|group| {
+        group.len() == 4
+            && group
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || (b'2'..=b'7').contains(&byte))
+    }));
+    let identity = state.join("terminal-identity.json");
+    assert!(identity.is_file());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&identity).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    let json = cli(&config, &state)
+        .args(["terminal", "--json", "fingerprint"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&json).unwrap();
+    assert_eq!(value["fingerprint"], fingerprint);
+    assert_eq!(value["publicKey"].as_str().unwrap().len(), 87);
+}
+
+/// A real `wsmp` relay against a minimal in-test websocket relay: a shutdown
+/// signal must kill running exec commands, tell the server, and remove the
+/// runtime files before the process dies from that signal.
+#[cfg(unix)]
+mod signal_shutdown {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::path::PathBuf;
+    use std::process::{Child, Stdio};
+    use std::time::{Duration, Instant};
+
+    const TOKEN_ENV: &str = "WSMP_SIGNAL_TEST_TOKEN";
+
+    /// SHA-1, only for the websocket handshake's `Sec-WebSocket-Accept`.
+    fn sha1(data: &[u8]) -> [u8; 20] {
+        let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+        let mut message = data.to_vec();
+        let bit_len = (data.len() as u64).wrapping_mul(8);
+        message.push(0x80);
+        while message.len() % 64 != 56 {
+            message.push(0);
+        }
+        message.extend_from_slice(&bit_len.to_be_bytes());
+        for chunk in message.chunks(64) {
+            let mut w = [0_u32; 80];
+            for (i, word) in chunk.chunks(4).enumerate() {
+                w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+            }
+            for i in 16..80 {
+                w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+            }
+            let [mut a, mut b, mut c, mut d, mut e] = h;
+            for (i, word) in w.iter().enumerate() {
+                let (f, k) = match i {
+                    0..=19 => ((b & c) | (!b & d), 0x5A827999),
+                    20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                    40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                    _ => (b ^ c ^ d, 0xCA62C1D6),
+                };
+                let temp = a
+                    .rotate_left(5)
+                    .wrapping_add(f)
+                    .wrapping_add(e)
+                    .wrapping_add(k)
+                    .wrapping_add(*word);
+                e = d;
+                d = c;
+                c = b.rotate_left(30);
+                b = a;
+                a = temp;
+            }
+            for (slot, value) in h.iter_mut().zip([a, b, c, d, e]) {
+                *slot = slot.wrapping_add(value);
+            }
+        }
+        let mut out = [0_u8; 20];
+        for (i, word) in h.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+
+    fn base64(bytes: &[u8]) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = (u32::from(chunk[0]) << 16)
+                | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*chunk.get(2).unwrap_or(&0));
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(TABLE[(n >> (18 - 6 * i)) as usize & 63] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn handshake_digest_matches_rfc_6455_example() {
+        let accept = base64(&sha1(
+            b"dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11",
+        ));
+        assert_eq!(accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    }
+
+    /// A client frame: opcode and unmasked payload. `None` on EOF.
+    fn read_frame(stream: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
+        let mut header = [0_u8; 2];
+        stream.read_exact(&mut header).ok()?;
+        let opcode = header[0] & 0x0f;
+        let masked = header[1] & 0x80 != 0;
+        let len = match header[1] & 0x7f {
+            126 => {
+                let mut bytes = [0_u8; 2];
+                stream.read_exact(&mut bytes).ok()?;
+                u64::from(u16::from_be_bytes(bytes))
+            }
+            127 => {
+                let mut bytes = [0_u8; 8];
+                stream.read_exact(&mut bytes).ok()?;
+                u64::from_be_bytes(bytes)
+            }
+            short => u64::from(short),
+        };
+        let mut mask = [0_u8; 4];
+        if masked {
+            stream.read_exact(&mut mask).ok()?;
+        }
+        let mut payload = vec![0_u8; usize::try_from(len).ok()?];
+        stream.read_exact(&mut payload).ok()?;
+        if masked {
+            for (i, byte) in payload.iter_mut().enumerate() {
+                *byte ^= mask[i % 4];
+            }
+        }
+        Some((opcode, payload))
+    }
+
+    fn write_text(stream: &mut TcpStream, text: &str) {
+        let payload = text.as_bytes();
+        let mut frame = vec![0x81_u8];
+        if payload.len() < 126 {
+            frame.push(payload.len() as u8);
+        } else {
+            frame.push(126);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        }
+        frame.extend_from_slice(payload);
+        stream.write_all(&frame).expect("write server frame");
+    }
+
+    enum Seen {
+        Text(Value),
+        Close(u16),
+    }
+
+    struct FakeRelay {
+        server_url: String,
+        socket: mpsc::Receiver<TcpStream>,
+        frames: mpsc::Receiver<Seen>,
+    }
+
+    impl FakeRelay {
+        /// Accept one relay websocket and forward the client's frames.
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake relay");
+            let addr = listener.local_addr().expect("relay addr");
+            let (socket_tx, socket) = mpsc::channel();
+            let (frame_tx, frames) = mpsc::channel();
+            thread::spawn(move || {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let request = read_request(&mut stream);
+                let key = request
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("sec-websocket-key")
+                            .then(|| value.trim().to_string())
+                    })
+                    .expect("websocket key");
+                let accept = base64(&sha1(
+                    format!("{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11").as_bytes(),
+                ));
+                let response = format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: ws-model-proxy.relay.v2\r\n\r\n"
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write handshake");
+                let _ = socket_tx.send(stream.try_clone().expect("clone relay socket"));
+                while let Some((opcode, payload)) = read_frame(&mut stream) {
+                    let seen = match opcode {
+                        1 => match serde_json::from_slice(&payload) {
+                            Ok(value) => Seen::Text(value),
+                            Err(_) => continue,
+                        },
+                        8 => Seen::Close(if payload.len() >= 2 {
+                            u16::from_be_bytes([payload[0], payload[1]])
+                        } else {
+                            0
+                        }),
+                        _ => continue,
+                    };
+                    let close = matches!(seen, Seen::Close(_));
+                    if frame_tx.send(seen).is_err() || close {
+                        return;
+                    }
+                }
+            });
+            Self {
+                server_url: format!("http://{addr}"),
+                socket,
+                frames,
+            }
+        }
+
+        fn next_text(&self, type_name: &str) -> Value {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match self.frames.recv_timeout(remaining) {
+                    Ok(Seen::Text(value)) if value["type"] == type_name => return value,
+                    Ok(_) => {}
+                    Err(error) => panic!("no `{type_name}` frame from the relay: {error}"),
+                }
+            }
+        }
+
+        /// Every frame until the client closes or the timeout passes.
+        fn rest(&self, timeout: Duration) -> Vec<Seen> {
+            let deadline = Instant::now() + timeout;
+            let mut seen = Vec::new();
+            while let Ok(frame) = self
+                .frames
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                let close = matches!(frame, Seen::Close(_));
+                seen.push(frame);
+                if close {
+                    break;
+                }
+            }
+            seen
+        }
+    }
+
+    fn wait_for_file(path: &Path) -> String {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(text) = fs::read_to_string(path)
+                && text.ends_with('\n')
+            {
+                return text.trim().to_string();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "`{}` never appeared",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Alive and not a zombie.
+    fn process_alive(pid: &str) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .expect("run ps");
+        let stat = String::from_utf8_lossy(&output.stdout);
+        let stat = stat.trim();
+        !stat.is_empty() && !stat.starts_with('Z')
+    }
+
+    fn wait_until_gone(pid: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while process_alive(pid) {
+            assert!(Instant::now() < deadline, "process {pid} survived shutdown");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn signal(pid: u32, name: &str) {
+        let status = std::process::Command::new("kill")
+            .args([&format!("-{name}"), &pid.to_string()])
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill -{name} {pid}");
+    }
+
+    fn wait_for_exit(child: &mut Child) -> std::process::ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(status) = child.try_wait().expect("wait for relay") {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!("relay did not exit after the shutdown signal");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Linux only: whether this test process inherited `signal` as ignored,
+    /// in which case the relay honours that and the test cannot run.
+    fn inherited_ignored(signal: u32) -> bool {
+        fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                let mask = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("SigIgn:"))?;
+                u64::from_str_radix(mask.trim(), 16).ok()
+            })
+            .is_some_and(|mask| mask & (1 << (signal - 1)) != 0)
+    }
+
+    struct Setup {
+        _tmp: tempfile::TempDir,
+        dir: PathBuf,
+        state: PathBuf,
+        relay: FakeRelay,
+        child: Child,
+    }
+
+    fn start_relay(args: &[&str]) -> Setup {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().canonicalize().expect("canonical tempdir");
+        let config = dir.join("config.json");
+        let state = dir.join("state");
+        let relay = FakeRelay::start();
+        write_config(
+            &config,
+            json!({
+                "version": 1,
+                "serverUrl": relay.server_url,
+                "cliSlug": "cli-signal-test",
+                "cliTokenEnv": TOKEN_ENV,
+                "allowMcpCommands": true,
+                "endpoints": []
+            }),
+        );
+        let child = std::process::Command::new(env!("CARGO_BIN_EXE_wsmp"))
+            .args(args)
+            .env("WSMP_CONFIG", &config)
+            .env("WSMP_STATE_DIR", &state)
+            .env("HOME", &dir)
+            .env(TOKEN_ENV, "signal-test-token")
+            .env_remove("WSMP_LOG")
+            .env_remove("RUST_LOG")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start relay");
+        Setup {
+            _tmp: tmp,
+            dir,
+            state,
+            relay,
+            child,
+        }
+    }
+
+    /// Start an exec whose shell and backgrounded grandchild record their pids.
+    fn start_exec(setup: &Setup) -> (String, String) {
+        setup.relay.next_text("hello");
+        let mut socket = setup
+            .relay
+            .socket
+            .recv_timeout(Duration::from_secs(5))
+            .expect("relay socket");
+        let shell_pid = setup.dir.join("shell.pid");
+        let grand_pid = setup.dir.join("grand.pid");
+        // On Linux, a child of the shell also records its own blocked mask.
+        let command = format!(
+            "if [ -r /proc/self/status ]; then grep SigBlk: /proc/self/status > '{}'; fi; echo $$ > '{}'; sleep 300 & echo $! > '{}'; wait",
+            setup.dir.join("mask").display(),
+            shell_pid.display(),
+            grand_pid.display()
+        );
+        write_text(
+            &mut socket,
+            &json!({ "type": "exec.start", "commandId": "sig-1", "command": command }).to_string(),
+        );
+        setup.relay.next_text("exec.started");
+        (wait_for_file(&shell_pid), wait_for_file(&grand_pid))
+    }
+
+    fn assert_clean_shutdown(setup: &mut Setup, shell: &str, grand: &str, signal_number: i32) {
+        let status = wait_for_exit(&mut setup.child);
+        assert!(
+            status.signal() == Some(signal_number) || status.code() == Some(128 + signal_number),
+            "unexpected relay status {status:?}"
+        );
+        wait_until_gone(shell);
+        wait_until_gone(grand);
+        let rest = setup.relay.rest(Duration::from_secs(5));
+        let done = rest.iter().find_map(|frame| match frame {
+            Seen::Text(value) if value["type"] == "exec.done" => Some(value),
+            _ => None,
+        });
+        assert_eq!(
+            done.map(|value| value["commandId"].clone()),
+            Some(json!("sig-1")),
+            "the server hears that the command ended"
+        );
+        assert!(
+            rest.iter()
+                .any(|frame| matches!(frame, Seen::Close(code) if *code == 1001)),
+            "the relay closes the websocket as going away"
+        );
+        assert!(
+            !setup.state.join("relay-control.sock").exists(),
+            "control socket removed"
+        );
+    }
+
+    #[test]
+    fn sigterm_kills_running_exec_commands_and_cleans_up() {
+        let mut setup = start_relay(&["connect"]);
+        let (shell, grand) = start_exec(&setup);
+        assert!(process_alive(&shell) && process_alive(&grand));
+        // The relay blocks shutdown signals; its children must not inherit that.
+        if let Ok(line) = fs::read_to_string(setup.dir.join("mask")) {
+            let blocked = line
+                .strip_prefix("SigBlk:")
+                .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+                .expect("SigBlk");
+            // SIGHUP, SIGINT, SIGTERM.
+            assert_eq!(blocked & 0x4003, 0, "exec children start unblocked");
+        }
+        signal(setup.child.id(), "TERM");
+        assert_clean_shutdown(&mut setup, &shell, &grand, 15);
+    }
+
+    #[test]
+    fn sigint_stops_a_detached_style_relay_and_removes_its_pid_file() {
+        if inherited_ignored(2) {
+            return;
+        }
+        let mut setup = start_relay(&[
+            "daemon",
+            "start",
+            "--foreground",
+            "--detach-token",
+            "signal-test-token",
+        ]);
+        let (shell, grand) = start_exec(&setup);
+        let pid_file = setup.state.join("relay.pid");
+        assert!(pid_file.is_file(), "detached relay claims the PID file");
+        signal(setup.child.id(), "INT");
+        assert_clean_shutdown(&mut setup, &shell, &grand, 2);
+        assert!(!pid_file.exists(), "PID file removed");
+    }
+
+    /// Two signals back to back may take the immediate-exit path instead of
+    /// the normal unwind. Either way the children and runtime files are gone.
+    #[test]
+    fn a_second_signal_still_kills_children_and_removes_runtime_files() {
+        let mut setup = start_relay(&[
+            "daemon",
+            "start",
+            "--foreground",
+            "--detach-token",
+            "signal-test-token-2",
+        ]);
+        let (shell, grand) = start_exec(&setup);
+        let pid_file = setup.state.join("relay.pid");
+        assert!(pid_file.is_file(), "detached relay claims the PID file");
+        signal(setup.child.id(), "TERM");
+        signal(setup.child.id(), "TERM");
+        let status = wait_for_exit(&mut setup.child);
+        assert!(
+            status.signal() == Some(15) || status.code() == Some(143),
+            "unexpected relay status {status:?}"
+        );
+        wait_until_gone(&shell);
+        wait_until_gone(&grand);
+        assert!(!pid_file.exists(), "PID file removed");
+        assert!(
+            !setup.state.join("relay-control.sock").exists(),
+            "control socket removed"
+        );
+    }
 }

@@ -85,7 +85,12 @@ describe("strict canonical stream parsing", () => {
 
   it.each([
     ["unknown SSE field", bytes('wat: x\ndata: {"choices":[]}\n\n')],
-    ["unknown Chat field", bytes('data: {"id":"x","choices":[],"secret":1}\n\n')],
+    [
+      "unknown Chat delta field",
+      bytes(
+        'data: {"id":"x","object":"chat.completion.chunk","created":0,"model":"m","choices":[{"index":0,"delta":{"secret":1},"finish_reason":null}]}\n\n',
+      ),
+    ],
     ["unknown Responses event", event("response.magic", {})],
     ["mismatched event names", bytes('event: message_stop\ndata: {"type":"ping"}\n\n')],
   ])("rejects %s", (_name, input) => {

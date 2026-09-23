@@ -50,6 +50,7 @@ import { chatMediaConfigQueryKey, useChatMediaConfig } from "@/hooks/use-chat-me
 import { useChatRelaySettings } from "@/hooks/use-chat-relay-settings";
 import { useChatScrollEngine } from "@/hooks/use-chat-scroll-engine";
 import { useChatThread } from "@/hooks/use-chat-thread";
+
 import { useIsDesktop } from "@/hooks/use-media-query";
 import { useRevokeAttachmentsOnUnmount } from "@/hooks/use-revoke-attachments-on-unmount";
 import {
@@ -66,6 +67,7 @@ import {
   streamChatCompletion,
   withSystemPrompt as withRelaySystemPrompt,
 } from "@/lib/chat-test-relay";
+
 import {
   acceptedAttachmentAcceptAttr,
   attachmentFileInfo,
@@ -113,6 +115,7 @@ function modelOptions(visibleModels: VisibleModels | undefined): ModelOption[] {
       maxAttachmentBytes: pool.maxAttachmentBytes,
       reasoning: pool.reasoning,
       compatibility: pool.compatibility,
+      effectiveProviderEgress: pool.effectiveProviderEgress,
     })),
   ];
 }
@@ -202,15 +205,17 @@ export function ChatTestPage({ lang }: { lang: string }) {
   const selectedModel = options.find((option) => option.modelId === effectiveModelId);
   const recommendedSurface = selectedModel?.compatibility?.recommendedSurface;
   const isPool = selectedModel?.kind === "MODEL_POOL";
+  const preferredSurface: ChatTestSurface | null =
+    recommendedSurface === "OPENAI_CHAT_COMPLETIONS" ||
+    recommendedSurface === "OPENAI_RESPONSES" ||
+    recommendedSurface === "ANTHROPIC_MESSAGES"
+      ? recommendedSurface
+      : null;
   const effectiveSurface: ChatTestSurface | null =
     selectedModel?.kind === "DIRECT_MODEL"
       ? "OPENAI_CHAT_COMPLETIONS"
       : surfaceSelection === "PREFERRED"
-        ? recommendedSurface === "OPENAI_CHAT_COMPLETIONS" ||
-          recommendedSurface === "OPENAI_RESPONSES" ||
-          recommendedSurface === "ANTHROPIC_MESSAGES"
-          ? recommendedSurface
-          : null
+        ? preferredSurface
         : surfaceSelection;
   const surfaceReasoning = effectiveSurface
     ? selectedModel?.reasoning[effectiveSurface]

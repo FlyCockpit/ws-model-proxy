@@ -18,7 +18,6 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     BETTER_AUTH_SECRET: "test-better-auth-secret",
     BETTER_AUTH_URL: "https://proxy.example.com",
     WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
-    MODEL_API_GLOBAL_CAPACITY_ENABLED: true,
     NODE_ENV: "test",
   },
 }));
@@ -35,6 +34,12 @@ vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
   return { default: mockDeep() };
 });
+
+vi.mock("../relay/cli-commands.js", () => ({
+  startCliCommand: vi.fn(),
+  waitCliCommand: vi.fn(),
+  snapshotCliCommand: vi.fn(),
+}));
 
 const DOC_URL = new URL("../../../../docs/mcp-tool-coverage.md", import.meta.url);
 

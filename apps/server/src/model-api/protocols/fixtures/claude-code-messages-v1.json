@@ -1,0 +1,66 @@
+{
+  "model": "placeholder-model",
+  "max_tokens": 64,
+  "stream": false,
+  "metadata": { "user_id": "placeholder-metadata" },
+  "top_k": 40,
+  "thinking": { "type": "disabled" },
+  "system": [
+    {
+      "type": "text",
+      "text": "placeholder-system",
+      "cache_control": { "type": "ephemeral" }
+    }
+  ],
+  "tools": [
+    {
+      "name": "placeholder_tool",
+      "description": "placeholder-tool",
+      "cache_control": { "type": "ephemeral" },
+      "input_schema": { "type": "object", "properties": {} }
+    }
+  ],
+  "tool_choice": { "type": "auto", "disable_parallel_tool_use": true },
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "placeholder-user",
+          "cache_control": { "type": "ephemeral" }
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_placeholder",
+          "name": "placeholder_tool",
+          "input": {},
+          "cache_control": { "type": "ephemeral" }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_placeholder",
+          "cache_control": { "type": "ephemeral" },
+          "content": [
+            {
+              "type": "text",
+              "text": "placeholder-result-a",
+              "cache_control": { "type": "ephemeral" }
+            },
+            { "type": "text", "text": "placeholder-result-b" }
+          ]
+        }
+      ]
+    }
+  ]
+}

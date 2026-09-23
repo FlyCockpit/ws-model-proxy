@@ -17,4 +17,5 @@ pub mod login;
 pub mod logout;
 pub mod reload;
 pub mod service;
+pub mod terminal;
 pub mod token;

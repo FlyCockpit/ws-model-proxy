@@ -801,14 +801,17 @@ ON CONFLICT ("discoveredModelId") DO NOTHING;
 -- physical engine, so the backfill intentionally creates one capacity per
 -- target. Owners can explicitly consolidate them later.
 INSERT INTO inference_capacity (
-  id, "createdAt", "updatedAt", "userId", label, "runtimeIdentityKey", "runtimeModel"
+  id, "createdAt", "updatedAt", "userId", label, "runtimeIdentityKey", "runtimeModel",
+  "hardConcurrencyLimitSource"
 )
 SELECT
   'cap_' || md5(target.id), target."createdAt", NOW(), target."userId",
   COALESCE(model."upstreamModelId", provider_model."upstreamModelId", target.id)
     || ' (' || target.id || ')',
   'execution-target:' || target.id,
-  COALESCE(model."upstreamModelId", provider_model."upstreamModelId", target.id)
+  COALESCE(model."upstreamModelId", provider_model."upstreamModelId", target.id),
+  -- Auto-created with a null limit: the application fills it (AUTO only).
+  'AUTO'::"CapacityLimitSource"
 FROM execution_target target
 LEFT JOIN discovered_model model ON model.id = target."discoveredModelId"
 LEFT JOIN provider_model ON provider_model.id = target."providerModelId"
@@ -841,11 +844,12 @@ BEGIN
   model_name := COALESCE(model_name, NEW.id);
   capacity_id := 'cap_' || md5(NEW.id);
   INSERT INTO inference_capacity (
-    id, "createdAt", "updatedAt", "userId", label, "runtimeIdentityKey", "runtimeModel"
+    id, "createdAt", "updatedAt", "userId", label, "runtimeIdentityKey", "runtimeModel",
+    "hardConcurrencyLimitSource"
   ) VALUES (
     capacity_id, NEW."createdAt", NOW(), NEW."userId",
     model_name || ' (' || NEW.id || ')',
-    'execution-target:' || NEW.id, model_name
+    'execution-target:' || NEW.id, model_name, 'AUTO'::"CapacityLimitSource"
   ) ON CONFLICT ("userId", "runtimeIdentityKey") DO UPDATE
     SET "updatedAt" = EXCLUDED."updatedAt"
   RETURNING id INTO capacity_id;
@@ -858,6 +862,75 @@ DROP TRIGGER IF EXISTS execution_target_capacity_backfill ON execution_target;
 CREATE TRIGGER execution_target_capacity_backfill
 BEFORE INSERT ON execution_target
 FOR EACH ROW EXECUTE FUNCTION create_execution_target_capacity();
+
+-- "hardConcurrencyLimitSource" was added with default AUTO, so limits users
+-- saved before it existed (including null = unlimited) look auto-generated and
+-- the discovered-capacity fill would overwrite them. Recover the user intent
+-- from the audit trail. Both statements only move AUTO to USER, never back, so
+-- rerunning them is safe.
+--
+-- capacityManagement.create audits resourceType INFERENCE_CAPACITY, action
+-- CREATE, after = the validated input (hardConcurrencyLimit is required).
+-- capacityManagement.update audits action UPDATE, after = the full updated row.
+-- The web capacity form always sends hardConcurrencyLimit, so any legacy
+-- UPDATE saved the limit. Current writers include "hardConcurrencyLimitSource"
+-- in the audited row and mark USER themselves, so only UPDATE rows without
+-- that key are treated as legacy user saves here. An UPDATE made through the
+-- API without the limit key before this column existed is also counted; the
+-- audit row cannot tell it apart.
+UPDATE inference_capacity capacity
+   SET "hardConcurrencyLimitSource" = 'USER'
+ WHERE capacity."hardConcurrencyLimitSource" = 'AUTO'
+   AND EXISTS (
+     SELECT 1
+       FROM capacity_audit_event edit
+      WHERE edit."resourceType" = 'INFERENCE_CAPACITY'
+        AND edit."resourceId" = capacity.id
+        AND edit."userId" = capacity."userId"
+        AND jsonb_typeof(edit.after) = 'object'
+        AND edit.after ? 'hardConcurrencyLimit'
+        AND (edit.action = 'CREATE'
+          OR (edit.action = 'UPDATE'
+            AND NOT (edit.after ? 'hardConcurrencyLimitSource')))
+   );
+
+-- providerManagement.updateModel copies the provider model limit into the
+-- capacity attached to that model's execution target and records
+-- MODEL_UPDATED with a "nextConcurrencyLimit" metadata key; the audit event
+-- names only the provider model. The capacity it wrote is the one the target
+-- was attached to at that moment. The discovered-capacity fill can only reach
+-- a provider target's capacity when capacityManagement.updateDirectPolicy
+-- attached it (EXECUTION_TARGET / UPDATE_POLICY with "inferenceCapacityId" in
+-- after); the trigger and provider-model attachments use keys the fill never
+-- matches. So a capacity counts when the target's latest audited attachment at
+-- or before the edit points at it. A detach audits a null id and never matches.
+UPDATE inference_capacity capacity
+   SET "hardConcurrencyLimitSource" = 'USER'
+ WHERE capacity."hardConcurrencyLimitSource" = 'AUTO'
+   AND EXISTS (
+     SELECT 1
+       FROM provider_audit_event edit
+       JOIN execution_target target
+         ON target."providerModelId" = edit."subjectId"
+        AND target."userId" = edit."userId"
+      WHERE edit.action = 'MODEL_UPDATED'
+        AND edit."userId" = capacity."userId"
+        AND jsonb_typeof(edit.metadata) = 'object'
+        AND edit.metadata ? 'nextConcurrencyLimit'
+        AND (
+          SELECT attachment.after ->> 'inferenceCapacityId'
+            FROM capacity_audit_event attachment
+           WHERE attachment."resourceType" = 'EXECUTION_TARGET'
+             AND attachment.action = 'UPDATE_POLICY'
+             AND attachment."resourceId" = target.id
+             AND attachment."userId" = edit."userId"
+             AND jsonb_typeof(attachment.after) = 'object'
+             AND attachment.after ? 'inferenceCapacityId'
+             AND attachment."createdAt" <= edit."createdAt"
+           ORDER BY attachment."createdAt" DESC, attachment.id DESC
+           LIMIT 1
+        ) = capacity.id
+   );
 
 -- Never guess how to merge independently configured duplicate rows. Updating
 -- the legacy representation would violate the new uniqueness constraint, so

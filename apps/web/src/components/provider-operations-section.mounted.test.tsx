@@ -10,6 +10,10 @@ const state = vi.hoisted(() => ({
   mutations: [] as Array<{ operation: string; input: unknown }>,
 }));
 
+vi.mock("@/hooks/use-deployment-audience", () => ({
+  useDeploymentAudience: () => ({ isAdmin: false }),
+}));
+
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
     t: (key: string) => key,

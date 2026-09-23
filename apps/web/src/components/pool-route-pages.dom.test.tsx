@@ -22,6 +22,10 @@ vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
 
+vi.mock("@/hooks/use-deployment-audience", () => ({
+  useDeploymentAudience: () => ({ isAdmin: false }),
+}));
+
 vi.mock("@tanstack/react-router", async (importOriginal) => {
   const original = await importOriginal<typeof import("@tanstack/react-router")>();
   return {
@@ -57,7 +61,7 @@ vi.mock("@/components/forwarder-dashboard-sections", () => ({
   GrantPoolDialog: ({ pool }: { pool: unknown }) => (pool ? <div>grant-pool-dialog</div> : null),
   PoolMemberForm: () => <div>pool-member-form</div>,
   PoolForm: () => <div>pool-form</div>,
-  resolveCapacityAvailability: (enabled: boolean) => (enabled ? "enabled" : "disabled"),
+  resolveCapacityAvailability: () => "enabled" as const,
 }));
 
 vi.mock("@/components/provider-operations-section", () => ({
@@ -83,10 +87,8 @@ vi.mock("@/utils/orpc", () => {
   });
   return {
     orpc: {
-      appConfig: query("appConfig", () => ({
-        capacityEnabled: state.capacityEnabled,
+      deploymentFlags: query("deploymentFlags", () => ({
         providerEgressEnabled: state.providerEgressEnabled,
-        protocolAdaptationAvailable: true,
       })),
       forwarderManagement: {
         listModelPools: query("pools", () => state.pools),
@@ -136,6 +138,44 @@ afterEach(() => {
 });
 
 describe("dedicated pool pages", () => {
+  it("shows private and external-provider badges on the pool list and detail", () => {
+    state.pools = [
+      {
+        id: "pool-private",
+        slug: "local",
+        name: "Local",
+        description: null,
+        canonicalModelId: "owner/pool/local",
+        effectiveProviderEgress: false,
+        members: [],
+        grants: [],
+        compatibility: { recommendedSurface: null },
+        transformer: { model: null },
+      },
+      {
+        id: "pool-external",
+        slug: "shared",
+        name: "Shared",
+        description: null,
+        canonicalModelId: "owner/pool/shared",
+        effectiveProviderEgress: true,
+        members: [],
+        grants: [],
+        compatibility: { recommendedSurface: null },
+        transformer: { model: null },
+      },
+    ];
+
+    mount(<PoolsListPage lang="en-US" />);
+
+    expect(screen.getByText("dashboard:pools.privacyBadge.private")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.privacyBadge.external")).toBeTruthy();
+
+    cleanup();
+    mount(<PoolDetailPage poolId="pool-external" />);
+    expect(screen.getByText("dashboard:pools.privacyBadge.external")).toBeTruthy();
+  });
+
   it("links the list edit action to the pool detail route instead of opening a sheet", () => {
     state.pools = [
       {
@@ -231,9 +271,8 @@ describe("dedicated pool pages", () => {
     expect(screen.getByText("dashboard:pools.fallbackSteps.acknowledge")).toBeTruthy();
   });
 
-  it("renders the disabled deployment copy in the fallback tab", () => {
-    state.capacityEnabled = false;
-    state.providerEgressEnabled = true;
+  it("renders the disabled deployment copy in the fallback tab when provider egress is off", () => {
+    state.providerEgressEnabled = false;
     state.tab = "fallback";
     state.pools = [
       {
@@ -304,13 +343,10 @@ describe("dedicated pool pages", () => {
     expect(policy.textContent).not.toContain("dashboard:pools.inherited");
   });
 
-  it("renders the disabled capacity reason instead of a skipped-query skeleton", async () => {
-    state.capacityEnabled = false;
+  it("loads capacity records instead of a deployment-disabled reason", async () => {
     mount(<InferenceCapacityPage />);
 
-    await waitFor(() =>
-      expect(screen.getByText("dashboard:pools.capacity.disabledReason")).toBeTruthy(),
-    );
-    expect(screen.queryByTestId("page-skeleton")).toBeNull();
+    await waitFor(() => expect(screen.getByText("dashboard:pools.capacity.empty")).toBeTruthy());
+    expect(screen.queryByText("dashboard:pools.capacity.disabledReason")).toBeNull();
   });
 });

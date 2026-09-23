@@ -45,6 +45,8 @@ import { createRouterClient, ORPCError } from "@orpc/server";
 import { type AppRouterClient, appRouter } from "@ws-model-proxy/api/routers/index";
 import { mcpScopesAllow } from "@ws-model-proxy/auth/mcp-config";
 import { runWithDbAbortFence } from "@ws-model-proxy/db/shutdown-fence";
+import { cliCommandsAllowed, isCliCommandTool } from "./cli-command-access";
+import { McpCliCommandRejectedError } from "./cli-command-tools";
 import { mcpSanitizedLog } from "./errors";
 import { redactSecrets } from "./redaction";
 import { toJsonSafe } from "./serialization";
@@ -135,6 +137,14 @@ function internalToolError(requestId: string): ToolResult {
   });
 }
 
+/**
+ * Same text the installed SDK uses when a name was never registered
+ * (`Tool ${name} not found`). Does not say the tool is hidden or disabled.
+ */
+function unknownToolError(name: string): ToolResult {
+  return toolError(`Tool ${name} not found`, { error: { code: "NOT_FOUND" } });
+}
+
 /** Strip the ceremonial `confirm` field so it never reaches a procedure. */
 function stripConfirmation(input: unknown): unknown {
   if (input === null || typeof input !== "object" || Array.isArray(input)) return input;
@@ -171,6 +181,13 @@ export function registerMcpTools(server: McpServer, ctx?: McpRequestContext): vo
     : undefined;
 
   for (const descriptor of MCP_TOOL_MANIFEST) {
+    // CLI command tools stay unregistered unless this request's credential
+    // is a personal token minted with allowCliCommands. OAuth, a PAT
+    // without the flag, and an unbound dispatch (treated as OAuth) do not
+    // see them. Call time checks the same predicate again.
+    if (isCliCommandTool(descriptor.name) && !cliCommandsAllowed(dispatch?.credential)) {
+      continue;
+    }
     // Explicit type arguments: the SDK's first overload cannot infer
     // OutputArgs when no outputSchema is passed (tools deliberately declare
     // none — no output validation, no SEP-2106 result wrapping), and InputArgs
@@ -185,7 +202,8 @@ export function registerMcpTools(server: McpServer, ctx?: McpRequestContext): vo
         inputSchema: descriptor.inputSchema,
         annotations: {
           readOnlyHint: descriptor.scope === "read",
-          destructiveHint: descriptor.confirmation === "DELETE",
+          destructiveHint:
+            descriptor.confirmation === "DELETE" || descriptor.name === "forwarder_cli_command_run",
           idempotentHint: descriptor.scope === "read",
           openWorldHint:
             descriptor.classification === "external" || descriptor.classification === "cost",
@@ -209,6 +227,9 @@ function toolDescription(descriptor: McpToolDescriptor): string {
   }
   if (descriptor.featureDependencies !== undefined && descriptor.featureDependencies.length > 0) {
     parts.push(`Depends on ${descriptor.featureDependencies.join(", ")}.`);
+  }
+  if (descriptor.descriptionNote !== undefined) {
+    parts.push(descriptor.descriptionNote);
   }
   return parts.join(" ");
 }
@@ -241,6 +262,19 @@ export async function runManifestTool(
   // abort or gate.close() never leaves a tool continuation that can START
   // new work (the DB-seam fence covers continuations that resume anyway).
   const signal = dispatch.signal;
+  const credential = dispatch.credential ?? { kind: "oauth" as const };
+
+  // CLI command tools are re-checked before scope and confirmation so a
+  // credential that cannot see them gets the same not-found answer as an
+  // unregistered name, not an insufficient-scope or confirmation error
+  // that would reveal the tool.
+  if (isCliCommandTool(descriptor.name) && !cliCommandsAllowed(credential)) {
+    mcpSanitizedLog("tool call rejected: unknown tool", {
+      toolName: descriptor.name,
+      requestId,
+    });
+    return unknownToolError(descriptor.name);
+  }
 
   // 2. Scope: write tools require the literal mcp:write; read tools accept
   //    either scope through the shared endpoint predicate.
@@ -275,8 +309,9 @@ export async function runManifestTool(
   //    redaction, serialization, or sizing — becomes a stable in-band tool
   //    error. NOTHING reaches the installed SDK, whose own catch would
   //    copy `Error.message` verbatim into tool output.
+  const deliverDespiteAbort = descriptor.deliverDespiteAbort === true;
   try {
-    if (signal?.aborted) throw new McpToolAbortedError();
+    if (!deliverDespiteAbort && signal?.aborted) throw new McpToolAbortedError();
     const adaptedInput = descriptor.inputAdapter
       ? descriptor.inputAdapter(stripConfirmation(argsRecord))
       : stripConfirmation(argsRecord);
@@ -290,19 +325,23 @@ export async function runManifestTool(
     // procedure continuations and transaction callbacks alike; an in-flight
     // single operation may still complete — atomic semantics). Normal HTTP
     // traffic runs outside the fence context and is unaffected.
+    //
+    // deliverDespiteAbort (CLI command run) does not race: the signal is
+    // passed into the wait, an abort ends that wait, and the result — which
+    // always carries commandId — is still delivered.
     let output: unknown;
     const invokeCore = descriptor.invokeCore;
     const invokeProcedure = descriptor.invokeProcedure;
     if (invokeCore !== undefined) {
-      output = await raceAbort(
+      const invoke = () =>
         runWithDbAbortFence(signal, () =>
           invokeCore(adaptedInput, {
             userId: dispatch.orpcContext.session.user.id,
             signal,
+            credential,
           }),
-        ),
-        signal,
-      );
+        );
+      output = deliverDespiteAbort ? await invoke() : await raceAbort(invoke(), signal);
     } else if (invokeProcedure !== undefined && client !== undefined) {
       output = await raceAbort(
         runWithDbAbortFence(signal, () => invokeProcedure(client, adaptedInput)),
@@ -317,14 +356,15 @@ export async function runManifestTool(
       return internalToolError(requestId);
     }
     // Post-await fence (G1): never START the output pipeline after abort.
-    if (signal?.aborted) throw new McpToolAbortedError();
+    // Skipped for deliverDespiteAbort — the abort is what ended the wait.
+    if (!deliverDespiteAbort && signal?.aborted) throw new McpToolAbortedError();
 
     // Project → redact → serialize → cap (G5: the FINAL serialized result —
     // text + structuredContent combined — is what must stay within the
     // advertised cap; the payload pre-check below is only the fast fail for
     // grossly oversized payloads).
     const projected = descriptor.outputProjector ? descriptor.outputProjector(output) : output;
-    if (signal?.aborted) throw new McpToolAbortedError();
+    if (!deliverDespiteAbort && signal?.aborted) throw new McpToolAbortedError();
     const safe = toJsonSafe(redactSecrets(projected));
     const serialized = serializeBounded(safe);
     if (serialized === null) {
@@ -362,6 +402,14 @@ export async function runManifestTool(
       return toolError(`Invalid input: field "${error.field}" must be an ISO-8601 timestamp.`, {
         error: { code: "INVALID_INPUT", field: error.field },
       });
+    }
+    if (error instanceof McpCliCommandRejectedError) {
+      // reason is a fixed runtime code. Command text and output are not logged.
+      mcpSanitizedLog(`tool call rejected: cli command ${error.reason}`, {
+        toolName: descriptor.name,
+        requestId,
+      });
+      return toolError(error.message, { error: { code: error.code } });
     }
     return mapToolError(error, descriptor, requestId);
   }

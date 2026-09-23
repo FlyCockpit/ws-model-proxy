@@ -41,6 +41,7 @@ model User {
   modelPools                 ModelPool[]                  @relation("ModelPoolOwner")
   ownedPoolGrants            PoolGrant[]                  @relation("PoolGrantOwner")
   receivedPoolGrants         PoolGrant[]                  @relation("PoolGrantGrantee")
+  dashboardNotices           DashboardNotice[]
   modelApiTokens             ModelApiToken[]              @relation("ModelApiTokenOwner")
   responseStickinessRecords  ResponseStickinessRecord[]   @relation("ResponseStickinessOwner")
   relayRequests              RelayRequest[]               @relation("RelayRequestOwner")
@@ -393,20 +394,21 @@ model McpGrant {
 // revocation use the same tombstone path as OAuth grants. clientId on the
 // grant is the synthetic `pat:<tokenId>` identifier, not an OauthClient row.
 model McpPersonalToken {
-  id           String    @id
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @default(now()) @updatedAt
-  userId       String
-  name         String
-  lookupPrefix String
-  secretDigest String
-  scopes       String[]
-  lastUsedAt   DateTime?
-  revokedAt    DateTime?
-  expiresAt    DateTime?
-  grantId      String    @unique
-  user         User      @relation("McpPersonalTokenOwner", fields: [userId], references: [id], onDelete: Cascade)
-  grant        McpGrant  @relation(fields: [grantId], references: [id], onDelete: Cascade)
+  id               String    @id
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @default(now()) @updatedAt
+  userId           String
+  name             String
+  lookupPrefix     String
+  secretDigest     String
+  scopes           String[]
+  allowCliCommands Boolean   @default(false)
+  lastUsedAt       DateTime?
+  revokedAt        DateTime?
+  expiresAt        DateTime?
+  grantId          String    @unique
+  user             User      @relation("McpPersonalTokenOwner", fields: [userId], references: [id], onDelete: Cascade)
+  grant            McpGrant  @relation(fields: [grantId], references: [id], onDelete: Cascade)
 
   @@unique([lookupPrefix])
   @@unique([secretDigest])

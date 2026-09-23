@@ -85,6 +85,15 @@ function buildContext(
   };
 }
 
+const NINETY_DAYS_MS = 90 * 86_400_000;
+
+function expectDefaultExpiry(expiresAt: unknown, startedAt: number, finishedAt: number) {
+  expect(expiresAt).toBeInstanceOf(Date);
+  const at = (expiresAt as Date).getTime();
+  expect(at).toBeGreaterThanOrEqual(startedAt + NINETY_DAYS_MS);
+  expect(at).toBeLessThanOrEqual(finishedAt + NINETY_DAYS_MS);
+}
+
 function tokenRow(overrides: Record<string, unknown> = {}) {
   return {
     id: "token-1",
@@ -96,6 +105,7 @@ function tokenRow(overrides: Record<string, unknown> = {}) {
     lastUsedAt: null,
     revokedAt: null,
     expiresAt: null,
+    allowCliCommands: false,
     ...overrides,
   };
 }
@@ -137,6 +147,7 @@ describe("mcpTokensRouter", () => {
         lastUsedAt: null,
         revokedAt: null,
         expiresAt: null,
+        allowCliCommands: false,
       },
     ]);
     expect(db.mcpPersonalToken.findMany).toHaveBeenCalledWith(
@@ -165,6 +176,7 @@ describe("mcpTokensRouter", () => {
         lastUsedAt: null,
         revokedAt: createdAt,
         expiresAt: null,
+        allowCliCommands: false,
       },
     ]);
     expect(db.mcpPersonalToken.findMany).toHaveBeenCalledWith(
@@ -187,9 +199,16 @@ describe("mcpTokensRouter", () => {
 
   it("creates a hashed token bound to a new grant generation and returns the secret once", async () => {
     db.mcpGrant.create.mockResolvedValue({ id: "grant-1" });
-    db.mcpPersonalToken.create.mockResolvedValue(tokenRow({ scopes: ["mcp:read", "mcp:write"] }));
+    db.mcpPersonalToken.create.mockImplementation(async (args: { data: { expiresAt?: unknown } }) =>
+      tokenRow({
+        scopes: ["mcp:read", "mcp:write"],
+        expiresAt: args.data.expiresAt,
+      }),
+    );
     const client = createRouterClient(mcpTokensRouter, { context: buildContext() });
+    const startedAt = Date.now();
     const result = await client.create({ name: "Laptop Grok", allowWrite: true });
+    const finishedAt = Date.now();
 
     expect(result.secret.startsWith(PRODUCT_CREDENTIAL_PREFIXES.mcpToken)).toBe(true);
     expect(result.token.scopes).toEqual(["mcp:read", "mcp:write"]);
@@ -209,10 +228,14 @@ describe("mcpTokensRouter", () => {
         data: expect.objectContaining({
           name: "Laptop Grok",
           scopes: ["mcp:read", "mcp:write"],
-          expiresAt: null,
         }),
       }),
     );
+    expectDefaultExpiry(result.token.expiresAt, startedAt, finishedAt);
+    const stored = db.mcpPersonalToken.create.mock.calls[0]?.[0] as
+      | { data?: { expiresAt?: unknown } }
+      | undefined;
+    expect(stored?.data?.expiresAt).toBe(result.token.expiresAt);
     expect(db.mcpGrant.create).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
@@ -224,12 +247,28 @@ describe("mcpTokensRouter", () => {
     );
   });
 
-  it("creates a no-expiry token while WMP_MCP_PAT_ALLOW_NO_EXPIRY is on", async () => {
+  it("defaults an omitted expiresAt to 90 days from the server clock", async () => {
     envMock.WMP_MCP_PAT_ALLOW_NO_EXPIRY = true;
     db.mcpGrant.create.mockResolvedValue({ id: "grant-1" });
-    db.mcpPersonalToken.create.mockResolvedValue(tokenRow());
+    db.mcpPersonalToken.create.mockImplementation(async (args: { data: { expiresAt?: unknown } }) =>
+      tokenRow({ expiresAt: args.data.expiresAt }),
+    );
     const client = createRouterClient(mcpTokensRouter, { context: buildContext() });
-    await expect(client.create({ name: "Laptop" })).resolves.toMatchObject({
+    const startedAt = Date.now();
+    const result = await client.create({ name: "Laptop" });
+    const finishedAt = Date.now();
+    expectDefaultExpiry(result.token.expiresAt, startedAt, finishedAt);
+    expect(result.token.expiresAt).not.toBeNull();
+  });
+
+  it("keeps an explicit null as no expiry while WMP_MCP_PAT_ALLOW_NO_EXPIRY is on", async () => {
+    envMock.WMP_MCP_PAT_ALLOW_NO_EXPIRY = true;
+    db.mcpGrant.create.mockResolvedValue({ id: "grant-1" });
+    db.mcpPersonalToken.create.mockImplementation(async (args: { data: { expiresAt?: unknown } }) =>
+      tokenRow({ expiresAt: args.data.expiresAt }),
+    );
+    const client = createRouterClient(mcpTokensRouter, { context: buildContext() });
+    await expect(client.create({ name: "Laptop", expiresAt: null })).resolves.toMatchObject({
       token: { expiresAt: null },
     });
     expect(db.mcpPersonalToken.create).toHaveBeenCalledWith(
@@ -290,6 +329,41 @@ describe("mcpTokensRouter", () => {
     );
   });
 
+  it("keeps an omitted expiresAt and an explicit null distinct on the RPC wire", async () => {
+    db.mcpGrant.create.mockResolvedValue({ id: "grant-1" });
+    db.mcpPersonalToken.create.mockImplementation(async (args: { data: { expiresAt?: unknown } }) =>
+      tokenRow({ expiresAt: args.data.expiresAt ?? null }),
+    );
+    const handler = new RPCHandler(mcpTokensRouter);
+    const link = new RPCLink({
+      url: "http://unit.test/rpc",
+      fetch: async (request, init) => {
+        const result = await handler.handle(new Request(request, init), {
+          prefix: "/rpc",
+          context: buildContext() satisfies Context,
+        });
+        return result.matched ? result.response : new Response(null, { status: 404 });
+      },
+    });
+    const client = createORPCClient(link) as ReturnType<
+      typeof createRouterClient<typeof mcpTokensRouter>
+    >;
+
+    const startedAt = Date.now();
+    await client.create({ name: "Omitted" });
+    const finishedAt = Date.now();
+    const omitted = db.mcpPersonalToken.create.mock.calls[0]?.[0] as
+      | { data?: { expiresAt?: unknown } }
+      | undefined;
+    expectDefaultExpiry(omitted?.data?.expiresAt, startedAt, finishedAt);
+
+    await client.create({ name: "Forever", expiresAt: null });
+    const explicit = db.mcpPersonalToken.create.mock.calls[1]?.[0] as
+      | { data?: { expiresAt?: unknown } }
+      | undefined;
+    expect(explicit?.data?.expiresAt).toBeNull();
+  });
+
   it("also accepts a Date object expiry", async () => {
     db.mcpGrant.create.mockResolvedValue({ id: "grant-1" });
     db.mcpPersonalToken.create.mockResolvedValue(tokenRow());
@@ -331,18 +405,33 @@ describe("mcpTokensRouter", () => {
     expect(db.$transaction).not.toHaveBeenCalled();
   });
 
-  it("refuses a no-expiry token while WMP_MCP_PAT_ALLOW_NO_EXPIRY is off", async () => {
+  it("still defaults an omitted expiresAt to 90 days while WMP_MCP_PAT_ALLOW_NO_EXPIRY is off", async () => {
+    envMock.WMP_MCP_PAT_ALLOW_NO_EXPIRY = false;
+    db.mcpGrant.create.mockResolvedValue({ id: "grant-1" });
+    db.mcpPersonalToken.create.mockImplementation(async (args: { data: { expiresAt?: unknown } }) =>
+      tokenRow({ expiresAt: args.data.expiresAt }),
+    );
+    const client = createRouterClient(mcpTokensRouter, { context: buildContext() });
+    const startedAt = Date.now();
+    const result = await client.create({ name: "Laptop" });
+    const finishedAt = Date.now();
+    expectDefaultExpiry(result.token.expiresAt, startedAt, finishedAt);
+  });
+
+  it("refuses an explicit null expiry while WMP_MCP_PAT_ALLOW_NO_EXPIRY is off", async () => {
     envMock.WMP_MCP_PAT_ALLOW_NO_EXPIRY = false;
     const client = createRouterClient(mcpTokensRouter, { context: buildContext() });
-    await expect(client.create({ name: "Laptop" })).rejects.toSatisfy((error: ORPCError) => {
-      expect(error).toBeInstanceOf(ORPCError);
-      expect(error.code).toBe("FORBIDDEN");
-      expect(error.message).toBe(
-        "No-expiry MCP tokens are disabled on this deployment. Choose an expiry date.",
-      );
-      expect(error.data).toEqual({ reason: MCP_PAT_NO_EXPIRY_DISABLED_REASON });
-      return true;
-    });
+    await expect(client.create({ name: "Laptop", expiresAt: null })).rejects.toSatisfy(
+      (error: ORPCError) => {
+        expect(error).toBeInstanceOf(ORPCError);
+        expect(error.code).toBe("FORBIDDEN");
+        expect(error.message).toBe(
+          "No-expiry MCP tokens are disabled on this deployment. Choose an expiry date.",
+        );
+        expect(error.data).toEqual({ reason: MCP_PAT_NO_EXPIRY_DISABLED_REASON });
+        return true;
+      },
+    );
     expect(db.$transaction).not.toHaveBeenCalled();
   });
 
@@ -419,6 +508,107 @@ describe("mcpTokensRouter", () => {
     });
     expect(db.mcpPersonalToken.update).not.toHaveBeenCalled();
     expect(db.mcpGrant.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("rejects allowCliCommands without write access", async () => {
+    const client = createRouterClient(mcpTokensRouter, { context: buildContext() });
+    await expect(
+      client.create({ name: "Laptop", allowWrite: false, allowCliCommands: true }),
+    ).rejects.toSatisfy((error: ORPCError) => {
+      expect(error).toBeInstanceOf(ORPCError);
+      expect(error.code).toBe("BAD_REQUEST");
+      expect(JSON.stringify(error.data)).toContain("CLI commands require write access.");
+      return true;
+    });
+    expect(db.$transaction).not.toHaveBeenCalled();
+  });
+
+  it("round-trips allowCliCommands on create and list", async () => {
+    db.mcpGrant.create.mockResolvedValue({ id: "grant-1" });
+    db.mcpPersonalToken.create.mockResolvedValue(
+      tokenRow({ scopes: ["mcp:read", "mcp:write"], allowCliCommands: true }),
+    );
+    const client = createRouterClient(mcpTokensRouter, { context: buildContext() });
+    const created = await client.create({
+      name: "Laptop Grok",
+      allowWrite: true,
+      allowCliCommands: true,
+    });
+    expect(created.token.allowCliCommands).toBe(true);
+    expect(db.mcpPersonalToken.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          allowCliCommands: true,
+          scopes: ["mcp:read", "mcp:write"],
+        }),
+      }),
+    );
+
+    db.mcpPersonalToken.findMany.mockResolvedValue([
+      tokenRow({ scopes: ["mcp:read", "mcp:write"], allowCliCommands: true }),
+    ]);
+    await expect(client.listMine()).resolves.toEqual([
+      expect.objectContaining({ id: "token-1", allowCliCommands: true }),
+    ]);
+  });
+
+  it("still refuses an explicit null expiry while WMP_MCP_PAT_ALLOW_NO_EXPIRY is off when CLI commands are requested", async () => {
+    envMock.WMP_MCP_PAT_ALLOW_NO_EXPIRY = false;
+    const client = createRouterClient(mcpTokensRouter, { context: buildContext() });
+    await expect(
+      client.create({ name: "Laptop", allowWrite: true, allowCliCommands: true, expiresAt: null }),
+    ).rejects.toSatisfy((error: ORPCError) => {
+      expect(error).toBeInstanceOf(ORPCError);
+      expect(error.code).toBe("FORBIDDEN");
+      expect(error.data).toEqual({ reason: MCP_PAT_NO_EXPIRY_DISABLED_REASON });
+      return true;
+    });
+    expect(db.$transaction).not.toHaveBeenCalled();
+  });
+
+  it("cancels CLI commands after the revoke transaction commits", async () => {
+    const events: string[] = [];
+    db.$transaction.mockImplementation(async (work: unknown) => {
+      events.push("begin");
+      const result = await (work as (tx: unknown) => Promise<unknown>)(prisma);
+      events.push("commit");
+      return result;
+    });
+    db.mcpPersonalToken.findUnique.mockResolvedValue({
+      id: "token-1",
+      userId: "user-1",
+      grantId: "grant-1",
+      revokedAt: null,
+    });
+    db.mcpPersonalToken.update.mockResolvedValue(tokenRow({ revokedAt: createdAt }));
+    db.mcpGrant.updateMany.mockResolvedValue({ count: 1 });
+    const cancelMcpTokenCommands = vi.fn(() => {
+      events.push("cancel");
+    });
+    const client = createRouterClient(mcpTokensRouter, {
+      context: { ...buildContext(), services: { cancelMcpTokenCommands } },
+    });
+
+    await expect(client.revokeMine({ id: "token-1" })).resolves.toMatchObject({
+      id: "token-1",
+      revokedAt: createdAt,
+    });
+    expect(cancelMcpTokenCommands).toHaveBeenCalledTimes(1);
+    expect(cancelMcpTokenCommands).toHaveBeenCalledWith("token-1");
+    expect(events).toEqual(["begin", "commit", "cancel"]);
+  });
+
+  it("does not cancel CLI commands when revoke does not commit", async () => {
+    const cancelMcpTokenCommands = vi.fn();
+    const client = createRouterClient(mcpTokensRouter, {
+      context: { ...buildContext(), services: { cancelMcpTokenCommands } },
+    });
+    await expect(client.revokeMine({ id: "missing" })).rejects.toSatisfy((error: ORPCError) => {
+      expect(error).toBeInstanceOf(ORPCError);
+      expect(error.code).toBe("NOT_FOUND");
+      return true;
+    });
+    expect(cancelMcpTokenCommands).not.toHaveBeenCalled();
   });
 
   it("hides unknown tokens as not found without writing anything", async () => {

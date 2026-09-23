@@ -39,7 +39,6 @@ import {
   supportsChatCompletions,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import prisma, { Prisma } from "@ws-model-proxy/db";
-import { env } from "@ws-model-proxy/env/server";
 import { type RelaySessionManager, relaySessionManager } from "../relay/session-manager.js";
 import { PostgresCapacityAdmissionStore } from "./capacity/postgres-store.js";
 import {
@@ -90,13 +89,12 @@ export interface DiagnosticCoreDependencies {
  * diagnostic core across BOTH transports (Hono chat-test routes and the MCP
  * chat completion test tool). Created lazily on first use — exactly the shape
  * the Hono route used to create per mount (one per app), never per request —
- * and disabled (undefined) exactly when the capacity feature flag is off,
- * mirroring `createChatTestRoutes`'s `capacityEnabled` semantics.
+ * Admission is always on: both transports share this runtime, and there is
+ * no in-memory limiter fallback when it is absent.
  */
 let sharedDiagnosticsCapacityRuntime: CapacityAdmissionRuntime | undefined;
 
-export function diagnosticsCapacityRuntime(): CapacityAdmissionRuntime | undefined {
-  if (!env.MODEL_API_GLOBAL_CAPACITY_ENABLED) return undefined;
+export function diagnosticsCapacityRuntime(): CapacityAdmissionRuntime {
   sharedDiagnosticsCapacityRuntime ??= new StoreCapacityAdmissionRuntime(
     new PostgresCapacityAdmissionStore(),
   );

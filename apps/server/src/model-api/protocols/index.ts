@@ -5,5 +5,6 @@ export * from "./errors.js";
 export * from "./nonstream.js";
 export * from "./openai-chat.js";
 export * from "./openai-responses.js";
+export * from "./request-controls.js";
 export * from "./sse.js";
 export * from "./streams.js";

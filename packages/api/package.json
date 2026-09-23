@@ -38,6 +38,9 @@
     "./lib/declared-context-window": {
       "default": "./src/lib/declared-context-window.ts"
     },
+    "./lib/effective-provider-egress": {
+      "default": "./src/lib/effective-provider-egress.ts"
+    },
     "./lib/guarded-pool-create-reasons": {
       "default": "./src/lib/guarded-pool-create-reasons.ts"
     },
@@ -46,6 +49,9 @@
     },
     "./lib/capacity-policy-safety": {
       "default": "./src/lib/capacity-policy-safety.ts"
+    },
+    "./lib/discovered-inference-capacity": {
+      "default": "./src/lib/discovered-inference-capacity.ts"
     },
     "./lib/reasoning-contract": {
       "default": "./src/lib/reasoning-contract.ts"
@@ -61,6 +67,9 @@
     },
     "./lib/provider-protocol": {
       "default": "./src/lib/provider-protocol.ts"
+    },
+    "./lib/relay-protocol-version": {
+      "default": "./src/lib/relay-protocol-version.ts"
     },
     "./routers/index": {
       "default": "./src/routers/index.ts"

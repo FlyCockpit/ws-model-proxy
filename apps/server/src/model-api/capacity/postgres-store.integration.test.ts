@@ -1787,7 +1787,6 @@ integration("model API routes with real PostgreSQL capacity", () => {
     process.env.DATABASE_URL = databaseUrl;
     process.env.BETTER_AUTH_SECRET = "w7Qp9Lm2Nx4Rv6Tk8Yc3Hu5Jd1Fs0ZaB";
     process.env.BETTER_AUTH_URL = "http://localhost:3000";
-    process.env.MODEL_API_GLOBAL_CAPACITY_ENABLED = "true";
 
     const [{ default: prisma }, security, routes, storeModule, runtimeModule, apiRouters, orpc] =
       await Promise.all([
@@ -1917,7 +1916,6 @@ integration("model API routes with real PostgreSQL capacity", () => {
     const runtime = new runtimeModule.StoreCapacityAdmissionRuntime(store, 5, 60_000);
     const app = routes.createModelApiRoutes({
       manager: manager as never,
-      capacityEnabled: true,
       capacityRuntime: runtime,
     });
     const authorization = { authorization: `Bearer ${secret}`, "content-type": "application/json" };

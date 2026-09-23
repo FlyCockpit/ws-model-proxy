@@ -92,12 +92,12 @@
     "samplePromptOne": "Explica las capacidades de este modelo.",
     "samplePromptTwo": "Dame un plan de pruebas conciso.",
     "routingMode": {
-      "label": "Modo de ruta del pool",
-      "PREFER_NATIVE": "API preferida (nativa primero)",
-      "REQUIRE_NATIVE": "Requerir API de Chat nativa",
-      "REQUIRE_ADAPTED": "Requerir API de Chat adaptada",
-      "help": "El modo nativo rechaza miembros adaptados; el modo adaptado rechaza miembros nativos. Los modos no compatibles fallan sin cambiar la ruta silenciosamente.",
-      "directHelp": "Los modelos directos siempre usan su API de Chat nativa."
+      "label": "Ruta de la prueba de chat",
+      "PREFER_NATIVE": "Probar primero los miembros que hablan esta API",
+      "REQUIRE_NATIVE": "Solo miembros que hablan esta API",
+      "REQUIRE_ADAPTED": "Solo miembros que necesitan traducción",
+      "help": "Afecta solo esta prueba de chat. Los clientes de API, como OpenCode, siempre prueban primero los miembros que hablan la API solicitada y después los miembros traducidos.",
+      "directHelp": "Los modelos directos siempre usan su propia API. Este control aplica a los pools."
     },
     "surface": {
       "label": "Superficie de API",
@@ -163,7 +163,21 @@
     },
     "searchPlaceholder": "Buscar ID de modelo, ID de origen, endpoint o etiqueta",
     "noSearchResults": "Ningún endpoint o modelo coincide con la búsqueda.",
-    "title": "CLIs, endpoints y modelos"
+    "title": "CLIs, endpoints y modelos",
+    "features": {
+      "terminal": "Terminal del navegador",
+      "commands": "Comandos MCP",
+      "saved": "Se actualizó el acceso a funciones del CLI",
+      "saveFailed": "No se pudo actualizar el acceso a funciones del CLI. Intenta de nuevo.",
+      "windows": "Aún no es compatible con Windows",
+      "configDisabled": "Desactivado en la configuración wsmp de este CLI — edítala y reinicia wsmp",
+      "updateWsmp": "Actualiza wsmp para usar esto"
+    }
+  },
+  "deploymentFeatures": {
+    "unavailable": "No disponible en esta implementación.",
+    "privateNetworkAdmin": "Las URL privadas y de loopback se rechazan. Define `WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS=true`.",
+    "privateNetworkUser": "Las URL privadas y de loopback se rechazan."
   },
   "description": "Opera CLIs conectados, pools de modelos, credenciales y metadatos de relay.",
   "endpoints": {
@@ -214,19 +228,118 @@
       "OPENAI_RESPONSES": "OpenAI Responses"
     }
   },
+  "terminals": {
+    "title": "Terminales",
+    "description": "Abre un shell en uno de tus CLIs. Las pulsaciones van cifradas entre este navegador y el CLI.",
+    "empty": "No hay terminales abiertas. Inicia una desde un CLI que permita terminales del navegador.",
+    "emptyClis": "Todavía no se ha registrado ningún dispositivo CLI.",
+    "loading": "Cargando terminales",
+    "add": "Nueva terminal",
+    "close": "Dejar de ver esta terminal",
+    "cliList": "Elige un CLI",
+    "reconnecting": "Reconectando con el servicio de terminal…",
+    "exited": "El shell terminó.",
+    "gone": "Esta terminal terminó mientras estabas desconectado.",
+    "rejected": "El CLI rechazó esta terminal ({{reason}}).",
+    "error": "La conexión de la terminal encontró un error.",
+    "inputDropped": "Parte de la entrada no se entregó porque llegó demasiado rápido. Revisa el último comando antes de continuar.",
+    "openElsewhere": "Esta terminal está abierta en otra pestaña del navegador.",
+    "viewHere": "Ver aquí",
+    "slowReconnecting": "Esta pestaña se quedó atrás de la salida de la terminal. Reconectando…",
+    "actions": "Acciones de la terminal",
+    "endSession": "Terminar sesión",
+    "endSessionTitle": "¿Terminar esta sesión de terminal?",
+    "endSessionDescription": "El shell se detiene para todos los que la están viendo. Se pierde el trabajo sin guardar.",
+    "status": {
+      "youTyping": "Estás escribiendo",
+      "otherTyping": "Alguien más está escribiendo",
+      "viewers_one": "{{count}} espectador",
+      "viewers_other": "{{count}} espectadores",
+      "following": "Viendo a {{cols}}×{{rows}}. Escribe aquí para tomar el control."
+    },
+    "approvalTitle": "Este CLI necesita aprobación",
+    "approvalInstructions": "Ejecuta este comando en esa máquina y luego abre la terminal de nuevo.",
+    "approvalCodeLabel": "Código de aprobación",
+    "copyCommand": "Copiar comando",
+    "copied": "Comando copiado",
+    "reasons": {
+      "notGranted": "No concedido para este CLI",
+      "offline": "El CLI está desconectado",
+      "unavailable": "La terminal no está disponible"
+    },
+    "rejection": {
+      "disabled": "Desactivado en la configuración del CLI",
+      "unsupported": "No es compatible en esta máquina",
+      "limit": "Ya hay demasiadas terminales abiertas",
+      "approval_required": "Este navegador todavía no está aprobado",
+      "bad_signature": "La firma de aprobación fue rechazada",
+      "bad_handshake": "El saludo de la terminal no es válido",
+      "bad_cwd": "El directorio de inicio del CLI no se puede usar",
+      "spawn_failed": "No se pudo iniciar el shell",
+      "not_found": "Terminal no encontrada",
+      "already_open": "Esa terminal ya está abierta",
+      "expired": "La solicitud de aprobación expiró",
+      "not_granted": "No concedido para este CLI",
+      "device_disabled": "Desactivado en la configuración del CLI",
+      "cli_too_old": "Actualiza wsmp para usar terminales",
+      "offline": "El CLI está desconectado",
+      "invalid": "Esa solicitud de terminal no es válida",
+      "viewer_limit": "Ya hay demasiadas pestañas viendo esta terminal",
+      "bad_frame": "El CLI desconectó esta pestaña por un marco inválido",
+      "identity_changed": "La clave de identidad de esta CLI cambió",
+      "identity_invalid": "Esta CLI no demostró su identidad",
+      "identity_mismatch": "La CLI respondió con una clave que su identidad no firmó"
+    },
+    "identity": {
+      "title": "Identidades de CLI",
+      "description": "El navegador fija la clave de identidad de cada CLI la primera vez que la ve. Compara una huella con `wsmp terminal fingerprint` en esa máquina.",
+      "fingerprint": "Huella",
+      "checking": "Verificando identidad…",
+      "offline": "Sin conexión",
+      "unpinned": "Este navegador no pudo guardar la clave. Compara la huella antes de escribir algo sensible.",
+      "unverified": "Sin verificar. Actualiza la CLI para verificar su identidad.",
+      "invalid": "Esta CLI no demostró su identidad. Sus terminales están bloqueadas.",
+      "changed": "La clave de identidad de esta CLI cambió. Sus terminales están bloqueadas hasta que confíes en la nueva clave.",
+      "downgraded": "Esta CLI ya no demuestra su identidad. Sus terminales están bloqueadas hasta que la permitas.",
+      "pinned": "Fijada",
+      "new": "Nueva",
+      "trustNew": "Confiar en la nueva clave",
+      "allowUnverified": "Permitir sin verificar",
+      "trustTitle": "¿Confiar en la nueva clave de {{label}}?",
+      "trustDescription": "Continúa solo si ejecutaste `wsmp terminal fingerprint` en esa máquina y coincide. De lo contrario, alguien podría estar interceptando tu terminal.",
+      "trustFailed": "No se pudo confiar en la clave. Recarga e inténtalo de nuevo.",
+      "keyChangedAgain": "La clave volvió a cambiar antes de poder confiar en ella. No se fijó nada. Compara la nueva huella e inténtalo de nuevo.",
+      "activeUnverified": "La identidad de esta CLI no está verificada. Actualiza la CLI para verificarla."
+    }
+  },
   "nav": {
     "ariaLabel": "Secciones del panel",
     "chatTest": "Prueba de chat",
     "capacity": "Capacidad",
     "cliTokens": "Tokens CLI",
     "clis": "CLIs",
+    "collapseSidebar": "Contraer barra lateral",
+    "expandSidebar": "Expandir barra lateral",
     "modelApiTokens": "Tokens API de modelo",
     "overview": "Resumen",
     "pools": "Grupos",
-    "relayMetadata": "Metadatos de relay"
+    "relayMetadata": "Metadatos de relay",
+    "terminals": "Terminales"
+  },
+  "notices": {
+    "region": "Avisos",
+    "dismiss": "Descartar",
+    "poolExternalProvider": "{{pool}} puede enviar solicitudes a un proveedor externo."
   },
   "pools": {
     "notFound": "No se encontró este grupo o ya no está disponible para ti.",
+    "privacyBadge": {
+      "private": "Privado",
+      "external": "Puede usar proveedores externos"
+    },
+    "granteePrivacyConfirmTitle": "Este grupo puede enviar datos a un proveedor externo",
+    "granteePrivacyConfirmDescription": "{{pool}} ya está compartido. Las solicitudes de estas personas pueden salir de esta instalación. Se les avisará. Su acceso no se pausa.",
+    "granteePrivacyConfirmAction": "Confirmar y continuar",
     "affinity": {
       "title": "Enrutamiento según caché",
       "description": "Las sesiones nuevas van al miembro con la mejor puntuación de disponibilidad (carga, salud, salida pública y costo). Cuando esas puntuaciones empatan, se prefiere un entorno que quizá conserve un prefijo de instrucción coincidente. El enrutamiento consciente del prompt de sistema es parte de este interruptor. Después de un turno de asistente o de herramienta, se prefiere el miembro que sirvió la conversación hasta ahora. Una conversación larga puede superar una carga moderada o un miembro medio abierto; una cola grande igual desborda la solicitud.",
@@ -319,7 +432,6 @@
     "allowLossyDeveloperRoleCollapse": "Permitir la conversión con pérdida del rol developer",
     "compatibilityDetails": "Matriz de compatibilidad de protocolos",
     "enableProtocolAdaptation": "Habilitar adaptación de protocolos del subconjunto estricto",
-    "protocolAdaptationDisabledReason": "La traducción de protocolos está desactivada para esta implementación.",
     "lossyDeveloperRoleWarning": "Advertencia: las instrucciones developer pueden combinarse con el rol system. Las solicitudes con ambos roles se rechazan salvo que se habilite esta opción.",
     "limitations": {
       "native_extensions_unavailable": "extensiones nativas no disponibles",
@@ -426,7 +538,7 @@
       "description": "Elige primero la capacidad local y luego decide explícitamente si las solicitudes pueden salir de tu infraestructura.",
       "disabled": "Desactivado",
       "egressRequired": "Reconoce la salida al proveedor antes de adjuntar cualquier destino de proveedor.",
-      "egressWarning": "Las solicitudes al proveedor PRIMARY, y las solicitudes de desbordamiento cuando estén habilitadas, envían prompts, adjuntos, definiciones de herramientas y resultados generados fuera de esta implementación. La puerta de lanzamiento y la admisión de capacidad global duradera también deben estar habilitadas.",
+      "egressWarning": "Las solicitudes al proveedor PRIMARY, y las solicitudes de desbordamiento cuando estén habilitadas, envían prompts, adjuntos, definiciones de herramientas y resultados generados fuera de esta implementación.",
       "enabled": "Activado",
       "fields": {
         "concurrency": "Límite de concurrencia física",
@@ -460,7 +572,7 @@
         "borrowPolicyHint": "Si este pool puede ejecutarse en espacios inactivos que otros pools reservaron en el runtime compartido. NEVER lo impide; WHEN_IDLE (predeterminado) lo permite salvo que una solicitud en cola de ellos, con mayor prioridad, necesite el espacio.",
         "protocolAdaptationEnabled": "Permitir adaptación estricta de protocolo si no hay una superficie nativa",
         "allowLossyDeveloperRoleCollapse": "Permitir colapso con pérdidas del rol de desarrollador/instrucción",
-        "protocolAdaptationHint": "La adaptación traduce estrictamente las solicitudes entre superficies de API cuando un miembro no tiene una nativa. Requiere la puerta de adaptación de protocolo del despliegue; sin ella las opciones no nativas quedan deshabilitadas.",
+        "protocolAdaptationHint": "La adaptación traduce estrictamente las solicitudes entre superficies de API cuando un miembro no tiene una nativa. Actívala en este pool para permitir las opciones no nativas.",
         "affinityEnabled": "Activar sugerencias de enrutamiento por afinidad de caché",
         "affinityEnabledHint": "Activada por defecto. Las solicitudes que continúan la misma conversación prefieren el mismo miembro para reutilizar sus cachés calientes; desactívala para enrutar solo por carga.",
         "affinityTtlSeconds": "Duración del registro de afinidad (segundos)",
@@ -598,7 +710,7 @@
     "grantTitle": "Dar acceso al pool",
     "grantEgressWarning": "Dar acceso a {{pool}} permite que esta persona envíe instrucciones, adjuntos, herramientas y resultados a proveedores configurados usados como destinos principales o desbordamiento público. Pueden aplicarse cargos.",
     "grantEgressWarningTitle": "Este permiso puede usar salida a proveedores externos",
-    "grantEgressAcknowledge": "Entiendo que las solicitudes de esta persona pueden salir del despliegue local mediante los proveedores de este pool.",
+    "grantEgressAcknowledge": "Entiendo que las solicitudes de este pool pueden enviarse a un proveedor, incluso cuando el desbordamiento público está activado, y que pueden aplicarse cargos del proveedor.",
     "memberTestSurface": "Superficie de API para probar el miembro",
     "memberTestMode": "Modo de ejecución para probar el miembro",
     "memberTestSurfaces": {
@@ -1008,8 +1120,9 @@
     "scopeMode": "Modo de alcance",
     "typeTokenName": "Escribe el nombre del token para confirmar",
     "visiblePreview": "{{count}} modelos visibles para este token",
-    "publicEgressWarningTitle": "Algunos recursos pueden usar proveedores externos",
-    "publicEgressWarning": "Este token puede acceder a {{pools}}. Las solicitudes a estos pools pueden enviar instrucciones, adjuntos, herramientas y resultados a proveedores configurados usados como destinos principales o desbordamiento público."
+    "publicEgressWarningTitle": "Algunos grupos pueden enviar datos fuera de esta instalación",
+    "publicEgressWarning": "Las solicitudes a {{pools}} pueden salir de esta instalación. Las instrucciones, los adjuntos, las herramientas y los resultados pueden enviarse a un proveedor externo.",
+    "publicEgressWarningNamed": "Las solicitudes a {{pools}} pueden salir de esta instalación. Las instrucciones, los adjuntos, las herramientas y los resultados pueden enviarse a {{providers}}."
   },
   "welcomeBack": "Bienvenido de vuelta, {{name}}"
 }

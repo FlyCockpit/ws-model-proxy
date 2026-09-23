@@ -13,7 +13,6 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     BETTER_AUTH_SECRET: "test-better-auth-secret",
     BETTER_AUTH_URL: "https://proxy.example.com",
     WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
-    MODEL_API_GLOBAL_CAPACITY_ENABLED: true,
     NODE_ENV: "test",
   },
 }));
@@ -30,6 +29,12 @@ vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
   return { default: mockDeep() };
 });
+
+vi.mock("../relay/cli-commands.js", () => ({
+  startCliCommand: vi.fn(),
+  waitCliCommand: vi.fn(),
+  snapshotCliCommand: vi.fn(),
+}));
 
 const { MCP_TOOL_MANIFEST, MCP_TOOL_EXCLUSIONS } = await import("./tool-manifest");
 const { appRouter } = await import("@ws-model-proxy/api/routers/index");
@@ -109,6 +114,8 @@ const PLAN_WRITE_TOOLS: readonly string[] = [
   "cli_token_revoke",
   "forwarder_pool_member_test",
   "forwarder_chat_completion_test",
+  "forwarder_cli_command_run",
+  "forwarder_cli_command_result",
 ];
 
 /** Confirmation literals for the write catalog. */
@@ -133,6 +140,7 @@ const PLAN_CONFIRMATIONS: Readonly<Record<string, "DELETE" | "RUN" | null>> = Ob
   cli_token_revoke: "DELETE",
   forwarder_pool_member_test: "RUN",
   forwarder_chat_completion_test: "RUN",
+  forwarder_cli_command_run: "RUN",
 });
 
 /** Exact catalog targets (name → target) for drift detection. */
@@ -207,6 +215,8 @@ const PLAN_TARGETS: Readonly<Record<string, string>> = Object.freeze({
   cli_token_revoke: "cliCredentials.revokeToken",
   forwarder_pool_member_test: "core:model-api/runPoolMemberTest",
   forwarder_chat_completion_test: "core:model-api/runChatCompletionDiagnostic",
+  forwarder_cli_command_run: "core:forwarderCliCommandRun",
+  forwarder_cli_command_result: "core:forwarderCliCommandResult",
 });
 
 /**
@@ -235,13 +245,13 @@ beforeEach(() => {
 });
 
 describe("MCP tool manifest — exact catalog", () => {
-  it("contains exactly 23 read + 46 write names (no extras, no missing, no duplicates)", () => {
+  it("contains exactly 23 read + 48 write names (no extras, no missing, no duplicates)", () => {
     const names = MCP_TOOL_MANIFEST.map((tool) => tool.name);
     expect(new Set(names).size).toBe(names.length);
     expect([...names].sort()).toEqual([...PLAN_READ_TOOLS, ...PLAN_WRITE_TOOLS].sort());
     expect(PLAN_READ_TOOLS).toHaveLength(23);
-    expect(PLAN_WRITE_TOOLS).toHaveLength(46);
-    expect(MCP_TOOL_MANIFEST).toHaveLength(69);
+    expect(PLAN_WRITE_TOOLS).toHaveLength(48);
+    expect(MCP_TOOL_MANIFEST).toHaveLength(71);
   });
 
   it("every descriptor carries its catalog target", () => {
@@ -328,6 +338,7 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
       "mcpTokens.listMine",
       "mcpTokens.create",
       "mcpTokens.revokeMine",
+      "forwarderManagement.setCliDeviceFeatureGrants",
     ]) {
       expect(excluded.has(required)).toBe(true);
     }
@@ -403,7 +414,7 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
     // Drive EVERY procedure-backed tool through the real dispatch path.
     let dispatched = 0;
     for (const tool of MCP_TOOL_MANIFEST) {
-      if (!tool.invokeProcedure) continue; // the 2 extracted-core diagnostics
+      if (!tool.invokeProcedure) continue; // 4 extracted cores (2 diagnostics + 2 CLI commands)
       const before = invoked.length;
       await tool.invokeProcedure(recordingClient, {});
       dispatched += 1;
@@ -413,7 +424,7 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
         `${tool.name}: ${PLAN_TARGETS[tool.name]}`,
       );
     }
-    // 69 catalog entries − 2 core diagnostics = 67 procedure dispatches.
+    // 71 catalog entries − 4 core diagnostics = 67 procedure dispatches.
     expect(dispatched).toBe(67);
     expect(invoked).toHaveLength(67);
 
@@ -434,7 +445,6 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
 
 describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
   const PROVIDER_EGRESS = "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED";
-  const CAPACITY = "MODEL_API_GLOBAL_CAPACITY_ENABLED";
 
   it("every provider-management tool advertises the provider-egress dependency", () => {
     for (const tool of MCP_TOOL_MANIFEST.filter((entry) =>
@@ -446,13 +456,11 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
     }
   });
 
-  it("every capacity-management tool advertises the capacity dependency", () => {
+  it("capacity-management tools are not behind a deployment feature flag", () => {
     for (const tool of MCP_TOOL_MANIFEST.filter((entry) =>
       entry.target.startsWith("capacityManagement."),
     )) {
-      expect(`${tool.name}: ${tool.featureDependencies?.join(",")}`).toBe(
-        `${tool.name}: ${CAPACITY}`,
-      );
+      expect(tool.featureDependencies).toBeUndefined();
     }
   });
 
@@ -472,10 +480,8 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
     expect(byName.get("forwarder_pool_member_update")?.featureDependencies).toEqual([
       PROVIDER_EGRESS,
     ]);
-    // Pool update additionally gates capacity policy fields on the capacity flag.
     expect(byName.get("forwarder_model_pool_update")?.featureDependencies).toEqual([
       PROVIDER_EGRESS,
-      CAPACITY,
     ]);
   });
 

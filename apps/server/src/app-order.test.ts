@@ -2,6 +2,12 @@ import { betterAuth } from "better-auth";
 import { memoryAdapter } from "better-auth/adapters/memory";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+vi.mock("./relay/cli-commands.js", () => ({
+  startCliCommand: vi.fn(),
+  waitCliCommand: vi.fn(),
+  snapshotCliCommand: vi.fn(),
+}));
+
 /**
  * PRODUCTION-REGISTRATION ORDERING CONTRACT TESTS (ledger L24, Part E pass 3;
  * env contract narrowed + configuration-consistency regression, pass 4 / L25).
@@ -64,7 +70,6 @@ const envMock = vi.hoisted(() => ({
   TRUST_PROXY_HOPS: undefined,
   MEDIA_MAX_UPLOAD_BYTES: 5 * 1024 * 1024,
   MODEL_API_TRANSCRIPTION_MAX_MULTIPART_BYTES: 1024 * 1024,
-  MODEL_API_GLOBAL_CAPACITY_ENABLED: false,
   WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: false,
   SSR_CACHE_TTL_SECONDS: 0,
 }));

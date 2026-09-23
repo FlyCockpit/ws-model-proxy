@@ -4,7 +4,9 @@
 //! codes, logging, paths, and output helpers live here so they can be tested and
 //! documented like normal Rust code.
 
+pub mod approvals;
 pub mod auth;
+pub mod child_env;
 pub mod cli;
 pub mod commands;
 pub mod config;
@@ -17,6 +19,12 @@ pub mod output;
 pub mod paths;
 pub mod probe;
 pub mod protocol;
+pub mod relay_bus;
+pub mod sessions;
+pub mod shutdown;
 pub mod slug;
+pub mod startup;
 pub mod state;
+pub mod terminal_crypto;
+pub mod terminal_identity;
 pub mod tokens;

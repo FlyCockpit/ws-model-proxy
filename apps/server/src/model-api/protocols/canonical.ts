@@ -46,6 +46,12 @@ export type CanonicalToolChoice =
   | { type: "required" }
   | { type: "tool"; name: string };
 
+/** Anthropic `thinking` after cache metadata is removed. Adaptive is a contract encoding. */
+export type CanonicalThinking =
+  | { type: "disabled" }
+  | { type: "enabled"; budgetTokens: number }
+  | { type: "adaptive" };
+
 export type CanonicalRequest = {
   adapterVersion: typeof ADAPTER_VERSION;
   source: ProtocolSurface;
@@ -57,7 +63,15 @@ export type CanonicalRequest = {
   /** Adapted paths deliberately force one tool call at a time. */
   parallelToolCalls: "single";
   stream: boolean;
-  sampling: { temperature?: number; topP?: number; stop?: string[]; maxOutputTokens?: number };
+  sampling: {
+    temperature?: number;
+    topP?: number;
+    /** Positive integer from Anthropic `top_k`. Renderers decide if the target accepts it. */
+    topK?: number;
+    stop?: string[];
+    maxOutputTokens?: number;
+  };
+  thinking?: CanonicalThinking;
   limitations: string[];
 };
 

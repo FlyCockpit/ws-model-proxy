@@ -1,0 +1,5 @@
+{
+  "subject": "{{pool}} may send requests to an external provider",
+  "heading": "A shared pool is no longer private",
+  "body": "Hi {{name}}, {{pool}} may now send requests to an external provider. Prompts, attachments, tools, and output can leave this deployment. Your access is not paused."
+}

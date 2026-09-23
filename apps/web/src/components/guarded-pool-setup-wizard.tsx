@@ -23,6 +23,7 @@ import type { ReactNode } from "react";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ProtocolCompatibilityRadio } from "@/components/forwarder-dashboard-sections";
+
 import {
   buildGuardedPoolWizardSchema,
   combinedPrimaryMemberCount,
@@ -139,7 +140,6 @@ export function GuardedPoolSetupWizard({
   initialStep = 0,
   initialProviderModelIds = [],
   capacityEnabled,
-  protocolAdaptationAvailable,
   providerEgressEnabled,
 }: {
   open: boolean;
@@ -151,7 +151,6 @@ export function GuardedPoolSetupWizard({
   initialStep?: 0 | 1 | 2 | 3;
   initialProviderModelIds?: string[];
   capacityEnabled: boolean;
-  protocolAdaptationAvailable: boolean;
   /** Deployment gate from WMP_PUBLIC_PROVIDER_EGRESS_ENABLED; false blocks provider selection. */
   providerEgressEnabled: boolean;
 }) {
@@ -203,7 +202,6 @@ export function GuardedPoolSetupWizard({
   // reflects the live egress gate, candidates, and capacities.
   const schema = buildGuardedPoolWizardSchema({
     providerEgressEnabled,
-    protocolAdaptationAvailable,
     directModels,
     providerModels: candidates.data ?? [],
     capacities: capacities.data ?? [],
@@ -271,12 +269,9 @@ export function GuardedPoolSetupWizard({
             physicalCountStrategy: value.physicalCountStrategy,
             contextMargin: value.contextMargin,
             borrowPolicy: value.borrowPolicy,
-            protocolAdaptationEnabled:
-              protocolAdaptationAvailable && value.protocolAdaptationEnabled,
+            protocolAdaptationEnabled: value.protocolAdaptationEnabled,
             allowLossyDeveloperRoleCollapse:
-              protocolAdaptationAvailable &&
-              value.protocolAdaptationEnabled &&
-              value.allowLossyDeveloperRoleCollapse,
+              value.protocolAdaptationEnabled && value.allowLossyDeveloperRoleCollapse,
             affinity: {
               enabled: value.affinityEnabled,
               ttlSeconds: value.affinityTtlSeconds,
@@ -364,6 +359,7 @@ export function GuardedPoolSetupWizard({
       },
       firstMemberSelection,
     );
+
     recommendedSurfaceFlags.current = decision.flags;
     if (decision.surface !== form.state.values.recommendedSurface)
       form.setFieldValue("recommendedSurface", decision.surface);
@@ -554,7 +550,6 @@ export function GuardedPoolSetupWizard({
                                     providerIds: form.state.values.providerModelIds,
                                     providerTier: form.state.values.providerTier,
                                     protocolAdaptationEnabled:
-                                      protocolAdaptationAvailable &&
                                       form.state.values.protocolAdaptationEnabled,
                                   },
                                   // First-PRIMARY-member trigger: the combined
@@ -774,7 +769,6 @@ export function GuardedPoolSetupWizard({
                       <ProtocolCompatibilityRadio
                         adaptationEnabled={adaptation}
                         allowLossyDeveloperRoleCollapse={lossy}
-                        protocolAdaptationAvailable={protocolAdaptationAvailable}
                         idPrefix="guarded"
                         onChange={(value) => {
                           form.setFieldValue("protocolAdaptationEnabled", value.adaptationEnabled);
@@ -786,8 +780,7 @@ export function GuardedPoolSetupWizard({
                             localIds: form.state.values.localModelIds,
                             providerIds: form.state.values.providerModelIds,
                             providerTier: form.state.values.providerTier,
-                            protocolAdaptationEnabled:
-                              protocolAdaptationAvailable && value.adaptationEnabled,
+                            protocolAdaptationEnabled: value.adaptationEnabled,
                           });
                         }}
                       />
@@ -891,6 +884,11 @@ export function GuardedPoolSetupWizard({
                         };
                       }}
                       {...errorProps("recommendedSurface")}
+                      aria-describedby={
+                        stepErrors.recommendedSurface
+                          ? "wizard-recommendedSurface-error"
+                          : undefined
+                      }
                     >
                       {guardedWizardSurfaces.map((surface) => (
                         <option key={surface} value={surface}>
@@ -967,7 +965,6 @@ export function GuardedPoolSetupWizard({
                                     providerIds: next,
                                     providerTier: tier,
                                     protocolAdaptationEnabled:
-                                      protocolAdaptationAvailable &&
                                       form.state.values.protocolAdaptationEnabled,
                                   },
                                   // Only a PRIMARY-tier provider can be the
@@ -1078,9 +1075,7 @@ export function GuardedPoolSetupWizard({
                             localIds: form.state.values.localModelIds,
                             providerIds,
                             providerTier: tier,
-                            protocolAdaptationEnabled:
-                              protocolAdaptationAvailable &&
-                              form.state.values.protocolAdaptationEnabled,
+                            protocolAdaptationEnabled: form.state.values.protocolAdaptationEnabled,
                           },
                           // Compare the combined primary count under the
                           // previous vs next tier: covers a provider selected

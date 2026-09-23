@@ -156,26 +156,22 @@ export const env = createEnv({
       .int()
       .positive()
       .default(15 * 60 * 1000),
-    // Native Anthropic relay is an incomplete, release-gated surface. Keep it
-    // explicitly disabled until the complete protocol gate is satisfied.
-    MODEL_API_ANTHROPIC_ENABLED: strictBooleanFlag(),
-    // Cross-protocol pool adaptation is independently release-gated and off by default.
-    MODEL_API_PROTOCOL_ADAPTATION_ENABLED: strictBooleanFlag(),
-    // Durable shared-capacity admission remains gated until PostgreSQL concurrency proofs pass.
-    MODEL_API_GLOBAL_CAPACITY_ENABLED: strictBooleanFlag(),
-    // Provider egress remains disabled until the full overflow admission and
-    // settlement path is enabled. The keyring is optional while that gate is off.
-    WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: strictBooleanFlag(),
-    // MCP server + OAuth provider surface (Phase 0b). Dormant by
-    // default: while false, the jwt/mcp/cimd auth plugins are not installed,
-    // no OAuth/JWKS routes exist, and the runtime Better Auth schema check
-    // does not expect the OAuth/JWKS tables. Human grant listing/revocation
-    // stays available when disabled (emergency kill switch), by design.
-    WMP_MCP_ENABLED: strictBooleanFlag(),
-    // MCP personal tokens (PAT) default to NO expiry (unlimited lifetime).
-    // Turn this off to require an explicit expiry within
-    // MCP_PAT_MAX_TTL_DAYS (see packages/auth/src/mcp-config.ts) at mint
-    // time. Applies at mint time only; existing tokens are unaffected.
+    // Kill switch for direct public-provider egress. On by default. Off stops
+    // provider HTTP; on does not send data by itself — a pool still needs the
+    // owner's acknowledgement and a provider member. When on with no keyring,
+    // startup warns once and does not log the key.
+    WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: strictBooleanFlag(true),
+    // Kill switch for the MCP server and OAuth provider surface (jwt/mcp/cimd
+    // plugins, /mcp, discovery, MCP login/consent). On by default. Set false
+    // to omit those plugins and answer the MCP surface with real 404s. Human
+    // grant listing/revocation stays available while disabled.
+    WMP_MCP_ENABLED: strictBooleanFlag(true),
+    // MCP personal tokens default to 90 days when expiresAt is omitted.
+    // This flag still allows an explicit no-expiry (null) mint. Turn it off
+    // to refuse that choice; an omitted expiry stays 90 days, and a chosen
+    // timestamp must still fall within MCP_PAT_MAX_TTL_DAYS (see
+    // packages/auth/src/mcp-config.ts). Mint time only; existing tokens are
+    // unaffected. The flag's own default stays true.
     WMP_MCP_PAT_ALLOW_NO_EXPIRY: strictBooleanFlag(true),
     WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: strictBooleanFlag(),
     WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS: z

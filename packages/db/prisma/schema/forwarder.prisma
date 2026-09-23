@@ -219,6 +219,15 @@ enum CapacityLimitMode {
   UNLIMITED
 }
 
+/// Who last authored an inference capacity's hard concurrency limit. AUTO rows
+/// (created by discovery, the CLI report, or the startup backfill) may have a
+/// null limit filled in. USER rows were saved through a user-facing path; a null
+/// USER limit means explicitly unlimited and is never overwritten automatically.
+enum CapacityLimitSource {
+  AUTO
+  USER
+}
+
 enum AdmissionSourceKind {
   DIRECT
   POOL
@@ -248,31 +257,42 @@ enum CapacityLeaseState {
 }
 
 model CliDevice {
-  id                      String                @id @default(cuid(2))
-  createdAt               DateTime              @default(now())
-  updatedAt               DateTime              @default(now()) @updatedAt
-  userId                  String
-  slug                    String
-  label                   String
-  status                  CliConnectionStatus   @default(DISCONNECTED)
-  lastConnectedAt         DateTime?
-  lastDisconnectedAt      DateTime?
-  lastHeartbeatAt         DateTime?
-  connectionCount         Int                   @default(0)
-  inventorySeq            Int                   @default(0)
-  inventoryDigest         String?
-  inventoryAcknowledgedAt DateTime?
+  id                        String                @id @default(cuid(2))
+  createdAt                 DateTime              @default(now())
+  updatedAt                 DateTime              @default(now()) @updatedAt
+  userId                    String
+  slug                      String
+  label                     String
+  status                    CliConnectionStatus   @default(DISCONNECTED)
+  lastConnectedAt           DateTime?
+  lastDisconnectedAt        DateTime?
+  lastHeartbeatAt           DateTime?
+  connectionCount           Int                   @default(0)
+  inventorySeq              Int                   @default(0)
+  inventoryDigest           String?
+  inventoryAcknowledgedAt   DateTime?
   /// True only for a relay that negotiated complete-snapshot acknowledgements
   /// and endpoint targeting. Legacy 2.0 registration is visible but never
   /// represented as a confirmed published inventory.
-  inventoryConfirmed      Boolean               @default(false)
+  inventoryConfirmed        Boolean               @default(false)
   /// Whether this relay negotiated endpoint-targeted request frames. Legacy
   /// relays must never be allowed to replace their inventory with >1 endpoint.
-  endpointTargeting       Boolean               @default(false)
-  User                    User                  @relation("CliDeviceOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  CliTokens               CliToken[]
-  CliDeviceCredentials    CliDeviceCredential[]
-  Endpoints               Endpoint[]
+  endpointTargeting         Boolean               @default(false)
+  /// Server grants. Hello must not overwrite these; the dashboard does.
+  allowHumanTerminal        Boolean               @default(false)
+  allowMcpCommands          Boolean               @default(false)
+  cliVersion                String?
+  relayProtocolVersion      String?
+  /// Null until a 2.4 hello reports the CLI's own config. False is a report.
+  reportedHumanTerminal     Boolean?
+  reportedMcpCommands       Boolean?
+  reportedTerminalApproval  Boolean?
+  reportedTerminalSupported Boolean?
+  featuresReportedAt        DateTime?
+  User                      User                  @relation("CliDeviceOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  CliTokens                 CliToken[]
+  CliDeviceCredentials      CliDeviceCredential[]
+  Endpoints                 Endpoint[]
 
   @@unique([userId, slug])
   @@index([userId, status])
@@ -946,6 +966,7 @@ model ModelPool {
   CapacityWaiters                 CapacityWaiter[]
   CapacityLeases                  CapacityLease[]
   CacheAffinityRecords            CacheAffinityRecord[]
+  DashboardNotices                DashboardNotice[]
 
   @@unique([userId, slug])
   @@unique([id, userId])
@@ -1039,32 +1060,35 @@ model PoolMember {
 /// that points at the same runtime/cache identity. Scheduler state is durable
 /// so a restart cannot reset fairness credit.
 model InferenceCapacity {
-  id                   String                @id @default(cuid(2))
-  createdAt            DateTime              @default(now())
-  updatedAt            DateTime              @default(now()) @updatedAt
-  userId               String
-  label                String
-  hardConcurrencyLimit Int?
-  physicalMaxContext   Int?
-  countStrategy        CapacityCountStrategy @default(CONSERVATIVE_ESTIMATE)
+  id                         String                @id @default(cuid(2))
+  createdAt                  DateTime              @default(now())
+  updatedAt                  DateTime              @default(now()) @updatedAt
+  userId                     String
+  label                      String
+  hardConcurrencyLimit       Int?
+  /// AUTO limits may be filled by discovery/backfill; USER limits (including
+  /// null = unlimited) are only changed through user-facing writes.
+  hardConcurrencyLimitSource CapacityLimitSource   @default(AUTO)
+  physicalMaxContext         Int?
+  countStrategy              CapacityCountStrategy @default(CONSERVATIVE_ESTIMATE)
   /// Stable, application-computed fingerprint for the physical runtime tuple.
-  runtimeIdentityKey   String
-  runtimeModel         String
-  runtimeRevision      String?
-  tokenizer            String?
-  tokenizerVersion     String?
-  template             String?
-  templateVersion      String?
-  engine               String?
-  cacheNamespace       String?
-  schedulerCursor      Int                   @default(31)
-  schedulerDeficits    Json                  @default("[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]")
-  schedulerVersion     Int                   @default(1)
-  nextFencingToken     BigInt                @default(1)
-  User                 User                  @relation("InferenceCapacityOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ExecutionTargets     ExecutionTarget[]
-  CapacityWaiters      CapacityWaiter[]
-  CapacityLeases       CapacityLease[]
+  runtimeIdentityKey         String
+  runtimeModel               String
+  runtimeRevision            String?
+  tokenizer                  String?
+  tokenizerVersion           String?
+  template                   String?
+  templateVersion            String?
+  engine                     String?
+  cacheNamespace             String?
+  schedulerCursor            Int                   @default(31)
+  schedulerDeficits          Json                  @default("[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]")
+  schedulerVersion           Int                   @default(1)
+  nextFencingToken           BigInt                @default(1)
+  User                       User                  @relation("InferenceCapacityOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ExecutionTargets           ExecutionTarget[]
+  CapacityWaiters            CapacityWaiter[]
+  CapacityLeases             CapacityLease[]
 
   @@unique([userId, label])
   @@unique([userId, runtimeIdentityKey])
@@ -1199,6 +1223,29 @@ model PoolGrant {
   @@index([ownerUserId])
   @@index([granteeUserId])
   @@map("pool_grant")
+}
+
+enum DashboardNoticeKind {
+  POOL_EXTERNAL_PROVIDER
+}
+
+/// Durable in-app notice. Written in the same transaction as the pool change
+/// that requires it, before any email attempt.
+model DashboardNotice {
+  id        String              @id @default(cuid(2))
+  createdAt DateTime            @default(now())
+  userId    String
+  kind      DashboardNoticeKind
+  poolId    String?
+  /// Pool display name at notice time. Not a credential.
+  poolName  String
+  readAt    DateTime?
+  User      User                @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ModelPool ModelPool?          @relation(fields: [poolId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@index([userId, readAt, createdAt])
+  @@index([poolId])
+  @@map("dashboard_notice")
 }
 
 model ModelApiToken {

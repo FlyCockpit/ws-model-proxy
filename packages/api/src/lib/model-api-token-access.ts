@@ -7,8 +7,21 @@ import {
   PRODUCT_CREDENTIAL_PREFIXES,
   verifyForwarderHmacDigest,
 } from "@ws-model-proxy/db/forwarder-security";
+import {
+  effectiveProviderEgress,
+  egressProviderAccountLabels,
+  providerPrimaryMemberWhere,
+} from "./effective-provider-egress";
 import { parseModelApiSurface } from "./model-api-surface";
 import type { ModelApiSurface } from "./surface-capabilities";
+
+export {
+  effectiveProviderEgress,
+  grantPoolAccessServerMessage,
+  grantPoolAccessServerMessages,
+  providerPrimaryMemberCount,
+  providerPrimaryMemberWhere,
+} from "./effective-provider-egress";
 
 export const modelApiTokenScopeModes = ["ALL_VISIBLE", "ALLOWLIST"] as const;
 export type ModelApiTokenScopeMode = (typeof modelApiTokenScopeModes)[number];
@@ -45,9 +58,15 @@ export type VisibleModelPoolTarget = {
   protocolAdaptationEnabled: boolean;
   publicEgressEnabled: boolean;
   publicEgressAcknowledged: boolean;
-  /** True when this pool can send requests to any external provider, including PRIMARY. */
+  /**
+   * True when a grant must acknowledge provider egress: public overflow is on,
+   * or a PRIMARY member is a provider model. Overflow-only provider members
+   * do not count unless public overflow is on.
+   */
   effectiveProviderEgress: boolean;
   providerPrimaryMemberCount: number;
+  /** Display names of provider accounts that can receive traffic. Never credentials. */
+  providerAccountLabels: string[];
   allowLossyDeveloperRoleCollapse: boolean;
   recommendedSurfaceOverride: ModelApiSurface | null;
 };
@@ -97,11 +116,22 @@ const modelPoolSelect = {
   recommendedSurfaceOverride: true,
   PoolMembers: {
     where: {
-      tier: "PRIMARY",
-      routingStatus: "ACTIVE",
-      ExecutionTarget: { ProviderModel: { isNot: null } },
+      OR: [
+        providerPrimaryMemberWhere,
+        { tier: "PUBLIC_OVERFLOW", ExecutionTarget: { providerModelId: { not: null } } },
+      ],
     },
-    select: { id: true },
+    select: {
+      id: true,
+      tier: true,
+      ExecutionTarget: {
+        select: {
+          ProviderModel: {
+            select: { ProviderAccount: { select: { label: true } } },
+          },
+        },
+      },
+    },
   },
   User: { select: { slug: true } },
 } satisfies Prisma.ModelPoolSelect;
@@ -150,8 +180,22 @@ function serializeModelPool(
     protocolAdaptationEnabled: row.protocolAdaptationEnabled,
     publicEgressEnabled: row.publicEgressEnabled,
     publicEgressAcknowledged: row.publicEgressAcknowledged,
-    effectiveProviderEgress: row.publicEgressEnabled || (row.PoolMembers?.length ?? 0) > 0,
-    providerPrimaryMemberCount: row.PoolMembers?.length ?? 0,
+    effectiveProviderEgress: effectiveProviderEgress({
+      publicEgressEnabled: row.publicEgressEnabled,
+      providerPrimaryMemberCount: (row.PoolMembers ?? []).filter(
+        (member) => member.tier === "PRIMARY",
+      ).length,
+    }),
+    providerPrimaryMemberCount: (row.PoolMembers ?? []).filter(
+      (member) => member.tier === "PRIMARY",
+    ).length,
+    providerAccountLabels: egressProviderAccountLabels({
+      publicEgressEnabled: row.publicEgressEnabled,
+      members: (row.PoolMembers ?? []).map((member) => ({
+        tier: member.tier,
+        accountLabel: member.ExecutionTarget?.ProviderModel?.ProviderAccount.label ?? null,
+      })),
+    }),
     allowLossyDeveloperRoleCollapse: row.allowLossyDeveloperRoleCollapse,
     recommendedSurfaceOverride: parseModelApiSurface(row.recommendedSurfaceOverride),
   };

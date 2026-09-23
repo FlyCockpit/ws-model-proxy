@@ -78,6 +78,94 @@ const requiredFragments = [
 for (const fragment of requiredFragments) {
   if (!sql.includes(fragment)) throw new Error(`Missing schema-hardening fragment: ${fragment}`);
 }
+
+// Legacy user-saved hard limits are recovered from the audit trail as USER.
+// The strings must match what capacity-management.ts and
+// provider-management.ts write, and the backfill may only move AUTO to USER.
+const limitSourceBackfills = sql
+  .split(/;\s*\n/)
+  .filter((statement) => statement.includes("SET \"hardConcurrencyLimitSource\" = 'USER'"));
+if (limitSourceBackfills.length !== 2)
+  throw new Error("Expected two audit-based hardConcurrencyLimitSource USER backfills");
+const [capacityAuditBackfill, providerAuditBackfill] = limitSourceBackfills;
+for (const [name, statement, fragments] of [
+  [
+    "capacity audit",
+    capacityAuditBackfill,
+    [
+      "UPDATE inference_capacity capacity",
+      `WHERE capacity."hardConcurrencyLimitSource" = 'AUTO'`,
+      "FROM capacity_audit_event edit",
+      `edit."resourceType" = 'INFERENCE_CAPACITY'`,
+      `edit."resourceId" = capacity.id`,
+      `edit."userId" = capacity."userId"`,
+      "edit.after ? 'hardConcurrencyLimit'",
+      "edit.action = 'CREATE'",
+      "edit.action = 'UPDATE'",
+      "NOT (edit.after ? 'hardConcurrencyLimitSource')",
+    ],
+  ],
+  [
+    "provider audit",
+    providerAuditBackfill,
+    [
+      "UPDATE inference_capacity capacity",
+      `WHERE capacity."hardConcurrencyLimitSource" = 'AUTO'`,
+      "FROM provider_audit_event edit",
+      `target."providerModelId" = edit."subjectId"`,
+      "edit.action = 'MODEL_UPDATED'",
+      "edit.metadata ? 'nextConcurrencyLimit'",
+      "FROM capacity_audit_event attachment",
+      `attachment."resourceType" = 'EXECUTION_TARGET'`,
+      "attachment.action = 'UPDATE_POLICY'",
+      `attachment."resourceId" = target.id`,
+      "attachment.after ? 'inferenceCapacityId'",
+      `attachment."createdAt" <= edit."createdAt"`,
+      `ORDER BY attachment."createdAt" DESC, attachment.id DESC`,
+      ") = capacity.id",
+    ],
+  ],
+]) {
+  for (const fragment of fragments) {
+    if (!statement.includes(fragment))
+      throw new Error(`Missing ${name} limit-source backfill fragment: ${fragment}`);
+  }
+}
+const [capacityRouter, providerRouter] = await Promise.all([
+  readFile(new URL("../../api/src/routers/capacity-management.ts", import.meta.url), "utf8"),
+  readFile(new URL("../../api/src/routers/provider-management.ts", import.meta.url), "utf8"),
+]);
+for (const [name, contents, fragment] of [
+  [
+    "capacity create audit",
+    capacityRouter,
+    'action: "CREATE",\n          resourceType: "INFERENCE_CAPACITY"',
+  ],
+  [
+    "capacity update audit",
+    capacityRouter,
+    'action: "UPDATE",\n            resourceType: "INFERENCE_CAPACITY"',
+  ],
+  ["capacity update audit row", capacityRouter, "after: updated,"],
+  [
+    "direct policy audit",
+    capacityRouter,
+    'action: "UPDATE_POLICY",\n          resourceType: "EXECUTION_TARGET"',
+  ],
+  ["provider model audit", providerRouter, 'action: "MODEL_UPDATED"'],
+  ["provider model audit metadata", providerRouter, "nextConcurrencyLimit:"],
+]) {
+  if (!contents.includes(fragment))
+    throw new Error(`Limit-source backfill no longer matches the ${name}: ${fragment}`);
+}
+if (/SET\s+"hardConcurrencyLimitSource"\s*=\s*'AUTO'/.test(sql))
+  throw new Error("Schema hardening must never move hardConcurrencyLimitSource back to AUTO");
+const commitIndex = sql.lastIndexOf("COMMIT;");
+if (
+  sql.indexOf(providerAuditBackfill) > commitIndex ||
+  sql.indexOf(capacityAuditBackfill) < sql.indexOf("BEGIN;")
+)
+  throw new Error("Limit-source backfills must run inside the hardening transaction");
 for (const fragment of [
   "model InferenceCapacity",
   "runtimeIdentityKey",

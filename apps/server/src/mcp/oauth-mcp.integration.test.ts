@@ -124,6 +124,12 @@ const state = vi.hoisted(() => {
   };
 });
 
+vi.mock("../relay/cli-commands.js", () => ({
+  startCliCommand: vi.fn(),
+  waitCliCommand: vi.fn(),
+  snapshotCliCommand: vi.fn(),
+}));
+
 vi.mock("@ws-model-proxy/env/server", () => {
   const env = {
     WMP_MCP_ENABLED: true,
@@ -477,8 +483,8 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
           options?.issuerUrl === undefined
             ? {}
             : { resourceUrl: canonical, issuerUrl: issuer }),
-          onVerified: ({ authInfo, orpcContext, requestId, signal }) =>
-            bindMcpToolDispatch(authInfo, { orpcContext, requestId, signal }),
+          onVerified: ({ authInfo, orpcContext, requestId, signal, credential }) =>
+            bindMcpToolDispatch(authInfo, { orpcContext, requestId, signal, credential }),
         })(c),
       );
     }

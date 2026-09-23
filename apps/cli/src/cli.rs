@@ -83,4 +83,7 @@ pub enum Command {
 
     /// Generate shell completion scripts.
     Completions(crate::commands::completions::Args),
+
+    /// Approve browser identities and show the CLI identity for terminals.
+    Terminal(crate::commands::terminal::Args),
 }

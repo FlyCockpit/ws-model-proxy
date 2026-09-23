@@ -11,6 +11,16 @@ export const MCP_PAT_NAME_MAX_LENGTH = 120;
  */
 export const MCP_PAT_MAX_TTL_DAYS = 365;
 
+/**
+ * Lifetime applied when create omits expiresAt. Exactly 90×24 hours.
+ * Explicit null is still no expiry and is not this default.
+ */
+export const MCP_PAT_DEFAULT_TTL_MS = 90 * 86_400_000;
+
+export function mcpPatOmittedExpiresAt(now: Date): Date {
+  return new Date(now.getTime() + MCP_PAT_DEFAULT_TTL_MS);
+}
+
 export const MCP_PAT_MAX_TTL_MS = MCP_PAT_MAX_TTL_DAYS * 24 * 60 * 60 * 1000;
 
 /**

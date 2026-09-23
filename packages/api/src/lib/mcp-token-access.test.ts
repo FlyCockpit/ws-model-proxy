@@ -116,6 +116,7 @@ describe("authenticateMcpPersonalToken", () => {
       scopes: ["mcp:read", "mcp:write"],
       revokedAt: null,
       expiresAt: null,
+      allowCliCommands: true,
     });
 
     await expect(authenticateMcpPersonalToken(RAW, NOW)).resolves.toEqual({
@@ -125,6 +126,7 @@ describe("authenticateMcpPersonalToken", () => {
       scopes: ["mcp:read", "mcp:write"],
       expiresAt: null,
       lookupPrefix,
+      allowCliCommands: true,
     });
     // Throttled stamp: the where shape makes the DB rewrite only rows whose
     // lastUsedAt is null or older than the touch interval; a zero-row match

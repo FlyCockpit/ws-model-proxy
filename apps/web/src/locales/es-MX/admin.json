@@ -201,6 +201,25 @@
       "deleteAllConfirmToken": "DELETE ALL",
       "deleteAllConfirmPrompt": "Escribe DELETE ALL para confirmar.",
       "deleteAllCopyLabel": "Copiar texto de confirmacion"
+    },
+    "deploymentFeatures": {
+      "title": "Funciones del despliegue",
+      "description": "Indicadores de solo lectura de este despliegue. Cambialos en el entorno y reinicia.",
+      "on": "Activado",
+      "off": "Desactivado",
+      "configured": "Configurado",
+      "missing": "Ausente",
+      "ready": "Listo",
+      "notReady": "No listo",
+      "flags": {
+        "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED": "Salida directa a proveedores publicos.",
+        "keyringConfigured": "Si WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS esta definido. La clave nunca se muestra.",
+        "ready": "La salida esta activada y el llavero de credenciales esta configurado.",
+        "WMP_MCP_ENABLED": "Servidor MCP y superficie de proveedor OAuth.",
+        "WMP_MCP_PAT_ALLOW_NO_EXPIRY": "Permitir tokens personales MCP sin caducidad.",
+        "WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS": "Permitir URL de proveedor privadas y de loopback.",
+        "SIGNUP_ENABLED": "Registro publico. Un ajuste de la base de datos puede anular la variable de entorno."
+      }
     }
   },
   "users": {

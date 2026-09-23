@@ -368,7 +368,6 @@ export function providerEgressFromAppConfig(data: unknown): boolean {
 
 export type GuardedPoolWizardSchemaInput = {
   providerEgressEnabled: boolean;
-  protocolAdaptationAvailable: boolean;
   directModels: readonly GuardedWizardLocalModel[];
   providerModels: readonly GuardedWizardProviderModel[];
   capacities: readonly GuardedWizardCapacity[];
@@ -451,7 +450,7 @@ export function buildGuardedPoolWizardSchema(input: GuardedPoolWizardSchemaInput
           value.providerModelIds,
           input.providerModels,
           value.providerTier,
-          input.protocolAdaptationAvailable && value.protocolAdaptationEnabled,
+          value.protocolAdaptationEnabled,
         )
       )
         ctx.addIssue({ code: "custom", path: ["recommendedSurface"] });

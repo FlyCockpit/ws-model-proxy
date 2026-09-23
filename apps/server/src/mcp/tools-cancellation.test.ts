@@ -20,7 +20,6 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     BETTER_AUTH_URL: "https://proxy.example.com",
     WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
     WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS: "v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-    MODEL_API_GLOBAL_CAPACITY_ENABLED: false,
     NODE_ENV: "test",
     RATE_LIMIT_MCP_POINTS: 1000,
     RATE_LIMIT_MCP_DURATION: 60,
@@ -33,6 +32,12 @@ vi.mock("@ws-model-proxy/env/shared", () => ({
     NODE_ENV: "test",
   },
 }));
+vi.mock("../relay/cli-commands.js", () => ({
+  startCliCommand: vi.fn(),
+  waitCliCommand: vi.fn(),
+  snapshotCliCommand: vi.fn(),
+}));
+
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
   const { withDbShutdownFence } = await import("@ws-model-proxy/db/shutdown-fence");

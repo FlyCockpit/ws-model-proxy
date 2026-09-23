@@ -12,6 +12,7 @@ import {
   texts,
   validateToolChoice,
 } from "./parse-utils.js";
+import { type ReasoningRenderControl, reasoningWireFieldsForRequest } from "./request-controls.js";
 
 const ROOT_KEYS = [
   "model",
@@ -198,7 +199,14 @@ function responseInstructionText(value: unknown, parameter: string) {
 export function renderOpenAiResponsesRequest(
   request: CanonicalRequest,
   model: string,
+  options: { reasoning?: ReasoningRenderControl } = {},
 ): Record<string, unknown> {
+  if (request.sampling.topK !== undefined) unsupported("top_k");
+  const reasoningFields = reasoningWireFieldsForRequest(
+    request,
+    "openai-responses",
+    options.reasoning,
+  );
   if (request.sampling.stop?.length)
     unsupported("stop", "OpenAI Responses has no lossless stop-sequence control");
   const input: Record<string, unknown>[] = request.instructions.map((instruction) => ({
@@ -280,6 +288,7 @@ export function renderOpenAiResponsesRequest(
     ...(request.sampling.maxOutputTokens !== undefined
       ? { max_output_tokens: request.sampling.maxOutputTokens }
       : {}),
+    ...reasoningFields,
   };
 }
 

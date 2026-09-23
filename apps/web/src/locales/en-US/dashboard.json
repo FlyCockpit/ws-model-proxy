@@ -30,7 +30,16 @@
     },
     "searchPlaceholder": "Search model ID, upstream ID, endpoint, or label",
     "noSearchResults": "No endpoints or models match that search.",
-    "title": "CLIs, Endpoints, and Models"
+    "title": "CLIs, Endpoints, and Models",
+    "features": {
+      "terminal": "Browser terminal",
+      "commands": "MCP commands",
+      "saved": "CLI feature access updated",
+      "saveFailed": "Couldn't update CLI feature access. Try again.",
+      "windows": "Not supported on Windows yet",
+      "configDisabled": "Disabled in this CLI's wsmp config — edit and restart wsmp",
+      "updateWsmp": "Update wsmp to use this"
+    }
   },
   "chatTest": {
     "announcements": {
@@ -111,12 +120,12 @@
     "samplePromptOne": "Explain this model's capabilities.",
     "samplePromptTwo": "Give me a concise test plan.",
     "routingMode": {
-      "label": "Pool route mode",
-      "PREFER_NATIVE": "Preferred API (native first)",
-      "REQUIRE_NATIVE": "Require native Chat API",
-      "REQUIRE_ADAPTED": "Require adapted Chat API",
-      "help": "Native mode rejects adapted members; adapted mode rejects native members. Unsupported modes fail without silently changing the route.",
-      "directHelp": "Direct models always use their native Chat API."
+      "label": "Chat test route",
+      "PREFER_NATIVE": "Try members that speak this API first",
+      "REQUIRE_NATIVE": "Only members that speak this API",
+      "REQUIRE_ADAPTED": "Only members that need translation",
+      "help": "Affects this chat test only. API clients such as OpenCode always try members that speak the requested API first, then translated members.",
+      "directHelp": "Direct models always use their own API. This control applies to pools."
     },
     "reasoning": {
       "label": "Reasoning level",
@@ -164,6 +173,11 @@
     "title": "Chat Test",
     "transcript": "Chat transcript",
     "user": "User"
+  },
+  "deploymentFeatures": {
+    "unavailable": "Not available on this deployment.",
+    "privateNetworkAdmin": "Private and loopback URLs are rejected. Set `WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS=true`.",
+    "privateNetworkUser": "Private and loopback URLs are rejected."
   },
   "description": "Operate connected CLIs, model pools, credentials, and relay metadata.",
   "endpoints": {
@@ -214,19 +228,118 @@
       "OPENAI_RESPONSES": "OpenAI Responses"
     }
   },
+  "terminals": {
+    "title": "Terminals",
+    "description": "Open a shell on one of your CLIs. Keystrokes stay encrypted between this browser and the CLI.",
+    "empty": "No terminals open. Start one from a CLI that allows browser terminals.",
+    "emptyClis": "No CLI devices have registered yet.",
+    "loading": "Loading terminals",
+    "add": "New terminal",
+    "close": "Stop viewing this terminal",
+    "cliList": "Choose a CLI",
+    "reconnecting": "Reconnecting to the terminal service…",
+    "exited": "The shell exited.",
+    "gone": "This terminal ended while you were disconnected.",
+    "rejected": "The CLI rejected this terminal ({{reason}}).",
+    "error": "The terminal connection hit an error.",
+    "inputDropped": "Some input was not delivered because it arrived too fast. Check the last command before you continue.",
+    "openElsewhere": "This terminal is open in another browser tab.",
+    "viewHere": "View here",
+    "slowReconnecting": "This tab fell behind the terminal output. Reconnecting…",
+    "actions": "Terminal actions",
+    "endSession": "End session",
+    "endSessionTitle": "End this terminal session?",
+    "endSessionDescription": "The shell stops for everyone viewing it. Unsaved work in it is lost.",
+    "status": {
+      "youTyping": "You're typing",
+      "otherTyping": "Someone else is typing",
+      "viewers_one": "{{count}} viewer",
+      "viewers_other": "{{count}} viewers",
+      "following": "Viewing at {{cols}}×{{rows}}. Type here to take over."
+    },
+    "approvalTitle": "This CLI needs approval",
+    "approvalInstructions": "Run this command on that machine, then open the terminal again.",
+    "approvalCodeLabel": "Approval code",
+    "copyCommand": "Copy command",
+    "copied": "Command copied",
+    "reasons": {
+      "notGranted": "Not granted for this CLI",
+      "offline": "CLI is offline",
+      "unavailable": "Terminal is unavailable"
+    },
+    "rejection": {
+      "disabled": "Disabled in the CLI config",
+      "unsupported": "Not supported on this machine",
+      "limit": "Too many terminals are already open",
+      "approval_required": "This browser is not approved yet",
+      "bad_signature": "The approval signature was rejected",
+      "bad_handshake": "The terminal handshake was invalid",
+      "bad_cwd": "The CLI home directory is not usable",
+      "spawn_failed": "The shell could not be started",
+      "not_found": "Terminal not found",
+      "already_open": "That terminal is already open",
+      "expired": "The approval request expired",
+      "not_granted": "Not granted for this CLI",
+      "device_disabled": "Disabled in the CLI config",
+      "cli_too_old": "Update wsmp to use terminals",
+      "offline": "CLI is offline",
+      "invalid": "That terminal request was invalid",
+      "viewer_limit": "Too many tabs are already viewing this terminal",
+      "bad_frame": "The CLI dropped this tab after a bad frame",
+      "identity_changed": "This CLI's identity key changed",
+      "identity_invalid": "This CLI did not prove its identity",
+      "identity_mismatch": "The CLI answered with a key its identity did not sign"
+    },
+    "identity": {
+      "title": "CLI identities",
+      "description": "Browsers pin each CLI's identity key the first time they see it. Compare a fingerprint with `wsmp terminal fingerprint` on that machine.",
+      "fingerprint": "Fingerprint",
+      "checking": "Checking identity…",
+      "offline": "Offline",
+      "unpinned": "This browser could not save the key. Compare the fingerprint before you type anything sensitive.",
+      "unverified": "Unverified. Update the CLI to verify its identity.",
+      "invalid": "This CLI did not prove its identity. Its terminals are blocked.",
+      "changed": "This CLI's identity key changed. Its terminals are blocked until you trust the new key.",
+      "downgraded": "This CLI no longer proves its identity. Its terminals are blocked until you allow it.",
+      "pinned": "Pinned",
+      "new": "New",
+      "trustNew": "Trust new key",
+      "allowUnverified": "Allow unverified",
+      "trustTitle": "Trust the new key for {{label}}?",
+      "trustDescription": "Only continue if you ran `wsmp terminal fingerprint` on that machine and it matches. Otherwise someone may be intercepting your terminal.",
+      "trustFailed": "The key could not be trusted. Reload and try again.",
+      "keyChangedAgain": "The key changed again before it could be trusted. Nothing was pinned. Compare the new fingerprint and try again.",
+      "activeUnverified": "This CLI's identity is unverified. Update the CLI to verify it."
+    }
+  },
   "nav": {
     "ariaLabel": "Dashboard sections",
     "chatTest": "Chat test",
     "capacity": "Capacity",
     "cliTokens": "CLI tokens",
     "clis": "CLIs",
+    "collapseSidebar": "Collapse sidebar",
+    "expandSidebar": "Expand sidebar",
     "modelApiTokens": "Model API tokens",
     "overview": "Overview",
     "pools": "Pools",
-    "relayMetadata": "Relay metadata"
+    "relayMetadata": "Relay metadata",
+    "terminals": "Terminals"
+  },
+  "notices": {
+    "region": "Notices",
+    "dismiss": "Dismiss",
+    "poolExternalProvider": "{{pool}} may send requests to an external provider."
   },
   "pools": {
     "notFound": "This pool was not found or is no longer available to you.",
+    "privacyBadge": {
+      "private": "Private",
+      "external": "May use external providers"
+    },
+    "granteePrivacyConfirmTitle": "This pool may send data to an external provider",
+    "granteePrivacyConfirmDescription": "{{pool}} is already shared. Requests from these people may leave this deployment. They will be notified. Their access is not paused.",
+    "granteePrivacyConfirmAction": "Confirm and continue",
     "affinity": {
       "title": "Cache-aware routing",
       "description": "New sessions go to the member with the best availability score (load, health, public-egress, and cost). When those scores tie, prefer a runtime that may still hold a matching instruction prefix. System-prompt-aware routing is part of this switch. After an assistant or tool turn, prefer the member that served the conversation so far. A long conversation can outweigh modest load or a half-open member; a large queue still spills the request.",
@@ -319,7 +432,6 @@
     "allowLossyDeveloperRoleCollapse": "Allow lossy developer-role collapse",
     "compatibilityDetails": "Protocol compatibility matrix",
     "enableProtocolAdaptation": "Enable strict-subset protocol adaptation",
-    "protocolAdaptationDisabledReason": "Protocol translation is turned off for this deployment.",
     "lossyDeveloperRoleWarning": "Warning: developer instructions may be merged into the system role. Requests containing both roles remain rejected unless this is enabled.",
     "limitations": {
       "native_extensions_unavailable": "native extensions unavailable",
@@ -426,7 +538,7 @@
       "description": "Choose local capacity first, then explicitly decide whether requests may leave your infrastructure.",
       "disabled": "Disabled",
       "egressRequired": "Acknowledge provider egress before attaching any provider target.",
-      "egressWarning": "Provider PRIMARY requests, and overflow requests when enabled, send prompts, attachments, tool definitions, and generated output outside this deployment. The deployment release gate and durable global capacity admission must also be enabled.",
+      "egressWarning": "Provider PRIMARY requests, and overflow requests when enabled, send prompts, attachments, tool definitions, and generated output outside this deployment.",
       "enabled": "Enabled",
       "fields": {
         "concurrency": "Physical concurrency ceiling",
@@ -460,7 +572,7 @@
         "borrowPolicyHint": "Whether this pool may run on idle slots other pools reserved on the shared runtime. NEVER keeps it off them; WHEN_IDLE (default) allows it unless a higher-priority queued request of theirs needs the slot.",
         "protocolAdaptationEnabled": "Allow strict protocol adaptation when a native surface is unavailable",
         "allowLossyDeveloperRoleCollapse": "Allow lossy developer/instruction role collapse",
-        "protocolAdaptationHint": "Adaptation strictly translates requests between API surfaces when a member has no native one. It requires the deployment protocol-adaptation gate; without it the non-native options stay disabled.",
+        "protocolAdaptationHint": "Adaptation strictly translates requests between API surfaces when a member has no native one. Turn it on for this pool to allow non-native options.",
         "affinityEnabled": "Enable cache-affinity routing hints",
         "affinityEnabledHint": "On by default. Requests that continue the same conversation prefer the same member to reuse its warm caches; turn this off to route purely by load.",
         "affinityTtlSeconds": "Affinity record lifetime (seconds)",
@@ -598,7 +710,7 @@
     "grantTitle": "Grant pool access",
     "grantEgressWarning": "Granting {{pool}} lets this user send prompts, attachments, tools, and output to configured providers used as primary targets or public overflow. Provider charges may apply.",
     "grantEgressWarningTitle": "This grant can use external-provider egress",
-    "grantEgressAcknowledge": "I understand this user's requests can leave the local deployment through this pool's providers.",
+    "grantEgressAcknowledge": "I understand requests on this pool may be sent to a provider, including when public overflow is on, and that provider charges may apply.",
     "memberTestSurface": "Member test API surface",
     "memberTestMode": "Member test execution mode",
     "memberTestSurfaces": {
@@ -764,8 +876,9 @@
     "scopeMode": "Scope mode",
     "typeTokenName": "Type the token name to confirm",
     "visiblePreview": "{{count}} models visible to this token",
-    "publicEgressWarningTitle": "Some resources can use external providers",
-    "publicEgressWarning": "This token can access {{pools}}. Requests to these pools may send prompts, attachments, tools, and output to configured providers used as primary targets or public overflow."
+    "publicEgressWarningTitle": "Some pools may send data outside this deployment",
+    "publicEgressWarning": "Requests to {{pools}} may leave this deployment. Prompts, attachments, tools, and output can be sent to an external provider.",
+    "publicEgressWarningNamed": "Requests to {{pools}} may leave this deployment. Prompts, attachments, tools, and output can be sent to {{providers}}."
   },
   "providers": {
     "title": "Public provider operations",

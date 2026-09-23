@@ -78,12 +78,29 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # A single shared tokenizer makes fallback throughput comparable across
 # heterogeneous upstream models. Pin to the MSRV-compatible release.
 tiktoken-rs = "=0.12.0"
+# Terminal session crypto. Versions stay on the digest 0.11 line with sha2 0.11.
+hkdf = "0.13"
+aes-gcm = "0.11"
+base64 = "0.23"
+p256 = { version = "0.14", features = ["ecdh"] }
 
 [target.'cfg(unix)'.dependencies]
 # Maintained Unix API wrapper used only for authenticated local-control peer
-# credentials. `socket` exposes SO_PEERCRED/LOCAL_PEERCRED and `user` exposes
-# the current effective UID without unsafe FFI.
-nix = { version = "0.31", default-features = false, features = ["fs", "socket", "user"] }
+# credentials and for killing terminal/exec process groups. `socket` exposes
+# SO_PEERCRED/LOCAL_PEERCRED and `user` exposes the current effective UID
+# without unsafe FFI. `signal` covers process-group SIGKILL.
+nix = { version = "0.31", default-features = false, features = ["fs", "socket", "user", "signal", "process", "poll"] }
+# Unix PTY. Its unsafe code stays inside the crate (`unsafe_code` is forbid
+# here). Windows v1 reports terminals unsupported and does not link this crate.
+portable-pty = "0.9"
+# `dup(2)` of the PTY master. Opening `/proc/self/fd/N` follows the ptmx
+# symlink and allocates a new pty, so the reader cannot poll that path.
+filedescriptor = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+# Console control events (Ctrl-C, Ctrl-Break, close, shutdown) start the same
+# bounded relay shutdown as SIGINT/SIGTERM on Unix. Unix keeps `sigwait`.
+tokio = { version = "1", features = ["signal"] }
 
 [dev-dependencies]
 # Black-box CLI testing: run the built binary and assert on stdout/stderr/exit.

@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   endOfLocalDay,
   latestMcpPatCustomDate,
+  MCP_PAT_DEFAULT_TTL_MS,
   MCP_PAT_NAME_MAX_LENGTH,
   MCP_PAT_NO_EXPIRY_DISABLED_REASON,
   mcpPatClientExpiryCapMs,
@@ -54,6 +55,10 @@ import { InlineRetry } from "@/components/inline-retry";
 import { isBadRequest, isConflict, isForbidden } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 
+function tokenAllowsCliCommands(token: object): boolean {
+  return Object.getOwnPropertyDescriptor(token, "allowCliCommands")?.value === true;
+}
+
 function copyToClipboard(value: string, message: string) {
   void navigator.clipboard.writeText(value).then(() => toast.success(message));
 }
@@ -65,6 +70,9 @@ const EXPIRY_CUSTOM = "custom";
 const EXPIRY_PRESET_DAYS = { "30": 30, "90": 90, "180": 180, "365": 365 } as const;
 
 type ExpiryChoice = typeof EXPIRY_NONE | keyof typeof EXPIRY_PRESET_DAYS | typeof EXPIRY_CUSTOM;
+
+// Product default, whether or not the deployment allows a no-expiry token.
+const DEFAULT_EXPIRY_CHOICE = "90" satisfies ExpiryChoice;
 
 function toLocalDateInput(date: Date): string {
   const month = String(date.getMonth() + 1).padStart(2, "0");
@@ -88,8 +96,11 @@ function resolveExpiresAtIso(
     const end = endOfLocalDay(new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
     return new Date(Math.min(end.getTime(), capMs)).toISOString();
   }
-  const days = EXPIRY_PRESET_DAYS[choice];
-  return new Date(Math.min(now.getTime() + days * 24 * 60 * 60 * 1000, capMs)).toISOString();
+  const durationMs =
+    choice === DEFAULT_EXPIRY_CHOICE
+      ? MCP_PAT_DEFAULT_TTL_MS
+      : EXPIRY_PRESET_DAYS[choice] * 86_400_000;
+  return new Date(Math.min(now.getTime() + durationMs, capMs)).toISOString();
 }
 
 function errorRecord(error: unknown): Record<string, unknown> | null {
@@ -136,8 +147,8 @@ export function McpTokensPanel({
   const [createOpen, setCreateOpen] = useState(false);
   const [name, setName] = useState("");
   const [allowWrite, setAllowWrite] = useState(false);
-  const defaultExpiryChoice: ExpiryChoice = allowNoExpiry ? EXPIRY_NONE : "90";
-  const [expiryChoice, setExpiryChoice] = useState<ExpiryChoice>(defaultExpiryChoice);
+  const [allowCliCommands, setAllowCliCommands] = useState(false);
+  const [expiryChoice, setExpiryChoice] = useState<ExpiryChoice>(DEFAULT_EXPIRY_CHOICE);
   const [customDate, setCustomDate] = useState("");
   const [secret, setSecret] = useState("");
   const [showRevoked, setShowRevoked] = useState(false);
@@ -238,7 +249,8 @@ export function McpTokensPanel({
                 if (!open) {
                   setName("");
                   setAllowWrite(false);
-                  setExpiryChoice(defaultExpiryChoice);
+                  setAllowCliCommands(false);
+                  setExpiryChoice(DEFAULT_EXPIRY_CHOICE);
                   setCustomDate("");
                   setSecret("");
                 }
@@ -266,11 +278,13 @@ export function McpTokensPanel({
                     if (!nameIsValid || customDateBlocked || secret) return;
                     const expiresAt = resolveExpiresAtIso(expiryChoice, customDate);
                     if (expiryChoice !== EXPIRY_NONE && expiresAt === null) return;
-                    create.mutate({
+                    const createInput = {
                       name: trimmedName,
                       allowWrite,
+                      allowCliCommands: allowWrite && allowCliCommands,
                       expiresAt,
-                    });
+                    };
+                    create.mutate(createInput);
                   }}
                 >
                   {secret ? (
@@ -300,7 +314,11 @@ export function McpTokensPanel({
                         <Checkbox
                           id="mcp-token-write"
                           checked={allowWrite}
-                          onCheckedChange={(checked) => setAllowWrite(checked === true)}
+                          onCheckedChange={(checked) => {
+                            const next = checked === true;
+                            setAllowWrite(next);
+                            if (!next) setAllowCliCommands(false);
+                          }}
                         />
                         <div className="space-y-1">
                           <Label htmlFor="mcp-token-write">
@@ -311,6 +329,23 @@ export function McpTokensPanel({
                           </p>
                         </div>
                       </div>
+                      {allowWrite ? (
+                        <div className="flex min-h-[44px] items-start gap-3">
+                          <Checkbox
+                            id="mcp-token-cli-commands"
+                            checked={allowCliCommands}
+                            onCheckedChange={(checked) => setAllowCliCommands(checked === true)}
+                          />
+                          <div className="space-y-1">
+                            <Label htmlFor="mcp-token-cli-commands">
+                              {t("settings:mcp.tokens.allowCliCommands")}
+                            </Label>
+                            <p className="text-sm text-muted-foreground">
+                              {t("settings:mcp.tokens.allowCliCommandsHelp")}
+                            </p>
+                          </div>
+                        </div>
+                      ) : null}
                       <div className="space-y-2">
                         <Label htmlFor="mcp-token-expiry">
                           {t("settings:mcp.tokens.expiryLabel")}
@@ -340,6 +375,11 @@ export function McpTokensPanel({
                         <p className="text-sm text-muted-foreground">
                           {t("settings:mcp.tokens.expiryHelp")}
                         </p>
+                        {expiryChoice === EXPIRY_NONE && allowCliCommands ? (
+                          <p className="text-sm text-destructive" role="status">
+                            {t("settings:mcp.tokens.allowCliCommandsNoExpiryWarning")}
+                          </p>
+                        ) : null}
                       </div>
                       {expiryChoice === EXPIRY_CUSTOM ? (
                         <div className="space-y-2">
@@ -449,6 +489,11 @@ export function McpTokensPanel({
                         ) : expired ? (
                           <span className="shrink-0 rounded bg-muted px-2 py-0.5 text-xs text-muted-foreground">
                             {t("settings:mcp.tokens.expiredBadge")}
+                          </span>
+                        ) : null}
+                        {tokenAllowsCliCommands(token) ? (
+                          <span className="shrink-0 rounded bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                            {t("settings:mcp.tokens.allowCliCommandsBadge")}
                           </span>
                         ) : null}
                       </div>

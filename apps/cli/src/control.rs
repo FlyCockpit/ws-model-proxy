@@ -104,6 +104,8 @@ pub struct ControlServer {
     listener: UnixListener,
     path: PathBuf,
     clients: Vec<ControlClient>,
+    /// Removes the socket file if a forced shutdown skips `Drop`.
+    _exit_cleanup: crate::shutdown::ExitCleanup,
 }
 #[cfg(unix)]
 pub struct PendingRequest {
@@ -139,10 +141,15 @@ impl ControlServer {
             .with_context(|| format!("binding relay control socket `{}`", path.display()))?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
+        let socket_path = path.clone();
+        let exit_cleanup = crate::shutdown::register_exit_cleanup(move || {
+            let _ = fs::remove_file(&socket_path);
+        });
         Ok(Self {
             listener,
             path,
             clients: Vec::new(),
+            _exit_cleanup: exit_cleanup,
         })
     }
 

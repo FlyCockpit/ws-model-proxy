@@ -1,0 +1,5 @@
+{
+  "subject": "{{pool}} puede enviar solicitudes a un proveedor externo",
+  "heading": "Un grupo compartido ya no es privado",
+  "body": "Hola {{name}}, {{pool}} ahora puede enviar solicitudes a un proveedor externo. Las instrucciones, los adjuntos, las herramientas y los resultados pueden salir de esta instalación. Tu acceso no se pausa."
+}
