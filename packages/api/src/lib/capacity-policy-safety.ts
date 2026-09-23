@@ -50,13 +50,6 @@ export const modelPoolCapacityPolicyFields = {
   capacityContextMargin: z.number().int().min(0).max(10_000_000).optional(),
 };
 
-export function assertCapacityManagementEnabled(capacityEnabled: boolean): void {
-  if (!capacityEnabled)
-    throw new ORPCError("NOT_FOUND", {
-      message: "Capacity management is disabled for this deployment.",
-    });
-}
-
 export function assertModelPoolCapacityPolicy(
   input: {
     concurrencyLimit: number | null | undefined;

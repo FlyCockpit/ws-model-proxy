@@ -50,7 +50,7 @@ import { chatMediaConfigQueryKey, useChatMediaConfig } from "@/hooks/use-chat-me
 import { useChatRelaySettings } from "@/hooks/use-chat-relay-settings";
 import { useChatScrollEngine } from "@/hooks/use-chat-scroll-engine";
 import { useChatThread } from "@/hooks/use-chat-thread";
-import { useDeploymentAudience } from "@/hooks/use-deployment-audience";
+
 import { useIsDesktop } from "@/hooks/use-media-query";
 import { useRevokeAttachmentsOnUnmount } from "@/hooks/use-revoke-attachments-on-unmount";
 import {
@@ -67,7 +67,7 @@ import {
   streamChatCompletion,
   withSystemPrompt as withRelaySystemPrompt,
 } from "@/lib/chat-test-relay";
-import { anthropicMessagesEnabledFromConfig } from "@/lib/deployment-feature-gate";
+
 import {
   acceptedAttachmentAcceptAttr,
   attachmentFileInfo,
@@ -138,12 +138,6 @@ export function ChatTestPage({ lang }: { lang: string }) {
     refetch: refetchVisibleModels,
   } = useQuery(orpc.forwarderManagement.visibleModels.queryOptions());
   const queryClient = useQueryClient();
-  const appConfig = useQuery(orpc.appConfig.queryOptions());
-  const { isAdmin: isDeploymentAdmin } = useDeploymentAudience();
-  const anthropicMessagesEnabled = anthropicMessagesEnabledFromConfig(
-    appConfig.data,
-    appConfig.isError,
-  );
   const { data: mediaConfig } = useChatMediaConfig();
   const mediaEnabled = mediaConfig?.enabled ?? false;
   const mediaMaxUploadBytes = mediaConfig?.maxUploadBytes ?? 0;
@@ -214,7 +208,7 @@ export function ChatTestPage({ lang }: { lang: string }) {
   const preferredSurface: ChatTestSurface | null =
     recommendedSurface === "OPENAI_CHAT_COMPLETIONS" ||
     recommendedSurface === "OPENAI_RESPONSES" ||
-    (recommendedSurface === "ANTHROPIC_MESSAGES" && anthropicMessagesEnabled)
+    recommendedSurface === "ANTHROPIC_MESSAGES"
       ? recommendedSurface
       : null;
   const effectiveSurface: ChatTestSurface | null =
@@ -222,9 +216,7 @@ export function ChatTestPage({ lang }: { lang: string }) {
       ? "OPENAI_CHAT_COMPLETIONS"
       : surfaceSelection === "PREFERRED"
         ? preferredSurface
-        : surfaceSelection === "ANTHROPIC_MESSAGES" && !anthropicMessagesEnabled
-          ? null
-          : surfaceSelection;
+        : surfaceSelection;
   const surfaceReasoning = effectiveSurface
     ? selectedModel?.reasoning[effectiveSurface]
     : undefined;
@@ -1150,8 +1142,6 @@ export function ChatTestPage({ lang }: { lang: string }) {
                   anthropicMaxTokens={anthropicMaxTokens}
                   onAnthropicMaxTokensChange={setAnthropicMaxTokens}
                   disabled={isStreaming || isPreparingSend}
-                  anthropicMessagesEnabled={anthropicMessagesEnabled}
-                  isDeploymentAdmin={isDeploymentAdmin}
                   onSurfaceChange={handleSurfaceChange}
                   onRoutingModeChange={handleRoutingModeChange}
                   onReasoningChange={setReasoningSelection}
@@ -1222,8 +1212,6 @@ export function ChatTestPage({ lang }: { lang: string }) {
                 anthropicMaxTokens={anthropicMaxTokens}
                 onAnthropicMaxTokensChange={setAnthropicMaxTokens}
                 disabled={isStreaming || isPreparingSend}
-                anthropicMessagesEnabled={anthropicMessagesEnabled}
-                isDeploymentAdmin={isDeploymentAdmin}
                 onSurfaceChange={handleSurfaceChange}
                 onRoutingModeChange={handleRoutingModeChange}
                 onReasoningChange={setReasoningSelection}

@@ -20,7 +20,6 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     BETTER_AUTH_SECRET: "test-better-auth-secret",
     BETTER_AUTH_URL: "https://proxy.example.com",
     WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
-    MODEL_API_GLOBAL_CAPACITY_ENABLED: true,
     NODE_ENV: "test",
     // auth.ts builds the MCP rate limiters at module scope (the full-chain
     // test below imports it).

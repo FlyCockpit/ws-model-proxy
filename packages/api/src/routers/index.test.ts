@@ -8,9 +8,6 @@ import type { Context } from "../context";
 const envMock = {
   SMTP_HOST: undefined as string | undefined,
   SIGNUP_ENABLED: true,
-  MODEL_API_ANTHROPIC_ENABLED: false,
-  MODEL_API_GLOBAL_CAPACITY_ENABLED: false,
-  MODEL_API_PROTOCOL_ADAPTATION_ENABLED: false,
   WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: false,
   WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS: undefined as string | undefined,
   WMP_MCP_ENABLED: false,
@@ -57,9 +54,6 @@ describe("appConfig", () => {
   beforeEach(() => {
     envMock.SMTP_HOST = undefined;
     envMock.SIGNUP_ENABLED = true;
-    envMock.MODEL_API_ANTHROPIC_ENABLED = false;
-    envMock.MODEL_API_GLOBAL_CAPACITY_ENABLED = false;
-    envMock.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = false;
     envMock.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = false;
     envMock.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS = undefined;
     envMock.WMP_MCP_ENABLED = false;
@@ -93,9 +87,6 @@ describe("appConfig", () => {
 
     expect(config).toEqual({
       deploymentFeatures: {
-        MODEL_API_ANTHROPIC_ENABLED: false,
-        MODEL_API_PROTOCOL_ADAPTATION_ENABLED: false,
-        MODEL_API_GLOBAL_CAPACITY_ENABLED: false,
         WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: {
           enabled: false,
           keyringConfigured: false,
@@ -111,27 +102,16 @@ describe("appConfig", () => {
       ssoProviderName: "SSO",
       signupEnabled: false,
       adminBootstrapSignupEnabled: false,
-      capacityEnabled: false,
-      protocolAdaptationAvailable: false,
       providerEgressEnabled: false,
       emailEnabled: true,
     });
     expect(config.signupEnabled).toBe(config.deploymentFeatures.SIGNUP_ENABLED);
-    expect(config.capacityEnabled).toBe(
-      config.deploymentFeatures.MODEL_API_GLOBAL_CAPACITY_ENABLED,
-    );
-    expect(config.protocolAdaptationAvailable).toBe(
-      config.deploymentFeatures.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
-    );
     expect(config.providerEgressEnabled).toBe(
       config.deploymentFeatures.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED.enabled,
     );
   });
 
   it("reports deployment features and keeps legacy aliases aligned", async () => {
-    envMock.MODEL_API_ANTHROPIC_ENABLED = true;
-    envMock.MODEL_API_GLOBAL_CAPACITY_ENABLED = true;
-    envMock.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = true;
     envMock.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
     envMock.WMP_MCP_ENABLED = true;
     envMock.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS = true;
@@ -144,9 +124,6 @@ describe("appConfig", () => {
       ready: false,
     });
     expect(missingKeyring.providerEgressEnabled).toBe(true);
-    expect(missingKeyring.capacityEnabled).toBe(true);
-    expect(missingKeyring.protocolAdaptationAvailable).toBe(true);
-    expect(missingKeyring.deploymentFeatures.MODEL_API_ANTHROPIC_ENABLED).toBe(true);
     expect(missingKeyring.deploymentFeatures.WMP_MCP_ENABLED).toBe(true);
     expect(missingKeyring.deploymentFeatures.WMP_MCP_PAT_ALLOW_NO_EXPIRY).toBe(true);
     expect(missingKeyring.deploymentFeatures.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS).toBe(true);
@@ -173,16 +150,6 @@ describe("appConfig", () => {
     envMock.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
 
     await expect(client.appConfig()).resolves.toMatchObject({ providerEgressEnabled: true });
-  });
-
-  it("reports the non-sensitive protocol adaptation deployment capability", async () => {
-    const client = createRouterClient(appRouter, { context: publicContext });
-
-    await expect(client.appConfig()).resolves.toMatchObject({ protocolAdaptationAvailable: false });
-
-    envMock.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = true;
-
-    await expect(client.appConfig()).resolves.toMatchObject({ protocolAdaptationAvailable: true });
   });
 
   it("lets a runtime false setting override SIGNUP_ENABLED=true", async () => {

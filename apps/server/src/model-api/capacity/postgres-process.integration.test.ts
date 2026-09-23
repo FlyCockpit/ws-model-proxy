@@ -987,8 +987,6 @@ integration("capacity admission across operating-system processes", () => {
     process.env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = "true";
     process.env.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS = "true";
     process.env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS = `process-v1:${Buffer.alloc(32, 37).toString("base64")}`;
-    process.env.MODEL_API_GLOBAL_CAPACITY_ENABLED = "true";
-    process.env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = "true";
     const { credentialLookupPrefix, hmacDigestForForwarderPurpose } = await import(
       "@ws-model-proxy/db/forwarder-security"
     );

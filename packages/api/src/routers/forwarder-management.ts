@@ -12,7 +12,6 @@ import { z } from "zod";
 import type { LiveCliFeatureSnapshot } from "../context";
 import { protectedProcedure } from "../index";
 import {
-  assertCapacityManagementEnabled,
   assertEffectiveConcurrencyPolicy,
   assertEffectiveContextPolicy,
   assertModelPoolCapacityPolicy,
@@ -144,6 +143,7 @@ const poolTransformerFields = {
   transformerTimeoutMs: z.number().int().min(1_000).max(600_000).nullable().optional(),
   transformerMaxAssets: z.number().int().min(1).max(64).nullable().optional(),
 };
+
 function hasModelPoolCapacityPolicy(input: Record<string, unknown>): boolean {
   return (
     input.capacityPriority !== undefined ||
@@ -697,8 +697,7 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
 }
 
 function serializePool(row: ModelPoolRow) {
-  const protocolAdaptationAvailable = env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED;
-  const adaptationEnabled = row.protocolAdaptationEnabled && protocolAdaptationAvailable;
+  const adaptationEnabled = row.protocolAdaptationEnabled;
   const recommendedSurfaceOverride = parseModelApiSurface(row.recommendedSurfaceOverride);
   const memberCapabilities = (model: PoolMemberModelRow) =>
     discoveredModelSurfaceCapabilities(model);
@@ -800,7 +799,6 @@ function serializePool(row: ModelPoolRow) {
     maxAttachmentBytes: row.maxAttachmentBytes,
     optimisticBasicTranscription: row.optimisticBasicTranscription,
     protocolAdaptationEnabled: row.protocolAdaptationEnabled,
-    protocolAdaptationAvailable,
     publicEgressEnabled: row.publicEgressEnabled,
     publicEgressAcknowledged: row.publicEgressAcknowledged,
     effectiveProviderEgress: effectiveProviderEgress({
@@ -1626,9 +1624,7 @@ export const forwarderManagementRouter = {
               capabilities: providerModelSurfaceCapabilities(provider.nativeCapabilities),
             })),
           ],
-          adaptationEnabled:
-            (input.advanced?.protocolAdaptationEnabled ?? false) &&
-            env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
+          adaptationEnabled: input.advanced?.protocolAdaptationEnabled ?? false,
         });
         const localTargets = await tx.executionTarget.findMany({
           where: { userId, discoveredModelId: { in: input.localModelIds } },
@@ -2441,7 +2437,6 @@ export const forwarderManagementRouter = {
         throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
       }
       const hasCapacityPolicy = hasModelPoolCapacityPolicy(input);
-      if (hasCapacityPolicy) assertCapacityManagementEnabled(env.MODEL_API_GLOBAL_CAPACITY_ENABLED);
       if (input.slug) {
         await assertPoolSlugAvailable(input.slug, context.session.user.id, input.id);
       }
@@ -2615,9 +2610,7 @@ export const forwarderManagementRouter = {
                 : current.recommendedSurfaceOverride,
             ),
             members,
-            adaptationEnabled:
-              (input.protocolAdaptationEnabled ?? current.protocolAdaptationEnabled) &&
-              env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
+            adaptationEnabled: input.protocolAdaptationEnabled ?? current.protocolAdaptationEnabled,
           });
         }
         const row = await tx.modelPool.update({
@@ -2792,8 +2785,7 @@ export const forwarderManagementRouter = {
         assertRecommendedSurfaceServable({
           override: parseModelApiSurface(surfacePool.recommendedSurfaceOverride),
           members: surfaceMembers,
-          adaptationEnabled:
-            surfacePool.protocolAdaptationEnabled && env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
+          adaptationEnabled: surfacePool.protocolAdaptationEnabled,
         });
         const target = await tx.executionTarget.upsert({
           where: { discoveredModelId: input.discoveredModelId },
@@ -3009,8 +3001,7 @@ export const forwarderManagementRouter = {
           assertRecommendedSurfaceServable({
             override: parseModelApiSurface(pool.recommendedSurfaceOverride),
             members: surfaceMembers,
-            adaptationEnabled:
-              pool.protocolAdaptationEnabled && env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
+            adaptationEnabled: pool.protocolAdaptationEnabled,
           });
         }
         await lockExecutionTargetIdentities(tx, [`provider-model:${providerModel.id}`]);
@@ -3473,9 +3464,7 @@ export const forwarderManagementRouter = {
             assertRecommendedSurfaceServable({
               override: parseModelApiSurface(member.ModelPool.recommendedSurfaceOverride),
               members: surfaceMembers,
-              adaptationEnabled:
-                member.ModelPool.protocolAdaptationEnabled &&
-                env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
+              adaptationEnabled: member.ModelPool.protocolAdaptationEnabled,
             });
           }
 
@@ -3677,9 +3666,7 @@ export const forwarderManagementRouter = {
           assertRecommendedSurfaceServable({
             override: parseModelApiSurface(member.ModelPool.recommendedSurfaceOverride),
             members: surfaceMembers,
-            adaptationEnabled:
-              member.ModelPool.protocolAdaptationEnabled &&
-              env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
+            adaptationEnabled: member.ModelPool.protocolAdaptationEnabled,
           });
         }
         await tx.poolMember.delete({ where: { id: input.id } });

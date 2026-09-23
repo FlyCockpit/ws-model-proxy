@@ -2,14 +2,9 @@ import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useParams } from "@tanstack/react-router";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { useTranslation } from "react-i18next";
-import {
-  allDirectModels,
-  resolveCapacityAvailability,
-} from "@/components/forwarder-dashboard-sections";
+import { allDirectModels } from "@/components/forwarder-dashboard-sections";
 import { GuardedPoolSetupWizard } from "@/components/guarded-pool-setup-wizard";
 import { InlineRetry } from "@/components/inline-retry";
-import { useDeploymentAudience } from "@/hooks/use-deployment-audience";
-import { anthropicMessagesEnabledFromConfig } from "@/lib/deployment-feature-gate";
 import { providerEgressFromAppConfig } from "@/lib/guarded-pool-wizard-validation";
 import { orpc } from "@/utils/orpc";
 
@@ -28,7 +23,6 @@ export function NewPoolPage() {
   const { lang } = useParams({ from: "/$lang/_auth/dashboard/pools/new" });
   const { t } = useTranslation("dashboard");
   const navigate = useNavigate();
-  const { isAdmin: isDeploymentAdmin } = useDeploymentAudience();
   const devices = useQuery(orpc.forwarderManagement.listCliDevices.queryOptions());
   // This page is one of ~10 appConfig consumers sharing a long staleTime, so a
   // warm cache would usually pin the wizard's egress gate to a stale snapshot.
@@ -44,14 +38,6 @@ export function NewPoolPage() {
   // keeps serving the snapshot (accepted RTT residual; submits in that window
   // are rejected server-side with PROVIDER_EGRESS_DISABLED).
   const providerEgressEnabled = providerEgressFromAppConfig(appConfig.data) && !appConfig.isError;
-  const anthropicMessagesEnabled = anthropicMessagesEnabledFromConfig(
-    appConfig.data,
-    appConfig.isError,
-  );
-  const capacityAvailability = resolveCapacityAvailability(
-    appConfig.data?.capacityEnabled,
-    appConfig.isError,
-  );
 
   if (devices.isPending) {
     return (
@@ -79,11 +65,8 @@ export function NewPoolPage() {
       page
       onOpenChange={() => undefined}
       directModels={allDirectModels(devices.data ?? [])}
-      capacityEnabled={capacityAvailability === "enabled"}
-      protocolAdaptationAvailable={appConfig.data?.protocolAdaptationAvailable ?? false}
+      capacityEnabled
       providerEgressEnabled={providerEgressEnabled}
-      anthropicMessagesEnabled={anthropicMessagesEnabled}
-      isDeploymentAdmin={isDeploymentAdmin}
       onSuccess={(poolId) => {
         if (poolId) {
           void navigate({

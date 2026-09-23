@@ -61,7 +61,7 @@ vi.mock("@/components/forwarder-dashboard-sections", () => ({
   GrantPoolDialog: ({ pool }: { pool: unknown }) => (pool ? <div>grant-pool-dialog</div> : null),
   PoolMemberForm: () => <div>pool-member-form</div>,
   PoolForm: () => <div>pool-form</div>,
-  resolveCapacityAvailability: (enabled: boolean) => (enabled ? "enabled" : "disabled"),
+  resolveCapacityAvailability: () => "enabled" as const,
 }));
 
 vi.mock("@/components/provider-operations-section", () => ({
@@ -90,7 +90,6 @@ vi.mock("@/utils/orpc", () => {
       appConfig: query("appConfig", () => ({
         capacityEnabled: state.capacityEnabled,
         providerEgressEnabled: state.providerEgressEnabled,
-        protocolAdaptationAvailable: true,
       })),
       forwarderManagement: {
         listModelPools: query("pools", () => state.pools),
@@ -273,9 +272,8 @@ describe("dedicated pool pages", () => {
     expect(screen.getByText("dashboard:pools.fallbackSteps.acknowledge")).toBeTruthy();
   });
 
-  it("renders the disabled deployment copy in the fallback tab", () => {
-    state.capacityEnabled = false;
-    state.providerEgressEnabled = true;
+  it("renders the disabled deployment copy in the fallback tab when provider egress is off", () => {
+    state.providerEgressEnabled = false;
     state.tab = "fallback";
     state.pools = [
       {
@@ -346,13 +344,10 @@ describe("dedicated pool pages", () => {
     expect(policy.textContent).not.toContain("dashboard:pools.inherited");
   });
 
-  it("renders the disabled capacity reason instead of a skipped-query skeleton", async () => {
-    state.capacityEnabled = false;
+  it("loads capacity records instead of a deployment-disabled reason", async () => {
     mount(<InferenceCapacityPage />);
 
-    await waitFor(() =>
-      expect(screen.getByText("dashboard:pools.capacity.disabledReason")).toBeTruthy(),
-    );
-    expect(screen.queryByTestId("page-skeleton")).toBeNull();
+    await waitFor(() => expect(screen.getByText("dashboard:pools.capacity.empty")).toBeTruthy());
+    expect(screen.queryByText("dashboard:pools.capacity.disabledReason")).toBeNull();
   });
 });

@@ -55,7 +55,6 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     MODEL_API_TRANSCRIPTION_MAX_CONCURRENT_UPLOADS: 4,
     MODEL_API_TRANSCRIPTION_MIN_FREE_BYTES: 0,
     MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS: 30_000,
-    MODEL_API_ANTHROPIC_ENABLED: true,
     WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
   },
 }));
@@ -471,17 +470,12 @@ function poolMemberRow({
 
 function appWith(
   manager: FakeRelayManager,
-  anthropicEnabled = true,
-  protocolAdaptationEnabled = false,
   capacityRuntime?: CapacityAdmissionRuntime,
   concurrencyLimiter = new ModelApiConcurrencyLimiter(),
 ) {
   return createModelApiRoutes({
     manager,
     concurrencyLimiter,
-    anthropicEnabled,
-    protocolAdaptationEnabled,
-    capacityEnabled: capacityRuntime !== undefined,
     capacityRuntime,
   });
 }
@@ -987,7 +981,7 @@ describe("model API routes", () => {
     ]);
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-chat"];
-    const responsePromise = appWith(manager, true, true).request("/messages", {
+    const responsePromise = appWith(manager).request("/messages", {
       method: "POST",
       headers: {
         authorization: "Bearer wsmp_model_test",
@@ -1073,7 +1067,7 @@ describe("model API routes", () => {
     ]);
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-chat"];
-    const responsePromise = appWith(manager, true, true).request("/messages", {
+    const responsePromise = appWith(manager).request("/messages", {
       method: "POST",
       headers: {
         authorization: "Bearer wsmp_model_test",
@@ -1184,7 +1178,7 @@ describe("model API routes", () => {
     ]);
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-responses"];
-    const responses = await appWith(manager, true, true).request("/messages", {
+    const responses = await appWith(manager).request("/messages", {
       method: "POST",
       headers: {
         authorization: "Bearer wsmp_model_test",
@@ -1222,7 +1216,7 @@ describe("model API routes", () => {
         },
       }),
     ]);
-    const thinking = await appWith(manager, true, true).request("/messages", {
+    const thinking = await appWith(manager).request("/messages", {
       method: "POST",
       headers: {
         authorization: "Bearer wsmp_model_test",
@@ -1268,7 +1262,7 @@ describe("model API routes", () => {
     ]);
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-responses"];
-    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+    const responsePromise = appWith(manager).request("/chat/completions", {
       method: "POST",
       headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
       body: requestBody(poolTarget.modelId),
@@ -1420,7 +1414,7 @@ describe("model API routes", () => {
     ]);
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-responses"];
-    const response = await appWith(manager, true, true).request("/chat/completions", {
+    const response = await appWith(manager).request("/chat/completions", {
       method: "POST",
       headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
       body: JSON.stringify({
@@ -1466,7 +1460,7 @@ describe("model API routes", () => {
     ]);
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-anthropic"];
-    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+    const responsePromise = appWith(manager).request("/chat/completions", {
       method: "POST",
       headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
       body: JSON.stringify({
@@ -1506,44 +1500,6 @@ describe("model API routes", () => {
     await response.text();
   });
 
-  it("keeps pool adaptation unavailable when the release gate is off", async () => {
-    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
-      directModels: [],
-      modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
-    });
-    db.poolMember.findMany.mockResolvedValue([
-      poolMemberRow({
-        id: "responses-member",
-        discoveredModelId: "responses-model",
-        upstreamModelId: "upstream-responses",
-        cliDeviceId: "cli-responses",
-        capabilityOverrideMetadata: {
-          version: 3,
-          protocol: "openai-compatible",
-          surfaces: {
-            openaiResponses: {
-              source: "declared",
-              confidence: "exact",
-              supported: true,
-            },
-          },
-        },
-      }),
-    ]);
-    const manager = new FakeRelayManager();
-    manager.activeCliDeviceIds = ["cli-responses"];
-    const response = await appWith(manager, true, false).request("/chat/completions", {
-      method: "POST",
-      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
-      body: requestBody(poolTarget.modelId),
-    });
-    expect(response.status).toBe(400);
-    expect(manager.sent).toEqual([]);
-    await expect(response.json()).resolves.toMatchObject({
-      error: { code: "unsupported_capability" },
-    });
-  });
-
   it("incrementally adapts a Responses SSE member back to requested Chat SSE", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
@@ -1571,7 +1527,7 @@ describe("model API routes", () => {
     ]);
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-responses"];
-    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+    const responsePromise = appWith(manager).request("/chat/completions", {
       method: "POST",
       headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
       body: JSON.stringify({
@@ -1635,7 +1591,7 @@ describe("model API routes", () => {
     ]);
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-multi"];
-    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+    const responsePromise = appWith(manager).request("/chat/completions", {
       method: "POST",
       headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
       body: JSON.stringify({
@@ -1723,18 +1679,15 @@ describe("model API routes", () => {
           store: { heartbeat: vi.fn().mockResolvedValue(true), release },
         }),
     };
-    const responsePromise = appWith(manager, true, true, capacityRuntime).request(
-      "/chat/completions",
-      {
-        method: "POST",
-        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
-        body: JSON.stringify({
-          model: poolTarget.modelId,
-          stream: true,
-          messages: [{ role: "user", content: "hello" }],
-        }),
-      },
-    );
+    const responsePromise = appWith(manager, capacityRuntime).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        stream: true,
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
     await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
     const sent = requireSent(manager);
     manager.headers(sent.requestId, 200, { "content-type": "text/event-stream" });
@@ -1794,7 +1747,7 @@ describe("model API routes", () => {
     ]);
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-chat"];
-    const responsePromise = appWith(manager, true, true).request("/responses", {
+    const responsePromise = appWith(manager).request("/responses", {
       method: "POST",
       headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
       body: JSON.stringify({ model: poolTarget.modelId, stream: true, input: "hello" }),
@@ -1862,7 +1815,7 @@ describe("model API routes", () => {
     ]);
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-responses", "cli-chat"];
-    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+    const responsePromise = appWith(manager).request("/chat/completions", {
       method: "POST",
       headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
       body: requestBody(poolTarget.modelId),
@@ -1931,7 +1884,7 @@ describe("model API routes", () => {
     );
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-first", "cli-second"];
-    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+    const responsePromise = appWith(manager).request("/chat/completions", {
       method: "POST",
       headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
       body: requestBody(poolTarget.modelId),
@@ -2007,7 +1960,7 @@ describe("model API routes", () => {
     );
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-first", "cli-second"];
-    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+    const responsePromise = appWith(manager).request("/chat/completions", {
       method: "POST",
       headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
       body: JSON.stringify({
@@ -2068,7 +2021,7 @@ describe("model API routes", () => {
     );
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-first", "cli-second"];
-    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+    const responsePromise = appWith(manager).request("/chat/completions", {
       method: "POST",
       headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
       body: JSON.stringify({
@@ -2128,7 +2081,7 @@ describe("model API routes", () => {
     ]);
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-responses"];
-    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+    const responsePromise = appWith(manager).request("/chat/completions", {
       method: "POST",
       headers: {
         authorization: "Bearer wsmp_model_test",
@@ -2186,7 +2139,7 @@ describe("model API routes", () => {
     ]);
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-anthropic"];
-    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+    const responsePromise = appWith(manager).request("/chat/completions", {
       method: "POST",
       headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
       body: JSON.stringify({
@@ -2243,7 +2196,7 @@ describe("model API routes", () => {
     ]);
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-responses"];
-    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+    const responsePromise = appWith(manager).request("/chat/completions", {
       method: "POST",
       headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
       body: JSON.stringify({
@@ -2321,7 +2274,7 @@ describe("model API routes", () => {
     ]);
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-no-tools", "cli-no-images", "cli-fully-capable"];
-    const responsePromise = appWith(manager, true, true).request("/chat/completions", {
+    const responsePromise = appWith(manager).request("/chat/completions", {
       method: "POST",
       headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
       body: JSON.stringify({
@@ -2888,14 +2841,6 @@ describe("model API routes", () => {
     await expect(response.text()).resolves.toBe(officialAnthropicFixture.stream);
   });
 
-  it("gates Anthropic routes off explicitly", async () => {
-    const response = await appWith(new FakeRelayManager(), false).request("/messages", {
-      method: "POST",
-      headers: { authorization: "Bearer wsmp_model_test", "anthropic-version": "2023-06-01" },
-    });
-    expect(response.status).toBe(404);
-  });
-
   it("returns the official Anthropic request-too-large envelope for oversized bodies", async () => {
     const response = await appWith(new FakeRelayManager()).request("/messages", {
       method: "POST",
@@ -3178,6 +3123,7 @@ describe("model API routes", () => {
       const response = await createModelApiRoutes({
         manager: new FakeRelayManager(),
         concurrencyLimiter: limiter,
+        capacityRuntime: undefined,
       }).request("/chat/completions", {
         method: "POST",
         headers: {
@@ -3238,6 +3184,7 @@ describe("model API routes", () => {
       const response = await createModelApiRoutes({
         manager: new FakeRelayManager(),
         concurrencyLimiter: limiter,
+        capacityRuntime: undefined,
       }).request("/messages", {
         method: "POST",
         headers: {
@@ -3921,19 +3868,17 @@ describe("model API routes", () => {
       affinity: undefined,
     });
 
-    const response = await appWith(
-      new FakeRelayManager(),
-      true,
-      false,
-      admittingCapacityRuntime(),
-    ).request("/chat/completions", {
-      method: "POST",
-      headers: {
-        authorization: "Bearer wsmp_model_test",
-        "content-type": "application/json",
+    const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: requestBody(poolTarget.modelId),
       },
-      body: requestBody(poolTarget.modelId),
-    });
+    );
 
     expect(response.status).toBe(200);
     expect(publicOverflow.dispatch.mock.calls.map(([input]) => input.memberTier)).toEqual([
@@ -3994,19 +3939,17 @@ describe("model API routes", () => {
       affinity: undefined,
     });
 
-    const response = await appWith(
-      new FakeRelayManager(),
-      true,
-      false,
-      admittingCapacityRuntime(),
-    ).request("/chat/completions", {
-      method: "POST",
-      headers: {
-        authorization: "Bearer wsmp_model_test",
-        "content-type": "application/json",
+    const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: requestBody(poolTarget.modelId),
       },
-      body: requestBody(poolTarget.modelId),
-    });
+    );
 
     expect(response.status).toBe(200);
     expect(publicOverflow.dispatch).toHaveBeenCalledTimes(1);
@@ -4126,7 +4069,7 @@ describe("model API routes", () => {
       hold: vi.fn((response) => response),
     };
 
-    const response = await appWith(new FakeRelayManager(), true, false, capacityRuntime).request(
+    const response = await appWith(new FakeRelayManager(), capacityRuntime).request(
       "/chat/completions",
       {
         method: "POST",
@@ -4196,7 +4139,7 @@ describe("model API routes", () => {
     };
 
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const response = await appWith(new FakeRelayManager(), true, false, capacityRuntime).request(
+    const response = await appWith(new FakeRelayManager(), capacityRuntime).request(
       "/chat/completions",
       {
         method: "POST",
@@ -4292,17 +4235,14 @@ describe("model API routes", () => {
     const manager = new FakeRelayManager();
     manager.activeCliDeviceIds = ["cli-local"];
 
-    const responsePromise = appWith(manager, true, false, capacityRuntime).request(
-      "/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          authorization: "Bearer wsmp_model_test",
-          "content-type": "application/json",
-        },
-        body: requestBody(grantedPoolTarget.modelId),
+    const responsePromise = appWith(manager, capacityRuntime).request("/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "content-type": "application/json",
       },
-    );
+      body: requestBody(grantedPoolTarget.modelId),
+    });
     await vi.waitFor(() => {
       expect(publicOverflow.dispatch.mock.calls.length + manager.sent.length).toBeGreaterThan(0);
     });
@@ -4382,7 +4322,7 @@ describe("model API routes", () => {
     };
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
-    const response = await appWith(new FakeRelayManager(), true, false, capacityRuntime).request(
+    const response = await appWith(new FakeRelayManager(), capacityRuntime).request(
       "/chat/completions",
       {
         method: "POST",
@@ -4515,14 +4455,11 @@ describe("model API routes", () => {
       });
       const manager = new FakeRelayManager();
       manager.activeCliDeviceIds = ["cli-local"];
-      const responsePromise = appWith(manager, true, true, capacityRuntime).request(
-        "/chat/completions",
-        {
-          method: "POST",
-          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
-          body: requestBody(poolTarget.modelId),
-        },
-      );
+      const responsePromise = appWith(manager, capacityRuntime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+      });
       await vi.waitFor(() => expect(selectedMembers).toHaveLength(1));
       expect(selectedMembers[0]).toBe(expectedMember);
       if (nativeKind === "local") {
@@ -4657,7 +4594,7 @@ describe("model API routes", () => {
         return response;
       }),
     };
-    const responsePromise = appWith(manager, true, false, capacityRuntime, limiter).request(
+    const responsePromise = appWith(manager, capacityRuntime, limiter).request(
       "/chat/completions",
       {
         method: "POST",
@@ -4756,14 +4693,11 @@ describe("model API routes", () => {
       hold: vi.fn((response) => response),
     };
     const manager = new FakeRelayManager();
-    const response = await appWith(manager, true, false, capacityRuntime).request(
-      "/chat/completions",
-      {
-        method: "POST",
-        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
-        body: requestBody(),
-      },
-    );
+    const response = await appWith(manager, capacityRuntime).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(),
+    });
 
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toMatchObject({
@@ -4815,24 +4749,22 @@ describe("model API routes", () => {
         },
       }),
     );
-    const response = await appWith(
-      new FakeRelayManager(),
-      true,
-      false,
-      admittingCapacityRuntime(),
-    ).request("/messages", {
-      method: "POST",
-      headers: {
-        authorization: "Bearer wsmp_model_test",
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
+    const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+      "/messages",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: directTarget.modelId,
+          max_tokens: 8,
+          messages: [{ role: "user", content: "context" }],
+        }),
       },
-      body: JSON.stringify({
-        model: directTarget.modelId,
-        max_tokens: 8,
-        messages: [{ role: "user", content: "context" }],
-      }),
-    });
+    );
 
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toMatchObject({
@@ -4943,16 +4875,14 @@ describe("model API routes", () => {
           countStrategy: "TOKENIZER",
         }),
       ]);
-      const response = await appWith(
-        new FakeRelayManager(),
-        true,
-        false,
-        admittingCapacityRuntime(),
-      ).request("/chat/completions", {
-        method: "POST",
-        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
-        body: requestBody(poolTarget.modelId),
-      });
+      const response = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+        "/chat/completions",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: requestBody(poolTarget.modelId),
+        },
+      );
 
       expect(response.status).toBe(400);
       await expect(response.json()).resolves.toMatchObject({
@@ -5024,7 +4954,7 @@ describe("model API routes", () => {
       release: vi.fn().mockResolvedValue(true),
       hold: vi.fn((response) => response),
     };
-    const responsePromise = appWith(manager, true, false, capacityRuntime).request("/responses", {
+    const responsePromise = appWith(manager, capacityRuntime).request("/responses", {
       method: "POST",
       headers: {
         authorization: "Bearer wsmp_model_test",
@@ -5082,7 +5012,7 @@ describe("model API routes", () => {
       release: vi.fn().mockResolvedValue(true),
       hold: vi.fn((response) => response),
     };
-    const responsePromise = appWith(manager, true, false, capacityRuntime).request("/responses", {
+    const responsePromise = appWith(manager, capacityRuntime).request("/responses", {
       method: "POST",
       headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
       body: JSON.stringify({ model: directTarget.modelId, input: "hello" }),
@@ -5148,14 +5078,11 @@ describe("model API routes", () => {
       release: vi.fn().mockResolvedValue(true),
       hold: vi.fn((response) => response),
     };
-    const responsePromise = appWith(manager, true, false, capacityRuntime).request(
-      "/chat/completions",
-      {
-        method: "POST",
-        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
-        body: requestBody(poolTarget.modelId),
-      },
-    );
+    const responsePromise = appWith(manager, capacityRuntime).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(poolTarget.modelId),
+    });
     await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
     expect(requireSent(manager).cliDeviceId).toBe("cli-fits");
     expect(capacityRuntime.acquire).toHaveBeenCalledWith(
@@ -5214,7 +5141,7 @@ describe("model API routes", () => {
       release: vi.fn().mockResolvedValue(true),
       hold: vi.fn((response) => response),
     };
-    const responsePromise = appWith(manager, true, false, capacityRuntime).request("/responses", {
+    const responsePromise = appWith(manager, capacityRuntime).request("/responses", {
       method: "POST",
       headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
       body: JSON.stringify({ model: poolTarget.modelId, input: "hello" }),
@@ -5541,17 +5468,14 @@ describe("model API routes", () => {
       markFirstClientByte: vi.fn().mockResolvedValue(undefined),
       affinity: undefined,
     });
-    const create = await appWith(new FakeRelayManager(), true, false, capacityRuntime).request(
-      "/responses",
-      {
-        method: "POST",
-        headers: {
-          authorization: "Bearer wsmp_model_test",
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ model: poolTarget.modelId, input: "hello", store: true }),
+    const create = await appWith(new FakeRelayManager(), capacityRuntime).request("/responses", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "content-type": "application/json",
       },
-    );
+      body: JSON.stringify({ model: poolTarget.modelId, input: "hello", store: true }),
+    });
     expect(create.status).toBe(200);
     await expect(create.json()).resolves.toMatchObject({ id: "resp_provider" });
     await vi.waitFor(() => expect(db.responseStickinessRecord.upsert).toHaveBeenCalled());
@@ -5597,7 +5521,7 @@ describe("model API routes", () => {
       markFirstClientByte: vi.fn().mockResolvedValue(undefined),
       affinity: undefined,
     });
-    const retrieve = await appWith(new FakeRelayManager(), true, false, capacityRuntime).request(
+    const retrieve = await appWith(new FakeRelayManager(), capacityRuntime).request(
       "/responses/resp_provider?include[]=output",
       { headers: { authorization: "Bearer wsmp_model_test" } },
     );
@@ -5643,7 +5567,7 @@ describe("model API routes", () => {
     vi.mocked(capacityRuntime.release)
       .mockRejectedValueOnce(new Error("capacity database disconnected"))
       .mockResolvedValue(true);
-    const failedRead = await appWith(new FakeRelayManager(), true, false, capacityRuntime).request(
+    const failedRead = await appWith(new FakeRelayManager(), capacityRuntime).request(
       "/responses/resp_provider",
       {
         headers: { authorization: "Bearer wsmp_model_test" },
@@ -5657,14 +5581,12 @@ describe("model API routes", () => {
     vi.mocked(capacityRuntime.release)
       .mockRejectedValueOnce(new Error("capacity database disconnected"))
       .mockResolvedValue(true);
-    const failedDispatch = await appWith(
-      new FakeRelayManager(),
-      true,
-      false,
-      capacityRuntime,
-    ).request("/responses/resp_provider", {
-      headers: { authorization: "Bearer wsmp_model_test" },
-    });
+    const failedDispatch = await appWith(new FakeRelayManager(), capacityRuntime).request(
+      "/responses/resp_provider",
+      {
+        headers: { authorization: "Bearer wsmp_model_test" },
+      },
+    );
     expect(failedDispatch.status).toBe(500);
     expect(capacityRuntime.release).toHaveBeenCalledTimes(dispatchFailureReleaseCount + 2);
 
@@ -5689,7 +5611,7 @@ describe("model API routes", () => {
       .mockRejectedValueOnce(new Error("capacity database disconnected"))
       .mockImplementationOnce(() => releaseAcknowledged);
     let deleteSettled = false;
-    const deletePromise = appWith(new FakeRelayManager(), true, false, capacityRuntime).request(
+    const deletePromise = appWith(new FakeRelayManager(), capacityRuntime).request(
       "/responses/resp_provider",
       {
         method: "DELETE",
@@ -5748,7 +5670,7 @@ describe("model API routes", () => {
           store: { heartbeat: vi.fn().mockResolvedValue(true), release },
         }),
     };
-    const responsePromise = appWith(manager, true, false, capacityRuntime).request("/responses", {
+    const responsePromise = appWith(manager, capacityRuntime).request("/responses", {
       method: "POST",
       headers: {
         authorization: "Bearer wsmp_model_test",
@@ -5825,17 +5747,14 @@ describe("model API routes", () => {
       hold: vi.fn((response) => response),
     };
 
-    const response = await appWith(manager, true, false, capacityRuntime, limiter).request(
-      "/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          authorization: "Bearer wsmp_model_test",
-          "content-type": "application/json",
-        },
-        body: requestBody(),
+    const response = await appWith(manager, capacityRuntime, limiter).request("/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "content-type": "application/json",
       },
-    );
+      body: requestBody(),
+    });
 
     expect(response.status).toBe(500);
     expect(cliRelease).toHaveBeenCalledTimes(1);
@@ -6027,7 +5946,7 @@ describe("model API routes", () => {
       expiresAt: new Date(Date.now() + 60_000),
     });
     const manager = new FakeRelayManager();
-    const response = await appWith(manager, true, false, admittingCapacityRuntime()).request(
+    const response = await appWith(manager, admittingCapacityRuntime()).request(
       "/responses/resp_provider",
       {
         headers: { authorization: "Bearer wsmp_model_test" },
@@ -6211,10 +6130,9 @@ describe("model API routes", () => {
       release: vi.fn().mockResolvedValue(true),
       hold: vi.fn((response) => response),
     };
-    const responsePromise = appWith(manager, true, false, capacityRuntime).request(
-      "/responses/resp_123",
-      { headers: { authorization: "Bearer wsmp_model_test" } },
-    );
+    const responsePromise = appWith(manager, capacityRuntime).request("/responses/resp_123", {
+      headers: { authorization: "Bearer wsmp_model_test" },
+    });
 
     await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
     expect(capacityRuntime.acquire).toHaveBeenCalledWith(

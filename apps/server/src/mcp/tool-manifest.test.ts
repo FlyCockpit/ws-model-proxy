@@ -13,7 +13,6 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     BETTER_AUTH_SECRET: "test-better-auth-secret",
     BETTER_AUTH_URL: "https://proxy.example.com",
     WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
-    MODEL_API_GLOBAL_CAPACITY_ENABLED: true,
     NODE_ENV: "test",
   },
 }));
@@ -446,7 +445,6 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
 
 describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
   const PROVIDER_EGRESS = "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED";
-  const CAPACITY = "MODEL_API_GLOBAL_CAPACITY_ENABLED";
 
   it("every provider-management tool advertises the provider-egress dependency", () => {
     for (const tool of MCP_TOOL_MANIFEST.filter((entry) =>
@@ -458,13 +456,11 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
     }
   });
 
-  it("every capacity-management tool advertises the capacity dependency", () => {
+  it("capacity-management tools are not behind a deployment feature flag", () => {
     for (const tool of MCP_TOOL_MANIFEST.filter((entry) =>
       entry.target.startsWith("capacityManagement."),
     )) {
-      expect(`${tool.name}: ${tool.featureDependencies?.join(",")}`).toBe(
-        `${tool.name}: ${CAPACITY}`,
-      );
+      expect(tool.featureDependencies).toBeUndefined();
     }
   });
 
@@ -484,10 +480,8 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
     expect(byName.get("forwarder_pool_member_update")?.featureDependencies).toEqual([
       PROVIDER_EGRESS,
     ]);
-    // Pool update additionally gates capacity policy fields on the capacity flag.
     expect(byName.get("forwarder_model_pool_update")?.featureDependencies).toEqual([
       PROVIDER_EGRESS,
-      CAPACITY,
     ]);
   });
 

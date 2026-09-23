@@ -27,14 +27,14 @@ fails the suite when a leaf is unclassified.
 | `auth.passwordCapabilities` | — (excluded) | — | — | — | — | — | Auth-router surface; not a model-proxy operation. |
 | `auth.updateLocale` | — (excluded) | — | — | — | — | — | Account identity management, not model-proxy operation. |
 | `auth.verifyEmailTransport` | — (excluded) | — | — | — | — | — | Auth-router surface; not a model-proxy operation. |
-| `capacityManagement.create` | `capacity_record_create` | write | — | pure | — | `MODEL_API_GLOBAL_CAPACITY_ENABLED` | — |
-| `capacityManagement.list` | `capacity_records_list` | read | — | pure | — | `MODEL_API_GLOBAL_CAPACITY_ENABLED` | — |
-| `capacityManagement.listAudit` | `capacity_audit_list` | read | — | pure | — | `MODEL_API_GLOBAL_CAPACITY_ENABLED` | — |
-| `capacityManagement.remove` | `capacity_record_remove` | write | DELETE | destructive | — | `MODEL_API_GLOBAL_CAPACITY_ENABLED` | — |
-| `capacityManagement.update` | `capacity_record_update` | write | — | pure | — | `MODEL_API_GLOBAL_CAPACITY_ENABLED` | — |
-| `capacityManagement.updateDirectPolicy` | `capacity_direct_policy_update` | write | — | pure | — | `MODEL_API_GLOBAL_CAPACITY_ENABLED` | — |
-| `capacityManagement.updateMemberPolicy` | `capacity_member_policy_update` | write | — | pure | — | `MODEL_API_GLOBAL_CAPACITY_ENABLED` | — |
-| `capacityManagement.updatePoolPolicy` | `capacity_pool_policy_update` | write | — | pure | — | `MODEL_API_GLOBAL_CAPACITY_ENABLED` | — |
+| `capacityManagement.create` | `capacity_record_create` | write | — | pure | — | — | — |
+| `capacityManagement.list` | `capacity_records_list` | read | — | pure | — | — | — |
+| `capacityManagement.listAudit` | `capacity_audit_list` | read | — | pure | — | — | — |
+| `capacityManagement.remove` | `capacity_record_remove` | write | DELETE | destructive | — | — | — |
+| `capacityManagement.update` | `capacity_record_update` | write | — | pure | — | — | — |
+| `capacityManagement.updateDirectPolicy` | `capacity_direct_policy_update` | write | — | pure | — | — | — |
+| `capacityManagement.updateMemberPolicy` | `capacity_member_policy_update` | write | — | pure | — | — | — |
+| `capacityManagement.updatePoolPolicy` | `capacity_pool_policy_update` | write | — | pure | — | — | — |
 | `cliCredentials.createToken` | — (excluded) | — | — | — | — | — | Returns the one-time raw token secret. |
 | `cliCredentials.exchangeDeviceCode` | — (excluded) | — | — | — | — | — | Public device-flow credential exchange; not an MCP surface. |
 | `cliCredentials.listTokens` | `cli_tokens_list` | read | — | pure | — | — | — |
@@ -52,9 +52,11 @@ fails the suite when a leaf is unclassified.
 | `forwarderManagement.createGuardedModelPool` | `forwarder_guarded_pool_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `forwarderManagement.createModelPool` | `forwarder_model_pool_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `forwarderManagement.deleteModelPool` | `forwarder_model_pool_delete` | write | DELETE | destructive | — | — | — |
+| `forwarderManagement.dismissDashboardNotice` | — (excluded) | — | — | — | — | — | human-only dashboard notices |
 | `forwarderManagement.getProfileSlug` | — (excluded) | — | — | — | — | — | Profile-slug procedures are account identity management. |
 | `forwarderManagement.grantPoolAccessByEmail` | `forwarder_pool_grant_create` | write | — | pure | — | — | — |
 | `forwarderManagement.listCliDevices` | `forwarder_cli_devices_list` | read | — | pure | — | — | — |
+| `forwarderManagement.listDashboardNotices` | — (excluded) | — | — | — | — | — | human-only dashboard notices |
 | `forwarderManagement.listGuardedOverflowCandidates` | `forwarder_guarded_candidates_list` | read | — | pure | — | — | — |
 | `forwarderManagement.listModelPools` | `forwarder_model_pools_list` | read | — | pure | — | — | — |
 | `forwarderManagement.previewProfileSlugChange` | — (excluded) | — | — | — | — | — | Profile-slug procedures are account identity management. |
@@ -68,7 +70,7 @@ fails the suite when a leaf is unclassified.
 | `forwarderManagement.setDiscoveredModelCapabilityProfile` | `forwarder_model_capability_profile_set` | write | — | pure | — | — | — |
 | `forwarderManagement.updateDiscoveredModelAttachmentLimit` | `forwarder_model_attachment_limit_update` | write | — | pure | — | — | — |
 | `forwarderManagement.updateDiscoveredModelCapabilities` | `forwarder_model_capabilities_update` | write | — | pure | — | — | — |
-| `forwarderManagement.updateModelPool` | `forwarder_model_pool_update` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED`, `MODEL_API_GLOBAL_CAPACITY_ENABLED` | — |
+| `forwarderManagement.updateModelPool` | `forwarder_model_pool_update` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `forwarderManagement.updatePoolMember` | `forwarder_pool_member_update` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `forwarderManagement.updateProfileSlug` | — (excluded) | — | — | — | — | — | Profile-slug procedures are account identity management. |
 | `forwarderManagement.visibleModels` | `forwarder_models_visible_list` | read | — | pure | — | — | — |

@@ -201,7 +201,6 @@ function mountPage() {
 
 function mount(
   open = true,
-  protocolAdaptationAvailable = true,
   initialStep: 0 | 1 | 2 | 3 = 0,
   options: { providerEgressEnabled?: boolean; initialProviderModelIds?: string[] } = {},
 ) {
@@ -213,7 +212,6 @@ function mount(
         onOpenChange={() => undefined}
         directModels={models}
         capacityEnabled
-        protocolAdaptationAvailable={protocolAdaptationAvailable}
         providerEgressEnabled={options.providerEgressEnabled ?? true}
         initialStep={initialStep}
         initialProviderModelIds={options.initialProviderModelIds ?? []}
@@ -247,7 +245,6 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
           onOpenChange={() => undefined}
           directModels={models}
           capacityEnabled
-          protocolAdaptationAvailable
           providerEgressEnabled
         />
       </QueryClientProvider>,
@@ -257,8 +254,8 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  it("keeps affinity available when protocol adaptation is disabled by deployment", () => {
-    mount(true, false, 1);
+  it("keeps protocol adaptation and affinity selectable without a deployment gate", () => {
+    mount(true, 1);
 
     const adaptation = screen.getByRole("radio", {
       name: "dashboard:pools.protocolOptions.lossless.label",
@@ -269,15 +266,15 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
     const affinity = screen.getByRole("checkbox", {
       name: "dashboard:pools.wizard.fields.affinityEnabled",
     });
-    expect((adaptation as HTMLInputElement).disabled).toBe(true);
-    expect((lossy as HTMLInputElement).disabled).toBe(true);
+    expect((adaptation as HTMLInputElement).disabled).toBe(false);
+    expect((lossy as HTMLInputElement).disabled).toBe(false);
     expect(affinity.getAttribute("aria-disabled")).toBeNull();
-    expect(screen.getByText("dashboard:pools.protocolAdaptationDisabledReason")).toBeTruthy();
+    expect(screen.queryByText("dashboard:pools.protocolAdaptationDisabledReason")).toBeNull();
   });
 
   it("selects lossless instruction merge from the protocol radio", async () => {
     const user = userEvent.setup();
-    mount(true, true, 1);
+    mount(true, 1);
 
     const lossy = screen.getByRole("radio", {
       name: "dashboard:pools.protocolOptions.lossy.label",
@@ -308,7 +305,6 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
           onOpenChange={() => undefined}
           directModels={models}
           capacityEnabled
-          protocolAdaptationAvailable
           providerEgressEnabled
         />
       </QueryClientProvider>,
@@ -322,7 +318,7 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
 
   it("disables provider selection and shows the deployment notice when egress is disabled", async () => {
     const user = userEvent.setup();
-    mount(true, true, 2, { providerEgressEnabled: false });
+    mount(true, 2, { providerEgressEnabled: false });
 
     const checkbox = await screen.findByLabelText(
       "dashboard:pools.wizard.selectProvider:Public provider",
@@ -336,7 +332,7 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
   });
 
   it("ignores initial provider selections when egress is disabled", async () => {
-    mount(true, true, 2, {
+    mount(true, 2, {
       providerEgressEnabled: false,
       initialProviderModelIds: ["provider-a"],
     });
@@ -350,7 +346,7 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
 
   it("submits an empty providerModels payload when egress is disabled from the start", async () => {
     const user = userEvent.setup();
-    mount(true, true, 0, { providerEgressEnabled: false });
+    mount(true, 0, { providerEgressEnabled: false });
 
     await driveToReviewStep(user);
     await user.click(screen.getByRole("button", { name: "dashboard:pools.wizard.create" }));
@@ -363,7 +359,7 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
 
   it("defaults the cache-affinity toggle on and submits affinity enabled", async () => {
     const user = userEvent.setup();
-    mount(true, true, 0);
+    mount(true, 0);
 
     await user.type(await screen.findByLabelText("dashboard:pools.slug"), "guarded-pool");
     await user.type(screen.getByLabelText("dashboard:pools.name"), "Guarded pool");
@@ -387,7 +383,7 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
 
   it("submits affinity disabled after unchecking the default-on toggle", async () => {
     const user = userEvent.setup();
-    mount(true, true, 0);
+    mount(true, 0);
 
     await user.type(await screen.findByLabelText("dashboard:pools.slug"), "guarded-pool");
     await user.type(screen.getByLabelText("dashboard:pools.name"), "Guarded pool");
@@ -416,7 +412,7 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
     // Dialog-mode callers have no page-level remount key, so a mid-session
     // gate flip must be caught by step validation (belt-and-braces alongside
     // the server-side PROVIDER_EGRESS_DISABLED rejection).
-    const view = mount(true, true, 2);
+    const view = mount(true, 2);
 
     const provider = await screen.findByLabelText(
       "dashboard:pools.wizard.selectProvider:Public provider",
@@ -431,7 +427,6 @@ describe("GuardedPoolSetupWizard mounted workflow", () => {
           onOpenChange={() => undefined}
           directModels={models}
           capacityEnabled
-          protocolAdaptationAvailable
           providerEgressEnabled={false}
           initialStep={2}
         />

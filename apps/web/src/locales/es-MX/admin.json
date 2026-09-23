@@ -212,9 +212,6 @@
       "ready": "Listo",
       "notReady": "No listo",
       "flags": {
-        "MODEL_API_ANTHROPIC_ENABLED": "Rutas nativas de la API Anthropic Messages.",
-        "MODEL_API_PROTOCOL_ADAPTATION_ENABLED": "Adaptacion entre protocolos para los pools de modelos.",
-        "MODEL_API_GLOBAL_CAPACITY_ENABLED": "Admision de capacidad global durable.",
         "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED": "Salida directa a proveedores publicos.",
         "keyringConfigured": "Si WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS esta definido. La clave nunca se muestra.",
         "ready": "La salida esta activada y el llavero de credenciales esta configurado.",

@@ -22,21 +22,6 @@ export function DeploymentFeaturesPanel({ features }: { features: DeploymentFeat
   const egress = features.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED;
   const rows = [
     {
-      name: "MODEL_API_ANTHROPIC_ENABLED",
-      value: onOff(features.MODEL_API_ANTHROPIC_ENABLED, onLabel, offLabel),
-      description: t("settings.deploymentFeatures.flags.MODEL_API_ANTHROPIC_ENABLED"),
-    },
-    {
-      name: "MODEL_API_PROTOCOL_ADAPTATION_ENABLED",
-      value: onOff(features.MODEL_API_PROTOCOL_ADAPTATION_ENABLED, onLabel, offLabel),
-      description: t("settings.deploymentFeatures.flags.MODEL_API_PROTOCOL_ADAPTATION_ENABLED"),
-    },
-    {
-      name: "MODEL_API_GLOBAL_CAPACITY_ENABLED",
-      value: onOff(features.MODEL_API_GLOBAL_CAPACITY_ENABLED, onLabel, offLabel),
-      description: t("settings.deploymentFeatures.flags.MODEL_API_GLOBAL_CAPACITY_ENABLED"),
-    },
-    {
       name: "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED",
       value: onOff(egress.enabled, onLabel, offLabel),
       description: t("settings.deploymentFeatures.flags.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED"),

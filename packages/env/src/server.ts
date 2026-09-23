@@ -156,13 +156,6 @@ export const env = createEnv({
       .int()
       .positive()
       .default(15 * 60 * 1000),
-    // Native Anthropic relay is an incomplete, release-gated surface. Keep it
-    // explicitly disabled until the complete protocol gate is satisfied.
-    MODEL_API_ANTHROPIC_ENABLED: strictBooleanFlag(),
-    // Cross-protocol pool adaptation is independently release-gated and off by default.
-    MODEL_API_PROTOCOL_ADAPTATION_ENABLED: strictBooleanFlag(),
-    // Durable shared-capacity admission remains gated until PostgreSQL concurrency proofs pass.
-    MODEL_API_GLOBAL_CAPACITY_ENABLED: strictBooleanFlag(),
     // Provider egress remains disabled until the full overflow admission and
     // settlement path is enabled. The keyring is optional while that gate is off.
     WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: strictBooleanFlag(),

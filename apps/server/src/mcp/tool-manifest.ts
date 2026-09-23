@@ -342,7 +342,6 @@ function projectCredentialRows(output: unknown): unknown {
 // ---------------------------------------------------------------------------
 
 const PROVIDER_EGRESS_FEATURE = "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED";
-const CAPACITY_FEATURE = "MODEL_API_GLOBAL_CAPACITY_ENABLED";
 
 // ---------------------------------------------------------------------------
 // The checked catalog — every entry's name/target pair is pinned against the
@@ -524,7 +523,6 @@ const READ_TOOLS: readonly McpToolDescriptor[] = [
     target: "capacityManagement.list",
     scope: "read",
     confirmation: null,
-    featureDependencies: [CAPACITY_FEATURE],
     classification: "pure",
     inputSchema: anyArgs(),
     invokeProcedure: procedureInvoker((client) => client.capacityManagement.list),
@@ -534,7 +532,6 @@ const READ_TOOLS: readonly McpToolDescriptor[] = [
     target: "capacityManagement.listAudit",
     scope: "read",
     confirmation: null,
-    featureDependencies: [CAPACITY_FEATURE],
     classification: "pure",
     inputSchema: anyArgs(),
     invokeProcedure: procedureInvoker((client) => client.capacityManagement.listAudit),
@@ -676,9 +673,9 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     confirmation: null,
     classification: "pure",
     inputSchema: anyArgs(),
-    // G8a: conditional provider-egress gate (publicEgress inputs) and the
-    // conditional capacity-management gate (capacity policy fields).
-    featureDependencies: [PROVIDER_EGRESS_FEATURE, CAPACITY_FEATURE],
+    // Conditional provider-egress gate (publicEgress inputs). Capacity policy
+    // fields are always admitted; there is no capacity release flag.
+    featureDependencies: [PROVIDER_EGRESS_FEATURE],
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.updateModelPool),
   },
   {
@@ -983,7 +980,6 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     target: "capacityManagement.create",
     scope: "write",
     confirmation: null,
-    featureDependencies: [CAPACITY_FEATURE],
     classification: "pure",
     inputSchema: anyArgs(),
     invokeProcedure: procedureInvoker((client) => client.capacityManagement.create),
@@ -993,7 +989,6 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     target: "capacityManagement.update",
     scope: "write",
     confirmation: null,
-    featureDependencies: [CAPACITY_FEATURE],
     classification: "pure",
     inputSchema: anyArgs(),
     invokeProcedure: procedureInvoker((client) => client.capacityManagement.update),
@@ -1003,7 +998,6 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     target: "capacityManagement.remove",
     scope: "write",
     confirmation: "DELETE",
-    featureDependencies: [CAPACITY_FEATURE],
     classification: "destructive",
     inputSchema: confirmedArgs("DELETE"),
     invokeProcedure: procedureInvoker((client) => client.capacityManagement.remove),
@@ -1013,7 +1007,6 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     target: "capacityManagement.updateDirectPolicy",
     scope: "write",
     confirmation: null,
-    featureDependencies: [CAPACITY_FEATURE],
     classification: "pure",
     inputSchema: anyArgs(),
     invokeProcedure: procedureInvoker((client) => client.capacityManagement.updateDirectPolicy),
@@ -1023,7 +1016,6 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     target: "capacityManagement.updatePoolPolicy",
     scope: "write",
     confirmation: null,
-    featureDependencies: [CAPACITY_FEATURE],
     classification: "pure",
     inputSchema: anyArgs(),
     invokeProcedure: procedureInvoker((client) => client.capacityManagement.updatePoolPolicy),
@@ -1033,7 +1025,6 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     target: "capacityManagement.updateMemberPolicy",
     scope: "write",
     confirmation: null,
-    featureDependencies: [CAPACITY_FEATURE],
     classification: "pure",
     inputSchema: anyArgs(),
     invokeProcedure: procedureInvoker((client) => client.capacityManagement.updateMemberPolicy),
@@ -1258,6 +1249,14 @@ export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
   {
     target: "forwarderManagement.setCliDeviceFeatureGrants",
     reason: "human-only device grant",
+  },
+  {
+    target: "forwarderManagement.listDashboardNotices",
+    reason: "human-only dashboard notices",
+  },
+  {
+    target: "forwarderManagement.dismissDashboardNotice",
+    reason: "human-only dashboard notices",
   },
   {
     target: "mcpTokens.revokeMine",

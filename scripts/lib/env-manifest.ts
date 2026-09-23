@@ -314,29 +314,6 @@ export const ENV_VARS: EnvVar[] = [
     default: "900000",
   },
   {
-    key: "MODEL_API_ANTHROPIC_ENABLED",
-    group: "runtime",
-    source: "default",
-    default: "false",
-    comment: [
-      "Release gate for the incomplete native Anthropic Messages surface. Keep false by default.",
-    ],
-  },
-  {
-    key: "MODEL_API_PROTOCOL_ADAPTATION_ENABLED",
-    group: "runtime",
-    source: "default",
-    default: "false",
-    comment: ["Release gate for opt-in model-pool cross-protocol adaptation."],
-  },
-  {
-    key: "MODEL_API_GLOBAL_CAPACITY_ENABLED",
-    group: "runtime",
-    source: "default",
-    default: "false",
-    comment: ["Release gate for durable global capacity admission. Keep false until proven."],
-  },
-  {
     key: "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED",
     group: "runtime",
     source: "default",

@@ -58,7 +58,7 @@ import {
   memberPolicyPayload,
   newCapacityDefaults,
 } from "@/lib/capacity-forms";
-import { ANTHROPIC_MESSAGES_ENV } from "@/lib/deployment-feature-gate";
+
 import {
   type GranteePrivacyConfirm,
   granteePrivacyConfirmationFromError,
@@ -91,13 +91,9 @@ type DeleteTarget =
   | { kind: "endpoint"; id: string; label: string }
   | { kind: "model"; id: string; label: string };
 
-export function resolveCapacityAvailability(
-  capacityEnabled: boolean | undefined,
-  isConfigError: boolean,
-): CapacityAvailability {
-  if (capacityEnabled !== undefined) return capacityEnabled ? "enabled" : "disabled";
-  if (isConfigError) return "error";
-  return "loading";
+/** Capacity admission is always on. The historical deployment flag is gone. */
+export function resolveCapacityAvailability(): CapacityAvailability {
+  return "enabled";
 }
 
 function capacityUnavailableReasonKey(availability: CapacityAvailability) {
@@ -592,12 +588,7 @@ function modelSupportsTransformerModalities(
 export function CliEndpointsModelsSection() {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
-  const appConfigQuery = useQuery(orpc.appConfig.queryOptions());
-  const appConfig = appConfigQuery.data;
-  const capacityAvailability = resolveCapacityAvailability(
-    appConfig?.capacityEnabled,
-    appConfigQuery.isError,
-  );
+  const capacityAvailability = resolveCapacityAvailability();
   const capacityEnabled = capacityAvailability === "enabled";
   const {
     data: devicesData,
@@ -1537,13 +1528,11 @@ export function CapacitySetupForm({
 export function ProtocolCompatibilityRadio({
   adaptationEnabled,
   allowLossyDeveloperRoleCollapse,
-  protocolAdaptationAvailable,
   idPrefix,
   onChange,
 }: {
   adaptationEnabled: boolean;
   allowLossyDeveloperRoleCollapse: boolean;
-  protocolAdaptationAvailable: boolean;
   idPrefix: string;
   onChange: (value: {
     adaptationEnabled: boolean;
@@ -1567,7 +1556,7 @@ export function ProtocolCompatibilityRadio({
     ["lossy", true, true],
   ] as const;
   return (
-    <fieldset className="space-y-3" aria-describedby={`${idPrefix}-reason`}>
+    <fieldset className="space-y-3">
       <legend className="text-sm font-medium">{t("dashboard:pools.protocolCompatibility")}</legend>
       {options.map(([value, adaptation, lossy]) => (
         <label
@@ -1580,7 +1569,6 @@ export function ProtocolCompatibilityRadio({
             value={value}
             aria-label={t(`dashboard:pools.protocolOptions.${value}.label`)}
             checked={selected === value}
-            disabled={value !== "native" && !protocolAdaptationAvailable}
             onChange={() =>
               onChange({ adaptationEnabled: adaptation, allowLossyDeveloperRoleCollapse: lossy })
             }
@@ -1595,11 +1583,6 @@ export function ProtocolCompatibilityRadio({
           </span>
         </label>
       ))}
-      {!protocolAdaptationAvailable ? (
-        <p id={`${idPrefix}-reason`} className="text-xs text-muted-foreground">
-          {t("dashboard:pools.protocolAdaptationDisabledReason")}
-        </p>
-      ) : null}
       <details className="rounded-md border p-3 text-sm">
         <summary className="min-h-11 cursor-pointer py-2">
           {t("dashboard:pools.protocolRejectedTitle")}
@@ -1618,9 +1601,6 @@ export function PoolForm({
   directModels,
   capacities = [],
   capacityAvailability,
-  protocolAdaptationAvailable,
-  anthropicMessagesEnabled = false,
-  isDeploymentAdmin = false,
   sections = ["identity", "routing", "capacity", "media"],
 }: {
   mode: "create" | "edit";
@@ -1630,14 +1610,9 @@ export function PoolForm({
   directModels: ReturnType<typeof allDirectModels>;
   capacities?: CapacityRow[];
   capacityAvailability: CapacityAvailability;
-  protocolAdaptationAvailable: boolean;
-  /** Deployment gate from MODEL_API_ANTHROPIC_ENABLED. Off keeps the option visible and disabled. */
-  anthropicMessagesEnabled?: boolean;
-  isDeploymentAdmin?: boolean;
   sections?: Array<"identity" | "routing" | "capacity" | "media">;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
-  const anthropicReasonId = useId();
   const capacityEnabled = capacityAvailability === "enabled";
   const show = (section: "identity" | "routing" | "capacity" | "media") =>
     sections.includes(section);
@@ -1993,34 +1968,18 @@ export function PoolForm({
                   id={field.name}
                   className="flex h-11 w-full rounded-md border border-input bg-transparent px-3 text-sm"
                   value={field.state.value}
-                  aria-describedby={anthropicMessagesEnabled ? undefined : anthropicReasonId}
                   onChange={(event) => {
-                    const next = event.target.value as typeof field.state.value;
-                    if (next === "ANTHROPIC_MESSAGES" && !anthropicMessagesEnabled) return;
                     setSurfaceUnsupported(false);
-                    field.handleChange(next);
+                    field.handleChange(event.target.value as typeof field.state.value);
                   }}
                 >
                   <option value="">{t("dashboard:pools.recommendedAutomatic")}</option>
                   {poolSurfaceValues.map((surface) => (
-                    <option
-                      key={surface}
-                      value={surface}
-                      disabled={surface === "ANTHROPIC_MESSAGES" && !anthropicMessagesEnabled}
-                    >
+                    <option key={surface} value={surface}>
                       {t(`dashboard:pools.wizard.surfaces.${surface}`)}
                     </option>
                   ))}
                 </select>
-                {anthropicMessagesEnabled ? null : (
-                  <p id={anthropicReasonId} className="text-xs text-muted-foreground">
-                    {isDeploymentAdmin
-                      ? t("dashboard:deploymentFeatures.adminEnable", {
-                          variable: ANTHROPIC_MESSAGES_ENV,
-                        })
-                      : t("dashboard:deploymentFeatures.unavailable")}
-                  </p>
-                )}
                 {surfaceUnsupported ? (
                   <p className="text-sm text-destructive">
                     {t("dashboard:pools.wizard.createErrors.SURFACE_NOT_SUPPORTED")}
@@ -2039,7 +1998,6 @@ export function PoolForm({
               <ProtocolCompatibilityRadio
                 adaptationEnabled={adaptation}
                 allowLossyDeveloperRoleCollapse={lossy}
-                protocolAdaptationAvailable={protocolAdaptationAvailable}
                 idPrefix="pool"
                 onChange={(value) => {
                   // Mirrors the override select: changing the adaptation

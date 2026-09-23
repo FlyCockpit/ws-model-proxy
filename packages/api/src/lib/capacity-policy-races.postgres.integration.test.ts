@@ -39,7 +39,6 @@ integration("capacity policy production-router races", () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
     process.env.NODE_ENV = "test";
-    process.env.MODEL_API_GLOBAL_CAPACITY_ENABLED = "true";
     process.env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = "true";
     const [db, dbFactory, capacity, forwarder, provider] = await Promise.all([
       import("@ws-model-proxy/db"),

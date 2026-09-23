@@ -53,9 +53,9 @@ vi.mock("@/utils/orpc", () => ({
       queryOptions: () => ({
         queryKey: ["appConfig"],
         queryFn: async () => ({
-          deploymentFeatures: { MODEL_API_ANTHROPIC_ENABLED: true },
+          deploymentFeatures: {},
         }),
-        initialData: { deploymentFeatures: { MODEL_API_ANTHROPIC_ENABLED: true } },
+        initialData: { deploymentFeatures: {} },
       }),
     },
     forwarderManagement: {

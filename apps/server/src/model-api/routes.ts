@@ -189,11 +189,6 @@ type ModelApiRouteDependencies = {
     | "completeRelayRequest"
   >;
   concurrencyLimiter?: ModelApiConcurrencyLimiter;
-  /** Test/deployment release gate; defaults to the validated env flag. */
-  anthropicEnabled?: boolean;
-  /** Independent release gate for opt-in pool protocol adaptation. */
-  protocolAdaptationEnabled?: boolean;
-  capacityEnabled?: boolean;
   capacityRuntime?: CapacityAdmissionRuntime;
 };
 
@@ -264,7 +259,6 @@ type RelayOperation = {
   contextCount?: ContextCountTelemetry;
   contextInput?: JsonObject;
   adaptation?: {
-    featureEnabled: boolean;
     poolEnabled: boolean;
     allowLossyDeveloperRoleCollapse: boolean;
     requestedSurface: ProtocolSurface;
@@ -1681,8 +1675,7 @@ function executionPathForPoolMember(
 ) {
   const requestedSurface = requestedSurfaceForOperation(operation);
   if (!requestedSurface) return null;
-  const adaptationEnabled =
-    operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled;
+  const adaptationEnabled = operation.adaptation?.poolEnabled === true;
   const responsesOperation = responsesOperationForRelay(operation);
   const rawRequirements = operation.adaptation
     ? profileSurfaceRequest(operation.adaptation.payload)
@@ -3660,8 +3653,7 @@ async function relayPool({
       body: built.body,
       signal: request.signal,
       releaseLocalCapacity: releaseProviderCapacity,
-      adaptationEnabled:
-        operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled,
+      adaptationEnabled: operation.adaptation?.poolEnabled === true,
       chatTestRoutingMode: testRoutingMode,
       forcedPoolMemberId: options?.forcedProviderMemberId ?? forcedPoolMemberId,
       retrySafe:
@@ -4114,7 +4106,7 @@ async function relayPool({
       )
     : members;
   let canonicalAdaptationRequest: ReturnType<typeof parseCanonicalRequest> | null = null;
-  if (operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled) {
+  if (operation.adaptation?.poolEnabled === true) {
     try {
       canonicalAdaptationRequest = parseCanonicalRequest(
         operation.adaptation.requestedSurface,
@@ -4244,8 +4236,7 @@ async function relayPool({
       stream: operation.stream,
       requiredFeatures,
       requestedOutputTokens,
-      adaptationEnabled:
-        operation.adaptation?.featureEnabled === true && operation.adaptation.poolEnabled,
+      adaptationEnabled: operation.adaptation?.poolEnabled === true,
       renderForTarget: canonicalAdaptationRequest
         ? async () => {
             throw new Error("Compatibility probe only.");
@@ -6230,7 +6221,6 @@ async function relayPreparedModeledRequest({
   operation,
   manager,
   limiter,
-  adaptationFeatureEnabled = false,
   capacityRuntime,
 }: {
   request: Request;
@@ -6241,7 +6231,6 @@ async function relayPreparedModeledRequest({
   };
   prepared: PreparedModeledRequest;
   operation: Omit<RelayOperation, "stream" | "buildRequest">;
-  adaptationFeatureEnabled?: boolean;
   capacityRuntime?: CapacityAdmissionRuntime;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
@@ -6361,7 +6350,6 @@ async function relayPreparedModeledRequest({
         (operation.family === "messages" && operation.capability === "messages.create"))
         ? {
             adaptation: {
-              featureEnabled: adaptationFeatureEnabled,
               poolEnabled: poolTarget.protocolAdaptationEnabled,
               allowLossyDeveloperRoleCollapse: poolTarget.allowLossyDeveloperRoleCollapse,
               requestedSurface:
@@ -6401,7 +6389,6 @@ async function authenticatedModeledHandler({
   prepare,
   manager,
   limiter,
-  adaptationFeatureEnabled,
   capacityRuntime,
 }: {
   request: Request;
@@ -6409,7 +6396,6 @@ async function authenticatedModeledHandler({
   prepare: (request: Request) => Promise<PreparedModeledRequest | Response>;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
-  adaptationFeatureEnabled?: boolean;
   capacityRuntime?: CapacityAdmissionRuntime;
 }) {
   const token = await authenticateRequest(request);
@@ -6442,7 +6428,6 @@ async function authenticatedModeledHandler({
       operation,
       manager,
       limiter,
-      adaptationFeatureEnabled,
       capacityRuntime,
     });
     responseReturned = true;
@@ -6457,14 +6442,12 @@ async function completionsHandler({
   family,
   manager,
   limiter,
-  adaptationFeatureEnabled,
   capacityRuntime,
 }: {
   request: Request;
   family: "chat.completions";
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
-  adaptationFeatureEnabled?: boolean;
   capacityRuntime?: CapacityAdmissionRuntime;
 }) {
   return authenticatedModeledHandler({
@@ -6478,7 +6461,6 @@ async function completionsHandler({
     prepare: prepareJsonModeledRequest,
     manager,
     limiter,
-    adaptationFeatureEnabled,
     capacityRuntime,
   });
 }
@@ -6785,13 +6767,11 @@ export async function responsesCreateHandler({
   manager,
   limiter,
   capacityRuntime,
-  adaptationFeatureEnabled,
   chatTestUserId,
 }: {
   request: Request;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
-  adaptationFeatureEnabled?: boolean;
   capacityRuntime?: CapacityAdmissionRuntime;
   chatTestUserId?: string;
 }) {
@@ -6829,7 +6809,6 @@ export async function responsesCreateHandler({
       operation,
       manager,
       limiter,
-      adaptationFeatureEnabled,
       capacityRuntime,
     });
   }
@@ -7010,7 +6989,6 @@ export async function anthropicMessagesHandler({
   countTokens,
   manager,
   limiter,
-  adaptationFeatureEnabled,
   capacityRuntime,
   chatTestUserId,
 }: {
@@ -7018,7 +6996,6 @@ export async function anthropicMessagesHandler({
   countTokens: boolean;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   limiter: ModelApiConcurrencyLimiter;
-  adaptationFeatureEnabled?: boolean;
   capacityRuntime?: CapacityAdmissionRuntime;
   chatTestUserId?: string;
 }) {
@@ -7054,7 +7031,6 @@ export async function anthropicMessagesHandler({
     },
     manager,
     limiter,
-    adaptationFeatureEnabled,
     capacityRuntime,
   });
   // Native upstream success and error bytes are intentionally opaque here.
@@ -7062,18 +7038,18 @@ export async function anthropicMessagesHandler({
   return response;
 }
 
-export function createModelApiRoutes({
-  manager = relaySessionManager,
-  concurrencyLimiter = modelApiConcurrencyLimiter,
-  anthropicEnabled = env.MODEL_API_ANTHROPIC_ENABLED,
-  protocolAdaptationEnabled = env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
-  capacityEnabled = env.MODEL_API_GLOBAL_CAPACITY_ENABLED,
-  capacityRuntime,
-}: ModelApiRouteDependencies = {}) {
+export function createModelApiRoutes(dependencies: ModelApiRouteDependencies = {}) {
+  const manager = dependencies.manager ?? relaySessionManager;
+  const concurrencyLimiter = dependencies.concurrencyLimiter ?? modelApiConcurrencyLimiter;
   const app = new Hono();
-  const admissionRuntime = capacityEnabled
-    ? (capacityRuntime ?? new StoreCapacityAdmissionRuntime(new PostgresCapacityAdmissionStore()))
-    : undefined;
+  // Durable admission is the default. Production always passes the process
+  // runtime. Omitting the property builds the Postgres store so a caller
+  // cannot silently fall back to the in-process limiter. An explicit
+  // capacityRuntime: undefined is only the unit-test double.
+  const admissionRuntime =
+    "capacityRuntime" in dependencies
+      ? dependencies.capacityRuntime
+      : new StoreCapacityAdmissionRuntime(new PostgresCapacityAdmissionStore());
 
   app.get("/models", async (c) => {
     const token = await authenticateRequest(c.req.raw);
@@ -7090,7 +7066,6 @@ export function createModelApiRoutes({
       family: "chat.completions",
       manager,
       limiter: concurrencyLimiter,
-      adaptationFeatureEnabled: protocolAdaptationEnabled,
       capacityRuntime: admissionRuntime,
     }),
   );
@@ -7108,7 +7083,6 @@ export function createModelApiRoutes({
       manager,
       limiter: concurrencyLimiter,
       capacityRuntime: admissionRuntime,
-      adaptationFeatureEnabled: protocolAdaptationEnabled,
     }),
   );
 
@@ -7163,33 +7137,29 @@ export function createModelApiRoutes({
       request: c.req.raw,
       manager,
       limiter: concurrencyLimiter,
-      adaptationFeatureEnabled: protocolAdaptationEnabled,
       capacityRuntime: admissionRuntime,
     }),
   );
 
-  if (anthropicEnabled) {
-    app.post("/messages", async (c) =>
-      anthropicMessagesHandler({
-        request: c.req.raw,
-        countTokens: false,
-        manager,
-        limiter: concurrencyLimiter,
-        adaptationFeatureEnabled: protocolAdaptationEnabled,
-        capacityRuntime: admissionRuntime,
-      }),
-    );
+  app.post("/messages", async (c) =>
+    anthropicMessagesHandler({
+      request: c.req.raw,
+      countTokens: false,
+      manager,
+      limiter: concurrencyLimiter,
+      capacityRuntime: admissionRuntime,
+    }),
+  );
 
-    app.post("/messages/count_tokens", async (c) =>
-      anthropicMessagesHandler({
-        request: c.req.raw,
-        countTokens: true,
-        manager,
-        limiter: concurrencyLimiter,
-        capacityRuntime: admissionRuntime,
-      }),
-    );
-  }
+  app.post("/messages/count_tokens", async (c) =>
+    anthropicMessagesHandler({
+      request: c.req.raw,
+      countTokens: true,
+      manager,
+      limiter: concurrencyLimiter,
+      capacityRuntime: admissionRuntime,
+    }),
+  );
 
   app.post("/responses/count_tokens", async (c) =>
     authenticatedModeledHandler({

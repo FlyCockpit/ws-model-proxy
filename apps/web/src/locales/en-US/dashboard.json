@@ -175,7 +175,6 @@
     "user": "User"
   },
   "deploymentFeatures": {
-    "adminEnable": "Set `{{variable}}=true`",
     "unavailable": "Not available on this deployment.",
     "privateNetworkAdmin": "Private and loopback URLs are rejected. Set `WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS=true`.",
     "privateNetworkUser": "Private and loopback URLs are rejected."
@@ -391,7 +390,6 @@
     "allowLossyDeveloperRoleCollapse": "Allow lossy developer-role collapse",
     "compatibilityDetails": "Protocol compatibility matrix",
     "enableProtocolAdaptation": "Enable strict-subset protocol adaptation",
-    "protocolAdaptationDisabledReason": "Protocol translation is turned off for this deployment.",
     "lossyDeveloperRoleWarning": "Warning: developer instructions may be merged into the system role. Requests containing both roles remain rejected unless this is enabled.",
     "limitations": {
       "native_extensions_unavailable": "native extensions unavailable",
@@ -498,7 +496,7 @@
       "description": "Choose local capacity first, then explicitly decide whether requests may leave your infrastructure.",
       "disabled": "Disabled",
       "egressRequired": "Acknowledge provider egress before attaching any provider target.",
-      "egressWarning": "Provider PRIMARY requests, and overflow requests when enabled, send prompts, attachments, tool definitions, and generated output outside this deployment. The deployment release gate and durable global capacity admission must also be enabled.",
+      "egressWarning": "Provider PRIMARY requests, and overflow requests when enabled, send prompts, attachments, tool definitions, and generated output outside this deployment.",
       "enabled": "Enabled",
       "fields": {
         "concurrency": "Physical concurrency ceiling",
@@ -532,7 +530,7 @@
         "borrowPolicyHint": "Whether this pool may run on idle slots other pools reserved on the shared runtime. NEVER keeps it off them; WHEN_IDLE (default) allows it unless a higher-priority queued request of theirs needs the slot.",
         "protocolAdaptationEnabled": "Allow strict protocol adaptation when a native surface is unavailable",
         "allowLossyDeveloperRoleCollapse": "Allow lossy developer/instruction role collapse",
-        "protocolAdaptationHint": "Adaptation strictly translates requests between API surfaces when a member has no native one. It requires the deployment protocol-adaptation gate; without it the non-native options stay disabled.",
+        "protocolAdaptationHint": "Adaptation strictly translates requests between API surfaces when a member has no native one. Turn it on for this pool to allow non-native options.",
         "affinityEnabled": "Enable cache-affinity routing hints",
         "affinityEnabledHint": "On by default. Requests that continue the same conversation prefer the same member to reuse its warm caches; turn this off to route purely by load.",
         "affinityTtlSeconds": "Affinity record lifetime (seconds)",

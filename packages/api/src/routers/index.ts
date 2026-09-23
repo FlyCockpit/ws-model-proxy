@@ -24,9 +24,6 @@ export const appRouter = {
       env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS,
     );
     const deploymentFeatures = {
-      MODEL_API_ANTHROPIC_ENABLED: env.MODEL_API_ANTHROPIC_ENABLED,
-      MODEL_API_PROTOCOL_ADAPTATION_ENABLED: env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
-      MODEL_API_GLOBAL_CAPACITY_ENABLED: env.MODEL_API_GLOBAL_CAPACITY_ENABLED,
       WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: {
         enabled: env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED,
         keyringConfigured,
@@ -44,8 +41,6 @@ export const appRouter = {
       ssoProviderName: "SSO",
       signupEnabled: deploymentFeatures.SIGNUP_ENABLED,
       adminBootstrapSignupEnabled: signupAccess.adminBootstrapSignupEnabled,
-      capacityEnabled: deploymentFeatures.MODEL_API_GLOBAL_CAPACITY_ENABLED,
-      protocolAdaptationAvailable: deploymentFeatures.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
       providerEgressEnabled: deploymentFeatures.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED.enabled,
       // Gates the login challenge's "email me a code" affordance. The delivery
       // unreliability of Better-Auth's send-otp endpoint (it swallows SMTP

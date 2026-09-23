@@ -313,13 +313,11 @@ export async function createApp(options: CreateAppOptions = {}) {
     }
     return generalModelApiBodyLimit(c, next);
   });
-  const capacityLifecycle = env.MODEL_API_GLOBAL_CAPACITY_ENABLED
-    ? createProductionCapacityRuntime()
-    : undefined;
+  const capacityLifecycle = createProductionCapacityRuntime();
   app.route(
     "/v1",
     createModelApiRoutes({
-      capacityRuntime: capacityLifecycle?.runtime,
+      capacityRuntime: capacityLifecycle.runtime,
     }),
   );
 

@@ -6,6 +6,7 @@ import type { Session } from "@ws-model-proxy/auth";
 import { Hono } from "hono";
 import { beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import type { ActiveRelayResponseHandlers, RelaySessionManager } from "../relay/session-manager.js";
+import type { CapacityAdmissionRuntime } from "./capacity/runtime.js";
 
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
@@ -236,6 +237,13 @@ function directRow() {
       },
       CliDevice: { status: "CONNECTED" },
     },
+    ExecutionTarget: {
+      id: "model-target",
+      inferenceCapacityId: "model-capacity",
+      directContextCeiling: null,
+      directContextMargin: 0,
+      InferenceCapacity: null,
+    },
   };
 }
 
@@ -268,7 +276,7 @@ function poolMemberRow(native: "chat" | "responses" = "responses") {
     },
     ExecutionTarget: {
       id: "member-target",
-      inferenceCapacityId: null,
+      inferenceCapacityId: "member-capacity",
       InferenceCapacity: null,
       DiscoveredModel: null,
     },
@@ -341,6 +349,29 @@ function publicOverflowPoolRow() {
   };
 }
 
+function admittingCapacityRuntime(): CapacityAdmissionRuntime {
+  return {
+    acquire: vi.fn(async (attempt) => {
+      const selected = attempt.candidates[0];
+      if (!selected) return { state: "CANCELLED" as const };
+      return {
+        state: "ADMITTED" as const,
+        lease: {
+          leaseId: `lease-${selected.poolMemberId ?? selected.executionTargetId}`,
+          attemptId: attempt.attemptId,
+          capacityId: selected.capacityId,
+          executionTargetId: selected.executionTargetId,
+          poolMemberId: selected.poolMemberId,
+          fencingToken: 1n,
+          expiresAt: new Date(Date.now() + 30_000),
+        },
+      };
+    }),
+    release: vi.fn(async () => true),
+    hold: vi.fn((response) => response),
+  };
+}
+
 function appWith(manager: FakeRelayManager, authSession: Session | null = session) {
   const app = new Hono<{ Variables: { session: Session | null } }>();
   app.use("*", async (c, next) => {
@@ -352,6 +383,7 @@ function appWith(manager: FakeRelayManager, authSession: Session | null = sessio
     createChatTestRoutes({
       manager,
       concurrencyLimiter: new ModelApiConcurrencyLimiter(),
+      capacityRuntime: admittingCapacityRuntime(),
     }),
   );
   return app;

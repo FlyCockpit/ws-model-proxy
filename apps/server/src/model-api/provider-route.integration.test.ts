@@ -109,9 +109,6 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     process.env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = "true";
     process.env.WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS = "true";
     process.env.WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS = `route-v1:${Buffer.alloc(32, 19).toString("base64")}`;
-    process.env.MODEL_API_ANTHROPIC_ENABLED = "true";
-    process.env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = "true";
-    process.env.MODEL_API_GLOBAL_CAPACITY_ENABLED = "true";
     const [prismaModule, security, routes, chatTest, identifiers, credentials, protocols] =
       await Promise.all([
         import("@ws-model-proxy/db"),
@@ -751,9 +748,6 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         })()
       : modules.routes.createModelApiRoutes({
           manager,
-          anthropicEnabled: true,
-          protocolAdaptationEnabled: true,
-          capacityEnabled: true,
         });
     const modelId = modules.identifiers.poolModelId({
       userSlug: user.slug,

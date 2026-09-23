@@ -14,9 +14,6 @@ import { RequestSettingsFields } from "@/components/chat-test/request-settings";
 import { DeploymentFeaturesPanel } from "@/components/deployment-features-panel";
 
 const features = {
-  MODEL_API_ANTHROPIC_ENABLED: false,
-  MODEL_API_PROTOCOL_ADAPTATION_ENABLED: false,
-  MODEL_API_GLOBAL_CAPACITY_ENABLED: false,
   WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: {
     enabled: false,
     keyringConfigured: false,
@@ -28,7 +25,7 @@ const features = {
   SIGNUP_ENABLED: false,
 };
 
-function renderSurface(isDeploymentAdmin: boolean) {
+function renderSurface() {
   return render(
     <RequestSettingsFields
       idPrefix="chat-test"
@@ -44,8 +41,6 @@ function renderSurface(isDeploymentAdmin: boolean) {
       anthropicMaxTokens={1024}
       onAnthropicMaxTokensChange={() => undefined}
       disabled={false}
-      anthropicMessagesEnabled={false}
-      isDeploymentAdmin={isDeploymentAdmin}
       onSurfaceChange={() => undefined}
       onRoutingModeChange={() => undefined}
       onReasoningChange={() => undefined}
@@ -58,38 +53,19 @@ afterEach(() => {
 });
 
 describe("deployment feature gates", () => {
-  it("keeps Anthropic Messages visible and disabled when the flag is off", () => {
-    renderSurface(true);
+  it("keeps Anthropic Messages selectable like the other surfaces", () => {
+    renderSurface();
     const option = screen.getByRole("option", {
       name: "dashboard:chatTest.surface.ANTHROPIC_MESSAGES",
     });
     expect(option).toBeTruthy();
-    expect((option as HTMLOptionElement).disabled).toBe(true);
-    expect(
-      screen.getByText("dashboard:deploymentFeatures.adminEnable:MODEL_API_ANTHROPIC_ENABLED"),
-    ).toBeTruthy();
-
-    cleanup();
-    renderSurface(false);
-    expect(
-      screen.getByRole("option", { name: "dashboard:chatTest.surface.ANTHROPIC_MESSAGES" }),
-    ).toBeTruthy();
-    expect(
-      (
-        screen.getByRole("option", {
-          name: "dashboard:chatTest.surface.ANTHROPIC_MESSAGES",
-        }) as HTMLOptionElement
-      ).disabled,
-    ).toBe(true);
-    expect(screen.getByText("dashboard:deploymentFeatures.unavailable")).toBeTruthy();
+    expect((option as HTMLOptionElement).disabled).toBe(false);
+    expect(screen.queryByText("dashboard:deploymentFeatures.unavailable")).toBeNull();
   });
 
-  it("lists every deployment flag on the admin panel, including the Anthropic variable", () => {
+  it("lists the remaining deployment flags on the admin panel", () => {
     render(<DeploymentFeaturesPanel features={features} />);
     for (const name of [
-      "MODEL_API_ANTHROPIC_ENABLED",
-      "MODEL_API_PROTOCOL_ADAPTATION_ENABLED",
-      "MODEL_API_GLOBAL_CAPACITY_ENABLED",
       "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED",
       "keyringConfigured",
       "ready",

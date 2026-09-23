@@ -20,10 +20,10 @@ import { Label } from "@ws-model-proxy/ui/components/label";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ShieldCheck } from "lucide-react";
 import type { ReactNode } from "react";
-import { useId, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ProtocolCompatibilityRadio } from "@/components/forwarder-dashboard-sections";
-import { ANTHROPIC_MESSAGES_ENV } from "@/lib/deployment-feature-gate";
+
 import {
   buildGuardedPoolWizardSchema,
   combinedPrimaryMemberCount,
@@ -140,10 +140,7 @@ export function GuardedPoolSetupWizard({
   initialStep = 0,
   initialProviderModelIds = [],
   capacityEnabled,
-  protocolAdaptationAvailable,
   providerEgressEnabled,
-  anthropicMessagesEnabled = false,
-  isDeploymentAdmin = false,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -154,15 +151,10 @@ export function GuardedPoolSetupWizard({
   initialStep?: 0 | 1 | 2 | 3;
   initialProviderModelIds?: string[];
   capacityEnabled: boolean;
-  protocolAdaptationAvailable: boolean;
   /** Deployment gate from WMP_PUBLIC_PROVIDER_EGRESS_ENABLED; false blocks provider selection. */
   providerEgressEnabled: boolean;
-  /** Deployment gate from MODEL_API_ANTHROPIC_ENABLED. Off keeps the option visible and disabled. */
-  anthropicMessagesEnabled?: boolean;
-  isDeploymentAdmin?: boolean;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
-  const anthropicReasonId = useId();
   const queryClient = useQueryClient();
   const capacityIsEnabled = capacityEnabled;
   const formRef = useRef<HTMLFormElement>(null);
@@ -210,7 +202,6 @@ export function GuardedPoolSetupWizard({
   // reflects the live egress gate, candidates, and capacities.
   const schema = buildGuardedPoolWizardSchema({
     providerEgressEnabled,
-    protocolAdaptationAvailable,
     directModels,
     providerModels: candidates.data ?? [],
     capacities: capacities.data ?? [],
@@ -278,12 +269,9 @@ export function GuardedPoolSetupWizard({
             physicalCountStrategy: value.physicalCountStrategy,
             contextMargin: value.contextMargin,
             borrowPolicy: value.borrowPolicy,
-            protocolAdaptationEnabled:
-              protocolAdaptationAvailable && value.protocolAdaptationEnabled,
+            protocolAdaptationEnabled: value.protocolAdaptationEnabled,
             allowLossyDeveloperRoleCollapse:
-              protocolAdaptationAvailable &&
-              value.protocolAdaptationEnabled &&
-              value.allowLossyDeveloperRoleCollapse,
+              value.protocolAdaptationEnabled && value.allowLossyDeveloperRoleCollapse,
             affinity: {
               enabled: value.affinityEnabled,
               ttlSeconds: value.affinityTtlSeconds,
@@ -371,7 +359,7 @@ export function GuardedPoolSetupWizard({
       },
       firstMemberSelection,
     );
-    if (!anthropicMessagesEnabled && decision.surface === "ANTHROPIC_MESSAGES") return;
+
     recommendedSurfaceFlags.current = decision.flags;
     if (decision.surface !== form.state.values.recommendedSurface)
       form.setFieldValue("recommendedSurface", decision.surface);
@@ -562,7 +550,6 @@ export function GuardedPoolSetupWizard({
                                     providerIds: form.state.values.providerModelIds,
                                     providerTier: form.state.values.providerTier,
                                     protocolAdaptationEnabled:
-                                      protocolAdaptationAvailable &&
                                       form.state.values.protocolAdaptationEnabled,
                                   },
                                   // First-PRIMARY-member trigger: the combined
@@ -782,7 +769,6 @@ export function GuardedPoolSetupWizard({
                       <ProtocolCompatibilityRadio
                         adaptationEnabled={adaptation}
                         allowLossyDeveloperRoleCollapse={lossy}
-                        protocolAdaptationAvailable={protocolAdaptationAvailable}
                         idPrefix="guarded"
                         onChange={(value) => {
                           form.setFieldValue("protocolAdaptationEnabled", value.adaptationEnabled);
@@ -794,8 +780,7 @@ export function GuardedPoolSetupWizard({
                             localIds: form.state.values.localModelIds,
                             providerIds: form.state.values.providerModelIds,
                             providerTier: form.state.values.providerTier,
-                            protocolAdaptationEnabled:
-                              protocolAdaptationAvailable && value.adaptationEnabled,
+                            protocolAdaptationEnabled: value.adaptationEnabled,
                           });
                         }}
                       />
@@ -892,9 +877,7 @@ export function GuardedPoolSetupWizard({
                       className="h-11 w-full rounded-md border bg-background px-3 text-sm"
                       value={field.state.value}
                       onChange={(event) => {
-                        const next = event.target.value as typeof field.state.value;
-                        if (next === "ANTHROPIC_MESSAGES" && !anthropicMessagesEnabled) return;
-                        field.handleChange(next);
+                        field.handleChange(event.target.value as typeof field.state.value);
                         recommendedSurfaceFlags.current = {
                           ...recommendedSurfaceFlags.current,
                           manuallyChosen: true,
@@ -902,33 +885,17 @@ export function GuardedPoolSetupWizard({
                       }}
                       {...errorProps("recommendedSurface")}
                       aria-describedby={
-                        [
-                          anthropicMessagesEnabled ? null : anthropicReasonId,
-                          stepErrors.recommendedSurface ? "wizard-recommendedSurface-error" : null,
-                        ]
-                          .filter((id): id is string => Boolean(id))
-                          .join(" ") || undefined
+                        stepErrors.recommendedSurface
+                          ? "wizard-recommendedSurface-error"
+                          : undefined
                       }
                     >
                       {guardedWizardSurfaces.map((surface) => (
-                        <option
-                          key={surface}
-                          value={surface}
-                          disabled={surface === "ANTHROPIC_MESSAGES" && !anthropicMessagesEnabled}
-                        >
+                        <option key={surface} value={surface}>
                           {t(`dashboard:pools.wizard.surfaces.${surface}`)}
                         </option>
                       ))}
                     </select>
-                    {anthropicMessagesEnabled ? null : (
-                      <p id={anthropicReasonId} className="text-xs text-muted-foreground">
-                        {isDeploymentAdmin
-                          ? t("dashboard:deploymentFeatures.adminEnable", {
-                              variable: ANTHROPIC_MESSAGES_ENV,
-                            })
-                          : t("dashboard:deploymentFeatures.unavailable")}
-                      </p>
-                    )}
                     <p className="text-xs text-muted-foreground">
                       {t("dashboard:pools.wizard.fields.recommendedSurfaceHint")}
                     </p>
@@ -998,7 +965,6 @@ export function GuardedPoolSetupWizard({
                                     providerIds: next,
                                     providerTier: tier,
                                     protocolAdaptationEnabled:
-                                      protocolAdaptationAvailable &&
                                       form.state.values.protocolAdaptationEnabled,
                                   },
                                   // Only a PRIMARY-tier provider can be the
@@ -1109,9 +1075,7 @@ export function GuardedPoolSetupWizard({
                             localIds: form.state.values.localModelIds,
                             providerIds,
                             providerTier: tier,
-                            protocolAdaptationEnabled:
-                              protocolAdaptationAvailable &&
-                              form.state.values.protocolAdaptationEnabled,
+                            protocolAdaptationEnabled: form.state.values.protocolAdaptationEnabled,
                           },
                           // Compare the combined primary count under the
                           // previous vs next tier: covers a provider selected

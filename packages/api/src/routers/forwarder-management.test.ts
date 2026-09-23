@@ -14,8 +14,6 @@ import { assertPoolSlugAvailable, forwarderManagementRouter } from "./forwarder-
 
 const testEnv = vi.hoisted(() => ({
   WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
-  MODEL_API_PROTOCOL_ADAPTATION_ENABLED: true,
-  MODEL_API_GLOBAL_CAPACITY_ENABLED: true,
 }));
 
 const mailerState = vi.hoisted(() => ({
@@ -248,8 +246,6 @@ describe("forwarderManagementRouter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     testEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
-    testEnv.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = true;
-    testEnv.MODEL_API_GLOBAL_CAPACITY_ENABLED = true;
     db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
       callback(db),
     );
@@ -1434,28 +1430,7 @@ describe("forwarderManagementRouter", () => {
     expect(db.modelPool.create).not.toHaveBeenCalled();
   });
 
-  it("ignores the pool adaptation flag when the deployment adaptation gate is disabled", async () => {
-    // The pool opts into adaptation, but the deployment gate is off: an
-    // adapted-only surface for the selection must still be rejected, while a
-    // natively-served surface stays acceptable under the same env.
-    testEnv.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = false;
-    db.modelPool.findUnique.mockResolvedValue(null);
-    db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel({}, "chat")]);
-
-    await expect(
-      client().createGuardedModelPool({
-        ...guardedCreateBase,
-        advanced: guardedAdvancedBase({ protocolAdaptationEnabled: true }),
-      }),
-    ).rejects.toMatchObject({
-      code: "BAD_REQUEST",
-      data: { reason: "SURFACE_NOT_SUPPORTED" },
-    });
-    expect(db.modelPool.create).not.toHaveBeenCalled();
-  });
-
-  it("accepts a natively-served recommended API while the deployment adaptation gate is disabled", async () => {
-    testEnv.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = false;
+  it("accepts a natively served recommended API when the pool opts into adaptation", async () => {
     db.modelPool.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(poolRow());
     db.discoveredModel.findMany.mockResolvedValue([guardedLocalModel({}, "chat")]);
     db.executionTarget.findMany.mockResolvedValue([guardedLocalTarget()]);
@@ -1463,9 +1438,8 @@ describe("forwarderManagementRouter", () => {
     db.modelPool.create.mockResolvedValue({ id: "pool-id" });
     db.poolMember.create.mockResolvedValue({ id: "member-id" });
 
-    // The chat-native member serves OPENAI_CHAT_COMPLETIONS natively, so the
-    // disabled adaptation gate must not block the create even though the pool
-    // payload carries protocolAdaptationEnabled: true.
+    // The chat-native member serves OPENAI_CHAT_COMPLETIONS natively, so
+    // opting the pool into adaptation must not block that surface.
     await expect(
       client().createGuardedModelPool({
         ...guardedCreateBase,
@@ -2076,25 +2050,6 @@ describe("forwarderManagementRouter", () => {
       client().updateModelPool({ id: "pool-id", publicEgressEnabled: true }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect(db.modelPool.update).not.toHaveBeenCalled();
-  });
-
-  it("only applies the capacity deployment gate when a pool capacity field is supplied", async () => {
-    testEnv.MODEL_API_GLOBAL_CAPACITY_ENABLED = false;
-    const existing = poolRow({ id: "pool-id", userId: "user-id" });
-    db.modelPool.findUnique.mockResolvedValue(existing);
-    db.modelPool.update.mockResolvedValue(existing);
-
-    await expect(
-      client().updateModelPool({ id: "pool-id", name: "Renamed" }),
-    ).resolves.toMatchObject({
-      id: "pool-id",
-    });
-    await expect(
-      client().updateModelPool({ id: "pool-id", capacityPriority: 17 }),
-    ).rejects.toMatchObject({
-      code: "NOT_FOUND",
-      message: "Capacity management is disabled for this deployment.",
-    });
   });
 
   it.each([
@@ -2764,8 +2719,7 @@ describe("forwarderManagementRouter", () => {
     });
   });
 
-  it("uses the deployment protocol gate for compatibility serialization", async () => {
-    testEnv.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = false;
+  it("serializes adapted surfaces from the pool adaptation flag alone", async () => {
     db.modelPool.findMany.mockResolvedValue([
       poolRow({
         protocolAdaptationEnabled: true,
@@ -2801,12 +2755,10 @@ describe("forwarderManagementRouter", () => {
 
     const [result] = await client().listModelPools();
 
-    expect(result?.protocolAdaptationAvailable).toBe(false);
     expect(result?.compatibility.surfaces.OPENAI_RESPONSES).toMatchObject({
-      adapted: 0,
-      unavailable: 1,
+      adapted: 1,
     });
-    expect(result?.compatibility.warnings).not.toContain("developer_role_collapse_lossy");
+    expect(result?.compatibility.warnings).toContain("developer_role_collapse_lossy");
   });
 
   it("rejects legacy Completions as a recommended pool API", async () => {
@@ -4304,22 +4256,17 @@ describe("forwarderManagementRouter", () => {
       expect(db.modelPool.update).toHaveBeenCalledTimes(1);
     });
 
-    it("ignores the pool adaptation flag on update when the deployment gate is disabled", async () => {
-      testEnv.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = false;
+    it("accepts an adapted-only override when the pool adaptation flag is on", async () => {
       db.modelPool.findUnique.mockResolvedValue(
         surfacePoolRow({ protocolAdaptationEnabled: true }),
       );
       db.poolMember.findMany.mockResolvedValue([surfaceMemberRow("member-a", "chat")]);
+      db.modelPool.update.mockResolvedValue(surfacePoolRow({ protocolAdaptationEnabled: true }));
 
-      // The pool flag stays on, but the deployment gate is off: the
-      // adaptation-only override must still be rejected on revalidation.
       await expect(
         client().updateModelPool({ id: "pool-id", recommendedSurfaceOverride: "OPENAI_RESPONSES" }),
-      ).rejects.toMatchObject({
-        code: "BAD_REQUEST",
-        data: { reason: "SURFACE_NOT_SUPPORTED" },
-      });
-      expect(db.modelPool.update).not.toHaveBeenCalled();
+      ).resolves.toMatchObject({ id: "pool-id" });
+      expect(db.modelPool.update).toHaveBeenCalledTimes(1);
     });
 
     it("accepts any override on update for a pool with no primary members", async () => {

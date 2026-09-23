@@ -7,12 +7,8 @@ import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Context } from "../context";
 
-const envMock = vi.hoisted(() => ({
-  MODEL_API_GLOBAL_CAPACITY_ENABLED: true,
-  MODEL_API_PROTOCOL_ADAPTATION_ENABLED: true,
-}));
 vi.mock("@ws-model-proxy/env/server", () => ({
-  env: envMock,
+  env: {},
 }));
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
@@ -92,38 +88,11 @@ function httpClient(captures?: Array<{ status: number; body: string }>) {
 describe("capacityManagementRouter", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    envMock.MODEL_API_GLOBAL_CAPACITY_ENABLED = true;
-    envMock.MODEL_API_PROTOCOL_ADAPTATION_ENABLED = true;
     db.appSetting.findUnique.mockResolvedValue(null);
     db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
       callback(db),
     );
     db.capacityAuditEvent.create.mockResolvedValue({ id: "audit" });
-  });
-
-  it("returns an empty list without querying when capacity is disabled", async () => {
-    envMock.MODEL_API_GLOBAL_CAPACITY_ENABLED = false;
-    const client = createRouterClient(capacityManagementRouter, { context });
-
-    await expect(client.list()).resolves.toEqual([]);
-    expect(db.inferenceCapacity.findMany).not.toHaveBeenCalled();
-  });
-
-  it("keeps mutations hidden when capacity is disabled", async () => {
-    envMock.MODEL_API_GLOBAL_CAPACITY_ENABLED = false;
-    const client = createRouterClient(capacityManagementRouter, { context });
-
-    await expect(
-      client.create({
-        label: "GPU",
-        runtimeIdentityKey: "host:model",
-        runtimeModel: "model",
-        hardConcurrencyLimit: 2,
-        physicalMaxContext: 4096,
-        countStrategy: "CONSERVATIVE_ESTIMATE",
-      }),
-    ).rejects.toMatchObject({ code: "NOT_FOUND" });
-    expect(db.inferenceCapacity.create).not.toHaveBeenCalled();
   });
 
   it("lists owner-scoped capacities with aggregate load only", async () => {

@@ -150,7 +150,6 @@ function renderStep(
         onOpenChange={() => undefined}
         directModels={[localModel]}
         initialStep={initialStep}
-        protocolAdaptationAvailable
         initialProviderModelIds={initialProviderModelIds}
         capacityEnabled
         providerEgressEnabled={providerEgressEnabled}
@@ -355,7 +354,6 @@ describe("GuardedPoolSetupWizard", () => {
   it("schema rejects provider selections under its own path when egress is disabled", () => {
     const result = buildGuardedPoolWizardSchema({
       providerEgressEnabled: false,
-      protocolAdaptationAvailable: false,
       directModels: [localModel],
       providerModels: [],
       capacities: [],
@@ -369,7 +367,6 @@ describe("GuardedPoolSetupWizard", () => {
   it("schema accepts the same provider selection when egress is enabled", () => {
     const result = buildGuardedPoolWizardSchema({
       providerEgressEnabled: true,
-      protocolAdaptationAvailable: false,
       directModels: [localModel],
       providerModels: [],
       capacities: [],

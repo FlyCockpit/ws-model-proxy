@@ -1,10 +1,8 @@
 import { ORPCError } from "@orpc/server";
 import prisma, { Prisma } from "@ws-model-proxy/db";
-import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
 import {
-  assertCapacityManagementEnabled,
   assertDirectCapacityPolicy,
   assertEffectiveConcurrencyPolicy,
   assertEffectiveContextPolicy,
@@ -32,10 +30,6 @@ const countStrategy = z.enum([
   "ENGINE_REPORTED",
   "CONSERVATIVE_ESTIMATE",
 ]);
-
-function enabled() {
-  assertCapacityManagementEnabled(env.MODEL_API_GLOBAL_CAPACITY_ENABLED);
-}
 
 function notFound(): never {
   throw new ORPCError("NOT_FOUND", { message: "Capacity resource not found." });
@@ -162,7 +156,6 @@ const memberPolicy = z
 
 export const capacityManagementRouter = {
   list: protectedProcedure.handler(async ({ context }) => {
-    if (!env.MODEL_API_GLOBAL_CAPACITY_ENABLED) return [];
     const userId = context.session.user.id;
     return prisma.inferenceCapacity.findMany({
       where: { userId },
@@ -182,7 +175,6 @@ export const capacityManagementRouter = {
   listAudit: protectedProcedure
     .input(z.object({ limit: z.number().int().min(1).max(200).default(50) }).optional())
     .handler(async ({ input, context }) => {
-      enabled();
       return prisma.capacityAuditEvent.findMany({
         where: { userId: context.session.user.id },
         orderBy: [{ createdAt: "desc" }, { id: "desc" }],
@@ -191,7 +183,6 @@ export const capacityManagementRouter = {
     }),
 
   create: protectedProcedure.input(z.object(capacityFields)).handler(async ({ input, context }) => {
-    enabled();
     if (
       input.hardConcurrencyLimit !== null &&
       input.hardConcurrencyLimit !== undefined &&
@@ -225,7 +216,6 @@ export const capacityManagementRouter = {
       }),
     )
     .handler(async ({ input, context }) => {
-      enabled();
       const { id: capacityId, ...data } = input;
       const userId = context.session.user.id;
       return capacityTransaction(
@@ -342,7 +332,6 @@ export const capacityManagementRouter = {
     }),
 
   remove: protectedProcedure.input(z.object({ id })).handler(async ({ input, context }) => {
-    enabled();
     const userId = context.session.user.id;
     return capacityTransaction(
       async (tx) => {
@@ -369,7 +358,6 @@ export const capacityManagementRouter = {
   }),
 
   updateDirectPolicy: protectedProcedure.input(directPolicy).handler(async ({ input, context }) => {
-    enabled();
     const userId = context.session.user.id;
     return capacityTransaction(
       async (tx) => {
@@ -495,7 +483,6 @@ export const capacityManagementRouter = {
       }),
     )
     .handler(async ({ input, context }) => {
-      enabled();
       const userId = context.session.user.id;
       return capacityTransaction(
         async (tx) => {
@@ -560,9 +547,7 @@ export const capacityManagementRouter = {
             assertRecommendedSurfaceServable({
               override: parseModelApiSurface(pool.recommendedSurfaceOverride),
               members,
-              adaptationEnabled:
-                (input.protocolAdaptationEnabled ?? pool.protocolAdaptationEnabled) &&
-                env.MODEL_API_PROTOCOL_ADAPTATION_ENABLED,
+              adaptationEnabled: input.protocolAdaptationEnabled ?? pool.protocolAdaptationEnabled,
             });
           }
           const { modelPoolId, ...data } = input;
@@ -582,7 +567,6 @@ export const capacityManagementRouter = {
     }),
 
   updateMemberPolicy: protectedProcedure.input(memberPolicy).handler(async ({ input, context }) => {
-    enabled();
     const userId = context.session.user.id;
     const normalizedInput = {
       ...input,

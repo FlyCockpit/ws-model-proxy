@@ -212,9 +212,6 @@
       "ready": "Ready",
       "notReady": "Not ready",
       "flags": {
-        "MODEL_API_ANTHROPIC_ENABLED": "Native Anthropic Messages API routes.",
-        "MODEL_API_PROTOCOL_ADAPTATION_ENABLED": "Cross-protocol adaptation for model pools.",
-        "MODEL_API_GLOBAL_CAPACITY_ENABLED": "Durable global capacity admission.",
         "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED": "Direct public-provider egress.",
         "keyringConfigured": "Whether WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS is set. The key itself is never shown.",
         "ready": "Egress is enabled and the credential keyring is configured.",

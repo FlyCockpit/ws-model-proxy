@@ -7,7 +7,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const state = vi.hoisted(() => ({
   mutationCalls: [] as string[],
   mutationPayloads: [] as Array<{ name: string; input: unknown }>,
-  protocolAdaptationAvailable: true,
   nextReject: null as { name: string; error: unknown } | null,
   cliDevices: [] as Array<Record<string, unknown>>,
   capabilityImpact: [] as Array<{ id: string; slug: string; surface: string }>,
@@ -198,7 +197,6 @@ const editablePool = {
   maxAttachmentBytes: null,
   optimisticBasicTranscription: false,
   protocolAdaptationEnabled: false,
-  protocolAdaptationAvailable: true,
   allowLossyDeveloperRoleCollapse: false,
   publicEgressEnabled: false,
   publicEgressAcknowledged: false,
@@ -227,7 +225,7 @@ const editablePool = {
 };
 
 function mount(
-  protocolAdaptationAvailable = true,
+  _protocolAdaptationAvailable = true,
   options: {
     mode?: "create" | "edit";
     capacityAvailability?: "enabled" | "disabled";
@@ -245,8 +243,7 @@ function mount(
         pool={mode === "edit" ? (options.pool ?? editablePool) : undefined}
         directModels={[]}
         capacities={[]}
-        capacityAvailability={options.capacityAvailability ?? "disabled"}
-        protocolAdaptationAvailable={protocolAdaptationAvailable}
+        capacityAvailability={options.capacityAvailability ?? "enabled"}
         sections={options.sections}
         onSuccess={() => undefined}
       />
@@ -478,15 +475,6 @@ describe("PoolForm protocol adaptation controls", () => {
         }),
       },
     ]);
-  });
-
-  it("omits capacity fields for a capacity-disabled edit", async () => {
-    mount(true, { mode: "edit", capacityAvailability: "disabled" });
-
-    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
-
-    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
-    expect(state.mutationPayloads[0]?.input).not.toHaveProperty("capacityPriority");
   });
 
   it("maps a SURFACE_NOT_SUPPORTED update rejection onto the recommended-API field", async () => {

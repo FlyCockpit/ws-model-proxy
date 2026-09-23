@@ -1,5 +1,4 @@
 import type { Session } from "@ws-model-proxy/auth";
-import { env } from "@ws-model-proxy/env/server";
 import { Hono } from "hono";
 import { relaySessionManager } from "../relay/session-manager.js";
 import { type DiagnosticCoreDependencies, diagnosticsCapacityRuntime } from "./diagnostics.js";
@@ -11,9 +10,7 @@ import {
   responsesCreateHandler,
 } from "./routes.js";
 
-type ChatTestRouteDependencies = DiagnosticCoreDependencies & {
-  capacityEnabled?: boolean;
-};
+type ChatTestRouteDependencies = DiagnosticCoreDependencies;
 
 type ChatTestVariables = {
   session: Session | null;
@@ -22,16 +19,13 @@ type ChatTestVariables = {
 export function createChatTestRoutes({
   manager = relaySessionManager,
   concurrencyLimiter = modelApiConcurrencyLimiter,
-  capacityEnabled = env.MODEL_API_GLOBAL_CAPACITY_ENABLED,
   capacityRuntime,
 }: ChatTestRouteDependencies = {}) {
   const app = new Hono<{ Variables: ChatTestVariables }>();
-  // Phase 5: the ONE module-lifetime diagnostics capacity runtime, shared
-  // with the MCP chat completion test tool (model-api/diagnostics.ts). An
-  // injected runtime still wins (tests); the flag-off case stays undefined.
-  const admissionRuntime = capacityEnabled
-    ? (capacityRuntime ?? diagnosticsCapacityRuntime())
-    : undefined;
+  // One module-lifetime diagnostics capacity runtime, shared with the MCP
+  // chat completion test tool. An injected runtime still wins in tests.
+  // Admission is always installed; there is no limiter-only fallback.
+  const admissionRuntime = capacityRuntime ?? diagnosticsCapacityRuntime();
 
   app.post("/chat/completions", async (c) => {
     const session = c.get("session");
@@ -57,7 +51,6 @@ export function createChatTestRoutes({
       chatTestUserId: session.user.id,
       manager,
       limiter: concurrencyLimiter,
-      adaptationFeatureEnabled: true,
       capacityRuntime: admissionRuntime,
     });
   });
@@ -72,7 +65,6 @@ export function createChatTestRoutes({
       countTokens: false,
       manager,
       limiter: concurrencyLimiter,
-      adaptationFeatureEnabled: true,
       capacityRuntime: admissionRuntime,
     });
   });
