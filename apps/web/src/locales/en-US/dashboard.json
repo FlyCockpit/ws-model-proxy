@@ -20,7 +20,7 @@
     "inventoryAcknowledged": "Inventory #{{sequence}} acknowledged: {{value}}",
     "inventoryUnconfirmed": "Inventory has not been acknowledged",
     "loadFailed": "Failed to load CLI metadata.",
-    "searchLabel": "Search endpoints and models",
+    "searchLabel": "Search CLIs, endpoints, and models",
     "healthFilterLabel": "Endpoint health filter",
     "filters": {
       "all": "All",
@@ -28,7 +28,7 @@
       "offline": "Offline",
       "stale": "Stale"
     },
-    "searchPlaceholder": "Search model ID, upstream ID, endpoint, or label",
+    "searchPlaceholder": "Search CLI name, model ID, upstream ID, or endpoint",
     "noSearchResults": "No endpoints or models match that search.",
     "title": "CLIs, Endpoints, and Models",
     "features": {
@@ -39,6 +39,22 @@
       "windows": "Not supported on Windows yet",
       "configDisabled": "Disabled in this CLI's wsmp config — edit and restart wsmp",
       "updateWsmp": "Update wsmp to use this"
+    },
+    "rename": {
+      "action": "Rename",
+      "actionLabel": "Rename {{name}}",
+      "title": "Rename CLI",
+      "description": "The name shows only in this dashboard. Model IDs keep using the slug {{slug}}.",
+      "field": "Name",
+      "hint": "Leave blank to show {{fallback}}.",
+      "tooLong": "Use at most {{max}} characters.",
+      "invalidCharacters": "Remove control or invisible formatting characters.",
+      "save": "Save name",
+      "saving": "Saving…",
+      "cancel": "Cancel",
+      "saved": "CLI renamed",
+      "cleared": "CLI name cleared",
+      "saveFailed": "Couldn't rename this CLI. Try again."
     }
   },
   "chatTest": {
@@ -179,7 +195,6 @@
     "privateNetworkAdmin": "Private and loopback URLs are rejected. Set `WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS=true`.",
     "privateNetworkUser": "Private and loopback URLs are rejected."
   },
-  "description": "Operate connected CLIs, model pools, credentials, and relay metadata.",
   "endpoints": {
     "empty": "No endpoints have registered for this CLI.",
     "failureReason": "Last probe failure: {{reason}}",
@@ -188,6 +203,7 @@
   "loadFailed": "Failed to load dashboard.",
   "metadata": {
     "delete": "Delete metadata",
+    "deleteCliDescription": "This deletes the CLI device and signs it out: its device login is deleted, CLI tokens bound to it are revoked, and its relay is disconnected. Run `wsmp login` on that machine to add it again. Local CLI configuration is not changed.",
     "deleteDescription": "This deletes only metadata owned by your account. It does not edit local CLI endpoint configuration.",
     "deleteModel": "Delete discovered model metadata",
     "deleteTitle": "Delete metadata",
@@ -237,6 +253,8 @@
     "add": "New terminal",
     "close": "Stop viewing this terminal",
     "cliList": "Choose a CLI",
+    "cliSearch": "Search CLIs",
+    "cliSearchEmpty": "No CLIs match your search.",
     "reconnecting": "Reconnecting to the terminal service…",
     "exited": "The shell exited.",
     "gone": "This terminal ended while you were disconnected.",
@@ -847,7 +865,6 @@
   "publication": {
     "unpublished": "Unpublished"
   },
-  "title": "Dashboard",
   "tokens": {
     "allVisible": "All visible",
     "allowlist": "Allowlist",
@@ -1136,5 +1153,150 @@
       "confidence": "Confidence"
     }
   },
-  "welcomeBack": "Welcome back, {{name}}"
+  "welcomeBack": "Welcome back, {{name}}",
+  "overview": {
+    "title": "Overview",
+    "description": "Traffic, prompt-cache efficiency, and health across the pools and models you own.",
+    "rangeLabel": "Time range",
+    "ranges": {
+      "1h": "1h",
+      "24h": "24h",
+      "7d": "7d"
+    },
+    "loadFailed": "Couldn't load overview metrics.",
+    "healthLoadFailed": "Couldn't load health status.",
+    "updatedAt": "Updated {{time}}",
+    "notReported": "Not reported",
+    "noValue": "—",
+    "kpi": {
+      "sectionLabel": "Key metrics",
+      "requests": "Requests",
+      "errorRate": "Error rate",
+      "cacheHitRate": "Prompt cache hit rate",
+      "cacheHitRateHint": "Token-weighted, over requests whose upstream reports cached tokens.",
+      "p95Latency": "p95 latency",
+      "p95Ttft": "p95 time to first token",
+      "tokens": "Tokens in / out",
+      "tokensValue": "{{input}} / {{output}}",
+      "deltaUp": "Up {{value}} vs previous period",
+      "deltaDown": "Down {{value}} vs previous period",
+      "deltaPoints": "{{value}} pp",
+      "deltaFlat": "No change vs previous period",
+      "deltaNone": "No previous data"
+    },
+    "health": {
+      "sectionLabel": "Health",
+      "clis": "CLIs online",
+      "endpoints": "Endpoints healthy",
+      "members": "Pool members",
+      "ratio": "{{value}} / {{total}}",
+      "membersValue": "{{degraded}} degraded · {{open}} circuit open",
+      "allHealthy": "All healthy",
+      "noneConfigured": "None yet",
+      "review": "Review",
+      "reviewClis": "Review CLIs",
+      "reviewEndpoints": "Review endpoints",
+      "reviewMember": "Open {{pool}}"
+    },
+    "pools": {
+      "title": "Pools",
+      "summary": "{{requests}} requests · {{errors}} errors · cache {{cache}}",
+      "chartLabel": "Requests per minute by member for {{name}}",
+      "perMinute": "req/min",
+      "noTraffic": "No traffic for this pool in the selected range.",
+      "open": "Open pool",
+      "other": "Other members",
+      "unrouted": "Not routed",
+      "removedMember": "Removed member",
+      "columns": {
+        "member": "Member",
+        "share": "Share",
+        "cache": "Cache hit",
+        "p50": "p50",
+        "p95": "p95",
+        "errors": "Errors",
+        "status": "Status"
+      },
+      "tier": {
+        "PRIMARY": "Primary",
+        "PUBLIC_OVERFLOW": "Overflow"
+      },
+      "health": {
+        "UNKNOWN": "Unknown",
+        "HEALTHY": "Healthy",
+        "HALF_OPEN": "Recovering",
+        "DEGRADED": "Degraded",
+        "UNHEALTHY": "Circuit open"
+      },
+      "routing": {
+        "ACTIVE": "Active",
+        "DRAINING": "Draining",
+        "DISABLED": "Disabled"
+      }
+    },
+    "direct": {
+      "title": "Direct model traffic",
+      "description": "Requests addressed to a single model rather than a pool.",
+      "unresolved": "Unresolved model",
+      "columns": {
+        "model": "Model",
+        "requests": "Requests",
+        "errors": "Errors",
+        "cache": "Cache hit",
+        "p95": "p95",
+        "tokens": "Tokens in / out"
+      }
+    },
+    "shared": {
+      "title": "Your usage of shared pools",
+      "description": "Your own requests to pools other users share with you. Other people's traffic on these pools is not shown.",
+      "unavailable": "Pool no longer shared with you",
+      "owner": "Shared by {{owner}}",
+      "columns": {
+        "pool": "Pool",
+        "requests": "Requests",
+        "errors": "Errors",
+        "cache": "Cache hit",
+        "p95": "p95",
+        "tokens": "Tokens in / out"
+      }
+    },
+    "empty": {
+      "title": "No traffic in this range",
+      "description": "Requests through your pools and models will appear here within a minute."
+    },
+    "setup": {
+      "title": "Get started",
+      "description": "Finish these steps to route your first request and see metrics here.",
+      "done": "Done",
+      "todo": "To do",
+      "steps": {
+        "connectCli": {
+          "title": "Connect a CLI",
+          "description": "Run wsmp login on the machine that hosts your models.",
+          "action": "Open CLIs"
+        },
+        "addEndpoint": {
+          "title": "Add an endpoint",
+          "description": "Point the CLI at a local OpenAI- or Anthropic-compatible server.",
+          "action": "Open CLIs"
+        },
+        "createPool": {
+          "title": "Create a pool",
+          "description": "Group models so requests fail over and share load.",
+          "action": "Create pool"
+        },
+        "createToken": {
+          "title": "Create an API token",
+          "description": "Clients use it to call the OpenAI-compatible API.",
+          "action": "Create token"
+        },
+        "tryChat": {
+          "title": "Try the chat test",
+          "description": "Send a message through a pool from the browser.",
+          "action": "Open chat test"
+        }
+      }
+    }
+  }
 }

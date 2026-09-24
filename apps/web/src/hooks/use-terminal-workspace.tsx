@@ -9,9 +9,12 @@ type DevicesQuery = ReturnType<typeof useCliDevicesQuery>;
 
 export type TerminalWorkspace = Sessions & {
   devicesQuery: DevicesQuery;
-  /** A CLI's label, then its slug, then its id. */
+  /** A CLI's display name (server-computed), then its listed slug, then its id. */
   labelFor: (cliDeviceId: string) => string;
-  /** A tab's CLI label, numbered when several tabs share a CLI. */
+  /**
+   * A tab's CLI display name. The slug is appended when another open CLI shows
+   * the same name, and tabs on one CLI are numbered.
+   */
   tabLabel: (tab: TerminalTab) => string;
 };
 
@@ -26,9 +29,34 @@ export function deviceId(device: object): string | null {
   return typeof value === "string" ? value : null;
 }
 
-export function deviceText(device: object, key: "label" | "slug"): string | null {
+export function deviceText(
+  device: object,
+  key: "displayName" | "slug" | "reportedHostname",
+): string | null {
   const value = Object.getOwnPropertyDescriptor(device, key)?.value;
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * A terminal tab's label. `name` and `slug` resolve a CLI's display name and
+ * slug. Two CLIs with the same display name are told apart by slug; several
+ * tabs on one CLI are numbered.
+ */
+export function terminalTabLabel(
+  tab: TerminalTab,
+  tabs: readonly TerminalTab[],
+  name: (cliDeviceId: string) => string,
+  slug: (cliDeviceId: string) => string | null,
+): string {
+  const shown = name(tab.cliDeviceId);
+  const clash = tabs.some(
+    (other) => other.cliDeviceId !== tab.cliDeviceId && name(other.cliDeviceId) === shown,
+  );
+  const cliSlug = slug(tab.cliDeviceId);
+  const base = clash && cliSlug && cliSlug !== shown ? `${shown} · ${cliSlug}` : shown;
+  const sameCli = tabs.filter((entry) => entry.cliDeviceId === tab.cliDeviceId);
+  if (sameCli.length < 2) return base;
+  return `${base} (${sameCli.indexOf(tab) + 1})`;
 }
 
 /**
@@ -52,22 +80,24 @@ export function TerminalWorkspaceProvider({
   const devicesQuery = useCliDevicesQuery(activated);
   const devices = devicesQuery.data ?? [];
 
+  const deviceFor = (cliDeviceId: string) =>
+    devices.find((entry) => deviceId(entry) === cliDeviceId);
+  const listedFor = (cliDeviceId: string) =>
+    sessions.clis.find((cli) => cli.cliDeviceId === cliDeviceId);
+
+  const slugFor = (cliDeviceId: string) => {
+    const device = deviceFor(cliDeviceId);
+    return (device ? deviceText(device, "slug") : null) ?? listedFor(cliDeviceId)?.slug ?? null;
+  };
+
   const labelFor = (cliDeviceId: string) => {
-    const device = devices.find((entry) => deviceId(entry) === cliDeviceId);
-    const listed = sessions.clis.find((cli) => cli.cliDeviceId === cliDeviceId);
+    const device = deviceFor(cliDeviceId);
     return (
-      (device ? (deviceText(device, "label") ?? deviceText(device, "slug")) : null) ??
-      listed?.slug ??
-      cliDeviceId
+      (device ? deviceText(device, "displayName") : null) ?? slugFor(cliDeviceId) ?? cliDeviceId
     );
   };
 
-  const tabLabel = (tab: TerminalTab) => {
-    const label = labelFor(tab.cliDeviceId);
-    const sameCli = sessions.tabs.filter((entry) => entry.cliDeviceId === tab.cliDeviceId);
-    if (sameCli.length < 2) return label;
-    return `${label} (${sameCli.indexOf(tab) + 1})`;
-  };
+  const tabLabel = (tab: TerminalTab) => terminalTabLabel(tab, sessions.tabs, labelFor, slugFor);
 
   return (
     <TerminalWorkspaceContext.Provider value={{ ...sessions, devicesQuery, labelFor, tabLabel }}>

@@ -77,6 +77,8 @@ export const env = createEnv({
     RATE_LIMIT_MCP_REGISTRATION_POINTS: z.coerce.number().int().positive().default(60),
     RATE_LIMIT_MCP_REGISTRATION_DURATION: z.coerce.number().int().positive().default(3600),
     SSR_CACHE_TTL_SECONDS: z.coerce.number().int().min(0).default(60),
+    /** Raw RelayRequest retention in days; the hourly retention sweep deletes older rows. */
+    RELAY_REQUEST_RETENTION_DAYS: z.coerce.number().int().min(1).max(3650).default(14),
     // Number of reverse-proxy hops in front of the app, for deriving the real
     // client IP used as the anonymous rate-limit key.
     //

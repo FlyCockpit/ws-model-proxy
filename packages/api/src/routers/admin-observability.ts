@@ -1,3 +1,4 @@
+import { cliDeviceDisplayName } from "@ws-model-proxy/config/cli-device-name";
 import { directModelId, poolModelId } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { z } from "zod";
@@ -175,7 +176,9 @@ function serializeCli(row: CliDeviceRow, now: Date) {
     updatedAt: row.updatedAt,
     owner: owner(row.User),
     slug: row.slug,
-    label: row.label,
+    name: row.name,
+    reportedHostname: row.reportedHostname,
+    displayName: cliDeviceDisplayName(row),
     status: String(row.status),
     lastConnectedAt: row.lastConnectedAt,
     lastDisconnectedAt: row.lastDisconnectedAt,
@@ -198,7 +201,7 @@ function serializeEndpoint(row: EndpointRow, now: Date) {
     cliDevice: {
       id: row.CliDevice.id,
       slug: row.CliDevice.slug,
-      label: row.CliDevice.label,
+      displayName: cliDeviceDisplayName(row.CliDevice),
       status: String(row.CliDevice.status),
       lastHeartbeatAt: row.CliDevice.lastHeartbeatAt,
       isStale: isStale(row.CliDevice.lastHeartbeatAt, now),
@@ -238,7 +241,7 @@ function serializeModel(row: DiscoveredModelRow, now: Date) {
     cliDevice: {
       id: row.Endpoint.CliDevice.id,
       slug: row.Endpoint.CliDevice.slug,
-      label: row.Endpoint.CliDevice.label,
+      displayName: cliDeviceDisplayName(row.Endpoint.CliDevice),
       status: String(row.Endpoint.CliDevice.status),
       lastHeartbeatAt: row.Endpoint.CliDevice.lastHeartbeatAt,
       isStale: isStale(row.Endpoint.CliDevice.lastHeartbeatAt, now),
@@ -323,7 +326,7 @@ function serializePool(row: ModelPoolRow, now: Date) {
               endpointStatus: String(model.Endpoint.status),
               cliDeviceId: model.Endpoint.CliDevice.id,
               cliDeviceSlug: model.Endpoint.CliDevice.slug,
-              cliDeviceLabel: model.Endpoint.CliDevice.label,
+              cliDeviceDisplayName: cliDeviceDisplayName(model.Endpoint.CliDevice),
               cliDeviceStatus: String(model.Endpoint.CliDevice.status),
               cliDeviceIsStale: isStale(model.Endpoint.CliDevice.lastHeartbeatAt, now),
             }
@@ -404,7 +407,8 @@ const ownerSelect = {
 const cliDeviceSummarySelect = {
   id: true,
   slug: true,
-  label: true,
+  name: true,
+  reportedHostname: true,
   status: true,
   lastHeartbeatAt: true,
 } satisfies Prisma.CliDeviceSelect;
@@ -414,7 +418,8 @@ const cliDeviceSelect = {
   createdAt: true,
   updatedAt: true,
   slug: true,
-  label: true,
+  name: true,
+  reportedHostname: true,
   status: true,
   lastConnectedAt: true,
   lastDisconnectedAt: true,

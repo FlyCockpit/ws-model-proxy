@@ -163,6 +163,9 @@ export function TerminalCliIdentities({ clis, trust, labelFor, onTrustNewKey }: 
             <StatusIcon trust={trust[cli.cliDeviceId]} />
             <div className="flex min-w-0 flex-1 flex-col gap-0.5">
               <p className="truncate text-sm">{labelFor(cli.cliDeviceId)}</p>
+              {cli.slug && cli.slug !== labelFor(cli.cliDeviceId) ? (
+                <p className="truncate font-mono text-xs text-muted-foreground">{cli.slug}</p>
+              ) : null}
               <IdentityStatus
                 trust={trust[cli.cliDeviceId]}
                 onTrust={(changed) => setConfirm({ cliDeviceId: cli.cliDeviceId, trust: changed })}

@@ -624,16 +624,24 @@ describe("chat test routes", () => {
           skipDuplicates: true,
         }),
       );
+      // The terminal write is status-guarded (the exactly-once rollup claim)
+      // and selects the rollup facts; the request source is CHAT_TEST.
       expect(db.relayRequest.update).toHaveBeenCalledWith(
         expect.objectContaining({
-          where: { id: "relay-request-id" },
+          where: { id: "relay-request-id", status: "PENDING" },
           data: expect.objectContaining({
             status: "SUCCEEDED",
             completionTokens: 3,
-            completedAt: new Date("2026-08-26T00:00:00.000Z"),
+            usageKnown: true,
+            // Captured once when the outcome is known (not the DB clock of
+            // whichever finalization attempt commits).
+            completedAt: expect.any(Date),
           }),
-          select: { id: true },
+          select: expect.objectContaining({ id: true, source: true, status: true }),
         }),
+      );
+      expect(db.relayRequest.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ source: "CHAT_TEST" }) }),
       );
     });
   });

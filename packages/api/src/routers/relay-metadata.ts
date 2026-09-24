@@ -1,5 +1,5 @@
 import { ORPCError } from "@orpc/server";
-import prisma from "@ws-model-proxy/db";
+import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { z } from "zod";
 import { adminProcedure, protectedProcedure } from "../index";
 
@@ -12,6 +12,17 @@ const deleteOwnInput = z
   .refine((input) => input.ids.length > 0 || input.createdBefore || input.createdAfter, {
     message: "Provide ids, createdBefore, or createdAfter.",
   });
+
+/**
+ * History deletion only removes TERMINAL requests. A PENDING request has not
+ * been counted in the usage rollups yet (its finalizer counts it in the same
+ * transaction as its terminal transition); deleting it would lose that
+ * increment and make its in-flight finalizer a no-op. In-flight rows stay and
+ * can be deleted once they finish.
+ */
+const TERMINAL_ONLY = {
+  status: { in: ["SUCCEEDED", "FAILED", "CANCELED"] },
+} satisfies Prisma.RelayRequestWhereInput;
 
 const pruneInput = z
   .object({
@@ -221,6 +232,7 @@ export const relayMetadataRouter = {
     const result = await prisma.relayRequest.deleteMany({
       where: {
         userId: context.session.user.id,
+        ...TERMINAL_ONLY,
         ...(input.ids.length > 0 ? { id: { in: input.ids } } : {}),
         ...(input.createdBefore || input.createdAfter
           ? {
@@ -244,6 +256,7 @@ export const relayMetadataRouter = {
 
     const result = await prisma.relayRequest.deleteMany({
       where: {
+        ...TERMINAL_ONLY,
         ...(input.ownerUserId ? { userId: input.ownerUserId } : {}),
         ...(input.createdBefore || input.createdAfter
           ? {

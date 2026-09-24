@@ -13,6 +13,12 @@
     "./forwarder-identifiers": {
       "default": "./src/forwarder-identifiers.ts"
     },
+    "./cli-device-name": {
+      "default": "./src/cli-device-name.ts"
+    },
+    "./cli-device-login": {
+      "default": "./src/cli-device-login.ts"
+    },
     "./theme-init": {
       "default": "./src/theme-init.ts"
     },
@@ -21,6 +27,9 @@
     },
     "./rpc-policy": {
       "default": "./src/rpc-policy.ts"
+    },
+    "./usage-metrics": {
+      "default": "./src/usage-metrics.ts"
     }
   },
   "files": [

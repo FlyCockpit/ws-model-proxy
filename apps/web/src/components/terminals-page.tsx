@@ -10,6 +10,14 @@ import {
 } from "@ws-model-proxy/ui/components/alert-dialog";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@ws-model-proxy/ui/components/command";
+import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -22,6 +30,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@ws-model-proxy/ui/components/dropdown-menu";
+import { Popover, PopoverContent, PopoverTrigger } from "@ws-model-proxy/ui/components/popover";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
@@ -40,11 +49,12 @@ import { TerminalStatusDot } from "@/components/terminal-status-dot";
 import { WideContent } from "@/components/wide-content";
 import { TERMINAL_GONE, type TerminalTab } from "@/hooks/use-terminal-sessions";
 import { deviceId, deviceText, useTerminalWorkspace } from "@/hooks/use-terminal-workspace";
+import { readCliDeviceFeatures } from "@/lib/cli-device-features";
 import {
-  featureReasonKey,
-  readCliDeviceFeatures,
-  terminalOpenBlockReason,
-} from "@/lib/cli-device-features";
+  type CliPickerOption,
+  cliPickerOption,
+  filterCliPickerOptions,
+} from "@/lib/terminal-cli-picker";
 import { TERMINAL_CHROME_VARS } from "@/lib/terminal-theme";
 import { followSize, writerStatusKey } from "@/lib/terminal-writer";
 
@@ -91,80 +101,115 @@ function ChromeTextButton({ className, ...props }: ComponentProps<"button">) {
   );
 }
 
-/** The CLI picker. `trigger` is the element that opens it. */
+/** The searchable CLI picker. `trigger` is the element that opens it. */
 function NewTerminalMenu({
   trigger,
   children,
 }: {
-  trigger: ComponentProps<typeof DropdownMenuTrigger>["render"];
+  trigger: ComponentProps<typeof PopoverTrigger>["render"];
   children: ReactNode;
 }) {
   const { t } = useTranslation(["dashboard"]);
   const workspace = useTerminalWorkspace();
   const visible = useContext(WorkspaceVisibleContext);
   const [open, setOpen] = useState(false);
-  if (!visible && open) setOpen(false);
+  const [query, setQuery] = useState("");
+  // Every close path (dismiss, pick, workspace hidden) goes through here so a
+  // search never outlives the popover.
+  const close = () => {
+    setOpen(false);
+    setQuery("");
+  };
+  if (!visible && open) close();
   const devices = workspace.devicesQuery.data ?? [];
+  const options = devices.flatMap((device): CliPickerOption[] => {
+    const id = deviceId(device);
+    if (!id) return [];
+    return [
+      cliPickerOption({
+        id,
+        displayName: deviceText(device, "displayName"),
+        slug: deviceText(device, "slug"),
+        reportedHostname: deviceText(device, "reportedHostname"),
+        terminal: readCliDeviceFeatures(device).features.terminal,
+        trust: workspace.cliTrust[id]?.status,
+      }),
+    ];
+  });
+  const filtered = filterCliPickerOptions(options, query);
   return (
-    <DropdownMenu
+    <Popover
       open={open}
       onOpenChange={(next) => {
         // The provider's CLI list outlives page visits; refresh availability
         // (a CLI may have come online) whenever the picker opens.
-        if (next) {
-          void workspace.devicesQuery.refetch();
-          void workspace.refreshClis();
+        if (!next) {
+          close();
+          return;
         }
-        setOpen(next);
+        void workspace.devicesQuery.refetch();
+        void workspace.refreshClis();
+        setOpen(true);
       }}
     >
-      <DropdownMenuTrigger render={trigger}>{children}</DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-72">
-        {devices.length === 0 ? (
-          <p className="px-2 py-2 text-sm text-muted-foreground">
+      <PopoverTrigger render={trigger}>{children}</PopoverTrigger>
+      <PopoverContent align="end" className="w-80 max-w-[calc(100vw-1rem)] p-0">
+        {options.length === 0 ? (
+          <p className="px-3 py-3 text-sm text-muted-foreground">
             {t("dashboard:terminals.emptyClis")}
           </p>
         ) : (
-          devices.map((device) => {
-            const id = deviceId(device);
-            if (!id) return null;
-            const features = readCliDeviceFeatures(device);
-            const block = terminalOpenBlockReason(features.features.terminal);
-            const trust = workspace.cliTrust[id]?.status;
-            const identityBlock =
-              trust === "changed"
-                ? "dashboard:terminals.rejection.identity_changed"
-                : trust === "invalid"
-                  ? "dashboard:terminals.rejection.identity_invalid"
-                  : null;
-            const label = deviceText(device, "label") ?? deviceText(device, "slug") ?? id;
-            return (
-              <DropdownMenuItem
-                key={id}
-                disabled={block !== null || identityBlock !== null}
-                className="min-h-11 items-start"
-                onClick={() => {
-                  if (block || identityBlock) return;
-                  workspace.openCli(id);
-                  setOpen(false);
-                }}
-              >
-                <span className="flex min-w-0 flex-col items-start gap-0.5">
-                  <span className="max-w-full truncate">{label}</span>
-                  {block ? (
-                    <span className="text-xs text-muted-foreground">
-                      {t(featureReasonKey(block))}
-                    </span>
-                  ) : identityBlock ? (
-                    <span className="text-xs text-destructive">{t(identityBlock)}</span>
-                  ) : null}
-                </span>
-              </DropdownMenuItem>
-            );
-          })
+          <Command shouldFilter={false} label={t("dashboard:terminals.cliList")}>
+            <CommandInput
+              placeholder={t("dashboard:terminals.cliSearch")}
+              value={query}
+              onValueChange={setQuery}
+              className="min-h-11 text-sm"
+            />
+            <CommandList>
+              {filtered.length === 0 ? (
+                <CommandEmpty>{t("dashboard:terminals.cliSearchEmpty")}</CommandEmpty>
+              ) : (
+                <CommandGroup>
+                  {filtered.map((option) => (
+                    <CommandItem
+                      key={option.id}
+                      value={option.id}
+                      disabled={option.blockKey !== null}
+                      className="min-h-11 items-start text-sm"
+                      onSelect={() => {
+                        if (option.blockKey) return;
+                        workspace.openCli(option.id);
+                        close();
+                      }}
+                    >
+                      <span className="flex min-w-0 flex-1 flex-col items-start gap-0.5">
+                        <span className="max-w-full truncate">{option.name}</span>
+                        {option.slug && option.slug !== option.name ? (
+                          <span className="max-w-full truncate font-mono text-xs text-muted-foreground">
+                            {option.slug}
+                          </span>
+                        ) : null}
+                        {option.blockKey ? (
+                          <span
+                            className={cn(
+                              "text-xs",
+                              option.blockIsIdentity ? "text-destructive" : "text-muted-foreground",
+                            )}
+                          >
+                            {t(option.blockKey)}
+                          </span>
+                        ) : null}
+                      </span>
+                    </CommandItem>
+                  ))}
+                </CommandGroup>
+              )}
+            </CommandList>
+          </Command>
         )}
-      </DropdownMenuContent>
-    </DropdownMenu>
+      </PopoverContent>
+    </Popover>
   );
 }
 
@@ -503,6 +548,7 @@ export function TerminalWorkspaceView({ visible }: { visible: boolean }) {
         style={TERMINAL_CHROME_VARS}
         className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-(--term-bg) text-(--term-fg)"
       >
+        <h1 className="sr-only">{t("dashboard:terminals.title")}</h1>
         <TabStrip onEnd={setEndTarget} onShowIdentities={() => setIdentitiesOpen(true)} />
         <Notices onReviewIdentities={() => setIdentitiesOpen(true)} />
 

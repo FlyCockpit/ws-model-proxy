@@ -65,7 +65,7 @@ function PageHeader({
     <div className="flex min-w-0 flex-col gap-3 border-b pb-4 sm:flex-row sm:items-start sm:justify-between">
       <div className="min-w-0">
         <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <h2 className="text-lg font-semibold">{title}</h2>
+          <h1 className="text-lg font-semibold">{title}</h1>
           {badge}
         </div>
         <p className="mt-1 max-w-3xl text-sm text-muted-foreground">{description}</p>

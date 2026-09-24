@@ -115,7 +115,6 @@ type BrowserConn = {
 
 type CliListRow = {
   id: string;
-  label: string;
   slug: string;
   status: string;
   allowHumanTerminal: boolean;
@@ -126,7 +125,6 @@ type CliListRow = {
 
 const cliListSelect = {
   id: true,
-  label: true,
   slug: true,
   status: true,
   allowHumanTerminal: true,
@@ -612,7 +610,6 @@ export class TerminalBrowserHub {
         const availability = availabilityFor(row, live.get(row.id) ?? null);
         return {
           cliDeviceId: row.id,
-          label: row.label,
           slug: row.slug,
           available: availability.available,
           publicKey: availability.publicKey,
@@ -679,7 +676,6 @@ export class TerminalBrowserHub {
       terminalId,
       userId: conn.userId,
       cliDeviceId: row.id,
-      label: row.label,
       cols: message.cols,
       rows: message.rows,
       browserPublicKey: message.publicKey,

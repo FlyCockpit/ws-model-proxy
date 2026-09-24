@@ -40,9 +40,12 @@ const db = prisma as unknown as {
   cliDevice: {
     upsert: MockInstance;
     update: MockInstance;
+    updateMany: MockInstance;
   };
   cliToken: {
     update: MockInstance;
+    updateMany: MockInstance;
+    findUnique: MockInstance;
   };
   endpoint: {
     upsert: MockInstance;
@@ -99,7 +102,7 @@ function helloFrame() {
     protocolVersion: "2.1",
     cli: {
       slug: "desktop",
-      label: "Desktop",
+      hostname: "desk-01.local",
       capabilities: {
         protocolVersion: "2.1",
         inventoryAck: true,
@@ -145,6 +148,9 @@ function helloFrame() {
 
 function seedRegistrationMocks() {
   db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) => callback(db));
+  // An unbound CLI token: every hello's conditional bind claims it.
+  db.cliToken.findUnique.mockResolvedValue({ revokedAt: null, expiresAt: null, cliDeviceId: null });
+  db.cliToken.updateMany.mockResolvedValue({ count: 1 });
   db.user.findUnique.mockResolvedValue({ id: "user-id", slug: "owner" });
   db.cliDevice.upsert.mockResolvedValue({
     id: "cli-device-id",
@@ -158,6 +164,7 @@ function seedRegistrationMocks() {
     inventoryAcknowledgedAt: now,
     id: "cli-device-id",
   });
+  db.cliDevice.updateMany.mockResolvedValue({ count: 1 });
   db.endpoint.findUnique.mockResolvedValue(null);
   db.endpoint.upsert.mockResolvedValue({ id: "endpoint-id", slug: "local-openai" });
   db.endpoint.updateMany.mockResolvedValue({ count: 0 });
@@ -198,7 +205,7 @@ describe("relay drain", () => {
     await manager.handleTextFrame(second, helloFrame(), now);
     expect(manager.getActiveCliDeviceIds()).toHaveLength(2);
 
-    db.cliDevice.update.mockImplementation(() => new Promise(() => {}));
+    db.cliDevice.updateMany.mockImplementation(() => new Promise(() => {}));
     const closing = manager.closeRelaySessions(now);
     let settled = false;
     void closing.then(() => {
@@ -275,6 +282,303 @@ describe("relay drain", () => {
   });
 });
 
+describe("revoked credentials", () => {
+  const credentials = prisma as unknown as { cliDeviceCredential: { findUnique: MockInstance } };
+  const deviceIdentity = (id: string): CliWebsocketIdentity => ({
+    kind: "deviceCredential",
+    id,
+    userId: "user-id",
+    cliDeviceId: "cli-device-id",
+    lookupPrefix: `wsmp_device_${id}`,
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    seedRegistrationMocks();
+    credentials.cliDeviceCredential.findUnique.mockResolvedValue({
+      revokedAt: null,
+      cliDeviceId: "cli-device-id",
+    });
+  });
+
+  it("closes registered and unregistered sockets of revoked credentials only", async () => {
+    const manager = new RelaySessionManager();
+    const registered = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: registered, identity: deviceIdentity("old"), now });
+    await manager.handleTextFrame(registered, helloFrame(), now);
+    const unregistered = new FakeSocket();
+    manager.acceptAuthenticatedSocket({
+      socket: unregistered,
+      identity: deviceIdentity("old-2"),
+      now,
+    });
+    // Same id, other kind: a CLI token is a different credential.
+    const token = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: token, identity: { ...identity, id: "old" }, now });
+    const current = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: current, identity: deviceIdentity("new"), now });
+    expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
+
+    const revokedAt = new Date("2026-01-01T00:01:00.000Z");
+    await manager.closeSessionsForRevokedCredentials(
+      { kind: "deviceCredential", ids: ["old", "old-2"] },
+      revokedAt,
+    );
+
+    expect(registered.closes).toEqual([{ code: 1008, reason: "access_denied" }]);
+    expect(unregistered.closes).toEqual([{ code: 1008, reason: "access_denied" }]);
+    expect(JSON.parse(String(registered.sends.at(-1)))).toMatchObject({
+      type: "protocol.error",
+      message: "access_denied",
+    });
+    expect(token.closes).toEqual([]);
+    expect(current.closes).toEqual([]);
+    expect(manager.getActiveCliDeviceIds()).toEqual([]);
+    expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
+      where: { id: "cli-device-id" },
+      data: { status: "DISCONNECTED", lastDisconnectedAt: revokedAt },
+    });
+    manager.dispose();
+  });
+
+  it("closes every live session of a deleted user by identity userId, any credential", async () => {
+    const manager = new RelaySessionManager();
+    const registered = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: registered, identity: deviceIdentity("old"), now });
+    await manager.handleTextFrame(registered, helloFrame(), now);
+    // Minted after any snapshot a caller could have taken: still the user's.
+    const mintedLater = new FakeSocket();
+    manager.acceptAuthenticatedSocket({
+      socket: mintedLater,
+      identity: deviceIdentity("minted-after-snapshot"),
+      now,
+    });
+    const userToken = new FakeSocket();
+    manager.acceptAuthenticatedSocket({
+      socket: userToken,
+      identity: { ...identity, id: "token-x", userId: "user-id" },
+      now,
+    });
+    const otherUser = new FakeSocket();
+    manager.acceptAuthenticatedSocket({
+      socket: otherUser,
+      identity: { ...deviceIdentity("other"), userId: "other-user-id" },
+      now,
+    });
+
+    const deletedAt = new Date("2026-01-01T00:02:00.000Z");
+    await manager.closeSessionsForUser("user-id", deletedAt);
+
+    for (const socket of [registered, mintedLater, userToken])
+      expect(socket.closes).toEqual([{ code: 1008, reason: "access_denied" }]);
+    expect(otherUser.closes).toEqual([]);
+    expect(manager.getActiveCliDeviceIds()).toEqual([]);
+    expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
+      where: { id: "cli-device-id" },
+      data: { status: "DISCONNECTED", lastDisconnectedAt: deletedAt },
+    });
+    manager.dispose();
+  });
+
+  it("refuses a hello from a credential revoked after its websocket authenticated", async () => {
+    credentials.cliDeviceCredential.findUnique.mockResolvedValue({
+      revokedAt: now,
+      cliDeviceId: "cli-device-id",
+    });
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity: deviceIdentity("old"), now });
+
+    await manager.handleTextFrame(socket, helloFrame(), now);
+
+    expect(socket.closes).toEqual([{ code: 1008, reason: "access_denied" }]);
+    expect(manager.getActiveCliDeviceIds()).toEqual([]);
+    manager.dispose();
+  });
+
+  it("closes the socket when an inventory update finds the credential revoked", async () => {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity: deviceIdentity("old"), now });
+    await manager.handleTextFrame(socket, helloFrame(), now);
+    expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
+
+    // Revoked where this process's hook could not reach (another replica).
+    credentials.cliDeviceCredential.findUnique.mockResolvedValue({
+      revokedAt: now,
+      cliDeviceId: "cli-device-id",
+    });
+    const hello = JSON.parse(helloFrame()) as { endpoints: unknown[] };
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "inventory.update", id: "inv-1", endpoints: hello.endpoints }),
+      now,
+    );
+
+    expect(socket.closes).toEqual([{ code: 1008, reason: "access_denied" }]);
+    expect(manager.getActiveCliDeviceIds()).toEqual([]);
+    manager.dispose();
+  });
+
+  /** Holds the next registration transaction until `release()`. */
+  function holdNextRegistration() {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reportStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      reportStarted = resolve;
+    });
+    db.$transaction.mockImplementationOnce(async (callback: (tx: typeof db) => unknown) => {
+      reportStarted?.();
+      await gate;
+      return callback(db);
+    });
+    return { started, release: () => release?.() };
+  }
+
+  const disconnectedWrites = () =>
+    db.cliDevice.updateMany.mock.calls.filter(
+      ([args]) => (args as { data?: { status?: string } }).data?.status === "DISCONNECTED",
+    );
+
+  it("keeps a hello out of routing when a revoke closes its socket mid-registration", async () => {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity: deviceIdentity("old"), now });
+    const held = holdNextRegistration();
+    const hello = manager.handleTextFrame(socket, helloFrame(), now);
+    await held.started;
+
+    // The revoke commits and its hook closes the (still unregistered) socket.
+    await manager.closeSessionsForRevokedCredentials({ kind: "deviceCredential", ids: ["old"] });
+    expect(socket.closes).toEqual([{ code: 1008, reason: "access_denied" }]);
+    // The registration itself then commits (it re-checked before the revoke).
+    held.release();
+    await hello;
+
+    expect(manager.getActiveCliDeviceIds()).toEqual([]);
+    expect(socket.sends.some((send) => String(send).includes('"hello.ok"'))).toBe(false);
+    // Registration wrote CONNECTED for a session that no longer exists: undone.
+    expect(disconnectedWrites()).toEqual([
+      [
+        {
+          where: { id: "cli-device-id" },
+          data: { status: "DISCONNECTED", lastDisconnectedAt: now },
+        },
+      ],
+    ]);
+
+    // A later CLI for the device registers and is not evicted by the dead one.
+    const current = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: current, identity: deviceIdentity("new"), now });
+    await manager.handleTextFrame(current, helloFrame(), now);
+    expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
+    expect(current.closes).toEqual([]);
+    manager.dispose();
+  });
+
+  it("keeps a hello out of routing when its socket closes mid-registration", async () => {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity: deviceIdentity("old"), now });
+    const held = holdNextRegistration();
+    const hello = manager.handleTextFrame(socket, helloFrame(), now);
+    await held.started;
+
+    await manager.removeSession(socket, now);
+    held.release();
+    await hello;
+
+    expect(manager.getActiveCliDeviceIds()).toEqual([]);
+    expect(socket.sends).toEqual([]);
+    expect(disconnectedWrites()).toHaveLength(1);
+    manager.dispose();
+  });
+
+  it("leaves the device status to a live session that took over during the detached hello", async () => {
+    const manager = new RelaySessionManager();
+    const stale = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: stale, identity: deviceIdentity("old"), now });
+    const held = holdNextRegistration();
+    const hello = manager.handleTextFrame(stale, helloFrame(), now);
+    await held.started;
+    await manager.removeSession(stale, now);
+
+    const current = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: current, identity: deviceIdentity("new"), now });
+    await manager.handleTextFrame(current, helloFrame(), now);
+    held.release();
+    await hello;
+
+    expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
+    expect(current.closes).toEqual([]);
+    expect(disconnectedWrites()).toEqual([]);
+    manager.dispose();
+  });
+
+  it("does not answer an inventory update whose socket was closed mid-write", async () => {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity: deviceIdentity("old"), now });
+    await manager.handleTextFrame(socket, helloFrame(), now);
+    const sendsAfterHello = socket.sends.length;
+    const held = holdNextRegistration();
+    const hello = JSON.parse(helloFrame()) as { endpoints: unknown[] };
+    const update = manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "inventory.update", id: "inv-1", endpoints: hello.endpoints }),
+      now,
+    );
+    await held.started;
+
+    await manager.closeSessionsForRevokedCredentials({ kind: "deviceCredential", ids: ["old"] });
+    const sendsAfterClose = socket.sends.length;
+    held.release();
+    await update;
+
+    expect(sendsAfterClose).toBe(sendsAfterHello + 1);
+    expect(socket.sends).toHaveLength(sendsAfterClose);
+    expect(manager.getActiveCliDeviceIds()).toEqual([]);
+    manager.dispose();
+  });
+
+  it("closes every revoked socket even when a status write fails", async () => {
+    const manager = new RelaySessionManager();
+    const first = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: first, identity: deviceIdentity("a"), now });
+    await manager.handleTextFrame(first, helloFrame(), now);
+    db.cliDevice.upsert.mockResolvedValueOnce({
+      id: "cli-device-2",
+      userId: "user-id",
+      slug: "laptop",
+    });
+    credentials.cliDeviceCredential.findUnique.mockResolvedValueOnce({
+      revokedAt: null,
+      cliDeviceId: "cli-device-2",
+    });
+    const second = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: second, identity: deviceIdentity("b"), now });
+    await manager.handleTextFrame(second, helloFrame(), now);
+    expect(manager.getActiveCliDeviceIds()).toHaveLength(2);
+    // The device was deleted: its status write fails (or matches nothing).
+    db.cliDevice.updateMany.mockRejectedValueOnce(new Error("gone"));
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await manager.closeSessionsForRevokedCredentials({
+      kind: "deviceCredential",
+      ids: ["a", "b"],
+    });
+
+    expect(first.closes).toEqual([{ code: 1008, reason: "access_denied" }]);
+    expect(second.closes).toEqual([{ code: 1008, reason: "access_denied" }]);
+    expect(manager.getActiveCliDeviceIds()).toEqual([]);
+    errors.mockRestore();
+    manager.dispose();
+  });
+});
+
 describe("RelaySessionManager", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -320,7 +624,7 @@ describe("RelaySessionManager", () => {
 
     const registration = await persistRelayRegistration({
       identity,
-      cli: { slug: parsed.cli.slug, label: parsed.cli.label },
+      cli: { slug: parsed.cli.slug },
       endpoints: parsed.endpoints,
       inventoryConfirmed: true,
       endpointTargeting: true,
@@ -512,10 +816,9 @@ describe("RelaySessionManager", () => {
     const closedAt = new Date("2026-01-01T00:01:00.000Z");
     await manager.removeSession(socket, closedAt);
 
-    expect(db.cliDevice.update).toHaveBeenCalledWith({
+    expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
       where: { id: "cli-device-id" },
       data: { status: "DISCONNECTED", lastDisconnectedAt: closedAt },
-      select: { id: true },
     });
     expect(db.poolMember.updateMany).toHaveBeenLastCalledWith({
       where: {
@@ -552,10 +855,9 @@ describe("RelaySessionManager", () => {
     await manager.checkStaleSessions(staleAt);
 
     expect(socket.closes).toEqual([{ code: 1001, reason: "stale" }]);
-    expect(db.cliDevice.update).toHaveBeenCalledWith({
+    expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
       where: { id: "cli-device-id" },
       data: { status: "STALE", lastDisconnectedAt: staleAt },
-      select: { id: true },
     });
     expect(db.poolMember.updateMany).toHaveBeenLastCalledWith({
       where: {
@@ -604,7 +906,7 @@ describe("RelaySessionManager", () => {
       protocolVersion: "2.1",
       cli: {
         slug: "desktop",
-        label: "Desktop",
+        hostname: "desk-01.local",
         capabilities: {
           protocolVersion: "2.1",
           inventoryAck: true,
@@ -993,7 +1295,7 @@ function hello24(features?: {
     protocolVersion: "2.4",
     cli: {
       slug: "desktop",
-      label: "Desktop",
+      hostname: "desk-01.local",
       version: "9.9.9",
       capabilities: {
         protocolVersion: "2.4",
@@ -1061,10 +1363,14 @@ describe("relay terminal and exec sessions", () => {
           reportedMcpCommands: null,
           reportedTerminalApproval: null,
           reportedTerminalSupported: null,
+          // Reported on every hello, whatever the protocol version.
+          reportedHostname: "desk-01.local",
           featuresReportedAt: null,
         }),
       }),
     );
+    expect(db.cliDevice.upsert.mock.calls[0]?.[0].update).not.toHaveProperty("name");
+    expect(db.cliDevice.upsert.mock.calls[0]?.[0].create).not.toHaveProperty("name");
     expect(db.cliDevice.upsert.mock.calls[0]?.[0].update).not.toHaveProperty("allowHumanTerminal");
     expect(db.cliDevice.upsert.mock.calls[0]?.[0].update).not.toHaveProperty("allowMcpCommands");
 
@@ -1083,6 +1389,7 @@ describe("relay terminal and exec sessions", () => {
       "reportedHumanTerminal",
     );
     expect(db.cliDevice.upsert.mock.calls[0]?.[0].update).not.toHaveProperty("cliVersion");
+    expect(db.cliDevice.upsert.mock.calls[0]?.[0].update).not.toHaveProperty("reportedHostname");
 
     const next = new FakeSocket();
     await register(manager, next);
@@ -1102,6 +1409,16 @@ describe("relay terminal and exec sessions", () => {
     );
   });
 
+  it("clears the reported hostname when a hello omits it", async () => {
+    const manager = new RelaySessionManager();
+    const frame = JSON.parse(hello24()) as { cli: Record<string, unknown> };
+    delete frame.cli.hostname;
+    await register(manager, new FakeSocket(), JSON.stringify(frame));
+    expect(db.cliDevice.upsert.mock.calls[0]?.[0].update).toMatchObject({
+      reportedHostname: null,
+    });
+  });
+
   it("does not send term or exec frames to a CLI below 2.4", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
@@ -1112,7 +1429,6 @@ describe("relay terminal and exec sessions", () => {
         terminalId: id16(),
         userId: "user-id",
         cliDeviceId: "cli-device-id",
-        label: "Desktop",
         cols: 80,
         rows: 24,
         browserPublicKey: uncompressedKey(),
@@ -1151,7 +1467,6 @@ describe("relay terminal and exec sessions", () => {
         terminalId,
         userId: "user-id",
         cliDeviceId: "cli-device-id",
-        label: "Desktop",
         cols: 80,
         rows: 24,
         browserPublicKey: uncompressedKey(),
@@ -1217,7 +1532,6 @@ describe("relay terminal and exec sessions", () => {
       terminalId: secondTerminal,
       userId: "user-id",
       cliDeviceId: "cli-device-id",
-      label: "Desktop",
       cols: 80,
       rows: 24,
       browserPublicKey: uncompressedKey(),
@@ -1234,7 +1548,7 @@ describe("relay terminal and exec sessions", () => {
         .some((send) => JSON.parse(String(send)).type === "term.close"),
     ).toBe(true);
     expect(onError).toHaveBeenCalledWith(expect.objectContaining({ failure: "disconnected" }));
-    expect(db.cliDevice.update).not.toHaveBeenCalledWith(
+    expect(db.cliDevice.updateMany).not.toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ status: "DISCONNECTED" }) }),
     );
 
@@ -1244,7 +1558,6 @@ describe("relay terminal and exec sessions", () => {
       terminalId: id16(10),
       userId: "user-id",
       cliDeviceId: "cli-device-id",
-      label: "Desktop",
       cols: 40,
       rows: 12,
       browserPublicKey: uncompressedKey(),
@@ -1252,7 +1565,7 @@ describe("relay terminal and exec sessions", () => {
       connId: "viewer-3",
     });
     await manager.removeSession(survivor, now);
-    expect(db.cliDevice.update).toHaveBeenCalledWith(
+    expect(db.cliDevice.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({ status: "DISCONNECTED" }),
       }),
@@ -1273,7 +1586,6 @@ describe("relay terminal and exec sessions", () => {
       terminalId,
       userId: "user-id",
       cliDeviceId: "cli-device-id",
-      label: "Desktop",
       cols: 80,
       rows: 24,
       browserPublicKey: uncompressedKey(),
@@ -1371,7 +1683,6 @@ describe("relay protocol 2.5 terminal viewers", () => {
         terminalId,
         userId: "user-id",
         cliDeviceId: "cli-device-id",
-        label: "Desktop",
         cols: 80,
         rows: 24,
         browserPublicKey: uncompressedKey(),
@@ -1723,7 +2034,6 @@ describe("relay protocol 2.5 terminal viewers", () => {
           terminalId,
           userId: "user-id",
           cliDeviceId: "cli-device-id",
-          label: "Desktop",
           cols: 80,
           rows: 24,
           browserPublicKey: uncompressedKey(),
@@ -1794,7 +2104,6 @@ describe("relay protocol 2.5 terminal viewers", () => {
       terminalId,
       userId: "user-id",
       cliDeviceId: "cli-device-id",
-      label: "Desktop",
       cols: 80,
       rows: 24,
       browserPublicKey: uncompressedKey(),

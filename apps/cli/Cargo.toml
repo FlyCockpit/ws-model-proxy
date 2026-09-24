@@ -94,8 +94,9 @@ p256 = { version = "0.14", features = ["ecdh"] }
 # Maintained Unix API wrapper used only for authenticated local-control peer
 # credentials and for killing terminal/exec process groups. `socket` exposes
 # SO_PEERCRED/LOCAL_PEERCRED and `user` exposes the current effective UID
-# without unsafe FFI. `signal` covers process-group SIGKILL.
-nix = { version = "0.31", default-features = false, features = ["fs", "socket", "user", "signal", "process", "poll"] }
+# without unsafe FFI. `signal` covers process-group SIGKILL. `hostname` is
+# reported in hello and suggests the login slug.
+nix = { version = "0.31", default-features = false, features = ["fs", "hostname", "socket", "user", "signal", "process", "poll"] }
 # Unix PTY. Its unsafe code stays inside the crate (`unsafe_code` is forbid
 # here). Windows v1 reports terminals unsupported and does not link this crate.
 portable-pty = "0.9"

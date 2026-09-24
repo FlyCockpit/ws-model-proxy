@@ -3,6 +3,7 @@ import {
   openAiCompatibleCapabilitiesSchema,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { relayProtocolAtLeast } from "@ws-model-proxy/api/lib/relay-protocol-version";
+import { normalizeReportedHostname } from "@ws-model-proxy/config/cli-device-name";
 import { z } from "zod";
 
 export { relayProtocolAtLeast };
@@ -288,7 +289,9 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
       cli: z
         .object({
           slug: z.string().trim().min(1).max(63),
-          label: z.string().trim().min(1).max(160),
+          // A fact about the machine, stored as CliDevice.reportedHostname.
+          // Normalized rather than rejected so an odd hostname never blocks hello.
+          hostname: z.string().max(1024).nullish().transform(normalizeReportedHostname),
           version: z.string().trim().max(80).optional(),
           capabilities: acceptedCliCapabilitiesSchema,
         })

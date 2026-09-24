@@ -718,7 +718,7 @@ function CliTable({
                   <OwnerCell owner={row.owner} />
                 </td>
                 <td className="px-4 py-3 align-top">
-                  <p className="font-medium">{row.label}</p>
+                  <p className="font-medium">{row.displayName}</p>
                   <p className="font-mono text-muted-foreground">{row.slug}</p>
                 </td>
                 <td className="px-4 py-3 align-top">
@@ -805,7 +805,7 @@ function EndpointTable({
                   <p className="font-mono text-muted-foreground">{row.slug}</p>
                 </td>
                 <td className="px-4 py-3 align-top">
-                  <p>{row.cliDevice.label}</p>
+                  <p>{row.cliDevice.displayName}</p>
                   <p className="font-mono text-muted-foreground">{row.cliDevice.slug}</p>
                 </td>
                 <td className="px-4 py-3 align-top">

@@ -440,19 +440,10 @@ FROM relay_execution_event event
 WHERE event."eventType" = 'ATTEMPT_STARTED'
 ON CONFLICT ("attemptId") DO NOTHING;
 
-WITH latest_terminal AS (
-  SELECT DISTINCT ON ("relayRequestId") "relayRequestId", "createdAt", "terminalState", "errorClass"
-    FROM relay_execution_event
-   WHERE "eventType" IN ('TERMINAL', 'CRASH_RECOVERED')
-     AND "attemptKind" = 'EXECUTION' AND "terminalState" IS NOT NULL
-   ORDER BY "relayRequestId", "createdAt" DESC
-)
-UPDATE relay_request request
-   SET status = terminal."terminalState"::"RelayRequestStatus",
-       "completedAt" = COALESCE(request."completedAt", terminal."createdAt"),
-       "errorClass" = COALESCE(request."errorClass", terminal."errorClass")
-  FROM latest_terminal terminal
- WHERE request.id = terminal."relayRequestId" AND request.status = 'PENDING';
+-- No statement in this file may move relay_request out of PENDING: every
+-- terminal transition must go through the application's status-guarded path
+-- that writes the usage rollup in the same transaction (usage-rollup.ts).
+-- verify-schema-hardening.mjs rejects any `UPDATE relay_request ... status`.
 
 ALTER TABLE relay_execution_attempt DROP CONSTRAINT IF EXISTS relay_execution_attempt_shape_check;
 ALTER TABLE relay_execution_attempt ADD CONSTRAINT relay_execution_attempt_shape_check CHECK (
@@ -2335,5 +2326,133 @@ FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_history_transitions();
 DROP TRIGGER IF EXISTS provider_budget_policy_transition ON provider_budget_policy;
 CREATE TRIGGER provider_budget_policy_transition BEFORE UPDATE ON provider_budget_policy
 FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_history_transitions();
+
+-- Usage rollups keep the RESOURCE owner's history when a REQUESTER is deleted.
+-- requesterUserId is not a foreign key (a SET NULL / SET DEFAULT action would
+-- collide with an existing sentinel row in the composite primary key), so this
+-- AFTER DELETE trigger merges the deleted user's requester rows into the ''
+-- sentinel requester of the same owner/bucket/pool/member/target/source, and
+-- drops rows the user also owned (the owner FK cascade has already removed
+-- them).
+--
+-- Ordering and locks (READ COMMITTED):
+--  * The trigger name sorts after PostgreSQL's RI_ConstraintTrigger_*
+--    triggers, so it runs after the cascades of this DELETE: the relay_request
+--    cascade (requests this user MADE) has waited for any in-flight finalizer
+--    holding such a request's row lock and seen its rollup commit, and no
+--    later finalizer can write a row with requesterUserId = this user.
+--  * Minute rows are moved before hour rows. DELETE ... RETURNING row-locks
+--    them, so a concurrent compaction either committed first (its hour rows
+--    are then visible to the hour step's fresh statement snapshot) or skips
+--    the locked rows (FOR UPDATE SKIP LOCKED).
+--  * The '' sentinel upserts run in the application's rollup key order
+--    (bucketStart, then the text keys by code point, i.e. COLLATE "C"), the
+--    same order writeRollupIncrements uses for finalizers and compaction, so
+--    two writers of overlapping sentinel keys never wait on each other in
+--    opposite orders.
+--
+-- Accepted, self-healing deadlocks (not prevented here): when the user being
+-- deleted is also a resource OWNER, (a) an in-flight finalizer of a request
+-- on the user's pool/target holds that relay_request row lock and inserts a
+-- new rollup row whose ownerUserId FK takes KEY SHARE on this "user" row,
+-- while this DELETE holds the "user" row and its cascade waits for the
+-- relay_request row lock; (b) compaction holds minute rows the owner cascade
+-- must delete while its hour INSERT's owner FK waits for this "user" row.
+-- (Case (a) blocks on the relay_request row because the pool/target cascade
+-- sets that request's requestedModelPoolId / execution-target links NULL.)
+-- PostgreSQL aborts one transaction of the cycle atomically: an aborted
+-- finalizer leaves its request PENDING and uncounted, to be re-run by the
+-- deferred local-finalization registry or counted later by crash repair or
+-- the abandoned-request reaper; an aborted compaction batch is retried by the
+-- next sweep; an aborted user delete surfaces as a retryable error
+-- (users.remove).
+-- Nothing is lost or double-counted because every side commits or rolls back
+-- as a whole.
+CREATE OR REPLACE FUNCTION detach_usage_rollup_requester()
+RETURNS trigger LANGUAGE plpgsql AS $usage_rollup_detach_requester$
+BEGIN
+  WITH moved AS (
+    DELETE FROM usage_rollup_minute WHERE "requesterUserId" = OLD.id RETURNING *
+  )
+  INSERT INTO usage_rollup_minute AS target (
+    "bucketStart", "ownerUserId", "requesterUserId", "poolId", "poolMemberId",
+    "executionTargetId", source, "updatedAt", "requests", "successes", "errors", "cancels", "retries", "usageKnownRequests", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "cacheKnownRequests", "cacheKnownInputTokens", "durationCount", "durationSumMs", "ttftCount", "ttftSumMs",
+    "latencyHistogram", "ttftHistogram"
+  )
+  SELECT "bucketStart", "ownerUserId", '', "poolId", "poolMemberId",
+    "executionTargetId", source, now(), "requests", "successes", "errors", "cancels", "retries", "usageKnownRequests", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "cacheKnownRequests", "cacheKnownInputTokens", "durationCount", "durationSumMs", "ttftCount", "ttftSumMs",
+    "latencyHistogram", "ttftHistogram"
+    FROM moved
+   WHERE "ownerUserId" <> OLD.id
+   ORDER BY "bucketStart", "ownerUserId" COLLATE "C", "poolId" COLLATE "C",
+     "poolMemberId" COLLATE "C", "executionTargetId" COLLATE "C", source::text COLLATE "C"
+  ON CONFLICT ("bucketStart", "ownerUserId", "requesterUserId", "poolId", "poolMemberId",
+    "executionTargetId", source)
+  DO UPDATE SET
+      "requests" = target."requests" + EXCLUDED."requests",
+      "successes" = target."successes" + EXCLUDED."successes",
+      "errors" = target."errors" + EXCLUDED."errors",
+      "cancels" = target."cancels" + EXCLUDED."cancels",
+      "retries" = target."retries" + EXCLUDED."retries",
+      "usageKnownRequests" = target."usageKnownRequests" + EXCLUDED."usageKnownRequests",
+      "inputTokens" = target."inputTokens" + EXCLUDED."inputTokens",
+      "outputTokens" = target."outputTokens" + EXCLUDED."outputTokens",
+      "cacheReadTokens" = target."cacheReadTokens" + EXCLUDED."cacheReadTokens",
+      "cacheWriteTokens" = target."cacheWriteTokens" + EXCLUDED."cacheWriteTokens",
+      "cacheKnownRequests" = target."cacheKnownRequests" + EXCLUDED."cacheKnownRequests",
+      "cacheKnownInputTokens" = target."cacheKnownInputTokens" + EXCLUDED."cacheKnownInputTokens",
+      "durationCount" = target."durationCount" + EXCLUDED."durationCount",
+      "durationSumMs" = target."durationSumMs" + EXCLUDED."durationSumMs",
+      "ttftCount" = target."ttftCount" + EXCLUDED."ttftCount",
+      "ttftSumMs" = target."ttftSumMs" + EXCLUDED."ttftSumMs",
+      "latencyHistogram" = ARRAY(SELECT COALESCE(h.a, 0) + COALESCE(h.b, 0) FROM unnest(target."latencyHistogram", EXCLUDED."latencyHistogram") WITH ORDINALITY AS h(a, b, i) ORDER BY h.i),
+      "ttftHistogram" = ARRAY(SELECT COALESCE(h.a, 0) + COALESCE(h.b, 0) FROM unnest(target."ttftHistogram", EXCLUDED."ttftHistogram") WITH ORDINALITY AS h(a, b, i) ORDER BY h.i),
+      "updatedAt" = now();
+
+  WITH moved AS (
+    DELETE FROM usage_rollup_hour WHERE "requesterUserId" = OLD.id RETURNING *
+  )
+  INSERT INTO usage_rollup_hour AS target (
+    "bucketStart", "ownerUserId", "requesterUserId", "poolId", "poolMemberId",
+    "executionTargetId", source, "updatedAt", "requests", "successes", "errors", "cancels", "retries", "usageKnownRequests", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "cacheKnownRequests", "cacheKnownInputTokens", "durationCount", "durationSumMs", "ttftCount", "ttftSumMs",
+    "latencyHistogram", "ttftHistogram"
+  )
+  SELECT "bucketStart", "ownerUserId", '', "poolId", "poolMemberId",
+    "executionTargetId", source, now(), "requests", "successes", "errors", "cancels", "retries", "usageKnownRequests", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "cacheKnownRequests", "cacheKnownInputTokens", "durationCount", "durationSumMs", "ttftCount", "ttftSumMs",
+    "latencyHistogram", "ttftHistogram"
+    FROM moved
+   WHERE "ownerUserId" <> OLD.id
+   ORDER BY "bucketStart", "ownerUserId" COLLATE "C", "poolId" COLLATE "C",
+     "poolMemberId" COLLATE "C", "executionTargetId" COLLATE "C", source::text COLLATE "C"
+  ON CONFLICT ("bucketStart", "ownerUserId", "requesterUserId", "poolId", "poolMemberId",
+    "executionTargetId", source)
+  DO UPDATE SET
+      "requests" = target."requests" + EXCLUDED."requests",
+      "successes" = target."successes" + EXCLUDED."successes",
+      "errors" = target."errors" + EXCLUDED."errors",
+      "cancels" = target."cancels" + EXCLUDED."cancels",
+      "retries" = target."retries" + EXCLUDED."retries",
+      "usageKnownRequests" = target."usageKnownRequests" + EXCLUDED."usageKnownRequests",
+      "inputTokens" = target."inputTokens" + EXCLUDED."inputTokens",
+      "outputTokens" = target."outputTokens" + EXCLUDED."outputTokens",
+      "cacheReadTokens" = target."cacheReadTokens" + EXCLUDED."cacheReadTokens",
+      "cacheWriteTokens" = target."cacheWriteTokens" + EXCLUDED."cacheWriteTokens",
+      "cacheKnownRequests" = target."cacheKnownRequests" + EXCLUDED."cacheKnownRequests",
+      "cacheKnownInputTokens" = target."cacheKnownInputTokens" + EXCLUDED."cacheKnownInputTokens",
+      "durationCount" = target."durationCount" + EXCLUDED."durationCount",
+      "durationSumMs" = target."durationSumMs" + EXCLUDED."durationSumMs",
+      "ttftCount" = target."ttftCount" + EXCLUDED."ttftCount",
+      "ttftSumMs" = target."ttftSumMs" + EXCLUDED."ttftSumMs",
+      "latencyHistogram" = ARRAY(SELECT COALESCE(h.a, 0) + COALESCE(h.b, 0) FROM unnest(target."latencyHistogram", EXCLUDED."latencyHistogram") WITH ORDINALITY AS h(a, b, i) ORDER BY h.i),
+      "ttftHistogram" = ARRAY(SELECT COALESCE(h.a, 0) + COALESCE(h.b, 0) FROM unnest(target."ttftHistogram", EXCLUDED."ttftHistogram") WITH ORDINALITY AS h(a, b, i) ORDER BY h.i),
+      "updatedAt" = now();
+
+  RETURN OLD;
+END;
+$usage_rollup_detach_requester$;
+
+DROP TRIGGER IF EXISTS usage_rollup_detach_requester ON "user";
+CREATE TRIGGER usage_rollup_detach_requester AFTER DELETE ON "user"
+FOR EACH ROW EXECUTE FUNCTION detach_usage_rollup_requester();
 
 COMMIT;

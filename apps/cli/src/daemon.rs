@@ -761,10 +761,7 @@ fn run_relay_session(
         protocol_version: mode.version().to_string(),
         cli: CliInventory {
             slug: cli_slug.to_string(),
-            label: config
-                .cli_label
-                .clone()
-                .unwrap_or_else(|| "CLI device".to_string()),
+            hostname: crate::hostname::reported_hostname(),
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
             capabilities: startup::hello_capabilities(startup, config, mode, cli_slug),
         },

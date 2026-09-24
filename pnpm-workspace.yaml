@@ -114,6 +114,10 @@ catalog:
   next-themes: ^0.4.6
   react: ^19.3.0
   react-dom: ^19.3.0
+  # Required recharts peer; keep aligned with react.
+  react-is: ^19.3.0
+  # shadcn chart component (packages/ui/src/components/chart.tsx).
+  recharts: ^3.8.1
   react-markdown: 10.1.0
   rehype-highlight: 7.0.2
   highlight.js: 11.12.0

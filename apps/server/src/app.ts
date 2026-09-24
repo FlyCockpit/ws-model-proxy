@@ -11,6 +11,7 @@ import type { Session } from "@ws-model-proxy/auth";
 import { auth as defaultAuth } from "@ws-model-proxy/auth";
 import { armAuthDbShutdownFence } from "@ws-model-proxy/auth/auth-db-shutdown-fence";
 import { isForceTwoFactorRequired } from "@ws-model-proxy/auth/force-two-factor-policy";
+import { onUserDeleted } from "@ws-model-proxy/auth/user-deletion-listeners";
 import { THEME_INIT_SCRIPT } from "@ws-model-proxy/config/theme-init";
 import prismaDefault from "@ws-model-proxy/db";
 import { env as defaultEnv } from "@ws-model-proxy/env/server";
@@ -198,12 +199,26 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
  * module-lifetime MCP transport, and the /mcp admission gate (both closed
  * by the shutdown sequence after the HTTP drain).
  */
+/**
+ * Closes a deleted user's live relay sessions in this process. Both user
+ * deletion paths (dashboard `users.remove` and Better Auth admin
+ * remove-user) notify post-commit; the Set-backed registry makes repeated
+ * createApp calls register this once.
+ */
+const closeRelaySessionsForDeletedUser = (userId: string) =>
+  relaySessionManager.closeSessionsForUser(userId);
+onUserDeleted(closeRelaySessionsForDeletedUser);
+
 function cliContextServices() {
   return {
     repairExpiredProviderBudgets: (scope: { userId: string; providerAccountId: string }) =>
       repairExpiredProviderBudgets(new Date(), scope),
     onCliFeatureGrantsChanged: (cliDeviceId: string) =>
       relaySessionManager.onCliFeatureGrantsChanged(cliDeviceId),
+    onCliCredentialsRevoked: (revoked: {
+      kind: "cliToken" | "deviceCredential";
+      ids: readonly string[];
+    }) => relaySessionManager.closeSessionsForRevokedCredentials(revoked),
     cancelMcpTokenCommands: (tokenId: string) => cancelCommandsForToken(tokenId),
     getLiveCliFeatures: (cliDeviceIds: readonly string[]) =>
       relaySessionManager.getLiveCliFeatures(cliDeviceIds),

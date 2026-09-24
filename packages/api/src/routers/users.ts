@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { ORPCError } from "@orpc/server";
 import { auth } from "@ws-model-proxy/auth";
+import { notifyUserDeleted } from "@ws-model-proxy/auth/user-deletion-listeners";
 import { validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma from "@ws-model-proxy/db";
 import { env } from "@ws-model-proxy/env/server";
@@ -269,9 +270,10 @@ export const usersRouter = {
     if (!target) throw new ORPCError("NOT_FOUND", { message: "User not found" });
 
     // Sessions, accounts, two-factors, api keys, device codes and push subs
-    // cascade. Posts (`onDelete: Restrict`) do not — if the user has authored
-    // posts the delete will fail with a Prisma constraint error and we
-    // surface a friendly message suggesting "archive" instead.
+    // cascade, and so do the user's CLI devices and CLI credentials. Posts
+    // (`onDelete: Restrict`) do not — if the user has authored posts the
+    // delete will fail with a Prisma constraint error and we surface a
+    // friendly message suggesting "archive" instead.
     try {
       await prisma.user.delete({ where: { id: input.userId } });
     } catch (err) {
@@ -290,6 +292,12 @@ export const usersRouter = {
           "Couldn't delete that account. Try again, or contact an admin if it keeps happening.",
       });
     }
+    // Close the deleted user's live relay sessions, matched by the
+    // authenticated identity's userId (not a credential-id snapshot, so a
+    // credential minted just before the delete is covered). Same post-commit
+    // notification Better Auth's admin remove-user fires; in-process only
+    // (see @ws-model-proxy/auth/user-deletion-listeners).
+    await notifyUserDeleted(input.userId);
     return { success: true };
   }),
 };

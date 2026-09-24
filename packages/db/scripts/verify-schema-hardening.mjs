@@ -74,6 +74,11 @@ const requiredFragments = [
   "pricing retirement preserves activation and sets retirement",
   'btrim("accountingVersion")',
   'AND br."pricingVersion" IS NOT DISTINCT FROM NEW."pricingVersion"',
+  "usage_rollup_detach_requester",
+  'DELETE FROM usage_rollup_minute WHERE "requesterUserId" = OLD.id RETURNING *',
+  'DELETE FROM usage_rollup_hour WHERE "requesterUserId" = OLD.id RETURNING *',
+  // Sentinel upserts in the application's rollup key order (usage-rollup.ts).
+  'ORDER BY "bucketStart", "ownerUserId" COLLATE "C", "poolId" COLLATE "C",',
 ];
 for (const fragment of requiredFragments) {
   if (!sql.includes(fragment)) throw new Error(`Missing schema-hardening fragment: ${fragment}`);
@@ -193,6 +198,50 @@ for (const [name, contents, fragment] of [
   if (!contents.includes(fragment)) throw new Error(`${name} bypasses schema hardening`);
 }
 
+// Invariant: no hardening statement may move relay_request out of PENDING.
+// Every terminal transition must go through the application's status-guarded
+// path, which writes the usage rollup in the same transaction; a SQL backfill
+// would finalize requests that are then counted zero times (or finalize a live
+// mid-retry request during a rolling deploy).
+function relayRequestStatusWrites(source) {
+  return source
+    .replace(/--[^\n]*/g, "")
+    .split(";")
+    .filter((statement) => {
+      const writesRelayRequest =
+        /\bUPDATE\s+(?:ONLY\s+)?(?:"?public"?\.)?"?relay_request"?(?![\w"])/i.test(statement) ||
+        /\bINSERT\s+INTO\s+(?:"?public"?\.)?"?relay_request"?(?![\w"])/i.test(statement) ||
+        /\bMERGE\s+INTO\s+(?:"?public"?\.)?"?relay_request"?(?![\w"])/i.test(statement);
+      if (!writesRelayRequest) return false;
+      const setIndex = statement.search(/\bSET\b/i);
+      const assignsStatus =
+        setIndex >= 0 && /(^|[\s,(])"?status"?\s*=/i.test(statement.slice(setIndex));
+      const insertsStatus =
+        /\bINSERT\s+INTO\s+(?:"?public"?\.)?"?relay_request"?\s*\([^)]*(^|[\s,(])"?status"?[\s,)]/i.test(
+          statement,
+        );
+      return assignsStatus || insertsStatus;
+    });
+}
+for (const [sample, expected] of [
+  [
+    `WITH t AS (SELECT 1) UPDATE relay_request request\n   SET status = t."terminalState"::"RelayRequestStatus" FROM t;`,
+    1,
+  ],
+  ['UPDATE "relay_request" SET "completedAt" = now(), "status" = \'FAILED\';', 1],
+  ["INSERT INTO relay_request (id, \"userId\", status) VALUES ('a', 'b', 'FAILED');", 1],
+  ['UPDATE relay_request AS consumer\n   SET "requestedDiscoveredModelId" = t.id FROM t;', 0],
+  ["UPDATE relay_request_other SET status = 'FAILED';", 0],
+]) {
+  if (relayRequestStatusWrites(sample).length !== expected)
+    throw new Error(`relay_request status-write guard misclassified: ${sample}`);
+}
+const statusWrites = relayRequestStatusWrites(sql);
+if (statusWrites.length > 0)
+  throw new Error(
+    `schema-hardening.sql must not write relay_request.status (rollup-accounted path only):\n${statusWrites.join(";\n")}`,
+  );
+
 const baseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (!baseUrl) {
   process.stdout.write(
@@ -256,9 +305,9 @@ try {
     INSERT INTO "user" (id, "createdAt", "updatedAt", name, email, slug)
     VALUES ('owner-a', NOW(), NOW(), 'A', 'a@example.test', 'owner-a'),
            ('owner-b', NOW(), NOW(), 'B', 'b@example.test', 'owner-b');
-    INSERT INTO cli_device (id, "createdAt", "updatedAt", "userId", slug, label)
-    VALUES ('cli-a', NOW(), NOW(), 'owner-a', 'cli', 'CLI'),
-           ('cli-b', NOW(), NOW(), 'owner-b', 'cli', 'CLI');
+    INSERT INTO cli_device (id, "createdAt", "updatedAt", "userId", slug)
+    VALUES ('cli-a', NOW(), NOW(), 'owner-a', 'cli'),
+           ('cli-b', NOW(), NOW(), 'owner-b', 'cli');
     INSERT INTO endpoint (id, "createdAt", "updatedAt", "userId", "cliDeviceId", slug, label)
     VALUES ('endpoint-a', NOW(), NOW(), 'owner-a', 'cli-a', 'local', 'Local'),
            ('endpoint-b', NOW(), NOW(), 'owner-b', 'cli-b', 'local', 'Local');

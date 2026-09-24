@@ -89,8 +89,11 @@ const db = prisma as unknown as {
     findMany: MockInstance;
     findUnique: MockInstance;
     update: MockInstance;
+    updateMany: MockInstance;
     delete: MockInstance;
   };
+  cliDeviceCredential: { findMany: MockInstance };
+  cliToken: { findMany: MockInstance; updateMany: MockInstance };
   endpoint: {
     findUnique: MockInstance;
     delete: MockInstance;
@@ -279,6 +282,8 @@ describe("forwarderManagementRouter", () => {
     db.modelPool.findFirst.mockResolvedValue(null);
     db.poolMember.findUnique.mockResolvedValue(null);
     db.providerModel.findFirst.mockResolvedValue(null);
+    // A foreign CLI device matches no owner-scoped row.
+    db.cliDevice.updateMany.mockResolvedValue({ count: 0 });
     const captures: Array<{ status: number; body: string }> = [];
     const rpc = httpClient(captures);
     const attempts = [
@@ -1782,7 +1787,8 @@ describe("forwarderManagementRouter", () => {
         createdAt: new Date("2026-01-01"),
         updatedAt: new Date("2026-01-02"),
         slug: "desk",
-        label: "Desk",
+        name: null,
+        reportedHostname: "desk-01.local",
         status: "CONNECTED",
         lastConnectedAt: new Date("2026-01-01T00:00:00Z"),
         lastDisconnectedAt: null,
@@ -1839,6 +1845,13 @@ describe("forwarderManagementRouter", () => {
       "renamed-owner/desk/local/llama",
     );
     expect(result[0]?.endpoints[0]?.models[0]?.executionTarget).toBeNull();
+    // No user-set name: the reported hostname is the display name.
+    expect(result[0]).toMatchObject({
+      slug: "desk",
+      name: null,
+      reportedHostname: "desk-01.local",
+      displayName: "desk-01.local",
+    });
     const serialized = JSON.stringify(result);
     expect(serialized).not.toContain("127.0.0.1");
     expect(serialized).not.toContain("endpoint-secret");
@@ -1870,7 +1883,8 @@ describe("forwarderManagementRouter", () => {
         createdAt: new Date("2026-01-01"),
         updatedAt: new Date("2026-01-02"),
         slug: "desk",
-        label: "Desk",
+        name: "Desk",
+        reportedHostname: null,
         status: "CONNECTED",
         lastConnectedAt: new Date("2026-01-01T00:00:00Z"),
         lastDisconnectedAt: null,
@@ -1924,12 +1938,8 @@ describe("forwarderManagementRouter", () => {
   });
 
   it("removes metadata only when the row belongs to the current user", async () => {
-    db.cliDevice.findUnique.mockResolvedValue({
-      id: "cli-id",
-      userId: "other-user-id",
-      status: "STALE",
-      lastHeartbeatAt: new Date("2026-01-01"),
-    });
+    // The owner-scoped lock write matches nothing for another user's device.
+    db.cliDevice.updateMany.mockResolvedValue({ count: 0 });
 
     await expect(client().removeCliDeviceMetadata({ id: "cli-id" })).rejects.toSatisfy(
       (error: ORPCError) => {
@@ -1937,7 +1947,44 @@ describe("forwarderManagementRouter", () => {
         return true;
       },
     );
+    expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
+      where: { id: "cli-id", userId: "user-id" },
+      data: { updatedAt: expect.any(Date) },
+    });
     expect(db.cliDevice.delete).not.toHaveBeenCalled();
+    expect(db.cliToken.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("deletes a device with its credentials and closes their live relay sessions", async () => {
+    db.cliDevice.updateMany.mockResolvedValue({ count: 1 });
+    db.cliDevice.delete.mockResolvedValue({ id: "cli-id" });
+    db.cliDeviceCredential.findMany.mockResolvedValue([{ id: "device-credential-1" }]);
+    db.cliToken.findMany.mockResolvedValue([{ id: "cli-token-1" }]);
+    db.cliToken.updateMany.mockResolvedValue({ count: 1 });
+    const onCliCredentialsRevoked = vi.fn();
+    const rpc = createRouterClient(forwarderManagementRouter, {
+      context: { ...buildContext(), services: { onCliCredentialsRevoked } },
+    });
+
+    await expect(rpc.removeCliDeviceMetadata({ id: "cli-id" })).resolves.toEqual({
+      deleted: true,
+    });
+
+    expect(db.cliToken.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ["cli-token-1"] }, revokedAt: null },
+      data: { revokedAt: expect.any(Date) },
+    });
+    expect(db.cliDevice.delete).toHaveBeenCalledWith({
+      where: { id: "cli-id" },
+      select: { id: true },
+    });
+    expect(onCliCredentialsRevoked.mock.calls).toEqual([
+      [{ kind: "deviceCredential", ids: ["device-credential-1"] }],
+      [{ kind: "cliToken", ids: ["cli-token-1"] }],
+    ]);
+    // Sessions are closed only after the delete transaction committed.
+    const deleteOrder = db.cliDevice.delete.mock.invocationCallOrder[0] ?? Number.NaN;
+    expect(onCliCredentialsRevoked.mock.invocationCallOrder[0]).toBeGreaterThan(deleteOrder);
   });
 
   it("creates and updates owned model pools without touching grant ids", async () => {
@@ -4860,6 +4907,90 @@ describe("forwarderManagementRouter", () => {
   });
 });
 
+describe("renameCliDevice", () => {
+  function renameClient(userId = "user-id") {
+    return createRouterClient(forwarderManagementRouter, {
+      context: buildContext({ user: { id: userId } }),
+    });
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("sets a trimmed name on an owned device and returns its display name", async () => {
+    db.cliDevice.findUnique.mockResolvedValue({ id: "cli-id", userId: "user-id" });
+    db.cliDevice.update.mockResolvedValue({
+      id: "cli-id",
+      slug: "desk",
+      name: "Work laptop",
+      reportedHostname: "desk-01.local",
+    });
+
+    const result = await renameClient().renameCliDevice({
+      cliDeviceId: "cli-id",
+      name: "  Work laptop  ",
+    });
+
+    expect(db.cliDevice.update).toHaveBeenCalledWith({
+      where: { id: "cli-id" },
+      data: { name: "Work laptop" },
+      select: { id: true, slug: true, name: true, reportedHostname: true },
+    });
+    expect(result).toEqual({
+      cliDeviceId: "cli-id",
+      name: "Work laptop",
+      displayName: "Work laptop",
+    });
+  });
+
+  it("clears the name with null so the hostname shows again", async () => {
+    db.cliDevice.findUnique.mockResolvedValue({ id: "cli-id", userId: "user-id" });
+    db.cliDevice.update.mockResolvedValue({
+      id: "cli-id",
+      slug: "desk",
+      name: null,
+      reportedHostname: "desk-01.local",
+    });
+
+    const result = await renameClient().renameCliDevice({ cliDeviceId: "cli-id", name: null });
+
+    expect(db.cliDevice.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { name: null } }),
+    );
+    expect(result.displayName).toBe("desk-01.local");
+  });
+
+  it("rejects blank, over-long, and invisible-character names before touching the database", async () => {
+    for (const name of ["   ", "x".repeat(121), "desk\u0000", "desk\u202Epot", "desk\u200Bpot"]) {
+      const error = await renameClient()
+        .renameCliDevice({ cliDeviceId: "cli-id", name })
+        .catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(ORPCError);
+      if (error instanceof ORPCError) expect(error.code).toBe("BAD_REQUEST");
+    }
+    expect(db.cliDevice.findUnique).not.toHaveBeenCalled();
+    expect(db.cliDevice.update).not.toHaveBeenCalled();
+  });
+
+  it("uses the same not-found error for an unknown device and another user's device", async () => {
+    db.cliDevice.findUnique
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ id: "cli-id", userId: "other-user" });
+    const unknown = await renameClient()
+      .renameCliDevice({ cliDeviceId: "missing", name: "Desk" })
+      .catch((error: unknown) => error);
+    const foreign = await renameClient()
+      .renameCliDevice({ cliDeviceId: "cli-id", name: "Desk" })
+      .catch((error: unknown) => error);
+    for (const error of [unknown, foreign]) {
+      expect(error).toBeInstanceOf(ORPCError);
+      if (error instanceof ORPCError) expect(error.code).toBe("NOT_FOUND");
+    }
+    expect(db.cliDevice.update).not.toHaveBeenCalled();
+  });
+});
+
 describe("setCliDeviceFeatureGrants", () => {
   function grantsClient(userId = "user-id", hook?: (cliDeviceId: string) => void) {
     return createRouterClient(forwarderManagementRouter, {
@@ -5001,7 +5132,8 @@ describe("setCliDeviceFeatureGrants", () => {
         createdAt: new Date("2026-01-01"),
         updatedAt: new Date("2026-01-02"),
         slug: "desk",
-        label: "Desk",
+        name: "Desk",
+        reportedHostname: "desk-01.local",
         status: "DISCONNECTED",
         allowHumanTerminal: true,
         allowMcpCommands: false,
@@ -5032,6 +5164,7 @@ describe("setCliDeviceFeatureGrants", () => {
         available: false,
       },
     });
+    expect(offline[0]?.displayName).toBe("Desk");
     expect(offline[0]?.cliVersion).toBe("1.2.0");
     expect(offline[0]?.relayProtocolVersion).toBe("2.4");
 

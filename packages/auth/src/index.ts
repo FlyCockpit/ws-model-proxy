@@ -18,10 +18,15 @@ import { admin, deviceAuthorization, twoFactor } from "better-auth/plugins";
 import { z } from "zod";
 import { sanitizedApiErrorLogLine } from "./api-error-logging";
 import { resolveAuthLogCall } from "./auth-logger-bridge";
+import {
+  DISABLED_DEVICE_AUTHORIZATION_PATHS,
+  requireCliDeviceLoginScope,
+} from "./cli-device-login-scope";
 import { resolveMcpPlugins } from "./mcp-plugins";
 import { resolveSignupLocale } from "./signup-locale";
 import { getSignupAccessState, resolveBootstrapAdminIdentity } from "./signup-policy";
 import { resolveUserCreatePolicy, toUserCreatePolicyInput } from "./user-create-policy";
+import { notifyUserDeleted } from "./user-deletion-listeners";
 import { withVerificationCallback } from "./verification-callback";
 
 const isCrossOrigin = !!env.CORS_ORIGIN;
@@ -224,6 +229,8 @@ export const auth = betterAuth({
       ? { sameSite: "none", secure: true, httpOnly: true }
       : { httpOnly: true, secure: env.NODE_ENV === "production" },
   },
+  // Only the device-flow session endpoint; see DISABLED_DEVICE_AUTHORIZATION_PATHS.
+  disabledPaths: [...DISABLED_DEVICE_AUTHORIZATION_PATHS],
   plugins: [
     admin({
       defaultRole: "user",
@@ -270,15 +277,19 @@ export const auth = betterAuth({
           }
         : {}),
     }),
-    // OAuth 2.0 Device Authorization Grant (RFC 8628). Lets CLI clients that
-    // can't paste a static token bootstrap an admin session via /device. We do
-    // not enable `oauthProvider` here — device flow alone is enough for MVP.
+    // OAuth 2.0 Device Authorization Grant (RFC 8628) for `wsmp login`. The
+    // plugin handles the request and approval steps; the approved code is
+    // redeemed only by `cliCredentials.exchangeDeviceCode` for one device
+    // credential. Its session-minting `/device/token` is disabled above.
     // The plugin's options schema uses `z.custom(() => true)` for the
     // `schema` field without `.optional()`, so we have to pass it explicitly
     // (even as `undefined`) or zod rejects the call at startup.
     deviceAuthorization({
       expiresIn: "30m",
       interval: "5s",
+      // Every request names the CLI slug it is for (`cli-slug:<slug>`); the
+      // approval page shows it and the exchange mints for that slug only.
+      onDeviceAuthRequest: requireCliDeviceLoginScope,
       // The adapter looks up `db.deviceCode` by the schema key `deviceCode`,
       // and the options-schema parser marks `schema` as nonoptional, so pass
       // the Prisma model mapping explicitly.
@@ -329,6 +340,15 @@ export const auth = betterAuth({
               role: policy.role,
             },
           };
+        },
+      },
+      delete: {
+        // Better Auth queues delete.after until its transaction commits
+        // (admin remove-user and the self-service delete-user routes both go
+        // through internalAdapter.deleteUser). Closes the deleted user's live
+        // relay sessions in this process; see user-deletion-listeners.ts.
+        after: async (user) => {
+          await notifyUserDeleted(user.id);
         },
       },
     },

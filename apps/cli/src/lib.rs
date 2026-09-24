@@ -13,6 +13,7 @@ pub mod config;
 pub mod control;
 pub mod daemon;
 pub mod exit;
+pub mod hostname;
 pub mod logging;
 pub mod media;
 pub mod output;

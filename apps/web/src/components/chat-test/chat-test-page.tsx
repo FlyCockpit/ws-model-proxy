@@ -1077,10 +1077,10 @@ export function ChatTestPage({ lang }: { lang: string }) {
   }
 
   return (
-    <section className="grid h-full min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)_auto] rounded-md border bg-background">
+    <section className="grid h-full min-h-0 min-w-0 flex-1 grid-rows-[auto_minmax(0,1fr)_auto] bg-background">
       <div className="flex shrink-0 flex-col gap-2 border-b bg-background p-2 sm:gap-3 sm:p-3 md:sticky md:top-0 md:z-10 md:flex-row md:items-start md:justify-between">
         <div className="min-w-0">
-          <h2 className="text-base font-semibold sm:text-lg">{t("dashboard:chatTest.title")}</h2>
+          <h1 className="text-base font-semibold sm:text-lg">{t("dashboard:chatTest.title")}</h1>
           {effectiveModelId ? (
             <p
               className="mt-0.5 break-all font-mono text-xs text-muted-foreground"

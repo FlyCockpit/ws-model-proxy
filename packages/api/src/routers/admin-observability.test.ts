@@ -155,7 +155,8 @@ describe("adminObservabilityRouter", () => {
         createdAt: new Date("2026-01-01T00:00:00.000Z"),
         updatedAt: new Date("2026-01-01T00:01:00.000Z"),
         slug: "desk",
-        label: "Desk",
+        name: null,
+        reportedHostname: "desk-01.local",
         status: "CONNECTED",
         lastConnectedAt: new Date("2026-01-01T00:00:00.000Z"),
         lastDisconnectedAt: null,
@@ -180,6 +181,9 @@ describe("adminObservabilityRouter", () => {
       id: "cli-id",
       owner: owner(),
       slug: "desk",
+      name: null,
+      reportedHostname: "desk-01.local",
+      displayName: "desk-01.local",
       status: "CONNECTED",
       endpointCount: 2,
       cliTokenCount: 3,
@@ -220,7 +224,8 @@ describe("adminObservabilityRouter", () => {
         CliDevice: {
           id: "cli-id",
           slug: "desk",
-          label: "Desk",
+          name: null,
+          reportedHostname: "desk-01.local",
           status: "CONNECTED",
           lastHeartbeatAt: new Date(Date.now()),
         },
@@ -235,6 +240,7 @@ describe("adminObservabilityRouter", () => {
       chatCompletions: { supported: true },
     });
     expect(result.items[0]?.discoveredModelCount).toBe(2);
+    expect(result.items[0]?.cliDevice.displayName).toBe("desk-01.local");
     const serialized = JSON.stringify(result);
     expect(serialized).not.toContain("127.0.0.1");
     expect(serialized).not.toContain("endpoint-secret");
@@ -266,7 +272,8 @@ describe("adminObservabilityRouter", () => {
           CliDevice: {
             id: "cli-id",
             slug: "desk",
-            label: "Desk",
+            name: null,
+            reportedHostname: "desk-01.local",
             status: "CONNECTED",
             lastHeartbeatAt: new Date(Date.now()),
           },
@@ -354,7 +361,8 @@ describe("adminObservabilityRouter", () => {
                   CliDevice: {
                     id: "cli-id",
                     slug: "desk",
-                    label: "Desk",
+                    name: null,
+                    reportedHostname: "desk-01.local",
                     status: "CONNECTED",
                     lastHeartbeatAt: new Date(Date.now()),
                   },
@@ -378,7 +386,7 @@ describe("adminObservabilityRouter", () => {
       healthStatus: "DEGRADED",
       routingStatus: "ACTIVE",
       lastFailureClass: "UPSTREAM_5XX",
-      model: { canonicalModelId: "owner/desk/local/llama" },
+      model: { canonicalModelId: "owner/desk/local/llama", cliDeviceDisplayName: "desk-01.local" },
     });
     expect(db.modelPool.findMany).toHaveBeenCalledWith(
       expect.objectContaining({

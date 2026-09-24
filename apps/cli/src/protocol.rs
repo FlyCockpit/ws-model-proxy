@@ -248,7 +248,9 @@ pub enum RelayMetricTokenizer {
 #[serde(rename_all = "camelCase")]
 pub struct CliInventory {
     pub slug: String,
-    pub label: String,
+    /// This machine's hostname, a reported fact. Omitted when unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     pub capabilities: CliCapabilities,
@@ -1227,13 +1229,35 @@ mod tests {
     }
 
     #[test]
+    fn hello_omits_an_unavailable_hostname() {
+        let inventory = CliInventory {
+            slug: "desktop".to_string(),
+            hostname: None,
+            version: None,
+            capabilities: CliCapabilities::from_snapshot(
+                &TerminalFeatureSnapshot {
+                    allow_human_terminal: false,
+                    allow_mcp_commands: false,
+                    require_terminal_approval: false,
+                    terminal_public_key_b64url: "AQID".to_string(),
+                    terminal_identity: None,
+                },
+                RelayProtocolMode::V25,
+            ),
+        };
+        let encoded = serde_json::to_string(&inventory).expect("encode");
+        assert!(!encoded.contains("hostname"));
+        assert!(!encoded.contains("label"));
+    }
+
+    #[test]
     fn control_frames_use_server_field_casing() {
         let message = ClientControlMessage::Hello {
             id: "hello-1".to_string(),
             protocol_version: RELAY_PROTOCOL_VERSION.to_string(),
             cli: CliInventory {
                 slug: "desktop".to_string(),
-                label: "Desktop".to_string(),
+                hostname: Some("desk-01.local".to_string()),
                 version: None,
                 capabilities: CliCapabilities::from_snapshot(
                     &TerminalFeatureSnapshot {
@@ -1263,6 +1287,8 @@ mod tests {
         let encoded = encode_control(&message).expect("encode");
 
         assert!(encoded.contains(r#""protocolVersion":"2.5""#));
+        assert!(encoded.contains(r#""hostname":"desk-01.local""#));
+        assert!(!encoded.contains(r#""label":"Desktop""#));
         assert!(encoded.contains(r#""terminalViewers":true"#));
         assert!(encoded.contains(r#""terminalIdentity":{"publicKey":"BAQE","signature":"Sig"}"#));
         assert!(encoded.contains(r#""sharedTokenizerTps":true"#));

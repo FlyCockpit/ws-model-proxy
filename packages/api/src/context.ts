@@ -41,6 +41,15 @@ export type ContextServices = {
   signal?: AbortSignal;
   /** Close terminals or cancel CLI commands after a dashboard grant change. */
   onCliFeatureGrantsChanged?: (cliDeviceId: string) => void | Promise<void>;
+  /**
+   * Close live relay sessions authenticated by credentials that were just
+   * revoked (re-login, CLI token revoke). Called after the revoking write
+   * commits. Per-process: it reaches the sessions this server holds.
+   */
+  onCliCredentialsRevoked?: (revoked: {
+    kind: "cliToken" | "deviceCredential";
+    ids: readonly string[];
+  }) => void | Promise<void>;
   /** Cancel in-memory CLI commands bound to a revoked personal token. */
   cancelMcpTokenCommands?: (tokenId: string) => void;
   /** Live protocol/feature snapshot for dashboard and MCP device lists. */

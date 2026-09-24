@@ -368,6 +368,7 @@ export async function runChatCompletionDiagnostic({
     manager,
     limiter: concurrencyLimiter,
     capacityRuntime: capacityRuntime ?? diagnosticsCapacityRuntime(),
+    source: "MCP",
   });
 
   if (response.status === 400) {

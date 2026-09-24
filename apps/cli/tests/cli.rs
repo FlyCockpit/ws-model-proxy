@@ -236,7 +236,44 @@ fn login_rejects_invalid_slug_before_device_authorization_request() {
 }
 
 #[test]
-fn login_slug_conflict_does_not_overwrite_local_slug_or_save_credential() {
+fn login_rejects_the_removed_name_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({
+            "version": 1,
+            "serverUrl": "http://127.0.0.1:9"
+        }),
+    );
+
+    cli(&config, &state)
+        .args(["login", "--name", "Desk", "--slug", "desk-01"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--name"));
+}
+
+#[test]
+fn non_interactive_login_defaults_the_slug_from_the_hostname() {
+    let Some(expected) = wsmp::hostname::hostname_slug() else {
+        // No usable hostname here: login must ask for `--slug` instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.json");
+        let state = tmp.path().join("state");
+        write_config(
+            &config,
+            json!({ "version": 1, "serverUrl": "http://127.0.0.1:9" }),
+        );
+        cli(&config, &state)
+            .arg("login")
+            .write_stdin("")
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("pass `--slug <slug>`"));
+        return;
+    };
     let server = TestServer::start(vec![
         (
             "/api/auth/device/code",
@@ -251,13 +288,62 @@ fn login_slug_conflict_does_not_overwrite_local_slug_or_save_credential() {
         ),
         (
             "/rpc/cliCredentials/exchangeDeviceCode",
-            409,
+            200,
+            json!({
+                "json": {
+                    "credentialId": "credential-1",
+                    "userId": "user-1",
+                    "secret": "wsmp_device_secret_for_test"
+                }
+            }),
+        ),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({ "version": 1, "serverUrl": server.base_url }),
+    );
+
+    // assert_cmd gives the child a non-terminal stdin.
+    cli(&config, &state)
+        .arg("login")
+        .write_stdin("")
+        .assert()
+        .success();
+    let start_request = server.requests.recv().unwrap();
+    assert!(start_request.contains("POST /api/auth/device/code"));
+    let exchange_request = server.requests.recv().unwrap();
+    assert!(exchange_request.contains(&format!(r#""cliSlug":"{expected}""#)));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["cliSlug"], expected.as_str());
+    server.join();
+}
+
+#[test]
+fn login_rejection_does_not_overwrite_local_slug_or_save_credential() {
+    let server = TestServer::start(vec![
+        (
+            "/api/auth/device/code",
+            200,
+            json!({
+                "device_code": "device-code-1",
+                "user_code": "ABCD-EFGH",
+                "verification_uri": "http://example.test/en-US/device",
+                "expires_in": 30,
+                "interval": 1
+            }),
+        ),
+        (
+            "/rpc/cliCredentials/exchangeDeviceCode",
+            400,
             json!({
                 "json": {
                     "defined": false,
-                    "code": "CONFLICT",
-                    "status": 409,
-                    "message": "CLI slug `desk-01` is already in use for your account; choose a different slug."
+                    "code": "BAD_REQUEST",
+                    "status": 400,
+                    "message": "Device authorization was requested for a different CLI slug."
                 }
             }),
         ),
@@ -278,15 +364,178 @@ fn login_slug_conflict_does_not_overwrite_local_slug_or_save_credential() {
         .args(["login", "--slug", "desk-01"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("choose a different slug"));
+        .stderr(predicate::str::contains("different CLI slug"));
 
-    let exchange_request = server.requests.recv().unwrap();
-    assert!(exchange_request.contains("POST /api/auth/device/code"));
+    let start_request = server.requests.recv().unwrap();
+    assert!(start_request.contains("POST /api/auth/device/code"));
     let exchange_request = server.requests.recv().unwrap();
     assert!(exchange_request.contains(r#""cliSlug":"desk-01""#));
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     assert_eq!(cfg["cliSlug"], "existing-cli");
     assert!(!state.join("device-auth.json").exists());
+    server.join();
+}
+
+#[test]
+fn login_untagged_error_fails_fast_even_when_the_message_says_pending() {
+    // Only one exchange response is served. Classifying by message text (it
+    // says "pending") instead of `data.deviceFlowError` would poll again, hit
+    // a closed server, and fail with a transport error instead of this error.
+    let server = TestServer::start(vec![
+        (
+            "/api/auth/device/code",
+            200,
+            json!({
+                "device_code": "device-code-1",
+                "user_code": "ABCD-EFGH",
+                "verification_uri": "http://example.test/en-US/device",
+                "expires_in": 30,
+                "interval": 1
+            }),
+        ),
+        (
+            "/rpc/cliCredentials/exchangeDeviceCode",
+            400,
+            json!({
+                "json": {
+                    "defined": false,
+                    "code": "BAD_REQUEST",
+                    "status": 400,
+                    "message": "Device authorization is pending, but for a different CLI slug."
+                }
+            }),
+        ),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({ "version": 1, "serverUrl": server.base_url }),
+    );
+
+    let started = std::time::Instant::now();
+    cli(&config, &state)
+        .args(["login", "--slug", "pending-ci"])
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("for a different CLI slug"));
+    // One poll interval (1s), not a poll loop until the 30s expiry.
+    assert!(started.elapsed() < std::time::Duration::from_secs(8));
+    assert!(!state.join("device-auth.json").exists());
+    server.join();
+}
+
+#[test]
+fn relogin_with_the_saved_slug_overwrites_the_device_credential() {
+    let server = TestServer::start(vec![
+        (
+            "/api/auth/device/code",
+            200,
+            json!({
+                "device_code": "device-code-2",
+                "user_code": "WXYZ-2345",
+                "verification_uri": "http://example.test/en-US/device",
+                "expires_in": 30,
+                "interval": 1
+            }),
+        ),
+        (
+            "/rpc/cliCredentials/exchangeDeviceCode",
+            200,
+            json!({
+                "json": {
+                    "credentialId": "credential-2",
+                    "userId": "user-1",
+                    "secret": "wsmp_device_new_secret"
+                }
+            }),
+        ),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({ "version": 1, "serverUrl": server.base_url, "cliSlug": "desk-01" }),
+    );
+    fs::create_dir_all(&state).unwrap();
+    fs::write(
+        state.join("device-auth.json"),
+        serde_json::to_string(&json!({
+            "credentialId": "credential-1",
+            "userId": "user-1",
+            "secret": "wsmp_device_old_secret"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    cli(&config, &state)
+        .arg("login")
+        .write_stdin("")
+        .assert()
+        .success();
+
+    // The approval request names the saved slug, so the approver sees which
+    // device this login replaces.
+    let start_request = server.requests.recv().unwrap();
+    assert!(start_request.contains(r#""scope":"cli-slug:desk-01""#));
+    let exchange_request = server.requests.recv().unwrap();
+    assert!(exchange_request.contains(r#""cliSlug":"desk-01""#));
+    let credential_text = fs::read_to_string(state.join("device-auth.json")).unwrap();
+    assert!(credential_text.contains("wsmp_device_new_secret"));
+    assert!(!credential_text.contains("wsmp_device_old_secret"));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["cliSlug"], "desk-01");
+    server.join();
+}
+
+#[test]
+fn non_interactive_login_defaults_to_the_saved_slug() {
+    let server = TestServer::start(vec![
+        (
+            "/api/auth/device/code",
+            200,
+            json!({
+                "device_code": "device-code-1",
+                "user_code": "ABCD-EFGH",
+                "verification_uri": "http://example.test/en-US/device",
+                "expires_in": 30,
+                "interval": 1
+            }),
+        ),
+        (
+            "/rpc/cliCredentials/exchangeDeviceCode",
+            200,
+            json!({
+                "json": {
+                    "credentialId": "credential-1",
+                    "userId": "user-1",
+                    "secret": "wsmp_device_secret_for_test"
+                }
+            }),
+        ),
+    ]);
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({ "version": 1, "serverUrl": server.base_url, "cliSlug": "saved-cli" }),
+    );
+
+    cli(&config, &state)
+        .arg("login")
+        .write_stdin("")
+        .assert()
+        .success();
+    let _start_request = server.requests.recv().unwrap();
+    let exchange_request = server.requests.recv().unwrap();
+    assert!(exchange_request.contains(r#""cliSlug":"saved-cli""#));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["cliSlug"], "saved-cli");
     server.join();
 }
 
@@ -312,7 +561,8 @@ fn login_writes_device_credential_to_state_dir() {
                     "defined": false,
                     "code": "BAD_REQUEST",
                     "status": 400,
-                    "message": "Device authorization is pending."
+                    "message": "Device authorization is pending.",
+                    "data": { "deviceFlowError": "authorization_pending" }
                 }
             }),
         ),
@@ -340,14 +590,17 @@ fn login_writes_device_credential_to_state_dir() {
     );
 
     cli(&config, &state)
-        .args(["login", "--name", "Test CLI", "--slug", "desk-01"])
+        .args(["login", "--slug", "desk-01"])
         .assert()
         .success()
         .stdout(predicate::str::contains("device login complete"));
     let start_request = server.requests.recv().unwrap();
     assert!(start_request.contains("POST /api/auth/device/code"));
+    assert!(start_request.contains(r#""scope":"cli-slug:desk-01""#));
     let pending_request = server.requests.recv().unwrap();
     assert!(pending_request.contains(r#""cliSlug":"desk-01""#));
+    // The device's name is dashboard-owned; login sends none.
+    assert!(!pending_request.contains(r#""name""#));
     let success_request = server.requests.recv().unwrap();
     assert!(success_request.contains(r#""cliSlug":"desk-01""#));
 

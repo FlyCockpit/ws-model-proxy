@@ -24,6 +24,10 @@ describe("auth locale key parity (en-US / es-MX)", () => {
     expect(keyTree(esAuth.mcpConsent)).toEqual(keyTree(enAuth.mcpConsent));
   });
 
+  it("has identical key trees for the device approval page", () => {
+    expect(keyTree(esAuth.device)).toEqual(keyTree(enAuth.device));
+  });
+
   it("contains the full MCP login/consent key sets in both bundles", () => {
     for (const bundle of [enAuth, esAuth]) {
       expect(keyTree(bundle.mcpLogin).sort()).toEqual(

@@ -38,7 +38,8 @@ cargo xtask sync-docs --check
 ## CLI
 
 ```sh
-wsmp login                         # start device-code login
+wsmp login                         # device-code login; slug defaults to the configured slug, else the hostname
+wsmp login --slug desk-01          # choose the CLI slug used in model ids
 wsmp token login WSMP_TOKEN         # store the env var name for a CLI token
 wsmp config path                    # where the config file lives
 wsmp config --json show             # print config as JSON
@@ -99,6 +100,21 @@ The terminals page shows each CLI's fingerprint: base32 of the first 20 bytes of
   LaunchAgent (macOS). Re-running install rewrites the unit/plist and restarts.
 - **Device credentials** (`wsmp login`) live in the state directory and work
   under services without extra setup.
+- **Logging in again.** `wsmp login` names its CLI slug in the approval
+  request, and the browser approval page shows it. Approving a slug you
+  already use replaces that device's login: the device keeps its name,
+  grants, pools, endpoints, and model ids; its previous device credential is
+  revoked and any relay still using it is disconnected (its reconnects are
+  refused with 401). If two logins for one slug are approved at about the same
+  time, the one approved last wins and the other CLI must log in again. If the
+  login moved to another machine, browser terminals ask you to trust the new
+  identity key.
+- **Deleting a device** in the dashboard deletes its device credentials,
+  revokes CLI tokens bound to it, and disconnects its relay. Run `wsmp login`
+  on that machine to add it again (as a new device).
+- **Device names.** The relay reports this machine's hostname. The dashboard
+  shows the name you give the device there, else that hostname, else the CLI
+  slug. The slug stays fixed because model ids use it.
 - **CLI tokens and endpoint header secrets** are env-var *names* in config, not
   values. User services do not inherit your interactive shell, so export those
   variables and run `wsmp service env-sync` to write them into the private

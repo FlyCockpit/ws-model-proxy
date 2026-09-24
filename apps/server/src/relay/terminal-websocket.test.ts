@@ -68,7 +68,7 @@ const db = prisma as unknown as {
     findFirst: MockInstance;
     findMany: MockInstance;
   };
-  cliToken: { update: MockInstance };
+  cliToken: { update: MockInstance; updateMany: MockInstance; findUnique: MockInstance };
   endpoint: { upsert: MockInstance; findUnique: MockInstance; updateMany: MockInstance };
   discoveredModel: {
     findUnique: MockInstance;
@@ -139,7 +139,7 @@ function hello(slug: string, protocol: "2.5" | "2.4" | "2.1", features?: CliFeat
       protocolVersion: "2.1",
       cli: {
         slug,
-        label: slug,
+        hostname: `${slug}.local`,
         capabilities: {
           protocolVersion: "2.1",
           inventoryAck: true,
@@ -161,7 +161,7 @@ function hello(slug: string, protocol: "2.5" | "2.4" | "2.1", features?: CliFeat
     protocolVersion: protocol,
     cli: {
       slug,
-      label: slug,
+      hostname: `${slug}.local`,
       version: "9.9.9",
       capabilities: {
         protocolVersion: protocol,
@@ -204,7 +204,6 @@ function cliIdentity() {
 function device(id: string, overrides: Record<string, unknown> = {}) {
   return {
     id,
-    label: id,
     slug: id,
     status: "CONNECTED",
     allowHumanTerminal: true,
@@ -368,6 +367,13 @@ describe("terminal browser hub", () => {
     db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
       callback(db),
     );
+    // An unbound CLI token: every hello's conditional bind claims it.
+    db.cliToken.findUnique.mockResolvedValue({
+      revokedAt: null,
+      expiresAt: null,
+      cliDeviceId: null,
+    });
+    db.cliToken.updateMany.mockResolvedValue({ count: 1 });
     db.user.findUnique.mockResolvedValue({ slug: "owner" });
     db.cliDevice.upsert.mockImplementation(async (args: { create: { slug: string } }) => ({
       id: args.create.slug,
@@ -390,7 +396,7 @@ describe("terminal browser hub", () => {
         const id = args.where.id;
         if (!id || id === "missing" || id === "foreign") return null;
         if (args.where.userId && args.where.userId !== "user-id") return null;
-        if (id === "foreign") return device("foreign", { label: "Foreign secret" });
+        if (id === "foreign") return device("foreign", { slug: "foreign-secret" });
         return device(id, id === "ungranted" ? { allowHumanTerminal: false } : {});
       },
     );

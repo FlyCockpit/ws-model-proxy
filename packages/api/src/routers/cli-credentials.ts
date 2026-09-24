@@ -1,4 +1,6 @@
 import { ORPCError } from "@orpc/server";
+import { cliSlugFromDeviceLoginScope } from "@ws-model-proxy/config/cli-device-login";
+import { cliDeviceDisplayName } from "@ws-model-proxy/config/cli-device-name";
 import { validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import {
@@ -8,6 +10,7 @@ import {
 import { z } from "zod";
 import { protectedProcedure, publicProcedure } from "../index";
 import {
+  closeRevokedCliCredentialSessions,
   digestCliTokenSecret,
   mintCliDeviceCredentialFromApprovedDeviceCode,
 } from "../lib/cli-credential-access";
@@ -47,6 +50,15 @@ function serializeCliToken(row: CliTokenRow) {
     expiresAt: row.expiresAt,
     cliDeviceId: row.cliDeviceId,
   };
+}
+
+/**
+ * Better Auth's user-code lookup: the exact code, else (for the default
+ * alphabet) the code with separators removed and upper-cased.
+ */
+function userCodeCandidates(userCode: string): string[] {
+  const normalized = userCode.replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+  return normalized && normalized !== userCode ? [userCode, normalized] : [userCode];
 }
 
 export const cliCredentialsRouter = {
@@ -116,6 +128,10 @@ export const cliCredentialsRouter = {
         data: { revokedAt: existing.revokedAt ?? new Date() },
         select: cliTokenSelection,
       });
+      await closeRevokedCliCredentialSessions(context.services, {
+        kind: "cliToken",
+        ids: [row.id],
+      });
       return serializeCliToken(row);
     }),
 
@@ -123,15 +139,51 @@ export const cliCredentialsRouter = {
     .input(
       z.object({
         deviceCode: z.string().trim().min(1).max(512),
-        name: credentialNameSchema.default("CLI device"),
         cliSlug: cliSlugSchema,
       }),
     )
-    .handler(async ({ input }) => {
-      return mintCliDeviceCredentialFromApprovedDeviceCode({
+    .handler(async ({ input, context }) => {
+      const minted = await mintCliDeviceCredentialFromApprovedDeviceCode({
         deviceCode: input.deviceCode,
-        name: input.name,
         cliSlug: input.cliSlug,
       });
+      await closeRevokedCliCredentialSessions(context.services, minted.revoked);
+      return { credentialId: minted.credentialId, userId: minted.userId, secret: minted.secret };
+    }),
+
+  /**
+   * What approving a `wsmp login` request authorizes, for the approval page:
+   * the CLI slug bound to the request and the existing device it would take
+   * over, if any. Only the account that claimed the code (Better Auth's
+   * `GET /device`) sees it; everything else is NOT_FOUND.
+   */
+  deviceLoginRequest: protectedProcedure
+    .input(z.object({ userCode: z.string().trim().min(1).max(191) }))
+    .handler(async ({ input, context }) => {
+      const userId = context.session.user.id;
+      const row = await prisma.deviceCode.findFirst({
+        where: { userCode: { in: userCodeCandidates(input.userCode) }, userId },
+        select: { status: true, expiresAt: true, scope: true },
+      });
+      if (!row || row.expiresAt <= new Date()) {
+        throw new ORPCError("NOT_FOUND", { message: "Device login request not found." });
+      }
+      const slug = cliSlugFromDeviceLoginScope(row.scope);
+      if (slug === null) {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "This device login request does not name a CLI slug; upgrade wsmp.",
+        });
+      }
+      const device = await prisma.cliDevice.findUnique({
+        where: { userId_slug: { userId, slug } },
+        select: { id: true, slug: true, name: true, reportedHostname: true },
+      });
+      return {
+        status: row.status,
+        slug,
+        existingDevice: device
+          ? { id: device.id, slug: device.slug, displayName: cliDeviceDisplayName(device) }
+          : null,
+      };
     }),
 };

@@ -76,6 +76,13 @@ declare module "@tanstack/react-router" {
   interface Register {
     router: ReturnType<typeof getRouter>;
   }
+  interface StaticDataRouteOption {
+    /**
+     * Dashboard page geometry. "fill" pages (terminals, chat test) own the
+     * whole content pane; everything else renders in the padded container.
+     */
+    dashboardLayout?: "padded" | "fill";
+  }
 }
 
 declare module "@tanstack/react-query" {

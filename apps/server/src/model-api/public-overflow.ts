@@ -516,6 +516,12 @@ export function publicTargetCompatibility(
     : "PROTOCOL_UNAVAILABLE";
 }
 
+export type PublicOverflowTerminal = {
+  ok: boolean;
+  responseBytes: number;
+  usage?: RawProviderUsage;
+};
+
 export type PublicOverflowResult =
   | {
       dispatched: true;
@@ -525,7 +531,12 @@ export type PublicOverflowResult =
       fencingToken: bigint;
       nativeSurface: ProtocolSurface;
       attemptCount: number;
-      terminal: Promise<{ ok: boolean; responseBytes: number }>;
+      /**
+       * Settles once the provider response is reconciled. `usage` is the same
+       * parsed provider usage that settled billing (absent when the provider
+       * reported none or the attempt failed before reconciliation).
+       */
+      terminal: Promise<PublicOverflowTerminal>;
       /** Record commitment only when the final rendered response emits a byte. */
       markFirstClientByte: () => Promise<void>;
       affinity: PublicProviderTarget["affinity"];
@@ -2145,8 +2156,8 @@ export async function dispatchPublicOverflow(
       let nonstreamBytes = 0;
       let nonstreamOverflow = false;
       let usageBytes = 0;
-      let resolveTerminal!: (value: { ok: boolean; responseBytes: number }) => void;
-      const terminal = new Promise<{ ok: boolean; responseBytes: number }>((resolve) => {
+      let resolveTerminal!: (value: PublicOverflowTerminal) => void;
+      const terminal = new Promise<PublicOverflowTerminal>((resolve) => {
         resolveTerminal = resolve;
       });
       const httpOk = status >= 200 && status < 400;
@@ -2305,7 +2316,7 @@ export async function dispatchPublicOverflow(
               : undefined,
             metadata: { status, responseBytes, streamComplete: transportComplete },
           }).catch(() => undefined);
-          resolveTerminal({ ok, responseBytes });
+          resolveTerminal({ ok, responseBytes, usage });
         })();
         return reconciliation;
       };
@@ -2424,6 +2435,11 @@ export async function dispatchPublicOverflow(
           prisma.relayRequest.updateMany({
             where: { id: request.requestId, providerAttemptId: attemptId },
             data: { streamCommitted: true },
+          }),
+          // Time-to-first-token for usage rollups; first commitment wins.
+          prisma.relayRequest.updateMany({
+            where: { id: request.requestId, firstClientByteAt: null },
+            data: { firstClientByteAt },
           }),
           recordProviderAttemptEvent({
             userId: request.userId,

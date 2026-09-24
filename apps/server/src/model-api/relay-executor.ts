@@ -5,6 +5,7 @@ import {
 } from "../relay/protocol.js";
 import type { ActiveRelayResponseHandlers, RelaySessionManager } from "../relay/session-manager.js";
 import type { RelayBodySource } from "./request-body-source.js";
+import { ResponseUsageRecorder, type ResponseUsageSample } from "./response-usage-sample.js";
 
 type RelayUsage = {
   promptTokens?: number;
@@ -33,6 +34,12 @@ export type RelayAttemptTerminal = {
   responseBytes: number;
   /** Actual request-body bytes emitted to the CLI websocket for this attempt. */
   requestBytes: number;
+  /**
+   * Bounded prefix/tail windows of the upstream response body, retained for
+   * every attempt so the server parses provider usage once at finalization.
+   * Absent for synthesized terminals that never received a response.
+   */
+  usageSample?: ResponseUsageSample | null;
 };
 
 type RelayAttemptStarted = {
@@ -196,6 +203,7 @@ export function startRelayAttempt({
   let responseStreamCancelled = false;
   let responseBytes = 0;
   let requestBytes = 0;
+  const usageRecorder = new ResponseUsageRecorder();
 
   const responseBody = new ReadableStream<Uint8Array>(
     {
@@ -258,7 +266,12 @@ export function startRelayAttempt({
       started.reject(new Error(result.failure ?? "unknown"));
       responseController?.error(new Error(result.failure ?? "unknown"));
     }
-    terminal.resolve({ ...result, responseBytes, requestBytes });
+    terminal.resolve({
+      ...result,
+      responseBytes,
+      requestBytes,
+      usageSample: responseBytes > 0 ? usageRecorder.sample() : null,
+    });
   }
 
   const handlers: ActiveRelayResponseHandlers = {
@@ -299,6 +312,7 @@ export function startRelayAttempt({
         return;
       }
       responseBytes += bodyChunk.byteLength;
+      usageRecorder.push(bodyChunk);
       onResponseBodyChunk?.(bodyChunk);
       responseController?.enqueue(bodyChunk);
     },

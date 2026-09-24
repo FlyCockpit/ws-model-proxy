@@ -43,6 +43,8 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
       "add",
       "close",
       "cliList",
+      "cliSearch",
+      "cliSearchEmpty",
       "reconnecting",
       "exited",
       "gone",
@@ -170,5 +172,31 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
         surface,
       );
     }
+  });
+  it("has identical overview key trees, covering every dynamic overview key", () => {
+    expect(keyTree(esDashboard.overview)).toEqual(keyTree(enDashboard.overview));
+    const overviewKeys = keyTree(enDashboard.overview);
+    for (const status of ["UNKNOWN", "HEALTHY", "HALF_OPEN", "DEGRADED", "UNHEALTHY"])
+      expect(overviewKeys).toContain(`pools.health.${status}`);
+    for (const status of ["ACTIVE", "DRAINING", "DISABLED"])
+      expect(overviewKeys).toContain(`pools.routing.${status}`);
+    for (const tier of ["PRIMARY", "PUBLIC_OVERFLOW"])
+      expect(overviewKeys).toContain(`pools.tier.${tier}`);
+    for (const range of ["1h", "24h", "7d"]) expect(overviewKeys).toContain(`ranges.${range}`);
+    for (const step of ["connectCli", "addEndpoint", "createPool", "createToken", "tryChat"])
+      for (const field of ["title", "description", "action"])
+        expect(overviewKeys).toContain(`setup.steps.${step}.${field}`);
+    // Units and shared-pool labels come from the bundles, never literals.
+    for (const key of ["kpi.deltaPoints", "shared.title", "shared.unavailable", "shared.owner"])
+      expect(overviewKeys).toContain(key);
+    for (const bundle of [enDashboard, esDashboard])
+      expect(bundle.overview.kpi.deltaPoints).toContain("{{value}}");
+  });
+
+  it("no longer carries the removed shared dashboard header keys", () => {
+    expect(enDashboard).not.toHaveProperty("title");
+    expect(enDashboard).not.toHaveProperty("description");
+    expect(esDashboard).not.toHaveProperty("title");
+    expect(esDashboard).not.toHaveProperty("description");
   });
 });

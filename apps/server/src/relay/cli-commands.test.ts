@@ -35,7 +35,7 @@ const db = prisma as unknown as {
   $queryRaw: MockInstance;
   user: { findUnique: MockInstance };
   cliDevice: { upsert: MockInstance; update: MockInstance; findUnique: MockInstance };
-  cliToken: { update: MockInstance };
+  cliToken: { update: MockInstance; updateMany: MockInstance; findUnique: MockInstance };
   endpoint: { upsert: MockInstance; findUnique: MockInstance; updateMany: MockInstance };
   discoveredModel: {
     findUnique: MockInstance;
@@ -94,7 +94,7 @@ function hello(
     protocolVersion,
     cli: {
       slug,
-      label: slug,
+      hostname: `${slug}.local`,
       version: "9.9.9",
       capabilities: {
         protocolVersion,
@@ -142,6 +142,13 @@ describe("cli commands", () => {
     db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
       callback(db),
     );
+    // An unbound CLI token: every hello's conditional bind claims it.
+    db.cliToken.findUnique.mockResolvedValue({
+      revokedAt: null,
+      expiresAt: null,
+      cliDeviceId: null,
+    });
+    db.cliToken.updateMany.mockResolvedValue({ count: 1 });
     db.user.findUnique.mockResolvedValue({ slug: "owner" });
     db.cliDevice.upsert.mockImplementation(async (args: { create: { slug: string } }) => ({
       id: args.create.slug,
@@ -258,7 +265,7 @@ describe("cli commands", () => {
         protocolVersion: "2.1",
         cli: {
           slug: "desktop",
-          label: "desktop",
+          hostname: "desktop.local",
           capabilities: {
             protocolVersion: "2.1",
             inventoryAck: true,

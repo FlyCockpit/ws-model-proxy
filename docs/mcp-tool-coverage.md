@@ -36,6 +36,7 @@ fails the suite when a leaf is unclassified.
 | `capacityManagement.updateMemberPolicy` | `capacity_member_policy_update` | write | — | pure | — | — | — |
 | `capacityManagement.updatePoolPolicy` | `capacity_pool_policy_update` | write | — | pure | — | — | — |
 | `cliCredentials.createToken` | — (excluded) | — | — | — | — | — | Returns the one-time raw token secret. |
+| `cliCredentials.deviceLoginRequest` | — (excluded) | — | — | — | — | — | Browser device-login approval page read; not an MCP surface. |
 | `cliCredentials.exchangeDeviceCode` | — (excluded) | — | — | — | — | — | Public device-flow credential exchange; not an MCP surface. |
 | `cliCredentials.listTokens` | `cli_tokens_list` | read | — | pure | — | — | — |
 | `cliCredentials.revokeToken` | `cli_token_revoke` | write | DELETE | destructive | — | — | — |
@@ -66,6 +67,7 @@ fails the suite when a leaf is unclassified.
 | `forwarderManagement.removeDiscoveredModelMetadata` | `forwarder_model_metadata_remove` | write | DELETE | destructive | — | — | — |
 | `forwarderManagement.removeEndpointMetadata` | `forwarder_endpoint_metadata_remove` | write | DELETE | destructive | — | — | — |
 | `forwarderManagement.removePoolMember` | `forwarder_pool_member_remove` | write | DELETE | destructive | — | — | — |
+| `forwarderManagement.renameCliDevice` | `forwarder_cli_device_rename` | write | — | pure | — | — | — |
 | `forwarderManagement.reorderProviderPoolMember` | `forwarder_provider_member_reorder` | write | — | pure | — | — | — |
 | `forwarderManagement.revokePoolAccessByEmail` | `forwarder_pool_grant_revoke` | write | DELETE | destructive | — | — | — |
 | `forwarderManagement.setCliDeviceFeatureGrants` | — (excluded) | — | — | — | — | — | human-only device grant |
@@ -86,6 +88,8 @@ fails the suite when a leaf is unclassified.
 | `modelApiTokens.list` | `model_api_tokens_list` | read | — | pure | — | — | — |
 | `modelApiTokens.preview` | `model_api_tokens_preview` | read | — | pure | — | — | — |
 | `modelApiTokens.revoke` | `model_api_token_revoke` | write | DELETE | destructive | — | — | — |
+| `overview.health` | `overview_health` | read | — | pure | — | — | — |
+| `overview.metrics` | `overview_metrics` | read | — | pure | — | — | — |
 | `providerManagement.activatePricingVersion` | `provider_pricing_version_activate` | write | RUN | external | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `providerManagement.createAccount` | `provider_account_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `providerManagement.createBudgetPolicy` | `provider_budget_policy_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |

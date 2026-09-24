@@ -24,6 +24,7 @@ import {
 } from "./model-api/provider-attempt-lifecycle.js";
 import { startProviderBudgetRepair } from "./model-api/provider-budget-runtime.js";
 import { startRelayTelemetryRecovery } from "./model-api/relay-telemetry-recovery.js";
+import { startUsageRetention } from "./model-api/usage-retention.js";
 import { warnMissingProviderCredentialKeyring } from "./provider-keyring-startup.js";
 import { sweepExpiredTokenCommands } from "./relay/cli-commands.js";
 import { RELAY_SUBPROTOCOL, RELAY_WS_MAX_PAYLOAD_BYTES } from "./relay/protocol.js";
@@ -166,6 +167,12 @@ const stopOauthCleanup = startOauthCleanup();
 // Better Auth does not remove expired browser sessions eagerly. This bounded,
 // idempotent sweep uses the same shutdown-fenced lifecycle as OAuth cleanup.
 const stopSessionCleanup = startSessionCleanup();
+// Metrics retention: reaps abandoned PENDING relay requests, deletes raw
+// RelayRequest rows past RELAY_REQUEST_RETENTION_DAYS, compacts minute usage
+// rollups to hourly after 30 days and drops hourly rollups after 13 months.
+const stopUsageRetention = startUsageRetention({
+  retentionDays: env.RELAY_REQUEST_RETENTION_DAYS,
+});
 
 function startUnrefInterval(tick: () => void, intervalMs: number): () => void {
   const timer = setInterval(tick, intervalMs);
@@ -229,6 +236,7 @@ async function shutdown(signal: string) {
       stopProviderAttemptExpiry?.();
       stopOauthCleanup?.();
       stopSessionCleanup();
+      stopUsageRetention();
       stopStaleRelaySessions();
       stopCliCommandSweep();
       stopTerminalSessionRecheck();

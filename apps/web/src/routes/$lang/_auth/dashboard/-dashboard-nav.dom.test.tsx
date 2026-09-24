@@ -28,6 +28,8 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
     ),
     Outlet: () => <div data-testid="dashboard-outlet" />,
     useMatchRoute: () => () => false,
+    useMatches: (options?: { select?: (matches: RouteMatchStub[]) => unknown }) =>
+      options?.select ? options.select(routeState.matches) : routeState.matches,
     useNavigate: () => router.navigate,
     createFileRoute: () => (options: { component?: ComponentType }) => ({
       ...options,
@@ -46,8 +48,8 @@ vi.mock("@/utils/orpc", () => ({
       listDashboardNotices: {
         queryOptions: () => ({
           queryKey: ["dashboard-notices"],
-          queryFn: async () => [],
-          initialData: [],
+          queryFn: async () => routeState.notices,
+          initialData: routeState.notices,
         }),
         key: () => ["dashboard-notices"],
       },
@@ -56,6 +58,13 @@ vi.mock("@/utils/orpc", () => ({
       },
     },
   },
+}));
+
+type RouteMatchStub = { staticData?: { dashboardLayout?: "padded" | "fill" } };
+
+const routeState = vi.hoisted(() => ({
+  matches: [] as RouteMatchStub[],
+  notices: [] as { id: string; kind: string; poolName: string }[],
 }));
 
 const router = vi.hoisted(() => ({ navigate: (_options: object): void => undefined }));
@@ -75,7 +84,7 @@ vi.mock("@/hooks/use-terminal-workspace", () => ({
   }),
 }));
 
-import { DashboardFrame } from "@/components/dashboard-frame";
+import { DashboardFrame, resolveDashboardLayout } from "@/components/dashboard-frame";
 
 function renderLayout() {
   return render(
@@ -92,6 +101,8 @@ afterEach(() => {
   localStorage.clear();
   useUiPreferences.setState({ sidebarCollapsed: false });
   workspace.tabs = [];
+  routeState.matches = [];
+  routeState.notices = [];
 });
 
 describe("dashboard sidebar", () => {
@@ -150,5 +161,48 @@ describe("dashboard sidebar", () => {
     renderLayout();
     expect(screen.queryByRole("list", { name: "dashboard:nav.openTerminals" })).toBeNull();
     expect(screen.getByRole("complementary").textContent).toContain("1");
+  });
+});
+
+describe("dashboard layout flag", () => {
+  it("resolves the deepest declared layout and defaults to padded", () => {
+    expect(resolveDashboardLayout([])).toBe("padded");
+    expect(resolveDashboardLayout([{}, { staticData: {} }])).toBe("padded");
+    expect(resolveDashboardLayout([{}, { staticData: { dashboardLayout: "fill" } }])).toBe("fill");
+    expect(
+      resolveDashboardLayout([
+        { staticData: { dashboardLayout: "fill" } },
+        { staticData: { dashboardLayout: "padded" } },
+      ]),
+    ).toBe("padded");
+    expect(
+      resolveDashboardLayout([{ staticData: { dashboardLayout: "fill" } }, { staticData: {} }]),
+    ).toBe("fill");
+  });
+
+  it("renders undeclared routes in the padded container without a shared header", () => {
+    routeState.matches = [{}, { staticData: {} }];
+    renderLayout();
+    expect(document.querySelector("[data-dashboard-layout='padded']")).toBeTruthy();
+    expect(document.querySelector("[data-dashboard-layout='fill']")).toBeNull();
+    expect(screen.queryByText("dashboard:title")).toBeNull();
+    expect(screen.queryByText("dashboard:description")).toBeNull();
+    expect(screen.queryByRole("heading", { level: 1 })).toBeNull();
+    expect(screen.getByTestId("dashboard-outlet")).toBeTruthy();
+  });
+
+  it("fills the pane for fill routes and keeps dashboard notices", () => {
+    routeState.matches = [{}, { staticData: { dashboardLayout: "fill" } }];
+    routeState.notices = [{ id: "n1", kind: "POOL_EXTERNAL_PROVIDER", poolName: "Main" }];
+    renderLayout();
+    const fill = document.querySelector("[data-dashboard-layout='fill']");
+    expect(fill).toBeTruthy();
+    expect(fill?.className).toContain("flex-1");
+    expect(fill?.className).toContain("min-h-0");
+    expect(fill?.className).toContain("min-w-0");
+    expect(within(fill as HTMLElement).getByTestId("dashboard-outlet")).toBeTruthy();
+    expect(document.querySelector("[data-dashboard-layout='padded']")).toBeNull();
+    expect(screen.getByRole("region", { name: "notices.region" })).toBeTruthy();
+    expect(document.querySelector("[data-dashboard-nav='strip']")).toBeTruthy();
   });
 });

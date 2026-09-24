@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 import { lockExecutionTargetPolicies } from "@ws-model-proxy/api/lib/capacity-policy-safety";
-import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
+import {
+  type CliWebsocketIdentity,
+  checkCliCredentialForDevice,
+} from "@ws-model-proxy/api/lib/cli-credential-access";
 import {
   type ContextWindowSeedDependent,
   declaredContextWindow,
@@ -113,6 +116,8 @@ export type ReportedRelayFeatures = {
   reportedMcpCommands: boolean | null;
   reportedTerminalApproval: boolean | null;
   reportedTerminalSupported: boolean | null;
+  /** Already normalized (see `normalizeReportedHostname`); null when not reported. */
+  reportedHostname: string | null;
   featuresReportedAt: Date | null;
 };
 
@@ -127,7 +132,7 @@ export async function persistRelayRegistration({
   now = new Date(),
 }: {
   identity: CliWebsocketIdentity;
-  cli: { slug: string; label: string };
+  cli: { slug: string };
   endpoints: EndpointInventory[];
   inventoryConfirmed: boolean;
   endpointTargeting: boolean;
@@ -160,6 +165,7 @@ export async function persistRelayRegistration({
           reportedMcpCommands: reported.reportedMcpCommands,
           reportedTerminalApproval: reported.reportedTerminalApproval,
           reportedTerminalSupported: reported.reportedTerminalSupported,
+          reportedHostname: reported.reportedHostname,
           featuresReportedAt: reported.featuresReportedAt,
         }
       : {};
@@ -178,8 +184,8 @@ export async function persistRelayRegistration({
 
           const cliDevice = await tx.cliDevice.upsert({
             where: { userId_slug: { userId: identity.userId, slug: cliSlug } },
+            // `name` is user-owned (dashboard); registration never writes it.
             update: {
-              label: cli.label,
               inventoryConfirmed,
               endpointTargeting,
               ...(connection
@@ -195,7 +201,6 @@ export async function persistRelayRegistration({
             create: {
               userId: identity.userId,
               slug: cliSlug,
-              label: cli.label,
               inventoryConfirmed,
               endpointTargeting,
               status: "CONNECTED",
@@ -217,27 +222,25 @@ export async function persistRelayRegistration({
             },
           });
 
-          if (identity.cliDeviceId && identity.cliDeviceId !== cliDevice.id) {
+          // After the device upsert, which holds the device row lock that a
+          // re-login's revoking transaction and a device delete also take. A
+          // device credential only ever registers as its minted device; an
+          // unbound CLI token is bound here. Any refusal rolls back the
+          // upsert, including a device row it just created.
+          const credentialCheck = await checkCliCredentialForDevice(
+            tx,
+            identity,
+            cliDevice.id,
+            now,
+          );
+          if (credentialCheck === "revoked") {
+            throw new RelayRegistrationError("Credential was revoked.", "access_denied");
+          }
+          if (credentialCheck === "otherDevice") {
             throw new RelayRegistrationError(
               "Credential is bound to a different CLI device.",
               "access_denied",
             );
-          }
-
-          if (!identity.cliDeviceId) {
-            if (identity.kind === "cliToken") {
-              await tx.cliToken.update({
-                where: { id: identity.id },
-                data: { cliDeviceId: cliDevice.id },
-                select: { id: true },
-              });
-            } else {
-              await tx.cliDeviceCredential.update({
-                where: { id: identity.id },
-                data: { cliDeviceId: cliDevice.id },
-                select: { id: true },
-              });
-            }
           }
 
           const inventoryChanged = cliDevice.inventoryDigest !== inventoryDigest;

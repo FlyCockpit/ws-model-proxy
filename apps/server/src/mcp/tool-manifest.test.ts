@@ -64,11 +64,14 @@ const PLAN_READ_TOOLS: readonly string[] = [
   "model_api_tokens_preview",
   "cli_tokens_list",
   "relay_requests_list",
+  "overview_metrics",
+  "overview_health",
 ];
 
 /** Write catalog — exact names, verbatim. */
 const PLAN_WRITE_TOOLS: readonly string[] = [
   "forwarder_guarded_pool_create",
+  "forwarder_cli_device_rename",
   "forwarder_cli_metadata_remove",
   "forwarder_endpoint_metadata_remove",
   "forwarder_model_metadata_remove",
@@ -168,7 +171,10 @@ const PLAN_TARGETS: Readonly<Record<string, string>> = Object.freeze({
   model_api_tokens_preview: "modelApiTokens.preview",
   cli_tokens_list: "cliCredentials.listTokens",
   relay_requests_list: "relayMetadata.listOwn",
+  overview_metrics: "overview.metrics",
+  overview_health: "overview.health",
   forwarder_guarded_pool_create: "forwarderManagement.createGuardedModelPool",
+  forwarder_cli_device_rename: "forwarderManagement.renameCliDevice",
   forwarder_cli_metadata_remove: "forwarderManagement.removeCliDeviceMetadata",
   forwarder_endpoint_metadata_remove: "forwarderManagement.removeEndpointMetadata",
   forwarder_model_metadata_remove: "forwarderManagement.removeDiscoveredModelMetadata",
@@ -245,13 +251,13 @@ beforeEach(() => {
 });
 
 describe("MCP tool manifest — exact catalog", () => {
-  it("contains exactly 23 read + 48 write names (no extras, no missing, no duplicates)", () => {
+  it("contains exactly 25 read + 49 write names (no extras, no missing, no duplicates)", () => {
     const names = MCP_TOOL_MANIFEST.map((tool) => tool.name);
     expect(new Set(names).size).toBe(names.length);
     expect([...names].sort()).toEqual([...PLAN_READ_TOOLS, ...PLAN_WRITE_TOOLS].sort());
-    expect(PLAN_READ_TOOLS).toHaveLength(23);
-    expect(PLAN_WRITE_TOOLS).toHaveLength(48);
-    expect(MCP_TOOL_MANIFEST).toHaveLength(71);
+    expect(PLAN_READ_TOOLS).toHaveLength(25);
+    expect(PLAN_WRITE_TOOLS).toHaveLength(49);
+    expect(MCP_TOOL_MANIFEST).toHaveLength(74);
   });
 
   it("every descriptor carries its catalog target", () => {
@@ -326,6 +332,7 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
       "modelApiTokens.create",
       "cliCredentials.createToken",
       "cliCredentials.exchangeDeviceCode",
+      "cliCredentials.deviceLoginRequest",
       "providerManagement.createCredential",
       "providerManagement.replaceCredential",
       "providerManagement.listUsageReport",
@@ -426,9 +433,9 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
         `${tool.name}: ${PLAN_TARGETS[tool.name]}`,
       );
     }
-    // 71 catalog entries − 4 core diagnostics = 67 procedure dispatches.
-    expect(dispatched).toBe(67);
-    expect(invoked).toHaveLength(67);
+    // 74 catalog entries − 4 core diagnostics = 70 procedure dispatches.
+    expect(dispatched).toBe(70);
+    expect(invoked).toHaveLength(70);
 
     // Human-only proof: ZERO mcpGrants access (property or invocation)
     // across every dispatch.

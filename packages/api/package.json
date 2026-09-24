@@ -78,7 +78,7 @@
   "scripts": {
     "check-types": "tsc -p tsconfig.check-types.json --noEmit",
     "test": "vitest run --passWithNoTests",
-    "test:postgres": "vitest run --maxWorkers=1 --no-file-parallelism src/lib/capacity-policy-races.postgres.integration.test.ts src/routers/forwarder-management.postgres.integration.test.ts src/routers/model-api-tokens.postgres.integration.test.ts src/routers/mcp-tokens.postgres.integration.test.ts"
+    "test:postgres": "vitest run --maxWorkers=1 --no-file-parallelism src/lib/capacity-policy-races.postgres.integration.test.ts src/routers/forwarder-management.postgres.integration.test.ts src/routers/model-api-tokens.postgres.integration.test.ts src/routers/mcp-tokens.postgres.integration.test.ts src/lib/cli-credential-access.postgres.integration.test.ts src/routers/overview.postgres.integration.test.ts"
   },
   "dependencies": {
     "@orpc/openapi": "catalog:",

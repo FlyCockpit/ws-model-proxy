@@ -96,7 +96,7 @@ describe("relayProtocol", () => {
           protocolVersion: "2.1",
           cli: {
             slug: "desktop",
-            label: "Desktop",
+            hostname: "desk-01.local",
             capabilities: {
               protocolVersion: "2.1",
               inventoryAck: true,
@@ -142,7 +142,7 @@ describe("relayProtocol", () => {
           protocolVersion: "2.1",
           cli: {
             slug: "desktop",
-            label: "Desktop",
+            hostname: "desk-01.local",
             capabilities: {
               protocolVersion: "2.1",
               inventoryAck: true,
@@ -232,10 +232,54 @@ function hello(
     type: "hello",
     id: "hello-id",
     protocolVersion,
-    cli: { slug: "desktop", label: "Desktop", version: "1.8.0", capabilities },
+    cli: { slug: "desktop", hostname: "desk-01.local", version: "1.8.0", capabilities },
     endpoints: [endpoint()],
   });
 }
+
+function helloWithCli(cli: Record<string, unknown>) {
+  return JSON.stringify({
+    type: "hello",
+    id: "hello-id",
+    protocolVersion: "2.0",
+    cli: {
+      slug: "desktop",
+      capabilities: {
+        protocolVersion: "2.0",
+        binaryFrames: true,
+        cancellation: true,
+        maxBinaryChunkBytes: 1024 * 1024,
+        requestBodyStreaming: true,
+        requestBodyWindowChunks: 16,
+      },
+      ...cli,
+    },
+    endpoints: [endpoint()],
+  });
+}
+
+describe("hello hostname", () => {
+  function parsedHostname(cli: Record<string, unknown>) {
+    const parsed = parseRelayClientControlFrame(helloWithCli(cli));
+    if (parsed.type !== "hello") throw new Error("expected hello");
+    return parsed.cli.hostname;
+  }
+
+  it("is null when omitted, null, or blank", () => {
+    expect(parsedHostname({})).toBeNull();
+    expect(parsedHostname({ hostname: null })).toBeNull();
+    expect(parsedHostname({ hostname: " \t\u0007 " })).toBeNull();
+  });
+
+  it("is trimmed, stripped of control characters, and bounded", () => {
+    expect(parsedHostname({ hostname: "  desk\u0000-01\n" })).toBe("desk-01");
+    expect(parsedHostname({ hostname: "a".repeat(400) })).toHaveLength(253);
+  });
+
+  it("rejects the removed label field", () => {
+    expect(() => parseRelayClientControlFrame(helloWithCli({ label: "Desktop" }))).toThrow();
+  });
+});
 
 describe("relay protocol 2.4", () => {
   const shared = {

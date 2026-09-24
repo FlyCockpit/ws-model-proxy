@@ -61,11 +61,20 @@
   --primary-700: oklch(0.42 0.11 186.391);
   --primary-800: oklch(0.35 0.09 186.391);
   --primary-900: oklch(0.28 0.07 186.391);
-  --chart-1: oklch(0.872 0.007 219.6);
-  --chart-2: oklch(0.56 0.021 213.5);
-  --chart-3: oklch(0.45 0.017 213.2);
-  --chart-4: oklch(0.378 0.015 216);
-  --chart-5: oklch(0.275 0.011 216.9);
+  /* Categorical series palette. Fixed order (slot order is the CVD-safety
+     mechanism): blue, orange, aqua, yellow, magenta, green, violet, red.
+     Validated with the dataviz validator against the light card (#ffffff):
+     worst adjacent CVD dE 8.4 (protan), normal-vision dE 19.3, every slot
+     >= 3:1 on white. Slots 3-5 use the darker ramp steps (the same values as
+     dark mode) so each band clears non-text contrast. */
+  --chart-1: #2a78d6;
+  --chart-2: #eb6834;
+  --chart-3: #199e70;
+  --chart-4: #c98500;
+  --chart-5: #d55181;
+  --chart-6: #008300;
+  --chart-7: #4a3aa7;
+  --chart-8: #e34948;
   --duration-fast: 150ms;
   --duration-base: 250ms;
   --duration-slow: 400ms;
@@ -139,11 +148,16 @@
   --primary-700: oklch(0.74 0.12 188.216);
   --primary-800: oklch(0.84 0.08 188.216);
   --primary-900: oklch(0.93 0.04 188.216);
-  --chart-1: oklch(0.872 0.007 219.6);
-  --chart-2: oklch(0.56 0.021 213.5);
-  --chart-3: oklch(0.45 0.017 213.2);
-  --chart-4: oklch(0.378 0.015 216);
-  --chart-5: oklch(0.275 0.011 216.9);
+  /* Same eight hues stepped for the dark card (#161b1d): worst adjacent
+     CVD dE 8.4, normal-vision dE 19.3, all slots >= 3:1. */
+  --chart-1: #3987e5;
+  --chart-2: #d95926;
+  --chart-3: #199e70;
+  --chart-4: #c98500;
+  --chart-5: #d55181;
+  --chart-6: #008300;
+  --chart-7: #9085e9;
+  --chart-8: #e66767;
   --sidebar: oklch(0.218 0.008 223.9);
   --sidebar-foreground: oklch(0.987 0.002 197.1);
   --sidebar-primary: oklch(0.704 0.14 182.503);
@@ -184,11 +198,14 @@
   --color-primary-700: var(--primary-700);
   --color-primary-800: var(--primary-800);
   --color-primary-900: var(--primary-900);
-  --color-chart-5: var(--chart-5);
-  --color-chart-4: var(--chart-4);
-  --color-chart-3: var(--chart-3);
-  --color-chart-2: var(--chart-2);
   --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-chart-6: var(--chart-6);
+  --color-chart-7: var(--chart-7);
+  --color-chart-8: var(--chart-8);
   --color-ring: var(--ring);
   --color-input: var(--input);
   --color-border: var(--border);

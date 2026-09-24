@@ -1,5 +1,10 @@
 import { ORPCError } from "@orpc/server";
 import {
+  CLI_DEVICE_NAME_MAX_LENGTH,
+  cliDeviceDisplayName,
+  cliDeviceNameIssue,
+} from "@ws-model-proxy/config/cli-device-name";
+import {
   directModelId,
   poolModelId,
   validateForwarderPoolSlug,
@@ -21,6 +26,10 @@ import {
   lockExecutionTargetPolicies,
   modelPoolCapacityPolicyFields,
 } from "../lib/capacity-policy-safety";
+import {
+  closeRevokedCliCredentialSessions,
+  deleteCliDeviceAndCredentials,
+} from "../lib/cli-credential-access";
 import {
   type ContextWindowSeedDependent,
   declaredContextWindow,
@@ -118,6 +127,24 @@ const poolSlugSchema = z
 const poolNameSchema = z.string().trim().min(1).max(120);
 const poolDescriptionSchema = z.string().trim().max(1000).nullable().optional();
 const idSchema = z.string().min(1);
+const CLI_DEVICE_NAME_ISSUE_MESSAGES = {
+  empty: "CLI device name must not be blank; send null to clear it.",
+  tooLong: `CLI device name must be at most ${CLI_DEVICE_NAME_MAX_LENGTH} characters.`,
+  invisibleCharacters:
+    "CLI device name must not contain control or invisible formatting characters.",
+} as const;
+/**
+ * A user-set CLI device name; null clears it. Validated by the shared
+ * `cliDeviceNameIssue` policy (also used by the dashboard form).
+ */
+const cliDeviceNameSchema = z
+  .string()
+  .trim()
+  .superRefine((name, ctx) => {
+    const issue = cliDeviceNameIssue(name);
+    if (issue) ctx.addIssue({ code: "custom", message: CLI_DEVICE_NAME_ISSUE_MESSAGES[issue] });
+  })
+  .nullable();
 const routingStatusSchema = z.enum(poolMemberRoutingStatuses);
 const poolRecommendedSurfaceSchema = z.enum([
   "OPENAI_CHAT_COMPLETIONS",
@@ -310,7 +337,8 @@ const listCliDevicesSelect = {
   createdAt: true,
   updatedAt: true,
   slug: true,
-  label: true,
+  name: true,
+  reportedHostname: true,
   status: true,
   lastConnectedAt: true,
   lastDisconnectedAt: true,
@@ -607,7 +635,9 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     slug: row.slug,
-    label: row.label,
+    name: row.name,
+    reportedHostname: row.reportedHostname,
+    displayName: cliDeviceDisplayName(row),
     status: row.status,
     lastConnectedAt: row.lastConnectedAt,
     lastDisconnectedAt: row.lastDisconnectedAt,
@@ -1091,26 +1121,11 @@ async function removeOwnedRow({
   userId,
   staleBefore,
 }: {
-  kind: "cliDevice" | "endpoint" | "discoveredModel";
+  kind: "endpoint" | "discoveredModel";
   id: string;
   userId: string;
   staleBefore?: Date;
 }) {
-  if (kind === "cliDevice") {
-    const row = await prisma.cliDevice.findUnique({
-      where: { id },
-      select: { id: true, userId: true, status: true, lastHeartbeatAt: true },
-    });
-    if (!row || row.userId !== userId) {
-      throw new ORPCError("NOT_FOUND", { message: "CLI device not found." });
-    }
-    if (staleBefore && row.lastHeartbeatAt && row.lastHeartbeatAt >= staleBefore) {
-      throw new ORPCError("CONFLICT", { message: "CLI device is not stale." });
-    }
-    await prisma.cliDevice.delete({ where: { id } });
-    return { deleted: true };
-  }
-
   if (kind === "endpoint") {
     const row = await prisma.endpoint.findUnique({
       where: { id },
@@ -2168,16 +2183,44 @@ export const forwarderManagementRouter = {
       };
     }),
 
+  /** Set or clear the user-owned device name. Hello never writes it. */
+  renameCliDevice: protectedProcedure
+    .input(z.object({ cliDeviceId: idSchema, name: cliDeviceNameSchema }))
+    .handler(async ({ input, context }) => {
+      const owned = await prisma.cliDevice.findUnique({
+        where: { id: input.cliDeviceId },
+        select: { id: true, userId: true },
+      });
+      if (!owned || owned.userId !== context.session.user.id) {
+        throw new ORPCError("NOT_FOUND", { message: "CLI device not found." });
+      }
+      const row = await prisma.cliDevice.update({
+        where: { id: owned.id },
+        data: { name: input.name },
+        select: { id: true, slug: true, name: true, reportedHostname: true },
+      });
+      return {
+        cliDeviceId: row.id,
+        name: row.name,
+        displayName: cliDeviceDisplayName(row),
+      };
+    }),
+
   removeCliDeviceMetadata: protectedProcedure
     .input(z.object({ id: idSchema, staleBefore: z.date().optional() }))
-    .handler(({ input, context }) =>
-      removeOwnedRow({
-        kind: "cliDevice",
-        id: input.id,
+    .handler(async ({ input, context }) => {
+      // Revokes the device's CLI tokens and deletes its device credentials in
+      // the same transaction as the device, then closes their live sessions.
+      const { revoked } = await deleteCliDeviceAndCredentials({
+        cliDeviceId: input.id,
         userId: context.session.user.id,
         staleBefore: input.staleBefore,
-      }),
-    ),
+      });
+      for (const credentials of revoked) {
+        await closeRevokedCliCredentialSessions(context.services, credentials);
+      }
+      return { deleted: true };
+    }),
 
   removeEndpointMetadata: protectedProcedure
     .input(z.object({ id: idSchema, staleBefore: z.date().optional() }))

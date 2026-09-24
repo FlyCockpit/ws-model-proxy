@@ -12,6 +12,7 @@ import { forwarderManagementRouter } from "./forwarder-management";
 import { mcpGrantsRouter } from "./mcp-grants";
 import { mcpTokensRouter } from "./mcp-tokens";
 import { modelApiTokensRouter } from "./model-api-tokens";
+import { overviewRouter } from "./overview";
 import { providerManagementRouter } from "./provider-management";
 import { relayMetadataRouter } from "./relay-metadata";
 import { settingsRouter } from "./settings";
@@ -75,6 +76,7 @@ export const appRouter = {
   cliCredentials: cliCredentialsRouter,
   capacityManagement: capacityManagementRouter,
   modelApiTokens: modelApiTokensRouter,
+  overview: overviewRouter,
   providerManagement: providerManagementRouter,
   relayMetadata: relayMetadataRouter,
   users: usersRouter,

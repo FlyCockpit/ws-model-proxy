@@ -800,7 +800,6 @@ integration("PostgreSQL capacity admission primitives", () => {
         data: {
           userId: user.id,
           slug: `device-${suffix}`,
-          label: "Capacity device",
         },
       });
       const endpoint = await db.endpoint.create({
@@ -1302,7 +1301,6 @@ integration("PostgreSQL capacity admission primitives", () => {
         data: {
           userId: user.id,
           slug: `device-${suffix}`,
-          label: "Reservation device",
         },
       });
       const endpoint = await db.endpoint.create({
@@ -1827,7 +1825,6 @@ integration("model API routes with real PostgreSQL capacity", () => {
       data: {
         userId: user.id,
         slug: `cli-${suffix}`,
-        label: "Capacity route CLI",
         status: "CONNECTED",
         inventoryConfirmed: true,
         endpointTargeting: true,

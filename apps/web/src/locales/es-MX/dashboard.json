@@ -153,7 +153,7 @@
     "inventoryAcknowledged": "Inventario #{{sequence}} reconocido: {{value}}",
     "inventoryUnconfirmed": "El inventario no ha sido reconocido",
     "loadFailed": "No se pudieron cargar los metadatos de CLI.",
-    "searchLabel": "Buscar endpoints y modelos",
+    "searchLabel": "Buscar CLIs, endpoints y modelos",
     "healthFilterLabel": "Filtro de estado del endpoint",
     "filters": {
       "all": "Todos",
@@ -161,7 +161,7 @@
       "offline": "Sin conexión",
       "stale": "Desactualizado"
     },
-    "searchPlaceholder": "Buscar ID de modelo, ID de origen, endpoint o etiqueta",
+    "searchPlaceholder": "Buscar nombre de CLI, ID de modelo, ID de origen o endpoint",
     "noSearchResults": "Ningún endpoint o modelo coincide con la búsqueda.",
     "title": "CLIs, endpoints y modelos",
     "features": {
@@ -172,6 +172,22 @@
       "windows": "Aún no es compatible con Windows",
       "configDisabled": "Desactivado en la configuración wsmp de este CLI — edítala y reinicia wsmp",
       "updateWsmp": "Actualiza wsmp para usar esto"
+    },
+    "rename": {
+      "action": "Renombrar",
+      "actionLabel": "Renombrar {{name}}",
+      "title": "Renombrar CLI",
+      "description": "El nombre solo se muestra en este panel. Los ID de modelo siguen usando el slug {{slug}}.",
+      "field": "Nombre",
+      "hint": "Déjalo vacío para mostrar {{fallback}}.",
+      "tooLong": "Usa como máximo {{max}} caracteres.",
+      "invalidCharacters": "Quita los caracteres de control o de formato invisibles.",
+      "save": "Guardar nombre",
+      "saving": "Guardando…",
+      "cancel": "Cancelar",
+      "saved": "Se renombró el CLI",
+      "cleared": "Se borró el nombre del CLI",
+      "saveFailed": "No se pudo renombrar este CLI. Intenta de nuevo."
     }
   },
   "deploymentFeatures": {
@@ -179,7 +195,6 @@
     "privateNetworkAdmin": "Las URL privadas y de loopback se rechazan. Define `WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS=true`.",
     "privateNetworkUser": "Las URL privadas y de loopback se rechazan."
   },
-  "description": "Opera CLIs conectados, pools de modelos, credenciales y metadatos de relay.",
   "endpoints": {
     "empty": "No hay endpoints registrados para este CLI.",
     "failureReason": "Último fallo de sondeo: {{reason}}",
@@ -188,6 +203,7 @@
   "loadFailed": "No se pudo cargar el panel de control.",
   "metadata": {
     "delete": "Eliminar metadatos",
+    "deleteCliDescription": "Esto elimina el dispositivo CLI y cierra su sesión: se elimina su inicio de sesión del dispositivo, se revocan los tokens CLI vinculados a él y se desconecta su relay. Ejecuta `wsmp login` en esa máquina para agregarlo de nuevo. La configuración local del CLI no cambia.",
     "deleteDescription": "Esto elimina solo metadatos de tu cuenta. No edita la configuración local de endpoints del CLI.",
     "deleteModel": "Eliminar metadatos del modelo descubierto",
     "deleteTitle": "Eliminar metadatos",
@@ -237,6 +253,8 @@
     "add": "Nueva terminal",
     "close": "Dejar de ver esta terminal",
     "cliList": "Elige un CLI",
+    "cliSearch": "Buscar CLIs",
+    "cliSearchEmpty": "Ningún CLI coincide con tu búsqueda.",
     "reconnecting": "Reconectando con el servicio de terminal…",
     "exited": "El shell terminó.",
     "gone": "Esta terminal terminó mientras estabas desconectado.",
@@ -1091,7 +1109,6 @@
   "status": {
     "stale": "Obsoleto"
   },
-  "title": "Panel",
   "tokens": {
     "allVisible": "Todos los visibles",
     "allowlist": "Lista permitida",
@@ -1136,5 +1153,150 @@
     "publicEgressWarning": "Las solicitudes a {{pools}} pueden salir de esta instalación. Las instrucciones, los adjuntos, las herramientas y los resultados pueden enviarse a un proveedor externo.",
     "publicEgressWarningNamed": "Las solicitudes a {{pools}} pueden salir de esta instalación. Las instrucciones, los adjuntos, las herramientas y los resultados pueden enviarse a {{providers}}."
   },
-  "welcomeBack": "Bienvenido de vuelta, {{name}}"
+  "welcomeBack": "Bienvenido de vuelta, {{name}}",
+  "overview": {
+    "title": "Resumen",
+    "description": "Tráfico, eficiencia de la caché de prompts y salud de los pools y modelos que te pertenecen.",
+    "rangeLabel": "Intervalo de tiempo",
+    "ranges": {
+      "1h": "1 h",
+      "24h": "24 h",
+      "7d": "7 d"
+    },
+    "loadFailed": "No se pudieron cargar las métricas del resumen.",
+    "healthLoadFailed": "No se pudo cargar el estado de salud.",
+    "updatedAt": "Actualizado {{time}}",
+    "notReported": "No reportado",
+    "noValue": "—",
+    "kpi": {
+      "sectionLabel": "Métricas clave",
+      "requests": "Solicitudes",
+      "errorRate": "Tasa de errores",
+      "cacheHitRate": "Aciertos de caché de prompts",
+      "cacheHitRateHint": "Ponderado por tokens, sobre solicitudes cuyo upstream reporta tokens en caché.",
+      "p95Latency": "Latencia p95",
+      "p95Ttft": "Tiempo al primer token p95",
+      "tokens": "Tokens de entrada / salida",
+      "tokensValue": "{{input}} / {{output}}",
+      "deltaUp": "Sube {{value}} frente al periodo anterior",
+      "deltaDown": "Baja {{value}} frente al periodo anterior",
+      "deltaPoints": "{{value}} p. p.",
+      "deltaFlat": "Sin cambios frente al periodo anterior",
+      "deltaNone": "Sin datos del periodo anterior"
+    },
+    "health": {
+      "sectionLabel": "Salud",
+      "clis": "CLI en línea",
+      "endpoints": "Endpoints en buen estado",
+      "members": "Miembros de pools",
+      "ratio": "{{value}} / {{total}}",
+      "membersValue": "{{degraded}} degradados · {{open}} con circuito abierto",
+      "allHealthy": "Todo en buen estado",
+      "noneConfigured": "Aún no hay",
+      "review": "Revisar",
+      "reviewClis": "Revisar CLI",
+      "reviewEndpoints": "Revisar endpoints",
+      "reviewMember": "Abrir {{pool}}"
+    },
+    "pools": {
+      "title": "Pools",
+      "summary": "{{requests}} solicitudes · {{errors}} errores · caché {{cache}}",
+      "chartLabel": "Solicitudes por minuto por miembro de {{name}}",
+      "perMinute": "sol/min",
+      "noTraffic": "Este pool no tuvo tráfico en el intervalo seleccionado.",
+      "open": "Abrir pool",
+      "other": "Otros miembros",
+      "unrouted": "Sin enrutar",
+      "removedMember": "Miembro eliminado",
+      "columns": {
+        "member": "Miembro",
+        "share": "Porcentaje",
+        "cache": "Aciertos de caché",
+        "p50": "p50",
+        "p95": "p95",
+        "errors": "Errores",
+        "status": "Estado"
+      },
+      "tier": {
+        "PRIMARY": "Principal",
+        "PUBLIC_OVERFLOW": "Desbordamiento"
+      },
+      "health": {
+        "UNKNOWN": "Desconocido",
+        "HEALTHY": "En buen estado",
+        "HALF_OPEN": "Recuperándose",
+        "DEGRADED": "Degradado",
+        "UNHEALTHY": "Circuito abierto"
+      },
+      "routing": {
+        "ACTIVE": "Activo",
+        "DRAINING": "Drenando",
+        "DISABLED": "Deshabilitado"
+      }
+    },
+    "direct": {
+      "title": "Tráfico directo a modelos",
+      "description": "Solicitudes dirigidas a un solo modelo en lugar de un pool.",
+      "unresolved": "Modelo no resuelto",
+      "columns": {
+        "model": "Modelo",
+        "requests": "Solicitudes",
+        "errors": "Errores",
+        "cache": "Aciertos de caché",
+        "p95": "p95",
+        "tokens": "Tokens de entrada / salida"
+      }
+    },
+    "shared": {
+      "title": "Tu uso de pools compartidos",
+      "description": "Tus propias solicitudes a pools que otros usuarios comparten contigo. No se muestra el tráfico de otras personas en estos pools.",
+      "unavailable": "Pool que ya no se comparte contigo",
+      "owner": "Compartido por {{owner}}",
+      "columns": {
+        "pool": "Pool",
+        "requests": "Solicitudes",
+        "errors": "Errores",
+        "cache": "Aciertos de caché",
+        "p95": "p95",
+        "tokens": "Tokens de entrada / salida"
+      }
+    },
+    "empty": {
+      "title": "Sin tráfico en este intervalo",
+      "description": "Las solicitudes a tus pools y modelos aparecerán aquí en menos de un minuto."
+    },
+    "setup": {
+      "title": "Primeros pasos",
+      "description": "Completa estos pasos para enrutar tu primera solicitud y ver métricas aquí.",
+      "done": "Hecho",
+      "todo": "Pendiente",
+      "steps": {
+        "connectCli": {
+          "title": "Conecta una CLI",
+          "description": "Ejecuta wsmp login en la máquina que aloja tus modelos.",
+          "action": "Abrir CLI"
+        },
+        "addEndpoint": {
+          "title": "Agrega un endpoint",
+          "description": "Apunta la CLI a un servidor local compatible con OpenAI o Anthropic.",
+          "action": "Abrir CLI"
+        },
+        "createPool": {
+          "title": "Crea un pool",
+          "description": "Agrupa modelos para que las solicitudes conmuten por error y compartan carga.",
+          "action": "Crear pool"
+        },
+        "createToken": {
+          "title": "Crea un token de API",
+          "description": "Los clientes lo usan para llamar a la API compatible con OpenAI.",
+          "action": "Crear token"
+        },
+        "tryChat": {
+          "title": "Prueba el chat",
+          "description": "Envía un mensaje a través de un pool desde el navegador.",
+          "action": "Abrir prueba de chat"
+        }
+      }
+    }
+  }
 }

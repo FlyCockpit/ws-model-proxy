@@ -46,6 +46,8 @@ model User {
   responseStickinessRecords  ResponseStickinessRecord[]   @relation("ResponseStickinessOwner")
   relayRequests              RelayRequest[]               @relation("RelayRequestOwner")
   relayExecutionEvents       RelayExecutionEvent[]        @relation("RelayExecutionEventOwner")
+  usageRollupMinutes         UsageRollupMinute[]          @relation("UsageRollupMinuteOwner")
+  usageRollupHours           UsageRollupHour[]            @relation("UsageRollupHourOwner")
   relayExecutionAttempts     RelayExecutionAttempt[]      @relation("RelayExecutionAttemptOwner")
   mediaAssets                MediaAsset[]                 @relation("MediaAssetOwner")
   providerAccounts           ProviderAccount[]            @relation("ProviderAccountOwner")

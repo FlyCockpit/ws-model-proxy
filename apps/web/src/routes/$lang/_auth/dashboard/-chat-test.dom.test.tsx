@@ -263,6 +263,10 @@ describe("Chat Test quick wins", () => {
     });
 
     await screen.findByText("Demo model");
+    // The page owns the dashboard's only h1 now that the shared header is gone.
+    const heading = screen.getByRole("heading", { level: 1, name: "dashboard:chatTest.title" });
+    // Fill layout: the pane is not a bordered card.
+    expect(heading.closest("section")?.className).not.toContain("border ");
     client!.setQueryData(["visibleModels"], { directModels: [], modelPools: [] });
 
     expect(await screen.findByText("dashboard:chatTest.emptyModels")).toBeTruthy();

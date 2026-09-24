@@ -2,6 +2,10 @@ import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credentia
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+vi.mock("@ws-model-proxy/env/server", () => ({
+  env: { BETTER_AUTH_SECRET: "test-better-auth-secret" },
+}));
+
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
   return { default: mockDeep() };
@@ -18,7 +22,7 @@ const db = prisma as unknown as {
   $executeRaw: MockInstance;
   user: { findUnique: MockInstance };
   cliDevice: { upsert: MockInstance; update: MockInstance };
-  cliToken: { update: MockInstance };
+  cliToken: { update: MockInstance; updateMany: MockInstance; findUnique: MockInstance };
   endpoint: { upsert: MockInstance; findUnique: MockInstance; updateMany: MockInstance };
   discoveredModel: {
     findUnique: MockInstance;
@@ -130,6 +134,13 @@ describe("capability override origin", () => {
     db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
       callback(db),
     );
+    // An unbound CLI token: every hello's conditional bind claims it.
+    db.cliToken.findUnique.mockResolvedValue({
+      revokedAt: null,
+      expiresAt: null,
+      cliDeviceId: null,
+    });
+    db.cliToken.updateMany.mockResolvedValue({ count: 1 });
     db.user.findUnique.mockResolvedValue({ id: "user-id", slug: "owner" });
     db.cliDevice.upsert.mockResolvedValue({
       id: "cli-device-id",
@@ -162,6 +173,130 @@ describe("capability override origin", () => {
     db.inferenceCapacity.upsert.mockResolvedValue({ id: "ensured-capacity" });
   });
 
+  it("stores the hello's reported hostname and never writes the user-owned name", async () => {
+    await persistRelayRegistration({
+      identity,
+      cli: { slug: "desktop" },
+      endpoints: [],
+      inventoryConfirmed: true,
+      endpointTargeting: true,
+      connection: true,
+      reported: {
+        cliVersion: "1.0.0",
+        relayProtocolVersion: "2.5",
+        reportedHumanTerminal: null,
+        reportedMcpCommands: null,
+        reportedTerminalApproval: null,
+        reportedTerminalSupported: null,
+        reportedHostname: "desk-01.local",
+        featuresReportedAt: null,
+      },
+      now,
+    });
+
+    const call = db.cliDevice.upsert.mock.calls[0]?.[0] as {
+      update: Record<string, unknown>;
+      create: Record<string, unknown>;
+    };
+    expect(call.update.reportedHostname).toBe("desk-01.local");
+    expect(call.create.reportedHostname).toBe("desk-01.local");
+    for (const data of [call.update, call.create]) {
+      expect(data).not.toHaveProperty("name");
+      expect(data).not.toHaveProperty("label");
+    }
+  });
+
+  it("refuses to register a revoked or expired credential", async () => {
+    const register = () =>
+      persistRelayRegistration({
+        identity,
+        cli: { slug: "desktop" },
+        endpoints: [],
+        inventoryConfirmed: true,
+        endpointTargeting: true,
+        now,
+      });
+    db.cliToken.findUnique.mockResolvedValueOnce({
+      revokedAt: now,
+      expiresAt: null,
+      cliDeviceId: null,
+    });
+    await expect(register()).rejects.toMatchObject({
+      name: "RelayRegistrationError",
+      code: "access_denied",
+    });
+    db.cliToken.findUnique.mockResolvedValueOnce({
+      revokedAt: null,
+      expiresAt: now,
+      cliDeviceId: null,
+    });
+    await expect(register()).rejects.toMatchObject({ code: "access_denied" });
+    // Checked inside the registration transaction, after the device upsert.
+    expect(db.cliToken.findUnique).toHaveBeenCalledWith({
+      where: { id: "token-id" },
+      select: { revokedAt: true, expiresAt: true, cliDeviceId: true },
+    });
+    expect(db.cliToken.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("registers a device credential only as the device it was minted for", async () => {
+    const credentials = prisma as unknown as {
+      cliDeviceCredential: { findUnique: MockInstance; update: MockInstance };
+    };
+    const deviceIdentity: CliWebsocketIdentity = {
+      kind: "deviceCredential",
+      id: "credential-id",
+      userId: "user-id",
+      cliDeviceId: "minted-device-id",
+      lookupPrefix: "wsmp_device_prefix",
+    };
+    const register = (slug: string) =>
+      persistRelayRegistration({
+        identity: deviceIdentity,
+        cli: { slug },
+        endpoints: [],
+        inventoryConfirmed: true,
+        endpointTargeting: true,
+        connection: true,
+        now,
+      });
+
+    // The hello names another slug (or the minted device was deleted and the
+    // upsert recreated a row): the device ids differ, so it is refused and the
+    // transaction (with the upserted row) rolls back.
+    credentials.cliDeviceCredential.findUnique.mockResolvedValueOnce({
+      revokedAt: null,
+      cliDeviceId: "minted-device-id",
+    });
+    await expect(register("someone-else")).rejects.toMatchObject({
+      code: "access_denied",
+      message: "Credential is bound to a different CLI device.",
+    });
+    // Deleted together with its device.
+    credentials.cliDeviceCredential.findUnique.mockResolvedValueOnce(null);
+    await expect(register("desktop")).rejects.toMatchObject({
+      code: "access_denied",
+      message: "Credential was revoked.",
+    });
+    // Never rebound to whatever device the hello names.
+    expect(credentials.cliDeviceCredential.update).not.toHaveBeenCalled();
+  });
+
+  it("leaves the reported hostname alone on inventory updates", async () => {
+    await persistRelayRegistration({
+      identity,
+      cli: { slug: "desktop" },
+      endpoints: [],
+      inventoryConfirmed: true,
+      endpointTargeting: true,
+      now,
+    });
+
+    const call = db.cliDevice.upsert.mock.calls[0]?.[0] as { update: Record<string, unknown> };
+    expect(call.update).not.toHaveProperty("reportedHostname");
+    expect(call.update).not.toHaveProperty("name");
+  });
+
   it("treats only dashboard origin as protected", () => {
     expect(shouldPreserveDashboardCapabilityOverride("DASHBOARD")).toBe(true);
     expect(shouldPreserveDashboardCapabilityOverride("CLI")).toBe(false);
@@ -185,7 +320,7 @@ describe("capability override origin", () => {
     ]);
     await persistRelayRegistration({
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: [
         {
           slug: "local-openai",
@@ -227,7 +362,7 @@ describe("capability override origin", () => {
     await expect(
       persistRelayRegistration({
         identity,
-        cli: { slug: "desktop", label: "Desktop" },
+        cli: { slug: "desktop" },
         endpoints: [
           {
             ...endpoint,
@@ -265,7 +400,7 @@ describe("capability override origin", () => {
     ]);
     await persistRelayRegistration({
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: [
         {
           slug: "local-openai",
@@ -324,7 +459,7 @@ describe("capability override origin", () => {
 
     await persistRelayRegistration({
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: [
         {
           slug: "local-openai",
@@ -366,7 +501,7 @@ describe("capability override origin", () => {
     });
     await persistRelayRegistration({
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: inventoryEndpoints(),
       inventoryConfirmed: true,
       endpointTargeting: true,
@@ -402,7 +537,7 @@ describe("capability override origin", () => {
     });
     await persistRelayRegistration({
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: inventoryEndpoints({ modelOverride: false }),
       inventoryConfirmed: true,
       endpointTargeting: true,
@@ -426,7 +561,7 @@ describe("capability override origin", () => {
     });
     await persistRelayRegistration({
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: inventoryEndpoints({ modelOverride: false }),
       inventoryConfirmed: true,
       endpointTargeting: true,
@@ -449,7 +584,7 @@ describe("capability override origin", () => {
     });
     await persistRelayRegistration({
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: inventoryEndpoints({ modelOverride: true }),
       inventoryConfirmed: true,
       endpointTargeting: true,
@@ -480,7 +615,7 @@ describe("capability override origin", () => {
     ]);
     const result = await persistRelayRegistration({
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: inventoryEndpoints(),
       inventoryConfirmed: true,
       endpointTargeting: true,
@@ -513,7 +648,7 @@ describe("capability override origin", () => {
 
     await persistRelayRegistration({
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: [
         {
           slug: "local-openai",
@@ -580,7 +715,7 @@ describe("capability override origin", () => {
 
     await persistRelayRegistration({
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: [
         {
           slug: "local-openai",
@@ -621,7 +756,7 @@ describe("capability override origin", () => {
 
     const registration = {
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: inventoryEndpoints(),
       inventoryConfirmed: true,
       endpointTargeting: true,
@@ -656,7 +791,7 @@ describe("capability override origin", () => {
 
     await persistRelayRegistration({
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: [
         {
           slug: "local-openai",
@@ -695,7 +830,7 @@ describe("capability override origin", () => {
   function preAttachedRegistration(concurrencyLimit?: number) {
     return {
       identity,
-      cli: { slug: "desktop", label: "Desktop" },
+      cli: { slug: "desktop" },
       endpoints: [
         {
           slug: "local-openai",

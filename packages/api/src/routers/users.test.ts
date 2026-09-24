@@ -1,8 +1,9 @@
 import { createRouterClient, ORPCError } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
 import { invalidateForceTwoFactorPolicyCache } from "@ws-model-proxy/auth/force-two-factor-policy";
+import { onUserDeleted } from "@ws-model-proxy/auth/user-deletion-listeners";
 import type { MockInstance } from "vitest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Context } from "../context";
 import { usersRouter } from "./users";
@@ -54,6 +55,8 @@ const db = prisma as unknown as {
     delete: MockInstance;
   };
   session: { deleteMany: MockInstance };
+  cliDeviceCredential: { findMany: MockInstance };
+  cliToken: { findMany: MockInstance };
   appSetting: { findUnique: MockInstance };
   $transaction: MockInstance;
 };
@@ -377,6 +380,43 @@ describe("usersRouter", () => {
   });
 
   describe("remove", () => {
+    const deletedUsers: string[] = [];
+    let unsubscribe: () => void = () => undefined;
+    beforeEach(() => {
+      deletedUsers.length = 0;
+      unsubscribe = onUserDeleted((userId) => {
+        deletedUsers.push(userId);
+      });
+    });
+    afterEach(() => unsubscribe());
+
+    it("notifies user-deletion listeners (live relay session close) after the delete", async () => {
+      db.user.findUnique.mockResolvedValue({ id: "other-user-id" });
+      let deletedBeforeNotify = false;
+      db.user.delete.mockImplementation(async () => {
+        deletedBeforeNotify = deletedUsers.length === 0;
+        return {};
+      });
+
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+      await client.remove({ userId: "other-user-id" });
+
+      expect(deletedUsers).toEqual(["other-user-id"]);
+      expect(deletedBeforeNotify).toBe(true);
+      // Matching is by user id at close time, not by a credential snapshot.
+      expect(db.cliDeviceCredential.findMany).not.toHaveBeenCalled();
+      expect(db.cliToken.findMany).not.toHaveBeenCalled();
+    });
+
+    it("notifies no listener when the delete fails", async () => {
+      db.user.findUnique.mockResolvedValue({ id: "other-user-id" });
+      db.user.delete.mockRejectedValue(new Error("Foreign key constraint violated"));
+
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+      await expect(client.remove({ userId: "other-user-id" })).rejects.toBeInstanceOf(ORPCError);
+      expect(deletedUsers).toEqual([]);
+    });
+
     it("hard-deletes when no FK constraint blocks it", async () => {
       db.user.findUnique.mockResolvedValue({ id: "other-user-id" });
       db.user.delete.mockResolvedValue({});
@@ -486,6 +526,11 @@ describe("usersRouter", () => {
   });
 
   describe("users.remove — prisma delete failure sink (pass 10 sibling)", () => {
+    beforeEach(() => {
+      db.cliDeviceCredential.findMany.mockResolvedValue([]);
+      db.cliToken.findMany.mockResolvedValue([]);
+    });
+
     it("logs the constructor name ONLY — Prisma SQL sentinel never reaches console.error, error kind INTERNAL_SERVER_ERROR enforced", async () => {
       db.user.findUnique.mockResolvedValue({ id: "target-id" });
       db.user.delete.mockRejectedValue(sentinelError("remove"));

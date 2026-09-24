@@ -100,7 +100,6 @@ export type TerminalRecord = {
   terminalId: string;
   userId: string;
   cliDeviceId: string;
-  label: string;
   cols: number;
   rows: number;
   /**
@@ -192,7 +191,7 @@ type SessionState = {
   connectedAt: Date;
   lastHeartbeatAt: Date;
   cliDeviceId: string | null;
-  cli: { slug: string; label: string } | null;
+  cli: { slug: string } | null;
   registered: boolean;
   inventoryConfirmed: boolean;
   endpointTargeting: boolean;
@@ -309,6 +308,7 @@ function firstEntry<T>(map: Map<string, T>): [string, T] | null {
 
 function reportedFeaturesFromHello(message: HelloMessage, now: Date): ReportedRelayFeatures {
   const cliVersion = message.cli.version ?? null;
+  const reportedHostname = message.cli.hostname ?? null;
   const interactive = relayProtocolAtLeast(message.protocolVersion, "2.4")
     ? interactiveCapabilities(message.cli.capabilities)
     : null;
@@ -321,6 +321,7 @@ function reportedFeaturesFromHello(message: HelloMessage, now: Date): ReportedRe
       reportedMcpCommands: features.mcpCommands,
       reportedTerminalApproval: features.terminalApproval,
       reportedTerminalSupported: features.terminalSupported,
+      reportedHostname,
       featuresReportedAt: now,
     };
   }
@@ -331,6 +332,7 @@ function reportedFeaturesFromHello(message: HelloMessage, now: Date): ReportedRe
     reportedMcpCommands: null,
     reportedTerminalApproval: null,
     reportedTerminalSupported: null,
+    reportedHostname,
     featuresReportedAt: null,
   };
 }
@@ -472,8 +474,16 @@ export class RelaySessionManager {
           reported: reportedFeaturesFromHello(message, now),
           now,
         });
+        if (this.sessionsBySocket.get(socket) !== session) {
+          // Detached while registration ran (socket closed, or its credential
+          // revoked / device deleted). The registration committed CONNECTED
+          // for a session that no longer exists: do not route to it, and put
+          // the device status back unless another live session owns it.
+          await this.settleDetachedRegistration(registration.cliDeviceId, now);
+          return;
+        }
         session.cliDeviceId = registration.cliDeviceId;
-        session.cli = { slug: message.cli.slug, label: message.cli.label };
+        session.cli = { slug: message.cli.slug };
         session.registered = true;
         session.inventoryConfirmed = message.protocolVersion !== "2.0";
         session.endpointTargeting = message.protocolVersion !== "2.0";
@@ -508,6 +518,8 @@ export class RelaySessionManager {
           }),
         );
       } catch (error) {
+        // Already detached and closed by whoever detached it.
+        if (this.sessionsBySocket.get(socket) !== session) return;
         const relayError =
           error instanceof RelayRegistrationError && error.code === "access_denied"
             ? "access_denied"
@@ -553,6 +565,9 @@ export class RelaySessionManager {
           endpointTargeting: session.endpointTargeting,
           now,
         });
+        // Detached during the write: nothing to acknowledge. An inventory
+        // update never writes connection state, so there is nothing to undo.
+        if (this.sessionsBySocket.get(socket) !== session) return;
         socket.send(
           encodeRelayServerControlMessage({
             type: "inventory.ok",
@@ -562,6 +577,21 @@ export class RelaySessionManager {
           }),
         );
       } catch (error) {
+        if (this.sessionsBySocket.get(socket) !== session) return;
+        if (error instanceof RelayRegistrationError && error.code === "access_denied") {
+          // The credential was revoked (or its owner removed) since the hello.
+          socket.send(
+            encodeRelayServerControlMessage({
+              type: "protocol.error",
+              failure: "protocol_error",
+              message: "access_denied",
+              requestId: message.id,
+            }),
+          );
+          socket.close(1008, "access_denied");
+          await this.removeSession(socket, now);
+          return;
+        }
         const messageText =
           error instanceof RelayRegistrationError ? error.message : "inventory update failed";
         socket.send(
@@ -744,15 +774,46 @@ export class RelaySessionManager {
     const cliDeviceId = session.cliDeviceId;
     if (!cliDeviceId || this.sessionsByCliDeviceId.get(cliDeviceId) !== session) return null;
     this.sessionsByCliDeviceId.delete(cliDeviceId);
-    return async () => {
-      await prisma.cliDevice.update({
-        where: { id: cliDeviceId },
-        data: { status: cliStatus, lastDisconnectedAt: now },
-        select: { id: true },
-      });
-      await markPoolMembersForCliUnavailable({ cliDeviceId, failureClass, now });
-      this.poolMemberRecovery.wake();
-    };
+    return () => this.writeDeviceDisconnected(cliDeviceId, { now, cliStatus, failureClass });
+  }
+
+  /**
+   * Persists that no session serves this device. `updateMany` because the
+   * device may have been deleted (its sessions are closed right after).
+   */
+  private async writeDeviceDisconnected(
+    cliDeviceId: string,
+    {
+      now,
+      cliStatus,
+      failureClass,
+    }: {
+      now: Date;
+      cliStatus: "DISCONNECTED" | "STALE";
+      failureClass: Extract<PoolMemberFailureClass, "WEBSOCKET_DISCONNECTED" | "STALE_SESSION">;
+    },
+  ) {
+    await prisma.cliDevice.updateMany({
+      where: { id: cliDeviceId },
+      data: { status: cliStatus, lastDisconnectedAt: now },
+    });
+    await markPoolMembersForCliUnavailable({ cliDeviceId, failureClass, now });
+    this.poolMemberRecovery.wake();
+  }
+
+  /**
+   * A hello's registration committed (device CONNECTED) after its session was
+   * detached. The session never entered routing; undo the connected status
+   * unless another live session now owns the device (its own registration
+   * wrote CONNECTED and routing points at it).
+   */
+  private async settleDetachedRegistration(cliDeviceId: string, now: Date) {
+    if (this.sessionsByCliDeviceId.has(cliDeviceId)) return;
+    await this.writeDeviceDisconnected(cliDeviceId, {
+      now,
+      cliStatus: "DISCONNECTED",
+      failureClass: "WEBSOCKET_DISCONNECTED",
+    });
   }
 
   async checkStaleSessions(now = new Date()) {
@@ -888,6 +949,85 @@ export class RelaySessionManager {
     });
   }
 
+  /**
+   * Closes every relay socket, registered or not, that authenticated with one
+   * of these credentials. Called after the revocation commits (re-login
+   * reattach, CLI token revoke, device or user deletion). Websocket auth
+   * refuses the revoked secret from then on, and registration re-checks it
+   * inside its transaction, so a socket that authenticated just before the
+   * commit but opened after this call is refused at its hello. A hello whose
+   * registration was in flight when its socket was closed here does not enter
+   * routing (see the hello handler's detach check).
+   *
+   * Per-process: sockets held by another server replica are not reached here;
+   * they are refused at their next hello or inventory update.
+   */
+  async closeSessionsForRevokedCredentials(
+    revoked: { kind: CliWebsocketIdentity["kind"]; ids: readonly string[] },
+    now = new Date(),
+  ) {
+    if (revoked.ids.length === 0) return;
+    const ids = new Set(revoked.ids);
+    await this.closeSessionsMatching(
+      (session) => session.identity.kind === revoked.kind && ids.has(session.identity.id),
+      now,
+    );
+  }
+
+  /**
+   * Closes every relay socket, registered or not, whose authenticated
+   * identity belongs to a user that was just deleted. Matched by
+   * `identity.userId` (every live session carries it), not by a credential-id
+   * snapshot, so a credential minted between any snapshot and the delete is
+   * covered too. Called post-commit through
+   * `@ws-model-proxy/auth/user-deletion-listeners` from both the dashboard
+   * `users.remove` procedure and Better Auth's `user.delete.after` hook.
+   *
+   * Per-process: sockets held by another replica are not reached here. Their
+   * credential rows cascade with the user, so that replica refuses them at
+   * the next hello or inventory update, and websocket auth refuses any
+   * reconnect.
+   */
+  async closeSessionsForUser(userId: string, now = new Date()) {
+    await this.closeSessionsMatching((session) => session.identity.userId === userId, now);
+  }
+
+  private async closeSessionsMatching(matches: (session: SessionState) => boolean, now: Date) {
+    const sessions = [...this.sessionsBySocket.values()].filter(matches);
+    // Close and detach every matching socket before any database write, so a
+    // failed or slow status write cannot leave a later socket open.
+    const writes: Array<() => Promise<void>> = [];
+    for (const session of sessions) {
+      this.teardownInteractiveWork(session);
+      if (session.socket.readyState === WS_READY_STATE_OPEN) {
+        session.socket.send(
+          encodeRelayServerControlMessage({
+            type: "protocol.error",
+            failure: "protocol_error",
+            message: "access_denied",
+          }),
+        );
+        session.socket.close(1008, "access_denied");
+      }
+      const write = this.detachSession(session.socket, {
+        now,
+        cliStatus: "DISCONNECTED",
+        failureClass: "WEBSOCKET_DISCONNECTED",
+      });
+      if (write) writes.push(write);
+    }
+    for (const write of writes) {
+      try {
+        await write();
+      } catch (error) {
+        console.error(
+          "[relay] revoked session status write failed",
+          error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+        );
+      }
+    }
+  }
+
   applyFeatureGrants(
     cliDeviceId: string,
     grants: { allowHumanTerminal: boolean; allowMcpCommands: boolean },
@@ -950,7 +1090,6 @@ export class RelaySessionManager {
   ): Array<{
     terminalId: string;
     cliDeviceId: string;
-    label: string;
     /** Kept for one release: viewerCount > 0. */
     viewerAttached: boolean;
     viewerCount: number;
@@ -966,7 +1105,6 @@ export class RelaySessionManager {
         terminals.push({
           terminalId: terminal.terminalId,
           cliDeviceId: terminal.cliDeviceId,
-          label: terminal.label,
           viewerAttached: terminal.viewers.size > 0,
           viewerCount: terminal.viewers.size,
           attachedHere: connId !== undefined && connViewerIds(terminal, connId).length > 0,
@@ -987,7 +1125,6 @@ export class RelaySessionManager {
     terminalId: string;
     userId: string;
     cliDeviceId: string;
-    label: string;
     cols: number;
     rows: number;
     browserPublicKey: string;
@@ -1014,7 +1151,6 @@ export class RelaySessionManager {
       terminalId: input.terminalId,
       userId: input.userId,
       cliDeviceId: input.cliDeviceId,
-      label: input.label,
       cols: input.cols,
       rows: input.rows,
       multiViewer,

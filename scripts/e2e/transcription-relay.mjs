@@ -269,7 +269,6 @@ try {
       version: 1,
       serverUrl,
       cliSlug,
-      cliLabel: "Transcription E2E",
       cliTokenEnv: "WSMP_E2E_CLI_TOKEN",
       endpoints: [
         {

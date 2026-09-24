@@ -120,7 +120,6 @@ pub struct Config {
     pub version: u8,
     pub server_url: Option<String>,
     pub cli_slug: Option<String>,
-    pub cli_label: Option<String>,
     pub cli_token_env: Option<String>,
     pub endpoints: Vec<EndpointConfig>,
     /// Extra HTTP(S) origins whose signed `/media/{id}` URLs the relay may fetch
@@ -145,7 +144,6 @@ impl Default for Config {
             version: CONFIG_VERSION,
             server_url: None,
             cli_slug: None,
-            cli_label: None,
             cli_token_env: None,
             endpoints: Vec::new(),
             media_trusted_origins: Vec::new(),

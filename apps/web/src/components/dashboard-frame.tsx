@@ -1,4 +1,4 @@
-import { Link, Outlet, useMatchRoute, useNavigate } from "@tanstack/react-router";
+import { Link, Outlet, useMatches, useMatchRoute, useNavigate } from "@tanstack/react-router";
 import { Button, buttonVariants } from "@ws-model-proxy/ui/components/button";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import {
@@ -89,17 +89,44 @@ const TerminalWorkspaceView = lazy(() =>
 
 type Section = (typeof dashboardSections)[number];
 
+export type DashboardLayoutMode = "padded" | "fill";
+
+/**
+ * The deepest matched route that declares `staticData.dashboardLayout` wins.
+ * Routes without the flag render inside the padded, centered container.
+ */
+export function resolveDashboardLayout(
+  matches: readonly { staticData?: { dashboardLayout?: DashboardLayoutMode } }[],
+): DashboardLayoutMode {
+  for (let index = matches.length - 1; index >= 0; index -= 1) {
+    const layout = matches[index]?.staticData?.dashboardLayout;
+    if (layout) return layout;
+  }
+  return "padded";
+}
+
 export function DashboardFrame({ lang }: { lang: string }) {
   const matchRoute = useMatchRoute();
+  const layout = useMatches({ select: resolveDashboardLayout });
+  // Terminal-specific behavior only (keep-alive workspace, provider activation);
+  // the page geometry comes from the route's declared layout.
   const onTerminals = Boolean(matchRoute({ to: "/$lang/dashboard/terminals", params: { lang } }));
   return (
     <TerminalWorkspaceProvider active={onTerminals}>
-      <DashboardLayout lang={lang} onTerminals={onTerminals} />
+      <DashboardLayout lang={lang} layout={layout} onTerminals={onTerminals} />
     </TerminalWorkspaceProvider>
   );
 }
 
-function DashboardLayout({ lang, onTerminals }: { lang: string; onTerminals: boolean }) {
+function DashboardLayout({
+  lang,
+  layout,
+  onTerminals,
+}: {
+  lang: string;
+  layout: DashboardLayoutMode;
+  onTerminals: boolean;
+}) {
   const { t } = useTranslation(["common", "dashboard"]);
   const sidebarCollapsed = useUiPreferences((state) => state.sidebarCollapsed);
   const toggleSidebar = useUiPreferences((state) => state.toggleSidebar);
@@ -158,16 +185,27 @@ function DashboardLayout({ lang, onTerminals }: { lang: string; onTerminals: boo
       </aside>
 
       <div className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col">
-        {onTerminals ? (
-          <MobileNavStrip lang={lang} className="shrink-0 px-2 py-1" />
+        {layout === "fill" ? (
+          <>
+            <MobileNavStrip lang={lang} className="shrink-0 px-2 py-1" />
+            {/* empty:hidden drops the padding when there are no notices. */}
+            <div data-dashboard-notices="fill" className="shrink-0 px-2 pt-2 empty:hidden md:px-4">
+              <DashboardNotices />
+            </div>
+            {/* The terminals route renders nothing; the workspace below fills instead. */}
+            <div
+              data-dashboard-layout="fill"
+              className={cn("flex min-h-0 min-w-0 flex-col", !onTerminals && "flex-1")}
+            >
+              <Outlet />
+            </div>
+          </>
         ) : (
-          <div className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col md:overflow-x-clip md:overflow-y-auto">
-            <div className="container mx-auto flex h-full min-h-0 min-w-0 max-w-6xl flex-col px-4 py-4 md:py-8">
-              <div className="mb-5 hidden shrink-0 md:block">
-                <h1 className="text-xl font-semibold md:text-2xl">{t("dashboard:title")}</h1>
-                <p className="mt-1 text-sm text-muted-foreground">{t("dashboard:description")}</p>
-              </div>
-
+          <div
+            data-dashboard-layout="padded"
+            className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col md:overflow-x-clip md:overflow-y-auto"
+          >
+            <div className="container mx-auto flex h-full min-h-0 min-w-0 max-w-6xl flex-col px-4 py-4 md:py-6">
               <MobileNavStrip lang={lang} className="mb-4" />
 
               <div className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col">
@@ -185,8 +223,6 @@ function DashboardLayout({ lang, onTerminals }: { lang: string; onTerminals: boo
             </Suspense>
           </div>
         ) : null}
-        {/* The terminals route renders nothing; it keeps the router's match. */}
-        {onTerminals ? <Outlet /> : null}
       </div>
     </div>
   );

@@ -270,6 +270,7 @@ describe("relayMetadataRouter", () => {
     );
     expect(db.relayRequest.deleteMany).toHaveBeenCalledWith({
       where: {
+        status: { in: ["SUCCEEDED", "FAILED", "CANCELED"] },
         userId: "user-id",
         id: { in: ["relay-a", "relay-b"] },
         createdAt: { lt: createdBefore },
@@ -287,6 +288,7 @@ describe("relayMetadataRouter", () => {
     });
     expect(db.relayRequest.deleteMany).toHaveBeenCalledWith({
       where: {
+        status: { in: ["SUCCEEDED", "FAILED", "CANCELED"] },
         userId: "user-id",
         createdAt: { lt: createdBefore, gte: createdAfter },
       },
@@ -315,6 +317,7 @@ describe("relayMetadataRouter", () => {
     ).resolves.toEqual({ deletedCount: 2 });
     expect(db.relayRequest.deleteMany).toHaveBeenCalledWith({
       where: {
+        status: { in: ["SUCCEEDED", "FAILED", "CANCELED"] },
         userId: "owner-id",
         createdAt: { lt: createdBefore, gte: createdAfter },
       },

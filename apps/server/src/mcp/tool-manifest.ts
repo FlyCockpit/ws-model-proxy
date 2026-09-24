@@ -574,6 +574,28 @@ const READ_TOOLS: readonly McpToolDescriptor[] = [
     inputAdapter: isoDateFieldsAdapter(["createdAfter", "createdBefore"]),
     invokeProcedure: procedureInvoker((client) => client.relayMetadata.listOwn),
   },
+  // --- dashboard overview (prompt-free aggregates) ---
+  // Same procedure and scope as the web Overview: traffic on resources the
+  // caller owns (any requester), plus the caller's own usage of pools shared
+  // with them as per-pool totals; never other requesters' shared-pool usage.
+  {
+    name: "overview_metrics",
+    target: "overview.metrics",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    inputSchema: anyArgs(),
+    invokeProcedure: procedureInvoker((client) => client.overview.metrics),
+  },
+  {
+    name: "overview_health",
+    target: "overview.health",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    inputSchema: anyArgs(),
+    invokeProcedure: procedureInvoker((client) => client.overview.health),
+  },
 ];
 
 /**
@@ -606,6 +628,15 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     invokeProcedure: procedureInvoker(
       (client) => client.forwarderManagement.createGuardedModelPool,
     ),
+  },
+  {
+    name: "forwarder_cli_device_rename",
+    target: "forwarderManagement.renameCliDevice",
+    scope: "write",
+    confirmation: null,
+    classification: "pure",
+    inputSchema: anyArgs(),
+    invokeProcedure: procedureInvoker((client) => client.forwarderManagement.renameCliDevice),
   },
   {
     name: "forwarder_cli_metadata_remove",
@@ -1128,8 +1159,8 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
 ];
 
 /**
- * The checked catalog: exactly 23 read tools and 48 write tools
- * (44 procedure-backed + 4 extracted cores: 2 diagnostics and 2 CLI commands).
+ * The checked catalog: exactly 23 read tools and 49 write tools
+ * (45 procedure-backed + 4 extracted cores: 2 diagnostics and 2 CLI commands).
  */
 export const MCP_TOOL_MANIFEST: readonly McpToolDescriptor[] = [...READ_TOOLS, ...WRITE_TOOLS];
 
@@ -1192,6 +1223,10 @@ export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
   {
     target: "cliCredentials.exchangeDeviceCode",
     reason: "Public device-flow credential exchange; not an MCP surface.",
+  },
+  {
+    target: "cliCredentials.deviceLoginRequest",
+    reason: "Browser device-login approval page read; not an MCP surface.",
   },
   {
     target: "relayMetadata.deleteOwn",

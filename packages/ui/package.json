@@ -24,6 +24,8 @@
     "next-themes": "catalog:",
     "react": "catalog:",
     "react-dom": "catalog:",
+    "react-is": "catalog:",
+    "recharts": "catalog:",
     "shadcn": "^4.21.0",
     "sileo": "catalog:",
     "tailwind-merge": "^3.7.0",
