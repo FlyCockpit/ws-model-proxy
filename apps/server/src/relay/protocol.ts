@@ -3,13 +3,30 @@ import {
   openAiCompatibleCapabilitiesSchema,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { relayProtocolAtLeast } from "@ws-model-proxy/api/lib/relay-protocol-version";
+import { WSMP_MIN_CLI_VERSION } from "@ws-model-proxy/config/cli-device-login";
 import { normalizeReportedHostname } from "@ws-model-proxy/config/cli-device-name";
 import { z } from "zod";
+import { stringifyWellFormed } from "./wire-text.js";
 
 export { relayProtocolAtLeast };
 
-export const RELAY_PROTOCOL_VERSIONS = ["2.0", "2.1", "2.2", "2.3", "2.4", "2.5"] as const;
+/**
+ * The only relay protocol this server speaks. 2.6 adds supervised (agent
+ * requested) terminals and the MCP command mode; it is also the minimum: an
+ * older CLI is refused at hello with `RELAY_UPGRADE_REQUIRED_MESSAGE`.
+ */
+export const RELAY_PROTOCOL_VERSIONS = ["2.6"] as const;
 export type RelayProtocolVersion = (typeof RELAY_PROTOCOL_VERSIONS)[number];
+export const RELAY_MIN_PROTOCOL_VERSION: RelayProtocolVersion = "2.6";
+/** First wsmp release that speaks relay protocol 2.6. */
+export const RELAY_MIN_CLI_VERSION = WSMP_MIN_CLI_VERSION;
+/**
+ * Sent as `protocol.error` to a CLI whose hello is older than 2.6. Every
+ * released wsmp prints `relay protocol error: <message>` and exits (0.3.x), or
+ * retries once with protocol 2.4 and then does the same (pre-release 2.5
+ * builds), so this text is what the person sees.
+ */
+export const RELAY_UPGRADE_REQUIRED_MESSAGE = `This server requires wsmp ${RELAY_MIN_CLI_VERSION} or newer (relay protocol ${RELAY_MIN_PROTOCOL_VERSION}). Upgrade wsmp and restart it.`;
 export const RELAY_SUBPROTOCOL = "ws-model-proxy.relay.v2";
 
 const RELAY_JSON_CONTROL_MAX_BYTES = 64 * 1024;
@@ -111,53 +128,25 @@ const terminalIdentitySchema = z
   })
   .strict();
 
-const v24FeatureSchema = z
+const mcpCommandModeSchema = z.enum(["off", "supervised", "unsupervised"]);
+
+const v26FeatureSchema = z
   .object({
     humanTerminal: z.boolean(),
-    mcpCommands: z.boolean(),
+    /** The CLI's own MCP command policy (`wsmp config set-mcp-commands`). */
+    mcpCommandMode: mcpCommandModeSchema,
     terminalApproval: z.boolean(),
     terminalSupported: z.boolean(),
   })
   .strict();
 
-const v24CliCapabilityFields = {
-  inventoryAck: z.literal(true),
-  inventoryReplace: z.literal(true),
-  endpointTargeting: z.literal(true),
-  binaryFrames: z.literal(true),
-  cancellation: z.literal(true),
-  maxBinaryChunkBytes: z.literal(RELAY_BINARY_CHUNK_MAX_BYTES),
-  requestBodyStreaming: z.literal(true),
-  requestBodyWindowChunks: z.literal(RELAY_REQUEST_BODY_WINDOW_CHUNKS),
-  sharedTokenizerTps: z.literal(true),
-  standardizedMetrics: z.literal(true),
-  terminal: z.literal(true),
-  exec: z.literal(true),
-  features: v24FeatureSchema,
-  terminalPublicKey: uncompressedP256PublicKeySchema,
-};
-
-/** 2.5 adds multi-viewer terminals: server-minted viewer ids and broadcast output. */
-const v25CliCapabilitiesSchema = z
+/**
+ * 2.6: multi-viewer terminals (server-minted viewer ids, broadcast output),
+ * CLI identity proof, and supervised terminals (`term.spawn`).
+ */
+const v26CliCapabilitiesSchema = z
   .object({
-    protocolVersion: z.literal("2.5"),
-    ...v24CliCapabilityFields,
-    terminalViewers: z.literal(true),
-    /** Absent when the CLI could not load its identity; browsers then refuse it. */
-    terminalIdentity: cliTerminalIdentitySchema.optional(),
-  })
-  .strict();
-
-const v24CliCapabilitiesSchema = z
-  .object({
-    protocolVersion: z.literal("2.4"),
-    ...v24CliCapabilityFields,
-  })
-  .strict();
-
-const v23CliCapabilitiesSchema = z
-  .object({
-    protocolVersion: z.literal("2.3"),
+    protocolVersion: z.literal("2.6"),
     inventoryAck: z.literal(true),
     inventoryReplace: z.literal(true),
     endpointTargeting: z.literal(true),
@@ -168,57 +157,18 @@ const v23CliCapabilitiesSchema = z
     requestBodyWindowChunks: z.literal(RELAY_REQUEST_BODY_WINDOW_CHUNKS),
     sharedTokenizerTps: z.literal(true),
     standardizedMetrics: z.literal(true),
+    terminal: z.literal(true),
+    exec: z.literal(true),
+    features: v26FeatureSchema,
+    terminalPublicKey: uncompressedP256PublicKeySchema,
+    terminalViewers: z.literal(true),
+    supervisedCommands: z.literal(true),
+    /** Absent when the CLI could not load its identity; browsers then refuse it. */
+    terminalIdentity: cliTerminalIdentitySchema.optional(),
   })
   .strict();
 
-const v22CliCapabilitiesSchema = z
-  .object({
-    protocolVersion: z.literal("2.2"),
-    inventoryAck: z.literal(true),
-    inventoryReplace: z.literal(true),
-    endpointTargeting: z.literal(true),
-    binaryFrames: z.literal(true),
-    cancellation: z.literal(true),
-    maxBinaryChunkBytes: z.literal(RELAY_BINARY_CHUNK_MAX_BYTES),
-    requestBodyStreaming: z.literal(true),
-    requestBodyWindowChunks: z.literal(RELAY_REQUEST_BODY_WINDOW_CHUNKS),
-    sharedTokenizerTps: z.literal(true),
-  })
-  .strict();
-
-const v21CliCapabilitiesSchema = z
-  .object({
-    protocolVersion: z.literal("2.1"),
-    inventoryAck: z.literal(true),
-    inventoryReplace: z.literal(true),
-    endpointTargeting: z.literal(true),
-    binaryFrames: z.literal(true),
-    cancellation: z.literal(true),
-    maxBinaryChunkBytes: z.literal(RELAY_BINARY_CHUNK_MAX_BYTES),
-    requestBodyStreaming: z.literal(true),
-    requestBodyWindowChunks: z.literal(RELAY_REQUEST_BODY_WINDOW_CHUNKS),
-  })
-  .strict();
-
-const legacyCliCapabilitiesSchema = z
-  .object({
-    protocolVersion: z.literal("2.0"),
-    binaryFrames: z.literal(true),
-    cancellation: z.literal(true),
-    maxBinaryChunkBytes: z.literal(RELAY_BINARY_CHUNK_MAX_BYTES),
-    requestBodyStreaming: z.literal(true),
-    requestBodyWindowChunks: z.literal(RELAY_REQUEST_BODY_WINDOW_CHUNKS),
-  })
-  .strict();
-
-const acceptedCliCapabilitiesSchema = z.union([
-  v25CliCapabilitiesSchema,
-  v24CliCapabilitiesSchema,
-  v23CliCapabilitiesSchema,
-  v22CliCapabilitiesSchema,
-  v21CliCapabilitiesSchema,
-  legacyCliCapabilitiesSchema,
-]);
+export type CliCapabilities = z.infer<typeof v26CliCapabilitiesSchema>;
 
 const discoveredModelSchema = z
   .object({
@@ -278,14 +228,7 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
     .object({
       type: z.literal("hello"),
       id: requestIdSchema,
-      protocolVersion: z.union([
-        z.literal("2.5"),
-        z.literal("2.4"),
-        z.literal("2.3"),
-        z.literal("2.2"),
-        z.literal("2.1"),
-        z.literal("2.0"),
-      ]),
+      protocolVersion: z.literal("2.6"),
       cli: z
         .object({
           slug: z.string().trim().min(1).max(63),
@@ -293,7 +236,7 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
           // Normalized rather than rejected so an odd hostname never blocks hello.
           hostname: z.string().max(1024).nullish().transform(normalizeReportedHostname),
           version: z.string().trim().max(80).optional(),
-          capabilities: acceptedCliCapabilitiesSchema,
+          capabilities: v26CliCapabilitiesSchema,
         })
         .strict(),
       endpoints: z.array(endpointInventorySchema).max(100).default([]),
@@ -434,6 +377,44 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({
+      type: z.literal("term.spawned"),
+      terminalId: base64Url16ByteSchema,
+      commandId: base64Url16ByteSchema,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("supervised.rejected"),
+      commandId: base64Url16ByteSchema,
+      reason: z.string().min(1).max(64),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("supervised.accepted"),
+      commandId: base64Url16ByteSchema,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("supervised.declined"),
+      commandId: base64Url16ByteSchema,
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("supervised.done"),
+      commandId: base64Url16ByteSchema,
+      exitCode: z.number().int().min(0).max(255).optional(),
+      signal: relayExitSignalSchema,
+      /** True: output was held for review in the browser and none was sent. */
+      review: z.boolean(),
+      /** Total output bytes after Enter; present only when output frames were sent. */
+      outputBytes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
+    })
+    .strict(),
+  z
+    .object({
       type: z.literal("exec.started"),
       commandId: base64Url16ByteSchema,
     })
@@ -535,7 +516,29 @@ export type RelayServerControlMessage =
   | { type: "term.close"; terminalId: string }
   | { type: "term.auth"; terminalId: string; viewerId?: string; signature: string }
   | { type: "exec.start"; commandId: string; command: string; cwd?: string }
-  | { type: "exec.cancel"; commandId: string };
+  | { type: "exec.cancel"; commandId: string }
+  | {
+      /** 2.6: a supervised (agent-requested) terminal with a confirm screen. */
+      type: "term.spawn";
+      terminalId: string;
+      commandId: string;
+      command: string;
+      cwd?: string;
+      reason?: string;
+      /** Server-asserted: the requesting MCP token's name. */
+      requester: string;
+      shareOutput: boolean;
+    }
+  | {
+      type: "supervised.cancel";
+      commandId: string;
+      /**
+       * Absent: end the terminal in whatever state. `expire` (confirm
+       * deadline) or `decline` (from the browser): a request the CLI decides;
+       * it declines a request still waiting, and an Enter it took first wins.
+       */
+      reason?: "expire" | "decline";
+    };
 
 const relayBodyMetadataFields = {
   requestId: requestIdSchema,
@@ -579,6 +582,15 @@ const relayBinaryFrameMetadataSchema = z.discriminatedUnion("type", [
       seq: sealedSeqSchema,
     })
     .strict(),
+  z
+    .object({
+      /** 2.6: shared supervised output, sent once at exit (never while review is on). */
+      type: z.literal("supervised.output"),
+      commandId: base64Url16ByteSchema,
+      part: z.enum(["head", "tail"]),
+      seq: sealedSeqSchema,
+    })
+    .strict(),
 ]);
 
 export type RelayBinaryFrameMetadata = z.infer<typeof relayBinaryFrameMetadataSchema>;
@@ -608,8 +620,12 @@ export function parseRelaySubprotocolHeader(header: string | undefined): {
   };
 }
 
+/**
+ * Throws `RelayWireTextError` (and sends nothing) when any string in the
+ * message is not well-formed Unicode: the CLI cannot read such a frame.
+ */
 export function encodeRelayServerControlMessage(message: RelayServerControlMessage): string {
-  return JSON.stringify(message);
+  return stringifyWellFormed(message);
 }
 
 export function parseRelayClientControlFrame(frame: string): RelayClientControlMessage {
@@ -619,6 +635,39 @@ export function parseRelayClientControlFrame(frame: string): RelayClientControlM
   }
   const parsed: unknown = JSON.parse(frame);
   return relayClientControlMessageSchema.parse(parsed);
+}
+
+/**
+ * True for a hello from a CLI older than protocol 2.6: another protocol
+ * version, or the pre-naming `cli.label` field. Checked before the strict
+ * schema so such a CLI gets `RELAY_UPGRADE_REQUIRED_MESSAGE` instead of an
+ * opaque "malformed message".
+ */
+export function helloNeedsUpgrade(frame: string): boolean {
+  if (utf8Length(frame) > RELAY_JSON_CONTROL_MAX_BYTES) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(frame);
+  } catch {
+    return false;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+  const record = parsed as Record<string, unknown>;
+  if (record.type !== "hello") return false;
+  if (record.protocolVersion !== RELAY_MIN_PROTOCOL_VERSION) return true;
+  const cli = record.cli;
+  if (!cli || typeof cli !== "object" || Array.isArray(cli)) return false;
+  const cliRecord = cli as Record<string, unknown>;
+  if ("label" in cliRecord) return true;
+  const capabilities = cliRecord.capabilities;
+  if (!capabilities || typeof capabilities !== "object" || Array.isArray(capabilities)) {
+    return false;
+  }
+  return (capabilities as Record<string, unknown>).protocolVersion !== RELAY_MIN_PROTOCOL_VERSION;
+}
+
+function utf8Length(text: string): number {
+  return new TextEncoder().encode(text).byteLength;
 }
 
 const RELAY_CONTROL_PARSE_ISSUE_LIMIT = 20;
@@ -672,7 +721,7 @@ export function encodeRelayBinaryFrame(
   if (body.byteLength > RELAY_BINARY_CHUNK_MAX_BYTES) {
     throw new RelayProtocolError("Binary body chunk exceeds 1 MiB.");
   }
-  const metadataBytes = new TextEncoder().encode(JSON.stringify(metadata));
+  const metadataBytes = new TextEncoder().encode(stringifyWellFormed(metadata));
   if (metadataBytes.byteLength > RELAY_JSON_CONTROL_MAX_BYTES) {
     throw new RelayProtocolError("Binary frame metadata exceeds 64 KiB.");
   }

@@ -59,6 +59,22 @@ afterEach(() => {
   state.payloads = [];
 });
 
+function commands(overrides: object = {}) {
+  return {
+    mode: "off",
+    deviceMode: "unsupervised",
+    supported: true,
+    live: true,
+    effectiveMode: "off",
+    available: false,
+    ...overrides,
+  };
+}
+
+function modeRadio(mode: string) {
+  return screen.getByRole("radio", { name: `dashboard:clis.features.commandModes.${mode}` });
+}
+
 describe("CLI feature switches", () => {
   it("disables the terminal switch on Windows and explains why", () => {
     renderSwitches({
@@ -69,17 +85,18 @@ describe("CLI feature switches", () => {
         live: true,
         available: false,
       },
-      commands: { granted: false, deviceAllows: true, live: true, available: false },
+      commands: commands({ supported: false }),
     });
     const terminal = screen.getByRole("switch", { name: "dashboard:clis.features.terminal" });
-    const commands = screen.getByRole("switch", { name: "dashboard:clis.features.commands" });
     expect(isDisabled(terminal)).toBe(false);
     expect(terminal.getAttribute("aria-checked")).toBe("true");
-    expect(isDisabled(commands)).toBe(false);
-    expect(screen.getByText("dashboard:clis.features.windows")).toBeTruthy();
+    // Supervised commands need a PTY; headless ones do not.
+    expect(isDisabled(modeRadio("supervised"))).toBe(true);
+    expect(isDisabled(modeRadio("unsupervised"))).toBe(false);
+    expect(screen.getAllByText("dashboard:clis.features.windows").length).toBeGreaterThan(0);
   });
 
-  it("disables a grant that is off when the CLI config turns the feature off", () => {
+  it("disables modes above what the CLI config allows", () => {
     renderSwitches({
       terminal: {
         granted: false,
@@ -88,18 +105,19 @@ describe("CLI feature switches", () => {
         live: false,
         available: false,
       },
-      commands: { granted: false, deviceAllows: false, live: false, available: false },
+      commands: commands({ deviceMode: "supervised" }),
     });
     expect(
       isDisabled(screen.getByRole("switch", { name: "dashboard:clis.features.terminal" })),
     ).toBe(true);
-    expect(
-      isDisabled(screen.getByRole("switch", { name: "dashboard:clis.features.commands" })),
-    ).toBe(true);
+    expect(isDisabled(modeRadio("off"))).toBe(false);
+    expect(isDisabled(modeRadio("supervised"))).toBe(false);
+    expect(isDisabled(modeRadio("unsupervised"))).toBe(true);
     expect(screen.getAllByText("dashboard:clis.features.configDisabled").length).toBe(2);
   });
 
-  it("keeps a granted switch enabled when the device flag is false", () => {
+  it("keeps the current grant selectable so it can be lowered", async () => {
+    const user = userEvent.setup();
     renderSwitches({
       terminal: {
         granted: true,
@@ -108,19 +126,18 @@ describe("CLI feature switches", () => {
         live: false,
         available: false,
       },
-      commands: { granted: true, deviceAllows: null, live: false, available: false },
+      commands: commands({ mode: "unsupervised", deviceMode: null }),
     });
     expect(
       isDisabled(screen.getByRole("switch", { name: "dashboard:clis.features.terminal" })),
     ).toBe(false);
-    expect(
-      isDisabled(screen.getByRole("switch", { name: "dashboard:clis.features.commands" })),
-    ).toBe(false);
-    expect(screen.getByText("dashboard:clis.features.windows")).toBeTruthy();
-    expect(screen.getByText("dashboard:clis.features.updateWsmp")).toBeTruthy();
+    expect((modeRadio("unsupervised") as HTMLInputElement).checked).toBe(true);
+    expect(isDisabled(modeRadio("unsupervised"))).toBe(false);
+    await user.click(modeRadio("off"));
+    expect(state.payloads).toEqual([{ cliDeviceId: "cli-1", mcpCommandMode: "off" }]);
   });
 
-  it("asks for a wsmp update when the device has not reported the flag", () => {
+  it("asks for a wsmp update when the device has not reported a mode", () => {
     renderSwitches({
       terminal: {
         granted: false,
@@ -129,9 +146,59 @@ describe("CLI feature switches", () => {
         live: false,
         available: false,
       },
-      commands: { granted: false, deviceAllows: null, live: false, available: false },
+      commands: commands({ deviceMode: null, supported: null }),
     });
+    expect(isDisabled(modeRadio("supervised"))).toBe(true);
     expect(screen.getAllByText("dashboard:clis.features.updateWsmp").length).toBe(2);
+  });
+
+  it("grants supervised mode and recommends browser approval", async () => {
+    const user = userEvent.setup();
+    renderSwitches({
+      terminal: {
+        granted: false,
+        deviceAllows: true,
+        supported: true,
+        live: true,
+        available: false,
+        approvalRequired: false,
+      },
+      commands: commands(),
+    });
+    expect(screen.queryByText("dashboard:clis.features.approvalRecommended")).toBeNull();
+    await user.click(modeRadio("supervised"));
+    expect(state.payloads).toEqual([{ cliDeviceId: "cli-1", mcpCommandMode: "supervised" }]);
+  });
+
+  it("recommends browser approval while agents can request commands", () => {
+    renderSwitches({
+      terminal: {
+        granted: false,
+        deviceAllows: true,
+        supported: true,
+        live: true,
+        available: false,
+        approvalRequired: false,
+      },
+      commands: commands({ mode: "supervised", effectiveMode: "supervised", available: true }),
+    });
+    expect(screen.getByText("dashboard:clis.features.approvalRecommended")).toBeTruthy();
+    expect(screen.getByText("wsmp config set-terminal-approval on")).toBeTruthy();
+  });
+
+  it("does not recommend approval when the CLI already requires it", () => {
+    renderSwitches({
+      terminal: {
+        granted: false,
+        deviceAllows: true,
+        supported: true,
+        live: true,
+        available: false,
+        approvalRequired: true,
+      },
+      commands: commands({ mode: "supervised", effectiveMode: "supervised", available: true }),
+    });
+    expect(screen.queryByText("dashboard:clis.features.approvalRecommended")).toBeNull();
   });
 
   it("keeps an offline CLI's last grant instead of forcing the switch off", async () => {
@@ -144,7 +211,7 @@ describe("CLI feature switches", () => {
         live: false,
         available: false,
       },
-      commands: { granted: false, deviceAllows: true, live: false, available: false },
+      commands: commands({ live: false }),
     });
     const terminal = screen.getByRole("switch", { name: "dashboard:clis.features.terminal" });
     expect(isDisabled(terminal)).toBe(false);

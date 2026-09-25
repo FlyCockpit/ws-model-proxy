@@ -16,6 +16,25 @@ vi.mock("@ws-model-proxy/db", async () => {
   return { default: mockDeep() };
 });
 
+// The ordered-delete locking itself runs against real PostgreSQL
+// (capacity-lock-order.postgres.integration.test.ts); here it is observed.
+const { lockCapacityGraphForDelete } = vi.hoisted(() => ({
+  lockCapacityGraphForDelete: vi.fn(async (_tx: unknown, _scope: unknown) => undefined),
+}));
+vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@ws-model-proxy/db/capacity-lock-order")>()),
+  lockCapacityGraphForDelete,
+}));
+// The history drain before an ordered delete runs against real PostgreSQL
+// (parent-deletion.postgres.integration.test.ts); here it is observed.
+const { prepareParentDeletion } = vi.hoisted(() => ({
+  prepareParentDeletion: vi.fn(async (_db: unknown, _scope: unknown) => ({})),
+}));
+vi.mock("@ws-model-proxy/db/parent-deletion", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@ws-model-proxy/db/parent-deletion")>()),
+  prepareParentDeletion,
+}));
+
 const {
   authenticateCliWebsocketSecret,
   digestCliDeviceCredentialSecret,
@@ -52,6 +71,9 @@ const db = prisma as unknown as {
     update: MockInstance;
     deleteMany: MockInstance;
   };
+  user: {
+    findUnique: MockInstance;
+  };
 };
 
 const now = new Date("2026-01-01T00:00:00.000Z");
@@ -67,6 +89,7 @@ describe("cliCredentialAccess", () => {
     db.cliDeviceCredential.create.mockResolvedValue({ id: "credential-id", userId: "user-id" });
     db.cliDeviceCredential.findMany.mockResolvedValue([]);
     db.cliDeviceCredential.updateMany.mockResolvedValue({ count: 0 });
+    db.user.findUnique.mockResolvedValue({ banned: false, deletionRequestedAt: null });
   });
 
   it("verifies active wsmp_cli_ tokens with the CLI-token HMAC context", async () => {
@@ -539,6 +562,7 @@ describe("deleteCliDeviceAndCredentials", () => {
     db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
       callback(db),
     );
+    db.cliDevice.findFirst.mockResolvedValue({ lastHeartbeatAt: null });
     db.cliDevice.updateMany.mockResolvedValue({ count: 1 });
     db.cliDevice.findUnique.mockResolvedValue({ lastHeartbeatAt: null });
     db.cliDevice.delete.mockResolvedValue({ id: "cli-device-id" });
@@ -571,10 +595,23 @@ describe("deleteCliDeviceAndCredentials", () => {
       where: { id: "cli-device-id" },
       select: { id: true },
     });
+    // Capacity lock order: the device row (L0) first, then every lock the
+    // cascade can reach, then the DELETE.
+    expect(lockCapacityGraphForDelete).toHaveBeenCalledWith(db, {
+      userId: "user-id",
+      cliDeviceIds: ["cli-device-id"],
+    });
+    // The request history is drained first, outside the ordered transaction.
+    expect(prepareParentDeletion).toHaveBeenCalledWith(expect.anything(), {
+      userId: "user-id",
+      cliDeviceIds: ["cli-device-id"],
+    });
     const order = [
+      prepareParentDeletion,
       db.cliDevice.updateMany,
       db.cliDeviceCredential.findMany,
       db.cliToken.updateMany,
+      lockCapacityGraphForDelete,
       db.cliDevice.delete,
     ].map((mock) => mock.mock.invocationCallOrder[0] ?? Number.NaN);
     expect(order).toEqual([...order].sort((a, b) => a - b));
@@ -585,16 +622,27 @@ describe("deleteCliDeviceAndCredentials", () => {
   });
 
   it("is NOT_FOUND for another user's (or a missing) device and deletes nothing", async () => {
-    db.cliDevice.updateMany.mockResolvedValue({ count: 0 });
+    db.cliDevice.findFirst.mockResolvedValue(null);
 
     await expect(
       deleteCliDeviceAndCredentials({ cliDeviceId: "cli-device-id", userId: "intruder", now }),
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(prepareParentDeletion).not.toHaveBeenCalled();
     expect(db.cliToken.updateMany).not.toHaveBeenCalled();
     expect(db.cliDevice.delete).not.toHaveBeenCalled();
   });
 
+  it("is NOT_FOUND when the device disappears after the precheck", async () => {
+    db.cliDevice.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(
+      deleteCliDeviceAndCredentials({ cliDeviceId: "cli-device-id", userId: "user-id", now }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(db.cliDevice.delete).not.toHaveBeenCalled();
+  });
+
   it("refuses to prune a device that heartbeated since staleBefore", async () => {
+    db.cliDevice.findFirst.mockResolvedValue({ lastHeartbeatAt: now });
     db.cliDevice.findUnique.mockResolvedValue({ lastHeartbeatAt: now });
 
     await expect(
@@ -605,6 +653,7 @@ describe("deleteCliDeviceAndCredentials", () => {
         now,
       }),
     ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(prepareParentDeletion).not.toHaveBeenCalled();
     expect(db.cliToken.updateMany).not.toHaveBeenCalled();
     expect(db.cliDevice.delete).not.toHaveBeenCalled();
   });

@@ -5,6 +5,15 @@ enum CliConnectionStatus {
   REVOKED
 }
 
+/// Which MCP commands may run on a CLI device. SUPERVISED: only commands a
+/// person confirms in a supervised terminal (Enter on the CLI-rendered confirm
+/// screen). UNSUPERVISED: headless exec as well (it also permits supervised).
+enum McpCommandMode {
+  OFF
+  SUPERVISED
+  UNSUPERVISED
+}
+
 enum EndpointKind {
   OPENAI_COMPATIBLE
   ANTHROPIC_COMPATIBLE
@@ -294,12 +303,12 @@ model CliDevice {
   endpointTargeting         Boolean               @default(false)
   /// Server grants. Hello must not overwrite these; the dashboard does.
   allowHumanTerminal        Boolean               @default(false)
-  allowMcpCommands          Boolean               @default(false)
+  mcpCommandMode            McpCommandMode        @default(OFF)
   cliVersion                String?
   relayProtocolVersion      String?
   /// Null until a 2.4 hello reports the CLI's own config. False is a report.
   reportedHumanTerminal     Boolean?
-  reportedMcpCommands       Boolean?
+  reportedMcpCommandMode    McpCommandMode?
   reportedTerminalApproval  Boolean?
   reportedTerminalSupported Boolean?
   /// The machine's hostname from the latest hello. Null when not reported.
@@ -793,6 +802,9 @@ model ProviderUsageLedger {
   Reservation                  ProviderBudgetReservation?     @relation(fields: [reservationId], references: [id], onDelete: Restrict, onUpdate: Cascade)
 
   @@unique([attemptId, fencingToken, sourceVersion])
+  // Created by schema-hardening.sql before Prisma knew it; declared here so
+  // `prisma db push` no longer drops it on every deploy.
+  @@unique([attemptId, fencingToken, revisionSequence], map: "provider_usage_ledger_attempt_revision_unique")
   @@index([userId, createdAt])
   @@index([providerAccountId, createdAt])
   @@map("provider_usage_ledger")
@@ -852,6 +864,9 @@ model ProviderBudgetSettlement {
   Reservation                  ProviderBudgetReservation      @relation(fields: [reservationId, userId], references: [id, userId], onDelete: Restrict, onUpdate: Cascade)
 
   @@unique([reservationId, attemptId, fencingToken, sourceVersion])
+  // Created by schema-hardening.sql before Prisma knew it; declared here so
+  // `prisma db push` no longer drops it on every deploy.
+  @@unique([reservationId, attemptId, fencingToken, revisionSequence], map: "provider_budget_settlement_reservation_revision_unique")
   @@index([userId, createdAt])
   @@map("provider_budget_settlement")
 }
@@ -1004,20 +1019,22 @@ model CacheAffinityRecord {
   expiresAt            DateTime
   userId               String
   /// Requester tenant; may differ from userId for an explicitly granted pool.
-  tenantUserId         String?
+  // NOT NULL since cache-affinity v3 (schema-hardening.sql deletes older rows
+  // first). Declared here so `prisma db push` stops dropping the constraint.
+  tenantUserId         String
   poolId               String
   executionTargetId    String
   targetIdentity       String
   digestVersion        Int             @default(4)
   /// Stable execution/security binding, separate from request content and conversation identity.
-  bindingDigest        String?
+  bindingDigest        String
   prefixDigest         String?
   conversationDigest   String?
   prefixDepth          Int
   estimatedTokens      Int?
   engineCacheConfirmed Boolean         @default(false)
   User                 User            @relation("CacheAffinityRecordOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  TenantUser           User?           @relation("CacheAffinityRecordTenant", fields: [tenantUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  TenantUser           User            @relation("CacheAffinityRecordTenant", fields: [tenantUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ModelPool            ModelPool       @relation(fields: [poolId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
   ExecutionTarget      ExecutionTarget @relation(fields: [executionTargetId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
 
@@ -1148,6 +1165,10 @@ model AdmissionRequest {
   @@index([state, heartbeatAt])
   @@index([basePriority, enqueueSequence, id])
   @@index([relayRequestId])
+  // Parent-deletion history drains (packages/db/src/parent-deletion.ts) and
+  // the ON DELETE CASCADE from model_pool / execution_target.
+  @@index([poolId])
+  @@index([directExecutionTargetId])
   @@map("admission_request")
 }
 
@@ -1187,6 +1208,10 @@ model CapacityWaiter {
   @@index([capacityId, state, deadlineAt, candidateOrder])
   @@index([admissionRequestId, state])
   @@index([poolMemberId, state])
+  // Parent-deletion history drains and the ON DELETE CASCADE from
+  // execution_target / model_pool.
+  @@index([executionTargetId])
+  @@index([poolId])
   @@map("capacity_waiter")
 }
 
@@ -1223,6 +1248,10 @@ model CapacityLease {
   @@index([capacityId, state, expiresAt])
   @@index([ownerServerInstance, state, heartbeatAt])
   @@index([poolMemberId, state])
+  // Retained-history preflight of parent deletes (RESTRICT from
+  // execution_target / model_pool).
+  @@index([executionTargetId])
+  @@index([poolId])
   @@map("capacity_lease")
 }
 
@@ -1644,6 +1673,10 @@ model RelayExecutionAttempt {
   @@index([state, expiresAt])
   @@index([ownerEpoch, state])
   @@index([relayRequestId, createdAt])
+  // The user-delete cascade (ON DELETE CASCADE on userId) and the final-phase
+  // residual recount under the capacity locks look attempts up by owner
+  // (DL1-TXBOUND); without this index both scanned the whole table.
+  @@index([userId])
   @@map("relay_execution_attempt")
 }
 

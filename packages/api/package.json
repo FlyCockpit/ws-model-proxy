@@ -14,6 +14,9 @@
     "./lib/mcp-token-access": {
       "default": "./src/lib/mcp-token-access.ts"
     },
+    "./lib/mcp-token-active": {
+      "default": "./src/lib/mcp-token-active.ts"
+    },
     "./lib/model-pool-routing": {
       "default": "./src/lib/model-pool-routing.ts"
     },
@@ -71,6 +74,12 @@
     "./lib/relay-protocol-version": {
       "default": "./src/lib/relay-protocol-version.ts"
     },
+    "./lib/mcp-command-mode": {
+      "default": "./src/lib/mcp-command-mode.ts"
+    },
+    "./lib/supervised-command-types": {
+      "default": "./src/lib/supervised-command-types.ts"
+    },
     "./routers/index": {
       "default": "./src/routers/index.ts"
     }
@@ -78,7 +87,8 @@
   "scripts": {
     "check-types": "tsc -p tsconfig.check-types.json --noEmit",
     "test": "vitest run --passWithNoTests",
-    "test:postgres": "vitest run --maxWorkers=1 --no-file-parallelism src/lib/capacity-policy-races.postgres.integration.test.ts src/routers/forwarder-management.postgres.integration.test.ts src/routers/model-api-tokens.postgres.integration.test.ts src/routers/mcp-tokens.postgres.integration.test.ts src/lib/cli-credential-access.postgres.integration.test.ts src/routers/overview.postgres.integration.test.ts"
+    "test:postgres": "vitest run --maxWorkers=1 --no-file-parallelism src/lib/capacity-policy-races.postgres.integration.test.ts src/lib/capacity-lock-order.postgres.integration.test.ts src/lib/parent-deletion.postgres.integration.test.ts src/lib/deletion-commit-point.postgres.integration.test.ts src/routers/forwarder-management.postgres.integration.test.ts src/routers/model-api-tokens.postgres.integration.test.ts src/routers/mcp-tokens.postgres.integration.test.ts src/lib/cli-credential-access.postgres.integration.test.ts src/routers/overview.postgres.integration.test.ts",
+    "test:postgres:volume": "WMP_PARENT_DELETE_ROWS=1400000 vitest run --maxWorkers=1 --no-file-parallelism src/lib/parent-deletion.postgres.integration.test.ts"
   },
   "dependencies": {
     "@orpc/openapi": "catalog:",

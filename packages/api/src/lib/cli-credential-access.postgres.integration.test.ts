@@ -150,7 +150,7 @@ integration("device-code exchange with real PostgreSQL", () => {
     });
     await prisma.cliDevice.update({
       where: { id: first.cliDeviceId },
-      data: { name: "Work laptop", allowHumanTerminal: true, allowMcpCommands: true },
+      data: { name: "Work laptop", allowHumanTerminal: true, mcpCommandMode: "SUPERVISED" },
     });
 
     const second = await access.mintCliDeviceCredentialFromApprovedDeviceCode({
@@ -163,9 +163,9 @@ integration("device-code exchange with real PostgreSQL", () => {
     expect(
       await prisma.cliDevice.findUniqueOrThrow({
         where: { id: first.cliDeviceId },
-        select: { name: true, allowHumanTerminal: true, allowMcpCommands: true },
+        select: { name: true, allowHumanTerminal: true, mcpCommandMode: true },
       }),
-    ).toEqual({ name: "Work laptop", allowHumanTerminal: true, allowMcpCommands: true });
+    ).toEqual({ name: "Work laptop", allowHumanTerminal: true, mcpCommandMode: "SUPERVISED" });
     const credentials = await prisma.cliDeviceCredential.findMany({
       where: { cliDeviceId: first.cliDeviceId },
       select: { id: true, revokedAt: true },
@@ -302,6 +302,21 @@ integration("device-code exchange with real PostgreSQL", () => {
     expect(await poll(5_000)).toBe("authorization_pending");
     expect(await poll(10_500)).toBe("authorization_pending");
     expect(await prisma.cliDevice.count({ where: { userId: user.id } })).toBe(0);
+  });
+
+  it("refuses an existing device credential after the owner is marked for deletion", async () => {
+    const { prisma, access } = required();
+    const user = await createUser();
+    const minted = await access.mintCliDeviceCredentialFromApprovedDeviceCode({
+      deviceCode: await approvedCode(user.id, "marked-user"),
+      cliSlug: "marked-user",
+    });
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { deletionRequestedAt: new Date(), banned: true },
+    });
+
+    expect(await access.authenticateCliWebsocketSecret(minted.secret)).toBeNull();
   });
 
   it("refuses a slug the approver did not see and keeps the code", async () => {

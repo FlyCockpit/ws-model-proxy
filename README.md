@@ -152,6 +152,8 @@ Optional values include SMTP settings (enables verification, password reset, and
 
 Schema sync is handled by the server container entrypoint with `APPLY_SCHEMA=off|safe|dangerous`; keep it `off` for normal deploys and use `safe` for additive schema deploys.
 
+Schema sync never queues behind live traffic for long. `prisma db push` runs with a 5s `lock_timeout` and is retried as a whole on a lock timeout or deadlock (`packages/db/scripts/push-schema.mjs`). Schema hardening locks every table it touches up front with `NOWAIT` and retries until it gets them all at once, and it is skipped entirely when neither `schema-hardening.sql` nor the database catalog changed since its last apply (`SCHEMA_HARDENING_FORCE=1` re-applies anyway).
+
 CLI operator flow:
 
 1. Deploy the web service and Postgres.

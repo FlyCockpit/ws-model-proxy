@@ -131,4 +131,49 @@ integration("model API token allowlists with real PostgreSQL", () => {
     expect(targets.directModels.map((target) => target.id)).toEqual([model.id]);
     expect(targets.modelPools.map((target) => target.id)).toEqual([pool.id]);
   });
+
+  it("refuses model API token authentication after the owner is marked for deletion", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const suffix = crypto.randomUUID();
+    const user = await modules.prisma.user.create({
+      data: {
+        name: "Marked token owner",
+        email: `marked-token-${suffix}@example.test`,
+        slug: `marked-token-${suffix}`,
+      },
+    });
+    const session = {
+      user,
+      session: {
+        id: `session-${suffix}`,
+        userId: user.id,
+        token: `token-${suffix}`,
+        expiresAt: new Date(Date.now() + 60_000),
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        ipAddress: "127.0.0.1",
+        userAgent: "integration",
+      },
+    } as Session;
+    const handler = new RPCHandler(modules.router.modelApiTokensRouter);
+    const link = new RPCLink({
+      url: "http://integration.test/rpc",
+      fetch: async (request, init) => {
+        const result = await handler.handle(new Request(request, init), {
+          prefix: "/rpc",
+          context: { session } satisfies Context,
+        });
+        return result.matched ? result.response : new Response(null, { status: 404 });
+      },
+    });
+    const client = createORPCClient(link) as ReturnType<
+      typeof createRouterClient<typeof modules.router.modelApiTokensRouter>
+    >;
+    const created = await client.create({ name: "token", scopeMode: "ALL_VISIBLE" });
+    await modules.prisma.user.update({
+      where: { id: user.id },
+      data: { deletionRequestedAt: new Date(), banned: true },
+    });
+    expect(await modules.access.authenticateModelApiTokenSecret(created.secret)).toBeNull();
+  });
 });

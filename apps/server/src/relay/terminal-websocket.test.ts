@@ -1,5 +1,8 @@
+import type { WebSocketLike } from "@hono/node-server";
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
+import type { Session } from "@ws-model-proxy/auth";
 import { Hono } from "hono";
+import { WSContext } from "hono/ws";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -54,14 +57,16 @@ vi.mock("../rate-limit.js", () => ({
 
 const { default: prisma } = await import("@ws-model-proxy/db");
 const { relaySessionManager } = await import("./session-manager.js");
-const { createTerminalWebsocketMiddleware, terminalBrowserHub } = await import(
-  "./terminal-websocket.js"
-);
+const {
+  admitBrowserConnection,
+  createTerminalWebsocketMiddleware,
+  terminalBrowserHub,
+  terminalSocketEvents,
+} = await import("./terminal-websocket.js");
 const { settleSocketHandler } = await import("./socket-handler.js");
 
 const db = prisma as unknown as {
   $transaction: MockInstance;
-  user: { findUnique: MockInstance };
   cliDevice: {
     upsert: MockInstance;
     update: MockInstance;
@@ -80,6 +85,7 @@ const db = prisma as unknown as {
   executionTarget: { findMany: MockInstance; upsert: MockInstance };
   inferenceCapacity: { findMany: MockInstance; updateMany: MockInstance };
   session: { findUnique: MockInstance };
+  user: { findUnique: MockInstance };
 };
 
 const identity: CliWebsocketIdentity = {
@@ -127,6 +133,7 @@ function nonce(): string {
 
 type CliFeatures = {
   humanTerminal?: boolean;
+  mcpCommandMode?: "off" | "supervised" | "unsupervised";
   terminalSupported?: boolean;
   terminalApproval?: boolean;
 };
@@ -155,16 +162,18 @@ function hello(slug: string, protocol: "2.5" | "2.4" | "2.1", features?: CliFeat
       endpoints: [],
     });
   }
+  // Every accepted CLI speaks 2.6; the 2.4 / 2.5 labels only pick whether it
+  // carries an identity proof.
   return JSON.stringify({
     type: "hello",
     id: `hello-${slug}`,
-    protocolVersion: protocol,
+    protocolVersion: "2.6",
     cli: {
       slug,
       hostname: `${slug}.local`,
       version: "9.9.9",
       capabilities: {
-        protocolVersion: protocol,
+        protocolVersion: "2.6",
         inventoryAck: true,
         inventoryReplace: true,
         endpointTargeting: true,
@@ -179,12 +188,14 @@ function hello(slug: string, protocol: "2.5" | "2.4" | "2.1", features?: CliFeat
         exec: true,
         features: {
           humanTerminal: features?.humanTerminal ?? true,
-          mcpCommands: false,
+          mcpCommandMode: features?.mcpCommandMode ?? "off",
           terminalApproval: features?.terminalApproval ?? false,
           terminalSupported: features?.terminalSupported ?? true,
         },
         terminalPublicKey: uncompressedKey(),
-        ...(protocol === "2.5" ? { terminalViewers: true, terminalIdentity: cliIdentity() } : {}),
+        terminalViewers: true,
+        supervisedCommands: true,
+        ...(protocol === "2.5" ? { terminalIdentity: cliIdentity() } : {}),
       },
     },
     endpoints: [],
@@ -209,7 +220,7 @@ function device(id: string, overrides: Record<string, unknown> = {}) {
     allowHumanTerminal: true,
     reportedHumanTerminal: true,
     reportedTerminalSupported: true,
-    relayProtocolVersion: "2.4",
+    relayProtocolVersion: "2.6",
     ...overrides,
   };
 }
@@ -364,6 +375,10 @@ describe("terminal websocket admission", () => {
 describe("terminal browser hub", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // `clearAllMocks` keeps queued `...Once` values; a test that stops early
+    // must not leak its admission reads into the next one.
+    db.user.findUnique.mockReset();
+    db.session.findUnique.mockReset();
     db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
       callback(db),
     );
@@ -380,7 +395,7 @@ describe("terminal browser hub", () => {
       userId: "user-id",
       slug: args.create.slug,
       allowHumanTerminal: true,
-      allowMcpCommands: false,
+      mcpCommandMode: "OFF",
       inventorySeq: 0,
       inventoryDigest: null,
       inventoryAcknowledgedAt: null,
@@ -519,7 +534,12 @@ describe("terminal browser hub", () => {
     const terminalId = opened?.terminalId as string;
     await relaySessionManager.handleTextFrame(
       cli,
-      JSON.stringify({ type: "term.opened", terminalId, cliNonce: nonce() }),
+      JSON.stringify({
+        type: "term.opened",
+        terminalId,
+        viewerId: opened?.viewerId,
+        cliNonce: nonce(),
+      }),
     );
     expect(browser.jsonSends().some((message) => message.type === "opened")).toBe(true);
     db.cliDevice.findMany.mockResolvedValue([device("one")]);
@@ -541,7 +561,7 @@ describe("terminal browser hub", () => {
     await relaySessionManager.handleBinaryFrame(
       cli,
       encodeRelayBinaryFrame(
-        { type: "term.sealed", terminalId, seq: 1 },
+        { type: "term.sealed", terminalId, seq: 1, epoch: 1 },
         new Uint8Array([1, 2, 3]),
       ),
     );
@@ -575,15 +595,18 @@ describe("terminal browser hub", () => {
     const browser = attachBrowser();
     await open(browser, "one");
     await open(browser, "one");
-    const terminalIds = cli
-      .jsonSends()
-      .filter((message) => message.type === "term.open")
-      .map((message) => message.terminalId as string);
+    const opens = cli.jsonSends().filter((message) => message.type === "term.open");
+    const terminalIds = opens.map((message) => message.terminalId as string);
     expect(terminalIds).toHaveLength(2);
-    for (const terminalId of terminalIds) {
+    for (const open of opens) {
       await relaySessionManager.handleTextFrame(
         cli,
-        JSON.stringify({ type: "term.opened", terminalId, cliNonce: nonce() }),
+        JSON.stringify({
+          type: "term.opened",
+          terminalId: open.terminalId,
+          viewerId: open.viewerId,
+          cliNonce: nonce(),
+        }),
       );
     }
     const [first, second] = terminalIds as [string, string];
@@ -603,6 +626,314 @@ describe("terminal browser hub", () => {
 
     terminalBrowserHub.handleBinary(browser, sealed(second, 1));
     expect(binarySends()).toBe(301);
+  });
+
+  it("closes browser sockets at the deletion mark and ignores later frames", async () => {
+    const cli = await connectCli("one");
+    const browser = attachBrowser();
+    await open(browser, "one");
+    expect(cli.jsonSends().some((message) => message.type === "term.open")).toBe(true);
+    const sendsBefore = browser.sends.length;
+
+    terminalBrowserHub.revokeTerminalAccessForUser("user-id");
+    expect(browser.closes).toEqual([{ code: 4401, reason: "user_deletion_pending" }]);
+
+    await terminalBrowserHub.handleText(browser, JSON.stringify({ type: "list" }));
+    await terminalBrowserHub.handleText(
+      browser,
+      JSON.stringify({
+        type: "open",
+        cliDeviceId: "one",
+        cols: 80,
+        rows: 24,
+        publicKey: uncompressedKey(),
+        nonce: nonce(),
+      }),
+    );
+    expect(browser.sends).toHaveLength(sendsBefore);
+    expect(cli.jsonSends().filter((message) => message.type === "term.open")).toHaveLength(1);
+  });
+
+  /** The admission read's row: a live session of `user-id`, owner flags as given. */
+  function admissionRow(user: Record<string, unknown> = {}) {
+    return {
+      userId: "user-id",
+      expiresAt: new Date(Date.now() + 60_000),
+      user: { deletionRequestedAt: null, banned: null, banExpires: null, ...user },
+    };
+  }
+
+  /** Queues one admission read that resolves (or rejects) when the test says. */
+  function deferredAdmissionRead() {
+    let resolve: (row: unknown) => void = () => undefined;
+    let reject: (error: unknown) => void = () => undefined;
+    db.session.findUnique.mockReturnValueOnce(
+      new Promise((resolveRead, rejectRead) => {
+        resolve = resolveRead;
+        reject = rejectRead;
+      }),
+    );
+    return { resolve: (row: unknown) => resolve(row), reject: (error: unknown) => reject(error) };
+  }
+
+  function registered(socket: FakeSocket): boolean {
+    return (terminalBrowserHub as unknown as { bySocket: Map<unknown, unknown> }).bySocket.has(
+      socket,
+    );
+  }
+
+  it("refuses hub registration when the handshake straddles a deletion mark", async () => {
+    const browser = new FakeSocket();
+    db.session.findUnique.mockResolvedValueOnce(
+      admissionRow({ deletionRequestedAt: new Date(), banned: true }),
+    );
+    await admitBrowserConnection({
+      socket: browser,
+      userId: "user-id",
+      sessionId: "session-id",
+    });
+    expect(browser.closes).toEqual([{ code: 4401, reason: "user_deletion_pending" }]);
+    expect(registered(browser)).toBe(false);
+    await terminalBrowserHub.handleText(browser, JSON.stringify({ type: "list" }));
+    expect(browser.sends).toHaveLength(0);
+  });
+
+  it("closes a pending socket when the mark listener runs during its admission read (probe r1)", async () => {
+    const browser = new FakeSocket();
+    // An earlier mark was handled and then abandoned: nothing of it remains.
+    terminalBrowserHub.revokeTerminalAccessForUser("user-id");
+    const read = deferredAdmissionRead();
+    const admission = admitBrowserConnection({
+      socket: browser,
+      userId: "user-id",
+      sessionId: "session-id",
+    });
+    // The socket is registered (pending) before the read resolves.
+    expect(registered(browser)).toBe(true);
+    // A new mark commits after the read's snapshot and its listener runs now.
+    terminalBrowserHub.revokeTerminalAccessForUser("user-id");
+    expect(browser.closes).toEqual([{ code: 4401, reason: "user_deletion_pending" }]);
+    // The stale snapshot shows no marker.
+    read.resolve(admissionRow());
+    await admission;
+    expect(browser.closes).toHaveLength(1);
+    expect(registered(browser)).toBe(false);
+    db.cliDevice.findMany.mockResolvedValue([device("one")]);
+    await terminalBrowserHub.handleText(browser, JSON.stringify({ type: "list" }));
+    expect(browser.sends).toHaveLength(0);
+  });
+
+  it("admits after an abandoned mark: no revocation state outlives the listener", async () => {
+    terminalBrowserHub.revokeTerminalAccessForUser("user-id");
+    const browser = new FakeSocket();
+    db.session.findUnique.mockResolvedValueOnce(admissionRow());
+    await admitBrowserConnection({ socket: browser, userId: "user-id", sessionId: "session-id" });
+    expect(browser.closes).toEqual([]);
+    db.cliDevice.findMany.mockResolvedValue([device("one")]);
+    await terminalBrowserHub.handleText(browser, JSON.stringify({ type: "list" }));
+    expect(browser.jsonSends()).toEqual([expect.objectContaining({ type: "terminals" })]);
+  });
+
+  it("fails closed when the session or its user is gone (probe r1b)", async () => {
+    // The delete committed: the session cascaded with the user row.
+    terminalBrowserHub.revokeTerminalAccessForUser("user-id");
+    const gone = new FakeSocket();
+    db.session.findUnique.mockResolvedValueOnce(null);
+    await admitBrowserConnection({ socket: gone, userId: "user-id", sessionId: "session-id" });
+    expect(gone.closes).toEqual([{ code: 4401, reason: "session_expired" }]);
+    expect(registered(gone)).toBe(false);
+    db.cliDevice.findMany.mockResolvedValue([device("one")]);
+    await terminalBrowserHub.handleText(gone, JSON.stringify({ type: "list" }));
+    expect(gone.sends).toHaveLength(0);
+
+    const banned = new FakeSocket();
+    db.session.findUnique.mockResolvedValueOnce(admissionRow({ banned: true }));
+    await admitBrowserConnection({ socket: banned, userId: "user-id", sessionId: "session-id" });
+    expect(banned.closes).toEqual([{ code: 4401, reason: "user_deletion_pending" }]);
+
+    const foreign = new FakeSocket();
+    db.session.findUnique.mockResolvedValueOnce({ ...admissionRow(), userId: "someone-else" });
+    await admitBrowserConnection({ socket: foreign, userId: "user-id", sessionId: "session-id" });
+    expect(foreign.closes).toEqual([{ code: 4401, reason: "session_expired" }]);
+  });
+
+  it("answers a list sent while admission is pending, after admission (ADMIT-WINDOW)", async () => {
+    const browser = new FakeSocket();
+    const read = deferredAdmissionRead();
+    const admission = admitBrowserConnection({
+      socket: browser,
+      userId: "user-id",
+      sessionId: "session-id",
+    });
+    db.cliDevice.findMany.mockResolvedValue([device("one")]);
+    const listed = terminalBrowserHub.handleText(
+      browser,
+      JSON.stringify({ type: "list", requestId: "on-open" }),
+    );
+    // Nothing runs, and nothing is pushed, before admission.
+    terminalBrowserHub.onTerminalEvent({ type: "list_changed", userId: "user-id" });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(browser.sends).toHaveLength(0);
+    read.resolve(admissionRow());
+    await admission;
+    await listed;
+    expect(browser.jsonSends()).toEqual([
+      expect.objectContaining({ type: "terminals", requestId: "on-open" }),
+    ]);
+    expect(browser.closes).toEqual([]);
+  });
+
+  it("closes the socket when the admission read fails, and answers no queued frame", async () => {
+    const browser = new FakeSocket();
+    const read = deferredAdmissionRead();
+    const admission = admitBrowserConnection({
+      socket: browser,
+      userId: "user-id",
+      sessionId: "session-id",
+    });
+    const listed = terminalBrowserHub.handleText(browser, JSON.stringify({ type: "list" }));
+    read.reject(new Error("db down"));
+    await expect(admission).rejects.toThrow("db down");
+    await listed;
+    expect(browser.closes).toEqual([{ code: 1011, reason: "admission_failed" }]);
+    expect(registered(browser)).toBe(false);
+    expect(browser.sends).toHaveLength(0);
+  });
+
+  it("never registers a socket that closed during its admission read", async () => {
+    const dead = new FakeSocket();
+    const read = deferredAdmissionRead();
+    const admission = admitBrowserConnection({ socket: dead, userId: "user-id", sessionId: "s" });
+    dead.readyState = 3;
+    terminalBrowserHub.handleClose(dead);
+    read.resolve(admissionRow());
+    await admission;
+    expect(registered(dead)).toBe(false);
+
+    // Closed without a close event reaching the hub yet: still not admitted.
+    const silent = new FakeSocket();
+    const silentRead = deferredAdmissionRead();
+    const silentAdmission = admitBrowserConnection({
+      socket: silent,
+      userId: "user-id",
+      sessionId: "s",
+    });
+    silent.readyState = 3;
+    silentRead.resolve(admissionRow());
+    await silentAdmission;
+    expect(registered(silent)).toBe(false);
+  });
+
+  it("refuses terminal input on a pending socket with 1008, never silently", async () => {
+    const browser = new FakeSocket();
+    const read = deferredAdmissionRead();
+    const admission = admitBrowserConnection({
+      socket: browser,
+      userId: "user-id",
+      sessionId: "session-id",
+    });
+    terminalBrowserHub.handleBinary(
+      browser,
+      encodeRelayBinaryFrame(
+        { type: "term.sealed", terminalId: Buffer.alloc(16, 1).toString("base64url"), seq: 1 },
+        new Uint8Array([1]),
+      ),
+    );
+    expect(browser.closes).toEqual([{ code: 1008, reason: "not_admitted" }]);
+    read.resolve(admissionRow());
+    await admission;
+    expect(registered(browser)).toBe(false);
+  });
+
+  it("closes pending and admitted sockets an admin impersonates through at the admin's mark (IMP-MARK)", async () => {
+    const admitted = new FakeSocket();
+    terminalBrowserHub.accept({
+      socket: admitted,
+      userId: "user-id",
+      sessionId: "impersonation",
+      impersonatedBy: "admin-id",
+    });
+    const pending = new FakeSocket();
+    const read = deferredAdmissionRead();
+    const admission = admitBrowserConnection({
+      socket: pending,
+      userId: "user-id",
+      sessionId: "impersonation-2",
+      impersonatedBy: "admin-id",
+    });
+    const own = attachBrowser();
+
+    terminalBrowserHub.revokeTerminalAccessForUser("admin-id");
+    expect(admitted.closes).toEqual([{ code: 4401, reason: "user_deletion_pending" }]);
+    expect(pending.closes).toEqual([{ code: 4401, reason: "user_deletion_pending" }]);
+    // The impersonated user's own session is not the admin's.
+    expect(own.closes).toEqual([]);
+    read.resolve(admissionRow());
+    await admission;
+    expect(registered(pending)).toBe(false);
+    expect(registered(admitted)).toBe(false);
+    expect(registered(own)).toBe(true);
+  });
+
+  it("the upgrade's onOpen registers synchronously and admits through the admission read", async () => {
+    const socket = new FakeSocket();
+    const ws = new WSContext<WebSocketLike>({
+      get readyState() {
+        return socket.readyState as 0 | 1 | 2 | 3;
+      },
+      send: (data) => socket.send(data as string | ArrayBuffer),
+      close: (code, reason) => socket.close(code, reason),
+    });
+    const events = terminalSocketEvents({
+      user: { id: "user-id" },
+      session: { id: "session-id", impersonatedBy: "admin-id" },
+    } as unknown as Session);
+    const read = deferredAdmissionRead();
+    events.onOpen?.(new Event("open"), ws);
+    // Registered before the read resolved: the admin's mark closes it.
+    expect(db.session.findUnique).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "session-id" } }),
+    );
+    db.cliDevice.findMany.mockResolvedValue([device("one")]);
+    events.onMessage?.(new MessageEvent("message", { data: '{"type":"list"}' }), ws);
+    terminalBrowserHub.revokeTerminalAccessForUser("admin-id");
+    expect(socket.closes).toEqual([{ code: 4401, reason: "user_deletion_pending" }]);
+    read.resolve(admissionRow());
+    await vi.waitFor(() => expect(db.session.findUnique).toHaveBeenCalledTimes(1));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(socket.sends).toHaveLength(0);
+
+    // The ordinary path: onOpen, then a list answered after admission.
+    const next = new FakeSocket();
+    const nextWs = new WSContext<WebSocketLike>({
+      get readyState() {
+        return next.readyState as 0 | 1 | 2 | 3;
+      },
+      send: (data) => next.send(data as string | ArrayBuffer),
+      close: (code, reason) => next.close(code, reason),
+    });
+    const nextEvents = terminalSocketEvents({
+      user: { id: "user-id" },
+      session: { id: "session-id" },
+    } as unknown as Session);
+    db.session.findUnique.mockResolvedValueOnce(admissionRow());
+    nextEvents.onOpen?.(new Event("open"), nextWs);
+    nextEvents.onMessage?.(new MessageEvent("message", { data: '{"type":"list"}' }), nextWs);
+    await vi.waitFor(() =>
+      expect(next.jsonSends()).toEqual([expect.objectContaining({ type: "terminals" })]),
+    );
+    nextEvents.onClose?.(new Event("close") as CloseEvent, nextWs);
+  });
+
+  it("closes a marked owner on the session recheck belt", async () => {
+    const browser = attachBrowser();
+    db.session.findUnique.mockResolvedValueOnce({
+      ...admissionRow({ deletionRequestedAt: new Date(), twoFactorEnabled: true }),
+      expiresAt: new Date(Date.now() + 60_000),
+    });
+    await terminalBrowserHub.recheckSessions(Date.now());
+    expect(browser.closes).toEqual([{ code: 4401, reason: "user_deletion_pending" }]);
   });
 
   it("closes with 4401 when the browser session is gone or expired", async () => {
@@ -705,13 +1036,93 @@ describe("terminal browser hub", () => {
     expect(cli.jsonSends().some((message) => message.type === "term.close")).toBe(false);
   });
 
+  it("confirms End session to the closing socket with `closed`, naming its request", async () => {
+    const cli = await connectCli("one");
+    const owner = attachBrowser();
+    await open(owner, "one");
+    const terminalId = cli.jsonSends().find((message) => message.type === "term.open")
+      ?.terminalId as string;
+    const closer = attachBrowser();
+    await terminalBrowserHub.handleText(
+      closer,
+      JSON.stringify({ type: "close", terminalId, requestId: "close_1" }),
+    );
+    expect(cli.jsonSends().filter((message) => message.type === "term.close")).toEqual([
+      { type: "term.close", terminalId },
+    ]);
+    expect(closer.jsonSends().at(-1)).toEqual({ type: "closed", terminalId, requestId: "close_1" });
+    // A second close finds nothing: the terminal is gone from the relay at once.
+    await terminalBrowserHub.handleText(
+      closer,
+      JSON.stringify({ type: "close", terminalId, requestId: "close_2" }),
+    );
+    expect(closer.jsonSends().at(-1)).toMatchObject({
+      type: "error",
+      code: "not_found",
+      requestId: "close_2",
+    });
+    await terminalBrowserHub.handleText(closer, JSON.stringify({ type: "list", requestId: "l_1" }));
+    expect(closer.jsonSends().at(-1)).toMatchObject({
+      type: "terminals",
+      requestId: "l_1",
+      terminals: [],
+    });
+  });
+
+  it("names the request in every direct refusal of an open, attach and auth", async () => {
+    const browser = attachBrowser();
+    const ghost = Buffer.alloc(16, 1).toString("base64url");
+    const offline = attachBrowser();
+    const frames = [
+      {
+        type: "open",
+        requestId: "open_missing",
+        cliDeviceId: "missing",
+        cols: 80,
+        rows: 24,
+        publicKey: uncompressedKey(),
+        nonce: nonce(),
+      },
+      {
+        type: "attach",
+        requestId: "attach_1",
+        terminalId: ghost,
+        publicKey: uncompressedKey(),
+        nonce: nonce(),
+      },
+      { type: "auth", requestId: "auth_1", terminalId: ghost, signature: "abcd" },
+      { type: "detach", requestId: "detach_1", terminalId: ghost },
+    ];
+    for (const frame of frames) {
+      await terminalBrowserHub.handleText(browser, JSON.stringify(frame));
+    }
+    const errors = browser.jsonSends().filter((message) => message.type === "error");
+    expect(errors.map((error) => ({ code: error.code, requestId: error.requestId }))).toEqual(
+      frames.map((frame) => ({ code: "not_found", requestId: frame.requestId })),
+    );
+    // The open's refusal also names the terminal id its `opening` announced.
+    const opening = browser.jsonSends().find((message) => message.type === "opening");
+    expect(opening).toMatchObject({ requestId: "open_missing" });
+    expect(errors[0]?.terminalId).toBe(opening?.terminalId);
+    // An open to a known CLI that is not connected: `offline`, with the request.
+    await terminalBrowserHub.handleText(
+      offline,
+      JSON.stringify({ ...frames[0], requestId: "open_offline", cliDeviceId: "one" }),
+    );
+    expect(offline.jsonSends().at(-1)).toMatchObject({
+      type: "error",
+      code: "offline",
+      requestId: "open_offline",
+    });
+  });
+
   it("clears the viewer on an opening terminal when the browser socket closes", async () => {
     const cli = await connectCli("one");
     const browser = attachBrowser();
     await open(browser, "one");
-    expect(relaySessionManager.listTerminalsForUser("user-id")).toEqual([
-      expect.objectContaining({ viewerAttached: true }),
-    ]);
+    // The opener waits for term.opened as a pending viewer.
+    const termOpen = cli.jsonSends().find((message) => message.type === "term.open");
+    expect(termOpen?.viewerId).toEqual(expect.any(String));
     terminalBrowserHub.handleClose(browser);
     expect(cli.jsonSends().some((message) => message.type === "term.detach")).toBe(true);
     expect(relaySessionManager.listTerminalsForUser("user-id")).toEqual([
@@ -1136,40 +1547,5 @@ describe("terminal browser hub", () => {
       expect(a.jsonSends().some((message) => message.code === "input_dropped")).toBe(false);
       expect(c.jsonSends().filter((message) => message.code === "input_dropped")).toHaveLength(1);
     });
-  });
-
-  it("keeps the 2.4 steal: a second tab takes the terminal and the first hears detached", async () => {
-    const cli = await connectCli("one");
-    const a = attachBrowser();
-    await open(a, "one");
-    const termOpen = cli.jsonSends().find((message) => message.type === "term.open");
-    expect(termOpen).not.toHaveProperty("viewerId");
-    const terminalId = termOpen?.terminalId as string;
-    await relaySessionManager.handleTextFrame(
-      cli,
-      JSON.stringify({ type: "term.opened", terminalId, cliNonce: nonce() }),
-    );
-    const b = attachBrowser();
-    await terminalBrowserHub.handleText(
-      b,
-      JSON.stringify({ type: "attach", terminalId, publicKey: uncompressedKey(), nonce: nonce() }),
-    );
-    expect(a.jsonSends().at(-1)).toEqual({ type: "detached", terminalId });
-    expect(cli.jsonSends().at(-1)).not.toHaveProperty("viewerId");
-    expect(b.jsonSends().at(-1)).toMatchObject({ type: "attaching", terminalId });
-    expect([...a.jsonSends(), ...b.jsonSends()].some((m) => m.type === "viewers")).toBe(false);
-    db.cliDevice.findMany.mockResolvedValue([device("one")]);
-    await terminalBrowserHub.handleText(b, JSON.stringify({ type: "list" }));
-    const listed = b.jsonSends().find((message) => message.type === "terminals");
-    expect(listed?.clis).toEqual([
-      expect.objectContaining({
-        terminalViewers: false,
-        identityPublicKey: null,
-        identitySignature: null,
-      }),
-    ]);
-    expect(listed?.terminals).toEqual([
-      expect.objectContaining({ viewerCount: 1, attachedHere: true, writerHere: true }),
-    ]);
   });
 });

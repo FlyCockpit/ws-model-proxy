@@ -1,3 +1,4 @@
+import { TERMINAL_BROWSER_JSON_WINDOW_MS } from "@ws-model-proxy/config/terminal-socket-policy";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useLatestRef } from "@/hooks/use-latest-ref";
 import {
@@ -12,6 +13,7 @@ import {
   deriveTerminalSessionKeysV2,
   encodeTerminalData,
   encodeTerminalResize,
+  encodeTerminalReviewToggle,
   generateEphemeralHandshake,
   importEcdhPublicRaw,
   importTerminalOutputKey,
@@ -23,7 +25,12 @@ import {
   type TerminalPlaintextV2,
   useTerminalIdentity,
 } from "@/hooks/use-terminal-crypto";
-import { type TerminalSocketStatus, useTerminalSocket } from "@/hooks/use-terminal-socket";
+import {
+  sendTaken,
+  type TerminalSendResult,
+  type TerminalSocketStatus,
+  useTerminalSocket,
+} from "@/hooks/use-terminal-socket";
 import {
   type ChangedCliTrust,
   type CliPinStore,
@@ -42,7 +49,9 @@ import {
   encodeSealedFrame,
   type ListedCli,
   type SealedTerminalFrame,
+  type SupervisedInfo,
   type TerminalClientMessage,
+  type TerminalOrigin,
   type TerminalServerMessage,
   type TerminalWriterLabel,
 } from "@/lib/terminal-protocol";
@@ -89,6 +98,12 @@ type InputBatch = {
   timer: ReturnType<typeof setTimeout> | null;
 };
 
+/** The output capture a supervised command left for review, as the CLI sent it. */
+export type ReviewCapture = { head: Uint8Array; tail: Uint8Array; totalBytes: number };
+
+/** Supervised statuses in which the command can still take keystrokes. */
+const SUPERVISED_INPUT_STATUSES: ReadonlySet<string> = new Set(["awaiting_user", "running"]);
+
 export type TerminalTab = {
   localId: string;
   terminalId: string | null;
@@ -96,7 +111,22 @@ export type TerminalTab = {
   /** This tab's own fitted size. */
   cols: number;
   rows: number;
-  phase: "opening" | "live" | "rejected" | "exited";
+  /**
+   * `waiting`: an agent request this page lists but does not view. It
+   * attaches only when the user selects it.
+   */
+  phase: "waiting" | "opening" | "live" | "rejected" | "exited";
+  /** `agent`: a supervised command an MCP agent requested. */
+  origin: TerminalOrigin;
+  /** Request details from the relay's list (agent terminals only). */
+  supervised: SupervisedInfo | null;
+  /** The CLI-reported output review flag; null until the CLI reports it. */
+  reviewOutput: boolean | null;
+  /** The capture awaiting this person's review, once the CLI sent it. */
+  reviewCapture: ReviewCapture | null;
+  /** How the terminal's process ended, from the relay's exit message. */
+  exitCode: number | null;
+  exitSignal: string | null;
   approvalCode: string | null;
   rejectionReason: string | null;
   error: string | null;
@@ -110,6 +140,36 @@ export type TerminalTab = {
   ptyRows: number | null;
   /** This tab asked the CLI to spawn the terminal and it has not gone live yet. */
   opener: boolean;
+  /**
+   * Agent requests, this tab's Decline:
+   * - `unsent`: pressed, but no open socket took it, or the socket closed
+   *   before the relay answered (the relay forgets a closed socket's
+   *   Decline). It is sent again once a list on a new socket still shows the
+   *   request waiting; a list showing it started makes it `started`; a list
+   *   without it ends the tab. Pressing Decline again also retries.
+   * - `sent`: the socket took it (it may still wait in the socket's rate
+   *   budget); the answer is the exit (declined), `started`, or an error
+   *   naming this Decline's request id. Only an answer naming that id (or
+   *   the terminal's exit or `started`) moves it; the socket closing makes it
+   *   `unsent`.
+   * - `started`: an Enter came first, so the command started anyway. A
+   *   Decline never ends a command that started.
+   * - `failed`: the relay refused this Decline (for example the CLI is
+   *   offline, or too many messages). Nothing is pending; Decline can be
+   *   pressed again.
+   */
+  decline: "unsent" | "sent" | "started" | "failed" | null;
+  /**
+   * End session on this tab:
+   * - `pending`: pressed, and the relay has not yet said the terminal ended
+   *   (its `closed` answer, the exit, or a list without it). The close is
+   *   sent again on the next socket if this one closes first. The tab stays
+   *   until then, so it never looks ended while the shell still runs.
+   * - `failed`: the relay refused the close for a reason a retry on its own
+   *   would not fix. The terminal may still run; End session can be pressed
+   *   again.
+   */
+  ending: "pending" | "failed" | null;
 };
 
 /** Output for a pane, in CLI order: bytes, and PTY size changes. */
@@ -165,6 +225,26 @@ type LiveSession = {
   future: SealedTerminalFrame[];
 };
 
+/**
+ * A terminal this page asked the relay to end, until the relay says it did.
+ * Owned here, not by the socket: a queued `close` dies with its socket, so the
+ * intent outlives it and is sent again on the next one.
+ */
+type CloseIntent = {
+  /** Request id of the close out on the current socket; null: none is out. */
+  requestId: string | null;
+  /** The tab showing `ending`, or null when no tab waits for it. */
+  localId: string | null;
+  /**
+   * `listSeqRef` when this page learned of the terminal (or, if unknown, when
+   * the intent began). A list requested after it that omits the terminal
+   * proves the terminal is gone.
+   */
+  since: number;
+  /** Sends it again after the socket's queue was full or the relay was busy. */
+  retry: ReturnType<typeof setTimeout> | null;
+};
+
 type Deferred = { promise: Promise<void>; resolve: () => void };
 
 function deferred(): Deferred {
@@ -207,10 +287,19 @@ function newTab(input: {
   multiViewer: boolean;
   opener: boolean;
   viewerCount: number;
+  origin?: TerminalOrigin;
+  supervised?: SupervisedInfo | null;
 }): TerminalTab {
+  const origin = input.origin ?? "user";
   return {
     ...input,
-    phase: "opening",
+    origin,
+    supervised: input.supervised ?? null,
+    reviewOutput: null,
+    reviewCapture: null,
+    exitCode: null,
+    exitSignal: null,
+    phase: origin === "agent" ? "waiting" : "opening",
     approvalCode: null,
     rejectionReason: null,
     error: null,
@@ -219,6 +308,8 @@ function newTab(input: {
     writer: input.opener || !input.multiViewer ? "you" : "none",
     ptyCols: null,
     ptyRows: null,
+    decline: null,
+    ending: null,
   };
 }
 
@@ -257,6 +348,11 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   detachTab: (localId: string) => void;
   /** End session: close the shell for everyone. */
   endSession: (localId: string) => void;
+  /**
+   * Decline an agent request. Not a kill: the CLI declines it unless an
+   * Enter came first, and the tab stays to show which happened.
+   */
+  declineRequest: (localId: string) => void;
   subscribeOutput: (
     localId: string,
     listener: (event: TerminalOutputEvent) => void,
@@ -264,6 +360,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   ) => () => void;
   sendInput: (localId: string, data: string) => void;
   sendResize: (localId: string, cols: number, rows: number) => void;
+  /** Ask the CLI to withhold (or release) a supervised command's output for review. */
+  setReviewOutput: (localId: string, on: boolean) => void;
+  /** Forget a capture once its review was submitted (or another viewer's was). */
+  clearReviewCapture: (localId: string) => void;
 } {
   const identity = useTerminalIdentity();
   const pinStore = options.pinStore ?? indexedDbCliPinStore;
@@ -299,8 +399,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const resettersRef = useRef(new Map<string, () => void>());
   const buffersRef = useRef(new Map<string, TerminalOutputEvent[]>());
   const pendingResizeRef = useRef(new Map<string, TerminalSize>());
-  const sendRef = useRef<(message: TerminalClientMessage) => void>(() => undefined);
+  const sendRef = useRef<(message: TerminalClientMessage) => TerminalSendResult>(() => "closed");
   const frameRef = useRef<(frame: ArrayBuffer) => void>(() => undefined);
+  /** `failOpening`, for the handshake code defined before it. */
+  const failOpeningRef = useRef<(localId: string, reason: string) => void>(() => undefined);
   const signRef = useRef(identity.sign);
   const publicKeyRef = useRef(identity.publicKey);
   const readyRef = useRef(identity.ready);
@@ -322,7 +424,15 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const generationRef = useRef(0);
   /** Tabs whose handshake waits for the browser identity to load. */
   const awaitingIdentityRef = useRef(new Set<string>());
-  const inflightOpensRef = useRef<string[]>([]);
+  /** `open` frames not yet answered by `opening`, in the order sent. */
+  const inflightOpensRef = useRef<{ localId: string; requestId: string }[]>([]);
+  /** localId -> request id of the Decline this tab has out (state `sent`). */
+  const declineRequestsRef = useRef(new Map<string, string>());
+  /**
+   * terminalId -> an End session (or an internal close of a shell no tab
+   * shows) the relay has not confirmed. See `CloseIntent`.
+   */
+  const closesRef = useRef(new Map<string, CloseIntent>());
   /**
    * Opens closed locally while their `open` still waits for `opening`. The ack
    * names the terminal the relay made, so it is closed as soon as it arrives.
@@ -359,6 +469,17 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
    * one the relay registered later may be missing from it.
    */
   const knownSinceRef = useRef(new Map<string, number>());
+  /**
+   * Agent tabs the user chose to view. Only these attach again after a
+   * reconnect; other agent requests stay listed but unattached.
+   */
+  const userAttachedRef = useRef(new Set<string>());
+  /**
+   * Agent tabs that have delivered output to their pane since they attached.
+   * Keystrokes before that are dropped, so nothing typed before the confirm
+   * screen was shown can reach the CLI.
+   */
+  const outputSeenRef = useRef(new Set<string>());
 
   const viewOf = useCallback((localId: string): TerminalWriterState => {
     return viewRef.current.get(localId) ?? { multiViewer: false, writer: "you" };
@@ -399,6 +520,151 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     listRequestsRef.current.push(listSeqRef.current);
   }, []);
 
+  /** Ask for a fresh list on the current socket (no-op while it is closed). */
+  const requestList = useCallback(() => {
+    noteListRequest();
+    if (!sendTaken(sendRef.current({ type: "list" }))) listRequestsRef.current.pop();
+  }, [noteListRequest]);
+
+  /**
+   * A Decline this tab could not confirm, against the request's listed
+   * status: still waiting, so send it again (the relay joins it to a stop
+   * already under way); started, so the Enter came first.
+   */
+  const sendDecline = useCallback((localId: string, terminalId: string): boolean => {
+    const requestId = newId("decline");
+    if (!sendTaken(sendRef.current({ type: "decline", terminalId, requestId }))) {
+      declineRequestsRef.current.delete(localId);
+      return false;
+    }
+    declineRequestsRef.current.set(localId, requestId);
+    return true;
+  }, []);
+
+  const redecline = useCallback(
+    (
+      localId: string,
+      terminalId: string,
+      status: SupervisedInfo["status"],
+    ): TerminalTab["decline"] => {
+      if (status === "running" || status === "awaiting_output_review") return "started";
+      if (status !== "awaiting_user") return "unsent";
+      return sendDecline(localId, terminalId) ? "sent" : "unsent";
+    },
+    [sendDecline],
+  );
+
+  const removeTab = useCallback(
+    (tab: TerminalTab) => {
+      const localId = tab.localId;
+      if (!tab.terminalId && inflightOpensRef.current.some((open) => open.localId === localId)) {
+        closedOpensRef.current.add(localId);
+      }
+      pendingRef.current.delete(localId);
+      establishingRef.current.delete(localId);
+      declineRequestsRef.current.delete(localId);
+      if (tab.terminalId) {
+        // A close still owed for it goes on without the tab.
+        const intent = closesRef.current.get(tab.terminalId);
+        if (intent?.localId === localId) intent.localId = null;
+        sessionsRef.current.delete(tab.terminalId);
+        pendingRef.current.delete(tab.terminalId);
+        attachingRef.current.delete(tab.terminalId);
+        earlySealedRef.current.delete(tab.terminalId);
+        knownSinceRef.current.delete(tab.terminalId);
+      }
+      buffersRef.current.delete(localId);
+      listenersRef.current.delete(localId);
+      resettersRef.current.delete(localId);
+      const batch = inputRef.current.get(localId);
+      if (batch?.timer) clearTimeout(batch.timer);
+      inputRef.current.delete(localId);
+      clearTimer(droppedNoticeRef.current, localId);
+      clearTimer(resizeTimersRef.current, localId);
+      clearTimer(reattachTimersRef.current, localId);
+      reattachRef.current.delete(localId);
+      viewRef.current.delete(localId);
+      userAttachedRef.current.delete(localId);
+      outputSeenRef.current.delete(localId);
+      ownSizeRef.current.delete(localId);
+      lastSentSizeRef.current.delete(localId);
+      pendingResizeRef.current.delete(localId);
+      const remaining = tabsRef.current.filter((item) => item.localId !== localId);
+      tabsRef.current = remaining;
+      setTabs((current) => current.filter((item) => item.localId !== localId));
+      if (activeRef.current === localId) {
+        setActiveLocalId(remaining[remaining.length - 1]?.localId ?? null);
+      }
+    },
+    [clearTimer],
+  );
+
+  /** Send a close intent's frame on the current socket (see `sendCloseIntent`). */
+  const sendClose = useCallback((terminalId: string) => {
+    sendCloseIntent(closesRef.current, sendRef, terminalId);
+  }, []);
+
+  /**
+   * Ask the relay to end a terminal, and keep asking (across reconnects)
+   * until it says it did. `localId`: the tab to remove once it has; null when
+   * no tab shows this terminal any more (the tab stays gone either way).
+   */
+  const requestClose = useCallback(
+    (terminalId: string, localId: string | null) => {
+      const existing = closesRef.current.get(terminalId);
+      if (existing) {
+        if (localId) existing.localId = localId;
+        if (existing.requestId === null && existing.retry === null) sendClose(terminalId);
+        return;
+      }
+      closesRef.current.set(terminalId, {
+        requestId: null,
+        localId,
+        // Known since then, so any list asked for later names it while it runs.
+        since: knownSinceRef.current.get(terminalId) ?? listSeqRef.current,
+        retry: null,
+      });
+      sendClose(terminalId);
+    },
+    [sendClose],
+  );
+
+  /** The relay ended the terminal (or has none by that id): the intent is done. */
+  const finishClose = useCallback(
+    (terminalId: string) => {
+      const intent = closesRef.current.get(terminalId);
+      if (!intent) return;
+      if (intent.retry) clearTimeout(intent.retry);
+      closesRef.current.delete(terminalId);
+      const tab = intent.localId
+        ? tabsRef.current.find((item) => item.localId === intent.localId)
+        : undefined;
+      if (tab) removeTab(tab);
+    },
+    [removeTab],
+  );
+
+  /**
+   * The relay refused the close for good. Show it: on the tab that asked, or
+   * on the tab still naming the terminal; with none, a fresh list brings the
+   * still-running terminal back as a tab instead of leaving it unseen.
+   */
+  const failClose = useCallback(
+    (terminalId: string) => {
+      const intent = closesRef.current.get(terminalId);
+      if (!intent) return;
+      if (intent.retry) clearTimeout(intent.retry);
+      closesRef.current.delete(terminalId);
+      const tab =
+        (intent.localId
+          ? tabsRef.current.find((item) => item.localId === intent.localId)
+          : undefined) ?? tabByTerminal(terminalId);
+      if (tab) patchTabNow(tab.localId, { ending: "failed" });
+      else requestList();
+    },
+    [patchTabNow, requestList, tabByTerminal],
+  );
+
   const noteTerminalKnown = useCallback((terminalId: string) => {
     if (!knownSinceRef.current.has(terminalId)) {
       knownSinceRef.current.set(terminalId, listSeqRef.current);
@@ -412,6 +678,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     if (listener) {
       if (resetBeforeOutputRef.current.delete(localId)) resettersRef.current.get(localId)?.();
       listener(event);
+      if (event.kind === "data") outputSeenRef.current.add(localId);
       return;
     }
     const queued = buffersRef.current.get(localId) ?? [];
@@ -572,12 +839,14 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     (pending: PendingHandshake, terminalId: string) => {
       attachingRef.current.delete(terminalId);
       const tab = tabsRef.current.find((item) => item.localId === pending.localId);
-      sendRef.current({ type: tab?.opener ? "close" : "detach", terminalId });
+      // This page opened it and nobody can use it: end it, and keep at that
+      // until the relay confirms (the tab shows the refusal meanwhile).
+      if (tab?.opener) requestClose(terminalId, null);
+      else sendRef.current({ type: "detach", terminalId });
       refuseTab(pending.localId, "identity_mismatch");
-      noteListRequest();
-      sendRef.current({ type: "list" });
+      requestList();
     },
-    [noteListRequest, refuseTab],
+    [refuseTab, requestClose, requestList],
   );
 
   const establish = useCallback(
@@ -743,18 +1012,34 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       };
       const cols = clampDimension(input.cols);
       const rows = clampDimension(input.rows);
+      // A socket that closed first drops nothing that matters: the next one
+      // opens and attaches again. A full queue refused it: start again later.
       if (input.mode === "open") {
-        inflightOpensRef.current.push(input.localId);
-        sendRef.current({
+        const requestId = newId("open");
+        inflightOpensRef.current.push({ localId: input.localId, requestId });
+        const result = sendRef.current({
           type: "open",
+          requestId,
           cliDeviceId: input.cliDeviceId,
           cols,
           rows,
           ...shared,
         });
+        if (result === "full") {
+          inflightOpensRef.current = inflightOpensRef.current.filter(
+            (open) => open.requestId !== requestId,
+          );
+          pendingRef.current.delete(input.localId);
+          failOpeningRef.current(input.localId, "rate_limited");
+        }
         return;
       }
-      sendRef.current({ type: "attach", terminalId: input.terminalId, ...shared });
+      const result = sendRef.current({ type: "attach", terminalId: input.terminalId, ...shared });
+      if (result === "full") {
+        pendingRef.current.delete(input.terminalId);
+        attachingRef.current.delete(input.terminalId);
+        failOpeningRef.current(input.localId, "rate_limited");
+      }
     },
     [ensureTrust, refuseTab, setView, viewOf],
   );
@@ -764,6 +1049,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       if (!tab.terminalId) return;
       clearTimer(reattachTimersRef.current, tab.localId);
       attachingRef.current.add(tab.terminalId);
+      // The attach replays the screen; keystrokes wait for it again.
+      outputSeenRef.current.delete(tab.localId);
       const own = ownSizeRef.current.get(tab.localId);
       void beginHandshake({
         mode: "attach",
@@ -780,6 +1067,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
 
   const canAttach = useCallback((tab: TerminalTab) => {
     if (!tab.terminalId || tab.phase === "exited" || tab.phase === "rejected") return false;
+    // Being ended: no new viewer slot for it.
+    if (closesRef.current.has(tab.terminalId)) return false;
+    // An agent request attaches only once the user picked it.
+    if (tab.origin === "agent" && !userAttachedRef.current.has(tab.localId)) return false;
     if (sessionsRef.current.has(tab.terminalId)) return false;
     // An attach may still be checking the CLI identity before its handshake.
     if (attachingRef.current.has(tab.terminalId)) return false;
@@ -809,6 +1100,32 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       }
     },
     [attach, beginHandshake, canAttach],
+  );
+
+  /**
+   * An opening tab whose `open`, `attach` or `auth` the relay refused before
+   * acting on it. Refused for rate: nothing was made, so start the tab again
+   * with backoff. Refused as invalid: the tab is rejected.
+   */
+  const failOpening = useCallback(
+    (localId: string, reason: string) => {
+      if (reason !== "rate_limited") {
+        patchTabNow(localId, { phase: "rejected", rejectionReason: reason, error: reason });
+        return;
+      }
+      const step = nextReattach(reattachRef.current.get(localId), Date.now());
+      reattachRef.current.set(localId, step.state);
+      clearTimer(reattachTimersRef.current, localId);
+      reattachTimersRef.current.set(
+        localId,
+        setTimeout(() => {
+          reattachTimersRef.current.delete(localId);
+          const current = tabsRef.current.find((item) => item.localId === localId);
+          if (current?.phase === "opening") retryTab(current);
+        }, step.delayMs),
+      );
+    },
+    [clearTimer, patchTabNow, retryTab],
   );
 
   /** A viewer left this tab (slow, stolen, or the socket dropped). */
@@ -842,13 +1159,20 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       awaitingIdentityRef.current.delete(localId);
       establishingRef.current.delete(localId);
       pendingRef.current.delete(localId);
+      declineRequestsRef.current.delete(localId);
       takePendingByTerminalId(pendingRef.current, terminalId);
       attachingRef.current.delete(terminalId);
       knownSinceRef.current.delete(terminalId);
       const session = sessionsRef.current.get(terminalId);
       if (session) retireAfterDrain(terminalId, session);
       else earlySealedRef.current.delete(terminalId);
-      patchTabNow(localId, { phase: "exited", approvalCode: null, error: TERMINAL_GONE });
+      const decline = tabsRef.current.find((item) => item.localId === localId)?.decline;
+      patchTabNow(localId, {
+        phase: "exited",
+        approvalCode: null,
+        error: TERMINAL_GONE,
+        ...(decline === "sent" || decline === "unsent" ? { decline: null } : {}),
+      });
     },
     [clearTimer, patchTabNow, retireAfterDrain],
   );
@@ -860,11 +1184,31 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
    * known which request this answers, so the oldest request bounds it.
    */
   const reconcileListedTerminals = useCallback(
-    (listed: ReadonlySet<string>) => {
+    (listed: ReadonlySet<string>, pushed: boolean) => {
+      if (pushed) {
+        // A pushed list is a snapshot as of now, but a shell this page is
+        // still opening may not be registered yet: only settled tabs count.
+        // A terminal with a close out is settled by the close's own answers.
+        for (const tab of tabsRef.current) {
+          const terminalId = tab.terminalId;
+          if (!terminalId || listed.has(terminalId)) continue;
+          if (closesRef.current.has(terminalId)) continue;
+          const settled = tab.origin === "agent" || tab.phase === "live" || tab.phase === "waiting";
+          if (!settled || tab.phase === "exited" || tab.phase === "rejected") continue;
+          if (!knownSinceRef.current.has(terminalId)) continue;
+          markTerminalGone(tab.localId, terminalId);
+        }
+        return;
+      }
       const outstanding = listRequestsRef.current;
       if (outstanding.length === 0) return;
       const requestedAt = Math.min(...outstanding);
       outstanding.splice(outstanding.indexOf(Math.max(...outstanding)), 1);
+      // A close whose terminal a list asked for after it no longer names has
+      // taken effect (or the terminal ended some other way).
+      for (const [terminalId, intent] of [...closesRef.current]) {
+        if (!listed.has(terminalId) && intent.since < requestedAt) finishClose(terminalId);
+      }
       for (const tab of tabsRef.current) {
         const terminalId = tab.terminalId;
         if (!terminalId || listed.has(terminalId)) continue;
@@ -874,14 +1218,14 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         markTerminalGone(tab.localId, terminalId);
       }
     },
-    [markTerminalGone],
+    [finishClose, markTerminalGone],
   );
 
   const onMessage = useCallback(
     (message: TerminalServerMessage) => {
       if (message.type === "terminals") {
         const listedIds = new Set(message.terminals.map((remote) => remote.terminalId));
-        reconcileListedTerminals(listedIds);
+        reconcileListedTerminals(listedIds, message.pushed === true);
         // A detached terminal that is no longer listed has ended; forget it.
         for (const terminalId of detachedRef.current) {
           if (!listedIds.has(terminalId)) detachedRef.current.delete(terminalId);
@@ -893,12 +1237,17 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
           cliViewersRef.current.set(cli.cliDeviceId, cli.terminalViewers);
         }
         listReady.resolve();
-        for (const resolve of listWaitersRef.current.splice(0)) resolve();
+        if (!message.pushed) for (const resolve of listWaitersRef.current.splice(0)) resolve();
         // Check every CLI now, so the page can show fingerprints and refusals.
         for (const cli of message.clis) void ensureTrust(cli.cliDeviceId);
         const additions: TerminalTab[] = [];
         const toAttach: TerminalTab[] = [];
         for (const remote of message.terminals) {
+          const closing = closesRef.current.get(remote.terminalId);
+          // Still running with no close out (its socket closed first): again.
+          if (closing && closing.requestId === null && closing.retry === null) {
+            sendClose(remote.terminalId);
+          }
           const multiViewer = cliViewersRef.current.get(remote.cliDeviceId) ?? false;
           // 2.4: attaching steals the terminal from the tab that has it. Only
           // do that when the user selects it.
@@ -906,17 +1255,25 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
           const known = tabByTerminal(remote.terminalId);
           if (known) {
             viewRef.current.set(known.localId, { ...viewOf(known.localId), multiViewer });
-            setTabs((current) =>
-              patchTab(current, known.localId, {
-                multiViewer,
-                ...(multiViewer ? { viewerCount: remote.viewerCount } : {}),
-              }),
-            );
+            patchTabNow(known.localId, {
+              multiViewer,
+              ...(multiViewer ? { viewerCount: remote.viewerCount } : {}),
+              ...(remote.origin === "agent"
+                ? { origin: "agent" as const, supervised: remote.supervised }
+                : {}),
+              ...(known.decline === "unsent" && remote.supervised
+                ? {
+                    decline: redecline(known.localId, remote.terminalId, remote.supervised.status),
+                  }
+                : {}),
+            });
             if (canAttach(known) && !heldElsewhere) toAttach.push({ ...known, multiViewer });
             continue;
           }
           if (additions.some((tab) => tab.terminalId === remote.terminalId)) continue;
           if (detachedRef.current.has(remote.terminalId)) continue;
+          // Being closed without a tab: it does not come back as one.
+          if (closing) continue;
           const tab = newTab({
             localId: newId("local"),
             terminalId: remote.terminalId,
@@ -926,12 +1283,16 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
             multiViewer,
             opener: false,
             viewerCount: remote.viewerCount,
+            origin: remote.origin,
+            supervised: remote.supervised,
           });
           if (heldElsewhere) tab.error = "detached";
           noteTerminalKnown(remote.terminalId);
           viewRef.current.set(tab.localId, { multiViewer, writer: tab.writer });
           additions.push(tab);
-          if (!heldElsewhere) toAttach.push(tab);
+          // Agent requests are listed, not attached: attaching takes a viewer
+          // slot and is the oversight step the person chooses.
+          if (!heldElsewhere && tab.origin !== "agent") toAttach.push(tab);
         }
         if (additions.length > 0) {
           tabsRef.current = [
@@ -952,12 +1313,19 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         return;
       }
       if (message.type === "opening") {
-        const localId = inflightOpensRef.current.shift();
+        const inflight = inflightOpensRef.current;
+        // Matched by request id: a refused `open` is never answered here.
+        const index = message.requestId
+          ? inflight.findIndex((open) => open.requestId === message.requestId)
+          : 0;
+        if (index === -1) return;
+        const localId = inflight.splice(index, 1)[0]?.localId;
         if (!localId) return;
         if (closedOpensRef.current.delete(localId)) {
-          // The tab is gone. Close the shell, or it would hold a slot unseen.
-          // Its later `pending` / `opened` find no handshake and are ignored.
-          sendRef.current({ type: "close", terminalId: message.terminalId });
+          // The tab is gone. Close the shell, or it would hold a slot unseen,
+          // until the relay confirms. Its later `pending` / `opened` find no
+          // handshake and are ignored.
+          requestClose(message.terminalId, null);
           return;
         }
         const pending = pendingRef.current.get(localId);
@@ -1018,11 +1386,16 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
           .then((proof) => {
             // A proof for a socket that has since closed answers nothing.
             if (!proof || generationRef.current !== generation) return;
-            sendRef.current({
+            const result = sendRef.current({
               type: "auth",
               terminalId: message.terminalId,
               signature: proof.signature,
             });
+            if (result !== "full") return;
+            // Refused by a full queue, like a rate-limited auth: start again.
+            takePendingByTerminalId(pendingRef.current, message.terminalId);
+            attachingRef.current.delete(message.terminalId);
+            failOpening(pending.localId, "rate_limited");
           })
           .catch(() => undefined);
         return;
@@ -1073,6 +1446,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       }
       if (message.type === "exit") {
         const terminalId = message.terminalId;
+        // A close this page owed is done; its tab (End session) goes now.
+        finishClose(terminalId);
         const session = sessionsRef.current.get(terminalId);
         const localId = tabByTerminal(terminalId)?.localId;
         if (!localId) {
@@ -1082,8 +1457,22 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         }
         clearTimer(reattachTimersRef.current, localId);
         clearTimer(resizeTimersRef.current, localId);
+        const exited = tabByTerminal(terminalId);
+        const supervised = exited?.supervised ?? null;
+        // The exit answers any Decline still out; nothing is pending any more.
+        declineRequestsRef.current.delete(localId);
         // Mark it exited now; frames that arrive from here on are dropped.
-        patchTabNow(localId, { phase: "exited" });
+        patchTabNow(localId, {
+          phase: "exited",
+          exitCode: message.exitCode,
+          exitSignal: message.signal,
+          ...(exited?.decline === "sent" || exited?.decline === "unsent" ? { decline: null } : {}),
+          // The request's final status comes with the exit, so the tab does
+          // not wait for a list push to say whether the command ran.
+          ...(supervised && message.supervisedStatus
+            ? { supervised: { ...supervised, status: message.supervisedStatus } }
+            : {}),
+        });
         if (session) {
           // Frames received before the exit may still be decrypting.
           retireAfterDrain(terminalId, session);
@@ -1093,6 +1482,24 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
           attachingRef.current.delete(terminalId);
           earlySealedRef.current.delete(terminalId);
         }
+        return;
+      }
+      if (message.type === "decline") {
+        // An Enter beat this tab's Decline: the command runs.
+        const tab = tabByTerminal(message.terminalId);
+        if (!tab || tab.phase === "exited" || tab.phase === "rejected") return;
+        declineRequestsRef.current.delete(tab.localId);
+        patchTabNow(tab.localId, {
+          decline: "started",
+          ...(tab.supervised?.status === "awaiting_user"
+            ? { supervised: { ...tab.supervised, status: "running" as const } }
+            : {}),
+        });
+        return;
+      }
+      if (message.type === "closed") {
+        // The relay ended this terminal for a close from this socket.
+        finishClose(message.terminalId);
         return;
       }
       if (message.type === "detached") {
@@ -1125,6 +1532,43 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         );
         return;
       }
+      if (message.requestId) {
+        // The relay's answer to one close.
+        for (const [terminalId, intent] of closesRef.current) {
+          if (intent.requestId !== message.requestId) continue;
+          // No such terminal (any more): nothing left to end.
+          if (message.code === "not_found") finishClose(terminalId);
+          // Refused unread: it runs on; send the close again after a window.
+          else if (message.code === "rate_limited") {
+            scheduleCloseRetry(closesRef.current, sendRef, terminalId);
+          } else failClose(terminalId);
+          return;
+        }
+        // An answer to one Decline: only that Decline fails. The tab itself
+        // is unaffected (a refused Decline says nothing about its viewing).
+        for (const [localId, requestId] of declineRequestsRef.current) {
+          if (requestId !== message.requestId) continue;
+          declineRequestsRef.current.delete(localId);
+          const declined = tabsRef.current.find((item) => item.localId === localId);
+          if (declined?.decline !== "sent") return;
+          patchTabNow(localId, { decline: "failed" });
+          // A request the relay no longer knows has ended; a fresh list ends the tab.
+          if (message.code === "not_found") requestList();
+          return;
+        }
+        // A refused `open`: it made no terminal, so no `opening` follows.
+        const inflight = inflightOpensRef.current;
+        const index = inflight.findIndex((open) => open.requestId === message.requestId);
+        if (index !== -1 && !message.terminalId) {
+          const localId = inflight.splice(index, 1)[0]?.localId;
+          if (!localId) return;
+          pendingRef.current.delete(localId);
+          establishingRef.current.delete(localId);
+          if (closedOpensRef.current.delete(localId)) return;
+          failOpening(localId, message.code ?? message.message);
+          return;
+        }
+      }
       if (!message.terminalId) return;
       const errorTerminalId = message.terminalId;
       const tab = tabByTerminal(errorTerminalId);
@@ -1156,6 +1600,11 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       attachingRef.current.delete(errorTerminalId);
       if (tab.phase === "opening") establishingRef.current.delete(localId);
       const reason = message.code ?? message.message;
+      if (message.code === "rate_limited" && tab.phase === "opening") {
+        // This tab's attach or auth was refused unread: start it again.
+        failOpening(localId, reason);
+        return;
+      }
       setTabs((current) =>
         current.map((item) =>
           item.localId === localId
@@ -1176,12 +1625,19 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       dropSession,
       ensureTrust,
       establish,
+      failClose,
+      failOpening,
+      finishClose,
       listReady,
       noteTerminalKnown,
       patchTabNow,
       reconcileListedTerminals,
+      redecline,
       refuseSubstitutedKey,
+      requestClose,
+      requestList,
       retireAfterDrain,
+      sendClose,
       setView,
       tabByTerminal,
       viewOf,
@@ -1200,6 +1656,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     reattachTimersRef.current.clear();
     lastSentSizeRef.current.clear();
     inputRef.current.clear();
+    outputSeenRef.current.clear();
     sessionsRef.current.clear();
     pendingRef.current.clear();
     attachingRef.current.clear();
@@ -1208,14 +1665,25 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     closedOpensRef.current.clear();
     // Lists asked on the closed socket are never answered.
     listRequestsRef.current = [];
+    // Nor are its Declines: `sent` becomes `unsent` below.
+    declineRequestsRef.current.clear();
+    // Nor its closes (a queued one never left). The next socket's list sends
+    // each again while it still names the terminal.
+    for (const intent of closesRef.current.values()) {
+      if (intent.retry) clearTimeout(intent.retry);
+      intent.retry = null;
+      intent.requestId = null;
+    }
     earlySealedRef.current.clear();
     sendChainRef.current.clear();
     recvChainRef.current.clear();
     for (const [localId, view] of viewRef.current) {
       if (view.multiViewer) viewRef.current.set(localId, { ...view, writer: "none" });
     }
-    setTabs((current) =>
-      current.flatMap((tab) => {
+    const settle = (tabs: TerminalTab[]) =>
+      tabs.flatMap((tab) => {
+        // The relay drops a closed socket's Decline: its answer never comes.
+        const decline = tab.decline === "sent" ? ("unsent" as const) : tab.decline;
         if (!tab.terminalId && tab.phase === "opening") return [];
         if (tab.phase === "live" || tab.phase === "opening") {
           return [
@@ -1224,12 +1692,14 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
               phase: "opening" as const,
               error: null,
               writer: tab.multiViewer ? ("none" as const) : tab.writer,
+              decline,
             },
           ];
         }
-        return [tab];
-      }),
-    );
+        return [decline === tab.decline ? tab : { ...tab, decline }];
+      });
+    tabsRef.current = settle(tabsRef.current);
+    setTabs(settle);
   }, []);
 
   /**
@@ -1252,14 +1722,28 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   }, [noteListRequest, retryTab]);
 
   const applyPlaintext = useCallback(
-    (session: LiveSession, decoded: TerminalPlaintextV2) => {
+    (session: LiveSession, decoded: TerminalPlaintextV2, unicast: boolean) => {
       if (decoded.kind === "data")
         emitOutput(session.localId, { kind: "data", data: decoded.data });
       else if (decoded.kind === "resize") {
         applyPtySize(session.localId, decoded.cols, decoded.rows);
+      } else if (decoded.kind === "reviewState") {
+        patchTabNow(session.localId, { reviewOutput: decoded.on });
+      } else if (decoded.kind === "reviewCapture") {
+        // The capture is for this viewer alone; a broadcast one is not the CLI's.
+        if (!unicast) return;
+        const tab = tabsRef.current.find((item) => item.localId === session.localId);
+        if (tab?.origin !== "agent") return;
+        patchTabNow(session.localId, {
+          reviewCapture: {
+            head: decoded.head,
+            tail: decoded.tail,
+            totalBytes: decoded.totalBytes,
+          },
+        });
       }
     },
-    [applyPtySize, emitOutput],
+    [applyPtySize, emitOutput, patchTabNow],
   );
 
   const openBroadcast = useCallback(
@@ -1286,7 +1770,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       const decoded = decodeTerminalPlaintextV2(plaintext);
       // An output key only ever arrives unicast.
       if (decoded.kind === "outputKey") return;
-      applyPlaintext(session, decoded);
+      applyPlaintext(session, decoded, false);
     },
     [applyPlaintext],
   );
@@ -1322,7 +1806,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       session.recvSeq = seq;
       const decoded = decodeTerminalPlaintextV2(plaintext);
       if (decoded.kind !== "outputKey") {
-        applyPlaintext(session, decoded);
+        applyPlaintext(session, decoded, true);
         return;
       }
       // A new key drops the old epoch. A stale or repeated key is ignored.
@@ -1411,9 +1895,10 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   // are in place before any message arrives.
   useLayoutEffect(() => {
     acceptSealedRef.current = onSealed;
+    failOpeningRef.current = failOpening;
     sendRef.current = socket.send;
     frameRef.current = socket.sendFrame;
-  }, [onSealed, socket.send, socket.sendFrame]);
+  }, [failOpening, onSealed, socket.send, socket.sendFrame]);
 
   // Handshakes held back until the browser identity loaded go out now.
   useEffect(() => {
@@ -1434,10 +1919,21 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     (localId: string) => {
       setActiveLocalId(localId);
       const tab = tabsRef.current.find((item) => item.localId === localId);
-      if (!tab || !canAttach(tab)) return;
-      attach(tab);
+      if (!tab) return;
+      if (
+        tab.origin === "agent" &&
+        tab.phase !== "exited" &&
+        tab.phase !== "rejected" &&
+        tab.ending !== "pending"
+      ) {
+        userAttachedRef.current.add(localId);
+        if (tab.phase === "waiting") patchTabNow(localId, { phase: "opening", error: null });
+      }
+      const current = tabsRef.current.find((item) => item.localId === localId);
+      if (!current || !canAttach(current)) return;
+      attach(current);
     },
-    [attach, canAttach],
+    [attach, canAttach, patchTabNow],
   );
 
   const socketStatusRef = useLatestRef(socket.status);
@@ -1453,10 +1949,9 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         resolve();
       }
       listWaitersRef.current.push(done);
-      noteListRequest();
-      sendRef.current({ type: "list" });
+      requestList();
     });
-  }, [noteListRequest, socketStatusRef]);
+  }, [requestList, socketStatusRef]);
 
   const startOpen = useCallback(
     (cliDeviceId: string) => {
@@ -1499,70 +1994,81 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     [refreshClis, startOpen],
   );
 
-  const removeTab = useCallback(
-    (tab: TerminalTab) => {
-      const localId = tab.localId;
-      if (!tab.terminalId && inflightOpensRef.current.includes(localId)) {
-        closedOpensRef.current.add(localId);
-      }
-      pendingRef.current.delete(localId);
-      establishingRef.current.delete(localId);
-      if (tab.terminalId) {
-        sessionsRef.current.delete(tab.terminalId);
-        pendingRef.current.delete(tab.terminalId);
-        attachingRef.current.delete(tab.terminalId);
-        earlySealedRef.current.delete(tab.terminalId);
-        knownSinceRef.current.delete(tab.terminalId);
-      }
-      buffersRef.current.delete(localId);
-      listenersRef.current.delete(localId);
-      resettersRef.current.delete(localId);
-      const batch = inputRef.current.get(localId);
-      if (batch?.timer) clearTimeout(batch.timer);
-      inputRef.current.delete(localId);
-      clearTimer(droppedNoticeRef.current, localId);
-      clearTimer(resizeTimersRef.current, localId);
-      clearTimer(reattachTimersRef.current, localId);
-      reattachRef.current.delete(localId);
-      viewRef.current.delete(localId);
-      ownSizeRef.current.delete(localId);
-      lastSentSizeRef.current.delete(localId);
-      pendingResizeRef.current.delete(localId);
-      const remaining = tabsRef.current.filter((item) => item.localId !== localId);
-      tabsRef.current = remaining;
-      setTabs((current) => current.filter((item) => item.localId !== localId));
-      if (activeRef.current === localId) {
-        setActiveLocalId(remaining[remaining.length - 1]?.localId ?? null);
-      }
-    },
-    [clearTimer],
-  );
-
   const detachTab = useCallback(
     (localId: string) => {
       const tab = tabsRef.current.find((item) => item.localId === localId);
       if (!tab) return;
+      if (tab.terminalId && closesRef.current.has(tab.terminalId)) {
+        // Ending already: the close goes on without the tab (removeTab).
+        removeTab(tab);
+        return;
+      }
+      if (
+        tab.origin === "agent" &&
+        tab.terminalId &&
+        tab.phase !== "exited" &&
+        tab.phase !== "rejected"
+      ) {
+        // An agent request stays pending when this page stops viewing it:
+        // keep it listed, unattached, so it can be picked again.
+        const terminalId = tab.terminalId;
+        if (tab.phase !== "waiting") sendRef.current({ type: "detach", terminalId });
+        userAttachedRef.current.delete(localId);
+        outputSeenRef.current.delete(localId);
+        dropSession(localId, terminalId);
+        const batch = inputRef.current.get(localId);
+        if (batch?.timer) clearTimeout(batch.timer);
+        inputRef.current.delete(localId);
+        patchTabNow(localId, { phase: "waiting", error: null, approvalCode: null });
+        return;
+      }
       if (tab.terminalId && tab.phase !== "exited" && tab.phase !== "rejected") {
-        // An open that never went live has no other viewers: cancel it outright.
-        const type = tab.opener && tab.phase !== "live" ? "close" : "detach";
-        sendRef.current({ type, terminalId: tab.terminalId });
-        if (type === "detach") detachedRef.current.add(tab.terminalId);
+        if (tab.opener && tab.phase !== "live") {
+          // An open that never went live has no other viewers: cancel it
+          // outright, and keep at it until the relay confirms.
+          requestClose(tab.terminalId, null);
+        } else {
+          // A lost detach needs no retry: the relay drops a closed socket's viewers.
+          sendRef.current({ type: "detach", terminalId: tab.terminalId });
+          detachedRef.current.add(tab.terminalId);
+        }
       }
       removeTab(tab);
     },
-    [removeTab],
+    [dropSession, patchTabNow, removeTab, requestClose],
   );
 
   const endSession = useCallback(
     (localId: string) => {
       const tab = tabsRef.current.find((item) => item.localId === localId);
       if (!tab) return;
-      if (tab.terminalId && tab.phase !== "exited" && tab.phase !== "rejected") {
-        sendRef.current({ type: "close", terminalId: tab.terminalId });
+      if (!tab.terminalId || tab.phase === "exited" || tab.phase === "rejected") {
+        removeTab(tab);
+        return;
       }
-      removeTab(tab);
+      // The tab stays, marked ending, until the relay says the terminal ended
+      // (`closed`, its exit, or a list without it). Only then is it removed.
+      const batch = inputRef.current.get(localId);
+      if (batch?.timer) clearTimeout(batch.timer);
+      inputRef.current.delete(localId);
+      patchTabNow(localId, { ending: "pending" });
+      requestClose(tab.terminalId, localId);
     },
-    [removeTab],
+    [patchTabNow, removeTab, requestClose],
+  );
+
+  const declineRequest = useCallback(
+    (localId: string) => {
+      const tab = tabsRef.current.find((item) => item.localId === localId);
+      if (tab?.origin !== "agent" || !tab.terminalId) return;
+      if (tab.phase === "exited" || tab.phase === "rejected") return;
+      if (tab.ending === "pending") return;
+      // One Decline at a time; a started command cannot be declined.
+      if (tab.decline === "sent" || tab.decline === "started") return;
+      const sent = sendDecline(localId, tab.terminalId);
+      patchTabNow(localId, { decline: sent ? "sent" : "unsent" });
+    },
+    [patchTabNow, sendDecline],
   );
 
   const subscribeOutput = useCallback(
@@ -1573,6 +2079,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       const queued = buffersRef.current.get(localId) ?? [];
       buffersRef.current.delete(localId);
       for (const event of queued) listener(event);
+      if (queued.some((event) => event.kind === "data")) outputSeenRef.current.add(localId);
       return () => {
         if (listenersRef.current.get(localId) === listener) listenersRef.current.delete(localId);
       };
@@ -1583,6 +2090,9 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
   const sendInput = useCallback(
     (localId: string, data: string) => {
       const tab = tabsRef.current.find((item) => item.localId === localId);
+      // A session being ended takes no more keystrokes.
+      if (tab?.ending === "pending") return;
+      if (tab?.origin === "agent" && !agentInputAllowed(tab, outputSeenRef.current)) return;
       const live =
         tab?.terminalId && tab.phase !== "exited" ? sessionsRef.current.has(tab.terminalId) : false;
       if (tab && live && needsTakeover(viewOf(localId))) {
@@ -1632,6 +2142,25 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     [clearTimer, flushResize, viewOf],
   );
 
+  const setReviewOutput = useCallback(
+    (localId: string, on: boolean) => {
+      const tab = tabsRef.current.find((item) => item.localId === localId);
+      if (tab?.origin !== "agent" || tab.phase !== "live") return;
+      const supervised = tab.supervised;
+      if (!supervised?.shareOutput || !SUPERVISED_INPUT_STATUSES.has(supervised.status)) return;
+      // The checkbox shows what the CLI reports back (0x06); nothing is set here.
+      sendPlaintext(localId, encodeTerminalReviewToggle(on));
+    },
+    [sendPlaintext],
+  );
+
+  const clearReviewCapture = useCallback(
+    (localId: string) => {
+      patchTabNow(localId, { reviewCapture: null });
+    },
+    [patchTabNow],
+  );
+
   const trustNewKey = useCallback(
     async (cliDeviceId: string, expected: ChangedCliTrust): Promise<boolean> => {
       const cli = cliListRef.current.get(cliDeviceId);
@@ -1673,10 +2202,61 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     refreshClis,
     detachTab,
     endSession,
+    declineRequest,
     subscribeOutput,
     sendInput,
     sendResize,
+    setReviewOutput,
+    clearReviewCapture,
   };
+}
+
+/**
+ * Keystrokes reach an agent request only while its command can take them,
+ * and only after this tab has shown output (the CLI's confirm screen), so a
+ * key pressed before the screen was on the page is never sent.
+ */
+export function agentInputAllowed(tab: TerminalTab, outputSeen: ReadonlySet<string>): boolean {
+  if (tab.phase !== "live") return false;
+  if (!tab.supervised || !SUPERVISED_INPUT_STATUSES.has(tab.supervised.status)) return false;
+  // While its Decline is out (or waits to be sent again) this tab sends
+  // nothing, so it cannot press Enter itself.
+  if (tab.decline === "sent" || tab.decline === "unsent") return false;
+  return outputSeen.has(tab.localId);
+}
+
+type SendRef = { readonly current: (message: TerminalClientMessage) => TerminalSendResult };
+
+/**
+ * Send a close intent's frame on the current socket. Not taken: a closed
+ * socket's successor lists the terminal and the list sends it then; a full
+ * queue tries again after a rate window.
+ */
+function sendCloseIntent(intents: Map<string, CloseIntent>, sendRef: SendRef, terminalId: string) {
+  const intent = intents.get(terminalId);
+  if (!intent) return;
+  if (intent.retry) clearTimeout(intent.retry);
+  intent.retry = null;
+  const requestId = newId("close");
+  const result = sendRef.current({ type: "close", terminalId, requestId });
+  intent.requestId = sendTaken(result) ? requestId : null;
+  if (result === "full") scheduleCloseRetry(intents, sendRef, terminalId);
+}
+
+/** Send an intent that has no close out again after one rate window. */
+function scheduleCloseRetry(
+  intents: Map<string, CloseIntent>,
+  sendRef: SendRef,
+  terminalId: string,
+) {
+  const intent = intents.get(terminalId);
+  if (!intent || intent.retry) return;
+  intent.requestId = null;
+  intent.retry = setTimeout(() => {
+    intent.retry = null;
+    if (intents.get(terminalId) !== intent || intent.requestId !== null) return;
+    sendCloseIntent(intents, sendRef, terminalId);
+  }, TERMINAL_BROWSER_JSON_WINDOW_MS);
 }
 
 function clampDimension(value: number): number {

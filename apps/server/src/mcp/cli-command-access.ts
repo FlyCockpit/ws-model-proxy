@@ -15,6 +15,7 @@ export type McpRequestCredential =
 
 const CLI_COMMAND_TOOL_NAMES: ReadonlySet<string> = new Set([
   "forwarder_cli_command_run",
+  "forwarder_cli_supervised_command_start",
   "forwarder_cli_command_result",
 ]);
 

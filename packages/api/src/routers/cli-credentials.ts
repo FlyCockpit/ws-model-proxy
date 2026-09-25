@@ -1,5 +1,9 @@
 import { ORPCError } from "@orpc/server";
-import { cliSlugFromDeviceLoginScope } from "@ws-model-proxy/config/cli-device-login";
+import {
+  CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE,
+  CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE,
+  cliSlugFromDeviceLoginScope,
+} from "@ws-model-proxy/config/cli-device-login";
 import { cliDeviceDisplayName } from "@ws-model-proxy/config/cli-device-name";
 import { validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma, { Prisma } from "@ws-model-proxy/db";
@@ -143,6 +147,11 @@ export const cliCredentialsRouter = {
       }),
     )
     .handler(async ({ input, context }) => {
+      // The device code a pre-0.4.0 `wsmp login` got from /device/code (it
+      // sends no slug scope). Those releases print this message.
+      if (input.deviceCode === CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE) {
+        throw new ORPCError("BAD_REQUEST", { message: CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE });
+      }
       const minted = await mintCliDeviceCredentialFromApprovedDeviceCode({
         deviceCode: input.deviceCode,
         cliSlug: input.cliSlug,

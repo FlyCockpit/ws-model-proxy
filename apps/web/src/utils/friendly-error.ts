@@ -62,6 +62,13 @@ export function isConflict(error: unknown): boolean {
   return e.status === 409 || e.code === "CONFLICT";
 }
 
+/** True if the error looks like a 404 / NOT_FOUND response from oRPC. */
+export function isNotFound(error: unknown): boolean {
+  const e = asErrorShape(error);
+  if (!e) return false;
+  return e.status === 404 || e.code === "NOT_FOUND";
+}
+
 /**
  * True if the error looks like a 403 / FORBIDDEN response from oRPC — e.g. a
  * policy that flipped server-side after the page loaded.

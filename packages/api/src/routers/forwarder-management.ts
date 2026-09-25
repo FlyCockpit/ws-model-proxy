@@ -12,6 +12,10 @@ import {
 } from "@ws-model-proxy/config/forwarder-identifiers";
 import { MEDIA_ATTACHMENT_MAX_BYTES_MAX } from "@ws-model-proxy/config/media-policy";
 import prisma, { Prisma } from "@ws-model-proxy/db";
+import {
+  lockCapacityGraphForDelete,
+  lockCapacityRowsForPolicyWrite,
+} from "@ws-model-proxy/db/capacity-lock-order";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
 import type { LiveCliFeatureSnapshot } from "../context";
@@ -37,6 +41,7 @@ import {
 } from "../lib/declared-context-window";
 import {
   ensureDiscoveredInferenceCapacity,
+  existingDiscoveredCapacityCandidates,
   linkExecutionTargetCapacity,
 } from "../lib/discovered-inference-capacity";
 import {
@@ -53,6 +58,14 @@ import {
   recordGranteePrivacyNotices,
 } from "../lib/grantee-privacy";
 import type { GuardedPoolCreateFailureReason } from "../lib/guarded-pool-create-reasons";
+import {
+  lowestMcpCommandMode,
+  MCP_COMMAND_MODES,
+  type McpCommandModeName,
+  mcpCommandModeAtLeast,
+  mcpCommandModeFromDb,
+  mcpCommandModeToDb,
+} from "../lib/mcp-command-mode";
 import {
   getConfiguredMediaAttachmentMaxBytes,
   resolveAttachmentLimit,
@@ -86,7 +99,11 @@ import {
 } from "../lib/pool-recommended-surface";
 import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
 import { relayProtocolAtLeast } from "../lib/relay-protocol-version";
-import { runSerializableTransaction } from "../lib/serializable-transaction";
+import {
+  drainBeforeParentDelete,
+  runCapacityDeleteTransaction,
+  runSerializableTransaction,
+} from "../lib/serializable-transaction";
 import {
   type ModelApiSurface,
   modelApiSurfaces,
@@ -350,11 +367,11 @@ const listCliDevicesSelect = {
   inventoryConfirmed: true,
   endpointTargeting: true,
   allowHumanTerminal: true,
-  allowMcpCommands: true,
+  mcpCommandMode: true,
   cliVersion: true,
   relayProtocolVersion: true,
   reportedHumanTerminal: true,
-  reportedMcpCommands: true,
+  reportedMcpCommandMode: true,
   reportedTerminalApproval: true,
   reportedTerminalSupported: true,
   User: { select: { slug: true } },
@@ -617,16 +634,20 @@ function liveTerminalFeature(snapshot: LiveCliFeatureSnapshot | null): boolean {
   );
 }
 
-function liveCommandFeature(snapshot: LiveCliFeatureSnapshot | null): boolean {
-  return relayProtocolAtLeast(snapshot?.protocolVersion, "2.4") && snapshot?.mcpCommands === true;
+/** The CLI's live MCP command mode; `off` while it is offline or pre-2.6. */
+function liveCommandMode(snapshot: LiveCliFeatureSnapshot | null): McpCommandModeName {
+  if (!snapshot || !relayProtocolAtLeast(snapshot.protocolVersion, "2.6")) return "off";
+  return snapshot.mcpCommandMode;
 }
 
 function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSnapshot | null) {
   const terminalLive = liveTerminalFeature(live);
-  const commandsLive = liveCommandFeature(live);
   const terminalDeviceAllows = row.reportedHumanTerminal ?? null;
   const terminalSupported = row.reportedTerminalSupported ?? null;
-  const commandsDeviceAllows = row.reportedMcpCommands ?? null;
+  const commandsGrant = mcpCommandModeFromDb(row.mcpCommandMode);
+  const commandsDeviceMode = mcpCommandModeFromDb(row.reportedMcpCommandMode ?? null);
+  const commandsLive = live !== null && relayProtocolAtLeast(live.protocolVersion, "2.6");
+  const commandsEffective = lowestMcpCommandMode(commandsGrant, liveCommandMode(live));
   const staleAt = row.lastHeartbeatAt
     ? new Date(row.lastHeartbeatAt.getTime() + CLI_HEARTBEAT_STALE_AFTER_MS)
     : null;
@@ -658,6 +679,8 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
         deviceAllows: terminalDeviceAllows,
         supported: terminalSupported,
         live: terminalLive,
+        /** The CLI requires local approval of a browser before it can attach. */
+        approvalRequired: row.reportedTerminalApproval ?? null,
         available:
           row.allowHumanTerminal === true &&
           terminalDeviceAllows === true &&
@@ -665,10 +688,16 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
           terminalSupported === true,
       },
       commands: {
-        granted: row.allowMcpCommands === true,
-        deviceAllows: commandsDeviceAllows,
+        /** Server grant. */
+        mode: commandsGrant,
+        /** The CLI's own config mode, from its latest hello. */
+        deviceMode: commandsDeviceMode,
+        /** Supervised commands need a PTY (Unix). */
+        supported: terminalSupported,
         live: commandsLive,
-        available: row.allowMcpCommands === true && commandsDeviceAllows === true && commandsLive,
+        /** What an MCP agent can do right now: the lowest of grant and live CLI mode. */
+        effectiveMode: commandsEffective,
+        available: commandsEffective !== "off",
       },
     },
     endpoints: row.Endpoints.map((endpoint) => ({
@@ -1115,6 +1144,45 @@ async function discoveredModelEditImpact(discoveredModelId: string, userId: stri
   });
 }
 
+/**
+ * A member may be detached when it exists, belongs to the caller's pool and,
+ * for a PRIMARY member, the pool's effective recommended surface stays
+ * servable across the remaining members (an overflow member leaves
+ * selectability untouched).
+ */
+async function assertPoolMemberRemovable(
+  db: Pick<Prisma.TransactionClient, "poolMember">,
+  memberId: string,
+  userId: string,
+): Promise<void> {
+  const member = await db.poolMember.findUnique({
+    where: { id: memberId },
+    select: {
+      id: true,
+      poolId: true,
+      tier: true,
+      ModelPool: {
+        select: {
+          userId: true,
+          recommendedSurfaceOverride: true,
+          protocolAdaptationEnabled: true,
+        },
+      },
+    },
+  });
+  if (!member || member.ModelPool.userId !== userId) {
+    throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
+  }
+  if (member.tier === "PRIMARY") {
+    const surfaceMembers = await loadPoolSurfaceMembers(db, member.poolId, member.id);
+    assertRecommendedSurfaceServable({
+      override: parseModelApiSurface(member.ModelPool.recommendedSurfaceOverride),
+      members: surfaceMembers,
+      adaptationEnabled: member.ModelPool.protocolAdaptationEnabled,
+    });
+  }
+}
+
 async function removeOwnedRow({
   kind,
   id,
@@ -1126,33 +1194,94 @@ async function removeOwnedRow({
   userId: string;
   staleBefore?: Date;
 }) {
-  if (kind === "endpoint") {
-    const row = await prisma.endpoint.findUnique({
+  // Read-only checks first, so a refused delete drains nothing; the ordered
+  // transaction repeats them under its locks.
+  const precheck =
+    kind === "endpoint"
+      ? await prisma.endpoint.findUnique({
+          where: { id },
+          select: { userId: true, lastSeenAt: true },
+        })
+      : await prisma.discoveredModel.findUnique({
+          where: { id },
+          select: { userId: true, lastSeenAt: true },
+        });
+  const label = kind === "endpoint" ? "Endpoint" : "Discovered model";
+  if (!precheck || precheck.userId !== userId) {
+    throw new ORPCError("NOT_FOUND", { message: `${label} not found.` });
+  }
+  if (staleBefore && precheck.lastSeenAt && precheck.lastSeenAt >= staleBefore) {
+    throw new ORPCError("CONFLICT", { message: `${label} is not stale.` });
+  }
+  // The request history the cascade deletes or detaches is drained in short
+  // batches first (DL1-TXBOUND), so the ordered transaction below holds the
+  // capacity locks only for the graph itself.
+  await drainBeforeParentDelete(
+    kind === "endpoint" ? { userId, endpointIds: [id] } : { userId, discoveredModelIds: [id] },
+  );
+  // Parent delete in capacity lock order: the owning device (L0, serializes
+  // with its relay registration), then every capacity lock the cascade into
+  // discovered models, execution targets, pool members and admission rows can
+  // reach, then the DELETE (see lockCapacityGraphForDelete).
+  return runCapacityDeleteTransaction(async (tx) => {
+    if (kind === "endpoint") {
+      const row = await tx.endpoint.findUnique({
+        where: { id },
+        select: { id: true, userId: true, cliDeviceId: true },
+      });
+      if (!row || row.userId !== userId) {
+        throw new ORPCError("NOT_FOUND", { message: "Endpoint not found." });
+      }
+      const targets = await tx.executionTarget.findMany({
+        where: { userId, DiscoveredModel: { is: { endpointId: id } } },
+        select: { id: true },
+      });
+      await lockCapacityGraphForDelete(tx, {
+        userId,
+        lockedCliDeviceIds: [row.cliDeviceId],
+        executionTargetIds: targets.map((target) => target.id),
+        endpointIds: [id],
+      });
+      const current = await tx.endpoint.findUnique({
+        where: { id },
+        select: { lastSeenAt: true },
+      });
+      if (!current) throw new ORPCError("NOT_FOUND", { message: "Endpoint not found." });
+      if (staleBefore && current.lastSeenAt && current.lastSeenAt >= staleBefore) {
+        throw new ORPCError("CONFLICT", { message: "Endpoint is not stale." });
+      }
+      await tx.endpoint.delete({ where: { id } });
+      return { deleted: true };
+    }
+
+    const row = await tx.discoveredModel.findUnique({
       where: { id },
-      select: { id: true, userId: true, lastSeenAt: true },
+      select: { id: true, userId: true, Endpoint: { select: { cliDeviceId: true } } },
     });
     if (!row || row.userId !== userId) {
-      throw new ORPCError("NOT_FOUND", { message: "Endpoint not found." });
+      throw new ORPCError("NOT_FOUND", { message: "Discovered model not found." });
     }
-    if (staleBefore && row.lastSeenAt && row.lastSeenAt >= staleBefore) {
-      throw new ORPCError("CONFLICT", { message: "Endpoint is not stale." });
+    const targets = await tx.executionTarget.findMany({
+      where: { userId, discoveredModelId: id },
+      select: { id: true },
+    });
+    await lockCapacityGraphForDelete(tx, {
+      userId,
+      lockedCliDeviceIds: [row.Endpoint.cliDeviceId],
+      executionTargetIds: targets.map((target) => target.id),
+      discoveredModelIds: [id],
+    });
+    const current = await tx.discoveredModel.findUnique({
+      where: { id },
+      select: { lastSeenAt: true },
+    });
+    if (!current) throw new ORPCError("NOT_FOUND", { message: "Discovered model not found." });
+    if (staleBefore && current.lastSeenAt && current.lastSeenAt >= staleBefore) {
+      throw new ORPCError("CONFLICT", { message: "Discovered model is not stale." });
     }
-    await prisma.endpoint.delete({ where: { id } });
+    await tx.discoveredModel.delete({ where: { id } });
     return { deleted: true };
-  }
-
-  const row = await prisma.discoveredModel.findUnique({
-    where: { id },
-    select: { id: true, userId: true, lastSeenAt: true },
   });
-  if (!row || row.userId !== userId) {
-    throw new ORPCError("NOT_FOUND", { message: "Discovered model not found." });
-  }
-  if (staleBefore && row.lastSeenAt && row.lastSeenAt >= staleBefore) {
-    throw new ORPCError("CONFLICT", { message: "Discovered model is not stale." });
-  }
-  await prisma.discoveredModel.delete({ where: { id } });
-  return { deleted: true };
 }
 
 const poolSelect = {
@@ -2134,11 +2263,12 @@ export const forwarderManagementRouter = {
         .object({
           cliDeviceId: idSchema,
           humanTerminal: z.boolean().optional(),
-          mcpCommands: z.boolean().optional(),
+          mcpCommandMode: z.enum(MCP_COMMAND_MODES).optional(),
         })
-        .refine((value) => value.humanTerminal !== undefined || value.mcpCommands !== undefined, {
-          message: "At least one feature grant is required.",
-        }),
+        .refine(
+          (value) => value.humanTerminal !== undefined || value.mcpCommandMode !== undefined,
+          { message: "At least one feature grant is required." },
+        ),
     )
     .handler(async ({ input, context }) => {
       const row = await prisma.cliDevice.findUnique({
@@ -2147,7 +2277,7 @@ export const forwarderManagementRouter = {
           id: true,
           userId: true,
           reportedHumanTerminal: true,
-          reportedMcpCommands: true,
+          reportedMcpCommandMode: true,
           reportedTerminalSupported: true,
         },
       });
@@ -2162,24 +2292,33 @@ export const forwarderManagementRouter = {
           message: "Browser terminal cannot be enabled until this CLI reports support.",
         });
       }
-      if (input.mcpCommands === true && row.reportedMcpCommands !== true) {
+      if (
+        input.mcpCommandMode !== undefined &&
+        input.mcpCommandMode !== "off" &&
+        !mcpCommandModeAtLeast(
+          mcpCommandModeFromDb(row.reportedMcpCommandMode ?? null),
+          input.mcpCommandMode,
+        )
+      ) {
         throw new ORPCError("BAD_REQUEST", {
-          message: "MCP commands cannot be enabled until this CLI reports support.",
+          message: `MCP commands cannot be set to ${input.mcpCommandMode} until this CLI reports that mode (wsmp config set-mcp-commands).`,
         });
       }
       const updated = await prisma.cliDevice.update({
         where: { id: row.id },
         data: {
           ...(input.humanTerminal !== undefined ? { allowHumanTerminal: input.humanTerminal } : {}),
-          ...(input.mcpCommands !== undefined ? { allowMcpCommands: input.mcpCommands } : {}),
+          ...(input.mcpCommandMode !== undefined
+            ? { mcpCommandMode: mcpCommandModeToDb(input.mcpCommandMode) }
+            : {}),
         },
-        select: { id: true, allowHumanTerminal: true, allowMcpCommands: true },
+        select: { id: true, allowHumanTerminal: true, mcpCommandMode: true },
       });
       await context.services?.onCliFeatureGrantsChanged?.(updated.id);
       return {
         cliDeviceId: updated.id,
         humanTerminal: updated.allowHumanTerminal,
-        mcpCommands: updated.allowMcpCommands,
+        mcpCommandMode: mcpCommandModeFromDb(updated.mcpCommandMode),
       };
     }),
 
@@ -2590,7 +2729,7 @@ export const forwarderManagementRouter = {
 
       const updated = await runSerializableTransaction(async (tx) => {
         const userId = context.session.user.id;
-        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${input.id} AND "userId" = ${userId} FOR UPDATE`;
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${input.id} AND "userId" = ${userId} FOR NO KEY UPDATE`;
         if (hasCapacityPolicy)
           await lockAndValidateModelPoolCapacityPolicy(tx, {
             modelPoolId: input.id,
@@ -2784,8 +2923,19 @@ export const forwarderManagementRouter = {
   deleteModelPool: protectedProcedure
     .input(z.object({ id: idSchema }))
     .handler(async ({ input, context }) => {
-      await ownedPool(input.id, context.session.user.id);
-      await prisma.modelPool.delete({ where: { id: input.id } });
+      const userId = context.session.user.id;
+      await ownedPool(input.id, userId);
+      // History first, in short batches (relay requests detach from the
+      // pool, terminal admission history goes), so the ordered transaction
+      // holds the capacity locks only for the graph (DL1-TXBOUND).
+      await drainBeforeParentDelete({ userId, poolIds: [input.id] });
+      // Parent delete in capacity lock order: the pool (L1), its members'
+      // targets (L2) and every capacity lock its cascade into members and
+      // admission rows can reach, then the DELETE.
+      await runCapacityDeleteTransaction(async (tx) => {
+        await lockCapacityGraphForDelete(tx, { userId, poolIds: [input.id] });
+        await tx.modelPool.delete({ where: { id: input.id } });
+      });
       return { deleted: true };
     }),
 
@@ -2810,7 +2960,7 @@ export const forwarderManagementRouter = {
       );
       return runSerializableTransaction(async (tx) => {
         const userId = context.session.user.id;
-        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${input.poolId} AND "userId" = ${userId} FOR UPDATE`;
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${input.poolId} AND "userId" = ${userId} FOR NO KEY UPDATE`;
         // Local members always join at PRIMARY tier, so every attach changes
         // the primary member set and must keep the effective recommended
         // surface servable before any write lands.
@@ -2849,6 +2999,35 @@ export const forwarderManagementRouter = {
             },
           },
         });
+        // Capacity lock order (@ws-model-proxy/db/capacity-lock-order): the
+        // pool row (L1) is locked above. Plan with reads only, then take one
+        // sorted L2 union (the operated target and every target sharing a
+        // capacity it may seed), then the capacity rows it may write (L5),
+        // and only then adopt, fill or link a capacity.
+        const candidateCapacityIds =
+          target.inferenceCapacityId !== null
+            ? [target.inferenceCapacityId]
+            : await existingDiscoveredCapacityCandidates(tx, {
+                userId,
+                discoveredModelId: input.discoveredModelId,
+                executionTargetId: target.id,
+              });
+        const targetsSharingCandidateCapacity =
+          declaredContext != null && candidateCapacityIds.length > 0
+            ? await tx.executionTarget.findMany({
+                where: {
+                  userId,
+                  inferenceCapacityId: { in: candidateCapacityIds },
+                },
+                select: { id: true },
+              })
+            : [];
+        const policyLockTargetIds = new Set([
+          target.id,
+          ...targetsSharingCandidateCapacity.map((sharedTarget) => sharedTarget.id),
+        ]);
+        await lockExecutionTargetPolicies(tx, [...policyLockTargetIds]);
+        await lockCapacityRowsForPolicyWrite(tx, userId, candidateCapacityIds);
         let inferenceCapacityId = target.inferenceCapacityId;
         if (inferenceCapacityId === null) {
           inferenceCapacityId = await ensureDiscoveredInferenceCapacity(tx, {
@@ -2870,24 +3049,6 @@ export const forwarderManagementRouter = {
             ? [[inferenceCapacityId, declaredContext]]
             : [],
         );
-        const targetsSharingCandidateCapacity =
-          seedCandidates.size > 0
-            ? await tx.executionTarget.findMany({
-                where: {
-                  userId,
-                  inferenceCapacityId: { in: [...seedCandidates.keys()] },
-                },
-                select: { id: true },
-              })
-            : [];
-        // The pool row is locked above. Take one sorted union of the operated
-        // target and every target sharing its candidate capacity before the
-        // fresh policy read and null-only seed.
-        const policyLockTargetIds = new Set([
-          target.id,
-          ...targetsSharingCandidateCapacity.map((sharedTarget) => sharedTarget.id),
-        ]);
-        await lockExecutionTargetPolicies(tx, [...policyLockTargetIds]);
         const reloadedTarget = await tx.executionTarget.findUnique({
           where: { id: target.id },
           select: {
@@ -2985,7 +3146,7 @@ export const forwarderManagementRouter = {
           select: { id: true },
         });
         if (!candidatePool) throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
-        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidatePool.id} AND "userId" = ${userId} FOR UPDATE`;
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidatePool.id} AND "userId" = ${userId} FOR NO KEY UPDATE`;
         const pool = await tx.modelPool.findFirst({
           where: { id: candidatePool.id, userId },
           select: {
@@ -3326,7 +3487,7 @@ export const forwarderManagementRouter = {
           // Serialize every tier/order transition with pool attachment and
           // reorder operations. Re-read all policy inputs after taking the lock
           // so acknowledgement and protection cannot be revoked concurrently.
-          await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidate.poolId} AND "userId" = ${userId} FOR UPDATE`;
+          await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidate.poolId} AND "userId" = ${userId} FOR NO KEY UPDATE`;
           if (candidate.executionTargetId)
             await lockExecutionTargetPolicies(tx, [candidate.executionTargetId]);
           const member = await tx.poolMember.findUnique({
@@ -3651,7 +3812,7 @@ export const forwarderManagementRouter = {
           candidate.tier !== "PUBLIC_OVERFLOW"
         )
           throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
-        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidate.poolId} AND "userId" = ${userId} FOR UPDATE`;
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidate.poolId} AND "userId" = ${userId} FOR NO KEY UPDATE`;
         const members = await tx.poolMember.findMany({
           where: { poolId: candidate.poolId, tier: "PUBLIC_OVERFLOW" },
           orderBy: [{ publicOrder: "asc" }, { id: "asc" }],
@@ -3677,7 +3838,11 @@ export const forwarderManagementRouter = {
     .input(z.object({ id: idSchema }))
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
-      return runSerializableTransaction(async (tx) => {
+      // Read-only checks first, so a refused detach drains nothing; the
+      // ordered transaction repeats them under the pool lock.
+      await assertPoolMemberRemovable(prisma, input.id, userId);
+      await drainBeforeParentDelete({ userId, poolMemberIds: [input.id] });
+      return runCapacityDeleteTransaction(async (tx) => {
         const candidate = await tx.poolMember.findUnique({
           where: { id: input.id },
           select: { id: true, poolId: true, ModelPool: { select: { userId: true } } },
@@ -3687,36 +3852,12 @@ export const forwarderManagementRouter = {
         }
         // Lock the pool row first (matching addPoolMember) so the member set
         // this decision is made against cannot change concurrently.
-        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidate.poolId} AND "userId" = ${userId} FOR UPDATE`;
-        const member = await tx.poolMember.findUnique({
-          where: { id: input.id },
-          select: {
-            id: true,
-            poolId: true,
-            tier: true,
-            ModelPool: {
-              select: {
-                userId: true,
-                recommendedSurfaceOverride: true,
-                protocolAdaptationEnabled: true,
-              },
-            },
-          },
-        });
-        if (!member || member.ModelPool.userId !== userId) {
-          throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
-        }
-        // Detaching a PRIMARY member re-shapes the primary member set: the
-        // effective recommended surface must stay servable across the remaining
-        // members. Detaching an overflow member leaves selectability untouched.
-        if (member.tier === "PRIMARY") {
-          const surfaceMembers = await loadPoolSurfaceMembers(tx, member.poolId, member.id);
-          assertRecommendedSurfaceServable({
-            override: parseModelApiSurface(member.ModelPool.recommendedSurfaceOverride),
-            members: surfaceMembers,
-            adaptationEnabled: member.ModelPool.protocolAdaptationEnabled,
-          });
-        }
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidate.poolId} AND "userId" = ${userId} FOR NO KEY UPDATE`;
+        await assertPoolMemberRemovable(tx, input.id, userId);
+        // Parent delete in capacity lock order: the pool row is L1 (above);
+        // then the member's target (L2) and every capacity lock its cascade
+        // into waiters and admission rows can reach, then the DELETE.
+        await lockCapacityGraphForDelete(tx, { userId, poolMemberIds: [input.id] });
         await tx.poolMember.delete({ where: { id: input.id } });
         return { deleted: true };
       });
@@ -3982,7 +4123,7 @@ export const forwarderManagementRouter = {
       // Lock the pool row before re-reading egress so a privacy transition
       // cannot commit between this check and the grant insert.
       return runSerializableTransaction(async (tx) => {
-        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${pool.id} AND "userId" = ${userId} FOR UPDATE`;
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${pool.id} AND "userId" = ${userId} FOR NO KEY UPDATE`;
         const locked = await tx.modelPool.findUnique({
           where: { id: pool.id },
           select: { id: true, userId: true, publicEgressEnabled: true },

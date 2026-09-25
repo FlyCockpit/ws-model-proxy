@@ -1,5 +1,6 @@
 import { ORPCError } from "@orpc/server";
 import type { Prisma } from "@ws-model-proxy/db";
+import { lockExecutionTargetPolicies } from "@ws-model-proxy/db/capacity-lock-order";
 import { z } from "zod";
 import type { GuardedPoolCreateFailureReason } from "./guarded-pool-create-reasons";
 
@@ -74,21 +75,16 @@ export function assertModelPoolCapacityPolicy(
 }
 
 /**
- * Serializes physical-capacity changes with every policy mutation for a target.
- * Callers must acquire pool row locks first (when applicable), then these locks
- * in sorted target-id order. This gives multi-target pool updates a stable order.
+ * L2 of the capacity-domain lock order: execution-target rows FOR NO KEY
+ * UPDATE plus their `capacity-policy:<id>` advisory locks, sorted. The order
+ * itself (L0 identity -> L1 pool -> L2 targets -> L3 scopes -> L4 capacity
+ * advisory -> L5 capacity rows -> L6 admission requests -> L7 trailing
+ * writes and parent deletes), including the implicit FK / upsert / DELETE
+ * locks, is documented and enforced in `@ws-model-proxy/db/capacity-lock-order`.
+ * Policy writers take L1 -> L2 -> L5; admission takes L0 -> L2 -> L3 -> L4 ->
+ * L5 -> L6.
  */
-export async function lockExecutionTargetPolicies(
-  tx: Prisma.TransactionClient,
-  executionTargetIds: readonly string[],
-): Promise<void> {
-  for (const targetId of [...new Set(executionTargetIds)].sort()) {
-    await tx.$queryRaw`SELECT id FROM execution_target WHERE id = ${targetId} FOR UPDATE`;
-    // pg_advisory_xact_lock returns PostgreSQL void, which Prisma's pg adapter
-    // cannot deserialize through $queryRaw. Execute it for its side effect.
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${"capacity-policy:" + targetId}, 0))`;
-  }
-}
+export { lockExecutionTargetPolicies };
 
 /**
  * Fences target discovery/creation before a row exists. Call this before
@@ -236,10 +232,18 @@ export async function lockAndValidateModelPoolCapacityPolicy(
   });
   if (!candidate || candidate.userId !== input.userId) return input.notFound();
 
-  // Lock order is model pool, then sorted execution targets. Keep this before
-  // re-reading the policy and members so concurrent attachments cannot bypass
-  // the effective-policy checks below.
-  await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${input.modelPoolId} AND "userId" = ${input.userId} FOR UPDATE`;
+  // Lock order is model pool (L1), then sorted execution targets (L2). FOR NO
+  // KEY UPDATE, not FOR UPDATE, so admission's FK checks on model_pool never
+  // wait on it. The member list that chooses the L2 set is read before L1.
+  // (updateModelPool takes L1 before calling; updatePoolPolicy does not.) A
+  // concurrent attach (which takes this same pool row lock before inserting
+  // a member) that commits between that read and L1 is not caught by the
+  // re-read below: every caller runs Serializable, so the re-read sees the
+  // transaction snapshot. SSI is what protects the checks: the attach wrote
+  // a member row whose absence this transaction read, so the writer fails
+  // with a serialization error (40001/P2034) and its retry plans with the
+  // new member set.
+  await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${input.modelPoolId} AND "userId" = ${input.userId} FOR NO KEY UPDATE`;
   await lockExecutionTargetPolicies(
     tx,
     candidate.PoolMembers.flatMap((member) =>

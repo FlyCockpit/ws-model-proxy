@@ -484,11 +484,14 @@ export async function rememberAffinity({
   const expiresAt = new Date(now.getTime() + policy.ttlSeconds * 1000);
   await prisma.$transaction(async (tx) => {
     // Serialize retention enforcement per owner/pool so concurrent successful
-    // requests cannot race past the configured bound.
+    // requests cannot race past the configured bound. FOR NO KEY UPDATE still
+    // serializes these writers; FOR UPDATE would also block the FK FOR KEY
+    // SHARE check of a concurrent capacity_lease insert on this pool, closing
+    // a deadlock cycle with admission (see lockExecutionTargetPolicies).
     const lockedPool = await tx.$queryRaw<Array<{ id: string }>>`
       SELECT id FROM model_pool
        WHERE id = ${poolId} AND "userId" = ${resourceOwnerId}
-       FOR UPDATE
+       FOR NO KEY UPDATE
     `;
     if (lockedPool.length !== 1) return;
     await tx.cacheAffinityRecord.deleteMany({

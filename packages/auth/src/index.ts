@@ -5,6 +5,7 @@ import {
   validateForwarderSlug,
 } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma from "@ws-model-proxy/db";
+import { deleteUserDurably } from "@ws-model-proxy/db/parent-deletion";
 import { env } from "@ws-model-proxy/env/server";
 import {
   isEmailConfigured,
@@ -14,6 +15,7 @@ import {
 } from "@ws-model-proxy/mailer";
 import { betterAuth } from "better-auth";
 import { prismaAdapter } from "better-auth/adapters/prisma";
+import { createAuthMiddleware } from "better-auth/api";
 import { admin, deviceAuthorization, twoFactor } from "better-auth/plugins";
 import { z } from "zod";
 import { sanitizedApiErrorLogLine } from "./api-error-logging";
@@ -26,7 +28,13 @@ import { resolveMcpPlugins } from "./mcp-plugins";
 import { resolveSignupLocale } from "./signup-locale";
 import { getSignupAccessState, resolveBootstrapAdminIdentity } from "./signup-policy";
 import { resolveUserCreatePolicy, toUserCreatePolicyInput } from "./user-create-policy";
-import { notifyUserDeleted } from "./user-deletion-listeners";
+import {
+  mapSessionRefusalToForbidden,
+  refuseAdminRestoreOfDeletingUser,
+  refuseSessionForDeletingUser,
+} from "./user-deletion-access-guard";
+import { notifyUserDeleted, notifyUserDeletionMarked } from "./user-deletion-listeners";
+import { refuseUndeletableUserBeforeCredentialDelete } from "./user-deletion-preflight";
 import { withVerificationCallback } from "./verification-callback";
 
 const isCrossOrigin = !!env.CORS_ORIGIN;
@@ -131,6 +139,9 @@ export const auth = betterAuth({
   // wholesale for Prisma-shaped errors). See api-error-logging.ts.
   onAPIError: {
     onError: (error: unknown) => {
+      // DEL-STATE commit point: the session trigger's refusal answers 403
+      // like the session.create.before hook (./user-deletion-access-guard.ts).
+      mapSessionRefusalToForbidden(error);
       const line = sanitizedApiErrorLogLine(error);
       if (line !== null) console.error(line);
     },
@@ -304,7 +315,39 @@ export const auth = betterAuth({
       baseUrl: env.BETTER_AUTH_URL,
     }),
   ],
+  hooks: {
+    // Defense in depth for the pending-deletion restore contract
+    // (./user-deletion-access-guard.ts); consumers enforce the marker.
+    before: createAuthMiddleware(async (ctx) => {
+      await refuseAdminRestoreOfDeletingUser(ctx);
+    }),
+  },
   databaseHooks: {
+    // On a user-delete route, Better Auth deletes sessions and accounts
+    // before the user. These hooks refuse a delete that retained history
+    // would fail before the first of them is removed
+    // (./user-deletion-preflight.ts).
+    session: {
+      // A pending deletion refuses every new session whatever the ban fields
+      // hold (./user-deletion-access-guard.ts).
+      create: {
+        before: async (session) => {
+          await refuseSessionForDeletingUser(session);
+        },
+      },
+      delete: {
+        before: async (session, context) => {
+          await refuseUndeletableUserBeforeCredentialDelete(session, context);
+        },
+      },
+    },
+    account: {
+      delete: {
+        before: async (account, context) => {
+          await refuseUndeletableUserBeforeCredentialDelete(account, context);
+        },
+      },
+    },
     user: {
       create: {
         before: async (user, context) => {
@@ -343,12 +386,33 @@ export const auth = betterAuth({
         },
       },
       delete: {
-        // Better Auth queues delete.after until its transaction commits
-        // (admin remove-user and the self-service delete-user routes both go
-        // through internalAdapter.deleteUser). Closes the deleted user's live
-        // relay sessions in this process; see user-deletion-listeners.ts.
-        after: async (user) => {
-          await notifyUserDeleted(user.id);
+        // Admin remove-user (and the self-service delete-user route, which is
+        // not enabled) reach internalAdapter.deleteUser after deleting the
+        // user's sessions and accounts. Its plain adapter DELETE would cascade
+        // into capacity rows while admissions hold capacity locks (DL-1), and
+        // through the whole request history under one statement. The hook
+        // performs the durable, bounded delete itself
+        // (@ws-model-proxy/db/parent-deletion: preflight, deletion marker and
+        // ban, history drain in short batches, then the capacity-graph delete
+        // in lock order) and returns false so Better Auth skips its own
+        // DELETE. Retained history was already refused before sessions and
+        // accounts were touched (./user-deletion-preflight.ts). If completion
+        // fails transiently the marker stays and the deletion sweeper finishes
+        // the user, so the route still reports success. After the delete
+        // commits, close the deleted user's live relay sessions in this
+        // process (see user-deletion-listeners.ts); Better Auth runs no
+        // delete.after for a delete the before hook declined.
+        before: async (user) => {
+          const result = await deleteUserDurably(prisma, user.id, {
+            onMarked: notifyUserDeletionMarked,
+            onTransientFailure: (error) =>
+              console.error(
+                "[auth] user delete incomplete, the deletion sweeper will finish it:",
+                error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+              ),
+          });
+          if (result === "deleted") await notifyUserDeleted(user.id);
+          return false;
         },
       },
     },

@@ -160,7 +160,9 @@ describe("createMcpTransport — pinned configuration", () => {
         MCP_TOOL_MANIFEST.map((tool) => tool.name)
           .filter(
             (name) =>
-              name !== "forwarder_cli_command_run" && name !== "forwarder_cli_command_result",
+              name !== "forwarder_cli_command_run" &&
+              name !== "forwarder_cli_supervised_command_start" &&
+              name !== "forwarder_cli_command_result",
           )
           .sort(),
       );

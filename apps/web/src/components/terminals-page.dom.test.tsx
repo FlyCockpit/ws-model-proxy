@@ -6,6 +6,10 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 const state = vi.hoisted(() => ({
   devices: [] as Array<Record<string, unknown>>,
   openCli: vi.fn(),
+  endSession: vi.fn(),
+  declineRequest: vi.fn(),
+  tabs: [] as Array<Record<string, unknown>>,
+  activeLocalId: null as string | null,
 }));
 
 vi.mock("react-i18next", () => ({
@@ -25,8 +29,14 @@ vi.mock("@/hooks/use-terminal-workspace", () => ({
     identityReady: true,
     clis: [{ cliDeviceId: "cli-1", slug: "desk", publicKey: "key" }],
     cliTrust: { "cli-1": { status: "trusted", fingerprint: "ABCD EFGH" } },
-    tabs: [],
-    activeLocalId: null,
+    tabs: state.tabs,
+    activeLocalId: state.activeLocalId,
+    selectTab: () => undefined,
+    detachTab: () => undefined,
+    endSession: state.endSession,
+    declineRequest: state.declineRequest,
+    setReviewOutput: () => undefined,
+    clearReviewCapture: () => undefined,
     devicesQuery: {
       data: state.devices,
       isPending: false,
@@ -76,6 +86,10 @@ afterEach(() => {
   cleanup();
   state.devices = [];
   state.openCli.mockReset();
+  state.endSession.mockReset();
+  state.declineRequest.mockReset();
+  state.tabs = [];
+  state.activeLocalId = null;
 });
 
 function openPicker() {
@@ -198,5 +212,103 @@ describe("new-terminal CLI picker", () => {
     openPicker();
     const search = screen.getByPlaceholderText("dashboard:terminals.cliSearch") as HTMLInputElement;
     expect(search.value).toBe("");
+  });
+});
+
+describe("agent request tabs", () => {
+  function agentTab(status: string) {
+    return {
+      localId: "local-1",
+      terminalId: "term-1",
+      cliDeviceId: "cli-1",
+      cols: 80,
+      rows: 24,
+      phase: "waiting",
+      approvalCode: null,
+      rejectionReason: null,
+      error: null,
+      multiViewer: true,
+      viewerId: null,
+      writer: "none",
+      viewerCount: 0,
+      ptyCols: null,
+      ptyRows: null,
+      opener: false,
+      origin: "agent",
+      supervised: {
+        commandId: "cmd",
+        status,
+        requester: "laptop agent",
+        reason: null,
+        command: "sudo true",
+        cwd: null,
+        shareOutput: false,
+        createdAt: null,
+        expiresAt: null,
+        exitCode: null,
+        signal: null,
+      },
+      reviewOutput: null,
+      reviewCapture: null,
+      exitCode: null,
+      exitSignal: null,
+      decline: null,
+      ending: null,
+    };
+  }
+
+  function confirmEndAction(label: string) {
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:terminals.actions" }));
+    fireEvent.click(screen.getByText(label));
+    const dialog = screen.getByRole("alertdialog");
+    const buttons = [...dialog.querySelectorAll("button")].filter(
+      (button) => button.textContent === label,
+    );
+    fireEvent.click(buttons[0] as HTMLElement);
+  }
+
+  it("sends Decline as a decline, never as End session", () => {
+    state.tabs = [agentTab("awaiting_user")];
+    state.activeLocalId = "local-1";
+    render(<TerminalWorkspaceView visible />);
+    confirmEndAction("dashboard:agentRequests.decline");
+    expect(state.declineRequest).toHaveBeenCalledWith("local-1");
+    expect(state.endSession).not.toHaveBeenCalled();
+  });
+
+  it("offers End session once the command runs, and says when an Enter beat this tab's Decline", () => {
+    state.tabs = [{ ...agentTab("running"), phase: "live", decline: "started" }];
+    state.activeLocalId = "local-1";
+    render(<TerminalWorkspaceView visible />);
+    expect(screen.getByText("dashboard:agentRequests.startedBeforeDecline")).toBeTruthy();
+    confirmEndAction("dashboard:terminals.endSession");
+    expect(state.endSession).toHaveBeenCalledWith("local-1");
+    expect(state.declineRequest).not.toHaveBeenCalled();
+  });
+
+  it("shows a session being ended without offering End session again, and a refused one", () => {
+    state.tabs = [{ ...agentTab("running"), phase: "live", ending: "pending" }];
+    state.activeLocalId = "local-1";
+    render(<TerminalWorkspaceView visible />);
+    expect(screen.getByText("dashboard:terminals.ending")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "dashboard:terminals.actions" })).toBeNull();
+    cleanup();
+    state.tabs = [{ ...agentTab("running"), phase: "live", ending: "failed" }];
+    render(<TerminalWorkspaceView visible />);
+    expect(screen.getByRole("alert").textContent).toBe("dashboard:terminals.endFailed");
+    confirmEndAction("dashboard:terminals.endSession");
+    expect(state.endSession).toHaveBeenCalledWith("local-1");
+  });
+
+  it("marks the tab as an agent request and offers Decline while it waits", () => {
+    state.tabs = [agentTab("awaiting_user")];
+    state.activeLocalId = "local-1";
+    render(<TerminalWorkspaceView visible />);
+    expect(screen.getByText("dashboard:agentRequests.tabLabel")).toBeTruthy();
+    expect(screen.getByText("dashboard:agentRequests.requestedBy")).toBeTruthy();
+    expect(screen.getByText("sudo true")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "dashboard:agentRequests.view" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:terminals.actions" }));
+    expect(screen.getByText("dashboard:agentRequests.decline")).toBeTruthy();
   });
 });

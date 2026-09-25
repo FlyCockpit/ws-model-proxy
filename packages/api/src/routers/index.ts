@@ -16,6 +16,7 @@ import { overviewRouter } from "./overview";
 import { providerManagementRouter } from "./provider-management";
 import { relayMetadataRouter } from "./relay-metadata";
 import { settingsRouter } from "./settings";
+import { supervisedCommandsRouter } from "./supervised-commands";
 import { usersRouter } from "./users";
 
 async function deploymentFeatureSnapshot() {
@@ -80,6 +81,8 @@ export const appRouter = {
   providerManagement: providerManagementRouter,
   relayMetadata: relayMetadataRouter,
   users: usersRouter,
+  // Human-only: confirm/review agent-requested commands. Never MCP tools.
+  supervisedCommands: supervisedCommandsRouter,
   // Human-only MCP grant management (Phase 7): never exposed as MCP tools —
   // see MCP_TOOL_EXCLUSIONS in apps/server/src/mcp/tool-manifest.ts.
   mcpGrants: mcpGrantsRouter,

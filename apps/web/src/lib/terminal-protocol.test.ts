@@ -19,12 +19,17 @@ describe("parseTerminalServerMessage", () => {
   it("reads opening and attaching with the viewer id", () => {
     expect(
       parseTerminalServerMessage({ type: "opening", terminalId: "t1", viewerId: "v1" }),
-    ).toEqual({ type: "opening", terminalId: "t1", viewerId: "v1" });
+    ).toEqual({ type: "opening", terminalId: "t1", viewerId: "v1", requestId: null });
     expect(parseTerminalServerMessage({ type: "opening", terminalId: "t1" })).toEqual({
       type: "opening",
       terminalId: "t1",
       viewerId: null,
+      requestId: null,
     });
+    // The request id of the `open` it answers.
+    expect(
+      parseTerminalServerMessage({ type: "opening", terminalId: "t1", requestId: "open_1" }),
+    ).toMatchObject({ requestId: "open_1" });
     expect(
       parseTerminalServerMessage({ type: "attaching", terminalId: "t1", viewerId: "v2" }),
     ).toEqual({ type: "attaching", terminalId: "t1", viewerId: "v2" });
@@ -55,6 +60,35 @@ describe("parseTerminalServerMessage", () => {
       terminalId: "t1",
       reason: null,
     });
+  });
+
+  it("reads a close confirmation with its request id", () => {
+    expect(
+      parseTerminalServerMessage({ type: "closed", terminalId: "t1", requestId: "close_1" }),
+    ).toEqual({ type: "closed", terminalId: "t1", requestId: "close_1" });
+    expect(parseTerminalServerMessage({ type: "closed" })).toBeNull();
+  });
+
+  it("reads a decline outcome and ignores unknown outcomes", () => {
+    expect(
+      parseTerminalServerMessage({ type: "decline", terminalId: "t1", outcome: "started" }),
+    ).toEqual({ type: "decline", terminalId: "t1", outcome: "started", requestId: null });
+    expect(
+      parseTerminalServerMessage({
+        type: "decline",
+        terminalId: "t1",
+        outcome: "started",
+        requestId: "decline_1",
+      }),
+    ).toMatchObject({ requestId: "decline_1" });
+    // An error names the frame it answers, with or without a terminal.
+    expect(
+      parseTerminalServerMessage({ type: "error", code: "rate_limited", requestId: "decline_1" }),
+    ).toMatchObject({ code: "rate_limited", terminalId: null, requestId: "decline_1" });
+    expect(
+      parseTerminalServerMessage({ type: "decline", terminalId: "t1", outcome: "stopped" }),
+    ).toBeNull();
+    expect(parseTerminalServerMessage({ type: "decline", outcome: "started" })).toBeNull();
   });
 
   it("reads viewer fields on listed terminals and the CLI viewer capability", () => {
@@ -104,9 +138,12 @@ describe("parseTerminalServerMessage", () => {
           identitySignature: null,
         },
       ],
+      pushed: false,
       terminals: [
         {
           terminalId: "t1",
+          origin: "user",
+          supervised: null,
           cliDeviceId: "c1",
           cols: 80,
           rows: 24,
@@ -117,6 +154,8 @@ describe("parseTerminalServerMessage", () => {
         },
         {
           terminalId: "t2",
+          origin: "user",
+          supervised: null,
           cliDeviceId: "c2",
           cols: 80,
           rows: 24,
@@ -125,6 +164,54 @@ describe("parseTerminalServerMessage", () => {
           writerHere: false,
           viewerAttached: true,
         },
+      ],
+    });
+  });
+});
+
+describe("agent terminals", () => {
+  const supervised = {
+    commandId: "cmd",
+    status: "awaiting_user",
+    requester: "laptop agent",
+    reason: "installs deps",
+    command: "sudo apt install jq",
+    cwd: "/home/me",
+    shareOutput: true,
+    createdAt: "2026-09-24T00:00:00.000Z",
+    expiresAt: "2026-09-24T00:15:00.000Z",
+    exitCode: null,
+    signal: null,
+  };
+
+  it("reads origin, request details, and the pushed flag", () => {
+    const parsed = parseTerminalServerMessage({
+      type: "terminals",
+      pushed: true,
+      clis: [],
+      terminals: [{ terminalId: "t1", cliDeviceId: "c1", origin: "agent", supervised }],
+    });
+    expect(parsed).toMatchObject({
+      type: "terminals",
+      pushed: true,
+      terminals: [{ terminalId: "t1", origin: "agent", supervised }],
+    });
+  });
+
+  it("keeps an agent terminal an agent terminal even with unreadable details", () => {
+    const parsed = parseTerminalServerMessage({
+      type: "terminals",
+      clis: [],
+      terminals: [
+        { terminalId: "t1", cliDeviceId: "c1", origin: "agent", supervised: { status: "?" } },
+        { terminalId: "t2", cliDeviceId: "c1", origin: "martian" },
+      ],
+    });
+    expect(parsed).toMatchObject({
+      pushed: false,
+      terminals: [
+        { terminalId: "t1", origin: "agent", supervised: null },
+        { terminalId: "t2", origin: "user", supervised: null },
       ],
     });
   });

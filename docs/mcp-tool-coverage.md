@@ -42,6 +42,7 @@ fails the suite when a leaf is unclassified.
 | `cliCredentials.revokeToken` | `cli_token_revoke` | write | DELETE | destructive | — | — | — |
 | `core:forwarderCliCommandResult` | `forwarder_cli_command_result` | write | — | pure | — | — | — |
 | `core:forwarderCliCommandRun` | `forwarder_cli_command_run` | write | RUN | external | — | — | — |
+| `core:forwarderCliSupervisedCommandStart` | `forwarder_cli_supervised_command_start` | write | RUN | external | — | — | — |
 | `core:model-api/runChatCompletionDiagnostic` | `forwarder_chat_completion_test` | write | RUN | cost | — | — | — |
 | `core:model-api/runPoolMemberTest` | `forwarder_pool_member_test` | write | RUN | cost | — | — | — |
 | `deploymentFeatures` | — (excluded) | — | — | — | — | — | Admin-only deployment inventory, including keyring status. |
@@ -130,6 +131,8 @@ fails the suite when a leaf is unclassified.
 | `settings.myNotificationPreferences` | — (excluded) | — | — | — | — | — | Notification settings are excluded from MCP. |
 | `settings.update` | — (excluded) | — | — | — | — | — | Admin-only global settings mutation. |
 | `settings.updateMyNotificationPreferences` | — (excluded) | — | — | — | — | — | Notification settings are excluded from MCP. |
+| `supervisedCommands.pending` | — (excluded) | — | — | — | — | — | Human-only supervised-command awareness: the person, not an agent, answers agent requests. |
+| `supervisedCommands.submitOutput` | — (excluded) | — | — | — | — | — | Human-only output review: an agent must never review or release the output of its own request. |
 | `users.archive` | — (excluded) | — | — | — | — | — | Admin-only account management. |
 | `users.invite` | — (excluded) | — | — | — | — | — | Admin-only account management. |
 | `users.list` | — (excluded) | — | — | — | — | — | Admin-only account management. |

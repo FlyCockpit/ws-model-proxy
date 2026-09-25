@@ -11,7 +11,7 @@ import type { Session } from "@ws-model-proxy/auth";
 import { auth as defaultAuth } from "@ws-model-proxy/auth";
 import { armAuthDbShutdownFence } from "@ws-model-proxy/auth/auth-db-shutdown-fence";
 import { isForceTwoFactorRequired } from "@ws-model-proxy/auth/force-two-factor-policy";
-import { onUserDeleted } from "@ws-model-proxy/auth/user-deletion-listeners";
+import { onUserDeleted, onUserDeletionMarked } from "@ws-model-proxy/auth/user-deletion-listeners";
 import { THEME_INIT_SCRIPT } from "@ws-model-proxy/config/theme-init";
 import prismaDefault from "@ws-model-proxy/db";
 import { env as defaultEnv } from "@ws-model-proxy/env/server";
@@ -22,6 +22,7 @@ import { logger } from "hono/logger";
 import { betterAuthAdminGate } from "./better-auth-admin-gate.js";
 import { CORS_ALLOW_HEADERS } from "./cors-headers.js";
 import { deviceAdminGate } from "./device-admin-gate.js";
+import { deviceCodeUpgradeGate } from "./device-code-upgrade-gate.js";
 import {
   EMAIL_RECIPIENT_PATHS,
   emailRecipientLimit,
@@ -94,10 +95,15 @@ import {
   signupLimiter,
   signupRecipientLimiter,
 } from "./rate-limit.js";
-import { cancelCommandsForToken } from "./relay/cli-commands.js";
+import {
+  cancelCommandsForToken,
+  listPendingSupervised,
+  submitSupervisedOutput,
+} from "./relay/cli-commands.js";
 import { relaySessionManager } from "./relay/session-manager.js";
 import {
   createTerminalWebsocketMiddleware,
+  terminalBrowserHub,
   terminalUpgradeHandler,
 } from "./relay/terminal-websocket.js";
 import { createRelayWebsocketMiddleware, relayUpgradeHandler } from "./relay/websocket.js";
@@ -200,14 +206,24 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
  * by the shutdown sequence after the HTTP drain).
  */
 /**
- * Closes a deleted user's live relay sessions in this process. Both user
- * deletion paths (dashboard `users.remove` and Better Auth admin
- * remove-user) notify post-commit; the Set-backed registry makes repeated
- * createApp calls register this once.
+ * Closes a marked or deleted user's live sockets in this process: browser
+ * terminal sockets first (synchronously, pending and admitted, including
+ * those an admin impersonates through), then CLI relay sessions. Both the
+ * mark and the completed delete notify post-commit; the Set-backed registry
+ * makes repeated createApp calls register this once.
+ *
+ * Awaited: `deleteUserDurably` awaits the mark listeners before
+ * `completeUserDeletion`, so the relay status writes finish before the
+ * capacity-ordered delete starts (the DL-1 lock-order proof assumes this),
+ * and `async` turns a synchronous throw into a rejection that
+ * `notifyUserDeletionMarked` / `notifyUserDeleted` catch and log.
  */
-const closeRelaySessionsForDeletedUser = (userId: string) =>
-  relaySessionManager.closeSessionsForUser(userId);
+const closeRelaySessionsForDeletedUser = async (userId: string): Promise<void> => {
+  terminalBrowserHub.revokeTerminalAccessForUser(userId);
+  await relaySessionManager.closeSessionsForUser(userId);
+};
 onUserDeleted(closeRelaySessionsForDeletedUser);
+onUserDeletionMarked(closeRelaySessionsForDeletedUser);
 
 function cliContextServices() {
   return {
@@ -222,6 +238,10 @@ function cliContextServices() {
     cancelMcpTokenCommands: (tokenId: string) => cancelCommandsForToken(tokenId),
     getLiveCliFeatures: (cliDeviceIds: readonly string[]) =>
       relaySessionManager.getLiveCliFeatures(cliDeviceIds),
+    supervisedCommands: {
+      listPending: listPendingSupervised,
+      submitOutput: submitSupervisedOutput,
+    },
   };
 }
 
@@ -761,6 +781,8 @@ export async function createApp(options: CreateAppOptions = {}) {
   // for the shape of the rejection. Must be mounted BEFORE the auth handler.
   app.use("/api/auth/device/approve", deviceAdminGate);
   app.use("/api/auth/device/deny", deviceAdminGate);
+  // A `wsmp login` too old to name its CLI slug gets an upgrade message it prints.
+  app.use("/api/auth/device/code", deviceCodeUpgradeGate);
 
   // Admin gate for Better-Auth's admin plugin endpoints. The plugin role-checks
   // by default, but these routes can set roles, reset passwords, impersonate

@@ -409,6 +409,38 @@ describe("cliCredentialsRouter", () => {
     });
   });
 
+  it("tells a pre-0.4.0 wsmp login to upgrade through the envelope 0.3.x prints", async () => {
+    const { CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE, CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE } =
+      await import("@ws-model-proxy/config/cli-device-login");
+    const handler = new RPCHandler(cliCredentialsRouter);
+    // 0.3.x sends `name` too; it is stripped, not rejected.
+    const result = await handler.handle(
+      new Request("https://example.test/rpc/exchangeDeviceCode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          json: {
+            deviceCode: CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE,
+            name: "CLI device",
+            cliSlug: "desk-01",
+          },
+        }),
+      }),
+      { prefix: "/rpc", context: buildContext(null) },
+    );
+    expect(result.matched).toBe(true);
+    if (!result.matched) return;
+    expect(result.response.status).toBe(400);
+    // 0.3.x `rpc_status_error` prints `json.message` verbatim.
+    expect(await result.response.json()).toMatchObject({
+      json: { code: "BAD_REQUEST", message: CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE },
+    });
+    // The sentinel never reaches the credential mint.
+    expect(db.deviceCode.findUnique).not.toHaveBeenCalled();
+    expect(db.$transaction).not.toHaveBeenCalled();
+    expect(db.cliDeviceCredential.create).not.toHaveBeenCalled();
+  });
+
   it("mints for the approved device-code user instead of the session user", async () => {
     db.deviceCode.findUnique.mockResolvedValue(deviceCodeRow({ userId: "approved-user" }));
     db.cliDeviceCredential.create.mockResolvedValue({

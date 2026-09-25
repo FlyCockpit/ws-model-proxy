@@ -97,8 +97,22 @@ describe("usage retention", () => {
   });
 
   it("deletes raw relay requests past the retention cutoff in SKIP LOCKED batches", async () => {
-    const { prisma } = fakePrisma();
-    prisma.$executeRaw.mockResolvedValueOnce(2).mockResolvedValueOnce(1);
+    const { prisma, tx } = fakePrisma();
+    let pickRound = 0;
+    const statements: string[] = [];
+    tx.$queryRaw.mockImplementation(async (strings: TemplateStringsArray) => {
+      const sql = strings.join("?");
+      statements.push(sql);
+      if (!sql.includes("FROM relay_request")) return [];
+      pickRound += 1;
+      return pickRound === 1 ? [{ id: "relay-1" }, { id: "relay-2" }] : [{ id: "relay-3" }];
+    });
+    let deleteRound = 0;
+    tx.$executeRaw.mockImplementation(async (strings: TemplateStringsArray) => {
+      statements.push(strings.join("?"));
+      deleteRound += 1;
+      return deleteRound === 1 ? 2 : 1;
+    });
     await expect(
       deleteExpiredRelayRequests({
         prisma: prisma as never,
@@ -107,19 +121,29 @@ describe("usage retention", () => {
         batch: 2,
       }),
     ).resolves.toBe(3);
-    expect(prisma.$executeRaw).toHaveBeenCalledTimes(2);
-    const [strings, cutoff, batch] = prisma.$executeRaw.mock.calls[0] as [
+    expect(prisma.$transaction).toHaveBeenCalledTimes(2);
+    expect(tx.$executeRaw).toHaveBeenCalledTimes(2);
+    const [pickStrings, cutoff, batch] = tx.$queryRaw.mock.calls[0] as [
       TemplateStringsArray,
       Date,
       number,
     ];
-    expect(strings.join("?")).toContain("FOR UPDATE SKIP LOCKED");
-    expect(strings.join("?")).toContain("DELETE FROM relay_request");
-    // Never deletes an uncounted (PENDING) request: terminal statuses only.
-    expect(strings.join("?")).toContain("status IN ('SUCCEEDED', 'FAILED', 'CANCELED')");
-    expect(strings.join("?")).not.toContain("PENDING");
+    // Never picks an uncounted (PENDING) request: terminal statuses only.
+    expect(pickStrings.join("?")).toContain("status IN ('SUCCEEDED', 'FAILED', 'CANCELED')");
+    expect(pickStrings.join("?")).not.toContain("PENDING");
     expect(cutoff).toEqual(new Date(NOW.getTime() - 14 * DAY_MS));
     expect(batch).toBe(2);
+    // Capacity lock order: the referencing admission_request rows are taken
+    // first, then the relay rows; both SKIP LOCKED, so the delete never waits
+    // on a row an in-flight admission holds.
+    const [pick, lockAdmissions, countAdmissions, remove] = statements;
+    expect(pick).toContain("FROM relay_request");
+    expect(lockAdmissions).toContain("FROM admission_request");
+    expect(lockAdmissions).toContain("FOR NO KEY UPDATE SKIP LOCKED");
+    expect(countAdmissions).toContain("count(*)");
+    expect(remove).toContain("DELETE FROM relay_request");
+    expect(remove).toContain("FOR UPDATE SKIP LOCKED");
+    expect(remove).toContain("status IN ('SUCCEEDED', 'FAILED', 'CANCELED')");
   });
 
   it("drains the whole abandoned backlog before deleting expired requests", async () => {

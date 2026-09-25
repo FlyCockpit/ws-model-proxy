@@ -2,7 +2,9 @@ import { Link, useParams } from "@tanstack/react-router";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import { useTranslation } from "react-i18next";
 
+import { AgentRequestsBadge } from "@/components/agent-requests-badge";
 import { useAuthSession } from "@/hooks/use-auth-session";
+import { usePendingAgentRequests } from "@/hooks/use-pending-agent-requests";
 import { DEFAULT_LOCALE, isSupportedLocale } from "@/i18n/config";
 import { getNavItems, toLangRoute } from "@/lib/nav-items";
 
@@ -12,6 +14,7 @@ export function MainNav() {
   const { state } = useAuthSession();
   const session = state.session;
   const { t } = useTranslation("nav");
+  const agentRequests = usePendingAgentRequests();
   const items = getNavItems({
     placement: "desktop",
     isAuthenticated: Boolean(session),
@@ -39,6 +42,7 @@ export function MainNav() {
           >
             <item.icon aria-hidden="true" className="size-4" />
             <span>{t(item.labelKey)}</span>
+            {item.id === "dashboard" ? <AgentRequestsBadge count={agentRequests.count} /> : null}
           </Link>
         ))}
       </div>

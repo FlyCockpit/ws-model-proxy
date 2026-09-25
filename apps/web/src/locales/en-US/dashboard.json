@@ -38,7 +38,18 @@
       "saveFailed": "Couldn't update CLI feature access. Try again.",
       "windows": "Not supported on Windows yet",
       "configDisabled": "Disabled in this CLI's wsmp config — edit and restart wsmp",
-      "updateWsmp": "Update wsmp to use this"
+      "updateWsmp": "Update wsmp to use this",
+      "commandModes": {
+        "off": "Off",
+        "supervised": "Supervised",
+        "unsupervised": "Unsupervised"
+      },
+      "commandModeHelp": {
+        "off": "MCP agents cannot run commands on this CLI.",
+        "supervised": "An agent can ask to run a command; it runs only after someone presses Enter on the CLI's confirm screen.",
+        "unsupervised": "Agents can run commands headlessly, and can also ask for supervised ones."
+      },
+      "approvalRecommended": "Recommended: require browser approval on this CLI. Without it, the CLI lets in any browser the WS Model Proxy server admits, so \"nothing runs without your keypress\" and \"unreviewed output never reaches the server\" hold only while the server is honest: a compromised server, or anyone signed in to this account, could open a request, press Enter, and read its output. With approval, only browsers you approved on this CLI can, provided the dashboard code your browser loads is genuine (the same server serves it and holds no terminal keys, but a compromised server could serve altered code). Run on the CLI:"
     },
     "rename": {
       "action": "Rename",
@@ -268,6 +279,8 @@
     "endSession": "End session",
     "endSessionTitle": "End this terminal session?",
     "endSessionDescription": "The shell stops for everyone viewing it. Unsaved work in it is lost.",
+    "ending": "Ending this session…",
+    "endFailed": "This session could not be ended. It may still be running; try End session again.",
     "status": {
       "youTyping": "You're typing",
       "otherTyping": "Someone else is typing",
@@ -303,6 +316,7 @@
       "cli_too_old": "Update wsmp to use terminals",
       "offline": "CLI is offline",
       "invalid": "That terminal request was invalid",
+      "rate_limited": "Too many terminal messages at once; try again shortly",
       "viewer_limit": "Too many tabs are already viewing this terminal",
       "bad_frame": "The CLI dropped this tab after a bad frame",
       "identity_changed": "This CLI's identity key changed",
@@ -336,7 +350,8 @@
       "opening": "Connecting",
       "live": "Connected",
       "rejected": "Rejected",
-      "exited": "Ended"
+      "exited": "Ended",
+      "waiting": "Not viewing"
     }
   },
   "nav": {
@@ -1297,6 +1312,65 @@
           "action": "Open chat test"
         }
       }
+    }
+  },
+  "agentRequests": {
+    "badge_one": "{{count}} agent request waiting",
+    "badge_other": "{{count}} agent requests waiting",
+    "noticeTitle_one": "An agent is waiting for you",
+    "noticeTitle_other": "{{count}} agent requests are waiting for you",
+    "noticeBody": "{{requester}} asked to run a command on one of your CLIs. Nothing runs until you press Enter on the CLI's confirm screen.",
+    "open": "Open Terminals",
+    "title": "Agent request",
+    "tabLabel": "Agent request · {{cli}}",
+    "requestedBy": "Requested by {{requester}}",
+    "reason": "Agent's reason:",
+    "command": "Command",
+    "commandIn": "Command, in {{cwd}}",
+    "commandSize_one": "{{count}} line, {{bytes}} bytes",
+    "commandSize_other": "{{count}} lines, {{bytes}} bytes",
+    "outputShared": "Output will be shared with the requesting agent.",
+    "outputPrivate": "Output stays in this terminal.",
+    "view": "Show the confirm screen",
+    "reviewOutput": "Review output before sending",
+    "finished": "Command finished (exit {{code}})",
+    "finishedSignal": "Command finished (signal {{signal}})",
+    "ended": "Agent request ended",
+    "cancelled": "Agent request cancelled",
+    "notRun": {
+      "declined": "Declined. The command did not run.",
+      "expired": "Expired. The command did not run.",
+      "rejected": "The CLI refused this request. The command did not run."
+    },
+    "decline": "Decline",
+    "declineTitle": "Decline this request?",
+    "declineDescription": "If nobody has pressed Enter on the confirm screen yet, the command never runs and the agent is told you declined. If someone already pressed Enter, the command keeps running and this tab says so; End session stops it.",
+    "declineSent": "Decline sent. Waiting for the CLI: if someone pressed Enter first, the command runs.",
+    "startedBeforeDecline": "Someone pressed Enter before your Decline reached the CLI, so the command started and keeps running. Use End session to stop it.",
+    "declineUnsent": "Not connected: your Decline has not reached the relay yet. It is sent again as soon as the connection is back, or press Decline to try now.",
+    "declineFailed": "Your Decline could not be delivered (the CLI may be offline, or too many messages were sent at once). Nothing was declined; press Decline to try again.",
+    "status": {
+      "awaiting_user": "Waiting for you",
+      "running": "Running",
+      "awaiting_output_review": "Output waiting for review",
+      "exited": "Finished",
+      "declined": "Declined",
+      "expired": "Expired",
+      "cancelled": "Cancelled",
+      "rejected": "Rejected"
+    },
+    "review": {
+      "title": "Review output before sending",
+      "description": "This is exactly what {{requester}} would receive. Edit it, send it, or redact all of it. Closing this redacts all output.",
+      "label": "Output",
+      "redact": "Redact all output",
+      "undo": "Undo changes",
+      "submit": "Submit",
+      "sent": "Reviewed output sent to the agent",
+      "redacted": "Output redacted",
+      "alreadyAnswered": "This output was already reviewed",
+      "failed": "Couldn't send the review. Try again.",
+      "truncated": "The command printed {{bytes}} bytes; only the start and the end are kept."
     }
   }
 }

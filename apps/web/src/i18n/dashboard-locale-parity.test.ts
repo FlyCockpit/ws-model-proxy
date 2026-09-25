@@ -27,6 +27,21 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
     expect(keyTree(esDashboard.models.surfaces).sort()).toEqual(expected);
   });
 
+  it("has identical agent request keys, with every supervised status", () => {
+    expect(keyTree(esDashboard.agentRequests)).toEqual(keyTree(enDashboard.agentRequests));
+    const statuses = [
+      "awaiting_user",
+      "running",
+      "awaiting_output_review",
+      "exited",
+      "declined",
+      "expired",
+      "cancelled",
+      "rejected",
+    ].sort();
+    expect(Object.keys(enDashboard.agentRequests.status).sort()).toEqual(statuses);
+  });
+
   it("has identical terminals, nav, and CLI feature keys", () => {
     expect(keyTree(esDashboard.terminals)).toEqual(keyTree(enDashboard.terminals));
     expect(keyTree(esDashboard.nav)).toEqual(keyTree(enDashboard.nav));
@@ -58,6 +73,8 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
       "endSession",
       "endSessionTitle",
       "endSessionDescription",
+      "ending",
+      "endFailed",
       "status.youTyping",
       "status.otherTyping",
       "status.viewers_one",
@@ -68,6 +85,7 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
       "phase.live",
       "phase.rejected",
       "phase.exited",
+      "phase.waiting",
       "approvalTitle",
       "approvalInstructions",
       "approvalCodeLabel",
@@ -92,6 +110,7 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
       "rejection.cli_too_old",
       "rejection.offline",
       "rejection.invalid",
+      "rejection.rate_limited",
       "rejection.viewer_limit",
       "rejection.bad_frame",
       "rejection.identity_changed",
@@ -127,6 +146,13 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
       "windows",
       "configDisabled",
       "updateWsmp",
+      "commandModes.off",
+      "commandModes.supervised",
+      "commandModes.unsupervised",
+      "commandModeHelp.off",
+      "commandModeHelp.supervised",
+      "commandModeHelp.unsupervised",
+      "approvalRecommended",
     ].sort();
     expect(keyTree(enDashboard.terminals).sort()).toEqual(terminalKeys);
     expect(keyTree(esDashboard.terminals).sort()).toEqual(terminalKeys);

@@ -8,6 +8,7 @@ import {
   parseRelayClientControlFrame,
   RELAY_REQUEST_BODY_WINDOW_CHUNKS,
   RELAY_STALE_AFTER_MS,
+  RELAY_UPGRADE_REQUIRED_MESSAGE,
 } from "./protocol.js";
 import { inventoryDigestFor, persistRelayRegistration } from "./registration.js";
 
@@ -62,7 +63,8 @@ const db = prisma as unknown as {
     updateMany: MockInstance;
   };
   executionTarget: {
-    upsert: MockInstance;
+    findMany: MockInstance;
+    findUnique: MockInstance;
   };
   inferenceCapacity: {
     findMany: MockInstance;
@@ -95,24 +97,48 @@ const identity: CliWebsocketIdentity = {
 
 const now = new Date("2026-01-01T00:00:00.000Z");
 
+function capabilities26(features?: {
+  humanTerminal?: boolean;
+  mcpCommandMode?: "off" | "supervised" | "unsupervised";
+  terminalApproval?: boolean;
+  terminalSupported?: boolean;
+}) {
+  return {
+    protocolVersion: "2.6",
+    inventoryAck: true,
+    inventoryReplace: true,
+    endpointTargeting: true,
+    binaryFrames: true,
+    cancellation: true,
+    maxBinaryChunkBytes: 1024 * 1024,
+    requestBodyStreaming: true,
+    requestBodyWindowChunks: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+    sharedTokenizerTps: true,
+    standardizedMetrics: true,
+    terminal: true,
+    exec: true,
+    features: {
+      humanTerminal: features?.humanTerminal ?? true,
+      mcpCommandMode: features?.mcpCommandMode ?? "unsupervised",
+      terminalApproval: features?.terminalApproval ?? false,
+      terminalSupported: features?.terminalSupported ?? true,
+    },
+    terminalPublicKey: uncompressedKey(),
+    terminalViewers: true,
+    supervisedCommands: true,
+  };
+}
+
 function helloFrame() {
   return JSON.stringify({
     type: "hello",
     id: "hello-id",
-    protocolVersion: "2.1",
+    protocolVersion: "2.6",
     cli: {
       slug: "desktop",
       hostname: "desk-01.local",
       capabilities: {
-        protocolVersion: "2.1",
-        inventoryAck: true,
-        inventoryReplace: true,
-        endpointTargeting: true,
-        binaryFrames: true,
-        cancellation: true,
-        maxBinaryChunkBytes: 1024 * 1024,
-        requestBodyStreaming: true,
-        requestBodyWindowChunks: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+        ...capabilities26(),
       },
     },
     endpoints: [
@@ -173,7 +199,8 @@ function seedRegistrationMocks() {
   db.discoveredModel.upsert.mockResolvedValue({ id: "model-id" });
   db.discoveredModel.updateMany.mockResolvedValue({ count: 0 });
   db.poolMember.updateMany.mockResolvedValue({ count: 1 });
-  db.executionTarget.upsert.mockResolvedValue({
+  db.executionTarget.findMany.mockResolvedValue([{ id: "execution-target-id" }]);
+  db.executionTarget.findUnique.mockResolvedValue({
     id: "execution-target-id",
     inferenceCapacityId: "capacity-id",
   });
@@ -653,7 +680,7 @@ describe("RelaySessionManager", () => {
     expect(JSON.parse(String(socket.sends[0]))).toEqual({
       type: "hello.ok",
       id: "hello-id",
-      protocolVersion: "2.1",
+      protocolVersion: "2.6",
       revision: {
         inventorySeq: 1,
         inventoryDigest: "digest",
@@ -903,21 +930,11 @@ describe("RelaySessionManager", () => {
     const frame = JSON.stringify({
       type: "hello",
       id: "hello-id",
-      protocolVersion: "2.1",
+      protocolVersion: "2.6",
       cli: {
         slug: "desktop",
         hostname: "desk-01.local",
-        capabilities: {
-          protocolVersion: "2.1",
-          inventoryAck: true,
-          inventoryReplace: true,
-          endpointTargeting: true,
-          binaryFrames: true,
-          cancellation: true,
-          maxBinaryChunkBytes: 1024 * 1024,
-          requestBodyStreaming: true,
-          requestBodyWindowChunks: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
-        },
+        capabilities: capabilities26(),
       },
       endpoints: [
         {
@@ -1285,41 +1302,19 @@ function id16(fill = 3): string {
 
 function hello24(features?: {
   humanTerminal?: boolean;
-  mcpCommands?: boolean;
+  mcpCommandMode?: "off" | "supervised" | "unsupervised";
   terminalApproval?: boolean;
   terminalSupported?: boolean;
 }) {
   return JSON.stringify({
     type: "hello",
     id: "hello-24",
-    protocolVersion: "2.4",
+    protocolVersion: "2.6",
     cli: {
       slug: "desktop",
       hostname: "desk-01.local",
       version: "9.9.9",
-      capabilities: {
-        protocolVersion: "2.4",
-        inventoryAck: true,
-        inventoryReplace: true,
-        endpointTargeting: true,
-        binaryFrames: true,
-        cancellation: true,
-        maxBinaryChunkBytes: 1024 * 1024,
-        requestBodyStreaming: true,
-        requestBodyWindowChunks: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
-        sharedTokenizerTps: true,
-        standardizedMetrics: true,
-        terminal: true,
-        exec: true,
-        features: {
-          humanTerminal: true,
-          mcpCommands: true,
-          terminalApproval: false,
-          terminalSupported: true,
-          ...features,
-        },
-        terminalPublicKey: uncompressedKey(),
-      },
+      capabilities: capabilities26(features),
     },
     endpoints: [],
   });
@@ -1335,7 +1330,7 @@ describe("relay terminal and exec sessions", () => {
       userId: "user-id",
       slug: "desktop",
       allowHumanTerminal: true,
-      allowMcpCommands: true,
+      mcpCommandMode: "UNSUPERVISED",
     });
   });
 
@@ -1352,27 +1347,26 @@ describe("relay terminal and exec sessions", () => {
   it("echoes the client protocol version and persists reported columns only from hello", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
-    await register(manager, socket, helloFrame());
-    expect(JSON.parse(String(socket.sends[0])).protocolVersion).toBe("2.1");
+    await register(manager, socket, hello24({ mcpCommandMode: "supervised" }));
+    expect(JSON.parse(String(socket.sends[0])).protocolVersion).toBe("2.6");
     expect(db.cliDevice.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         update: expect.objectContaining({
-          cliVersion: null,
-          relayProtocolVersion: "2.1",
-          reportedHumanTerminal: null,
-          reportedMcpCommands: null,
-          reportedTerminalApproval: null,
-          reportedTerminalSupported: null,
-          // Reported on every hello, whatever the protocol version.
+          cliVersion: "9.9.9",
+          relayProtocolVersion: "2.6",
+          reportedHumanTerminal: true,
+          reportedMcpCommandMode: "SUPERVISED",
+          reportedTerminalApproval: false,
+          reportedTerminalSupported: true,
           reportedHostname: "desk-01.local",
-          featuresReportedAt: null,
+          featuresReportedAt: now,
         }),
       }),
     );
     expect(db.cliDevice.upsert.mock.calls[0]?.[0].update).not.toHaveProperty("name");
     expect(db.cliDevice.upsert.mock.calls[0]?.[0].create).not.toHaveProperty("name");
     expect(db.cliDevice.upsert.mock.calls[0]?.[0].update).not.toHaveProperty("allowHumanTerminal");
-    expect(db.cliDevice.upsert.mock.calls[0]?.[0].update).not.toHaveProperty("allowMcpCommands");
+    expect(db.cliDevice.upsert.mock.calls[0]?.[0].update).not.toHaveProperty("mcpCommandMode");
 
     socket.sends.length = 0;
     db.cliDevice.upsert.mockClear();
@@ -1388,25 +1382,11 @@ describe("relay terminal and exec sessions", () => {
     expect(db.cliDevice.upsert.mock.calls[0]?.[0].update).not.toHaveProperty(
       "reportedHumanTerminal",
     );
+    expect(db.cliDevice.upsert.mock.calls[0]?.[0].update).not.toHaveProperty(
+      "reportedMcpCommandMode",
+    );
     expect(db.cliDevice.upsert.mock.calls[0]?.[0].update).not.toHaveProperty("cliVersion");
     expect(db.cliDevice.upsert.mock.calls[0]?.[0].update).not.toHaveProperty("reportedHostname");
-
-    const next = new FakeSocket();
-    await register(manager, next);
-    expect(JSON.parse(String(next.sends[0])).protocolVersion).toBe("2.4");
-    expect(db.cliDevice.upsert).toHaveBeenCalledWith(
-      expect.objectContaining({
-        update: expect.objectContaining({
-          cliVersion: "9.9.9",
-          relayProtocolVersion: "2.4",
-          reportedHumanTerminal: true,
-          reportedMcpCommands: true,
-          reportedTerminalApproval: false,
-          reportedTerminalSupported: true,
-          featuresReportedAt: now,
-        }),
-      }),
-    );
   });
 
   it("clears the reported hostname when a hello omits it", async () => {
@@ -1419,35 +1399,84 @@ describe("relay terminal and exec sessions", () => {
     });
   });
 
-  it("does not send term or exec frames to a CLI below 2.4", async () => {
+  it.each([
+    [
+      "a 2.5 hello",
+      (() => {
+        const frame = JSON.parse(hello24()) as {
+          protocolVersion: string;
+          cli: { capabilities: Record<string, unknown> };
+        };
+        frame.protocolVersion = "2.5";
+        frame.cli.capabilities.protocolVersion = "2.5";
+        delete frame.cli.capabilities.supervisedCommands;
+        return JSON.stringify(frame);
+      })(),
+    ],
+    [
+      "a 0.3.x hello (2.3 with cli.label, no hostname)",
+      JSON.stringify({
+        type: "hello",
+        id: "old",
+        protocolVersion: "2.3",
+        cli: {
+          slug: "desktop",
+          label: "Desktop",
+          version: "0.3.1",
+          capabilities: {
+            protocolVersion: "2.3",
+            inventoryAck: true,
+            inventoryReplace: true,
+            endpointTargeting: true,
+            binaryFrames: true,
+            cancellation: true,
+            maxBinaryChunkBytes: 1024 * 1024,
+            requestBodyStreaming: true,
+            requestBodyWindowChunks: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+            sharedTokenizerTps: true,
+            standardizedMetrics: true,
+          },
+        },
+        endpoints: [],
+      }),
+    ],
+    [
+      "a 2.6 hello carrying cli.label",
+      (() => {
+        const frame = JSON.parse(hello24()) as { cli: Record<string, unknown> };
+        frame.cli.label = "Desktop";
+        return JSON.stringify(frame);
+      })(),
+    ],
+  ])("refuses %s with the upgrade message before schema parsing", async (_, frame) => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
-    await register(manager, socket, helloFrame());
-    socket.sends.length = 0;
-    expect(
-      manager.startTerminal({
-        terminalId: id16(),
-        userId: "user-id",
-        cliDeviceId: "cli-device-id",
-        cols: 80,
-        rows: 24,
-        browserPublicKey: uncompressedKey(),
-        browserNonce: id16(4),
-        connId: "viewer",
-      }),
-    ).toBe(false);
-    const command = {
-      commandId: id16(5),
-      cliDeviceId: "cli-device-id",
-      status: "running" as const,
-      markCancelled() {},
-      markStarted() {},
-      markRejected() {},
-      markDone() {},
-      appendOutput() {},
-    };
-    expect(manager.dispatchExecStart(command, { command: "pwd" })).toBe(false);
-    expect(socket.sends).toEqual([]);
+    await register(manager, socket, frame);
+    expect(socket.sends.map((send) => JSON.parse(String(send)))).toEqual([
+      {
+        type: "protocol.error",
+        failure: "protocol_error",
+        message: RELAY_UPGRADE_REQUIRED_MESSAGE,
+      },
+    ]);
+    expect(socket.closes).toEqual([{ code: 1002, reason: "protocol_error" }]);
+    expect(db.cliDevice.upsert).not.toHaveBeenCalled();
+    expect(manager.getActiveCliDeviceIds()).toEqual([]);
+    // Refused before the strict schema, so no schema-rejection log.
+    expect(consoleError).not.toHaveBeenCalledWith(
+      "[relay] control frame schema rejected",
+      expect.anything(),
+    );
+    consoleError.mockRestore();
+  });
+
+  it("registers a valid 2.6 hello", async () => {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    await register(manager, socket);
+    expect(JSON.parse(String(socket.sends[0]))).toMatchObject({ type: "hello.ok" });
+    expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
   });
 
   it("tears down terminals and commands on close, replacement, and grant removal", async () => {
@@ -1504,7 +1533,7 @@ describe("relay terminal and exec sessions", () => {
 
     manager.applyFeatureGrants("cli-device-id", {
       allowHumanTerminal: false,
-      allowMcpCommands: false,
+      mcpCommandMode: "off",
     });
     const control = first.sends
       .filter((send) => typeof send === "string")
@@ -1523,7 +1552,7 @@ describe("relay terminal and exec sessions", () => {
       userId: "user-id",
       slug: "desktop",
       allowHumanTerminal: true,
-      allowMcpCommands: true,
+      mcpCommandMode: "UNSUPERVISED",
     });
     const again = new FakeSocket();
     await register(manager, again);
@@ -1612,16 +1641,12 @@ describe("relay terminal and exec sessions", () => {
   });
 });
 
-function hello25(features?: { terminalApproval?: boolean; mcpCommands?: boolean }) {
-  const frame = JSON.parse(hello24(features)) as {
-    id: string;
-    protocolVersion: string;
-    cli: { capabilities: Record<string, unknown> };
-  };
+function hello25(features?: {
+  terminalApproval?: boolean;
+  mcpCommandMode?: "off" | "supervised" | "unsupervised";
+}) {
+  const frame = JSON.parse(hello24(features)) as { id: string };
   frame.id = "hello-25";
-  frame.protocolVersion = "2.5";
-  frame.cli.capabilities.protocolVersion = "2.5";
-  frame.cli.capabilities.terminalViewers = true;
   return JSON.stringify(frame);
 }
 
@@ -1638,7 +1663,7 @@ describe("relay protocol 2.5 terminal viewers", () => {
       userId: "user-id",
       slug: "desktop",
       allowHumanTerminal: true,
-      allowMcpCommands: true,
+      mcpCommandMode: "UNSUPERVISED",
     });
     events = [];
     const { registerTerminalBridge } = await import("./session-manager.js");
@@ -1715,20 +1740,21 @@ describe("relay protocol 2.5 terminal viewers", () => {
     });
   }
 
-  it("keeps MCP commands and terminal keys for a 2.5 CLI and persists the version", async () => {
+  it("keeps MCP commands and terminal keys for a 2.6 CLI and persists the version", async () => {
     const { manager } = await setup();
     expect(db.cliDevice.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         update: expect.objectContaining({
-          relayProtocolVersion: "2.5",
-          reportedMcpCommands: true,
+          relayProtocolVersion: "2.6",
+          reportedMcpCommandMode: "UNSUPERVISED",
           reportedHumanTerminal: true,
         }),
       }),
     );
     expect(manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")).toMatchObject({
-      protocolVersion: "2.5",
-      mcpCommands: true,
+      protocolVersion: "2.6",
+      mcpCommandMode: "unsupervised",
+      supervisedCommands: true,
       terminalPublicKey: uncompressedKey(),
     });
     const command = {
@@ -2021,10 +2047,7 @@ describe("relay protocol 2.5 terminal viewers", () => {
     expect(events).toEqual([]);
   });
 
-  it.each([
-    ["2.4", hello24({ terminalApproval: true })],
-    ["2.5", hello25({ terminalApproval: true })],
-  ])(
+  it.each([["2.6", hello25({ terminalApproval: true })]])(
     "closes an expired approval handshake on the %s CLI and a late term.opened",
     async (_, frame) => {
       const { manager, socket } = await setup(frame);
@@ -2095,52 +2118,5 @@ describe("relay protocol 2.5 terminal viewers", () => {
     await manager.removeSession(socket, now);
     expect(events.at(-1)).toMatchObject({ type: "exit", terminalId: second, connIds: ["a"] });
     expect(manager.listTerminalsForUser("user-id")).toEqual([]);
-  });
-
-  it("keeps the 2.4 steal: a second attach replaces the viewer with a detached event", async () => {
-    const { manager, socket } = await setup(hello24());
-    const terminalId = id16(20);
-    manager.startTerminal({
-      terminalId,
-      userId: "user-id",
-      cliDeviceId: "cli-device-id",
-      cols: 80,
-      rows: 24,
-      browserPublicKey: uncompressedKey(),
-      browserNonce: id16(4),
-      connId: "a",
-    });
-    expect(control(socket).at(-1)).not.toHaveProperty("viewerId");
-    await manager.handleTextFrame(
-      socket,
-      JSON.stringify({ type: "term.opened", terminalId, cliNonce: id16(5) }),
-      now,
-    );
-    expect(attach(manager, "b", terminalId).ok).toBe(true);
-    expect(control(socket).at(-1)).toEqual({
-      type: "term.attach",
-      terminalId,
-      browserPublicKey: uncompressedKey(),
-      browserNonce: id16(4),
-    });
-    expect(events).toContainEqual({ type: "detached", terminalId, connId: "a" });
-    expect(events.some((event) => event.type === "viewers")).toBe(false);
-    events = [];
-    manager.handleBinaryFrame(
-      socket,
-      encodeRelayBinaryFrame({ type: "term.sealed", terminalId, seq: 1 }, new Uint8Array([1])),
-    );
-    expect(events).toEqual([expect.objectContaining({ type: "sealed", connIds: ["b"] })]);
-    expect(manager.forwardBrowserSealed(terminalId, "user-id", "b", 1, new Uint8Array([1]))).toBe(
-      "sent",
-    );
-    expect(parseRelayBinaryFrame(socket.sends.at(-1) as ArrayBuffer).metadata).toEqual({
-      type: "term.sealed",
-      terminalId,
-      seq: 1,
-    });
-    expect(manager.forwardBrowserSealed(terminalId, "user-id", "a", 2, new Uint8Array([1]))).toBe(
-      "missing",
-    );
   });
 });

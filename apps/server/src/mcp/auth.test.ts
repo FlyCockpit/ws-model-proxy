@@ -436,6 +436,22 @@ describe("createMcpRequestHandler — admission decisions", () => {
     ).toBe(200);
   });
 
+  it("pending deletion → 403 whatever the ban fields say", async () => {
+    // Better Auth's unban-user / update-user can clear the ban while the
+    // deletion marker stays; the marker alone must refuse.
+    const deleting = {
+      ...healthyUser,
+      banned: false,
+      banExpires: null,
+      deletionRequestedAt: new Date("2026-05-01T00:00:00Z"),
+    };
+    const denied = buildHandler({ prisma: buildPrisma({ user: deleting }) });
+    expect(
+      (await callHandler(denied.handler, mcpRequest({ authorization: `Bearer ${TOKEN}` }))).status,
+    ).toBe(403);
+    expect(denied.transport.calls).toHaveLength(0);
+  });
+
   it("force-2FA policy on + twoFactorEnabled falsy → 403; enabled or policy off → admitted", async () => {
     const noTwoFactor: McpSessionUser = { ...healthyUser, twoFactorEnabled: false };
     const enforced = buildHandler({

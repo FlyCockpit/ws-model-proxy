@@ -60,6 +60,12 @@ vi.mock("@/utils/orpc", () => ({
   },
 }));
 
+const agentRequests = vi.hoisted(() => ({ count: 0 }));
+
+vi.mock("@/hooks/use-pending-agent-requests", () => ({
+  usePendingAgentRequests: () => ({ requests: [], count: agentRequests.count }),
+}));
+
 type RouteMatchStub = { staticData?: { dashboardLayout?: "padded" | "fill" } };
 
 const routeState = vi.hoisted(() => ({
@@ -103,9 +109,21 @@ afterEach(() => {
   workspace.tabs = [];
   routeState.matches = [];
   routeState.notices = [];
+  agentRequests.count = 0;
 });
 
 describe("dashboard sidebar", () => {
+  it("badges Terminals while agent requests wait, and not otherwise", () => {
+    renderLayout();
+    expect(screen.queryAllByText("dashboard:agentRequests.badge")).toHaveLength(0);
+    cleanup();
+    agentRequests.count = 2;
+    renderLayout();
+    // Sidebar and the mobile strip each badge the Terminals link.
+    expect(screen.getAllByText("dashboard:agentRequests.badge").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText("2").length).toBeGreaterThanOrEqual(2);
+  });
+
   it("shows the aside at md and hides the horizontal strip at md", () => {
     useUiPreferences.setState({ sidebarCollapsed: false });
     renderLayout();

@@ -30,6 +30,15 @@
     },
     "./usage-metrics": {
       "default": "./src/usage-metrics.ts"
+    },
+    "./cli-command-output": {
+      "default": "./src/cli-command-output.ts"
+    },
+    "./display-escape": {
+      "default": "./src/display-escape.ts"
+    },
+    "./terminal-socket-policy": {
+      "default": "./src/terminal-socket-policy.ts"
     }
   },
   "files": [

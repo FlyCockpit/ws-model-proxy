@@ -4,12 +4,22 @@ export type TerminalFeature = {
   supported: boolean | null;
   live: boolean;
   available: boolean;
+  /** The CLI requires local approval before a browser can view a terminal. */
+  approvalRequired?: boolean | null;
 };
 
+export const MCP_COMMAND_MODES = ["off", "supervised", "unsupervised"] as const;
+export type McpCommandMode = (typeof MCP_COMMAND_MODES)[number];
+
 export type CommandFeature = {
-  granted: boolean;
-  deviceAllows: boolean | null;
+  /** The dashboard grant. */
+  mode: McpCommandMode;
+  /** The CLI's own config mode; null until a 2.6 CLI reports it. */
+  deviceMode: McpCommandMode | null;
+  /** Supervised commands need a PTY (not on Windows). */
+  supported: boolean | null;
   live: boolean;
+  effectiveMode: McpCommandMode;
   available: boolean;
 };
 
@@ -39,9 +49,11 @@ const EMPTY_TERMINAL: TerminalFeature = {
 };
 
 const EMPTY_COMMANDS: CommandFeature = {
-  granted: false,
-  deviceAllows: null,
+  mode: "off",
+  deviceMode: null,
+  supported: null,
   live: false,
+  effectiveMode: "off",
   available: false,
 };
 
@@ -64,9 +76,42 @@ export function readCliDeviceFeatures(device: {
   };
 }
 
+function modeRank(mode: McpCommandMode): number {
+  return MCP_COMMAND_MODES.indexOf(mode);
+}
+
+/**
+ * Whether the dashboard can grant `option` for this CLI, and why not. `off`
+ * and the current grant are always selectable, so a grant can always be
+ * lowered. A higher mode needs the CLI to allow it in its own config, and
+ * supervised commands need a PTY.
+ */
+export function commandModeOptionState(
+  feature: CommandFeature,
+  option: McpCommandMode,
+): { disabled: boolean; reason: FeatureSwitchReason | null } {
+  if (option === "off" || option === feature.mode) return { disabled: false, reason: null };
+  if (feature.supported === false && option === "supervised") {
+    return { disabled: true, reason: "windows" };
+  }
+  if (feature.deviceMode === null) return { disabled: true, reason: "updateWsmp" };
+  if (modeRank(option) > modeRank(feature.deviceMode)) {
+    return { disabled: true, reason: "configDisabled" };
+  }
+  return { disabled: false, reason: null };
+}
+
+/** Recommend CLI-side browser approval while agents can ask for supervised commands. */
+export function recommendTerminalApproval(
+  commands: CommandFeature,
+  terminal: TerminalFeature,
+): boolean {
+  return commands.mode !== "off" && terminal.approvalRequired !== true;
+}
+
 export function featureSwitchState(
   feature: { granted: boolean; deviceAllows: boolean | null; supported?: boolean | null },
-  kind: "terminal" | "commands",
+  kind: "terminal",
 ): { disabled: boolean; reason: FeatureSwitchReason | null } {
   let reason: FeatureSwitchReason | null = null;
   if (kind === "terminal" && feature.supported === false) reason = "windows";

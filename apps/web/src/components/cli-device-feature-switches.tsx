@@ -2,22 +2,27 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Switch } from "@ws-model-proxy/ui/components/switch";
+import { cn } from "@ws-model-proxy/ui/lib/utils";
+import { ShieldAlert } from "lucide-react";
 import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import {
   type CommandFeature,
+  commandModeOptionState,
   type FeatureSwitchReason,
   featureReasonKey,
   featureSwitchState,
+  MCP_COMMAND_MODES,
+  type McpCommandMode,
   readCliDeviceFeatures,
-  type TerminalFeature,
+  recommendTerminalApproval,
 } from "@/lib/cli-device-features";
 import { orpc } from "@/utils/orpc";
 
 type OptimisticGrants = {
   terminal?: boolean;
-  commands?: boolean;
+  commands?: McpCommandMode;
 };
 
 function FeatureSwitch({
@@ -62,6 +67,71 @@ function FeatureSwitch({
   );
 }
 
+/** Off / Supervised / Unsupervised. Modes above what the CLI allows are disabled. */
+function CommandModeControl({
+  id,
+  feature,
+  selected,
+  pending,
+  onSelect,
+}: {
+  id: string;
+  feature: CommandFeature;
+  selected: McpCommandMode;
+  pending: boolean;
+  onSelect: (mode: McpCommandMode) => void;
+}) {
+  const { t } = useTranslation("dashboard");
+  const reasons = MCP_COMMAND_MODES.map((mode) => commandModeOptionState(feature, mode).reason);
+  const firstReason = reasons.find((reason) => reason !== null) ?? null;
+  const reasonId = `${id}-reason`;
+  return (
+    <fieldset className="min-w-0 flex-1" aria-describedby={firstReason ? reasonId : undefined}>
+      <legend className="flex min-h-11 items-center text-sm font-medium">
+        {t("dashboard:clis.features.commands")}
+      </legend>
+      <div className="flex flex-wrap gap-2">
+        {MCP_COMMAND_MODES.map((mode) => {
+          const state = commandModeOptionState(feature, mode);
+          const optionId = `${id}-${mode}`;
+          const checked = selected === mode;
+          return (
+            <label
+              key={mode}
+              htmlFor={optionId}
+              className={cn(
+                "inline-flex min-h-11 cursor-pointer items-center gap-2 rounded-md border px-3 text-sm has-focus-visible:outline-2 has-focus-visible:outline-ring",
+                checked ? "border-primary bg-primary/10" : "border-border",
+                state.disabled || pending ? "cursor-not-allowed opacity-50" : "hover:bg-muted",
+              )}
+            >
+              <input
+                id={optionId}
+                type="radio"
+                name={`${id}-mode`}
+                value={mode}
+                className="size-4 accent-primary"
+                checked={checked}
+                disabled={state.disabled || pending}
+                onChange={() => onSelect(mode)}
+              />
+              {t(`dashboard:clis.features.commandModes.${mode}`)}
+            </label>
+          );
+        })}
+      </div>
+      <p className="mt-1 text-xs text-muted-foreground">
+        {t(`dashboard:clis.features.commandModeHelp.${selected}`)}
+      </p>
+      {firstReason ? (
+        <p id={reasonId} className="text-xs text-muted-foreground">
+          {t(featureReasonKey(firstReason))}
+        </p>
+      ) : null}
+    </fieldset>
+  );
+}
+
 export function CliDeviceFeatureSwitches({
   cliDeviceId,
   device,
@@ -87,48 +157,52 @@ export function CliDeviceFeatureSwitches({
       },
     }),
   );
-  const terminal = switchView(features.features.terminal, "terminal", optimistic.terminal);
-  const commands = switchView(features.features.commands, "commands", optimistic.commands);
+  const terminalFeature = features.features.terminal;
+  const commandFeature = features.features.commands;
+  const terminalGate = featureSwitchState(terminalFeature, "terminal");
+  const commandMode = optimistic.commands ?? commandFeature.mode;
+  const showApproval = recommendTerminalApproval(
+    { ...commandFeature, mode: commandMode },
+    terminalFeature,
+  );
 
   return (
-    <div className="flex flex-col gap-2 border-b p-4 sm:flex-row">
-      <FeatureSwitch
-        id={`${baseId}-terminal`}
-        label={t("dashboard:clis.features.terminal")}
-        checked={terminal.checked}
-        disabled={terminal.disabled}
-        pending={grants.isPending}
-        reason={terminal.reason}
-        onCheckedChange={(checked) => {
-          setOptimistic((current) => ({ ...current, terminal: checked }));
-          grants.mutate({ cliDeviceId, humanTerminal: checked });
-        }}
-      />
-      <FeatureSwitch
-        id={`${baseId}-commands`}
-        label={t("dashboard:clis.features.commands")}
-        checked={commands.checked}
-        disabled={commands.disabled}
-        pending={grants.isPending}
-        reason={commands.reason}
-        onCheckedChange={(checked) => {
-          setOptimistic((current) => ({ ...current, commands: checked }));
-          grants.mutate({ cliDeviceId, mcpCommands: checked });
-        }}
-      />
+    <div className="flex flex-col gap-3 border-b p-4">
+      <div className="flex flex-col gap-3 sm:flex-row">
+        <FeatureSwitch
+          id={`${baseId}-terminal`}
+          label={t("dashboard:clis.features.terminal")}
+          checked={optimistic.terminal ?? terminalFeature.granted}
+          disabled={terminalGate.disabled}
+          pending={grants.isPending}
+          reason={terminalGate.reason}
+          onCheckedChange={(checked) => {
+            setOptimistic((current) => ({ ...current, terminal: checked }));
+            grants.mutate({ cliDeviceId, humanTerminal: checked });
+          }}
+        />
+        <CommandModeControl
+          id={`${baseId}-commands`}
+          feature={commandFeature}
+          selected={commandMode}
+          pending={grants.isPending}
+          onSelect={(mode) => {
+            setOptimistic((current) => ({ ...current, commands: mode }));
+            grants.mutate({ cliDeviceId, mcpCommandMode: mode });
+          }}
+        />
+      </div>
+      {showApproval ? (
+        <div className="flex min-w-0 gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
+          <ShieldAlert className="mt-0.5 size-4 shrink-0 text-amber-600" aria-hidden="true" />
+          <div className="min-w-0">
+            <p>{t("dashboard:clis.features.approvalRecommended")}</p>
+            <code className="mt-1 block max-w-full overflow-x-auto overflow-y-hidden overscroll-x-contain font-mono text-xs">
+              wsmp config set-terminal-approval on
+            </code>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
-}
-
-function switchView(
-  feature: TerminalFeature | CommandFeature,
-  kind: "terminal" | "commands",
-  optimistic: boolean | undefined,
-): { checked: boolean; disabled: boolean; reason: FeatureSwitchReason | null } {
-  const gate = featureSwitchState(feature, kind);
-  return {
-    checked: optimistic ?? feature.granted,
-    disabled: gate.disabled,
-    reason: gate.reason,
-  };
 }

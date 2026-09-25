@@ -25,6 +25,17 @@ const BROADCAST_LABEL: &[u8] = b"wsmp-term-v2-out";
 const APPROVAL_LABEL_V2: &[u8] = b"wsmp-term-approve-v2";
 const CLI_IDENTITY_LABEL: &[u8] = b"wsmp-term-cli-id-v1";
 pub const PLAINTEXT_OUTPUT_KEY: u8 = 0x03;
+/// Browser -> CLI: turn output review on or off for a supervised command.
+pub const PLAINTEXT_REVIEW_TOGGLE: u8 = 0x04;
+/// CLI -> browser, unicast: the output capture for review.
+pub const PLAINTEXT_REVIEW_CAPTURE: u8 = 0x05;
+/// CLI -> browser: whether output review is on.
+pub const PLAINTEXT_REVIEW_STATE: u8 = 0x06;
+/// Retained capture head, matching the server's bounded command output.
+pub const CAPTURE_HEAD_MAX: usize = 8192;
+/// Retained capture tail, matching the server's bounded command output.
+pub const CAPTURE_TAIL_MAX: usize = 40960;
+const REVIEW_CAPTURE_HEADER_LEN: usize = 1 + 8 + 4;
 const OUTPUT_KEY_PLAINTEXT_LEN: usize = 1 + 4 + 32;
 const BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
@@ -558,10 +569,36 @@ fn aead_open(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], ciphertext: &[u8]) ->
 
 /// v2 plaintexts. `0x01`/`0x02` match v1; `0x03` carries `be32(epoch) ‖ outKey`
 /// and is only ever sent unicast. The v1 codec keeps rejecting `0x03`.
+///
+/// Supervised commands add `0x04` review toggle (`[0x04, on]`, browser to
+/// CLI), `0x05` review capture (`[0x05] ‖ be64(total) ‖ be32(headLen) ‖ head
+/// ‖ tail`, CLI to browser, unicast) and `0x06` review state (`[0x06, on]`).
+#[derive(Debug, PartialEq, Eq)]
 pub enum TermPlaintextV2 {
     Data(Vec<u8>),
-    Resize { cols: u16, rows: u16 },
-    OutputKey { epoch: u32, key: [u8; 32] },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    OutputKey {
+        epoch: u32,
+        key: [u8; 32],
+    },
+    ReviewToggle(bool),
+    ReviewCapture {
+        total: u64,
+        head: Vec<u8>,
+        tail: Vec<u8>,
+    },
+    ReviewState(bool),
+}
+
+fn flag_byte(bytes: &[u8]) -> Result<bool> {
+    match bytes {
+        [_, 0] => Ok(false),
+        [_, 1] => Ok(true),
+        _ => anyhow::bail!("terminal payload is invalid"),
+    }
 }
 
 pub fn encode_plaintext_v2(message: &TermPlaintextV2) -> Result<Vec<u8>> {
@@ -578,6 +615,21 @@ pub fn encode_plaintext_v2(message: &TermPlaintextV2) -> Result<Vec<u8>> {
             out.extend_from_slice(key);
             Ok(out)
         }
+        TermPlaintextV2::ReviewToggle(on) => Ok(vec![PLAINTEXT_REVIEW_TOGGLE, u8::from(*on)]),
+        TermPlaintextV2::ReviewState(on) => Ok(vec![PLAINTEXT_REVIEW_STATE, u8::from(*on)]),
+        TermPlaintextV2::ReviewCapture { total, head, tail } => {
+            if head.len() > CAPTURE_HEAD_MAX || tail.len() > CAPTURE_TAIL_MAX {
+                anyhow::bail!("review capture is too large");
+            }
+            let head_len = u32::try_from(head.len()).context("review capture head")?;
+            let mut out = Vec::with_capacity(REVIEW_CAPTURE_HEADER_LEN + head.len() + tail.len());
+            out.push(PLAINTEXT_REVIEW_CAPTURE);
+            out.extend_from_slice(&total.to_be_bytes());
+            out.extend_from_slice(&head_len.to_be_bytes());
+            out.extend_from_slice(head);
+            out.extend_from_slice(tail);
+            Ok(out)
+        }
     }
 }
 
@@ -589,6 +641,34 @@ pub fn decode_plaintext_v2(bytes: &[u8]) -> Result<TermPlaintextV2> {
         let epoch = require_epoch(u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]))?;
         let key = copy_exact::<32>(&bytes[5..], "terminal output key")?;
         return Ok(TermPlaintextV2::OutputKey { epoch, key });
+    }
+    match bytes.first().copied() {
+        Some(PLAINTEXT_REVIEW_TOGGLE) => {
+            return Ok(TermPlaintextV2::ReviewToggle(flag_byte(bytes)?));
+        }
+        Some(PLAINTEXT_REVIEW_STATE) => return Ok(TermPlaintextV2::ReviewState(flag_byte(bytes)?)),
+        Some(PLAINTEXT_REVIEW_CAPTURE) => {
+            if bytes.len() < REVIEW_CAPTURE_HEADER_LEN {
+                anyhow::bail!("terminal payload is invalid");
+            }
+            let mut total = [0_u8; 8];
+            total.copy_from_slice(&bytes[1..9]);
+            let total = u64::from_be_bytes(total);
+            let head_len = u32::from_be_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]) as usize;
+            let rest = &bytes[REVIEW_CAPTURE_HEADER_LEN..];
+            if head_len > rest.len()
+                || head_len > CAPTURE_HEAD_MAX
+                || rest.len() - head_len > CAPTURE_TAIL_MAX
+            {
+                anyhow::bail!("terminal payload is invalid");
+            }
+            return Ok(TermPlaintextV2::ReviewCapture {
+                total,
+                head: rest[..head_len].to_vec(),
+                tail: rest[head_len..].to_vec(),
+            });
+        }
+        _ => {}
     }
     Ok(match decode_plaintext(bytes)? {
         TermPlaintext::Data(bytes) => TermPlaintextV2::Data(bytes),
@@ -744,6 +824,57 @@ fn copy_exact<const N: usize>(bytes: &[u8], what: &str) -> Result<[u8; N]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_plaintexts_round_trip_and_reject_bad_shapes() {
+        for message in [
+            TermPlaintextV2::ReviewToggle(true),
+            TermPlaintextV2::ReviewToggle(false),
+            TermPlaintextV2::ReviewState(true),
+            TermPlaintextV2::ReviewCapture {
+                total: 70_000,
+                head: vec![b'h'; CAPTURE_HEAD_MAX],
+                tail: vec![b't'; CAPTURE_TAIL_MAX],
+            },
+            TermPlaintextV2::ReviewCapture {
+                total: 0,
+                head: Vec::new(),
+                tail: Vec::new(),
+            },
+        ] {
+            let encoded = encode_plaintext_v2(&message).expect("encode");
+            assert_eq!(decode_plaintext_v2(&encoded).expect("decode"), message);
+        }
+        assert_eq!(
+            encode_plaintext_v2(&TermPlaintextV2::ReviewToggle(true)).expect("toggle"),
+            vec![0x04, 1]
+        );
+        assert!(decode_plaintext_v2(&[0x04]).is_err());
+        assert!(decode_plaintext_v2(&[0x04, 2]).is_err());
+        assert!(decode_plaintext_v2(&[0x06, 1, 0]).is_err());
+        assert!(decode_plaintext_v2(&[0x05, 0, 0]).is_err());
+        let mut long_head = vec![0x05];
+        long_head.extend_from_slice(&0_u64.to_be_bytes());
+        long_head
+            .extend_from_slice(&(u32::try_from(CAPTURE_HEAD_MAX + 1).expect("len")).to_be_bytes());
+        long_head.extend(vec![0_u8; CAPTURE_HEAD_MAX + 1]);
+        assert!(decode_plaintext_v2(&long_head).is_err());
+        let mut past_end = vec![0x05];
+        past_end.extend_from_slice(&0_u64.to_be_bytes());
+        past_end.extend_from_slice(&5_u32.to_be_bytes());
+        past_end.extend_from_slice(b"abc");
+        assert!(decode_plaintext_v2(&past_end).is_err());
+        assert!(
+            encode_plaintext_v2(&TermPlaintextV2::ReviewCapture {
+                total: 1,
+                head: vec![0; CAPTURE_HEAD_MAX + 1],
+                tail: Vec::new(),
+            })
+            .is_err()
+        );
+        // The v1 codec never accepts the supervised tags.
+        assert!(decode_plaintext(&[0x04, 1]).is_err());
+    }
 
     fn hex(value: &str) -> Vec<u8> {
         (0..value.len())

@@ -3,13 +3,22 @@ import { cliSlugFromDeviceLoginScope } from "@ws-model-proxy/config/cli-device-l
 import { validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import {
+  lockCapacityGraphForDelete,
+  runCapacityOrderedTransaction,
+} from "@ws-model-proxy/db/capacity-lock-order";
+import {
   credentialLookupPrefix,
   generateProductCredentialSecret,
   hmacDigestForForwarderPurpose,
   PRODUCT_CREDENTIAL_PREFIXES,
   verifyForwarderHmacDigest,
 } from "@ws-model-proxy/db/forwarder-security";
+import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import type { Context } from "../context";
+import {
+  drainBeforeParentDelete,
+  throwParentDeletionPendingConflict,
+} from "./serializable-transaction";
 
 export type CliCredentialKind = "cliToken" | "deviceCredential";
 
@@ -77,6 +86,11 @@ async function authenticateCliToken(
   });
 
   if (!token || token.revokedAt || isExpired(token.expiresAt, now)) return null;
+  const owner = await prisma.user.findUnique({
+    where: { id: token.userId },
+    select: { banned: true, banExpires: true, deletionRequestedAt: true },
+  });
+  if (!owner || userCredentialAccessBlocked(owner, new Date())) return null;
   if (
     !verifyForwarderHmacDigest({
       purpose: "cliToken",
@@ -115,6 +129,11 @@ async function authenticateDeviceCredential(
   });
 
   if (!credential || credential.revokedAt) return null;
+  const owner = await prisma.user.findUnique({
+    where: { id: credential.userId },
+    select: { banned: true, banExpires: true, deletionRequestedAt: true },
+  });
+  if (!owner || userCredentialAccessBlocked(owner, new Date())) return null;
   if (
     !verifyForwarderHmacDigest({
       purpose: "deviceCredential",
@@ -294,7 +313,46 @@ export async function deleteCliDeviceAndCredentials({
   staleBefore?: Date;
   now?: Date;
 }): Promise<{ revoked: RevokedCliCredentials[] }> {
-  return prisma.$transaction(async (tx) => {
+  // Read-only checks first, so a refused delete drains nothing; the ordered
+  // transaction repeats them under the device lock.
+  const precheck = await prisma.cliDevice.findFirst({
+    where: { id: cliDeviceId, userId },
+    select: { lastHeartbeatAt: true },
+  });
+  if (!precheck) throw new ORPCError("NOT_FOUND", { message: "CLI device not found." });
+  if (staleBefore && precheck.lastHeartbeatAt && precheck.lastHeartbeatAt >= staleBefore) {
+    throw new ORPCError("CONFLICT", { message: "CLI device is not stale." });
+  }
+  // The request history the cascade deletes or detaches (relay requests,
+  // terminal admission history, stickiness records) is drained in short
+  // batches first (DL1-TXBOUND), so the ordered transaction holds the
+  // capacity locks only for the device's graph.
+  await drainBeforeParentDelete({ userId, cliDeviceIds: [cliDeviceId] });
+  // READ COMMITTED with deadlock/lock-set retries: the device delete cascades
+  // into endpoints, models, execution targets, pool members and admission
+  // rows, so it takes the capacity locks in order first (step 4). A residual
+  // above the final-phase bound found by the in-transaction recount rolls it
+  // back and answers CONFLICT, like the pre-lock count.
+  try {
+    return await deleteCliDeviceInCapacityLockOrder({ cliDeviceId, userId, staleBefore, now });
+  } catch (error) {
+    throwParentDeletionPendingConflict(error);
+    throw error;
+  }
+}
+
+async function deleteCliDeviceInCapacityLockOrder({
+  cliDeviceId,
+  userId,
+  staleBefore,
+  now,
+}: {
+  cliDeviceId: string;
+  userId: string;
+  staleBefore?: Date;
+  now: Date;
+}): Promise<{ revoked: RevokedCliCredentials[] }> {
+  return runCapacityOrderedTransaction(prisma, async (tx) => {
     const locked = await tx.cliDevice.updateMany({
       where: { id: cliDeviceId, userId },
       data: { updatedAt: now },
@@ -327,6 +385,11 @@ export async function deleteCliDeviceAndCredentials({
         data: { revokedAt: now },
       });
     }
+    // Capacity lock order: the device row above is L0; take every lock the
+    // cascade can reach (pools, targets, capacities, live admission rows)
+    // before the DELETE, so no admitter holding a capacity lock can be
+    // waiting on a row this delete removes.
+    await lockCapacityGraphForDelete(tx, { userId, cliDeviceIds: [cliDeviceId] });
     await tx.cliDevice.delete({ where: { id: cliDeviceId }, select: { id: true } });
 
     return {

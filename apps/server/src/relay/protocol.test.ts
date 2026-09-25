@@ -3,14 +3,19 @@ import { sanitizeRelayRequestHeaders } from "./headers.js";
 import {
   describeRelayControlParseError,
   encodeRelayBinaryFrame,
+  encodeRelayServerControlMessage,
+  helloNeedsUpgrade,
   parseRelayBinaryFrame,
   parseRelayClientControlFrame,
   parseRelaySubprotocolHeader,
   RELAY_BINARY_CHUNK_MAX_BYTES,
+  RELAY_MIN_PROTOCOL_VERSION,
   RELAY_PROTOCOL_VERSIONS,
   RELAY_SUBPROTOCOL,
+  RELAY_UPGRADE_REQUIRED_MESSAGE,
   relayProtocolAtLeast,
 } from "./protocol.js";
+import { characterCount, RelayWireTextError, truncateCharacters } from "./wire-text.js";
 
 const RELAY_JSON_CONTROL_MAX_BYTES = 64 * 1024;
 
@@ -224,15 +229,37 @@ function bytes16(): string {
   return Buffer.alloc(16, 7).toString("base64url");
 }
 
-function hello(
-  protocolVersion: "2.0" | "2.1" | "2.2" | "2.3" | "2.4" | "2.5",
-  capabilities: unknown,
-) {
+const CAPABILITIES_26 = {
+  protocolVersion: "2.6",
+  inventoryAck: true,
+  inventoryReplace: true,
+  endpointTargeting: true,
+  binaryFrames: true,
+  cancellation: true,
+  maxBinaryChunkBytes: 1024 * 1024,
+  requestBodyStreaming: true,
+  requestBodyWindowChunks: 16,
+  sharedTokenizerTps: true,
+  standardizedMetrics: true,
+  terminal: true,
+  exec: true,
+  features: {
+    humanTerminal: true,
+    mcpCommandMode: "supervised",
+    terminalApproval: false,
+    terminalSupported: true,
+  },
+  terminalPublicKey: uncompressedKey(),
+  terminalViewers: true,
+  supervisedCommands: true,
+};
+
+function hello(protocolVersion: string, capabilities: unknown) {
   return JSON.stringify({
     type: "hello",
     id: "hello-id",
     protocolVersion,
-    cli: { slug: "desktop", hostname: "desk-01.local", version: "1.8.0", capabilities },
+    cli: { slug: "desktop", hostname: "desk-01.local", version: "0.4.0", capabilities },
     endpoints: [endpoint()],
   });
 }
@@ -241,17 +268,10 @@ function helloWithCli(cli: Record<string, unknown>) {
   return JSON.stringify({
     type: "hello",
     id: "hello-id",
-    protocolVersion: "2.0",
+    protocolVersion: "2.6",
     cli: {
       slug: "desktop",
-      capabilities: {
-        protocolVersion: "2.0",
-        binaryFrames: true,
-        cancellation: true,
-        maxBinaryChunkBytes: 1024 * 1024,
-        requestBodyStreaming: true,
-        requestBodyWindowChunks: 16,
-      },
+      capabilities: CAPABILITIES_26,
       ...cli,
     },
     endpoints: [endpoint()],
@@ -281,87 +301,53 @@ describe("hello hostname", () => {
   });
 });
 
-describe("relay protocol 2.4", () => {
-  const shared = {
-    inventoryAck: true,
-    inventoryReplace: true,
-    endpointTargeting: true,
-    binaryFrames: true,
-    cancellation: true,
-    maxBinaryChunkBytes: 1024 * 1024,
-    requestBodyStreaming: true,
-    requestBodyWindowChunks: 16,
-  };
-
-  it("accepts 2.0 through 2.3 hellos unchanged", () => {
-    expect(
-      parseRelayClientControlFrame(
-        hello("2.0", {
-          protocolVersion: "2.0",
-          binaryFrames: true,
-          cancellation: true,
-          maxBinaryChunkBytes: 1024 * 1024,
-          requestBodyStreaming: true,
-          requestBodyWindowChunks: 16,
-        }),
-      ).type,
-    ).toBe("hello");
-    expect(
-      parseRelayClientControlFrame(hello("2.1", { protocolVersion: "2.1", ...shared })).type,
-    ).toBe("hello");
-    expect(
-      parseRelayClientControlFrame(
-        hello("2.2", { protocolVersion: "2.2", ...shared, sharedTokenizerTps: true }),
-      ).type,
-    ).toBe("hello");
-    expect(
-      parseRelayClientControlFrame(
-        hello("2.3", {
-          protocolVersion: "2.3",
-          ...shared,
-          sharedTokenizerTps: true,
-          standardizedMetrics: true,
-        }),
-      ).type,
-    ).toBe("hello");
+describe("relay protocol 2.6 minimum", () => {
+  it("speaks only 2.6 and names the first wsmp that does in the upgrade message", () => {
+    expect(RELAY_PROTOCOL_VERSIONS).toEqual(["2.6"]);
+    expect(RELAY_MIN_PROTOCOL_VERSION).toBe("2.6");
+    expect(RELAY_UPGRADE_REQUIRED_MESSAGE).toContain("wsmp 0.4.0 or newer");
+    expect(RELAY_UPGRADE_REQUIRED_MESSAGE).toContain("Upgrade wsmp");
   });
 
-  it("parses a 2.4 hello and rejects a mismatched capability version", () => {
-    const parsed = parseRelayClientControlFrame(
-      hello("2.4", {
-        protocolVersion: "2.4",
-        ...shared,
-        sharedTokenizerTps: true,
-        standardizedMetrics: true,
-        terminal: true,
-        exec: true,
-        features: {
-          humanTerminal: true,
-          mcpCommands: false,
-          terminalApproval: true,
-          terminalSupported: true,
-        },
-        terminalPublicKey: uncompressedKey(),
-      }),
+  it("flags every older hello, and the pre-naming label field, before schema parsing", () => {
+    for (const version of ["2.0", "2.3", "2.4", "2.5"]) {
+      expect(helloNeedsUpgrade(hello(version, { protocolVersion: version }))).toBe(true);
+    }
+    // 0.3.x shape: protocol 2.3 with `cli.label` and no hostname.
+    expect(
+      helloNeedsUpgrade(
+        JSON.stringify({
+          type: "hello",
+          id: "h",
+          protocolVersion: "2.3",
+          cli: { slug: "desk", label: "Desk", capabilities: { protocolVersion: "2.3" } },
+          endpoints: [],
+        }),
+      ),
+    ).toBe(true);
+    expect(helloNeedsUpgrade(helloWithCli({ label: "Desk" }))).toBe(true);
+    expect(helloNeedsUpgrade(hello("2.6", { ...CAPABILITIES_26, protocolVersion: "2.5" }))).toBe(
+      true,
     );
-    expect(parsed).toMatchObject({ type: "hello", protocolVersion: "2.4" });
-    const withConcurrency = JSON.parse(
-      hello("2.4", {
-        protocolVersion: "2.4",
-        ...shared,
-        sharedTokenizerTps: true,
-        standardizedMetrics: true,
-        terminal: true,
-        exec: true,
-        features: {
-          humanTerminal: true,
-          mcpCommands: false,
-          terminalApproval: true,
-          terminalSupported: true,
+    expect(helloNeedsUpgrade(hello("2.6", CAPABILITIES_26))).toBe(false);
+    expect(helloNeedsUpgrade(JSON.stringify({ type: "heartbeat", id: "x" }))).toBe(false);
+    expect(helloNeedsUpgrade("not json")).toBe(false);
+  });
+
+  it("parses a 2.6 hello and refuses older or loose capability shapes", () => {
+    expect(parseRelayClientControlFrame(hello("2.6", CAPABILITIES_26))).toMatchObject({
+      type: "hello",
+      protocolVersion: "2.6",
+      cli: {
+        capabilities: {
+          supervisedCommands: true,
+          features: { mcpCommandMode: "supervised" },
         },
-        terminalPublicKey: uncompressedKey(),
-      }),
-    ) as { endpoints: Array<{ models: unknown[] }> };
+      },
+    });
+    const withConcurrency = JSON.parse(hello("2.6", CAPABILITIES_26)) as {
+      endpoints: Array<{ models: unknown[] }>;
+    };
     withConcurrency.endpoints[0]?.models.push({
       upstreamModelId: "llama-local",
       capabilityOverrideMode: "inherit",
@@ -377,37 +363,102 @@ describe("relay protocol 2.4", () => {
     });
     expect(() => parseRelayClientControlFrame(JSON.stringify(withConcurrency))).toThrow();
 
+    const bad: unknown[] = [
+      { ...CAPABILITIES_26, supervisedCommands: false },
+      { ...CAPABILITIES_26, terminalViewers: false },
+      { ...CAPABILITIES_26, extra: true },
+      { ...CAPABILITIES_26, terminalPublicKey: uncompressedKey(0x02) },
+      {
+        ...CAPABILITIES_26,
+        features: { ...CAPABILITIES_26.features, mcpCommandMode: "always" },
+      },
+      {
+        ...CAPABILITIES_26,
+        features: {
+          humanTerminal: true,
+          mcpCommands: true,
+          terminalApproval: false,
+          terminalSupported: true,
+        },
+      },
+    ];
+    for (const capabilities of bad) {
+      expect(() => parseRelayClientControlFrame(hello("2.6", capabilities))).toThrow();
+    }
     expect(() =>
-      parseRelayClientControlFrame(
-        hello("2.4", {
-          protocolVersion: "2.3",
-          ...shared,
-          sharedTokenizerTps: true,
-          standardizedMetrics: true,
-        }),
-      ),
-    ).toThrow();
-    expect(() =>
-      parseRelayClientControlFrame(
-        hello("2.4", {
-          protocolVersion: "2.4",
-          ...shared,
-          sharedTokenizerTps: true,
-          standardizedMetrics: true,
-          terminal: true,
-          exec: true,
-          features: {
-            humanTerminal: true,
-            mcpCommands: true,
-            terminalApproval: false,
-            terminalSupported: true,
-          },
-          terminalPublicKey: uncompressedKey(0x02),
-        }),
-      ),
+      parseRelayClientControlFrame(hello("2.5", { ...CAPABILITIES_26, protocolVersion: "2.5" })),
     ).toThrow();
   });
 
+  it("accepts an optional, strict terminalIdentity", () => {
+    const identityKey = Buffer.alloc(65, 3);
+    identityKey[0] = 0x04;
+    const terminalIdentity = {
+      publicKey: identityKey.toString("base64url"),
+      signature: Buffer.alloc(64, 7).toString("base64url"),
+    };
+    expect(
+      parseRelayClientControlFrame(hello("2.6", { ...CAPABILITIES_26, terminalIdentity })),
+    ).toMatchObject({ cli: { capabilities: { terminalIdentity } } });
+    for (const bad of [
+      { publicKey: terminalIdentity.publicKey },
+      { ...terminalIdentity, signature: Buffer.alloc(63, 7).toString("base64url") },
+      { ...terminalIdentity, extra: true },
+    ]) {
+      expect(() =>
+        parseRelayClientControlFrame(hello("2.6", { ...CAPABILITIES_26, terminalIdentity: bad })),
+      ).toThrow();
+    }
+  });
+
+  it("parses the supervised-command frames strictly", () => {
+    const id = bytes16();
+    expect(
+      parseRelayClientControlFrame(
+        JSON.stringify({ type: "term.spawned", terminalId: id, commandId: id }),
+      ),
+    ).toMatchObject({ type: "term.spawned" });
+    for (const frame of [
+      { type: "supervised.rejected", commandId: id, reason: "limit" },
+      { type: "supervised.accepted", commandId: id },
+      { type: "supervised.declined", commandId: id },
+      { type: "supervised.done", commandId: id, exitCode: 0, review: false, outputBytes: 3 },
+      { type: "supervised.done", commandId: id, signal: 9, review: true },
+    ]) {
+      expect(parseRelayClientControlFrame(JSON.stringify(frame)).type).toBe(frame.type);
+    }
+    for (const frame of [
+      { type: "supervised.accepted", commandId: id, extra: 1 },
+      { type: "supervised.done", commandId: id, exitCode: 0 },
+      { type: "supervised.done", commandId: "short", review: false },
+      { type: "supervised.done", commandId: id, review: false, outputBytes: -1 },
+      { type: "term.spawned", terminalId: id },
+    ]) {
+      expect(() => parseRelayClientControlFrame(JSON.stringify(frame))).toThrow();
+    }
+    const output = parseRelayBinaryFrame(
+      encodeRelayBinaryFrame(
+        { type: "supervised.output", commandId: id, part: "tail", seq: 2 },
+        new Uint8Array([1, 2]),
+      ),
+    );
+    expect(output.metadata).toEqual({
+      type: "supervised.output",
+      commandId: id,
+      part: "tail",
+      seq: 2,
+    });
+    const metadataBytes = new TextEncoder().encode(
+      JSON.stringify({ type: "supervised.output", commandId: id, part: "middle", seq: 1 }),
+    );
+    const bad = new Uint8Array(4 + metadataBytes.byteLength);
+    new DataView(bad.buffer).setUint32(0, metadataBytes.byteLength, false);
+    bad.set(metadataBytes, 4);
+    expect(() => parseRelayBinaryFrame(bad.buffer)).toThrow();
+  });
+});
+
+describe("relay terminal and exec frames", () => {
   it("rejects unknown keys on terminal and exec frames", () => {
     const opened = parseRelayClientControlFrame(
       JSON.stringify({ type: "term.opened", terminalId: bytes16(), cliNonce: bytes16() }),
@@ -476,29 +527,7 @@ describe("relay protocol 2.4", () => {
   });
 });
 
-describe("relay protocol 2.5", () => {
-  const capabilities24 = {
-    inventoryAck: true,
-    inventoryReplace: true,
-    endpointTargeting: true,
-    binaryFrames: true,
-    cancellation: true,
-    maxBinaryChunkBytes: 1024 * 1024,
-    requestBodyStreaming: true,
-    requestBodyWindowChunks: 16,
-    sharedTokenizerTps: true,
-    standardizedMetrics: true,
-    terminal: true,
-    exec: true,
-    features: {
-      humanTerminal: true,
-      mcpCommands: true,
-      terminalApproval: false,
-      terminalSupported: true,
-    },
-    terminalPublicKey: uncompressedKey(),
-  };
-
+describe("relay viewer frames", () => {
   function viewer(fill = 8): string {
     return Buffer.alloc(16, fill).toString("base64url");
   }
@@ -510,75 +539,6 @@ describe("relay protocol 2.5", () => {
     frame.set(metadataBytes, 4);
     return frame.buffer;
   }
-
-  it("accepts an optional, strict 2.5 terminalIdentity and keeps it off 2.4", () => {
-    const identityKey = Buffer.alloc(65, 3);
-    identityKey[0] = 0x04;
-    const terminalIdentity = {
-      publicKey: identityKey.toString("base64url"),
-      signature: Buffer.alloc(64, 7).toString("base64url"),
-    };
-    const v25 = { protocolVersion: "2.5", ...capabilities24, terminalViewers: true };
-    expect(parseRelayClientControlFrame(hello("2.5", { ...v25, terminalIdentity }))).toMatchObject({
-      cli: { capabilities: { terminalIdentity } },
-    });
-    for (const bad of [
-      { publicKey: terminalIdentity.publicKey },
-      { ...terminalIdentity, signature: Buffer.alloc(63, 7).toString("base64url") },
-      { ...terminalIdentity, publicKey: Buffer.alloc(65, 3).toString("base64url") },
-      { ...terminalIdentity, extra: true },
-    ]) {
-      expect(() =>
-        parseRelayClientControlFrame(hello("2.5", { ...v25, terminalIdentity: bad })),
-      ).toThrow();
-    }
-    expect(() =>
-      parseRelayClientControlFrame(
-        hello("2.4", { protocolVersion: "2.4", ...capabilities24, terminalIdentity }),
-      ),
-    ).toThrow();
-  });
-
-  it("accepts a 2.5 hello only with terminalViewers and keeps 2.4 strict", () => {
-    expect(RELAY_PROTOCOL_VERSIONS).toContain("2.5");
-    expect(
-      parseRelayClientControlFrame(
-        hello("2.5", { protocolVersion: "2.5", ...capabilities24, terminalViewers: true }),
-      ),
-    ).toMatchObject({
-      type: "hello",
-      protocolVersion: "2.5",
-      cli: { capabilities: { terminalViewers: true } },
-    });
-    expect(() =>
-      parseRelayClientControlFrame(hello("2.5", { protocolVersion: "2.5", ...capabilities24 })),
-    ).toThrow();
-    expect(() =>
-      parseRelayClientControlFrame(
-        hello("2.5", { protocolVersion: "2.5", ...capabilities24, terminalViewers: false }),
-      ),
-    ).toThrow();
-    expect(() =>
-      parseRelayClientControlFrame(
-        hello("2.5", {
-          protocolVersion: "2.5",
-          ...capabilities24,
-          terminalViewers: true,
-          extra: true,
-        }),
-      ),
-    ).toThrow();
-    expect(() =>
-      parseRelayClientControlFrame(
-        hello("2.4", { protocolVersion: "2.4", ...capabilities24, terminalViewers: true }),
-      ),
-    ).toThrow();
-    expect(() =>
-      parseRelayClientControlFrame(
-        hello("2.4", { protocolVersion: "2.5", ...capabilities24, terminalViewers: true }),
-      ),
-    ).toThrow();
-  });
 
   it("compares versions numerically", () => {
     expect(relayProtocolAtLeast("2.5", "2.4")).toBe(true);
@@ -706,5 +666,72 @@ describe("sanitizeRelayRequestHeaders", () => {
     });
     expect(headers).not.toHaveProperty("openai-organization");
     expect(headers).not.toHaveProperty("openai-project");
+  });
+});
+
+describe("relay text is always well-formed Unicode", () => {
+  it("refuses to encode a frame with an unpaired surrogate in any string", () => {
+    // JSON.stringify would write `\ud800`, which the CLI cannot parse.
+    expect(JSON.stringify({ command: "\ud800" })).toBe('{"command":"\\ud800"}');
+    for (const command of ["echo \ud800", "\udc00", "x\udbff"]) {
+      expect(() =>
+        encodeRelayServerControlMessage({ type: "exec.start", commandId: "c", command }),
+      ).toThrow(RelayWireTextError);
+    }
+    expect(() =>
+      encodeRelayServerControlMessage({
+        type: "term.spawn",
+        terminalId: "t",
+        commandId: "c",
+        command: "true",
+        requester: "agent \ud83d",
+        shareOutput: false,
+      }),
+    ).toThrow(RelayWireTextError);
+    expect(() =>
+      encodeRelayServerControlMessage({
+        type: "relay.request",
+        requestId: "r",
+        family: "generic",
+        method: "GET",
+        path: "/",
+        headers: { "x-\ud800": "v" },
+        timeoutMs: 1,
+        endpointSlug: "e",
+        expectBody: false,
+      }),
+    ).toThrow(RelayWireTextError);
+    expect(() =>
+      encodeRelayBinaryFrame(
+        { type: "term.sealed", terminalId: "\ud800", seq: 1 },
+        new Uint8Array(),
+      ),
+    ).toThrow(RelayWireTextError);
+    // Paired surrogates (astral characters) are fine and sent as they are.
+    expect(
+      encodeRelayServerControlMessage({ type: "exec.start", commandId: "c", command: "echo 😀" }),
+    ).toBe('{"type":"exec.start","commandId":"c","command":"echo 😀"}');
+  });
+
+  it("counts characters as code points and cuts only between graphemes", () => {
+    expect(characterCount("😀".repeat(500))).toBe(500);
+    expect(truncateCharacters(`${"a".repeat(99)}😀b`, 100)).toBe(`${"a".repeat(99)}😀`);
+    expect(truncateCharacters(`${"a".repeat(99)}😀`, 100)).toBe(`${"a".repeat(99)}😀`);
+    expect(truncateCharacters(`${"a".repeat(100)}😀`, 100)).toBe("a".repeat(100));
+    expect(truncateCharacters(`${"a".repeat(98)}e\u0301x`, 99)).toBe("a".repeat(98));
+    expect(truncateCharacters("a\ud800b", 100)).toBe("a\ufffdb");
+  });
+
+  it("never truncates non-empty text to nothing", () => {
+    // One grapheme of 101 code points: the cut falls between code points.
+    const stacked = `e${"\u0301".repeat(100)}`;
+    expect(truncateCharacters(stacked, 100)).toBe(`e${"\u0301".repeat(99)}`);
+    expect(truncateCharacters(`${stacked}x`, 100)).toBe(`e${"\u0301".repeat(99)}`);
+    // A lone surrogate becomes U+FFFD, which starts a new grapheme.
+    const broken = truncateCharacters(`e${"\u0301".repeat(50)}\ud800${"\u0301".repeat(60)}`, 100);
+    expect(broken).toBe(`e${"\u0301".repeat(50)}`);
+    // Marks with no base letter are one grapheme too.
+    expect(truncateCharacters("\u0301".repeat(120), 100)).toBe("\u0301".repeat(100));
+    expect(truncateCharacters("", 100)).toBe("");
   });
 });

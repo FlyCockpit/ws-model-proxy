@@ -7,7 +7,9 @@ type Tone = "live" | "pending" | "problem" | "ended";
 function toneOf(tab: TerminalTab): Tone {
   if (tab.phase === "rejected") return "problem";
   if (tab.phase === "exited") return "ended";
-  if (tab.phase === "opening" || tab.error === "slow") return "pending";
+  if (tab.phase === "opening" || tab.phase === "waiting" || tab.error === "slow") {
+    return "pending";
+  }
   if (tab.error && tab.error !== "detached") return "problem";
   return "live";
 }

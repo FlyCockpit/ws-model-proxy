@@ -21,10 +21,13 @@ const {
   CLI_OUTPUT_ELLIPSIS,
   CLI_STREAM_HEAD_MAX_BYTES,
   CLI_STREAM_TAIL_MAX_BYTES,
+  CLI_OUTPUT_CREDENTIAL_PREFIXES,
   formatBoundedStream,
   presentCliCommand,
+  presentSupervisedCommand,
   redactCredentialSubstrings,
 } = await import("./cli-command-output");
+const { PRODUCT_CREDENTIAL_PREFIXES } = await import("@ws-model-proxy/db/forwarder-security");
 
 const text = (value: string) => new TextEncoder().encode(value);
 
@@ -235,5 +238,115 @@ describe("CLI command output formatting", () => {
       undefined,
     );
     expect(record.rejectionReason).toBe("bad_cwd");
+  });
+});
+
+describe("shared credential prefixes", () => {
+  it("equal the product credential prefixes, so the browser review shows what the agent gets", () => {
+    expect([...CLI_OUTPUT_CREDENTIAL_PREFIXES].sort()).toEqual(
+      Object.values(PRODUCT_CREDENTIAL_PREFIXES).sort(),
+    );
+  });
+});
+
+describe("presentSupervisedCommand", () => {
+  const base = {
+    commandId: "sup-1",
+    exitCode: null,
+    signal: null,
+    rejectionReason: null,
+    waitDeadline: null,
+    started: null,
+    output: null,
+    shared: null,
+    reviewedText: null,
+  };
+  const capture = {
+    head: text("SECRET_UNREVIEWED_OUTPUT"),
+    tail: new Uint8Array(),
+    totalBytes: 24,
+  };
+
+  it.each(["awaiting_user", "running", "awaiting_output_review"])(
+    "carries only the status while %s, even if a capture is present",
+    (status) => {
+      const presented = presentSupervisedCommand({ ...base, status, shared: capture });
+      expect(JSON.stringify(presented)).not.toContain("SECRET_UNREVIEWED_OUTPUT");
+      expect(presented).not.toHaveProperty("stdout");
+      expect(presented).toMatchObject({ commandId: "sup-1", kind: "supervised", status });
+    },
+  );
+
+  it.each(["redacted", "private"] as const)("has no stdout for mode %s", (mode) => {
+    const presented = presentSupervisedCommand({
+      ...base,
+      status: "exited",
+      exitCode: 0,
+      output: { mode, edited: false },
+      shared: capture,
+    });
+    expect(presented).not.toHaveProperty("stdout");
+    expect(JSON.stringify(presented)).not.toContain("SECRET_UNREVIEWED_OUTPUT");
+    expect(presented).toMatchObject({ status: "exited", exitCode: 0, output: { mode } });
+  });
+
+  it("shows shared capture text and reviewed text with the edited flag", () => {
+    const shared = presentSupervisedCommand({
+      ...base,
+      status: "exited",
+      exitCode: 2,
+      output: { mode: "shared", edited: false },
+      shared: {
+        head: text("\u001b[31mred\u001b[0m wsmp_cli_abc"),
+        tail: new Uint8Array(),
+        totalBytes: 24,
+      },
+    });
+    expect(shared).toMatchObject({
+      exitCode: 2,
+      output: { mode: "shared", edited: false },
+      stdout: { text: "red [redacted]", truncated: false },
+    });
+    const reviewed = presentSupervisedCommand({
+      ...base,
+      status: "exited",
+      exitCode: 0,
+      output: { mode: "reviewed", edited: true },
+      reviewedText: "ok",
+    });
+    expect(reviewed).toMatchObject({
+      output: { mode: "reviewed", edited: true },
+      stdout: { text: "ok", truncated: false, totalBytes: 2 },
+    });
+  });
+
+  it("reports why a request ended and whether its command had started", () => {
+    expect(
+      presentSupervisedCommand({
+        ...base,
+        status: "cancelled",
+        rejectionReason: "cli_disconnected",
+      }),
+    ).toEqual({
+      commandId: "sup-1",
+      kind: "supervised",
+      status: "cancelled",
+      started: null,
+      rejectionReason: "cli_disconnected",
+    });
+    expect(
+      presentSupervisedCommand({
+        ...base,
+        status: "cancelled",
+        rejectionReason: "token_revoked",
+        started: true,
+      }),
+    ).toMatchObject({ status: "cancelled", started: true });
+    expect(presentSupervisedCommand({ ...base, status: "expired", started: false })).toEqual({
+      commandId: "sup-1",
+      kind: "supervised",
+      status: "expired",
+      started: false,
+    });
   });
 });

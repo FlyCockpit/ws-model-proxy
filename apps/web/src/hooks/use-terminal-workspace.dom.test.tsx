@@ -83,6 +83,14 @@ function tab(localId: string, cliDeviceId: string): TerminalTab {
     ptyCols: null,
     ptyRows: null,
     opener: false,
+    origin: "user",
+    supervised: null,
+    reviewOutput: null,
+    reviewCapture: null,
+    exitCode: null,
+    exitSignal: null,
+    decline: null,
+    ending: null,
   };
 }
 

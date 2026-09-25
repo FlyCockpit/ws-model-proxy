@@ -49,8 +49,8 @@
  */
 
 import { deepStrictEqual } from "node:assert/strict";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { posix, resolve } from "node:path";
 
 const ROOT = resolve(import.meta.dirname!, "..");
 
@@ -68,10 +68,12 @@ const RUNNER = "runner";
 const DOCKERFILES = ["Dockerfile"];
 
 // A follower may wait up to the entrypoint's advisory-lock timeout before the
-// schema leader's `prisma db push` and hardening run. Reserve an additional two
-// minutes for that bounded apply phase and application boot before failed
-// health probes count toward an unhealthy rollout.
-const SCHEMA_APPLY_AND_BOOT_SLACK_SECONDS = 120;
+// schema leader's `prisma db push` and hardening run. Reserve additional time
+// for that bounded apply phase and application boot before failed health
+// probes count toward an unhealthy rollout: push-schema.mjs retries lock
+// conflicts for at most ~90s (8 attempts, 5s lock_timeout, <=8s backoff),
+// apply-schema-hardening.mjs for at most 60s, plus the runs and boot.
+const SCHEMA_APPLY_AND_BOOT_SLACK_SECONDS = 170;
 
 // Runtime artifacts invoked by the production entrypoint. Unlike workspace
 // manifests, these are deliberately copied one-by-one into the minimal runner
@@ -80,6 +82,10 @@ const REQUIRED_RUNNER_COPIES = [
   {
     source: "/app/packages/db/scripts/apply-schema-hardening.mjs",
     destination: "./packages/db/scripts/apply-schema-hardening.mjs",
+  },
+  {
+    source: "/app/packages/db/scripts/push-schema.mjs",
+    destination: "./packages/db/scripts/push-schema.mjs",
   },
 ];
 
@@ -175,6 +181,115 @@ function healthcheckSchemaBudgetErrors(
   ];
 }
 
+/**
+ * Relative module and file references of a runtime script: static
+ * `import`/`export ... from`, dynamic `import()`, and
+ * `new URL(<relative>, import.meta.url)`. Only `./` and `../` specifiers;
+ * bare package names resolve from the COPY'd node_modules.
+ */
+export function relativeReferences(source: string): string[] {
+  const found = new Set<string>();
+  const patterns = [
+    /\b(?:import|export)\s[^;]*?\bfrom\s*["'](\.{1,2}\/[^"']*|\.{1,2})["']/g,
+    /\bimport\s*["'](\.{1,2}\/[^"']*)["']/g,
+    /\bimport\s*\(\s*["'](\.{1,2}\/[^"']*)["']\s*\)/g,
+    /\bnew\s+URL\(\s*["'](\.{1,2}(?:\/[^"']*)?)["']\s*,\s*import\.meta\.url\s*\)/g,
+  ];
+  for (const pattern of patterns)
+    for (const match of source.matchAll(pattern)) if (match[1]) found.add(match[1]);
+  return [...found];
+}
+
+type RunnerCopy = { source: string; destination: string };
+
+/** `COPY [--flags] --from=builder <source> <destination>` lines of the runner stage. */
+export function runnerBuilderCopies(dockerfileText: string): RunnerCopy[] {
+  const copies: RunnerCopy[] = [];
+  let currentStage = "";
+  for (const { line } of logicalLines(dockerfileText)) {
+    const stageMatch = /^FROM\s+(?:--\S+\s+)*\S+\s+AS\s+(\S+)/i.exec(line);
+    if (stageMatch) {
+      currentStage = stageMatch[1] ?? "";
+      continue;
+    }
+    if (currentStage !== RUNNER) continue;
+    const fields = line.split(/\s+/);
+    if (fields[0]?.toUpperCase() !== "COPY" || !fields.includes("--from=builder")) continue;
+    const source = fields.at(-2);
+    const destination = fields.at(-1);
+    if (source && destination) copies.push({ source, destination });
+  }
+  return copies;
+}
+
+/** The runner copy that places `/app/<path>` at the same path in the image, if any. */
+function coveringCopy(copies: RunnerCopy[], appPath: string): RunnerCopy | undefined {
+  return copies.find(
+    ({ source, destination }) =>
+      (appPath === source || appPath.startsWith(`${source}/`)) &&
+      destination === `.${source.slice("/app".length)}`,
+  );
+}
+
+/**
+ * Every file a runtime script reaches through relative references (followed
+ * through imported .mjs/.js modules) that the runner stage does not COPY to
+ * the same path. `read` returns a repo file's text, `isDirectory` whether a
+ * repo path is a directory (a directory reference, e.g. a package root used
+ * as a cwd, is not a file the image must contain).
+ */
+export function missingRuntimeReferences(
+  entries: readonly string[],
+  copies: RunnerCopy[],
+  read: (repoPath: string) => string | null,
+  isDirectory: (repoPath: string) => boolean,
+): string[] {
+  const missing = new Set<string>();
+  const seen = new Set<string>();
+  const queue = [...entries];
+  while (queue.length > 0) {
+    const appPath = queue.shift() ?? "";
+    if (seen.has(appPath)) continue;
+    seen.add(appPath);
+    const repoPath = appPath.slice("/app/".length);
+    const text = read(repoPath);
+    if (text === null) continue;
+    for (const reference of relativeReferences(text)) {
+      const target = posix.normalize(posix.join(posix.dirname(appPath), reference));
+      if (isDirectory(target.slice("/app/".length))) continue;
+      if (!coveringCopy(copies, target)) missing.add(`${target} (referenced by ${appPath})`);
+      if (/\.(?:mjs|js)$/.test(target)) queue.push(target);
+    }
+  }
+  return [...missing];
+}
+
+{
+  // Regression fixture: the pass-8 image copied push-schema.mjs without the
+  // helper it imports. The closure check must report it.
+  const files: Record<string, string> = {
+    "packages/db/scripts/push-schema.mjs": `import { a } from "./helper.mjs";\nconst x = await import("./lazy.mjs");\nconst root = new URL("..", import.meta.url);\nconst sql = new URL("../prisma/x.sql", import.meta.url);`,
+    "packages/db/scripts/helper.mjs": `export { b } from "./nested.mjs";`,
+    "packages/db/scripts/lazy.mjs": "",
+    "packages/db/scripts/nested.mjs": "",
+  };
+  const fixture = `FROM node AS runner
+COPY --from=builder /app/packages/db/prisma ./packages/db/prisma
+COPY --from=builder /app/packages/db/scripts/push-schema.mjs ./packages/db/scripts/push-schema.mjs
+COPY --from=builder /app/packages/db/scripts/lazy.mjs ./packages/db/scripts/lazy.mjs
+`;
+  const result = missingRuntimeReferences(
+    ["/app/packages/db/scripts/push-schema.mjs"],
+    runnerBuilderCopies(fixture),
+    (path) => files[path] ?? null,
+    (path) => path === "packages/db",
+  );
+  deepStrictEqual(result.sort(), [
+    "/app/packages/db/scripts/helper.mjs (referenced by /app/packages/db/scripts/push-schema.mjs)",
+    "/app/packages/db/scripts/nested.mjs (referenced by /app/packages/db/scripts/helper.mjs)",
+  ]);
+}
+
 if (process.argv.includes("--self-test")) {
   const healthcheckFixture = (startPeriod: number) => `FROM base AS runner
 HEALTHCHECK --interval=30s --timeout=5s --start-period=${startPeriod}s \\
@@ -182,8 +297,8 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=${startPeriod}s \\
 `;
   deepStrictEqual(schemaLockTimeoutSeconds("SET lock_timeout = '300s';"), 300);
   deepStrictEqual(healthcheckSchemaBudgetErrors("Dockerfile", healthcheckFixture(480), 300), []);
-  deepStrictEqual(healthcheckSchemaBudgetErrors("Dockerfile", healthcheckFixture(420), 300), [
-    "Dockerfile: HEALTHCHECK --start-period=420s must exceed the schema startup budget (300s advisory-lock wait + 120s apply/boot slack = 420s).",
+  deepStrictEqual(healthcheckSchemaBudgetErrors("Dockerfile", healthcheckFixture(470), 300), [
+    "Dockerfile: HEALTHCHECK --start-period=470s must exceed the schema startup budget (300s advisory-lock wait + 170s apply/boot slack = 470s).",
   ]);
   console.log("Docker runtime regression checks passed.");
   process.exit(0);
@@ -314,6 +429,24 @@ for (const dockerfile of DOCKERFILES) {
         `${dockerfile}: missing runtime COPY for "${required.source}" to "${required.destination}".`,
       );
     }
+  }
+
+  // Runtime scripts reach other files through relative imports and
+  // `new URL(..., import.meta.url)`; the runner copies files one by one, so
+  // every file in that closure must be copied to the same path.
+  for (const reference of missingRuntimeReferences(
+    REQUIRED_RUNNER_COPIES.map((required) => required.source),
+    runnerBuilderCopies(dockerfileText),
+    (repoPath) => {
+      const path = resolve(ROOT, repoPath);
+      return existsSync(path) && statSync(path).isFile() ? readFileSync(path, "utf8") : null;
+    },
+    (repoPath) => {
+      const path = resolve(ROOT, repoPath);
+      return existsSync(path) && statSync(path).isDirectory();
+    },
+  )) {
+    errors.push(`${dockerfile} (${RUNNER}): runtime script reference not copied: ${reference}.`);
   }
 
   const builder = stages.get(BUILDER);

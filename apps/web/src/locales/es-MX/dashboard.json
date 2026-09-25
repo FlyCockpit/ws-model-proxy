@@ -171,7 +171,18 @@
       "saveFailed": "No se pudo actualizar el acceso a funciones del CLI. Intenta de nuevo.",
       "windows": "Aún no es compatible con Windows",
       "configDisabled": "Desactivado en la configuración wsmp de este CLI — edítala y reinicia wsmp",
-      "updateWsmp": "Actualiza wsmp para usar esto"
+      "updateWsmp": "Actualiza wsmp para usar esto",
+      "commandModes": {
+        "off": "Desactivado",
+        "supervised": "Supervisado",
+        "unsupervised": "Sin supervisión"
+      },
+      "commandModeHelp": {
+        "off": "Los agentes MCP no pueden ejecutar comandos en este CLI.",
+        "supervised": "Un agente puede pedir ejecutar un comando; solo se ejecuta después de que alguien presione Enter en la pantalla de confirmación del CLI.",
+        "unsupervised": "Los agentes pueden ejecutar comandos sin interfaz y también pedir comandos supervisados."
+      },
+      "approvalRecommended": "Recomendado: exige aprobación del navegador en este CLI. Sin ella, el CLI acepta cualquier navegador que admita el servidor de WS Model Proxy, así que \"nada se ejecuta sin que presiones una tecla\" y \"la salida sin revisar nunca llega al servidor\" solo se cumplen mientras el servidor sea honesto: un servidor comprometido, o cualquiera con una sesión iniciada en esta cuenta, podría abrir una solicitud, presionar Enter y leer su salida. Con aprobación, solo pueden hacerlo los navegadores que aprobaste en este CLI, siempre que el código del panel que carga tu navegador sea legítimo (lo sirve el mismo servidor, que no tiene las claves de la terminal, pero un servidor comprometido podría servir código alterado). Ejecuta en el CLI:"
     },
     "rename": {
       "action": "Renombrar",
@@ -268,6 +279,8 @@
     "endSession": "Terminar sesión",
     "endSessionTitle": "¿Terminar esta sesión de terminal?",
     "endSessionDescription": "El shell se detiene para todos los que la están viendo. Se pierde el trabajo sin guardar.",
+    "ending": "Terminando esta sesión…",
+    "endFailed": "No se pudo terminar esta sesión. Puede que siga en ejecución; intenta Terminar sesión de nuevo.",
     "status": {
       "youTyping": "Estás escribiendo",
       "otherTyping": "Alguien más está escribiendo",
@@ -303,6 +316,7 @@
       "cli_too_old": "Actualiza wsmp para usar terminales",
       "offline": "El CLI está desconectado",
       "invalid": "Esa solicitud de terminal no es válida",
+      "rate_limited": "Demasiados mensajes de terminal a la vez; inténtalo de nuevo en un momento",
       "viewer_limit": "Ya hay demasiadas pestañas viendo esta terminal",
       "bad_frame": "El CLI desconectó esta pestaña por un marco inválido",
       "identity_changed": "La clave de identidad de esta CLI cambió",
@@ -336,7 +350,8 @@
       "opening": "Conectando",
       "live": "Conectada",
       "rejected": "Rechazada",
-      "exited": "Finalizada"
+      "exited": "Finalizada",
+      "waiting": "Sin ver"
     }
   },
   "nav": {
@@ -1297,6 +1312,65 @@
           "action": "Abrir prueba de chat"
         }
       }
+    }
+  },
+  "agentRequests": {
+    "badge_one": "{{count}} solicitud de agente en espera",
+    "badge_other": "{{count}} solicitudes de agente en espera",
+    "noticeTitle_one": "Un agente está esperándote",
+    "noticeTitle_other": "{{count}} solicitudes de agentes te están esperando",
+    "noticeBody": "{{requester}} pidió ejecutar un comando en uno de tus CLI. Nada se ejecuta hasta que presiones Enter en la pantalla de confirmación del CLI.",
+    "open": "Abrir terminales",
+    "title": "Solicitud de agente",
+    "tabLabel": "Solicitud de agente · {{cli}}",
+    "requestedBy": "Solicitado por {{requester}}",
+    "reason": "Motivo del agente:",
+    "command": "Comando",
+    "commandIn": "Comando, en {{cwd}}",
+    "commandSize_one": "{{count}} línea, {{bytes}} bytes",
+    "commandSize_other": "{{count}} líneas, {{bytes}} bytes",
+    "outputShared": "La salida se compartirá con el agente que la solicitó.",
+    "outputPrivate": "La salida se queda en esta terminal.",
+    "view": "Mostrar la pantalla de confirmación",
+    "reviewOutput": "Revisar la salida antes de enviarla",
+    "finished": "Comando terminado (código {{code}})",
+    "finishedSignal": "Comando terminado (señal {{signal}})",
+    "ended": "La solicitud del agente terminó",
+    "cancelled": "La solicitud del agente se canceló",
+    "notRun": {
+      "declined": "Rechazada. El comando no se ejecutó.",
+      "expired": "Vencida. El comando no se ejecutó.",
+      "rejected": "El CLI rechazó esta solicitud. El comando no se ejecutó."
+    },
+    "decline": "Rechazar",
+    "declineTitle": "¿Rechazar esta solicitud?",
+    "declineDescription": "Si nadie ha presionado Enter en la pantalla de confirmación, el comando nunca se ejecuta y se le informa al agente que la rechazaste. Si alguien ya presionó Enter, el comando sigue ejecutándose y esta pestaña lo indica; Terminar sesión lo detiene.",
+    "declineSent": "Rechazo enviado. Esperando al CLI: si alguien presionó Enter antes, el comando se ejecuta.",
+    "startedBeforeDecline": "Alguien presionó Enter antes de que tu rechazo llegara al CLI, así que el comando empezó y sigue ejecutándose. Usa Terminar sesión para detenerlo.",
+    "declineUnsent": "Sin conexión: tu rechazo todavía no llegó al relay. Se envía de nuevo en cuanto vuelva la conexión, o presiona Rechazar para intentarlo ahora.",
+    "declineFailed": "No se pudo entregar tu rechazo (puede que el CLI esté desconectado o que se enviaran demasiados mensajes a la vez). No se rechazó nada; presiona Rechazar para intentarlo de nuevo.",
+    "status": {
+      "awaiting_user": "Esperándote",
+      "running": "En ejecución",
+      "awaiting_output_review": "Salida en espera de revisión",
+      "exited": "Terminado",
+      "declined": "Rechazado",
+      "expired": "Vencido",
+      "cancelled": "Cancelado",
+      "rejected": "Denegado"
+    },
+    "review": {
+      "title": "Revisar la salida antes de enviarla",
+      "description": "Esto es exactamente lo que recibiría {{requester}}. Edítalo, envíalo o elimínalo por completo. Cerrar este cuadro elimina toda la salida.",
+      "label": "Salida",
+      "redact": "Eliminar toda la salida",
+      "undo": "Deshacer cambios",
+      "submit": "Enviar",
+      "sent": "Se envió la salida revisada al agente",
+      "redacted": "Se eliminó la salida",
+      "alreadyAnswered": "Esta salida ya se revisó",
+      "failed": "No se pudo enviar la revisión. Intenta de nuevo.",
+      "truncated": "El comando imprimió {{bytes}} bytes; solo se conservan el inicio y el final."
     }
   }
 }

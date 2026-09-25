@@ -17,8 +17,11 @@ import {
 import { lazy, Suspense, useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { AgentRequestsBadge } from "@/components/agent-requests-badge";
+import { AgentRequestsNotice } from "@/components/agent-requests-notice";
 import { DashboardNotices } from "@/components/dashboard-notices";
 import { TerminalStatusDot } from "@/components/terminal-status-dot";
+import { usePendingAgentRequests } from "@/hooks/use-pending-agent-requests";
 import { TerminalWorkspaceProvider, useTerminalWorkspace } from "@/hooks/use-terminal-workspace";
 import { useUiPreferences } from "@/stores/ui-preferences";
 
@@ -190,6 +193,7 @@ function DashboardLayout({
             <MobileNavStrip lang={lang} className="shrink-0 px-2 py-1" />
             {/* empty:hidden drops the padding when there are no notices. */}
             <div data-dashboard-notices="fill" className="shrink-0 px-2 pt-2 empty:hidden md:px-4">
+              {onTerminals ? null : <AgentRequestsNotice lang={lang} />}
               <DashboardNotices />
             </div>
             {/* The terminals route renders nothing; the workspace below fills instead. */}
@@ -209,6 +213,7 @@ function DashboardLayout({
               <MobileNavStrip lang={lang} className="mb-4" />
 
               <div className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col">
+                <AgentRequestsNotice lang={lang} />
                 <DashboardNotices />
                 <Outlet />
               </div>
@@ -233,11 +238,14 @@ function SidebarLink({
   lang,
   collapsed,
   className,
+  badge = 0,
 }: {
   item: Section;
   lang: string;
   collapsed: boolean;
   className?: string;
+  /** Agent requests waiting (Terminals only). */
+  badge?: number;
 }) {
   const { t } = useTranslation(["dashboard"]);
   return (
@@ -264,7 +272,10 @@ function SidebarLink({
       {collapsed ? (
         <span className="sr-only">{t(item.labelKey)}</span>
       ) : (
-        <span className="min-w-0 truncate">{t(item.labelKey)}</span>
+        <>
+          <span className="min-w-0 truncate">{t(item.labelKey)}</span>
+          <AgentRequestsBadge count={badge} className="ms-auto" />
+        </>
       )}
     </Link>
   );
@@ -287,11 +298,16 @@ function TerminalsNavItem({
   const navigate = useNavigate();
   const [expanded, setExpanded] = useState(true);
   const tabs = workspace.tabs;
+  const agentRequests = usePendingAgentRequests();
 
   if (collapsed) {
     return (
       <div className="relative flex justify-center">
         <SidebarLink item={item} lang={lang} collapsed />
+        <AgentRequestsBadge
+          count={agentRequests.count}
+          className="pointer-events-none absolute bottom-1 end-1"
+        />
         {tabs.length > 0 ? (
           <span
             aria-hidden="true"
@@ -307,7 +323,13 @@ function TerminalsNavItem({
   return (
     <div className="flex min-w-0 flex-col">
       <div className="flex min-w-0 items-center">
-        <SidebarLink item={item} lang={lang} collapsed={false} className="min-w-0 flex-1" />
+        <SidebarLink
+          item={item}
+          lang={lang}
+          collapsed={false}
+          className="min-w-0 flex-1"
+          badge={agentRequests.count}
+        />
         {tabs.length > 0 ? (
           <Button
             type="button"
@@ -369,6 +391,7 @@ function TerminalsNavItem({
 /** Below md: a horizontal strip of section links in place of the sidebar. */
 function MobileNavStrip({ lang, className }: { lang: string; className?: string }) {
   const { t } = useTranslation(["dashboard"]);
+  const agentRequests = usePendingAgentRequests();
   return (
     // Horizontal-only: overflow-y-hidden clips accidental vertical overflow;
     // overscroll-x-contain keeps horizontal swipes from chaining. Avoid
@@ -397,6 +420,9 @@ function MobileNavStrip({ lang, className }: { lang: string; className?: string 
           >
             <item.icon aria-hidden="true" className="size-4" />
             {t(item.labelKey)}
+            {item.to === "/$lang/dashboard/terminals" ? (
+              <AgentRequestsBadge count={agentRequests.count} />
+            ) : null}
           </Link>
         ))}
       </nav>

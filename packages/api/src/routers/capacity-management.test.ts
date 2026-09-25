@@ -15,6 +15,24 @@ vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
   return { default: mockDeep() };
 });
+// The ordered-delete locking runs against real PostgreSQL
+// (capacity-lock-order.postgres.integration.test.ts); here it is observed.
+const { lockCapacityGraphForDelete } = vi.hoisted(() => ({
+  lockCapacityGraphForDelete: vi.fn(async (_tx: unknown, _scope: unknown) => undefined),
+}));
+vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@ws-model-proxy/db/capacity-lock-order")>()),
+  lockCapacityGraphForDelete,
+}));
+// The history drain before an ordered delete runs against real PostgreSQL
+// (parent-deletion.postgres.integration.test.ts); here it is observed.
+const { prepareParentDeletion } = vi.hoisted(() => ({
+  prepareParentDeletion: vi.fn(async (_db: unknown, _scope: unknown) => ({})),
+}));
+vi.mock("@ws-model-proxy/db/parent-deletion", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@ws-model-proxy/db/parent-deletion")>()),
+  prepareParentDeletion,
+}));
 
 const { capacityManagementRouter } = await import("./capacity-management");
 const { backfillDiscoveredInferenceCapacities, ensureDiscoveredInferenceCapacity } = await import(
@@ -222,7 +240,27 @@ describe("capacityManagementRouter", () => {
       _count: { ExecutionTargets: 1 },
     });
     const client = createRouterClient(capacityManagementRouter, { context });
+    lockCapacityGraphForDelete.mockClear();
+    prepareParentDeletion.mockClear();
+    // Refused by the read-only precheck: nothing is drained or locked.
     await expect(client.remove({ id: "capacity" })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(prepareParentDeletion).not.toHaveBeenCalled();
+    expect(lockCapacityGraphForDelete).not.toHaveBeenCalled();
+    // A target attached after the precheck is refused by the re-read that
+    // runs after the capacity's delete locks are held.
+    db.inferenceCapacity.findUnique
+      .mockResolvedValueOnce({ userId: "owner", _count: { ExecutionTargets: 0 } })
+      .mockResolvedValueOnce({ userId: "owner" })
+      .mockResolvedValueOnce({ userId: "owner", _count: { ExecutionTargets: 1 } });
+    await expect(client.remove({ id: "capacity" })).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(prepareParentDeletion).toHaveBeenCalledWith(expect.anything(), {
+      userId: "owner",
+      capacityIds: ["capacity"],
+    });
+    expect(lockCapacityGraphForDelete).toHaveBeenCalledWith(expect.anything(), {
+      userId: "owner",
+      capacityIds: ["capacity"],
+    });
     await expect(
       client.updateDirectPolicy({ executionTargetId: "target", directPriority: 32 }),
     ).rejects.toBeTruthy();

@@ -15,6 +15,26 @@ vi.mock("@ws-model-proxy/db", async () => {
   return { default: mockDeep() };
 });
 
+// The durable, bounded user delete (preflight, intent, history drain, ordered
+// capacity-graph delete) is exercised against real PostgreSQL in
+// parent-deletion.postgres.integration.test.ts. Here it forwards to the mocked
+// delete so the router's result and error mapping are testable; the error
+// classes and the permanent-failure classifier are the real ones.
+vi.mock("@ws-model-proxy/db/parent-deletion", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@ws-model-proxy/db/parent-deletion")>();
+  const { default: client } = await import("@ws-model-proxy/db");
+  const users = client as unknown as {
+    user: { delete(args: { where: { id: string } }): Promise<unknown> };
+  };
+  return {
+    ...actual,
+    deleteUserDurably: vi.fn(async (_db: unknown, userId: string) => {
+      await users.user.delete({ where: { id: userId } });
+      return "deleted";
+    }),
+  };
+});
+
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: { BETTER_AUTH_URL: "http://localhost:3000" },
   ADMIN_EMAIL: undefined,
@@ -45,6 +65,9 @@ vi.mock("@ws-model-proxy/mailer", () => ({
 const { default: prisma } = await import("@ws-model-proxy/db");
 const { auth } = await import("@ws-model-proxy/auth");
 const { renderInviteUser, sendEmail } = await import("@ws-model-proxy/mailer");
+const { deleteUserDurably, RetainedHistoryError } = await import(
+  "@ws-model-proxy/db/parent-deletion"
+);
 
 const db = prisma as unknown as {
   user: {
@@ -52,6 +75,7 @@ const db = prisma as unknown as {
     findMany: MockInstance;
     count: MockInstance;
     update: MockInstance;
+    updateMany: MockInstance;
     delete: MockInstance;
   };
   session: { deleteMany: MockInstance };
@@ -364,18 +388,47 @@ describe("usersRouter", () => {
   });
 
   describe("unarchive", () => {
-    it("clears banned + banReason + banExpires", async () => {
-      db.user.findUnique.mockResolvedValue({ id: "other-user-id" });
-      db.user.update.mockResolvedValue({});
+    it("clears banned + banReason + banExpires with one statement conditional on no marker", async () => {
+      db.user.updateMany.mockResolvedValue({ count: 1 });
 
       const client = createRouterClient(usersRouter, { context: buildContext() });
       const res = await client.unarchive({ userId: "other-user-id" });
 
       expect(res).toEqual({ success: true });
-      expect(db.user.update).toHaveBeenCalledWith({
-        where: { id: "other-user-id" },
+      expect(db.user.updateMany).toHaveBeenCalledWith({
+        where: { id: "other-user-id", deletionRequestedAt: null },
         data: { banned: false, banReason: null, banExpires: null },
       });
+      expect(db.user.update).not.toHaveBeenCalled();
+    });
+
+    it("refuses unarchive while a deletion marker is present", async () => {
+      // The conditional write matched nothing (the marker is set), the row exists.
+      db.user.updateMany.mockResolvedValue({ count: 0 });
+      db.user.findUnique.mockResolvedValue({ id: "other-user-id" });
+
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+      await expect(client.unarchive({ userId: "other-user-id" })).rejects.toSatisfy(
+        (e: ORPCError) => {
+          expect(e.code).toBe("CONFLICT");
+          expect(e.message).toMatch(/being deleted/i);
+          return true;
+        },
+      );
+      expect(db.user.update).not.toHaveBeenCalled();
+    });
+
+    it("returns NOT_FOUND for a missing user", async () => {
+      db.user.updateMany.mockResolvedValue({ count: 0 });
+      db.user.findUnique.mockResolvedValue(null);
+
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+      await expect(client.unarchive({ userId: "other-user-id" })).rejects.toSatisfy(
+        (e: ORPCError) => {
+          expect(e.code).toBe("NOT_FOUND");
+          return true;
+        },
+      );
     });
   });
 
@@ -424,8 +477,35 @@ describe("usersRouter", () => {
       const client = createRouterClient(usersRouter, { context: buildContext() });
       const res = await client.remove({ userId: "other-user-id" });
 
-      expect(res).toEqual({ success: true });
+      expect(res).toEqual({ success: true, pending: false });
+      expect(deleteUserDurably).toHaveBeenCalledWith(prisma, "other-user-id", expect.any(Object));
       expect(db.user.delete).toHaveBeenCalledWith({ where: { id: "other-user-id" } });
+    });
+
+    it("reports a durable pending delete without notifying listeners yet", async () => {
+      db.user.findUnique.mockResolvedValue({ id: "other-user-id" });
+      vi.mocked(deleteUserDurably).mockResolvedValueOnce("pending");
+
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+      const res = await client.remove({ userId: "other-user-id" });
+
+      expect(res).toEqual({ success: true, pending: true });
+      expect(deletedUsers).toEqual([]);
+    });
+
+    it("maps retained history to a CONFLICT with archive guidance", async () => {
+      db.user.findUnique.mockResolvedValue({ id: "other-user-id" });
+      vi.mocked(deleteUserDurably).mockRejectedValueOnce(
+        new RetainedHistoryError("capacity lease"),
+      );
+
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+      await expect(client.remove({ userId: "other-user-id" })).rejects.toSatisfy((e: ORPCError) => {
+        expect(e.code).toBe("CONFLICT");
+        expect(e.message).toMatch(/archive/i);
+        return true;
+      });
+      expect(deletedUsers).toEqual([]);
     });
 
     it("blocks self-delete", async () => {

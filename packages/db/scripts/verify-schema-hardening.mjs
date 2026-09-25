@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 
@@ -79,6 +79,13 @@ const requiredFragments = [
   'DELETE FROM usage_rollup_hour WHERE "requesterUserId" = OLD.id RETURNING *',
   // Sentinel upserts in the application's rollup key order (usage-rollup.ts).
   'ORDER BY "bucketStart", "ownerUserId" COLLATE "C", "poolId" COLLATE "C",',
+  // DEL-STATE commit point: the session insert reads its owner FOR SHARE (not
+  // FOR KEY SHARE, which does not serialize with the deletion mark).
+  "CREATE TRIGGER session_refuse_deleting_user BEFORE INSERT ON session",
+  'WHERE u.id = NEW."userId"\n     FOR SHARE;',
+  // IMP-MARK: an impersonation session is refused for a pending or deleted impersonator.
+  'WHERE u.id = NEW."impersonatedBy"\n       FOR SHARE;\n    IF NOT FOUND OR pending THEN',
+  "RAISE EXCEPTION 'user deletion pending' USING ERRCODE = 'WMPD1';",
 ];
 for (const fragment of requiredFragments) {
   if (!sql.includes(fragment)) throw new Error(`Missing schema-hardening fragment: ${fragment}`);
@@ -185,7 +192,13 @@ for (const fragment of [
   if (!forwarderSchema.includes(fragment))
     throw new Error(`Missing capacity schema fragment: ${fragment}`);
 }
-for (const fragment of ['error?.code === "40P01"', 'error?.code === "55P03"', "maxAttempts"]) {
+for (const fragment of [
+  'error?.code === "40P01"',
+  'error?.code === "55P03"',
+  "MAX_ATTEMPTS",
+  "SCHEMA_HARDENING_FORCE",
+  "wmp_schema_hardening_state",
+]) {
   if (!applyScript.includes(fragment))
     throw new Error(`Missing schema retry fragment: ${fragment}`);
 }
@@ -197,6 +210,121 @@ for (const [name, contents, fragment] of [
 ]) {
   if (!contents.includes(fragment)) throw new Error(`${name} bypasses schema hardening`);
 }
+// Every deploy-time push goes through the lock_timeout + retry wrapper.
+for (const [name, contents, fragment] of [
+  ["package db:push", packageJson, "node scripts/push-schema.mjs &&"],
+  ["container entrypoint", entrypoint, "node scripts/push-schema.mjs $push_flags"],
+  ["dangerous local wrapper", dangerousWrapper, "node scripts/push-schema.mjs --accept-data-loss"],
+]) {
+  if (!contents.includes(fragment)) throw new Error(`${name} bypasses push-schema.mjs`);
+}
+
+// DL-1 deploy lock order: the hardening transaction's first statement locks
+// every table the file touches, in ACCESS EXCLUSIVE mode with NOWAIT, so it
+// never waits on a lock while holding one. "Touches" is over-approximated as
+// every repository table (Prisma @@map) named anywhere outside comments and
+// string literals, including trigger/function bodies that backfill writes
+// fire.
+function stripSqlCommentsAndLiterals(source) {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/--[^\n]*/g, " ")
+    .replace(/'(?:[^']|'')*'/g, "''");
+}
+function hardeningLockCoverage(source, tables) {
+  const code = stripSqlCommentsAndLiterals(source);
+  const locks = [
+    ...code.matchAll(/\bLOCK\s+(?:TABLE\s+)?([\s\S]*?)\s+IN\s+([A-Z ]+?)\s+MODE(\s+NOWAIT)?\s*;/gi),
+  ];
+  const problems = [];
+  if (locks.length !== 1)
+    problems.push(`expected exactly one LOCK TABLE statement, found ${locks.length}`);
+  const lock = locks[0];
+  if (!lock) return { problems, missing: [] };
+  if (lock[2].trim().toUpperCase() !== "ACCESS EXCLUSIVE" || !lock[3])
+    problems.push(`LOCK TABLE must be IN ACCESS EXCLUSIVE MODE NOWAIT, found ${lock[0]}`);
+  const begin = code.search(/\bBEGIN\s*;/i);
+  if (
+    begin < 0 ||
+    code
+      .slice(begin)
+      .replace(/^BEGIN\s*;\s*/i, "")
+      .indexOf(lock[0]) !== 0
+  )
+    problems.push("LOCK TABLE must be the first statement after BEGIN");
+  const locked = new Set(lock[1].split(",").map((name) => name.trim().replace(/^"|"$/g, "")));
+  for (const name of locked)
+    if (!tables.has(name)) problems.push(`LOCK TABLE names a non-repository table: ${name}`);
+  const rest = code.replace(lock[0], " ");
+  // "user" is a reserved word, so as a table it only ever appears quoted.
+  const mentions = (table) =>
+    table === "user"
+      ? rest.includes('"user"')
+      : new RegExp(`(?<![A-Za-z0-9_$])"?${table}"?(?![A-Za-z0-9_$])`).test(rest);
+  const missing = [...tables].filter((table) => !locked.has(table) && mentions(table));
+  return { problems, missing };
+}
+const repositoryTables = new Set();
+const schemaDirectory = new URL("../prisma/schema/", import.meta.url);
+for (const file of (await readdir(schemaDirectory)).filter((name) => name.endsWith(".prisma"))) {
+  const text = await readFile(new URL(file, schemaDirectory), "utf8");
+  for (const match of text.matchAll(/@@map\("([^"]+)"\)/g)) repositoryTables.add(match[1]);
+}
+{
+  const sample = `BEGIN;\nLOCK TABLE pool_member IN ACCESS EXCLUSIVE MODE NOWAIT;\nUPDATE "user" SET name = 'relay_request' WHERE false; -- model_pool\nCOMMIT;`;
+  const result = hardeningLockCoverage(sample, repositoryTables);
+  if (result.problems.length > 0 || result.missing.join() !== "user")
+    throw new Error(
+      `hardening lock-coverage guard misclassified its sample: ${JSON.stringify(result)}`,
+    );
+  const weak = hardeningLockCoverage(
+    "BEGIN;\nUPDATE pool_member SET weight = 1;\nLOCK TABLE pool_member IN SHARE MODE;\nCOMMIT;",
+    repositoryTables,
+  );
+  if (weak.problems.length !== 2)
+    throw new Error(
+      `hardening lock-coverage guard accepted a weak or late lock: ${JSON.stringify(weak)}`,
+    );
+}
+{
+  const { problems, missing } = hardeningLockCoverage(sql, repositoryTables);
+  if (missing.length > 0)
+    problems.push(
+      `tables touched by schema-hardening.sql but not locked up front: ${missing.join(", ")}`,
+    );
+  if (problems.length > 0) throw new Error(`Schema hardening lock order:\n${problems.join("\n")}`);
+}
+// The apply script runs the SQL body inside its own transaction and records
+// the gate key before COMMIT; that holds only if the body really lost the
+// file's own BEGIN;/COMMIT;. Strip the real file with the same function and
+// check the result, and prove the parser fails closed.
+{
+  const { hardeningSqlBody } = await import("./hardening-sql.mjs");
+  if (!applyScript.includes("const sqlBody = hardeningSqlBody(sql);"))
+    throw new Error("apply-schema-hardening.mjs must derive its SQL body with hardeningSqlBody");
+  const body = hardeningSqlBody(sql);
+  if (/^\s*(?:BEGIN|COMMIT|ROLLBACK)\s*;/im.test(body))
+    throw new Error("stripped schema-hardening.sql body still has a transaction statement");
+  if (!/^\s*LOCK TABLE\b/m.test(body.replace(/^\s*--.*$/gm, "").trimStart()))
+    throw new Error("stripped schema-hardening.sql body must start with its LOCK TABLE");
+  for (const [label, text] of [
+    ["no BEGIN", "LOCK TABLE a;\nCOMMIT;\n"],
+    ["statement after COMMIT", "BEGIN;\nSELECT 1;\nCOMMIT;\nSELECT 2;\n"],
+    ["nested COMMIT", "BEGIN;\nSELECT 1;\nCOMMIT;\nSELECT 2;\nCOMMIT;\n"],
+  ]) {
+    let refused = false;
+    try {
+      hardeningSqlBody(text);
+    } catch {
+      refused = true;
+    }
+    if (!refused) throw new Error(`hardeningSqlBody accepted a malformed file (${label})`);
+  }
+  if (hardeningSqlBody("-- c\nBEGIN;\nSELECT 1;\nCOMMIT;\n-- tail\n") !== "SELECT 1;")
+    throw new Error("hardeningSqlBody must strip only the outer BEGIN;/COMMIT; lines");
+}
+if (!applyScript.includes("await recordKey(client, establishedKey);"))
+  throw new Error("apply-schema-hardening.mjs must record the catalog fingerprint before COMMIT");
 
 // Invariant: no hardening statement may move relay_request out of PENDING.
 // Every terminal transition must go through the application's status-guarded
@@ -266,6 +394,27 @@ async function expectConstraintFailure(statement, expectedCode = "23514") {
     throw error;
   }
   throw new Error("Expected PostgreSQL constraint failure");
+}
+
+const schemaUrl = new URL(baseUrl);
+schemaUrl.searchParams.set("options", `-c search_path=${schema}`);
+
+async function waitForHardeningRetry(hardening, onTimeout) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    if (hardening.output().stderr.includes("retrying attempt")) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  await onTimeout();
+  throw new Error(
+    `Schema apply wrapper did not retry its lock conflict: ${hardening.output().stderr}`,
+  );
+}
+
+async function databaseDeadlocks() {
+  const { rows } = await admin.query(
+    "SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()",
+  );
+  return Number(rows[0].deadlocks);
 }
 
 function runHardeningProcess(databaseUrl, extraEnv = {}) {
@@ -1369,23 +1518,19 @@ try {
     VALUES ('model-during-rollout', NOW(), NOW(), 'owner-a', 'endpoint-a',
       'during-rollout', 'owner-a/cli/local/during-rollout')
   `);
-  const hardeningPid = (await hardeningClient.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
-  const concurrentHardening = hardeningClient.query(sql);
-  let observedLockWait = false;
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    const activity = await admin.query(
-      "SELECT wait_event_type FROM pg_stat_activity WHERE pid = $1",
-      [hardeningPid],
-    );
-    if (activity.rows[0]?.wait_event_type === "Lock") {
-      observedLockWait = true;
-      break;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  if (!observedLockWait) throw new Error("Hardening did not lock out the concurrent old writer");
+  // The hardening transaction never waits while the old writer holds its
+  // table: its up-front NOWAIT lock fails and the production wrapper retries
+  // the whole transaction until the writer has committed.
+  const rolloutHardening = runHardeningProcess(schemaUrl.toString(), {
+    SCHEMA_HARDENING_FORCE: "1",
+  });
+  await waitForHardeningRetry(rolloutHardening, async () => {
+    await oldWriter.query("ROLLBACK");
+  });
   await oldWriter.query("COMMIT");
-  await concurrentHardening;
+  const rolloutResult = await rolloutHardening.completion;
+  if (rolloutResult.code !== 0)
+    throw new Error(`Rollout hardening failed: ${rolloutHardening.output().stderr}`);
   const upgradedHistory = await client.query(`
     SELECT ledger."payloadHash" AS ledger_hash, settlement."payloadHash" AS settlement_hash,
            settlement."providerAccountId" AS account_id, settlement."requestId" AS request_id,
@@ -1498,10 +1643,9 @@ try {
   // apply wrapper retries the complete transaction and then converges.
   await oldWriter.query("BEGIN");
   await oldWriter.query("LOCK TABLE pool_member IN ACCESS EXCLUSIVE MODE");
-  const retryUrl = new URL(prismaUrl);
-  retryUrl.searchParams.set("options", `-c search_path=${schema}`);
-  const retryingHardening = runHardeningProcess(retryUrl.toString(), {
+  const retryingHardening = runHardeningProcess(schemaUrl.toString(), {
     SCHEMA_HARDENING_LOCK_TIMEOUT_MS: "100",
+    SCHEMA_HARDENING_FORCE: "1",
   });
   let observedRetry = false;
   for (let attempt = 0; attempt < 200; attempt += 1) {
@@ -1522,6 +1666,190 @@ try {
       `Schema hardening did not recover after lock retry: ${retryingHardening.output().stderr}`,
     );
   }
+
+  // DL-1 cycle 5: a lease release mid-flight holds an inference_capacity row
+  // FOR UPDATE and RowExclusive on capacity_lease. Hardening must never wait
+  // on it (it would then hold its other tables while the release waits on
+  // them): it retries, the release finishes without ever being blocked, and
+  // no deadlock is detected.
+  const capacityRow = await client.query("SELECT id FROM inference_capacity ORDER BY id LIMIT 1");
+  const capacityId = capacityRow.rows[0]?.id;
+  if (!capacityId) throw new Error("Hardening fixture has no inference_capacity row");
+  const deadlocksBefore = await databaseDeadlocks();
+  const releasePid = (await hardeningClient.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+  await hardeningClient.query("BEGIN");
+  await hardeningClient.query("SELECT id FROM inference_capacity WHERE id = $1 FOR UPDATE", [
+    capacityId,
+  ]);
+  await hardeningClient.query("UPDATE capacity_lease SET state = state WHERE false");
+  const releaseRace = runHardeningProcess(schemaUrl.toString(), { SCHEMA_HARDENING_FORCE: "1" });
+  await waitForHardeningRetry(releaseRace, async () => {
+    await hardeningClient.query("ROLLBACK");
+  });
+  const blockers = await admin.query("SELECT pg_blocking_pids($1::int) AS pids", [releasePid]);
+  if (blockers.rows[0].pids.length > 0)
+    throw new Error(`Lease release was blocked by ${blockers.rows[0].pids.join(",")}`);
+  await hardeningClient.query("SET LOCAL lock_timeout = '2s'");
+  await hardeningClient.query(
+    'UPDATE inference_capacity SET "hardConcurrencyLimit" = "hardConcurrencyLimit" WHERE id = $1',
+    [capacityId],
+  );
+  await hardeningClient.query("UPDATE capacity_lease SET state = state WHERE false");
+  await hardeningClient.query("COMMIT");
+  const releaseRaceResult = await releaseRace.completion;
+  if (releaseRaceResult.code !== 0)
+    throw new Error(`Hardening did not converge after the release: ${releaseRace.output().stderr}`);
+  const deadlocksAfter = await databaseDeadlocks();
+  if (deadlocksAfter !== deadlocksBefore)
+    throw new Error(
+      `Hardening vs lease release detected ${deadlocksAfter - deadlocksBefore} deadlock(s)`,
+    );
+
+  // Version gate: an unchanged SQL file on an unchanged catalog is skipped
+  // without taking any table lock (the held ACCESS EXCLUSIVE lock would make
+  // any hardening attempt fail and retry).
+  async function unforcedHardening() {
+    const run = runHardeningProcess(schemaUrl.toString(), {
+      SCHEMA_HARDENING_LOCK_TIMEOUT_MS: "100",
+    });
+    const result = await run.completion;
+    if (result.code !== 0) throw new Error(`Unforced hardening failed: ${run.output().stderr}`);
+    return run.output();
+  }
+  await oldWriter.query("BEGIN");
+  await oldWriter.query("LOCK TABLE pool_member IN ACCESS EXCLUSIVE MODE");
+  const skipped = await unforcedHardening();
+  await oldWriter.query("ROLLBACK");
+  if (!skipped.stdout.includes("skipping") || skipped.stderr.includes("retrying"))
+    throw new Error(`Unchanged hardening was not skipped lock-free: ${JSON.stringify(skipped)}`);
+  // Any catalog drift (here: a hardening trigger dropped) re-applies.
+  await client.query("DROP TRIGGER relay_request_execution_target_consistency ON relay_request");
+  const reapplied = await unforcedHardening();
+  if (reapplied.stdout.includes("skipping"))
+    throw new Error("Hardening skipped although its trigger was missing");
+  const restored = await client.query(
+    "SELECT 1 FROM pg_trigger WHERE tgname = 'relay_request_execution_target_consistency' AND tgrelid = 'relay_request'::regclass",
+  );
+  if (restored.rowCount !== 1) throw new Error("Re-applied hardening did not restore its trigger");
+  // A `prisma db push` of the unchanged schema leaves the fingerprint alone.
+  execFileSync("pnpm", ["exec", "prisma", "db", "push"], {
+    cwd: packageRoot,
+    env: { ...process.env, DATABASE_URL: prismaUrl.toString() },
+    stdio: "pipe",
+  });
+  const afterPush = await unforcedHardening();
+  if (!afterPush.stdout.includes("skipping"))
+    throw new Error("A no-op prisma db push changed the catalog fingerprint");
+
+  // Pre-push NULL cleanup: safe mode refuses legacy rows; dangerous mode deletes
+  // exactly the rows schema-hardening.sql removes before NOT NULL (lines 122-126).
+  const { runPrePushNullCleanup } = await import("./pre-push-null-cleanup.mjs");
+  const unboundCredentialId = `verify-null-credential-${randomBytes(6).toString("hex")}`;
+  const ownerRow = await client.query(`SELECT id FROM "user" ORDER BY id LIMIT 1`);
+  const ownerId = ownerRow.rows[0]?.id;
+  if (!ownerId) throw new Error("Hardening fixture has no user row");
+  await client.query(`ALTER TABLE cache_affinity_record DISABLE TRIGGER USER`);
+  await client.query(`ALTER TABLE cache_affinity_record ALTER COLUMN "tenantUserId" DROP NOT NULL`);
+  await client.query(
+    `ALTER TABLE cache_affinity_record ALTER COLUMN "bindingDigest" DROP NOT NULL`,
+  );
+  await client.query(
+    `UPDATE cache_affinity_record SET "tenantUserId" = NULL WHERE id = 'affinity-a'`,
+  );
+  await client.query(
+    `UPDATE cache_affinity_record SET "bindingDigest" = NULL WHERE id = 'affinity-b'`,
+  );
+  await client.query(`ALTER TABLE cache_affinity_record ENABLE TRIGGER USER`);
+  await client.query(`ALTER TABLE cli_device_credential ALTER COLUMN "cliDeviceId" DROP NOT NULL`);
+  await client.query(
+    `INSERT INTO cli_device_credential (id, "userId", "cliDeviceId", "lookupPrefix", "secretDigest")
+     VALUES ($1, $2, NULL, $3, 'fixture-digest')`,
+    [unboundCredentialId, ownerId, `prefix-${unboundCredentialId}`],
+  );
+  let safeFailed = false;
+  try {
+    await runPrePushNullCleanup(client, { dangerous: false });
+  } catch (error) {
+    safeFailed = /pre-push-null-cleanup/i.test(String(error));
+  }
+  if (!safeFailed) throw new Error("Safe pre-push NULL cleanup did not refuse legacy rows");
+  const beforeDangerous = await client.query(`
+    SELECT count(*)::int AS count FROM cache_affinity_record
+     WHERE id IN ('affinity-a', 'affinity-b')
+       AND ("tenantUserId" IS NULL OR "bindingDigest" IS NULL)
+  `);
+  if (beforeDangerous.rows[0].count !== 2)
+    throw new Error("Safe mode must not delete incompatible affinity rows");
+  await runPrePushNullCleanup(client, { dangerous: true });
+  const affinityLeft = await client.query(`
+    SELECT count(*)::int AS count FROM cache_affinity_record
+     WHERE id IN ('affinity-a', 'affinity-b')
+       AND ("tenantUserId" IS NULL OR "bindingDigest" IS NULL)
+  `);
+  const credentialLeft = await client.query(
+    `SELECT count(*)::int AS count FROM cli_device_credential WHERE id = $1`,
+    [unboundCredentialId],
+  );
+  if (affinityLeft.rows[0].count !== 0 || credentialLeft.rows[0].count !== 0) {
+    throw new Error("Dangerous pre-push cleanup did not delete the legacy NULL rows");
+  }
+
+  // The cleanup's waits are bounded (r2 P4): behind an ACCESS EXCLUSIVE lock
+  // each attempt fails at lock_timeout (55P03) and is retried within the
+  // attempt budget, then the error surfaces; it never waits indefinitely.
+  const { runPrePushNullCleanupBounded } = await import("./pre-push-null-cleanup.mjs");
+  const boundedUrl = new URL(schemaUrl);
+  boundedUrl.searchParams.set(
+    "options",
+    `${boundedUrl.searchParams.get("options")} -c lock_timeout=200ms -c statement_timeout=5000ms`,
+  );
+  boundedUrl.search = boundedUrl.searchParams.toString().replace(/\+/g, "%20");
+  await oldWriter.query("BEGIN");
+  await oldWriter.query("LOCK TABLE cli_device_credential IN ACCESS EXCLUSIVE MODE");
+  const retries = [];
+  const boundedStarted = Date.now();
+  let boundedError = null;
+  try {
+    await runPrePushNullCleanupBounded({
+      connectionString: boundedUrl.toString(),
+      dangerous: false,
+      maxAttempts: 3,
+      backoffFor: () => 10,
+      log: (line) => retries.push(line),
+    });
+  } catch (error) {
+    boundedError = error;
+  } finally {
+    await oldWriter.query("ROLLBACK");
+  }
+  const boundedMs = Date.now() - boundedStarted;
+  if (boundedError?.code !== "55P03" || retries.length !== 2 || boundedMs > 10_000) {
+    throw new Error(
+      `Pre-push cleanup did not bound its lock wait: ${JSON.stringify({
+        code: boundedError?.code ?? null,
+        retries: retries.length,
+        boundedMs,
+      })}`,
+    );
+  }
+
+  // DEL-STATE commit point: a session insert for a user whose deletion is
+  // pending is refused by the trigger; other users are unaffected.
+  await client.query(`
+    INSERT INTO "user" (id, "createdAt", "updatedAt", name, email, slug, "deletionRequestedAt")
+    VALUES ('session-live', NOW(), NOW(), 'L', 'session-live@example.test', 'session-live', NULL),
+           ('session-deleting', NOW(), NOW(), 'D', 'session-deleting@example.test',
+            'session-deleting', NOW())`);
+  await client.query(`
+    INSERT INTO session (id, "createdAt", "updatedAt", "expiresAt", token, "userId")
+    VALUES ('session-live-1', NOW(), NOW(), NOW() + interval '1 hour', 'session-live-1', 'session-live')`);
+  await expectConstraintFailure(
+    `INSERT INTO session (id, "createdAt", "updatedAt", "expiresAt", token, "userId")
+     VALUES ('session-deleting-1', NOW(), NOW(), NOW() + interval '1 hour', 'session-deleting-1',
+             'session-deleting')`,
+    "WMPD1",
+  );
+
   process.stdout.write("Schema-hardening PostgreSQL integration validation complete.\n");
 } finally {
   await oldWriter.end().catch(() => undefined);

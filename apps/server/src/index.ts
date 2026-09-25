@@ -32,6 +32,7 @@ import { relaySessionManager } from "./relay/session-manager.js";
 import { terminalBrowserHub } from "./relay/terminal-websocket.js";
 import { configureHttpServerTimeouts } from "./server-timeouts.js";
 import { startSessionCleanup } from "./session-cleanup.js";
+import { startUserDeletionSweep } from "./user-deletion-sweep.js";
 
 // ---------------------------------------------------------------------------
 // Startup guards
@@ -167,6 +168,10 @@ const stopOauthCleanup = startOauthCleanup();
 // Better Auth does not remove expired browser sessions eagerly. This bounded,
 // idempotent sweep uses the same shutdown-fenced lifecycle as OAuth cleanup.
 const stopSessionCleanup = startSessionCleanup();
+// Accepted user deletions whose completion failed transiently or was cut
+// short by a restart: the durable marker (User.deletionRequestedAt) is
+// resumed here until the user is gone (see user-deletion-sweep.ts).
+const stopUserDeletionSweep = startUserDeletionSweep();
 // Metrics retention: reaps abandoned PENDING relay requests, deletes raw
 // RelayRequest rows past RELAY_REQUEST_RETENTION_DAYS, compacts minute usage
 // rollups to hourly after 30 days and drops hourly rollups after 13 months.
@@ -220,6 +225,9 @@ const stopTerminalSessionRecheck = startUnrefInterval(() => {
 // ---------------------------------------------------------------------------
 
 let isShuttingDown = false;
+let userDeletionSweepStopped: Promise<void> | null = null;
+/** Bound on joining the user-deletion tick in flight at shutdown. */
+const USER_DELETION_SWEEP_JOIN_TIMEOUT_MS = 5_000;
 
 async function shutdown(signal: string) {
   if (isShuttingDown) return;
@@ -236,6 +244,9 @@ async function shutdown(signal: string) {
       stopProviderAttemptExpiry?.();
       stopOauthCleanup?.();
       stopSessionCleanup();
+      // Sets the stop flag only (no await): the in-flight tick is joined
+      // after the DB fence arms, below.
+      userDeletionSweepStopped = stopUserDeletionSweep();
       stopUsageRetention();
       stopStaleRelaySessions();
       stopCliCommandSweep();
@@ -325,7 +336,17 @@ async function shutdown(signal: string) {
       await Promise.all([mcpAdmissionGate.close(), mcpHandler?.close()]);
     },
     // 3. Close database connections last.
-    disconnectPrisma: () => prisma.$disconnect(),
+    disconnectPrisma: async () => {
+      // Join the user-deletion tick in flight (bounded): the fence armed by
+      // closeMcpHandler stops its drain between batches, and an ordered
+      // transaction commits or rolls back, before the connections close.
+      await runWithDeadline(
+        () => userDeletionSweepStopped ?? stopUserDeletionSweep(),
+        USER_DELETION_SWEEP_JOIN_TIMEOUT_MS,
+        "user deletion sweep join",
+      );
+      await prisma.$disconnect();
+    },
   });
   console.log("[server] Shutdown complete.");
   process.exit(0);

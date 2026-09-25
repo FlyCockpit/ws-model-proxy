@@ -35,6 +35,7 @@ import {
   USAGE_ROLLUP_MINUTE_RETENTION_DAYS,
 } from "@ws-model-proxy/config/usage-metrics";
 import defaultPrisma from "@ws-model-proxy/db";
+import { deleteTerminalRelayRequestsWithoutWaiting } from "@ws-model-proxy/db/capacity-lock-order";
 import { isDbShutdownFenceArmed } from "@ws-model-proxy/db/shutdown-fence";
 import { MODEL_API_RELAY_TIMEOUT_MS } from "./limits.js";
 import {
@@ -140,15 +141,25 @@ export async function deleteExpiredRelayRequests({
     // version, and no writer ever moves a row back to PENDING (only
     // createRelayMetadata writes PENDING), so a selected row is terminal and
     // already counted.
-    const count = await prisma.$executeRaw`
-      DELETE FROM relay_request
-       WHERE id IN (
-         SELECT id FROM relay_request
-          WHERE "createdAt" < ${cutoff}
-            AND status IN ('SUCCEEDED', 'FAILED', 'CANCELED')
-          ORDER BY "createdAt"
-          LIMIT ${batch}
-          FOR UPDATE SKIP LOCKED)`;
+    //
+    // Capacity lock order (@ws-model-proxy/db/capacity-lock-order): the
+    // DELETE's ON DELETE SET NULL rewrites admission_request rows, which an
+    // admitter locks before it updates their relay rows. The shared helper
+    // takes the admission rows and then the relay rows with SKIP LOCKED, so
+    // this delete never waits on a row an admitter holds; skipped rows are
+    // deleted by a later run.
+    const count = await prisma.$transaction(async (tx) => {
+      const picked = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM relay_request
+         WHERE "createdAt" < ${cutoff}
+           AND status IN ('SUCCEEDED', 'FAILED', 'CANCELED')
+         ORDER BY "createdAt"
+         LIMIT ${batch}`;
+      return deleteTerminalRelayRequestsWithoutWaiting(
+        tx,
+        picked.map((row) => row.id),
+      );
+    });
     deleted += count;
     if (count < batch) return deleted;
   }

@@ -6,7 +6,6 @@ import {
   isMcpPersonalTokenSecret,
   type McpPersonalTokenIdentity,
 } from "@ws-model-proxy/api/lib/mcp-token-access";
-import { isUserBanned } from "@ws-model-proxy/auth/is-user-banned";
 import {
   MCP_ISSUER,
   MCP_RESOURCE_URL,
@@ -16,6 +15,7 @@ import {
 } from "@ws-model-proxy/auth/mcp-config";
 import { MCP_GRANT_ID_CLAIM } from "@ws-model-proxy/auth/mcp-grant";
 import type prismaClientDefault from "@ws-model-proxy/db";
+import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import type { Context } from "hono";
 import { RateLimiterRes } from "rate-limiter-flexible";
 import { mcpIdentityKey, mcpIdentityQuotaLimiter } from "../mcp-rate-limit";
@@ -820,10 +820,12 @@ async function handleVerifiedRequest({
     return mcpForbiddenResponse();
   }
 
-  // 6-7. Live user: missing → 401; active ban → 403; forced 2FA not set up → 403.
+  // 6-7. Live user: missing → 401; active ban or pending deletion → 403; forced 2FA not set up → 403.
   // FULL Prisma user row (invariant 5): the synthetic oRPC context must
-  // satisfy the production `Session["user"]` shape — no projection.
-  let user: McpSessionUser | null;
+  // satisfy the production `Session["user"]` shape — no projection. The
+  // row also carries the deletion marker, which Better Auth's session type
+  // does not declare.
+  let user: (McpSessionUser & { deletionRequestedAt: Date | null }) | null;
   try {
     user = await options.prisma.user.findUnique({ where: { id: sub } });
   } catch (error) {
@@ -841,8 +843,10 @@ async function handleVerifiedRequest({
       resourceUrl,
     });
   }
-  if (isUserBanned(user, now())) {
-    mcpSanitizedLog("rejected: user banned", { sub, clientId });
+  // A pending deletion refuses whatever the ban fields say (Better Auth's
+  // unban/update/ban-with-expiry can rewrite them while the marker stays).
+  if (userCredentialAccessBlocked(user, now())) {
+    mcpSanitizedLog("rejected: user banned or deletion pending", { sub, clientId });
     return mcpForbiddenResponse();
   }
   let forceTwoFactor = false;

@@ -308,9 +308,23 @@ jobs:
           | grep -v 'scripts/test-docker-entrypoint-schema.sh:' \
             | grep -v 'policy: bounded-delete' \
             | grep -v '.github/workflows/pr-checks.yml:' \
+            | grep -vE '^packages/db/scripts/(push-schema|pre-push-null-cleanup|verify-schema-hardening)\.mjs:' \
+            | grep -vE '\.test\.ts:[0-9]+:[[:space:]]*expect\(.*\)\.toContain\("DELETE FROM [a-z_]+"\);$' \
             | grep -v '/dist/' \
             | grep -v 'node_modules'; then
             echo "::error::Found forbidden destructive Prisma or SQL command. Use the documented db:push flow and explicit local-only dangerous script instead."
+            exit 1
+          fi
+          # The deploy push wrapper, its NULL cleanup and the schema verifier
+          # name --accept-data-loss (the flag APPLY_SCHEMA=dangerous passes
+          # through, and the verifier asserts). Everything else stays forbidden
+          # in them.
+          if grep -nE \
+            '(migrate reset|migrate dev|migrate deploy|db push --force-reset|db drop|DROP TABLE|DROP DATABASE|\bTRUNCATE\b|DELETE FROM[[:space:]]+[^;]+;)' \
+            packages/db/scripts/push-schema.mjs packages/db/scripts/pre-push-null-cleanup.mjs \
+            packages/db/scripts/verify-schema-hardening.mjs \
+            | grep -v 'policy: bounded-delete'; then
+            echo "::error::Found forbidden destructive Prisma or SQL command in a deploy schema script."
             exit 1
           fi
 

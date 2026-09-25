@@ -6,6 +6,11 @@ vi.mock("./relay/cli-commands.js", () => ({
   startCliCommand: vi.fn(),
   waitCliCommand: vi.fn(),
   snapshotCliCommand: vi.fn(),
+  cancelCommandsForToken: vi.fn(),
+  startSupervisedCommand: vi.fn(),
+  snapshotSupervisedCommand: vi.fn(),
+  listPendingSupervised: vi.fn(() => []),
+  submitSupervisedOutput: vi.fn(),
 }));
 
 /**

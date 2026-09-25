@@ -250,6 +250,8 @@
     "userRestored": "User restored",
     "restoreFailed": "Couldn't restore that user.",
     "userDeleted": "User deleted",
+    "userDeletePending": "Deletion started; the account will be removed shortly",
+    "deletingBadge": "Deleting",
     "deleteFailed": "Couldn't delete that user.",
     "deleteTitle": "Delete this user?",
     "deleteDescription": "This permanently deletes the account. This cannot be undone.",

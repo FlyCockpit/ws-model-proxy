@@ -1,5 +1,6 @@
 import { ORPCError } from "@orpc/server";
 import prisma, { Prisma } from "@ws-model-proxy/db";
+import { lockCapacityGraphForDelete } from "@ws-model-proxy/db/capacity-lock-order";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
 import {
@@ -13,7 +14,11 @@ import {
 import { parseModelApiSurface } from "../lib/model-api-surface";
 import { assertRecommendedSurfaceServable } from "../lib/pool-recommended-surface";
 import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
-import { runSerializableTransaction } from "../lib/serializable-transaction";
+import {
+  drainBeforeParentDelete,
+  runCapacityDeleteTransaction,
+  runSerializableTransaction,
+} from "../lib/serializable-transaction";
 
 const id = z.string().min(1);
 const priority = z.number().int().min(0).max(31);
@@ -345,28 +350,48 @@ export const capacityManagementRouter = {
 
   remove: protectedProcedure.input(z.object({ id })).handler(async ({ input, context }) => {
     const userId = context.session.user.id;
-    return capacityTransaction(
-      async (tx) => {
-        const current = await tx.inferenceCapacity.findUnique({
-          where: { id: input.id },
-          select: { userId: true, _count: { select: { ExecutionTargets: true } } },
-        });
-        if (!current || current.userId !== userId) return notFound();
-        if (current._count.ExecutionTargets > 0) {
-          throw new ORPCError("CONFLICT", { message: "Capacity is still attached." });
-        }
-        await tx.inferenceCapacity.delete({ where: { id: input.id } });
-        await audit(tx, {
-          userId,
-          action: "DELETE",
-          resourceType: "INFERENCE_CAPACITY",
-          resourceId: input.id,
-          before: current,
-        });
-        return { success: true };
-      },
-      { isolationLevel: "Serializable" },
-    );
+    // Read-only checks first, so a refused delete drains nothing; the
+    // ordered transaction repeats them under its locks.
+    const precheck = await prisma.inferenceCapacity.findUnique({
+      where: { id: input.id },
+      select: { userId: true, _count: { select: { ExecutionTargets: true } } },
+    });
+    if (!precheck || precheck.userId !== userId) return notFound();
+    if (precheck._count.ExecutionTargets > 0) {
+      throw new ORPCError("CONFLICT", { message: "Capacity is still attached." });
+    }
+    // Terminal waiter history on the capacity is drained in short batches
+    // first (DL1-TXBOUND), so the ordered transaction holds the capacity
+    // locks only for the capacity row and its live rows.
+    await drainBeforeParentDelete({ userId, capacityIds: [input.id] });
+    // Parent delete in capacity lock order: the capacity's L3-L5 locks and
+    // the L6 rows of every live request waiting on it are taken before the
+    // DELETE cascades into its waiters (see lockCapacityGraphForDelete).
+    return runCapacityDeleteTransaction(async (tx) => {
+      const owner = await tx.inferenceCapacity.findUnique({
+        where: { id: input.id },
+        select: { userId: true },
+      });
+      if (!owner || owner.userId !== userId) return notFound();
+      await lockCapacityGraphForDelete(tx, { userId, capacityIds: [input.id] });
+      const current = await tx.inferenceCapacity.findUnique({
+        where: { id: input.id },
+        select: { userId: true, _count: { select: { ExecutionTargets: true } } },
+      });
+      if (!current || current.userId !== userId) return notFound();
+      if (current._count.ExecutionTargets > 0) {
+        throw new ORPCError("CONFLICT", { message: "Capacity is still attached." });
+      }
+      await tx.inferenceCapacity.delete({ where: { id: input.id } });
+      await audit(tx, {
+        userId,
+        action: "DELETE",
+        resourceType: "INFERENCE_CAPACITY",
+        resourceId: input.id,
+        before: current,
+      });
+      return { success: true };
+    });
   }),
 
   updateDirectPolicy: protectedProcedure.input(directPolicy).handler(async ({ input, context }) => {
@@ -628,7 +653,7 @@ export const capacityManagementRouter = {
           },
         });
         if (!candidate || candidate.ModelPool.userId !== userId) return notFound();
-        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidate.poolId} AND "userId" = ${userId} FOR UPDATE`;
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidate.poolId} AND "userId" = ${userId} FOR NO KEY UPDATE`;
         if (candidate.executionTargetId)
           await lockExecutionTargetPolicies(tx, [candidate.executionTargetId]);
         const member = await tx.poolMember.findUnique({

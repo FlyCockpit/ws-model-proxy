@@ -32,9 +32,12 @@ import type { McpRequestCredential } from "./cli-command-access.js";
 import {
   adaptCliCommandResultInput,
   adaptCliCommandRunInput,
+  adaptCliSupervisedStartInput,
   CLI_COMMAND_OUTPUT_NOTICE,
+  CLI_SUPERVISED_COMMAND_NOTICE,
   runForwarderCliCommand,
   runForwarderCliCommandResult,
+  runForwarderCliSupervisedCommandStart,
 } from "./cli-command-tools.js";
 
 /** Endpoint-wide scope requirement. Write tools require literal `mcp:write`. */
@@ -1141,6 +1144,27 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
     invokeCore: (input, deps) => runForwarderCliCommand(input, deps),
   },
   {
+    name: "forwarder_cli_supervised_command_start",
+    target: "core:forwarderCliSupervisedCommandStart",
+    scope: "write",
+    confirmation: "RUN",
+    classification: "external",
+    descriptionNote: `${CLI_SUPERVISED_COMMAND_NOTICE} ${CLI_COMMAND_OUTPUT_NOTICE}`,
+    deliverDespiteAbort: true,
+    inputSchema: withInputSizeBound(
+      z.looseObject({
+        cliDeviceId: z.string(),
+        command: z.string(),
+        cwd: z.string().optional(),
+        reason: z.string().optional(),
+        shareOutput: z.boolean().optional(),
+        confirm: z.literal("RUN"),
+      }),
+    ),
+    inputAdapter: adaptCliSupervisedStartInput,
+    invokeCore: (input, deps) => runForwarderCliSupervisedCommandStart(input, deps),
+  },
+  {
     name: "forwarder_cli_command_result",
     target: "core:forwarderCliCommandResult",
     scope: "write",
@@ -1159,8 +1183,8 @@ const WRITE_TOOLS: readonly McpToolDescriptor[] = [
 ];
 
 /**
- * The checked catalog: exactly 23 read tools and 49 write tools
- * (45 procedure-backed + 4 extracted cores: 2 diagnostics and 2 CLI commands).
+ * The checked catalog: exactly 23 read tools and 50 write tools
+ * (45 procedure-backed + 5 extracted cores: 2 diagnostics and 3 CLI commands).
  */
 export const MCP_TOOL_MANIFEST: readonly McpToolDescriptor[] = [...READ_TOOLS, ...WRITE_TOOLS];
 
@@ -1292,6 +1316,16 @@ export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
   {
     target: "forwarderManagement.setCliDeviceFeatureGrants",
     reason: "human-only device grant",
+  },
+  {
+    target: "supervisedCommands.pending",
+    reason:
+      "Human-only supervised-command awareness: the person, not an agent, answers agent requests.",
+  },
+  {
+    target: "supervisedCommands.submitOutput",
+    reason:
+      "Human-only output review: an agent must never review or release the output of its own request.",
   },
   {
     target: "forwarderManagement.listDashboardNotices",
