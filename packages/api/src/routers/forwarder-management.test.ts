@@ -7,6 +7,10 @@ import {
   parseDirectModelId,
   validateForwarderSlug,
 } from "@ws-model-proxy/config/forwarder-identifiers";
+import {
+  ParentDeletionDrainPendingError,
+  RetainedHistoryError,
+} from "@ws-model-proxy/db/parent-deletion";
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Context } from "../context";
@@ -5023,6 +5027,124 @@ describe("forwarderManagementRouter", () => {
         lockedCliDeviceIds: ["cli-device-id"],
         executionTargetIds: ["target-id"],
         discoveredModelIds: ["model-id"],
+      });
+    });
+
+    describe("deletion CONFLICT reasons", () => {
+      const recent = new Date("2026-06-01T00:00:00Z");
+      const staleBefore = new Date("2026-05-31T00:00:00Z");
+
+      it("endpoint: a recent precheck heartbeat is not_stale", async () => {
+        db.endpoint.findUnique.mockResolvedValue({ userId: "user-id", lastSeenAt: recent });
+        await expect(
+          client().removeEndpointMetadata({ id: "endpoint-id", staleBefore }),
+        ).rejects.toMatchObject({
+          code: "CONFLICT",
+          message: "Endpoint is not stale.",
+          data: { reason: "not_stale" },
+        });
+        expect(prepareParentDeletion).not.toHaveBeenCalled();
+      });
+
+      it("endpoint: a heartbeat under the locks is not_stale", async () => {
+        db.endpoint.findUnique
+          .mockResolvedValueOnce({ userId: "user-id", lastSeenAt: null })
+          .mockResolvedValueOnce({ id: "endpoint-id", userId: "user-id", cliDeviceId: "cli" })
+          .mockResolvedValueOnce({ lastSeenAt: recent });
+        db.executionTarget.findMany.mockResolvedValue([]);
+        await expect(
+          client().removeEndpointMetadata({ id: "endpoint-id", staleBefore }),
+        ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "not_stale" } });
+        expect(db.endpoint.delete).not.toHaveBeenCalled();
+      });
+
+      it("discovered model: precheck and under-lock heartbeats are not_stale", async () => {
+        db.discoveredModel.findUnique.mockResolvedValueOnce({
+          userId: "user-id",
+          lastSeenAt: recent,
+        });
+        await expect(
+          client().removeDiscoveredModelMetadata({ id: "model-id", staleBefore }),
+        ).rejects.toMatchObject({
+          code: "CONFLICT",
+          message: "Discovered model is not stale.",
+          data: { reason: "not_stale" },
+        });
+        db.discoveredModel.findUnique
+          .mockResolvedValueOnce({ userId: "user-id", lastSeenAt: null })
+          .mockResolvedValueOnce({
+            id: "model-id",
+            userId: "user-id",
+            Endpoint: { cliDeviceId: "cli" },
+          })
+          .mockResolvedValueOnce({ lastSeenAt: recent });
+        db.executionTarget.findMany.mockResolvedValue([]);
+        await expect(
+          client().removeDiscoveredModelMetadata({ id: "model-id", staleBefore }),
+        ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "not_stale" } });
+        expect(db.discoveredModel.delete).not.toHaveBeenCalled();
+      });
+
+      it("endpoint: retained history and an undrained residual carry their reasons", async () => {
+        db.endpoint.findUnique.mockResolvedValue({ userId: "user-id", lastSeenAt: null });
+        prepareParentDeletion.mockRejectedValueOnce(new RetainedHistoryError("capacity lease"));
+        await expect(client().removeEndpointMetadata({ id: "endpoint-id" })).rejects.toMatchObject({
+          code: "CONFLICT",
+          data: { reason: "retained_history" },
+        });
+        prepareParentDeletion.mockRejectedValueOnce(new ParentDeletionDrainPendingError("busy"));
+        await expect(client().removeEndpointMetadata({ id: "endpoint-id" })).rejects.toMatchObject({
+          code: "CONFLICT",
+          data: { reason: "delete_pending" },
+        });
+        expect(db.endpoint.delete).not.toHaveBeenCalled();
+      });
+
+      it("pool: retained history and an undrained residual carry their reasons", async () => {
+        db.modelPool.findUnique.mockResolvedValue({
+          id: "pool-id",
+          userId: "user-id",
+          publicEgressEnabled: false,
+        });
+        prepareParentDeletion.mockRejectedValueOnce(new RetainedHistoryError("capacity lease"));
+        await expect(client().deleteModelPool({ id: "pool-id" })).rejects.toMatchObject({
+          code: "CONFLICT",
+          data: { reason: "retained_history" },
+        });
+        prepareParentDeletion.mockRejectedValueOnce(new ParentDeletionDrainPendingError("busy"));
+        await expect(client().deleteModelPool({ id: "pool-id" })).rejects.toMatchObject({
+          code: "CONFLICT",
+          data: { reason: "delete_pending" },
+        });
+        expect(db.modelPool.delete).not.toHaveBeenCalled();
+      });
+
+      it("pool member: retained history carries its reason", async () => {
+        db.poolMember.findUnique.mockResolvedValue({
+          id: "member-a",
+          poolId: "pool-id",
+          tier: "PUBLIC_OVERFLOW",
+          ModelPool: {
+            userId: "user-id",
+            recommendedSurfaceOverride: null,
+            protocolAdaptationEnabled: false,
+          },
+        });
+        prepareParentDeletion.mockRejectedValueOnce(new RetainedHistoryError("capacity lease"));
+        await expect(client().removePoolMember({ id: "member-a" })).rejects.toMatchObject({
+          code: "CONFLICT",
+          data: { reason: "retained_history" },
+        });
+        expect(db.poolMember.delete).not.toHaveBeenCalled();
+      });
+
+      it("CLI device: retained history carries its reason", async () => {
+        db.cliDevice.findFirst.mockResolvedValue({ lastHeartbeatAt: null });
+        prepareParentDeletion.mockRejectedValueOnce(new RetainedHistoryError("capacity lease"));
+        await expect(client().removeCliDeviceMetadata({ id: "cli-id" })).rejects.toMatchObject({
+          code: "CONFLICT",
+          data: { reason: "retained_history" },
+        });
       });
     });
   });

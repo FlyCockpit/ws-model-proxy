@@ -39,6 +39,7 @@ import {
   declaredContextWindow,
   isContextWindowSeedAdmissible,
 } from "../lib/declared-context-window";
+import { deletionConflict } from "../lib/deletion-conflict";
 import {
   ensureDiscoveredInferenceCapacity,
   existingDiscoveredCapacityCandidates,
@@ -1211,7 +1212,7 @@ async function removeOwnedRow({
     throw new ORPCError("NOT_FOUND", { message: `${label} not found.` });
   }
   if (staleBefore && precheck.lastSeenAt && precheck.lastSeenAt >= staleBefore) {
-    throw new ORPCError("CONFLICT", { message: `${label} is not stale.` });
+    throw deletionConflict("not_stale", `${label} is not stale.`);
   }
   // The request history the cascade deletes or detaches is drained in short
   // batches first (DL1-TXBOUND), so the ordered transaction below holds the
@@ -1248,7 +1249,7 @@ async function removeOwnedRow({
       });
       if (!current) throw new ORPCError("NOT_FOUND", { message: "Endpoint not found." });
       if (staleBefore && current.lastSeenAt && current.lastSeenAt >= staleBefore) {
-        throw new ORPCError("CONFLICT", { message: "Endpoint is not stale." });
+        throw deletionConflict("not_stale", "Endpoint is not stale.");
       }
       await tx.endpoint.delete({ where: { id } });
       return { deleted: true };
@@ -1277,7 +1278,7 @@ async function removeOwnedRow({
     });
     if (!current) throw new ORPCError("NOT_FOUND", { message: "Discovered model not found." });
     if (staleBefore && current.lastSeenAt && current.lastSeenAt >= staleBefore) {
-      throw new ORPCError("CONFLICT", { message: "Discovered model is not stale." });
+      throw deletionConflict("not_stale", "Discovered model is not stale.");
     }
     await tx.discoveredModel.delete({ where: { id } });
     return { deleted: true };

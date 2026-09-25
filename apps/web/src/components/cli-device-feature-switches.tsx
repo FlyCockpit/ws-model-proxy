@@ -1,9 +1,19 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@ws-model-proxy/ui/components/alert-dialog";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Switch } from "@ws-model-proxy/ui/components/switch";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { ShieldAlert } from "lucide-react";
+import { ShieldAlert, TriangleAlert } from "lucide-react";
 import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -67,7 +77,12 @@ function FeatureSwitch({
   );
 }
 
-/** Off / Supervised / Unsupervised. Modes above what the CLI allows are disabled. */
+/**
+ * Off / Supervised / Unsupervised. Modes above what the CLI allows are
+ * disabled. Unsupervised is styled as dangerous (any agent with an MCP token
+ * for this account can run arbitrary commands, unconfirmed) and Supervised is
+ * marked as the recommended mode.
+ */
 function CommandModeControl({
   id,
   feature,
@@ -95,14 +110,25 @@ function CommandModeControl({
           const state = commandModeOptionState(feature, mode);
           const optionId = `${id}-${mode}`;
           const checked = selected === mode;
+          const dangerous = mode === "unsupervised";
           return (
             <label
               key={mode}
               htmlFor={optionId}
               className={cn(
                 "inline-flex min-h-11 cursor-pointer items-center gap-2 rounded-md border px-3 text-sm has-focus-visible:outline-2 has-focus-visible:outline-ring",
-                checked ? "border-primary bg-primary/10" : "border-border",
-                state.disabled || pending ? "cursor-not-allowed opacity-50" : "hover:bg-muted",
+                dangerous
+                  ? checked
+                    ? "border-destructive text-destructive ring-1 ring-destructive"
+                    : "border-destructive/50 text-destructive"
+                  : checked
+                    ? "border-primary bg-primary/10"
+                    : "border-border",
+                state.disabled || pending
+                  ? "cursor-not-allowed opacity-50"
+                  : dangerous
+                    ? "hover:bg-destructive/10"
+                    : "hover:bg-muted",
               )}
             >
               <input
@@ -110,17 +136,28 @@ function CommandModeControl({
                 type="radio"
                 name={`${id}-mode`}
                 value={mode}
-                className="size-4 accent-primary"
+                className={cn("size-4", dangerous ? "accent-destructive" : "accent-primary")}
                 checked={checked}
                 disabled={state.disabled || pending}
                 onChange={() => onSelect(mode)}
               />
+              {dangerous ? <TriangleAlert className="size-4 shrink-0" aria-hidden="true" /> : null}
               {t(`dashboard:clis.features.commandModes.${mode}`)}
+              {mode === "supervised" ? (
+                <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-foreground">
+                  {t("dashboard:clis.features.commandModeRecommended")}
+                </span>
+              ) : null}
             </label>
           );
         })}
       </div>
-      <p className="mt-1 text-xs text-muted-foreground">
+      <p
+        className={cn(
+          "mt-1 text-xs",
+          selected === "unsupervised" ? "text-destructive" : "text-muted-foreground",
+        )}
+      >
         {t(`dashboard:clis.features.commandModeHelp.${selected}`)}
       </p>
       {firstReason ? (
@@ -134,9 +171,12 @@ function CommandModeControl({
 
 export function CliDeviceFeatureSwitches({
   cliDeviceId,
+  deviceName,
   device,
 }: {
   cliDeviceId: string;
+  /** Shown in the Unsupervised confirm dialog. */
+  deviceName: string;
   device: Parameters<typeof readCliDeviceFeatures>[0];
 }) {
   const { t } = useTranslation("dashboard");
@@ -144,23 +184,30 @@ export function CliDeviceFeatureSwitches({
   const baseId = useId();
   const features = readCliDeviceFeatures(device);
   const [optimistic, setOptimistic] = useState<OptimisticGrants>({});
-  const grants = useMutation(
-    orpc.forwarderManagement.setCliDeviceFeatureGrants.mutationOptions({
+  // Switching TO Unsupervised waits here for an explicit confirm; the radio
+  // stays on the current mode until then, so cancelling changes nothing.
+  const [confirmUnsupervised, setConfirmUnsupervised] = useState(false);
+  const grants = useMutation({
+    ...orpc.forwarderManagement.setCliDeviceFeatureGrants.mutationOptions({
       onSuccess: () => {
         void queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:clis.features.saved"));
         setOptimistic({});
       },
       onError: () => {
-        toast.error(t("dashboard:clis.features.saveFailed"));
         setOptimistic({});
       },
     }),
-  );
+    meta: { errorFallbackKey: "dashboard:clis.features.saveFailed" },
+  });
   const terminalFeature = features.features.terminal;
   const commandFeature = features.features.commands;
   const terminalGate = featureSwitchState(terminalFeature, "terminal");
   const commandMode = optimistic.commands ?? commandFeature.mode;
+  const setCommandMode = (mode: McpCommandMode) => {
+    setOptimistic((current) => ({ ...current, commands: mode }));
+    grants.mutate({ cliDeviceId, mcpCommandMode: mode });
+  };
   const showApproval = recommendTerminalApproval(
     { ...commandFeature, mode: commandMode },
     terminalFeature,
@@ -187,11 +234,44 @@ export function CliDeviceFeatureSwitches({
           selected={commandMode}
           pending={grants.isPending}
           onSelect={(mode) => {
-            setOptimistic((current) => ({ ...current, commands: mode }));
-            grants.mutate({ cliDeviceId, mcpCommandMode: mode });
+            if (mode === "unsupervised" && commandMode !== "unsupervised") {
+              setConfirmUnsupervised(true);
+              return;
+            }
+            setCommandMode(mode);
           }}
         />
       </div>
+      <AlertDialog open={confirmUnsupervised} onOpenChange={setConfirmUnsupervised}>
+        <AlertDialogContent className="max-w-[calc(100%-2rem)]! sm:max-w-md! data-[size=default]:max-w-[calc(100%-2rem)]! data-[size=default]:sm:max-w-md! data-[size=sm]:max-w-[calc(100%-2rem)]! data-[size=sm]:sm:max-w-md!">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="flex min-w-0 items-center gap-2 break-words">
+              <TriangleAlert className="size-5 shrink-0 text-destructive" aria-hidden="true" />
+              {t("dashboard:clis.features.unsupervisedConfirm.title", { name: deviceName })}
+            </AlertDialogTitle>
+            <AlertDialogDescription className="min-w-0 max-w-full break-words">
+              {t("dashboard:clis.features.unsupervisedConfirm.description", {
+                name: deviceName,
+              })}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter className="sm:flex-wrap">
+            <AlertDialogCancel className="min-h-[44px] w-full sm:w-auto">
+              {t("dashboard:clis.features.unsupervisedConfirm.cancel")}
+            </AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              className="min-h-[44px] w-full sm:w-auto"
+              onClick={() => {
+                setConfirmUnsupervised(false);
+                setCommandMode("unsupervised");
+              }}
+            >
+              {t("dashboard:clis.features.unsupervisedConfirm.confirm")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
       {showApproval ? (
         <div className="flex min-w-0 gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
           <ShieldAlert className="mt-0.5 size-4 shrink-0 text-amber-600" aria-hidden="true" />

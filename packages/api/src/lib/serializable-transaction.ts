@@ -11,6 +11,7 @@ import {
   prepareParentDeletion,
   RetainedHistoryError,
 } from "@ws-model-proxy/db/parent-deletion";
+import { deletionConflict } from "./deletion-conflict";
 
 const RETRYABLE_CODES = new Set(["P2034", "40001", "40P01"]);
 const TRANSACTION_WRITE_CONFLICT = "TransactionWriteConflict";
@@ -85,9 +86,10 @@ export async function runCapacityDeleteTransaction<T>(
   } catch (error) {
     throwParentDeletionPendingConflict(error);
     if (!isRetryableCapacityTransactionError(error)) throw error;
-    throw new ORPCError("CONFLICT", {
-      message: "Configuration changed concurrently. Retry the request.",
-    });
+    throw deletionConflict(
+      "delete_contended",
+      "Configuration changed concurrently. Retry the request.",
+    );
   }
 }
 
@@ -99,9 +101,10 @@ export async function runCapacityDeleteTransaction<T>(
  */
 export function throwParentDeletionPendingConflict(error: unknown): void {
   if (!(error instanceof ParentDeletionDrainPendingError)) return;
-  throw new ORPCError("CONFLICT", {
-    message: "This item still has requests in flight. Retry once they finish.",
-  });
+  throw deletionConflict(
+    "delete_pending",
+    "This item still has requests in flight. Retry once they finish.",
+  );
 }
 
 /**
@@ -118,10 +121,10 @@ export async function drainBeforeParentDelete(scope: ParentDeletionScope): Promi
     await prepareParentDeletion(prisma, scope);
   } catch (error) {
     if (error instanceof RetainedHistoryError) {
-      throw new ORPCError("CONFLICT", {
-        message:
-          "This item has retained capacity or provider history and cannot be deleted. Disable it instead.",
-      });
+      throw deletionConflict(
+        "retained_history",
+        "This item has retained capacity or provider history and cannot be deleted. Disable it instead.",
+      );
     }
     throwParentDeletionPendingConflict(error);
     if (error instanceof ParentDeletionInterruptedError) {

@@ -3,6 +3,7 @@ import { cliSlugFromDeviceLoginScope } from "@ws-model-proxy/config/cli-device-l
 import { validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import {
+  isRetryableCapacityTransactionError,
   lockCapacityGraphForDelete,
   runCapacityOrderedTransaction,
 } from "@ws-model-proxy/db/capacity-lock-order";
@@ -15,6 +16,7 @@ import {
 } from "@ws-model-proxy/db/forwarder-security";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import type { Context } from "../context";
+import { deletionConflict } from "./deletion-conflict";
 import {
   drainBeforeParentDelete,
   throwParentDeletionPendingConflict,
@@ -321,7 +323,7 @@ export async function deleteCliDeviceAndCredentials({
   });
   if (!precheck) throw new ORPCError("NOT_FOUND", { message: "CLI device not found." });
   if (staleBefore && precheck.lastHeartbeatAt && precheck.lastHeartbeatAt >= staleBefore) {
-    throw new ORPCError("CONFLICT", { message: "CLI device is not stale." });
+    throw deletionConflict("not_stale", "CLI device is not stale.");
   }
   // The request history the cascade deletes or detaches (relay requests,
   // terminal admission history, stickiness records) is drained in short
@@ -337,7 +339,11 @@ export async function deleteCliDeviceAndCredentials({
     return await deleteCliDeviceInCapacityLockOrder({ cliDeviceId, userId, staleBefore, now });
   } catch (error) {
     throwParentDeletionPendingConflict(error);
-    throw error;
+    if (!isRetryableCapacityTransactionError(error)) throw error;
+    throw deletionConflict(
+      "delete_contended",
+      "Configuration changed concurrently. Retry the request.",
+    );
   }
 }
 
@@ -366,7 +372,7 @@ async function deleteCliDeviceInCapacityLockOrder({
         select: { lastHeartbeatAt: true },
       });
       if (device?.lastHeartbeatAt && device.lastHeartbeatAt >= staleBefore) {
-        throw new ORPCError("CONFLICT", { message: "CLI device is not stale." });
+        throw deletionConflict("not_stale", "CLI device is not stale.");
       }
     }
 

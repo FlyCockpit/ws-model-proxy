@@ -180,7 +180,14 @@
       "commandModeHelp": {
         "off": "Los agentes MCP no pueden ejecutar comandos en este CLI.",
         "supervised": "Un agente puede pedir ejecutar un comando; solo se ejecuta después de que alguien presione Enter en la pantalla de confirmación del CLI.",
-        "unsupervised": "Los agentes pueden ejecutar comandos sin interfaz y también pedir comandos supervisados."
+        "unsupervised": "Peligroso: cualquier agente con un token MCP de esta cuenta puede ejecutar cualquier comando en esta máquina, como el usuario del sistema operativo del CLI, sin que nadie lo confirme. Prefiere Supervisado."
+      },
+      "commandModeRecommended": "Recomendado",
+      "unsupervisedConfirm": {
+        "title": "¿Permitir comandos sin supervisión en {{name}}?",
+        "description": "Cualquier agente con un token MCP de esta cuenta podrá ejecutar cualquier comando en {{name}}, como el usuario del sistema operativo con el que se ejecuta el CLI, sin que nadie lo confirme. Un token filtrado o mal usado significa control total de esa cuenta en esta máquina. El modo Supervisado mantiene a una persona en el proceso y es el recomendado.",
+        "cancel": "Mantener el modo actual",
+        "confirm": "Permitir sin supervisión"
       },
       "approvalRecommended": "Recomendado: exige aprobación del navegador en este CLI. Sin ella, el CLI acepta cualquier navegador que admita el servidor de WS Model Proxy, así que \"nada se ejecuta sin que presiones una tecla\" y \"la salida sin revisar nunca llega al servidor\" solo se cumplen mientras el servidor sea honesto: un servidor comprometido, o cualquiera con una sesión iniciada en esta cuenta, podría abrir una solicitud, presionar Enter y leer su salida. Con aprobación, solo pueden hacerlo los navegadores que aprobaste en este CLI, siempre que el código del panel que carga tu navegador sea legítimo (lo sirve el mismo servidor, que no tiene las claves de la terminal, pero un servidor comprometido podría servir código alterado). Ejecuta en el CLI:"
     },

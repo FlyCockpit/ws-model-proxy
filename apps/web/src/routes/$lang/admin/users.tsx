@@ -138,7 +138,7 @@ function AdminUsers() {
         trigger("error");
       },
     }),
-    meta: { errorFallbackKey: "admin:users.restoreFailed" },
+    meta: { errorFallbackKey: "admin:users.restoreFailed", deletionEntity: "user" },
   });
 
   const remove = useMutation({
@@ -157,7 +157,7 @@ function AdminUsers() {
         trigger("error");
       },
     }),
-    meta: { errorFallbackKey: "admin:users.deleteFailed" },
+    meta: { errorFallbackKey: "admin:users.deleteFailed", deletionEntity: "user" },
   });
 
   const allUsers = (list.data?.users ?? []) as UserRow[];

@@ -96,6 +96,7 @@ vi.mock("@/utils/orpc", () => {
 
 import { grantPoolAccessServerMessages } from "@ws-model-proxy/api/lib/effective-provider-egress";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { createAppMutationCache } from "@/utils/mutation-error-toast";
 import {
   CliEndpointsModelsSection,
   GrantPoolDialog,
@@ -731,6 +732,65 @@ describe("CliEndpointsModelsSection capability-impact advisory", () => {
     );
     expect(toast.warning).not.toHaveBeenCalled();
   });
+});
+
+describe("CliEndpointsModelsSection delete conflicts", () => {
+  function mountWithAppToasts() {
+    return render(
+      <QueryClientProvider
+        client={
+          new QueryClient({
+            defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+            mutationCache: createAppMutationCache((key) => key),
+          })
+        }
+      >
+        <CliEndpointsModelsSection />
+      </QueryClientProvider>,
+    );
+  }
+
+  async function confirmDelete(token: string) {
+    fireEvent.change(await screen.findByPlaceholderText(token), { target: { value: token } });
+    fireEvent.click(screen.getByRole("button", { name: "actions.delete" }));
+  }
+
+  it.each([
+    ["removeCliDeviceMetadata", 0, "desk", "retained_history", "retainedHistory.cliDevice"],
+    ["removeEndpointMetadata", 1, "desk/local", "delete_pending", "deletePending"],
+    [
+      "removeDiscoveredModelMetadata",
+      -1,
+      "owner/desk/local/example",
+      "retained_history",
+      "retainedHistory.discoveredModel",
+    ],
+  ])(
+    "%s: a structured CONFLICT shows its specific copy, not the generic one",
+    async (name, buttonIndex, token, reason, key) => {
+      state.cliDevices = [cliDeviceWithModel];
+      state.nextReject = {
+        name,
+        error: { status: 409, code: "CONFLICT", message: "raw", data: { reason } },
+      };
+      mountWithAppToasts();
+
+      if (buttonIndex < 0) {
+        fireEvent.click(screen.getByRole("button", { name: "dashboard:metadata.deleteModel" }));
+      } else {
+        fireEvent.click(
+          screen.getAllByRole("button", { name: "dashboard:metadata.delete" })[buttonIndex],
+        );
+      }
+      await confirmDelete(token);
+
+      await waitFor(() => expect(state.mutationCalls).toEqual([name]));
+      await waitFor(() =>
+        expect(toast.error).toHaveBeenCalledWith(`errors:deletionConflict.${key}`),
+      );
+      expect(toast.error).not.toHaveBeenCalledWith("That conflicts with an existing record.");
+    },
+  );
 });
 
 describe("CliEndpointsModelsSection device names", () => {

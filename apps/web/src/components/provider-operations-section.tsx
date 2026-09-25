@@ -644,12 +644,14 @@ export function ProviderOperationsSection() {
       onError: () => toast.error(t("dashboard:providers.feedback.failed")),
     }),
   );
-  const removePoolMember = useMutation(
-    orpc.forwarderManagement.removePoolMember.mutationOptions({
+  // Errors go through the global mutation toast (one toast): a structured
+  // deletion CONFLICT gets its specific copy, anything else the fallback.
+  const removePoolMember = useMutation({
+    ...orpc.forwarderManagement.removePoolMember.mutationOptions({
       onSuccess: () => invalidate(),
-      onError: () => toast.error(t("dashboard:providers.feedback.failed")),
     }),
-  );
+    meta: { errorFallbackKey: "dashboard:providers.feedback.failed", deletionEntity: "poolMember" },
+  });
   const credentialActive = credentials.data?.find((item) => item.status === "ACTIVE");
   const accountForm = useForm({
     defaultValues: {

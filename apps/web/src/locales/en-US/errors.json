@@ -2,5 +2,21 @@
   "appUpdateAvailable": "A new version is available. Reloading…",
   "couldNotCopy": "Couldn't copy — please select and copy manually.",
   "pageDescription": "{{appName}} is a web application",
-  "rootError": "This page didn't load. Try again, or reload."
+  "rootError": "This page didn't load. Try again, or reload.",
+  "deletionConflict": {
+    "deletePending": "This still has requests in flight, so nothing was deleted. Try again in a moment.",
+    "deleteContended": "This was busy with live traffic, so nothing was deleted. Try again in a moment.",
+    "stillAttached": "This capacity is still attached to a pool member. Detach it first.",
+    "notStale": "It reported in recently, so it wasn't removed as stale.",
+    "deletionInProgress": "This account is being deleted and can't be restored.",
+    "retainedHistory": {
+      "user": "This user has retained history and can't be deleted. Archive them instead.",
+      "cliDevice": "This CLI has retained capacity or provider history and can't be deleted. Disable it instead: set its pool members' routing to Disabled.",
+      "endpoint": "This endpoint has retained capacity or provider history and can't be deleted. Disable it instead: set its pool members' routing to Disabled.",
+      "discoveredModel": "This model has retained capacity or provider history and can't be deleted. Disable it instead: set its pool members' routing to Disabled.",
+      "pool": "This pool has retained capacity or provider history and can't be deleted. Disable it instead: set its members' routing to Disabled.",
+      "poolMember": "This member has retained capacity or provider history and can't be removed. Set its routing to Disabled instead.",
+      "capacity": "This capacity has retained history and can't be deleted. Leave it detached instead; it no longer serves requests."
+    }
+  }
 }

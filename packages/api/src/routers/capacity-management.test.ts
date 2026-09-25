@@ -35,6 +35,9 @@ vi.mock("@ws-model-proxy/db/parent-deletion", async (importOriginal) => ({
 }));
 
 const { capacityManagementRouter } = await import("./capacity-management");
+const { ParentDeletionDrainPendingError, RetainedHistoryError } = await import(
+  "@ws-model-proxy/db/parent-deletion"
+);
 const { backfillDiscoveredInferenceCapacities, ensureDiscoveredInferenceCapacity } = await import(
   "../lib/discovered-inference-capacity"
 );
@@ -243,7 +246,10 @@ describe("capacityManagementRouter", () => {
     lockCapacityGraphForDelete.mockClear();
     prepareParentDeletion.mockClear();
     // Refused by the read-only precheck: nothing is drained or locked.
-    await expect(client.remove({ id: "capacity" })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(client.remove({ id: "capacity" })).rejects.toMatchObject({
+      code: "CONFLICT",
+      data: { reason: "still_attached" },
+    });
     expect(prepareParentDeletion).not.toHaveBeenCalled();
     expect(lockCapacityGraphForDelete).not.toHaveBeenCalled();
     // A target attached after the precheck is refused by the re-read that
@@ -252,7 +258,10 @@ describe("capacityManagementRouter", () => {
       .mockResolvedValueOnce({ userId: "owner", _count: { ExecutionTargets: 0 } })
       .mockResolvedValueOnce({ userId: "owner" })
       .mockResolvedValueOnce({ userId: "owner", _count: { ExecutionTargets: 1 } });
-    await expect(client.remove({ id: "capacity" })).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(client.remove({ id: "capacity" })).rejects.toMatchObject({
+      code: "CONFLICT",
+      data: { reason: "still_attached" },
+    });
     expect(prepareParentDeletion).toHaveBeenCalledWith(expect.anything(), {
       userId: "owner",
       capacityIds: ["capacity"],
@@ -264,6 +273,25 @@ describe("capacityManagementRouter", () => {
     await expect(
       client.updateDirectPolicy({ executionTargetId: "target", directPriority: 32 }),
     ).rejects.toBeTruthy();
+    expect(db.inferenceCapacity.delete).not.toHaveBeenCalled();
+  });
+
+  it("tags retained-history and in-flight capacity delete refusals", async () => {
+    db.inferenceCapacity.findUnique.mockResolvedValue({
+      userId: "owner",
+      _count: { ExecutionTargets: 0 },
+    });
+    const client = createRouterClient(capacityManagementRouter, { context });
+    prepareParentDeletion.mockRejectedValueOnce(new RetainedHistoryError("capacity lease"));
+    await expect(client.remove({ id: "capacity" })).rejects.toMatchObject({
+      code: "CONFLICT",
+      data: { reason: "retained_history" },
+    });
+    prepareParentDeletion.mockRejectedValueOnce(new ParentDeletionDrainPendingError("busy"));
+    await expect(client.remove({ id: "capacity" })).rejects.toMatchObject({
+      code: "CONFLICT",
+      data: { reason: "delete_pending" },
+    });
     expect(db.inferenceCapacity.delete).not.toHaveBeenCalled();
   });
 

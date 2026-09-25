@@ -643,26 +643,28 @@ export function CliEndpointsModelsSection() {
   }, [devicesData, healthFilter, search]);
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
 
-  const removeCli = useMutation(
-    orpc.forwarderManagement.removeCliDeviceMetadata.mutationOptions({
+  const removeCli = useMutation({
+    ...orpc.forwarderManagement.removeCliDeviceMetadata.mutationOptions({
       onSuccess: () => {
         queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:metadata.deleted"));
         setDeleteTarget(null);
       },
     }),
-  );
-  const removeEndpoint = useMutation(
-    orpc.forwarderManagement.removeEndpointMetadata.mutationOptions({
+    meta: { deletionEntity: "cliDevice" },
+  });
+  const removeEndpoint = useMutation({
+    ...orpc.forwarderManagement.removeEndpointMetadata.mutationOptions({
       onSuccess: () => {
         queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:metadata.deleted"));
         setDeleteTarget(null);
       },
     }),
-  );
-  const removeModel = useMutation(
-    orpc.forwarderManagement.removeDiscoveredModelMetadata.mutationOptions({
+    meta: { deletionEntity: "endpoint" },
+  });
+  const removeModel = useMutation({
+    ...orpc.forwarderManagement.removeDiscoveredModelMetadata.mutationOptions({
       onSuccess: (data) => {
         queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         const impacted = data?.impactedPools ?? [];
@@ -678,7 +680,8 @@ export function CliEndpointsModelsSection() {
         setDeleteTarget(null);
       },
     }),
-  );
+    meta: { deletionEntity: "discoveredModel" },
+  });
   const updateModelCapabilities = useMutation(
     orpc.forwarderManagement.updateDiscoveredModelCapabilities.mutationOptions({
       onSuccess: (data) => {
@@ -813,7 +816,11 @@ export function CliEndpointsModelsSection() {
                 </div>
               </div>
 
-              <CliDeviceFeatureSwitches cliDeviceId={device.id} device={device} />
+              <CliDeviceFeatureSwitches
+                cliDeviceId={device.id}
+                deviceName={device.displayName}
+                device={device}
+              />
 
               <div className="divide-y">
                 {device.endpoints.length === 0 ? (

@@ -412,6 +412,7 @@ describe("usersRouter", () => {
         (e: ORPCError) => {
           expect(e.code).toBe("CONFLICT");
           expect(e.message).toMatch(/being deleted/i);
+          expect(e.data).toEqual({ reason: "deletion_in_progress" });
           return true;
         },
       );
@@ -503,7 +504,20 @@ describe("usersRouter", () => {
       await expect(client.remove({ userId: "other-user-id" })).rejects.toSatisfy((e: ORPCError) => {
         expect(e.code).toBe("CONFLICT");
         expect(e.message).toMatch(/archive/i);
+        expect(e.data).toEqual({ reason: "retained_history" });
         return true;
+      });
+      expect(deletedUsers).toEqual([]);
+    });
+
+    it("tags a deletion abandoned by a permanent refusal as retained_history", async () => {
+      db.user.findUnique.mockResolvedValue({ id: "other-user-id" });
+      vi.mocked(deleteUserDurably).mockResolvedValueOnce("abandoned");
+
+      const client = createRouterClient(usersRouter, { context: buildContext() });
+      await expect(client.remove({ userId: "other-user-id" })).rejects.toMatchObject({
+        code: "CONFLICT",
+        data: { reason: "retained_history" },
       });
       expect(deletedUsers).toEqual([]);
     });
@@ -527,6 +541,7 @@ describe("usersRouter", () => {
       await expect(client.remove({ userId: "other-user-id" })).rejects.toSatisfy((e: ORPCError) => {
         expect(e.code).toBe("CONFLICT");
         expect(e.message).toMatch(/archive/i);
+        expect(e.data).toEqual({ reason: "retained_history" });
         return true;
       });
     });

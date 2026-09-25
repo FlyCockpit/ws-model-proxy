@@ -11,6 +11,7 @@ import {
   lockExecutionTargetPolicies,
   modelPoolCapacityPolicyFields,
 } from "../lib/capacity-policy-safety";
+import { deletionConflict } from "../lib/deletion-conflict";
 import { parseModelApiSurface } from "../lib/model-api-surface";
 import { assertRecommendedSurfaceServable } from "../lib/pool-recommended-surface";
 import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
@@ -358,7 +359,7 @@ export const capacityManagementRouter = {
     });
     if (!precheck || precheck.userId !== userId) return notFound();
     if (precheck._count.ExecutionTargets > 0) {
-      throw new ORPCError("CONFLICT", { message: "Capacity is still attached." });
+      throw deletionConflict("still_attached", "Capacity is still attached.");
     }
     // Terminal waiter history on the capacity is drained in short batches
     // first (DL1-TXBOUND), so the ordered transaction holds the capacity
@@ -380,7 +381,7 @@ export const capacityManagementRouter = {
       });
       if (!current || current.userId !== userId) return notFound();
       if (current._count.ExecutionTargets > 0) {
-        throw new ORPCError("CONFLICT", { message: "Capacity is still attached." });
+        throw deletionConflict("still_attached", "Capacity is still attached.");
       }
       await tx.inferenceCapacity.delete({ where: { id: input.id } });
       await audit(tx, {

@@ -152,6 +152,11 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
       "commandModeHelp.off",
       "commandModeHelp.supervised",
       "commandModeHelp.unsupervised",
+      "commandModeRecommended",
+      "unsupervisedConfirm.title",
+      "unsupervisedConfirm.description",
+      "unsupervisedConfirm.cancel",
+      "unsupervisedConfirm.confirm",
       "approvalRecommended",
     ].sort();
     expect(keyTree(enDashboard.terminals).sort()).toEqual(terminalKeys);

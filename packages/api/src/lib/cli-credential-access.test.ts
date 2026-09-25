@@ -44,6 +44,9 @@ const {
   mintCliDeviceCredentialFromApprovedDeviceCode,
 } = await import("./cli-credential-access");
 const { default: prisma } = await import("@ws-model-proxy/db");
+const { ParentDeletionDrainPendingError, RetainedHistoryError } = await import(
+  "@ws-model-proxy/db/parent-deletion"
+);
 
 const db = prisma as unknown as {
   $transaction: MockInstance;
@@ -652,9 +655,73 @@ describe("deleteCliDeviceAndCredentials", () => {
         staleBefore: new Date(now.getTime() - 60_000),
         now,
       }),
-    ).rejects.toMatchObject({ code: "CONFLICT" });
+    ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "not_stale" } });
     expect(prepareParentDeletion).not.toHaveBeenCalled();
     expect(db.cliToken.updateMany).not.toHaveBeenCalled();
     expect(db.cliDevice.delete).not.toHaveBeenCalled();
+  });
+
+  it("refuses under the device lock when a heartbeat lands after the precheck", async () => {
+    db.cliDevice.findFirst.mockResolvedValue({ lastHeartbeatAt: null });
+    db.cliDevice.findUnique.mockResolvedValue({ lastHeartbeatAt: now });
+
+    await expect(
+      deleteCliDeviceAndCredentials({
+        cliDeviceId: "cli-device-id",
+        userId: "user-id",
+        staleBefore: new Date(now.getTime() - 60_000),
+        now,
+      }),
+    ).rejects.toMatchObject({
+      code: "CONFLICT",
+      message: "CLI device is not stale.",
+      data: { reason: "not_stale" },
+    });
+    expect(db.cliDevice.delete).not.toHaveBeenCalled();
+  });
+
+  it("answers delete_pending when the in-transaction recount is above the bound", async () => {
+    db.$transaction.mockRejectedValueOnce(new ParentDeletionDrainPendingError("recount"));
+
+    await expect(
+      deleteCliDeviceAndCredentials({ cliDeviceId: "cli-device-id", userId: "user-id", now }),
+    ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "delete_pending" } });
+  });
+
+  it("answers retained_history before draining when history must be kept", async () => {
+    prepareParentDeletion.mockRejectedValueOnce(new RetainedHistoryError("capacity lease"));
+
+    await expect(
+      deleteCliDeviceAndCredentials({ cliDeviceId: "cli-device-id", userId: "user-id", now }),
+    ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "retained_history" } });
+    expect(db.cliDevice.delete).not.toHaveBeenCalled();
+  });
+
+  it("answers delete_contended when ordered delete retries are exhausted", async () => {
+    const deadlock = Object.assign(new Error("deadlock detected"), { code: "40P01" });
+    db.$transaction.mockRejectedValue(deadlock);
+
+    await expect(
+      deleteCliDeviceAndCredentials({ cliDeviceId: "cli-device-id", userId: "user-id", now }),
+    ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "delete_contended" } });
+    expect(db.$transaction).toHaveBeenCalledTimes(5);
+  });
+
+  it("rethrows a non-retryable transaction error unchanged", async () => {
+    const boom = new Error("boom");
+    db.$transaction.mockRejectedValue(boom);
+
+    await expect(
+      deleteCliDeviceAndCredentials({ cliDeviceId: "cli-device-id", userId: "user-id", now }),
+    ).rejects.toBe(boom);
+  });
+
+  it("rethrows NOT_FOUND from inside the ordered transaction unchanged", async () => {
+    const notFound = new ORPCError("NOT_FOUND", { message: "CLI device not found." });
+    db.$transaction.mockRejectedValue(notFound);
+
+    await expect(
+      deleteCliDeviceAndCredentials({ cliDeviceId: "cli-device-id", userId: "user-id", now }),
+    ).rejects.toBe(notFound);
   });
 });

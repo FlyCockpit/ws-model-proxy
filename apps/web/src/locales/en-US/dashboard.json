@@ -47,7 +47,14 @@
       "commandModeHelp": {
         "off": "MCP agents cannot run commands on this CLI.",
         "supervised": "An agent can ask to run a command; it runs only after someone presses Enter on the CLI's confirm screen.",
-        "unsupervised": "Agents can run commands headlessly, and can also ask for supervised ones."
+        "unsupervised": "Dangerous: any agent holding an MCP token for this account can run any command on this machine, as the CLI's OS user, with no one confirming it. Prefer Supervised."
+      },
+      "commandModeRecommended": "Recommended",
+      "unsupervisedConfirm": {
+        "title": "Allow unsupervised commands on {{name}}?",
+        "description": "Any agent holding an MCP token for this account will be able to run any command on {{name}}, as the operating-system user the CLI runs as, without anyone confirming it. A leaked or misused token means full control of that account on this machine. Supervised mode keeps a person in the loop and is recommended.",
+        "cancel": "Keep current mode",
+        "confirm": "Allow unsupervised"
       },
       "approvalRecommended": "Recommended: require browser approval on this CLI. Without it, the CLI lets in any browser the WS Model Proxy server admits, so \"nothing runs without your keypress\" and \"unreviewed output never reaches the server\" hold only while the server is honest: a compromised server, or anyone signed in to this account, could open a request, press Enter, and read its output. With approval, only browsers you approved on this CLI can, provided the dashboard code your browser loads is genuine (the same server serves it and holds no terminal keys, but a compromised server could serve altered code). Run on the CLI:"
     },

@@ -18,6 +18,7 @@ import { renderInviteUser, sendEmail } from "@ws-model-proxy/mailer";
 import { z } from "zod";
 
 import { adminOr404Procedure } from "../index";
+import { deletionConflict } from "../lib/deletion-conflict";
 
 // Roles surfaced in the admin UI. Better-auth itself stores `role` as a free-
 // form string (and supports comma-separated lists), but the admin dashboard
@@ -268,10 +269,10 @@ export const usersRouter = {
       select: { id: true },
     });
     if (!target) throw new ORPCError("NOT_FOUND", { message: "User not found" });
-    throw new ORPCError("CONFLICT", {
-      message:
-        "This account is being deleted and cannot be restored. Wait for deletion to finish or contact support.",
-    });
+    throw deletionConflict(
+      "deletion_in_progress",
+      "This account is being deleted and cannot be restored. Wait for deletion to finish or contact support.",
+    );
   }),
 
   remove: adminOr404Procedure.input(userIdInput).handler(async ({ input, context }) => {
@@ -318,10 +319,10 @@ export const usersRouter = {
         isPermanentParentDeletionFailure(err) ||
         /foreign key|constraint|restrict/i.test(message)
       ) {
-        throw new ORPCError("CONFLICT", {
-          message:
-            "This user has retained history and cannot be deleted. Archive them instead, or reassign their content first.",
-        });
+        throw deletionConflict(
+          "retained_history",
+          "This user has retained history and cannot be deleted. Archive them instead, or reassign their content first.",
+        );
       }
       console.error(`[users.remove] prisma delete failed: ${label(err)}`);
       throw new ORPCError("INTERNAL_SERVER_ERROR", {
@@ -333,10 +334,10 @@ export const usersRouter = {
     if (result === "pending") return { success: true, pending: true };
     if (result === "abandoned") {
       // A permanent refusal archived the user before this call finished.
-      throw new ORPCError("CONFLICT", {
-        message:
-          "This user has retained history and cannot be deleted. Archive them instead, or reassign their content first.",
-      });
+      throw deletionConflict(
+        "retained_history",
+        "This user has retained history and cannot be deleted. Archive them instead, or reassign their content first.",
+      );
     }
     // Close the deleted user's live relay sessions, matched by the
     // authenticated identity's userId (not a credential-id snapshot, so a

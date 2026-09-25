@@ -39,6 +39,9 @@
     },
     "./terminal-socket-policy": {
       "default": "./src/terminal-socket-policy.ts"
+    },
+    "./deletion-conflict": {
+      "default": "./src/deletion-conflict.ts"
     }
   },
   "files": [

@@ -57,6 +57,7 @@ export async function refuseUndeletableUserBeforeCredentialDelete(
   if (blocker)
     throw new APIError("CONFLICT", {
       message: RETAINED_HISTORY_REMOVE_USER_MESSAGE,
+      code: "RETAINED_HISTORY",
       cause: new RetainedHistoryError(blocker),
     });
   // Idempotent: the first call starts the deletion generation (and notifies),

@@ -266,22 +266,24 @@ export function PoolDetailPage({ poolId, lang = "en-US" }: { poolId: string; lan
   const [deletePoolOpen, setDeletePoolOpen] = useState(false);
   const [deleteMemberId, setDeleteMemberId] = useState<string | null>(null);
   const [revokeEmail, setRevokeEmail] = useState<string | null>(null);
-  const deletePool = useMutation(
-    orpc.forwarderManagement.deleteModelPool.mutationOptions({
+  const deletePool = useMutation({
+    ...orpc.forwarderManagement.deleteModelPool.mutationOptions({
       onSuccess: () => {
         void queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         setDeletePoolOpen(false);
       },
     }),
-  );
-  const removeMember = useMutation(
-    orpc.forwarderManagement.removePoolMember.mutationOptions({
+    meta: { deletionEntity: "pool" },
+  });
+  const removeMember = useMutation({
+    ...orpc.forwarderManagement.removePoolMember.mutationOptions({
       onSuccess: () => {
         void queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         setDeleteMemberId(null);
       },
     }),
-  );
+    meta: { deletionEntity: "poolMember" },
+  });
   const revokeGrant = useMutation(
     orpc.forwarderManagement.revokePoolAccessByEmail.mutationOptions({
       onSuccess: () => {
@@ -726,14 +728,15 @@ export function InferenceCapacityPage() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
-  const remove = useMutation(
-    orpc.capacityManagement.remove.mutationOptions({
+  const remove = useMutation({
+    ...orpc.capacityManagement.remove.mutationOptions({
       onSuccess: () => {
         void queryClient.invalidateQueries({ queryKey: orpc.capacityManagement.key() });
         setDeletingId(null);
       },
     }),
-  );
+    meta: { deletionEntity: "capacity" },
+  });
 
   if (availability === "loading" || (availability === "enabled" && capacities.isPending)) {
     return <PageSkeleton />;
