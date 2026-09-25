@@ -168,8 +168,6 @@ const v26CliCapabilitiesSchema = z
   })
   .strict();
 
-export type CliCapabilities = z.infer<typeof v26CliCapabilitiesSchema>;
-
 const discoveredModelSchema = z
   .object({
     slug: z.string().trim().min(1).max(128).optional(),

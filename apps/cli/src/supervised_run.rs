@@ -12,7 +12,8 @@
 //! The screen always fits the PTY: the request (header, command, output
 //! notice) scrolls in a viewport above a pinned footer. When part of it does
 //! not fit, the footer says so next to the Enter prompt, with the command's
-//! size and how to see the rest. The layout follows PTY resizes (SIGWINCH).
+//! size and how to see the rest. The layout follows PTY resizes: the key
+//! loop re-reads the size while it waits for a key.
 //!
 //! Enter does not `exec` on its own: this process prints its `accepted`
 //! marker and waits for the daemon's `go` token on stdin. The daemon writes

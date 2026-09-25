@@ -15,6 +15,62 @@ use crate::sessions::{
 /// typed meanwhile is flushed with the rest of the type-ahead.
 const SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
 
+/// How often the key loop re-reads the terminal size while no key arrives.
+///
+/// The size is polled (a cheap ioctl) instead of waiting for SIGWINCH:
+/// SIGWINCH is ignored by default, and on macOS a signal the process ignores
+/// is discarded when it is sent, even while it is blocked, so `sigwait` never
+/// sees it (XNU `psignal_internal` checks `p_sigignore` first). Only a real
+/// handler would change that, which needs `unsafe`.
+const RESIZE_CHECK_MS: i64 = 100;
+
+/// Why [`wait_for_input_or_resize`] returned.
+#[derive(Debug, PartialEq, Eq)]
+enum Wake {
+    /// A read on the input will not block.
+    Input,
+    /// The terminal now has this `(cols, rows)` size.
+    Resized((usize, usize)),
+}
+
+/// Waits until `input` is readable or `measure` reports a size other than
+/// `current`, whichever comes first (a resize wins a tie; the input stays
+/// readable for the next call). Uses select(2), which supports ttys
+/// everywhere, rather than poll(2), which on macOS only works for devices
+/// with a kqueue filter. Nothing is read from `input`.
+fn wait_for_input_or_resize(
+    input: std::os::fd::BorrowedFd<'_>,
+    current: (usize, usize),
+    mut measure: impl FnMut() -> (usize, usize),
+) -> nix::Result<Wake> {
+    use std::os::fd::AsRawFd;
+
+    use nix::errno::Errno;
+    use nix::sys::select::{FD_SETSIZE, FdSet, select};
+    use nix::sys::time::{TimeVal, TimeValLike};
+
+    if usize::try_from(input.as_raw_fd()).map_or(true, |fd| fd >= FD_SETSIZE) {
+        return Err(Errno::EBADF);
+    }
+    loop {
+        let mut readable = FdSet::new();
+        readable.insert(input);
+        let mut timeout = TimeVal::milliseconds(RESIZE_CHECK_MS);
+        let ready = match select(None, &mut readable, None, None, &mut timeout) {
+            Ok(count) => count > 0 && readable.contains(input),
+            Err(Errno::EINTR) => false,
+            Err(error) => return Err(error),
+        };
+        let size = measure();
+        if size != current {
+            return Ok(Wake::Resized(size));
+        }
+        if ready {
+            return Ok(Wake::Input);
+        }
+    }
+}
+
 /// The size assumed when the PTY size cannot be read. Small on purpose:
 /// every row is narrower than 40 columns and there are at most 16 rows, so
 /// on any terminal at least that big nothing wraps or scrolls away, and the
@@ -202,12 +258,10 @@ fn terminal_size() -> (usize, usize) {
 }
 
 pub fn run() -> Result<()> {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::os::fd::AsFd;
     use std::os::unix::process::CommandExt;
 
-    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-    use nix::sys::signal::{SigSet, Signal};
     use nix::sys::termios::{
         self, FlushArg, InputFlags, LocalFlags, SetArg, SpecialCharacterIndices,
     };
@@ -237,21 +291,6 @@ pub fn run() -> Result<()> {
         share_output,
     };
 
-    // Resizes arrive as SIGWINCH; a helper thread turns them into a byte on
-    // a pipe that the key loop polls next to stdin. The mask is restored
-    // before the command is exec'd.
-    let mut winch = SigSet::empty();
-    winch.add(Signal::SIGWINCH);
-    winch.thread_block().context("blocking the resize signal")?;
-    let (mut resized, mut resize_tx) = std::io::pipe().context("creating the resize pipe")?;
-    std::thread::spawn(move || {
-        while winch.wait().is_ok() {
-            if resize_tx.write_all(b"r").is_err() {
-                return;
-            }
-        }
-    });
-
     let stdin = std::io::stdin();
     let original = termios::tcgetattr(&stdin).context("reading terminal settings")?;
     let mut raw = original.clone();
@@ -267,7 +306,7 @@ pub fn run() -> Result<()> {
     let _ = termios::tcflush(&stdin, FlushArg::TCIFLUSH);
 
     let mut stdout = std::io::stdout().lock();
-    // Read again only on SIGWINCH, not on every key.
+    // Re-read by the key loop while it waits (see `RESIZE_CHECK_MS`).
     let mut size = terminal_size();
     let mut screen = layout(&request, size.0, size.1, 0);
     let drawn = stdout
@@ -303,33 +342,20 @@ pub fn run() -> Result<()> {
 
     let mut keys = KeyReader::default();
     'confirm: loop {
-        let (input_ready, resize_ready) = {
-            let mut fds = [
-                PollFd::new(stdin.as_fd(), PollFlags::POLLIN),
-                PollFd::new(resized.as_fd(), PollFlags::POLLIN),
-            ];
-            match poll(&mut fds, PollTimeout::NONE) {
-                Ok(_) => {}
-                Err(nix::errno::Errno::EINTR) => continue,
-                Err(error) => {
-                    restore(&stdin);
-                    return Err(error).context("waiting for the confirm key");
-                }
+        match wait_for_input_or_resize(stdin.as_fd(), size, terminal_size) {
+            Ok(Wake::Input) => {}
+            Ok(Wake::Resized(new_size)) => {
+                size = new_size;
+                screen = layout(&request, size.0, size.1, screen.offset);
+                let _ = stdout
+                    .write_all(screen.paint().as_bytes())
+                    .and_then(|()| stdout.flush());
+                continue;
             }
-            let ready = |fd: &PollFd<'_>| fd.revents().is_some_and(|flags| !flags.is_empty());
-            (ready(&fds[0]), ready(&fds[1]))
-        };
-        if resize_ready {
-            let mut drained = [0_u8; 64];
-            let _ = resized.read(&mut drained);
-            size = terminal_size();
-            screen = layout(&request, size.0, size.1, screen.offset);
-            let _ = stdout
-                .write_all(screen.paint().as_bytes())
-                .and_then(|()| stdout.flush());
-        }
-        if !input_ready {
-            continue;
+            Err(error) => {
+                restore(&stdin);
+                return Err(error).context("waiting for the confirm key");
+            }
         }
         let byte = match read_byte(&stdin) {
             Ok(Some(byte)) => byte,
@@ -389,7 +415,6 @@ pub fn run() -> Result<()> {
     }
     restore(&stdin);
     drop(stdout);
-    let _ = winch.thread_unblock();
 
     let (program, flag) = crate::child_env::exec_shell();
     let mut process = std::process::Command::new(program);
@@ -481,5 +506,40 @@ mod tests {
         let mut other = TokenMatcher::new(&token);
         let wrong = crate::sessions::supervised_marker("go", "ffffffffffffffffffffffffffffffff");
         assert!(!wrong.iter().any(|byte| other.feed(*byte)));
+    }
+
+    #[test]
+    fn a_resize_is_seen_while_no_key_arrives() {
+        use std::os::fd::AsFd;
+
+        // An open pipe with nothing written stands in for an idle terminal.
+        let (idle, _writer) = std::io::pipe().expect("pipe");
+        let mut checks = 0;
+        let started = std::time::Instant::now();
+        let wake = wait_for_input_or_resize(idle.as_fd(), (80, 24), || {
+            checks += 1;
+            if checks < 3 { (80, 24) } else { (40, 12) }
+        })
+        .expect("wait");
+        assert_eq!(wake, Wake::Resized((40, 12)));
+        assert_eq!(checks, 3);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn waiting_leaves_a_ready_key_unread() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsFd;
+
+        let (mut reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"qx").expect("write");
+        let wake = wait_for_input_or_resize(reader.as_fd(), (80, 24), || (80, 24)).expect("wait");
+        assert_eq!(wake, Wake::Input);
+        // A resize reported at the same time wins; the key is still there.
+        let wake = wait_for_input_or_resize(reader.as_fd(), (80, 24), || (40, 12)).expect("wait");
+        assert_eq!(wake, Wake::Resized((40, 12)));
+        let mut both = [0_u8; 2];
+        reader.read_exact(&mut both).expect("read");
+        assert_eq!(&both, b"qx");
     }
 }

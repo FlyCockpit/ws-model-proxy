@@ -10,8 +10,6 @@ export {
   CLI_OUTPUT_ELLIPSIS,
   CLI_STREAM_HEAD_MAX_BYTES,
   CLI_STREAM_TAIL_MAX_BYTES,
-  type CliStreamText,
-  cleanText,
   formatBoundedStream,
   redactCredentialSubstrings,
 } from "@ws-model-proxy/config/cli-command-output";

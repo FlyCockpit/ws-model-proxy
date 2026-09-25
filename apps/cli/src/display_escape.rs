@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 
 /// Inclusive code point ranges shown as `\u{<hex>}`: controls (except the
 /// line feed), bidi embeddings/overrides/isolates, zero-width and invisible
-/// characters, space look-alikes, surrogates, variation selectors, tag
+/// characters, lookalike spaces, surrogates, variation selectors, tag
 /// characters, and invisible format controls.
 pub const ESCAPE_RANGES: &[(u32, u32)] = &[
     (0x0000, 0x0009),

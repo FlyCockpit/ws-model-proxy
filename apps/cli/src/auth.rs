@@ -298,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tags_and_unparseable_bodies_are_fatal() {
+    fn unknown_tags_and_unparsable_bodies_are_fatal() {
         let body = error_body("BAD_REQUEST", "odd", Some("something_new"));
         assert!(matches!(
             classify_exchange_error(400, &body),
